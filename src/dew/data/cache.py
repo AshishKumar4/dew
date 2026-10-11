@@ -19,7 +19,7 @@ from contextlib import ExitStack, closing
 from dataclasses import dataclass, field
 from functools import cached_property, lru_cache
 from pathlib import Path
-from typing import Literal, Protocol, overload, runtime_checkable
+from typing import Literal, Protocol, TypedDict, overload, runtime_checkable
 
 import grain.python as grain
 import numpy as np
@@ -39,6 +39,13 @@ type Outputs = tuple[Record, ...]
 type Transform = Callable[[int, Record], Outputs]
 type CachedValue = Record | Outputs
 type RowId = int | tuple[str, int]
+
+
+class CacheStats(TypedDict):
+    admitting: bool
+    spool_bytes: int
+    uploaded_bytes: int
+    upload_seconds: float
 
 
 class DependencyManifest(Protocol):
@@ -470,6 +477,8 @@ class _Writer:
         self.admitting = True
         self.closed = False
         self.closing = False
+        self.uploaded_bytes = 0
+        self.upload_seconds = 0.0
         self.volatile = volatile
         self.expected = expected
         self.seal_future: Future | None = None
@@ -636,6 +645,7 @@ class _Writer:
         return True
 
     def _upload(self, number: int, path: Path, entries: list[dict], used: int) -> dict:
+        started = time.monotonic()
         payload = path.read_bytes()
         shard = f"shards/{self.writer}/{number:06d}.array_record"
         segment = f"segments/{self.writer}/{number:06d}.json"
@@ -665,6 +675,8 @@ class _Writer:
                         raise ValueError(f"cache retry found conflicting segment {segment}") from None
                 with self.lock:
                     self.spool_bytes -= used
+                    self.uploaded_bytes += used
+                    self.upload_seconds += time.monotonic() - started
                     self.lock.notify_all()
                 path.unlink()
                 return {"path": segment, "bytes": len(encoded), "sha256": _hash(encoded)}
@@ -673,6 +685,15 @@ class _Writer:
                     raise
                 time.sleep(min(0.25 * 2**attempt, 10))
         raise RuntimeError("cache upload retry budget exhausted")
+
+    def metrics(self) -> CacheStats:
+        with self.lock:
+            return {
+                "admitting": self.admitting,
+                "spool_bytes": self.spool_bytes,
+                "uploaded_bytes": self.uploaded_bytes,
+                "upload_seconds": self.upload_seconds,
+            }
 
     def seal(self) -> None:
         with self.lock:
@@ -769,6 +790,9 @@ class _CachedMap(grain.MapDataset[CachedValue]):
     def close(self) -> None:
         if "_writer" in self.__dict__:
             self.writer.close()
+
+    def metrics(self) -> CacheStats:
+        return self.writer.metrics()
 
     def to_iter_dataset(
         self, read_options: grain.ReadOptions | None = None, *, allow_nones: bool = False
@@ -877,6 +901,9 @@ class _CachedIterator(grain.DatasetIterator):
     def close(self) -> None:
         self.parent.close()
         self.writer.close()
+
+    def metrics(self) -> CacheStats:
+        return self.writer.metrics()
 
 
 @dataclass(frozen=True)
