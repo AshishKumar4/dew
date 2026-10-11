@@ -41,6 +41,7 @@ from collections.abc import Mapping
 from typing import TYPE_CHECKING, Protocol, Self, runtime_checkable
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn, struct
 from flax.typing import PrecisionLike, VariableDict
@@ -277,6 +278,18 @@ class ProjectionGroup:
     packed: str
     members: tuple[str, ...]
     widths: tuple[int, ...]
+
+    @classmethod
+    def of(cls, path: tuple[str, ...], packed: str, members: tuple[str, ...],
+           projections: Mapping[str, tuple[int, int]]) -> Self:
+        """The group of `members`, their widths read from the module's own
+        `projections()`, `{name: (inputs, outputs)}`, the geometry its setup builds."""
+        return cls(path, packed, members, tuple(projections[name][1] for name in members))
+
+    def split(self, out: jax.Array) -> tuple[jax.Array, ...]:
+        """The members' outputs from the packed projection's `out`, in member order."""
+        ends = np.cumsum(self.widths)[:-1]
+        return tuple(jnp.split(out, [int(end) for end in ends], axis=-1))
 
     def held(self, params: Mapping) -> bool:
         """Whether `params`, the parameters at `path`, hold the group packed or every member."""
