@@ -636,6 +636,18 @@ def chunk_bwd_dv_local(q, k, g, do, *, scale: float, chunk: int = 64, bk: int | 
     )(q, k, g, do)
 
 
+def _split_dot(wide, narrow, *, exact: bool):
+    """`wide @ narrow` for an fp32 `wide` against a 16-bit `narrow`: `wide` as two `narrow`-dtype parts,
+    its rounding and the rounding's remainder, each product exact and summed in fp32, so `wide`'s
+    rounding to the narrow dtype, which fla's single product takes, drops out. FP32 operands keep
+    the one product."""
+    if jnp.dtype(narrow.dtype).itemsize == 4:
+        return _dot(wide, narrow, exact=exact)
+    high = wide.astype(narrow.dtype)
+    low = (wide - high.astype(jnp.float32)).astype(narrow.dtype)
+    return _dot(high, narrow, exact=exact) + _dot(low, narrow, exact=exact)
+
+
 def _state_inner_product(memory, memory_grad):
     """fla chunk_o.py:251: multiply h/dh in their storage dtype, then tl.sum widens to fp32.
     In particular, bf16 products round before reduction; widening both inputs omits that round."""
@@ -680,9 +692,8 @@ def _dqkwg_kernel(q_ref, k_ref, v_ref, g_ref, h_ref, do_ref, dh_ref, dv_ref, dq_
         dk = dk * jnp.exp2(last - gate)[:, None]
         dg_last += jnp.sum(dk * keys.astype(jnp.float32))
         ds = jnp.where(causal, ds * jnp.exp2(gate[:, None] - gate[None, :]), 0.0) * scale
-        ds = ds.astype(keys.dtype)
-        dq += _dot(ds, keys, exact=exact)
-        dk += _dot(ds.T, queries, exact=exact)
+        dq += _split_dot(ds, keys, exact=exact)
+        dk += _split_dot(ds.T, queries, exact=exact)
         dg = (jnp.sum(dq * queries.astype(jnp.float32), axis=1)
               - jnp.sum(dk * keys.astype(jnp.float32), axis=1))
         dg_ref[:, head] = jnp.where(index < size - 1, dg, dg + dg_last)
