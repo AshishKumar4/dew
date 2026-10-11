@@ -49,7 +49,7 @@ def test_recipe_sources_round_trip_in_a_run_record(tmp_path):
 
 
 def test_indexed_jsonl_refuses_to_build_an_index_without_provisioning(jsonl):
-    with pytest.raises((ValueError, FileNotFoundError), match="index|provision"):
+    with pytest.raises((ValueError, FileNotFoundError), match=r"index|provision"):
         load(Records(source=jsonl), batch=4, read="indexed", loading=READ)
     data = load(Records(source=jsonl), batch=4, read="indexed", provision=True, loading=READ)
     stream = data.train(DataPartition())
@@ -151,7 +151,7 @@ def test_a_per_share_position_refuses_another_worker_topology(jsonl):
     other = load(Records(source=jsonl), batch=4, read="streamed",
                  loading=Loading(workers=2, threads=1, read_buffer=4, worker_buffer=1)).train(DataPartition())
     try:
-        with pytest.raises(ValueError, match="worker|topology|plan"):
+        with pytest.raises(ValueError, match=r"worker|topology|plan"):
             other.set_state(state)
     finally:
         other.close()
@@ -161,7 +161,8 @@ def test_per_record_rng_draws_agree_with_plain_grain():
     rows = [{"index": np.int32(index)} for index in range(24)]
     data = compile(Pipeline(Memory(rows)).shuffle(11).repeat().random_map(Draw()).batch(4),
                    seed=11, read="indexed", loading=READ)
-    oracle = iter(grain.MapDataset.source(rows).seed(11).shuffle(11).repeat().random_map(Draw()).to_iter_dataset(
+    oracle = iter(grain.MapDataset.source(rows).seed(11).shuffle(11).repeat().random_map(
+        Draw()).to_iter_dataset(
         grain.ReadOptions(num_threads=1, prefetch_buffer_size=4)).batch(4))
     actual = data.train(DataPartition())
     try:

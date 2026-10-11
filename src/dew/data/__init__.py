@@ -8,7 +8,7 @@ or streamed access for every source in the run.
 
 from .cache import Cache, Generation
 from .chat import Role
-from .compile import compile, iterate, publish
+from .compile import compile, iterate, publish, validation
 from .dataset import (
     Batch,
     Checkpointable,
@@ -89,4 +89,5 @@ __all__ = [
     "iterate",
     "load",
     "publish",
+    "validation",
 ]

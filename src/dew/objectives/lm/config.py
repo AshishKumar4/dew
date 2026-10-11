@@ -261,7 +261,8 @@ def token_vocabulary(tokens: Text) -> tuple[str, int]:
         metadata = source(leaf).metadata()
         if metadata.get("token_store"):
             if "tokenizer" not in metadata or "vocab_size" not in metadata:
-                raise FileNotFoundError(f"{source(leaf).describe()} needs producer metadata (tokenizer and vocab_size)")
+                raise FileNotFoundError(
+                    f"{source(leaf).describe()} needs producer metadata (tokenizer and vocab_size)")
             recorded.add((text(metadata["tokenizer"], "tokenizer"), integer(metadata["vocab_size"],
                 "vocab_size")))
         else:

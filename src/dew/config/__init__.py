@@ -1143,6 +1143,7 @@ class RunConfig:
         # Before the run length, since a ramp reads fewer records a step early
         # and a pass over the data is that many steps longer.
         dataset = dataset if trainer.batch_ramp is None else ramped(dataset, trainer.batch_ramp)
+        summary = {**(summary or {}), **({} if dataset.plan is None else {"data_plan": dataset.plan.record()})}
         steps = trainer.total_steps(dataset)
         tracker = None
         try:

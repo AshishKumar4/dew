@@ -39,7 +39,8 @@ def encoded_token_fixture(directory: Path, documents: Iterable[str], *, tokenize
                 raise ValueError("an EOS fixture needs a tokenizer with an EOS id")
             ids.append(vocabulary.eos_id)
         pieces.extend(ids)
-    dtype = np.uint8 if vocabulary.vocab_size <= 256 else np.uint16 if vocabulary.vocab_size <= 65536 else np.uint32
+    dtype = (np.uint8 if vocabulary.vocab_size <= 256 else
+             np.uint16 if vocabulary.vocab_size <= 65536 else np.uint32)
     tokens = np.asarray(pieces, dtype=dtype)
     held = int(len(tokens) * val_fraction)
     return write_token_corpus(directory, tokens[held:], tokens[:held], tokenizer=tokenizer,

@@ -184,7 +184,7 @@ def test_the_fit_check_leaves_out_a_set_none_of_whose_rows_fit():
         assert next(stream)["tokens"].shape[0] == 2
     finally:
         stream.close()
-    with pytest.raises(ValueError, match="fit|accepted|empty"):
+    with pytest.raises(ValueError, match=r"fit|accepted|empty"):
         refused = load(Decisions(source={"long": long}, weights={"long": 1.0}), batch=2,
                        read="memory", objective=objective.data(), loading=Loading(workers=0))
         next(refused.train(DataPartition()))

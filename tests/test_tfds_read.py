@@ -13,11 +13,11 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-tfds = pytest.importorskip("tensorflow_datasets", reason="needs the tfds extra")
-
 from dew.data import TFDS, DataPartition, HoldOut, Images, Loading, load
 from dew.data.images import decode_image
 from dew.data.steps.image import ImageRecord
+
+tfds = pytest.importorskip("tensorflow_datasets", reason="needs the tfds extra")
 
 FIXTURE = Path(__file__).parent / "fixtures" / "tfds" / "dew_images" / "1.0.0"
 
