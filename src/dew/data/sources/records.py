@@ -37,10 +37,7 @@ class ArrayRecords:
             elif "gs" in protocols or "gcs" in protocols:
                 paths.append("gs://" + path)
             else:
-                options = dict(self.storage_options or {})
-                fs, path = Store(
-                    url if url.startswith("dewcache::") else "dewcache::" + url, options
-                ).resolve()
+                fs, path = Store(url, self.storage_options).cached().resolve()
                 pin = fs.open(path, "rb")
                 if not isinstance(pin.name, str):
                     pin.close()
