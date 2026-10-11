@@ -86,14 +86,14 @@ class Torch:
     facts: Mapping[str, object] | None = None
 
     def describe(self) -> str:
-        return f"torch:{self.identity or describe(self.dataset)}:{self.fields}"
+        return f"torch:{self.identity or repr(TorchRecords(self.dataset, self.fields))}:{self.fields}"
 
     def snapshot(self) -> Mapping[str, object]:
         return {
             "store": "torch",
             "identity_required": True,
             "identity": self.identity,
-            "dataset": describe(self.dataset),
+            "dataset": repr(TorchRecords(self.dataset, self.fields)),
             "rows": len(self.records("indexed")),
             "fields": self.fields,
         }
