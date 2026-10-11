@@ -30,6 +30,8 @@ from dew.nn import attention, kernels
 from dew.nn.attention import RMSNorm, forward_mode_attention, rms_normalized, unweighted_rmsnorm
 from dew.nn.moe import ExpertMLP, gated_product
 
+pytestmark = pytest.mark.kernel
+
 
 def relative(got, want):
     want = np.asarray(want, np.float64)
