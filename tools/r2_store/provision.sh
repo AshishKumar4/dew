@@ -7,7 +7,8 @@
 #   tools/r2_store/provision.sh NAME [EXPIRE_DAYS]
 #
 # EXPIRE_DAYS deletes an object that many days after it is written; without
-# it the bucket keeps every object until it is deleted. Two tokens are made
+# it the bucket keeps every object until it is deleted, except under _smoke/,
+# where a remote smoke's objects expire after a day. Two tokens are made
 # once: the write token at ~/.config/dew/NAME.token, which also reads, and a
 # read token at ~/.config/dew/NAME.read.token, refused a PUT, for readers
 # such as a restore-only VM (both mode 600). The Worker's URL is written to
@@ -26,6 +27,8 @@ if ! $wrangler r2 bucket info "$name" >/dev/null 2>&1; then
 fi
 if [ -n "$days" ] && ! $wrangler r2 bucket lifecycle list "$name" 2>/dev/null | grep -q "expire-${days}d"; then
   $wrangler r2 bucket lifecycle add "$name" "expire-${days}d" --expire-days "$days" --force
+elif [ -z "$days" ] && ! $wrangler r2 bucket lifecycle list "$name" 2>/dev/null | grep -q "smoke-1d"; then
+  $wrangler r2 bucket lifecycle add "$name" smoke-1d _smoke/ --expire-days 1 --force
 fi
 
 mkdir -p "$HOME/.config/dew"

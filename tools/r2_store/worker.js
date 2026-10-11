@@ -2,8 +2,9 @@
 // (dew-xla-cache.jsonc, dew-data.jsonc; provision.sh): GET, HEAD and PUT of
 // /<key> in the bucket bound as CACHE, and GET /?list=<prefix> for the keys
 // under a prefix, a page at a time, for a bearer of the store's CACHE_TOKEN
-// secret. A bearer of its READ_TOKEN secret, where one is set, reads the same
-// way and is refused a PUT with a 403. A miss is a 404. A GET with a Range header answers 206 with that
+// secret, who may also DELETE /<key>. A bearer of its READ_TOKEN secret, where
+// one is set, reads the same way and is refused a PUT or a DELETE with a 403.
+// A miss is a 404. A GET with a Range header answers 206 with that
 // slice and its Content-Range. A PUT honours If-None-Match and If-Match
 // (`If-None-Match: *` writes a key only if it is absent) and answers 412
 // where the condition fails; every answer about an object carries its ETag.
@@ -61,6 +62,11 @@ export default {
       const object = await env.CACHE.head(key);
       return new Response(null, object === null ? { status: 404 }
         : { status: 200, headers: { 'content-length': String(object.size), etag: object.httpEtag } });
+    }
+    if (request.method === 'DELETE') {
+      if (!writes) return new Response(null, { status: 403 });
+      await env.CACHE.delete(key);
+      return new Response(null, { status: 204 });
     }
     if (request.method === 'PUT') {
       if (!writes) return new Response(null, { status: 403 });
