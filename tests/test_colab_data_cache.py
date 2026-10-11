@@ -205,11 +205,22 @@ def assembly_manifest(objects, *, bad_order=False, missing=False):
     chunks = {"split=train/part.0": b"first\n", "split=train/part.1": b"second\n"}
     for name, value in chunks.items():
         objects["decision/mix-v3/" + name] = value
-    manifest = {"schema": 1, "name": "generic-dataset", "files": [
-        {"path": name, "bytes": len(value), "sha256": hashlib.sha256(value).hexdigest()}
-        for name, value in chunks.items()], "assemblies": [{"path": "logical.jsonl", "bytes": 13,
-        "sha256": hashlib.sha256(b"first\nsecond\n").hexdigest(),
-        "shards": ["missing"] if missing else list(reversed(chunks)) if bad_order else list(chunks)}]}
+    manifest = {
+        "schema": 1,
+        "name": "generic-dataset",
+        "files": [
+            {"path": name, "bytes": len(value), "sha256": hashlib.sha256(value).hexdigest()}
+            for name, value in chunks.items()
+        ],
+        "assemblies": [
+            {
+                "path": "logical.jsonl",
+                "bytes": 13,
+                "sha256": hashlib.sha256(b"first\nsecond\n").hexdigest(),
+                "shards": ["missing"] if missing else list(reversed(chunks)) if bad_order else list(chunks),
+            }
+        ],
+    }
     body = json.dumps(manifest).encode()
     identity = hashlib.sha256(body).hexdigest()
     key = "decision/mix-v3/manifests/" + identity + ".json"

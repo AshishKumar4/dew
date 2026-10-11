@@ -1,4 +1,5 @@
 """Verified VM materialization of remotely built datasets and ordered assemblies."""
+
 import hashlib
 import os
 import re
@@ -45,8 +46,11 @@ def validate_manifest(manifest: dict) -> list[dict]:
         if not shards or any(shard not in files for shard in shards):
             raise ValueError("assembly requires declared physical shards")
         size = sum(files[shard]["bytes"] for shard in shards)
-        if (not SHA.fullmatch(assembly["sha256"]) or type(assembly.get("bytes", size)) is not int
-                or assembly.get("bytes", size) != size):
+        if (
+            not SHA.fullmatch(assembly["sha256"])
+            or type(assembly.get("bytes", size)) is not int
+            or assembly.get("bytes", size) != size
+        ):
             raise ValueError("invalid assembly size or checksum")
         if name in destinations:
             if shards == [name] and assembly["sha256"] == files[name]["sha256"]:
@@ -106,7 +110,14 @@ def shard_blocks(target: Path, names: list[str]) -> Iterable[bytes]:
 class DataCache:
     def __init__(self, endpoint: str, token_file: Path):
         url = urlparse(endpoint)
-        if url.scheme != "https" or not url.netloc or url.username or url.password or url.query or url.fragment:
+        if (
+            url.scheme != "https"
+            or not url.netloc
+            or url.username
+            or url.password
+            or url.query
+            or url.fragment
+        ):
             raise ValueError("data cache requires an HTTPS endpoint without credentials/query/fragment")
         self.endpoint = endpoint.rstrip("/")
         self.headers = {"Authorization": "Bearer " + token_file.read_text().strip()}
@@ -116,14 +127,15 @@ class DataCache:
             raise ValueError("invalid data-cache key")
         for attempt in range(4):
             try:
-                response = requests.get(self.endpoint + "/" + key, headers=self.headers,
-                                        timeout=(20, 120), stream=stream)
+                response = requests.get(
+                    self.endpoint + "/" + key, headers=self.headers, timeout=(20, 120), stream=stream
+                )
                 response.raise_for_status()
                 return response
             except requests.RequestException:
                 if attempt == 3:
                     raise
-                time.sleep(2 ** attempt)
+                time.sleep(2**attempt)
         raise AssertionError("request retries exhausted")
 
     def remote_blocks(self, key: str) -> Iterable[bytes]:
