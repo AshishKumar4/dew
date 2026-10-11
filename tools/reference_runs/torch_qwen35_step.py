@@ -4,8 +4,8 @@
 Run --smoke only on armada CPU; the full run requires an A100-SXM4-80GB.
 --requirements prints the pinned environment without importing torch.
 The 200-step synchronized window excludes both compilation and the later
-five-step profiler capture. Qwen3.5-0.8B had a Clef head, so subtracting its measured
-head time gives an estimated backbone comparison, not a matched rerun.
+five-step profiler capture. Dew's side of the comparison is the same-session
+pair (qwen35_pair.py), not an estimate from another workload.
 Results: ~/.cache/dew/verification-evidence/torch_qwen35_step_result.json.
 """
 
@@ -77,17 +77,11 @@ def arguments() -> argparse.Namespace:
     parser.add_argument("--smoke-fixture", type=Path,
                         help="export the untrained tiny CPU weights for Dew's loader proof")
     parser.add_argument("--session", help="identity supplied by the same-session paired runner")
-    parser.add_argument("--dew-attribution", type=Path)
-    parser.add_argument("--dew-entry", type=Path)
     args = parser.parse_args()
     if args.warmup < 2 or args.steps < 1 or args.profile_steps < 1:
         parser.error("need at least two warmup steps, one timed step and one profiled step")
     if args.smoke_fixture and not args.smoke:
         parser.error("--smoke-fixture requires --smoke")
-    if bool(args.dew_attribution) != bool(args.dew_entry):
-        parser.error("pass both Dew attribution and entry for a comparison")
-    if args.dew_attribution and "by_part_kind_ms" not in json.loads(args.dew_attribution.read_text())["time"]:
-        parser.error("Dew comparison requires corrected all-op by_part_kind_ms attribution")
     return args
 
 
@@ -237,57 +231,6 @@ def smoke_attribution(path: Path) -> dict:
         raise AssertionError("lost GEMM input-shape attribution")
     return {"launch_correlation": True, "cross_thread_optimizer_scope": True,
             "unknown_kernel_retained": True, "interval_union_idle": True, "mlp_shape_attribution": True}
-
-
-def comparison(reference: dict, attribution: Path, entry: Path) -> dict:
-    from common import peak_flops
-
-    work = reference["work"]
-
-    dew, timed = json.loads(attribution.read_text()), json.loads(entry.read_text())
-    if "by_part_kind_ms" not in dew["time"]:
-        raise ValueError("use corrected Qwen3.5-0.8B attribution with all-op by_part_kind_ms, not top_ops")
-    head = dew["time"]["by_part_kind_ms"].get("head_loss", {})
-    # The corrected classifier groups every JointSchemaHead source path
-    # under head_loss, including its attention, MLP and norm submodules.
-    head_ms = sum(head.values())
-    if head_ms <= 0:
-        raise ValueError("corrected attribution has no head_loss timings")
-    adjusted = dict(dew["time"]["by_kind_ms"])
-    for kind, value in head.items():
-        adjusted[kind] = adjusted.get(kind, 0) - value
-    categories = defaultdict(float)
-    kind_map = {"pallas": "gdn", "slicing": "layout", "gather_scatter": "layout"}
-    for part, by_kind in dew["time"]["by_part_kind_ms"].items():
-        if part == "head_loss":
-            continue
-        for kind, ms in by_kind.items():
-            category = ("optimizer" if part == "optimizer" else "elementwise" if part == "norm"
-                        else kind_map.get(kind, kind))
-            categories[category] += ms
-    estimated_ms = timed["steady"]["step_ms"] - head_ms
-    return {"caveat": "Qwen3.5-0.8B includes Clef; its backbone is a subtraction estimate. "
-                      "HF uses a negligible hidden-state loss on synthetic unpadded rows.",
-            "dew_measured": {"step_ms": timed["steady"]["step_ms"], "tokens_per_s": timed["tokens_per_s"],
-                             "mfu": timed["mfu"], "peak_gib": timed["peak_mib"] / 1024,
-                             "peak_metric": "Qwen3.5-0.8B XLA/device high-water mark; HF uses allocated bytes",
-                             "by_kind_ms": dew["time"]["by_kind_ms"]},
-            "dew_backbone_estimate": {"step_ms": estimated_ms,
-                                      "tokens_per_s": work["tokens_per_step"] / (estimated_ms / 1000),
-                                      "mfu": work["training_flops_per_step"] / (estimated_ms / 1000)
-                                             / peak_flops("NVIDIA A100"),
-                                      "head_profile_ms_subtracted": head_ms, "by_kind_ms": adjusted,
-                                      "categories_ms": dict(categories),
-                                      "profile_idle_ms": dew["time"]["device_idle_ms_per_step"],
-                                      "by_part_kind_ms": {
-                                          part: value for part, value in
-                                          dew["time"]["by_part_kind_ms"].items()
-                                          if part != "head_loss"},
-                                      "peak_gib": None,
-                                      "reason": "no separately measured head-free step or memory peak"},
-            "reference": {**reference["steady"], "peak_gib": reference["memory"]["peak_allocated_gib"],
-                          "by_kind_ms": reference["time"].get("by_kind_ms", {}),
-                          "profile_idle_ms": reference["time"].get("device_idle_ms_per_step")}}
 
 
 def load_backbone(smoke: bool):
@@ -543,8 +486,6 @@ def result_record(args: argparse.Namespace, model, device, batch: int, seq: int,
         record["checks"]["attribution_fixture"] = smoke_attribution(
             Path(args.out).with_suffix(".fixture.json"))
         record["checks"]["compiled_sdpa_calls"] = observed_sdpa
-    if args.dew_attribution:
-        record["comparison"] = comparison(record, args.dew_attribution, args.dew_entry)
     return record
 
 
@@ -581,7 +522,6 @@ def run(args: argparse.Namespace) -> dict:
                                               if key != "dynamo_counters"},
         "time": {key: value for key, value in record["time"].items()
                  if key not in ("top_ops", "common_summary")},
-        "comparison": record.get("comparison"),
     })
     return record
 
