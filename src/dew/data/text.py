@@ -29,6 +29,7 @@ def tokenizer_snapshot(name: str) -> Mapping[str, object]:
         return {"name": "byte", "encoding": "utf-8", "eos": 255}
     directory = Path(name)
     resolved = None
+    repo = None
     if not directory.is_dir():
         from huggingface_hub import HfApi, snapshot_download
 

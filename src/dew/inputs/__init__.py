@@ -46,9 +46,12 @@ class Field:
 
     key: str
     shape: tuple[int, ...]
+    variable_axes: tuple[int, ...] = ()
 
     def __post_init__(self):
         object.__setattr__(self, "shape", tuple(int(size) for size in self.shape))
+        if any(axis < 0 or axis >= len(self.shape) for axis in self.variable_axes):
+            raise ValueError("variable field axes must index its per-sample shape")
 
 
 @dataclass(frozen=True)
@@ -126,16 +129,21 @@ class InputSpec:
                 raise ValueError(f"objective.inputs needs field {declared.key!r} in the training batch")
             value = batch[declared.key]
             actual = np.shape(value.tokens if isinstance(value, ModelInputs) else value)[1:]
-            if tuple(actual) != declared.shape:
+            matches = len(actual) == len(declared.shape) and all(
+                0 < size <= bound if axis in declared.variable_axes else size == bound
+                for axis, (size, bound) in enumerate(zip(actual, declared.shape, strict=True)))
+            if not matches:
                 raise ValueError(f"objective.inputs field {declared.key!r} declares shape {declared.shape}, "
                                  f"but the first training batch has shape {tuple(actual)}")
 
     def to_json(self) -> dict:
         return {
-            "sample": {"key": self.sample.key, "shape": list(self.sample.shape)},
+            "sample": {"key": self.sample.key, "shape": list(self.sample.shape),
+                       **({"variable_axes": list(self.sample.variable_axes)} if self.sample.variable_axes else {})},
             "conditions": {keyword: condition.to_json() for keyword, condition in self.conditions.items()},
             **(
-                {"mask": {"key": self.mask.key, "shape": list(self.mask.shape)}}
+                {"mask": {"key": self.mask.key, "shape": list(self.mask.shape),
+                          **({"variable_axes": list(self.mask.variable_axes)} if self.mask.variable_axes else {})}}
                 if self.mask is not None
                 else {}
             ),
@@ -149,12 +157,13 @@ class InputSpec:
         When it is None, each encoder loads its own weights."""
         sample = record["sample"]
         return cls(
-            sample=Field(sample["key"], tuple(sample["shape"])),
+            sample=Field(sample["key"], tuple(sample["shape"]), tuple(sample.get("variable_axes", ()))),
             conditions={
                 keyword: Condition.from_json(condition, params=None if params is None else params[keyword])
                 for keyword, condition in record["conditions"].items()
             },
-            mask=Field(record["mask"]["key"], tuple(record["mask"]["shape"])) if "mask" in record else None,
+            mask=Field(record["mask"]["key"], tuple(record["mask"]["shape"]),
+                       tuple(record["mask"].get("variable_axes", ()))) if "mask" in record else None,
         )
 
 
