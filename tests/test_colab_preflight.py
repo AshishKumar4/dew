@@ -178,7 +178,7 @@ def test_a_ref_without_the_called_module_fails_the_preflight(tmp_path, monkeypat
     args = argparse.Namespace(
         ref=commit, hardware="gpu:G4", command="python /content/c56/rules.py", inputs=[str(script)], pin=[]
     )
-    args.origin, args.accept, args.dew_python = "origin", [], sys.executable
+    args.origin, args.accept, args.also, args.dew_python = "origin", [], [], sys.executable
     receipt = preflight.preflight(args, tmp_path / "work")
     assert receipt["commit"] == commit and not receipt["ok"]
     assert receipt["failures"] == ["rules.py:2: dew.kernels.fla_gdn: dew.kernels has no fla_gdn"]
@@ -260,3 +260,75 @@ def test_selection_refuses_a_request_without_a_preflight(tmp_path, monkeypatch):
     monkeypatch.setattr(batch, "QUEUE", queue)
     with pytest.raises(ValueError, match="GPU request lacks preflight"):
         batch.select("gpu", "test", "gpu:T4", [])
+
+
+KERNELS_SOURCE = "KERNELS = {'gated_delta_rule': {'sm80': 'fla'}, 'attention': {'sm80': 'flash'}}\n"
+
+
+def kernel_tree(root: Path, kernels: str = KERNELS_SOURCE) -> Path:
+    write(root, {
+        "src/dew/__init__.py": "", "src/dew/nn/__init__.py": "", "src/dew/nn/kernels/__init__.py": "",
+        "src/dew/nn/kernels/generation.py": kernels,
+        "src/dew/nn/kernels/rule.py": "def rule(): return 1\n",
+        "src/dew/nn/linear.py": "from dew.nn.kernels import rule\n",
+        "src/dew/data.py": "x = 1\n",
+    })
+    return root
+
+
+def test_the_kernel_digest_covers_the_kernels_and_their_callers_only(tmp_path):
+    tree = kernel_tree(tmp_path)
+    first = preflight.kernel_digest(tree)
+    (tree / "src/dew/data.py").write_text("x = 2\n")
+    assert preflight.kernel_digest(tree) == first
+    for changed in ("src/dew/nn/linear.py", "src/dew/nn/kernels/rule.py"):
+        (tree / changed).write_text((tree / changed).read_text() + "# changed\n")
+        assert preflight.kernel_digest(tree) != first
+        first = preflight.kernel_digest(tree)
+
+
+def test_pallas_kernel_choices_need_the_labs_record_of_their_exact_code(tmp_path, monkeypatch):
+    """A ref whose KERNELS run Pallas kernels on the target GPU needs the kernel lab's record for its
+    kernels' digest; a ref naming none (here the A100's flash attention is CUDA, not Pallas) needs
+    none, and a G4 with no row runs no Pallas kernel."""
+    tree = kernel_tree(tmp_path)
+    records = {}
+    monkeypatch.setattr(preflight, "store_read", lambda key: records.get(key))
+    failures: list[str] = []
+    found = preflight.lab_verified(tree, "gpu:A100", failures)
+    assert found["pallas"] == ["gated_delta_rule=fla"]
+    assert failures and "not verified on a100" in failures[0]
+    records[f"lab/verified/a100/{found['digest']}.json"] = {"ok": True, "ref": "abc", "gpu": "a100"}
+    failures.clear()
+    assert preflight.lab_verified(tree, "gpu:A100", failures)["record"]["ref"] == "abc" and not failures
+    assert preflight.lab_verified(tree, "gpu:G4", failures) == {"generation": "sm120", "pallas": []}
+    assert not failures
+
+
+def test_a_second_ref_is_checked_out_only_when_declared_and_fetched(tmp_path, monkeypatch):
+    """c58's fallback checkout failed on the VM, which had fetched only the job's ref, and the
+    script went on at the job's ref. A script's other ref must be declared (`--also`), and the
+    entry's `refs:` must fetch it."""
+    tree = tmp_path / "dew"
+    commit = repository(tree, {"src/dew/__init__.py": "", "src/dew/kernels.py": "rule = 1\n"})
+    subprocess.run(["git", "-C", str(tree), "-c", "user.name=T", "-c", "user.email=t@e.invalid",
+                    "commit", "--allow-empty", "-qm", "fallback"], check=True)
+    fallback = subprocess.check_output(["git", "-C", str(tree), "rev-parse", "HEAD"], text=True).strip()
+    monkeypatch.setattr(preflight, "REPO", tree)
+    monkeypatch.setattr(preflight, "VENV_PYTHON", "{}.{}".format(*sys.version_info[:2]))
+    script = tmp_path / "run.sh"
+    script.write_text(f"git checkout -q {commit}\ngit checkout -q {fallback}\n")
+    args = argparse.Namespace(ref=commit, hardware="gpu:A100", command="bash /content/c/run.sh",
+                              inputs=[str(script)], pin=[], origin="origin", accept=[], also=[],
+                              dew_python=sys.executable)
+    undeclared = preflight.preflight(args, tmp_path / "work")
+    assert not undeclared["ok"] and "nor a declared --also ref" in undeclared["failures"][0]
+    args.also = [fallback]
+    declared = preflight.preflight(args, tmp_path / "work2")
+    assert declared["ok"] and declared["refs"] == [fallback]
+    path = tmp_path / "receipt.json"
+    path.write_text(json.dumps(declared))
+    request = {"commit": commit, "hardware": "gpu:A100", "command": args.command, "runtime": []}
+    with pytest.raises(ValueError, match="refs: does not fetch"):
+        preflight.verify(path, request, [])
+    assert preflight.verify(path, {**request, "refs": [fallback]}, [])
