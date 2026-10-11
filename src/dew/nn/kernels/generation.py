@@ -151,6 +151,18 @@ def bf16_dot_runs() -> bool:
     return not generation.startswith('sm') or int(generation[2:]) >= BF16_GPU
 
 
+def backend() -> str:
+    """The platform a call's code is chosen for: `jax.default_backend()`, or within `assumed` the
+    assumed generation's, 'gpu' for an `smXY` and 'tpu' for a TPU's, so a choice keyed on the
+    platform acts as on that device while a step traces for it on another."""
+    generation = ASSUMED.get()
+    if generation is None:
+        return jax.default_backend()
+    if generation.startswith('sm'):
+        return 'gpu'
+    return 'tpu' if generation in TPU_GENERATIONS.values() else generation
+
+
 def triton_runs() -> bool:
     """Return whether Dew's Pallas GPU (Triton) kernels can run here.
 
@@ -159,7 +171,5 @@ def triton_runs() -> bool:
     A T4 fails to compile them ("Triton support is only enabled for
     cc>=8.0"). Within `assumed`, the GPU is the assumed generation's.
     """
-    generation = ASSUMED.get()
-    gpu = jax.default_backend() == 'gpu' if generation is None else generation.startswith('sm')
     # JAX's bound is `_backend_supports_triton`.
-    return gpu and bf16_dot_runs()
+    return backend() == 'gpu' and bf16_dot_runs()

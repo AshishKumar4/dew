@@ -12,9 +12,16 @@ lowers for CUDA, which runs every Pallas-Triton lowering in the step. XLA's
 own compile of the lowered step, and Triton's of each kernel, still need the
 GPU.
 
-What the dry run cannot see is a choice made on `jax.default_backend()`
-rather than the generation: attention's cuDNN and FlashAttention paths, CUDA
-kernels and not Pallas ones, take their CPU path here.
+A choice keyed on the platform reads `generation.backend()`, the assumed
+generation's platform, and takes the GPU's path here. Three still read
+`jax.default_backend()`, so the dry run cannot see their GPU path:
+attention's cuDNN (`cudnn_runs`) and FlashAttention (`flash_refusal`) calls,
+CUDA kernels and not Pallas ones, whose trace asks the CUDA plugin for
+versions and libraries a CPU host lacks, so attention traces its XLA path;
+and the gated delta rule's explicit 'pallas' on a CPU
+(dew.nn.linear's `chunk_states_kernel` and `fla_refusal`), which places the
+kernel interpreted where a GPU below sm80 would refuse it. `auto` never asks
+for that.
 """
 
 from __future__ import annotations
