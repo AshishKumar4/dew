@@ -16,6 +16,8 @@ import pytest
 from dew.nn.kernels import fla_gdn
 from dew.nn.linear import GatedDeltaNet, chunk_gated_delta_rule, fla_refusal, l2norm
 
+pytestmark = pytest.mark.kernel
+
 INTERPRETED = jax.default_backend() != "gpu"
 
 
