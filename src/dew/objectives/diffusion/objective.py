@@ -284,36 +284,6 @@ class DiffusionObjective(Objective[Ratio]):
 
     counts_tokens = False
 
-    @property
-    def counts_work(self) -> bool:
-        """Only a denoiser whose complete configured work is declared supplies MFU."""
-        if self._missing_flops(self.model) is not None:
-            return False
-        batch = {self.inputs.sample.key: np.empty((1,)), **self.inputs.tokenize([""])}
-        try:
-            self.training_flops(None, batch)
-        except MissingFlopsCount:
-            return False
-        return True
-
-    def _missing_flops(self, model) -> str | None:
-        """Keep telemetry availability and an explicit count's refusal in agreement."""
-        if not isinstance(model, CountedImages | CountedSequences | CountedMultimodal
-                          | CountedSpatial | CountedVideo):
-            return f"{type(model).__name__} has no declared image_flops geometry"
-        if type(self) is not DiffusionObjective or self.alignment is not None or self.end_to_end is not None:
-            return f"{type(self).__name__} needs counts for its additional forwards and heads"
-        if self.autoencoder is not None or self.uncertainty is not None:
-            return "DiffusionObjective needs auxiliary autoencoder/uncertainty work"
-        if len(self.inputs.conditions) > 1:
-            return "DiffusionObjective needs the composition of multiple condition geometries"
-        for condition in self.inputs.conditions.values():
-            if not isinstance(condition.encoder, CountedCondition):
-                return f"{type(condition.encoder).__name__} does not declare conditioning_flops(tokens)"
-        if isinstance(model, RequiresText) and not self.inputs.conditions:
-            return f"{type(model).__name__} needs real text context lengths"
-        return None
-
     def real_lengths(self, batch: Batch) -> np.ndarray:
         """The denoiser's real patch-token lengths from the objective's latent shape."""
         rows = np.shape(batch[self.inputs.sample.key])[0]
@@ -327,11 +297,23 @@ class DiffusionObjective(Objective[Ratio]):
     def model_flops(self, model, batch: Batch) -> float:
         """Assemble the denoiser's patch/time/text projections and its layers."""
         model = self.model if model is None else model
-        missing = self._missing_flops(model)
-        if missing is not None:
-            raise MissingFlopsCount(missing)
-        conditions = [condition.encoder.conditioning_flops(batch[condition.field])
-                      for condition in self.inputs.conditions.values()]
+        if not isinstance(model, CountedImages | CountedSequences | CountedMultimodal
+                          | CountedSpatial | CountedVideo):
+            raise MissingFlopsCount(f"{type(model).__name__} has no declared image_flops geometry")
+        if type(self) is not DiffusionObjective or self.alignment is not None or self.end_to_end is not None:
+            raise MissingFlopsCount(f"{type(self).__name__} needs counts for its additional forwards and heads")
+        if self.autoencoder is not None or self.uncertainty is not None:
+            raise MissingFlopsCount("DiffusionObjective needs auxiliary autoencoder/uncertainty work")
+        if len(self.inputs.conditions) > 1:
+            raise MissingFlopsCount("DiffusionObjective needs the composition of multiple condition geometries")
+        if isinstance(model, RequiresText) and not self.inputs.conditions:
+            raise MissingFlopsCount(f"{type(model).__name__} needs real text context lengths")
+        conditions = []
+        for condition in self.inputs.conditions.values():
+            encoder = condition.encoder
+            if not isinstance(encoder, CountedCondition):
+                raise MissingFlopsCount(f"{type(encoder).__name__} does not declare conditioning_flops(tokens)")
+            conditions.append(encoder.conditioning_flops(batch[condition.field]))
         encoded = sum(condition.flops for condition in conditions)
         context = None if not conditions else conditions[0].lengths
         features = None if not conditions else conditions[0].features
