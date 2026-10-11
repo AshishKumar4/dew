@@ -239,11 +239,46 @@ def test_the_peak_is_dews_dense_bf16_figure_for_a_named_device(tmp_path):
     assert attribute.main(command) == 0
     time = json.loads(out.read_text())["time"]
     assert time["peak_gflops"] == 500e3 and time["peak_source"].startswith("dew.telemetry.peaks")
-    assert time["mfu_of_device_time"] == 0.5
+    assert time["mfu_bf16_of_device_time"] == time["mfu_mixed_of_device_time"] == 0.5
+    assert time["bf16_equiv_throughput_tflops"] == 250.0
     entry.write_text(json.dumps({"model_flops_per_step": 2.5e11}))
     assert attribute.main(command) == 0
     time = json.loads(out.read_text())["time"]
     assert time["peak_source"] == "no device named" and time["xprof_peak_gflops"] == 3742430.0
-    assert (time["peak_gflops"], time.get("mfu_of_device_time"), time["gemm_lost_ms"],
-            time["gemm_fraction_of_peak"]) == (None, None, None, None)
+    assert (time["peak_gflops"], time["mfu_bf16_of_device_time"], time["mfu_mixed_of_device_time"],
+            time["gemm_lost_ms"], time["gemm_fraction_of_peak"]) == (None, None, None, None, None)
     assert time["device_ms_per_step"] == 1.0
+
+
+def test_an_fp8_gemm_counts_against_its_own_peak(tmp_path, monkeypatch):
+    """With an FP8 GEMM in the step, mfu_bf16 is a bf16-equivalent throughput, and mfu_mixed takes
+    that GEMM's FLOPs over the FP8 peak; with no FP8 peak for the device, mfu_mixed is unknown."""
+    from dew.telemetry import peaks
+
+    reports = tmp_path / "profile" / "capture-a" / "reports"
+    reports.mkdir(parents=True)
+    columns = ["program_id", "category", "hlo_op_name", "hlo_op_expression", "tf_op_name", "occurrences",
+               "total_self_time", "source_info", "normalized_flop_rate"]
+    cells = [("15", "custom-call", "custom-call.1", '%custom-call.1 = bf16[8,8]{1,0} custom-call('
+              'f8e4m3fn[8,8]{1,0} %a, f8e4m3fn[8,8]{1,0} %b), custom_call_target="__cublas$lt$matmul$f8"',
+              "jit(step)/dot_general", "1", 1000.0, "", 1.0e5),
+             ("15", "custom-call", "custom-call.2", '%custom-call.2 = bf16[8,8]{1,0} custom-call('
+              'bf16[8,8]{1,0} %a, bf16[8,8]{1,0} %b), custom_call_target="__cublas$gemm"',
+              "jit(step)/dot_general", "1", 1000.0, "", 1.0e5)]
+    rows = [{"c": [{"v": v} for v in row]} for row in cells]
+    (reports / "hlo_stats.json").write_text(json.dumps([{"cols": [{"id": name} for name in columns],
+                                                         "rows": rows}]))
+    (reports / "roofline_model.json").write_text(json.dumps({"p": {"peak_flop_rate": 3742430.0}}))
+    entry = tmp_path / "entry.json"
+    entry.write_text(json.dumps({"model_flops_per_step": 2e11, "device": "NVIDIA RTX PRO 6000 Blackwell"}))
+    out = tmp_path / "attribution.json"
+    command = ["--trace", str(tmp_path / "profile"), "--out", str(out), "--entry", str(entry)]
+    assert attribute.main(command) == 0
+    time = json.loads(out.read_text())["time"]
+    # 1e5 GFLOP/s for 1 ms is 1e11 FLOPs on FP8 of the 2e11 the model does, over 2 ms.
+    assert time["fp8_gemm_flops_per_step"] == 1e11 and time["mfu_mixed_of_device_time"] is None
+    assert time["mfu_bf16_of_device_time"] == 0.2 and time["bf16_equiv_throughput_tflops"] == 100.0
+    monkeypatch.setitem(peaks.PEAK_FP8_FLOPS_PER_DEVICE, "NVIDIA RTX PRO 6000 Blackwell", 1000e12)
+    assert attribute.main(command) == 0
+    # 1e11 / 5e14 + 1e11 / 1e15 over 2 ms.
+    assert json.loads(out.read_text())["time"]["mfu_mixed_of_device_time"] == 0.15
