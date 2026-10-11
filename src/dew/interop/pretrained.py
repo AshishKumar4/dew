@@ -976,8 +976,7 @@ def load_processor(source: str, model: nn.Module) -> Processor | None:
     media geometry again without loading the model's weights.
     """
     name, revision = split_revision(source)
-    directory = (Path(name) if os.path.isdir(name) else
-                 sources.snapshot(name, revision, weights=False))
+    directory = sources.snapshot(name, revision, weights=False)
     config, _ = _source_config(name, directory, revision, None)
     record = decoders.translate_wrapper_config(config)
     return source_processor(directory, config, record, model, source=source)
