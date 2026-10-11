@@ -1674,10 +1674,10 @@ def _publish(store: Store, data: bytes) -> dict:
     digest = hashlib.sha256(data).hexdigest()
     with contextlib.suppress(PreconditionFailed):
         store.put_if_absent(data)
-    found = store.read()
-    if len(found) != len(data) or hashlib.sha256(found).hexdigest() != digest:
+    found = store.get_versioned()
+    if len(found.data) != len(data) or hashlib.sha256(found.data).hexdigest() != digest:
         raise ValueError(f"immutable decision artifact differs: {store.url}")
-    return {"bytes": len(data), "sha256": digest}
+    return {"bytes": len(data), "sha256": digest, "etag": found.version}
 
 
 def _json(store: Store, value: dict) -> dict:
