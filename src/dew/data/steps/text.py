@@ -69,7 +69,7 @@ class Chunks:
             {
                 key: value[start : start + self.length] if key in self.fields else value
                 for key, value in element.items()
-            }
+            } | {"_dew_length": min(self.length, count - start)}
             for start in range(0, count, self.length)
         )
 
