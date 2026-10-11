@@ -1053,3 +1053,133 @@ def test_artifact_exclusions_ignore_ancestors_above_archive_root(tmp_path):
     assert set(sync.output_files(tree, ["out/"], "measurements", ["*dew*"])) == {"out/train.log"}
     with pytest.raises(ValueError, match="archive-relative"):
         sync.output_files(tree, ["out/"], "measurements", [str(tree / "out/*")])
+
+
+def test_live_prune_between_inventory_and_open_is_skipped_and_relisted(tmp_path, monkeypatch):
+    tree = tmp_path / "source"
+    disappearing = write(tree / "out/hlo/module.config.pbtxt", b"ephemeral")
+    durable = write(tree / "out/result.json", b"measured")
+    real = sync.pack_files
+
+    def prune(files, archive):
+        disappearing.unlink()
+        return real(files, archive)
+
+    monkeypatch.setattr(sync, "pack_files", prune)
+    packed = tmp_path / "delta.tar.gz"
+    current, count = sync.snapshot(tree, ["out/"], {}, packed)
+    assert count == 1 and set(current) == {"out/result.json"}
+    sync.apply_snapshot(packed, tmp_path / "retained", current)
+    assert (tmp_path / "retained/out/result.json").read_bytes() == durable.read_bytes()
+    monkeypatch.setattr(sync, "pack_files", real)
+    write(disappearing, b"recreated")
+    second, count = sync.snapshot(tree, ["out/"], current, packed)
+    assert count == 1 and "out/hlo/module.config.pbtxt" in second
+
+
+def test_prune_after_open_uses_the_opened_inode_not_its_vanished_path(tmp_path, monkeypatch):
+    file = write(tmp_path / "out/result.json", b"complete")
+    original = tarfile.TarFile.gettarinfo
+
+    def unlinked(packed, *args, **kwargs):
+        file.unlink()
+        return original(packed, *args, **kwargs)
+
+    monkeypatch.setattr(tarfile.TarFile, "gettarinfo", unlinked)
+    archive = tmp_path / "snapshot.tar.gz"
+    found = sync.pack_files({"out/result.json": file}, archive)
+    assert found == digests({"out/result.json": b"complete"})
+    sync.apply_snapshot(archive, tmp_path / "retained", found)
+    assert (tmp_path / "retained/out/result.json").read_bytes() == b"complete"
+
+
+def test_live_truncation_never_writes_a_partial_tar_member(tmp_path, monkeypatch):
+    file = write(tmp_path / "out/log", b"original content")
+    original = tarfile.TarFile.gettarinfo
+
+    def shortened(packed, *args, **kwargs):
+        info = original(packed, *args, **kwargs)
+        file.write_bytes(b"short")
+        return info
+
+    monkeypatch.setattr(tarfile.TarFile, "gettarinfo", shortened)
+    archive = tmp_path / "snapshot.tar.gz"
+    assert sync.pack_files({"out/log": file}, archive) == {}
+    with tarfile.open(archive) as packed:
+        assert packed.getnames() == []
+
+
+def test_named_training_roots_keep_tracking_but_exclude_weight_stores(tmp_path):
+    root = tmp_path / "out/timed/custom+experiment"
+    for name in ("run.json", "tracking/scalars.jsonl", "220/weights", "220/commit_success.txt",
+                 "220/_CHECKPOINT_METADATA", "221.tmp/weights", "frozen/weights"):
+        write(root / name)
+    write(tmp_path / "out/train.log")
+    found = sync.output_files(tmp_path, ["out/"], "measurements")
+    assert set(found) == {"out/timed/custom+experiment/run.json",
+                         "out/timed/custom+experiment/tracking/scalars.jsonl", "out/train.log"}
+    complete = sync.output_files(tmp_path, ["out/"], "all")
+    assert "out/timed/custom+experiment/220/weights" in complete
+    assert not any("221.tmp" in name for name in complete)
+
+
+def test_named_checkpoint_with_a_missing_member_is_not_restored(tmp_path):
+    members = {"out/named/run.json": b"config", "out/named/220/weights": b"weight",
+               "out/named/220/commit_success.txt": b"ok", "out/named/220/_CHECKPOINT_METADATA": b"metadata"}
+    for name, value in members.items():
+        write(tmp_path / "outputs" / name, value)
+    save(tmp_path / "manifest.json", digests(members))
+    (tmp_path / "outputs/out/named/220/weights").unlink()
+    packed = tmp_path / "resume.tar.gz"
+    sync.pack_retained(tmp_path, packed)
+    with tarfile.open(packed) as archive:
+        assert archive.getnames() == ["out/named/run.json"]
+
+
+def test_remote_snapshot_prune_error_is_retryable_not_a_session_failure(tmp_path):
+    class Kernel:
+        def execute_code(self, *args, **kwargs):
+            return [{"output_type": "error", "ename": "FileNotFoundError", "evalue": "pruned"}]
+
+        def stop(self, **kwargs):
+            return None
+
+    client = types.SimpleNamespace(kernel=lambda *args, **kwargs: Kernel())
+    driver = Driver(tmp_path / "run", client, "unused")
+    with pytest.raises(ops_driver.TransportError, match="re-list"):
+        driver.control(allocation.Session("owned", "https://fake.invalid/", "token"), "snapshot", live_read=True)
+    assert driver.state["action"] == "poll" and driver.state["results"] == []
+
+
+def test_emergency_out_measurements_survive_a_slow_batch_log(tmp_path, fake_vm, monkeypatch):
+    remote, _, session = fake_vm
+    write(remote / "content/out/result.json", b'{"exit":0}')
+    write(remote / "content/out/analysis/attribution.json", b'{"device_ms":4}')
+    write(remote / "content/batch/setup.log", b"slow log")
+    original = requests.get
+
+    def slow(url, **kwargs):
+        if url.endswith("setup.log"):
+            time.sleep(30)
+        return original(url, **kwargs)
+
+    monkeypatch.setattr(requests, "get", slow)
+    plan = {"driver_sha": "driver", "jobs": [{"index": 1, "outputs": ["/content/out/"]}]}
+    began = time.monotonic()
+    receipt = metadata_capture.capture(tmp_path / "run", plan, session, "/content/batch", seconds=1)
+    assert time.monotonic() - began < 3
+    assert {file["remote"] for file in receipt["files"]} == {
+        "/content/out/result.json", "/content/out/analysis/attribution.json"}
+    assert receipt["tiers"]["logs"]["timed_out"] and not receipt["tiers"]["measurements"]["timed_out"]
+
+
+def test_emergency_named_runs_exclude_checkpoints_and_capture_tracking_first(tmp_path, fake_vm):
+    remote, _, session = fake_vm
+    write(remote / "content/out/experiment/run.json", b"{}")
+    write(remote / "content/out/experiment/tracking/scalars.jsonl", b'{"step":52}')
+    write(remote / "content/out/experiment/220/weights.json", b"weights")
+    plan = {"driver_sha": "driver", "jobs": [{"index": 1, "outputs": ["/content/out/"]}]}
+    receipt = metadata_capture.capture(tmp_path / "run", plan, session, "/content/batch")
+    assert any("tracking/scalars.jsonl" in file["remote"] for file in receipt["files"])
+    assert not any("220/" in file["remote"] for file in receipt["files"])
+    assert all(file["tier"] == "measurements" for file in receipt["files"])
