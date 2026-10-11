@@ -66,7 +66,7 @@ _BLACKWELL = {"prepare_wy_repr_bwd": {"bk": 64, "bv": 64, "warps": 2, "stages": 
 
 
 def _table(name: str, target: generation.GpuTarget, dtype: str) -> dict:
-    wide = target.shared_limit >= generation.TARGETS["sm80"].shared_limit
+    wide = (target.shared_limit or 0) >= (generation.TARGETS["sm80"].shared_limit or 0)
     table = {("bfloat16", True): _SM80_BF16, ("float32", True): _SM80_FP32,
              ("bfloat16", False): _SMALL_BF16, ("float32", False): _SMALL_FP32}[dtype, wide]
     # fla's IS_NVIDIA_BLACKWELL: compute capability 10.x or 12.x.
