@@ -24,12 +24,13 @@ trainers keep one.
 
     python tools/reference_runs/diffusion.py --framework flaxdiff \\
         --flaxdiff-path <dir holding flaxdiff/> --data flowers.npz --init init.npz \\
-        --dtype bfloat16 --batch 64 --out flaxdiff-bf16.json
+        --dtype bfloat16 --batch 64 --work work.json --out flaxdiff-bf16.json
     python tools/reference_runs/diffusion.py --framework dew --data flowers.npz \\
-        --init init.npz --dtype bfloat16 --batch 64 --out dew-bf16.json
+        --init init.npz --dtype bfloat16 --batch 64 --work work.json --out dew-bf16.json
 """
 
 import argparse
+import dataclasses
 import json
 import sys
 import time
@@ -42,8 +43,8 @@ import numpy as np
 import optax
 from common import (
     TracedWindow,
+    WorkloadWork,
     attach_xplane_profile,
-    dit_train_flops_per_image,
     git_head,
     host,
     peak_flops,
@@ -69,6 +70,7 @@ def arguments() -> argparse.Namespace:
     parser.add_argument("--data", required=True)
     parser.add_argument("--init", required=True, help="the shared initial weights (npz)")
     parser.add_argument("--out", required=True)
+    parser.add_argument("--work", required=True, help="write native work on Dew; read it on flaxdiff")
     parser.add_argument("--dtype", choices=("bfloat16", "float32"), required=True)
     parser.add_argument("--attention", default=None,
                         help="attention kernel; unset is cudnn at bf16 and xla at fp32")
@@ -127,6 +129,7 @@ def solver(args, total: int) -> tuple[optax.GradientTransformation, optax.Schedu
 
 def flaxdiff_side(args, images, total, attention):
     """flaxdiff's trainer over its own mesh, with the draws read from the batch."""
+    work = WorkloadWork.read(args.work)
     sys.path.insert(0, args.flaxdiff_path)
     from flaxdiff.inputs import DiffusionInputConfig
     from flaxdiff.models.simple_dit import SimpleDiT
@@ -185,23 +188,39 @@ def flaxdiff_side(args, images, total, attention):
         from flaxdiff.utils import shard_batch
         return shard_batch(trainer.batch_sharding, batch)
 
-    return state, run, place, schedule, dict(trainer.mesh.shape), None
+    return state, run, place, schedule, dict(trainer.mesh.shape), None, work
+
+
+def counting_objective(shape: tuple[int, ...], dtype: str, attention: str):
+    """The denoiser and image geometry shared by training and host-only counting."""
+    from dew.diffusion.presets import EDM
+    from dew.inputs import Field, InputSpec
+    from dew.objectives.diffusion import DiffusionObjective
+    from dew.registry import models
+
+    model = models.build("simple_dit", {**MODEL, "dtype": dtype, "attention_impl": attention})
+    return DiffusionObjective(model, EDM(P_mean=-0.4, P_std=1.0), InputSpec(sample=Field("image", shape)),
+                              guidance=None)
 
 
 def dew_side(args, images, total, attention):
     """Dew's trainer over `MeshSpec`, with the draws read from the batch."""
-    from dew.diffusion.presets import EDM
+    from work import measure
+
     from dew.diffusion.schedules import expand
     from dew.diffusion.transforms import broadcast_rates
-    from dew.inputs import Field, InputSpec, unit_range
+    from dew.inputs import unit_range
     from dew.objectives.base import Aux, Ratio
     from dew.objectives.diffusion import DiffusionObjective
-    from dew.registry import models
     from dew.training import MeshSpec, Trainer
     from dew.training.distributed import batch_shardings
 
     class FixedDraws(DiffusionObjective):
         """Dew's `DiffusionObjective.loss`, the two draws read from the batch."""
+
+        def model_flops(self, model, batch):
+            """Fixed randomness changes no forward geometry from the counted objective."""
+            return counted.model_flops(model, batch)
 
         def loss(self, variables, batch, step):
             samples = unit_range(batch[self.inputs.sample.key])
@@ -214,10 +233,13 @@ def dew_side(args, images, total, attention):
             preds = self.process.prediction.pred_transform(noisy, preds, rates, t)
             losses = optax.l2_loss(preds, target)
             weights = expand(self.process.weight(t), losses)
-            return Ratio(jnp.sum(losses * weights),
-                        jnp.asarray(losses.size, jnp.promote_types(losses.dtype, jnp.float32))), Aux(metrics={})
+            total = jnp.asarray(losses.size, jnp.promote_types(losses.dtype, jnp.float32))
+            return Ratio(jnp.sum(losses * weights), total), Aux(metrics={})
 
-    model = models.build("simple_dit", {**MODEL, "dtype": args.dtype, "attention_impl": attention})
+    counted = counting_objective(images.shape[1:], args.dtype, attention)
+    model = counted.model
+    work = measure(counted, {"image": images[:args.batch]})
+    work.write(args.work)
     # The npz holds flaxdiff's whole variables dict, {"params": ...}. flaxdiff
     # keeps its Fourier table out of that dict, and its main branch draws it
     # from numpy's RandomState(42) (commit 63f2427), as Dew's init does, so
@@ -226,7 +248,7 @@ def dew_side(args, images, total, attention):
     constants = jax.tree.map(np.asarray, model.init(
         jax.random.key(0), jnp.zeros((1, *images.shape[1:])), jnp.zeros((1,)))["constants"])
     initial = {**load_tree(args.init), "constants": constants, "encoders": {}}
-    objective = FixedDraws(model, EDM(P_mean=-0.4, P_std=1.0), InputSpec(sample=Field("image", images.shape[1:])),
+    objective = FixedDraws(model, counted.process, counted.inputs,
                            ema_decay=args.ema, guidance=None, variables=initial)
     optimizer, schedule = solver(args, total)
     devices = jax.device_count()
@@ -248,7 +270,7 @@ def dew_side(args, images, total, attention):
         state, loss, _, _, _, _ = compiled["step"](state, batch)
         return state, loss
 
-    return state, run, place, schedule, dict(trainer.device_mesh.shape), trainer
+    return state, run, place, schedule, dict(trainer.device_mesh.shape), trainer, work
 
 
 def main() -> None:
@@ -267,7 +289,7 @@ def main() -> None:
     levels, noise = draws(args.seed, total, args.batch, images.shape[1:])
 
     side = flaxdiff_side if args.framework == "flaxdiff" else dew_side
-    state, run, place, schedule, mesh_shape, trainer = side(args, images, schedule_steps, attention)
+    state, run, place, schedule, mesh_shape, trainer, work = side(args, images, schedule_steps, attention)
 
     def batch(step: int):
         return place({"image": images[window_rows(order, step, args.batch)],
@@ -292,7 +314,7 @@ def main() -> None:
     devices = jax.device_count()
     timed = throughput(window_seconds, window.timed_steps, args.batch)
     timed["images_per_s"] = timed.pop("tokens_per_s")
-    flops_image = dit_train_flops_per_image(MODEL, *images.shape[1:])
+    flops_image = work.training_flops_per_step / work.examples_per_step
     peak_rate = peak_flops(device_kind)
     stats = [device.memory_stats() or {} for device in jax.local_devices()]
     record = {
@@ -314,8 +336,10 @@ def main() -> None:
         "throughput": timed,
         "first_step_seconds": first_step_seconds,
         "flops_per_image": flops_image,
+        "work": dataclasses.asdict(work),
         "hlo_flops_per_step": None if trainer is None else trainer.flops_per_step,
-        "mfu": None if peak_rate is None else flops_image * timed["images_per_s"] / (peak_rate * devices),
+        "mfu": None if peak_rate is None else work.training_flops_per_step * window.timed_steps
+            / window_seconds / (peak_rate * devices),
         "memory": {"peak_allocated_bytes": [int(s.get("peak_bytes_in_use", 0)) for s in stats]},
     }
     if args.profile_steps:
