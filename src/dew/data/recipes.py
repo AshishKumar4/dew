@@ -5,6 +5,7 @@ from __future__ import annotations
 import dataclasses
 import functools
 import hashlib
+import random
 from collections.abc import Callable, Mapping, Sequence
 from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
 
@@ -13,23 +14,25 @@ import numpy as np
 from dew.data.compile import compile
 from dew.data.dataset import Batch, Dataset, Loading
 from dew.data.dataset import Records as IndexedRecords
-from dew.data.pipeline import Artifact, HostStep, Mixture, ObjectiveData, Pipeline, RandomMap, Rejected, Stage
+from dew.data.pipeline import Artifact, Configured, HostStep, Mixture, ObjectiveData, Pipeline, RandomMap, Rejected, Stage
 from dew.records import integer
 
 if TYPE_CHECKING:
     from dew.data.cache import Cache, Generation
     from dew.data.sources.files import Format
 from dew.data.sources.base import Read, Shard, ShardManifest, Source
-from dew.data.steps.chat import PreferencePair, RenderChat, RenderPrompt
+from dew.data.steps.chat import ConfigurePrompt, PreferencePair, RenderChat, RenderPrompt
 from dew.data.steps.generic import Formatting
 from dew.data.steps.image import (
     AugmentationKey,
     Caption,
     ColorJitter,
+    ConfigureImage,
     DecodeImage,
     DeviceAugment,
     EncodeCaptions,
     Flip,
+    ImageRecord,
     RandomCrop,
     Resize,
 )
@@ -37,7 +40,7 @@ from dew.data.steps.text import Chunks, LengthPolicy, Tokenize
 from dew.data.steps.video import Audio, DecodeClip, FixedClip
 
 type SourceValue = Source | str | Sequence[Batch] | Mapping[str, Sequence]
-type Validation = HoldOut | Split | SourceValue | None
+type Validation = HoldOut | Split | Pipeline | SourceValue | None
 _DEFAULT_LOADING = Loading(workers="auto")
 
 
@@ -45,7 +48,9 @@ _DEFAULT_LOADING = Loading(workers="auto")
 class HoldOut:
     records: int | None = None
     fraction: float | None = None
-    by: Literal["index", "hash"] = "index"
+    by: Literal["index", "hash", "random"] = "index"
+    most: int | None = None
+    seed: int = 0
 
     def __post_init__(self) -> None:
         if (self.records is None) == (self.fraction is None):
@@ -157,6 +162,46 @@ class _SelectedRow:
         return self.rows[index]
 
 
+@dataclasses.dataclass(frozen=True)
+class _RandomSource:
+    source: Source
+    split: HoldOut
+    held: bool
+
+    def describe(self) -> str:
+        return f"{self.source.describe()} random holdout={self.split!r},held={self.held}"
+
+    def snapshot(self) -> Mapping[str, object]:
+        return {**self.source.snapshot(), "holdout": dataclasses.asdict(self.split), "held": self.held}
+
+    def supports(self, read: Read) -> bool:
+        return read != "streamed" and self.source.supports(read)
+
+    def _indices(self, count: int) -> tuple[int, ...]:
+        size = self.split.records if self.split.records is not None else int(count * (self.split.fraction or 0.))
+        size = min(size, self.split.most) if self.split.most is not None else size
+        order = list(range(count))
+        random.Random(self.split.seed).shuffle(order)
+        chosen = set(order[:size])
+        return tuple(index for index in range(count) if (index in chosen) == self.held)
+
+    def records(self, read: Read):
+        import grain.python as grain
+
+        rows = self.source.records(read)
+        return grain.MapDataset.source(self._indices(len(rows))).map(_SelectedRow(rows))
+
+    def metadata(self) -> Mapping[str, object]:
+        return self.source.metadata()
+
+    def lengths(self) -> np.ndarray | None:
+        lengths = self.source.lengths()
+        return None if lengths is None else lengths[list(self._indices(len(lengths)))]
+
+    def manifest(self) -> ShardManifest:
+        raise ValueError("random-index HoldOut needs indexed records; use by='hash' for streams")
+
+
 def _source(value: SourceValue, *, split: str = "train", format: Format | None = None) -> Source:
     from dew.data.sources import source
 
@@ -174,8 +219,13 @@ def _branches(
     source = _source(value, split=split, format=format)
     held: Source | None = None
     train = Pipeline(source, prefix)
+    if isinstance(validation, Pipeline):
+        return train, validation
     if isinstance(validation, HoldOut):
-        if validation.by == "hash":
+        if validation.by == "random":
+            train = Pipeline(_RandomSource(source, validation, held=False), prefix)
+            held = _RandomSource(source, validation, held=True)
+        elif validation.by == "hash":
             if validation.fraction is None:
                 raise ValueError("hash HoldOut needs fraction=")
             train = Pipeline(_HashSource(source, validation.fraction, held=False), prefix)
@@ -239,12 +289,12 @@ class Text:
         train, held = _branches(self.source, self.validation, split=self.split, prefix=prefix)
         if self.pack is None:
             train = train.windows(self.seq_len, stride=self.stride)
-            held = None if held is None else held.windows(self.seq_len)
+            held = None if held is None else held if isinstance(self.validation, Pipeline) else held.windows(self.seq_len)
         else:
             train = train.flat_map(Chunks(self.seq_len + 1)).pack(
                 self.seq_len + 1, bins=self.packing_bins, policy=self.pack
             )
-            held = (
+            held = self.validation if isinstance(self.validation, Pipeline) else (
                 None
                 if held is None
                 else held.flat_map(Chunks(self.seq_len + 1)).pack(
@@ -258,6 +308,10 @@ class Text:
         from dew.data.steps.windows import Documents, WindowSource
 
         held = self.validation
+        if isinstance(held, Split):
+            held = dataclasses.replace(stored, split=held.name)
+        elif isinstance(held, HoldOut):
+            raise ValueError("token-store validation uses its named split; slice a windows Pipeline for HoldOut")
         if held is None and stored.metadata().get("val_tokens", 0):
             held = dataclasses.replace(stored, split="val")
         sources = (stored, None if held is None else _source(held))
@@ -298,7 +352,7 @@ class Chat:
                 )
             return pipeline.pack(self.seq_len + 1, fields=("text", "text_roles"), bins=self.packing_bins)
 
-        return policy(train), None if held is None else policy(held), ()
+        return policy(train), None if held is None else held if isinstance(self.validation, Pipeline) else policy(held), ()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -307,19 +361,62 @@ class Prompts:
     tokenizer: str
     max_prompt_len: int = 256
     pad_id: int = 0
-    reward_bytes: int = 1024
+    reward_bytes: int | None = None
     long: Literal["drop", "truncate"] = "drop"
     thinking: bool | None = None
     validation: Validation = None
     split: str = "train"
 
     def pipelines(self) -> tuple[Pipeline, Pipeline | None, tuple[HostStep, ...]]:
-        step = RenderPrompt(
-            self.tokenizer, self.max_prompt_len, self.pad_id, self.reward_bytes, self.long, self.thinking
-        )
-        prefix = Pipeline(_source(self.source)).map(step).stages
-        train, held = _branches(self.source, self.validation, split=self.split, prefix=prefix)
+        source = _PromptFacts(_source(self.source, split=self.split), self.reward_bytes)
+        step = Configured(ConfigurePrompt(self.tokenizer, self.max_prompt_len, self.pad_id,
+                                         self.long, self.thinking), needs=("reward_bytes",))
+        prefix = Pipeline(source).map(step).stages
+        validation = self.validation
+        if validation is not None and not isinstance(validation, (HoldOut, Split, Pipeline)):
+            validation = _PromptFacts(_source(validation), self.reward_bytes)
+        train, held = _branches(source, validation, split=self.split, prefix=prefix)
         return train, held, ()
+
+
+@dataclasses.dataclass(frozen=True)
+class _PromptFacts:
+    source: Source
+    width: int | None
+
+    @functools.cached_property
+    def _measured(self) -> dict[str, int]:
+        return {}
+
+    def describe(self) -> str:
+        return self.source.describe()
+
+    def snapshot(self) -> Mapping[str, object]:
+        return self.source.snapshot()
+
+    def supports(self, read: Read) -> bool:
+        return self.source.supports(read)
+
+    def records(self, read: Read):
+        from dew.data.prompts import _ground_truth, _text
+
+        rows = self.source.records(read)
+        if read == "memory" and self.width is None and "reward_bytes" not in self._measured:
+            self._measured["reward_bytes"] = max(1, max((len(text.encode("utf-8"))
+                for index in range(len(rows)) for row in (rows[index],) if isinstance(row, Mapping)
+                for text in (_text(row.get("data_source")), _ground_truth(row, "prompt"),
+                             _text(row.get("extra_info")))), default=1))
+        return rows
+
+    def metadata(self) -> Mapping[str, object]:
+        return {**self.source.metadata(), **self._measured,
+                **({} if self.width is None else {"reward_bytes": self.width})}
+
+    def lengths(self) -> np.ndarray | None:
+        return self.source.lengths()
+
+    def manifest(self) -> ShardManifest:
+        return self.source.manifest()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -352,34 +449,35 @@ class Images:
     staging_size: int | None = None
     field: str = "image"
     caption: str | None = None
+    caption_templates: tuple[str, ...] = ()
+    caption_columns: tuple[str, ...] = ("caption", "text")
+    classes: tuple[str, ...] = ()
+    labels: str | None = None
     augment: Augment | None = dataclasses.field(default_factory=Augment)
     validation: Validation = None
     split: str = "train"
 
     def pipelines(self) -> tuple[Pipeline, Pipeline | None, tuple[HostStep, ...]]:
         size = self.staging_size or self.image_size
-        prefix = (
-            Pipeline(_source(self.source))
-            .map(DecodeImage(self.field, size), Resize(size), Caption(self.caption))
-            .stages
-        )
-        train, held = _branches(self.source, self.validation, split=self.split, prefix=prefix)
+        train, held = _branches(self.source, self.validation, split=self.split, prefix=())
         augment = self.augment
-        if augment is not None:
-            if augment.backend == "device":
-                train = train.random_map(AugmentationKey())
-                train = train.map_batch(DeviceAugment(self.image_size, augment.crop_scale,
-                                                       augment.flip, augment.jitter))
-            elif augment.crop or size != self.image_size or augment.crop_scale != (1.0, 1.0):
-                train = train.random_map(
-                    RandomCrop(self.image_size, augment.crop_scale, augment.flip, augment.jitter)
-                )
-            elif augment.jitter:
-                train = train.random_map(ColorJitter(augment.flip))
-            elif augment.flip:
-                train = train.random_map(Flip())
+        classes = self.classes
+        if self.labels is not None:
+            from dew.data.storage import Store
+
+            classes = tuple(Store(self.labels).read().decode().splitlines())
+        transform = ImageRecord(self.image_size, size, self.field, self.caption, self.caption_templates,
+                                self.caption_columns, classes, flip=augment is not None and augment.flip,
+                                jitter=augment is not None and augment.jitter,
+                                crop_scale=(1., 1.) if augment is None else augment.crop_scale,
+                                backend="host" if augment is None else augment.backend)
+        train = train.map(Configured(ConfigureImage(transform), needs=(), random=True))
+        if augment is not None and augment.backend == "device":
+            train = train.map_batch(DeviceAugment(self.image_size, augment.crop_scale, augment.flip, augment.jitter))
         if held is not None:
-            held = held.map(Resize(self.image_size))
+            evaluated = dataclasses.replace(transform, staging_size=self.image_size, backend="host",
+                                            flip=False, jitter=False, crop_scale=(1., 1.))
+            held = held.map(Configured(ConfigureImage(evaluated), needs=(), random=True))
         return train, held, (EncodeCaptions(),)
 
 @dataclasses.dataclass(frozen=True)
@@ -392,12 +490,18 @@ class Video:
     validation: Validation = None
     split: str = "train"
 
+    @property
+    def audio_seconds(self) -> float:
+        from dew.data.sources.av_utils import FPS
+
+        return (self.frames + 2 * self.audio_padding) / FPS
+
     def pipelines(self) -> tuple[Pipeline, Pipeline | None, tuple[HostStep, ...]]:
         train, held = _branches(self.source, self.validation, split=self.split, prefix=())
         audio = Audio(self.audio_model)
         decoder = DecodeClip(self.frames, self.frame_size, self.audio_padding, audio.processor.sampling_rate)
         train = train.random_map(decoder).map(audio)
-        held = None if held is None else held.map(FixedClip(decoder), audio)
+        held = None if held is None else held.random_map(decoder).map(audio)
         return train, held, (EncodeCaptions(),)
 
 
@@ -408,7 +512,8 @@ def load(
     read: Read = "indexed",
     provision: bool = False,
     cache: Cache | Generation | str | None = None,
-    objective: ObjectiveData | Callable[[Mapping[str, object]], ObjectiveData] | None = None,
+    validation_records: int | None = None,
+    objective: ObjectiveData | None = None,
     seed: int = 0,
     loading: Loading = _DEFAULT_LOADING,
     host: tuple[HostStep, ...] = (),
@@ -435,6 +540,8 @@ def load(
     if not isinstance(recipe, Recipe):
         raise TypeError("load expects a typed recipe with pipelines()")
     train, held, shared = recipe.pipelines()
+    if held is not None and validation_records is not None:
+        held = held.take(validation_records)
     if cache is not None:
         train = _cached(train, cache)
         held = None if held is None else _cached(held, cache)
@@ -458,7 +565,8 @@ def _ordered(pipeline: Pipeline, read: Read, seed: int) -> Pipeline:
         return dataclasses.replace(pipeline, source=dataclasses.replace(pipeline.source, pipelines=children))
     if read == "memory":
         at = next(
-            (index for index, stage in enumerate(pipeline.stages) if isinstance(stage, RandomMap)),
+            (index for index, stage in enumerate(pipeline.stages)
+             if isinstance(stage, RandomMap) or isinstance(stage, Configured) and stage.random),
             len(pipeline.stages),
         )
         order = Pipeline(pipeline.source).shuffle(seed).repeat().stages
@@ -477,7 +585,13 @@ def _ordered(pipeline: Pipeline, read: Read, seed: int) -> Pipeline:
 
 
 def _batched(pipeline: Pipeline, batch: int, *, train: bool) -> Pipeline:
-    from dew.data.pipeline import MapBatch
+    from dew.data.pipeline import BatchStage, MapBatch
+
+    stated = [stage.size for stage in pipeline.stages if isinstance(stage, BatchStage)]
+    if stated:
+        if stated != [batch]:
+            raise ValueError(f"pipeline batches {stated}, but load requested batch={batch}")
+        return pipeline
 
     at = next((index for index, stage in enumerate(pipeline.stages)
                if isinstance(stage, MapBatch)), len(pipeline.stages))
@@ -492,6 +606,7 @@ def _cached(pipeline: Pipeline, cache: Cache | Generation | str) -> Pipeline:
         children = tuple(_cached(child, cache) for child in pipeline.source.pipelines)
         return dataclasses.replace(pipeline, source=dataclasses.replace(pipeline.source, pipelines=children))
     at = next((index for index, stage in enumerate(pipeline.stages)
-               if isinstance(stage, (RandomMap, MapBatch, Pack, Windows))), len(pipeline.stages))
+               if isinstance(stage, (RandomMap, MapBatch, Pack, Windows))
+               or isinstance(stage, Configured) and stage.random), len(pipeline.stages))
     prefix = dataclasses.replace(pipeline, stages=pipeline.stages[:at]).cache(cache)
     return dataclasses.replace(prefix, stages=(*prefix.stages, *pipeline.stages[at:]))

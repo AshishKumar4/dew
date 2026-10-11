@@ -40,7 +40,7 @@ def test_decision_objective_data_matches_legacy_augmented_and_unaugmented_batche
                 for index in range(40)]
     objective = _objective(bucket)
     recipe = Decisions(examples, validation=examples[:5])
-    ours = load(recipe, batch=4, read="memory", objective=functools.partial(objective.data, None),
+    ours = load(recipe, batch=4, read="memory", objective=objective.data(),
                 seed=7, loading=READ)
     old = objective.dataset(examples, validation=examples[:5], batch=4, seed=7, loading=READ)
     _assert_batches(ours.train(DataPartition()), old.train(DataPartition()))
