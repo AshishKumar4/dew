@@ -178,6 +178,7 @@ def attribute_time(trace: Path, steps: int, model_flops: float | None,
     target = gpu_target(device) if device else None
     known = None if target is None else target.bf16_peak
     peak = known / 1e9 if known else None
+    fp8_peak = None if target is None or target.fp8_peak is None else target.fp8_peak / 1e9
     peak_source = (f"dew.nn.kernels.generation.gpu_target for {device}" if known
                    else f"unknown device: {device}" if device else "no device named")
     xprof_peak = float(roofline.get("p", {}).get("peak_flop_rate", 0) or 0) or None
@@ -203,7 +204,11 @@ def attribute_time(trace: Path, steps: int, model_flops: float | None,
         by_part[part][direction] += us
         by_kind[kind] += us
         by_part_kind[part][kind] += us
-        gflops = float(row.get("normalized_flop_rate") or row.get("model_flop_rate") or 0)
+        # The compiler's FLOPs over the measured time: the work done. XProf's normalized rate
+        # scales them by bf16's peak over the op's precision's, its own guess of that precision
+        # (an fp32 dot as non-tensor-core arithmetic, though it runs as TF32), which put the later Qwen3.5-0.8B step's
+        # GEMMs at 1.127 of the A100's peak.
+        gflops = float(row.get("model_flop_rate") or 0)
         record = {"us": round(us, 1), "part": part, "direction": direction, "kind": kind,
                   "hlo": row.get("hlo_op_name"), "framework": name[:200], "count": row.get("occurrences"),
                   "gflops": round(gflops, 1), "bound_by": row.get("bound_by"), "source": source}
@@ -213,17 +218,20 @@ def attribute_time(trace: Path, steps: int, model_flops: float | None,
             # Model FLOPs exclude remat's recompute, so an FP8 GEMM's recomputed copy is not charged.
             if record["precision"] == "fp8" and not (known is not None and known.recomputed):
                 fp8_gflop += gflops * us * 1e-6
-        if kind == "gemm" and peak:
-            record["lost_us"] = round(us * max(0.0, 1 - gflops / peak), 1)
-            gemms.append(record)
+            # Each GEMM against its own precision's peak, as mfu_mixed counts it.
+            limit = fp8_peak if record["precision"] == "fp8" else peak
+            if limit:
+                record["fraction_of_peak"] = round(gflops / limit, 3)
+                record["lost_us"] = round(us * max(0.0, 1 - gflops / limit), 1)
+                gemms.append(record)
         if kind == "layout":
             layouts.append(record)
     device_us = sum(by_kind.values())
     _, operations = report_table(reports / "framework_op_stats.json")
     idle_us = sum(float(row["total_self_time"]) for row in operations
                   if row.get("host_or_device") == "Device" and row.get("type") == "IDLE") / steps
-    gemm_us = by_kind.get("gemm", 0.0)
-    gemm_work = sum(record["us"] * record["gflops"] for record in gemms)
+    judged_us = sum(record["us"] for record in gemms)
+    judged = sum(record["us"] * record["fraction_of_peak"] for record in gemms)
     result = {
         "capture": str(capture), "steps": steps, "peak_gflops": peak, "peak_source": peak_source,
         "xprof_peak_gflops": xprof_peak, "step_program": step,
@@ -235,7 +243,7 @@ def attribute_time(trace: Path, steps: int, model_flops: float | None,
                        for part, directions in heaviest(by_part)},
         "by_kind_ms": ms(by_kind),
         "by_part_kind_ms": {part: ms(kinds) for part, kinds in heaviest(by_part_kind)},
-        "gemm_fraction_of_peak": round(gemm_work / gemm_us / peak, 3) if gemm_us and peak else None,
+        "gemm_fraction_of_peak": round(judged / judged_us, 3) if judged_us else None,
         "gemm_lost_ms": round(sum(record["lost_us"] for record in gemms) / 1e3, 3) if peak else None,
         "gemms_by_lost_time": sorted(gemms, key=lambda record: -record["lost_us"])[:25],
         "layout_moves": sorted(layouts, key=lambda record: -record["us"])[:25],
@@ -249,14 +257,13 @@ def attribute_time(trace: Path, steps: int, model_flops: float | None,
         # utilization, null where an FP8 GEMM runs on a device with no FP8 peak in Dew's table.
         seconds = device_us * 1e-6
         fp8 = fp8_gflop * 1e9
-        fp8_peak = None if target is None else target.fp8_peak
         result.update(model_flops_per_step=model_flops, fp8_gemm_flops_per_step=fp8,
                       bf16_equiv_throughput_tflops=round(model_flops / seconds / 1e12, 2))
         result["mfu_bf16_of_device_time"] = round(model_flops / seconds / (peak * 1e9), 4) if peak else None
         if peak and not fp8:
             result["mfu_mixed_of_device_time"] = result["mfu_bf16_of_device_time"]
         elif peak and fp8_peak and fp8 <= model_flops:
-            share = ((model_flops - fp8) / (peak * 1e9) + fp8 / fp8_peak) / seconds
+            share = ((model_flops - fp8) / (peak * 1e9) + fp8 / (fp8_peak * 1e9)) / seconds
             result["mfu_mixed_of_device_time"] = round(share, 4)
         else:
             result["mfu_mixed_of_device_time"] = None
