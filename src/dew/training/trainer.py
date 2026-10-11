@@ -32,7 +32,7 @@ import numpy as np
 import optax
 from flax import linen as nn
 from flax.training import dynamic_scale as dynamic_scale_lib
-from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+from jax.sharding import AbstractMesh, Mesh, NamedSharding, PartitionSpec as P
 from typing_extensions import TypeVar as DefaultTypeVar
 
 from dew.checkpoints import Checkpoints, Ranking
@@ -47,7 +47,7 @@ from dew.data.dataset import (
     stream_endless,
     stream_identity,
 )
-from dew.nn.kernels.generation import measured_kernel
+from dew.nn.kernels.generation import assumed, measured_kernel
 from dew.nn.sharding import (
     BATCH_AXES,
     SEQUENCE_AXIS,
@@ -96,6 +96,7 @@ from dew.telemetry.records import (
     Record,
     StepCompiled,
 )
+from dew.training._lowering import Lowered, gpu_mesh
 from dew.training.display import TrainingDisplay
 from dew.training.distributed import (
     DevicePrefetchIterator,
@@ -126,7 +127,14 @@ from dew.training.memory import (
     step_compiler_options,
     step_fits,
 )
-from dew.training.model_flops import FORWARD_FLOPS, TOKENS, model_batch, prepare_counts, step_counts
+from dew.training.model_flops import (
+    FORWARD_FLOPS,
+    TOKENS,
+    TRAINING_FLOPS,
+    model_batch,
+    prepare_counts,
+    step_counts,
+)
 from dew.training.narrow import narrowed, narrowed_paths
 from dew.training.rungs import keep_rung, recorded_rung
 from dew.training.runtime import Preempted, PreemptionNotice
@@ -447,6 +455,7 @@ class Trainer(Generic[Loss, Effects]):
         step: Callable[[Objective[Loss, Effects], optax.GradientTransformation], StepFn] | None = None,
         rollout: Rollout | None = None,
         profile: ProfileWindow | None = None,
+        lower_for: str | None = None,
     ):
         """Hold everything a run needs, without opening any of it.
 
@@ -459,7 +468,8 @@ class Trainer(Generic[Loss, Effects]):
         it. `step` replaces the built-in transaction. A custom step then owns the clocks, the
         scaler, the EMA and the mutable writes, and the compiled wrapper owns only the
         attempted-step counter. `rollout` runs once per batch read, before the step and outside
-        replay. `layout` and `mesh` say where the state lives.
+        replay. `layout` and `mesh` say where the state lives. `lower_for`, a CUDA generation, lowers
+        the first step for it in place of compiling it (`dew.training._lowering.Lowered`).
         """
         if accumulation < 1:
             raise ValueError(f"accumulation must be at least 1, got {accumulation}")
@@ -485,6 +495,7 @@ class Trainer(Generic[Loss, Effects]):
         self.step = step
         self.rollout = rollout
         self.profile = profile
+        self.lower_for = lower_for
         # Set by `compile`, for the batch shape it was called with. A ramped
         # run has one value per stage; `fit` keeps them beside each step. The
         # program is the step as handed to XLA, before GSPMD partitions it,
@@ -1010,13 +1021,15 @@ class Trainer(Generic[Loss, Effects]):
         return links
 
     @contextlib.contextmanager
-    def _traced_on(self, mesh: Mesh, links: Mapping[str, Link] | None = None) -> Iterator[Schedule]:
+    def _traced_on(self, mesh: Mesh | AbstractMesh,
+                   links: Mapping[str, Link] | None = None) -> Iterator[Schedule]:
         """What a traced step reads from context: the mesh, the pipeline's
         microbatch count, the layout's rules, which place the activations
         the model constrains (`dew.nn.sharding.constrain`) as they place the
         parameters, and the links of the axes the step measured, none by
-        default."""
-        with (jax.set_mesh(mesh), pipeline_microbatches(self.mesh.microbatches) as schedule,
+        default. An abstract mesh is a GPU's this process lacks (`_lowered_for`)."""
+        on = jax.sharding.use_abstract_mesh(mesh) if isinstance(mesh, AbstractMesh) else jax.set_mesh(mesh)
+        with (on, pipeline_microbatches(self.mesh.microbatches) as schedule,
               nn.logical_axis_rules(self.layout.axis_rules), measured_links({} if links is None else links)):
             yield schedule
 
@@ -1048,6 +1061,8 @@ class Trainer(Generic[Loss, Effects]):
             raise ValueError("checkpoint accumulation window_size differs from this trainer")
         if (state.scale is not None) != self.dynamic_scale:
             raise ValueError("checkpoint dynamic-scaler configuration differs from this trainer")
+        if self.lower_for is not None:
+            raise Lowered(self.lower_for, self._lowered_for(state, batch, self.lower_for))
         if self.host_master:
             return self._compile_host(state, batch)
         mesh = self.device_mesh
@@ -1055,14 +1070,7 @@ class Trainer(Generic[Loss, Effects]):
         shaped = self._at_base_rung(batch)
         resumed, self._resumed_rung = self._resumed_rung if shaped is None else shaped, None
         with self._traced_on(mesh, links) as schedule:
-            shapes = None if self.step is not None else self._loss_shape(state, batch)
-            if shapes is not None:
-                self._refuse_unpipelined(schedule)
-            prepared = self._initialize_accumulation(state, batch, shapes, shape_only=True)
-            copies = self._narrow_copies(state, batch)
-            if copies:
-                prepared = dataclasses.replace(prepared, compute=jax.eval_shape(
-                    lambda variables: narrowed(variables, copies), prepared.variables))
+            shapes, copies, prepared = self._prepared(state, batch, schedule)
             shardings = self.shardings(prepared)
             replicated = NamedSharding(mesh, P())
             placement = batch_shardings(mesh, batch)
@@ -1078,21 +1086,7 @@ class Trainer(Generic[Loss, Effects]):
             refusals: list[RuntimeError] = []
             consulted, record_path, key = False, None, {}
             while True:
-                body = self._step_body(shapes, copies)
-
-                def step(current, batch, body=body):
-                    # The body sees every field on the device; the out shardings
-                    # return the host-resident ones to pinned host memory.
-                    advanced, loss, aux, committed = body(self._fetched(current, shardings),
-                                                          model_batch(batch))
-                    return (dataclasses.replace(advanced, step=current.step + 1), loss,
-                            {**aux.metrics, **step_counts(batch)}, jnp.isfinite(loss),
-                            advanced.microstep > current.microstep, committed)
-
-                jitted = jax.jit(step, in_shardings=(shardings, placement),
-                                 out_shardings=(shardings, replicated, replicated, replicated,
-                                                replicated, replicated),
-                                 donate_argnums=0)
+                jitted = self._jitted(shapes, copies, shardings, placement, replicated)
                 self.program = jitted.lower(prepared, batch)
                 if not consulted:
                     consulted, before = True, self._rung()
@@ -1147,6 +1141,59 @@ class Trainer(Generic[Loss, Effects]):
                             current.variables))
                 return executable(current, batch)
         return run
+
+    def _prepared(self, state: TrainState, batch: Batch, schedule: Schedule):
+        """The loss's shapes (None under a custom step), the narrow copies and the state's shapes
+        with the accumulation and the copies the step builds, as the step traces them."""
+        shapes = None if self.step is not None else self._loss_shape(state, batch)
+        if shapes is not None:
+            self._refuse_unpipelined(schedule)
+        prepared = self._initialize_accumulation(state, batch, shapes, shape_only=True)
+        copies = self._narrow_copies(state, batch)
+        if copies:
+            prepared = dataclasses.replace(prepared, compute=jax.eval_shape(
+                lambda variables: narrowed(variables, copies), prepared.variables))
+        return shapes, copies, prepared
+
+    def _jitted(self, shapes, copies: dict, shardings: Placement[TrainState], placement,
+                replicated: NamedSharding):
+        """The transaction's step, or the custom one, which donates the state it is handed."""
+        body = self._step_body(shapes, copies)
+
+        def step(current, batch):
+            # The body sees every field on the device; the out shardings
+            # return the host-resident ones to pinned host memory.
+            advanced, loss, aux, committed = body(self._fetched(current, shardings), model_batch(batch))
+            return (dataclasses.replace(advanced, step=current.step + 1), loss,
+                    {**aux.metrics, **step_counts(batch)}, jnp.isfinite(loss),
+                    advanced.microstep > current.microstep, committed)
+
+        return jax.jit(step, in_shardings=(shardings, placement),
+                       out_shardings=(shardings, replicated, replicated, replicated, replicated, replicated),
+                       donate_argnums=0)
+
+    def _lowered_for(self, state: TrainState, batch: Batch, generation: str) -> jax.stages.Lowered:
+        """The step `compile` builds first, traced as on a GPU of the CUDA `generation` and lowered
+        for one (`dew.training._lowering`), on whatever devices this process has.
+
+        It traces on an abstract mesh of that GPU's devices, from which JAX's Pallas lowering reads the
+        GPU, at the base rung: a run that does not fit climbs to heavier remat, no other kernel. A
+        CPU-owned state's step realizes its parameters on the host as it runs, and is not lowered."""
+        if self.host_master:
+            raise ValueError("lower_for lowers a step whose state the devices hold; this layout keeps "
+                             "the variables on the host")
+        mesh = gpu_mesh(self.device_mesh, generation)
+        self._at_base_rung(batch)
+        with assumed(generation), self._traced_on(mesh) as schedule:
+            state, batch = jax.tree.map(lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype), (state, batch))
+            shapes, copies, prepared = self._prepared(state, batch, schedule)
+            shardings = jax.tree.map(lambda s: NamedSharding(mesh, s.spec, memory_kind=s.memory_kind),
+                                     self.shardings(prepared))
+            placement = batch_shardings(mesh, batch)
+            jitted = self._jitted(shapes, copies, shardings, placement, NamedSharding(mesh, P()))
+            placed = [jax.tree.map(lambda x, s: jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=s), tree, at)
+                      for tree, at in ((prepared, shardings), (batch, placement))]
+            return jitted.trace(*placed).lower(lowering_platforms=('cuda',))
 
     def _narrow_copies(self, state: TrainState, batch: Batch) -> dict:
         """The parameters the step reads through narrow copies
@@ -1542,7 +1589,8 @@ class Trainer(Generic[Loss, Effects]):
         the checkpoints, and the preemption notice. Returns whether the
         notice stops the run at this step, whose checkpoint is then written."""
         current, steps, checkpoints = run.current, plan.steps, self.checkpoints
-        aux = {name: value for name, value in aux.items() if name not in (FORWARD_FLOPS, TOKENS)}
+        aux = {name: value for name, value in aux.items()
+               if name not in (FORWARD_FLOPS, TRAINING_FLOPS, TOKENS)}
         run.training = {'train/loss': loss, **{f'train/{name}': value for name, value in aux.items()}}
         if current % plan.log_every == 0:
             interval.check_finite(current, self._display)
@@ -2152,8 +2200,8 @@ class Trainer(Generic[Loss, Effects]):
                 "loss": loss, "aux": aux, "accepted": accepted, "rate": rate,
                 "committed": None if interval.book is None else (interval.book.norms, interval.book.commits),
                 "scale": None if state.scale is None else state.scale.scale,
-                "model_flops": (interval.book.forward if interval.model_counted and interval.book is not None
-                                else None),
+                "training_flops": (interval.book.training
+                                   if interval.model_counted and interval.book is not None else None),
                 "tokens": (interval.book.tokens if interval.tokens_counted and interval.book is not None
                            else None),
                 "rollout": {} if self.rollout is None else dict(_rollout_metrics(self.rollout))})
@@ -2161,7 +2209,7 @@ class Trainer(Generic[Loss, Effects]):
                        **{f"train/{k}": float(v) for k, v in read["aux"].items()},
                        **self._throughput(now - interval.last_log_time, interval.since_log,
                                           interval.samples, interval.flops, waited=interval.waited,
-                                          compiling=interval.compiling, model_flops=read["model_flops"],
+                                          compiling=interval.compiling, training_flops=read["training_flops"],
                                           tokens=read["tokens"])}
             scalars["train/accepted"] = float(read["accepted"])
             if read['committed'] is not None:
@@ -2216,7 +2264,8 @@ class Trainer(Generic[Loss, Effects]):
                 error = failure
         try:
             outcome = FitEnded.outcome(time.perf_counter() - run.started, error,
-                                       preempted=run.preempted is not None)
+                                       preempted=run.preempted is not None,
+                                       lowered=isinstance(error, Lowered))
             self._report(outcome, run.current)
         except BaseException as failure:
             if error is None:
@@ -2336,13 +2385,14 @@ class Trainer(Generic[Loss, Effects]):
 
     def _throughput(self, elapsed: float, steps: int, samples: int, flops: StepFlops | None, *,
                     waited: float = 0.0, compiling: float = 0.0,
-                    model_flops: float | None = None, tokens: float | None = None) -> dict[str, float]:
+                    training_flops: float | None = None, tokens: float | None = None) -> dict[str, float]:
         """Compute the interval's rates from the records it read and its FLOPs.
 
         The FLOPs are the ones the compiler measured for each step's own
         shape; `flops` is None when a shape's measurement was unavailable.
-        train/mfu is three times the objective's analytical forward work on
-        real rows, over the whole mesh's peak. train/hfu keeps hardware HLO
+        train/mfu is the objective's analytical training work on real rows,
+        over the whole mesh's peak: 3*forward for full FT, explicit frozen/
+        trainable matrix work for PEFT. train/hfu keeps hardware HLO
         work including remat; train/hlo_flops_util is the former HLO model
         count with recomputation removed. No HLO count substitutes for MFU.
 
@@ -2368,8 +2418,8 @@ class Trainer(Generic[Loss, Effects]):
         if tokens is not None:
             scalars["train/tokens"] = float(tokens) / steps
             scalars["train/tokens_per_s"] = float(tokens) / stepping
-        if model_flops is not None:
-            per_device = 3 * float(model_flops) / self.device_mesh.devices.size
+        if training_flops is not None:
+            per_device = float(training_flops) / self.device_mesh.devices.size
             utilization = model_flops_utilization(per_device / steps, step_time)
             if utilization is not None:
                 scalars["train/mfu"] = utilization

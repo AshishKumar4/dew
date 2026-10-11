@@ -7,7 +7,7 @@ import numpy as np
 from flax import linen as nn
 
 from ..dit import ROPE_THETA, ModulatedBlock, _DiTStackOptions, remat_block, rope_for_scan
-from ..flops import MissingFlopsCount, counted_flops, projection_flops, real_lengths
+from ..flops import MissingFlopsCount, counted_flops
 from ..precision import at_least_fp32
 from ..rope import rotary_freqs
 
@@ -71,27 +71,17 @@ class SimpleDiT(_DiTStackOptions):
     @nn.nowrap
     def image_flops(self, lengths, input_channels: int, text_features: int | None = None) -> float:
         """Every matmul, including patch/time/text input maps; only lookups excluded."""
-        real_lengths(lengths)
-        channels, hidden = self.patch_size**2 * input_channels, self.emb_features
-        bottleneck = self.patch_bottleneck
-        total = projection_flops(lengths, channels, bottleneck or hidden)
-        if bottleneck is not None:
-            total += projection_flops(lengths, bottleneck, hidden)
-        rows = np.ones(np.shape(lengths), np.int64)
-        # Fourier signals have no matmul. TimeProjection has TWO maps,
-        # width -> r*width -> r*width, followed by the final r*width -> width.
-        expanded = self.mlp_ratio * hidden
-        total += (1 + self.interval) * (2 * projection_flops(rows, hidden, expanded)
-                                      + projection_flops(rows, expanded, expanded))
-        if text_features is not None:
-            total += projection_flops(rows, text_features, hidden)
+        embed = self._embedding(self.patch_size, self.emb_features, bottleneck=self.patch_bottleneck)
+        condition = self._conditioning(self.emb_features, interval=self.interval)
+        total = embed.model_flops(lengths, input_channels) + condition.model_flops(lengths, text_features)
         for index, block in enumerate(self.counted_blocks()):
             active = np.asarray(lengths)
             for ratio, start, end in self.checked_routes():
                 if start <= index <= end:
                     active = active - np.floor(active * ratio).astype(np.int64)
             total += counted_flops(block, active)
-        return total + projection_flops(lengths, self.emb_features, self.patch_size**2 * self.output_channels)
+        return total + self._output(self.patch_size, self.output_channels).model_flops(
+            lengths, self.emb_features)
 
 
     def setup(self):

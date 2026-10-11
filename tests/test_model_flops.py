@@ -59,7 +59,7 @@ from dew.telemetry.instrumentation import StepFlops
 from dew.training import MeshSpec
 from dew.training.distributed import DevicePrefetchIterator
 from dew.training.interval import Interval
-from dew.training.model_flops import FORWARD_FLOPS, TOKENS, prepare_counts, step_counts
+from dew.training.model_flops import FORWARD_FLOPS, TOKENS, TRAINING_FLOPS, prepare_counts, step_counts
 
 LENGTHS = np.asarray([2, 5], np.int64)
 
@@ -290,12 +290,13 @@ def test_interval_accumulates_work_with_its_loss_and_resets_only_at_logs():
     for forward, tokens in ((100, 4), (200, 3)):
         interval.count({"rows": np.ones((2, 1))}, StepFlops(10, 20), loss,
                         jnp.asarray(a=True), None, {FORWARD_FLOPS: jnp.asarray(forward),
+                                                   TRAINING_FLOPS: jnp.asarray(3 * forward),
                                                    TOKENS: jnp.asarray(tokens)})
-    np.testing.assert_array_equal(np.asarray([interval.book.forward, interval.book.tokens]), [300, 7])
+    np.testing.assert_array_equal(np.asarray([interval.book.training, interval.book.tokens]), [900, 7])
     interval.saved(2)
-    np.testing.assert_array_equal(np.asarray([interval.book.forward, interval.book.tokens]), [300, 7])
+    np.testing.assert_array_equal(np.asarray([interval.book.training, interval.book.tokens]), [900, 7])
     interval.logged(3.0)
-    np.testing.assert_array_equal(np.asarray([interval.book.forward, interval.book.tokens]), [0, 0])
+    np.testing.assert_array_equal(np.asarray([interval.book.training, interval.book.tokens]), [0, 0])
     assert not interval.model_counted and not interval.tokens_counted
 
 
@@ -343,7 +344,7 @@ def jaxpr_products(graph, *, state_mac=False):
                 for operand in equation.invars:
                     if np.issubdtype(operand.aval.dtype, np.floating):
                         factor = 4
-                    source = producers.get(operand)
+                    source = producer(producers, operand)
                     if source is not None and source.primitive.name == "convert_element_type" and (
                             np.issubdtype(source.invars[0].aval.dtype, np.floating)):
                         factor = 4  # Real input against complex weights.
@@ -359,7 +360,7 @@ def jaxpr_products(graph, *, state_mac=False):
             total += (2 * np.prod(equation.outvars[0].aval.shape, dtype=np.int64)
                       * np.prod([kernel[axis] for axis in dims[1:]], dtype=np.int64))
         elif state_mac and primitive == "reduce_sum":
-            product = producers.get(equation.invars[0])
+            product = producer(producers, equation.invars[0])
             if product is not None and product.primitive.name == "mul":
                 total += 2 * np.prod(product.outvars[0].aval.shape, dtype=np.int64)
         elif primitive == "mul" and convolution_tap(equation, producers):
@@ -376,6 +377,11 @@ def jaxpr_products(graph, *, state_mac=False):
     return total
 
 
+def producer(producers, variable):
+    """Scalar constants have no producer and Literal is intentionally unhashable."""
+    return None if isinstance(variable, jaxpr_core.Literal) else producers.get(variable)
+
+
 def convolution_tap(equation, producers):
     """The explicit depthwise conv's [D,K] column times a shifted [B,D,T].
 
@@ -388,9 +394,9 @@ def convolution_tap(equation, producers):
     for variable in equation.invars:
         if isinstance(variable, jaxpr_core.Literal):
             continue
-        source = producers.get(variable)
+        source = producer(producers, variable)
         while source is not None and source.primitive.name in ("broadcast_in_dim", "convert_element_type"):
-            source = producers.get(source.invars[0])
+            source = producer(producers, source.invars[0])
         if source is not None and source.primitive.name == "slice":
             original, selected = source.invars[0].aval.shape, source.outvars[0].aval.shape
             if len(original) == 2 and original[1] > 1 and selected == (original[0], 1):
@@ -509,10 +515,10 @@ def test_microbatches_two_sum_real_tokens_before_interval_throughput():
         aux = step_counts(jax.tree.map(jnp.asarray, counted))
         interval.count(counted, StepFlops(10, 20), jnp.asarray(1.0), jnp.asarray(a=True), None, aux)
     trainer = Trainer(objective, optax.sgd(0.01), key=0, accumulation=2)
-    totals = np.asarray([interval.book.forward, interval.book.tokens])
+    totals = np.asarray([interval.book.training, interval.book.tokens])
     assert totals[1] == 8
     metrics = trainer._throughput(2, 2, 2, interval.flops,
-                                  model_flops=float(totals[0]), tokens=float(totals[1]))
+                                  training_flops=float(totals[0]), tokens=float(totals[1]))
     assert metrics["train/tokens"] * 2 == 8
     assert metrics["train/tokens_per_s"] == 4
 

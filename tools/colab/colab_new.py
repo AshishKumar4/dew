@@ -39,6 +39,7 @@ class Colab:
         return Session(endpoint, info.url, info.token)
 
     def allocate(self, session_name: str, hardware: str, high_mem: bool, journal: Path) -> str:
+        validate_shape(hardware, high_mem)
         session_name = name(session_name)
         with lock(STATE / "colab-allocation.lock"):
             held = self.assignments()
@@ -56,7 +57,11 @@ class Colab:
                 "requested_at": time.time(),
             }
             save(journal, request)
-            response = self._assign(request)
+            try:
+                response = self._assign(request)
+            except Exception:
+                save(journal, request)
+                raise
             self._store(session_name, response, variant, accelerator, shape)
             request.update(endpoint=response.endpoint, assigned_at=time.time())
             save(journal, request)
@@ -71,6 +76,18 @@ class Colab:
                 if attempt == 11:
                     raise
                 time.sleep(5)
+            except self.types.ColabRequestError as error:
+                # colab_cli.client.Client.assign GETs before any POST; re-audit
+                # this proof if a client upgrade changes that order. Only the
+                # first GET proves no POST; earlier timeouts remain ambiguous.
+                if (
+                    attempt == 0
+                    and getattr(error.request, "method", None) == "GET"
+                    and getattr(error.response, "status_code", None) == 400
+                ):
+                    request["allocation_rejected_at"] = time.time()
+                    request["allocation_rejection"] = {"method": "GET", "http_status": 400}
+                raise
         raise AssertionError("allocation retries exhausted")
 
     def _options(self, request: dict) -> dict:
@@ -86,7 +103,13 @@ class Colab:
             return None
         if request.get("endpoint"):
             return request["endpoint"]
-        assigned = self.state.client._get_assignment(uuid.UUID(request["notebook"]), **self._options(request))
+        options = self._options(request)
+        if request["accelerator"] == "G4" and request.get("shape") == "HIGH_RAM":
+            # Legacy requests can contain this unsupported shape. Lookup is a
+            # read-only GET of the owned UUID, not a new allocation; retain the
+            # original journal and omit only the invalid selector from the query.
+            options["shape"] = None
+        assigned = self.state.client._get_assignment(uuid.UUID(request["notebook"]), **options)
         return getattr(assigned, "endpoint", None)
 
     def _store(self, session_name, response, variant, accelerator, shape):
@@ -118,3 +141,19 @@ class Colab:
     def kernel(self, session: Session, **kwargs):
         runtime = importlib.import_module("colab_cli.runtime").ColabRuntime
         return runtime(session.url, session.token, **kwargs)
+
+
+def validate_shape(hardware: str, high_mem: bool) -> None:
+    if hardware == "gpu:G4" and high_mem:
+        raise ValueError("gpu:G4 already has 96GB VRAM; its high-memory shape is unsupported")
+
+
+def no_assignment_acquired(allocation: dict, driver: dict) -> bool:
+    rejected = allocation.get("allocation_rejected_at")
+    return (
+        allocation.get("allocation_rejection") == {"method": "GET", "http_status": 400}
+        and isinstance(rejected, (float, int))
+        and not isinstance(rejected, bool)
+        and 0 < rejected < float("inf")
+        and not any(key in record for record in (allocation, driver) for key in ("endpoint", "assigned_at"))
+    )

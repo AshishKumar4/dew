@@ -13,6 +13,7 @@ inside functions. `colab_batch.plan_jobs` requires the receipt this writes.
 
 import argparse
 import ast
+import contextlib
 import hashlib
 import json
 import os
@@ -21,6 +22,9 @@ import shlex
 import subprocess
 import sys
 import tempfile
+import urllib.error
+import urllib.request
+from collections.abc import Sequence
 from pathlib import Path
 
 from tools.colab.common import REPO, VENV_PYTHON, git
@@ -582,13 +586,16 @@ def preflight(args: argparse.Namespace, work: Path) -> dict:
             texts[item.name] = data.decode()
     found = shell(args.command, texts)
     failures = list(found["failures"])
+    # A ref beside the job's own reaches the VM only through the entry's `refs:` (colab_batch adds
+    # them to the commits it fetches): a checkout of any other one fails there, and silently in a
+    # script that runs on (c58's fallback).
+    declared = {resolved(ref, args.origin): ref for ref in args.also}
+    receipt["refs"] = sorted(declared)
     for ref in found["checkouts"]:
-        try:
-            target = git(REPO, "rev-parse", f"{ref}^{{commit}}")
-        except RuntimeError:
-            target = ref
-        if target != commit:
-            failures.append(f"a script checks out {ref}, not the preflighted {commit}")
+        target = resolved(ref, args.origin)
+        if target != commit and target not in declared:
+            failures.append(f"a script checks out {ref}, which is neither the preflighted {commit} "
+                            "nor a declared --also ref")
     targets = set(found["interpreters"]) or {"system"}
     if len(targets) > 1:
         failures.append("pins go to both the system Python and the job's venv; preflight one interpreter")
@@ -625,6 +632,22 @@ def preflight(args: argparse.Namespace, work: Path) -> dict:
             failures.append(f"{label(chain)}: {detail}")
     failures += static.closure({chain["module"] for chain in other if top(chain) in static.scope}, bound)
     receipt.update(static={name: failed[name] for name in sorted(static.scope)}, guarded=static.guarded)
+    failures += hazards(texts, args.command)
+    unverified: list[str] = []
+    explicit = explicit_pallas(texts, args.command)
+    receipt["kernel_lab"] = lab = lab_verified(tree, args.hardware, unverified, explicit)
+    missing = bool(unverified) and "digest" in lab and "record" not in lab
+    if missing and lab_session(found, texts, args.command):
+        lab["bootstrap"] = "this session produces the record"
+    elif missing and (gate := runtime_gate(texts, args.command)) is not None:
+        lab["gated_at_runtime"] = gate
+    else:
+        failures += unverified
+    sites = trains(texts, args.command) or runs_dew(chains)
+    receipt["lowered"] = lowered(tree, args.hardware, args.dew_python, sites,
+                                 lowering_env(texts, args.command), failures, geometry(texts, args.command))
+
+    receipt["lowered"].update(unlowered(lab.get("pallas", [])))
     receipt["accepted"], failures = accept(failures, args.accept)
     receipt.update(checked=len(chains), failures=failures, ok=not failures)
     return receipt
@@ -702,6 +725,308 @@ def top(chain: dict) -> str:
     return chain["module"].split(".")[0]
 
 
+def resolved(ref: str, origin: str) -> str:
+    """`ref` as a commit of this clone, fetched from `origin` if it lacks it; `ref` itself if it
+    names none."""
+
+    def known() -> bool:
+        return subprocess.run(["git", "-C", str(REPO), "cat-file", "-e", f"{ref}^{{commit}}"],
+                              capture_output=True, check=False).returncode == 0
+
+    if not known():
+        subprocess.run(["git", "-C", str(REPO), "fetch", "-q", origin, ref], capture_output=True, check=False)
+    return git(REPO, "rev-parse", f"{ref}^{{commit}}") if known() else ref
+
+
+GENERATIONS = {"gpu:T4": "sm75", "gpu:L4": "sm89", "gpu:A100": "sm80", "gpu:G4": "sm120"}
+LAB_GPUS = {"gpu:A100": "a100", "gpu:G4": "g4", "gpu:L4": "l4", "gpu:T4": "t4"}
+STORE_CONFIG = Path.home() / ".config/dew/dew-data.json"
+
+
+def kernel_digest(tree: Path) -> str:
+    """The content of Dew's kernels and of every source file that calls them, at `tree`, and the
+    jax and jaxlib its constraints pin, whose Triton lowering is half of a kernel's fate: a ref's
+    kernels are the kernel lab's verified ones exactly when this matches the lab's record."""
+    source = tree / "src" / "dew"
+    calls = re.compile(r"(?:from|import)\s+(?:dew\.nn\.)?(?:\.+)?kernels\b|dew\.nn\.kernels")
+    files = sorted(path for path in source.rglob("*.py")
+                   if "kernels" in path.relative_to(source).parts or calls.search(path.read_text()))
+    digest = hashlib.sha256()
+    for path in files:
+        digest.update(str(path.relative_to(tree)).encode() + b"\0" + path.read_bytes() + b"\0")
+    constraints = tree / "constraints.txt"
+    pinned = constraints.read_text() if constraints.exists() else ""
+    pins = re.findall(r"^(?:jax|jaxlib|jax-cuda\d+-\w+)==\S+", pinned, re.M)
+    digest.update("\n".join(sorted(pins)).encode())
+    return digest.hexdigest()
+
+
+# An explicit Pallas choice in a staged script or the command, which `auto`'s KERNELS row does not see.
+EXPLICIT = re.compile(r"""(?:implementation|_impl)["']?\s*[=:]\s*["'](pallas|fla|triton)["']"""
+                      r"""|--[\w.-]*impl[\w.-]*[= ](pallas|fla|triton)\b""")
+
+
+def explicit_pallas(texts: dict[str, str], command: str) -> list[str]:
+    """Each site that asks for a Pallas implementation by name, as `file:line`."""
+    sites = []
+    for name, text in [("<command>", command), *texts.items()]:
+        for number, line in enumerate(text.splitlines(), 1):
+            if EXPLICIT.search(line):
+                sites.append(f"{name}:{number}")
+    return sites
+
+
+# Settings that break a GPU run whatever the code: each with what it breaks. A pattern matches the setting
+# made, `NAME=1`, `"NAME": "1"`, `environ["NAME"] = "1"` or `config.update("name", True)`, and not a line
+# that only names it, as a driver's note that it does not set it (c50_profile.py's).
+HAZARDS = {
+    re.compile(r"(?:JAX_EXPLAIN_CACHE_MISSES|jax_explain_cache_misses)[\"']?\]?\s*[:=,]"):
+        "JAX 0.11.2's cache-miss explainer crashes on Pallas-Triton lowerings that pass debug_info as "
+        "a keyword (partial_eval.explain -> diff_tracing_cache_keys): c58's and c57's runs died "
+        "before their first compile",
+}
+
+
+def hazards(texts: dict[str, str], command: str) -> list[str]:
+    """A failure for each known-bad setting a staged script or the command makes."""
+    return [f"{name}:{number} sets {match.group(0)}: {why}"
+            for name, text in [("<command>", command), *texts.items()]
+            for number, line in enumerate(text.splitlines(), 1)
+            for pattern, why in HAZARDS.items() if (match := pattern.search(line))]
+
+
+def lab_verified(tree: Path, hardware: str, failures: list[str], explicit: Sequence[str] = (),
+                 config: Path = STORE_CONFIG) -> dict:
+    """Where the ref's measured kernel choices on `hardware` name Pallas kernels, or a script asks for
+    one by name (`explicit`), the kernel lab's record that it compiled and ran them on that GPU,
+    kernels, their callers and the pinned JAX byte for byte: CPU interpretation cannot catch a
+    Triton lowering failure (c58, c57). None needed, none read."""
+    if not (tree / "src/dew/nn/kernels/generation.py").exists():
+        named = [f"explicit at {site}" for site in explicit]
+        return lab_record(tree, hardware, GENERATIONS[hardware], named, failures, config)
+    choices = subprocess.run(
+        [sys.executable, "-c", "import json; from dew.nn.kernels.generation import KERNELS; "
+         "print(json.dumps(KERNELS))"],
+        capture_output=True, text=True, env={**os.environ, "PYTHONPATH": str(tree / "src")}, cwd=tree,
+        timeout=300)
+    if choices.returncode:
+        failures.append(f"cannot read the ref's KERNELS: {choices.stderr[-300:]}")
+        return {}
+    from dew.nn.kernels.generation import PALLAS_CHOICES
+
+    generation = GENERATIONS[hardware]
+    named = sorted(f"{choice}={row[generation]}" for choice, row in json.loads(choices.stdout).items()
+                   if row.get(generation) in PALLAS_CHOICES)
+    named += [f"explicit at {site}" for site in explicit]
+    return lab_record(tree, hardware, generation, named, failures, config)
+
+
+def lab_record(tree: Path, hardware: str, generation: str, named: list[str], failures: list[str],
+               config: Path = STORE_CONFIG) -> dict:
+    """The kernel lab's record for `tree`'s kernels on `hardware`, where `named` Pallas kernels run."""
+    found: dict = {"generation": generation, "pallas": named}
+    if not named:
+        return found
+    found["digest"] = digest = kernel_digest(tree)
+    key = f"lab/verified/{LAB_GPUS[hardware]}/{digest}.json"
+    record, missing = store_read(key, config)
+    if record is None or not record.get("ok"):
+        failures.append(f"KERNELS on {generation} names Pallas kernels ({', '.join(named)}) whose code "
+                        f"the kernel lab has not verified on {LAB_GPUS[hardware]} ({key}: "
+                        f"{missing or 'not ok'})")
+        return found
+    found["record"] = {k: record.get(k) for k in ("ref", "gpu", "versions", "at")}
+    return found
+
+
+# What the kernel lab's own session runs: its server and client, which produce the lab's record, and
+# the gate that reads it.
+LAB_MODULES = {"tools.kernel_lab.server", "tools.kernel_lab.submit", "tools.kernel_lab.verify",
+               "tools.colab.lab_gate"}
+GATE = re.compile(r"\btools[./]colab[./]lab_gate\b")
+
+
+def lab_session(found: dict, texts: dict[str, str], command: str) -> bool:
+    """Whether the request runs the kernel lab alone: every Python module it starts is the lab's, it
+    runs no Python script and nothing it stages trains. Its own preflight cannot need the record
+    the session exists to write."""
+    modules, scripts = set(found["modules"]), [run for run in found["runs"] if run.endswith(".py")]
+    return bool(modules) and modules <= LAB_MODULES and not scripts and not trains(texts, command)
+
+
+def runtime_gate(texts: dict[str, str], command: str) -> str | None:
+    """Where the command or a shell script runs the lab gate (tools.colab.lab_gate) and stops on its
+    failure, `set -e` before it or `|| exit` on its line, before anything that trains, as
+    `file:line`: a session that verifies its kernels and then trains on them. None where none does."""
+    training = {name for name, text in texts.items() if trains({name: text}, "")}
+    for name, text in [("<command>", command), *texts.items()]:
+        if name != "<command>" and not name.endswith(SCRIPTS[1:]):
+            continue
+        # A comment names what the script runs without running it.
+        lines = [re.sub(r"(^|\s)#.*", "", line) for line in text.splitlines()]
+        stops = False
+        for number, line in enumerate(lines, 1):
+            stops = stops or re.match(r"\s*set\s+-\w*e", line) is not None
+            if not GATE.search(line) or not (stops or re.search(r"\|\|\s*(exit|return)\b", line)):
+                continue
+            before, after = "\n".join(lines[: number - 1]), "\n".join(lines[number:])
+            guarded = TRAINING.search(after) or any(script in after for script in training)
+            unguarded = TRAINING.search(before) or any(script in before for script in training)
+            if guarded and not unguarded:
+                return f"{name}:{number}"
+    return None
+
+
+# A staged script or the command that names one of these trains: a recipe, Dew's training package or its
+# Trainer.
+TRAINING = re.compile(r"\brecipes/[\w.-]+/[\w.-]+\.py\b|\bdew\.training\b|\bTrainer\b")
+LOWERING_TIMEOUT = 900
+
+
+def trains(texts: dict[str, str], command: str) -> list[str]:
+    """Each site where the command or a staged script reaches a training entry, as `file:line`."""
+    return [f"{name}:{number}" for name, text in [("<command>", command), *texts.items()]
+            for number, line in enumerate(text.splitlines(), 1) if TRAINING.search(line)]
+
+
+def runs_dew(chains: list[dict]) -> list[str]:
+    """Each site where the request imports Dew or a tool of its tree (the kernel lab's verify, a kernel
+    bench), as `file:line`: code that compiles Dew's kernels on the GPU, whose step lowers here first
+    whatever the request calls itself (two short verifies launched on a kernel that did not lower)."""
+    return sorted({chain["where"] for chain in chains if top(chain) in LOCAL})
+
+
+def lowering_env(texts: dict[str, str], command: str) -> dict[str, str]:
+    """The JAX_ and XLA_ settings the command and its shell scripts assign, which the run's step
+    lowers under. A value read from another variable is unknown here, and left out."""
+    env = {}
+    for name, text in [("<command>", command), *texts.items()]:
+        if name != "<command>" and not name.endswith(SCRIPTS[1:]):
+            continue
+        for line in re.sub(r"\\\n", " ", text).splitlines():
+            try:
+                words = shlex.split(line, comments=True)
+            except ValueError:
+                continue  # `shell_facts` reports a line that does not parse.
+            for word in words:
+                key, equals, value = word.partition("=")
+                if equals and re.fullmatch(r"(?:JAX|XLA)_\w+", key) and "$" not in value:
+                    env[key] = value
+    return env
+
+
+# The request's flags the lowered step takes, by clef_step's own: the checkpoint whose layers it copies
+# and its commit, and the step's rows.
+GEOMETRY = {"like": r"pretrained", "revision": r"revision", "max-len": r"max[-_]len",
+            "batch": r"trainer\.batch[-_]size"}
+
+
+# Flags of a request that change which kernel a step runs and that the lowered tiny step does not take:
+# the receipt names them, so a reader knows what the dry run did not cover.
+UNAPPLIED = re.compile(r"--(?:loop[-_](?:layers|steps|backprop[-_]steps|remat)|[\w.-]*impl(?:ementation)?"
+                       r"|[\w.-]*chunk[-_]size|remat)\b")
+
+
+def geometry(texts: dict[str, str], command: str) -> dict[str, str]:
+    """The checkpoint, its commit, the row length and the batch the request's training names, as the
+    first flag in the command or a staged script gives each (`--pretrained Qwen/Qwen3.5-0.8B`, or
+    `"--pretrained", "Qwen/Qwen3.5-0.8B"` in a Python list): the step lowers with that checkpoint's
+    layer widths and those rows (`clef_step --like`). A local checkpoint, which this host lacks,
+    leaves the tiny model's widths, and says so."""
+    found: dict[str, str] = {}
+    for name, flag in GEOMETRY.items():
+        # `--flag value` or `--flag=value` in a shell; `"--flag", "value"` in a Python list, whose value
+        # is a literal only where it is quoted.
+        pattern = re.compile(rf"--{flag}(?:[= ]+[\"']?|[\"']\s*,\s*[\"'])([\w./-]+)")
+        for text in [command, *texts.values()]:
+            if name not in found and (match := pattern.search(text)) and match[1] != "None":
+                found[name] = match[1]
+    if found.get("like", "").startswith("/"):
+        found["local"] = found.pop("like")
+        found.pop("revision", None)
+    unread = sorted({match[0] for text in [command, *texts.values()] for match in UNAPPLIED.finditer(text)})
+    if unread:
+        found["not applied"] = ", ".join(unread)
+    return found
+
+
+def lowered(tree: Path, hardware: str, python: str, sites: Sequence[str], env: dict[str, str],
+            failures: list[str], shape: dict[str, str] | None = None) -> dict:
+    """For a request that trains (`sites`), the Clef recipe's step at the ref lowered on this CPU for
+    `hardware`'s generation over one device, as Colab's GPU runs it, under the request's JAX and XLA
+    settings (tools/clef_step.py, `TrainerConfig.lower_for`): every Pallas-Triton lowering the step
+    makes, which otherwise first runs in the GPU's own compile, where c58 and c57 died. The step
+    takes the layer widths of the checkpoint the request trains, and its rows, where the request
+    names them (`geometry`), else the tiny model's (`model`). Every request that runs Dew's code
+    lowers, a verify or a bench as much as a training run (`runs_dew`); only one that runs none, a
+    torch reference, has nothing to lower."""
+    if not sites:
+        return {"skipped": "the request runs no Dew code"}
+    generation, script = GENERATIONS[hardware], tree / "tools" / "clef_step.py"
+    shape = shape or {}
+    found: dict = {"generation": generation, "devices": 1, "env": env, "sites": list(sites),
+                   "model": shape.get("like", "tiny"), "geometry": shape}
+    if not script.is_file():
+        failures.append(f"the request runs Dew's code ({', '.join(sites[:3])}) at a ref that predates the "
+                        "lowering dry run (tools/clef_step.py), the check c58's failure needs")
+        return found
+    found["script"] = hashlib.sha256(script.read_bytes()).hexdigest()
+    environment = {**os.environ, **env, "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(tree / "src")}
+    with tempfile.TemporaryDirectory(prefix="dew-lowered-") as work:
+        try:
+            flags = [f"--{name}={value}" for name, value in shape.items() if name in GEOMETRY]
+            done = subprocess.run([python, str(script), "--lower-for", generation, "--devices", "1", *flags,
+                                   "--work", work], capture_output=True, text=True, cwd=tree, env=environment,
+                                  timeout=LOWERING_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            failures.append(f"the Clef step's lowering for {generation} ran past {LOWERING_TIMEOUT} s")
+            return found
+    found["kernels"] = None
+    # A run that printed no record proved nothing.
+    with contextlib.suppress(IndexError, json.JSONDecodeError, KeyError, TypeError):
+        if done.returncode == 0:
+            found["kernels"] = json.loads(done.stdout.splitlines()[-1])["kernels"]
+    if found["kernels"] is None:
+        failures.append(f"the Clef step does not lower for {generation} at this ref (tools/clef_step.py "
+                        f"exited {done.returncode}): {done.stderr.strip()[-1500:]}")
+    return found
+
+
+def unlowered(pallas: Sequence[str]) -> dict:
+    """The kernels the ref's KERNELS row names for the GPU (`lab_verified`'s `pallas`) that no CPU
+    lowers (`dew.training._lowering.UNLOWERABLE`), each with why, so a receipt never passes them as
+    lowered: the kernel lab's record is their only check."""
+    from dew.training._lowering import UNLOWERABLE
+
+    unseen = {f"{choice}={kernel}": why for (choice, kernel), why in UNLOWERABLE.items()
+              if f"{choice}={kernel}" in pallas}
+    return {"not lowered": unseen} if unseen else {}
+
+
+def store_read(key: str, config: Path = STORE_CONFIG) -> tuple[dict | None, str]:
+    """A JSON object from Dew's R2 store (dew-data) with the read token in DEW_DATA_READ_TOKEN or the
+    token file `config` names, its read token's or else the kernel lab's, which reads `lab/`; and
+    why there is none where there is none."""
+    url = "https://dew-data.ashishkmr472.workers.dev"
+    token = os.environ.get("DEW_DATA_READ_TOKEN")
+    if config.exists():
+        settings = json.loads(config.read_text())
+        url = settings.get("url", url)
+        named = settings.get("read_token_file") or settings.get("lab_token_file")
+        if token is None and named:
+            token = Path(named).expanduser().read_text().strip()
+    if not token:
+        return None, "no read token for the store (DEW_DATA_READ_TOKEN)"
+    request = urllib.request.Request(f"{url.rstrip('/')}/{key}", headers={
+        "Authorization": f"Bearer {token}", "User-Agent": "dew-preflight"})
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            value = json.loads(response.read())
+    except (urllib.error.URLError, json.JSONDecodeError) as error:
+        return None, f"{type(error).__name__}: {error}"
+    return (value, "") if isinstance(value, dict) else (None, "the record is not a JSON object")
+
+
 def label(chain: dict) -> str:
     return f"{chain['where']}: {'.'.join([chain['module'], *chain['attrs']])}"
 
@@ -715,6 +1040,9 @@ def verify(path: Path, request: dict, inputs: list[tuple[str, str]]) -> str:
     if not receipt.get("ok"):
         problems.append("it failed: " + "; ".join(receipt.get("failures", ["no result"]))[:2000])
     expected = {key: request[key] for key in ("commit", "hardware", "command")}
+    fetched = set(request.get("refs", ()))
+    problems.extend(f"its scripts check out {ref[:12]}, which the entry's refs: does not fetch"
+                    for ref in receipt.get("refs", []) if ref not in fetched)
     expected.update(
         tool=TOOL, runtime=sorted(pin.lower() for pin in request["runtime"]), dew_python=VENV_PYTHON
     )
@@ -743,6 +1071,8 @@ def main() -> None:
     parser.add_argument(
         "--accept", action="append", default=[], help="TEXT::REASON for a failure that stands"
     )
+    parser.add_argument("--also", action="append", default=[],
+                        help="another ref the scripts check out, which the entry's refs: names")
     parser.add_argument("--origin", default="origin", help="where to fetch a ref this clone lacks")
     parser.add_argument("--dew-python", default=sys.executable)
     parser.add_argument("--out", type=Path)

@@ -20,7 +20,7 @@ from dew.data.dataset import rows_of
 from dew.objectives.base import Batch
 from dew.telemetry.instrumentation import NO_FLOPS, StepFlops
 from dew.training.display import TrainingDisplay
-from dew.training.model_flops import FORWARD_FLOPS, TOKENS
+from dew.training.model_flops import TOKENS, TRAINING_FLOPS
 from dew.training.transaction import Committed
 
 # Consecutive non-finite losses that stop a run.
@@ -32,7 +32,7 @@ class Book(NamedTuple):
 
     `loss` sums the loss since the last checkpoint. `bad_run` is the current
     streak of non-finite losses and `worst_bad_run` the longest since the last
-    check. `forward` and `tokens` sum the objective's analytical forward FLOPs
+    check. `training` and `tokens` sum the objective's analytical training FLOPs
     and real tokens, and `norms` and `commits` the committed gradient norms
     and their count, since the last log.
     """
@@ -40,7 +40,7 @@ class Book(NamedTuple):
     loss: jax.Array
     bad_run: jax.Array
     worst_bad_run: jax.Array
-    forward: jax.Array
+    training: jax.Array
     tokens: jax.Array
     norms: jax.Array
     commits: jax.Array
@@ -59,7 +59,7 @@ def fresh_book(loss: jax.Array) -> Book:
 
 
 @jax.jit
-def bookkeep(book: Book, loss: jax.Array, finite: jax.Array, committed: Committed | None, forward=0.0,
+def bookkeep(book: Book, loss: jax.Array, finite: jax.Array, committed: Committed | None, training=0.0,
              tokens=0.0) -> Book:
     """Advance the loop's counters for one step in a single dispatch.
 
@@ -72,7 +72,7 @@ def bookkeep(book: Book, loss: jax.Array, finite: jax.Array, committed: Committe
     if committed is not None:
         norms, commits = norms + committed.norm.astype(dtype), commits + committed.count
     return Book(book.loss + loss.astype(dtype), bad_run, jnp.maximum(book.worst_bad_run, bad_run),
-                book.forward + forward, book.tokens + tokens, norms, commits)
+                book.training + training, book.tokens + tokens, norms, commits)
 
 
 @dataclasses.dataclass
@@ -121,11 +121,11 @@ class Interval:
         if self.book is None:
             self.book = self.fresh = fresh_book(loss)
         aux = {} if aux is None else aux
-        self.model_counted |= FORWARD_FLOPS in aux
+        self.model_counted |= TRAINING_FLOPS in aux
         self.tokens_counted |= TOKENS in aux
         assert self.fresh is not None
         self.book = bookkeep(self.book, loss, finite, committed,
-                             aux.get(FORWARD_FLOPS, self.fresh.forward), aux.get(TOKENS, self.fresh.tokens))
+                             aux.get(TRAINING_FLOPS, self.fresh.training), aux.get(TOKENS, self.fresh.tokens))
 
     def check_finite(self, step: int, display: TrainingDisplay) -> None:
         """Raise RuntimeError once the loss has been non-finite for
@@ -157,7 +157,7 @@ class Interval:
         self.flops, self.rollout_seconds, self.waited, self.compiling = NO_FLOPS, 0.0, 0.0, 0.0
         self.model_counted = self.tokens_counted = False
         if self.book is not None and self.fresh is not None:
-            self.book = self.book._replace(forward=self.fresh.forward, tokens=self.fresh.tokens,
+            self.book = self.book._replace(training=self.fresh.training, tokens=self.fresh.tokens,
                                            norms=self.fresh.norms, commits=self.fresh.commits)
 
     def saved(self, step: int) -> None:

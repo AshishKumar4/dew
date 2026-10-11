@@ -47,7 +47,9 @@ def run_logged(
 
 
 def public_environment() -> dict[str, str]:
-    private = {"MPLBACKEND", "WANDB_API_KEY", "WANDB_ENTITY", "WANDB_PROJECT"}
+    # JAX 0.11.2's cache-miss explainer crashes Pallas/Triton lowerings.
+    # Explicit script usage is refused by preflight; don't inherit it either.
+    private = {"MPLBACKEND", "WANDB_API_KEY", "WANDB_ENTITY", "WANDB_PROJECT", "JAX_EXPLAIN_CACHE_MISSES"}
     return {key: value for key, value in os.environ.items() if key not in private}
 
 
@@ -305,16 +307,24 @@ class Batch:
         env = {**environment(venv), **compilation_cache(job, tree, venv), **private_environment(job)}
         # One venv per commit, but every job imports its own checked-out tree.
         env["PYTHONPATH"] = str(tree / "src")
+        if job.get("boundary_control"):
+            env["PYTHONPATH"] += os.pathsep + str(self.root)
         began = time.time()
         status.update(command_started_at=began)
         self.save_job(job, status)
-        code = run_logged(
-            ["bash", "-c", job["command"]],
-            home / "run.log",
-            cwd=tree,
-            env=env,
-            timeout=max(1800, 3 * 60 * job["minutes"]),
-        )
+        timeout = max(1800, 3 * 60 * job["minutes"])
+        if job.get("boundary_control"):
+            from tools.colab.boundary import run
+
+            def update(**fields):
+                status.update(fields)
+                self.save_job(job, status)
+
+            code = run(job, home, tree, env, timeout, run_logged, update)
+        else:
+            code = run_logged(
+                ["bash", "-c", job["command"]], home / "run.log", cwd=tree, env=env, timeout=timeout
+            )
         status.update(exit=code, seconds=round(time.time() - began), command_finished_at=time.time())
         self.save_job(job, status)
         # Durable measurements precede parser execution. A parser failure never
