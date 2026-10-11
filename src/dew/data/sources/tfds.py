@@ -185,9 +185,6 @@ def read_only_builder(path: str, *, name: str | None, config: str | None, versio
     return reader
 
 
-
-
-
 @dataclasses.dataclass(frozen=True)
 class TFDS:
     """A prepared TFDS split, read with TFDS's native ArrayRecord data source."""
@@ -248,7 +245,13 @@ class TFDS:
             for instruction in splits[name].file_instructions:
                 store = Store(instruction.filename)
                 fs, path = store.resolve()
-                header = fs.info(path)
+                try:
+                    header = fs.info(path)
+                except FileNotFoundError as error:
+                    raise FileNotFoundError(
+                        f"Missing prepared ArrayRecord shard {instruction.filename!r}; "
+                        "copy the complete split or provision it again"
+                    ) from error
                 files.append({"uri": store.url, "bytes": header["size"], "version": fs.ukey(path)})
         return {
             "store": "tfds",
@@ -263,7 +266,7 @@ class TFDS:
 
     def supports(self, read: Read) -> bool:
         try:
-            self.snapshot()
+            _ = self.builder
         except FileNotFoundError:
             return False
         return True
@@ -332,6 +335,7 @@ class TFDS:
                 f"{self.describe()} has no prepared ArrayRecord data; "
                 "run dew data provision or set provision=True"
             )
+        self.snapshot()
         rows = self.builder.as_data_source(self.split, decoders=self.decoders)
         import grain.python as grain
 

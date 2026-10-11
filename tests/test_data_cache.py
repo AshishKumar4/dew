@@ -40,6 +40,7 @@ def test_expansion_publication_certifies_empty_and_nonempty_inputs():
 
     rows = cache.mapped(grain.MapDataset.source(source.records("indexed")), key, source, transform=expand)
     cold = [rows[index] for index in range(len(rows))]
+    rows.finish()
     rows.close()
     generation = cache.publish(key, source)
     assert len(generation) == 10
@@ -55,6 +56,7 @@ def test_missing_input_completion_refuses_publication():
     rows = cache.mapped(grain.MapDataset.source(source.records("indexed")), key, source)
     assert rows[0] == {"id": 0}
     assert rows[2] == {"id": 2}
+    rows.finish()
     rows.close()
     with pytest.raises(ValueError, match="1 missing"):
         cache.publish(key, source)
@@ -69,6 +71,7 @@ def test_unsealed_writer_cannot_certify_coverage():
     with pytest.raises(ValueError, match="missing"):
         cache.publish(key, source)
     rows[1]
+    rows.finish()
     rows.close()
     assert len(cache.publish(key, source)) == 2
 
@@ -79,7 +82,9 @@ def test_conflicting_duplicate_writers_refuse_publication():
     first = cache.mapped(grain.MapDataset.source([{"id": 0}]), key, source)
     second = cache.mapped(grain.MapDataset.source([{"id": 999}]), key, source)
     first[0], second[0]
+    first.finish()
     first.close()
+    second.finish()
     second.close()
     with pytest.raises(ValueError, match="conflicting cache duplicate"):
         cache.publish(key, source)
@@ -90,6 +95,7 @@ def test_corrupt_shard_never_reaches_current():
     cache, key = _cache(), Manifest()
     rows = cache.mapped(grain.MapDataset.source(source.records("indexed")), key, source)
     rows[0]
+    rows.finish()
     rows.close()
     fs, path = Store(cache.url + "/" + key.key + "/shards").resolve()
     fs.pipe_file(fs.find(path)[0], b"corrupt")
@@ -103,6 +109,7 @@ def test_corrupt_committed_index_is_an_error_without_fallback():
     cache, key = _cache(), Manifest()
     rows = cache.mapped(grain.MapDataset.source(source.records("indexed")), key, source)
     rows[0]
+    rows.finish()
     rows.close()
     generation = cache.publish(key, source)
     manifest = json.loads(Store(generation.url + "/manifest.json").read())
@@ -118,6 +125,7 @@ def test_full_spool_stops_admitting_and_training_continues():
     rows = cache.mapped(grain.MapDataset.source(source.records("indexed")), key, source)
     assert rows[0] == source.records("indexed")[0]
     assert not rows.writer.admitting
+    rows.finish()
     rows.close()
     with pytest.raises(ValueError, match="missing"):
         cache.publish(key, source)
@@ -149,6 +157,7 @@ def test_moto_generation_publication_checks_shards_and_concurrent_finalizers():
     rows = cache.mapped(grain.MapDataset.source(source.records("indexed")), key, source)
     for index in range(len(rows)):
         rows[index]
+    rows.finish()
     rows.close()
     start = threading.Barrier(2)
 
@@ -218,6 +227,7 @@ def test_cold_warm_and_resumed_caches_keep_per_epoch_randomness():
     state = reader.get_state()
     rest = list(reader)
     reader.close()
+    cold.finish()
     cold.close()
     expected = first + rest
     assert [row["id"] for row in expected[:8]] == [row["id"] for row in expected[8:]]
@@ -250,6 +260,7 @@ def test_published_generation_exposes_only_declared_order_metadata_and_plan():
     rows = cache.mapped(grain.MapDataset.source(source.records("indexed")), key, source)
     for index in range(len(rows)):
         rows[index]
+    rows.finish()
     rows.close()
     generation = cache.publish(key, source, plan=lambda ready: {"offsets": np.arange(len(ready) + 1)})
     assert generation.source().metadata()["valid_targets"] == 10
@@ -272,6 +283,7 @@ def test_transient_failures_never_certify_cache_coverage_but_permanent_rejection
         transform=lambda index, row: (Rejected("transient", permanent=False),),
     )
     assert transient[0][0].reason == "transient"
+    transient.finish()
     transient.close()
     with pytest.raises(ValueError, match="missing"):
         cache.publish(key, source)
@@ -282,6 +294,7 @@ def test_transient_failures_never_certify_cache_coverage_but_permanent_rejection
         transform=lambda index, row: (Rejected("http_404"),) if index == 0 else (row,),
     )
     permanent[0], permanent[1]
+    permanent.finish()
     permanent.close()
     generation = cache.publish(key, source)
     assert len(generation) == 1
@@ -295,10 +308,12 @@ def test_local_retention_keeps_pinned_generations_and_evicts_closed_ones(tmp_pat
     first_key, second_key = Manifest(b'{"source":"one"}'), Manifest(b'{"source":"two"}')
     first = cache.mapped(grain.MapDataset.source(source.records("indexed")), first_key, source)
     first[0]
+    first.finish()
     first.close()
     generation = cache.publish(first_key, source)
     second = cache.mapped(grain.MapDataset.source(source.records("indexed")), second_key, source)
     second[0]
+    second.finish()
     second.close()
     assert generation[0] == {"id": 0}
     with pytest.raises(ValueError, match="missing"):
@@ -306,6 +321,7 @@ def test_local_retention_keeps_pinned_generations_and_evicts_closed_ones(tmp_pat
     generation.close()
     retry = cache.mapped(grain.MapDataset.source(source.records("indexed")), second_key, source)
     retry[0]
+    retry.finish()
     retry.close()
     assert cache.publish(second_key, source)[0] == {"id": 0}
     assert cache.generation(first_key) is None
@@ -327,6 +343,7 @@ def test_real_r2_generation_publication_mirror_and_cleanup(tmp_path):
         rows = cache.mapped(grain.MapDataset.source(source.records("indexed")), key, source)
         for index in range(len(rows)):
             rows[index]
+        rows.finish()
         rows.close()
         generation = cache.publish(key, source)
     try:
