@@ -328,7 +328,7 @@ def test_a_trained_wan_step_exports_and_reloads(pipeline, walk, tmp_path):
         return float(loss.total / loss.mass)
 
     before = value(initial.variables)
-    state, _, _, _, accepted = trainer.compile(initial, batch)(initial, batch)
+    state, _, _, _, accepted, _ = trainer.compile(initial, batch)(initial, batch)
     assert bool(accepted)
     assert value(state.variables) < before
     assert not np.allclose(state.variables["params"]["proj_out"]["kernel"],
@@ -393,7 +393,7 @@ def test_a_wan_lora_starts_as_the_source_and_trains_its_factors_alone(pipeline, 
     batch = clip_batch(objective, prompts)
     trainer = Trainer(objective, optax.sgd(1e-1), key=jax.random.key(3))
     initial = trainer.initial_state()
-    state, _, _, _, accepted = trainer.compile(initial, batch)(initial, batch)
+    state, _, _, _, accepted, _ = trainer.compile(initial, batch)(initial, batch)
     assert bool(accepted)
     factors = jax.tree_util.tree_leaves_with_path(state.variables["params"])
     assert factors and all(path[-1].key in ("lora_A", "lora_B") for path, _ in factors)
