@@ -244,7 +244,7 @@ def train(args: argparse.Namespace, run: Run, probe: RouterProbe | None) -> tupl
             spent = probe(step, state.variables)
             if window.times(step):
                 window.excluded += spent
-        state, loss, metrics, _, _ = run.step(state, run.batch(step))
+        state, loss, metrics, _, _, _ = run.step(state, run.batch(step))
         # The step's loss is the whole objective, balance terms included;
         # the cross entropy the reference records as its loss is `ce`.
         losses.append(metrics["ce"])

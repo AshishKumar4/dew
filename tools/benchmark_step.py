@@ -374,7 +374,7 @@ def measure(case: Case, config: BenchmarkConfig) -> Row:
 
         def step(state):
             batch = initial_batch if config.fixed_batch else next(source)
-            state, loss, _, finite, _ = compiled(state, batch)
+            state, loss, _, finite, _, _ = compiled(state, batch)
             return state, loss, finite
 
         # At least one warm step, so the first dispatch of the executable is

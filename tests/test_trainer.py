@@ -53,6 +53,7 @@ from dew.training import (
     memory,
     trainer as trainer_module,
 )
+from dew.training.interval import Book, Interval
 from dew.training.optim import Cosine
 from dew.training.transaction import write_back
 
@@ -728,10 +729,10 @@ def test_the_compiled_step_consumes_the_state_it_is_given():
     batch = next(Counting())
     step = trainer.compile(state, batch)
     stale = jax.tree.leaves(state.variables)[0]
-    advanced, _loss, _, finite, _ = step(state, batch)
+    advanced, _loss, _, finite, _, _ = step(state, batch)
     assert bool(finite) and int(advanced.step) == 1
     assert stale.is_deleted()
-    again, _, _, _, _ = step(advanced, batch)
+    again, _, _, _, _, _ = step(advanced, batch)
     assert int(again.step) == 2
 
 
@@ -1544,7 +1545,7 @@ def test_a_rejected_dynamic_scale_step_leaves_no_trace(accum):
     np.testing.assert_allclose(ema, .9, rtol=1e-6)
     # the step consumes the state
     counted, advanced, scaled = int(state.step), int(state.microstep), float(state.scale.scale)
-    state, _, _, finite, accepted = step(state, bad)
+    state, _, _, finite, accepted, _ = step(state, bad)
     assert bool(finite) and not bool(accepted)
     assert int(state.step) == counted + 1
     assert int(state.microstep) == advanced
@@ -1919,8 +1920,8 @@ def test_a_new_steps_failure_on_the_devices_is_raised_as_the_steps(monkeypatch):
     with pytest.raises(RuntimeError, match=r"compiled for step 1 failed on its first run.*\"held\": 123"):
         trainer._await_first_run(SimpleNamespace(block_until_ready=refused), 1)
 
-    interval = trainer_module._Interval(last_log_time=0.0, last_saved=None)
-    interval.book = interval.fresh = (0.0, 0, SimpleNamespace(), 0.0, 0.0)
+    interval = Interval(last_log_time=0.0, last_saved=None)
+    interval.book = interval.fresh = Book(0.0, 0, SimpleNamespace(), 0.0, 0.0, 0.0, 0)
     monkeypatch.setattr(jax, "device_get", lambda value: refused())
     with pytest.raises(RuntimeError, match="a training step before step 7 failed on the devices"):
         interval.check_finite(7, trainer._display)
@@ -2164,7 +2165,7 @@ def test_a_step_compiles_from_its_arrays_shapes_before_they_are_placed():
     batch = {"text": jnp.zeros((8, 5), jnp.int32)}
     expected, _ = trainer.objective.scalar_loss(state.variables, batch,
                               Step(state.microstep, jax.random.fold_in(state.key, state.step), None))
-    advanced, loss, _, finite, _ = jax.block_until_ready(compiled(state, batch))
+    advanced, loss, _, finite, _, _ = jax.block_until_ready(compiled(state, batch))
     assert loss == pytest.approx(float(expected), rel=1e-6)
     assert int(advanced.step) == 1 and bool(finite)
 
