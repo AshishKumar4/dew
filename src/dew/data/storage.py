@@ -225,14 +225,23 @@ class DewDataFileSystem(AbstractFileSystem):
         }
 
     def _keys(self, prefix: str) -> Iterator[str]:
+        for entry in self._listing(prefix):
+            yield str(entry["name"])[len(self.bucket) + 1 :]
+
+    def _listing(self, prefix: str) -> Iterator[dict[str, str | int]]:
         cursor = ""
         while True:
-            options = {"list": prefix, **({"cursor": cursor} if cursor else {})}
+            options = {"list": prefix, "detail": "1", **({"cursor": cursor} if cursor else {})}
             query = "?" + urllib.parse.urlencode(options)
             body, _ = self._request("GET", self.bucket, query=query)
             page = json.loads(body)
-            for suffix in page["keys"]:
-                yield prefix + suffix
+            for entry in page["objects"]:
+                yield {
+                    "name": self.bucket + "/" + prefix + entry["key"],
+                    "size": entry["size"],
+                    "etag": entry["etag"],
+                    "type": "file",
+                }
             if page["cursor"] is None:
                 break
             cursor = page["cursor"]
@@ -241,17 +250,11 @@ class DewDataFileSystem(AbstractFileSystem):
         prefix = self._key(path.rstrip("/"))
         prefix = prefix.rstrip("/") + "/" if prefix else ""
         entries: dict[str, dict[str, str | int]] = {}
-        for key in self._keys(prefix):
-            tail = key[len(prefix) :]
+        for entry in self._listing(prefix):
+            tail = str(entry["name"])[len(self.bucket) + 1 + len(prefix) :]
             first, slash, _ = tail.partition("/")
             name = f"{self.bucket}/{prefix}{first}"
-            entries[name] = (
-                {"name": name, "type": "directory", "size": 0}
-                if slash
-                else self.info(name)
-                if detail
-                else {"name": name, "type": "file", "size": 0}
-            )
+            entries[name] = {"name": name, "type": "directory", "size": 0} if slash else entry
         found = sorted(entries.values(), key=lambda entry: str(entry["name"]))
         return found if detail else [entry["name"] for entry in found]
 
