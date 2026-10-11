@@ -22,7 +22,7 @@ import pyarrow.dataset as ds
 import pyarrow.fs as pafs
 
 from dew.data.dataset import Batch, Records
-from dew.data.storage import DewDataFileSystem, Store
+from dew.data.storage import Store
 from dew.records import integer, record
 
 from .base import Read, Shard, ShardManifest
@@ -659,11 +659,7 @@ class _IndexedLines:
         fs, path = Store(self.source.paths[shard], self.source.storage_options).resolve()
         names = self.fieldnames[shard] if self.source.kind == "csv" else None
         offset = int(entry["offset"])
-        stated = self.source.declared.get(self.source.paths[shard], {})
-        options = (
-            {"version": stated["etag"]} if isinstance(fs, DewDataFileSystem) and "etag" in stated else {}
-        )
-        payload = fs.cat_file(path, start=offset, end=offset + int(entry["bytes"]), **options)
+        payload = fs.cat_file(path, start=offset, end=offset + int(entry["bytes"]))
         if names is not None:
             return next(csv.DictReader(io.StringIO(payload.decode()), fieldnames=names))
         return json.loads(payload) if self.source.kind == "jsonl" else {"text": payload.decode()}

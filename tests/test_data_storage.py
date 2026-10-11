@@ -1,5 +1,6 @@
 """Conditional publication, transport bounds and URL credentials."""
 
+import hashlib
 import json
 import os
 import threading
@@ -9,7 +10,7 @@ from uuid import uuid4
 import fsspec
 import pytest
 
-from dew.data.storage import BoundedFileCache, PreconditionFailed, Store, _profile
+from dew.data.storage import BoundedFileCache, PreconditionFailed, Store, Versioned, _profile
 
 
 @pytest.fixture(params=["memory", "file", "s3"])
@@ -50,6 +51,41 @@ def test_an_immutable_put_accepts_its_own_retry_and_refuses_other_bytes(store):
     with pytest.raises(ValueError, match="other bytes"):
         store.put_immutable(b"different")
     assert store.read() == b"payload"
+
+
+def test_a_filesystem_of_its_own_supplies_conditional_writes():
+    """A third-party filesystem plugs into Store through put_conditional and
+    imports nothing of Dew: a plain FileExistsError is a failed precondition,
+    and its ukey names the versions put_if_match compares."""
+    from fsspec.implementations.memory import MemoryFileSystem
+
+    class Conditional(MemoryFileSystem):
+        protocol = "conditional"
+
+        @classmethod
+        def _strip_protocol(cls, path):
+            return super()._strip_protocol(path.replace("conditional://", "memory://", 1))
+
+        def ukey(self, path):
+            return hashlib.sha256(self.cat_file(path)).hexdigest()
+
+        def put_conditional(self, path, payload, version):
+            if (self.ukey(path) if self.exists(path) else None) != version:
+                raise FileExistsError(path)
+            self.pipe_file(path, payload)
+            return self.ukey(path)
+
+    fsspec.register_implementation("conditional", Conditional, clobber=True)
+    store = Store(f"conditional://storage-{uuid4().hex}/value")
+    first = store.put_if_absent(b"first")
+    assert store.get_versioned() == Versioned(b"first", first)
+    with pytest.raises(PreconditionFailed):
+        store.put_if_absent(b"other")
+    second = store.put_if_match(b"second", first)
+    with pytest.raises(PreconditionFailed):
+        store.put_if_match(b"stale", first)
+    assert store.get_versioned() == Versioned(b"second", second)
+    assert store.put_immutable(b"second") == second
 
 
 def test_two_finalizers_publish_only_one_snapshot(store):
@@ -260,7 +296,7 @@ def test_gcs_generation_preconditions_are_sent_to_the_json_api():
 def test_real_r2_conditional_publication_and_bounded_read(tmp_path):
     root = os.environ.get("DEW_DATA_TEST_URL")
     if not root:
-        pytest.skip("DEW_DATA_TEST_URL names the writable R2 smoke prefix")
+        pytest.skip("DEW_DATA_TEST_URL names a writable remote smoke prefix")
     store = Store(root.rstrip("/") + "/CURRENT")
     first = ('{"generation":"' + uuid4().hex + '"}').encode()
     try:
@@ -276,9 +312,6 @@ def test_real_r2_conditional_publication_and_bounded_read(tmp_path):
     )
     assert cached.read() == first
     fs, path = store.resolve()
-    version = store.get_versioned().version
-    assert fs.cat_file(path, start=0, end=8, version=version) == first[:8]
-    with pytest.raises(PreconditionFailed):
-        fs.cat_file(path, start=0, end=8, version='"incorrect-version"')
+    assert fs.cat_file(path, start=0, end=8) == first[:8]
     fs.rm(path)
     assert not fs.exists(path)

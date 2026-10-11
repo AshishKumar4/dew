@@ -15,47 +15,34 @@ import threading
 import time
 import tomllib
 import urllib.parse
-from collections.abc import Buffer, Iterator, Mapping
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
-from functools import lru_cache
 from pathlib import Path
-from typing import BinaryIO, TypedDict
+from typing import BinaryIO, Protocol, TypedDict, runtime_checkable
 
 import fsspec
-import urllib3
 from filelock import FileLock, Timeout
 from fsspec.implementations.cached import CachingFileSystem, WholeFileCacheFileSystem
-from fsspec.spec import AbstractBufferedFile, AbstractFileSystem
+from fsspec.spec import AbstractFileSystem
 from gcsfs import GCSFileSystem
 from huggingface_hub import HfFileSystem
 from huggingface_hub.hf_file_system import HfFileSystemResolvedRepositoryPath
 from s3fs import S3FileSystem
-from urllib3.response import BaseHTTPResponse
-from urllib3.util import Retry, Timeout as HttpTimeout
 
 from dew.cache import dew_cache_dir
 from dew.data.retention import LocalRetention
 from dew.records import JSON, json_value
 
 
-@lru_cache(maxsize=1)
-def _http_pool(process: int) -> urllib3.PoolManager:
-    return urllib3.PoolManager(
-        num_pools=16,
-        maxsize=64,
-        block=True,
-        retries=Retry(
-            total=2,
-            backoff_factor=0.1,
-            allowed_methods=frozenset(("GET", "HEAD")),
-            status_forcelist=(429, 500, 502, 503, 504),
-            raise_on_status=False,
-        ),
-    )
-
-
 class PreconditionFailed(FileExistsError):
     """The object changed since the caller read its version."""
+
+
+@runtime_checkable
+class ConditionalWrites(Protocol):
+    """An fsspec filesystem that supplies its own conditional writes (`Store`)."""
+
+    def put_conditional(self, path: str, payload: bytes, version: str | None) -> str: ...
 
 
 class ObjectInfo(TypedDict):
@@ -119,247 +106,6 @@ def _profile(name: str, base: str, options: Mapping[str, object]) -> None:
     fsspec.register_implementation(name, profile_type, clobber=True)
 
 
-class DewDataFileSystem(AbstractFileSystem):
-    """The scoped dew-data Worker, including range reads and conditional writes.
-
-    A deployment exposes one bucket, named by the URL's first component.
-    The token is resolved on first use from DEW_DATA_TOKEN or its configured
-    file. Write-token holders can delete objects; lifecycle rules expire abandoned smokes.
-    """
-
-    protocol = ("dewdata", "r2")
-    cachable = False
-
-    def __init__(
-        self,
-        *,
-        endpoint_url: str | None = None,
-        token: str | None = None,
-        token_file: str | None = None,
-        bucket: str = "dew-data",
-        **kwargs,
-    ):
-        super().__init__(**kwargs)
-        config = Path(os.environ.get("DEW_DATA_CONFIG", "~/.config/dew/dew-data.json")).expanduser()
-        settings = json.loads(config.read_text()) if config.is_file() else {}
-        self.endpoint = (
-            endpoint_url
-            or os.environ.get("DEW_DATA_URL")
-            or settings.get("url")
-            or "https://dew-data.ashishkmr472.workers.dev"
-        ).rstrip("/")
-        self.token_file = token_file or settings.get("token_file")
-        self.token = token
-        self.bucket = bucket
-
-    def _key(self, path: str) -> str:
-        stripped = self._strip_protocol(path).lstrip("/")
-        bucket, _, key = stripped.partition("/")
-        if bucket != self.bucket:
-            raise ValueError(f"dew-data profile serves bucket {self.bucket!r}, not {bucket!r}")
-        if key and (
-            len(key) > 512
-            or not re.fullmatch(r"[A-Za-z0-9._=-]+(?:/[A-Za-z0-9._=-]+)*", key)
-            or ".." in key.split("/")
-        ):
-            raise ValueError(f"invalid dew-data object key {key!r}")
-        return key
-
-    @contextlib.contextmanager
-    def _response(
-        self,
-        method: str,
-        path: str,
-        *,
-        payload: bytes | None = None,
-        headers: Mapping[str, str] | None = None,
-        query: str = "",
-    ) -> Iterator[BaseHTTPResponse]:
-        token = self.token or os.environ.get("DEW_DATA_TOKEN")
-        if not token and self.token_file:
-            token = Path(self.token_file).expanduser().read_text().strip()
-        if not token:
-            raise ValueError("storage profile 'r2' needs DEW_DATA_TOKEN or its configured token_file")
-        key = self._key(path)
-        response = None
-        try:
-            response = _http_pool(os.getpid()).request(
-                method,
-                f"{self.endpoint}/{key}{query}",
-                body=payload,
-                headers={"Authorization": f"Bearer {token}", "User-Agent": "dew-data/1", **(headers or {})},
-                timeout=HttpTimeout(connect=10, read=120),
-                preload_content=False,
-                redirect=False,
-            )
-            if response.status == 404:
-                raise FileNotFoundError(path)
-            if response.status in (409, 412):
-                raise PreconditionFailed(path)
-            if response.status >= 300:
-                raise OSError(f"dew-data {method} {path}: HTTP {response.status}")
-            if headers and "Range" in headers and response.status != 206:
-                raise OSError(f"dew-data did not honour range read for {path}")
-            yield response
-        except urllib3.exceptions.HTTPError as error:
-            raise OSError(f"dew-data {method} {path}: {error}") from error
-        finally:
-            if response is not None:
-                response.close()
-                response.release_conn()
-
-    def _request(
-        self,
-        method: str,
-        path: str,
-        *,
-        payload: bytes | None = None,
-        headers: Mapping[str, str] | None = None,
-        query: str = "",
-    ) -> tuple[bytes, dict[str, str]]:
-        with self._response(method, path, payload=payload, headers=headers, query=query) as response:
-            return response.read(), dict(response.headers.items())
-
-    def get_file(self, rpath: str, lpath: str, **kwargs) -> None:
-        self._get_versioned(rpath, lpath)
-
-    def _get_versioned(self, rpath: str, lpath: str, version: str | None = None) -> None:
-        with (
-            self._response(
-                "GET", rpath, headers=None if version is None else {"If-Match": version}
-            ) as response,
-            open(lpath, "wb") as target,
-        ):
-            if version is not None and response.headers.get("ETag") != version:
-                raise OSError(f"dew-data source changed before downloading {rpath}")
-            shutil.copyfileobj(response, target, length=2**20)
-
-    def ukey(self, path: str) -> str:
-        return str(self.info(path)["etag"])
-
-    def info(self, path: str, **kwargs) -> dict[str, str | int]:
-        key = self._key(path)
-        if not key:
-            return {"name": self.bucket, "size": 0, "type": "directory"}
-        try:
-            _, headers = self._request("HEAD", path)
-        except FileNotFoundError:
-            if next(self._keys(key.rstrip("/") + "/"), None) is None:
-                raise
-            return {"name": self._strip_protocol(path), "size": 0, "type": "directory"}
-        normalized = {key.lower(): value for key, value in headers.items()}
-        return {
-            "name": self._strip_protocol(path),
-            "type": "file",
-            "size": int(normalized["content-length"]),
-            "etag": normalized["etag"],
-        }
-
-    def _keys(self, prefix: str) -> Iterator[str]:
-        for entry in self._listing(prefix):
-            yield str(entry["name"])[len(self.bucket) + 1 :]
-
-    def _listing(self, prefix: str) -> Iterator[dict[str, str | int]]:
-        cursor = ""
-        while True:
-            options = {"list": prefix, "detail": "1", **({"cursor": cursor} if cursor else {})}
-            query = "?" + urllib.parse.urlencode(options)
-            body, _ = self._request("GET", self.bucket, query=query)
-            page = json.loads(body)
-            for entry in page["objects"]:
-                yield {
-                    "name": self.bucket + "/" + prefix + entry["key"],
-                    "size": entry["size"],
-                    "etag": entry["etag"],
-                    "type": "file",
-                }
-            if page["cursor"] is None:
-                break
-            cursor = page["cursor"]
-
-    def ls(self, path: str, detail: bool = True, **kwargs):
-        prefix = self._key(path.rstrip("/"))
-        prefix = prefix.rstrip("/") + "/" if prefix else ""
-        entries: dict[str, dict[str, str | int]] = {}
-        for entry in self._listing(prefix):
-            tail = str(entry["name"])[len(self.bucket) + 1 + len(prefix) :]
-            first, slash, _ = tail.partition("/")
-            name = f"{self.bucket}/{prefix}{first}"
-            entries[name] = {"name": name, "type": "directory", "size": 0} if slash else entry
-        found = sorted(entries.values(), key=lambda entry: str(entry["name"]))
-        return found if detail else [entry["name"] for entry in found]
-
-    def cat_file(self, path: str, start: int | None = None, end: int | None = None, **kwargs) -> bytes:
-        headers = {}
-        version = kwargs.get("version")
-        if version is not None:
-            headers["If-Match"] = version
-        if start is not None or end is not None:
-            if start is not None and start < 0:
-                headers["Range"] = f"bytes={start}"
-            else:
-                headers["Range"] = f"bytes={start or 0}-{'' if end is None else end - 1}"
-            if end is not None and end <= (start or 0):
-                return b""
-        body, returned = self._request("GET", path, headers=headers)
-        if (
-            version is not None
-            and next(value for key, value in returned.items() if key.lower() == "etag") != version
-        ):
-            raise OSError(f"dew-data source changed before reading {path}")
-        return body
-
-    def pipe_file(self, path: str, value: bytes, mode: str = "overwrite", **kwargs) -> None:
-        if not 0 < len(value) <= 100_000_000:
-            raise ValueError(f"dew-data object {path} must be between 1 byte and 100 MB; write shards")
-        self._request("PUT", path, payload=value)
-
-    def rm_file(self, path: str) -> None:
-        self._request("DELETE", path)
-
-    def makedirs(self, path: str, exist_ok: bool = False) -> None:
-        self._key(path.rstrip("/"))
-
-    def _open(
-        self,
-        path: str,
-        mode: str = "rb",
-        block_size: int | None = None,
-        autocommit: bool = True,
-        cache_options: Mapping[str, object] | None = None,
-        **kwargs,
-    ):
-        if mode == "rb":
-            return _WorkerReader(self, path, block_size=block_size or 2**20)
-        if mode == "wb":
-            return _WorkerWriter(self, path)
-        raise ValueError(f"dew-data does not support mode {mode!r}")
-
-
-class _WorkerReader(AbstractBufferedFile):
-    def _fetch_range(self, start: int, end: int) -> bytes:
-        return self.fs.cat_file(self.path, start=start, end=end)
-
-
-class _WorkerWriter(io.BytesIO):
-    def __init__(self, filesystem: DewDataFileSystem, path: str):
-        super().__init__()
-        self.filesystem = filesystem
-        self.path = path
-
-    def write(self, payload: Buffer) -> int:
-        if self.tell() + memoryview(payload).nbytes > 100_000_000:
-            raise ValueError(f"dew-data object {self.path} exceeds 100 MB; write smaller shards")
-        return super().write(payload)
-
-    def close(self) -> None:
-        if not self.closed:
-            try:
-                self.filesystem.pipe_file(self.path, self.getvalue())
-            finally:
-                super().close()
-
-
 class _PinnedReader(io.BufferedReader):
     def __init__(self, raw: io.FileIO, pin: BinaryIO):
         super().__init__(raw)
@@ -392,8 +138,6 @@ class BoundedFileCache(WholeFileCacheFileSystem):
                 namespace = remote.protocol
                 if isinstance(remote, S3FileSystem):
                     namespace = (namespace, remote.endpoint_url or remote.client_kwargs.get("endpoint_url"))
-                elif isinstance(remote, DewDataFileSystem):
-                    namespace = (namespace, remote.endpoint)
             digest = hashlib.sha256(json.dumps(namespace, sort_keys=True).encode()).hexdigest()[:16]
             kwargs["cache_storage"] = os.path.join(dew_cache_dir(), "transport", digest)
         super().__init__(**{"check_files": True, **kwargs})
@@ -427,9 +171,6 @@ class BoundedFileCache(WholeFileCacheFileSystem):
             size = None
             if snapshot is not None and snapshot.get("sha256") is not None:
                 version, size = "sha256:" + snapshot["sha256"], int(snapshot["size"])
-            elif isinstance(self.fs, DewDataFileSystem):
-                metadata = self.fs.info(path) if snapshot is None else snapshot
-                version, size = str(metadata["etag"]), int(metadata["size"])
             else:
                 version = self.fs.ukey(path)
             with FileLock(str(directory / ".dew-lock")):
@@ -486,16 +227,10 @@ class BoundedFileCache(WholeFileCacheFileSystem):
         pending = Path(temporary)
         try:
             if version.startswith("sha256:"):
-                if isinstance(self.fs, DewDataFileSystem):
-                    self.fs.get_file(path, str(pending))
-                else:
-                    with self.fs.open(path, "rb", size=size) as source, pending.open("wb") as target:
-                        shutil.copyfileobj(source, target, length=2**20)
+                with self.fs.open(path, "rb", size=size) as source, pending.open("wb") as target:
+                    shutil.copyfileobj(source, target, length=2**20)
                 with pending.open("rb") as downloaded:
                     unchanged = hashlib.file_digest(downloaded, "sha256").hexdigest() == version[7:]
-            elif isinstance(self.fs, DewDataFileSystem):
-                self.fs._get_versioned(path, str(pending), version)
-                unchanged = True
             else:
                 self.fs.get_file(path, str(pending))
                 unchanged = self.fs.ukey(path) == version
@@ -579,7 +314,19 @@ class Versioned:
 
 @dataclass(frozen=True)
 class Store:
-    """An object URL with compare-and-swap publication and verified uploads."""
+    """An object URL with compare-and-swap publication and verified uploads.
+
+    `put_if_absent` and `put_if_match` run natively on local files, memory,
+    S3 and the S3-compatible endpoints that honour its conditional PUTs, GCS
+    and Hugging Face Hub repositories. Any other fsspec filesystem can
+    supply them (`ConditionalWrites`) with a method `put_conditional(path,
+    payload, version)`, which writes `payload` only while the object is
+    absent (`version` None) or still at `version`, and returns the new
+    version. It reports a failed precondition with any FileExistsError, so
+    it needs nothing from Dew, and `Store` raises that again as
+    PreconditionFailed. The filesystem's `ukey(path)` names the same
+    versions, and `get_versioned` reads it on both sides of the bytes.
+    """
 
     url: str
     storage_options: Mapping[str, object] | None = field(default=None, repr=False)
@@ -627,8 +374,6 @@ class Store:
                 endpoint=fs.client_kwargs.get("endpoint_url") or fs.endpoint_url,
                 region=fs.client_kwargs.get("region_name"),
             )
-        elif isinstance(fs, DewDataFileSystem):
-            settings.update(endpoint=fs.endpoint)
         return settings
 
     def read(self) -> bytes:
@@ -680,9 +425,9 @@ class Store:
         fs, path = self.resolve()
         while isinstance(fs, CachingFileSystem):
             fs = fs.fs
-        protocol = fs.protocol
+        protocol = "conditional" if issubclass(type(fs), ConditionalWrites) else fs.protocol
         schemes = (protocol,) if isinstance(protocol, str) else protocol
-        for scheme in ("file", "memory", "s3", "gs", "gcs", "hf", "dewdata", "r2"):
+        for scheme in ("conditional", "file", "memory", "s3", "gs", "gcs", "hf"):
             if scheme in schemes:
                 return fs, path, scheme
         raise ValueError(f"conditional publication is unavailable for {self.url}")
@@ -703,9 +448,12 @@ class Store:
             with self._locked(path, scheme):
                 payload = fs.cat_file(path)
                 return Versioned(payload, hashlib.sha256(payload).hexdigest())
-        if isinstance(fs, DewDataFileSystem):
-            payload, headers = fs._request("GET", path)
-            return Versioned(payload, next(value for key, value in headers.items() if key.lower() == "etag"))
+        if scheme == "conditional":
+            version = str(fs.ukey(path))
+            payload = fs.cat_file(path)
+            if str(fs.ukey(path)) != version:
+                raise OSError(f"{self.url} changed while it was read")
+            return Versioned(payload, version)
         if isinstance(fs, S3FileSystem):
             from fsspec.asyn import sync
 
@@ -767,10 +515,11 @@ class Store:
                 else:
                     fs.pipe_file(path, payload)
                 return hashlib.sha256(payload).hexdigest()
-        headers = {"If-None-Match": "*"} if version is None else {"If-Match": version}
-        if isinstance(fs, DewDataFileSystem):
-            _, response = fs._request("PUT", path, payload=payload, headers=headers)
-            return next(value for key, value in response.items() if key.lower() == "etag")
+        if isinstance(fs, ConditionalWrites):
+            try:
+                return fs.put_conditional(path, payload, version)
+            except FileExistsError as error:
+                raise PreconditionFailed(self.url) from error
         if isinstance(fs, S3FileSystem):
             from botocore.exceptions import ClientError
             from fsspec.asyn import sync
@@ -852,8 +601,6 @@ class Store:
 
 def _register() -> None:
     fsspec.register_implementation("dewcache", BoundedFileCache, clobber=True)
-    fsspec.register_implementation("dewdata", DewDataFileSystem, clobber=True)
-    fsspec.register_implementation("r2", DewDataFileSystem, clobber=True)
     config = Path(os.environ.get("DEW_STORAGE_CONFIG", "~/.config/dew/storage.toml")).expanduser()
     if config.is_file():
         for name, values in tomllib.loads(config.read_text()).items():

@@ -13,7 +13,7 @@ from dew.data.storage import Store
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--source", default="r2://dew-data/decision/mix-v3")
+    parser.add_argument("--source", required=True, help="the published dataset's root URL")
     parser.add_argument("--reads", type=int, default=1000)
     parser.add_argument("--bytes", type=int, default=64)
     options = parser.parse_args()

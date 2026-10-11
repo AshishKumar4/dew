@@ -16,7 +16,7 @@ from dew.data.storage import Store
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--source", default="r2://dew-data/decision/mix-v3")
+    parser.add_argument("--source", required=True, help="the published dataset's root URL")
     parser.add_argument("--cache", help="a fresh local transport directory for a cold-open measurement")
     parser.add_argument("--descriptor", help="a verified immutable descriptor carrying source file facts")
     options = parser.parse_args()
