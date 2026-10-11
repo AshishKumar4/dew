@@ -119,15 +119,19 @@ class ProfileWindow:
 
 @dataclasses.dataclass(frozen=True)
 class FitEnded:
-    status: Literal['completed', 'preempted', 'failed', 'interrupted']
+    status: Literal['completed', 'preempted', 'failed', 'interrupted', 'lowered']
     seconds: float
     error: str | None = None
     traceback: str | None = None
 
     @classmethod
-    def outcome(cls, seconds: float, error: BaseException | None, *, preempted: bool = False) -> FitEnded:
-        """A run's end: an error, else stopped at a preemption notice with
-        its checkpoint written, else completed."""
+    def outcome(cls, seconds: float, error: BaseException | None, *, preempted: bool = False,
+                lowered: bool = False) -> FitEnded:
+        """A run's end: its first step lowered for another device in place of
+        training (`TrainerConfig.lower_for`), an error, else stopped at a
+        preemption notice with its checkpoint written, else completed."""
+        if lowered:
+            return cls('lowered', seconds)
         if error is None:
             return cls('preempted' if preempted else 'completed', seconds)
         return cls('interrupted' if isinstance(error, KeyboardInterrupt) else 'failed', seconds,
