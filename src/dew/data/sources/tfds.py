@@ -199,7 +199,7 @@ class TFDS:
     @property
     def remote(self) -> bool:
         return self.path is not None and (
-            "::" in self.path or "://" in self.path and not self.path.startswith(("file://", "gs://"))
+            "::" in self.path or ("://" in self.path and not self.path.startswith(("file://", "gs://")))
         )
 
     @property
