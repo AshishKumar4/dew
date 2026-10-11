@@ -44,8 +44,14 @@ PEAK_FLOPS_PER_DEVICE = {
 }
 
 
-def peak_flops(device_kind: str) -> float | None:
-    """The dense bf16 peak of one device of `device_kind`, by the longest
-    table key it starts with, or None for hardware the table does not name."""
-    keys = [key for key in PEAK_FLOPS_PER_DEVICE if device_kind.startswith(key)]
-    return PEAK_FLOPS_PER_DEVICE[max(keys, key=len)] if keys else None
+# Dense FP8 peaks, for utilization of FP8 GEMMs against their own precision. Hardware without FP8
+# tensor cores, the A100 among them, has no entry.
+PEAK_FP8_FLOPS_PER_DEVICE: dict[str, float] = {}
+
+
+def peak_flops(device_kind: str, precision: str = "bf16") -> float | None:
+    """The dense peak of one device of `device_kind` at `precision` ('bf16' or 'fp8'), by the
+    longest table key it starts with, or None for hardware the table does not name."""
+    table = {"bf16": PEAK_FLOPS_PER_DEVICE, "fp8": PEAK_FP8_FLOPS_PER_DEVICE}[precision]
+    keys = [key for key in table if device_kind.startswith(key)]
+    return table[max(keys, key=len)] if keys else None

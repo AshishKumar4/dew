@@ -31,35 +31,8 @@ import re
 from collections import Counter
 
 import jax
-from jax.sharding import AbstractDevice, AbstractMesh, Mesh
-
-DEVICE_KINDS = {
-    'sm75': "Tesla T4",
-    'sm80': "NVIDIA A100-SXM4-80GB",
-    'sm86': "NVIDIA A10",
-    'sm89': "NVIDIA L4",
-    'sm90': "NVIDIA H100 80GB HBM3",
-    'sm120': "NVIDIA RTX PRO 6000 Blackwell Server Edition",
-}
-"""A `device_kind` of each CUDA generation a step lowers for, as the device reports it: JAX's
-Pallas lowering reads the compute capability it targets from the kind (`get_gpu_info`)."""
-
-UNLOWERABLE = {
-    ('tokamax_grouped_matmul', 'triton'): (
-        "tokamax registers its Triton ragged dot on GPU hosts only, so no CPU lowers it, and the "
-        "kernel lab's verify on the GPU is its only check"),
-}
-"""The Pallas choices a `KERNELS` row can name whose Triton lowering no CPU reaches, and why."""
 
 _TRITON_CALL = re.compile(r'custom_call @__gpu\$xla\.gpu\.triton\(.*?\bname = "([^"]*)"')
-
-
-def gpu_mesh(mesh: Mesh, generation: str) -> AbstractMesh:
-    """`mesh`'s axes over devices of the CUDA `generation` ('sm80'), none of which this process needs."""
-    if generation not in DEVICE_KINDS:
-        raise ValueError(f"lower_for names {generation!r}; it lowers for one of {', '.join(DEVICE_KINDS)}")
-    device = AbstractDevice(device_kind=DEVICE_KINDS[generation], num_cores=None, platform='cuda')
-    return AbstractMesh(mesh.axis_sizes, mesh.axis_names, axis_types=mesh.axis_types, abstract_device=device)
 
 
 def triton_kernels(lowered: jax.stages.Lowered) -> dict[str, int]:
