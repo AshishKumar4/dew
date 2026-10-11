@@ -191,7 +191,9 @@ def identity(plan: dict) -> dict:
                 "wandb": job.get("wandb", False),
                 "raw_profiles": job.get("raw_profiles", False),
                 "profile_steps": job.get("profile_steps"),
-                "profile_analysis_ref": job.get("profile_analysis_ref", "b420100f20856822ae19d7f314a9a22ba24e26df"),
+                "profile_analysis_ref": job.get(
+                    "profile_analysis_ref", "b420100f20856822ae19d7f314a9a22ba24e26df"
+                ),
                 **{
                     key: job[key]
                     for key in ("commit", "command", "outputs", "artifact_policy", "ref", "compile_cache")
@@ -222,7 +224,9 @@ def plan_jobs(chosen: list[dict], device: str, hardware: str, base: str, repo: P
             wandb=fields.get("wandb", "off") == "on",
             raw_profiles=fields.get("raw_profiles", "off") == "on",
             profile_steps=int(fields["profile_steps"]) if fields.get("profile_steps") else None,
-            profile_analysis_ref=fields.get("profile_analysis_ref", "b420100f20856822ae19d7f314a9a22ba24e26df"),
+            profile_analysis_ref=fields.get(
+                "profile_analysis_ref", "b420100f20856822ae19d7f314a9a22ba24e26df"
+            ),
             entry=entry,
             economics={
                 key: fields[key] for key in ("gpu_reason", "expected_cu", "decision", "memory_estimate")

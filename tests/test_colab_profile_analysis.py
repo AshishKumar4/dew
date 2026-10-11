@@ -1,4 +1,5 @@
 """Profile parsing executes on the fake VM; the controller receives small JSON."""
+
 import json
 import os
 import subprocess
@@ -30,24 +31,35 @@ def fixture_profile(tmp_path):
 
 
 def fixture_tool(tree, failed=False):
-    script = ("import argparse,json,pathlib,os\np=argparse.ArgumentParser()\n"
-              "p.add_argument('--trace');p.add_argument('--hlo');p.add_argument('--out');"
-              "p.add_argument('--steps',type=int,default=1);p.add_argument('--entry')\na=p.parse_args()\n"
-              "assert os.environ['JAX_PLATFORMS']=='cpu' and os.environ['CUDA_VISIBLE_DEVICES']==''\n"
-              "pathlib.Path(a.out).write_text(json.dumps({'time':{'by_part_ms':{'gemm':4,'layout':2},"
-              "'device_idle_ms_per_step':1},'memory':{'peak_gib':20},'steps':a.steps}))\n"
-              + ("raise SystemExit(1)\n" if failed else ""))
+    script = (
+        "import argparse,json,pathlib,os\np=argparse.ArgumentParser()\n"
+        "p.add_argument('--trace');p.add_argument('--hlo');p.add_argument('--out');"
+        "p.add_argument('--steps',type=int,default=1);p.add_argument('--entry')\na=p.parse_args()\n"
+        "assert os.environ['JAX_PLATFORMS']=='cpu' and os.environ['CUDA_VISIBLE_DEVICES']==''\n"
+        "pathlib.Path(a.out).write_text(json.dumps({'time':{'by_part_ms':{'gemm':4,'layout':2},"
+        "'device_idle_ms_per_step':1},'memory':{'peak_gib':20},'steps':a.steps}))\n"
+        + ("raise SystemExit(1)\n" if failed else "")
+    )
     file(tree / "tools/attribute_step.py", script.encode())
-    for args in (("init", "-q"), ("add", "."), ("-c", "user.name=Test", "-c", "user.email=test@example.invalid",
-                  "commit", "-qm", "profile-tool")):
+    for args in (
+        ("init", "-q"),
+        ("add", "."),
+        ("-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", "profile-tool"),
+    ):
         subprocess.run(["git", "-C", str(tree), *args], check=True)
 
 
 def test_discovery_uses_metadata_steps_and_matches_experiment_hlo(tmp_path):
     tree, capture = fixture_profile(tmp_path)
     found = profile_analysis.discover({"outputs": ["out/"]}, tree)
-    assert found == [{"capture": capture, "steps": 5, "entry": tree / "out/experiment/entry.json",
-                       "hlo": tree / "out/experiment/hlo.tgz"}]
+    assert found == [
+        {
+            "capture": capture,
+            "steps": 5,
+            "entry": tree / "out/experiment/entry.json",
+            "hlo": tree / "out/experiment/hlo.tgz",
+        }
+    ]
 
 
 def test_analysis_runs_after_capture_and_retains_only_small_breakdowns(tmp_path):
@@ -74,8 +86,9 @@ def test_failed_analysis_is_visible_without_hiding_the_training_exit(tmp_path):
     venv = tmp_path / "venv"
     (venv / "bin").mkdir(parents=True)
     (venv / "bin/python").symlink_to(sys.executable)
-    result = profile_analysis.analyze({"outputs": ["out/"]}, tree, venv, tree, tmp_path,
-                                      "unused", dict(os.environ), run_logged)
+    result = profile_analysis.analyze(
+        {"outputs": ["out/"]}, tree, venv, tree, tmp_path, "unused", dict(os.environ), run_logged
+    )
     assert result["attempted"] and not result["complete"] and result["captures"][0]["exit"] == 1
 
 
@@ -86,8 +99,9 @@ def test_unknown_steps_are_labeled_capture_total_not_mfu(tmp_path):
     venv = tmp_path / "venv"
     (venv / "bin").mkdir(parents=True)
     (venv / "bin/python").symlink_to(sys.executable)
-    result = profile_analysis.analyze({"outputs": ["out/"]}, tree, venv, tree, tmp_path,
-                                      "unused", dict(os.environ), run_logged)
+    result = profile_analysis.analyze(
+        {"outputs": ["out/"]}, tree, venv, tree, tmp_path, "unused", dict(os.environ), run_logged
+    )
     assert result["captures"][0]["normalization"].startswith("capture total")
     assert result["captures"][0]["steps"] is None
 
@@ -95,5 +109,6 @@ def test_unknown_steps_are_labeled_capture_total_not_mfu(tmp_path):
 def test_non_profile_job_does_not_fetch_analysis_tool(tmp_path):
     tree = tmp_path / "tree"
     file(tree / "out/result.json", b"{}")
-    assert profile_analysis.analyze({"outputs": ["out/"]}, tree, tmp_path / "venv", tree, tmp_path,
-                                    "unused", {}, run_logged) == {"attempted": False, "reason": "no native device profile"}
+    assert profile_analysis.analyze(
+        {"outputs": ["out/"]}, tree, tmp_path / "venv", tree, tmp_path, "unused", {}, run_logged
+    ) == {"attempted": False, "reason": "no native device profile"}
