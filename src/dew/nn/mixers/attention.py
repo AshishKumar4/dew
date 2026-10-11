@@ -448,13 +448,19 @@ class CausalSelfAttention(nn.Module):
         positions and an explicit pairwise mask do not. Otherwise causality and the
         window stay flags, since a materialized [B, 1, S, S] mask sends the call to
         the xla kernel (docs/performance.md). A validity array is opaque at trace
-        time, so a host that knows a row is unpadded passes none. Decoding always
+        time, so a host that knows a row is unpadded passes none, and one that
+        right-pads its rows says so (`AttentionMetadata.right_padded`): causality
+        alone keeps a real query off the padding after it. Decoding always
         builds the mask, which carries the cache's validity.
         """
         if decode:
             return metadata is not None or self.bidirectional_images
+        # QK-Clip's logit maxima are taken under the mask (`_attended`), so a
+        # layer that sows them keeps it.
+        implied = (metadata is not None and metadata.right_padded and self.causal
+                   and not (not self.is_initializing() and self.is_mutable_collection("qk")))
         return metadata is not None and (
-            metadata.valid is not None
+            (metadata.valid is not None and not implied)
             or (self.bidirectional_images and metadata.image_groups is not None))
 
     @nn.compact

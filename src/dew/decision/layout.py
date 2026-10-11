@@ -443,7 +443,9 @@ def _parallel(spans: list[tuple[int, int]], length: int) -> tuple[tuple[int, ...
 class DecisionInputs:
     """A batch of laid-out rows, padded to the longest row, the most questions and the most options.
 
-    - `tokens` `[B, L]` ids, `valid` `[B, L]` the real tokens;
+    - `tokens` `[B, L]` ids, `valid` `[B, L]` the real tokens, each row's
+      first (`collate` and the training `Encoding` pad after them, and the
+      model reads its rows as right-padded);
     - `kinds` `[B, Q]` each question's type (`KINDS`), `questions` `[B, Q]` the
       real questions, `spans` `[B, Q, 2]` their instructions' (start, end);
     - `option_spans` `[B, Q, K, 2]` each option slot's (start, end), `options`

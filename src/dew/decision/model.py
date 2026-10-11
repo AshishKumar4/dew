@@ -51,10 +51,12 @@ class DecisionModel:
             return _array(self.backbone.apply(
                 backbone, inputs, media, rngs=rngs,
                 method=lambda module, rows, given: module.hidden_states(
-                    rows.tokens, train=train, attention_mask=rows.valid, **given.kwargs())))
+                    rows.tokens, train=train, attention_mask=rows.valid, right_padded=True,
+                    **given.kwargs())))
         if inputs.positions is None or inputs.slots is None:
             return _array(self.backbone.apply(backbone, inputs.tokens, train=train,
-                                              attention_mask=inputs.valid, method=method, rngs=rngs))
+                                              attention_mask=inputs.valid, right_padded=True,
+                                              method=method, rngs=rngs))
         slots = inputs.slots
         other = (slots[:, :, None] > 0) & (slots[:, None, :] > 0) & (slots[:, :, None] != slots[:, None, :])
         visible = inputs.valid[:, None, :] & ~other

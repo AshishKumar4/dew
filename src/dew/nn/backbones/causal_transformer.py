@@ -1218,12 +1218,12 @@ class CausalTransformer(nn.Module):
                  positions=None, segment_ids=None,
                  input_embeddings=None,
                  attention_mask=None, image_groups=None, rotary_positions=None,
-                 attention_pairwise_mask=None, attention_key_positions=None):
+                 attention_pairwise_mask=None, attention_key_positions=None, right_padded: bool = False):
         x, prediction = self.hidden_and_mtp_inputs(
             tokens, train=train, decode=decode, positions=positions, segment_ids=segment_ids,
             input_embeddings=input_embeddings, attention_mask=attention_mask, image_groups=image_groups,
             rotary_positions=rotary_positions, attention_pairwise_mask=attention_pairwise_mask,
-            attention_key_positions=attention_key_positions)
+            attention_key_positions=attention_key_positions, right_padded=right_padded)
         if self.is_initializing() and self.dspark is not None:
             self.reach_drafter(tokens, x.dtype)
         if self.is_initializing() and self.mtp:
@@ -1464,7 +1464,8 @@ class CausalTransformer(nn.Module):
                               input_embeddings=None,
                               attention_mask=None, image_groups=None, rotary_positions=None,
                               attention_pairwise_mask=None, attention_key_positions=None,
-                              routed_experts=None, routed=None, media_mask=None, admitted=None):
+                              routed_experts=None, routed=None, media_mask=None, admitted=None,
+                              right_padded: bool = False):
         """Return the final normalized states and the prediction depths' input.
 
         V4's depth reads the raw residual streams from before the collapse head
@@ -1487,10 +1488,15 @@ class CausalTransformer(nn.Module):
           selects for them.
         - `admitted` makes a cached call a serving step's mixed call
           (`dew.nn.inputs.Admitted`).
+        - `right_padded` says each row of `attention_mask` holds its real
+          tokens first and its padding after, as a training batch pads them
+          (`dew.nn.inputs.AttentionMetadata.right_padded`). The real tokens'
+          states are the masked call's, the padding's are unspecified, and a
+          causal layer runs as an unpadded call does.
         """
         attention_metadata = self._attention_metadata(
             tokens, decode, positions, attention_mask, image_groups, rotary_positions,
-            attention_pairwise_mask, attention_key_positions, media_mask, admitted)
+            attention_pairwise_mask, attention_key_positions, media_mask, admitted, right_padded)
         # The stack's entry and exit sit where the batch does, so neither the
         # lookup nor the head is computed whole on the shards of an axis that
         # splits the rows or the positions.
@@ -1545,7 +1551,8 @@ class CausalTransformer(nn.Module):
 
     def _attention_metadata(self, tokens, decode: bool, positions, attention_mask, image_groups,
                             rotary_positions, pairwise_mask, key_positions,
-                            media_mask, admitted=None) -> AttentionMetadata | None:
+                            media_mask, admitted=None,
+                            right_padded: bool = False) -> AttentionMetadata | None:
         """What the layers read beside the residual, None for a call that
         carries none of it: the masks and positions `hidden_and_mtp_inputs`
         takes, the token ids a hash router selects by, the engram layers'
@@ -1569,7 +1576,7 @@ class CausalTransformer(nn.Module):
             valid=attention_mask, image_groups=image_groups, rotary_positions=rotary_positions,
             pairwise_mask=pairwise_mask, key_positions=key_positions,
             token_ids=tokens if self.hash_layers else None, engram_ids=engram_ids, media=media_mask,
-            admitted=admitted)
+            admitted=admitted, right_padded=right_padded)
 
     def looped(self, x, **stack):
         """Run the layer stack over `x` once, or as `loop` says: the layers before
