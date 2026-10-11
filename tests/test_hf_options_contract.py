@@ -18,7 +18,8 @@ def test_hub_builder_uses_the_resolved_commit_and_named_configuration(tmp_path, 
     requested = []
     marker = tmp_path / "dataset_info.json"
     marker.write_text("{}")
-    expected = SimpleNamespace(cache_dir=str(tmp_path), as_dataset=lambda **kwargs: SimpleNamespace(cache_files=[]))
+    expected = SimpleNamespace(cache_dir=str(tmp_path),
+                               as_dataset=lambda **kwargs: SimpleNamespace(cache_files=[]))
     monkeypatch.setattr(HfApi, "dataset_info", lambda self, repo_id, **kwargs: SimpleNamespace(sha="frozen"))
     monkeypatch.setattr(datasets, "load_dataset_builder", lambda repo, **kwargs:
                         requested.append((repo, kwargs)) or expected)

@@ -48,7 +48,7 @@ from dew.cache import default_compilation_cache_dir, dew_cache_dir
 from dew.checkpoints import RUN_FILE, Checkpoints, Keep
 from dew.config.sweep import RandomSearch, Search, Space, read_ledger, write_ledger
 from dew.coordination import agree_process_phase, agreed
-from dew.data import Dataset, Images, Loading, Ramp, Read, Recipe, load
+from dew.data import Augment, Dataset, HoldOut, Images, Loading, Ramp, Read, Recipe, load
 from dew.data.dataset import Reader, ramped, record_argument
 from dew.files import write_atomically
 from dew.lora import AdapterRecord, LoRA
@@ -850,7 +850,9 @@ class RunConfig:
     subcommand its flags imply."""
 
     model: ModelConfig = dataclasses.field(default_factory=ModelConfig)
-    data: DataSpec = dataclasses.field(default_factory=lambda: Images(source="tfds://oxford_flowers102"))
+    data: DataSpec = dataclasses.field(default_factory=lambda: Images(
+        source="tfds://oxford_flowers102", split="all", augment=Augment(flip=True, jitter=True),
+        caption_templates=("a photo of a {}",), validation=HoldOut(records=128)))
     data_read: Read = "memory"
     provision: bool = False
     data_seed: int = 0
@@ -1143,7 +1145,8 @@ class RunConfig:
         # Before the run length, since a ramp reads fewer records a step early
         # and a pass over the data is that many steps longer.
         dataset = dataset if trainer.batch_ramp is None else ramped(dataset, trainer.batch_ramp)
-        summary = {**(summary or {}), **({} if dataset.plan is None else {"data_plan": dataset.plan.record()})}
+        if dataset.plan is not None:
+            summary = {**(summary or {}), "data_plan": dataset.plan.record()}
         steps = trainer.total_steps(dataset)
         tracker = None
         try:
