@@ -92,14 +92,10 @@ def _preferred_read(pipelines: Sequence[Pipeline]) -> Read:
         else:
             chosen.append("indexed" if source.supports("indexed") else "streamed")
     preferred = READS.index(max(chosen, key=READS.index))
-    return next(
-        (
-            read
-            for read in READS[preferred::-1]
-            if all(isinstance(source, _Provisionable) for source in _unsupported(pipelines, read))
-        ),
-        READS[preferred],
-    )
+    for read in READS[preferred::-1]:
+        if all(isinstance(source, _Provisionable) for source in _unsupported(pipelines, read)):
+            return read
+    return READS[preferred]
 
 
 def _unsupported(pipelines: Sequence[Pipeline], read: Read) -> list[Source]:
