@@ -40,7 +40,7 @@ from dew.data import (
     compile,
     validation,
 )
-from dew.data.dataset import CAPTION, Dataset, ramped, weight_counts
+from dew.data.dataset import CAPTION, Dataset, GlobalStream, ramped, weight_counts
 from dew.data.recipes import load
 from dew.data.steps.image import EncodeCaptions
 from dew.objectives.base import VALID_ROWS, Aux, Objective
@@ -189,13 +189,17 @@ def test_a_mixtures_pass_is_the_records_every_corpus_has_been_read_in():
     assert records(two_corpora(weights=(3, 9), records=(10, 30))) == 40
 
 
-def length(record) -> int:
-    """A record's length for `LengthGroups`, read off its id."""
-    return int(record["id"]) % 7
+@dataclasses.dataclass(frozen=True)
+class Length:
+    """A record's length for `LengthGroups`, read off its id. A value, so the
+    plan names it and a position saved under it resumes exactly."""
+
+    def __call__(self, record) -> int:
+        return int(record["id"]) % 7
 
 
 def grouped(corpora, batch=4, window=3):
-    return compile(corpora.group(length, window=window).batch(batch), read="memory", loading=READ).train
+    return compile(corpora.group(Length(), window=window).batch(batch), read="memory", loading=READ).train
 
 
 def test_length_groups_read_each_window_as_batches_of_like_length():
@@ -729,6 +733,22 @@ def indexed_data(records: int, batch: int, seed: int = 0) -> Dataset:
                    loading=READ)
 
 
+def stitched_data(records: int, batch: int, seed: int) -> Dataset:
+    """The order `indexed_data` compiles, read straight off plain Grain at
+    `batch` records a step, behind a position that counts records and so
+    carries on at another batch."""
+
+    def train(partition: DataPartition) -> GlobalStream:
+        def open_at(offset: int):
+            order = pygrain.MapDataset.source(Indexed(1, records)).seed(seed).shuffle(seed).repeat(None)
+            mine = order[offset + partition.index::partition.count]
+            return iter(mine.to_iter_dataset(pygrain.ReadOptions(1, 8)).batch(partition.rows(batch)))
+
+        return GlobalStream(open_at, batch, f"{records} records reshuffled from seed {seed}", READ)
+
+    return Dataset(train=train, val=None, records=records, batch=batch)
+
+
 def test_a_ramped_stream_reads_the_records_the_flat_stream_reads():
     """The ramp cuts the same order into different steps, so the records it
     hands over are the flat stream's records in the flat stream's order: a
@@ -945,7 +965,7 @@ def test_a_ramped_run_lands_where_the_fixed_batch_runs_stitched_together_land(tm
         steps=sum(lengths), log_every=100, checkpoint_every=None)
 
     stitched = [regression_trainer(tmp_path / "stitched").fit(
-                    indexed_data(records, batch, seed), steps=sum(lengths[:stage + 1]),
+                    stitched_data(records, batch, seed), steps=sum(lengths[:stage + 1]),
                     log_every=100, checkpoint_every=None)
                 for stage, batch in enumerate([8, 16, 24])][-1]
 
