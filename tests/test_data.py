@@ -40,7 +40,9 @@ from dew.data import (
     load,
 )
 from dew.data.compile import validation
-from dew.data.dataset import Forwarding, GlobalStream, _batches, describe, hold_out, train_stream, validation_pass
+from dew.data.dataset import (
+    Forwarding, GlobalStream, _batches, describe, hold_out, train_stream, validation_pass,
+)
 from dew.data.dataset import Records as IndexedRows
 from dew.data.images import decode_image
 from dew.data.sinks import export
