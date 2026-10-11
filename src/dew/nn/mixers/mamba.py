@@ -39,7 +39,7 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.blocks import normal_kernel
-from dew.nn.flops import projection_flops, real_lengths
+from dew.nn.flops import conv_flops, projection_flops, ssd_flops
 from dew.nn.inputs import AttentionMetadata
 from dew.nn.linear import DepthwiseConv1d, held_scan
 from dew.nn.mixer_base import MixerBase, MixerContext
@@ -141,7 +141,8 @@ class Mamba(nn.Module):
         inner = self.intermediate_size
         return (projection_flops(lengths, self.emb_features, 3 * inner)
                 + projection_flops(lengths, inner, 2 * self.time_step_rank + 2 * self.state_size)
-                + float(real_lengths(lengths).sum()) * inner * (2 * self.conv_kernel + 4 * self.state_size))
+                + conv_flops(lengths, inner, inner, self.conv_kernel, groups=inner)
+                + ssd_flops(lengths, 1, self.state_size, inner))
 
     def setup(self):
         if self.conv_kernel < 2:

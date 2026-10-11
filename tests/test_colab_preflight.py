@@ -178,10 +178,12 @@ def test_a_ref_without_the_called_module_fails_the_preflight(tmp_path, monkeypat
     args = argparse.Namespace(
         ref=commit, hardware="gpu:G4", command="python /content/c56/rules.py", inputs=[str(script)], pin=[]
     )
-    args.origin, args.accept, args.dew_python = "origin", [], sys.executable
+    args.origin, args.accept, args.also, args.dew_python = "origin", [], [], sys.executable
     receipt = preflight.preflight(args, tmp_path / "work")
     assert receipt["commit"] == commit and not receipt["ok"]
-    assert receipt["failures"] == ["rules.py:2: dew.kernels.fla_gdn: dew.kernels has no fla_gdn"]
+    # The script runs Dew's code, and this ref predates the lowering dry run: both fail, by name.
+    assert receipt["failures"][0] == "rules.py:2: dew.kernels.fla_gdn: dew.kernels has no fla_gdn"
+    assert len(receipt["failures"]) == 2 and "predates the lowering dry run" in receipt["failures"][1]
     assert receipt["inputs"] == {"rules.py": hashlib.sha256(script.read_bytes()).hexdigest()}
     assert (receipt["interpreter"], receipt["tool"]) == ("system", preflight.TOOL)
 
@@ -260,3 +262,274 @@ def test_selection_refuses_a_request_without_a_preflight(tmp_path, monkeypatch):
     monkeypatch.setattr(batch, "QUEUE", queue)
     with pytest.raises(ValueError, match="GPU request lacks preflight"):
         batch.select("gpu", "test", "gpu:T4", [])
+
+
+KERNELS_SOURCE = "KERNELS = {'gated_delta_rule': {'sm80': 'fla'}, 'attention': {'sm80': 'flash'}}\n"
+
+
+def kernel_tree(root: Path, kernels: str = KERNELS_SOURCE) -> Path:
+    write(root, {
+        "src/dew/__init__.py": "", "src/dew/nn/__init__.py": "", "src/dew/nn/kernels/__init__.py": "",
+        "src/dew/nn/kernels/generation.py": kernels,
+        "src/dew/nn/kernels/rule.py": "def rule(): return 1\n",
+        "src/dew/nn/linear.py": "from dew.nn.kernels import rule\n",
+        "src/dew/data.py": "x = 1\n",
+    })
+    return root
+
+
+def test_the_kernel_digest_covers_the_kernels_and_their_callers_only(tmp_path):
+    tree = kernel_tree(tmp_path)
+    first = preflight.kernel_digest(tree)
+    (tree / "src/dew/data.py").write_text("x = 2\n")
+    assert preflight.kernel_digest(tree) == first
+    for changed in ("src/dew/nn/linear.py", "src/dew/nn/kernels/rule.py"):
+        (tree / changed).write_text((tree / changed).read_text() + "# changed\n")
+        assert preflight.kernel_digest(tree) != first
+        first = preflight.kernel_digest(tree)
+
+
+def test_pallas_kernel_choices_need_the_labs_record_of_their_exact_code(tmp_path, monkeypatch):
+    """A ref whose KERNELS run Pallas kernels on the target GPU needs the kernel lab's record for its
+    kernels' digest; a ref naming none (here the A100's flash attention is CUDA, not Pallas) needs
+    none, and a G4 with no row runs no Pallas kernel."""
+    tree = kernel_tree(tmp_path)
+    records = {}
+    monkeypatch.setattr(preflight, "store_read", lambda key, config=None: (records.get(key), "absent"))
+    failures: list[str] = []
+    found = preflight.lab_verified(tree, "gpu:A100", failures)
+    assert found["pallas"] == ["gated_delta_rule=fla"]
+    assert failures and "not verified on a100" in failures[0]
+    records[f"lab/verified/a100/{found['digest']}.json"] = {"ok": True, "ref": "abc", "gpu": "a100"}
+    failures.clear()
+    assert preflight.lab_verified(tree, "gpu:A100", failures)["record"]["ref"] == "abc" and not failures
+    assert preflight.lab_verified(tree, "gpu:G4", failures) == {"generation": "sm120", "pallas": []}
+    assert not failures
+    # A script that names a Pallas implementation needs the record even where KERNELS names none.
+    script = {"ab.py": "rule(q, implementation='fla')\n"}
+    sites = preflight.explicit_pallas(script, "clef --delta-rule-impl pallas")
+    assert sites == ["<command>:1", "ab.py:1"]
+    preflight.lab_verified(tree, "gpu:G4", failures, sites)
+    assert failures and "not verified on g4" in failures[0]
+    # The pinned JAX is part of the digest: a JAX bump needs the lab again.
+    digest = preflight.kernel_digest(tree)
+    (tree / "constraints.txt").write_text("jax==0.11.2\njaxlib==0.11.2\nnumpy==2.0\n")
+    bumped = preflight.kernel_digest(tree)
+    (tree / "constraints.txt").write_text("jax==0.11.3\njaxlib==0.11.3\nnumpy==2.0\n")
+    newer = preflight.kernel_digest(tree)
+    assert len({digest, bumped, newer}) == 3
+    (tree / "constraints.txt").write_text("jax==0.11.3\njaxlib==0.11.3\nnumpy==2.1\n")
+    assert preflight.kernel_digest(tree) == newer
+
+
+def test_a_second_ref_is_checked_out_only_when_declared_and_fetched(tmp_path, monkeypatch):
+    """c58's fallback checkout failed on the VM, which had fetched only the job's ref, and the
+    script went on at the job's ref. A script's other ref must be declared (`--also`), and the
+    entry's `refs:` must fetch it."""
+    tree = tmp_path / "dew"
+    commit = repository(tree, {"src/dew/__init__.py": "", "src/dew/kernels.py": "rule = 1\n"})
+    subprocess.run(["git", "-C", str(tree), "-c", "user.name=T", "-c", "user.email=t@e.invalid",
+                    "commit", "--allow-empty", "-qm", "fallback"], check=True)
+    fallback = subprocess.check_output(["git", "-C", str(tree), "rev-parse", "HEAD"], text=True).strip()
+    monkeypatch.setattr(preflight, "REPO", tree)
+    monkeypatch.setattr(preflight, "VENV_PYTHON", "{}.{}".format(*sys.version_info[:2]))
+    script = tmp_path / "run.sh"
+    script.write_text(f"git checkout -q {commit}\ngit checkout -q {fallback}\n")
+    args = argparse.Namespace(ref=commit, hardware="gpu:A100", command="bash /content/c/run.sh",
+                              inputs=[str(script)], pin=[], origin="origin", accept=[], also=[],
+                              dew_python=sys.executable)
+    undeclared = preflight.preflight(args, tmp_path / "work")
+    assert not undeclared["ok"] and "nor a declared --also ref" in undeclared["failures"][0]
+    args.also = [fallback]
+    declared = preflight.preflight(args, tmp_path / "work2")
+    assert declared["ok"] and declared["refs"] == [fallback]
+    path = tmp_path / "receipt.json"
+    path.write_text(json.dumps(declared))
+    request = {"commit": commit, "hardware": "gpu:A100", "command": args.command, "runtime": []}
+    with pytest.raises(ValueError, match="refs: does not fetch"):
+        preflight.verify(path, request, [])
+    assert preflight.verify(path, {**request, "refs": [fallback]}, [])
+
+
+def test_a_setting_known_to_break_gpu_runs_fails_the_preflight():
+    texts = {"drive.py": "env = {**os.environ, 'JAX_EXPLAIN_CACHE_MISSES': '1'}\n"}
+    found = preflight.hazards(texts, "python drive.py")
+    assert len(found) == 1 and found[0].startswith("drive.py:1 sets JAX_EXPLAIN_CACHE_MISSES")
+    assert preflight.hazards({"drive.py": "print(1)\n"}, "python drive.py") == []
+    made = {"run.sh": "JAX_EXPLAIN_CACHE_MISSES=1 python x.py\n",
+            "x.py": "os.environ['JAX_EXPLAIN_CACHE_MISSES'] = '1'\n"
+                    "jax.config.update('jax_explain_cache_misses', True)\n"}
+    assert [hazard.split(" sets ")[0] for hazard in preflight.hazards(made, "bash run.sh")] == [
+        "run.sh:1", "x.py:1", "x.py:2"]
+    named = {"c50_profile.py": '"""JAX\'s cache-miss explainer (JAX_EXPLAIN_CACHE_MISSES) is not used."""\n'}
+    assert preflight.hazards(named, "python c50_profile.py") == []
+
+
+
+def test_every_request_that_runs_dews_code_has_a_step_to_lower(tmp_path):
+    """c58's command reached the Clef recipe through the profile script it staged. A kernel bench and
+    the lab's verify run Dew's kernels without training and lower as much: two short verifies once
+    launched on a kernel whose inline assembly did not lower. Only a request running no Dew code,
+    a torch reference, has nothing to lower."""
+    texts = {"c58.sh": 'bash -c "$C58_PROFILE"\n',
+             "c50_profile.py": "import subprocess\nsubprocess.run(['python', 'recipes/decision/clef.py'])\n"}
+    assert preflight.trains(texts, "C58_PROFILE='python c50_profile.py' bash c58.sh") == ["c50_profile.py:2"]
+    assert preflight.trains({"run.py": "from dew.training import Trainer\n"}, "python run.py") == ["run.py:1"]
+    bench, _, _, _ = preflight.uses("from dew.nn.kernels import fla_gdn\n", "c54_fla_port.py")
+    assert preflight.trains({"c54_fla_port.py": ""}, "python c54_fla_port.py") == []
+    assert preflight.runs_dew(bench) == ["c54_fla_port.py:1"]
+    verify = [{"module": "tools.kernel_lab.verify", "attrs": [], "where": "<shell>"}]
+    assert preflight.runs_dew(verify) == ["<shell>"]
+    torch, _, _, _ = preflight.uses("import torch\n", "reference.py")
+    assert preflight.runs_dew(torch) == []
+    failures: list[str] = []
+    assert preflight.lowered(tmp_path, "gpu:A100", sys.executable, [], {}, failures) == {
+        "skipped": "the request runs no Dew code"}
+    assert not failures
+    preflight.lowered(tmp_path, "gpu:A100", sys.executable, ["<shell>"], {}, failures)
+    assert len(failures) == 1 and "runs Dew's code (<shell>)" in failures[0]
+
+
+FAKE_STEP = """import json, os, sys
+print("lowering", file=sys.stderr)
+print(json.dumps({"kernels": {"args": " ".join(sys.argv[1:-1]), "platforms": os.environ["JAX_PLATFORMS"],
+                              "flags": os.environ["XLA_FLAGS"], "path": os.environ["PYTHONPATH"]}}))
+"""
+
+
+def test_a_training_request_lowers_the_refs_clef_step_under_its_own_jax_settings(tmp_path):
+    """The ref's tools/clef_step.py lowers its Clef step for the GPU's generation over one device, on
+    this CPU whatever platform the request names, under the JAX and XLA settings the request's
+    command and shell scripts assign; the receipt keeps the generation, the device count, the
+    settings, the script's digest and the kernels it lowered. A ref without the script, or one
+    whose step does not lower, fails."""
+    tree = tmp_path / "dew"
+    failures: list[str] = []
+    found = preflight.lowered(tree, "gpu:A100", sys.executable, ["<command>:1"], {}, failures)
+    assert len(failures) == 1 and "predates the lowering dry run" in failures[0] and "kernels" not in found
+    write(tree, {"tools/clef_step.py": FAKE_STEP})
+    shell = {"run.sh": "export XLA_FLAGS='--xla_a=1 --xla_b=2'\nJAX_PLATFORMS=cuda python recipes/d/clef.py\n"
+                       "JAX_Z=$W true\n"}
+    env = preflight.lowering_env(shell, "JAX_TRACEBACK_FILTERING=off bash run.sh")
+    assert env == {"JAX_TRACEBACK_FILTERING": "off", "XLA_FLAGS": "--xla_a=1 --xla_b=2",
+                   "JAX_PLATFORMS": "cuda"}
+    failures.clear()
+    found = preflight.lowered(tree, "gpu:G4", sys.executable, ["run.sh:2"], env, failures)
+    assert not failures
+    assert found == {"generation": "sm120", "devices": 1, "env": env, "sites": ["run.sh:2"], "model": "tiny",
+                     "geometry": {}, "script": hashlib.sha256(FAKE_STEP.encode()).hexdigest(),
+                     "kernels": {"args": "--lower-for sm120 --devices 1 --work", "platforms": "cpu",
+                                 "flags": "--xla_a=1 --xla_b=2", "path": str(tree / "src")}}
+    shape = {"like": "Qwen/Qwen3.5-9B", "max-len": "3072"}
+    found = preflight.lowered(tree, "gpu:G4", sys.executable, ["run.sh:2"], env, failures, shape)
+    assert found["model"] == "Qwen/Qwen3.5-9B" and found["geometry"] == shape and not failures
+    assert found["kernels"]["args"] == ("--lower-for sm120 --devices 1 --like=Qwen/Qwen3.5-9B --max-len=3072 "
+                                        "--work")
+    write(tree, {"tools/clef_step.py": "import sys\nsys.exit('ValueError: not enough values to unpack')\n"})
+    found = preflight.lowered(tree, "gpu:A100", sys.executable, ["run.sh:2"], {}, failures)
+    assert len(failures) == 1 and "does not lower for sm80" in failures[0]
+    assert "not enough values to unpack" in failures[0] and found["kernels"] is None
+
+
+LAB_SCRIPT = 'git checkout -q "$LAB_REF"\npython -m tools.kernel_lab.server --gpu a100 --work /content/lab\n'
+
+
+def test_the_kernel_labs_own_session_needs_no_record_it_exists_to_write(tmp_path, monkeypatch):
+    """A session that runs the kernel lab alone, its server, client and gate, produces the lab's
+    record, so its preflight records the bootstrap; a session that also runs a script of its own or
+    trains is no lab session, and still needs the record."""
+    command = "bash /content/kernel-lab/kernel-lab.sh"
+    texts = {"kernel-lab.sh": LAB_SCRIPT}
+    assert preflight.lab_session(preflight.shell(command, texts), texts, command)
+    bench = {**texts, "c54.py": "from dew.nn.kernels import fla_gdn\n"}
+    benched = command + " && python /content/c54/c54.py"
+    assert not preflight.lab_session(preflight.shell(benched, bench), bench, benched)
+    training = {"kernel-lab.sh": LAB_SCRIPT + "python -m tools.kernel_lab.submit --verify --ref X\n"
+                                              "python -m dew.training.launch recipes/decision/clef.py\n"}
+    assert not preflight.lab_session(preflight.shell(command, training), training, command)
+    tree = kernel_tree(tmp_path / "dew")
+    write(tree, {"tools/__init__.py": "", "tools/kernel_lab/__init__.py": "",
+                 "tools/kernel_lab/server.py": "",
+                 "tools/clef_step.py": "import json\nprint(json.dumps({'kernels': {'rms_norm': 'xla'}}))\n"})
+    commit = repository(tree, {})
+    monkeypatch.setattr(preflight, "REPO", tree)
+    monkeypatch.setattr(preflight, "VENV_PYTHON", "{}.{}".format(*sys.version_info[:2]))
+    monkeypatch.setattr(preflight, "store_read", lambda key, config=None: (None, "absent"))
+    script = tmp_path / "kernel-lab.sh"
+    script.write_text(LAB_SCRIPT)
+    args = argparse.Namespace(ref=commit, hardware="gpu:A100", command=f"LAB_REF={commit} {command}",
+                              inputs=[str(script)], pin=[], origin="origin", accept=[], also=[],
+                              dew_python=sys.executable)
+    receipt = preflight.preflight(args, tmp_path / "work")
+    assert receipt["ok"], receipt["failures"]
+    assert receipt["kernel_lab"]["bootstrap"] == "this session produces the record"
+    # The lab's server compiles Dew's kernels on the GPU, so its step lowers here first.
+    assert receipt["lowered"]["generation"] == "sm80" and receipt["lowered"]["kernels"]
+
+
+def test_a_session_that_trains_only_after_the_lab_gate_stops_it_is_gated_at_runtime():
+    """The gate must stop the session where it fails, by `set -e` before it or `|| exit` on its line,
+    and stand before everything that trains, here a staged driver that runs the Clef recipe."""
+    driver = {"train.py": "subprocess.run([python, 'recipes/decision/clef.py'])\n"}
+    verified = ("set -eu\n# then train.py, once the gate holds\n"
+                "python -m tools.kernel_lab.verify --gpu a100 --ref X\n")
+    gated = {"run.sh": verified + "python -m tools.colab.lab_gate --gpu a100\npython train.py\n", **driver}
+    assert preflight.runtime_gate(gated, "bash run.sh") == "run.sh:4"
+    stopped = {"run.sh": "python -m tools.colab.lab_gate --gpu a100 || exit 1\npython train.py\n", **driver}
+    assert preflight.runtime_gate(stopped, "bash run.sh") == "run.sh:1"
+    for unsafe in ("python -m tools.colab.lab_gate --gpu a100\npython train.py\n",
+                   "python train.py\npython -m tools.colab.lab_gate --gpu a100 || exit 1\n",
+                   "python -m tools.colab.lab_gate --gpu a100 || exit 1\necho done\n"):
+        assert preflight.runtime_gate({"run.sh": unsafe, **driver}, "bash run.sh") is None, unsafe
+
+
+def test_lab_gate_help_works_when_docstrings_are_stripped(monkeypatch):
+    from tools.colab import lab_gate
+
+    monkeypatch.setattr(lab_gate, "__doc__", None)
+    monkeypatch.setattr(sys, "argv", ["gate", "--help"])
+    with pytest.raises(SystemExit) as stopped:
+        lab_gate.main()
+    assert stopped.value.code == 0
+
+
+def test_the_lab_gate_reads_what_the_preflight_reads(tmp_path, monkeypatch):
+    """The gate fails a ref whose KERNELS row names Pallas kernels on the GPU and whose digest has no
+    ok record, passes one that has it, and passes a GPU whose row names none."""
+    from tools.colab import lab_gate
+
+    tree = kernel_tree(tmp_path)
+    records: dict = {}
+    monkeypatch.setattr(preflight, "store_read", lambda key, config=None: (records.get(key), "absent"))
+    found, failures = lab_gate.gate(tree, "a100")
+    assert failures and "not verified on a100" in failures[0]
+    records[f"lab/verified/a100/{found['digest']}.json"] = {"ok": True, "ref": "abc", "gpu": "a100"}
+    assert lab_gate.gate(tree, "a100")[1] == []
+    assert lab_gate.gate(tree, "g4") == ({"generation": "sm120", "pallas": []}, [])
+
+
+def test_the_lowered_step_takes_the_checkpoint_and_rows_the_request_trains():
+    """c58's profile script handed the recipe its checkpoint in a Python list and its command its batch:
+    the step lowers with that checkpoint's widths at those rows. A checkpoint on the VM's disk, which
+    this host lacks, leaves the tiny model's widths and is named."""
+    texts = {"c50_profile.py": 'flags = ["--pretrained", "Qwen/Qwen3.5-0.8B", "--revision", "abc123",\n'
+                               '         "--max-len", "3072"]\n',
+             "c58.sh": "python c50_profile.py --trainer.batch-size 8\n"}
+    assert preflight.geometry(texts, "bash c58.sh") == {"like": "Qwen/Qwen3.5-0.8B", "revision": "abc123",
+                                                        "max-len": "3072", "batch": "8"}
+    local = "python recipes/decision/clef.py --pretrained /content/ckpt --revision None"
+    assert preflight.geometry({}, local) == {"local": "/content/ckpt"}
+    computed = {"c50.py": 'run(["--pretrained", backbone[0], "--max-len", str(row)])\n'}
+    assert preflight.geometry(computed, "python c50.py") == {}
+    looped = "python recipes/decision/clef.py --loop-layers 2 6 --model.attention-impl xla --remat minimal"
+    assert preflight.geometry({}, looped) == {"not applied": "--loop-layers, --model.attention-impl, --remat"}
+
+
+def test_a_kernel_no_cpu_lowers_is_named_in_the_receipt_and_never_passed_as_lowered():
+    """tokamax's Triton ragged dot registers on GPU hosts only (`dew.training._lowering.UNLOWERABLE`): a
+    ref whose KERNELS row names it for the GPU gets a receipt that says it was not lowered, and why,
+    so the kernel lab's record stands as its only check."""
+    named = ["gated_delta_rule=pallas", "grouped_matmul=pallas", "tokamax_grouped_matmul=triton"]
+    unseen = preflight.unlowered(named)["not lowered"]
+    assert list(unseen) == ["tokamax_grouped_matmul=triton"] and "GPU hosts only" in unseen[named[2]]
+    assert preflight.unlowered(named[:2]) == {}

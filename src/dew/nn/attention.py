@@ -27,7 +27,7 @@ from dew.telemetry.devices import deterministic_ops_requested
 
 from .attention_sinks import attention_with_sinks
 from .flops import attention_flops, projection_flops, real_lengths
-from .kernels import decode_attention
+from .kernels import decode_attention, generation
 from .kernels.generation import bf16_dot_runs, device_generation, first_refusal, measured_kernel, ran_kernel
 from .kv_cache import Append, KVCache, KVStore, filled_slots
 from .precision import (
@@ -917,7 +917,7 @@ def weighted_values(equation, weights, value, *, precision=None) -> jax.Array:
     if equation != '...hqk,...khd->...qhd':
         raise ValueError(f"weighted_values takes flax's value product, got {equation!r}")
     weights = weights.astype(value.dtype)
-    if value.dtype != jnp.float32 or value.shape[-3] <= VALUE_BLOCK or jax.default_backend() != 'cpu':
+    if value.dtype != jnp.float32 or value.shape[-3] <= VALUE_BLOCK or generation.backend() != 'cpu':
         return jnp.einsum(equation, weights, value, precision=precision)
     return _blocked_values(weights, value, precision)
 
@@ -1117,7 +1117,7 @@ def folds(query, key, bias, mask, causal, sliding_window) -> bool:
     few query positions over keys of the query's heads, masked by key
     lengths at most, such as a decode step's grouped query
     (`CausalSelfAttention._decode_attention`) where cudnn does not run."""
-    return (jax.default_backend() == 'gpu' and query.shape[-2] == key.shape[-2]
+    return (generation.backend() == 'gpu' and query.shape[-2] == key.shape[-2]
             and query.shape[-3] * key.shape[-2] <= FOLDED_PAIRS
             and bias is None and mask is None and not causal and sliding_window is None)
 
@@ -1241,7 +1241,7 @@ def fused_attention(query, key, value, bias, mask, causal, sliding_window, imple
             mask = with_key_lengths(mask, key_value_seq_lengths, key.shape[-3])
         out = tpu_attention(query, key, value, bias, mask, causal, sliding_window,
                             softcap=softcap, sinks=sinks, segment_ids=segment_ids,
-                            interpret=jax.default_backend() != 'tpu')
+                            interpret=generation.backend() != 'tpu')
     return out if v_head_dim == out.shape[-1] else out[..., :v_head_dim]
 
 
@@ -1400,7 +1400,7 @@ def _xla_kernel_narrows(query) -> bool:
     fp32"), and names the BF16_BF16_F32 algorithm for a bf16 one, which a GPU
     older than sm80 rejects at run time, past jax's own fallback."""
     return query.dtype == jnp.float64 or (
-        query.dtype == jnp.bfloat16 and jax.default_backend() == 'gpu' and not bf16_dot_runs())
+        query.dtype == jnp.bfloat16 and generation.backend() == 'gpu' and not bf16_dot_runs())
 
 
 def _xla_kernel_chains(query, key) -> bool:
@@ -1408,7 +1408,7 @@ def _xla_kernel_chains(query, key) -> bool:
     product over more than VALUE_BLOCK keys in one chain, as YNNPACK,
     XLA:CPU's dot, does, so 'auto' and 'xla' take the reference path, whose
     `weighted_values` sums it in blocks."""
-    return query.dtype == jnp.float32 and key.shape[-3] > VALUE_BLOCK and jax.default_backend() == 'cpu'
+    return query.dtype == jnp.float32 and key.shape[-3] > VALUE_BLOCK and generation.backend() == 'cpu'
 
 
 def resolve_implementation(implementation, query, key, *, dtype=None, precision=None,
@@ -1761,7 +1761,7 @@ def tpu_runs(query, key, *, causal=False, sliding_window=None, mask=None, bias=N
     would gather the queries back. `exchanged_heads_attention` calls the kernel
     inside a `shard_map` where `sequence_shards` is 1, so splash takes those.
     """
-    if jax.default_backend() != 'tpu' or query.dtype not in SPLASH_DTYPES:
+    if generation.backend() != 'tpu' or query.dtype not in SPLASH_DTYPES:
         return False
     if sequence_shards() > 1 or bias is not None:
         return False

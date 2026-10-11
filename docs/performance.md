@@ -78,8 +78,22 @@ product; trainable weights additionally perform their weight-gradient product.
 A frozen `in * out` dense layer with trainable rank-r LoRA factors therefore costs
 `4 * in * out + 6 * r * (in + out)` per token (`nn.flops.dense_training_flops`).
 `Objective.training_flops` is the named training-work assembly point; it is not
-`Objective.model_flops`, which counts only the forward. Core currently refuses
-adapter geometry by name, and never reports three-times-forward MFU for PEFT.
+`Objective.model_flops`, which counts only the forward. For adapted causal
+decoders, the model declares its learned-matrix contribution and each native
+adapter scope's usage, including looped layer passes and a separate vocabulary
+head. Adapter factor geometry comes from the actual bound two-axis layouts.
+Frozen base maps cost twice their forward work, trainable factors three times
+their forward work, and nonparameter attention/state MACs remain three-times
+forward. Frozen matrices are charged 4N throughout, including the first layer's
+input projections, whose input gradient a frozen embedding never needs.
+A decision objective adds its newly trained head separately; a text-only
+multimodal wrapper counts its language model, not its unused media towers.
+Unsupported matrix scopes/geometry raise `MissingFlopsCount` by name.
+
+The trainer consumes `Objective.training_flops`, not `3 * Objective.model_flops`.
+Forward and training counters remain separate in prefetched batch metadata;
+the training sum rides the existing interval's single metric read, without an
+extra transfer or a hidden full-FT assumption for LoRA.
 
 ## A CPU cluster against one GPU, 2026-10-08
 

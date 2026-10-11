@@ -11,7 +11,7 @@ import math
 import numpy as np
 from flax import linen as nn
 
-from .protocols import Counted
+from .protocols import Counted, CountedParameters
 
 
 class MissingFlopsCount(ValueError):
@@ -28,11 +28,6 @@ def real_lengths(lengths: np.ndarray) -> np.ndarray:
 
 def counted_flops(module: nn.Module | Counted, lengths: np.ndarray) -> float:
     """Read a module's declaration, or refuse by name; never read its HLO."""
-    from dew.lora import AdaptedClass
-
-    if isinstance(module, AdaptedClass):
-        raise MissingFlopsCount(f"{type(module).__name__} needs its adapter projection geometry "
-                                "for train/mfu")
     if not isinstance(module, Counted):
         raise MissingFlopsCount(f"{type(module).__name__} has no model_flops(lengths); "
                                 "cannot report train/mfu")
@@ -43,9 +38,21 @@ def counted_flops(module: nn.Module | Counted, lengths: np.ndarray) -> float:
     return count
 
 
+def parameter_flops(module: nn.Module | CountedParameters, lengths: np.ndarray) -> float:
+    """The declared learned-matrix contribution; no inference from parameter names."""
+    if not isinstance(module, CountedParameters):
+        raise MissingFlopsCount(f"{type(module).__name__} has no parameter_flops for PEFT training work")
+    return float(module.parameter_flops(lengths))
+
+
 def projection_flops(lengths: np.ndarray, inputs: int, outputs: int) -> float:
     """One dense matrix: two operations per input/output pair per real token."""
     return float(2 * inputs * outputs * np.sum(real_lengths(lengths)))
+
+
+def conv_flops(lengths: np.ndarray, inputs: int, outputs: int, taps: int, *, groups: int = 1) -> float:
+    """Convolution MACs per real output position, with grouped input width."""
+    return projection_flops(lengths, taps * inputs // groups, outputs)
 
 
 def dense_training_flops(lengths: np.ndarray, inputs: int, outputs: int, *,
