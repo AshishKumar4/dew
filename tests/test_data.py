@@ -599,7 +599,7 @@ def test_a_position_over_another_order_is_refused():
     for other in ({"length": 64}, {"seed": 1}):
         stream = load(Indexed(**other, batch=8), batch=8, read="indexed", seed=other.get("seed", 0),
                       loading=Loading(workers=0)).train(DataPartition())
-        with pytest.raises(ValueError, match="records into"):
+        with pytest.raises(ValueError, match="saved data plan order changed"):
             stream.set_state(saved[0])
         stream.close()
 
@@ -660,13 +660,21 @@ def test_records_listed_in_memory_are_described_by_their_count_not_their_content
     stream = load(Records(source=rows), batch=8, read="memory").train(DataPartition())
     next(stream)
 
-    assert len(stream.get_state()) < 512
+    saved = stream.get_state()
+    assert len(saved) < 4096
+    larger = load(Records(source=rows * 4), batch=8, read="memory", loading=Loading(workers=0)).train(
+        DataPartition())
+    try:
+        next(larger)
+        assert abs(len(larger.get_state()) - len(saved)) < 128
+    finally:
+        larger.close()
     stream.close()
 
 
 def test_an_indexed_filter_resumes_the_exact_accepted_record_order():
     pipeline = Pipeline(Memory(_Points(16))).shuffle(0).repeat().filter(
-        lambda row: int(row["index"]) % 3 != 0).batch(4)
+        lambda row: int(row["index"]) % 3 != 0, identity="exclude-multiples-of-three").batch(4)
     data = compile(pipeline, read="indexed", **WORKERS)
     stream = data.train(DataPartition())
     try:
@@ -732,8 +740,11 @@ def test_local_videos_lists_every_file_under_the_directory(tmp_path):
     clips = _voxceleb_tree(tmp_path)
     (tmp_path / "extra.webm").write_bytes(b"")
 
-    training, _, _ = Video(source=str(tmp_path), caption="a clip").pipelines()
-    records = training.source.records("memory")
+    from dew.data import Files
+    from dew.data.steps.video import VideoPath
+
+    rows = Files(str(tmp_path), format="files").records("memory")
+    records = [VideoPath(caption="a clip").map(row) for row in rows]
 
     assert [r["video_path"] for r in records] == sorted(
         [str(c) for c in clips] + [str(tmp_path / "extra.webm")]
@@ -877,6 +888,8 @@ class Augmenting:
     def pipelines(self):
         source = self.source()
         count = len(source) if self.count is None else self.count
+        if count > len(source):
+            raise ValueError(f"count {count} is more than the {len(source)} records")
         train, held = hold_out(source, count, 0 if self.val_split else (self.val_batches or 0) * self.batch,
                                "Augmenting")
         if self.val_split is not None:
@@ -977,9 +990,18 @@ class Lingering(Augmenting):
 
     seconds: float = 2.0
 
-    def record(self, element, rng):
+    def transform(self, *, training=True):
+        return _LingeringRecord(super().transform(training=training), self.seconds)
+
+
+@dataclasses.dataclass(frozen=True)
+class _LingeringRecord(pygrain.RandomMapTransform):
+    transform: ImageRecord
+    seconds: float
+
+    def random_map(self, element, rng):
         _linger(self.seconds)
-        return super().record(element, rng)
+        return self.transform.random_map(element, rng)
 
 
 @pytest.mark.slow
@@ -1470,7 +1492,7 @@ def test_a_map_dataset_streams_and_resumes_as_grains_own_pipeline_reads_it():
     pipeline = _grain_points(10)
     reference = pipeline.repeat(None).batch(4)
     expected = [[int(i) for i in reference[index]["index"]] for index in range(6)]
-    data = compile(Pipeline(Memory(pipeline)).repeat().batch(4), read="indexed", **WORKERS)
+    data = compile(Pipeline(Memory(_Points(10))).shuffle(0).repeat().batch(4), read="indexed", **WORKERS)
 
     stream = data.train(DataPartition())
     assert _indices(stream, 3) == expected[:3]

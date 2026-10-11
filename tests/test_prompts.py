@@ -216,7 +216,7 @@ def test_a_malformed_message_is_refused():
 def test_a_non_object_row_is_refused():
     with pytest.raises(json.JSONDecodeError):
         prompt_rows(("{oops",), TOKENIZER, WINDOW, 0)
-    with pytest.raises(ValueError, match="an object"):
+    with pytest.raises(ValueError, match="record of named fields"):
         source([1, 2])[0]
 
 
