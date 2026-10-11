@@ -3,6 +3,7 @@ CUDA generation on any host or trained for a few steps on this one's devices.
 
     python tools/clef_step.py --lower-for sm80    # a CPU will do: every Pallas-Triton kernel lowers
     python tools/clef_step.py --steps 3           # on the GPU: the step compiles and runs
+    python tools/clef_step.py --lower-for sm80 --like Qwen/Qwen3.5-9B --max-len 3072 --batch 4
 
 c58 (an A100) and c57 (a G4) passed every CPU test and the port's own GPU
 tests, then died in their first compile of the decision step, in a
@@ -14,7 +15,9 @@ on every projection and Clef's joint head. The backbone is the size of a
 test fixture: the tiny Qwen 3.5's three Gated DeltaNet layers and one
 full-attention layer, with 64-wide key and value heads, the narrowest the
 port takes (`dew.nn.linear.fla_refusal`), so `KERNELS` chooses on it as on
-the 0.8B.
+the 0.8B. `--like` gives its four layers another checkpoint's widths instead
+(`GEOMETRY`, from that checkpoint's config alone), the heads and widths a
+kernel's choices and refusals read, and `--max-len` and `--batch` its rows.
 
 The last line printed is a JSON record: the Pallas-Triton kernels the
 lowered step calls, by name (`dew.training.lowering.triton_kernels`), or the
@@ -37,6 +40,13 @@ QWEN = Path("tests") / "fixtures" / "hf" / "qwen38-dense-tiny"
 WIDTHS = {"linear_key_head_dim": 64, "linear_value_head_dim": 64, "linear_num_value_heads": 2}
 """The Gated DeltaNet heads the port tiles: keys of 64, 128 or 256 and values by 64."""
 
+GEOMETRY = ("hidden_size", "head_dim", "num_attention_heads", "num_key_value_heads", "attn_output_gate",
+            "partial_rotary_factor", "linear_key_head_dim", "linear_value_head_dim", "linear_num_key_heads",
+            "linear_num_value_heads", "linear_conv_kernel_dim")
+"""What `--like` takes from its checkpoint: a layer's widths and heads. The layers, the vocabulary and
+the MLP's width stay the tiny model's, which no kernel choice reads, so a 9B's geometry lowers in a
+few gigabytes."""
+
 
 def recipe(tree: Path, name: str):
     """A module of `tree`'s recipes/decision, which imports its siblings by name."""
@@ -50,7 +60,7 @@ def recipe(tree: Path, name: str):
     return module
 
 
-def backbone(tree: Path, directory: Path) -> Path:
+def backbone(tree: Path, directory: Path, like: str | None = None, revision: str | None = None) -> Path:
     """The tiny Qwen 3.5's decoder at the port's widths, drawn by transformers' own initializer and
     saved in its layout with the tiny model's tokenizer: Dew writes no Gated DeltaNet hybrid's
     checkpoint of its own (`refuse_lossy_export`). The multi-token-prediction head stays off, as
@@ -61,8 +71,15 @@ def backbone(tree: Path, directory: Path) -> Path:
     qwen = tree / QWEN
     text = json.loads((qwen / "config.json").read_text())["text_config"]
     text = {name: value for name, value in text.items() if not name.startswith("mtp_")}
+    shaped = WIDTHS
+    if like is not None:
+        from dew.interop import sources
+
+        config = json.loads((sources.snapshot(like, revision, weights=False) / "config.json").read_text())
+        config = config.get("text_config", config)
+        shaped = {name: config[name] for name in GEOMETRY if name in config}
     torch.manual_seed(0)
-    Qwen3_5ForCausalLM(Qwen3_5TextConfig.from_dict({**text, **WIDTHS})).save_pretrained(directory)
+    Qwen3_5ForCausalLM(Qwen3_5TextConfig.from_dict({**text, **shaped})).save_pretrained(directory)
     for asset in [*qwen.glob("tokenizer*"), qwen / "chat_template.jinja"]:
         (directory / asset.name).write_bytes(asset.read_bytes())
     return directory
@@ -89,17 +106,33 @@ def mixture(tree: Path, directory: Path) -> Path:
     return directory / "mixture"
 
 
-def run(tree: Path, work: Path, steps: int, generation: str | None):
+@dataclasses.dataclass(frozen=True)
+class Rows:
+    """The backbone's geometry (`backbone`'s `like` at `revision`) and the step's rows."""
+
+    like: str | None = None
+    revision: str | None = None
+    max_len: int = 1024
+    batch: int = 8
+
+
+TINY = Rows()
+"""The tiny model's own geometry at 8 rows of 1,024 tokens."""
+
+
+def run(tree: Path, work: Path, steps: int, generation: str | None, rows: Rows = TINY):
     """`tree`'s Clef recipe's run over the tiny backbone and mixture in `work`, `steps` long, lowered
     for `generation` instead where one is named."""
     from dew.decision.config import DecisionRunConfig
 
-    flags = ["--pretrained", str(backbone(tree, work / "backbone")), "--revision", "None",
-             "--mixture.root", str(mixture(tree, work / "data")), "--max-len", "1024",
+    built = backbone(tree, work / "backbone", rows.like, rows.revision)
+    flags = ["--pretrained", str(built), "--revision", "None",
+             "--mixture.root", str(mixture(tree, work / "data")), "--max-len", str(rows.max_len),
              "--lora.rank", "4", "--head.width", "24", "--head.heads", "2", "--head.feedforward", "40",
              "--head.layers", "1", "--head.routing-layers", "1",
              "--trainer.name", "clef-step", "--trainer.checkpoint-dir", str(work / "runs"),
-             "--trainer.batch-size", "8", "--trainer.steps", str(steps), "--trainer.log-every", "1",
+             "--trainer.batch-size", str(rows.batch), "--trainer.steps", str(steps),
+             "--trainer.log-every", "1",
              "--trainer.eval-every", str(steps), "--trainer.checkpoint-every", str(steps),
              "--trainer.multi-host", "False", "--trainer.compilation-cache-dir", "None",
              "--data.loading.workers", "0", "--optim.schedule.warmup-steps", "1", "--no-calibrate"]
@@ -118,23 +151,23 @@ def host_devices(count: int) -> None:
     os.environ["XLA_FLAGS"] = " ".join([*kept, f"--xla_force_host_platform_device_count={count}"])
 
 
-def lowered(tree: Path, work: Path, generation: str) -> dict:
+def lowered(tree: Path, work: Path, generation: str, rows: Rows = TINY) -> dict:
     """The kernels the step calls once lowered for `generation`."""
     from dew.training.lowering import Lowered
 
     try:
         # Two steps: the schedule decays after its one warmup step.
-        run(tree, work, 2, generation)
+        run(tree, work, 2, generation, rows)
     except Lowered as done:
-        return {"generation": done.generation, "kernels": done.kernels}
+        return {"generation": done.generation, "kernels": done.kernels, **dataclasses.asdict(rows)}
     raise RuntimeError(f"the run trained rather than lowering for {generation}")
 
 
-def trained(tree: Path, work: Path, steps: int) -> dict:
+def trained(tree: Path, work: Path, steps: int, rows: Rows = TINY) -> dict:
     """The loss of each of `steps` steps on this host's devices, as the run's journal holds them."""
     import jax
 
-    run(tree, work, steps, None)
+    run(tree, work, steps, None, rows)
     journal = work / "runs" / "clef-step" / "tracking" / "scalars.jsonl"
     scalars = [json.loads(line)["scalars"] for line in journal.read_text().splitlines()]
     return {"device_kind": jax.devices()[0].device_kind,
@@ -146,6 +179,10 @@ def main() -> None:
     parser.add_argument("--lower-for", help="a CUDA generation ('sm80', 'sm120') to lower the step for")
     parser.add_argument("--devices", type=int, default=1, help="the GPUs the lowered step spreads over")
     parser.add_argument("--steps", type=int, default=3, help="the steps to train, where nothing is lowered")
+    parser.add_argument("--like", help="a checkpoint whose layer widths the backbone takes (`GEOMETRY`)")
+    parser.add_argument("--revision", help="--like's commit")
+    parser.add_argument("--max-len", type=int, default=Rows.max_len, help="a row's tokens")
+    parser.add_argument("--batch", type=int, default=Rows.batch, help="the rows of a step")
     parser.add_argument("--work", type=Path, help="where the backbone, the data and the run go; a temporary "
                         "directory by default")
     parser.add_argument("--tree", type=Path, default=ROOT, help="the Dew checkout whose recipe and tiny "
@@ -155,8 +192,9 @@ def main() -> None:
         host_devices(args.devices)
     with tempfile.TemporaryDirectory() as scratch:
         work = args.work or Path(scratch)
-        result = (lowered(args.tree, work, args.lower_for) if args.lower_for else
-                  trained(args.tree, work, args.steps))
+        rows = Rows(args.like, args.revision, args.max_len, args.batch)
+        result = (lowered(args.tree, work, args.lower_for, rows) if args.lower_for else
+                  trained(args.tree, work, args.steps, rows))
     print(json.dumps(result, sort_keys=True))
 
 
