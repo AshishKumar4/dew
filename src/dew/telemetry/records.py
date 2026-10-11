@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import dataclasses
 import importlib.metadata
+import json
 import logging
 import math
 import platform
@@ -17,11 +18,45 @@ import traceback
 import typing
 from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import Literal
+from typing import TYPE_CHECKING, Literal, Self
 
-from dew.records import JSON
+if TYPE_CHECKING:
+    from dew.records import JSON
 
 _log = logging.getLogger(__name__)
+
+
+@dataclasses.dataclass(frozen=True)
+class WorkloadWork:
+    """One objective's analytical training work, shared across framework environments.
+
+    The model's native config names the counted geometry. The batch shape
+    includes the LM target column or the image's channels; tokens count the
+    real model inputs (patches for images). Reading this record requires only
+    the standard library, so a reference environment need not install JAX.
+    """
+    training_flops_per_step: float
+    tokens_per_step: int
+    basis: str
+    model_identity: str
+    batch_shape: tuple[int, ...]
+
+    @property
+    def examples_per_step(self) -> int:
+        return self.batch_shape[0]
+
+    def write(self, path: str | Path) -> None:
+        """Keep the numerator beside the run so its reference can read the same work."""
+        destination = Path(path)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(json.dumps(dataclasses.asdict(self), indent=2, allow_nan=False) + "\n")
+
+    @classmethod
+    def read(cls, path: str | Path) -> Self:
+        """Restore the native count without loading its model or a device backend."""
+        record = json.loads(Path(path).read_text())
+        record["batch_shape"] = tuple(record["batch_shape"])
+        return cls(**record)
 
 
 def json_value(value: object) -> JSON:
