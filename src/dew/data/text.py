@@ -8,6 +8,7 @@ tokenizer on first use, so a host without the hub cache still imports
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import threading
 from collections.abc import Mapping, Sequence
@@ -23,10 +24,34 @@ _load_lock = threading.Lock()
 _loaded: dict[tuple[str, str | None, bool], PreTrainedTokenizerBase] = {}
 
 
-def tokenizer_snapshot(name: str) -> Mapping[str, object]:
-    """Pin the tokenizer and every local template file its loader can read."""
+@dataclasses.dataclass(frozen=True)
+class PinnedTokenizer:
+    """A tokenizer resolved once to immutable files (`pin_tokenizer`): the
+    snapshot a step's identity hashes and the directory it reads its
+    vocabulary and templates from, which are one revision by construction."""
+
+    snapshot: Mapping[str, object]
+    directory: str | None
+    """The snapshot's local directory, or None for the byte vocabulary."""
+
+    def load(self) -> ByteTokenizer | HFTokenizer:
+        if self.directory is None:
+            return ByteTokenizer()
+        return HFTokenizer(self.directory, local_files_only=True)
+
+    def transformers(self) -> PreTrainedTokenizerBase:
+        """The transformers tokenizer of these files, whose chat template renders conversations."""
+        if self.directory is None:
+            raise ValueError("chat templates need a Hugging Face tokenizer, not the byte vocabulary")
+        return load_tokenizer(self.directory, local_files_only=True)
+
+
+def pin_tokenizer(name: str) -> PinnedTokenizer:
+    """Resolve `name` once: the byte vocabulary, a local directory, or a hub
+    repo (optionally `repo@revision`) downloaded at its resolved revision,
+    with every file its loader can read hashed."""
     if name == "byte":
-        return {"name": "byte", "encoding": "utf-8", "eos": 255}
+        return PinnedTokenizer({"name": "byte", "encoding": "utf-8", "eos": 255}, None)
     directory = Path(name)
     resolved = None
     repo = None
@@ -41,7 +66,13 @@ def tokenizer_snapshot(name: str) -> Mapping[str, object]:
     files = {str(path.relative_to(directory)): hashlib.sha256(path.read_bytes()).hexdigest()
              for pattern in ("*.json", "*.jinja", "*.model", "*.txt", "*.tiktoken")
              for path in directory.rglob(pattern) if path.is_file()}
-    return {"name": None if resolved is None else repo, "revision": resolved, "files": files}
+    snapshot = {"name": None if resolved is None else repo, "revision": resolved, "files": files}
+    return PinnedTokenizer(snapshot, str(directory))
+
+
+def tokenizer_snapshot(name: str) -> Mapping[str, object]:
+    """Pin the tokenizer and every local template file its loader can read."""
+    return pin_tokenizer(name).snapshot
 
 
 def load_tokenizer(name: str, *, revision: str | None = None,

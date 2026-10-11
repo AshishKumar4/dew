@@ -1361,3 +1361,34 @@ def test_the_same_corpus_gives_the_same_windows_and_packing_in_every_store(store
     for name in fields:
         assert windows[name] == windows["bin"], name
         assert packed[name] == packed["bin"], name
+
+
+def test_a_hub_tokenizer_runs_the_revision_its_identity_names(monkeypatch, tmp_path):
+    """Tokenize resolves a hub name once: its identity hashes the files of the
+    resolved revision and its encoding reads those same files, here and in a
+    worker it is pickled to, never the name again."""
+    import pickle
+
+    import huggingface_hub
+
+    from dew.data.steps.text import Tokenize
+    from dew.data.text import load_tokenizer
+
+    files = tmp_path / "snapshot"
+    shutil.copytree(Path(__file__).parent / "fixtures" / "tokenizers" / "gpt2", files)
+    resolved = []
+
+    class Hub:
+        def model_info(self, repo, revision=None):
+            resolved.append(repo)
+            return type("Info", (), {"sha": "a" * 40})()
+
+    monkeypatch.setattr(huggingface_hub, "HfApi", Hub)
+    monkeypatch.setattr(huggingface_hub, "snapshot_download",
+                        lambda repo, revision, allow_patterns: str(files))
+    step = Tokenize("acme/tokenizer")
+    assert step.dependencies()["tokenizer"]["revision"] == "a" * 40
+    sent = pickle.loads(pickle.dumps(step))
+    encoded = [int(token) for token in sent.map({"text": "hello there"})["text"]]
+    assert encoded == load_tokenizer(str(files), local_files_only=True).encode("hello there")
+    assert resolved == ["acme/tokenizer"]
