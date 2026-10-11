@@ -12,7 +12,8 @@
 // The largest request body Cloudflare's edge hands a Worker on this account's
 // plan (100 MB); a larger PUT would fail there before the Worker answers.
 const MAX_BYTES = 100 * 1000 * 1000;
-const KEY = /^[A-Za-z0-9._-]+(\/[A-Za-z0-9._-]+)*$/;
+// '=' for Hive partition directories (split=train), as pyarrow.dataset writes them.
+const KEY = /^[A-Za-z0-9._=-]+(\/[A-Za-z0-9._=-]+)*$/;
 
 async function authorized(request, token) {
   const given = new TextEncoder().encode(request.headers.get('authorization') ?? '');
