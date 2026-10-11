@@ -448,10 +448,18 @@ class DecisionInputs:
       real questions, `spans` `[B, Q, 2]` their instructions' (start, end);
     - `option_spans` `[B, Q, K, 2]` each option slot's (start, end), `options`
       `[B, Q, K]` the real slots;
-    - in the parallel layout, `positions` `[B, L]` and `slots` `[B, L]`.
+    - in the parallel layout, `positions` `[B, L]` and `slots` `[B, L]`;
+    - `option_slots` `[B, P]` each row's real options as flat indices `q * K + k`
+      into its `[Q, K]` grid, in that order (`compacted`), and `slotted` `[B, P]`
+      which of them are real, or None for the grid itself.
 
     A row of one question with one marker per option, Laya's, has Q of 1 and
     spans one token long.
+
+    The grid holds the most questions times the most options, and a row's real
+    options are a few of them: in the Qwen3.5-0.8B decision mixture 24 to 100 of
+    28 x 100. A head that reads `option_slots` computes the real ones alone,
+    P rather than Q x K of them.
     """
 
     tokens: jnp.ndarray
@@ -463,6 +471,8 @@ class DecisionInputs:
     options: jnp.ndarray
     positions: jnp.ndarray | None = None
     slots: jnp.ndarray | None = None
+    option_slots: jnp.ndarray | None = None
+    slotted: jnp.ndarray | None = None
 
     @property
     def markers(self) -> jnp.ndarray:
@@ -471,11 +481,13 @@ class DecisionInputs:
 
     @classmethod
     def collate(cls, rows: Sequence[Encoded], pad: int, *, questions: int | None = None,
-                options: int | None = None) -> "DecisionInputs":
+                options: int | None = None, option_slots: int | None = None) -> "DecisionInputs":
         """Right-pad `rows` into one batch (`pad_token_rows`), its question and option slots to the widest.
 
         `questions` and `options` widen those slots further, to shapes a caller
-        keeps fixed.
+        keeps fixed. `option_slots` is the real options a row may hold, a shape
+        a caller keeps fixed too (`compacted`); without it, the batch's most,
+        rounded up to `OPTION_TILE`, where that is fewer than the grid's slots.
         """
         parallel = rows[0].positions is not None
         if any((row.positions is not None) != parallel for row in rows):
@@ -499,7 +511,36 @@ class DecisionInputs:
                 spans[index, slot] = laid.span
                 option_spans[index, slot, :len(laid.options)] = laid.options
                 real_options[index, slot, :len(laid.options)] = True
+        if option_slots is None:
+            most = int(real_options.reshape(len(rows), -1).sum(axis=1).max())
+            option_slots = -(-max(most, 1) // OPTION_TILE) * OPTION_TILE
+            compact = option_slots < count * width
+        else:
+            compact = True
+        indexed = [compacted(row, option_slots) for row in real_options] if compact else None
         return cls(jnp.asarray(tokens), jnp.asarray(valid), jnp.asarray(kinds), jnp.asarray(real),
                    jnp.asarray(spans), jnp.asarray(option_spans), jnp.asarray(real_options),
                    jnp.asarray(padded["positions"], jnp.int32) if parallel else None,
-                   jnp.asarray(padded["slots"], jnp.int32) if parallel else None)
+                   jnp.asarray(padded["slots"], jnp.int32) if parallel else None,
+                   None if indexed is None else jnp.asarray(np.stack([slots for slots, _ in indexed])),
+                   None if indexed is None else jnp.asarray(np.stack([real for _, real in indexed])))
+
+
+OPTION_TILE = 128
+"""What a batch's option slots round up to when its caller fixes none (`DecisionInputs.collate`)."""
+
+
+def compacted(options: np.ndarray, slots: int) -> tuple[np.ndarray, np.ndarray]:
+    """A row's real options, `options` `[Q, K]`, as `slots` flat indices into
+    its grid in row order, padded with 0, and which of them are real.
+
+    Raises ValueError for a row of more real options than `slots`: its shape
+    is the caller's to keep, and widening it would compile the step again.
+    """
+    real = np.flatnonzero(np.asarray(options, bool).reshape(-1)).astype(np.int32)
+    if len(real) > slots:
+        raise ValueError(f"a row of {len(real)} options outgrows its {slots} option slots; "
+                         "raise option_slots to the most options a row holds")
+    indices = np.zeros(slots, np.int32)
+    indices[:len(real)] = real
+    return indices, np.arange(slots) < len(real)
