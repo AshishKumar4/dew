@@ -11,6 +11,14 @@ Dew's rounded_to also rounds cotangents, unlike Liger's straight-through
 casts. Both passes reproduce those roundings; in particular SwiGLU's up
 gradient reads the rounded activation, not the unrounded SiLU. No hardware
 generation selects these kernels until c53 measures the complete VJPs.
+
+The fp32 tests hold maximum relative differences from XLA below 1e-5.
+At bf16 rounding midpoints, changing the reduction grouping can flip an
+output or input gradient by one bf16 ulp, despite the same arithmetic and
+rounding sites. The large random bf16 stress therefore also measures both
+implementations against float64, holding RMS error to the reference's
+budget (tests/reference_error.py), not promising 1e-5 maximum relative
+agreement after bf16 rounding. c53 reports the actual largest differences.
 """
 
 import functools
