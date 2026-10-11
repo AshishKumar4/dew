@@ -7,6 +7,7 @@ import importlib.util
 import io
 import json
 import sqlite3
+import subprocess
 import sys
 import unicodedata
 import zipfile
@@ -106,6 +107,37 @@ def test_url_producer_shards_without_changing_training_or_held_bytes(sources, mo
     assert made["slots"] == {"questions": 1, "options": 2, "total_options": 2, "choice_questions": 1}
     manifest = root.child("manifest.json").read()
     assert root.child("manifest.sha256").read().strip().decode() == hashlib.sha256(manifest).hexdigest()
+
+
+def test_sparse_slot_descriptor_references_unchanged_raw_data(sources, monkeypatch, tmp_path):
+    examples = [
+        Example("one", {"a": Choice("Pick", ["x", "y", "z"]), "b": Noul("Yes?")}, {"a": "x", "b": "true"}),
+        Example(
+            "two",
+            {"a": Choice("Pick", ["x", "y"]), "b": Choice("Pick", ["a", "b", "c", "d"])},
+            {"a": "x", "b": "a"},
+        ),
+    ]
+    monkeypatch.setattr(sources.Intents, "examples", lambda self: list(examples))
+    default = sources.Mixture()
+    off = {
+        entry.name: dataclasses.replace(getattr(default, entry.name), weight=0.0)
+        for entry in dataclasses.fields(default)
+    }
+    mixture = sources.Mixture(**{**off, "banking77": sources.Intents(held=0)})
+    sources.write(mixture, tmp_path)
+    original = (tmp_path / "manifest.json").read_bytes()
+    raw = (tmp_path / "banking77.jsonl").read_bytes()
+    command = [sys.executable, "tools/decision_metadata.py", "--source", str(tmp_path)]
+    subprocess.run([*command, "--set", "banking77"], check=True, capture_output=True, text=True)
+    published = subprocess.run([*command, "--publish"], check=True, capture_output=True, text=True)
+    metadata = json.loads(published.stdout)
+    descriptor = json.loads(Path(metadata["url"]).read_bytes())
+    assert descriptor["slots"] == {"questions": 2, "options": 4, "total_options": 6, "choice_questions": 2}
+    assert descriptor["provenance"]["original_manifest_sha"] == hashlib.sha256(original).hexdigest()
+    assert descriptor["provenance"]["raw_shards"][0]["sha256"] == hashlib.sha256(raw).hexdigest()
+    assert (tmp_path / "manifest.json").read_bytes() == original
+    assert (tmp_path / "banking77.jsonl").read_bytes() == raw
 
 
 @pytest.mark.parametrize("label", ["E", "S", "C", "I"])
