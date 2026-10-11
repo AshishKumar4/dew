@@ -402,6 +402,25 @@ def test_a_saved_vision_run_answers_image_rows(tmp_path):
     assert not np.array_equal(second, reloaded("charged twice!", asked)["team"].probabilities)
 
 
+def test_calibration_counts_33_validation_rows_once_at_batch_32():
+    """A filled validation pass fits temperatures on exactly its 33 answers.
+
+    Both the type and bucket reach a floor of 33 and miss a floor of 34.
+    The second batch's 31 repeats therefore add no calibration samples.
+    """
+    held = [Example(f"charged twice {index}", {"team": INTENT}, {"team": "billing"})
+            for index in range(33)]
+    objective = DecisionObjective(tiny_backbone(), tokenizer=TOKENIZER, specials=SPECIALS, layout=LAYOUT)
+    data = objective.dataset(EXAMPLES * 4, batch=32, validation=held)
+    task = Decide(objective.model, objective.init(jax.random.key(0)), LAYOUT, TOKENIZER, SPECIALS)
+
+    fitted = task.calibrated(data.val, type_minimum=33, bucket_minimum=33).calibration.temperatures
+    below = task.calibrated(data.val, type_minimum=34, bucket_minimum=34).calibration.temperatures
+
+    assert set(fitted.types) == {"choice"} and set(fitted.buckets) == {"choice:3-5"}
+    assert below.types == {} and below.buckets == {}
+
+
 def test_a_calibration_comes_back_with_the_weights_it_was_fitted_on(tmp_path):
     """A calibration saved into a run reloads with the step it was fitted
     on; trained further, the run's latest weights refuse it rather than

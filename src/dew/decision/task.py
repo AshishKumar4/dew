@@ -55,7 +55,7 @@ from dew.files import write_atomically
 from dew.inference.tasks import SHAPE_BUCKETS
 from dew.interop.processors import Processor
 from dew.nn.inputs import RowPlan, mesh_of
-from dew.objectives.base import Metric, Variables
+from dew.objectives.base import Metric, Objective, Variables
 from dew.records import JSON, json_value, record
 
 if TYPE_CHECKING:
@@ -462,7 +462,8 @@ class Decide:
         for batch in reader(DataPartition()):
             inputs = laid_out(batch)
             logits = np.asarray(self._forward(self.variables, inputs))
-            answered = np.asarray(batch["scored"])
+            answered = (np.asarray(batch["scored"])
+                        & (np.asarray(Objective.row_weights(batch, len(logits))) > 0)[:, None])
             for row, slot in zip(*np.nonzero(answered), strict=True):
                 count = int(np.sum(batch["options"][row, slot]))
                 scored.append(Scored(KINDS[int(batch["kinds"][row, slot])].kind, logits[row, slot, :count],
