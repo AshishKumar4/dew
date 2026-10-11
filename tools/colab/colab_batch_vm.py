@@ -243,11 +243,20 @@ class Batch:
             verified_bytes = 0
             for source in self.plan["data_sources"]:
                 cache = DataCache(source["endpoint"], Path("/content/.dew-data-read.token"))
-                restored = cache.restore(source["prefix"], source["manifest_sha256"], Path(source["target"]),
-                                         manifest_key=source.get("manifest_key"))
+                restored = cache.restore(
+                    source["prefix"],
+                    source["manifest_sha256"],
+                    Path(source["target"]),
+                    manifest_key=source.get("manifest_key"),
+                )
                 verified_bytes += sum(record["bytes"] for record in restored["files"])
-            self.save(data_restore={"seconds": time.monotonic() - data_began, "verified_physical_bytes": verified_bytes,
-                                    "includes": "download or verified reuse, hashing, and declared assemblies"})
+            self.save(
+                data_restore={
+                    "seconds": time.monotonic() - data_began,
+                    "verified_physical_bytes": verified_bytes,
+                    "includes": "download or verified reuse, hashing, and declared assemblies",
+                }
+            )
         if shutil.which("uv") is None:
             command([sys.executable, "-m", "pip", "install", "uv"], timeout=300, env=public_environment())
 
