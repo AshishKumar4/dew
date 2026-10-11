@@ -60,7 +60,7 @@ def step_compiler_options(objective, tokens: float, frozen: bool) -> jax.stages.
 
     Only an LM objective gives the tokens per row, its `seq_len`, so any other
     objective's frozen step runs apart. Triton GEMM fusions are turned off where
-    `KERNELS['xla_triton_gemm']` measured a win and no module the step runs
+    `gpu_target().kernels['xla_triton_gemm']` measured a win and no module the step runs
     keeps them (`TritonGemm`).
     """
     generation = device_generation()

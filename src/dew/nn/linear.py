@@ -388,7 +388,7 @@ def chunk_states_kernel(implementation: str, key, out_vals, gc) -> str:
     values and decays runs: 'xla' or 'pallas' (`delta_chunks`, `delta_prep`),
     whose fused in-chunk correction and memory recurrence decay per head.
 
-    'auto' takes the generation's measured one (`KERNELS['gated_delta_rule']`)
+    'auto' takes the generation's measured one (`gpu_target().kernels['gated_delta_rule']`)
     and 'xla' elsewhere. 'pallas' needs a GPU the kernels compile for,
     operands they take (`delta_chunks.refusal`) and reverse mode, since under
     `forward_mode_attention`, which traces for `jax.jvp`, the XLA scan gives
