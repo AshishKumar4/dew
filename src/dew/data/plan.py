@@ -87,6 +87,8 @@ class _Dependencies(Protocol):
 
 
 def _dependencies(step: object) -> Mapping[str, object]:
+    if step is None or isinstance(step, (str, int, float, bool, bytes, np.ndarray)):
+        return {}
     if isinstance(step, _Dependencies):
         return step.dependencies()
     if dataclasses.is_dataclass(step) and not isinstance(step, type):

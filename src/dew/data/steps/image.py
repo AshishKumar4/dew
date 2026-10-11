@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import dataclasses
 import functools
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
+from typing import Literal
 
 import grain.python as grain
 import numpy as np
@@ -144,3 +145,74 @@ class DeviceAugment:
                 augment_batch, size=self.size, crop_scale=self.crop_scale, flip=self.flip, jitter=self.jitter
             )
         )
+
+
+@dataclasses.dataclass(frozen=True)
+class ImageRecord(grain.RandomMapTransform):
+    size: int
+    staging_size: int
+    field: str = "image"
+    caption: str | None = None
+    templates: tuple[str, ...] = ()
+    columns: tuple[str, ...] = ("caption", "text")
+    classes: tuple[str, ...] = ()
+    flip: bool = False
+    jitter: bool = False
+    crop_scale: tuple[float, float] = (1., 1.)
+    backend: Literal["host", "device"] = "host"
+
+    def random_map(self, element: Batch | bytes, rng: np.random.Generator) -> Batch:
+        import_opencv()
+        if isinstance(element, bytes):
+            from dew.data.sources.codec import unpack_dict_of_byte_arrays
+
+            decoded = unpack_dict_of_byte_arrays(element)
+            if "shape" in decoded:
+                height, width = np.frombuffer(decoded["shape"], np.int32)
+                pixels = np.frombuffer(decoded["image"], np.uint8).reshape(int(height), int(width), 3)
+                label = None if "label" not in decoded else int(np.frombuffer(decoded["label"], np.int32)[0])
+                element = {"image": pixels, "caption": decoded["caption"].decode(), "label": label}
+            else:
+                element = {"image": decoded["jpg"], "caption": decoded["txt"].decode()}
+        image = element[self.field]
+        label = element.get("label")
+        if self.templates:
+            chosen = self.templates[int(rng.integers(len(self.templates)))]
+            described = self.classes[int(label)] if self.classes else label
+            caption = chosen.format(described, label=described)
+        elif self.caption is not None:
+            described = self.classes[int(label)] if self.classes else label
+            caption = self.caption.format(**{**element, "label": described})
+        elif not self.columns:
+            caption = ""
+        else:
+            caption = next((str(element[key]) for key in self.columns if key in element), "")
+        if isinstance(image, bytes):
+            image = decode_image(image, at_least=self.staging_size)
+        else:
+            image = as_rgb(np.asarray(image))
+        image = resize_image(image, self.staging_size)
+        if self.backend == "host":
+            if (self.flip or self.jitter) and (self.crop_scale != (1., 1.) or self.staging_size != self.size):
+                image = RandomCrop(self.size, self.crop_scale, self.flip, self.jitter).random_map(
+                    {"image": image}, rng)["image"]
+            else:
+                image = augment_image(Augment(self.flip, self.jitter), image, rng)
+        held: Batch = {"image": image, "caption": caption}
+        if self.backend == "device":
+            held["image_augmentation_key"] = rng.integers(0, 2**32, size=2, dtype=np.uint32)
+        if label is not None:
+            held["label"] = np.int32(label)
+        return held
+
+
+@dataclasses.dataclass(frozen=True)
+class ConfigureImage:
+    image: ImageRecord
+
+    def __call__(self, metadata: Mapping[str, object]) -> ImageRecord:
+        from dew.records import record, strings
+
+        labels = record(metadata.get("class_names", {}), "class names").get("label")
+        return self.image if self.image.classes or labels is None else dataclasses.replace(
+            self.image, classes=strings(labels, "class_names.label"))
