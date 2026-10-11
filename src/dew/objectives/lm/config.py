@@ -147,7 +147,12 @@ class LMRunConfig(RunConfig):
                       read=self.data_read, provision=self.provision,
                       seed=self.data_seed, loading=self.loading,
                       validation_records=self.validation_records, objective=objective.data())
-        if not loaded.steps_per_epoch:
+        if loaded.steps_per_epoch is None and self.trainer.steps is None:
+            raise ValueError("this data has no epoch length, so a run cannot count epochs of it: online "
+                             "packing or a filter over an indexed or streamed read cuts its order per share. "
+                             "Read it whole first (--data-read memory), read a published packing generation "
+                             "by index, or give the run length as --trainer.steps")
+        if loaded.steps_per_epoch == 0:
             raise ValueError(f"{loaded.records} training windows do not fill one batch of "
                              f"{self.trainer.batch_size}, so an epoch is no steps at all: read more data "
                              "or lower --trainer.batch-size")
