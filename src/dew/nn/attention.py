@@ -73,8 +73,8 @@ calls splash's mask descriptor cannot carry.
 triton where cudnn's kernel runs and `triton_runs`; flash where
 `flash_refusal` finds none; cudnn where its kernel runs; tpu where splash's does;
 the reference path where the call asks for arithmetic only it honours; and
-xla anywhere else. A call off the kernel `KERNELS` measured fastest on the
-device is logged once a process with the reason (`ran_kernel`).
+xla anywhere else. A call off the kernel the device's target row (`gpu_target().kernels`)
+measured fastest is logged once a process with the reason (`ran_kernel`).
 """
 
 
@@ -812,7 +812,7 @@ FLASH_MAX_BACKWARD_HEAD_DIM = 192
 def flash_refusal(query, key, causal=False, sliding_window=None, mask=None, bias=None, softcap=None,
                   sinks=None) -> str | None:
     """Why 'auto' does not send a call to FlashAttention-2 (`flash_attention`),
-    or None where it does: `KERNELS` names it for the GPU, the query is bf16
+    or None where it does: the GPU's target row names it, the query is bf16
     or fp16 with heads a multiple of 8 up to 256 wide (192 off sm80, whose
     backward alone takes wider ones), a causal call is square, the call has
     no window, mask, bias, softcap or sinks, no deterministic ops are asked
@@ -822,7 +822,7 @@ def flash_refusal(query, key, causal=False, sliding_window=None, mask=None, bias
     widest = FLASH_MAX_HEAD_DIM if device_generation() == 'sm80' else FLASH_MAX_BACKWARD_HEAD_DIM
     return first_refusal(
         (jax.default_backend() == 'gpu' and measured_kernel('attention', 'cudnn') == 'flash',
-         "KERNELS names it for no other device"),
+         "its target row names it for no other device"),
         (query.dtype in CUDNN_DTYPES, f"the query is {query.dtype}"),
         (head_dim % 8 == 0 and head_dim <= widest, f"the heads are {head_dim} wide"),
         (not causal or query.shape[-3] == key.shape[-3], "a causal call has more keys than queries"),

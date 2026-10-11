@@ -228,6 +228,7 @@ def smoke_attribution(path: Path) -> dict:
 
 
 def comparison(reference: dict, attribution: Path, entry: Path) -> dict:
+    from common import peak_flops
     from qwen35 import FLOPS_PER_STEP, TOKENS_PER_STEP
 
     dew, timed = json.loads(attribution.read_text()), json.loads(entry.read_text())
@@ -260,7 +261,8 @@ def comparison(reference: dict, attribution: Path, entry: Path) -> dict:
                              "by_kind_ms": dew["time"]["by_kind_ms"]},
             "dew_backbone_estimate": {"step_ms": estimated_ms,
                                       "tokens_per_s": TOKENS_PER_STEP / (estimated_ms / 1000),
-                                      "mfu": FLOPS_PER_STEP / (estimated_ms / 1000) / 312e12,
+                                      "mfu": FLOPS_PER_STEP / (estimated_ms / 1000)
+                                             / peak_flops("NVIDIA A100"),
                                       "head_profile_ms_subtracted": head_ms, "by_kind_ms": adjusted,
                                       "categories_ms": dict(categories),
                                       "profile_idle_ms": dew["time"]["device_idle_ms_per_step"],

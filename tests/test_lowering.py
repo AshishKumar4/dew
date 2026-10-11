@@ -20,7 +20,6 @@ from dew.nn.kernels.generation import (
     assumed,
     backend,
     bf16_dot_runs,
-    derive_config,
     device_generation,
     gpu_mesh,
     gpu_target,
@@ -90,7 +89,7 @@ def test_the_gpu_mesh_keeps_the_axes_over_the_generations_devices():
     ('gpu:A100', 'sm80', 312e12, None, 163 * 1024),
     ('g4', 'sm120', 500e12, 1000e12, 99 * 1024),
     ('NVIDIA H100 PCIe', 'sm90', 756e12, 1513e12, 227 * 1024),
-    ('NVIDIA H200 NVL', 'sm90', 989e12, 1979e12, 227 * 1024),
+    ('NVIDIA H200 NVL', 'sm90', 835e12, 1670.5e12, 227 * 1024),
     ('NVIDIA GeForce RTX 4080', 'sm89', 97.5e12, None, 99 * 1024),
     ('TPU v5 lite', 'v5e', 197e12, None, None),
     ('unknown accelerator', 'unknown accelerator', None, None, None),
@@ -100,17 +99,6 @@ def test_one_target_resolves_generation_precision_peaks_and_block_memory(identif
     target = gpu_target(identifier)
     assert (target.generation, target.bf16_peak, target.fp8_peak, target.shared_limit) == (
         generation, bf16, fp8, shared)
-
-
-def test_configs_are_derived_from_the_worst_declared_shape_and_device_limit():
-    candidates = [{'stages': 2}, {'stages': 1}]
-    shapes = {'small': {'tile_bytes': 16 * 1024}, 'training': {'tile_bytes': 64 * 1024}}
-    def shared_bytes(kernel, config, shape, dtype):
-        return config['stages'] * shape['tile_bytes']
-    assert derive_config('test', candidates, shapes, 'float32', shared_bytes, 'sm80') == {'stages': 2}
-    assert derive_config('test', candidates, shapes, 'float32', shared_bytes, 'sm120') == {'stages': 1}
-    with pytest.raises(ValueError, match='no float32 config'):
-        derive_config('test', candidates[:1], shapes, 'float32', shared_bytes, 'sm120')
 
 
 def test_reference_target_reader_imports_with_the_standard_library_only():
