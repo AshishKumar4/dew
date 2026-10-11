@@ -33,10 +33,14 @@ def run_logged(args: list[str], log: Path, *, timeout: float, cwd: Path, env: di
             return f"timeout after {timeout} s"
 
 
+def public_environment() -> dict[str, str]:
+    private = {"MPLBACKEND", "WANDB_API_KEY", "WANDB_ENTITY", "WANDB_PROJECT"}
+    return {key: value for key, value in os.environ.items() if key not in private}
+
+
 def environment(venv: Path) -> dict[str, str]:
-    inherited = {key: value for key, value in os.environ.items() if key != "MPLBACKEND"}
     return {
-        **inherited,
+        **public_environment(),
         "PATH": f"{venv / 'bin'}:{os.environ['PATH']}",
         "VIRTUAL_ENV": str(venv),
         "PYTHONUNBUFFERED": "1",
@@ -51,6 +55,7 @@ def join_parts(root: Path, parts: list[str], target: Path, expected: str) -> Non
     digest = hashlib.sha256()
     try:
         with temporary.open("wb") as destination:
+            os.fchmod(destination.fileno(), 0o600)
             for name in parts:
                 if Path(name).name != name:
                     raise ValueError("input part escapes staging")
@@ -107,7 +112,7 @@ def install(venv: Path, tree: Path, log: Path) -> None:
     if (tree / "constraints.txt").is_file():
         commands[-1].extend(["-c", str(tree / "constraints.txt")])
     for args in commands:
-        code = run_logged(args, log, timeout=1200, cwd=tree, env=dict(os.environ))
+        code = run_logged(args, log, timeout=1200, cwd=tree, env=public_environment())
         if code != 0:
             raise RuntimeError(f"environment setup failed: {code}")
     check = [
@@ -198,6 +203,7 @@ class Batch:
 
     def prepare(self) -> None:
         command(["git", "init", "-q", str(self.repo)], timeout=30)
+        command(["git", "-C", str(self.repo), "remote", "add", "origin", self.plan["origin"]], timeout=30)
         for sha in self.plan["fetch_commits"]:
             command(
                 [
@@ -231,8 +237,29 @@ class Batch:
             command(["git", "-C", str(self.repo), "update-ref", "refs/colab/" + key, sha], timeout=30)
         for target, source in self.plan["uploads"].items():
             join_parts(self.root, source["parts"], Path(target).expanduser(), source["sha256"])
+        if self.plan.get("data_sources"):
+            from tools.colab.data_cache import DataCache
+
+            data_began = time.monotonic()
+            verified_bytes = 0
+            for source in self.plan["data_sources"]:
+                cache = DataCache(source["endpoint"], Path("/content/.dew-data-read.token"))
+                restored = cache.restore(
+                    source["prefix"],
+                    source["manifest_sha256"],
+                    Path(source["target"]),
+                    manifest_key=source.get("manifest_key"),
+                )
+                verified_bytes += sum(record["bytes"] for record in restored["files"])
+            self.save(
+                data_restore={
+                    "seconds": time.monotonic() - data_began,
+                    "verified_physical_bytes": verified_bytes,
+                    "includes": "download or verified reuse, hashing, and declared assemblies",
+                }
+            )
         if shutil.which("uv") is None:
-            command([sys.executable, "-m", "pip", "install", "uv"], timeout=300)
+            command([sys.executable, "-m", "pip", "install", "uv"], timeout=300, env=public_environment())
 
     def run_job(self, job: dict) -> dict:
         started = time.time()
@@ -260,7 +287,9 @@ class Batch:
             join_parts(self.root, job["resume_parts"], packed, job["resume_sha256"])
             colab_sync.restore(packed, tree, job["outputs"])
             packed.unlink()
-        env = {**environment(venv), **compilation_cache(job, tree, venv)}
+        from tools.colab.credentials import environment as private_environment
+
+        env = {**environment(venv), **compilation_cache(job, tree, venv), **private_environment(job)}
         # One venv per commit, but every job imports its own checked-out tree.
         env["PYTHONPATH"] = str(tree / "src")
         began = time.time()
@@ -275,7 +304,13 @@ class Batch:
         )
         status.update(exit=code, seconds=round(time.time() - began), command_finished_at=time.time())
         self.save_job(job, status)
-        colab_sync.pack_outputs(tree, job["outputs"], home / "outputs.tar.gz", job["artifact_policy"])
+        colab_sync.pack_outputs(
+            tree,
+            job["outputs"],
+            home / "outputs.tar.gz",
+            job["artifact_policy"],
+            job.get("artifact_excludes", []),
+        )
         status.update(
             stage_seconds=round(time.time() - started), artifact_manifest="outputs.tar.gz.manifest.json"
         )

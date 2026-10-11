@@ -592,7 +592,7 @@ def test_a_phased_run_resumes_past_a_switch_and_refuses_a_changed_history(tmp_pa
         with pytest.raises(ValueError, match="saved data plan order changed"):
             load(changed, batch=4, read="memory", loading=READ).train(DataPartition()).set_state(state)
     plain = Text(source=both, pack="first-fit", seq_len=8, packing_bins=2)
-    with pytest.raises(ValueError, match="phased run"):
+    with pytest.raises(ValueError, match=r"phase|stable identity"):
         load(plain, batch=4, read="memory", loading=READ).train(DataPartition()).set_state(state)
 
 
@@ -980,7 +980,7 @@ def test_a_ramp_stage_the_mesh_cannot_hold_is_refused_before_the_run_reads(tmp_p
     trainer = Trainer(Regression(), optax.sgd(0.5), key=jax.random.key(0),
                       layout=Layout(min_shard=1, tolerance=1.0))
 
-    with pytest.raises(ValueError, match=r"\[4, 12\].*multiple of 8"):
+    with pytest.raises(ValueError, match="batch 12 must divide across 8 row shards"):
         trainer.fit(ramped(indexed_data(256, 12), Ramp(start=4, increment=4, samples=16)),
                     steps=2, log_every=100)
 

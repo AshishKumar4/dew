@@ -1,6 +1,7 @@
 """Incremental job output snapshots, retained locally for re-release."""
 
 import errno
+import fnmatch
 import glob
 import hashlib
 import json
@@ -11,15 +12,19 @@ import tempfile
 from pathlib import Path
 
 
-def output_files(tree, patterns, policy="all"):
+def output_files(tree, patterns, policy="all", excludes=()):
     """One inventory for incremental and final collection, including nested logs.
 
     A measurements job declares OUT once, not a fragile list of log globs.
     Only its checkpoint step/frozen subtrees are excluded; scalars, profiles,
     tracking, run.json, and built data remain ordinary output files.
+    Exclusion patterns match archive-relative names: an external
+    /content/out/x/a.json is stored as content/out/x/a.json.
     """
     if policy not in ("all", "measurements"):
         raise ValueError(f"unknown artifact policy: {policy}")
+    if any(Path(pattern).is_absolute() for pattern in excludes):
+        raise ValueError("artifact exclusions must be archive-relative")
     tree = Path(tree)
     files = {}
     for pattern in patterns:
@@ -28,6 +33,10 @@ def output_files(tree, patterns, policy="all"):
             scope = root.resolve() if root.is_dir() else root.parent.resolve()
             for file in root.rglob("*") if root.is_dir() else [root]:
                 if not file.is_file():
+                    continue
+                relative = os.path.relpath(file, tree)
+                name = str(file).lstrip("/") if relative.startswith("..") else relative
+                if any(fnmatch.fnmatch(name, pattern) for pattern in excludes):
                     continue
                 if file.is_symlink() and not file.resolve().is_relative_to(scope):
                     raise ValueError(f"output link escapes declared scope: {file}")
@@ -55,8 +64,6 @@ def output_files(tree, patterns, policy="all"):
                     )
                 ):
                     continue
-                relative = os.path.relpath(file, tree)
-                name = str(file).lstrip("/") if relative.startswith("..") else relative
                 files[name] = file
     return files
 
@@ -96,9 +103,9 @@ def pack_files(files, archive):
     return manifest
 
 
-def pack_outputs(tree, patterns, archive, policy="all"):
+def pack_outputs(tree, patterns, archive, policy="all", excludes=()):
     """Final packaging uses exactly the same output policy as snapshots."""
-    files = output_files(tree, patterns, policy)
+    files = output_files(tree, patterns, policy, excludes)
     manifest = pack_files(files, archive)
     sidecar = Path(str(archive) + ".manifest.json")
     temporary = sidecar.with_name(sidecar.name + ".tmp")
@@ -107,10 +114,10 @@ def pack_outputs(tree, patterns, archive, policy="all"):
     return list(files)
 
 
-def snapshot(tree, patterns, known, archive, policy="all"):
+def snapshot(tree, patterns, known, archive, policy="all", excludes=()):
     tree = Path(tree)
     files = {}
-    for name, file in output_files(tree, patterns, policy).items():
+    for name, file in output_files(tree, patterns, policy, excludes).items():
         try:
             before = file.stat()
             with file.open("rb") as stream:

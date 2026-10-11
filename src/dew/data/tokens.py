@@ -1,21 +1,4 @@
-"""Reads token datasets off a tokenized corpus directory.
-
-The corpus is the `train.bin`, `val.bin` and `meta.json` that
-`dew tokenize` writes, or the same splits as ArrayRecord shards
-(`dew.data.sources.text`).
-
-`TokenWindows` reads `seq_len + 1` windows off the token stream, at a fixed
-stride or packed with whole documents and the segment ids and positions the
-backbone's mask needs. Train shuffles from `seed`, reshuffles per epoch and
-runs forever; val reads `val.bin` once, in file order, in whole batches, so
-every validation pass scores the same windows. Both shard by JAX process.
-
-The sharding comes last, so a run resumes from a global record count: the
-strided windows are fixed spans of the stream, and packing is planned over
-the whole corpus in file order. A step is then the same windows at any
-process count, and a saved position is a place in one order rather than one
-process's offset into its shard.
-"""
+"""Indexed document chunks, first-fit plans and finite reader forwarding."""
 
 from __future__ import annotations
 

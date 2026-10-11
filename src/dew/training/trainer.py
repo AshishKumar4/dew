@@ -78,7 +78,7 @@ from dew.objectives.base import (
     Variables,
     select,
 )
-from dew.records import JSON, boolean, record
+from dew.records import JSON, boolean, json_value, record
 from dew.telemetry import profile as telemetry_profile
 from dew.telemetry.instrumentation import compiled_flops, model_flops_utilization, peak_flops
 from dew.telemetry.profile import region
@@ -162,8 +162,9 @@ def batch_shapes(batch: Batch) -> Shapes:
 
 
 def batch_layout(batch: Batch) -> str:
-    """A batch's fields, each with its dtype and global shape."""
-    return ", ".join(f"{jax.tree_util.keystr(path)} {jnp.asarray(leaf).dtype}{list(np.shape(leaf))}"
+    """A batch's fields, each with its dtype and global shape; the batch may be
+    arrays or their abstract shapes (`jax.ShapeDtypeStruct`)."""
+    return ", ".join(f"{jax.tree_util.keystr(path)} {jnp.result_type(leaf)}{list(np.shape(leaf))}"
                      for path, leaf in jax.tree_util.tree_leaves_with_path(batch))
 
 
@@ -604,6 +605,14 @@ class Trainer(Generic[Loss, Effects]):
         # last trace of `initial_state` saw them (`_boxed_axes`).
         self._boxed: dict[tuple[str, ...], LogicalAxes] | None = None
         self._resumed_rung: JSON = None
+        # The rung each newly met shape starts from, as the first compile found
+        # the objective: its modules, head tile, XLA option choice and record
+        # (`_at_base_rung`); then the rung each shape compiled at, by layout,
+        # and the rungs a resumed checkpoint recorded for its shapes.
+        self._base_rung: tuple[tuple[nn.Module, ...], tuple[int, int] | None, bool, dict[str, JSON]] | None
+        self._base_rung = None
+        self._shape_rungs: dict[str, JSON] = {}
+        self._resumed_shapes: dict[str, JSON] = {}
 
     @property
     def optimizer(self) -> optax.GradientTransformation:
@@ -784,7 +793,7 @@ class Trainer(Generic[Loss, Effects]):
             abstract, shardings)
         state, position = checkpoints.restore(template, resume,
                                               share=DataPartition.of(self.device_mesh))
-        self._climb_to(checkpoints.rung(resume))
+        self._resume_rung(checkpoints.rung(resume))
         from dew.nn.inputs import request_key
         state = dataclasses.replace(state, key=jax.device_put(request_key(state.key), shardings.key))
         if int(state.window_size) != self.accumulation:
@@ -811,7 +820,7 @@ class Trainer(Generic[Loss, Effects]):
                          "(TextGeneration.from_run, dew.pipeline) until it is fixed: %s", reason)
         return artifact
 
-    def _rung(self) -> JSON:
+    def _rung(self) -> dict[str, JSON]:
         """The fit ladder's rung this trainer's step compiles at: the
         objective's head tile, its trained modules' remat (`recompute_record`) and whether
         the step keeps XLA's default options (`fitting_default`). A
@@ -820,6 +829,52 @@ class Trainer(Generic[Loss, Effects]):
         return {'head_tile': None if tile is None else list(tile),
                 'remat': recompute_record(self.objective),
                 'xla_defaults': self._xla_defaults}
+
+    def _checkpoint_rung(self) -> JSON:
+        """The rung a checkpoint records: the run's own, which every newly met
+        shape starts from (`_rung`'s fields as the first compile found them),
+        and under `shapes` the rung each shape compiled at, by its layout
+        (`batch_layout`)."""
+        base = self._rung() if self._base_rung is None else self._base_rung[3]
+        return {**base, 'shapes': dict(self._shape_rungs)}
+
+    def _resume_rung(self, rung: JSON) -> None:
+        """Take a checkpoint's rung (`_checkpoint_rung`): the objective climbs
+        to the run's own rung, and each shape the checkpoint names climbs to
+        its own when it is compiled (`_at_base_rung`). A rung recorded before
+        shapes had their own names none, so every shape starts at it."""
+        self._climb_to(rung)
+        if rung is not None:
+            shapes = record(record(rung, 'rung').get('shapes', {}), 'rung shapes')
+            self._resumed_shapes = {name: json_value(shape, f'rung of {name}')
+                                    for name, shape in shapes.items()}
+
+    def _at_base_rung(self, batch: Batch) -> JSON:
+        """Put the objective at the rung a newly met shape starts from, and
+        return the rung a resumed checkpoint recorded for this shape, or None.
+
+        Each shape fits on its own. A run bucketed by length meets a long
+        bucket that climbs, and when that rung stayed, every later, shorter
+        bucket compiled at it too, though it fitted with less recomputation
+        (c50's real mix: six shapes at 'minimal' that fitted with none, 15%
+        slower a token). So each new shape starts where the first compile
+        found the objective, its configured remat and head or the rung its
+        checkpoint trained on, and climbs only as far as it must. A shape the
+        checkpoint names climbs to that shape's own rung, so a resumed run
+        compiles each shape as the run it continues did."""
+        if self._base_rung is None:
+            self._base_rung = (tuple(entry.module for entry in self.objective.program_key()),
+                               head_tile_of(self.objective), self._xla_defaults, self._rung())
+        else:
+            modules, tile, defaults, _ = self._base_rung
+            self.objective.substitute(list(modules))
+            self.objective.restore_head_tile(tile)
+            self._xla_defaults = defaults
+        recorded = self._resumed_shapes.get(batch_layout(batch))
+        if recorded is None:
+            return None
+        self._climb_to(recorded)
+        return self._rung()
 
     def _climb_to(self, rung: JSON) -> None:
         """Move the objective up to `rung`, a checkpoint's (`_rung`), where
@@ -1075,7 +1130,8 @@ class Trainer(Generic[Loss, Effects]):
             return self._compile_host(state, batch)
         mesh = self.device_mesh
         links = self._links(mesh)
-        resumed, self._resumed_rung = self._resumed_rung, None
+        shaped = self._at_base_rung(batch)
+        resumed, self._resumed_rung = self._resumed_rung if shaped is None else shaped, None
         with self._traced_on(mesh, links) as schedule:
             shapes = None if self.step is not None else self._loss_shape(state, batch)
             if shapes is not None:
@@ -1148,6 +1204,7 @@ class Trainer(Generic[Loss, Effects]):
                 raise refusals[-1]
             if record_path is not None:
                 keep_rung(record_path, key, self._rung())
+            self._shape_rungs[batch_layout(batch)] = self._rung()
             self.flops_per_step = compiled_flops(self.executable)
             self.memory = memory_record(self.executable, self._local_devices(), held, fits=fits)
             self.links = links
@@ -1551,7 +1608,8 @@ class Trainer(Generic[Loss, Effects]):
         run.training = {'train/loss': loss, **{f'train/{name}': value for name, value in aux.items()}}
         if current % plan.log_every == 0:
             interval.check_finite(current, self._display)
-            self._log_interval(current, loss, aux, accepted, state, interval)
+            self._log_interval(current, loss, aux, accepted, state, interval,
+                               statistics=plan.dataset.statistics)
 
         if isinstance(plan.checkpoint_every, datetime.timedelta):
             # The clock is read at the log interval, where the step is already
@@ -2083,7 +2141,7 @@ class Trainer(Generic[Loss, Effects]):
                 ranking = (Ranking('train/loss', metadata['train/loss']),)
         checkpoints.save(step, state, position, metadata, share=DataPartition.of(self.device_mesh),
                          ranking=ranking, control=control, weights_only=weights_only,
-                         rung=self._rung(), artifact=self._artifact(), boxed=self._boxed_axes())
+                         rung=self._checkpoint_rung(), artifact=self._artifact(), boxed=self._boxed_axes())
         self._report(CheckpointRequested(checkpoints.directory), step)
         interval.saved(step)
         self._display.status("")
@@ -2105,14 +2163,15 @@ class Trainer(Generic[Loss, Effects]):
         paused = time.perf_counter()
         self._display.status("writing a local checkpoint")
         checkpoints.save_local(step, state, position, share=DataPartition.of(self.device_mesh),
-                               control=control, rung=self._rung(), artifact=self._artifact(),
+                               control=control, rung=self._checkpoint_rung(), artifact=self._artifact(),
                                boxed=self._boxed_axes())
         self._report(CheckpointRequested(str(checkpoints.local_directory), local=True), step)
         self._display.status("")
         return time.perf_counter() - paused
 
     def _log_interval(self, step: int, loss: jax.Array, aux: dict[str, jax.Array],
-                      accepted: jax.Array, state: TrainState, interval: _Interval) -> None:
+                      accepted: jax.Array, state: TrainState, interval: _Interval,
+                      *, statistics: Callable[[], Mapping[str, float]]) -> None:
         """Report one logging interval and start the next.
 
         Rank zero builds the row; every other rank has nothing to report.
@@ -2144,7 +2203,7 @@ class Trainer(Generic[Loss, Effects]):
             if self.rollout is not None:
                 scalars["train/rollout_seconds"] = interval.rollout_seconds
                 scalars.update({f"rollout/{name}": float(value) for name, value in read["rollout"].items()})
-            scalars.update(self.dataset.statistics())
+            scalars.update(statistics())
             self._display.interval(step, scalars)
             if self.tracker is not None:
                 self.tracker.log(scalars, step)

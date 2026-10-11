@@ -272,7 +272,7 @@ def test_an_incomplete_row_is_refused():
         preference_rows(records({"chosen": [1]}), 0, 4)
     with pytest.raises(ValueError, match="unknown fields"):
         preference_rows(records(dict(PAIR, reward=1.0)), 0, 4)
-    with pytest.raises(ValueError, match="an object"):
+    with pytest.raises(ValueError, match="record of named fields"):
         preference_rows(records([1, 2]), 0, 4)[0]
     with pytest.raises(ValueError, match=r"accepted|pairs|empty"):
         load(Preferences(source=(), seq_len=4), batch=1, read="memory", loading=Loading(workers=0))
