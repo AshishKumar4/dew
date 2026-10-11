@@ -32,6 +32,8 @@ from ..precision import at_least_fp32
 from ..rope import rotary_freqs
 from .joint import DoubleStreamBlock
 
+PATCH_SIDE = 2
+
 
 def _block(stack: _AttentionStackOptions, remat: RematChoice, features: int, heads: int,
            name: str | None = None) -> DoubleStreamBlock:
@@ -116,7 +118,7 @@ class PatchMerging(nn.Module):
 
     @nn.nowrap
     def model_flops(self, lengths, input_features: int) -> float:
-        return projection_flops(lengths, 4 * input_features, self.out_features)
+        return projection_flops(lengths, PATCH_SIDE**2 * input_features, self.out_features)
 
     @nn.compact
     def __call__(self, x, H_patches, W_patches):
@@ -126,7 +128,7 @@ class PatchMerging(nn.Module):
         merged = einops.rearrange(
             x,
             'b (h p1) (w p2) c -> b h w (p1 p2 c)',
-            p1=2, p2=2
+            p1=PATCH_SIDE, p2=PATCH_SIDE
         )
         merged = LayerNorm(epsilon=self.norm_epsilon, dtype=self.dtype, name="norm")(merged)
         merged = nn.Dense(
@@ -136,8 +138,8 @@ class PatchMerging(nn.Module):
             name="projection"
         )(merged)
 
-        new_H = H_patches // 2
-        new_W = W_patches // 2
+        new_H = H_patches // PATCH_SIDE
+        new_W = W_patches // PATCH_SIDE
         merged = merged.reshape(B, new_H * new_W, self.out_features)
 
         return merged, new_H, new_W
@@ -153,7 +155,7 @@ class PatchExpanding(nn.Module):
 
     @property
     def expanded_features(self) -> int:
-        return 4 * self.out_features
+        return PATCH_SIDE**2 * self.out_features
 
     @nn.nowrap
     def model_flops(self, lengths, input_features: int) -> float:
@@ -176,11 +178,11 @@ class PatchExpanding(nn.Module):
         expanded = einops.rearrange(
             x,
             'b h w (p1 p2 c) -> b (h p1) (w p2) c',
-            p1=2, p2=2, c=self.out_features
+            p1=PATCH_SIDE, p2=PATCH_SIDE, c=self.out_features
         )
 
-        new_H = H_patches * 2
-        new_W = W_patches * 2
+        new_H = H_patches * PATCH_SIDE
+        new_W = W_patches * PATCH_SIDE
         expanded = expanded.reshape(B, new_H * new_W, self.out_features)
 
         return expanded, new_H, new_W
@@ -213,7 +215,7 @@ class HierarchicalMMDiT(_AttentionStackOptions):
 
     @nn.nowrap
     def image_lengths(self, sample_shape: tuple[int, ...], rows: int) -> np.ndarray:
-        coarsest = self.base_patch_size * 2**(len(self.emb_features) - 1)
+        coarsest = self.base_patch_size * PATCH_SIDE**(len(self.emb_features) - 1)
         patch_lengths(sample_shape, (coarsest, coarsest), rows)
         return patch_lengths(sample_shape, (self.base_patch_size, self.base_patch_size), rows)
 
@@ -222,14 +224,14 @@ class HierarchicalMMDiT(_AttentionStackOptions):
         """Per-stage streams, patch merges/expansions, skip maps and output."""
         image, _ = matching_lengths(lengths, context_lengths)
         rows, base = np.ones(image.shape, np.int64), self.emb_features[0]
-        if np.any(image % 4**(len(self.emb_features) - 1)):
+        if np.any(image % PATCH_SIDE**(2 * (len(self.emb_features) - 1))):
             raise MissingFlopsCount("HierarchicalMMDiT needs whole patches at its coarsest stage")
         count = (self._embedding(self.base_patch_size, base).model_flops(lengths, input_channels)
                  + self._conditioning(base).model_flops(lengths, text_features))
         maps = self.projections(text_features)
         for stage, (width, layers, heads) in enumerate(zip(
                 self.emb_features, self.num_layers, self.num_heads, strict=True)):
-            level = (image / 4**stage).astype(np.int64)
+            level = (image / PATCH_SIDE**(2 * stage)).astype(np.int64)
             count += (projection_flops(rows, *maps[f'cond_proj_stage{stage}'])
                       + projection_flops(context_lengths, *maps[f'txt_embed_stage{stage}']))
             block = _block(self, remat=False, features=width, heads=heads)
@@ -237,8 +239,8 @@ class HierarchicalMMDiT(_AttentionStackOptions):
                 level, context_lengths)
             if stage < len(self.emb_features) - 1:
                 below = self.emb_features[stage + 1]
-                count += PatchMerging(below, parent=None).model_flops(level // 4, width)
-                count += PatchExpanding(width, parent=None).model_flops(level // 4, below)
+                count += PatchMerging(below, parent=None).model_flops(level // PATCH_SIDE**2, width)
+                count += PatchExpanding(width, parent=None).model_flops(level // PATCH_SIDE**2, below)
                 count += projection_flops(level, *maps[f'fusion_{stage}'])
         return count + self._output(self.base_patch_size, self.output_channels, modulated=True).model_flops(
             lengths, base)
@@ -346,11 +348,11 @@ class HierarchicalMMDiT(_AttentionStackOptions):
         _, H, W, _ = x.shape
         num_stages = len(self.emb_features)
         assert (
-            H % (self.base_patch_size * (2 ** (num_stages - 1))) == 0
-            and W % (self.base_patch_size * (2 ** (num_stages - 1))) == 0
+            H % (self.base_patch_size * (PATCH_SIDE ** (num_stages - 1))) == 0
+            and W % (self.base_patch_size * (PATCH_SIDE ** (num_stages - 1))) == 0
         ), (
             f"Image dimensions ({H},{W}) must be divisible by effective coarsest patch size "
-            f"{self.base_patch_size * (2 ** (num_stages - 1))}"
+            f"{self.base_patch_size * (PATCH_SIDE ** (num_stages - 1))}"
         )
 
         img, _ = self.embed(x)

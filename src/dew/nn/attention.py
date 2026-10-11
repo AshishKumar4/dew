@@ -2002,10 +2002,16 @@ class NormalAttention(nn.Module):
     attention_impl: str = "auto"  # an AttentionImpl
 
     @nn.nowrap
+    def projections(self, context_features: int | None = None) -> dict[str, tuple[int, int]]:
+        inner = self.heads * self.dim_head
+        context = self.query_dim if context_features is None else context_features
+        return {'to_q': (self.query_dim, inner), 'to_k': (context, inner), 'to_v': (context, inner),
+                'to_out_0': (inner, self.query_dim)}
+
+    @nn.nowrap
     def model_flops(self, lengths) -> float:
         """Self-attention maps and its full QK/AV products on real rows."""
-        inner = self.heads * self.dim_head
-        return (4 * projection_flops(lengths, self.query_dim, inner)
+        return (sum(projection_flops(lengths, *shape) for shape in self.projections().values())
                 + attention_flops(lengths, self.heads, self.dim_head, self.dim_head, causal=False))
 
     @nn.nowrap
@@ -2015,14 +2021,16 @@ class NormalAttention(nn.Module):
         if query.shape != context.shape:
             raise ValueError("cross-attention FLOPs need matching query/context rows")
         inner = self.heads * self.dim_head
-        return (2 * projection_flops(lengths, self.query_dim, inner)
-                + 2 * projection_flops(context_lengths, context_features, inner)
+        maps = self.projections(context_features)
+        return (sum(projection_flops(lengths, *maps[name]) for name in ('to_q', 'to_out_0'))
+                + sum(projection_flops(context_lengths, *maps[name]) for name in ('to_k', 'to_v'))
                 + 4 * inner * float(np.sum(query * context)))
 
     def setup(self):
+        maps = self.projections()
         dense = functools.partial(
             nn.DenseGeneral,
-            features=[self.heads, self.dim_head],
+            features=[self.heads, maps['to_q'][1] // self.heads],
             axis=-1,
             precision=self.precision,
             use_bias=self.use_bias if self.qkv_bias is None else self.qkv_bias,
@@ -2037,7 +2045,7 @@ class NormalAttention(nn.Module):
             self.k_norm = RMSNorm(epsilon=1e-6, dtype=self.dtype, name="k_norm")
 
         self.proj_attn = nn.DenseGeneral(
-            self.query_dim,
+            maps['to_out_0'][1],
             axis=(-2, -1),
             precision=self.precision,
             use_bias=self.use_bias,
