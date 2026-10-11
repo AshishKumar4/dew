@@ -1479,8 +1479,10 @@ class GlobalStream:
 
     def __init__(self, open_at: Callable[[int], pygrain.DatasetIterator[Batch]],
                  batch: int, order: str, loading: Loading, content: Callable[[], str] | None = None,
-                 *, plan: Plan | None = None, resume: Literal["exact", "non-exact"] = "exact"):
+                 *, plan: Plan | None = None, resume: Literal["exact", "non-exact"] = "exact",
+                 endless: bool = True):
         self._open = open_at
+        self.endless = endless
         self._batch = batch
         self._order = order
         self._content = content

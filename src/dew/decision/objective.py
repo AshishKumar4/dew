@@ -190,6 +190,7 @@ class _Cut:
 
     bucket: int
     length: int
+    single_reader = True
 
     def __call__(self, batch: Batch) -> Batch:
         longest = int(np.max(np.sum(batch["valid"], axis=1)))
