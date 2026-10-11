@@ -241,6 +241,41 @@ def test_exported_token_lengths_support_indexed_spans_without_record_scan():
     assert isinstance(resolve(root), TokenFiles)
 
 
+def test_remote_indexed_arrayrecords_read_only_the_selected_physical_shard(monkeypatch):
+    root = Store(f"memory://lazy-records-{uuid4().hex}")
+    manifest = export(
+        [{"id": index} for index in range(12)], root.url, format="array_record", rows_per_shard=4
+    )
+    filesystem, _ = root.resolve()
+    downloaded = []
+    get_file = filesystem.get_file
+
+    def download(remote, local, **kwargs):
+        downloaded.append(remote)
+        return get_file(remote, local, **kwargs)
+
+    monkeypatch.setattr(filesystem, "get_file", download)
+    rows = Files(root.url, format="array_record").records("indexed")
+    assert len(rows) == 12
+    assert downloaded == []
+    assert rows[9] == {"id": 9}
+    assert len(downloaded) == 1
+    assert downloaded[0].endswith(manifest["files"][2]["path"])
+
+
+def test_jsonl_offset_index_is_mapped_and_reopened_instead_of_pickled_as_rows():
+    import pickle
+
+    root = Store(f"memory://mapped-index-{uuid4().hex}/rows.jsonl")
+    root.write(b'{"id":0}\n{"id":1}\n')
+    source = Files(root.url).provision()
+    indexed = source.records("indexed")
+    assert isinstance(indexed.tables[0], np.memmap)
+    resumed = pickle.loads(pickle.dumps(indexed))
+    assert resumed[1] == {"id": 1}
+    assert isinstance(resumed.tables[0], np.memmap)
+
+
 def test_torch_source_refuses_streaming_and_cache_without_content_identity():
     import torch
     from torch.utils.data import TensorDataset
