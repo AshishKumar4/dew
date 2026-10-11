@@ -98,10 +98,11 @@ def swiglu_kernel(implementation: str, gate, up) -> str:
     ))
 
 
-def _weight(scale_ref, columns, width: int, offset: bool):
+def _weight(scale_ref, columns, width: int, offset: bool, interpret: bool):
     scale = plgpu.load(scale_ref.at[columns], mask=columns < width, other=0)
     # The offset adds in the stored weight's dtype, including a bf16 weight.
-    return (scale + 1.0 if offset else scale).astype(jnp.float32)
+    weight = scale.astype(jnp.float32)
+    return _round(weight + 1.0, scale.dtype, interpret) if offset else weight
 
 
 def _rms_forward(x_ref, scale_ref, y_ref, inverse_ref, *, epsilon: float,
@@ -118,7 +119,7 @@ def _rms_forward(x_ref, scale_ref, y_ref, inverse_ref, *, epsilon: float,
     if scale_ref is not None:
         if after_cast:
             y = _round(y, y_ref.dtype, interpret)
-        y = y * _weight(scale_ref, columns, width, offset)[None, :]
+        y = y * _weight(scale_ref, columns, width, offset, interpret)[None, :]
     plgpu.store(y_ref.at[row[:, None], columns[None, :]], y.astype(y_ref.dtype), mask=mask)
     plgpu.store(inverse_ref.at[row], inverse, mask=row < rows)
 
@@ -130,7 +131,7 @@ def _rms_backward(x_ref, scale_ref, inverse_ref, dy_ref, dx_ref, partial_ref, *,
     groups = pl.num_programs(0)
     group = pl.program_id(0)
     row_block = _row_block(width)
-    weight = _weight(scale_ref, columns, width, offset) if scale_ref is not None else 1.0
+    weight = _weight(scale_ref, columns, width, offset, interpret) if scale_ref is not None else 1.0
 
     def block(i, accumulated):
         row = (i * groups + group) * row_block + jnp.arange(row_block)
