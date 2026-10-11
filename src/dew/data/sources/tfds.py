@@ -433,7 +433,7 @@ class TFDS:
                 for name, feature in features.items()
                 if isinstance(feature, tfds.features.ClassLabel)
             }
-            if isinstance(features, Mapping)
+            if isinstance(features, tfds.features.FeaturesDict)
             else {}
         )
         return {
