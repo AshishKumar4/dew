@@ -122,7 +122,8 @@ class GptOssMLP(nn.Module):
             raise MissingFlopsCount("GptOssMLP needs admitted expert counts when capacity drops tokens")
         return (projection_flops(lengths, self.hidden_size, self.num_local_experts)
                 + 3 * self.num_experts_per_tok * projection_flops(
-                    lengths, self.hidden_size, self.intermediate_size))
+                    lengths, self.hidden_size, self.intermediate_size)
+                + projection_flops(lengths, self.num_experts_per_tok, self.hidden_size))
 
     @nn.compact
     def __call__(self, x: jax.Array, routes: Routes | None = None) -> jax.Array:

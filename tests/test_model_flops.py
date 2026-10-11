@@ -155,7 +155,7 @@ def test_dense_mlp_gate_and_active_experts_are_counted():
     assert GatedMLP(16, 8).model_flops(LENGTHS) == 6 * 8 * 16 * 7
     assert GatedMLP(16, 8, activation="gelu").model_flops(LENGTHS) == 4 * 8 * 16 * 7
     routed = SparseMLP(num_experts=8, top_k=2, hidden_features=16, out_features=8)
-    assert routed.model_flops(LENGTHS) == (2 * 8 * 8 + 2 * 6 * 8 * 16) * 7
+    assert routed.model_flops(LENGTHS) == (2 * 8 * 8 + 2 * 6 * 8 * 16 + 2 * 2 * 8) * 7
     more = routed.clone(num_experts=16)
     assert more.model_flops(LENGTHS) - routed.model_flops(LENGTHS) == 2 * 8 * 8 * 7
     with pytest.raises(MissingFlopsCount, match="admitted routing"):
@@ -466,7 +466,9 @@ def test_active_expert_products_match_the_executed_forward(kind):
         model = Gemma4Experts(4, 2, 16, 8, implementation="xla")
     operands = (x, x) if kind == "gemma4" else (x,)
     variables = model.init(jax.random.key(203), *operands)
-    assert model.model_flops(lengths) == forward_products(model.apply, variables, *operands)
+    # GPT-OSS spells the final weighted expert contraction as mul+reduce.
+    scalar_mix = 2 * 2 * 8 * 8 if kind == "gpt_oss" else 0
+    assert model.model_flops(lengths) == forward_products(model.apply, variables, *operands) + scalar_mix
 
 
 def test_microbatches_two_sum_real_tokens_before_interval_throughput():
