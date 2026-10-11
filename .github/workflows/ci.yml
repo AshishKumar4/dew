@@ -231,7 +231,7 @@ jobs:
         ARMADA_URL: ${{ secrets.ARMADA_URL }}
         ARMADA_TOKEN: ${{ secrets.ARMADA_TOKEN }}
       run: |
-        armada="bunx --bun github:AshishKumar4/armada#f8725d7760164878a978795a2dd39ffa3bd60f9d"
+        armada="bunx --bun github:AshishKumar4/armada#b2bf6df719e64c0992f51e52d877af91d63b49e6"
         $armada verdict ${{ github.sha }} || $armada run ${{ github.sha }} --label="${{ github.ref_name }}"
 
   multihost:
@@ -251,7 +251,7 @@ jobs:
         ARMADA_URL: ${{ secrets.ARMADA_URL }}
         ARMADA_TOKEN: ${{ secrets.ARMADA_TOKEN }}
       run: |
-        armada="bunx --bun github:AshishKumar4/armada#f8725d7760164878a978795a2dd39ffa3bd60f9d"
+        armada="bunx --bun github:AshishKumar4/armada#b2bf6df719e64c0992f51e52d877af91d63b49e6"
         echo '[{"gang": 4}]' | $armada map --commit=${{ github.sha }} --items=- --pool=4 --size=medium \
           --label="${{ github.ref_name }}" -- .venv-3.12/bin/python -m pytest -q -p no:cacheprovider \
           -m "not network" -rfE --tb=short --basetemp=/tmp/dew-gang tests/test_multihost.py
