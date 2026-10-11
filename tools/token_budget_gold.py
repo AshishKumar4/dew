@@ -35,6 +35,7 @@ def main() -> None:
     parser.add_argument("--batches", type=int, default=64)
     parser.add_argument("--micro-tokens", type=int, default=24576)
     parser.add_argument("--profile-open", type=Path)
+    parser.add_argument("--descriptor")
     args = parser.parse_args()
     pinned = snapshot_download(
         "Qwen/Qwen3.5-2B",
@@ -55,7 +56,7 @@ def main() -> None:
     profiler = cProfile.Profile()
     with profiler:
         dataset = load(
-            Decisions(args.root),
+            Decisions(args.root, descriptor=args.descriptor),
             tokens=args.micro_tokens,
             read="indexed",
             objective=objective.data(),
@@ -68,6 +69,11 @@ def main() -> None:
         pstats.Stats(profiler, stream=report).sort_stats("cumulative").print_stats(20)
         args.profile_open.with_suffix(".txt").write_text(report.getvalue())
     opened = time.monotonic()
+    profiled = profiler.getstats()
+    head_requests = sum(entry.callcount for entry in profiled if hasattr(entry.code, "co_name")
+                        and entry.code.co_name == "info" and entry.code.co_filename.endswith("/data/storage.py"))
+    requests = sum(entry.callcount for entry in profiled if hasattr(entry.code, "co_name")
+                   and entry.code.co_name == "request" and "urllib3" in entry.code.co_filename)
     reader = dataset.train(DataPartition())
     shapes = collections.Counter()
     real_tokens = rows = 0
@@ -105,6 +111,9 @@ def main() -> None:
         "real_tokens": real_tokens,
         "observed_shapes": dict(shapes),
         "open_seconds": opened - started,
+        "open_http_requests": requests,
+        "open_head_requests": head_requests,
+        "descriptor": args.descriptor,
         "first_batch_seconds": first_seconds,
         "elapsed_seconds": time.monotonic() - started,
         "resume_exact": True,
