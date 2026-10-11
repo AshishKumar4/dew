@@ -25,6 +25,7 @@ import fsspec
 from filelock import FileLock
 from fsspec.implementations.cached import WholeFileCacheFileSystem
 from fsspec.spec import AbstractBufferedFile, AbstractFileSystem
+from gcsfs import GCSFileSystem
 from huggingface_hub import HfFileSystem
 from huggingface_hub.hf_file_system import HfFileSystemResolvedRepositoryPath
 from s3fs import S3FileSystem
@@ -513,7 +514,7 @@ class Store:
         if scheme in ("gs", "gcs"):
             metadata = fs.info(path)
             version = str(metadata["generation"])
-            return Versioned(fs.cat_file(path, generation=version), version)
+            return Versioned(fs.cat_file(path, generation=version, concurrency=1), version)
         if not isinstance(fs, HfFileSystem):
             raise ValueError(f"conditional publication is unavailable for {self.url}")
         resolved = fs.resolve_path(path)
@@ -589,10 +590,24 @@ class Store:
             version = sync(loop, put_s3)
             fs.invalidate_cache()
             return version
-        if scheme in ("gs", "gcs"):
-            fs.pipe_file(path, payload, if_generation_match=0 if version is None else int(version))
-            fs.invalidate_cache(path)
-            return str(fs.info(path)["generation"])
+        if isinstance(fs, GCSFileSystem):
+            bucket, key, _ = fs.split_path(path)
+            endpoint = f"{fs._location}/upload/storage/v1/b/{urllib.parse.quote(bucket, safe='')}/o"
+            try:
+                outcome = fs.call(
+                    "POST",
+                    endpoint,
+                    uploadType="media",
+                    name=key,
+                    ifGenerationMatch="0" if version is None else version,
+                    data=payload,
+                    headers={"Content-Type": "application/octet-stream"},
+                    json_out=True,
+                )
+            except FileExistsError as error:
+                raise PreconditionFailed(self.url) from error
+            fs.invalidate_cache()
+            return str(outcome["generation"])
         from huggingface_hub import CommitOperationAdd, HfApi
         from huggingface_hub.errors import HfHubHTTPError
 

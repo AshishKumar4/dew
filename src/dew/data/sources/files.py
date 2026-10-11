@@ -6,6 +6,7 @@ import bisect
 import csv
 import io
 import json
+import threading
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from functools import cached_property, lru_cache
@@ -61,8 +62,19 @@ def _arrow_filesystem(fs) -> pafs.FileSystem:
             endpoint_override=parsed.netloc if parsed else None,
             scheme=parsed.scheme if parsed else "https",
         )
-    if "gs" in protocols and fs.token is None:
-        return pafs.GcsFileSystem()
+    if (
+        "gs" in protocols
+        and fs.credentials.method in ("google_default", "cloud", "anon")
+        and not fs.requester_pays
+    ):
+        from urllib.parse import urlsplit
+
+        endpoint = urlsplit(fs._location)
+        return pafs.GcsFileSystem(
+            anonymous=fs.credentials.method == "anon",
+            scheme=endpoint.scheme,
+            endpoint_override=endpoint.netloc,
+        )
     return pafs.PyFileSystem(pafs.FSSpecHandler(fs))
 
 
@@ -162,13 +174,12 @@ class Files:
             if url in indexes and not fs.exists(path):
                 continue
             metadata = fs.info(path)
+            version = metadata.get("ETag") or metadata.get("etag") or metadata.get("generation")
             files.append(
                 {
                     "uri": url,
                     "bytes": metadata["size"],
-                    "version": metadata.get(
-                        "ETag", metadata.get("etag", metadata.get("generation", fs.ukey(path)))
-                    ),
+                    "version": fs.ukey(path) if version is None else version,
                 }
             )
         return {
@@ -366,14 +377,18 @@ class _Paths:
 class _ArrowFragment:
     source: Files
     index: int
+    lock: threading.RLock = field(default_factory=threading.RLock, compare=False, repr=False)
 
-    @cached_property
+    @property
     def table(self) -> pa.Table:
-        return self.source.fragments[self.index].to_table(
-            schema=self.source.arrow.schema,
-            columns=list(self.source.columns) if self.source.columns is not None else None,
-            filter=self.source.filter,
-        )
+        with self.lock:
+            if "_table" not in self.__dict__:
+                self.__dict__["_table"] = self.source.fragments[self.index].to_table(
+                    schema=self.source.arrow.schema,
+                    columns=list(self.source.columns) if self.source.columns is not None else None,
+                    filter=self.source.filter,
+                )
+            return self.__dict__["_table"]
 
     def __len__(self) -> int:
         return self.table.num_rows
@@ -420,6 +435,15 @@ class _IndexedLines:
         )
         self.offsets = np.cumsum([0, *(len(index) for index in self.tables)])
 
+    @cached_property
+    def fieldnames(self) -> tuple[tuple[str, ...], ...]:
+        headers = []
+        for url in self.source.paths:
+            fs, path = Store(url, self.source.storage_options).resolve()
+            with fs.open(path, "rb") as file:
+                headers.append(tuple(next(csv.reader(_CsvLines(file)))))
+        return tuple(headers)
+
     def __len__(self) -> int:
         return int(self.offsets[-1])
 
@@ -430,10 +454,9 @@ class _IndexedLines:
         entry = self.tables[group][index - int(self.offsets[group])]
         shard = int(entry["shard"]) if self.source.index else group
         fs, path = Store(self.source.paths[shard], self.source.storage_options).resolve()
-        with fs.open(path, "rb") as file:
-            names = next(csv.reader(_CsvLines(file))) if self.source.kind == "csv" else None
-            file.seek(int(entry["offset"]))
-            payload = file.read(int(entry["bytes"]))
+        names = self.fieldnames[shard] if self.source.kind == "csv" else None
+        offset = int(entry["offset"])
+        payload = fs.cat_file(path, start=offset, end=offset + int(entry["bytes"]))
         if names is not None:
             return next(csv.DictReader(io.StringIO(payload.decode()), fieldnames=names))
         return json.loads(payload) if self.source.kind == "jsonl" else {"text": payload.decode()}
@@ -766,8 +789,10 @@ class TokenFiles:
             )
         if read == "memory" and isinstance(self.tokens, TokenRecords):
             self.tokens.materialize_lengths()
+        if read == "memory":
+            return ({"text": self.tokens[:].astype(np.int32)},)
         indexed = _TokenChunks(self.tokens, self.chunk_tokens)
-        return tuple(indexed[index] for index in range(len(indexed))) if read == "memory" else indexed
+        return indexed
 
     def manifest(self) -> ShardManifest:
         count = len(self.records("indexed"))
