@@ -308,8 +308,7 @@ def rms_normalized(x, scale, epsilon: float, dtype, scale_offset: bool, scale_af
     """
     chosen = norm_swiglu.rms_kernel(implementation, x, scale, dtype, fp32_statistics)
     if chosen == 'pallas':
-        return norm_swiglu.rms_norm(x, scale, epsilon, dtype, scale_offset, scale_after_cast,
-                                    jax.default_backend() == 'cpu')
+        return norm_swiglu.rms_norm(x, scale, epsilon, dtype, scale_offset, scale_after_cast)
     return _xla_rms_normalized(x, scale, epsilon, dtype, scale_offset, scale_after_cast, fp32_statistics)
 
 

@@ -237,6 +237,13 @@ def test_rms_module_uses_the_same_fused_vjp(offset, after_cast, with_scale):
     assert "rms_norm_forward" in str(jax.make_jaxpr(module.apply)(params, x))
 
 
+def measured_on_this_host(monkeypatch, choice: str) -> None:
+    """This host's generation measures the Pallas kernel fastest for `choice`, so a call the
+    kernel turns down is logged (`ran_kernel`), as on a GPU whose target row names it."""
+    host = kernels.device_generation()
+    monkeypatch.setitem(kernels.TARGETS, host, kernels.GpuTarget(host, host, kernels={choice: "pallas"}))
+
+
 @pytest.mark.parametrize("statistics,dtype,scale_shape,width,reason", [
     (False, jnp.float32, (31,), 31, "input-dtype statistics"),
     (True, jnp.float64, (31,), 31, "float64"),
@@ -247,6 +254,7 @@ def test_rms_refusals_fall_back_and_log_once(monkeypatch, caplog, statistics, dt
                                            scale_shape, width, reason):
     from dew.nn.kernels import norm_swiglu
 
+    measured_on_this_host(monkeypatch, "rms_norm")
     monkeypatch.setattr(kernels.generation, "_logged", set())
     with jax.enable_x64(new_val=True):
         x, scale = jnp.ones((2, width), dtype), jnp.ones(scale_shape, dtype)
@@ -317,6 +325,7 @@ def test_unknown_implementation_is_rejected():
 
 
 def test_inverse_cast_variant_refuses_the_normalized_activation_kernel(monkeypatch, caplog):
+    measured_on_this_host(monkeypatch, "rms_norm")
     monkeypatch.setattr(kernels.generation, "_logged", set())
     x = jax.random.normal(jax.random.key(15), (3, 31)).astype(jnp.bfloat16)
     reference = evaluated(lambda x: unweighted_rmsnorm(x, 1e-5, implementation="xla"), (x,), x)

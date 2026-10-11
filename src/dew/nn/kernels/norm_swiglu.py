@@ -318,8 +318,15 @@ def _rms_bwd(epsilon: float, dtype, offset: bool, after_cast: bool, interpret: b
     return dx.reshape(x.shape), dscale
 
 
-rms_norm = jax.custom_vjp(_rms, nondiff_argnums=(2, 3, 4, 5, 6))
-rms_norm.defvjp(_rms_fwd, _rms_bwd)
+_rms_vjp = jax.custom_vjp(_rms, nondiff_argnums=(2, 3, 4, 5, 6))
+_rms_vjp.defvjp(_rms_fwd, _rms_bwd)
+
+
+def rms_norm(x, scale, epsilon: float, dtype, offset: bool, after_cast: bool):
+    """The fused RMSNorm and its VJP. It interprets where no Triton GPU runs
+    it (`generation.triton_runs`), as the CPU suite does, and lowers for the
+    assumed GPU within `generation.assumed`, as the GDN kernels decide."""
+    return _rms_vjp(x, scale, epsilon, dtype, offset, after_cast, not generation.triton_runs())
 
 
 def _swiglu_forward(gate_ref, up_ref, y_ref, *, interpret: bool):
@@ -370,5 +377,10 @@ def _swiglu_bwd(interpret: bool, residual, dy):
     return dg.reshape(gate.shape), du.reshape(up.shape)
 
 
-swiglu = jax.custom_vjp(_swiglu, nondiff_argnums=(2,))
-swiglu.defvjp(_swiglu_fwd, _swiglu_bwd)
+_swiglu_vjp = jax.custom_vjp(_swiglu, nondiff_argnums=(2,))
+_swiglu_vjp.defvjp(_swiglu_fwd, _swiglu_bwd)
+
+
+def swiglu(gate, up):
+    """The fused SiLU product and its VJP, interpreted or lowered as `rms_norm` is."""
+    return _swiglu_vjp(gate, up, not generation.triton_runs())
