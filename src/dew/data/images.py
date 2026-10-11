@@ -47,21 +47,6 @@ def as_rgb(pixels: np.ndarray) -> np.ndarray:
     return np.ascontiguousarray(np.broadcast_to(pixels, (*pixels.shape[:2], 3)))
 
 
-def _header(encoded: bytes) -> tuple[int, int, bool]:
-    """(height, width, whether it carries transparency) from the header alone;
-    PIL reads no pixels for this."""
-    import io
-
-    from PIL import Image
-
-    try:
-        with Image.open(io.BytesIO(encoded)) as header:
-            width, height = header.size
-            transparent = "A" in header.getbands() or "transparency" in header.info
-    except Exception as error:
-        raise ValueError(f"could not read the header of {len(encoded)} bytes of image") from error
-    return height, width, transparent
-
 
 def resize_image(image: np.ndarray, size: int) -> np.ndarray:
     """`image` at `size` square; area interpolation down, cubic up."""
