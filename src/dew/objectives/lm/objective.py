@@ -649,10 +649,10 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
 
     def model_flops(self, model, batch: Batch) -> float:
         """Hidden states plus predictions within real documents; never padded logits."""
-        self._check_flop_geometry(batch)
         model = self.model if model is None else model
         if type(self) is not LMObjective:
             raise MissingFlopsCount(f"{type(self).__name__} needs counts for its auxiliary model forwards")
+        self._check_flop_geometry(batch)
         if self.mtp_weight:
             raise MissingFlopsCount("LMObjective needs the prediction-depth geometry when MTP is trained")
         if not isinstance(model, CountedLogits):
@@ -666,6 +666,8 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
 
     def training_flops(self, model, batch: Batch) -> float:
         """The adapted trunk and prediction head on actual token geometry."""
+        if type(self) is not LMObjective:
+            raise MissingFlopsCount(f"{type(self).__name__} needs counts for its auxiliary model forwards")
         self._check_flop_geometry(batch)
         model = self.model if model is None else model
         if not isinstance(model, CountedTraining):
