@@ -14,16 +14,18 @@ from jax.experimental import pallas as pl
 from jax.sharding import Mesh
 
 from dew.nn.kernels.generation import (
+    DEVICE_KINDS,
     KERNELS,
     PALLAS_CHOICES,
     assumed,
     backend,
     bf16_dot_runs,
     device_generation,
+    gpu_mesh,
     measured_kernel,
     triton_runs,
 )
-from dew.training._lowering import DEVICE_KINDS, UNLOWERABLE, gpu_mesh, triton_kernels
+from dew.training._lowering import UNLOWERABLE, triton_kernels
 
 ROOT = Path(__file__).resolve().parents[1]
 
