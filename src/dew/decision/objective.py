@@ -24,7 +24,7 @@ from dew.data.dataset import (
     train_stream,
     validation_pass,
 )
-from dew.data.pipeline import ObjectiveData, Rejected
+from dew.data.pipeline import Configured, ObjectiveData, Rejected
 from dew.data.text import HFTokenizer, Tokenizer
 from dew.decision.calibration import Temperatures
 from dew.decision.data import DecisionTable, Example, Weighted
@@ -378,6 +378,26 @@ class StoredLength:
         return _fitted(element).length if "decision" in element else int(np.sum(element["valid"]))
 
 
+@dataclass(frozen=True)
+class ConfigureLayout:
+    layout: Layout
+    tokenizer: Tokenizer
+    specials: Specials
+    shuffle: bool
+    none_of_the_above: float
+    train: bool
+
+    def __call__(self, metadata: Mapping[str, object]) -> LayoutRows | EvaluateRows:
+        slots = record(metadata["slots"], "decision slots")
+        width = integer(slots.get("options"), "slots.options") + int(self.none_of_the_above > 0)
+        questions = integer(slots.get("questions"), "slots.questions") if self.layout.joint else 1
+        if min(width, questions) < 1:
+            raise ValueError("decision source slot maxima must be positive")
+        encoding = Encoding(self.layout, self.tokenizer, self.specials, width, questions,
+                            self.shuffle, self.none_of_the_above)
+        return LayoutRows(encoding) if self.train else EvaluateRows(encoding)
+
+
 class DecisionObjective(Objective[Ratio]):
     """Trains a decision model on questions with known answers.
 
@@ -580,31 +600,18 @@ class DecisionObjective(Objective[Ratio]):
         return jax.jit(lambda variables, inputs: self.model.logits(variables, inputs))
 
     def data(
-        self, tokenizer: Tokenizer | None = None, metadata: Mapping[str, object] | None = None
+        self, tokenizer: Tokenizer | None = None
     ) -> ObjectiveData:
         """Fit rows before mixing, augment training layouts, and cut training batches."""
-        if metadata is None or "slots" not in metadata:
-            raise ValueError("decision data needs source metadata slots (questions and options)")
-        slots = record(metadata["slots"], "decision slots")
-        width = integer(slots.get("options"), "slots.options") + int(self.none_of_the_above > 0)
-        questions = integer(slots.get("questions"), "slots.questions") if self.layout.joint else 1
-        if min(width, questions) < 1:
-            raise ValueError("decision source slot maxima must be positive")
         vocabulary = self.tokenizer if tokenizer is None else tokenizer
-        encoding = Encoding(
-            self.layout,
-            vocabulary,
-            self.specials,
-            width,
-            questions,
-            self.shuffle_options,
-            self.none_of_the_above,
-        )
+        training = ConfigureLayout(self.layout, vocabulary, self.specials, self.shuffle_options,
+                                    self.none_of_the_above, train=True)
+        evaluating = dataclasses.replace(training, train=False)
         fit = Fit(self.layout, vocabulary, self.specials)
         expand = () if self.layout.joint else (QuestionRows(),)
         return ObjectiveData(
-            train=(fit, *expand, LayoutRows(encoding)),
-            evaluate=(fit, *expand, EvaluateRows(encoding)),
+            train=(fit, *expand, Configured(training, needs=("slots",), scope="run", random=True)),
+            evaluate=(fit, *expand, Configured(evaluating, needs=("slots",), scope="run")),
             group=None if self.bucket is None else LengthGroups(StoredLength()),
             train_batch=() if self.bucket is None else (_Cut(self.bucket, self.layout.max_len),),
         )

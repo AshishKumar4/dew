@@ -171,8 +171,9 @@ def test_cache_refuses_random_prefix_before_opening_the_artifact():
 def test_map_batch_before_batch_and_random_validation_are_named_refusals():
     with pytest.raises(ValueError, match="map_batch.*batch"):
         compile(Pipeline(source()).map_batch(Shift(1)).batch(4), loading=READ)
-    with pytest.raises(ValueError, match="validation.*Draw"):
-        compile(Pipeline(source()).batch(4), validation=Pipeline(source()).random_map(Draw()).batch(4), loading=READ)
+    with pytest.raises(ValueError, match="validation.*Draw.*canonical"):
+        compile(Pipeline(source()).batch(4),
+                validation=Pipeline(source()).shuffle(0).random_map(Draw()).batch(4), loading=READ)
 
 
 def test_token_deficit_mix_counts_targets_and_restores_delivered_counts():

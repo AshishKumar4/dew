@@ -640,6 +640,7 @@ class Dataset:
     ramp: Ramp | None = None
     held_out: int = 0
     counts: Mapping[str, CorpusCounts] = dataclasses.field(default_factory=dict)
+    validation_counts: Mapping[str, CorpusCounts] = dataclasses.field(default_factory=dict)
     plan: Plan | None = None
 
     @classmethod
@@ -1125,6 +1126,11 @@ def mixed_counts(corpora: Sequence[Corpus], records: int) -> tuple[int, ...]:
     time (`_dataset_and_key_of_next_element`, mix.py at grain 0.2).
     """
     shares = _shares(corpora)
+    return weight_counts(shares, records)
+
+
+def weight_counts(shares: Sequence[float], records: int) -> tuple[int, ...]:
+    """Grain's proportional selection counts over a prefix of an indexed mixture."""
     scale = 100 / min(shares)
     proportions = [int(share * scale) for share in shares]
     counts, remaining, left = [], sum(proportions), records
@@ -1511,6 +1517,10 @@ class GlobalStream:
                                                 plan=None if self._plan is None else self._plan.record()))
 
     @property
+    def records(self) -> int:
+        return self._records
+
+    @property
     def order(self) -> str:
         """The order's description, which a saved position is compared against."""
         return self._order
@@ -1549,6 +1559,19 @@ class GlobalStream:
                 reads.close()
 
 
+@runtime_checkable
+class GlobalReader(Protocol):
+    @property
+    def records(self) -> int: ...
+    @property
+    def order(self) -> str: ...
+    def __next__(self) -> Batch: ...
+    def get_state(self) -> Position: ...
+    def set_state(self, state: bytes) -> None: ...
+    def close(self) -> None: ...
+    def identity(self) -> str: ...
+
+
 class PhasedStream:
     """Reads one global order per phase, switching at step boundaries.
 
@@ -1571,7 +1594,7 @@ class PhasedStream:
 
     endless = True
 
-    def __init__(self, phases: Sequence[tuple[Callable[[], GlobalStream], int | None]],
+    def __init__(self, phases: Sequence[tuple[Callable[[], GlobalReader], int | None]],
                  stop_seconds: float):
         ends = [end for _, end in phases]
         bounded = [end for end in ends[:-1] if end is not None]
@@ -1606,9 +1629,9 @@ class PhasedStream:
         stream = self._streams[phase]
         # The stream's own count, which it advances only for a batch it
         # delivered; its checkpoint envelope is for checkpoints.
-        before = stream._records
+        before = stream.records
         batch = next(stream)
-        read = stream._records - before
+        read = stream.records - before
         self._records += read
         if phase < len(self._ends) and self._records > self._ends[phase]:
             raise ValueError(
@@ -1621,13 +1644,25 @@ class PhasedStream:
         # phase is read yet, so the finished one is still current and a
         # resume may change what follows it or extend it.
         phase = bisect.bisect_left(self._ends, self._records)
+        plans = [position.read(_global_position(stream.get_state())).plan for stream in self._streams[:phase + 1]]
         return position.encode(position.Global(
             records=self._records, order=self._streams[phase].order,
             completed=tuple((self._streams[index].order, self._ends[index])
-                            for index in range(phase))))
+                            for index in range(phase)),
+            plan={"phases": plans} if any(plan is not None for plan in plans) else None))
 
     def set_state(self, state: bytes) -> None:
         saved = position.read(state)
+        if saved.plan is not None:
+            plans = saved.plan.get("phases")
+            if not isinstance(plans, list) or len(plans) != len(saved.completed) + 1:
+                raise ValueError("saved phase plans do not cover the completed and current phases")
+            for index, plan in enumerate(plans):
+                if index >= len(self._streams) or plan is not None and not isinstance(plan, Mapping):
+                    raise ValueError("saved phase plan is not part of this run")
+                end = saved.completed[index][1] if index < len(saved.completed) else saved.records
+                self._streams[index].set_state(position.encode(position.Global(
+                    records=end - self._start(index), order=self._streams[index].order, plan=plan)))
         for index, (order, end) in enumerate(saved.completed):
             if index >= len(self._ends) or (self._streams[index].order, self._ends[index]) != (order, end):
                 raise ValueError(

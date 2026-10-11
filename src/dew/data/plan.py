@@ -59,13 +59,13 @@ class StepIdentity:
         declared = identity or (step.identity if isinstance(step, _DeclaredIdentity) else None)
         config = repr(step) if frozen else declared or name
         unstable = any(marker in name or marker in config for marker in ("<lambda>", "<locals>", " at 0x"))
-        exact = bool(declared) or not unstable
+        exact = bool(declared) or (not unstable and (frozen or inspect.isfunction(step)))
         external = not module.startswith("dew.")
         if cache and (
             not exact or (external and declared is None) or (inspect.isfunction(step) and declared is None)
         ):
             raise ValueError(f"cache prefix step {name} needs identity='name@version'")
-        path = inspect.getsourcefile(kind)
+        path = None if inspect.isbuiltin(step) or kind.__module__ == "builtins" else inspect.getsourcefile(kind)
         module_hash = (
             hashlib.sha256(Path(path).read_bytes()).hexdigest()
             if external and path is not None and Path(path).is_file()
@@ -73,6 +73,10 @@ class StepIdentity:
         )
         config = re.sub(r" at 0x[0-9a-fA-F]+", "", config)
         dependencies = _dependencies(step)
+        if dependencies and dataclasses.is_dataclass(step) and not isinstance(step, type):
+            config = json.dumps({field.name: dependencies[field.name] if field.name in dependencies
+                                  else repr(getattr(step, field.name)) for field in dataclasses.fields(step)
+                                  if field.repr}, sort_keys=True)
         return cls(name, config, exact, module_hash, declared, dependencies)
 
 
@@ -87,6 +91,8 @@ class _Dependencies(Protocol):
 
 
 def _dependencies(step: object) -> Mapping[str, object]:
+    if step is None or isinstance(step, (str, int, float, bool, bytes, np.ndarray)):
+        return {}
     if isinstance(step, _Dependencies):
         return step.dependencies()
     if dataclasses.is_dataclass(step) and not isinstance(step, type):
@@ -104,7 +110,7 @@ class Manifest:
     revision: str = "unversioned"
     lock: str = ""
     python: str = platform.python_version()
-    platform: str = sys.platform
+    platform: str = platform.platform()
     tokenizer: Mapping[str, object] = dataclasses.field(default_factory=dict)
     fill: Mapping[str, object] = dataclasses.field(default_factory=dict)
     codec: int = 1

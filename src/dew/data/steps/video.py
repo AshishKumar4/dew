@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import functools
 
@@ -14,6 +15,17 @@ from dew.data.video import fit_frames
 
 
 @dataclasses.dataclass(frozen=True)
+class VideoPath(grain.MapTransform):
+    caption: str = ""
+
+    def map(self, element: Batch) -> Batch:
+        from dew.records import text
+
+        path = text(element.get("video_path", element.get("path")), "video_path")
+        return {"video_path": path, "caption": element.get("caption", self.caption)}
+
+
+@dataclasses.dataclass(frozen=True)
 class DecodeClip(grain.RandomMapTransform):
     frames: int = 16
     size: int = 256
@@ -23,13 +35,17 @@ class DecodeClip(grain.RandomMapTransform):
     def random_map(self, element: Batch, rng: np.random.Generator) -> Batch:
         from dew.data.sources.av_utils import read_av_random_clip
 
-        frames, audio = read_av_random_clip(
-            element["video_path"],
-            num_frames=self.frames,
-            audio_padding=self.audio_padding,
-            seed=int(rng.integers(0, 2**32 - 1)),
-            sample_rate=self.sample_rate,
-        )
+        with contextlib.ExitStack() as pins:
+            path = str(element["video_path"])
+            if "://" in path and not path.startswith("file://"):
+                from dew.data.storage import Store
+
+                fs, target = Store(path if "::" in path else "dewcache::" + path).resolve()
+                held = pins.enter_context(fs.open(target, "rb"))
+                path = held.name
+            frames, audio = read_av_random_clip(
+                path.removeprefix("file://"), num_frames=self.frames, audio_padding=self.audio_padding,
+                seed=int(rng.integers(0, 2**32 - 1)), sample_rate=self.sample_rate)
         return {"video": fit_frames(frames, self.size), "caption": element.get("caption", ""), "audio": audio}
 
 
