@@ -354,6 +354,13 @@ def test_a_setting_known_to_break_gpu_runs_fails_the_preflight():
     found = preflight.hazards(texts, "python drive.py")
     assert len(found) == 1 and found[0].startswith("drive.py:1 sets JAX_EXPLAIN_CACHE_MISSES")
     assert preflight.hazards({"drive.py": "print(1)\n"}, "python drive.py") == []
+    made = {"run.sh": "JAX_EXPLAIN_CACHE_MISSES=1 python x.py\n",
+            "x.py": "os.environ['JAX_EXPLAIN_CACHE_MISSES'] = '1'\n"
+                    "jax.config.update('jax_explain_cache_misses', True)\n"}
+    assert [hazard.split(" sets ")[0] for hazard in preflight.hazards(made, "bash run.sh")] == [
+        "run.sh:1", "x.py:1", "x.py:2"]
+    named = {"c50_profile.py": '"""JAX\'s cache-miss explainer (JAX_EXPLAIN_CACHE_MISSES) is not used."""\n'}
+    assert preflight.hazards(named, "python c50_profile.py") == []
 
 
 

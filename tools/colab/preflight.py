@@ -775,9 +775,11 @@ def explicit_pallas(texts: dict[str, str], command: str) -> list[str]:
     return sites
 
 
-# Settings that break a GPU run whatever the code: each with what it breaks.
+# Settings that break a GPU run whatever the code: each with what it breaks. A pattern matches the setting
+# made, `NAME=1`, `"NAME": "1"`, `environ["NAME"] = "1"` or `config.update("name", True)`, and not a line
+# that only names it, as a driver's note that it does not set it (c50_profile.py's).
 HAZARDS = {
-    re.compile(r"JAX_EXPLAIN_CACHE_MISSES|jax_explain_cache_misses"):
+    re.compile(r"(?:JAX_EXPLAIN_CACHE_MISSES|jax_explain_cache_misses)[\"']?\]?\s*[:=,]"):
         "JAX 0.11.2's cache-miss explainer crashes on Pallas-Triton lowerings that pass debug_info as "
         "a keyword (partial_eval.explain -> diff_tracing_cache_keys): c58's and c57's runs died "
         "before their first compile",
