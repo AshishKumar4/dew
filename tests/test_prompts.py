@@ -193,7 +193,7 @@ def test_template_variables_reach_the_chat_template():
 
 
 def test_a_row_without_a_prompt_is_refused():
-    with pytest.raises(ValueError, match="without a prompt"):
+    with pytest.raises(ValueError, match="needs a prompt column"):
         source({"data_source": "rule"})
 
 
@@ -214,7 +214,7 @@ def test_a_malformed_message_is_refused():
 
 
 def test_a_non_object_row_is_refused():
-    with pytest.raises(ValueError, match="not JSON"):
+    with pytest.raises(json.JSONDecodeError):
         prompt_rows(("{oops",), TOKENIZER, WINDOW, 0)
     with pytest.raises(ValueError, match="an object"):
         source([1, 2])[0]
@@ -260,7 +260,7 @@ def test_parquet_without_a_prompt_column_is_refused(tmp_path):
 
     path = tmp_path / "noprompt.parquet"
     pq.write_table(pa.table({"data_source": ["rule"]}), path)
-    with pytest.raises(ValueError, match="prompt column is required"):
+    with pytest.raises(ValueError, match="needs a prompt column"):
         prompt_file(str(path), TOKENIZER, WINDOW, 0)
 
 

@@ -11,7 +11,7 @@ import numpy as np
 
 from dew.data.dataset import Batch, DataPartition
 from dew.data.pipeline import Geometry, TokenBudget, TokenField
-from dew.records import integer, record
+from dew.records import integer, integers, record
 from dew.objectives.base import VALID_ROWS
 
 TOKEN_COUNTS = "_dew_token_counts"
@@ -143,7 +143,7 @@ class _TokenBatches(grain.DatasetIterator[Batch]):
                 "lengths": self._lengths, "shapes": sorted(self._shapes)}
 
     def set_state(self, state: Mapping[str, object]) -> None:
-        if tuple(state["lengths"]) != self._lengths:
+        if integers(state["lengths"], "token budget lengths") != self._lengths:
             raise ValueError("saved token-budget bucket lengths changed")
         self._read.set_state(record(state["parent"], "token budget parent"))
         self._window = integer(state["window"], "token budget window")

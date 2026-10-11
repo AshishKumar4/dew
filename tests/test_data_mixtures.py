@@ -36,10 +36,10 @@ from dew.data.dataset import (
     mixed_stream,
     mixture,
     ramped,
-    tokenized,
     train_stream,
 )
 from dew.data.recipes import load
+from dew.data.steps.image import EncodeCaptions
 from dew.objectives.base import Aux, Objective
 from dew.training import Checkpoints, Layout, MeshSpec, Trainer
 
@@ -589,7 +589,7 @@ def test_a_phased_run_resumes_past_a_switch_and_refuses_a_changed_history(tmp_pa
         assert packed_rows(resumed, 3) == rest
     for changed in (phased_packed(first, second, (first, 2), (both, None)),
                     phased_packed(first, second, (second, 3), (both, None))):
-        with pytest.raises(ValueError, match="cannot change under it"):
+        with pytest.raises(ValueError, match="saved data plan order changed"):
             load(changed, batch=4, read="memory", loading=READ).train(DataPartition()).set_state(state)
     plain = Text(source=both, pack="first-fit", seq_len=8, packing_bins=2)
     with pytest.raises(ValueError, match="phased run"):
@@ -598,12 +598,12 @@ def test_a_phased_run_resumes_past_a_switch_and_refuses_a_changed_history(tmp_pa
 
 def test_phases_are_a_list_of_ends_and_refuse_a_ramp(tmp_path):
     _, first, second = weighted_packed(tmp_path, (1.0, 1.0))
-    with pytest.raises(ValueError, match="ends must increase"):
+    with pytest.raises(ValueError, match="phase step boundaries must increase"):
         load(phased_packed(first, second, (first, 3), (second, 3), (first, None)), batch=4,
             read="memory", loading=READ).train(
             DataPartition()
         )
-    with pytest.raises(ValueError, match="the last runs on"):
+    with pytest.raises(ValueError, match="last boundary is None"):
         load(phased_packed(first, second, (first, 3), (second, 5)), batch=4, read="memory",
             loading=READ).train(DataPartition())
     spec = phased_packed(first, second, (first, 3), (second, None))
@@ -804,9 +804,8 @@ def test_a_ramp_reads_through_a_captioned_datasets_tokenized_stream():
         return {"length": np.asarray([len(caption) for caption in captions], np.int32)}
 
     def captioned(batch: int) -> Dataset:
-        return Dataset(train=tokenized(train_stream(Captioned(1, 64), [], batch=batch,
-                                                    seed=0, loading=READ), lengths),
-                       val=None, records=64, batch=batch)
+        return compile(Pipeline(Memory(Captioned(1, 64))).shuffle(0).repeat().batch(batch).map_batch(
+                           EncodeCaptions(lengths)), read="memory", seed=0, loading=READ)
 
     flat = [value for step in taken(captioned(4).train(DataPartition()), 12) for value in step]
     schedule = Ramp(start=2, increment=1, samples=6)
@@ -1082,7 +1081,7 @@ def test_a_corpus_that_recurs_across_phases_continues_its_order_and_repeats_noth
               ([code], None)]
     pipelines = []
     for corpora, _ in phases:
-        children = tuple(Pipeline(Memory(corpus.records), name=corpus.name).shuffle(0).repeat()
+        children = tuple(Pipeline(Memory(corpus.source), name=corpus.name).shuffle(0).repeat()
                          for corpus in corpora)
         pipelines.append(children[0] if len(children) == 1 else
                          children[0].mix(*children[1:], weights=tuple(corpus.weight for corpus in corpora)))
