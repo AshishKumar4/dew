@@ -147,6 +147,52 @@ def test_a_part_is_read_from_the_source_that_traced_it_before_the_module_path(fr
     assert attribute.part_of(f"{framework} {source}") == part
 
 
+TRACED = ('metadata={op_name="jit(step)/transpose(jvp(MultimodalTransformer.hidden_states))/'
+          'language_model.hidden_states/layers_3/input_layernorm/OP" '
+          'source_file="/root/dew/src/dew/nn/attention.py" source_line=292}')
+NAMELESS = "\n".join([
+    "HloModule jit_step",
+    "",
+    "%fused_norm.4 (param_0: f32[8,3072,1024]) -> (f32[8,3072], f32[8,3072,1024]) {",
+    "  %param_0 = f32[8,3072,1024]{2,1,0} parameter(0)",
+    "  %multiply.9 = f32[8,3072,1024]{2,1,0} multiply(%param_0, %param_0), " + TRACED.replace("OP", "mul"),
+    "  %constant.1 = f32[] constant(0)",
+    "  %reduce.2 = f32[8,3072]{1,0} reduce(%multiply.9, %constant.1), dimensions={2}, to_apply=%add, "
+    + TRACED.replace("OP", "reduce_sum"),
+    "  ROOT %tuple.1 = (f32[8,3072]{1,0}, f32[8,3072,1024]{2,1,0}) tuple(%reduce.2, %multiply.9)",
+    "}",
+    "",
+    "ENTRY %main.2 (p0: f32[8,3072,1024]) -> (f32[8,3072], f32[8,3072,1024]) {",
+    "  %p0 = f32[8,3072,1024]{2,1,0} parameter(0)",
+    "  ROOT %input_reduce_fusion.4 = (f32[8,3072]{1,0}, f32[8,3072,1024]{2,1,0}) fusion(%p0), kind=kInput, "
+    "calls=%fused_norm.4",
+    "}",
+    "",
+])
+
+
+def test_a_nameless_fusion_is_attributed_by_the_ops_it_fuses(tmp_path):
+    """A multi-output fusion carries no op_name of its own (Qwen3.5-0.8B's 50 ms of
+    "other"): its part and direction come from the ops fused inside it."""
+    reports = tmp_path / "profile" / "capture-a" / "reports"
+    reports.mkdir(parents=True)
+    columns = ["program_id", "category", "hlo_op_name", "hlo_op_expression", "tf_op_name", "occurrences",
+               "total_self_time", "source_info"]
+    cells = [("15", "input fusion", "input_reduce_fusion.4", "%input_reduce_fusion.4 = (f32[8,3072]{1,0}, "
+              "f32[8,3072,1024]{2,1,0}) fusion(f32[8,3072,1024]{2,1,0} %p0)", "", "1", 2000.0, "")]
+    (reports / "hlo_stats.json").write_text(json.dumps([{"cols": [{"id": name} for name in columns],
+                                                         "rows": [{"c": [{"v": v} for v in cells[0]]}]}]))
+    (reports / "roofline_model.json").write_text(json.dumps({"p": {"peak_flop_rate": 311869.0}}))
+    dump = tmp_path / "hlo"
+    dump.mkdir()
+    (dump / "module_0015.jit_step.sm_8.0_gpu_after_optimizations.txt").write_text(NAMELESS)
+    out = tmp_path / "attribution.json"
+    assert attribute.main(["--trace", str(tmp_path / "profile"), "--hlo", str(dump), "--out", str(out)]) == 0
+    time = json.loads(out.read_text())["time"]
+    assert time["by_part_kind_ms"] == {"norm": {"reduce": 2.0}}
+    assert time["by_part_ms"] == {"norm": {"backward": 2.0}}
+
+
 def test_a_capture_attributes_its_time_by_part_and_kind(tmp_path):
     """Through the command: the step's time by kind and by part and kind, each op once."""
     reports = tmp_path / "profile" / "capture-a" / "reports"

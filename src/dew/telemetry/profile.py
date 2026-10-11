@@ -103,8 +103,8 @@ def report_table(path: Path, index: int = 0) -> tuple[list[str], list[dict[str, 
     """The `index`-th DataTable of an exported XProf report (`reports/hlo_stats.json`,
     `framework_op_stats.json`, ...): its column ids, and its rows as values by column.
     A report that is absent or holds no such table has neither."""
-    data = json.loads(path.read_text()) if path.exists() else []
-    tables = data if isinstance(data, list) else [data]
+    exported = json.loads(path.read_text()) if path.exists() else []
+    tables = exported if isinstance(exported, list) else [exported]
     if index >= len(tables) or not isinstance(tables[index], dict) or "cols" not in tables[index]:
         return [], []
     columns = [column.get("id") for column in tables[index]["cols"]]
