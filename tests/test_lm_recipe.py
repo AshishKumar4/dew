@@ -550,7 +550,8 @@ def test_masked_diffusion_trains_on_packed_documents(tmp_path):
         ids[6::7] = 1  # every seventh id ends a document
         (directory / f"{split}.bin").write_bytes(ids.tobytes())
     (directory / "meta.json").write_text(json.dumps(
-        {"tokenizer": str(checkpoint), "vocab_size": 100, "dtype": "uint8", "eos_id": 1}))
+        {"tokenizer": str(checkpoint), "vocab_size": 100, "dtype": "uint8", "eos_id": 1,
+         "train_tokens": 400, "val_tokens": 96}))
     config = LMRunConfig.cli([
         "--data.pack", "first-fit", "--pretrained", str(checkpoint), "--objective", "masked_diffusion",
         "--tokenizer", str(checkpoint), "--data.source", str(directory),
@@ -622,7 +623,8 @@ def test_masked_diffusion_continues_a_pretrained_checkpoint(tmp_path):
         ids = np.random.RandomState(count).randint(4, 100, count).astype(np.uint8)
         (directory / f"{split}.bin").write_bytes(ids.tobytes())
     (directory / "meta.json").write_text(json.dumps(
-        {"tokenizer": str(checkpoint), "vocab_size": 100, "dtype": "uint8", "eos_id": 1}))
+        {"tokenizer": str(checkpoint), "vocab_size": 100, "dtype": "uint8", "eos_id": 1,
+         "train_tokens": 400, "val_tokens": 96}))
     config = LMRunConfig.cli([
         "--pretrained", str(checkpoint), "--objective", "masked_diffusion",
         "--tokenizer", str(checkpoint), "--data.source", str(directory),
@@ -748,5 +750,5 @@ def test_the_shipped_lm_run_config_round_trips_through_its_record():
     assert "ema_decay" not in record["objective"]["defaults"]
     assert record["sampling"]["temperature"] == 0.5 and record["sampling"]["top_k"] == 7
     assert LMRunConfig.from_dict(record) == config
-    with pytest.raises(ValueError, match="trains on token files"):
+    with pytest.raises(ValueError, match="trains on a Text recipe"):
         config.prepare()
