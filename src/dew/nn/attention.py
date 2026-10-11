@@ -27,7 +27,7 @@ from dew.telemetry.devices import deterministic_ops_requested
 
 from .attention_sinks import attention_with_sinks
 from .flops import attention_flops, projection_flops, real_lengths
-from .kernels import decode_attention, generation
+from .kernels import decode_attention, generation, norm_swiglu
 from .kernels.generation import bf16_dot_runs, device_generation, first_refusal, measured_kernel, ran_kernel
 from .kv_cache import Append, KVCache, KVStore, filled_slots
 from .precision import (
@@ -260,8 +260,8 @@ def normalized_in_fp32(normalize, static_argnums: tuple[int, ...] = ()):
 
 
 @functools.partial(normalized_in_fp32, static_argnums=(2, 3, 4, 5, 6))
-def rms_normalized(x, scale, epsilon: float, dtype, scale_offset: bool, scale_after_cast: bool,
-                   fp32_statistics: bool):
+def _xla_rms_normalized(x, scale, epsilon: float, dtype, scale_offset: bool, scale_after_cast: bool,
+                        fp32_statistics: bool):
     """Normalize `x` by its root mean square, then apply `scale`.
 
     The families differ on which side of the cast the weight goes, which
@@ -291,6 +291,26 @@ def rms_normalized(x, scale, epsilon: float, dtype, scale_offset: bool, scale_af
         # follows, and keeps the weight's product and gradient in fp32.
         return rounded_to(rounded_to(y, dtype) * weight, dtype).astype(dtype)
     return (y * weight).astype(dtype)
+
+
+def rms_normalized(x, scale, epsilon: float, dtype, scale_offset: bool, scale_after_cast: bool,
+                   fp32_statistics: bool, *, implementation: str = 'auto'):
+    """Normalize the last axis and apply an optional vector weight.
+
+    `scale_offset` adds one to the stored weight; `scale_after_cast` rounds
+    the normalized activation before multiplying and rounds the product
+    again. `fp32_statistics=False` retains the input-dtype arithmetic.
+    `implementation` selects the generation's measured kernel by default;
+    explicit 'pallas' interprets on CPU. The fused VJP retains only the
+    narrow input, weight and per-row inverse RMS, not fp32 activations.
+    Unsupported variants run the checkpointed XLA reference instead
+    (`norm_swiglu.rms_kernel`), including float64 and input-dtype statistics.
+    """
+    chosen = norm_swiglu.rms_kernel(implementation, x, scale, dtype, fp32_statistics)
+    if chosen == 'pallas':
+        return norm_swiglu.rms_norm(x, scale, epsilon, dtype, scale_offset, scale_after_cast,
+                                    jax.default_backend() == 'cpu')
+    return _xla_rms_normalized(x, scale, epsilon, dtype, scale_offset, scale_after_cast, fp32_statistics)
 
 
 @functools.partial(normalized_in_fp32, static_argnums=(3, 4))
@@ -355,6 +375,7 @@ class RMSNorm(nn.Module):
     with_scale: bool = True
     fp32_statistics: bool = True
     dtype: Dtype | None = None
+    implementation: str = 'auto'
 
     @nn.compact
     def __call__(self, x):
@@ -364,7 +385,7 @@ class RMSNorm(nn.Module):
             nn.initializers.zeros if self.scale_offset else nn.initializers.ones,
             (x.shape[-1],), jnp.float32) if self.with_scale else None
         return rms_normalized(x, scale, self.epsilon, dtype, self.scale_offset,
-                              self.scale_after_cast, self.fp32_statistics)
+                              self.scale_after_cast, self.fp32_statistics, implementation=self.implementation)
 
 
 class LayerNorm(nn.Module):
