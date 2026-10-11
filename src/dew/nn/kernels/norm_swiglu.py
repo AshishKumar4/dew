@@ -107,7 +107,8 @@ def _rms_forward(x_ref, scale_ref, y_ref, inverse_ref, *, epsilon: float,
     row = pl.program_id(0) * row_block + jnp.arange(row_block)
     mask = (row[:, None] < rows) & (columns[None, :] < width)
     x = plgpu.load(x_ref.at[row[:, None], columns[None, :]], mask=mask, other=0).astype(jnp.float32)
-    inverse = jax.lax.rsqrt(jnp.sum(x * x, axis=1) / width + epsilon)
+    # XLA's mean multiplies by the fp32 reciprocal, not an fp32 division.
+    inverse = jax.lax.rsqrt(jnp.sum(x * x, axis=1) * (1.0 / width) + epsilon)
     y = x * inverse[:, None]
     if scale_ref is not None:
         if after_cast:
@@ -136,7 +137,7 @@ def _rms_backward(x_ref, scale_ref, inverse_ref, dy_ref, dx_ref, partial_ref, *,
         if scale_ref is not None and after_cast:
             m = _round(m, dy_ref.dtype, interpret)
         # The two x contributions are kept separate, as XLA's square VJP is.
-        correction = (-0.5 * jnp.sum(m * x, axis=1)) * (inverse * inverse * inverse) / width
+        correction = (-0.5 * jnp.sum(m * x, axis=1)) * (inverse * inverse * inverse) * (1.0 / width)
         dx = m * inverse[:, None] + (2.0 * x) * correction[:, None]
         plgpu.store(dx_ref.at[row[:, None], columns[None, :]], dx.astype(dx_ref.dtype), mask=mask)
         if scale_ref is not None:
