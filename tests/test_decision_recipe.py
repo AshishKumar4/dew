@@ -204,9 +204,7 @@ def test_the_fit_check_leaves_out_a_set_none_of_whose_rows_fit():
 def test_the_clef_recipe_defaults_build_token_budget_batches():
     import itertools
 
-    from recipes.decision.clef import run_config
-
-    run = run_config()
+    run = _module("clef").run_config()
     trainer = run.trainer.derived()
     assert trainer.batch_size is None
     assert trainer.batch_tokens == trainer.update_tokens == 16_384
