@@ -1869,7 +1869,24 @@ def publish(
                     raise ValueError(f"{stem} concatenated checksum differs from the canonical mix")
     files.append({"path": "mixture.json", **_json(root.child("mixture.json"), made)})
     revision = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
-    manifest = {"schema": 1, "name": str(out).rstrip("/").rsplit("/", 1)[-1], "dew": revision, "files": files}
+    assemblies = [
+        {
+            "path": f"{name}{'.held' if split == 'held' else ''}.jsonl",
+            "bytes": sum(shard["bytes"] for shard in part[split]["shards"]),
+            "sha256": part[split]["sha256"],
+            "shards": [shard["path"] for shard in part[split]["shards"]],
+        }
+        for name, part in parts.items()
+        for split in ("train", "held")
+        if len(part[split]["shards"]) > 1
+    ]
+    manifest = {
+        "schema": 1,
+        "name": str(out).rstrip("/").rsplit("/", 1)[-1],
+        "dew": revision,
+        "files": files,
+        "assemblies": assemblies,
+    }
     digest = _json(root.child("manifest.json"), manifest)["sha256"]
     _publish(root.child("manifest.sha256"), (digest + "\n").encode())
     return made

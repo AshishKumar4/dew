@@ -550,7 +550,7 @@ class TokenRecords:
     """ArrayRecord token documents with a producer's authoritative length index."""
 
     paths: tuple[str, ...]
-    lengths: np.ndarray
+    lengths: np.ndarray | None
     dtype: str = "int32"
     field: str | None = None
     eos_id: int | None = None
@@ -565,7 +565,19 @@ class TokenRecords:
 
     @cached_property
     def ends(self) -> np.ndarray:
+        if self.lengths is None:
+            raise FileNotFoundError(
+                "ArrayRecord token spans need the producer's length index; "
+                "set provision=True or choose read='memory'"
+            )
         return np.cumsum(self.lengths, dtype=np.int64)
+
+    def materialize_lengths(self) -> np.ndarray:
+        if self.lengths is None:
+            self.__dict__["lengths"] = np.asarray(
+                [len(self.piece(index)) for index in range(len(self.records))], dtype=np.int64
+            )
+        return self.__dict__["lengths"]
 
     def piece(self, index: int) -> np.ndarray:
         from .codec import decode, unpack_dict_of_byte_arrays
@@ -583,7 +595,7 @@ class TokenRecords:
             values = np.frombuffer(payload, dtype=self.dtype)
         else:
             values = np.frombuffer(payload, dtype=self.dtype)
-        if len(values) != int(self.lengths[index]):
+        if self.lengths is not None and len(values) != int(self.lengths[index]):
             raise ValueError(f"token document {index} differs from the producer's length index")
         return values
 
@@ -611,9 +623,23 @@ class TokenFiles:
     split: str = "train"
     storage_options: Mapping[str, object] | None = None
     chunk_tokens: int = 65536
+    field: str | None = None
 
     def describe(self) -> str:
-        return f"tokens:{self.url}:{self.split}"
+        return f"tokens:{self.url}:{self.split}:field={self.field}"
+
+    @cached_property
+    def array_paths(self) -> tuple[str, ...]:
+        fs, path = Store(self.url, self.storage_options).resolve()
+        return tuple(
+            fs.unstrip_protocol(name)
+            for name in sorted(fs.glob(path.rstrip("/") + f"/{self.split}*.array_record*"))
+            if fs.isfile(name)
+        )
+
+    @property
+    def length_index(self) -> Store:
+        return Store(self.url, self.storage_options).child(f"{self.split}.lengths.npy")
 
     @cached_property
     def meta(self) -> Mapping[str, object]:
@@ -664,6 +690,21 @@ class TokenFiles:
                 self.storage_options,
                 record_codec=True,
             )
+        if self.array_paths:
+            binary = Store(self.url, self.storage_options).child(f"{self.split}.bin")
+            fs, path = binary.resolve()
+            if fs.exists(path):
+                raise ValueError(f"{self.url} holds {self.split} in both binary and ArrayRecord stores")
+            fs, path = self.length_index.resolve()
+            lengths = np.load(io.BytesIO(fs.cat_file(path)), allow_pickle=False) if fs.exists(path) else None
+            return TokenRecords(
+                self.array_paths,
+                lengths,
+                str(self.meta.get("dtype", "uint16")),
+                self.field,
+                eos,
+                self.storage_options,
+            )
         return TokenBytes(
             self.url.rstrip("/") + f"/{self.split}.bin",
             str(self.meta.get("dtype", "uint16")),
@@ -672,21 +713,26 @@ class TokenFiles:
         )
 
     def metadata(self) -> Mapping[str, object]:
-        return {
-            **self.meta,
-            "tokens": len(self.tokens),
-            "token_store": True,
-            f"{self.split}_tokens": len(self.tokens),
-        }
+        facts = dict(self.meta)
+        tokens = self.tokens
+        if isinstance(tokens, TokenBytes) or tokens.lengths is not None:
+            facts.update(tokens=len(tokens), **{f"{self.split}_tokens": len(tokens)})
+        elif f"{self.split}_tokens" in facts:
+            facts["tokens"] = facts[f"{self.split}_tokens"]
+        return {**facts, "token_store": True}
 
     def snapshot(self) -> Mapping[str, object]:
         if isinstance(self.tokens, TokenRecords):
+            fs, path = self.length_index.resolve()
             return {
                 "store": "tokens",
                 "url": self.url,
                 "split": self.split,
                 "metadata": self.meta,
-                "shards": Files(self.url).snapshot(),
+                "shards": Files(
+                    self.tokens.paths, format="array_record", storage_options=self.storage_options
+                ).snapshot(),
+                "index": fs.ukey(path) if fs.exists(path) else None,
             }
         fs, path = Store(self.tokens.url, self.storage_options).resolve()
         return {
@@ -699,9 +745,27 @@ class TokenFiles:
         }
 
     def supports(self, read: Read) -> bool:
-        return True
+        if read == "memory":
+            return True
+        tokens = self.tokens
+        return isinstance(tokens, TokenBytes) or tokens.lengths is not None
+
+    def provision(self) -> TokenFiles:
+        tokens = self.tokens
+        if isinstance(tokens, TokenRecords):
+            encoded = io.BytesIO()
+            np.save(encoded, tokens.materialize_lengths(), allow_pickle=False)
+            self.length_index.write(encoded.getvalue())
+        return self
 
     def records(self, read: Read) -> Records:
+        if not self.supports(read):
+            raise FileNotFoundError(
+                f"{self.describe()} needs its producer length index; "
+                "run dew data provision or choose read='memory'"
+            )
+        if read == "memory" and isinstance(self.tokens, TokenRecords):
+            self.tokens.materialize_lengths()
         indexed = _TokenChunks(self.tokens, self.chunk_tokens)
         return tuple(indexed[index] for index in range(len(indexed))) if read == "memory" else indexed
 

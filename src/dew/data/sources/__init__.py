@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping, Sequence
 from os import PathLike, fspath
 from typing import Protocol, runtime_checkable
@@ -45,6 +46,12 @@ def source(
             committed = files.committed
             metadata = None if committed is None else committed.get("metadata")
             native_tokens = isinstance(metadata, Mapping) and metadata.get("token_store") is True
+            metadata_path = path.rstrip("/") + "/meta.json"
+            if format is None and not native_tokens and fs.exists(metadata_path):
+                metadata = json.loads(fs.cat_file(metadata_path))
+                native_tokens = (
+                    isinstance(metadata, Mapping) and {"tokenizer", "dtype", "vocab_size"} <= metadata.keys()
+                )
             resolved = (
                 TokenFiles(url, split or "train")
                 if format is None and (native_tokens or fs.exists(token_file))
@@ -56,7 +63,7 @@ def source(
         resolved = Memory(value)
     else:
         raise TypeError(f"a source is a filesystem URL, named store, or records; got {type(value).__name__}")
-    if provision and isinstance(resolved, (Files, Hub, TFDS)):
+    if provision and isinstance(resolved, (Files, Hub, TFDS, TokenFiles)):
         resolved.provision()
     return resolved
 

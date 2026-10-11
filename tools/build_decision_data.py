@@ -91,6 +91,14 @@ def _index(work: Path, url: str) -> None:
         "dew": revision,
         "sha256": digest,
         "files": files,
+        "assemblies": [
+            {
+                "path": "eval-index.npz",
+                "bytes": len(data),
+                "sha256": digest,
+                "shards": [entry["path"] for entry in files],
+            }
+        ],
     }
     encoded = (json.dumps(manifest, indent=1) + "\n").encode()
     root.child("manifest.json").put_if_absent(encoded)
