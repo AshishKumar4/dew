@@ -6,7 +6,9 @@ packed documents treated as one attention square, and a vocabulary head
 incorrectly charged to a decision model.
 """
 
+import json
 import threading
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
@@ -22,6 +24,7 @@ from dew.decision.layout import DecisionInputs, Specials, StateFirstLayout
 from dew.decision.objective import DecisionObjective
 from dew.diffusion import presets
 from dew.inputs import Field, InputSpec
+from dew.interop.hf_decoders import translate_config
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import GatedMLP, RematPolicy
 from dew.nn.backbones.decoder_stack import Loop
@@ -594,3 +597,19 @@ def test_training_work_assembly_is_distinct_from_forward_model_count():
     objective = LMObjective(decoder(), seq_len=6, pad_id=0)
     batch = packed_batch()
     assert objective.training_flops(None, batch) == 3 * objective.model_flops(None, batch)
+
+
+def test_qwen35_reference_uses_the_counted_real_token_backbone_convention():
+    """The reference workload has no vocabulary projection, only its backbone.
+
+    Translate its committed released config without allocating any weights;
+    8x3072 real rows and the same 6HDkDv recurrent convention must give the
+    number both device runners publish, rather than an independent literal.
+    """
+    from tools.reference_runs.qwen35 import FLOPS_PER_STEP
+
+    path = Path(__file__).parent / "fixtures" / "hf" / "qwen35-0.8b" / "config.json"
+    config = json.loads(path.read_text())
+    model = translate_config(config["text_config"]).value
+    counted = int(3 * counted_flops(model, np.full((8,), 3072, np.int64)))
+    assert counted == FLOPS_PER_STEP, (counted, FLOPS_PER_STEP, counted - FLOPS_PER_STEP)
