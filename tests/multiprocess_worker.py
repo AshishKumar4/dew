@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import hashlib
 import json
 import time
 from datetime import datetime, timedelta
@@ -2244,18 +2245,25 @@ def matrix_data(read: str, cached: bool, rejecting: bool, packed: bool, cache_di
 
 def mode_matrix(args) -> dict:
     """Train one cell of the data matrix (`--cell read,cache,rejecting,packed`)
-    for `--steps`, from where the run directory's checkpoint left it."""
+    for `--steps`, from where the run directory's checkpoint left it. `batches`
+    is a digest of each batch this process read, in the order it read them."""
+    from dew.data.dataset import tapped
+
     read, cached, rejecting, packed = args.cell.split(",")
     data = matrix_data(read, cached == "cache", rejecting == "rejecting", packed == "packed",
                        Path(args.run_dir).parent / "cache")
     trainer = build_trainer(args.name, args.run_dir, args.fsdp_size)
     restored_step, _ = restored_state(trainer)
-    state = trainer.fit(Data(data.train, records=MATRIX_RECORDS), steps=args.steps, log_every=1,
+    batches = []
+    train = tapped(data.train, lambda batch: batches.append(hashlib.sha256(b"".join(
+        np.ascontiguousarray(batch[name]).tobytes() for name in sorted(batch))).hexdigest()))
+    state = trainer.fit(Data(train, records=MATRIX_RECORDS), steps=args.steps, log_every=1,
                         checkpoint_every=args.save_every)
     dump_params(args.out.with_suffix(".npz"), state.variables)
     _, position = restored_state(trainer)
     return {"step": int(as_numpy(state.step)), "restored_step": restored_step,
-            "lowering": None if data.plan is None else data.plan.lowering, "dataset_state": position}
+            "lowering": None if data.plan is None else data.plan.lowering, "dataset_state": position,
+            "batches": batches}
 
 
 MODES = {"matrix": mode_matrix, "host_training": mode_host_training, "step_fits": mode_step_fits,
