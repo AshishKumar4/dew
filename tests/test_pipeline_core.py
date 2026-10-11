@@ -419,6 +419,16 @@ def test_shares_agree_on_one_identity_and_resume_only_their_own_rows():
         second.close()
 
 
+def test_a_memory_read_counts_a_missing_row_alike_with_or_without_a_cache():
+    """A row the source holds as None is left out and counted missing,
+    whether the memory read fills a cache with it or not."""
+    stored = Memory([{"id": np.int32(0)}, None, {"id": np.int32(2)}])
+    for pipeline in (Pipeline(stored), Pipeline(stored).cache(Cache(f"memory://{uuid4().hex}"))):
+        data = compile(pipeline.batch(1), read="memory", loading=READ)
+        assert data.records == 2
+        assert [count.rejected["missing"] for count in data.counts.values()] == [1]
+
+
 def test_a_cached_indexed_root_is_cut_into_disjoint_shares_that_repeat():
     """Each share of a cached indexed read takes its own rows of the source,
     and a training read with no repeat stage goes on past one pass."""

@@ -720,9 +720,22 @@ class _ShardSteps:
 
 @dataclasses.dataclass(frozen=True)
 class _CachedOutputs:
-    def flat_map(self, outputs: Sequence[Batch | Rejected]) -> Sequence[Batch | Rejected]:
+    """What a cache holds for one input, as rows: its outputs, a missing one
+    and an empty expansion each rejected, which every read of a cache uses."""
+
+    def flat_map(self, outputs: Sequence[Record]) -> tuple[Record, ...]:
         held = tuple(Rejected("missing") if value is None else value for value in outputs)
         return held if held else (Rejected("empty_expansion"),)
+
+
+def _fill(pipeline: Pipeline, source: Source, at: int, read: Read) -> tuple[Cache, Manifest, _Prefix]:
+    """The cache stage at `at`, the manifest its fill is keyed by and the
+    record steps before it that fill it, from which memory, indexed and
+    streamed reads all open the cache."""
+    artifact, prefix = pipeline.stages[at], pipeline.stages[:at]
+    if not isinstance(artifact, Artifact) or any(not isinstance(stage, _LOCAL) for stage in prefix):
+        raise ValueError(f"cache prefix in {_name(pipeline)} must hold only deterministic record steps")
+    return _filled(artifact), _cache_manifest(source, prefix, read), _Prefix(prefix)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -805,20 +818,14 @@ def _memory_inputs(
     rows: list[tuple[tuple[int, ...], Record]] = []
     consumed = 0
     if artifact_at is not None:
-        artifact = pipeline.stages[artifact_at]
-        if not isinstance(artifact, Artifact):
-            raise RuntimeError("cache stage changed in an immutable pipeline")
-        prefix = pipeline.stages[:artifact_at]
-        manifest = _cache_manifest(source, prefix, "memory")
-        cached = _filled(artifact).mapped(
-            pygrain.MapDataset.source(stored), manifest, source, transform=_Prefix(prefix)
-        )
+        filled, manifest, prefix = _fill(pipeline, source, artifact_at, "memory")
+        cached = filled.mapped(pygrain.MapDataset.source(stored), manifest, source, transform=prefix)
         try:
             for index in range(len(cached)):
                 outputs = cached[index]
                 if not isinstance(outputs, tuple):
                     raise TypeError("cached input must return its tuple of expansion outputs")
-                for child, value in enumerate(outputs):
+                for child, value in enumerate(_CachedOutputs().flat_map(outputs)):
                     if isinstance(value, Rejected):
                         counter.rejected[value.reason] += 1
                     else:
@@ -1167,10 +1174,8 @@ class _Build:
             if measured is not None:
                 measured = self.shared(measured, pipeline, partition)
             return self.shared(rows, pipeline, partition), measured, 0
-        artifact, prefix = self.cached(pipeline, cache)
-        cached = _filled(artifact).mapped(
-            stored, _cache_manifest(source, prefix, self.read), source, transform=_Prefix(prefix)
-        )
+        filled, manifest, prefix = _fill(pipeline, source, cache, self.read)
+        cached = filled.mapped(stored, manifest, source, transform=prefix)
         view = self.shared(cached.map_with_index(_Placed()) if last > cache else cached, pipeline, partition)
         rows = cached.iterated(view, pygrain.ReadOptions(self.loading.threads, self.loading.read_buffer))
         flat = gx.FlatMapIterDataset(rows, _CachedOutputs())
@@ -1188,10 +1193,9 @@ class _Build:
         start = 0 if cache is None else cache + 1
         shards = source.manifest()
         if cache is not None:
-            artifact, prefix = self.cached(pipeline, cache)
+            filled, manifest, prefix = _fill(pipeline, source, cache, self.read)
             shards = _positioned(shards) if 0 <= last < cache else shards
-            manifest = _cache_manifest(source, prefix, self.read)
-            reader = _filled(artifact).streamed(shards.reader, manifest, shards, transform=_Prefix(prefix))
+            reader = filled.streamed(shards.reader, manifest, shards, transform=prefix)
             shards = dataclasses.replace(shards, reader=reader)
         shards = _positioned(shards) if last >= start else shards
         written = stages[start : start if interleave is None else interleave]
@@ -1201,12 +1205,6 @@ class _Build:
         if cache is not None or any(_drops(stage) for stage in local):
             rows = Accepted(rows, _name(pipeline), budget=self.budget)
         return rows, start if interleave is None else interleave + 1
-
-    def cached(self, pipeline: Pipeline, at: int) -> tuple[Artifact, tuple[Stage, ...]]:
-        artifact, prefix = pipeline.stages[at], pipeline.stages[:at]
-        if not isinstance(artifact, Artifact) or any(not isinstance(stage, _LOCAL) for stage in prefix):
-            raise ValueError(f"cache prefix in {_name(pipeline)} must hold only deterministic record steps")
-        return artifact, prefix
 
     def shared(
         self, rows: pygrain.MapDataset, pipeline: Pipeline, partition: DataPartition
