@@ -7,6 +7,7 @@ speed against fla's kernels are the GPU session's (c53 onwards).
 
 import functools
 
+import fla_gdn_support as support
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -48,7 +49,7 @@ def test_the_output_kernel_computes_flas_expression(dtype, shape, config):
     bk, bv = config
     scale = shape[4] ** -0.5
     got = fla_gdn.chunk_fwd_o(*operands, scale=scale, bk=bk, bv=bv, interpret=INTERPRETED)
-    want = fla_gdn.reference_o(*operands, scale=scale)
+    want = support.reference_o(*operands, scale=scale)
     assert got.shape == want.shape and got.dtype == want.dtype
     assert relative(got, want) < (2e-2 if dtype == jnp.bfloat16 else 1e-5)
 
@@ -81,7 +82,7 @@ def test_the_w_u_kernel_is_flas_recompute(dtype, shape):
     step = -jnp.exp(jax.random.normal(keys[4], (batch, length, value_heads)) - 3.0) * fla_gdn.RCP_LN2
     g = jnp.cumsum(step.reshape(batch, length // 64, 64, value_heads), axis=2).reshape(step.shape)
     got = fla_gdn.recompute_w_u(k, v, beta, a, g, interpret=INTERPRETED)
-    want = fla_gdn.reference_w_u(k, v, beta, a, g)
+    want = support.reference_w_u(k, v, beta, a, g)
     for name, mine, theirs in zip(("w", "u"), got, want, strict=True):
         assert mine.shape == theirs.shape and mine.dtype == theirs.dtype, name
         assert relative(mine, theirs) < (2e-2 if dtype == jnp.bfloat16 else 1e-5), name
@@ -100,7 +101,7 @@ def test_the_kkt_solve_kernel_inverts_flas_matrix(dtype, shape):
     step = -jnp.exp(jax.random.normal(keys[2], (batch, length, value_heads)) - 3.0) * fla_gdn.RCP_LN2
     g = jnp.cumsum(step.reshape(batch, length // 64, 64, value_heads), axis=2).reshape(step.shape)
     got = fla_gdn.kkt_solve(k, g, beta, interpret=INTERPRETED)
-    want = fla_gdn.reference_kkt_solve(k, g, beta)
+    want = support.reference_kkt_solve(k, g, beta)
     assert got.shape == want.shape and got.dtype == want.dtype
     assert relative(got, want) < (2e-2 if dtype == jnp.bfloat16 else 2e-3)
 
@@ -119,7 +120,7 @@ def test_the_h_kernel_is_flas_recurrence(dtype, shape):
     g = jnp.cumsum(step.reshape(batch, length // 64, 64, value_heads), axis=2).reshape(step.shape)
     h0 = 0.1 * jax.random.normal(keys[4], (batch, value_heads, width, columns))
     got = fla_gdn.chunk_fwd_h(k, w, u, g, h0, interpret=INTERPRETED)
-    want = fla_gdn.reference_h(k, w, u, g, h0)
+    want = support.reference_h(k, w, u, g, h0)
     for name, mine, theirs in zip(("h", "v_new", "final"), got, want, strict=True):
         assert mine.shape == theirs.shape and mine.dtype == theirs.dtype, name
         assert relative(mine, theirs) < (2e-2 if dtype == jnp.bfloat16 else 1e-5), name
@@ -142,7 +143,7 @@ def test_the_dhu_kernel_is_flas_reverse_recurrence(dtype, shape):
     dv = jax.random.normal(keys[6], (batch, length, value_heads, columns)).astype(dtype)
     scale = width ** -0.5
     got = fla_gdn.chunk_bwd_dhu(q, k, w, g, dht, do, dv, scale=scale, interpret=INTERPRETED)
-    want = fla_gdn.reference_dhu(q, k, w, g, dht, do, dv, scale=scale)
+    want = support.reference_dhu(q, k, w, g, dht, do, dv, scale=scale)
     for name, mine, theirs in zip(("dh", "dh0", "dv2"), got, want, strict=True):
         assert mine.shape == theirs.shape and mine.dtype == theirs.dtype, name
         assert relative(mine, theirs) < (2e-2 if dtype == jnp.bfloat16 else 1e-5), name
@@ -161,7 +162,7 @@ def test_the_dv_local_kernel_is_flas(dtype, shape):
     do = jax.random.normal(keys[3], (batch, length, value_heads, columns)).astype(dtype)
     scale = width ** -0.5
     got = fla_gdn.chunk_bwd_dv_local(q, k, g, do, scale=scale, interpret=INTERPRETED)
-    want = fla_gdn.reference_dv_local(q, k, g, do, scale=scale)
+    want = support.reference_dv_local(q, k, g, do, scale=scale)
     assert got.shape == want.shape and got.dtype == want.dtype
     assert relative(got, want) < (2e-2 if dtype == jnp.bfloat16 else 1e-5)
 
@@ -186,7 +187,7 @@ def test_the_dqkwg_kernel_is_flas(dtype, shape):
     do = jax.random.normal(keys[0], (batch, length, value_heads, columns)).astype(dtype)
     scale = width ** -0.5
     got = fla_gdn.chunk_bwd_dqkwg(q, k, v, w, g, h, dv, do, dh, scale=scale, interpret=INTERPRETED)
-    want = fla_gdn.reference_dqkwg(q, k, v, w, g, h, dv, do, dh, scale=scale)
+    want = support.reference_dqkwg(q, k, v, w, g, h, dv, do, dh, scale=scale)
     for name, mine, theirs in zip(("dq", "dk", "dw", "dg"), got, want, strict=True):
         assert mine.shape == theirs.shape and mine.dtype == theirs.dtype, name
         assert relative(mine, theirs) < (3e-2 if dtype == jnp.bfloat16 else 1e-5), name
@@ -475,13 +476,12 @@ def test_an_fp32_port_dot_names_its_products_whatever_the_global_precision():
     """The port's fp32 dots lower alike under a run's default precision and the suite's 'highest':
     TF32x3, or IEEE where fla asks for it, never the global setting's (which made the sm80 WY backward
     an IEEE kernel ptxas compiled for minutes). A dot that names nothing follows the setting."""
-    from dew.nn.kernels.generation import strict_dot
-
     for named in (False, True):
-        product = functools.partial(strict_dot, ieee=named)
+        product = functools.partial(fla_gdn._dot, exact=False, ieee=named)
         assert _lowered_dot(product, "default") == _lowered_dot(product, "highest")
-    ieee = functools.partial(strict_dot, ieee=True)
-    assert _lowered_dot(strict_dot, "default") != _lowered_dot(ieee, "default")
+    ieee = functools.partial(fla_gdn._dot, exact=False, ieee=True)
+    tf32x3 = functools.partial(fla_gdn._dot, exact=False)
+    assert _lowered_dot(tf32x3, "default") != _lowered_dot(ieee, "default")
 
     def unnamed(a, b):
         return jnp.dot(a, b, preferred_element_type=jnp.float32)

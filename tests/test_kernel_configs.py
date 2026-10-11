@@ -1,32 +1,15 @@
-"""CPU first filters for declared Pallas kernel configs: each compiles for its GPU within the block's
-shared memory, and the dots the kernels share refuse mixed dtypes. A GPU's own tests are the verdict."""
+"""CPU first filters for the fla port's declared configs: each compiles for its GPU within the block's
+shared memory, and its dots refuse mixed dtypes. A GPU's own tests are the verdict."""
 
-import ast
-import importlib
-from pathlib import Path
-
+import fla_gdn_support as support
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from kernel_compile import compile_kernels
 
-from dew.nn import kernels
 from dew.nn.kernels import fla_gdn, generation
 from dew.nn.linear import chunk_gated_delta_rule, fla_refusal, l2norm
-
-
-def configured_modules():
-    """Kernel modules declaring CONFIGS, found from source without importing the ones that do not."""
-    for root in kernels.__path__:
-        for path in sorted(Path(root).glob("*.py")):
-            tree = ast.parse(path.read_text(encoding="utf-8"))
-            declared = any((isinstance(node, ast.Assign)
-                            and any(isinstance(target, ast.Name) and target.id == "CONFIGS"
-                                    for target in node.targets))
-                           or (isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name)
-                               and node.target.id == "CONFIGS") for node in tree.body)
-            if declared:
-                yield importlib.import_module(f"{kernels.__name__}.{path.stem}")
 
 
 def test_the_declared_shapes_are_the_training_shapes():
@@ -67,7 +50,7 @@ def test_a_config_takes_the_labs_overrides_and_clips_to_the_operands():
 
 @pytest.mark.parametrize("target", ["sm80", "sm120"])
 def test_the_kernel_cases_lower_each_kernel_on_abstract_training_operands(target):
-    cases = list(fla_gdn.kernel_cases(target))
+    cases = list(support.kernel_cases(target))
     # Nine kernels at two dtypes and two shapes, plus the four reverse cumsums.
     assert len(cases) == 40 and len({case.name for case in cases}) == 40
     for case in cases:
@@ -84,14 +67,12 @@ def test_the_kernel_cases_lower_each_kernel_on_abstract_training_operands(target
 def test_the_shared_dot_rejects_mismatches_before_interpret_widening(exact, left, right):
     a, b = jnp.ones((2, 2), left), jnp.ones((2, 2), right)
     with pytest.raises(TypeError, match="same dtype"):
-        generation.strict_dot(a, b, exact=exact)
-    with pytest.raises(TypeError, match="same dtype"):
         fla_gdn._dot(a, b, exact=exact)
 
 
 def test_the_shared_dot_preserves_narrow_products_with_fp32_accumulation():
     a = jnp.asarray([[1.0, 0.5], [-0.25, 2.0]], jnp.bfloat16)
-    got = generation.strict_dot(a, a.T, exact=True)
+    got = fla_gdn._dot(a, a.T, exact=True)
     assert got.dtype == jnp.float32
     expected = a.astype(jnp.float32) @ a.T.astype(jnp.float32)
     np.testing.assert_array_equal(np.asarray(got), np.asarray(expected))
@@ -121,19 +102,25 @@ def test_the_fla_rule_refuses_a_key_head_serving_no_power_of_two_value_heads(mon
 def test_the_fla_rule_refuses_a_gpu_without_its_configs(monkeypatch):
     monkeypatch.setattr(generation, "device_generation", lambda: "sm75")
     k, v = jnp.zeros((1, 64, 1, 128), jnp.bfloat16), jnp.zeros((1, 64, 2, 128), jnp.bfloat16)
-    assert fla_gdn.rule_refusal(k, v, 64) == "the port has no configs for sm75"
+    assert fla_gdn.rule_refusal(k, v, 64) == "the port has no bfloat16 configs for sm75"
+
+
+def test_the_fla_rule_refuses_a_dtype_without_configs_where_it_interprets_too():
+    with jax.enable_x64(new_val=True):
+        k, v = jnp.zeros((1, 64, 1, 64), jnp.float64), jnp.zeros((1, 64, 2, 64), jnp.float64)
+        assert fla_gdn.rule_refusal(k, v, 64) == "the port has no float64 configs for cpu"
+        assert fla_refusal(k, v, 64) == "the port has no float64 configs for cpu"
 
 
 @pytest.mark.parametrize("target", ["sm80", "sm89", "sm120"])
 def test_every_declared_kernel_config_compiles_on_tritons_compiler_within_its_block(target):
     """Each declared config at each declared shape, lowered as on the GPU and compiled by pip's Triton
-    for its capability on this CPU (`generation.compile_kernels`): it compiles, within the bound, to
+    for its capability on this CPU (tests/kernel_compile.py): it compiles, within the bound, to
     no more shared memory than its GPU's block holds. A kernel that does not compile (a two-result
     inline asm, a mixed-dtype dot) or compiles pathologically slowly (an IEEE fp32 dot on sm80) fails
     here and never reaches a GPU."""
     pytest.importorskip("triton", reason="the test extra pins Triton on Linux x86_64")
-    found = [record for module in configured_modules()
-             for record in generation.compile_kernels(module, [target])]
+    found = compile_kernels(support.kernel_cases(target), target)
     assert found, "the compile gate must not be vacuous"
     failures = [f"{record['name']}: {record['error']}" if "error" in record else
                 f"{record['name']}: {record['shared']} shared bytes, limit {record['limit']}"
