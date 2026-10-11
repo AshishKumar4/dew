@@ -18,8 +18,11 @@ SwiGLU's gate gradient was 1.00e-3 against 1.45e-3 (A100). No generation
 selects these kernels until c53 measures their physical GPU kernel times.
 
 The fp32 activation/input-gradient tests hold relative differences below
-1e-5. Weight gradients use float64 as the judge: their RMS error may be
-no greater than XLA's, whose GPU column reduction is itself inexact. The
+1e-5. Weight gradients keep Liger's rounded forward coefficient. Their
+whole-function RMS error uses the project's unchanged 2x-XLA float64
+budget. Accumulation is separately judged by the exact float64 sum of
+the identical rounded factors, within XLA's sum error plus one final
+rounding, and at 24,576 rows within 2 ulp outright. The
 A100 verify found a 24,576-row fp32 dscale at 4.91e-3 RMS from float64,
 against XLA's 1.22e-3. Both accumulation levels now retain separate fp32
 Neumaier sums/corrections, instead of a left fold followed by plain sum.
