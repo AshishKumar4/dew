@@ -5,11 +5,11 @@ Iterates a dataset's training stream for a fixed number of steps and reports
 throughput and per-step latency. No model is built, so when a training step
 looks slow this says whether the loader is the reason.
 
-The dataset is a registered spec and its fields are the command line, so the
+The dataset is a registered recipe and its fields are the command line, so the
 knobs here are the knobs a run has:
 
     python tools/benchmark_data.py --steps 100 data:oxford-flowers --data.image-size 128
-    python tools/benchmark_data.py data:local-videos --data.path /mnt/data/voxceleb2/train --data.frames 16
+    python tools/benchmark_data.py data:local-videos --data.source /mnt/data/voxceleb2/train --data.frames 16
 """
 
 import os

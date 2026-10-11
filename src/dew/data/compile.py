@@ -396,7 +396,7 @@ class _Prefix:
 @dataclasses.dataclass(frozen=True)
 class _CachedOutputs:
     def flat_map(self, outputs: Sequence[Batch | Rejected]) -> Sequence[Batch | Rejected]:
-        return outputs or (Rejected("empty_expansion"),)
+        return tuple(Rejected("missing") if value is None else value for value in outputs) or (Rejected("empty_expansion"),)
 
 
 class _CacheIterator(pygrain.DatasetIterator[Record]):
