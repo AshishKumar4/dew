@@ -984,8 +984,9 @@ def test_vm_fetches_exact_shallow_sources_with_optional_delta_bundle(tmp_path, m
     for expected in (sha, plan["jobs"][0]["commit"]):
         subprocess.run(["git", "-C", str(worker.repo), "cat-file", "-e", expected + "^{commit}"], check=True)
     assert (worker.repo / ".git/shallow").is_file()
-    assert subprocess.check_output(["git", "-C", str(worker.repo), "remote", "get-url", "origin"],
-                                   text=True).strip() == str(origin)
+    assert subprocess.check_output(
+        ["git", "-C", str(worker.repo), "remote", "get-url", "origin"], text=True
+    ).strip() == str(origin)
 
 
 @pytest.mark.parametrize("expected,explicit", [(0.1, None), (0.7, None), (0.2, 0.08)])
