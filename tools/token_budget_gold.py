@@ -66,10 +66,12 @@ def main() -> None:
     parser.add_argument("--batch-rows", type=int)
     parser.add_argument("--profile-open", type=Path)
     parser.add_argument("--descriptor")
+    parser.add_argument("--tokenizer-model", default="Qwen/Qwen3.5-2B")
+    parser.add_argument("--tokenizer-revision", default="15852e8c16360a2fea060d615a32b45270f8a8fc")
     args = parser.parse_args()
     pinned = snapshot_download(
-        "Qwen/Qwen3.5-2B",
-        revision="15852e8c16360a2fea060d615a32b45270f8a8fc",
+        args.tokenizer_model,
+        revision=args.tokenizer_revision,
         allow_patterns=["*.json", "*.jinja", "*.model", "*.txt"],
     )
     tokenizer = HFTokenizer(pinned, local_files_only=True)
@@ -134,6 +136,7 @@ def main() -> None:
         raise ValueError(f"the budget path emitted {len(shapes)} shapes, expected at most six")
     result = {
         "root": args.root,
+        "tokenizer": {"model": args.tokenizer_model, "revision": args.tokenizer_revision},
         "micro_tokens": args.micro_tokens,
         "batch_rows": args.batch_rows,
         "rows": rows,
