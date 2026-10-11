@@ -959,13 +959,6 @@ def _token_spans(documents: Iterable[Record], split: TokenSplit) -> list[tuple[i
     return spans
 
 
-def _token_span(document: Record, split: TokenSplit, first: int, last: int) -> Batch:
-    return {
-        key: np.asarray(column)[first:last] if key in split.fields else column
-        for key, column in record(document, "token split document").items()
-    }
-
-
 class _TokenSplit(_WrappingDataset):
     """A token split of a finite indexed order, such as a shuffled corpus:
     the spans `_token_spans` keeps, computed once over the order as it reads."""
@@ -980,7 +973,10 @@ class _TokenSplit(_WrappingDataset):
 
     def record(self, index: int) -> Batch:
         document, first, last = self.spans[index]
-        return _token_span(self._parent[document], self._split, first, last)
+        return {
+            key: np.asarray(column)[first:last] if key in self._split.fields else column
+            for key, column in record(self._parent[document], "token split document").items()
+        }
 
 
 def _memory_mixture(
