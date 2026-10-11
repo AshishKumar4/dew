@@ -338,13 +338,13 @@ SECTIONS = {function.__name__: function for function in
 
 def offline(out):
     """Serve the Hub names the cells read from small fixtures, without the network."""
-    import datasets
-    import huggingface_hub
-    from PIL import Image
-    from huggingface_hub import HfApi
     from types import SimpleNamespace
 
-    import dew.data.text
+    import datasets
+    import huggingface_hub
+    from huggingface_hub import HfApi
+    from PIL import Image
+
     import dew.interop.hub as hub
     from dew.data import ByteTokenizer
     from dew.decision import Decide
@@ -354,7 +354,7 @@ def offline(out):
 
     os.environ["XDG_CACHE_HOME"] = str(out / "cache")
     images = [Image.new("RGB", (32, 32), (255, 0, 255))] * 320
-    tables = {"winglian/tiny-shakespeare": {"text": ["dew trains jax models. " * 100] * 4},
+    tables = {"winglian/tiny-shakespeare": {"text": ["token5 token7 token9 token11 " * 100] * 4},
               "uoft-cs/cifar10": {"img": images, "label": [0] * len(images)}}
     builder = datasets.load_dataset_builder
     builders = {}
@@ -372,7 +372,8 @@ def offline(out):
     datasets.load_dataset_builder = lambda repo, **options: (
         builders[repo] if repo in builders else builder(repo, **options))
     decoders = {"Qwen/Qwen3-0.6B", "HuggingFaceTB/SmolLM2-135M-Instruct"}
-    tokenizer_files = ROOT / "tests/fixtures/tokenizers/tiny-tools"
+    # Its 256 word ids fit the decoder fixture, with distinct targets in the fixture corpus.
+    tokenizer_files = ROOT / "tests/fixtures/hf/qwen35-native-tiny"
     model_info, snapshot = HfApi.model_info, huggingface_hub.snapshot_download
     HfApi.model_info = lambda self, repo, **options: (
         SimpleNamespace(sha="offline-fixture") if repo in decoders else model_info(self, repo, **options))
