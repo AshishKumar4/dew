@@ -1490,7 +1490,7 @@ class PhasedStream:
     def set_state(self, state: bytes) -> None:
         saved = position.read(state)
         if saved.plan is not None:
-            plans = saved.plan.get("phases")
+            plans = saved.plan.get("phases") if "phases" in saved.plan else [saved.plan]
             if not isinstance(plans, list) or len(plans) != len(saved.completed) + 1:
                 raise ValueError("saved phase plans do not cover the completed and current phases")
             for index, plan in enumerate(plans):

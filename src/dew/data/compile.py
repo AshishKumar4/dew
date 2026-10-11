@@ -263,6 +263,23 @@ def _capabilities(pipelines: Sequence[Pipeline], read: Read, provision: bool) ->
         )
 
 
+def _tokenizer_contract(pipelines: Sequence[Pipeline]) -> None:
+    declared: dict[str, JSON] = {}
+    for pipeline in pipelines:
+        for leaf in _leaves(pipeline):
+            if isinstance(leaf.source, (Mixture, Phases)):
+                continue
+            metadata = leaf.source.metadata()
+            for key in ("tokenizer", "vocab_size", "eos_id", "tokenizer_revision"):
+                if key not in metadata:
+                    continue
+                value = json_value(metadata[key], key)
+                if key in declared and value != declared[key]:
+                    raise ValueError(f"corpus {_name(leaf)} has {key}={value!r}, expected {declared[key]!r}; "
+                                     "mixed corpora must share the tokenizer contract")
+                declared[key] = value
+
+
 def _configured(pipeline: Pipeline, shared: Mapping[str, object], read: Read,
                  scope: Literal["source", "run"] | None = None) -> Pipeline:
     source = pipeline.source
@@ -1398,6 +1415,7 @@ def compile(
         validation, _ = _promoted(validation)
     pipelines = (train,) if validation is None else (train, validation)
     _capabilities(pipelines, read, provision)
+    _tokenizer_contract(pipelines)
     counts: dict[str, CorpusCounts] = {}
     validation_counts: dict[str, CorpusCounts] = {}
     if objective is not None:
@@ -1483,6 +1501,7 @@ def _compile_phases(train: Pipeline, *, validation: Pipeline | None, host: tuple
     if not isinstance(source, Phases):
         raise TypeError("phased compilation needs a Phases source")
     _capabilities((train,) if validation is None else (train, validation), read, provision)
+    _tokenizer_contract((train,) if validation is None else (train, validation))
     consumed: dict[str, int] = {}
     built: list[tuple[Dataset, int | None]] = []
     previous = 0
