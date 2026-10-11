@@ -399,8 +399,9 @@ class Decisions:
 
         table = ParseTable(self.options, self.text, self.label, self.question, self.instructions)
         if isinstance(self.source, Mapping):
-            branches = [dataclasses.replace(self, source=rows, validation=None, weights={}).pipelines()[0]
-                        for _, rows in sorted(self.source.items())]
+            branches = [dataclasses.replace(
+                dataclasses.replace(self, source=rows, validation=None, weights={}).pipelines()[0], name=name)
+                        for name, rows in sorted(self.source.items())]
             weights = [self.weights.get(name, 1.) for name in sorted(self.source)]
             train = branches[0] if len(branches) == 1 else branches[0].mix(*branches[1:], weights=weights)
             held = None if self.validation is None else dataclasses.replace(
@@ -477,16 +478,16 @@ class Decisions:
             dataset.records("memory")
             if any("example" not in row for row in rows):
                 dataset.records("memory")
-                train = Pipeline(dataset).map(Configured(_ParseConfigured(table), needs=()))
+                train = Pipeline(dataset, name="examples").map(Configured(_ParseConfigured(table), needs=()))
             else:
-                train = Pipeline(dataset)
+                train = Pipeline(dataset, name="examples")
         else:
             dataset = _DecisionSource(
                 source(self.source, split=self.split),
                 {"questions": 1, "options": len(self.options)} if self.options else None,
                 table=table,
             )
-            train = Pipeline(dataset).map(Configured(_ParseConfigured(table), needs=()))
+            train = Pipeline(dataset, name="examples").map(Configured(_ParseConfigured(table), needs=()))
         if self.validation is None:
             evaluated = None
         elif isinstance(self.validation, HoldOut):
@@ -500,7 +501,7 @@ class Decisions:
             rows = tuple({"example": Example.of(row)} for row in self.validation)
             held_source = _DecisionSource(Memory(rows))
             held_source._memory_slots(rows)
-            evaluated = Pipeline(held_source)
+            evaluated = Pipeline(held_source, name="held out")
         else:
             evaluated = Pipeline(_DecisionSource(source(self.validation), table=table)).map(
                 Configured(_ParseConfigured(table), needs=()))

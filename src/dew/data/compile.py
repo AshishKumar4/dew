@@ -376,12 +376,12 @@ class _Memory:
 
 
 def _materialize(pipeline: Pipeline, counts: dict[str, CorpusCounts],
-                 groups: LengthGroups | None = None) -> Pipeline:
+                 groups: LengthGroups | None = None, *, training: bool = True) -> Pipeline:
     groups = next((stage.groups for stage in pipeline.stages if isinstance(stage, Group)), groups)
     if isinstance(pipeline.source, Phases):
         raise ValueError("materialize each phase before constructing its global order")
     if isinstance(pipeline.source, (Mixture, Phases)):
-        return _memory_mixture(pipeline, pipeline.source, counts, groups)
+        return _memory_mixture(pipeline, pipeline.source, counts, groups, training=training)
     source = pipeline.source
     stored = source.records("memory")
     rows: list[tuple[tuple[int, ...], Record]] = []
@@ -464,18 +464,21 @@ def _materialize(pipeline: Pipeline, counts: dict[str, CorpusCounts],
                         )
             rows = expanded
         consumed += 1
-    return _memory_order(pipeline, rows, consumed, source, len(stored), counter, derived, groups)
+    return _memory_order(pipeline, rows, consumed, source, len(stored), counter, derived, groups,
+                         training=training)
 
 
 def _memory_mixture(pipeline: Pipeline, mixture: Mixture, counts: dict[str, CorpusCounts],
-                    groups: LengthGroups | None) -> Pipeline:
-    children = tuple(_materialize(child, counts, groups) for child in mixture.pipelines)
+                    groups: LengthGroups | None, *, training: bool) -> Pipeline:
+    children = tuple(_materialize(child, counts, groups, training=training) for child in mixture.pipelines)
     kept = tuple((child, weight) for child, weight in zip(children, mixture.weights, strict=True)
                  if isinstance(child.source, (Mixture, Phases)) or len(child.source.records("memory")))
     omitted = [_name(child) for child in children if all(child is not accepted for accepted, _ in kept)]
     if omitted:
         _log.warning("left out of the mixture: %s (zero accepted rows)", ", ".join(omitted))
     if not kept:
+        if not training:
+            return dataclasses.replace(children[0], stages=(*children[0].stages, *pipeline.stages))
         raise ValueError(f"no accepted row of {', '.join(_name(child) for child in children)}; raise the row budgets")
     if len(kept) == 1:
         child = kept[0][0]
@@ -487,7 +490,7 @@ def _memory_mixture(pipeline: Pipeline, mixture: Mixture, counts: dict[str, Corp
 
 def _memory_order(pipeline: Pipeline, collected: Sequence[tuple[tuple[int, ...], Record]], consumed: int,
                   source: Source, inputs: int, counter: CorpusCounts, derived: dict[str, str],
-                  groups: LengthGroups | None) -> Pipeline:
+                  groups: LengthGroups | None, *, training: bool) -> Pipeline:
     rows = [(identifier, value if isinstance(value, bytes) else record(value, "materialized record"))
             for identifier, value in collected]
     remaining = pipeline.stages[consumed:]
@@ -523,7 +526,7 @@ def _memory_order(pipeline: Pipeline, collected: Sequence[tuple[tuple[int, ...],
                 counter.rejected["zero_targets"] += 1
         rows = kept
         facts = {"windows": len(rows), "valid_targets": sum(targets(record(value, "packed window")) for _, value in rows)}
-        if facts["valid_targets"] == 0:
+        if facts["valid_targets"] == 0 and training:
             raise ValueError(f"corpus {_name(pipeline)} has zero valid target tokens")
         derived["valid_targets"] = fingerprint(facts)
         counter.accepted = len(rows)
@@ -1143,10 +1146,13 @@ def compile(
         raise ValueError("compile needs one batch(global_size) stage on the training pipeline")
     batch = batches[0]
     counts: dict[str, CorpusCounts] = {}
+    validation_counts: dict[str, CorpusCounts] = {}
     original = train
     if read == "memory":
         train = _materialize(train, counts)
-        validation = None if validation is None else _materialize(validation, {})
+        validation = None if validation is None else _materialize(validation, validation_counts, training=False)
+        if validation_counts and not any(count.accepted for count in validation_counts.values()):
+            validation = None
     global_order = not _per_share(train, read)
     manifest = Manifest.of(
         {
@@ -1182,7 +1188,10 @@ def compile(
     records = _epoch_records(train, read) if global_order else None
     if records == 0:
         raise ValueError(f"corpus {_name(train)} has no accepted rows")
-    return Dataset(training, held_reader, records, batch, counts=counts, plan=plan)
+    held_out = sum(integer(leaf.source.metadata().get("held_out", 0), "held_out") for leaf in _leaves(train)
+                   if not isinstance(leaf.source, (Mixture, Phases)))
+    return Dataset(training, held_reader, records, batch, held_out=held_out, counts=counts,
+                   validation_counts=validation_counts, plan=plan)
 
 
 def _compile_phases(train: Pipeline, *, validation: Pipeline | None, host: tuple[HostStep, ...],
@@ -1279,6 +1288,8 @@ def _validation_reader(partition: DataPartition, *, pipeline: Pipeline, build: _
                        host: tuple[HostStep, ...]) -> Iterator[Batch]:
     build = dataclasses.replace(build, global_order=not _per_share(pipeline, build.read))
     opened: Iterator[Batch]
+    if not build.global_order:
+        build = dataclasses.replace(build, loading=dataclasses.replace(build.loading, workers=0))
     if build.read == "streamed":
         build = dataclasses.replace(build, loading=dataclasses.replace(build.loading, workers=0))
         opened = _CanonicalPass(functools.partial(build.batches, pipeline), partition)
@@ -1485,7 +1496,7 @@ def iterate(
     _check(pipeline, read)
     _capabilities((pipeline,), read, provision)
     if read == "memory":
-        pipeline = _materialize(pipeline, {})
+        pipeline = _materialize(pipeline, {}, training=False)
     build = _Build(read, loading, 0, 1, budget, not _per_share(pipeline, read), training=False)
     rows, _ = build.records(pipeline, DataPartition())
     return _as_iter(rows, loading)

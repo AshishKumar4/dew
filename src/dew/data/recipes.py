@@ -91,7 +91,8 @@ class _SliceRecords:
         return SourceSlice(records, self.start, stop)
 
     def metadata(self) -> Mapping[str, object]:
-        return self.source.metadata()
+        stated = self.source.metadata()
+        return {**stated, **({"held_out": self.start} if self.start else {})}
 
     def lengths(self) -> np.ndarray | None:
         lengths = self.source.lengths()
@@ -471,7 +472,7 @@ class Preferences:
 class Augment:
     crop: bool = False
     flip: bool = True
-    jitter: bool = False
+    jitter: bool = True
     crop_scale: tuple[float, float] = (1.0, 1.0)
     backend: Literal["host", "device"] = "device"
 
