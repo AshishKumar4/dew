@@ -345,13 +345,17 @@ def l2_normalized(x, eps: float = 1e-12):
     return x / jnp.sqrt(jnp.maximum(jnp.sum(jnp.square(x), axis=-1, keepdims=True), eps * eps))
 
 
-def unweighted_rmsnorm(x, eps: float):
+def unweighted_rmsnorm(x, eps: float, *, implementation: str = 'auto'):
     """Normalize the last axis by its root mean square, with no learned weight.
 
     The reduction runs in fp32 and the inverse deviation is cast back
     before it multiplies, which is what `DeepseekV4UnweightedRMSNorm`
-    (modeling_deepseek_v4.py:66-72) and its GLM twin do.
+    (modeling_deepseek_v4.py:66-72) and its GLM twin do. The fused RMSNorm
+    rounds the normalized activation instead, so this variant refuses it
+    through the kernel table and retains XLA's input-dtype product and VJP.
     """
+    norm_swiglu.rms_kernel(implementation, x, None, x.dtype, fp32_statistics=True,
+                           inverse_after_cast=True)
     fp32 = x.astype(at_least_fp32(x.dtype))
     inverse = jax.lax.rsqrt(jnp.mean(jnp.square(fp32), axis=-1, keepdims=True) + eps)
     return x * inverse.astype(x.dtype)

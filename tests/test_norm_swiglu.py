@@ -14,7 +14,7 @@ import pytest
 from reference_error import assert_as_exact_as_the_reference
 
 from dew.nn import attention, kernels
-from dew.nn.attention import RMSNorm, forward_mode_attention, rms_normalized
+from dew.nn.attention import RMSNorm, forward_mode_attention, rms_normalized, unweighted_rmsnorm
 from dew.nn.kernels import norm_swiglu
 from dew.nn.moe import gated_product
 
@@ -31,6 +31,8 @@ def evaluated(function, operands, seed):
 
 def compare(functions, operands, seed, labels):
     xla, pallas, exact = functions
+    graph = str(jax.make_jaxpr(pallas)(*operands))
+    assert "rms_norm_forward" in graph or "swiglu_forward" in graph
     reference = jax.jit(functools.partial(evaluated, xla))(operands, seed)
     actual = jax.jit(functools.partial(evaluated, pallas))(operands, seed)
     cpu = jax.devices("cpu")[0]
@@ -195,3 +197,16 @@ def test_unknown_implementation_is_rejected():
                         fp32_statistics=True, implementation="other")
     with pytest.raises(ValueError, match="implementation"):
         gated_product("swiglu", implementation="other")
+
+
+def test_inverse_cast_variant_refuses_the_normalized_activation_kernel(monkeypatch, caplog):
+    monkeypatch.setitem(kernels.KERNELS, "rms_norm", {"cpu": "pallas"})
+    monkeypatch.setattr(kernels.generation, "_logged", set())
+    x = jax.random.normal(jax.random.key(15), (3, 31)).astype(jnp.bfloat16)
+    reference = evaluated(lambda x: unweighted_rmsnorm(x, 1e-5, implementation="xla"), (x,), x)
+    for _ in range(2):
+        actual = evaluated(lambda x: unweighted_rmsnorm(x, 1e-5, implementation="pallas"), (x,), x)
+        for mine, theirs in zip(actual, reference, strict=True):
+            np.testing.assert_array_equal(mine, theirs)
+    logged = [record.getMessage() for record in caplog.records if record.name == kernels.generation.__name__]
+    assert len(logged) == 1 and "rounds the inverse" in logged[0]
