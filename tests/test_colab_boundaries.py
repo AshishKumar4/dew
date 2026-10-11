@@ -2,6 +2,8 @@
 
 import hashlib
 import os
+import signal
+import subprocess
 import sys
 import threading
 import time
@@ -212,3 +214,27 @@ def test_late_decision_is_refused_before_publishing(tmp_path):
     with pytest.raises(ValueError, match="expired"):
         boundary.decide(tmp_path, {"request_id": "request", "generation": 0, "action": "replace"})
     assert not (tmp_path / "decision.json").exists()
+
+
+def test_decision_accepted_before_deadline_is_honored_when_child_resumes_after_it(tmp_path):
+    directory = tmp_path / "boundary"
+    directory.mkdir()
+    child = tmp_path / "child.py"
+    child.write_text("from tools.colab.boundary import checkpoint\ncheckpoint('E5')\n")
+    boundary.request(directory, "E5", 0, "accepted", decision_seconds=.5)
+    env = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1]),
+           "DEW_COLAB_BOUNDARY_DIR": str(directory), "DEW_COLAB_GENERATION": "0"}
+    with (tmp_path / "run.log").open("w") as log:
+        process = subprocess.Popen([sys.executable, str(child)], env=env, stdout=log, stderr=log)
+        try:
+            wait_file(directory / "ready.json")
+            os.kill(process.pid, signal.SIGSTOP)
+            boundary.decide(directory, {"request_id": "accepted", "generation": 0,
+                                       "action": "stop", "snapshot_acknowledged": True})
+            time.sleep(.6)
+            os.kill(process.pid, signal.SIGCONT)
+            assert process.wait(timeout=3) == boundary.REPLACED
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait()

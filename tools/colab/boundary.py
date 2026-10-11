@@ -49,10 +49,6 @@ def checkpoint(name: str) -> None:
     }
     save(directory / "ready.json", ready)
     while True:
-        if time.time() >= ready["decision_deadline"]:
-            ready.update(state="boundary decision timed out; continued", at=time.time())
-            save(directory / "ready.json", ready)
-            return
         decision = read(directory / "decision.json")
         if decision.get("request_id") == ready["request_id"] and decision.get("generation") == generation:
             if decision.get("action") == "continue":
@@ -62,6 +58,10 @@ def checkpoint(name: str) -> None:
                     raise ValueError("boundary cannot exit before its outputs are acknowledged")
                 raise SystemExit(REPLACED)
             raise ValueError("unknown boundary decision")
+        if time.time() >= ready["decision_deadline"]:
+            ready.update(state="boundary decision timed out; continued", at=time.time())
+            save(directory / "ready.json", ready)
+            return
         time.sleep(0.1)
 
 
