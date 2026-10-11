@@ -203,6 +203,7 @@ class Batch:
 
     def prepare(self) -> None:
         command(["git", "init", "-q", str(self.repo)], timeout=30)
+        command(["git", "-C", str(self.repo), "remote", "add", "origin", self.plan["origin"]], timeout=30)
         for sha in self.plan["fetch_commits"]:
             command(
                 [
