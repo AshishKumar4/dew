@@ -19,7 +19,7 @@ from jax.extend import core as jaxpr_core
 from recording import RecordingTracker
 
 from dew.data.text import ByteTokenizer
-from dew.decision.head import DecisionHead, JointSchemaHead
+from dew.decision.head import DecisionHead, Head, JointSchemaHead
 from dew.decision.layout import DecisionInputs, Specials, StateFirstLayout
 from dew.decision.objective import DecisionObjective
 from dew.diffusion import presets
@@ -50,7 +50,7 @@ from dew.nn.mixers.mamba import Mamba, selective_scan
 from dew.nn.mixers.mamba2 import Mamba2, recurrent_ssd
 from dew.nn.mla import MultiHeadLatentAttention
 from dew.nn.moe import SparseMLP
-from dew.nn.protocols import Counted, CountedLogits
+from dew.nn.protocols import Counted, CountedDecisions, CountedLogits
 from dew.nn.ssm import BidirectionalS5Layer, S5Layer, _scanned_directions
 from dew.objectives.diffusion import DiffusionObjective
 from dew.objectives.lm import LMObjective
@@ -158,6 +158,7 @@ def test_diffusion_supplies_patch_channels_and_refuses_missing_auxiliary_work():
     objective = DiffusionObjective(model, presets.Flow(), inputs=InputSpec(sample=Field("images", (4, 8, 3))),
                                    autoencoder=None, ema_decay=None)
     batch = {"images": np.zeros((2, 4, 8, 3), np.float32)}
+    assert objective.counts_work
     np.testing.assert_array_equal(objective.real_lengths(batch), [8, 8])
     assert objective.model_flops(None, batch) == model.image_flops(np.array([8, 8]), 3)
 
@@ -212,6 +213,7 @@ def test_lm_packing_counts_independent_attention_squares_and_real_predictions():
 def test_preference_geometry_is_not_mistaken_for_a_single_lm_sequence():
     objective = DPOObjective(decoder(), seq_len=6)
     batch = {"input_ids": np.ones((2, 2, 7), np.int32)}
+    assert not objective.counts_work
     assert prepare_counts(objective, batch, count_model=False) is batch
     with pytest.raises(MissingFlopsCount, match=r"DPOObjective.*auxiliary"):
         objective.model_flops(None, batch)
@@ -228,8 +230,9 @@ def test_decision_head_charges_options_and_evidence_not_a_vocabulary():
     scorer = (8 * 16 * 16 + 2 * 16 + 6 * 16 + 2 * 8) * 8
     pooling = 2 * 8 * (2 * (1 + 2 * 2) + 5 * (2 + 2 * 6))
     assert clef.decision_flops(LENGTHS, questions, options) == projected + evidence + scorer + pooling
-    with pytest.raises(MissingFlopsCount, match=r"JointSchemaHead.*decision_flops"):
-        clef.model_flops(LENGTHS)
+    assert isinstance(clef, CountedDecisions) and not isinstance(clef, Counted)
+    with pytest.raises(MissingFlopsCount, match=r"JointSchemaHead.*model_flops"):
+        counted_flops(clef, LENGTHS)
 
 
 def test_missing_family_is_named_instead_of_falling_back_to_hlo():
@@ -239,6 +242,7 @@ def test_missing_family_is_named_instead_of_falling_back_to_hlo():
 
 def test_host_row_counts_add_to_objectives_total_without_padding():
     objective = LMObjective(decoder(), seq_len=6, pad_id=0)
+    assert objective.counts_work
     batch = packed_batch()
     counted = prepare_counts(objective, batch, count_model=True)
     np.testing.assert_array_equal(counted[TOKENS], [4, 3])
@@ -261,8 +265,42 @@ def test_decision_objective_supplies_the_layout_geometry_to_the_head():
                                   [[True, True, True], [True, True, True]]])}
     np.testing.assert_array_equal(objective.real_lengths(batch), LENGTHS)
     wanted = model.model_flops(LENGTHS) + head.decision_flops(LENGTHS, np.array([1, 2]), np.array([2, 6]))
+    assert objective.counts_work
     assert objective.model_flops(None, batch) == wanted
     assert objective.model_flops(objective.model, batch) == wanted
+
+
+def test_uncounted_decision_head_makes_work_unavailable_but_direct_counts_stay_strict():
+    objective = DecisionObjective(decoder(), head=Head(), tokenizer=ByteTokenizer(),
+                                  specials=Specials(begin=None, separator=10, marker=0,
+                                                    marker_text="\x00", pad=255),
+                                  layout=StateFirstLayout(max_len=16))
+    assert not isinstance(objective.model.head, CountedDecisions)
+    assert not objective.counts_work
+    batch = {"valid": np.ones((2, 8), bool)}
+    for count in (objective.model_flops, objective.training_flops):
+        with pytest.raises(MissingFlopsCount, match=r"Head.*decision_flops"):
+            count(None, batch)
+
+
+@pytest.mark.parametrize("uncertainty", [None, 8])
+def test_diffusion_work_availability_uses_the_same_auxiliary_geometry_as_direct_counts(uncertainty):
+    model = SimpleDiT(emb_features=8, num_layers=1, num_heads=2, patch_size=2)
+    objective = DiffusionObjective(model, presets.Flow(), inputs=InputSpec(sample=Field("images", (4, 4, 3))),
+                                   autoencoder=None, uncertainty=uncertainty, ema_decay=None)
+    assert objective.counts_work is (uncertainty is None)
+    if uncertainty is not None:
+        with pytest.raises(MissingFlopsCount, match="uncertainty work"):
+            objective.training_flops(None, {"images": np.zeros((2, 4, 4, 3), np.float32)})
+
+
+@pytest.mark.parametrize("mtp_weight", [None, 1.0])
+def test_lm_work_availability_uses_the_same_prediction_depth_geometry_as_direct_counts(mtp_weight):
+    objective = LMObjective(decoder(num_nextn_predict_layers=1), seq_len=6, mtp_weight=mtp_weight)
+    assert objective.counts_work is (mtp_weight is None)
+    if mtp_weight is not None:
+        with pytest.raises(MissingFlopsCount, match="prediction-depth geometry"):
+            objective.training_flops(None, packed_batch())
 
 
 @pytest.mark.mesh(devices=2)

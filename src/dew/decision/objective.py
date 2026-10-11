@@ -40,7 +40,7 @@ from dew.interop.processors import Processor
 from dew.lora import Adapter
 from dew.nn.flops import MissingFlopsCount, counted_flops
 from dew.nn.inputs import ModelInputs
-from dew.nn.protocols import CountedTraining, TokenModel
+from dew.nn.protocols import Counted, CountedDecisions, CountedTraining, TokenModel
 from dew.objectives.base import (
     OMITTED,
     Aux,
@@ -307,6 +307,12 @@ class DecisionObjective(Objective[Ratio]):
 
     counts_tokens = True
 
+    @property
+    def counts_work(self) -> bool:
+        """Both the backbone and the layout-aware head must declare their work."""
+        return (isinstance(self.model.backbone, Counted)
+                and isinstance(self.model.head, CountedDecisions))
+
     def real_lengths(self, batch: Batch) -> np.ndarray:
         """The layout's unpadded row lengths, not its bucket or maximum length."""
         return np.sum(np.asarray(batch["valid"], bool), axis=-1, dtype=np.int64)
@@ -314,28 +320,27 @@ class DecisionObjective(Objective[Ratio]):
     def model_flops(self, model, batch: Batch) -> float:
         """One backbone pass plus the head's real question/option geometry."""
         model = self.model if model is None else model
+        return counted_flops(model.backbone, self.real_lengths(batch)) + self._head_flops(model, batch)
+
+    def _head_flops(self, model, batch: Batch) -> float:
+        """Forward and training work read the same layout geometry and head capability."""
         tokens = batch.get("tokens")
         if isinstance(tokens, ModelInputs) and tokens.conditioning:
             raise MissingFlopsCount("DecisionObjective needs its image tower's multi-sequence geometry")
+        if not isinstance(model.head, CountedDecisions):
+            raise MissingFlopsCount(f"{type(model.head).__name__} has no declared decision_flops")
         lengths = self.real_lengths(batch)
         questions = np.sum(np.asarray(batch["questions"], bool), axis=-1, dtype=np.int64)
         options = np.sum(np.asarray(batch["options"], bool), axis=(-2, -1), dtype=np.int64)
-        return (counted_flops(model.backbone, lengths)
-                + model.head.decision_flops(lengths, questions, options))
+        return model.head.decision_flops(lengths, questions, options)
 
     def training_flops(self, model, batch: Batch) -> float:
         """The adapted frozen/trainable backbone plus the trained decision head."""
         model = self.model if model is None else model
         if not isinstance(model.backbone, CountedTraining):
             return super().training_flops(model, batch)
-        tokens = batch.get("tokens")
-        if isinstance(tokens, ModelInputs) and tokens.conditioning:
-            raise MissingFlopsCount("adapted DecisionObjective needs image-tower training geometry")
-        lengths = self.real_lengths(batch)
-        questions = np.sum(np.asarray(batch["questions"], bool), axis=-1, dtype=np.int64)
-        options = np.sum(np.asarray(batch["options"], bool), axis=(-2, -1), dtype=np.int64)
-        return (model.backbone.training_flops(lengths)
-                + 3 * model.head.decision_flops(lengths, questions, options))
+        return (model.backbone.training_flops(self.real_lengths(batch))
+                + 3 * self._head_flops(model, batch))
 
     def __init__(self, backbone: nn.Module | Source | Adapter | Decide, *,
                  loss: ScoringRule | None = None, tokenizer: Tokenizer | None = None,
