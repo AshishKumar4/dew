@@ -6,6 +6,7 @@
 //   pnpm build && pnpm test
 
 import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
 import { after, before, test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { chromium } from 'playwright-core';
@@ -276,24 +277,29 @@ test('every landing cell copies its edited code, runs on the pool or in Colab, a
 
 test('the MoE controls render the recorded frame and router counts, not synthetic traffic', async () => {
 	const page = await browser.newPage();
-	await page.goto(`http://127.0.0.1:${server.address().port}/`);
+	await page.goto(site.url);
 	const view = page.locator('[data-moe-routing]');
 	await view.locator('.moe-device').first().waitFor();
-	const record = JSON.parse(await readFile(path.join(dist, 'examples/moe-mesh/moe-mesh.json'), 'utf8'));
-	assert.equal(await view.locator('.moe-device').count(), record.devices.length);
-	const expected = record.frames[0].layers[0].sent.flatMap((row, source) => row.flatMap((count, destination) =>
+	const record = JSON.parse(await readFile(new URL('../dist/examples/moe-mesh/moe-mesh.json', import.meta.url), 'utf8'));
+	// Every arrow is a recorded count between two devices, source by source, for the frame and router shown.
+	const edges = (frame, layer) => record.frames[frame].layers[layer].sent.flatMap((row, source) => row.flatMap((count, destination) =>
 		count && source !== destination ? [`${record.devices[source]} → ${record.devices[destination]}: ${count} assignments`] : []));
-	assert.deepEqual(await view.locator('.moe-edge title').allTextContents(), expected);
+	assert.equal(await view.locator('.moe-device').count(), record.devices.length);
+	assert.deepEqual(await view.locator('.moe-edge title').allTextContents(), edges(0, 0));
+	const last = record.frames.length - 1;
 	await view.locator('[data-moe-frame]').evaluate((input, last) => {
 		input.value = String(last);
 		input.dispatchEvent(new Event('input', { bubbles: true }));
-	}, record.frames.length - 1);
+	}, last);
 	await view.locator('[data-moe-layer]').selectOption('1');
+	assert.deepEqual(await view.locator('.moe-edge title').allTextContents(), edges(last, 1));
 	assert.match(await view.locator('[data-moe-label]').textContent(), /after training/);
 	assert.match(await view.locator('[data-moe-label]').textContent(), /layers_1/);
-	await view.locator('[data-moe-play]').click();
-	await view.getByRole('button', { name: 'Pause', exact: true }).waitFor();
-	await view.locator('[data-moe-play]').click();
+	const play = view.locator('[data-moe-play]');
+	await play.click();
+	assert.equal(await play.textContent(), 'Pause');
+	await play.click();
+	assert.equal(await play.textContent(), 'Play');
 	await page.close();
 });
 
