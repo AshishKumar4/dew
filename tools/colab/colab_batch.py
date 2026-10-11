@@ -166,6 +166,8 @@ def select(device: str, selector: str, hardware: str, order: list[str]) -> list[
             raise ValueError("compile_cache must be on or off")
         if fields.get("wandb", "off") not in ("on", "off"):
             raise ValueError("wandb must be on or off")
+        if fields.get("boundary_control", "off") not in ("on", "off"):
+            raise ValueError("boundary_control must be on or off")
     return sorted(
         chosen,
         key=lambda entry: next(
@@ -185,6 +187,7 @@ def identity(plan: dict) -> dict:
                 "artifact_excludes": job.get("artifact_excludes", []),
                 "data_sources": job.get("data_sources", []),
                 "wandb": job.get("wandb", False),
+                "boundary_control": job.get("boundary_control", False),
                 **{
                     key: job[key]
                     for key in ("commit", "command", "outputs", "artifact_policy", "ref", "compile_cache")
@@ -213,6 +216,7 @@ def plan_jobs(chosen: list[dict], device: str, hardware: str, base: str, repo: P
             artifact_excludes=fields.get("artifact_excludes", "").split(),
             compile_cache=fields.get("compile_cache", "off"),
             wandb=fields.get("wandb", "off") == "on",
+            boundary_control=fields.get("boundary_control", "off") == "on",
             entry=entry,
             economics={
                 key: fields[key] for key in ("gpu_reason", "expected_cu", "decision", "memory_estimate")
@@ -242,6 +246,8 @@ def plan_jobs(chosen: list[dict], device: str, hardware: str, base: str, repo: P
                 "wandb": job["wandb"],
             },
         )
+        job["replaceable_scripts"] = [target for _, target in input_paths(fields)
+                                      if Path(target).suffix in (".py", ".sh")]
         jobs.append(job)
     return {
         "schema": 1,
