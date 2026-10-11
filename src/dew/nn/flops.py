@@ -74,14 +74,22 @@ def attention_flops(lengths: np.ndarray, heads: int, key: int, value: int, *, ca
     return float(2 * heads * (key + value) * np.sum(work))
 
 
-def delta_flops(lengths: np.ndarray, heads: int, key: int, value: int, chunk: int) -> float:
-    """The chunked delta rule, excluding learned projections and convolution.
+def delta_flops(lengths: np.ndarray, heads: int, key: int, value: int) -> float:
+    """The delta rule's recurrent function, not one implementation's work.
 
-    Reading and writing the key-by-value state each cost 2*H*Dk*Dv per
-    token. In-chunk key products and value application each cost 2*H*C*D
-    per token after dividing their C-by-C products by the C-token chunk:
-    4*H*Dk*Dv + 2*H*C*(Dk+Dv). C is the configured algorithmic chunk size;
-    padding and rematerialized repeats do not change this model count.
+    Per token, w*S predicts the stored value, k^T*delta writes its correction
+    and q*S reads the updated state. Each is 2*H*Dk*Dv FLOPs under the
+    multiply-add convention: 6*H*Dk*Dv total. Chunked prep/inversion, padding
+    and remat are hardware work, not model work, just as FlashAttention's
+    tiling changes no model attention count. GDN and KDA use this same rule.
     """
-    return float(np.sum(real_lengths(lengths)) * (4 * heads * key * value
-                                                 + 2 * heads * chunk * (key + value)))
+    return float(np.sum(real_lengths(lengths)) * 6 * heads * key * value)
+
+
+def ssd_flops(lengths: np.ndarray, heads: int, state: int, channels: int) -> float:
+    """SSD's recurrent state write and read, 4*H*N*P per token, without chunk work.
+
+    Unlike the delta rule, SSD has no value-correction read. Its scalar
+    decay/scaling is pointwise work, excluded like GDN's decay and gates.
+    """
+    return float(np.sum(real_lengths(lengths)) * 4 * heads * state * channels)

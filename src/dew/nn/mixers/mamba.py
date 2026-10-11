@@ -132,16 +132,16 @@ class Mamba(nn.Module):
 
     @nn.nowrap
     def model_flops(self, lengths) -> float:
-        """Input/output and selective-step maps, conv, and selective scan.
+        """Input/output maps, conv and the recurrent state write/read, 4*D*N.
 
-        Per channel/state, dt*A costs one multiply, dt*B*x two, decay*state
-        plus its write two, and the read C*state two: seven per real token.
-        The exp/softplus and pointwise gates are outside the matmul count.
+        The delta*B*x outer write and C*h read each cost 2*D*N per token.
+        Pointwise exp(delta*A)*h and gates are excluded, the same MAC
+        convention used for GDN/KDA and SSD, independent of chunk size.
         """
         inner = self.intermediate_size
         return (projection_flops(lengths, self.emb_features, 3 * inner)
                 + projection_flops(lengths, inner, 2 * self.time_step_rank + 2 * self.state_size)
-                + float(real_lengths(lengths).sum()) * inner * (2 * self.conv_kernel + 7 * self.state_size))
+                + float(real_lengths(lengths).sum()) * inner * (2 * self.conv_kernel + 4 * self.state_size))
 
     def setup(self):
         if self.conv_kernel < 2:

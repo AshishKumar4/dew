@@ -111,7 +111,7 @@ class KimiDeltaAttention(nn.Module):
             low_rank += self.head_dim * inner
         return (projection_flops(lengths, self.emb_features, direct)
                 + float(real_lengths(lengths).sum()) * (2 * low_rank + 6 * inner * self.conv_kernel)
-                + delta_flops(lengths, self.num_heads, self.head_dim, self.head_dim, self.chunk_size))
+                + delta_flops(lengths, self.num_heads, self.head_dim, self.head_dim))
 
     def setup(self):
         if self.conv_kernel < 2:

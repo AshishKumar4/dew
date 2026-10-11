@@ -606,11 +606,11 @@ class GatedDeltaNet(nn.Module):
 
     @nn.nowrap
     def model_flops(self, lengths) -> float:
-        """Learned maps, depthwise conv and the chunked rule (`delta_flops`)."""
+        """Learned maps, conv and algorithm-independent recurrent rule (`delta_flops`)."""
         projected = 2 * self.key_features + 3 * self.value_features + 2 * self.num_v_heads
         return (projection_flops(lengths, self.emb_features, projected)
                 + 2 * self.conv_features * self.conv_kernel * float(real_lengths(lengths).sum())
-                + delta_flops(lengths, self.num_v_heads, self.head_k_dim, self.head_v_dim, self.chunk_size))
+                + delta_flops(lengths, self.num_v_heads, self.head_k_dim, self.head_v_dim))
 
     def setup(self):
         if self.num_v_heads % self.num_k_heads:
