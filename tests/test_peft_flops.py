@@ -19,6 +19,7 @@ from dew.interop import Pretrained
 from dew.lora import LoRA
 from dew.nn.backbones.decoder_stack import Loop
 from dew.nn.flops import MissingFlopsCount, dense_training_flops, projection_flops
+from dew.nn.inputs import ModelInputs
 from dew.objectives.base import FROZEN
 from dew.objectives.lm import LMObjective
 from dew.training import Trainer
@@ -138,6 +139,16 @@ def test_native_multimodal_qwen_adapter_counts_text_without_its_unused_image_tow
     assert adapter_forward > 0
     assert adapted.model.training_flops(lengths) == 3 * forward - frozen_maps + 3 * adapter_forward
     assert original.model_flops(lengths) == original.language_model.model_flops(lengths)
+
+
+def test_unknown_media_work_can_count_tokens_without_claiming_a_model_flop_count():
+    objective = LMObjective(decoder(), seq_len=6)
+    batch = {"text": ModelInputs(np.ones((2, 7), np.int32),
+                                conditioning={"pixels": np.ones((2, 1), np.float32)})}
+    measured = prepare_counts(objective, batch, count_model=False)
+    assert measured[TOKENS].sum() == 12 and TRAINING_FLOPS not in measured
+    with pytest.raises(MissingFlopsCount, match="conditioning tower"):
+        prepare_counts(objective, batch, count_model=True)
 
 
 def test_trainer_reads_training_work_once_from_the_existing_interval_record(monkeypatch):
