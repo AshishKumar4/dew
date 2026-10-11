@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+from concurrent.futures import ThreadPoolExecutor
 import json
 import logging
 import math
@@ -245,12 +246,11 @@ def _check(pipeline: Pipeline, read: Read, *, validation: bool = False) -> None:
 
 
 def _capabilities(pipelines: Sequence[Pipeline], read: Read, provision: bool) -> None:
-    missing: list[Source] = []
-    for pipeline in pipelines:
-        for leaf in _leaves(pipeline):
-            source = leaf.source
-            if not isinstance(source, (Mixture, Phases)) and not source.supports(read):
-                missing.append(source)
+    sources = [leaf.source for pipeline in pipelines for leaf in _leaves(pipeline)
+               if not isinstance(leaf.source, (Mixture, Phases))]
+    with ThreadPoolExecutor(max_workers=min(8, max(1, len(sources)))) as readers:
+        supported = tuple(readers.map(lambda source: source.supports(read), sources))
+    missing = [source for source, available in zip(sources, supported, strict=True) if not available]
     if provision:
         for source in missing:
             if isinstance(source, _Provisionable):
@@ -261,6 +261,68 @@ def _capabilities(pipelines: Sequence[Pipeline], read: Read, provision: bool) ->
             f"read={read!r} is unavailable for {', '.join(refused)}; "
             "provision the named artifact with dew data provision or provision=True"
         )
+
+
+@dataclasses.dataclass(frozen=True)
+class _Facts:
+    source: Source
+    read: Read
+    stated_snapshot: Mapping[str, object]
+    stated_metadata: Mapping[str, object]
+
+    def describe(self) -> str:
+        return self.source.describe()
+
+    def snapshot(self) -> Mapping[str, object]:
+        return self.stated_snapshot
+
+    def metadata(self) -> Mapping[str, object]:
+        return self.stated_metadata
+
+    def supports(self, read: Read) -> bool:
+        return read == self.read or self.source.supports(read)
+
+    def records(self, read: Read) -> Records:
+        return self.source.records(read)
+
+    def manifest(self) -> ShardManifest:
+        return self.source.manifest()
+
+    @functools.cached_property
+    def _lengths(self) -> np.ndarray | None:
+        return self.source.lengths()
+
+    def lengths(self) -> np.ndarray | None:
+        return self._lengths
+
+    def order_fingerprints(self) -> Mapping[str, str]:
+        return self.source.order_fingerprints() if isinstance(self.source, _OrderFacts) else {}
+
+    def locality(self) -> tuple[tuple[int, ...], bool]:
+        if not isinstance(self.source, _Locality):
+            raise ValueError(f"{self.describe()} does not state physical shard locality")
+        return self.source.locality()
+
+
+def _pin_sources(pipelines: Sequence[Pipeline], read: Read) -> tuple[Pipeline, ...]:
+    sources = {id(leaf.source): leaf.source for branch in pipelines for leaf in _leaves(branch)
+               if not isinstance(leaf.source, (Mixture, Phases))}
+
+    def pin(source: Source) -> _Facts:
+        if read == "memory":
+            source.records(read)
+        return _Facts(source, read, source.snapshot(), source.metadata())
+
+    with ThreadPoolExecutor(max_workers=min(8, max(1, len(sources)))) as readers:
+        pinned = dict(zip(sources, readers.map(pin, sources.values()), strict=True))
+
+    def replace(branch: Pipeline) -> Pipeline:
+        source = branch.source
+        source = (dataclasses.replace(source, pipelines=tuple(replace(child) for child in source.pipelines))
+                  if isinstance(source, (Mixture, Phases)) else pinned[id(source)])
+        return dataclasses.replace(branch, source=source)
+
+    return tuple(replace(branch) for branch in pipelines)
 
 
 def _tokenizer_contract(pipelines: Sequence[Pipeline]) -> None:
@@ -443,12 +505,14 @@ class _Memory:
     facts: Mapping[str, object] = dataclasses.field(default_factory=dict)
     identifiers: tuple[tuple[int, ...], ...] = ()
     inputs: int = 0
+    prefix: tuple[StepIdentity, ...] = ()
 
     def describe(self) -> str:
         return self.original.describe()
 
     def snapshot(self) -> Mapping[str, object]:
-        return {"materialized": self.original.snapshot(), "derived": self.derived}
+        return {"materialized": self.original.snapshot(), "derived": self.derived,
+                "steps": [dataclasses.asdict(step) for step in self.prefix]}
 
     def supports(self, read: Read) -> bool:
         return read in ("memory", "indexed")
@@ -678,7 +742,8 @@ def _memory_order(pipeline: Pipeline, collected: Sequence[tuple[tuple[int, ...],
     return dataclasses.replace(
         pipeline,
         source=_Memory(source, tuple(value for _, value in rows), lengths, derived, facts,
-                       tuple(identifier for identifier, _ in rows), inputs),
+                       tuple(identifier for identifier, _ in rows), inputs,
+                       tuple(_identity(stage) for stage in pipeline.stages[:consumed])),
         stages=remaining,
     )
 
@@ -1419,6 +1484,10 @@ def compile(
         validation, _ = _promoted(validation)
     pipelines = (train,) if validation is None else (train, validation)
     _capabilities(pipelines, read, provision)
+    pinned = _pin_sources(pipelines, read)
+    train = pinned[0]
+    validation = None if validation is None else pinned[1]
+    pipelines = pinned
     _tokenizer_contract(pipelines)
     counts: dict[str, CorpusCounts] = {}
     validation_counts: dict[str, CorpusCounts] = {}
@@ -1844,7 +1913,11 @@ def validation(pipeline: Pipeline, *, batch: int, objective: ObjectiveData | Non
     if objective is not None:
         pipeline = _objective_branch(pipeline, objective, train=False, read=read)
     if any(isinstance(stage, Configured) for stage in _steps(pipeline)):
-        pipeline = _configured(pipeline, _metadata((pipeline,), read), read)
+        metadata = _metadata((pipeline,), read)
+        if read == "memory":
+            pipeline = _materialize(_configured(pipeline, metadata, read, "source"), {}, training=False)
+            metadata = _metadata((pipeline,), read)
+        pipeline = _configured(pipeline, metadata, read)
     _check(pipeline, read, validation=True)
     if read == "memory":
         pipeline = _materialize(pipeline, {}, training=False)
