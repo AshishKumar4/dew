@@ -5,8 +5,9 @@ the pool fills, a filter that rejects rows and online packing
 (`multiprocess_worker.matrix_data`). A pool of two trains it for three steps
 and saves; pools of one, two and four processes resume that checkpoint for
 three more, and each lands where a pool of its own size that nobody stopped
-lands: the same data position on every process and the same parameters, so
-every global batch after the resume was the batch the uninterrupted run read.
+lands: every process reads, after the resume, the batches that pool's process
+read after its third step, and ends at the same data position with the same
+parameters.
 A cell compiled to one global order resumes on any process count; a per-share
 cell keeps each share's rows, so it resumes on its own count and refuses
 another.
@@ -54,6 +55,7 @@ def test_a_saved_position_resumes_where_an_uninterrupted_pool_lands(tmp_path, ce
         for index, report in enumerate(resumed):
             assert report["restored_step"] == STEPS
             assert report["step"] == 2 * STEPS
+            assert report["batches"][:STEPS] == whole[index]["batches"][STEPS:2 * STEPS]
             assert report["dataset_state"] == whole[index]["dataset_state"]
             name = f"process{index}.json"
             assert_same_parameters(dumped_params(tmp_path / f"resumed{processes}-out" / name),
