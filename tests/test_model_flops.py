@@ -300,13 +300,13 @@ def forward_products(function, *operands, state_mac: bool = False):
 
 def jaxpr_products(graph, *, state_mac=False):
     """Count a scan body once per iteration, and one executed cond branch."""
-    if isinstance(graph, jaxpr_core.ClosedJaxpr):
-        return jaxpr_products(graph.jaxpr, state_mac=state_mac)
     if isinstance(graph, dict):
         return sum(jaxpr_products(part, state_mac=state_mac) for part in graph.values())
     if isinstance(graph, tuple | list):
         return sum(jaxpr_products(part, state_mac=state_mac) for part in graph)
-    if not isinstance(graph, jaxpr_core.Jaxpr):
+    if not hasattr(graph, "eqns"):
+        if hasattr(graph, "jaxpr"):
+            return jaxpr_products(graph.jaxpr, state_mac=state_mac)
         return 0
     total, producers = 0, {}
     consumers = {}
