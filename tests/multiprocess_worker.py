@@ -11,6 +11,7 @@ processes are the same run in two topologies.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import time
 from datetime import datetime, timedelta
@@ -2204,7 +2205,58 @@ def mode_whole_validation(args) -> dict:
     return {"passes": passes, "perplexity": perplexity(windows), "one": perplexity(windows, 1)}
 
 
-MODES = {"host_training": mode_host_training, "step_fits": mode_step_fits,
+MATRIX_RECORDS = 96
+
+
+@dataclasses.dataclass(frozen=True)
+class Imaged:
+    """A record's or packed window's tokens laid out as the image the
+    reconstruction objective trains on, so what it learns depends on which
+    records each step read."""
+
+    def __call__(self, element):
+        tokens = np.asarray(element["text"], np.int64)
+        return {"image": np.resize(tokens % 256, (RES, RES, 3)).astype(np.uint8)}
+
+
+def matrix_data(read: str, cached: bool, rejecting: bool, packed: bool, cache_dir: Path):
+    """One cell of the data matrix compiled for training: records of one to
+    eight tokens, each holding its own id; a filter that rejects every third;
+    a cache filled by the pool; online packing into eight-token windows; then
+    the order the read can keep."""
+    from dew.data import Memory, Pipeline, compile
+    from dew.data.cache import Cache
+
+    records = [{"text": np.full(1 + index % 8, index, np.int32)} for index in range(MATRIX_RECORDS)]
+    pipeline = Pipeline(Memory(records, shard_rows=16))
+    if rejecting:
+        pipeline = pipeline.filter(lambda row: int(row["text"][0]) % 3 != 0, identity="thirds@1")
+    if cached:
+        pipeline = pipeline.cache(Cache(str(cache_dir)))
+    if packed:
+        pipeline = pipeline.pack(8, bins=2)
+    pipeline = pipeline.map(Imaged(), identity="imaged@1")
+    order = pipeline.shuffle(0, window=8 if read == "streamed" else None).repeat()
+    return compile(order.batch(BATCH), read=read, seed=0, loading=Loading(workers=0))
+
+
+def mode_matrix(args) -> dict:
+    """Train one cell of the data matrix (`--cell read,cache,rejecting,packed`)
+    for `--steps`, from where the run directory's checkpoint left it."""
+    read, cached, rejecting, packed = args.cell.split(",")
+    data = matrix_data(read, cached == "cache", rejecting == "rejecting", packed == "packed",
+                       Path(args.run_dir).parent / "cache")
+    trainer = build_trainer(args.name, args.run_dir, args.fsdp_size)
+    restored_step, _ = restored_state(trainer)
+    state = trainer.fit(Data(data.train, records=MATRIX_RECORDS), steps=args.steps, log_every=1,
+                        checkpoint_every=args.save_every)
+    dump_params(args.out.with_suffix(".npz"), state.variables)
+    _, position = restored_state(trainer)
+    return {"step": int(as_numpy(state.step)), "restored_step": restored_step,
+            "lowering": None if data.plan is None else data.plan.lowering, "dataset_state": position}
+
+
+MODES = {"matrix": mode_matrix, "host_training": mode_host_training, "step_fits": mode_step_fits,
          "whole_validation": mode_whole_validation,
          "topology": mode_topology, "data": mode_data, "packed": mode_packed,
          "masked_generation": mode_masked_generation,
@@ -2259,6 +2311,7 @@ def parse_args(argv=None):
                         help="read the training records through a compiled global order, whose "
                              "saved position is a global record count")
     parser.add_argument("--profile-dir", help="directory the scheduled profile window writes")
+    parser.add_argument("--cell", help="read,cache|nocache,rejecting|all,packed|rows for the matrix mode")
     return parser.parse_args(argv)
 
 def main(argv=None) -> None:
