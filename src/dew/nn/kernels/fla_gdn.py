@@ -738,31 +738,27 @@ def _wy_bwd_kernel(k_ref, v_ref, beta_ref, g_ref, a_ref, dw_ref, du_ref, dk_ref,
     gate = g_ref[...].astype(jnp.float32)
     decay = jnp.exp2(gate)
     size, width = k_ref.shape
-    def key_block(block, carried):
-        d_x, d_beta, d_gate = carried
+    d_x = jnp.zeros((size, size), jnp.float32)
+    d_beta = jnp.zeros((size,), jnp.float32)
+    d_gate = jnp.zeros((size,), jnp.float32)
+    for block in range(width // bk):
         columns = pl.ds(block * bk, bk)
         key = k_ref[:, columns]
         scaled = key * (beta * decay)[:, None]
         w_grad = dw_ref[:, columns]
+        d_x += _dot(w_grad, scaled.T.astype(w_grad.dtype), exact=exact)
         d_scaled = _dot(inverse_t, w_grad, exact=exact)
-        return (d_x + _dot(w_grad, scaled.T.astype(w_grad.dtype), exact=exact),
-                d_beta + jnp.sum(d_scaled * key * decay[:, None], axis=1),
-                d_gate + jnp.sum(d_scaled * scaled, axis=1))
-
-    def value_block(block, carried):
-        d_x, d_beta = carried
+        d_beta += jnp.sum(d_scaled * key * decay[:, None], axis=1)
+        d_gate += jnp.sum(d_scaled * scaled, axis=1)
+    for block in range(v_ref.shape[-1] // bv):
         columns = pl.ds(block * bv, bv)
         value = v_ref[:, columns]
         scaled = (value * beta[:, None]).astype(value.dtype)
         u_grad = du_ref[:, columns]
+        d_x += _dot(u_grad, scaled.T, exact=exact)
         d_scaled = _dot(inverse_t, u_grad, exact=exact)
         dv_ref[:, columns] = (d_scaled * beta[:, None]).astype(dv_ref.dtype)
-        return d_x + _dot(u_grad, scaled.T, exact=exact), d_beta + jnp.sum(d_scaled * value, axis=1)
-
-    row = jnp.zeros((size,), jnp.float32)
-    d_x, d_beta, d_gate = jax.lax.fori_loop(0, width // bk, key_block,
-                                            (jnp.zeros((size, size), jnp.float32), row, row))
-    d_x, d_beta = jax.lax.fori_loop(0, v_ref.shape[-1] // bv, value_block, (d_x, d_beta))
+        d_beta += jnp.sum(d_scaled * value, axis=1)
     index = jnp.arange(size)
     strict = index[:, None] > index[None, :]
     d_x = jnp.where(strict, d_x, 0.0)
@@ -770,20 +766,17 @@ def _wy_bwd_kernel(k_ref, v_ref, beta_ref, g_ref, a_ref, dw_ref, du_ref, dk_ref,
     d_x = _dot(inverse_t, d_x.astype(inverse_t.dtype), exact=exact)
     d_x = d_x * jnp.exp2(gate[:, None] - gate[None, :])
     d_l = jnp.where(strict, -d_x, 0.0).astype(k_ref.dtype)
-
-    def key_gradient(block, carried):
-        products, d_beta = carried
+    products = jnp.zeros((size, size), jnp.float32)
+    for block in range(width // bk):
         columns = pl.ds(block * bk, bk)
         key = k_ref[:, columns]
         scaled = key * beta[:, None]
+        products += _dot(key, key.T, exact=exact)
         d_key = _dot(d_l, key, exact=exact)
+        d_beta += jnp.sum(d_key * key, axis=1)
         through_w = _dot(inverse_t, dw_ref[:, columns], exact=exact) * (decay * beta)[:, None]
         full = d_key * beta[:, None] + _dot(scaled.T.astype(d_l.dtype), d_l, exact=exact).T
         dk_ref[:, columns] = (through_w + full).astype(dk_ref.dtype)
-        return products + _dot(key, key.T, exact=exact), d_beta + jnp.sum(d_key * key, axis=1)
-
-    products, d_beta = jax.lax.fori_loop(0, width // bk, key_gradient,
-                                         (jnp.zeros((size, size), jnp.float32), d_beta))
     db_ref[...] = d_beta.astype(db_ref.dtype)
     weighted = d_l.astype(jnp.float32) * (products * beta[:, None])
     dg_ref[...] = _wy_gate_sum(d_gate, weighted).astype(dg_ref.dtype)
