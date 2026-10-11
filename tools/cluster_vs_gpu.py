@@ -246,7 +246,7 @@ def main() -> None:
                 args.out.with_suffix(".hlo.txt").write_text(trainer.executable.as_text())
                 return
             start = time.monotonic()
-        state, loss, _, _, _ = compiled(state, batch)
+        state, loss, _, _, _, _ = compiled(state, batch)
         loss = float(loss)
         seconds.append(time.monotonic() - start)
         losses.append(loss)
