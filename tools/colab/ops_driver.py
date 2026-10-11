@@ -52,9 +52,14 @@ class Driver:
                 self.record(control_cleanup_error=type(error).__name__)
             self.record(action="poll", action_deadline=None)
 
-    def upload(self, session_name: str, source: Path, remote: str) -> None:
+    def upload(self, session_name: str, source: Path, remote: str, *, private: bool = False) -> None:
         self.record(action="upload", action_deadline=time.time() + 1230)
-        command([self.cli, "upload", "-s", session_name, str(source), remote], timeout=1200)
+        try:
+            command([self.cli, "upload", "-s", session_name, str(source), remote], timeout=1200)
+        except RuntimeError:
+            if private:
+                raise RuntimeError("private credential upload failed; output withheld") from None
+            raise
         self.record(action="poll", action_deadline=None)
 
     def deploy(self, session: Session, plan: dict, work: Path, remote: str) -> None:
@@ -73,7 +78,12 @@ class Driver:
                     raise
         for file in sorted(work.iterdir()):
             if file.suffix == ".part" or file.name in ("runner.tar.gz", "plan.json"):
-                self.upload(plan["device"], file, remote + "/" + file.name)
+                self.upload(
+                    plan["device"],
+                    file,
+                    remote + "/" + file.name,
+                    private=file.name in plan.get("private_parts", []),
+                )
 
     def start(self, session: Session, plan: dict, remote: str) -> None:
         ready = threading.Event()
@@ -127,7 +137,8 @@ class Driver:
             f"import sys,json\nsys.path.insert(0,{remote!r})\n"
             "from tools.colab.colab_sync import snapshot\n"
             f"manifest,count=snapshot({home + '/dew'!r},{job['outputs']!r},{known!r},"
-            f"{home + '/sync.tar.gz'!r},policy={job['artifact_policy']!r})\n"
+            f"{home + '/sync.tar.gz'!r},policy={job['artifact_policy']!r},"
+            f"excludes={job.get('artifact_excludes', [])!r})\n"
             "print('SYNC',json.dumps([manifest,count]))\n"
         )
         output = self.control(session, script, timeout=600)

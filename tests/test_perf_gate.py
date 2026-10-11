@@ -135,3 +135,67 @@ def test_the_report_fails_on_a_partial_row(gate, tmp_path, monkeypatch, head, ro
                                       "--table", str(tmp_path / "gate.md")])
     assert gate.main() == 1
     assert f"| row | ms | - | - | - | - | {shown} |" in (tmp_path / "gate.md").read_text()
+
+
+@pytest.mark.parametrize("code, ratio, state, status", [
+    (0, 1.10, "passed", 0), (1, 0.72, "failed", 1), (1, None, "failed", 1),
+])
+def test_external_reference_row_judges_only_head_and_reports_exit_and_ratio(
+        gate, tmp_path, monkeypatch, capsys, code, ratio, state, status):
+    """The base need not beat an external reference for a head that now beats it to qualify."""
+    row = gate.Row("external reference", "items/s", "external.py", head_only=True)
+    measurement = {"exit_code": code, "value": 110.0 if code == 0 else 72.0,
+                   "ratio": ratio, "tolerance": 0.01, "passed": code == 0}
+    record = {"base": "main", "head": "head", "rounds": 2, "rows": [row.__dict__],
+              "samples": {"main": [{}, {}], "head": [{row.name: measurement}] * 2}}
+    out = tmp_path / "reference.json"
+    out.write_text(json.dumps(record))
+    monkeypatch.setattr(sys, "argv", ["perf_gate.py", "report", str(out)])
+    assert gate.main() == status
+    printed = capsys.readouterr().out
+    assert f"{state} (exit codes {code}, {code})" in printed
+    if ratio is not None:
+        assert f"{ratio:.3f}x reference" in printed
+    verdict, numbers = gate.verdict(row, [None, None], [measurement, measurement])
+    assert verdict == state
+    assert numbers["exit_codes"] == [code, code]
+    assert numbers.get("ratio") == ratio
+
+
+def test_external_reference_row_fails_closed_on_missing_or_partial_head(gate):
+    row = gate.Row("external reference", "items/s", "external.py", head_only=True)
+    good = {"exit_code": 0, "value": 110.0, "ratio": 1.10, "tolerance": 0.01, "passed": True}
+    assert gate.verdict(row, [], [None, None])[0] == "incomplete"
+    assert gate.verdict(row, [], [good, None])[0] == "incomplete"
+    missing = "not measured on this hardware"
+    assert gate.verdict(row, [], [good, missing])[0] == "incomplete"
+    assert gate.verdict(row, [], [{**good, "exit_code": 1}, missing])[0] == "failed"
+
+
+def test_external_reference_subprocess_failure_keeps_its_measurement(gate, tmp_path, monkeypatch):
+    """Exit 1 from an external reference still carries measured evidence through the battery, and a
+    tree that measures no hardware row starts no process to read the device kind."""
+    from types import SimpleNamespace
+
+    commands = []
+
+    def child(command, **kwargs):
+        commands.append(command)
+        if "-c" in command:
+            return subprocess.CompletedProcess(command, 0, "NVIDIA A100-SXM4-80GB\n", "")
+        out = Path(command[command.index("--out") + 1])
+        out.write_text(json.dumps({"comparison": {"dew_tokens_per_s": 720.0, "dew_over_torch": 0.72,
+                                                  "tolerance": 0.01, "performance_claim_passed": False}}))
+        return subprocess.CompletedProcess(command, 1, "measured a slower head", "")
+
+    monkeypatch.setattr(gate.subprocess, "run", child)
+    args = SimpleNamespace(only=["reference"], claim=True, model="unused", flowers="unused",
+                           torch_python="torch", out=tmp_path / "gate.json")
+    name = next(row.name for row in gate.BATTERY if row.head_only)
+    sample = gate.measure(ROOT, args, ROOT / "tools", is_head=True)
+    assert sample[name] == {"exit_code": 1, "value": 720.0, "ratio": 0.72,
+                            "tolerance": 0.01, "passed": False}
+    assert Path(sample[f"evidence {name}"]).is_file()
+    assert len(commands) == 2
+    assert gate.measure(ROOT, args, ROOT / "tools", is_head=False) == {}
+    assert len(commands) == 2

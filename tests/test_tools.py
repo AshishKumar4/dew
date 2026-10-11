@@ -41,6 +41,52 @@ T5_OUTPUTS = {"last_hidden_state": 1e-4}
 VAE_OUTPUTS = {"latent": 1e-5, "decoded": 1e-5}
 
 
+def test_perf_gate_hardware_rows_are_unmeasured_not_passed_off_device():
+    gate = load("perf_gate")
+    row = next(row for row in gate.BATTERY if row.name == "reference qwen3.5-0.8b 8x3072 vs torch")
+    assert row.hardware == "A100-SXM4-80GB" and row.gated
+    assert row.head_only
+    skipped = gate.hardware_status(row, "cpu")
+    assert skipped.startswith("not measured on this hardware")
+    assert gate.verdict(row, [skipped] * 2, [skipped] * 2)[0] == "not measured on this hardware"
+    assert gate.hardware_status(row, "NVIDIA A100-SXM4-80GB") is None
+
+
+@pytest.mark.parametrize("claim, omitted, code", [(False, False, 0), (True, False, 1), (True, True, 1)])
+def test_perf_gate_claim_requires_hardware_evidence(tmp_path, claim, omitted, code):
+    gate = load("perf_gate")
+    row = next(row for row in gate.BATTERY if row.hardware)
+    skipped = gate.hardware_status(row, "cpu")
+    record = {"base": "base", "head": "head", "rounds": 2,
+              "rows": [] if omitted else [dataclasses.asdict(row)],
+              "samples": {tree: [{row.name: skipped}] * 2 for tree in ("base", "head")}}
+    path = tmp_path / "gate.json"
+    path.write_text(json.dumps(record))
+    done = subprocess.run([sys.executable, "tools/perf_gate.py", "report", str(path),
+                           *(["--claim"] if claim else [])], cwd=REPO_ROOT,
+                          text=True, capture_output=True)
+    assert done.returncode == code, done.stdout + done.stderr
+    assert ("required hardware row omitted" if omitted else "not measured on this hardware") in done.stdout
+
+
+def test_perf_gate_cpu_claim_runs_required_row_even_under_only(tmp_path):
+    """An --only filter must not let a speed claim omit its hardware requirement."""
+    out = tmp_path / "gate.json"
+    done = subprocess.run([
+        sys.executable, "tools/perf_gate.py", "run", "--base", f"base={REPO_ROOT}",
+        "--head", f"head={REPO_ROOT}", "--rounds", "1", "--model", "unused", "--flowers", "unused",
+        "--only", "no-existing-row", "--claim", "--out", str(out)],
+        cwd=REPO_ROOT, text=True, capture_output=True)
+    assert done.returncode == 1, done.stdout + done.stderr
+    assert "not measured on this hardware" in done.stdout
+    record = json.loads(out.read_text())
+    assert record["claim"] and len(record["rows"]) == 1
+    row = record["rows"][0]
+    assert row["hardware"] == "A100-SXM4-80GB"
+    assert record["samples"]["base"] == [{}]
+    assert record["samples"]["head"][0][row["name"]].startswith("not measured on this hardware")
+
+
 
 
 

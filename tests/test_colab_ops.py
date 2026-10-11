@@ -852,7 +852,8 @@ def test_review_published_sources_do_not_upload_a_bundle(tmp_path, monkeypatch):
     repo, _, sha = fixture_repository(tmp_path)
     monkeypatch.setattr(batch, "STATE", tmp_path / "state")
     plan = batch.plan_jobs([request(sha)], "gpu", "gpu:T4", sha, repo)
-    batch.stage(plan, tmp_path / "staging", repo)
+    netrc_file = write(tmp_path / "netrc", b"machine api.wandb.ai login test password test-key\n")
+    batch.stage(plan, tmp_path / "staging", repo, netrc_file=netrc_file)
     assert not list((tmp_path / "staging").glob("bundle*"))
     assert plan["fetch_commits"] == [sha]
 
@@ -878,7 +879,8 @@ def test_review_unpushed_bundle_contains_only_the_new_range(tmp_path, monkeypatc
     )
     monkeypatch.setattr(batch, "STATE", tmp_path / "state")
     plan = batch.plan_jobs([request()], "gpu", "gpu:T4", sha, repo)
-    batch.stage(plan, tmp_path / "staging", repo)
+    netrc_file = write(tmp_path / "netrc", b"machine api.wandb.ai login test password test-key\n")
+    batch.stage(plan, tmp_path / "staging", repo, netrc_file=netrc_file)
     assert sum(file.stat().st_size for file in (tmp_path / "staging").glob("bundle*")) < 10000
     assert sha in plan["fetch_commits"]
 
@@ -952,7 +954,7 @@ def test_publish_retained_excludes_stale_files_outside_the_acknowledged_manifest
 
 @pytest.mark.parametrize("unpublished", [False, True])
 def test_vm_fetches_exact_shallow_sources_with_optional_delta_bundle(tmp_path, monkeypatch, unpublished):
-    repo, _, sha = fixture_repository(tmp_path)
+    repo, origin, sha = fixture_repository(tmp_path)
     if unpublished:
         write(repo / "unpublished", b"new")
         subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
@@ -974,12 +976,17 @@ def test_vm_fetches_exact_shallow_sources_with_optional_delta_bundle(tmp_path, m
     monkeypatch.setattr(batch, "STATE", tmp_path / "state")
     plan = batch.plan_jobs([request()], "gpu", "gpu:T4", sha, repo)
     staging = tmp_path / "staging"
-    batch.stage(plan, staging, repo)
+    netrc_file = write(tmp_path / "netrc", b"machine api.wandb.ai login test password test-key\n")
+    batch.stage(plan, staging, repo, netrc_file=netrc_file)
+
     worker = vm.Batch(staging)
     worker.prepare()
     for expected in (sha, plan["jobs"][0]["commit"]):
         subprocess.run(["git", "-C", str(worker.repo), "cat-file", "-e", expected + "^{commit}"], check=True)
     assert (worker.repo / ".git/shallow").is_file()
+    assert subprocess.check_output(
+        ["git", "-C", str(worker.repo), "remote", "get-url", "origin"], text=True
+    ).strip() == str(origin)
 
 
 @pytest.mark.parametrize("expected,explicit", [(0.1, None), (0.7, None), (0.2, 0.08)])
@@ -1011,3 +1018,38 @@ def test_launcher_always_sets_a_finite_session_budget(tmp_path, monkeypatch, exp
     assert command[command.index("--budget-source") + 1] == (
         "explicit" if explicit else "expected_cu_times_1.5"
     )
+
+
+def test_artifact_exclusions_match_incremental_and_final_without_losing_nested_logs(tmp_path):
+    paths = (
+        "out/e1/train.log",
+        "out/result.jsonl",
+        "out/e1/mix/train.jsonl",
+        "out/mix-long/train.jsonl",
+        "out/mix-long-3072/rows.jsonl",
+        "out/autotune/cache.bin",
+    )
+    for name in paths:
+        write(tmp_path / name)
+    excludes = ["*/mix/*", "*/mix-long*/*", "*/autotune/*"]
+    packed = tmp_path / "delta.tar.gz"
+    current, count = sync.snapshot(tmp_path, ["out/"], {}, packed, "measurements", excludes)
+    assert count == 2 and set(current) == {"out/e1/train.log", "out/result.jsonl"}
+    final = tmp_path / "final.tar.gz"
+    sync.pack_outputs(tmp_path, ["out/"], final, "measurements", excludes)
+    assert read(Path(str(final) + ".manifest.json")) == current
+    assert (tmp_path / "out/e1/mix/train.jsonl").exists()
+
+
+def test_input_paths_preserve_plus_in_experiment_directories(tmp_path):
+    source = write(tmp_path / "step+profile/entry.json", b"metrics")
+    found = batch.input_paths({"inputs": f"{source} to /content/reference+metadata/", "command": "run"})
+    assert found == [(source, "/content/reference+metadata/entry.json")]
+
+
+def test_artifact_exclusions_ignore_ancestors_above_archive_root(tmp_path):
+    tree = tmp_path / "dew-in-parent" / "tree"
+    write(tree / "out/train.log", b"retained")
+    assert set(sync.output_files(tree, ["out/"], "measurements", ["*dew*"])) == {"out/train.log"}
+    with pytest.raises(ValueError, match="archive-relative"):
+        sync.output_files(tree, ["out/"], "measurements", [str(tree / "out/*")])

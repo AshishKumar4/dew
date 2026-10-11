@@ -1,5 +1,5 @@
-// Deployed by hand with `wrangler deploy -c tools/armada/xla_cache/wrangler.jsonc`
-// on the account armada-dew2 runs on; its CACHE_TOKEN is `wrangler secret put`.
+// CI's shared XLA compilation cache (tests/remote_cache.py); armada-dew2 holds its
+// token as DEW_XLA_CACHE_TOKEN. `tools/r2_store/provision.sh dew-xla-cache 14`.
 {
   "name": "dew-xla-cache",
   "main": "worker.js",
