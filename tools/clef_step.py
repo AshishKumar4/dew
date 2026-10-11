@@ -25,6 +25,7 @@ import argparse
 import dataclasses
 import importlib.util
 import json
+import os
 import sys
 import tempfile
 from pathlib import Path
@@ -107,6 +108,16 @@ def run(tree: Path, work: Path, steps: int, generation: str | None):
     return DecisionRunConfig.cli(flags, default=recipe(tree, "clef").run_config()).run()
 
 
+def host_devices(count: int) -> None:
+    """XLA_FLAGS with `count` host devices, as many as the GPUs the step lowers for, before JAX reads
+    them: a mesh over more splits the batch, and the kernels, which see whole arrays, refuse it
+    (`seen_whole`), so the devices this host happens to simulate (the suite's eight) must not
+    decide the program."""
+    kept = [flag for flag in os.environ.get("XLA_FLAGS", "").split()
+            if not flag.startswith("--xla_force_host_platform_device_count")]
+    os.environ["XLA_FLAGS"] = " ".join([*kept, f"--xla_force_host_platform_device_count={count}"])
+
+
 def lowered(tree: Path, work: Path, generation: str) -> dict:
     """The kernels the step calls once lowered for `generation`."""
     from dew.training.lowering import Lowered
@@ -133,12 +144,15 @@ def trained(tree: Path, work: Path, steps: int) -> dict:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("--lower-for", help="a CUDA generation ('sm80', 'sm120') to lower the step for")
+    parser.add_argument("--devices", type=int, default=1, help="the GPUs the lowered step spreads over")
     parser.add_argument("--steps", type=int, default=3, help="the steps to train, where nothing is lowered")
     parser.add_argument("--work", type=Path, help="where the backbone, the data and the run go; a temporary "
                         "directory by default")
     parser.add_argument("--tree", type=Path, default=ROOT, help="the Dew checkout whose recipe and tiny "
                         "model run, with its src on the path; this one by default")
     args = parser.parse_args()
+    if args.lower_for:
+        host_devices(args.devices)
     with tempfile.TemporaryDirectory() as scratch:
         work = args.work or Path(scratch)
         result = (lowered(args.tree, work, args.lower_for) if args.lower_for else
