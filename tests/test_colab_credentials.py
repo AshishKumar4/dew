@@ -90,8 +90,9 @@ def test_parent_credentials_do_not_reach_install_preamble_or_default_jobs(tmp_pa
     monkeypatch.setenv("WANDB_API_KEY", "parent-key")
     monkeypatch.setenv("WANDB_ENTITY", "parent-team")
     monkeypatch.setenv("WANDB_PROJECT", "parent-project")
+    monkeypatch.setenv("JAX_EXPLAIN_CACHE_MISSES", "1")
     env = vm_environment(tmp_path / "venv")
-    assert all(key not in env for key in ("WANDB_API_KEY", "WANDB_ENTITY", "WANDB_PROJECT"))
+    assert all(key not in env for key in ("WANDB_API_KEY", "WANDB_ENTITY", "WANDB_PROJECT", "JAX_EXPLAIN_CACHE_MISSES"))
 
 
 def test_opted_job_requires_entity_and_project_from_local_config(tmp_path):
