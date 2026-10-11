@@ -16,6 +16,7 @@ import numpy as np
 import pytest
 
 from dew.artifacts import ImageGrid
+from dew.data import Records, load
 from dew.eval import FID, PSNR, SSIM, CLIPDistance, CLIPScore
 from dew.registry import metrics as registry
 
@@ -60,13 +61,13 @@ def test_mean_lm_accuracy_matches_the_full_forward_after_a_real_fit(tmp_path):
 
     from dew import Checkpoints, Mean, Trainer
     from dew.artifacts import TokenScores
-    from dew.data import Dataset, Loading
+    from dew.data import Loading
     from dew.nn.backbones import CausalTransformer
     from dew.objectives.lm import LMObjective
 
     tokens = np.tile(np.asarray([[0, 1, 2, 3, 0]], np.int32), (8, 1))
-    data = Dataset.from_records({"text": tokens}, batch=8, validation={"text": tokens},
-                                loading=Loading(workers=0, threads=1, read_buffer=1))
+    data = load(Records(source={"text": tokens}, validation={"text": tokens}), batch=8,
+        loading=Loading(workers=0, threads=1, read_buffer=1), read="memory")
     model = CausalTransformer(vocab_size=4, emb_features=8, num_layers=1,
                               num_heads=2, mlp_features=16, max_seq_len=4, attention_impl="reference")
     objective = LMObjective(model, seq_len=4, ema_decay=None)
@@ -92,7 +93,7 @@ def test_mean_image_error_matches_each_real_row_after_a_fit(tmp_path):
     import optax
 
     from dew import Checkpoints, Mean, Trainer
-    from dew.data import Dataset, Loading
+    from dew.data import Loading
     from dew.objectives.base import Aux, Objective
 
     class Pixels(Objective):
@@ -106,8 +107,8 @@ def test_mean_image_error_matches_each_real_row_after_a_fit(tmp_path):
             return ImageGrid(jnp.broadcast_to(params["params"]["value"], batch["images"].shape))
 
     images = np.full((8, 2, 2, 1), .5, np.float32)
-    data = Dataset.from_records({"images": images}, batch=8, validation={"images": images},
-                                loading=Loading(workers=0, threads=1, read_buffer=1))
+    data = load(Records(source={"images": images}, validation={"images": images}), batch=8,
+        loading=Loading(workers=0, threads=1, read_buffer=1), read="memory")
     metric = Mean(lambda grid, batch: np.square(grid.images - batch["images"]).mean(axis=(1, 2, 3)),
                   reads=ImageGrid, name="pixel_error", better="lower")
     trainer = Trainer(Pixels(), optax.sgd(.1), key=jax.random.key(0),

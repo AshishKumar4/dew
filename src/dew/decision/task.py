@@ -393,7 +393,7 @@ class Decide:
         If asked, it also fits a binning map and abstention thresholds that keep the
         error of the accepted answers at `target_error`, as `Calibration`'s parts fit
         them. `held_out` is labelled examples, or a dataset's validation reader
-        (`DecisionObjective.dataset(...).val`), whose rows are already laid out. The
+        (``load(recipe, objective=...).val``), whose rows are already laid out. The
         minimum counts are Laya's: a type's temperature needs `type_minimum` answers
         and a bucket's `bucket_minimum`.
         """
@@ -416,6 +416,8 @@ class Decide:
         and the log loss. The pass agrees its result across a process pool, so
         there every process calls it.
         """
+        from dew.data.compile import validation
+        from dew.decision.data import Decisions as DecisionRecipe
         from dew.decision.metrics import AURC, ECE, Accuracy
         from dew.decision.objective import DecisionObjective
         from dew.decision.scoring import LogLoss
@@ -427,7 +429,9 @@ class Decide:
         # A batch is one pass within the budget, as `batch` packs its rows, on
         # one device, as an answer is: a short last batch need not divide.
         rows = max(1, min(self.budget.rows, self.budget.tokens // self.layout.max_len))
-        evaluation = Evaluation.run(objective, self.variables, objective.held_out(examples, batch=rows),
+        held, _, _ = DecisionRecipe(source=tuple(examples)).pipelines()
+        reader = validation(held, batch=rows, objective=objective.data(), read="memory")
+        evaluation = Evaluation.run(objective, self.variables, reader,
                                     key=0, metrics=chosen, mesh=MeshSpec().build(jax.local_devices()[:1]))
         return {metric.name: evaluation.scores[f"val/{metric.name}"] for metric in chosen}
 
@@ -578,7 +582,9 @@ def laid_out(batch: Mapping[str, object]) -> DecisionInputs:
                           questions=array("questions"), spans=array("spans"),
                           option_spans=array("option_spans"), options=array("options"),
                           positions=array("positions") if "positions" in batch else None,
-                          slots=array("slots") if "slots" in batch else None)
+                          slots=array("slots") if "slots" in batch else None,
+                          option_slots=array("option_slots") if "option_slots" in batch else None,
+                          slotted=array("slotted") if "slotted" in batch else None)
 
 
 def _bucket(value: int, smallest: int = 64) -> int:

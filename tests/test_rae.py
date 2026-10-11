@@ -241,7 +241,7 @@ def test_a_latent_run_trains_behind_the_rae_and_samples_its_image_size(source):
     from diffusion_stubs import STUB_TEXT
 
     from dew.config import ModelConfig, ObjectiveConfig, TrainerConfig
-    from dew.data import Dataset, TFDSImages
+    from dew.data import Dataset, Images
     from dew.objectives.diffusion import DiffusionRunConfig, PretrainedAutoencoder, TextCondition
     from dew.sampling import Euler
     from dew.training import Trainer
@@ -252,7 +252,7 @@ def test_a_latent_run_trains_behind_the_rae_and_samples_its_image_size(source):
             {"patch_size": 1, "emb_features": 16, "num_layers": 1, "num_heads": 2, "mlp_ratio": 1,
              "dtype": "float32", "attention_impl": "reference"},
         ),
-        data=TFDSImages(image_size=64),
+        data=Images(source="tfds://oxford_flowers102", image_size=64),
         trainer=TrainerConfig(batch_size=8, steps=2),
         text=TextCondition(encoder=STUB_TEXT, checkpoint="stub-clip"),
         autoencoder=PretrainedAutoencoder(

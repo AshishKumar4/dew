@@ -14,7 +14,7 @@ import pytest
 
 from dew.checkpoints import Checkpoints
 from dew.config import ModelConfig
-from dew.data import Dataset, Loading
+from dew.data import Dataset, Loading, Memory, Pipeline, compile
 from dew.diffusion import schedules, transforms
 from dew.diffusion.process import Process
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -76,7 +76,8 @@ def test_the_documented_model_records_itself_and_its_run_loads_back(tmp_path, mo
     objective = DiffusionObjective(model, Flow(), InputSpec(Field("image", (4, 4, 3))),
                                    guidance=None, steps=2)
     rows = [{"image": np.full((4, 4, 3), 128, np.uint8)} for _ in range(8)]
-    data = Dataset.from_grain(grain.MapDataset.source(rows), batch=8, loading=Loading(workers=0))
+    data = compile(Pipeline(Memory(grain.MapDataset.source(rows))).repeat().batch(8), read="indexed",
+        loading=Loading(workers=0))
     checkpoints = Checkpoints(str(tmp_path / "run"))
     state = Trainer(objective, optax.sgd(.01), key=0, checkpoints=checkpoints).fit(
         data, steps=1, checkpoint_every=1)
@@ -104,7 +105,8 @@ def test_a_model_with_no_import_path_trains_and_saves_and_loading_says_why(tmp_p
                                       if field.init and field.name not in ("parent", "name")}),
                             seq_len=8, ema_decay=None)
     rows = [{'text': np.arange(9, dtype=np.int32)} for _ in range(8)]
-    data = Dataset.from_grain(grain.MapDataset.source(rows), batch=8, loading=Loading(workers=0))
+    data = compile(Pipeline(Memory(grain.MapDataset.source(rows))).repeat().batch(8), read="indexed",
+        loading=Loading(workers=0))
     checkpoints = Checkpoints(str(tmp_path / 'run'))
     with caplog.at_level("WARNING", logger="dew.training.trainer"):
         Trainer(objective, optax.sgd(.01), key=0, checkpoints=checkpoints).fit(data, steps=1,
@@ -138,7 +140,8 @@ def test_a_model_no_record_can_describe_still_checkpoints_and_loading_says_why(t
     objective = DiffusionObjective(Noted(), Flow(), InputSpec(Field("image", (4, 4, 3))), guidance=None,
                                    steps=2)
     rows = [{"image": np.zeros((4, 4, 3), np.uint8)} for _ in range(8)]
-    data = Dataset.from_grain(grain.MapDataset.source(rows), batch=8, loading=Loading(workers=0))
+    data = compile(Pipeline(Memory(grain.MapDataset.source(rows))).repeat().batch(8), read="indexed",
+        loading=Loading(workers=0))
     checkpoints = Checkpoints(str(tmp_path / 'run'))
     with caplog.at_level("WARNING", logger="dew.training.trainer"):
         Trainer(objective, optax.sgd(.01), key=0, checkpoints=checkpoints).fit(data, steps=1,
@@ -163,7 +166,8 @@ def test_an_adapted_run_records_its_base_and_adapter_and_loads_what_it_trained(t
         base, base.init(jax.random.key(0), jnp.zeros((1, 8), jnp.int32)), key=1)
     objective = LMObjective(adapter.model, seq_len=8, ema_decay=None, variables=adapter.variables)
     rows = [{'text': np.arange(9, dtype=np.int32)} for _ in range(8)]
-    data = Dataset.from_grain(grain.MapDataset.source(rows), batch=8, loading=Loading(workers=0))
+    data = compile(Pipeline(Memory(grain.MapDataset.source(rows))).repeat().batch(8), read="indexed",
+        loading=Loading(workers=0))
     checkpoints = Checkpoints(str(tmp_path / 'run'))
     state = Trainer(objective, optax.sgd(1.0), key=0, checkpoints=checkpoints).fit(
         data, steps=2, checkpoint_every=1)
@@ -277,7 +281,8 @@ def test_an_adapted_denoiser_run_loads_what_it_trained(tmp_path):
                                    guidance=None, steps=2, ema_decay=None,
                                    variables={**adapter.variables, "encoders": {}})
     rows = [{"image": np.full((4, 4, 3), 200, np.uint8)} for _ in range(8)]
-    data = Dataset.from_grain(grain.MapDataset.source(rows), batch=8, loading=Loading(workers=0))
+    data = compile(Pipeline(Memory(grain.MapDataset.source(rows))).repeat().batch(8), read="indexed",
+        loading=Loading(workers=0))
     checkpoints = Checkpoints(str(tmp_path / 'run'))
     state = Trainer(objective, optax.sgd(1.0), key=0, checkpoints=checkpoints).fit(
         data, steps=2, checkpoint_every=1)
@@ -294,7 +299,8 @@ def python_lm_run(directory):
     """A run defined in Python, an LMObjective fit two steps into `directory`: its objective and state."""
     objective = LMObjective(model(), seq_len=8, ema_decay=None)
     rows = [{'text': np.arange(9, dtype=np.int32)} for _ in range(16)]
-    data = Dataset.from_grain(grain.MapDataset.source(rows), batch=8, loading=Loading(workers=0))
+    data = compile(Pipeline(Memory(grain.MapDataset.source(rows))).repeat().batch(8), read="indexed",
+        loading=Loading(workers=0))
     checkpoints = Checkpoints(str(directory))
     trainer = Trainer(objective, optax.sgd(.01), key=0, checkpoints=checkpoints)
     state = trainer.fit(data, steps=2, log_every=2, checkpoint_every=1)
@@ -441,7 +447,7 @@ def test_masked_run_returns_its_own_bundle_kind(tmp_path):
     objective = MaskedDiffusionObjective(masked, MDLM(mask_id=0)(), 8,
                                         head_chunks=1, ema_decay=None, steps=2)
     source = grain.MapDataset.source([{'text': np.arange(1, 9, dtype=np.int32)}] * 8)
-    data = Dataset.from_grain(source, batch=8, loading=Loading(workers=0))
+    data = compile(Pipeline(Memory(source)).repeat().batch(8), read="indexed", loading=Loading(workers=0))
     trainer = Trainer(objective, optax.sgd(.01), key=jax.random.key(0),
                       checkpoints=Checkpoints(str(tmp_path / 'run')))
     trainer.fit(data, steps=1, log_every=1, checkpoint_every=1)
@@ -531,7 +537,7 @@ def test_python_diffusion_checkpoint_preserves_its_solver(tmp_path):
     objective = DiffusionObjective(model, Flow(), InputSpec(Field('image', (4, 4, 1))),
                                    solver=Euler(), steps=2, ema_decay=None)
     source = grain.MapDataset.source([{'image': np.ones((4, 4, 1), np.float32)}] * 8)
-    data = Dataset.from_grain(source, batch=8, loading=Loading(workers=0))
+    data = compile(Pipeline(Memory(source)).repeat().batch(8), read="indexed", loading=Loading(workers=0))
     trainer = Trainer(objective, optax.sgd(.01), key=0, checkpoints=Checkpoints(str(tmp_path / 'run')))
     trainer.fit(data, steps=1, log_every=1, checkpoint_every=1)
     trainer.checkpoints.wait()

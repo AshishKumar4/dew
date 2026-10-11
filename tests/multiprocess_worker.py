@@ -20,6 +20,7 @@ import numpy as np
 from process_support import prepare_worker
 
 from dew.data import Loading
+from dew.data.recipes import load
 from dew.telemetry.records import RECORD_TYPES
 from dew.training.evaluation import Evaluation
 
@@ -358,12 +359,12 @@ def mode_data(args) -> dict:
     """One pass over the held-out split, which ends by itself."""
     import jax
 
-    from dew.data import DataPartition, TokenWindows
+    from dew.data import DataPartition, Text
     from dew.training import MeshSpec
 
-    data = TokenWindows(path=args.tokens, seq_len=args.seq_len, val_batches=None,
-                        loading=Loading(workers=args.workers, threads=1,
-                                        read_buffer=8, worker_buffer=1)).load(batch=BATCH)
+    data = load(Text(source=args.tokens, seq_len=args.seq_len), batch=BATCH, read="memory",
+        loading=Loading(workers=args.workers, threads=1,
+                                        read_buffer=8, worker_buffer=1))
     partition = DataPartition.of(MeshSpec().build())
     assert data.val is not None
     records, batches = [], 0
@@ -385,12 +386,12 @@ def mode_data(args) -> dict:
 def mode_packed(args) -> dict:
     import jax
 
-    from dew.data import DataPartition, TokenWindows
+    from dew.data import DataPartition, Text
     from dew.training import MeshSpec
 
-    data = TokenWindows(pack=True, path=args.tokens, seq_len=args.seq_len, val_batches=None,
-                        loading=Loading(workers=args.workers,
-                                        worker_buffer=1)).load(batch=BATCH)
+    data = load(Text(source=args.tokens, pack="first-fit", seq_len=args.seq_len), batch=BATCH,
+        read="memory", loading=Loading(workers=args.workers,
+                                        worker_buffer=1))
     partition = DataPartition.of(MeshSpec().build())
     assert data.val is not None
     documents, windows = set(), 0
@@ -477,13 +478,13 @@ def mode_packed_fit(args) -> dict:
 
     import jax
 
-    from dew.data import TokenWindows
+    from dew.data import Text
 
     trainer = token_trainer(args.name, args.run_dir, args.fsdp_size, args.seq_len)
     restored_step, restored = restored_state(trainer)
-    data = TokenWindows(pack=True, path=args.tokens, seq_len=args.seq_len, val_batches=0,
-                        loading=Loading(workers=args.workers,
-                                        worker_buffer=1)).load(batch=BATCH)
+    data = load(Text(source=args.tokens, pack="first-fit", seq_len=args.seq_len), batch=BATCH,
+        read="memory", loading=Loading(workers=args.workers,
+                                        worker_buffer=1), validation_records=(0) * (BATCH))
     seen: list = []
     state = trainer.fit(
         dataclasses.replace(data, train=lambda partition: Recording(data.train(partition), seen)),
@@ -612,10 +613,11 @@ def mode_fit(args) -> dict:
         # The packed token split, whose documents are strided over the
         # processes before packing. The objective's evaluation ignores the
         # batch's contents, so the split only has to shard.
-        from dew.data import DataPartition, TokenWindows
+        from dew.data import DataPartition, Text
 
-        data = TokenWindows(pack=True, path=args.tokens, seq_len=args.seq_len, val_batches=args.val_steps,
-                            loading=Loading(workers=args.workers)).load(batch=BATCH)
+        data = load(Text(source=args.tokens, pack="first-fit", seq_len=args.seq_len), batch=BATCH,
+            read="memory", loading=Loading(workers=args.workers),
+                validation_records=(args.val_steps) * (BATCH))
         val = data.val
         assert val is not None
         available = sum(1 for _ in val(DataPartition.of(trainer.device_mesh)))

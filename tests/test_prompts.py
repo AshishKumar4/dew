@@ -15,7 +15,9 @@ import numpy as np
 import pytest
 
 from dew.data import DataPartition, Loading, Prompts
-from dew.data.prompts import INFO_KEY, LENGTH_KEY, PROMPT_KEY, SOURCE_KEY, TRUTH_KEY, PromptSource
+from dew.data.compile import iterate
+from dew.data.prompts import INFO_KEY, LENGTH_KEY, PROMPT_KEY, SOURCE_KEY, TRUTH_KEY
+from dew.data.recipes import load
 
 TOKENIZER = "tests/fixtures/tokenizers/tiny-chat"
 WINDOW = 8
@@ -34,7 +36,20 @@ def read(row):
 
 
 def source(*rows, width=WINDOW):
-    return PromptSource.from_records(records(*rows), TOKENIZER, width, 0)
+    return prompt_rows(records(*rows), TOKENIZER, width, 0)
+
+
+def prompt_rows(rows, tokenizer, width, pad_id, thinking=None):
+    recipe = Prompts(source=tuple(json.loads(row) for row in rows), tokenizer=tokenizer,
+                     max_prompt_len=width, pad_id=pad_id, thinking=thinking, long="truncate")
+    pipeline, _, _ = recipe.pipelines()
+    return list(iterate(pipeline, read="memory", loading=Loading(workers=0)))
+
+
+def prompt_file(path, tokenizer, width, pad_id):
+    pipeline, _, _ = Prompts(source=path, tokenizer=tokenizer, max_prompt_len=width,
+                            pad_id=pad_id, long="truncate").pipelines()
+    return list(iterate(pipeline, read="memory", loading=Loading(workers=0)))
 
 
 def test_ids_prompts_left_pad_with_their_length():
@@ -103,8 +118,9 @@ def test_a_string_prompt_encodes_on_its_own():
 def test_byte_string_prompts_load_as_the_native_tokenizers_ids(prompt):
     from dew.data.text import tokenizer_for
 
-    data = Prompts(tokenizer="byte", records=records({"prompt": prompt}) * 8,
-                   max_prompt_len=WINDOW, loading=Loading(workers=0)).load(batch=8)
+    data = load(Prompts(source=tuple(json.loads(row) for row in records({"prompt": prompt}) * 8),
+        tokenizer="byte", max_prompt_len=WINDOW, long="truncate"), batch=8, read="memory",
+            loading=Loading(workers=0), validation_records=4 * (8))
     stream = data.train(DataPartition())
     try:
         batch = next(stream)
@@ -129,8 +145,9 @@ def test_string_prompts_keep_the_hf_sources_special_tokens_out(tmp_path):
     tokenizer.save_pretrained(tmp_path)
     ids = tokenizer.encode("dew", add_special_tokens=False)
     assert tokenizer.encode("dew") != ids
-    data = Prompts(tokenizer=str(tmp_path), records=records({"prompt": "dew"}),
-                   max_prompt_len=WINDOW, loading=Loading(workers=0)).load(batch=1)
+    data = load(Prompts(source=tuple(json.loads(row) for row in records({"prompt": "dew"})),
+        tokenizer=str(tmp_path), max_prompt_len=WINDOW, long="truncate"), batch=1, read="memory",
+            loading=Loading(workers=0), validation_records=4 * (1))
     stream = data.train(DataPartition())
     try:
         batch = next(stream)
@@ -169,14 +186,14 @@ def test_template_variables_reach_the_chat_template():
     plain = list(render(conversation, tokenize=True, return_dict=False, add_generation_prompt=True,
                         enable_thinking=False))
     assert plain != thinking, "the variable matters for this template"
-    spec = Prompts(tokenizer=TOKENIZER, records=records({"prompt": conversation}), max_prompt_len=64,
-                   val_batches=None, loading=Loading(workers=0), thinking=False)
-    batch = next(spec.load(batch=1).train(DataPartition()))
+    spec = Prompts(source=tuple(json.loads(row) for row in records({"prompt": conversation})),
+        tokenizer=TOKENIZER, max_prompt_len=64, thinking=False, long="truncate")
+    batch = next(load(spec, batch=1, read="memory", loading=Loading(workers=0)).train(DataPartition()))
     assert [int(token) for token in batch[PROMPT_KEY][0, 64 - int(batch[LENGTH_KEY][0]):]] == plain
 
 
 def test_a_row_without_a_prompt_is_refused():
-    with pytest.raises(ValueError, match="without a prompt"):
+    with pytest.raises(ValueError, match="needs a prompt column"):
         source({"data_source": "rule"})
 
 
@@ -197,25 +214,25 @@ def test_a_malformed_message_is_refused():
 
 
 def test_a_non_object_row_is_refused():
-    with pytest.raises(ValueError, match="not JSON"):
-        PromptSource.from_records(("{oops",), TOKENIZER, WINDOW, 0)
-    with pytest.raises(ValueError, match="an object"):
+    with pytest.raises(json.JSONDecodeError):
+        prompt_rows(("{oops",), TOKENIZER, WINDOW, 0)
+    with pytest.raises(ValueError, match="record of named fields"):
         source([1, 2])[0]
 
 
 def test_a_window_below_one_is_refused():
     with pytest.raises(ValueError, match="max_prompt_len"):
-        PromptSource.from_records(records({"prompt": IDS}), TOKENIZER, 0, 0)
+        prompt_rows(records({"prompt": IDS}), TOKENIZER, 0, 0)
 
 
 @pytest.mark.parametrize("prompt", ["hi", IDS])
 def test_tool_schemas_need_a_chat_prompt(prompt):
     """Plain text and pretokenized ids have no template to render schemas."""
-    spec = Prompts(tokenizer=TOKENIZER,
-                   records=records({"prompt": prompt, "tools": []}),
-                   max_prompt_len=WINDOW, loading=Loading(workers=0))
+    spec = Prompts(source=tuple(json.loads(row) for row in records({"prompt": prompt, "tools": []})),
+        tokenizer=TOKENIZER, max_prompt_len=WINDOW, long="truncate")
     with pytest.raises(ValueError, match="tools require chat messages"):
-        next(spec.load(batch=1).train(DataPartition()))
+        next(load(spec, batch=1, read="memory", loading=Loading(workers=0),
+            validation_records=4 * (1)).train(DataPartition()))
 
 
 def test_parquet_carries_the_verl_columns(tmp_path):
@@ -230,7 +247,7 @@ def test_parquet_carries_the_verl_columns(tmp_path):
         "extra_info": ["", "x"],
     }), path)
 
-    rows = PromptSource.from_parquet(str(path), TOKENIZER, WINDOW, 0)
+    rows = prompt_file(str(path), TOKENIZER, WINDOW, 0)
 
     assert len(rows) == 2
     assert read(rows[1][SOURCE_KEY]) == "other"
@@ -243,14 +260,15 @@ def test_parquet_without_a_prompt_column_is_refused(tmp_path):
 
     path = tmp_path / "noprompt.parquet"
     pq.write_table(pa.table({"data_source": ["rule"]}), path)
-    with pytest.raises(ValueError, match="prompt column is required"):
-        PromptSource.from_parquet(str(path), TOKENIZER, WINDOW, 0)
+    with pytest.raises(ValueError, match="needs a prompt column"):
+        prompt_file(str(path), TOKENIZER, WINDOW, 0)
 
 
 def test_the_dataset_batches_fixed_width_rows():
-    data = Prompts(tokenizer=TOKENIZER, records=records(
-        {"prompt": IDS}, {"prompt": LONG}, {"prompt": "hi"}),
-        max_prompt_len=WINDOW, loading=Loading(workers=0)).load(batch=2)
+    data = load(Prompts(source=tuple(json.loads(row) for row in records(
+        {"prompt": IDS}, {"prompt": LONG}, {"prompt": "hi"})), tokenizer=TOKENIZER,
+            max_prompt_len=WINDOW, long="truncate"), batch=2, read="memory", loading=Loading(workers=0),
+                validation_records=4 * (2))
 
     batch = next(data.train(DataPartition()))
 
@@ -260,12 +278,10 @@ def test_the_dataset_batches_fixed_width_rows():
     assert set(batch) == {PROMPT_KEY, LENGTH_KEY, SOURCE_KEY, TRUTH_KEY, INFO_KEY}
 
 
-def test_the_dataset_reads_one_source():
-    with pytest.raises(ValueError, match="one source"):
-        Prompts(tokenizer=TOKENIZER).load(batch=2)
-    with pytest.raises(ValueError, match="one source"):
-        Prompts(tokenizer=TOKENIZER, path="x.parquet",
-                records=records({"prompt": IDS})).load(batch=2)
+def test_unknown_recipe_fields_are_refused_before_reading_records():
+    with pytest.raises(ValueError, match="unknown fields"):
+        load("prompts", source=({"prompt": IDS},), tokenizer=TOKENIZER, batch=2,
+             read="memory", records=({"prompt": IDS},))
 
 
 def test_validation_is_one_pass_over_a_second_file(tmp_path):
@@ -275,8 +291,9 @@ def test_validation_is_one_pass_over_a_second_file(tmp_path):
     train, val = tmp_path / "train.parquet", tmp_path / "val.parquet"
     pq.write_table(pa.table({"prompt": [IDS, LONG]}), train)
     pq.write_table(pa.table({"prompt": [IDS]}), val)
-    data = Prompts(tokenizer=TOKENIZER, path=str(train), val_path=str(val),
-                   max_prompt_len=WINDOW, loading=Loading(workers=0)).load(batch=1)
+    data = load(Prompts(source=str(train), tokenizer=TOKENIZER, max_prompt_len=WINDOW,
+        validation=str(val), long="truncate"), batch=1, read="memory", loading=Loading(workers=0),
+            validation_records=4 * (1))
 
     assert data.val is not None
     batches = list(data.val(DataPartition()))
@@ -289,8 +306,9 @@ def test_validation_is_one_pass_over_a_second_file(tmp_path):
 def test_the_train_stream_encodes_inside_workers():
     """The same rows through real worker processes: the source pickles, the
     workers load their own tokenizer copy, the batches match."""
-    data = Prompts(tokenizer=TOKENIZER, records=records({"prompt": IDS}),
-                   max_prompt_len=WINDOW, loading=Loading(workers=1)).load(batch=1)
+    data = load(Prompts(source=tuple(json.loads(row) for row in records({"prompt": IDS})),
+        tokenizer=TOKENIZER, max_prompt_len=WINDOW, long="truncate"), batch=1, read="memory",
+            loading=Loading(workers=1), validation_records=4 * (1))
 
     batch = next(data.train(DataPartition()))
 

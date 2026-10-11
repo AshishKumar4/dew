@@ -36,6 +36,7 @@ from typing import (
     ClassVar,
     Literal,
     Protocol,
+    TypeAliasType,
     TypedDict,
     Union,
     overload,
@@ -54,7 +55,7 @@ if TYPE_CHECKING:
     from _typeshed import DataclassInstance
     from flax import linen as nn
 
-    from dew.data.dataset import DatasetSpec
+    from dew.data.recipes import Recipe
     from dew.diffusion.presets import Preset
     from dew.inputs.encoders import ConditionEncoder
     from dew.nn.mixers import MixerBase
@@ -296,6 +297,13 @@ def resolve_alias(annotation: Annotation) -> Annotation:
     return annotation
 
 
+def _union_members(annotation: Annotation) -> tuple[Annotation, ...]:
+    annotation = resolve_alias(annotation)
+    if typing.get_origin(annotation) in (Union, types.UnionType):
+        return tuple(inner for member in typing.get_args(annotation) for inner in _union_members(member))
+    return (annotation,)
+
+
 def _unwrapped(annotation: Annotation) -> Annotation:
     """Return `annotation` with an Optional looked through. A union of several
     members says nothing about its entries and answers None."""
@@ -330,7 +338,17 @@ def wants_tuple(annotation: Annotation) -> bool:
             or typing.get_origin(annotation) in (tuple, Sequence))
 
 
-def from_record[ValueT](annotation: type[ValueT], value: Configured, *, dtypes: bool = True) -> ValueT:
+@overload
+def from_record[ValueT](annotation: type[ValueT], value: Configured, *, dtypes: bool = True) -> ValueT: ...
+
+
+@overload
+def from_record(annotation: types.UnionType | TypeAliasType, value: Configured, *,
+                dtypes: bool = True) -> Configured: ...
+
+
+def from_record[ValueT](annotation: type[ValueT] | types.UnionType | TypeAliasType, value: Configured, *,
+                        dtypes: bool = True) -> ValueT | Configured:
     """Return `value` as the class `annotation` names, from a record or already one.
 
     The class is the witness: what comes back is an instance of it or a
@@ -344,7 +362,9 @@ def from_record[ValueT](annotation: type[ValueT], value: Configured, *, dtypes: 
     """
     with _reading(value):
         built = _rebuilt(annotation, value, dtypes=dtypes)
-    witness: type[ValueT] = typing.get_origin(annotation) or annotation
+    if isinstance(annotation, (types.UnionType, TypeAliasType)):
+        return built
+    witness = typing.get_origin(annotation) or annotation
     if not isinstance(built, witness):
         raise ValueError(f"{value!r} builds {type(built).__name__}, "
                          f"not the {witness.__name__} the field declares")
@@ -493,7 +513,7 @@ def _rebuilt(annotation: Annotation, value: object, *, dtypes: bool, name: str =
     if typing.get_origin(annotation) in (Union, types.UnionType):
         if value is None:
             return value
-        inner = [member for member in typing.get_args(annotation) if member is not type(None)]
+        inner = [member for member in _union_members(annotation) if member is not type(None)]
         if len(inner) == 1:
             return _rebuilt(inner[0], value, dtypes=dtypes)
         classes = tuple(member for member in inner if isinstance(member, type))
@@ -1118,21 +1138,16 @@ solvers: Aliases[type[Solver[Any]], Solver[Any]] = Aliases("solver", {
     "unipc": "dew.sampling.solvers.unipc:UniPC",
     "unmask": "dew.diffusion.discrete:Unmask",
 })
-datasets: Aliases[type[DatasetSpec], DatasetSpec] = Aliases("dataset", {
-    "array_record_images": "dew.data.images:ArrayRecordImages",
-    "chat_messages": "dew.data.chat:ChatMessages",
-    "decision_table": "dew.decision.data:DecisionTable",
-    "hf": "dew.data.providers:HubDataset",
-    "hf_images": "dew.data.images:HFImages",
-    "local_videos": "dew.data.video:LocalVideos",
-    "online_images": "dew.data.streaming:OnlineImages",
-    "online_videos": "dew.data.streaming:OnlineVideos",
-    "preference_pairs": "dew.data.preferences:PreferencePairs",
-    "prompts": "dew.data.prompts:Prompts",
-    "tfds": "dew.data.providers:PreparedTFDS",
-    "tfds_images": "dew.data.images:TFDSImages",
-    "token_windows": "dew.data.tokens:TokenWindows",
-}, base="dew.data.dataset:DatasetSpec")
+datasets: Aliases[type[Recipe], Recipe] = Aliases("dataset", {
+    "chat": "dew.data.recipes:Chat",
+    "decisions": "dew.decision.data:Decisions",
+    "images": "dew.data.recipes:Images",
+    "preferences": "dew.data.recipes:Preferences",
+    "prompts": "dew.data.recipes:Prompts",
+    "records": "dew.data.recipes:Records",
+    "text": "dew.data.recipes:Text",
+    "video": "dew.data.recipes:Video",
+}, base="dew.data.recipes:Recipe")
 encoders: Aliases[type[ConditionEncoder[Any]], ConditionEncoder[Any]] = Aliases("encoder", {
     "char_table": "dew.inputs.encoders:CharTable",
     "clip_text": "dew.inputs.encoders:CLIPText",

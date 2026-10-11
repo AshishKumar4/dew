@@ -37,20 +37,20 @@ print(len(ids) - held_out, "training tokens,", held_out, "validation tokens")
 48830 training tokens, 2569 validation tokens
 ```
 
-This is the layout `dew tokenize` writes: `train.bin` and `val.bin` hold the token IDs back to back, and `meta.json` records the tokenizer, vocabulary size, dtype and counts. The validation split is the head of the stream.
+This small self-contained fixture uses native binary token stores: `train.bin` and `val.bin` hold the token IDs back to back, and `meta.json` records the tokenizer, vocabulary size, dtype and counts. The validation split is the head of the stream.
 
 ```python
+from dew.data import load
 import jax
 
 from dew import Trainer
 from dew.config import OptimConfig
-from dew.data import Loading, TokenWindows
+from dew.data import Loading, Text
 from dew.nn.backbones import CausalTransformer
 from dew.objectives.lm import LMObjective, Perplexity
 from dew.sampling import Sampling, generate
 
-data = TokenWindows(path="data/stories-byte", seq_len=64,
-                    loading=Loading(workers=0)).load(batch=16)
+data = load(Text(source="data/stories-byte", seq_len=64), batch=16, read="memory", loading=Loading(workers=0), validation_records=(4) * (16))
 model = CausalTransformer(vocab_size=tokenizer.vocab_size,
                           emb_features=64, num_layers=2, num_heads=2, mlp_features=256,
                           max_seq_len=128)
@@ -74,19 +74,32 @@ Trained 300 steps in 0:00:14: first step after 2.76 s, then 30.0 step/s
 One day, Lily saw a big dog in the park. The dog want
 ```
 
-`TokenWindows(seq_len=64)` yields rows of 65 IDs under the key `text`. `LMObjective(model, seq_len=64)` feeds the first 64 to the model and scores the predictions against the next 64. Token IDs must be integers inside the model's vocabulary. `temperature=0.0` picks the most likely token at every step, and the returned row holds the prompt followed by the continuation.
+`Text(seq_len=64)` yields rows of 65 IDs under the key `text`. `LMObjective(model, seq_len=64)` feeds the first 64 to the model and scores the predictions against the next 64. Token IDs must be integers inside the model's vocabulary. `temperature=0.0` picks the most likely token at every step, and the returned row holds the prompt followed by the continuation.
 
 The training loss is near zero because the same four sentences repeat, and validation on the held-out start of the stream scores just as low. Validation and the generation above both use the trained `lm_state.variables`, since the objective keeps no moving average unless `ema_decay` is set.
 
 ## TinyStories
 
-The same code trains a decoder on TinyStories, a corpus of short stories in simple English, with the GPT-2 tokenizer. Download the 22 MB validation file of TinyStories V2 and tokenize it; the tool holds out the first 1% of the tokens for validation:
+The same code trains a decoder on TinyStories, a corpus of short stories in simple English, with the GPT-2 tokenizer. Download the 22 MB validation file of TinyStories V2 and export two token stores; the script reserves the first 1% for validation:
 
 ```bash
 hf download roneneldan/TinyStories TinyStoriesV2-GPT4-valid.txt \
     --repo-type dataset --local-dir data
-dew tokenize --input data/TinyStoriesV2-GPT4-valid.txt \
-    --out data/tinystories --tokenizer gpt2
+python - <<'PY'
+from pathlib import Path
+import numpy as np
+from dew.data import HFTokenizer, export
+
+tokenizer = HFTokenizer("gpt2")
+ids = np.asarray(tokenizer.encode(Path("data/TinyStoriesV2-GPT4-valid.txt").read_text()), np.int32)
+held = int(len(ids) * 0.01)
+metadata = {"token_store": True, "tokenizer": "gpt2", "vocab_size": tokenizer.vocab_size,
+            "dtype": "int32", "eos_id": None}
+export([{"text": ids[held:]}], "data/tinystories/train", format="array_record",
+       metadata=metadata, length_field="text")
+export([{"text": ids[:held]}], "data/tinystories/val", format="array_record",
+       metadata=metadata, length_field="text")
+PY
 ```
 
 The measured run changes these settings from the example:
@@ -94,7 +107,7 @@ The measured run changes these settings from the example:
 | Setting | Value |
 |---|---|
 | Tokenizer | `HFTokenizer("gpt2")` |
-| Data | `TokenWindows(path="data/tinystories", seq_len=256).load(batch=32)` |
+| Data | `load(Text(source="data/tinystories/train", validation="data/tinystories/val", seq_len=256), batch=32, read="memory")` |
 | Model | `emb_features=256, num_layers=4, num_heads=4, max_seq_len=256, dtype=jnp.bfloat16` |
 | Optimizer | `OptimConfig(learning_rate=1e-3)` |
 | Objective | `LMObjective(model, seq_len=256, ema_decay=0.999)` |
@@ -115,25 +128,36 @@ Use one tokenizer everywhere: data preparation, model construction, decoding and
 
 `RunProcessor(tokenizer)` in `dew.inference` wraps an `encode`/`decode` tokenizer in the same kind of callable, which is what a task takes as `processor=`. A text-to-image run's captions are tokenized by its condition encoder, for example `CLIPText.tokenize` in `dew.inputs`.
 
-`dew tokenize`, or `TokenCorpus.write` from `dew.data` in Python, tokenizes a file, or every `.txt` file under a directory, into `train.bin`, `val.bin` and `meta.json`:
+`export` writes token records as committed ArrayRecord shards with a producer manifest and length index. Use the same tokenizer for data, model construction, decoding and checkpoint export. `dew data export` accepts a recipe alias and JSON fields; optional `--tokenizer` and `--eos` add tokenization to the deterministic prefix.
 
 ```bash
-dew tokenize --input data/corpus.txt --out data/corpus-byte \
-    --tokenizer byte --val-fraction 0.1
+dew data export records data/corpus-byte \
+    --fields '{"source": "data/corpus.txt"}' \
+    --format array_record --tokenizer byte --eos --read memory
 ```
 
-| Flag | Default | Meaning |
-|---|---|---|
-| `--input` | required | A file, or a directory read as every `*.txt` inside it. |
-| `--out` | required | Directory for `train.bin`, `val.bin` and `meta.json`. |
-| `--tokenizer` | `byte` | `byte`, or a Hugging Face tokenizer name. |
-| `--val-fraction` | `0.01` | Share of the token stream held out for validation, taken from its head. |
-| `--pack` | off | Write the tokenizer's EOS ID after every input file, so `TokenWindows(pack=True)` can split the stream back into documents. Refused for a tokenizer without an EOS ID. |
+That command publishes the complete input. Prepare held-out records separately and pass their URL as `Text(validation=...)`. To preserve a token-axis head split, encode the stream once and export two slices:
 
-The binary files use the smallest unsigned dtype that holds the vocabulary. `TokenWindows(path, seq_len).load(batch=B)` reads them:
+```python
+from pathlib import Path
+import numpy as np
+from dew.data import ByteTokenizer, export
 
-- By default it cuts fixed windows of `seq_len + 1` IDs, `{"text": int32 [B, seq_len + 1]}`. Each window starts `seq_len` IDs after the last, so every transition is scored once.
-- With `pack=True` it packs whole documents into rows and adds `text_segment_ids` and `text_positions`. The objective skips padded targets and the transitions between documents. Packing needs a segment mask in attention, which can change which attention implementations run.
+tokenizer = ByteTokenizer()
+ids = np.asarray(tokenizer.encode(Path("data/corpus.txt").read_text()), np.int32)
+held = int(len(ids) * 0.1)
+metadata = {"token_store": True, "tokenizer": "byte", "vocab_size": 256,
+            "dtype": "int32", "eos_id": None}
+export([{"text": ids[held:]}], "data/corpus-byte/train", format="array_record",
+       metadata=metadata, length_field="text")
+export([{"text": ids[:held]}], "data/corpus-byte/val", format="array_record",
+       metadata=metadata, length_field="text")
+```
+
+`load(Text(source="data/corpus-byte/train", validation="data/corpus-byte/val", seq_len=64), batch=8, read="memory")` reads those stores. Indexed mode reads producer lengths without scanning token payloads. Binary token stores remain native inputs through TokenFiles; new producers use committed shards.
+
+- Fixed windows contain `seq_len + 1` IDs, `{"text": int32 [B, seq_len + 1]}`. Each starts `seq_len` IDs after the last.
+- `pack="first-fit"` keeps documents in padded windows and adds aligned segment IDs and positions. `pack="concat"` concatenates and splits aligned fields.
 
 ## LMObjective
 
@@ -192,15 +216,16 @@ With gradient accumulation, the cross-entropy and multi-token-prediction (MTP) l
 
 ## Pretrained checkpoints
 
-`Pretrained.load(name_or_dir)` reads a local Hugging Face directory or a Hub identifier into a `Pretrained` bundle that holds the native Flax model, its variables, the checkpoint's processor or tokenizer, the source config and the generation defaults. The bundle's class depends on the kind of source it read, and each class has the methods that work for that kind: `PretrainedDecoder` (text generation), `PretrainedMaskedDecoder` (LLaDA, Dream), `PretrainedBlockDecoder` (DiffusionGemma), `PretrainedPipeline` (latent diffusion, `text_to_image`) and `PretrainedFallback` (`fallback="torchax"`, training only). Every kind can take an adapter (`adapt`), and you can pass any of them in place of the model to the objective that trains it. Calling `load` on a specific kind, as in `PretrainedDecoder.load(...)`, refuses a source of another kind and names it. `dew.pipeline(source)` wraps the same loader and returns a `TextGeneration` (a `BlockGeneration` for DiffusionGemma, a `MaskedGeneration` for LLaDA and Dream) with the weights placed on the current devices and the sampling policy and budget taken from the checkpoint.
+`Pretrained.load(name_or_dir)` reads a local Hugging Face directory or a Hub identifier into a `Pretrained` bundle that holds the native Flax model, its variables, the checkpoint's processor or tokenizer, the source config and the generation defaults. The bundle's class depends on the kind of source it read, and each class has the methods that work for that kind: `PretrainedDecoder` (text generation), `PretrainedMaskedDecoder` (LLaDA, Dream), `PretrainedBlockDecoder` (DiffusionGemma), `PretrainedPipeline` (latent diffusion, `text_to_image`) and `PretrainedFallback` (`fallback="torchax"`, training only). Every kind can take an adapter (`adapt`), and you can pass any of them in place of the model to the objective that trains it. Calling `load` on a specifi…
 
-`LMObjective(bundle, seq_len, **options)` trains a decoder bundle from its loaded weights. With token files prepared using the checkpoint's tokenizer (`dew tokenize --tokenizer Qwen/Qwen3-0.6B`), fine-tuning uses the same trainer as training from scratch:
+`LMObjective(bundle, seq_len, **options)` trains a decoder bundle from its loaded weights. With token files prepared using the checkpoint's tokenizer (`dew data export ... --tokenizer Qwen/Qwen3-0.6B`), fine-tuning uses the same trainer as training from scratch:
 
-<!-- not run: fine-tunes Qwen3-0.6B on the token files `dew tokenize` writes, which CI does not prepare -->
+<!-- not run: fine-tunes Qwen3-0.6B on a produced token store, which CI does not prepare -->
 ```python
+from dew.data import Loading, Text, load
 from dew.interop import PretrainedDecoder
 
-data = TokenWindows(path="data/qwen3-tokens", seq_len=512).load(batch=4)
+data = load(Text(source="data/qwen3-tokens", seq_len=512), batch=4, read="memory", loading=Loading(workers=0), validation_records=(4) * (4))
 bundle = PretrainedDecoder.load("Qwen/Qwen3-0.6B", max_seq_len=512)
 objective = LMObjective(bundle, seq_len=512)
 state = Trainer(objective, OptimConfig(learning_rate=1e-5), key=jax.random.key(0)).fit(data, steps=100)
@@ -364,14 +389,14 @@ An encoder takes `input_features` shaped `[B, T, F]` and a boolean `input_featur
 
 ## Masked diffusion language models
 
-`MaskedDiffusionObjective` trains a bidirectional decoder to recover masked tokens under MDLM's negative ELBO. As in MDLM's SUBS parameterization, the mask token gets no probability mass, so its column is left out of the cross entropy's partition. LLaDA's published training script takes the cross entropy over the whole vocabulary, so its loss values differ from Dew's by that term. Each row holds exactly `seq_len` tokens, because there is no next-token shift; `TokenWindows(seq_len=63)`, whose rows hold 64 IDs, feeds a 64-token objective. The mask token needs an ID of its own, here the one after the last byte:
+`MaskedDiffusionObjective` trains a bidirectional decoder to recover masked tokens under MDLM's negative ELBO. As in MDLM's SUBS parameterization, the mask token gets no probability mass, so its column is left out of the cross entropy's partition. LLaDA's published training script takes the cross entropy over the whole vocabulary, so its loss values differ from Dew's by that term. Each row holds exactly `seq_len` tokens, because there is no next-token shift; `Text(seq_len=63)`, whose rows hold 64 IDs, feeds a 64-token objective. The mask token needs an ID of its own, here the one after the last byte:
 
 ```python
+from dew.data import Loading, Text, load
 from dew.diffusion.discrete import MDLM
 from dew.objectives.diffusion import MaskedDiffusionObjective
 
-masked_data = TokenWindows(path="data/stories-byte", seq_len=63,
-                           loading=Loading(workers=0)).load(batch=16)
+masked_data = load(Text(source="data/stories-byte", seq_len=63), batch=16, read="memory", loading=Loading(workers=0), validation_records=(4) * (16))
 mask_id = tokenizer.vocab_size
 process = MDLM(mask_id=mask_id)()
 masked_model = CausalTransformer(vocab_size=mask_id + 1,
@@ -490,7 +515,7 @@ Optimizer updates: 1
 `recipes/lm/train.py --objective block_diffusion` runs the same objective; there is no separate recipe. It trains on complete token-window rows, and `data.seq_len + 1` must equal `--objective.prompt-length` plus a whole number of training canvases. `--objective.canvas-size` defaults to the checkpoint's canvas length. Packed documents are rejected, because their context boundaries differ. Block SFT logs `canvas_ce` and `encoder_ce`. It does not report autoregressive perplexity or use the autoregressive preview settings.
 
 ```bash
-python recipes/lm/train.py data:token-windows --data.path data/diffusion-token-windows \
+python recipes/lm/train.py data:text --data.source data/diffusion-token-windows \
     --data.seq-len 511 --objective block_diffusion --objective.prompt-length 256 \
     --pretrained google/diffusiongemma-26B-A4B-it \
     --tokenizer google/diffusiongemma-26B-A4B-it \

@@ -39,6 +39,8 @@ import time
 import urllib.request
 from pathlib import Path
 
+from dew.data.recipes import load
+
 CORPUS = ("https://huggingface.co/datasets/roneneldan/TinyStories/resolve/"
           "f54c09fd23315a6f9c86f9dc80f725de7d8f9c64/TinyStories-valid.txt")
 """TinyStories' validation split, about 19 MB of English, at a pinned revision."""
@@ -58,11 +60,12 @@ SHAPES = {
 
 
 def corpus(cache: Path) -> Path:
-    """The pinned text as byte tokens, train.bin and val.bin, written once."""
-    from dew.data import TokenCorpus
+    """The pinned text as a produced ArrayRecord token store."""
+    from dew.data import ByteTokenizer, export
+    import numpy as np
 
     tokens = cache / "tokens"
-    if (tokens / "meta.json").is_file():
+    if (tokens / "_dew_manifest.json").is_file():
         return tokens
     cache.mkdir(parents=True, exist_ok=True)
     text = cache / "TinyStories-valid.txt"
@@ -71,7 +74,13 @@ def corpus(cache: Path) -> Path:
         urllib.request.urlretrieve(CORPUS, part)
         part.rename(text)
     print("corpus sha256", hashlib.sha256(text.read_bytes()).hexdigest(), flush=True)
-    TokenCorpus.write(str(text), str(tokens), tokenizer="byte", val_fraction=0.01)
+    ids = np.asarray(ByteTokenizer().encode(text.read_text()), np.int32)
+    held = int(len(ids) * 0.01)
+    metadata = {"token_store": True, "tokenizer": "byte", "vocab_size": 256,
+                "dtype": "int32", "eos_id": None}
+    export([{"text": ids[held:]}], str(tokens), format="array_record", metadata=metadata, length_field="text")
+    export([{"text": ids[:held]}], str(cache / "held_tokens"), format="array_record", metadata=metadata,
+           length_field="text")
     return tokens
 
 
@@ -202,7 +211,7 @@ def main() -> None:
     import optax
     from jax.experimental import multihost_utils
 
-    from dew.data import TokenWindows
+    from dew.data import Text
     from dew.data.dataset import DataPartition
     from dew.nn.backbones import CausalTransformer
     from dew.objectives.lm import LMObjective
@@ -215,7 +224,8 @@ def main() -> None:
     target = shape["target"] if args.target is None else args.target
     tokens = corpus(args.cache)
     batch_size = shape["batch"] if args.batch is None else args.batch
-    data = TokenWindows(path=str(tokens), seq_len=SEQ_LEN).load(batch=batch_size)
+    data = load(Text(source=str(tokens), seq_len=SEQ_LEN), batch=batch_size, read="memory",
+        validation_records=4 * (batch_size))
     model = CausalTransformer(**shape["model"], vocab_size=256, max_seq_len=SEQ_LEN + 1,
                               dtype=getattr(jnp, dtype), attention_impl="auto", scan_layers=args.scan_layers)
     mesh = MeshSpec(**mesh_of(shape["mesh"], jax.device_count()))

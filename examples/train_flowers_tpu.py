@@ -35,8 +35,9 @@ from PIL import Image
 import dew
 from dew.artifacts import uint8_pixels
 from dew.config import ModelConfig, ObjectiveConfig, OptimConfig, TrainerConfig
-from dew.data import ArrayRecordImages, DataPartition, Loading, TFDSImages
-from dew.data.images import pack_dict_of_byte_arrays
+from dew.data import TFDS, Augment, DataPartition, Files, HoldOut, Images, Loading, load
+from dew.data.sources.codec import pack_dict_of_byte_arrays
+from dew.data.steps.image import EncodeCaptions
 from dew.diffusion.presets import EDM
 from dew.eval import FID, CLIPScore
 from dew.nn.backbones import SimpleDiT
@@ -108,9 +109,11 @@ def smoke_config(config: Config, out: Path) -> DiffusionRunConfig:
     return DiffusionRunConfig(
         model=ModelConfig.from_model(SimpleDiT(patch_size=4, emb_features=32, num_layers=1, num_heads=2,
                                                dtype=jnp.float32)),
-        data=ArrayRecordImages(path=str(out / "data"), image_size=16, augmentation="none",
-                               val_batches=1, loading=Loading(workers=0, threads=1,
-                                                              read_buffer=2, worker_buffer=1)),
+        data=Images(source=Files(str(out / "data" / "*.array_record"), format="array_record"),
+                    image_size=16, augment=None,
+                    validation=HoldOut(records=4)),
+        validation_records=4,
+        loading=Loading(workers=0, threads=1, read_buffer=2, worker_buffer=1),
         preset=EDM(regime="pixel"),
         objective=ObjectiveConfig("diffusion", {"solver": Heun(), "guidance": CFG(2.0), "steps": 2,
                                                 "ema_decay": 0.9}),
@@ -131,11 +134,15 @@ def slice_config(config: Config) -> DiffusionRunConfig:
     if config.data is None:
         raise ValueError("--data is the prepared record directory; --smoke writes its own")
     path = str(config.data.expanduser())
-    prepared = (ArrayRecordImages(path=path) if (config.data / "manifest.json").is_file()
-                else TFDSImages(path=path))
+    records = (config.data / "manifest.json").is_file() or (config.data / "_dew_manifest.json").is_file()
+    prepared = Images(source=Files(path, format="array_record") if records else
+                      TFDS("oxford_flowers102", split="all", path=path),
+                      caption_templates=() if records else ("a photo of a {}",),
+                      augment=Augment(flip=True, jitter=True))
     return DiffusionRunConfig(
         model=ModelConfig.from_model(SimpleDiT(**config.model, dtype=jnp.bfloat16)),
-        data=replace(prepared, image_size=config.image_size, val_batches=4),
+        data=replace(prepared, image_size=config.image_size,
+                     validation=HoldOut(records=4 * config.batch_size)),
         preset=EDM(regime="pixel"),
         objective=ObjectiveConfig("diffusion", {"solver": Heun(), "guidance": CFG(config.guidance),
                                                 "steps": config.sampling_steps, "ema_decay": 0.9999}),
@@ -154,9 +161,10 @@ def slice_config(config: Config) -> DiffusionRunConfig:
 
 def held_out(run: DiffusionRunConfig) -> np.ndarray:
     """The uint8 images of the validation pass, which the run never trained on."""
-    data = run.data.load(batch=run.trainer.batch_size)
+    data = load(run.data, batch=run.trainer.batch_size, read=run.data_read, loading=run.loading,
+                validation_records=run.validation_records)
     if data.val is None:
-        raise ValueError("scoring FID needs a held-out split: set data.val_batches")
+        raise ValueError("scoring FID needs an explicit validation source or HoldOut")
     # This process's share of the pass on the run's plain data-parallel mesh.
     share = DataPartition.of(run.trainer.mesh.build())
     return np.concatenate([np.asarray(batch["image"], np.uint8) for batch in data.val(share)])
@@ -182,7 +190,8 @@ def main(config: Config) -> Path:
         run = replace(run, trainer=replace(run.trainer, mesh=MeshSpec(fsdp=jax.device_count())))
 
     objective = run.build()
-    data = run.data.load(batch=run.trainer.batch_size, tokenize=objective.inputs.tokenize)
+    data = load(run.data, batch=run.trainer.batch_size, read=run.data_read, loading=run.loading,
+                validation_records=run.validation_records, host=(EncodeCaptions(objective.inputs.tokenize),))
     name = "smoke" if config.smoke else f"flowers-{config.image_size}"
     run.train(objective, data, name=name, metrics=run.build_eval_metrics(),
               summary={"prompts": list(PROMPTS)})

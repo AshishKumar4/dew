@@ -14,7 +14,8 @@ from PIL import Image
 
 from dew.artifacts import uint8_pixels
 from dew.config import OptimConfig
-from dew.data import TFDSImages
+from dew.data import TFDS, Augment, HoldOut, Images, load
+from dew.data.steps.image import EncodeCaptions
 from dew.diffusion import presets
 from dew.inputs import CLIPText, Condition, Field, InputSpec
 from dew.interop import save_hf_layout
@@ -49,11 +50,14 @@ def text_conditioned_inputs(image_size: int) -> InputSpec:
 
 def main(config: Config, data=None, inputs=None):
     inputs = inputs or text_conditioned_inputs(config.image_size)
-    data = data or TFDSImages(
-        path=None if config.data_path is None else str(config.data_path.expanduser()),
-        name="oxford_flowers102",
+    data = data or load(Images(
+        source=TFDS("oxford_flowers102", split="all",
+                    path=None if config.data_path is None else str(config.data_path.expanduser())),
         image_size=config.image_size,
-    ).load(batch=config.batch_size, tokenize=inputs.tokenize)
+        caption_templates=("a photo of a {}",),
+        augment=Augment(flip=True, jitter=True), validation=HoldOut(records=4 * config.batch_size),
+    ), batch=config.batch_size, provision=config.data_path is None, read="memory",
+        host=(EncodeCaptions(inputs.tokenize),))
     steps = config.steps or data.epoch_steps(config.epochs)
     model = SimpleDiT(**config.model, output_channels=3, dtype=jnp.bfloat16)
     objective = DiffusionObjective(model, presets.EDM(regime="pixel"), inputs,

@@ -2,7 +2,6 @@
 that rebuilds from what it logged."""
 
 import dataclasses
-import itertools
 import json
 from collections.abc import Mapping
 from pathlib import Path
@@ -13,8 +12,8 @@ import pytest
 from diffusion_stubs import RES, STUB_TEXT
 
 from dew.config import RunConfig, ScheduleSpec
-from dew.data import Dataset, OnlineImages, TFDSImages, TokenWindows
-from dew.data.dataset import record_argument, tokenized
+from dew.data import Augment, Dataset, Files, HoldOut, Images, Loading, Text, export
+from dew.data.dataset import record_argument
 from dew.diffusion.presets import Flow
 from dew.objectives.diffusion import DiffusionRunConfig
 from dew.objectives.jepa import JepaRunConfig
@@ -34,13 +33,14 @@ def parse(cls, args):
 
 def test_the_flags_pick_a_dataset_a_preset_and_a_solver_from_the_registries():
     config = parse(DiffusionRunConfig, [
-        "--data.image-size", "64", "--data.augmentation", "flip_only",
+        "--data.image-size", "64", "--data.augment.crop-scale", "0.8", "1.0",
         "preset:flow", "--preset.shift", "3.0", "--objective.solver", '{"class": "heun"}',
         "--objective.guidance", '{"class": "dew.sampling.guidance:CFG", "fields": {"scale": 2.5}}',
         "--trainer.batch-size", "8", "--trainer.steps", "10", "--trainer.mesh.fsdp", "2",
         "--model", "simple_dit", "--model.scan_order", "hilbert"])
 
-    assert config.data == TFDSImages(image_size=64, augmentation="flip_only")
+    assert config.data == dataclasses.replace(DiffusionRunConfig().data, image_size=64,
+                                               augment=Augment(jitter=True, crop_scale=(0.8, 1.0)))
     assert config.preset == Flow(shift=3.0)
     assert config.objective.fields["solver"]["class"] == import_path(Heun)
     assert config.objective.fields["guidance"]["fields"]["scale"] == 2.5
@@ -50,15 +50,15 @@ def test_the_flags_pick_a_dataset_a_preset_and_a_solver_from_the_registries():
 
 def test_the_default_dataset_takes_flags_without_naming_its_subcommand():
     config = parse(RunConfig, ["--data.image-size", "96", "--trainer.epochs", "3"])
-    assert config.data == TFDSImages(image_size=96) and config.trainer.epochs == 3
+    assert config.data == dataclasses.replace(RunConfig().data, image_size=96) and config.trainer.epochs == 3
 
 
 def test_another_dataset_is_its_subcommand():
-    config = parse(LMRunConfig, ["data:token-windows", "--data.path", "d", "--data.pack",
+    config = parse(LMRunConfig, ["data:text", "--data.source", "d", "--data.pack", "first-fit",
                                  "--data.seq-len", "64", "--data.packing-bins", "2"])
-    assert config.data == TokenWindows(path="d", seq_len=64, packing_bins=2, pack=True)
-    with pytest.raises(ValueError, match="trains on token files: data:token-windows"):
-        LMRunConfig(data=TFDSImages()).prepare()
+    assert config.data == Text(source="d", seq_len=64, packing_bins=2, pack="first-fit")
+    with pytest.raises(ValueError, match="trains on a Text recipe"):
+        LMRunConfig(data=Images(source="tfds://oxford_flowers102")).prepare()
 
 
 def test_a_spec_field_the_dataset_lacks_is_a_command_line_error():
@@ -71,7 +71,7 @@ def test_a_run_config_round_trips_through_its_json_record(name):
     cls = {"diffusion": DiffusionRunConfig, "lm": LMRunConfig, "jepa": JepaRunConfig}[name]
     args = {"diffusion": ["preset:karras", "--preset.sigma-data", "0.6",
                           "--objective.unconditional-prob", "0.2"],
-            "lm": ["--data.path", "d", "--max-new-tokens", "4", "--objective.ema-decay", "0.9"],
+            "lm": ["--data.source", "d", "--max-new-tokens", "4", "--objective.ema-decay", "0.9"],
             "jepa": ["--probe-classes", "7", "--objective.momentum", "0.9", "0.99"]}[name]
     config = parse(cls, [*args, "--trainer.steps", "5"])
 
@@ -84,12 +84,13 @@ def test_a_run_config_round_trips_through_its_json_record(name):
 def test_a_run_over_url_datasets_round_trips_through_its_json_record():
     """A diffusion run may train on any hub table of urls; its record has to
     name the sources, so the run and its solvers rebuild from run.json."""
-    config = DiffusionRunConfig(data=OnlineImages(sources=("user/urls",), image_size=64))
+    config = DiffusionRunConfig(data=Images(source=Files("hf://datasets/user/images/train.parquet",
+        format="parquet"), image_size=64))
 
     record = json.loads(json.dumps(config.to_dict()))
 
     assert DiffusionRunConfig.from_dict(record) == config
-    assert record["data"]["class"] == datasets.paths["online_images"]
+    assert record["data"]["class"] == datasets.paths["images"]
 
 
 def test_steps_and_epochs_are_one_choice():
@@ -102,6 +103,14 @@ def test_steps_and_epochs_are_one_choice():
         config.trainer.total_steps(
             Dataset(train=lambda partition: iter(()), val=None, records=None, batch=10)
         )
+
+
+def test_the_cli_selects_a_token_budget_without_selecting_a_row_batch():
+    config = parse(RunConfig, ["--trainer.batch-size", "None", "--trainer.batch-tokens", "24576",
+                              "--trainer.update-tokens", "98304", "--trainer.steps", "1"])
+    assert config.trainer.batch_size is None
+    assert config.trainer.derived().accumulation == 4
+    assert RunConfig.from_dict(json.loads(json.dumps(config.to_dict()))) == config
 
 
 class _Batches:
@@ -136,14 +145,10 @@ def _batches(batch):
 
 def test_the_diffusion_entrypoint_runs_without_a_tracker_and_saves_its_run_spec(tmp_path, monkeypatch):
     batch = 8
-    def load(self, *, batch, tokenize=None):
-        train = tokenized(_batches(batch), tokenize)
-        return Dataset(train=train,
-                       val=tokenized(lambda partition: itertools.islice(_batches(batch)(partition), 1),
-                                     tokenize),
-                       records=4 * batch, batch=batch)
-
-    monkeypatch.setattr(TFDSImages, "load", load)
+    samples = next(_Batches(5 * batch))
+    rows = [{"image": image, "caption": "a flower"} for image in samples["image"]]
+    inputs = tmp_path / "inputs"
+    export(rows, str(inputs), format="array_record")
     config = parse(DiffusionRunConfig, [
         "--text.encoder", STUB_TEXT, "--text.checkpoint", "stub",
         "--data.image-size", str(RES), "--trainer.batch-size", str(batch), "--trainer.steps", "2",
@@ -155,7 +160,9 @@ def test_the_diffusion_entrypoint_runs_without_a_tracker_and_saves_its_run_spec(
         "--objective.steps", "2"])
     # A validation pass needs a consumer; psnr scores samples against the
     # batch and downloads nothing, unlike the default clip metric.
-    config = dataclasses.replace(config, val_metrics=("psnr",))
+    config = dataclasses.replace(config, val_metrics=("psnr",), loading=Loading(workers=0),
+                                 data=Images(source=str(inputs), validation=HoldOut(records=batch),
+                                             image_size=RES, augment=None))
 
     state = config.run()
 
@@ -197,11 +204,11 @@ def test_the_jepa_entrypoint_runs_without_a_tracker_and_saves_its_run_spec(tmp_p
         def set_state(self, state):
             self.count = json.loads(state)["count"]
 
-    def load(self, *, batch, tokenize=None):
-        return Dataset(train=lambda partition: _Images(), val=lambda partition: _Images(count=1),
-                       records=4 * batch, batch=batch)
-
-    monkeypatch.setattr(TFDSImages, "load", load)
+    samples = next(_Images())
+    rows = [{"image": image, "label": label} for _ in range(5)
+            for image, label in zip(samples["image"], samples["label"], strict=True)]
+    inputs = tmp_path / "inputs"
+    export(rows, str(inputs), format="array_record")
     config = parse(
         JepaRunConfig,
         [
@@ -231,6 +238,9 @@ def test_the_jepa_entrypoint_runs_without_a_tracker_and_saves_its_run_spec(tmp_p
             "--model.num_layers", "1", "--model.num_heads", "2", "--model.mlp_ratio", "2",
         ],
     )
+
+    config = dataclasses.replace(config, loading=Loading(workers=0),
+                                 data=Images(source=str(inputs), image_size=size, augment=None))
 
     state = config.run()
 

@@ -7,7 +7,8 @@ from pathlib import Path
 
 import pytest
 
-from dew.decision import Choice, DecisionTable, Example
+from dew.data import Loading, iterate
+from dew.decision import Choice, Decisions, Example
 
 RECIPES = Path(__file__).parents[1] / "recipes" / "decision"
 
@@ -29,14 +30,15 @@ INSTRUCTIONS = ("Read the customer's message carefully and decide which team of 
 
 
 def _table(path: Path, texts: list[tuple[str, str]]) -> list[Example]:
-    """`texts` as a DecisionTable reads them, one schema asked of every row."""
+    """A table with one question schema asked of every row."""
     with path.open("w", newline="") as file:
         writer = csv.writer(file)
         writer.writerow(["text", "label"])
         writer.writerows(texts)
-    examples, _ = DecisionTable(path=str(path), question="team", instructions=INSTRUCTIONS,
-                                options=("billing", "technical", "sales"), held_out=0.0).examples()
-    return examples
+    pipeline, _, _ = Decisions(source=str(path), question="team", instructions=INSTRUCTIONS,
+                                options=("billing", "technical", "sales")).pipelines()
+    return [Example.of(row["example"]) for row in iterate(pipeline, read="memory",
+        loading=Loading(workers=0))]
 
 
 def test_a_shared_question_is_not_a_repeat_but_a_shared_decision_is(contamination, tmp_path):

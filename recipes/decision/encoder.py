@@ -25,7 +25,7 @@ split and 100 typed-decisions cases. Any `DecisionRunConfig` flag follows;
 """
 
 from dew.config import ObjectiveConfig, OptimConfig, TrainerConfig
-from dew.decision import Brier, DecisionMixture, LogLoss, RankedProbability
+from dew.decision import Brier, Decisions, LogLoss, RankedProbability
 from dew.decision.config import DecisionRunConfig
 from dew.training.optim import Cosine
 
@@ -37,7 +37,7 @@ def run_config() -> DecisionRunConfig:
     """The encoder recipe's run, every value a flag."""
     return DecisionRunConfig(
         pretrained="answerdotai/ModernBERT-large", revision="45bb4654a4d5aaff24dd11d4781fa46d39bf8c13",
-        mixture=DecisionMixture("data/mixture"),
+        data=Decisions("data/mixture"),
         objective=ObjectiveConfig("decision", {"loss": RULES, "label_smoothing": 0.05}),
         optim=OptimConfig(learning_rate=2.5e-5, schedule=Cosine(peak=2.5e-5, warmup_steps=500)),
         trainer=TrainerConfig(batch_size=32, steps=15_000, eval_every=1_000, checkpoint_every=1_000),

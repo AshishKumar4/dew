@@ -14,10 +14,11 @@ autoencoder and convention; `--objective flow_grpo --objective.reward clip_score
 trains the model with Flow-GRPO on that reward instead of the denoising loss.
 """
 
-from dew.data import TFDSImages
+from dew.data import Augment, HoldOut, Images
 from dew.objectives.diffusion import DiffusionRunConfig
 
-FLOWERS = TFDSImages(name="oxford_flowers102", caption_templates=(
+FLOWERS = Images(source="tfds://oxford_flowers102", augment=Augment(flip=True, jitter=True),
+                 validation=HoldOut(records=128), caption_templates=(
     "a photo of a {}", "a photo of a {} flower", "This is a photo of a {}", "This is a photo of a {} flower",
     "A photo of a {} flower"))
 
