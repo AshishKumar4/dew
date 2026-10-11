@@ -290,7 +290,8 @@ def build(args: argparse.Namespace, place: Ranks) -> Run:
     network = model
     if args.parallel == "ddp":
         from torch.nn.parallel import DistributedDataParallel
-        network = DistributedDataParallel(model, device_ids=[place.device.index], gradient_as_bucket_view=True)
+        network = DistributedDataParallel(model, device_ids=[place.device.index],
+                                          gradient_as_bucket_view=True)
     elif args.parallel == "fsdp2":
         from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
         policy = (MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
@@ -311,7 +312,8 @@ def train_step(args: argparse.Namespace, place: Ranks, run: Run, step: int
     micro-batches: the mean cross entropy, the pre-clip gradient norm and the
     weighted balance loss."""
     rows = window_rows(run.order, step, args.batch)[place.rank * run.share:(place.rank + 1) * run.share]
-    tokens = torch.from_numpy(run.windows[rows].astype(np.int64)).pin_memory().to(place.device, non_blocking=True)
+    tokens = torch.from_numpy(run.windows[rows].astype(np.int64)).pin_memory().to(
+        place.device, non_blocking=True)
     step_loss = torch.zeros((), device=place.device)
     step_aux = torch.zeros((), device=place.device)
     routed = run.active > 0
@@ -411,7 +413,8 @@ def record(args: argparse.Namespace, place: Ranks, run: Run, curves: Curves) -> 
     loss_vector = torch.stack(curves.losses)
     if place.distributed:
         dist.all_reduce(loss_vector, op=dist.ReduceOp.AVG)
-    peak = torch.tensor([torch.cuda.max_memory_allocated(place.device), torch.cuda.max_memory_reserved(place.device)],
+    peak = torch.tensor([torch.cuda.max_memory_allocated(place.device),
+                         torch.cuda.max_memory_reserved(place.device)],
                         device=place.device, dtype=torch.float64)
     peaks = [peak]
     if place.distributed:
@@ -431,7 +434,8 @@ def record(args: argparse.Namespace, place: Ranks, run: Run, curves: Curves) -> 
         "precision": args.precision,
         "parallel": args.parallel,
         "world": place.world,
-        "config": {**vars(args), "total_steps": run.total, "schedule_steps": run.schedule_steps, "seq": run.seq,
+        "config": {**vars(args), "total_steps": run.total, "schedule_steps": run.schedule_steps,
+                   "seq": run.seq,
                    "accumulation": run.accumulation, "micro_batch": run.micro,
                    "data_sha256": sha256(args.data), "model_type": hf_config["model_type"],
                    "optimizer": "torch.optim.AdamW(fused=True)",
