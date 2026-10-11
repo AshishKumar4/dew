@@ -582,7 +582,9 @@ def laid_out(batch: Mapping[str, object]) -> DecisionInputs:
                           questions=array("questions"), spans=array("spans"),
                           option_spans=array("option_spans"), options=array("options"),
                           positions=array("positions") if "positions" in batch else None,
-                          slots=array("slots") if "slots" in batch else None)
+                          slots=array("slots") if "slots" in batch else None,
+                          option_slots=array("option_slots") if "option_slots" in batch else None,
+                          slotted=array("slotted") if "slotted" in batch else None)
 
 
 def _bucket(value: int, smallest: int = 64) -> int:
