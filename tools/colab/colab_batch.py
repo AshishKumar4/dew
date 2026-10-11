@@ -167,6 +167,8 @@ def select(device: str, selector: str, hardware: str, order: list[str]) -> list[
             raise ValueError("compile_cache must be on or off")
         if fields.get("wandb", "off") not in ("on", "off"):
             raise ValueError("wandb must be on or off")
+        if fields.get("boundary_control", "off") not in ("on", "off"):
+            raise ValueError("boundary_control must be on or off")
         if fields.get("raw_profiles", "off") not in ("on", "off"):
             raise ValueError("raw_profiles must be on or off")
         if fields.get("profile_steps") and int(fields["profile_steps"]) <= 0:
@@ -190,6 +192,7 @@ def identity(plan: dict) -> dict:
                 "artifact_excludes": job.get("artifact_excludes", []),
                 "data_sources": job.get("data_sources", []),
                 "wandb": job.get("wandb", False),
+                "boundary_control": job.get("boundary_control", False),
                 "raw_profiles": job.get("raw_profiles", False),
                 "profile_steps": job.get("profile_steps"),
                 "profile_analysis_ref": job.get("profile_analysis_ref", TOOL_REF),
@@ -221,6 +224,7 @@ def plan_jobs(chosen: list[dict], device: str, hardware: str, base: str, repo: P
             artifact_excludes=fields.get("artifact_excludes", "").split(),
             compile_cache=fields.get("compile_cache", "off"),
             wandb=fields.get("wandb", "off") == "on",
+            boundary_control=fields.get("boundary_control", "off") == "on",
             raw_profiles=fields.get("raw_profiles", "off") == "on",
             profile_steps=int(fields["profile_steps"]) if fields.get("profile_steps") else None,
             profile_analysis_ref=fields.get("profile_analysis_ref", TOOL_REF),
@@ -254,6 +258,9 @@ def plan_jobs(chosen: list[dict], device: str, hardware: str, base: str, repo: P
                 "wandb": job["wandb"],
             },
         )
+        job["replaceable_scripts"] = [
+            target for _, target in input_paths(fields) if Path(target).suffix in (".py", ".sh")
+        ]
         jobs.append(job)
     return {
         "schema": 1,
