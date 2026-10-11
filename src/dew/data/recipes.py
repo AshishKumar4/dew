@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Annotated, Literal, Protocol, TypeAliasType, r
 import numpy as np
 import tyro
 
-from dew.data.compile import compile
+from dew.data.compile import _preferred_read, compile
 from dew.data.dataset import Batch, DataPhase, Dataset, Loading, Records as IndexedRecords, record_argument
 from dew.data.pipeline import (
     Artifact,
@@ -744,7 +744,7 @@ def load(
     batch: int | None = None,
     tokens: int | None = None,
     lengths: tuple[int, ...] = (),
-    read: Read = "indexed",
+    read: Read | None = "indexed",
     provision: bool = False,
     cache: Cache | Generation | str | None = None,
     validation_records: int | None = None,
@@ -754,7 +754,8 @@ def load(
     host: tuple[HostStep, ...] = (),
     **fields,
 ) -> Dataset:
-    """Resolve a recipe alias and compile its training and evaluation pipelines."""
+    """Resolve a recipe alias and compile its training and evaluation pipelines.
+    With no `read`, the recipe's sources choose it, as `compile` does."""
     if (batch is None) == (tokens is None):
         raise ValueError("load needs exactly one of batch rows or tokens")
     if isinstance(recipe, str):
@@ -777,6 +778,7 @@ def load(
     if not isinstance(recipe, Recipe):
         raise TypeError("load expects a typed recipe with pipelines()")
     train, held, shared = recipe.pipelines()
+    read = read or _preferred_read((train,) if held is None else (train, held))
     if held is not None and validation_records is not None:
         held = held.take(validation_records)
     if cache is not None:

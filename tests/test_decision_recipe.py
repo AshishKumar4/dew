@@ -98,6 +98,15 @@ def _mixture(tmp_path: Path, rows: list[dict], evaluated: list[str], held: int) 
     return out
 
 
+def test_a_decision_mixture_from_its_manifest_reads_by_index_by_default(tmp_path):
+    """The produced mixture states an offset index for each set, so a run that
+    states no read reads it by index rather than loading it whole."""
+    mixture = _mixture(tmp_path, _requests(24, joint=False), [], held=4)
+    loaded = load(Decisions(str(mixture)), batch=4, read=DecisionRunConfig.data_read,
+                  loading=Loading(workers=0))
+    assert loaded.plan is not None and loaded.plan.order["read"] == "indexed"
+
+
 def _flags(mixture: Path, runs: Path) -> list[str]:
     return ["--data.source", str(mixture), "--trainer.name", "run", "--trainer.checkpoint-dir", str(runs),
             "--trainer.batch-size", "8", "--trainer.steps", "2", "--trainer.eval-every", "2",
