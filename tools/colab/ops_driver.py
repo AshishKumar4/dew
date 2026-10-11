@@ -298,8 +298,11 @@ class Driver:
     def boundary_ack(self, session: Session, remote: str, job: dict) -> None:
         directory = remote + f"/job-{job['index']}/boundary"
         try:
-            ready = json.loads(colab_io.content_bytes(colab_io.contents(session, directory + "/ready.json", content=True)))
+            ready = json.loads(
+                colab_io.content_bytes(colab_io.contents(session, directory + "/ready.json", content=True))
+            )
         except FileNotFoundError:
+            self.record(boundary_waiting_job=job["index"])
             return
         acknowledgments = self.state.get("boundary_snapshots", {})
         if ready["request_id"] in acknowledgments:
@@ -308,9 +311,11 @@ class Driver:
             self.record(boundary_needs_attention=ready)
             return
         acknowledgments[ready["request_id"]] = {**ready, "snapshot_acknowledged": True, "at": time.time()}
-        script = (f"import sys\nsys.path.insert(0,{remote!r})\nfrom tools.colab.common import save\n"
-                  f"from pathlib import Path\nsave(Path({directory + '/snapshot-ack.json'!r}),"
-                  f"{acknowledgments[ready['request_id']]!r})\n")
+        script = (
+            f"import sys\nsys.path.insert(0,{remote!r})\nfrom tools.colab.common import save\n"
+            f"from pathlib import Path\nsave(Path({directory + '/snapshot-ack.json'!r}),"
+            f"{acknowledgments[ready['request_id']]!r})\n"
+        )
         self.control(session, script)
         self.record(boundary_snapshots=acknowledgments)
 

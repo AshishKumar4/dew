@@ -246,8 +246,9 @@ def plan_jobs(chosen: list[dict], device: str, hardware: str, base: str, repo: P
                 "wandb": job["wandb"],
             },
         )
-        job["replaceable_scripts"] = [target for _, target in input_paths(fields)
-                                      if Path(target).suffix in (".py", ".sh")]
+        job["replaceable_scripts"] = [
+            target for _, target in input_paths(fields) if Path(target).suffix in (".py", ".sh")
+        ]
         jobs.append(job)
     return {
         "schema": 1,

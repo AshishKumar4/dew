@@ -1,4 +1,5 @@
 """Cooperative experiment boundaries, owned by one unchanged VM job budget."""
+
 import hashlib
 import os
 import time
@@ -23,8 +24,14 @@ def checkpoint(name: str) -> None:
     request = read(directory / "request.json")
     if request.get("after") != name or request.get("generation") != generation:
         return
-    ready = {"name": name, "generation": generation, "request_id": request["request_id"],
-             "pid": os.getpid(), "ready_at": time.time(), "state": "quiescent"}
+    ready = {
+        "name": name,
+        "generation": generation,
+        "request_id": request["request_id"],
+        "pid": os.getpid(),
+        "ready_at": time.time(),
+        "state": "quiescent",
+    }
     save(directory / "ready.json", ready)
     while True:
         decision = read(directory / "decision.json")
@@ -48,8 +55,11 @@ def validate_replacement(job: dict, decision: dict, directory: Path, generation:
     for file in decision.get("files", []):
         staged = Path(file["staged"])
         target = file["target"]
-        if (".." in staged.parts or not staged.resolve().is_relative_to((directory / "inputs").resolve())
-                or staged.is_symlink()):
+        if (
+            ".." in staged.parts
+            or not staged.resolve().is_relative_to((directory / "inputs").resolve())
+            or staged.is_symlink()
+        ):
             raise ValueError("replacement file escapes owned boundary inputs")
         if target not in targets or Path(target).suffix not in (".py", ".sh"):
             raise ValueError("replacement may change only declared script inputs")
@@ -71,7 +81,9 @@ def run(job: dict, home: Path, tree: Path, env: dict, timeout: float, run_logged
         if remaining <= 0:
             return "job timeout, including all boundary generations"
         child_env = {**env, "DEW_COLAB_BOUNDARY_DIR": str(directory), "DEW_COLAB_GENERATION": str(generation)}
-        code = run_logged(["bash", "-c", command], home / "run.log", cwd=tree, env=child_env, timeout=remaining)
+        code = run_logged(
+            ["bash", "-c", command], home / "run.log", cwd=tree, env=child_env, timeout=remaining
+        )
         if code != REPLACED:
             return code
         ready, decision = read(directory / "ready.json"), read(directory / "decision.json")
@@ -89,9 +101,18 @@ def run(job: dict, home: Path, tree: Path, env: dict, timeout: float, run_logged
         for file in decision.get("files", []):
             os.replace(file["staged"], file["target"])
         command = decision["command"]
-        lineage.append({"at": time.time(), "after": ready["name"], "generation": generation,
-                        "old_command_sha256": old, "new_command_sha256": hashlib.sha256(command.encode()).hexdigest(),
-                        "files": [{"target": file["target"], "sha256": file["sha256"]} for file in decision.get("files", [])]})
+        lineage.append(
+            {
+                "at": time.time(),
+                "after": ready["name"],
+                "generation": generation,
+                "old_command_sha256": old,
+                "new_command_sha256": hashlib.sha256(command.encode()).hexdigest(),
+                "files": [
+                    {"target": file["target"], "sha256": file["sha256"]} for file in decision.get("files", [])
+                ],
+            }
+        )
         generation += 1
         update(boundary_lineage=lineage, generation=generation)
         (directory / "ready.json").unlink()
