@@ -123,16 +123,14 @@ def _preferred_read(pipelines: Sequence[Pipeline]) -> Read:
     a store that reads by index, and streamed otherwise. A mixture takes the
     least eager of its corpora's choices."""
     chosen: list[Read] = []
-    for leaf in (leaf for pipeline in pipelines for leaf in _leaves(pipeline)):
-        if isinstance(leaf.source, (Mixture, Phases)):
-            continue
-        held = leaf.source
+    for source in (source for pipeline in pipelines for _, source in _leaves(pipeline)):
+        held = source
         while isinstance(held, _Wrapping):
             held = held.source
         if isinstance(held, Memory):
             chosen.append("memory")
         else:
-            chosen.append("indexed" if leaf.source.supports("indexed") else "streamed")
+            chosen.append("indexed" if source.supports("indexed") else "streamed")
     return max(chosen, key=READS.index)
 
 
@@ -147,12 +145,14 @@ def _until(stages: Sequence[Stage], kinds: type | tuple[type, ...]) -> int:
     return len(stages) if at is None else at
 
 
-def _leaves(pipeline: Pipeline) -> Iterator[Pipeline]:
-    if isinstance(pipeline.source, (Mixture, Phases)):
-        for child in pipeline.source.pipelines:
+def _leaves(pipeline: Pipeline) -> Iterator[tuple[Pipeline, Source]]:
+    """Each corpus under a pipeline's mixtures and phases, with the source it reads."""
+    source = pipeline.source
+    if isinstance(source, (Mixture, Phases)):
+        for child in source.pipelines:
             yield from _leaves(child)
     else:
-        yield pipeline
+        yield pipeline, source
 
 
 def _steps(pipeline: Pipeline) -> Iterator[Stage]:
@@ -195,16 +195,12 @@ def _cache_manifest(source: Source, prefix: Sequence[Stage], read: Read) -> Mani
 
 
 def _cache_references(pipeline: Pipeline, read: Read) -> tuple[str, ...]:
-    references = []
-    for leaf in _leaves(pipeline):
-        if isinstance(leaf.source, (Mixture, Phases)):
-            continue
-        for index, stage in enumerate(leaf.stages):
-            if isinstance(stage, Artifact):
-                references.append(
-                    stage.cache.reference(_cache_manifest(leaf.source, leaf.stages[:index], read))
-                )
-    return tuple(references)
+    return tuple(
+        stage.cache.reference(_cache_manifest(source, leaf.stages[:index], read))
+        for leaf, source in _leaves(pipeline)
+        for index, stage in enumerate(leaf.stages)
+        if isinstance(stage, Artifact)
+    )
 
 
 def _promoted(pipeline: Pipeline) -> Pipeline:
@@ -424,12 +420,7 @@ def _checked(
 
 
 def _capabilities(pipelines: Sequence[Pipeline], read: Read, provision: bool) -> None:
-    sources = [
-        leaf.source
-        for pipeline in pipelines
-        for leaf in _leaves(pipeline)
-        if not isinstance(leaf.source, (Mixture, Phases))
-    ]
+    sources = [source for pipeline in pipelines for _, source in _leaves(pipeline)]
     with ThreadPoolExecutor(max_workers=min(8, max(1, len(sources)))) as readers:
         supported = tuple(readers.map(lambda source: source.supports(read), sources))
     missing = [source for source, available in zip(sources, supported, strict=True) if not available]
@@ -487,12 +478,7 @@ class _Facts:
 
 
 def _pin_sources(pipelines: Sequence[Pipeline], read: Read) -> tuple[Pipeline, ...]:
-    sources = {
-        id(leaf.source): leaf.source
-        for branch in pipelines
-        for leaf in _leaves(branch)
-        if not isinstance(leaf.source, (Mixture, Phases))
-    }
+    sources = {id(source): source for branch in pipelines for _, source in _leaves(branch)}
 
     def pin(source: Source) -> _Facts:
         if isinstance(source, _Facts):
@@ -519,10 +505,8 @@ def _pin_sources(pipelines: Sequence[Pipeline], read: Read) -> tuple[Pipeline, .
 def _tokenizer_contract(pipelines: Sequence[Pipeline]) -> None:
     declared: dict[str, JSON] = {}
     for pipeline in pipelines:
-        for leaf in _leaves(pipeline):
-            if isinstance(leaf.source, (Mixture, Phases)):
-                continue
-            metadata = leaf.source.metadata()
+        for leaf, source in _leaves(pipeline):
+            metadata = source.metadata()
             for key in ("tokenizer", "vocab_size", "eos_id", "tokenizer_revision"):
                 if key not in metadata:
                     continue
@@ -1548,10 +1532,7 @@ def _budget_rows(budget: TokenBudget) -> int:
 
 def _derived(pipeline: Pipeline, seed: int, read: Read) -> Mapping[str, str]:
     arrays: dict[str, str] = {}
-    for index, leaf in enumerate(_leaves(pipeline)):
-        source = leaf.source
-        if isinstance(source, (Mixture, Phases)):
-            continue
+    for index, (leaf, source) in enumerate(_leaves(pipeline)):
         if isinstance(source, _Memory):
             arrays.update({f"{index}/{key}": value for key, value in source.derived.items()})
         lengths = source.lengths()
@@ -1612,11 +1593,7 @@ def _prepared(
         )
     if any(isinstance(stage, Configured) for branch in branches for stage in _steps(branch)):
         def stored(branch: Pipeline) -> bool:
-            return any(
-                len(leaf.source.records(read))
-                for leaf in _leaves(branch)
-                if not isinstance(leaf.source, (Mixture, Phases))
-            )
+            return any(len(source.records(read)) for _, source in _leaves(branch))
 
         if training and read == "memory" and not stored(branches[0]):
             raise ValueError(f"no accepted rows of {_name(branches[0])}; source is empty")
@@ -1736,13 +1713,7 @@ def _compiled(
         build.global_order,
     )
     manifest = Manifest.of(
-        {
-            "sources": [
-                leaf.source.snapshot()
-                for leaf in _leaves(original)
-                if not isinstance(leaf.source, (Mixture, Phases))
-            ]
-        },
+        {"sources": [source.snapshot() for _, source in _leaves(original)]},
         (
             *(_identity(stage) for stage in _steps(original) if not isinstance(stage, (Workers, Prefetch))),
             *(StepIdentity.of(step) for step in host),
@@ -1790,11 +1761,7 @@ def _compiled(
         raise ValueError(f"corpus {_name(train)} has no accepted rows")
     if records is not None and records < batch:
         raise ValueError(f"corpus {_name(train)} has {records} records, fewer than one batch of {batch}")
-    held_out = sum(
-        integer(leaf.source.metadata().get("held_out", 0), "held_out")
-        for leaf in _leaves(train)
-        if not isinstance(leaf.source, (Mixture, Phases))
-    )
+    held_out = sum(integer(source.metadata().get("held_out", 0), "held_out") for _, source in _leaves(train))
     return Dataset(
         training,
         held_reader,
@@ -2137,10 +2104,7 @@ def _metadata(pipelines: Sequence[Pipeline], read: Read) -> Mapping[str, object]
     combined: Batch = {}
     slots: dict[str, int] = {}
     for pipeline in pipelines:
-        for leaf in _leaves(pipeline):
-            source = leaf.source
-            if isinstance(source, (Mixture, Phases)):
-                continue
+        for _, source in _leaves(pipeline):
             if isinstance(source, _Memory) and not source.held:
                 continue
             facts = source.metadata()
