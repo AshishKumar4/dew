@@ -558,7 +558,7 @@ def gated_product(activation: GatedActivation, *, implementation: str = 'auto'
 
     def product(gate: jax.Array, up: jax.Array) -> jax.Array:
         if activation == 'swiglu' and norm_swiglu.swiglu_kernel(implementation, gate, up) == 'pallas':
-            return norm_swiglu.swiglu(gate, up, jax.default_backend() == 'cpu')
+            return norm_swiglu.swiglu(gate, up)
         if jnp.finfo(jnp.result_type(gate, up)).bits >= 32:
             return activate(gate) * up
         return rounded_product(gate, up)
