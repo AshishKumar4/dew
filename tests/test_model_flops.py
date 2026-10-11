@@ -373,15 +373,20 @@ def convolution_tap(equation, producers):
     """
     if len(equation.outvars[0].aval.shape) != 3:
         return False
+    tapped = shifted = False
     for variable in equation.invars:
+        if isinstance(variable, jaxpr_core.Literal):
+            continue
         source = producers.get(variable)
         while source is not None and source.primitive.name in ("broadcast_in_dim", "convert_element_type"):
             source = producers.get(source.invars[0])
         if source is not None and source.primitive.name == "slice":
             original, selected = source.invars[0].aval.shape, source.outvars[0].aval.shape
             if len(original) == 2 and original[1] > 1 and selected == (original[0], 1):
-                return True
-    return False
+                tapped = True
+            if len(original) == 3 and original[:2] == selected[:2] and original[-1] > selected[-1]:
+                shifted = True
+    return tapped and shifted
 
 
 @pytest.mark.parametrize("family", ["decoder", "loop", "mlp", "attention", "dit", "jepa"])
