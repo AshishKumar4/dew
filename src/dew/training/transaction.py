@@ -406,7 +406,8 @@ class Transaction:
             numerical = _chosen(due, committed, numerical)
             native_finite = native_finite | ~due
         else:
-            zero = jnp.asarray(0., jnp.result_type(*jax.tree.leaves(state.variables["params"]), jnp.float32))
+            dtype = jnp.result_type(*jax.tree.leaves(state.variables["params"]), jnp.float32)
+            zero = jnp.real(jnp.zeros((), dtype))
             numerical, native_finite, norm = jax.lax.cond(
                 due, commit, lambda x: (x, jnp.asarray(a=True), zero), numerical)
         finite = finite & native_finite
