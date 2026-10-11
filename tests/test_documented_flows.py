@@ -76,7 +76,7 @@ def test_the_diffusion_flow_trains_restores_and_samples(tmp_path):
                          "fields": {"name": "dew_images", "path": str(IMAGES), "split": "all"}})
     step(tmp_path, str(ROOT / "recipes" / "diffusion" / "train.py"), "data:images",
          "--data.source", source, "--data.image-size", "8",
-         "--data.validation", "null", "--loading.workers", "0", "--loading.threads", "1",
+         "--data.validation", "None", "--loading.workers", "0", "--loading.threads", "1",
          "--loading.read-buffer", "2", "preset:flow", "--objective.solver", '{"class": "euler"}',
          "--objective.guidance", "None",
          "--text.encoder", "char_table", "--text.checkpoint", "char_table",

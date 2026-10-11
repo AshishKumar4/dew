@@ -54,7 +54,7 @@ class Config:
     dataset: str = "hf://datasets/allenai/tulu-3-sft-mixture"
     """A Hub source URL, Parquet file or JSONL conversations."""
     data_read: Read = "memory"
-    """Materialize rendering and packing; choose indexed or streamed only with producer metadata."""
+    """Materialize rendering and packing so four workers can share even one physical source shard."""
     split: str = "train"
     column: str = "messages"
     out: Path = Path("runs/gemma4-sft")
