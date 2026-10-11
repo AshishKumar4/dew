@@ -8,11 +8,13 @@ from typing import TYPE_CHECKING, Protocol, Self, runtime_checkable
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from flax import linen as nn, struct
 from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_stack import DecoderBank
+from dew.nn.flops import MissingFlopsCount, counted_flops, parameter_flops
 from dew.nn.protocols import OutputTable, ProjectionGroup
 from dew.nn.sharding import explicit_spec
 from dew.nn.vision import Gemma3nVision, ProjectorBase, TowerBase
@@ -204,6 +206,31 @@ class MultimodalTransformer(nn.Module):
     audio_soft_tokens: int | None = None
     dtype: Dtype | None = None
     precision: PrecisionLike = None
+
+    @nn.nowrap
+    def model_flops(self, lengths) -> float:
+        """Text-only decoder work. Media inputs require their own tower geometry."""
+        if self.audio is not None:
+            raise MissingFlopsCount("MultimodalTransformer needs its hard-audio-vocabulary matrix geometry")
+        return counted_flops(self.language_model, lengths)
+
+    @nn.nowrap
+    def parameter_flops(self, lengths) -> float:
+        return parameter_flops(self.language_model, lengths)
+
+    @nn.nowrap
+    def logits_flops(self, lengths) -> float:
+        return self.language_model.logits_flops(lengths)
+
+    @nn.nowrap
+    def matrix_usage(self, path: tuple[str, ...], lengths, *, logits: bool = False):
+        """The same native language scope the wrapper actually invokes without media."""
+        relative = path[1:] if path and path[0] == 'params' else path
+        if relative and relative[0] == 'language_model':
+            return self.language_model.matrix_usage(relative[1:], lengths, logits=logits)
+        if relative and relative[0] in ('conditioner', 'audio_conditioner'):
+            return np.zeros(np.shape(lengths), np.int64)
+        raise MissingFlopsCount(f"MultimodalTransformer has no matrix usage for {'/'.join(relative)}")
 
     def setup(self):
         self.conditioner = VisionConditioner(

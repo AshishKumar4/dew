@@ -56,6 +56,7 @@ if TYPE_CHECKING:
     from dew.records import JSON
 
 __all__ = ["AffineHead", "BlockDenoiser", "CacheCapacity", "Counted", "CountedImages", "CountedLogits",
+           "CountedMatrixUsage", "CountedParameters", "CountedTraining",
            "DecoderTraining", "DenoisingModel",
            "HiddenStates", "IntervalModel", "LayerScalars", "Logits", "LogitsFromHidden", "Looping",
            "ModelKwarg", "OutputTable", "ProjectionGroup", "Recomputing", "RematChoosing", "RequiresText",
@@ -102,6 +103,35 @@ class Counted(Protocol):
     """
 
     def model_flops(self, lengths: np.ndarray) -> float: ...
+
+
+@runtime_checkable
+class CountedParameters(Protocol):
+    """Forward work of learned matrix maps, separately from state/attention MACs.
+
+    An adapter freezes these base matrices: their training work is twice
+    forward work, while its trainable factors cost three times their own
+    forward work. Nonparameter attention/state contractions remain separate.
+    """
+
+    def parameter_flops(self, lengths: np.ndarray) -> float: ...
+
+
+@runtime_checkable
+class CountedMatrixUsage(Protocol):
+    """A model's declared call geometry for an adapted native matrix path."""
+
+    def matrix_usage(self, path: tuple[str, ...], lengths: np.ndarray, *,
+                      logits: bool = False) -> np.ndarray: ...
+
+
+@runtime_checkable
+class CountedTraining(Protocol):
+    """An adapted token model's training work, including its factors, not 3*forward."""
+
+    def training_flops(self, lengths: np.ndarray) -> float: ...
+
+    def logits_training_flops(self, lengths: np.ndarray) -> float: ...
 
 
 @runtime_checkable

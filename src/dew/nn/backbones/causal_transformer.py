@@ -30,6 +30,7 @@ from typing import Literal, Self
 import flax.core
 import jax
 import jax.numpy as jnp
+import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
@@ -44,7 +45,7 @@ from ..deepseek_v4 import DeepseekV4Mixer
 from ..dsa_kpool import KPoolSparseAttentionMixer
 from ..dspark import DSpark, DSparkStage, draft as dspark_draft
 from ..engram import Engram, EngramHashes, EngramLayer
-from ..flops import MissingFlopsCount, counted_flops, projection_flops
+from ..flops import MissingFlopsCount, counted_flops, parameter_flops, projection_flops
 from ..gemma3n import AltUp, rescale_to
 from ..gemma4_moe import Gemma4Experts
 from ..gpt_oss import GptOssMLP
@@ -931,6 +932,46 @@ class CausalTransformer(nn.Module):
         if self.head_transform is not None:
             count += projection_flops(lengths, self.emb_features, self.emb_features)
         return count
+
+    @nn.nowrap
+    def parameter_flops(self, lengths) -> float:
+        """Learned base matrices, separately from nonparameter attention/state work."""
+        if any(value is not None for value in (self.altup, self.hyper_connections, self.attention_residuals)):
+            raise MissingFlopsCount("CausalTransformer needs its multi-stream parameter geometry for PEFT")
+        types = self.per_layer_types
+        kinds = self.layer_kinds(types)
+        mixer = self.mixer if self.mixer is not None else AttentionMixer()
+        specs = self._layer_specs(types, kinds, mixer)
+        factories = self.feedforward_factories()
+        first, end = ((0, self.num_layers) if self.loop is None or self.loop.layers is None
+                      else self.loop.layers)
+        count = 0.0
+        for index in range(self.num_layers):
+            block = self._block(specs, mixer, factories, BlockWiring(), index, f'layers_{index}')
+            passes = self.loop.steps if self.loop is not None and first <= index < end else 1
+            count += passes * parameter_flops(block, lengths)
+        if self.per_layer_input_dim:
+            count += projection_flops(lengths, self.emb_features, self.num_layers * self.per_layer_input_dim)
+        if self.loop is not None and self.loop.exit_gate:
+            count += self.loop.steps * projection_flops(lengths, self.emb_features, 1)
+        return count
+
+    @nn.nowrap
+    def matrix_usage(self, path: tuple[str, ...], lengths, *, logits: bool = False):
+        """Native matrix scopes declare head versus trunk work and repeated loop passes."""
+        relative = path[1:] if path and path[0] == 'params' else path
+        if not relative:
+            raise MissingFlopsCount("CausalTransformer adapter matrix has no native scope")
+        head = relative[0] in ('lm_head', 'head_dense')
+        if head != logits or relative[0].startswith(('mtp_', 'dspark_')):
+            return np.zeros(np.shape(lengths), np.int64)
+        passes = 1
+        if self.loop is not None and relative[0].startswith('layers_'):
+            layer = int(relative[0].removeprefix('layers_'))
+            first, end = (0, self.num_layers) if self.loop.layers is None else self.loop.layers
+            if first <= layer < end:
+                passes = self.loop.steps
+        return np.asarray(lengths) * passes
 
     def setup(self):
         """Build the embeddings, the layers, the prediction depths `mtp`, the final
