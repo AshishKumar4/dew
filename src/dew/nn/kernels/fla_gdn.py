@@ -43,7 +43,9 @@ _SM80_BF16 = {
     "chunk_fwd_o": {"bk": 128, "bv": 128, "warps": 8, "stages": 3},
     "chunk_bwd_dv_local": {"bk": 64, "bv": 64, "warps": 2, "stages": 3},
     "chunk_bwd_dhu": {"bv": 32, "warps": 4, "stages": 3},
-    "chunk_bwd_dqkwg": {"bk": 64, "bv": 64, "warps": 4, "stages": 2},
+    # One stage: its loop over a key head's value heads holds every block of a head, and a second
+    # stage stages the next head's whole, past an RTX's 99 KB at the 9B's two heads a key.
+    "chunk_bwd_dqkwg": {"bk": 64, "bv": 64, "warps": 4, "stages": 1},
     "prepare_wy_repr_bwd": {"bk": 64, "bv": 64, "warps": 4, "stages": 2},
 }
 _SM80_FP32 = {**_SM80_BF16,
@@ -643,50 +645,51 @@ def _state_inner_product(memory, memory_grad):
 def _dqkwg_kernel(q_ref, k_ref, v_ref, g_ref, h_ref, do_ref, dh_ref, dv_ref, dq_ref, dk_ref, dw_ref,
                   dg_ref, *, scale: float, bv: int, exact: bool):
     """fla's `chunk_bwd_kernel_dqkwg` (fla/ops/common/chunk_o.py:159-331) for one chunk of one key
-    head and `BK` key columns, over the value heads it serves in turn and their value columns `bv` at
-    a time: `ds = do v^T`, `dq = do h^T`, `dk = v dh^T`, `dw = -dv h^T` and `sum(h dh)`; the gates,
-    `ds`'s causal mask, `dq += ds k`, `dk += ds^T q` and the decay's gradient, its last row taking the
-    memory's. Each product is gated as it lands, so `dq` and `dk` accumulate over the value heads in
-    fp32 and round to their dtype once, where fla rounds each value head's and sums them after."""
-    size = q_ref.shape[0]
+    head and `BK` key columns, over the value heads it serves in turn: over the value columns `bv` at
+    a time, `ds = do v^T`, `dq = do h^T`, `dk = v dh^T`, `dw = -dv h^T` and `sum(h dh)`; then the
+    gates, `ds`'s causal mask, `dq += ds k`, `dk += ds^T q` and the decay's gradient, its last row
+    taking the memory's. The value heads' `dq` and `dk` sum in fp32 and round to their dtype once,
+    where fla rounds each value head's and sums them after. The heads are a loop, not unrolled, so a
+    program holds one head's accumulators at a time."""
+    size, width = q_ref.shape
     queries, keys = q_ref[...], k_ref[...]
-    wide_queries, wide_keys = queries.astype(jnp.float32), keys.astype(jnp.float32)
     index = jnp.arange(size)
     causal = index[:, None] >= index[None, :]
-    dq = jnp.zeros(queries.shape, jnp.float32)
-    dk = jnp.zeros(keys.shape, jnp.float32)
-    for head in range(v_ref.shape[1]):
-        gate = g_ref[:, head].astype(jnp.float32)
-        last = g_ref[size - 1, head].astype(jnp.float32)
-        read = jnp.exp2(gate)[:, None] * scale
-        kept = jnp.exp2(last - gate)[:, None]
+
+    def head_grads(head, sums):
         ds = jnp.zeros((size, size), jnp.float32)
-        dw = jnp.zeros(queries.shape, jnp.float32)
-        dg = jnp.zeros((size,), jnp.float32)
+        dq = jnp.zeros((size, width), jnp.float32)
+        dk = jnp.zeros((size, width), jnp.float32)
+        dw = jnp.zeros((size, width), jnp.float32)
         dg_last = jnp.zeros((), jnp.float32)
         for block in range(v_ref.shape[-1] // bv):
             columns = pl.ds(block * bv, bv)
             value, out_grad = v_ref[:, head, columns], do_ref[:, head, columns]
             local = dv_ref[:, head, columns]
             memory, memory_grad = h_ref[head, :, columns], dh_ref[head, :, columns]
-            dg_last += _state_inner_product(memory, memory_grad) * jnp.exp2(last)
+            dg_last += _state_inner_product(memory, memory_grad)
             ds += _dot(out_grad, value.T, exact=exact)
-            from_memory = _dot(out_grad, memory.T.astype(out_grad.dtype), exact=exact) * read
-            to_memory = _dot(value, memory_grad.T.astype(value.dtype), exact=exact) * kept
-            dg_last += jnp.sum(to_memory * wide_keys)
-            dg += jnp.sum(from_memory * wide_queries, axis=1) - jnp.sum(to_memory * wide_keys, axis=1)
-            dq += from_memory
-            dk += to_memory
+            dq += _dot(out_grad, memory.T.astype(out_grad.dtype), exact=exact)
+            dk += _dot(value, memory_grad.T.astype(value.dtype), exact=exact)
             dw += _dot(local.astype(value.dtype), memory.T.astype(value.dtype), exact=exact)
         dw_ref[:, head, :] = (-dw).astype(dw_ref.dtype)
+        gate = g_ref[:, head].astype(jnp.float32)
+        last = g_ref[size - 1, head].astype(jnp.float32)
+        dg_last = dg_last * jnp.exp2(last)
+        dq = dq * jnp.exp2(gate)[:, None] * scale
+        dk = dk * jnp.exp2(last - gate)[:, None]
+        dg_last += jnp.sum(dk * keys.astype(jnp.float32))
         ds = jnp.where(causal, ds * jnp.exp2(gate[:, None] - gate[None, :]), 0.0) * scale
         ds = ds.astype(keys.dtype)
-        from_scores = _dot(ds, keys, exact=exact)
-        to_scores = _dot(ds.T, queries, exact=exact)
-        dg += jnp.sum(from_scores * wide_queries, axis=1) - jnp.sum(to_scores * wide_keys, axis=1)
-        dq += from_scores
-        dk += to_scores
+        dq += _dot(ds, keys, exact=exact)
+        dk += _dot(ds.T, queries, exact=exact)
+        dg = (jnp.sum(dq * queries.astype(jnp.float32), axis=1)
+              - jnp.sum(dk * keys.astype(jnp.float32), axis=1))
         dg_ref[:, head] = jnp.where(index < size - 1, dg, dg + dg_last)
+        return sums[0] + dq, sums[1] + dk
+
+    zeros = jnp.zeros((size, width), jnp.float32)
+    dq, dk = jax.lax.fori_loop(0, v_ref.shape[1], head_grads, (zeros, zeros))
     dq_ref[...] = dq.astype(dq_ref.dtype)
     dk_ref[...] = dk.astype(dk_ref.dtype)
 
