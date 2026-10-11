@@ -31,6 +31,7 @@ from dew.nn.flops import MissingFlopsCount, attention_flops, projection_flops, r
 from dew.nn.inputs import AttentionMetadata
 from dew.nn.mixer_base import MixerContext
 from dew.nn.mixers import AttentionMixer
+from dew.nn.precision import at_least_fp32
 from dew.nn.scatter import DROPPED
 from dew.records import JSON
 
@@ -165,7 +166,8 @@ class DecisionHead(Head):
                 raise TypeError("the head's blocks carry one plain residual stream")
         marked = jnp.take_along_axis(x, inputs.markers[:, 0, :, None], axis=1)
         hidden = gelu_exact_torch(self.scorer_hidden(self.scorer_norm(marked)))
-        return self.scorer_out(hidden)[:, None, :, 0].astype(jnp.float32)
+        scores = self.scorer_out(hidden)[:, None, :, 0]
+        return scores.astype(at_least_fp32(scores.dtype))
 
 
 # Clef numbers its type embedding noul 0, choice 1, score 2
@@ -411,7 +413,8 @@ class JointSchemaHead(Head):
         features = jnp.concatenate([repeated, options, repeated * options, jnp.abs(repeated - options)], -1)
         residual = self.scorer_out(gelu_exact_torch(self.scorer_hidden(features)))[..., 0]
         joint = jnp.exp(jnp.minimum(self.joint_logit_scale, math.log(100.0))) * cosine + residual
-        return _laid_back((prior + jax.nn.sigmoid(self.residual_gate) * joint).astype(jnp.float32), inputs)
+        scores = prior + jax.nn.sigmoid(self.residual_gate) * joint
+        return _laid_back(scores.astype(at_least_fp32(scores.dtype)), inputs)
 
 
 def decision_geometry(lengths, questions, options):

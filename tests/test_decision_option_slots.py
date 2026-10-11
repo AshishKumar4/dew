@@ -16,7 +16,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import FACTOR, distance
+from reference_error import FACTOR, distance, widened
 from safetensors.numpy import load_file
 
 from dew.data import DataPartition
@@ -150,36 +150,31 @@ def test_a_ragged_batch_trains_on_compacted_options_as_on_the_grid():
 
     (grid, grid_gradient), (fewer, fewer_gradient) = (jax.value_and_grad(loss)(variables, rows)
                                                       for rows in (batch, slotted))
-    # Float64 truth: the grid's step in float64. The compacted step is held
-    # to it as the grid is, per tensor (tests/reference_error.py): no looser
-    # rule for the head than for any other port.
+    # Float64 truth: the grid's step in float64 (the head and its scoring rule
+    # keep a float64 input's dtype). The compacted step is held to it as the
+    # grid is, per tensor (tests/reference_error.py).
     with jax.enable_x64(new_val=True):
-        wide = jax.tree.map(lambda leaf: leaf.astype(jnp.float64)
-                            if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf, (variables, batch))
-        truth, truth_gradient = jax.value_and_grad(loss)(*wide)
+        truth, truth_gradient = jax.value_and_grad(loss)(*widened((variables, batch)))
         truth, truth_gradient = float(truth), jax.tree.map(np.asarray, truth_gradient)
-    # Each tensor is held to float64 as the grid's is, within FACTOR. The
-    # compaction reorders the sums over the grid's option slots, whose float32
-    # rounding grows as the square root of their count in RMS, so the grid's
-    # own distance is taken as at least that many units of the tensor's size:
-    # one draw of rounding below it is luck, not a bar, and a gradient that
-    # vanished still fails by orders of magnitude. A gradient zero to
-    # float32's resolution of the step (a key bias's, which softmax cancels)
-    # holds only rounding on either path and stays at that resolution.
+    # The compaction reorders the sums over the grid's option slots, whose
+    # float32 rounding grows as the square root of their count in RMS, so the
+    # grid's own distance is taken as at least that many units of the
+    # tensor's size: one draw of rounding below it is luck, not a bar.
     slots = options.shape[1] * options.shape[2]
     unit = float(np.finfo(np.float32).eps)
-    floor = unit * max(distance(leaf, 0) for leaf in jax.tree.leaves(truth_gradient))
+    rows = []
 
     def exact(path, got, want, true):
-        label, mine = jax.tree_util.keystr(path), distance(got, true)
-        if distance(true, 0) <= floor:
-            assert mine <= floor, (label, mine, floor)
-            return
         bar = FACTOR * max(distance(want, true), np.sqrt(slots) * unit * distance(true, 0))
-        assert mine <= bar, f"{label}: {mine:.3e} from float64 (rms), allowed {bar:.3e}"
+        rows.append((jax.tree_util.keystr(path), distance(true, 0), distance(want, true),
+                     distance(got, true), bar))
 
     exact((), float(fewer), float(grid), truth)
     jax.tree_util.tree_map_with_path(exact, fewer_gradient, grid_gradient, truth_gradient)
+    for row in rows:
+        print("ROW %s truth=%.3e grid=%.3e fewer=%.3e bar=%.3e ratio=%.2f" % (*row, row[3] / row[4]))
+    over = [row for row in rows if row[3] > row[4]]
+    assert not over, over
 
     # Whatever the head gives a slot with no real option, the loss and its
     # gradients are the same bits: the model's logits mask those slots.
