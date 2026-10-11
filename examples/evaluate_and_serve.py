@@ -42,6 +42,7 @@ import dew
 from dew.artifacts import uint8_pixels
 from dew.config import ModelConfig, OptimConfig, TrainerConfig
 from dew.data import ByteTokenizer, Loading, Text, load
+from dew.data.sources.files import TokenFiles
 from dew.eval import FID, CLIPScore
 from dew.inference import RunProcessor, TextGeneration, TextToImage
 from dew.nn.backbones import CausalTransformer
@@ -112,7 +113,7 @@ def smoke_run(out: Path) -> tuple[Path, Path]:
                               attention_impl="reference")
     run = LMRunConfig(
         model=ModelConfig.from_model(model),
-        data=Text(source=str(tokens), seq_len=32),
+        data=Text(source=str(tokens), validation=TokenFiles(str(tokens), split="val"), seq_len=32),
         loading=Loading(workers=0, threads=1, read_buffer=2, worker_buffer=1),
         max_new_tokens=8,
         optim=OptimConfig(learning_rate=1e-3),
@@ -135,7 +136,8 @@ def perplexity(task: TextGeneration, config: Config) -> dict[str, float]:
     """
     if config.tokens is None:
         return {}
-    data = load(Text(source=str(config.tokens), seq_len=config.sequence_length),
+    data = load(Text(source=str(config.tokens), validation=TokenFiles(str(config.tokens), split="val"),
+                     seq_len=config.sequence_length),
                 batch=config.batch_size, read="memory", validation_records=4 * config.batch_size,
                 loading=Loading(workers=0))
     if data.val is None:
