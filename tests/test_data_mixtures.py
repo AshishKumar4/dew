@@ -1026,8 +1026,6 @@ def test_a_batch_the_row_shards_cannot_split_is_refused_before_it_is_placed():
     refused before a batch is placed or anything compiles, naming the row
     shards and a batch that splits over them, where placing the batch raised
     jax's own error about a sharding that does not divide a dimension."""
-    from dew.nn.sharding import LayoutRefused
-
     trainer = Trainer(Regression(), optax.sgd(0.5), key=jax.random.key(0),
                       layout=Layout(min_shard=1, tolerance=1.0))
 
