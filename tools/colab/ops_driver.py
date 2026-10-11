@@ -43,10 +43,11 @@ class Driver:
                 raise TransportError(type(error).__name__) from error
             errors = [item for item in outputs if item.get("output_type") == "error"]
             if errors:
-                if live_read and all(
-                    item.get("ename") in ("FileNotFoundError", "NotADirectoryError") for item in errors
-                ):
-                    raise TransportError("live output changed during snapshot; re-list on next cycle")
+                if live_read:
+                    names = [item.get("ename", "unknown") for item in errors]
+                    benign = all(name in ("FileNotFoundError", "NotADirectoryError") for name in names)
+                    self.record(collection_error_names=names, collection_needs_attention=not benign)
+                    raise TransportError("live output collection failed; re-list on next cycle, not a workload exit")
                 raise RuntimeError(redact(str(errors)))
             return "".join(item.get("text", "") for item in outputs)
         finally:
@@ -225,10 +226,22 @@ class Driver:
             if index in collected:
                 continue
             if status.get("artifact_manifest"):
-                self.collect(session, remote, plan, job, status)
+                try:
+                    self.collect(session, remote, plan, job, status)
+                except (OSError, ValueError, RuntimeError) as error:
+                    if isinstance(error, TransportError):
+                        raise
+                    self.record(collection_error=type(error).__name__, collection_needs_attention=True)
+                    raise TransportError("local artifact collection failed; workload liveness is independent") from error
                 collected.add(index)
             elif status and time.monotonic() - synced.get(index, 0) >= 600:
-                self.sync(session, remote, job)
+                try:
+                    self.sync(session, remote, job)
+                except (OSError, ValueError, RuntimeError) as error:
+                    if isinstance(error, TransportError):
+                        raise
+                    self.record(collection_error=type(error).__name__, collection_needs_attention=True)
+                    raise TransportError("local snapshot collection failed; workload liveness is independent") from error
                 synced[index] = time.monotonic()
         if progress.get("phase") in ("done", "failed"):
             self.preamble(session, remote, plan, progress)
