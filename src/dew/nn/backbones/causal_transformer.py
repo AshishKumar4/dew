@@ -960,10 +960,12 @@ class CausalTransformer(nn.Module):
 
     @nn.nowrap
     def logits_flops(self, lengths) -> float:
-        """The vocabulary matrix and optional prediction transform, tied or untied."""
-        count = projection_flops(lengths, self.emb_features, self.vocab_size)
-        if self.head_transform is not None:
-            count += projection_flops(lengths, *self.projections()['head_dense'])
+        """The vocabulary matrix and optional prediction transform. A tied head
+        reads the embedding table, `vocab_size` rows of `emb_features`."""
+        projections = self.projections()
+        count = projection_flops(lengths, *projections.get('lm_head', (self.emb_features, self.vocab_size)))
+        if 'head_dense' in projections:
+            count += projection_flops(lengths, *projections['head_dense'])
         return count
 
     @nn.nowrap
