@@ -578,6 +578,7 @@ class _IndexedLines:
 
 class _CsvLines(Iterator[str]):
     def __init__(self, file: BinaryIO):
+        csv.field_size_limit(2**31 - 1)
         self.file = file
 
     def __next__(self) -> str:
