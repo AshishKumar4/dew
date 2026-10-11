@@ -293,7 +293,7 @@ def test_pallas_kernel_choices_need_the_labs_record_of_their_exact_code(tmp_path
     none, and a G4 with no row runs no Pallas kernel."""
     tree = kernel_tree(tmp_path)
     records = {}
-    monkeypatch.setattr(preflight, "store_read", lambda key: records.get(key))
+    monkeypatch.setattr(preflight, "store_read", lambda key: (records.get(key), "absent"))
     failures: list[str] = []
     found = preflight.lab_verified(tree, "gpu:A100", failures)
     assert found["pallas"] == ["gated_delta_rule=fla"]

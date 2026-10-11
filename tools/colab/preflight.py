@@ -711,15 +711,14 @@ def top(chain: dict) -> str:
 def resolved(ref: str, origin: str) -> str:
     """`ref` as a commit of this clone, fetched from `origin` if it lacks it; `ref` itself if it
     names none."""
-    try:
-        return git(REPO, "rev-parse", f"{ref}^{{commit}}")
-    except RuntimeError:
-        pass
-    try:
-        git(REPO, "fetch", "-q", origin, ref)
-        return git(REPO, "rev-parse", f"{ref}^{{commit}}")
-    except RuntimeError:
-        return ref
+
+    def known() -> bool:
+        return subprocess.run(["git", "-C", str(REPO), "cat-file", "-e", f"{ref}^{{commit}}"],
+                              capture_output=True, check=False).returncode == 0
+
+    if not known():
+        subprocess.run(["git", "-C", str(REPO), "fetch", "-q", origin, ref], capture_output=True, check=False)
+    return git(REPO, "rev-parse", f"{ref}^{{commit}}") if known() else ref
 
 
 # Kernel choices that run Dew's own Pallas (Triton) kernels, whose lowering only a GPU proves.
@@ -763,18 +762,19 @@ def lab_verified(tree: Path, hardware: str, failures: list[str]) -> dict:
         return found
     found["digest"] = digest = kernel_digest(tree)
     key = f"lab/verified/{LAB_GPUS[hardware]}/{digest}.json"
-    record = store_read(key)
+    record, missing = store_read(key)
     if record is None or not record.get("ok"):
         failures.append(f"KERNELS on {generation} names Pallas kernels ({', '.join(named)}) whose code "
-                        f"the kernel lab has not verified on {LAB_GPUS[hardware]} ({key})")
+                        f"the kernel lab has not verified on {LAB_GPUS[hardware]} ({key}: "
+                        f"{missing or 'not ok'})")
         return found
     found["record"] = {k: record.get(k) for k in ("ref", "gpu", "versions", "at")}
     return found
 
 
-def store_read(key: str) -> dict | None:
+def store_read(key: str) -> tuple[dict | None, str]:
     """A JSON object from Dew's R2 store (dew-data) with the read token in DEW_DATA_READ_TOKEN or
-    ~/.config/dew/dew-data.json's read_token_file; None where it is absent or unreadable."""
+    ~/.config/dew/dew-data.json's read_token_file, and why there is none where there is none."""
     config = Path.home() / ".config/dew/dew-data.json"
     url = "https://dew-data.ashishkmr472.workers.dev"
     token = os.environ.get("DEW_DATA_READ_TOKEN")
@@ -784,15 +784,15 @@ def store_read(key: str) -> dict | None:
         if token is None and settings.get("read_token_file"):
             token = Path(settings["read_token_file"]).expanduser().read_text().strip()
     if not token:
-        return None
+        return None, "no read token for the store (DEW_DATA_READ_TOKEN)"
     request = urllib.request.Request(f"{url.rstrip('/')}/{key}", headers={
         "Authorization": f"Bearer {token}", "User-Agent": "dew-preflight"})
     try:
         with urllib.request.urlopen(request, timeout=60) as response:
             value = json.loads(response.read())
-    except (urllib.error.URLError, json.JSONDecodeError):
-        return None
-    return value if isinstance(value, dict) else None
+    except (urllib.error.URLError, json.JSONDecodeError) as error:
+        return None, f"{type(error).__name__}: {error}"
+    return (value, "") if isinstance(value, dict) else (None, "the record is not a JSON object")
 
 
 def label(chain: dict) -> str:
