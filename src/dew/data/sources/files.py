@@ -179,7 +179,8 @@ class Files:
                 names = sorted(
                     name
                     for name in fs.find(path)
-                    if not any(part.startswith(("_", ".")) for part in PurePosixPath(name[len(path) :]).parts)
+                    if self.kind not in ("parquet", "arrow")
+                    or not any(part.startswith(("_", ".")) for part in PurePosixPath(name[len(path) :]).parts)
                 )
                 extensions = {
                     "parquet": ".parquet",
@@ -468,6 +469,15 @@ class Files:
             remote |= "file" not in protocols and "memory" not in protocols
         if self.kind in ("parquet", "arrow") and self.filter is None:
             return tuple(_fragment_rows(fragment) for fragment in self.fragments), remote
+        if self.kind in ("jsonl", "text", "csv") and self.supports("indexed"):
+            indexed = _IndexedLines(self)
+            if self.index is None:
+                return tuple(len(table) for table in indexed.tables), remote
+            shards = indexed.tables[0]["shard"]
+            boundaries = [bisect.bisect_left(shards, shard) for shard in range(len(self.paths) + 1)]
+            return tuple(
+                right - left for left, right in zip(boundaries, boundaries[1:], strict=False)
+            ), remote
         if self.kind == "array_record" and self.committed is not None:
             return self._declared_rows() or (), remote
         if self.kind == "files":

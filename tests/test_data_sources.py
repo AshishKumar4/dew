@@ -1,5 +1,6 @@
 """Read-mode capabilities, range splits, partition discovery and shard resume."""
 
+import hashlib
 import io
 import json
 import tarfile
@@ -151,6 +152,16 @@ def test_csv_quoted_newlines_are_never_byte_split():
     indexed = files.records("indexed")
     assert indexed[0] == {"id": "0", "text": "two\nlines"}
     assert indexed[1] == {"id": "1", "text": "last"}
+
+
+def test_file_catalog_keeps_distinct_nested_names_including_underscore_directories(tmp_path):
+    names = [f"speaker-{speaker}/{clip}/00001.mp4" for speaker in (1, 2) for clip in ("_clip", "other")]
+    for name in names:
+        path = tmp_path / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"video")
+    rows = Files(str(tmp_path), format="files").records("indexed")
+    assert [row["path"] for row in rows] == [(tmp_path / name).as_uri() for name in sorted(names)]
 
 
 def test_csv_large_quoted_fields_survive_streaming_and_offset_provisioning():
@@ -355,6 +366,28 @@ def test_jsonl_offset_index_is_mapped_and_reopened_instead_of_pickled_as_rows():
     resumed = pickle.loads(pickle.dumps(indexed))
     assert resumed[1] == {"id": 1}
     assert isinstance(resumed.tables[0], np.memmap)
+
+
+def test_published_file_facts_avoid_metadata_probes_and_verify_the_index(monkeypatch):
+    root = Store(f"memory://published-facts-{uuid4().hex}/rows.jsonl")
+    root.write(b'{"id":0}\n{"id":1}\n')
+    Files(root.url).provision()
+    index = root.url.removesuffix(".jsonl") + ".index.npy"
+    facts = {
+        url: {"bytes": len(Store(url).read()), "sha256": hashlib.sha256(Store(url).read()).hexdigest()}
+        for url in (root.url, index)
+    }
+    source = Files((root.url,), format="jsonl", index=index, file_info=facts)
+    fs, _ = root.resolve()
+
+    def unexpected(*args, **kwargs):
+        raise RuntimeError("published source performed an unexpected info/HEAD request")
+
+    monkeypatch.setattr(fs, "info", unexpected)
+    assert source.supports("indexed")
+    assert source.metadata()["rows"] == 2
+    assert source.snapshot()["files"][0]["version"] == facts[root.url]["sha256"]
+    assert source.records("indexed")[1] == {"id": 1}
 
 
 def test_torch_source_refuses_streaming_and_cache_without_content_identity():

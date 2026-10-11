@@ -36,8 +36,9 @@ class _Columns:
     values: Mapping[str, Sequence]
 
     def __post_init__(self) -> None:
-        if len({len(column) for column in self.values.values()}) > 1:
-            raise ValueError("memory columns have different row counts")
+        lengths = {name: len(column) for name, column in self.values.items()}
+        if len(set(lengths.values())) > 1:
+            raise ValueError(f"memory columns have different row counts: {lengths}")
 
     def __len__(self) -> int:
         return len(next(iter(self.values.values()))) if self.values else 0
