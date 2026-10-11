@@ -1,9 +1,10 @@
 // One of Dew's R2 object stores, each its own Worker over its own bucket
 // (dew-xla-cache.jsonc, dew-data.jsonc; provision.sh): GET, HEAD and PUT of
 // /<key> in the bucket bound as CACHE, and GET /?list=<prefix> for the keys
-// under a prefix (the whole bucket for an empty one), a page at a time, for
-// a bearer of the store's CACHE_TOKEN secret, who may also DELETE /<key>. A bearer of its READ_TOKEN secret, where
-// one is set, reads the same way and is refused a PUT or a DELETE with a 403.
+// under a prefix (the whole bucket for an empty one), a page at a time, with
+// `&detail=1` each one's size and ETag beside them, for a bearer of the
+// store's CACHE_TOKEN secret, who may also DELETE /<key>. A bearer of its
+// READ_TOKEN secret, where one is set, reads the same way and is refused a PUT or a DELETE with a 403.
 // A miss is a 404. A GET with a Range header answers 206 with that
 // slice and its Content-Range. A PUT honours If-None-Match and If-Match
 // (`If-None-Match: *` writes a key only if it is absent) and answers 412
@@ -34,8 +35,15 @@ export default {
         return new Response(null, { status: 400 });
       }
       const page = await env.CACHE.list({ prefix: listed, limit: 1000, cursor: url.searchParams.get('cursor') ?? undefined });
-      return Response.json({ keys: page.objects.map((object) => object.key.slice(listed.length)),
-        cursor: page.truncated ? page.cursor : null });
+      const keys = page.objects.map((object) => object.key.slice(listed.length));
+      const answer = { keys, cursor: page.truncated ? page.cursor : null };
+      // `detail=1` adds each object's size and ETag from the same listing, so a reader resolves a
+      // directory's objects without a HEAD each.
+      if (url.searchParams.get('detail') === '1') {
+        answer.objects = page.objects.map((object, index) =>
+          ({ key: keys[index], size: object.size, etag: object.httpEtag }));
+      }
+      return Response.json(answer);
     }
     const key = decodeURIComponent(url.pathname.slice(1));
     if (key.length > 512 || !KEY.test(key) || key.split('/').includes('..')) return new Response(null, { status: 400 });
