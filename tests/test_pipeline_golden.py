@@ -38,7 +38,8 @@ def _digest(batch):
     leaves = []
     for value in jax.tree.leaves(batch):
         array = np.asarray(value)
-        encoded = json.dumps(array.tolist(), sort_keys=True).encode() if array.dtype.hasobject else array.tobytes()
+        encoded = (json.dumps(array.tolist(), sort_keys=True).encode()
+                   if array.dtype.hasobject else array.tobytes())
         leaves.append({"shape": list(array.shape), "dtype": array.dtype.str,
                        "sha256": hashlib.sha256(encoded).hexdigest()})
     return {"tree": str(jax.tree.structure(batch)), "leaves": leaves}
@@ -83,8 +84,9 @@ def _videos(root):
     directory.mkdir()
     video = directory / "00.mp4"
     subprocess.run([get_ffmpeg_exe(), "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i",
-                    "testsrc=size=16x16:rate=25", "-f", "lavfi", "-i", "sine=frequency=1000:sample_rate=16000",
-                    "-t", "2", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", str(video)], check=True)
+                    "testsrc=size=16x16:rate=25", "-f", "lavfi", "-i",
+                    "sine=frequency=1000:sample_rate=16000", "-t", "2", "-c:v", "libx264",
+                    "-pix_fmt", "yuv420p", "-c:a", "aac", str(video)], check=True)
     for index in range(1, 12):
         shutil.copyfile(video, directory / f"{index:02}.mp4")
     audio = root / "audio"
@@ -117,10 +119,11 @@ def recipes(tmp_path_factory):
     examples = [Example(f"state {index}", {"class": Choice("Pick", ["yes", "no"])}, {"class": index % 2})
                 for index in range(40)]
     augment = Augment(backend="host", jitter=True)
-    built = {
+    return {
         "text_windows": (Text(tokens, seq_len=16), {"validation_records": 16}),
         "text_packed": (Text(tokens, seq_len=16, pack="first-fit"), {"validation_records": 16}),
-        "text_phases": (Text(phases=(DataPhase(tokens, 3), DataPhase(other)), seq_len=16), {"validation_records": 16}),
+        "text_phases": (Text(phases=(DataPhase(tokens, 3), DataPhase(other)), seq_len=16),
+                        {"validation_records": 16}),
         "chat": (Chat(conversations, "tests/fixtures/tokenizers/tiny-chat", seq_len=64, long="chunk",
                        validation=conversations), {"validation_records": 16}),
         "prompts": (Prompts(prompts, "byte", max_prompt_len=16, long="truncate"), {}),
@@ -141,7 +144,6 @@ def recipes(tmp_path_factory):
         "decision_mix": (Decisions({"a": examples, "b": examples[:8]}, weights={"a": 3, "b": 1},
                                     validation=examples[:5]), {"objective": objective.data()}),
     }
-    return built
 
 
 @pytest.mark.parametrize("name", CASES)

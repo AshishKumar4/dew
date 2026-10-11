@@ -8,8 +8,8 @@ import grain.python as grain
 import numpy as np
 import pytest
 
-from dew.data.compile import compile
 from dew.data.cache import Cache
+from dew.data.compile import compile
 from dew.data.dataset import DataPartition, Loading, train_stream
 from dew.data.mix import SearchBudget, TokenDeficit, token_weights
 from dew.data.pipeline import Artifact, Pipeline, Rejected
@@ -99,7 +99,8 @@ def test_pipeline_global_order_matches_the_existing_grain_order():
 
 def test_memory_rejections_are_dense_before_global_order():
     stored = source()
-    data = compile(Pipeline(stored).map(Odd()).shuffle(3).repeat().batch(4), read="memory", loading=READ, seed=3)
+    data = compile(Pipeline(stored).map(Odd()).shuffle(3).repeat().batch(4),
+                   read="memory", loading=READ, seed=3)
     rows = tuple(value for value in stored.values if int(value["id"]) % 2)
     oracle = train_stream(rows, [], batch=4, seed=3, loading=READ)
     reader = data.train(DataPartition())
@@ -164,14 +165,14 @@ def test_rejection_iterator_resumes_exactly_and_refuses_topology_change():
 
 def test_cache_refuses_random_prefix_before_opening_the_artifact():
     pipeline = Pipeline(source()).random_map(Draw()).then(Artifact(object())).batch(4)
-    with pytest.raises(ValueError, match="cache prefix.*Draw"):
+    with pytest.raises(ValueError, match=r"cache prefix.*Draw"):
         compile(pipeline, loading=READ)
 
 
 def test_map_batch_before_batch_and_random_validation_are_named_refusals():
-    with pytest.raises(ValueError, match="map_batch.*batch"):
+    with pytest.raises(ValueError, match=r"map_batch.*batch"):
         compile(Pipeline(source()).map_batch(Shift(1)).batch(4), loading=READ)
-    with pytest.raises(ValueError, match="validation.*Draw.*canonical"):
+    with pytest.raises(ValueError, match=r"validation.*Draw.*canonical"):
         compile(Pipeline(source()).batch(4),
                 validation=Pipeline(source()).shuffle(0).random_map(Draw()).batch(4), loading=READ)
 
@@ -218,7 +219,7 @@ def test_zero_target_corpus_exhausts_named_rejection_budget_without_starvation()
                for count in (0, 4)]
     reader = iter(TokenDeficit(parents, [1, 1], tokens=Targets(), names=["all-zero", "useful"],
                               budget=SearchBudget(consecutive=5, seconds=None)))
-    with pytest.raises(ValueError, match="all-zero.*search budget exhausted.*zero_targets"):
+    with pytest.raises(ValueError, match=r"all-zero.*search budget exhausted.*zero_targets"):
         next(reader)
     counts = reader.get_state()["parents"][0]["counts"]
     assert counts["attempted"] == 5
@@ -227,7 +228,7 @@ def test_zero_target_corpus_exhausts_named_rejection_budget_without_starvation()
 
 
 def test_authoritative_zero_target_count_is_refused_before_division():
-    with pytest.raises(ValueError, match="empty-targets.*zero valid target"):
+    with pytest.raises(ValueError, match=r"empty-targets.*zero valid target"):
         token_weights(["empty-targets", "useful"], [1, 1], [3, 2], [0, 10])
 
 
@@ -264,8 +265,11 @@ def test_cold_warm_and_resumed_cache_keep_per_epoch_randomness(tmp_path):
     saved = reader.get_state()
     second_epoch = take(reader, 2)
     reader.close()
-    by_id = lambda epoch: {identifier: draw for batch in epoch for identifier, draw in
-                          zip(batch["id"], batch["draw"], strict=True)}
+
+    def by_id(epoch):
+        return {identifier: draw for batch in epoch for identifier, draw in
+                zip(batch["id"], batch["draw"], strict=True)}
+
     assert by_id(first_epoch) != by_id(second_epoch)
     manifest = Manifest.of(stored.snapshot(), (), fill={"read": "memory", "row_ids": "indexed"})
     generation = cache.publish(manifest, stored)
@@ -359,6 +363,6 @@ def test_token_mixer_probes_an_unselected_tiny_share_before_emitting_a_row():
                grain.MapDataset.source([{"targets": 0}]).repeat().to_iter_dataset()]
     reader = iter(TokenDeficit(parents, [1, 1e-9], tokens=Targets(), names=["normal", "broken"],
                               budget=SearchBudget(consecutive=3, seconds=None)))
-    with pytest.raises(ValueError, match="broken.*budget exhausted"):
+    with pytest.raises(ValueError, match=r"broken.*budget exhausted"):
         next(reader)
     reader.close()

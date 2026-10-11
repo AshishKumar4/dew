@@ -7,11 +7,11 @@ import grain.python as grain
 import numpy as np
 import pytest
 
+from dew.data.batching import TOKEN_COUNTS
 from dew.data.compile import compile
 from dew.data.dataset import DataPartition, Loading
 from dew.data.pipeline import Pipeline, TokenField
 from dew.data.sources.memory import Memory
-from dew.data.batching import TOKEN_COUNTS
 from dew.inputs import Field, InputSpec
 from dew.objectives.base import VALID_ROWS
 
@@ -36,7 +36,8 @@ def records():
 
 
 def batches():
-    return Pipeline(records()).map(Geometry(), rejects=False).shuffle(7).repeat().batch(tokens=64, lengths=(4, 8, 16))
+    return Pipeline(records()).map(Geometry(), rejects=False).shuffle(7).repeat().batch(
+        tokens=64, lengths=(4, 8, 16))
 
 
 def copy_batch(row):
@@ -118,5 +119,5 @@ def test_token_budget_keeps_post_batch_limit_and_workers(workers):
 
 
 def test_token_budget_refuses_row_rebatching():
-    with pytest.raises(ValueError, match="rebatch.*fixed token budget"):
+    with pytest.raises(ValueError, match=r"rebatch.*fixed token budget"):
         compile(batches().rebatch(8), read="memory", loading=READ)

@@ -205,7 +205,7 @@ plain sequence of them. A spec that lists its records in memory hands over
 the sequence, the way the video specs list their clips."""
 
 type InMemory = Mapping[str, ArrayLike] | Indexed
-"""Records a caller holds, for `Dataset.from_records`: columns whose first
+"""Records a caller holds, for `Records(source=...)`: columns whose first
 axis is the record, or anything `Indexed`."""
 
 
