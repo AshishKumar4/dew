@@ -51,13 +51,13 @@ def test_two_finalizers_publish_only_one_snapshot(store):
         try:
             store.put_if_absent(data)
             return data
-        except PreconditionFailed:
-            return None
+        except PreconditionFailed as error:
+            return error
 
     with ThreadPoolExecutor(2) as pool:
         results = list(pool.map(publish, [b"a", b"b"]))
-    assert results.count(None) == 1
-    assert store.read() == next(result for result in results if result is not None)
+    assert sum(isinstance(result, PreconditionFailed) for result in results) == 1
+    assert store.read() == next(result for result in results if isinstance(result, bytes))
 
 
 def test_named_profile_resolves_secrets_lazily(monkeypatch):

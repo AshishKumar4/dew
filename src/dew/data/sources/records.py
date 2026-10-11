@@ -46,10 +46,10 @@ class ArrayRecords:
         return len(self.reader)
 
     def __getitem__(self, index: int) -> Batch | bytes | None:
-        data = self.reader[index]
+        payload = self.reader[index]
         if not self.record_codec:
-            return data
-        value = decode(data)
+            return payload
+        value = decode(payload)
         if not isinstance(value, (Mapping, bytes)) and value is not None:
             raise TypeError("an exported ArrayRecord source must hold records or bytes")
         return value

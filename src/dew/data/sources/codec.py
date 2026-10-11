@@ -8,11 +8,17 @@ import importlib
 import io
 import json
 import struct
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
+from typing import TYPE_CHECKING
 
 import numpy as np
 
 from dew.records import JSON
+
+if TYPE_CHECKING:
+    from _typeshed import DataclassInstance
+
+type Value = JSON | bytes | np.ndarray | np.generic | DataclassInstance | tuple[Value, ...] | Mapping[str, Value]
 
 
 def pack_dict_of_byte_arrays(values: Mapping[str, bytes]) -> bytes:
@@ -26,28 +32,28 @@ def pack_dict_of_byte_arrays(values: Mapping[str, bytes]) -> bytes:
     return bytes(packed)
 
 
-def unpack_dict_of_byte_arrays(data: bytes) -> dict[str, bytes]:
+def unpack_dict_of_byte_arrays(payload: bytes) -> dict[str, bytes]:
     values = {}
     offset = 0
-    while offset < len(data):
-        if offset + 4 > len(data):
+    while offset < len(payload):
+        if offset + 4 > len(payload):
             raise ValueError("truncated ArrayRecord key length")
-        length = struct.unpack_from("<I", data, offset)[0]
+        length = struct.unpack_from("<I", payload, offset)[0]
         offset += 4
-        key = data[offset:offset + length].decode()
+        key = payload[offset:offset + length].decode()
         offset += length
-        if offset + 4 > len(data):
+        if offset + 4 > len(payload):
             raise ValueError(f"truncated ArrayRecord value length for {key!r}")
-        length = struct.unpack_from("<I", data, offset)[0]
+        length = struct.unpack_from("<I", payload, offset)[0]
         offset += 4
-        if offset + length > len(data) or key in values:
+        if offset + length > len(payload) or key in values:
             raise ValueError(f"invalid ArrayRecord value for {key!r}")
-        values[key] = data[offset:offset + length]
+        values[key] = payload[offset:offset + length]
         offset += length
     return values
 
 
-def _tree(value: object, leaves: dict[str, bytes]) -> JSON:
+def _tree(value: Value, leaves: dict[str, bytes]) -> JSON:
     if value is None or isinstance(value, (bool, int, float, str)):
         return value
     if isinstance(value, np.generic):
@@ -64,9 +70,9 @@ def _tree(value: object, leaves: dict[str, bytes]) -> JSON:
     if isinstance(value, Mapping):
         if not all(isinstance(key, str) for key in value):
             raise TypeError("artifact mappings need string keys")
-        return {"mapping": {key: _tree(item, leaves) for key, item in value.items()}}
+        return {"mapping": {key: _tree(entry, leaves) for key, entry in value.items()}}
     if isinstance(value, (list, tuple)):
-        return {"tuple" if isinstance(value, tuple) else "list": [_tree(item, leaves) for item in value]}
+        return {"tuple" if isinstance(value, tuple) else "list": [_tree(entry, leaves) for entry in value]}
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
         cls = type(value)
         if not cls.__module__.startswith("dew."):
@@ -77,9 +83,11 @@ def _tree(value: object, leaves: dict[str, bytes]) -> JSON:
     raise TypeError(f"artifact codec cannot encode {type(value).__name__}")
 
 
-def _restore(node: JSON, leaves: Mapping[str, bytes]) -> object:
-    if not isinstance(node, dict):
+def _restore(node: object, leaves: Mapping[str, bytes]) -> Value:
+    if node is None or isinstance(node, (bool, int, float, str)):
         return node
+    if not isinstance(node, dict):
+        raise ValueError("artifact node is not a scalar or tagged object")
     if "bytes" in node:
         return leaves[str(node["bytes"])]
     if "array" in node:
@@ -104,19 +112,19 @@ def _restore(node: JSON, leaves: Mapping[str, bytes]) -> object:
     raise ValueError("unknown artifact record schema")
 
 
-def encode(value: object) -> bytes:
+def encode(value: Value) -> bytes:
     leaves: dict[str, bytes] = {}
     tree = _tree(value, leaves)
     leaves["schema"] = json.dumps(tree, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode()
     return pack_dict_of_byte_arrays(leaves)
 
 
-def decode(value: bytes) -> object:
+def decode(value: bytes) -> Value:
     leaves = unpack_dict_of_byte_arrays(value)
     return _restore(json.loads(leaves.pop("schema")), leaves)
 
 
-def fingerprint(values) -> str:
+def fingerprint(values: Iterable[Value]) -> str:
     digest = hashlib.sha256()
     for value in values:
         encoded = encode(value)
