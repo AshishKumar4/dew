@@ -535,17 +535,6 @@ class Objective(ABC, Generic[Loss, Effects]):
     counts_tokens: ClassVar[bool] = False
     """Whether the objective supplies real token lengths for throughput telemetry."""
 
-    @property
-    def counts_work(self) -> bool:
-        """Whether analytical training work is available for this objective's networks.
-
-        Telemetry consumes this capability without requesting a count. An
-        objective with other geometry overrides it beside its count methods;
-        explicitly requesting an unavailable count still raises.
-        """
-        from dew.nn.protocols import Counted
-        return self.counts_tokens and isinstance(vars(self).get("model"), Counted)
-
     def real_lengths(self, batch: Batch) -> np.ndarray:
         """Real row (or packed-segment) lengths, read before device placement.
 

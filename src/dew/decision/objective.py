@@ -48,7 +48,7 @@ from dew.interop.processors import Processor
 from dew.lora import Adapter
 from dew.nn.flops import MissingFlopsCount, counted_flops
 from dew.nn.inputs import ModelInputs
-from dew.nn.protocols import Counted, CountedDecisions, CountedTraining, TokenModel
+from dew.nn.protocols import CountedDecisions, CountedTraining, TokenModel
 from dew.objectives.base import (
     OMITTED,
     Aux,
@@ -319,12 +319,6 @@ class DecisionObjective(Objective[Ratio]):
     _held_parts = True
 
     counts_tokens = True
-
-    @property
-    def counts_work(self) -> bool:
-        """Both the backbone and the layout-aware head must declare their work."""
-        return (isinstance(self.model.backbone, Counted)
-                and isinstance(self.model.head, CountedDecisions))
 
     def real_lengths(self, batch: Batch) -> np.ndarray:
         """The layout's unpadded row lengths, not its bucket or maximum length."""
