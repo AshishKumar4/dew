@@ -592,7 +592,8 @@ def test_incomplete_retained_checkpoint_is_never_released_with_commit_markers(tm
         assert archive.getnames() == ["out/train.log"]
 
 
-def test_fake_vm_runs_pinned_jobs_after_one_nonblocking_preamble(tmp_path):
+@pytest.mark.parametrize("boundary_control", [False, True])
+def test_fake_vm_runs_pinned_jobs_after_one_nonblocking_preamble(tmp_path, boundary_control):
     repo = tmp_path / "repo"
     repo.mkdir()
     profile = (
@@ -602,7 +603,10 @@ def test_fake_vm_runs_pinned_jobs_after_one_nonblocking_preamble(tmp_path):
         "with (out/'calls').open('a') as f:f.write('capture\\n')\nsys.exit(1)\n"
     )
     job_script = (
-        "from pathlib import Path\n"
+        "from pathlib import Path\nimport os\n"
+        "paths = os.environ['PYTHONPATH'].split(os.pathsep)\n"
+        "assert paths[0] == str(Path.cwd()/'src')\n"
+        f"assert paths[1:] == ([str(Path.cwd().parents[1])] if {boundary_control!r} else [])\n"
         "assert (Path.cwd().parents[1]/'out/_preamble/profile-check/check.json').is_file()\n"
         "Path('out').mkdir();Path('out/result.json').write_text('{\"step\":3}')\n"
     )
@@ -629,6 +633,7 @@ def test_fake_vm_runs_pinned_jobs_after_one_nonblocking_preamble(tmp_path):
                 "command": "python job.py",
                 "minutes": 1,
                 "compile_cache": "off",
+                "boundary_control": boundary_control,
                 "outputs": ["out/"],
                 "artifact_policy": "measurements",
             }
