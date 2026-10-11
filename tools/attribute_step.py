@@ -184,6 +184,7 @@ def attribute_time(trace: Path, steps: int, model_flops: float | None,
     by_kind: dict = defaultdict(float)
     by_part_kind: dict = defaultdict(lambda: defaultdict(float))
     gemms, layouts, everything = [], [], []
+    fp8_gflop = 0.0
     for row in (row for row in rows if str(row.get("program_id")) == step):
         name = str(row.get("tf_op_name") or "")
         us = float(row["total_self_time"]) / steps
@@ -202,6 +203,10 @@ def attribute_time(trace: Path, steps: int, model_flops: float | None,
                   "hlo": row.get("hlo_op_name"), "framework": name[:200], "count": row.get("occurrences"),
                   "gflops": round(gflops, 1), "bound_by": row.get("bound_by"), "source": source}
         everything.append(record)
+        if kind == "gemm":
+            record["precision"] = gemm_precision(row, known)
+            if record["precision"] == "fp8":
+                fp8_gflop += gflops * us * 1e-6
         if kind == "gemm" and peak:
             record["lost_us"] = round(us * max(0.0, 1 - gflops / peak), 1)
             gemms.append(record)
@@ -231,10 +236,33 @@ def attribute_time(trace: Path, steps: int, model_flops: float | None,
         "top_ops": sorted(everything, key=lambda record: -record["us"])[:40],
         "xprof_steps": report_table(reports / "input_pipeline_analyzer.json", 1)[1][:8],
     }
-    if model_flops and peak:
-        result["model_flops_per_step"] = model_flops
-        result["mfu_of_device_time"] = round(model_flops / (device_us * 1e-6) / (peak * 1e9), 4)
+    if model_flops:
+        # Utilization names its precision and denominator. mfu_bf16: model FLOPs over the bf16 peak,
+        # which is utilization only when every GEMM is bf16 and otherwise a bf16-equivalent
+        # throughput. mfu_mixed: each GEMM's FLOPs over its own precision's peak, the true
+        # utilization, null where an FP8 GEMM runs on a device with no FP8 peak in Dew's table.
+        seconds = device_us * 1e-6
+        fp8 = fp8_gflop * 1e9 / steps
+        fp8_peak = peak_flops(device, "fp8") if device and fp8 else None
+        result.update(model_flops_per_step=model_flops, fp8_gemm_flops_per_step=fp8,
+                      bf16_equiv_throughput_tflops=round(model_flops / seconds / 1e12, 2))
+        result["mfu_bf16_of_device_time"] = round(model_flops / seconds / (peak * 1e9), 4) if peak else None
+        if peak and not fp8:
+            result["mfu_mixed_of_device_time"] = result["mfu_bf16_of_device_time"]
+        elif peak and fp8_peak:
+            share = ((model_flops - fp8) / (peak * 1e9) + fp8 / fp8_peak) / seconds
+            result["mfu_mixed_of_device_time"] = round(share, 4)
+        else:
+            result["mfu_mixed_of_device_time"] = None
     return result
+
+
+def gemm_precision(row: dict, known: HloInstruction | None) -> str:
+    """'fp8' for a GEMM that multiplies FP8 operands (cuBLASLt's f8 matmul, or f8 operand types in
+    its expression), else 'bf16': the peak its FLOPs count against."""
+    target = known.target if known is not None else ""
+    expression = str(row.get("hlo_op_expression") or "")
+    return "fp8" if "$f8" in target or re.search(r"\bf8e[45]m", expression) else "bf16"
 
 
 # ---- memory, from XLA's dump ------------------------------------------------------------------
@@ -374,7 +402,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"time: {time['device_ms_per_step']} ms device a step, "
               f"{time['device_idle_ms_per_step']} ms idle, "
               f"GEMMs at {time['gemm_fraction_of_peak']} of peak, {time['gemm_lost_ms']} ms lost to it, "
-              f"MFU of device time {time.get('mfu_of_device_time')}")
+              f"MFU of device time: bf16 {time.get('mfu_bf16_of_device_time')}, "
+              f"mixed {time.get('mfu_mixed_of_device_time')}")
         for part, directions in time["by_part_ms"].items():
             print(f"  {part:10s} " + "  ".join(f"{d} {ms:.2f}" for d, ms in directions.items()))
         print("  kinds: " + ", ".join(f"{k} {ms:.2f}" for k, ms in time["by_kind_ms"].items()))
