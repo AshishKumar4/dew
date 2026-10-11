@@ -274,8 +274,8 @@ class JointSchemaHead(Head):
         Each attention has query/output maps on its queries and key/value
         maps on memory. The field layers also have Q-by-Q self-attention.
         The residual scorer reads four width-sized features per option.
-        Lookup embeddings, span pooling and pointwise normalization/gates
-        are excluded, as they are in the backbone's model-work convention.
+        Span pooling is a masked matrix product and is counted. Lookup
+        embeddings and pointwise normalization/gates are excluded.
         """
         length, question, option = decision_geometry(lengths, questions, options)
         width, hidden = self.width, self.hidden_size
@@ -289,7 +289,9 @@ class JointSchemaHead(Head):
                   + 4 * width * self.feedforward * np.sum(question))
         scorer = (8 * width * width + 2 * width) * np.sum(option)
         summaries = (6 * width + 2 * hidden) * np.sum(option)
-        return float(count + self.routing_layers * evidence + self.layers * fields + scorer + summaries)
+        pooling = 2 * hidden * np.sum(length * (question + 2 * option))
+        return float(count + pooling + self.routing_layers * evidence
+                     + self.layers * fields + scorer + summaries)
 
     @classmethod
     def rebuilt(cls, width: int, fields: Mapping[str, object], *, dtype: Dtype | None,
