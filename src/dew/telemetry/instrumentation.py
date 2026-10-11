@@ -12,6 +12,8 @@ matmul (docs/research/benchmark-parity.md:5-9,93-102).
 
 import math
 import re
+import sys
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 
 import jax
@@ -59,10 +61,14 @@ class _Instruction:
     dims: tuple[int, ...]
     operands: tuple[str, ...]
     attributes: str
+    """Its attributes after the operands, its `metadata={...}` taken out."""
     recomputed: bool = False
     """Whether it recomputes the forward: JAX's remat names its recomputation
     `rematted_computation`, and XLA's own rematerialization clones an
     instruction as `<name>.remat`."""
+    traced: tuple[str, ...] = ()
+    """Its metadata's `op_name source_file:line`, interned: a module repeats
+    each a great many times."""
 
 
 @dataclass
@@ -87,6 +93,22 @@ def _dims(text: str) -> tuple[int, ...]:
     return tuple(int(d) for d in body.split(',')) if body else ()
 
 
+def _without_metadata(attributes: str) -> tuple[str, str]:
+    """`attributes` with its `metadata={...}` taken out, and that metadata."""
+    start = attributes.find('metadata={')
+    if start < 0:
+        return attributes, ''
+    quoted, end = False, len(attributes)
+    for index in range(start + len('metadata={'), len(attributes)):
+        character = attributes[index]
+        if character == '"' and attributes[index - 1] != '\\':
+            quoted = not quoted
+        elif character == '}' and not quoted:
+            end = index + 1
+            break
+    return attributes[:start] + attributes[end:], attributes[start:end]
+
+
 def _split_operands(rest: str) -> tuple[tuple[str, ...], str]:
     """The operand names of an instruction, and the attribute text after them."""
     depth, end = 1, len(rest)
@@ -100,11 +122,13 @@ def _split_operands(rest: str) -> tuple[tuple[str, ...], str]:
     return operands, rest[end + 1:]
 
 
-def _parse(text: str) -> tuple[dict[str, _Computation], str | None]:
-    """The module's computations, and the name of its entry computation."""
+def _parse(text: str | Iterable[str]) -> tuple[dict[str, _Computation], str | None]:
+    """The module's computations, and the name of its entry computation, from
+    its text or its lines one at a time (a dump file read as it streams): a
+    module's metadata is most of its text, and only its traced names are kept."""
     computations: dict[str, _Computation] = {}
     entry, current = None, None
-    for line in text.splitlines():
+    for line in text.splitlines() if isinstance(text, str) else text:
         stripped = line.strip()
         header = _COMPUTATION.match(line)
         if header and ' = ' not in stripped:
@@ -127,8 +151,11 @@ def _parse(text: str) -> tuple[dict[str, _Computation], str | None]:
         element = _ELEMENT.match(match.group('shape'))
         computation.elements[name] = element.group(1) if element else ''
         recomputed = '.remat' in name or '.remat' in current or 'rematted_computation' in attributes
+        attributes, metadata = _without_metadata(attributes)
+        traced = tuple(sys.intern(f"{op_name} {file}:{line}".strip() if file else op_name)
+                       for op_name, file, line in _TRACED.findall(metadata) if op_name)
         computation.instructions[name] = _Instruction(match.group('op'), dims, operands, attributes,
-                                                      recomputed)
+                                                      recomputed, traced)
         if stripped.startswith('ROOT'):
             computation.root = name
         literal = _INTEGER.match(match.group('rest'))
@@ -269,39 +296,41 @@ class HloInstruction:
     multi-output fusion carries none of its own, its ops do."""
 
 
-def hlo_instructions(text: str) -> dict[str, HloInstruction]:
+def hlo_instructions(text: str | Iterable[str]) -> dict[str, HloInstruction]:
     """Every instruction of the module in `text` (`compiled.as_text()`, or an XLA
-    dump's after-optimizations HLO) by name, read by the parser the FLOP count
-    reads (`hlo_flops`)."""
+    dump's after-optimizations HLO, whole or as its lines) by name, read by the
+    parser the FLOP count reads (`hlo_flops`). Each computation's body is
+    gathered once, so the fusions that call one share its sets."""
     computations, _ = _parse(text)
+    bodies: dict[str, tuple[frozenset[str], frozenset[str]]] = {}
 
-    def traced(attributes: str) -> set[str]:
-        return {f"{op_name} {file}:{line}".strip() if file else op_name
-                for op_name, file, line in _TRACED.findall(attributes) if op_name}
-
-    def fused(name: str, seen: frozenset[str]) -> tuple[set[str], set[str]]:
+    def fused(name: str, seen: frozenset[str] = frozenset()) -> tuple[frozenset[str], frozenset[str]]:
+        if name in bodies:
+            return bodies[name]
         computation = computations.get(name)
         if computation is None or name in seen:
-            return set(), set()
+            return frozenset(), frozenset()
         ops = {instruction.op for instruction in computation.instructions.values()}
-        names = set().union(*(traced(each.attributes) for each in computation.instructions.values()))
+        names = {each for instruction in computation.instructions.values() for each in instruction.traced}
         for instruction in computation.instructions.values():
             for called in _CALLS.findall(instruction.attributes):
                 inner_ops, inner_names = fused(called, seen | {name})
                 ops |= inner_ops
                 names |= inner_names
-        return ops, names
+        bodies[name] = frozenset(ops), frozenset(names)
+        return bodies[name]
 
     found = {}
     for computation in computations.values():
         for name, instruction in computation.instructions.items():
             target = _TARGET.search(instruction.attributes)
             calls = _CALLS.findall(instruction.attributes) if instruction.op == 'fusion' else []
-            bodies = [fused(called, frozenset()) for called in calls]
-            found[name] = HloInstruction(
-                instruction.op, target.group(1) if target else '',
-                frozenset().union(*(ops for ops, _ in bodies)), instruction.recomputed,
-                frozenset(traced(instruction.attributes).union(*(names for _, names in bodies))))
+            called = [fused(each) for each in calls]
+            ops = called[0][0] if len(called) == 1 else frozenset().union(*(each for each, _ in called))
+            names = frozenset(instruction.traced).union(*(each for _, each in called))
+            found[name] = HloInstruction(instruction.op, target.group(1) if target else '', ops,
+                                         instruction.recomputed, names)
+    computations.clear()
     return found
 
 

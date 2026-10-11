@@ -34,12 +34,16 @@ It reads text and JSON only, through Dew's own readers: the HLO parser the FLOP 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import html
-import io
 import json
 import re
+import resource
+import shutil
 import tarfile
+import tempfile
 from collections import defaultdict
+from collections.abc import Iterable, Iterator
 from pathlib import Path
 
 from dew.telemetry.instrumentation import HloInstruction, custom_call_kind, hlo_instructions
@@ -268,45 +272,65 @@ def gemm_precision(row: dict, known: HloInstruction | None) -> str:
 # ---- memory, from XLA's dump ------------------------------------------------------------------
 
 
-def dump_files(hlo: Path, module: str) -> dict[str, str]:
+@contextlib.contextmanager
+def dump_files(hlo: Path, module: str) -> Iterator[dict]:
     """The newest `module`'s after-optimizations HLO, live-range, buffer-assignment and
-    memory-usage-report texts, by suffix (the HLO's is `.txt`)."""
+    memory-usage-report files, by suffix (the HLO's is `.txt`), as paths read a line at a
+    time (`lines`): from a .tgz only those four are extracted, to a directory that lasts
+    the context. A dump holds every compile of the step, each tens of megabytes."""
     suffixes = (".txt", "-live-range.txt", "-buffer-assignment.txt", "-memory-usage-report.txt")
-    texts: dict[str, dict[str, str]] = defaultdict(dict)
+    pattern = re.compile(rf"module_(\d+)\.{re.escape(module)}\..*after_optimizations((?:-[a-z-]+)?\.txt)$")
 
-    def take(name: str, read) -> None:
-        base = name.rsplit("/", 1)[-1]
-        match = re.match(rf"module_(\d+)\.{re.escape(module)}\..*after_optimizations((?:-[a-z-]+)?\.txt)$",
-                         base)
-        if match and match.group(2) in suffixes:
-            texts[match.group(1)][match.group(2)] = read()
+    def wanted(name: str) -> tuple[int, str] | None:
+        match = pattern.match(name.rsplit("/", 1)[-1])
+        return (int(match.group(1)), match.group(2)) if match and match.group(2) in suffixes else None
 
-    if hlo.is_file():
-        with tarfile.open(hlo) as archive:
-            for member in archive.getmembers():
-                if member.isfile():
-                    take(member.name, lambda member=member: io.TextIOWrapper(
-                        archive.extractfile(member), errors="replace").read())
-    else:
-        for path in hlo.rglob(f"module_*.{module}.*after_optimizations*.txt"):
-            take(str(path), lambda path=path: path.read_text(errors="replace"))
-    if not texts:
-        raise SystemExit(f"no {module} after-optimizations dumps under {hlo}")
-    newest = max(texts, key=int)
-    return {"module_number": newest, **texts[newest]}
+    with contextlib.ExitStack() as stack:
+        if hlo.is_file():
+            archive = stack.enter_context(tarfile.open(hlo))
+            found = [(key, member) for member in archive.getmembers()
+                     if member.isfile() and (key := wanted(member.name))]
+        else:
+            found = [(key, path) for path in hlo.rglob(f"module_*.{module}.*after_optimizations*.txt")
+                     if (key := wanted(str(path)))]
+        if not found:
+            raise SystemExit(f"no {module} after-optimizations dumps under {hlo}")
+        newest = max(number for (number, _), _ in found)
+        directory = Path(stack.enter_context(tempfile.TemporaryDirectory()))
+        files: dict = {"module_number": str(newest)}
+        for (number, suffix), source in found:
+            if number != newest:
+                continue
+            if isinstance(source, Path):
+                files[suffix] = source
+                continue
+            target = directory / f"module{suffix}"
+            with archive.extractfile(source) as reader, target.open("wb") as writer:
+                shutil.copyfileobj(reader, writer)
+            files[suffix] = target
+        yield files
 
 
-def peak_breakdown(text: str) -> tuple[int, list[tuple[str, int]]]:
+def lines(path: Path | None) -> Iterator[str]:
+    """`path`'s lines without their newlines, read as they stream; none for no path."""
+    if path is None:
+        return
+    with path.open(errors="replace") as stream:
+        for line in stream:
+            yield line.rstrip("\n")
+
+
+def peak_breakdown(text: str | Iterable[str]) -> tuple[int, list[tuple[str, int]]]:
     """The live-range dump's peak bytes and its "Stack trace breakdown for peak usage" as
     (label, bytes the node itself holds): an op's op_name path, or an argument's tree path
     (`p/params/in_proj_qkv/kernel`)."""
-    _, _, tree = text.partition("Stack trace breakdown for peak usage:")
-    if not tree:
-        return 0, []
-    first, _, rest = tree.partition("\n")
-    peak = int(re.sub(r"\D", "", first))
-    leaves, stack = [], []
-    for line in rest.splitlines():
+    marker = "Stack trace breakdown for peak usage:"
+    peak, leaves, stack, inside = 0, [], [], False
+    for line in text.splitlines() if isinstance(text, str) else text:
+        if not inside:
+            if marker in line:
+                inside, peak = True, int(re.sub(r"\D", "", line.partition(marker)[2]) or 0)
+            continue
         match = re.match(r"^([\s│├└─]*)(.+?) \(\d+\.\d+%, total: [\d ]+ bytes, current: ([\d ]+) bytes", line)
         if not match:
             if line.strip() and not line.startswith(" "):
@@ -343,28 +367,34 @@ def role_of(label: str) -> str:
     return "other ops"
 
 
-def allocations(text: str) -> dict[str, int]:
+def allocations(text: str | Iterable[str]) -> dict[str, int]:
     kinds: dict[str, int] = defaultdict(int)
-    for size, attributes in re.findall(r"^allocation \d+: size (\d+), (.*)$", text, re.M):
+    for line in text.splitlines() if isinstance(text, str) else text:
+        match = re.match(r"^allocation \d+: size (\d+), (.*)$", line)
+        if match is None:
+            continue
         kind = next((name for name in ("preallocated-temp", "parameter", "constant", "thread-local",
-                                       "maybe-live-out") if name in attributes), "other")
-        kinds[kind] += int(size)
+                                       "maybe-live-out") if name in match.group(2)), "other")
+        kinds[kind] += int(match.group(1))
     return dict(kinds)
 
 
-def attribute_memory(files: dict[str, str]) -> dict:
-    peak, leaves = peak_breakdown(files.get("-live-range.txt", ""))
+def attribute_memory(files: dict) -> dict:
+    """The peak's bytes by role and part, from `dump_files`'s files, each read as it streams."""
+    peak, leaves = peak_breakdown(lines(files.get("-live-range.txt")))
     groups: dict = defaultdict(int)
     for label, size in leaves:
         groups[(role_of(label), part_of(label))] += size
-    total = re.search(r"Total bytes: (\d+)", files.get("-memory-usage-report.txt", ""))
+    total = next(filter(None, (re.search(r"Total bytes: (\d+)", line)
+                               for line in lines(files.get("-memory-usage-report.txt")))), None)
+    held = allocations(lines(files.get("-buffer-assignment.txt")))
     gib = 1 << 30
     return {
         "module_number": files["module_number"],
         "peak_gib": round(peak / gib, 3),
         "total_bytes_gib": round(int(total.group(1)) / gib, 3) if total else None,
         "allocations_gib": {kind: round(size / gib, 3)
-                            for kind, size in allocations(files.get("-buffer-assignment.txt", "")).items()},
+                            for kind, size in held.items()},
         "peak_by_role_and_part_gib": [
             {"role": role, "part": part, "gib": round(size / gib, 3),
              "share": round(size / peak, 4) if peak else None}
@@ -390,12 +420,14 @@ def main(argv: list[str] | None = None) -> int:
         entry = json.loads(args.entry.read_text())
         flops, device = entry.get("model_flops_per_step"), device or entry.get("device")
     result = {}
-    files = dump_files(args.hlo, args.module) if args.hlo else {}
-    if args.trace:
-        result["time"] = attribute_time(args.trace, args.steps, flops,
-                                        hlo_instructions(files[".txt"]) if ".txt" in files else None, device)
-    if files:
-        result["memory"] = attribute_memory(files)
+    with dump_files(args.hlo, args.module) if args.hlo else contextlib.nullcontext({}) as files:
+        if args.trace:
+            ops = hlo_instructions(lines(files[".txt"])) if ".txt" in files else None
+            result["time"] = attribute_time(args.trace, args.steps, flops, ops, device)
+            result["time"]["hlo_module"] = files.get("module_number")
+        if files:
+            result["memory"] = attribute_memory(files)
+    result["peak_rss_gib"] = round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 2**20, 3)
     args.out.write_text(json.dumps(result, indent=1))
     time = result.get("time", {})
     if "by_part_ms" in time:
