@@ -108,8 +108,11 @@ class Files:
 
     @cached_property
     def kind(self) -> Format:
-        if self.format is None and self.committed is not None:
-            return _format("data." + str(self.committed["format"]))
+        if self.committed is not None:
+            declared = _format("data." + str(self.committed["format"]))
+            if self.format is not None and self.format != declared:
+                raise ValueError(f"source {self.url!r} declares format={declared}, not {self.format}")
+            return declared
         return self.format or _format(self.url if isinstance(self.url, str) else self.url[0])
 
     @cached_property
@@ -118,7 +121,15 @@ class Files:
             return None
         store = Store(self.url, self.storage_options).child("_dew_manifest.json")
         fs, path = store.resolve()
-        return json.loads(fs.cat_file(path)) if fs.exists(path) else None
+        if not fs.exists(path):
+            return None
+        try:
+            manifest = json.loads(fs.cat_file(path))
+        except ValueError as error:
+            raise ValueError(f"committed export manifest is corrupt: {store.url}") from error
+        if not isinstance(manifest, dict) or manifest.get("schema") != 1:
+            raise ValueError(f"committed export manifest has an unknown schema: {store.url}")
+        return manifest
 
     @cached_property
     def paths(self) -> tuple[str, ...]:
@@ -421,6 +432,21 @@ class Files:
             raise ValueError("export manifest files must be a list")
         return tuple(integer(record(entry, "export file")["rows"], "export shard rows") for entry in entries)
 
+    def order_fingerprints(self) -> Mapping[str, str]:
+        if self.kind not in ("jsonl", "text", "csv"):
+            return {}
+        if "index_headers" not in self.__dict__ and not self.supports("indexed"):
+            return {}
+        indexes = (self.index,) if self.index else tuple(self._index_url(path) for path in self.paths)
+        known = self.__dict__["index_headers"]
+        headers = []
+        for url in indexes:
+            fs, path = Store(url, self.storage_options).resolve()
+            metadata = known[url]
+            version = metadata.get("sha256") or metadata.get("etag") or metadata.get("ETag")
+            headers.append({"url": url, "version": fs.ukey(path) if version is None else version})
+        return {"row_index": hashlib.sha256(json.dumps(headers, sort_keys=True).encode()).hexdigest()}
+
     def metadata(self) -> Mapping[str, object]:
         if self.committed is not None:
             metadata = self.committed.get("metadata", {})
@@ -578,6 +604,7 @@ class _IndexedLines:
 
 class _CsvLines(Iterator[str]):
     def __init__(self, file: BinaryIO):
+        csv.field_size_limit(2**31 - 1)
         self.file = file
 
     def __next__(self) -> str:

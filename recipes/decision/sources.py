@@ -1712,7 +1712,7 @@ def _examples(
     buffer = bytearray()
     files = []
     digest = hashlib.sha256()
-    slots = {"questions": 0, "options": 0}
+    slots = {"questions": 0, "options": 0, "total_options": 0, "choice_questions": 0}
 
     def flush(final: bool) -> None:
         if not buffer:
@@ -1740,6 +1740,13 @@ def _examples(
         )
         slots["questions"] = max(slots["questions"], questions)
         slots["options"] = max(slots["options"], options)
+        slots["total_options"] = max(
+            slots["total_options"], sum(len(question.options) for question in example.questions.values())
+        )
+        slots["choice_questions"] = max(
+            slots["choice_questions"],
+            sum(isinstance(question, Choice) for question in example.questions.values()),
+        )
         digest.update(data)
         buffer.extend(data)
     flush(final=True)
@@ -1851,7 +1858,7 @@ def publish(
                 (part[split]["slots"][key] for part in parts.values() for split in ("train", "held")),
                 default=0,
             )
-            for key in ("questions", "options")
+            for key in ("questions", "options", "total_options", "choice_questions")
         },
     }
     if expected is not None:
