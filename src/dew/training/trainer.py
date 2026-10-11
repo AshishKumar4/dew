@@ -1280,9 +1280,9 @@ class Trainer(Generic[Loss, Effects]):
         """The step `compile` builds first, traced as on a GPU of the CUDA `generation` and lowered
         for one (`dew.training.lowering`), on whatever devices this process has.
 
-        The step traces on an abstract mesh of that GPU's devices, from which JAX's Pallas lowering
-        reads the GPU, so only shapes cross over. A CPU-owned state's step realizes its parameters on
-        the host as it runs, and is not lowered whole."""
+        It traces on an abstract mesh of that GPU's devices, from which JAX's Pallas lowering reads the
+        GPU, at the base rung: a run that does not fit climbs to heavier remat, no other kernel. A
+        CPU-owned state's step realizes its parameters on the host as it runs, and is not lowered."""
         if self.host_master:
             raise ValueError("lower_for lowers a step whose state the devices hold; this layout keeps "
                              "the variables on the host")

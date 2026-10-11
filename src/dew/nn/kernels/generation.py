@@ -33,6 +33,12 @@ def assumed(generation: str | None) -> Iterator[None]:
         ASSUMED.reset(token)
 
 
+PALLAS_CHOICES = frozenset({'pallas', 'fla', 'triton'})
+"""The `KERNELS` values that run Dew's Pallas or Triton kernels, which lower through JAX's Pallas
+Triton backend for a GPU only: what the CPU dry run lowers (`dew.training.lowering`) and the kernel
+lab verifies on the GPU. 'flash' and 'cudnn' name CUDA libraries."""
+
+
 # `device_kind` of the TPU generations Dew names.
 TPU_GENERATIONS = {'TPU v4': 'v4', 'TPU v5 lite': 'v5e', 'TPU v5': 'v5p', 'TPU v5p': 'v5p',
                    'TPU v6 lite': 'v6e'}
