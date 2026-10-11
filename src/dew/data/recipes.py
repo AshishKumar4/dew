@@ -14,7 +14,8 @@ from typing import TYPE_CHECKING, Annotated, Literal, Protocol, TypeAliasType, r
 import numpy as np
 import tyro
 
-from dew.data.compile import _at, _preferred_read, _promoted, _random, _until, compile
+from dew.data.analysis import _at, _preferred_read, _random, _until
+from dew.data.compile import _promoted, compile
 from dew.data.dataset import Batch, DataPhase, Dataset, Loading, Records as IndexedRecords, record_argument
 from dew.data.pipeline import (
     Artifact,
