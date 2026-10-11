@@ -35,7 +35,7 @@ from dew.decision.data import Decisions
 from dew.decision.scoring import Brier, LogLoss, RankedProbability
 from dew.interop import sources
 from dew.objectives.base import Metric, Objective
-from dew.telemetry.profile import Profiler
+from dew.telemetry.profile import Profiler, region
 from dew.training import Trainer
 from dew.training.distributed import DevicePrefetchIterator
 from dew.training.runtime import prepare_process
@@ -124,20 +124,23 @@ class Measurement:
 
     def step(self, state: TrainState, reader: DevicePrefetchIterator, index: int) -> TrainState:
         started = time.perf_counter()
-        batch = next(reader)
+        with region("input.wait"):
+            batch = next(reader)
         wait = time.perf_counter() - started
         counted = self.counted.counts.get_nowait()
         shape = batch_shapes(batch)
         compile_seconds = 0.0
         if shape not in self.compiled:
             began = time.perf_counter()
-            self.compiled[shape] = self.trainer.compile(state, batch)
+            with region("compile"):
+                self.compiled[shape] = self.trainer.compile(state, batch)
             compile_seconds = time.perf_counter() - began
             self.compiles.append({
                 "microstep": index, "shape": list(batch["tokens"].shape), "seconds": compile_seconds,
                 "hlo_flops": self.trainer.flops_per_step, "memory": self.trainer.memory,
             })
-        state, loss, _, finite, accepted = self.compiled[shape](state, batch)
+        with region("train.step"):
+            state, loss, _, finite, accepted = self.compiled[shape](state, batch)
         loss.block_until_ready()
         values = jax.device_get((loss, finite, accepted))
         if not bool(values[1]) or not bool(values[2]) or not math.isfinite(float(values[0])):
@@ -152,7 +155,7 @@ class Measurement:
         })
         return state
 
-    def windows(self) -> list[dict[str, float]]:
+    def windows(self) -> list[dict[str, float | None]]:
         accumulation = self.config.trainer.accumulation
         warmup = self.config.warmup_updates * accumulation
         size = self.config.timed_updates * accumulation
@@ -175,7 +178,8 @@ class Measurement:
                 "input_wait_fraction": sum(row["input_wait_seconds"] for row in rows) / seconds,
                 "padding_fraction": 1 - real / sum(row["padded_tokens"] for row in rows),
                 "drift_fraction": after / before - 1,
-                "model_mfu": sum(row["model_flops"] for row in rows) / seconds / 312e12,
+                "model_mfu": (None if self.config.smoke else
+                              sum(row["model_flops"] for row in rows) / seconds / 312e12),
             })
         return results
 
