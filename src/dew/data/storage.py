@@ -23,7 +23,7 @@ from typing import BinaryIO, TypedDict
 
 import fsspec
 from filelock import FileLock
-from fsspec.implementations.cached import WholeFileCacheFileSystem
+from fsspec.implementations.cached import CachingFileSystem, WholeFileCacheFileSystem
 from fsspec.spec import AbstractBufferedFile, AbstractFileSystem
 from gcsfs import GCSFileSystem
 from huggingface_hub import HfFileSystem
@@ -432,7 +432,7 @@ class Store:
 
     def describe(self) -> Mapping[str, object]:
         fs, _ = self.resolve()
-        while isinstance(fs, WholeFileCacheFileSystem):
+        while isinstance(fs, CachingFileSystem):
             fs = fs.fs
         settings = {"url": self.url, "protocol": fs.protocol}
         if isinstance(fs, S3FileSystem):
@@ -470,7 +470,7 @@ class Store:
 
     def _backend(self) -> tuple[AbstractFileSystem, str, str]:
         fs, path = self.resolve()
-        while isinstance(fs, WholeFileCacheFileSystem):
+        while isinstance(fs, CachingFileSystem):
             fs = fs.fs
         protocol = fs.protocol
         schemes = (protocol,) if isinstance(protocol, str) else protocol
@@ -621,7 +621,10 @@ class Store:
             version
             or api.repo_info(resolved.repo_id, repo_type=resolved.repo_type, revision=resolved.revision).sha
         )
-        if version is None and fs.exists(path):
+        if parent is None:
+            raise ValueError(f"HF publication has no parent commit at {self.url}")
+        pinned = f"{resolved.repo_type}s/{resolved.repo_id}@{parent}/{resolved.path_in_repo}"
+        if version is None and fs.exists(pinned):
             raise PreconditionFailed(self.url)
         try:
             outcome = api.create_commit(
