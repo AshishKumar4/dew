@@ -195,15 +195,17 @@ class Measurement:
             raise ValueError("the comparison requires fp32 optimizer moments")
         if not all(bool(jnp.all(jnp.isfinite(leaf))) for leaf in leaves):
             raise ValueError("nonfinite final parameters or optimizer state")
+        measured = self.rows[self.config.warmup_updates * self.config.trainer.accumulation:]
         return {
             "arm": self.config.arm, "smoke": self.config.smoke,
             "loss_normalization": (
                 "per real token" if self.config.trainer.batch_tokens else "per scored question"),
             "analytic_mfu_scope": "C50 trunk work at real lengths, causal attention; head and remat excluded",
-            "model_flops_per_step": statistics.mean(row["model_flops"] for row in self.rows),
+            "model_flops_per_step": statistics.mean(row["model_flops"] for row in measured),
             "whole_run_compile_seconds": sum(float(row["seconds"]) for row in self.compiles),
             "compile_count": len(self.compiles), "compiles": self.compiles,
             "first_step_seconds": self.first_step_seconds, "windows": self.windows(), "microsteps": self.rows,
+            "first_step_scope": "after state placement: reader first batch and first compile",
             "live_peak_bytes": peak,
             "live_peak_scope": "process through timed end; excludes finite-state diagnostics",
             "checks": {"finite_losses_and_final_state": True, "fp32_parameters_and_moments": True,
