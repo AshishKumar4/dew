@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import overload
 
 import grain.python as pygrain
@@ -29,6 +30,34 @@ def chunk_lengths(lengths, chunk_len: int) -> np.ndarray:
     last = np.cumsum(counts)[kept] - 1
     sizes[last] = lengths[kept] - (counts[kept] - 1) * chunk_len
     return sizes
+
+
+def chunk_table(lengths, chunk_len: int) -> tuple[np.ndarray, np.ndarray]:
+    """The document each chunk `chunk_lengths` sizes is cut from, and where
+    in that document the chunk starts, both int64 and one entry per chunk."""
+    counts = chunk_counts(lengths, chunk_len)
+    documents = np.repeat(np.arange(len(counts), dtype=np.int64), counts)
+    first = np.repeat(np.cumsum(counts) - counts, counts)
+    return documents, (np.arange(len(documents), dtype=np.int64) - first) * chunk_len
+
+
+def packed_window(chunks: Sequence[Batch], window: int) -> Batch:
+    """`chunks`, each holding the same per-token fields, laid end to end in a
+    zero-padded window of `window` tokens, with the segment ids and positions
+    `PackedWindows` describes."""
+    fields = {key: np.zeros(window, value.dtype) for key, value in chunks[0].items()}
+    segment_ids = np.zeros(window, np.int32)
+    positions = np.zeros(window, np.int32)
+    filled = 0
+    for segment, chunk in enumerate(chunks, start=1):
+        length = len(next(iter(chunk.values())))
+        for key, value in chunk.items():
+            fields[key][filled:filled + length] = value
+        segment_ids[filled:filled + length] = segment
+        positions[filled:filled + length] = np.arange(length, dtype=np.int32)
+        filled += length
+    ids = next(iter(fields))
+    return {**fields, f"{ids}_segment_ids": segment_ids, f"{ids}_positions": positions}
 
 
 def first_fit(sizes: np.ndarray, window: int, bins: int) -> tuple[np.ndarray, np.ndarray]:
@@ -113,12 +142,7 @@ class DocumentChunks(_WrappingDataset):
     def __init__(self, parent: pygrain.MapDataset, lengths, chunk_len: int):
         super().__init__(parent)
         self._chunk_len = chunk_len
-        lengths = np.asarray(lengths, np.int64)
-        counts = chunk_counts(lengths, chunk_len)
-        self._document = np.repeat(np.arange(len(lengths), dtype=np.int64), counts)
-        first_chunk = np.concatenate([[0], np.cumsum(counts)[:-1]])
-        self._offset = (np.arange(len(self._document), dtype=np.int64)
-                        - first_chunk[self._document]) * chunk_len
+        self._document, self._offset = chunk_table(lengths, chunk_len)
 
     def __len__(self) -> int:
         return len(self._document)
@@ -151,6 +175,7 @@ class PackedWindows(_WrappingDataset):
     document lengths alone, in file order, before any sharding. Window w
     therefore holds the same chunks at every process count, and the training
     stream shuffles, shards and counts windows as it does any other record.
+    `order` and `starts` hold that plan as `first_fit` returns it.
 
     `documents` is any dataset of per-token fields whose lengths are
     `lengths`. `described` names it the way a saved position needs
@@ -163,7 +188,7 @@ class PackedWindows(_WrappingDataset):
         super().__init__(DocumentChunks(documents, lengths, window))
         self._window, self._bins = window, bins
         self._described = described
-        self._order, self._starts = first_fit(chunk_lengths(lengths, window), window, bins)
+        self.order, self.starts = first_fit(chunk_lengths(lengths, window), window, bins)
 
     def __repr__(self) -> str:
         # A saved position names the order it counts into (`dew.position`),
@@ -172,28 +197,15 @@ class PackedWindows(_WrappingDataset):
                 f"bins={self._bins}, windows={len(self)})")
 
     def __len__(self) -> int:
-        return len(self._starts) - 1
+        return len(self.starts) - 1
 
     def record(self, index: int) -> Batch:
         chunks = []
-        for position in self._order[self._starts[index]:self._starts[index + 1]]:
+        for position in self.order[self.starts[index]:self.starts[index + 1]]:
             chunk = self._parent[int(position)]
             if chunk is None:
                 raise ValueError(f"chunk {int(position)} of the packed corpus is missing")
             chunks.append(chunk)
-        fields = {key: np.zeros(self._window, value.dtype)
-                  for key, value in chunks[0].items()}
-        segment_ids = np.zeros(self._window, np.int32)
-        positions = np.zeros(self._window, np.int32)
-        filled = 0
-        for segment, chunk in enumerate(chunks, start=1):
-            length = len(next(iter(chunk.values())))
-            for key, value in chunk.items():
-                fields[key][filled:filled + length] = value
-            segment_ids[filled:filled + length] = segment
-            positions[filled:filled + length] = np.arange(length, dtype=np.int32)
-            filled += length
-        ids = next(iter(fields))
-        return {**fields, f"{ids}_segment_ids": segment_ids, f"{ids}_positions": positions}
+        return packed_window(chunks, self._window)
 
 
