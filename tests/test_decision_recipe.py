@@ -306,7 +306,7 @@ def test_a_decision_run_keeps_its_loop_memory_options_under_lora(tmp_path):
     built. A trained and reloaded tiny multimodal Qwen keeps all three
     choices, and the trainer's next rung starts above the selected one.
     """
-    from dew.nn.backbones.decoder_block import REMAT_POLICIES
+    from dew.nn.backbones.decoder_block import DECODER_REMAT, REMAT_POLICIES
 
     mixture = _mixture(tmp_path, _requests(16, joint=True), [], held=4)
     flags = [*_flags(mixture, tmp_path / "runs"), "--pretrained", str(QWEN),
@@ -322,7 +322,8 @@ def test_a_decision_run_keeps_its_loop_memory_options_under_lora(tmp_path):
     assert backbone.language_model.loop.backprop_steps == 1
     assert backbone.language_model.loop.remat is True
     assert backbone.language_model.remat == REMAT_POLICIES["minimal"]
-    assert backbone.recompute_more().language_model.remat == REMAT_POLICIES["full"]
+    next_rung = DECODER_REMAT[DECODER_REMAT.index(REMAT_POLICIES["minimal"]) + 1]
+    assert backbone.recompute_more().language_model.remat == next_rung
 
 
 @pytest.mark.parametrize("fields,checkpoint,message", [
