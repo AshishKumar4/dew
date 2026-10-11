@@ -249,6 +249,10 @@ def _laid_back(values: jax.Array, inputs: DecisionInputs) -> jax.Array:
         grid = values.reshape(batch, count, width, *values.shape[2:])
         return jnp.where(inputs.options.reshape(*inputs.options.shape, *(1,) * (grid.ndim - 3)), grid, 0)
     assert inputs.slotted is not None
+    # A padding slot indexes slot 0 (`compacted`) and so computes slot 0's own
+    # values, and the scatter's gradient masks a duplicate index; dropping it
+    # still keeps a padding slot from writing anywhere on the grid, a row of
+    # no real options' slot 0 included.
     target = jnp.where(inputs.slotted, inputs.option_slots, count * width)
     laid = jnp.zeros((batch, count * width, *values.shape[2:]), values.dtype)
     laid = laid.at[jnp.arange(batch)[:, None], target].set(values, mode="drop")
