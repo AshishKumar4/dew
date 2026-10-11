@@ -70,6 +70,8 @@ def _checked(root: Store, entry: Mapping[str, object]) -> bytes:
     path = entry["path"]
     if not isinstance(path, str):
         raise ValueError("artifact object path is not a string")
+    if path.startswith("/") or any(part in ("", ".", "..") for part in path.split("/")):
+        raise ValueError(f"artifact object path escapes its root: {path!r}")
     payload = root.child(path).read()
     if len(payload) != entry["bytes"] or _hash(payload) != entry["sha256"]:
         raise OSError(
@@ -444,6 +446,7 @@ class _Writer:
         self.spool_bytes = 0
         self.admitting = True
         self.closed = False
+        self.closing = False
         self.volatile = volatile
         self.expected = expected
         self.seal_future: Future | None = None
@@ -462,8 +465,8 @@ class _Writer:
     def process(self, row_id: RowId, ordinal: int, value: Record, transform: Transform | None) -> CachedValue:
         row_key = _row_key(row_id)
         with self.lock:
-            existing = self.pending.get(row_key)
-            completed = self.index.execute(
+            existing = None if self.closing else self.pending.get(row_key)
+            completed = None if self.closing else self.index.execute(
                 "SELECT shard, offset, digest FROM inputs WHERE id=?", (row_key,)
             ).fetchone()
         if existing is not None:
@@ -484,9 +487,13 @@ class _Writer:
         outputs = (value,) if transform is None else transform(ordinal, value)
         if not isinstance(outputs, tuple):
             raise TypeError("cache input transform must return a tuple of outputs")
+        if self.closing:
+            return outputs if transform is not None else outputs[0]
         payload = encode(outputs)
         transient = any(isinstance(output, Rejected) and not output.permanent for output in outputs)
         with self.lock:
+            if self.closing:
+                return outputs if transform is not None else outputs[0]
             existing = self.pending.get(row_key)
             if existing is not None:
                 if existing != payload:
@@ -666,17 +673,25 @@ class _Writer:
                 raise
 
     def close(self) -> None:
-        if self.closed:
-            return
-        self.seal()
-        if self.seal_future is not None:
-            self.seal_future.result()
-        self.closed = True
-        self.pool.shutdown(wait=True, cancel_futures=True)
-        self.index.close()
-        self.directory.cleanup()
-        if self.pin is not None:
-            self.pin.close()
+        with self.lock:
+            if self.closing:
+                return
+            self.closing = True
+        try:
+            self.seal()
+            if self.seal_future is not None:
+                self.seal_future.result()
+        except OSError as error:
+            if self.cache.on_full == "block":
+                raise
+            _log.warning("cache %s remains filling after upload failure: %s", self.root.url, error)
+        finally:
+            self.closed = True
+            self.pool.shutdown(wait=True, cancel_futures=True)
+            self.index.close()
+            self.directory.cleanup()
+            if self.pin is not None:
+                self.pin.close()
 
 
 class _CachedMap(grain.MapDataset[CachedValue]):
@@ -728,12 +743,44 @@ class _CachedMap(grain.MapDataset[CachedValue]):
         if "_writer" in self.__dict__:
             self.writer.close()
 
+    def to_iter_dataset(self, read_options: grain.ReadOptions | None = None, *, allow_nones: bool = False
+                        ) -> grain.IterDataset[CachedValue]:
+        return _ClosingCache(super().to_iter_dataset(read_options, allow_nones=allow_nones), self)
+
     def __getstate__(self) -> dict:
         return {key: value for key, value in self.__dict__.items() if key not in ("_writer", "writer_lock")}
 
     def __setstate__(self, state: Mapping[str, object]) -> None:
         self.__dict__.update(state)
         self.writer_lock = threading.RLock()
+
+
+class _ClosingCache(grain.IterDataset[CachedValue]):
+    def __init__(self, parent: grain.IterDataset[CachedValue], owner: _CachedMap):
+        super().__init__(parent)
+        self.input_parent, self.owner = parent, owner
+
+    def __iter__(self) -> grain.DatasetIterator[CachedValue]:
+        return _ClosingCacheIterator(self.input_parent.__iter__(), self.owner)
+
+
+class _ClosingCacheIterator(grain.DatasetIterator[CachedValue]):
+    def __init__(self, parent: grain.DatasetIterator[CachedValue], owner: _CachedMap):
+        super().__init__(parent)
+        self.input_parent, self.owner = parent, owner
+
+    def __next__(self) -> CachedValue:
+        return next(self.input_parent)
+
+    def get_state(self) -> Mapping[str, object]:
+        return self.input_parent.get_state()
+
+    def set_state(self, state: Mapping[str, object]) -> None:
+        self.input_parent.set_state(state)
+
+    def close(self) -> None:
+        self.input_parent.close()
+        self.owner.close()
 
 
 @dataclass(frozen=True)
