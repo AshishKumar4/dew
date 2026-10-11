@@ -50,20 +50,24 @@ def recipe(name: str):
 
 
 def backbone(directory: Path) -> Path:
-    """The tiny Qwen 3.5's decoder at the port's widths, freshly initialized, saved with its tokenizer."""
+    """The tiny Qwen 3.5's decoder at the port's widths, freshly initialized, written in its Hugging
+    Face layout with its tokenizer. The text config is written as it is: Dew derives none for a
+    Gated DeltaNet hybrid (`refuse_lossy_export`)."""
     import jax
     import numpy as np
 
-    from dew.data.text import HFTokenizer
-    from dew.interop.hf_decoders import translate_config
-    from dew.interop.pretrained import PretrainedDecoder
+    from dew.interop.hf_decoders import export_decoder_weights, translate_config
+    from dew.interop.safetensors_io import save_hf_layout
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.registry import from_record
 
-    text = {**json.loads((QWEN / "config.json").read_text())["text_config"], **WIDTHS}
+    text = {**json.loads((QWEN / "config.json").read_text())["text_config"], **WIDTHS,
+            "architectures": ["Qwen3_5ForCausalLM"]}
     model = from_record(CausalTransformer, {**translate_config(text), "dtype": "float32"})
     variables = model.init(jax.random.key(0), np.zeros((1, 4), np.int32))
-    PretrainedDecoder.from_model(model, variables, tokenizer=HFTokenizer(str(QWEN))).save(directory)
+    save_hf_layout(export_decoder_weights(model, variables, text), text, directory)
+    for asset in [*QWEN.glob("tokenizer*"), QWEN / "chat_template.jinja"]:
+        (directory / asset.name).write_bytes(asset.read_bytes())
     return directory
 
 
