@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import itertools
 import os
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -113,7 +114,7 @@ class DecisionRunConfig(RunConfig):
         lengths = self.bucket_lengths
         if len(lengths) > 6 or any(length < 1 for length in lengths):
             raise ValueError("--bucket-lengths needs at most six positive lengths")
-        if any(before >= after for before, after in zip(lengths, lengths[1:])):
+        if any(before >= after for before, after in itertools.pairwise(lengths)):
             raise ValueError("--bucket-lengths must increase without duplicates")
         if lengths and self.trainer.batch_tokens is None:
             raise ValueError("--bucket-lengths selects token-budget batches; set --trainer.batch-tokens "
