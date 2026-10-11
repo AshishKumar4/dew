@@ -30,8 +30,8 @@ from dew.decision import (
     Question,
     Specials,
 )
-from dew.decision.data import Decisions as DecisionRecipe
 from dew.decision.clef import ClefHead
+from dew.decision.data import Decisions as DecisionRecipe
 from dew.decision.layout import compacted
 from dew.decision.task import laid_out
 from dew.nn.backbones.causal_transformer import CausalTransformer
