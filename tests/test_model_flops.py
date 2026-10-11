@@ -111,7 +111,7 @@ def test_dit_counts_routed_tokens_modulation_and_output_but_not_remat():
     model = SimpleDiT(emb_features=8, num_heads=2, num_layers=2, patch_size=2)
     block = 24 * 8 * 8 * 7 + 4 * 8 * 29 + 12 * 8 * 8 * 2
     output = 2 * 8 * 4 * 3 * 7
-    inputs = 2 * 12 * 8 * 7 + 4 * 4 * 8 * 8 * 2
+    inputs = 2 * 12 * 8 * 7 + 4 * 4 * 8 * 8 * 2 + 2 * 32 * 32 * 2
     assert model.image_flops(LENGTHS, 3) == 2 * block + output + inputs
     assert model.clone(remat='full').image_flops(LENGTHS, 3) == model.image_flops(LENGTHS, 3)
     routed = model.clone(routes=((0.5, 0, 0),))
