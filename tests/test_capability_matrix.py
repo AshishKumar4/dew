@@ -479,8 +479,9 @@ def assert_trains(objective, batch: Mapping, directory: Path, *, evaluated: Mapp
                   data=None, sampled: bool = True, rollout=None, scores: bool = True) -> Trained:
     """The proof every supported cell gives, on `batch`.
 
-    The first batch passes the objective's input check and a cut one does
-    not. The trainer builds the tree, and its step on the batch logs a finite
+    The first batch passes the objective's input check, and one whose sample
+    runs a position past its declared bound, which no geometry admits, fixed
+    or variable, does not. The trainer builds the tree, and its step on the batch logs a finite
     loss and leaves every trained leaf finite, some of them moved: Adam's
     first update moves a leaf exactly where its gradient is nonzero, and a
     gradient that is not finite would leave the leaf so. The run checkpoints
@@ -492,10 +493,12 @@ def assert_trains(objective, batch: Mapping, directory: Path, *, evaluated: Mapp
     """
     if objective.inputs is not None and sampled:
         objective.inputs.check(batch)
-        cut = {key: value[:, :-1] if key == objective.inputs.sample.key else value
-               for key, value in batch.items()}
+        sample = objective.inputs.sample
+        longer = {key: np.pad(value, [(0, 0), (0, sample.shape[0] + 1 - np.shape(value)[1]),
+                                      *[(0, 0)] * (np.ndim(value) - 2)]) if key == sample.key else value
+                  for key, value in batch.items()}
         with pytest.raises(ValueError, match="shape"):
-            objective.inputs.check(cut)
+            objective.inputs.check(longer)
     tracker = RecordingTracker()
     checkpoints = Checkpoints(str(directory))
     trainer = Trainer(objective, optax.adam(1e-3), key=0, checkpoints=checkpoints, tracker=tracker,

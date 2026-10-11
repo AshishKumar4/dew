@@ -2215,7 +2215,7 @@ class Imaged:
     reconstruction objective trains on, so what it learns depends on which
     records each step read."""
 
-    def __call__(self, element):
+    def __call__(self, element) -> dict[str, np.ndarray]:
         tokens = np.asarray(element["text"], np.int64)
         return {"image": np.resize(tokens % 256, (RES, RES, 3)).astype(np.uint8)}
 
@@ -2240,7 +2240,8 @@ def matrix_data(read: str, cached: bool, rejecting: bool, packed: bool, cache_di
     pipeline = pipeline.map(Imaged(), identity="imaged@1")
     indexed = read == "memory" or (read == "indexed" and not (cached or rejecting or packed))
     order = pipeline.shuffle(0, window=None if indexed else 8).repeat()
-    return compile(order.batch(BATCH), read=read, seed=0, loading=Loading(workers=0))
+    return compile(order.batch(BATCH), read=read, seed=0,
+                   loading=Loading(workers=0, threads=1, read_buffer=1))
 
 
 def mode_matrix(args) -> dict:
