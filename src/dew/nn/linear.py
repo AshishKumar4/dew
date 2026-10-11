@@ -512,7 +512,7 @@ def chunk_gated_delta_rule(query, key, value, g, beta, state=None,
     if implementation not in GATED_DELTA_RULES:
         raise ValueError(f"implementation must be one of {list(GATED_DELTA_RULES)}, got {implementation!r}")
     if gated_rule(implementation) == 'fla':
-        refusal = fla_refusal(key, value, chunk_size)
+        refusal = fla_refusal(query, key, value, chunk_size)
         if refusal is None:
             return _fla_rule(query, key, value, g, beta, state, chunk_size)
         # 'auto' falls back to Dew's own measured kernels (`chunk_states_kernel`), an explicit 'fla' to XLA.
@@ -530,9 +530,9 @@ def gated_rule(implementation: str) -> str:
     return measured_kernel('gated_delta_rule', 'xla') if implementation == 'auto' else implementation
 
 
-def fla_refusal(key, value, chunk_size: int) -> str | None:
-    """Why the port does not take a rule over these `[B, S, Hk, Dk]` keys and
-    `[B, S, Hv, Dv]` values, or None where it does: a GPU it compiles for, or
+def fla_refusal(query, key, value, chunk_size: int) -> str | None:
+    """Why the port does not take a rule over these `[B, S, Hk, Dk]` queries and
+    keys and `[B, S, Hv, Dv]` values, or None where it does: a GPU it compiles for, or
     the CPU interpreting it; reverse mode; fla's 64-token chunks; key and
     value widths its 64-wide blocks tile; whole key heads per value head; and
     operands no mesh axis splits."""
@@ -545,7 +545,7 @@ def fla_refusal(key, value, chunk_size: int) -> str | None:
          f"keys {width} and values {columns} wide; the port tiles keys of 64, 128 or 256 and values by 64"),
         (value.shape[2] % key.shape[2] == 0, f"{value.shape[2]} value heads over {key.shape[2]} key heads"),
         (seen_whole(key), "a mesh axis splits the rule's operands, and the kernels see whole arrays"),
-    ) or fla_gdn.rule_refusal(key, value, chunk_size)
+    ) or fla_gdn.rule_refusal(query, key, value, chunk_size)
 
 
 def _fla_rule(query, key, value, g, beta, state, chunk_size: int):
@@ -799,10 +799,12 @@ class GatedDeltaNet(nn.Module):
             state = None if held is None else held.astype(wide)
             if S > 1 and gated_rule(self.implementation) == 'fla':
                 # fla's layer hands its rule the projections' dtype, the
-                # queries and keys on their own heads and beta beside them.
+                # queries and keys on their own heads and beta beside them;
+                # a call the port turns down keeps the wide operands below.
                 rows, keys, values, gates = (x.astype(operand) for x in (query, key, value, beta))
-                return chunk_gated_delta_rule(rows, keys, values, g, gates, state, self.chunk_size,
-                                              self.implementation)
+                if fla_refusal(rows, keys, values, self.chunk_size) is None:
+                    return chunk_gated_delta_rule(rows, keys, values, g, gates, state, self.chunk_size,
+                                                  self.implementation)
             query, key = self._expand_kv(query), self._expand_kv(key)
             if S == 1 and held is not None and delta_rule.fits(held):
                 return decode_gated_delta_rule(query, key, value, g, beta, held,

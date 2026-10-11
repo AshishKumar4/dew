@@ -12,13 +12,9 @@ from dew.nn.kernels import fla_gdn, generation
 from dew.nn.linear import chunk_gated_delta_rule, fla_refusal, l2norm
 
 
-def test_the_declared_shapes_are_the_training_shapes():
-    assert fla_gdn.CONFIG_SHAPES == {
-        "0.8b": {"batch": 8, "length": 3072, "key_heads": 16, "value_heads": 16,
-                 "width": 128, "columns": 128, "chunk": 64},
-        "9b": {"batch": 4, "length": 3072, "key_heads": 16, "value_heads": 32,
-               "width": 128, "columns": 128, "chunk": 64},
-    }
+def test_the_training_shapes_reach_the_ports_widest_heads():
+    assert max(shape[side] for shape in support.TRAINING_SHAPES.values()
+               for side in ("width", "columns")) == fla_gdn.WIDEST == 128
 
 
 def test_each_triton_gpu_takes_the_table_its_block_holds():
@@ -84,9 +80,9 @@ def test_the_fla_rule_refuses_keys_wider_than_its_configs_and_falls_back_cleanly
     k = l2norm(jax.random.normal(jax.random.key(89), q.shape))
     v = jax.random.normal(jax.random.key(97), (1, 64, 2, 128))
     g, beta = jnp.full(v.shape[:3], -0.1), jnp.full(v.shape[:3], 0.5)
-    assert fla_gdn.rule_refusal(k, v, 64) == (
+    assert fla_gdn.rule_refusal(k, k, v, 64) == (
         "keys 256 and values 128 wide; the port's configs compile for at most 128")
-    assert fla_refusal(k, v, 64) is not None
+    assert fla_refusal(k, k, v, 64) is not None
     got = chunk_gated_delta_rule(q, k, v, g, beta, implementation="fla")
     want = chunk_gated_delta_rule(q, k, v, g, beta, implementation="xla")
     for mine, theirs in zip(got, want, strict=True):
@@ -96,20 +92,32 @@ def test_the_fla_rule_refuses_keys_wider_than_its_configs_and_falls_back_cleanly
 def test_the_fla_rule_refuses_a_key_head_serving_no_power_of_two_value_heads(monkeypatch):
     monkeypatch.setattr(generation, "device_generation", lambda: "sm120")
     k, v = jnp.zeros((1, 64, 1, 128), jnp.bfloat16), jnp.zeros((1, 64, 3, 128), jnp.bfloat16)
-    assert fla_gdn.rule_refusal(k, v, 64) == "3 value heads a key head; dqkwg's block holds a power of two"
+    assert fla_gdn.rule_refusal(k, k, v, 64) == "3 value heads a key head; dqkwg's block holds a power of two"
+
+
+def test_a_rule_with_float32_queries_over_bf16_keys_runs_xla_not_the_port():
+    q = l2norm(jax.random.normal(jax.random.key(101), (1, 64, 1, 64)))
+    k = l2norm(jax.random.normal(jax.random.key(103), q.shape)).astype(jnp.bfloat16)
+    v = jax.random.normal(jax.random.key(107), (1, 64, 2, 64)).astype(jnp.bfloat16)
+    g, beta = jnp.full(v.shape[:3], -0.1), jnp.full(v.shape[:3], 0.5, jnp.bfloat16)
+    got = chunk_gated_delta_rule(q, k, v, g, beta, implementation="fla")
+    want = chunk_gated_delta_rule(q, k, v, g, beta, implementation="xla")
+    for mine, theirs in zip(got, want, strict=True):
+        np.testing.assert_array_equal(np.asarray(mine), np.asarray(theirs))
 
 
 def test_the_fla_rule_refuses_a_gpu_without_its_configs(monkeypatch):
     monkeypatch.setattr(generation, "device_generation", lambda: "sm75")
     k, v = jnp.zeros((1, 64, 1, 128), jnp.bfloat16), jnp.zeros((1, 64, 2, 128), jnp.bfloat16)
-    assert fla_gdn.rule_refusal(k, v, 64) == "the port has no bfloat16 configs for sm75"
+    assert fla_gdn.rule_refusal(k, k, v, 64) == "the port has no bfloat16 configs for sm75"
 
 
-def test_the_fla_rule_refuses_a_dtype_without_configs_where_it_interprets_too():
+def test_the_fla_rule_refuses_a_dtype_without_configs_where_it_interprets_too(monkeypatch):
+    monkeypatch.setattr(generation, "device_generation", lambda: "cpu")
     with jax.enable_x64(new_val=True):
         k, v = jnp.zeros((1, 64, 1, 64), jnp.float64), jnp.zeros((1, 64, 2, 64), jnp.float64)
-        assert fla_gdn.rule_refusal(k, v, 64) == "the port has no float64 configs for cpu"
-        assert fla_refusal(k, v, 64) == "the port has no float64 configs for cpu"
+        assert fla_gdn.rule_refusal(k, k, v, 64) == "the port has no float64 configs for cpu"
+        assert fla_refusal(k, k, v, 64) == "the port has no float64 configs for cpu"
 
 
 @pytest.mark.parametrize("target", ["sm80", "sm89", "sm120"])
@@ -119,7 +127,7 @@ def test_every_declared_kernel_config_compiles_on_tritons_compiler_within_its_bl
     no more shared memory than its GPU's block holds. A kernel that does not compile (a two-result
     inline asm, a mixed-dtype dot) or compiles pathologically slowly (an IEEE fp32 dot on sm80) fails
     here and never reaches a GPU."""
-    pytest.importorskip("triton", reason="the test extra pins Triton on Linux x86_64")
+    pytest.importorskip("triton")
     found = compile_kernels(support.kernel_cases(target), target)
     assert found, "the compile gate must not be vacuous"
     failures = [f"{record['name']}: {record['error']}" if "error" in record else

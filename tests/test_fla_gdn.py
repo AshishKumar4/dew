@@ -408,10 +408,12 @@ def test_the_fla_rule_names_what_the_port_does_not_take():
     """Shapes outside the port's blocks, and chunks other than fla's, run XLA under a named reason;
     an unknown implementation is refused."""
     key, value = jnp.zeros((1, 64, 2, 64)), jnp.zeros((1, 64, 4, 64))
-    assert fla_refusal(key, value, 64) is None
-    assert "chunks of 32" in fla_refusal(key, value, 32)
-    assert "keys 96" in fla_refusal(jnp.zeros((1, 64, 2, 96)), value, 64)
-    assert "4 value heads over 3 key heads" in fla_refusal(jnp.zeros((1, 64, 3, 64)), value, 64)
+    wide, odd = jnp.zeros((1, 64, 2, 96)), jnp.zeros((1, 64, 3, 64))
+    assert fla_refusal(key, key, value, 64) is None
+    assert "chunks of 32" in fla_refusal(key, key, value, 32)
+    assert "keys 96" in fla_refusal(wide, wide, value, 64)
+    assert "4 value heads over 3 key heads" in fla_refusal(odd, odd, value, 64)
+    assert "one dtype for queries, keys and values" in fla_refusal(key.astype(jnp.bfloat16), key, value, 64)
     with pytest.raises(ValueError, match="implementation must be one of"):
         gates = jnp.zeros((1, 64, 2))
         chunk_gated_delta_rule(key, key, key, gates, gates, implementation="flash")

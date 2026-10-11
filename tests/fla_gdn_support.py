@@ -10,6 +10,14 @@ import jax.numpy as jnp
 
 from dew.nn.kernels import fla_gdn
 
+TRAINING_SHAPES = {
+    "0.8b": {"batch": 8, "length": 3072, "key_heads": 16, "value_heads": 16,
+             "width": 128, "columns": 128, "chunk": 64},
+    "9b": {"batch": 4, "length": 3072, "key_heads": 16, "value_heads": 32,
+           "width": 128, "columns": 128, "chunk": 64},
+}
+"""The training shapes every declared config compiles at; their widest heads are `fla_gdn.WIDEST`."""
+
 
 class KernelCase(NamedTuple):
     """One declared kernel call for the compile test (tests/kernel_compile.py): the kernel with its
@@ -59,7 +67,7 @@ def kernel_cases(target: str) -> Iterator[KernelCase]:
             continue
         for kernel, config in table.items():
             flags = "-".join(f"{key}{value}" for key, value in sorted(config.items()))
-            for shape_name, shape in fla_gdn.CONFIG_SHAPES.items():
+            for shape_name, shape in TRAINING_SHAPES.items():
                 for reverse in ((False, True) if kernel == "chunk_local_cumsum" else (False,)):
                     name = f"{target}/{kernel}/{dtype}/{flags}/{shape_name}" + "/reverse" * reverse
                     yield KernelCase(name, functools.partial(_case_call, kernel, config, shape, dtype,
