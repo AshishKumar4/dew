@@ -100,6 +100,11 @@ class _Locality(Protocol):
     def locality(self) -> tuple[tuple[int, ...], bool]: ...
 
 
+@runtime_checkable
+class _OrderFacts(Protocol):
+    def order_fingerprints(self) -> Mapping[str, str]: ...
+
+
 def _leaves(pipeline: Pipeline) -> Iterator[Pipeline]:
     if isinstance(pipeline.source, (Mixture, Phases)):
         for child in pipeline.source.pipelines:
@@ -164,7 +169,17 @@ def _promoted(pipeline: Pipeline) -> tuple[Pipeline, tuple[str, ...]]:
         references = tuple(reference for _, held in branches for reference in held)
     for index, stage in enumerate(pipeline.stages):
         if isinstance(stage, Artifact) and isinstance(stage.cache, Generation):
-            return (dataclasses.replace(pipeline, source=stage.cache.source(), stages=pipeline.stages[index + 1:]),
+            from dew.data.packing import PackedSource, plan_name
+
+            suffix = pipeline.stages[index + 1:]
+            promoted: Source = stage.cache.source()
+            if suffix and isinstance(suffix[0], Pack):
+                pack = suffix[0]
+                plans = record(stage.cache.manifest.get("plan", {}), "published plans")
+                if plan_name(pack, "accepted") in plans:
+                    promoted = PackedSource(promoted, stage.cache, pack)
+                    suffix = suffix[1:]
+            return (dataclasses.replace(pipeline, source=promoted, stages=suffix),
                     (*references, f"generation {stage.cache.url}"))
     return dataclasses.replace(pipeline, source=source), references
 
@@ -1312,7 +1327,9 @@ def _derived(pipeline: Pipeline, seed: int, read: Read) -> Mapping[str, str]:
         if isinstance(source, _Memory):
             arrays.update({f"{index}/{key}": value for key, value in source.derived.items()})
         lengths = source.lengths()
-        if lengths is not None:
+        if isinstance(source, _OrderFacts):
+            arrays.update({f"{index}/{key}": value for key, value in source.order_fingerprints().items()})
+        if lengths is not None and f"{index}/lengths" not in arrays:
             arrays[f"{index}/lengths"] = fingerprint(lengths)
         if any(isinstance(stage, Shuffle) and stage.block_shards is not None for stage in leaf.stages):
             if not isinstance(source, _Locality):
@@ -1802,6 +1819,19 @@ def publish(pipeline: Pipeline, cache, *, read: Read = "streamed", provision: bo
         raise TypeError("publish needs a Cache destination")
     if isinstance(pipeline.source, (Mixture, Phases)):
         raise ValueError("publish each source prefix before mixing")
+    _capabilities((pipeline,), read, provision)
+    if any(isinstance(stage, Configured) for stage in pipeline.stages):
+        pipeline = _configured(pipeline, _metadata((pipeline,), read), read)
+    planned = next((index for index, stage in enumerate(pipeline.stages) if isinstance(stage, Pack)), None)
+    builder = None
+    if planned is not None:
+        from dew.data.packing import PackingPlan
+
+        packing = pipeline.stages[planned]
+        if not isinstance(packing, Pack) or planned != len(pipeline.stages) - 1:
+            raise ValueError("publication accepts one terminal packing stage after the cached prefix")
+        builder = PackingPlan(packing)
+        pipeline = dataclasses.replace(pipeline, stages=pipeline.stages[:planned])
     cached = pipeline.cache(cache)
     _check(cached, read)
     manifest = _cache_manifest(pipeline.source, pipeline.stages, read)
@@ -1811,4 +1841,4 @@ def publish(pipeline: Pipeline, cache, *, read: Read = "streamed", provision: bo
             pass
     finally:
         iterator.close()
-    return cache.publish(manifest, pipeline.source)
+    return cache.publish(manifest, pipeline.source, plan=builder)
