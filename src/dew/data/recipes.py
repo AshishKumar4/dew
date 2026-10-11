@@ -36,7 +36,7 @@ from dew.data.steps.image import (
     RandomCrop,
     Resize,
 )
-from dew.data.steps.text import Chunks, LengthPolicy, Tokenize
+from dew.data.steps.text import Chunks, LengthPolicy, Tokenize, ValidTargets
 from dew.data.steps.video import Audio, DecodeClip, VideoPath
 
 type SourceValue = Source | str | Sequence[Batch] | Mapping[str, Sequence]
@@ -293,6 +293,7 @@ class Text:
     validation: Validation = None
     split: str = "train"
     phases: tuple[DataPhase, ...] = ()
+    token_holdout: HoldOut | None = None
 
     def pipelines(self) -> tuple[Pipeline, Pipeline | None, tuple[HostStep, ...]]:
         from dew.data.sources.files import TokenFiles
@@ -312,7 +313,7 @@ class Text:
             weights = [float(self.source[path]) for path in sorted(self.source)]
             trains = [branch[0] for branch in branches]
             held = [branch[1] for branch in branches]
-            train = trains[0] if len(trains) == 1 else trains[0].mix(*trains[1:], weights=weights)
+            train = trains[0] if len(trains) == 1 else trains[0].mix(*trains[1:], weights=weights, tokens=ValidTargets())
             scored = [branch for branch in held if branch is not None]
             validation = (None if not scored else scored[0] if len(scored) == 1
                           else scored[0].mix(*scored[1:], weights=weights))
@@ -322,6 +323,11 @@ class Text:
             return self._token_pipelines(stored)
         prefix = Pipeline(stored).map(Tokenize(self.tokenizer, self.field, self.eos)).stages
         train, held = _branches(self.source, self.validation, split=self.split, prefix=prefix)
+        if self.token_holdout is not None:
+            if self.validation is not None or self.token_holdout.fraction is None:
+                raise ValueError("token_holdout needs fraction= and no separate validation source")
+            held = train.token_split(self.token_holdout.fraction, held=True)
+            train = train.token_split(self.token_holdout.fraction, held=False)
         if self.pack is None:
             train = train.windows(self.seq_len, stride=self.stride)
             held = None if held is None else held if isinstance(self.validation, Pipeline) else held.windows(self.seq_len)
