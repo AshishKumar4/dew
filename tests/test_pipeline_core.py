@@ -401,3 +401,19 @@ def test_a_stage_without_a_lowering_is_refused_at_compile_time():
 
     with pytest.raises(ValueError, match=r"Foreign in .* is not a pipeline stage"):
         compile(Pipeline(source()).then(Foreign()).batch(4), loading=READ)
+
+
+def test_shares_agree_on_one_identity_and_resume_only_their_own_rows():
+    """A per-share order is agreed across the pool without the share index,
+    which only a share's saved position keeps."""
+    thirds = Pipeline(source()).filter(lambda row: int(row["id"]) % 3 > 0, identity="thirds@1")
+    data = compile(thirds.batch(4), loading=READ)
+    first, second = data.train(DataPartition(0, 2)), data.train(DataPartition(1, 2))
+    try:
+        assert first.identity() == second.identity()
+        next(first)
+        with pytest.raises(ValueError, match="topology changed"):
+            second.set_state(first.get_state())
+    finally:
+        first.close()
+        second.close()
