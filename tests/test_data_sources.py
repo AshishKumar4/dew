@@ -85,6 +85,7 @@ def test_tfds_source_metadata_and_decoder_identity_need_no_data_scan():
     )
     assert decoded.snapshot() != raw.snapshot()
     assert isinstance(raw.records("indexed")[0]["image"], bytes)
+    assert raw.with_split("test").metadata()["rows"] == 4
 
 
 def test_remote_tfds_requires_explicit_provisioning_before_native_reads():
@@ -331,6 +332,8 @@ def test_exported_token_lengths_support_indexed_spans_without_record_scan():
     from dew.data.sources import source as resolve
 
     assert isinstance(resolve(root), TokenFiles)
+    with pytest.raises(ValueError, match="one split"):
+        source.with_split("val")
 
 
 def test_remote_indexed_arrayrecords_read_only_the_selected_physical_shard(monkeypatch):
