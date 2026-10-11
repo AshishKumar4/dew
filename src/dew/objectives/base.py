@@ -832,6 +832,16 @@ class Objective(ABC, Generic[Loss, Effects]):
         """
         return None
 
+    def restore_head_tile(self, tile: tuple[int, int] | None) -> None:
+        """Set the head's backward tile to `tile`, None keeping its whole logits.
+
+        The trainer fits each batch shape it meets on its own, so before it
+        compiles a new shape it puts the objective back at the run's own rung,
+        the head tile included (`tile_head` only ever moves up). An objective
+        with no such head has only None to restore."""
+        if tile is not None:
+            raise ValueError(f"{type(self).__name__} has no head to tile, so no tile {tile} to restore")
+
     def apply_effects(self, variables: Variables, effects: Effects) -> Variables:
         """Return replacement nonparameter collections computed from one accepted window's `effects`.
 
