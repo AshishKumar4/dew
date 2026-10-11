@@ -112,6 +112,12 @@ def test_the_fla_rule_refuses_keys_wider_than_its_configs_and_falls_back_cleanly
         np.testing.assert_array_equal(np.asarray(mine), np.asarray(theirs))
 
 
+def test_the_fla_rule_refuses_a_key_head_serving_no_power_of_two_value_heads(monkeypatch):
+    monkeypatch.setattr(generation, "device_generation", lambda: "sm120")
+    k, v = jnp.zeros((1, 64, 1, 128), jnp.bfloat16), jnp.zeros((1, 64, 3, 128), jnp.bfloat16)
+    assert fla_gdn.rule_refusal(k, v, 64) == "3 value heads a key head; dqkwg's block holds a power of two"
+
+
 def test_the_fla_rule_refuses_a_gpu_without_its_configs(monkeypatch):
     monkeypatch.setattr(generation, "device_generation", lambda: "sm75")
     k, v = jnp.zeros((1, 64, 1, 128), jnp.bfloat16), jnp.zeros((1, 64, 2, 128), jnp.bfloat16)
