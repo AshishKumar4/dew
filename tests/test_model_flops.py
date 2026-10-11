@@ -18,6 +18,7 @@ from dew.data.text import ByteTokenizer
 from dew.decision.head import DecisionHead, JointSchemaHead
 from dew.decision.layout import Specials, StateFirstLayout
 from dew.decision.objective import DecisionObjective
+from dew.diffusion import presets
 from dew.inputs import Field, InputSpec
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import GatedMLP, RematPolicy
@@ -137,7 +138,7 @@ def test_jepa_supplies_context_target_and_factorized_geometry_explicitly():
 
 def test_diffusion_supplies_patch_channels_and_refuses_missing_auxiliary_work():
     model = SimpleDiT(emb_features=8, num_layers=2, num_heads=2, patch_size=2)
-    objective = DiffusionObjective(model, inputs=InputSpec(sample=Field("images", (4, 8, 3))),
+    objective = DiffusionObjective(model, presets.Flow(), inputs=InputSpec(sample=Field("images", (4, 8, 3))),
                                    autoencoder=None, ema_decay=None)
     batch = {"images": np.zeros((2, 4, 8, 3), np.float32)}
     np.testing.assert_array_equal(objective.real_lengths(batch), [8, 8])

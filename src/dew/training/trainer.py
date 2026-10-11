@@ -119,7 +119,7 @@ from dew.training.memory import (
     step_compiler_options,
     step_fits,
 )
-from dew.training.model_flops import FORWARD_FLOPS, TOKENS, prepare_counts, step_counts
+from dew.training.model_flops import FORWARD_FLOPS, TOKENS, model_batch, prepare_counts, step_counts
 from dew.training.narrow import narrowed, narrowed_paths
 from dew.training.rungs import keep_rung, recorded_rung
 from dew.training.runtime import Preempted, PreemptionNotice
@@ -1039,6 +1039,7 @@ class Trainer(Generic[Loss, Effects]):
     # ------------------------------------------------------------------
 
     def _loss_shape(self, state: TrainState, batch: Batch):
+        batch = model_batch(batch)
         # Shapes and dtypes only: a resident frozen leaf sits in another
         # memory space than the moving ones, and the loss the realization
         # runs reads a snapshot in one space. The step's key is drawn inside
@@ -1062,7 +1063,7 @@ class Trainer(Generic[Loss, Effects]):
             return jax.ShapeDtypeStruct(leaf.shape, leaf.dtype)
 
         trainable = jax.tree.map(shape, state.variables["params"])
-        records = jax.tree.map(shape, batch)
+        records = jax.tree.map(shape, model_batch(batch))
         mutable = (None if shared or aux.variables is None else
                    jax.tree.map(shape, {name: state.variables[name] for name in aux.variables}))
 
@@ -1187,7 +1188,7 @@ class Trainer(Generic[Loss, Effects]):
                 def step(current, batch, body=body):
                     # The body sees every field on the device; the out shardings
                     # return the host-resident ones to pinned host memory.
-                    advanced, loss, aux = body(self._fetched(current, shardings), batch)
+                    advanced, loss, aux = body(self._fetched(current, shardings), model_batch(batch))
                     return (dataclasses.replace(advanced, step=current.step + 1), loss,
                             {**aux.metrics, **step_counts(batch)}, jnp.isfinite(loss),
                             advanced.microstep > current.microstep)
@@ -1266,7 +1267,8 @@ class Trainer(Generic[Loss, Effects]):
             # the objective included: a parameter read there is used twice.
             variables = {**rest, "params": params}
             return self.objective._loss(
-                variables, batch, Step(microstep, jax.random.fold_in(key, step), with_ema(variables, ema)))
+                variables, model_batch(batch),
+                Step(microstep, jax.random.fold_in(key, step), with_ema(variables, ema)))
 
         rest = {name: tree for name, tree in variables.items() if name != "params"}
         return narrowed_paths(loss, variables["params"], rest, batch, state.microstep, state.key, state.step,
@@ -1300,7 +1302,7 @@ class Trainer(Generic[Loss, Effects]):
             with self._traced_on(cpu):
                 if current.accumulation is None and self.accumulation > 1:
                     current = self._initialize_accumulation(current, batch, shapes)
-                advanced, loss, aux = body(current, batch)
+                advanced, loss, aux = body(current, model_batch(batch))
                 advanced = dataclasses.replace(advanced, step=current.step + 1)
                 # A leaf already where its placement says stays the array it
                 # is: the resident frozen collection crosses no boundary.
