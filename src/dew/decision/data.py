@@ -3,20 +3,16 @@
 import dataclasses
 import functools
 import json
-import random
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Annotated
 
 import numpy as np
 
 from dew import records
-from dew.data.dataset import Dataset, DatasetSpec, Tokenize
 from dew.data.pipeline import Configured, HostStep, Pipeline
 from dew.data.recipes import HoldOut, Split, Validation, _branches, source_argument
 from dew.data.sources.base import Read, ShardManifest, Source
-from dew.data.sources.hf import HFDatasetSource, HFOptions
 from dew.decision.questions import Choice, Question
 from dew.records import JSON, json_value, record
 
@@ -97,65 +93,6 @@ class Example:
         return np.eye(len(self.questions[name].options))[self.labels()[name]]
 
 
-@dataclass(frozen=True)
-class Weighted:
-    """Examples that fill `weight`, a share of every training step, in a mixture of several.
-
-    `DecisionObjective.dataset` reads a mapping of names to these as one stream,
-    each set at its share whatever its length (`dew.data.dataset.mixture`).
-    """
-
-    examples: Sequence["Example | Mapping[str, object]"]
-    """`Example`s, or rows `Example.of` reads."""
-    weight: float
-
-
-@dataclass(frozen=True)
-class DecisionMixture:
-    """Labelled sets of examples, each at its share of every training step.
-
-    `root` holds each set as JSON-lines rows `Example.of` reads, `<name>.jsonl`,
-    and the rows it holds back for validation and calibration as
-    `<name>.held.jsonl`, where it holds some back. Each set's share is the one
-    `<root>/mixture.json` records, as `recipes/decision/sources.py` writes it
-    beside the sets, unless `weights` gives another: a weight there adds a
-    set of your own, and a weight of 0 leaves a set out.
-    """
-
-    root: str = "data/mixture"
-    weights: dict[str, float] = field(default_factory=dict)
-
-    def recorded(self) -> JSON:
-        """What `<root>/mixture.json` records about how the sets were made, or nothing."""
-        path = Path(self.root) / "mixture.json"
-        return json_value(json.loads(path.read_text()), "mixture.json") if path.is_file() else {}
-
-    def shares(self) -> dict[str, float]:
-        """Each set's share by name, those of weight 0 left out."""
-        recorded = record(record(self.recorded(), "mixture.json").get("weights", {}), "weights")
-        stated = {name: records.number(weight, f"weights.{name}") for name, weight in recorded.items()}
-        shares = {name: float(weight) for name, weight in (stated | self.weights).items() if weight > 0}
-        if not shares:
-            raise ValueError(
-                f"no set has a weight: give --mixture.weights, or write {self.root}/mixture.json"
-            )
-        return shares
-
-    def read(self) -> tuple[dict[str, Weighted], list[Example]]:
-        """Every set at its share, and the rows they hold back, together."""
-        weighted, held = {}, []
-        for name, weight in self.shares().items():
-            weighted[name] = Weighted(_lines(Path(self.root) / f"{name}.jsonl"), weight)
-            kept = Path(self.root) / f"{name}.held.jsonl"
-            if kept.is_file():
-                held.extend(_lines(kept))
-        return weighted, held
-
-
-def _lines(path: Path) -> list[Example]:
-    with path.open() as file:
-        return [Example.of(json.loads(line)) for line in file if line.strip()]
-
 
 def _distribution(question: Question, target: JSON, name: str) -> tuple[float, ...]:
     """A target distribution from a row: probabilities in the question's option order, or keyed by option."""
@@ -169,102 +106,6 @@ def _distribution(question: Question, target: JSON, name: str) -> tuple[float, .
         case _:
             raise ValueError(f"{name} is a list of probabilities or a mapping of options to them")
 
-
-_FORMATS = {".csv": "csv", ".json": "json", ".jsonl": "json", ".parquet": "parquet"}
-
-
-@dataclass(frozen=True)
-class DecisionTable(DatasetSpec):
-    """A table of labelled text, read as examples of one choice question.
-
-    This is how Laya's `laya-train --data tickets.csv` reads a table. `path` is a
-    .csv, .json, .jsonl or .parquet file, or a Hugging Face dataset id read at
-    `split`; every format is read through `datasets`. Each row's `text` column is
-    the state, and its `label` column is the answer to the question `question`,
-    asked with `instructions` over `options`. Without `options`, the options are
-    the label column's class names where it has them (BANKING77's, CLINC150's),
-    and otherwise its distinct values in the order they first appear. A row whose
-    label is an int names its option by index. A table with `state` and
-    `questions` columns is read as whole examples instead (`Example.of`),
-    including its `answers` column.
-
-    A `held_out` share of the rows, at most `held_out_most`, is drawn from `seed`
-    for validation and calibration (Laya's 10% and 400), unless
-    `validation_split` names a split to hold out instead.
-    `DecisionObjective.dataset` lays the examples out; `load` alone cannot,
-    because the layout depends on the objective's tokenizer.
-    """
-
-    path: str = "tickets.csv"
-    split: str = "train"
-    text: str = "text"
-    label: str = "label"
-    question: str = "label"
-    instructions: str = "Classify the input into the correct category."
-    options: tuple[str, ...] = ()
-    held_out: float = 0.1
-    held_out_most: int = 400
-    validation_split: str | None = None
-    revision: str | None = None
-    """The Hub dataset's commit."""
-
-    def load(self, *, batch: int, tokenize: Tokenize | None = None) -> Dataset:
-        raise TypeError(
-            "a decision table is laid out by its objective's tokenizer: "
-            "DecisionObjective.dataset(table, batch=...)"
-        )
-
-    def examples(self) -> tuple[list[Example], list[Example]]:
-        """Return the training examples and the held-out ones."""
-        rows = self._rows(self.split)
-        if self.validation_split is not None:
-            return self._read(rows), self._read(self._rows(self.validation_split))
-        examples = self._read(rows)
-        order = list(range(len(examples)))
-        random.Random(self.seed).shuffle(order)
-        count = min(self.held_out_most, int(len(examples) * self.held_out))
-        held = set(order[:count])
-        return (
-            [example for index, example in enumerate(examples) if index not in held],
-            [example for index, example in enumerate(examples) if index in held],
-        )
-
-    def _rows(self, split: str) -> HFDatasetSource:
-        suffix = Path(self.path).suffix.lower()
-        if suffix in _FORMATS:
-            files = HFOptions(data_files={split: self.path})
-            return HFDatasetSource(_FORMATS[suffix], split=split, options=files)
-        return HFDatasetSource(self.path, split=split, options=HFOptions(revision=self.revision))
-
-    def _read(self, source: HFDatasetSource) -> list[Example]:
-        rows = [source[index] for index in range(len(source))]
-        if {"state", "questions"} <= set(source.columns):
-            return [Example.of(row) for row in rows]
-        missing = {self.text, self.label} - set(source.columns)
-        if missing:
-            raise ValueError(f"{self.path} has no column {sorted(missing)}; its columns are {source.columns}")
-        names = (
-            self.options
-            or _class_names(source, self.label)
-            or tuple(dict.fromkeys(str(row[self.label]) for row in rows))
-        )
-        question = Choice(self.instructions, list(names))
-        return [
-            Example(
-                json_value(row[self.text], self.text),
-                {self.question: question},
-                {self.question: _label(row[self.label])},
-            )
-            for row in rows
-        ]
-
-
-def _class_names(source: HFDatasetSource, column: str) -> tuple[str, ...]:
-    """A `datasets` ClassLabel column's names, or nothing for any other column."""
-    from datasets import ClassLabel
-
-    feature = source.features[column]
-    return tuple(feature.names) if isinstance(feature, ClassLabel) else ()
 
 
 def _label(value: str | int | float | bool) -> str | int:
