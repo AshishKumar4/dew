@@ -549,3 +549,17 @@ def test_a_run_that_states_no_read_reads_as_its_sources_choose(tmp_path):
     assert [read(listed), read(indexed), read(streamed)] == ["memory", "indexed", "streamed"]
     assert [read(listed, "streamed"), read(indexed, "memory"), read(streamed, "memory")] == [
         "streamed", "memory", "memory"]
+
+
+def test_a_run_that_states_no_read_takes_the_first_read_its_sources_can_all_take(tmp_path):
+    """A CSV with no index prefers a stream, but its random holdout cannot be
+    streamed and the CSV cannot be read by index, so the run reads it into
+    memory and trains on the half the holdout leaves."""
+    from dew.data import HoldOut, Records, load
+
+    (tmp_path / "rows.csv").write_text("text\n" + "".join(f"row {index}\n" for index in range(8)))
+    split = HoldOut(fraction=0.5, by="random")
+    loaded = load(Records(source=str(tmp_path / "rows.csv"), validation=split), batch=2, read=None,
+                  loading=Loading(workers=0))
+    assert loaded.plan is not None and loaded.plan.order["read"] == "memory"
+    assert loaded.records == 4

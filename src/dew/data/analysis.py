@@ -69,10 +69,19 @@ class _Wrapping(Protocol):
 
 
 def _preferred_read(pipelines: Sequence[Pipeline]) -> Read:
-    """The read a run's sources choose when it states none: memory for records
-    held in memory (`Memory`, through any source that wraps one), indexed for
-    a store that reads by index, and streamed otherwise. A mixture takes the
-    least eager of its corpora's choices."""
+    """The read a run's sources choose when it states none, which compile,
+    validation and load all take from here.
+
+    Each source prefers memory for records held in memory (`Memory`, through
+    any source that wraps one), indexed for a store that reads by index, and
+    streamed otherwise, and a mixture takes the least eager of its corpora's
+    preferences. The run reads by the first read, from that preference
+    toward the more eager ones, that every source takes or can be provisioned
+    for. A CSV prefers a stream, a random holdout of it cannot be streamed,
+    and the CSV has no index to read it by, so the run reads it into memory.
+    When no read is left, the preference stands for `_capabilities` to refuse
+    with its remedy.
+    """
     chosen: list[Read] = []
     for source in (source for pipeline in pipelines for _, source in _leaves(pipeline)):
         held = source
@@ -82,7 +91,23 @@ def _preferred_read(pipelines: Sequence[Pipeline]) -> Read:
             chosen.append("memory")
         else:
             chosen.append("indexed" if source.supports("indexed") else "streamed")
-    return max(chosen, key=READS.index)
+    preferred = READS.index(max(chosen, key=READS.index))
+    return next(
+        (
+            read
+            for read in reversed(READS[: preferred + 1])
+            if all(isinstance(source, _Provisionable) for source in _unsupported(pipelines, read))
+        ),
+        READS[preferred],
+    )
+
+
+def _unsupported(pipelines: Sequence[Pipeline], read: Read) -> list[Source]:
+    """The sources under `pipelines` that cannot take `read`, asked together."""
+    sources = [source for pipeline in pipelines for _, source in _leaves(pipeline)]
+    with ThreadPoolExecutor(max_workers=min(8, max(1, len(sources)))) as readers:
+        supported = tuple(readers.map(lambda source: source.supports(read), sources))
+    return [source for source, available in zip(sources, supported, strict=True) if not available]
 
 
 def _at(stages: Sequence[Stage], kinds: type | tuple[type, ...]) -> int | None:
@@ -338,10 +363,7 @@ def _checked(
 
 
 def _capabilities(pipelines: Sequence[Pipeline], read: Read, provision: bool) -> None:
-    sources = [source for pipeline in pipelines for _, source in _leaves(pipeline)]
-    with ThreadPoolExecutor(max_workers=min(8, max(1, len(sources)))) as readers:
-        supported = tuple(readers.map(lambda source: source.supports(read), sources))
-    missing = [source for source, available in zip(sources, supported, strict=True) if not available]
+    missing = _unsupported(pipelines, read)
     if provision:
         for source in missing:
             if isinstance(source, _Provisionable):
