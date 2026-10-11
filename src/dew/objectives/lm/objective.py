@@ -621,8 +621,6 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         """Host token geometry, with the same padding/packing fields as the loss."""
         raw = batch[TEXT_KEY]
         prepared = raw if isinstance(raw, ModelInputs) else ModelInputs(raw)
-        if prepared.conditioning:
-            raise MissingFlopsCount("LMObjective needs its conditioning tower's multi-sequence geometry")
         tokens = np.asarray(prepared.tokens)
         fields = prepared.token_fields
         documents = batch.get("text_segment_ids", fields.get("segment_ids"))
@@ -651,6 +649,7 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
 
     def model_flops(self, model, batch: Batch) -> float:
         """Hidden states plus predictions within real documents; never padded logits."""
+        self._check_flop_geometry(batch)
         model = self.model if model is None else model
         if type(self) is not LMObjective:
             raise MissingFlopsCount(f"{type(self).__name__} needs counts for its auxiliary model forwards")
@@ -667,6 +666,7 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
 
     def training_flops(self, model, batch: Batch) -> float:
         """The adapted trunk and prediction head on actual token geometry."""
+        self._check_flop_geometry(batch)
         model = self.model if model is None else model
         if not isinstance(model, CountedTraining):
             return super().training_flops(model, batch)
@@ -678,6 +678,12 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
             predicted &= documents[:, :-1] == documents[:, 1:]
         targets = np.sum(predicted, axis=-1, dtype=np.int64)
         return model.training_flops(self.real_lengths(batch)) + model.logits_training_flops(targets)
+
+    def _check_flop_geometry(self, batch: Batch) -> None:
+        """Media needs its own FLOP count, but does not prevent counting token lengths."""
+        raw = batch[TEXT_KEY]
+        if isinstance(raw, ModelInputs) and raw.conditioning:
+            raise MissingFlopsCount("LMObjective needs its conditioning tower's multi-sequence geometry")
 
     def __init__(
         self,
