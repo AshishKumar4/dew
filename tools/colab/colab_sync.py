@@ -18,9 +18,13 @@ def output_files(tree, patterns, policy="all", excludes=()):
     A measurements job declares OUT once, not a fragile list of log globs.
     Only its checkpoint step/frozen subtrees are excluded; scalars, profiles,
     tracking, run.json, and built data remain ordinary output files.
+    Exclusion patterns match archive-relative names: an external
+    /content/out/x/a.json is stored as content/out/x/a.json.
     """
     if policy not in ("all", "measurements"):
         raise ValueError(f"unknown artifact policy: {policy}")
+    if any(Path(pattern).is_absolute() for pattern in excludes):
+        raise ValueError("artifact exclusions must be archive-relative")
     tree = Path(tree)
     files = {}
     for pattern in patterns:
@@ -30,7 +34,9 @@ def output_files(tree, patterns, policy="all", excludes=()):
             for file in root.rglob("*") if root.is_dir() else [root]:
                 if not file.is_file():
                     continue
-                if any(fnmatch.fnmatch(str(file), pattern) for pattern in excludes):
+                relative = os.path.relpath(file, tree)
+                name = str(file).lstrip("/") if relative.startswith("..") else relative
+                if any(fnmatch.fnmatch(name, pattern) for pattern in excludes):
                     continue
                 if file.is_symlink() and not file.resolve().is_relative_to(scope):
                     raise ValueError(f"output link escapes declared scope: {file}")
@@ -58,8 +64,6 @@ def output_files(tree, patterns, policy="all", excludes=()):
                     )
                 ):
                     continue
-                relative = os.path.relpath(file, tree)
-                name = str(file).lstrip("/") if relative.startswith("..") else relative
                 files[name] = file
     return files
 

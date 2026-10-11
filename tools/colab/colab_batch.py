@@ -159,6 +159,8 @@ def select(device: str, selector: str, hardware: str, order: list[str]) -> list[
             raise ValueError("expected_cu must be finite and positive")
         if fields.get("artifact_policy", "all") not in ("all", "measurements"):
             raise ValueError("invalid artifact_policy")
+        if any(Path(pattern).is_absolute() for pattern in fields.get("artifact_excludes", "").split()):
+            raise ValueError("artifact exclusions must be archive-relative")
         if fields.get("compile_cache", "off") not in ("on", "off"):
             raise ValueError("compile_cache must be on or off")
         if fields.get("wandb", "off") not in ("on", "off"):
@@ -266,6 +268,7 @@ def data_inputs(fields: dict) -> dict:
                 "target": str(destination),
                 "prefix": source["prefix"],
                 "manifest_sha256": source["manifest_sha256"],
+                "manifest_key": source.get("manifest_key", source["prefix"].rstrip("/") + "/manifest.json"),
             }
         )
     return result
