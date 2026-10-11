@@ -184,7 +184,7 @@ def attribute(path: Path, steps: int, intermediate: int) -> dict:
             "by_part_kind_ms": dict(part_kinds),
             "top_ops": sorted(rows.values(), key=lambda row: -row["us"]),
             "accounting": "kernel sums can overlap; device busy is interval union; idle is window minus busy",
-            "part_scope": "MLP GEMMs require input shapes; other GEMMs are projections; unknowns are retained",
+            "part_scope": "MLP GEMMs require shapes; other GEMMs are projections; unknowns are retained",
             "common_summary": kernel_summary(kernels, steps)}
 
 
@@ -253,7 +253,7 @@ def comparison(reference: dict, attribution: Path, entry: Path) -> dict:
                       "HF uses a negligible hidden-state loss on synthetic unpadded rows.",
             "dew_measured": {"step_ms": timed["steady"]["step_ms"], "tokens_per_s": timed["tokens_per_s"],
                              "mfu": timed["mfu"], "peak_gib": timed["peak_mib"] / 1024,
-                             "peak_metric": "Qwen3.5-0.8B XLA/device high-water mark; HF uses allocator allocated bytes",
+                             "peak_metric": "Qwen3.5-0.8B XLA/device high-water mark; HF uses allocated bytes",
                              "by_kind_ms": dew["time"]["by_kind_ms"]},
             "dew_backbone_estimate": {"step_ms": estimated_ms,
                                       "tokens_per_s": E1_TOKENS / (estimated_ms / 1000),
@@ -262,7 +262,8 @@ def comparison(reference: dict, attribution: Path, entry: Path) -> dict:
                                       "categories_ms": dict(categories),
                                       "profile_idle_ms": dew["time"]["device_idle_ms_per_step"],
                                       "by_part_kind_ms": {
-                                          part: value for part, value in dew["time"]["by_part_kind_ms"].items()
+                                          part: value for part, value in
+                                          dew["time"]["by_part_kind_ms"].items()
                                           if part != "head_loss"},
                                       "peak_gib": None,
                                       "reason": "no separately measured head-free step or memory peak"},
