@@ -2223,7 +2223,8 @@ def matrix_data(read: str, cached: bool, rejecting: bool, packed: bool, cache_di
     """One cell of the data matrix compiled for training: records of one to
     eight tokens, each holding its own id; a filter that rejects every third;
     a cache filled by the pool; online packing into eight-token windows; then
-    the order the read can keep."""
+    a global shuffle where the order stays indexed and a windowed one where it
+    streams."""
     from dew.data import Memory, Pipeline, compile
     from dew.data.cache import Cache
 
@@ -2236,7 +2237,8 @@ def matrix_data(read: str, cached: bool, rejecting: bool, packed: bool, cache_di
     if packed:
         pipeline = pipeline.pack(8, bins=2)
     pipeline = pipeline.map(Imaged(), identity="imaged@1")
-    order = pipeline.shuffle(0, window=8 if read == "streamed" else None).repeat()
+    indexed = read == "memory" or (read == "indexed" and not (cached or rejecting or packed))
+    order = pipeline.shuffle(0, window=None if indexed else 8).repeat()
     return compile(order.batch(BATCH), read=read, seed=0, loading=Loading(workers=0))
 
 
