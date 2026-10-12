@@ -580,6 +580,22 @@ class Laid:
         return {"image": np.resize(np.asarray(element["text"]), (2, 4))}
 
 
+def test_a_scored_branch_cut_per_share_splits_its_whole_order():
+    """A validation branch is read in one canonical pass, so a token split in
+    it is whole even where a filter cuts its order per share: it holds out the
+    first half of the documents' tokens."""
+    documents = Memory(tuple({"text": np.arange(4, dtype=np.int32) + 4 * index} for index in range(4)))
+    held = Pipeline(documents).token_split(0.5, held=True).filter(lambda row: True, identity="all@1")
+    data = compile(Pipeline(source()).batch(2), validation=held.batch(1), read="indexed", loading=READ)
+    assert data.val is not None
+    reader = data.val(DataPartition())
+    try:
+        tokens = [value for batch in reader for row in np.asarray(batch["text"]) for value in row.tolist()]
+    finally:
+        reader.close()
+    assert tokens == list(range(8))
+
+
 def test_a_streamed_repeat_repeats_where_it_is_written_past_a_limit_or_a_repeat():
     """A streamed root repeats in place of a written repeat only when nothing
     before it counts the rows: two rows taken and repeated three times read
