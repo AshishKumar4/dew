@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import fnmatch
+import hashlib
 import json
 import logging
 import math
@@ -13,6 +14,7 @@ import statistics
 import threading
 import time
 from collections.abc import Callable, Iterator, Mapping
+from pathlib import Path
 
 import jax
 import numpy as np
@@ -22,6 +24,7 @@ from jax.sharding import AbstractMesh, AxisType, Mesh, NamedSharding, PartitionS
 
 from dew.coordination import agreed, broadcast_from_process_zero, from_every_process, stop_at_exit
 from dew.data.dataset import Budgeted, Checkpointable, Closeable, DataPartition, Stoppable
+from dew.files import write_atomically
 from dew.nn.inputs import filled_validity
 from dew.nn.sharding import (
     BATCH_AXES,
@@ -219,7 +222,16 @@ def link_bandwidth(mesh: Mesh, axis: str, size: int = 1 << 28) -> float:
     (DeepSeek-V3's residual gradient over 16384 tokens is 235 MB in bf16),
     past the sizes where a collective's latency counts: on 4x RTX 3090 an
     NVLink pair's all-gather moved 8.2 GB/s a device at 4 MiB and 31.0 at
-    128 MiB."""
+    128 MiB.
+
+    A pool keeps its figure beside the persistent compilation cache, by the
+    axis and the devices it spans, and a later pool on them takes it, a
+    resume among them: the decisions from it shape the step, and a figure
+    measured again moves by noise, across a threshold one time in some."""
+    record = _link_record(mesh, axis)
+    # Every process gathers, or none does: a pool measures unless each of its processes sees the figure.
+    if record is not None and all(from_every_process(record.exists())):
+        return min(from_every_process(float(json.loads(record.read_text())["bytes_per_second"])))
     ways = mesh.shape[axis]
     count = size // 4 // ways * ways
     sharding = NamedSharding(mesh, P(axis))
@@ -234,8 +246,23 @@ def link_bandwidth(mesh: Mesh, axis: str, size: int = 1 << 28) -> float:
         jax.block_until_ready(gather(source))
         if attempt >= 2:
             seconds.append(time.perf_counter() - began)
-    received = (ways - 1) / ways * count * 4 / statistics.median(seconds)
-    return min(from_every_process(received))
+    received = min(from_every_process((ways - 1) / ways * count * 4 / statistics.median(seconds)))
+    if record is not None and jax.process_index() == 0:
+        record.parent.mkdir(parents=True, exist_ok=True)
+        write_atomically(record, json.dumps({"bytes_per_second": received}))
+    return received
+
+
+def _link_record(mesh: Mesh, axis: str) -> Path | None:
+    """Where `link_bandwidth` keeps `mesh`'s `axis` figure: beside the persistent compilation cache,
+    named by the axis's width, the mesh's shape and its devices' kinds and processes, or nowhere when
+    the process keeps no cache."""
+    cache = jax.config.jax_compilation_cache_dir
+    if not cache:
+        return None
+    devices = sorted({(device.device_kind, device.process_index) for device in mesh.devices.flat})
+    name = json.dumps([axis, dict(mesh.shape), devices], sort_keys=True)
+    return Path(cache) / "dew-links" / f"{hashlib.sha256(name.encode()).hexdigest()}.json"
 
 
 def _slice(device) -> int:
