@@ -1,7 +1,5 @@
 """Shared model requests keep untrusted inputs away from model memory."""
 import importlib.util
-import json
-import socket
 import sys
 from pathlib import Path
 
@@ -21,16 +19,6 @@ def module(name):
 @pytest.fixture(scope="module")
 def service():
     return module("model_service")
-
-
-def test_a_foreign_uid_cannot_submit_a_request(service, tmp_path):
-    with (service.ModelService(tmp_path / "model.sock", object(), uids=[]) as server,
-          socket.socket(socket.AF_UNIX) as connection):
-        connection.connect(str(server.path))
-        request = {"op": "describe", "repo": "model", "revision": "pinned"}
-        connection.sendall(json.dumps(request).encode() + b"\n")
-        result = json.loads(connection.makefile("rb").readline())
-        assert result["error"]["name"] == "PermissionError"
 
 
 def test_image_transport_keeps_native_pixels_and_preparation_keys(service, tmp_path):

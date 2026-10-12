@@ -47,7 +47,15 @@ from dew.nn.flops import MissingFlopsCount, counted_flops
 from dew.nn.inputs import ModelInputs
 from dew.nn.mla import INDEXER, INDEXER_COLLECTION
 from dew.nn.moe import RouterMoments, global_router_loss, load_balance_update, sequence_router_losses
-from dew.nn.protocols import CountedLogits, CountedLogitsTraining, DecoderTraining, Logits, TokenModel
+from dew.nn.protocols import (
+    CountedLogits,
+    CountedLogitsTraining,
+    CountedPredictions,
+    CountedPredictionTraining,
+    DecoderTraining,
+    Logits,
+    TokenModel,
+)
 from dew.nn.sharding import LOGITS, constrain
 from dew.objectives.base import (
     OMITTED,
@@ -621,10 +629,10 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         """What the forward and training counts both lack, or None."""
         if type(self) is not LMObjective:
             return f"{type(self).__name__} needs counts for its auxiliary model forwards"
-        if self.mtp_weight:
-            return "LMObjective needs the prediction-depth geometry when MTP is trained"
         if not isinstance(model, CountedLogits):
             return f"{type(model).__name__} does not declare logits_flops for the LM head"
+        if self.mtp_weight and not isinstance(model, CountedPredictions):
+            return f"{type(model).__name__} does not declare prediction_flops for its MTP depths"
         return None
 
     def _counted_tokens(self, batch: Batch):
@@ -649,10 +657,14 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         segment ids on different rows remain separate documents.
         """
         valid, documents = self._counted_tokens(batch)
+        return self._row_lengths(valid[:, :-1], None if documents is None else documents[:, :-1])
+
+    @staticmethod
+    def _row_lengths(valid, documents) -> np.ndarray:
         if documents is None:
-            return np.sum(valid[:, :-1], axis=-1, dtype=np.int64)
+            return np.sum(valid, axis=-1, dtype=np.int64)
         lengths = []
-        for row, visible in zip(documents[:, :-1], valid[:, :-1], strict=True):
+        for row, visible in zip(documents, valid, strict=True):
             _, counts = np.unique(row[visible], return_counts=True)
             lengths.extend(counts)
         return np.asarray(lengths, np.int64)
@@ -665,7 +677,10 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
             raise MissingFlopsCount(missing)
         self._check_flop_geometry(batch)
         lengths = self._prediction_lengths(batch)
-        return counted_flops(model, self.real_lengths(batch)) + model.logits_flops(lengths)
+        count = counted_flops(model, self.real_lengths(batch)) + model.logits_flops(lengths)
+        return count + (model.prediction_flops(self.real_lengths(batch),
+                                               prediction_lengths=self._prediction_rows(model, batch))
+                        if self.mtp_weight else 0)
 
     def training_flops(self, model, batch: Batch) -> float:
         """The adapted trunk and prediction head on actual token geometry."""
@@ -677,7 +692,39 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         if not isinstance(model, CountedLogitsTraining):
             return super().training_flops(model, batch)
         targets = self._prediction_lengths(batch)
-        return model.training_flops(self.real_lengths(batch)) + model.logits_training_flops(targets)
+        lengths = self.real_lengths(batch)
+        count = model.training_flops(lengths) + model.logits_training_flops(targets)
+        if self.mtp_weight:
+            if not isinstance(model, CountedPredictionTraining):
+                raise MissingFlopsCount(f"{type(model).__name__} has no prediction_training_flops "
+                                        "for adapted depths")
+            count += model.prediction_training_flops(
+                lengths, prediction_lengths=self._prediction_rows(model, batch))
+        return count
+
+    def _prediction_rows(self, model: CountedPredictions,
+                          batch: Batch) -> list[tuple[np.ndarray, np.ndarray]]:
+        """A depth's real fusion inputs and scored targets differ at document boundaries.
+
+        Every intervening token must be real, as `_depth_weights` requires;
+        counting totals and subtracting a depth would join across pad holes.
+        """
+        valid, documents = self._counted_tokens(batch)
+        depth_rows = []
+        for depth in range(1, model.num_nextn_predict_layers + 1):
+            span = valid.shape[1] - 1 - depth
+            admitted = np.ones((valid.shape[0], span), bool)
+            for offset in range(depth + 1):
+                admitted &= valid[:, offset:offset + span]
+            segments = None if documents is None else documents[:, :span]
+            if documents is not None:
+                admitted &= segments == documents[:, depth:depth + span]
+            inputs = self._row_lengths(admitted, segments)
+            admitted &= valid[:, depth + 1:depth + 1 + span]
+            if documents is not None:
+                admitted &= segments == documents[:, depth + 1:depth + 1 + span]
+            depth_rows.append((inputs, self._row_lengths(admitted, segments)))
+        return depth_rows
 
     def _check_flop_geometry(self, batch: Batch) -> None:
         """Media needs its own FLOP count, but does not prevent counting token lengths."""

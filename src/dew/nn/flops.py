@@ -7,6 +7,7 @@ MFU. Rematerialization belongs only to the separate HLO hardware count.
 """
 
 import math
+from collections.abc import Sequence
 
 import numpy as np
 from flax import linen as nn
@@ -24,6 +25,23 @@ def real_lengths(lengths: np.ndarray) -> np.ndarray:
     if lengths.ndim != 1 or not np.issubdtype(lengths.dtype, np.integer) or np.any(lengths < 0):
         raise ValueError("model FLOPs need nonnegative integer lengths of shape [rows]")
     return lengths.astype(np.float64)
+
+
+def matching_lengths(*lengths: np.ndarray) -> tuple[np.ndarray, ...]:
+    """Independent real sequence lengths belonging to the same batch rows."""
+    widened = tuple(real_lengths(column) for column in lengths)
+    if not widened or any(column.shape != widened[0].shape for column in widened[1:]):
+        raise ValueError("model FLOPs need matching [rows] sequence geometries")
+    return widened
+
+
+def patch_lengths(sample_shape: Sequence[int], patch: Sequence[int], rows: int) -> np.ndarray:
+    """Token counts of a known image/video shape after its patch convolution."""
+    if (len(sample_shape) != len(patch) + 1 or rows < 0 or any(step <= 0 for step in patch)
+            or any(size <= 0 or size % step for size, step in zip(sample_shape[:-1], patch, strict=True))):
+        raise MissingFlopsCount(f"sample shape {tuple(sample_shape)} is not whole {tuple(patch)} patches")
+    count = math.prod(size // step for size, step in zip(sample_shape[:-1], patch, strict=True))
+    return np.full((rows,), count, np.int64)
 
 
 def counted_flops(module: nn.Module | Counted, lengths: np.ndarray) -> float:
@@ -96,7 +114,18 @@ def attention_flops(lengths: np.ndarray, heads: int, key: int, value: int, *, ca
         work = np.floor(length / chunk) * pairs(chunk) + pairs(np.remainder(length, chunk))
     else:
         work = pairs(length)
-    return float(2 * heads * (key + value) * np.sum(work))
+    return _attention_products(work, heads, key, value)
+
+
+def cross_attention_flops(lengths: np.ndarray, context_lengths: np.ndarray,
+                           heads: int, key: int, value: int) -> float:
+    """QK and AV over independent query/key rows, rather than a joined square."""
+    query, context = matching_lengths(lengths, context_lengths)
+    return _attention_products(query * context, heads, key, value)
+
+
+def _attention_products(pairs: np.ndarray, heads: int, key: int, value: int) -> float:
+    return float(2 * heads * (key + value) * np.sum(pairs))
 
 
 def delta_flops(lengths: np.ndarray, heads: int, key: int, value: int) -> float:

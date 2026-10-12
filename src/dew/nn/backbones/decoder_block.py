@@ -574,12 +574,29 @@ class DecoderBlock(nn.Module):
     @nn.nowrap
     def model_flops(self, lengths) -> float:
         """Compose the declared mixer and MLPs, independent of remat and storage."""
-        return self._submodule_flops(lengths, counted_flops)
+        count = self._submodule_flops(lengths, counted_flops)
+        if self.altup is not None:
+            count += AltUpLayer(self.altup, self.emb_features, parent=None).mixing_flops(lengths)
+        if self.hyper_connections is not None:
+            site = HyperConnection(self.hyper_connections, self.emb_features, parent=None)
+            count += (1 + (self.feedforward is not None)) * site.mixing_flops(lengths)
+        if self.residual_site is not None:
+            count += DepthAttention(self.emb_features, parent=None).depth_parameter_flops(
+                lengths, self.residual_sources)
+        return count
 
     @nn.nowrap
     def parameter_flops(self, lengths) -> float:
         """The same submodules' learned matrices, as PEFT's frozen base work."""
         return self._submodule_flops(lengths, parameter_flops)
+
+    @property
+    def residual_sources(self) -> int:
+        site = self.residual_site
+        if site is None:
+            return 0
+        sources = site.finished + 1 if site.finished else 0
+        return sources + (site.finished + site.opens + 1 if self.feedforward is not None else 0)
 
     @nn.nowrap
     def projections(self) -> dict[str, tuple[int, int]]:
@@ -590,16 +607,23 @@ class DecoderBlock(nn.Module):
 
     @nn.nowrap
     def _submodule_flops(self, lengths, counter) -> float:
-        if any(value is not None for value in (self.altup, self.hyper_connections,
-                                               self.residual_site, self.engram)):
-            raise MissingFlopsCount("DecoderBlock needs its multi-stream or memory-extension geometry")
+        if self.engram is not None:
+            raise MissingFlopsCount("DecoderBlock needs its memory-extension geometry")
         count = counter(self.mixer(parent=None), lengths)
         for factory in (self.feedforward, self.parallel):
             if factory is not None:
                 count += counter(factory(parent=None), lengths)
         count += sum(projection_flops(lengths, *shape) for shape in self.projections().values())
         if self.laurel_rank is not None:
-            count += 2 * projection_flops(lengths, self.emb_features, self.laurel_rank)
+            count += LaurelBlock(self.emb_features, self.laurel_rank, parent=None).model_flops(lengths)
+        if self.altup is not None:
+            count += AltUpLayer(self.altup, self.emb_features, parent=None).parameter_flops(lengths)
+        if self.hyper_connections is not None:
+            site = HyperConnection(self.hyper_connections, self.emb_features, parent=None)
+            count += (1 + (self.feedforward is not None)) * site.parameter_flops(lengths)
+        if self.residual_site is not None:
+            count += DepthAttention(self.emb_features, parent=None).depth_parameter_flops(
+                lengths, self.residual_sources)
         return count
 
     def setup(self):
@@ -1024,35 +1048,59 @@ class MTPBlock(nn.Module):
     dtype: Dtype | None = None
     precision: PrecisionLike = None
 
+    @nn.nowrap
+    def projections(self) -> dict[str, tuple[int, int]]:
+        width = self.emb_features
+        return ({'eh_proj': (2 * width, width)} if self.hyper_connections is None else
+                {'e_proj': (width, width), 'h_proj': (width, width)})
+
+    @nn.nowrap
+    def model_flops(self, lengths) -> float:
+        """Prediction input maps, one decoder block and any learned stream collapse."""
+        return self._flops(lengths, counted_flops)
+
+    @nn.nowrap
+    def parameter_flops(self, lengths) -> float:
+        """Prediction input maps and the decoder's learned matrices."""
+        return self._flops(lengths, parameter_flops)
+
+    @nn.nowrap
+    def _flops(self, lengths, counter) -> float:
+        maps = self.projections()
+        count = sum(projection_flops(lengths, *shape) for shape in maps.values())
+        if self.hyper_connections is not None:
+            count += (self.hyper_connections.hc_mult - 1) * projection_flops(lengths, *maps['h_proj'])
+            count += HyperHead(self.hyper_connections, self.emb_features, parent=None).model_flops(lengths)
+        return count + counter(self._decoder(parent=None), lengths)
+
+    def _decoder(self, **scope):
+        return DecoderBlock(
+            mixer=self.mixer, feedforward=self.feedforward, emb_features=self.emb_features,
+            norm_eps=self.norm_eps, scale_offset=self.scale_offset, scale_after_cast=self.scale_after_cast,
+            wiring=self.wiring, hyper_connections=self.hyper_connections, dropout_rate=self.dropout_rate,
+            remat=self.remat, dtype=self.dtype, precision=self.precision, **scope)
+
     def setup(self):
         norm = functools.partial(
             RMSNorm, epsilon=self.norm_eps, scale_offset=self.scale_offset,
             scale_after_cast=self.scale_after_cast, dtype=self.dtype)
         self.enorm = norm(name='enorm')
         self.hnorm = norm(name='hnorm')
-        dense = functools.partial(nn.Dense, self.emb_features, use_bias=False,
-                                   dtype=self.dtype, precision=self.precision)
+        maps = self.projections()
+        def dense(name):
+            return nn.Dense(maps[name][1], use_bias=False, dtype=self.dtype,
+                            precision=self.precision, name=name)
         if self.hyper_connections is None:
-            self.eh_proj = dense(name='eh_proj')
+            self.eh_proj = dense('eh_proj')
         else:
             # Official V4 inference/model.py MTPBlock.forward: project the
             # embedding once and broadcast over independently projected raw
             # residual streams; the trunk's collapsed/normed state is not read.
-            self.e_proj = dense(name='e_proj')
-            self.h_proj = dense(name='h_proj')
+            self.e_proj = dense('e_proj')
+            self.h_proj = dense('h_proj')
             self.hc_head = HyperHead(spec=self.hyper_connections, emb_features=self.emb_features,
                                      norm_eps=self.norm_eps, name='hc_head')
-        self.block = DecoderBlock(
-            mixer=self.mixer, feedforward=self.feedforward,
-            emb_features=self.emb_features,
-            norm_eps=self.norm_eps,
-            scale_offset=self.scale_offset,
-            scale_after_cast=self.scale_after_cast,
-            wiring=self.wiring,
-            hyper_connections=self.hyper_connections,
-            dropout_rate=self.dropout_rate,
-            remat=self.remat,
-            dtype=self.dtype, precision=self.precision, name='block')
+        self.block = self._decoder(name='block')
         self.final_norm = norm(name='final_norm')
 
     def projection_groups(self) -> tuple[ProjectionGroup, ...]:
