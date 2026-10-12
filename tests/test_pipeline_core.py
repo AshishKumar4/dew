@@ -578,6 +578,43 @@ def test_a_token_split_is_part_of_the_order_a_resume_checks():
         half.close()
 
 
+@pytest.mark.parametrize("grown", ["in the source", "by a step"])
+def test_a_resume_is_refused_where_the_same_token_split_keeps_other_documents(grown):
+    """Four 4-token documents split at a quarter train on documents 1-3; with
+    the first grown to eight tokens the same split trains on its last three
+    tokens and on documents 1-3, so a resume after one row would read
+    document 1 again. The first document grows in the source, which keeps its
+    name and row count, or in a step without a stable identity, which a
+    non-exact resume cannot check; the split's spans in the derived order
+    refuse both."""
+    def reader(first):
+        sizes = (first if grown == "in the source" else 4, 4, 4, 4)
+        documents = [{"text": np.arange(4 * index, 4 * index + size, dtype=np.int32)}
+                     for index, size in enumerate(sizes)]
+        pipeline = Pipeline(Memory(documents, identity="docs"))
+        if grown == "by a step":
+            pipeline = pipeline.map(
+                lambda row: {"text": np.resize(row["text"], first) if row["text"][0] == 0 else row["text"]},
+                rejects=False,
+            )
+        split = pipeline.token_split(0.25, held=False).batch(1)
+        resume = "exact" if grown == "in the source" else "non-exact"
+        return compile(split, read="indexed", loading=READ, resume=resume).train(DataPartition())
+
+    four = reader(4)
+    try:
+        assert next(four)["text"].tolist() == [[4, 5, 6, 7]]
+        state = four.get_state()
+    finally:
+        four.close()
+    eight = reader(8)
+    try:
+        with pytest.raises(ValueError, match="derived order token_spans changed"):
+            eight.set_state(state)
+    finally:
+        eight.close()
+
+
 def test_a_recipe_reads_a_published_packing_before_its_default_order(tmp_path):
     """A typed recipe given a generation with a published packing plan reads
     that plan, and shuffles its windows, instead of packing again online."""
