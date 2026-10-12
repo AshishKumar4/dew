@@ -1413,7 +1413,7 @@ class Trainer(Generic[Loss, Effects]):
                 run.stop_control = checkpoints.control(checkpoints.latest)
         else:
             # A supplied state's trees are held as dicts too (`initial_state`).
-            initial = initial.replace(variables=unfreeze(initial.variables))
+            initial = dataclasses.replace(initial, variables=unfreeze(dict(initial.variables)))
             shardings = self.shardings(initial)
             self.layout.check(initial.variables, shardings.variables, self.device_mesh)
             state = jax.device_put(initial, shardings)
