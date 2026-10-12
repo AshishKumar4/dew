@@ -49,6 +49,7 @@ from dew.data.dataset import (
 )
 from dew.nn.flops import MissingFlopsCount
 from dew.nn.kernels.generation import assumed, gpu_mesh, gpu_target, measured_kernel
+from dew.nn.kernels.tuning import tune
 from dew.nn.sharding import (
     BATCH_AXES,
     SEQUENCE_AXIS,
@@ -1247,8 +1248,10 @@ class Trainer(Generic[Loss, Effects]):
              if built is None and field is not None])
         jitted = self._jitted(shapes, copies, shardings, placement, replicated, split)
         part = jax.ShapeDtypeStruct((), jnp.int32, sharding=replicated)
-        return Candidate(micro, shapes, copies, shardings, prepared, held,
-                         jitted.lower(prepared, batch, part))
+        lower = functools.partial(jitted.lower, prepared, batch, part)
+        # The lowering after `tune` reads the launch configs it settled.
+        tune(lower)
+        return Candidate(micro, shapes, copies, shardings, prepared, held, lower())
 
     def _prepared(self, state: TrainState, batch: Batch, schedule: Schedule, window: int):
         """The loss's shapes (None under a custom step), the narrow copies and the state's shapes
