@@ -18,6 +18,7 @@ the last `map_with_index`, which is the only step that reads it.
 from __future__ import annotations
 
 import dataclasses
+import functools
 import math
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
@@ -38,7 +39,7 @@ from dew.data.analysis import (
     _name,
     _until,
 )
-from dew.data.dataset import Batch, DataPartition, FilledBatch, Loading, Records, _Grouped
+from dew.data.dataset import Batch, DataPartition, FilledBatch, Loading, Records, _Grouped, stacked
 from dew.data.mix import Accepted, PrimedMix, SearchBudget, TokenDeficit, primed_maps, token_weights
 from dew.data.pipeline import (
     Artifact,
@@ -826,10 +827,10 @@ class _SharedOutput(Protocol):
 @dataclasses.dataclass
 class _Batched:
     """The batch step: each row's private fields dropped (`_Payload`), then
-    the rows stacked by the pipeline's `batch_fn`, or by Grain's own batch,
-    into shared memory once Grain asks for it. The strip runs inside the
-    batch, so it adds no Grain stage of its own; rows carry their private
-    fields up to it, for the grouping and counting that read them."""
+    the rows stacked (`stacked`) by the pipeline's `batch_fn`, or by Grain's
+    own batch, into shared memory once Grain asks for it. The strip runs
+    inside the batch, so it adds no Grain stage of its own; rows carry their
+    private fields up to it, for the grouping and counting that read them."""
 
     batch_fn: Callable[[Sequence[Batch]], Batch] | None
     shared: bool = False
@@ -848,8 +849,8 @@ class _Batched:
             )
         payload = [_Payload()(row) for row in rows]
         if self.batch_fn is not None:
-            return self.batch_fn(payload)
-        return make_batch(payload, output_to_shared_memory=self.shared)
+            return stacked(payload, self.batch_fn)
+        return stacked(payload, functools.partial(make_batch, output_to_shared_memory=self.shared))
 
 
 @dataclasses.dataclass(frozen=True)
