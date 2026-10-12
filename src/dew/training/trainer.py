@@ -664,8 +664,25 @@ class Trainer(Generic[Loss, Effects]):
         state, the frozen collection is the exception: it stays where the realization
         reads it (`execution.resident`) for the whole run.
         """
-        with boxed(ruled_boxes(self._boxed_axes(), self.layout.axis_rules)):
+        with self._declared():
             return self._shardings(state)
+
+    def _declared(self):
+        """The context in which the layout reads the axes the objective's
+        modules box, as its rules place them."""
+        return boxed(ruled_boxes(self._boxed_axes(), self.layout.axis_rules))
+
+    def check(self, variables: Variables, placement: Placement[Variables]) -> None:
+        """`Layout.check` of `variables` placed by `placement`, read as the
+        layout placed them: in the axes the modules box, and a CPU-owned
+        run's frozen banks as their layers (`dew.inference.banks.spread`)."""
+        from dew.inference.banks import row_sharding, shape_rows, spread
+        if self.host_master and FROZEN in variables:
+            variables = {**variables, FROZEN: spread(variables[FROZEN], shape_rows)}
+            placement = {**placement, FROZEN: spread(
+                placement[FROZEN], lambda sharding, count: [row_sharding(sharding)] * count)}
+        with self._declared():
+            self.layout.check(variables, placement, self.device_mesh)
 
     def _shardings(self, state: TrainState) -> Placement[TrainState]:
         mesh = self.state_mesh
@@ -722,7 +739,7 @@ class Trainer(Generic[Loss, Effects]):
         abstract = jax.eval_shape(self.initial_state, initializer, key)
         refuse_wide_floats(abstract, self.device_mesh)
         shardings = self.shardings(abstract)
-        self.layout.check(abstract.variables, shardings.variables, self.device_mesh)
+        self.check(abstract.variables, shardings.variables)
         checkpoints = self.checkpoints
         # Each process lists the checkpoints itself, and on a shared
         # filesystem one listing can lag another's: every process resumes
@@ -1187,7 +1204,7 @@ class Trainer(Generic[Loss, Effects]):
         plans, probes = plan_step(
             lower, lambda candidate: step_compiler_options(
                 self.objective, device_tokens(self.objective, candidate.micro, shards),
-                FROZEN in candidate.prepared.variables),
+                FROZEN in candidate.prepared.variables, mesh.devices.size),
             candidates, candidates.index(first) if isinstance(first, int) and first in candidates else 0,
             objective=self.objective, mesh=mesh, xla_defaults=self._xla_defaults,
             base=None if self._base_rung is None else self._base_rung[1], resumed=resumed,
@@ -1491,7 +1508,7 @@ class Trainer(Generic[Loss, Effects]):
                 run.stop_control = checkpoints.control(checkpoints.latest)
         else:
             shardings = self.shardings(initial)
-            self.layout.check(initial.variables, shardings.variables, self.device_mesh)
+            self.check(initial.variables, shardings.variables)
             state = jax.device_put(initial, shardings)
             position = None
         run.last_checkpoint = time.perf_counter()
@@ -1870,7 +1887,7 @@ class Trainer(Generic[Loss, Effects]):
             return choice
 
         selection = tuple(
-            self._best_selection(owned(Best(choice) if isinstance(choice, str) else choice), metrics, splits)
+            owned(Best(choice) if isinstance(choice, str) else choice).resolved(metrics, splits)
             for choice in raw
         )
         labels = [(choice.split, choice.metric) for choice in selection
@@ -1883,52 +1900,11 @@ class Trainer(Generic[Loss, Effects]):
                 raise TypeError(
                     "Plateau selects a declared metric object, not a Best policy or score function"
                 )
-            stopping = self._best_selection(Best(metric, mode=stop.mode, split=stop.split), metrics, splits)
+            stopping = Best(metric, mode=stop.mode, split=stop.split).resolved(metrics, splits)
             stop = dataclasses.replace(stop, metric=metric, mode=stopping.mode, split=stopping.split)
         if restore_best and any(choice.weights_only for choice in selection):
             raise ValueError("restore_best requires full checkpoints, not weights_only snapshots")
         return selection, stop
-
-    @staticmethod
-    def _best_selection(
-        best: str | Metric | TrainingScalar | Best,
-        metrics: Sequence[Metric],
-        splits: Sequence[str] = ("val",),
-    ) -> Best:
-        selection = best if isinstance(best, Best) else Best(best)
-        metric = selection._source
-        if metric is None:
-            name = selection.metric.removeprefix((selection.split or 'val') + '/')
-            metric = next((declared for declared in metrics if declared.name == name), None)
-            if metric is None:
-                raise ValueError(f"best metric {selection.metric!r} is not among fit's metrics")
-            selection = dataclasses.replace(selection, _source=metric)
-        if isinstance(metric, TrainingScalar):
-            if selection.mode is None:
-                if metric.shown.better is None:
-                    raise ValueError("training scalar has no declared direction; use Best(scalar, mode=...)")
-                selection = dataclasses.replace(
-                    selection, mode="max" if metric.shown.better == "higher" else "min"
-                )
-            return dataclasses.replace(selection, split='train')
-        if isinstance(metric, (Metric, TrainingScalar)):
-            if not any(metric is declared for declared in metrics):
-                raise ValueError("best must be a metric object passed in metrics")
-            declaration = _reported(None, metrics).get(metric.name)
-            better = declaration.better if isinstance(declaration, Shown) else None
-            if selection.mode is None:
-                if better not in ('higher', 'lower'):
-                    raise ValueError(
-                        "best metric has no declared direction; use Best(metric, mode='min' or 'max')"
-                    )
-                selection = dataclasses.replace(selection, mode='max' if better == 'higher' else 'min')
-        if selection.split is None:
-            if len(splits) != 1 and isinstance(metric, Metric):
-                raise ValueError("Best(metric, split=...) is required with several validation splits")
-            selection = dataclasses.replace(selection, split=splits[0] if len(splits) == 1 else None)
-        elif selection.split not in splits:
-            raise ValueError(f"unknown validation split {selection.split!r}")
-        return selection
 
     def _ranking(self, plan: _FitPlan, scores: Mapping[str, float]) -> tuple[Ranking, ...]:
         if not plan.best:

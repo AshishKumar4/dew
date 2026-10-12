@@ -2,17 +2,17 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Literal
 
 import jax
 import jax.numpy as jnp
+from flax import struct
 from jax import lax
 
 from .common import _check_endpoint_domain, _push
 
 
-@dataclass(frozen=True)
+@struct.dataclass
 class DDPM:
     """Exact ancestral sampler for the reverse diffusion SDE.
 
@@ -38,7 +38,7 @@ class DDPM:
     `current_beta_t`.
     """
 
-    variance: Literal["small", "large"] = "small"
+    variance: Literal["small", "large"] = struct.field(pytree_node=False, default="small")
 
     def __post_init__(self) -> None:
         if self.variance not in ("small", "large"):
@@ -68,7 +68,7 @@ class DDPM:
         return alpha_s * denoised + eps_coeff * eps + noise * gamma, state
 
 
-@dataclass(frozen=True)
+@struct.dataclass
 class DDIM:
     """The DDIM update, where `eta` sets the stochasticity: 0 is deterministic, 1 is DDPM-like.
 
@@ -78,7 +78,7 @@ class DDIM:
     from `SourceLimitedPrediction`, in the process's conversion.
     """
 
-    eta: float = 0.0
+    eta: float = struct.field(pytree_node=False, default=0.0)
 
     def init(self, x, times, process, *, key):
         return ()
@@ -106,7 +106,7 @@ def _pndm_step(x, eps, rates_t, rates_s):
     return (alpha_s / alpha_t) * x - (alpha_s ** 2 - alpha_t ** 2) * eps / denominator
 
 
-@dataclass(frozen=True)
+@struct.dataclass
 class PNDM:
     """PNDM as Diffusers 0.34.0's `PNDMScheduler`: Adams-Bashforth over eps with DDIM as the transfer.
 
@@ -122,7 +122,7 @@ class PNDM:
     retain their fixed training stride. Transfers cannot start at alpha = 0.
     """
 
-    skip_prk_steps: bool = False
+    skip_prk_steps: bool = struct.field(pytree_node=False, default=False)
 
     def init(self, x, times, process, *, key):
         _check_endpoint_domain(process, times, source=True,
@@ -174,7 +174,7 @@ class PNDM:
             index = jnp.where(count < 3, 0, 1)
         return lax.switch(index, branches, None), (outputs, count + 1)
 
-@dataclass(frozen=True)
+@struct.dataclass
 class Consistency:
     """Multistep consistency sampling, the update of Diffusers 0.34.0's `LCMScheduler`.
 
@@ -196,7 +196,7 @@ class Consistency:
         return stepped, (count + 1, steps)
 
 
-@dataclass(frozen=True)
+@struct.dataclass
 class TCD:
     """Trajectory consistency sampling, as Diffusers 0.34.0's `TCDScheduler`.
 
@@ -210,7 +210,7 @@ class TCD:
     grid's end itself and takes no noise.
     """
 
-    eta: float = 0.3
+    eta: float = struct.field(pytree_node=False, default=0.3)
 
     def __post_init__(self) -> None:
         if not 0 <= self.eta <= 1:
