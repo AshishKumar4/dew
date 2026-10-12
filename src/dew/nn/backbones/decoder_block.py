@@ -561,23 +561,27 @@ class DecoderBlock(nn.Module):
         """Compose the declared mixer and MLPs, independent of remat and storage."""
         count = self._submodule_flops(lengths, counted_flops)
         if self.altup is not None:
-            count += AltUpLayer(self.altup, self.emb_features, parent=None).model_flops(lengths)
+            count += AltUpLayer(self.altup, self.emb_features, parent=None).mixing_flops(lengths)
         if self.hyper_connections is not None:
             site = HyperConnection(self.hyper_connections, self.emb_features, parent=None)
-            count += (1 + (self.feedforward is not None)) * site.model_flops(lengths)
+            count += (1 + (self.feedforward is not None)) * site.mixing_flops(lengths)
         if self.residual_site is not None:
-            sources = self.residual_site.finished + 1 if self.residual_site.finished else 0
-            if self.feedforward is not None:
-                sources += self.residual_site.finished + self.residual_site.opens + 1
-            count += DepthAttention(self.emb_features, parent=None).depth_flops(lengths, sources)
+            count += DepthAttention(self.emb_features, parent=None).depth_parameter_flops(
+                lengths, self.residual_sources)
         return count
 
     @nn.nowrap
     def parameter_flops(self, lengths) -> float:
         """The same submodules' learned matrices, as PEFT's frozen base work."""
-        if any(value is not None for value in (self.altup, self.hyper_connections, self.residual_site)):
-            raise MissingFlopsCount("DecoderBlock needs its multi-stream parameter geometry for PEFT")
         return self._submodule_flops(lengths, parameter_flops)
+
+    @property
+    def residual_sources(self) -> int:
+        site = self.residual_site
+        if site is None:
+            return 0
+        sources = site.finished + 1 if site.finished else 0
+        return sources + (site.finished + site.opens + 1 if self.feedforward is not None else 0)
 
     @nn.nowrap
     def projections(self) -> dict[str, tuple[int, int]]:
@@ -597,6 +601,14 @@ class DecoderBlock(nn.Module):
         count += sum(projection_flops(lengths, *shape) for shape in self.projections().values())
         if self.laurel_rank is not None:
             count += LaurelBlock(self.emb_features, self.laurel_rank, parent=None).model_flops(lengths)
+        if self.altup is not None:
+            count += AltUpLayer(self.altup, self.emb_features, parent=None).parameter_flops(lengths)
+        if self.hyper_connections is not None:
+            site = HyperConnection(self.hyper_connections, self.emb_features, parent=None)
+            count += (1 + (self.feedforward is not None)) * site.parameter_flops(lengths)
+        if self.residual_site is not None:
+            count += DepthAttention(self.emb_features, parent=None).depth_parameter_flops(
+                lengths, self.residual_sources)
         return count
 
     def setup(self):
