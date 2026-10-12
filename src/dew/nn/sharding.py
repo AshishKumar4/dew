@@ -274,6 +274,16 @@ def measured_links(links: Mapping[str, Link]) -> Iterator[Mapping[str, Link]]:
         _LINKS.reset(token)
 
 
+def trace_context() -> tuple:
+    """What a model reads from context as it traces, beside the mesh (which jax keys on itself): the
+    pipeline's microbatch count, the logical-axis rules and the measured links. A program cached by
+    its arguments' shapes is reused only under the same (`Objective._compiled_program`)."""
+    schedule = _SCHEDULE.get()
+    links = tuple(sorted((axis, link.bytes_per_second, link.flops_per_second, link.platform)
+                         for axis, link in _LINKS.get().items()))
+    return (None if schedule is None else schedule.count, axis_rules(), links)
+
+
 def _spreads(axis: str, x: jax.Array, latent: int, tokens: float, *, padding: float = 0.0) -> bool:
     """Whether a projection of `x`'s tokens to `latent` features, which would
     otherwise run on every token of every `axis` shard, runs split over
