@@ -148,5 +148,5 @@ def test_stats_counts_a_fresh_pass_and_mix_weighs_tokens():
         origins = np.concatenate([next(reader)["origin"] for _ in range(40)])
     finally:
         reader.close()
-    # Three-token records carry two targets each, nine-token records eight: equal targets, four short to one long.
+    # Three-token records carry two targets, nine-token records eight: equal targets, four short to one long.
     assert np.mean(origins == "short") == pytest.approx(0.8, abs=0.05)
