@@ -36,7 +36,7 @@ import jax
 import jax.numpy as jnp
 from flax import linen as nn
 from flax.linen.dtypes import promote_dtype
-from flax.linen.linear import PromoteDtypeFn
+from flax.linen.linear import PromoteDtypeFn, canonicalize_padding
 from flax.typing import ConvGeneralDilatedT
 from jax.extend import core
 from jax.interpreters import ad, batching, mlir
@@ -251,10 +251,11 @@ class Conv(nn.Conv):
         dilation = ((self.kernel_dilation,) * len(kernel) if isinstance(self.kernel_dilation, int) else
                     (1,) * len(kernel) if self.kernel_dilation is None else tuple(self.kernel_dilation))
         effective = tuple((tap - 1) * rate + 1 for tap, rate in zip(kernel, dilation, strict=True))
-        if self.padding == 'SAME':
+        padding = canonicalize_padding(self.padding, len(kernel))
+        if padding in ('SAME', 'CIRCULAR', 'REFLECT', 'CAUSAL'):
             sizes = tuple((size + step - 1) // step for size, step in zip(spatial, strides, strict=True))
         else:
-            padding = ((0, 0),) * len(kernel) if self.padding == 'VALID' else self.padding
+            padding = ((0, 0),) * len(kernel) if padding == 'VALID' else padding
             sizes = tuple((size + sum(pad) - tap) // step + 1
                           for size, tap, step, pad in zip(spatial, effective, strides, padding, strict=True))
         return (*sizes, self.features)
