@@ -45,10 +45,14 @@ def fingerprint(value: JSON | Mapping[str, object] | np.ndarray) -> str:
 
 @dataclasses.dataclass(frozen=True)
 class StepIdentity:
+    """What a step computes (`semantic`), and the bytes of each external
+    module its code comes from (`modules`): its own, then those of the
+    factory that configured it."""
+
     name: str
     config: str
     exact: bool
-    module_hash: str | None = None
+    modules: tuple[str, ...] = ()
     declared: str | None = None
     dependencies: Mapping[str, object] = dataclasses.field(default_factory=dict)
 
@@ -70,10 +74,10 @@ class StepIdentity:
         path = (
             None if inspect.isbuiltin(step) or kind.__module__ == "builtins" else inspect.getsourcefile(kind)
         )
-        module_hash = (
-            hashlib.sha256(Path(path).read_bytes()).hexdigest()
+        modules = (
+            (hashlib.sha256(Path(path).read_bytes()).hexdigest(),)
             if external and path is not None and Path(path).is_file()
-            else None
+            else ()
         )
         config = re.sub(r" at 0x[0-9a-fA-F]+", "", config)
         dependencies = (
@@ -85,7 +89,13 @@ class StepIdentity:
         )
         if dependencies and dataclasses.is_dataclass(step) and not isinstance(step, type):
             config = json.dumps(_configuration(step), sort_keys=True)
-        return cls(name, config, exact, module_hash, declared, dependencies)
+        return cls(name, config, exact, modules, declared, dependencies)
+
+    def semantic(self) -> dict[str, JSON]:
+        """What the step computes, on any host: its identity without its
+        modules' bytes, which only a manifest's environment records."""
+        recorded = dataclasses.asdict(self)
+        return {name: json_value(value, name) for name, value in recorded.items() if name != "modules"}
 
 
 @runtime_checkable
@@ -136,10 +146,15 @@ def _changed(saved: Mapping[str, object], current: Mapping[str, object]) -> tupl
 
 @dataclasses.dataclass(frozen=True)
 class Manifest:
-    """The dependency manifest shared by an execution plan and its cache."""
+    """The dependency manifest shared by an execution plan and its cache.
+
+    `ran` are the steps a memory read already ran into a source it holds.
+    That source's snapshot names them by what they compute, so only their
+    modules reach the record from here, in the environment."""
 
     source: Mapping[str, object]
     steps: tuple[StepIdentity, ...] = ()
+    ran: tuple[StepIdentity, ...] = ()
     revision: str = "unversioned"
     lock: str = ""
     python: str = platform.python_version()
@@ -156,6 +171,7 @@ class Manifest:
         source: Mapping[str, object],
         steps: Sequence[StepIdentity],
         *,
+        ran: Sequence[StepIdentity] = (),
         fill: Mapping[str, object] | None = None,
     ) -> Manifest:
         root = Path(__file__).resolve().parents[3]
@@ -199,6 +215,7 @@ class Manifest:
         return cls(
             source,
             tuple(steps),
+            tuple(ran),
             revision=revision,
             lock=lock,
             fill={} if fill is None else fill,
@@ -214,31 +231,31 @@ class Manifest:
         recorded: dict[str, JSON] = {
             field.name: json_value(getattr(self, field.name), field.name)
             for field in dataclasses.fields(self)
-            if field.name != "steps"
+            if field.name not in ("steps", "ran")
         }
         recorded["steps"] = [json_value(dataclasses.asdict(step), "step") for step in self.steps]
+        recorded["ran"] = [json_value(dataclasses.asdict(step), "step") for step in self.ran]
         return recorded
 
     def semantic(self) -> dict[str, JSON]:
         """What the rows are, on any host: the pinned sources, each step's
-        identity and dependencies, the tokenizers and the fill."""
+        identity and dependencies (`StepIdentity.semantic`), the tokenizers
+        and the fill."""
         recorded = self.record()
-        recorded["steps"] = [
-            json_value({name: value for name, value in step.items() if name != "module_hash"}, "step")
-            for step in map(dataclasses.asdict, self.steps)
-        ]
-        return {name: value for name, value in recorded.items() if name not in _ENVIRONMENT}
+        recorded["steps"] = [step.semantic() for step in self.steps]
+        return {name: value for name, value in recorded.items() if name not in (*_ENVIRONMENT, "ran")}
 
     def environment(self) -> dict[str, JSON]:
         """The code and machine that ran the steps: Dew's revision and lock,
-        the interpreter, the platform and each external step module's bytes.
-        A step states a change to what it computes in its configuration or
-        declared identity; its module's bytes change with any edit to its
-        file, as Dew's revision does with any edit to Dew."""
+        the interpreter, the platform and each external module's bytes, for
+        the steps a memory read ran and then the plan's own. A step states a
+        change to what it computes in its configuration or declared identity;
+        its modules' bytes change with any edit to their files, as Dew's
+        revision does with any edit to Dew."""
         recorded = self.record()
         return {
             **{name: recorded[name] for name in _ENVIRONMENT},
-            "modules": [step.module_hash for step in self.steps],
+            "modules": [list(step.modules) for step in (*self.ran, *self.steps)],
         }
 
     @property

@@ -248,7 +248,7 @@ include each timing interval, the image-byte SHA-256 and the example outputs.
 
 ## Position and multiple processes
 
-The checkpoint stores the compiled plan with the iterator position: source snapshots, step identities, ordering, derived packing and grouping facts, cache generations and topology constraints. A resume rebuilds that plan and refuses changed data, tokenizer, order or transforms. A change only to the code that ran the steps (Dew's revision, the installed packages, the interpreter, the platform or a step module's bytes) is a warning on a global resume and a refusal on a per-share one. A step states a change to what it computes in its configuration or its declared `identity`.
+The checkpoint stores the compiled plan with the iterator position: source snapshots, step identities, ordering, derived packing and grouping facts, cache generations and topology constraints. A resume rebuilds that plan and refuses changed data, tokenizer, order or transforms. A change only to the code that ran the steps (Dew's revision, the installed packages, the interpreter, the platform or the bytes of a step's module or of the factory that configured it) is a warning on a global resume and a refusal on a per-share one. A step states a change to what it computes in its configuration or its declared `identity`.
 
 | Lowering | Position | Resume topology |
 |---|---|---|

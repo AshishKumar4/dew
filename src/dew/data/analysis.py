@@ -11,12 +11,12 @@ Grain lowering (`dew.data.lowering`) and the plan `compile` saves read this
 analysis instead of deriving it again.
 
 The stage facts they share are here too: a pipeline's corpora and steps, a
-step's identity and the manifest a cache's fill is keyed by, which stages
-draw from the record rng, which drop or make rows, which a cache can hold
-(`_cache_at`), which run inside a cache's or a shard's reader, and where a
-recipe's default order goes (`_order_at`). `_capabilities` and
-`_preferred_read` ask a run's sources which reads they support and which
-they prefer.
+step's identity and the manifest a plan or a cache's fill records
+(`_manifest`), which stages draw from the record rng, which drop or make
+rows, which a cache can hold (`_cache_at`), which run inside a cache's or a
+shard's reader, and where a recipe's default order goes (`_order_at`).
+`_capabilities` and `_preferred_read` ask a run's sources which reads they
+support and which they prefer.
 """
 
 from __future__ import annotations
@@ -222,17 +222,23 @@ def _identity(stage: Stage, *, cache: bool = False) -> StepIdentity:
     """What a stage runs, as the plan's manifest and a cache's key record it.
     A cache stage is its kind alone. The plan names the rows a cache serves
     by their key (`Cache.reference`), and where the cache lives is no part of
-    the data, so a run resumes against the same rows cached anywhere."""
+    the data, so a run resumes against the same rows cached anywhere. A step
+    a `Configured` stage resolved names its factory by what it computes and
+    carries the factory's modules after its own."""
     if isinstance(stage, Artifact):
         return StepIdentity(f"dew.data.cache.{type(stage.cache).__name__}", "", exact=True)
     if isinstance(stage, Configured):
         return StepIdentity.of(stage.factory, cache=cache)
     if isinstance(stage, (Map, RandomMap, MapWithIndex, FlatMap, MapBatch)):
         identity = StepIdentity.of(stage.step, stage.identity, cache=cache)
-        if isinstance(stage, (Map, RandomMap, FlatMap)) and stage.configured:
+        if isinstance(stage, (Map, RandomMap, FlatMap)) and stage.configured is not None:
+            bound = stage.configured
+            factory = _identity(bound.step)
+            binding = {"factory": factory.semantic(), "scope": bound.step.scope, "values": bound.values}
             identity = dataclasses.replace(
                 identity,
-                config=json.dumps({"step": identity.config, "configured": stage.configured}, sort_keys=True),
+                config=json.dumps({"step": identity.config, "configured": binding}, sort_keys=True),
+                modules=(*identity.modules, *factory.modules),
             )
         return identity
     if isinstance(stage, Filter):
@@ -240,9 +246,24 @@ def _identity(stage: Stage, *, cache: bool = False) -> StepIdentity:
     return StepIdentity.of(stage)
 
 
+def _manifest(
+    snapshot: Mapping[str, object],
+    sources: Sequence[Source],
+    steps: Sequence[StepIdentity],
+    *,
+    fill: Mapping[str, object] | None = None,
+) -> Manifest:
+    """The manifest of the rows `sources` hold, named by `snapshot`, through
+    `steps`. A source a memory read made (`_Ran`) names the steps it already
+    ran by what they compute; their modules join the environment here."""
+    ran = tuple(_identity(stage) for source in sources for stage in _written(source, ()))
+    return Manifest.of(snapshot, steps, ran=ran, fill=fill)
+
+
 def _cache_manifest(source: Source, prefix: Sequence[Stage], read: Read) -> Manifest:
-    return Manifest.of(
+    return _manifest(
         source.snapshot(),
+        (source,),
         tuple(_identity(stage, cache=True) for stage in prefix),
         fill={"read": read, "row_ids": "sharded" if read == "streamed" else "indexed"},
     )
