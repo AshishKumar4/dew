@@ -23,6 +23,7 @@ kernel accepts explicit block/warp/stage overrides for the lab.
 from __future__ import annotations
 
 import functools
+import operator
 from collections.abc import Mapping
 
 import jax
@@ -369,18 +370,6 @@ def recompute_w_u(k, v, beta, a, g, *, chunk: int = 64, bk: int | None = None, b
     )(k, v, beta, a, g)
 
 
-def _gated_state_write(key, gated, *, exact: bool):
-    """The fp32 gated value as two input-dtype parts for k^T v, summed in fp32. fla rounds gated
-    v_new once to bf16/fp16; retaining its residual on chip removes that quantization error with
-    one additional narrow dot and zero extra HBM bytes. FP32 inputs keep their existing product."""
-    high = gated.astype(key.dtype)
-    update = _dot(key.T, high, exact=exact)
-    if jnp.dtype(key.dtype).itemsize == 2:
-        low = (gated - high.astype(jnp.float32)).astype(key.dtype)
-        update += _dot(key.T, low, exact=exact)
-    return update
-
-
 def _h_kernel(k_ref, u_ref, w_ref, g_ref, h0_ref, h_ref, corrected_ref, ht_ref, *, chunk: int, exact: bool,
               per_key: bool = False):
     """fla's `chunk_gated_delta_rule_fwd_kernel_h_blockdim64` (fla/ops/common/chunk_delta_h.py:50-
@@ -388,8 +377,8 @@ def _h_kernel(k_ref, u_ref, w_ref, g_ref, h0_ref, h_ref, corrected_ref, ht_ref, 
     64-key slices; each chunk stores the memory it enters in `h`'s dtype, then the corrected values
     `u - w h` (fla's `v_new`; `h` cast to `w`'s dtype for the product), gates them by
     `exp2(g_last - g)` and the memory by `exp2(g_last)`, casts the gated values to `k`'s dtype and
-    adds `k^T v` to the memory. Narrow inputs keep the gated-value residual as a second bf16/fp16
-    part on chip: h remains fp32, while h/corrected HBM outputs keep fla's original storage dtypes.
+    adds `k^T v` to the memory, the fp32 gated values as two parts of `k`'s dtype (`_split_dot`)
+    where fla rounds them once: h remains fp32, and h and the corrected values keep fla's storage.
     `per_key` is fla's USE_GK branch: `g_ref` holds a decay per key dimension `[T, K]`, which gates
     the memory's rows by `exp2(g_last)` and not the values, whose keys carry their own decay."""
     length, width = k_ref.shape
@@ -407,13 +396,12 @@ def _h_kernel(k_ref, u_ref, w_ref, g_ref, h0_ref, h_ref, corrected_ref, ht_ref, 
         if per_key:
             last = n * chunk + chunk - 1
             return [state[i] * jnp.exp2(g_ref[last, pl.ds(i * 64, 64)].astype(jnp.float32))[:, None]
-                    + _gated_state_write(k_ref[rows, pl.ds(i * 64, 64)], corrected, exact=exact)
+                    + _split_dot(k_ref[rows, pl.ds(i * 64, 64)].T, corrected, exact=exact)
                     for i in range(slices)]
         gate = g_ref[rows].astype(jnp.float32)
         last = g_ref[n * chunk + chunk - 1].astype(jnp.float32)
         gated = corrected * jnp.exp2(last - gate)[:, None]
-        return [state[i] * jnp.exp2(last) + _gated_state_write(k_ref[rows, pl.ds(i * 64, 64)], gated,
-                                                            exact=exact)
+        return [state[i] * jnp.exp2(last) + _split_dot(k_ref[rows, pl.ds(i * 64, 64)].T, gated, exact=exact)
                 for i in range(slices)]
 
     state = jax.lax.fori_loop(0, length // chunk, step, state)
@@ -485,8 +473,9 @@ def _dhu_kernel(q_ref, k_ref, w_ref, g_ref, dht_ref, do_ref, dv_ref, dh_ref, dh0
     """fla's `chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64` (chunk_delta_h.py:359-669) for one
     row's head and `BV` value columns, chunks in reverse. Each stores the gradient of the memory it
     leaves into, `dh`, then `dv2 = dv + (k dh) exp2(g_last - g)` (dh cast to k's dtype), then
-    `dh = dh exp2(g_last) + scale (q exp2(g))^T do - w^T dv2`, the query product in fp32 and the w
-    product with dv2 cast to w's dtype, as fla's dtypes fall. `per_key` is fla's USE_GK branch:
+    `dh = dh exp2(g_last) + scale (q exp2(g))^T do - w^T dv2`: the gated queries fp32 as two parts
+    of `do`'s dtype (`_split_dot`), where fla takes one TF32 product, and dv2 cast to w's dtype for
+    its product, as fla casts it. `per_key` is fla's USE_GK branch:
     `g_ref` `[T, K]` decays the gradient's rows by `exp2(g_last)`, and neither `dv2` nor the
     queries, which carry their own decay, are gated; the query product stays in q's dtype."""
     length, width = k_ref.shape
@@ -514,7 +503,7 @@ def _dhu_kernel(q_ref, k_ref, w_ref, g_ref, dht_ref, do_ref, dv_ref, dh_ref, dh0
         def moved(i):
             read = q_ref[rows, pl.ds(i * 64, 64)].astype(jnp.float32) * decay
             written = w_ref[rows, pl.ds(i * 64, 64)]
-            return (_dot(read.T, out_grad.astype(jnp.float32), exact=exact) * scale
+            return (_split_dot(read.T, out_grad, exact=exact) * scale
                     - _dot(written.T, dv.astype(written.dtype), exact=exact))
 
         return [grad[i] * jnp.exp2(last) + moved(i) for i in range(slices)]
@@ -660,16 +649,22 @@ def chunk_bwd_dv_local(q, k, g, do, *, scale: float, chunk: int = 64, bk: int | 
     )(q, k, g, do)
 
 
-def _split_dot(wide, narrow, *, exact: bool):
-    """`wide @ narrow` for an fp32 `wide` against a 16-bit `narrow`: `wide` as two `narrow`-dtype parts,
-    its rounding and the rounding's remainder, each product exact and summed in fp32, so `wide`'s
-    rounding to the narrow dtype, which fla's single product takes, drops out. FP32 operands keep
-    the one product."""
-    if jnp.dtype(narrow.dtype).itemsize == 4:
-        return _dot(wide, narrow, exact=exact)
-    high = wide.astype(narrow.dtype)
-    low = (wide - high.astype(jnp.float32)).astype(narrow.dtype)
-    return _dot(high, narrow, exact=exact) + _dot(low, narrow, exact=exact)
+def _split_dot(a, b, *, exact: bool):
+    """`a @ b` with an fp32 operand beside a 16-bit one: the fp32 one as two parts of the other's
+    dtype, its rounding and the rounding's remainder, each product exact and summed in fp32. fla
+    rounds that operand to the narrow dtype for one product, or takes one TF32 product of both in
+    fp32; the parts keep 16 bits of it at the cost of a second narrow product, which runs as fast as
+    one TF32 product. Operands of one dtype keep the one product."""
+    narrow = min(a.dtype, b.dtype, key=lambda dtype: jnp.dtype(dtype).itemsize)
+
+    def parts(x):
+        if x.dtype == narrow:
+            return [x]
+        high = x.astype(narrow)
+        return [high, (x - high.astype(jnp.float32)).astype(narrow)]
+
+    products = [_dot(left, right, exact=exact) for left in parts(a) for right in parts(b)]
+    return functools.reduce(operator.add, products)
 
 
 def _state_inner_product(memory, memory_grad):

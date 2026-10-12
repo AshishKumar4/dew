@@ -227,7 +227,7 @@ def test_the_state_write_retains_the_bf16_gated_value_residual_on_chip():
     """A gated value at a bf16 midpoint must not lose its residual before the fp32 state write."""
     key = jnp.ones((1, 1), jnp.bfloat16)
     gated = jnp.full((1, 1), 1.00390625, jnp.float32)
-    got = fla_gdn._gated_state_write(key, gated, exact=True)
+    got = fla_gdn._split_dot(key.T, gated, exact=True)
     assert got.dtype == jnp.float32
     assert float(got[0, 0]) == 1.00390625
     rounded = key.astype(jnp.float32).T @ gated.astype(jnp.bfloat16).astype(jnp.float32)
