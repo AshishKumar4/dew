@@ -39,6 +39,7 @@ import math
 import re
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path as FilePath
 from typing import ClassVar, Protocol, TypedDict, runtime_checkable
 
@@ -56,10 +57,20 @@ from dew.nn.backbones.layer_plan import group_layers
 from dew.nn.flops import MissingFlopsCount, counted_flops, parameter_flops, projection_flops
 from dew.nn.protocols import (
     Counted,
+    CountedConditionedSpatial,
+    CountedImages,
     CountedLogits,
+    CountedLogitsTraining,
     CountedMatrixUsage,
+    CountedMultimodal,
     CountedParameters,
     CountedPredictionParameters,
+    CountedPredictions,
+    CountedPredictionTraining,
+    CountedSequences,
+    CountedSpatial,
+    CountedTraining,
+    CountedVideo,
 )
 from dew.objectives.base import Path, Variables, freeze, merge as overlay, select, thaw
 from dew.registry import wrapper_layers
@@ -415,10 +426,22 @@ class _Branch:
         return output + jnp.asarray(_scale(target, self.rslora), delta.dtype) * delta
 
 
+def _refusing_counts(model: nn.Module, base: type[nn.Module], *protocols) -> type[nn.Module]:
+    """Inherited geometry describes the native forward, not the added factors."""
+    def missing(self, *args: object, **kwargs: object) -> float:
+        raise MissingFlopsCount(f"{type(model).__name__} needs declared adapter matrix usage "
+                                "and parameter work for this geometry")
+
+    methods = {name: nn.nowrap(missing) for protocol in protocols for name in vars(protocol)
+               if name.endswith('_flops') and hasattr(model, name)}
+    return type('UncountedAdapter', (base,), methods)
+
+
 def _counted_adapter(model: nn.Module, branch: _Branch,
                      layouts: Mapping[str, WeightLayout]) -> type[nn.Module]:
     """An adapter adds analytical work only to capabilities its wrapped model declares."""
-    base = type(model)
+    base = _refusing_counts(model, type(model), CountedImages, CountedMultimodal, CountedSequences,
+                            CountedSpatial, CountedConditionedSpatial, CountedVideo)
     bindings = {layout.paths[0][:-1]: layout for layout in layouts.values() if len(layout.paths) == 1}
 
     class CountedAdapter(base):
@@ -449,6 +472,10 @@ def _counted_adapter(model: nn.Module, branch: _Branch,
             return counted_flops(unadapted(self), lengths) + self._adapter_forward(lengths)
 
         @nn.nowrap
+        def parameter_flops(self, lengths) -> float:
+            return parameter_flops(unadapted(self), lengths) + self._adapter_forward(lengths)
+
+        @nn.nowrap
         def training_flops(self, lengths) -> float:
             """Frozen base maps get 4N, factors 6N; state/attention retain 3*forward.
 
@@ -463,22 +490,32 @@ def _counted_adapter(model: nn.Module, branch: _Branch,
 
     class LogitsAdapter(CountedAdapter):
         @nn.nowrap
-        def prediction_flops(self, lengths) -> float:
+        def prediction_flops(self, lengths, *, prediction_lengths=None) -> float:
             original = unadapted(self)
             if not isinstance(original, CountedPredictionParameters):
                 raise MissingFlopsCount(f"{type(original).__name__} has no declared prediction matrix work")
-            return original.prediction_flops(lengths) + self._adapter_forward(
-                lengths, usage=original.prediction_matrix_usage)
+            forward = original.prediction_flops(lengths, prediction_lengths=prediction_lengths)
+            usage = partial(original.prediction_matrix_usage, prediction_lengths=prediction_lengths)
+            return forward + self._adapter_forward(lengths, usage=usage)
 
         @nn.nowrap
-        def prediction_training_flops(self, lengths) -> float:
+        def prediction_parameter_flops(self, lengths, *, prediction_lengths=None) -> float:
             original = unadapted(self)
             if not isinstance(original, CountedPredictionParameters):
                 raise MissingFlopsCount(f"{type(original).__name__} has no declared prediction matrix work")
-            forward = original.prediction_flops(lengths)
-            learned = original.prediction_parameter_flops(lengths)
-            return 3 * forward - learned + 3 * self._adapter_forward(
-                lengths, usage=original.prediction_matrix_usage)
+            learned = original.prediction_parameter_flops(lengths, prediction_lengths=prediction_lengths)
+            usage = partial(original.prediction_matrix_usage, prediction_lengths=prediction_lengths)
+            return learned + self._adapter_forward(lengths, usage=usage)
+
+        @nn.nowrap
+        def prediction_training_flops(self, lengths, *, prediction_lengths=None) -> float:
+            original = unadapted(self)
+            if not isinstance(original, CountedPredictionParameters):
+                raise MissingFlopsCount(f"{type(original).__name__} has no declared prediction matrix work")
+            forward = original.prediction_flops(lengths, prediction_lengths=prediction_lengths)
+            learned = original.prediction_parameter_flops(lengths, prediction_lengths=prediction_lengths)
+            usage = partial(original.prediction_matrix_usage, prediction_lengths=prediction_lengths)
+            return 3 * forward - learned + 3 * self._adapter_forward(lengths, usage=usage)
 
         @nn.nowrap
         def logits_flops(self, lengths) -> float:
@@ -497,7 +534,9 @@ def _counted_adapter(model: nn.Module, branch: _Branch,
     # The factors' work reads each target's matrix usage and the frozen base's
     # parameter work, so the adapter counts only where the model declares all three.
     if not all(isinstance(model, protocol) for protocol in (Counted, CountedMatrixUsage, CountedParameters)):
-        return base
+        return _refusing_counts(model, base, Counted, CountedParameters, CountedLogits, CountedTraining,
+                                CountedLogitsTraining, CountedPredictions, CountedPredictionParameters,
+                                CountedPredictionTraining)
     return LogitsAdapter if isinstance(model, CountedLogits) else CountedAdapter
 
 

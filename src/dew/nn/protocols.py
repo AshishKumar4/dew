@@ -37,7 +37,7 @@ callers add flags and absent values.
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Protocol, Self, runtime_checkable
 
 import jax
@@ -197,23 +197,33 @@ class CountedCondition(Protocol):
 class CountedPredictions(Protocol):
     """The extra decoder depths and heads trained beside a language model's trunk."""
 
-    def prediction_flops(self, lengths: np.ndarray) -> float: ...
+    num_nextn_predict_layers: int
+
+    def prediction_flops(self, lengths: np.ndarray, *,
+                          prediction_lengths: Sequence[tuple[np.ndarray, np.ndarray]] | None = None
+                          ) -> float: ...
 
 
 @runtime_checkable
 class CountedPredictionParameters(CountedPredictions, Protocol):
     """Prediction depths declare their learned maps and adapted scopes separately."""
 
-    def prediction_parameter_flops(self, lengths: np.ndarray) -> float: ...
+    def prediction_parameter_flops(self, lengths: np.ndarray, *,
+                                    prediction_lengths: Sequence[tuple[np.ndarray, np.ndarray]] | None = None
+                                    ) -> float: ...
 
-    def prediction_matrix_usage(self, path: tuple[str, ...], lengths: np.ndarray) -> np.ndarray: ...
+    def prediction_matrix_usage(self, path: tuple[str, ...], lengths: np.ndarray, *,
+                                  prediction_lengths: Sequence[tuple[np.ndarray, np.ndarray]] | None = None
+                                  ) -> np.ndarray: ...
 
 
 @runtime_checkable
 class CountedPredictionTraining(CountedPredictions, Protocol):
     """An adapted prediction stack's frozen-base and trainable-factor training work."""
 
-    def prediction_training_flops(self, lengths: np.ndarray) -> float: ...
+    def prediction_training_flops(self, lengths: np.ndarray, *,
+                                   prediction_lengths: Sequence[tuple[np.ndarray, np.ndarray]] | None = None
+                                   ) -> float: ...
 
 
 @runtime_checkable
