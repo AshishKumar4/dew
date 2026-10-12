@@ -395,10 +395,10 @@ def test_fit_checkpoints_the_final_step(tmp_path):
     assert not os.path.exists(tmp_path / "run" / "0")
 
 
-@pytest.mark.parametrize("cadence, expected", [(None, set()), (2, {2, 4})])
-def test_final_checkpoint_policy_is_independent_of_the_cadence(tmp_path, cadence, expected):
+@pytest.mark.parametrize("cadence, steps, expected", [(None, 5, set()), (2, 5, {2, 4}), (2, 6, {2, 4, 6})])
+def test_final_checkpoint_policy_is_independent_of_the_cadence(tmp_path, cadence, steps, expected):
     trainer = make_trainer(tmp_path, keep=4)
-    trainer.fit(Data(), steps=5, checkpoint_every=cadence, checkpoint_final=False)
+    trainer.fit(Data(), steps=steps, checkpoint_every=cadence, checkpoint_final=False)
     assert set(trainer.checkpoints._open().all_steps()) == expected
 
 

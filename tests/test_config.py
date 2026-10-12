@@ -19,7 +19,7 @@ from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.vision import GemmaProjector, SiglipVision
 from dew.objectives.diffusion import DiffusionRunConfig
 from dew.registry import Aliases, datasets, projectors, towers
-from dew.training import Layout, MeshSpec
+from dew.training import Checkpoints, Layout, MeshSpec
 
 
 def test_to_dict_and_from_dict_round_trip_a_run():
@@ -329,6 +329,14 @@ def test_a_run_records_its_token_budget_and_final_checkpoint_policy(tmp_path):
     run = RunConfig(trainer=config)
     assert RunConfig.from_dict(run.to_dict()).trainer == config
     assert config.total_steps(_data()) is None
+
+
+def test_a_run_can_disable_final_checkpoint_saving(tmp_path):
+    run = RunConfig(trainer=TrainerConfig(steps=1, checkpoint_final=False, batch_size=8,
+                    checkpoint_dir=str(tmp_path), eval_every=None, checkpoint_every=None))
+    data = Dataset(lambda partition: batches(), None, None, 8)
+    assert int(run.train(Regression(), data, name="no-final").step) == 1
+    assert Checkpoints(str(tmp_path / "no-final")).latest is None
 
 
 def test_a_dataset_at_another_batch_than_the_run_is_refused(tmp_path, capsys):
