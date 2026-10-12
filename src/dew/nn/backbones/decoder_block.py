@@ -223,25 +223,36 @@ class GatedMLP(nn.Module):
     @nn.nowrap
     def model_flops(self, lengths) -> float:
         """The residual-width MLP's two maps, or three with a learned gate."""
-        maps = 2 if self.activation in UNGATED else 3
-        return maps * projection_flops(lengths, self.out_features, self.hidden_features)
+        return sum(projection_flops(lengths, *shape) for shape in self.projections().values())
 
     parameter_flops = model_flops
 
+    @nn.nowrap
+    def projections(self) -> dict[str, tuple[int, int]]:
+        """The feed-forward's maps as `{name: (inputs, outputs)}`: what setup
+        builds, the count reads and the packed group (`_group`) concatenates."""
+        sites = {'up_proj': (self.out_features, self.hidden_features),
+                 'down_proj': (self.hidden_features, self.out_features)}
+        if self.activation not in UNGATED:
+            sites['gate_proj'] = sites['up_proj']
+        return sites
+
     def setup(self):
+        projections = self.projections()
         dense = functools.partial(
             self.linear, use_bias=self.use_bias, dtype=self.dtype, precision=self.precision,
             **normal_kernel(self.init_std))
         if self.activation not in UNGATED:
             if self._packed():
-                self.gate_up_proj = dense(2 * self.hidden_features, name='gate_up_proj')
+                group = self._group()
+                self.gate_up_proj = dense(sum(group.widths), name=group.packed)
             else:
-                self.gate_proj = dense(self.hidden_features, name='gate_proj')
+                self.gate_proj = dense(projections['gate_proj'][1], name='gate_proj')
         elif self.activation_sparsity or self.swiglu_limit is not None or self.packed:
             raise ValueError('activation_sparsity, swiglu_limit and packed require a gated MLP')
         if not self._packed():
-            self.up_proj = dense(self.hidden_features, name='up_proj')
-        self.down_proj = dense(self.out_features, name='down_proj', **normal_kernel(
+            self.up_proj = dense(projections['up_proj'][1], name='up_proj')
+        self.down_proj = dense(projections['down_proj'][1], name='down_proj', **normal_kernel(
             self.init_std if self.output_init_std is None else self.output_init_std))
         self.dropout = nn.Dropout(rate=self.dropout_rate)
 
@@ -259,7 +270,7 @@ class GatedMLP(nn.Module):
             hidden = self.dropout(ungated_activation(self.activation, up), deterministic=not train)
             return checkpoint_name(self.down_proj(hidden), 'down_proj')
         if self._packed():
-            gate, up = jnp.split(self.gate_up_proj(x), 2, axis=-1)
+            gate, up = self._group().split(self.gate_up_proj(x))
         else:
             gate, up = self.gate_proj(x), self.up_proj(x)
         gate = checkpoint_name(constrain(gate, MLP_HIDDEN), 'gate_proj')
@@ -278,14 +289,17 @@ class GatedMLP(nn.Module):
         layer's own layout, or a server's packing of the two."""
         return self.packed or self.has_variable('params', 'gate_up_proj')
 
+    def _group(self) -> ProjectionGroup:
+        """A gated MLP's gate and up projections, packed as `gate_up_proj`."""
+        return ProjectionGroup.of(tuple(self.path), 'gate_up_proj', ('gate_proj', 'up_proj'),
+                                  self.projections())
+
     def projection_groups(self) -> tuple[ProjectionGroup, ...]:
-        """Its gate and up projections packed as `gate_up_proj` (`ProjectionSites`),
-        which `setup` reads in their place, where it is gated and its variables
-        hold them."""
+        """Its group (`_group`) where it is gated and its variables hold it
+        (`ProjectionSites`), which `setup` reads packed in the members' place."""
         if self.activation in UNGATED:
             return ()
-        group = ProjectionGroup(tuple(self.path), 'gate_up_proj', ('gate_proj', 'up_proj'),
-                                (self.hidden_features,) * 2)
+        group = self._group()
         return (group,) if group.held(self.variables.get('params', {})) else ()
 
 
@@ -553,6 +567,13 @@ class DecoderBlock(nn.Module):
         return self._submodule_flops(lengths, parameter_flops)
 
     @nn.nowrap
+    def projections(self) -> dict[str, tuple[int, int]]:
+        """The block's own per-layer residual maps; its sublayers own theirs."""
+        return {} if not self.per_layer_input_dim else {
+            'per_layer_input_gate': (self.emb_features, self.per_layer_input_dim),
+            'per_layer_projection': (self.per_layer_input_dim, self.emb_features)}
+
+    @nn.nowrap
     def _submodule_flops(self, lengths, counter) -> float:
         if any(value is not None for value in (self.altup, self.hyper_connections,
                                                self.residual_site, self.engram)):
@@ -561,13 +582,13 @@ class DecoderBlock(nn.Module):
         for factory in (self.feedforward, self.parallel):
             if factory is not None:
                 count += counter(factory(parent=None), lengths)
-        if self.per_layer_input_dim:
-            count += 2 * projection_flops(lengths, self.emb_features, self.per_layer_input_dim)
+        count += sum(projection_flops(lengths, *shape) for shape in self.projections().values())
         if self.laurel_rank is not None:
             count += 2 * projection_flops(lengths, self.emb_features, self.laurel_rank)
         return count
 
     def setup(self):
+        projections = self.projections()
         norm = decoder_norm(
             self.norm_type, epsilon=self.norm_eps, bias=self.norm_bias,
             scale_offset=self.scale_offset, scale_after_cast=self.scale_after_cast,
@@ -602,9 +623,9 @@ class DecoderBlock(nn.Module):
         if self.per_layer_input_dim:
             dense = functools.partial(
                 nn.Dense, use_bias=False, dtype=self.dtype, precision=self.precision)
-            self.per_layer_input_gate = dense(self.per_layer_input_dim,
+            self.per_layer_input_gate = dense(projections['per_layer_input_gate'][1],
                                               name='per_layer_input_gate')
-            self.per_layer_projection = dense(self.emb_features,
+            self.per_layer_projection = dense(projections['per_layer_projection'][1],
                                               name='per_layer_projection')
             self.post_per_layer_input_norm = norm(name='post_per_layer_input_norm')
         if self.altup is not None:
