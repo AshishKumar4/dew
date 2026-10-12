@@ -74,6 +74,14 @@ class _Wrapping(Protocol):
     source: Source
 
 
+def _in_memory(source: Source) -> bool:
+    """Whether a source holds its records in memory (`Memory`), itself or
+    through the sources that wrap it."""
+    while isinstance(source, _Wrapping):
+        source = source.source
+    return isinstance(source, Memory)
+
+
 def _promoted(pipeline: Pipeline) -> Pipeline:
     """The pipeline as the run reads it. Each published generation it caches
     is read as a source, in place of the steps the generation already ran,
@@ -139,10 +147,7 @@ def _preferred_read(compiled: Callable[[Read], Sequence[Pipeline]], *, provision
 
     chosen: list[Read] = []
     for source in (source for pipeline in promoted(READS[-1]) for _, source in _leaves(pipeline)):
-        held = source
-        while isinstance(held, _Wrapping):
-            held = held.source
-        if isinstance(held, Memory):
+        if _in_memory(source):
             chosen.append("memory")
         else:
             chosen.append("indexed" if source.supports("indexed") else "streamed")

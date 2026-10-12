@@ -465,6 +465,23 @@ def test_a_memory_read_counts_a_missing_row_alike_with_or_without_a_cache():
         assert [count.rejected["missing"] for count in data.counts.values()] == [1]
 
 
+def test_an_indexed_read_batches_the_records_memory_holds_in_full_batches():
+    """A source held in memory may hold a missing record. An indexed order
+    batches the records present, keeping their positions, so every batch is
+    full and the order counts three records."""
+    stored = Memory([{"id": np.int32(0)}, None, {"id": np.int32(2)}, {"id": np.int32(3)}])
+    placed = Pipeline(stored).map_with_index(lambda at, row: {**row, "at": np.int32(at)}, identity="at@1")
+    data = compile(placed.batch(2), read="indexed", loading=READ)
+    reader = data.train(DataPartition())
+    try:
+        batches = take(reader, 3)
+    finally:
+        reader.close()
+    assert data.records == 3
+    assert all(len(batch["id"]) == 2 and batch["id"] == batch["at"] for batch in batches)
+    assert {value for batch in batches for value in batch["id"]} == {0, 2, 3}
+
+
 def test_a_cached_indexed_root_is_cut_into_disjoint_shares_that_repeat():
     """Each share of a cached indexed read takes its own rows of the source,
     and a training read with no repeat stage goes on past one pass."""

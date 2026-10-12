@@ -27,8 +27,18 @@ import grain.python as pygrain
 import numpy as np
 from grain._src.python.dataset.transformations.batch import make_batch
 
-from dew.data.analysis import _LOCAL, _at, _cache_manifest, _drops, _identity, _Lowering, _name, _until
-from dew.data.dataset import Batch, DataPartition, FilledBatch, Loading, _Grouped
+from dew.data.analysis import (
+    _LOCAL,
+    _at,
+    _cache_manifest,
+    _drops,
+    _identity,
+    _in_memory,
+    _Lowering,
+    _name,
+    _until,
+)
+from dew.data.dataset import Batch, DataPartition, FilledBatch, Loading, Records, _Grouped
 from dew.data.mix import Accepted, PrimedMix, SearchBudget, TokenDeficit, primed_maps, token_weights
 from dew.data.pipeline import (
     Artifact,
@@ -394,13 +404,25 @@ class _Build:
         self, pipeline: Pipeline, source: Source, partition: DataPartition, last: int
     ) -> tuple[Rows, pygrain.MapDataset | None, int]:
         """The root of an indexed read, cut to its share by index (`shared`),
-        and through its cache when it has one, with the stages it consumed."""
-        stored = pygrain.MapDataset.source(source.records(self.read)).seed(self.seed)
+        and through its cache when it has one, with the stages it consumed.
+
+        Without a cache the root is dense: an order batched by index needs a
+        record at every position. A source held in memory may hold missing
+        records (None), so its root is the records it holds, each keeping its
+        source position (`_Present`); a cache rejects a missing record as it
+        reads it (`_CachedOutputs`)."""
+        records = source.records(self.read)
+        stored = pygrain.MapDataset.source(records).seed(self.seed)
         cache = self.lowering.cache
         if cache is None:
             identifiers = source.identifiers if isinstance(source, _Materialized) else ()
-            rows = stored.map_with_index(_Placed(identifiers=identifiers)) if last >= 0 else stored
             lengths = source.lengths()
+            present = _Present.of(records) if _in_memory(source) else None
+            if present is not None:
+                stored = pygrain.MapDataset.source(present).seed(self.seed)
+                identifiers = tuple((int(position),) for position in present.positions)
+                lengths = None if lengths is None else np.asarray(lengths)[present.positions]
+            rows = stored.map_with_index(_Placed(identifiers=identifiers)) if last >= 0 else stored
             measured = None if lengths is None else pygrain.MapDataset.source(lengths)
             if measured is not None:
                 measured = self.shared(measured, pipeline, partition)
@@ -765,6 +787,28 @@ class _Payload:
         return {name: value for name, value in row.items() if not name.startswith("_dew_")}
 
 
+@dataclasses.dataclass(frozen=True)
+class _Present:
+    """The records a source holds at `positions`, those not missing, read
+    densely by index."""
+
+    records: Records
+    positions: np.ndarray
+
+    @classmethod
+    def of(cls, records: Records) -> _Present | None:
+        """The present records of `records`, or None when none is missing."""
+        held = [index for index in range(len(records)) if records[index] is not None]
+        positions = np.asarray(held, np.int64)
+        return None if len(positions) == len(records) else cls(records, positions)
+
+    def __len__(self) -> int:
+        return len(self.positions)
+
+    def __getitem__(self, index: int) -> Batch | bytes | None:
+        return self.records[int(self.positions[index])]
+
+
 @runtime_checkable
 class _SharedOutput(Protocol):
     """A batch function that can write its batches into shared memory, which
@@ -791,6 +835,11 @@ class _Batched:
             self.batch_fn.enable_shared_memory_output()
 
     def __call__(self, rows: Sequence[Batch]) -> Batch:
+        if any(row is None for row in rows):
+            raise ValueError(
+                "an order batched by index read a missing record; a source read by index must hold "
+                "every record, or be read with read='memory', which leaves missing records out"
+            )
         payload = [_Payload()(row) for row in rows]
         if self.batch_fn is not None:
             return self.batch_fn(payload)
