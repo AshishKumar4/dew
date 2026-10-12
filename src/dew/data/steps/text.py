@@ -45,6 +45,33 @@ class Tokenize(grain.MapTransform):
 
 
 @dataclasses.dataclass(frozen=True)
+class Dropped(grain.RandomMapTransform):
+    """The text in `field` emptied with probability `p`."""
+
+    field: str = "caption"
+    p: float = 0.1
+
+    def __post_init__(self) -> None:
+        if not 0 <= self.p <= 1:
+            raise ValueError(f"a drop probability is in [0, 1], not {self.p}")
+
+    def random_map(self, element: Batch, rng: np.random.Generator) -> Batch:
+        return {**element, self.field: ""} if rng.random() < self.p else element
+
+
+@dataclasses.dataclass(frozen=True)
+class MinChars:
+    """Whether the text in `field` holds at least `count` characters."""
+
+    count: int
+    field: str = "text"
+    reason = "too_short"
+
+    def __call__(self, element: Batch) -> bool:
+        return len(str(element[self.field])) >= self.count
+
+
+@dataclasses.dataclass(frozen=True)
 class LengthPolicy(grain.MapTransform):
     length: int
     field: str = "text"

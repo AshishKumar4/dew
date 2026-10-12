@@ -19,11 +19,17 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
+from typing import TYPE_CHECKING, Literal
 
 import numpy as np
 
 from .chat import Conversation, render_prompt
 from .text import ByteTokenizer, HFTokenizer
+
+if TYPE_CHECKING:
+    from transformers import PreTrainedTokenizerBase
+
+    from dew.data.steps.chat import RenderPrompt
 
 PROMPT_KEY = "prompt"
 """Batch key the prompts pipeline left-pads `[B, max_prompt_len]` ids under."""
@@ -131,3 +137,12 @@ def _utf8(text: str, width: int) -> np.ndarray:
     return out
 
 
+def encode(tokenizer: str | PreTrainedTokenizerBase, *, max_prompt_len: int = 256, pad_id: int = 0,
+           long: Literal["drop", "truncate"] = "drop", thinking: bool | None = None) -> RenderPrompt:
+    """A record step that renders a prompt row (verl's columns: "prompt",
+    "data_source", "ground_truth", ...) to `max_prompt_len` left-padded ids,
+    dropping (counted) or cutting a longer one."""
+    from dew.data.steps.chat import RenderPrompt
+    from dew.data.text import tokenizer_name
+
+    return RenderPrompt(tokenizer_name(tokenizer), max_prompt_len, pad_id, long=long, thinking=thinking)
