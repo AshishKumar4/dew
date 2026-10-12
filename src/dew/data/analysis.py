@@ -2,18 +2,21 @@
 
 `_analyzed` walks a pipeline once and returns `_Lowering`: whether its order
 is cut into shares at the read or kept global and cut just before batching,
-the cache a memory read fills and the eager stages it runs over the whole
-source, the canonical order a resume checks, and whether the order ever
-ends. The same walk (`_checked`) refuses, where it stands, any stage no
-lowering takes. The memory executor (`dew.data.materialize`), the Grain
-lowering (`dew.data.lowering`) and the plan `compile` saves read this
+where its cache and interleave stand, the eager stages a memory read runs
+over the whole source, where its order repeats, the canonical order a
+resume checks, and whether the order ever ends, with the same for each
+corpus it mixes. The same walk (`_checked`) refuses, where it stands, any
+stage no lowering takes. The memory executor (`dew.data.materialize`), the
+Grain lowering (`dew.data.lowering`) and the plan `compile` saves read this
 analysis instead of deriving it again.
 
 The stage facts they share are here too: a pipeline's corpora and steps, a
 step's identity and the manifest a cache's fill is keyed by, which stages
-draw from the record rng, which drop or make rows, and which run inside a
-cache's or a shard's reader. `_capabilities` and `_preferred_read` ask a
-run's sources which reads they support and which they prefer.
+draw from the record rng, which drop or make rows, which a cache can hold
+(`_cache_at`), which run inside a cache's or a shard's reader, and where a
+recipe's default order goes (`_order_at`). `_capabilities` and
+`_preferred_read` ask a run's sources which reads they support and which
+they prefer.
 """
 
 from __future__ import annotations
