@@ -92,7 +92,7 @@ def unet_body(model: "Unet", x, temb, text, temporal=None, operations=None):
     x = operations.concatenate(x, downs.pop())
     x = operations.residual(residual(features=feature_depths[0], name="final_residual"), x, temb)
 
-    x = operations.normalized(x, model.conv_out_norm)
+    x = operations.normalized(x, lambda values: model.conv_out_norm(values))
     return operations.project(conv(features=model.output_channels), x)
 
 

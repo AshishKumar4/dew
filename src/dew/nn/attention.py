@@ -356,7 +356,6 @@ def gated_rms_normalized(x, gate, scale, epsilon: float, dtype, activation: str,
     return (y * (jax.nn.silu(gate) if activation == 'silu' else jax.nn.sigmoid(gate))).astype(dtype)
 
 
-@functools.partial(normalized_in_fp32, static_argnums=(3, 4))
 @functools.partial(normalized_in_fp32, static_argnums=(3, 4, 5, 6))
 def group_normalized(x, scale, bias, groups: int, epsilon: float, activation, dtype):
     """`x` `[batch, ..., channels]` normalized over each of `groups` channel
@@ -381,6 +380,7 @@ def group_normalized(x, scale, bias, groups: int, epsilon: float, activation, dt
     return (y if activation is None else activation(y)).astype(dtype)
 
 
+@functools.partial(normalized_in_fp32, static_argnums=(3, 4))
 def layer_normalized(x, scale, bias, epsilon: float, dtype):
     """Normalize `x` over its last axis, op for op as flax computes it.
 
