@@ -25,6 +25,7 @@ import numpy as np
 import pytest
 from jax.ad_checkpoint import print_saved_residuals
 from reference_error import assert_as_exact_as_the_reference, distance
+from tuned import each_config
 
 from dew.nn import attention, kernels
 from dew.nn.attention import (
@@ -35,6 +36,7 @@ from dew.nn.attention import (
     stream_rms_normalized,
     unweighted_rmsnorm,
 )
+from dew.nn.kernels import norm_swiglu, tuning
 from dew.nn.moe import ExpertMLP, gated_product
 
 pytestmark = pytest.mark.kernel
@@ -100,17 +102,29 @@ def assert_scale_accumulation(mine, reference, coefficient, seed):
 
 
 def compare(functions, operands, seed, labels, *, coefficient=None):
-    xla, pallas, exact = functions
+    pallas = functions[1]
     graph = str(jax.make_jaxpr(pallas)(*operands))
     assert "rms_norm_forward" in graph or "swiglu_forward" in graph
     differentiated = str(jax.make_jaxpr(functools.partial(evaluated, pallas))(operands, seed))
     assert "rms_norm_backward" in differentiated or "swiglu_backward" in differentiated
+    reference, truth = oracles(functions, operands, seed)
+    gated(labels, jax.jit(functools.partial(evaluated, pallas))(operands, seed), reference, truth, seed,
+          coefficient)
+
+
+def oracles(functions, operands, seed):
+    """XLA's outputs and gradients, and float64 truth."""
+    xla, _, exact = functions
     reference = jax.jit(functools.partial(evaluated, xla))(operands, seed)
-    actual = jax.jit(functools.partial(evaluated, pallas))(operands, seed)
     cpu = jax.devices("cpu")[0]
     with jax.enable_x64(new_val=True), jax.default_device(cpu):
         wide = jax.tree.map(lambda x: jnp.asarray(np.asarray(x, np.float64)), operands)
         truth = evaluated(exact, wide, jnp.asarray(np.asarray(seed, np.float64)))
+    return reference, truth
+
+
+def gated(labels, actual, reference, truth, seed, coefficient):
+    """Every output and gradient within the float64 gate."""
     try:
         for label, mine, theirs, want in zip(labels, actual, reference, truth, strict=True):
             if mine is None:
@@ -159,7 +173,6 @@ def test_rms_variants_and_every_gradient(dtype, scale_dtype, offset, after_cast)
 
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
 @pytest.mark.parametrize("shape", [(7, 1000), (3, 4096), (3, 257, 17)])
-@pytest.mark.usefixtures("config_extreme")
 def test_rms_ragged_widths_and_many_rows(dtype, shape):
     operands, seed = norm_operands(shape, dtype, jnp.float32)
     compare(norm_functions(dtype, offset=True, after_cast=True), operands, seed, ("y", "x", "scale"),
@@ -167,15 +180,66 @@ def test_rms_ragged_widths_and_many_rows(dtype, shape):
 
 
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
-@pytest.mark.usefixtures("config_extreme")
 def test_rms_weight_gradient_accumulates_a_full_step_of_rows(dtype):
     # Repeated tokens hold the row arithmetic fixed while the column sum
     # grows to Qwen3.5-0.8B's size, isolating partial-sum error from bf16 midpoint flips.
-    (row, scale), seed = norm_operands((1, 1000), dtype, jnp.float32)
-    x = jnp.broadcast_to(row, (24576, 1000))
-    seed = jnp.broadcast_to(seed, x.shape)
+    (x, scale), seed = full_step(dtype)
     compare(norm_functions(dtype, offset=True, after_cast=True), (x, scale), seed, ("y", "x", "scale"),
             coefficient=scale_coefficient(x, dtype, after_cast=True))
+
+
+def full_step(dtype):
+    """Qwen3.5-0.8B's 24,576 rows of one repeated 1000-wide token, so the weight
+    gradient's sums reach a step's length (`test_rms_weight_gradient...`)."""
+    (row, scale), seed = norm_operands((1, 1000), dtype, jnp.float32)
+    x = jnp.broadcast_to(row, (24576, 1000))
+    return (x, scale), jnp.broadcast_to(seed, x.shape)
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("kernel", [norm_swiglu.RmsForward, norm_swiglu.RmsBackward])
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
+@pytest.mark.parametrize("operands", ["full step", "wide rows"])
+def test_every_config_of_the_norm_kernels_holds_the_float64_gate(kernel, dtype, operands):
+    """Each config the tuner may pick, at a step's rows and at rows wider
+    than a tile holds two of: the space declares only configs proven here."""
+    (x, scale), seed = full_step(dtype) if operands == "full step" else norm_operands((7, 4096), dtype,
+                                                                                      jnp.float32)
+    functions = norm_functions(dtype, offset=True, after_cast=True)
+    reference, truth = oracles(functions, (x, scale), seed)
+    configs = each_config(kernel, functools.partial(evaluated, functions[1]), (x, scale), seed)
+    assert len(configs) > 1
+    for config in configs:
+        with tuning.pinned({kernel: config}):
+            actual = jax.jit(functools.partial(evaluated, functions[1]))((x, scale), seed)
+        try:
+            gated(("y", "x", "scale"), actual, reference, truth, seed,
+                  scale_coefficient(x, dtype, after_cast=True))
+        except AssertionError as error:
+            error.add_note(f"{kernel.__name__} at {config}")
+            raise
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("kernel", [norm_swiglu.SwigluForward, norm_swiglu.SwigluBackward])
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
+def test_every_config_of_the_swiglu_kernels_holds_the_float64_gate(kernel, dtype):
+    """Each block and warp count, over a ragged tail of elements."""
+    shape = (3, 257, 17)
+    operands = tuple(jax.random.normal(jax.random.key(index), shape).astype(dtype) for index in (31, 32))
+    seed = jax.random.normal(jax.random.key(33), shape).astype(dtype)
+    xla, pallas = (gated_product("swiglu", implementation=name) for name in ("xla", "pallas"))
+    reference, truth = oracles((xla, pallas, xla), operands, seed)
+    configs = each_config(kernel, functools.partial(evaluated, pallas), operands, seed)
+    assert len(configs) > 1
+    for config in configs:
+        with tuning.pinned({kernel: config}):
+            actual = jax.jit(functools.partial(evaluated, pallas))(operands, seed)
+        try:
+            gated(("y", "gate", "up"), actual, reference, truth, seed, None)
+        except AssertionError as error:
+            error.add_note(f"{kernel.__name__} at {config}")
+            raise
 
 
 def test_random_bf16_gradients_keep_fp32_intermediates_near_float64():
@@ -224,7 +288,6 @@ def stream_seam(implementation: str, dtype, joined: bool, offset: bool = True, a
 @pytest.mark.parametrize("joined", [False, True])
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
 @pytest.mark.parametrize("shape", [(2, 3, 31), (3, 257, 17), (5, 1000)])
-@pytest.mark.usefixtures("config_extreme")
 def test_stream_seam_takes_the_add_and_the_stream_cotangent(joined, dtype, shape):
     """The kernel's sum is XLA's to the bit; the norm and every gradient,
     the stream's cotangent folded into dx, hold the float64 gate."""
@@ -261,7 +324,6 @@ def test_stream_seam_takes_the_add_and_the_stream_cotangent(joined, dtype, shape
 @pytest.mark.parametrize("activation", ["silu", "sigmoid"])
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
 @pytest.mark.parametrize("shape", [(2, 3, 4, 31), (2, 64, 16, 128)])
-@pytest.mark.usefixtures("config_extreme")
 def test_gated_norm_and_every_gradient_hold_the_float64_gate(activation, dtype, shape):
     """Qwen3-Next's gated norm: the kernel's output and its input, gate and
     weight gradients each within the gate of XLA's float64 distance."""
@@ -349,7 +411,6 @@ def test_decoder_block_seams_run_the_fused_norm(monkeypatch):
 
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
 @pytest.mark.parametrize("shape", [(2, 3, 1000), (3, 4096), (3, 257, 17)])
-@pytest.mark.usefixtures("config_extreme")
 def test_swiglu_forward_and_both_gradients(dtype, shape):
     operands = tuple(jax.random.normal(jax.random.key(index), shape).astype(dtype) for index in (31, 32))
     seed = jax.random.normal(jax.random.key(33), shape).astype(dtype)

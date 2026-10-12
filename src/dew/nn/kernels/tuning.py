@@ -9,8 +9,9 @@ measures (`_get_autotuning_configs`), the rule it takes without a measurement
 on its heads and widths. The kernel's own `custom_vjp`, shard placement and
 remat names stay around it; the op is never differentiated.
 
-At trace time a launch takes, in order, a pinned end of its space (`pinned`),
-the pick measured for its key on this GPU model, and its heuristic. Picks are
+At trace time a launch takes, in order, a config pinned for its kernel
+(`pinned`), the pick measured for its key on this GPU model, and its
+heuristic. Picks are
 measured once, where a program is lowered before its compile (`tune`: the
 Trainer's step, the serving engine's), on the launches tokamax finds in the
 lowered program's metadata. Every config of a missing launch compiles on a
@@ -22,10 +23,11 @@ the same program. Picks persist per GPU model and jaxlib beside XLA's own
 measures (`dew.cache.measures_picks`); a CPU, an interpreted kernel or a shared
 GPU takes stored picks and heuristics.
 
-Tile choice changes a kernel's reduction order, so a kernel's float64 gate
-holds at both ends of its space, not only at its pick: its tests run under
-each of `EXTREMES` (`pinned`), as tests/conftest.py's `config_extreme` fixture
-does.
+Tile choice changes a kernel's reduction order, and its error is not
+monotone in tiles, warps or programs, so the space is a declaration of
+proven configs: each kernel's GPU tests hold its float64 gate at every config
+of its space (`pinned`, tests/tuned.py's `each_config`), and a config that
+fails leaves the space. The tuner only times what is proven.
 """
 
 from __future__ import annotations
@@ -53,19 +55,16 @@ from . import generation
 
 _log = logging.getLogger(__name__)
 
-EXTREMES = ('lowest', 'highest')
-"""The ends of a space in its config's field order: a kernel declares the
-fields that shape its reductions first."""
-
 ROTATION_BYTES = 256 << 20
 """The operand bytes a measurement cycles through: twice the largest L2 among
 Dew's GPUs (an RTX PRO 6000's 128 MB), so no call finds the last one's
 operands in cache, as no training step does."""
 
-_STATE = jax.make_user_context((0, None))
-"""(tunes, pin): how many times `tune` added picks in this process, and the
-pinned end. JAX keys its trace and compile caches on it, so a program lowered
-again after picks arrive, or under another pin, is traced again."""
+_STATE = jax.make_user_context((0, ()))
+"""(tunes, pins): how many times `tune` added picks in this process, and the
+pinned `(kernel, config)` pairs. JAX keys its trace and compile caches on it,
+so a program lowered again after picks arrive, or under other pins, is traced
+again."""
 
 _PICKS: dict[tuple[tokamax.Op, str], _Picks] = {}
 _LOADED: set[str] = set()
@@ -129,11 +128,10 @@ class KernelOp(tokamax.Op):
     revision: int = 1
 
     def __call__(self, *args, **kwargs):
-        _, pin = _STATE.value
+        pin = dict(_STATE.value[1]).get(type(self))
         op = self
-        if pin is not None and self.config is None:
-            ordered = sorted(self.bind(*args, **kwargs).autotuning_configs, key=dataclasses.astuple)
-            op = self.replace(config=ordered[0] if pin == 'lowest' else ordered[-1])
+        if pin is not None and self.config is None and pin in self.bind(*args, **kwargs).autotuning_configs:
+            op = self.replace(config=pin)
         return tokamax.Op.__call__(op, *args, **kwargs)
 
     def get_autotuning_cache(self, device_kind: str | None = None) -> _Picks:
@@ -281,13 +279,11 @@ def tune(jitted: jax.stages.Wrapped, *args) -> bool:
 
 
 @contextlib.contextmanager
-def pinned(extreme: str | None) -> Iterator[None]:
-    """Every launch traced within takes `extreme` of its space, one of
-    `EXTREMES` (None for its usual config), any stored pick or heuristic set
-    aside: for a kernel's float64 gate at the ends of its space, and for a lab
-    that times one end."""
-    if extreme not in (None, *EXTREMES):
-        raise ValueError(f"extreme must be one of {EXTREMES} or None, not {extreme!r}")
+def pinned(configs: Mapping[type[KernelOp], Hashable]) -> Iterator[None]:
+    """Each launch of a kernel `configs` names, traced within, takes that
+    config where its space at the launch's shapes holds it, any stored pick
+    or heuristic set aside: for the float64 gate at every config of a space,
+    and for a lab that times one."""
     tunes, _ = _STATE.value
-    with _STATE((tunes, extreme)):
+    with _STATE((tunes, tuple(configs.items()))):
         yield
