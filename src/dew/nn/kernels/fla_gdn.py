@@ -848,7 +848,7 @@ def _wy_bwd_kernel(k_ref, v_ref, beta_ref, g_ref, a_ref, dw_ref, du_ref, *refs, 
         full = through_w + (d_key * beta[:, None] + _dot(scaled.T.astype(d_l.dtype), d_l, exact=exact).T)
         if earlier_ref is not None:
             earlier = earlier_ref[:, columns].astype(jnp.float32)
-            full += earlier if group == 1 else jnp.where(pl.program_id(1) % group == 0, earlier, 0.0)
+            full += jnp.where(pl.program_id(1) % group == 0, earlier, 0.0)
         dk_ref[:, columns] = full.astype(dk_ref.dtype)
     db_ref[...] = d_beta.astype(db_ref.dtype)
     weighted = d_l.astype(jnp.float32) * (products * beta[:, None])
