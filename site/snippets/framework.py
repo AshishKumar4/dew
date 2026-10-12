@@ -26,11 +26,12 @@ def lm():
     # Begin snippet: lm
     from dew import Trainer
     from dew.config import OptimConfig
-    from dew.data import HoldOut, Hub, Loading, Text, load
+    from dew.config.data import HoldOut, TextData, loader
+    from dew.data import Hub, Loading
     from dew.nn.backbones import CausalTransformer
     from dew.objectives.lm import LMObjective
 
-    data = load(Text(source=Hub("winglian/tiny-shakespeare"), tokenizer="byte", seq_len=64,
+    data = loader(TextData(source=Hub("winglian/tiny-shakespeare"), tokenizer="byte", seq_len=64,
                      eos=True, token_holdout=HoldOut(fraction=0.01)), batch=8, read="memory",
                 provision=True, loading=Loading(workers=0))
     model = CausalTransformer(vocab_size=256, emb_features=32, num_layers=1, num_heads=2,
@@ -46,13 +47,14 @@ def diffusion():
     # Begin snippet: diffusion
     from dew import Field, InputSpec, Trainer
     from dew.config import OptimConfig
-    from dew.data import Augment, HoldOut, Hub, Images, Loading, load
+    from dew.config.data import Augment, HoldOut, ImageData, loader
+    from dew.data import Hub, Loading
     from dew.diffusion.presets import Flow
     from dew.nn.backbones import SimpleDiT
     from dew.objectives.diffusion import DiffusionObjective
     from dew.sampling import Euler
 
-    data = load(Images(source=Hub("uoft-cs/cifar10"), field="img", image_size=32,
+    data = loader(ImageData(source=Hub("uoft-cs/cifar10"), field="img", image_size=32,
                        augment=Augment(flip=True, jitter=True), validation=HoldOut(records=256)),
                 batch=64, read="memory", provision=True, loading=Loading(workers=0))
     model = SimpleDiT(patch_size=4, emb_features=32, num_layers=1, num_heads=2, mlp_ratio=2)
@@ -68,10 +70,11 @@ def jepa():
     # Begin snippet: jepa
     from dew import Field, Trainer
     from dew.config import OptimConfig
-    from dew.data import Augment, HoldOut, Hub, Images, Loading, load
+    from dew.config.data import Augment, HoldOut, ImageData, loader
+    from dew.data import Hub, Loading
     from dew.objectives.jepa import JepaEncoder, JepaObjective, JepaPredictor, MultiBlockMask
 
-    data = load(Images(source=Hub("uoft-cs/cifar10"), field="img", image_size=32,
+    data = loader(ImageData(source=Hub("uoft-cs/cifar10"), field="img", image_size=32,
                        augment=Augment(flip=True, jitter=True), validation=HoldOut(records=256)),
                 batch=64, read="memory", provision=True, loading=Loading(workers=0))
     encoder = JepaEncoder(patch_size=4, emb_features=32, num_layers=1, num_heads=2)
@@ -94,7 +97,8 @@ def grpo():
 
     from dew import LocalTracker, Trainer
     from dew.config import OptimConfig
-    from dew.data import Loading, Prompts, load
+    from dew.config.data import PromptData, loader
+    from dew.data import Loading
     from dew.nn.backbones import CausalTransformer
     from dew.objectives.rl import GRPOObjective, SampledRollout
     from dew.sampling import Sampling
@@ -106,7 +110,7 @@ def grpo():
 
     rng = np.random.default_rng(0)
     records = tuple(json.dumps({"prompt": rng.integers(0, 13, 4).tolist()}) for _ in range(512))
-    data = load(Prompts(tokenizer="byte", source=tuple(json.loads(row) for row in records),
+    data = loader(PromptData(tokenizer="byte", source=tuple(json.loads(row) for row in records),
                         max_prompt_len=4), batch=8, read="memory", loading=Loading(workers=0))
     model = CausalTransformer(vocab_size=13, emb_features=64, num_layers=2, num_heads=4,
                               head_dim=16, mlp_features=128, max_seq_len=16)
@@ -133,14 +137,15 @@ def finetune():
 
     from dew import Trainer
     from dew.config import OptimConfig
-    from dew.data import HoldOut, Hub, Loading, Text, load
+    from dew.config.data import HoldOut, TextData, loader
+    from dew.data import Hub, Loading
     from dew.interop import PretrainedDecoder
     from dew.objectives.lm import LMObjective
     from dew.sampling import Sampling
 
     name = "HuggingFaceTB/SmolLM2-135M-Instruct"
     model = PretrainedDecoder.load(name, dtype="float32", max_seq_len=256)
-    data = load(Text(source=Hub("winglian/tiny-shakespeare"), tokenizer=name, seq_len=64,
+    data = loader(TextData(source=Hub("winglian/tiny-shakespeare"), tokenizer=name, seq_len=64,
                      eos=True, token_holdout=HoldOut(fraction=0.01)), batch=1, read="memory",
                 provision=True, loading=Loading(workers=0))
     state = Trainer(LMObjective(model, seq_len=64), OptimConfig(learning_rate=1e-4), key=0).fit(
@@ -160,7 +165,8 @@ def pretrained():
 
     from dew import Trainer
     from dew.config import OptimConfig
-    from dew.data import HoldOut, Hub, Loading, Text, load
+    from dew.config.data import HoldOut, TextData, loader
+    from dew.data import Hub, Loading
     from dew.interop import PretrainedDecoder
     from dew.objectives.lm import LMObjective
     from dew.sampling import Sampling
@@ -170,7 +176,7 @@ def pretrained():
     task = bundle.text_generation(sampling=Sampling(temperature=0))
     print(task("The capital of France is", 12, key=0).text[0])
 
-    data = load(Text(source=Hub("winglian/tiny-shakespeare"), tokenizer="Qwen/Qwen3-0.6B", seq_len=64,
+    data = loader(TextData(source=Hub("winglian/tiny-shakespeare"), tokenizer="Qwen/Qwen3-0.6B", seq_len=64,
                      eos=True, token_holdout=HoldOut(fraction=0.01)), batch=1, read="memory",
                 provision=True, loading=Loading(workers=0))
     trainer = Trainer(LMObjective(bundle, seq_len=64), OptimConfig(learning_rate=1e-5), key=0)
@@ -251,11 +257,12 @@ def mesh():
 
     from dew import MeshSpec, Trainer
     from dew.config import OptimConfig
-    from dew.data import HoldOut, Hub, Loading, Text, load
+    from dew.config.data import HoldOut, TextData, loader
+    from dew.data import Hub, Loading
     from dew.nn.backbones import CausalTransformer
     from dew.objectives.lm import LMObjective
 
-    data = load(Text(source=Hub("winglian/tiny-shakespeare"), tokenizer="byte", seq_len=64,
+    data = loader(TextData(source=Hub("winglian/tiny-shakespeare"), tokenizer="byte", seq_len=64,
                      eos=True, token_holdout=HoldOut(fraction=0.01)), batch=8, read="memory",
                 provision=True, loading=Loading(workers=0))
     model = CausalTransformer(vocab_size=256, emb_features=32, num_layers=1, num_heads=2,
@@ -273,13 +280,14 @@ def reliability():
     # Begin snippet: reliability
     from dew import Checkpoints, Trainer
     from dew.config import OptimConfig
-    from dew.data import HoldOut, Hub, Loading, Text, load
+    from dew.config.data import HoldOut, TextData, loader
+    from dew.data import Hub, Loading
     from dew.nn.backbones import CausalTransformer
     from dew.objectives.lm import LMObjective
     from dew.training import prepare_process
 
     prepare_process(multi_host=False, xla_flags="--xla_gpu_deterministic_ops=true")
-    data = load(Text(source=Hub("winglian/tiny-shakespeare"), tokenizer="byte", seq_len=64,
+    data = loader(TextData(source=Hub("winglian/tiny-shakespeare"), tokenizer="byte", seq_len=64,
                      eos=True, token_holdout=HoldOut(fraction=0.01)), batch=8, read="memory",
                 provision=True, loading=Loading(workers=0))
     model = CausalTransformer(vocab_size=256, emb_features=32, num_layers=1, num_heads=2,
@@ -314,11 +322,12 @@ def profile():
     # Begin snippet: profile
     from dew import ProfileWindow, Trainer
     from dew.config import OptimConfig
-    from dew.data import HoldOut, Hub, Loading, Text, load
+    from dew.config.data import HoldOut, TextData, loader
+    from dew.data import Hub, Loading
     from dew.nn.backbones import CausalTransformer
     from dew.objectives.lm import LMObjective
 
-    data = load(Text(source=Hub("winglian/tiny-shakespeare"), tokenizer="byte", seq_len=64,
+    data = loader(TextData(source=Hub("winglian/tiny-shakespeare"), tokenizer="byte", seq_len=64,
                      eos=True, token_holdout=HoldOut(fraction=0.01)), batch=8, read="memory",
                 provision=True, loading=Loading(workers=0))
     model = CausalTransformer(vocab_size=256, emb_features=32, num_layers=1, num_heads=2,
