@@ -8,15 +8,12 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from interop_support import assert_same_stored_tensors
+from interop_support import NVFP4_QDQ_CASES, assert_same_stored_tensors, nvfp4_qdq_case
 from reference_error import assert_as_exact_as_the_reference
 
 from dew.interop import Pretrained, codecs
 from dew.interop.safetensors_io import read_weights
 from dew.training.quantization import InputQuantizer, _nvfp4_divide, nvfp4_input_qdq
-
-FIXTURE = Path(__file__).parent / "fixtures" / "codecs" / "nvfp4_qdq"
-
 
 def test_the_quantizer_divider_is_ieee_fp32_across_its_scale_ranges():
     """2.5M normal ratios, half at or beside E2M1 boundaries, with x64 disabled.
@@ -42,11 +39,9 @@ def test_the_quantizer_divider_is_ieee_fp32_across_its_scale_ranges():
                                   (numerators / denominators).view(np.uint32))
 
 
-@pytest.fixture(scope="module", params=["unrounded", "e4m3"])
+@pytest.fixture(scope="module", params=NVFP4_QDQ_CASES)
 def case(request):
-    directory = FIXTURE / request.param
-    with np.load(directory / "reference.npz") as reference:
-        return request.param, directory, dict(reference)
+    return request.param, *nvfp4_qdq_case(request.param)
 
 
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16], ids=["fp32", "bf16"])

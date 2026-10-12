@@ -174,6 +174,39 @@ def test_a_run_of_an_input_quantized_checkpoint_reloads_with_its_input_quantizat
     assert float(np.max(np.abs(logits(plain, task.variables) - logits(task.model, task.variables)))) > 0
 
 
+def test_an_input_quantized_run_resumes_from_its_record_where_two_steps_would_end(tmp_path):
+    """A run of an input-quantized checkpoint resumed from its own record
+    rebuilds the model with no source at hand: its `init` declares the scales
+    the record names (`InputQuantization.sites`), which the checkpoint then
+    restores, so one step and a resumed second end where two uninterrupted
+    steps end, scales and weights bit for bit."""
+    from dew.config import RunConfig
+
+    source = Pretrained.load(FIXTURES / "codecs" / "nvfp4_qdq" / "e4m3", dtype="float32",
+                             attention_impl="reference")
+
+    def run(directory, steps, record=None):
+        config = record or LMRunConfig(trainer=TrainerConfig(
+            checkpoint_dir=str(directory), batch_size=BATCH, steps=steps, eval_every=None,
+            checkpoint_every=1, compilation_cache_dir=None))
+        objective = (LMObjective(record.model.build(), SEQ) if record
+                     else LMObjective(source.model, SEQ, variables=source.variables))
+        state = config.train(objective, Dataset(lambda partition: Stream(96), None, None, BATCH), name="run")
+        Checkpoints(str(directory / "run")).wait()
+        return state
+
+    whole = run(tmp_path / "whole", 2)
+    run(tmp_path / "stopped", 1)
+    record = RunConfig.load(str(tmp_path / "stopped" / "run"))
+    resumed = run(tmp_path / "stopped", 2, dataclasses.replace(
+        record, trainer=dataclasses.replace(record.trainer, steps=2)))
+    assert int(resumed.step) == int(whole.step) == 2
+    assert jax.tree.leaves(resumed.variables[QUANTIZATION])
+    for before, after in zip(jax.tree.leaves(whole.variables), jax.tree.leaves(resumed.variables),
+                             strict=True):
+        np.testing.assert_array_equal(np.asarray(before), np.asarray(after))
+
+
 def test_a_block_run_the_trainer_quantizes_reloads_quantized(tmp_path):
     """The trainer quantizes the block objective's training view; the model
     its record and task read is wrapped the same way at its serving

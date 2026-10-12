@@ -1105,7 +1105,7 @@ def _input_quantization(model: nn.Module, variables: Variables, layouts: tuple[W
     codec = source_quantization(config)
     if codec is None or codec.input_scale_dtype is None:
         return model, variables
-    sites: dict[tuple[str, ...], dict[str, np.ndarray]] = {}
+    sites: dict[tuple[str, ...], tuple[str, np.ndarray]] = {}
     for layout in layouts:
         part = layout.name.removesuffix('.weight') + codec.input_suffix
         if part not in grid:
@@ -1122,13 +1122,13 @@ def _input_quantization(model: nn.Module, variables: Variables, layouts: tuple[W
         quantizer = (InputQuantizer.fp8(value) if codec.input_kind(layout.name) == 'fp8' else
                      InputQuantizer.nvfp4(value, codec.input_scale_dtype == 'float8_e4m3fn',
                                           format=codec.input_format))
-        sites[layout.paths[0][1:-1]] = {INPUT_SCALES[quantizer.kind]: scale.reshape(())}
+        sites[layout.paths[0][1:-1]] = (quantizer.kind, quantizer.scale)
     if len(sites) != sum(name.endswith(codec.input_suffix) for name in grid):
         raise ValueError("NVFP4 input scales must each bind one Linear scope; "
                          "an unbound scale would drop QDQ")
-    scheme = InputQuantization(codec.input_scale_dtype == 'float8_e4m3fn', codec.input_format)
-    held = unflatten_dict({(*path, leaf): value for path, leaves in sites.items()
-                           for leaf, value in leaves.items()})
+    scheme = InputQuantization(codec.input_scale_dtype == 'float8_e4m3fn', codec.input_format,
+                               tuple(sorted(('/'.join(path), kind) for path, (kind, _) in sites.items())))
+    held = unflatten_dict({(*path, INPUT_SCALES[kind]): scale for path, (kind, scale) in sites.items()})
     return scheme.apply(model), {**variables, QUANTIZATION: held}
 
 

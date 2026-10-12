@@ -10,12 +10,13 @@ the model without its input QDQ fails.
 """
 
 import dataclasses
-from pathlib import Path
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from flax import linen as nn
+from interop_support import NVFP4_QDQ_CASES, nvfp4_qdq_case
 from reference_error import FACTOR, assert_as_exact_as_the_reference, distance
 
 import dew
@@ -25,17 +26,13 @@ from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.nn.sharding import pipeline_microbatches
 from dew.registry import wrapper_layers
 from dew.training import Layout, MeshSpec
-from dew.training.quantization import QUANTIZATION
-
-FIXTURE = Path(__file__).parent / "fixtures" / "codecs" / "nvfp4_qdq"
+from dew.training.quantization import INPUT_SCALES, QUANTIZATION, InputQuantization
 
 
-@pytest.fixture(scope="module", params=["unrounded", "e4m3"])
+@pytest.fixture(scope="module", params=NVFP4_QDQ_CASES)
 def case(request):
-    directory = FIXTURE / request.param
-    loaded = Pretrained.load(directory, dtype="float32", attention_impl="reference")
-    with np.load(directory / "reference.npz") as reference:
-        return directory, loaded, dict(reference)
+    directory, reference = nvfp4_qdq_case(request.param)
+    return directory, Pretrained.load(directory, dtype="float32", attention_impl="reference"), reference
 
 
 def assert_quantized(logits, reference, label):
@@ -60,6 +57,19 @@ def test_the_scanned_stack_quantizes_each_layer_with_its_own_scales(case):
     _, loaded, reference = case
     scanned = loaded.model.clone(scan_layers=True)
     assert_quantized(scanned.apply(loaded.variables, reference["ids"].astype(np.int32)), reference, "scanned")
+
+
+def test_layers_quantized_apart_refuse_one_scanned_run_by_name(case):
+    """A checkpoint that quantizes two otherwise like layers differently, here
+    one with a projection left unquantized, gives them different scale trees,
+    which one scanned body cannot read; the scan says so."""
+    _, loaded, reference = case
+    variables = jax.tree.map(lambda leaf: leaf, dict(loaded.variables))
+    layer = variables[QUANTIZATION]["layers_1"]
+    mixer = next(name for name in layer if "q_proj" in layer[name] or "qkv" in layer[name])
+    layer[mixer] = {name: leaves for name, leaves in layer[mixer].items() if name != "q_proj"}
+    with pytest.raises(ValueError, match="'quantization' differs between layers_0 and layers_1"):
+        loaded.model.clone(scan_layers=True).apply(variables, reference["ids"].astype(np.int32))
 
 
 @pytest.mark.mesh(devices=2)
@@ -130,3 +140,23 @@ def test_every_entry_method_quantizes_the_sites_it_reaches(case):
     cache = block.apply(variables, ids.shape[0], method="init_cache", mutable=["cache"])[1]
     encoded = block.apply({**variables, **cache}, ids, method="encode", mutable=["cache"])[0]
     np.testing.assert_array_equal(np.asarray(encoded), np.asarray(prefill))
+
+
+def test_a_linear_given_its_input_by_name_quantizes_it_too():
+    """Flax passes a Linear's input positionally or as `inputs=`; the site
+    quantizes it either way."""
+    x = jnp.linspace(-3, 3, 64, dtype=jnp.float32).reshape(2, 32)
+    model = InputQuantization().apply(nn.Dense(8))
+    params = model.init(jax.random.key(0), x)["params"]
+    variables = {"params": params, QUANTIZATION: {INPUT_SCALES["fp8"]: np.float32(0.004)}}
+    positional = model.apply(variables, x)
+    np.testing.assert_array_equal(np.asarray(model.apply(variables, inputs=x)), np.asarray(positional))
+    assert not np.array_equal(np.asarray(nn.Dense(8).apply({"params": params}, x)), np.asarray(positional))
+
+
+def test_a_scheme_its_arithmetic_ignores_is_refused_by_name():
+    """ModelOpt's NVFP4 always rounds its local scales to E4M3, so a record
+    that says otherwise is refused where it is made, not computed apart."""
+    with pytest.raises(ValueError, match="always rounds its local scales to E4M3"):
+        InputQuantization(e4m3_scale=False, format="modelopt")
+
