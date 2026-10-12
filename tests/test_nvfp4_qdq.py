@@ -15,6 +15,7 @@ from dew.interop import Pretrained, codecs
 from dew.interop.safetensors_io import read_weights
 from dew.training.quantization import InputQuantizer, _nvfp4_divide, nvfp4_input_qdq
 
+
 def test_the_quantizer_divider_is_ieee_fp32_across_its_scale_ranges():
     """2.5M normal ratios, half at or beside E2M1 boundaries, with x64 disabled.
 
