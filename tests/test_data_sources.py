@@ -4,7 +4,11 @@ import dataclasses
 import hashlib
 import io
 import json
+import pickle
 import tarfile
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from uuid import uuid4
 
@@ -472,6 +476,143 @@ def test_remote_indexed_arrayrecords_read_only_the_selected_physical_shard(monke
     assert rows[9] == {"id": 9}
     assert len(downloaded) == 1
     assert downloaded[0].endswith(manifest["files"][2]["path"])
+
+
+@pytest.fixture
+def arrayrecord_paths(tmp_path):
+    from array_record.python.array_record_module import ArrayRecordWriter
+
+    paths = tuple(str(tmp_path / f"{shard}.array_record") for shard in range(3))
+    for shard, path in enumerate(paths):
+        writer = ArrayRecordWriter(path, "group_size:1")
+        for index in range(8):
+            writer.write(f"{shard}:{index}".encode())
+        writer.close()
+    return paths
+
+
+def test_arrayrecords_threaded_reads_overlap(arrayrecord_paths, monkeypatch):
+    from dew.data.sources import records
+
+    source = records.ArrayRecords(arrayrecord_paths[:1], counts=(8,))
+    active = maximum = 0
+    lock = threading.Lock()
+    start = threading.Barrier(8)
+
+    class SlowReader(records.ArrayRecords):
+        def __getitem__(self, index):
+            nonlocal active, maximum
+            with lock:
+                active += 1
+                maximum = max(maximum, active)
+            try:
+                time.sleep(0.05)
+                return super().__getitem__(index)
+            finally:
+                with lock:
+                    active -= 1
+
+    monkeypatch.setattr(records, "ArrayRecords", SlowReader)
+
+    def read(index):
+        start.wait(timeout=5)
+        return source[index]
+
+    try:
+        with ThreadPoolExecutor(8) as pool:
+            assert list(pool.map(read, range(8))) == [f"0:{index}".encode() for index in range(8)]
+        assert maximum > 1
+    finally:
+        source.close()
+
+
+@pytest.mark.parametrize("fail", [False, True])
+@pytest.mark.parametrize("retire", ["eviction", "close"])
+def test_arrayrecords_retired_reader_lives_until_its_last_read(
+    arrayrecord_paths, monkeypatch, fail, retire
+):
+    from dew.data.sources import records
+
+    source = records.ArrayRecords(arrayrecord_paths, counts=(8, 8, 8))
+    entered = threading.Barrier(3)
+    released = [threading.Event(), threading.Event()]
+    readers = []
+
+    class HeldReader(records.ArrayRecords):
+        def __init__(self, urls, *args, **kwargs):
+            super().__init__(urls, *args, **kwargs)
+            self.active = self.closes = 0
+            self.closed_while_reading = False
+            self.held = not readers
+            self.read_lock = threading.Lock()
+            readers.append(self)
+
+        def __getitem__(self, index):
+            with self.read_lock:
+                self.active += 1
+            try:
+                if self.held:
+                    entered.wait(timeout=5)
+                    assert released[index].wait(timeout=5)
+                    if fail:
+                        raise ValueError("failed child read")
+                return super().__getitem__(index)
+            finally:
+                with self.read_lock:
+                    self.active -= 1
+
+        def close(self):
+            self.closed_while_reading |= self.active > 0
+            self.closes += 1
+            super().close()
+
+    monkeypatch.setattr(records, "ArrayRecords", HeldReader)
+    try:
+        with ThreadPoolExecutor(2) as pool:
+            pending = [pool.submit(source.__getitem__, index) for index in range(2)]
+            try:
+                entered.wait(timeout=5)
+                if retire == "eviction":
+                    assert source[8] == b"1:0"
+                    assert source[16] == b"2:0"
+                else:
+                    source.close()
+                held = readers[0]
+                assert held.closes == 0
+                # Reopening the same shard must not adopt the retired reader's read count.
+                assert source[2] == b"0:2"
+                replacement = readers[-1]
+                for index, future in enumerate(pending):
+                    released[index].set()
+                    if fail:
+                        with pytest.raises(ValueError, match="failed child read"):
+                            future.result(timeout=5)
+                    else:
+                        assert future.result(timeout=5) == f"0:{index}".encode()
+                    assert held.closes == (1 if index == 1 else 0)
+                    assert replacement.closes == 0
+                assert not held.closed_while_reading
+            finally:
+                for release in released:
+                    release.set()
+    finally:
+        source.close()
+
+
+def test_pickled_arrayrecords_open_independent_readers(arrayrecord_paths):
+    from dew.data.sources.records import ArrayRecords
+
+    source = ArrayRecords(arrayrecord_paths, counts=(8, 8, 8))
+    assert source[0] == b"0:0"
+    restored = pickle.loads(pickle.dumps(source))
+    try:
+        source.close()
+        assert restored[1] == b"0:1"
+        restored.close()
+        assert source[2] == b"0:2"
+    finally:
+        source.close()
+        restored.close()
 
 
 def test_jsonl_offset_index_is_mapped_and_reopened_instead_of_pickled_as_rows():
