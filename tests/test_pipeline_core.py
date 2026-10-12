@@ -264,7 +264,7 @@ def test_an_exact_resume_refuses_a_step_that_makes_other_values():
         other.close()
 
 
-GIVEN = """import dataclasses
+SHIFTED = """import dataclasses
 
 
 @dataclasses.dataclass(frozen=True)
@@ -274,6 +274,11 @@ class Shifted:
 
     def __call__(self, row):
         return {**row, "id": row["id"] + self.by}
+"""
+
+
+GIVEN = """import dataclasses
+from {shifted} import Shifted
 
 
 @dataclasses.dataclass(frozen=True)
@@ -293,8 +298,11 @@ def test_an_edit_to_a_configured_factorys_module_alone_is_environment(tmp_path, 
     an exact resume reads on, where the plan names the step and where a
     memory read's rows name the steps that made them; the same factory
     configured otherwise, to make the same step, is refused."""
+    shifted = tmp_path / f"shifted_{uuid4().hex}.py"
+    shifted.write_text(SHIFTED)
+    factory = GIVEN.format(shifted=shifted.stem)
     module = tmp_path / f"given_{uuid4().hex}.py"
-    module.write_text(GIVEN)
+    module.write_text(factory)
     monkeypatch.syspath_prepend(str(tmp_path))
     given = importlib.import_module(module.stem).Given
 
@@ -310,7 +318,7 @@ def test_an_edit_to_a_configured_factorys_module_alone_is_environment(tmp_path, 
         expected = take(first, 2)
     finally:
         first.close()
-    module.write_text(GIVEN + "# an edit that changes no code\n")
+    module.write_text(factory + "# an edit that changes no code\n")
     edited = reader(1)
     try:
         edited.set_state(state)
