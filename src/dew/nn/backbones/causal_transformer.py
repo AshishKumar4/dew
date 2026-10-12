@@ -46,7 +46,7 @@ from ..dsa_kpool import KPoolSparseAttentionMixer
 from ..dspark import DSpark, DSparkStage, draft as dspark_draft
 from ..engram import Engram, EngramHashes, EngramLayer
 from ..flops import MissingFlopsCount, counted_flops, parameter_flops, projection_flops
-from ..gemma3n import AltUp, rescale_to
+from ..gemma3n import AltUp, AltUpLayer, rescale_to
 from ..gemma4_moe import Gemma4Experts
 from ..gpt_oss import GptOssMLP
 from ..hyper_connections import (
@@ -899,16 +899,26 @@ class CausalTransformer(nn.Module):
     @nn.nowrap
     def model_flops(self, lengths) -> float:
         """Real-row hidden-state work, summing the same block factories as setup."""
-        if self.altup is not None or self.hyper_connections is not None:
-            raise MissingFlopsCount("CausalTransformer needs its multi-stream expansion geometry")
-        return self._layer_flops(lengths, counted_flops)
+        return (self._layer_flops(lengths, counted_flops)
+                + self._root_flops(lengths, DepthAttention.depth_flops))
+
+    @nn.nowrap
+    def _root_flops(self, lengths, depth_counter) -> float:
+        maps = self.projections()
+        count = sum(projection_flops(lengths, *shape) for name, shape in maps.items()
+                     if name.startswith(('altup_projections_', 'altup_unembed_projections_')))
+        if self.hyper_connections is not None and self.hyper_connections.head == 'weighted':
+            count += HyperHead(self.hyper_connections, self.emb_features, parent=None).model_flops(lengths)
+        if self.attention_residuals is not None:
+            sources = self.attention_residuals.blocks(self.num_layers) + 1
+            count += depth_counter(DepthAttention(self.emb_features, parent=None), lengths, sources)
+        return count
 
     @nn.nowrap
     def parameter_flops(self, lengths) -> float:
         """Learned matrices, separately from nonparameter attention/state work."""
-        if any(value is not None for value in (self.altup, self.hyper_connections, self.attention_residuals)):
-            raise MissingFlopsCount("CausalTransformer needs its multi-stream parameter geometry for PEFT")
-        return self._layer_flops(lengths, parameter_flops)
+        return (self._layer_flops(lengths, parameter_flops)
+                + self._root_flops(lengths, DepthAttention.depth_parameter_flops))
 
     @nn.nowrap
     def projections(self) -> dict[str, tuple[int, int]]:
@@ -962,6 +972,52 @@ class CausalTransformer(nn.Module):
         return count
 
     @nn.nowrap
+    def prediction_flops(self, lengths, *, prediction_lengths=None) -> float:
+        """Each trained prediction depth shortens the real sequence by one token."""
+        return self._prediction_flops(lengths, counted_flops, prediction_lengths)
+
+    @nn.nowrap
+    def prediction_parameter_flops(self, lengths, *, prediction_lengths=None) -> float:
+        """The same shortened depth forwards' learned matrices, head included."""
+        return self._prediction_flops(lengths, parameter_flops, prediction_lengths)
+
+    @nn.nowrap
+    def _prediction_rows(self, lengths, prediction_lengths):
+        if prediction_lengths is not None:
+            return prediction_lengths
+        return [(shorter, shorter) for depth in range(1, self.num_nextn_predict_layers + 1)
+                for shorter in (np.maximum(np.asarray(lengths) - depth, 0),)]
+
+    @nn.nowrap
+    def _prediction_flops(self, lengths, counter, prediction_lengths) -> float:
+        types, factories = self.per_layer_types, self.feedforward_factories()
+        kinds = self.layer_kinds(types)
+        mixer = self.mixer if self.mixer is not None else AttentionMixer()
+        blocks = self._prediction_depths(types, kinds, mixer, factories[0], factories[1], BlockWiring())
+        count = 0.0
+        rows = self._prediction_rows(lengths, prediction_lengths)
+        for block, (inputs, outputs) in zip(blocks, rows, strict=True):
+            count += counter(block, inputs) + self.logits_flops(outputs)
+        return count
+
+    @nn.nowrap
+    def prediction_matrix_usage(self, path: tuple[str, ...], lengths, *, prediction_lengths=None):
+        """Each depth's maps run once; the shared head runs on every shorter state."""
+        relative = path[1:] if path and path[0] == 'params' else path
+        if not relative:
+            raise MissingFlopsCount("CausalTransformer prediction matrix has no native scope")
+        lengths = np.asarray(lengths)
+        rows = self._prediction_rows(lengths, prediction_lengths)
+        if relative[0].startswith('mtp_'):
+            depth = int(relative[0].removeprefix('mtp_'))
+            copies = (self.mtp_hyper_connections.hc_mult
+                      if relative[1] == 'h_proj' and self.mtp_hyper_connections is not None else 1)
+            return rows[depth][0] * copies
+        if relative[0] in ('lm_head', 'head_dense'):
+            return np.concatenate([np.empty((0,), np.int64), *(outputs for _, outputs in rows)])
+        return np.zeros_like(lengths)
+
+    @nn.nowrap
     def matrix_usage(self, path: tuple[str, ...], lengths, *, logits: bool = False):
         """Native matrix scopes declare head versus trunk work and repeated loop passes."""
         relative = path[1:] if path and path[0] == 'params' else path
@@ -976,6 +1032,9 @@ class CausalTransformer(nn.Module):
             first, end = (0, self.num_layers) if self.loop.layers is None else self.loop.layers
             if first <= layer < end:
                 passes = self.loop.steps
+        if self.altup is not None and relative[-1] == 'modality_router':
+            site = AltUpLayer(self.altup, self.emb_features, parent=None)
+            passes *= site.projection_uses()['modality_router']
         return np.asarray(lengths) * passes
 
     def setup(self):

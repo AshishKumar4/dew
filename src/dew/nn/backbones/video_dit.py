@@ -7,14 +7,44 @@ grows linearly in T and the temporal half's linearly in S.
 """
 
 import jax.numpy as jnp
+import numpy as np
+from flax import linen as nn
 
 from ..dit import ROPE_THETA, ModulatedBlock, _DiTStackOptions, remat_block, rope_for_scan
+from ..flops import MissingFlopsCount, matching_lengths, patch_lengths
 from ..precision import at_least_fp32
 from ..rope import rotary_freqs
 
 
 class VideoDiT(_DiTStackOptions):
     """Factorized spatial-temporal DiT over (B, T, H, W, C) inputs."""
+
+    @nn.nowrap
+    def model_flops(self, lengths) -> float:
+        raise MissingFlopsCount("VideoDiT requires spatiotemporal_flops(frames, patches, input_channels)")
+
+    @nn.nowrap
+    def video_lengths(self, sample_shape: tuple[int, ...], rows: int) -> tuple[np.ndarray, np.ndarray]:
+        if len(sample_shape) != 4:
+            raise MissingFlopsCount("VideoDiT needs [frames, height, width, channels] geometry")
+        frames = np.full((rows,), sample_shape[0], np.int64)
+        return frames, patch_lengths(sample_shape[1:], (self.patch_size, self.patch_size), rows)
+
+    @nn.nowrap
+    def spatiotemporal_flops(self, frames, patches, input_channels: int,
+                             text_features: int | None = None) -> float:
+        """Factorized squares and the modulation copies computed for each block row."""
+        time, spatial = matching_lengths(frames, patches)
+        lengths = (time * spatial).astype(np.int64)
+        width = self.emb_features
+        count = (self._embedding(self.patch_size, width, self.scan_order).model_flops(lengths, input_channels)
+                 + self._output(self.patch_size, self.output_channels).model_flops(lengths, width)
+                 + self._conditioning(width).model_flops(frames, text_features))
+        block = ModulatedBlock(width, self.num_heads, **self._block_options(), parent=None)
+        count += self.num_layers * (block.model_flops(np.repeat(patches, frames))
+                                     + block.model_flops(np.repeat(frames, patches)))
+        return count
+
     def setup(self):
         self.embed = self._embedding(self.patch_size, self.emb_features, self.scan_order)
         self.conditioning = self._conditioning(self.emb_features)

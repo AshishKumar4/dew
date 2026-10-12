@@ -97,6 +97,16 @@ def test_multiple_directions_and_threshold(tmp_path):
     assert {entry.step for entry in run.checkpoints.kept()} == {3, 5, 6}
 
 
+def test_a_terminal_winner_is_saved_without_the_unconditional_final_policy(tmp_path):
+    metric = Value('value', Shown(better='higher'))
+    run = trainer(tmp_path / 'run')
+    state = run.fit(data(), steps=2, log_every=1, eval_every=1, metrics=[metric],
+                    best=metric, checkpoint_final=False, restore_best=True)
+    assert run.checkpoints.best == 2
+    assert int(state.step) == 2
+    assert float(state.variables['params']['w']) == pytest.approx(.36)
+
+
 def test_missing_and_undeclared_metrics_are_refused_before_training(tmp_path):
     metric = Value('accuracy', Shown())
     with pytest.raises(ValueError, match='passed in metrics'):
@@ -127,6 +137,26 @@ def test_plateau_restores_patience_and_stops_after_eligible_evaluations(tmp_path
     assert int(state.step) == 4
     assert second.checkpoints.latest == 4
     assert second.checkpoints.control(4)['plateau:val/value']['bad'] == 3
+
+
+@pytest.mark.parametrize("checkpoint_final", [True, False])
+def test_terminal_local_resume_keeps_the_final_plateau_evaluation(tmp_path, checkpoint_final):
+    metric = Value('value', Shown(better='lower'))
+
+    def local():
+        run = trainer(tmp_path / 'run')
+        run.checkpoints = Checkpoints(str(tmp_path / 'run'), local_directory=str(tmp_path / 'local'),
+                                      local_every=2)
+        return run
+
+    first = local()
+    first.fit(data(), steps=2, log_every=1, eval_every=1, checkpoint_every=1,
+              checkpoint_final=checkpoint_final, metrics=[metric], stop=Plateau(metric, evals=3))
+    assert first.checkpoints.control(2)['plateau:val/value']['bad'] == 1
+    second = local()
+    state = second.fit(data(), steps=10, log_every=1, eval_every=1, checkpoint_every=1,
+                       checkpoint_final=checkpoint_final, metrics=[metric], stop=Plateau(metric, evals=3))
+    assert int(state.step) == 4
 
 
 def test_multi_split_metric_keys_and_ambiguous_selection(tmp_path):
@@ -246,7 +276,9 @@ def test_aggregate_never_reuses_missing_metrics_and_preserves_first_tracker(tmp_
     run = trainer(tmp_path / 'run')
     from dew.training import EvalSuite
     from dew.training.trainer import _FitPlan
-    plan = _FitPlan(data(), 1, 1, 1, 1, None, [first, second], preview=False,
+    plan = _FitPlan(data(), steps=1, log_every=1, eval_every=1, total_tokens=None,
+                    checkpoint_every=1, checkpoint_final=True, local_every=None,
+                    metrics=[first, second], preview=False,
                     best=(Best(lambda m: m[first] - m[second]), Best(second, mode='max', split='val')),
                     suites={'val': EvalSuite(data().val, (first, second), 1)})
     ranks = run._ranking(plan, {'val/second': .5})
