@@ -113,7 +113,7 @@ def _materialize(
     counter = counts.setdefault(_name(pipeline), CorpusCounts(_name(pipeline)))
     if not isinstance(source, _Memory):
         counter.attempted = len(stored)
-    lowering = _analyzed(pipeline, "memory")
+    lowering = _analyzed(pipeline, "memory", validation=not training)
     rows, consumed = _memory_inputs(pipeline, source, stored, counter, lowering.cache)
     return _memory_stages(
         pipeline, source, stored, rows, consumed, lowering.eager, counter, groups, training=training
