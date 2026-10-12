@@ -47,8 +47,17 @@ from .inputs import AttentionMetadata, valid_order
 from .kernels import generation
 from .kernels.generation import first_refusal, ran_kernel, triton_runs
 from .precision import asks_default_precision, at_least_fp32, compensated_add
-from .sharding import (HEADS, RESIDUAL, constrain, logical_axes, logical_spec, manual_map, mesh_axes, rows_like,
-                       seen_whole)
+from .sharding import (
+    HEADS,
+    RESIDUAL,
+    constrain,
+    logical_axes,
+    logical_spec,
+    manual_map,
+    mesh_axes,
+    rows_like,
+    seen_whole,
+)
 
 CHUNK_SIZE = 64
 """Tokens per chunk of the chunked form, the reference's default
