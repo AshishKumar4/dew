@@ -125,7 +125,7 @@ def _kept(valid_ref, tokens, length: int):
 
 
 def _taps(w_ref, b_ref, columns, count: int):
-    taps = [w_ref[tap, columns].astype(jnp.float32) for tap in range(count)]
+    taps = [w_ref[columns, tap].astype(jnp.float32) for tap in range(count)]
     bias = None if b_ref is None else b_ref[columns].astype(jnp.float32)
     return taps, bias
 
@@ -281,7 +281,7 @@ def _backward_kernel(*refs, first: int, normalised: bool, block: int, segments: 
     _, _, totals, lost, _ = jax.lax.fori_loop(0, steps + count - 1, step, carry)
     totals = tuple(total - error for total, error in zip(totals, lost, strict=True))
     for tap, total in enumerate(totals[:count]):
-        dw_ref[tap, local] = jnp.sum(total, axis=0)
+        dw_ref[local, tap] = jnp.sum(total, axis=0)
     if db_ref:
         db_ref[0][local] = jnp.sum(totals[count], axis=0)
 
@@ -332,7 +332,7 @@ def _forward(x, taps, bias, valid, parts, activation: bool, eps: float, dtype, i
     out = []
     for first, width, head in _pieces(parts):
         block = block_width(width, head)
-        grid, specs, operands = _specs(x, taps.T, bias, valid, width, block, segments, steps)
+        grid, specs, operands = _specs(x, taps, bias, valid, width, block, segments, steps)
         kernel = functools.partial(
             _forward_kernel, first=first, normalised=head is not None, block=block, segments=segments,
             steps=steps, count=taps.shape[1], length=length, has_bias=bias is not None,
@@ -355,16 +355,16 @@ def _backward(x, taps, bias, valid, cotangents, parts, activation: bool, eps: fl
     dx, dw, db = None, [], []
     for (first, width, head), dy in zip(_pieces(parts), cotangents, strict=True):
         block = block_width(width, head)
-        grid, specs, operands = _specs(x, taps.T, bias, valid, width, block, segments, steps)
+        grid, specs, operands = _specs(x, taps, bias, valid, width, block, segments, steps)
         tiles = grid[1]
         kernel = functools.partial(
             _backward_kernel, first=first, normalised=head is not None, block=block, segments=segments,
             steps=steps, count=count, length=length, has_bias=bias is not None, has_valid=valid is not None,
             aliased=dx is not None, activation=activation, eps=eps, interpret=interpret)
         whole = pl.BlockSpec((None, length, channels), lambda c, t, b: (b, 0, 0))
-        out_specs = [whole, pl.BlockSpec((None, None, count, width), lambda c, t, b: (b, t, 0, 0))]
+        out_specs = [whole, pl.BlockSpec((None, None, width, count), lambda c, t, b: (b, t, 0, 0))]
         out_shape = [jax.ShapeDtypeStruct(x.shape, x.dtype),
-                     jax.ShapeDtypeStruct((batch, tiles, count, width), jnp.float32)]
+                     jax.ShapeDtypeStruct((batch, tiles, width, count), jnp.float32)]
         if bias is not None:
             out_specs.append(pl.BlockSpec((None, None, width), lambda c, t, b: (b, t, 0)))
             out_shape.append(jax.ShapeDtypeStruct((batch, tiles, width), jnp.float32))
@@ -382,7 +382,7 @@ def _backward(x, taps, bias, valid, cotangents, parts, activation: bool, eps: fl
         dw.append(jnp.sum(found[1], axis=(0, 1)))
         if bias is not None:
             db.append(jnp.sum(found[2], axis=(0, 1)))
-    dw = jnp.concatenate(dw, axis=1).T.astype(taps.dtype)
+    dw = jnp.concatenate(dw).astype(taps.dtype)
     return dx, dw, None if bias is None else jnp.concatenate(db).astype(bias.dtype)
 
 
