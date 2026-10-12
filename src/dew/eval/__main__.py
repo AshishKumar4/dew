@@ -8,7 +8,6 @@ lm_eval's own entry point, so every flag and every task is the harness's.
 
 from __future__ import annotations
 
-import sys
 from importlib import import_module
 
 
@@ -17,7 +16,6 @@ def main() -> int:
 
     import_module("dew.eval.harness")  # registers the `dew` model with lm_eval
 
-    sys.argv = ["lm_eval", *sys.argv[1:]]
     cli_evaluate()
     return 0
 
