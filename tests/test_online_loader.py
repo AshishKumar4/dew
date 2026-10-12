@@ -7,8 +7,9 @@ import numpy as np
 import pytest
 from PIL import Image
 
-from dew.data import DataPartition, Loading, Memory, Pipeline, Rejected, compile
-from dew.data.compile import iterate
+from dew.data import DataPartition, Loading, Memory, Pipeline, Rejected, compile, images, video
+from dew.data.cache import Cache
+from dew.data.compile import iterate, publish
 from dew.data.mix import SearchBudget
 from dew.data.sources.urls import Fetch
 from dew.data.steps.image import DecodeImage, Resize
@@ -99,3 +100,111 @@ def test_a_finite_fetch_pass_ends_after_its_catalog(tmp_path):
     rows = list(iterate(catalog(tmp_path, 3), read="indexed", loading=READ))
     assert [row["label"] for row in rows] == [0, 1, 2]
     assert all(np.all(row["image"] == index + 1) for index, row in enumerate(rows))
+
+
+def web_table(root: Path) -> list[dict]:
+    """A url table as the open web serves it: images worth training on (labels 0-7), and ones
+    that are too small, too elongated, one flat colour, not an image, gone, or not a url."""
+    rng = np.random.default_rng(0)
+
+    def saved(name, pixels):
+        path = root / f"{name}.png"
+        Image.fromarray(pixels).save(path)
+        return path.as_uri()
+
+    rows = [{"url": saved(f"good-{index}", rng.integers(0, 256, (32, 40, 3), np.uint8)), "label": index}
+            for index in range(8)]
+    (root / "page.html").write_text("<html>moved</html>")
+    return [*rows,
+            {"url": saved("small", rng.integers(0, 256, (8, 8, 3), np.uint8)), "label": -1},
+            {"url": saved("strip", rng.integers(0, 256, (16, 96, 3), np.uint8)), "label": -2},
+            {"url": saved("flat", np.full((32, 32, 3), 7, np.uint8)), "label": -3},
+            {"url": (root / "page.html").as_uri(), "label": -4},
+            {"url": (root / "gone.png").as_uri(), "label": -5},
+            {"url": None, "label": -6}]
+
+
+def rejected(stream) -> dict[str, float]:
+    """The reader's dropped records by reason, as a run logs them."""
+    return {key.rsplit("/", 1)[1]: count for key, count in stream.statistics().items()
+            if key.startswith("data/rejected/") and count}
+
+
+def worth_training_on(pipeline: Pipeline) -> Pipeline:
+    """The old url loader's checks, as stages."""
+    return (pipeline.map(images.decode()).filter(images.min_side(16)).filter(images.max_aspect(2.4))
+            .filter(images.not_flat()))
+
+
+def test_a_web_image_flow_trains_on_the_good_images_and_counts_each_drop_by_reason(tmp_path):
+    """Fetched in four threads, decoded and checked: only the good images reach a batch, and the
+    reader's counts name every reason a url was dropped."""
+    fetched = Pipeline(Memory(web_table(tmp_path))).shuffle(5).repeat().map(images.fetch(retries=0))
+    data = compile(worth_training_on(fetched).map(Resize(16)).batch(4), read="indexed",
+                   loading=Loading(workers=0, threads=4, read_buffer=8, worker_buffer=1))
+    stream = data.train(DataPartition())
+    try:
+        batches = list(itertools.islice(stream, 12))
+        dropped = rejected(stream)
+    finally:
+        stream.close()
+    labels = np.concatenate([batch["label"] for batch in batches])
+    assert set(labels.tolist()) == set(range(8))
+    assert set(dropped) == {"too_small", "too_elongated", "flat", "undecodable", "transient", "invalid_url"}
+
+
+def test_fetched_bytes_published_once_train_and_resume_exactly_after_every_url_dies(tmp_path):
+    """A published fetch is the bytes the run reads: with every url gone, a run over the cached
+    generation trains on the original pixels, and resuming from a saved position continues it
+    exactly."""
+    table = web_table(tmp_path)
+    generation = publish(Pipeline(Memory(table)).map(images.fetch(retries=0)), Cache(str(tmp_path / "cache")),
+                         read="indexed", loading=READ)
+    originals = {row["label"]: np.asarray(Image.open(row["url"].removeprefix("file://")).convert("RGB"))
+                 for row in table[:8]}
+    for path in tmp_path.glob("*.png"):
+        path.unlink()
+    pipeline = worth_training_on(Pipeline(Memory(table)).map(images.fetch(retries=0)).cache(generation)
+                                 .shuffle(5).repeat()).batch(4)
+    data = compile(pipeline, read="indexed", loading=READ)
+    stream = data.train(DataPartition())
+    try:
+        first = [next(stream) for _ in range(3)]
+        state = stream.get_state()
+        rest = [next(stream) for _ in range(3)]
+    finally:
+        stream.close()
+    for batch in first + rest:
+        for label, pixels in zip(batch["label"], batch["image"], strict=True):
+            np.testing.assert_array_equal(pixels, originals[int(label)])
+    resumed = data.train(DataPartition())
+    try:
+        resumed.set_state(state)
+        again = [next(resumed) for _ in range(3)]
+    finally:
+        resumed.close()
+    for expected, found in zip(rest, again, strict=True):
+        np.testing.assert_array_equal(expected["image"], found["image"])
+
+
+def test_a_web_video_flow_decodes_frames_from_fetched_bytes(tmp_path):
+    """Clips fetched by url decode from their bytes to frames; bytes that are no clip are dropped."""
+    from test_data_av import CLIP_FRAMES, GREY_STEP, _clip
+
+    clip = Path(_clip(tmp_path, audio=False))
+    (tmp_path / "broken.mp4").write_bytes(b"not a video")
+    table = [{"url": clip.as_uri(), "caption": "a fade"}, {"url": (tmp_path / "broken.mp4").as_uri()}]
+    pipeline = (Pipeline(Memory(table)).shuffle(2).repeat().map(video.fetch(retries=0))
+                .random_map(video.decode(frames=8, size=16)).batch(2))
+    data = compile(pipeline, read="indexed", loading=READ)
+    stream = data.train(DataPartition())
+    try:
+        batch = next(stream)
+        dropped = rejected(stream)
+    finally:
+        stream.close()
+    assert batch["video"].shape == (2, 8, 16, 16, 3)
+    for frames in batch["video"]:
+        greys = [round(int(frame[8, 8, 0]) / GREY_STEP) for frame in frames]
+        assert greys == list(range(greys[0], greys[0] + 8)) and greys[-1] < CLIP_FRAMES
+    assert dropped["undecodable"] > 0

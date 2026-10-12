@@ -34,8 +34,11 @@ def _payload(image: bytes | Mapping[str, object] | ArrayLike) -> bytes | ArrayLi
 
 @dataclasses.dataclass(frozen=True)
 class DecodeImage(grain.MapTransform):
+    """The image in `field` as RGB uint8 pixels under `to`; bytes that are no image are rejected."""
+
     field: str = "image"
     at_least: int | None = None
+    to: str = "image"
     rejects = True
 
     def map(self, element: Batch) -> Batch | Rejected:
@@ -48,7 +51,44 @@ class DecodeImage(grain.MapTransform):
                 return Rejected("undecodable")
         else:
             image = as_rgb(np.asarray(image))
-        return {**element, "image": image}
+        return {**element, self.to: image}
+
+
+@dataclasses.dataclass(frozen=True)
+class MinSide:
+    """Whether the pixels in `field`, `[..., H, W, C]`, are at least `size` on their shorter side."""
+
+    size: int
+    field: str = "image"
+    reason = "too_small"
+
+    def __call__(self, element: Batch) -> bool:
+        return min(np.shape(element[self.field])[-3:-1]) >= self.size
+
+
+@dataclasses.dataclass(frozen=True)
+class MaxAspect:
+    """Whether the pixels in `field` are at most `ratio` times as long as wide."""
+
+    ratio: float
+    field: str = "image"
+    reason = "too_elongated"
+
+    def __call__(self, element: Batch) -> bool:
+        shorter, longer = sorted(np.shape(element[self.field])[-3:-1])
+        return longer <= self.ratio * shorter
+
+
+@dataclasses.dataclass(frozen=True)
+class NotFlat:
+    """Whether the pixels in `field` hold more than one value."""
+
+    field: str = "image"
+    reason = "flat"
+
+    def __call__(self, element: Batch) -> bool:
+        pixels = np.asarray(element[self.field])
+        return bool(pixels.min() != pixels.max())
 
 
 @dataclasses.dataclass(frozen=True)

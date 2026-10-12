@@ -5,11 +5,13 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import functools
+import tempfile
 
 import grain.python as grain
 import numpy as np
 
 from dew.data.dataset import Batch
+from dew.data.pipeline import Rejected
 from dew.data.processors import AutoAudioProcessor
 from dew.data.video import fit_frames
 
@@ -51,6 +53,38 @@ class DecodeClip(grain.RandomMapTransform):
                 sample_rate=self.sample_rate,
             )
         return {"video": fit_frames(frames, self.size), "caption": element.get("caption", ""), "audio": audio}
+
+
+@dataclasses.dataclass(frozen=True)
+class DecodeFrames(grain.RandomMapTransform):
+    """`frames` consecutive frames from a random start of the clip in `field`,
+    its bytes or a local path, each fitted into a `size` square, under `to`,
+    without its audio. A clip that does not decode or is shorter than
+    `frames` is rejected."""
+
+    frames: int = 16
+    size: int = 256
+    field: str = "mp4"
+    to: str = "video"
+    rejects = True
+
+    def random_map(self, element: Batch, rng: np.random.Generator) -> Batch | Rejected:
+        from dew.data.sources.av_utils import read_random_frames
+
+        clip, seed = element[self.field], int(rng.integers(0, 2**32 - 1))
+        try:
+            with contextlib.ExitStack() as held:
+                if isinstance(clip, bytes):
+                    # The decoder reads a file.
+                    file = held.enter_context(tempfile.NamedTemporaryFile())
+                    file.write(clip)
+                    file.flush()
+                    clip = file.name
+                frames, _ = read_random_frames(str(clip).removeprefix("file://"), num_frames=self.frames,
+                                               padding=0, seed=seed)
+        except (OSError, ValueError):
+            return Rejected("undecodable")
+        return {**element, self.to: fit_frames(frames, self.size)}
 
 
 @dataclasses.dataclass(frozen=True)

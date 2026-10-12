@@ -13,8 +13,13 @@ reader and the audio processor are imported on use.
 from __future__ import annotations
 
 import os
+from typing import TYPE_CHECKING
 
 import numpy as np
+
+if TYPE_CHECKING:
+    from dew.data.sources.urls import Fetch
+    from dew.data.steps.video import DecodeFrames
 
 
 def video_paths(root: str, extensions: tuple[str, ...]) -> list[str]:
@@ -37,3 +42,20 @@ def fit_frames(frames: np.ndarray, size: int) -> np.ndarray:
                      for frame in frames])
 
 
+def fetch(url: str = "url", to: str = "mp4", *, timeout: float = 30.0, retries: int = 2,
+          max_bytes: int = 256 * 2**20) -> Fetch:
+    """A record step that fetches the clip at the record's `url` field into
+    `to` as bytes, as `images.fetch` does an image."""
+    from dew.data.sources.urls import Fetch
+
+    return Fetch(url, to, timeout, retries, max_bytes)
+
+
+def decode(field: str = "mp4", to: str = "video", *, frames: int = 16, size: int = 256) -> DecodeFrames:
+    """A random record step that decodes `frames` frames of the clip in
+    `field`, from a random start, each fitted into a `size` square, under
+    `to`, without audio; a clip that does not decode or is too short is
+    counted and dropped."""
+    from dew.data.steps.video import DecodeFrames
+
+    return DecodeFrames(frames, size, field, to)
