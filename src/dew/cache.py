@@ -5,6 +5,7 @@ interop, config and inference modules take their cache paths without
 importing the FLOP accounting.
 """
 
+import importlib.metadata
 import os
 import sys
 
@@ -37,10 +38,22 @@ def default_compilation_cache_dir() -> str:
 
 
 def enable_compilation_cache(path: str):
-    """Persist compiled executables so restarts skip XLA compilation.
+    """Persist compiled executables so restarts skip XLA compilation, and the
+    GPU autotuner's picks beside them.
 
     The dominant cost of a restart-heavy TPU workflow, where every run otherwise
     recompiles the same step function from scratch.
+
+    XLA's GPU compile measures each fusion's candidate kernels on the device.
+    The picks go to `<path>/autotune/jaxlib-<version>`, one file a fusion keyed
+    by the fusion and the GPU model, for this XLA alone, so a later compile of
+    the same fusions takes them without measuring. A process beside other work
+    on its GPU would measure unfairly, so it reads them and adds none
+    (`gpu-run -n 0.5` sets XLA's AUTOTUNE_CACHE_MODE_READ). Neither the
+    directory nor the mode is in JAX's cache key, so a run and the process
+    that compiled ahead of it (`TrainerConfig.compile_only`) share
+    executables. XLA reads its flags at the first compile; a directory the
+    run names is kept.
     """
     os.makedirs(path, exist_ok=True)
     jax.config.update('jax_compilation_cache_dir', path)
@@ -48,6 +61,11 @@ def enable_compilation_cache(path: str):
     # caching everything keeps startup predictable.
     jax.config.update('jax_persistent_cache_min_entry_size_bytes', -1)
     jax.config.update('jax_persistent_cache_min_compile_time_secs', 0.0)
+    flags = os.environ.get('XLA_FLAGS', '')
+    if '--xla_gpu_per_fusion_autotune_cache_dir' not in flags:
+        picks = os.path.join(path, 'autotune', f"jaxlib-{importlib.metadata.version('jaxlib')}")
+        os.makedirs(picks, exist_ok=True)
+        os.environ['XLA_FLAGS'] = f"{flags} --xla_gpu_per_fusion_autotune_cache_dir={picks}".strip()
 
 
 def persist_compilations() -> None:
