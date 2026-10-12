@@ -63,6 +63,7 @@ __all__ = [
     "CacheCapacity",
     "Counted",
     "CountedCondition",
+    "CountedConditionLayout",
     "CountedConditionedSpatial",
     "CountedDecisions",
     "CountedImages",
@@ -191,6 +192,13 @@ class CountedCondition(Protocol):
     """A condition encoder owns its work and the geometry its denoiser reads."""
 
     def conditioning_flops(self, tokens: Mapping[str, np.ndarray]) -> ConditionWork: ...
+
+
+@runtime_checkable
+class CountedConditionLayout(Protocol):
+    """A denoiser selects the valid keys or physical positions its forward reads."""
+
+    def condition_lengths(self, lengths: np.ndarray, spans: np.ndarray) -> np.ndarray: ...
 
 
 @runtime_checkable

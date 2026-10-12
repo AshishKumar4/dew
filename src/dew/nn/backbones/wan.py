@@ -218,6 +218,10 @@ class WanTransformer(nn.Module):
     def features(self) -> int:
         return self.num_attention_heads * self.attention_head_dim
 
+    @nn.nowrap
+    def condition_lengths(self, lengths: np.ndarray, spans: np.ndarray) -> np.ndarray:
+        return spans
+
     @property
     def text_keyword(self) -> str:
         """Every call takes the text as `conditioning`, which every block cross-attends to."""

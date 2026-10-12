@@ -255,6 +255,11 @@ class Upsample(nn.Module):
     def model_flops(self, lengths, input_features: int) -> float:
         return self._convolution(parent=None).model_flops(lengths, input_features)
 
+    @nn.nowrap
+    def spatial_shape(self, shape: tuple[int, ...]) -> tuple[int, ...]:
+        enlarged = (*tuple(size * self.scale for size in shape[:-1]), shape[-1])
+        return self._convolution(parent=None).spatial_shape(enlarged)
+
     @nn.compact
     def __call__(self, x):
         B, H, W, C = x.shape
@@ -277,6 +282,10 @@ class Downsample(nn.Module):
     def model_flops(self, lengths, input_features: int) -> float:
         return self._convolution(parent=None).model_flops(lengths, input_features)
 
+    @nn.nowrap
+    def spatial_shape(self, shape: tuple[int, ...]) -> tuple[int, ...]:
+        return self._convolution(parent=None).spatial_shape(shape)
+
     @nn.compact
     def __call__(self, x):
         return self._convolution()(x)
@@ -295,6 +304,10 @@ class ResidualBlock(nn.Module):
     precision: PrecisionLike = None
     norm_epsilon: float = 1e-4
     dropout: float = 0.0
+
+    @nn.nowrap
+    def spatial_shape(self, shape: tuple[int, ...]) -> tuple[int, ...]:
+        return Conv(self.features, self.kernel_size, parent=None).spatial_shape(shape)
 
     @nn.nowrap
     def model_flops(self, lengths, input_features: int, time_features: int) -> float:

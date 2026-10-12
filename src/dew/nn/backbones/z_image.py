@@ -28,7 +28,7 @@ from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.attention import RMSNorm
 from dew.nn.blocks import sinusoidal_time
-from dew.nn.flops import MissingFlopsCount, attention_flops, matching_lengths, patch_lengths, projection_flops
+from dew.nn.flops import MissingFlopsCount, matching_lengths, patch_lengths, projection_flops
 from dew.nn.precision import at_least_fp32
 from dew.nn.scan_orders import patchify, unpatchify
 from dew.nn.sharding import logical_axes
@@ -91,6 +91,12 @@ class ZImageBlock(nn.Module):
         return GatedMLP(int(self.features / 3 * 8), self.features, dtype=self.dtype,
                         precision=self.precision, name=name)
 
+    @nn.nowrap
+    def _attention(self):
+        return JointAttention(self.heads, self.features // self.heads, bias=False, epsilon=1e-5,
+                              dtype=self.dtype, precision=self.precision,
+                              attention_impl=self.attention_impl, name="attention")
+
     @property
     def modulation_features(self) -> int:
         return 4 * self.features
@@ -99,10 +105,8 @@ class ZImageBlock(nn.Module):
     def model_flops(self, lengths) -> float:
         """Real-token QKV/output and gated MLP; pad rows stay outside MFU."""
         length, = matching_lengths(lengths)
-        count = (4 * projection_flops(lengths, self.features, self.features)
-                 + self._feed_forward().model_flops(lengths)
-                 + attention_flops(lengths, self.heads, self.features // self.heads,
-                                   self.features // self.heads, causal=False))
+        count = (self._attention().stream_flops(lengths, None, self.features)
+                 + self._feed_forward().model_flops(lengths))
         if self.modulation:
             count += projection_flops(np.ones(length.shape, np.int64), min(self.features, FREQUENCIES),
                                        self.modulation_features)
@@ -115,9 +119,7 @@ class ZImageBlock(nn.Module):
 
         # `ZSingleStreamAttnProcessor`: bias-free, its query and key norms at
         # 1e-5 whatever `norm_eps`.
-        joint = JointAttention(self.heads, self.features // self.heads, bias=False, epsilon=1e-5,
-                               dtype=self.dtype, precision=self.precision, attention_impl=self.attention_impl,
-                               name="attention")
+        joint = self._attention()
 
         def attention(x):
             return joint(x, rotation=rotation, lengths=lengths)[0]
@@ -164,12 +166,15 @@ class ZImageTransformer(nn.Module):
     attention_impl: str = "auto"  # an AttentionImpl
 
     @nn.nowrap
-    def projections(self, input_channels: int | None = None) -> dict[str, tuple[int, int]]:
+    def projections(self, input_channels: int, text_features: int) -> dict[str, tuple[int, int]]:
         time = min(self.dim, FREQUENCIES)
-        channels = self.in_channels if input_channels is None else input_channels
-        return {'x_embedder': (4 * channels, self.dim), 'cap_embedder': (self.cap_feat_dim, self.dim),
+        return {'x_embedder': (4 * input_channels, self.dim), 'cap_embedder': (text_features, self.dim),
                 't_embedder_1': (FREQUENCIES, 1024), 't_embedder_2': (1024, time),
-                'final_modulation': (time, self.dim), 'final_linear': (self.dim, 4 * channels)}
+                'final_modulation': (time, self.dim), 'final_linear': (self.dim, 4 * input_channels)}
+
+    @nn.nowrap
+    def condition_lengths(self, lengths: np.ndarray, spans: np.ndarray) -> np.ndarray:
+        return lengths
 
     @property
     def text_keyword(self) -> str:
@@ -178,18 +183,18 @@ class ZImageTransformer(nn.Module):
 
     @nn.nowrap
     def model_flops(self, lengths) -> float:
-        raise MissingFlopsCount("ZImageTransformer requires multisequence_flops(image_lengths, text_lengths)")
+        raise MissingFlopsCount("ZImageTransformer requires multimodal_flops with actual image/text widths")
 
     @nn.nowrap
     def image_lengths(self, sample_shape: tuple[int, ...], rows: int) -> np.ndarray:
         return patch_lengths(sample_shape, (2, 2), rows)
 
     @nn.nowrap
-    def multisequence_flops(self, lengths, context_lengths) -> float:
+    def multimodal_flops(self, lengths, context_lengths, input_channels: int, text_features: int) -> float:
         """Static patch/text maps, both refiner stacks and the joined stack."""
         image, context = matching_lengths(lengths, context_lengths)
         rows = np.ones(image.shape, np.int64)
-        maps = self.projections()
+        maps = self.projections(input_channels, text_features)
         count = sum(projection_flops(lengths if name in ('x_embedder', 'final_linear') else
                                      context_lengths if name == 'cap_embedder' else rows, *shape)
                     for name, shape in maps.items())
@@ -209,7 +214,7 @@ class ZImageTransformer(nn.Module):
         width = at_least_fp32(self.dtype)
         source_time = (1000.0 - jnp.asarray(time, width)) / 1000.0 * self.t_scale
         features = sinusoidal_time(source_time, FREQUENCIES, dtype=width).astype(dtype)
-        maps = self.projections()
+        maps = self.projections(0, 0)
         hidden = nn.Dense(maps['t_embedder_1'][1], dtype=self.dtype, precision=self.precision,
                           name="t_embedder_1")(features)
         return nn.Dense(maps['t_embedder_2'][1], dtype=self.dtype, precision=self.precision,
@@ -244,7 +249,7 @@ class ZImageTransformer(nn.Module):
         embedded = self._embedded_time(time, x.dtype)
         pad_image = self.param("x_pad_token", nn.initializers.zeros, (1, self.dim))
         pad_caption = self.param("cap_pad_token", nn.initializers.zeros, (1, self.dim))
-        maps = self.projections(x.shape[-1])
+        maps = self.projections(x.shape[-1], conditioning.context.shape[-1])
         image = nn.Dense(maps['x_embedder'][1], dtype=self.dtype, precision=self.precision,
                          name="x_embedder")(patchify(x, 2))
         image = jnp.concatenate(

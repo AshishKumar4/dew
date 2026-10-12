@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from abc import abstractmethod
 from collections.abc import Mapping, Sequence
+from dataclasses import replace
 from functools import cached_property
 from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple, Protocol, runtime_checkable
 
@@ -44,6 +45,7 @@ from dew.nn.mp import Uncertainty
 from dew.nn.protocols import (
     CountedCondition,
     CountedConditionedSpatial,
+    CountedConditionLayout,
     CountedImages,
     CountedMultimodal,
     CountedSequences,
@@ -321,9 +323,29 @@ class DiffusionObjective(Objective[Ratio]):
             encoder = condition.encoder
             if not isinstance(encoder, CountedCondition):
                 raise MissingFlopsCount(f"{type(encoder).__name__} has no conditioning_flops(tokens)")
-            conditions.append(encoder.conditioning_flops(batch[condition.field]))
+            work = encoder.conditioning_flops(batch[condition.field])
+            conditions.append(work)
         encoded = sum(condition.flops for condition in conditions)
-        context = None if not conditions else conditions[0].lengths
+        context = None
+        if conditions:
+            if not isinstance(model, CountedConditionLayout):
+                raise MissingFlopsCount(f"{type(model).__name__} has no condition_lengths layout declaration")
+            work = conditions[0]
+            context = model.condition_lengths(work.lengths, work.spans)
+            if self.unconditional_prob:
+                condition = next(iter(self.inputs.conditions.values()))
+                encoder = condition.encoder
+                if not isinstance(encoder, CountedCondition):
+                    raise MissingFlopsCount(f"{type(encoder).__name__} has no conditioning_flops(tokens)")
+                blank = encoder.conditioning_flops(encoder.tokenize([condition.unconditional]))
+                dropped = replace(work, lengths=np.broadcast_to(blank.lengths, work.lengths.shape))
+                blank_context = model.condition_lengths(dropped.lengths, dropped.spans)
+                if self.unconditional_prob == 1:
+                    work, context = dropped, blank_context
+                elif np.any(context != blank_context):
+                    raise MissingFlopsCount("DiffusionObjective needs post-dropout context lengths; "
+                                            "the host count does not know the conditioning-dropout draw")
+            conditions[0] = work
         features = None if not conditions else conditions[0].features
         rows = np.shape(batch[self.inputs.sample.key])[0]
         if isinstance(model, CountedConditionedSpatial) and conditions:
