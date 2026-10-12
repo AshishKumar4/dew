@@ -35,7 +35,7 @@ from ..hyper_connections import (
 from ..inputs import LayerInputs, PredictionPhase
 from ..moe import EXPERT_DISPATCHES, GROUPED_MATMULS, GatedActivation, SparseMLP, gated_product
 from ..precision import scaled
-from ..protocols import ProjectionGroup, declared_groups
+from ..protocols import ProjectionGroup, RoutesExperts, declared_groups
 from ..sharding import MLP_HIDDEN, RESIDUAL, constrain, logical_axes
 
 STREAMS = ("activation_batch", "activation_length", None, "activation_embed")
@@ -74,15 +74,6 @@ class ReadsTrain(Protocol):
 
     @property
     def reads_train(self) -> bool: ...
-
-
-@runtime_checkable
-class RoutesExperts(Protocol):
-    """A token mixer whose call takes `routes`, the layer's replayed experts,
-    because it routes over experts itself (an MLP in the mixer's slot)."""
-
-    @property
-    def routes_experts(self) -> bool: ...
 
 
 @dataclasses.dataclass(frozen=True)

@@ -432,6 +432,16 @@ class ProjectionGroup:
 
 
 @runtime_checkable
+class RoutesExperts(Protocol):
+    """A module whose call takes `routes`, a layer's replayed experts, because
+    it routes over experts: a routed feed-forward, or a token mixer holding one
+    (an MLP in the mixer's slot)."""
+
+    @property
+    def routes_experts(self) -> bool: ...
+
+
+@runtime_checkable
 class ProjectionSites(Protocol):
     """A bound module's packed groups, its own and its children's."""
 
