@@ -403,7 +403,8 @@ def test_a_wan_lora_starts_as_the_source_and_trains_its_factors_alone(pipeline, 
     for row in range(len(prompts)):
         truth = channels_last(arrays[f"latents_f64.{row}"][None])[0]
         assert_no_less_exact(adapted.latents[row], original.latents[row], truth, f"zero-adapter latent {row}")
-        frames = [np.clip(np.asarray(walked.images[row]) / 2 + .5, 0.0, 1.0) for walked in (adapted, original)]
+        frames = [np.clip(np.asarray(walked.images[row]) / 2 + .5, 0.0, 1.0)
+                  for walked in (adapted, original)]
         assert_no_less_exact(*frames, arrays[f"frames_f64.{row}"], f"zero-adapter frames {row}")
     objective = DiffusionObjective(tuned, ema_decay=None, unconditional_prob=0.0)
     batch = clip_batch(objective, prompts)
