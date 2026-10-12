@@ -2228,6 +2228,13 @@ class Trainer(Generic[Loss, Effects]):
                 "tokens": (interval.book.tokens if interval.tokens_counted and interval.book is not None
                            else None),
                 "rollout": {} if self.rollout is None else dict(_rollout_metrics(self.rollout))})
+            work = read["training_flops"]
+            if work is not None and not math.isfinite(work) and self._refusal is None:
+                # Another process refused a count (`_counted_batch`); the global
+                # sum carried it here, and this process stops counting too.
+                self._refusal = "another process's batch could not be counted"
+                self._display.note(f"train/mfu is unavailable for {type(self.objective).__name__}: "
+                                   f"{self._refusal}")
             scalars = {"train/loss": float(read["loss"]),
                        **{f"train/{k}": float(v) for k, v in read["aux"].items()},
                        **self._throughput(now - interval.last_log_time, interval.since_log,
