@@ -27,7 +27,8 @@ from flax import linen as nn
 from moe_support import by_expert, router_variables
 
 from dew.nn.backbones.decoder_block import GatedMLP
-from dew.nn.moe import ExpertMLP, Router, SparseMLP, load_balance_update
+from dew.nn.kernels import TARGETS, assumed
+from dew.nn.moe import ExpertMLP, Router, SparseMLP, grouped_matmul, load_balance_update
 from dew.training import MeshSpec
 
 pytestmark = pytest.mark.kernel
@@ -542,6 +543,26 @@ def test_the_tokamax_grouped_matmul_agrees_with_the_xla_one():
     # Observed 0 on CPU, where tokamax lowers to the same ragged_dot; the
     # bound leaves room for a Mosaic or Triton kernel's accumulation order.
     assert np.max(np.abs(np.asarray(other) - np.asarray(expected))) < 1e-6
+
+
+GPU_ROWS = sorted(generation for generation in TARGETS if generation.startswith('sm'))
+
+
+@pytest.mark.parametrize("generation", GPU_ROWS)
+def test_each_gpu_row_names_a_tokamax_kernel_tokamax_registers(generation):
+    """A KERNELS row names an implementation Dew's install provides: tokamax's
+    Triton kernel imports jax_triton, which no Dew install brings, so a row
+    that named it failed with tokamax's "Unknown implementation" on that GPU.
+    Each row's kernel computes the XLA product."""
+    pytest.importorskip("tokamax")
+    keys = jax.random.split(jax.random.key(5), 2)
+    tokens = jax.random.normal(keys[0], (24, 16))
+    kernel = jax.random.normal(keys[1], (4, 16, 8))
+    sizes = jnp.asarray([5, 0, 12, 7], jnp.int32)
+    expected = grouped_matmul(tokens, kernel, sizes, implementation='xla')
+    with assumed(generation):
+        chosen = grouped_matmul(tokens, kernel, sizes, implementation='tokamax')
+    np.testing.assert_allclose(np.asarray(chosen), np.asarray(expected), rtol=0, atol=1e-6)
 
 
 def test_the_tokamax_grouped_matmul_backs_the_same_gradients():
