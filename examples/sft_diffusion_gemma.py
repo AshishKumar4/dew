@@ -8,9 +8,9 @@ fetching one layer at a time. The 26B-A4B base has not been run through it:
         --model google/diffusiongemma-26B-A4B-it \\
         --chat data/tulu-3-sft.parquet --steps 2000
 
-`--chat` is a Hub dataset id, a `.jsonl` file or a parquet file of
-conversations, which is what `dew.data.ChatMessages` reads and renders with
-the checkpoint's own chat template. The run writes the PEFT adapter directory
+`--chat` is an `hf://` Hub dataset, a `.jsonl` file or a parquet file of
+conversations, which is what the `Chat` recipe reads and renders with the
+checkpoint's own chat template. The run writes the PEFT adapter directory
 `Adapter.save` produces, which transformers loads, then loads the base again
 through `dew.pipeline`, merges the adapter into it and writes the decoded
 canvases to `samples.txt`. Image-conditioned training on real Oxford Flowers
@@ -72,7 +72,7 @@ class Config:
 
 
 def smoke_conversations(out: Path) -> Path:
-    """The canned turns as the JSONL `ChatMessages` reads line by line."""
+    """The canned turns as the JSONL file the `Chat` recipe reads line by line."""
     jsonl = out / "chat.jsonl"
     jsonl.write_text("".join(json.dumps({"messages": turns}) + "\n" for turns in CONVERSATIONS))
     return jsonl
