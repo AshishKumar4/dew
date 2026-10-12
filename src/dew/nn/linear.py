@@ -27,6 +27,8 @@ value head.
 """
 
 import functools
+from collections.abc import Sequence
+from typing import overload
 
 import jax
 import jax.numpy as jnp
@@ -64,7 +66,22 @@ def l2norm(x, eps: float = L2NORM_EPS):
     return x * inv
 
 
-def causal_conv1d(x, kernel, activation: bool = True, bias=None, *, valid=None, parts=None, dtype=None):
+Pieces = Sequence[tuple[int, int | None]]
+"""`causal_conv1d`'s `parts`: each piece's width and the head its l2 norm runs over, or None."""
+
+
+@overload
+def causal_conv1d(x, kernel, activation: bool = True, bias=None, *, valid=None, parts: None = None,
+                  dtype=None) -> jax.Array: ...
+
+
+@overload
+def causal_conv1d(x, kernel, activation: bool = True, bias=None, *, valid=None, parts: Pieces,
+                  dtype=None) -> tuple[jax.Array, ...]: ...
+
+
+def causal_conv1d(x, kernel, activation: bool = True, bias=None, *, valid=None, parts: Pieces | None = None,
+                  dtype=None) -> jax.Array | tuple[jax.Array, ...]:
     """Depthwise causal conv over `[B, S, D]` with the `[D, K]` taps.
 
     The reference pads `K - 1` zeros to the left
@@ -100,7 +117,8 @@ def causal_conv1d(x, kernel, activation: bool = True, bias=None, *, valid=None, 
     return xla_conv1d(x, kernel, activation, bias, valid=valid, parts=parts, dtype=dtype)
 
 
-def xla_conv1d(x, kernel, activation: bool = True, bias=None, *, valid=None, parts=None, dtype=None):
+def xla_conv1d(x, kernel, activation: bool = True, bias=None, *, valid=None, parts: Pieces | None = None,
+               dtype=None) -> jax.Array | tuple[jax.Array, ...]:
     """`causal_conv1d`'s arithmetic in XLA: a CPU's and a TPU's, and the
     oracle of the GPU's kernels."""
     dtype = x.dtype if dtype is None else jnp.dtype(dtype)
@@ -879,10 +897,10 @@ class GatedDeltaNet(nn.Module):
         # keys on their own heads and beta beside them; the other rules take
         # the wide operands. The conv rounds once, to the dtype its rule takes.
         widths = (self.head_k_dim, self.head_k_dim, self.head_v_dim)
-        fla = S > 1 and gated_rule(self.implementation) == 'fla' and fla_refusal(
-            *(self._split_heads(part, width) for part, width in
-              zip(jnp.split(mixed, [key_dim, 2 * key_dim], axis=-1), widths, strict=True)),
-            self.chunk_size) is None
+        rows, keys, values = (self._split_heads(part, width) for part, width in
+                              zip(jnp.split(mixed, [key_dim, 2 * key_dim], axis=-1), widths, strict=True))
+        fla = (S > 1 and gated_rule(self.implementation) == 'fla'
+               and fla_refusal(rows, keys, values, self.chunk_size) is None)
 
         def scan(convolved, *, starts, valid, held):
             del starts
