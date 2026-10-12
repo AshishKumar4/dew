@@ -10,6 +10,11 @@ ids; anything else fails naming the row.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from dew.data.steps.chat import PreferencePair
+
 IDS_KEY = "input_ids"
 """Batch key holding the `[B, 2, S]` pair ids, chosen at index 0."""
 
@@ -45,3 +50,9 @@ def _mask(values: object, name: str, length: int, where: str) -> list[int]:
     return mask
 
 
+def pair(seq_len: int = 256, *, pad_id: int = 0) -> PreferencePair:
+    """A record step that lays a chosen and a rejected completion's ids and
+    loss masks out as two `seq_len` rows."""
+    from dew.data.steps.chat import PreferencePair
+
+    return PreferencePair(seq_len, pad_id)

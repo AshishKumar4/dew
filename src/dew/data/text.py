@@ -8,6 +8,7 @@ tokenizer on first use, so a host without the hub cache still imports
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import functools
 import hashlib
@@ -19,6 +20,8 @@ from typing import TYPE_CHECKING, Protocol, runtime_checkable
 if TYPE_CHECKING:
     from jax.typing import ArrayLike
     from transformers import PreTrainedTokenizerBase
+
+    from dew.data.steps.text import Dropped, MinChars, Tokenize
 
 
 _load_lock = threading.Lock()
@@ -255,6 +258,61 @@ class HFTokenizer:
 
     def __repr__(self):
         return f"{self.__class__.__name__}(name={self.name!r})"
+
+
+def tokenizer_name(tokenizer: str | PreTrainedTokenizerBase) -> str:
+    """A tokenizer as the name Dew's steps carry: a name as it is, and a
+    transformers tokenizer object saved once to a directory named for its
+    files' hash, which every worker reads and every run hashes alike."""
+    if isinstance(tokenizer, str):
+        return tokenizer
+    import shutil
+    import tempfile
+
+    from dew.cache import dew_cache_dir
+
+    root = Path(dew_cache_dir(), "tokenizers")
+    root.mkdir(parents=True, exist_ok=True)
+    staging = Path(tempfile.mkdtemp(dir=root))
+    try:
+        tokenizer.save_pretrained(str(staging))
+        digest = hashlib.sha256()
+        for path in sorted(path for path in staging.rglob("*") if path.is_file()):
+            digest.update(str(path.relative_to(staging)).encode() + b"\0" + path.read_bytes())
+        directory = root / digest.hexdigest()
+        if not directory.is_dir():
+            # Another process saving the same tokenizer writes the same files first.
+            with contextlib.suppress(OSError):
+                staging.rename(directory)
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+    return str(directory)
+
+
+def tokenize(tokenizer: str | PreTrainedTokenizerBase = "byte", *, field: str = "text",
+             eos: bool = True) -> Tokenize:
+    """A record step that encodes the text in `field` to token ids under
+    "text", each document ended by the tokenizer's EOS where `eos`.
+    `tokenizer` is "byte" (Dew's utf-8 vocabulary), a Hub repo or directory,
+    or a transformers tokenizer object."""
+    from dew.data.steps.text import Tokenize
+
+    return Tokenize(tokenizer_name(tokenizer), field, eos)
+
+
+def drop(field: str = "caption", p: float = 0.1) -> Dropped:
+    """A random step that empties the text in `field` with probability `p`,
+    as classifier-free guidance trains its unconditioned branch."""
+    from dew.data.steps.text import Dropped
+
+    return Dropped(field, p)
+
+
+def min_chars(count: int, field: str = "text") -> MinChars:
+    """A filter keeping texts of at least `count` characters."""
+    from dew.data.steps.text import MinChars
+
+    return MinChars(count, field)
 
 
 def tokenizer_for(name: str, *, local_files_only: bool = False) -> ByteTokenizer | HFTokenizer:

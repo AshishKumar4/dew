@@ -31,13 +31,16 @@ import functools
 import json
 from collections.abc import Mapping, Sequence
 from enum import Enum
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import numpy as np
 from jinja2 import TemplateError
 
 if TYPE_CHECKING:
     from transformers import PreTrainedTokenizerBase
+
+    from dew.data.steps.chat import RenderChat
+    from dew.data.steps.text import LengthPolicy
 
 ROLES_KEY = "text_roles"
 """Batch key the chat pipeline packs `[B, seq_len + 1]` int8 roles under."""
@@ -497,3 +500,20 @@ def _turn_end(full: Sequence[int], following: Sequence[int], agreed: int, role: 
     return end
 
 
+def template(tokenizer: str | PreTrainedTokenizerBase, *, messages: str = "messages") -> RenderChat:
+    """A record step that renders the conversation in `messages` through the
+    tokenizer's chat template to token ids under "text" and each token's
+    speaker under "text_roles", which an assistant-only loss reads.
+    `tokenizer` is a Hub repo or directory, or a transformers tokenizer."""
+    from dew.data.steps.chat import RenderChat
+    from dew.data.text import tokenizer_name
+
+    return RenderChat(tokenizer_name(tokenizer), messages)
+
+
+def fit_length(length: int, *, long: Literal["truncate", "drop"] = "truncate") -> LengthPolicy:
+    """A record step that keeps a rendered conversation within `length`
+    tokens, cutting its end (or dropping it, counted) and its roles alike."""
+    from dew.data.steps.text import LengthPolicy
+
+    return LengthPolicy(length, long=long, aligned=(ROLES_KEY,))
