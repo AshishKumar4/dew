@@ -32,6 +32,7 @@ from dew.data.analysis import (
     _leaves,
     _name,
     _preferred_read,
+    _promoted,
     _steps,
     _until,
 )
@@ -103,31 +104,6 @@ def _cache_references(pipeline: Pipeline, read: Read) -> tuple[str, ...]:
         for index, stage in enumerate(leaf.stages)
         if isinstance(stage, Artifact)
     )
-
-
-def _promoted(pipeline: Pipeline) -> Pipeline:
-    """The pipeline reading each published generation it caches as a source,
-    in place of the steps the generation already ran, and its published
-    packing in place of the pack stage that follows it."""
-    from dew.data.cache import Generation
-
-    source = pipeline.source
-    if isinstance(source, (Mixture, Phases)):
-        source = dataclasses.replace(source, pipelines=tuple(_promoted(child) for child in source.pipelines))
-    for index, stage in enumerate(pipeline.stages):
-        if isinstance(stage, Artifact) and isinstance(stage.cache, Generation):
-            from dew.data.packing import PackedSource, plan_name
-
-            suffix = pipeline.stages[index + 1 :]
-            promoted: Source = stage.cache.source()
-            if suffix and isinstance(suffix[0], Pack):
-                pack = suffix[0]
-                plans = record(stage.cache.manifest.get("plan", {}), "published plans")
-                if plan_name(pack, "accepted") in plans:
-                    promoted = PackedSource(promoted, stage.cache, pack)
-                    suffix = suffix[1:]
-            return dataclasses.replace(pipeline, source=promoted, stages=suffix)
-    return dataclasses.replace(pipeline, source=source)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -404,7 +380,8 @@ def compile(
 ) -> Dataset:
     """Check every leaf before opening readers, then build both branches.
     With no `read`, the sources choose it (`_preferred_read`)."""
-    read = read or _preferred_read((train,) if validation is None else (train, validation))
+    branches = (train,) if validation is None else (train, validation)
+    read = read or _preferred_read(branches, provision=provision)
     if isinstance(train.source, Phases):
         return _compile_phases(
             train,
@@ -426,7 +403,7 @@ def compile(
     counts: dict[str, CorpusCounts] = {}
     validation_counts: dict[str, CorpusCounts] = {}
     branches = _prepared(
-        (train,) if validation is None else (train, validation),
+        branches,
         read,
         provision=provision,
         training=True,
@@ -846,7 +823,7 @@ def validation(
 ) -> Reader:
     """Compile one finite evaluation branch without constructing a training
     stream. With no `read`, the sources choose it (`_preferred_read`)."""
-    read = read or _preferred_read((pipeline,))
+    read = read or _preferred_read((pipeline,), provision=provision)
     if not any(isinstance(stage, BatchStage) for stage in pipeline.stages):
         pipeline = pipeline.batch(batch, drop_remainder=False)
     (pipeline,) = _prepared((pipeline,), read, provision=provision, objective=objective, counts=({},))

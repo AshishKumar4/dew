@@ -43,6 +43,7 @@ from dew.data.pipeline import (
     RandomMap,
     Rebatch,
     Repeat,
+    ShardByHost,
     Shuffle,
     Slice,
     Stage,
@@ -54,6 +55,7 @@ from dew.data.pipeline import (
 from dew.data.plan import Manifest, StepIdentity
 from dew.data.sources.base import READS, Read, Source
 from dew.data.sources.memory import Memory
+from dew.records import record
 
 _STAGES = get_args(Stage.__value__)
 
@@ -68,22 +70,49 @@ class _Wrapping(Protocol):
     source: Source
 
 
-def _preferred_read(pipelines: Sequence[Pipeline]) -> Read:
-    """The read a run's sources choose when it states none, which compile,
-    validation and load all take from here.
+def _promoted(pipeline: Pipeline) -> Pipeline:
+    """The pipeline reading each published generation it caches as a source,
+    in place of the steps the generation already ran, and its published
+    packing in place of the pack stage that follows it."""
+    from dew.data.cache import Generation
 
-    Each source prefers memory for records held in memory (`Memory`, through
-    any source that wraps one), indexed for a store that reads by index, and
-    streamed otherwise, and a mixture takes the least eager of its corpora's
-    preferences. The run reads by the first read, from that preference
-    toward the more eager ones, that every source takes or can be provisioned
-    for. A CSV prefers a stream, a random holdout of it cannot be streamed,
-    and the CSV has no index to read it by, so the run reads it into memory.
-    When no read is left, the preference stands for `_capabilities` to refuse
-    with its remedy.
+    source = pipeline.source
+    if isinstance(source, (Mixture, Phases)):
+        source = dataclasses.replace(source, pipelines=tuple(_promoted(child) for child in source.pipelines))
+    for index, stage in enumerate(pipeline.stages):
+        if isinstance(stage, Artifact) and isinstance(stage.cache, Generation):
+            from dew.data.packing import PackedSource, plan_name
+
+            suffix = pipeline.stages[index + 1 :]
+            promoted: Source = stage.cache.source()
+            if suffix and isinstance(suffix[0], Pack):
+                pack = suffix[0]
+                plans = record(stage.cache.manifest.get("plan", {}), "published plans")
+                if plan_name(pack, "accepted") in plans:
+                    promoted = PackedSource(promoted, stage.cache, pack)
+                    suffix = suffix[1:]
+            return dataclasses.replace(pipeline, source=promoted, stages=suffix)
+    return dataclasses.replace(pipeline, source=source)
+
+
+def _preferred_read(pipelines: Sequence[Pipeline], *, provision: bool) -> Read:
+    """The read a run takes when it states none, decided here once for
+    compile, validation and load.
+
+    Each source the run reads, after its published generations are promoted,
+    prefers memory for records held in memory (`Memory`, through any source
+    that wraps one), indexed for a store that reads by index, and streamed
+    otherwise, and a mixture takes the least eager of its corpora's
+    preferences. The run reads by the first read, from that preference toward
+    the more eager ones, that it can take (`_takes`). A CSV prefers a stream,
+    but a random holdout of it cannot be streamed and a token split needs a
+    finite indexed order, so without an index, or provision= to build one,
+    the run reads it into memory. When no read is left, the preference
+    stands, and the preparation refuses it with its own remedy.
     """
+    promoted = tuple(_promoted(pipeline) for pipeline in pipelines)
     chosen: list[Read] = []
-    for source in (source for pipeline in pipelines for _, source in _leaves(pipeline)):
+    for source in (source for pipeline in promoted for _, source in _leaves(pipeline)):
         held = source
         while isinstance(held, _Wrapping):
             held = held.source
@@ -93,9 +122,26 @@ def _preferred_read(pipelines: Sequence[Pipeline]) -> Read:
             chosen.append("indexed" if source.supports("indexed") else "streamed")
     preferred = READS.index(max(chosen, key=READS.index))
     for read in READS[preferred::-1]:
-        if all(isinstance(source, _Provisionable) for source in _unsupported(pipelines, read)):
+        if _takes(promoted, read, provision=provision):
             return read
     return READS[preferred]
+
+
+def _takes(pipelines: Sequence[Pipeline], read: Read, *, provision: bool) -> bool:
+    """Whether a run can read `pipelines` by `read`: every source takes it, a
+    wrapping source answering for what it wraps, or is provisioned for it, and
+    the analysis lowers every stage at it. The analysis's refusals are the one
+    statement of what a read takes, so this asks them and states none of its
+    own."""
+    missing = _unsupported(pipelines, read)
+    if missing and not (provision and all(isinstance(source, _Provisionable) for source in missing)):
+        return False
+    try:
+        for pipeline in pipelines:
+            _analyzed(pipeline, read)
+    except ValueError:
+        return False
+    return True
 
 
 def _unsupported(pipelines: Sequence[Pipeline], read: Read) -> list[Source]:
@@ -339,6 +385,8 @@ def _checked(
                 _identity(earlier, cache=True)
         if isinstance(stage, Shuffle) and stage.window is None and not indexed and not promotion:
             raise ValueError(f"global shuffle in {name} needs an indexed pipeline; give window=")
+        if isinstance(stage, (Slice, ShardByHost)) and not indexed and not promotion:
+            raise ValueError(f"{type(stage).__name__} in {name} needs an indexed pipeline")
         streams = isinstance(stage, (Interleave, Rebatch, Workers, BatchStage, TokenBudget)) or (
             _drops(stage) and index >= eager
         )

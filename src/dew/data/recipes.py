@@ -14,8 +14,8 @@ from typing import TYPE_CHECKING, Annotated, Literal, Protocol, TypeAliasType, r
 import numpy as np
 import tyro
 
-from dew.data.analysis import _at, _preferred_read, _random, _until
-from dew.data.compile import _promoted, compile
+from dew.data.analysis import _at, _preferred_read, _promoted, _random, _until
+from dew.data.compile import compile
 from dew.data.dataset import Batch, DataPhase, Dataset, Loading, Records as IndexedRecords, record_argument
 from dew.data.pipeline import (
     Artifact,
@@ -787,13 +787,13 @@ def load(
     if not isinstance(recipe, Recipe):
         raise TypeError("load expects a typed recipe with pipelines()")
     train, held, shared = recipe.pipelines()
-    read = read or _preferred_read((train,) if held is None else (train, held))
     if held is not None and validation_records is not None:
         held = held.take(validation_records)
     if cache is not None:
         train = _cached(train, cache)
         held = None if held is None else _cached(held, cache)
     train, held = _promoted(train), None if held is None else _promoted(held)
+    read = read or _preferred_read((train,) if held is None else (train, held), provision=provision)
     train = _batched(_ordered(train, read, seed), batch, train=True, tokens=tokens, lengths=lengths)
     held = None if held is None else _batched(held, batch, train=False, tokens=tokens, lengths=lengths)
     return compile(
