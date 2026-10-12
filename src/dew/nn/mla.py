@@ -749,7 +749,8 @@ class MLAMixer(MixerBase):
         return self.index_topk is not None
 
     def build(self, ctx: MixerContext) -> Callable[..., nn.Module]:
-        unsupported = {
+        ctx.refuse("mla", {
+            **ctx.policies(),
             "v_norm": ctx.v_norm,
             "k_eq_v": ctx.k_eq_v,
             "sliding_window": ctx.sliding_window,
@@ -757,14 +758,8 @@ class MLAMixer(MixerBase):
             "attention_scale": ctx.attention_scale,
             "partial_rotary_factor": ctx.partial_rotary_factor,
             "kv_cache": ctx.kv_cache != KVCache(),
-        }
-        asked = sorted(name for name, value in unsupported.items() if value)
-        if asked:
-            raise ValueError(
-                f"the mla mixer has no {', '.join(asked)}: the latent "
-                "attention scales by its head dims and the yarn mscale, "
-                "rotates its rope head whole, attends the whole sequence "
-                "and norms its latents, not its values")
+        }, "the latent attention scales by its head dims and the yarn mscale, rotates its rope head "
+           "whole, attends the whole sequence with an fp32 softmax and norms its latents, not its values")
         if self.yarn is not None and self.yarn.rope_theta != ctx.rope_theta:
             raise ValueError(
                 f"the yarn record's rope_theta ({self.yarn.rope_theta}) and "

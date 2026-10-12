@@ -43,7 +43,7 @@ from residual_orders import permuted
 from dew.interop import Pretrained
 from dew.interop.hf_decoders import _wrapper_sources, families, translate_config, translate_wrapper_config
 from dew.nn.engram import Engram
-from dew.nn.fake_quant import fake_quant_fp4, fake_quant_fp8
+from dew.nn.fake_quant import E2M1, E2M1_MIDPOINTS, fake_quant_fp4, fake_quant_fp8
 from dew.nn.inputs import ModelInputs
 from dew.registry import models
 from dew.sampling import Sample, Sampling, Speculative, generate
@@ -222,7 +222,8 @@ def test_the_quantizers_round_fp32_input_as_the_stand_ins():
     rng = np.random.default_rng(0)
     blocks = [rng.standard_normal((64, 64)) * scale * rng.random((64, 1)) * 3
               for scale in (1e-3, 0.3, 3.0, 40.0, 1e4)]
-    ties = np.tile(np.array([0, .25, .5, .75, 1, 1.25, 1.5, 1.75, 2, 2.5, 3, 3.5, 4, 5, 6, 6]), 4)
+    grid = np.sort(np.concatenate([E2M1[:8], E2M1_MIDPOINTS]))
+    ties = np.tile(np.append(grid, 6.0), 4)
     ties[0] = 6.0  # the block's amax, so its scale is exactly one
     x = np.concatenate([*blocks, np.stack([ties, -ties])]).astype(np.float32)
     x[3, :32] = 0

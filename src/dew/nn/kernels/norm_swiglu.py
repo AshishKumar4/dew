@@ -201,7 +201,7 @@ def _selected(choice: str, implementation: str, refusal: str | None) -> str:
     chosen = generation.measured_kernel(choice, 'xla') if implementation == 'auto' else implementation
     if chosen != 'pallas':
         return chosen
-    placed = generation.triton_runs() or (implementation == 'pallas' and jax.default_backend() == 'cpu')
+    placed = generation.triton_runs() or (implementation == 'pallas' and generation.backend() == 'cpu')
     reason = first_refusal(
         (placed, "the Pallas kernels need a GPU of sm80 or later"),
         (not FORWARD_MODE.get(), "forward_mode_attention needs a JVP; these kernels implement VJPs"),

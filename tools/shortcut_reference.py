@@ -27,12 +27,12 @@ from __future__ import annotations
 import ast
 import json
 import types
-import urllib.request
 from pathlib import Path
 
 import jax
 import jax.numpy as jnp
 import numpy as np
+from reference_source import fetched
 
 COMMIT = "601004348667094e1b71f30942199759412d4432"
 SOURCE = f"https://raw.githubusercontent.com/kvfrans/shortcut-models/{COMMIT}/"
@@ -44,7 +44,7 @@ SHAPE = (12, 4, 4, 3)
 
 
 def source(path: str) -> str:
-    return urllib.request.urlopen(SOURCE + path).read().decode()
+    return fetched(SOURCE + path)
 
 
 class Draws:

@@ -36,13 +36,12 @@ What it writes:
   exact top-k masks.
 """
 
-import ast
 import json
 import types
-import urllib.request
 from pathlib import Path
 
 import numpy as np
+from reference_source import defined_in, definitions, fetched
 
 FIXTURES = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "indexer"
 COMMIT = "538fe7a3f3376d94cf3f04e77741aa6d7e8efa45"
@@ -179,17 +178,6 @@ def main() -> None:
               + (f" = {float(value):.6f}" if value.ndim == 0 else ""))
 
 
-def fetched(path: str) -> str:
-    return urllib.request.urlopen(MAXTEXT + path).read().decode()
-
-
-def constant(text: str, name: str, scope: dict):
-    """A module-level constant of the fetched source, evaluated as published."""
-    node = next(node for node in ast.parse(text).body if isinstance(node, ast.Assign)
-                and any(isinstance(target, ast.Name) and target.id == name for target in node.targets))
-    return eval(compile(ast.Expression(node.value), name, "eval"), scope)
-
-
 class Numpy(types.ModuleType):
     """jax.numpy with `float32`, which the loss casts its softmaxes to, as
     the run's precision: the float64 run is the same code in float64."""
@@ -212,20 +200,13 @@ def published_methods(dtype) -> tuple[dict, float]:
 
     scope = {"jax": jax, "jnp": Numpy(dtype), "checkpoint_name": checkpoint_name, "np": np,
              "Array": jax.Array, "Optional": __import__("typing").Optional}
-    scope["EPS"] = constant(fetched("utils/globals.py"), "EPS", scope)
-    mask_value = constant(fetched("common/common_types.py"), "DEFAULT_MASK_VALUE", scope)
-    scope["DEFAULT_MASK_VALUE"] = mask_value
-    text = fetched("layers/attention_mla.py")
-    methods = {}
-    for node in ast.parse(text).body:
-        if isinstance(node, ast.ClassDef) and node.name in ("Indexer", "MLA"):
-            for item in node.body:
-                if isinstance(item, ast.FunctionDef) and item.name in {"generate_mask",
-                                                                       "calculate_indexer_loss"}:
-                    exec(compile(ast.Module(body=[item], type_ignores=[]), "attention_mla.py", "exec"), scope)
-                    methods[item.name] = scope[item.name]
-    assert set(methods) == {"generate_mask", "calculate_indexer_loss"}
-    return methods, mask_value
+    definitions(MAXTEXT + "utils/globals.py", {"EPS"}, scope)
+    definitions(MAXTEXT + "common/common_types.py", {"DEFAULT_MASK_VALUE"}, scope)
+    text = fetched(MAXTEXT + "layers/attention_mla.py")
+    defined_in(text, {"generate_mask"}, scope, within="Indexer", filename="attention_mla.py")
+    defined_in(text, {"calculate_indexer_loss"}, scope, within="MLA", filename="attention_mla.py")
+    methods = {name: scope[name] for name in ("generate_mask", "calculate_indexer_loss")}
+    return methods, scope["DEFAULT_MASK_VALUE"]
 
 
 def published_loss(methods: dict, dtype, raw, attention_mask, query, key, sparse: bool):
