@@ -686,14 +686,14 @@ def test_local_videos_lists_every_file_under_the_directory(tmp_path):
     clips = _voxceleb_tree(tmp_path)
     (tmp_path / "extra.webm").write_bytes(b"")
 
+    from dew.config.data import _VideoRow
     from dew.data import Files
-    from dew.data.steps.video import VideoPath
 
     patterns = (str(tmp_path / "**" / "*.mp4"), str(tmp_path / "**" / "*.webm"))
     rows = Files(patterns, format="files").records("memory")
-    records = [VideoPath(caption="a clip").map(row) for row in rows]
+    records = [_VideoRow(caption="a clip")(row) for row in rows]
 
-    assert sorted(r["video_path"] for r in records) == sorted(
+    assert sorted(r["mp4"] for r in records) == sorted(
         [c.as_uri() for c in clips] + [(tmp_path / "extra.webm").as_uri()]
     )
     assert {r["caption"] for r in records} == {"a clip"}
@@ -729,13 +729,14 @@ def test_video_records_flow_through_the_audio_video_transform(tmp_path, monkeypa
     monkeypatch.setattr(AutoFeatureExtractor, "from_pretrained",
                         lambda name: Wav2Vec2FeatureExtractor(sampling_rate=16000))
 
-    records = [{"video_path": str(path), "caption": spec.caption} for path in sorted(tmp_path.rglob("*.mp4"))]
+    records = [{"mp4": str(path), "caption": spec.caption} for path in sorted(tmp_path.rglob("*.mp4"))]
     audio = Audio(spec.audio_model)
-    decoded = DecodeClip(spec.frames, spec.frame_size, spec.audio_padding,
-                         audio.processor.sampling_rate).random_map(records[0], np.random.default_rng(0))
+    decoded = DecodeClip(spec.frames, spec.frame_size, audio_padding=spec.audio_padding,
+                         sample_rate=audio.processor.sampling_rate)
+    decoded = decoded.random_map(records[0], np.random.default_rng(0))
     batch = audio.map(decoded)
 
-    assert seen["video_path"] == records[0]["video_path"]
+    assert seen["video_path"] == records[0]["mp4"]
     assert seen["num_frames"] == 4 and seen["audio_padding"] == 1
     assert seen["seed"] == int(np.random.default_rng(0).integers(0, 2**32 - 1))
     assert batch["video"].shape == (4, 32, 32, 3)
@@ -768,9 +769,9 @@ def test_a_clip_is_decoded_at_the_rate_its_audio_model_reads(tmp_path, monkeypat
                         lambda name: Wav2Vec2FeatureExtractor(sampling_rate=48000))
 
     audio = Audio(spec.audio_model)
-    decoded = DecodeClip(spec.frames, spec.frame_size, spec.audio_padding,
-                         audio.processor.sampling_rate).random_map(
-                             {"video_path": str(next(tmp_path.rglob("*.mp4")))}, np.random.default_rng(0))
+    decoded = DecodeClip(spec.frames, spec.frame_size, audio_padding=spec.audio_padding,
+                         sample_rate=audio.processor.sampling_rate).random_map(
+                             {"mp4": str(next(tmp_path.rglob("*.mp4")))}, np.random.default_rng(0))
     batch = audio.map(decoded)
 
     assert batch["audio"]["full_audio"].shape == (6, 48000 // 25)
@@ -1069,19 +1070,19 @@ def test_an_interrupted_epoch_resumes_on_exactly_the_records_it_had_not_seen(
     iterator batches ahead of the worker slice so that holds at every worker
     count.
     """
-    def loader():
+    def opened():
         return loader(Augmenting(image_size=8, seed=3, val_batches=2,
                           loading=Loading(workers=worker_count, threads=1, read_buffer=1,
                                           worker_buffer=1), batch=4), batch=4, read="indexed", seed=3,
                                               loading=Loading(workers=worker_count, threads=1, read_buffer=1,
                                           worker_buffer=1), host=(EncodeCaptions(keep_captions),))
 
-    interrupted = loader().train(DataPartition())
+    interrupted = opened().train(DataPartition())
     seen = _rows(next(interrupted))
     state = interrupted.get_state()
     rest = [row for batch in itertools.islice(interrupted, 3) for row in _rows(batch)]
 
-    restored = loader().train(DataPartition())
+    restored = opened().train(DataPartition())
     restored.set_state(state)
     resumed = [row for batch in itertools.islice(restored, 3) for row in _rows(batch)]
 

@@ -1241,11 +1241,11 @@ def test_an_interrupted_token_epoch_resumes_through_real_workers(tmp_path):
     seq_len = 8
     _token_dir(tmp_path, train_tokens=33 * seq_len, val_tokens=2 * seq_len)
 
-    def loader():
+    def opened():
         return loader(TextData(source=str(tmp_path), seq_len=seq_len), batch=4, read="memory", seed=7,
             loading=Loading(workers=2))
 
-    data = loader()
+    data = opened()
     epoch = data.steps_per_epoch  # 32 windows in eight batches
     interrupted = data.train(DataPartition())
     seen = [row.tobytes() for row in next(interrupted)["text"]]
@@ -1253,7 +1253,7 @@ def test_an_interrupted_token_epoch_resumes_through_real_workers(tmp_path):
     rest = list(itertools.islice(interrupted, 2 * epoch - 1))
     unseen = [row.tobytes() for batch in rest for row in batch["text"]]
 
-    restored = loader().train(DataPartition())
+    restored = opened().train(DataPartition())
     restored.set_state(state)
     after = list(itertools.islice(restored, 2 * epoch - 1))
     resumed = [row.tobytes() for batch in after for row in batch["text"]]
@@ -1271,17 +1271,17 @@ def test_an_interrupted_packed_epoch_resumes_through_mp_prefetch(tmp_path):
     behind them, so a restart has to carry the packer's position too."""
     _document_dir(tmp_path, [[i, i + 1, i + 2] for i in range(10, 100, 3)])
 
-    def loader():
+    def opened():
         return loader(TextData(source=str(tmp_path), pack="first-fit", seq_len=8, packing_bins=2), batch=2,
             read="memory", loading=Loading(workers=2, worker_buffer=1))
 
-    interrupted = loader().val(DataPartition())
+    interrupted = opened().val(DataPartition())
     seen = _rows([next(interrupted)])
     state = interrupted.get_state()
     rest, ended = _bounded(interrupted, 40)
     unseen = _rows(rest)
 
-    restored = loader().val(DataPartition())
+    restored = opened().val(DataPartition())
     restored.set_state(state)
     after, ended_again = _bounded(restored, 40)
     resumed = _rows(after)
