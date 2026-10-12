@@ -295,6 +295,29 @@ def test_the_wy_backward_kernel_is_the_gradient_of_flas_wy_representation():
         assert relative(mine, theirs) < 1e-4, name
 
 
+@pytest.mark.parametrize("value_heads", [2, 4])
+def test_the_wy_backward_adds_the_keys_gradient_so_far_once_per_key_head(value_heads):
+    """Given the query-side kernel's key gradient, the WY backward returns its own plus that one,
+    summed in fp32 before the one rounding, the earlier gradient counted once for each key head
+    whatever its group of value heads; the rest of its outputs are unchanged."""
+    batch, length, key_heads, width, columns = 1, 128, 2, 64, 64
+    keys = jax.random.split(jax.random.key(14), 8)
+    k = l2norm(jax.random.normal(keys[0], (batch, length, key_heads, width)))
+    v = jax.random.normal(keys[1], (batch, length, value_heads, columns))
+    beta = jax.nn.sigmoid(jax.random.normal(keys[2], (batch, length, value_heads)))
+    step = -jnp.exp(jax.random.normal(keys[3], (batch, length, value_heads)) - 3.0) * fla_gdn.RCP_LN2
+    g = jnp.cumsum(step.reshape(batch, length // 64, 64, value_heads), axis=2).reshape(step.shape)
+    a = jnp.tril(jax.random.normal(keys[4], (batch, length, value_heads, 64)) * 0.1)
+    dw = jax.random.normal(keys[5], (batch, length, value_heads, width))
+    du = jax.random.normal(keys[6], (batch, length, value_heads, columns))
+    earlier = jax.random.normal(keys[7], k.shape)
+    alone = fla_gdn.prepare_wy_repr_bwd(k, v, beta, g, a, dw, du, interpret=INTERPRETED)
+    joined = fla_gdn.prepare_wy_repr_bwd(k, v, beta, g, a, dw, du, earlier, interpret=INTERPRETED)
+    assert relative(joined[0], alone[0] + earlier) < 1e-6
+    for name, mine, theirs in zip(("dv", "db", "dg"), joined[1:], alone[1:], strict=True):
+        np.testing.assert_array_equal(np.asarray(mine), np.asarray(theirs), err_msg=name)
+
+
 def rule_math(q, k, v, g, beta, h0):
     """The gated delta rule token by token, in whatever dtype it is given: the reference both paths
     are held to, run in float64."""
