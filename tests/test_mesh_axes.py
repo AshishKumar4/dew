@@ -800,21 +800,36 @@ def test_a_stage_axis_under_a_model_with_no_pipeline_is_refused():
         trainer.compile(state, batch)
 
 
-def test_a_copy_or_transpose_at_a_kernel_calls_edge_is_found_through_its_tuple():
-    """`sharded.boundary_copies` finds a copy feeding a Triton call and a transposing fusion reading
-    its result through a tuple element, and nothing that only reads the result in place."""
-    text = """ENTRY %main {
-  %p0 = bf16[8,64]{1,0} parameter(0)
-  %copy.1 = bf16[8,64]{0,1} copy(bf16[8,64]{1,0} %p0)
-  %cc = (bf16[8,64]{1,0}, f32[8]{0}) custom-call(bf16[8,64]{0,1} %copy.1), \
+def test_a_layout_pass_at_a_kernel_calls_edge_is_found_through_views_and_fusion_bodies():
+    """`sharded.boundary_copies` finds a copy feeding a Triton call through a bitcast, and a fusion
+    whose body only transposes reading its result through a tuple element, whatever its name; a
+    fusion that computes beside its transpose writes its result once and is not a layout pass."""
+    text = """HloModule module
+
+%only_moves (p.0: bf16[8,64]) -> bf16[64,8] {
+  %p.0 = bf16[8,64]{1,0} parameter(0)
+  ROOT %t.0 = bf16[64,8]{1,0} transpose(bf16[8,64]{1,0} %p.0), dimensions={1,0}
+}
+
+%computes (p.1: bf16[8,64]) -> bf16[64,8] {
+  %p.1 = bf16[8,64]{1,0} parameter(0)
+  %e.1 = bf16[8,64]{1,0} exponential(bf16[8,64]{1,0} %p.1)
+  ROOT %t.1 = bf16[64,8]{1,0} transpose(bf16[8,64]{1,0} %e.1), dimensions={1,0}
+}
+
+ENTRY %main (x: bf16[8,64]) -> (bf16[64,8], bf16[64,8]) {
+  %x = bf16[8,64]{1,0} parameter(0)
+  %copy.1 = bf16[8,64]{0,1} copy(bf16[8,64]{1,0} %x)
+  %view = bf16[8,64]{1,0} bitcast(bf16[8,64]{0,1} %copy.1)
+  %kernel = (bf16[8,64]{1,0}, f32[8]{0}) custom-call(bf16[8,64]{1,0} %view), \
 custom_call_target="__gpu$xla.gpu.triton"
-  %gte = bf16[8,64]{1,0} get-tuple-element((bf16[8,64]{1,0}, f32[8]{0}) %cc), index=0
-  %transpose_fusion.2 = bf16[64,8]{1,0} fusion(bf16[8,64]{1,0} %gte), kind=kLoop, calls=%fused
-  %sum = bf16[8,64]{1,0} add(bf16[8,64]{1,0} %gte, bf16[8,64]{1,0} %gte)
-  ROOT %gemm = (bf16[64,8]{1,0}, s8[0]{0}) custom-call(bf16[64,8]{1,0} %transpose_fusion.2), \
-custom_call_target="__cublas$gemm"
-}"""
-    assert sharded.boundary_copies(text) == ["copy.1 -> cc", "cc -> transpose_fusion.2"]
+  %result = bf16[8,64]{1,0} get-tuple-element((bf16[8,64]{1,0}, f32[8]{0}) %kernel), index=0
+  %fusion.7 = bf16[64,8]{1,0} fusion(bf16[8,64]{1,0} %result), kind=kLoop, calls=%only_moves
+  %fusion.8 = bf16[64,8]{1,0} fusion(bf16[8,64]{1,0} %result), kind=kLoop, calls=%computes
+  ROOT %out = (bf16[64,8]{1,0}, bf16[64,8]{1,0}) tuple(bf16[64,8]{1,0} %fusion.7, bf16[64,8]{1,0} %fusion.8)
+}
+"""
+    assert sharded.boundary_copies(text) == ["copy.1 -> kernel", "kernel -> fusion.7"]
 
 
 def test_an_async_collective_counts_its_results_not_its_operands():

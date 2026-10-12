@@ -37,7 +37,7 @@ from jax.ad_checkpoint import checkpoint_name
 
 from dew.nn.kernels import delta_rule, fla_gdn
 
-from .attention import FORWARD_MODE, repeat_kv_heads, unweighted_rmsnorm
+from .attention import FORWARD_MODE, unweighted_rmsnorm
 from .blocks import normal_kernel
 from .flops import conv_flops, delta_flops, projection_flops
 from .inputs import AttentionMetadata, valid_order
@@ -437,21 +437,26 @@ def chunk_delta_rule(query, key, value, g, beta, state=None, chunk_size: int = C
     return core.astype(dtype), state.astype(dtype)
 
 
-def chunk_gated_delta_rule(query, key, value, g, beta, state=None, chunk_size: int = CHUNK_SIZE):
+def chunk_gated_delta_rule(query, key, value, g, beta, state=None, chunk_size: int = CHUNK_SIZE, *,
+                           projected=None):
     """`torch_chunk_gated_delta_rule` (modeling_qwen3_next.py:374-453) with one
     log decay per head, `g` `[B, S, H]`. Its queries and keys may sit on fewer
     heads than the values, each serving `Hv // Hk` of them, as fla takes them.
 
     Where the port takes it (`port_refusal`), it is fla 0.5.2's chunked rule
-    on Dew's port of its kernels (`fla_rule`), on fla's numbers; elsewhere the
-    portable math (`chunk_delta_rule`) in `chunk_size` chunks, which the
-    port's 64 need not match: the rule's value does not depend on them.
+    on Dew's port of its kernels (`fla_rule`), on fla's numbers, its operands
+    and beta in `projected` where given, the dtype a layer's projections
+    hand fla's rule; elsewhere the portable math (`chunk_delta_rule`) on the
+    operands as they come, in `chunk_size` chunks, which the port's 64 need
+    not match: the rule's value does not depend on them.
     """
     if value.shape[2] % key.shape[2]:
         raise ValueError(f"{value.shape[2]} value heads over {key.shape[2]} key heads: each key head serves "
                          "a whole number of value heads")
-    if on_the_port(query, key, value):
-        return fla_rule(query, key, value, g, beta, state)
+    rows, keys, values, gates = ((query, key, value, beta) if projected is None
+                                 else (x.astype(projected) for x in (query, key, value, beta)))
+    if on_the_port(rows, keys, values):
+        return fla_rule(rows, keys, values, g, gates, state)
     group = value.shape[2] // key.shape[2]
     if group > 1:
         query, key = (jnp.repeat(x, group, axis=2) for x in (query, key))
@@ -493,12 +498,13 @@ def fla_rule(query, key, value, g, beta, state=None):
     `g` and `beta` `[B, S, Hv]`, the memory `[B, Hv, Dk, Dv]` or None.
 
     The operands go to their common dtype, beta with them, as fla's layer
-    holds them. On a mesh the rule runs per shard (`manual_map`): rows and
-    value heads where the rules split them, each shard's key heads the ones
-    its value heads read, repeated until the head split divides them, and
-    the time axis whole. Each shard's call is then shaped to the kernels'
-    blocks (`_blocked_rule`) and cut back. Off a GPU its kernels interpret,
-    as the CPU suite runs them.
+    holds them. On a mesh the rule runs per shard (`manual_map`): rows where
+    the rules split them, and value heads with the key heads they read where
+    the head split divides the key heads, the time axis whole; a split that
+    does not divide them keeps the heads whole, so no key's gradient is
+    summed across shards after rounding. Each shard's call is shaped to the
+    kernels' blocks (`_blocked_rule`) and cut back. Off a GPU its kernels
+    interpret, as the CPU suite runs them.
     """
     dtype = jnp.result_type(query, key, value)
     query, key, value, beta = (x.astype(dtype) for x in (query, key, value, beta))
@@ -511,9 +517,8 @@ def fla_rule(query, key, value, g, beta, state=None):
         return _blocked_rule(query, key, value, g, beta, state)
     spec = logical_spec(HEADS, value.shape)
     rows, heads = (spec[i] if i < len(spec) else None for i in (0, 2))
-    shards = math.prod(mesh.shape[axis] for axis in mesh_axes(heads))
-    key_heads = math.lcm(key.shape[2], shards)
-    query, key = (repeat_kv_heads(x, key_heads) for x in (query, key))
+    if key.shape[2] % math.prod(mesh.shape[axis] for axis in mesh_axes(heads)):
+        heads = None
     P = jax.sharding.PartitionSpec
     four, three, memory = P(rows, None, heads, None), P(rows, None, heads), P(rows, heads, None, None)
     return manual_map(_blocked_rule, (four, four, four, three, three, memory), (four, memory))(
@@ -525,11 +530,11 @@ def _blocked_rule(query, key, value, g, beta, state):
     wider than the port's widest split into more value heads of their key
     head; value heads padded to a power of two per key head, which dqkwg's
     block holds, with heads that neither write nor read (zero value, beta
-    and decay); keys and values padded with zero columns to whole 64-wide
-    blocks; the sequence padded to whole chunks with tokens that neither
-    decay nor write. None of them changes a real output or gradient: every
-    padded product is an exact zero. The outputs are cut back and typed
-    varying where the operands are (a Pallas call states no such type)."""
+    and decay); keys and values padded with zero columns to 64, 128 or 256,
+    widths every block of the kernels' configs divides; the sequence padded
+    to whole chunks with tokens that neither decay nor write. None of them
+    changes a real output or gradient: every padded product is an exact
+    zero. The outputs are cut back."""
     B, S, Hk, Dk = key.shape
     Hv, Dv = value.shape[2:]
     scale = Dk ** -0.5
@@ -548,7 +553,7 @@ def _blocked_rule(query, key, value, g, beta, state):
         return x.reshape(*x.shape[:axis], Hk * group, *x.shape[axis + 2:])
 
     value, g, beta, state = grouped(value, 2), grouped(g, 2), grouped(beta, 2), grouped(state, 1)
-    blocks = -(-Dk // 64) * 64, -(-value.shape[3] // 64) * 64
+    blocks = (max(64, 1 << (Dk - 1).bit_length()), max(64, 1 << (value.shape[3] - 1).bit_length()))
     query, key = (_padded(x, 3, blocks[0]) for x in (query, key))
     value = _padded(value, 3, blocks[1])
     state = _padded(_padded(state, 2, blocks[0]), 3, blocks[1])
@@ -560,7 +565,7 @@ def _blocked_rule(query, key, value, g, beta, state):
     out = out.reshape(B, S, Hv, split * width)[..., :Dv]
     final = final[:, :, :Dk, :width].reshape(B, Hk, group, Dk, width)[:, :, :served]
     final = jnp.moveaxis(final.reshape(B, Hv, split, Dk, width), 2, 3).reshape(B, Hv, Dk, split * width)
-    return _varying_as((out, final[..., :Dv]), value)
+    return out, final[..., :Dv]
 
 
 def _padded(x, axis: int, size: int):
@@ -568,13 +573,6 @@ def _padded(x, axis: int, size: int):
     if x.shape[axis] == size:
         return x
     return jnp.pad(x, [(0, size - x.shape[axis]) if i == axis else (0, 0) for i in range(x.ndim)])
-
-
-def _varying_as(outputs, like):
-    """`outputs` typed varying over the manual axes `like` varies over, inside
-    a `shard_map` that checks them; a Pallas call's outputs state none."""
-    axes = jax.typeof(like).mat.varying
-    return tuple(jax.lax.pcast(x, tuple(axes - jax.typeof(x).mat.varying), to='varying') for x in outputs)
 
 
 def recurrent_delta_rule(query, key, value, g, beta, state=None):
@@ -809,17 +807,15 @@ class GatedDeltaNet(nn.Module):
             key = l2norm(self._split_heads(key, self.head_k_dim))
             value = self._split_heads(value, self.head_v_dim)
             state = None if held is None else held.astype(wide)
-            if S > 1 and on_the_port(query, key, value):
+            if S > 1:
                 # fla's layer hands its rule the projections' dtype, the
                 # queries and keys on their own heads and beta beside them.
-                rows, keys, values, gates = (x.astype(operand) for x in (query, key, value, beta))
-                return fla_rule(rows, keys, values, g, gates, state)
+                return chunk_gated_delta_rule(query, key, value, g, beta, state, self.chunk_size,
+                                              projected=operand)
             query, key = self._expand_kv(query), self._expand_kv(key)
             if S == 1 and held is not None and delta_rule.fits(held):
                 return decode_gated_delta_rule(query, key, value, g, beta, held,
                                                None if valid is None else valid[:, 0])
-            if S > 1:
-                return chunk_delta_rule(query, key, value, g[..., None], beta, state, self.chunk_size)
             out, final = recurrent_gated_delta_rule(query, key, value, g, beta, state)
             if held is not None and held.dtype == jnp.bfloat16:
                 final = delta_rule.round_to_bf16(final, key[:, 0].astype(wide), value[:, 0].astype(wide))
