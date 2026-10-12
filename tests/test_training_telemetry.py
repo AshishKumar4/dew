@@ -16,7 +16,7 @@ import dew.config
 from dew.config import OptimConfig, RunConfig, TrainerConfig, Wandb
 from dew.data import Dataset
 from dew.objectives import Aux, Objective
-from dew.telemetry.instrumentation import StepFlops, compilation_cache_counts
+from dew.telemetry.instrumentation import StepFlops, compilation_cache_counts, count_compilation_cache
 from dew.training import Trainer, WandbTracker
 from dew.training.interval import Interval
 from dew.training.optim import Cosine
@@ -136,6 +136,7 @@ def test_wandb_tick_receives_memory_cache_and_existing_throughput(tmp_path, monk
                          flops=StepFlops(model=312e12, hardware=624e12), waited=.02, compiling=.1, compiles=1)
     loss = jnp.asarray(1.)
     accepted = jnp.asarray(a=True)
+    count_compilation_cache()
     before = compilation_cache_counts()
     jax.monitoring.record_event('/jax/compilation_cache/cache_hits')
     jax.monitoring.record_event('/jax/compilation_cache/cache_misses')
@@ -194,12 +195,12 @@ def test_configured_cosine_rate_is_the_last_applied_update(every, monkeypatch):
         assert row['train/learning_rate'] == pytest.approx(float(oracle(update // every)))
 
 
-def test_cache_listener_is_registered_once_across_trainers():
-    trainers = [Trainer(Squared(), optax.sgd(.1), key=0) for _ in range(3)]
+def test_cache_counting_starts_once_however_often_it_is_asked():
+    for _ in range(3):
+        count_compilation_cache()
     before = compilation_cache_counts()
     jax.monitoring.record_event('/jax/compilation_cache/cache_hits')
     jax.monitoring.record_event('/jax/compilation_cache/cache_misses')
     after = compilation_cache_counts()
-    assert len(trainers) == 3
     assert after['train/cache_hits'] == before['train/cache_hits'] + 1
     assert after['train/cache_misses'] == before['train/cache_misses'] + 1
