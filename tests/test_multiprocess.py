@@ -1359,8 +1359,9 @@ def test_a_profile_window_that_fails_on_one_rank_fails_the_pool_together(tmp_pat
 def test_a_pool_refuses_what_its_processes_do_not_share_before_any_trains(tmp_path):
     """Each process opens its own stream over its own copy of the corpus, reads
     its batches on its own prefetch thread and lists the checkpoints itself.
-    Where one process's corpus holds other records of the same length, or
-    another count of them, where its first read fails, where its
+    Where one process's corpus holds other records of the same length, under
+    its own description or one name both copies share, or another count of
+    them, where its first read fails, where its
     stream (one Dew does not know endless) runs out a step before its peers',
     where its batch lacks a field, or where its listing has not yet seen the
     newest checkpoint a resume reads, every process refuses with the cause,
@@ -1371,6 +1372,7 @@ def test_a_pool_refuses_what_its_processes_do_not_share_before_any_trains(tmp_pa
     for rank, report in enumerate(reports):
         assert report["same"] is None and report["saved"] is None and report["latest"] == 2, report
         assert "training data differs between the processes" in report["content"], report
+        assert "training data differs between the processes" in report["named"], report
         assert all(source in report["count"] for source in report["counted"]), report
         assert "holds no rows" in report["first_read"], report
         assert "StopIteration" in report["eof"], report

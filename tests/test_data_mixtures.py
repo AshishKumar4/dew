@@ -41,6 +41,7 @@ from dew.data import (
     validation,
 )
 from dew.data.dataset import CAPTION, Dataset, GlobalStream, ramped, weight_counts
+from dew.data.plan import Manifest, Plan
 from dew.data.recipes import load
 from dew.data.steps.image import EncodeCaptions
 from dew.objectives.base import VALID_ROWS, Aux, Objective
@@ -744,7 +745,8 @@ def stitched_data(records: int, batch: int, seed: int) -> Dataset:
             mine = order[offset + partition.index::partition.count]
             return iter(mine.to_iter_dataset(pygrain.ReadOptions(1, 8)).batch(partition.rows(batch)))
 
-        return GlobalStream(open_at, batch, f"{records} records reshuffled from seed {seed}", READ)
+        order = {"records": records, "reshuffled from seed": seed}
+        return GlobalStream(open_at, batch, Plan("global", Manifest({}), order), READ)
 
     return Dataset(train=train, val=None, records=records, batch=batch)
 
