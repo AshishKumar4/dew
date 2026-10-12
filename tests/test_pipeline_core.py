@@ -16,7 +16,7 @@ import pytest
 from dew.data.cache import Cache
 from dew.data.compile import compile, iterate, publish
 from dew.data.dataset import DataPartition, Loading
-from dew.data.mix import SearchBudget, TokenDeficit, token_weights
+from dew.data.mixing import SearchBudget, TokenDeficit, token_weights
 from dew.data.pipeline import Artifact, Configured, Pipeline, Rejected
 from dew.data.plan import Manifest, Plan, StepIdentity, fingerprint
 from dew.data.sources import Files, Memory

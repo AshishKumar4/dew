@@ -136,7 +136,7 @@ class _HashSource:
         return dataclasses.replace(manifest, reader=functools.partial(self._reader, manifest))
 
     def _reader(self, manifest: ShardManifest, shard: Shard):
-        from dew.data.mix import Accepted
+        from dew.data.mixing import Accepted
 
         rows = manifest.reader(shard).map(_HashRows(self.low, self.high, self.held))
         return Accepted(rows, self.describe())

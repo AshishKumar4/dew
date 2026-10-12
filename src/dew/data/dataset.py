@@ -50,7 +50,7 @@ if not flags.FLAGS.is_parsed():
     flags.FLAGS.mark_as_parsed()
 
 if TYPE_CHECKING:
-    from dew.data.mix import CorpusCounts
+    from dew.data.mixing import CorpusCounts
     from dew.data.plan import Plan
 
 

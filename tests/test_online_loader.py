@@ -11,7 +11,7 @@ from dew.data import Loading, Memory, Rejected, images, video
 from dew.data.cache import Cache
 from dew.data.compile import compile, iterate, publish
 from dew.data.dataset import DataPartition
-from dew.data.mix import SearchBudget
+from dew.data.mixing import SearchBudget
 from dew.data.pipeline import Pipeline
 from dew.data.sources.urls import Fetch
 from dew.data.steps.image import DecodeImage, Resize
@@ -161,8 +161,8 @@ def test_fetched_bytes_published_once_train_and_resume_exactly_after_every_url_d
     exactly. A url that fails transiently would be fetched again, so it keeps a table from
     publishing; this one fails only permanently."""
     table = [row for row in web_table(tmp_path) if not str(row["url"]).endswith("gone.png")]
-    generation = publish(Pipeline(Memory(table)).filter_map(images.fetch(retries=0)), Cache(str(tmp_path / "cache")),
-                         read="indexed", loading=READ)
+    fetched = Pipeline(Memory(table)).filter_map(images.fetch(retries=0))
+    generation = publish(fetched, Cache(str(tmp_path / "cache")), read="indexed", loading=READ)
     originals = {row["label"]: np.asarray(Image.open(row["url"].removeprefix("file://")).convert("RGB"))
                  for row in table[:8]}
     for path in tmp_path.glob("*.png"):
