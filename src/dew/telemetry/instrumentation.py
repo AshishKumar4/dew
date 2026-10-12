@@ -314,6 +314,8 @@ class HloInstruction:
     op: str
     target: str
     """A custom call's target, empty for any other op."""
+    operands: tuple[str, ...]
+    """The names of the instructions it reads."""
     fused: frozenset[str]
     """The ops of the computations it calls, theirs included: a fusion's body."""
     recomputed: bool
@@ -355,8 +357,8 @@ def hlo_instructions(text: str | Iterable[str]) -> dict[str, HloInstruction]:
             called = [fused(each) for each in calls]
             ops = called[0][0] if len(called) == 1 else frozenset().union(*(each for each, _ in called))
             names = frozenset(instruction.traced).union(*(each for _, each in called))
-            found[name] = HloInstruction(instruction.op, target.group(1) if target else '', ops,
-                                         instruction.recomputed, names)
+            found[name] = HloInstruction(instruction.op, target.group(1) if target else '',
+                                         tuple(instruction.operands), ops, instruction.recomputed, names)
     computations.clear()
     return found
 

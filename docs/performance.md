@@ -1364,7 +1364,7 @@ The chunked delta rule's memory, 2026-10-10. Only the memory `S` crosses
 chunks; each chunk's output reads the state it entered and its corrected
 values. The `lax.scan` now carries `S` alone and the output is batched over
 every chunk after it, and on an sm80 GPU the recurrence is two Pallas kernels
-(`dew.nn.kernels.delta_chunks`, fla's `chunk_delta_h` design): one program a
+(the old `delta_chunks`, fla's `chunk_delta_h` design): one program a
 row-head and block of value columns walks its chunks with its slice of `S` on
 chip, forward and in reverse for the gradient. On a Colab A100 40GB at
 Qwen3.5-9B's widths (4 x 1280 tokens, 32 heads of 128, fp32 rule, default
@@ -1389,7 +1389,7 @@ A fused output lost at all nine tested tiles (c45), its forward and backward
 taking 24.02 ms against the preceding path's 9.33 at the default tile.
 The output stays in XLA.
 
-Fused prep did improve training (c46). `dew.nn.kernels.delta_prep` keeps the
+Fused prep did improve training (c46). The old `delta_prep` kept the
 key products and strictly lower solve on chip and saves one fp32 inverse
 for the backward (40 MiB here). Its 16-wide diagonal blocks use masked row
 reductions, then 16-to-32-to-64 merges use `X2 A21 X1`, the XLA inverse's
@@ -1406,10 +1406,20 @@ The rule's training time fell 10.1%, the mixer's 9.6%; fla's rule took
 1.36/3.61 ms. Temporary memory fell from 1254.8 to 1051.8 MiB for the rule
 and 1659.0 to 1387.7 for the mixer. Eighteen prep tiles did not beat the
 default 32-column, 4-warp, 2-stage tile (lowest repeat 8.25 ms). The single
-`KERNELS['gated_delta_rule'] = {'sm80': 'pallas'}` takes recurrence and prep
-together; other generations remain unmeasured, and KDA stays XLA. The
-whole rule's float64 RMS ratios were at most 1.002 at default precision
-and 1.324 at highest, with bitwise repeats.
+`KERNELS['gated_delta_rule'] = {'sm80': 'pallas'}` took recurrence and prep
+together. The whole rule's float64 RMS ratios were at most 1.002 at default
+precision and 1.324 at highest, with bitwise repeats.
+
+Both kernels are gone (2026-10-12). Dew's port of fla 0.5.2's nine kernels
+(`dew.nn.kernels.fla_gdn`) runs the gated delta rule on every GPU of sm80
+or later, on any heads, dtypes, chunk sizes and mesh, with keys up to 256
+wide in bf16 or fp16 and 128 in fp32 (`dew.nn.linear.fla_rule`). The XLA
+math stays for CPUs, TPUs, older GPUs, forward-mode traces, float64 and
+wider keys, and as the tests' oracle (`port_refusal` names the GPU cases).
+On a G4 the port's bf16 forward ran 1.32 and 1.18 ms at the 0.8B's (8 x
+3072 tokens, 16 key and 16 value heads of 128) and the 9B's (4 x 3072, 16
+and 32) shapes against fla's 2.66 and 2.37 (kernel lab `fwd` job,
+4653d4451).
 
 With canonical metadata the call is exactly the plain call. Its outputs are
 bitwise equal to the no-metadata forward, and its parameter gradients are

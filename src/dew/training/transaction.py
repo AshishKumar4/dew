@@ -358,9 +358,8 @@ class Transaction:
                 averaged = _chosen(self.objective.averages(current.updates),
                                    ema_update(averaged, params, self.objective.ema.decay(current.updates)),
                                    averaged)
-            compute = None if current.compute is None else narrowed(params, self.copies)
             return dataclasses.replace(current, variables=params, opt_state=opt_state, ema=averaged,
-                                       updates=current.updates + 1, compute=compute)
+                                       updates=current.updates + 1)
 
         if current.scale is None:
             return apply(current), native_finite, norm
@@ -439,6 +438,12 @@ class Transaction:
             numerical = dataclasses.replace(
                 numerical, accumulation=jax.lax.cond(pending.due, clear, retain, candidate))
         advanced = _chosen(accepted, numerical, state)
+        if advanced.compute is not None:
+            # The copies are the cast of whichever parameters were chosen, so
+            # they are cast after the choice. Choosing between the new and the
+            # old copies reads the old ones, two bytes a parameter that the
+            # update's fused pass otherwise never reads.
+            advanced = dataclasses.replace(advanced, compute=narrowed(advanced.variables, self.copies))
         if scale is not None:
             advanced = dataclasses.replace(advanced, scale=_advance_scale(scale, finite))
         counted = due & accepted
