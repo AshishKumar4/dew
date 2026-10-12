@@ -615,6 +615,23 @@ def test_pickled_arrayrecords_open_independent_readers(arrayrecord_paths):
         restored.close()
 
 
+def test_arrayrecords_refuse_a_mirror_without_room_for_the_read_width(arrayrecord_paths, tmp_path):
+    from dew.data.sources.records import ArrayRecords
+
+    shard = Store(f"memory://small-record-mirror-{uuid4().hex}/0.array_record")
+    shard.write(Path(arrayrecord_paths[0]).read_bytes())
+    source = ArrayRecords(
+        (shard.url,),
+        {"dewcache": {"cache_storage": str(tmp_path / "mirror"), "max_bytes": 1}},
+        counts=(8,),
+    )
+    try:
+        with pytest.raises(ValueError, match=rf"room for {Loading().threads} physical shards"):
+            source[0]
+    finally:
+        source.close()
+
+
 def test_jsonl_offset_index_is_mapped_and_reopened_instead_of_pickled_as_rows():
     import pickle
 
