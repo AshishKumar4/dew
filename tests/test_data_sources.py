@@ -794,6 +794,55 @@ def test_arrayrecords_release_an_idle_mirror_before_opening_its_replacement(
         source.close()
 
 
+def test_arrayrecords_queue_a_missing_shard_when_every_retained_reader_is_busy(arrayrecord_paths, monkeypatch):
+    import grain.python as grain
+
+    from dew.data.sources.records import ArrayRecords
+
+    source = ArrayRecords(arrayrecord_paths, counts=(8,) * len(arrayrecord_paths))
+    width = Loading().threads
+    entered = threading.Barrier(width + 1)
+    released, queued = threading.Event(), threading.Event()
+    lock = threading.Lock()
+    admitted = 0
+    underlying_read = grain.ArrayRecordDataSource.__getitem__
+    condition_wait = threading.Condition.wait
+
+    def held(reader, index):
+        nonlocal admitted
+        with lock:
+            ordinal = admitted
+            admitted += 1
+        if ordinal < width:
+            entered.wait(timeout=5)
+            assert released.wait(timeout=5)
+        return underlying_read(reader, index)
+
+    def waiting(condition, timeout=None):
+        if condition is source._lock:
+            queued.set()
+        return condition_wait(condition, timeout)
+
+    monkeypatch.setattr(grain.ArrayRecordDataSource, "__getitem__", held)
+    monkeypatch.setattr(threading.Condition, "wait", waiting)
+    try:
+        with ThreadPoolExecutor(width + 1) as pool:
+            pending = [pool.submit(source.__getitem__, 8 * shard) for shard in range(width)]
+            try:
+                entered.wait(timeout=5)
+                overflow = pool.submit(source.__getitem__, 8 * width)
+                assert queued.wait(timeout=5)
+                assert not overflow.done()
+            finally:
+                released.set()
+            assert [future.result(timeout=5) for future in pending] == [
+                f"{shard}:0".encode() for shard in range(width)
+            ]
+            assert overflow.result(timeout=5) == f"{width}:0".encode()
+    finally:
+        source.close()
+
+
 def test_jsonl_offset_index_is_mapped_and_reopened_instead_of_pickled_as_rows():
     import pickle
 
