@@ -47,6 +47,21 @@ SOURCE = """
 
     if __name__ == "__main__":
         logging.basicConfig()
+    else:
+        logging.basicConfig()
+    if __name__ != "__main__":
+        jax.config.update("jax_enable_x64", True)
+    try:
+        pass
+    finally:
+        os.environ["XLA_FLAGS"] = ""
+
+
+    class Configured:
+        jax.config.update("jax_enable_x64", True)
+
+        def method(self):
+            jax.config.update("jax_enable_x64", True)
 """
 
 
@@ -54,4 +69,4 @@ def test_import_time_writes_are_reported_and_called_ones_are_not(lint):
     source = textwrap.dedent(SOURCE)
     module = lint.Module(Path("src/dew/effects.py"), "src/dew/effects.py", source, ast.parse(source))
     lines = sorted(finding.line for finding in lint.imports(module))
-    assert lines == [9, 10, 12, 14, 16, 17]
+    assert lines == [9, 10, 12, 14, 16, 17, 29, 31, 35, 39]
