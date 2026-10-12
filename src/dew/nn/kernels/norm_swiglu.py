@@ -349,27 +349,35 @@ def _rms_backward(x_ref, scale_ref, gate_ref, inverse_ref, dy_ref, stream_ref, d
         row = (i * groups + group) * row_block + jnp.arange(row_block)
         at = (row[:, None], columns[None, :])
         mask = (row[:, None] < rows) & (columns[None, :] < width)
-        x = plgpu.load(x_ref.at[at], mask=mask, other=0).astype(jnp.float32)
-        dy = plgpu.load(dy_ref.at[at], mask=mask, other=0).astype(jnp.float32)
+
+        def streamed(ref):
+            # Read once and never again: first out of L2, so the weight and
+            # the partial sums stay. All three are issued before the row
+            # reduction waits on any of them.
+            return plgpu.load(ref.at[at], mask=mask, other=0, eviction_policy="evict_first")
+
+        x = streamed(x_ref).astype(jnp.float32)
+        dy = streamed(dy_ref).astype(jnp.float32)
+        ds = None if stream_ref is None else streamed(stream_ref)
         inverse = plgpu.load(inverse_ref.at[row], mask=row < rows, other=0)
         normalized = x * inverse[:, None]
         if after_cast:
             normalized = _round(normalized, dy_ref.dtype, interpret)
         if gate_ref is not None:
             # The gate's cotangent reads the weighted norm; the norm's, the gated one.
-            activated, slope = _activated(plgpu.load(gate_ref.at[at], mask=mask, other=0).astype(jnp.float32),
-                                          activation)
+            activated, slope = _activated(streamed(gate_ref).astype(jnp.float32), activation)
             dgate = dy * (normalized * weight) * slope
-            plgpu.store(dgate_ref.at[at], dgate.astype(dgate_ref.dtype), mask=mask)
+            plgpu.store(dgate_ref.at[at], dgate.astype(dgate_ref.dtype), mask=mask,
+                        eviction_policy="evict_first")
             dy = dy * activated
         m = dy * weight
         # The two x contributions are kept separate, as XLA's square VJP is.
         correction = (-0.5 * jnp.sum(m * x, axis=1)) * (inverse * inverse * inverse) * (1.0 / width)
         dx = m * inverse[:, None] + (2.0 * x) * correction[:, None]
-        if stream_ref is not None:
+        if ds is not None:
             # The stream's own cotangent joins in fp32, one rounding for the sum.
-            dx = dx + plgpu.load(stream_ref.at[at], mask=mask, other=0).astype(jnp.float32)
-        plgpu.store(dx_ref.at[at], dx.astype(dx_ref.dtype), mask=mask)
+            dx = dx + ds.astype(jnp.float32)
+        plgpu.store(dx_ref.at[at], dx.astype(dx_ref.dtype), mask=mask, eviction_policy="evict_first")
         if scale_ref is None:
             return accumulated
         # Every product exact as a pair, compensated (Neumaier) into the
