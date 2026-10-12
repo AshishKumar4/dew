@@ -8,11 +8,13 @@
 # Python 3.12 of a Linux GPU host. A host installs the one its driver reads: tools/install_environment.sh.
 # Usage, from the checkout: sh tools/lock_environment.sh
 set -eu
+# uv versions annotate locks differently, so one uv writes them wherever this runs.
 RESOLVED=2026-10-12T00:00:00Z
+UV=0.13.0
 lock() {
   name=$1
   shift
-  uv pip compile -q --no-header pyproject.toml --extra ci --extra tutorials --extra mutation -c constraints.txt \
+  uvx "uv@$UV" pip compile -q --no-header pyproject.toml --extra ci --extra tutorials --extra mutation -c constraints.txt \
     --exclude-newer "$RESOLVED" "$@" -o "locks/$name.txt"
 }
 lock cpu --universal --torch-backend cpu
