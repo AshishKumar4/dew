@@ -359,3 +359,20 @@ def test_torch_reference_keeps_whole_run_peak_beside_reset_window_peak(monkeypat
     assert window.peak_allocated == 300
     assert window.peak_reserved == 400
     assert window.whole_peak_allocated == 500
+
+
+def test_the_dew_qwen35_runner_trains_its_compiled_step(tmp_path, monkeypatch):
+    """The Dew side of the matched pair runs the trainer's compiled step as it returns: a tiny
+    Qwen3.5 backbone warms up, times and samples a step each, updating and staying finite."""
+    from types import SimpleNamespace
+
+    from dew.interop import translate_config
+
+    monkeypatch.syspath_prepend(str(REPO_ROOT / "tools" / "reference_runs"))
+    runner = load("reference_runs/dew_qwen35_step")
+    shapes = load("reference_runs/qwen35")
+    model = translate_config(shapes.config(smoke=True)).value.clone(remat=None)
+    args = SimpleNamespace(smoke=True, seed=17, work=tmp_path / "work.json", warmup=1, steps=1)
+    trainer, state, compiled, batch, _, _ = runner.compile_step(args, model, None)
+    seconds, _, samples, record = runner.train(args, trainer, state, compiled, batch)
+    assert seconds > 0 and len(samples) == 1 and record["finite_losses"]
