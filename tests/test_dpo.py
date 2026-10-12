@@ -6,7 +6,7 @@ must match TRL 1.12's DPO path with the defaults (`sigmoid` loss,
 tools/parity_dpo.py writes by running TRL's own `DPOTrainer._compute_loss`
 on fixed logits. `DPOObjective` composes that term with the
 chunked head's per-token log-probabilities, reading the reference from the
-frozen `step.ema`, and `PreferenceData` stacks the batches it trains on.
+frozen `step.ema`, and `Preferences` stacks the batches it trains on.
 """
 
 import json

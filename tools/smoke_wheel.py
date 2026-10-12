@@ -35,7 +35,7 @@ import jax, jax.numpy as jnp, numpy as np, optax
 import dew
 from dew import Trainer
 from dew.data import Loading
-from dew.config.data import TextData, loader
+from dew.config.data import Text, load
 from dew.nn.backbones import CausalTransformer
 from dew.objectives.lm import LMObjective
 

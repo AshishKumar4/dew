@@ -1,6 +1,6 @@
-"""PromptData for online RL: fixed-width rows and their reward context.
+"""Prompts for online RL: fixed-width rows and their reward context.
 
-A `PromptData` source encodes verl-layout rows into a left-padded `prompt` of
+A `Prompts` source encodes verl-layout rows into a left-padded `prompt` of
 `max_prompt_len` ids plus `prompt_length`, with `data_source`,
 `ground_truth` and `extra_info` riding along as fixed-width UTF-8 bytes, so
 every leaf survives the device transfer. These tests pin the encoding: the
@@ -306,7 +306,7 @@ def test_validation_is_one_pass_over_a_second_file(tmp_path):
 @pytest.mark.slow
 def test_the_train_stream_encodes_inside_workers():
     """The same rows through real worker processes: the source pickles, the
-    workers loader their own tokenizer copy, the batches match."""
+    workers load their own tokenizer copy, the batches match."""
     data = loader(PromptData(source=tuple(json.loads(row) for row in records({"prompt": IDS})),
         tokenizer=TOKENIZER, max_prompt_len=WINDOW, long="truncate"), batch=1, read="memory",
             loading=Loading(workers=1), validation_records=4 * (1))

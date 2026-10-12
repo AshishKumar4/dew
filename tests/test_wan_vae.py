@@ -381,7 +381,7 @@ def test_an_unsupported_config_is_refused(source, change):
 
 
 def test_a_video_run_denoises_wan_latents_and_samples_whole_clips(source):
-    """A VideoData recipe behind the Wan VAE denoises 1 + k latent frames
+    """A Video recipe behind the Wan VAE denoises 1 + k latent frames
     for clips of 1 + 4k, trains, and samples clips of the length it read."""
     import optax
     from diffusion_stubs import STUB_TEXT

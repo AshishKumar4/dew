@@ -1058,7 +1058,7 @@ def test_a_source_read_only_as_a_stream_packs_its_rows_as_they_arrive():
 
 
 def test_a_run_that_states_no_read_reads_as_its_sources_choose(tmp_path):
-    """RecordsData held in memory read from memory, a store that reads by index
+    """Records held in memory read from memory, a store that reads by index
     reads by index and a stream streams, when the run states no read; a read
     it states wins over each."""
     import pyarrow.parquet as pq

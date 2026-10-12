@@ -38,8 +38,8 @@ from dew.training import Checkpoints, Layout, Rollout, Trainer, TrainState
 class Stage:
     """One link: `data` trained for `steps` gradient steps.
 
-    The data decides the loss: `ChatData` trains SFT, `PreferenceData`
-    DPO and `PromptData` GRPO. `beta` is the DPO or GRPO KL strength, 0.1 for
+    The data decides the loss: `Chat` trains SFT, `Preferences`
+    DPO and `Prompts` GRPO. `beta` is the DPO or GRPO KL strength, 0.1 for
     DPO and 0.0 for GRPO when None; an SFT stage refuses one. A GRPO stage
     names its `reward` and sampling sizes, and refuses to run without a
     reward: a rollout no rule scores is steps in the dark.

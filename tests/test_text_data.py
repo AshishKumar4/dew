@@ -1,4 +1,4 @@
-"""TextData data for language models: tokenizers, the token-file source, the loader.
+"""Text data for language models: tokenizers, the token-file source, the loader.
 
 ByteTokenizer and the token sources are pure numpy; the HF tokenizer tests only
 run when a cached copy of the hub is reachable, matching the repo's policy
@@ -231,7 +231,7 @@ def test_the_ids_are_read_at_the_width_meta_json_records(tmp_path):
 
 
 # ---------------------------------------------------------------------------------
-# TextData
+# Text
 # ---------------------------------------------------------------------------------
 
 def test_token_loader_yields_int32_batches_with_one_overlap_token(tmp_path):
@@ -1326,7 +1326,7 @@ CORPUS = np.concatenate([np.asarray([*document, PACK_EOS], np.int64) for documen
 @pytest.fixture
 def stores(tmp_path):
     """The same corpus in every store, each split cut differently in each,
-    as the fields of a `TextData` over it.
+    as the fields of a `Text` over it.
 
     The pieces are deliberately unequal, so a window that crosses a record
     boundary has to be joined out of two of them; identical windows then say
