@@ -518,6 +518,7 @@ class Trainer(Generic[Loss, Effects]):
         self._display = TrainingDisplay()
         self._count_work = False
         self._refusal: str | None = None
+        self._unavailable_noted = False
         # The fit ladder's rung beyond the objective's own head and remat: a
         # step that fit only under XLA's default options keeps them for later
         # compiles. A resumed run starts at its checkpoint's rung, and says so
@@ -1526,7 +1527,7 @@ class Trainer(Generic[Loss, Effects]):
         # On a device with a known peak, the run counts its batches' work
         # for train/mfu while they can be counted (`_counted_batch`).
         self._count_work = gpu_target(started.device_kind).bf16_peak is not None
-        self._refusal = None
+        self._refusal, self._unavailable_noted = None, False
         self._report(started, current)
         # Read through the type that declares it: fit takes any object with a
         # Dataset's readers, and a held-out count is not one of them.
@@ -2072,19 +2073,19 @@ class Trainer(Generic[Loss, Effects]):
 
         The count is the capability: from the first batch whose work the
         model or objective cannot declare (`MissingFlopsCount`, as a media
-        row's tower), this process counts no more, notes the count's reason
-        once and trains on. Its batches keep their work columns, as unknown
-        work (`uncounted`), so every process runs one step program and the
-        step's global sum leaves train/mfu unreported pool-wide. One thread
-        prepares batches, the prefetch worker or a rollout's caller. A count
-        asked of the objective directly stays strict.
+        row's tower), this process counts no more, keeps the count's reason
+        for the log's note, and trains on. Its batches keep their work
+        columns, as unknown work (`uncounted`), so every process runs one
+        step program and the step's global sum leaves train/mfu unreported
+        pool-wide. One thread prepares batches, the prefetch worker or a
+        rollout's caller, and only it writes the reason. A count asked of the
+        objective directly stays strict.
         """
         if self._count_work and self._refusal is None:
             try:
                 return prepare_counts(self.objective, batch, count_model=True)
             except MissingFlopsCount as missing:
                 self._refusal = str(missing)
-                self._display.note(f"train/mfu is unavailable for {type(self.objective).__name__}: {missing}")
         counted = prepare_counts(self.objective, batch, count_model=False)
         return counted if self._refusal is None else uncounted(counted)
 
@@ -2229,12 +2230,12 @@ class Trainer(Generic[Loss, Effects]):
                            else None),
                 "rollout": {} if self.rollout is None else dict(_rollout_metrics(self.rollout))})
             work = read["training_flops"]
-            if work is not None and not math.isfinite(work) and self._refusal is None:
-                # Another process refused a count (`_counted_batch`); the global
-                # sum carried it here, and this process stops counting too.
-                self._refusal = "another process's batch could not be counted"
-                self._display.note(f"train/mfu is unavailable for {type(self.objective).__name__}: "
-                                   f"{self._refusal}")
+            if work is not None and not math.isfinite(work) and not self._unavailable_noted:
+                # A process refused a count (`_counted_batch`) and the global
+                # sum carried it here: this thread alone says so, once.
+                self._unavailable_noted = True
+                reason = self._refusal or "another process's batch could not be counted"
+                self._display.note(f"train/mfu is unavailable for {type(self.objective).__name__}: {reason}")
             scalars = {"train/loss": float(read["loss"]),
                        **{f"train/{k}": float(v) for k, v in read["aux"].items()},
                        **self._throughput(now - interval.last_log_time, interval.since_log,
