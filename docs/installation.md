@@ -117,9 +117,16 @@ uv pip install 'dewml[interop,streaming] @ git+https://github.com/AshishKumar4/d
 The `vision` extra expects CPU builds of PyTorch and torchvision, installed first, so that no CUDA PyTorch sits beside JAX's accelerator runtime. Without it the native multimodal checkpoints still load, but their processors raise an error when given images.
 
 ```bash
-uv pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+uv pip install --upgrade torch torchvision --index-url https://download.pytorch.org/whl/cpu
 uv pip install 'dewml[interop,vision] @ git+https://github.com/AshishKumar4/dew'
 ```
+
+Run the first command even if CPU torch is already installed. Installing `vision`
+from PyPI alone can add a CUDA-enabled torchvision beside it on Linux. Its
+torch requirement accepts the CPU build, but its extension cannot load and importing
+it fails with `operator torchvision::nms does not exist`. Resolving both from the
+CPU index gives them the same build flavor; `--upgrade` also replaces an existing
+torchvision from the wrong index. A package extra cannot select an index.
 
 The `profile` extra installs XProf 2.23.1 or a later release, never 2.23.2. XProf 2.23.2 declares `setuptools<70`, and PyTorch 2.13 and later declare `setuptools>=77.0.3`, so 2.23.2 can't be installed beside the `torch`, `vision`, `diffusers`, `torchax` or `test` extras. Don't upgrade XProf to 2.23.2 by hand in such an environment.
 
@@ -134,7 +141,7 @@ git clone https://github.com/AshishKumar4/dew.git
 cd dew
 uv venv --python 3.14
 source .venv/bin/activate
-uv pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+sh tools/install_host_torch.sh
 uv pip install -e '.[test,av,tfds,metrics,plots,inference-clients,serve,vision,quantization,profile]' -c constraints.txt
 ```
 

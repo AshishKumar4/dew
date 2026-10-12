@@ -116,6 +116,15 @@ def token_corpus(directory: Path, records: int, seq_len: int) -> Path:
     return write_token_corpus(directory, tokens, tokens, vocab_size=int(tokens.max()) + 1)
 
 
+@pytest.mark.distributed
+def test_a_real_token_budget_agrees_across_processes_after_logging_ticks(tmp_path):
+    corpus = token_corpus(tmp_path / "tokens", records=16, seq_len=4)
+    reports = run_pool("token_budget", tmp_path / "pool", 2, devices=1, tokens=corpus, timeout=60)
+    assert [report["step"] for report in reports] == [3, 3]
+    assert [report["updates"] for report in reports] == [3, 3]
+    assert [report["logged"] for report in reports] == [3, 0]
+
+
 def document_corpus(directory: Path, documents: int, length) -> Path:
     """A corpus whose documents each say which document they are.
 
@@ -203,6 +212,13 @@ def test_the_global_batch_is_the_union_of_the_process_slices(two_processes):
     assert not set(slices[0]) & set(slices[1]), "both processes hold the same rows"
     assert sorted(slices[0] + slices[1]) == list(range(worker.BATCH))
     assert slices[0] == list(range(worker.BATCH // 2)), "process 0 did not get its own rows"
+
+
+@pytest.mark.distributed
+def test_process_placement_owns_its_reader_buffer(two_processes):
+    for report in two_processes:
+        assert not report["aliases_reader"]
+        assert report["preserved_rows"] == report["local_rows"]
 
 
 # --------------------------------------------------------------------------

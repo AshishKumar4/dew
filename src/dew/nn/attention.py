@@ -294,7 +294,7 @@ def _xla_rms_normalized(x, scale, epsilon: float, dtype, scale_offset: bool, sca
 
 
 def rms_normalized(x, scale, epsilon: float, dtype, scale_offset: bool, scale_after_cast: bool,
-                   fp32_statistics: bool, *, implementation: str = 'auto'):
+                   fp32_statistics: bool, *, implementation: str = 'auto', axes=None):
     """Normalize the last axis and apply an optional vector weight.
 
     `scale_offset` adds one to the stored weight; `scale_after_cast` rounds
@@ -305,11 +305,51 @@ def rms_normalized(x, scale, epsilon: float, dtype, scale_offset: bool, scale_af
     narrow input, weight and per-row inverse RMS, not fp32 activations.
     Unsupported variants run the checkpointed XLA reference instead
     (`norm_swiglu.rms_kernel`), including float64 and input-dtype statistics.
+    `axes`, `x`'s logical axes, place the kernel's rows on a mesh; without
+    them a split mesh runs XLA.
     """
-    chosen = norm_swiglu.rms_kernel(implementation, x, scale, dtype, fp32_statistics)
+    return stream_rms_normalized(x, None, scale, epsilon, dtype, scale_offset, scale_after_cast,
+                                 fp32_statistics, implementation=implementation, axes=axes)[1]
+
+
+def stream_rms_normalized(x, branch, scale, epsilon: float, dtype, scale_offset: bool,
+                          scale_after_cast: bool, fp32_statistics: bool, *, implementation: str = 'auto',
+                          axes=None):
+    """A pre-norm block's seam: the residual stream `x` plus `branch` (None
+    adds nothing) and that stream's `rms_normalized`, as `(stream, normed)`.
+
+    The caller carries the returned stream on, so the fused kernel
+    (`norm_swiglu.stream_rms_norm`) owns both ends of the norm: its forward
+    reads the two addends once and writes the sum beside the norm, and its
+    reverse adds the stream's own cotangent to the norm's in the same pass.
+    XLA's add and norm are the portable path and the oracle.
+    """
+    chosen = norm_swiglu.rms_kernel(implementation, x, scale, dtype, fp32_statistics, branch=branch,
+                                    axes=axes)
     if chosen == 'pallas':
-        return norm_swiglu.rms_norm(x, scale, epsilon, dtype, scale_offset, scale_after_cast)
-    return _xla_rms_normalized(x, scale, epsilon, dtype, scale_offset, scale_after_cast, fp32_statistics)
+        return norm_swiglu.stream_rms_norm(x, branch, scale, epsilon, dtype, scale_offset, scale_after_cast,
+                                           axes=axes)
+    stream = x if branch is None else x + branch
+    return stream, _xla_rms_normalized(stream, scale, epsilon, dtype, scale_offset, scale_after_cast,
+                                       fp32_statistics)
+
+
+def gated_rms_normalized(x, gate, scale, epsilon: float, dtype, activation: str, *,
+                         implementation: str = 'auto', axes=None):
+    """Qwen3-Next's gated norm (`Qwen3NextRMSNormGated`,
+    modeling_qwen3_next.py:57-74): `x` normalized in fp32, times `scale`,
+    times `activation(gate)` ('silu' or 'sigmoid'), cast once to `dtype`.
+    The fused kernel (`norm_swiglu.gated_rms_norm`) reads both inputs once a
+    pass; XLA's arithmetic is the portable path and the oracle. `axes`, the
+    inputs' logical axes, place the kernel's rows on a mesh.
+    """
+    chosen = norm_swiglu.gated_rms_kernel(implementation, x, gate, scale, dtype, activation, axes=axes)
+    if chosen == 'pallas':
+        return norm_swiglu.gated_rms_norm(x, gate, scale, epsilon, dtype, activation, axes=axes)
+    wide = at_least_fp32(x.dtype)
+    y = unweighted_rmsnorm(x.astype(wide), epsilon, implementation='xla') * scale.astype(wide)
+    gate = gate.astype(wide)
+    return (y * (jax.nn.silu(gate) if activation == 'silu' else jax.nn.sigmoid(gate))).astype(dtype)
 
 
 @functools.partial(normalized_in_fp32, static_argnums=(3, 4))
@@ -380,15 +420,23 @@ class RMSNorm(nn.Module):
     dtype: Dtype | None = None
     implementation: str = 'auto'
 
+    def __call__(self, x, *, axes=None):
+        """The norm of `x`. `axes`, `x`'s logical axes, place the fused kernel on a mesh."""
+        return self.seam(x, axes=axes)[1]
+
     @nn.compact
-    def __call__(self, x):
+    def seam(self, x, branch=None, *, axes=None):
+        """A pre-norm block's residual seam: `(stream, normed)` for the stream
+        `x + branch` (`x` for a None branch) and its norm, whose fused kernel
+        owns the add and the stream's cotangent (`stream_rms_normalized`)."""
         dtype = self.dtype if self.dtype is not None else x.dtype
         scale = self.param(
             'scale',
             nn.initializers.zeros if self.scale_offset else nn.initializers.ones,
             (x.shape[-1],), jnp.float32) if self.with_scale else None
-        return rms_normalized(x, scale, self.epsilon, dtype, self.scale_offset,
-                              self.scale_after_cast, self.fp32_statistics, implementation=self.implementation)
+        return stream_rms_normalized(x, branch, scale, self.epsilon, dtype, self.scale_offset,
+                                     self.scale_after_cast, self.fp32_statistics,
+                                     implementation=self.implementation, axes=axes)
 
 
 class LayerNorm(nn.Module):
@@ -828,22 +876,46 @@ def triton_runs(query, sliding_window=None, mask=None, bias=None) -> bool:
 
 
 FLASH_MAX_HEAD_DIM = 256
-# Its backward takes heads up to 192 wide off sm80: "FlashAttention backward for head dim > 192
-# requires A100/A800 or H100/H800", measured on an RTX 4080.
+# Its backward takes heads up to 192 wide on sm8x parts other than sm80: "FlashAttention backward for
+# head dim > 192 requires A100/A800 or H100/H800", measured on an RTX 4080.
 FLASH_MAX_BACKWARD_HEAD_DIM = 192
+
+
+def flash_architectures() -> tuple[str, ...] | None:
+    """The GPU generations the installed dew_flash_attn holds code for, as the wheel reports them
+    (its build's CUDA architectures), or None where it is not installed. A wheel from before it
+    reported them, 0.1.0, holds sm80's alone."""
+    if importlib.util.find_spec('dew_flash_attn') is None:
+        return None
+    return _reported_architectures(importlib.import_module('dew_flash_attn'))
+
+
+def _reported_architectures(wheel) -> tuple[str, ...]:
+    """The boundary with an installed dew_flash_attn: the architectures it reports, or sm80's alone
+    for 0.1.0, which predates the report."""
+    return getattr(wheel, 'ARCHITECTURES', ('sm80',))
+
+
+def flash_built_for(generation: str, architectures: tuple[str, ...]) -> bool:
+    """Whether a wheel built for `architectures` holds code `generation` runs: its own, or sm80's on
+    any 8.x part, which runs it."""
+    return generation in architectures or (generation.startswith('sm8') and 'sm80' in architectures)
 
 
 def flash_refusal(query, key, causal=False, sliding_window=None, mask=None, bias=None, softcap=None,
                   sinks=None) -> str | None:
     """Why 'auto' does not send a call to FlashAttention-2 (`flash_attention`),
     or None where it does: the GPU's target row names it, the query is bf16
-    or fp16 with heads a multiple of 8 up to 256 wide (192 off sm80, whose
-    backward alone takes wider ones), a causal call is square, the call has
-    no window, mask, bias, softcap or sinks, no deterministic ops are asked
-    for, which its backward's atomic sum of the query gradient would not
-    keep, and dew_flash_attn is installed."""
+    or fp16 with heads a multiple of 8 up to 256 wide (192 on sm8x parts other
+    than sm80, whose backward takes no wider), a causal call is square, the
+    call has no window, mask, bias, softcap or sinks, no deterministic ops are
+    asked for, which its backward's atomic sum of the query gradient would
+    not keep, and the installed dew_flash_attn holds code for this GPU."""
     head_dim = query.shape[-1]
-    widest = FLASH_MAX_HEAD_DIM if device_generation() == 'sm80' else FLASH_MAX_BACKWARD_HEAD_DIM
+    generation = device_generation()
+    architectures = flash_architectures()
+    narrow = generation.startswith('sm8') and generation != 'sm80'
+    widest = FLASH_MAX_BACKWARD_HEAD_DIM if narrow else FLASH_MAX_HEAD_DIM
     return first_refusal(
         (jax.default_backend() == 'gpu' and measured_kernel('attention', 'cudnn') == 'flash',
          "its target row names it for no other device"),
@@ -856,7 +928,9 @@ def flash_refusal(query, key, causal=False, sliding_window=None, mask=None, bias
         (softcap is None, "the call has a logit softcap"),
         (sinks is None, "the call has attention sinks"),
         (not deterministic_ops_requested(), "--xla_gpu_deterministic_ops is set"),
-        (importlib.util.find_spec('dew_flash_attn') is not None, "dew_flash_attn is not installed"),
+        (architectures is not None, "dew_flash_attn is not installed"),
+        (architectures is None or flash_built_for(generation, architectures),
+         f"the installed dew_flash_attn holds no code for {generation}"),
     )
 
 
@@ -864,16 +938,16 @@ def flash_attention(query, key, value, causal: bool):
     """FlashAttention-2 (dew_flash_attn, kernels/flash_attn) over `[B, S, H, D]`
     arrays at jax.nn's default scale. Its causal mask is aligned to the last
     key, where jax.nn's is aligned to the first, so a causal call is square.
-    On a mesh it runs per shard, as `triton_attention` does. The wheel holds
-    sm80 code alone, which compute capability 8.x runs and no other does."""
+    On a mesh it runs per shard, as `triton_attention` does. It runs where
+    the installed wheel holds code for the device (`flash_built_for`)."""
     generation = device_generation()
-    if not generation.startswith('sm8'):
-        raise ValueError(f"FlashAttention-2 is built for sm8x and this device is {generation}; "
-                         "use attention_impl 'cudnn' or 'xla'")
-    try:
-        flash = importlib.import_module('dew_flash_attn')
-    except ImportError as e:
-        raise ValueError("attention 'flash' needs dew_flash_attn (docs/installation.md)") from e
+    architectures = flash_architectures()
+    if architectures is None:
+        raise ValueError("attention 'flash' needs dew_flash_attn (docs/installation.md)")
+    if not flash_built_for(generation, architectures):
+        raise ValueError(f"the installed dew_flash_attn holds code for {', '.join(architectures)} and this "
+                         f"device is {generation}; use attention_impl 'cudnn' or 'xla'")
+    flash = importlib.import_module('dew_flash_attn')
 
     def local(query, key, value):
         return flash.flash_mha(query, key, value, is_causal=causal)
@@ -1138,18 +1212,21 @@ FOLDED_PAIRS = 16
 
 def folds(query, key, bias, mask, causal, sliding_window) -> bool:
     """Whether an xla call goes to `folded_attention`: on a GPU, a call of
-    few query positions over keys of the query's heads, masked by key
-    lengths at most, such as a decode step's grouped query
-    (`CausalSelfAttention._decode_attention`) where cudnn does not run."""
+    few query positions over keys of the query's heads, masked at most by a
+    mask every head shares (key lengths are one), such as a decode step's
+    grouped query (`CausalSelfAttention._decode_attention`) where cudnn does
+    not run."""
     return (generation.backend() == 'gpu' and query.shape[-2] == key.shape[-2]
             and query.shape[-3] * key.shape[-2] <= FOLDED_PAIRS
-            and bias is None and mask is None and not causal and sliding_window is None)
+            and (mask is None or (mask.ndim == 4 and mask.shape[1] == 1))
+            and bias is None and not causal and sliding_window is None)
 
 
-def folded_attention(query, key, value, key_value_seq_lengths):
+def folded_attention(query, key, value, mask=None):
     """jax.nn's xla attention for query `[B, T, N, D]` over keys and values
     `[B, S, N, D]` of the same heads, with every query head against every
-    (key, head) pair.
+    (key, head) pair, under a boolean `mask` `[B, 1, T | 1, S]` every head
+    shares (key lengths come as the mask they mean, `with_key_lengths`).
 
     XLA's GPU products take each head's keys apart, so jax.nn's attention
     transposed the whole cache, keys and values, at every decode step where
@@ -1172,8 +1249,8 @@ def folded_attention(query, key, value, key_value_seq_lengths):
                         preferred_element_type=wide)
     logits = jnp.diagonal(logits.reshape(batch, positions, heads, keys, heads), axis1=2, axis2=4)
     logits = logits * jnp.asarray(1 / math.sqrt(width), wide)  # [B, T, S, N]
-    if key_value_seq_lengths is not None:
-        valid = jnp.arange(keys)[None, None, :, None] < key_value_seq_lengths[:, None, None, None]
+    if mask is not None:
+        valid = jnp.broadcast_to(mask[:, 0], (batch, positions, keys))[..., None]
         logits = jnp.where(valid, logits, jnp.asarray(-0.7 * jnp.finfo(jnp.float32).max, wide))
     probs = jax.nn.softmax(logits.astype(jnp.float32), axis=2).astype(value.dtype)
     # Each query head's probabilities over its own head's keys, zeros elsewhere.
@@ -1247,11 +1324,14 @@ def fused_attention(query, key, value, bias, mask, causal, sliding_window, imple
                              "Use attention_impl 'xla'.")
         attend = triton_attention if implementation == 'triton' else flash_attention
         out = attend(query, key, value, causal)
-    elif (implementation == 'xla' and folds(query, key, bias, mask, causal, sliding_window)
+    elif (implementation == 'xla' and mask is None and folds(query, key, bias, mask, causal, sliding_window)
           and key_value_seq_lengths is not None and decode_attention.fits(query, key)):
         out = decode_attention.attend(query, key, value, key_value_seq_lengths)
     elif implementation == 'xla' and folds(query, key, bias, mask, causal, sliding_window):
-        out = folded_attention(query, key, value, key_value_seq_lengths)
+        # Key lengths and the prefix mask they mean take one path here, so where no lengths-only
+        # kernel takes the call the two forms agree bitwise.
+        out = folded_attention(query, key, value, mask if key_value_seq_lengths is None
+                               else with_key_lengths(mask, key_value_seq_lengths, key.shape[-3]))
     elif implementation == 'xla':
         # A window of (l, r) keeps the l keys before the query and the r after
         # it on both the xla and the cudnn path, the sides `window_sides` counts.
