@@ -1374,21 +1374,19 @@ def test_a_hub_tokenizer_runs_the_revision_its_identity_names(monkeypatch, tmp_p
     from dew.data.steps.text import Tokenize
     from dew.data.text import load_tokenizer
 
-    files = tmp_path / "snapshot"
+    # The Hub cache keeps a commit's files in a directory named for it.
+    files = tmp_path / "snapshots" / ("a" * 40)
     shutil.copytree(Path(__file__).parent / "fixtures" / "tokenizers" / "gpt2", files)
     resolved = []
 
-    class Hub:
-        def model_info(self, repo, revision=None):
-            resolved.append(repo)
-            return type("Info", (), {"sha": "a" * 40})()
+    def download(repo, revision, allow_patterns, local_files_only):
+        resolved.append((repo, revision))
+        return str(files)
 
-    monkeypatch.setattr(huggingface_hub, "HfApi", Hub)
-    monkeypatch.setattr(huggingface_hub, "snapshot_download",
-                        lambda repo, revision, allow_patterns: str(files))
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", download)
     step = Tokenize("acme/tokenizer")
     assert step.dependencies()["tokenizer"]["revision"] == "a" * 40
     sent = pickle.loads(pickle.dumps(step))
     encoded = [int(token) for token in sent.map({"text": "hello there"})["text"]]
     assert encoded == load_tokenizer(str(files), local_files_only=True).encode("hello there")
-    assert resolved == ["acme/tokenizer"]
+    assert resolved == [("acme/tokenizer", None)]

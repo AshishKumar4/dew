@@ -23,7 +23,7 @@ from collections.abc import Mapping
 import numpy as np
 
 from .chat import Conversation, render_prompt
-from .text import PinnedTokenizer
+from .text import ByteTokenizer, HFTokenizer
 
 PROMPT_KEY = "prompt"
 """Batch key the prompts pipeline left-pads `[B, max_prompt_len]` ids under."""
@@ -81,7 +81,7 @@ def _ground_truth(row: Mapping[str, object], where: str) -> str:
     return _text(nested.get("ground_truth"))
 
 
-def _prompt_ids(tokenizer: PinnedTokenizer, prompt: object, tools: object, origin: str,
+def _prompt_ids(tokenizer: ByteTokenizer | HFTokenizer, prompt: object, tools: object, origin: str,
                 thinking: bool | None) -> list[int]:
     """Encodes a prompt, retaining structured messages until text rendering.
 
@@ -98,12 +98,16 @@ def _prompt_ids(tokenizer: PinnedTokenizer, prompt: object, tools: object, origi
             raise ValueError(f"{origin}: tools require chat messages, not a plain string")
         if not prompt.strip():
             raise ValueError(f"{origin}: the prompt is blank")
-        ids = tokenizer.load().encode(prompt, add_special_tokens=False)
+        ids = tokenizer.encode(prompt, add_special_tokens=False)
     elif isinstance(prompt, list):
         ids = [token for token in prompt if isinstance(token, int)]
         if len(ids) != len(prompt):
             conversation = Conversation.parse(prompt, tools, origin)
-            ids = render_prompt(tokenizer.transformers(), conversation, origin, thinking)
+            if not isinstance(tokenizer, HFTokenizer):
+                raise ValueError(
+                    f"{origin}: chat templates need a Hugging Face tokenizer, not the byte vocabulary"
+                )
+            ids = render_prompt(tokenizer.tokenizer, conversation, origin, thinking)
         elif tools is not None:
             raise ValueError(f"{origin}: tools require chat messages, not pretokenized ids")
     else:

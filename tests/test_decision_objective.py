@@ -145,6 +145,38 @@ EXAMPLES = [Example(state, {"team": INTENT}, {"team": label})
                                  ("double charge", "billing"), ("cannot log in", "technical"))]
 
 
+def test_a_hub_tokenizer_lays_rows_out_from_the_revision_its_identity_names(monkeypatch, tmp_path):
+    """A decision step holds an HFTokenizer, which resolves a hub name once:
+    the step's identity hashes the files of the resolved revision, and the
+    step lays its rows out from those same files, here and in a worker it is
+    pickled to, never from the name again."""
+    import pickle
+    import shutil
+
+    import huggingface_hub
+
+    from dew.data.plan import StepIdentity
+    from dew.data.text import HFTokenizer
+
+    # The Hub cache keeps a commit's files in a directory named for it.
+    files = tmp_path / "snapshots" / ("a" * 40)
+    shutil.copytree(Path(__file__).parent / "fixtures" / "tokenizers" / "gpt2", files)
+    resolved = []
+
+    def download(repo, revision, allow_patterns, local_files_only):
+        resolved.append((repo, revision))
+        return str(files)
+
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", download)
+    encoding = Encoding(LAYOUT, HFTokenizer("acme/tokenizer"), SPECIALS, width=4)
+    assert StepIdentity.of(encoding).dependencies["tokenizer"]["revision"] == "a" * 40
+    sent = pickle.loads(pickle.dumps(encoding))
+    local = Encoding(LAYOUT, HFTokenizer(str(files)), SPECIALS, width=4)
+    np.testing.assert_array_equal(sent(EXAMPLES[0], ("team",), None)["tokens"],
+                                  local(EXAMPLES[0], ("team",), None)["tokens"])
+    assert resolved == [("acme/tokenizer", None)]
+
+
 def test_an_encoding_shuffles_a_choice_and_moves_its_label_with_it():
     encoding = Encoding(LAYOUT, TOKENIZER, SPECIALS, width=4)
     rng = np.random.default_rng(0)
