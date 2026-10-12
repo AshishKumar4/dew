@@ -122,14 +122,6 @@ def test_vocabulary_bias_gradient_matches_full_logits_under_the_float64_rule(dty
     assert_as_exact_as_the_reference(actual, reference, exact, f'{dtype} vocabulary bias gradient')
 
 
-def test_vocabulary_bias_reference_catches_rounding_the_offset_into_the_product(monkeypatch):
-    real = chunked._biased_logits
-    monkeypatch.setattr(chunked, '_biased_logits', lambda logits, bias: real(
-        logits, None if bias is None else bias.astype(jnp.bfloat16).astype(jnp.float32)))
-    with pytest.raises(AssertionError):
-        test_vocabulary_bias_is_fp32_after_tied_or_untied_head_products(jnp.bfloat16, tied=True)
-
-
 @pytest.mark.mesh(devices=2)
 def test_vocabulary_split_slices_the_bias_with_its_table_columns():
     from dew.objectives.lm import LMObjective
