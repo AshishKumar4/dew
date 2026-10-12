@@ -356,12 +356,14 @@ def gated_rms_normalized(x, gate, scale, epsilon: float, dtype, activation: str,
     return (y * (jax.nn.silu(gate) if activation == 'silu' else jax.nn.sigmoid(gate))).astype(dtype)
 
 
-def _moment_normalized(x, scale, bias, axes: tuple[int, ...], epsilon: float, statistics):
-    """`x` normalized over `axes` op for op as flax computes it, in fp32 or
-    wider (`statistics`, at least fp32): E[x] and E[x^2] reduced, the
-    variance their difference clipped at zero, the weight folded into the
-    inverse deviation before it meets the centered activations. `scale` and
-    `bias` (None for none) broadcast against `x`'s trailing axes."""
+def _moment_normalized(x, scale, bias, axes: tuple[int, ...], epsilon: float, requested):
+    """`x` normalized over `axes` op for op as flax computes it, reduced in
+    the module's `requested` dtype, else `x`'s, at least fp32
+    (flax.linen.normalization._compute_stats): E[x] and E[x^2], the variance
+    their difference clipped at zero, the weight folded into the inverse
+    deviation before it meets the centered activations. `scale` and `bias`
+    (None for none) broadcast against `x`'s trailing axes."""
+    statistics = at_least_fp32(x.dtype if requested is None else requested)
     reduced = x.astype(statistics)
     mean = jnp.mean(reduced, axis=axes, keepdims=True)
     variance = jnp.maximum(0.0, jnp.mean(jax.lax.square(reduced), axis=axes, keepdims=True)
@@ -375,24 +377,24 @@ def _moment_normalized(x, scale, bias, axes: tuple[int, ...], epsilon: float, st
 
 
 @functools.partial(normalized_in_fp32, static_argnums=(3, 4, 5, 6, 7))
-def group_normalized(x, scale, bias, groups: int, epsilon: float, activation, statistics, dtype):
+def group_normalized(x, scale, bias, groups: int, epsilon: float, activation, requested, dtype):
     """`x` `[batch, ..., channels]` normalized over each of `groups` channel
     groups and every axis but the batch, as flax's `GroupNorm`
     (`_moment_normalized`). `activation` (None for none) runs on the result
     before its one cast to `dtype`."""
     grouped = x.reshape(*x.shape[:-1], groups, x.shape[-1] // groups)
     affine = [None if value is None else value.reshape(grouped.shape[-2:]) for value in (scale, bias)]
-    y = _moment_normalized(grouped, *affine, (*range(1, x.ndim - 1), x.ndim), epsilon, statistics)
+    y = _moment_normalized(grouped, *affine, (*range(1, x.ndim - 1), x.ndim), epsilon, requested)
     y = y.reshape(x.shape)
     return (y if activation is None else activation(y)).astype(dtype)
 
 
 @functools.partial(normalized_in_fp32, static_argnums=(3, 4, 5))
-def layer_normalized(x, scale, bias, epsilon: float, statistics, dtype):
+def layer_normalized(x, scale, bias, epsilon: float, requested, dtype):
     """Normalize `x` over its last axis as flax's `LayerNorm`
     (`_moment_normalized`). `scale` and `bias` of None are the affine-free
     norm."""
-    return _moment_normalized(x, scale, bias, (-1,), epsilon, statistics).astype(dtype)
+    return _moment_normalized(x, scale, bias, (-1,), epsilon, requested).astype(dtype)
 
 
 def l2_normalized(x, eps: float = 1e-12):
@@ -484,9 +486,7 @@ class LayerNorm(nn.Module):
                            self.param_dtype) if self.use_scale else None
         bias = self.param('bias', nn.initializers.zeros, width,
                           self.param_dtype) if self.use_bias else None
-        # flax reduces in the module's dtype, else the input's, at least fp32.
-        statistics = at_least_fp32(x.dtype if self.dtype is None else self.dtype)
-        return layer_normalized(x, scale, bias, self.epsilon, statistics,
+        return layer_normalized(x, scale, bias, self.epsilon, self.dtype,
                                 canonicalize_dtype(x, scale, bias, dtype=self.dtype))
 
 
@@ -513,8 +513,7 @@ class GroupNorm(nn.Module):
         width = (x.shape[-1],)
         scale = self.param('scale', nn.initializers.ones, width, self.param_dtype)
         bias = self.param('bias', nn.initializers.zeros, width, self.param_dtype)
-        statistics = at_least_fp32(x.dtype if self.dtype is None else self.dtype)
-        return group_normalized(x, scale, bias, self.num_groups, self.epsilon, self.activation, statistics,
+        return group_normalized(x, scale, bias, self.num_groups, self.epsilon, self.activation, self.dtype,
                                 canonicalize_dtype(x, scale, bias, dtype=self.dtype))
 
 

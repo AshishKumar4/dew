@@ -844,9 +844,10 @@ def test_group_norm_activates_its_wide_output_before_its_one_cast(rng, dtype):
     params = ours.init(rng, x)
     wide = nn.swish(nn.GroupNorm(4).apply(params, x.astype(jnp.float32)))
     assert jnp.array_equal(ours.apply(params, x), wide.astype(dtype))
-    seed = jax.random.normal(rng, x.shape, dtype)
-    graph = str(jax.make_jaxpr(jax.grad(lambda x: jnp.sum(ours.apply(params, x) * seed)))(x))
-    assert "remat" in graph or "checkpoint" in graph
+    # The pullback holds the input as it arrived, no wider activation.
+    _, pullback = jax.vjp(lambda x: ours.apply(params, x), x)
+    held = [leaf for leaf in jax.tree.leaves(pullback) if leaf.size == x.size]
+    assert held and {leaf.dtype for leaf in held} == {x.dtype}
 
 
 @pytest.mark.parametrize('use_scale,use_bias', [(False, False), (True, False), (True, True)])
