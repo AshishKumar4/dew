@@ -74,7 +74,7 @@ def test_the_platform_is_the_placements():
 
 
 def test_a_platform_keyed_choice_takes_the_assumed_gpus_path():
-    """On this CPU, jax.nn's xla attention sums a long fp32 value product in one chain, so 'auto' takes
+    """On a CPU, jax.nn's xla attention sums a long fp32 value product in one chain, so 'auto' takes
     the reference path, and an explicit Pallas grouped matmul interprets. Under an assumed T4 both
     act as on the GPU: the xla path, and XLA's ragged dot, as a T4 compiles no Triton kernel."""
     from dew.nn.attention import VALUE_BLOCK, _xla_kernel_chains
@@ -82,11 +82,12 @@ def test_a_platform_keyed_choice_takes_the_assumed_gpus_path():
 
     query, key = jnp.zeros((1, 8, 2, 64)), jnp.zeros((1, VALUE_BLOCK + 1, 2, 64))
     operands = (jnp.bfloat16, jnp.bfloat16)
-    assert _xla_kernel_chains(query, key)
-    assert grouped_matmul_kernel('pallas', jnp.bfloat16, operands, None) == 'pallas'
-    with assumed('sm75'):
-        assert not _xla_kernel_chains(query, key)
-        assert grouped_matmul_kernel('pallas', jnp.bfloat16, operands, None) == 'xla'
+    with jax.default_device(jax.devices('cpu')[0]):
+        assert _xla_kernel_chains(query, key)
+        assert grouped_matmul_kernel('pallas', jnp.bfloat16, operands, None) == 'pallas'
+        with assumed('sm75'):
+            assert not _xla_kernel_chains(query, key)
+            assert grouped_matmul_kernel('pallas', jnp.bfloat16, operands, None) == 'xla'
 
 
 def test_the_gpu_mesh_keeps_the_axes_over_the_generations_devices():
@@ -138,14 +139,15 @@ def _doubled(x):
 
 
 def test_a_kernel_traced_for_an_assumed_gpu_lowers_to_a_named_triton_call():
-    """Traced under an assumed A100 on that GPU's mesh, a kernel lowers on this CPU to one Triton call,
-    by its name; traced for the CPU it interprets, and calls none."""
+    """Traced under an assumed A100 on that GPU's mesh, a kernel lowers on any host to one Triton call,
+    by its name; traced for a CPU it interprets, and calls none."""
     x = jax.ShapeDtypeStruct((64,), jnp.float32)
     mesh = gpu_mesh(Mesh(np.array(jax.devices()[:1]), ('data',)), 'sm80')
     with assumed('sm80'), jax.sharding.use_abstract_mesh(mesh):
         lowered = jax.jit(_doubled).trace(x).lower(lowering_platforms=('cuda',))
     assert triton_kernels(lowered) == {"doubled": 1}
-    assert triton_kernels(jax.jit(_doubled).lower(x)) == {}
+    with jax.default_device(jax.devices('cpu')[0]):
+        assert triton_kernels(jax.jit(_doubled).lower(x)) == {}
 
 
 # The Triton kernels each Pallas choice a KERNELS row can name lowers to, by their `pallas_call` names,
