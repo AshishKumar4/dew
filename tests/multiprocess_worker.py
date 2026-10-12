@@ -517,7 +517,7 @@ def restored_state(trainer):
 def mode_token_budget(args) -> dict:
     from dew.data import TokenWindows
 
-    trainer = lm_trainer(args.name, args.out.parent, seq_len=4)
+    trainer = token_trainer(args.name, args.out.parent, fsdp=1, seq_len=4)
     trainer.checkpoints = None
     tracker = LossRecorder()
     trainer.tracker = tracker
