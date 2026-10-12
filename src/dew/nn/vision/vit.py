@@ -221,10 +221,11 @@ class VisionTransformer(nn.Module):
         for index in range(lay.depth):
             wanted = lay.order[index]
             if wanted != current:
-                back = None if orders[current] is None else jnp.argsort(orders[current], axis=1)
-                step = orders[wanted] if back is None else (
-                    back if orders[wanted] is None else jnp.take_along_axis(back, orders[wanted], axis=1))
-                hidden = _gather(hidden, step)
+                leaving, entering = orders[current], orders[wanted]
+                if leaving is not None:
+                    back = jnp.argsort(leaving, axis=1)
+                    entering = back if entering is None else jnp.take_along_axis(back, entering, axis=1)
+                hidden = _gather(hidden, entering)
                 current = wanted
             order = orders[current]
             segment = _gather(segments[lay.attention[index]], order)
@@ -239,8 +240,9 @@ class VisionTransformer(nn.Module):
                 hidden, segment_ids=segment, attention_metadata=metadata)
             # A block without hyper-connections hands on the plain residual.
             assert isinstance(hidden, jax.Array)
-        if orders[current] is not None:
-            hidden = _gather(hidden, jnp.argsort(orders[current], axis=1))
+        leaving = orders[current]
+        if leaving is not None:
+            hidden = _gather(hidden, jnp.argsort(leaving, axis=1))
         if lay.post_norm:
             hidden = outer(name="post_norm")(hidden)
         if not lay.merge_blocks and merge > 1:

@@ -163,8 +163,9 @@ def translate_muse_glimmer_vision_config(hf_config: Mapping[str, object]) -> Rec
         raise ValueError(f"hidden_act {activation!r} is not expressible: the trunk runs "
                          f"{', '.join(TOWER_ACTIVATIONS)}")
     layers = records.integer(vision["num_hidden_layers"], "num_hidden_layers")
-    kinds = vision.get("layer_types") or ["full_attention" if (i + 1) % 4 == 0 or i == layers - 1
-                                          else "window_attention" for i in range(layers)]
+    default = ["full_attention" if (i + 1) % 4 == 0 or i == layers - 1 else "window_attention"
+               for i in range(layers)]
+    kinds = records.strings(vision.get("layer_types") or default, "layer_types")
     unknown = sorted(set(kinds) - {"full_attention", "window_attention"})
     if unknown:
         raise ValueError(f"layer_types {unknown} are neither window_attention nor full_attention")
@@ -181,7 +182,7 @@ def translate_muse_glimmer_vision_config(hf_config: Mapping[str, object]) -> Rec
         "pos_emb_width": records.integer(vision.get("pos_emb_width", 32), "pos_emb_width"),
         "layer_norm_eps": records.number(vision.get("layer_norm_eps", 1e-5), "layer_norm_eps"),
         "rope_theta": records.number(rope.get("rope_theta", 10000.0), "rope_theta"),
-        "layer_types": tuple(str(kind) for kind in kinds),
+        "layer_types": kinds,
     }}
 
 

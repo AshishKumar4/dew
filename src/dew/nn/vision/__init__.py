@@ -5,7 +5,8 @@ transformers 5 ships no Flax classes, so the towers are vendored the way
 weight read from the checkpoint's safetensors under its reference tensor name.
 The operation order follows transformers 5.16.1
 `models/siglip/modeling_siglip.py`, `models/llama4/modeling_llama4.py`,
-`models/gemma4/modeling_gemma4.py` and `models/qwen3_5/modeling_qwen3_5.py`.
+`models/gemma4/modeling_gemma4.py`, `models/qwen3_5/modeling_qwen3_5.py` and
+`models/muse_glimmer/modeling_muse_glimmer.py`, and MiMo-V2.6's `modeling_mimo_v2.py`.
 
 The SigLIP trunk is patch convolution with bias, learned position embeddings
 with no class token, pre-norm encoder blocks and a post layer norm. Its block
@@ -18,9 +19,11 @@ token dropped, and the pixel-shuffle MLP inside the tower where the reference
 keeps it. The Gemma 4 trunk is patch pixels scaled to [-1, 1] through a
 bias-free map, summed 2D position tables, RMS-normed blocks with a 2D rotary
 and gated feed-forwards, and a position pooler with standardization. The
-Qwen 3.5 trunk is a NaViT-style patchify with the still frame repeated along
-time, interpolated learned positions with a 2D rotary, full-attention blocks
-and the merger MLP as its projector. Each tower's projector is a
+Qwen 3.5, MiMo-V2.6 and Muse Glimmer trunks are configs of one windowed and
+full vision transformer (`vit`): a NaViT-style patchify with the still frame
+repeated along time, an optional resampled position table, decoder blocks
+with a 2D rotary that attend over a frame, a band of keys or a window of
+patches, each layer in its own token order, and the merge-block projector. Each tower's projector is a
 value beside it: Gemma 3's averages each patch block, norms and maps to the
 decoder width, Llama 4's maps the shuffled output to the decoder width,
 Gemma 4's norms without a scale and maps, and Qwen 3.5's is the merger.
@@ -32,7 +35,8 @@ projector is the aligner, which groups squares of the patch grid through an
 exact-GELU MLP and lays the image out as its decoder reads it.
 
 Each family lives in its own module of this package (`siglip`, `llama4`,
-`gemma4`, `qwen35`, `deepseek_v41`, `gemma3n`) over the bases in `common`,
+`gemma4`, `qwen35`, `mimo`, `muse_glimmer`, `deepseek_v41`, `gemma3n`) over the
+bases in `common` and the shared trunk in `vit`,
 with its path map and its config and weight translators. The package exports
 the classes a caller constructs or subclasses, and keeps where each kind's
 tensors sit and which map reads them.
