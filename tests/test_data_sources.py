@@ -595,6 +595,26 @@ def test_a_token_holdout_over_an_indexed_store_reads_into_memory_when_no_read_is
     assert loaded.plan is not None and loaded.plan.order["read"] == "memory"
 
 
+def test_a_default_read_is_judged_on_the_order_the_recipe_adds_at_that_read(tmp_path):
+    """A token split straight after an indexed source is a global, finite
+    order by itself, but the default order a recipe adds at an indexed read
+    repeats before it. The run reads into memory, where the order follows
+    the split, rather than choosing indexed for the recipe as written."""
+    import pyarrow.parquet as pq
+
+    from dew.data import load
+    from dew.data.pipeline import Pipeline
+
+    class Split:
+        def pipelines(self):
+            return Pipeline(Files(str(tmp_path / "rows.parquet"))).token_split(0.5, held=False), None, ()
+
+    rows = [{"text": [index] * 4} for index in range(8)]
+    pq.write_table(pa.Table.from_pylist(rows), tmp_path / "rows.parquet")
+    loaded = load(Split(), batch=1, read=None, loading=Loading(workers=0))
+    assert loaded.plan is not None and loaded.plan.order["read"] == "memory"
+
+
 def test_a_token_store_without_its_length_index_is_refused_naming_provisioning(tmp_path):
     """A token store that cannot be read by span until its length index is
     built is not read whole into memory when the run states no read: the
