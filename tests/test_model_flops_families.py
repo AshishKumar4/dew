@@ -12,6 +12,7 @@ from test_model_flops import forward_products
 from dew.diffusion import presets
 from dew.diffusion.process import DenoisingCondition
 from dew.inputs import Condition, Field, InputSpec
+from dew.inputs.diffusion import DiffusionConditioner, T5Segment
 from dew.inputs.encoders import CharTable, ConditionWork, T5Text
 from dew.nn.attention import Stage
 from dew.nn.attention_residuals import AttentionResiduals
@@ -550,3 +551,43 @@ def test_joint_family_counts_use_actual_dense_inputs_when_config_defaults_disagr
                                       text_features=condition.context.shape[-1],
                                       pooled_features=pooled)
     assert count == forward_products(model.apply, variables, image, time, condition) - upper
+
+
+def test_flux_conditioner_pooled_width_is_unprojected_and_its_composition_matches_the_forward():
+    clip = CLIPTextTransformer(vocab_size=16, hidden_size=8, intermediate_size=16,
+                               num_layers=1, num_heads=2, max_position_embeddings=4)
+    ids = np.ones((1, 2), np.int32)
+    clip_variables = clip.init(jax.random.key(334), jnp.asarray(ids))
+    directory = Path(__file__).parent / "fixtures" / "t5" / "tiny"
+    t5 = T5Text.from_pretrained(str(directory), max_length=2)
+    conditioner = DiffusionConditioner((clip,), (t5.tokenizer,), ("clip",),
+        {"clip": {"text_model": clip_variables["params"]}, "t5": t5.params},
+        "tiny-flux", 4, 4, t5.transformer.emb_features, composition="flux",
+        t5=T5Segment(t5.transformer, t5.tokenizer, "t5", 2))
+    tokens = {"input_ids": ids, "t5_input_ids": ids, "zero_condition": np.zeros((1,), bool)}
+    assert "text_projection" not in conditioner.params["clip"]
+    work = conditioner.conditioning_flops(tokens)
+    condition = conditioner.encode(conditioner.params, tokens)
+    assert work.pooled_features == condition.pooled.shape[-1] == clip.emb_features
+    np.testing.assert_array_equal(work.spans, [2])
+    model = FluxTransformer(in_channels=12, out_channels=12, heads=1, head_dim=8,
+                             num_layers=1, num_single_layers=1, joint_attention_dim=16,
+                             pooled_projection_dim=32, guidance_embeds=False,
+                             axes_dims_rope=(2, 2, 4), attention_impl="reference")
+    image, time = jnp.ones((1, 4, 4, 3)), jnp.ones((1,))
+    variables = model.init(jax.random.key(335), image, time, condition)
+    objective = DiffusionObjective(model, presets.Flow(),
+        InputSpec(Field("images", image.shape[1:]), conditions={"conditioning": Condition(conditioner)}),
+        autoencoder=None, ema_decay=None, unconditional_prob=0)
+
+    def forward(variables, encoder_params, image, time, tokens):
+        encoded = conditioner.encode(encoder_params, tokens)
+        return model.apply(variables, image, time, encoded)
+
+    count = objective.model_flops(None, {"images": np.asarray(image), "text": tokens})
+    upper = clip.num_layers * 2 * clip.hidden_size * ids.shape[1]**2
+    assert count == forward_products(forward, variables, conditioner.params, image, time, tokens) - upper
+    native = model.multisequence_flops(np.array([4]), work.spans, input_channels=3,
+                                       text_features=work.features, pooled_features=work.pooled_features)
+    training = objective.training_flops(None, {"images": np.asarray(image), "text": tokens})
+    assert training == 3 * native + work.flops
