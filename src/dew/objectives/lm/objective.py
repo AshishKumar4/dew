@@ -35,6 +35,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn, struct
+from flax.traverse_util import flatten_dict, unflatten_dict
 
 from dew.artifacts import Artifact, TextSamples, TokenScores
 from dew.coordination import agreed, collective_host
@@ -222,26 +223,27 @@ def _is_indexer(path: tuple[str, ...]) -> bool:
     return INDEXER in path
 
 
-def _sown_nodes(tree, *markers: str) -> list[Mapping]:
-    """Find every node of a sown collection that holds all of `markers`.
+def _sown_nodes(tree, *markers: str) -> list[tuple[tuple[str, ...], Mapping]]:
+    """Find every node of a sown collection that holds all of `markers`, with
+    its path: the module path that sowed it.
 
     A sown collection nests by module path, so what a layer sowed is the
     branch that names the keys it sowed under. The search stops at such a
     branch rather than descending into the arrays below it, and walks the
     children it does descend into in sorted key order.
     """
-    found: list[Mapping] = []
+    found: list[tuple[tuple[str, ...], Mapping]] = []
 
-    def visit(node) -> None:
+    def visit(node, path: tuple[str, ...]) -> None:
         if not isinstance(node, Mapping):
             return
         if all(marker in node for marker in markers):
-            found.append(node)
+            found.append((path, node))
             return
         for key in sorted(node):
-            visit(node[key])
+            visit(node[key], (*path, key))
 
-    visit(tree)
+    visit(tree, ())
     return found
 
 
@@ -251,7 +253,7 @@ def _indexer_kls(sown: Variables) -> list[jax.Array]:
     Each is `[B, S]`, and they come back in the tree's key order.
     """
     kls: list[jax.Array] = []
-    for node in _sown_nodes(sown, "kl"):
+    for _, node in _sown_nodes(sown, "kl"):
         (kl,) = node["kl"]
         kls.append(kl)
     return kls
@@ -368,39 +370,29 @@ def text_preview[S](phase: str, setup: Callable[[], S | None],
 ROUTER_BIAS = "e_score_correction_bias"
 
 
-def _balanced_biases(moe: Variables | jax.Array) -> Variables | jax.Array:
-    """Select the balancing biases of a `moe` collection, at their own paths.
-
-    The recursion hands itself the branches it walks, so the argument is a
-    collection or one of its leaves.
-
-    Router state that is not a bias, and any branch left holding none of
-    them, is dropped, so what comes back is one leaf per router the load
-    balancer moves.
-    """
-    if not isinstance(moe, Mapping):
-        return moe
-    kept = {}
-    for key, value in moe.items():
-        if not isinstance(value, Mapping):
-            if key == ROUTER_BIAS:
-                kept[key] = value
-            continue
-        branch = _balanced_biases(value)
-        if branch:
-            kept[key] = branch
-    return kept
+def _at(tree: Variables, path: tuple[str, ...]) -> jax.Array | None:
+    """The leaf at `path` in `tree`, or None where `tree` holds none."""
+    *branches, leaf = path
+    for key in branches:
+        tree = tree.get(key, {})
+    return tree.get(leaf)
 
 
 def router_counts(moe: Variables, routing: Variables) -> Variables:
-    """Count the selected slots at each active bias path."""
-    def count(path, bias):
-        sown = routing
-        for entry in path[:-1]:
-            sown = sown[entry.key]
-        (indices,) = sown["indices"]
-        return jnp.bincount(indices.ravel(), length=bias.shape[0])
-    return jax.tree_util.tree_map_with_path(count, _balanced_biases(moe))
+    """Count the slots each router the forward ran selected, at the path of
+    the balancing bias it keeps in `moe`.
+
+    The routers that ran are the ones `routing` holds sown `indices` for, so
+    a router the forward skipped (a prediction depth left out, a draft stage)
+    counts nothing; one that selects by a hash table keeps no bias and
+    counts nothing either."""
+    counts = {}
+    for path, node in _sown_nodes(routing, "indices"):
+        bias = _at(moe, (*path, ROUTER_BIAS))
+        if bias is not None:
+            (indices,) = node["indices"]
+            counts[(*path, ROUTER_BIAS)] = jnp.bincount(indices.ravel(), length=bias.shape[0])
+    return unflatten_dict(counts)
 
 
 def _updated_bias(bias: jax.Array, counts: jax.Array, rate: float) -> jax.Array:
@@ -421,7 +413,7 @@ def router_z_terms(routing: Variables, weight: float, batch: Batch) -> tuple[Rat
     """
     terms = []
     # lm-engine: moe/module.py at 45b6b57b, before its 0.1 and router_aux_loss_coef.
-    for node in _sown_nodes(routing, "log_z"):
+    for _, node in _sown_nodes(routing, "log_z"):
         (log_z,) = node["log_z"]
         work = Objective.row_mean(jnp.square(log_z.astype(jnp.promote_types(log_z.dtype, jnp.float32))),
                                   batch)
@@ -447,7 +439,7 @@ def router_moments(scores: jax.Array, indices: jax.Array, batch: Batch) -> Route
 def _router_scores(routing: Variables) -> list[tuple[jax.Array, jax.Array]]:
     """Collect every router's sown (scores, indices), in the tree's key order."""
     found: list[tuple[jax.Array, jax.Array]] = []
-    for node in _sown_nodes(routing, "scores", "indices"):
+    for _, node in _sown_nodes(routing, "scores", "indices"):
         (scores,), (indices,) = node["scores"], node["indices"]
         found.append((scores, indices))
     return found
@@ -459,7 +451,7 @@ def _global_qk_max(qk) -> jax.Array | None:
     None when no layer sowed one.
     """
     found: list[jax.Array] = []
-    for node in _sown_nodes(qk, "max_logits"):
+    for _, node in _sown_nodes(qk, "max_logits"):
         logged = node["max_logits"]
         found.append(jnp.max(logged[0] if isinstance(logged, (tuple, list)) else logged))
     return jnp.max(jnp.stack(found)) if found else None
@@ -1294,9 +1286,7 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         """
         if "moe" not in params or routing is None:
             raise ValueError("balance_rate requires a mixture with bias=True")
-        ran = {name: bias for name, bias in params["moe"].items()
-               if self.mtp_weight is not None or not name.startswith("mtp_")}
-        counts = router_counts(ran, routing)
+        counts = router_counts(params["moe"], routing)
         shares = [count / jnp.sum(count) for count in jax.tree.leaves(counts)]
         if not shares:
             raise ValueError(
@@ -1327,11 +1317,9 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         if rate is None:
             raise ValueError("router count effects require balance_rate")
         moe = variables["moe"]
-        active = _balanced_biases({name: moe[name] for name in effects})
-        balanced = jax.tree.map(
-            lambda bias, count: _updated_bias(bias, count, rate),
-            active, effects)
-        return {"moe": merge(moe, balanced)}
+        balanced = {path: _updated_bias(_at(moe, path), count, rate)
+                    for path, count in flatten_dict(effects).items()}
+        return {"moe": merge(moe, unflatten_dict(balanced))}
 
     def evaluate(self, params, batch, step: Step):
         """Score the complete batch teacher-forced, using EMA when present; the

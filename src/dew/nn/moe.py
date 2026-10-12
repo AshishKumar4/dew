@@ -1172,6 +1172,11 @@ class SparseMLP(nn.Module):
         the routed experts keep their stacked kernels."""
         return () if self.shared is None else declared_groups(self.shared_experts)
 
+    @property
+    def routes_experts(self) -> bool:
+        """It takes a layer's replayed experts (`RoutesExperts`)."""
+        return True
+
     def __call__(self, x, tokens=None, media=None, routes: Routes | None = None):
         weights, indices = self.gate(x, tokens, media, routes)
         if self.latent_features is None:

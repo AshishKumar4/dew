@@ -12,7 +12,7 @@ from flax import linen as nn
 from dew.nn.flops import counted_flops
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.moe import Routes, SparseMLP
-from dew.nn.protocols import ProjectionGroup, declared_groups
+from dew.nn.protocols import ProjectionGroup, RoutesExperts, declared_groups
 
 if TYPE_CHECKING:
     from dew.nn.backbones.decoder_block import GatedMLP, Mixture
@@ -34,8 +34,8 @@ class _MLP(nn.Module):
     @property
     def routes_experts(self) -> bool:
         """Whether its feed-forward routes over experts, and so takes the
-        layer's replayed ones (`decoder_block.RoutesExperts`)."""
-        return isinstance(self.feedforward, SparseMLP)
+        layer's replayed ones (`RoutesExperts`)."""
+        return isinstance(self.feedforward, RoutesExperts) and self.feedforward.routes_experts
 
     def __call__(self, x, decode: bool = False, positions=None, segment_ids=None, kv_store=None,
                  attention_metadata=None, routes: Routes | None = None):
