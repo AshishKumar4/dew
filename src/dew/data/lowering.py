@@ -125,17 +125,17 @@ def _outputs(
         if rng is None:
             raise ValueError(f"random step {_identity(stage).name} needs a record rng")
         step = stage.step
-        return (
-            step.random_map(value, rng)
-            if isinstance(step, pygrain.RandomMapTransform)
-            else step(record(value, "random map input"), rng),
-        )
-    if isinstance(stage, Map):
+        output = (step.random_map(value, rng) if isinstance(step, pygrain.RandomMapTransform)
+                  else step(record(value, "random map input"), rng))
+    elif isinstance(stage, Map):
         step = stage.step
-        return (
-            step.map(value) if isinstance(step, pygrain.MapTransform) else step(record(value, "map input")),
-        )
-    raise ValueError(f"{type(stage).__name__} is not a record stage")
+        output = step.map(value) if isinstance(step, pygrain.MapTransform) else step(record(value, "map"))
+    else:
+        raise ValueError(f"{type(stage).__name__} is not a record stage")
+    if isinstance(output, Rejected) and not stage.rejects:
+        raise ValueError(f"step {_identity(stage).name} dropped a record ({output.reason}) under map, which "
+                         "keeps every record; apply a step that drops records with filter_map")
+    return (output,)
 
 
 _POSITION = "_dew_position"
