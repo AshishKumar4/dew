@@ -244,8 +244,8 @@ class Halved:
 
 def test_a_cut_stream_maps_every_batch_and_is_read_by_one_process():
     """The training stream and the validation pass alike."""
-    held = Pipeline(Memory(Indexed(3, 6)), name="held").batch(4).map_batch(Halved())
-    data = compile(two_corpora().batch(4).map_batch(Halved()), validation=held, read="memory", loading=READ)
+    held = Pipeline(Memory(Indexed(3, 6)), name="held").batch(4).map_batches(Halved())
+    data = compile(two_corpora().batch(4).map_batches(Halved()), validation=held, read="memory", loading=READ)
     assert [len(batch) for batch in taken(data.train(DataPartition()), 3)] == [2, 2, 2]
     for reader in (data.train, data.val):
         with pytest.raises(ValueError, match="one reader"):
@@ -860,7 +860,7 @@ def test_a_ramp_reads_through_a_captioned_datasets_tokenized_stream():
         return {"length": np.asarray([len(caption) for caption in captions], np.int32)}
 
     def captioned(batch: int) -> Loader:
-        return compile(Pipeline(Memory(Captioned(1, 64))).shuffle(0).repeat().batch(batch).map_batch(
+        return compile(Pipeline(Memory(Captioned(1, 64))).shuffle(0).repeat().batch(batch).map_batches(
                            EncodeCaptions(lengths)), read="memory", seed=0, loading=READ)
 
     flat = [value for step in taken(captioned(4).train(DataPartition()), 12) for value in step]

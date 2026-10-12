@@ -43,6 +43,7 @@ from dew.data.dataset import Batch, DataPartition, FilledBatch, Loading, Records
 from dew.data.mixing import Accepted, PrimedMix, SearchBudget, TokenDeficit, primed_maps, token_weights
 from dew.data.pipeline import (
     Artifact,
+    Batched,
     BatchStage,
     Filter,
     FlatMap,
@@ -53,6 +54,7 @@ from dew.data.pipeline import (
     MapBatch,
     MapWithIndex,
     Mixture,
+    Native,
     Pack,
     Phases,
     Pipeline,
@@ -211,6 +213,17 @@ class _Rows:
             return _outputs(self.stage, None, element, rng)
         outputs = _outputs(self.stage, position, _unplaced(element), rng)
         return tuple(_placed(output, position) for output in outputs)
+
+
+@dataclasses.dataclass(frozen=True)
+class _Groups(pygrain.experimental.FlatMapTransform):
+    """A `map_batches` step over one group: its records, as Grain's flat map takes them."""
+
+    stage: Batched
+    max_fan_out: int = 1 << 20
+
+    def flat_map(self, group: list[Record]) -> Sequence[Record]:
+        return list(self.stage.step([record(value, "map_batches input") for value in group]))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -560,6 +573,13 @@ class _Build:
             rows = gx.RebatchIterDataset(
                 _as_iter(rows, self.loading), partition.rows(stage.size), drop_remainder=self.training
             )
+        elif isinstance(stage, Native):
+            rows = stage.function(rows)
+            lengths = None
+        elif isinstance(stage, Batched):
+            groups = _as_iter(rows, self.loading).batch(stage.size, drop_remainder=False, batch_fn=list)
+            rows = gx.FlatMapIterDataset(groups, _Groups(stage))
+            lengths = None
         else:
             return self.layout_stage(rows, lengths, stage, pipeline, partition)
         return rows, lengths

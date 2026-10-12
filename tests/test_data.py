@@ -851,7 +851,7 @@ class Augmenting:
         training = Pipeline(Memory(train)).random_map(self.transform())
         if self.augmentation_backend == "device":
             mode = self.augment
-            training = training.map_batch(DeviceAugment(self.image_size,
+            training = training.map_batches(DeviceAugment(self.image_size,
                 self.crop_scale if mode else (1.0, 1.0),
                 False if mode is None else mode.flip, False if mode is None else mode.jitter))
         validation = (None if held is None else

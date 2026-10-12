@@ -28,7 +28,7 @@ from dew.data.sources.base import Read, ShardManifest, Source, _consumed
 from dew.data.steps.chat import ConfigurePrompt, PreferencePair, RenderChat
 from dew.data.steps.generic import Formatting
 from dew.data.steps.image import EncodeCaptions
-from dew.data.steps.text import Chunks, LengthPolicy, Tokenize, ValidTargets
+from dew.data.steps.text import Chunks, LengthPolicy, Tokenize
 
 type SourceValue = Source | str | Sequence[Batch] | Mapping[str, Sequence]
 type Validation = HoldOut | Split | Pipeline | Source | str | Sequence[Batch] | Mapping[str, Sequence] | None
@@ -289,7 +289,7 @@ class TextData:
             train = (
                 trains[0]
                 if len(trains) == 1
-                else mix(trains, weights, tokens=ValidTargets())
+                else mix(trains, weights, by="tokens")
             )
             scored = [branch for branch in held if branch is not None]
             validation = (
@@ -582,7 +582,7 @@ class ImageData:
             if augment.jitter:
                 train = train.random_map(images.color_jitter())
         elif augment is not None:
-            train = train.random_map(images.augmentation_key()).map_batch(images.device_augment(
+            train = train.random_map(images.augmentation_key()).map_batches(images.device_augment(
                 self.image_size, crop_scale=augment.crop_scale, flip=augment.flip, jitter=augment.jitter))
         held = None if held is None else prepared(held, self.image_size)
         return train, held, (EncodeCaptions(),)
