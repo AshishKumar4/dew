@@ -37,6 +37,7 @@ class ArrayRecords:
     retained reader is idle and can release its mirror before the new open.
     More read threads than retained readers queue on missing shard opens
     until a reader drains.
+    Readers retired by close still occupy that bound until their reads drain.
     """
 
     def __init__(
@@ -57,6 +58,7 @@ class ArrayRecords:
             raise ValueError("ArrayRecord counts must name every physical shard with a nonnegative row count")
         self._pins = []
         self._opened: OrderedDict[int, _OpenedShard] = OrderedDict()
+        self._retired: list[_OpenedShard] = []
         self._lock = threading.Condition(threading.Lock())
 
     @cached_property
@@ -99,12 +101,12 @@ class ArrayRecords:
             with self._lock:
                 while (
                     shard not in self._opened
-                    and len(self._opened) >= _MAX_OPEN_SHARDS
+                    and len(self._opened) + len(self._retired) >= _MAX_OPEN_SHARDS
                     and all(opened.reads for opened in self._opened.values())
                 ):
                     self._lock.wait()
                 if shard not in self._opened:
-                    if len(self._opened) >= _MAX_OPEN_SHARDS:
+                    if len(self._opened) + len(self._retired) >= _MAX_OPEN_SHARDS:
                         idle = next(key for key, opened in self._opened.items() if not opened.reads)
                         self._opened.pop(idle).reader.close()
                     opened = ArrayRecords(
@@ -127,6 +129,7 @@ class ArrayRecords:
                     # A reopened shard owns a different reader from an evicted in-flight read.
                     if not opened_shard.reads:
                         if self._opened.get(shard) is not opened_shard:
+                            self._retired.remove(opened_shard)
                             opened_shard.reader.close()
                         self._lock.notify_all()
         payload = self.reader[index]
@@ -149,12 +152,15 @@ class ArrayRecords:
         self.__dict__.update(state)
         self._pins = []
         self._opened = OrderedDict()
+        self._retired = []
         self._lock = threading.Condition(threading.Lock())
 
     def close(self) -> None:
         with self._lock:
             for opened in self._opened.values():
-                if not opened.reads:
+                if opened.reads:
+                    self._retired.append(opened)
+                else:
                     opened.reader.close()
             self._opened.clear()
             self._lock.notify_all()

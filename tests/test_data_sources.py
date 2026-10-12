@@ -748,9 +748,9 @@ def test_arrayrecords_refuse_a_mirror_without_room_for_the_read_width(arrayrecor
         source.close()
 
 
-@pytest.mark.parametrize("busy_oldest", [False, True])
+@pytest.mark.parametrize("busy_oldest,retire", [(False, "eviction"), (True, "eviction"), (True, "close")])
 def test_arrayrecords_release_an_idle_mirror_before_opening_its_replacement(
-    arrayrecord_paths, tmp_path, monkeypatch, busy_oldest
+    arrayrecord_paths, tmp_path, monkeypatch, busy_oldest, retire
 ):
     import grain.python as grain
 
@@ -782,6 +782,8 @@ def test_arrayrecords_release_an_idle_mirror_before_opening_its_replacement(
                 pending = pool.submit(source.__getitem__, 0)
                 try:
                     assert entered.wait(timeout=5)
+                    if retire == "close":
+                        source.close()
                     for shard in range(1, len(shards)):
                         assert source[8 * shard] == f"{shard}:0".encode()
                 finally:
