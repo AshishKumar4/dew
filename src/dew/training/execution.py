@@ -268,13 +268,12 @@ def _selected(tree, paths):
     return selected
 
 
-@functools.partial(jax.jit, static_argnames=("loss", "layout"))
-def _forward(primal, frozen, store, batch, execution, *, loss, layout):
+def _forward(loss, primal, frozen, store, batch, execution, *, layout):
     """`loss` of the moving leaves `primal` beside the `frozen` ones, the
     store's other collections, the batch and the step's clock and keys, with
-    its pullback. Retained, the forward hands back a pullback whose static
-    part is the same program each realization, so `_trainable_cotangent`
-    traces once rather than once an attempt."""
+    its pullback. Compiled once for its objective (`HostExecution`), it hands
+    back a pullback whose static part is the same program each realization,
+    so `_trainable_cotangent` traces once rather than once an attempt."""
     treedef, held = layout
 
     def evaluate(trainable):
@@ -313,7 +312,9 @@ class HostExecution:
         self.objective, self.layout = objective, layout
         self.accelerator, self.cpu = accelerator, cpu
         self.sites = bank_sites(objective) if objective.bank_sites else ()
-        self.loss = jax.jit(objective._loss)
+        # The objective owns the program, which its fit ladder replaces with its model.
+        self.forward = objective._compiled_program(
+            'host_forward', functools.partial(_forward, objective._loss), static_argnames=("layout",))
         self.unstack = jax.jit(functools.partial(_logical, sites=self.sites))
 
     def snapshot(self, variables):
@@ -432,8 +433,7 @@ class HostExecution:
             batch = transfer(batch, batch_shardings(self.accelerator, batch))
             clock, key = self.on_accelerator((step.step, step.key))
             rest = {name: tree for name, tree in store.items() if name != "params"}
-            stats, back, aux = _forward(primal, frozen, rest, batch, Step(clock, key, ema),
-                                        loss=self.loss, layout=layout)
+            stats, back, aux = self.forward(primal, frozen, rest, batch, Step(clock, key, ema), layout=layout)
         stats, aux = self.on_cpu((stats, aux))
         if aux.variables is not None:
             with jax.set_mesh(self.cpu):
