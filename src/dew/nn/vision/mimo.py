@@ -138,7 +138,7 @@ def translate_mimo_vision_config(hf_config: Mapping[str, object]) -> Record:
         raise ValueError(f"hidden_act {vision.get('hidden_act')!r} is not expressible: MiMo ViT's "
                          "feed-forward is a SwiGLU")
     depth = records.integer(vision["depth"], "depth")
-    types = vision.get("vit_window_attn_types") or [-1] * depth
+    types = records.integers(vision.get("vit_window_attn_types") or [-1] * depth, "vit_window_attn_types")
     return {"class": "mimo", "fields": {
         "depth": depth,
         "hidden_size": records.integer(vision["hidden_size"], "hidden_size"),
@@ -152,9 +152,9 @@ def translate_mimo_vision_config(hf_config: Mapping[str, object]) -> Record:
         "spatial_merge_size": records.integer(vision.get("spatial_merge_size", 2), "spatial_merge_size"),
         "temporal_patch_size": records.integer(vision["temporal_patch_size"], "temporal_patch_size"),
         "rms_norm_eps": records.number(vision.get("rms_norm_eps", 1e-6), "rms_norm_eps"),
-        "fullatt_block_indexes": tuple(records.integer(i, "fullatt_block_indexes")
-                                       for i in vision.get("fullatt_block_indexes", ())),
-        "vit_window_attn_types": tuple(records.integer(i, "vit_window_attn_types") for i in types),
+        "fullatt_block_indexes": records.integers(vision.get("fullatt_block_indexes", []),
+                                                  "fullatt_block_indexes"),
+        "vit_window_attn_types": types,
         "use_sink": bool(vision.get("use_sink", False)),
         "visual_token_window_size": records.integer(vision.get("visual_token_window_size", -1),
                                                     "visual_token_window_size"),
