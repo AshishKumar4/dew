@@ -50,15 +50,24 @@ from .generation import first_refusal
 
 IMPLEMENTATIONS = ('auto', 'xla', 'pallas')
 DTYPES = (jnp.dtype(jnp.float32), jnp.dtype(jnp.bfloat16))
-ROW_ELEMENTS = 4096
-MAX_PROGRAMS = 256
+ROW_ELEMENTS = 2048
+MAX_PROGRAMS = 512
+ROW_BLOCKS = 12
 ELEMENT_BLOCK = 1024
 
 
+def _programs(rows: int, width: int) -> int:
+    """The reverse pass's programs: each walks at least `ROW_BLOCKS` row
+    blocks, so the two fp32 partial rows it writes stay a small share of
+    what it reads, up to `MAX_PROGRAMS`."""
+    return max(1, min(MAX_PROGRAMS, pl.cdiv(rows, _row_block(width) * ROW_BLOCKS)))
+
+
 def _row_block(width: int) -> int:
-    """At most sixteen rows, with the live register tile bounded at 4096
-    elements except when a single row is wider. A 4096-wide norm takes one
-    row rather than spilling four copies of every backward intermediate."""
+    """At most sixteen rows, with the live register tile bounded at
+    `ROW_ELEMENTS` elements except when a single row is wider. A 4096-wide
+    norm takes one row rather than spilling copies of every backward
+    intermediate."""
     return min(16, max(1, ROW_ELEMENTS // pl.next_power_of_2(width)))
 
 
@@ -223,11 +232,13 @@ def gated_rms_kernel(implementation: str, x, gate, scale, dtype, activation: str
     ) or _norm_refusal(x, scale, dtype, axes, (gate,)))
 
 
-def swiglu_kernel(implementation: str, gate, up, *, axes=None) -> str:
+def swiglu_kernel(implementation: str, gate, up, *, axes=None, packed: bool = False) -> str:
     """Resolve the SiLU product only. GeGLU and SiTU keep their own XLA
-    arithmetic; broadcasting or mixed operand dtypes also stay there.
+    arithmetic; broadcasting or mixed operand dtypes also stay there, and so
+    do a packed projection's halves, which XLA reads in place.
     `axes`, the operands' logical axes, places the kernel on a mesh (`_placed`)."""
     return _selected('swiglu', implementation, first_refusal(
+        (not packed, "the gate and up are halves of one packed projection, which the kernel would copy out"),
         (not any(isinstance(operand, JVPTracer) for operand in (gate, up)),
          "a JVP trace needs forward-mode derivatives; the SwiGLU kernel implements a VJP"),
         (gate.dtype in DTYPES and gate.dtype == up.dtype,
@@ -403,7 +414,7 @@ def _rms_backward_call(stream, scale, gate, inverse, dy, ds, norm: _Norm):
         zeros = [None if value is None else jnp.zeros_like(value) for value in (stream, gate, scale)]
         return (zeros[0] if ds is None else ds), zeros[1], zeros[2]
     rows, width = math.prod(stream.shape[:-1]), stream.shape[-1]
-    groups = min(MAX_PROGRAMS, pl.cdiv(rows, _row_block(width)))
+    groups = _programs(rows, width)
     partial_shape = None if scale is None else jax.ShapeDtypeStruct((groups, width), jnp.float32)
     dx, dgate, partial, correction = pl.pallas_call(
         functools.partial(_rms_backward, offset=norm.offset, after_cast=norm.after_cast,
