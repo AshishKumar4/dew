@@ -146,7 +146,8 @@ def case_for(path: str, batch: int, args: argparse.Namespace | None) -> Case:
     if path == "dit":
         # DiT-L/2's width and depth on 64x64 inputs, 1024 tokens a sample.
         config: dict[str, object] = {"patch_size": 2, "emb_features": 1024, "num_layers": 24,
-                                     "num_heads": 16, "mlp_ratio": 4, "remat": remat != "none"}
+                                     "num_heads": 16, "mlp_ratio": 4,
+                                     "remat": False if remat in (None, "none") else remat}
         return Case("simple_dit", config, dtype="bfloat16", batch_size=batch,
                                    image_size=64)
     if path == "lm-dense":
@@ -164,13 +165,6 @@ def case_for(path: str, batch: int, args: argparse.Namespace | None) -> Case:
 
 
 def step(args: argparse.Namespace) -> dict[str, object]:
-    if args.path == "dit" and args.remat == "full":
-        # A DiT's remat is a flag for the dots policy; full recomputation is
-        # that block under no policy.
-        import functools
-
-        import dew.nn.backbones.dit as dit
-        dit.remat_block = functools.partial(dit.remat_block, policy=None)
     case = case_for(args.path, args.batch, args)
     trainer = build_trainer(case, optimizer=OptimConfig(
         optimizer="adam", learning_rate=1e-4, state_dtype=args.state_dtype).build(1000))
