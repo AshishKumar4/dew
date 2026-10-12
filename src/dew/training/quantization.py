@@ -473,10 +473,7 @@ class InputQuantization:
             if quantizer is None:
                 return next_fun(*args, **kwargs)
             inputs, *rest = args
-            axis = getattr(module, "axis", -1)
-            axes = tuple(sorted(a % inputs.ndim for a in ((axis,) if isinstance(axis, int) else axis)))
-            if (not isinstance(module, nn.Dense | nn.DenseGeneral) or axes != (inputs.ndim - 1,)
-                    or getattr(module, "batch_dims", ())):
+            if not _trailing_contraction(module, inputs.ndim):
                 raise ValueError(f"{'/'.join(module.path)} holds an input scale, which a Linear "
                                  "contracting its input's trailing axis alone reads")
             return next_fun(quantizer.qdq(inputs), *rest, **kwargs)
@@ -497,6 +494,17 @@ class InputQuantization:
         return InputQuantized(**{field.name: getattr(model, field.name)
                                  for field in dataclasses.fields(model)
                                  if field.init and field.name not in ("parent", "name")})
+
+
+def _trailing_contraction(module: nn.Module, ndim: int) -> bool:
+    """Whether `module` is a Linear that contracts its rank-`ndim` input's trailing axis alone."""
+    match module:
+        case nn.Dense():
+            return True
+        case nn.DenseGeneral(axis=axis, batch_dims=batch_dims):
+            axes = (axis,) if isinstance(axis, int) else tuple(axis)
+            return not batch_dims and sorted(a % ndim for a in axes) == [ndim - 1]
+    return False
 
 
 def _qtype(dtype: QuantizedDtype) -> jax.typing.DTypeLike:
