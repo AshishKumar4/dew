@@ -17,7 +17,7 @@ trainer.fit(train.shuffle(seed=0).batch(64), validation=val.batch(64), epochs=1)
 ```mermaid
 flowchart LR
   S["Source<br/>Files · Hub · TFDS · Memory<br/>from_hf · from_torch · from_grain · from_iter"]
-  R["Per-record functions<br/>map · filter · filter_map<br/>random_map · random_filter_map · flat_map"]
+  R["Per-record functions<br/>map · random_map · filter<br/>filter_map · flat_map"]
   X["Cross-record verbs<br/>pack · shuffle · mix · concat<br/>interleave · schedule · holdout · cache"]
   B["batch(n)<br/>the global training batch"]
   T["Trainer<br/>host share from the mesh<br/>device prefetch"]
@@ -30,7 +30,7 @@ Stages run in the order you write them. Dew never reorders them.
 
 ## 1. Primitives
 
-Three types, seven function shapes.
+Three types, six function shapes.
 
 | Type | What it is |
 |---|---|
@@ -44,7 +44,6 @@ Three types, seven function shapes.
 | `RandomFn` | `(r, rng) -> r` or a `grain.RandomMapTransform` | `random_map` | exactly 1 |
 | `Predicate` | `(r) -> bool` | `filter` | 0 or 1 |
 | `TryFn` | `(r) -> r \| Rejected` | `filter_map` | 0 or 1, with a reason |
-| `RandomTryFn` | `(r, rng) -> r \| Rejected` | `random_filter_map` | 0 or 1, with a reason |
 | `ExpandFn` | `(r) -> Iterable[r]` (finite) | `flat_map` | any |
 | `DatasetFn` | `(Dataset) -> Dataset` | `pipe` | any |
 
@@ -57,9 +56,7 @@ flowchart TD
   Rn -- no --> M["map"]
   Rn -- yes --> RM["random_map"]
   D -- "yes, a yes/no test" --> FI["filter"]
-  D -- "yes, while transforming" --> Rt{"Random?"}
-  Rt -- no --> FM["filter_map"]
-  Rt -- yes --> RFM["random_filter_map"]
+  D -- "yes, while transforming" --> FM["filter_map"]
   D -- "it makes several" --> FLM["flat_map"]
 ```
 
@@ -84,19 +81,20 @@ Preparing a Hub dataset happens on first use, with one log line naming what is p
 
 | Group | Verbs |
 |---|---|
-| Per record | `map`, `random_map`, `filter`, `filter_map`, `random_filter_map`, `flat_map` |
-| Reuse | `pipe(fn)` for your own `Dataset -> Dataset` functions; `pipe_grain(fn)` for any Grain operation Dew doesn't name |
-| Shape | `rename(new="old")`, `keep(*fields)`, `take(n)`, `named(name)` |
+| Per record | `map`, `random_map`, `filter`, `filter_map`, `flat_map`; `map` and `flat_map` also take `batched=True, batch_size=k` |
+| Reuse | `pipe(fn)` for your own `Dataset -> Dataset` functions; `grain(fn)` for any Grain operation Dew doesn't name |
+| Columns | `rename_columns({"old": "new"})`, `select_columns(*names)`, `remove_columns(*names)` (Hugging Face's names) |
+| Other | `take(n)`, `named(name)` |
 | Sequence | `pack(seq_len, fields=, ...)` forwards Grain's packer options; `text.chunk(length, overlap=)` cuts long documents first |
 | Order | `shuffle(seed=, window=)`, `repeat(epochs=)` |
 | Combine | `mix(datasets, weights=, by="records" \| "tokens", stop=)`, `concat(datasets)`, `interleave(datasets, cycle_length=)`, `schedule([(dataset, tokens), ...])` |
 | Split | `holdout(0.01)`, `holdout(val=, test=)`, `holdout(records=)`, `holdout(split=)`, each with `key=` |
-| Batch | `map_batches(fn, size=k)` for preprocessing in chunks; `batch(n)` for the global training batch; `map_batches(fn)` after `batch` for the training batch |
+| Batch | `batch(n)`, the global training batch; a `map` after it receives the whole batch |
 | Persist | `cache(url)` (write-through accelerator), `snapshot(url)` (a terminal job that seals an immutable generation, read back with `Files(url)`) |
 | Execution | `workers(n)`, `threads(n)`, `prefetch(n)`, `read(mode)` |
 | Look | `take(n).show()`, `stats(records=n)` |
 
-`map_batches` is the one batched verb. With `size=k` it hands your function chunks of k records (HF's `map(batched=True)`) and returns records, so `pack`, `mix` and the global `batch` still follow. After `batch(n)` it runs on the training batch on the host.
+Batched preprocessing is Hugging Face's own form: `map(fn, batched=True, batch_size=k)` hands `fn` a dict of columns (`{"text": [...k strings]}`) and expects the same number of rows back; `flat_map(fn, batched=True)` may return any number. The chain stays a stream of records, so `pack`, `mix` and `batch` still follow. After `batch(n)`, a `map` receives the training batch, as in Grain and tf.data.
 
 ## 4. Examples
 
@@ -128,11 +126,10 @@ ds = (Files("s3://corpus/forum/*.jsonl")
 ### Batched tokenization, HF style
 
 ```python
-def tokenize_chunk(rows):                      # a list of records in, a list out
-    ids = tok([r["text"] for r in rows])["input_ids"]
-    return [r | {"tokens": i} for r, i in zip(rows, ids)]
+def tokenize(batch):                           # columns in, columns out, as in HF datasets
+    return {"tokens": tok(batch["text"])["input_ids"]}
 
-ds = Hub("HuggingFaceFW/fineweb-edu").map_batches(tokenize_chunk, size=1024).pack(seq_len=4096)
+ds = Hub("HuggingFaceFW/fineweb-edu").map(tokenize, batched=True, batch_size=1024).pack(seq_len=4096)
 ```
 
 ### Images with albumentations or torchvision
@@ -250,7 +247,7 @@ ds = from_grain(grain.MapDataset.source(my_source)).map(my_grain_transform)
 ds = from_hf(load_dataset("...").map(my_hf_fn, batched=True))
 ds = from_torch(my_torch_dataset).map(to_record)
 ds = from_iter(lambda: wds.WebDataset(urls), state=..., load_state=...)
-ds = ds.pipe_grain(lambda d: grain.experimental.ZipIterDataset([d, other]))   # any Grain op
+ds = ds.grain(lambda d: grain.experimental.ZipIterDataset([d, other]))   # any Grain op
 ```
 
 ## 5. Workers and parallelism
@@ -313,9 +310,9 @@ The chain lowers one stage per Grain operator. On top of that, Dew fuses adjacen
 
 | Area | Status |
 |---|---|
-| `Dataset` chain, sources, `map`/`filter`/`filter_map`/`random_filter_map`/`flat_map`, `mix([..], weights=)`, `holdout`, `concat`, `named`, `rename`, `pipe`, `show` | Built on `feat/data-fetch` |
+| `Dataset` chain, sources, `map`/`random_map`/`filter`/`filter_map`/`flat_map`, `mix([..], weights=)`, `holdout`, `concat`, `named`, `pipe`, `show` | Built on `feat/data-fetch` (verb names being aligned to this page) |
 | `images.fetch`/`decode`, albumentations and torchvision adapters, `video.fetch`/`decode_clip` | Built; the AV clip descriptor is being redesigned |
 | `fit(data, validation=, steps=/epochs=/tokens=)` | Built |
-| `keep`, `pipe_grain`, `from_iter`, `map_batches(size=)`, `mix(by=, stop=)` keyed members, `schedule` in tokens, `snapshot`, `text.chunk`, `stats` | Planned (revision 2) |
+| HF column verbs, `grain()`, `from_iter`, `map(batched=True)`, `mix(by=, stop=)` keyed members, `schedule` in tokens, `snapshot`, `text.chunk`, `stats` | Planned |
 | Elastic resume, `text.decontaminate`, `text.dedup_minhash`, language and quality filters, fusion, measured defaults, GPU decode | Planned |
 | Native `jax.Mesh` with any axes | Planned (training) |
