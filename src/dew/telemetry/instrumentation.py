@@ -10,6 +10,7 @@ the compiler picked a visible Triton dot or an opaque cuBLAS call for the same
 matmul (docs/research/benchmark-parity.md:5-9,93-102).
 """
 
+import functools
 import math
 import re
 import sys
@@ -31,13 +32,16 @@ def _cache_event(event: str, **metadata) -> None:
             _cache_counts[event] += 1
 
 
-jax.monitoring.register_event_listener(_cache_event)
+@functools.cache
+def count_compilation_cache() -> None:
+    """Count JAX's persistent-cache hits and misses from now on, once per process."""
+    jax.monitoring.register_event_listener(_cache_event)
 
 
 def compilation_cache_counts() -> dict[str, float]:
-    """Cumulative JAX persistent-cache events since Dew's instrumentation was imported.
+    """Cumulative JAX persistent-cache events since `count_compilation_cache` first ran.
 
-    The listener is registered once per process. Counts include every jitted
+    The trainer starts counting when a fit begins. Counts include every jitted
     program, not just training steps. JAX emits cache_misses when it writes a
     cache entry, so compilations below its write thresholds do not count as
     misses. An unavailable or disabled persistent cache emits neither event.
