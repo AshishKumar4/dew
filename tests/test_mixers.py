@@ -211,7 +211,7 @@ def test_a_packed_row_computes_what_its_documents_compute_alone(kind):
     (packed, packed_grads), (alone, alone_grads) = packed_and_alone(model, variables, tokens, cotangent)
     with jax.enable_x64(new_val=True):
         wide = jax.tree.map(lambda x: jnp.asarray(np.asarray(x, np.float64)), variables)
-        _, (truth, truth_grads) = packed_and_alone(model.clone(dtype=jnp.float64, param_dtype=jnp.float64),
-                                                   wide, tokens, jnp.asarray(cotangent, jnp.float64))
+        _, (truth, truth_grads) = packed_and_alone(model.clone(dtype=jnp.float64), wide, tokens,
+                                                   jnp.asarray(cotangent, jnp.float64))
     assert_leaves_as_exact({"logits": packed, "grads": packed_grads}, {"logits": alone, "grads": alone_grads},
                            {"logits": truth, "grads": truth_grads}, reductions=sum(DOCUMENTS))
