@@ -140,6 +140,8 @@ FAMILIES = {
                                               "gated_delta_prep", "gated_delta_prep_backward"}),
     ('grouped_matmul', 'pallas'): ("experts", {"pallas_triton_ragged_dot", "tgmm_ragged_dot"}),
     ('tokamax_grouped_matmul', 'triton'): ("experts", None),
+    ('rms_norm', 'pallas'): ("step", {"rms_norm_forward", "rms_norm_backward", "rms_norm_scale_backward"}),
+    ('swiglu', 'pallas'): ("step", {"swiglu_forward", "swiglu_backward"}),
 }
 
 GPUS = sorted({generation for generation, target in TARGETS.items()
@@ -161,6 +163,31 @@ def test_every_pallas_choice_a_row_names_has_a_lowering_probe():
              if kernel in PALLAS_CHOICES}
     assert named <= set(FAMILIES), sorted(named - set(FAMILIES))
     assert {key for key, (_, names) in FAMILIES.items() if names is None} == set(UNLOWERABLE)
+
+
+@pytest.mark.parametrize("generation", ["sm80", "sm120"])
+def test_the_compensated_norm_vjp_lowers_for_both_gpu_generations(generation):
+    """Explicit Pallas checks the candidate even before that generation opts in.
+
+    The separate scale-gradient combine and its rounded assembly must lower
+    too; interpreting on CPU cannot expose broken multi-result GPU assembly.
+    """
+    from dew.nn.attention import rms_normalized
+
+    def forward_backward(x, scale, seed):
+        def norm(x, scale):
+            return rms_normalized(x, scale, 1e-5, jnp.bfloat16, scale_offset=True,
+                                   scale_after_cast=True, fp32_statistics=True, implementation='pallas')
+        y, backward = jax.vjp(norm, x, scale)
+        return y, *backward(seed)
+
+    x = jax.ShapeDtypeStruct((32, 17), jnp.bfloat16)
+    scale = jax.ShapeDtypeStruct((17,), jnp.float32)
+    mesh = gpu_mesh(Mesh(np.array(jax.devices()[:1]), ('data',)), generation)
+    with assumed(generation), jax.sharding.use_abstract_mesh(mesh):
+        lowered = jax.jit(forward_backward).trace(x, scale, x).lower(lowering_platforms=('cuda',))
+    assert triton_kernels(lowered) == {
+        'rms_norm_forward': 1, 'rms_norm_backward': 1, 'rms_norm_scale_backward': 1}
 
 
 @pytest.mark.parametrize("generation", ["sm80", "sm120"])

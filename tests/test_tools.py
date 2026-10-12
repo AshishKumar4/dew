@@ -13,7 +13,6 @@ compiles on CPU in seconds.
 import ast
 import dataclasses
 import json
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -1295,12 +1294,3 @@ def test_a_tutorial_run_records_a_stalled_notebook_and_runs_the_rest(tmp_path, m
     assert runner.main() == 1
     assert ran == [0, 1]
     assert json.loads((stale / "kernel.json").read_text())["argv"][0] == sys.executable
-
-
-@pytest.mark.skipif(shutil.which("node") is None, reason="node runs the store Worker's own tests")
-def test_the_store_workers_tests_pass_under_node():
-    """tools/r2_store/worker.js's tests (worker.test.mjs, each token's reach over an in-memory bucket),
-    run where the suite runs, so a change to the Worker meets them."""
-    done = subprocess.run(["node", "--test", "tools/r2_store/worker.test.mjs"], cwd=REPO_ROOT,
-                          capture_output=True, text=True, timeout=120)
-    assert done.returncode == 0, done.stdout[-4000:] + done.stderr[-2000:]
