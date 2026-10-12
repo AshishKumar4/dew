@@ -186,6 +186,8 @@ def test_capture_does_not_retain_donated_arrays(tmp_path, native_reports):
 
 
 @pytest.mark.mesh(devices=2)
+@pytest.mark.skipif(jax.default_backend() != "cpu",
+                    reason="only the CPU leaves a donated replicated array live with one buffer")
 def test_a_capture_drains_past_an_array_a_donation_consumed(tmp_path, native_reports):
     """An array still held after a step donated it can list as live with
     only its first buffer left: XLA counts an array deleted by that buffer,
