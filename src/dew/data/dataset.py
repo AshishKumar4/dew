@@ -920,16 +920,18 @@ _UNSTACKED = "Expected all input elements to have the same structure"
 not stack. A grain that words it otherwise raises its own error unchanged."""
 
 
-def stacked(reads: Iterator[Batch]) -> Batch:
-    """The next batch of `reads`, with grain's failure to stack its records
-    said in terms of what to change.
+def stacked(rows: Sequence[Batch], stack: Callable[[Sequence[Batch]], Batch]) -> Batch:
+    """`rows` stacked into one batch by `stack`, with grain's failure to
+    stack them said in terms of what to change. Every batch Dew makes of
+    rows is stacked here, so a reader and the loading tuner that samples it
+    refuse alike.
 
     The usual cause is a field of varying length, as token ids are before
     anything cuts or packs them, and grain's message names the batch's
     structure rather than the field or the remedy.
     """
     try:
-        return next(reads)
+        return stack(rows)
     except ValueError as failed:
         if not str(failed).startswith(_UNSTACKED):
             raise
@@ -994,7 +996,7 @@ class GlobalStream:
     def __next__(self) -> Batch:
         if self._reads is None:
             self._reads = self._open(self._records)
-        batch = stacked(self._reads)
+        batch = next(self._reads)
         # Counted after the batch: a step the stream did not deliver is not
         # a step a resume may skip.
         self._records += self._batch
