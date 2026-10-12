@@ -62,9 +62,6 @@ def peak_bytes() -> int | None:
 def projection(args: argparse.Namespace) -> dict[str, object]:
     rows, experts = args.rows, args.experts
     width, features = (args.width, args.features) if args.shape == "up" else (args.features, args.width)
-    if args.tokamax_kernel is not None:
-        from dew.nn.kernels.generation import device_generation, gpu_target
-        gpu_target(device_generation()).kernels["tokamax_grouped_matmul"] = args.tokamax_kernel
     rng = np.random.default_rng(0)
     sizes = np.floor(rng.dirichlet(np.ones(experts)) * rows).astype(np.int32)
     sizes[-1] += rows - sizes.sum()
@@ -99,8 +96,7 @@ def projection(args: argparse.Namespace) -> dict[str, object]:
     def relative(value, reference):
         return float(np.abs(np.asarray(value, np.float64) - reference).max() / np.abs(reference).max())
 
-    return {"implementation": args.implementation, "tokamax_kernel": args.tokamax_kernel,
-            "shape": [rows, width, features, experts],
+    return {"implementation": args.implementation, "shape": [rows, width, features, experts],
             "groups": sizes.tolist(), "forward": timed(forward, (x, kernel), args.repeats),
             "forward_backward": timed(both, (x, kernel), args.repeats),
             "forward_error": relative(output, oracle), "input_gradient_error": relative(dx, dx_oracle),
@@ -222,8 +218,6 @@ def main(argv: list[str] | None = None) -> None:
     project.add_argument("--experts", type=int, default=8)
     project.add_argument("--width", type=int, default=768, help="the model width an up projection reads")
     project.add_argument("--features", type=int, default=2048, help="the expert width it writes")
-    project.add_argument("--tokamax-kernel", default=None,
-                         help="the tokamax kernel 'tokamax' runs, in place of the generation's row")
     project.add_argument("--repeats", type=int, default=50)
     update = modes.add_parser("adam")
     update.add_argument("--state-dtype", choices=("float32", "bfloat16"), default="float32")
