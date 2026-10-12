@@ -275,7 +275,7 @@ def test_a_row_with_a_hole_pools_as_its_cache_does():
     hidden, valid = inputs()
     valid[0, 3] = False
     variables = translated(block)
-    metadata = AttentionMetadata(valid=jnp.asarray(valid))
+    metadata = AttentionMetadata(coordinates=coordinates(valid=jnp.asarray(valid)))
     parallel = np.asarray(module().apply(variables, jnp.asarray(hidden), attention_metadata=metadata))
 
     stepped = decode_steps(module(), variables, hidden, valid, prefill=5)
