@@ -4,8 +4,6 @@ import gzip
 import hashlib
 import itertools
 import json
-import shutil
-import subprocess
 from pathlib import Path
 
 import cv2
@@ -25,7 +23,6 @@ from dew.config.data import (
     PromptData,
     RecordsData,
     TextData,
-    VideoData,
     loader,
 )
 from dew.data.dataset import DataPartition, DataPhase, Loading
@@ -41,8 +38,11 @@ from dew.nn.backbones.causal_transformer import CausalTransformer
 
 GOLD = Path(__file__).parent / "fixtures/golden/loaders-66beb5305.json.gz"
 CASES = ("text_windows", "text_packed", "text_phases", "chat", "prompts", "preferences", "images_memory",
-         "images_arrayrecord", "images_hf", "images_tfds", "hub_records", "tfds_records", "videos_local",
-         "decision_table", "decision_mix")
+         "images_arrayrecord", "images_hf", "images_tfds", "hub_records", "tfds_records", "decision_table",
+         "decision_mix")
+"""Every migrated loader but the video recipe's, whose record the media stages changed on purpose (a
+waveform and its validity in place of per-frame rows and features); tests/test_data.py holds that
+recipe to itself across workers and a resume."""
 
 
 def _digest(batch):
@@ -87,24 +87,6 @@ def _image_sources(root, pixels):
     return str(image_root), str(image_file)
 
 
-def _videos(root):
-    from imageio_ffmpeg import get_ffmpeg_exe
-    from transformers import Wav2Vec2FeatureExtractor
-
-    directory = root / "clips"
-    directory.mkdir()
-    video = directory / "00.mp4"
-    subprocess.run([get_ffmpeg_exe(), "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i",
-                    "testsrc=size=16x16:rate=25", "-f", "lavfi", "-i",
-                    "sine=frequency=1000:sample_rate=16000", "-t", "2", "-c:v", "libx264",
-                    "-pix_fmt", "yuv420p", "-c:a", "aac", str(video)], check=True)
-    for index in range(1, 12):
-        shutil.copyfile(video, directory / f"{index:02}.mp4")
-    audio = root / "audio"
-    Wav2Vec2FeatureExtractor(sampling_rate=16000).save_pretrained(audio)
-    return str(directory), str(audio)
-
-
 @pytest.fixture(scope="module")
 def recipes(tmp_path_factory):
     root = tmp_path_factory.mktemp("pipeline-golden")
@@ -122,7 +104,6 @@ def recipes(tmp_path_factory):
     image_root, image_file = _image_sources(root, pixels)
     table = root / "records.parquet"
     pq.write_table(pa.table({"id": list(range(40)), "x": [[index, index + 1] for index in range(40)]}), table)
-    clips, audio = _videos(root)
     objective = DecisionObjective(
         CausalTransformer(vocab_size=256, emb_features=8, num_layers=1, num_heads=2, mlp_features=16),
         tokenizer=ByteTokenizer(), specials=Specials(0, 1, 2, "<mark>", 3),
@@ -151,8 +132,6 @@ def recipes(tmp_path_factory):
                                 validation=HoldOut(records=4)), {}),
         "hub_records": (RecordsData(Files(str(table))), {}),
         "tfds_records": (RecordsData(TFDS("dew_images", path="tests/fixtures/tfds/dew_images/1.0.0")), {}),
-        "videos_local": (VideoData(clips, frames=4, frame_size=16, audio_padding=1, audio_model=audio,
-                                caption="clip", validation=HoldOut(records=4)), {}),
         "decision_table": (Decisions(examples, validation=examples[:5]), {"objective": objective.data()}),
         "decision_mix": (Decisions({"a": examples, "b": examples[:8]}, weights={"a": 3, "b": 1},
                                     validation=examples[:5]), {"objective": objective.data()}),
