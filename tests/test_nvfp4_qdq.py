@@ -13,7 +13,7 @@ from reference_error import assert_as_exact_as_the_reference
 
 from dew.interop import Pretrained, codecs
 from dew.interop.safetensors_io import read_weights
-from dew.training.quantization import NVFP4Input, _nvfp4_divide, nvfp4_input_qdq
+from dew.training.quantization import InputQuantizer, _nvfp4_divide, nvfp4_input_qdq
 
 FIXTURE = Path(__file__).parent / "fixtures" / "codecs" / "nvfp4_qdq"
 
@@ -57,7 +57,7 @@ def test_the_checkpoint_input_quantizer_matches_the_librarys_forward_bit_for_bit
         if not key.endswith("/inputs"):
             continue
         stem = key.removesuffix("/inputs")
-        spec = NVFP4Input(float(reference[stem + "/global"].reshape(())), kind == "e4m3")
+        spec = InputQuantizer.nvfp4(float(reference[stem + "/global"].reshape(())), kind == "e4m3")
         actual = jax.jit(lambda x, spec=spec: nvfp4_input_qdq(x, spec))(jnp.asarray(value, dtype))
         expected = reference[stem + ("/qdq" if dtype == jnp.float32 else "/qdq_bf16")]
         np.testing.assert_array_equal(np.asarray(actual, np.float32).view(np.uint32),
@@ -88,7 +88,7 @@ def test_input_qdq_uses_the_training_paths_straight_through_gradient(case):
     kind, _, reference = case
     key = next(key for key in reference if key.endswith("/inputs"))
     stem = key.removesuffix("/inputs")
-    spec = NVFP4Input(float(reference[stem + "/global"].reshape(())), kind == "e4m3")
+    spec = InputQuantizer.nvfp4(float(reference[stem + "/global"].reshape(())), kind == "e4m3")
     x = jnp.asarray(reference[key])
     cotangent = jnp.arange(x.size, dtype=x.dtype).reshape(x.shape) / x.size
     gradient = jax.jit(jax.grad(lambda values: jnp.sum(nvfp4_input_qdq(values, spec) * cotangent)))(x)
@@ -98,7 +98,7 @@ def test_input_qdq_uses_the_training_paths_straight_through_gradient(case):
 @pytest.mark.parametrize("scale", [0, -1, np.inf, np.nan])
 def test_an_invalid_global_scale_is_refused_before_compilation(scale):
     with pytest.raises(ValueError, match="positive and finite"):
-        NVFP4Input(scale, e4m3_scale=False)
+        InputQuantizer.nvfp4(scale, e4m3_scale=False)
 
 
 def test_an_input_scale_missing_from_the_file_cannot_silently_drop_qdq(case, tmp_path):

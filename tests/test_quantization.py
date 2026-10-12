@@ -535,7 +535,7 @@ def test_a_quantized_text_task_matches_qwix_direct_logits_and_generation(dtype, 
 
     from dew.inference import TextGeneration
     from dew.sampling import Sampling
-    from dew.training.quantization import METHODS
+    from dew.training.quantization import entry_methods
 
     qwix = pytest.importorskip("qwix")
     model = tiny()
@@ -549,7 +549,7 @@ def test_a_quantized_text_task_matches_qwix_direct_logits_and_generation(dtype, 
     rules = [qwix.QuantizationRule(module_path=".*_proj", weight_qtype=qtype,
                                   act_qtype=None if weight_only else qtype, **fields)]
     reference = qwix.quantize_model(model, qwix.PtqProvider(rules),
-                                    methods=tuple(method for method in METHODS if hasattr(model, method)))
+                                    methods=entry_methods(model))
     abstract = jax.eval_shape(functools.partial(reference.init, jax.random.key(0),
                                                jnp.zeros((1, 1), jnp.int32)))
     expected_variables = {
@@ -600,7 +600,7 @@ def test_a_quantized_image_task_matches_qwix_direct_prediction_and_samples(flux_
     and the VAE keep their weights, leaf for leaf."""
     import functools
 
-    from dew.training.quantization import METHODS
+    from dew.training.quantization import entry_methods
 
     qwix = pytest.importorskip("qwix")
     task = flux_task
@@ -610,7 +610,7 @@ def test_a_quantized_image_task_matches_qwix_direct_prediction_and_samples(flux_
     rules = [qwix.QuantizationRule(module_path=".*", weight_qtype=qtype,
                                   act_qtype=None if weight_only else qtype, **fields)]
     reference = qwix.quantize_model(task.model, qwix.PtqProvider(rules),
-                                    methods=tuple(name for name in METHODS if hasattr(task.model, name)))
+                                    methods=entry_methods(task.model))
     example = task.prepare("", key=0, steps=1)
     own = {name: tree for name, tree in task.variables.items() if name not in ("encoders", "autoencoder")}
     abstract = jax.eval_shape(functools.partial(reference.init, jax.random.key(0), example.noise,
@@ -662,7 +662,7 @@ def test_quantizing_host_weights_keeps_numpy_storage_and_matches_qwix():
 
     from dew.inference import TextGeneration
     from dew.sampling import Sampling
-    from dew.training.quantization import METHODS
+    from dew.training.quantization import entry_methods
 
     qwix = pytest.importorskip("qwix")
     model = tiny()
@@ -676,7 +676,7 @@ def test_quantizing_host_weights_keeps_numpy_storage_and_matches_qwix():
     reference = qwix.quantize_model(model, qwix.PtqProvider([
         qwix.QuantizationRule(module_path=".*_proj", weight_qtype=jnp.int8,
                               op_names=("dot_general", "einsum", "dot"))]),
-        methods=tuple(method for method in METHODS if hasattr(model, method)))
+        methods=entry_methods(model))
     abstract = jax.eval_shape(functools.partial(reference.init, jax.random.key(0),
                                                jnp.zeros((1, 1), jnp.int32)))
     reference_variables = {**host, "params": qwix.quantize_params(resident["params"], abstract["params"])}

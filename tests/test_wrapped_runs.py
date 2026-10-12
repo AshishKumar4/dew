@@ -20,7 +20,7 @@ from dew.lora import AdapterRecord, LoRA
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.objectives.lm import LMObjective, LMRunConfig
 from dew.training import Checkpoints, Trainer
-from dew.training.quantization import InputQuantization, Quantization, quantize_trunk
+from dew.training.quantization import QUANTIZATION, InputQuantization, Quantization, quantize_trunk
 
 pytestmark = pytest.mark.mesh
 
@@ -157,8 +157,9 @@ def test_a_second_quantization_is_refused_where_qwix_would_replace_the_first():
 def test_a_run_of_an_input_quantized_checkpoint_reloads_with_its_input_quantization(tmp_path, fixture):
     """A ModelOpt or compressed-tensors FP8 or NVFP4 checkpoint computes with
     its input quantization (`InputQuantization`); a run of it records the
-    per-Linear scales and reloads computing the run's logits bit for bit,
-    which the same weights without them do not."""
+    scheme, keeps the per-Linear scales in its variables (`QUANTIZATION`) and
+    reloads computing the run's logits bit for bit, which the same weights
+    without the scheme do not."""
     pytest.importorskip("qwix")
     source = Pretrained.load(FIXTURES / "codecs" / fixture, dtype="float32", attention_impl="reference")
     objective = LMObjective(source.model, SEQ, variables=source.variables)
@@ -166,7 +167,8 @@ def test_a_run_of_an_input_quantized_checkpoint_reloads_with_its_input_quantizat
 
     recorded = ModelConfig.from_model(task.model).wrappers
     assert recorded == ModelConfig.from_model(source.model).wrappers
-    assert len(recorded) == 1 and isinstance(recorded[0], InputQuantization) and recorded[0].inputs
+    assert len(recorded) == 1 and isinstance(recorded[0], InputQuantization)
+    assert jax.tree.leaves(task.variables[QUANTIZATION])
     np.testing.assert_array_equal(logits(task.model, task.variables), logits(source.model, state.variables))
     plain = rebuilt_with(task.model)
     assert float(np.max(np.abs(logits(plain, task.variables) - logits(task.model, task.variables)))) > 0
