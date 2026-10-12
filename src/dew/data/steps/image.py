@@ -222,27 +222,33 @@ class Processor(grain.MapTransform):
         return {**element, self.to: np.asarray(processed["pixel_values"][0])}
 
 
-_local = threading.local()
 _torch_rng = threading.Lock()
 
 
 @dataclasses.dataclass(frozen=True, eq=False)
 class Albumentations(grain.RandomMapTransform):
     """An albumentations pipeline on the image in `field`, seeded from the
-    record's generator: each reader thread runs its own copy, so threads
-    never share a seed, and a record's draw is the same at any thread count
-    and after a resume."""
+    record's generator through `Compose.set_random_seed`, one record at a time
+    in each process, so a record's draw is the same at any thread count and
+    after a resume."""
 
     transform: object
     field: str = "image"
 
-    def random_map(self, element: Batch, rng: np.random.Generator) -> Batch:
-        import copy
+    @functools.cached_property
+    def _turn(self) -> threading.Lock:
+        """This stage's one lock in its process: the seed and the call it seeds go together."""
+        return threading.Lock()
 
-        copies = _local.__dict__.setdefault("albumentations", {})
-        transform = copies.setdefault(id(self), copy.deepcopy(self.transform))
-        transform.set_random_seed(int(rng.integers(0, 2**32 - 1)))
-        return {**element, self.field: transform(image=np.asarray(element[self.field]))["image"]}
+    def random_map(self, element: Batch, rng: np.random.Generator) -> Batch:
+        with self._turn:
+            self.transform.set_random_seed(int(rng.integers(0, 2**32 - 1)))
+            augmented = self.transform(image=np.asarray(element[self.field]))["image"]
+        return {**element, self.field: augmented}
+
+    def __getstate__(self) -> dict:
+        # A worker builds its own lock.
+        return {key: value for key, value in self.__dict__.items() if key != "_turn"}
 
 
 @dataclasses.dataclass(frozen=True, eq=False)

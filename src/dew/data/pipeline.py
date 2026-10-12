@@ -374,19 +374,24 @@ class Dataset:
         every read and resume."""
         for step in steps:
             if _declares_rejects(step):
-                raise TypeError(f"{_named_step(step)} drops records; apply it with filter_map")
+                raise TypeError(f"{_named_step(step)} drops records; apply it with random_filter_map")
         return self.then(*(RandomMap(step, identity) for step in steps))
 
-    def filter_map(self, *steps: RecordStep | pygrain.RandomMapTransform,
-                   identity: str | None = None) -> Pipeline:
+    def filter_map(self, *steps: RecordStep, identity: str | None = None) -> Pipeline:
         """One record to none or one: each step returns its record's
         replacement or `Rejected(reason)`, which drops it, counted by reason
         in the reader's checkpointed counts, as `images.fetch` and
-        `images.decode` do. A `grain.RandomMapTransform` draws from the
-        record's generator."""
-        return self.then(*(RandomMap(step, identity, rejects=True)
-                           if isinstance(step, pygrain.RandomMapTransform)
-                           else Map(step, identity, rejects=True) for step in steps))
+        `images.decode` do."""
+        for step in steps:
+            if isinstance(step, pygrain.RandomMapTransform):
+                raise TypeError(f"{_named_step(step)} draws from a generator; use random_filter_map")
+        return self.then(*(Map(step, identity, rejects=True) for step in steps))
+
+    def random_filter_map(self, *steps: RandomStep, identity: str | None = None) -> Pipeline:
+        """`filter_map` for steps that draw from the record's generator
+        (`fn(record, rng)` or a `grain.RandomMapTransform`), as
+        `video.decode_clip` picks a random start and drops a clip that fails."""
+        return self.then(*(RandomMap(step, identity, rejects=True) for step in steps))
 
     def map_with_index(
         self, step: Callable[[int, Batch], Batch | Rejected], *, identity: str | None = None

@@ -52,7 +52,8 @@ def test_holdout_puts_each_record_in_one_part_by_its_identity_the_same_in_every_
     assert sum(map(len, parts)) == len(set().union(*parts)) == 4000
     assert [len(part) / 4000 for part in parts] == pytest.approx([0.85, 0.05, 0.1], abs=0.02)
     # With a key, a document's other versions land in its part: the split follows "i" alone.
-    revised = Memory([{**row, "origin": "a2"} for row in rows("a", 4000)]).map(lambda row: {**row, "seen": True})
+    revised = Memory([{**row, "origin": "a2"} for row in rows("a", 4000)])
+    revised = revised.map(lambda row: {**row, "seen": True})
     by_key = [{i for _, i in keys(part, "memory")} for part in corpus.holdout(0.1, key="i")]
     assert by_key == [{i for _, i in keys(part, "memory")} for part in revised.holdout(0.1, key="i")]
     first, held = Memory(rows("c", 10)).holdout(records=3)
