@@ -198,16 +198,29 @@ def packed_and_alone(model, variables, tokens, cotangent):
     return run(packed), run(alone)
 
 
+KIND_FIELDS = {"mlp": ({"intermediate_size": 64}, {}), "llama4": ({}, {"qk_norm": False}),
+               "deepseek_v4": ({}, {"sliding_window": 8})}
+"""The fields a kind needs beyond its defaults to build in `tiny`: its own, then the model's."""
+
+REFUSED = {"kpool_sparse_attention": "a packed row of documents"}
+"""Kinds that refuse packed rows by name, and the name."""
+
+
 @pytest.mark.parametrize("kind", sorted(mixers.paths))
 def test_a_packed_row_computes_what_its_documents_compute_alone(kind):
     """Every mixer in the registry: a row packing two documents (segment ids, positions restarting)
     gives each document's logits and the parameters' gradients its documents give run one at a time,
     within the float64 gate, so no layer carries a conv history, a recurrent state or attention across
     a document boundary. The float64 truth is the documents run alone in float64."""
-    model = tiny(mixer=mixers.build(kind), max_seq_len=32)
+    fields, overrides = KIND_FIELDS.get(kind, ({}, {}))
+    model = tiny(mixer=mixers.build(kind, **fields), max_seq_len=32, **overrides)
     tokens = jax.random.randint(jax.random.key(3), (1, sum(DOCUMENTS)), 0, VOCAB)
     variables = model.init(jax.random.key(4), tokens)
     cotangent = jax.random.normal(jax.random.key(5), (1, sum(DOCUMENTS), VOCAB))
+    if kind in REFUSED:
+        with pytest.raises(ValueError, match=REFUSED[kind]):
+            packed_and_alone(model, variables, tokens, cotangent)
+        return
     (packed, packed_grads), (alone, alone_grads) = packed_and_alone(model, variables, tokens, cotangent)
     with jax.enable_x64(new_val=True):
         wide = jax.tree.map(lambda x: jnp.asarray(np.asarray(x, np.float64)), variables)
