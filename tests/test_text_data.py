@@ -1044,7 +1044,7 @@ def test_a_position_saved_under_other_packing_bins_is_refused(tmp_path):
     source, other = one.train(DataPartition()), two.train(DataPartition())
     try:
         next(source)
-        with pytest.raises(ValueError, match="saved data plan derived order"):
+        with pytest.raises(ValueError, match="saved data plan order changed"):
             other.set_state(source.get_state())
     finally:
         source.close()
