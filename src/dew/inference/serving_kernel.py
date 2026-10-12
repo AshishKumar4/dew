@@ -477,10 +477,8 @@ def resident_formats(model: nn.Module, params: Variables, pad_id: int, placement
     program = _compiled(automatic(resident), automatic(carried), rows)
     arguments = (model, params, pad_id, placement, steps, resident, carried, None, transforms, stopping,
                  grammar)
-    lowered = program.lower(*arguments)
-    if tune(lowered):
-        lowered = program.lower(*arguments)
-    compiled = lowered.compile()
+    tune(lambda: program.lower(*arguments))
+    compiled = program.lower(*arguments).compile()
     return joined(*compiled.output_formats[1][:2])
 
 

@@ -18,7 +18,7 @@ shapes' heuristic, the first two only where the space holds them; Dew
 resolves the config itself, so no tokamax policy measures or refuses inside
 a trace. Picks are measured once, where a program is lowered before its
 compile (`tune`: the Trainer's step, the serving engine's), on the launches
-tokamax finds in the lowered program's metadata. Every config of a missing
+tokamax finds in a lowering that describes them (`launches`). Every config of a missing
 launch compiles on a thread pool and runs alone, its kernel's device time
 read by CUPTI after `FLUSH_BYTES` are read, and the fastest is kept. A
 pool's process 0 decides every launch's pick, stored or measured, and the
@@ -135,15 +135,17 @@ class KernelOp(tokamax.Op):
     revision: int = 1
 
     def __call__(self, *args, **kwargs):
-        if self.config is not None:
-            return tokamax.Op.__call__(self, *args, **kwargs)
-        ba = self.bind(*args, **kwargs)
-        keyed = self.keyed(ba)
-        pin = dict(cache.KERNEL_PINS.value).get(type(self))
-        pick = _pick(keyed)
-        config = (pin if pin in keyed.autotuning_configs
-                  else ba.heuristics_config if pick is None else pick.fastest_config)
-        return tokamax.Op.__call__(self.replace(config=config), *args, **kwargs)
+        config = self.config
+        if config is None:
+            ba = self.bind(*args, **kwargs)
+            keyed = self.keyed(ba)
+            pin = dict(cache.KERNEL_PINS.value).get(type(self))
+            pick = _pick(keyed)
+            config = (pin if pin in keyed.autotuning_configs
+                      else ba.heuristics_config if pick is None else pick.fastest_config)
+        if cache.KERNEL_LAUNCHES.value:
+            return tokamax.Op.__call__(self.replace(config=config), *args, **kwargs)
+        return self._fwd(*args, config=config, **kwargs)[0]
 
     def keyed(self, ba: tokamax.BoundArguments) -> tokamax.BoundArguments:
         """`ba` with its token-counted arguments at its key's shapes, where its
@@ -312,14 +314,26 @@ def _store(picks: tokamax.AutotuningResult) -> None:
                          .dumps(prune_errors=True))
 
 
-def tune(lowered: jax.stages.Lowered) -> bool:
-    """Settle every launch's config in the `lowered` program across the pool:
-    process 0 takes its stored pick, or measures one where it has its GPU to
-    itself (storing it), and every process takes exactly process 0's picks
-    for the program's launches. True on every process when any process's
-    picks changed, so the caller lowers again to compile with them."""
+@contextlib.contextmanager
+def launches() -> Iterator[None]:
+    """Each kernel launch traced within carries tokamax's description of
+    itself, which `tokamax.autotuning.get_bound_args` reads out of the
+    lowered program (`dew.cache.KERNEL_LAUNCHES`)."""
+    with cache.KERNEL_LAUNCHES(new_value=True):
+        yield
+
+
+def tune(lower: Callable[[], jax.stages.Lowered]) -> bool:
+    """Settle every launch's config in the program `lower()` lowers across the
+    pool: process 0 takes its stored pick, or measures one where it has its
+    GPU to itself (storing it), and every process takes exactly process 0's
+    picks for the program's launches. True on every process when any
+    process's picks changed, so the caller lowers again to compile with them.
+    The launches are read from a lowering of their own (`launches`)."""
     if not generation.triton_runs():
         return False
+    with launches():
+        lowered = lower()
     found = [(op, op.keyed(ba)) for ba in _bound_args(lowered)
              if isinstance(op := ba.op, KernelOp)]
     if not found:
