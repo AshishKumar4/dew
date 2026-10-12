@@ -60,13 +60,12 @@ jobs:
     - uses: astral-sh/setup-uv@v6
       with:
         enable-cache: true
-        cache-dependency-glob: |
-          pyproject.toml
-          constraints.txt
+        cache-dependency-glob: locks/cpu.txt
     - name: Install dependencies
       run: |
-        sh tools/install_host_torch.sh --system
-        uv pip install --system flake8 -e ".[ci]" -c constraints.txt
+        sh tools/install_environment.sh cpu --system
+    - name: The locks match pyproject.toml and constraints.txt
+      run: sh tools/lock_environment.sh && git diff --exit-code locks/
     - name: Lint with flake8
       run: |
         # stop the build if there are Python syntax errors or undefined names; the
@@ -114,15 +113,12 @@ jobs:
     - uses: astral-sh/setup-uv@v6
       with:
         enable-cache: true
-        cache-dependency-glob: |
-          pyproject.toml
-          constraints.txt
+        cache-dependency-glob: locks/cpu.txt
     - name: Install dependencies
       run: |
-        sh tools/install_host_torch.sh --system
         # pyright resolves every import in src/dew, the optional readers' included: the
         # test suite's environment (pyproject.toml's `ci` extra) holds every one.
-        uv pip install --system -e ".[ci]" -c constraints.txt
+        sh tools/install_environment.sh cpu --system
     - name: Type check
       run: uvx pyright@1.1.406 --pythonpath "$(which python)" src/dew
 

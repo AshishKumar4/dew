@@ -142,11 +142,10 @@ git clone https://github.com/AshishKumar4/dew.git
 cd dew
 uv venv --python 3.14
 source .venv/bin/activate
-sh tools/install_host_torch.sh
-uv pip install -e '.[ci]' -c constraints.txt
+sh tools/install_environment.sh cpu   # cuda12 or cuda13 on a GPU host
 ```
 
-The `ci` extra is the test suite's environment, every package a test file imports, as CI, the GPU nodes and the kernel lab's GPU jobs install it, with the same JAX build CI uses: `constraints.txt` names the patched build of 0.11.2, which the multi-process cache tests need. PyTorch is used only by the reference tests and the image processors; Dew's model computation runs in JAX.
+The `ci` extra is the test suite's environment, every package a test file imports. `tools/lock_environment.sh` locks it in `locks/`, and CI, the GPU nodes and the kernel lab's GPU jobs all install the lock for their host, with the same JAX build CI uses: `constraints.txt` names the patched build of 0.11.2, which the multi-process cache tests need. PyTorch is used only by the reference tests and the image processors; Dew's model computation runs in JAX.
 
 ## Bumping JAX
 

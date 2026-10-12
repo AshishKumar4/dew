@@ -12,10 +12,10 @@ on:
     # ci/** is the branch run a head gets before it lands, so a notebook a
     # change breaks fails there rather than after the merge.
     branches: [ "main", "ci/**" ]
-    paths: [ "src/dew/**", "tutorials/**", "pyproject.toml", "tools/install_host_torch.sh", "tools/run_tutorials.py", "tools/check_tutorial_outputs.py", ".github/workflows/tutorials.yml" ]
+    paths: [ "src/dew/**", "tutorials/**", "pyproject.toml", "locks/cpu.txt", "tools/install_environment.sh", "tools/run_tutorials.py", "tools/check_tutorial_outputs.py", ".github/workflows/tutorials.yml" ]
   pull_request:
     branches: [ "main" ]
-    paths: [ "src/dew/**", "tutorials/**", "pyproject.toml", "tools/install_host_torch.sh", "tools/run_tutorials.py", "tools/check_tutorial_outputs.py", ".github/workflows/tutorials.yml" ]
+    paths: [ "src/dew/**", "tutorials/**", "pyproject.toml", "locks/cpu.txt", "tools/install_environment.sh", "tools/run_tutorials.py", "tools/check_tutorial_outputs.py", ".github/workflows/tutorials.yml" ]
   schedule:
     - cron: "23 5 * * *"
   workflow_dispatch:
@@ -68,11 +68,10 @@ jobs:
     - uses: astral-sh/setup-uv@v6
       with:
         enable-cache: true
-        cache-dependency-glob: pyproject.toml
+        cache-dependency-glob: locks/cpu.txt
     - name: Install Dew and the notebooks' dependencies
       run: |
-        sh tools/install_host_torch.sh --system
-        uv pip install --system -e ".[tutorials]"
+        sh tools/install_environment.sh cpu --system
     - name: Cache the datasets and checkpoints the notebooks download
       uses: actions/cache@v4
       with:
