@@ -548,6 +548,16 @@ class Laid:
         return {"image": np.resize(np.asarray(element["text"]), (2, 4))}
 
 
+def test_the_saved_order_names_the_stages_a_memory_read_ran_as_an_indexed_read_does():
+    """The canonical order a resume checks is the pipeline as written,
+    whichever read runs its packing. A memory read packs before it orders,
+    and its order still names the pack."""
+    documents = [{"text": np.arange(size, dtype=np.int32)} for size in (8, 1, 8)]
+    packed = Pipeline(Memory(documents)).pack(8, bins=1).shuffle(0, window=2).repeat().batch(1)
+    orders = [compile(packed, read=read, loading=READ).plan.order["stages"] for read in ("memory", "indexed")]
+    assert orders[0] == orders[1] and orders[0][0].startswith("Pack(")
+
+
 def test_a_memory_read_counts_valid_targets_where_it_packs():
     """Windows are kept by their own targets, however a later step lays them
     out: the one-token document's window has none and is left out."""

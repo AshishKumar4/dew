@@ -252,6 +252,24 @@ def _drops(stage: Stage) -> bool:
     )
 
 
+@runtime_checkable
+class _Ran(Protocol):
+    """Rows the first stages of a pipeline already made, as a memory read
+    holds them (`dew.data.materialize`), with the source they came from."""
+
+    original: Source
+    ran: tuple[Stage, ...]
+
+
+def _written(source: Source, stages: Sequence[Stage]) -> tuple[Stage, ...]:
+    """A corpus's stages as its pipeline wrote them: the ones a memory read
+    already ran, then the ones left to lower."""
+    while isinstance(source, _Ran):
+        stages = (*source.ran, *stages)
+        source = source.original
+    return tuple(stages)
+
+
 @dataclasses.dataclass(frozen=True)
 class _Lowering:
     """What a pipeline's stages mean for its lowering, analyzed once in one
@@ -305,6 +323,7 @@ def _analyzed(
             "until_steps": list(source.until_steps),
         }
     else:
+        written = stages if isinstance(source, Mixture) else _written(source, stages)
         order = {
             **(
                 {
@@ -317,12 +336,12 @@ def _analyzed(
             ),
             "stages": [
                 repr(stage)
-                for stage in stages
-                if isinstance(stage, (Shuffle, Repeat, Slice, Limit, TokenSplit, Pack, BatchStage))
+                for stage in written
+                if isinstance(stage, (Shuffle, Repeat, Slice, Limit, TokenSplit, Pack, Windows, BatchStage))
             ],
-            "groups": [stage.groups.window for stage in stages if isinstance(stage, Group)],
+            "groups": [stage.groups.window for stage in written if isinstance(stage, Group)],
             "token_budgets": [
-                dataclasses.asdict(stage) for stage in stages if isinstance(stage, TokenBudget)
+                dataclasses.asdict(stage) for stage in written if isinstance(stage, TokenBudget)
             ],
         }
     return _Lowering(per_share or any(child.per_share for child in children), cache, eager, order, endless)
