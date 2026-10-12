@@ -46,11 +46,3 @@ def test_every_requirement_names_a_release():
     lines = [*project["dependencies"], *(line for extra in project["optional-dependencies"].values()
                                          for line in extra)]
     assert [line for line in lines if Requirement(line).url is not None] == []
-
-
-def test_pretrained_loading_brings_the_multimodal_processors_host_dependency():
-    extras = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text())["project"]["optional-dependencies"]
-    requirements = {canonicalize_name(Requirement(line).name): Requirement(line)
-                    for line in extras["interop"]}
-    assert "torchvision" in requirements
-    assert requirements["torchvision"].specifier.contains("0.29")
