@@ -51,9 +51,14 @@ class Hub(Dataset):
         except ImportError as error:
             raise ImportError("HF Arrow reads need pip install 'dewml[streaming]'") from error
 
-        return load_dataset_builder(
-            self.repo, name=self.name, revision=self.commit, cache_dir=self.cache_dir
-        )
+        pinned = {"name": self.name, "revision": self.commit, "cache_dir": self.cache_dir}
+        whole = load_dataset_builder(self.repo, **pinned)
+        # Only this split's own files, as the dataset's own configuration resolves
+        # them: preparing the whole dataset would download every split to read one.
+        splits = whole.config.data_files or {}
+        if len(splits) < 2 or self.split not in splits:
+            return whole
+        return load_dataset_builder(self.repo, **pinned, data_files={self.split: list(splits[self.split])})
 
     @property
     def streamed(self) -> str | None:
