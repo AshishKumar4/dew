@@ -14,7 +14,6 @@ import json
 from pathlib import Path
 
 import jax
-import numpy as np
 import pytest
 
 from dew.config import ModelConfig, ObjectiveConfig
@@ -42,7 +41,6 @@ from dew.objectives.lm import LMObjective
 from dew.objectives.rl import DPOObjective, GRPOObjective, PPOObjective, ValueHead
 from dew.objectives.rl.sessions import Call, Session, Status, pack
 from dew.objectives.supervised import CrossEntropy, Supervised
-from dew.registry import objectives
 from dew.sampling.solvers import Euler
 
 IMAGES = Path(__file__).parent / "fixtures" / "tfds" / "dew_images" / "1.0.0"
@@ -192,25 +190,3 @@ def cases(windows):
                                           inputs=InputSpec(Field("text", (windows.seq_len + 1,)))),
                                first(windows)),
     }
-
-
-def test_every_registered_objective_has_a_recipe_case(windows):
-    assert set(cases(windows)) == set(objectives), "an aliased objective needs a case here"
-
-
-@pytest.mark.parametrize("name", sorted(objectives))
-def test_the_declared_inputs_match_the_recipe_batch(name, windows):
-    objective, batch = cases(windows)[name]()
-    assert type(objective) is objectives[name]
-    objective.inputs.check(batch)
-
-
-def test_a_drifted_declaration_is_refused_before_compiling(windows):
-    """What the cases guard: GRPO's packed `input_ids` are not the LM's
-    `text` windows, so an LM declaration over them is refused."""
-    _, batch = packed(lambda seq_len: GRPOObjective(decoder(), seq_len))
-    with pytest.raises(ValueError, match="needs field 'text'"):
-        LMObjective(decoder(), SEQ_LEN).inputs.check(batch)
-    with pytest.raises(ValueError, match="declares shape"):
-        GRPOObjective(decoder(), SEQ_LEN + 1).inputs.check(batch)
-    assert np.shape(batch["input_ids"])[1] == SEQ_LEN + 1

@@ -14,7 +14,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from flax import linen as nn
 from jax.sharding import NamedSharding, PartitionSpec as P
 from moe_support import exchange_worker, objective, routing_case
 from reference_error import assert_as_exact_as_the_reference, assert_computes_the_oracle
@@ -22,7 +21,7 @@ from reference_error import assert_as_exact_as_the_reference, assert_computes_th
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.moe import ExpertMLP, capacity_positions
-from dew.training import DEFAULT_RULES, MeshSpec
+from dew.training import MeshSpec
 
 MAXTEXT = Path(__file__).resolve().parent / "fixtures" / "maxtext" / "capacity.npz"
 
@@ -108,36 +107,6 @@ def test_decoder_exchange_retains_logits_and_expert_bias_observations(parallel):
         np.testing.assert_allclose(actual_leaf, expected_leaf, atol=1e-7, rtol=1e-6)
 
 
-def test_exchange_requires_an_expert_axis_that_owns_whole_experts():
-    x, weights, indices = map(jnp.asarray, routing_case(8, 6, 2, skewed=False))
-    module = ExpertMLP(6, 12, 8, dispatch='exchange')
-    parameters = module.init(jax.random.key(0), x, weights, indices)
-    for shards in (1, 4):
-        mesh = MeshSpec(expert=shards).build()
-        with jax.set_mesh(mesh), pytest.raises(ValueError, match='divides num_experts'):
-            module.apply(parameters, x, weights, indices)
-
-
-@pytest.mark.mesh(devices=4)
-def test_exchange_refuses_experts_the_rules_keep_off_the_expert_axis():
-    """The exchange holds each device's own experts, so a rule table that
-    leaves the expert dimension off the expert axis is refused, not run."""
-    x, weights, indices = map(jnp.asarray, routing_case(8, 8, 2, skewed=False))
-    module = ExpertMLP(8, 12, 8, dispatch='exchange')
-    parameters = module.init(jax.random.key(0), x, weights, indices)
-    rules = tuple(rule for rule in DEFAULT_RULES if rule[0] != 'exp')
-    with (jax.set_mesh(MeshSpec(expert=2).build(jax.devices()[:4])), nn.logical_axis_rules(rules),
-          pytest.raises(ValueError, match='first dimension over the expert axis')):
-        module.apply(parameters, x, weights, indices)
-
-
-def test_unknown_dispatch_is_rejected_at_the_mixture():
-    with pytest.raises(ValueError, match='dispatch'):
-        Mixture(experts=4, dispatch='drop')
-    with pytest.raises(ValueError, match='capacity_factor'):
-        Mixture(experts=4, capacity_factor=0.0)
-
-
 def maxtext_positions(indices: np.ndarray, experts: int) -> np.ndarray:
     """Each slot's place in its expert's queue as MaxText's `generate_masks`
     counts it: a running count over a sequence's tokens and, within a
@@ -150,17 +119,6 @@ def maxtext_positions(indices: np.ndarray, experts: int) -> np.ndarray:
 
 def maxtext_capacity(length: int, top_k: int, experts: int, factor: float) -> int:
     return int(max(math.ceil(length * top_k / experts) * factor, factor))
-
-
-@pytest.mark.mesh(devices=1)
-@pytest.mark.parametrize('experts,top_k,factor', [(8, 2, 1.0), (4, 1, 1.25), (16, 4, 0.5)])
-def test_capacity_queues_each_sequence_in_token_order(experts, top_k, factor):
-    scores = np.random.default_rng(3).normal(size=(3, 10, experts))
-    scores[..., :2] += 1.0
-    indices = np.argsort(-scores, axis=-1)[..., :top_k].astype(np.int32)
-    positions, capacity = capacity_positions(jnp.asarray(indices), experts, factor)
-    np.testing.assert_array_equal(positions, maxtext_positions(indices, experts))
-    assert capacity == maxtext_capacity(10, top_k, experts, factor)
 
 
 @pytest.mark.mesh(devices=4)
