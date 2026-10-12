@@ -112,7 +112,7 @@ class Interval:
     compiles: int = 0
 
     def count(self, batch: Batch, flops: StepFlops | None, loss: jax.Array, finite: jax.Array,
-              committed: Committed | None, aux: Mapping[str, jax.Array] | None = None) -> None:
+              committed: Committed | None, aux: Mapping[str, jax.Array] | None = None) -> Book:
         """Add one step: its records, its FLOPs, its loss and its optimizer commit."""
         self.since_log += 1
         self.steps += 1
@@ -126,6 +126,7 @@ class Interval:
         assert self.fresh is not None
         self.book = bookkeep(self.book, loss, finite, committed,
                              aux.get(TRAINING_FLOPS, self.fresh.training), aux.get(TOKENS, self.fresh.tokens))
+        return self.book
 
     def check_finite(self, step: int, display: TrainingDisplay) -> None:
         """Raise RuntimeError once the loss has been non-finite for

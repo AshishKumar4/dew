@@ -420,6 +420,7 @@ class _FitRun:
     loss: jax.Array | None = None
     evaluation: Evaluation | None = None
     last_checkpoint: float = 0.0
+    checkpoint_due: bool = False
     stop_control: dict = dataclasses.field(default_factory=dict)
     tokens_at_log: int = 0
     stopped: bool = False
@@ -1472,10 +1473,9 @@ class Trainer(Generic[Loss, Effects]):
                 run.current += 1
                 self._display.step(run.current)
                 seen += 1
-                interval.count(batch, measured_flops, loss, finite, committed, aux)
+                counted = interval.count(batch, measured_flops, loss, finite, committed, aux)
                 if plan.total_tokens is not None:
-                    assert interval.book is not None
-                    run.stop_control["tokens"] = run.tokens_at_log + int(jax.device_get(interval.book.tokens))
+                    run.stop_control["tokens"] = run.tokens_at_log + int(jax.device_get(counted.tokens))
                 if run.first_step is None:
                     loss.block_until_ready()
                     run.first_step = time.perf_counter() - run.started
@@ -1637,16 +1637,16 @@ class Trainer(Generic[Loss, Effects]):
             # The clock is read at the log interval, where the step is already
             # waited on, so a pool's processes agree on it there rather than
             # gathering behind every step.
-            checkpoint_due = False
+            run.checkpoint_due = False
             if current % plan.log_every == 0:
                 elapsed = time.perf_counter() - run.last_checkpoint
                 due = elapsed >= plan.checkpoint_every.total_seconds()
-                checkpoint_due = agree_process_phase(None, phase="checkpoint clock", available=due) > 0
+                run.checkpoint_due = agree_process_phase(None, phase="checkpoint clock", available=due) > 0
         else:
-            checkpoint_due = bool(plan.checkpoint_every and current % plan.checkpoint_every == 0)
+            run.checkpoint_due = bool(plan.checkpoint_every and current % plan.checkpoint_every == 0)
         due = plan.due(current)
         evaluation_due = bool(due) or bool(plan.eval_every and current % plan.eval_every == 0)
-        ranked = bool((plan.validation or plan.best or plan.stop) and checkpoint_due)
+        ranked = bool((plan.validation or plan.best or plan.stop) and run.checkpoint_due)
         if not ending and (evaluation_due or ranked):
             with region("evaluate"):
                 # A checkpoint that ranks the steps reads every suite's score.
@@ -1669,7 +1669,7 @@ class Trainer(Generic[Loss, Effects]):
         # On its own clock, not the logging one, so that a cadence
         # which does not divide log_every still fires.
         if (plan.checkpoint_every and checkpoints is not None
-                and checkpoint_due and not ending) or (candidate and not ending):
+                and run.checkpoint_due and not ending) or (candidate and not ending):
             assert checkpoints is not None
             run.other += self._saved_checkpoint(
                 checkpoints,
@@ -1681,7 +1681,7 @@ class Trainer(Generic[Loss, Effects]):
                 ranking=ranking,
                 training_best=not plan.validation and not plan.best,
                 control=run.stop_control,
-                weights_only=not checkpoint_due
+                weights_only=not run.checkpoint_due
                 and not run.stopped
                 and bool(winners)
                 and all(rank.weights_only for rank in winners),
@@ -1755,7 +1755,7 @@ class Trainer(Generic[Loss, Effects]):
                 run.stopped = True
                 run.stop_control['stop_reason'] = 'validation plateau'
                 self._display.note("Stopped: validation plateau")
-        if plan.checkpoint_final and checkpoints is not None and interval.last_saved != current:
+        if (plan.checkpoint_final or run.checkpoint_due) and checkpoints is not None and interval.last_saved != current:
             # The in-loop saves are conditional, so the state the run ends
             # on may never have been written. It goes out under its real
             # step: a step-0 checkpoint holding the final weights would
