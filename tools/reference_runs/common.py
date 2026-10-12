@@ -43,7 +43,7 @@ def _native(name: str, source: str):
 
 
 gpu_target = _native("dew_gpu_targets", "nn/kernels/generation.py").gpu_target
-WorkloadWork = _native("dew_work_records", "telemetry/records.py").WorkloadWork
+WorkloadWork = _native("dew_workload", "telemetry/workload.py").WorkloadWork
 
 
 def peak_flops(device_kind: str) -> float | None:
