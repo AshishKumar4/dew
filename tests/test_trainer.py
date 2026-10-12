@@ -123,6 +123,41 @@ def test_fit_trains_to_the_step_it_was_asked_for():
     assert int(state.step) == 4
 
 
+class TokenRegression(Regression):
+    counts_tokens = True
+
+    def real_lengths(self, batch):
+        return batch["index"] + 1
+
+
+@pytest.mark.parametrize("log_every", [1, 4])
+@pytest.mark.parametrize("accumulation", [1, 2])
+def test_a_real_token_budget_counts_each_microbatch_without_padding(log_every, accumulation):
+    tracker = RecordingTracker()
+    trainer = make_trainer(objective=TokenRegression(), tracker=tracker, accumulation=accumulation)
+    state = trainer.fit(Data(), total_tokens=30, log_every=log_every)
+    assert int(state.step) == 3  # Eight rows of lengths 1, 2, 3 cross 30 at 48.
+    if log_every == 1:
+        assert [scalars["train/tokens"] for _, scalars in tracker.scalars if "train/tokens" in scalars] == [
+            8, 16, 24]
+
+
+def test_a_token_budget_and_step_cap_stop_at_the_first_reached():
+    state = make_trainer(objective=TokenRegression()).fit(Data(), steps=2, total_tokens=30)
+    assert int(state.step) == 2
+
+
+def test_a_token_budget_resumes_its_count_from_the_checkpoint(tmp_path):
+    first = make_trainer(tmp_path, objective=TokenRegression())
+    assert int(first.fit(Data(), steps=2, total_tokens=30, log_every=1).step) == 2
+    assert first.checkpoints.control(2)["tokens"] == 24
+    resumed = make_trainer(tmp_path, objective=TokenRegression())
+    assert int(resumed.fit(Data(), total_tokens=30, log_every=1).step) == 3
+    assert resumed.checkpoints.control(3)["tokens"] == 48
+    complete = make_trainer(tmp_path, objective=TokenRegression())
+    assert int(complete.fit(Data(), total_tokens=30).step) == 3
+
+
 def test_an_optim_config_is_built_over_the_updates_fit_makes():
     """Four steps of two microbatches are two updates: the run is the config built over two, bit
     for bit, not over four. Before fit there is no length to build it over."""
@@ -358,6 +393,13 @@ def test_fit_checkpoints_the_final_step(tmp_path):
     assert trainer.checkpoints.latest == 4
     assert os.path.isdir(tmp_path / "run" / "4")
     assert not os.path.exists(tmp_path / "run" / "0")
+
+
+@pytest.mark.parametrize("cadence, expected", [(None, set()), (2, {2, 4})])
+def test_final_checkpoint_policy_is_independent_of_the_cadence(tmp_path, cadence, expected):
+    trainer = make_trainer(tmp_path, keep=4)
+    trainer.fit(Data(), steps=5, checkpoint_every=cadence, checkpoint_final=False)
+    assert set(trainer.checkpoints._open().all_steps()) == expected
 
 
 def test_checkpoint_every_saves_on_its_own_cadence(tmp_path):
