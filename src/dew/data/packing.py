@@ -168,9 +168,10 @@ class PackedSource:
     lengths (`plan_windows`): the plan a published generation stores
     (`published`), or the one made from the lengths a source states when it
     is first read (`planned`). Either way the windows are read by index in
-    one global order."""
+    one global order. It reads windows, not its documents' records, so it
+    names them `documents` rather than wrapping them as a source."""
 
-    source: Source
+    documents: Source
     plan: _Published | _Held
 
     @classmethod
@@ -182,23 +183,23 @@ class PackedSource:
         return cls(source, _Held(source, pack))
 
     def describe(self) -> str:
-        return f"{self.source.describe()} {self.plan.kind} packing={self.plan.pack!r}"
+        return f"{self.documents.describe()} {self.plan.kind} packing={self.plan.pack!r}"
 
     def snapshot(self) -> Mapping[str, object]:
-        return {"source": self.source.snapshot(), "packing": self.order_fingerprints()}
+        return {"source": self.documents.snapshot(), "packing": self.order_fingerprints()}
 
     def order_fingerprints(self) -> Mapping[str, str]:
         return self.plan.fingerprints()
 
     def supports(self, read: Read) -> bool:
-        return self.source.supports("indexed" if read == "streamed" else read)
+        return self.documents.supports("indexed" if read == "streamed" else read)
 
     def records(self, read: Read) -> _PackedRows:
-        return _PackedRows(self.source.records(read), self.plan)
+        return _PackedRows(self.documents.records(read), self.plan)
 
     def metadata(self) -> Mapping[str, object]:
         return {
-            **self.source.metadata(),
+            **self.documents.metadata(),
             "windows": len(self.plan),
             "rows": len(self.plan),
             "valid_targets": self.plan.at("totals", 0),
