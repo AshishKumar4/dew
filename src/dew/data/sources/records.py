@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import bisect
+import io
 import itertools
 import threading
 from collections import OrderedDict
@@ -70,7 +71,7 @@ class ArrayRecords:
             else:
                 fs, path = Store(url, self.storage_options).cached().resolve()
                 pin = fs.open(path, "rb")
-                if not isinstance(pin.name, str):
+                if not isinstance(pin, io.BufferedReader) or not isinstance(pin.name, str):
                     pin.close()
                     raise ValueError(
                         f"ArrayRecord {url} needs mirror room for {_MAX_OPEN_SHARDS} physical shards "
