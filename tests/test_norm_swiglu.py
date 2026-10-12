@@ -442,12 +442,17 @@ def test_swiglu_refuses_broadcast_mixed_and_wide_dtypes():
                                           gated_product("swiglu", implementation="xla")(gate, up))
 
 
-def test_cpu_auto_and_forward_mode_are_portable():
+def test_auto_takes_the_generation_row_and_forward_mode_is_portable():
+    """Auto takes the device's measured kernel on a GPU Triton runs, XLA on a CPU."""
     from dew.nn.kernels import norm_swiglu
 
+    def expected(choice):
+        on_gpu = kernels.generation.triton_runs()
+        return kernels.generation.measured_kernel(choice, "xla") if on_gpu else "xla"
+
     x = jnp.ones((2, 17), jnp.float32)
-    assert norm_swiglu.rms_kernel("auto", x, None, x.dtype, fp32_statistics=True) == "xla"
-    assert norm_swiglu.swiglu_kernel("auto", x, x) == "xla"
+    assert norm_swiglu.rms_kernel("auto", x, None, x.dtype, fp32_statistics=True) == expected("rms_norm")
+    assert norm_swiglu.swiglu_kernel("auto", x, x) == expected("swiglu")
     with forward_mode_attention():
         assert norm_swiglu.rms_kernel("pallas", x, None, x.dtype, fp32_statistics=True) == "xla"
         assert norm_swiglu.swiglu_kernel("pallas", x, x) == "xla"
@@ -551,6 +556,56 @@ def test_seam_and_product_run_per_shard_as_on_one_device(split):
         meshed = jax.jit(functools.partial(run, RESIDUAL, MLP_HIDDEN))()
     for mine, theirs in zip(jax.tree.leaves(meshed), jax.tree.leaves(alone), strict=True):
         assert relative(mine, theirs) < 1e-6
+
+
+@pytest.mark.mesh(devices=2)
+def test_a_narrow_weight_gradient_sums_its_shards_before_it_rounds():
+    """Rows split over two shards: each shard's bf16-rounded sum would lose
+    the 1/256 that the whole column's fp32 sum keeps (1 + 1/256 rounds to 1)."""
+    from dew.nn.sharding import RESIDUAL
+    from dew.training import MeshSpec
+
+    x = jnp.ones((4, 1, 1), jnp.float32)
+    dy = jnp.asarray([1.0, 1 / 256, -1.0, 0.0], jnp.float32).reshape(x.shape)
+    scale = jnp.ones((1,), jnp.bfloat16)
+
+    def dscale(x, scale):
+        return jax.vjp(lambda scale: rms_normalized(
+            x, scale, 0.0, x.dtype, scale_offset=False, scale_after_cast=False, fp32_statistics=True,
+            implementation="pallas", axes=RESIDUAL), scale)[1](dy)[0]
+
+    with jax.set_mesh(MeshSpec(fsdp=2).build(jax.devices()[:2])):
+        assert "shard_map" in str(jax.make_jaxpr(dscale)(x, scale))
+        meshed = jax.jit(dscale)(x, scale)
+    assert meshed.dtype == jnp.bfloat16
+    np.testing.assert_array_equal(np.asarray(meshed, np.float32), [1 / 256])
+
+
+@pytest.mark.mesh(devices=2)
+def test_any_varying_operand_refuses_both_kernels_in_a_checked_shard_map():
+    """A Pallas call states no varying type for its result, so a stream,
+    weight, branch, gate or up that varies inside a checking shard_map keeps
+    XLA, even where the first operand is replicated."""
+    from jax.sharding import PartitionSpec
+
+    from dew.nn.kernels import norm_swiglu
+    from dew.training import MeshSpec
+
+    mesh = MeshSpec(fsdp=2).build(jax.devices()[:2])
+    replicated, rows = jnp.ones((2, 8), jnp.float32), jnp.ones((4, 8), jnp.float32)
+    chosen = {}
+
+    def local(replicated, varying):
+        chosen["branch"] = norm_swiglu.rms_kernel("pallas", replicated, None, jnp.float32,
+                                                  fp32_statistics=True, branch=varying)
+        chosen["gate"] = norm_swiglu.gated_rms_kernel("pallas", replicated, varying, None, jnp.float32,
+                                                      "silu")
+        chosen["up"] = norm_swiglu.swiglu_kernel("pallas", replicated, varying)
+        return varying
+
+    jax.make_jaxpr(jax.shard_map(local, mesh=mesh, in_specs=(PartitionSpec(), PartitionSpec("fsdp")),
+                                 out_specs=PartitionSpec("fsdp")))(replicated, rows)
+    assert chosen == {"branch": "xla", "gate": "xla", "up": "xla"}, chosen
 
 
 def test_expert_jvp_refuses_swiglu_once_and_matches_xla(monkeypatch, caplog):
