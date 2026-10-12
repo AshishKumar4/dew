@@ -97,7 +97,7 @@ def _piece(index, layout):
     piece = sum((index >= first).astype(jnp.int32) for first, _ in layout[1:]) if len(layout) > 1 else 0
     normalised = functools.reduce(
         jnp.logical_or, [piece == number for number, (_, norm) in enumerate(layout) if norm],
-        jnp.bool_(False))
+        jnp.zeros((), bool))
     return piece, normalised
 
 

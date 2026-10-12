@@ -3,7 +3,7 @@
 Host tests interpret the kernels at small shapes, where they hold the runs a program walks, the pieces
 it writes and each gradient to `xla_conv1d`, with the float64 conv as the truth. The kernel lab's GPU
 tier runs them on the GPU, with the training shapes' tests: there each output's and gradient's float64
-distance is held to XLA's own.
+distance is held to XLA's own by tests/reference_error.py's rule.
 """
 
 import jax
@@ -12,7 +12,7 @@ import numpy as np
 import pytest
 from fla_gdn_support import KernelCase
 from kernel_compile import compile_kernels
-from reference_error import assert_rounds_where_the_reference_does, distance, within
+from reference_error import assert_as_exact_as_the_reference, assert_rounds_where_the_reference_does, within
 
 from dew.nn.kernels import generation, short_conv
 from dew.nn.linear import causal_conv1d, conv_refusal, xla_conv1d
@@ -52,7 +52,8 @@ def run(conv, x, weights, shift, valid, parts, dtype, grads, activation=True):
 
 def kernel_conv(x, weights, activation, shift, *, valid, parts, dtype):
     return short_conv.conv(x, weights, shift, None if valid is None else valid.astype(jnp.int8), parts,
-                           activation, 1e-6, jnp.dtype(dtype), jax.default_backend() != "gpu")
+                           activation=activation, eps=1e-6, dtype=jnp.dtype(dtype),
+                           interpret=jax.default_backend() != "gpu")
 
 
 def truth(x, weights, shift, valid, parts, grads, activation=True):
@@ -162,17 +163,17 @@ TRAINING_SHAPES = {
 @pytest.mark.parametrize("model", sorted(TRAINING_SHAPES))
 def test_the_kernels_are_as_exact_as_xla_at_the_training_shapes(model):
     """A delta net's conv at its training shape, bf16 projections into the bf16 operands fla's rule
-    takes: each piece's and gradient's RMS distance from float64 at most XLA's own conv's."""
+    takes: each piece and gradient as exact as XLA's own conv (`assert_as_exact_as_the_reference`)."""
     shape, parts = TRAINING_SHAPES[model]
     x, weights, _, _ = operands(*shape, parts)
     grads = cotangents(x, parts, jnp.bfloat16)
     got, got_grads = run(kernel_conv, x, weights, None, None, parts, jnp.bfloat16, grads)
     want, want_grads = run(xla_conv1d, x, weights, None, None, parts, jnp.bfloat16, grads)
     exact, exact_grads = truth(x, weights, None, None, parts, grads)
-    for label, mine, theirs, value in [*zip(("q", "k", "v"), got, want, exact, strict=True),
-                                       *zip(("dx", "dtaps"), got_grads, want_grads, exact_grads)]:
-        ours, xla = distance(mine, value), distance(theirs, value)
-        assert within(ours, xla), f"{model} {label}: kernels {ours:.3e} from float64, XLA {xla:.3e}"
+    labels = ("q", "k", "v", "dx", "dtaps")
+    for label, mine, theirs, value in zip(labels, (*got, *got_grads), (*want, *want_grads),
+                                          (*exact, *exact_grads), strict=True):
+        assert_as_exact_as_the_reference(mine, theirs, value, f"{model} {label}")
 
 
 def training_cases():
@@ -187,15 +188,16 @@ def training_cases():
 
             def grads(x, weights, shift, kept):
                 def loss(x, weights, shift):
-                    out_ = short_conv.conv(x, weights, shift, kept, parts, True, 1e-6, jnp.dtype(out), False)
+                    out_ = short_conv.conv(x, weights, shift, kept, parts, activation=True, eps=1e-6,
+                                           dtype=jnp.dtype(out), interpret=False)
                     return sum(jnp.sum(piece.astype(jnp.float32)) for piece in out_)
                 return jax.grad(loss, argnums=(0, 1, 2))(x, weights, shift)
             return grads, (x, weights, shift, kept)
         return KernelCase(name, call)
 
     for model, (shape, parts) in sorted(TRAINING_SHAPES.items()):
-        yield case(f"{model}/delta", shape, parts, jnp.bfloat16, False, True)
-    yield case("mamba", (8, 3072), ((3072, None),), jnp.float32, True, False)
+        yield case(f"{model}/delta", shape, parts, jnp.bfloat16, bias=False, valid=True)
+    yield case("mamba", (8, 3072), ((3072, None),), jnp.float32, bias=True, valid=False)
 
 
 @pytest.mark.parametrize("target", ["sm80", "sm89", "sm120"])
