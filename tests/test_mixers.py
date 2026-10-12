@@ -221,6 +221,10 @@ def test_a_packed_row_computes_what_its_documents_compute_alone(kind):
     a document boundary, nor between the documents and the segment-0 padding after them. The
     float64 truth is the documents run alone in float64, the fp32 runs at IEEE products, as the
     rule's references take theirs."""
+    if jax.default_backend() == "gpu":
+        pytest.skip("a GPU's XLA picks GEMM algorithms by shape, so a packed row and its documents "
+                    "alone sum in different orders and one draw of each measures luck; isolation on a "
+                    "GPU is test_no_token_reaches_another_document's, bitwise")
     fields, overrides = KIND_FIELDS.get(kind, ({}, {}))
     model = tiny(mixer=mixers.build(kind, **fields), max_seq_len=32, **overrides)
     tokens = jax.random.randint(jax.random.key(3), (1, sum(DOCUMENTS)), 0, VOCAB)
@@ -238,3 +242,39 @@ def test_a_packed_row_computes_what_its_documents_compute_alone(kind):
                                                    jnp.asarray(cotangent, jnp.float64))
     assert_leaves_as_exact({"logits": packed, "grads": packed_grads}, {"logits": alone, "grads": alone_grads},
                            {"logits": truth, "grads": truth_grads}, reductions=sum(DOCUMENTS))
+
+
+@pytest.mark.parametrize("kind", sorted(mixers.paths))
+def test_no_token_reaches_another_document(kind):
+    """Every mixer in the registry, on every backend: in a packed row (two documents, then segment-0
+    padding), changing the first document's tokens and the padding's leaves the second document's
+    logits, and the gradients of a loss on them alone, bitwise as they were. The same program on the
+    same shapes, so any difference is information crossing a document boundary."""
+    if kind in REFUSED:
+        pytest.skip(f"{kind} refuses packed rows")
+    fields, overrides = KIND_FIELDS.get(kind, ({}, {}))
+    model = tiny(mixer=mixers.build(kind, **fields), max_seq_len=32, **overrides)
+    first, second = DOCUMENTS
+    total = first + second + PADDING
+    segments = jnp.asarray([[1] * first + [2] * second + [0] * PADDING], jnp.int32)
+    positions = jnp.asarray([[*range(first), *range(second)] + [0] * PADDING], jnp.int32)
+    tokens = jax.random.randint(jax.random.key(3), (1, total), 0, VOCAB)
+    changed = tokens.at[:, :first].set((tokens[:, :first] + 7) % VOCAB)
+    changed = changed.at[:, first + second:].set((changed[:, first + second:] + 5) % VOCAB)
+    variables = model.init(jax.random.key(4), tokens)
+    weight = jax.random.normal(jax.random.key(5), (1, total, VOCAB))
+    weight = weight.at[:, :first].set(0).at[:, first + second:].set(0)
+    tokens_at = coordinates(segments=segments, positions=positions, max_segments=3)
+
+    def second_document(row):
+        def loss(variables):
+            logits = model.apply(variables, row, coordinates=tokens_at)
+            return jnp.sum(logits * weight), logits[:, first:first + second]
+
+        (_, logits), grads = jax.value_and_grad(loss, has_aux=True)(variables)
+        return logits, grads
+
+    for (path, mine), theirs in zip(jax.tree_util.tree_leaves_with_path(second_document(changed)),
+                                    jax.tree.leaves(second_document(tokens)), strict=True):
+        np.testing.assert_array_equal(np.asarray(mine), np.asarray(theirs),
+                                      err_msg=jax.tree_util.keystr(path))

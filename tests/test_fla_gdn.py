@@ -6,6 +6,7 @@ speed against fla's kernels are the GPU session's (c53 onwards).
 """
 
 import functools
+import itertools
 
 import fla_gdn_support as support
 import jax
@@ -422,6 +423,63 @@ def test_dews_fla_rule_follows_the_recurrence_for_any_heads_widths_and_length(
     names = ("out", "final", "q", "k", "v", "g", "beta", "h0")
     for name, mine, theirs in zip(names, port, truth, strict=True):
         assert mine.shape == theirs.shape, name
+        assert relative(mine, theirs) < 1e-4, name
+
+
+def test_dews_fla_rule_runs_packed_documents_as_flas_varlen_sequences():
+    """Packed documents (`starts`, at most `max_segments` a row) as fla's varlen sequences: each
+    document from a zero memory but a row's first, from the row's, the row's final memory its last
+    document's; output, final memory and gradients within fp32 rounding of the token recurrence run
+    document by document in float64. Documents start on and off the chunk grid, one shorter than a
+    chunk and one longer."""
+    batch, length, key_heads, value_heads, width = 2, 150, 1, 2, 64
+    cuts = ((0, 37, 100), (0, 64))
+    starts = np.zeros((batch, length), bool)
+    for row, begins in enumerate(cuts):
+        starts[row, list(begins[1:])] = True
+    keys = jax.random.split(jax.random.key(19), 8)
+    q = l2norm(jax.random.normal(keys[0], (batch, length, key_heads, width)))
+    k = l2norm(jax.random.normal(keys[1], (batch, length, key_heads, width)))
+    v = jax.random.normal(keys[2], (batch, length, value_heads, width))
+    g = -jnp.exp(jax.random.normal(keys[3], (batch, length, value_heads)) - 3.0)
+    beta = jax.nn.sigmoid(jax.random.normal(keys[4], (batch, length, value_heads)))
+    h0 = 0.1 * jax.random.normal(keys[5], (batch, value_heads, width, width))
+    do = jax.random.normal(keys[6], v.shape)
+    dht = 0.1 * jax.random.normal(keys[7], h0.shape)
+    group = value_heads // key_heads
+
+    def documents(q, k, v, g, beta, h0):
+        """The recurrence document by document, each row's first from its memory."""
+        q, k = jnp.repeat(q, group, axis=2), jnp.repeat(k, group, axis=2)
+        outs, finals = [], []
+        for row, begins in enumerate(cuts):
+            state, pieces = h0[row:row + 1], []
+            for begin, end in itertools.pairwise((*begins, length)):
+                state = state if begin == 0 else jnp.zeros_like(state)
+                out, state = rule_math(*(x[row:row + 1, begin:end] for x in (q, k, v, g, beta)), state)
+                pieces.append(out)
+            outs.append(jnp.concatenate(pieces, axis=1))
+            finals.append(state)
+        return jnp.concatenate(outs), jnp.concatenate(finals)
+
+    def through(rule, do, dht):
+        def loss(*args):
+            out, final = rule(*args)
+            return jnp.sum(out * do) + jnp.sum(final * dht), (out, final)
+
+        def run(*args):
+            (_, (out, final)), grads = jax.value_and_grad(loss, argnums=range(6), has_aux=True)(*args)
+            return out, final, *grads
+
+        return run
+
+    packed = functools.partial(fla_rule, starts=jnp.asarray(starts), max_segments=3)
+    port = through(packed, do, dht)(q, k, v, g, beta, h0)
+    with jax.enable_x64(new_val=True):
+        operands = wide(q, k, v, g, beta, h0, do, dht)
+        truth = jax.tree.map(np.asarray, through(documents, *operands[6:])(*operands[:6]))
+    names = ("out", "final", "q", "k", "v", "g", "beta", "h0")
+    for name, mine, theirs in zip(names, port, truth, strict=True):
         assert relative(mine, theirs) < 1e-4, name
 
 
