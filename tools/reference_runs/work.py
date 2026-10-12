@@ -66,7 +66,7 @@ def qwen35(args) -> WorkloadWork:
 
     batch, sequence = (2, 16) if args.smoke else (8, 3072)
     if args.smoke:
-        fields = translate_config(config(True))
+        fields = translate_config(config(smoke=True))
         fields.update(dtype=args.dtype, attention_impl=args.attention)
         model = fields.value.clone(remat=None)
     else:
