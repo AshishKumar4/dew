@@ -366,6 +366,46 @@ def test_lambda_identity_requires_explicit_non_exact_resume():
     assert plan.check(plan.record(), resume="non-exact") == ()
 
 
+@dataclasses.dataclass(frozen=True)
+class Shifting:
+    by: int
+
+    def __call__(self, metadata):
+        return Shift(self.by)
+
+
+@pytest.mark.parametrize("read", ["indexed", "memory"])
+def test_a_lambda_step_needs_a_non_exact_resume_whether_or_not_memory_ran_it(read):
+    """A lambda has no stable identity, so a plan that runs one is not exact
+    and resumes only with resume='non-exact'. Read into memory beside a
+    configured step, the lambda is one of the steps the memory read already
+    ran into the rows it holds, which the plan counts as it counts its own."""
+    def compiled(resume):
+        lambdas = Pipeline(source(8)).map(lambda row: row, rejects=False)
+        return compile(lambdas.map(Configured(Shifting(1), needs=())).batch(2),
+                       read=read, loading=READ, resume=resume)
+
+    data = compiled("exact")
+    assert data.plan.record()["exact"] is False
+    first = data.train(DataPartition())
+    try:
+        next(first)
+        state = first.get_state()
+    finally:
+        first.close()
+    again = compiled("exact").train(DataPartition())
+    try:
+        with pytest.raises(ValueError, match="resume='non-exact' is required"):
+            again.set_state(state)
+    finally:
+        again.close()
+    resumed = compiled("non-exact").train(DataPartition())
+    try:
+        resumed.set_state(state)
+    finally:
+        resumed.close()
+
+
 def test_cold_warm_and_resumed_cache_keep_per_epoch_randomness(tmp_path):
     stored = source(8)
     cache = Cache(str(tmp_path / "cache"), shard_bytes=2048, spool_bytes=2 * 1024**2)
