@@ -1065,8 +1065,9 @@ def local_trainer(tmp_path, **kwargs):
 def test_terminal_local_cadence_does_not_need_a_final_persistent_save(tmp_path):
     trainer = local_trainer(tmp_path)
     trainer.fit(Data(), steps=2, checkpoint_final=False)
-    assert Checkpoints(str(tmp_path / "local")).latest == 2
-    assert trainer.checkpoints.latest is None
+    restored, _, _ = local_trainer(tmp_path).place()
+    assert int(restored.step) == 2
+    assert not os.path.exists(tmp_path / "run" / "2")
 
 
 def stop_at_local_step(trainer, stop: int):
@@ -1090,18 +1091,17 @@ def stop_at_local_step(trainer, stop: int):
 def test_the_local_checkpoint_is_written_on_its_own_cadence_and_keeps_the_newest(tmp_path):
     """Local every two, persistent every three: after eight steps the
     persistent directory holds 3, 6 and the final 8 with their losses, the
-    local one holds 6 alone (2 and 4 replaced, the end of the run being the
-    persistent save's), and the persistent directory holds nothing of the
+    local one holds 8 alone (2, 4 and 6 replaced), and the persistent directory holds nothing of the
     local cadence."""
     trainer = local_trainer(tmp_path)
     trainer.fit(Data(), steps=8, log_every=1, checkpoint_every=3)
     checkpoints = trainer.checkpoints
 
     assert sorted(checkpoints._open().all_steps()) == [3, 6, 8]
-    assert sorted(checkpoints._open_local().all_steps()) == [6]
+    assert sorted(checkpoints._open_local().all_steps()) == [8]
     assert checkpoints.best in (3, 6, 8)
     assert checkpoints.local_path == str(tmp_path / "local" / "process0")
-    assert (tmp_path / "local" / "process0" / "6" / "commit_success.txt").exists()
+    assert (tmp_path / "local" / "process0" / "8" / "commit_success.txt").exists()
     assert not (tmp_path / "local" / "process0" / "4").exists()
     assert not (tmp_path / "run" / "4").exists()
 
