@@ -6,8 +6,9 @@ import dataclasses
 import inspect
 import itertools
 import math
+import types
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from typing import TYPE_CHECKING, Concatenate, Literal, Protocol, cast, runtime_checkable
+from typing import TYPE_CHECKING, Concatenate, Literal, Protocol, TypeGuard, runtime_checkable
 
 import grain.python as pygrain
 import numpy as np
@@ -32,11 +33,21 @@ type Record = Batch | bytes | Rejected | None
 type RecordStep = pygrain.MapTransform | Callable[[Batch], Batch | Rejected]
 type RandomStep = pygrain.RandomMapTransform | Callable[[Batch, np.random.Generator], Batch | Rejected]
 type HostStep = Callable[[Batch], Batch] | pygrain.MapTransform
+type ColumnStep = Callable[[dict[str, list]], Mapping[str, Sequence]]
+"""A function of records read as a dict of columns, each a list, as Hugging
+Face's `map(batched=True)` reads them."""
 
 
 @runtime_checkable
 class Rejecting(Protocol):
     rejects: bool
+
+
+@runtime_checkable
+class Reasoned(Protocol):
+    """A predicate that names what it drops (`images.min_side`'s "too_small")."""
+
+    reason: str
 
 
 @runtime_checkable
@@ -127,7 +138,7 @@ class Batched:
     records that replace the group. The last group of a finite pass may be
     smaller."""
 
-    step: Callable[[dict[str, list]], dict[str, Sequence]]
+    step: ColumnStep
     size: int
     identity: str | None = None
     same_rows: bool = True
@@ -360,7 +371,11 @@ class Dataset:
 
     def chain(self) -> Pipeline:
         """This dataset as a store and its stages, a store's being none."""
-        return Pipeline(cast("Source", self))
+        from dew.data.sources.base import Source
+
+        if not isinstance(self, Source):
+            raise TypeError(f"{type(self).__name__} is a Dataset that is neither a store nor a chain")
+        return Pipeline(self)
 
     def holdout(self, fraction: float | None = None, *, key: str | None = None, records: int | None = None,
                 split: str | None = None, **named: float) -> tuple[Dataset, ...]:
@@ -404,11 +419,12 @@ class Dataset:
         if self.batched:
             if batched:
                 raise ValueError("after batch, map already reads the training batch")
-            return self.then(*(MapBatch(cast("HostStep", step), identity) for step in steps))
+            hosts = [step for step in steps if _host(step)]
+            if len(hosts) < len(steps):
+                raise TypeError("after batch, map takes functions of the training batch that keep every row")
+            return self.then(*(MapBatch(step, identity) for step in hosts))
         if batched:
-            return self.then(*(Batched(cast("Callable[[dict[str, list]], dict[str, Sequence]]", step),
-                                       batch_size,
-                                       identity) for step in steps))
+            return self.then(*(Batched(step, batch_size, identity) for step in _columns(steps)))
         for step in steps:
             if isinstance(step, pygrain.RandomMapTransform):
                 raise TypeError(f"{_named_step(step)} draws from a generator; apply it with random_map")
@@ -457,19 +473,19 @@ class Dataset:
     ) -> Pipeline:
         """Keep the records `predicate` accepts; the rest are counted under
         `reason`, by default the predicate's own (`images.min_side`'s "too_small")."""
-        return self.then(Filter(predicate, reason or getattr(predicate, "reason", "filtered"), identity))
+        return self.then(Filter(predicate, reason or _reason(predicate), identity))
 
-    def flat_map(self, step: Expansion | Callable[[dict[str, list]], dict[str, list]], *,
-                 batched: bool = False,
+    def flat_map(self, step: Expansion | ColumnStep, *, batched: bool = False,
                  batch_size: int = 1000, identity: str | None = None) -> Pipeline:
         """One record to any number: the step returns a record's records. With
         `batched`, it reads `batch_size` records at a time as a dict of columns
         and returns columns of any length, the records that replace them."""
         if batched:
-            return self.then(Batched(cast("Callable[[dict[str, list]], dict[str, Sequence]]", step),
-                                     batch_size,
-                                     identity, same_rows=False))
-        return self.then(FlatMap(cast("Expansion", step), identity))
+            (columns,) = _columns((step,))
+            return self.then(Batched(columns, batch_size, identity, same_rows=False))
+        if not isinstance(step, Expansion):
+            raise TypeError(f"{_named_step(step)} is a function of columns; flat_map reads it batched=True")
+        return self.then(FlatMap(step, identity))
 
     @property
     def batched(self) -> bool:
@@ -615,7 +631,8 @@ class Dataset:
                 next(reader)
             return dict(loader.statistics())
         finally:
-            cast("Closeable", reader).close()
+            if isinstance(reader, Closeable):
+                reader.close()
 
     def read(self, mode: Read) -> Pipeline:
         """Read the stores this way, rather than as they prefer: "memory" holds
@@ -658,7 +675,8 @@ class Dataset:
                 yield batch if batched else {
                     name: value[0] for name, value in batch.items() if name != VALID_ROWS}
         finally:
-            cast("Closeable", reader).close()
+            if isinstance(reader, Closeable):
+                reader.close()
 
     def show(self, count: int = 8) -> None:
         """Print the first `count` records."""
@@ -714,14 +732,16 @@ class _Kept:
 
 def concat(datasets: Sequence[Dataset]) -> Pipeline:
     """The records of `datasets`, stores read one after another, as one dataset."""
+    from dew.data.sources.base import Source
     from dew.data.sources.concatenate import Concatenate
 
-    if any(isinstance(dataset, Pipeline) for dataset in datasets):
+    stores = tuple(dataset for dataset in datasets if isinstance(dataset, Source))
+    if len(stores) < len(datasets):
         raise ValueError("concat joins stores; add the steps after it, or mix datasets that have steps")
-    return Pipeline(Concatenate(tuple(cast("Source", dataset) for dataset in datasets)))
+    return Pipeline(Concatenate(stores))
 
 
-def _shown(value: object) -> object:
+def _shown[Field](value: np.ndarray | bytes | Field) -> np.ndarray | bytes | Field | str:
     """A field as `show` prints it: an array as its shape and dtype, bytes as their length."""
     if isinstance(value, np.ndarray) and value.size > 16:
         return f"{value.dtype}{list(value.shape)}"
@@ -761,11 +781,39 @@ class ObjectiveData:
     evaluate_batch: tuple[HostStep, ...] = ()
 
 
-def _named_step(step: object) -> str:
-    return getattr(step, "__qualname__", None) or type(step).__name__
+type _Step = RecordStep | RandomStep | HostStep | Configured | Expansion | ColumnStep
 
 
-def _declares_rejects(step: object) -> bool:
+def _named_step(step: _Step) -> str:
+    if isinstance(step, types.FunctionType | types.MethodType | types.BuiltinFunctionType):
+        return step.__qualname__
+    return type(step).__name__
+
+
+def _reason(predicate: Callable[[Batch], bool]) -> str:
+    return predicate.reason if isinstance(predicate, Reasoned) else "filtered"
+
+
+def _host(step: RecordStep | Configured | HostStep) -> TypeGuard[HostStep]:
+    """Whether `step` can read a training batch: a function or a Grain map that
+    neither drops rows nor waits on a source's facts."""
+    return not isinstance(step, Configured | pygrain.RandomMapTransform) and not _declares_rejects(step)
+
+
+def _columns(steps: Sequence[_Step]) -> list[ColumnStep]:
+    """`steps` as functions of columns, refusing a record transform."""
+    columns = [step for step in steps if _reads_columns(step)]
+    if len(columns) < len(steps):
+        raise TypeError("a batched step is a function of columns, not a record transform")
+    return columns
+
+
+def _reads_columns(step: _Step) -> TypeGuard[ColumnStep]:
+    return callable(step) and not isinstance(
+        step, pygrain.MapTransform | pygrain.RandomMapTransform | Configured | Expansion)
+
+
+def _declares_rejects(step: _Step) -> bool:
     """Whether `step` says it drops records, with a `rejects` flag (`images.fetch`, `images.decode`)."""
     return isinstance(step, Rejecting) and bool(step.rejects)
 

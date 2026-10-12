@@ -8,7 +8,7 @@ import functools
 import inspect
 import threading
 from collections.abc import Callable, Mapping, Sequence
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Literal, Protocol
 
 import grain.python as grain
 import numpy as np
@@ -18,6 +18,9 @@ from dew.data.dataset import Batch
 from dew.data.image_codec import decode_image
 from dew.data.images import Augment, as_rgb, augment_image, import_opencv, resize_image
 from dew.data.pipeline import Rejected
+
+if TYPE_CHECKING:
+    import torch
 
 
 def _payload(image: bytes | Mapping[str, object] | ArrayLike) -> bytes | ArrayLike:
@@ -261,11 +264,25 @@ class ColorJitter(grain.RandomMapTransform):
         return {**element, self.field: np.rint(pixels).astype(np.uint8)}
 
 
+class ImageProcessor(Protocol):
+    """A Hugging Face image processor, as `Processor` calls it."""
+
+    def __call__(self, *, images: np.ndarray, return_tensors: str) -> Mapping[str, np.ndarray]: ...
+
+
+class Augmentation(Protocol):
+    """An albumentations pipeline (`Compose`), as `Albumentations` seeds and calls it."""
+
+    def set_random_seed(self, seed: int) -> None: ...
+
+    def __call__(self, *, image: np.ndarray) -> Mapping[str, np.ndarray]: ...
+
+
 @dataclasses.dataclass(frozen=True, eq=False)
 class Processor(grain.MapTransform):
     """A Hugging Face image processor's `pixel_values` for the image in `field`, under `to`."""
 
-    processor: Any
+    processor: ImageProcessor
     field: str = "image"
     to: str = "pixel_values"
 
@@ -280,7 +297,7 @@ _torch_rng = threading.Lock()
 class _ThreadCopy(threading.local):
     """A thread's own copy of a stage's pipeline, made when the thread first runs the stage."""
 
-    transform: Any = None
+    transform: Augmentation | None = None
 
 
 @dataclasses.dataclass(frozen=True, eq=False)
@@ -292,7 +309,7 @@ class Albumentations(grain.RandomMapTransform):
     two, and a record's draw is the same at any thread count and after a
     resume."""
 
-    transform: Any
+    transform: Augmentation
     field: str = "image"
 
     @functools.cached_property
@@ -318,7 +335,7 @@ class Torchvision(grain.RandomMapTransform):
     process, so the transform runs one record at a time in each process, the
     generator seeded inside that turn and restored after it."""
 
-    transform: Any
+    transform: Callable[[torch.Tensor], torch.Tensor]
     field: str = "image"
 
     def random_map(self, element: Batch, rng: np.random.Generator) -> Batch:
