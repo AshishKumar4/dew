@@ -588,6 +588,9 @@ def _capabilities(pipelines: Sequence[Pipeline], read: Read, provision: bool) ->
     missing = _unsupported(pipelines, read)
     if provision:
         for source in missing:
+            # A split or a slice reads its source's records, so that source is what provisions.
+            while isinstance(source, _Wrapping) and not isinstance(source, _Provisionable):
+                source = source.source
             if isinstance(source, _Provisionable):
                 source.provision()
     refused = [source.describe() for source in missing if not source.supports(read)]
