@@ -502,6 +502,20 @@ class Dataset:
     def map_batch(self, *steps: HostStep, identity: str | None = None) -> Pipeline:
         return self.then(*(MapBatch(step, identity) for step in steps))
 
+    def unbatch(self) -> Pipeline:
+        """Each row of each batch record as a record of its own."""
+        return self.then(FlatMap(_Unbatched()))
+
+    def publish(self, url: str):
+        """Run this dataset's deterministic steps once over every record and
+        commit the result at `url` as a versioned generation, which `cache`
+        reads in their place: the same bytes on every later read and resume."""
+        from dew.data.cache import Cache
+        from dew.data.compile import publish
+
+        chain = self if isinstance(self, Pipeline) else Pipeline(self)
+        return publish(chain, Cache(url), read=chain.mode or "streamed", provision=True, **_loading(chain))
+
     def rename(self, **names: str) -> Pipeline:
         """Each record with its field `old` under the name `new`, as `rename(caption="txt")`."""
         return self.map(_Renamed(tuple(names.items())), identity=f"dew.rename:{sorted(names.items())}")
@@ -527,11 +541,22 @@ class Dataset:
             loading, threads=count, read_buffer=max(loading.read_buffer, count)))
 
     def iterate(self) -> Iterator[Batch]:
-        """This dataset's records, one pass, as a run would read them."""
-        from dew.data.compile import iterate
+        """This dataset's records, or its batches where it batches, read as a
+        run reads them: one pass, or endlessly after a `repeat`."""
+        from dew.data.compile import validation
+        from dew.data.dataset import DataPartition
+        from dew.objectives.base import VALID_ROWS
 
         chain = self if isinstance(self, Pipeline) else Pipeline(self)
-        return iter(iterate(chain, read=chain.mode, provision=True, **_loading(chain)))
+        batched = any(isinstance(stage, (BatchStage, TokenBudget)) for stage in chain.stages)
+        reader = validation(chain if batched else chain.batch(1, drop_remainder=False), batch=1,
+                            read=chain.mode, provision=True, **_loading(chain))(DataPartition())
+        try:
+            for batch in reader:
+                yield batch if batched else {
+                    name: value[0] for name, value in batch.items() if name != VALID_ROWS}
+        finally:
+            reader.close()
 
     def show(self, count: int = 8) -> None:
         """Print the first `count` records."""
@@ -572,6 +597,22 @@ class _Selected:
 
     def __call__(self, record: Batch) -> Batch:
         return {name: record[name] for name in self.fields}
+
+
+@dataclasses.dataclass(frozen=True)
+class _Unbatched:
+    def flat_map(self, batch: Batch) -> list[Batch]:
+        rows = len(next(iter(batch.values())))
+        return [{name: value[row] for name, value in batch.items()} for row in range(rows)]
+
+
+def concat(datasets: Sequence[Dataset]) -> Pipeline:
+    """The records of `datasets`, stores read one after another, as one dataset."""
+    from dew.data.sources.concatenate import Concatenate
+
+    if any(isinstance(dataset, Pipeline) for dataset in datasets):
+        raise ValueError("concat joins stores; add the steps after it, or mix datasets that have steps")
+    return Pipeline(Concatenate(tuple(datasets)))
 
 
 def _loading(chain: Pipeline) -> dict[str, Loading]:

@@ -12,7 +12,7 @@ datasets. The stage libraries (`images`, `video`, `text`, `chat`, `prompts`,
 from . import chat, images, preferences, prompts, text, video
 from .chat import Role
 from .dataset import Batch, Loading
-from .pipeline import Dataset, Rejected, mix
+from .pipeline import Dataset, Rejected, concat, mix
 from .sources import TFDS, Files, Hub, Memory, Source, Torch, from_grain, from_hf, from_torch
 from .text import ByteTokenizer, HFTokenizer
 
@@ -31,6 +31,7 @@ __all__ = [
     "Source",
     "Torch",
     "chat",
+    "concat",
     "from_grain",
     "from_hf",
     "from_torch",
