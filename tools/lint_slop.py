@@ -99,7 +99,7 @@ NARROWERS = {"Mapping", "MutableMapping", "dict", "Dict", "Sequence", "list", "t
              "int", "float", "bool", "bytes"}
 # Process-wide state a module must not change while it is imported.
 GLOBAL_WRITES = ("config.update", "environ.setdefault", "environ.update", "putenv", "basicConfig",
-                 "mark_as_parsed", "register_event_listener", "filterwarnings", "simplefilter")
+                 "register_event_listener", "filterwarnings", "simplefilter")
 
 
 @dataclass(frozen=True)
