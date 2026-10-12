@@ -15,13 +15,17 @@ from typing import Literal
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.attention import LayerNorm, RMSNorm, scaled_dot_product_attention
 from dew.nn.backbones.decoder_block import GatedMLP
+from dew.nn.flops import MissingFlopsCount, attention_flops, matching_lengths, projection_flops
 from dew.nn.rope import rotate
 from dew.nn.sharding import logical_axes
+
+TIME_FEATURES = 256
 
 
 class Modulation(nn.Module):
@@ -39,9 +43,18 @@ class Modulation(nn.Module):
     dtype: Dtype | None = None
     precision: PrecisionLike = None
 
+    @property
+    def output_features(self) -> int:
+        return self.pieces * self.features
+
+    @nn.nowrap
+    def model_flops(self, lengths, input_features: int | None = None) -> float:
+        return projection_flops(lengths, self.features if input_features is None else input_features,
+                                self.output_features)
+
     @nn.compact
     def __call__(self, conditioning):
-        projected = nn.Dense(self.pieces * self.features, use_bias=self.bias, dtype=self.dtype,
+        projected = nn.Dense(self.output_features, use_bias=self.bias, dtype=self.dtype,
                              precision=self.precision, name="linear",
                              kernel_init=(nn.initializers.zeros if self.zero_init
                                           else nn.initializers.lecun_normal()))(nn.silu(conditioning))
@@ -72,6 +85,11 @@ def embedding(x, features: int, name: str, *, bias: bool = True, dtype: Dtype | 
     hidden = nn.Dense(features, use_bias=bias, dtype=dtype, precision=precision, name=f"{name}_linear_1")(x)
     return nn.Dense(features, use_bias=bias, dtype=dtype, precision=precision,
                     name=f"{name}_linear_2")(activation(hidden))
+
+
+def embedding_flops(lengths, input_features: int, features: int) -> float:
+    """The two maps that `embedding` builds around its activation."""
+    return projection_flops(lengths, input_features, features) + projection_flops(lengths, features, features)
 
 
 def guided_time(embed: Callable[[jax.Array, str], jax.Array], time, guidance, *, guidance_embeds: bool):
@@ -141,8 +159,35 @@ class JointAttention(nn.Module):
     attention_impl: str = "auto"  # an AttentionImpl
     force_fp32_for_softmax: bool = True
 
+    @property
+    def inner_features(self) -> int:
+        return self.heads * self.head_dim
+
+    @nn.nowrap
+    def model_flops(self, lengths) -> float:
+        raise MissingFlopsCount("JointAttention needs stream_flops with image/context feature widths")
+
+    @nn.nowrap
+    def stream_flops(self, lengths, context_lengths, image_features: int,
+                     context_features: int | None = None) -> float:
+        """Both streams' Q/K/V maps and joined QK/AV, with optional output maps."""
+        joined_streams = context_lengths is not None
+        context_lengths = (np.zeros(np.shape(lengths), np.int64)
+                           if context_lengths is None else context_lengths)
+        image, context = matching_lengths(lengths, context_lengths)
+        inner = self.inner_features
+        count = (3 * projection_flops(lengths, image_features, inner)
+                 + 3 * projection_flops(context_lengths, context_features or 0, inner)
+                 + attention_flops((image + context).astype(np.int64), self.heads,
+                                   self.head_dim, self.head_dim, causal=False))
+        if self.project or joined_streams:
+            count += projection_flops(lengths, inner, inner)
+            if self.context_out:
+                count += projection_flops(context_lengths, inner, inner)
+        return count
+
     def _heads(self, name: str, x):
-        projected = nn.Dense(self.heads * self.head_dim, use_bias=self.bias, dtype=self.dtype,
+        projected = nn.Dense(self.inner_features, use_bias=self.bias, dtype=self.dtype,
                              precision=self.precision, name=name)(x)
         return projected.reshape(x.shape[0], x.shape[1], self.heads, self.head_dim)
 
@@ -172,7 +217,7 @@ class JointAttention(nn.Module):
         if rotation is not None:
             query, key = (rotate(part, *rotation, pairs=self.rotary_pairs) for part in (query, key))
         attended = self.attend(query, key, value, lengths)
-        inner = self.heads * self.head_dim
+        inner = self.inner_features
         attended = attended.reshape(attended.shape[0], attended.shape[1], inner)
 
         def projection(name: str):
@@ -238,22 +283,50 @@ class DoubleStreamBlock(nn.Module):
     attention_impl: str = "auto"  # an AttentionImpl
     force_fp32_for_softmax: bool = True
 
+    @nn.nowrap
+    def model_flops(self, lengths) -> float:
+        raise MissingFlopsCount("DoubleStreamBlock requires multisequence_flops(image_lengths, text_lengths)")
+
+    @nn.nowrap
+    def multisequence_flops(self, lengths, context_lengths) -> float:
+        """The declared attention and MLPs, plus each stream's per-row modulation."""
+        image, _ = matching_lengths(lengths, context_lengths)
+        attention = self._attention(context_out=not self.context_pre_only)
+        count = attention.stream_flops(lengths, context_lengths, self.features, self.features)
+        feedforward = self._feed_forward()
+        count += feedforward.model_flops(lengths)
+        if not self.context_pre_only:
+            count += feedforward.model_flops(context_lengths)
+        if self.dual_attention:
+            count += self._attention().stream_flops(lengths, None, self.features)
+        if not self.shared_modulation:
+            rows = np.ones(image.shape, np.int64)
+            count += sum(Modulation(self.features, pieces, parent=None).model_flops(rows)
+                         for pieces in self.modulation_pieces)
+        return count
+
+    @property
+    def modulation_pieces(self) -> tuple[int, int]:
+        return (9 if self.dual_attention else 6, 2 if self.context_pre_only else 6)
+
     def _modulation(self, conditioning):
         def projected(pieces: int, name: str):
             return Modulation(self.features, pieces, zero_init=self.zero_modulation, dtype=self.dtype,
                               precision=self.precision, name=name)(conditioning)
 
-        return (projected(9 if self.dual_attention else 6, "norm1"),
-                projected(2 if self.context_pre_only else 6, "norm1_context"))
+        image, context = self.modulation_pieces
+        return projected(image, "norm1"), projected(context, "norm1_context")
 
-    def _feed_forward(self, name: str):
+    @nn.nowrap
+    def _feed_forward(self, name: str | None = None):
         # FLUX.2's SwiGLU stores its gate and up maps as one bias-free `linear_in`;
         # the others' tanh GELU (`FeedForward(activation_fn="gelu-approximate")`) is biased.
         return GatedMLP(self.mlp_hidden or 4 * self.features, self.features,
                         activation="swiglu" if self.swiglu else "gelu", use_bias=not self.swiglu,
                         packed=self.swiglu, dtype=self.dtype, precision=self.precision, name=name)
 
-    def _attention(self, name: str, *, context_out: bool = True):
+    @nn.nowrap
+    def _attention(self, name: str | None = None, *, context_out: bool = True):
         return JointAttention(self.heads, self.head_dim, bias=self.bias, qk_norm=self.qk_norm,
                               epsilon=self.epsilon if self.qk_epsilon is None else self.qk_epsilon,
                               context_first=self.context_first, context_out=context_out,

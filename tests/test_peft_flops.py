@@ -16,14 +16,21 @@ from dew.data.text import ByteTokenizer
 from dew.decision.head import JointSchemaHead
 from dew.decision.layout import Specials, StateFirstLayout
 from dew.decision.objective import DecisionObjective
+from dew.diffusion import presets
+from dew.inputs import Field, InputSpec
 from dew.interop import Pretrained
 from dew.lora import LoRA
+from dew.nn.attention_residuals import AttentionResiduals
 from dew.nn.backbones.decoder_stack import Loop
+from dew.nn.backbones.dit import SimpleDiT
 from dew.nn.flops import MissingFlopsCount, counted_flops, dense_training_flops, projection_flops
+from dew.nn.gemma3n import AltUp
+from dew.nn.hyper_connections import HyperConnections
 from dew.nn.inputs import ModelInputs
 from dew.nn.protocols import CountedTraining
 from dew.objectives.base import FROZEN
-from dew.objectives.lm import LMObjective
+from dew.objectives.diffusion import DiffusionObjective
+from dew.objectives.lm import TEXT_KEY, LMObjective
 from dew.training import Trainer
 from dew.training.model_flops import FORWARD_FLOPS, TOKENS, TRAINING_FLOPS, prepare_counts
 
@@ -82,6 +89,75 @@ def test_decoder_frozen_matrices_and_repeated_adapter_scopes_are_separate(loop):
     assert adapted.model.model_flops(lengths) == forward + extra
     assert adapted.model.training_flops(lengths) == 3 * forward - learned + 3 * extra
     assert adapted.model.logits_training_flops(lengths) == 2 * model.logits_flops(lengths)
+
+
+def test_adapted_prediction_depths_count_their_maps_and_the_reused_head():
+    model = decoder(num_nextn_predict_layers=2, attention_impl="reference", tie_embeddings=False)
+    tokens = jnp.ones((1, 6), jnp.int32)
+    variables = model.init(jax.random.key(409), tokens)
+    adapted = LoRA(rank=2, alpha=4, modules=("q_proj", "eh_proj", "lm_head")).apply(
+        model, variables, key=509)
+    lengths = np.array([6], np.int64)
+    # The input projection exists once per depth and the head is shared across both.
+    predicted = 5 + 4
+    factors = 2 * 2 * predicted * ((8 + 8) + (16 + 8) + (8 + model.vocab_size))
+    native = model.prediction_flops(lengths)
+    learned = model.prediction_parameter_flops(lengths)
+    assert adapted.model.prediction_flops(lengths) == native + factors
+    assert adapted.model.prediction_training_flops(lengths) == 3 * native - learned + 3 * factors
+
+    def forward(variables, tokens):
+        hidden = adapted.model.apply(variables, tokens, method="hidden_states")
+        logits = adapted.model.apply(variables, hidden, method="logits_from_hidden")
+        return logits, adapted.model.apply(variables, hidden, tokens, method="mtp_logits")
+
+    objective = LMObjective(adapted.model, variables=adapted.variables, seq_len=6, mtp_weight=1.0)
+    batch = {TEXT_KEY: np.ones((1, 7), np.int32)}
+    upper = 2 * model.num_heads * model.head_dim * (model.num_layers * 6**2 + 5**2 + 4**2)
+    assert objective.model_flops(None, batch) == forward_products(forward, adapted.variables, tokens) - upper
+    assert objective.training_flops(None, batch) == (adapted.model.training_flops(lengths)
+        + adapted.model.logits_training_flops(lengths) + adapted.model.prediction_training_flops(lengths))
+
+
+def test_adapted_image_geometry_refuses_inherited_native_work_without_matrix_usage():
+    model = SimpleDiT(emb_features=8, num_layers=1, num_heads=2, patch_size=2)
+    image, time = jnp.ones((1, 4, 4, 3)), jnp.ones((1,))
+    variables = model.init(jax.random.key(410), image, time)
+    adapted = LoRA(rank=2, alpha=4, modules=("final_proj",)).apply(model, variables, key=510)
+    objective = DiffusionObjective(adapted.model, presets.Flow(), InputSpec(Field("images", (4, 4, 3))),
+                                   variables=adapted.variables, autoencoder=None, ema_decay=None)
+    for count in (objective.model_flops, objective.training_flops):
+        with pytest.raises(MissingFlopsCount, match="adapter matrix usage"):
+            count(None, {"images": np.asarray(image)})
+
+
+@pytest.mark.parametrize("fields", [{"altup": AltUp(num_inputs=2)},
+                                    {"hyper_connections": HyperConnections(hc_mult=2, head="weighted")},
+                                    {"attention_residuals": AttentionResiduals(block_size=2)}])
+def test_residual_streams_separate_learned_work_from_mixing_for_peft(fields):
+    model = decoder(causal=False, attention_impl="reference", **fields)
+    tokens = jnp.ones((1, 4), jnp.int32)
+    variables = model.init(jax.random.key(411), tokens)
+    adapted = LoRA(rank=2, alpha=4, modules=("q_proj",)).apply(model, variables, key=511)
+    lengths = np.array([4])
+    factors = model.num_layers * 2 * 2 * (8 + 8) * 4
+    native, learned = model.model_flops(lengths), model.parameter_flops(lengths)
+    assert 0 < learned < native
+    assert adapted.model.parameter_flops(lengths) == learned + factors
+    assert adapted.model.training_flops(lengths) == 3 * native - learned + 3 * factors
+    complete = adapted.model.model_flops(lengths) + adapted.model.logits_flops(lengths)
+    assert complete == forward_products(adapted.model.apply, adapted.variables, tokens)
+
+
+def test_altup_adapter_router_is_used_for_both_prediction_and_correction():
+    model = decoder(altup=AltUp(num_inputs=2), attention_impl="reference", causal=False)
+    tokens = jnp.ones((1, 4), jnp.int32)
+    variables = model.init(jax.random.key(412), tokens)
+    adapted = LoRA(rank=2, alpha=4, modules=("modality_router",)).apply(model, variables, key=512)
+    extra = model.num_layers * 2 * 2 * 2 * (8 + 2) * 4
+    assert adapted.model.model_flops(np.array([4])) == model.model_flops(np.array([4])) + extra
+    complete = adapted.model.model_flops(np.array([4])) + adapted.model.logits_flops(np.array([4]))
+    assert complete == forward_products(adapted.model.apply, adapted.variables, tokens)
 
 
 def test_objective_assembles_peft_training_work_without_three_times_forward():

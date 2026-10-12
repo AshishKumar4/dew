@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from abc import abstractmethod
 from collections.abc import Mapping, Sequence
+from dataclasses import replace
 from functools import cached_property
 from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple, Protocol, runtime_checkable
 
@@ -41,7 +42,17 @@ from dew.nn.autoencoders import AutoEncoder
 from dew.nn.autoencoders.kl import posterior_latent
 from dew.nn.flops import MissingFlopsCount
 from dew.nn.mp import Uncertainty
-from dew.nn.protocols import CountedImages, RequiresText
+from dew.nn.protocols import (
+    CountedCondition,
+    CountedConditionedSpatial,
+    CountedConditionLayout,
+    CountedImages,
+    CountedMultimodal,
+    CountedSequences,
+    CountedSpatial,
+    CountedVideo,
+    RequiresText,
+)
 from dew.objectives.base import (
     FROZEN,
     OMITTED,
@@ -277,23 +288,89 @@ class DiffusionObjective(Objective[Ratio]):
 
     def real_lengths(self, batch: Batch) -> np.ndarray:
         """The denoiser's real patch-token lengths from the objective's latent shape."""
-        if not isinstance(self.model, CountedImages):
-            raise MissingFlopsCount(f"{type(self.model).__name__} has no declared image_lengths geometry")
         rows = np.shape(batch[self.inputs.sample.key])[0]
+        if isinstance(self.model, CountedVideo):
+            frames, patches = self.model.video_lengths(self.latent_shape, rows)
+            return frames * patches
+        if not isinstance(self.model, CountedImages | CountedSequences | CountedMultimodal):
+            raise MissingFlopsCount(f"{type(self.model).__name__} has no declared image_lengths geometry")
         return self.model.image_lengths(self.latent_shape, rows)
 
     def model_flops(self, model, batch: Batch) -> float:
         """Assemble the denoiser's patch/time/text projections and its layers."""
+        denoiser, encoder = self._forward_flops(model, batch)
+        return denoiser + encoder
+
+    def training_flops(self, model, batch: Batch) -> float:
+        """The denoiser trains; the frozen condition encoder executes only forward."""
+        denoiser, encoder = self._forward_flops(model, batch)
+        return 3 * denoiser + encoder
+
+    def _forward_flops(self, model, batch: Batch) -> tuple[float, float]:
         model = self.model if model is None else model
-        if not isinstance(model, CountedImages):
-            raise MissingFlopsCount(f"{type(model).__name__} has no declared image_flops geometry")
         if type(self) is not DiffusionObjective or self.alignment is not None or self.end_to_end is not None:
             raise MissingFlopsCount(f"{type(self).__name__} needs counts for its "
                                     "additional forwards and heads")
-        if self.autoencoder is not None or self.inputs.conditions or self.uncertainty is not None:
-            raise MissingFlopsCount("DiffusionObjective needs auxiliary "
-                                    "autoencoder/condition/uncertainty work")
-        return model.image_flops(self.real_lengths(batch), self.latent_shape[-1])
+        if self.autoencoder is not None or self.uncertainty is not None:
+            raise MissingFlopsCount("DiffusionObjective needs auxiliary autoencoder/uncertainty work")
+        if len(self.inputs.conditions) > 1:
+            raise MissingFlopsCount("DiffusionObjective needs the composition "
+                                    "of multiple condition geometries")
+        if isinstance(model, RequiresText) and not self.inputs.conditions:
+            raise MissingFlopsCount(f"{type(model).__name__} needs real text context lengths")
+        conditions = []
+        for condition in self.inputs.conditions.values():
+            encoder = condition.encoder
+            if not isinstance(encoder, CountedCondition):
+                raise MissingFlopsCount(f"{type(encoder).__name__} has no conditioning_flops(tokens)")
+            work = encoder.conditioning_flops(batch[condition.field])
+            conditions.append(work)
+        encoded = sum(condition.flops for condition in conditions)
+        context = None
+        if conditions:
+            if not isinstance(model, CountedConditionLayout):
+                raise MissingFlopsCount(f"{type(model).__name__} has no condition_lengths layout declaration")
+            work = conditions[0]
+            context = model.condition_lengths(work.lengths, work.spans)
+            if self.unconditional_prob:
+                condition = next(iter(self.inputs.conditions.values()))
+                encoder = condition.encoder
+                if not isinstance(encoder, CountedCondition):
+                    raise MissingFlopsCount(f"{type(encoder).__name__} has no conditioning_flops(tokens)")
+                blank = encoder.conditioning_flops(encoder.tokenize([condition.unconditional]))
+                dropped = replace(work, lengths=np.broadcast_to(blank.lengths, work.lengths.shape))
+                blank_context = model.condition_lengths(dropped.lengths, dropped.spans)
+                if self.unconditional_prob == 1:
+                    work, context = dropped, blank_context
+                elif np.any(context != blank_context):
+                    raise MissingFlopsCount("DiffusionObjective needs post-dropout context lengths; "
+                                            "the host count does not know the conditioning-dropout draw")
+            conditions[0] = work
+        features = None if not conditions else conditions[0].features
+        rows = np.shape(batch[self.inputs.sample.key])[0]
+        if isinstance(model, CountedConditionedSpatial) and conditions:
+            return model.conditioned_spatial_flops(self.latent_shape, rows, conditions[0]), encoded
+        if isinstance(model, CountedSpatial):
+            return model.spatial_flops(self.latent_shape, rows, context, features), encoded
+        if isinstance(model, CountedVideo):
+            frames, patches = model.video_lengths(self.latent_shape, rows)
+            return model.spatiotemporal_flops(frames, patches, self.latent_shape[-1], features), encoded
+        if isinstance(model, CountedMultimodal):
+            lengths = model.image_lengths(self.latent_shape, rows)
+            return model.multimodal_flops(lengths, np.zeros(lengths.shape, np.int64)
+                                          if context is None else context,
+                                          self.latent_shape[-1], features or 0), encoded
+        if isinstance(model, CountedSequences):
+            if context is None or features is None:
+                raise MissingFlopsCount(f"{type(model).__name__} needs real text context lengths")
+            lengths = model.image_lengths(self.latent_shape, rows)
+            return model.multisequence_flops(lengths, context, input_channels=self.latent_shape[-1],
+                                             text_features=features,
+                                             pooled_features=conditions[0].pooled_features), encoded
+        if not isinstance(model, CountedImages):
+            raise MissingFlopsCount(f"{type(model).__name__} has no declared image_flops geometry")
+        return model.image_flops(model.image_lengths(self.latent_shape, rows),
+                                  self.latent_shape[-1], features), encoded
 
     @property
     def inputs(self) -> InputSpec:
