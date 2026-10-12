@@ -1640,8 +1640,8 @@ for the 12900K's P-cores).
 A GPU step whose mesh spans more than one device compiles with NVIDIA
 JAX-Toolbox's collective options (`dew.training.memory.COLLECTIVES`): the
 latency-hiding scheduler, all-reduce and all-gather combined up to 1 GiB and
-reduce-scatter up to 128 MiB, while-loop double buffering, and
-combine-by-dim off. A flag the run names stands. Llama-3.1-8B (random
+reduce-scatter up to 128 MiB, and combine-by-dim off. A flag the run names
+stands. Llama-3.1-8B (random
 weights) over FSDP 2 on two H100 80GB HBM3 SXMs joined by NVLink, 2 x 4096
 tokens a step, JAX 0.11.2.post3, `XLA_FLAGS` empty, the trainer's own fit
 (a 1024 x 8192 head tile and minimal remat), 55 timed steps each, alternated:
@@ -1660,7 +1660,10 @@ rematerialization pass off changed nothing. Toolbox also names three
 pipelined-collective flags, which this XLA accepts in `XLA_FLAGS` and
 ignores; no compile accepts them as options. On one GPU there's nothing to
 combine: a dense 1.1B Llama on one H100 SXM ran within 0.4% with the whole
-bundle.
+bundle. Toolbox's while-loop double buffering stays out too: the 8B, whose
+layers Dew unrolls, stepped in 479.4 and 479.1 ms with it and 479.5 and
+479.2 without (84ec3a043's parent), and it failed XLA's schedule check
+(`hlo_schedule.cc:463`) in a two-process GPU pool's step.
 
 ```
 cd <dew checkout> && JAX_PLATFORMS=cuda XLA_FLAGS= XLA_PYTHON_CLIENT_MEM_FRACTION=0.90 PYTHONPATH=src \
