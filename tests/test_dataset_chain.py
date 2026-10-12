@@ -56,42 +56,47 @@ def test_holdout_puts_each_record_in_one_part_by_its_identity_the_same_in_every_
     assert [int(row["i"]) for row in iterate(first, read="memory")] == list(range(3, 10))
 
 
-def drop_odd(row: dict) -> dict:
-    """Keep even rows, dropping the rest as a fetch drops a dead url."""
+def drop_thirds(row: dict) -> dict:
+    """Drop every third row, as a fetch drops a dead url."""
     from dew.data import Rejected
 
-    return row if row["i"] % 2 == 0 else Rejected("odd")
+    return Rejected("third") if row["i"] % 3 == 0 else row
 
 
-drop_odd.__annotations__["return"] = "dict | Rejected"
+drop_thirds.__annotations__["return"] = "dict | Rejected"
 
 
 def test_dropped_records_are_the_same_whole_sharded_and_resumed():
-    """A mix whose members drop records: two shares read together what one reads, a resumed
-    reader continues where it stopped, and the drop counts are part of the saved position."""
-    members = [Memory(rows(origin, 40)).filter_map(drop_odd).shuffle(index).repeat()
+    """A mix whose members drop records drops the same ones however it is read: one reader and two
+    shares each see only the kept records, and over an epoch all of them; a resumed reader continues
+    exactly where it stopped, its drop counts part of the saved position."""
+    members = [Memory(rows(origin, 30)).shuffle(index).repeat().filter_map(drop_thirds)
                for index, origin in enumerate(("a", "b"))]
     data = compile(mix(members).batch(8), read="indexed", loading=READ)
+    kept = {(origin, i) for origin in ("a", "b") for i in range(30) if i % 3}
 
     def keys(batch):
-        return sorted(zip(batch["origin"].tolist(), batch["i"].tolist(), strict=True))
+        return set(zip(batch["origin"].tolist(), batch["i"].tolist(), strict=True))
 
     whole = data.train(DataPartition())
     halves = [data.train(DataPartition(index, 2)) for index in range(2)]
     try:
-        batches = [next(whole) for _ in range(6)]
-        assert all(int(i) % 2 == 0 for batch in batches for i in batch["i"])
-        for batch in batches:
-            assert keys(batch) == sorted(sum((keys(next(half)) for half in halves), []))
-        state, dropped = whole.get_state(), data.statistics()
+        seen = set().union(*(keys(next(whole)) for _ in range(10)))
+        shared = set().union(*(keys(next(half)) for half in halves for _ in range(10)))
+        assert seen == shared == kept
+        state = whole.get_state()
         rest = [keys(next(whole)) for _ in range(3)]
+        share_state = halves[1].get_state()
+        share_rest = [keys(next(halves[1])) for _ in range(3)]
     finally:
         for reader in (whole, *halves):
             reader.close()
-    resumed = data.train(DataPartition())
-    try:
-        resumed.set_state(state)
-        assert [keys(next(resumed)) for _ in range(3)] == rest
-    finally:
-        resumed.close()
-    assert dropped == {} or any(key.endswith("/odd") and value > 0 for key, value in dropped.items())
+    for partition, saved, expected in ((DataPartition(), state, rest),
+                                       (DataPartition(1, 2), share_state, share_rest)):
+        resumed = data.train(partition)
+        try:
+            resumed.set_state(saved)
+            assert [keys(next(resumed)) for _ in range(3)] == expected
+        finally:
+            resumed.close()
+    assert b'"third"' in state
