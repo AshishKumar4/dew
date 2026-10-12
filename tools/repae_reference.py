@@ -55,7 +55,6 @@ import json
 import math
 import tarfile
 import types
-import urllib.request
 from collections import OrderedDict
 from pathlib import Path
 
@@ -66,7 +65,7 @@ import torch
 import torch.nn.functional as F
 from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKL
 from einops import rearrange
-from reference_source import defined_in
+from reference_source import defined_in, fetched, ran
 from safetensors.torch import load as load_safetensors
 from torchvision import models
 
@@ -98,7 +97,7 @@ ARGS = types.SimpleNamespace(path_type="linear", prediction="v", weighting="unif
 
 
 def source(path: str) -> str:
-    return urllib.request.urlopen(REPOSITORY + path).read().decode()
+    return fetched(REPOSITORY + path)
 
 
 def regularizer() -> None:
@@ -269,16 +268,11 @@ def published_discriminator() -> torch.nn.Module:
 
 def perceptual(vgg: dict[str, np.ndarray], linear: dict[str, np.ndarray]) -> type:
     """REPA-E's `PerceptualLoss` over its `LPIPS`, whose weights are these."""
-    scope = defined_in(source("loss/perceptual_loss.py"), {"PerceptualLoss"},
-                       {"torch": torch, "models": models,
-                        "LPIPS": lpips_reference.lpips_class(
-                            {key: torch.as_tensor(value) for key, value in vgg.items()},
-                            {key: torch.as_tensor(value) for key, value in linear.items()})})
-    text = source("loss/perceptual_loss.py")
-    for node in ast.parse(text).body:
-        if isinstance(node, ast.Assign) and any(getattr(target, "id", "").startswith("_IMAGENET")
-                                                  for target in node.targets):
-            exec(compile(ast.Module(body=[node], type_ignores=[]), "perceptual_loss.py", "exec"), scope)
+    lpips = lpips_reference.lpips_class({key: torch.as_tensor(value) for key, value in vgg.items()},
+                                        {key: torch.as_tensor(value) for key, value in linear.items()})
+    names = {"PerceptualLoss", "_IMAGENET_MEAN", "_IMAGENET_STD"}
+    scope = defined_in(source("loss/perceptual_loss.py"), names,
+                       {"torch": torch, "models": models, "LPIPS": lpips})
     return scope["PerceptualLoss"]
 
 
@@ -396,7 +390,7 @@ def run(dtype, drawn: dict[str, np.ndarray], pixels: np.ndarray, classes: np.nda
                       and ast.unparse(node.items[0]).startswith("accelerator.accumulate"))
     statements = [*loop.body[start:loop.body.index(accumulate)], *accumulate.body]
     with precision(dtype):
-        exec(compile(ast.Module(body=statements, type_ignores=[]), "train_repae.py", "exec"), scope)
+        ran(statements, scope, "train_repae.py")
     assert not random.draws, "the step drew fewer times than DiffusionObjective.loss"
 
     tail = "_f64" if dtype == torch.float64 else ""

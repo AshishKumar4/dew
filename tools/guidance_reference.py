@@ -45,12 +45,11 @@ import json
 import math
 import sys
 import types
-import urllib.request
 from pathlib import Path
 
 import numpy as np
 import torch
-from reference_source import definitions
+from reference_source import definitions, fetched, selected
 
 GUIDERS = ("https://raw.githubusercontent.com/huggingface/diffusers/"
            "5ff8e59ff9fe81c6e2df4fb4c6ea0d97a5df5ab2/src/diffusers/guiders/")
@@ -88,21 +87,12 @@ def members(url: str, owner: str, names: set[str]) -> list[str]:
     """The source of the named members of class `owner` in the file at
     `url`, decorators kept but for `register_to_config`, which only records
     the arguments for a config file."""
-    text = urllib.request.urlopen(url).read().decode()
-    found = {}
-    for node in ast.parse(text).body:
-        if isinstance(node, ast.ClassDef) and node.name == owner:
-            for member in node.body:
-                name = (member.name if isinstance(member, ast.FunctionDef)
-                        else member.targets[0].id if isinstance(member, ast.Assign)
-                        and isinstance(member.targets[0], ast.Name) else None)
-                if name in names:
-                    if isinstance(member, ast.FunctionDef):
-                        member.decorator_list = [decorator for decorator in member.decorator_list
-                                                 if ast.unparse(decorator) != "register_to_config"]
-                    found[name] = ast.unparse(member)
-    assert set(found) == names, names - set(found)
-    return list(found.values())
+    found = selected(fetched(url), names, within=owner, filename=url)
+    for member in found:
+        if isinstance(member, ast.FunctionDef):
+            member.decorator_list = [decorator for decorator in member.decorator_list
+                                     if ast.unparse(decorator) != "register_to_config"]
+    return [ast.unparse(member) for member in found]
 
 
 def guider() -> type:
