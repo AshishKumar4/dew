@@ -18,6 +18,8 @@ import pytest
 from dew.inference.banks import HeldBanks
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
+from dew.nn.backbones.layer_plan import LayerKind
+from dew.nn.mixers.mlp import MLPMixer
 from dew.nn.sharding import pipeline_microbatches
 from dew.objectives.lm import LMObjective
 from dew.objectives.lm.objective import router_counts
@@ -77,6 +79,31 @@ def test_replay_reproduces_the_rollout_routing_where_the_trainer_would_flip(scan
         "the fixture must make the trainer's own routing disagree"
     for layer in native:
         np.testing.assert_array_equal(replayed[layer], recorded[layer])
+
+
+def test_a_routed_mixer_replays_the_record_as_a_routed_feedforward_does():
+    """Nemotron-H routes in its mixer's slot (an `MLPMixer` with a mixture),
+    not its feed-forward's; a replayed record reaches that site too, so the
+    layer runs the recorded experts rather than its own."""
+    model = CausalTransformer(
+        vocab_size=VOCAB, emb_features=32, num_layers=2, num_heads=2, num_kv_heads=1, mlp_features=0,
+        max_seq_len=SEQ_LEN, layer_types=("moe", "full_attention"),
+        kinds={"moe": LayerKind(mixer=MLPMixer(intermediate_size=32,
+                                               mixture=Mixture(experts=EXPERTS, top_k=TOP_K)))})
+    obj = LMObjective(model, SEQ_LEN)
+    params = obj.init(jax.random.key(0))
+    tokens = tokens_of(2)
+
+    def chosen(routes=None):
+        sown = obj.token_scores(params, tokens, routing=True, routes=routes).routing
+        (indices,) = [leaf for path, leaf in jax.tree_util.tree_leaves_with_path(sown)
+                      if path[0].key == "layers_0" and path[-2].key == "indices"]
+        return np.asarray(indices)
+
+    native = chosen()
+    recorded = (native + 1) % EXPERTS
+    replayed = chosen((engine_layout({0: recorded}, 2)[:, :, :2], None))
+    np.testing.assert_array_equal(replayed, recorded)
 
 
 def test_replaying_a_forwards_own_routing_changes_nothing():

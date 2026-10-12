@@ -416,7 +416,9 @@ class KPoolSparseAttentionMixer(MixerBase):
             raise ValueError(
                 "kpool_sparse_attention requires causal=True; its indexer selects among "
                 "the keys at or before each query")
-        unsupported = {
+        ctx.refuse("kpool_sparse_attention", {
+            **ctx.policies(),
+            "force_fp32_for_softmax": False,  # forwarded
             "v_norm": ctx.v_norm,
             "k_eq_v": ctx.k_eq_v,
             "sliding_window": ctx.sliding_window,
@@ -426,13 +428,8 @@ class KPoolSparseAttentionMixer(MixerBase):
             "kv_shared": ctx.kv_shared,
             "output_gate": ctx.output_gate,
             "kv_cache": ctx.kv_cache != KVCache(),
-        }
-        asked = sorted(name for name, value in unsupported.items() if value)
-        if asked:
-            raise ValueError(
-                f"the kpool_sparse_attention mixer has no {', '.join(asked)}: the layer "
-                "scales by its nope head dim, rotates nothing, attends its own selection "
-                "of the whole sequence and norms its latents, not its values")
+        }, "the layer scales by its nope head dim, rotates nothing, attends its own selection of the "
+           "whole sequence and norms its latents, not its values")
         return functools.partial(
             KPoolSparseAttention,
             emb_features=ctx.emb_features,
