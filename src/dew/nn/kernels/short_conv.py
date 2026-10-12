@@ -23,8 +23,15 @@ time, carrying the last K-1 inputs (and in the backward the last K-1 pre-activat
 step to step, so each token's conv, silu, norm and their gradients are computed once. A run reads the
 K-1 tokens before it and the backward computes K-1 past its end, `(K - 1) / steps` extra.
 
-The arithmetic is `causal_conv1d`'s in fp32 with one rounding at each output: a query or key head is
-`a * rsqrt(sum(a^2) + eps)` of its silu output `a`, `linear.l2norm`'s.
+The arithmetic is `causal_conv1d`'s in fp32, each output rounded once to its dtype, and nearer the exact
+values than XLA's: XLA sums the conv's products rounding each (4.1 fp32 ulps from float64 on average at
+the 0.8B's widths) and divides and takes roots approximately (Triton's and XLA's fp32 division is
+`div.full`, the root `sqrt.approx`), so where the bf16 outputs of the two straddle a rounding midpoint,
+which side XLA's lands on is noise. Here the conv keeps each product's rounding error and sums them
+compensated, the sigmoid's quotient and the norm's root and inverse round once (`div.rn`, `sqrt.rn`):
+0.25 ulps from float64 after the conv, 0.63 after the norm. Of the 0.8B's 50M bf16 queries on an H100,
+1,913 differ from XLA's, 1,654 of them nearer float64; values 1,605 to 152; the projection's gradient
+6,243 to 5,244 of 151M.
 """
 
 from __future__ import annotations
@@ -36,6 +43,7 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 
 from . import generation
+from .norm_swiglu import _compensated_add, _product_parts
 
 SEGMENTS = 8
 """Rows of a program's tile, each its own run of tokens: with a 128-channel block, 1024 elements, eight
@@ -122,11 +130,54 @@ def _taps(w_ref, b_ref, columns, count: int):
     return taps, bias
 
 
-def _preactivation(window, taps, bias):
-    total = window[0] * taps[0][None, :]
+def _inline(asm: str, *args):
+    from jax.experimental.pallas import triton as plgpu
+
+    shape = jax.ShapeDtypeStruct(args[0].shape, jnp.float32)
+    return plgpu.elementwise_inline_asm(asm, args=args, constraints=",".join(["=f", *"f" * len(args)]),
+                                        pack=1, result_shape_dtypes=(shape,))[0]
+
+
+def _divide(numerator, denominator, *, interpret: bool):
+    """The quotient rounded once: Triton divides fp32 approximately (`div.full`, 2 ulp)."""
+    if interpret:
+        return numerator / denominator
+    numerator, denominator = jnp.broadcast_arrays(numerator, denominator)
+    return _inline("div.rn.f32 $0, $1, $2;", numerator, denominator)
+
+
+def _sqrt(x, *, interpret: bool):
+    """The root rounded once: Triton's fp32 root is approximate (`sqrt.approx`)."""
+    return jnp.sqrt(x) if interpret else _inline("sqrt.rn.f32 $0, $1;", x)
+
+
+def _preactivation(window, taps, bias, *, interpret: bool):
+    """The conv's sum rounded once: each product's rounding error kept exactly and the sum's in a
+    Neumaier correction, so the shared rounding of every later step starts from the exact sum."""
+    def tap_product(inputs, tap):
+        return _product_parts(inputs, jnp.broadcast_to(tap[None, :], inputs.shape), interpret=interpret)
+
+    total, correction = tap_product(window[0], taps[0])
     for inputs, tap in zip(window[1:], taps[1:], strict=True):
-        total = total + inputs * tap[None, :]
-    return total if bias is None else total + bias[None, :]
+        product, error = tap_product(inputs, tap)
+        total, correction = _compensated_add(total, correction, product, interpret=interpret)
+        correction = correction + error
+    if bias is not None:
+        total, correction = _compensated_add(total, correction, jnp.broadcast_to(bias[None, :], total.shape),
+                                             interpret=interpret)
+    return total + correction
+
+
+def _sigmoid(pre, *, interpret: bool):
+    """The sigmoid, one rounding of its quotient."""
+    return _divide(1.0, 1.0 + jnp.exp(-pre), interpret=interpret)
+
+
+def _inverse_norm(y, eps: float, *, interpret: bool):
+    """`1 / sqrt(sum(y^2) + eps)` over each row `[segments, 1]`, its root and quotient each rounded once:
+    `l2norm`'s scale without rsqrt's approximation."""
+    root = _sqrt(jnp.sum(y * y, axis=1, keepdims=True) + eps, interpret=interpret)
+    return _divide(1.0, root, interpret=interpret)
 
 
 def _unpack(refs, has_bias: bool, has_valid: bool):
@@ -138,7 +189,8 @@ def _unpack(refs, has_bias: bool, has_valid: bool):
 
 
 def _forward_kernel(*refs, first: int, normalised: bool, block: int, segments: int, steps: int, count: int,
-                    length: int, has_bias: bool, has_valid: bool, activation: bool, eps: float):
+                    length: int, has_bias: bool, has_valid: bool, activation: bool, eps: float,
+                    interpret: bool):
     from jax.experimental.pallas import triton as plgpu
 
     x_ref, w_ref, b_ref, valid_ref, (out_ref,) = _unpack(refs, has_bias, has_valid)
@@ -156,11 +208,11 @@ def _forward_kernel(*refs, first: int, normalised: bool, block: int, segments: i
         # The next token's loads go out before this one's arithmetic, which hides their latency.
         ahead = load(tokens + 1)
         window = (*history, current)
-        y = _preactivation(window, taps, bias)
+        y = _preactivation(window, taps, bias, interpret=interpret)
         if activation:
-            y = y * jax.nn.sigmoid(y)
+            y = _divide(y, 1.0 + jnp.exp(-y), interpret=interpret)
         if normalised:
-            y = y * jax.lax.rsqrt(jnp.sum(y * y, axis=1, keepdims=True) + eps)
+            y = y * _inverse_norm(y, eps, interpret=interpret)
         y = jnp.where(kept[:, None], y, 0.0)
         plgpu.store(out_ref.at[tokens[:, None], local[None, :]], y.astype(out_ref.dtype),
                     mask=(tokens < length)[:, None])
@@ -171,7 +223,7 @@ def _forward_kernel(*refs, first: int, normalised: bool, block: int, segments: i
 
 def _backward_kernel(*refs, first: int, normalised: bool, block: int, segments: int, steps: int,
                      count: int, length: int, has_bias: bool, has_valid: bool, aliased: bool,
-                     activation: bool, eps: float):
+                     activation: bool, eps: float, interpret: bool):
     from jax.experimental.pallas import triton as plgpu
 
     x_ref, w_ref, b_ref, valid_ref, rest = _unpack(refs, has_bias, has_valid)
@@ -195,13 +247,15 @@ def _backward_kernel(*refs, first: int, normalised: bool, block: int, segments: 
         # The next token's loads go out before this one's arithmetic, which hides their latency.
         ahead = load(tokens + 1)
         window = (*history, current)
-        pre = _preactivation(window, taps, bias)
-        gate = jax.nn.sigmoid(pre) if activation else None
+        pre = _preactivation(window, taps, bias, interpret=interpret)
+        gate = _sigmoid(pre, interpret=interpret) if activation else None
         out = pre if gate is None else pre * gate
         if normalised:
-            scale = jax.lax.rsqrt(jnp.sum(out * out, axis=1, keepdims=True) + eps)
-            along = jnp.sum(out * grad, axis=1, keepdims=True)
-            grad = scale * grad - (scale * scale * scale * along) * out
+            # l2norm's transpose, scale * dy - scale^3 (out . dy) out, as scale * (dy - (u . dy) u) for the
+            # normalised u.
+            scale = _inverse_norm(out, eps, interpret=interpret)
+            unit = out * scale
+            grad = scale * (grad - jnp.sum(unit * grad, axis=1, keepdims=True) * unit)
         if gate is not None:
             # silu's derivative as XLA's autodiff rounds it, the closer of the forms to float64.
             grad = grad * gate + (grad * pre) * (gate * (1.0 - gate))
@@ -282,7 +336,7 @@ def _forward(x, taps, bias, valid, parts, activation: bool, eps: float, dtype, i
         kernel = functools.partial(
             _forward_kernel, first=first, normalised=head is not None, block=block, segments=segments,
             steps=steps, count=taps.shape[1], length=length, has_bias=bias is not None,
-            has_valid=valid is not None, activation=activation, eps=eps)
+            has_valid=valid is not None, activation=activation, eps=eps, interpret=interpret)
         out.append(pl.pallas_call(
             kernel, grid=grid, in_specs=specs,
             out_specs=pl.BlockSpec((None, length, width), lambda c, t, b: (b, 0, 0)),
@@ -306,7 +360,7 @@ def _backward(x, taps, bias, valid, cotangents, parts, activation: bool, eps: fl
         kernel = functools.partial(
             _backward_kernel, first=first, normalised=head is not None, block=block, segments=segments,
             steps=steps, count=count, length=length, has_bias=bias is not None, has_valid=valid is not None,
-            aliased=dx is not None, activation=activation, eps=eps)
+            aliased=dx is not None, activation=activation, eps=eps, interpret=interpret)
         whole = pl.BlockSpec((None, length, channels), lambda c, t, b: (b, 0, 0))
         out_specs = [whole, pl.BlockSpec((None, None, count, width), lambda c, t, b: (b, t, 0, 0))]
         out_shape = [jax.ShapeDtypeStruct(x.shape, x.dtype),
