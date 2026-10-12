@@ -53,7 +53,7 @@ SHAPES = {
                       "mixture": {"experts": 64, "top_k": 2, "expert_features": 512, "layers": (1, 3, 5)}},
             "mesh": {"expert": -1}, "batch": 256, "lr": 1e-3, "target": 1.2},
     "pipe": {"model": {"emb_features": 512, "num_layers": 32, "num_heads": 8, "mlp_features": 2048},
-             "mesh": {"stage": -1, "microbatches": 16}, "batch": 128, "lr": 5e-4, "target": 1.2},
+             "mesh": {"stage": -1}, "microbatches": 16, "batch": 128, "lr": 5e-4, "target": 1.2},
 }
 
 
@@ -218,12 +218,10 @@ def main() -> None:
     data = TokenWindows(path=str(tokens), seq_len=SEQ_LEN).load(batch=batch_size)
     model = CausalTransformer(**shape["model"], vocab_size=256, max_seq_len=SEQ_LEN + 1,
                               dtype=getattr(jnp, dtype), attention_impl="auto", scan_layers=args.scan_layers)
-    fields = mesh_of(shape["mesh"], jax.device_count())
-    microbatches = fields.pop("microbatches", None)
     trainer = Trainer(LMObjective(model, SEQ_LEN, ema_decay=None),
                       optax.adamw(shape["lr"], weight_decay=0.1), key=jax.random.key(0),
-                      mesh=MeshSpec(**fields), microbatches=microbatches, layout=Layout(), checkpoints=None,
-                      tracker=None)
+                      mesh=MeshSpec(**mesh_of(shape["mesh"], jax.device_count())),
+                      microbatches=shape.get("microbatches"), layout=Layout(), checkpoints=None, tracker=None)
     if args.diloco:
         # Each host's own devices: its steps sum nothing over the hosts.
         trainer.device_mesh = MeshSpec().build(jax.local_devices())

@@ -16,7 +16,6 @@ import numpy as np
 import optax
 import pytest
 import sharded
-from flax import linen as nn
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from model_support import TINY_DECODER
 from recording import RecordingTracker
@@ -258,17 +257,17 @@ def native_trainer(mesh, layout, directory, **hybrid) -> Trainer:
                    tracker=None)
 
 
-def native_steps(trainer: Trainer, steps: int):
-    """`steps` SGD steps from the trainer's placed (or resumed) state, the
-    batch placed under its layout's rules as the trainer places one."""
-    batch = {"text": np.random.default_rng(0).integers(0, VOCAB, (8, LENGTH + 1)).astype(np.int32)}
-    state, _, _ = trainer.place()
-    with nn.logical_axis_rules(trainer.layout.axis_rules):
-        placed = shard_batch(trainer.device_mesh, batch)
-    step = trainer.compile(state, placed)
-    for _ in range(steps):
-        state, *_ = step(state, placed)
-    return state
+def token_windows(directory):
+    """Eight-row batches of windows over a token file, a stream fit
+    checkpoints and resumes."""
+    from dew.data import Loading, TokenWindows
+
+    directory.mkdir(exist_ok=True)
+    tokens = (np.arange(400) * 7 % VOCAB).astype(np.uint16)
+    for split in ("train", "val"):
+        tokens.tofile(directory / f"{split}.bin")
+    return TokenWindows(path=str(directory), seq_len=LENGTH, stride=1, seed=7,
+                        loading=Loading(workers=0, threads=1, read_buffer=1)).load(batch=8)
 
 
 @pytest.mark.mesh(devices=8)
@@ -276,39 +275,34 @@ def native_steps(trainer: Trainer, steps: int):
 def test_a_native_mesh_of_its_own_axes_trains_saves_and_resumes_as_one_device(tmp_path, hybrid):
     """A `jax.sharding.Mesh` of axes Dew does not name, two fsdp levels and
     a replica axis, under a layout whose rules name them and whose
-    `data_axes` split the rows over all three: the parameters split over
-    both fsdp levels, and two steps, a save and a resumed third step train
-    what one device trains in three, as a `MeshSpec` mesh does."""
+    `data_axes` split the rows over all three: fit splits the parameters
+    over both fsdp levels and the rows over all three axes, and two steps,
+    a checkpoint and a resumed third step train what one device trains in
+    three, as a `MeshSpec` mesh does. A rule naming an axis the mesh lacks
+    is refused before anything is placed."""
     layers = delta_layers(fused=False) if hybrid else {}
     native = Mesh(np.asarray(jax.devices()[:8]).reshape(2, 2, 2), ("replica", "zero", "zero2"))
     layout = Layout(rules=NATIVE_RULES, data_axes=("replica", "zero", "zero2"), min_shard=TINY_SHARD)
-    with nn.logical_axis_rules(layout.axis_rules):
-        assert batch_axes(native) == ("replica", "zero", "zero2")
+    data = token_windows(tmp_path / "tokens")
 
-    first = native_steps(native_trainer(native, layout, tmp_path / "run", **layers), 2)
-    assert {"zero", "zero2"} <= sharded.split_axes(first.variables["params"])
-    saved = Checkpoints(str(tmp_path / "run"))
-    saved.save(2, first)
-    saved.wait()
-    resumed = native_steps(native_trainer(native, layout, tmp_path / "run", **layers), 1)
+    def run(steps):
+        return native_trainer(native, layout, tmp_path / "run", **layers).fit(data, steps=steps,
+                                                                               checkpoint_every=2)
+
+    assert {"zero", "zero2"} <= sharded.split_axes(run(2).variables["params"])
+    resumed = run(3)
     assert int(resumed.step) == 3
 
     plain = Layout(min_shard=TINY_SHARD)
-    whole = native_steps(native_trainer(Mesh(np.asarray(jax.devices()[:1]), ("data",)), plain, None,
-                                        **layers), 3)
-    spec = native_steps(native_trainer(MeshSpec(fsdp=2), plain, None, **layers), 3)
+    whole = native_trainer(Mesh(np.asarray(jax.devices()[:1]), ("data",)), plain, None, **layers).fit(
+        data, steps=3)
+    spec = native_trainer(MeshSpec(fsdp=2), plain, None, **layers).fit(data, steps=3)
     for state in (resumed, spec):
         assert_trains_alike(*jax.device_get((state.variables["params"], whole.variables["params"])))
 
-
-def test_a_rule_naming_an_axis_the_mesh_lacks_is_refused_by_name():
-    """Dew's role axes a mesh lacks are size 1; any other name a rule uses
-    must be the mesh's, or the layout says which."""
-    mesh = Mesh(np.asarray(jax.devices()[:1]), ("zero",))
-    variables = jax.eval_shape(tiny().init, jax.random.key(0), jnp.ones((1, SEQ_LEN), jnp.int32))
-    Layout(rules={"embed": ("zero", "fsdp")}).shardings(mesh, variables)
+    misspelt = Layout(rules={**NATIVE_RULES, "embed": "zer0"}, data_axes=layout.data_axes)
     with pytest.raises(ValueError, match="zer0"):
-        Layout(rules={"embed": "zer0"}).shardings(mesh, variables)
+        native_trainer(native, misspelt, None, **layers).fit(data, steps=1)
 
 
 @pytest.mark.parametrize(("bytes_per_second", "peak", "platform", "spreads"), [

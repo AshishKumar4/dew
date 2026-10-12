@@ -155,13 +155,13 @@ def test_replay_under_a_pipeline_scores_as_on_one_stage():
     tokens = tokens_of(8)
     routed = (engine_layout(choices(obj, params, tokens), 8) + 1) % EXPERTS
 
-    def scored(spec):
+    def scored(spec, microbatches=None):
         mesh = spec.build()
-        with jax.set_mesh(mesh), pipeline_microbatches(spec.microbatches):
+        with jax.set_mesh(mesh), pipeline_microbatches(microbatches):
             return np.asarray(jax.jit(lambda p: replayed_log_probs(obj, p, tokens, (routed, None)))(params))
 
     flat = scored(MeshSpec(fsdp=4))
-    np.testing.assert_allclose(scored(MeshSpec(fsdp=2, stage=2, microbatches=2)), flat, atol=1e-5)
+    np.testing.assert_allclose(scored(MeshSpec(fsdp=2, stage=2), 2), flat, atol=1e-5)
 
 
 def test_under_replay_the_bias_counts_the_replayed_experts():
