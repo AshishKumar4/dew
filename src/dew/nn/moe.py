@@ -523,8 +523,8 @@ GatedActivation = str | Situ
 """A gated MLP's activation: 'swiglu', 'geglu' or 'geglu_exact' by name, or a `Situ`."""
 
 
-def gated_product(activation: GatedActivation, *, implementation: str = 'auto'
-                  ) -> Callable[[jax.Array, jax.Array], jax.Array]:
+def gated_product(activation: GatedActivation, *, implementation: str = 'auto', axes=None,
+                  packed: bool = False) -> Callable[[jax.Array, jax.Array], jax.Array]:
     """The product a gated MLP takes of its gate and up projections, rounded
     where torch rounds `act_fn(gate) * up`: the activation (silu 'swiglu', tanh
     gelu 'geglu', erf gelu 'geglu_exact') runs in fp32 and rounds to the gate's
@@ -533,7 +533,10 @@ def gated_product(activation: GatedActivation, *, implementation: str = 'auto'
     bf16 products differed from transformers' by up to 2 ulp. fp32 and wider
     round nowhere. A `Situ` computes its own product. SwiGLU's
     `implementation` defaults to the generation's measured kernel; explicit
-    'pallas' interprets on CPU. GeGLU and SiTU remain XLA products."""
+    'pallas' interprets on CPU. GeGLU and SiTU remain XLA products. `axes`,
+    the operands' logical axes, place the kernel on a mesh; `packed` says the
+    operands are halves of one projection's output, which XLA's product reads
+    in place."""
     if implementation not in norm_swiglu.IMPLEMENTATIONS:
         raise ValueError(f"implementation must be one of {norm_swiglu.IMPLEMENTATIONS}, "
                          f"got {implementation!r}")
@@ -557,8 +560,10 @@ def gated_product(activation: GatedActivation, *, implementation: str = 'auto'
         return rounded_to(activated * up_fp32, dtype).astype(dtype)
 
     def product(gate: jax.Array, up: jax.Array) -> jax.Array:
-        if activation == 'swiglu' and norm_swiglu.swiglu_kernel(implementation, gate, up) == 'pallas':
-            return norm_swiglu.swiglu(gate, up)
+        chosen = 'xla' if activation != 'swiglu' else norm_swiglu.swiglu_kernel(
+            implementation, gate, up, axes=axes, packed=packed)
+        if chosen == 'pallas':
+            return norm_swiglu.swiglu(gate, up, axes=axes)
         if jnp.finfo(jnp.result_type(gate, up)).bits >= 32:
             return activate(gate) * up
         return rounded_product(gate, up)

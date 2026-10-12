@@ -40,13 +40,13 @@ from jax.interpreters.ad import JVPTracer
 
 from dew.nn.kernels import delta_rule, fla_gdn, short_conv
 
-from .attention import FORWARD_MODE, unweighted_rmsnorm
+from .attention import FORWARD_MODE, gated_rms_normalized
 from .blocks import normal_kernel
 from .flops import conv_flops, delta_flops, projection_flops
 from .inputs import AttentionMetadata, valid_order
 from .kernels import generation
 from .kernels.generation import first_refusal, ran_kernel, triton_runs
-from .precision import asks_default_precision, at_least_fp32
+from .precision import asks_default_precision, at_least_fp32, compensated_add
 from .sharding import HEADS, logical_axes, logical_spec, manual_map, mesh_axes, rows_like, seen_whole
 
 CHUNK_SIZE = 64
@@ -345,19 +345,6 @@ def _masked_conv1d(x, kernel, valid, state=None, bias=None, segments=None, parts
     return conv_pieces(output, parts, x.dtype if dtype is None else dtype), history
 
 
-def _compensated_add(left, right):
-    """Add two double-float values, `(hi, lo)` pairs whose sum is the value:
-    `hi` is the rounded sum and `lo` carries what its rounding dropped
-    (Knuth's TwoSum), so a running sum keeps fp32's precision squared.
-    XLA reassociates no float arithmetic unless fast math is on; with it,
-    `lo` cancels to zero and the sum is the plain one."""
-    (left_hi, left_lo), (right_hi, right_lo) = left, right
-    total = left_hi + right_hi
-    part = total - left_hi
-    dropped = (left_hi - (total - part)) + (right_hi - part)
-    return total, dropped + left_lo + right_lo
-
-
 def chunk_decay(g):
     """Cumulate per-chunk log decays and build the pairwise decay between positions.
 
@@ -369,7 +356,7 @@ def chunk_decay(g):
     The references subtract two fp32 cumulative sums, so every exponent
     carries the rounding of the chunk's whole accumulated magnitude, which
     exp turns into a relative error on every decay. Here the cumulative sum
-    is compensated (`_compensated_add`) and the difference takes both
+    is compensated (`compensated_add`) and the difference takes both
     halves, so an exponent is as precise as its own range. On
     tests/fixtures/hf/kimi-linear-tiny that error dominated the gradient:
     over 16 orderings of the residual stream (an exact symmetry, so only the
@@ -382,7 +369,7 @@ def chunk_decay(g):
     47.6 against 48.0 ms, Qwen3.5-0.8B's gated delta net over 4096 16.3
     against 16.5).
     """
-    hi, lo = jax.lax.associative_scan(_compensated_add, (g, jnp.zeros_like(g)), axis=g.ndim - 2)
+    hi, lo = jax.lax.associative_scan(compensated_add, (g, jnp.zeros_like(g)), axis=g.ndim - 2)
     chunk_size = hi.shape[-2]
     inclusive = jnp.tril(jnp.ones((chunk_size, chunk_size), jnp.bool_))[..., None]
     diff = ((hi[..., :, None, :] - hi[..., None, :, :]) + (lo[..., :, None, :] - lo[..., None, :, :]))
@@ -989,22 +976,19 @@ class RMSNormGated(nn.Module):
     gate, then the cast back (modeling_qwen3_next.py:57-74). The gate is
     silu in the qwen3_5/qwen3_next references and sigmoid where qwen4_exp's
     output_gate_type says so; the caller picks, since the reference makes
-    the activation a config field.
+    the activation a config field. It takes per-head `[batch, length, heads,
+    head_dim]` outputs and gates (`gated_rms_normalized`).
     """
 
     epsilon: float = 1e-6
     activation: str = 'silu'
     dtype: Dtype | None = None
+    implementation: str = 'auto'
 
     @nn.compact
     def __call__(self, x, gate):
         dtype = self.dtype if self.dtype is not None else x.dtype
-        wide = at_least_fp32(x.dtype)
-        y = unweighted_rmsnorm(x.astype(wide), self.epsilon)
         scale = self.param('weight', nn.initializers.ones,
                            (x.shape[-1],), jnp.float32)
-        y = y * scale.astype(wide)
-        gate = gate.astype(wide)
-        gated = (nn.silu(gate) if self.activation == 'silu'
-                 else nn.sigmoid(gate))
-        return (y * gated).astype(dtype)
+        return gated_rms_normalized(x, gate, scale, self.epsilon, dtype, self.activation,
+                                    implementation=self.implementation, axes=HEADS)

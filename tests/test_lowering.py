@@ -138,7 +138,7 @@ def test_a_kernel_traced_for_an_assumed_gpu_lowers_to_a_named_triton_call():
 FAMILIES = {
     ('grouped_matmul', 'pallas'): ("experts", {"pallas_triton_ragged_dot", "tgmm_ragged_dot"}),
     ('tokamax_grouped_matmul', 'triton'): ("experts", None),
-    ('rms_norm', 'pallas'): ("step", {"rms_norm_forward", "rms_norm_backward", "rms_norm_scale_backward"}),
+    ('rms_norm', 'pallas'): ("step", {"rms_norm_forward", "rms_norm_backward"}),
     ('swiglu', 'pallas'): ("step", {"swiglu_forward", "swiglu_backward"}),
 }
 
@@ -176,8 +176,9 @@ def test_every_pallas_choice_a_row_names_has_a_lowering_probe():
 def test_the_compensated_norm_vjp_lowers_for_both_gpu_generations(generation):
     """Explicit Pallas checks the candidate even before that generation opts in.
 
-    The separate scale-gradient combine and its rounded assembly must lower
+    The reverse pass's compensated sums and their rounded assembly must lower
     too; interpreting on CPU cannot expose broken multi-result GPU assembly.
+    The programs' partial sums meet in an XLA reduction, not a third kernel.
     """
     from dew.nn.attention import rms_normalized
 
@@ -193,8 +194,7 @@ def test_the_compensated_norm_vjp_lowers_for_both_gpu_generations(generation):
     mesh = gpu_mesh(Mesh(np.array(jax.devices()[:1]), ('data',)), generation)
     with assumed(generation), jax.sharding.use_abstract_mesh(mesh):
         lowered = jax.jit(forward_backward).trace(x, scale, x).lower(lowering_platforms=('cuda',))
-    assert triton_kernels(lowered) == {
-        'rms_norm_forward': 1, 'rms_norm_backward': 1, 'rms_norm_scale_backward': 1}
+    assert triton_kernels(lowered) == {'rms_norm_forward': 1, 'rms_norm_backward': 1}
 
 
 @pytest.mark.parametrize("generation", ["sm80", "sm120"])
