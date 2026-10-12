@@ -83,19 +83,21 @@ def test_single_flux_blocks_share_output_without_double_counting_it():
 def test_joint_families_have_additive_rows_and_refuse_missing_text_geometry(model):
     with pytest.raises(MissingFlopsCount, match="multisequence_flops"):
         model.model_flops(IMAGE)
-    complete = model.multisequence_flops(IMAGE, TEXT)
-    split = sum(model.multisequence_flops(IMAGE[index:index + 1], TEXT[index:index + 1])
+    widths = {"input_channels": 1, "text_features": 6, "pooled_features": 5}
+    complete = model.multisequence_flops(IMAGE, TEXT, **widths)
+    split = sum(model.multisequence_flops(IMAGE[index:index + 1], TEXT[index:index + 1], **widths)
                 for index in range(2))
     assert complete == split and complete > 0
-    assert model.multisequence_flops(IMAGE, TEXT * 2) > complete
+    assert model.multisequence_flops(IMAGE, TEXT * 2, **widths) > complete
 
 
 def test_flux2_shared_modulation_is_not_counted_for_every_layer():
     model = Flux2Transformer(heads=2, head_dim=4, num_layers=1, num_single_layers=0,
                              in_channels=4, out_channels=4, joint_attention_dim=16)
     block = DoubleStreamBlock(8, 2, 4, mlp_hidden=24, swiglu=True, shared_modulation=True)
-    assert model.clone(num_layers=3).multisequence_flops(IMAGE, TEXT) - model.multisequence_flops(
-        IMAGE, TEXT) == 2 * block.multisequence_flops(IMAGE, TEXT)
+    assert model.clone(num_layers=3).multisequence_flops(
+        IMAGE, TEXT, input_channels=4, text_features=6) - model.multisequence_flops(
+            IMAGE, TEXT, input_channels=4, text_features=6) == 2 * block.multisequence_flops(IMAGE, TEXT)
 
 
 def test_wan_cross_attention_uses_video_times_text_not_the_joined_square():
@@ -120,8 +122,9 @@ def test_zimage_visible_pad_slots_count_in_blocks_but_not_patch_or_output_maps()
 def test_qwen_shared_time_zero_row_is_counted_once_for_the_batch():
     model = QwenImageTransformer(in_channels=4, out_channels=4, heads=2, head_dim=4,
                                  num_layers=1, context_in_dim=16)
-    together = model.multisequence_flops(IMAGE, TEXT)
-    separate = sum(model.multisequence_flops(IMAGE[index:index + 1], TEXT[index:index + 1])
+    together = model.multisequence_flops(IMAGE, TEXT, input_channels=4, text_features=6)
+    separate = sum(model.multisequence_flops(IMAGE[index:index + 1], TEXT[index:index + 1],
+                                            input_channels=4, text_features=6)
                    for index in range(2))
     shared = 2 * 256 * 8 + 2 * 8 * 5 * 8
     assert separate - together == shared
@@ -214,7 +217,11 @@ def test_each_family_matches_every_traced_forward_product(family):
     else:
         image, model, condition = diffusion_family(family)
         operands = (image, time, condition)
-        count = model.multisequence_flops(model.image_lengths(image.shape[1:], 1), np.array([2]))
+        pooled = None if condition.pooled is None else condition.pooled.shape[-1]
+        count = model.multisequence_flops(model.image_lengths(image.shape[1:], 1), np.array([2]),
+                                          input_channels=image.shape[-1],
+                                          text_features=condition.context.shape[-1],
+                                          pooled_features=pooled)
     variables = model.init(jax.random.key(310), *operands, **method_kwargs)
     def forward(variables, *operands):
         return model.apply(variables, *operands, **method_kwargs)
@@ -282,7 +289,9 @@ def test_published_single_stream_families_match_forward_products(family):
         text, upper = 32, 0
     condition = DenoisingCondition(jnp.ones((1, text, 8)), mask=jnp.ones((1, text), bool))
     variables = model.init(jax.random.key(321), image, time, condition)
-    count = (model.multisequence_flops(model.image_lengths(image.shape[1:], 1), np.array([text]))
+    count = (model.multisequence_flops(model.image_lengths(image.shape[1:], 1), np.array([text]),
+                                       input_channels=image.shape[-1],
+                                       text_features=condition.context.shape[-1])
              if family == "qwen_image" else model.multimodal_flops(
                  model.image_lengths(image.shape[1:], 1), np.array([text]),
                  image.shape[-1], condition.context.shape[-1]))
@@ -486,7 +495,8 @@ def test_masked_condition_dropout_counts_blank_geometry_or_refuses_an_unknown_dr
             objective.model_flops(None, batch)
     else:
         lengths = np.array([1 if probability == 1 else 4])
-        assert objective.model_flops(None, batch) == model.multisequence_flops(np.array([4]), lengths)
+        assert objective.model_flops(None, batch) == model.multisequence_flops(
+            np.array([4]), lengths, input_channels=3, text_features=8)
 
 
 def test_zimage_counts_actual_image_and_caption_widths_not_unused_config_defaults():
@@ -512,3 +522,31 @@ def test_zero_block_conditional_unet_counts_the_middle_width_change_and_decoder_
 
     assert model.spatial_flops(image.shape[1:], 1, np.array([2]), 8) == forward_products(
         forward, variables, image, time, text)
+
+
+@pytest.mark.parametrize("family", ["flux", "flux2", "sd3", "wan", "qwen_image"])
+def test_joint_family_counts_use_actual_dense_inputs_when_config_defaults_disagree(family):
+    if family == "qwen_image":
+        image = jnp.ones((1, 4, 4, 3))
+        model = QwenImageTransformer(in_channels=5, out_channels=3, heads=1, head_dim=8,
+                                     context_in_dim=16, num_layers=1, axes_dims_rope=(2, 2, 4),
+                                     attention_impl="reference")
+        condition = DenoisingCondition(jnp.ones((1, 2, 8)), mask=jnp.ones((1, 2), bool))
+        upper = model.num_layers * 2 * model.features * 2**2
+    else:
+        image, model, condition = diffusion_family(family)
+        if family in ("flux", "sd3"):
+            model = model.clone(in_channels=5, joint_attention_dim=16, pooled_projection_dim=12)
+        elif family == "flux2":
+            model = model.clone(in_channels=5, joint_attention_dim=16)
+        else:
+            model = model.clone(in_channels=5, text_dim=16)
+        upper = 0
+    time = jnp.ones((1,))
+    variables = model.init(jax.random.key(333), image, time, condition)
+    pooled = None if condition.pooled is None else condition.pooled.shape[-1]
+    count = model.multisequence_flops(model.image_lengths(image.shape[1:], 1), np.array([2]),
+                                      input_channels=image.shape[-1],
+                                      text_features=condition.context.shape[-1],
+                                      pooled_features=pooled)
+    assert count == forward_products(model.apply, variables, image, time, condition) - upper

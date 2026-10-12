@@ -189,6 +189,8 @@ class DiffusionConditioner(ConditionEncoder[str | Mapping[str, object]]):
         lengths = (t5_lengths if self.composition == "flux" else
                    clip_lengths + t5_lengths if self.composition == "sd3" else clip_lengths)
         pooled, time_ids = None, None
+        if self.composition in ("sd3", "flux"):
+            pooled = sum(self.params[name]["text_projection"]["kernel"].shape[1] for name in self.names)
         if self.composition == "clip_pooled":
             pooled = self.params[self.names[-1]]["text_projection"]["kernel"].shape[1]
             time_ids = (np.shape(tokens["time_ids"])[-1] if "time_ids" in tokens

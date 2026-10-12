@@ -169,15 +169,18 @@ class FluxTransformer(nn.Module):
         return patch_lengths(sample_shape, (2, 2), rows)
 
     @nn.nowrap
-    def multisequence_flops(self, lengths, context_lengths) -> float:
+    def multisequence_flops(self, lengths, context_lengths, *, input_channels: int,
+                            text_features: int, pooled_features: int | None = None) -> float:
         """Every packed image/text map, joint block, time/pooled map and output."""
+        if pooled_features is None:
+            raise MissingFlopsCount("FluxTransformer needs the actual pooled conditioning width")
         image, context = matching_lengths(lengths, context_lengths)
         rows = np.ones(image.shape, np.int64)
-        count = (projection_flops(lengths, self.in_channels, self.features)
-                 + projection_flops(context_lengths, self.joint_attention_dim, self.features))
+        count = (projection_flops(lengths, 4 * input_channels, self.features)
+                 + projection_flops(context_lengths, text_features, self.features))
         time = embedding_flops(rows, TIME_FEATURES, self.features)
         count += (1 + self.guidance_embeds) * time
-        count += embedding_flops(rows, self.pooled_projection_dim, self.features)
+        count += embedding_flops(rows, pooled_features, self.features)
         block = DoubleStreamBlock(self.features, self.heads, self.head_dim, parent=None)
         count += self.num_layers * block.multisequence_flops(lengths, context_lengths)
         single = FluxSingleBlock(self.features, self.heads, self.head_dim, parent=None)

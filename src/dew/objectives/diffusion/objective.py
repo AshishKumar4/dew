@@ -361,10 +361,12 @@ class DiffusionObjective(Objective[Ratio]):
                                           if context is None else context,
                                           self.latent_shape[-1], features or 0), encoded
         if isinstance(model, CountedSequences):
-            if context is None:
+            if context is None or features is None:
                 raise MissingFlopsCount(f"{type(model).__name__} needs real text context lengths")
             lengths = model.image_lengths(self.latent_shape, rows)
-            return model.multisequence_flops(lengths, context), encoded
+            return model.multisequence_flops(lengths, context, input_channels=self.latent_shape[-1],
+                                             text_features=features,
+                                             pooled_features=conditions[0].pooled_features), encoded
         if not isinstance(model, CountedImages):
             raise MissingFlopsCount(f"{type(model).__name__} has no declared image_flops geometry")
         return model.image_flops(model.image_lengths(self.latent_shape, rows),
