@@ -99,18 +99,29 @@ class LengthPolicy(grain.MapTransform):
 
 @dataclasses.dataclass(frozen=True)
 class Chunks:
+    """A document's token `fields` cut into pieces of at most `length`, each
+    starting `length - overlap` after the last, so with `overlap=1` every
+    token's next-token target stays in one piece."""
+
     length: int
     fields: tuple[str, ...] = ("text",)
+    overlap: int = 0
+
+    def __post_init__(self) -> None:
+        if not 0 <= self.overlap < self.length:
+            raise ValueError(f"chunks of {self.length} overlap by 0 to {self.length - 1}, not {self.overlap}")
 
     def flat_map(self, element: Batch) -> Sequence[Batch]:
         count = len(element[self.fields[0]])
+        stride = self.length - self.overlap
+        starts = range(0, max(count - self.overlap, 1), stride)
         return tuple(
             {
                 key: value[start : start + self.length] if key in self.fields else value
                 for key, value in element.items()
             }
             | {"_dew_length": min(self.length, count - start)}
-            for start in range(0, count, self.length)
+            for start in starts
         )
 
 

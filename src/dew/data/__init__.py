@@ -13,7 +13,7 @@ from . import chat, images, preferences, prompts, text, video
 from .chat import Role
 from .dataset import Batch, Loading
 from .pipeline import Dataset, Rejected, concat, mix
-from .sources import TFDS, Files, Hub, Memory, Source, Torch, from_grain, from_hf, from_torch
+from .sources import TFDS, Files, Hub, Memory, Source, Torch, from_grain, from_hf, from_iter, from_torch
 from .text import ByteTokenizer, HFTokenizer
 
 __all__ = [
@@ -34,6 +34,7 @@ __all__ = [
     "concat",
     "from_grain",
     "from_hf",
+    "from_iter",
     "from_torch",
     "images",
     "mix",

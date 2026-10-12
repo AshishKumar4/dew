@@ -7,7 +7,7 @@ import grain.python as grain
 import numpy as np
 import pytest
 
-from dew.data import Dataset, Files, Loading, Memory, from_grain, mix
+from dew.data import Dataset, Files, Loading, Memory, from_grain, from_iter, mix, text
 from dew.data.compile import compile, iterate
 from dew.data.dataset import DataPartition
 
@@ -150,3 +150,46 @@ def test_stats_counts_a_fresh_pass_and_mix_weighs_tokens():
         reader.close()
     # Three-token records carry two targets, nine-token records eight: equal targets, four short to one long.
     assert np.mean(origins == "short") == pytest.approx(0.8, abs=0.05)
+
+
+class Countdown:
+    """A resumable iterator, as a streaming library keeps its own position."""
+
+    def __init__(self, start: int = 0):
+        self.next = start
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self.next >= 40:
+            raise StopIteration
+        self.next += 1
+        return {"i": self.next - 1, "origin": "iter"}
+
+
+def test_an_iterator_resumes_through_its_own_state_or_by_replaying():
+    """A stateful iterator resumes through state= and load_state=, and one without them by
+    replaying the records it already gave; both continue exactly where they stopped."""
+    for source in (from_iter(Countdown, name="countdown", state=lambda it: it.next,
+                             load_state=lambda it, saved: setattr(it, "next", saved)),
+                   from_iter(Countdown, name="replayed")):
+        reader = compile(source.repeat().batch(4), read="streamed", loading=READ).train(DataPartition())
+        try:
+            first = [next(reader)["i"].tolist() for _ in range(3)]
+            state = reader.get_state()
+            rest = [next(reader)["i"].tolist() for _ in range(3)]
+        finally:
+            reader.close()
+        assert [i for batch in first for i in batch] == list(range(12))
+        resumed = compile(source.repeat().batch(4), read="streamed", loading=READ).train(DataPartition())
+        try:
+            resumed.set_state(state)
+            assert [next(resumed)["i"].tolist() for _ in range(3)] == rest
+        finally:
+            resumed.close()
+
+
+def test_chunks_cut_long_documents_keeping_every_target():
+    pieces = list(Memory([{"text": np.arange(10)}]).flat_map(text.chunk(4, overlap=1)).iterate())
+    assert [piece["text"].tolist() for piece in pieces] == [[0, 1, 2, 3], [3, 4, 5, 6], [6, 7, 8, 9]]

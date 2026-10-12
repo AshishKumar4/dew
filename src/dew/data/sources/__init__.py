@@ -14,6 +14,7 @@ from .files import Files, Format, TokenFiles
 from .grain import Grain, from_grain
 from .hf import HF, from_hf
 from .hub import Hub
+from .iterator import Iterated, from_iter
 from .memory import Memory
 from .pytorch import Torch, from_torch
 from .tfds import TFDS
@@ -76,6 +77,7 @@ __all__ = [
     "Files",
     "Grain",
     "Hub",
+    "Iterated",
     "Memory",
     "Read",
     "Shard",
@@ -85,5 +87,6 @@ __all__ = [
     "Torch",
     "from_grain",
     "from_hf",
+    "from_iter",
     "from_torch",
 ]
