@@ -23,7 +23,7 @@ import fnmatch
 import functools
 import inspect
 from collections.abc import Callable, Mapping, Sequence
-from typing import NamedTuple
+from typing import Literal, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -498,12 +498,16 @@ def power_profiles(solver: optax.GradientTransformation,
     return optax.GradientTransformationExtraArgs(init_fn, update_fn)
 
 
+Optimizer = Literal['adam', 'adamw', 'lamb', 'muon', 'muonclip']
+"""The optimizers `OptimConfig.optimizer` names, each built by its `OPTIMIZER_MAP` entry."""
+
 # The optimizers `OptimConfig.state_dtype='bfloat16'` builds: optax.adam and
 # optax.adamw with the moments stored in bf16, their other options kept.
-BF16_STATE_OPTIMIZERS = {'adam': _bf16_adam, 'adamw': _bf16_adamw}
+BF16_STATE_OPTIMIZERS: dict[Optimizer, Callable[..., optax.GradientTransformation]] = {
+    'adam': _bf16_adam, 'adamw': _bf16_adamw}
 
 
-OPTIMIZER_MAP = {
+OPTIMIZER_MAP: dict[Optimizer, Callable[..., optax.GradientTransformation]] = {
     'adam': _adam,
     'adamw': optax.adamw,
     'lamb': optax.lamb,
