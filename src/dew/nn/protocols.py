@@ -431,6 +431,34 @@ class ProjectionGroup:
         return self.packed in params or all(member in params for member in self.members)
 
 
+type Routes = tuple[jax.Array, jax.Array | None]
+"""A routing replay for one layer: `[..., top_k]` expert ids the rollout
+engine used, and `[...]` booleans marking the tokens its record covers (None
+for all of them).
+
+Routing replay (R3, arXiv 2510.11370; verl 12ebe0c `router_replay_patch.py`)
+trains a mixture on the engine's experts, so a top-k flip between the
+engine's numerics and the trainer's cannot move a token to experts that
+never produced its sample. Only the selection is replayed; the gate weights
+come from this forward's scores, so the router keeps its gradient. An
+uncovered token keeps the router's choice, as verl's replay mask does, and
+the sown `indices` are the replayed ones, so a balancing bias counts where
+the tokens went. The stack hands each layer its slice of a `[B, S, layers,
+top_k]` record (`CausalTransformer.hidden_states`)."""
+
+
+@runtime_checkable
+class RoutesExperts(Protocol):
+    """A module whose call takes `routes`, a layer's replayed experts, because
+    it routes over experts: a routed feed-forward, or a token mixer holding one
+    (an MLP in the mixer's slot)."""
+
+    @property
+    def routes_experts(self) -> bool: ...
+
+    def __call__(self, x: jax.Array, *, routes: Routes | None = None) -> jax.Array: ...
+
+
 @runtime_checkable
 class ProjectionSites(Protocol):
     """A bound module's packed groups, its own and its children's."""

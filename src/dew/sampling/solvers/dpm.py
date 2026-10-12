@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Literal, NamedTuple
 
 import jax
 import jax.numpy as jnp
+from flax import struct
 from jax import lax
 
 from .common import Multistep, _check_endpoint_domain, _half_log_snr, _lambda_step, _multistep, _tapered_order
@@ -45,7 +45,7 @@ def _dpm_terms(algorithm: str, alpha_s, sigma_s, alpha_t, sigma_t, h):
             -2.0 * sigma_t * (psi / h - 1.0), None, sigma_t * jnp.sqrt(jnp.exp(2 * h) - 1.0))
 
 
-@dataclass(frozen=True)
+@struct.dataclass
 class DPMSolverMultistep:
     """DPM-Solver and DPM-Solver++ as multistep integrators in lambda = log(alpha) - log(sigma).
 
@@ -79,11 +79,11 @@ class DPMSolverMultistep:
     """
     # `_dpm_terms` holds each algorithm's coefficients.
 
-    order: int = 2
-    algorithm: Algorithm = "dpmsolver++"
-    solver_type: Literal["midpoint", "heun"] = "midpoint"
-    lower_order_final: bool = True
-    euler_at_final: bool = False
+    order: int = struct.field(pytree_node=False, default=2)
+    algorithm: Algorithm = struct.field(pytree_node=False, default="dpmsolver++")
+    solver_type: Literal["midpoint", "heun"] = struct.field(pytree_node=False, default="midpoint")
+    lower_order_final: bool = struct.field(pytree_node=False, default=True)
+    euler_at_final: bool = struct.field(pytree_node=False, default=False)
 
     def __post_init__(self) -> None:
         if self.order not in (1, 2, 3):
@@ -152,7 +152,7 @@ class Singlestep(NamedTuple):
     orders: jax.Array
 
 
-@dataclass(frozen=True)
+@struct.dataclass
 class DPMSolverSinglestep:
     """Diffusers 0.34.0's grouped DPM-Solver updates from each group's anchor.
 
@@ -167,10 +167,11 @@ class DPMSolverSinglestep:
     SDE Heun groups diverge; initialization rejects those source/grid pairs.
     """
 
-    order: int = 2
-    algorithm: Literal["dpmsolver++", "dpmsolver", "sde-dpmsolver++"] = "dpmsolver++"
-    solver_type: Literal["midpoint", "heun"] = "midpoint"
-    lower_order_final: bool = False
+    order: int = struct.field(pytree_node=False, default=2)
+    algorithm: Literal["dpmsolver++", "dpmsolver", "sde-dpmsolver++"] = struct.field(
+        pytree_node=False, default="dpmsolver++")
+    solver_type: Literal["midpoint", "heun"] = struct.field(pytree_node=False, default="midpoint")
+    lower_order_final: bool = struct.field(pytree_node=False, default=False)
 
     def __post_init__(self) -> None:
         if self.order not in (1, 2, 3):
@@ -330,7 +331,7 @@ def _deis_third(t, b, c, d):
     return jnp.where(infinite_b, 0.0, integral)
 
 
-@dataclass(frozen=True)
+@struct.dataclass
 class DEIS:
     """DEIS (Zhang and Chen 2023, arXiv 2204.13902) in its log-rho multistep
     form, Diffusers 0.34.0's `DEISMultistepScheduler`: the exponential
@@ -343,8 +344,8 @@ class DEIS:
     that node's weight vanishes in subsequent finite-interval integrals.
     """
 
-    order: int = 2
-    lower_order_final: bool = True
+    order: int = struct.field(pytree_node=False, default=2)
+    lower_order_final: bool = struct.field(pytree_node=False, default=True)
 
     def __post_init__(self) -> None:
         if self.order not in (1, 2, 3):
