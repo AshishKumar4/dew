@@ -638,7 +638,7 @@ def test_arrayrecords_threaded_reads_overlap(arrayrecord_paths, monkeypatch):
 
 @pytest.mark.parametrize("fail", [False, True])
 @pytest.mark.parametrize("retire", ["eviction", "close"])
-def test_arrayrecords_retired_reader_lives_until_its_last_read(
+def test_arrayrecords_keep_busy_readers_alive_during_eviction_or_close(
     arrayrecord_paths, monkeypatch, fail, retire
 ):
     from dew.data.sources import records
@@ -661,7 +661,7 @@ def test_arrayrecords_retired_reader_lives_until_its_last_read(
             with self.read_lock:
                 self.active += 1
             try:
-                if self.held:
+                if self.held and index < 2:
                     entered.wait(timeout=5)
                     assert released[index].wait(timeout=5)
                     if fail:
@@ -689,7 +689,7 @@ def test_arrayrecords_retired_reader_lives_until_its_last_read(
                     source.close()
                 held = readers[0]
                 assert held.closes == 0
-                # Reopening the same shard must not adopt the retired reader's read count.
+                # Close retires the busy reader; eviction keeps it and retires an idle one.
                 assert source[2] == b"0:2"
                 replacement = readers[-1]
                 for index, future in enumerate(pending):
@@ -699,7 +699,7 @@ def test_arrayrecords_retired_reader_lives_until_its_last_read(
                             future.result(timeout=5)
                     else:
                         assert future.result(timeout=5) == f"0:{index}".encode()
-                    assert held.closes == (1 if index == 1 else 0)
+                    assert held.closes == (1 if retire == "close" and index == 1 else 0)
                     assert replacement.closes == 0
                 assert not held.closed_while_reading
             finally:
@@ -742,7 +742,12 @@ def test_arrayrecords_refuse_a_mirror_without_room_for_the_read_width(arrayrecor
         source.close()
 
 
-def test_arrayrecords_release_an_idle_mirror_before_opening_its_replacement(arrayrecord_paths, tmp_path):
+@pytest.mark.parametrize("busy_oldest", [False, True])
+def test_arrayrecords_release_an_idle_mirror_before_opening_its_replacement(
+    arrayrecord_paths, tmp_path, monkeypatch, busy_oldest
+):
+    import grain.python as grain
+
     from dew.data.sources.records import ArrayRecords
 
     root = Store(f"memory://bounded-record-mirror-{uuid4().hex}")
@@ -755,7 +760,27 @@ def test_arrayrecords_release_an_idle_mirror_before_opening_its_replacement(arra
         {"dewcache": {"cache_storage": str(tmp_path / "mirror"), "max_bytes": capacity}},
         counts=(8,) * len(shards),
     )
+    entered, released = threading.Event(), threading.Event()
+    underlying_read = grain.ArrayRecordDataSource.__getitem__
+
+    def held(reader, index):
+        if busy_oldest and not entered.is_set():
+            entered.set()
+            assert released.wait(timeout=5)
+        return underlying_read(reader, index)
+
+    monkeypatch.setattr(grain.ArrayRecordDataSource, "__getitem__", held)
     try:
+        if busy_oldest:
+            with ThreadPoolExecutor(1) as pool:
+                pending = pool.submit(source.__getitem__, 0)
+                try:
+                    assert entered.wait(timeout=5)
+                    for shard in range(1, len(shards)):
+                        assert source[8 * shard] == f"{shard}:0".encode()
+                finally:
+                    released.set()
+                assert pending.result(timeout=5) == b"0:0"
         for _ in range(2):
             for shard in range(len(shards)):
                 assert source[8 * shard] == f"{shard}:0".encode()

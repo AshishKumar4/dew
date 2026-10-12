@@ -32,6 +32,9 @@ class ArrayRecords:
 
     Shuffled indexed reads reuse the LRU across Loading's in-flight read width.
     Non-native shards need a mirror with room for that many physical shards.
+    Busy readers stay open until their reads drain. With as many readers as
+    read threads, a thread asking for a new shard holds none, so at least one
+    retained reader is idle and can release its mirror before the new open.
     """
 
     def __init__(
@@ -94,9 +97,8 @@ class ArrayRecords:
             with self._lock:
                 if shard not in self._opened:
                     if len(self._opened) >= _MAX_OPEN_SHARDS:
-                        _, removed = self._opened.popitem(last=False)
-                        if not removed.reads:
-                            removed.reader.close()
+                        idle = next(key for key, opened in self._opened.items() if not opened.reads)
+                        self._opened.pop(idle).reader.close()
                     opened = ArrayRecords(
                         (self.urls[shard],), self.storage_options, record_codec=self.record_codec
                     )
