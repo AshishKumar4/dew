@@ -33,6 +33,7 @@ from dew.nn.attention import (
     scaled_dot_product_attention,
     tpu_runs,
     weighted_values,
+    with_key_lengths,
 )
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.kernels import bf16_dot_runs
@@ -748,17 +749,18 @@ def test_cpu_fp32_attention_rounds_closer_to_float64_in_blocks():
 
 @pytest.mark.parametrize("call, taken", [
     ({}, True), ({"positions": 8, "heads": 2}, True), ({"positions": 9, "heads": 2}, False),
-    ({"kv_heads": 1}, False), ({"causal": True}, False), ({"mask": True}, False),
+    ({"kv_heads": 1}, False), ({"causal": True}, False), ({"mask": 1}, True), ({"mask": 2}, False),
     ({"backend": "cpu"}, False)])
 def test_a_decode_shaped_xla_call_on_a_gpu_folds_its_heads(monkeypatch, call, taken):
     """An xla call of at most FOLDED_PAIRS query positions times heads, over
-    keys of its own heads and masked by key lengths at most, reads the cache
-    in its layout on a GPU (`folded_attention`); anything else is jax.nn's."""
+    keys of its own heads and masked at most by a mask every head shares (key
+    lengths among them), reads the cache in its layout on a GPU
+    (`folded_attention`); anything else, a per-head mask included, is jax.nn's."""
     monkeypatch.setattr(jax, 'default_backend', lambda: call.get("backend", "gpu"))
     heads = call.get("heads", 2)
     query = jnp.zeros((3, call.get("positions", 4), heads, 256), jnp.bfloat16)
     key = jnp.zeros((3, 40, call.get("kv_heads", heads), 256), jnp.bfloat16)
-    mask = jnp.ones((3, 1, query.shape[1], 40), bool) if call.get("mask") else None
+    mask = jnp.ones((3, call["mask"], query.shape[1], 40), bool) if call.get("mask") else None
     assert folds(query, key, None, mask, call.get("causal", False), None) == taken
 
 
@@ -779,7 +781,7 @@ def test_folded_attention_is_jax_nn_attention(dtype, heads):
     key, value = rng.normal(size=(2, 3, 40, heads, 256)) * np.array([0.3, 1.0])[:, None, None, None, None]
     lengths = jnp.asarray([1, 17, 40], jnp.int32)
     q, k, v = (jnp.asarray(x, dtype) for x in (query, key, value))
-    folded = folded_attention(q, k, v, lengths)
+    folded = folded_attention(q, k, v, with_key_lengths(None, lengths, 40))
     plain = jax.nn.dot_product_attention(q, k, v, key_value_seq_lengths=lengths,
                                          implementation='xla')
     assert folded.shape == plain.shape and folded.dtype == plain.dtype
@@ -874,7 +876,11 @@ def test_the_paged_decode_kernel_reads_each_row_through_its_table(page_size):
 @pytest.mark.parametrize("implementation", ["reference", "xla"])
 def test_normal_attention_ends_each_rows_keys_at_its_length_as_a_prefix_mask_does(implementation):
     """Key lengths keep each row's first keys, as the prefix mask of those lengths
-    does, bitwise: a right-padded context's padding reads as nothing either way."""
+    does, bitwise: a right-padded context's padding reads as nothing either way.
+    Bitwise because the lengths become that very mask (`with_key_lengths`) before
+    the kernel, so on a GPU, where a call this size folds its heads (8-wide
+    heads, which the lengths-only decode kernel does not take), both forms run
+    `folded_attention` alike."""
     module = NormalAttention(16, heads=2, dim_head=8, attention_impl=implementation)
     rng = np.random.default_rng(1)
     queries = jnp.asarray(rng.normal(size=(3, 5, 16)), jnp.float32)
