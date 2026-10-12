@@ -466,7 +466,8 @@ def test_a_mixture_cut_per_share_reads_each_corpus_in_disjoint_shares():
     corpus it mixes is cut per share too: two shares never read one row."""
     other = Memory(tuple({"id": np.int32(100 + index)} for index in range(16)))
     mixed = Pipeline(source(16)).mix(Pipeline(other), weights=(1, 1))
-    data = compile(mixed.filter(lambda row: int(row["id"]) % 2 > 0, identity="odd@1").batch(2), loading=READ)
+    thirds = mixed.filter(lambda row: int(row["id"]) % 3 > 0, identity="thirds@1")
+    data = compile(thirds.batch(2), loading=READ)
     shares = [data.train(DataPartition(index, 2)) for index in range(2)]
     try:
         read = [[value for batch in take(reader, 4) for value in batch["id"]] for reader in shares]
