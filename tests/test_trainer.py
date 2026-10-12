@@ -166,6 +166,13 @@ def test_a_token_budget_resumes_its_count_from_the_checkpoint(tmp_path):
     assert int(complete.fit(Data(), total_tokens=30).step) == 3
 
 
+def test_an_explicit_state_starts_a_token_count_with_its_own_reader(tmp_path):
+    make_trainer(tmp_path, objective=TokenRegression()).fit(Data(), steps=2, total_tokens=30)
+    trainer = make_trainer(tmp_path, objective=TokenRegression())
+    state = trainer.initial_state()
+    assert int(trainer.fit(Data(), total_tokens=30, state=state).step) == 3
+
+
 def test_an_optim_config_is_built_over_the_updates_fit_makes():
     """Four steps of two microbatches are two updates: the run is the config built over two, bit
     for bit, not over four. Before fit there is no length to build it over."""
