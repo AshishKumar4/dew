@@ -12,7 +12,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from sharded import assert_runs_per_shard
+from sharded import assert_runs_per_shard, boundary_copies
 
 from dew.nn import linear
 from dew.nn.kernels import fla_gdn
@@ -498,6 +498,24 @@ def test_the_port_keeps_the_kernel_contract_on_a_mesh(axis, split):
     spec = PartitionSpec(*(axis if dim in split else None for dim in range(3)))
     mesh = Mesh(np.asarray(jax.devices()[:2]), (axis,))
     assert_runs_per_shard(gradients(fla_rule, do), (q, k, v, g, beta), [spec] * 5, mesh, truth)
+
+
+@pytest.mark.gpu(reason="the port's kernels lower to Triton calls only on a GPU")
+def test_a_bf16_gated_delta_net_trains_with_no_copy_at_the_ports_edges():
+    """A bf16 GatedDeltaNet at the 0.8B's heads, forward and backward, compiled for this GPU: no copy
+    or transpose feeds one of the port's Triton calls or reads one of its results
+    (`sharded.boundary_copies`), so every operand reaches the kernels in the layout they read."""
+    layer = GatedDeltaNet(emb_features=1024, num_k_heads=16, num_v_heads=16, head_k_dim=128, head_v_dim=128,
+                          dtype=jnp.bfloat16)
+    x = jax.random.normal(jax.random.key(47), (2, 512, 1024), jnp.bfloat16)
+    params = layer.init(jax.random.key(53), x)
+
+    def loss(params, x):
+        return jnp.sum(layer.apply(params, x).astype(jnp.float32) ** 2)
+
+    text = jax.jit(jax.grad(loss, argnums=(0, 1))).lower(params, x).compile().as_text()
+    assert "__gpu$xla.gpu.triton" in text
+    assert boundary_copies(text) == []
 
 
 def _lowered_dot(product, default: str) -> str:

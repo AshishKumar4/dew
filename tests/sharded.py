@@ -11,8 +11,13 @@ partitioner, which replicates it and gathers its inputs to every device
 unless the kernel runs per shard. Every such kernel's entry point keeps one
 contract, which `assert_runs_per_shard` checks on a mesh of CPU devices in
 the suite and of GPUs on a multi-GPU host: split over the mesh it computes
-what it computes on one device, within the float64 gate, and its compiled
-step moves none of its operands between devices.
+what it computes on one device, within the float64 gate, its compiled step
+moves none of its operands between devices, and no copy or transpose sits
+at its boundary (`boundary_copies`): a Pallas-Triton call takes and gives
+row-major arrays, so a producer or consumer laid out otherwise costs a pass
+over the array that the layout at the boundary, not the logical shape, has
+to remove. A CPU interprets Pallas kernels, so there only the first two
+hold; the third needs the GPU.
 """
 
 import math
@@ -87,10 +92,10 @@ needs none of: a reduction (all-reduce, reduce-scatter) is a gradient's sum, not
 def assert_runs_per_shard(fn, args, specs, mesh, truth, *, moves=()) -> None:
     """The custom-kernel contract (module docstring): `fn(*args)` with `args` placed on `mesh` by
     `specs` (PartitionSpecs) is within the float64 gate (`assert_leaves_as_exact`) of `fn` on one
-    device, both measured from `truth`, the float64 tree of `fn`'s outputs; and its compiled step
-    holds no collective that moves entries between devices (`MOVES`) beyond the ops `moves` names
-    (a sequence split's intended exchange). XLA, which cannot split an opaque call, would otherwise
-    replicate it and gather its operands silently."""
+    device, both measured from `truth`, the float64 tree of `fn`'s outputs; its compiled step holds
+    no collective that moves entries between devices (`MOVES`) beyond the ops `moves` names (a
+    sequence split's intended exchange), which XLA, unable to split an opaque call, would otherwise
+    insert to replicate it; and no copy or transpose at a kernel call's edge (`boundary_copies`)."""
     run = jax.jit(fn)
     whole = run(*args)
     with jax.set_mesh(mesh):
@@ -98,7 +103,45 @@ def assert_runs_per_shard(fn, args, specs, mesh, truth, *, moves=()) -> None:
                   for arg, spec in zip(args, specs, strict=True)]
         compiled = run.lower(*placed).compile()
         split = compiled(*placed)
-    moved = [(op, shapes) for op, shapes in collectives(compiled.as_text())
-             if op in MOVES and op not in moves]
+    text = compiled.as_text()
+    moved = [(op, shapes) for op, shapes in collectives(text) if op in MOVES and op not in moves]
     assert not moved, f"the step moves operands between devices: {moved}"
+    copies = boundary_copies(text)
+    assert not copies, f"XLA re-lays out arrays at the kernel's boundary: {copies}"
     assert_leaves_as_exact(jax.tree.map(np.asarray, split), jax.tree.map(np.asarray, whole), truth)
+
+
+INSTRUCTION = re.compile(
+    r"^\s*(?:ROOT\s+)?%(?P<name>\S+)\s+=\s+.+?\s(?P<op>[a-z][a-z0-9-]*)\((?P<operands>.*)\)")
+KERNEL_TARGETS = re.compile(r'custom_call_target="(__gpu\$xla\.gpu\.triton|dew_[a-z_]+)"')
+"""The custom calls a custom kernel lowers to: a Pallas-Triton call, or one of Dew's FFI handlers."""
+
+
+def boundary_copies(text: str) -> list[str]:
+    """Each copy or transpose in compiled HLO `text` (an instruction of that opcode, or a fusion XLA
+    named for one) that produces an operand of a kernel call (`KERNEL_TARGETS`) or reads one of its
+    results, directly or through a tuple element: XLA re-laying out an array at the kernel's edge."""
+    ops, readers, kernels = {}, {}, set()
+    for line in text.splitlines():
+        match = INSTRUCTION.match(line)
+        if not match:
+            continue
+        name, op = match["name"], match["op"]
+        ops[name] = op
+        for operand in re.findall(r"%([\w.-]+)", match["operands"]):
+            readers.setdefault(operand, []).append(name)
+        if op == "custom-call" and KERNEL_TARGETS.search(line):
+            kernels.add((name, tuple(re.findall(r"%([\w.-]+)", match["operands"]))))
+
+    def moves(name):
+        return ops.get(name) in ("copy", "transpose") or (
+            ops.get(name) == "fusion" and re.search(r"copy|transpose", name) is not None)
+
+    found = []
+    for kernel, operands in kernels:
+        found += [f"{operand} -> {kernel}" for operand in operands if moves(operand)]
+        results = [kernel, *(reader for reader in readers.get(kernel, ())
+                             if ops.get(reader) == "get-tuple-element")]
+        found += [f"{kernel} -> {reader}" for result in results for reader in readers.get(result, ())
+                  if moves(reader)]
+    return found
