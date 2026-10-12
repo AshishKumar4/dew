@@ -12,7 +12,7 @@ import numpy as np
 
 from dew import records
 from dew.data.pipeline import Configured, HostStep, Pipeline
-from dew.data.recipes import HoldOut, SourceValue, Split, Validation, _branches, source_argument
+from dew.data.recipes import HoldOut, SourceValue, Split, Validation, _branches, _named_split, source_argument
 from dew.data.sources.base import Read, ShardManifest, Source
 from dew.decision.questions import Choice, Question
 from dew.records import JSON, json_value, record
@@ -300,7 +300,7 @@ class Decisions:
         elif isinstance(self.validation, Pipeline):
             evaluated = self.validation
         elif isinstance(self.validation, Split):
-            held_source = _DecisionSource(source(self.source, split=self.validation.name), table=table)
+            held_source = _DecisionSource(_named_split(dataset.source, self.validation), table=table)
             evaluated = Pipeline(held_source).map(Configured(_ParseConfigured(table), needs=()))
         elif isinstance(self.validation, Sequence) and not isinstance(self.validation, str):
             rows = tuple({"example": Example.of(row)} for row in self.validation)

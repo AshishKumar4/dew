@@ -1,7 +1,7 @@
 """Supervised fine-tuning data: conversations with a role on every token.
 
-A `ChatMessages` source reads conversations from a parquet file, a JSONL
-file or a Hub dataset id, and renders each with the tokenizer's chat
+The `Chat` recipe reads conversations from a parquet file, a JSONL file or
+an `hf://` Hub dataset, and renders each with the tokenizer's chat
 template. Every token gets the role of the message that wrote it, so
 `LMObjective` with `loss_role=Role.ASSISTANT` trains on assistant tokens
 only.

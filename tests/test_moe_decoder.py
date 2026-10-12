@@ -20,6 +20,7 @@ from jax.sharding import PartitionSpec as P
 from recording import RecordingTracker
 from sharded import assert_sharded
 
+from dew.data.dataset import Dataset
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import GatedMLP, Mixture
 from dew.nn.moe import SparseMLP
@@ -331,16 +332,6 @@ def token_batches():
         yield batch
 
 
-class Data:
-    def __init__(self, train):
-        self._train, self.val, self.batch, self.records = train, None, BATCH, None
-
-    def train(self, partition):
-        return self._train()
-
-    steps_per_epoch = None
-
-
 def moe_trainer(expert_size, fsdp_size, tracker=None, bias=False):
     config = moe_config()
     model = models.build("causal_transformer",
@@ -355,7 +346,8 @@ def moe_trainer(expert_size, fsdp_size, tracker=None, bias=False):
 def run_losses(trainer, steps):
     """Per-step losses of a fit, as the tracker receives them."""
     trainer.tracker = tracker = RecordingTracker()
-    state = trainer.fit(Data(token_batches), steps=steps, log_every=1)
+    state = trainer.fit(
+        Dataset(lambda partition: token_batches(), None, batch=BATCH, records=None), steps=steps, log_every=1)
     assert_sharded(state.variables["params"], trainer.device_mesh)
     return [scalars["train/loss"] for _, scalars in tracker.scalars if "train/loss" in scalars]
 
@@ -380,7 +372,8 @@ def test_the_expert_shards_train_the_same_model():
 
 @pytest.mark.mesh
 def test_the_experts_are_really_split_across_the_expert_axis():
-    state = moe_trainer(expert_size=4, fsdp_size=2).fit(Data(token_batches), steps=0)
+    state = moe_trainer(expert_size=4, fsdp_size=2).fit(
+        Dataset(lambda partition: token_batches(), None, batch=BATCH, records=None), steps=0)
     experts = state.variables["params"]["layers_1"]["mlp"]["experts"]
     kernel = experts["gate_proj"]["kernel"]
 
@@ -412,7 +405,8 @@ def test_a_from_scratch_run_logs_the_load_and_moves_the_deepseek_bias():
     np.testing.assert_array_equal(
         np.asarray(fresh.variables["moe"]["layers_1"]["mlp"]["gate"]["e_score_correction_bias"]), 0.0)
 
-    state = trainer.fit(Data(token_batches), steps=steps, log_every=1)
+    state = trainer.fit(
+        Dataset(lambda partition: token_batches(), None, batch=BATCH, records=None), steps=steps, log_every=1)
 
     bias = np.asarray(state.variables["moe"]["layers_1"]["mlp"]["gate"]["e_score_correction_bias"])
     assert np.any(bias != 0), "the bias never moved"
@@ -451,7 +445,8 @@ def test_the_balancing_bias_is_one_replicated_value_across_every_shard():
     per-shard direction and the shards would disagree.
     """
     steps = 3
-    state = moe_trainer(4, 2, bias=True).fit(Data(token_batches), steps=steps)
+    state = moe_trainer(4, 2, bias=True).fit(
+        Dataset(lambda partition: token_batches(), None, batch=BATCH, records=None), steps=steps)
     bias = state.variables["moe"]["layers_1"]["mlp"]["gate"]["e_score_correction_bias"]
 
     assert bias.sharding.spec == jax.sharding.PartitionSpec(), bias.sharding
@@ -477,6 +472,7 @@ def single_device_bias(steps):
     """
     script = f"""
 import numpy as np, jax, optax
+from dew.data.dataset import Dataset
 from dew.registry import models
 import dew.nn.backbones
 from dew.objectives.lm import LMObjective
@@ -489,7 +485,8 @@ model = models.build("causal_transformer", **{{
 trainer = Trainer(LMObjective(model, suite.SEQ_LEN, balance_rate=0.01),
                   optax.adam(1e-3), key=jax.random.key(0),
                   mesh=MeshSpec(), layout=Layout(min_shard=suite.TINY_SHARD))
-state = trainer.fit(suite.Data(suite.token_batches), steps={steps})
+state = trainer.fit(
+    Dataset(lambda partition: suite.token_batches(), None, batch=suite.BATCH, records=None), steps={steps})
 bias = state.variables["moe"]["layers_1"]["mlp"]["gate"]["e_score_correction_bias"]
 print(",".join(repr(float(value)) for value in np.asarray(bias)))
 """

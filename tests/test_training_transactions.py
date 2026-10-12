@@ -14,7 +14,7 @@ from affine_run import raw_leaf
 from flax import struct
 
 from dew.checkpoints import Checkpoints
-from dew.data import DataPartition
+from dew.data import DataPartition, Dataset
 from dew.objectives import Aux, EMASpec, Objective, Ratio
 from dew.objectives.base import under
 from dew.training import Trainer
@@ -150,30 +150,25 @@ class Stream:
         self.index = json.loads(state)
 
 
-class Data:
-    batch = 2 * jax.device_count()
-    def train(self, partition):
-        return Stream()
-
-
 @pytest.mark.parametrize("composite", [False, True])
 @pytest.mark.parametrize("cut", [1, 2])
 def test_partial_checkpoint_replays_exact_realized_records(tmp_path, composite, cut):
     checkpoints = Checkpoints(str(tmp_path / "run"))
-    trainer(composite, checkpoints=checkpoints).fit(Data(), steps=cut)
-    resumed = trainer(composite, checkpoints=checkpoints).fit(Data(), steps=4)
+    data = Dataset(lambda partition: Stream(), None, batch=2 * jax.device_count(), records=None)
+    trainer(composite, checkpoints=checkpoints).fit(data, steps=cut)
+    resumed = trainer(composite, checkpoints=checkpoints).fit(data, steps=4)
     assert float(resumed.scale.scale) == 65536.
     assert int(resumed.scale.fin_steps) == 0
-    uninterrupted = trainer(composite).fit(Data(), steps=4)
+    uninterrupted = trainer(composite).fit(data, steps=4)
     for want, got in zip(jax.tree.leaves(uninterrupted), jax.tree.leaves(resumed), strict=True):
         np.testing.assert_array_equal(raw_leaf(got), raw_leaf(want))
-    class Unused(Data):
-        def train(self, partition):
-            raise AssertionError("same-target resume opened the data stream")
-    same = trainer(composite, checkpoints=checkpoints).fit(Unused(), steps=4)
+    def unused(partition):
+        raise AssertionError("same-target resume opened the data stream")
+    unopened = dataclasses.replace(data, train=unused)
+    same = trainer(composite, checkpoints=checkpoints).fit(unopened, steps=4)
     assert int(same.step) == 4
     with pytest.raises(ValueError, match="window_size"):
-        trainer(composite, k=4, checkpoints=checkpoints).fit(Unused(), steps=5)
+        trainer(composite, k=4, checkpoints=checkpoints).fit(unopened, steps=5)
 
 
 @pytest.mark.parametrize("composite,aux_active,updates", [(False, 0, 0), (True, 0, 0), (True, 1, 1)])

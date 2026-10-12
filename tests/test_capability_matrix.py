@@ -34,11 +34,12 @@ import dataclasses
 import functools
 import gc
 import importlib
+import itertools
 import pkgutil
 import re
 import shutil
 import tempfile
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -54,7 +55,7 @@ from test_precision_policy import PER_ARCH, TINY
 
 import dew
 from dew.checkpoints import Checkpoints
-from dew.data import DataPartition
+from dew.data import DataPartition, Dataset
 from dew.data.preferences import IDS_KEY as PAIR_IDS_KEY, MASK_KEY as PAIR_MASK_KEY
 from dew.data.prompts import LENGTH_KEY, PROMPT_KEY
 from dew.data.recipes import load
@@ -443,21 +444,6 @@ def test_a_fixture_is_the_family_it_is_listed_under(family):
 
 # --- running a method ------------------------------------------------------
 
-class Batches:
-    """The `Dataset` a trainer reads: `batch`, over and over."""
-
-    def __init__(self, batch: Mapping):
-        self._batch = batch
-        self.batch = ROWS
-        self.records = None
-        self.val = None
-        self.steps_per_epoch = None
-
-    def train(self, partition) -> Iterator[Mapping]:
-        while True:
-            yield self._batch
-
-
 def finite(tree) -> bool:
     return all(bool(np.all(np.isfinite(leaf))) for leaf in jax.tree.leaves(tree)
                if np.issubdtype(np.asarray(leaf).dtype, np.inexact))
@@ -508,7 +494,9 @@ def assert_trains(objective, batch: Mapping, directory: Path, *, evaluated: Mapp
                       rollout=rollout)
     initial = trainer.initial_state()
     started = jax.device_get(initial.variables["params"])
-    state = trainer.fit(Batches(batch) if data is None else data, steps=1, log_every=1, state=initial)
+    if data is None:
+        data = Dataset(lambda partition: itertools.repeat(batch), None, batch=ROWS, records=None)
+    state = trainer.fit(data, steps=1, log_every=1, state=initial)
     checkpoints.wait()
     losses = [scalars["train/loss"] for _, scalars in tracker.scalars if "train/loss" in scalars]
     assert len(losses) == 1 and np.isfinite(losses[0]), losses

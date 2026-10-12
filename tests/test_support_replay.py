@@ -14,7 +14,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from affine_run import Data
+from affine_run import dataset
 
 from dew.lora import LoRA
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -105,7 +105,7 @@ def test_an_adapted_head_rescores_its_support_and_trains_its_factors_alone():
     scored = np.asarray(grpo.packed_log_probs(params, batch))[drawn_ids]
     np.testing.assert_allclose(scored, batch["behavior_log_probs"][drawn_ids], atol=2e-5)
 
-    data = Data(lambda: iter([batch]), batch=jax.device_count())
+    data = dataset(lambda: iter([batch]), batch=jax.device_count())
     trainer = Trainer(grpo, optax.sgd(0.1), key=jax.random.key(3), mesh=MeshSpec(),
                       layout=Layout(min_shard=2**30))
     initial = trainer.initial_state()

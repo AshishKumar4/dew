@@ -22,6 +22,7 @@ from recording import RecordingTracker
 import dew
 import dew.nn.backbones  # registers the decoder the FLOP formula test builds
 from dew.cache import default_compilation_cache_dir, enable_compilation_cache
+from dew.data.dataset import Dataset
 from dew.data.preferences import IDS_KEY, MASK_KEY
 from dew.lora import LoRA
 from dew.nn.flops import MissingFlopsCount
@@ -36,16 +37,6 @@ from dew.training.distributed import shard_batch
 
 # Needs the eight simulated CPU devices conftest configures; the GPU lane skips it.
 pytestmark = pytest.mark.mesh
-
-
-class Data:
-    def __init__(self, train, batch=BATCH):
-        self._train, self.val, self.batch, self.records = train, None, batch, None
-
-    def train(self, partition):
-        return self._train()
-
-    steps_per_epoch = None
 
 
 def make_trainer(**kwargs):
@@ -576,7 +567,8 @@ def test_gpu_matmul_custom_calls_are_counted_from_their_shapes():
 def test_fit_reports_throughput_to_the_tracker():
     """The logging tick carries the throughput numbers along with the loss."""
     tracker = RecordingTracker()
-    make_trainer(tracker=tracker).fit(Data(batches), steps=3, log_every=1)
+    make_trainer(tracker=tracker).fit(
+        Dataset(lambda partition: batches(), None, batch=BATCH, records=None), steps=3, log_every=1)
 
     ticks = [p for _, p in tracker.scalars if "train/samples_per_sec" in p]
     assert len(ticks) == 3, "no throughput was logged"
@@ -591,7 +583,7 @@ def test_fit_without_analytical_work_trains_on_known_peak_hardware(monkeypatch, 
     device = jax.devices()[0].device_kind
     monkeypatch.setitem(TARGETS, device, GpuTarget(device, device, dense_peaks={device: {"bf16": 100.0}}))
     objective = Regression() if kind == "custom" else TokenRegression()
-    data = Data(batches)
+    data = Dataset(lambda partition: batches(), None, batch=BATCH, records=None)
     if kind == "lora":
         variables = objective.init(jax.random.key(0))
         adapter = LoRA(1, ("Dense_0",)).apply(objective.model, variables, key=1)
@@ -607,13 +599,13 @@ def test_fit_without_analytical_work_trains_on_known_peak_hardware(monkeypatch, 
                 ids = np.stack((tokens, np.roll(tokens, 1, axis=-1)), axis=1)
                 yield {IDS_KEY: ids, MASK_KEY: np.ones_like(ids, bool)}
 
-        data = Data(pairs)
+        data = Dataset(lambda partition: pairs(), None, batch=BATCH, records=None)
     elif kind == "multistream":
         # Counted as a decoder, but its residual streams' mixing declares no work.
         model = models.build('causal_transformer', vocab_size=16, emb_features=8, num_layers=1, num_heads=1,
                              mlp_features=16, max_seq_len=4, hyper_connections=HyperConnections(hc_mult=2))
         objective = LMObjective(model, 4)
-        data = Data(lambda: token_batches(BATCH, 4, 16))
+        data = Dataset(lambda partition: token_batches(BATCH, 4, 16), None, batch=BATCH, records=None)
     tracker = RecordingTracker()
     trainer = Trainer(objective, optax.adam(1e-3), key=0, tracker=tracker)
     state = trainer.fit(data, steps=3, log_every=1)
@@ -648,7 +640,7 @@ def test_a_batch_that_cannot_be_counted_ends_mfu_and_the_run_trains_on(monkeypat
 
     tracker = RecordingTracker()
     state = Trainer(StopsCounting(), optax.adam(1e-3), key=0, tracker=tracker).fit(
-        Data(marked), steps=4, log_every=1)
+        Dataset(lambda partition: marked(), None, batch=BATCH, records=None), steps=4, log_every=1)
     ticks = [values for _, values in tracker.scalars if "train/step_time_ms" in values]
     assert int(state.step) == 4
     assert ["train/mfu" in values for values in ticks] == [True, True, False, False]
@@ -666,7 +658,7 @@ def test_fit_with_analytical_work_reports_mfu_on_known_peak_hardware(monkeypatch
     if kind == "custom":
         objective = CountedRegression()
         trainer = Trainer(objective, optax.adam(1e-3), key=0, tracker=tracker)
-        data = Data(batches)
+        data = Dataset(lambda partition: batches(), None, batch=BATCH, records=None)
         batch = next(batches())
     else:
         trainer = lm_trainer(vocab=16, width=8, layers=1, heads=1, ratio=2, seq=4)
@@ -675,7 +667,7 @@ def test_fit_with_analytical_work_reports_mfu_on_known_peak_hardware(monkeypatch
             adapter = LoRA(1, ("q_proj",)).apply(objective.model, objective.init(jax.random.key(0)), key=1)
             objective.model, objective.variables = adapter.model, adapter.variables
         trainer.tracker = tracker
-        data = Data(lambda: token_batches(BATCH, 4, 16))
+        data = Dataset(lambda partition: token_batches(BATCH, 4, 16), None, batch=BATCH, records=None)
         batch = next(token_batches(BATCH, 4, 16))
     work = objective.training_flops(None, batch)
     state = trainer.fit(data, steps=3, log_every=1)
@@ -736,7 +728,8 @@ def test_fit_reports_the_wait_on_input_and_a_later_compile():
             x = rng.normal(size=(rows, FEATURES)).astype(np.float32)
             yield {"x": x, "y": 2 * x[:, :2]}
 
-    make_trainer(tracker=tracker).fit(Data(slow), steps=steps, log_every=1)
+    make_trainer(tracker=tracker).fit(
+        Dataset(lambda partition: slow(), None, batch=BATCH, records=None), steps=steps, log_every=1)
 
     ticks = [p for _, p in tracker.scalars if "train/step_time_ms" in p]
     assert len(ticks) == 10
@@ -809,7 +802,7 @@ def test_a_tracker_can_capture_after_each_training_update(tmp_path, monkeypatch)
                 captured.append(step)
 
     state = make_trainer(tracker=CapturingTracker()).fit(
-        Data(batches), steps=2, log_every=1)
+        Dataset(lambda partition: batches(), None, batch=BATCH, records=None), steps=2, log_every=1)
 
     assert int(state.step) == 2
     assert captured == [1, 2]
@@ -848,7 +841,7 @@ def test_profiler_writes_a_trace_after_the_warmup(tmp_path, monkeypatch):
     monkeypatch.setattr(trainer, "compile", counting_compile)
     monkeypatch.setattr(jax.profiler, "start_trace",
                         lambda *a, **k: started_at.append(len(trainer.executable.ran)) or real_start(*a, **k))
-    trainer.fit(Data(batches), steps=5, log_every=1)
+    trainer.fit(Dataset(lambda partition: batches(), None, batch=BATCH, records=None), steps=5, log_every=1)
 
     assert started_at == [2], "the trace did not open after the configured warmup"
     assert list((tmp_path / "profile").glob("**/*.xplane.pb")), "no trace to read"
@@ -859,11 +852,11 @@ def test_an_unfinished_profile_window_is_still_closed(tmp_path, monkeypatch):
     takes the next one down with it."""
     _capture_env(monkeypatch)
     make_trainer(profile=ProfileWindow(str(tmp_path / "long"), steps=8, warmup=1)).fit(
-        Data(batches), steps=3, log_every=1)
+        Dataset(lambda partition: batches(), None, batch=BATCH, records=None), steps=3, log_every=1)
     assert list((tmp_path / "long").glob("**/*.xplane.pb")), "no trace to read"
 
     make_trainer(profile=ProfileWindow(str(tmp_path / "short"), steps=1, warmup=0)).fit(
-        Data(batches), steps=2, log_every=1)
+        Dataset(lambda partition: batches(), None, batch=BATCH, records=None), steps=2, log_every=1)
     assert list((tmp_path / "short").glob("**/*.xplane.pb")), "no trace to read"
 
 
@@ -871,7 +864,7 @@ def test_the_profiler_runs_once_per_fit(tmp_path, monkeypatch):
     """One scheduled window means one capture directory holding one trace."""
     _capture_env(monkeypatch)
     make_trainer(profile=ProfileWindow(str(tmp_path), steps=1, warmup=0)).fit(
-        Data(batches), steps=6, log_every=1)
+        Dataset(lambda partition: batches(), None, batch=BATCH, records=None), steps=6, log_every=1)
 
     captures = list((tmp_path).glob("capture-*"))
     assert len(captures) == 1
@@ -882,7 +875,8 @@ def test_an_outer_profile_covers_the_whole_fit(tmp_path, monkeypatch):
     """With no scheduled window an explicit capture sees every step."""
     _capture_env(monkeypatch)
     with dew.Profiler(tmp_path / "outer"):
-        make_trainer().fit(Data(batches), steps=3, log_every=1)
+        make_trainer().fit(
+            Dataset(lambda partition: batches(), None, batch=BATCH, records=None), steps=3, log_every=1)
 
     assert list((tmp_path / "outer").glob("**/*.xplane.pb")), "no trace to read"
 
@@ -892,7 +886,7 @@ def test_a_scheduled_window_and_an_outer_profile_conflict(tmp_path, monkeypatch)
     _capture_env(monkeypatch)
     with dew.Profiler(tmp_path / "outer"), pytest.raises(ValueError, match=r"dew.Profiler capture is active"):
         make_trainer(profile=ProfileWindow(str(tmp_path / "window"), steps=1, warmup=0)).fit(
-            Data(batches), steps=2)
+            Dataset(lambda partition: batches(), None, batch=BATCH, records=None), steps=2)
 
 
 def test_a_stopped_outer_profile_releases_the_loop(tmp_path, monkeypatch):
@@ -920,7 +914,8 @@ def test_a_stopped_outer_profile_releases_the_loop(tmp_path, monkeypatch):
                 return self.scope.__exit__(*args)
 
         monkeypatch.setattr(jax.profiler, "StepTraceAnnotation", CountingScope)
-        make_trainer().fit(Data(batches), steps=4, log_every=2)
+        make_trainer().fit(
+            Dataset(lambda partition: batches(), None, batch=BATCH, records=None), steps=4, log_every=2)
 
         assert scopes == [1, 1], "scopes kept being built after the outer capture stopped"
         assert not outer.running
@@ -961,7 +956,7 @@ def test_a_peer_start_failure_keeps_the_cleanup_note(tmp_path, monkeypatch):
     try:
         with pytest.raises(RuntimeError, match="peer reported a broken window") as raised:
             make_trainer(profile=ProfileWindow(str(tmp_path / "window"), steps=2, warmup=0)).fit(
-                Data(batches), steps=4)
+                Dataset(lambda partition: batches(), None, batch=BATCH, records=None), steps=4)
 
         assert any("export refused" in note for note in raised.value.__notes__), (
             "the profiler-stop failure never reached the propagated error")
@@ -976,7 +971,8 @@ def test_the_next_outer_capture_still_works(tmp_path, monkeypatch):
     context capture afterwards proves neither leaked the process-wide owner."""
     _capture_env(monkeypatch)
     with dew.Profiler(tmp_path / "outer"):
-        make_trainer().fit(Data(batches), steps=2, log_every=1)
+        make_trainer().fit(
+            Dataset(lambda partition: batches(), None, batch=BATCH, records=None), steps=2, log_every=1)
 
     assert list((tmp_path / "outer").glob("**/*.xplane.pb")), "no trace to read"
 
@@ -993,7 +989,7 @@ def test_the_training_step_is_compiled_once_per_fit(monkeypatch):
 
     monkeypatch.setattr(jax.stages.Lowered, "compile", counting_compile)
     trainer = make_trainer()
-    trainer.fit(Data(batches), steps=6, log_every=1)
+    trainer.fit(Dataset(lambda partition: batches(), None, batch=BATCH, records=None), steps=6, log_every=1)
 
     # The placement goes through the jit cache; the step's lower().compile()
     # is the one explicit compile, and the loop runs on it.
