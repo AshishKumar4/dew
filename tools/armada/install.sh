@@ -4,7 +4,7 @@
 # its own (.github/workflows/ci.yml): CPU torch, then dewml with every extra a
 # test file imports (the workflow's EXTRAS) under constraints.txt, which pins
 # the patched jax 0.11.2 the multi-process cache tests need. tokamax is not a
-# dependency (docs/installation.md); the MoE tests run its grouped matmul.
+# dependency (docs/installation.md); the attention tests run its kernels.
 set -eu
 EXTRAS=test,av,tfds,metrics,plots,inference-clients,serve,vision,quantization,profile,torchax,gguf
 for python in 3.12 3.14; do
