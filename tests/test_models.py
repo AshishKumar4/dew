@@ -423,6 +423,27 @@ def test_dropout_is_active_in_train_mode(rng, stack):
     assert jnp.array_equal(e0, e1), "eval mode must be deterministic"
 
 
+def test_the_second_attention_of_a_dual_block_takes_its_dropout():
+    """With every gate closed but the second attention's, a dual-attention block's training outputs
+    differ between dropout keys and its evaluation ones do not: the second attention's output is
+    dropped as the block's other projected outputs are."""
+    block = DoubleStreamBlock(8, 2, 4, mlp_hidden=16, attention_impl="reference", dual_attention=True,
+                              shared_modulation=True, dropout_rate=0.5)
+    image, context = jnp.ones((1, 3, 8)), jnp.ones((1, 2, 8))
+    ones, zeros = jnp.ones((1, 8)), jnp.zeros((1, 8))
+    image_mods = (zeros, zeros, zeros, zeros, zeros, zeros, zeros, zeros, ones)
+    condition = (image_mods, (zeros,) * 6)
+    variables = block.init(jax.random.key(0), image, context, condition)
+    variables = jax.tree.map(lambda p: p + 0.02, variables)
+
+    def run(key=None):
+        rngs = None if key is None else {"dropout": jax.random.key(key)}
+        return block.apply(variables, image, context, condition, train=key is not None, rngs=rngs)[0]
+
+    assert not jnp.array_equal(run(1), run(2))
+    assert jnp.array_equal(run(), run())
+
+
 def test_mmdit_is_dual_stream(rng):
     """Text must participate in the token sequence: zeroing the text context
     must change the image output through joint attention, beyond the change
