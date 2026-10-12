@@ -81,7 +81,12 @@ class DepthAttention(nn.Module):
     @nn.nowrap
     def depth_flops(self, lengths, num_sources: int) -> float:
         """The pseudo-query score and weighted-value contraction for each source."""
-        return 2 * projection_flops(lengths, self.emb_features, num_sources)
+        return 2 * self.depth_parameter_flops(lengths, num_sources)
+
+    @nn.nowrap
+    def depth_parameter_flops(self, lengths, num_sources: int) -> float:
+        """Only the score contracts a learned matrix; value mixing uses its weights."""
+        return projection_flops(lengths, self.emb_features, num_sources)
 
     @nn.compact
     def __call__(self, values):

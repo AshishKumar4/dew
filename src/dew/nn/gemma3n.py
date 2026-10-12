@@ -192,10 +192,21 @@ class AltUpLayer(nn.Module):
     @nn.nowrap
     def model_flops(self, lengths) -> float:
         """Both router reads, coefficient maps and the prediction's copy contraction."""
+        return self.parameter_flops(lengths) + self.mixing_flops(lengths)
+
+    @nn.nowrap
+    def projection_uses(self) -> dict[str, int]:
+        return {'modality_router': 2, 'correction_coefs': 1, 'prediction_coefs': 1}
+
+    @nn.nowrap
+    def parameter_flops(self, lengths) -> float:
         maps = self.projections()
-        return (sum(projection_flops(lengths, *shape) for shape in maps.values())
-                + projection_flops(lengths, *maps['modality_router'])
-                + projection_flops(lengths, self.spec.num_inputs, self.spec.num_inputs * self.emb_features))
+        return sum(self.projection_uses()[name] * projection_flops(lengths, *shape)
+                   for name, shape in maps.items())
+
+    @nn.nowrap
+    def mixing_flops(self, lengths) -> float:
+        return projection_flops(lengths, self.spec.num_inputs, self.spec.num_inputs * self.emb_features)
 
     def setup(self):
         maps = self.projections()

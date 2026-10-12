@@ -140,9 +140,16 @@ class HyperConnection(nn.Module):
     @nn.nowrap
     def model_flops(self, lengths) -> float:
         """The learned mapping and the comb contraction used to write the streams."""
+        return self.parameter_flops(lengths) + self.mixing_flops(lengths)
+
+    @nn.nowrap
+    def parameter_flops(self, lengths) -> float:
+        return projection_flops(lengths, *self.projections()['fn'])
+
+    @nn.nowrap
+    def mixing_flops(self, lengths) -> float:
         copies = self.spec.hc_mult
-        return (projection_flops(lengths, *self.projections()['fn'])
-                + projection_flops(lengths, copies, copies * self.emb_features))
+        return projection_flops(lengths, copies, copies * self.emb_features)
 
     def __call__(self, streams):
         pre, post, comb = self.mapping(streams)
@@ -203,6 +210,10 @@ class HyperHead(nn.Module):
     def model_flops(self, lengths) -> float:
         """The learned collapse's flattened projection; sums are pointwise work."""
         return projection_flops(lengths, *self.projections()['hc_fn'])
+
+    @nn.nowrap
+    def parameter_flops(self, lengths) -> float:
+        return self.model_flops(lengths)
 
     @nn.compact
     def __call__(self, streams):

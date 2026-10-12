@@ -46,7 +46,7 @@ from ..dsa_kpool import KPoolSparseAttentionMixer
 from ..dspark import DSpark, DSparkStage, draft as dspark_draft
 from ..engram import Engram, EngramHashes, EngramLayer
 from ..flops import MissingFlopsCount, counted_flops, parameter_flops, projection_flops
-from ..gemma3n import AltUp, rescale_to
+from ..gemma3n import AltUp, AltUpLayer, rescale_to
 from ..gemma4_moe import Gemma4Experts
 from ..gpt_oss import GptOssMLP
 from ..hyper_connections import (
@@ -899,23 +899,26 @@ class CausalTransformer(nn.Module):
     @nn.nowrap
     def model_flops(self, lengths) -> float:
         """Real-row hidden-state work, summing the same block factories as setup."""
-        count = self._layer_flops(lengths, counted_flops)
+        return (self._layer_flops(lengths, counted_flops)
+                + self._root_flops(lengths, DepthAttention.depth_flops))
+
+    @nn.nowrap
+    def _root_flops(self, lengths, depth_counter) -> float:
         maps = self.projections()
-        count += sum(projection_flops(lengths, *shape) for name, shape in maps.items()
+        count = sum(projection_flops(lengths, *shape) for name, shape in maps.items()
                      if name.startswith(('altup_projections_', 'altup_unembed_projections_')))
         if self.hyper_connections is not None and self.hyper_connections.head == 'weighted':
             count += HyperHead(self.hyper_connections, self.emb_features, parent=None).model_flops(lengths)
         if self.attention_residuals is not None:
             sources = self.attention_residuals.blocks(self.num_layers) + 1
-            count += DepthAttention(self.emb_features, parent=None).depth_flops(lengths, sources)
+            count += depth_counter(DepthAttention(self.emb_features, parent=None), lengths, sources)
         return count
 
     @nn.nowrap
     def parameter_flops(self, lengths) -> float:
         """Learned matrices, separately from nonparameter attention/state work."""
-        if any(value is not None for value in (self.altup, self.hyper_connections, self.attention_residuals)):
-            raise MissingFlopsCount("CausalTransformer needs its multi-stream parameter geometry for PEFT")
-        return self._layer_flops(lengths, parameter_flops)
+        return (self._layer_flops(lengths, parameter_flops)
+                + self._root_flops(lengths, DepthAttention.depth_parameter_flops))
 
     @nn.nowrap
     def projections(self) -> dict[str, tuple[int, int]]:
@@ -1029,6 +1032,9 @@ class CausalTransformer(nn.Module):
             first, end = (0, self.num_layers) if self.loop.layers is None else self.loop.layers
             if first <= layer < end:
                 passes = self.loop.steps
+        if self.altup is not None and relative[-1] == 'modality_router':
+            site = AltUpLayer(self.altup, self.emb_features, parent=None)
+            passes *= site.projection_uses()['modality_router']
         return np.asarray(lengths) * passes
 
     def setup(self):

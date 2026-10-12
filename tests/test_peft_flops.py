@@ -19,9 +19,12 @@ from dew.diffusion import presets
 from dew.inputs import Field, InputSpec
 from dew.interop import Pretrained
 from dew.lora import LoRA
+from dew.nn.attention_residuals import AttentionResiduals
 from dew.nn.backbones.decoder_stack import Loop
 from dew.nn.backbones.dit import SimpleDiT
 from dew.nn.flops import MissingFlopsCount, counted_flops, dense_training_flops, projection_flops
+from dew.nn.gemma3n import AltUp
+from dew.nn.hyper_connections import HyperConnections
 from dew.nn.inputs import ModelInputs
 from dew.nn.protocols import CountedTraining
 from dew.objectives.base import FROZEN
@@ -125,6 +128,35 @@ def test_adapted_image_geometry_refuses_inherited_native_work_without_matrix_usa
     for count in (objective.model_flops, objective.training_flops):
         with pytest.raises(MissingFlopsCount, match="adapter matrix usage"):
             count(None, {"images": np.asarray(image)})
+
+
+@pytest.mark.parametrize("fields", [{"altup": AltUp(num_inputs=2)},
+                                    {"hyper_connections": HyperConnections(hc_mult=2, head="weighted")},
+                                    {"attention_residuals": AttentionResiduals(block_size=2)}])
+def test_residual_streams_separate_learned_work_from_mixing_for_peft(fields):
+    model = decoder(causal=False, attention_impl="reference", **fields)
+    tokens = jnp.ones((1, 4), jnp.int32)
+    variables = model.init(jax.random.key(411), tokens)
+    adapted = LoRA(rank=2, alpha=4, modules=("q_proj",)).apply(model, variables, key=511)
+    lengths = np.array([4])
+    factors = model.num_layers * 2 * 2 * (8 + 8) * 4
+    native, learned = model.model_flops(lengths), model.parameter_flops(lengths)
+    assert 0 < learned < native
+    assert adapted.model.parameter_flops(lengths) == learned + factors
+    assert adapted.model.training_flops(lengths) == 3 * native - learned + 3 * factors
+    complete = adapted.model.model_flops(lengths) + adapted.model.logits_flops(lengths)
+    assert complete == forward_products(adapted.model.apply, adapted.variables, tokens)
+
+
+def test_altup_adapter_router_is_used_for_both_prediction_and_correction():
+    model = decoder(altup=AltUp(num_inputs=2), attention_impl="reference", causal=False)
+    tokens = jnp.ones((1, 4), jnp.int32)
+    variables = model.init(jax.random.key(412), tokens)
+    adapted = LoRA(rank=2, alpha=4, modules=("modality_router",)).apply(model, variables, key=512)
+    extra = model.num_layers * 2 * 2 * 2 * (8 + 2) * 4
+    assert adapted.model.model_flops(np.array([4])) == model.model_flops(np.array([4])) + extra
+    complete = adapted.model.model_flops(np.array([4])) + adapted.model.logits_flops(np.array([4]))
+    assert complete == forward_products(adapted.model.apply, adapted.variables, tokens)
 
 
 def test_objective_assembles_peft_training_work_without_three_times_forward():
