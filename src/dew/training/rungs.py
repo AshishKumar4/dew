@@ -18,16 +18,20 @@ import json
 import os
 from collections.abc import Mapping, Sequence
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import jax
 import numpy as np
-from jax._src.cache_key import xla_flags_to_exclude_from_cache_key
 from jax.sharding import Mesh
 
 from dew.files import write_atomically
 from dew.nn.sharding import trace_context
 from dew.records import JSON, json_value, record
 from dew.telemetry.instrumentation import StepFlops, count_compilation_cache, step_flops
+
+if TYPE_CHECKING:
+    from dew.objectives.base import Batch
+    from dew.training.state import TrainState
 
 
 def rung_records() -> Path | None:
@@ -37,28 +41,27 @@ def rung_records() -> Path | None:
     return None if not cache else Path(cache) / 'dew-rungs'
 
 
-def rung_key(modules: Sequence[object], arguments: object, mesh: Mesh) -> dict[str, JSON]:
+def rung_key(modules: Sequence[object], arguments: tuple[TrainState, Batch], mesh: Mesh) -> dict[str, JSON]:
     """What a recorded rung was decided for, read before the step traces: the
     configuration of the `modules` its programs run at the rung it starts from
     (`Objective.program_key`), the step's `arguments` (each leaf's path, shape
     and dtype), the mesh's shape and its devices' kind and allocator limit, what
     a model reads from context as it traces (`trace_context`), and XLA_FLAGS
-    less the flags JAX's own key leaves out. A change of code under one key
-    keeps the rung as a first candidate the fit check still decides."""
+    in order. A change of code under one key keeps the rung as a first
+    candidate the fit check still decides."""
     devices = [device for device in mesh.devices.flat if device.process_index == jax.process_index()]
     limits = {f"{device.device_kind}, limit {(device.memory_stats() or {}).get('bytes_limit')}"
               for device in devices}
     devices_seen: list[JSON] = [*sorted(limits)]
-    leaves = [f"{jax.tree_util.keystr(path)} {np.shape(leaf)} {np.dtype(leaf.dtype)}"
+    leaves = [f"{jax.tree_util.keystr(path)} {np.shape(leaf)} {leaf.dtype}"
               for path, leaf in jax.tree_util.tree_flatten_with_path(arguments)[0]]
-    flags = sorted(flag for flag in os.environ.get('XLA_FLAGS', '').split()
-                   if flag.split('=')[0] not in xla_flags_to_exclude_from_cache_key)
+    settings = sorted(os.environ.get('XLA_FLAGS', '').split())
     program = repr([[repr(module) for module in modules], leaves, dict(mesh.shape), trace_context()])
     return {'program': hashlib.sha256(program.encode()).hexdigest(), 'devices': devices_seen,
-            'xla_flags': ' '.join(flags)}
+            'xla_flags': ' '.join(settings)}
 
 
-def recorded_rung(modules: Sequence[object], arguments: object,
+def recorded_rung(modules: Sequence[object], arguments: tuple[TrainState, Batch],
                   mesh: Mesh) -> tuple[Path | None, dict[str, JSON], JSON]:
     """Where the rung of the step over `arguments` on `mesh` is recorded, its key
     (`rung_key`), and the rung the record holds (None if there is none). A
