@@ -482,7 +482,7 @@ def test_remote_indexed_arrayrecords_read_only_the_selected_physical_shard(monke
 def arrayrecord_paths(tmp_path):
     from array_record.python.array_record_module import ArrayRecordWriter
 
-    paths = tuple(str(tmp_path / f"{shard}.array_record") for shard in range(3))
+    paths = tuple(str(tmp_path / f"{shard}.array_record") for shard in range(Loading().threads + 1))
     for shard, path in enumerate(paths):
         writer = ArrayRecordWriter(path, "group_size:1")
         for index in range(8):
@@ -533,7 +533,7 @@ def test_arrayrecords_retired_reader_lives_until_its_last_read(
 ):
     from dew.data.sources import records
 
-    source = records.ArrayRecords(arrayrecord_paths, counts=(8, 8, 8))
+    source = records.ArrayRecords(arrayrecord_paths, counts=(8,) * len(arrayrecord_paths))
     entered = threading.Barrier(3)
     released = [threading.Event(), threading.Event()]
     readers = []
@@ -573,8 +573,8 @@ def test_arrayrecords_retired_reader_lives_until_its_last_read(
             try:
                 entered.wait(timeout=5)
                 if retire == "eviction":
-                    assert source[8] == b"1:0"
-                    assert source[16] == b"2:0"
+                    for shard in range(1, len(arrayrecord_paths)):
+                        assert source[8 * shard] == f"{shard}:0".encode()
                 else:
                     source.close()
                 held = readers[0]
@@ -602,7 +602,7 @@ def test_arrayrecords_retired_reader_lives_until_its_last_read(
 def test_pickled_arrayrecords_open_independent_readers(arrayrecord_paths):
     from dew.data.sources.records import ArrayRecords
 
-    source = ArrayRecords(arrayrecord_paths, counts=(8, 8, 8))
+    source = ArrayRecords(arrayrecord_paths, counts=(8,) * len(arrayrecord_paths))
     assert source[0] == b"0:0"
     restored = pickle.loads(pickle.dumps(source))
     try:
