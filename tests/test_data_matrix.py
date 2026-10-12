@@ -2,15 +2,16 @@
 
 Each cell is a read mode (memory, indexed, streamed), with or without a cache
 the pool fills, a filter that rejects rows and online packing
-(`multiprocess_worker.matrix_data`). A pool of two trains it for three steps
-and saves; pools of one, two and four processes resume that checkpoint for
-three more, and each lands where a pool of its own size that nobody stopped
-lands: every process reads, after the resume, the batches that pool's process
-read after its third step, and ends at the same data position with the same
-parameters.
-A cell compiled to one global order resumes on any process count; a per-share
+(`multiprocess_worker.matrix_data`). A pool of one, two or four processes
+trains it for three steps and saves; a pool of the same size resumes that
+checkpoint for three more and lands where a pool of its size that nobody
+stopped lands: every process reads, after the resume, the batches that
+pool's process read after its third step, and ends at the same data
+position with the same parameters.
+A cell compiled to one global order resumes on any process count, so the
+checkpoint two processes saved also resumes on one and on four; a per-share
 cell keeps each share's rows, so it resumes on its own count and refuses
-another.
+every other.
 
 Run the matrix alone with `pytest tests/test_data_matrix.py`; `-k` picks cells.
 """
@@ -24,6 +25,7 @@ from test_multiprocess import assert_same_parameters, dumped_params
 pytestmark = [pytest.mark.mesh, pytest.mark.distributed]
 
 STEPS = 3
+COUNTS = (1, 2, 4)
 CELLS = [
     f"{read},{cache},{rejecting},{packed}"
     for read in ("memory", "indexed", "streamed")
@@ -33,16 +35,19 @@ CELLS = [
 ]
 
 
+@pytest.mark.parametrize("saved_by", COUNTS, ids=lambda count: f"saved-by-{count}")
 @pytest.mark.parametrize("cell", CELLS)
-def test_a_saved_position_resumes_where_an_uninterrupted_pool_lands(tmp_path, cell):
+def test_a_saved_position_resumes_where_an_uninterrupted_pool_lands(tmp_path, cell, saved_by):
     saved = tmp_path / "saved" / "run"
-    first = run_pool("matrix", tmp_path / "first", 2, run_dir=saved, cell=cell, name="matrix",
+    first = run_pool("matrix", tmp_path / "first", saved_by, run_dir=saved, cell=cell, name="matrix",
                      steps=STEPS, save_every=STEPS)
     elastic = first[0]["lowering"] == "global"
-    for processes in (1, 2, 4):
+    # A global order crosses counts from the two-process save; a per-share
+    # order is refused on every count but its own.
+    for processes in (saved_by,) if elastic and saved_by != 2 else COUNTS:
         directory = tmp_path / f"resumed{processes}" / "run"
         shutil.copytree(saved, directory)
-        if not elastic and processes != 2:
+        if not elastic and processes != saved_by:
             with pytest.raises(AssertionError, match="cannot be translated to another share"):
                 run_pool("matrix", tmp_path / f"resumed{processes}-out", processes, run_dir=directory,
                          cell=cell, name="matrix", steps=2 * STEPS)
