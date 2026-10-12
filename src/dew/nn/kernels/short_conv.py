@@ -276,7 +276,8 @@ def _specs(x, w, bias, valid, block: int, segments: int, steps: int):
 
 
 def _forward(x, taps, bias, valid, parts, activation: bool, eps: float, dtype, interpret: bool,
-             segments: int | None = None, steps: int | None = None, warps: int | None = None):
+             segments: int | None = None, steps: int | None = None, warps: int | None = None,
+             stages: int | None = None):
     from jax.experimental.pallas import triton as plgpu
 
     batch, length, channels = x.shape
@@ -291,13 +292,15 @@ def _forward(x, taps, bias, valid, parts, activation: bool, eps: float, dtype, i
         kernel, grid=grid, in_specs=specs,
         out_specs=[pl.BlockSpec((None, length, width), lambda c, t, b: (b, 0, 0)) for width, _ in parts],
         out_shape=[jax.ShapeDtypeStruct((batch, length, width), dtype) for width, _ in parts],
-        compiler_params=plgpu.CompilerParams(num_warps=WARPS if warps is None else warps, num_stages=1),
+        compiler_params=plgpu.CompilerParams(num_warps=WARPS if warps is None else warps,
+                                             num_stages=1 if stages is None else stages),
         interpret=interpret, name="short_conv_forward",
     )(*operands))
 
 
 def _backward(x, taps, bias, valid, cotangents, parts, activation: bool, eps: float, interpret: bool,
-              segments: int | None = None, steps: int | None = None, warps: int | None = None):
+              segments: int | None = None, steps: int | None = None, warps: int | None = None,
+              stages: int | None = None):
     from jax.experimental.pallas import triton as plgpu
 
     batch, length, channels = x.shape
@@ -322,7 +325,8 @@ def _backward(x, taps, bias, valid, cotangents, parts, activation: bool, eps: fl
         in_specs=specs + [pl.BlockSpec((None, length, width), lambda c, t, b: (b, 0, 0))
                           for width, _ in parts],
         out_specs=out_specs, out_shape=out_shape,
-        compiler_params=plgpu.CompilerParams(num_warps=WARPS if warps is None else warps, num_stages=1),
+        compiler_params=plgpu.CompilerParams(num_warps=WARPS if warps is None else warps,
+                                             num_stages=1 if stages is None else stages),
         interpret=interpret, name="short_conv_backward",
     )(*operands, *cotangents)
     dx, dw = found[0], jnp.sum(found[1], axis=(0, 1)).T
