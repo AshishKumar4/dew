@@ -42,7 +42,7 @@ from dew.nn.sharding import (
     mesh_axes,
     ruled_boxes,
 )
-from dew.objectives.base import Batch, Variables
+from dew.objectives.base import FROZEN, Batch, Variables
 from dew.telemetry.profile import region
 
 # The axes a parameter can be split over. A dimension named 'exp' takes the
@@ -385,12 +385,21 @@ class Layout:
     fetches each layer's parameters as it reaches that layer. When
     `host_parameters` is set, `check` refuses a placement that keeps every
     parameter on the device, so the patterns are never silently ignored.
+
+    `frozen_whole` keeps the frozen collection (`FROZEN`, a LoRA run's base)
+    whole on every device rather than split as the rules split it. A frozen
+    leaf has no gradient and no optimizer state, so a split saves only its
+    memory, and the step gathers it whole forward and again backward:
+    Qwen3.5-9B with rank-256 factors over FSDP 2 on two H100 SXMs stepped in
+    446.8 ms split and 398.0 ms whole, at 25.8 and 34.0 GiB
+    (docs/performance.md). `check` counts no leaf it keeps whole.
     """
     rules: LogicalAxisRules | Mapping[str, MeshAxes] = DEFAULT_RULES
     min_shard: int = 2 ** 16
     tolerance: float = 0.02
     host: tuple[str, ...] = ()
     host_parameters: tuple[str, ...] = ()
+    frozen_whole: bool = False
 
     def __post_init__(self):
         if not 0.0 <= self.tolerance <= 1.0:
@@ -442,7 +451,9 @@ class Layout:
         def leaf_sharding(path, value):
             axes = declared_axes(path, value.ndim)
             size = int(np.prod(value.shape, dtype=np.int64))
-            if axes is None:
+            if self._kept_whole(path):
+                spec = P()
+            elif axes is None:
                 spec = parameter_spec(value.shape, fsdp_size, self.min_shard)
             elif sharded_devices == 1 or size < self.min_shard:
                 spec = P()
@@ -459,6 +470,13 @@ class Layout:
 
         with boxed(ruled_boxes({**current_boxes(), **boxed_axes(tree)}, self.axis_rules)):
             return jax.tree_util.tree_map_with_path(leaf_sharding, nn.unbox(tree))
+
+    def _kept_whole(self, path) -> bool:
+        """Whether a leaf sits in the frozen collection `frozen_whole` keeps
+        whole: the first key on its path, in a variables tree or a train
+        state's, is `FROZEN`."""
+        collection = next((entry.key for entry in path if isinstance(entry, jax.tree_util.DictKey)), None)
+        return self.frozen_whole and collection == FROZEN
 
     def offloaded[TreeT](self, mesh: Mesh, tree: TreeT) -> Placement[TreeT]:
         """Return `shardings`, with the memory kind each leaf's path asks for.
@@ -530,7 +548,7 @@ class Layout:
         for (path, param), sharding in zip(
                 path_leaves, jax.tree.leaves(shardings), strict=True):
             elements = int(np.prod(param.shape, dtype=np.int64))
-            if elements < self.min_shard:
+            if elements < self.min_shard or self._kept_whole(path):
                 continue
             shardable_elements += elements
             if any(axis in mesh_axes(assignment)
@@ -669,6 +687,18 @@ def placed_bytes(tree) -> int:
     sharding places it (abstract arrays carry their sharding)."""
     return sum(math.prod(leaf.sharding.shard_shape(np.shape(leaf))) * np.dtype(leaf.dtype).itemsize
                for leaf in jax.tree.leaves(tree))
+
+
+def device_bytes(state, shardings) -> dict[str, int]:
+    """The bytes a device holds of a train state laid out by `shardings`,
+    by what they are: its variables (`params`), the optimizer's state
+    (`optimizer`), the EMA's copies (`ema`), and the gradients a step builds
+    of the trained parameters, which lie as those do (`gradients`). `state`
+    holds arrays or their shapes (`jax.ShapeDtypeStruct`)."""
+    placed = jax.tree.map(lambda leaf, sharding: jax.ShapeDtypeStruct(np.shape(leaf), leaf.dtype,
+                                                                      sharding=sharding), state, shardings)
+    return {"params": placed_bytes(placed.variables), "optimizer": placed_bytes(placed.opt_state),
+            "ema": placed_bytes(placed.ema), "gradients": placed_bytes(placed.variables["params"])}
 
 
 def prefetched_bytes(batch: Batch, shardings: Placement[Batch]) -> int:

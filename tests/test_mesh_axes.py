@@ -224,6 +224,48 @@ def test_a_delta_net_moves_no_activation_over_fsdp(fused):
     assert moved(**layers) == moved()
 
 
+@pytest.mark.mesh(devices=2)
+def test_a_frozen_collection_kept_whole_is_never_gathered():
+    """`Layout.frozen_whole` holds a LoRA base whole on each fsdp shard: the
+    state takes half the base more a device, the step gathers none of it,
+    and one step trains what the split layout trains."""
+    from dew.lora import LoRA
+    from dew.objectives.base import FROZEN
+    from dew.training.distributed import device_bytes
+
+    model = tiny()
+    adapter = LoRA(rank=2, modules=("q_proj", "v_proj", "gate_proj", "down_proj")).apply(
+        model, model.init(jax.random.key(0), jnp.ones((1, SEQ_LEN), jnp.int32)), key=1)
+    batch = next(token_batches())
+
+    def stepped(frozen_whole: bool):
+        mesh = MeshSpec(fsdp=2)
+        objective = LMObjective(adapter.model, SEQ_LEN, variables=jax.tree.map(np.asarray, adapter.variables))
+        trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(0), mesh=mesh, checkpoints=None,
+                          tracker=None, layout=Layout(min_shard=TINY_SHARD, frozen_whole=frozen_whole))
+        trainer.device_mesh = mesh.build(jax.devices()[:2])
+        state, shardings, _ = trainer.place()
+        placed = shard_batch(trainer.device_mesh, batch)
+        run = trainer.compile(state, placed)
+        gathered = sharded.collective_bytes(trainer.executable.as_text(), ("all-gather",))
+        trained, *_ = run(state, placed)
+        return shardings, device_bytes(state, shardings), gathered, jax.device_get(trained.variables["params"])
+
+    split, split_bytes, split_gathered, split_trained = stepped(False)
+    whole, whole_bytes, whole_gathered, whole_trained = stepped(True)
+    frozen = adapter.variables[FROZEN]
+    assert {sharding.spec for sharding in jax.tree.leaves(whole.variables[FROZEN])} == {P()}
+    assert P("fsdp") in {sharding.spec for sharding in jax.tree.leaves(split.variables[FROZEN])}
+    split_frozen = sum(leaf.nbytes for leaf, sharding in zip(
+        jax.tree.leaves(frozen), jax.tree.leaves(split.variables[FROZEN]), strict=True) if sharding.spec)
+    assert whole_bytes["params"] - split_bytes["params"] == split_frozen // 2
+    assert {name: whole_bytes[name] for name in ("optimizer", "gradients")} == {
+        name: split_bytes[name] for name in ("optimizer", "gradients")}
+    assert split_gathered - whole_gathered >= split_frozen
+    for got, want in zip(jax.tree.leaves(whole_trained), jax.tree.leaves(split_trained), strict=True):
+        np.testing.assert_allclose(got, want, rtol=1e-5, atol=1e-6)
+
+
 @pytest.mark.parametrize(("bytes_per_second", "peak", "platform", "spreads"), [
     (None, None, None, False),
     (5.8e9, 71e12, "gpu", False),
