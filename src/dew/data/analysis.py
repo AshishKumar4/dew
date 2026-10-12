@@ -78,10 +78,12 @@ def _promoted(pipeline: Pipeline) -> Pipeline:
     """The pipeline as the run reads it. Each published generation it caches
     is read as a source, in place of the steps the generation already ran,
     with its published packing in place of the pack stage that follows it.
-    A first-fit pack directly on a source that states its documents'
-    lengths reads that source's planned windows (`PackedSource.planned`),
-    by the plan a published generation stores, so the windows are indexed
-    and the order is global in every read."""
+    A first-fit pack directly on a source that reads its documents by index
+    and states their lengths reads that source's planned windows
+    (`PackedSource.planned`), by the plan a published generation stores, so
+    the windows are indexed and the order is global in every read. A source
+    read only as a stream, such as one filtered by a predicate, is packed as
+    its rows arrive."""
     from dew.data.cache import Generation
     from dew.data.packing import PackedSource, plan_name
 
@@ -100,6 +102,7 @@ def _promoted(pipeline: Pipeline) -> Pipeline:
         isinstance(pack, Pack)
         and pack.policy == "first-fit"
         and not isinstance(source, (Mixture, Phases))
+        and source.supports("indexed")
         and source.lengths() is not None
     ):
         source, stages = PackedSource.planned(source, pack), stages[1:]
