@@ -30,7 +30,7 @@ from dew.inference import RunProcessor, TextGeneration
 from dew.inputs import Field, unit_range
 from dew.objectives.base import merge
 from dew.objectives.diffusion import DiffusionRunConfig, PretrainedAutoencoder, TextCondition
-from dew.sampling import APG, CFG, CFGPlusPlus, Euler, Heun, TextToImage
+from dew.sampling import APG, CFG, CFGPlusPlus, DPMSolverSDE, Euler, Heun, TextToImage
 from dew.sampling.pipelines import Images
 from dew.training import Checkpoints, Trainer
 
@@ -299,6 +299,27 @@ def test_sampler_and_guidance_are_call_arguments(tmp_path):
     assert np.array_equal(pipe(["x"], steps=8, guidance=None, solver=Heun(), key=key).host().images, plain)
     assert np.array_equal(pipe(["x"], steps=8, guidance=4.0, solver=Heun(), key=key).host().images,
                           pipe(["x"], steps=8, guidance=CFG(4.0), solver=Heun(), key=key).host().images)
+
+
+def test_another_guidance_scale_or_brownian_seed_reuses_the_compiled_walk(tmp_path):
+    """A request's CFG scale and a Brownian solver's seed are data to the image walk: another value
+    changes the sample and runs the program the first value compiled."""
+    from dew.sampling import pipelines
+
+    make_run(tmp_path)
+    loaded = TextToImage.from_run(str(tmp_path))
+    pipe = dataclasses.replace(loaded, variables=jax.tree.map(lambda leaf: leaf + 0.05, loaded.variables))
+
+    def draw(scale, seed):
+        return pipe(["x"], steps=8, guidance=CFG(scale), solver=DPMSolverSDE(seed=seed),
+                    key=jax.random.PRNGKey(1)).host().images
+
+    first = draw(4.0, 1)
+    compiled = pipelines._run(None)._cache_size()
+    assert not np.allclose(draw(2.0, 1), first)
+    assert not np.allclose(draw(4.0, 2), first)
+    assert np.array_equal(draw(4.0, 1), first)
+    assert pipelines._run(None)._cache_size() == compiled
 
 
 def test_the_run_record_refuses_a_field_it_does_not_know(tmp_path):
