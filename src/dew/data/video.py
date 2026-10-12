@@ -19,7 +19,7 @@ import numpy as np
 
 if TYPE_CHECKING:
     from dew.data.sources.urls import Fetch
-    from dew.data.steps.video import DecodeFrames
+    from dew.data.steps.video import Audio, DecodeClip
 
 
 def video_paths(root: str, extensions: tuple[str, ...]) -> list[str]:
@@ -51,11 +51,19 @@ def fetch(url: str = "url", to: str = "mp4", *, timeout: float = 30.0, retries: 
     return Fetch(url, to, timeout, retries, max_bytes)
 
 
-def decode(field: str = "mp4", to: str = "video", *, frames: int = 16, size: int = 256) -> DecodeFrames:
-    """A random record step that decodes `frames` frames of the clip in
-    `field`, from a random start, each fitted into a `size` square, under
-    `to`, without audio; a clip that does not decode or is too short is
-    counted and dropped."""
-    from dew.data.steps.video import DecodeFrames
+def decode_clip(frames: int = 16, *, size: int = 256, fps: float = 25.0, field: str = "mp4",
+                to: str = "video", audio_padding: int | None = None, sample_rate: int = 16_000) -> DecodeClip:
+    """A random record step that decodes `frames` frames at `fps` from a
+    random start of the clip in `field`, bytes or a path, each fitted into a
+    `size` square, under `to`; with `audio_padding`, the sound under them
+    too (`DecodeClip`). A clip that does not decode is counted and dropped."""
+    from dew.data.steps.video import DecodeClip
 
-    return DecodeFrames(frames, size, field, to)
+    return DecodeClip(frames, size, fps, field, to, audio_padding, sample_rate)
+
+
+def audio(features: str = "facebook/wav2vec2-base-960h") -> Audio:
+    """A record step that featurizes a decoded clip's "audio" for the audio model `features`."""
+    from dew.data.steps.video import Audio
+
+    return Audio(features)

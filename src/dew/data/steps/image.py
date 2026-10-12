@@ -5,6 +5,7 @@ from __future__ import annotations
 import dataclasses
 import functools
 import inspect
+import threading
 from collections.abc import Callable, Mapping, Sequence
 from typing import Literal
 
@@ -91,12 +92,178 @@ class NotFlat:
         return bool(pixels.min() != pixels.max())
 
 
+_INTERPOLATIONS = {"area": "INTER_AREA", "bilinear": "INTER_LINEAR", "bicubic": "INTER_CUBIC",
+                   "nearest": "INTER_NEAREST", "lanczos": "INTER_LANCZOS4"}
+type Interpolation = Literal["area", "bilinear", "bicubic", "nearest", "lanczos"]
+
+
+def _resized(image: np.ndarray, height: int, width: int, method: Interpolation) -> np.ndarray:
+    import cv2
+
+    if image.shape[:2] == (height, width):
+        return image
+    return cv2.resize(image, (width, height), interpolation=getattr(cv2, _INTERPOLATIONS[method]))
+
+
 @dataclasses.dataclass(frozen=True)
 class Resize(grain.MapTransform):
-    size: int
+    """The pixels in `field` resized to `size`, a square side or (height, width)."""
+
+    size: int | tuple[int, int]
+    method: Interpolation = "area"
+    field: str = "image"
 
     def map(self, element: Batch) -> Batch:
-        return {**element, "image": resize_image(np.asarray(element["image"]), self.size)}
+        height, width = (self.size, self.size) if isinstance(self.size, int) else self.size
+        return {**element, self.field: _resized(np.asarray(element[self.field]), height, width, self.method)}
+
+
+@dataclasses.dataclass(frozen=True)
+class CenterCrop(grain.MapTransform):
+    """The central `size` square of the pixels in `field`; a smaller image is
+    first resized up so its shorter side is `size`."""
+
+    size: int
+    method: Interpolation = "bicubic"
+    field: str = "image"
+
+    def map(self, element: Batch) -> Batch:
+        image = np.asarray(element[self.field])
+        height, width = image.shape[:2]
+        if min(height, width) < self.size:
+            scale = self.size / min(height, width)
+            height, width = max(self.size, round(height * scale)), max(self.size, round(width * scale))
+            image = _resized(image, height, width, self.method)
+        top, left = (height - self.size) // 2, (width - self.size) // 2
+        return {**element, self.field: image[top : top + self.size, left : left + self.size]}
+
+
+@dataclasses.dataclass(frozen=True)
+class RandomResizedCrop(grain.RandomMapTransform):
+    """torchvision's RandomResizedCrop: a crop of `scale` of the area and
+    `ratio` of aspect, drawn from the record's generator, resized to a `size`
+    square; after ten draws that do not fit, the central crop of the nearest
+    aspect."""
+
+    size: int
+    scale: tuple[float, float] = (0.08, 1.0)
+    ratio: tuple[float, float] = (3 / 4, 4 / 3)
+    method: Interpolation = "bilinear"
+    field: str = "image"
+
+    def random_map(self, element: Batch, rng: np.random.Generator) -> Batch:
+        image = np.asarray(element[self.field])
+        height, width = image.shape[:2]
+        area, bounds = height * width, np.log(self.ratio)
+        for _ in range(10):
+            target = area * rng.uniform(*self.scale)
+            aspect = np.exp(rng.uniform(*bounds))
+            crop_width, crop_height = round(np.sqrt(target * aspect)), round(np.sqrt(target / aspect))
+            if 0 < crop_width <= width and 0 < crop_height <= height:
+                top = int(rng.integers(0, height - crop_height + 1))
+                left = int(rng.integers(0, width - crop_width + 1))
+                break
+        else:
+            aspect = width / height
+            if aspect < min(self.ratio):
+                crop_width, crop_height = width, round(width / min(self.ratio))
+            elif aspect > max(self.ratio):
+                crop_height, crop_width = height, round(height * max(self.ratio))
+            else:
+                crop_width, crop_height = width, height
+            top, left = (height - crop_height) // 2, (width - crop_width) // 2
+        crop = image[top : top + crop_height, left : left + crop_width]
+        return {**element, self.field: _resized(crop, self.size, self.size, self.method)}
+
+
+@dataclasses.dataclass(frozen=True)
+class Flip(grain.RandomMapTransform):
+    """The pixels in `field` mirrored left to right with probability `p`."""
+
+    p: float = 0.5
+    field: str = "image"
+
+    def random_map(self, element: Batch, rng: np.random.Generator) -> Batch:
+        image = np.asarray(element[self.field])
+        flipped = np.ascontiguousarray(image[:, ::-1]) if rng.random() < self.p else image
+        return {**element, self.field: flipped}
+
+
+@dataclasses.dataclass(frozen=True)
+class ColorJitter(grain.RandomMapTransform):
+    """torchvision's float ColorJitter of the pixels in `field`: brightness,
+    contrast and saturation factors drawn from [1 - x, 1 + x], applied in a
+    random order, rounded once."""
+
+    brightness: float = 0.2
+    contrast: float = 0.05
+    saturation: float = 0.2
+    field: str = "image"
+
+    def random_map(self, element: Batch, rng: np.random.Generator) -> Batch:
+        from dew.data.image_augmentation import jitter_host
+
+        spreads = (self.brightness, self.contrast, self.saturation)
+        factors = np.asarray([rng.uniform(max(0.0, 1 - spread), 1 + spread) for spread in spreads])
+        pixels = jitter_host(np.asarray(element[self.field]).astype(np.float32), factors, rng.permutation(3))
+        return {**element, self.field: np.rint(pixels).astype(np.uint8)}
+
+
+@dataclasses.dataclass(frozen=True, eq=False)
+class Processor(grain.MapTransform):
+    """A Hugging Face image processor's `pixel_values` for the image in `field`, under `to`."""
+
+    processor: object
+    field: str = "image"
+    to: str = "pixel_values"
+
+    def map(self, element: Batch) -> Batch:
+        processed = self.processor(images=np.asarray(element[self.field]), return_tensors="np")
+        return {**element, self.to: np.asarray(processed["pixel_values"][0])}
+
+
+_local = threading.local()
+_torch_rng = threading.Lock()
+
+
+@dataclasses.dataclass(frozen=True, eq=False)
+class Albumentations(grain.RandomMapTransform):
+    """An albumentations pipeline on the image in `field`, seeded from the
+    record's generator: each reader thread runs its own copy, so threads
+    never share a seed, and a record's draw is the same at any thread count
+    and after a resume."""
+
+    transform: object
+    field: str = "image"
+
+    def random_map(self, element: Batch, rng: np.random.Generator) -> Batch:
+        import copy
+
+        copies = _local.__dict__.setdefault("albumentations", {})
+        transform = copies.setdefault(id(self), copy.deepcopy(self.transform))
+        transform.set_random_seed(int(rng.integers(0, 2**32 - 1)))
+        return {**element, self.field: transform(image=np.asarray(element[self.field]))["image"]}
+
+
+@dataclasses.dataclass(frozen=True, eq=False)
+class Torchvision(grain.RandomMapTransform):
+    """A torchvision v2 transform on the image in `field` (HWC uint8 in and
+    out), seeded from the record's generator. torch draws from one generator a
+    process, so the transform runs one record at a time in each process, the
+    generator seeded inside that turn and restored after it."""
+
+    transform: object
+    field: str = "image"
+
+    def random_map(self, element: Batch, rng: np.random.Generator) -> Batch:
+        import torch
+
+        seed = int(rng.integers(0, 2**63 - 1))
+        pixels = torch.from_numpy(np.ascontiguousarray(element[self.field])).permute(2, 0, 1)
+        with _torch_rng, torch.random.fork_rng(devices=[]):
+            torch.manual_seed(seed)
+            transformed = self.transform(pixels)
+        return {**element, self.field: np.ascontiguousarray(np.asarray(transformed).transpose(1, 2, 0))}
 
 
 @dataclasses.dataclass(frozen=True)
@@ -113,55 +280,6 @@ class Caption(grain.MapTransform):
                 label = self.classes[int(label)]
             caption = self.template.format(**{**element, "label": label})
         return {**element, "caption": caption}
-
-
-@dataclasses.dataclass(frozen=True)
-class CenterCrop(grain.MapTransform):
-    size: int
-
-    def map(self, element: Batch) -> Batch:
-        image = np.asarray(element["image"])
-        top, left = max(0, (image.shape[0] - self.size) // 2), max(0, (image.shape[1] - self.size) // 2)
-        return {
-            **element,
-            "image": resize_image(image[top : top + self.size, left : left + self.size], self.size),
-        }
-
-
-@dataclasses.dataclass(frozen=True)
-class RandomCrop(grain.RandomMapTransform):
-    size: int
-    scale: tuple[float, float] = (0.8, 1.0)
-    flip: bool = False
-    jitter: bool = False
-
-    def random_map(self, element: Batch, rng: np.random.Generator) -> Batch:
-        from dew.data.image_augmentation import apply_host, draw_host
-
-        image = np.asarray(element["image"])
-        parameters = draw_host(rng, image.shape, flip=self.flip, jitter=self.jitter, crop_scale=self.scale)
-        pixels = apply_host(image, parameters, self.size)
-        return {**element, "image": np.clip(np.rint(pixels), 0, 255).astype(np.uint8)}
-
-
-@dataclasses.dataclass(frozen=True)
-class Flip(grain.RandomMapTransform):
-    def random_map(self, element: Batch, rng: np.random.Generator) -> Batch:
-        return {
-            **element,
-            "image": augment_image(Augment(flip=True, jitter=False), np.asarray(element["image"]), rng),
-        }
-
-
-@dataclasses.dataclass(frozen=True)
-class ColorJitter(grain.RandomMapTransform):
-    flip: bool = False
-
-    def random_map(self, element: Batch, rng: np.random.Generator) -> Batch:
-        return {
-            **element,
-            "image": augment_image(Augment(flip=self.flip, jitter=True), np.asarray(element["image"]), rng),
-        }
 
 
 @dataclasses.dataclass(frozen=True)

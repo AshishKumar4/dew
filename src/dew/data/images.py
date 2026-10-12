@@ -10,7 +10,24 @@ import numpy as np
 
 if TYPE_CHECKING:
     from dew.data.sources.urls import Fetch
-    from dew.data.steps.image import DecodeImage, MaxAspect, MinSide, NotFlat
+    from dew.data.steps.image import (
+        Albumentations,
+        AugmentationKey,
+        Caption,
+        CenterCrop,
+        ColorJitter,
+        DecodeImage,
+        DeviceAugment,
+        Flip,
+        Interpolation,
+        MaxAspect,
+        MinSide,
+        NotFlat,
+        Processor,
+        RandomResizedCrop,
+        Resize,
+        Torchvision,
+    )
 
 
 def import_opencv() -> None:
@@ -134,3 +151,94 @@ def not_flat(field: str = "image") -> NotFlat:
     from dew.data.steps.image import NotFlat
 
     return NotFlat(field)
+
+
+def resize(size: int | tuple[int, int], method: Interpolation = "area", *, field: str = "image") -> Resize:
+    """A record step that resizes the pixels in `field` to `size`, a square
+    side or (height, width), with OpenCV's `method` interpolation."""
+    from dew.data.steps.image import Resize
+
+    return Resize(size, method, field)
+
+
+def center_crop(size: int, *, field: str = "image") -> CenterCrop:
+    """A record step that keeps the central `size` square of the pixels in
+    `field`, resizing a smaller image up first."""
+    from dew.data.steps.image import CenterCrop
+
+    return CenterCrop(size, field=field)
+
+
+def random_resized_crop(size: int, *, scale: tuple[float, float] = (0.08, 1.0),
+                        ratio: tuple[float, float] = (3 / 4, 4 / 3),
+                        field: str = "image") -> RandomResizedCrop:
+    """A random step, torchvision's RandomResizedCrop: a crop of `scale` of
+    the area at `ratio` of aspect, resized to a `size` square."""
+    from dew.data.steps.image import RandomResizedCrop
+
+    return RandomResizedCrop(size, scale, ratio, field=field)
+
+
+def flip(p: float = 0.5, *, field: str = "image") -> Flip:
+    """A random step that mirrors the pixels in `field` left to right with probability `p`."""
+    from dew.data.steps.image import Flip
+
+    return Flip(p, field)
+
+
+def color_jitter(brightness: float = 0.2, contrast: float = 0.05, saturation: float = 0.2, *,
+                 field: str = "image") -> ColorJitter:
+    """A random step, torchvision's ColorJitter of brightness, contrast and saturation."""
+    from dew.data.steps.image import ColorJitter
+
+    return ColorJitter(brightness, contrast, saturation, field)
+
+
+def caption(template: str | None = None, *, classes: tuple[str, ...] = ()) -> Caption:
+    """A record step that writes "caption": the record's caption or text, or
+    `template` formatted with its fields, "{label}" being the class name
+    `classes` gives a label."""
+    from dew.data.steps.image import Caption
+
+    return Caption(template, classes)
+
+
+def processor(image_processor: object, *, field: str = "image", to: str = "pixel_values") -> Processor:
+    """A record step that runs a Hugging Face image processor on the image in
+    `field`, its `pixel_values` under `to`."""
+    from dew.data.steps.image import Processor
+
+    return Processor(image_processor, field, to)
+
+
+def albumentations(transform: object, *, field: str = "image") -> Albumentations:
+    """A random step that runs an albumentations pipeline on the image in
+    `field`, seeded from the record's generator, so its draws repeat exactly
+    on resume and at any thread or worker count."""
+    from dew.data.steps.image import Albumentations
+
+    return Albumentations(transform, field)
+
+
+def torchvision(transform: object, *, field: str = "image") -> Torchvision:
+    """A random step that runs a torchvision v2 transform on the image in
+    `field` (HWC uint8 in and out), seeded from the record's generator."""
+    from dew.data.steps.image import Torchvision
+
+    return Torchvision(transform, field)
+
+
+def augmentation_key() -> AugmentationKey:
+    """A random step that draws the key `device_augment` augments its record with."""
+    from dew.data.steps.image import AugmentationKey
+
+    return AugmentationKey()
+
+
+def device_augment(size: int, *, crop_scale: tuple[float, float] = (1.0, 1.0), flip: bool = True,
+                   jitter: bool = False) -> DeviceAugment:
+    """A batch step that crops, flips and jitters a batch's images on the
+    host's accelerator, each record by the key `augmentation_key` drew."""
+    from dew.data.steps.image import DeviceAugment
+
+    return DeviceAugment(size, crop_scale, flip, jitter)
