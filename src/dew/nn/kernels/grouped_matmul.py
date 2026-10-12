@@ -8,9 +8,7 @@ input gradient `gmm` against the transposed kernel, kernel gradient `tgmm`.
 They are Triton kernels, compiled only for a CUDA lowering, chosen where the
 call lowers (`jax.lax.platform_dependent`), so a CPU computation on a GPU
 host lowers to `jax.lax.ragged_dot`; an explicit request interprets them on
-the CPU, as the CPU suite checks them. Each launch's tile is measured per
-GPU model and shape (`Gmm`, `Tgmm`, `dew.nn.kernels.tuning`); JAX's
-`_hyperparam_selection_rule` is the tile without a measurement. They stay on sm80 to sm89 despite
+the CPU, as the CPU suite checks them. They stay on sm80 to sm89 despite
 jax 0.11.2 deprecating Pallas Triton (it warns at each lowering, left to the
 user's filters): JAX's Mosaic GPU grouped matmul needs wgmma, which those
 lack, and tokamax's sm80 Mosaic config overflows an Ada card's shared memory
@@ -19,9 +17,7 @@ and has no backward (`dew.nn.kernels.generation.triton_runs`).
 
 from __future__ import annotations
 
-import dataclasses
 import functools
-from typing import ClassVar
 
 import jax
 import jax.numpy as jnp
@@ -29,7 +25,6 @@ import numpy as np
 from flax.typing import Dtype, PrecisionLike
 
 from ..precision import asks_default_precision
-from . import generation, tuning
 
 
 def ragged_dot_refusal(compute: Dtype, operands: tuple[Dtype, ...],
@@ -57,95 +52,22 @@ def ragged_dot_refusal(compute: Dtype, operands: tuple[Dtype, ...],
         "fp32 products above the default precision, and the kernels multiply in TF32")
 
 
-@dataclasses.dataclass(frozen=True)
-class TileConfig:
-    """A grouped matmul's tile, rows by contraction by columns, and its warps
-    and pipeline stages (None: Triton's own)."""
-    block_m: int
-    block_k: int
-    block_n: int
-    warps: int | None
-    stages: int | None
-
-
-@dataclasses.dataclass(frozen=True)
-class _Grouped(tuning.KernelOp):
-    """A grouped matmul launch over `[rows, ...]` tokens and `[groups]` sizes:
-    JAX's tile without a measurement, and the tiles of FrontDamselfly's A100
-    sweep that fit the GPU's shared memory with their stages."""
-
-    config_cls: ClassVar[type[TileConfig]] = TileConfig
-
-    def _get_heuristics_config(self, ba) -> TileConfig:
-        # Imported at first use: the kernels need jax's Pallas Triton backend,
-        # which jax 0.11.2 deprecates, and importing a model must not load it.
-        from . import ragged_dot
-        return TileConfig(**ragged_dot._hyperparam_selection_rule(np.dtype(ba.arguments['tokens'].dtype)),
-                          warps=None, stages=None)
-
-    def _get_autotuning_configs(self, ba) -> set[TileConfig]:
-        size = np.dtype(ba.arguments['tokens'].dtype).itemsize
-        shared = generation.gpu_target().shared_limit or 0
-        return {TileConfig(m, k, n, warps, stages) for m in (64, 128, 256) for k in (32, 64, 128)
-                for n in (128, 256) for warps in (4, 8) for stages in (2, 3, 4)
-                if stages * (m * k + k * n) * size <= shared}
-
-    def operands(self, specs: list[jax.ShapeDtypeStruct], seed: int) -> list[jax.Array]:
-        """Normal floats, and group sizes of a Dirichlet draw over the rows
-        with the last group empty, as routing leaves one."""
-        *arrays, sizes = super().operands(specs, seed)
-        rng = np.random.default_rng(seed)
-        groups, rows = specs[-1].shape[0], specs[0].shape[0]
-        counts = (np.append(rng.multinomial(rows, rng.dirichlet(np.ones(groups - 1))), 0) if groups > 1
-                  else np.array([rows]))
-        return [*arrays, jnp.asarray(counts, sizes.dtype)]
-
-
-@dataclasses.dataclass(frozen=True)
-class Gmm(_Grouped):
-    """`ragged_dot.gmm`: each group's rows of `tokens` against its matrix of
-    `kernel`, `[k, n]`, or `[n, k]` transposed (`trans_rhs`, the input
-    gradient)."""
-
-    ROWS: ClassVar[tuple[str, ...]] = ('tokens',)
-
-    def _fwd(self, tokens: jax.Array, kernel: jax.Array, sizes: jax.Array, *, out_dtype: str,
-             trans_rhs: bool, interpret: bool, config: TileConfig, return_residuals: bool = False):
-        from . import ragged_dot
-        return ragged_dot.gmm(tokens, kernel, sizes, block_m=config.block_m, block_k=config.block_k,
-                              block_n=config.block_n, num_warps=config.warps, num_stages=config.stages,
-                              trans_rhs=trans_rhs, interpret=interpret, compute_dtype=tokens.dtype,
-                              out_dtype=jnp.dtype(out_dtype)), None
-
-
-@dataclasses.dataclass(frozen=True)
-class Tgmm(_Grouped):
-    """`ragged_dot.tgmm`: each group's `[k, n]` sum of its rows' outer
-    products of `tokens` and `cotangent`, the kernel gradient."""
-
-    ROWS: ClassVar[tuple[str, ...]] = ('tokens', 'cotangent')
-
-    def _fwd(self, tokens: jax.Array, cotangent: jax.Array, sizes: jax.Array, *, out_dtype: str,
-             interpret: bool, config: TileConfig, return_residuals: bool = False):
-        from . import ragged_dot
-        return ragged_dot.tgmm(tokens, cotangent, sizes, block_m=config.block_m, block_k=config.block_k,
-                               block_n=config.block_n, num_warps=config.warps, num_stages=config.stages,
-                               interpret=interpret, compute_dtype=tokens.dtype,
-                               out_dtype=jnp.dtype(out_dtype)), None
-
-
-_GMM = Gmm()
-_TGMM = Tgmm()
-
-
 def _gmm(tokens, kernel, sizes, out_dtype, *, trans_rhs: bool, interpret: bool):
-    return _GMM(tokens, kernel.astype(tokens.dtype), sizes, out_dtype=jnp.dtype(out_dtype).name,
-                trans_rhs=trans_rhs, interpret=interpret)
+    # Imported at first use: the kernels need jax's Pallas Triton backend,
+    # which jax 0.11.2 deprecates, and importing a model must not load it.
+    from . import ragged_dot
+    compute = tokens.dtype
+    return ragged_dot.gmm(tokens, kernel.astype(compute), sizes,
+                          **ragged_dot._hyperparam_selection_rule(np.dtype(compute)), trans_rhs=trans_rhs,
+                          interpret=interpret, compute_dtype=compute, out_dtype=out_dtype)
 
 
 def _tgmm(tokens, cotangent, sizes, out_dtype, *, interpret: bool):
-    return _TGMM(tokens, cotangent.astype(tokens.dtype), sizes, out_dtype=jnp.dtype(out_dtype).name,
-                 interpret=interpret)
+    from . import ragged_dot
+    compute = tokens.dtype
+    return ragged_dot.tgmm(tokens, cotangent.astype(compute), sizes,
+                           **ragged_dot._hyperparam_selection_rule(np.dtype(compute)), interpret=interpret,
+                           compute_dtype=compute, out_dtype=out_dtype)
 
 
 def _on_platform(kernel, fallback, interpret_on_cpu: bool):
