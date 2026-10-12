@@ -78,7 +78,7 @@ import json
 from test_tuning import launches, operands, step
 from dew.nn.kernels import tuning
 print(json.dumps([{rows: launches(step(), *operands(rows)) for rows in (13, 15)},
-                  tuning.tune(step(), *operands(15))]))
+                  tuning.tune(step().lower(*operands(15)))]))
 """
 
 

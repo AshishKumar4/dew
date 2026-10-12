@@ -301,16 +301,15 @@ def _store(picks: tokamax.AutotuningResult) -> None:
                          .dumps(prune_errors=True))
 
 
-def tune(jitted: jax.stages.Wrapped, *args) -> bool:
-    """Settle every launch's config in `jitted(*args)` across the pool: process
-    0 takes its stored pick, or measures one where it has its GPU to itself
-    (storing it), and every process takes exactly process 0's picks for the
-    program's launches. True on every process when any process's picks
-    changed, so the caller lowers again to compile with them. The program is
-    lowered as the caller lowers it, which JAX's cache answers."""
+def tune(lowered: jax.stages.Lowered) -> bool:
+    """Settle every launch's config in the `lowered` program across the pool:
+    process 0 takes its stored pick, or measures one where it has its GPU to
+    itself (storing it), and every process takes exactly process 0's picks
+    for the program's launches. True on every process when any process's
+    picks changed, so the caller lowers again to compile with them."""
     if not generation.triton_runs():
         return False
-    found = [(op, op.keyed(ba)) for ba in tokamax.autotuning.get_bound_args(jitted, *args)
+    found = [(op, op.keyed(ba)) for ba in tokamax.autotuning.get_bound_args(lowered)
              if isinstance(op := ba.op, KernelOp)]
     if not found:
         return False
