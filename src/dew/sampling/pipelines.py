@@ -466,11 +466,6 @@ class TextToImage:
         if type(decode) is not bool:
             raise ValueError("decode must be a boolean")
         solver = self.solver if solver is None else solver
-        for role, value in (("solver", solver), ("guidance", chosen)):
-            if value is not None and jax.tree_util.all_leaves([value]):
-                raise TypeError(f"the {role} {type(value).__name__} is no pytree, and a call takes its "
-                                f"{role} as data: declare it a flax struct.dataclass, its settings "
-                                "static fields")
         if prepared is not None:
             prepared = self._checked_inputs(prepared, mesh, count)
             if chosen is not None and prepared.conditions and not prepared.unconditional:
