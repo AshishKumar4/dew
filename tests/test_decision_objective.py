@@ -502,7 +502,7 @@ def test_a_saved_vision_run_answers_image_rows(tmp_path, separate_tokenizer):
     task = Decide(base.model, base.init(jax.random.key(0)), layout, tokenizer, base.specials,
                   processor=source.processor)
     objective = DecisionObjective(task)
-    data = objective.dataset(EXAMPLES, batch=8)
+    data = load(DecisionRecipe(source=EXAMPLES), batch=8, read="memory", objective=objective.data())
     run = tmp_path / "run"
     checkpoints = Checkpoints(str(run), keep=1)
     state = Trainer(objective, optax.adam(1e-3), key=0, checkpoints=checkpoints).fit(
@@ -542,7 +542,7 @@ def test_a_saved_byte_decision_run_records_no_tokenizer_backed_processor(tmp_pat
     task = Decide(base.model, base.init(jax.random.key(0)), LAYOUT, TOKENIZER, SPECIALS,
                   processor=source.processor)
     objective = DecisionObjective(task)
-    data = objective.dataset(EXAMPLES, batch=8)
+    data = load(DecisionRecipe(source=EXAMPLES), batch=8, read="memory", objective=objective.data())
     run = tmp_path / "run"
     checkpoints = Checkpoints(str(run), keep=1)
     state = Trainer(objective, optax.adam(1e-3), key=0, checkpoints=checkpoints).fit(
@@ -568,7 +568,8 @@ def test_calibration_counts_33_validation_rows_once_at_batch_32():
     held = [Example(f"charged twice {index}", {"team": INTENT}, {"team": "billing"})
             for index in range(33)]
     objective = DecisionObjective(tiny_backbone(), tokenizer=TOKENIZER, specials=SPECIALS, layout=LAYOUT)
-    data = objective.dataset(EXAMPLES * 4, batch=32, validation=held)
+    data = load(DecisionRecipe(source=EXAMPLES * 4, validation=held), batch=32, read="memory",
+                objective=objective.data())
     task = Decide(objective.model, objective.init(jax.random.key(0)), LAYOUT, TOKENIZER, SPECIALS)
 
     fitted = task.calibrated(data.val, type_minimum=33, bucket_minimum=33).calibration.temperatures
