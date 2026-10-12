@@ -707,14 +707,12 @@ class TextToImage:
             assert prepared.rows is not None
             plan = RowPlan.over(mesh, prepared.rows)
             walk = jax.random.fold_in(request, 1)
-            # The grid is data, so the solver's state, whose checks and tables read its values, is built
-            # here from the concrete grid: the default one, a function of the step count, or the given one.
-            grid = jnp.asarray(process.times(count) if times is None else times, jnp.float32)
-            initial = solver.init(prepared.noise, grid, process, key=walk)
+            grid = _default_grid(process, count) if times is None else times
+            initial = _initial(plan.sharding)(solver, process, grid, prepared.noise, walk)
             generated = _run(plan.sharding)(self.model, process, self.autoencoder, self.finish,
-                                         self.final_denoise, decode, solver, chosen, grid, initial,
-                                         self.variables, prepared.conditions, prepared.unconditional,
-                                         prepared.noise, walk)
+                                         self.final_denoise, decode, solver, chosen,
+                                         np.asarray(grid, np.float32), initial, self.variables,
+                                         prepared.conditions, prepared.unconditional, prepared.noise, walk)
         return replace(generated, rows=plan.rows)
 
 
@@ -833,13 +831,28 @@ def _noise(rows: jax.sharding.NamedSharding | None):
     return jax.jit(noise, static_argnums=(0, 2), in_shardings=(rows,), out_shardings=rows)
 
 
+@functools.lru_cache(maxsize=64)
+def _default_grid(process: Process, count: int) -> tuple[float, ...]:
+    """The process's own grid of `count` steps, read once per process and count."""
+    return _time_grid(process.times(count))
+
+
+@functools.cache
+def _initial(rows: jax.sharding.NamedSharding | None):
+    """The solver's state before a walk's first step, on the concrete `grid`: its checks and tables
+    read the grid's values, so this small program is a grid's own and the walk's is every grid's."""
+    def initial(solver, process, grid, x_T, key):
+        return solver.init(x_T, jnp.asarray(grid, jnp.float32), process, key=key)
+    return jax.jit(initial, static_argnums=(0, 1, 2), in_shardings=(rows, None))
+
+
 @functools.cache
 def _run(rows: jax.sharding.NamedSharding | None):
     # Rebinding weights must not change the static compilation identity, nor a
     # solver's or guidance's numbers, nor the grid's values: the solver and the
     # guidance are pytrees whose structure is static and whose numbers (a
     # guidance scale, a Brownian seed) are data, and the grid is data with the
-    # solver state the host built from it.
+    # solver state `_initial` built from it.
     def run(model, process, autoencoder, finish, final_denoise, decode,
             solver, guidance, times, initial, params, given, null, x_T, key):
         variables = {name: value for name, value in params.items() if name not in ("encoders", "autoencoder")}
