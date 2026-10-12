@@ -84,6 +84,7 @@ from dew.telemetry import profile as telemetry_profile
 from dew.telemetry.instrumentation import (
     StepFlops,
     compilation_cache_counts,
+    count_compilation_cache,
     model_flops_utilization,
     step_flops,
 )
@@ -1331,6 +1332,7 @@ class Trainer(Generic[Loss, Effects]):
         """
         if steps is None and total_tokens is None:
             raise ValueError("fit needs steps or total_tokens to name the run length")
+        count_compilation_cache()
         if total_tokens is not None and not self.objective.counts_tokens:
             raise ValueError("total_tokens needs an objective that counts real tokens")
         updates = None if steps is None else steps // self.accumulation
