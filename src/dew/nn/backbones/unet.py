@@ -9,7 +9,7 @@ import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
-from ..attention import RMSNorm, Stage, stage_attention
+from ..attention import GroupNorm, RMSNorm, Stage, stage_attention
 from ..blocks import Downsample, FourierEmbedding, ResidualBlock, TimeProjection, Upsample
 from ..conv import Conv
 from ..flops import MissingFlopsCount, patch_lengths
@@ -92,7 +92,7 @@ def unet_body(model: "Unet", x, temb, text, temporal=None, operations=None):
     x = operations.concatenate(x, downs.pop())
     x = operations.residual(residual(features=feature_depths[0], name="final_residual"), x, temb)
 
-    x = operations.normalized(x, lambda values: model.conv_out_norm(values), model.activation)
+    x = operations.normalized(x, model.conv_out_norm)
     return operations.project(conv(features=model.output_channels), x)
 
 
@@ -152,9 +152,9 @@ class Unet(nn.Module):
 
     def setup(self):
         if self.norm_groups > 0:
-            self.conv_out_norm = nn.GroupNorm(self.norm_groups, dtype=self.dtype)
+            self.conv_out_norm = GroupNorm(self.norm_groups, activation=self.activation, dtype=self.dtype)
         else:
-            self.conv_out_norm = RMSNorm(epsilon=1e-5, dtype=self.dtype)
+            self.conv_out_norm = RMSNorm(epsilon=1e-5, activation=self.activation, dtype=self.dtype)
 
     @nn.compact
     def __call__(self, x, temb, textcontext=None, train: bool = False):
