@@ -457,8 +457,23 @@ class Layout:
                     f"split the batch, and the stage axis holds the pipeline")
             return NamedSharding(mesh, spec)
 
-        with boxed(ruled_boxes({**current_boxes(), **boxed_axes(tree)}, self.axis_rules)):
+        with self._declared(tree):
             return jax.tree_util.tree_map_with_path(leaf_sharding, nn.unbox(tree))
+
+    def _declared(self, tree):
+        """The context in which `declared_axes` reads the axes `tree`'s
+        modules declared, as the rules place them."""
+        return boxed(ruled_boxes({**current_boxes(), **boxed_axes(tree)}, self.axis_rules))
+
+    def _splitting(self, path, value) -> set[str]:
+        """The parameter axes the rules could split the leaf at `path` over:
+        those its declared names' rules name, or fsdp, which the shape
+        heuristic splits an undeclared leaf over."""
+        axes = declared_axes(path, value.ndim)
+        if axes is None:
+            return {FSDP_AXIS}
+        return {axis for name, assignment in self.axis_rules if name in axes
+                for axis in mesh_axes(assignment) if axis in PARAMETER_AXES}
 
     def offloaded[TreeT](self, mesh: Mesh, tree: TreeT) -> Placement[TreeT]:
         """Return `shardings`, with the memory kind each leaf's path asks for.
@@ -501,9 +516,12 @@ class Layout:
 
         MaxText measures the excess per-chip memory over perfect sharding
         across every parameter. This check takes the same ratio over the
-        parameters of at least `min_shard` elements only. Smaller ones are
-        replicated on purpose, so counting them would fail models that are
-        merely small.
+        parameters of at least `min_shard` elements whose rules name a
+        parameter axis this mesh splits. Smaller ones are replicated on
+        purpose, so counting them would fail models that are merely small;
+        one no rule splits over this mesh's axes is replicated by the mesh's
+        choice, as a data axis replicates every parameter, so an expert-only
+        mesh keeps a mixture's dense weights whole as data parallelism does.
 
         Raises `LayoutRefused` when the replicated fraction is above
         `tolerance`, naming the five largest replicated parameters, and
@@ -524,13 +542,16 @@ class Layout:
         if all(mesh.shape[axis] == 1 for axis in PARAMETER_AXES):
             return
 
-        path_leaves, _ = jax.tree_util.tree_flatten_with_path(params)
+        path_leaves, _ = jax.tree_util.tree_flatten_with_path(nn.unbox(params))
+        splits = {axis for axis in PARAMETER_AXES if mesh.shape[axis] > 1}
+        with self._declared(params):
+            splittable = [bool(self._splitting(path, param) & splits) for path, param in path_leaves]
         shardable_elements = 0
         replicated = []
-        for (path, param), sharding in zip(
-                path_leaves, jax.tree.leaves(shardings), strict=True):
+        for (path, param), sharding, ruled in zip(
+                path_leaves, jax.tree.leaves(shardings), splittable, strict=True):
             elements = int(np.prod(param.shape, dtype=np.int64))
-            if elements < self.min_shard:
+            if elements < self.min_shard or not ruled:
                 continue
             shardable_elements += elements
             if any(axis in mesh_axes(assignment)
