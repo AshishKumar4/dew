@@ -42,8 +42,7 @@ def test_row_plan_folds_a_mesh_replicated_request_key_on_device():
     import jax.numpy as jnp
     from jax.sharding import NamedSharding, PartitionSpec as P
 
-    from dew.nn.inputs import RowPlan
-    from dew.nn.sharding import batch_axes
+    from dew.nn.inputs import RowPlan, request_axes
     from dew.training import MeshSpec
 
     mesh = MeshSpec().build()
@@ -55,7 +54,7 @@ def test_row_plan_folds_a_mesh_replicated_request_key_on_device():
     expected = jax.vmap(lambda row: jax.random.fold_in(jax.random.key(11), row))(jnp.arange(8))
     np.testing.assert_array_equal(jax.random.key_data(keys), jax.random.key_data(expected))
     assert jax.random.key_impl(keys) == jax.random.key_impl(key)
-    assert keys.sharding == NamedSharding(mesh, P(batch_axes(mesh) or None))
+    assert keys.sharding == NamedSharding(mesh, P(request_axes(mesh)))
 
 
 def test_shard_batch_preserves_resident_nested_inputs_without_host_transfer():

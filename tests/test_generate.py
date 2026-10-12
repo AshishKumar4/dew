@@ -297,7 +297,7 @@ def test_the_sampled_rows_keep_their_sharding_and_host_reads_them_back(rng):
     did not compute, and `host()` hands back the rows a process owns in
     order. Without the pinned output layout the placement would be the
     compiler's choice."""
-    from dew.nn.sharding import batch_axes
+    from dew.nn.inputs import request_axes
     from dew.training import Layout, MeshSpec
     from dew.training.distributed import batch_shardings
 
@@ -314,7 +314,7 @@ def test_the_sampled_rows_keep_their_sharding_and_host_reads_them_back(rng):
     plain = generate(model, params, prompt, 3, key=jax.random.PRNGKey(0), sampling=Sampling(temperature=0))
 
     assert generated.tokens.sharding.mesh == mesh
-    assert generated.tokens.sharding.spec == jax.sharding.PartitionSpec(batch_axes(mesh))
+    assert generated.tokens.sharding.spec == jax.sharding.PartitionSpec(request_axes(mesh))
     assert generated.rows == 8
     rows = generated.host()
     assert isinstance(rows.tokens, np.ndarray) and rows.tokens.shape == (8, 6)
@@ -327,8 +327,7 @@ def test_row_padding_pads_prompts_and_hands_back_only_their_continuations(rng):
     continuations exist, so a process's real rows are its own prompts' `n`
     continuations and nothing else. The padded prompt groups stay on the
     global array, which is why `rows` counts real prompts times `n`."""
-    from dew.nn.inputs import local_rows
-    from dew.nn.sharding import batch_axes
+    from dew.nn.inputs import local_rows, request_axes
     from dew.training import Layout, MeshSpec
 
     model = tiny(max_seq_len=8)
@@ -341,7 +340,7 @@ def test_row_padding_pads_prompts_and_hands_back_only_their_continuations(rng):
     generated = generate(model, placed, prompt, 3, key=jax.random.PRNGKey(0), sampling=sampling, n=2)
     plain = generate(model, params, prompt, 3, key=jax.random.PRNGKey(0), sampling=sampling, n=2)
 
-    assert generated.tokens.sharding.spec == jax.sharding.PartitionSpec(batch_axes(mesh))
+    assert generated.tokens.sharding.spec == jax.sharding.PartitionSpec(request_axes(mesh))
     assert generated.tokens.shape == (16, 6) and generated.rows == 10
     rows = generated.host()
     assert rows.tokens.shape == (10, 6)

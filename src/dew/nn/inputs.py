@@ -16,7 +16,7 @@ from flax import struct
 from jax.core import Tracer
 
 from dew.coordination import agreed
-from dew.nn.sharding import batch_axes
+from dew.nn.sharding import SEQUENCE_AXIS, STAGE_AXIS
 
 if TYPE_CHECKING:
     from PIL.Image import Image
@@ -575,13 +575,21 @@ def mesh_of(tree) -> jax.sharding.Mesh | None:
     return None
 
 
+def request_axes(mesh: jax.sharding.Mesh) -> tuple[str, ...]:
+    """The mesh axes a request's rows split over: every axis but sequence and
+    stage, so each process places rows of its own requests on its own
+    devices. A training batch's rows split over the data axes alone
+    (`dew.nn.sharding.batch_axes`): every process of a share reads the same
+    rows there, where each process here brings its own."""
+    return tuple(axis for axis in mesh.axis_names if axis not in (SEQUENCE_AXIS, STAGE_AXIS))
+
+
 @dataclass(frozen=True)
 class RowPlan:
     """Where one request's rows sit while a task runs.
 
     Without a mesh every array stays on the default device. On a mesh, rows
-    split over its row axes, those the rules in context give
-    `activation_batch` (`batch_axes`). Each process contributes ``count`` rows, its
+    split over its request axes (`request_axes`). Each process contributes ``count`` rows, its
     ``rows`` real ones followed by repeats that pad them to a multiple of its
     devices on those axes, so every device holds the same shape and every
     collective lines up. Results keep that sharding, and ``host`` reads a
@@ -599,7 +607,7 @@ class RowPlan:
         if mesh is None:
             return cls(None, rows, rows, 0, 1)
         processes, process = jax.process_count(), jax.process_index()
-        batch_devices = math.prod(mesh.shape[axis] for axis in batch_axes(mesh))
+        batch_devices = math.prod(mesh.shape[axis] for axis in request_axes(mesh))
         if batch_devices % processes:
             raise ValueError("the batch axes of the mesh do not split evenly over the processes")
         local_devices = batch_devices // processes
@@ -609,8 +617,7 @@ class RowPlan:
     def sharding(self) -> jax.sharding.NamedSharding | None:
         if self.mesh is None:
             return None
-        return jax.sharding.NamedSharding(self.mesh, jax.sharding.PartitionSpec(
-            batch_axes(self.mesh) or None))
+        return jax.sharding.NamedSharding(self.mesh, jax.sharding.PartitionSpec(request_axes(self.mesh)))
 
     @property
     def global_rows(self) -> int:

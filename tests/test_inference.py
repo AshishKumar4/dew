@@ -660,7 +660,7 @@ def test_pipeline_places_a_run_on_a_mesh_and_answers_the_same_images(tmp_path):
     """Placed under the trainer's layout, the weights shard over the mesh,
     prompts split over its batch axes, the result keeps that sharding, and
     `host()` reads back exactly what the single device draws."""
-    from dew.nn.sharding import batch_axes
+    from dew.nn.inputs import request_axes
     from dew.training import Layout, MeshSpec
 
     make_run(tmp_path)
@@ -669,7 +669,8 @@ def test_pipeline_places_a_run_on_a_mesh_and_answers_the_same_images(tmp_path):
     specs = {leaf.sharding.spec for leaf in jax.tree.leaves(placed.variables)}
     assert any("fsdp" in str(spec) for spec in specs)
     result = placed(["a", "b", "c"], steps=3, key=7)
-    assert result.images.sharding.spec == jax.sharding.PartitionSpec(batch_axes(result.images.sharding.mesh))
+    placed_on = result.images.sharding
+    assert placed_on.spec == jax.sharding.PartitionSpec(request_axes(placed_on.mesh))
     assert result.rows == 3
     np.testing.assert_allclose(result.host().images, plain(["a", "b", "c"], steps=3, key=7).host().images,
                                atol=2e-5, rtol=2e-5)

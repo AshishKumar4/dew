@@ -1311,8 +1311,8 @@ class Trainer(Generic[Loss, Effects]):
             body = transaction.step(realize=execution.realize, host=True)
 
         def run(current, batch):
-            batch = transfer(batch, batch_shardings(cpu, batch))
             with self._traced_on(cpu):
+                batch = transfer(batch, batch_shardings(cpu, batch))
                 if current.accumulation is None and self.accumulation > 1:
                     current = self._initialize_accumulation(current, batch, shapes)
                 advanced, loss, aux, committed = body(current, model_batch(batch))

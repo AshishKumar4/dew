@@ -477,11 +477,13 @@ def test_a_pipeline_refuses_a_schedule_that_does_not_fit_the_batch():
     with pytest.raises(ValueError, match="microbatch count that divides the rows"):
         loss_and_grads(LMObjective(model, SEQ_LEN), MeshSpec(fsdp=4, stage=2), variables, token_batch(),
                        microbatches=16)
-    for mesh, microbatches in ((MeshSpec(stage=2), 3), (MeshSpec(), 4)):
+    for mesh, microbatches in ((MeshSpec(fsdp=4, stage=2), 3), (MeshSpec(fsdp=4), 4)):
         trainer = Trainer(LMObjective(model, SEQ_LEN), optax.sgd(0.1), key=0, mesh=mesh,
-                          microbatches=microbatches, checkpoints=None, tracker=None)
+                          microbatches=microbatches, layout=Layout(min_shard=TINY_SHARD), checkpoints=None,
+                          tracker=None)
+        state, _, _ = trainer.place()
         with pytest.raises(ValueError, match="microbatches"):
-            trainer.microbatches  # noqa: B018 - the property refuses
+            trainer.compile(state, shard_batch(trainer.device_mesh, token_batch()))
 
 
 @pytest.mark.mesh(devices=4)
