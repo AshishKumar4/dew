@@ -14,7 +14,7 @@ No EMA (`ema_decay=None`): the reference keeps none, and the average would
 cost the step memory and time the comparison does not ask about.
 
     python tools/reference_runs/dew_lm.py --model <hf dir> --data windows.npz \\
-        --batch 4 --dtype bfloat16 --out dew-bf16.json
+        --batch 4 --dtype bfloat16 --work work.json --out dew-bf16.json
     python tools/reference_runs/dew_lm.py ... --mesh fsdp
 
 The mesh axis spans every device the process sees (`jax.device_count()`);
@@ -35,6 +35,7 @@ import numpy as np
 import optax
 from common import (
     TracedWindow,
+    WorkloadWork,
     attach_xplane_profile,
     git_head,
     host,
@@ -42,7 +43,6 @@ from common import (
     sha256,
     steps_for,
     throughput,
-    train_flops_per_token,
     window_rows,
     write_record,
 )
@@ -71,6 +71,7 @@ def arguments() -> argparse.Namespace:
     parser.add_argument("--model", required=True)
     parser.add_argument("--data", required=True)
     parser.add_argument("--out", required=True)
+    parser.add_argument("--work", required=True, help="write the native workload count for the reference")
     parser.add_argument("--batch", type=int, required=True, help="global rows per step")
     parser.add_argument("--dtype", choices=("bfloat16", "float32"), required=True)
     parser.add_argument("--mesh", choices=("data", "fsdp", "expert"), default="data",
@@ -120,6 +121,7 @@ class Run:
     total: int
     schedule_steps: int
     compile_seconds: float
+    work: WorkloadWork
 
 
 def build(args: argparse.Namespace) -> Run:
@@ -128,6 +130,8 @@ def build(args: argparse.Namespace) -> Run:
     if args.dtype == "float32":
         # The fp32 run is the truth the bound is measured from: no TF32.
         jax.config.update("jax_default_matmul_precision", "highest")
+
+    from work import measure
 
     from dew.config import OptimConfig
     from dew.interop import Pretrained
@@ -154,6 +158,8 @@ def build(args: argparse.Namespace) -> Run:
     objective = LMObjective(model, seq, ema_decay=None, head_chunks=args.head_chunks,
                             variables=pretrained.variables, aux_loss_alpha=args.aux_loss_alpha,
                             seq_aux=args.seq_aux)
+    work = measure(objective, {TEXT_KEY: windows[:args.batch]})
+    work.write(args.work)
     schedule = Cosine(peak=args.lr_peak, warmup_steps=args.warmup, end=args.lr_end, init=args.lr_init)
     # One group over every parameter, as torch_lm.py's AdamW decays the norms
     # and biases too.
@@ -176,7 +182,7 @@ def build(args: argparse.Namespace) -> Run:
     compile_start = time.perf_counter()
     step = trainer.compile(state, batch(0))
     return Run(trainer, state, step, batch, schedule.schedule(schedule_steps), windows, seq, total,
-               schedule_steps, time.perf_counter() - compile_start)
+               schedule_steps, time.perf_counter() - compile_start, work)
 
 
 class RouterProbe:
@@ -244,7 +250,7 @@ def train(args: argparse.Namespace, run: Run, probe: RouterProbe | None) -> tupl
             spent = probe(step, state.variables)
             if window.times(step):
                 window.excluded += spent
-        state, loss, metrics, _, _ = run.step(state, run.batch(step))
+        state, loss, metrics, _, _, _ = run.step(state, run.batch(step))
         # The step's loss is the whole objective, balance terms included;
         # the cross entropy the reference records as its loss is `ce`.
         losses.append(metrics["ce"])
@@ -269,7 +275,7 @@ def record(args: argparse.Namespace, run: Run, curves: Curves, probe: RouterProb
     devices = jax.device_count()
     timed = throughput(curves.window_seconds, curves.timed_steps, args.batch * run.seq)
     hf_config = json.loads(Path(args.model, "config.json").read_text())
-    flops_token = train_flops_per_token(hf_config, run.seq)
+    flops_token = run.work.training_flops_per_step / run.work.tokens_per_step
     peak_rate = peak_flops(device_kind)
     stats = [device.memory_stats() or {} for device in jax.local_devices()]
     result = {
@@ -277,10 +283,12 @@ def record(args: argparse.Namespace, run: Run, curves: Curves, probe: RouterProb
         "precision": args.dtype,
         "parallel": f"{args.mesh}={devices}",
         "world": devices,
-        "config": {**vars(args), "total_steps": run.total, "schedule_steps": run.schedule_steps, "seq": run.seq,
+        "config": {**vars(args), "total_steps": run.total, "schedule_steps": run.schedule_steps,
+                   "seq": run.seq,
                    "data_sha256": sha256(args.data), "model_type": hf_config["model_type"],
                    "mesh": dict(run.trainer.device_mesh.shape),
-                   "optimizer": "optax.chain(recorded_norm, clip_by_global_norm, adamw) via OptimConfig.build",
+                   "optimizer": "optax.chain(recorded_norm, clip_by_global_norm, adamw) "
+                                "via OptimConfig.build",
                    "schedule": "dew.training.optim.Cosine", "ema": None,
                    "model_config": {k: v for k, v in run.trainer.objective.model.__dict__.items()
                                     if isinstance(v, (int, float, str, bool, type(None)))}},
@@ -294,13 +302,16 @@ def record(args: argparse.Namespace, run: Run, curves: Curves, probe: RouterProb
         "throughput": timed,
         "compile_seconds": run.compile_seconds,
         "flops_per_token": flops_token,
+        "work": dataclasses.asdict(run.work),
         "hlo_flops_per_step": run.trainer.flops_per_step,
-        "mfu": None if peak_rate is None else flops_token * timed["tokens_per_s"] / (peak_rate * devices),
+        "mfu": None if peak_rate is None else run.work.training_flops_per_step * curves.timed_steps
+            / curves.window_seconds / (peak_rate * devices),
         "memory": {"peak_allocated_bytes": [int(s.get("peak_bytes_in_use", 0)) for s in stats],
                    "bytes_limit": [int(s.get("bytes_limit", 0)) for s in stats]},
     }
     for name in (curves.extras[0] if curves.extras else {}):
-        result[name] = np.asarray(jax.device_get([entry[name] for entry in curves.extras]), np.float64).tolist()
+        result[name] = np.asarray(jax.device_get([entry[name] for entry in curves.extras]),
+                                  np.float64).tolist()
     if probe is not None:
         result["router_probe"] = probe.records
     return result

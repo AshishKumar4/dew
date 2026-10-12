@@ -533,7 +533,7 @@ def mode_steps(args) -> dict:
     compiled = trainer.compile(state, batch)
     losses = []
     for _ in range(args.steps):
-        state, loss, _, _, _ = compiled(state, batch)
+        state, loss, _, _, _, _ = compiled(state, batch)
         losses.append(float(as_numpy(loss)))
     if args.save and args.steps:
         checkpoints.save(int(as_numpy(state.step)), state, None)
@@ -931,7 +931,7 @@ def pipeline_losses(trainer, rows, steps: int):
     compiled = trainer.compile(state, batch)
     losses = []
     for _ in range(steps):
-        state, loss, _, _, _ = compiled(state, batch)
+        state, loss, _, _, _, _ = compiled(state, batch)
         losses.append(float(loss))
     return losses, state
 
@@ -1351,7 +1351,7 @@ def mode_training_contract(args) -> dict:
     step = trainer.compile(state, data[0])
     flags = []
     for attempt, batch in enumerate(data):
-        state, loss, _, finite, accepted = step(state, batch)
+        state, loss, _, finite, accepted, _ = step(state, batch)
         flags.append([bool(as_numpy(finite)), bool(as_numpy(accepted))])
         if attempt == 0:
             checkpoints.save(1, state, None, {"loss": float(as_numpy(loss))})
@@ -1815,7 +1815,7 @@ def mixed_validity_step(trainer, batch: dict, out: Path | None = None) -> dict:
     placed = shard_batch(trainer.device_mesh, batch)
     compiled = trainer.compile(state, placed)
     before = params_dict(state.variables)  # the step consumes `state`
-    updated, loss, _, _, _ = compiled(state, placed)
+    updated, loss, _, _, _, _ = compiled(state, placed)
     after = params_dict(updated.variables)
     update = {name: after[name] - before[name] for name in after}
     if out is not None:
@@ -2158,7 +2158,7 @@ def mode_host_training(args) -> dict:
                           layout=Layout(host=host, min_shard=1, tolerance=1.))
         state, _, _ = trainer.place()
         batch = shard_batch(trainer.device_mesh, {"x": local})
-        state, loss, _, _, _ = trainer.compile(state, batch)(state, batch)
+        state, loss, _, _, _, _ = trainer.compile(state, batch)(state, batch)
         reports[name] = {"params": jax.tree.map(lambda x: x.tolist(), as_numpy(state.variables)),
                          "loss": float(loss), "step": int(state.step)}
     reports["compute_devices"] = [d.id for d in compute_devices]

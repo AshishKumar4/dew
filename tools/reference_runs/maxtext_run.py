@@ -12,12 +12,13 @@ fixed apart from `--steps`, so a short warm-up run compiles the program a
 measured run executes.
 
     PYTHONPATH=<maxtext site> python maxtext_run.py --model <hf checkpoint> \
-        --model-name qwen3-0.6b --mesh fsdp --batch 8 --seq 1024 --out record.json
+        --model-name qwen3-0.6b --mesh fsdp --batch 8 --seq 1024 --work work.json --out record.json
 """
 
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import os
 import shutil
@@ -29,14 +30,15 @@ from pathlib import Path
 os.environ.setdefault("DECOUPLE_GCLOUD", "TRUE")
 
 import jax
-from common import attach_xplane_profile, host, peak_flops, throughput, train_flops_per_token, write_record
+from common import WorkloadWork, attach_xplane_profile, host, peak_flops, throughput, write_record
 
 
-def arguments() -> argparse.Namespace:
+def arguments(argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    parser.add_argument("--model", required=True, help="the HF checkpoint whose config.json counts the FLOPs")
+    parser.add_argument("--model", required=True, help="the HF checkpoint the reference compares against")
     parser.add_argument("--model-name", required=True, help="MaxText's config for the same shape")
     parser.add_argument("--out", required=True)
+    parser.add_argument("--work", required=True, help="Dew's work.json for this config and global shape")
     parser.add_argument("--mesh", choices=("data", "fsdp"), required=True)
     parser.add_argument("--batch", type=int, required=True, help="global rows per step")
     parser.add_argument("--seq", type=int, default=1024)
@@ -45,7 +47,8 @@ def arguments() -> argparse.Namespace:
     parser.add_argument("--timing-warmup", type=int, default=10)
     parser.add_argument("--profile-steps", type=int, default=5)
     parser.add_argument("--attention", default=None,
-                        help="MaxText's kernel; cudnn_flash_jax on a GPU and its splash kernel, flash, on a TPU")
+                        help="MaxText's kernel; cudnn_flash_jax on a GPU "
+                             "and its splash kernel, flash, on a TPU")
     parser.add_argument("--remat", default="full")
     parser.add_argument("--lr-peak", type=float, default=2e-5)
     parser.add_argument("--b1", type=float, default=0.9)
@@ -54,7 +57,7 @@ def arguments() -> argparse.Namespace:
     parser.add_argument("--weight-decay", type=float, default=0.1)
     parser.add_argument("--clip", type=float, default=1.0)
     parser.add_argument("overrides", nargs="*", help="further MaxText key=value settings")
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def maxtext_argv(args: argparse.Namespace, workdir: Path) -> list[str]:
@@ -66,7 +69,8 @@ def maxtext_argv(args: argparse.Namespace, workdir: Path) -> list[str]:
         raise ValueError(f"batch {args.batch} does not split over {devices} devices")
     base = Path(maxtext.__file__).parent / "configs" / "base.yml"
     settings = {
-        "model_name": args.model_name, "hardware": "gpu" if gpu else "tpu", "skip_jax_distributed_system": True,
+        "model_name": args.model_name, "hardware": "gpu" if gpu else "tpu",
+        "skip_jax_distributed_system": True,
         "run_name": "reference", "base_output_directory": str(workdir),
         "metrics_file": str(workdir / "metrics.jsonl"), "enable_tensorboard": False,
         "enable_checkpointing": False, "dataset_type": "synthetic",
@@ -91,6 +95,7 @@ def maxtext_argv(args: argparse.Namespace, workdir: Path) -> list[str]:
 
 def main() -> None:
     args = arguments()
+    work = WorkloadWork.read(args.work)
     from absl import logging
     from maxtext.trainers.pre_train import train
 
@@ -102,7 +107,7 @@ def main() -> None:
     timed = [row for row in steps if args.timing_warmup <= row["step"] < args.steps - args.profile_steps]
     seconds = [row["perf/step_time_seconds"] for row in timed]
     hf_config = json.loads(Path(args.model, "config.json").read_text())
-    flops_token = train_flops_per_token(hf_config, args.seq)
+    flops_token = work.training_flops_per_step / work.tokens_per_step
     device_kind = jax.devices()[0].device_kind
     devices = jax.device_count()
     rate = throughput(sum(seconds), len(seconds), args.batch * args.seq, seconds)
@@ -121,8 +126,10 @@ def main() -> None:
         "loss": [row["learning/loss"] for row in steps],
         "throughput": rate,
         "flops_per_token": flops_token,
+        "work": dataclasses.asdict(work),
         "maxtext_tflops_per_device": [row.get("perf/per_device_tflops_per_sec") for row in timed],
-        "mfu": None if peak_rate is None else flops_token * rate["tokens_per_s"] / (peak_rate * devices),
+        "mfu": None if peak_rate is None else work.training_flops_per_step * len(seconds)
+            / sum(seconds) / (peak_rate * devices),
         "memory": {"peak_allocated_bytes": [int(s.get("peak_bytes_in_use", 0)) for s in stats],
                    "bytes_limit": [int(s.get("bytes_limit", 0)) for s in stats]},
     }
@@ -131,7 +138,8 @@ def main() -> None:
                               rows=Path(args.out).resolve().with_suffix("") / "kernels.json.gz")
     shutil.rmtree(workdir)
     write_record(args.out, record)
-    print(json.dumps({"tokens_per_s": rate["tokens_per_s"], "step_ms": rate["step_ms_mean"], "mfu": record["mfu"],
+    print(json.dumps({"tokens_per_s": rate["tokens_per_s"], "step_ms": rate["step_ms_mean"],
+                      "mfu": record["mfu"],
                       "peak_gib": max(record["memory"]["peak_allocated_bytes"]) / 2**30}, indent=1))
 
 

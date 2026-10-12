@@ -32,7 +32,7 @@ Precision policies:
   fsdp-bf16  FSDP2 MixedPrecisionPolicy(param_dtype=bf16, reduce_dtype=fp32)
 
     python tools/reference_runs/torch_lm.py --model <hf dir> --data windows.npz \\
-        --batch 4 --precision autocast --out torch-autocast.json
+        --batch 4 --precision autocast --work work.json --out torch-autocast.json
     torchrun --nproc-per-node 4 tools/reference_runs/torch_lm.py --parallel fsdp2 \\
         --precision fsdp-bf16 --batch 16 ...
 """
@@ -52,6 +52,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from common import (
     TorchTracedWindow,
+    WorkloadWork,
     chrome_trace_kernels,
     host,
     kernel_summary,
@@ -59,7 +60,6 @@ from common import (
     sha256,
     steps_for,
     throughput,
-    train_flops_per_token,
     trim_trace,
     warmup_cosine,
     window_rows,
@@ -67,11 +67,12 @@ from common import (
 )
 
 
-def arguments() -> argparse.Namespace:
+def arguments(argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", required=True)
     parser.add_argument("--data", required=True)
     parser.add_argument("--out", required=True)
+    parser.add_argument("--work", required=True, help="Dew's work.json for this config and global shape")
     parser.add_argument("--batch", type=int, required=True, help="global rows per step")
     parser.add_argument("--micro-batch", type=int, default=None,
                         help="rows per forward on one rank; unset is the rank's whole share")
@@ -103,7 +104,7 @@ def arguments() -> argparse.Namespace:
     parser.add_argument("--timing-warmup", type=int, default=10)
     parser.add_argument("--profile-steps", type=int, default=5)
     parser.add_argument("--trace-dir", default=None)
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def moe_aux(router_logits, active: int, distributed: bool) -> torch.Tensor:
@@ -407,7 +408,8 @@ def train(args: argparse.Namespace, place: Ranks, run: Run) -> Curves:
                   window.timed_steps, window.step_seconds, window.profiler is not None)
 
 
-def record(args: argparse.Namespace, place: Ranks, run: Run, curves: Curves) -> dict | None:
+def record(args: argparse.Namespace, place: Ranks, run: Run, curves: Curves,
+           work: WorkloadWork) -> dict | None:
     """The ranks' mean losses and every rank's memory peak, gathered by all
     of them; rank 0's record of the run, None on the others."""
     loss_vector = torch.stack(curves.losses)
@@ -425,7 +427,7 @@ def record(args: argparse.Namespace, place: Ranks, run: Run, curves: Curves) -> 
 
     timed = throughput(curves.window_seconds, curves.timed_steps, args.batch * run.seq, curves.step_seconds)
     hf_config = json.loads(Path(args.model, "config.json").read_text())
-    flops_token = train_flops_per_token(hf_config, run.seq)
+    flops_token = work.training_flops_per_step / work.tokens_per_step
     device_name = torch.cuda.get_device_name(place.device)
     peak_rate = peak_flops(device_name)
     routed = run.active > 0
@@ -453,7 +455,9 @@ def record(args: argparse.Namespace, place: Ranks, run: Run, curves: Curves) -> 
            if routed else {}),
         "throughput": timed,
         "flops_per_token": flops_token,
-        "mfu": None if peak_rate is None else flops_token * timed["tokens_per_s"] / (peak_rate * place.world),
+        "work": dataclasses.asdict(work),
+        "mfu": None if peak_rate is None else work.training_flops_per_step * curves.timed_steps
+            / curves.window_seconds / (peak_rate * place.world),
         "memory": {"peak_allocated_bytes": [int(p[0]) for p in peaks],
                    "peak_reserved_bytes": [int(p[1]) for p in peaks]},
     }
@@ -477,10 +481,11 @@ def attach_profile(args: argparse.Namespace, place: Ranks, result: dict) -> None
 
 def main() -> None:
     args = arguments()
+    work = WorkloadWork.read(args.work)
     place = ranks(args)
     run = build(args, place)
     curves = train(args, place, run)
-    result = record(args, place, run, curves)
+    result = record(args, place, run, curves, work)
     if result is not None:
         if curves.traced:
             write_record(args.out, result)

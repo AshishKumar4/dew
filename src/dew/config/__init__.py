@@ -646,7 +646,12 @@ class TrainerConfig:
     None compiles from scratch every run.
     """
     wandb: Wandb | None = None
-    """An optional W&B sink, in addition to the local tracking journal."""
+    """An optional W&B telemetry sink, in addition to the local tracking journal.
+
+    Scalars, records and objective previews are tracked; checkpoints are not uploaded.
+    """
+    publish: bool = False
+    """Publish the final checkpoint to the W&B model registry; requires `wandb`."""
     multi_host: bool | None = None
     """Whether to join the JAX process pool.
 
@@ -666,6 +671,17 @@ class TrainerConfig:
     the compute dtype. `dew.training.quantization` describes what the wrapper does
     and what it keeps.
     """
+    lower_for: str | None = None
+    """Check the run's step for a GPU on any host, a CPU too, then exit without training.
+
+    `--trainer.lower-for sm80` (or sm75, sm86, sm89, sm90, sm120) builds the run
+    as it would, traces its first step as on a GPU of that CUDA generation, with
+    every kernel choice and refusal that GPU makes, and lowers it for CUDA,
+    each of its Pallas kernels to Triton. A kernel that would fail the GPU's
+    first compile there fails here, in seconds and without the GPU; XLA's
+    compile of the whole step still needs one. The program exits with status
+    0 once the step lowers, and opens no W&B run.
+    """
 
     def __post_init__(self):
         if (self.batch_tokens is None) != (self.update_tokens is None):
@@ -682,6 +698,8 @@ class TrainerConfig:
                 raise ValueError("--trainer.batch-ramp grows row batches and cannot use token budgets")
         elif self.batch_size is None or self.batch_size < 1:
             raise ValueError("--trainer.batch-size must be positive without token budgets")
+        if self.publish and self.wandb is None:
+            raise ValueError("trainer.publish requires trainer.wandb to name the publishing run")
         if self.steps is not None and self.epochs is not None:
             raise ValueError("steps and epochs both name the run length; set one")
         if isinstance(self.checkpoint_every, str) and self.checkpoint_every != 'epoch':
@@ -1143,10 +1161,10 @@ class RunConfig:
         The run lives under `name` in `trainer.checkpoint_dir`, and process zero writes
         the record there before training starts. A `trainer.wandb` opens a tracker
         under the same name, with the record, `summary` (the recipe's own view of the
-        run) and the step count as its config. The final checkpoint is published to
-        the W&B registry under the name with slashes and spaces replaced, because an
-        artifact name allows neither. Local tracking journals live in a separate
-        tracking directory.
+        run) and the step count as its config. Only `trainer.publish` publishes the
+        final checkpoint to the W&B registry, under the name with slashes and spaces
+        replaced because an artifact name allows neither. Local tracking journals
+        live in a separate tracking directory.
 
         `dataset` must be the one the recipe loaded at `trainer.batch_size`; a dataset
         at any other batch size is refused here. The record, the ramp and the reported
@@ -1189,7 +1207,7 @@ class RunConfig:
         tracker = None
         try:
             wandb_tracker = None
-            if trainer.wandb is not None:
+            if trainer.wandb is not None and trainer.lower_for is None:
                 wandb_tracker = WandbTracker(
                     trainer.wandb.project, name, entity=trainer.wandb.entity,
                     offline=trainer.wandb.offline)
@@ -1204,7 +1222,9 @@ class RunConfig:
                     display.note(f"Local tracking: {local.directory}")
                     self.save(checkpoints.directory)
                     tracker.artifact(RunRecord(name, json_value(self.to_dict()),
-                        json_value(summary or {}), steps, packages_installed()), 0)
+                        json_value(summary or {}), steps, packages_installed(),
+                        device_kind=jax.devices()[0].device_kind, devices=jax.device_count(),
+                        processes=jax.process_count()), 0)
 
             agreed("run metadata", record_run)
             # The trainer holds mesh, layout, accumulation, dynamic_scale and
@@ -1214,7 +1234,7 @@ class RunConfig:
                 objective, self.optim, key=trainer.key,
                 mesh=trainer.mesh, layout=trainer.layout, accumulation=trainer.accumulation,
                 dynamic_scale=trainer.dynamic_scale, checkpoints=checkpoints, tracker=tracker,
-                rollout=rollout, profile=trainer.profile,
+                rollout=rollout, profile=trainer.profile, lower_for=trainer.lower_for,
             ).fit(
                 dataset, steps=steps,
                 log_every=trainer.log_every,
@@ -1227,7 +1247,7 @@ class RunConfig:
                 after(state, checkpoints.directory)
             def publish_checkpoint() -> None:
                 """Upload the checkpoint the run ended on, where a tracker takes one."""
-                if wandb_tracker is not None:
+                if trainer.publish and wandb_tracker is not None:
                     # fit wrote the step it ended on, so that checkpoint is the run's.
                     dew.io.publish(checkpoints.path(int(state.step)), _artifact_name(name),
                                    tracker=wandb_tracker)

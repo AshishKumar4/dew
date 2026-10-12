@@ -9,21 +9,35 @@ are not retroactively a matched pair with this workload.
 """
 
 import hashlib
+import json
+from pathlib import Path
 
 import numpy as np
 
 MODEL = "Qwen/Qwen3.5-0.8B"
 REVISION = "2fc06364715b967f1860aea9cf38778875588b17"
-# Dew's Counted Qwen3.5-0.8B backbone, 8x3072 real tokens, forward x3:
-# recurrent 6*H*Dk*Dv state MACs and the learned depthwise conv included.
-# tests/test_model_flops.py binds this numerator to the released native config.
-FLOPS_PER_STEP = 81_095_156_563_968
-FLOPS_FORMULA = ("training=3*analytical forward; backbone matmuls and learned depthwise conv; causal QK+PV; "
-                 "GDN recurrent 6*H*Dk*Dv; lookups/head/pointwise decay/WY/chunk preparation/"
-                 "recompute excluded")
-TOKENS_PER_STEP = 8 * 3072
 WHOLE_PEAK_SCOPE = ("process start through timed-window end; includes load/compile/warmup, "
                     "excludes diagnostics")
+
+
+def config(smoke: bool) -> dict:
+    """Both frameworks and the work writer build the same checkpoint or tiny geometry."""
+    if smoke:
+        return {
+            "model_type": "qwen3_5_text", "vocab_size": 128, "hidden_size": 32,
+            "intermediate_size": 64, "num_hidden_layers": 2, "num_attention_heads": 2,
+            "num_key_value_heads": 1, "head_dim": 16, "linear_key_head_dim": 8,
+            "linear_value_head_dim": 8, "linear_num_key_heads": 2, "linear_num_value_heads": 2,
+            "linear_conv_kernel_dim": 4,
+            "layer_types": ["linear_attention", "full_attention"], "use_cache": False,
+            "tie_word_embeddings": True,
+            "rope_parameters": {"rope_type": "default", "rope_theta": 1e6, "partial_rotary_factor": 0.5,
+                                "mrope_interleaved": True, "mrope_section": [2, 1, 1]},
+        }
+    from huggingface_hub import hf_hub_download
+
+    path = Path(hf_hub_download(MODEL, "config.json", revision=REVISION))
+    return json.loads(path.read_text())["text_config"]
 
 
 def inputs(seed: int, vocab: int, hidden: int, batch: int, sequence: int):
@@ -53,5 +67,4 @@ def workload(seed: int, vocab: int, hidden: int, batch: int, sequence: int, smok
         "gradient_clipping": None, "gradient_checkpointing": False, "gradient_accumulation": 1,
         "ema": False, "full_finetune": True,
         "timing": "wall window synchronized only at both endpoints; no profiling or compilation",
-        "model_flops_per_step": None if smoke else FLOPS_PER_STEP,
     }
