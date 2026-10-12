@@ -1660,6 +1660,20 @@ cd <dew checkout> && JAX_PLATFORMS=cuda XLA_FLAGS= XLA_PYTHON_CLIENT_MEM_FRACTIO
   --attention auto --lr-init 0 --warmup 16
 ```
 
+The options cost Qwen3.5-9B with rank-256 factors over FSDP 2 (below) 3.6%
+at e3c90a968. There the delta net's activation exchanges, on the step's
+critical path, waited behind combined gathers of the frozen base. With the
+projections placed and every split on its leading dimension, the options
+are within the run-to-run spread there and win elsewhere. All-gathers
+combined to 128 MiB, MaxText's GPU value, lose on the 8B:
+
+| step, FSDP 2, leading-dimension splits | no options | options | all-gathers at 128 MiB |
+|---|---|---|---|
+| Llama-3.1-8B, ms (two runs) | 508.3, 507.8 | 488.6, 489.0 | 501.4, 500.5 |
+| 9B LoRA, ms (one run) | 434.7 | 437.4 | 431.9 |
+
+Three runs of the 9B's FSDP 2 arm at e3c90a968 spread 0.8%.
+
 ### fsdp splits a parameter's leading dimension, 2026-10-12
 
 A parameter fsdp splits is gathered whole for every use, so which of its
