@@ -1,6 +1,8 @@
 """Diffusion solvers, each taking one reverse step from t to t_next with the model's prediction at t.
 
-A solver is a value. Whatever it needs between steps is kept in its state,
+A solver is a value, and a pytree: its settings are static, so they shape
+the compiled walk, and only a number a walk varies by request (DPMSolverSDE's
+seed) is a leaf. Whatever it needs between steps is kept in its state,
 which `init` builds and `step` carries through `sample`'s scan. The signal and
 noise rates come from `process`. A solver that needs another model evaluation
 (Heun's corrector, RK4's stages, KDPM2's midpoint) calls `denoise`. A solver

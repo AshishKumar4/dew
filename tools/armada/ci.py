@@ -224,8 +224,8 @@ def collect(python: str, tests: list[str], out: Path, deadline: float) -> int:
     """Import `tests` under `python` without running them and write one verdict row a file: red
     where collecting it errs or skips on a missing import, which running it would have."""
     began = time.monotonic()
-    command = [f".venv-{python}/bin/python", "-m", "pytest", "--collect-only", "-q", "-rs", "-p",
-               "no:cacheprovider", *tests]
+    command = [f".venv-{python}/bin/python", "-m", "pytest", "--collect-only", "-q", "-rs",
+               *tests]
     done = subprocess.run(command, capture_output=True, text=True, timeout=deadline)
     output = done.stdout + done.stderr
     errors = dict.fromkeys(re.findall(r"ERROR collecting (tests/\S+\.py)", output), "")
@@ -259,7 +259,7 @@ def task(python: str, tests: list[str], split: str, out: Path, deadline: float, 
     # log holds every test that finished when a task is cut short.
     command = [f".venv-{python}/bin/python", "-u", "-m", "pytest", "-q", "-m", "not network", "-rfE",
                "--tb=short", "--continue-on-collection-errors", "-o", "faulthandler_timeout=600",
-               "-p", "no:cacheprovider", f"--junitxml={report}", *tests, *grouping]
+               f"--junitxml={report}", *tests, *grouping]
     # pytest leads a process group of its own, so what its tests start ends with it. Its output is
     # streamed as it comes by a reader of its own, which nothing waits on past pytest's end: a test's
     # child holding the pipe open (a pool worker, a server) cannot keep the verdict from being written.

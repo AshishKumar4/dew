@@ -55,7 +55,6 @@ import json
 import math
 import tarfile
 import types
-import urllib.request
 from collections import OrderedDict
 from pathlib import Path
 
@@ -66,6 +65,7 @@ import torch
 import torch.nn.functional as F
 from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKL
 from einops import rearrange
+from reference_source import defined_in, fetched, ran
 from safetensors.torch import load as load_safetensors
 from torchvision import models
 
@@ -97,23 +97,12 @@ ARGS = types.SimpleNamespace(path_type="linear", prediction="v", weighting="unif
 
 
 def source(path: str) -> str:
-    return urllib.request.urlopen(REPOSITORY + path).read().decode()
-
-
-def definitions(text: str, names: set[str], scope: dict) -> dict:
-    """Run the module's top-level classes and functions named `names` as
-    published, in `scope`."""
-    for node in ast.parse(text).body:
-        if isinstance(node, (ast.ClassDef, ast.FunctionDef)) and node.name in names:
-            exec(compile(ast.Module(body=[node], type_ignores=[]), "<repa-e>", "exec"), scope)
-    missing = names - set(scope)
-    assert not missing, missing
-    return scope
+    return fetched(REPOSITORY + path)
 
 
 def regularizer() -> None:
-    scope = definitions(source("models/autoencoder.py"), {"DiagonalGaussianDistribution"},
-                        {"torch": torch, "np": np})
+    scope = defined_in(source("models/autoencoder.py"), {"DiagonalGaussianDistribution"},
+                       {"torch": torch, "np": np})
     generator = torch.Generator().manual_seed(0)
     moments = torch.randn(3, 8, 4, 4, generator=generator, dtype=torch.float64) * 2
     images = torch.rand(3, 3, 16, 16, generator=generator, dtype=torch.float64) * 2 - 1
@@ -271,24 +260,19 @@ def tiny_vae() -> AutoencoderKL:
 def published_discriminator() -> torch.nn.Module:
     """REPA-E's `NLayerDiscriminator(input_nc=3, n_layers=3)` at
     `DISCRIMINATOR_WIDTH`, drawn by its `weights_init`."""
-    scope = definitions(source("loss/discriminator.py"), {"ActNorm", "weights_init", "NLayerDiscriminator"},
-                        {"torch": torch, "nn": torch.nn, "functools": functools})
+    scope = defined_in(source("loss/discriminator.py"), {"ActNorm", "weights_init", "NLayerDiscriminator"},
+                       {"torch": torch, "nn": torch.nn, "functools": functools})
     return scope["NLayerDiscriminator"](input_nc=3, ndf=DISCRIMINATOR_WIDTH, n_layers=3).apply(
         scope["weights_init"])
 
 
 def perceptual(vgg: dict[str, np.ndarray], linear: dict[str, np.ndarray]) -> type:
     """REPA-E's `PerceptualLoss` over its `LPIPS`, whose weights are these."""
-    scope = definitions(source("loss/perceptual_loss.py"), {"PerceptualLoss"},
-                        {"torch": torch, "models": models,
-                         "LPIPS": lpips_reference.lpips_class(
-                             {key: torch.as_tensor(value) for key, value in vgg.items()},
-                             {key: torch.as_tensor(value) for key, value in linear.items()})})
-    text = source("loss/perceptual_loss.py")
-    for node in ast.parse(text).body:
-        if isinstance(node, ast.Assign) and any(getattr(target, "id", "").startswith("_IMAGENET")
-                                                  for target in node.targets):
-            exec(compile(ast.Module(body=[node], type_ignores=[]), "perceptual_loss.py", "exec"), scope)
+    lpips = lpips_reference.lpips_class({key: torch.as_tensor(value) for key, value in vgg.items()},
+                                        {key: torch.as_tensor(value) for key, value in linear.items()})
+    names = {"PerceptualLoss", "_IMAGENET_MEAN", "_IMAGENET_STD"}
+    scope = defined_in(source("loss/perceptual_loss.py"), names,
+                       {"torch": torch, "models": models, "LPIPS": lpips})
     return scope["PerceptualLoss"]
 
 
@@ -330,12 +314,12 @@ def run(dtype, drawn: dict[str, np.ndarray], pixels: np.ndarray, classes: np.nda
     """One published step at `dtype`: each network's gradients, the batch
     norm's running statistics after it and the step's losses."""
     random = Replayed(dtype, replayed)
-    sit = definitions(source("models/sit.py"), {"mean_flat", "build_mlp", "LabelEmbedder", "SiT"},
-                      {"torch": random, "nn": torch.nn, "np": np, "math": math})
-    autoencoder = definitions(
+    sit = defined_in(source("models/sit.py"), {"mean_flat", "build_mlp", "LabelEmbedder", "SiT"},
+                     {"torch": random, "nn": torch.nn, "np": np, "math": math})
+    autoencoder = defined_in(
         source("models/autoencoder.py"), {"DiagonalGaussianDistribution", "AutoencoderKL"},
         {"torch": random, "nn": torch.nn, "np": np, "dictdot": Config})
-    losses = definitions(
+    losses = defined_in(
         source("loss/losses.py"),
         {"hinge_d_loss", "compute_lecam_loss", "ReconstructionLoss_Stage2",
          "ReconstructionLoss_Single_Stage"},
@@ -343,14 +327,14 @@ def run(dtype, drawn: dict[str, np.ndarray], pixels: np.ndarray, classes: np.nda
          "autocast": lambda enabled=True: (lambda method: method),
          "PerceptualLoss": perceptual(*lpips_reference.drawn_weights()),
          "NLayerDiscriminator": functools.partial(
-             definitions(source("loss/discriminator.py"), {"ActNorm", "NLayerDiscriminator"},
-                         {"torch": torch, "nn": torch.nn, "functools": functools})["NLayerDiscriminator"],
+             defined_in(source("loss/discriminator.py"), {"ActNorm", "NLayerDiscriminator"},
+                        {"torch": torch, "nn": torch.nn, "functools": functools})["NLayerDiscriminator"],
              ndf=DISCRIMINATOR_WIDTH),
-         "weights_init": definitions(source("loss/discriminator.py"), {"weights_init"},
-                                     {"torch": torch, "nn": torch.nn})["weights_init"]})
+         "weights_init": defined_in(source("loss/discriminator.py"), {"weights_init"},
+                                    {"torch": torch, "nn": torch.nn})["weights_init"]})
     train = source("train_repae.py")
-    script = definitions(train, {"requires_grad", "update_ema"}, {"torch": torch, "OrderedDict": OrderedDict})
-    definitions(source("utils.py"), {"preprocess_imgs_vae"}, script)
+    script = defined_in(train, {"requires_grad", "update_ema"}, {"torch": torch, "OrderedDict": OrderedDict})
+    defined_in(source("utils.py"), {"preprocess_imgs_vae"}, script)
 
     vae = autoencoder["AutoencoderKL"].__new__(autoencoder["AutoencoderKL"])
     torch.nn.Module.__init__(vae)
@@ -406,7 +390,7 @@ def run(dtype, drawn: dict[str, np.ndarray], pixels: np.ndarray, classes: np.nda
                       and ast.unparse(node.items[0]).startswith("accelerator.accumulate"))
     statements = [*loop.body[start:loop.body.index(accumulate)], *accumulate.body]
     with precision(dtype):
-        exec(compile(ast.Module(body=statements, type_ignores=[]), "train_repae.py", "exec"), scope)
+        ran(statements, scope, "train_repae.py")
     assert not random.draws, "the step drew fewer times than DiffusionObjective.loss"
 
     tail = "_f64" if dtype == torch.float64 else ""

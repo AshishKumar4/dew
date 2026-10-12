@@ -28,10 +28,8 @@ run's precision.
 
 from __future__ import annotations
 
-import ast
 import json
 import types
-import urllib.request
 from pathlib import Path
 
 import jax
@@ -39,6 +37,7 @@ import numpy as np
 import torch
 from diffusers import FlowMatchEulerDiscreteScheduler
 from diffusers.training_utils import compute_loss_weighting_for_sd3
+from reference_source import fetched, selected, simple_statements
 
 from dew.diffusion import presets
 
@@ -53,21 +52,10 @@ STATEMENTS = ("noisy_model_input = (1.0 - sigmas) * model_input + sigmas * noise
 
 def published() -> tuple[str, str]:
     """The script's statements before the model call and after it."""
-    text = urllib.request.urlopen(SCRIPT).read().decode()
-    main = next(node for node in ast.parse(text).body
-                if isinstance(node, ast.FunctionDef) and node.name == "main")
-    compound = (ast.For, ast.If, ast.With, ast.While, ast.Try)
-    found = {}
-    for node in ast.walk(main):
-        if isinstance(node, ast.stmt) and not isinstance(node, compound):
-            source = ast.get_source_segment(text, node) or ""
-            for start in STATEMENTS:
-                if source.startswith(start) and start not in found:
-                    found[start] = source
-    missing = [start for start in STATEMENTS if start not in found]
-    if missing:
-        raise SystemExit(f"the script no longer holds {missing}")
-    return found[STATEMENTS[0]], "\n".join(found[start] for start in STATEMENTS[1:])
+    text = fetched(SCRIPT)
+    [main] = selected(text, {"main"}, filename=SCRIPT)
+    before, *after = simple_statements(text, main, STATEMENTS)
+    return before, "\n".join(after)
 
 
 def velocity(weights, x, timestep):

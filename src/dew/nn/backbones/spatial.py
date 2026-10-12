@@ -38,8 +38,8 @@ class SpatialForward:
         from ..blocks import torch_nearest_resize
         return torch_nearest_resize(x, height, width)
 
-    def normalized(self, x, norm, activation):
-        return activation(norm(x))
+    def normalized(self, x, norm):
+        return norm(x)
 
     def activated(self, x, activation):
         return activation(x)
@@ -87,7 +87,7 @@ class SpatialCount:
     def resize(self, x: SpatialShape, height: int, width: int) -> SpatialShape:
         return SpatialShape((x.shape[0], height, width, x.shape[-1]))
 
-    def normalized(self, x: SpatialShape, norm, activation) -> SpatialShape:
+    def normalized(self, x: SpatialShape, norm) -> SpatialShape:
         return x
 
     def activated(self, x: SpatialShape, activation) -> SpatialShape:
