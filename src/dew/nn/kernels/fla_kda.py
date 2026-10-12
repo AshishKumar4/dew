@@ -54,13 +54,21 @@ _SM80 = {
 }
 _SMALL = {**_SM80, "bwd_wy_dqkg": {"bk": 32, "bv": 32, "warps": 4, "stages": 1}}
 
+_A100 = {**_SM80,
+         # Measured on an A100-40GB at Kimi Linear's 1 x 4096 x 32 x 128 bf16: the solve 0.98 -> 0.80 ms,
+         # the backward intra kernel 2.49 -> 1.98 ms, the output 0.25 -> 0.23 ms.
+         "intra_solve": {"bk": 32, "warps": 1, "stages": 1},
+         "chunk_fwd_o": {"bk": 64, "bv": 128, "warps": 4, "stages": 2},
+         "bwd_intra": {"bk": 64, "warps": 4, "stages": 1}}
+
 _A100_SHARED = generation.TARGETS["sm80"].shared_limit or 0
 
-CONFIGS = {(name, dtype): _SM80 if (generation.TARGETS[name].shared_limit or 0) >= _A100_SHARED else _SMALL
+CONFIGS = {(name, dtype): _A100 if name == "sm80" else
+           _SM80 if (generation.TARGETS[name].shared_limit or 0) >= _A100_SHARED else _SMALL
            for name, dtype in fla_gdn.CONFIGS}
 """Each kernel's blocks, warps and stages, keyed as `fla_gdn.CONFIGS` and read through its
-`kernel_config`: an A100's wherever a block holds as much shared memory, narrower value blocks for the
-99 KB ones."""
+`kernel_config`: an A100's measured choices; fla's elsewhere wherever a block holds as much shared memory
+as an A100's, narrower value blocks for the 99 KB ones."""
 
 def kernel_config(kernel: str, width: int, dtype, *, bk: int | None = None, bv: int | None = None,
                   warps: int | None = None, stages: int | None = None) -> dict[str, int]:
