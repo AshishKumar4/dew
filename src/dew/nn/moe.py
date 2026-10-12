@@ -20,18 +20,21 @@ layout `jax.lax.ragged_dot` takes and the `expert` mesh axis shards.
 
 import dataclasses
 import functools
-import importlib
 import math
 from collections.abc import Callable, Mapping, Sequence
+from typing import get_args
 
 import jax
 import jax.numpy as jnp
+import tokamax
 from flax import linen as nn, struct
 from flax.linen.dtypes import canonicalize_dtype, promote_dtype
 from flax.typing import Dtype, PrecisionLike
 from jax.ad_checkpoint import checkpoint_name
 from jax.custom_derivatives import SymbolicZero
 from jax.sharding import PartitionSpec as P
+from tokamax._src.ops.ragged_dot.api import Implementation as RaggedDotImplementation
+from typing_extensions import TypeIs
 
 from .activations import gelu_exact, gelu_tanh, relu2, silu
 from .blocks import normal_kernel
@@ -360,6 +363,19 @@ def grouped_matmul_kernel(implementation: str, compute: Dtype, operands: tuple[D
     return 'pallas' if refusal is None else ran_kernel('grouped_matmul', 'xla', refusal)
 
 
+def _is_tokamax_kernel(name: str) -> TypeIs[RaggedDotImplementation]:
+    # tokamax exports ragged_dot but not the type of its kernel names, which lives in its api module.
+    return name in get_args(RaggedDotImplementation.__value__)
+
+
+def _tokamax_kernel(name: str) -> RaggedDotImplementation:
+    """The `KERNELS['tokamax_grouped_matmul']` value as the kernel name tokamax's own type admits."""
+    if not _is_tokamax_kernel(name):
+        raise ValueError(f"tokamax.ragged_dot has no kernel {name!r}; it takes "
+                         f"{get_args(RaggedDotImplementation.__value__)}")
+    return name
+
+
 def grouped_matmul(tokens: jax.Array, kernel: jax.Array, group_sizes: jax.Array, *,
                    implementation: str, precision: PrecisionLike = None,
                    preferred_element_type: Dtype | None = None) -> jax.Array:
@@ -377,13 +393,10 @@ def grouped_matmul(tokens: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
             f"implementation must be one of {list(GROUPED_MATMULS)}, got "
             f"{implementation!r}")
     if implementation == 'tokamax':
-        # tokamax is not a dependency (docs/concepts/moe.md), so it is
-        # imported at the call.
-        tokamax = importlib.import_module('tokamax')
         return tokamax.ragged_dot(
             tokens, kernel, group_sizes, precision=precision,
             preferred_element_type=preferred_element_type,
-            implementation=measured_kernel('tokamax_grouped_matmul', 'xla'))
+            implementation=_tokamax_kernel(measured_kernel('tokamax_grouped_matmul', 'xla')))
     return xla_ragged_dot(tokens, kernel, group_sizes, precision=precision,
                           preferred_element_type=preferred_element_type)
 
