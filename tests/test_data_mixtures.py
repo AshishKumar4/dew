@@ -724,6 +724,18 @@ def test_a_pass_over_the_data_is_more_steps_under_a_ramp():
     assert flat.steps_per_epoch == 12
     assert ramped(flat, ramp).steps_per_epoch == 20
     assert ramp.steps_for(64, 8) == 16, "the ramp itself is sixteen steps of four"
+    # The ramp happens once, so a second pass is twelve flat steps more, not twenty.
+    assert ramped(flat, ramp).epoch_steps(2) == 32
+
+
+def test_epochs_under_a_ramp_read_that_many_passes_of_records():
+    """Two epochs of 64 records ramping from 8 to 16 over the first 32 read
+    exactly 128 records: four steps of 8, then six of 16."""
+    ramp = Ramp(start=8, increment=8, samples=32)
+    data = ramped(Loader(train=lambda partition: iter(()), val=None, records=64, batch=16), ramp)
+    batches = [stage.batch for stage in ramp.stages(16)]
+    assert (data.epoch_steps(1), data.epoch_steps(2)) == (6, 10) and batches == [8, 16]
+    assert 4 * 8 + 6 * 16 == 2 * 64
 
 
 # --------------------------------------------------------------------------
