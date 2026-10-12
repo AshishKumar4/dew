@@ -218,9 +218,10 @@ def test_an_fsdp_step_splits_leading_dimensions_and_moves_no_activation(fused):
     (`GatedDeltaNet._project`), Qwen3-Next's fused projections before their
     reshape."""
     def moved(text: str) -> list:
-        # Every exchange of entries, and each gather of the step's positions.
-        return sorted((op, shapes) for op, shapes in sharded.collectives(text) if op in sharded.MOVES
-                      and (op != "all-gather" or any(LENGTH in shape for shape in shapes)))
+        # Every exchange of entries, and each gathered array of the step's
+        # positions, read apart from those a combined gather carries with it.
+        return sorted((op, shape) for op, shapes in sharded.collectives(text) if op in sharded.MOVES
+                      for shape in shapes if op != "all-gather" or LENGTH in shape)
 
     shardings, text, trained = stepped(MeshSpec(fsdp=2), 2, **delta_layers(fused=fused))
     specs = {jax.tree_util.keystr(path): sharding.spec
