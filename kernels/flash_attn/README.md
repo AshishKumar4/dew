@@ -31,3 +31,12 @@ out = flash_mha(query, key, value, is_causal=True)  # [B, S, H, D], bf16 or fp16
 
 Key heads may divide the query's (grouped-query attention). The backward pass
 is the kernel's own.
+
+Packed sequences, `[T, H, D]` with int32 offsets `cu_seqlens` `[N + 1]` from 0 to
+T, attend each within itself:
+
+```python
+from dew_flash_attn import flash_mha_varlen
+
+out = flash_mha_varlen(query, key, value, cu_seqlens, max_seqlen, is_causal=True)
+```

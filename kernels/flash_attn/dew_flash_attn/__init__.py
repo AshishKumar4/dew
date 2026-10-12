@@ -1,7 +1,8 @@
 """FlashAttention-2 for JAX: Dao-AILab's CUDA kernels (BSD-3), through
 flash_attn_jax's XLA FFI port (BSD-3), as two FFI targets of a library with
 no Python ABI. `flash_mha` takes `[B, S, H, D]` bf16 or fp16 arrays, with
-grouped key heads, and differentiates through the kernel's own backward."""
+grouped key heads, and `flash_mha_varlen` packed sequences `[T, H, D]` between
+cumulative offsets; both differentiate through the kernel's own backward."""
 
 import ctypes
 import functools
@@ -13,7 +14,8 @@ import jax.numpy as jnp
 import numpy as np
 
 _library = ctypes.cdll.LoadLibrary(str(Path(__file__).with_name("libdew_flash_attn.so")))
-for _name in ("dew_flash_mha_fwd", "dew_flash_mha_bwd"):
+for _name in ("dew_flash_mha_fwd", "dew_flash_mha_bwd",
+              "dew_flash_mha_varlen_fwd", "dew_flash_mha_varlen_bwd"):
     jax.ffi.register_ffi_target(_name, jax.ffi.pycapsule(getattr(_library, _name)), platform="CUDA")
 
 
@@ -117,3 +119,77 @@ def flash_mha(query, key, value, softmax_scale: float | None = None, is_causal: 
                          f"not query {query.shape}, key {key.shape} and value {value.shape}")
     scale = 1.0 / math.sqrt(query.shape[-1]) if softmax_scale is None else softmax_scale
     return _attend(query, key, value, float(scale), bool(is_causal))
+
+
+def _varlen_forward(query, key, value, starts, longest, scale, causal):
+    heads, width = query.shape[1:]
+    sequences = starts.shape[0] - 1
+    q, k, v = _padded(query, key, value)
+    # The packed forward never splits the keys, so its split scratch is a token buffer.
+    out, lse, _, _ = jax.ffi.ffi_call("dew_flash_mha_varlen_fwd", (
+        jax.ShapeDtypeStruct(q.shape, q.dtype),
+        jax.ShapeDtypeStruct((sequences, heads, longest), jnp.float32),
+        jax.ShapeDtypeStruct((1, 1, 1, 1, 1), jnp.float32),
+        jax.ShapeDtypeStruct((1, 1, 1, 1), jnp.float32),
+    ))(q, k, v, starts, starts, max_seqlen_q=np.int32(longest), max_seqlen_k=np.int32(longest),
+       zero_tensors=False, **_attributes(scale, causal))
+    return out[..., :width], lse
+
+
+def _varlen_backward(grad, query, key, value, out, lse, starts, longest, scale, causal):
+    total, heads, width = query.shape
+    key_heads = key.shape[1]
+    sequences = starts.shape[0] - 1
+    g, q, k, v, o = _padded(grad, query, key, value, out)
+    padded = q.shape[-1]
+    attributes = _attributes(scale, causal)
+    attributes["softmax_scale"] = np.float32(scale)
+    dq, dk, dv, _, _ = jax.ffi.ffi_call("dew_flash_mha_varlen_bwd", (
+        jax.ShapeDtypeStruct(q.shape, q.dtype),
+        jax.ShapeDtypeStruct((key.shape[0], heads, padded), q.dtype),
+        jax.ShapeDtypeStruct((key.shape[0], heads, padded), q.dtype),
+        jax.ShapeDtypeStruct((sequences, heads, _round(longest, 128)), jnp.float32),
+        jax.ShapeDtypeStruct((total + 128 * sequences, heads, _round(padded, 32)), jnp.float32),
+    ))(g, q, k, v, o, lse, starts, starts, max_seqlen_q=np.int64(longest), max_seqlen_k=np.int64(longest),
+       zero_tensors=False, deterministic=False, **attributes)
+    group = heads // key_heads
+    dk = dk.reshape(key.shape[0], key_heads, group, padded).sum(2)
+    dv = dv.reshape(key.shape[0], key_heads, group, padded).sum(2)
+    return dq[..., :width], dk[..., :width], dv[..., :width]
+
+
+@functools.partial(jax.custom_vjp, nondiff_argnums=(4, 5, 6))
+def _attend_packed(query, key, value, starts, longest, scale, causal):
+    return _varlen_forward(query, key, value, starts, longest, scale, causal)[0]
+
+
+def _attend_packed_forward(query, key, value, starts, longest, scale, causal):
+    out, lse = _varlen_forward(query, key, value, starts, longest, scale, causal)
+    return out, (query, key, value, out, lse, starts)
+
+
+def _attend_packed_backward(longest, scale, causal, residuals, grad):
+    query, key, value, out, lse, starts = residuals
+    dq, dk, dv = _varlen_backward(grad, query, key, value, out, lse, starts, longest, scale, causal)
+    return dq, dk, dv, np.zeros(starts.shape, jax.dtypes.float0)
+
+
+_attend_packed.defvjp(_attend_packed_forward, _attend_packed_backward)
+
+
+def flash_mha_varlen(query, key, value, cu_seqlens, max_seqlen: int, softmax_scale: float | None = None,
+                     is_causal: bool = False):
+    """Attention within each of the sequences packed into `query`, `key` and `value`, `[T, H, D]`:
+    sequence i holds tokens `cu_seqlens[i]` to `cu_seqlens[i + 1]` (int32, `[N + 1]`, from 0 to T),
+    none longer than `max_seqlen`, and a sequence may be empty. A causal mask is each sequence's own."""
+    if query.dtype not in (jnp.bfloat16, jnp.float16) or not query.dtype == key.dtype == value.dtype:
+        raise ValueError(f"flash_mha_varlen takes bf16 or fp16 inputs of one dtype, not {query.dtype}, "
+                         f"{key.dtype} and {value.dtype}")
+    if (query.ndim != 3 or query.shape[1] % key.shape[1] or key.shape != value.shape
+            or query.shape[0] != key.shape[0] or query.shape[2] > 256):
+        raise ValueError(f"flash_mha_varlen takes packed [T, H, D] arrays whose key heads divide the query's "
+                         f"and heads up to 256 wide, not query {query.shape}, key {key.shape} and value "
+                         f"{value.shape}")
+    scale = 1.0 / math.sqrt(query.shape[-1]) if softmax_scale is None else softmax_scale
+    starts = jnp.asarray(cu_seqlens, jnp.int32)
+    return _attend_packed(query, key, value, starts, int(max_seqlen), float(scale), bool(is_causal))

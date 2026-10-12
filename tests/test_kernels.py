@@ -10,6 +10,8 @@ device skips elsewhere; run that half with
 kernel's own numbers are tests/test_attention_splash.py.
 """
 
+import functools
+import itertools
 import os
 
 import jax
@@ -307,6 +309,63 @@ def test_flash_trains_and_agrees_with_xla(q_len, kv_len, heads, kv_heads, head_d
     for got, want in zip(fused, reference, strict=True):
         assert got.shape == want.shape
         assert np.abs(got - want).max() <= 2 ** -6 * np.abs(want).max()
+
+
+def float64_attention(query, key, value, causal):
+    """Attention of `[S, H, D]` arrays as float64 math, key heads repeated over their group."""
+    group = query.shape[1] // key.shape[1]
+    key, value = jnp.repeat(key, group, axis=1), jnp.repeat(value, group, axis=1)
+    logits = jnp.einsum('qhd,khd->hqk', query, key) / np.sqrt(query.shape[-1])
+    if causal:
+        logits = jnp.where(jnp.tril(jnp.ones(logits.shape[1:], bool)), logits, -jnp.inf)
+    return jnp.einsum('hqk,khd->qhd', jax.nn.softmax(logits, axis=-1), value)
+
+
+def relative_distance(got, want) -> tuple[float, float]:
+    """RMS and largest distance of `got` from `want`, relative to `want`'s RMS and largest magnitude."""
+    error = np.asarray(got, np.float64) - want
+    return (float(np.sqrt(np.mean(error ** 2) / np.mean(want ** 2))),
+            float(np.abs(error).max() / np.abs(want).max()))
+
+
+@on_gpu
+@pytest.mark.parametrize("head_dim", [128, 256])
+@pytest.mark.parametrize("causal", [True, False])
+def test_packed_sequences_attend_within_themselves_as_far_from_float64_as_one_at_a_time(
+        head_dim, causal, without_deterministic_ops):
+    """Documents packed back to back, one a single token, with an empty sequence between two: each
+    document's output and its three input gradients lie no farther from float64 attention than
+    FlashAttention-2's own on that document alone, in the worse of two runs of it, whose atomic
+    query gradient varies from run to run."""
+    flash = pytest.importorskip("dew_flash_attn")
+    if head_dim > 192 and kernels.device_generation() in ('sm86', 'sm87', 'sm89'):
+        pytest.skip("FlashAttention-2's backward takes heads over 192 wide only on sm80, sm90 and sm1xx")
+    lengths = [700, 1, 0, 333, 64]
+    starts = np.concatenate([[0], np.cumsum(lengths)]).astype(np.int32)
+    query, _, _ = qkv((int(starts[-1]), 8, head_dim))
+    _, key, value = qkv((int(starts[-1]), 2, head_dim), seed=1)
+    cotangent = qkv((int(starts[-1]), 8, head_dim), seed=2)[0]
+
+    def grads(attend, cotangent, *arrays):
+        out, pull = jax.vjp(attend, *arrays)
+        return [np.asarray(x, np.float64) for x in (out, *pull(cotangent))]
+
+    packed = grads(lambda q, k, v: flash.flash_mha_varlen(q, k, v, starts, max(lengths), is_causal=causal),
+                   cotangent, query, key, value)
+    for begin, end in itertools.pairwise(starts):
+        if begin == end:
+            continue
+        pieces = (query[begin:end], key[begin:end], value[begin:end])
+        dense = [grads(lambda q, k, v: flash.flash_mha(q[None], k[None], v[None], is_causal=causal)[0],
+                       cotangent[begin:end], *pieces) for _ in range(2)]
+        with jax.enable_x64(new_val=True):
+            wide = [jnp.asarray(np.asarray(x, np.float64)) for x in (*pieces, cotangent[begin:end])]
+            truth = grads(functools.partial(float64_attention, causal=causal), wide[3], *wide[:3])
+        for name, got, runs, want in zip(("o", "dq", "dk", "dv"), (x[begin:end] for x in packed),
+                                         zip(*dense, strict=True), truth, strict=True):
+            bound = [max(pair) for pair in zip(*(relative_distance(run, want) for run in runs), strict=True)]
+            measured = relative_distance(got, want)
+            assert measured[0] <= bound[0] and measured[1] <= bound[1], (name, begin, measured, bound)
 
 
 def key_length_call(implementation, query, key, value, lengths, **kwargs):
