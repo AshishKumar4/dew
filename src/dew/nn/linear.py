@@ -864,20 +864,20 @@ class GatedDeltaNet(nn.Module):
         queries, keys and values flat over heads in that order, z
         `[B, S, Hv*Dv]`, and b and a `[B, S, Hv]`.
 
-        Each projection is placed as the residual is, its rows where the
-        batch axes put them and its width whole: the rules split no delta
-        net width over the tensor axis, and the rule's `manual_map` takes
-        rows split. Unplaced, an fsdp mesh ran the layer head-split with
-        every row gathered to every device, its all-to-alls 8.4 GiB of a
-        Qwen3.5-9B step over FSDP 2 (docs/performance.md)."""
+        Each projection keeps its rows where the batch axes put them, as the
+        rule's `manual_map` takes them: q, k, v and z with their width whole,
+        which no rule splits, and b and a with their heads where the tensor
+        axis splits the kernels'. Unplaced, an fsdp mesh ran the layer
+        head-split with every row gathered to every device, its all-to-alls
+        8.4 GiB of a Qwen3.5-9B step over FSDP 2 (docs/performance.md)."""
         B, S, _ = x.shape
 
-        def projected(dense):
-            return constrain(dense(x), RESIDUAL)
+        def projected(dense, axes=RESIDUAL):
+            return constrain(dense(x), axes)
 
         if not self.fused_in_proj:
-            return (projected(self.in_proj_qkv), projected(self.in_proj_z), projected(self.in_proj_b),
-                    projected(self.in_proj_a))
+            return (projected(self.in_proj_qkv), projected(self.in_proj_z),
+                    projected(self.in_proj_b, HEADS[:3]), projected(self.in_proj_a, HEADS[:3]))
         # One row group per key head: its q, its k, then the v and z of the
         # value heads it serves (modeling_qwen3_next.py:558-586).
         per_key = self.per_v * self.head_v_dim
