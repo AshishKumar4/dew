@@ -911,6 +911,26 @@ class CausalTransformer(nn.Module):
         return self._layer_flops(lengths, parameter_flops)
 
     @nn.nowrap
+    def projections(self) -> dict[str, tuple[int, int]]:
+        """The trunk's own maps as `{name: (inputs, outputs)}`, the head
+        included: what setup builds and the counts read."""
+        sites = {}
+        if self.per_layer_input_dim:
+            sites['per_layer_model_projection'] = (self.emb_features,
+                                                   self.num_layers * self.per_layer_input_dim)
+        if self.altup is not None:
+            sites.update({f'{prefix}_{index}': (self.emb_features, self.emb_features)
+                          for prefix in ('altup_projections', 'altup_unembed_projections')
+                          for index in range(self.altup.num_inputs - 1)})
+        if self.loop is not None and self.loop.exit_gate:
+            sites['early_exit_gate'] = (self.emb_features, 1)
+        if not self.tie_embeddings:
+            sites['lm_head'] = (self.emb_features, self.vocab_size)
+        if self.head_transform is not None:
+            sites['head_dense'] = (self.emb_features, self.emb_features)
+        return sites
+
+    @nn.nowrap
     def _layer_flops(self, lengths, counter) -> float:
         types = self.per_layer_types
         kinds = self.layer_kinds(types)
@@ -926,16 +946,20 @@ class CausalTransformer(nn.Module):
             passes = self.loop.steps if self.loop is not None and loop_start <= index < loop_end else 1
             total += passes * counter(block, lengths)
         if self.per_layer_input_dim:
-            total += projection_flops(lengths, self.emb_features, self.num_layers * self.per_layer_input_dim)
+            total += projection_flops(lengths, *self.projections()['per_layer_model_projection'])
         if self.loop is not None and self.loop.exit_gate:
-            total += self.loop.steps * projection_flops(lengths, self.emb_features, 1)
+            total += self.loop.steps * projection_flops(lengths, *self.projections()['early_exit_gate'])
         return total
 
     @nn.nowrap
     def logits_flops(self, lengths) -> float:
-        """The vocabulary matrix and optional prediction transform, tied or untied."""
-        widths = self.vocab_size + (self.emb_features if self.head_transform is not None else 0)
-        return projection_flops(lengths, self.emb_features, widths)
+        """The vocabulary matrix and optional prediction transform. A tied head
+        reads the embedding table, `vocab_size` rows of `emb_features`."""
+        projections = self.projections()
+        count = projection_flops(lengths, *projections.get('lm_head', (self.emb_features, self.vocab_size)))
+        if 'head_dense' in projections:
+            count += projection_flops(lengths, *projections['head_dense'])
+        return count
 
     @nn.nowrap
     def matrix_usage(self, path: tuple[str, ...], lengths, *, logits: bool = False):
@@ -964,6 +988,7 @@ class CausalTransformer(nn.Module):
         types = self.per_layer_types
         kinds = self.layer_kinds(types)
         self.refuse_unbuildable_fields(kinds)
+        projections = self.projections()
         ple = self.per_layer_input_dim
 
         self.embed_tokens = TokenEmbedding(
@@ -992,7 +1017,7 @@ class CausalTransformer(nn.Module):
                 num_embeddings=self.per_layer_vocab, features=self.num_layers * ple,
                 dtype=self.dtype, name='embed_tokens_per_layer')
             self.per_layer_model_projection = nn.Dense(
-                self.num_layers * ple, use_bias=False,
+                projections['per_layer_model_projection'][1], use_bias=False,
                 dtype=self.dtype, precision=self.precision,
                 name='per_layer_model_projection')
             self.per_layer_projection_norm = RMSNorm(
@@ -1026,13 +1051,14 @@ class CausalTransformer(nn.Module):
             # and leave through their own (modeling_gemma3n.py,
             # Gemma3nTextModel.altup_projections and altup_unembed_projections).
             projection = functools.partial(
-                nn.Dense, self.emb_features, use_bias=False, dtype=self.dtype,
+                nn.Dense, use_bias=False, dtype=self.dtype,
                 precision=self.precision)
             self.altup_projections = [
-                projection(name=f'altup_projections_{index}')
+                projection(projections[f'altup_projections_{index}'][1], name=f'altup_projections_{index}')
                 for index in range(self.altup.num_inputs - 1)]
             self.altup_unembed_projections = [
-                projection(name=f'altup_unembed_projections_{index}')
+                projection(projections[f'altup_unembed_projections_{index}'][1],
+                           name=f'altup_unembed_projections_{index}')
                 for index in range(self.altup.num_inputs - 1)]
         if self.hyper_connections is not None and self.hyper_connections.head == 'weighted':
             self.hc_head = HyperHead(spec=self.hyper_connections, emb_features=self.emb_features,
@@ -1048,17 +1074,18 @@ class CausalTransformer(nn.Module):
             scale_offset=self.scale_offset, scale_after_cast=self.scale_after_cast,
             dtype=self.dtype)(name='norm')
         if self.loop is not None and self.loop.exit_gate:
-            self.early_exit_gate = nn.Dense(1, dtype=self.dtype, precision=self.precision,
-                                            name='early_exit_gate', **normal_kernel(self.initializer_range))
+            self.early_exit_gate = nn.Dense(
+                projections['early_exit_gate'][1], dtype=self.dtype, precision=self.precision,
+                name='early_exit_gate', **normal_kernel(self.initializer_range))
         if not self.tie_embeddings:
             self.lm_head = nn.Dense(
-                features=self.vocab_size, use_bias=False, dtype=at_least_fp32(self.dtype),
+                features=projections['lm_head'][1], use_bias=False, dtype=at_least_fp32(self.dtype),
                 precision=self.precision,
                 dot_general=head_dot_general(self.dtype, self.precision),
                 name='lm_head', **normal_kernel(self.initializer_range))
         if self.head_transform is not None:
             self.head_dense = nn.Dense(
-                self.emb_features, use_bias=False, dtype=self.dtype, precision=self.precision,
+                projections['head_dense'][1], use_bias=False, dtype=self.dtype, precision=self.precision,
                 name='head_dense', **normal_kernel(self.initializer_range))
             self.head_norm = decoder_norm(
                 self.norm_type, epsilon=self.norm_eps, bias=self.norm_bias,
