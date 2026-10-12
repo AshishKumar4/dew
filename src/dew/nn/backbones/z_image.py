@@ -28,6 +28,7 @@ from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.attention import RMSNorm
 from dew.nn.blocks import sinusoidal_time
+from dew.nn.flops import MissingFlopsCount, matching_lengths, patch_lengths, projection_flops
 from dew.nn.precision import at_least_fp32
 from dew.nn.scan_orders import patchify, unpatchify
 from dew.nn.sharding import logical_axes
@@ -85,6 +86,32 @@ class ZImageBlock(nn.Module):
     precision: PrecisionLike = None
     attention_impl: str = "auto"  # an AttentionImpl
 
+    @nn.nowrap
+    def _feed_forward(self, name=None):
+        return GatedMLP(int(self.features / 3 * 8), self.features, dtype=self.dtype,
+                        precision=self.precision, name=name)
+
+    @nn.nowrap
+    def _attention(self):
+        return JointAttention(self.heads, self.features // self.heads, bias=False, epsilon=1e-5,
+                              dtype=self.dtype, precision=self.precision,
+                              attention_impl=self.attention_impl, name="attention")
+
+    @property
+    def modulation_features(self) -> int:
+        return 4 * self.features
+
+    @nn.nowrap
+    def model_flops(self, lengths) -> float:
+        """Real-token QKV/output and gated MLP; pad rows stay outside MFU."""
+        length, = matching_lengths(lengths)
+        count = (self._attention().stream_flops(lengths, None, self.features)
+                 + self._feed_forward().model_flops(lengths))
+        if self.modulation:
+            count += projection_flops(np.ones(length.shape, np.int64), min(self.features, FREQUENCIES),
+                                       self.modulation_features)
+        return count
+
     @nn.compact
     def __call__(self, x, rotation, lengths, embedded=None):
         def norm(name):
@@ -92,19 +119,16 @@ class ZImageBlock(nn.Module):
 
         # `ZSingleStreamAttnProcessor`: bias-free, its query and key norms at
         # 1e-5 whatever `norm_eps`.
-        joint = JointAttention(self.heads, self.features // self.heads, bias=False, epsilon=1e-5,
-                               dtype=self.dtype, precision=self.precision, attention_impl=self.attention_impl,
-                               name="attention")
+        joint = self._attention()
 
         def attention(x):
             return joint(x, rotation=rotation, lengths=lengths)[0]
 
-        feed_forward = GatedMLP(int(self.features / 3 * 8), self.features, dtype=self.dtype,
-                                precision=self.precision, name="feed_forward")
+        feed_forward = self._feed_forward("feed_forward")
         if not self.modulation:
             x = x + norm("attention_norm2")(attention(norm("attention_norm1")(x)))
             return x + norm("ffn_norm2")(feed_forward(norm("ffn_norm1")(x)))
-        modulated = nn.Dense(4 * self.features, dtype=self.dtype, precision=self.precision,
+        modulated = nn.Dense(self.modulation_features, dtype=self.dtype, precision=self.precision,
                              name="modulation")(embedded)[:, None]
         scale, gate, scale_mlp, gate_mlp = jnp.split(modulated, 4, axis=-1)
         attended = attention(norm("attention_norm1")(x) * (1 + scale))
@@ -141,10 +165,47 @@ class ZImageTransformer(nn.Module):
     precision: PrecisionLike = None
     attention_impl: str = "auto"  # an AttentionImpl
 
+    @nn.nowrap
+    def projections(self, input_channels: int, text_features: int) -> dict[str, tuple[int, int]]:
+        time = min(self.dim, FREQUENCIES)
+        return {'x_embedder': (4 * input_channels, self.dim), 'cap_embedder': (text_features, self.dim),
+                't_embedder_1': (FREQUENCIES, 1024), 't_embedder_2': (1024, time),
+                'final_modulation': (time, self.dim), 'final_linear': (self.dim, 4 * input_channels)}
+
+    @nn.nowrap
+    def condition_lengths(self, lengths: np.ndarray, spans: np.ndarray) -> np.ndarray:
+        return lengths
+
     @property
     def text_keyword(self) -> str:
         """Every call takes the caption as `conditioning`, which joins the image's single stream."""
         return "conditioning"
+
+    @nn.nowrap
+    def model_flops(self, lengths) -> float:
+        raise MissingFlopsCount("ZImageTransformer requires multimodal_flops with actual image/text widths")
+
+    @nn.nowrap
+    def image_lengths(self, sample_shape: tuple[int, ...], rows: int) -> np.ndarray:
+        return patch_lengths(sample_shape, (2, 2), rows)
+
+    @nn.nowrap
+    def multimodal_flops(self, lengths, context_lengths, input_channels: int, text_features: int) -> float:
+        """Static patch/text maps, both refiner stacks and the joined stack."""
+        image, context = matching_lengths(lengths, context_lengths)
+        rows = np.ones(image.shape, np.int64)
+        maps = self.projections(input_channels, text_features)
+        count = sum(projection_flops(lengths if name in ('x_embedder', 'final_linear') else
+                                     context_lengths if name == 'cap_embedder' else rows, *shape)
+                    for name, shape in maps.items())
+        image_block = ZImageBlock(self.dim, self.n_heads, parent=None)
+        text_block = ZImageBlock(self.dim, self.n_heads, modulation=False, parent=None)
+        # Learned pad slots are visible architectural tokens, not masked batch padding.
+        image_span = (np.ceil(image / MULTIPLE) * MULTIPLE).astype(np.int64)
+        context_span = (np.ceil(context / MULTIPLE) * MULTIPLE).astype(np.int64)
+        count += self.n_refiner_layers * (image_block.model_flops(image_span)
+                                          + text_block.model_flops(context_span))
+        return count + self.n_layers * image_block.model_flops(image_span + context_span)
 
     def _embedded_time(self, time, dtype):
         """`TimestepEmbedder` of the source's time, (1000 - time) / 1000 times
@@ -153,8 +214,10 @@ class ZImageTransformer(nn.Module):
         width = at_least_fp32(self.dtype)
         source_time = (1000.0 - jnp.asarray(time, width)) / 1000.0 * self.t_scale
         features = sinusoidal_time(source_time, FREQUENCIES, dtype=width).astype(dtype)
-        hidden = nn.Dense(1024, dtype=self.dtype, precision=self.precision, name="t_embedder_1")(features)
-        return nn.Dense(min(self.dim, FREQUENCIES), dtype=self.dtype, precision=self.precision,
+        maps = self.projections(0, 0)
+        hidden = nn.Dense(maps['t_embedder_1'][1], dtype=self.dtype, precision=self.precision,
+                          name="t_embedder_1")(features)
+        return nn.Dense(maps['t_embedder_2'][1], dtype=self.dtype, precision=self.precision,
                         name="t_embedder_2")(nn.silu(hidden))
 
     @nn.compact
@@ -170,7 +233,7 @@ class ZImageTransformer(nn.Module):
             raise ValueError(f"Z-Image takes NHWC latents of even height and width, got shape {x.shape}")
         if conditioning.mask is None:
             raise ValueError("Z-Image reads the prompt's real tokens; its conditioning needs a mask")
-        batch, height, width, channels = x.shape
+        batch, height, width, _ = x.shape
         rows, columns = height // 2, width // 2
         count = rows * columns
         image_span = -(-count // MULTIPLE) * MULTIPLE
@@ -186,13 +249,15 @@ class ZImageTransformer(nn.Module):
         embedded = self._embedded_time(time, x.dtype)
         pad_image = self.param("x_pad_token", nn.initializers.zeros, (1, self.dim))
         pad_caption = self.param("cap_pad_token", nn.initializers.zeros, (1, self.dim))
-        image = nn.Dense(self.dim, dtype=self.dtype, precision=self.precision, name="x_embedder")(
-            patchify(x, 2))
+        maps = self.projections(x.shape[-1], conditioning.context.shape[-1])
+        image = nn.Dense(maps['x_embedder'][1], dtype=self.dtype, precision=self.precision,
+                         name="x_embedder")(patchify(x, 2))
         image = jnp.concatenate(
             [image, jnp.broadcast_to(pad_image.astype(image.dtype), (batch, image_span - count, self.dim))],
             axis=1,
         )
-        caption = nn.Dense(self.dim, dtype=self.dtype, precision=self.precision, name="cap_embedder")(
+        caption = nn.Dense(maps['cap_embedder'][1], dtype=self.dtype, precision=self.precision,
+                           name="cap_embedder")(
             RMSNorm(epsilon=self.norm_eps, dtype=self.dtype, name="cap_norm")(context))
         caption = jnp.where(mask[..., None], caption, pad_caption.astype(caption.dtype))
 
@@ -225,9 +290,10 @@ class ZImageTransformer(nn.Module):
             joined = ZImageBlock(self.dim, self.n_heads, name=f"layers_{index}", **block)(
                 joined, rotation, image_span + spans, embedded)
 
-        scale = 1 + nn.Dense(self.dim, dtype=self.dtype, precision=self.precision,
+        scale = 1 + nn.Dense(maps['final_modulation'][1], dtype=self.dtype, precision=self.precision,
                              name="final_modulation")(nn.silu(embedded))[:, None]
-        out = nn.Dense(4 * channels, dtype=self.dtype, precision=self.precision, name="final_linear")(
+        out = nn.Dense(maps['final_linear'][1], dtype=self.dtype, precision=self.precision,
+                       name="final_linear")(
             layer_norm(self.dtype)(joined[:, :count]) * scale)
         return -unpatchify(out, 2, *x.shape[1:])
 

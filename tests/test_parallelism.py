@@ -551,6 +551,24 @@ def test_shard_batch_splits_across_all_devices():
     assert sharded.addressable_shards[0].data.shape == (1, 4)
 
 
+@pytest.mark.parametrize("devices", [1, 8])
+def test_placed_batch_owns_its_reader_buffer(devices):
+    # CPU zero-copy needs aligned storage; each row and device slice stays aligned.
+    size = 1 << 20
+    storage = np.empty(size * 4 + 63, np.uint8)
+    offset = -storage.ctypes.data % 64
+    source = storage[offset:offset + size * 4].view(np.float32).reshape(8, -1)
+    source.fill(7)
+    mesh = MeshSpec().build(jax.devices()[:devices])
+    placed = shard_batch(mesh, {"tokens": source})["tokens"]
+    placed.block_until_ready()
+
+    for shard in placed.addressable_shards:
+        assert not np.shares_memory(np.asarray(shard.data), source)
+    source.fill(-1)
+    np.testing.assert_array_equal(np.asarray(placed), np.full(source.shape, 7, np.float32))
+
+
 def test_prefetch_iterator_preserves_order_and_terminates():
     mesh = MeshSpec().build()
     source = ({"x": np.full((jax.device_count(), 2), i, np.float32)} for i in range(5))

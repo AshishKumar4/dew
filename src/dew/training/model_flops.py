@@ -19,6 +19,34 @@ TRAINING_FLOPS = "__dew_training_flops"
 TOKENS = "__dew_real_tokens"
 
 
+class _TokenCount:
+    """Unsigned 64-bit counts as low/high uint32 words, without enabling float64 in JAX."""
+
+    @staticmethod
+    def words(values) -> np.ndarray:
+        values = np.asarray(values, np.uint64)
+        return np.stack((values.astype(np.uint32), (values >> np.uint64(32)).astype(np.uint32)), axis=-1)
+
+    @staticmethod
+    def _plus(left, right):
+        low = left[0] + right[0]
+        return low, left[1] + right[1] + (low < left[0]).astype(jnp.uint32)
+
+    @classmethod
+    def add(cls, left, right) -> jax.Array:
+        return jnp.stack(cls._plus(left, right))
+
+    @classmethod
+    def sum(cls, rows: jax.Array) -> jax.Array:
+        return jnp.stack(jax.lax.reduce((rows[:, 0], rows[:, 1]),
+                                       (np.uint32(0), np.uint32(0)), cls._plus, (0,)))
+
+    @staticmethod
+    def host(words) -> int:
+        words = np.asarray(words)
+        return int(words[0]) + (int(words[1]) << 32)
+
+
 def prepare_counts[Loss, Effects](objective: Objective[Loss, Effects], batch: Batch, *,
                                  count_model: bool) -> Batch:
     """Count the source's host rows, preserving its checkpoint and model inputs."""
@@ -32,12 +60,10 @@ def prepare_counts[Loss, Effects](objective: Objective[Loss, Effects], batch: Ba
         row = jax.tree.map(lambda leaf, index=index: leaf[index:index + 1]
                            if np.ndim(leaf) and np.shape(leaf)[0] == rows else leaf, batch)
         if objective.counts_tokens:
-            tokens.append(float(np.sum(objective.real_lengths(row), dtype=np.float64)))
-    # The step's scalar telemetry accumulates in fp32, just like its loss;
-    # widening before counting kept large integer products from overflowing.
+            tokens.append(np.sum(objective.real_lengths(row), dtype=np.uint64))
     counted = dict(batch)
     if objective.counts_tokens:
-        counted[TOKENS] = np.asarray(tokens, np.float32)
+        counted[TOKENS] = _TokenCount.words(tokens)
     if count_model:
         # Partition each assembled scalar over the batch's row shards. A
         # shared conditioning row is counted once, not once per example.
@@ -58,8 +84,11 @@ def uncounted(batch: Batch) -> Batch:
 
 def step_counts(batch: Batch) -> dict[str, jax.Array]:
     """Global device-side sums, returned with the step's other scalar metrics."""
-    return {name: jnp.sum(batch[name], dtype=jnp.float32)
-            for name in (FORWARD_FLOPS, TRAINING_FLOPS, TOKENS) if name in batch}
+    work = {name: jnp.sum(batch[name], dtype=jnp.float32)
+            for name in (FORWARD_FLOPS, TRAINING_FLOPS) if name in batch}
+    if TOKENS in batch:
+        work[TOKENS] = _TokenCount.sum(batch[TOKENS])
+    return work
 
 
 def model_batch(batch: Batch) -> Batch:

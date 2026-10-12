@@ -122,6 +122,19 @@ def rounded_to(x: jax.Array, dtype: Dtype) -> jax.Array:
     return jax.lax.reduce_precision(x, exponent_bits=bits.nexp, mantissa_bits=bits.nmant)
 
 
+def compensated_add(left, right):
+    """Add two double-float values, `(hi, lo)` pairs whose sum is the value:
+    `hi` is the rounded sum and `lo` carries what its rounding dropped
+    (Knuth's TwoSum), so a running sum keeps fp32's precision squared.
+    XLA reassociates no float arithmetic unless fast math is on; with it,
+    `lo` cancels to zero and the sum is the plain one."""
+    (left_hi, left_lo), (right_hi, right_lo) = left, right
+    total = left_hi + right_hi
+    part = total - left_hi
+    dropped = (left_hi - (total - part)) + (right_hi - part)
+    return total, dropped + left_lo + right_lo
+
+
 @functools.partial(jax.custom_jvp, nondiff_argnums=(1,))
 def rounded_operand(x: jax.Array, dtype: Dtype) -> jax.Array:
     """The value `x` takes in `dtype`, held in `x`'s own dtype, with a

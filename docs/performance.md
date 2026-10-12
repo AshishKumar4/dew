@@ -2934,6 +2934,33 @@ step with the copies against 79.8 without, with 2.1 GiB more temporaries.
 
 A T4 (sm75) rejects the `BF16_BF16_F32` dot algorithm at run time ("UNIMPLEMENTED: Unsupported algorithm on the current device(s): ALG_DOT_BF16_BF16_F32"), cuDNN's fused attention refuses bf16 there ("SDPA FP16/BF16 requires SM80"), and Triton does not compile for it. `dew.nn.kernels.generation.bf16_dot_runs` is the single check for all three. Below sm80, bf16 attention takes the reference path for `auto` and `xla`, the bf16 operand precision keeps the caller's precision, and the grouped matmul runs XLA.
 
+### LoRA's branch stays beside the base product, 2026-10-12
+
+An adapted projection computes `x W + s (x A) B` (`dew.lora`). On a GPU, XLA already runs the
+branch through the base GEMM's cuBLASLt epilogue in both directions: the scale goes into alpha of
+the rank-r product `(x A) B`, and that product is the base GEMM's `C` with beta 1. The same holds
+for the input gradient. On an RTX 4080, with XLA's Triton GEMMs off as on the step, moving the
+scale onto `x A` only moved it out of alpha into an elementwise kernel (4.67 against 4.71 ms for
+an adapted MLP's gradient at 768 x 4096 x 12288, rank 256). The fusion left to make is the one that removes the `[tokens, out]` delta written by
+one GEMM and read by the next: `y = [x | s x A] [W ; B]` as one GEMM that accumulates both
+segments in fp32 and rounds once, and `dx = [dy | dh] [W^T ; A^T]` the same way. I wrote it as a
+Pallas Triton kernel with grouped tiles and timed the 9B's six adapted delta-net projections
+(rank 256, bf16, forward and backward over the factors and the input) against XLA's branch.
+Medians in ms, best tile of four or three:
+
+| GPU | tokens | XLA's branch | fused GEMMs | ratio |
+|---|---:|---:|---:|---:|
+| A100 40 GB SXM | 768 | 4.26 | 5.15 | 0.83 |
+| A100 40 GB SXM | 3072 | 14.65 | 14.79 | 0.99 |
+| H100 PCIe | 768 | 2.54 | 2.46 | 1.03 |
+| H100 PCIe | 3072 | 8.37 | 8.77 | 0.95 |
+
+The kernel's Triton mainloop runs slower than cuBLAS at these shapes, by more than the saved delta
+costs, so Dew keeps the branch beside the module's product. The kernel and the benchmark's `lora`
+mode are on the branch `perf/lora-in-gemm` at `837154b54`:
+`PYTHONPATH=src python tools/benchmark_kernels.py lora --tokens 768 --tiles 128,128,32,4,3
+128,128,64,4,3 128,256,64,8,3 64,128,32,4,4` (jax 0.11.2). The G4 (sm120) was not measured.
+
 ### Faster kernels not adopted
 
 Kernel matrix, 2026-09-22, jax 0.11.2, forward plus backward medians, every cell checked against float64. Each of these needs a kernel or a dependency that Dew does not have yet:

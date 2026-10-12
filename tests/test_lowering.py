@@ -138,7 +138,7 @@ def test_a_kernel_traced_for_an_assumed_gpu_lowers_to_a_named_triton_call():
 FAMILIES = {
     ('grouped_matmul', 'pallas'): ("experts", {"pallas_triton_ragged_dot", "tgmm_ragged_dot"}),
     ('tokamax_grouped_matmul', 'triton'): ("experts", None),
-    ('rms_norm', 'pallas'): ("step", {"rms_norm_forward", "rms_norm_backward", "rms_norm_scale_backward"}),
+    ('rms_norm', 'pallas'): ("step", {"rms_norm_forward", "rms_norm_backward"}),
     ('swiglu', 'pallas'): ("step", {"swiglu_forward", "swiglu_backward"}),
 }
 
@@ -152,6 +152,9 @@ GATED_DELTA_RULE = {"fla_chunk_local_cumsum", "fla_kkt_solve", "fla_recompute_w_
                     "fla_prepare_wy_repr_bwd"}
 """The port's kernels (dew.nn.kernels.fla_gdn), which every GPU step with a Gated DeltaNet calls: no
 KERNELS row chooses them, a GPU runs no other."""
+
+SHORT_CONV = {"short_conv_forward", "short_conv_backward"}
+"""The short conv's kernels (`causal_conv1d`), which every GPU step with a recurrent mixer calls."""
 
 
 def chosen(generation: str, probe: str) -> set[tuple[str, str]]:
@@ -173,8 +176,9 @@ def test_every_pallas_choice_a_row_names_has_a_lowering_probe():
 def test_the_compensated_norm_vjp_lowers_for_both_gpu_generations(generation):
     """Explicit Pallas checks the candidate even before that generation opts in.
 
-    The separate scale-gradient combine and its rounded assembly must lower
+    The reverse pass's compensated sums and their rounded assembly must lower
     too; interpreting on CPU cannot expose broken multi-result GPU assembly.
+    The programs' partial sums meet in an XLA reduction, not a third kernel.
     """
     from dew.nn.attention import rms_normalized
 
@@ -190,22 +194,22 @@ def test_the_compensated_norm_vjp_lowers_for_both_gpu_generations(generation):
     mesh = gpu_mesh(Mesh(np.array(jax.devices()[:1]), ('data',)), generation)
     with assumed(generation), jax.sharding.use_abstract_mesh(mesh):
         lowered = jax.jit(forward_backward).trace(x, scale, x).lower(lowering_platforms=('cuda',))
-    assert triton_kernels(lowered) == {
-        'rms_norm_forward': 1, 'rms_norm_backward': 1, 'rms_norm_scale_backward': 1}
+    assert triton_kernels(lowered) == {'rms_norm_forward': 1, 'rms_norm_backward': 1}
 
 
 @pytest.mark.parametrize("generation", ["sm80", "sm120"])
 def test_the_clef_step_lowers_for_the_gpu_with_every_kernel_its_generation_chooses(generation, tmp_path):
     """c58's and c57's step, the Clef recipe's decision step over a Qwen 3.5 hybrid, lowered on this CPU
     for their GPUs, an A100 and a G4 (tools/clef_step.py): it lowers, and it calls the Triton kernels
-    of the gated delta rule's port and of every Pallas choice the generation's KERNELS row names for its
-    layers, so none was interpreted or refused."""
+    of the gated delta rule's port, of the short conv and of every Pallas choice the generation's KERNELS
+    row names for its layers, so none was interpreted or refused."""
     done = subprocess.run([sys.executable, str(ROOT / "tools" / "clef_step.py"), "--lower-for", generation,
                            "--work", str(tmp_path)], capture_output=True, text=True, cwd=ROOT, timeout=1500,
                           env={**os.environ, "JAX_PLATFORMS": "cpu"})
     assert done.returncode == 0, done.stderr[-4000:]
     kernels = json.loads(done.stdout.splitlines()[-1])["kernels"]
-    assert set(kernels) == GATED_DELTA_RULE.union(*(FAMILIES[key][1] for key in chosen(generation, "step")))
+    assert set(kernels) == (GATED_DELTA_RULE | SHORT_CONV).union(
+        *(FAMILIES[key][1] for key in chosen(generation, "step")))
 
 
 def _experts_lowered(generation: str, implementation: str):
