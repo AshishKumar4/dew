@@ -944,6 +944,14 @@ class TokenFiles:
         return ArrayIndex(self.length_index.url, self.storage_options)
 
     @property
+    def document_index(self) -> Store:
+        return Store(self.url, self.storage_options).child(f"{self.split}.documents.npy")
+
+    @cached_property
+    def mapped_documents(self) -> ArrayIndex:
+        return ArrayIndex(self.document_index.url, self.storage_options)
+
+    @property
     def row_manifest(self) -> Store:
         return Store(self.url, self.storage_options).child(f"{self.split}.shards.json")
 
@@ -1035,6 +1043,8 @@ class TokenFiles:
         return {**facts, "token_store": True}
 
     def snapshot(self) -> Mapping[str, object]:
+        documents, indexed = self.document_index.resolve()
+        boundaries = {"documents": documents.ukey(indexed)} if documents.exists(indexed) else {}
         if isinstance(self.tokens, (TokenRecords, TokenShards)):
             fs, path = self.length_index.resolve()
             return {
@@ -1050,6 +1060,7 @@ class TokenFiles:
                 "index": fs.ukey(path) if fs.exists(path) else None,
                 "shard_rows": self.tokens.shard_rows if isinstance(self.tokens, TokenRecords) else None,
                 "producer": Files(self.url, storage_options=self.storage_options).committed,
+                **boundaries,
             }
         fs, path = Store(self.tokens.url, self.storage_options).resolve()
         return {
@@ -1061,6 +1072,7 @@ class TokenFiles:
             "chunk_tokens": self.chunk_tokens,
             "bytes": fs.size(path),
             "version": fs.ukey(path),
+            **boundaries,
         }
 
     def supports(self, read: Read) -> bool:
@@ -1070,6 +1082,9 @@ class TokenFiles:
         return not isinstance(tokens, TokenRecords) or tokens.lengths is not None
 
     def provision(self) -> TokenFiles:
+        """Build the indexes the store's reads need: a record store's record
+        lengths, and, for a store with an EOS id, where each document ends
+        (`document_ends`)."""
         tokens = self.tokens
         if isinstance(tokens, TokenRecords):
             from .records import ArrayRecords
@@ -1087,9 +1102,25 @@ class TokenFiles:
                     reader.close()
             self.row_manifest.write(json.dumps({"rows": counts}).encode())
             self.__dict__.pop("tokens", None)
+        if tokens.eos_id is not None:
+            block = 1 << 24
+            found = [
+                np.flatnonzero(tokens[start : start + block] == tokens.eos_id) + start + 1
+                for start in range(0, len(tokens), block)
+            ]
+            ends = np.concatenate([np.zeros(0, np.int64), *found]).astype(np.int64)
+            if not len(ends) or ends[-1] != len(tokens):
+                ends = np.append(ends, len(tokens))
+            encoded = io.BytesIO()
+            np.save(encoded, ends, allow_pickle=False)
+            self.document_index.write(encoded.getvalue())
+            self.__dict__.pop("mapped_documents", None)
         return self
 
     def records(self, read: Read) -> Records:
+        """Each document by index where the store has a document index
+        (`document_ends`), and otherwise uniform chunks of `chunk_tokens`,
+        or for a memory read the whole stream as one record."""
         if not self.supports(read):
             raise FileNotFoundError(
                 f"{self.describe()} needs its producer length index; "
@@ -1097,16 +1128,27 @@ class TokenFiles:
             )
         if read == "memory" and isinstance(self.tokens, TokenRecords):
             self.tokens.materialize_lengths()
+        ends = self.document_ends()
+        if ends is not None:
+            return _TokenDocuments(self.tokens, ends)
         if read == "memory":
             return ({"text": self.tokens[:].astype(np.int32)},)
         return _TokenChunks(self.tokens, self.chunk_tokens)
 
+    def document_ends(self) -> np.ndarray | None:
+        """Where each document ends in the token stream, each running through
+        its EOS, from the index provisioning builds; None without one."""
+        fs, path = self.document_index.resolve()
+        return np.asarray(self.mapped_documents.values, np.int64) if fs.exists(path) else None
+
     def manifest(self) -> ShardManifest:
         count = len(self.records("indexed"))
+        size = 1 if self.document_ends() is None else 1024
         return ShardManifest(
             tuple(
-                Shard(f"{self.url}:{self.split}:{index}", self.url, index, index + 1, 1)
-                for index in range(count)
+                Shard(f"{self.url}:{self.split}:{start}", self.url, start, min(start + size, count),
+                      min(size, count - start))
+                for start in range(0, count, size)
             ),
             self._read_shard,
         )
@@ -1115,7 +1157,23 @@ class TokenFiles:
         return grain.MapDataset.source(self.records("indexed"))[shard.start : shard.stop].to_iter_dataset()
 
     def lengths(self) -> np.ndarray | None:
-        return None
+        ends = self.document_ends()
+        return None if ends is None else np.diff(ends, prepend=0)
+
+
+@dataclass(frozen=True)
+class _TokenDocuments:
+    """A token store's documents by index, each the span its index names."""
+
+    tokens: TokenBytes | TokenRecords | TokenShards
+    ends: np.ndarray
+
+    def __len__(self) -> int:
+        return len(self.ends)
+
+    def __getitem__(self, index: int) -> Batch:
+        start = int(self.ends[index - 1]) if index else 0
+        return {"text": self.tokens[start : int(self.ends[index])].astype(np.int32)}
 
 
 @dataclass(frozen=True)

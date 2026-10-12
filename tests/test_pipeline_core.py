@@ -594,6 +594,31 @@ def test_the_saved_order_names_the_stages_a_memory_read_ran_as_an_indexed_read_d
     assert orders[0] == orders[1] and orders[0][0].startswith("Pack(")
 
 
+def test_an_indexed_pack_over_a_token_store_reads_its_planned_global_windows(tmp_path):
+    """A token store with its document index built packs by the plan of its
+    documents' lengths: the indexed order is global, and its windows are the
+    ones a memory read packs from the same documents."""
+    from dew.data.sources.files import TokenFiles
+
+    documents = [np.append(np.full(size, index + 1), 0).astype(np.int32)
+                 for index, size in enumerate((5, 3, 9, 2, 7, 4, 6, 1))]
+    (tmp_path / "train.bin").write_bytes(np.concatenate(documents).astype(np.uint16).tobytes())
+    (tmp_path / "meta.json").write_text(json.dumps({
+        "tokenizer": "byte", "dtype": "uint16", "vocab_size": 256, "eos_id": 0,
+        "train_tokens": sum(len(document) for document in documents)}))
+    store = TokenFiles(str(tmp_path)).provision()
+
+    def windows(pipeline, read):
+        rows = iterate(pipeline.pack(8, bins=2), read=read, loading=READ)
+        return [{name: np.asarray(value).tolist() for name, value in row.items() if name[:5] != "_dew_"}
+                for row in rows]
+
+    lowering = compile(Pipeline(store).pack(8, bins=2).batch(2), read="indexed", loading=READ).plan.lowering
+    assert lowering == "global"
+    memory = Pipeline(Memory([{"text": document} for document in documents]))
+    assert windows(Pipeline(store), "indexed") == windows(memory, "memory")
+
+
 def test_a_memory_read_counts_valid_targets_where_it_packs():
     """Windows are kept by their own targets, however a later step lays them
     out: the one-token document's window has none and is left out."""
