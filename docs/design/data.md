@@ -1,6 +1,6 @@
 # Data in Dew: one chain, plain functions, Grain underneath
 
-Design record, 2026-10-12. This is the binding design for Dew's data API. The code blocks show the target API; the [status table](#9-status) at the end says what is built and what is planned. The working implementation lives on the `feat/data-fetch` branch.
+Design record, 2026-10-12. This is the binding design for Dew's data API. The code blocks show the target API; the [status table](#10-status) at the end says what is built and what is planned. The working implementation lives on the `feat/data-fetch` branch.
 
 ## 0. The idea in one paragraph
 
@@ -45,7 +45,7 @@ Three types, six function shapes.
 | `Predicate` | `(r) -> bool` | `filter` | 0 or 1 |
 | `TryFn` | `(r) -> r \| Rejected` | `filter_map` | 0 or 1, with a reason |
 | `ExpandFn` | `(r) -> Iterable[r]` (finite) | `flat_map` | any |
-| `DatasetFn` | `(Dataset) -> Dataset` | `pipe` | any |
+| `DatasetFn` | `(Dataset, *settings) -> Dataset` | `pipe(fn, *settings)` | any |
 
 ```mermaid
 flowchart TD
@@ -82,13 +82,13 @@ Preparing a Hub dataset happens on first use, with one log line naming what is p
 | Group | Verbs |
 |---|---|
 | Per record | `map`, `random_map`, `filter`, `filter_map`, `flat_map`; `map` and `flat_map` also take `batched=True, batch_size=k` |
-| Reuse | `pipe(fn)` for your own `Dataset -> Dataset` functions; `grain(fn)` for any Grain operation Dew doesn't name |
+| Reuse | `pipe(fn, *args, **kwargs)` for [presets](#5-presets) and your own `Dataset -> Dataset` functions; `grain(fn)` for any Grain operation Dew doesn't name |
 | Columns | `rename_columns({"old": "new"})`, `select_columns(*names)`, `remove_columns(*names)` (Hugging Face's names) |
 | Other | `take(n)`, `named(name)` |
 | Sequence | `pack(seq_len, fields=, ...)` forwards Grain's packer options; `text.chunk(length, overlap=)` cuts long documents first |
 | Order | `shuffle(seed=, window=)`, `repeat(epochs=)` |
 | Combine | `mix(datasets, weights=, by="records" \| "tokens", stop=)`, `concat(datasets)`, `interleave(datasets, cycle_length=)`, `schedule([(dataset, tokens), ...])` |
-| Split | `holdout(0.01)`, `holdout(val=, test=)`, `holdout(records=)`, `holdout(split=)`, each with `key=` |
+| Split | `holdout(0.01)`, `holdout(val=, test=)`, `holdout(records=)`, `holdout(split="validation" | ("validation", "test"))`, each with `key=` |
 | Batch | `batch(n)`, the global training batch; a `map` after it receives the whole batch |
 | Persist | `cache(url)` (write-through accelerator), `snapshot(url)` (a terminal job that seals an immutable generation, read back with `Files(url)`) |
 | Execution | `workers(n)`, `threads(n)`, `prefetch(n)`, `read(mode)` |
@@ -145,6 +145,19 @@ ds = (Files("gs://bucket/laion/*.array_record")
         .random_map(images.albumentations(aug))    # seeded per record: reproducible and resumable
         .random_map(text.drop("caption", p=0.1)))  # caption dropout for guidance
 ```
+
+### Augmenting on the GPU
+
+```python
+ds = (Files("gs://bucket/laion/*.array_record")
+        .filter_map(images.decode())
+        .map(images.resize(256))
+        .random_map(images.augmentation_key())                      # each record draws its own key
+        .batch(512)
+        .map(images.device_augment(256, crop_scale=(0.6, 1), jitter=True)))   # crop, flip, colour on the GPU
+```
+
+The host only decodes and resizes. The accelerator crops, flips and colour-jitters each batch, each image by the key its record drew, so the result is the same on every worker count and after a resume. On an 8-vCPU host this reads about 2.4× the images per second that host-side augmentation reads (512×384 JPEGs to 256 crops).
 
 ### Several sources, one downloaded on the fly
 
@@ -233,12 +246,11 @@ web = Files("s3://tokens/v3/web/")                 # training reads it back
 clips = (Files("gs://av/catalog.parquet")
            .filter_map(video.fetch())
            .random_map(video.pick_clip(seconds=2.0))       # writes one start/stop descriptor
-           .filter_map(video.decode(frames=32, fps=16))    # reads the descriptor
-           .filter_map(audio.decode(sample_rate=16_000))   # reads the same descriptor
-           .map(audio.features(processor)))
+           .filter_map(video.decode(frames=32, fps=16, size=256))            # reads the descriptor
+           .filter_map(audio.decode(sample_rate=16_000, missing="silence")))  # reads the same descriptor
 ```
 
-Both decoders read one clip descriptor, so the frames and the waveform cover the same time window.
+Both decoders read one clip descriptor, so the frames and the waveform cover the same time window. With `missing="silence"`, a clip without sound gets a zero waveform and `audio_valid` false; the default, `"reject"`, drops it. Audio features come from the model's audio conditioner, not from a data step.
 
 ### Grain, Hugging Face, PyTorch and iterators, unchanged
 
@@ -250,7 +262,83 @@ ds = from_iter(lambda: wds.WebDataset(urls), state=..., load_state=...)
 ds = ds.grain(lambda d: grain.experimental.ZipIterDataset([d, other]))   # any Grain op
 ```
 
-## 5. Workers and parallelism
+## 5. Presets
+
+A preset is a ready chain for one common job, built only from the steps on this page. It is a plain `DatasetFn`: a function that takes a dataset, then its settings, and returns a dataset. `pipe` passes the settings through, so the built-in presets and your own have one shape. Each built-in ends in `batch`, so its result goes straight to `fit`. `show()` lists the steps a preset expanded to.
+
+```python
+from dew.data import TFDS, presets
+
+train, val = TFDS("oxford_flowers102", path=data_path).holdout(split="validation")
+trainer.fit(train.pipe(presets.images, 64, batch=16, augment=True),
+            validation=val.pipe(presets.images, 64, batch=16),
+            steps=1000)
+```
+
+Training and validation use the same preset, so both are prepared the same way. Augmentation is off unless you ask for it, so a validation split never gets it by accident. There are no train or eval variants. Presets live in `dew.data.presets`; `images`, `text`, `chat`, `video` and `audio` hold only steps.
+
+| Preset | Reads per record | Writes per batch |
+|---|---|---|
+| `images(ds, size, *, batch, augment=False, crop_scale=(1, 1), cache=None)` | `image`: encoded bytes or uint8 `[H, W, 3]` | `image` uint8 `[B, size, size, 3]` |
+| `lm(ds, tokenizer, *, seq_len, batch, field="text", cache=None)` | `text`: a string | `text`, `text_segment_ids`, `text_positions`: int32 `[B, seq_len + 1]` |
+| `sft(ds, tokenizer, *, seq_len, batch, cache=None)` | `messages`: chat turns | the `lm` fields and `text_roles` int32 `[B, seq_len + 1]` |
+| `clips(ds, seconds, *, frames, fps, size, batch, sample_rate=None)` | `mp4`: bytes | `video` uint8 `[B, frames, size, size, 3]`; with `sample_rate`, `audio` float32 `[B, samples]` and `audio_valid` bool `[B]` |
+
+- A `lm` or `sft` row holds `seq_len` inputs and their next-token targets.
+- `images` and `clips` pass every other field through, stacked per batch: `label` becomes `[B]`, `caption` a list of `B` strings.
+- `lm` and `sft` pack several documents into one row, so a per-document field has no row to land in. They keep only the fields they write. To pack a per-token field of your own along, write the chain with `pack(fields=)`.
+- `augment=True` crops to `crop_scale` of the area, flips and colour-jitters on the accelerator, as in [Augmenting on the GPU](#augmenting-on-the-gpu). `augment=` also takes your own random step, such as `images.albumentations(aug)`, which runs on the host right after the resize.
+- `cache=url` caches the preset's fixed steps (decode and resize, or tokenize). Augmentation, packing and batching run after the cache.
+
+### Where the rest of the chain goes
+
+| You want | Where it goes |
+|---|---|
+| `shuffle`, `mix`, `interleave`, `filter`, `take`, your own `map`s | Before the preset. They act on records. |
+| Augmentation | `augment=` on the training split's preset |
+| `workers`, `threads`, `prefetch` | After the preset. They set how the chain up to that point runs, so the preset's decode, resize, pack and batch run in the workers. |
+| A function on whole batches | After the preset. A `map` after `batch` runs last, in the training process; the GPU augmentation is one. |
+| `snapshot` | A separate job before training, read back with `Files(url)` |
+
+```python
+data = (train.shuffle(seed=0)
+             .pipe(presets.images, 256, batch=64, augment=True, cache="gs://cache/photos")
+             .workers(16)
+             .prefetch(4))
+```
+
+### One preparation, then the splits
+
+`holdout` assigns each record by its source identity, wherever it sits in the chain. Write the shared steps once, then split; each part keeps them.
+
+```python
+from dew.data import Hub, images, presets
+
+photos = (Hub("user/photos", columns=["jpg", "caption", "id"])
+            .filter_map(images.decode())                     # shared by every split
+            .filter(images.min_side(256))
+            .map(images.caption("a photo of {caption}")))
+train, val, test = photos.holdout(val=0.01, test=0.01, key="id")
+
+trainer.fit(train.pipe(presets.images, 256, batch=64, augment=True),
+            validation=val.pipe(presets.images, 256, batch=64))
+```
+
+A dataset with named splits works the same way: `train, val, test = flowers.holdout(split=("validation", "test"))` returns the source's own split (`train` by default), then each named split in order.
+
+### Your own preset
+
+A preset of your own is a plain function, and it can build on a built-in one:
+
+```python
+def flowers(ds, size, *, batch, augment=False):
+    return (ds.map(images.caption("a photo of a {label}", classes=FLOWER_NAMES))
+              .pipe(presets.images, size, batch=batch, augment=augment))
+
+train.pipe(flowers, 64, batch=16, augment=True)
+```
+
+## 6. Workers and parallelism
 
 ```python
 ds = (Files("gs://data/laion/*.array_record").threads(32)   # read parallelism at the source
@@ -264,9 +352,9 @@ ds = (Files("gs://data/laion/*.array_record").threads(32)   # read parallelism a
 trainer.fit(ds, device_prefetch=2)                            # batches already placed on the GPUs
 ```
 
-`.workers(n)` splits the chain where you put it: heavy decoding and augmentation go before it, cheap work after. Settings are per host. For streamed data, worker and interleave counts are part of the checkpoint and stay fixed on resume. Defaults are fixed numbers today; they will be measured against step time, so you set these only to take control.
+`.workers(n)` splits the chain where you put it: heavy decoding and augmentation go before it, cheap work after. Settings are per host. For streamed data, worker and interleave counts are part of the checkpoint and stay fixed on resume. Defaults are fixed numbers today; they will be measured against step time, so you set these only to take control. A `map` after `batch` always runs last, in the training process, so a GPU step never runs in a worker.
 
-## 6. Training on a mesh
+## 7. Training on a mesh
 
 ```python
 mesh = jax.make_mesh((32, 8), ("fsdp", "tensor"))     # or MeshSpec(fsdp=32, tensor=8)
@@ -286,7 +374,7 @@ flowchart TB
 
 `batch(n)` is the global batch. Each host reads only its share, derived from the mesh's data-parallel axes (the `activation_batch` rule); devices in one tensor, sequence or stage group read the same rows. The memory planner picks micro-batches, so the same `batch(1024)` works on 8 GPUs or 256. The checkpoint stores each share's data position: a restart on the same mesh is exact; a different host count needs elastic resume (planned).
 
-## 7. Exactness, caching and snapshots
+## 8. Exactness, caching and snapshots
 
 ```mermaid
 flowchart TD
@@ -302,16 +390,18 @@ flowchart TD
 - `snapshot(url)` seals an immutable generation, including fetch outcomes and dedup results. A run that pins it resumes exactly.
 - Random stages draw from per-record keys, so augmentation is the same on every thread count and after a resume. Libraries with global RNG state (torchvision, albumentations) run through adapters that make seed and call one transaction.
 
-## 8. Performance
+## 9. Performance
 
 The chain lowers one stage per Grain operator. On top of that, Dew fuses adjacent per-record stages into one transform, pushes `where=` predicates into the Parquet reader, and runs `batched=True` maps column-wise. The target is to beat plain Grain on every workload; each gate is published with its measurement. Measured today: planned text packing is 0.929× plain Grain on an A100, images 0.91 to 1.04×, and online CC3M fetch 45.5 images/s against 42.7 for the old loader.
 
-## 9. Status
+## 10. Status
 
 | Area | Status |
 |---|---|
 | `Dataset` chain, sources, `map`/`random_map`/`filter`/`filter_map`/`flat_map`, `mix([..], weights=)`, `holdout`, `concat`, `named`, `pipe`, `show` | Built on `feat/data-fetch` (verb names being aligned to this page) |
-| `images.fetch`/`decode`, albumentations and torchvision adapters, `video.fetch`/`decode_clip` | Built; the AV clip descriptor is being redesigned |
+| `images.fetch`/`decode`, albumentations and torchvision adapters, `images.augmentation_key`/`device_augment` | Built |
+| `video.pick_clip`/`decode`, `audio.decode` on one clip descriptor | Being built (replaces `video.decode_clip` and `video.audio`) |
+| `dew.data.presets` (`images`, `lm`, `sft`, `clips`), `holdout(split=)` with several names, steps passing unread fields through | Being built |
 | `fit(data, validation=, steps=/epochs=/tokens=)` | Built |
 | HF column verbs, `grain()`, `from_iter`, `map(batched=True)`, `mix(by=, stop=)` keyed members, `schedule` in tokens, `snapshot`, `text.chunk`, `stats` | Planned |
 | Elastic resume, `text.decontaminate`, `text.dedup_minhash`, language and quality filters, fusion, measured defaults, GPU decode | Planned |
