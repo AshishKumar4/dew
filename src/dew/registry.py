@@ -1199,6 +1199,8 @@ towers: Aliases[type[TowerBase], TowerBase] = Aliases("tower", {
     "gemma4": "dew.nn.vision.gemma4:Gemma4Vision",
     "gemma4_audio": "dew.nn.audio:Gemma4Audio",
     "llama4": "dew.nn.vision.llama4:Llama4Vision",
+    "mimo": "dew.nn.vision.mimo:MiMoVision",
+    "muse_glimmer": "dew.nn.vision.muse_glimmer:MuseGlimmerVision",
     "qwen3_5": "dew.nn.vision.qwen35:Qwen35Vision",
     "siglip": "dew.nn.vision.siglip:SiglipVision",
 }, base="dew.nn.vision.common:TowerBase")
@@ -1208,6 +1210,8 @@ projectors: Aliases[type[ProjectorBase], ProjectorBase] = Aliases("projector", {
     "gemma3n": "dew.nn.vision.gemma3n:Gemma3nProjector",
     "gemma4": "dew.nn.vision.gemma4:Gemma4Projector",
     "llama4": "dew.nn.vision.llama4:Llama4Projector",
+    "mimo": "dew.nn.vision.mimo:MiMoProjector",
+    "muse_glimmer": "dew.nn.vision.muse_glimmer:MuseGlimmerProjector",
     "qwen3_5": "dew.nn.vision.qwen35:Qwen35Projector",
 }, base="dew.nn.vision.common:ProjectorBase")
 schedules: Aliases[type[ScheduleBase], ScheduleBase] = Aliases("schedule", {

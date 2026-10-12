@@ -81,11 +81,21 @@ from .llama4 import (
     Llama4VisionTransformer as Llama4VisionTransformer,
     llama4_vision_path,
 )
+from .mimo import (
+    MiMoProjector as MiMoProjector,
+    MiMoVision as MiMoVision,
+    mimo_vision_path,
+    translate_mimo_vision_weights,
+)
+from .muse_glimmer import (
+    MuseGlimmerProjector as MuseGlimmerProjector,
+    MuseGlimmerProjectorModule as MuseGlimmerProjectorModule,
+    MuseGlimmerVision as MuseGlimmerVision,
+    muse_glimmer_vision_path,
+)
 from .qwen35 import (
     Qwen35Projector as Qwen35Projector,
-    Qwen35ProjectorModule as Qwen35ProjectorModule,
     Qwen35Vision as Qwen35Vision,
-    Qwen35VisionTransformer as Qwen35VisionTransformer,
     qwen35_vision_path,
     translate_qwen35_vision_weights,
 )
@@ -97,17 +107,27 @@ from .siglip import (
     siglip_vision_path,
     translate_gemma_projector_weights,
 )
+from .vit import (
+    MergeProjector as MergeProjector,
+    VisionTransformer as VisionTransformer,
+    ViTLayout as ViTLayout,
+)
 
 # Where each tower and projector kind's tensors sit in a media checkpoint, and
 # the translators that read them.
 TOWER_PREFIX = {"siglip": "vision_tower.", "llama4": "vision_model.", "gemma4": "vision_tower.",
-                "qwen3_5": "visual.", "gemma3n": "vision_tower.", "deepseek_v41": "vision."}
-PROJECTOR_PREFIX = {"gemma": "multi_modal_projector.", "llama4": "multi_modal_projector.",
-                    "gemma4": "embed_vision.", "qwen3_5": "visual.merger.", "gemma3n": "embed_vision.",
-                    "deepseek_v41": "aligner."}
+                "qwen3_5": "visual.", "gemma3n": "vision_tower.", "deepseek_v41": "vision.",
+                "mimo": "visual.", "muse_glimmer": "vision_tower."}
+PROJECTOR_PREFIX: dict[str, str | tuple[str, ...]] = {
+    "gemma": "multi_modal_projector.", "llama4": "multi_modal_projector.", "gemma4": "embed_vision.",
+    "qwen3_5": "visual.merger.", "gemma3n": "embed_vision.", "deepseek_v41": "aligner.",
+    "mimo": "visual.merger.", "muse_glimmer": ("vision_adapter.", "vision_projection.")}
+"""Where each projector kind's tensors sit: one prefix, or several whose tensors each keep the name
+past their own."""
 TOWER_PATHS: dict[str, Callable[[str], tuple[str, ...] | None]] = {
     "siglip": siglip_vision_path, "llama4": llama4_vision_path, "gemma4": gemma4_vision_path,
-    "qwen3_5": qwen35_vision_path, "gemma3n": gemma3n_vision_path, "deepseek_v41": deepseek_v41_vision_path}
+    "qwen3_5": qwen35_vision_path, "gemma3n": gemma3n_vision_path, "deepseek_v41": deepseek_v41_vision_path,
+    "mimo": mimo_vision_path, "muse_glimmer": muse_glimmer_vision_path}
 # Qwen 3.5's tower reshapes its patch convolution, and three projectors check
 # their tensors; every other map reads one tensor to one leaf.
 _PROJECTOR_WEIGHTS: dict[str, Callable[..., Variables]] = {
@@ -121,6 +141,8 @@ def tower_variables(kind: str, hf_tensors: Mapping[str, np.ndarray], param_dtype
     """One vision tower's variables, in the requested storage."""
     if kind == "qwen3_5":
         return {"params": translate_qwen35_vision_weights(hf_tensors, param_dtype=param_dtype)}
+    if kind == "mimo":
+        return {"params": translate_mimo_vision_weights(hf_tensors, param_dtype=param_dtype)}
     if kind not in TOWER_PATHS:
         raise ValueError(f"tower kind {kind!r} has no weight map here")
     tree = translate_parameters(hf_tensors, TOWER_PATHS[kind], param_dtype)
