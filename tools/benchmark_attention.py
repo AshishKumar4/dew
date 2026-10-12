@@ -26,7 +26,6 @@ Usage:
 """
 
 import contextlib
-import importlib
 import json
 import statistics
 from dataclasses import dataclass
@@ -34,6 +33,7 @@ from typing import Optional
 
 import jax
 import jax.numpy as jnp
+import tokamax
 import tyro
 
 from dew.nn.kernels.tuning import samples
@@ -78,9 +78,6 @@ def attention_fn(implementation: str, config: BenchmarkConfig, causal: bool, dty
     from dew.nn.attention import scaled_dot_product_attention
     window, softcap = config.sliding_window, config.softcap
     if implementation == 'triton':
-        # tokamax is not a dependency (docs/concepts/moe.md), so it is
-        # imported at the call.
-        tokamax = importlib.import_module('tokamax')
         local = None if window is None else (window - 1, 0)
         return lambda q, k, v: tokamax.dot_product_attention(
             q, k, v, is_causal=causal, local_window_size=local,
@@ -114,9 +111,8 @@ def measure(case: dict, config: BenchmarkConfig) -> dict:
     reason; the row is part of the answer, not an error. jax raises
     NotImplementedError for a shape its cudnn checks refuse, a
     JaxRuntimeError when the materialized logits do not fit in memory or a
-    Pallas kernel exceeds the card's shared memory, and ImportError when
-    tokamax is not installed. A forward that runs but a backward that does
-    not is a served row with `backward_reason`.
+    Pallas kernel exceeds the card's shared memory. A forward that runs but a
+    backward that does not is a served row with `backward_reason`.
     """
     seq, head_dim = case['sequence_length'], case['head_dim']
     heads = max(1, TOKEN_HEAD_BUDGET // (seq * case['batch_size']))
