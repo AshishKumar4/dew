@@ -281,7 +281,8 @@ def test_packed_documents_run_as_if_each_ran_alone(reference, geometry):
     cuts = [0, 20, 22, 70]
     segments = jnp.asarray(np.repeat(np.arange(1, 4), np.diff(cuts))[None], jnp.int32)
 
-    packed = module.apply(variables, hidden, segment_ids=segments)
+    packed = module.apply(variables, hidden,
+                          attention_metadata=AttentionMetadata(coordinates=coordinates(segments=segments)))
     alone = jnp.concatenate([module.apply(variables, hidden[:, start:end])
                              for start, end in itertools.pairwise(cuts)], axis=1)
 

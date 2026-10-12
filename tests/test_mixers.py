@@ -200,7 +200,8 @@ def packed_and_alone(model, variables, tokens, cotangent):
 
 
 KIND_FIELDS = {"mlp": ({"intermediate_size": 64}, {}), "llama4": ({}, {"qk_norm": False}),
-               "deepseek_v4": ({}, {"kinds": {"full_attention": LayerKind(window=8)}})}
+               "deepseek_v4": ({"rope_head_dim": 8, "index_head_dim": 8},
+                               {"kinds": {"full_attention": LayerKind(window=8)}})}
 """The fields a kind needs beyond its defaults to build in `tiny`: its own, then the model's."""
 
 REFUSED = {"kpool_sparse_attention": "a packed row of documents"}

@@ -1653,6 +1653,9 @@ class CausalTransformer(nn.Module):
           packer's `max_segments`); where None they are built here from
           `segment_ids`, `attention_mask`, `positions` and `right_padded`.
         """
+        if coordinates is not None and coordinates.segments is not None:
+            # Attention still reads the documents and their positions as fields of its own.
+            segment_ids, positions = coordinates.segments, coordinates.positions
         attention_metadata = self._attention_metadata(
             tokens, decode, positions, segment_ids, attention_mask, image_groups, rotary_positions,
             attention_pairwise_mask, attention_key_positions, media_mask, admitted, right_padded,
