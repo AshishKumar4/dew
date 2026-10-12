@@ -23,13 +23,18 @@ def _objective(bucket=None):
 
 
 @pytest.mark.parametrize("bucket", [None, 16])
-def test_decision_branches_keep_labels_aligned_with_option_order_and_cut_only_training(bucket):
+def test_decision_branches_keep_labels_aligned_with_option_order_and_cut_both_alike(bucket):
     examples = [Example(f"state {index}", {"class": Choice("Pick", ["yes", "no"])}, {"class": index % 2})
                 for index in range(40)]
     objective = _objective(bucket)
     recipe = Decisions(examples, validation=examples[:5])
     ours = load(recipe, batch=4, read="memory", objective=objective.data(),
                 seed=7, loading=READ)
+
+    def width(batch) -> int:
+        longest = int(batch["valid"].sum(axis=1).max())
+        return 128 if bucket is None else min(128, -(-longest // bucket) * bucket)
+
     reader = ours.train(DataPartition())
     try:
         for batch in itertools.islice(reader, 8):
@@ -40,15 +45,13 @@ def test_decision_branches_keep_labels_aligned_with_option_order_and_cut_only_tr
                 index = int(matched[1])
                 order = ("yes", "no") if text.index("yes") < text.index("no") else ("no", "yes")
                 assert order[int(labels[0])] == ("yes" if index % 2 == 0 else "no")
-            if bucket is not None:
-                longest = int(batch["valid"].sum(axis=1).max())
-                assert batch["tokens"].shape[1] == min(128, -(-longest // bucket) * bucket)
+            assert batch["tokens"].shape[1] == width(batch)
     finally:
         reader.close()
     held = ours.val(DataPartition())
     try:
         batch = next(held)
-        assert batch["tokens"].shape[1] == 128
+        assert batch["tokens"].shape[1] == width(batch)
         np.testing.assert_array_equal(batch["labels"][:, 0], [0, 1, 0, 1])
     finally:
         held.close()
