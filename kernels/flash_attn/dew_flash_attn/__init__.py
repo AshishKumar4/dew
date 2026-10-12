@@ -1,26 +1,42 @@
-"""FlashAttention-2 for JAX: Dao-AILab's CUDA kernels (BSD-3), through
-flash_attn_jax's XLA FFI port (BSD-3), as two FFI targets of a library with
-no Python ABI. `flash_mha` takes `[B, S, H, D]` bf16 or fp16 arrays, with
-grouped key heads, and `flash_mha_varlen` packed sequences `[T, H, D]` between
-cumulative offsets; both differentiate through the kernel's own backward."""
+"""FlashAttention for JAX: Dao-AILab's CUDA kernels (BSD-3) as FFI targets of
+libraries with no Python ABI. FlashAttention-2 comes through flash_attn_jax's
+XLA FFI port (BSD-3) and runs on sm8x and sm120; FlashAttention-3, Hopper's,
+comes through flash-attn3-jax's port (BSD-3) and runs on sm90. `flash_mha`
+takes `[B, S, H, D]` bf16 or fp16 arrays, with grouped key heads, and
+`flash_mha_varlen` packed sequences `[T, H, D]` between cumulative offsets;
+both run the kernel built for the device and differentiate through its own
+backward."""
 
 import ctypes
 import functools
 import math
+import re
 from pathlib import Path
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 
-_library = ctypes.cdll.LoadLibrary(str(Path(__file__).with_name("libdew_flash_attn.so")))
-_library.dew_flash_architectures.restype = ctypes.c_char_p
-ARCHITECTURES = tuple(f"sm{entry.split('-')[0]}"
-                      for entry in _library.dew_flash_architectures().decode().split(","))
-"""The GPU generations the library holds code for, as its build compiled them ('sm80', 'sm120')."""
+
+def _load(name: str, report: str) -> tuple[ctypes.CDLL, tuple[str, ...]]:
+    """The library and the GPU generations it reports holding code for, its build's CUDA
+    architectures ('80-real' is sm80, '90a-real' sm90)."""
+    library = ctypes.cdll.LoadLibrary(str(Path(__file__).with_name(name)))
+    getattr(library, report).restype = ctypes.c_char_p
+    entries = getattr(library, report)().decode().split(",")
+    return library, tuple(f"sm{re.match(r'[0-9]+', entry).group()}" for entry in entries)
+
+
+_library, _two = _load("libdew_flash_attn.so", "dew_flash_architectures")
+_library3, _three = _load("libdew_flash_attn3.so", "dew_flash3_architectures")
+ARCHITECTURES = _two + _three
+"""The GPU generations the libraries hold code for, as their builds compiled them ('sm80', 'sm90',
+'sm120')."""
 for _name in ("dew_flash_mha_fwd", "dew_flash_mha_bwd",
               "dew_flash_mha_varlen_fwd", "dew_flash_mha_varlen_bwd"):
     jax.ffi.register_ffi_target(_name, jax.ffi.pycapsule(getattr(_library, _name)), platform="CUDA")
+for _name in ("dew_flash3_mha_fwd", "dew_flash3_mha_bwd"):
+    jax.ffi.register_ffi_target(_name, jax.ffi.pycapsule(getattr(_library3, _name)), platform="CUDA")
 
 
 def _round(x: int, multiple: int) -> int:
@@ -30,6 +46,12 @@ def _round(x: int, multiple: int) -> int:
 @functools.cache
 def _multiprocessors() -> int:
     return jax.devices("gpu")[0].core_count
+
+
+@functools.cache
+def _hopper() -> bool:
+    """Whether the device runs FlashAttention-3, which is built for sm90 alone."""
+    return f"sm{jax.devices('gpu')[0].compute_capability.replace('.', '')}" in _three
 
 
 def _splits(work: int, slots: int, blocks: int) -> int:
@@ -111,6 +133,103 @@ def _attend_backward(scale, causal, residuals, grad):
 _attend.defvjp(_attend_forward, _attend_backward)
 
 
+def _absent(dtype):
+    """An operand FlashAttention-3's port reads as not given: it takes an empty buffer for each."""
+    return jnp.zeros((0,), dtype)
+
+
+def _forward3(query, key, value, starts, longest, scale, causal):
+    """FlashAttention-3's forward over `[B, S, H, D]` arrays, or over packed `[T, H, D]` ones between
+    `starts` (cumulative offsets, None for a batch) with sequences of at most `longest` tokens."""
+    q, k, v = _padded(query, key, value)
+    packed = starts is not None
+    heads = q.shape[-2]
+    lse = (heads, q.shape[0]) if packed else (q.shape[0], heads, q.shape[1])
+    offsets = starts if packed else _absent(jnp.int32)
+    queries = longest if packed else q.shape[1]
+    keys = longest if packed else k.shape[1]
+    out, lse, _, _ = jax.ffi.ffi_call("dew_flash3_mha_fwd", (
+        jax.ShapeDtypeStruct(q.shape, q.dtype),
+        jax.ShapeDtypeStruct(lse, jnp.float32),
+        jax.ShapeDtypeStruct((1, 1, 1, 1), jnp.float32),
+        jax.ShapeDtypeStruct((1, 1, 1), jnp.float32),
+    ))(q, k, v, _absent(q.dtype), _absent(q.dtype), _absent(q.dtype), offsets, offsets,
+       *(_absent(jnp.int32),) * 6, _absent(q.dtype), _absent(q.dtype), _absent(jnp.int32),
+       *(_absent(jnp.float32),) * 3, _absent(jnp.int32),
+       max_seqlen_q=np.int64(queries), max_seqlen_q_has_value=True, max_seqlen_k=np.int64(keys),
+       max_seqlen_k_has_value=True, softmax_scale_val=np.float64(scale), softmax_scale_has_value=True,
+       pack_gqa_val=False, pack_gqa_has_value=False, is_causal=causal, window_size_left=np.int64(-1),
+       window_size_right=np.int64(-1), attention_chunk=np.int64(0), softcap=np.float64(0.0),
+       is_rotary_interleaved=False, num_splits=np.int64(1), sm_margin=np.int64(0))
+    return out[..., :query.shape[-1]], lse
+
+
+def _backward3(grad, query, key, value, out, lse, starts, longest, scale, causal):
+    """FlashAttention-3's backward, whose key and value gradients come per key head."""
+    width = query.shape[-1]
+    g, q, k, v, o = _padded(grad, query, key, value, out)
+    packed = starts is not None
+    heads = q.shape[-2]
+    # Its scratch rows: each sequence's queries rounded up to the 128-row block, as the port's
+    # preprocess writes them.
+    if packed:
+        rows = _round(q.shape[0] + 128 * (starts.shape[0] - 1), 128)
+        scratch = (heads, rows)
+    else:
+        scratch = (q.shape[0], heads, _round(q.shape[1], 128))
+    offsets = starts if packed else _absent(jnp.int32)
+    queries = longest if packed else q.shape[1]
+    keys = longest if packed else k.shape[1]
+    dq, dk, dv, _, _ = jax.ffi.ffi_call("dew_flash3_mha_bwd", (
+        jax.ShapeDtypeStruct(q.shape, q.dtype),
+        jax.ShapeDtypeStruct(k.shape, q.dtype),
+        jax.ShapeDtypeStruct(v.shape, q.dtype),
+        jax.ShapeDtypeStruct(scratch, jnp.float32),
+        jax.ShapeDtypeStruct(scratch, jnp.float32),
+    ))(g, q, k, v, o, lse, offsets, offsets, _absent(jnp.int32), _absent(jnp.int32),
+       max_seqlen_q_val=np.int64(queries), max_seqlen_q_has_value=True, max_seqlen_k_val=np.int64(keys),
+       max_seqlen_k_has_value=True, softmax_scale_val=np.float64(scale), softmax_scale_has_value=True,
+       is_causal=causal, window_size_left=np.int64(-1), window_size_right=np.int64(-1),
+       softcap=np.float64(0.0), deterministic=False, sm_margin=np.int64(0))
+    return dq[..., :width], dk[..., :width], dv[..., :width]
+
+
+@functools.partial(jax.custom_vjp, nondiff_argnums=(3, 4))
+def _attend3(query, key, value, scale, causal):
+    return _forward3(query, key, value, None, None, scale, causal)[0]
+
+
+def _attend3_forward(query, key, value, scale, causal):
+    out, lse = _forward3(query, key, value, None, None, scale, causal)
+    return out, (query, key, value, out, lse)
+
+
+def _attend3_backward(scale, causal, residuals, grad):
+    return _backward3(grad, *residuals, None, None, scale, causal)
+
+
+_attend3.defvjp(_attend3_forward, _attend3_backward)
+
+
+@functools.partial(jax.custom_vjp, nondiff_argnums=(4, 5, 6))
+def _attend3_packed(query, key, value, starts, longest, scale, causal):
+    return _forward3(query, key, value, starts, longest, scale, causal)[0]
+
+
+def _attend3_packed_forward(query, key, value, starts, longest, scale, causal):
+    out, lse = _forward3(query, key, value, starts, longest, scale, causal)
+    return out, (query, key, value, out, lse, starts)
+
+
+def _attend3_packed_backward(longest, scale, causal, residuals, grad):
+    query, key, value, out, lse, starts = residuals
+    dq, dk, dv = _backward3(grad, query, key, value, out, lse, starts, longest, scale, causal)
+    return dq, dk, dv, np.zeros(starts.shape, jax.dtypes.float0)
+
+
+_attend3_packed.defvjp(_attend3_packed_forward, _attend3_packed_backward)
+
+
 def flash_mha(query, key, value, softmax_scale: float | None = None, is_causal: bool = False):
     """Attention of `query` over `key` and `value`, `[B, S, H, D]`, scaled by
     `softmax_scale` (1/sqrt(D) by default). A causal mask is aligned to the
@@ -122,7 +241,8 @@ def flash_mha(query, key, value, softmax_scale: float | None = None, is_causal: 
         raise ValueError(f"flash_mha takes key heads that divide the query's and heads up to 256 wide, "
                          f"not query {query.shape}, key {key.shape} and value {value.shape}")
     scale = 1.0 / math.sqrt(query.shape[-1]) if softmax_scale is None else softmax_scale
-    return _attend(query, key, value, float(scale), bool(is_causal))
+    attend = _attend3 if _hopper() else _attend
+    return attend(query, key, value, float(scale), bool(is_causal))
 
 
 def _varlen_forward(query, key, value, starts, longest, scale, causal):
@@ -196,4 +316,5 @@ def flash_mha_varlen(query, key, value, cu_seqlens, max_seqlen: int, softmax_sca
                          f"{value.shape}")
     scale = 1.0 / math.sqrt(query.shape[-1]) if softmax_scale is None else softmax_scale
     starts = jnp.asarray(cu_seqlens, jnp.int32)
-    return _attend_packed(query, key, value, starts, int(max_seqlen), float(scale), bool(is_causal))
+    attend = _attend3_packed if _hopper() else _attend_packed
+    return attend(query, key, value, starts, int(max_seqlen), float(scale), bool(is_causal))
