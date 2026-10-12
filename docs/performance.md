@@ -904,10 +904,11 @@ the numerics of the fp32 head, and the precision rule refuses it anyway.)
 Correction, 2026-09-22, checked against current main. The jitted `bookkeep`
 from the first class-1 row is on main (`src/dew/training/trainer.py`, called
 from `Trainer.fit`). The class-5 row about `objective.py:141` no longer
-matches the code. The diffusion objective encodes the unconditional prompt
-once, when it is built, and each step only casts that stored encoding to the
-batch's dtypes (`DiffusionObjective.blank_conditions` in
-`src/dew/objectives/diffusion/objective.py`).
+matches the code. Correction, 2026-10-12: each step encodes the unconditional
+prompt's one row with the step's own towers (`DiffusionObjective.blank_conditions`
+in `src/dew/objectives/diffusion/objective.py`), so a restored tree conditions
+both branches; the cached encoding it replaced was baked into the step from the
+towers the objective was built with.
 
 ### Comparison with PyTorch
 
