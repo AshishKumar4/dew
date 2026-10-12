@@ -301,24 +301,29 @@ def test_sampler_and_guidance_are_call_arguments(tmp_path):
                           pipe(["x"], steps=8, guidance=CFG(4.0), solver=Heun(), key=key).host().images)
 
 
-def test_another_guidance_scale_or_brownian_seed_reuses_the_compiled_walk(tmp_path):
-    """A request's CFG scale and a Brownian solver's seed are data to the image walk: another value
-    changes the sample and runs the program the first value compiled."""
+def test_another_guidance_scale_seed_or_grid_reuses_the_compiled_walk(tmp_path):
+    """A request's CFG scale, a Brownian solver's seed and an explicit grid's values are data to the
+    image walk: another value changes the sample and runs the program the first value compiled."""
     from dew.sampling import pipelines
 
     make_run(tmp_path)
     loaded = TextToImage.from_run(str(tmp_path))
     pipe = dataclasses.replace(loaded, variables=jax.tree.map(lambda leaf: leaf + 0.05, loaded.variables))
+    grid = np.asarray(pipe.process.times(8), np.float32)
+    nudged = grid.copy()
+    nudged[4] = 0.5 * (grid[3] + grid[4])
 
-    def draw(scale, seed):
-        return pipe(["x"], steps=8, guidance=CFG(scale), solver=DPMSolverSDE(seed=seed),
+    def draw(scale=4.0, seed=1, times=None):
+        prepared = pipe.prepare(["x"], key=0, steps=8, times=times)
+        return pipe(prepared, guidance=CFG(scale), solver=DPMSolverSDE(seed=seed),
                     key=jax.random.PRNGKey(1)).host().images
 
-    first = draw(4.0, 1)
+    first = draw(times=grid)
     compiled = pipelines._run(None)._cache_size()
-    assert not np.allclose(draw(2.0, 1), first)
-    assert not np.allclose(draw(4.0, 2), first)
-    assert np.array_equal(draw(4.0, 1), first)
+    for other in (draw(scale=2.0, times=grid), draw(seed=2, times=grid), draw(times=nudged)):
+        assert not np.allclose(other, first)
+    assert np.array_equal(draw(times=grid), first)
+    assert np.array_equal(draw(), first)
     assert pipelines._run(None)._cache_size() == compiled
 
 

@@ -706,10 +706,15 @@ class TextToImage:
         with region("inference.image"):
             assert prepared.rows is not None
             plan = RowPlan.over(mesh, prepared.rows)
-            generated = _run(plan.sharding)(self.model, process, self.autoencoder, self.finish, count,
-                                         self.final_denoise, times, decode, solver, chosen, self.variables,
-                                         prepared.conditions, prepared.unconditional,
-                                         prepared.noise, jax.random.fold_in(request, 1))
+            walk = jax.random.fold_in(request, 1)
+            # The grid is data, so the solver's state, whose checks and tables read its values, is built
+            # here from the concrete grid: the default one, a function of the step count, or the given one.
+            grid = jnp.asarray(process.times(count) if times is None else times, jnp.float32)
+            initial = solver.init(prepared.noise, grid, process, key=walk)
+            generated = _run(plan.sharding)(self.model, process, self.autoencoder, self.finish,
+                                         self.final_denoise, decode, solver, chosen, grid, initial,
+                                         self.variables, prepared.conditions, prepared.unconditional,
+                                         prepared.noise, walk)
         return replace(generated, rows=plan.rows)
 
 
@@ -831,20 +836,16 @@ def _noise(rows: jax.sharding.NamedSharding | None):
 @functools.cache
 def _run(rows: jax.sharding.NamedSharding | None):
     # Rebinding weights must not change the static compilation identity, nor a
-    # solver's or guidance's numbers: they are pytrees whose structure is static
-    # and whose numbers (a guidance scale, a Brownian seed) are data.
-    def run(model, process, autoencoder, finish, steps, final_denoise, times, decode,
-            solver, guidance, params, given, null, x_T, key):
+    # solver's or guidance's numbers, nor the grid's values: the solver and the
+    # guidance are pytrees whose structure is static and whose numbers (a
+    # guidance scale, a Brownian seed) are data, and the grid is data with the
+    # solver state the host built from it.
+    def run(model, process, autoencoder, finish, final_denoise, decode,
+            solver, guidance, times, initial, params, given, null, x_T, key):
         variables = {name: value for name, value in params.items() if name not in ("encoders", "autoencoder")}
         denoise = process.denoiser(model, variables, given, None if guidance is None else null)
-        with jax.ensure_compile_time_eval():
-            grid = None if times is None else jnp.asarray(times, jnp.float32)
-        if grid is None:
-            latents = sample(denoise, x_T, steps, solver=solver, guidance=guidance,
-                             key=key, final_denoise=final_denoise)
-        else:
-            latents = sample(denoise, x_T, solver=solver, guidance=guidance,
-                             key=key, times=grid, final_denoise=final_denoise)
+        latents = sample(denoise, x_T, solver=solver, guidance=guidance, key=key, times=times,
+                         initial=initial, final_denoise=final_denoise)
         if not decode:
             return Images(None, latents=latents)
         images = autoencoder.decode(params["autoencoder"], latents) if autoencoder is not None else latents
@@ -852,5 +853,5 @@ def _run(rows: jax.sharding.NamedSharding | None):
         if finish is not None:
             images = finish(params, images)
         return Images(images, latents=latents)
-    return jax.jit(run, static_argnums=(0, 1, 2, 3, 4, 5, 6, 7),
-                   in_shardings=(None, None, None, rows, None, rows, None), out_shardings=rows)
+    return jax.jit(run, static_argnums=(0, 1, 2, 3, 4, 5),
+                   in_shardings=(None, None, None, None, None, rows, None, rows, None), out_shardings=rows)
