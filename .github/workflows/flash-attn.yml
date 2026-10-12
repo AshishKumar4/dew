@@ -1,6 +1,8 @@
 # Builds kernels/flash_attn's wheels, FlashAttention-2 for JAX, for each CUDA
 # major, on the CUDA toolkit's own glibc-2.28 image; no GPU is needed to build.
-# The wheels are this run's artifacts.
+# The wheels are this run's artifacts. It runs for a release tag or by hand: a
+# build takes about an hour, so a kernel change builds its wheel on a GPU node
+# or the PC while its lane works, and a branch push builds none.
 #
 # A tag flash-attn-v<version> releases them: the build checks that the tag is
 # the version kernels/flash_attn/pyproject.toml carries and that both wheels
@@ -17,10 +19,7 @@ name: FlashAttention wheels
 
 on:
   push:
-    branches: [ "main", "ci/**" ]
-    # GitHub does not evaluate the paths below for a tag.
     tags: [ "flash-attn-v*" ]
-    paths: [ "kernels/flash_attn/**", ".github/workflows/flash-attn.yml" ]
   workflow_dispatch:
 
 permissions:
