@@ -174,13 +174,12 @@ def _backward3(grad, query, key, value, out, lse, starts, used, longest, scale, 
     width = query.shape[-1]
     g, q, k, v, o = _padded(grad, query, key, value, out)
     heads = q.shape[-2]
-    # Two scratch buffers whose rows the port lays out per sequence, each sequence's queries rounded
-    # up to the backward's row block, which it picks from 64, 80, 96 and 128 by width and mask:
-    # 128 rows a sequence more than its queries holds any of them.
-    if starts.size > 0:
-        scratch = (heads, q.shape[0] + 128 * starts.shape[0])
-    else:
-        scratch = (q.shape[0], heads, q.shape[1] + 128)
+    # Two scratch buffers of rows per head, each sequence's queries rounded up to the backward's row
+    # block, which the port picks from 64, 80, 96 and 128 by width and mask, and with lengths or
+    # offsets one block more over all of them: 128 rows a sequence and 128 more hold any layout.
+    tokens, sequences = (q.shape[0], starts.shape[0] - 1) if starts.size > 0 else (q.shape[0] * q.shape[1],
+                                                                                  q.shape[0])
+    scratch = (heads * (tokens + 128 * (sequences + 1)),)
     dq, dk, dv, _, _ = jax.ffi.ffi_call("dew_flash3_mha_bwd", (
         jax.ShapeDtypeStruct(q.shape, q.dtype),
         jax.ShapeDtypeStruct(k.shape, q.dtype),

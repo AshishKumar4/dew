@@ -871,11 +871,11 @@ def flash_refusal(query, key, causal=False, sliding_window=None, mask=None, bias
     or fp16 with heads a multiple of 8 up to 256 wide (192 on sm8x parts other
     than sm80, whose backward takes no wider), a causal call is square, the
     call has no window, mask, bias, softcap or sinks, its key lengths if any
-    are its only mask, without the causal one, on a GPU whose kernel takes
-    them (`flash_key_lengths`), no deterministic ops are asked for, which its
-    backward's atomic sum of the query gradient would not keep, and the
-    installed dew_flash_attn holds code for this GPU. `mask` excludes the key
-    lengths."""
+    are its only mask, without the causal one, over more than one query, on
+    a GPU whose kernel takes them (`flash_key_lengths`), no deterministic ops
+    are asked for, which its backward's atomic sum of the query gradient
+    would not keep, and the installed dew_flash_attn holds code for this
+    GPU. `mask` excludes the key lengths."""
     head_dim = query.shape[-1]
     generation = device_generation()
     architectures = flash_architectures()
@@ -891,6 +891,9 @@ def flash_refusal(query, key, causal=False, sliding_window=None, mask=None, bias
         (mask is None, "the call has a mask"),
         (key_lengths is None or (not causal and generation in flash_key_lengths()),
          "the call has key lengths, which its kernel here does not take, or a causal mask beside them"),
+        (key_lengths is None or query.shape[-3] > 1,
+         "a decode step's one query over its cache, which the wheel's FlashAttention-3 serves without "
+         "the split keys and packed heads it leaves out"),
         (bias is None, "the call has a bias"),
         (softcap is None, "the call has a logit softcap"),
         (sinks is None, "the call has attention sinks"),

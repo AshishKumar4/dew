@@ -8,8 +8,9 @@ is worth measuring at all: which kernel wins at this shape, forward-only and
 forward+backward.
 
 Four of the paths are the attention kernels the trainer can log for a GPU
-run: the flax reference einsum, xla, cudnn, and flash, FlashAttention-2 from
-the dew_flash_attn wheel on any sm8x part. The fifth, `triton`, is tokamax's
+run: the flax reference einsum, xla, cudnn, and flash, from the
+dew_flash_attn wheel: FlashAttention-3 on Hopper, FlashAttention-2 on sm8x
+and sm120. The fifth, `triton`, is tokamax's
 Pallas-Triton flash attention, called directly through
 `tokamax.dot_product_attention`; Dew has no route to it, and this tool is
 where the case for one is measured. Batch and head counts are picked so
