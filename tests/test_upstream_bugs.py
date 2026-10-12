@@ -1,9 +1,10 @@
 """The upstream bugs Dew works around, each reproduced as it behaves on the
 installed jax and jaxlib.
 
-Each test asserts the right behaviour and is marked xfail(strict=True). While
-the bug stands the test fails, and the suite passes; the release that fixes it
-makes the test pass, which fails the suite and names the workaround to delete.
+Each test asserts the right behaviour and is marked xfail(strict=True) where
+the bug reproduces. While the bug stands the test fails, and the suite passes;
+the release that fixes it makes the test pass, which fails the suite and names
+the workaround to delete.
 Only the bug's own symptom counts as the expected failure (`assert_fixed`):
 any other outcome raises an error that no xfail excuses. A repro that can
 crash its process runs in a fresh interpreter, where a crash is an outcome.
@@ -192,17 +193,35 @@ except Exception as failure:
 """
 
 
+GROWING_POOL_KEEPS_FREED_REGIONS = {"sm80": True, "sm89": False, "sm90": True, "sm120": False}
+"""Where openxla/xla#50052 reproduces, by CUDA generation (`device_generation`),
+as A_FREED_POOL measured it on jax and jaxlib 0.11.2, 2026-10-12. An A100-SXM4-40GB
+(sm80, jax-cuda12-pjrt, driver 570.148.08), an H100 PCIe (sm90, cuda12, 570.148.08) and
+an H100 80GB HBM3 (sm90, cuda13, 580.105.08) kept the freed region: RESOURCE_EXHAUSTED at
+4.74 and 9.50 GiB. An RTX 4080 (sm89, cuda12, 595.84) and the G4's RTX PRO 6000
+Blackwell (sm120, cuda13) allocated. A generation not measured is skipped until it is."""
+
+
 @CUDA
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason=(
-    "openxla/xla#50052: when this passes, a growing pool returns the regions it freed, so a "
-    "process that compiles a step and one that loads it find the same memory, and "
-    "dew.training.rungs need not record the rung"))
-def test_a_growing_pool_holds_a_larger_buffer_once_the_smaller_is_freed():
+def test_a_growing_pool_holds_a_larger_buffer_once_the_smaller_is_freed(request):
     """With XLA_PYTHON_CLIENT_PREALLOCATE=false the allocator pool grows a
     region for an allocation no free chunk holds and never gives a free region
     back, so a buffer of 0.6 of the limit fails once one of 0.45 was freed,
     with nothing in use. The limit is a fifth of the device, beside what the
-    suite's own process holds."""
+    suite's own process holds. The bug is expected where it was measured
+    (`GROWING_POOL_KEEPS_FREED_REGIONS`), and the release that fixes it there
+    fails the suite."""
+    from dew.nn.kernels.generation import device_generation
+
+    generation = device_generation()
+    if generation not in GROWING_POOL_KEEPS_FREED_REGIONS:
+        pytest.skip(f"openxla/xla#50052 is not measured on {generation}: run A_FREED_POOL there and "
+                    "add it to GROWING_POOL_KEEPS_FREED_REGIONS")
+    if GROWING_POOL_KEEPS_FREED_REGIONS[generation]:
+        request.applymarker(pytest.mark.xfail(strict=True, raises=AssertionError, reason=(
+            "openxla/xla#50052: when this passes, a growing pool returns the regions it freed, so a "
+            "process that compiles a step and one that loads it find the same memory, and "
+            "dew.training.rungs need not record the rung")))
     said = outcome(A_FREED_POOL, JAX_PLATFORMS="cuda", XLA_PYTHON_CLIENT_PREALLOCATE="false",
                    XLA_PYTHON_CLIENT_MEM_FRACTION="0.2")
     assert_fixed(said, "allocated", "RESOURCE_EXHAUSTED")
