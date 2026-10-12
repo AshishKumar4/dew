@@ -186,16 +186,21 @@ def test_tokamax_takes_the_calls_it_takes_before_flash(monkeypatch, generation, 
     assert chosen == ['triton', 'flash']
 
 
-WHEEL = ("sm80", "sm120")
-"""The architectures dew_flash_attn 0.1.1 reports."""
+WHEEL = ("sm80", "sm90", "sm120")
+"""The architectures dew_flash_attn 0.2.0 reports."""
+
+BEFORE_HOPPER = ("sm80", "sm120")
+"""The architectures dew_flash_attn 0.1.1 reports, without FlashAttention-3."""
 
 
 @pytest.mark.parametrize("generation, architectures, built", [
     ("sm80", WHEEL, True), ("sm86", WHEEL, True), ("sm89", ("sm80",), True), ("sm120", WHEEL, True),
-    ("sm120", ("sm80",), False), ("sm90", WHEEL, False), ("sm100", WHEEL, False)])
+    ("sm120", ("sm80",), False), ("sm90", WHEEL, True), ("sm90", BEFORE_HOPPER, False),
+    ("sm100", WHEEL, False)])
 def test_flash_runs_where_the_installed_wheel_holds_code_for_the_gpu(generation, architectures, built):
-    """FlashAttention-2 runs on a GPU the installed wheel's own architectures cover, an 8.x part
-    running sm80's code: 0.1.0's sm80 alone leaves an RTX PRO 6000 (sm120) to the other kernels."""
+    """FlashAttention runs on a GPU the installed wheel's own architectures cover, an 8.x part
+    running sm80's code: 0.1.0's sm80 alone leaves an RTX PRO 6000 (sm120) to the other kernels,
+    and 0.1.1's a Hopper part."""
     from dew.nn import attention
     assert attention.flash_built_for(generation, architectures) == built
 
@@ -214,19 +219,23 @@ def test_flash_runs_where_the_installed_wheel_holds_code_for_the_gpu(generation,
     ("sm89", WHEEL, {}, "flash", None),
     ("sm89", WHEEL, {"head_dim": 192}, "flash", None),
     ("sm89", WHEEL, {"head_dim": 256}, "xla", "the heads are 256 wide"),
-    ("sm90", WHEEL, {}, "cudnn", None),
+    ("sm90", WHEEL, {}, "flash", None),
+    ("sm90", WHEEL, {"head_dim": 256}, "flash", None),
+    ("sm90", WHEEL, {"mask": jnp.ones((1, 1, 128, 128), bool)}, "cudnn", "the call has a mask"),
+    ("sm90", BEFORE_HOPPER, {}, "cudnn", "the installed dew_flash_attn holds no code for sm90"),
+    ("sm90", BEFORE_HOPPER, {"head_dim": 256}, "xla", "the installed dew_flash_attn holds no code for sm90"),
     ("sm120", WHEEL, {}, "flash", None),
     ("sm120", WHEEL, {"head_dim": 256}, "flash", None),
 ])
 def test_auto_sends_a_plain_call_to_flash_where_it_was_measured(monkeypatch, caplog, generation, installed,
                                                                 call, chosen, refusal,
                                                                 without_deterministic_ops):
-    """With dew_flash_attn installed, 'auto' takes FlashAttention-2 where it
+    """With dew_flash_attn installed, 'auto' takes FlashAttention where it
     was measured faster than cuDNN, for a bf16 call with no window, mask, bias
-    or softcap, heads up to 256 wide on sm80 and 192 elsewhere, whose backward
-    takes no wider, and a square causal mask if any. A call it turns down
-    there logs why, once however often it is traced; on a device where it was
-    not measured, nothing is logged."""
+    or softcap, heads up to 256 wide on sm80, sm90 and sm120 and 192 on the
+    other sm8x parts, whose backward takes no wider, and a square causal mask
+    if any. A call it turns down there logs why, once however often it is
+    traced; on a device where it was not measured, nothing is logged."""
     from importlib import util
 
     from dew.nn import attention
@@ -246,7 +255,7 @@ def test_auto_sends_a_plain_call_to_flash_where_it_was_measured(monkeypatch, cap
     assert logged == ([] if refusal is None else [f"{measured}: {refusal}"])
 
 
-@pytest.mark.parametrize("generation", ["sm90", "sm100", "sm75", "cpu"])
+@pytest.mark.parametrize("generation", ["sm100", "sm75", "cpu"])
 def test_flash_refuses_a_device_its_wheel_has_no_code_for(monkeypatch, generation, without_deterministic_ops):
     """An explicit 'flash' on a device the installed wheel holds no code for
     is refused by name, before a CUDA launch could fail without one."""
@@ -255,7 +264,7 @@ def test_flash_refuses_a_device_its_wheel_has_no_code_for(monkeypatch, generatio
     monkeypatch.setattr(attention, 'device_generation', lambda: generation)
     monkeypatch.setattr(attention, 'flash_architectures', lambda: WHEEL)
     query = jnp.zeros((1, 128, 4, 64), jnp.bfloat16)
-    with pytest.raises(ValueError, match=f"holds code for sm80, sm120 and this device is {generation}"):
+    with pytest.raises(ValueError, match=f"holds code for sm80, sm90, sm120 and this device is {generation}"):
         attention.flash_attention(query, query, query, causal=True)
 
 
@@ -324,10 +333,11 @@ def test_triton_trains_and_agrees_with_xla(q_len, kv_len, heads, kv_heads, head_
 ])
 def test_flash_trains_and_agrees_with_xla(q_len, kv_len, heads, kv_heads, head_dim, causal,
                                           without_deterministic_ops):
-    """FlashAttention-2 at the shapes 'auto' sends it: within two bf16 ulps
-    of the output scale of the xla kernel, forward and backward, as cudnn and
-    triton are. Its backward takes heads over 192 wide only on sm80 and sm90
-    ("requires A100/A800 or H100/H800", measured on an L4)."""
+    """FlashAttention at the shapes 'auto' sends it, FlashAttention-3 on
+    Hopper and FlashAttention-2 elsewhere: within two bf16 ulps of the output
+    scale of the xla kernel, forward and backward, as cudnn and triton are.
+    FlashAttention-2's backward takes heads over 192 wide only on sm80 and
+    sm90 ("requires A100/A800 or H100/H800", measured on an L4)."""
     flash_here()
     if head_dim > 192 and kernels.device_generation() in ('sm86', 'sm87', 'sm89'):
         pytest.skip("FlashAttention-2's backward takes heads over 192 wide only on sm80 and sm90")
@@ -352,6 +362,12 @@ def float64_attention(query, key, value, causal):
     return jnp.einsum('hqk,khd->qhd', jax.nn.softmax(logits, axis=-1), value)
 
 
+def output_and_gradients(attend, cotangent, *arrays):
+    """`attend`'s output and the gradients of its inputs under `cotangent`, as float64 host arrays."""
+    out, pull = jax.vjp(attend, *arrays)
+    return [np.asarray(x, np.float64) for x in (out, *pull(cotangent))]
+
+
 @on_gpu
 @pytest.mark.parametrize("head_dim", [128, 256])
 @pytest.mark.parametrize("causal", [True, False])
@@ -371,27 +387,53 @@ def test_packed_sequences_attend_within_themselves_as_far_from_float64_as_one_at
     _, key, value = qkv((int(starts[-1]), 2, head_dim), seed=1)
     cotangent = qkv((int(starts[-1]), 8, head_dim), seed=2)[0]
 
-    def grads(attend, cotangent, *arrays):
-        out, pull = jax.vjp(attend, *arrays)
-        return [np.asarray(x, np.float64) for x in (out, *pull(cotangent))]
-
-    packed = grads(lambda q, k, v: flash.flash_mha_varlen(q, k, v, starts, max(lengths), is_causal=causal),
-                   cotangent, query, key, value)
+    packed = output_and_gradients(
+        lambda q, k, v: flash.flash_mha_varlen(q, k, v, starts, max(lengths), is_causal=causal),
+        cotangent, query, key, value)
     for begin, end in itertools.pairwise(starts):
         if begin == end:
             continue
         pieces = (query[begin:end], key[begin:end], value[begin:end])
-        dense = grads(lambda q, k, v: flash.flash_mha(q[None], k[None], v[None], is_causal=causal)[0],
-                      cotangent[begin:end], *pieces)
+        dense = output_and_gradients(
+            lambda q, k, v: flash.flash_mha(q[None], k[None], v[None], is_causal=causal)[0],
+            cotangent[begin:end], *pieces)
         with jax.enable_x64(new_val=True):
             wide = [jnp.asarray(np.asarray(x, np.float64)) for x in (*pieces, cotangent[begin:end])]
-            truth = grads(functools.partial(float64_attention, causal=causal), wide[3], *wide[:3])
+            truth = output_and_gradients(functools.partial(float64_attention, causal=causal), wide[3],
+                                         *wide[:3])
         for name, got, theirs, want in zip(("o", "dq", "dk", "dv"), (x[begin:end] for x in packed), dense,
                                            truth, strict=True):
             if distance(theirs, want) == 0:  # a one-token document's attention is exact either way
                 np.testing.assert_array_equal(got, theirs)
             else:
                 assert_as_exact_as_the_reference(got, theirs, want, f"{name} of the document at {begin}")
+
+
+@on_gpu
+@pytest.mark.parametrize("head_dim", [128, 256])
+def test_flash_is_as_exact_as_the_xla_kernel_from_float64(head_dim, without_deterministic_ops):
+    """At Qwen3.5's grouped causal heads, 8 queries over 2 keys, FlashAttention's output and its
+    three input gradients lie within tests/reference_error.py's rule of the xla kernel's, both
+    measured from float64; on Hopper that holds FlashAttention-3 to it."""
+    flash_here()
+    if head_dim > 192 and kernels.device_generation() in ('sm86', 'sm87', 'sm89'):
+        pytest.skip("FlashAttention-2's backward takes heads over 192 wide only on sm80, sm90 and sm1xx")
+    query, _, _ = qkv((1, 1024, 8, head_dim))
+    _, key, value = qkv((1, 1024, 2, head_dim), seed=1)
+    cotangent = qkv((1, 1024, 8, head_dim), seed=2)[0]
+
+    def kernel(implementation):
+        return jax.jit(lambda q, k, v: scaled_dot_product_attention(
+            q, k, v, implementation=implementation, causal=True))
+
+    fused = output_and_gradients(kernel('flash'), cotangent, query, key, value)
+    reference = output_and_gradients(kernel('xla'), cotangent, query, key, value)
+    with jax.enable_x64(new_val=True):
+        wide = [jnp.asarray(np.asarray(x[0], np.float64)) for x in (query, key, value, cotangent)]
+        truth = output_and_gradients(functools.partial(float64_attention, causal=True), wide[3],
+                                     *wide[:3])
+    for name, got, theirs, want in zip(("o", "dq", "dk", "dv"), fused, reference, truth, strict=True):
+        assert_as_exact_as_the_reference(got[0], theirs[0], want, name)
 
 
 def key_length_call(implementation, query, key, value, lengths, **kwargs):

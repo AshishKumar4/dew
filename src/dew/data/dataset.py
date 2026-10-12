@@ -60,10 +60,6 @@ if TYPE_CHECKING:
     from torch.utils.data import Dataset as TorchDataset
 
 
-# grain's worker processes read absl flags; a script that never runs absl.app
-# would crash on any worker_count > 0 with UnparsedFlagAccessError.
-if not flags.FLAGS.is_parsed():
-    flags.FLAGS.mark_as_parsed()
 
 
 type Tokenize = Callable[[Sequence[str]], Batch]
@@ -1343,6 +1339,9 @@ def _batches[Record](records: pygrain.MapDataset[Record], *, rows: int,
     if remainder:
         stream = stream.map(FilledBatch(rows, real=not empty))
     if loading.workers:
+        # grain's workers read absl flags, which a script without absl.app never parsed.
+        if not flags.FLAGS.is_parsed():
+            flags.FLAGS.mark_as_parsed()
         stream = stream.mp_prefetch(pygrain.MultiprocessingOptions(
             num_workers=loading.workers,
             per_worker_buffer_size=loading.worker_buffer))
