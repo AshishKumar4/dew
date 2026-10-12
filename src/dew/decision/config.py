@@ -165,7 +165,8 @@ class DecisionRunConfig(RunConfig):
             derived["layout"] = _budgeted(start.layout, budgets)
         else:
             start = Pretrained.load(self.pretrained, revision=self.revision, dtype=dtype,
-                                    param_dtype=self.param_dtype, attention_impl=attention_impl)
+                                    param_dtype=self.param_dtype, attention_impl=attention_impl,
+                                    weights=not self.trainer.resumes())
             if self.remat is not None:
                 if not isinstance(start.model, RematChoosing):
                     raise ValueError(f"--remat chooses a decoder's layer policy (RematChoosing), which "

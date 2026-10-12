@@ -24,6 +24,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from jax.ad_checkpoint import print_saved_residuals
+from jax.sharding import Mesh
 from reference_error import assert_as_exact_as_the_reference, distance
 
 from dew.nn import attention, kernels
@@ -442,6 +443,28 @@ def test_swiglu_refuses_broadcast_mixed_and_wide_dtypes():
                                           gated_product("swiglu", implementation="xla")(gate, up))
 
 
+@pytest.mark.gpu
+@pytest.mark.parametrize("implementation", ["auto", "pallas"])
+def test_a_gpu_hosts_cpu_runs_the_seams_its_placement_chooses(without_deterministic_ops, implementation):
+    """On a GPU host, the norm, the SiLU product and attention placed on the CPU, eagerly under the
+    default device and in a JIT on a CPU mesh, as a host-layout run places its state, run there:
+    'auto' takes no GPU kernel, and an explicit Pallas kernel interprets."""
+    cpu = jax.devices("cpu")[0]
+
+    def seams(x):
+        y = rms_normalized(x, None, 1e-5, x.dtype, scale_offset=False, scale_after_cast=False,
+                           fp32_statistics=True, implementation=implementation)
+        y = gated_product("swiglu", implementation=implementation)(y, y).reshape(1, 4, 2, 64)
+        return attention.attention_kernel(y, y, y).astype(jnp.float32).sum()
+
+    x = jax.device_put(jnp.linspace(-1, 1, 512, dtype=jnp.bfloat16).reshape(4, 128), cpu)
+    with jax.default_device(cpu):
+        eager = jax.value_and_grad(seams)(x)
+    with jax.set_mesh(Mesh(np.array([cpu]), ("data",))):
+        jitted = jax.jit(jax.value_and_grad(seams))(x)
+    assert {device for value in (*eager, *jitted) for device in value.devices()} == {cpu}
+
+
 def test_auto_takes_the_generation_row_and_forward_mode_is_portable():
     """Auto takes the device's measured kernel on a GPU Triton runs, XLA on a CPU."""
     from dew.nn.kernels import norm_swiglu
@@ -619,6 +642,8 @@ def test_expert_jvp_refuses_swiglu_once_and_matches_xla(monkeypatch, caplog):
         return expert.apply(params, x, weights, indices)
 
     reference = jax.jvp(function, (x,), (jnp.ones_like(x),))
+    # A GPU's own row may already have logged the reference's refusal.
+    caplog.clear()
     monkeypatch.setitem(kernels.gpu_target("sm80").kernels, "swiglu", "pallas")
     monkeypatch.setattr(kernels.generation, "device_generation", lambda: "sm80")
     monkeypatch.setattr(kernels.generation, "triton_runs", lambda: True)

@@ -27,15 +27,13 @@ from transformers.models.gpt_oss.modeling_gpt_oss import (
     eager_attention_forward,
 )
 
+from dew.nn.fake_quant import E2M1_MIDPOINTS
+
 FIXTURES = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "gpt_oss"
 
 KERNELS = ("kernels-community/gpt-oss-triton-kernels", "0f351046d799bc4d2c9dbb2c7cf36753204b5916")
 """The kernel transformers 5.16.1 loads for MXFP4 (`get_kernel(..., version=1)`,
 integrations/mxfp4.py:567), at the commit its v1 branch names."""
-
-MIDPOINTS = np.array([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0], np.float32)
-"""Halfway between neighbouring E2M1 magnitudes."""
-
 
 def write_attention() -> None:
     config = GptOssConfig(hidden_size=32, num_attention_heads=4,
@@ -85,7 +83,7 @@ def write_mxfp4() -> None:
 def mxfp4_domains() -> dict[str, np.ndarray]:
     """[expert, input, output] float32 weights for the MXFP4 encoder, by name."""
     rng = np.random.default_rng(4242)
-    ties = np.concatenate([[6.0], MIDPOINTS, [-6.0], -MIDPOINTS])
+    ties = np.concatenate([[6.0], E2M1_MIDPOINTS, [-6.0], -E2M1_MIDPOINTS])
     groups = np.zeros((8, 32), np.float32)
     # 6 sets each scale, so every midpoint of either sign is its own
     # quotient; at 2 ** -126 the smaller ones are bf16 subnormals.
