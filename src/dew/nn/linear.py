@@ -35,13 +35,13 @@ from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.kernels import delta_chunks, delta_prep, delta_rule
 
-from .attention import FORWARD_MODE, unweighted_rmsnorm
+from .attention import FORWARD_MODE, gated_rms_normalized
 from .blocks import normal_kernel
 from .flops import conv_flops, delta_flops, projection_flops
 from .inputs import AttentionMetadata, valid_order
 from .kernels.generation import first_refusal, measured_kernel, ran_kernel, triton_runs
 from .precision import asks_default_precision, at_least_fp32
-from .sharding import logical_axes, rows_like
+from .sharding import HEADS, logical_axes, rows_like
 
 CHUNK_SIZE = 64
 """Tokens per chunk of the chunked form, the reference's default
@@ -790,22 +790,19 @@ class RMSNormGated(nn.Module):
     gate, then the cast back (modeling_qwen3_next.py:57-74). The gate is
     silu in the qwen3_5/qwen3_next references and sigmoid where qwen4_exp's
     output_gate_type says so; the caller picks, since the reference makes
-    the activation a config field.
+    the activation a config field. It takes per-head `[batch, length, heads,
+    head_dim]` outputs and gates (`gated_rms_normalized`).
     """
 
     epsilon: float = 1e-6
     activation: str = 'silu'
     dtype: Dtype | None = None
+    implementation: str = 'auto'
 
     @nn.compact
     def __call__(self, x, gate):
         dtype = self.dtype if self.dtype is not None else x.dtype
-        wide = at_least_fp32(x.dtype)
-        y = unweighted_rmsnorm(x.astype(wide), self.epsilon)
         scale = self.param('weight', nn.initializers.ones,
                            (x.shape[-1],), jnp.float32)
-        y = y * scale.astype(wide)
-        gate = gate.astype(wide)
-        gated = (nn.silu(gate) if self.activation == 'silu'
-                 else nn.sigmoid(gate))
-        return (y * gated).astype(dtype)
+        return gated_rms_normalized(x, gate, scale, self.epsilon, dtype, self.activation,
+                                    implementation=self.implementation, axes=HEADS)

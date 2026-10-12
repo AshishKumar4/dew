@@ -59,6 +59,16 @@ def decoder_norm(kind: Literal['rms', 'layer', 'fast_layer'], *, epsilon: float,
 
 
 @runtime_checkable
+class SeamNorm(Protocol):
+    """A pre-norm that owns a block's residual seam (`dew.nn.attention.RMSNorm`):
+    it adds a sublayer's branch to the stream it reads and hands that stream
+    back beside the norm, `(x + branch, normed)`, so one fused pass takes the
+    add, the norm and, in reverse, the stream's own cotangent."""
+
+    def seam(self, x, branch=None, *, axes=None) -> tuple[jax.Array, jax.Array]: ...
+
+
+@runtime_checkable
 class ReadsTrain(Protocol):
     """A token mixer or feed-forward whose call takes `train`, for a dropout of its own."""
 
@@ -281,7 +291,8 @@ class GatedMLP(nn.Module):
             up = jnp.clip(up, -self.swiglu_limit, self.swiglu_limit)
         if self.activation_sparsity:
             gate = gaussian_topk(gate, self.activation_sparsity)
-        hidden = self.dropout(gated_product(self.activation)(gate, up), deterministic=not train)
+        hidden = self.dropout(gated_product(self.activation, axes=MLP_HIDDEN)(gate, up),
+                              deterministic=not train)
         return checkpoint_name(self.down_proj(hidden), 'down_proj')
 
     def _packed(self) -> bool:
@@ -735,14 +746,24 @@ class DecoderBlock(nn.Module):
         """
         state = self._enter(x, train, attention_metadata)
         state, read, site = self._read(state, "attention")
-        normed = self.input_layernorm(read) if self.wiring.pre_norms and self.attention_norm else read
+        if not (self.wiring.pre_norms and self.attention_norm):
+            normed = read
+        elif self._seam(state, self.input_layernorm):
+            state, normed = self._stream_normed(self.input_layernorm, state, None)
+        else:
+            normed = self.input_layernorm(read)
         mixed = self._mix(
             normed, decode, positions, segment_ids, kv_store, attention_metadata, prediction_phase, train
         )
         if self.wiring.output_norms:
             mixed = self.attention_output_norm(mixed)
         attention_branch = self._branch(mixed, train)
-        if not self.wiring.parallel_residual:
+        # The MLP's pre-norm adds the attention branch itself where it can
+        # (`_stream_normed`); no other sublayer reads the stream in between.
+        joined = (self.feedforward is not None and self.wiring.pre_norms and self.laurel_rank is None
+                  and not self.wiring.parallel_residual and not self.wiring.shared_parallel_norm
+                  and self._seam(state, self.post_attention_layernorm))
+        if not (self.wiring.parallel_residual or joined):
             state = self._write(state, "attention", attention_branch, site)
         if self.laurel_rank is not None:
             # Only the plain form admits LAuReL (setup refuses the rest).
@@ -752,9 +773,12 @@ class DecoderBlock(nn.Module):
             )
         if self.feedforward is not None:
             routes = self._routes(per_layer_input)
+            if joined:
+                state, mlp_input = self._stream_normed(self.post_attention_layernorm, state, attention_branch)
             state, read, site = self._read(state, "mlp")
-            mlp_input = (normed if self.wiring.shared_parallel_norm else
-                         self.post_attention_layernorm(read) if self.wiring.pre_norms else read)
+            if not joined:
+                mlp_input = (normed if self.wiring.shared_parallel_norm else
+                             self.post_attention_layernorm(read) if self.wiring.pre_norms else read)
             hidden = self.mlp(mlp_input,
                               **self._feedforward_inputs(attention_metadata),
                               **({} if self.parallel is not None else routes),
@@ -771,6 +795,21 @@ class DecoderBlock(nn.Module):
                 mlp_branch = mlp_branch + attention_branch
             state = self._write(state, "mlp", mlp_branch, site)
         return self._leave(state, train, per_layer_input)
+
+    @staticmethod
+    def _seam(state: _BlockState, norm) -> bool:
+        """Whether `norm` over `state` is a residual seam one fused pass can own:
+        a `SeamNorm` reading the plain stream."""
+        return isinstance(state, _Plain) and isinstance(norm, SeamNorm)
+
+    def _stream_normed(self, norm: SeamNorm, state: _Plain, branch) -> tuple[_Plain, jax.Array]:
+        """The plain stream plus `branch` (None for none) and its norm, as the
+        state after the add and the normed input. The norm returns the stream
+        it read and the block carries that one on, so the norm's kernel adds
+        the branch in its forward and the stream's cotangent in its reverse;
+        the values are `_write`'s and the norm's."""
+        stream, normed = norm.seam(state.x, branch, axes=RESIDUAL)
+        return state._replace(x=constrain(stream, RESIDUAL)), normed
 
     def _branch(self, output, train: bool):
         """A sublayer's output as it joins the residual: times
