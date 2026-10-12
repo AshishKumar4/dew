@@ -454,6 +454,10 @@ class PowerProfilesState(NamedTuple):
     """The number of updates made so far, the t in the averages' power-function profiles."""
     stds: jax.Array
     """The relative standard deviation of each average."""
+    powers: jax.Array
+    """Each average's γ + 1, the power its decay raises (1 - 1/t) to, solved
+    from its std when the state starts: a resumed average decays as it was
+    tracked, whatever stds the resuming run configures."""
     averages: tuple[optax.Params, ...]
     inner: optax.OptState
 
@@ -472,17 +476,17 @@ def power_profiles(solver: optax.GradientTransformation,
     whole so the state and averages share one atomic save. Each std is rounded to fp32 first, the
     precision the state records it in.
     """
-    from dew.training.posthoc import power_decay
+    from dew.training.posthoc import exponent, powered_decay
     from dew.training.transaction import ema_update
 
     stds = tuple(float(np.float32(std)) for std in stds)
     if not stds:
         raise ValueError("power_profiles tracks at least one average; name its relative std")
-    decays = tuple(power_decay(std) for std in stds)
     solver = optax.with_extra_args_support(solver)
 
     def init_fn(params):
         return PowerProfilesState(updates=jnp.zeros([], jnp.int32), stds=jnp.asarray(stds, jnp.float32),
+                                  powers=jnp.asarray([exponent(std) + 1 for std in stds], jnp.float32),
                                   averages=tuple(jax.tree.map(jnp.copy, params) for _ in stds),
                                   inner=solver.init(params))
 
@@ -491,9 +495,9 @@ def power_profiles(solver: optax.GradientTransformation,
             raise ValueError("power_profiles averages the parameters, so its update needs them")
         updates, inner = solver.update(updates, state.inner, params, **extra_args)
         produced = optax.apply_updates(params, updates)
-        averages = tuple(ema_update(average, produced, decay(state.updates))
-                         for average, decay in zip(state.averages, decays, strict=True))
-        return updates, PowerProfilesState(state.updates + 1, state.stds, averages, inner)
+        averages = tuple(ema_update(average, produced, powered_decay(state.powers[index])(state.updates))
+                         for index, average in enumerate(state.averages))
+        return updates, PowerProfilesState(state.updates + 1, state.stds, state.powers, averages, inner)
 
     return optax.GradientTransformationExtraArgs(init_fn, update_fn)
 

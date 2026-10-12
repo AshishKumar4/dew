@@ -17,17 +17,16 @@ the critic step, and rCM's discrete consistency (dCM) step.
 
 from __future__ import annotations
 
-import ast
 import contextlib
 import json
 import math
 import types
-import urllib.request
 from pathlib import Path
 
 import numpy as np
 import torch
 from einops import rearrange, repeat
+from reference_source import definitions
 
 RCM = "https://raw.githubusercontent.com/NVlabs/rcm/ed3cb14dd936f92cdc9f9381af7369991509b41f/"
 FIXTURE = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "rcm"
@@ -37,25 +36,6 @@ CONFIG = {"teacher_guidance": 2.5, "fd_type": 0, "tangent_warmup": 10, "loss_sca
           "rectified_flow_t_scaling_factor": 1000.0, "student_update_freq": 5,
           "dcm_total_steps": 8, "dcm_skipping_interval_steps": 2, "dcm_timestep_shift": 5.0}
 STRENGTH = {"student": 0.5, "teacher": 0.6, "fake_score": 0.4}
-
-
-def definitions(url: str, names: tuple[str, ...], scope: dict, *, within: str | None = None) -> dict:
-    """The named top-level definitions (or methods of the class `within`)
-    of the file at `url`, run as published."""
-    text = urllib.request.urlopen(url).read().decode()
-    body = ast.parse(text).body
-    if within is not None:
-        body = next(node for node in body if isinstance(node, ast.ClassDef) and node.name == within).body
-    for node in body:
-        if isinstance(node, (ast.FunctionDef, ast.ClassDef)) and node.name in names:
-            source = ast.get_source_segment(text, node)
-            if within is not None:
-                # The segment's first line starts at the def; the rest keep
-                # the class body's indentation.
-                first, *rest = source.splitlines()
-                source = "\n".join([first, *(line[4:] for line in rest)])
-            exec(source, scope)
-    return scope
 
 
 def velocity(strength: float):

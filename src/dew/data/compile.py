@@ -55,10 +55,12 @@ from dew.data.materialize import _materialize, _Memory
 from dew.data.mixing import CorpusCounts, SearchBudget
 from dew.data.pipeline import (
     Artifact,
+    Batched,
     BatchStage,
     Bound,
     Configured,
     Expansion,
+    Filter,
     FlatMap,
     Geometry,
     Group,
@@ -67,6 +69,7 @@ from dew.data.pipeline import (
     Map,
     MapBatch,
     Mixture,
+    Native,
     ObjectiveData,
     Pack,
     Phases,
@@ -699,8 +702,13 @@ def _one_shape(host: tuple[HostStep, ...], partition: DataPartition) -> None:
 
 
 def objective_steps(pipeline: Pipeline, objective: ObjectiveData, *, train: bool, read: Read) -> Pipeline:
-    """Put objective record steps on each corpus before its mixture."""
-    if isinstance(pipeline.source, (Mixture, Phases)):
+    """Put objective record steps on each corpus before its mixture, where the
+    mixture is batched as it is; after a mixture's own steps (a preset's
+    tokenize and pack over raw stores), on the mixture."""
+    batched = _until(pipeline.stages, (BatchStage, TokenBudget))
+    own = any(isinstance(stage, (Map, RandomMap, FlatMap, Filter, Pack, Windows, Native, Batched))
+              for stage in pipeline.stages[:batched])
+    if isinstance(pipeline.source, (Mixture, Phases)) and not own:
         children = tuple(
             objective_steps(child, objective, train=train, read=read) for child in pipeline.source.pipelines
         )

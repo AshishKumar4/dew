@@ -425,10 +425,9 @@ def test_the_deepseek_stack_fits_on_the_mesh(fsdp, expert):
     assert np.any(np.asarray(bias) != 0), "the bias never moved"
     attention = state.variables["params"]["layers_0"]["self_attn"]
     experts = state.variables["params"]["layers_1"]["mlp"]["experts"]
-    assert attention["kv_b_proj"]["kernel"].sharding.spec == P(None, "fsdp")
-    assert attention["indexer"]["wq_b"]["kernel"].sharding.spec == P(None, "fsdp")
-    assert experts["gate_proj"]["kernel"].sharding.spec == P(
-        "expert" if expert > 1 else None, None, "fsdp")
+    assert attention["kv_b_proj"]["kernel"].sharding.spec == P("fsdp")
+    assert attention["indexer"]["wq_b"]["kernel"].sharding.spec == P("fsdp")
+    assert experts["gate_proj"]["kernel"].sharding.spec == P("expert" if expert > 1 else None, "fsdp")
     abstract = jax.eval_shape(
         model.init, jax.random.key(0), jnp.ones((1, 16), jnp.int32))
     shardings = trainer.layout.shardings(trainer.device_mesh, abstract)

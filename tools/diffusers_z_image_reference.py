@@ -27,13 +27,13 @@ from __future__ import annotations
 
 import contextlib
 import json
-import math
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
 import torch
+from diffusers_reference_helpers import rounded_timestep_embedding as shared_timestep_embedding
 
 DIFFUSERS = "0.40.0"
 SOURCE = Path(__file__).resolve().parents[1] / "tests/fixtures/hf/z-image-source"
@@ -70,11 +70,10 @@ CASES: dict[str, Case] = {
 
 def rounded_timestep_embedding(t, dim, max_period=10000):
     """`TimestepEmbedder.timestep_embedding` with its exponential taken in
-    float64 and rounded once to float32, the table Dew builds on the host."""
-    half = dim // 2
-    exponent = -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32) / half
-    args = t[:, None].float() * torch.exp(exponent.double()).float()[None]
-    return torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+    float64 and rounded once to float32, the table Dew builds on the host:
+    the shared helper with no frequency shift, cosines first."""
+    return shared_timestep_embedding(t, dim, flip_sin_to_cos=True, downscale_freq_shift=0,
+                                     max_period=max_period)
 
 
 @contextlib.contextmanager

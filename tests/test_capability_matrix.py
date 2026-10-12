@@ -204,7 +204,7 @@ def built(name: str, **config) -> Callable[[], Loaded]:
     def load() -> Loaded:
         model = models.build(name, **config)
         return Loaded(model, model)
-    return loader
+    return load
 
 
 def released(directory: str) -> Callable[[], Loaded]:
@@ -212,7 +212,7 @@ def released(directory: str) -> Callable[[], Loaded]:
     def load() -> Loaded:
         source = Pretrained.load(FIXTURES / directory, dtype="float32", attention_impl="reference")
         return Loaded(source, source.model, source.variables, source.text_processor)
-    return loader
+    return load
 
 
 def adapted(load: Callable[[], Loaded], *modules: str) -> Callable[[], Loaded]:
@@ -229,7 +229,7 @@ def user(module, **fields) -> Callable[[], Loaded]:
     def load() -> Loaded:
         model = module(**fields)
         return Loaded(model, model)
-    return loader
+    return load
 
 
 def torch_fallback() -> Loaded:
