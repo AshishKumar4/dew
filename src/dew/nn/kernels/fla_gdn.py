@@ -653,28 +653,25 @@ def _dhu_kernel(span_ref, q_ref, k_ref, w_ref, g_ref, dht_ref, do_ref, dv_ref, d
             dv = sum(_dot(read(k_ref, pl.ds(i * 64, 64)), grad[i].astype(k_ref.dtype), exact=exact)
                      for i in range(slices))
             final = begin + taken - 1
+            queries = [read(q_ref, pl.ds(i * 64, 64)) for i in range(slices)]
             if per_key:
                 dv = dv + read(dv_ref).astype(jnp.float32)
                 kept = [jnp.exp2(g_ref[final, pl.ds(i * 64, 64)].astype(jnp.float32))[:, None]
                         for i in range(slices)]
-
-                def queried(query):
-                    return _dot(query.T, out_grad.astype(query.dtype), exact=exact)
+                read_out = [_dot(query.T, out_grad.astype(query.dtype), exact=exact) for query in queries]
             else:
                 gate = _gates(g_ref, begin, taken, chunk)
                 last = g_ref[final].astype(jnp.float32)
                 dv = dv * jnp.exp2(last - gate)[:, None] + read(dv_ref).astype(jnp.float32)
                 decay = jnp.exp2(gate)[:, None]
                 kept = [jnp.exp2(last)] * slices
-
-                def queried(query):
-                    return _split_dot((query.astype(jnp.float32) * decay).T, out_grad, exact=exact)
+                read_out = [_split_dot((query.astype(jnp.float32) * decay).T, out_grad, exact=exact)
+                            for query in queries]
             _write(_rows(dv2_ref, begin, chunk), taken, dv)
 
             def moved(i):
                 written = read(w_ref, pl.ds(i * 64, 64))
-                return (queried(read(q_ref, pl.ds(i * 64, 64))) * scale
-                        - _dot(written.T, dv.astype(written.dtype), exact=exact))
+                return read_out[i] * scale - _dot(written.T, dv.astype(written.dtype), exact=exact)
 
             return [grad[i] * kept[i] + moved(i) for i in range(slices)]
 
