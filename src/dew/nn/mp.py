@@ -115,6 +115,10 @@ class MPConv(nn.Module):
     kernel_size: tuple[int, ...] = ()
 
     @nn.nowrap
+    def spatial_shape(self, shape: tuple[int, ...]) -> tuple[int, ...]:
+        return (*shape[:-1], self.features)
+
+    @nn.nowrap
     def model_flops(self, lengths, input_features: int) -> float:
         """Dense or convolution products; weight normalization is pointwise work."""
         from dew.nn.flops import conv_flops

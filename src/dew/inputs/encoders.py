@@ -64,6 +64,7 @@ class ConditionWork:
 
     flops: float
     lengths: np.ndarray
+    spans: np.ndarray
     features: int
     pooled_features: int | None = None
     time_ids: int | None = None
@@ -193,7 +194,9 @@ class _TextTower(ConditionEncoder[str, TextContext]):
 
     def conditioning_flops(self, tokens) -> ConditionWork:
         lengths = np.sum(np.asarray(tokens["attention_mask"]) != 0, axis=-1, dtype=np.int64)
-        return ConditionWork(counted_flops(self.transformer, lengths), lengths, self.transformer.emb_features)
+        spans = np.full(lengths.shape, np.shape(tokens["input_ids"])[1], np.int64)
+        return ConditionWork(counted_flops(self.transformer, lengths), lengths, spans,
+                             self.transformer.emb_features)
 
     def encode(self, params, tokens) -> TextContext:
         mask = jnp.asarray(tokens["attention_mask"])
@@ -333,7 +336,8 @@ class CharTable(ConditionEncoder[str, TextContext]):
 
     def conditioning_flops(self, tokens) -> ConditionWork:
         lengths = np.sum(np.asarray(tokens["attention_mask"]) != 0, axis=-1, dtype=np.int64)
-        return ConditionWork(0.0, lengths, self.features)
+        return ConditionWork(0.0, lengths, np.full(lengths.shape, np.shape(tokens["input_ids"])[1], np.int64),
+                             self.features)
 
     def encode(self, params, tokens) -> TextContext:
         table = params["table"]

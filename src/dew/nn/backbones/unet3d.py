@@ -15,10 +15,12 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from ..attention import NormalAttention, RMSNorm
+from ..blocks import TimeProjection
 from ..dit import ROPE_THETA
-from ..flops import MissingFlopsCount, projection_flops
+from ..flops import MissingFlopsCount, patch_lengths, projection_flops
 from ..precision import at_least_fp32
 from ..rope import rotary_freqs
+from .spatial import SpatialCount, SpatialShape
 from .unet import Unet, unet_body
 
 
@@ -80,21 +82,32 @@ class UNet3D(Unet):
     @nn.nowrap
     def spatial_flops(self, sample_shape: tuple[int, ...], rows: int, context_lengths=None,
                        text_features: int | None = None) -> float:
-        """Spatial UNet per frame and temporal attention at each walked level."""
+        """The frame body and its temporal hook share the forward's ordered walk."""
         if len(sample_shape) != 4:
             raise MissingFlopsCount("UNet3D needs [frames, height, width, channels] geometry")
-        frames, height, width, _ = sample_shape
+        frames, height, width, channels = sample_shape
+        divisor = 2**(len(self.feature_depths) - 1)
+        patch_lengths(sample_shape[1:], (divisor, divisor), rows)
         text = None if context_lengths is None else np.repeat(context_lengths, frames)
-        count = super().spatial_flops(sample_shape[1:], rows * frames, text, text_features)
-        for level, features in enumerate(self.feature_depths):
-            tokens = np.full((rows * height * width // 4**level,), frames, np.int64)
-            down_features = self.feature_depths[max(0, level - 1)]
-            for channels in (down_features, features):
-                count += TemporalBlock(self.temporal_heads, parent=None).model_flops(tokens, channels)
-            if level == len(self.feature_depths) - 1:
-                middle = TemporalBlock(self.temporal_heads, parent=None).model_flops(tokens, features)
-                count += self.num_middle_res_blocks * middle
-        return count
+        operations = SpatialCount(text, text_features)
+        operations.flops = TimeProjection(self.emb_features, parent=None).model_flops(
+            np.ones((rows * frames,), np.int64), self.emb_features)
+
+        def temporal(x, name):
+            batch_frames, h, w, features = x.shape
+            lengths = np.full((batch_frames // frames * h * w,), frames, np.int64)
+            operations.flops += self.temporal_block(name, parent=None).model_flops(lengths, features)
+            return x
+
+        unet_body(self, SpatialShape((rows * frames, height, width, channels)),
+                  SpatialShape((rows * frames, self.emb_features)), None,
+                  temporal=temporal, operations=operations)
+        return operations.flops
+
+    @nn.nowrap
+    def temporal_block(self, name, **scope):
+        return TemporalBlock(heads=self.temporal_heads, dtype=self.dtype, precision=self.precision,
+                             name=name, **scope)
 
     @nn.compact
     def __call__(self, x, temb, textcontext=None, train: bool = False):
@@ -102,10 +115,10 @@ class UNet3D(Unet):
         text = None if textcontext is None else jnp.repeat(textcontext.hidden, T, axis=0)
 
         def temporal(x, name):
-            return TemporalBlock(heads=self.temporal_heads,
-                                 dtype=self.dtype, precision=self.precision, name=name)(x, T)
+            return self.temporal_block(name)(x, T)
 
-        out = unet_body(self, x.reshape(B * T, H, W, C), jnp.repeat(temb, T, axis=0), text,
+        temb = self.time_embedding(jnp.repeat(temb, T, axis=0))
+        out = unet_body(self, x.reshape(B * T, H, W, C), temb, text,
                         temporal=temporal)
         return out.reshape(B, T, H, W, self.output_channels)
 

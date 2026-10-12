@@ -108,8 +108,8 @@ def test_wan_cross_attention_uses_video_times_text_not_the_joined_square():
 def test_zimage_visible_pad_slots_count_in_blocks_but_not_patch_or_output_maps():
     model = ZImageTransformer(in_channels=4, dim=24, n_heads=3, n_layers=1,
                               n_refiner_layers=1, cap_feat_dim=16)
-    difference = model.multisequence_flops(np.array([33]), np.array([3])) - model.multisequence_flops(
-        np.array([32]), np.array([3]))
+    difference = model.multimodal_flops(np.array([33]), np.array([3]), 4, 16) - model.multimodal_flops(
+        np.array([32]), np.array([3]), 4, 16)
     block = ZImageBlock(24, 3)
     expected = (2 * 16 * 24 + 2 * 24 * 16
                 + block.model_flops(np.array([64])) - block.model_flops(np.array([32]))
@@ -134,7 +134,7 @@ def test_sharded_objective_counts_sum_to_one_qwen_batch_not_one_per_row():
     encoder = CharTable.from_pretrained(tokens=6, features=16)
     objective = DiffusionObjective(model, presets.Flow(),
         InputSpec(Field("images", (2, 3, 4)), conditions={"conditioning": Condition(encoder)}),
-        autoencoder=None, ema_decay=None)
+        autoencoder=None, ema_decay=None, unconditional_prob=0)
     batch = {"images": np.zeros((2, 2, 3, 4), np.float32), "text": encoder.tokenize(["a", "abcd"])}
     whole = objective.model_flops(None, batch)
     counted = prepare_counts(objective, batch, count_model=True)
@@ -282,7 +282,10 @@ def test_published_single_stream_families_match_forward_products(family):
         text, upper = 32, 0
     condition = DenoisingCondition(jnp.ones((1, text, 8)), mask=jnp.ones((1, text), bool))
     variables = model.init(jax.random.key(321), image, time, condition)
-    count = model.multisequence_flops(model.image_lengths(image.shape[1:], 1), np.array([text]))
+    count = (model.multisequence_flops(model.image_lengths(image.shape[1:], 1), np.array([text]))
+             if family == "qwen_image" else model.multimodal_flops(
+                 model.image_lengths(image.shape[1:], 1), np.array([text]),
+                 image.shape[-1], condition.context.shape[-1]))
     assert count == forward_products(model.apply, variables, image, time, condition) - upper
 
 
@@ -380,7 +383,8 @@ def test_conditional_unet_counts_odd_resizing_pooled_time_ids_and_cross_only_att
     def forward(variables, image, time, condition):
         return model.apply(variables, image, time, conditioning=condition, **extra)
 
-    count = model.conditioned_spatial_flops(image.shape[1:], 1, ConditionWork(0, np.array([2]), 8, 5, 6))
+    count = model.conditioned_spatial_flops(image.shape[1:], 1,
+        ConditionWork(0, np.array([2]), np.array([2]), 8, 5, 6))
     assert count == forward_products(forward, variables, image, time, condition)
 
 
@@ -425,3 +429,86 @@ def test_uvit_counts_time_mlp_text_tokens_and_hilbert_skip_projections():
     variables = model.init(jax.random.key(329), image, time, text)
     count = model.multimodal_flops(np.array([4]), np.array([2]), 3, 8)
     assert count == forward_products(model.apply, variables, image, time, text)
+
+
+@pytest.mark.parametrize("family", ["unet", "unet3d", "uvit", "mmdit", "hierarchical", "flux2"])
+def test_unmasked_denoisers_count_the_conditioners_physical_padded_span(family):
+    encoder = CharTable.from_pretrained(tokens=4, features=8)
+    tokens = encoder.tokenize(["a"])
+    work = encoder.conditioning_flops(tokens)
+    np.testing.assert_array_equal(work.lengths, [1])
+    np.testing.assert_array_equal(work.spans, [4])
+    image, time = jnp.ones((1, 4, 4, 3)), jnp.ones((1,))
+    text = encoder.encode(encoder.params, tokens)
+    if family in ("unet", "unet3d"):
+        kind = UNet3D if family == "unet3d" else Unet
+        model = kind(feature_depths=(8, 16), attention_configs=(Stage(heads=2), Stage(heads=2)),
+                     emb_features=8, num_res_blocks=1, norm_groups=1, attention_impl="reference")
+        if family == "unet3d":
+            model = model.clone(temporal_heads=2)
+            image = jnp.ones((1, 2, 4, 4, 3))
+    elif family == "uvit":
+        model = UViT(emb_features=8, num_heads=2, num_layers=2, patch_size=2,
+                      image_size=4, text_tokens=4, attention_impl="reference")
+    elif family == "mmdit":
+        model = SimpleMMDiT(emb_features=8, num_heads=2, num_layers=1, patch_size=2,
+                            attention_impl="reference")
+    elif family == "hierarchical":
+        model = HierarchicalMMDiT(emb_features=(8, 16), num_heads=(2, 2), num_layers=(1, 1),
+                                  base_patch_size=2, attention_impl="reference")
+    else:
+        model = Flux2Transformer(in_channels=3, out_channels=3, heads=1, head_dim=8,
+                                  num_layers=1, num_single_layers=1, joint_attention_dim=8,
+                                  guidance_embeds=False, axes_dims_rope=(2, 2, 2, 2),
+                                  attention_impl="reference")
+        text = DenoisingCondition(text.hidden, mask=text.mask)
+    keyword = "conditioning" if family == "flux2" else "textcontext"
+    objective = DiffusionObjective(model, presets.Flow(),
+        InputSpec(Field("images", image.shape[1:]), conditions={keyword: Condition(encoder)}),
+        autoencoder=None, ema_decay=None, unconditional_prob=0)
+    variables = model.init(jax.random.key(330), image, time, text)
+    count = objective.model_flops(None, {"images": np.asarray(image), "text": tokens})
+    assert count == forward_products(model.apply, variables, image, time, text)
+
+
+@pytest.mark.parametrize("probability", [0, 0.12, 1])
+def test_masked_condition_dropout_counts_blank_geometry_or_refuses_an_unknown_draw(probability):
+    encoder = CharTable.from_pretrained(tokens=4, features=8)
+    model = QwenImageTransformer(in_channels=3, out_channels=3, heads=1, head_dim=8,
+                                 num_layers=1, context_in_dim=8, axes_dims_rope=(2, 2, 4),
+                                 attention_impl="reference")
+    objective = DiffusionObjective(model, presets.Flow(),
+        InputSpec(Field("images", (2, 2, 3)), conditions={"conditioning": Condition(encoder)}),
+        autoencoder=None, ema_decay=None, unconditional_prob=probability)
+    batch = {"images": np.ones((1, 2, 2, 3)), "text": encoder.tokenize(["abcd"])}
+    if probability == 0.12:
+        with pytest.raises(MissingFlopsCount, match="post-dropout context lengths"):
+            objective.model_flops(None, batch)
+    else:
+        lengths = np.array([0 if probability == 1 else 4])
+        assert objective.model_flops(None, batch) == model.multisequence_flops(np.array([4]), lengths)
+
+
+def test_zimage_counts_actual_image_and_caption_widths_not_unused_config_defaults():
+    model = ZImageTransformer(in_channels=4, cap_feat_dim=16, dim=24, n_heads=3, n_layers=1,
+                              n_refiner_layers=1, axes_dims=(2, 2, 4), axes_lens=(64, 16, 16),
+                              attention_impl="reference")
+    image, time = jnp.ones((1, 4, 4, 3)), jnp.ones((1,))
+    text = DenoisingCondition(jnp.ones((1, 32, 8)), mask=jnp.ones((1, 32), bool))
+    variables = model.init(jax.random.key(331), image, time, text)
+    count = model.multimodal_flops(np.array([4]), np.array([32]), 3, 8)
+    assert count == forward_products(model.apply, variables, image, time, text)
+
+
+def test_zero_block_conditional_unet_counts_the_middle_width_change_and_decoder_skip():
+    model = UNet2DCondition((UNetStage(8, 2), UNetStage(16, 2)), in_channels=3, out_channels=3,
+                            blocks_per_level=0, norm_groups=1, attention_impl="reference")
+    image, time = jnp.ones((1, 4, 4, 3)), jnp.ones((1,))
+    text = DenoisingCondition(jnp.ones((1, 2, 8)))
+    variables = model.init(jax.random.key(332), image, time, conditioning=text)
+
+    def forward(variables, image, time, text):
+        return model.apply(variables, image, time, conditioning=text)
+
+    assert model.spatial_flops(image.shape[1:], 1, np.array([2]), 8) == forward_products(
+        forward, variables, image, time, text)

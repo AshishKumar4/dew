@@ -22,8 +22,10 @@ from flax.typing import Dtype
 
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.dit import TextContext, masked_mean
-from dew.nn.flops import MissingFlopsCount, attention_flops, patch_lengths, projection_flops
+from dew.nn.flops import MissingFlopsCount, attention_flops, patch_lengths
 from dew.nn.mp import MPConv, MPFourier, mp_cat, mp_silu, mp_sum, normalize
+
+from .spatial import SpatialCount, SpatialForward, SpatialShape
 
 
 def _resample(x: jax.Array, mode: str) -> jax.Array:
@@ -35,6 +37,14 @@ def _resample(x: jax.Array, mode: str) -> jax.Array:
     if mode == "up":
         return jnp.repeat(jnp.repeat(x, 2, axis=1), 2, axis=2)
     return x
+
+
+class _EDMForward(SpatialForward):
+    def __init__(self, concat_balance: float):
+        self.concat_balance = concat_balance
+
+    def concatenate(self, x, skip):
+        return mp_cat(x, skip, t=self.concat_balance)
 
 
 class Block(nn.Module):
@@ -56,7 +66,16 @@ class Block(nn.Module):
         return MPConv(self.features, (3, 3), **scope)
 
     @nn.nowrap
-    def spatial_flops(self, lengths, input_features: int, emb_features: int) -> float:
+    def spatial_shape(self, shape: tuple[int, ...]) -> tuple[int, ...]:
+        spatial = shape[:-1]
+        if self.resample == "down":
+            spatial = tuple(size // 2 for size in spatial)
+        elif self.resample == "up":
+            spatial = tuple(size * 2 for size in spatial)
+        return (*spatial, self.features)
+
+    @nn.nowrap
+    def model_flops(self, lengths, input_features: int, emb_features: int) -> float:
         """The block's residual, time and skip maps and optional spatial attention."""
         residual_in = self.features if self.flavor == "enc" else input_features
         conv = self._residual_conv(parent=None)
@@ -135,6 +154,10 @@ class EDM2UNet(nn.Module):
     def channels(self) -> list[int]:
         return [self.model_channels * mult for mult in self.channel_mult]
 
+    @nn.nowrap
+    def condition_lengths(self, lengths: np.ndarray, spans: np.ndarray) -> np.ndarray:
+        return spans
+
     @property
     def noise_features(self) -> int:
         return self.model_channels * (self.channel_mult_noise or self.channel_mult[0])
@@ -154,57 +177,63 @@ class EDM2UNet(nn.Module):
     @nn.nowrap
     def spatial_flops(self, sample_shape: tuple[int, ...], rows: int, context_lengths=None,
                        text_features: int | None = None) -> float:
-        """Magnitude-preserving convolutions, skip projections and resolution-specific attention."""
-        del context_lengths  # The text is mean-pooled before its one label projection.
+        """Count the shared magnitude-preserving stage walk on spatial shapes."""
         divisor = 2**(len(self.channel_mult) - 1)
         patch_lengths(sample_shape, (divisor, divisor), rows)
-        height, width, input_channels = sample_shape
-        depths, noise, emb = self.channels, self.noise_features, self.embedding_features
+        operations = SpatialCount()
         row = np.ones((rows,), np.int64)
-        count = projection_flops(row, noise, emb)
+        operations.flops = MPConv(self.embedding_features, parent=None).model_flops(row, self.noise_features)
         if text_features is not None:
-            count += projection_flops(row, text_features, emb)
+            operations.flops += MPConv(self.embedding_features, parent=None).model_flops(row, text_features)
+        height, width, channels = sample_shape
+        x = self.spatial_walk(SpatialShape((rows, height, width, channels + 1)),
+                              SpatialShape((rows, self.embedding_features)),
+                              train=False, operations=operations)
+        operations.project(self._convolution(self.output_channels, parent=None), x)
+        return operations.flops
 
-        def block(area, inputs, outputs, *, encoder: bool, attend: bool):
-            counted = Block(outputs, "enc" if encoder else "dec", attention=attend,
-                            channels_per_head=self.channels_per_head, parent=None)
-            return counted.spatial_flops(area, inputs, emb)
-
-        area = np.full((rows,), height * width, np.int64)
-        channels, skips = input_channels + 1, []
-        for level, features in enumerate(depths):
+    @nn.nowrap
+    def spatial_walk(self, x, emb, train, operations):
+        channels = self.channels
+        block = {"channels_per_head": self.channels_per_head, "dropout": self.dropout,
+                 "res_balance": self.res_balance, "attn_balance": self.attn_balance,
+                 "clip_act": self.clip_act, "attention_impl": self.attention_impl}
+        skips = []
+        for level, features in enumerate(channels):
+            size = x.shape[1] if level == 0 else skips[-1].shape[1] // 2
             if level == 0:
-                count += self._convolution(features, parent=None).model_flops(area, channels)
-                channels = features
+                x = operations.project(self._convolution(features, name=f"enc_{size}x{size}_conv"), x)
             else:
-                area = area // 4
-                count += block(area, channels, channels, encoder=True, attend=False)
-            skips.append(channels)
-            for _ in range(self.num_blocks):
-                count += block(area, channels, features, encoder=True,
-                                attend=height // 2**level in self.attn_resolutions)
-                channels = features
-                skips.append(channels)
-        for level in range(len(depths) - 1, -1, -1):
-            if level == len(depths) - 1:
-                count += block(area, channels, channels, encoder=False, attend=True)
-                count += block(area, channels, channels, encoder=False, attend=False)
+                x = operations.residual(Block(x.shape[-1], "enc", "down", name=f"enc_{size}x{size}_down",
+                          **block), x, emb, train=train)
+            skips.append(x)
+            for index in range(self.num_blocks):
+                x = operations.residual(Block(features, "enc", attention=size in self.attn_resolutions,
+                          name=f"enc_{size}x{size}_block{index}", **block), x, emb, train=train)
+                skips.append(x)
+
+        for level, features in reversed(list(enumerate(channels))):
+            size = x.shape[1]
+            if level == len(channels) - 1:
+                x = operations.residual(
+                    Block(x.shape[-1], "dec", attention=True, name=f"dec_{size}x{size}_in0", **block),
+                    x, emb, train=train)
+                x = operations.residual(Block(x.shape[-1], "dec", name=f"dec_{size}x{size}_in1", **block),
+                                        x, emb, train=train)
             else:
-                area = area * 4
-                count += block(area, channels, channels, encoder=False, attend=False)
-            for _ in range(self.num_blocks + 1):
-                count += block(area, channels + skips.pop(), depths[level], encoder=False,
-                                attend=height // 2**level in self.attn_resolutions)
-                channels = depths[level]
-        return count + self._convolution(self.output_channels, parent=None).model_flops(area, channels)
+                size *= 2
+                x = operations.residual(Block(x.shape[-1], "dec", "up", name=f"dec_{size}x{size}_up",
+                          **block), x, emb, train=train)
+            for index in range(self.num_blocks + 1):
+                x = operations.concatenate(x, skips.pop())
+                x = operations.residual(Block(features, "dec", attention=size in self.attn_resolutions,
+                          name=f"dec_{size}x{size}_block{index}", **block), x, emb, train=train)
+        return x
 
     @nn.compact
     def __call__(self, x: jax.Array, time: jax.Array, textcontext: TextContext | None = None,
                  train: bool = False) -> jax.Array:
-        channels, noise, width = self.channels, self.noise_features, self.embedding_features
-        block = {"channels_per_head": self.channels_per_head, "dropout": self.dropout,
-                 "res_balance": self.res_balance, "attn_balance": self.attn_balance,
-                 "clip_act": self.clip_act, "attention_impl": self.attention_impl}
+        noise, width = self.noise_features, self.embedding_features
         if self.dtype is not None:
             x = x.astype(self.dtype)
 
@@ -216,34 +245,7 @@ class EDM2UNet(nn.Module):
         emb = mp_silu(emb).astype(x.dtype)
 
         x = jnp.concatenate([x, jnp.ones_like(x[..., :1])], axis=-1)
-        skips = []
-        for level, features in enumerate(channels):
-            size = x.shape[1] if level == 0 else skips[-1].shape[1] // 2
-            if level == 0:
-                x = self._convolution(features, name=f"enc_{size}x{size}_conv")(x)
-            else:
-                x = Block(x.shape[-1], "enc", "down", name=f"enc_{size}x{size}_down",
-                          **block)(x, emb, train)
-            skips.append(x)
-            for index in range(self.num_blocks):
-                x = Block(features, "enc", attention=size in self.attn_resolutions,
-                          name=f"enc_{size}x{size}_block{index}", **block)(x, emb, train)
-                skips.append(x)
-
-        for level, features in reversed(list(enumerate(channels))):
-            size = x.shape[1]
-            if level == len(channels) - 1:
-                x = Block(x.shape[-1], "dec", attention=True, name=f"dec_{size}x{size}_in0",
-                          **block)(x, emb, train)
-                x = Block(x.shape[-1], "dec", name=f"dec_{size}x{size}_in1", **block)(x, emb, train)
-            else:
-                size *= 2
-                x = Block(x.shape[-1], "dec", "up", name=f"dec_{size}x{size}_up",
-                          **block)(x, emb, train)
-            for index in range(self.num_blocks + 1):
-                x = mp_cat(x, skips.pop(), t=self.concat_balance)
-                x = Block(features, "dec", attention=size in self.attn_resolutions,
-                          name=f"dec_{size}x{size}_block{index}", **block)(x, emb, train)
+        x = self.spatial_walk(x, emb, train, _EDMForward(self.concat_balance))
         gain = self.param("out_gain", nn.initializers.zeros, ())
         return self._convolution(self.output_channels, name="out_conv")(x, gain=gain)
 

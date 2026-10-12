@@ -242,6 +242,24 @@ class Conv(nn.Conv):
     conv_general_dilated: ConvGeneralDilatedT | None = _conv_general_dilated
 
     @nn.nowrap
+    def spatial_shape(self, shape: tuple[int, ...]) -> tuple[int, ...]:
+        """The native convolution's output geometry, without allocating its arrays."""
+        spatial = shape[:-1]
+        kernel = (self.kernel_size,) if isinstance(self.kernel_size, int) else tuple(self.kernel_size)
+        strides = ((self.strides,) * len(kernel) if isinstance(self.strides, int) else
+                   (1,) * len(kernel) if self.strides is None else tuple(self.strides))
+        dilation = ((self.kernel_dilation,) * len(kernel) if isinstance(self.kernel_dilation, int) else
+                    (1,) * len(kernel) if self.kernel_dilation is None else tuple(self.kernel_dilation))
+        effective = tuple((tap - 1) * rate + 1 for tap, rate in zip(kernel, dilation, strict=True))
+        if self.padding == 'SAME':
+            sizes = tuple((size + step - 1) // step for size, step in zip(spatial, strides, strict=True))
+        else:
+            padding = ((0, 0),) * len(kernel) if self.padding == 'VALID' else self.padding
+            sizes = tuple((size + sum(pad) - tap) // step + 1
+                          for size, tap, step, pad in zip(spatial, effective, strides, padding, strict=True))
+        return (*sizes, self.features)
+
+    @nn.nowrap
     def model_flops(self, lengths, input_channels: int) -> float:
         """Learned convolution products at the caller's real output positions."""
         taps = self.kernel_size if isinstance(self.kernel_size, int) else math.prod(self.kernel_size)

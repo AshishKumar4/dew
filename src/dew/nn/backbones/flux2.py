@@ -159,6 +159,10 @@ class Flux2Transformer(nn.Module):
     def features(self) -> int:
         return self.heads * self.head_dim
 
+    @nn.nowrap
+    def condition_lengths(self, lengths: np.ndarray, spans: np.ndarray) -> np.ndarray:
+        return spans
+
     @property
     def text_keyword(self) -> str:
         """Every call takes the text as `conditioning`, run beside the image in the double-stream blocks."""
