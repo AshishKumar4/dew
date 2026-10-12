@@ -51,7 +51,7 @@ from .generation import first_refusal
 IMPLEMENTATIONS = ('auto', 'xla', 'pallas')
 DTYPES = (jnp.dtype(jnp.float32), jnp.dtype(jnp.bfloat16))
 ROW_ELEMENTS = 2048
-MAX_PROGRAMS = 512
+MAX_PROGRAMS = 1024
 ROW_BLOCKS = 12
 ELEMENT_BLOCK = 1024
 
