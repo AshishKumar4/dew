@@ -17,7 +17,17 @@ from dew.data.analysis import _cache_at, _order_at, _preferred_read, _promoted, 
 from dew.data.compile import compile
 from dew.data.dataset import Batch, DataPhase, Loader, Loading, record_argument
 from dew.data.holdout import _HashSource, _named_split, _SelectedRow, _SliceRecords
-from dew.data.pipeline import Configured, HostStep, Mixture, ObjectiveData, Phases, Pipeline, Stage, mix
+from dew.data.pipeline import (
+    Configured,
+    HostStep,
+    MapBatch,
+    Mixture,
+    ObjectiveData,
+    Phases,
+    Pipeline,
+    Stage,
+    mix,
+)
 from dew.records import integer
 
 if TYPE_CHECKING:
@@ -582,8 +592,10 @@ class ImageData:
             if augment.jitter:
                 train = train.random_map(images.color_jitter())
         elif augment is not None:
-            train = train.random_map(images.augmentation_key()).map_batches(images.device_augment(
-                self.image_size, crop_scale=augment.crop_scale, flip=augment.flip, jitter=augment.jitter))
+            # The batch goes in before the device step (`_batched`).
+            device = images.device_augment(self.image_size, crop_scale=augment.crop_scale, flip=augment.flip,
+                                           jitter=augment.jitter)
+            train = train.random_map(images.augmentation_key()).then(MapBatch(device))
         held = None if held is None else prepared(held, self.image_size)
         return train, held, (EncodeCaptions(),)
 
@@ -626,8 +638,8 @@ class VideoData:
         audio = video.audio(self.audio_model)
         decoder = video.decode_clip(self.frames, size=self.frame_size, audio_padding=self.audio_padding,
                                     sample_rate=audio.processor.sampling_rate)
-        train = train.random_filter_map(decoder).map(audio)
-        held = None if held is None else held.random_filter_map(decoder).map(audio)
+        train = train.filter_map(decoder).map(audio)
+        held = None if held is None else held.filter_map(decoder).map(audio)
         return train, held, (EncodeCaptions(),)
 
 

@@ -779,7 +779,8 @@ def _objective_branch(pipeline: Pipeline, objective: ObjectiveData, *, train: bo
         branch = dataclasses.replace(
             branch, stages=(*branch.stages[:at], Group(objective.group), *branch.stages[at:])
         )
-    return branch.map_batches(*(objective.train_batch if train else objective.evaluate_batch))
+    steps = objective.train_batch if train else objective.evaluate_batch
+    return branch.then(*(MapBatch(step) for step in steps))
 
 
 def _metadata(pipelines: Sequence[Pipeline], read: Read) -> Mapping[str, object]:
