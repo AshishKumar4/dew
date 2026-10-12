@@ -267,6 +267,14 @@ def _source(
     return source(value, split=split, format=format)
 
 
+def _named_split(source: Source, split: Split) -> Source:
+    """`source`'s own split `split.name`, through its `with_split`; a source with no native splits
+    refuses it by name."""
+    if not isinstance(source, _SplitSource):
+        raise ValueError(f"source {source.describe()} has no native split {split.name!r}")
+    return source.with_split(split.name)
+
+
 def _branches(
     value: SourceValue | Mapping[str, float],
     validation: Validation,
@@ -301,9 +309,7 @@ def _branches(
             train = Pipeline(_SliceRecords(source, count), prefix)
             held = _SliceRecords(source, 0, count) if count else None
     elif isinstance(validation, Split):
-        if not isinstance(source, _SplitSource):
-            raise ValueError(f"source {source.describe()} has no native split {validation.name!r}")
-        held = source.with_split(validation.name)
+        held = _named_split(source, validation)
     elif validation is not None:
         held = _source(validation, format=format)
     evaluated = None if held is None else Pipeline(held, prefix)

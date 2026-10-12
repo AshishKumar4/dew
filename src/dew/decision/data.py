@@ -12,7 +12,7 @@ import numpy as np
 
 from dew import records
 from dew.data.pipeline import Configured, HostStep, Pipeline
-from dew.data.recipes import HoldOut, SourceValue, Split, Validation, _branches, source_argument
+from dew.data.recipes import HoldOut, SourceValue, Split, Validation, _branches, _named_split, source_argument
 from dew.data.sources.base import Read, ShardManifest, Source
 from dew.decision.questions import Choice, Question
 from dew.records import JSON, json_value, record
@@ -300,10 +300,7 @@ class Decisions:
         elif isinstance(self.validation, Pipeline):
             evaluated = self.validation
         elif isinstance(self.validation, Split):
-            # The named split of the training source, opened as every recipe opens one (`_branches`):
-            # through the source's own `with_split`, refused for a source with no native splits.
-            _, named = _branches(self.source, self.validation, split=self.split, prefix=())
-            held_source = _DecisionSource(named.source, table=table)
+            held_source = _DecisionSource(_named_split(dataset.source, self.validation), table=table)
             evaluated = Pipeline(held_source).map(Configured(_ParseConfigured(table), needs=()))
         elif isinstance(self.validation, Sequence) and not isinstance(self.validation, str):
             rows = tuple({"example": Example.of(row)} for row in self.validation)
