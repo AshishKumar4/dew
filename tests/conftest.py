@@ -111,13 +111,3 @@ def caplog(caplog):
 def rng():
     return jax.random.PRNGKey(0)
 
-
-@pytest.fixture(params=(None, "lowest", "highest"))
-def config_extreme(request):
-    """Each kernel at its usual config and at both ends of its space
-    (`dew.nn.kernels.tuning.pinned`): a kernel's float64 gate holds at
-    any config the autotuner may pick."""
-    from dew.nn.kernels import tuning
-
-    with tuning.pinned(request.param):
-        yield request.param
