@@ -372,7 +372,8 @@ def test_the_dew_qwen35_runner_trains_its_compiled_step(tmp_path, monkeypatch):
     runner = load("reference_runs/dew_qwen35_step")
     shapes = load("reference_runs/qwen35")
     model = translate_config(shapes.config(smoke=True)).value.clone(remat=None)
+    variables = model.init(jax.random.key(17), jnp.zeros((1, 16), jnp.int32))
     args = SimpleNamespace(smoke=True, seed=17, work=tmp_path / "work.json", warmup=1, steps=1)
-    trainer, state, compiled, batch, _, _ = runner.compile_step(args, model, None)
+    trainer, state, compiled, batch, _, _ = runner.compile_step(args, model, variables)
     seconds, _, samples, record = runner.train(args, trainer, state, compiled, batch)
     assert seconds > 0 and len(samples) == 1 and record["finite_losses"]
