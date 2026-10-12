@@ -2571,6 +2571,22 @@
     }
    ]
   },
+  "hf/mimo-audio-tiny": {
+   "tool": "tools/mimo_audio_reference.py",
+   "sources": [
+    {
+     "repo": "XiaomiMiMo/MiMo-V2.6-Pro-MOPD",
+     "version": "6a7f202e8dbd0e57b3fe1da03917d08d75abc4b8",
+     "runs": "fetched"
+    },
+    {
+     "repo": "pytorch/audio",
+     "version": "2.11.0",
+     "runs": "torchaudio"
+    }
+   ],
+   "note": "AudioTokenizerEncoder's pooled features and codes (tokenize_audio_batch) and MiMoAudioEncoder's embeddings, fp32 and float64 (model.npz); torchaudio's MelSpectrogram at MiMo-Audio-Tokenizer's mel_spectrogram settings, fp32 and float64 (mel.npz)."
+  },
   "hf/mimo-vision-tiny": {
    "tool": "tools/vit_reference.py",
    "sources": [
