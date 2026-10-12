@@ -322,6 +322,10 @@ class HloInstruction:
     """Where JAX traced it and what it fused: `op_name source_file:line` of
     its own metadata and of each op in the computations it calls. A
     multi-output fusion carries none of its own, its ops do."""
+    reads: frozenset[str]
+    """The traced names of the parameters it reads, through bitcasts, copies
+    and tuple elements: a jitted step's own are its arguments' paths, such
+    as `current.opt_state[0].mu['head']`."""
 
 
 def hlo_instructions(text: str | Iterable[str]) -> dict[str, HloInstruction]:
@@ -348,6 +352,16 @@ def hlo_instructions(text: str | Iterable[str]) -> dict[str, HloInstruction]:
         bodies[name] = frozenset(ops), frozenset(names)
         return bodies[name]
 
+    def parameters(computation: _Computation, operand: str) -> frozenset[str]:
+        instruction = computation.instructions.get(operand)
+        if instruction is None:
+            return frozenset()
+        if instruction.op == 'parameter':
+            return frozenset(instruction.traced)
+        if instruction.op in ('bitcast', 'copy', 'get-tuple-element'):
+            return frozenset().union(*(parameters(computation, each) for each in instruction.operands))
+        return frozenset()
+
     found = {}
     for computation in computations.values():
         for name, instruction in computation.instructions.items():
@@ -356,8 +370,10 @@ def hlo_instructions(text: str | Iterable[str]) -> dict[str, HloInstruction]:
             called = [fused(each) for each in calls]
             ops = called[0][0] if len(called) == 1 else frozenset().union(*(each for each, _ in called))
             names = frozenset(instruction.traced).union(*(each for _, each in called))
+            reads = frozenset().union(*(parameters(computation, each) for each in instruction.operands))
             found[name] = HloInstruction(instruction.op, target.group(1) if target else '',
-                                         tuple(instruction.operands), ops, instruction.recomputed, names)
+                                         tuple(instruction.operands), ops, instruction.recomputed, names,
+                                         reads)
     computations.clear()
     return found
 
