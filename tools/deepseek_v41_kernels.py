@@ -18,6 +18,8 @@ The GEMMs over fp8 and fp4 weights have no stand-in: the reference runs
 dense weights.
 """
 
+import ml_dtypes
+import numpy as np
 import torch
 
 FP8_MAX = 448.0
@@ -97,15 +99,16 @@ def fp4_act_quant(x, block_size=32, inplace=False, scale_dtype=torch.float8_e8m0
     return _fake_quant(x, quantized.flatten(-2), inplace)
 
 
-_E2M1 = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
-# Mantissa bit of each grid value; a tie goes to the neighbour whose bit is 0.
-_E2M1_ODD = torch.tensor([False, True, False, True, False, True, False, True])
+E2M1 = torch.from_numpy(np.arange(8, dtype=np.uint8).view(ml_dtypes.float4_e2m1fn).astype(np.float32))
+"""The non-negative E2M1 values by code, ml_dtypes' float4_e2m1fn (as dew.nn.fake_quant reads them)."""
+# Mantissa bit of each grid value, its code's bit 0; a tie goes to the neighbour whose bit is 0.
+_E2M1_ODD = torch.from_numpy(np.arange(8) % 2 == 1)
 
 
 def e2m1(values: torch.Tensor) -> torch.Tensor:
     """Round fp32 values within +-6 to the nearest E2M1 value, ties to even,
     which the kernel's cvt.rn to float4_e2m1fn does."""
-    grid = _E2M1.to(values.device, values.dtype)
+    grid = E2M1.to(values.device, values.dtype)
     magnitude = values.abs()
     upper = torch.bucketize(magnitude, grid).clamp(1, len(grid) - 1)
     lower = upper - 1

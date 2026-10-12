@@ -4,7 +4,7 @@
     "base": "cloudflare/debian-trixie",
     "setup": "tools/armada/setup.sh",
     "install": "tools/armada/install.sh",
-    "key": ["pyproject.toml", "constraints.txt", "tools/install_host_torch.sh"],
+    "key": ["locks/cpu.txt", "tools/install_environment.sh"],
     "smoke": ".venv-3.12/bin/python -c 'import dew' && .venv-3.14/bin/python -c 'import dew'"
   },
   "history": "commit",

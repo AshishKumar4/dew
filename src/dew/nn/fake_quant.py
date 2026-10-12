@@ -10,6 +10,20 @@ convert pair under jit, and the quantization silently does not happen.
 
 import jax
 import jax.numpy as jnp
+import ml_dtypes
+import numpy as np
+
+E2M1 = np.arange(16, dtype=np.uint8).view(ml_dtypes.float4_e2m1fn).astype(np.float32)
+"""Each E2M1 code's value in code order (ml_dtypes' float4_e2m1fn): 0 to 6
+by codes 0-7, then their negatives with the sign in bit 3, -0 included. The
+FP4 codecs, these quantizers and the fixture generators all read it."""
+
+E2M1_MIDPOINTS = (E2M1[:7] + E2M1[1:8]) / 2
+"""The magnitudes halfway between neighbouring E2M1 values, 0.25 up to 5."""
+
+E2M1_TIES_UP = np.arange(7) % 2 == 1
+"""Whether a magnitude exactly on each midpoint rounds up, to even: where the
+lower neighbour's mantissa bit, its code's bit 0, is 1 (0.5, 1.5, 3)."""
 
 _E4M3_MAX = float(jnp.finfo(jnp.float8_e4m3fn).max)
 _E2M1_MAX = float(jnp.finfo(jnp.float4_e2m1fn).max)
@@ -52,13 +66,6 @@ def _e2m1(values):
     return _round(values, 1, 0)
 
 
-# E2M1's midpoints, each with whether a value exactly on it rounds up: to
-# even, so up where the lower neighbour's mantissa bit is 1 (0.5, 1.5, 3).
-_E2M1_MIDPOINTS = ((0.25, False), (0.75, True), (1.25, False), (1.75, True), (2.5, False), (3.5, True),
-                   (5.0, False))
-_E2M1_VALUES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
-
-
 def _e2m1_quotient(values, scale):
     """E2M1 of `values / scale` under an E4M3 scale, ties to even, clamped to
     +-6, without dividing: |values| is compared with each midpoint times the
@@ -73,8 +80,9 @@ def _e2m1_quotient(values, scale):
     -1.25 rounds to -1.0)."""
     magnitude = jnp.abs(values)
     index = sum(((magnitude > point * scale) | ((magnitude == point * scale) if up else False))
-                .astype(jnp.int32) for point, up in _E2M1_MIDPOINTS)
-    return jnp.copysign(jnp.asarray(_E2M1_VALUES, jnp.float32)[index], values)
+                .astype(jnp.int32) for point, up in zip(E2M1_MIDPOINTS.tolist(), E2M1_TIES_UP.tolist(),
+                                                        strict=True))
+    return jnp.copysign(jnp.asarray(E2M1[:8])[index], values)
 
 
 def straight_through(x, rounded):
