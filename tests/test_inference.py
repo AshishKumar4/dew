@@ -327,6 +327,26 @@ def test_another_guidance_scale_seed_or_grid_reuses_the_compiled_walk(tmp_path):
     assert pipelines._run(None)._cache_size() == compiled
 
 
+def test_a_solver_that_is_no_pytree_is_refused_with_how_to_declare_it(tmp_path):
+    """A call takes its solver as data, so a solver wrapper written as a plain class is refused before
+    the walk compiles, naming what to declare it as."""
+
+    class Plain:
+        def __init__(self, inner):
+            self.inner = inner
+
+        def init(self, x, times, process, *, key):
+            return self.inner.init(x, times, process, key=key)
+
+        def step(self, *arguments):
+            return self.inner.step(*arguments)
+
+    make_run(tmp_path)
+    pipe = TextToImage.from_run(str(tmp_path))
+    with pytest.raises(TypeError, match=r"solver Plain is no pytree.*flax struct\.dataclass"):
+        pipe(["x"], steps=4, solver=Plain(Heun()), key=0)
+
+
 def test_the_run_record_refuses_a_field_it_does_not_know(tmp_path):
     """A run.json from another objective, or with a knob this class lacks,
     raises a ValueError naming the field, and no model is built from it."""
