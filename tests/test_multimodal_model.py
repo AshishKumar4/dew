@@ -33,6 +33,52 @@ from dew.training import Layout, MeshSpec, Trainer
 FIXTURE = Path(__file__).parent / "fixtures" / "hf" / "gemma3-native-tiny"
 
 
+@pytest.mark.parametrize("name", [
+    "qwen38-dense-tiny", "gemma3-native-tiny", "gemma4-native-tiny", "qwen35-native-tiny",
+    "llama4-native-tiny", "gemma-3n-audio-tiny", "gemma-4-audio-tiny",
+])
+def test_text_preprocessing_matches_the_sources_full_processor(name):
+    from transformers import AutoProcessor
+
+    from dew.data.text import load_tokenizer
+
+    directory = FIXTURE.parent / name
+    tokenizer = load_tokenizer(str(directory), local_files_only=True)
+    options = {"backend": "pil"} if name == "gemma3-native-tiny" else {}
+    reference = AutoProcessor.from_pretrained(str(directory), local_files_only=True, **options)
+    loaded = Pretrained.load(directory, dtype="float32", attention_impl="reference")
+    processor = loaded.processor
+    assert processor is not None
+    for text in ("token4", ["token4", "token4 token5", "A text-only request"]):
+        expected = reference(text=text, padding=True, truncation=False, return_tensors="np")
+        encoded = tokenizer(text=text, padding=True, truncation=False, return_tensors="np")
+        for field in ("input_ids", "attention_mask"):
+            np.testing.assert_array_equal(encoded[field], expected[field])
+        inputs = processor(text)
+        np.testing.assert_array_equal(inputs.tokens, expected["input_ids"])
+        decoded = reference.batch_decode(expected["input_ids"], skip_special_tokens=True)
+        assert tokenizer.batch_decode(encoded["input_ids"], skip_special_tokens=True) == decoded
+        assert processor.decode(inputs.tokens) == decoded
+    for content in ("token4", [{"type": "text", "text": "token4"}]):
+        messages = [{"role": "user", "content": content}]
+        if reference.chat_template is None:
+            for host in (reference, tokenizer):
+                with pytest.raises(ValueError, match="chat template"):
+                    host.apply_chat_template(messages, tokenize=False)
+            with pytest.raises(ValueError, match="chat template"):
+                processor.chat(messages)
+        else:
+            rendered = reference.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+            assert tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True) == rendered
+            expected = reference.apply_chat_template(
+                messages, tokenize=True, return_dict=True, return_tensors="np", add_generation_prompt=True)
+            encoded = tokenizer.apply_chat_template(
+                messages, tokenize=True, return_dict=True, return_tensors="np", add_generation_prompt=True)
+            np.testing.assert_array_equal(encoded["input_ids"], expected["input_ids"])
+            np.testing.assert_array_equal(processor.chat(messages).tokens, expected["input_ids"])
+
+
 @pytest.fixture(scope="module")
 def source():
     loaded = Pretrained.load(FIXTURE, dtype="float32", attention_impl="reference")
@@ -144,6 +190,7 @@ def test_source_processor_rejects_unknown_fields_and_incorrect_image_counts(sour
 
 @pytest.fixture(scope='module')
 def gemma4_video_batch():
+    from transformers import AutoProcessor
     from transformers.video_utils import VideoMetadata
 
     loaded = Pretrained.load(
@@ -152,7 +199,8 @@ def gemma4_video_batch():
     native = loaded.processor
     if native is None:
         raise ValueError('the Gemma4 fixture requires its saved Processor')
-    processor = native.reference
+    processor = AutoProcessor.from_pretrained(
+        str(FIXTURE.parent / "gemma4-native-tiny"), local_files_only=True)
     vision = native.config.get('vision_config')
     if not isinstance(vision, dict):
         raise ValueError('the Gemma4 fixture requires its vision configuration')
