@@ -85,24 +85,14 @@ from .llama4 import (
     Llama4VisionTransformer as Llama4VisionTransformer,
     llama4_vision_path,
 )
-from .mimo import (
-    MiMoProjector as MiMoProjector,
-    MiMoVision as MiMoVision,
-    mimo_vision_path,
-    translate_mimo_vision_weights,
-)
+from .mimo import MiMoProjector as MiMoProjector, MiMoVision as MiMoVision, mimo_vision_path
 from .muse_glimmer import (
     MuseGlimmerProjector as MuseGlimmerProjector,
     MuseGlimmerProjectorModule as MuseGlimmerProjectorModule,
     MuseGlimmerVision as MuseGlimmerVision,
     muse_glimmer_vision_path,
 )
-from .qwen35 import (
-    Qwen35Projector as Qwen35Projector,
-    Qwen35Vision as Qwen35Vision,
-    qwen35_vision_path,
-    translate_qwen35_vision_weights,
-)
+from .qwen35 import Qwen35Projector as Qwen35Projector, Qwen35Vision as Qwen35Vision, qwen35_vision_path
 from .siglip import (
     GemmaProjector as GemmaProjector,
     GemmaProjectorModule as GemmaProjectorModule,
@@ -115,6 +105,7 @@ from .vit import (
     MergeProjector as MergeProjector,
     VisionTransformer as VisionTransformer,
     ViTLayout as ViTLayout,
+    translate_vit_weights,
 )
 
 # Where each tower and projector kind's tensors sit in a media checkpoint, and
@@ -132,7 +123,7 @@ TOWER_PATHS: dict[str, Callable[[str], tuple[str, ...] | None]] = {
     "siglip": siglip_vision_path, "llama4": llama4_vision_path, "gemma4": gemma4_vision_path,
     "qwen3_5": qwen35_vision_path, "gemma3n": gemma3n_vision_path, "deepseek_v41": deepseek_v41_vision_path,
     "mimo": mimo_vision_path, "muse_glimmer": muse_glimmer_vision_path}
-# Qwen 3.5's tower reshapes its patch convolution, and three projectors check
+# The Qwen-style towers reshape their patch convolution (`translate_vit_weights`), and three projectors check
 # their tensors; every other map reads one tensor to one leaf.
 _PROJECTOR_WEIGHTS: dict[str, Callable[..., Variables]] = {
     "gemma": translate_gemma_projector_weights,
@@ -143,10 +134,8 @@ _PROJECTOR_WEIGHTS: dict[str, Callable[..., Variables]] = {
 
 def tower_variables(kind: str, hf_tensors: Mapping[str, np.ndarray], param_dtype: str) -> Variables:
     """One vision tower's variables, in the requested storage."""
-    if kind == "qwen3_5":
-        return {"params": translate_qwen35_vision_weights(hf_tensors, param_dtype=param_dtype)}
-    if kind == "mimo":
-        return {"params": translate_mimo_vision_weights(hf_tensors, param_dtype=param_dtype)}
+    if kind in ("qwen3_5", "mimo"):
+        return {"params": translate_vit_weights(hf_tensors, TOWER_PATHS[kind], param_dtype)}
     if kind not in TOWER_PATHS:
         raise ValueError(f"tower kind {kind!r} has no weight map here")
     tree = translate_parameters(hf_tensors, TOWER_PATHS[kind], param_dtype)

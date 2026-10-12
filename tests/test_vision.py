@@ -256,7 +256,7 @@ def test_qwen35_tower_matches_the_reference_implementation():
     fixture = load_fixture("qwen35-vision-tiny")
     record = qwen35.translate_qwen35_vision_config(fixture["config"])
     tower = towers.from_record(record).build()
-    variables = {"params": qwen35.translate_qwen35_vision_weights(fixture["tensors"])}
+    variables = tower_variables("qwen3_5", fixture["tensors"], "float32")
     assert np.max(np.abs(
         np.asarray(tower.apply(variables, fixture["pixels"])) - fixture["tower_ref"])) < 1e-4
     unpositioned = jax.tree_util.tree_map_with_path(
@@ -344,7 +344,8 @@ def test_a_qwen35_merger_beside_the_decoder_width_is_refused():
 
 
 def shared_fixture(name):
-    """A tools/vit_reference.py fixture: the reference config, the tower's and projector's tensors,
+    """A tools/mimo_reference.py or tools/muse_glimmer_reference.py fixture: the reference config, the
+    tower's and projector's tensors,
     and the IEEE references (`refs.npz`)."""
     directory = FIXTURES / name
     return (json.loads((directory / "config.json").read_text()),

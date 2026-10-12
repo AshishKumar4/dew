@@ -96,6 +96,8 @@ class MiMoAudio(TowerBase):
     out_hidden_size: int = 6144
     speech_vocab_size: tuple[int, ...] = (1280,) * 20
     audio_segment_size: int = 6000
+    tokenizer_batch_frames: int = 256000
+    """The mel frames the reference tokenizes in one batch (tokenize_audio_batch's `_at_group_by_length`)."""
 
     def build(self) -> nn.Module:
         return MiMoAudioTower(self)
@@ -109,22 +111,34 @@ class AudioTokenizerEncoder(nn.Module):
     quantizer). Each row is one sequence of `lengths` mel frames: two GELU convolutions, the second
     halving time; the blocks, the output of layer `encoder_skip_layer_id - 1` added back after the
     last; a layer norm; then a bias-free convolution pooling `avg_pooler` frames, GELU and a layer norm.
-    Returns the features `[B, frames, d_model]` the quantizer reads and which frames hold one."""
+    Returns the features `[B, frames, d_model]` the quantizer reads and which frames hold one.
+
+    The reference runs its segments in batches and pads each to the batch's longest, which reaches
+    the frames at a row's end: `batch_lengths` is the longest of each row's batch, every row's own
+    batch where None (`MiMoAudioTower` groups them as tokenize_audio_batch does)."""
 
     config: MiMoAudioTokenizer
     dtype: Dtype | None = None
     precision: PrecisionLike = None
 
     @nn.compact
-    def __call__(self, mels, lengths):
+    def __call__(self, mels, lengths, batch_lengths=None):
         cfg = self.config
+        batch_lengths = jnp.max(lengths) if batch_lengths is None else batch_lengths
         conv = functools.partial(nn.Conv, cfg.d_model, dtype=self.dtype, precision=self.precision)
         place = jnp.arange(mels.shape[1])[None, :]
         x = jnp.where((place < lengths[:, None])[..., None], mels, 0)
         x = gelu_exact(conv((cfg.kernel_size,), padding=((1, 1),), name="conv1")(x))
+        # The reference's first convolution ends where its batch does; the second reads zeros past it.
+        ends = jnp.broadcast_to(batch_lengths + 3 - cfg.kernel_size, lengths.shape)
+        x = jnp.where((jnp.arange(x.shape[1])[None, :] < ends[:, None])[..., None], x, 0)
         x = gelu_exact(conv((cfg.kernel_size,), strides=(cfg.stride_size,), padding=((1, 1),),
                             name="conv2")(x))
-        counts = (lengths + 3 - cfg.kernel_size + 2 - cfg.kernel_size) // cfg.stride_size + 1
+
+        def convolved(frames):
+            return (frames + 3 - cfg.kernel_size + 2 - cfg.kernel_size) // cfg.stride_size + 1
+
+        counts, widest = convolved(lengths), convolved(jnp.broadcast_to(batch_lengths, lengths.shape))
         valid = jnp.arange(x.shape[1])[None, :] < counts[:, None]
         heads = cfg.encoder_attention_heads
         skip = None
@@ -155,7 +169,7 @@ class AudioTokenizerEncoder(nn.Module):
             # longest, each place repeats the row's last frame, and past the longest it is zero.
             last = jnp.take_along_axis(x, jnp.maximum(counts - 1, 0)[:, None, None], axis=1)
             spot = jnp.arange(x.shape[1])[None, :, None]
-            x = jnp.where(spot < counts[:, None, None], x, jnp.where(spot < jnp.max(counts), last, 0))
+            x = jnp.where(spot < counts[:, None, None], x, jnp.where(spot < widest[:, None, None], last, 0))
             x = jnp.pad(x, ((0, 0), (0, -x.shape[1] % pool), (0, 0)))
             x = gelu_exact(conv((pool,), strides=(pool,), padding="VALID", use_bias=False,
                                 name="down_sample_layer")(x))
@@ -246,7 +260,7 @@ class MiMoAudioTower(nn.Module):
         mels = mels.reshape(clips * segments, size, mel)
         spans = jnp.clip(lengths[:, None] - jnp.arange(segments)[None, :] * size, 0, size).reshape(-1)
         features, valid = AudioTokenizerEncoder(cfg.tokenizer, dtype=self.dtype, precision=self.precision,
-                                                name="tokenizer")(mels, spans)
+                                                name="tokenizer")(mels, spans, batch_longest(spans, cfg))
         codes = ResidualQuantizer(cfg.tokenizer.codebook_size, cfg.tokenizer.d_model,
                                   name="quantizer")(features)
         # Only a clip's last segment is short, so its codes are a prefix of the joined rows.
@@ -256,6 +270,21 @@ class MiMoAudioTower(nn.Module):
             codes, counts)
         groups = -(-counts // cfg.group_size)
         return AudioEncoding(features, jnp.arange(features.shape[1])[None, :] < groups[:, None])
+
+
+def batch_longest(spans, config: MiMoAudio) -> jax.Array:
+    """Each segment's reference batch's longest: tokenize_audio_batch takes the segments in order into
+    batches of at most `tokenizer_batch_frames` frames (`_at_group_by_length`), a segment that would
+    pass the bound opening the next batch unless its batch is empty; empty segments join none."""
+
+    def take(carry, span):
+        total, batch = carry
+        opens = (total + span > config.tokenizer_batch_frames) & (total > 0)
+        return (jnp.where(opens, span, total + span), batch + opens), batch + opens
+
+    _, batches = jax.lax.scan(take, (jnp.zeros((), spans.dtype), jnp.zeros((), jnp.int32)), spans)
+    longest = jax.ops.segment_max(spans, batches, num_segments=spans.shape[0])
+    return longest[batches]
 
 
 def translate_mimo_audio_config(audio_config: Mapping[str, object],
@@ -268,9 +297,10 @@ def translate_mimo_audio_config(audio_config: Mapping[str, object],
     if records.number(audio_config.get("partial_rotary_factor", 1.0), "partial_rotary_factor") != 1.0:
         raise ValueError("the audio encoder rotates every head dimension")
     channels = records.integer(audio_config["audio_channels"], "audio_channels")
-    vocab = audio_config.get("speech_vocab_size", 1280)
-    sizes = ([int(x) for x in vocab.split("-")] if isinstance(vocab, str) and "-" in vocab
-             else [records.integer(int(vocab), "speech_vocab_size")] * channels)  # type: ignore[arg-type]
+    # The release writes the vocabularies as text: one size for every channel, or each one's, dashed.
+    vocab = str(audio_config.get("speech_vocab_size", 1280))
+    sizes = [records.integer(int(size), "speech_vocab_size") for size in vocab.split("-")]
+    sizes = sizes if len(sizes) > 1 else sizes * channels
     stages = records.integer(tokenizer_config.get("num_quantizers", 20), "num_quantizers")
     books = tokenizer_config.get("codebook_size", 1024)
     books = records.integers(books, "codebook_size") if isinstance(books, (list, tuple)) else (
@@ -394,7 +424,7 @@ def translate_mimo_audio_weights(tokenizer: Mapping[str, np.ndarray], encoder: M
     for name, tensor in list(tensors.items()):
         if name.endswith("k_proj.weight"):
             bias = name.removesuffix("weight") + "bias"
-            tensors.setdefault(bias, np.zeros(np.shape(tensor)[0], np.float32))
+            tensors.setdefault(bias, np.zeros(np.shape(tensor)[0], np.asarray(tensor).dtype))
     params = translate_parameters(tensors, mimo_audio_tokenizer_path, param_dtype)
     params.update(translate_parameters(encoder, mimo_audio_encoder_path, param_dtype))
     return {"params": params}
