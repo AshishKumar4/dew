@@ -1077,6 +1077,13 @@ Engine's `transformer_engine.jax.flax.DotProductAttention` (built from source fo
 FlashAttention-2 wheel rebuilt for sm90, and torch's `F.scaled_dot_product_attention` under the cuDNN
 backend and `kernels.get_kernel("kernels-community/flash-attn3").flash_attn_func`.
 
+### FlashAttention-2 on the RTX PRO 6000, 2026-10-11
+
+At Qwen3.5's attention (B 2 and 4 x 3072 tokens, 16 query and 4 key heads of 256, causal bf16), where
+cuDNN refuses heads over 128, the wheel's sm120 build ran forward and backward in 3.27 and 6.32 ms
+against XLA's 9.84 and 19.34 on a G4, its float64 distances those of FlashAttention-2 in torch, so
+sm120's row names 'flash'.
+
 ### Splash's tiles on the TPU, 2026-10-02
 
 Splash attention took 34 ms of Dew's 156 ms Qwen3-0.6B step at 8 x 1024
@@ -1450,11 +1457,13 @@ together. The whole rule's float64 RMS ratios were at most 1.002 at default
 precision and 1.324 at highest, with bitwise repeats.
 
 Both kernels are gone (2026-10-12). Dew's port of fla 0.5.2's nine kernels
-(`dew.nn.kernels.fla_gdn`) runs the gated delta rule on every GPU of sm80
-or later, on any heads, dtypes, chunk sizes and mesh, with keys up to 256
-wide in bf16 or fp16 and 128 in fp32 (`dew.nn.linear.fla_rule`). The XLA
-math stays for CPUs, TPUs, older GPUs, forward-mode traces, float64 and
-wider keys, and as the tests' oracle (`port_refusal` names the GPU cases).
+(`dew.nn.kernels.fla_gdn`) runs the gated delta rule on every GPU whose
+target row names it (`'gated_delta_rule': 'fla'` on sm80, sm89, sm90 and
+sm120, where it was measured; the row is what qualification reads), on any
+heads, dtypes, chunk sizes and mesh, with keys up to 256 wide in bf16 or
+fp16 and 128 in fp32 (`dew.nn.linear.fla_rule`). The XLA math stays for
+CPUs, TPUs, unmeasured GPUs, forward-mode traces, float64 and wider keys,
+and as the tests' oracle (`port_refusal` names each case).
 On a G4 the port's bf16 forward ran 1.32 and 1.18 ms at the 0.8B's (8 x
 3072 tokens, 16 key and 16 value heads of 128) and the 9B's (4 x 3072, 16
 and 32) shapes against fla's 2.66 and 2.37 (kernel lab `fwd` job,
