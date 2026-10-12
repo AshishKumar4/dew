@@ -51,37 +51,44 @@ class Hub:
         )
 
     @cached_property
-    def files(self) -> Files:
+    def streamed(self) -> str:
+        """The immutable revision the split's shards are streamed from, pinned
+        once, so the snapshot and the shard URLs name the same files. It is
+        the resolved commit, or for the default revision when that commit
+        holds no native Parquet, Arrow or JSONL files of the split, the commit
+        its Parquet conversion (refs/convert/parquet) holds. The conversion
+        moves on its own, so the snapshot names it apart from the commit."""
         from huggingface_hub import HfApi
 
-        revision = self.commit
+        if self.revision is not None or self._selected(self.commit)[0]:
+            return self.commit
+        converted = HfApi().dataset_info(self.repo, revision="refs/convert/parquet").sha
+        if converted is None:
+            raise ValueError(f"HF {self.repo!r} conversion did not resolve to a commit")
+        return converted
 
-        paths, format = self._selected(
-            HfApi().list_repo_files(self.repo, repo_type="dataset", revision=revision)
-        )
-        if not paths:
-            if self.revision is not None:
-                raise FileNotFoundError(
-                    f"HF {self.repo!r}@{revision} split {self.split!r} "
-                    "has no native Parquet, Arrow or JSONL files; "
-                    "pin the converted branch's own commit explicitly, "
-                    "or provision=True for Arrow at this revision"
-                )
-            revision = HfApi().dataset_info(self.repo, revision="refs/convert/parquet").sha
-            if revision is None:
-                raise ValueError(f"HF {self.repo!r} conversion did not resolve to a commit")
-            paths, format = self._selected(
-                HfApi().list_repo_files(self.repo, repo_type="dataset", revision=revision)
+    @cached_property
+    def files(self) -> Files:
+        paths, format = self._selected(self.streamed)
+        if not paths and self.revision is not None:
+            raise FileNotFoundError(
+                f"HF {self.repo!r}@{self.commit} split {self.split!r} "
+                "has no native Parquet, Arrow or JSONL files; "
+                "pin the converted branch's own commit explicitly, "
+                "or provision=True for Arrow at this revision"
             )
         if not paths:
             raise FileNotFoundError(
                 f"HF {self.repo!r} split {self.split!r} has no physical readable shards; "
                 "name an hf:// Parquet URL or explicitly provision Arrow"
             )
-        urls = tuple(f"hf://datasets/{self.repo}@{revision}/{path}" for path in sorted(paths))
+        urls = tuple(f"hf://datasets/{self.repo}@{self.streamed}/{path}" for path in sorted(paths))
         return Files(urls, format=format)
 
-    def _selected(self, paths: list[str]) -> tuple[list[str], Format]:
+    def _selected(self, revision: str) -> tuple[list[str], Format]:
+        from huggingface_hub import HfApi
+
+        paths = HfApi().list_repo_files(self.repo, repo_type="dataset", revision=revision)
         formats: tuple[Format, ...] = ("parquet", "arrow", "jsonl")
         for format in formats:
             matches = [
@@ -103,13 +110,16 @@ class Hub:
         return f"hf:{self.repo}@{self.commit}:{self.config}:{self.split}"
 
     def snapshot(self) -> Mapping[str, object]:
-        """The pinned split. The resolved commit fixes every file the split is
-        read or prepared from, so the snapshot is the same on any host, in any
-        cache directory, whether or not Arrow was prepared there."""
+        """The pinned split: the resolved commit Arrow is prepared from, and the
+        commit its shards are streamed from (`streamed`). The two commits fix
+        every file the split is read or prepared from, so the snapshot is the
+        same on any host, in any cache directory, whether or not Arrow was
+        prepared there."""
         return {
             "store": "hf",
             "repo": self.repo,
             "revision": self.commit,
+            "streamed": self.streamed,
             "config": self.config,
             "split": self.split,
         }
