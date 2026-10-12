@@ -64,9 +64,9 @@ Dew's GPUs (an RTX PRO 6000's 128 MB), so no call finds the last one's
 operands in cache, as no training step does."""
 
 _STATE = jax.make_user_context((0, None))
-"""(loads, pin): how many times picks arrived in this process, and the pinned
-end. JAX keys its trace and compile caches on it, so a program lowered again
-after picks arrive, or under another pin, is traced again."""
+"""(tunes, pin): how many times `tune` added picks in this process, and the
+pinned end. JAX keys its trace and compile caches on it, so a program lowered
+again after picks arrive, or under another pin, is traced again."""
 
 _PICKS: dict[tuple[tokamax.Op, str], _Picks] = {}
 _LOADED: set[str] = set()
@@ -208,15 +208,14 @@ def _measured(op: KernelOp, ba: tokamax.BoundArguments) -> AutotuningData:
 
 
 def _added(picks: tokamax.AutotuningResult) -> None:
-    """Take `picks` into each launch's in-process cache, and trace anew."""
+    """Take `picks` into each launch's in-process cache."""
     for ba, timings in picks.data:
         ba.op.get_autotuning_cache(picks.device_kind)[ba.autotuning_cache_key] = timings.prune()
-    loads, pin = _STATE.get_global()
-    _STATE.set_global((loads + 1, pin))
 
 
 def _load(kind: str) -> None:
-    """Read the picks stored for GPUs of `kind`, once a process."""
+    """Read the picks stored for GPUs of `kind`, once a process, at its first
+    launch's lookup: no program traced before them, so none is traced again."""
     if kind in _LOADED:
         return
     _LOADED.add(kind)
@@ -275,6 +274,9 @@ def tune(jitted: jax.stages.Wrapped, *args) -> bool:
     if text is None:
         return False
     _added(tokamax.AutotuningResult.loads(text))
+    # Programs traced before these picks arrived are traced again.
+    tunes, pin = _STATE.get_global()
+    _STATE.set_global((tunes + 1, pin))
     return True
 
 
@@ -286,6 +288,6 @@ def pinned(extreme: str | None) -> Iterator[None]:
     that times one end."""
     if extreme not in (None, *EXTREMES):
         raise ValueError(f"extreme must be one of {EXTREMES} or None, not {extreme!r}")
-    loads, _ = _STATE.value
-    with _STATE((loads, extreme)):
+    tunes, _ = _STATE.value
+    with _STATE((tunes, extreme)):
         yield
