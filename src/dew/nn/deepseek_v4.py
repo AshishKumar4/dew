@@ -57,6 +57,7 @@ from dew.nn.attention import (
     document_mask,
     unweighted_rmsnorm,
 )
+from dew.nn.attention_sinks import sink_softmax
 from dew.nn.fake_quant import fake_quant_fp4, fake_quant_fp8
 from dew.nn.inputs import AttentionMetadata
 from dew.nn.kv_cache import KVCache, write_cache
@@ -784,8 +785,7 @@ class DeepseekV4Attention(nn.Module):
         logits = jnp.einsum('bshd,btd->bhst', query.astype(wide), keys.astype(wide),
                             precision=self.precision) * self.head_dim ** -0.5
         logits = jnp.where(allowed[:, None], logits, -jnp.inf)
-        sinks = jnp.broadcast_to(self.sinks[None, :, None, None], (batch, self.num_heads, length, 1))
-        probs = jax.nn.softmax(jnp.concatenate([logits, sinks], axis=-1), axis=-1)[..., :-1]
+        probs = sink_softmax(logits, self.sinks)
         context = jnp.einsum('bhst,btd->bshd', probs.astype(keys.dtype), keys, precision=self.precision)
         # The values are the rotated keys, so the rope slice of the output is
         # turned back at the query's position (:853-859).
