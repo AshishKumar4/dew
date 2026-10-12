@@ -76,6 +76,15 @@ class ReadsTrain(Protocol):
     def reads_train(self) -> bool: ...
 
 
+@runtime_checkable
+class RoutesExperts(Protocol):
+    """A token mixer whose call takes `routes`, the layer's replayed experts,
+    because it routes over experts itself (an MLP in the mixer's slot)."""
+
+    @property
+    def routes_experts(self) -> bool: ...
+
+
 @dataclasses.dataclass(frozen=True)
 class Mixture:
     """The experts that some layers route to, and how the router chooses among them.
@@ -780,9 +789,10 @@ class DecoderBlock(nn.Module):
             state, normed = self._stream_normed(self.input_layernorm, state, None)
         else:
             normed = self.input_layernorm(read)
+        routes = self._routes(per_layer_input)
         mixed = self._mix(
-            normed, decode, positions, segment_ids, kv_store, attention_metadata, prediction_phase, train
-        )
+            normed, decode, positions, segment_ids, kv_store, attention_metadata, prediction_phase, train,
+            routes if self._mixer_routes else {})
         if self.wiring.output_norms:
             mixed = self.attention_output_norm(mixed)
         attention_branch = self._branch(mixed, train)
@@ -796,7 +806,7 @@ class DecoderBlock(nn.Module):
                 x=(state.x + self.laurel(normed)) * jnp.asarray(1 / math.sqrt(2), state.x.dtype)
             )
         if self.feedforward is not None:
-            routes = self._routes(per_layer_input)
+            routes = routes if self.routed else {}
             if joined is not None:
                 state, mlp_input = self._stream_normed(*joined, attention_branch)
                 state, read, site = self._read(state, "mlp")
@@ -966,15 +976,17 @@ class DecoderBlock(nn.Module):
                      reduce_fn=lambda _, value: value, init_fn=lambda: mean)
 
     def _mix(self, x, decode: bool, positions, segment_ids, kv_store, attention_metadata,
-             prediction_phase: PredictionPhase, train: bool):
-        """The token mixer over `x`. The store, the metadata and a prediction
-        phase other than ordinary reach it only when the call carries them,
-        since a mixer with no use for one does not take it."""
+             prediction_phase: PredictionPhase, train: bool, routes: dict):
+        """The token mixer over `x`. The store, the metadata, a prediction
+        phase other than ordinary and the layer's replayed experts reach it
+        only when the call carries them, since a mixer with no use for one
+        does not take it."""
         return self.self_attn(
             x,
             decode=decode,
             positions=positions,
             segment_ids=segment_ids,
+            **routes,
             **(
                 {"train": train}
                 if isinstance(self.self_attn, ReadsTrain) and self.self_attn.reads_train
@@ -1000,9 +1012,20 @@ class DecoderBlock(nn.Module):
                 "model passes down the stack as attention_metadata.token_ids")
         return {"tokens": attention_metadata.token_ids}
 
+    @property
+    def _mixer_routes(self) -> bool:
+        """Whether the token mixer is the layer's routed site. A layer replays
+        one routing record, so its mixer and its feed-forward do not both route."""
+        routes = isinstance(self.self_attn, RoutesExperts) and self.self_attn.routes_experts
+        if routes and self.routed:
+            raise ValueError("a layer replays one routing record, and this one routes in both its mixer "
+                             "and its feed-forward; route in one of them")
+        return routes
+
     def _routes(self, per_layer_input: LayerInputs | None) -> dict:
-        """The replayed experts for a routed feed-forward, nothing otherwise."""
-        if not self.routed or per_layer_input is None or per_layer_input.experts is None:
+        """The layer's replayed experts, for its one routed site, the feed-forward
+        or the mixer; nothing without a record."""
+        if per_layer_input is None or per_layer_input.experts is None:
             return {}
         return {"routes": (per_layer_input.experts, per_layer_input.routed)}
 

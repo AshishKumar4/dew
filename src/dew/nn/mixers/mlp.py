@@ -11,7 +11,7 @@ from flax import linen as nn
 
 from dew.nn.flops import counted_flops
 from dew.nn.mixer_base import MixerBase, MixerContext
-from dew.nn.moe import SparseMLP
+from dew.nn.moe import Routes, SparseMLP
 from dew.nn.protocols import ProjectionGroup, declared_groups
 
 if TYPE_CHECKING:
@@ -31,10 +31,17 @@ class _MLP(nn.Module):
     def setup(self):
         nn.share_scope(self, self.feedforward)
 
+    @property
+    def routes_experts(self) -> bool:
+        """Whether its feed-forward routes over experts, and so takes the
+        layer's replayed ones (`decoder_block.RoutesExperts`)."""
+        return isinstance(self.feedforward, SparseMLP)
+
     def __call__(self, x, decode: bool = False, positions=None, segment_ids=None, kv_store=None,
-                 attention_metadata=None):
+                 attention_metadata=None, routes: Routes | None = None):
+        # Tokenwise: no position, document, cache or metadata changes what an MLP computes.
         del decode, positions, segment_ids, kv_store, attention_metadata
-        return self.feedforward(x)
+        return self.feedforward(x) if routes is None else self.feedforward(x, routes=routes)
 
     def projection_groups(self) -> tuple[ProjectionGroup, ...]:
         """The packed groups its feed-forward declares (`ProjectionSites`), in the scope they share."""
