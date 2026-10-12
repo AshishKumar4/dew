@@ -69,13 +69,10 @@ jobs:
       - uses: astral-sh/setup-uv@v6
         with:
           enable-cache: true
-          cache-dependency-glob: |
-            pyproject.toml
-            constraints.txt
+          cache-dependency-glob: locks/cpu.txt
       - name: Install dependencies
         run: |
-          sh tools/install_host_torch.sh --system
-          uv pip install --system -e ".[ci,mutation]" -c constraints.txt
+          sh tools/install_environment.sh cpu --system
       - name: Run mutation tests
         run: |
           file=()
