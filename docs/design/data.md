@@ -157,7 +157,7 @@ ds = (Files("gs://bucket/laion/*.array_record")
         .map(images.device_augment(256, crop_scale=(0.6, 1), jitter=True)))   # crop, flip, colour on the GPU
 ```
 
-The host only decodes and resizes. The accelerator crops, flips and colour-jitters each batch, each image by the key its record drew, so the result is the same on every worker count and after a resume. On an 8-vCPU host this reads about 2.4× the images per second that host-side augmentation reads (512×384 JPEGs to 256 crops).
+The host only decodes and resizes. A device step like `device_augment` runs inside the compiled training step, on each device's shard of the batch: every accelerator crops, flips and colour-jitters its own rows, each image by the key its record drew, so the result is the same on every worker count and after a resume. On an 8-vCPU host this reads about 2.4× the images per second that host-side augmentation reads (512×384 JPEGs to 256 crops).
 
 ### Several sources, one downloaded on the fly
 
@@ -297,7 +297,7 @@ Training and validation use the same preset, so both are prepared the same way. 
 | `shuffle`, `mix`, `interleave`, `filter`, `take`, your own `map`s | Before the preset. They act on records. |
 | Augmentation | `augment=` on the training split's preset |
 | `workers`, `threads`, `prefetch` | After the preset. They set how the chain up to that point runs, so the preset's decode, resize, pack and batch run in the workers. |
-| A function on whole batches | After the preset. A `map` after `batch` runs last, in the training process; the GPU augmentation is one. |
+| A function on whole batches | After the preset. A host `map` after `batch` runs last, in the training process; a device step such as the GPU augmentation runs inside the compiled step. |
 | `snapshot` | A separate job before training, read back with `Files(url)` |
 
 ```python
@@ -352,7 +352,7 @@ ds = (Files("gs://data/laion/*.array_record").threads(32)   # read parallelism a
 trainer.fit(ds, device_prefetch=2)                            # batches already placed on the GPUs
 ```
 
-`.workers(n)` splits the chain where you put it: heavy decoding and augmentation go before it, cheap work after. Settings are per host. For streamed data, worker and interleave counts are part of the checkpoint and stay fixed on resume. Defaults are fixed numbers today; they will be measured against step time, so you set these only to take control. A `map` after `batch` always runs last, in the training process, so a GPU step never runs in a worker.
+`.workers(n)` splits the chain where you put it: heavy decoding and augmentation go before it, cheap work after. Settings are per host. For streamed data, worker and interleave counts are part of the checkpoint and stay fixed on resume. Defaults are fixed numbers today; they will be measured against step time, so you set these only to take control. A host `map` after `batch` always runs last, in the training process. A device step runs inside the compiled step, so the reader only ever yields numpy.
 
 ## 7. Training on a mesh
 
