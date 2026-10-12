@@ -55,8 +55,9 @@ def fresh(script: str, *arguments: str, cache_dir, flags: str) -> list:
     and these tests, compiling into `cache_dir` under XLA `flags`."""
     environment = {**os.environ, "JAX_COMPILATION_CACHE_DIR": str(cache_dir), "XLA_FLAGS": flags,
                    "PYTHONPATH": os.pathsep.join((str(REPO_ROOT / "src"), str(REPO_ROOT / "tests")))}
-    run = subprocess.run([sys.executable, "-c", script, *arguments], env=environment, check=True,
+    run = subprocess.run([sys.executable, "-c", script, *arguments], env=environment, check=False,
                          capture_output=True, text=True)
+    assert run.returncode == 0, run.stderr[-3000:]
     return json.loads(run.stdout.splitlines()[-1])
 
 
