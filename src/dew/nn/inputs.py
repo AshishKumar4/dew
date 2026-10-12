@@ -261,6 +261,10 @@ class AttentionMetadata:
     a conv reads the row as it stands (`dew.nn.linear.held_conv1d`). A padding
     slot's output is then unspecified. A mask with padding before or between
     real slots must not set it.
+
+    `max_segments` is the most packed documents a row of the batch holds, a
+    static bound the batch's plan declares: a recurrent layer's kernels size
+    their sequences by it (`dew.nn.linear.chunk_gated_delta_rule`).
     """
 
     valid: jax.Array | None = None
@@ -274,6 +278,7 @@ class AttentionMetadata:
     admitted: Admitted | None = None
     position_bias: jax.Array | None = None
     right_padded: bool = struct.field(pytree_node=False, default=False)
+    max_segments: int | None = struct.field(pytree_node=False, default=None)
 
 
 @struct.dataclass

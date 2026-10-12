@@ -352,7 +352,7 @@ def test_the_ported_rule_and_its_gradients_follow_the_recurrence(dtype, bound):
     scale = width ** -0.5
 
     def ported(*args):
-        out, final = fla_gdn.chunk_gated_delta_rule(*args, scale, 64, INTERPRETED)
+        out, final = fla_gdn.chunk_gated_delta_rule(*args, None, scale, 64, INTERPRETED)
         return jnp.sum(out.astype(jnp.float32) * do.astype(jnp.float32)) + jnp.sum(final * dht), (out, final)
 
     (_, (out, final)), grads = jax.value_and_grad(ported, argnums=(0, 1, 2, 3, 4, 5), has_aux=True)(

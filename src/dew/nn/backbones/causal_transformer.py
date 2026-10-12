@@ -1364,12 +1364,14 @@ class CausalTransformer(nn.Module):
                  positions=None, segment_ids=None,
                  input_embeddings=None,
                  attention_mask=None, image_groups=None, rotary_positions=None,
-                 attention_pairwise_mask=None, attention_key_positions=None, right_padded: bool = False):
+                 attention_pairwise_mask=None, attention_key_positions=None, right_padded: bool = False,
+                 max_segments: int | None = None):
         x, prediction = self.hidden_and_mtp_inputs(
             tokens, train=train, decode=decode, positions=positions, segment_ids=segment_ids,
             input_embeddings=input_embeddings, attention_mask=attention_mask, image_groups=image_groups,
             rotary_positions=rotary_positions, attention_pairwise_mask=attention_pairwise_mask,
-            attention_key_positions=attention_key_positions, right_padded=right_padded)
+            attention_key_positions=attention_key_positions, right_padded=right_padded,
+            max_segments=max_segments)
         if self.is_initializing() and self.dspark is not None:
             self.reach_drafter(tokens, x.dtype)
         if self.is_initializing() and self.mtp:
@@ -1611,7 +1613,7 @@ class CausalTransformer(nn.Module):
                               attention_mask=None, image_groups=None, rotary_positions=None,
                               attention_pairwise_mask=None, attention_key_positions=None,
                               routed_experts=None, routed=None, media_mask=None, admitted=None,
-                              right_padded: bool = False):
+                              right_padded: bool = False, max_segments: int | None = None):
         """Return the final normalized states and the prediction depths' input.
 
         V4's depth reads the raw residual streams from before the collapse head
@@ -1639,10 +1641,13 @@ class CausalTransformer(nn.Module):
           (`dew.nn.inputs.AttentionMetadata.right_padded`). The real tokens'
           states are the masked call's, the padding's are unspecified, and a
           causal layer runs as an unpadded call does.
+        - `max_segments` bounds the packed documents a row of `segment_ids`
+          holds (`dew.nn.inputs.AttentionMetadata.max_segments`).
         """
         attention_metadata = self._attention_metadata(
             tokens, decode, positions, attention_mask, image_groups, rotary_positions,
-            attention_pairwise_mask, attention_key_positions, media_mask, admitted, right_padded)
+            attention_pairwise_mask, attention_key_positions, media_mask, admitted, right_padded,
+            max_segments)
         # The stack's entry and exit sit where the batch does, so neither the
         # lookup nor the head is computed whole on the shards of an axis that
         # splits the rows or the positions.
@@ -1698,7 +1703,8 @@ class CausalTransformer(nn.Module):
     def _attention_metadata(self, tokens, decode: bool, positions, attention_mask, image_groups,
                             rotary_positions, pairwise_mask, key_positions,
                             media_mask, admitted=None,
-                            right_padded: bool = False) -> AttentionMetadata | None:
+                            right_padded: bool = False,
+                            max_segments: int | None = None) -> AttentionMetadata | None:
         """What the layers read beside the residual, None for a call that
         carries none of it: the masks and positions `hidden_and_mtp_inputs`
         takes, the token ids a hash router selects by, the engram layers'
@@ -1716,13 +1722,13 @@ class CausalTransformer(nn.Module):
                       else self.engram_hashes(tokens, attention_mask, positions, decode, media_mask))
         if (attention_mask is None and image_groups is None and rotary_positions is None
                 and pairwise_mask is None and key_positions is None and not self.hash_layers
-                and engram_ids is None and media_mask is None and admitted is None):
+                and engram_ids is None and media_mask is None and admitted is None and max_segments is None):
             return None
         return AttentionMetadata(
             valid=attention_mask, image_groups=image_groups, rotary_positions=rotary_positions,
             pairwise_mask=pairwise_mask, key_positions=key_positions,
             token_ids=tokens if self.hash_layers else None, engram_ids=engram_ids, media=media_mask,
-            admitted=admitted, right_padded=right_padded)
+            admitted=admitted, right_padded=right_padded, max_segments=max_segments)
 
     def looped(self, x, **stack):
         """Run the layer stack over `x` once, or as `loop` says: the layers before
