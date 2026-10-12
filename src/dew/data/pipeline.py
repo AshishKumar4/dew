@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import dataclasses
 import inspect
+import itertools
 import math
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from typing import TYPE_CHECKING, Concatenate, Literal, Protocol, runtime_checkable
 
 import grain.python as pygrain
@@ -15,7 +16,8 @@ from dew.data.dataset import Batch, LengthGroups
 
 if TYPE_CHECKING:
     from dew.data.cache import Cache, Generation
-    from dew.data.sources.base import Source
+    from dew.data.dataset import Loading
+    from dew.data.sources.base import Read, Source
 
 
 @dataclasses.dataclass(frozen=True)
@@ -490,6 +492,45 @@ class Dataset:
     def map_batch(self, *steps: HostStep, identity: str | None = None) -> Pipeline:
         return self.then(*(MapBatch(step, identity) for step in steps))
 
+    def rename(self, **names: str) -> Pipeline:
+        """Each record with its field `old` under the name `new`, as `rename(caption="txt")`."""
+        return self.map(_Renamed(tuple(names.items())), identity=f"dew.rename:{sorted(names.items())}")
+
+    def select(self, *fields: str) -> Pipeline:
+        """Each record with `fields` alone."""
+        return self.map(_Selected(fields), identity=f"dew.select:{list(fields)}")
+
+    def read(self, mode: Read) -> Pipeline:
+        """Read the stores this way, rather than as they prefer: "memory" holds
+        every record and runs the deterministic steps once, "indexed" reads by
+        index, "streamed" reads shards in order."""
+        chain = self if isinstance(self, Pipeline) else Pipeline(self)
+        return dataclasses.replace(chain, mode=mode)
+
+    def threads(self, count: int) -> Pipeline:
+        """Read with `count` threads a worker, rather than the measured default."""
+        from dew.data.dataset import Loading
+
+        chain = self if isinstance(self, Pipeline) else Pipeline(self)
+        loading = chain.loading or Loading()
+        return dataclasses.replace(chain, loading=dataclasses.replace(
+            loading, threads=count, read_buffer=max(loading.read_buffer, count)))
+
+    def iterate(self) -> Iterator[Batch]:
+        """This dataset's records, one pass, as a run would read them."""
+        from dew.data.compile import iterate
+
+        chain = self if isinstance(self, Pipeline) else Pipeline(self)
+        return iter(iterate(chain, read=chain.mode, provision=True, **_loading(chain)))
+
+    def show(self, count: int = 8) -> None:
+        """Print the first `count` records."""
+        from rich.pretty import pprint
+
+        for record in itertools.islice(self.iterate(), count):
+            pprint({name: _shown(value) for name, value in record.items()} if isinstance(record, Mapping)
+                   else record)
+
 
 @dataclasses.dataclass(frozen=True)
 class Pipeline(Dataset):
@@ -498,9 +539,42 @@ class Pipeline(Dataset):
     source: Source | Mixture | Phases
     stages: tuple[Stage, ...] = ()
     name: str | None = None
+    mode: Read | None = None
+    loading: Loading | None = None
 
     def then(self, *stages: Stage) -> Pipeline:
         return dataclasses.replace(self, stages=(*self.stages, *stages))
+
+
+@dataclasses.dataclass(frozen=True)
+class _Renamed:
+    names: tuple[tuple[str, str], ...]
+
+    def __call__(self, record: Batch) -> Batch:
+        moved = {old for _, old in self.names}
+        return {**{key: value for key, value in record.items() if key not in moved},
+                **{new: record[old] for new, old in self.names}}
+
+
+@dataclasses.dataclass(frozen=True)
+class _Selected:
+    fields: tuple[str, ...]
+
+    def __call__(self, record: Batch) -> Batch:
+        return {name: record[name] for name in self.fields}
+
+
+def _loading(chain: Pipeline) -> dict[str, Loading]:
+    return {} if chain.loading is None else {"loading": chain.loading}
+
+
+def _shown(value: object) -> object:
+    """A field as `show` prints it: an array as its shape and dtype, bytes as their length."""
+    if isinstance(value, np.ndarray) and value.size > 16:
+        return f"{value.dtype}{list(value.shape)}"
+    if isinstance(value, bytes) and len(value) > 64:
+        return f"<{len(value)} bytes>"
+    return value
 
 
 def mix(datasets: Sequence[Dataset], weights: Sequence[float] | None = None, *,
