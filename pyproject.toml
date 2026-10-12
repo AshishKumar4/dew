@@ -55,7 +55,7 @@ dependencies = [
     "s3fs>=2026.6.0",
     "urllib3>=2.5",
     "pyarrow>=25.0.1",
-    "array-record>=0.8.3",
+    "array-record>=0.8.3; sys_platform != 'win32'",
 ]
 license = "MIT"
 # Third-party code Dew carries keeps its notice: each file translated or
