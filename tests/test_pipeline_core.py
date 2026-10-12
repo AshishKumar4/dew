@@ -564,6 +564,25 @@ class Laid:
         return {"image": np.resize(np.asarray(element["text"]), (2, 4))}
 
 
+def test_a_streamed_repeat_repeats_where_it_is_written_past_a_limit_or_a_repeat():
+    """A streamed root repeats in place of a written repeat only when nothing
+    before it counts the rows: two rows taken and repeated three times read
+    six, and eight rows repeated twice and then three times read 48, streamed
+    as indexed."""
+    def ids(pipeline, read):
+        reader = compile(pipeline.batch(1), read=read, loading=READ).train(DataPartition())
+        try:
+            return [row["id"] for row in take(reader, 64)]
+        finally:
+            reader.close()
+
+    limited = Pipeline(source(8)).take(2).repeat(3)
+    streamed = ids(limited, "streamed")
+    assert streamed == streamed[:2] * 3 and len(ids(limited, "indexed")) == 6
+    twice = Pipeline(source(8)).repeat(2).repeat(3)
+    assert len(ids(twice, "streamed")) == len(ids(twice, "indexed")) == 48
+
+
 def test_a_nested_mixture_counts_its_epoch_from_each_part():
     """A mixture of a corpus and a mixture ends its epoch when the first of its
     parts comes round, the inner mixture counted the same way: the inner one

@@ -40,6 +40,7 @@ from dew.data.pipeline import (
     Pack,
     Phases,
     Pipeline,
+    Prefetch,
     RandomMap,
     Rebatch,
     Repeat,
@@ -251,6 +252,11 @@ _LOCAL = (Map, MapWithIndex, Filter, FlatMap)
 """The deterministic record steps that run before a cache or an interleave,
 inside the reader of each input or shard."""
 
+_ROOTED = (*_LOCAL, Configured, Artifact, Interleave, Shuffle, Pack, Windows, Prefetch, Workers)
+"""The stages a streamed read's repeat can move before, to its root: none
+counts the rows or draws from the record rng, so they read one continuous
+stream whose shards reshuffle each epoch."""
+
 def _order_at(stages: Sequence[Stage], read: Read) -> tuple[int, bool]:
     """Where a recipe's default order goes, and whether the rows there are
     indexed so one shuffle can order them all. A memory read orders the rows
@@ -317,9 +323,10 @@ class _Lowering:
     `repeated` says whether any of its steps repeats the order; a training
     read of an order that repeats nowhere repeats it for ever, at its root.
     A streamed read repeats at its root in place of the first written repeat
-    (`absorbed`) when no random step comes before it, and its root reads
-    `epochs` epochs when it trains: the absorbed repeat's, one when a repeat
-    stays where it is written, and endless when none is written.
+    (`absorbed`) when only stages it can move across (`_ROOTED`) come before
+    it, and its root reads `epochs` epochs when it trains: the absorbed
+    repeat's, one when a repeat stays where it is written, and endless when
+    none is written.
 
     `split` says whether a token split runs in the lowered order rather than
     in a memory read's eager pass. `order` is the canonical order a resume
@@ -377,7 +384,7 @@ def _analyzed(
         written
         if read == "streamed"
         and written is not None
-        and not any(isinstance(stage, RandomMap) for stage in stages[: written[0]])
+        and all(isinstance(stage, _ROOTED) and not _random(stage) for stage in stages[: written[0]])
         else None
     )
     epochs = None if written is None else 1 if absorbed is None else absorbed[1].epochs
