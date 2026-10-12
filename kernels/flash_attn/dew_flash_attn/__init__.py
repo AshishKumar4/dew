@@ -1,26 +1,53 @@
-"""FlashAttention-2 for JAX: Dao-AILab's CUDA kernels (BSD-3), through
-flash_attn_jax's XLA FFI port (BSD-3), as two FFI targets of a library with
-no Python ABI. `flash_mha` takes `[B, S, H, D]` bf16 or fp16 arrays, with
-grouped key heads, and `flash_mha_varlen` packed sequences `[T, H, D]` between
-cumulative offsets; both differentiate through the kernel's own backward."""
+"""FlashAttention for JAX: Dao-AILab's CUDA kernels (BSD-3) as FFI targets of
+libraries with no Python ABI. FlashAttention-2 comes through flash_attn_jax's
+XLA FFI port (BSD-3) and runs on sm8x and sm120; FlashAttention-3, Hopper's,
+comes through flash-attn3-jax's port (BSD-3) and runs on sm90. `flash_mha`
+takes `[B, S, H, D]` bf16 or fp16 arrays, with grouped key heads, and
+`flash_mha_varlen` packed sequences `[T, H, D]` between cumulative offsets;
+both run the kernel built for the device and differentiate through its own
+backward."""
 
 import ctypes
 import functools
 import math
+import re
 from pathlib import Path
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 
-_library = ctypes.cdll.LoadLibrary(str(Path(__file__).with_name("libdew_flash_attn.so")))
-_library.dew_flash_architectures.restype = ctypes.c_char_p
-ARCHITECTURES = tuple(f"sm{entry.split('-')[0]}"
-                      for entry in _library.dew_flash_architectures().decode().split(","))
-"""The GPU generations the library holds code for, as its build compiled them ('sm80', 'sm120')."""
-for _name in ("dew_flash_mha_fwd", "dew_flash_mha_bwd",
-              "dew_flash_mha_varlen_fwd", "dew_flash_mha_varlen_bwd"):
-    jax.ffi.register_ffi_target(_name, jax.ffi.pycapsule(getattr(_library, _name)), platform="CUDA")
+
+def _load(name: str, report: str) -> tuple[ctypes.CDLL, tuple[str, ...]]:
+    """The library and the GPU generations it reports holding code for, its build's CUDA
+    architectures ('80-real' is sm80, '90a-real' sm90)."""
+    library = ctypes.cdll.LoadLibrary(str(Path(__file__).with_name(name)))
+    getattr(library, report).restype = ctypes.c_char_p
+    entries = getattr(library, report)().decode().split(",")
+    return library, tuple(f"sm{re.match(r'[0-9]+', entry).group()}" for entry in entries)
+
+
+_library, _two = _load("libdew_flash_attn.so", "dew_flash_architectures")
+_library3, _three = _load("libdew_flash_attn3.so", "dew_flash3_architectures")
+ARCHITECTURES = _two + _three
+"""The GPU generations the libraries hold code for, as their builds compiled them ('sm80', 'sm90',
+'sm120')."""
+
+
+@functools.cache
+def _registered() -> None:
+    """Both libraries' FFI targets, registered with jax once, at the first call that needs them:
+    importing the package to read ARCHITECTURES leaves jax's registry as it was."""
+    for library, prefix in ((_library, "dew_flash_mha"), (_library3, "dew_flash3_mha")):
+        for suffix in ("_fwd", "_bwd", "_varlen_fwd", "_varlen_bwd"):
+            name = prefix + suffix
+            jax.ffi.register_ffi_target(name, jax.ffi.pycapsule(getattr(library, name)), platform="CUDA")
+
+
+def _call(name: str, results):
+    """`jax.ffi.ffi_call` of one of the libraries' targets."""
+    _registered()
+    return jax.ffi.ffi_call(name, results)
 
 
 def _round(x: int, multiple: int) -> int:
@@ -30,6 +57,12 @@ def _round(x: int, multiple: int) -> int:
 @functools.cache
 def _multiprocessors() -> int:
     return jax.devices("gpu")[0].core_count
+
+
+@functools.cache
+def _hopper() -> bool:
+    """Whether the device runs FlashAttention-3, which is built for sm90 alone."""
+    return f"sm{jax.devices('gpu')[0].compute_capability.replace('.', '')}" in _three
 
 
 def _splits(work: int, slots: int, blocks: int) -> int:
@@ -59,14 +92,56 @@ def _attributes(scale: float, causal: bool) -> dict:
             "window_size_left": np.int64(-1), "window_size_right": np.int64(-1)}
 
 
+def _forward3(query, key, value, starts, longest, scale, causal):
+    """FlashAttention-3's forward over `[B, S, H, D]` arrays, or, given cumulative offsets `starts`,
+    over packed `[T, H, D]` ones whose sequences hold at most `longest` tokens."""
+    q, k, v = _padded(query, key, value)
+    heads = q.shape[-2]
+    packed = starts is not None
+    results = (jax.ShapeDtypeStruct(q.shape, q.dtype),
+               jax.ShapeDtypeStruct((heads, q.shape[0]) if packed else (q.shape[0], heads, q.shape[1]),
+                                    jnp.float32),
+               jax.ShapeDtypeStruct((1, 1, 1, 1), jnp.float32), jax.ShapeDtypeStruct((1, 1, 1), jnp.float32))
+    attributes = {"softmax_scale": np.float64(scale), "is_causal": causal}
+    if packed:
+        out, lse, _, _ = _call("dew_flash3_mha_varlen_fwd", results)(
+            q, k, v, starts, max_seqlen=np.int64(longest), **attributes)
+    else:
+        out, lse, _, _ = _call("dew_flash3_mha_fwd", results)(q, k, v, **attributes)
+    return out[..., :query.shape[-1]], lse
+
+
+def _backward3(grad, query, key, value, out, lse, starts, longest, scale, causal):
+    """FlashAttention-3's backward, whose key and value gradients come per key head."""
+    width = query.shape[-1]
+    g, q, k, v, o = _padded(grad, query, key, value, out)
+    packed = starts is not None
+    # Two scratch buffers of rows per head, each sequence's queries rounded up to the backward's row
+    # block, which the port picks from 64, 80, 96 and 128 by width and mask, and packed one block
+    # more over all of them: 128 rows a sequence and 128 more hold either layout.
+    tokens, sequences = (q.shape[0], starts.shape[0] - 1) if packed else (q.shape[0] * q.shape[1], q.shape[0])
+    scratch = jax.ShapeDtypeStruct((q.shape[-2] * (tokens + 128 * (sequences + 1)),), jnp.float32)
+    results = (jax.ShapeDtypeStruct(q.shape, q.dtype), jax.ShapeDtypeStruct(k.shape, q.dtype),
+               jax.ShapeDtypeStruct(v.shape, q.dtype), scratch, scratch)
+    attributes = {"softmax_scale": np.float64(scale), "is_causal": causal}
+    if packed:
+        dq, dk, dv, _, _ = _call("dew_flash3_mha_varlen_bwd", results)(
+            g, q, k, v, o, lse, starts, max_seqlen=np.int64(longest), **attributes)
+    else:
+        dq, dk, dv, _, _ = _call("dew_flash3_mha_bwd", results)(g, q, k, v, o, lse, **attributes)
+    return dq[..., :width], dk[..., :width], dv[..., :width]
+
+
 def _forward(query, key, value, scale, causal):
+    if _hopper():
+        return _forward3(query, key, value, None, None, scale, causal)
     batch, queries, heads, width = query.shape
     keys = key.shape[1]
     block = 256 if width <= 64 else 128 if width <= 128 else 64
     blocks = max(1, -(-keys // block))
     splits = _splits(batch * heads * max(1, -(-queries // 64)), _multiprocessors() * 2, blocks)
     q, k, v = _padded(query, key, value)
-    out, lse, _, _ = jax.ffi.ffi_call("dew_flash_mha_fwd", (
+    out, lse, _, _ = _call("dew_flash_mha_fwd", (
         jax.ShapeDtypeStruct(q.shape, q.dtype),
         jax.ShapeDtypeStruct((batch, heads, queries), jnp.float32),
         jax.ShapeDtypeStruct((splits, batch, queries, heads, _round(width, 32)), jnp.float32),
@@ -76,11 +151,13 @@ def _forward(query, key, value, scale, causal):
 
 
 def _backward(grad, query, key, value, out, lse, scale, causal):
+    if _hopper():
+        return _backward3(grad, query, key, value, out, lse, None, None, scale, causal)
     batch, queries, heads, width = query.shape
     keys, key_heads = key.shape[1], key.shape[2]
     g, q, k, v, o = _padded(grad, query, key, value, out)
     padded = q.shape[-1]
-    dq, dk, dv, _, _ = jax.ffi.ffi_call("dew_flash_mha_bwd", (
+    dq, dk, dv, _, _ = _call("dew_flash_mha_bwd", (
         jax.ShapeDtypeStruct(q.shape, q.dtype),
         jax.ShapeDtypeStruct((batch, keys, heads, padded), q.dtype),
         jax.ShapeDtypeStruct((batch, keys, heads, padded), q.dtype),
@@ -114,7 +191,7 @@ _attend.defvjp(_attend_forward, _attend_backward)
 def flash_mha(query, key, value, softmax_scale: float | None = None, is_causal: bool = False):
     """Attention of `query` over `key` and `value`, `[B, S, H, D]`, scaled by
     `softmax_scale` (1/sqrt(D) by default). A causal mask is aligned to the
-    last key, as FlashAttention-2 aligns it."""
+    last key, as FlashAttention aligns it."""
     if query.dtype not in (jnp.bfloat16, jnp.float16) or not query.dtype == key.dtype == value.dtype:
         raise ValueError(f"flash_mha takes bf16 or fp16 inputs of one dtype, not {query.dtype}, "
                          f"{key.dtype} and {value.dtype}")
@@ -126,11 +203,13 @@ def flash_mha(query, key, value, softmax_scale: float | None = None, is_causal: 
 
 
 def _varlen_forward(query, key, value, starts, longest, scale, causal):
+    if _hopper():
+        return _forward3(query, key, value, starts, longest, scale, causal)
     heads, width = query.shape[1:]
     sequences = starts.shape[0] - 1
     q, k, v = _padded(query, key, value)
     # The packed forward never splits the keys, so its split scratch is a token buffer.
-    out, lse, _, _ = jax.ffi.ffi_call("dew_flash_mha_varlen_fwd", (
+    out, lse, _, _ = _call("dew_flash_mha_varlen_fwd", (
         jax.ShapeDtypeStruct(q.shape, q.dtype),
         jax.ShapeDtypeStruct((sequences, heads, longest), jnp.float32),
         jax.ShapeDtypeStruct((1, 1, 1, 1, 1), jnp.float32),
@@ -141,6 +220,8 @@ def _varlen_forward(query, key, value, starts, longest, scale, causal):
 
 
 def _varlen_backward(grad, query, key, value, out, lse, starts, longest, scale, causal):
+    if _hopper():
+        return _backward3(grad, query, key, value, out, lse, starts, longest, scale, causal)
     total, heads, width = query.shape
     key_heads = key.shape[1]
     sequences = starts.shape[0] - 1
@@ -148,7 +229,7 @@ def _varlen_backward(grad, query, key, value, out, lse, starts, longest, scale, 
     padded = q.shape[-1]
     attributes = _attributes(scale, causal)
     attributes["softmax_scale"] = np.float32(scale)
-    dq, dk, dv, _, _ = jax.ffi.ffi_call("dew_flash_mha_varlen_bwd", (
+    dq, dk, dv, _, _ = _call("dew_flash_mha_varlen_bwd", (
         jax.ShapeDtypeStruct(q.shape, q.dtype),
         jax.ShapeDtypeStruct((key.shape[0], heads, padded), q.dtype),
         jax.ShapeDtypeStruct((key.shape[0], heads, padded), q.dtype),
