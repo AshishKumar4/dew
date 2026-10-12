@@ -107,9 +107,10 @@ def test_a_decision_mixture_from_its_manifest_reads_by_index_by_default(tmp_path
     assert loaded.plan is not None and loaded.plan.order["read"] == "indexed"
 
 
-def _flags(mixture: Path, runs: Path) -> list[str]:
+def _flags(mixture: Path, runs: Path, *, tokens: int | None = None) -> list[str]:
     return ["--data.source", str(mixture), "--trainer.name", "run", "--trainer.checkpoint-dir", str(runs),
-            "--trainer.batch-size", "8", "--trainer.batch-tokens", "None", "--trainer.update-tokens", "None",
+            "--trainer.batch-size", "8" if tokens is None else "None",
+            "--trainer.batch-tokens", str(tokens), "--trainer.update-tokens", str(tokens),
             "--trainer.steps", "2", "--trainer.eval-every", "2",
             "--trainer.checkpoint-every", "2", "--trainer.log-every", "1", "--trainer.multi-host", "False",
             "--trainer.compilation-cache-dir", "None", "--loading.workers", "0",
@@ -244,10 +245,7 @@ def test_the_clef_recipe_trains_a_joint_head_under_lora_on_a_frozen_decoder(tmp_
     mixture = _mixture(tmp_path, rows, ["nothing these rows share at all"], held=8)
     clef = _module("clef")
     storage = [] if param_dtype == "float32" else ["--param-dtype", param_dtype]
-    flags = _flags(mixture, tmp_path / "runs")
-    flags[flags.index("--trainer.batch-size") + 1] = "None"
-    flags[flags.index("--trainer.batch-tokens") + 1] = "8192"
-    flags[flags.index("--trainer.update-tokens") + 1] = "8192"
+    flags = _flags(mixture, tmp_path / "runs", tokens=8192)
     flags[:0] = ["--data-read", "memory"]
     config = DecisionRunConfig.cli([*flags, "--pretrained", str(QWEN),
                                     "--lora.rank", "4", "--head.width", "24", "--head.heads", "2",
@@ -289,10 +287,8 @@ def test_a_bucketed_decision_run_resumes_bitwise_and_after_a_change_that_keeps_i
     clef = _module("clef")
 
     def run(directory: Path, steps: int, *changed):
-        flags = _flags(mixture, directory)
+        flags = _flags(mixture, directory, tokens=8192)
         flags[flags.index("--trainer.steps") + 1] = str(steps)
-        flags[flags.index("--trainer.batch-size") + 1] = "None"
-        flags += ["--trainer.batch-tokens", "8192", "--trainer.update-tokens", "8192"]
         flags += ["--pretrained", str(QWEN), "--lora.rank", "4", "--head.width", "24", "--head.heads", "2",
                   "--head.feedforward", "40", "--head.layers", "1", "--head.routing-layers", "1",
                   "--max-len", "1024", "--objective.bucket", "64", "--no-calibrate", *changed]
