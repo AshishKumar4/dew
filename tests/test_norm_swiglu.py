@@ -406,6 +406,26 @@ def test_rms_refusals_fall_back_and_log_once(monkeypatch, caplog, statistics, dt
     assert len(logged) == 1 and reason in logged[0]
 
 
+def test_packed_halves_keep_xla_product_and_say_why(monkeypatch, caplog):
+    """A packed gate_up projection's halves stay XLA's product, which reads
+    them in place; the kernel would copy each half out first."""
+    from dew.nn.backbones.decoder_block import GatedMLP
+
+    measured_on_this_host(monkeypatch, "swiglu")
+    monkeypatch.setattr(kernels.generation, "_logged", set())
+    x = jax.random.normal(jax.random.key(81), (2, 5, 8))
+    for packed in (False, True):
+        mlp = GatedMLP(hidden_features=16, out_features=8, packed=packed)
+        params = mlp.init(jax.random.key(82), x)
+        graph = str(jax.make_jaxpr(lambda p: mlp.apply(p, x))(params))
+        assert ("swiglu_forward" in graph) == (not packed and jax.default_backend() == "gpu"), packed
+    with monkeypatch.context() as patched:
+        patched.setattr(kernels.generation, "triton_runs", lambda: True)
+        assert kernels.norm_swiglu.swiglu_kernel("auto", x, x, packed=True) == "xla"
+    logged = [record.getMessage() for record in caplog.records if record.name == kernels.generation.__name__]
+    assert any("packed projection" in message for message in logged), logged
+
+
 def test_swiglu_refuses_broadcast_mixed_and_wide_dtypes():
     from dew.nn.kernels import norm_swiglu
 

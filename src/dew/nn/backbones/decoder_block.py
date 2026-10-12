@@ -291,8 +291,8 @@ class GatedMLP(nn.Module):
             up = jnp.clip(up, -self.swiglu_limit, self.swiglu_limit)
         if self.activation_sparsity:
             gate = gaussian_topk(gate, self.activation_sparsity)
-        hidden = self.dropout(gated_product(self.activation, axes=MLP_HIDDEN)(gate, up),
-                              deterministic=not train)
+        product = gated_product(self.activation, axes=MLP_HIDDEN, packed=self._packed())
+        hidden = self.dropout(product(gate, up), deterministic=not train)
         return checkpoint_name(self.down_proj(hidden), 'down_proj')
 
     def _packed(self) -> bool:
