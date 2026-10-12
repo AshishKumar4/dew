@@ -789,15 +789,20 @@ def _wy_gate_sum(d_gate, weighted):
     return d_gate + (jnp.sum(weighted, axis=1) - jnp.sum(weighted, axis=0))
 
 
-def _wy_bwd_kernel(k_ref, v_ref, beta_ref, g_ref, a_ref, dw_ref, du_ref, dk_ref, dv_ref, db_ref, dg_ref, *,
-                   bk: int, bv: int, exact: bool):
+def _wy_bwd_kernel(k_ref, v_ref, beta_ref, g_ref, a_ref, dw_ref, du_ref, *refs, bk: int, bv: int,
+                   group: int | None, exact: bool):
     """fla's `prepare_wy_repr_bwd_kernel` (fla/ops/gated_delta_rule/wy_fast.py:119-243) for one
     chunk of one head. With `X = (I + L)^-1` (fla's `A`), `w = X (k beta exp2(g))` and
     `u = X (v beta)`: their gradients through `X^T`, `dX = dw (k beta exp2 g)^T + du (v beta)^T`, then
     `dL = -X^T tril(dX, -1) X^T` gated by `exp2(g_s - g_t)`, and from it the keys', beta's and the
     decay's gradients. `dk`'s part through `w` is recomputed beside its part through `L` and the
     two stored once, where fla stores the first, rounded, and reads it back behind a barrier
-    (wy_fast.py:223): one rounding, and no store that other threads must see before a later read."""
+    (wy_fast.py:223): one rounding, and no store that other threads must see before a later read.
+    `group`, the value heads per key head, is given when the keys' gradient so far (`refs[0]`, the
+    query-side kernel's) is an operand: it joins the sum before that store in the first value head
+    of each key head's group, where fla adds the two stored gradients in a pass of their own
+    (chunk.py:244)."""
+    earlier_ref, (dk_ref, dv_ref, db_ref, dg_ref) = (refs[0], refs[1:]) if group else (None, refs)
     inverse_t = a_ref[...].T
     beta = beta_ref[...]
     gate = g_ref[...].astype(jnp.float32)
@@ -840,20 +845,25 @@ def _wy_bwd_kernel(k_ref, v_ref, beta_ref, g_ref, a_ref, dw_ref, du_ref, dk_ref,
         d_key = _dot(d_l, key, exact=exact)
         d_beta += jnp.sum(d_key * key, axis=1)
         through_w = _dot(inverse_t, dw_ref[:, columns], exact=exact) * (decay * beta)[:, None]
-        full = d_key * beta[:, None] + _dot(scaled.T.astype(d_l.dtype), d_l, exact=exact).T
-        dk_ref[:, columns] = (through_w + full).astype(dk_ref.dtype)
+        full = through_w + (d_key * beta[:, None] + _dot(scaled.T.astype(d_l.dtype), d_l, exact=exact).T)
+        if earlier_ref is not None:
+            earlier = earlier_ref[:, columns].astype(jnp.float32)
+            full += earlier if group == 1 else jnp.where(pl.program_id(1) % group == 0, earlier, 0.0)
+        dk_ref[:, columns] = full.astype(dk_ref.dtype)
     db_ref[...] = d_beta.astype(db_ref.dtype)
     weighted = d_l.astype(jnp.float32) * (products * beta[:, None])
     dg_ref[...] = _wy_gate_sum(d_gate, weighted).astype(dg_ref.dtype)
 
 
-def prepare_wy_repr_bwd(k, v, beta, g, a, dw, du, *, chunk: int = 64, bk: int | None = None,
+def prepare_wy_repr_bwd(k, v, beta, g, a, dw, du, dk=None, *, chunk: int = 64, bk: int | None = None,
                         bv: int | None = None, warps: int | None = None, stages: int | None = None,
                         interpret: bool = False):
     """`(dk, dv, db, dg)` through the WY representation: fla's `prepare_wy_repr_bwd` (wy_fast.py:
     296-343). `k` `[B, T, H, K]`, `v` `[B, T, HV, V]`, `beta` and `g` `[B, T, HV]`, `a` the inverse
-    per chunk `[B, T, HV, BT]`, `dw` and `du` the gradients of `w` and `u`. `dk` is summed over each
-    key head's group. fla tiles `BK`, `BV` at 64 on an A100 and chose 4 warps, 2 stages (c53)."""
+    per chunk `[B, T, HV, BT]`, `dw` and `du` the gradients of `w` and `u`, and `dk` `[B, T, H, K]`
+    the keys' gradient so far, which the returned one includes, added in fp32 before its one
+    rounding; without it, fla's call. `dk` is summed over each key head's group. fla tiles `BK`,
+    `BV` at 64 on an A100 and chose 4 warps, 2 stages (c53)."""
     from jax.experimental.pallas import triton as plgpu
 
     config = kernel_config("prepare_wy_repr_bwd", _rule_shape(k, v, chunk), k.dtype,
@@ -874,13 +884,16 @@ def prepare_wy_repr_bwd(k, v, beta, g, a, dw, du, *, chunk: int = 64, bk: int | 
         return bh // value_heads, i_t, bh % value_heads
 
     gate = pl.BlockSpec((None, chunk, None), gated)
+    keys = pl.BlockSpec((None, chunk, None, width), keyed)
     per_key = pl.BlockSpec((None, chunk, None, width), headed)
     per_value = pl.BlockSpec((None, chunk, None, columns), headed)
+    earlier = () if dk is None else (dk,)
     dk, dv, db, dg = pl.pallas_call(
-        functools.partial(_wy_bwd_kernel, bk=min(bk, width), bv=min(bv, columns), exact=interpret),
+        functools.partial(_wy_bwd_kernel, bk=min(bk, width), bv=min(bv, columns),
+                          group=group if earlier else None, exact=interpret),
         grid=(length // chunk, batch * value_heads),
-        in_specs=[pl.BlockSpec((None, chunk, None, width), keyed), per_value, gate, gate,
-                  pl.BlockSpec((None, chunk, None, chunk), headed), per_key, per_value],
+        in_specs=[keys, per_value, gate, gate, pl.BlockSpec((None, chunk, None, chunk), headed), per_key,
+                  per_value, *(keys for _ in earlier)],
         out_specs=[per_key, per_value, gate, gate],
         out_shape=[jax.ShapeDtypeStruct((batch, length, value_heads, width), k.dtype),
                    jax.ShapeDtypeStruct(v.shape, v.dtype),
@@ -888,7 +901,7 @@ def prepare_wy_repr_bwd(k, v, beta, g, a, dw, du, *, chunk: int = 64, bk: int | 
                    jax.ShapeDtypeStruct(g.shape, g.dtype)],
         compiler_params=plgpu.CompilerParams(num_warps=warps, num_stages=stages),
         interpret=interpret, name="fla_prepare_wy_repr_bwd",
-    )(k, v, beta, g, a, dw, du)
+    )(k, v, beta, g, a, dw, du, *earlier)
     if group > 1:
         dk = dk.reshape(batch, length, key_heads, group, width).sum(3).astype(k.dtype)
     return dk, dv, db, dg
@@ -1002,8 +1015,7 @@ def _rule_bwd(scale: float, chunk: int, interpret: bool, residual, cotangent):
                                 interpret=interpret)
     dq, dk, dw, dg = chunk_bwd_dqkwg(q, k, corrected, w, gc, h, dv, do, dh, scale=scale, chunk=chunk,
                                      interpret=interpret)
-    dk2, dv, db, dg2 = prepare_wy_repr_bwd(k, v, beta, gc, a, dw, dv, chunk=chunk, interpret=interpret)
-    dk = (dk.astype(jnp.float32) + dk2.astype(jnp.float32)).astype(k.dtype)
+    dk, dv, db, dg2 = prepare_wy_repr_bwd(k, v, beta, gc, a, dw, dv, dk, chunk=chunk, interpret=interpret)
     dg = chunk_local_cumsum(dg + dg2, chunk=chunk, reverse=True, interpret=interpret)
     return dq, dk, dv, dg.astype(jnp.float32), db, dh0
 
