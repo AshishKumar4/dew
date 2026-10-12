@@ -335,6 +335,16 @@ def mode_topology(args) -> dict:
     rows = BATCH // args.processes
     local = row_marked_batch()[args.process_id * rows:(args.process_id + 1) * rows]
     sharded = shard_batch(mesh, {"image": local})["image"]
+    size = rows * (1 << 17)
+    storage = np.empty(size * 4 + 63, np.uint8)
+    offset = -storage.ctypes.data % 64
+    source = storage[offset:offset + size * 4].view(np.float32).reshape(rows, -1)
+    source[:] = np.arange(args.process_id * rows, (args.process_id + 1) * rows)[:, None]
+    owned = shard_batch(mesh, {"tokens": source})["tokens"]
+    owned.block_until_ready()
+    aliases_reader = any(np.shares_memory(np.asarray(shard.data), source)
+                         for shard in owned.addressable_shards)
+    source.fill(-1)
     return {
         "process_index": jax.process_index(),
         "process_count": jax.process_count(),
@@ -349,6 +359,9 @@ def mode_topology(args) -> dict:
         "local_rows": sorted(
             {int(value) for shard in sharded.addressable_shards
              for value in np.asarray(shard.data)[:, 0, 0, 0]}),
+        "aliases_reader": aliases_reader,
+        "preserved_rows": sorted({int(value) for shard in owned.addressable_shards
+                                  for value in np.asarray(shard.data)[:, 0]}),
         "run_timestamp": runtime.run_timestamp(),
         "own_year": runtime.datetime.now().year,
     }
