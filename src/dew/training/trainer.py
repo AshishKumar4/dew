@@ -31,6 +31,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 from flax import linen as nn
+from flax.core import unfreeze
 from flax.training import dynamic_scale as dynamic_scale_lib
 from jax.sharding import AbstractMesh, Mesh, NamedSharding, PartitionSpec as P
 from typing_extensions import TypeVar as DefaultTypeVar
@@ -582,7 +583,10 @@ class Trainer(Generic[Loss, Effects]):
         # Static metadata, the same on every trace of the state: the
         # placement reads it from here rather than tracing init again.
         self._boxed = boxed_axes(initialized)
-        params = nn.unbox(initialized)
+        # The state holds its trees as dicts, whichever Flax container (a
+        # FrozenDict) the objective's tree came in, so its placement, its
+        # updates and its restores share one structure.
+        params = unfreeze(nn.unbox(initialized))
         if "params" not in params:
             raise ValueError(
                 f"the objective's tree has no params collection, only {sorted(params)}; "
