@@ -65,8 +65,9 @@ field, a module's `attention_impl`, and `scaled_dot_product_attention`'s
 dtype, precision and force_fp32_for_softmax. 'xla' and 'cudnn' are
 `jax.nn.dot_product_attention`'s own two. 'triton' is tokamax's Pallas-Triton
 flash kernel (`triton_attention`), which needs tokamax installed
-(docs/installation.md). 'flash' is FlashAttention-2 (`flash_attention`), from
-the dew_flash_attn wheel (docs/installation.md). 'tpu' is the
+(docs/installation.md). 'flash' is FlashAttention (`flash_attention`), from
+the dew_flash_attn wheel (docs/installation.md): FlashAttention-3 on Hopper,
+FlashAttention-2 elsewhere. 'tpu' is the
 pallas splash kernel, with the older pallas flash kernel behind it for the
 calls splash's mask descriptor cannot carry.
 'auto', every module's default, resolves per trace (`resolve_implementation`):
@@ -856,7 +857,7 @@ def flash_built_for(generation: str, architectures: tuple[str, ...]) -> bool:
 
 def flash_refusal(query, key, causal=False, sliding_window=None, mask=None, bias=None, softcap=None,
                   sinks=None) -> str | None:
-    """Why 'auto' does not send a call to FlashAttention-2 (`flash_attention`),
+    """Why 'auto' does not send a call to FlashAttention (`flash_attention`),
     or None where it does: the GPU's target row names it, the query is bf16
     or fp16 with heads a multiple of 8 up to 256 wide (192 on sm8x parts other
     than sm80, whose backward takes no wider), a causal call is square, the
@@ -887,7 +888,7 @@ def flash_refusal(query, key, causal=False, sliding_window=None, mask=None, bias
 
 
 def flash_attention(query, key, value, causal: bool):
-    """FlashAttention-2 (dew_flash_attn, kernels/flash_attn) over `[B, S, H, D]`
+    """FlashAttention (dew_flash_attn, kernels/flash_attn) over `[B, S, H, D]`
     arrays at jax.nn's default scale. Its causal mask is aligned to the last
     key, where jax.nn's is aligned to the first, so a causal call is square.
     On a mesh it runs per shard, as `triton_attention` does. It runs where
