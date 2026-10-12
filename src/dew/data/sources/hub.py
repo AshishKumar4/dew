@@ -51,25 +51,31 @@ class Hub:
         )
 
     @cached_property
-    def streamed(self) -> str:
+    def streamed(self) -> str | None:
         """The immutable revision the split's shards are streamed from, pinned
         once, so the snapshot and the shard URLs name the same files. It is
         the resolved commit, or for the default revision when that commit
         holds no native Parquet, Arrow or JSONL files of the split, the commit
         its Parquet conversion (refs/convert/parquet) holds. The conversion
-        moves on its own, so the snapshot names it apart from the commit."""
+        moves on its own, so the snapshot names it apart from the commit. A
+        repo with neither has no shards to stream, and its split is read only
+        from prepared Arrow."""
         from huggingface_hub import HfApi
 
         if self.revision is not None or self._selected(self.commit)[0]:
             return self.commit
-        converted = HfApi().dataset_info(self.repo, revision="refs/convert/parquet").sha
-        if converted is None:
-            raise ValueError(f"HF {self.repo!r} conversion did not resolve to a commit")
-        return converted
+        converts = HfApi().list_repo_refs(self.repo, repo_type="dataset").converts
+        return next((ref.target_commit for ref in converts if ref.ref == "refs/convert/parquet"), None)
 
     @cached_property
     def files(self) -> Files:
-        paths, format = self._selected(self.streamed)
+        revision = self.streamed
+        if revision is None:
+            raise FileNotFoundError(
+                f"HF {self.repo!r}@{self.commit} split {self.split!r} has no native Parquet, Arrow or "
+                "JSONL files and the repo no Parquet conversion; provision=True and read it indexed"
+            )
+        paths, format = self._selected(revision)
         if not paths and self.revision is not None:
             raise FileNotFoundError(
                 f"HF {self.repo!r}@{self.commit} split {self.split!r} "
@@ -82,7 +88,7 @@ class Hub:
                 f"HF {self.repo!r} split {self.split!r} has no physical readable shards; "
                 "name an hf:// Parquet URL or explicitly provision Arrow"
             )
-        urls = tuple(f"hf://datasets/{self.repo}@{self.streamed}/{path}" for path in sorted(paths))
+        urls = tuple(f"hf://datasets/{self.repo}@{revision}/{path}" for path in sorted(paths))
         return Files(urls, format=format)
 
     def _selected(self, revision: str) -> tuple[list[str], Format]:
@@ -111,9 +117,9 @@ class Hub:
 
     def snapshot(self) -> Mapping[str, object]:
         """The pinned split: the resolved commit Arrow is prepared from, and the
-        commit its shards are streamed from (`streamed`). The two commits fix
-        every file the split is read or prepared from, so the snapshot is the
-        same on any host, in any cache directory, whether or not Arrow was
+        commit its shards are streamed from, if any (`streamed`). The commits
+        fix every file the split is read or prepared from, so the snapshot is
+        the same on any host, in any cache directory, whether or not Arrow was
         prepared there."""
         return {
             "store": "hf",
@@ -126,7 +132,7 @@ class Hub:
 
     def supports(self, read: Read) -> bool:
         if read == "streamed":
-            return True
+            return self.streamed is not None
         return Path(self.builder.cache_dir, "dataset_info.json").is_file()
 
     def provision(self) -> Hub:

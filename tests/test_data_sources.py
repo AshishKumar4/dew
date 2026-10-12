@@ -38,17 +38,18 @@ def test_pinned_hub_revision_never_falls_through_to_a_different_conversion(monke
     from types import SimpleNamespace
 
     from huggingface_hub import HfApi
+    from huggingface_hub.hf_api import GitRefInfo, GitRefs
 
     from dew.data.sources import Hub
-
-    def metadata(self, repo, revision=None):
-        return SimpleNamespace(sha="converted" if revision == "refs/convert/parquet" else "original")
 
     def listing(self, repo, *, repo_type, revision):
         return ["data/train-00000.parquet"] if revision == "converted" else ["train.tar"]
 
-    monkeypatch.setattr(HfApi, "dataset_info", metadata)
+    conversion = GitRefInfo(name="parquet", ref="refs/convert/parquet", target_commit="converted")
+    monkeypatch.setattr(HfApi, "dataset_info", lambda self, repo, **kwargs: SimpleNamespace(sha="original"))
     monkeypatch.setattr(HfApi, "list_repo_files", listing)
+    monkeypatch.setattr(HfApi, "list_repo_refs",
+                        lambda self, repo, **kwargs: GitRefs(branches=[], converts=[conversion], tags=[]))
     with pytest.raises(FileNotFoundError, match=r"original.*converted branch.*provision=True"):
         _ = Hub("owner/data", revision="original").files
     latest = Hub("owner/data").files
@@ -65,14 +66,16 @@ def test_a_conversion_that_moves_under_one_default_commit_is_another_snapshot(mo
 
     import datasets
     from huggingface_hub import HfApi
+    from huggingface_hub.hf_api import GitRefInfo, GitRefs
 
     from dew.data import Pipeline, compile
     from dew.data.sources import Hub
 
     converted = ["first"]
 
-    def metadata(self, repo, revision=None):
-        return SimpleNamespace(sha=converted[-1] if revision == "refs/convert/parquet" else "original")
+    def refs(self, repo, *, repo_type):
+        conversion = GitRefInfo(name="parquet", ref="refs/convert/parquet", target_commit=converted[-1])
+        return GitRefs(branches=[], converts=[conversion], tags=[])
 
     def listing(self, repo, *, repo_type, revision):
         return ["train.tar"] if revision == "original" else ["default/train/0000.parquet"]
@@ -81,8 +84,9 @@ def test_a_conversion_that_moves_under_one_default_commit_is_another_snapshot(mo
         streamed = Pipeline(Hub("owner/data")).batch(2)
         return compile(streamed, read="streamed", loading=Loading(workers=0)).plan
 
-    monkeypatch.setattr(HfApi, "dataset_info", metadata)
+    monkeypatch.setattr(HfApi, "dataset_info", lambda self, repo, **kwargs: SimpleNamespace(sha="original"))
     monkeypatch.setattr(HfApi, "list_repo_files", listing)
+    monkeypatch.setattr(HfApi, "list_repo_refs", refs)
     builder = SimpleNamespace(info=SimpleNamespace(features=None, splits=None))
     monkeypatch.setattr(datasets, "load_dataset_builder", lambda *args, **kwargs: builder)
     source = Hub("owner/data")
