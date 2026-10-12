@@ -11,9 +11,8 @@
 # the fix.
 jax @ https://github.com/AshishKumar4/jax/archive/19a48d1decce77ee228334d56f7a9f78bf6f478b.tar.gz
 
-# The tokamax CI installs beside Dew (tools/armada/install.sh); tokamax is not
-# a dependency (docs/installation.md). 0.0.15 is the first release without
-# 0.0.13 and 0.0.14's typeguard==2.13.3, which tyro's typeguard>=4 excludes,
-# and its attention and grouped-matmul kernels are those of main at 47d3d663,
-# which this file named before.
+# tokamax's release CI tests: the first without 0.0.13 and 0.0.14's
+# typeguard==2.13.3, which tyro's typeguard>=4 excludes, and its attention and
+# grouped-matmul kernels are those of main at 47d3d663, which this file named
+# before.
 tokamax==0.0.15

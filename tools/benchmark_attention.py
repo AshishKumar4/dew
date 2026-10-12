@@ -28,13 +28,15 @@ Usage:
 import contextlib
 import importlib
 import json
-import time
+import statistics
 from dataclasses import dataclass
 from typing import Optional
 
 import jax
 import jax.numpy as jnp
 import tyro
+
+from dew.nn.kernels.tuning import samples
 
 IMPLEMENTATIONS = ('reference', 'xla', 'cudnn', 'flash', 'triton')
 # B chosen so batch * sequence * heads is constant across the sequence sweep:
@@ -140,12 +142,8 @@ def measure(case: dict, config: BenchmarkConfig) -> dict:
             return {**row, 'served': False, 'reason': failure(e)}
 
         def time_call(callable_, *args):
-            for _ in range(config.warmup):
-                jax.block_until_ready(callable_(*args))
-            start = time.perf_counter()
-            for _ in range(config.steps):
-                jax.block_until_ready(callable_(*args))
-            return (time.perf_counter() - start) / config.steps * 1e3
+            measured = samples(callable_, *args, warmup=config.warmup, repeats=config.steps)
+            return statistics.mean(measured) * 1e3
 
         row.update(served=True, forward_ms=time_call(fn, q, k, v))
 

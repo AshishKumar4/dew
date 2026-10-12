@@ -21,6 +21,7 @@ from jax.sharding import Mesh, NamedSharding
 
 from dew.inference.tasks import cache_sized
 from dew.nn.inputs import Admitted, ModelInputs
+from dew.nn.kernels.tuning import tune
 from dew.nn.kv_cache import CURSOR, POOLED, TABLE, as_words, from_words, grouped, is_paged, leaf_name
 from dew.nn.protocols import Serving
 from dew.nn.scatter import DROPPED
@@ -474,8 +475,10 @@ def resident_formats(model: nn.Module, params: Variables, pad_id: int, placement
                             half, shardings, is_leaf=lambda leaf: leaf is None)
 
     program = _compiled(automatic(resident), automatic(carried), rows)
-    compiled = program.lower(model, params, pad_id, placement, steps, resident, carried, None, transforms,
-                             stopping, grammar).compile()
+    arguments = (model, params, pad_id, placement, steps, resident, carried, None, transforms, stopping,
+                 grammar)
+    tune(program, *arguments)
+    compiled = program.lower(*arguments).compile()
     return joined(*compiled.output_formats[1][:2])
 
 

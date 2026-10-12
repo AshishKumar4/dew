@@ -33,6 +33,7 @@ from benchmark_cases import Case
 from benchmark_models import batches, build_trainer
 
 from dew.config import OptimConfig
+from dew.nn.kernels.tuning import samples
 from dew.nn.moe import expert_projection
 from dew.telemetry.profile import capture_options
 from dew.training.distributed import DevicePrefetchIterator
@@ -42,16 +43,10 @@ SEQUENCE = 1024
 
 
 def timed(function, arguments, repeats: int) -> dict[str, float]:
-    """Ratio, minimum and median wall time of `function`, each call synced."""
-    for _ in range(5):
-        jax.block_until_ready(function(*arguments))
-    samples = []
-    for _ in range(repeats):
-        start = time.perf_counter()
-        jax.block_until_ready(function(*arguments))
-        samples.append((time.perf_counter() - start) * 1e3)
-    return {"mean_ms": float(np.mean(samples)), "min_ms": float(np.min(samples)),
-            "median_ms": float(np.median(samples))}
+    """Mean, minimum and median wall time of `function`, each call synced."""
+    measured = np.asarray(samples(function, *arguments, warmup=5, repeats=repeats)) * 1e3
+    return {"mean_ms": float(np.mean(measured)), "min_ms": float(np.min(measured)),
+            "median_ms": float(np.median(measured))}
 
 
 def peak_bytes() -> int | None:

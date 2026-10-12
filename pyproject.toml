@@ -50,6 +50,10 @@ dependencies = [
     "jinja2",
     "filelock",
     "huggingface_hub",
+    # dew.nn.kernels.tuning: every Pallas launch is a tokamax Op, whose config
+    # is measured per GPU model and shape. 0.0.13 and 0.0.14 pin
+    # typeguard==2.13.3, which tyro excludes.
+    "tokamax>=0.0.15",
 ]
 license = "MIT"
 # Third-party code Dew carries keeps its notice: each file translated or
