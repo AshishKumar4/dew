@@ -182,16 +182,24 @@ class _PerShare(Forwarding):
     def endless(self) -> bool:
         return self._endless
 
+    @property
+    def stop_seconds(self) -> float:
+        """Its Loading's stop budget: the Grain iterator it wraps reports none, so the reader that
+        owns the iterator states it, as the global reader does."""
+        return self._stop_seconds
+
     def __init__(
         self,
         open_reader: Callable[[], pygrain.DatasetIterator[Batch]],
         plan: Plan,
         resume: Literal["exact", "non-exact"],
         *,
+        stop_seconds: float,
         endless: bool = True,
     ):
         self._open, self._plan = open_reader, plan
         self._resume: Literal["exact", "non-exact"] = resume
+        self._stop_seconds = stop_seconds
         self._endless = endless
         self._read: pygrain.DatasetIterator[Batch] | None = None
         self._saved: Mapping[str, object] | None = None

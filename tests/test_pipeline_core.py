@@ -435,6 +435,19 @@ def test_shares_agree_on_one_identity_and_resume_only_their_own_rows():
         second.close()
 
 
+def test_a_per_share_reader_states_its_loadings_stop_budget_without_opening():
+    """A per-share reader wraps a Grain iterator, which reports no stop budget, so the reader
+    states its Loading's own, without opening the iterator to ask."""
+    loading = Loading(workers=8, threads=1, read_buffer=1)
+    thirds = Pipeline(source()).filter(lambda row: int(row["id"]) % 3 > 0, identity="thirds@1")
+    data = compile(thirds.batch(4), loading=loading)
+    opened = []
+    reader = data.train(DataPartition(0, 2))
+    reader._open = lambda: opened.append(True)
+    assert reader.stop_seconds == loading.stop_seconds > 5.0
+    assert opened == []
+
+
 def test_a_memory_read_counts_a_missing_row_alike_with_or_without_a_cache():
     """A row the source holds as None is left out and counted missing,
     whether the memory read fills a cache with it or not."""
