@@ -547,11 +547,16 @@ class Dataset:
     kept back for validation, which `fit` reports when the run starts; it is 0
     when validation is a separate split or there is none.
 
-    Each factory call returns a fresh iterator that the caller owns. Close it
-    after use if it has `close`, but never close the shared dataset or its
-    backing store. A source's optional `request_stop` is a separate,
-    thread-safe signal; it does not make it safe to call the final `close`
-    while another thread is still iterating.
+    Each factory call returns a fresh iterator, and the code that opened it
+    owns closing it. Close it after use when it is `Closeable`; every wrapper
+    around a stream (host steps, ramps, phases, the readers) forwards `close`
+    to the stream it wraps. Never close the shared dataset or its backing
+    store. A batch an iterator yields stays valid until its consumer asks for
+    the next one. A consumer that keeps batches longer copies them, since a
+    batch made by worker processes lives in shared memory and holds a
+    descriptor for as long as it is kept. A source's optional `request_stop`
+    is a separate, thread-safe signal; it does not make it safe to call the
+    final `close` while another thread is still iterating.
 
     Image and video fields are uint8 in [0, 255], text is the tokenized
     `{"input_ids", "attention_mask"}` dict under "text", and a token window
