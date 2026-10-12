@@ -452,6 +452,11 @@ class _TransformerOptions(nn.Module, kw_only=True):
     norm_epsilon: float = 1e-5
     attention_impl: str = 'auto'
 
+    @nn.nowrap
+    def condition_lengths(self, lengths: np.ndarray, spans: np.ndarray) -> np.ndarray:
+        """Joint streams read every text position; pooled paths have no length-dependent products."""
+        return spans
+
     def _block_options(self) -> _BlockOptions:
         return {'mlp_ratio': self.mlp_ratio, 'dtype': self.dtype, 'precision': self.precision,
                 'force_fp32_for_softmax': self.force_fp32_for_softmax,

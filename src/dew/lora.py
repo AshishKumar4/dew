@@ -37,8 +37,9 @@ import dataclasses
 import json
 import math
 import re
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path as FilePath
 from typing import ClassVar, Protocol, TypedDict, runtime_checkable
 
@@ -54,7 +55,23 @@ from dew.interop.safetensors_io import read_file, write_file
 from dew.interop.streaming import WeightLayout
 from dew.nn.backbones.layer_plan import group_layers
 from dew.nn.flops import MissingFlopsCount, counted_flops, parameter_flops, projection_flops
-from dew.nn.protocols import Counted, CountedLogits, CountedMatrixUsage
+from dew.nn.protocols import (
+    Counted,
+    CountedConditionedSpatial,
+    CountedImages,
+    CountedLogits,
+    CountedLogitsTraining,
+    CountedMatrixUsage,
+    CountedMultimodal,
+    CountedParameters,
+    CountedPredictionParameters,
+    CountedPredictions,
+    CountedPredictionTraining,
+    CountedSequences,
+    CountedSpatial,
+    CountedTraining,
+    CountedVideo,
+)
 from dew.objectives.base import Path, Variables, freeze, merge as overlay, select, thaw
 from dew.registry import wrapper_layers
 
@@ -409,15 +426,28 @@ class _Branch:
         return output + jnp.asarray(_scale(target, self.rslora), delta.dtype) * delta
 
 
+def _refusing_counts(model: nn.Module, base: type[nn.Module], *protocols) -> type[nn.Module]:
+    """Inherited geometry describes the native forward, not the added factors."""
+    def missing(self, *args, **kwargs) -> float:
+        raise MissingFlopsCount(f"{type(model).__name__} needs declared adapter matrix usage "
+                                "and parameter work for this geometry")
+
+    methods = {name: nn.nowrap(missing) for protocol in protocols for name in vars(protocol)
+               if name.endswith('_flops') and hasattr(model, name)}
+    return type('UncountedAdapter', (base,), methods)
+
+
 def _counted_adapter(model: nn.Module, branch: _Branch,
                      layouts: Mapping[str, WeightLayout]) -> type[nn.Module]:
     """An adapter adds analytical work only to capabilities its wrapped model declares."""
-    base = type(model)
+    base = _refusing_counts(model, type(model), CountedImages, CountedMultimodal, CountedSequences,
+                            CountedSpatial, CountedConditionedSpatial, CountedVideo)
     bindings = {layout.paths[0][:-1]: layout for layout in layouts.values() if len(layout.paths) == 1}
 
     class CountedAdapter(base):
         @nn.nowrap
-        def _adapter_forward(self, lengths, *, logits: bool = False) -> float:
+        def _adapter_forward(self, lengths, *, logits: bool = False,
+                              usage: Callable[[Path, np.ndarray], np.ndarray] | None = None) -> float:
             original = unadapted(self)
             if not isinstance(original, CountedMatrixUsage):
                 raise MissingFlopsCount(f"{type(original).__name__} has no declared adapter matrix usage")
@@ -431,14 +461,19 @@ def _counted_adapter(model: nn.Module, branch: _Branch,
                     if len(layout.transpose) != 2:
                         raise MissingFlopsCount(f"adapter {'/'.join(path)} has nonmatrix native axes")
                     shape = tuple(shape[layout.transpose.index(axis)] for axis in range(2))
-                usage = original.matrix_usage(path, lengths, logits=logits)
-                total += projection_flops(usage, shape[0] + shape[1], target.rank)
+                positions = (original.matrix_usage(path, lengths, logits=logits) if usage is None
+                             else usage(path, lengths))
+                total += projection_flops(positions, shape[0] + shape[1], target.rank)
             return total
 
         @nn.nowrap
         def model_flops(self, lengths) -> float:
             """Actual forward work, including factors, distinct from training work."""
             return counted_flops(unadapted(self), lengths) + self._adapter_forward(lengths)
+
+        @nn.nowrap
+        def parameter_flops(self, lengths) -> float:
+            return parameter_flops(unadapted(self), lengths) + self._adapter_forward(lengths)
 
         @nn.nowrap
         def training_flops(self, lengths) -> float:
@@ -455,6 +490,34 @@ def _counted_adapter(model: nn.Module, branch: _Branch,
 
     class LogitsAdapter(CountedAdapter):
         @nn.nowrap
+        def prediction_flops(self, lengths, *, prediction_lengths=None) -> float:
+            original = unadapted(self)
+            if not isinstance(original, CountedPredictionParameters):
+                raise MissingFlopsCount(f"{type(original).__name__} has no declared prediction matrix work")
+            forward = original.prediction_flops(lengths, prediction_lengths=prediction_lengths)
+            usage = partial(original.prediction_matrix_usage, prediction_lengths=prediction_lengths)
+            return forward + self._adapter_forward(lengths, usage=usage)
+
+        @nn.nowrap
+        def prediction_parameter_flops(self, lengths, *, prediction_lengths=None) -> float:
+            original = unadapted(self)
+            if not isinstance(original, CountedPredictionParameters):
+                raise MissingFlopsCount(f"{type(original).__name__} has no declared prediction matrix work")
+            learned = original.prediction_parameter_flops(lengths, prediction_lengths=prediction_lengths)
+            usage = partial(original.prediction_matrix_usage, prediction_lengths=prediction_lengths)
+            return learned + self._adapter_forward(lengths, usage=usage)
+
+        @nn.nowrap
+        def prediction_training_flops(self, lengths, *, prediction_lengths=None) -> float:
+            original = unadapted(self)
+            if not isinstance(original, CountedPredictionParameters):
+                raise MissingFlopsCount(f"{type(original).__name__} has no declared prediction matrix work")
+            forward = original.prediction_flops(lengths, prediction_lengths=prediction_lengths)
+            learned = original.prediction_parameter_flops(lengths, prediction_lengths=prediction_lengths)
+            usage = partial(original.prediction_matrix_usage, prediction_lengths=prediction_lengths)
+            return 3 * forward - learned + 3 * self._adapter_forward(lengths, usage=usage)
+
+        @nn.nowrap
         def logits_flops(self, lengths) -> float:
             original = unadapted(self)
             if not isinstance(original, CountedLogits):
@@ -468,8 +531,12 @@ def _counted_adapter(model: nn.Module, branch: _Branch,
                 raise MissingFlopsCount(f"{type(original).__name__} has no declared vocabulary-head work")
             return 2 * original.logits_flops(lengths) + 3 * self._adapter_forward(lengths, logits=True)
 
-    return (LogitsAdapter if isinstance(model, CountedLogits) else
-            CountedAdapter if isinstance(model, Counted) else base)
+    if isinstance(model, CountedLogits):
+        return LogitsAdapter
+    if isinstance(model, Counted):
+        return CountedAdapter
+    return _refusing_counts(model, base, CountedParameters, CountedTraining, CountedLogitsTraining,
+                            CountedPredictions, CountedPredictionParameters, CountedPredictionTraining)
 
 
 def _adapted(model: nn.Module, branch: _Branch, layouts: Mapping[str, WeightLayout]) -> nn.Module:
