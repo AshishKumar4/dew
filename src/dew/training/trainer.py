@@ -1073,12 +1073,13 @@ class Trainer(Generic[Loss, Effects]):
         and no concurrent transfer limit. The batch is not donated, because the loader
         owns it.
         """
+        if self.lower_for is not None:
+            # Shapes are all a lowering reads, so the state may be abstract (`jax.eval_shape`).
+            raise Lowered(self.lower_for, self._lowered_for(state, batch, self.lower_for))
         if int(state.window_size) != self.accumulation:
             raise ValueError("checkpoint accumulation window_size differs from this trainer")
         if (state.scale is not None) != self.dynamic_scale:
             raise ValueError("checkpoint dynamic-scaler configuration differs from this trainer")
-        if self.lower_for is not None:
-            raise Lowered(self.lower_for, self._lowered_for(state, batch, self.lower_for))
         if self.host_master:
             return self._compile_host(state, batch)
         mesh = self.device_mesh
