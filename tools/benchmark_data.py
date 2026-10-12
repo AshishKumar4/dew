@@ -29,20 +29,21 @@ from absl import flags  # noqa: E402
 # grain's worker processes read absl flags, and a plain script never parses them
 flags.FLAGS.mark_as_parsed()
 
-from dew.data import Images, Loading, Recipe, load  # noqa: E402
+from dew.config.data import ImageData, RunData, loader  # noqa: E402
+from dew.data import Loading  # noqa: E402
 from dew.registry import datasets  # noqa: E402
 
 if TYPE_CHECKING:
     # tyro reads the runtime annotation, a Union of the registered specs, and
     # a type checker cannot read a variable in a type expression.
-    AnySpec = Recipe
+    AnySpec = RunData
 else:
     AnySpec = datasets.union
 
 
 @dataclass(frozen=True)
 class Benchmark:
-    data: AnySpec = field(default_factory=lambda: Images(source="tfds://oxford_flowers102:2.1.1"))
+    data: AnySpec = field(default_factory=lambda: ImageData(source="tfds://oxford_flowers102:2.1.1"))
     """Which dataset, with its own fields as flags."""
     batch: int = 32
     """Global batch size."""
@@ -84,10 +85,10 @@ def report(latencies: List[float], batch_size: int) -> None:
 
 
 def main(config: Benchmark) -> None:
-    dataset = load(config.data, batch=config.batch, read=config.read, loading=config.loading)
+    dataset = loader(config.data, batch=config.batch, read=config.read, loading=config.loading)
     print(f"{datasets.alias_of(type(config.data))}: {dataset.records} records, "
           f"batch {dataset.batch} across every process")
-    from dew.data import DataPartition
+    from dew.data.dataset import DataPartition
     from dew.training import MeshSpec
 
     # The share this process reads on the plain data-parallel mesh.

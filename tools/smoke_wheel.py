@@ -34,7 +34,8 @@ import jax, jax.numpy as jnp, numpy as np, optax
 
 import dew
 from dew import Trainer
-from dew.data import Loading, Text, load
+from dew.data import Loading
+from dew.config.data import TextData, loader
 from dew.nn.backbones import CausalTransformer
 from dew.objectives.lm import LMObjective
 
@@ -46,7 +47,7 @@ for split, repeats in (("train", 64), ("val", 16)):
 (tokens / "meta.json").write_text(json.dumps({
     "tokenizer": "symbols", "vocab_size": 8, "dtype": "uint8", "train_tokens": 256, "val_tokens": 64,
     "eos_id": None}))
-data = load(Text(source=str(tokens), seq_len=8), batch=4, read="memory", validation_records=4,
+data = loader(TextData(source=str(tokens), seq_len=8), batch=4, read="memory", validation_records=4,
             loading=Loading(workers=0, threads=1, read_buffer=2))
 model = CausalTransformer(vocab_size=8, emb_features=16, num_layers=1, num_heads=2, mlp_features=32,
                           max_seq_len=16, dtype=jnp.float32, attention_impl="xla")

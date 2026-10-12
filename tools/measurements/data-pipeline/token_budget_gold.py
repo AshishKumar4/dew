@@ -18,9 +18,9 @@ from pathlib import Path
 
 import numpy as np
 
+from dew.config.data import loader
 from dew.data.batching import TOKEN_COUNTS
 from dew.data.dataset import DataPartition, Loading
-from dew.data.recipes import load
 from dew.data.text import HFTokenizer
 from dew.decision.data import Decisions
 from dew.decision.layout import JointLayout, Specials
@@ -88,7 +88,7 @@ def main() -> None:
     started = time.monotonic()
     profiler = cProfile.Profile()
     with count_requests() as requests, profiler:
-        dataset = load(
+        dataset = loader(
             Decisions(args.root, descriptor=args.descriptor),
             batch=args.batch_rows,
             tokens=args.micro_tokens if args.batch_rows is None else None,
