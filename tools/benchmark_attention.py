@@ -62,6 +62,11 @@ class BenchmarkConfig:
     heads: Optional[int] = None
     """Query heads; by default what the tokens*heads budget leaves at the batch and length."""
     sliding_window: Optional[int] = None
+    """A causal window runs `local_attention`, as a model's sliding layers do."""
+    sinks: bool = False
+    """One learned logit a query head in each row's denominator (gpt-oss, MiMo-V2), drawn at random."""
+    value_dim: Optional[int] = None
+    """The value heads' width where it is narrower than the query's (MiMo-V2's 128 under 192)."""
     softcap: Optional[float] = None
     """Gemma 2's tanh logit cap. Only the reference, xla and triton paths take it."""
     forward_only: bool = False
@@ -80,9 +85,11 @@ class BenchmarkConfig:
     json_out: Optional[str] = None
 
 
-def attention_fn(implementation: str, config: BenchmarkConfig, causal: bool, dtype=None):
-    from dew.nn.attention import scaled_dot_product_attention
+def attention_fn(implementation: str, config: BenchmarkConfig, causal: bool, sinks=None, dtype=None):
+    from dew.nn.attention import local_attention, scaled_dot_product_attention
     window, softcap = config.sliding_window, config.softcap
+    if sinks is not None and implementation in ('jax_cudnn', 'triton'):
+        raise ValueError(f"{implementation} takes no attention sinks")
     if implementation == 'jax_cudnn':
         # jax.nn's own cuDNN call, which takes heads wider than Dew's cudnn path does.
         return lambda q, k, v: jax.nn.dot_product_attention(q, k, v, is_causal=causal, implementation='cudnn')
@@ -94,9 +101,12 @@ def attention_fn(implementation: str, config: BenchmarkConfig, causal: bool, dty
         return lambda q, k, v: tokamax.dot_product_attention(
             q, k, v, is_causal=causal, local_window_size=local,
             logits_soft_cap=softcap, implementation='triton')
+    if causal and window is not None:
+        return lambda q, k, v: local_attention(
+            q, k, v, window=window, implementation=implementation, sinks=sinks, softcap=softcap, dtype=dtype)
     return lambda q, k, v: scaled_dot_product_attention(
         q, k, v, implementation=implementation,
-        causal=causal, sliding_window=window, softcap=softcap, dtype=dtype)
+        causal=causal, sliding_window=window, sinks=sinks, softcap=softcap, dtype=dtype)
 
 
 def lowering_target(implementation: str, config: BenchmarkConfig):
@@ -133,17 +143,19 @@ def measure(case: dict, config: BenchmarkConfig) -> dict:
         raise ValueError(f"{heads} query heads at S={seq} do not split into "
                          f"kv_groups={config.kv_groups}")
     batch = case['batch_size']
-    keys = jax.random.split(jax.random.PRNGKey(0), 4)
+    keys = jax.random.split(jax.random.PRNGKey(0), 5)
+    value_dim = config.value_dim or head_dim
     q = jax.random.normal(keys[0], (batch, seq, heads, head_dim), jnp.bfloat16)
     k = jax.random.normal(keys[1], (batch, seq, heads // config.kv_groups, head_dim), jnp.bfloat16)
-    v = jax.random.normal(keys[2], (batch, seq, heads // config.kv_groups, head_dim), jnp.bfloat16)
-    cotangent = jax.random.normal(keys[3], q.shape, jnp.float32)
+    v = jax.random.normal(keys[2], (batch, seq, heads // config.kv_groups, value_dim), jnp.bfloat16)
+    cotangent = jax.random.normal(keys[3], (*q.shape[:-1], value_dim), jnp.float32)
+    sinks = jax.random.normal(keys[4], (heads,), jnp.float32) if config.sinks else None
     causal = case['causal']
     row = {**case, 'heads': heads, 'kv_heads': heads // config.kv_groups}
 
     with lowering_target(case['implementation'], config):
         try:
-            kernel = attention_fn(case['implementation'], config, causal)
+            kernel = attention_fn(case['implementation'], config, causal, sinks)
             fn = jax.jit(kernel)
             out = fn(q, k, v)
             out.block_until_ready()
@@ -176,7 +188,7 @@ def measure(case: dict, config: BenchmarkConfig) -> dict:
     if config.reference_error:
         # The reference einsum in fp32 on the same bf16 values, the number
         # every kernel row is measured against.
-        reference = attention_fn('reference', config, causal, dtype=jnp.float32)
+        reference = attention_fn('reference', config, causal, sinks, dtype=jnp.float32)
         expected = jax.jit(reference)(q, k, v)
         row['forward_error'] = largest_difference(out, expected)
         if grads is not None:

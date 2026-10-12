@@ -49,6 +49,7 @@ from .rope import rotate
 from .sharding import (
     HEADS,
     KV_HEADS,
+    SCORES,
     SEQUENCE_AXIS,
     LayoutRefused,
     constrain,
@@ -73,8 +74,9 @@ field, a module's `attention_impl`, and `scaled_dot_product_attention`'s
 dtype, precision and force_fp32_for_softmax. 'xla' and 'cudnn' are
 `jax.nn.dot_product_attention`'s own two. 'triton' is tokamax's Pallas-Triton
 flash kernel (`triton_attention`), which needs tokamax installed
-(docs/installation.md). 'flash' is FlashAttention-2 (`flash_attention`), from
-the dew_flash_attn wheel (docs/installation.md). 'tpu' is the
+(docs/installation.md). 'flash' is FlashAttention (`flash_attention`),
+FlashAttention-3 on Hopper and FlashAttention-2 elsewhere, from the
+dew_flash_attn wheel (docs/installation.md). 'tpu' is the
 pallas splash kernel, with the older pallas flash kernel behind it for the
 calls splash's mask descriptor cannot carry.
 'auto', every module's default, resolves per trace (`resolve_implementation`):
@@ -616,7 +618,8 @@ def cudnn_attention(query, key, value, bias, mask, causal, sliding_window,
     tokens, most text-plus-image sequences), so one zero row pads it even. The
     padded query row is sliced off and the padded key hidden by the kernel's
     key_value_seq_lengths, which never reach past the real keys.
-    tests/test_kernels.py pins the equality with the xla path.
+    tests/test_kernels.py pins the equality with the xla path. On a mesh it
+    runs per shard (`per_shard`).
     """
     q_len, kv_len = query.shape[-3], key.shape[-3]
     # jax's cudnn call takes a mask or bias only at the full [.., Q, K]
@@ -639,13 +642,20 @@ def cudnn_attention(query, key, value, bias, mask, causal, sliding_window,
     kv_lengths = key_value_seq_lengths
     if kv_lengths is None and kv_pad:
         kv_lengths = jnp.full(key.shape[:1], kv_len, jnp.int32)
-    # A window of (l, r) keeps the l keys before the query and the r after it
-    # on both the xla and the cudnn path, the sides `window_sides` counts.
-    out = jax.nn.dot_product_attention(
-        query, key, value, bias=bias, mask=mask, is_causal=causal,
-        key_value_seq_lengths=kv_lengths,
-        local_window_size=None if sliding_window is None else window_sides(causal, sliding_window),
-        implementation='cudnn')
+
+    def local(query, key, value, bias=None, mask=None, key_value_seq_lengths=None):
+        # A window of (l, r) keeps the l keys before the query and the r after it
+        # on both the xla and the cudnn path, the sides `window_sides` counts.
+        return jax.nn.dot_product_attention(
+            query, key, value, bias=bias, mask=mask, is_causal=causal,
+            key_value_seq_lengths=key_value_seq_lengths,
+            local_window_size=None if sliding_window is None else window_sides(causal, sliding_window),
+            implementation='cudnn')
+
+    out = per_shard(local, query, key, value,
+                    bias=(None if bias is None else _four_dimensional(bias), SCORES),
+                    mask=(None if mask is None else _four_dimensional(mask), SCORES),
+                    key_value_seq_lengths=(kv_lengths, ("activation_batch",)))
     return out[:, :q_len] if q_pad else out
 
 
@@ -869,8 +879,7 @@ def gathered_keys_attention(kernel, query, key, value, shards: int, *, causal,
     for name, x in (('mask', mask), ('bias', bias)):
         if x is not None:
             x = _four_dimensional(x)
-            extras[name] = (x, logical_spec(
-                ("activation_batch", "activation_heads", "activation_length", None), x.shape))
+            extras[name] = (x, logical_spec(SCORES, x.shape))
     if sinks is not None:
         extras['sinks'] = (sinks, logical_spec(("activation_heads",), sinks.shape))
     if key_value_seq_lengths is not None:
@@ -964,13 +973,14 @@ def flash_built_for(generation: str, architectures: tuple[str, ...]) -> bool:
 
 def flash_refusal(query, key, causal=False, sliding_window=None, mask=None, bias=None, softcap=None,
                   sinks=None) -> str | None:
-    """Why 'auto' does not send a call to FlashAttention-2 (`flash_attention`),
-    or None where it does: the GPU's target row names it, the query is bf16
-    or fp16 with heads a multiple of 8 up to 256 wide (192 on sm8x parts other
+    """Why 'auto' does not send a call to FlashAttention (`flash_attention`),
+    or None where it does: the GPU's target row names it, and names it for a
+    sliding window or sinks where the call has them, the query is bf16 or
+    fp16 with heads a multiple of 8 up to 256 wide (192 on sm8x parts other
     than sm80, whose backward takes no wider), a causal call is square, the
-    call has no window, mask, bias, softcap or sinks, no deterministic ops are
-    asked for, which its backward's atomic sum of the query gradient would
-    not keep, and the installed dew_flash_attn holds code for this GPU."""
+    call has no mask, bias or softcap, no deterministic ops are asked for,
+    which its backward's atomic sum of the query gradient would not keep, and
+    the installed dew_flash_attn holds code for this GPU."""
     head_dim = query.shape[-1]
     generation = device_generation()
     architectures = flash_architectures()
@@ -979,14 +989,16 @@ def flash_refusal(query, key, causal=False, sliding_window=None, mask=None, bias
     return first_refusal(
         (gpu_placed() and measured_kernel('attention', 'cudnn') == 'flash',
          "its target row names it for no other device"),
+        (sliding_window is None or measured_kernel('attention_window', 'cudnn') == 'flash',
+         f"the call has a sliding window, for which its target row names it on no {generation}"),
+        (sinks is None or measured_kernel('attention_sinks', 'xla') == 'flash',
+         f"the call has attention sinks, for which its target row names it on no {generation}"),
         (query.dtype in CUDNN_DTYPES, f"the query is {query.dtype}"),
         (head_dim % 8 == 0 and head_dim <= widest, f"the heads are {head_dim} wide"),
         (not causal or query.shape[-3] == key.shape[-3], "a causal call has more keys than queries"),
-        (sliding_window is None, "the call has a sliding window"),
         (mask is None, "the call has a mask"),
         (bias is None, "the call has a bias"),
         (softcap is None, "the call has a logit softcap"),
-        (sinks is None, "the call has attention sinks"),
         (not deterministic_ops_requested(), "--xla_gpu_deterministic_ops is set"),
         (architectures is not None, "dew_flash_attn is not installed"),
         (architectures is None or flash_built_for(generation, architectures),
@@ -994,12 +1006,46 @@ def flash_refusal(query, key, causal=False, sliding_window=None, mask=None, bias
     )
 
 
-def flash_attention(query, key, value, causal: bool):
-    """FlashAttention-2 (dew_flash_attn, kernels/flash_attn) over `[B, S, H, D]`
-    arrays at jax.nn's default scale. Its causal mask is aligned to the last
-    key, where jax.nn's is aligned to the first, so a causal call is square.
-    On a mesh it runs per shard, as `triton_attention` does. It runs where
-    the installed wheel holds code for the device (`flash_built_for`)."""
+def per_shard(local, query, key, value, **extras):
+    """`local(query, key, value, **extras)` on a mesh's shards, or whole without one.
+
+    On a mesh it runs in `manual_map` on each shard's rows and heads, the key
+    heads repeated until the tensor axes split them as they split the query's.
+    A Pallas kernel has no partitioning rule, and jax's cuDNN attention
+    partitions through `custom_partitioning`, whose lowering on several devices
+    keys the persistent compilation cache by a process address
+    (`str(id(...))` in its backend config), so every fresh process would
+    compile again; under a fully manual map jax lowers neither. `extras` maps
+    each further argument to the array, or None, and the logical axes it
+    splits on.
+    """
+    given = {name: pair for name, pair in extras.items() if pair[0] is not None}
+    mesh = jax.sharding.get_abstract_mesh()
+    # Inside a map that holds every axis manual (the sequence exchanges) the
+    # arrays are a shard's already.
+    if mesh.empty or set(mesh.axis_names) <= set(mesh.manual_axes):
+        return local(query, key, value, **{name: x for name, (x, _) in given.items()})
+    kv_heads = math.lcm(key.shape[-2], _tensor_shards(query))
+    key, value = repeat_kv_heads(key, kv_heads), repeat_kv_heads(value, kv_heads)
+    queries, keys = logical_spec(HEADS, query.shape), logical_spec(KV_HEADS, key.shape)
+    names = tuple(given)
+
+    def shard(query, key, value, *arrays):
+        return local(query, key, value, **dict(zip(names, arrays, strict=True)))
+
+    specs = (queries, keys, keys, *(logical_spec(axes, x.shape) for x, axes in given.values()))
+    return manual_map(shard, specs, queries)(query, key, value, *(x for x, _ in given.values()))
+
+
+def flash_attention(query, key, value, causal: bool, sliding_window=None, sinks=None):
+    """FlashAttention (dew_flash_attn, kernels/flash_attn) over `[B, S, H, D]`
+    arrays at jax.nn's default scale: FlashAttention-3 on Hopper and
+    FlashAttention-2 elsewhere. A window keeps the keys `window_sides` counts,
+    and `sinks` `[H]` puts one value-free logit a head in each row's
+    denominator. Its causal mask is
+    aligned to the last key, where jax.nn's is aligned to the first, so a
+    causal call is square. On a mesh it runs per shard (`per_shard`). It runs
+    where the installed wheel holds code for the device (`flash_built_for`)."""
     generation = device_generation()
     architectures = flash_architectures()
     if architectures is None:
@@ -1008,16 +1054,12 @@ def flash_attention(query, key, value, causal: bool):
         raise ValueError(f"the installed dew_flash_attn holds code for {', '.join(architectures)} and this "
                          f"device is {generation}; use attention_impl 'cudnn' or 'xla'")
     flash = importlib.import_module('dew_flash_attn')
+    window = (-1, -1) if sliding_window is None else window_sides(causal, sliding_window)
 
-    def local(query, key, value):
-        return flash.flash_mha(query, key, value, is_causal=causal)
+    def local(query, key, value, sinks=None):
+        return flash.flash_mha(query, key, value, is_causal=causal, window_size=window, sinks=sinks)
 
-    if jax.sharding.get_abstract_mesh().empty:
-        return local(query, key, value)
-    kv_heads = math.lcm(key.shape[-2], _tensor_shards(query))
-    key, value = repeat_kv_heads(key, kv_heads), repeat_kv_heads(value, kv_heads)
-    queries, keys = logical_spec(HEADS, query.shape), logical_spec(KV_HEADS, key.shape)
-    return manual_map(local, (queries, keys, keys), queries)(query, key, value)
+    return per_shard(local, query, key, value, sinks=(sinks, ("activation_heads",)))
 
 
 def triton_attention(query, key, value, causal: bool):
@@ -1025,10 +1067,9 @@ def triton_attention(query, key, value, causal: bool):
     tokamax's heuristic config, with jax.nn's default scale of 1/sqrt(D).
 
     It takes grouped key heads and any length itself. A Pallas call has no
-    partitioning rule, so on a mesh it runs inside `manual_map` on each
-    shard's rows and heads, with the key heads repeated until the tensor
-    axes split them as they split the query's. tokamax is not a dependency
-    of Dew (docs/installation.md says how to install it), so it is imported here.
+    partitioning rule, so on a mesh it runs per shard (`per_shard`). tokamax
+    is not a dependency of Dew (docs/installation.md says how to install it),
+    so it is imported here.
     """
     try:
         tokamax = importlib.import_module('tokamax')
@@ -1040,12 +1081,7 @@ def triton_attention(query, key, value, causal: bool):
         return tokamax.dot_product_attention(query, key, value, is_causal=causal,
                                              implementation='triton')
 
-    if jax.sharding.get_abstract_mesh().empty:
-        return local(query, key, value)
-    kv_heads = math.lcm(key.shape[-2], _tensor_shards(query))
-    key, value = repeat_kv_heads(key, kv_heads), repeat_kv_heads(value, kv_heads)
-    queries, keys = logical_spec(HEADS, query.shape), logical_spec(KV_HEADS, key.shape)
-    return manual_map(local, (queries, keys, keys), queries)(query, key, value)
+    return per_shard(local, query, key, value)
 
 
 VALUE_BLOCK = 256
@@ -1368,22 +1404,27 @@ def fused_attention(query, key, value, bias, mask, causal, sliding_window, imple
                 "bidirectional call windows both sides; use attention_impl 'xla'.")
         out = cudnn_attention(query, key, value, bias, mask, causal, sliding_window,
                               key_value_seq_lengths)
-    elif implementation in ('triton', 'flash'):
+    elif implementation == 'triton':
         if any(x is not None for x in (sinks, softcap, bias, mask, sliding_window, key_value_seq_lengths)):
             raise ValueError(
-                f"attention implementation '{implementation}' takes no sinks, softcap, bias, mask, "
-                "window or key lengths; use attention_impl 'cudnn' or 'xla' for this call.")
-        if implementation == 'flash' and query.dtype not in CUDNN_DTYPES:
+                "attention implementation 'triton' takes no sinks, softcap, bias, mask, window or key "
+                "lengths; use attention_impl 'cudnn' or 'xla' for this call.")
+        out = triton_attention(query, key, value, causal)
+    elif implementation == 'flash':
+        if any(x is not None for x in (softcap, bias, mask, key_value_seq_lengths)):
+            raise ValueError(
+                "attention implementation 'flash' takes no softcap, bias, mask or key lengths; use "
+                "attention_impl 'cudnn' or 'xla' for this call.")
+        if query.dtype not in CUDNN_DTYPES:
             raise ValueError(f"flash attention needs bf16 or fp16 inputs, the query is {query.dtype}")
-        if implementation == 'flash' and causal and query.shape[-3] != key.shape[-3]:
+        if causal and query.shape[-3] != key.shape[-3]:
             raise ValueError("flash attention aligns its causal mask to the last key, so a causal call "
                              f"needs as many queries as keys, not {query.shape[-3]} and {key.shape[-3]}")
-        if implementation == 'flash' and deterministic_ops_requested():
+        if deterministic_ops_requested():
             raise ValueError("attention implementation 'flash' cannot run under --xla_gpu_deterministic_ops: "
                              "its backward sums the query gradient with atomics. "
                              "Use attention_impl 'xla'.")
-        attend = triton_attention if implementation == 'triton' else flash_attention
-        out = attend(query, key, value, causal)
+        out = flash_attention(query, key, value, causal, sliding_window, sinks)
     elif (implementation == 'xla' and mask is None and folds(query, key, bias, mask, causal, sliding_window)
           and key_value_seq_lengths is not None and decode_attention.fits(query, key)):
         out = decode_attention.attend(query, key, value, key_value_seq_lengths)
@@ -1674,8 +1715,9 @@ def local_attention(query, key, value, *, window: int | None = None, chunk: int 
     index), `segment_ids` keeps packed documents apart (0 is padding) and
     `valid` `[B, S]` drops the keys it marks False.
 
-    No `[S, S]` array is built above two spans. A window cudnn (no sinks or
-    packing) or splash takes as a flag runs there, skipping blocks outside it.
+    No `[S, S]` array is built above two spans. A window flash, cudnn (no
+    sinks) or splash takes as a flag, without packing, runs there, skipping
+    blocks outside it.
     Chunks that start at row multiples fold into the batch. Everything else
     runs banded: query blocks of the span against their own block and the one
     before under a `[W, 2W]` mask, so the logits are `[S, 2W]` per head. Banding
@@ -1711,8 +1753,8 @@ def local_attention(query, key, value, *, window: int | None = None, chunk: int 
         # flash kernel, whose default 128-row blocks must divide the length
         # (flash_attention.py:113-128, 1707-1715), so it would raise there.
         on_splash = resolved == 'tpu' and length % SPLASH_LANES == 0
-        if on_splash or (segment_ids is None and (
-                (resolved in ('cudnn', 'tpu') and sinks is None) or length <= 2 * span)):
+        flag = resolved == 'flash' or (resolved in ('cudnn', 'tpu') and sinks is None)
+        if on_splash or (segment_ids is None and (flag or length <= 2 * span)):
             return whole(implementation=implementation, causal=True, sliding_window=window,
                          segment_ids=segment_ids)
     shards = sequence_shards()
