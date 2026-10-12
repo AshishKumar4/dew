@@ -495,3 +495,18 @@ def test_tile_head_invalidates_validation_trace_for_the_same_batch_shape():
     objective.model = objective.model.clone(remat=None)
     Evaluation.run(objective, variables, reader, key=jax.random.key(0), loss=True)
     assert objective.traces == 3
+
+
+def test_a_refused_save_leaves_the_step_the_retention_policy_reads(tmp_path):
+    """Orbax refuses a second save of a step it holds; the retention policy
+    then still reads that step's record as it was saved, and keeps it."""
+    checkpoints = Checkpoints(str(tmp_path), keep=Keep(latest=1, where=lambda kept: kept.ranked_by is None))
+    state = {"v": jnp.zeros((4,))}
+    checkpoints.save(1, state)
+    checkpoints.wait()
+    assert [kept.ranked_by for kept in checkpoints.kept()] == [None]
+    with pytest.raises(ValueError):
+        checkpoints.save(1, state, metrics={"loss": 1.0}, ranking=Ranking("loss", 1.0))
+    checkpoints.save(2, state)
+    checkpoints.wait()
+    assert [kept.step for kept in checkpoints.kept()] == [1, 2]
