@@ -14,6 +14,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from flax import linen as nn
 from reference_error import assert_fp32_reduction_bound
 
 from dew.config import ObjectiveConfig, OptimConfig
@@ -1104,3 +1105,37 @@ def test_an_objective_that_trains_no_single_model_is_refused(tmp_path):
             name="quantized",
         )
     assert not (tmp_path / "quantized").exists()
+
+
+class _Contracted(nn.Module):
+    """One quantized Dense, then an einsum that asks for an fp32 result from bf16 operands."""
+
+    precision: str | None = None
+
+    @nn.compact
+    def __call__(self, x):
+        y = nn.Dense(16, dtype=jnp.bfloat16, param_dtype=jnp.bfloat16, precision=self.precision)(x)
+        table = self.param("table", nn.initializers.normal(), (16, 8), jnp.bfloat16)
+        return jnp.einsum("bd,dv->bv", y, table, preferred_element_type=jnp.float32)
+
+
+def test_a_quantized_matmul_keeps_the_result_dtype_its_call_asks_for():
+    """Qwix's quantized einsum drops `preferred_element_type`; the provider
+    widens the operands to it instead, exactly for bf16, so the product
+    comes out in fp32 as the unquantized one does."""
+    pytest.importorskip("qwix")
+    x = jnp.ones((2, 8), jnp.bfloat16)
+    model = Quantization().apply(_Contracted())
+    variables = model.init(jax.random.key(0), x)
+    assert model.apply(variables, x).dtype == jnp.float32
+
+
+def test_a_quantized_matmul_refuses_a_precision_it_cannot_honour():
+    """An accumulation precision past the default has no quantized form, so
+    the call is refused by name rather than run at the default."""
+    pytest.importorskip("qwix")
+    x = jnp.ones((2, 8), jnp.bfloat16)
+    model = Quantization().apply(_Contracted(precision="highest"))
+    with pytest.raises(ValueError, match="asks for precision highest"):
+        model.init(jax.random.key(0), x)
+
