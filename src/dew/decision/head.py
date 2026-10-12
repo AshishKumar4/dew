@@ -28,7 +28,7 @@ from dew.nn.activations import gelu_exact_torch
 from dew.nn.attention import NormalAttention, l2_normalized
 from dew.nn.backbones.decoder_block import BlockWiring, DecoderBlock, GatedMLP, decoder_norm
 from dew.nn.flops import attention_flops, projection_flops, real_lengths
-from dew.nn.inputs import AttentionMetadata
+from dew.nn.inputs import AttentionMetadata, coordinates
 from dew.nn.mixer_base import MixerContext
 from dew.nn.mixers import AttentionMixer
 from dew.nn.precision import at_least_fp32
@@ -149,7 +149,9 @@ class DecisionHead(Head):
         if inputs.kinds.shape[1] != 1:
             raise ValueError("Laya's head reads one question per row; lay the rows out with a QuestionLayout")
         x = states + self.type_embedding(inputs.kinds[:, 0])[:, None, :].astype(states.dtype)
-        metadata = AttentionMetadata(valid=inputs.valid)
+        valid = inputs.valid
+        metadata = AttentionMetadata(
+            coordinates=None if valid is None else coordinates(*valid.shape, valid=valid))
         for block in self.blocks:
             x = block(x, train=train, attention_metadata=metadata)
             if not isinstance(x, jax.Array):
