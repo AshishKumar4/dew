@@ -137,10 +137,10 @@ def test_a_gpu_runs_the_kernels_both_ways():
 @pytest.mark.parametrize("dtype, out, parts, taps, reason", [
     (jnp.float64, jnp.float64, DELTA, 4, "float64"),
     (jnp.float32, jnp.float64, DELTA, 4, "into float64"),
-    (jnp.bfloat16, jnp.bfloat16, ((48, 48), (48, None)), 4, "one block"),
-    (jnp.bfloat16, jnp.bfloat16, ((32, 16), (32, 32)), 4, "one block"),
+    (jnp.bfloat16, jnp.bfloat16, ((48, 48), (48, None)), 4, "its block"),
+    (jnp.bfloat16, jnp.bfloat16, ((32, 16), (40, 32)), 4, "its block"),
     # One key head of 16 and a value head of 8: no 16-channel block holds the values.
-    (jnp.bfloat16, jnp.bfloat16, ((16, 16), (16, 16), (8, None)), 4, "one block"),
+    (jnp.bfloat16, jnp.bfloat16, ((16, 16), (16, 16), (8, None)), 4, "its block"),
     (jnp.bfloat16, jnp.bfloat16, DELTA, 12, "12 taps"),
 ])
 def test_the_kernels_name_what_they_do_not_take(dtype, out, parts, taps, reason):

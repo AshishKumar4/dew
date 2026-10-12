@@ -7,7 +7,9 @@ backward reads and writes the `[B, T, C]` activation once for each of the norm's
 transposes, several of them in fp32. Here the forward reads the projection once and writes each output
 piece once (the queries, keys and values as the scans take them, so no copy splits them), and the
 backward reads the projection and the cotangents once and writes the projection's gradient once,
-everything between in fp32 registers. Neither saves anything but the projection.
+everything between in fp32 registers. Neither saves anything but the projection. Each piece is its
+own call, so a program knows statically whether it normalises and which cotangent it reads; the
+backward's calls write their columns of one gradient, each taking the last one's as its output.
 
 A kernel that reads a time block's inputs at the K shifts of the conv, as fla's causal_conv1d does
 (fla/modules/conv/triton/kernels.py, v0.5.2), would need the backward's pre-activation gradient at
@@ -50,20 +52,22 @@ WIDEST_TAPS = 8
 DTYPES = (jnp.dtype(jnp.float32), jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float16))
 
 
-def block_width(channels: int, parts) -> int | None:
-    """The channels a program holds: a normalised piece's head, which its row sum needs whole, else the
-    widest power of two up to 128 that divides every piece; None where no width serves."""
-    heads = {head for _, head in parts if head is not None}
-    if len(heads) > 1:
-        return None
-    if heads:
-        block = heads.pop()
-        fits = block & (block - 1) == 0 and block <= 256 and not any(width % block for width, _ in parts)
-        return block if fits else None
+def block_width(width: int, head: int | None) -> int:
+    """The channels a program of a `width`-channel piece holds: a normalised piece's `head`, which its
+    row sum needs whole, else the widest power of two up to 128 that divides the piece."""
+    if head is not None:
+        return head
     block = 128
-    while block > 1 and any(width % block for width, _ in parts):
+    while block > 1 and width % block:
         block //= 2
-    return block if block >= 16 else None
+    return block
+
+
+def _fits(width: int, head: int | None) -> bool:
+    """Whether a piece's block tiles it: a power of two of 16 to 256 channels dividing it, at most 128
+    where it is not normalised."""
+    block = block_width(width, head)
+    return block & (block - 1) == 0 and 16 <= block <= (128 if head is None else 256) and width % block == 0
 
 
 def refusal(x, taps, parts, dtype) -> str | None:
@@ -77,33 +81,16 @@ def refusal(x, taps, parts, dtype) -> str | None:
          "float16, summing in float32"),
         (2 <= taps.shape[-1] <= WIDEST_TAPS, f"{taps.shape[-1]} taps; the kernels unroll 2 to {WIDEST_TAPS}"),
         (sum(width for width, _ in parts) == channels, f"pieces {parts} of {channels} channels"),
-        (block_width(channels, parts) is not None,
-         f"pieces {parts}: every piece a multiple of one block, the normalised heads' power-of-two width "
-         "up to 256, else 16 to 128 channels"),
+        (all(_fits(width, head) for width, head in parts),
+         f"pieces {parts}: each a multiple of its block, a normalised piece's power-of-two head up to "
+         "256, another's 16 to 128 channels"),
     )
 
 
-def _layout(parts, block: int):
-    """Each piece's first block and whether its heads are normalised, from the static `parts`."""
-    starts, first = [], 0
-    for width, head in parts:
-        starts.append((first, head is not None))
-        first += width // block
-    return starts
-
-
-def _piece(index, layout):
-    """The piece holding channel block `index` and whether it is normalised, as traced scalars."""
-    piece = sum((index >= first).astype(jnp.int32) for first, _ in layout[1:]) if len(layout) > 1 else 0
-    normalised = functools.reduce(
-        jnp.logical_or, [piece == number for number, (_, norm) in enumerate(layout) if norm],
-        jnp.zeros((), bool))
-    return piece, normalised
-
-
-def _program(block: int, segments: int, steps: int):
-    """This program's channels `[block]` and the first token of each of its runs `[segments]`."""
-    columns = pl.program_id(0) * block + jnp.arange(block, dtype=jnp.int32)
+def _program(first: int, block: int, segments: int, steps: int):
+    """This program's channels of the projection `[block]`, from the piece's `first`, and the first
+    token of each of its runs `[segments]`."""
+    columns = first + pl.program_id(0) * block + jnp.arange(block, dtype=jnp.int32)
     starts = (pl.program_id(1) * segments + jnp.arange(segments, dtype=jnp.int32)) * steps
     return columns, starts
 
@@ -150,13 +137,13 @@ def _unpack(refs, has_bias: bool, has_valid: bool):
     return x_ref, w_ref, b_ref, valid_ref, refs
 
 
-def _forward_kernel(*refs, layout, block: int, segments: int, steps: int, count: int, length: int,
-                    has_bias: bool, has_valid: bool, activation: bool, eps: float):
+def _forward_kernel(*refs, first: int, normalised: bool, block: int, segments: int, steps: int, count: int,
+                    length: int, has_bias: bool, has_valid: bool, activation: bool, eps: float):
     from jax.experimental.pallas import triton as plgpu
 
-    x_ref, w_ref, b_ref, valid_ref, out_refs = _unpack(refs, has_bias, has_valid)
-    columns, starts = _program(block, segments, steps)
-    piece, normalised = _piece(pl.program_id(0), layout)
+    x_ref, w_ref, b_ref, valid_ref, (out_ref,) = _unpack(refs, has_bias, has_valid)
+    columns, starts = _program(first, block, segments, steps)
+    local = columns - first
     taps, bias = _taps(w_ref, b_ref, columns, count)
     history = tuple(_rows(x_ref, starts - count + 1 + tap, columns, length) for tap in range(count - 1))
 
@@ -172,46 +159,35 @@ def _forward_kernel(*refs, layout, block: int, segments: int, steps: int, count:
         y = _preactivation(window, taps, bias)
         if activation:
             y = y * jax.nn.sigmoid(y)
-        if any(norm for _, norm in layout):
-            scale = jax.lax.rsqrt(jnp.sum(y * y, axis=1, keepdims=True) + eps)
-            y = jnp.where(normalised, y * scale, y)
+        if normalised:
+            y = y * jax.lax.rsqrt(jnp.sum(y * y, axis=1, keepdims=True) + eps)
         y = jnp.where(kept[:, None], y, 0.0)
-        inside = (tokens < length)[:, None]
-        for number, ((first, _), out_ref) in enumerate(zip(layout, out_refs, strict=True)):
-            width = out_ref.shape[-1]
-            local = (columns - first * block) % width
-            plgpu.store(out_ref.at[tokens[:, None], local[None, :]], y.astype(out_ref.dtype),
-                        mask=inside & (piece == number))
+        plgpu.store(out_ref.at[tokens[:, None], local[None, :]], y.astype(out_ref.dtype),
+                    mask=(tokens < length)[:, None])
         return window[1:], ahead
 
     jax.lax.fori_loop(0, steps, step, (history, load(starts)))
 
 
-def _backward_kernel(*refs, layout, block: int, segments: int, steps: int, count: int, length: int,
-                     has_bias: bool, has_valid: bool, activation: bool, eps: float):
+def _backward_kernel(*refs, first: int, normalised: bool, block: int, segments: int, steps: int,
+                     count: int, length: int, has_bias: bool, has_valid: bool, aliased: bool,
+                     activation: bool, eps: float):
     from jax.experimental.pallas import triton as plgpu
 
     x_ref, w_ref, b_ref, valid_ref, rest = _unpack(refs, has_bias, has_valid)
-    pieces = len(layout)
-    dy_refs, (dx_ref, dw_ref, *db_ref) = rest[:pieces], rest[pieces:]
-    columns, starts = _program(block, segments, steps)
-    piece, normalised = _piece(pl.program_id(0), layout)
+    # The gradient the calls before wrote, aliased to this call's, is read by none.
+    dy_ref, dx_ref, dw_ref, *db_ref = rest[1:] if aliased else rest
+    columns, starts = _program(first, block, segments, steps)
+    local = columns - first
     taps, bias = _taps(w_ref, b_ref, columns, count)
     history = tuple(_rows(x_ref, starts - count + 1 + tap, columns, length) for tap in range(count - 1))
     zero = jnp.zeros((segments, block), jnp.float32)
 
-    def cotangent(tokens):
-        kept = _kept(valid_ref, tokens, length)[:, None]
-        total = zero
-        for number, ((first, _), dy_ref) in enumerate(zip(layout, dy_refs, strict=True)):
-            local = (columns - first * block) % dy_ref.shape[-1]
-            total = total + plgpu.load(
-                dy_ref.at[jnp.clip(tokens, 0, length - 1)[:, None], local[None, :]],
-                mask=kept & (piece == number), other=0).astype(jnp.float32)
-        return total
-
     def load(tokens):
-        return _rows(x_ref, tokens, columns, length), cotangent(tokens)
+        kept = _kept(valid_ref, tokens, length)[:, None]
+        grad = plgpu.load(dy_ref.at[jnp.clip(tokens, 0, length - 1)[:, None], local[None, :]], mask=kept,
+                          other=0).astype(jnp.float32)
+        return _rows(x_ref, tokens, columns, length), grad
 
     def step(index, carry):
         history, later, sums, lost, (current, grad) = carry
@@ -220,16 +196,13 @@ def _backward_kernel(*refs, layout, block: int, segments: int, steps: int, count
         ahead = load(tokens + 1)
         window = (*history, current)
         pre = _preactivation(window, taps, bias)
-        if activation:
-            gate = jax.nn.sigmoid(pre)
-            out = pre * gate
-        else:
-            out = pre
-        if any(norm for _, norm in layout):
+        gate = jax.nn.sigmoid(pre) if activation else None
+        out = pre if gate is None else pre * gate
+        if normalised:
             scale = jax.lax.rsqrt(jnp.sum(out * out, axis=1, keepdims=True) + eps)
             along = jnp.sum(out * grad, axis=1, keepdims=True)
-            grad = jnp.where(normalised, scale * grad - (scale * scale * scale * along) * out, grad)
-        if activation:
+            grad = scale * grad - (scale * scale * scale * along) * out
+        if gate is not None:
             # silu's derivative as XLA's autodiff rounds it, the closer of the forms to float64.
             grad = grad * gate + (grad * pre) * (gate * (1.0 - gate))
         # The token's own run sums its taps' and bias's gradients, compensated (Kahan) so a run's tokens
@@ -254,9 +227,9 @@ def _backward_kernel(*refs, layout, block: int, segments: int, steps: int, count
     _, _, totals, lost, _ = jax.lax.fori_loop(0, steps + count - 1, step, carry)
     totals = tuple(total - error for total, error in zip(totals, lost, strict=True))
     for tap, total in enumerate(totals[:count]):
-        dw_ref[tap, columns] = jnp.sum(total, axis=0)
+        dw_ref[tap, local] = jnp.sum(total, axis=0)
     if db_ref:
-        db_ref[0][columns] = jnp.sum(totals[count], axis=0)
+        db_ref[0][local] = jnp.sum(totals[count], axis=0)
 
 
 def _config(length: int, segments: int | None, steps: int | None) -> tuple[int, int]:
@@ -265,11 +238,11 @@ def _config(length: int, segments: int | None, steps: int | None) -> tuple[int, 
     return segments, steps
 
 
-def _specs(x, w, bias, valid, block: int, segments: int, steps: int):
-    """The grid over channel blocks, time tiles and rows, and the inputs' specs: each program sees its
-    row of `x` and `valid` whole and indexes its tokens."""
+def _specs(x, w, bias, valid, width: int, block: int, segments: int, steps: int):
+    """The grid over a piece's channel blocks, time tiles and rows, and the inputs' specs: each program
+    sees its row of `x` and `valid` whole and indexes its tokens."""
     batch, length, channels = x.shape
-    grid = (channels // block, pl.cdiv(length, segments * steps), batch)
+    grid = (width // block, pl.cdiv(length, segments * steps), batch)
     specs = [pl.BlockSpec((None, length, channels), lambda c, t, b: (b, 0, 0)),
              pl.BlockSpec(w.shape, lambda c, t, b: (0, 0))]
     operands = [x, w]
@@ -282,63 +255,81 @@ def _specs(x, w, bias, valid, block: int, segments: int, steps: int):
     return grid, specs, operands
 
 
+def _pieces(parts):
+    """Each piece's first channel, width and head."""
+    first = 0
+    for width, head in parts:
+        yield first, width, head
+        first += width
+
+
+def _params(warps: int | None, stages: int | None):
+    from jax.experimental.pallas import triton as plgpu
+
+    return plgpu.CompilerParams(num_warps=WARPS if warps is None else warps,
+                                num_stages=1 if stages is None else stages)
+
+
 def _forward(x, taps, bias, valid, parts, activation: bool, eps: float, dtype, interpret: bool,
              segments: int | None = None, steps: int | None = None, warps: int | None = None,
              stages: int | None = None):
-    from jax.experimental.pallas import triton as plgpu
-
-    batch, length, channels = x.shape
-    block = block_width(channels, parts)
+    batch, length, _ = x.shape
     segments, steps = _config(length, segments, steps)
-    grid, specs, operands = _specs(x, taps.T, bias, valid, block, segments, steps)
-    kernel = functools.partial(
-        _forward_kernel, layout=_layout(parts, block), block=block, segments=segments, steps=steps,
-        count=taps.shape[1], length=length, has_bias=bias is not None, has_valid=valid is not None,
-        activation=activation, eps=eps)
-    return tuple(pl.pallas_call(
-        kernel, grid=grid, in_specs=specs,
-        out_specs=[pl.BlockSpec((None, length, width), lambda c, t, b: (b, 0, 0)) for width, _ in parts],
-        out_shape=[jax.ShapeDtypeStruct((batch, length, width), dtype) for width, _ in parts],
-        compiler_params=plgpu.CompilerParams(num_warps=WARPS if warps is None else warps,
-                                             num_stages=1 if stages is None else stages),
-        interpret=interpret, name="short_conv_forward",
-    )(*operands))
+    out = []
+    for first, width, head in _pieces(parts):
+        block = block_width(width, head)
+        grid, specs, operands = _specs(x, taps.T, bias, valid, width, block, segments, steps)
+        kernel = functools.partial(
+            _forward_kernel, first=first, normalised=head is not None, block=block, segments=segments,
+            steps=steps, count=taps.shape[1], length=length, has_bias=bias is not None,
+            has_valid=valid is not None, activation=activation, eps=eps)
+        out.append(pl.pallas_call(
+            kernel, grid=grid, in_specs=specs,
+            out_specs=pl.BlockSpec((None, length, width), lambda c, t, b: (b, 0, 0)),
+            out_shape=jax.ShapeDtypeStruct((batch, length, width), dtype),
+            compiler_params=_params(warps, stages), interpret=interpret, name="short_conv_forward",
+        )(*operands))
+    return tuple(out)
 
 
 def _backward(x, taps, bias, valid, cotangents, parts, activation: bool, eps: float, interpret: bool,
               segments: int | None = None, steps: int | None = None, warps: int | None = None,
               stages: int | None = None):
-    from jax.experimental.pallas import triton as plgpu
-
     batch, length, channels = x.shape
     count = taps.shape[1]
-    block = block_width(channels, parts)
     segments, steps = _config(length, segments, steps)
-    grid, specs, operands = _specs(x, taps.T, bias, valid, block, segments, steps)
-    tiles = grid[1]
-    kernel = functools.partial(
-        _backward_kernel, layout=_layout(parts, block), block=block, segments=segments, steps=steps,
-        count=count, length=length, has_bias=bias is not None, has_valid=valid is not None,
-        activation=activation, eps=eps)
-    out_specs = [pl.BlockSpec((None, length, channels), lambda c, t, b: (b, 0, 0)),
-                 pl.BlockSpec((None, None, count, channels), lambda c, t, b: (b, t, 0, 0))]
-    out_shape = [jax.ShapeDtypeStruct(x.shape, x.dtype),
-                 jax.ShapeDtypeStruct((batch, tiles, count, channels), jnp.float32)]
-    if bias is not None:
-        out_specs.append(pl.BlockSpec((None, None, channels), lambda c, t, b: (b, t, 0)))
-        out_shape.append(jax.ShapeDtypeStruct((batch, tiles, channels), jnp.float32))
-    found = pl.pallas_call(
-        kernel, grid=grid,
-        in_specs=specs + [pl.BlockSpec((None, length, width), lambda c, t, b: (b, 0, 0))
-                          for width, _ in parts],
-        out_specs=out_specs, out_shape=out_shape,
-        compiler_params=plgpu.CompilerParams(num_warps=WARPS if warps is None else warps,
-                                             num_stages=1 if stages is None else stages),
-        interpret=interpret, name="short_conv_backward",
-    )(*operands, *cotangents)
-    dx, dw = found[0], jnp.sum(found[1], axis=(0, 1)).T
-    db = None if bias is None else jnp.sum(found[2], axis=(0, 1)).astype(bias.dtype)
-    return dx, dw.astype(taps.dtype), db
+    dx, dw, db = None, [], []
+    for (first, width, head), dy in zip(_pieces(parts), cotangents, strict=True):
+        block = block_width(width, head)
+        grid, specs, operands = _specs(x, taps.T, bias, valid, width, block, segments, steps)
+        tiles = grid[1]
+        kernel = functools.partial(
+            _backward_kernel, first=first, normalised=head is not None, block=block, segments=segments,
+            steps=steps, count=count, length=length, has_bias=bias is not None, has_valid=valid is not None,
+            aliased=dx is not None, activation=activation, eps=eps)
+        whole = pl.BlockSpec((None, length, channels), lambda c, t, b: (b, 0, 0))
+        out_specs = [whole, pl.BlockSpec((None, None, count, width), lambda c, t, b: (b, t, 0, 0))]
+        out_shape = [jax.ShapeDtypeStruct(x.shape, x.dtype),
+                     jax.ShapeDtypeStruct((batch, tiles, count, width), jnp.float32)]
+        if bias is not None:
+            out_specs.append(pl.BlockSpec((None, None, width), lambda c, t, b: (b, t, 0)))
+            out_shape.append(jax.ShapeDtypeStruct((batch, tiles, width), jnp.float32))
+        # Each piece writes its columns of one gradient: the calls after the first take the one before's.
+        before = [] if dx is None else [dx]
+        found = pl.pallas_call(
+            kernel, grid=grid,
+            in_specs=[*specs, *([whole] if before else []),
+                      pl.BlockSpec((None, length, width), lambda c, t, b: (b, 0, 0))],
+            out_specs=out_specs, out_shape=out_shape,
+            input_output_aliases={len(operands): 0} if before else {},
+            compiler_params=_params(warps, stages), interpret=interpret, name="short_conv_backward",
+        )(*operands, *before, dy)
+        dx = found[0]
+        dw.append(jnp.sum(found[1], axis=(0, 1)))
+        if bias is not None:
+            db.append(jnp.sum(found[2], axis=(0, 1)))
+    dw = jnp.concatenate(dw, axis=1).T.astype(taps.dtype)
+    return dx, dw, None if bias is None else jnp.concatenate(db).astype(bias.dtype)
 
 
 def _conv(x, taps, bias, valid, parts, activation, eps, dtype, interpret):
