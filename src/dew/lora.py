@@ -428,7 +428,7 @@ class _Branch:
 
 def _refusing_counts(model: nn.Module, base: type[nn.Module], *protocols) -> type[nn.Module]:
     """Inherited geometry describes the native forward, not the added factors."""
-    def missing(self, *args: object, **kwargs: object) -> float:
+    def missing(self, *args, **kwargs) -> float:
         raise MissingFlopsCount(f"{type(model).__name__} needs declared adapter matrix usage "
                                 "and parameter work for this geometry")
 
