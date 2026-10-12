@@ -10,6 +10,7 @@ and its bundled ffmpeg writes the fixtures, so nothing here depends on a
 binary on PATH.
 """
 
+import dataclasses
 import subprocess
 
 import numpy as np
@@ -158,6 +159,8 @@ def test_media_too_short_or_unreadable_is_dropped_and_frames_past_their_window_r
     rows = [{"mp4": media["clip"], "id": 0}, {"mp4": b"not a clip" * 64, "id": 1}]
 
     assert _records(Memory(rows).filter_map(video.pick_clip(3.0))) == []
+    with pytest.raises(ValueError, match=r"holds no 3\.0-second clip"):
+        dataclasses.replace(video.pick_clip(3.0), rejects=False).random_map(rows[0], np.random.default_rng(0))
     picked = _records(Memory(rows).filter_map(video.pick_clip(1.0)))
     assert [int(record["id"]) for record in picked] == [0]
     with pytest.raises(ValueError, match="run past"):
