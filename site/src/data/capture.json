@@ -2,24 +2,24 @@
 	"about": "Terminal frames from public/hero/train.cast, prepared by scripts/terminal-replay.py.",
 	"meta": {
 		"where": "one A100",
-		"python": "3.12.3",
+		"python": "3.12.15",
 		"jax": "0.11.2.post3",
 		"flax": "0.12.10",
 		"optax": "0.2.8",
-		"dew": "9235af7f3e8e80169dac359b2c60a295a8c92845",
-		"date": "2026-10-09",
-		"wall_seconds": 109.6,
-		"script_sha256": "12530d343929a61cd3f4cd5f20ca88ec084e35bd8dfaadfa5f4229f109257e31",
-		"cell_sha256": "70f3e3b07b9fb8997d5e7ac544927e934fc1d910cb407cd676bbd4ed9dbb0ff6",
+		"dew": "7ae1f47abb752d0f34adf02d4e41d8015868beb1",
+		"date": "2026-10-12",
+		"wall_seconds": 83.9,
+		"script_sha256": "456719306db58a3fc62f7f3482d425855093506322ac8a84b921e8bf62434725",
 		"steps": 1000,
 		"device": "NVIDIA A100-SXM4-40GB",
 		"description": "Tiny Shakespeare from winglian/tiny-shakespeare, the first 1% of its tokens held out, freshly initialized weights, real recorded training",
-		"validation_perplexity_display": 3.89
+		"validation_perplexity_display": 3.903,
+		"cell_sha256": "516c10dbfe968831ef72408b414e3767952124897d22633dc009814c7e821572"
 	},
 	"hero": {
 		"returncode": 0,
-		"seconds": 109.6,
-		"columns": 110,
+		"seconds": 83.9,
+		"columns": 96,
 		"screen": [
 			[
 				{
@@ -42,7 +42,7 @@
 					"bold": true
 				},
 				{
-					"text": "  \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u256e",
+					"text": "  \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u256e",
 					"fg": "00afd7"
 				}
 			],
@@ -73,7 +73,7 @@
 					"dim": true
 				},
 				{
-					"text": "float32                                 "
+					"text": "float32                   "
 				},
 				{
 					"text": "\u2502",
@@ -86,7 +86,7 @@
 					"fg": "00afd7"
 				},
 				{
-					"text": "                                                                                                            "
+					"text": "                                                                                              "
 				},
 				{
 					"text": "\u2502",
@@ -102,23 +102,23 @@
 					"text": " "
 				},
 				{
-					"text": "\u2501\u2501\u2501\u2501\u2501",
+					"text": "\u2501\u2501\u2501\u2501",
 					"fg": "00afd7"
 				},
 				{
-					"text": "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501",
+					"text": "\u2501\u2501\u2501\u2501\u2501\u2501",
 					"fg": "5fafd7"
 				},
 				{
-					"text": "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501",
+					"text": "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501",
 					"fg": "5f87d7"
 				},
 				{
-					"text": "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501",
+					"text": "\u2501\u2501\u2501\u2501\u2501\u2501",
 					"fg": "8787d7"
 				},
 				{
-					"text": "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501",
+					"text": "\u2501\u2501\u2501\u2501\u2501\u2501\u2501",
 					"fg": "875fd7"
 				},
 				{
@@ -133,14 +133,14 @@
 					"dim": true
 				},
 				{
-					"text": "  100%  30.8"
+					"text": "  100%  30.4"
 				},
 				{
 					"text": " step/s",
 					"dim": true
 				},
 				{
-					"text": "  0:01:07 "
+					"text": "  0:00:58 "
 				},
 				{
 					"text": "\u2502",
@@ -153,7 +153,7 @@
 					"fg": "00afd7"
 				},
 				{
-					"text": "                                                                                                            "
+					"text": "                                                                                              "
 				},
 				{
 					"text": "\u2502",
@@ -169,7 +169,7 @@
 					"text": " "
 				},
 				{
-					"text": "train                                                                                                     ",
+					"text": "train                                                                                       ",
 					"fg": "875fd7",
 					"bold": true
 				},
@@ -190,14 +190,14 @@
 					"text": " "
 				},
 				{
-					"text": "  loss           ",
+					"text": "  loss                  ",
 					"dim": true
 				},
 				{
 					"text": "  "
 				},
 				{
-					"text": "     1.120",
+					"text": "     1.119",
 					"bold": true
 				},
 				{
@@ -231,7 +231,7 @@
 					"fg": "5faf5f"
 				},
 				{
-					"text": "                                                       "
+					"text": "                                  "
 				},
 				{
 					"text": "\u2502",
@@ -247,14 +247,14 @@
 					"text": " "
 				},
 				{
-					"text": "  ce             ",
+					"text": "  ce                    ",
 					"dim": true
 				},
 				{
 					"text": "  "
 				},
 				{
-					"text": "     1.120",
+					"text": "     1.119",
 					"bold": true
 				},
 				{
@@ -288,7 +288,7 @@
 					"fg": "5faf5f"
 				},
 				{
-					"text": "                                                       "
+					"text": "                                  "
 				},
 				{
 					"text": "\u2502",
@@ -304,14 +304,14 @@
 					"text": " "
 				},
 				{
-					"text": "  perplexity     ",
+					"text": "  perplexity            ",
 					"dim": true
 				},
 				{
 					"text": "  "
 				},
 				{
-					"text": "     3.064",
+					"text": "     3.061",
 					"bold": true
 				},
 				{
@@ -341,11 +341,11 @@
 					"text": "  "
 				},
 				{
-					"text": "    \u2193 56%",
+					"text": "    \u2193 57%",
 					"fg": "5faf5f"
 				},
 				{
-					"text": "                                                       "
+					"text": "                                  "
 				},
 				{
 					"text": "\u2502",
@@ -361,7 +361,7 @@
 					"text": " "
 				},
 				{
-					"text": "  token_accuracy ",
+					"text": "  token_accuracy        ",
 					"dim": true
 				},
 				{
@@ -398,11 +398,11 @@
 					"text": "  "
 				},
 				{
-					"text": "\u2191 22.6 pt",
+					"text": "\u2191 22.8 pt",
 					"fg": "5faf5f"
 				},
 				{
-					"text": "                                                       "
+					"text": "                                  "
 				},
 				{
 					"text": "\u2502",
@@ -418,7 +418,316 @@
 					"text": " "
 				},
 				{
-					"text": "throughput                                                                                                ",
+					"text": "  data_wait_ms          ",
+					"dim": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "    0.7835",
+					"bold": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "\u2581",
+					"fg": "00afd7"
+				},
+				{
+					"text": "\u2584",
+					"fg": "5fafd7"
+				},
+				{
+					"text": "\u2585\u2584\u2588\u2583\u2585",
+					"fg": "5f87d7"
+				},
+				{
+					"text": "\u2586",
+					"fg": "8787d7"
+				},
+				{
+					"text": "\u2585\u2582",
+					"fg": "875fd7"
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "    \u2191 26%",
+					"dim": true
+				},
+				{
+					"text": "                                  "
+				},
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "  grad_norm             ",
+					"dim": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "    0.2767",
+					"bold": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "\u2588",
+					"fg": "00afd7"
+				},
+				{
+					"text": "\u2583",
+					"fg": "5fafd7"
+				},
+				{
+					"text": "\u2582\u2581\u2581\u2581\u2581",
+					"fg": "5f87d7"
+				},
+				{
+					"text": "\u2581",
+					"fg": "8787d7"
+				},
+				{
+					"text": "\u2581\u2581",
+					"fg": "875fd7"
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "    \u2193 75%",
+					"dim": true
+				},
+				{
+					"text": "                                  "
+				},
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "  cache_hits            ",
+					"dim": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "     3.000",
+					"bold": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "\u2581",
+					"fg": "00afd7"
+				},
+				{
+					"text": "\u2581",
+					"fg": "5fafd7"
+				},
+				{
+					"text": "\u2581\u2581\u2581\u2588\u2588",
+					"fg": "5f87d7"
+				},
+				{
+					"text": "\u2588",
+					"fg": "8787d7"
+				},
+				{
+					"text": "\u2588\u2588",
+					"fg": "875fd7"
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "   \u2191 200%",
+					"dim": true
+				},
+				{
+					"text": "                                  "
+				},
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "  cache_misses          ",
+					"dim": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "     4.000",
+					"bold": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "\u2581",
+					"fg": "00afd7"
+				},
+				{
+					"text": "\u2581",
+					"fg": "5fafd7"
+				},
+				{
+					"text": "\u2581\u2581\u2581\u2588\u2588",
+					"fg": "5f87d7"
+				},
+				{
+					"text": "\u2588",
+					"fg": "8787d7"
+				},
+				{
+					"text": "\u2588\u2588",
+					"fg": "875fd7"
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "    \u2191 33%",
+					"dim": true
+				},
+				{
+					"text": "                                  "
+				},
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "  peak_memory_gib       ",
+					"dim": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "     3.999",
+					"bold": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "\u2581",
+					"fg": "00afd7"
+				},
+				{
+					"text": "\u2581",
+					"fg": "5fafd7"
+				},
+				{
+					"text": "\u2582\u2582\u2587\u2587\u2587",
+					"fg": "5f87d7"
+				},
+				{
+					"text": "\u2587",
+					"fg": "8787d7"
+				},
+				{
+					"text": "\u2588\u2588",
+					"fg": "875fd7"
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "        \u2192",
+					"dim": true
+				},
+				{
+					"text": "                                  "
+				},
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				},
+				{
+					"text": "   "
+				},
+				{
+					"text": "compiles ",
+					"dim": true
+				},
+				{
+					"text": "1.000",
+					"bold": true
+				},
+				{
+					"text": "                                                                             "
+				},
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "throughput                                                                                  ",
 					"fg": "875fd7",
 					"bold": true
 				},
@@ -439,14 +748,14 @@
 					"text": " "
 				},
 				{
-					"text": "  step_time_ms   ",
+					"text": "  step_time_ms          ",
 					"dim": true
 				},
 				{
 					"text": "  "
 				},
 				{
-					"text": "     33.96",
+					"text": "     32.99",
 					"bold": true
 				},
 				{
@@ -476,11 +785,11 @@
 					"text": "  "
 				},
 				{
-					"text": "   \u2193 4.0%",
+					"text": "   \u2193 1.6%",
 					"fg": "5faf5f"
 				},
 				{
-					"text": "                                                       "
+					"text": "                                  "
 				},
 				{
 					"text": "\u2502",
@@ -496,14 +805,14 @@
 					"text": " "
 				},
 				{
-					"text": "  samples_per_sec",
+					"text": "  samples_per_sec       ",
 					"dim": true
 				},
 				{
 					"text": "  "
 				},
 				{
-					"text": "     1,885",
+					"text": "     1,940",
 					"bold": true
 				},
 				{
@@ -533,11 +842,11 @@
 					"text": "  "
 				},
 				{
-					"text": "   \u2191 4.1%",
+					"text": "   \u2191 1.6%",
 					"fg": "5faf5f"
 				},
 				{
-					"text": "                                                       "
+					"text": "                                  "
 				},
 				{
 					"text": "\u2502",
@@ -553,14 +862,14 @@
 					"text": " "
 				},
 				{
-					"text": "  mfu            ",
+					"text": "  tokens_per_s          ",
 					"dim": true
 				},
 				{
 					"text": "  "
 				},
 				{
-					"text": "     11.0%",
+					"text": "   496,682",
 					"bold": true
 				},
 				{
@@ -590,11 +899,11 @@
 					"text": "  "
 				},
 				{
-					"text": " \u2191 0.4 pt",
+					"text": "   \u2191 1.6%",
 					"fg": "5faf5f"
 				},
 				{
-					"text": "                                                       "
+					"text": "                                  "
 				},
 				{
 					"text": "\u2502",
@@ -610,12 +919,264 @@
 					"text": " "
 				},
 				{
-					"text": "optimizer                                                                                                 ",
+					"text": "  mfu                   ",
+					"dim": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "     10.8%",
+					"bold": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "\u2588",
+					"fg": "00afd7"
+				},
+				{
+					"text": "\u2588",
+					"fg": "5fafd7"
+				},
+				{
+					"text": "\u2588\u2588\u2588\u2581\u2588",
+					"fg": "5f87d7"
+				},
+				{
+					"text": "\u2588",
+					"fg": "8787d7"
+				},
+				{
+					"text": "\u2588\u2588",
+					"fg": "875fd7"
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": " \u2191 0.2 pt",
+					"fg": "5faf5f"
+				},
+				{
+					"text": "                                  "
+				},
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "  hlo_flops_util        ",
+					"dim": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "     11.4%",
+					"bold": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "\u2588",
+					"fg": "00afd7"
+				},
+				{
+					"text": "\u2588",
+					"fg": "5fafd7"
+				},
+				{
+					"text": "\u2588\u2588\u2588\u2581\u2588",
+					"fg": "5f87d7"
+				},
+				{
+					"text": "\u2588",
+					"fg": "8787d7"
+				},
+				{
+					"text": "\u2588\u2588",
+					"fg": "875fd7"
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": " \u2191 0.2 pt",
+					"fg": "5faf5f"
+				},
+				{
+					"text": "                                  "
+				},
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "  hfu                   ",
+					"dim": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "     11.4%",
+					"bold": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "\u2588",
+					"fg": "00afd7"
+				},
+				{
+					"text": "\u2588",
+					"fg": "5fafd7"
+				},
+				{
+					"text": "\u2588\u2588\u2588\u2581\u2588",
+					"fg": "5f87d7"
+				},
+				{
+					"text": "\u2588",
+					"fg": "8787d7"
+				},
+				{
+					"text": "\u2588\u2588",
+					"fg": "875fd7"
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": " \u2191 0.2 pt",
+					"fg": "5faf5f"
+				},
+				{
+					"text": "                                  "
+				},
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				},
+				{
+					"text": "   "
+				},
+				{
+					"text": "tokens ",
+					"dim": true
+				},
+				{
+					"text": "16,384",
+					"bold": true
+				},
+				{
+					"text": "                                                                              "
+				},
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "optimizer                                                                                   ",
 					"fg": "875fd7",
 					"bold": true
 				},
 				{
 					"text": " "
+				},
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "  learning_rate         ",
+					"dim": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": " 1.000e-04",
+					"bold": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "\u2588",
+					"fg": "00afd7"
+				},
+				{
+					"text": "\u2588",
+					"fg": "5fafd7"
+				},
+				{
+					"text": "\u2587\u2587\u2586\u2585\u2584",
+					"fg": "5f87d7"
+				},
+				{
+					"text": "\u2583",
+					"fg": "8787d7"
+				},
+				{
+					"text": "\u2582\u2581",
+					"fg": "875fd7"
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "    \u2193 90%",
+					"dim": true
+				},
+				{
+					"text": "                                  "
 				},
 				{
 					"text": "\u2502",
@@ -639,20 +1200,7 @@
 					"bold": true
 				},
 				{
-					"text": "                                                                                          "
-				},
-				{
-					"text": "\u2502",
-					"fg": "00afd7"
-				}
-			],
-			[
-				{
-					"text": "\u2502",
-					"fg": "00afd7"
-				},
-				{
-					"text": "                                                                                                            "
+					"text": "                                                                            "
 				},
 				{
 					"text": "\u2502",
@@ -668,7 +1216,189 @@
 					"text": " "
 				},
 				{
-					"text": "val \u00b7 step 1000                                                                                           ",
+					"text": "data                                                                                        ",
+					"fg": "875fd7",
+					"bold": true
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				},
+				{
+					"text": "   "
+				},
+				{
+					"text": "attempted/hf:winglian/tiny-shakespeare@619106eee01474d8eaa5dd400b4b405eb3734ebe:None:train",
+					"dim": true
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "472.0",
+					"bold": true
+				},
+				{
+					"text": "                                                                                        "
+				},
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "accepted/hf:winglian/tiny-shakespeare@619106eee01474d8eaa5dd400b4b405eb3734ebe:None:train ",
+					"dim": true
+				},
+				{
+					"text": "   "
+				},
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "4,728",
+					"bold": true
+				},
+				{
+					"text": "                                                                                        "
+				},
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "truncated/hf:winglian/tiny-shakespeare@619106eee01474d8eaa5dd400b4b405eb3734ebe:None:train ",
+					"dim": true
+				},
+				{
+					"text": "0",
+					"bold": true
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "chunks_per_record/hf:winglian/tiny-shakespeare@619106eee01474d8eaa5dd400b4b405eb3734ebe:None",
+					"dim": true
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": ":train ",
+					"dim": true
+				},
+				{
+					"text": "0",
+					"bold": true
+				},
+				{
+					"text": "                                                                                     "
+				},
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				},
+				{
+					"text": "                                                                                              "
+				},
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "val \u00b7 step 1000                                                                             ",
 					"fg": "875fd7",
 					"bold": true
 				},
@@ -696,7 +1426,7 @@
 					"text": "  "
 				},
 				{
-					"text": "     3.890",
+					"text": "     3.903",
 					"bold": true
 				},
 				{
@@ -714,11 +1444,11 @@
 					"text": "  "
 				},
 				{
-					"text": "   \u2193 2.9%",
+					"text": "   \u2193 2.8%",
 					"fg": "5faf5f"
 				},
 				{
-					"text": "                                                                    "
+					"text": "                                                      "
 				},
 				{
 					"text": "\u2502",
@@ -727,7 +1457,7 @@
 			],
 			[
 				{
-					"text": "\u2570\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500  ",
+					"text": "\u2570\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500  ",
 					"fg": "00afd7"
 				},
 				{
@@ -776,7 +1506,7 @@
 					"dim": true
 				},
 				{
-					"text": "1000 steps in 0:01:11           "
+					"text": "1000 steps in 0:01:03           "
 				},
 				{
 					"text": "\u2502",
@@ -796,7 +1526,7 @@
 					"dim": true
 				},
 				{
-					"text": "after 23.01 s                   "
+					"text": "after 22.10 s                   "
 				},
 				{
 					"text": "\u2502",
@@ -816,7 +1546,7 @@
 					"dim": true
 				},
 				{
-					"text": "29.3 step/s                     "
+					"text": "30.3 step/s                     "
 				},
 				{
 					"text": "\u2502",
@@ -836,7 +1566,7 @@
 					"dim": true
 				},
 				{
-					"text": "48.1% of the wall time in steps "
+					"text": "52.8% of the wall time in steps "
 				},
 				{
 					"text": "\u2502",
@@ -856,7 +1586,7 @@
 					"dim": true
 				},
 				{
-					"text": "1.120                          ",
+					"text": "1.119                          ",
 					"bold": true
 				},
 				{
@@ -880,14 +1610,14 @@
 					"dim": true
 				},
 				{
-					"text": "3.890",
+					"text": "3.903",
 					"bold": true
 				},
 				{
 					"text": " "
 				},
 				{
-					"text": "\u2193 2.9%",
+					"text": "\u2193 2.8%",
 					"fg": "5faf5f"
 				},
 				{
@@ -922,9 +1652,10 @@
 			],
 			[
 				{
-					"text": "The means that he is not have to hear me to them."
+					"text": "The means the chamber of the treacherous spoils."
 				}
 			],
+			[],
 			[],
 			[],
 			[
@@ -934,16 +1665,16 @@
 			],
 			[
 				{
-					"text": "What say you should be so, that I have seen them at"
+					"text": "What say you say the father of the same part"
 				}
 			],
 			[
 				{
-					"text": "hand."
+					"text": "To have the strength of your country."
 				}
 			]
 		],
-		"rows": 35,
+		"rows": 55,
 		"source_rows": 200,
 		"viewer_rows": 200,
 		"replay": "/hero/train.json"
