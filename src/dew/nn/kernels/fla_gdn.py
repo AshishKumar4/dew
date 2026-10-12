@@ -123,11 +123,13 @@ def _config_key(dtype, target: str | None = None) -> tuple[str, str]:
 
 
 def kernel_config(kernel: str, shape: Mapping[str, int], dtype, *, target: str | None = None,
+                  table: Mapping[tuple[str, str], Mapping[str, Mapping[str, int]]] | None = None,
                   **overrides: int | None) -> dict[str, int]:
-    """`kernel`'s config for `dtype` on `target` (`_config_key`), capped for keys wider than 128
+    """`kernel`'s config for `dtype` on `target` (`_config_key`) from `table`, keyed as `CONFIGS` (where
+    None, `CONFIGS`; fla_kda's for Kimi's delta attention), capped for keys wider than 128
     (`_WIDE_KEYS`); overrides (the lab's) replace its fields. Blocks are clipped to the
     keys' `width` and values' `columns`."""
-    config = dict(CONFIGS[_config_key(dtype, target)][kernel])
+    config = dict((CONFIGS if table is None else table)[_config_key(dtype, target)][kernel])
     if shape["width"] > WIDEST:
         config.update({key: min(config[key], cap) for key, cap in _WIDE_KEYS.get(kernel, {}).items()})
     config.update({key: value for key, value in overrides.items() if value is not None})
