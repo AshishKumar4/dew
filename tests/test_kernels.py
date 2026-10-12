@@ -51,6 +51,19 @@ def on_gpu(test):
     return pytest.mark.gpu(reason=reason)(pytest.mark.skipif(not bf16_dot_runs(), reason=reason)(test))
 
 
+def flash_here():
+    """dew_flash_attn where the installed wheel holds code for this GPU (the fact `flash_refusal` reads);
+    a GPU it was not built for skips by name, where 'auto' runs another kernel."""
+    flash = pytest.importorskip("dew_flash_attn")
+    from dew.nn.attention import flash_architectures, flash_built_for
+    generation = kernels.device_generation()
+    architectures = flash_architectures() or ()
+    if not flash_built_for(generation, architectures):
+        pytest.skip(f"the installed dew_flash_attn holds code for {', '.join(architectures)}, "
+                    f"not {generation}")
+    return flash
+
+
 def qkv(shape, seed=0):
     keys = jax.random.split(jax.random.PRNGKey(seed), 3)
     return tuple(jax.random.normal(key, shape, jnp.bfloat16) for key in keys)
@@ -76,7 +89,7 @@ def test_a_fused_kernel_takes_forward_mode_through_the_reference(implementation,
     refuses the JVP of the kernel's custom_vjp, which this also holds."""
     from dew.nn.attention import forward_mode_attention
     if implementation == "flash":
-        pytest.importorskip("dew_flash_attn")
+        flash_here()
     query, key, value = qkv((2, 256, 8, 64))
     tangents = qkv((2, 256, 8, 64), seed=1)
 
@@ -314,7 +327,7 @@ def test_flash_trains_and_agrees_with_xla(q_len, kv_len, heads, kv_heads, head_d
     of the output scale of the xla kernel, forward and backward, as cudnn and
     triton are. Its backward takes heads over 192 wide only on sm80 and sm90
     ("requires A100/A800 or H100/H800", measured on an L4)."""
-    pytest.importorskip("dew_flash_attn")
+    flash_here()
     if head_dim > 192 and kernels.device_generation() in ('sm86', 'sm87', 'sm89'):
         pytest.skip("FlashAttention-2's backward takes heads over 192 wide only on sm80 and sm90")
     query, _, _ = qkv((2, q_len, heads, head_dim))
@@ -348,7 +361,7 @@ def test_packed_sequences_attend_within_themselves_as_far_from_float64_as_one_at
     FlashAttention-2's own on that document alone, both measured from float64. Not bitwise: on one
     short document the dense forward splits its keys across blocks (`_splits`) and the packed one
     does not, so the two round differently (on an RTX 4080, 1.0003 to 1.012 times apart in RMS)."""
-    flash = pytest.importorskip("dew_flash_attn")
+    flash = flash_here()
     if head_dim > 192 and kernels.device_generation() in ('sm86', 'sm87', 'sm89'):
         pytest.skip("FlashAttention-2's backward takes heads over 192 wide only on sm80, sm90 and sm1xx")
     lengths = [700, 1, 0, 333, 64]

@@ -15,9 +15,9 @@ reads its chunk of its head where it sits, as fla's pointer arithmetic does.
 
 CONFIGS keys the GPU generation and activation dtype: fla's own A100 choices on the generations
 whose blocks hold an A100's shared memory, and on the 99 KB ones fla's narrower picks for those
-devices. Each config compiles within its GPU's block at the training shapes
-(tests/test_kernel_configs.py), and the port takes keys and values no wider than those (WIDEST).
-Every public kernel accepts explicit block/warp/stage overrides for the lab.
+devices. Each config compiles within its GPU's block at the training shapes and at the widest keys
+(tests/test_kernel_configs.py); `dew.nn.linear.fla_rule` shapes any other call to them. Every public
+kernel accepts explicit block/warp/stage overrides for the lab.
 """
 
 from __future__ import annotations
@@ -27,6 +27,7 @@ from collections.abc import Mapping
 
 import jax
 import jax.numpy as jnp
+from jax.ad_checkpoint import checkpoint_name
 from jax.experimental import pallas as pl
 
 from dew.nn.kernels import generation
@@ -82,6 +83,11 @@ def _declared(name: str, target: generation.GpuTarget, dtype: str) -> dict:
             ("bfloat16", False): _SMALL_BF16, ("float32", False): _SMALL_FP32}[dtype, wide]
 
 
+# Keys wider than 128 hold a wider memory, so their kernels take at most these fields, each a choice
+# fla's autotuner offers: on an A100 three-stage dhu took 177,160 bytes of 166,912 at 256-wide keys
+# (CPU compile).
+_WIDE_KEYS = {"chunk_bwd_dhu": {"stages": 2}}
+
 CONFIGS = {(name, dtype): _declared(name, target, dtype)
            for name, target in generation.TARGETS.items()
            if name.startswith("sm") and int(name[2:]) >= generation.BF16_GPU
@@ -90,8 +96,14 @@ CONFIGS = {(name, dtype): _declared(name, target, dtype)
 Triton: an A100's wherever a block holds as much shared memory, the 99 KB tables elsewhere."""
 
 WIDEST = 128
-"""The widest keys and values the port takes: its configs compile for the 0.8B's and 9B's 128-wide
-heads (tests/fla_gdn_support.py's TRAINING_SHAPES)."""
+"""The widest values each of the port's calls takes: its configs compile for the 0.8B's and 9B's
+128-wide heads (tests/fla_gdn_support.py's COMPILED_SHAPES); wider values split into more heads."""
+
+WIDEST_KEYS = 256
+"""The widest 16-bit keys the port takes, fla's own bound (chunk_delta_h.py's four 64-wide blocks of
+the memory), for which its configs compile too; keys cannot split. fp32 keys take at most WIDEST: at
+256 an A100's fp32 forward h needs 172,292 shared bytes at its narrowest tile and an RTX 4000's fp32
+WY backward compiles past the suite's minute (CPU compile)."""
 
 
 def _rule_shape(key, value, chunk):
@@ -99,39 +111,28 @@ def _rule_shape(key, value, chunk):
 
 
 def _config_key(dtype, target: str | None = None) -> tuple[str, str]:
-    """The CONFIGS key a call reads: its GPU, or an A100 where the kernels interpret off a GPU, and its
-    activation dtype, fp16 taking bf16's, whose itemsize it shares."""
+    """The CONFIGS key a call reads: its GPU's, an A100's where the kernels interpret off a GPU, and
+    the 99 KB tables' (sm89's) on a GPU the targets do not list, whose block holds at least that; and
+    its activation dtype, fp16 taking bf16's, whose itemsize it shares."""
     target = generation.device_generation() if target is None else target
     name = jnp.dtype(dtype).name
-    return target if target.startswith("sm") else "sm80", "bfloat16" if name == "float16" else name
+    name = "bfloat16" if name == "float16" else name
+    if not target.startswith("sm"):
+        return "sm80", name
+    return (target if (target, name) in CONFIGS else "sm89"), name
 
 
 def kernel_config(kernel: str, shape: Mapping[str, int], dtype, *, target: str | None = None,
                   **overrides: int | None) -> dict[str, int]:
-    """`kernel`'s config for `dtype` on `target` (`_config_key`); overrides (the lab's) replace its
-    fields. Blocks are clipped to the keys' `width` and values' `columns`."""
-    config = {**CONFIGS[_config_key(dtype, target)][kernel],
-              **{key: value for key, value in overrides.items() if value is not None}}
+    """`kernel`'s config for `dtype` on `target` (`_config_key`), capped for keys wider than 128
+    (`_WIDE_KEYS`); overrides (the lab's) replace its fields. Blocks are clipped to the
+    keys' `width` and values' `columns`."""
+    config = dict(CONFIGS[_config_key(dtype, target)][kernel])
+    if shape["width"] > WIDEST:
+        config.update({key: min(config[key], cap) for key, cap in _WIDE_KEYS.get(kernel, {}).items()})
+    config.update({key: value for key, value in overrides.items() if value is not None})
     return {key: min(value, shape["width"] if key == "bk" else shape["columns"]) if key in ("bk", "bv")
             else value for key, value in config.items()}
-
-
-def rule_refusal(query, key, value, chunk):
-    """Why the port does not run here for these keys and values: no configs for their dtype on this
-    device, keys or values wider than the configs compile for, or a key head serving a number of value
-    heads no Triton block holds."""
-    if not query.dtype == key.dtype == value.dtype:
-        return (f"the port needs one dtype for queries, keys and values, got {query.dtype}, {key.dtype} "
-                f"and {value.dtype}")
-    if _config_key(key.dtype) not in CONFIGS:
-        return f"the port has no {jnp.dtype(key.dtype).name} configs for {generation.device_generation()}"
-    if key.shape[-1] > WIDEST or value.shape[-1] > WIDEST:
-        return (f"keys {key.shape[-1]} and values {value.shape[-1]} wide; the port's configs compile for "
-                f"at most {WIDEST}")
-    group = value.shape[2] // key.shape[2]
-    if group & (group - 1):
-        return f"{group} value heads a key head; dqkwg's block holds a power of two"
-    return None
 
 
 def _cumsum_kernel(s_ref, o_ref, *, scale: float | None, reverse: bool):
@@ -920,9 +921,11 @@ def _rule(q, k, v, g, beta, h0, scale: float, chunk: int, interpret: bool):
 def _rule_fwd(q, k, v, g, beta, h0, scale: float, chunk: int, interpret: bool):
     """fla's `chunk_gated_delta_rule_fwd` (fla/ops/gated_delta_rule/chunk.py:33-123): the decay
     cumulated in base 2, the inverse, `w` and `u`, the memory across chunks, then the output. Saves
-    what fla saves: the cumulated decay, the inverse and the initial memory."""
-    gc = chunk_local_cumsum(g, chunk=chunk, scale=RCP_LN2, interpret=interpret)
-    a = kkt_solve(k, gc, beta, chunk=chunk, interpret=interpret)
+    what fla saves: the cumulated decay and the inverse, named 'delta_decay' and 'delta_inverse' for a
+    remat policy, and the initial memory."""
+    gc = checkpoint_name(chunk_local_cumsum(g, chunk=chunk, scale=RCP_LN2, interpret=interpret),
+                         'delta_decay')
+    a = checkpoint_name(kkt_solve(k, gc, beta, chunk=chunk, interpret=interpret), 'delta_inverse')
     w, u = recompute_w_u(k, v, beta, a, gc, chunk=chunk, interpret=interpret)
     h, corrected, final = chunk_fwd_h(k, w, u, gc, h0, chunk=chunk, interpret=interpret)
     o = chunk_fwd_o(q, k, corrected, h, gc, scale=scale, chunk=chunk, interpret=interpret)

@@ -136,22 +136,25 @@ def test_a_kernel_traced_for_an_assumed_gpu_lowers_to_a_named_triton_call():
 # forward and backward (`_experts_lowered`). None for a kernel whose Triton lowering no CPU reaches
 # (`dew.nn.kernels.generation.UNLOWERABLE`).
 FAMILIES = {
-    ('gated_delta_rule', 'pallas'): ("step", {"gated_delta_states", "gated_delta_states_backward",
-                                              "gated_delta_prep", "gated_delta_prep_backward"}),
     ('grouped_matmul', 'pallas'): ("experts", {"pallas_triton_ragged_dot", "tgmm_ragged_dot"}),
     ('tokamax_grouped_matmul', 'triton'): ("experts", None),
     ('rms_norm', 'pallas'): ("step", {"rms_norm_forward", "rms_norm_backward", "rms_norm_scale_backward"}),
     ('swiglu', 'pallas'): ("step", {"swiglu_forward", "swiglu_backward"}),
 }
 
-ONE_PATH = {"short_conv_forward", "short_conv_backward"}
-"""The Pallas kernels a step runs on every Triton GPU, with no KERNELS row to choose them: the short
-conv's (`causal_conv1d`)."""
-
 GPUS = sorted({generation for generation, target in TARGETS.items()
                if generation.startswith('sm') and target.kernels}
               | {'sm80', 'sm120'}, key=lambda generation: int(generation[2:]))
 """Every CUDA generation a KERNELS row names, and the A100's and the G4's, which Dew's sessions take."""
+
+GATED_DELTA_RULE = {"fla_chunk_local_cumsum", "fla_kkt_solve", "fla_recompute_w_u", "fla_chunk_fwd_h",
+                    "fla_chunk_fwd_o", "fla_chunk_bwd_dv_local", "fla_chunk_bwd_dhu", "fla_chunk_bwd_dqkwg",
+                    "fla_prepare_wy_repr_bwd"}
+"""The port's kernels (dew.nn.kernels.fla_gdn), which every GPU step with a Gated DeltaNet calls: no
+KERNELS row chooses them, a GPU runs no other."""
+
+SHORT_CONV = {"short_conv_forward", "short_conv_backward"}
+"""The short conv's kernels (`causal_conv1d`), which every GPU step with a recurrent mixer calls."""
 
 
 def chosen(generation: str, probe: str) -> set[tuple[str, str]]:
@@ -198,14 +201,15 @@ def test_the_compensated_norm_vjp_lowers_for_both_gpu_generations(generation):
 def test_the_clef_step_lowers_for_the_gpu_with_every_kernel_its_generation_chooses(generation, tmp_path):
     """c58's and c57's step, the Clef recipe's decision step over a Qwen 3.5 hybrid, lowered on this CPU
     for their GPUs, an A100 and a G4 (tools/clef_step.py): it lowers, and it calls the Triton kernels
-    of every Pallas choice the generation's KERNELS row names for its layers and the ones every GPU
-    runs, so none was interpreted or refused."""
+    of the gated delta rule's port, of the short conv and of every Pallas choice the generation's KERNELS
+    row names for its layers, so none was interpreted or refused."""
     done = subprocess.run([sys.executable, str(ROOT / "tools" / "clef_step.py"), "--lower-for", generation,
                            "--work", str(tmp_path)], capture_output=True, text=True, cwd=ROOT, timeout=1500,
                           env={**os.environ, "JAX_PLATFORMS": "cpu"})
     assert done.returncode == 0, done.stderr[-4000:]
     kernels = json.loads(done.stdout.splitlines()[-1])["kernels"]
-    assert set(kernels) == ONE_PATH.union(*(FAMILIES[key][1] for key in chosen(generation, "step")))
+    assert set(kernels) == (GATED_DELTA_RULE | SHORT_CONV).union(
+        *(FAMILIES[key][1] for key in chosen(generation, "step")))
 
 
 def _experts_lowered(generation: str, implementation: str):
