@@ -815,7 +815,13 @@ def flash_architectures() -> tuple[str, ...] | None:
     reported them, 0.1.0, holds sm80's alone."""
     if importlib.util.find_spec('dew_flash_attn') is None:
         return None
-    return getattr(importlib.import_module('dew_flash_attn'), 'ARCHITECTURES', ('sm80',))
+    return _reported_architectures(importlib.import_module('dew_flash_attn'))
+
+
+def _reported_architectures(wheel) -> tuple[str, ...]:
+    """The boundary with an installed dew_flash_attn: the architectures it reports, or sm80's alone
+    for 0.1.0, which predates the report."""
+    return getattr(wheel, 'ARCHITECTURES', ('sm80',))
 
 
 def flash_built_for(generation: str, architectures: tuple[str, ...]) -> bool:
