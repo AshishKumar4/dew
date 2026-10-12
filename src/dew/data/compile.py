@@ -661,6 +661,7 @@ def _training_reader(
             functools.partial(build.batches, pipeline, partition),
             own_plan,
             resume,
+            stop_seconds=build.loading.stop_seconds,
             endless=build.lowering.endless,
         )
         statistics.observe(opened)
