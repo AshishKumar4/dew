@@ -140,7 +140,8 @@ class Hub(Dataset):
             "repo": self.repo,
             "revision": self.commit,
             "config": self.name,
-            "columns": None if self.columns is None else list(self.columns),
+            # Only a selection names its columns, so every other split keeps its key.
+            **({} if self.columns is None else {"columns": list(self.columns)}),
             "split": self.split,
         }
 
