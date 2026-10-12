@@ -776,18 +776,33 @@ def boundaries(module: Module, models: ModelIndex) -> Iterator[Finding]:
                           f"reads {member}, private to a model; ask for a public capability instead")
 
 
-def _module_level(body: Sequence[ast.stmt]) -> Iterator[ast.stmt]:
-    """The statements an import runs, through module-level if and try."""
+def _script_guard(node: ast.If) -> bool:
+    """`if __name__ == "__main__":`, whose body runs only as a script."""
+    test = node.test
+    return (isinstance(test, ast.Compare) and _named(test.left) == "__name__"
+            and len(test.ops) == 1 and isinstance(test.ops[0], ast.Eq)
+            and isinstance(test.comparators[0], ast.Constant) and test.comparators[0].value == "__main__")
+
+
+def _module_level(body: Sequence[ast.stmt]) -> Iterator[ast.AST]:
+    """The statements an import executes: every block but function bodies and the
+    script guard's body (its `else` still runs), class bodies included."""
     for node in body:
-        if isinstance(node, ast.If) and _named(node.test.left if isinstance(node.test, ast.Compare)
-                                               else node.test) == "__name__":
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
             continue
-        if isinstance(node, ast.If | ast.Try):
+        if isinstance(node, ast.ClassDef):
             yield from _module_level(node.body)
+        elif isinstance(node, ast.If):
+            if not _script_guard(node):
+                yield node.test
+                yield from _module_level(node.body)
             yield from _module_level(node.orelse)
+        elif isinstance(node, ast.Try | ast.With | ast.For | ast.While):
+            for block in ("body", "orelse", "finalbody"):
+                yield from _module_level(getattr(node, block, []))
             for handler in getattr(node, "handlers", []):
                 yield from _module_level(handler.body)
-        elif not isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
+        else:
             yield node
 
 
