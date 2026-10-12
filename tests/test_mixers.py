@@ -12,12 +12,15 @@ and values agree, and an unknown kind or field raises naming what was asked for.
 
 import dataclasses
 import functools
+import itertools
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
 from flax import linen as nn
 from model_support import TINY_DECODER
+from reference_error import assert_leaves_as_exact
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.layer_plan import LayerKind
@@ -164,3 +167,51 @@ def test_models_build_takes_kind_mixer_records():
     ids = jnp.asarray([[1, 2, 3, 4]], jnp.int32)
     params = expected.init(jax.random.key(0), ids)
     assert jnp.array_equal(model.apply(params, ids), expected.apply(params, ids))
+
+
+DOCUMENTS = (5, 7)
+"""Two packed documents' lengths: the first shorter than a conv's history would carry, both uneven."""
+
+
+def packed_and_alone(model, variables, tokens, cotangent):
+    """Logits and parameter gradients of `tokens` `[1, sum(DOCUMENTS)]` run packed (segment ids and
+    positions restarting per document) and of each document run alone, the latter concatenated."""
+    total = sum(DOCUMENTS)
+    segments = jnp.concatenate([jnp.full((1, length), i + 1, jnp.int32)
+                                for i, length in enumerate(DOCUMENTS)], axis=1)
+    positions = jnp.concatenate([jnp.arange(length)[None] for length in DOCUMENTS], axis=1)
+
+    def packed(variables):
+        return model.apply(variables, tokens, positions=positions, segment_ids=segments,
+                           max_segments=len(DOCUMENTS))
+
+    def alone(variables):
+        starts = (0, *itertools.accumulate(DOCUMENTS))
+        return jnp.concatenate([model.apply(variables, tokens[:, begin:end])
+                                for begin, end in itertools.pairwise(starts)], axis=1)
+
+    def run(forward):
+        logits, pull = jax.vjp(forward, variables)
+        return logits, pull(cotangent.astype(logits.dtype))[0]
+
+    assert tokens.shape == (1, total)
+    return run(packed), run(alone)
+
+
+@pytest.mark.parametrize("kind", sorted(mixers.paths))
+def test_a_packed_row_computes_what_its_documents_compute_alone(kind):
+    """Every mixer in the registry: a row packing two documents (segment ids, positions restarting)
+    gives each document's logits and the parameters' gradients its documents give run one at a time,
+    within the float64 gate, so no layer carries a conv history, a recurrent state or attention across
+    a document boundary. The float64 truth is the documents run alone in float64."""
+    model = tiny(mixer=mixers.build(kind), max_seq_len=32)
+    tokens = jax.random.randint(jax.random.key(3), (1, sum(DOCUMENTS)), 0, VOCAB)
+    variables = model.init(jax.random.key(4), tokens)
+    cotangent = jax.random.normal(jax.random.key(5), (1, sum(DOCUMENTS), VOCAB))
+    (packed, packed_grads), (alone, alone_grads) = packed_and_alone(model, variables, tokens, cotangent)
+    with jax.enable_x64(new_val=True):
+        wide = jax.tree.map(lambda x: jnp.asarray(np.asarray(x, np.float64)), variables)
+        _, (truth, truth_grads) = packed_and_alone(model.clone(dtype=jnp.float64, param_dtype=jnp.float64),
+                                                   wide, tokens, jnp.asarray(cotangent, jnp.float64))
+    assert_leaves_as_exact({"logits": packed, "grads": packed_grads}, {"logits": alone, "grads": alone_grads},
+                           {"logits": truth, "grads": truth_grads}, reductions=sum(DOCUMENTS))

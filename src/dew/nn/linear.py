@@ -524,7 +524,7 @@ def chunk_delta_rule(query, key, value, g, beta, state=None, chunk_size: int = C
 
 
 def chunk_gated_delta_rule(query, key, value, g, beta, state=None, chunk_size: int = CHUNK_SIZE, *,
-                           projected=None):
+                           projected=None, starts=None, max_segments: int | None = None):
     """`torch_chunk_gated_delta_rule` (modeling_qwen3_next.py:374-453) with one
     log decay per head, `g` `[B, S, H]`. Its queries and keys may sit on fewer
     heads than the values, each serving `Hv // Hk` of them, as fla takes them.
@@ -535,17 +535,28 @@ def chunk_gated_delta_rule(query, key, value, g, beta, state=None, chunk_size: i
     hand fla's rule; elsewhere the portable math (`chunk_delta_rule`) on the
     operands as they come, in `chunk_size` chunks, which the port's 64 need
     not match: the rule's value does not depend on them.
+
+    `starts` `[B, S]` marks packed documents' first tokens, each starting
+    from a zero memory (`state` continues a row's first document): fla's
+    varlen sequences on the port, at most `max_segments` documents a row
+    (static, `AttentionMetadata.max_segments`), and the recurrence reset at
+    each start in the portable math.
     """
     if value.shape[2] % key.shape[2]:
         raise ValueError(f"{value.shape[2]} value heads over {key.shape[2]} key heads: each key head serves "
                          "a whole number of value heads")
     rows, keys, values, gates = ((query, key, value, beta) if projected is None
                                  else (x.astype(projected) for x in (query, key, value, beta)))
+    if starts is not None and max_segments is None:
+        raise ValueError("packed documents need max_segments, the most a row holds "
+                         "(AttentionMetadata.max_segments), to bound the port's sequences")
     if on_the_port(rows, keys, values):
-        return fla_rule(rows, keys, values, g, gates, state)
+        return fla_rule(rows, keys, values, g, gates, state, starts=starts, max_segments=max_segments)
     group = value.shape[2] // key.shape[2]
     if group > 1:
         query, key = (jnp.repeat(x, group, axis=2) for x in (query, key))
+    if starts is not None:
+        return recurrent_delta_rule(query, key, value, g[..., None], beta, state, starts=starts)
     return chunk_delta_rule(query, key, value, g[..., None], beta, state, chunk_size)
 
 
@@ -586,10 +597,12 @@ def on_the_port(query, key, value) -> bool:
     return refusal is None
 
 
-def fla_rule(query, key, value, g, beta, state=None):
+def fla_rule(query, key, value, g, beta, state=None, *, starts=None, max_segments: int | None = None):
     """`fla_gdn.chunk_gated_delta_rule` for any call the portable math takes:
     `[B, S, Hk, Dk]` queries and keys, `[B, S, Hv, Dv]` values, the log decay
-    `g` and `beta` `[B, S, Hv]`, the memory `[B, Hv, Dk, Dv]` or None.
+    `g` and `beta` `[B, S, Hv]`, the memory `[B, Hv, Dk, Dv]` or None, and
+    packed documents' first tokens `starts` `[B, S]`, at most `max_segments`
+    a row, as fla's varlen sequences.
 
     The operands go to their common dtype, beta with them, as fla's layer
     holds them. On a mesh the rule runs per shard (`manual_map`): rows where
@@ -607,28 +620,30 @@ def fla_rule(query, key, value, g, beta, state=None):
     state = (jnp.zeros((B, Hv, key.shape[-1], Dv), jnp.float32) if state is None
              else state.astype(jnp.float32))
     mesh = jax.sharding.get_abstract_mesh()
+    starts = jnp.zeros(query.shape[:2], bool) if starts is None else jnp.asarray(starts, bool)
+    blocked = functools.partial(_blocked_rule, max_segments=max_segments)
     if mesh.empty or set(mesh.axis_names) <= set(mesh.manual_axes):
-        return _blocked_rule(query, key, value, g, beta, state)
+        return blocked(query, key, value, g, beta, state, starts)
     spec = logical_spec(HEADS, value.shape)
     rows, heads = (spec[i] if i < len(spec) else None for i in (0, 2))
     if key.shape[2] % math.prod(mesh.shape[axis] for axis in mesh_axes(heads)):
         heads = None
     P = jax.sharding.PartitionSpec
     four, three, memory = P(rows, None, heads, None), P(rows, None, heads), P(rows, heads, None, None)
-    return manual_map(_blocked_rule, (four, four, four, three, three, memory), (four, memory))(
-        query, key, value, g, beta, state)
+    return manual_map(blocked, (four, four, four, three, three, memory, P(rows, None)), (four, memory))(
+        query, key, value, g, beta, state, starts)
 
 
-def _blocked_rule(query, key, value, g, beta, state):
+def _blocked_rule(query, key, value, g, beta, state, starts, *, max_segments: int | None):
     """The port's rule on one shard, shaped to its kernels' blocks: values
     wider than the port's widest split into more value heads of their key
     head; value heads padded to a power of two per key head, which dqkwg's
     block holds, with heads that neither write nor read (zero value, beta
     and decay); keys and values padded with zero columns to 64, 128 or 256,
-    widths every block of the kernels' configs divides; the sequence padded
-    to whole chunks with tokens that neither decay nor write. None of them
-    changes a real output or gradient: every padded product is an exact
-    zero. The outputs are cut back."""
+    widths every block of the kernels' configs divides. None of them changes
+    a real output or gradient: every padded product is an exact zero. The
+    outputs are cut back. Packed documents (`starts`, with `max_segments`)
+    are fla's varlen sequences over the shard's rows (`_cu_seqlens`)."""
     B, S, Hk, Dk = key.shape
     Hv, Dv = value.shape[2:]
     scale = Dk ** -0.5
@@ -651,15 +666,25 @@ def _blocked_rule(query, key, value, g, beta, state):
     query, key = (_padded(x, 3, blocks[0]) for x in (query, key))
     value = _padded(value, 3, blocks[1])
     state = _padded(_padded(state, 2, blocks[0]), 3, blocks[1])
-    length = -(-S // CHUNK_SIZE) * CHUNK_SIZE
-    query, key, value, g, beta = (_padded(x, 1, length) for x in (query, key, value, g, beta))
-    out, final = fla_gdn.chunk_gated_delta_rule(query, key, value, g, beta, state, scale, CHUNK_SIZE,
-                                                not generation.triton_runs())
-    out = out[:, :S, :, :width].reshape(B, S, Hk, group, width)[:, :, :, :served]
+    cu_seqlens = None if max_segments is None else _cu_seqlens(starts, max_segments)
+    out, final = fla_gdn.chunk_gated_delta_rule(query, key, value, g, beta, state, cu_seqlens, scale,
+                                                CHUNK_SIZE, not generation.triton_runs())
+    out = out[..., :width].reshape(B, S, Hk, group, width)[:, :, :, :served]
     out = out.reshape(B, S, Hv, split * width)[..., :Dv]
     final = final[:, :, :Dk, :width].reshape(B, Hk, group, Dk, width)[:, :, :served]
     final = jnp.moveaxis(final.reshape(B, Hv, split, Dk, width), 2, 3).reshape(B, Hv, Dk, split * width)
     return out, final[..., :Dv]
+
+
+def _cu_seqlens(starts, max_segments: int):
+    """fla's `cu_seqlens` over the `[B * S]` tokens of `starts`' rows: each row and each document a row
+    holds (its first token marked) a sequence, at most `max_segments` a row, the unused ones empty at
+    the end."""
+    rows, length = starts.shape
+    first = starts.at[:, 0].set(True).reshape(-1)
+    count = rows * max_segments
+    begins = jnp.nonzero(first, size=count, fill_value=rows * length)[0]
+    return jnp.concatenate([begins, jnp.full((1,), rows * length, begins.dtype)]).astype(jnp.int32)
 
 
 def _padded(x, axis: int, size: int):
@@ -669,13 +694,14 @@ def _padded(x, axis: int, size: int):
     return jnp.pad(x, [(0, size - x.shape[axis]) if i == axis else (0, 0) for i in range(x.ndim)])
 
 
-def recurrent_delta_rule(query, key, value, g, beta, state=None):
+def recurrent_delta_rule(query, key, value, g, beta, state=None, *, starts=None):
     """One token at a time, the decode path, in fp32 as a lax.scan over the
     time axis so the state rides the scan the way it rides the decode cache.
 
     `g` is the log decay per key dimension, `[B, S, H, Dk]`, which is
     `recurrent_kimi_delta_attention` (modeling_glm5_next.py:428-478). The
     gated delta rule decays per head, one decay over every key dimension.
+    A token `starts` `[B, S]` marks begins a packed document from a zero memory.
     """
     dtype, work = query.dtype, at_least_fp32(query.dtype)
     query, key, value, g, beta = (
@@ -684,6 +710,7 @@ def recurrent_delta_rule(query, key, value, g, beta, state=None):
 
     def one_token(s, step):
         q_t, k_t, v_t, g_t, beta_t = (step[name] for name in ('q', 'k', 'v', 'g', 'beta'))
+        s = jnp.where(step['start'][:, None, None, None], 0.0, s)
         s = s * jnp.exp(g_t)[..., :, None]                 # rows decay per key dimension
         kv_mem = jnp.sum(s * k_t[..., :, None], axis=-2)   # [B, H, Dv]
         delta = (v_t - kv_mem) * beta_t[..., None]        # [B, H, Dv]
@@ -693,10 +720,11 @@ def recurrent_delta_rule(query, key, value, g, beta, state=None):
     if state is None:
         state = jnp.zeros((query.shape[0], query.shape[-2], key.shape[-1],
                            value.shape[-1]), work)
+    starts = jnp.zeros(query.shape[:2], bool) if starts is None else jnp.asarray(starts, bool)
     state, out = jax.lax.scan(
         one_token, state.astype(work),
         {name: jnp.moveaxis(x, 1, 0) for name, x in
-         (('q', query), ('k', key), ('v', value), ('g', g), ('beta', beta))})
+         (('q', query), ('k', key), ('v', value), ('g', g), ('beta', beta), ('start', starts))})
     return jnp.moveaxis(out, 0, 1).astype(dtype), state.astype(dtype)
 
 
@@ -874,11 +902,12 @@ class GatedDeltaNet(nn.Module):
     def __call__(self, x, decode: bool = False,
                  positions=None, segment_ids=None, kv_store=None,
                  attention_metadata: AttentionMetadata | None = None):
-        del positions, segment_ids, kv_store
+        del positions, kv_store
         B, S, _ = x.shape
         valid = None if attention_metadata is None else attention_metadata.valid
         if valid is not None and valid.shape != (B, S):
             raise ValueError(f"row validity must be {(B, S)}, got {valid.shape}")
+        max_segments = None if attention_metadata is None else attention_metadata.max_segments
         mixed, z, b, a = self._project(x)
         key_dim = self.key_features
         operand = mixed.dtype
@@ -902,7 +931,6 @@ class GatedDeltaNet(nn.Module):
         ported = S > 1 and port_refusal(rows, keys, values) is None
 
         def scan(convolved, *, starts, valid, held):
-            del starts
             query, key, value = (self._split_heads(part, width)
                                  for part, width in zip(convolved, widths, strict=True))
             state = None if held is None else held.astype(wide)
@@ -910,7 +938,7 @@ class GatedDeltaNet(nn.Module):
                 # fla's layer hands its rule the projections' dtype, the
                 # queries and keys on their own heads and beta beside them.
                 return chunk_gated_delta_rule(query, key, value, g, beta, state, self.chunk_size,
-                                              projected=operand)
+                                              projected=operand, starts=starts, max_segments=max_segments)
             query, key = self._expand_kv(query), self._expand_kv(key)
             if S == 1 and held is not None and delta_rule.fits(held):
                 return decode_gated_delta_rule(query, key, value, g, beta, held,
@@ -932,7 +960,7 @@ class GatedDeltaNet(nn.Module):
         heads = ((key_dim, self.head_k_dim), (key_dim, self.head_k_dim), (self.value_features, None))
         out = held_scan(self, mixed, self.conv1d()[0], None, scan,
                         (self.num_v_heads, self.head_k_dim, self.head_v_dim), decode=decode,
-                        valid=valid, state='recurrent_state', state_dtype=stored,
+                        valid=valid, segments=segment_ids, state='recurrent_state', state_dtype=stored,
                         conv_dtype=jnp.promote_types(operand, stored),
                         right_padded=attention_metadata is not None and attention_metadata.right_padded,
                         parts=heads, dtype=operand if ported else wide)
