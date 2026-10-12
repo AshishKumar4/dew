@@ -322,22 +322,16 @@ def float64_attention(query, key, value, causal):
     return jnp.einsum('hqk,khd->qhd', jax.nn.softmax(logits, axis=-1), value)
 
 
-def relative_distance(got, want) -> tuple[float, float]:
-    """RMS and largest distance of `got` from `want`, relative to `want`'s RMS and largest magnitude."""
-    error = np.asarray(got, np.float64) - want
-    return (float(np.sqrt(np.mean(error ** 2) / np.mean(want ** 2))),
-            float(np.abs(error).max() / np.abs(want).max()))
-
-
 @on_gpu
 @pytest.mark.parametrize("head_dim", [128, 256])
 @pytest.mark.parametrize("causal", [True, False])
 def test_packed_sequences_attend_within_themselves_as_far_from_float64_as_one_at_a_time(
         head_dim, causal, without_deterministic_ops):
     """Documents packed back to back, one a single token, with an empty sequence between two: each
-    document's output and its three input gradients lie no farther from float64 attention than
-    FlashAttention-2's own on that document alone, in the worse of two runs of it, whose atomic
-    query gradient varies from run to run."""
+    document's output and its three input gradients lie within tests/reference_error.py's rule of
+    FlashAttention-2's own on that document alone, both measured from float64. Not bitwise: on one
+    short document the dense forward splits its keys across blocks (`_splits`) and the packed one
+    does not, so the two round differently (on an RTX 4080, 1.0003 to 1.012 times apart in RMS)."""
     flash = pytest.importorskip("dew_flash_attn")
     if head_dim > 192 and kernels.device_generation() in ('sm86', 'sm87', 'sm89'):
         pytest.skip("FlashAttention-2's backward takes heads over 192 wide only on sm80, sm90 and sm1xx")
@@ -357,16 +351,17 @@ def test_packed_sequences_attend_within_themselves_as_far_from_float64_as_one_at
         if begin == end:
             continue
         pieces = (query[begin:end], key[begin:end], value[begin:end])
-        dense = [grads(lambda q, k, v: flash.flash_mha(q[None], k[None], v[None], is_causal=causal)[0],
-                       cotangent[begin:end], *pieces) for _ in range(2)]
+        dense = grads(lambda q, k, v: flash.flash_mha(q[None], k[None], v[None], is_causal=causal)[0],
+                      cotangent[begin:end], *pieces)
         with jax.enable_x64(new_val=True):
             wide = [jnp.asarray(np.asarray(x, np.float64)) for x in (*pieces, cotangent[begin:end])]
             truth = grads(functools.partial(float64_attention, causal=causal), wide[3], *wide[:3])
-        for name, got, runs, want in zip(("o", "dq", "dk", "dv"), (x[begin:end] for x in packed),
-                                         zip(*dense, strict=True), truth, strict=True):
-            bound = [max(pair) for pair in zip(*(relative_distance(run, want) for run in runs), strict=True)]
-            measured = relative_distance(got, want)
-            assert measured[0] <= bound[0] and measured[1] <= bound[1], (name, begin, measured, bound)
+        for name, got, theirs, want in zip(("o", "dq", "dk", "dv"), (x[begin:end] for x in packed), dense,
+                                           truth, strict=True):
+            if distance(theirs, want) == 0:  # a one-token document's attention is exact either way
+                np.testing.assert_array_equal(got, theirs)
+            else:
+                assert_as_exact_as_the_reference(got, theirs, want, f"{name} of the document at {begin}")
 
 
 def key_length_call(implementation, query, key, value, lengths, **kwargs):
