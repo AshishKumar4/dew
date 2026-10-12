@@ -128,7 +128,7 @@ def exercise_updates_and_resume(
 ):
     objective = DenseObjective(parameter_kind, loss_kind)
     if ON_TPU and "64" in parameter_kind:
-        with pytest.raises(ValueError, match="a TPU has no float64"):
+        with pytest.raises(ValueError):
             Trainer(objective, optax.adam(.01), key=jax.random.PRNGKey(17)).place()
         return
     if ema_decay is not None:

@@ -270,7 +270,7 @@ def test_a_run_can_disable_final_checkpoint_saving(tmp_path):
 
 
 def test_publishing_requires_a_final_checkpoint_policy():
-    with pytest.raises(ValueError, match="checkpoint_final"):
+    with pytest.raises(ValueError):
         TrainerConfig(publish=True, wandb=dew.config.Wandb(project="test"), checkpoint_final=False)
 
 

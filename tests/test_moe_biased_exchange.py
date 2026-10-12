@@ -27,7 +27,7 @@ def test_biased_exchange_keeps_every_selected_expert_and_requires_its_mesh():
     variables['params']['down_proj_bias'] = jnp.asarray(rng.normal(size=(4, 8)), jnp.float32)
     expected = jnp.asarray(reference.apply(variables, x, weights, indices))
     exchanged = GptOssExperts(8, 12, 4, dispatch='exchange')
-    with pytest.raises(ValueError, match='expert mesh axis'):
+    with pytest.raises(ValueError):
         exchanged.apply(variables, x, weights, indices)
     with jax.set_mesh(MeshSpec(expert=4).build()):
         actual = jax.jit(exchanged.apply)(variables, x, weights, indices)

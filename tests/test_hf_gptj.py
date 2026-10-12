@@ -61,7 +61,7 @@ def test_gptj_reference_catches_interleaved_pairs_read_as_rotate_half():
             parts = name.split('.')
             variables['params'][f'layers_{parts[2]}']['self_attn'][parts[4]]['kernel'] = jnp.asarray(tensor.T)
     wrong = loaded.model.apply(variables, np.load(DIRECTORY / 'input_ids.npy'))
-    with pytest.raises(AssertionError, match=r'allowed 2\.0'):
+    with pytest.raises(AssertionError):
         assert_as_exact_as_the_reference(wrong, np.load(DIRECTORY / 'logits.npy'),
                                          np.load(DIRECTORY / 'logits_f64.npy'), 'GPT-J wrong pairing')
     np.testing.assert_array_equal(

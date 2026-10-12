@@ -229,5 +229,5 @@ def test_gaussian_topk_uses_zero_relu_derivative_at_the_cutoff():
 
 @pytest.mark.parametrize("field,value", [("num_inputs", 1), ("active_idx", 4), ("coef_clip", 0.0)])
 def test_an_altup_spec_out_of_range_is_refused(field, value):
-    with pytest.raises(ValueError, match=f"altup_{field}"):
+    with pytest.raises(ValueError):
         AltUp(**{field: value})

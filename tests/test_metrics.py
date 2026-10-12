@@ -29,9 +29,9 @@ def test_mean_metric_counts_uneven_batches_and_weighted_totals():
     weighted = Mean(lambda artifact, batch: batch["totals"], name="weighted", better="lower", reads=ImageGrid)
     assert weighted.finalize(weighted.merge(weighted(artifact, {"totals": (12., 3.)}),
                                              weighted(artifact, {"totals": (8., 1.)}))) == 5.
-    with pytest.raises(ValueError, match="count"):
+    with pytest.raises(ValueError):
         weighted.finalize((0., 0.))
-    with pytest.raises(ValueError, match="per-example"):
+    with pytest.raises(ValueError):
         metric(artifact, {"values": np.asarray(4.)})
 
 

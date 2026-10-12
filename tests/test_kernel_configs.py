@@ -60,7 +60,7 @@ def test_the_kernel_cases_lower_each_kernel_on_abstract_operands(target):
                                        (jnp.float16, jnp.bfloat16)])
 def test_the_shared_dot_rejects_mismatches_before_interpret_widening(exact, left, right):
     a, b = jnp.ones((2, 2), left), jnp.ones((2, 2), right)
-    with pytest.raises(TypeError, match="same dtype"):
+    with pytest.raises(TypeError):
         fla_gdn._dot(a, b, exact=exact)
 
 

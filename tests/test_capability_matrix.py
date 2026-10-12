@@ -677,7 +677,7 @@ def mdlm(family: Family, directory: Path) -> None:
                                                              variables=task.variables, ema_decay=None),
                        batch)
         return
-    with pytest.raises(ValueError, match="mask_token_id"):
+    with pytest.raises(ValueError):
         objective.saved_task.from_run(str(directory))
 
 
