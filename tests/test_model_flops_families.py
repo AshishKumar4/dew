@@ -564,7 +564,8 @@ def test_flux_conditioner_pooled_width_is_unprojected_and_its_composition_matche
         {"clip": {"text_model": clip_variables["params"]}, "t5": t5.params},
         "tiny-flux", 4, 4, t5.transformer.emb_features, composition="flux",
         t5=T5Segment(t5.transformer, t5.tokenizer, "t5", 2))
-    tokens = {"input_ids": ids, "t5_input_ids": ids, "zero_condition": np.zeros((1,), bool)}
+    tokens = {"input_ids": ids[:, None, :], "t5_input_ids": ids,
+              "zero_condition": np.zeros((1,), bool)}
     assert "text_projection" not in conditioner.params["clip"]
     work = conditioner.conditioning_flops(tokens)
     condition = conditioner.encode(conditioner.params, tokens)
