@@ -72,8 +72,11 @@ def test_the_shared_dot_preserves_narrow_products_with_fp32_accumulation():
     np.testing.assert_array_equal(np.asarray(got), np.asarray(expected))
 
 
-def test_wide_keys_cap_an_a100s_dhu_at_two_stages():
+def test_wide_keys_cap_an_a100s_dhu_at_two_stages_and_its_fp32_forward_h_at_32_columns():
     shape = {"width": 256, "columns": 128}
+    assert fla_gdn.kernel_config("chunk_fwd_h", shape, jnp.float32, target="sm80")["bv"] == 32
+    assert fla_gdn.kernel_config("chunk_fwd_h", {"width": 128, "columns": 128}, jnp.float32,
+                                 target="sm80")["bv"] == 64
     assert fla_gdn.kernel_config("chunk_bwd_dhu", shape, jnp.bfloat16, target="sm80")["stages"] == 2
     assert fla_gdn.kernel_config("chunk_bwd_dhu", shape, jnp.bfloat16, target="sm120")["stages"] == 1
     assert fla_gdn.kernel_config("chunk_bwd_dhu", {"width": 128, "columns": 128}, jnp.bfloat16,
