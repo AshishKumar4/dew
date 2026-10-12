@@ -9,7 +9,6 @@ import numpy as np
 import pytest
 
 
-
 @pytest.fixture(scope="module")
 def vae():
     from dew.nn.autoencoders.sd_vae import StableDiffusionVAE

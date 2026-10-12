@@ -70,7 +70,7 @@ def test_terminal_greedy_still_refuses_an_undefined_processed_distribution(inval
     error, _ = jax.jit(lambda state: checked(
         state, jnp.asarray([[1.0, 2.0, 3.0]], jnp.float32),
         decoding.chain((undefined, decoding.Greedy()))))(state)
-    with pytest.raises(Exception):
+    with pytest.raises(checkify.JaxRuntimeError):
         error.throw()
 
 
@@ -115,8 +115,9 @@ def test_a_plain_callable_transform_runs_inside_the_compiled_loop(model, array_b
     def lean(state, logits):
         return logits + bias
 
-    processors = (lean, decoding.SuppressTokens(jnp.asarray([1, 3], jnp.int32)), decoding.Greedy()) if array_backed else (
-        lean, decoding.Greedy())
+    processors = (
+        lean, decoding.SuppressTokens(jnp.asarray([1, 3], jnp.int32)), decoding.Greedy()
+    ) if array_backed else (lean, decoding.Greedy())
     drawn = generate(module, params, prompt, 5, key=jax.random.key(0),
                      sampling=Sampling(temperature=0), logits=processors)
 
@@ -227,7 +228,7 @@ def test_an_undefined_distribution_raises_instead_of_returning_a_token(model):
     module, params = model
     prompt = jnp.asarray([[1, 2, 3]], jnp.int32)
     everything = decoding.SuppressTokens(jnp.arange(VOCAB, dtype=jnp.int32))
-    with pytest.raises(Exception):
+    with pytest.raises(checkify.JaxRuntimeError):
         generate(module, params, prompt, 2, key=jax.random.key(0), logits=(everything,))
     # A row that keeps one token is defined, and that token is what it draws.
     kept = decoding.SuppressTokens(jnp.asarray([index for index in range(VOCAB) if index != 5],

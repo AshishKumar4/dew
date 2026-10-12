@@ -9,7 +9,7 @@ import pytest
 from interop_support import assert_same_stored_tensors
 from reference_error import assert_as_exact_as_the_reference
 
-from dew.interop import Pretrained, codecs
+from dew.interop import Pretrained
 from dew.interop.safetensors_io import read_weights
 from dew.training.quantization import NVFP4Input, nvfp4_input_qdq
 

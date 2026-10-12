@@ -291,7 +291,6 @@ def test_a_launched_process_keeps_every_device_inside_a_slurm_step():
     it pins a process it finds in Slurm's variables to the GPU at the step's
     SLURM_LOCALID, one device of the launcher's several. A process dew launch
     started takes its placement from the launcher."""
-    import jax
 
     env = {**outside_any_cluster(os.environ), **ONE_SLURM_TASK, "PYTHONPATH": str(REPO_ROOT / "src")}
     program = ("from dew.training.runtime import prepare_process\n"
@@ -781,3 +780,78 @@ def test_the_readers_of_one_share_train_on_the_rows_its_first_reader_sampled(tmp
     np.testing.assert_allclose(first["old_log_probs"], reference["old_log_probs"], atol=TOLERANCE)
     for name, value in single.items():
         np.testing.assert_allclose(pooled[name], value, atol=TOLERANCE)
+
+
+@pytest.mark.mesh(devices=2)
+@pytest.mark.xfail(os.environ.get("DEW_UPSTREAM_JAX") == "1", strict=True, reason=(
+    "jax-ml/jax#40940 on a jax release, which CI's package job runs this on: when it passes "
+    "there, constraints.txt's patched jax and dew.training.runtime's refusal of the cache "
+    "(_pool_keys_alike) can go"))
+def test_a_pools_second_run_loads_what_its_first_compiled(tmp_path):
+    """A pool runs twice over one persistent compilation cache, and the second
+    run loads its step on every process. jax 0.11.2 keyed an executable by the
+    compiling process's topology fingerprint, which on a GPU describes the
+    device down to its NVLink links, and only process 0 writes entries. On the
+    box, whose GPUs 0 and 1 share NVLink and 2 and 3 do not, a pool of GPUs 1
+    and 2 loaded the step on one process and compiled it on the other, whose
+    sharded autotuning then waited for ever for its peer's share. Each process
+    here reports a fingerprint of its own, as those two did, whatever devices
+    the run has; the jax constraints.txt names hashes the fingerprints of
+    every process a computation spans. CI's package job runs this on PyPI's
+    jax (DEW_UPSTREAM_JAX=1), where it fails until a release has the fix."""
+    cache, records = tmp_path / "cache", tmp_path / "records"
+    program = (
+        "import json, sys\n"
+        "from pathlib import Path\n"
+        "import jax\n"
+        "from jax._src.lib import xla_client\n"
+        "topology_of = xla_client.get_topology_for_devices\n"
+        "class Apart:\n"
+        "    def __init__(self, topology):\n"
+        "        self.topology = topology\n"
+        "    def fingerprint(self):\n"
+        "        return self.topology.fingerprint() ^ (jax.process_index() + 1)\n"
+        "xla_client.get_topology_for_devices = lambda devices: Apart(topology_of(devices))\n"
+        "events = []\n"
+        "jax.monitoring.register_event_listener(lambda event, **_: events.append(event))\n"
+        "jax.config.update('jax_explain_cache_misses', True)\n"
+        "from dew.training.runtime import prepare_process\n"
+        "prepare_process(compilation_cache_dir=sys.argv[1])\n"
+        "import jax.numpy as jnp, numpy as np\n"
+        "from jax.sharding import NamedSharding, PartitionSpec\n"
+        "from dew.training import MeshSpec\n"
+        "mesh = MeshSpec(fsdp=jax.device_count()).build()\n"
+        "def placed(value, spec):\n"
+        "    return jax.make_array_from_callback(value.shape, NamedSharding(mesh, spec),"
+        " lambda index: value[index])\n"
+        "weights = [placed((np.random.default_rng(i).standard_normal((1024, 1024)) / 32)"
+        ".astype(jnp.bfloat16), PartitionSpec()) for i in range(4)]\n"
+        "x = placed(np.ones((jax.device_count() * 512, 1024), jnp.bfloat16), PartitionSpec('fsdp'))\n"
+        "def loss(x, weights):\n"
+        "    for weight in weights:\n"
+        "        x = jax.nn.gelu(x @ weight)\n"
+        "    return (x.astype(jnp.float32) ** 2).mean()\n"
+        "before = len(events)\n"
+        "float(jax.jit(lambda x, weights: jax.grad(loss)(x, weights).astype(jnp.float32).sum())"
+        "(x, weights))\n"
+        "step = events[before:]\n"
+        "Path(sys.argv[2], f'{jax.process_index()}.json').write_text(json.dumps(\n"
+        "    [step.count('/jax/compilation_cache/compile_requests_use_cache'),\n"
+        "     step.count('/jax/compilation_cache/cache_hits')]))\n"
+    )
+    runs, logged = [], []
+    for run in range(2):
+        out = records / str(run)
+        out.mkdir(parents=True)
+        done = launch("--processes-per-host", "2", "--", sys.executable, "-c", program,
+                      str(cache), str(out), devices=1, timeout=150)
+        assert done.returncode == 0, done.stdout + done.stderr
+        runs.append([json.loads(path.read_text()) for path in sorted(out.iterdir())])
+        # What each rank's jax said of the cache: the key it missed, the entry
+        # it wrote or could not, which says why a second run loads nothing.
+        logged += [f"run {run}: {line}" for line in (done.stdout + done.stderr).splitlines()
+                   if "cache" in line.lower()]
+    # [lookups, hits] a process: the first run compiles every lookup, the second loads it.
+    compiled = runs[0][0][0]
+    assert compiled > 0 and runs == [[[compiled, 0]] * 2, [[compiled, compiled]] * 2], (
+        runs, "\n".join(logged))

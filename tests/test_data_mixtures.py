@@ -29,7 +29,16 @@ from token_support import write_token_corpus
 
 import dew.data
 from dew.data import Corpus, DataPartition, DataPhase, Loading, Ramp, TokenWindows
-from dew.data.dataset import CAPTION, Dataset, LengthGroups, mixed_stream, mixture, ramped, tokenized, train_stream
+from dew.data.dataset import (
+    CAPTION,
+    Dataset,
+    LengthGroups,
+    mixed_stream,
+    mixture,
+    ramped,
+    tokenized,
+    train_stream,
+)
 from dew.objectives.base import Aux, Objective
 from dew.training import Checkpoints, Layout, MeshSpec, Trainer
 

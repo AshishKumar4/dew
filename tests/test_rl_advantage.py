@@ -85,7 +85,8 @@ def test_masked_whiten_matches_the_references(reference, compiled):
 
     values = jnp.array([[1.0, 3.0, 100.0], [5.0, 7.0, -100.0]])
     mask = jnp.array([[1.0, 1.0, 0.0], [1.0, 1.0, 0.0]])
-    assert np.allclose(whiten(values, mask), np.array([[-3, -1, 96], [1, 3, -104]]) / math.sqrt(20 / 3), atol=1e-6)
+    assert np.allclose(whiten(values, mask),
+                        np.array([[-3, -1, 96], [1, 3, -104]]) / math.sqrt(20 / 3), atol=1e-6)
 
 
 @pytest.mark.parametrize("normalise", [True, False])

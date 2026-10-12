@@ -1,7 +1,6 @@
 """PPO actor/critic math against pinned verl and a real episode training run."""
 
 import itertools
-from dataclasses import replace
 from pathlib import Path
 
 import jax
@@ -10,7 +9,6 @@ import numpy as np
 import optax
 import pytest
 from episode_support import (
-    EOS,
     GROUPS,
     PROMPT,
     RESPONSE,

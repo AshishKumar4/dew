@@ -20,7 +20,6 @@ import orbax.checkpoint as ocp
 import pytest
 from flax.training.dynamic_scale import DynamicScale
 from orbax.checkpoint import checkpoint_managers
-from test_checkpoint_ranking import data
 from test_host_training import HOST, Coupled, centered
 
 from dew.checkpoints import Checkpoints, Keep, Ranking

@@ -245,7 +245,8 @@ def test_tiny_checkpoint_image_embeddings_match_the_reference():
     difference = largest_difference(embeds, expected["image_embeds"])
     assert difference < TOLERANCE, f"max |image embedding difference| {difference:.3e}"
 
-    baseline = model.module.apply(model.variables, pixel_values, method=lambda clip, pixels: clip.vision_model(pixels))
+    baseline = model.module.apply(
+        model.variables, pixel_values, method=lambda clip, pixels: clip.vision_model(pixels))
     moved = model.module.apply(model.variables, np.flip(pixel_values, axis=-1),
                                method=lambda clip, pixels: clip.vision_model(pixels))
     assert np.max(np.abs(np.asarray(baseline.pooler_output) - np.asarray(moved.pooler_output))) > 0.1

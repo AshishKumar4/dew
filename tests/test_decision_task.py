@@ -10,7 +10,18 @@ import numpy as np
 import pytest
 from reference_error import assert_as_exact_as_the_reference
 
-from dew.decision import Abstention, Binning, Budget, Choice, Decide, EntropyConfidence, Example, Question, Scored, Temperatures
+from dew.decision import (
+    Abstention,
+    Binning,
+    Budget,
+    Choice,
+    Decide,
+    EntropyConfidence,
+    Example,
+    Question,
+    Scored,
+    Temperatures,
+)
 from dew.decision.calibration import softmax
 from dew.decision.task import decoded_images
 
@@ -76,7 +87,7 @@ def test_images_decode_from_every_form_a_request_carries():
     assert [image.size for image in images] == [(4, 3)] * 4
     assert all(image.convert("RGB").getpixel((0, 0)) == (200, 10, 30) for image in images)
     assert decoded_images(None) == []
-    for bad, message in ((["%%%"], "not base64"), ([base64.b64encode(b"text").decode()], "Pillow"),
+    for bad, _message in ((["%%%"], "not base64"), ([base64.b64encode(b"text").decode()], "Pillow"),
                          ([3], "PIL image"), ("x", "a list")):
         with pytest.raises(ValueError):
             decoded_images(bad)

@@ -4,13 +4,12 @@ from __future__ import annotations
 import dataclasses
 from typing import TYPE_CHECKING
 
-
 from dew.config import ObjectiveConfig
 from dew.inputs import Field, InputSpec
 from dew.registry import Aliases
 
 if TYPE_CHECKING:
-    from decimal import Decimal
+    pass
 
 
 @dataclasses.dataclass(frozen=True)

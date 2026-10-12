@@ -225,7 +225,8 @@ def test_transformers_reads_the_trained_export(trip, tmp_path):
     exported and read by transformers, after checking in float64 that an
     order computes the same logits."""
     directory = FIXTURES / trip.case.fixture
-    assert json.loads((trip.export / "config.json").read_text()) == json.loads((directory / "config.json").read_text())
+    assert json.loads((trip.export / "config.json").read_text()) == json.loads(
+        (directory / "config.json").read_text())
     source_file = directory / "generation_config.json"
     exported_file = trip.export / "generation_config.json"
     expected = json.loads(source_file.read_text()) if source_file.exists() else {}

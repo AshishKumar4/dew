@@ -26,7 +26,13 @@ import pytest
 from reference_error import assert_as_exact_as_the_reference, distance
 
 from dew.nn import kernels
-from dew.nn.attention import RMSNorm, forward_mode_attention, gated_rms_normalized, rms_normalized, stream_rms_normalized
+from dew.nn.attention import (
+    RMSNorm,
+    forward_mode_attention,
+    gated_rms_normalized,
+    rms_normalized,
+    stream_rms_normalized,
+)
 from dew.nn.moe import gated_product
 
 pytestmark = pytest.mark.kernel

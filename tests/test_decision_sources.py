@@ -12,7 +12,6 @@ from pathlib import Path
 
 import pytest
 
-
 RECIPES = Path(__file__).parents[1] / "recipes" / "decision"
 
 

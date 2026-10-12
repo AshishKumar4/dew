@@ -25,7 +25,15 @@ import pytest
 from interop_support import fetch
 
 from dew.interop import Pretrained
-from dew.interop.codecs import BLOCK, SCALE_SUFFIX, dequantize_fp8_blocks, fp8_blocks, fp8_format, quantize_fp8_blocks, scaled_names
+from dew.interop.codecs import (
+    BLOCK,
+    SCALE_SUFFIX,
+    dequantize_fp8_blocks,
+    fp8_blocks,
+    fp8_format,
+    quantize_fp8_blocks,
+    scaled_names,
+)
 
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "hf" / "deepseek-v3-tiny"
 

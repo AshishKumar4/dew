@@ -24,7 +24,14 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from dew.nn.attention import NormalAttention, attention_kernel, causal_attention_mask, exchanged_heads_attention, gathered_keys_attention, scaled_dot_product_attention
+from dew.nn.attention import (
+    NormalAttention,
+    attention_kernel,
+    causal_attention_mask,
+    exchanged_heads_attention,
+    gathered_keys_attention,
+    scaled_dot_product_attention,
+)
 from dew.nn.rope import rotary_freqs
 from dew.training import MeshSpec
 

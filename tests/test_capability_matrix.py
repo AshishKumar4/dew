@@ -1038,7 +1038,7 @@ CRASHES = re.compile(r"unexpected keyword argument|missing \d+ required|has no a
 
 @pytest.mark.parametrize("method, family", cells(supported=False))
 def test_a_refused_cell_names_what_the_family_lacks(method, family):
-    reason = "|".join(REASONS[fact] for fact in sorted(method.needs - family.facts))
+
     with pytest.raises((TypeError, ValueError)) as refused:
         method.refuse(family)
     assert not CRASHES.search(str(refused.value)), refused.value

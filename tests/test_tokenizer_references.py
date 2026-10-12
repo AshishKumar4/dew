@@ -26,7 +26,8 @@ def test_the_byte_tokenizer_encodes_rfc_3629s_examples(text, encoded):
     assert tokenizer.encode(text) == list(bytes.fromhex(encoded))
     assert tokenizer.decode(tokenizer.encode(text)) == text
     for sample in ("hello, world", "\u00fcn\u00efc\u00f6d\u00e9 \u2014 \u03c0\u22483.14159",
-                   "\u65e5\u672c\u8a9e\u306e\u30c6\u30ad\u30b9\u30c8", "emoji \U0001f680\U0001f525 and \x00 control bytes\n\t"):
+                   "\u65e5\u672c\u8a9e\u306e\u30c6\u30ad\u30b9\u30c8",
+                   "emoji \U0001f680\U0001f525 and \x00 control bytes\n\t"):
         assert tokenizer.decode(tokenizer.encode(sample)) == sample
 
 

@@ -146,7 +146,6 @@ def test_a_published_lora_run_downloads_to_a_run_that_loads_and_restores(tmp_pat
     records into a directory that `Adapter.from_run` and `Checkpoints.restore`
     read with the run itself gone: the adapter computes what the run trained,
     and the restored state is the run's, bitwise."""
-    import jax
     import jax.numpy as jnp
     import numpy as np
     import optax

@@ -749,7 +749,6 @@ def test_a_source_noise_sampler_seed_pins_the_brownian_path():
     """`noise_sampler_seed` makes the tree's entropy the checkpoint's, so two
     walks with different keys integrate one path; without it the walk's own
     key decides, as the source's unseeded tree draws its entropy per run."""
-    from dew.sampling import DPMSolverSDE
 
     _, process, times, x_T = source_case("dpm_sde.default")
     model = SourceOracle()
@@ -825,3 +824,15 @@ def test_the_closing_denoise_is_edms_last_euler_step_onto_sigma_zero(name):
     closed = sample(edm_grid(steps).denoiser(EDMOracle(), {}, {}), x_T, solver=solver,
                     key=jax.random.PRNGKey(7), times=np.arange(steps, 0, -1, dtype=np.float32))
     assert_as_exact_as_the_reference(closed, EDM[f"{name}.result32"], EDM[f"{name}.result"], name)
+
+
+@pytest.mark.parametrize("solver", [MultiStepDPM(), RK4(), EulerAncestral(), KDPM2(), LMS()],
+                         ids=solver_id)
+def test_sigma_integrators_reject_a_vp_schedule(solver):
+    """Each integrates dx/dsigma = eps, which only holds when alpha is 1. On a
+    VP schedule the step would run and drift the samples narrow (0.275 std for
+    a 0.3 oracle on the cosine schedule, inside the convergence tolerance), so
+    the schedule is refused by type."""
+    process, model = vp_process()
+    with pytest.raises(ValueError):
+        generate(process, model, solver)

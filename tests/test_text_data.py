@@ -475,7 +475,8 @@ def test_a_packed_validation_pass_covers_the_split_once(tmp_path, document_width
     """The documents packed for validation are read once, without the
     training stream's repeat, so the pass finishes and scores each document
     once."""
-    documents = [list(range(i, i + document_width)) for i in range(10, 10 + 10 * document_width, document_width)]
+    documents = [list(range(i, i + document_width))
+                 for i in range(10, 10 + 10 * document_width, document_width)]
     _document_dir(tmp_path, documents)
     data = _packed_tokens(tmp_path, seq_len=8, packing_bins=2).load(batch=2)
 
