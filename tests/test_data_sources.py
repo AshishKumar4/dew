@@ -130,6 +130,63 @@ def test_hub_native_shards_keep_the_requested_revision(monkeypatch, format):
     assert native.format == format
 
 
+@pytest.mark.parametrize("revision,native", [(None, True), ("original", True), (None, False)])
+def test_hub_shard_capability_and_urls_list_each_revision_once(monkeypatch, revision, native):
+    from types import SimpleNamespace
+
+    from huggingface_hub import HfApi
+    from huggingface_hub.hf_api import GitRefInfo, GitRefs
+
+    from dew.data.sources import Hub
+
+    listed = []
+
+    def listing(self, repo, *, repo_type, revision):
+        listed.append(revision)
+        if not native and revision == "original":
+            return ["train.tar"]
+        return ["train-1.parquet", "train-0.parquet"]
+
+    conversion = GitRefInfo(name="parquet", ref="refs/convert/parquet", target_commit="converted")
+    monkeypatch.setattr(HfApi, "dataset_info", lambda self, repo, **kwargs: SimpleNamespace(sha="original"))
+    monkeypatch.setattr(HfApi, "list_repo_files", listing)
+    monkeypatch.setattr(HfApi, "list_repo_refs",
+                        lambda self, repo, **kwargs: GitRefs(branches=[], converts=[conversion], tags=[]))
+    source = Hub("owner/data", revision=revision)
+    commit = "original" if native else "converted"
+    assert source.supports("streamed")
+    assert source.streamed == commit
+    assert source.files.url == tuple(f"hf://datasets/owner/data@{commit}/train-{index}.parquet"
+                                     for index in range(2))
+    assert source.files.format == "parquet"
+    assert source.supports("streamed")
+    assert listed == (["original"] if native else ["original", "converted"])
+
+
+@pytest.mark.parametrize("revision", [None, "original"])
+def test_hub_refuses_streaming_when_the_chosen_revision_has_no_shards_of_the_split(monkeypatch, revision):
+    from types import SimpleNamespace
+
+    from huggingface_hub import HfApi
+    from huggingface_hub.hf_api import GitRefInfo, GitRefs
+
+    from dew.data import Pipeline, compile
+    from dew.data.sources import Hub
+
+    conversion = GitRefInfo(name="parquet", ref="refs/convert/parquet", target_commit="converted")
+    monkeypatch.setattr(HfApi, "dataset_info", lambda self, repo, **kwargs: SimpleNamespace(sha="original"))
+    monkeypatch.setattr(HfApi, "list_repo_files", lambda self, repo, **kwargs: ["default/test/0000.parquet"])
+    monkeypatch.setattr(HfApi, "list_repo_refs",
+                        lambda self, repo, **kwargs: GitRefs(branches=[], converts=[conversion], tags=[]))
+    source = Hub("owner/data", revision=revision)
+    assert not source.supports("streamed")
+    assert source.streamed is None
+    with pytest.raises(FileNotFoundError, match="split 'train'"):
+        _ = source.files
+    with pytest.raises(ValueError, match=r"read='streamed' is unavailable"):
+        compile(Pipeline(source).batch(2), read="streamed", loading=Loading(workers=0))
+
+
 def test_tfds_source_metadata_and_decoder_identity_need_no_data_scan():
     import tensorflow_datasets as tfds
 

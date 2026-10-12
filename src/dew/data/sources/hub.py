@@ -50,45 +50,46 @@ class Hub:
             self.repo, name=self.config, revision=self.commit, cache_dir=self.cache_dir
         )
 
-    @cached_property
+    @property
     def streamed(self) -> str | None:
-        """The immutable revision the split's shards are streamed from, pinned
-        once, so the shard URLs name the same files on every read. It is
-        the resolved commit, or for the default revision when that commit
-        holds no native Parquet, Arrow or JSONL files of the split, the commit
-        its Parquet conversion (refs/convert/parquet) holds. The conversion
-        moves on its own, so its shard URLs name that commit. A
-        repo with neither has no shards to stream, and its split is read only
-        from prepared Arrow."""
+        """The pinned commit with readable shards of this split, or None.
+        Native shards come from the resolved commit. An unpinned default
+        revision without native shards can read its Parquet conversion."""
+        return None if self._selection is None else self._selection[0]
+
+    @cached_property
+    def _selection(self) -> tuple[str, tuple[str, ...], Format] | None:
         from huggingface_hub import HfApi
 
-        if self.revision is not None or self._selected(self.commit)[0]:
-            return self.commit
-        converts = HfApi().list_repo_refs(self.repo, repo_type="dataset").converts
-        return next((ref.target_commit for ref in converts if ref.ref == "refs/convert/parquet"), None)
+        revision = self.commit
+        paths, format = self._selected(revision)
+        if not paths and self.revision is None:
+            converts = HfApi().list_repo_refs(self.repo, repo_type="dataset").converts
+            conversion = next(
+                (ref.target_commit for ref in converts if ref.ref == "refs/convert/parquet"), None
+            )
+            if conversion is not None and conversion != revision:
+                revision = conversion
+                paths, format = self._selected(revision)
+        return (revision, tuple(sorted(paths)), format) if paths else None
 
     @cached_property
     def files(self) -> Files:
-        revision = self.streamed
-        if revision is None:
-            raise FileNotFoundError(
-                f"HF {self.repo!r}@{self.commit} split {self.split!r} has no native Parquet, Arrow or "
-                "JSONL files and the repo no Parquet conversion; provision=True and read it indexed"
-            )
-        paths, format = self._selected(revision)
-        if not paths and self.revision is not None:
-            raise FileNotFoundError(
-                f"HF {self.repo!r}@{self.commit} split {self.split!r} "
-                "has no native Parquet, Arrow or JSONL files; "
-                "pin the converted branch's own commit explicitly, "
-                "or provision=True for Arrow at this revision"
-            )
-        if not paths:
+        selection = self._selection
+        if selection is None:
+            if self.revision is not None:
+                raise FileNotFoundError(
+                    f"HF {self.repo!r}@{self.commit} split {self.split!r} "
+                    "has no native Parquet, Arrow or JSONL files; "
+                    "pin the converted branch's own commit explicitly, "
+                    "or provision=True for Arrow at this revision"
+                )
             raise FileNotFoundError(
                 f"HF {self.repo!r} split {self.split!r} has no physical readable shards; "
-                "name an hf:// Parquet URL or explicitly provision Arrow"
+                "name an hf:// Parquet URL or provision=True and read it indexed"
             )
-        urls = tuple(f"hf://datasets/{self.repo}@{revision}/{path}" for path in sorted(paths))
+        revision, paths, format = selection
+        urls = tuple(f"hf://datasets/{self.repo}@{revision}/{path}" for path in paths)
         return Files(urls, format=format)
 
     def _selected(self, revision: str) -> tuple[list[str], Format]:
