@@ -205,7 +205,7 @@ class Files(Dataset):
     def describe(self) -> str:
         return f"files:{self.kind}:{self.url}"
 
-    def snapshot(self) -> Mapping[str, object]:
+    def fingerprint(self) -> Mapping[str, object]:
         return self._snapshot
 
     @cached_property
@@ -291,7 +291,7 @@ class Files(Dataset):
         if self.kind not in ("jsonl", "text", "csv"):
             raise ValueError(f"{self.describe()} has no provisionable offset index")
         stores = [Store(url, self.storage_options).resolve() for url in self.paths]
-        preparing(self, sum(fs.size(path) for fs, path in stores), "an offset index beside each file")
+        preparing(self, sum(fs.size(path) or 0 for fs, path in stores), "an offset index beside each file")
         for url in self.paths:
             fs, path = Store(url, self.storage_options).resolve()
             offsets = []
@@ -1045,7 +1045,7 @@ class TokenFiles(Dataset):
             facts["tokens"] = facts[f"{self.split}_tokens"]
         return {**facts, "token_store": True}
 
-    def snapshot(self) -> Mapping[str, object]:
+    def fingerprint(self) -> Mapping[str, object]:
         documents, indexed = self.document_index.resolve()
         boundaries = {"documents": documents.ukey(indexed)} if documents.exists(indexed) else {}
         if isinstance(self.tokens, (TokenRecords, TokenShards)):
@@ -1059,7 +1059,7 @@ class TokenFiles(Dataset):
                 "chunk_tokens": self.chunk_tokens,
                 "shards": Files(
                     self.tokens.paths, format="array_record", storage_options=self.storage_options
-                ).snapshot(),
+                ).fingerprint(),
                 "index": fs.ukey(path) if fs.exists(path) else None,
                 "shard_rows": self.tokens.shard_rows if isinstance(self.tokens, TokenRecords) else None,
                 "producer": Files(self.url, storage_options=self.storage_options).committed,

@@ -26,7 +26,7 @@ def test_hub_builder_uses_the_resolved_commit_and_named_configuration(tmp_path, 
     source = Hub("acme/records", split="validation", name="named", revision="release", cache_dir="arrow")
     assert source.builder is expected
     assert requested == [("acme/records", {"name": "named", "revision": "frozen", "cache_dir": "arrow"})]
-    assert source.snapshot() == {"store": "hf", "repo": "acme/records", "revision": "frozen",
+    assert source.fingerprint() == {"store": "hf", "repo": "acme/records", "revision": "frozen",
                                  "config": "named", "split": "validation"}
 
 
@@ -55,10 +55,10 @@ def test_a_split_prepared_in_two_caches_is_one_snapshot_and_one_plan(tmp_path, m
     sources = [Hub("acme/records", revision="frozen", cache_dir=cache) for cache in builders]
     plans = [compile(Pipeline(source).batch(2), loading=Loading(workers=0)).plan for source in sources]
     unprepared = Hub("acme/records", revision="frozen", cache_dir=str(tmp_path / "third"))
-    assert sources[0].snapshot() == sources[1].snapshot()
+    assert sources[0].fingerprint() == sources[1].fingerprint()
     assert plans[0] is not None and plans[1] is not None
     assert plans[0].record() == plans[1].record()
-    assert unprepared.snapshot() == sources[0].snapshot()
+    assert unprepared.fingerprint() == sources[0].fingerprint()
 
 
 def test_a_split_with_no_shards_and_no_conversion_reads_indexed_but_not_streamed(tmp_path, monkeypatch):

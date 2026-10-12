@@ -87,7 +87,7 @@ class Torch(Dataset):
     def describe(self) -> str:
         return f"torch:{self.identity or repr(TorchRecords(self.dataset, self.fields))}:{self.fields}"
 
-    def snapshot(self) -> Mapping[str, object]:
+    def fingerprint(self) -> Mapping[str, object]:
         return {
             "store": "torch",
             "identity_required": True,

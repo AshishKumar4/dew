@@ -26,7 +26,7 @@ class Grain(Dataset):
     def describe(self) -> str:
         return f"grain:{self.name}"
 
-    def snapshot(self) -> Mapping[str, object]:
+    def fingerprint(self) -> Mapping[str, object]:
         return {"store": "grain", "name": self.name, **self.metadata()}
 
     def supports(self, read: Read) -> bool:

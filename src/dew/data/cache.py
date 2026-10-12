@@ -204,7 +204,7 @@ class Cache:
         transform: Transform | None = None,
     ) -> _CachedMap:
         self._root(key)
-        snapshot = source.snapshot()
+        snapshot = source.fingerprint()
         if snapshot.get("identity_required") is True and snapshot.get("identity") is None:
             raise ValueError(f"cache source {source.describe()} needs an explicit content identity")
         return _CachedMap(parent, self, key, source, transform)
@@ -1121,7 +1121,7 @@ class _GenerationSource:
     def describe(self) -> str:
         return f"generation:{self.generation.url}"
 
-    def snapshot(self) -> Mapping[str, object]:
+    def fingerprint(self) -> Mapping[str, object]:
         return {
             "store": "generation",
             "uri": self.generation.url,

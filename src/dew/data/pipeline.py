@@ -7,7 +7,7 @@ import inspect
 import itertools
 import math
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from typing import TYPE_CHECKING, Concatenate, Literal, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Concatenate, Literal, Protocol, cast, runtime_checkable
 
 import grain.python as pygrain
 import numpy as np
@@ -356,7 +356,11 @@ class Dataset:
 
     def then(self, *stages: Stage) -> Pipeline:
         """This dataset with `stages` after its own."""
-        return Pipeline(self, stages)
+        return dataclasses.replace(self.chain(), stages=(*self.chain().stages, *stages))
+
+    def chain(self) -> Pipeline:
+        """This dataset as a store and its stages, a store's being none."""
+        return Pipeline(cast("Source", self))
 
     def holdout(self, fraction: float | None = None, *, key: str | None = None, records: int | None = None,
                 split: str | None = None, **named: float) -> tuple[Dataset, ...]:
@@ -379,7 +383,7 @@ class Dataset:
 
     def named(self, name: str) -> Pipeline:
         """This dataset under `name`, which its counts log under in a mix."""
-        chain = self if isinstance(self, Pipeline) else Pipeline(self)
+        chain = self.chain()
         return dataclasses.replace(chain, name=name)
 
     def pipe[**Options](self, stages: Callable[Concatenate[Dataset, Options], Dataset],
@@ -400,9 +404,11 @@ class Dataset:
         if self.batched:
             if batched:
                 raise ValueError("after batch, map already reads the training batch")
-            return self.then(*(MapBatch(step, identity) for step in steps))
+            return self.then(*(MapBatch(cast("HostStep", step), identity) for step in steps))
         if batched:
-            return self.then(*(Batched(step, batch_size, identity) for step in steps))
+            return self.then(*(Batched(cast("Callable[[dict[str, list]], dict[str, Sequence]]", step),
+                                       batch_size,
+                                       identity) for step in steps))
         for step in steps:
             if isinstance(step, pygrain.RandomMapTransform):
                 raise TypeError(f"{_named_step(step)} draws from a generator; apply it with random_map")
@@ -460,8 +466,10 @@ class Dataset:
         `batched`, it reads `batch_size` records at a time as a dict of columns
         and returns columns of any length, the records that replace them."""
         if batched:
-            return self.then(Batched(step, batch_size, identity, same_rows=False))
-        return self.then(FlatMap(step, identity))
+            return self.then(Batched(cast("Callable[[dict[str, list]], dict[str, Sequence]]", step),
+                                     batch_size,
+                                     identity, same_rows=False))
+        return self.then(FlatMap(cast("Expansion", step), identity))
 
     @property
     def batched(self) -> bool:
@@ -565,7 +573,7 @@ class Dataset:
         run that reads the snapshot resumes exactly. Returns the manifest."""
         from dew.data.sinks import export
 
-        chain = self if isinstance(self, Pipeline) else Pipeline(self)
+        chain = self.chain()
         return export(chain, url, format=format, rows_per_shard=rows_per_shard)
 
     def rename_columns(self, names: Mapping[str, str]) -> Pipeline:
@@ -595,32 +603,32 @@ class Dataset:
         """The counts a run logs, from a fresh reader's first `records`
         records: attempted, accepted, and dropped by reason, per source."""
         from dew.data.compile import compile
-        from dew.data.dataset import DataPartition
+        from dew.data.dataset import Closeable, DataPartition
 
-        chain = self if isinstance(self, Pipeline) else Pipeline(self)
+        chain = self.chain()
         if any(isinstance(stage, (BatchStage, TokenBudget)) for stage in chain.stages):
             raise ValueError("stats counts records; take them before the batch")
-        loader = compile(chain.repeat().batch(1), read=chain.mode, **_loading(chain))
+        loader = compile(chain.repeat().batch(1), read=chain.mode, provision=True, loading=chain.loading)
         reader = loader.train(DataPartition())
         try:
             for _ in range(records):
                 next(reader)
             return dict(loader.statistics())
         finally:
-            reader.close()
+            cast("Closeable", reader).close()
 
     def read(self, mode: Read) -> Pipeline:
         """Read the stores this way, rather than as they prefer: "memory" holds
         every record and runs the deterministic steps once, "indexed" reads by
         index, "streamed" reads shards in order."""
-        chain = self if isinstance(self, Pipeline) else Pipeline(self)
+        chain = self.chain()
         return dataclasses.replace(chain, mode=mode)
 
     def threads(self, count: int) -> Pipeline:
         """Read with `count` threads a worker, rather than the measured default."""
         from dew.data.dataset import Loading
 
-        chain = self if isinstance(self, Pipeline) else Pipeline(self)
+        chain = self.chain()
         loading = chain.loading or Loading()
         return dataclasses.replace(chain, loading=dataclasses.replace(
             loading, threads=count, read_buffer=max(loading.read_buffer, count)))
@@ -629,19 +637,20 @@ class Dataset:
         """This dataset's records, or its batches where it batches, read as a
         run reads them: one pass, or endlessly after a `repeat`."""
         from dew.data.compile import validation
-        from dew.data.dataset import DataPartition
+        from dew.data.dataset import Closeable, DataPartition, Loading
         from dew.objectives.base import VALID_ROWS
 
-        chain = self if isinstance(self, Pipeline) else Pipeline(self)
+        chain = self.chain()
         batched = any(isinstance(stage, (BatchStage, TokenBudget)) for stage in chain.stages)
-        reader = validation(chain if batched else chain.batch(1, drop_remainder=False), batch=1,
-                            read=chain.mode, provision=True, **_loading(chain))(DataPartition())
+        read = chain if batched else chain.batch(1, drop_remainder=False)
+        reader = validation(read, batch=1, read=chain.mode, provision=True,
+                            loading=chain.loading or Loading())(DataPartition())
         try:
             for batch in reader:
                 yield batch if batched else {
                     name: value[0] for name, value in batch.items() if name != VALID_ROWS}
         finally:
-            reader.close()
+            cast("Closeable", reader).close()
 
     def show(self, count: int = 8) -> None:
         """Print the first `count` records."""
@@ -664,6 +673,9 @@ class Pipeline(Dataset):
 
     def then(self, *stages: Stage) -> Pipeline:
         return dataclasses.replace(self, stages=(*self.stages, *stages))
+
+    def chain(self) -> Pipeline:
+        return self
 
 
 @dataclasses.dataclass(frozen=True)
@@ -698,11 +710,7 @@ def concat(datasets: Sequence[Dataset]) -> Pipeline:
 
     if any(isinstance(dataset, Pipeline) for dataset in datasets):
         raise ValueError("concat joins stores; add the steps after it, or mix datasets that have steps")
-    return Pipeline(Concatenate(tuple(datasets)))
-
-
-def _loading(chain: Pipeline) -> dict[str, Loading]:
-    return {} if chain.loading is None else {"loading": chain.loading}
+    return Pipeline(Concatenate(tuple(cast("Source", dataset) for dataset in datasets)))
 
 
 def _shown(value: object) -> object:
@@ -732,7 +740,7 @@ def mix(datasets: Sequence[Dataset], weights: Sequence[float] | None = None, *,
     shares = (1.0,) * len(datasets) if weights is None else tuple(float(weight) for weight in weights)
     if len(shares) != len(datasets):
         raise ValueError(f"mix has {len(datasets)} datasets and {len(shares)} weights")
-    chains = tuple(dataset if isinstance(dataset, Pipeline) else Pipeline(dataset) for dataset in datasets)
+    chains = tuple(dataset.chain() for dataset in datasets)
     return Pipeline(Mixture(chains, shares, tokens))
 
 

@@ -70,9 +70,9 @@ class Memory(Dataset):
         return cls.from_arrow(frame.toArrow())
 
     def describe(self) -> str:
-        return f"memory:{self.identity or self.snapshot()['sha256']}"
+        return f"memory:{self.identity or self.fingerprint()['sha256']}"
 
-    def snapshot(self) -> Mapping[str, object]:
+    def fingerprint(self) -> Mapping[str, object]:
         rows = self.records("indexed")
         return {
             "store": "memory",

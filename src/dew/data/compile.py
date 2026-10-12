@@ -117,7 +117,7 @@ class _Facts:
     def describe(self) -> str:
         return self.source.describe()
 
-    def snapshot(self) -> Mapping[str, object]:
+    def fingerprint(self) -> Mapping[str, object]:
         return self.stated_snapshot
 
     def metadata(self) -> Mapping[str, object]:
@@ -157,7 +157,7 @@ def _pin_sources(pipelines: Sequence[Pipeline], read: Read) -> tuple[Pipeline, .
         source = _consumed(source, read)
         if read == "memory":
             source.records(read)
-        return _Facts(source, read, source.snapshot(), source.metadata())
+        return _Facts(source, read, source.fingerprint(), source.metadata())
 
     with ThreadPoolExecutor(max_workers=min(8, max(1, len(sources)))) as readers:
         pinned = dict(zip(sources, readers.map(pin, sources.values()), strict=True))
@@ -373,7 +373,7 @@ def compile(
     host: tuple[HostStep, ...] = (),
     objective: ObjectiveData | None = None,
     read: Read | None = None,
-    provision: bool = True,
+    provision: bool = False,
     loading: Loading | None = None,
     seed: int = 0,
     rejections: Literal["drop", "mask"] = "drop",
@@ -465,7 +465,7 @@ def _compiled(
     )
     sources = [source for _, source in _leaves(original)]
     manifest = _manifest(
-        {"sources": [source.snapshot() for source in sources]},
+        {"sources": [source.fingerprint() for source in sources]},
         sources,
         (
             *(_identity(stage) for stage in _steps(original) if not isinstance(stage, (Workers, Prefetch))),

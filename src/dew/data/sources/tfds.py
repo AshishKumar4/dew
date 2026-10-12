@@ -236,7 +236,7 @@ class TFDS(Dataset):
     def describe(self) -> str:
         return f"tfds:{self.name}/{self.config}:{self.version}:{self.split}:{self.path}"
 
-    def snapshot(self) -> Mapping[str, object]:
+    def fingerprint(self) -> Mapping[str, object]:
         from dew.data.storage import Store
 
         directory = str(self.builder.data_path)
@@ -373,7 +373,7 @@ class TFDS(Dataset):
                 f"{self.describe()} has no prepared ArrayRecord data; "
                 "run dew data provision or set provision=True"
             )
-        self.snapshot()
+        self.fingerprint()
         rows = self.builder.as_data_source(self.split, decoders=self.decoders)
         import grain.python as grain
 

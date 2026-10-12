@@ -60,12 +60,12 @@ class _Memory:
     def describe(self) -> str:
         return self.original.describe()
 
-    def snapshot(self) -> Mapping[str, object]:
+    def fingerprint(self) -> Mapping[str, object]:
         """The rows as a memory read made them: the source it read, the
         derived order facts and the steps it ran, by what they compute. The
         manifest records those steps' modules in its environment."""
         return {
-            "materialized": self.original.snapshot(),
+            "materialized": self.original.fingerprint(),
             "derived": self.derived,
             "steps": [_identity(stage).semantic() for stage in self.ran],
         }

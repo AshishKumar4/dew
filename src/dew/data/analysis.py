@@ -268,7 +268,7 @@ def _manifest(
 
 def _cache_manifest(source: Source, prefix: Sequence[Stage], read: Read) -> Manifest:
     return _manifest(
-        source.snapshot(),
+        source.fingerprint(),
         (source,),
         tuple(_identity(stage, cache=True) for stage in prefix),
         fill={"read": read, "row_ids": "sharded" if read == "streamed" else "indexed"},

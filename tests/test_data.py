@@ -1207,7 +1207,7 @@ class _Lazy:
     def describe(self):
         return describe(self.values)
 
-    def snapshot(self):
+    def fingerprint(self):
         return {"source": describe(self.values), "records": len(self.values)}
 
     def supports(self, read):

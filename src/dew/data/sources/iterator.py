@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
+from typing import Any, cast
 
 import grain.python as grain
 import numpy as np
@@ -36,7 +37,7 @@ class Iterated(Dataset):
     def describe(self) -> str:
         return f"iter:{self.name}"
 
-    def snapshot(self) -> Mapping[str, object]:
+    def fingerprint(self) -> Mapping[str, object]:
         return {"store": "iterator", "name": self.name}
 
     def supports(self, read: Read) -> bool:
@@ -78,16 +79,16 @@ class _StreamIterator(grain.DatasetIterator):
         self._read = 0
 
     def __next__(self) -> Batch:
-        row = _record(next(self._rows))
+        row = cast("Batch", _record(next(self._rows)))
         self._read += 1
         return row
 
-    def get_state(self) -> dict:
+    def get_state(self) -> dict[str, Any]:
         if self._source.state is None:
             return {"read": self._read}
         return {"read": self._read, "state": self._source.state(self._rows)}
 
-    def set_state(self, state: dict) -> None:
+    def set_state(self, state: Mapping[str, Any]) -> None:
         self._rows, self._read = self._source.factory(), 0
         if self._source.load_state is not None:
             self._source.load_state(self._rows, state["state"])
