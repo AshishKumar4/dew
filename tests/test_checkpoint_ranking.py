@@ -246,7 +246,9 @@ def test_aggregate_never_reuses_missing_metrics_and_preserves_first_tracker(tmp_
     run = trainer(tmp_path / 'run')
     from dew.training import EvalSuite
     from dew.training.trainer import _FitPlan
-    plan = _FitPlan(data(), 1, 1, 1, 1, None, [first, second], preview=False,
+    plan = _FitPlan(data(), steps=1, log_every=1, eval_every=1, total_tokens=None,
+                    checkpoint_every=1, checkpoint_final=True, local_every=None,
+                    metrics=[first, second], preview=False,
                     best=(Best(lambda m: m[first] - m[second]), Best(second, mode='max', split='val')),
                     suites={'val': EvalSuite(data().val, (first, second), 1)})
     ranks = run._ranking(plan, {'val/second': .5})
