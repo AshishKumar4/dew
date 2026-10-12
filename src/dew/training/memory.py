@@ -34,13 +34,12 @@ COLLECTIVES = {
     'xla_gpu_all_reduce_combine_threshold_bytes': 1 << 30,
     'xla_gpu_all_gather_combine_threshold_bytes': 1 << 30,
     'xla_gpu_reduce_scatter_combine_threshold_bytes': 1 << 27,
-    'xla_gpu_enable_while_loop_double_buffering': True,
     'xla_gpu_enable_all_gather_combine_by_dim': False,
     'xla_gpu_enable_reduce_scatter_combine_by_dim': False,
 }
 """NVIDIA JAX-Toolbox's collective options for a GPU step over several devices: the scheduler overlaps
-each collective with compute, the collectives combine into few large ones, and the layer loop double
-buffers them. Measured in docs/performance.md, "Collectives over several GPUs"."""
+each collective with compute, and the collectives combine into few large ones. Measured in
+docs/performance.md, "Collectives over several GPUs"."""
 
 
 def step_compiler_options(objective, tokens: float, frozen: bool,
