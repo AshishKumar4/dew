@@ -97,7 +97,12 @@ def backbone(source, revision: str | None, dtype: str):
                      if "language_model" in tree}
     if not isinstance(model, CausalTransformer) or not model.tie_embeddings:
         raise RuntimeError("expected the tied-embedding Qwen3.5 text backbone")
-    return model.clone(remat=None), variables
+    # The checkpoint's prediction depth (MTP) is no part of the backbone torch trains: its block would add
+    # 20.5M parameters the step only carries and updates.
+    depths = {f"mtp_{depth}" for depth in range(model.num_nextn_predict_layers)}
+    variables = {collection: {name: value for name, value in tree.items() if name not in depths}
+                 for collection, tree in variables.items()}
+    return model.clone(remat=None, num_nextn_predict_layers=0), variables
 
 
 def build(args):
