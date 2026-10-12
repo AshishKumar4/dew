@@ -72,7 +72,7 @@ jobs:
           constraints.txt
     - name: Install dependencies
       run: |
-        uv pip install --system torch torchvision --index-url https://download.pytorch.org/whl/cpu
+        sh tools/install_host_torch.sh --system
         uv pip install --system flake8 -e ".[$EXTRAS]" -c constraints.txt
     - name: Lint with flake8
       run: |
@@ -126,7 +126,7 @@ jobs:
           constraints.txt
     - name: Install dependencies
       run: |
-        uv pip install --system torch torchvision --index-url https://download.pytorch.org/whl/cpu
+        sh tools/install_host_torch.sh --system
         # pyright resolves every import in src/dew, the optional readers' included.
         uv pip install --system -e ".[$EXTRAS]" -c constraints.txt
     - name: Type check
