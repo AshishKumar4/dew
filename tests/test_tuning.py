@@ -108,7 +108,8 @@ def test_a_steps_launches_take_pins_stored_picks_and_heuristics(tmp_path):
                    "XLA_FLAGS": "--xla_gpu_experimental_autotune_cache_mode=AUTOTUNE_CACHE_MODE_READ"}
     store = textwrap.dedent("""
         import json, os, tokamax
-                path = cache.kernel_picks_path(tokamax.AutotuningResult.loads(TEXT).device_kind)
+        from dew import cache
+        path = cache.kernel_picks_path(tokamax.AutotuningResult.loads(TEXT).device_kind)
         os.makedirs(os.path.dirname(path), exist_ok=True)
         open(path, "w").write(TEXT)
         print(json.dumps(path))

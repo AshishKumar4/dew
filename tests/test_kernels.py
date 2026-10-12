@@ -133,33 +133,25 @@ def test_cudnn_trains_odd_lengths_and_agrees_with_xla(q_len, kv_len, causal,
         assert np.abs(got - want).max() <= 2 ** -6 * np.abs(want).max()
 
 
-@pytest.mark.parametrize("installed, call, chosen", [
-    (True, {}, "triton"),
-    (True, {"causal": True}, "triton"),
-    (True, {"sliding_window": 64, "causal": True}, "cudnn"),
-    (True, {"sliding_window": 64}, "xla"),
-    (False, {"sliding_window": 64}, "xla"),
-    (True, {"bias": jnp.zeros((1, 1, 128, 128), jnp.bfloat16)}, "cudnn"),
-    (True, {"mask": jnp.ones((1, 1, 128, 128), bool)}, "cudnn"),
-    (False, {}, "cudnn"),
-    (True, {"head_dim": 128}, "cudnn"),
+@pytest.mark.parametrize("call, chosen", [
+    ({}, "triton"),
+    ({"causal": True}, "triton"),
+    ({"sliding_window": 64, "causal": True}, "cudnn"),
+    ({"sliding_window": 64}, "xla"),
+    ({"bias": jnp.zeros((1, 1, 128, 128), jnp.bfloat16)}, "cudnn"),
+    ({"mask": jnp.ones((1, 1, 128, 128), bool)}, "cudnn"),
+    ({"head_dim": 128}, "cudnn"),
 ])
-def test_auto_sends_a_plain_cudnn_call_to_tokamax_when_it_is_installed(monkeypatch, installed, call,
-                                                                        chosen, without_deterministic_ops):
+def test_auto_sends_a_plain_cudnn_call_to_tokamax(monkeypatch, call, chosen, without_deterministic_ops):
     """Where cudnn's kernel runs, 'auto' takes tokamax's Pallas-Triton kernel
-    for heads up to 64 wide and a call with no window, mask or bias, if
-    tokamax is installed: the calls it measured faster on
-    (`triton_runs`). Anything else stays on cudnn, except a bidirectional
-    window, which cudnn cannot take (`window_sides`) and xla does."""
-    from importlib import util
-
+    for heads up to 64 wide and a call with no window, mask or bias: the
+    calls it measured faster on (`triton_runs`). Anything else stays on
+    cudnn, except a bidirectional window, which cudnn cannot take
+    (`window_sides`) and xla does."""
     from dew.nn import attention
     monkeypatch.setattr(jax, 'default_backend', lambda: 'gpu')
     monkeypatch.setattr(attention, 'bf16_dot_runs', lambda: True)
-    found = util.find_spec
     # dew_flash_attn, which 'auto' prefers on an A100, is out of this test.
-    monkeypatch.setattr(util, 'find_spec', lambda name: object() if name == 'tokamax' and installed
-                        else None if name == 'tokamax' else found(name))
     monkeypatch.setattr(attention, 'flash_architectures', lambda: None)
     query = jnp.zeros((1, 128, 4, call.pop("head_dim", 64)), jnp.bfloat16)
     assert attention.resolve_implementation('auto', query, query, **call) == chosen
