@@ -23,7 +23,7 @@ from dew.records import integer
 if TYPE_CHECKING:
     from dew.data.cache import Cache, Generation
     from dew.data.sources.files import Format
-from dew.data.sources.base import Read, Shard, ShardManifest, Source
+from dew.data.sources.base import Read, Shard, ShardManifest, Source, _consumed
 from dew.data.steps.chat import ConfigurePrompt, PreferencePair, RenderChat
 from dew.data.steps.generic import Formatting
 from dew.data.steps.image import ConfigureImage, DeviceAugment, EncodeCaptions, ImageRecord
@@ -106,6 +106,9 @@ class _SliceRecords:
     start: int
     stop: int | None = None
 
+    def consumed(self, read: Read) -> _SliceRecords:
+        return dataclasses.replace(self, source=_consumed(self.source, read))
+
     def describe(self) -> str:
         return f"{self.source.describe()}[{self.start}:{self.stop}]"
 
@@ -153,6 +156,9 @@ class _HashSource:
     source: Source
     fraction: float
     held: bool
+
+    def consumed(self, read: Read) -> _HashSource:
+        return dataclasses.replace(self, source=_consumed(self.source, read))
 
     def describe(self) -> str:
         return f"{self.source.describe()} hash holdout={self.fraction},held={self.held}"
@@ -210,6 +216,9 @@ class _RandomSource:
     source: Source
     split: HoldOut
     held: bool
+
+    def consumed(self, read: Read) -> _RandomSource:
+        return dataclasses.replace(self, source=_consumed(self.source, read))
 
     def describe(self) -> str:
         return f"{self.source.describe()} random holdout={self.split!r},held={self.held}"
@@ -544,6 +553,11 @@ class Prompts:
 class _PromptFacts:
     source: Source
     width: int | None
+
+    def consumed(self, read: Read) -> _PromptFacts:
+        consumed = dataclasses.replace(self, source=_consumed(self.source, read))
+        consumed._measured.update(self._measured)
+        return consumed
 
     @functools.cached_property
     def _measured(self) -> dict[str, int]:

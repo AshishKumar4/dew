@@ -10,7 +10,7 @@ import grain.python as grain
 import numpy as np
 
 from dew.data.dataset import Records
-from dew.data.sources.base import Read, Shard, ShardManifest, Source
+from dew.data.sources.base import Read, Shard, ShardManifest, Source, _consumed
 
 
 @dataclasses.dataclass(frozen=True)
@@ -23,6 +23,9 @@ class Concatenate:
 
     def describe(self) -> str:
         return "concatenate[" + ",".join(source.describe() for source in self.sources) + "]"
+
+    def consumed(self, read: Read) -> Concatenate:
+        return dataclasses.replace(self, sources=tuple(_consumed(source, read) for source in self.sources))
 
     def snapshot(self) -> Mapping[str, object]:
         return {"concatenate": [source.snapshot() for source in self.sources]}

@@ -13,7 +13,7 @@ import numpy as np
 from dew import records
 from dew.data.pipeline import Configured, HostStep, Pipeline
 from dew.data.recipes import HoldOut, SourceValue, Split, Validation, _branches, _named_split, source_argument
-from dew.data.sources.base import Read, ShardManifest, Source
+from dew.data.sources.base import Read, ShardManifest, Source, _consumed
 from dew.decision.questions import Choice, Question
 from dew.records import JSON, json_value, record
 
@@ -152,6 +152,12 @@ class _DecisionSource:
     slots: Mapping[str, int] | None = None
     table: ParseTable | None = None
     descriptor: Mapping[str, object] = field(default_factory=dict)
+
+    def consumed(self, read: Read) -> "_DecisionSource":
+        consumed = dataclasses.replace(self, source=_consumed(self.source, read))
+        consumed._classes[:] = self._classes
+        consumed._facts.update(self._facts)
+        return consumed
 
     def describe(self) -> str:
         return self.source.describe()
