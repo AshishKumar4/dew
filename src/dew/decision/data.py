@@ -11,8 +11,9 @@ from typing import Annotated
 import numpy as np
 
 from dew import records
+from dew.config.data import HoldOut, SourceValue, Split, Validation, _branches, source_argument
+from dew.data.holdout import _named_split
 from dew.data.pipeline import Configured, HostStep, Pipeline, mix
-from dew.data.recipes import HoldOut, SourceValue, Split, Validation, _branches, _named_split, source_argument
 from dew.data.sources.base import Read, ShardManifest, Source, _consumed
 from dew.decision.questions import Choice, Question
 from dew.records import JSON, json_value, record

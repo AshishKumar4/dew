@@ -23,7 +23,7 @@ from dew.cache import dew_cache_dir
 from dew.data.pipeline import Dataset
 
 from ..dataset import Records
-from .base import Read, Shard, ShardManifest
+from .base import Read, Shard, ShardManifest, preparing
 
 if TYPE_CHECKING:  # tensorflow_datasets is imported on use, not at import
     from tensorflow_datasets import DecoderTree
@@ -292,6 +292,7 @@ class TFDS(Dataset):
 
     def provision(self) -> TFDS:
         if self.remote:
+            preparing(self, None, self.directory)
             self._mirror()
             return self
         if self.path is not None:
@@ -299,6 +300,7 @@ class TFDS(Dataset):
                 f"TFDS {self.name!r} path={self.path!r} is read-only; prepare that directory "
                 "with TFDS or omit path to use Dew's preparation directory"
             )
+        preparing(self, None, os.path.join(dew_cache_dir(), "tfds"))
         prepared(self.name, config=self.config, version=self.version)
         return self
 

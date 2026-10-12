@@ -18,6 +18,7 @@ revision, each file's size and ETag).
 from __future__ import annotations
 
 import dataclasses
+import logging
 from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
 
@@ -47,6 +48,12 @@ class Shard:
     start: int = 0
     stop: int | None = None
     rows: int | None = None
+
+
+def preparing(source: Source, size: int | None, into: str) -> None:
+    """Log the one line a source logs as it prepares a read: what, how large, and where."""
+    stated = "size not stated" if size is None else f"{size / 2**20:.1f} MiB"
+    logging.getLogger("dew.data").warning("preparing %s (%s) into %s", source.describe(), stated, into)
 
 
 @dataclasses.dataclass(frozen=True)

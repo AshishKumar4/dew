@@ -114,3 +114,10 @@ class Torch(Dataset):
 
     def lengths(self) -> np.ndarray | None:
         return None
+
+
+def from_torch(dataset: TorchDataset, fields: tuple[str, ...] | None = None,
+               name: str | None = None) -> Torch:
+    """A map-style `torch.utils.data.Dataset` as a Dew dataset, its samples
+    named by `fields` where they are tuples, under `name` (`Torch`)."""
+    return Torch(dataset, fields, identity=name)

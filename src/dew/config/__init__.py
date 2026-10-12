@@ -46,10 +46,12 @@ import dew.io
 from dew import registry
 from dew.cache import default_compilation_cache_dir, dew_cache_dir
 from dew.checkpoints import RUN_FILE, Checkpoints, Keep
+from dew.config.data import Augment, HoldOut, ImageData, RunData, loader
 from dew.config.sweep import RandomSearch, Search, Space, read_ledger, write_ledger
 from dew.coordination import agree_process_phase, agreed
-from dew.data import Augment, HoldOut, Images, Loader, Loading, Ramp, Read, Recipe, load
-from dew.data.dataset import Reader, ramped, record_argument
+from dew.data import Loading
+from dew.data.dataset import Loader, Ramp, Reader, ramped, record_argument
+from dew.data.sources.base import Read
 from dew.files import write_atomically
 from dew.lora import AdapterRecord, LoRA
 from dew.objectives.base import Effects, Loss, Metric, Objective
@@ -106,7 +108,7 @@ if TYPE_CHECKING:
     # tyro reads the runtime annotation, a Union of the aliased specs, and a
     # type checker cannot read a variable in a type expression. Both get what
     # they need: the base class statically, the union at runtime.
-    type DataSpec = Recipe
+    type DataSpec = RunData
     type ScheduleSpec = ScheduleBase
 else:
     DataSpec = datasets.union
@@ -914,7 +916,7 @@ class RunConfig:
     subcommand its flags imply."""
 
     model: ModelConfig = dataclasses.field(default_factory=ModelConfig)
-    data: DataSpec = dataclasses.field(default_factory=lambda: Images(
+    data: DataSpec = dataclasses.field(default_factory=lambda: ImageData(
         source="tfds://oxford_flowers102", split="all", augment=Augment(flip=True, jitter=True),
         caption_templates=("a photo of a {}",), validation=HoldOut(records=128)))
     data_read: Read | None = None
@@ -1086,7 +1088,7 @@ class RunConfig:
         return value
 
     @classmethod
-    def load(cls, directory: str, *, trust: Sequence[str] = ()) -> Self:
+    def loader(cls, directory: str, *, trust: Sequence[str] = ()) -> Self:
         """Read the run a directory's `run.json` records, or the file itself,
         as the class it names, which must be this one or derive from it.
         `trust` names the packages outside Dew the record may import."""
@@ -1119,7 +1121,7 @@ class RunConfig:
             raise ValueError(f"{type(self).__name__} builds the objective it names around its whole model; "
                              "name an objective, and train an adapter as a kind of run that attaches one")
         objective = self.objective.build(model=self.model.build())
-        dataset = load(self.data, batch=self.trainer.batch_size, tokens=self.trainer.batch_tokens,
+        dataset = loader(self.data, batch=self.trainer.batch_size, tokens=self.trainer.batch_tokens,
                        read=self.data_read,
                        provision=self.provision, seed=self.data_seed, loading=self.loading,
                        validation_records=self.validation_records, objective=objective.data())
@@ -1204,7 +1206,7 @@ class RunConfig:
             raise ValueError(
                 f"--trainer.batch-size is {self.trainer.batch_size} and this dataset "
                 f"reads {dataset.batch} records a step; load it with "
-                f"load(batch={self.trainer.batch_size})")
+                f"loader(batch={self.trainer.batch_size})")
         if dataset.batch_tokens != self.trainer.batch_tokens:
             raise ValueError(f"dataset.batch_tokens is {dataset.batch_tokens}, but trainer.batch_tokens is "
                              f"{self.trainer.batch_tokens}; compile data with the trainer's token budget")

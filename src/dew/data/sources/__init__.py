@@ -12,9 +12,10 @@ from dew.data.dataset import Batch
 from .base import Read, Shard, ShardManifest, Source
 from .files import Files, Format, TokenFiles
 from .grain import Grain, from_grain
+from .hf import HF, from_hf
 from .hub import Hub
 from .memory import Memory
-from .pytorch import Torch
+from .pytorch import Torch, from_torch
 from .tfds import TFDS
 
 
@@ -70,6 +71,7 @@ def source(
 
 
 __all__ = [
+    "HF",
     "TFDS",
     "Files",
     "Grain",
@@ -82,4 +84,6 @@ __all__ = [
     "TokenFiles",
     "Torch",
     "from_grain",
+    "from_hf",
+    "from_torch",
 ]

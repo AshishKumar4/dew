@@ -39,7 +39,7 @@ _unpartition_gpu_pool()
 
 if TYPE_CHECKING:  # the surface above, with its types, for checkers and editors
     from dew.artifacts import ImageGrid, Representations, TextSamples, TokenScores, VideoGrid
-    from dew.data import Loader
+    from dew.data.dataset import Loader
     from dew.diffusion import Process
     from dew.eval import Mean
     from dew.inference import pipeline
