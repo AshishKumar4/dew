@@ -548,6 +548,15 @@ class Laid:
         return {"image": np.resize(np.asarray(element["text"]), (2, 4))}
 
 
+def test_a_nested_mixture_counts_its_epoch_from_each_part():
+    """A mixture of a corpus and a mixture ends its epoch when the first of its
+    parts comes round, the inner mixture counted the same way: the inner one
+    of 8 and 4 rows at even weights in 16, the outer of 12 and 16 in 32."""
+    inner = Pipeline(source(8)).mix(Pipeline(source(4)), weights=(1, 1))
+    nested = Pipeline(source(12)).mix(inner, weights=(1, 1))
+    assert compile(nested.batch(2), loading=READ).records == 32
+
+
 def test_the_saved_order_names_the_stages_a_memory_read_ran_as_an_indexed_read_does():
     """The canonical order a resume checks is the pipeline as written,
     whichever read runs its packing. A memory read packs before it orders,

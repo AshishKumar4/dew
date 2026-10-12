@@ -711,25 +711,26 @@ class _Build:
 def _epoch_records(train: Pipeline, build: _Build) -> int | None:
     """The records in one epoch of a global order: each corpus's indexed order
     up to its first repeat, as the lowering builds it, so a slice, a limit and
-    a token split count exactly; a mixture reads until its first corpus would
-    come round."""
+    a token split count exactly; a mixture, nested or not, reads until its
+    first part would come round."""
     if not build.global_order:
         return None
 
-    def counted(leaf: Pipeline) -> int | None:
-        at = _until(leaf.stages, (Repeat, Group))
-        rows, _ = build.records(dataclasses.replace(leaf, stages=leaf.stages[:at]), DataPartition())
+    def counted(pipeline: Pipeline) -> int | None:
+        source = pipeline.source
+        if isinstance(source, Mixture):
+            sizes = [counted(child) for child in source.pipelines]
+            known = [size for size in sizes if size is not None]
+            if len(known) != len(sizes):
+                return None
+            weights = _weights(source)
+            shares = zip(known, weights, strict=True)
+            return max(math.ceil(size * sum(weights) / weight) for size, weight in shares)
+        at = _until(pipeline.stages, (Repeat, Group))
+        rows, _ = build.records(dataclasses.replace(pipeline, stages=pipeline.stages[:at]), DataPartition())
         return len(rows) if isinstance(rows, pygrain.MapDataset) else None
 
-    source = train.source
-    if not isinstance(source, Mixture):
-        return counted(train)
-    counts = [counted(child) for child in source.pipelines if not isinstance(child.source, (Mixture, Phases))]
-    sizes = [count for count in counts if count is not None]
-    if len(sizes) != len(counts):
-        return None
-    weights = _weights(source)
-    return max(math.ceil(size * sum(weights) / weight) for size, weight in zip(sizes, weights, strict=True))
+    return counted(train)
 
 
 def _weights(mixture: Mixture) -> Sequence[float]:
