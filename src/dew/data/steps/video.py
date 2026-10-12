@@ -32,7 +32,8 @@ class DecodeClip(grain.RandomMapTransform):
     to: str = "video"
     audio_padding: int | None = None
     sample_rate: int = 16_000
-    rejects = True
+    rejects: bool = True
+    """Whether a clip that does not decode is dropped (`filter_map`) rather than an error."""
 
     def random_map(self, element: Batch, rng: np.random.Generator) -> Batch | Rejected:
         from dew.data.sources.av_utils import read_av_random_clip, read_random_frames
@@ -51,6 +52,8 @@ class DecodeClip(grain.RandomMapTransform):
                                                         sample_rate=self.sample_rate, fps=self.fps)
                     sound = {"audio": audio}
         except (OSError, ValueError):
+            if not self.rejects:
+                raise
             return Rejected("undecodable")
         # The decoded frames replace the clip they came from.
         kept = {key: value for key, value in element.items() if key != self.field}

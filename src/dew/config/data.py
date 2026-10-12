@@ -463,10 +463,12 @@ class VideoData:
         prefix = Pipeline(source).map(_VideoRow(self.caption)).stages
         train, held = _branches(source, self.validation, split=self.split, prefix=prefix)
         audio = video.audio(self.audio_model)
-        decoder = video.decode_clip(self.frames, size=self.frame_size, audio_padding=self.audio_padding,
-                                    sample_rate=audio.processor.sampling_rate)
-        train = train.filter_map(decoder).map(audio)
-        held = None if held is None else held.filter_map(decoder).map(audio)
+        # A listed clip that does not decode is an error, as it always was here, so the run knows its count.
+        decoder = dataclasses.replace(video.decode_clip(
+            self.frames, size=self.frame_size, audio_padding=self.audio_padding,
+            sample_rate=audio.processor.sampling_rate), rejects=False)
+        train = train.random_map(decoder).map(audio)
+        held = None if held is None else held.random_map(decoder).map(audio)
         return train, held, (EncodeCaptions(),)
 
 
