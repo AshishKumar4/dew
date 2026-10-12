@@ -1138,18 +1138,21 @@ FOLDED_PAIRS = 16
 
 def folds(query, key, bias, mask, causal, sliding_window) -> bool:
     """Whether an xla call goes to `folded_attention`: on a GPU, a call of
-    few query positions over keys of the query's heads, masked by key
-    lengths at most, such as a decode step's grouped query
-    (`CausalSelfAttention._decode_attention`) where cudnn does not run."""
+    few query positions over keys of the query's heads, masked at most by a
+    mask every head shares (key lengths are one), such as a decode step's
+    grouped query (`CausalSelfAttention._decode_attention`) where cudnn does
+    not run."""
     return (generation.backend() == 'gpu' and query.shape[-2] == key.shape[-2]
             and query.shape[-3] * key.shape[-2] <= FOLDED_PAIRS
-            and bias is None and mask is None and not causal and sliding_window is None)
+            and (mask is None or (mask.ndim == 4 and mask.shape[1] == 1))
+            and bias is None and not causal and sliding_window is None)
 
 
-def folded_attention(query, key, value, key_value_seq_lengths):
+def folded_attention(query, key, value, mask=None):
     """jax.nn's xla attention for query `[B, T, N, D]` over keys and values
     `[B, S, N, D]` of the same heads, with every query head against every
-    (key, head) pair.
+    (key, head) pair, under a boolean `mask` `[B, 1, T | 1, S]` every head
+    shares (key lengths come as the mask they mean, `with_key_lengths`).
 
     XLA's GPU products take each head's keys apart, so jax.nn's attention
     transposed the whole cache, keys and values, at every decode step where
@@ -1172,8 +1175,8 @@ def folded_attention(query, key, value, key_value_seq_lengths):
                         preferred_element_type=wide)
     logits = jnp.diagonal(logits.reshape(batch, positions, heads, keys, heads), axis1=2, axis2=4)
     logits = logits * jnp.asarray(1 / math.sqrt(width), wide)  # [B, T, S, N]
-    if key_value_seq_lengths is not None:
-        valid = jnp.arange(keys)[None, None, :, None] < key_value_seq_lengths[:, None, None, None]
+    if mask is not None:
+        valid = jnp.broadcast_to(mask[:, 0], (batch, positions, keys))[..., None]
         logits = jnp.where(valid, logits, jnp.asarray(-0.7 * jnp.finfo(jnp.float32).max, wide))
     probs = jax.nn.softmax(logits.astype(jnp.float32), axis=2).astype(value.dtype)
     # Each query head's probabilities over its own head's keys, zeros elsewhere.
@@ -1247,11 +1250,14 @@ def fused_attention(query, key, value, bias, mask, causal, sliding_window, imple
                              "Use attention_impl 'xla'.")
         attend = triton_attention if implementation == 'triton' else flash_attention
         out = attend(query, key, value, causal)
-    elif (implementation == 'xla' and folds(query, key, bias, mask, causal, sliding_window)
+    elif (implementation == 'xla' and mask is None and folds(query, key, bias, mask, causal, sliding_window)
           and key_value_seq_lengths is not None and decode_attention.fits(query, key)):
         out = decode_attention.attend(query, key, value, key_value_seq_lengths)
     elif implementation == 'xla' and folds(query, key, bias, mask, causal, sliding_window):
-        out = folded_attention(query, key, value, key_value_seq_lengths)
+        # Key lengths and the prefix mask they mean take one path here, so where no lengths-only
+        # kernel takes the call the two forms agree bitwise.
+        out = folded_attention(query, key, value, mask if key_value_seq_lengths is None
+                               else with_key_lengths(mask, key_value_seq_lengths, key.shape[-3]))
     elif implementation == 'xla':
         # A window of (l, r) keeps the l keys before the query and the r after
         # it on both the xla and the cudnn path, the sides `window_sides` counts.
