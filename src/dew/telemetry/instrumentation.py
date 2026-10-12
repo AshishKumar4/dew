@@ -74,7 +74,7 @@ _MAC = 2
 _CUSTOM_CALLS = (
     ("gemm", re.compile(r'^__cublas')),
     ("convolution", re.compile(r'^__cudnn\$conv')),
-    ("attention", re.compile(r'^__cudnn\$fmha|^dew_flash3?_mha')),
+    ("attention", re.compile(r'^__cudnn\$fmha|^dew_flash_mha')),
     ("triton", re.compile(r'^__gpu\$xla\.gpu\.triton$')),
 )
 
@@ -264,11 +264,10 @@ def _cudnn_convolution_flops(target: str, instruction: _Instruction,
     return _MAC * macs / (int(groups.group(1)) if groups else 1)
 
 
-_FLASH = {'dew_flash_mha_fwd': (0, False), 'dew_flash_mha_bwd': (1, True),
-          'dew_flash3_mha_fwd': (0, False), 'dew_flash3_mha_bwd': (1, True)}
-"""FlashAttention-2's and FlashAttention-3's calls (dew_flash_attn): where
-the query sits among each one's operands (the backward's first is the
-output's gradient), and whether it is the backward."""
+_FLASH = {'dew_flash_mha_fwd': (0, False), 'dew_flash_mha_bwd': (1, True)}
+"""FlashAttention-2's calls (dew_flash_attn): where the query sits among
+each one's operands (the backward's first is the output's gradient), and
+whether it is the backward."""
 
 
 def _fused_attention_flops(instruction: _Instruction, shapes: dict[str, tuple[int, ...]], *,
