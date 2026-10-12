@@ -467,30 +467,32 @@ class Conv(nn.Module):
 
 
 class GroupNorm(nn.Module):
-    def __init__(self, channels, groups=8, eps=1e-4):
+    def __init__(self, channels, groups=8, eps=1e-4, activation=None):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(channels))
         self.bias = nn.Parameter(torch.zeros(channels))
-        self.groups, self.eps = groups, eps
+        self.groups, self.eps, self.activation = groups, eps, activation
 
     def forward(self, x):
-        return F.group_norm(x.float(), self.groups, self.weight, self.bias, self.eps).to(BF16)
+        # Dew's GroupNorm activates its fp32 output before the one bf16 cast.
+        y = F.group_norm(x.float(), self.groups, self.weight, self.bias, self.eps)
+        return (y if self.activation is None else self.activation(y)).to(BF16)
 
 
 class ResidualBlock(nn.Module):
     def __init__(self, cin, cout, temb_features):
         super().__init__()
-        self.norm1 = GroupNorm(cin)
+        self.norm1 = GroupNorm(cin, activation=F.silu)
         self.conv1 = Conv(cin, cout)
         self.temb_projection = Linear(temb_features, cout)
-        self.norm2 = GroupNorm(cout)
+        self.norm2 = GroupNorm(cout, activation=F.silu)
         self.conv2 = Conv(cout, cout)
         self.residual_conv = Conv(cin, cout, k=1) if cin != cout else None
 
     def forward(self, x, temb):
-        h = self.conv1(F.silu(self.norm1(x)))
+        h = self.conv1(self.norm1(x))
         h = h + self.temb_projection(temb)[:, :, None, None]
-        h = self.conv2(F.silu(self.norm2(h)))
+        h = self.conv2(self.norm2(h))
         residual = x if self.residual_conv is None else self.residual_conv(x)
         return h + residual
 
@@ -577,7 +579,7 @@ class Unet(nn.Module):
                 ch = up_features
         self.pre_final = Conv(ch, depths[0])
         self.final_res = ResidualBlock(depths[0] + skips.pop(), depths[0], emb)
-        self.out_norm = GroupNorm(depths[0], eps=1e-6)  # flax GroupNorm default epsilon
+        self.out_norm = GroupNorm(depths[0], eps=1e-6, activation=F.silu)  # flax GroupNorm default epsilon
         self.out_conv = Conv(depths[0], 3)
 
     def forward(self, x, temb, textcontext):
@@ -609,7 +611,7 @@ class Unet(nn.Module):
         x = self.pre_final(x)
         x = torch.cat([x, downs.pop()], dim=1)
         x = self.final_res(x, temb)
-        x = F.silu(self.out_norm(x))
+        x = self.out_norm(x)
         x = self.out_conv(x)
         return x.permute(0, 2, 3, 1).float()  # back to NHWC, fp32 for the loss
 
