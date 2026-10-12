@@ -163,15 +163,11 @@ def test_tokamax_takes_the_calls_it_takes_before_flash(monkeypatch, generation, 
     kernel takes (heads up to 64 wide, no window, mask or bias) runs it, as
     fast as FlashAttention-2 on the A100 and faster on the L4, and a wider one
     runs FlashAttention-2."""
-    from importlib import util
-
     from dew.nn import attention
     monkeypatch.setattr(jax, 'default_backend', lambda: 'gpu')
     monkeypatch.setattr(attention, 'bf16_dot_runs', lambda: True)
     monkeypatch.setattr(kernels.generation, 'device_generation', lambda: generation)
     monkeypatch.setattr(attention, 'device_generation', lambda: generation)
-    found = util.find_spec
-    monkeypatch.setattr(util, 'find_spec', lambda name: object() if name == 'tokamax' else found(name))
     monkeypatch.setattr(attention, 'flash_architectures', lambda: ('sm80', 'sm120'))
     chosen = [attention.resolve_implementation('auto', query, query, causal=True)
               for query in (jnp.zeros((1, 128, 4, width), jnp.bfloat16) for width in (64, 128))]
@@ -219,16 +215,12 @@ def test_auto_sends_a_plain_call_to_flash_where_it_was_measured(monkeypatch, cap
     takes no wider, and a square causal mask if any. A call it turns down
     there logs why, once however often it is traced; on a device where it was
     not measured, nothing is logged."""
-    from importlib import util
-
     from dew.nn import attention
     monkeypatch.setattr(jax, 'default_backend', lambda: 'gpu')
     monkeypatch.setattr(attention, 'bf16_dot_runs', lambda: True)
     monkeypatch.setattr(kernels.generation, 'device_generation', lambda: generation)
     monkeypatch.setattr(attention, 'device_generation', lambda: generation)
     monkeypatch.setattr(kernels.generation, '_logged', set())
-    found = util.find_spec
-    monkeypatch.setattr(util, 'find_spec', lambda name: None if name == 'tokamax' else found(name))
     monkeypatch.setattr(attention, 'flash_architectures', lambda: installed)
     query = jnp.zeros((1, 128, 4, call.pop("head_dim", 128)), call.pop("dtype", jnp.bfloat16))
     key = jnp.zeros((1, call.pop("keys", 128), *query.shape[2:]), query.dtype)
