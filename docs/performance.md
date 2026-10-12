@@ -1038,6 +1038,13 @@ causal mask to the last key where jax.nn aligns it to the first. Its backward
 sums the query gradient with atomics, so a run with
 `--xla_gpu_deterministic_ops` stays off it.
 
+### FlashAttention-2 on the RTX PRO 6000, 2026-10-11
+
+At Qwen3.5's attention (B 2 and 4 x 3072 tokens, 16 query and 4 key heads of 256, causal bf16), where
+cuDNN refuses heads over 128, the wheel's sm120 build ran forward and backward in 3.27 and 6.32 ms
+against XLA's 9.84 and 19.34 on a G4, its float64 distances those of FlashAttention-2 in torch, so
+sm120's row names 'flash'.
+
 ### Splash's tiles on the TPU, 2026-10-02
 
 Splash attention took 34 ms of Dew's 156 ms Qwen3-0.6B step at 8 x 1024
