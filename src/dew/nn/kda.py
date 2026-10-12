@@ -51,9 +51,9 @@ from .sharding import logical_axes
 def chunk_kimi_delta_rule(query, key, value, g, beta, state=None, chunk_size: int = CHUNK_SIZE):
     """`chunk_kimi_delta_attention` (modeling_glm5_next.py:482-578): the
     chunked rule (`dew.nn.linear.chunk_delta_rule`) with `g` `[B, S, H, Dk]`,
-    a log decay per key dimension, on the XLA recurrence, as the Pallas
-    kernels decay per head."""
-    return chunk_delta_rule(query, key, value, g, beta, state, chunk_size, implementation='xla')
+    a log decay per key dimension, on the portable math: fla's port
+    (`dew.nn.kernels.fla_gdn`) decays per head."""
+    return chunk_delta_rule(query, key, value, g, beta, state, chunk_size)
 
 
 # q/k/v_proj and o_proj carry the attention mixer's declarations under the

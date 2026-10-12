@@ -10,13 +10,16 @@ import jax.numpy as jnp
 
 from dew.nn.kernels import fla_gdn
 
-TRAINING_SHAPES = {
+COMPILED_SHAPES = {
     "0.8b": {"batch": 8, "length": 3072, "key_heads": 16, "value_heads": 16,
              "width": 128, "columns": 128, "chunk": 64},
     "9b": {"batch": 4, "length": 3072, "key_heads": 16, "value_heads": 32,
            "width": 128, "columns": 128, "chunk": 64},
+    "wide keys": {"batch": 1, "length": 512, "key_heads": 2, "value_heads": 4,
+                  "width": 256, "columns": 128, "chunk": 64},
 }
-"""The training shapes every declared config compiles at; their widest heads are `fla_gdn.WIDEST`."""
+"""The shapes every declared config compiles at: the training shapes, whose heads are `fla_gdn.WIDEST`
+wide, and the widest keys the port takes in 16 bits (`fla_gdn.WIDEST_KEYS`)."""
 
 
 class KernelCase(NamedTuple):
@@ -60,14 +63,17 @@ def _case_call(kernel, config, shape, dtype, *, reverse=False):
 
 
 def kernel_cases(target: str) -> Iterator[KernelCase]:
-    """Each kernel at `target`'s configs for both dtypes and both training shapes, and the reverse
-    cumsum, for the compile test."""
+    """Each kernel at the config `target` runs it with (`fla_gdn.kernel_config`) for both dtypes at
+    each shape, and the reverse cumsum, for the compile test."""
     for (name, dtype), table in fla_gdn.CONFIGS.items():
         if name != target:
             continue
-        for kernel, config in table.items():
-            flags = "-".join(f"{key}{value}" for key, value in sorted(config.items()))
-            for shape_name, shape in TRAINING_SHAPES.items():
+        for kernel in table:
+            for shape_name, shape in COMPILED_SHAPES.items():
+                if shape["width"] > fla_gdn.WIDEST and dtype == "float32":
+                    continue
+                config = fla_gdn.kernel_config(kernel, shape, dtype, target=target)
+                flags = "-".join(f"{key}{value}" for key, value in sorted(config.items()))
                 for reverse in ((False, True) if kernel == "chunk_local_cumsum" else (False,)):
                     name = f"{target}/{kernel}/{dtype}/{flags}/{shape_name}" + "/reverse" * reverse
                     yield KernelCase(name, functools.partial(_case_call, kernel, config, shape, dtype,

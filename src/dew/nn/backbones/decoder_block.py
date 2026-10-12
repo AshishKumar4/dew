@@ -335,12 +335,16 @@ class BlockWiring:
 QKV_RESIDUALS = ('q_proj', 'k_proj', 'v_proj', 'kv_proj')
 ATTENTION_RESIDUALS = (*QKV_RESIDUALS, 'o_proj')
 MLP_RESIDUALS = ('gate_proj', 'up_proj', 'down_proj')
-RESIDUALS = (*ATTENTION_RESIDUALS, 'context', *MLP_RESIDUALS)
+DELTA_RESIDUALS = ('delta_decay', 'delta_inverse')
+RESIDUALS = (*ATTENTION_RESIDUALS, 'context', *DELTA_RESIDUALS, *MLP_RESIDUALS)
 """The values a block names as it runs, each after the projection that
 produced it: `kv_proj` is latent attention's fused `kv_b_proj`, `context`
-the attention kernel's output before `o_proj`, and the MLP names cover the
-dense MLP and the routed experts alike. A remat policy picks from these; a
-name off the list is a typo that would otherwise recompute silently."""
+the attention kernel's or the gated delta rule's output before `o_proj`,
+`delta_decay` and `delta_inverse` the rule's cumulated decay and chunk
+inverse the port saves for its backward (`dew.nn.kernels.fla_gdn`), and the
+MLP names cover the dense MLP and the routed experts alike. A remat policy
+picks from these; a name off the list is a typo that would otherwise
+recompute silently."""
 
 
 @dataclasses.dataclass(frozen=True)
