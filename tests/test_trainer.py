@@ -54,7 +54,7 @@ from dew.training import (
     trainer as trainer_module,
 )
 from dew.training.interval import Book, Interval
-from dew.training.optim import Cosine
+from dew.training.optim import Cosine, Power
 from dew.training.transaction import write_back
 
 
@@ -145,6 +145,14 @@ def test_a_real_token_budget_counts_each_microbatch_without_padding(log_every, a
 def test_a_token_budget_and_step_cap_stop_at_the_first_reached():
     state = make_trainer(objective=TokenRegression()).fit(Data(), steps=2, total_tokens=30)
     assert int(state.step) == 2
+
+
+@pytest.mark.parametrize("schedule", [None, Power(peak=.1, warmup_steps=2, a=.1, b=0),
+                                       Cosine(peak=.1, warmup_steps=1, decay_steps=8)])
+def test_a_token_only_run_uses_the_schedules_own_horizon(schedule):
+    config = OptimConfig(schedule=schedule)
+    state = make_trainer(objective=TokenRegression(), optimizer=config).fit(Data(), total_tokens=30)
+    assert int(state.step) == 3
 
 
 def test_a_token_budget_resumes_its_count_from_the_checkpoint(tmp_path):
