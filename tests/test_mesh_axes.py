@@ -816,3 +816,13 @@ custom_call_target="__cublas$gemm"
 }"""
     assert sharded.boundary_copies(text) == ["copy.1 -> cc", "cc -> transpose_fusion.2"]
 
+
+def test_an_async_collective_counts_its_results_not_its_operands():
+    """An async `-start` names `(operands, results)`; only the results are the collective's bytes."""
+    text = """  %ag = ((bf16[4,8]{1,0}), bf16[8,8]{1,0}) all-gather-start(bf16[4,8]{1,0} %x), dimensions={0}
+  %rs = (f32[16]{0}, f32[8]{0}) reduce-scatter-start(f32[16]{0} %y), dimensions={0}
+  %ar = f32[8]{0} all-reduce(f32[8]{0} %z), to_apply=%add"""
+    assert sharded.collectives(text) == [("all-gather", [(8, 8)]), ("reduce-scatter", [(8,)]),
+                                         ("all-reduce", [(8,)])]
+    assert sharded.collective_bytes(text, sharded.COLLECTIVE_OPS) == 128 + 32 + 32
+

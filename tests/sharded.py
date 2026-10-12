@@ -53,11 +53,25 @@ def assert_sharded(tree, mesh: jax.sharding.Mesh) -> None:
 COLLECTIVE_OPS = ("all-reduce", "all-gather", "reduce-scatter", "all-to-all", "collective-permute")
 COLLECTIVE = re.compile(
     r"^\s*(?:ROOT\s+)?%\S+\s+=\s+(?P<shape>.+?)\s+"
-    rf"(?P<op>{'|'.join(COLLECTIVE_OPS)})(?:-start)?\(")
+    rf"(?P<op>{'|'.join(COLLECTIVE_OPS)})(?P<start>-start)?\(")
 ARRAY = re.compile(r"[a-z]+\d*\[([\d,]*)\]")
 TYPED = re.compile(r"([a-z]+\d*)\[([\d,]*)\]")
 ITEMSIZE = {"pred": 1, "s8": 1, "u8": 1, "bf16": 2, "f16": 2, "f32": 4, "s32": 4, "u32": 4, "f64": 8,
             "s64": 8}
+
+
+def _result(match) -> str:
+    """A collective's result shape: an async `-start`'s is the last member of its `(operands,
+    results)` tuple (SwiftHeron's 8B FSDP step counted its all-gathers' inputs too, 1.5x)."""
+    shape = match["shape"]
+    if not match["start"]:
+        return shape
+    depth = 0
+    for index in range(len(shape) - 2, 0, -1):
+        depth += {")": 1, "]": 1, "}": 1, "(": -1, "[": -1, "{": -1}.get(shape[index], 0)
+        if depth == 0 and shape[index] == ",":
+            return shape[index + 1:-1]
+    return shape
 
 
 def collectives(text: str) -> list[tuple[str, list[tuple[int, ...]]]]:
@@ -67,7 +81,7 @@ def collectives(text: str) -> list[tuple[str, list[tuple[int, ...]]]]:
         match = COLLECTIVE.match(line)
         if match:
             shapes = [tuple(int(size) for size in dims.split(",") if size)
-                      for dims in ARRAY.findall(match["shape"])]
+                      for dims in ARRAY.findall(_result(match))]
             found.append((match["op"], shapes))
     return found
 
@@ -80,7 +94,7 @@ def collective_bytes(text: str, ops) -> int:
         match = COLLECTIVE.match(line)
         if match and match["op"] in ops:
             total += sum(ITEMSIZE[dtype] * math.prod(int(size) for size in dims.split(",") if size)
-                         for dtype, dims in TYPED.findall(match["shape"]))
+                         for dtype, dims in TYPED.findall(_result(match)))
     return total
 
 
