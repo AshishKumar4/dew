@@ -535,24 +535,19 @@ def test_recurrent_state_macs_are_algorithm_independent_and_scan_aware(kind):
         assert counted == 4 * batch * length * channels * key
 
 
-@pytest.mark.parametrize("model,padding_work", [
-    (GatedDeltaNet(8, 2, 2, 4, 3), 0), (KimiDeltaAttention(8, 2, 4), 0),
-    (Mamba(8, 16, state_size=3, chunk_size=1), 0),
-    (Mamba2(8, 2, 4, state_size=3, chunk_size=1), 2 * 2 * 14 * 4 * 3),
-    (MultiHeadLatentAttention(8, 2, 16, 4, 3, 2, 2, 3, causal=False, attention_impl="reference"), 0),
+@pytest.mark.parametrize("model", [
+    GatedDeltaNet(8, 2, 2, 4, 3), KimiDeltaAttention(8, 2, 4), Mamba(8, 16, state_size=3, chunk_size=1),
+    Mamba2(8, 2, 4, state_size=3, chunk_size=1),
+    MultiHeadLatentAttention(8, 2, 16, 4, 3, 2, 2, 3, causal=False, attention_impl="reference"),
 ])
-def test_remaining_recurrent_and_latent_modules_match_token_paths(model, padding_work):
-    """One-token recurrence has no chunk-prep products.
-
-    Mamba-2 computes throwaway convolution outputs over K-1 padded history
-    positions, before slicing. That exact 2*B*conv_features*K*(K-1) jaxpr
-    overhead is not MFU; model plus it must equal the full traced product
-    count, with no tolerance to hide a missing learned projection.
-    """
+def test_remaining_recurrent_and_latent_modules_match_token_paths(model):
+    """One-token recurrence has no chunk-prep products, and the convs
+    compute no outputs over their zero history: the model's count is the
+    full traced product count, with no tolerance to hide a missing learned
+    projection."""
     x = jnp.ones((2, 1, 8))
     variables = model.init(jax.random.key(202), x)
-    assert model.model_flops(np.array([1, 1])) + padding_work == forward_products(
-        model.apply, variables, x, state_mac=True)
+    assert model.model_flops(np.array([1, 1])) == forward_products(model.apply, variables, x, state_mac=True)
 
 
 @pytest.mark.parametrize("kind", ["sparse", "gpt_oss", "gemma4"])

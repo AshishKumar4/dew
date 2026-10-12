@@ -37,7 +37,7 @@ import jax.numpy as jnp
 from flax import linen as nn
 
 from dew.diffusion.process import Denoiser
-from dew.nn.linear import _compensated_add
+from dew.nn.precision import compensated_add
 
 Predict = Callable[[jax.Array, jax.Array], tuple[jax.Array, jax.Array]]
 # A step's index in its walk: traced inside the walk's scan, a Python int at
@@ -244,7 +244,7 @@ def _projected_components(direction, output):
     floor = jnp.ldexp(jnp.asarray(1e-24, dtype), -2 * output_exponent)
 
     def summed(left, right):
-        high, low = jax.lax.reduce(_product_pair(left, right), (zero, zero), _compensated_add, axes)
+        high, low = jax.lax.reduce(_product_pair(left, right), (zero, zero), compensated_add, axes)
         return high.reshape(shape), low.reshape(shape)
 
     numerator, numerator_lo = summed(vector, conditioned)
@@ -253,12 +253,12 @@ def _projected_components(direction, output):
     denominator = jnp.maximum(denominator, floor)
     quotient = numerator / denominator
     product, product_lo = _product_pair(quotient, denominator)
-    residual, residual_lo = _compensated_add(
+    residual, residual_lo = compensated_add(
         (numerator, numerator_lo), (-product, -product_lo - quotient * denominator_lo))
     correction = (residual + residual_lo) / denominator
     parallel, parallel_lo = _product_pair(quotient, conditioned)
     parallel_lo = parallel_lo + correction * conditioned
-    orthogonal, orthogonal_lo = _compensated_add((vector, jnp.zeros_like(vector)), (-parallel, -parallel_lo))
+    orthogonal, orthogonal_lo = compensated_add((vector, jnp.zeros_like(vector)), (-parallel, -parallel_lo))
     orthogonal = jnp.ldexp(orthogonal + orthogonal_lo, vector_exponent).astype(output.dtype)
     parallel = jnp.ldexp(parallel + parallel_lo, vector_exponent).astype(output.dtype)
     return orthogonal, parallel

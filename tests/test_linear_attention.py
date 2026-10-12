@@ -43,6 +43,7 @@ from dew.nn.linear import (
     _stream_order,
     causal_conv1d,
     chunk_decay,
+    chunk_delta_rule,
     chunk_gated_delta_rule,
     held_conv1d,
     l2norm,
@@ -103,6 +104,13 @@ def test_the_chunked_rule_matches_the_reference(reference):
     assert largest(state, reference["chunk.state"]) < 1e-5
 
 
+def portable(query, key, value, g, beta, state=None):
+    """The gated rule on the portable math (`chunk_delta_rule`), the port of
+    `torch_chunk_gated_delta_rule` a GPU does not run: it runs fla's kernels,
+    held to fla's numbers (tests/test_fla_gdn.py)."""
+    return chunk_delta_rule(query, key, value, g[..., None], beta, state)
+
+
 def test_the_chunked_rule_rounds_as_close_to_float64_as_the_reference(reference):
     """The same 70 tokens against the chunked rule evaluated in float64: Dew's
     fp32 output and final state within twice the RMS distance of
@@ -111,11 +119,10 @@ def test_the_chunked_rule_rounds_as_close_to_float64_as_the_reference(reference)
     and 1.05 (state)."""
     rule_inputs = operands(reference)
     with jax.default_matmul_precision("highest"):
-        out, state = chunk_gated_delta_rule(*rule_inputs)
+        out, state = portable(*rule_inputs)
     cpu = jax.devices("cpu")[0]
     with jax.enable_x64(new_val=True), jax.default_device(cpu):
-        truth, truth_state = chunk_gated_delta_rule(
-            *(jax.device_put(np.asarray(x, np.float64), cpu) for x in rule_inputs))
+        truth, truth_state = portable(*(jax.device_put(np.asarray(x, np.float64), cpu) for x in rule_inputs))
 
     assert_as_exact_as_the_reference(out, reference["chunk.output"], truth, "output")
     assert_as_exact_as_the_reference(state, reference["chunk.state"], truth_state, "state")
@@ -599,7 +606,7 @@ def test_a_decay_deep_in_a_chunk_keeps_its_own_precision():
 
 def test_the_chunked_rule_holds_with_aligned_keys():
     """Keys nearly aligned within a chunk, beta near one and slow decay, the
-    case real checkpoints reach: the chunked rule still gives the
+    case real checkpoints reach: the chunked math still gives the
     token-by-token recurrence's output."""
     rng = np.random.default_rng(0)
     B, S, H, D = 1, 128, 2, 16
@@ -613,7 +620,7 @@ def test_the_chunked_rule_holds_with_aligned_keys():
     beta = 0.99 + 0.01 * rng.random((B, S, H))
     query, key, value, g, beta = (jnp.asarray(x, jnp.float32) for x in (query, key, value, g, beta))
     want, want_state = recurrent_gated_delta_rule(query, key, value, g, beta)
-    got, state = chunk_gated_delta_rule(query, key, value, g, beta)
+    got, state = portable(query, key, value, g, beta)
     np.testing.assert_allclose(got, want, atol=2e-4)
     np.testing.assert_allclose(state, want_state, atol=2e-4)
 
