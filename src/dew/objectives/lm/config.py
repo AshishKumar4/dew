@@ -90,12 +90,13 @@ class LMRunConfig(RunConfig):
         The files decide the vocabulary; training and sampling decide the
         context, since generation decodes into a cache sized once at build
         time. A `pretrained` checkpoint decides the architecture instead, and
-        the run records it as the commit it was read at. The record holds the
-        model's fields as built, vocabulary and context included, so
-        `dew.pipeline` rebuilds it. An adapter binds to the model and the tree
-        training starts from, the loaded weights or a fresh draw from the
-        run's key, so the objective trains its factors alone. Perplexity scores
-        each validation pass.
+        the run records it as the commit it was read at. A fresh model records
+        its vocabulary and context; a fine-tune records only its model choices,
+        since the source supplies its geometry on every load. The objective's
+        inference record holds the built model for `dew.pipeline`. An adapter
+        binds to the model and the tree training starts from, the loaded weights
+        or a fresh draw from the run's key, so the objective trains its factors
+        alone. Perplexity scores each validation pass.
         """
         tokens = self.tokens()
         written, vocab_size = token_vocabulary(tokens)
@@ -124,9 +125,8 @@ class LMRunConfig(RunConfig):
         else:
             source, run = self.pretrained_source(written, vocab_size, context)
             model, fields = source.model, dict(source.model_config)
-        if kind == "block_diffusion":
-            fields["max_seq_len"] = model.max_seq_len
-        run = dataclasses.replace(run, model=dataclasses.replace(self.model, fields=fields))
+        if source is None:
+            run = dataclasses.replace(run, model=dataclasses.replace(self.model, fields=fields))
         variables = None if source is None else source.variables
         if self.lora is not None:
             if source is None:
