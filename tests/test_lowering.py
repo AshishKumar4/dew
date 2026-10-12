@@ -16,7 +16,6 @@ from jax.sharding import Mesh
 from dew.nn.kernels.generation import (
     PALLAS_CHOICES,
     TARGETS,
-    UNLOWERABLE,
     assumed,
     backend,
     bf16_dot_runs,
@@ -133,11 +132,9 @@ def test_a_kernel_traced_for_an_assumed_gpu_lowers_to_a_named_triton_call():
 
 # The Triton kernels each Pallas choice a KERNELS row can name lowers to, by their `pallas_call` names,
 # and the probe that runs them: the Clef recipe's step (tools/clef_step.py), or an expert layer's
-# forward and backward (`_experts_lowered`). None for a kernel whose Triton lowering no CPU reaches
-# (`dew.nn.kernels.generation.UNLOWERABLE`).
+# forward and backward (`_experts_lowered`).
 FAMILIES = {
     ('grouped_matmul', 'pallas'): ("experts", {"pallas_triton_ragged_dot", "tgmm_ragged_dot"}),
-    ('tokamax_grouped_matmul', 'triton'): ("experts", None),
     ('rms_norm', 'pallas'): ("step", {"rms_norm_forward", "rms_norm_backward"}),
     ('swiglu', 'pallas'): ("step", {"swiglu_forward", "swiglu_backward"}),
     ('gated_delta_rule', 'fla'): ("step", {"fla_chunk_local_cumsum", "fla_kkt_solve", "fla_recompute_w_u",
@@ -167,7 +164,6 @@ def test_every_pallas_choice_a_row_names_has_a_lowering_probe():
     named = {(choice, kernel) for target in TARGETS.values() for choice, kernel in target.kernels.items()
              if kernel in PALLAS_CHOICES}
     assert named <= set(FAMILIES), sorted(named - set(FAMILIES))
-    assert {key for key, (_, names) in FAMILIES.items() if names is None} == set(UNLOWERABLE)
 
 
 @pytest.mark.parametrize("generation", ["sm80", "sm120"])
@@ -236,15 +232,3 @@ def test_an_expert_layer_lowers_for_the_gpu_with_the_grouped_matmul_its_generati
     expected = set().union(*(FAMILIES[key][1] for key in chosen(generation, "experts")
                              if key[0] == 'grouped_matmul'))
     assert set(triton_kernels(_experts_lowered(generation, 'auto'))) == expected
-
-
-@pytest.mark.parametrize("generation", [generation for generation in GPUS
-                                        if 'tokamax_grouped_matmul' in dict(chosen(generation, "experts"))])
-def test_tokamax_lowers_for_the_gpu_its_row_names(generation):
-    """'tokamax', an opt-in implementation 'auto' never takes, names its Triton kernel per generation;
-    tokamax registers that kernel only on a host with a GPU, so a CPU's dry run skips it, and the
-    kernel lab's verify on the GPU runs it (tests/test_moe.py)."""
-    api = pytest.importorskip("tokamax._src.ops.ragged_dot.api")
-    if 'triton' not in api.IMPLEMENTATIONS:
-        pytest.skip("tokamax registers its Triton ragged dot only where a GPU is present")
-    assert triton_kernels(_experts_lowered(generation, 'tokamax'))
