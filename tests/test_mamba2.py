@@ -243,7 +243,7 @@ def test_the_decode_state_is_a_fixed_size(reference, geometry):
         geometry["num_heads"] * geometry["head_dim"] + 2 * geometry["n_groups"] * geometry["state_size"]
     )
     assert jax.tree.map(jnp.shape, mutated["cache"]) == {
-        "conv_state": (2, conv_dim, geometry["conv_kernel"] - 1),
+        "conv_state": (2, geometry["conv_kernel"] - 1, conv_dim),
         "ssm_state": (2, geometry["num_heads"], geometry["head_dim"], geometry["state_size"])}
 
 

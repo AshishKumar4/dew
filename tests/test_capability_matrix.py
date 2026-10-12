@@ -102,6 +102,9 @@ from dew.registry import models, objectives
 from dew.sampling import Euler, Sampling
 from dew.training import Trainer
 
+# CI runs this file in tasks of its own: torchax renames torch's privateuse1 backend process-wide.
+pytestmark = pytest.mark.torchax
+
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "hf"
 
 ROWS = 8

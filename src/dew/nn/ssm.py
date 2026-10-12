@@ -14,7 +14,7 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from .conv import Conv
-from .flops import projection_flops, real_lengths
+from .flops import conv_flops, projection_flops
 from .precision import at_least_fp32
 
 
@@ -275,7 +275,7 @@ class SpatialFusionConv(nn.Module):
     def model_flops(self, lengths) -> float:
         """Each depthwise filter has the same taps per real spatial position."""
         taps = self.kernel_size**2 * len(self.dilations)
-        return float(real_lengths(lengths).sum()) * 2 * self.features * taps
+        return conv_flops(lengths, self.features, self.features, taps, groups=self.features)
 
     @nn.compact
     def __call__(self, y_2d):

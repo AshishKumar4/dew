@@ -1,10 +1,12 @@
 """Reporting persists real results and releases owned sinks on failures."""
 
+import dataclasses
 import io
 import json
 import math
 import subprocess
 import sys
+from contextlib import nullcontext
 
 import jax
 import numpy as np
@@ -13,9 +15,11 @@ import pytest
 from affine_run import TimingRegression as Regression, batches
 from PIL import Image
 
-from dew.artifacts import ImageGrid, Representations, TextSamples, TokenScores, VideoGrid
+import dew.artifacts
+from dew.artifacts import Decisions, ImageGrid, Representations, TextSamples, TokenScores, VideoGrid
 from dew.data import Dataset
-from dew.telemetry.records import RunRecord, json_value
+from dew.pool import PREEMPTED_EXIT
+from dew.telemetry.records import FitEnded, RunRecord, json_value
 from dew.training import Checkpoints, LocalTracker, Trackers, Trainer
 
 
@@ -56,6 +60,47 @@ def test_journals_do_not_touch_recipe_config_and_preserve_metadata(tmp_path):
         json_value({'device-array': np.ones(2)})
 
 
+def decisions() -> Decisions:
+    """Two rows of two questions over three options: row 0 asks both, with known answers 2 and 0; row 1
+    asks one with no known answer, and its second question has no options."""
+    probabilities = np.array([[[0.1, 0.2, 0.7], [0.6, 0.3, 0.1]], [[0.3, 0.3, 0.4], [1 / 3] * 3]], np.float32)
+    options = np.array([[[True] * 3, [True] * 3], [[True] * 3, [False] * 3]])
+    return Decisions(probabilities=probabilities, options=options, labels=np.array([[2, 0], [1, 0]]),
+                     ordinal=np.zeros((2, 2), bool), scored=np.array([[True, True], [False, True]]))
+
+
+def builtin_artifacts() -> list:
+    """One of each artifact type Dew defines."""
+    return [ImageGrid(np.zeros((1, 8, 8, 3)), ('image',)), VideoGrid(np.zeros((1, 2, 8, 8, 3)), ('clip',)),
+            TextSamples(np.array([[1, 2]]), texts=('text',)),
+            Representations(np.ones((2, 3)), np.array([0, 1])),
+            TokenScores(np.ones((2, 3)), np.ones((2, 3)), correct=np.zeros((2, 3), dtype=bool)), decisions()]
+
+
+def test_every_tracker_renders_every_artifact_type_dew_defines():
+    """A tracker shows a preview of any of Dew's types (`dew.artifacts.Artifact`), and an objective's
+    default preview is its scoring artifact: a type some tracker cannot render stops a run that previews
+    it, as a decision run reporting to W&B did. Each renderer registry covers every type."""
+    from dew.training.tracker import _summarize, _write_preview, render
+
+    defined = {value for value in vars(dew.artifacts).values()
+               if isinstance(value, type) and dataclasses.is_dataclass(value)
+               and value.__module__ == 'dew.artifacts'}
+    assert {type(artifact) for artifact in builtin_artifacts()} == defined
+    for registry in (render, _write_preview, _summarize):
+        assert defined <= set(registry.registry), sorted(t.__name__ for t in defined - set(registry.registry))
+
+
+def test_a_decision_preview_shows_each_scored_question_with_its_prediction():
+    pytest.importorskip('wandb')
+    from dew.training.tracker import render
+
+    table = render(decisions())['val/decisions']
+    assert table.columns == ['row', 'question', 'label', 'predicted', 'p_label']
+    assert [row[:4] for row in table.data] == [[0, 0, 2, 2], [0, 1, 0, 0]]
+    assert [row[4] for row in table.data] == pytest.approx([0.7, 0.6])
+
+
 def test_all_builtin_previews_have_local_representations(tmp_path):
     with LocalTracker(tmp_path) as tracker:
         tracker.artifact(ImageGrid(np.zeros((1, 8, 8, 3)), ('image',)), 1)
@@ -66,9 +111,13 @@ def test_all_builtin_previews_have_local_representations(tmp_path):
             TokenScores(np.ones((2, 3)), np.ones((2, 3)), correct=np.zeros_like(np.ones((2, 3)), dtype=bool)),
             1,
         )
+        tracker.artifact(decisions(), 1)
     entries = records(tmp_path)
     assert {e['type'] for e in entries} == {
-        'ImageGrid', 'VideoGrid', 'TextSamples', 'Representations', 'TokenScores'}
+        'ImageGrid', 'VideoGrid', 'TextSamples', 'Representations', 'TokenScores', 'Decisions'}
+    saved = {name: np.load(path) for name, path in ((p.name, p) for p in tmp_path.glob('*.npz'))}
+    assert any('probabilities' in archive and archive['labels'].tolist() == [[2, 0], [1, 0]]
+               for archive in saved.values())
     image = Image.open(next(tmp_path.glob('*.png')))
     assert image.size == (8, 8) and np.asarray(image)[0, 0].tolist() == [128, 128, 128]
     payloads = [json.loads(p.read_text()) for p in tmp_path.glob('*.json')]
@@ -255,6 +304,57 @@ def mlflow_store(tmp_path, monkeypatch):
     return (tmp_path / 'mlruns').as_uri()
 
 
+@pytest.fixture
+def tracked_runs(tmp_path, monkeypatch):
+    import wandb
+    from test_publish import TrackedRun
+
+    from dew.training import MLflowTracker, WandbTracker
+
+    run = TrackedRun()
+    monkeypatch.setattr(wandb, 'init', lambda **_: run)
+    mlflow = MLflowTracker('dew-outcomes', uri=mlflow_store(tmp_path, monkeypatch))
+    return run, mlflow, Trackers(WandbTracker('dew-outcomes', offline=True), mlflow)
+
+
+@pytest.mark.parametrize('unwind', [False, True])
+@pytest.mark.parametrize('status,exit_code,terminal_status', [
+    ('completed', 0, 'FINISHED'), ('lowered', 0, 'FINISHED'),
+    ('preempted', PREEMPTED_EXIT, 'KILLED'), ('failed', 1, 'FAILED'), ('interrupted', 1, 'FAILED'),
+])
+def test_trackers_finish_with_the_recorded_outcome(tracked_runs, status, exit_code, terminal_status, unwind):
+    run, mlflow, sinks = tracked_runs
+    with (pytest.raises(SystemExit) if unwind else nullcontext()), sinks:
+        sinks.artifact(FitEnded(status, 1.), 2)
+        client, run_id = mlflow.run
+        if unwind:
+            raise SystemExit(exit_code)
+    assert run.exit_codes == [exit_code]
+    assert run.preempting is (status == 'preempted')
+    assert client.get_run(run_id).info.status == terminal_status
+
+
+@pytest.mark.parametrize('code,exit_code,terminal_status', [
+    (0, 0, 'FINISHED'), (None, 0, 'FINISHED'), (2, 1, 'FAILED'), ('stopped', 1, 'FAILED'),
+])
+def test_trackers_use_the_contexts_process_exit_code(tracked_runs, code, exit_code, terminal_status):
+    run, mlflow, sinks = tracked_runs
+    with pytest.raises(SystemExit) as caught, sinks:
+        sinks.artifact(FitEnded('completed', 1.), 2)
+        client, run_id = mlflow.run
+        raise SystemExit(code)
+    assert caught.value.code == code
+    assert run.exit_codes == [exit_code]
+    assert client.get_run(run_id).info.status == terminal_status
+
+
+@pytest.mark.parametrize('code', [0, None])
+def test_successful_process_exit_is_a_completed_fit(code):
+    outcome = FitEnded.outcome(1., SystemExit(code))
+    assert outcome.status == 'completed'
+    assert outcome.error is None and outcome.traceback is None
+
+
 def test_mlflow_run_holds_the_fit_read_back_with_mlflows_client(tmp_path, monkeypatch):
     store = mlflow_store(tmp_path, monkeypatch)
     import mlflow.artifacts
@@ -329,9 +429,14 @@ def test_tensorboard_events_hold_the_fit_read_back_with_the_accumulator(tmp_path
     assert reader.Histograms('val/representation_std')[0].histogram_value.num == 3
 
 
-def test_the_previews_tensorboard_can_show_render_and_the_rest_raises(tmp_path):
+def test_tensorboard_renders_clips_texts_token_losses_and_decisions(tmp_path):
     pytest.importorskip('tensorboard')
-    from tensorboard.backend.event_processing.event_accumulator import IMAGES, TENSORS, EventAccumulator
+    from tensorboard.backend.event_processing.event_accumulator import (
+        HISTOGRAMS,
+        IMAGES,
+        TENSORS,
+        EventAccumulator,
+    )
 
     from dew.training import TensorBoardTracker
 
@@ -340,17 +445,17 @@ def test_the_previews_tensorboard_can_show_render_and_the_rest_raises(tmp_path):
         clip = np.stack([np.full((8, 8, 3), -1.0), np.full((8, 8, 3), 1.0)])[None]
         tracker.artifact(VideoGrid(clip, ('a clip',)), 1)
         tracker.artifact(TextSamples(np.array([[1, 2]]), texts=('text',)), 1)
-        with pytest.raises(TypeError, match='no renderer for TokenScores'):
-            tracker.artifact(
-                TokenScores(
-                    np.zeros((1, 2)), np.ones((1, 2)), correct=np.zeros_like(np.zeros((1, 2)), dtype=bool)
-                ),
-                1,
-            )
+        scores = np.array([[0.5, 2.0]])
+        tracker.artifact(TokenScores(scores, np.array([[1.0, 0.0]]), correct=np.zeros((1, 2), dtype=bool)), 1)
+        tracker.artifact(decisions(), 1)
 
-    reader = EventAccumulator(str(tmp_path / 'events'), size_guidance={IMAGES: 0, TENSORS: 0})
+    reader = EventAccumulator(str(tmp_path / 'events'), size_guidance={IMAGES: 0, TENSORS: 0, HISTOGRAMS: 0})
     reader.Reload()
     clip = Image.open(io.BytesIO(reader.Images('val/samples/0')[0].encoded_image_string))
     assert (clip.format, clip.n_frames) == ('GIF', 2)
     assert json.loads(reader.Tensors('val/samples')[0]
                       .tensor_proto.string_val[0]) == {'prompt': '', 'texts': ['text']}
+    losses = reader.Histograms('val/token_losses')[0].histogram_value
+    assert (losses.num, losses.sum) == (1, 0.5)
+    shown = json.loads(reader.Tensors('val/decisions')[0].tensor_proto.string_val[0])
+    assert [row[:4] for row in shown['rows']] == [[0, 0, 2, 2], [0, 1, 0, 0]]
