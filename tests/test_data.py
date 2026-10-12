@@ -1708,10 +1708,15 @@ def test_a_validation_split_needs_no_training_records():
 
 def test_records_whose_field_lengths_differ_are_refused_with_the_remedy():
     """Token ids of varying length are the usual cause, and grain's own
-    message names the batch structure rather than what to change."""
+    message names the batch structure rather than what to change. Automatic
+    loading samples a batch to size its buffers, so the load refuses them;
+    with loading set by hand, the first batch does."""
     rows = [{"text": np.arange(length, dtype=np.int32)} for length in (3, 5, 4, 6)]
-    stream = load(Records(source=rows), batch=2, read="memory").train(DataPartition())
-
+    with pytest.raises(ValueError, match="cut or pad a variable-length field") as refused:
+        load(Records(source=rows), batch=2, read="memory")
+    assert "same structure" in str(refused.value.__cause__)
+    loaded = load(Records(source=rows), batch=2, read="memory", loading=Loading(workers=0))
+    stream = loaded.train(DataPartition())
     with pytest.raises(ValueError, match="cut or pad a variable-length field") as refused:
         next(stream)
     assert "same structure" in str(refused.value.__cause__)

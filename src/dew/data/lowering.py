@@ -18,6 +18,7 @@ the last `map_with_index`, which is the only step that reads it.
 from __future__ import annotations
 
 import dataclasses
+import functools
 import math
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
@@ -27,8 +28,18 @@ import grain.python as pygrain
 import numpy as np
 from grain._src.python.dataset.transformations.batch import make_batch
 
-from dew.data.analysis import _LOCAL, _at, _cache_manifest, _drops, _identity, _Lowering, _name, _until
-from dew.data.dataset import Batch, DataPartition, FilledBatch, Loading, _Grouped
+from dew.data.analysis import (
+    _LOCAL,
+    _at,
+    _cache_manifest,
+    _drops,
+    _identity,
+    _in_memory,
+    _Lowering,
+    _name,
+    _until,
+)
+from dew.data.dataset import Batch, DataPartition, FilledBatch, Loading, Records, _Grouped, stacked
 from dew.data.mix import Accepted, PrimedMix, SearchBudget, TokenDeficit, primed_maps, token_weights
 from dew.data.pipeline import (
     Artifact,
@@ -150,12 +161,16 @@ def _unplaced(value: Record) -> Record:
 class _Placed:
     """The source position of each row a read numbers from `start`, or of each
     output a cache holds for it; a materialized source states its rows'
-    positions (`identifiers`)."""
+    positions (`identifiers`). An indexed root numbers `rows` rows, and Grain
+    counts its index on across the epochs a repeat reads, so the position is
+    that of the row the index reads in its epoch."""
 
     start: int = 0
     identifiers: tuple[tuple[int, ...], ...] = ()
+    rows: int | None = None
 
     def __call__(self, index: int, value: Record | tuple[Record, ...]) -> Record | tuple[Record, ...]:
+        index = index if self.rows is None else index % self.rows
         position = self.identifiers[index][0] if self.identifiers else self.start + index
         if isinstance(value, tuple):
             return tuple(_placed(output, position) for output in value)
@@ -394,20 +409,34 @@ class _Build:
         self, pipeline: Pipeline, source: Source, partition: DataPartition, last: int
     ) -> tuple[Rows, pygrain.MapDataset | None, int]:
         """The root of an indexed read, cut to its share by index (`shared`),
-        and through its cache when it has one, with the stages it consumed."""
-        stored = pygrain.MapDataset.source(source.records(self.read)).seed(self.seed)
+        and through its cache when it has one, with the stages it consumed.
+
+        Without a cache the root is dense: an order batched by index needs a
+        record at every position. A source held in memory may hold missing
+        records (None), so its root is the records it holds, each keeping its
+        source position (`_Present`); a cache rejects a missing record as it
+        reads it (`_CachedOutputs`)."""
+        records = source.records(self.read)
+        stored = pygrain.MapDataset.source(records).seed(self.seed)
         cache = self.lowering.cache
         if cache is None:
             identifiers = source.identifiers if isinstance(source, _Materialized) else ()
-            rows = stored.map_with_index(_Placed(identifiers=identifiers)) if last >= 0 else stored
             lengths = source.lengths()
+            present = _Present.of(records) if _in_memory(source) else None
+            if present is not None:
+                stored = pygrain.MapDataset.source(present).seed(self.seed)
+                identifiers = tuple((int(position),) for position in present.positions)
+                lengths = None if lengths is None else np.asarray(lengths)[present.positions]
+            placed = _Placed(identifiers=identifiers, rows=len(stored))
+            rows = stored.map_with_index(placed) if last >= 0 else stored
             measured = None if lengths is None else pygrain.MapDataset.source(lengths)
             if measured is not None:
                 measured = self.shared(measured, pipeline, partition)
             return self.shared(rows, pipeline, partition), measured, 0
         filled, manifest, prefix = _fill(pipeline, source, cache, self.read)
         cached = filled.mapped(stored, manifest, source, transform=prefix)
-        view = self.shared(cached.map_with_index(_Placed()) if last > cache else cached, pipeline, partition)
+        placed = cached.map_with_index(_Placed(rows=len(cached))) if last > cache else cached
+        view = self.shared(placed, pipeline, partition)
         rows = cached.iterated(view, pygrain.ReadOptions(self.loading.threads, self.loading.read_buffer))
         flat = gx.FlatMapIterDataset(rows, _CachedOutputs())
         return Accepted(flat, _name(pipeline), budget=self.budget), None, cache + 1
@@ -626,6 +655,20 @@ class _Build:
     def batches(
         self, pipeline: Pipeline, partition: DataPartition, offset: int = 0, *, fill: bool = True
     ) -> pygrain.DatasetIterator[Batch]:
+        """This share's batches, through the stages after the batch."""
+        batching = next(stage for stage in pipeline.stages if isinstance(stage, (BatchStage, TokenBudget)))
+        stream = self.batched(pipeline, partition, offset, fill=fill)
+        return iter(self.after_batch(stream, pipeline, partition, batching))
+
+    def batched(
+        self, pipeline: Pipeline, partition: DataPartition, offset: int = 0, *, fill: bool = True
+    ) -> pygrain.IterDataset:
+        """This share's batches as the reader reads them, before the stages
+        after the batch, which automatic loading also sizes its buffers by
+        (`Loading.resolved`). A global order is batched by index before the
+        reader starts, as Grain's own indexed pipelines are, so each read in
+        flight is a whole batch and each worker reads whole batches of its
+        own; any other order is batched as its rows arrive."""
         budget = next((stage for stage in pipeline.stages if isinstance(stage, TokenBudget)), None)
         if budget is not None:
             return self.token_batches(pipeline, partition, budget)
@@ -646,9 +689,6 @@ class _Build:
             empty = not self.training and not len(rows) and bool(len(whole))
             if empty:
                 rows = whole[:1]
-            # Batched by index before the reader starts, as Grain's own indexed
-            # pipelines are, so each read in flight is a whole batch and each
-            # worker reads whole batches of its own.
             batched = rows.batch(size, drop_remainder=drop, batch_fn=_Batched(batch_stage.batch_fn))
             stream = _as_iter(batched, self.loading)
             for stage in pipeline.stages[: pipeline.stages.index(batch_stage)]:
@@ -663,7 +703,7 @@ class _Build:
             stream = stream.map(
                 _FillShare(partition, batch_stage.size) if canonical else FilledBatch(size, real=not empty)
             )
-        return iter(self.after_batch(stream, pipeline, partition, batch_stage))
+        return stream
 
     def after_batch(
         self,
@@ -686,7 +726,7 @@ class _Build:
 
     def token_batches(
         self, pipeline: Pipeline, partition: DataPartition, budget: TokenBudget
-    ) -> pygrain.DatasetIterator[Batch]:
+    ) -> pygrain.IterDataset:
         from dew.data.batching import TokenBatches
 
         if partition.count > 1:
@@ -694,8 +734,7 @@ class _Build:
                 "token-budget batching requires one share until a synchronized shape schedule is supplied"
             )
         rows, _ = self.records(pipeline, partition)
-        stream = TokenBatches(_as_iter(rows, self.loading), budget, partition, self.seed)
-        return iter(self.after_batch(stream, pipeline, partition, budget))
+        return TokenBatches(_as_iter(rows, self.loading), budget, partition, self.seed)
 
 
 def _epoch_records(train: Pipeline, build: _Build) -> int | None:
@@ -755,6 +794,28 @@ class _Payload:
         return {name: value for name, value in row.items() if not name.startswith("_dew_")}
 
 
+@dataclasses.dataclass(frozen=True)
+class _Present:
+    """The records a source holds at `positions`, those not missing, read
+    densely by index."""
+
+    records: Records
+    positions: np.ndarray
+
+    @classmethod
+    def of(cls, records: Records) -> _Present | None:
+        """The present records of `records`, or None when none is missing."""
+        held = [index for index in range(len(records)) if records[index] is not None]
+        positions = np.asarray(held, np.int64)
+        return None if len(positions) == len(records) else cls(records, positions)
+
+    def __len__(self) -> int:
+        return len(self.positions)
+
+    def __getitem__(self, index: int) -> Batch | bytes | None:
+        return self.records[int(self.positions[index])]
+
+
 @runtime_checkable
 class _SharedOutput(Protocol):
     """A batch function that can write its batches into shared memory, which
@@ -766,10 +827,10 @@ class _SharedOutput(Protocol):
 @dataclasses.dataclass
 class _Batched:
     """The batch step: each row's private fields dropped (`_Payload`), then
-    the rows stacked by the pipeline's `batch_fn`, or by Grain's own batch,
-    into shared memory once Grain asks for it. The strip runs inside the
-    batch, so it adds no Grain stage of its own; rows carry their private
-    fields up to it, for the grouping and counting that read them."""
+    the rows stacked (`stacked`) by the pipeline's `batch_fn`, or by Grain's
+    own batch, into shared memory once Grain asks for it. The strip runs
+    inside the batch, so it adds no Grain stage of its own; rows carry their
+    private fields up to it, for the grouping and counting that read them."""
 
     batch_fn: Callable[[Sequence[Batch]], Batch] | None
     shared: bool = False
@@ -781,10 +842,15 @@ class _Batched:
             self.batch_fn.enable_shared_memory_output()
 
     def __call__(self, rows: Sequence[Batch]) -> Batch:
+        if any(row is None for row in rows):
+            raise ValueError(
+                "an order batched by index read a missing record; a source read by index must hold "
+                "every record, or be read with read='memory', which leaves missing records out"
+            )
         payload = [_Payload()(row) for row in rows]
         if self.batch_fn is not None:
-            return self.batch_fn(payload)
-        return make_batch(payload, output_to_shared_memory=self.shared)
+            return stacked(payload, self.batch_fn)
+        return stacked(payload, functools.partial(make_batch, output_to_shared_memory=self.shared))
 
 
 @dataclasses.dataclass(frozen=True)

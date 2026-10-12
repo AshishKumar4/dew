@@ -173,6 +173,26 @@ def test_worker_processes_read_a_global_order_in_the_batches_one_process_reads()
     assert batches(2) == batches(0)
 
 
+def test_automatic_loading_sizes_an_indexed_read_buffer_by_the_batches_it_holds(monkeypatch):
+    """An indexed order's read buffer holds whole batches, so automatic
+    loading sizes it by a batch: 2 MiB holds four batches of eight 64 KiB
+    rows, where sized by a row it would hold sixteen."""
+    import grain.experimental as gx
+
+    chosen = []
+    pick = gx.pick_performance_config
+
+    def recorded(*args, **kwargs):
+        config = pick(*args, **kwargs)
+        chosen.append(config.read_options.prefetch_buffer_size)
+        return config
+
+    monkeypatch.setattr(gx, "pick_performance_config", recorded)
+    rows = Memory(tuple({"x": np.zeros(16384, np.float32)} for _ in range(64)))
+    compile(Pipeline(rows).repeat().batch(8), loading=Loading(workers="auto", ram_budget_mb=2, max_workers=1))
+    assert chosen == [4]
+
+
 def test_token_deficit_mix_counts_targets_and_restores_delivered_counts():
     corpora = [grain.MapDataset.source([{"id": tag, "targets": targets}]).repeat().to_iter_dataset()
                for tag, targets in [(0, 2), (1, 7)]]
@@ -458,6 +478,44 @@ def test_a_memory_read_counts_a_missing_row_alike_with_or_without_a_cache():
         assert [count.rejected["missing"] for count in data.counts.values()] == [1]
 
 
+def test_an_indexed_read_batches_the_records_memory_holds_in_full_batches():
+    """A source held in memory may hold a missing record. An indexed order
+    batches the records present, so every batch is full and the order counts
+    three records."""
+    stored = Memory([{"id": np.int32(0)}, None, {"id": np.int32(2)}, {"id": np.int32(3)}])
+    data = compile(Pipeline(stored).batch(2), read="indexed", loading=READ)
+    reader = data.train(DataPartition())
+    try:
+        batches = take(reader, 3)
+    finally:
+        reader.close()
+    assert data.records == 3
+    assert all(len(batch["id"]) == 2 for batch in batches)
+    assert sorted(value for batch in batches for value in batch["id"]) == [0, 0, 2, 2, 3, 3]
+
+
+def _numbered(index: int, row: dict) -> dict:
+    return {**row, "at": np.int32(index)}
+
+
+def test_map_with_index_reads_each_row_at_its_source_position_in_every_epoch():
+    """Grain counts an index on across the epochs a repeat reads, but a row's
+    source position is its place in the source: four rows read twice over
+    are numbered by their ids both times, held whole or as the records
+    memory holds."""
+    whole = Pipeline(source(4))
+    missing = Pipeline(Memory([{"id": np.int32(0)}, None, {"id": np.int32(2)}, {"id": np.int32(3)}]))
+    for pipeline, rows in ((whole, 4), (missing, 3)):
+        numbered = pipeline.map_with_index(_numbered, identity="at@1")
+        data = compile(numbered.batch(2), read="indexed", loading=READ)
+        reader = data.train(DataPartition())
+        try:
+            batches = take(reader, rows)
+        finally:
+            reader.close()
+        assert all(batch["at"] == batch["id"] for batch in batches)
+
+
 def test_a_cached_indexed_root_is_cut_into_disjoint_shares_that_repeat():
     """Each share of a cached indexed read takes its own rows of the source,
     and a training read with no repeat stage goes on past one pass."""
@@ -607,6 +665,23 @@ def test_a_scored_branch_cut_per_share_splits_its_whole_order():
     finally:
         reader.close()
     assert tokens == list(range(8))
+
+
+def test_a_scored_memory_branch_that_shuffles_before_its_split_holds_out_half_its_tokens():
+    """A memory read of a scored branch is analyzed as scored too, so a token
+    split after a shuffle, in an order a filter cuts per share, holds out the
+    first half of the shuffled documents' tokens."""
+    documents = Memory(tuple({"text": np.arange(4, dtype=np.int32) + 4 * index} for index in range(4)))
+    split = Pipeline(documents).shuffle(0).token_split(0.5, held=True)
+    held = split.filter(lambda row: True, identity="all@1")
+    data = compile(Pipeline(source()).batch(2), validation=held.batch(1), read="memory", loading=READ)
+    assert data.val is not None
+    reader = data.val(DataPartition())
+    try:
+        tokens = [value for batch in reader for row in np.asarray(batch["text"]) for value in row.tolist()]
+    finally:
+        reader.close()
+    assert len(tokens) == len(set(tokens)) == 8
 
 
 def test_a_streamed_repeat_repeats_where_it_is_written_past_a_limit_or_a_repeat():
