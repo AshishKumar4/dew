@@ -914,13 +914,6 @@ def chunk_fwd_o(q, k, v, h, g, *, scale: float, chunk: int = 64, bk: int | None 
     )(q, k, v, h, g)
 
 
-def _varying_like(x, *operands):
-    """`x` typed varying over every manual mesh axis one of `operands` varies over, inside a
-    `shard_map` that checks them: a Pallas call states no such type for its results."""
-    axes = frozenset().union(*(jax.typeof(operand).mat.varying for operand in operands))
-    return jax.lax.pcast(x, tuple(axes - jax.typeof(x).mat.varying), to='varying')
-
-
 def _rule(q, k, v, g, beta, h0, scale: float, chunk: int, interpret: bool):
     return _rule_fwd(q, k, v, g, beta, h0, scale, chunk, interpret)[0]
 
@@ -936,7 +929,6 @@ def _rule_fwd(q, k, v, g, beta, h0, scale: float, chunk: int, interpret: bool):
     w, u = recompute_w_u(k, v, beta, a, gc, chunk=chunk, interpret=interpret)
     h, corrected, final = chunk_fwd_h(k, w, u, gc, h0, chunk=chunk, interpret=interpret)
     o = chunk_fwd_o(q, k, corrected, h, gc, scale=scale, chunk=chunk, interpret=interpret)
-    o, final = (_varying_like(x, q, k, v, g, beta, h0) for x in (o, final))
     return (o, final), (q, k, v, gc, beta, a, h0)
 
 
@@ -956,9 +948,7 @@ def _rule_bwd(scale: float, chunk: int, interpret: bool, residual, cotangent):
     dk2, dv, db, dg2 = prepare_wy_repr_bwd(k, v, beta, gc, a, dw, dv, chunk=chunk, interpret=interpret)
     dk = (dk.astype(jnp.float32) + dk2.astype(jnp.float32)).astype(k.dtype)
     dg = chunk_local_cumsum(dg + dg2, chunk=chunk, reverse=True, interpret=interpret)
-    # Each gradient varies where its operand does (the decay where its cumulated sum does).
-    return tuple(_varying_like(grad, operand) for grad, operand in
-                 zip((dq, dk, dv, dg.astype(jnp.float32), db, dh0), (q, k, v, gc, beta, h0), strict=True))
+    return dq, dk, dv, dg.astype(jnp.float32), db, dh0
 
 
 chunk_gated_delta_rule = jax.custom_vjp(_rule, nondiff_argnums=(6, 7, 8))

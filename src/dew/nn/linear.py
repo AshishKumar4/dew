@@ -468,13 +468,19 @@ def port_refusal(query, key, value) -> str | None:
     port (`fla_rule`), or None where the port takes it: every GPU Triton runs
     (`triton_runs`) and every shape, dtype, chunk size and mesh, except
     inside `jax.jvp`'s traces (`FORWARD_MODE`), which the port's custom VJP
-    gives no tangent; float64 operands, whose rule is the reference math
-    itself; and keys wider than the port takes in their dtype."""
+    gives no tangent; inside a caller's `shard_map` that checks varying axes
+    over operands that vary, where a Pallas call, which states no varying
+    type for its results, cannot run; float64 operands, whose rule is the
+    reference math itself; and keys wider than the port takes in their
+    dtype."""
     widest = fla_gdn.WIDEST_KEYS if jnp.result_type(query, key, value).itemsize == 2 else fla_gdn.WIDEST
     return first_refusal(
         (triton_runs(), "the port's kernels need a GPU of sm80 or later"),
         (not FORWARD_MODE.get(), "forward_mode_attention traces for jax.jvp, which the port's custom VJP "
                                  "gives no tangent"),
+        (not jax.typeof(value).mat.varying,
+         "a shard_map that checks varying axes holds the operands, and a Pallas call states no "
+         "varying type for its results"),
         (all(jnp.dtype(x.dtype) != jnp.float64 for x in (query, key, value)),
          "float64 operands, whose rule is the reference math itself"),
         (key.shape[-1] <= widest,
