@@ -16,13 +16,12 @@ its x and y.
 
 from __future__ import annotations
 
-import ast
 import os
-import urllib.request
 from pathlib import Path
 
 import numpy as np
 import torch
+from reference_source import definitions, fetched
 
 NANOGPT = "https://raw.githubusercontent.com/karpathy/nanoGPT/3adf61e154c3fe3fca428ad6bc3818b27a3b8291/"
 SHAKESPEARE = ("https://raw.githubusercontent.com/karpathy/char-rnn/6f9487a6fe5b420b7ca9afb0d7c078e37c1d1b4e"
@@ -31,19 +30,11 @@ FIXTURE = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "nanogpt"
 CHARACTERS, BLOCK, BATCH, BATCHES = 20_000, 32, 6, 8
 
 
-def fetched(url: str) -> str:
-    return urllib.request.urlopen(url).read().decode()
-
-
 def get_batch():
     """train.py's `get_batch`, with the names it reads."""
-    text = fetched(NANOGPT + "train.py")
-    node = next(node for node in ast.parse(text).body
-                if isinstance(node, ast.FunctionDef) and node.name == "get_batch")
     scope = {"np": np, "torch": torch, "os": os, "data_dir": str(FIXTURE), "block_size": BLOCK,
              "batch_size": BATCH, "device_type": "cpu", "device": "cpu"}
-    exec(compile(ast.Module(body=[node], type_ignores=[]), "train.py", "exec"), scope)
-    return scope["get_batch"]
+    return definitions(NANOGPT + "train.py", {"get_batch"}, scope)["get_batch"]
 
 
 def main() -> None:

@@ -105,6 +105,19 @@ type LogicalAxisRules = tuple[tuple[str, MeshAxes], ...]
 # vocabulary, which shares no array with a residual, splits fsdp times
 # tensor ways.
 #
+# fsdp alone stores a split: a parameter it splits is gathered whole for
+# every use, so which dimension it takes changes no product, only how the
+# shards lie in memory. Among the dimensions a rule names it alone for, it
+# takes the array's leading one that no other axis took (`logical_spec`),
+# whatever the rule order: each shard is then one block of the row-major
+# array, so its gather concatenates and its gradient's reduce-scatter cuts,
+# as PyTorch's FSDP2 splits every parameter on dim 0 (`fully_shard`).
+# Split on the mlp width, the gate and up projections transposed their
+# gradients for every update: Llama-3.1-8B over FSDP 2 on two H100 SXMs
+# stepped in 537.8 ms, and in 488.0 split on the residual width.
+# A name whose rule pairs fsdp with tensor (the vocabulary, the heads) splits
+# for a computation, and its rule order stands.
+#
 # The activation_ names place what a step computes rather than what it
 # stores, by the same table: rows over the batch axes, positions over the
 # sequence axis, and the widths of Megatron's split over tensor. The residual
@@ -472,7 +485,9 @@ def logical_spec(axes: LogicalAxes, shape: tuple[int, ...], *,
     it, so that rule is set aside for this array: the name takes its next
     rule, or none, and the mesh axis goes to the next dimension that names
     it. For example, an odd vocabulary shards the embedding on its width and
-    keeps the table in the layout.
+    keeps the table in the layout. fsdp, placed by a name whose first rule
+    names it alone, then moves to the leading dimension of such a name that
+    no other axis took and that it divides (`DEFAULT_RULES`).
     """
     rules = axis_rules() if rules is None else rules
     mesh = jax.sharding.get_abstract_mesh() if mesh is None else mesh
@@ -482,13 +497,17 @@ def logical_spec(axes: LogicalAxes, shape: tuple[int, ...], *,
                      if axis not in mesh.manual_axes and mesh.shape.get(axis, 1) > 1)
 
     # A rule of None keeps its name whole and stands; one whose axes all
-    # split nothing is dropped.
+    # split nothing is dropped. `stored` names those whose first rule left
+    # names fsdp alone.
     left: list[tuple[str, MeshAxes]] = []
+    stored: set[str] = set()
     for name, assignment in rules:
-        if assignment is None:
-            left.append((name, None))
-        elif used := splitting(assignment):
-            left.append((name, used[0] if len(used) == 1 else used))
+        used = splitting(assignment)
+        if assignment is not None and not used:
+            continue
+        if all(name != kept for kept, _ in left) and mesh_axes(assignment) == (FSDP_AXIS,):
+            stored.add(name)
+        left.append((name, None if assignment is None else used[0] if len(used) == 1 else used))
     while True:
         mapped = spmd.logical_to_mesh_axes(axes, tuple(left))
         assert mapped is not None, "flax answers None for array_dim_names=None only"
@@ -499,6 +518,11 @@ def logical_spec(axes: LogicalAxes, shape: tuple[int, ...], *,
         if not blocked:
             break
         left = [rule for rule in left if rule not in blocked]
+    # fsdp alone takes the leading such dimension no other axis took (`DEFAULT_RULES`).
+    leading = [dim for dim, (name, used, size) in enumerate(zip(axes, assigned, shape, strict=True))
+               if name in stored and used in ((), (FSDP_AXIS,)) and size % mesh.shape.get(FSDP_AXIS, 1) == 0]
+    if (FSDP_AXIS,) in assigned and assigned.index((FSDP_AXIS,)) in leading:
+        assigned[assigned.index((FSDP_AXIS,))], assigned[leading[0]] = (), (FSDP_AXIS,)
     entries = [used[0] if len(used) == 1 else used or None for used in assigned]
     while entries and entries[-1] is None:
         entries.pop()
