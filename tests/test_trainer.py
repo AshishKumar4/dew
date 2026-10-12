@@ -29,7 +29,7 @@ import numpy as np
 import optax
 import orbax.checkpoint as ocp
 import pytest
-from affine_run import BATCH, FEATURES, Counting, Data, Features, Regression, Spread, raw_leaf, val_batches
+from affine_run import BATCH, FEATURES, Counting, Features, Regression, Spread, dataset, raw_leaf, val_batches
 from flax import linen as nn
 from flax.errors import ScopeParamShapeError
 from recording import RecordingTracker
@@ -102,7 +102,7 @@ def test_fit_lets_go_of_each_state_its_step_consumed():
 
     trainer.place = place
     trainer.tracker = Watching()
-    trainer.fit(Data(), steps=2, log_every=1)
+    trainer.fit(dataset(), steps=2, log_every=1)
     assert alive == [False, False]
 
 
@@ -120,7 +120,7 @@ def test_train_state_exposes_the_whole_variables_tree():
 
 
 def test_fit_trains_to_the_step_it_was_asked_for():
-    state = make_trainer().fit(Data(endless), steps=4, log_every=2)
+    state = make_trainer().fit(dataset(endless), steps=4, log_every=2)
     assert int(state.step) == 4
 
 
@@ -130,8 +130,9 @@ def test_an_optim_config_is_built_over_the_updates_fit_makes():
     config = OptimConfig(schedule=Cosine(peak=0.1, warmup_steps=0), weight_decay=0.1, b2=0.99)
     with pytest.raises(ValueError, match="fit"):
         make_trainer(optimizer=config).initial_state()
-    built, over_two, over_four = (make_trainer(optimizer=given, accumulation=2).fit(Data(), steps=4).variables
-                                  for given in (config, config.build(2), config.build(4)))
+    built, over_two, over_four = (
+        make_trainer(optimizer=given, accumulation=2).fit(dataset(), steps=4).variables
+        for given in (config, config.build(2), config.build(4)))
     jax.tree.map(np.testing.assert_array_equal, built, over_two)
     assert not all(jax.tree.leaves(jax.tree.map(np.array_equal, built, over_four)))
 
@@ -161,7 +162,7 @@ def test_steps_after_the_first_logs_neither_compile_nor_move_data_unasked(varian
     tracker = Steady()
     try:
         make_trainer(tracker=tracker, **options).fit(
-            Data(), steps=24, log_every=4, checkpoint_every=4 if variant == "checkpoints" else None)
+            dataset(), steps=24, log_every=4, checkpoint_every=4 if variant == "checkpoints" else None)
     finally:
         window.close()
     assert [step for step, scalars in tracker.scalars if "train/loss" in scalars] == [4, 8, 12, 16, 20, 24]
@@ -170,8 +171,8 @@ def test_steps_after_the_first_logs_neither_compile_nor_move_data_unasked(varian
 def test_integer_root_key_matches_a_typed_key_bit_exactly():
     integer = Trainer(Regression(), optax.adam(1e-3), key=0)
     typed = Trainer(Regression(), optax.adam(1e-3), key=jax.random.key(0))
-    left = integer.fit(Data(), steps=3, log_every=1)
-    right = typed.fit(Data(), steps=3, log_every=1)
+    left = integer.fit(dataset(), steps=3, log_every=1)
+    right = typed.fit(dataset(), steps=3, log_every=1)
     assert jax.tree.structure(left) == jax.tree.structure(right)
     for actual, expected in zip(jax.tree.leaves(left), jax.tree.leaves(right), strict=True):
         np.testing.assert_array_equal(np.asarray(raw_leaf(actual)), np.asarray(raw_leaf(expected)))
@@ -181,7 +182,7 @@ def test_integer_root_seed_is_recorded_at_fit_start():
     from dew.telemetry.records import FitStarted
 
     tracker = RecordingTracker()
-    Trainer(Regression(), optax.sgd(.1), key=23, tracker=tracker).fit(Data(), steps=1)
+    Trainer(Regression(), optax.sgd(.1), key=23, tracker=tracker).fit(dataset(), steps=1)
     started = next(value for _, value in tracker.artifacts if isinstance(value, FitStarted))
     assert started.seed == 23
 
@@ -198,7 +199,7 @@ def test_the_banner_says_how_much_of_the_parameters_the_mesh_splits(capsys):
     for min_shard, share in ((2**16, 0.0), (1, 1.0)):
         tracker = RecordingTracker()
         Trainer(Regression(), optax.sgd(.1), key=0, mesh=MeshSpec(fsdp=2, tensor=2), tracker=tracker,
-                layout=Layout(min_shard=min_shard, tolerance=1.0)).fit(Data(), steps=1)
+                layout=Layout(min_shard=min_shard, tolerance=1.0)).fit(dataset(), steps=1)
         started = next(value for _, value in tracker.artifacts if isinstance(value, FitStarted))
         assert started.sharded == share
         assert f"{share:.0%} of the parameters' bytes split" in capsys.readouterr().out
@@ -209,15 +210,15 @@ def test_typed_root_key_round_trips_and_resumes_bit_exactly(tmp_path):
         return Trainer(Regression(), optax.adam(1e-3), key=0,
                        checkpoints=None if path is None else Checkpoints(str(path)))
 
-    baseline = build().fit(Data(), steps=4, log_every=1)
+    baseline = build().fit(dataset(), steps=4, log_every=1)
     split = build(tmp_path / "typed")
-    prefix = split.fit(Data(), steps=2, checkpoint_every=1, log_every=1)
+    prefix = split.fit(dataset(), steps=2, checkpoint_every=1, log_every=1)
     assert jnp.issubdtype(prefix.key.dtype, jax.dtypes.prng_key)
     fresh = build(tmp_path / "typed")
     restored, _, _ = fresh.place()
     assert restored.key.dtype == prefix.key.dtype
     np.testing.assert_array_equal(jax.random.key_data(restored.key), jax.random.key_data(prefix.key))
-    resumed = fresh.fit(Data(), steps=4, checkpoint_every=1, log_every=1)
+    resumed = fresh.fit(dataset(), steps=4, checkpoint_every=1, log_every=1)
     for left, right in zip(jax.tree.leaves(resumed), jax.tree.leaves(baseline), strict=True):
         np.testing.assert_array_equal(np.asarray(raw_leaf(left)), np.asarray(raw_leaf(right)))
 
@@ -250,7 +251,7 @@ def test_a_held_fit_error_releases_the_prefetch_iterator(monkeypatch):
 
     monkeypatch.setattr(trainer_module, "DevicePrefetchIterator", ObservedPrefetch)
     with pytest.raises(ScopeParamShapeError) as failure:
-        make_trainer().fit(Data(train=WrongWidth), steps=10, log_every=100)
+        make_trainer().fit(dataset(train=WrongWidth), steps=10, log_every=100)
     # A caller may retain the error for reporting; its traceback must not
     # retain the closed worker and its queue after fit has relinquished it.
     assert failure.value.__traceback__ is not None
@@ -262,7 +263,7 @@ def test_a_held_fit_error_releases_the_prefetch_iterator(monkeypatch):
 def test_off_a_terminal_fit_prints_one_line_per_logging_interval(capsys):
     """Piped to a log, the run's progress is plain lines at the logging
     cadence, not a live display's redraws."""
-    make_trainer().fit(Data(endless), steps=7, log_every=2)
+    make_trainer().fit(dataset(endless), steps=7, log_every=2)
     output = capsys.readouterr().out
 
     assert [int(step) for step in re.findall(r"^step\s+(\d+)/7\b", output, re.M)] == [2, 4, 6], output
@@ -273,12 +274,12 @@ def test_the_summary_gives_the_last_steps_loss_and_only_this_fits_steps(tmp_path
     """Seven steps logged every two end on a step no interval read, and a
     fit asked again for the step the run is at trains nothing."""
     tracker = RecordingTracker()
-    make_trainer(tracker=tracker).fit(Data(), steps=7, log_every=1)
+    make_trainer(tracker=tracker).fit(dataset(), steps=7, log_every=1)
     losses = {step: scalars["train/loss"] for step, scalars in tracker.scalars if "train/loss" in scalars}
     capsys.readouterr()
 
     trainer = make_trainer(tmp_path)
-    trainer.fit(Data(), steps=7, log_every=2)
+    trainer.fit(dataset(), steps=7, log_every=2)
     summary = re.search(r"Trained (\d+) steps.*final loss (\S+)", capsys.readouterr().out, re.S)
     assert summary is not None
     assert int(summary[1]) == 7
@@ -286,14 +287,14 @@ def test_the_summary_gives_the_last_steps_loss_and_only_this_fits_steps(tmp_path
     assert abs(float(summary[2]) - losses[7]) <= 5e-4 * abs(losses[7])
     assert abs(float(summary[2]) - losses[6]) > 5e-4 * abs(losses[7])
 
-    trainer.fit(Data(), steps=7, log_every=2)
+    trainer.fit(dataset(), steps=7, log_every=2)
     assert re.search(r"Trained \d+ steps", capsys.readouterr().out) is None
 
 
 def test_a_second_fit_continues_from_the_state_on_disk(tmp_path):
     trainer = make_trainer(tmp_path)
-    first = trainer.fit(Data(), steps=3, log_every=1)
-    resumed = make_trainer(tmp_path).fit(Data(), steps=5, log_every=1)
+    first = trainer.fit(dataset(), steps=3, log_every=1)
+    resumed = make_trainer(tmp_path).fit(dataset(), steps=5, log_every=1)
 
     assert int(first.step) == 3 and int(resumed.step) == 5
     assert Checkpoints(str(tmp_path / "run")).latest == 5
@@ -326,9 +327,9 @@ def test_a_resumed_run_continues_the_key_stream(tmp_path):
     its keys, or restored the step but not the run key, lands where the
     uninterrupted run does not.
     """
-    make_trainer(tmp_path, objective=Keyed()).fit(Data(), steps=2, log_every=1)
-    resumed = make_trainer(tmp_path, objective=Keyed()).fit(Data(), steps=4, log_every=1)
-    whole = make_trainer(objective=Keyed()).fit(Data(), steps=4, log_every=1)
+    make_trainer(tmp_path, objective=Keyed()).fit(dataset(), steps=2, log_every=1)
+    resumed = make_trainer(tmp_path, objective=Keyed()).fit(dataset(), steps=4, log_every=1)
+    whole = make_trainer(objective=Keyed()).fit(dataset(), steps=4, log_every=1)
 
     for expected, actual in zip(jax.tree.leaves(whole.variables),
                                 jax.tree.leaves(resumed.variables), strict=True):
@@ -354,7 +355,7 @@ def test_the_ema_lags_the_parameters_at_the_configured_decay():
 def test_fit_checkpoints_the_final_step(tmp_path):
     """The last save of a run carries the step the run ended on, not step 0."""
     trainer = make_trainer(tmp_path)
-    trainer.fit(Data(), steps=4, log_every=1)
+    trainer.fit(dataset(), steps=4, log_every=1)
 
     assert trainer.checkpoints.latest == 4
     assert os.path.isdir(tmp_path / "run" / "4")
@@ -373,7 +374,7 @@ def test_checkpoint_every_saves_on_its_own_cadence(tmp_path):
         return real_save(step, state, position, metrics, share=share, **metadata)
 
     trainer.checkpoints.save = spy
-    trainer.fit(Data(), steps=6, log_every=4, checkpoint_every=2)
+    trainer.fit(dataset(), steps=6, log_every=4, checkpoint_every=2)
 
     assert saved == [(2, ["train/loss"]), (4, ["train/loss"]), (6, ["train/loss"])]
     assert set(trainer.checkpoints._open().all_steps()) == {2, 4, 6}
@@ -381,7 +382,7 @@ def test_checkpoint_every_saves_on_its_own_cadence(tmp_path):
 
 def test_checkpoint_every_needs_a_stream_that_reports_its_position(tmp_path):
     with pytest.raises(ValueError, match="get_state"):
-        make_trainer(tmp_path).fit(Data(endless), steps=2, checkpoint_every=1)
+        make_trainer(tmp_path).fit(dataset(endless), steps=2, checkpoint_every=1)
 
 
 def test_checkpoint_every_needs_a_stream_that_can_also_be_put_back(tmp_path):
@@ -402,27 +403,27 @@ def test_checkpoint_every_needs_a_stream_that_can_also_be_put_back(tmp_path):
             return self.inner.get_state()
 
     with pytest.raises(ValueError, match="get_state"):
-        make_trainer(tmp_path).fit(Data(HalfCheckpointable), steps=2, checkpoint_every=1)
+        make_trainer(tmp_path).fit(dataset(HalfCheckpointable), steps=2, checkpoint_every=1)
 
 
 def test_checkpoint_every_without_a_checkpointer_is_refused():
     """Asking for checkpoints from a trainer that has nowhere to write them
     raises a ValueError before the first step, not at the first save."""
     with pytest.raises(ValueError, match="no checkpointer"):
-        make_trainer().fit(Data(), steps=2, checkpoint_every=1)
+        make_trainer().fit(dataset(), steps=2, checkpoint_every=1)
 
 
 def test_fit_that_never_trains_checkpoints_step_zero(tmp_path):
     """A run that ends at step 0 writes a step-0 checkpoint."""
     trainer = make_trainer(tmp_path)
-    trainer.fit(Data(), steps=0)
+    trainer.fit(dataset(), steps=0)
     assert trainer.checkpoints.latest == 0
 
 
 def test_a_run_past_its_target_is_refused(tmp_path):
-    make_trainer(tmp_path).fit(Data(), steps=3, log_every=1)
+    make_trainer(tmp_path).fit(dataset(), steps=3, log_every=1)
     with pytest.raises(ValueError, match="past"):
-        make_trainer(tmp_path).fit(Data(), steps=2)
+        make_trainer(tmp_path).fit(dataset(), steps=2)
 
 
 def held_lm_trainer(**settings):
@@ -785,7 +786,7 @@ def test_place_asks_the_objective_for_its_held_variables_once():
 
 def test_restore_preserves_the_optimizer_state_the_ema_and_the_key(tmp_path):
     trainer = make_trainer(tmp_path, optimizer=optax.adam(1e-3))
-    trained = trainer.fit(Data(), steps=3, log_every=1)
+    trained = trainer.fit(dataset(), steps=3, log_every=1)
 
     resumed = make_trainer(tmp_path, optimizer=optax.adam(1e-3))
     state, _, position = resumed.place()
@@ -933,7 +934,7 @@ class AffineWithOffset(nn.Module):
 def test_a_checkpoint_without_a_leaf_the_model_now_has_is_refused_by_name(tmp_path):
     """A resume cannot hand back a state with a leaf the checkpoint never
     stored, so it refuses and names the leaf."""
-    make_trainer(tmp_path).fit(Data(), steps=2, log_every=1)
+    make_trainer(tmp_path).fit(dataset(), steps=2, log_every=1)
     grown = Regression()
     grown.model = AffineWithOffset()
     with pytest.raises(ValueError, match=r"holds no .*\['variables'\]\['constants'\]\['offset'\]"):
@@ -944,9 +945,9 @@ def test_a_resumed_run_continues_the_data_where_it_stopped(tmp_path):
     """A run killed at step 2 and resumed to 4 lands where an uninterrupted
     four-step run lands: the batches after the checkpoint are neither
     replayed nor skipped, so the parameters agree."""
-    make_trainer(tmp_path).fit(Data(), steps=2, log_every=1)
-    resumed = make_trainer(tmp_path).fit(Data(), steps=4, log_every=1)
-    whole = make_trainer().fit(Data(), steps=4, log_every=1)
+    make_trainer(tmp_path).fit(dataset(), steps=2, log_every=1)
+    resumed = make_trainer(tmp_path).fit(dataset(), steps=4, log_every=1)
+    whole = make_trainer().fit(dataset(), steps=4, log_every=1)
 
     for expected, actual in zip(jax.tree.leaves(whole.variables),
                                 jax.tree.leaves(resumed.variables), strict=True):
@@ -1013,7 +1014,7 @@ def stop_at_local_step(trainer, stop: int):
 
     trainer.checkpoints.save_local = save_then_stop
     with pytest.raises(Stop):
-        trainer.fit(Data(), steps=100, log_every=1, checkpoint_every=3)
+        trainer.fit(dataset(), steps=100, log_every=1, checkpoint_every=3)
 
 
 def test_the_local_checkpoint_is_written_on_its_own_cadence_and_keeps_the_newest(tmp_path):
@@ -1023,7 +1024,7 @@ def test_the_local_checkpoint_is_written_on_its_own_cadence_and_keeps_the_newest
     persistent save's), and the persistent directory holds nothing of the
     local cadence."""
     trainer = local_trainer(tmp_path)
-    trainer.fit(Data(), steps=8, log_every=1, checkpoint_every=3)
+    trainer.fit(dataset(), steps=8, log_every=1, checkpoint_every=3)
     checkpoints = trainer.checkpoints
 
     assert sorted(checkpoints._open().all_steps()) == [3, 6, 8]
@@ -1050,8 +1051,8 @@ def test_a_newer_local_checkpoint_wins_the_resume_and_leaves_the_persistent_one(
     assert checkpoints.source(8) == str(tmp_path / "local" / "process0")
     assert checkpoints.source(6) == str(persistent)
 
-    resumed = local_trainer(tmp_path).fit(Data(), steps=9, log_every=1, checkpoint_every=3)
-    whole = make_trainer(tmp_path / "whole").fit(Data(), steps=9, log_every=1, checkpoint_every=3)
+    resumed = local_trainer(tmp_path).fit(dataset(), steps=9, log_every=1, checkpoint_every=3)
+    whole = make_trainer(tmp_path / "whole").fit(dataset(), steps=9, log_every=1, checkpoint_every=3)
 
     assert int(resumed.step) == 9
     assert jax.tree.map(lambda a, b: bool(np.array_equal(a, b)),
@@ -1068,7 +1069,7 @@ def test_a_local_checkpoint_refuses_another_placement_and_names_the_way_out(tmp_
     stop_at_local_step(local_trainer(tmp_path), 8)
 
     with pytest.raises(ValueError) as error:
-        local_trainer(tmp_path, mesh=MeshSpec(fsdp=2)).fit(Data(), steps=9, log_every=1)
+        local_trainer(tmp_path, mesh=MeshSpec(fsdp=2)).fit(dataset(), steps=9, log_every=1)
     message = str(error.value)
     assert "holds step 8 written with" in message and "places it as" in message
     assert f"delete {tmp_path / 'local'}" in message
@@ -1086,7 +1087,7 @@ def test_local_checkpoints_take_both_the_directory_and_the_cadence(tmp_path):
 
 def test_a_local_cadence_needs_a_stream_that_reports_its_position(tmp_path):
     with pytest.raises(ValueError, match="get_state"):
-        local_trainer(tmp_path).fit(Data(endless), steps=2)
+        local_trainer(tmp_path).fit(dataset(endless), steps=2)
 
 
 class ExplodingManager:
@@ -1112,7 +1113,7 @@ def test_a_checkpoint_that_does_not_land_fails_the_run(tmp_path):
     trainer = make_trainer(tmp_path)
     trainer.checkpoints._manager = ExplodingManager()
     with pytest.raises(OSError):
-        trainer.fit(Data(), steps=1, log_every=1)
+        trainer.fit(dataset(), steps=1, log_every=1)
 
 
 def _rewrite_position(trainer, step, rows, shares):
@@ -1133,13 +1134,13 @@ def test_a_position_written_by_another_process_count_is_refused(tmp_path):
     wrote, each over its own share, has no row the single share of one
     process can take over, and says so."""
     trainer = make_trainer(tmp_path)
-    trainer.fit(Data(), steps=1, log_every=1)
+    trainer.fit(dataset(), steps=1, log_every=1)
     _, saved = trainer.checkpoints.restore(share=DataPartition())
     _rewrite_position(trainer, 2, [saved, saved], shares=[[0, 2], [1, 2]])
 
     with pytest.raises(ValueError, match=r"shares \[\(0, 2\), \(1, 2\)\] \(index, count\), and this "
                                          r"reader reads share 0 of 1"):
-        make_trainer(tmp_path).fit(Data(), steps=3)
+        make_trainer(tmp_path).fit(dataset(), steps=3)
 
 
 def test_a_share_offset_resumes_on_whichever_processes_read_that_share(tmp_path):
@@ -1148,7 +1149,7 @@ def test_a_share_offset_resumes_on_whichever_processes_read_that_share(tmp_path)
     resumes from it, and a table whose readers of one share disagree is
     refused rather than resumed from either."""
     trainer = make_trainer(tmp_path)
-    trainer.fit(Data(), steps=1, log_every=1)
+    trainer.fit(dataset(), steps=1, log_every=1)
     _, saved = trainer.checkpoints.restore(share=DataPartition())
     _rewrite_position(trainer, 2, [saved, saved], shares=[[0, 1], [0, 1]])
 
@@ -1166,7 +1167,7 @@ def test_a_global_position_is_read_by_any_process_count(tmp_path):
     process's position as well. Only a shard offset ties a resume to the
     count that wrote it."""
     trainer = make_trainer(tmp_path)
-    trainer.fit(Data(), steps=1, log_every=1)
+    trainer.fit(dataset(), steps=1, log_every=1)
     global_position = position.encode(position.Global(records=16, order="Counting"))
     _rewrite_position(trainer, 2, [global_position, global_position], shares=[[0, 2], [1, 2]])
 
@@ -1188,7 +1189,7 @@ def test_global_positions_that_disagree_between_processes_are_refused(tmp_path):
     """Every process reports the same global position, so two that differ are
     two orders, and no one of them is this run's place in its own."""
     trainer = make_trainer(tmp_path)
-    trainer.fit(Data(), steps=1, log_every=1)
+    trainer.fit(dataset(), steps=1, log_every=1)
     _rewrite_position(trainer, 2, [
         position.encode(position.Global(records=records, order="Counting"))
         for records in (16, 32)], shares=[[0, 2], [1, 2]])
@@ -1206,7 +1207,7 @@ def test_eval_every_scores_the_validation_split_and_logs_the_artifacts():
     tracker = RecordingTracker()
     objective = Features()
     trainer = make_trainer(objective=objective, tracker=tracker)
-    state = trainer.fit(Data(val=val_batches(3)), steps=4, log_every=2, eval_every=2,
+    state = trainer.fit(dataset(val=val_batches(3)), steps=4, log_every=2, eval_every=2,
                         metrics=(Spread(seen),), preview=True)
 
     # Two passes: at step 2, and at the end of the run.
@@ -1229,9 +1230,9 @@ def test_each_suite_is_scored_on_its_own_cadence_with_its_own_metrics():
 
     tracker = RecordingTracker()
     trainer = make_trainer(objective=Features(), tracker=tracker)
-    trainer.fit(Data(val=None), steps=6, log_every=2, eval_every=2, metrics=(Spread([]),),
-                validation={"often": Data(val=val_batches(1)).val,
-                            "rare": EvalSuite(Data(val=val_batches(2)).val, (Spread([]),), 3)})
+    trainer.fit(dataset(val=None), steps=6, log_every=2, eval_every=2, metrics=(Spread([]),),
+                validation={"often": dataset(val=val_batches(1)).val,
+                            "rare": EvalSuite(dataset(val=val_batches(2)).val, (Spread([]),), 3)})
     steps = {name: [step for step, scores in tracker.scalars if f"{name}/spread" in scores]
              for name in ("often", "rare")}
     assert steps == {"often": [2, 4, 6], "rare": [3, 6]}
@@ -1242,11 +1243,11 @@ def test_the_validation_split_is_the_one_suite_val():
     from dew.training import EvalSuite
 
     runs = []
-    held = Data(val=val_batches(3)).val
+    held = dataset(val=val_batches(3)).val
     for validation in (None, {"val": held}, {"val": EvalSuite(held, (Spread([]),), 3)}):
         tracker = RecordingTracker()
         make_trainer(objective=Features(), tracker=tracker).fit(
-            Data(val=val_batches(3)), steps=6, log_every=2, eval_every=3, metrics=(Spread([]),),
+            dataset(val=val_batches(3)), steps=6, log_every=2, eval_every=3, metrics=(Spread([]),),
             validation=validation)
         runs.append([(step, scores["val/spread"]) for step, scores in tracker.scalars
                      if "val/spread" in scores])
@@ -1278,7 +1279,7 @@ def test_a_fit_on_a_terminal_of_any_width_shows_every_metric(width, monkeypatch)
     monkeypatch.setattr(display, "terminal", lambda console: True)
     monkeypatch.setattr(display, "Console", lambda: Console(file=screen, width=width, height=40,
                                                             force_terminal=True, color_system=None))
-    make_trainer(objective=Features()).fit(Data(val=val_batches(3)), steps=6, log_every=2, eval_every=3,
+    make_trainer(objective=Features()).fit(dataset(val=val_batches(3)), steps=6, log_every=2, eval_every=3,
                                            metrics=(Spread([]),))
 
     output = screen.getvalue()
@@ -1303,7 +1304,7 @@ def test_off_a_terminal_evaluation_keeps_its_plain_line(averaged, label, capsys)
     if not averaged:
         objective.ema = None
     trainer = make_trainer(objective=objective)
-    trainer.fit(Data(val=val_batches(3)), steps=6, log_every=2, eval_every=3, metrics=(Spread([]),))
+    trainer.fit(dataset(val=val_batches(3)), steps=6, log_every=2, eval_every=3, metrics=(Spread([]),))
     output = capsys.readouterr().out
     assert re.search(rf"eval {label} at step 3: spread \S+ \(24 records in \S+ s\)", output), output
     assert re.search(rf"eval {label} at step 6: spread \S+ .+ \(24 records in \S+ s\)", output), output
@@ -1324,7 +1325,7 @@ def test_a_failing_metric_fails_the_validation_pass():
             return accumulated
 
     with pytest.raises(ZeroDivisionError):
-        make_trainer(objective=Features()).fit(Data(val=val_batches(1)), steps=1,
+        make_trainer(objective=Features()).fit(dataset(val=val_batches(1)), steps=1,
                                                log_every=1, eval_every=1, metrics=(Broken(),))
 
 
@@ -1332,9 +1333,9 @@ def test_a_scheduled_validation_pass_with_no_consumer_is_refused():
     """eval_every with neither metrics nor a tracked preview would open
     nothing and report nothing; the contradiction is named before training."""
     with pytest.raises(ValueError, match="nothing consumes"):
-        make_trainer().fit(Data(val=val_batches(1)), steps=1, log_every=1, eval_every=1)
+        make_trainer().fit(dataset(val=val_batches(1)), steps=1, log_every=1, eval_every=1)
     with pytest.raises(ValueError, match="needs a tracker"):
-        make_trainer().fit(Data(val=val_batches(1)), steps=1, log_every=1, eval_every=1, preview=True)
+        make_trainer().fit(dataset(val=val_batches(1)), steps=1, log_every=1, eval_every=1, preview=True)
 
 
 def test_a_failing_validation_loader_fails_the_pass():
@@ -1346,7 +1347,7 @@ def test_a_failing_validation_loader_fails_the_pass():
             raise OSError("val.bin: Input/output error")
 
     with pytest.raises(OSError, match=r"val.bin"):
-        make_trainer(objective=Features()).fit(Data(val=UnreadableSplit), steps=1,
+        make_trainer(objective=Features()).fit(dataset(val=UnreadableSplit), steps=1,
                                                log_every=1, eval_every=1, metrics=(Spread([]),))
 
 
@@ -1365,7 +1366,7 @@ def test_a_metric_that_reads_a_type_the_objective_does_not_produce_is_an_error()
             return accumulated
 
     with pytest.raises(ValueError, match="reads str"):
-        make_trainer(objective=Features()).fit(Data(val=val_batches(1)), steps=1,
+        make_trainer(objective=Features()).fit(dataset(val=val_batches(1)), steps=1,
                                                log_every=1, eval_every=1, metrics=(WantsText(),))
 
 
@@ -1375,7 +1376,7 @@ def test_a_metric_that_reads_a_type_the_objective_does_not_produce_is_an_error()
 
 def test_the_log_tick_carries_the_loss_the_objective_metrics_and_the_throughput():
     tracker = RecordingTracker()
-    make_trainer(tracker=tracker).fit(Data(endless), steps=4, log_every=2)
+    make_trainer(tracker=tracker).fit(dataset(endless), steps=4, log_every=2)
 
     ticks = [(step, scalars) for step, scalars in tracker.scalars if "train/loss" in scalars]
     assert [step for step, _ in ticks] == [2, 4]
@@ -1426,7 +1427,7 @@ def test_the_first_log_tick_measures_steps_not_the_compile(monkeypatch):
 
     monkeypatch.setattr(trainer, "place", slow_place)
     monkeypatch.setattr(trainer, "compile", compile_then_time_each_step)
-    trainer.fit(Data(endless), steps=3, log_every=1)
+    trainer.fit(dataset(endless), steps=3, log_every=1)
 
     ticks = [s for _, s in tracker.scalars if "train/step_time_ms" in s]
     assert [s["train/step_time_ms"] for s in ticks] == pytest.approx([1000.0] * 3)
@@ -1470,7 +1471,7 @@ def test_goodput_counts_evaluations_and_checkpoints_as_time_outside_steps(monkey
     monkeypatch.setattr(trainer, "compile", compile_then_time_each_step)
     monkeypatch.setattr(trainer_module.Evaluation, "run", slow_evaluate)
     monkeypatch.setattr(trainer.checkpoints, "save", slow_save)
-    trainer.fit(Data(val=val_batches()), steps=4, log_every=1, eval_every=2, checkpoint_every=2,
+    trainer.fit(dataset(val=val_batches()), steps=4, log_every=1, eval_every=2, checkpoint_every=2,
                 metrics=(Spread([]),))
 
     goodput = [s for _, s in tracker.scalars if "goodput/step_fraction" in s]
@@ -1501,11 +1502,11 @@ class Diverging(Regression):
 
 def test_sustained_non_finite_loss_stops_the_run():
     with pytest.raises(RuntimeError, match="non-finite"):
-        make_trainer(objective=Diverging()).fit(Data(endless), steps=8, log_every=1)
+        make_trainer(objective=Diverging()).fit(dataset(endless), steps=8, log_every=1)
 
 
 def test_a_healthy_run_does_not_trip_the_detector():
-    state = make_trainer().fit(Data(endless), steps=6, log_every=1)
+    state = make_trainer().fit(dataset(endless), steps=6, log_every=1)
     assert int(state.step) == 6
 
 
@@ -1582,7 +1583,7 @@ def test_a_one_microbatch_step_commits_without_a_conditional(dynamic_scale):
 def test_mixed_precision_trains_through_fit():
     """Every step of a healthy run is accepted, so the loop counts three
     updates and not three rejections."""
-    state = make_trainer(dynamic_scale=True).fit(Data(endless), steps=3, log_every=1)
+    state = make_trainer(dynamic_scale=True).fit(dataset(endless), steps=3, log_every=1)
     assert int(state.step) == 3 and int(state.updates) == 3
 
 
@@ -1605,7 +1606,7 @@ class Counted(Objective):
 
 def test_aux_variables_are_written_back_into_the_state_and_checkpointed(tmp_path):
     trainer = make_trainer(tmp_path, objective=Counted())
-    state = trainer.fit(Data(), steps=3, log_every=1)
+    state = trainer.fit(dataset(), steps=3, log_every=1)
     assert float(state.variables["stats"]["seen"]) == 3.0
 
     restored, _ = trainer.checkpoints.restore()
@@ -1614,7 +1615,7 @@ def test_aux_variables_are_written_back_into_the_state_and_checkpointed(tmp_path
 
 def test_the_optimizer_never_touches_a_non_parameter_collection():
     state = make_trainer(objective=Counted(), optimizer=optax.adamw(1e-2, weight_decay=1.0)).fit(
-        Data(endless), steps=2, log_every=1)
+        dataset(endless), steps=2, log_every=1)
     assert float(state.variables["stats"]["seen"]) == 2.0
     assert set(state.opt_state[0].mu) == {"w"}
 
@@ -1652,7 +1653,7 @@ class TwoTrees(Objective):
 def test_the_ema_stores_only_the_selected_subtree_and_merges_over_the_rest():
     objective = TwoTrees(EMASpec(decay=optax.constant_schedule(0.5),
                                  select=under("params", "tracked")))
-    state = make_trainer(objective=objective).fit(Data(endless), steps=2, log_every=1)
+    state = make_trainer(objective=objective).fit(dataset(endless), steps=2, log_every=1)
 
     assert set(state.ema["params"]) == {"tracked"}
     live = state.variables["params"]
@@ -1752,14 +1753,14 @@ def test_a_custom_step_alternates_two_optimizers_on_the_same_checkpoints_and_tra
                        checkpoints=Checkpoints(str(tmp_path / "gan"), keep=2),
                        tracker=tracker, step=alternating(gen, disc))
 
-    state = trainer().fit(Data(), steps=2, log_every=1)
+    state = trainer().fit(dataset(), steps=2, log_every=1)
     # Step 0 moved the generator half way to 1 (lr 0.25 on a gradient of 2(g - 1));
     # step 1 moved the discriminator half way to the generator.
     assert float(state.variables["params"]["gen"]["g"]) == pytest.approx(0.5)
     assert float(state.variables["params"]["disc"]["d"]) == pytest.approx(0.25)
     assert [s["train/player"] for _, s in tracker.scalars if "train/player" in s] == [0.0, 1.0]
 
-    resumed = trainer().fit(Data(), steps=4, log_every=1)
+    resumed = trainer().fit(dataset(), steps=4, log_every=1)
     assert float(resumed.variables["params"]["gen"]["g"]) == pytest.approx(0.75)
     assert float(resumed.variables["params"]["disc"]["d"]) == pytest.approx(0.5)
     assert Checkpoints(str(tmp_path / "gan")).latest == 4
@@ -1808,8 +1809,8 @@ def test_an_objective_alternates_two_networks_each_with_its_own_optimizer(tmp_pa
                        layout=Layout(min_shard=1, tolerance=1.0),
                        checkpoints=Checkpoints(str(tmp_path / "players"), keep=2))
 
-    halfway = trainer().fit(Data(), steps=2, log_every=10)
-    state = trainer().fit(Data(), steps=4, log_every=10)
+    halfway = trainer().fit(dataset(), steps=2, log_every=10)
+    state = trainer().fit(dataset(), steps=4, log_every=10)
     objective = TwoPlayers()
 
     def own(network, loss, others):

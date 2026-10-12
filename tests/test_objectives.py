@@ -279,7 +279,7 @@ def test_a_supplied_gradient_is_what_the_trainer_steps_with():
     """The statistics keep their value, the derivative of the reduced loss
     is the supplied rule over the mass, and two microbatches of a window
     pool their rules by mass, as the trainer pools `jax.grad`'s."""
-    from affine_run import Data
+    from affine_run import dataset
 
     from dew.training import Layout, Trainer
 
@@ -293,7 +293,7 @@ def test_a_supplied_gradient_is_what_the_trainer_steps_with():
 
     trainer = Trainer(objective, optax.sgd(0.5), key=jax.random.key(0), accumulation=2,
                       layout=Layout(min_shard=1, tolerance=1.0))
-    stepped = trainer.fit(Data(lambda: iter([{"x": x} for x in rows]), batch=8), steps=2).variables
+    stepped = trainer.fit(dataset(lambda: iter([{"x": x} for x in rows]), batch=8), steps=2).variables
     expected = -0.5 * (rows[0].sum(0) + rows[1].sum(0)) / 16
     np.testing.assert_allclose(stepped["params"]["w"], expected, rtol=1e-6)
 

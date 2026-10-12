@@ -13,7 +13,7 @@ import jax
 import numpy as np
 import optax
 import pytest
-from affine_run import Data, Regression
+from affine_run import Regression, dataset
 from recording import RecordingTracker
 from rl_support import TinyHead
 
@@ -68,9 +68,9 @@ def test_an_identity_rollout_leaves_the_loop_byte_identical():
     because it runs under `set_mesh`, which refuses to trace."""
     assert make_trainer().rollout is None
     plain, ident = RecordingTracker(), RecordingTracker()
-    make_trainer(tracker=plain).fit(Data(), steps=2, log_every=1)
+    make_trainer(tracker=plain).fit(dataset(), steps=2, log_every=1)
     make_trainer(rollout=lambda state, batch, key: batch,
-                 tracker=ident).fit(Data(), steps=2, log_every=1)
+                 tracker=ident).fit(dataset(), steps=2, log_every=1)
 
     assert [logged["train/loss"] for _, logged in plain.scalars if "train/loss" in logged] == [
         logged["train/loss"] for _, logged in ident.scalars if "train/loss" in logged] != []
@@ -89,7 +89,7 @@ def test_changing_batches_compile_once():
     compiles = [trainer.compile]
     trainer.compile = lambda *args: (compiles.append(1), compiles[0](*args))[1]
 
-    trainer.fit(Data(), steps=4, log_every=4)
+    trainer.fit(dataset(), steps=4, log_every=4)
 
     assert len(calls) == 4
     assert len(compiles) == 2, "the step compiled more than once"
@@ -99,8 +99,8 @@ def test_rollout_keys_fold_forward_and_reproduce():
     """Three steps draw three distinct keys, and a second identical run draws
     the same three: the rollout stream is checkpointed randomness, not noise."""
     first, second = Recorder(), Recorder()
-    make_trainer(rollout=first).fit(Data(), steps=3, log_every=3)
-    make_trainer(rollout=second).fit(Data(), steps=3, log_every=3)
+    make_trainer(rollout=first).fit(dataset(), steps=3, log_every=3)
+    make_trainer(rollout=second).fit(dataset(), steps=3, log_every=3)
     assert first.steps == [0, 1, 2]
     assert len(set(first.keys)) == 3
     assert first.keys == second.keys
@@ -109,8 +109,8 @@ def test_a_resumed_run_does_not_replay_rollouts(tmp_path):
     """Two steps, then the resumed run samples steps 2 and 3, never 0 and 1
     again."""
     rollout = Recorder()
-    make_trainer(tmp_path, rollout=rollout).fit(Data(), steps=2, log_every=2)
-    make_trainer(tmp_path, rollout=rollout).fit(Data(), steps=4, log_every=4)
+    make_trainer(tmp_path, rollout=rollout).fit(dataset(), steps=2, log_every=2)
+    make_trainer(tmp_path, rollout=rollout).fit(dataset(), steps=4, log_every=4)
 
     assert rollout.steps == [0, 1, 2, 3]
 
@@ -120,13 +120,13 @@ def test_rollout_seconds_logs_only_with_a_rollout():
     and no such key without one. The run's final goodput line is not a step
     tick, so only ticks with a loss count."""
     tracking = RecordingTracker()
-    make_trainer(rollout=Recorder(), tracker=tracking).fit(Data(), steps=2, log_every=1)
+    make_trainer(rollout=Recorder(), tracker=tracking).fit(dataset(), steps=2, log_every=1)
     ticks = [logged for _, logged in tracking.scalars if "train/loss" in logged]
     assert len(ticks) == 2
     assert all(tick["train/rollout_seconds"] >= 0.0 for tick in ticks)
 
     tracking = RecordingTracker()
-    make_trainer(tracker=tracking).fit(Data(), steps=2, log_every=1)
+    make_trainer(tracker=tracking).fit(dataset(), steps=2, log_every=1)
     ticks = [logged for _, logged in tracking.scalars if "train/loss" in logged]
     assert len(ticks) == 2
     assert all("train/rollout_seconds" not in tick for tick in ticks)
@@ -143,7 +143,7 @@ def test_a_rollouts_metrics_log_as_of_its_latest_call():
             return super().__call__(state, batch, key)
 
     tracking = RecordingTracker()
-    make_trainer(rollout=Counting(), tracker=tracking).fit(Data(), steps=4, log_every=2)
+    make_trainer(rollout=Counting(), tracker=tracking).fit(dataset(), steps=4, log_every=2)
     ticks = [logged for _, logged in tracking.scalars if "train/loss" in logged]
     assert [tick["rollout/reward/mean"] for tick in ticks] == [1.5, 3.5]
 
