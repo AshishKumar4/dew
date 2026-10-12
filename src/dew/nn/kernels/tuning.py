@@ -191,12 +191,12 @@ def _bucketed(spec: jax.ShapeDtypeStruct) -> jax.ShapeDtypeStruct:
     return jax.ShapeDtypeStruct((1 << max(spec.shape[0] - 1, 0).bit_length(), *spec.shape[1:]), spec.dtype)
 
 
-def _kernel_times(executable, *args) -> list[tuple[str, float]]:
-    """Each kernel's name and device milliseconds over one run of `executable`
-    (CUPTI); none where it launched none."""
-    from jax.experimental.mosaic.gpu import profiler
-
-    return profiler.measure(executable, aggregate=False)(*args)[1] or []
+def _kernel_times(cupti, executable, *args) -> list[tuple[str, float]]:
+    """Each kernel's name and device milliseconds over one run of
+    `executable`, read by `cupti` (a mosaic `profiler.Cupti`); none where it
+    launched none."""
+    _, kernels = cupti.measure(executable, aggregate=False)(*args)
+    return kernels if isinstance(kernels, list) else []
 
 
 def _measured(op: KernelOp, ba: tokamax.BoundArguments) -> AutotuningData:
@@ -204,13 +204,14 @@ def _measured(op: KernelOp, ba: tokamax.BoundArguments) -> AutotuningData:
     thread and timed alone: the device time CUPTI reads for the launch's own
     kernels, each run after `FLUSH_BYTES` are read, so every config starts
     with its operands out of cache."""
+    from jax.experimental.mosaic.gpu import profiler
+
     leaves, tree = jax.tree.flatten((ba.args, ba.kwargs),
                                     is_leaf=lambda leaf: isinstance(leaf, jax.ShapeDtypeStruct))
     places = [index for index, leaf in enumerate(leaves) if isinstance(leaf, jax.ShapeDtypeStruct)]
     arrays = op.operands([leaves[index] for index in places], 0)
     flush = jnp.zeros(FLUSH_BYTES // 4, jnp.float32)
     evicting = jax.jit(jnp.sum).lower(flush).compile()
-    flushes = {name for name, _ in _kernel_times(evicting, flush)}
 
     def compiled(config):
         configured = op.replace(config=config)
@@ -230,21 +231,26 @@ def _measured(op: KernelOp, ba: tokamax.BoundArguments) -> AutotuningData:
         executable = lowered.compile()
         return executable, (middle - start) * 1e3, (time.perf_counter() - middle) * 1e3
 
-    def launched(executable) -> float:
-        """Milliseconds the launch's kernels ran, the flush's left out."""
-        return sum(milliseconds for name, milliseconds in _kernel_times(executable, flush, arrays)
-                   if name not in flushes)
-
     timings: dict[Hashable, tokamax.BenchmarkData | Exception] = {}
+    read = {}
     with concurrent.futures.ThreadPoolExecutor(os.cpu_count()) as pool:
         futures = {config: pool.submit(compiled, config) for config in ba.autotuning_configs}
-    for config, future in futures.items():
-        try:
-            executable, lowering, compiling = future.result()
-            times = tuple(launched(executable) for _ in range(REPEATS))
-        except Exception as error:  # a config past the GPU's shared memory or registers
-            timings[config] = error
-            continue
+    # One CUPTI subscription reads every run; the flush's own read, last,
+    # detaches it, so a profiler can subscribe after.
+    cupti = profiler.Cupti(finalize=False)
+    try:
+        for config, future in futures.items():
+            try:
+                executable, lowering, compiling = future.result()
+                runs = [_kernel_times(cupti, executable, flush, arrays) for _ in range(REPEATS)]
+            except Exception as error:  # a config past the GPU's shared memory or registers
+                timings[config] = error
+                continue
+            read[config] = runs, lowering, compiling
+    finally:
+        flushes = {name for name, _ in _kernel_times(profiler.Cupti(), evicting, flush)}
+    for config, (runs, lowering, compiling) in read.items():
+        times = tuple(sum(milliseconds for name, milliseconds in run if name not in flushes) for run in runs)
         timings[config] = tokamax.BenchmarkData(compile_time_ms=compiling, lower_time_ms=lowering,
                                                 metadata={}, evaluation_times_ms=times)
     return AutotuningData(timings)
