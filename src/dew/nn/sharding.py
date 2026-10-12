@@ -389,7 +389,8 @@ def row_axes(batch: int, *, mesh: jax.sharding.Mesh | jax.sharding.AbstractMesh 
     return mesh_axes(spec[0]) if spec else ()
 
 
-def manual_map(local, in_specs, out_specs):
+def manual_map[**Arguments, Result](local: Callable[Arguments, Result], in_specs,
+                                     out_specs) -> Callable[Arguments, Result]:
     """`local` in a `shard_map` over every axis the context leaves automatic.
 
     Those the specs do not name go manual too, and the operands are

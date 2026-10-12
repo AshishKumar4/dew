@@ -1180,10 +1180,10 @@ def test_the_real_qwen35_0_8b_delta_rule_chunks_as_it_recurs():
     captured = []
     chunked = linear.chunk_gated_delta_rule
 
-    def recording(query, key, value, g, beta, state=None, chunk_size=linear.CHUNK_SIZE):
+    def recording(query, key, value, g, beta, state=None, chunk_size=linear.CHUNK_SIZE, **dtypes):
         jax.debug.callback(lambda *args: captured.append([np.asarray(x) for x in args]),
                            query, key, value, g, beta)
-        return chunked(query, key, value, g, beta, state, chunk_size)
+        return chunked(query, key, value, g, beta, state, chunk_size, **dtypes)
 
     prompt = np.random.default_rng(0).integers(100, 150_000, (1, 256)).astype(np.int32)
     with jax.default_matmul_precision("highest"):

@@ -13,15 +13,12 @@ own compile of the lowered step, and Triton's of each kernel, still need the
 GPU.
 
 A choice keyed on the platform reads `generation.backend()`, the assumed
-generation's platform, and takes the GPU's path here. Three still read
+generation's platform, and takes the GPU's path here. Two still read
 `jax.default_backend()`, so the dry run cannot see their GPU path:
 attention's cuDNN (`cudnn_runs`) and FlashAttention (`flash_refusal`) calls,
 CUDA kernels and not Pallas ones, whose trace asks the CUDA plugin for
-versions and libraries a CPU host lacks, so attention traces its XLA path;
-and the gated delta rule's explicit 'pallas' on a CPU (dew.nn.linear's
-`chunk_states_kernel`), which places the kernel interpreted where a GPU
-below sm80 would refuse it. `auto` never asks for that. Nor can it lower
-tokamax's Triton ragged dot, the opt-in 'tokamax' grouped matmul's, which
+versions and libraries a CPU host lacks, so attention traces its XLA path.
+Nor can it lower tokamax's Triton ragged dot, the opt-in 'tokamax' grouped matmul's, which
 tokamax registers only on a host with a GPU.
 """
 

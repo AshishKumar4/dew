@@ -307,10 +307,13 @@ def test_a_distillation_recomputes_more_in_its_student_alone_and_resumes_there()
 
 
 @pytest.mark.gpu(reason="needs GPU allocator memory statistics")
-def test_compilation_counts_memory_kept_alive_outside_its_state():
+def test_compilation_counts_memory_kept_alive_outside_its_state(tmp_path):
     """A fresh 2 GiB allocator isolates the accounting regression from
     fragmentation left by earlier GPU tests. Its real held buffers force
     the compiler to fit the remaining memory, then the step runs there.
+    It compiles into a cache of its own: a rung recorded beside a shared
+    cache (`dew.training.rungs`), as its own held buffers record one, would
+    start the next run's first compile above the whole logits.
     """
     if jax.device_count() != 1 or shutil.which("nvidia-smi") is None:
         pytest.skip("needs one NVIDIA GPU with memory reporting")
@@ -328,7 +331,7 @@ def test_compilation_counts_memory_kept_alive_outside_its_state():
     root = Path(__file__).resolve().parents[1]
     environment = {**os.environ, "JAX_PLATFORMS": "cuda",
                    "PYTHONPATH": os.pathsep.join((str(root / "src"), str(root / "tests"))),
-                   "XLA_PYTHON_CLIENT_ALLOCATOR": "bfc",
+                   "XLA_PYTHON_CLIENT_ALLOCATOR": "bfc", "JAX_COMPILATION_CACHE_DIR": str(tmp_path),
                    "XLA_PYTHON_CLIENT_MEM_FRACTION": str(pool_mib / int(total)),
                    "XLA_PYTHON_CLIENT_PREALLOCATE": "true"}
     done = subprocess.run(
