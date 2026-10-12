@@ -79,11 +79,11 @@ def _promoted(pipeline: Pipeline) -> Pipeline:
     is read as a source, in place of the steps the generation already ran,
     with its published packing in place of the pack stage that follows it.
     A first-fit pack directly on a source that states its documents'
-    lengths reads that source's planned windows (`PlannedSource`), by the
-    plan a published generation stores, so the windows are indexed and the
-    order is global in every read."""
+    lengths reads that source's planned windows (`PackedSource.planned`),
+    by the plan a published generation stores, so the windows are indexed
+    and the order is global in every read."""
     from dew.data.cache import Generation
-    from dew.data.packing import PackedSource, PlannedSource, plan_name
+    from dew.data.packing import PackedSource, plan_name
 
     source, stages = pipeline.source, pipeline.stages
     if isinstance(source, (Mixture, Phases)):
@@ -93,7 +93,7 @@ def _promoted(pipeline: Pipeline) -> Pipeline:
             source, stages = stage.cache.source(), stages[index + 1 :]
             plans = record(stage.cache.manifest.get("plan", {}), "published plans")
             if stages and isinstance(stages[0], Pack) and plan_name(stages[0], "accepted") in plans:
-                source, stages = PackedSource(source, stage.cache, stages[0]), stages[1:]
+                source, stages = PackedSource.published(source, stage.cache, stages[0]), stages[1:]
             break
     pack = stages[0] if stages else None
     if (
@@ -102,7 +102,7 @@ def _promoted(pipeline: Pipeline) -> Pipeline:
         and not isinstance(source, (Mixture, Phases))
         and source.lengths() is not None
     ):
-        source, stages = PlannedSource(source, pack), stages[1:]
+        source, stages = PackedSource.planned(source, pack), stages[1:]
     return dataclasses.replace(pipeline, source=source, stages=stages)
 
 

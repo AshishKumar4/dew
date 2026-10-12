@@ -2,10 +2,10 @@
 
 `plan_windows` makes the plan, which chunks of which documents each window
 holds and which windows hold a target. A published generation stores it
-(`PackingPlan`, read back by `PackedSource`), and a source that states its
-documents' lengths is packed by it when it is opened (`PlannedSource`), so
-both read windows by index in one global order, the same at any process
-count, without a pass over the tokens.
+(`PackingPlan`), and a source that states its documents' lengths makes it
+when it is first read. `PackedSource` reads windows by either plan, by
+index in one global order, the same at any process count, without a pass
+over the tokens.
 """
 
 from __future__ import annotations
@@ -13,6 +13,7 @@ from __future__ import annotations
 import dataclasses
 import functools
 from collections.abc import Mapping
+from typing import ClassVar
 
 import grain.python as grain
 import numpy as np
@@ -73,12 +74,22 @@ class PackingPlan:
         return {plan_name(self.pack, field): value for field, value in planned.items()}
 
 
+_FIELDS = ("documents", "offsets", "sizes", "order", "starts", "targets", "accepted")
+"""The plan arrays that fix which chunks each window holds, which a saved
+position's order fingerprints."""
+
+
 @dataclasses.dataclass(frozen=True)
 class _Published:
     """A plan as a generation stores it, read a page at a time."""
 
     generation: Generation
     pack: Pack
+    kind: ClassVar[str] = "published"
+
+    @property
+    def location(self) -> str:
+        return self.generation.url
 
     def at(self, field: str, index: int) -> int:
         return int(self.generation.plan_at(plan_name(self.pack, field), index).item())
@@ -86,12 +97,29 @@ class _Published:
     def __len__(self) -> int:
         return self.generation.plan_length(plan_name(self.pack, "accepted"))
 
+    def fingerprints(self) -> Mapping[str, str]:
+        return {field: self.generation.plan_hash(plan_name(self.pack, field)) for field in _FIELDS}
+
 
 @dataclasses.dataclass(frozen=True)
 class _Held:
-    """A plan made when its source is opened, held in memory."""
+    """A plan made from the lengths `source` states, when it is first read,
+    and held in memory."""
 
-    arrays: Mapping[str, np.ndarray]
+    source: Source
+    pack: Pack
+    kind: ClassVar[str] = "planned"
+
+    @functools.cached_property
+    def arrays(self) -> Mapping[str, np.ndarray]:
+        lengths = self.source.lengths()
+        if lengths is None:
+            raise ValueError(f"{self.source.describe()} states no document lengths to plan its packing by")
+        return plan_windows(lengths, self.pack)
+
+    @property
+    def location(self) -> str:
+        return self.source.describe()
 
     def at(self, field: str, index: int) -> int:
         return int(self.arrays[field][index])
@@ -99,12 +127,15 @@ class _Held:
     def __len__(self) -> int:
         return len(self.arrays["accepted"])
 
+    def fingerprints(self) -> Mapping[str, str]:
+        return {field: fingerprint(self.arrays[field]) for field in _FIELDS}
+
 
 class _PackedRows:
     """The windows a plan makes of `documents`, by index, each with its targets."""
 
-    def __init__(self, documents: Records, plan: _Published | _Held, pack: Pack):
-        self._documents, self._plan, self._pack = documents, plan, pack
+    def __init__(self, documents: Records, plan: _Published | _Held):
+        self._documents, self._plan, self._pack = documents, plan, plan.pack
 
     def _at(self, field: str, index: int) -> int:
         return self._plan.at(field, index)
@@ -133,102 +164,44 @@ class _PackedRows:
 
 @dataclasses.dataclass(frozen=True)
 class PackedSource:
+    """A source's documents packed first-fit into windows by a plan of their
+    lengths (`plan_windows`): the plan a published generation stores
+    (`published`), or the one made from the lengths a source states when it
+    is first read (`planned`). Either way the windows are read by index in
+    one global order."""
+
     source: Source
-    generation: Generation
-    pack: Pack
+    plan: _Published | _Held
+
+    @classmethod
+    def published(cls, source: Source, generation: Generation, pack: Pack) -> PackedSource:
+        return cls(source, _Published(generation, pack))
+
+    @classmethod
+    def planned(cls, source: Source, pack: Pack) -> PackedSource:
+        return cls(source, _Held(source, pack))
 
     def describe(self) -> str:
-        return f"{self.source.describe()} published packing={self.pack!r}"
+        return f"{self.source.describe()} {self.plan.kind} packing={self.plan.pack!r}"
 
     def snapshot(self) -> Mapping[str, object]:
         return {"source": self.source.snapshot(), "packing": self.order_fingerprints()}
 
     def order_fingerprints(self) -> Mapping[str, str]:
-        return {
-            field: self.generation.plan_hash(plan_name(self.pack, field))
-            for field in ("documents", "offsets", "sizes", "order", "starts", "targets", "accepted")
-        }
-
-    def supports(self, read: Read) -> bool:
-        return read in ("memory", "indexed", "streamed")
-
-    def records(self, read: Read) -> _PackedRows:
-        return _PackedRows(self.source.records(read), _Published(self.generation, self.pack), self.pack)
-
-    def metadata(self) -> Mapping[str, object]:
-        total = self.generation.plan_at(plan_name(self.pack, "totals"), 0)
-        return {
-            **self.source.metadata(),
-            "windows": len(self.records("indexed")),
-            "rows": len(self.records("indexed")),
-            "valid_targets": int(total.item()),
-            "zero_target_windows": 0,
-        }
-
-    def lengths(self) -> np.ndarray | None:
-        return None
-
-    def manifest(self) -> ShardManifest:
-        size = len(self.records("indexed"))
-        return ShardManifest(
-            tuple(
-                Shard(
-                    f"{self.generation.url}:{start}",
-                    self.generation.url,
-                    start,
-                    min(start + 1024, size),
-                    min(1024, size - start),
-                )
-                for start in range(0, size, 1024)
-            ),
-            self._reader,
-        )
-
-    def _reader(self, shard: Shard) -> grain.IterDataset[Batch]:
-        return grain.MapDataset.source(self.records("indexed"))[shard.start : shard.stop].to_iter_dataset()
-
-
-@dataclasses.dataclass(frozen=True)
-class PlannedSource:
-    """A source's documents packed first-fit by the plan of the lengths the
-    source states (`plan_windows`), the plan a published generation stores,
-    made from those lengths alone when the source is opened."""
-
-    source: Source
-    pack: Pack
-
-    @functools.cached_property
-    def plan(self) -> Mapping[str, np.ndarray]:
-        lengths = self.source.lengths()
-        if lengths is None:
-            raise ValueError(f"{self.source.describe()} states no document lengths to plan its packing by")
-        return plan_windows(lengths, self.pack)
-
-    def describe(self) -> str:
-        return f"{self.source.describe()} planned packing={self.pack!r}"
-
-    def snapshot(self) -> Mapping[str, object]:
-        return {"source": self.source.snapshot(), "packing": self.order_fingerprints()}
-
-    def order_fingerprints(self) -> Mapping[str, str]:
-        return {
-            field: fingerprint(self.plan[field])
-            for field in ("documents", "offsets", "sizes", "order", "starts", "targets", "accepted")
-        }
+        return self.plan.fingerprints()
 
     def supports(self, read: Read) -> bool:
         return self.source.supports("indexed" if read == "streamed" else read)
 
     def records(self, read: Read) -> _PackedRows:
-        return _PackedRows(self.source.records(read), _Held(self.plan), self.pack)
+        return _PackedRows(self.source.records(read), self.plan)
 
     def metadata(self) -> Mapping[str, object]:
-        windows = len(self.plan["accepted"])
         return {
             **self.source.metadata(),
-            "windows": windows,
-            "rows": windows,
-            "valid_targets": int(self.plan["totals"][0]),
+            "windows": len(self.plan),
+            "rows": len(self.plan),
+            "valid_targets": self.plan.at("totals", 0),
             "zero_target_windows": 0,
         }
 
@@ -236,11 +209,12 @@ class PlannedSource:
         return None
 
     def manifest(self) -> ShardManifest:
-        size = len(self.plan["accepted"])
+        size, location = len(self.plan), self.plan.location
         return ShardManifest(
             tuple(
-                Shard(f"{self.describe()}:{start}", self.describe(), start, min(start + 1024, size),
-                      min(1024, size - start))
+                Shard(
+                    f"{location}:{start}", location, start, min(start + 1024, size), min(1024, size - start)
+                )
                 for start in range(0, size, 1024)
             ),
             self._reader,
