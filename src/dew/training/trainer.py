@@ -389,10 +389,10 @@ class _FitPlan:
     def validation(self) -> bool:
         return bool(self.suites)
 
-    def finished(self, step: int, control: Mapping) -> bool:
+    def finished(self, step: int, tokens: int) -> bool:
         """Whether either run-length cap has been reached."""
         return ((self.steps is not None and step >= self.steps)
-                or (self.total_tokens is not None and control.get("tokens", 0) >= self.total_tokens))
+                or (self.total_tokens is not None and tokens >= self.total_tokens))
 
     @property
     def scored(self) -> tuple[Metric, ...]:
@@ -422,7 +422,6 @@ class _FitRun:
     last_checkpoint: float = 0.0
     checkpoint_due: bool = False
     stop_control: dict = dataclasses.field(default_factory=dict)
-    tokens_at_log: int = 0
     stopped: bool = False
     training: dict[str, jax.Array] = dataclasses.field(default_factory=dict)
     source: Iterator[Batch] | None = None
@@ -1410,15 +1409,15 @@ class Trainer(Generic[Loss, Effects]):
             state = jax.device_put(initial, shardings)
             position = None
         run.last_checkpoint = time.perf_counter()
-        run.tokens_at_log = int(run.stop_control.get("tokens", 0))
-        if self._opened(plan, run, state, position):
+        interval = Interval(time.time(), last_saved=(
+            int(state.step) if checkpoints is not None and checkpoints.latest is not None else None),
+            tokens_before_log=int(run.stop_control.pop("tokens", 0)))
+        if self._opened(plan, run, interval, state, position):
             return state, True
         compiled: dict[Shapes, tuple[CompiledStep, StepFlops | None]] = {}
-        interval = Interval(time.time(), last_saved=(
-            run.current if checkpoints is not None and checkpoints.latest is not None else None))
         seen = 0
         run.notice = PreemptionNotice()
-        while not plan.finished(run.current, run.stop_control):
+        while not plan.finished(run.current, interval.real_tokens if plan.total_tokens is not None else 0):
             # The window's capture opens before this iteration's first
             # read, so the step row records the read it waits on rather
             # than a compile that ran before capture began.
@@ -1473,9 +1472,7 @@ class Trainer(Generic[Loss, Effects]):
                 run.current += 1
                 self._display.step(run.current)
                 seen += 1
-                counted = interval.count(batch, measured_flops, loss, finite, committed, aux)
-                if plan.total_tokens is not None:
-                    run.stop_control["tokens"] = run.tokens_at_log + int(jax.device_get(counted.tokens))
+                interval.count(batch, measured_flops, loss, finite, committed, aux)
                 if run.first_step is None:
                     loss.block_until_ready()
                     run.first_step = time.perf_counter() - run.started
@@ -1537,7 +1534,7 @@ class Trainer(Generic[Loss, Effects]):
         run.other += time.perf_counter() - paused
         return self._reported_outcome(error, run)
 
-    def _opened(self, plan: _FitPlan, run: _FitRun, state: TrainState, position) -> bool:
+    def _opened(self, plan: _FitPlan, run: _FitRun, interval: Interval, state: TrainState, position) -> bool:
         """Start `fit` from the placed state: report it, refuse a run already
         past its steps or a checkpoint cadence with no checkpointer, and open
         the training stream on its prefetch worker. Returns whether the run
@@ -1567,10 +1564,10 @@ class Trainer(Generic[Loss, Effects]):
             raise ValueError(
                 "checkpoint_every asks for checkpoints and this trainer has no "
                 "checkpointer; pass Checkpoints(directory) to write any")
-        if (plan.finished(current, run.stop_control)
+        if (plan.finished(current, interval.real_tokens)
                 and checkpoints is not None and checkpoints.latest is not None):
             return True
-        if not plan.finished(current, run.stop_control):
+        if not plan.finished(current, interval.real_tokens):
             run.source = plan.dataset.train(DataPartition.of(mesh))
             self._check_stream(run.source, mesh, plan.dataset.batch,
                                checkpointing=bool(plan.checkpoint_every or plan.local_every or (
@@ -1625,14 +1622,13 @@ class Trainer(Generic[Loss, Effects]):
         the checkpoints, and the preemption notice. Returns whether the
         notice stops the run at this step, whose checkpoint is then written."""
         current, checkpoints = run.current, self.checkpoints
-        ending = plan.finished(current, run.stop_control)
+        ending = plan.finished(current, interval.real_tokens if plan.total_tokens is not None else 0)
         aux = {name: value for name, value in aux.items()
                if name not in (FORWARD_FLOPS, TRAINING_FLOPS, TOKENS)}
         run.training = {'train/loss': loss, **{f'train/{name}': value for name, value in aux.items()}}
         if current % plan.log_every == 0:
             interval.check_finite(current, self._display)
             self._log_interval(current, loss, aux, accepted, state, interval)
-            run.tokens_at_log = int(run.stop_control.get("tokens", 0))
 
         if isinstance(plan.checkpoint_every, datetime.timedelta):
             # The clock is read at the log interval, where the step is already
@@ -1657,41 +1653,12 @@ class Trainer(Generic[Loss, Effects]):
         scores = (
             {} if run.evaluation is None or run.evaluation.step != current else dict(run.evaluation.scores)
         )
-        ranking = self._ranking(plan, scores)
-        winners = checkpoints._candidates(ranking) if (
-            evaluation_due and checkpoints is not None and (plan.checkpoint_every or plan.best)) else ()
-        candidate = bool(winners)
-        if scores and self._plateau(plan, run, scores):
-            run.stopped = True
-            run.stop_control['stop_reason'] = 'validation plateau'
-            self._display.note("Stopped: validation plateau")
-            candidate = checkpoints is not None
-
-        # On its own clock, not the logging one, so that a cadence
-        # which does not divide log_every still fires.
-        if (plan.checkpoint_every and checkpoints is not None
-                and run.checkpoint_due and not ending) or (candidate and not ending):
-            assert checkpoints is not None
-            run.other += self._saved_checkpoint(
-                checkpoints,
-                current,
-                state,
-                position,
-                interval,
-                scores=scores,
-                ranking=ranking,
-                training_best=not plan.validation and not plan.best,
-                control=run.stop_control,
-                weights_only=not run.checkpoint_due
-                and not run.stopped
-                and bool(winners)
-                and all(rank.weights_only for rank in winners),
-            )
-            run.last_checkpoint = time.perf_counter()
+        if not ending:
+            self._saves(plan, run, interval, state, position, scores, evaluation_due=evaluation_due)
         if (plan.local_every and checkpoints is not None
-                and current % plan.local_every == 0 and not ending):
+                and current % plan.local_every == 0):
             run.other += self._saved_local_checkpoint(
-                checkpoints, current, state, position, control=run.stop_control)
+                checkpoints, current, state, position, interval, control=run.stop_control)
         # Asked at every step on every process, as JAX's agreement
         # needs; the last step ends the run on its own.
         if run.stopped:
@@ -1711,6 +1678,29 @@ class Trainer(Generic[Loss, Effects]):
             run.preempted = current
             return True
         return False
+
+    def _saves(self, plan: _FitPlan, run: _FitRun, interval: Interval, state: TrainState, position,
+               scores: Mapping[str, float], *, evaluation_due: bool, final: bool = False) -> None:
+        """Resolve cadence, ranking, stopping and unconditional final saves in one place."""
+        checkpoints, current = self.checkpoints, run.current
+        ranking = self._ranking(plan, scores)
+        winners = checkpoints._candidates(ranking) if (
+            evaluation_due and checkpoints is not None and (plan.checkpoint_every or plan.best)) else ()
+        candidate = bool(winners)
+        if scores and self._plateau(plan, run, scores):
+            run.stopped = True
+            run.stop_control['stop_reason'] = 'validation plateau'
+            self._display.note("Stopped: validation plateau")
+            candidate = checkpoints is not None
+        if (checkpoints is not None and interval.last_saved != current
+                and (run.checkpoint_due or candidate or (final and plan.checkpoint_final))):
+            run.other += self._saved_checkpoint(
+                checkpoints, current, state, position, interval, scores=scores, ranking=ranking,
+                training_best=not plan.validation and not plan.best, control=run.stop_control,
+                weights_only=not run.checkpoint_due and not run.stopped
+                and not (final and plan.checkpoint_final) and bool(winners)
+                and all(rank.weights_only for rank in winners))
+            run.last_checkpoint = time.perf_counter()
 
     def _wind_down(self, plan: _FitPlan, run: _FitRun, interval: Interval, state: TrainState,
                    shardings: Placement[TrainState], position, profiler: Profiler | None) -> None:
@@ -1745,6 +1735,7 @@ class Trainer(Generic[Loss, Effects]):
         if loss is not None:
             # The last step has to land before the wall time is read.
             loss.block_until_ready()
+        scores: Mapping[str, float] = {}
         if (
             (plan.validation or plan.eval_every or plan.best or plan.stop)
             and run.preempted is None
@@ -1752,28 +1743,8 @@ class Trainer(Generic[Loss, Effects]):
         ):
             run.evaluation = self._evaluation(plan, state, shardings, run.training)
             run.other += run.evaluation.elapsed_seconds
-            if self._plateau(plan, run, run.evaluation.scores):
-                run.stopped = True
-                run.stop_control['stop_reason'] = 'validation plateau'
-                self._display.note("Stopped: validation plateau")
-        if ((plan.checkpoint_final or run.checkpoint_due)
-                and checkpoints is not None and interval.last_saved != current):
-            # The in-loop saves are conditional, so the state the run ends
-            # on may never have been written. It goes out under its real
-            # step: a step-0 checkpoint holding the final weights would
-            # make a resume restart the schedule from the beginning.
-            scores = {} if run.evaluation is None or run.evaluation.step != current else run.evaluation.scores
-            run.other += self._saved_checkpoint(
-                checkpoints,
-                current,
-                state,
-                position,
-                interval,
-                scores=scores,
-                ranking=self._ranking(plan, scores),
-                training_best=not plan.validation and not plan.best,
-                control=run.stop_control,
-            )
+            scores = run.evaluation.scores
+        self._saves(plan, run, interval, state, position, scores, evaluation_due=bool(scores), final=True)
         if checkpoints is not None:
             checkpoints.wait()
 
@@ -2185,7 +2156,8 @@ class Trainer(Generic[Loss, Effects]):
             if not ranking and training_best:
                 ranking = (Ranking('train/loss', metadata['train/loss']),)
         checkpoints.save(step, state, position, metadata, share=DataPartition.of(self.device_mesh),
-                         ranking=ranking, control=control, weights_only=weights_only,
+                         ranking=ranking, control={**(control or {}), "tokens": interval.real_tokens},
+                         weights_only=weights_only,
                          rung=self._checkpoint_rung(), artifact=self._artifact(), boxed=self._boxed_axes())
         self._report(CheckpointRequested(checkpoints.directory), step)
         interval.saved(step)
@@ -2198,6 +2170,7 @@ class Trainer(Generic[Loss, Effects]):
         step: int,
         state: TrainState,
         position: bytes | None,
+        interval: Interval,
         *,
         control: dict | None = None,
     ) -> float:
@@ -2208,7 +2181,8 @@ class Trainer(Generic[Loss, Effects]):
         paused = time.perf_counter()
         self._display.status("writing a local checkpoint")
         checkpoints.save_local(step, state, position, share=DataPartition.of(self.device_mesh),
-                               control=control, rung=self._checkpoint_rung(), artifact=self._artifact(),
+                               control={**(control or {}), "tokens": interval.real_tokens},
+                               rung=self._checkpoint_rung(), artifact=self._artifact(),
                                boxed=self._boxed_axes())
         self._report(CheckpointRequested(str(checkpoints.local_directory), local=True), step)
         self._display.status("")
@@ -2293,10 +2267,10 @@ class Trainer(Generic[Loss, Effects]):
             self._display.interval(step, scalars)
             if self.tracker is not None:
                 self.tracker.log(scalars, step)
-            interval.logged(now)
 
         with region("log"):
             agreed("training reporting", report)
+        interval.logged(time.time())
 
     def _reported_outcome(self, error: BaseException | None, run: _FitRun) -> BaseException | None:
         """Agree the run's cleanup, report its goodput and its outcome.

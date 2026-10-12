@@ -660,7 +660,7 @@ class TrainerConfig:
     Scalars, records and objective previews are tracked; checkpoints are not uploaded.
     """
     publish: bool = False
-    """Publish the final checkpoint to the W&B model registry; requires `wandb`."""
+    """Publish the final checkpoint to W&B; requires `wandb` and `checkpoint_final`."""
     multi_host: bool | None = None
     """Whether to join the JAX process pool.
 
@@ -693,8 +693,8 @@ class TrainerConfig:
     """
 
     def __post_init__(self):
-        if self.publish and self.wandb is None:
-            raise ValueError("trainer.publish requires trainer.wandb to name the publishing run")
+        if self.publish and (self.wandb is None or not self.checkpoint_final):
+            raise ValueError("trainer.publish requires trainer.wandb and trainer.checkpoint_final")
         if self.steps is not None and self.epochs is not None:
             raise ValueError("steps and epochs both name the run length; set one")
         if isinstance(self.checkpoint_every, str) and self.checkpoint_every != 'epoch':

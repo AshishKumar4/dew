@@ -98,6 +98,7 @@ class Interval:
 
     last_log_time: float
     last_saved: int | None
+    tokens_before_log: int = 0
     book: Book | None = None
     fresh: Book | None = None
     steps: int = 0
@@ -112,7 +113,7 @@ class Interval:
     compiles: int = 0
 
     def count(self, batch: Batch, flops: StepFlops | None, loss: jax.Array, finite: jax.Array,
-              committed: Committed | None, aux: Mapping[str, jax.Array] | None = None) -> Book:
+              committed: Committed | None, aux: Mapping[str, jax.Array] | None = None) -> None:
         """Add one step: its records, its FLOPs, its loss and its optimizer commit."""
         self.since_log += 1
         self.steps += 1
@@ -124,11 +125,8 @@ class Interval:
         self.model_counted |= TRAINING_FLOPS in aux
         self.tokens_counted |= TOKENS in aux
         assert self.fresh is not None
-        counted: Book = bookkeep(
-            self.book, loss, finite, committed,
-            aux.get(TRAINING_FLOPS, self.fresh.training), aux.get(TOKENS, self.fresh.tokens))
-        self.book = counted
-        return counted
+        self.book = bookkeep(self.book, loss, finite, committed,
+                             aux.get(TRAINING_FLOPS, self.fresh.training), aux.get(TOKENS, self.fresh.tokens))
 
     def check_finite(self, step: int, display: TrainingDisplay) -> None:
         """Raise RuntimeError once the loss has been non-finite for
@@ -154,8 +152,16 @@ class Interval:
             display.note(f"Non-finite loss for {streak} step(s) before {step}", style="red")
         self.book = self.book._replace(worst_bad_run=self.fresh.worst_bad_run)
 
+    @property
+    def real_tokens(self) -> int:
+        """Lifetime real tokens from completed logs and the current device counter."""
+        current = (int(jax.device_get(self.book.tokens))
+                   if self.tokens_counted and self.book is not None else 0)
+        return self.tokens_before_log + current
+
     def logged(self, now: float) -> None:
         """Start the next logging interval at `now`."""
+        self.tokens_before_log = self.real_tokens
         self.last_log_time, self.since_log, self.samples = now, 0, 0
         self.flops, self.rollout_seconds, self.waited, self.compiling = NO_FLOPS, 0.0, 0.0, 0.0
         self.model_counted = self.tokens_counted = False
