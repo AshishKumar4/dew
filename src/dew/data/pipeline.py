@@ -542,15 +542,16 @@ class Dataset:
             raise ValueError(f"map_batches reads groups of at least one record, not {size}")
         return self.then(Batched(step, size, identity))
 
-    def publish(self, url: str):
-        """Run this dataset's deterministic steps once over every record and
-        commit the result at `url` as a versioned generation, which `cache`
-        reads in their place: the same bytes on every later read and resume."""
-        from dew.data.cache import Cache
-        from dew.data.compile import publish
+    def snapshot(self, url: str, *, format: Literal["array_record", "parquet"] = "array_record",
+                 rows_per_shard: int = 100_000) -> Mapping[str, object]:
+        """Run this dataset once over every record and seal what it makes at
+        `url`: immutable shards and their committed manifest, which
+        `Files(url)` reads back. A fetch's outcomes are sealed with it, so a
+        run that reads the snapshot resumes exactly. Returns the manifest."""
+        from dew.data.sinks import export
 
         chain = self if isinstance(self, Pipeline) else Pipeline(self)
-        return publish(chain, Cache(url), read=chain.mode or "streamed", provision=True, **_loading(chain))
+        return export(chain, url, format=format, rows_per_shard=rows_per_shard)
 
     def rename(self, **names: str) -> Pipeline:
         """Each record with its field `old` under the name `new`, as `rename(caption="txt")`."""
