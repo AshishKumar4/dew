@@ -150,7 +150,9 @@ class Manifest:
 
     `ran` are the steps a memory read already ran into a source it holds.
     That source's snapshot names them by what they compute, so the semantic
-    record leaves them out and the environment takes their modules."""
+    record leaves them out and the environment takes their modules. They are
+    steps of the plan all the same, so the manifest is exact only when they
+    are as well as its own."""
 
     source: Mapping[str, object]
     steps: tuple[StepIdentity, ...] = ()
@@ -268,7 +270,7 @@ class Manifest:
 
     @property
     def exact(self) -> bool:
-        return all(step.exact for step in self.steps)
+        return all(step.exact for step in (*self.ran, *self.steps))
 
 
 @dataclasses.dataclass(frozen=True)
