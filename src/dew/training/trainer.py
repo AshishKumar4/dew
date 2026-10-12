@@ -375,6 +375,7 @@ class _FitPlan:
     log_every: int
     eval_every: int | None
     checkpoint_every: int | datetime.timedelta | None
+    checkpoint_final: bool
     local_every: int | None
     metrics: Sequence[Metric]
     preview: bool
@@ -1270,6 +1271,7 @@ class Trainer(Generic[Loss, Effects]):
         log_every: int = 100,
         eval_every: int | None = None,
         checkpoint_every: int | datetime.timedelta | None = None,
+        checkpoint_final: bool = True,
         metrics: Sequence[Metric] = (),
         preview: bool = False,
         best: str | Metric | TrainingScalar | types.MethodType | Best | Sequence[Best] | None = None,
@@ -1293,8 +1295,9 @@ class Trainer(Generic[Loss, Effects]):
         reader scored as `dataset.val` would be or an `EvalSuite` with its own
         metrics and cadence, logged as `<name>/<metric>`.
 
-        Every `checkpoint_every` steps, and at the end, the state and the data
-        position are written; a duration is checked at each `log_every` step, so
+        Every `checkpoint_every` steps, the state and the data position are
+        written; `checkpoint_final=True` also writes the final state, independently
+        of that cadence. A duration is checked at each `log_every` step, so
         they are written at the first log step after that much time. Every
         `checkpoints.local_every` steps they are also written to the local
         directory.
@@ -1337,6 +1340,7 @@ class Trainer(Generic[Loss, Effects]):
                 log_every,
                 eval_every,
                 checkpoint_every,
+                checkpoint_final,
                 None if checkpoints is None else checkpoints.local_every,
                 metrics,
                 preview,
@@ -1726,7 +1730,7 @@ class Trainer(Generic[Loss, Effects]):
                 run.stopped = True
                 run.stop_control['stop_reason'] = 'validation plateau'
                 self._display.note("Stopped: validation plateau")
-        if checkpoints is not None and interval.last_saved != current:
+        if plan.checkpoint_final and checkpoints is not None and interval.last_saved != current:
             # The in-loop saves are conditional, so the state the run ends
             # on may never have been written. It goes out under its real
             # step: a step-0 checkpoint holding the final weights would

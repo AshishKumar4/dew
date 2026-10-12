@@ -617,6 +617,11 @@ class TrainerConfig:
     A stream whose iterator cannot report its read position must train with None;
     the trainer refuses any other value for it.
     """
+    checkpoint_final: bool = True
+    """Write the final state when training ends, independently of `checkpoint_every`.
+
+    False disables this save; cadenced, ranked and preemption saves keep their own policy.
+    """
     accumulation: int = 1
     """The number of micro-batches per optimizer update."""
     batch_ramp: Ramp | None = None
@@ -1191,6 +1196,7 @@ class RunConfig:
                 log_every=trainer.log_every,
                 eval_every=trainer.eval_interval(dataset),
                 checkpoint_every=trainer.checkpoint_interval(dataset),
+                checkpoint_final=trainer.checkpoint_final,
                 metrics=metrics, preview=trainer.wandb is not None,
                 best=trainer.best_policies(), validation=validation,
             )
