@@ -35,7 +35,6 @@ Run with the Dew test environment's torch, on CPU:
     python tools/vllm_router_reference.py OUTPUT.npz
 """
 
-import ast
 import contextlib
 import hashlib
 import json
@@ -46,6 +45,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from reference_source import ran, selected
 
 REPO, COMMIT = "vllm-project/vllm", "ced6857afa0ea7b2e3f0846a62e1394e90f15607"
 PATH = "vllm/model_executor/layers/fused_moe/router/grouped_topk_router.py"
@@ -76,17 +76,14 @@ def grouped_topk():
     found = hashlib.sha256(local.read_bytes()).hexdigest()
     if found != DIGEST:
         raise RuntimeError(f"{local} has SHA-256 {found}, not the pinned {DIGEST}")
-    tree = ast.parse(local.read_text())
-    [function] = [node for node in tree.body
-                  if isinstance(node, ast.FunctionDef) and node.name == "grouped_topk"]
+    [function] = selected(local.read_text(), {"grouped_topk"}, filename=str(local))
     function.decorator_list = []
     namespace = {
         "torch": torch,
         "envs": types.SimpleNamespace(VLLM_USE_FUSED_MOE_GROUPED_TOPK=False, VLLM_BATCH_INVARIANT=True),
         "current_platform": types.SimpleNamespace(is_cuda=lambda: False, is_xpu=lambda: False),
     }
-    exec(compile(ast.Module([function], type_ignores=[]), str(local), "exec"), namespace)
-    return namespace["grouped_topk"]
+    return ran([function], namespace, str(local))["grouped_topk"]
 
 
 def margins(logits: np.ndarray, bias: np.ndarray, config: dict) -> np.ndarray:
