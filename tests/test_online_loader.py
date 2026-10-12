@@ -187,13 +187,13 @@ def test_a_snapshot_of_fetched_bytes_trains_and_resumes_exactly_after_every_url_
 
 def test_a_web_video_flow_decodes_frames_from_fetched_bytes(tmp_path):
     """Clips fetched by url decode from their bytes to frames; bytes that are no clip are dropped."""
-    from test_data_av import CLIP_FRAMES, GREY_STEP, _clip
+    from test_data_av import CLIP_FRAMES, FPS, GREY_STEP, _mux
 
-    clip = Path(_clip(tmp_path, audio=False))
+    clip = Path(_mux(tmp_path / "clip.avi", sound=0))
     (tmp_path / "broken.mp4").write_bytes(b"not a video")
     table = [{"url": clip.as_uri(), "caption": "a fade"}, {"url": (tmp_path / "broken.mp4").as_uri()}]
     pipeline = (Pipeline(Memory(table)).shuffle(2).repeat().filter_map(video.fetch())
-                .filter_map(video.decode_clip(8, size=16)).batch(2))
+                .filter_map(video.pick_clip(8 / FPS)).filter_map(video.decode(8, size=16)).batch(2))
     data = compile(pipeline, read="indexed", loading=READ)
     stream = data.train(DataPartition())
     try:
