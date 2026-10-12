@@ -29,8 +29,9 @@ GREY_STEP = 5
 SAMPLE_STEP = 100
 
 
-def _mux(path, *, frames=CLIP_FRAMES, sound=CLIP_FRAMES):
-    """A clip of `frames` frames over `sound` frames' worth of sound; either may be 0."""
+def _mux(path, *, frames=CLIP_FRAMES, sound=CLIP_FRAMES, delay=0.0):
+    """A clip of `frames` frames over `sound` frames' worth of sound starting `delay` seconds in;
+    either count may be 0."""
     inputs, codecs = [], []
     if frames:
         pixels = np.stack([np.full((32, 32, 3), GREY_STEP * index, np.uint8) for index in range(frames)])
@@ -41,7 +42,8 @@ def _mux(path, *, frames=CLIP_FRAMES, sound=CLIP_FRAMES):
     if sound:
         samples = np.repeat(np.arange(sound, dtype=np.int16) * SAMPLE_STEP, SAMPLES_PER_FRAME)
         path.with_suffix(".pcm").write_bytes(samples.tobytes())
-        inputs += ["-f", "s16le", "-ar", str(SAMPLE_RATE), "-ac", "1", "-i", str(path.with_suffix(".pcm"))]
+        inputs += ["-itsoffset", str(delay), "-f", "s16le", "-ar", str(SAMPLE_RATE), "-ac", "1",
+                   "-i", str(path.with_suffix(".pcm"))]
         codecs += ["-c:a", "pcm_s16le"]
     subprocess.run([moviepy_config.FFMPEG_BINARY, "-y", "-loglevel", "error", *inputs, *codecs, str(path)],
                    check=True)
@@ -52,11 +54,14 @@ def _mux(path, *, frames=CLIP_FRAMES, sound=CLIP_FRAMES):
 def media(tmp_path_factory):
     root = tmp_path_factory.mktemp("av")
     return {"clip": _mux(root / "clip.avi"), "sound": _mux(root / "sound.wav", frames=0),
-            "silent": _mux(root / "silent.avi", sound=0), "short": _mux(root / "short.avi", sound=20)}
+            "silent": _mux(root / "silent.avi", sound=0), "short": _mux(root / "short.avi", sound=20),
+            "exact": _mux(root / "exact.avi", frames=12, sound=12),
+            # Matroska keeps a stream's start, where AVI starts every stream with the file.
+            "late": _mux(root / "late.mkv", delay=0.5)}
 
 
 def _records(chain):
-    return list(chain.iterate())
+    return list(chain.repeat(1).iterate())
 
 
 def _frame_indices(frames):
@@ -113,14 +118,16 @@ def test_a_sound_file_reads_through_the_same_stages(media):
 
 
 def test_sound_a_window_lacks_is_rejected_or_silence_marked_invalid(media):
-    """A clip with no track, one whose track ends inside the window and a window whose context
-    opens before the file: rejected, or under `missing="silence"` held as silence that
-    `audio_valid` marks, the sound there is sample for sample where it is."""
+    """A clip with no track, one whose track ends inside the window, a window whose context opens
+    before the file and a track that starts after its video: rejected, or under
+    `missing="silence"` held as silence that `audio_valid` marks, the sound there sample for sample
+    where it is."""
     window = np.asarray([0.6, 0.92])
     rows = [{"mp4": media["silent"], "clip": window, "id": 0},
             {"mp4": media["short"], "clip": window, "id": 1},
             {"mp4": media["clip"], "clip": np.asarray([0.0, 0.32]), "id": 2},
-            {"mp4": media["clip"], "clip": window, "id": 3}]
+            {"mp4": media["clip"], "clip": window, "id": 3},
+            {"mp4": media["late"], "clip": window - 0.2, "id": 4}]
     context = 2 / FPS
 
     def read(missing):
@@ -129,7 +136,7 @@ def test_sound_a_window_lacks_is_rejected_or_silence_marked_invalid(media):
 
     assert list(read("reject")) == [3]
     silence = read("silence")
-    silent, short, early, whole = (silence[index] for index in range(4))
+    silent, short, early, whole, late = (silence[index] for index in range(5))
     samples = round((0.32 + 2 * context) * SAMPLE_RATE)
     assert not silent["audio_valid"].any() and not silent["audio"].any()
     # The short clip's sound ends at 0.8 seconds, 0.28 seconds into the widened window.
@@ -141,6 +148,10 @@ def test_sound_a_window_lacks_is_rejected_or_silence_marked_invalid(media):
     assert early["audio_valid"].tolist() == [False] * lead + [True] * (samples - lead)
     assert not early["audio"][:lead].any() and _sound_from(early["audio"][lead:], 0)
     assert whole["audio_valid"].all() and _sound_from(whole["audio"], round(0.52 * SAMPLE_RATE))
+    # The late track starts half a second in, 0.18 seconds into the widened window from 0.32.
+    held = round(0.18 * SAMPLE_RATE)
+    assert late["audio_valid"].tolist() == [False] * held + [True] * (samples - held)
+    assert not late["audio"][:held].any() and _sound_from(late["audio"][held:], 0)
 
 
 def test_media_too_short_or_unreadable_is_dropped_and_frames_past_their_window_raise(media):
@@ -153,20 +164,33 @@ def test_media_too_short_or_unreadable_is_dropped_and_frames_past_their_window_r
         video.decode(10, fps=FPS).map({"mp4": media["clip"], "clip": np.asarray([0.0, 8 / FPS])})
 
 
-def test_a_window_is_the_record_s_own_draw():
+def test_a_clip_that_fits_its_window_exactly_is_read(media):
+    """Twelve frames hold an eight-frame window two frames clear of either end in one place only."""
+    chain = (Memory([{"mp4": media["exact"], "id": 0}])
+             .filter_map(video.pick_clip(8 / FPS, margin=2 / FPS))
+             .filter_map(video.decode(8, fps=FPS, size=32))
+             .filter_map(audio.decode(SAMPLE_RATE, context=2 / FPS)))
+
+    (record,) = _records(chain)
+
+    assert record["clip"].tolist() == pytest.approx([2 / FPS, 10 / FPS])
+    assert _frame_indices(record["video"]) == list(range(2, 10))
+    assert record["audio_valid"].all() and _sound_from(record["audio"], 0)
+
+
+def test_a_window_is_the_record_s_own_draw(media):
     """The same record draws the same window in any read, without the global generator."""
     np.random.seed(1234)
     state = np.random.get_state()[1].copy()
     pick = video.pick_clip(0.4, margin=0.1)
 
-    from dew.data.sources import av_utils
+    def draws():
+        record = {"mp4": media["clip"]}
+        return [pick.random_map(record, np.random.default_rng(seed))["clip"] for seed in range(16)]
 
-    with pytest.MonkeyPatch.context() as patch:
-        patch.setattr(av_utils, "media_info", lambda path: (2.0, True, True))
-        first = [pick.random_map({"mp4": "x"}, np.random.default_rng(seed))["clip"] for seed in range(64)]
-        again = [pick.random_map({"mp4": "x"}, np.random.default_rng(seed))["clip"] for seed in range(64)]
+    first, again = draws(), draws()
 
     assert all(np.array_equal(a, b) for a, b in zip(first, again, strict=True))
     starts = np.asarray([clip[0] for clip in first])
-    assert starts.min() >= 0.1 and starts.max() <= 2.0 - 0.4 - 0.1 and len(set(starts.tolist())) == 64
+    assert starts.min() >= 0.1 and starts.max() <= 2.0 - 0.4 - 0.1 and len(set(starts.tolist())) == 16
     assert np.array_equal(state, np.random.get_state()[1])

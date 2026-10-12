@@ -59,9 +59,10 @@ class PickClip(grain.RandomMapTransform):
         except (OSError, ValueError):
             return Rejected("undecodable")
         latest = duration - self.seconds - self.margin
-        if latest < self.margin:
+        # A nanosecond of slack: a clip that fits exactly, 0.48 - 0.32 - 0.08 seconds, is short by roundoff.
+        if latest < self.margin - 1e-9:
             return Rejected("shorter than the clip")
-        start = float(rng.uniform(self.margin, latest))
+        start = float(rng.uniform(self.margin, max(latest, self.margin)))
         return {**element, self.to: np.asarray([start, start + self.seconds])}
 
 

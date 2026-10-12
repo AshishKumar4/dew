@@ -7,6 +7,7 @@ open across records.
 
 from __future__ import annotations
 
+import re
 import subprocess
 
 import numpy as np
@@ -30,9 +31,10 @@ def media_info(path: str) -> tuple[float, bool, bool]:
     return float(duration), bool(probed.get("video_found")), bool(probed.get("audio_found"))
 
 
-def audio_window(path: str, start: float, duration: float, sample_rate: int) -> np.ndarray:
-    """The sound of `path` from `start` for `duration` seconds, mono at
-    `sample_rate`, float32 in [-1, 1]; shorter where the track ends first.
+def audio_window(path: str, start: float, duration: float, sample_rate: int) -> tuple[np.ndarray, np.ndarray]:
+    """The sound of `path` from `start` for `duration` seconds, mono at `sample_rate`, float32 in
+    [-1, 1], and whether the track holds each sample: silence and False before the track begins,
+    whether `start` is before the file's or the track starts late, and after it ends.
 
     ffmpeg does the seek, the resampling and the downmix, through the binary
     moviepy drives. moviepy's own audio reader asks for stereo at 44.1 kHz
@@ -40,23 +42,35 @@ def audio_window(path: str, start: float, duration: float, sample_rate: int) -> 
     a mono track; sampling that stream at another rate then picks the
     nearest 44.1 kHz sample, which aliases and is never sample-exact.
 
-    The seek lands a second early and decodes up to `start`: seeking straight
-    to it, ffmpeg started an AVI's track at the next packet, 73 or 261
-    samples late in 2 of 80 windows, where this read was within a sample of
-    the asked start in all 80.
+    The samples are placed by the timestamp of the first one decoded, read a
+    second before `start`: cut by ffmpeg's own seek instead, an AVI's track
+    started 73 or 261 samples late in 2 of 80 windows and a Matroska one up
+    to 464 samples off, and a track that starts after the video came back
+    shifted to the window's start. Placed, all 80 were sample-exact.
     """
     from moviepy.config import FFMPEG_BINARY
 
-    early = max(start - 1.0, 0.0)
     done = subprocess.run(
-        [FFMPEG_BINARY, "-loglevel", "error", "-nostdin", "-ss", f"{early:.6f}", "-i", path,
-         "-ss", f"{start - early:.6f}", "-t", f"{duration:.6f}", "-vn", "-f", "s16le", "-ac", "1",
-         "-ar", str(sample_rate), "-"],
+        [FFMPEG_BINARY, "-loglevel", "info", "-nostdin", "-copyts", "-start_at_zero",
+         "-ss", f"{max(start - 1.0, 0.0):.6f}", "-to", f"{start + duration + 0.01:.6f}", "-i", path,
+         "-map", "0:a:0", "-af", "ashowinfo", "-f", "s16le", "-ac", "1", "-ar", str(sample_rate), "-"],
         capture_output=True)
     if done.returncode:
         raise ValueError(f"ffmpeg could not read the audio of {path}: "
-                         f"{done.stderr.decode(errors='replace').strip()}")
-    return np.frombuffer(done.stdout, np.int16).astype(np.float32) / 32768.0
+                         f"{done.stderr.decode(errors='replace').strip()[-2000:]}")
+    count = round(duration * sample_rate)
+    wave, held = np.zeros(count, np.float32), np.zeros(count, bool)
+    first = re.search(rb"pts_time:(\S+)", done.stderr)
+    if first is None:
+        return wave, held
+    decoded = np.frombuffer(done.stdout, np.int16).astype(np.float32) / 32768.0
+    # The first decoded sample's place in the window; before it where the read began early.
+    at = round((float(first.group(1)) - start) * sample_rate)
+    lead = min(max(at, 0), count)
+    kept = decoded[max(-at, 0):][:count - lead]
+    wave[lead:lead + len(kept)] = kept
+    held[lead:lead + len(kept)] = True
+    return wave, held
 
 
 def read_frames(path: str, start: float, count: int, fps: float) -> np.ndarray:
