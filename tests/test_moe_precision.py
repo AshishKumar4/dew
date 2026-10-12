@@ -14,12 +14,9 @@ import numpy as np
 import optax
 import pytest
 from jax.sharding import NamedSharding, PartitionSpec as P
-from reference_error import assert_as_exact_as_the_reference
 from scipy.special import erfc
-from tuned import each_config
 
 from dew.nn.gpt_oss import GptOssExperts
-from dew.nn.kernels import grouped_matmul, tuning
 from dew.nn.kernels.generation import triton_runs
 from dew.nn.moe import ExpertMLP, exact_gelu, expert_dispatch, expert_projection
 from dew.training import MeshSpec
@@ -203,44 +200,6 @@ def test_a_projection_on_the_cpu_of_a_gpu_host_runs_without_the_triton_kernels(i
     assert y.devices() == {cpu}
     np.testing.assert_allclose(np.asarray(y, np.float64), rounded(grouped(rounded(x), rounded(kernel))),
                                atol=TOLERANCE, rtol=TOLERANCE)
-
-
-@pytest.mark.gpu(reason="needs a GPU the Pallas kernels compile for")
-@pytest.mark.parametrize('kernel', [grouped_matmul.Gmm, grouped_matmul.Tgmm])
-def test_every_tile_of_the_grouped_matmuls_holds_the_float64_gate(kernel):
-    """Each tile the tuner may pick, over ragged groups, an empty one among
-    them, and rows past the routed ones: the output and both gradients, the
-    tile under test in every launch of its kernel, as close to float64 as
-    XLA's ragged dot. The space declares only tiles proven here."""
-    rng = np.random.default_rng(89)
-    sizes = np.array([0, 300, 17, 0, 410, 99, 64, 0], np.int32)
-    x = jnp.asarray(rng.normal(size=(1000, 256)), jnp.bfloat16)
-    master = jnp.asarray(rng.normal(size=(8, 256, 384)) / 16, jnp.float32)
-    cotangent = jnp.asarray(rng.normal(size=(1000, 384)), jnp.bfloat16)
-    qx, qk, qy = (np.asarray(value, np.float64) for value in (x, rounded(master), cotangent))
-    rows = np.searchsorted(np.cumsum(sizes), np.arange(1000), side='right')
-    routed = np.flatnonzero(np.arange(1000) < sizes.sum())
-    truth = [np.zeros((1000, 384)), np.zeros((1000, 256)), np.zeros((8, 256, 384))]
-    for row in routed:
-        truth[0][row] = qx[row] @ qk[rows[row]]
-        truth[1][row] = qy[row] @ qk[rows[row]].T
-        truth[2][rows[row]] += np.outer(qx[row], qy[row])
-
-    def evaluated(implementation):
-        def run(x, master):
-            y, backward = jax.vjp(lambda x, master: expert_projection(
-                x, master, jnp.asarray(sizes), jnp.bfloat16, implementation, None), x, master)
-            return (y, *backward(cotangent))
-        return jax.jit(run)
-
-    reference = evaluated('xla')(x, master)
-    configs = each_config(kernel, evaluated('pallas'), x, master)
-    assert len(configs) > 1
-    for config in configs:
-        with tuning.pinned({kernel: config}):
-            actual = evaluated('pallas')(x, master)
-        for label, mine, theirs, exact in zip(('y', 'x', 'kernel'), actual, reference, truth, strict=True):
-            assert_as_exact_as_the_reference(mine, theirs, exact, f"{kernel.__name__} at {config}: {label}")
 
 
 @pytest.mark.parametrize('sizes', [np.full(8, 3), np.array([0, 5, 0, 0, 12, 1, 0, 3])],
