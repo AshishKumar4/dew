@@ -35,11 +35,11 @@ from dew.nn.attention import (
     causal_attention_mask,
     exchanged_heads_attention,
     gathered_keys_attention,
-    local_attention,
     scaled_dot_product_attention,
     stripe,
     unstripe,
 )
+from dew.nn.local_attention import local_attention
 from dew.nn.mixers.mamba2 import Mamba2
 from dew.nn.rope import rotary_freqs
 from dew.objectives.lm import LMObjective
