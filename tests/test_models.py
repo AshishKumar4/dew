@@ -106,9 +106,9 @@ def test_a_bf16_vae_rounds_where_diffusers_flax_vae_does(part):
         jax.tree_util.tree_structure(params)
     params = jax.tree.map(lambda leaf: leaf + 0.05 * jax.random.normal(jax.random.key(1), leaf.shape),
                           params)
-    actual = np.asarray(ours.clone(dtype=jnp.bfloat16).apply(params, jnp.asarray(x, jnp.bfloat16)), np.float32)
-    reference = np.asarray(theirs.clone(dtype=jnp.bfloat16).apply(params, jnp.asarray(x, jnp.bfloat16)),
-                           np.float32)
+    narrow = jnp.asarray(x, jnp.bfloat16)
+    actual = np.asarray(ours.clone(dtype=jnp.bfloat16).apply(params, narrow), np.float32)
+    reference = np.asarray(theirs.clone(dtype=jnp.bfloat16).apply(params, narrow), np.float32)
     with jax.enable_x64():
         wide = jax.tree.map(lambda leaf: jnp.asarray(np.asarray(leaf), jnp.float64), params)
         truth = np.asarray(ours.clone(dtype=jnp.float64).apply(wide, jnp.asarray(x, jnp.float64)))
