@@ -63,19 +63,20 @@ def ragged_dot_refusal(compute: Dtype, operands: tuple[Dtype, ...],
 
 @dataclasses.dataclass(frozen=True)
 class Tile:
-    """One launch's output tile, its depth step, and its warps and pipeline
-    stages; None is Triton's own count, as the rule leaves it."""
+    """One launch's output tile, its depth step, and its warps and pipeline stages."""
     block_m: int
     block_n: int
     block_k: int
-    warps: int | None
-    stages: int | None
+    warps: int
+    stages: int
 
 
 def _rule(dtype: jnp.dtype) -> Tile:
-    """JAX's one tile for every shape (`ragged_dot._hyperparam_selection_rule`)."""
+    """JAX's one tile for every shape (`ragged_dot._hyperparam_selection_rule`),
+    at the 4 warps and 3 stages Pallas Triton gives a CUDA launch that names
+    none (jax/_src/pallas/triton/pallas_call_registration.py:95-98)."""
     from . import ragged_dot
-    return Tile(**ragged_dot._hyperparam_selection_rule(np.dtype(dtype)), warps=None, stages=None)
+    return Tile(**ragged_dot._hyperparam_selection_rule(np.dtype(dtype)), warps=4, stages=3)
 
 
 def _tiles(dtype: jnp.dtype) -> set[Tile]:
