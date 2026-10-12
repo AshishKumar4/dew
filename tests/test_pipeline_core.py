@@ -596,6 +596,23 @@ def test_a_scored_branch_cut_per_share_splits_its_whole_order():
     assert tokens == list(range(8))
 
 
+def test_a_scored_memory_branch_that_shuffles_before_its_split_holds_out_half_its_tokens():
+    """A memory read of a scored branch is analyzed as scored too, so a token
+    split after a shuffle, in an order a filter cuts per share, holds out the
+    first half of the shuffled documents' tokens."""
+    documents = Memory(tuple({"text": np.arange(4, dtype=np.int32) + 4 * index} for index in range(4)))
+    split = Pipeline(documents).shuffle(0).token_split(0.5, held=True)
+    held = split.filter(lambda row: True, identity="all@1")
+    data = compile(Pipeline(source()).batch(2), validation=held.batch(1), read="memory", loading=READ)
+    assert data.val is not None
+    reader = data.val(DataPartition())
+    try:
+        tokens = [value for batch in reader for row in np.asarray(batch["text"]) for value in row.tolist()]
+    finally:
+        reader.close()
+    assert len(tokens) == len(set(tokens)) == 8
+
+
 def test_a_streamed_repeat_repeats_where_it_is_written_past_a_limit_or_a_repeat():
     """A streamed root repeats in place of a written repeat only when nothing
     before it counts the rows: two rows taken and repeated three times read
