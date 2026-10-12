@@ -27,8 +27,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from dew import Dataset, Trainer
+from dew import Trainer
 from dew.config import OptimConfig
+from dew.data.dataset import Loader
 from dew.data import ByteTokenizer, Loading
 from dew.config.data import PreferenceData
 from dew.data.chat import Role

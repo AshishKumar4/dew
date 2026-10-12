@@ -221,25 +221,34 @@ def _event(key: jax.Array, step: int | jax.Array, schedule_step: int | jax.Array
            ) -> tuple[int, Step, tuple[int, ...], dict[str, float]]:
     """Draw the event's clocks and RNG, and the identity every rank reports.
 
-    The clocks come home through a collective, so a rank whose own step
-    differs uses root's. The key folds in 'EVAL' and that step, so an
-    evaluation never draws what a training step at the same clock drew.
+    The clocks come home through a collective and every rank takes root's,
+    so a rank whose own step differs uses root's step and schedule step. The
+    key folds in 'EVAL' and that step, so an evaluation never draws what a
+    training step at the same clock drew; a rank whose key differs from its
+    peers' is refused, by the identity they compare.
     """
     step_home, schedule_home, reports = collective_host(
         (step, step if schedule_step is None else schedule_step, dict(training or {})),
         phase="evaluation clocks",
     )
 
-    def event() -> tuple[int, Step, jax.Array]:
-        at = int(step_home)
-        event_key = _folded(_folded(key, 0x4556414C), at)
-        return (at, Step(step=jax.device_put(schedule_home), key=event_key, ema=averaged),
-                jax.random.key_data(event_key))
+    def root_clocks() -> list | None:
+        # Root's clocks as root holds them; a clock root cannot read is refused on every rank.
+        schedule = np.asarray(schedule_home)
+        return ([int(step_home), schedule.item(), schedule.dtype.name] if jax.process_index() == 0
+                else None)
 
-    event_step, context, event_data = agreed("evaluation context", event)
-    event_words = tuple(int(word) for word in np.asarray(collective_host(
-        event_data, phase="event identity")))
-    return event_step, context, event_words, {name: float(value) for name, value in reports.items()}
+    at, schedule_at, dtype = broadcast_from_process_zero(agreed("evaluation clocks", root_clocks))
+
+    def event() -> tuple[Step, jax.Array]:
+        event_key = _folded(_folded(key, 0x4556414C), at)
+        schedule = jax.device_put(np.asarray(schedule_at, np.dtype(dtype)))
+        return Step(step=schedule, key=event_key, ema=averaged), jax.random.key_data(event_key)
+
+    context, event_data = agreed("evaluation context", event)
+    event_words = agreed_same("evaluation key", lambda: [int(word) for word in np.asarray(collective_host(
+        event_data, phase="event identity"))])
+    return at, context, tuple(event_words), {name: float(value) for name, value in reports.items()}
 
 
 def _folded(key: jax.Array, word: int) -> jax.Array:

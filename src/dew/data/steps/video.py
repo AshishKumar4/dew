@@ -48,7 +48,8 @@ class PickClip(grain.RandomMapTransform):
     margin: float = 0.0
     field: str = "mp4"
     to: str = "clip"
-    rejects = True
+    rejects: bool = True
+    """Whether media that does not read or is too short is dropped (`filter_map`) rather than an error."""
 
     def random_map(self, element: Batch, rng: np.random.Generator) -> Batch | Rejected:
         from dew.data.sources.av_utils import media_info
@@ -57,10 +58,15 @@ class PickClip(grain.RandomMapTransform):
             with contextlib.ExitStack() as held:
                 duration, _, _ = media_info(local_file(element[self.field], held))
         except (OSError, ValueError):
+            if not self.rejects:
+                raise
             return Rejected("undecodable")
         latest = duration - self.seconds - self.margin
         # A nanosecond of slack: a clip that fits exactly, 0.48 - 0.32 - 0.08 seconds, is short by roundoff.
         if latest < self.margin - 1e-9:
+            if not self.rejects:
+                raise ValueError(f"{duration}-second media holds no {self.seconds}-second clip {self.margin} "
+                                 "seconds clear of either end")
             return Rejected("shorter than the clip")
         start = float(rng.uniform(self.margin, max(latest, self.margin)))
         return {**element, self.to: np.asarray([start, start + self.seconds])}
@@ -78,7 +84,8 @@ class DecodeVideo(grain.MapTransform):
     field: str = "mp4"
     clip: str = "clip"
     to: str = "video"
-    rejects = True
+    rejects: bool = True
+    """Whether a clip that does not decode is dropped (`filter_map`) rather than an error."""
 
     def map(self, element: Batch) -> Batch | Rejected:
         from dew.data.sources.av_utils import read_frames
@@ -91,5 +98,7 @@ class DecodeVideo(grain.MapTransform):
             with contextlib.ExitStack() as held:
                 frames = read_frames(local_file(element[self.field], held), start, self.frames, self.fps)
         except (OSError, ValueError):
+            if not self.rejects:
+                raise
             return Rejected("undecodable")
         return {**element, self.to: fit_frames(frames, self.size)}

@@ -662,6 +662,24 @@ def _voxceleb_tree(root, split="train", identities=("id00012", "id00015")):
     return clips
 
 
+def test_local_videos_lists_every_file_under_the_directory(tmp_path):
+    pytest.importorskip("moviepy.config", reason="needs the av extra")
+    clips = _voxceleb_tree(tmp_path)
+    (tmp_path / "extra.webm").write_bytes(b"")
+
+    from dew.config.data import _VideoRow
+    from dew.data import Files
+
+    patterns = (str(tmp_path / "**" / "*.avi"), str(tmp_path / "**" / "*.webm"))
+    rows = Files(patterns, format="files").records("memory")
+    records = [_VideoRow(caption="a clip")(row) for row in rows]
+
+    assert sorted(r["mp4"] for r in records) == sorted(
+        [c.as_uri() for c in clips] + [(tmp_path / "extra.webm").as_uri()]
+    )
+    assert {r["caption"] for r in records} == {"a clip"}
+
+
 def test_a_missing_clip_directory_is_refused(tmp_path):
     with pytest.raises((ValueError, FileNotFoundError), match=r"source|files|directory"):
         stored_source(str(tmp_path / "missing"), format="files").records("memory")
@@ -990,19 +1008,19 @@ def test_an_interrupted_epoch_resumes_on_exactly_the_records_it_had_not_seen(
     iterator batches ahead of the worker slice so that holds at every worker
     count.
     """
-    def loader():
+    def opened():
         return loader(Augmenting(image_size=8, seed=3, val_batches=2,
                           loading=Loading(workers=worker_count, threads=1, read_buffer=1,
                                           worker_buffer=1), batch=4), batch=4, read="indexed", seed=3,
                                               loading=Loading(workers=worker_count, threads=1, read_buffer=1,
                                           worker_buffer=1), host=(EncodeCaptions(keep_captions),))
 
-    interrupted = loader().train(DataPartition())
+    interrupted = opened().train(DataPartition())
     seen = _rows(next(interrupted))
     state = interrupted.get_state()
     rest = [row for batch in itertools.islice(interrupted, 3) for row in _rows(batch)]
 
-    restored = loader().train(DataPartition())
+    restored = opened().train(DataPartition())
     restored.set_state(state)
     resumed = [row for batch in itertools.islice(restored, 3) for row in _rows(batch)]
 

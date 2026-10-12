@@ -36,6 +36,7 @@ from diffusers_reference_helpers import (
     frequency_exponent as frequency_exponent,
     rounded_frequency_table as rounded_frequency_table,
     rounded_timestep_embedding as rounded_timestep_embedding,
+    torch_exp_disagreements,
 )
 
 # The SD3 tool restores the transformers names diffusers 0.34.0 imports.
@@ -68,13 +69,6 @@ CASES: dict[str, Case] = {
     # a per-row tensor rather than one scalar.
     "mixed": Case(dict(guidance_embeds=True), guidance=(3.5, 7.0)),
 }
-
-
-def torch_exp_disagreements(half: int) -> int:
-    """How many of the table's entries torch's float32 `exp` rounds differently
-    from the float64 one; the attribution the record carries."""
-    exponent = frequency_exponent(half, 0, 10000)
-    return int((torch.exp(exponent) != torch.exp(exponent.double()).float()).sum())
 
 
 def image_ids(rows: int, columns: int) -> torch.Tensor:

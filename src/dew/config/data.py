@@ -469,10 +469,13 @@ class VideoData:
         padding = self.audio_padding / FPS
 
         def clips(chain: Pipeline) -> Pipeline:
-            return (chain.filter_map(video.pick_clip(self.frames / FPS, margin=padding))
-                    .filter_map(video.decode(self.frames, fps=FPS, size=self.frame_size))
-                    .filter_map(audio.decode(rate, context=padding))
-                    .remove_columns("mp4", "clip"))
+            # A listed clip too short or that does not decode is an error, as it always was here, so the
+            # run knows its count.
+            pick = dataclasses.replace(video.pick_clip(self.frames / FPS, margin=padding), rejects=False)
+            frames = dataclasses.replace(video.decode(self.frames, fps=FPS, size=self.frame_size),
+                                         rejects=False)
+            sound = dataclasses.replace(audio.decode(rate, context=padding), rejects=False)
+            return chain.random_map(pick).map(frames, sound).remove_columns("mp4", "clip")
 
         return clips(train), None if held is None else clips(held), (EncodeCaptions(),)
 

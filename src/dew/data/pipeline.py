@@ -634,20 +634,29 @@ class Dataset:
             loading, threads=count, read_buffer=max(loading.read_buffer, count)))
 
     def iterate(self) -> Iterator[Batch]:
-        """This dataset's records, or its batches where it batches, read as a
-        run reads them: one pass, or endlessly after a `repeat`."""
-        from dew.data.compile import compile
-        from dew.data.dataset import Closeable, DataPartition
+        """This dataset's records, or its batches where it batches: one pass,
+        as a validation pass reads it, or endlessly after a `repeat`, as
+        training reads it, where random steps after a shuffle or a drop may
+        draw."""
+        from dew.data.compile import compile, validation
+        from dew.data.dataset import Closeable, DataPartition, Loading
+        from dew.objectives.base import VALID_ROWS
 
         chain = self.chain()
         batched = any(isinstance(stage, (BatchStage, TokenBudget)) for stage in chain.stages)
-        # A run's own lowering, so random steps draw as training draws them.
-        loader = compile(chain if batched else chain.batch(1, drop_remainder=False), read=chain.mode,
-                         provision=True, loading=chain.loading)
-        reader = loader.train(DataPartition())
+        read = chain if batched else chain.batch(1, drop_remainder=False)
+        if any(isinstance(stage, Repeat) for stage in chain.stages):
+            # An endless chain reads as training reads it, random steps drawing as they draw there.
+            reader = compile(read, read=chain.mode, provision=True,
+                             loading=chain.loading).train(DataPartition())
+        else:
+            # One pass, as a validation pass reads it.
+            reader = validation(read, batch=1, read=chain.mode, provision=True,
+                                loading=chain.loading or Loading())(DataPartition())
         try:
             for batch in reader:
-                yield batch if batched else {name: value[0] for name, value in batch.items()}
+                yield batch if batched else {
+                    name: value[0] for name, value in batch.items() if name != VALID_ROWS}
         finally:
             cast("Closeable", reader).close()
 

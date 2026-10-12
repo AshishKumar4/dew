@@ -28,7 +28,9 @@ class DecodeAudio(grain.MapTransform):
     clip: str = "clip"
     to: str = "audio"
     missing: Literal["reject", "silence"] = "reject"
-    rejects = True
+    rejects: bool = True
+    """Whether a file that does not read, or under `missing="reject"` lacks sound, is dropped
+    (`filter_map`) rather than an error."""
 
     def __post_init__(self) -> None:
         if self.missing not in ("reject", "silence"):
@@ -47,7 +49,12 @@ class DecodeAudio(grain.MapTransform):
                                             self.sample_rate) if sound else
                                (np.zeros(samples, np.float32), np.zeros(samples, bool)))
         except (OSError, ValueError):
+            if not self.rejects:
+                raise
             return Rejected("undecodable")
         if not valid.all() and self.missing == "reject":
-            return Rejected("no audio" if not sound else "audio shorter than the clip")
+            reason = "no audio" if not sound else "audio shorter than the clip"
+            if not self.rejects:
+                raise ValueError(f"the media in {self.field!r} has {reason}")
+            return Rejected(reason)
         return {**element, self.to: wave, f"{self.to}_valid": valid}
