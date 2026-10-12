@@ -1,7 +1,7 @@
 """Full-weight SFT of a Gemma 4 text decoder on a Hub chat dataset.
 
     python examples/sft_gemma4.py --model google/gemma-4-E2B \\
-        --dataset allenai/tulu-3-sft-mixture --steps 4000 --out runs/gemma4-sft
+        --dataset hf://datasets/allenai/tulu-3-sft-mixture --steps 4000 --out runs/gemma4-sft
 
 The run packs whole conversations into windows, counts the loss on assistant
 targets alone, shards the weights over the visible devices and accumulates
@@ -12,9 +12,9 @@ them, and the run directory itself scores through the harness:
     python -m dew.eval --model dew --model_args run=runs/gemma4-sft/checkpoints/gemma4-sft \\
         --tasks hellaswag --limit 64
 
-`dew.data.ChatMessages` reads the Hub dataset itself, so the id on the
-command line is what the run trains on: it renders every conversation with
-the checkpoint's own chat template and packs them into windows.
+The `Chat` recipe reads the Hub dataset through its `hf://` source, so the URL
+on the command line is what the run trains on: it renders every conversation
+with the checkpoint's own chat template and packs them into windows.
 
     JAX_PLATFORMS=cpu python examples/sft_gemma4.py --smoke --out /tmp/gemma4-smoke
 """
@@ -71,7 +71,7 @@ class Config:
 
 
 def write_conversations(conversations: list, out: Path) -> Path:
-    """The canned turns as the JSONL `ChatMessages` reads line by line."""
+    """The canned turns as the JSONL file the `Chat` recipe reads line by line."""
     out.mkdir(parents=True, exist_ok=True)
     jsonl = out / "chat.jsonl"
     jsonl.write_text("".join(json.dumps({"messages": turns}) + "\n" for turns in conversations))
