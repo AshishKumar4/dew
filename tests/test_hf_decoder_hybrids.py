@@ -655,7 +655,7 @@ def test_qwen_mtp_weights_require_a_declared_prediction_layer():
     """An undeclared prediction component must never disappear on load."""
     config = translate_config(fixture_config("qwen35-tiny"))
     tensors = {"mtp.layers.0.self_attn.q_proj.weight": np.zeros((8, 64), np.float32)}
-    with pytest.raises(ValueError, match="mtp tensors require"):
+    with pytest.raises(ValueError, match="undeclared prediction depth"):
         translate_weights(tensors, config)
     with pytest.raises(ValueError, match="unknown tensor name"):
         translate_weights({"model.layers.0.linear_attn.nope.weight": np.zeros((4,), np.float32)},
