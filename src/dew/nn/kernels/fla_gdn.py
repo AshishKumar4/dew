@@ -146,8 +146,8 @@ class Sequences(NamedTuple):
     chunk's first token and count, in order, a chunk never crossing a sequence and those past the
     last empty; `spans` `[N, 3]` is each sequence's first token, count and first chunk. Sequences never
     cross rows, so a row's first sequence takes its initial memory and its last gives its final one."""
-    chunks: jax.Array
-    spans: jax.Array
+    chunks: jax.Array | np.ndarray
+    spans: jax.Array | np.ndarray
 
 
 def sequences(batch: int, length: int, cu_seqlens=None, *, chunk: int = 64) -> Sequences:
@@ -655,29 +655,28 @@ def _dhu_kernel(span_ref, q_ref, k_ref, w_ref, g_ref, dht_ref, do_ref, dv_ref, d
             final = begin + taken - 1
             if per_key:
                 dv = dv + read(dv_ref).astype(jnp.float32)
-                _write(_rows(dv2_ref, begin, chunk), taken, dv)
+                kept = [jnp.exp2(g_ref[final, pl.ds(i * 64, 64)].astype(jnp.float32))[:, None]
+                        for i in range(slices)]
 
-                def moved(i):
-                    query = read(q_ref, pl.ds(i * 64, 64))
-                    written = read(w_ref, pl.ds(i * 64, 64))
-                    return (_dot(query.T, out_grad.astype(query.dtype), exact=exact) * scale
-                            - _dot(written.T, dv.astype(written.dtype), exact=exact))
+                def queried(query):
+                    return _dot(query.T, out_grad.astype(query.dtype), exact=exact)
+            else:
+                gate = _gates(g_ref, begin, taken, chunk)
+                last = g_ref[final].astype(jnp.float32)
+                dv = dv * jnp.exp2(last - gate)[:, None] + read(dv_ref).astype(jnp.float32)
+                decay = jnp.exp2(gate)[:, None]
+                kept = [jnp.exp2(last)] * slices
 
-                return [grad[i] * jnp.exp2(g_ref[final, pl.ds(i * 64, 64)].astype(jnp.float32))[:, None]
-                        + moved(i) for i in range(slices)]
-            gate = _gates(g_ref, begin, taken, chunk)
-            last = g_ref[final].astype(jnp.float32)
-            dv = dv * jnp.exp2(last - gate)[:, None] + read(dv_ref).astype(jnp.float32)
+                def queried(query):
+                    return _split_dot((query.astype(jnp.float32) * decay).T, out_grad, exact=exact)
             _write(_rows(dv2_ref, begin, chunk), taken, dv)
-            decay = jnp.exp2(gate)[:, None]
 
             def moved(i):
-                gated = read(q_ref, pl.ds(i * 64, 64)).astype(jnp.float32) * decay
                 written = read(w_ref, pl.ds(i * 64, 64))
-                return (_split_dot(gated.T, out_grad, exact=exact) * scale
+                return (queried(read(q_ref, pl.ds(i * 64, 64))) * scale
                         - _dot(written.T, dv.astype(written.dtype), exact=exact))
 
-            return [grad[i] * jnp.exp2(last) + moved(i) for i in range(slices)]
+            return [grad[i] * kept[i] + moved(i) for i in range(slices)]
 
         grad = jax.lax.fori_loop(0, chunks, step, grad)
 
@@ -1136,7 +1135,7 @@ def _rule_fwd(q, k, v, g, beta, h0, cu_seqlens, scale: float, chunk: int, interp
     cumulated in base 2, the inverse, `w` and `u`, the memory across chunks, then the output. Saves
     what fla saves: the cumulated decay and the inverse, named 'delta_decay' and 'delta_inverse' for a
     remat policy, and the initial memory."""
-    spans = sequences(*q.shape[:2], cu_seqlens, chunk=chunk)
+    spans = sequences(q.shape[0], q.shape[1], cu_seqlens, chunk=chunk)
     kernels = {"chunk": chunk, "spans": spans, "interpret": interpret}
     gc = checkpoint_name(chunk_local_cumsum(g, scale=RCP_LN2, **kernels), 'delta_decay')
     a = checkpoint_name(kkt_solve(k, gc, beta, **kernels), 'delta_inverse')

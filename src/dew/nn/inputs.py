@@ -272,8 +272,12 @@ def coordinates(shape: tuple[int, int] | None = None, *, segments=None, valid=No
     (one document a row where None), a `valid` mask (every token real where None), explicit
     `positions` (each document's real tokens counted from 0 where None) and the packer's
     `max_segments` (the row length where None). `shape` is the first given field's where None."""
-    given = [x for x in (segments, valid, positions) if x is not None]
-    shape = tuple(shape if shape is not None else jnp.shape(given[0]))[:2]
+    if shape is None:
+        given = [x for x in (segments, valid, positions) if x is not None]
+        if not given:
+            raise ValueError("token coordinates take their shape from a field, or `shape`")
+        batch, length = jnp.shape(given[0])[:2]
+        shape = (batch, length)
     length = shape[1]
     segments = None if segments is None else jnp.asarray(segments, jnp.int32)
     valid = None if valid is None else jnp.asarray(valid, bool)
