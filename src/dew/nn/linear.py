@@ -47,7 +47,8 @@ from .inputs import AttentionMetadata, valid_order
 from .kernels import generation
 from .kernels.generation import first_refusal, ran_kernel, triton_runs
 from .precision import asks_default_precision, at_least_fp32, compensated_add
-from .sharding import HEADS, logical_axes, logical_spec, manual_map, mesh_axes, rows_like, seen_whole
+from .sharding import (HEADS, RESIDUAL, constrain, logical_axes, logical_spec, manual_map, mesh_axes, rows_like,
+                       seen_whole)
 
 CHUNK_SIZE = 64
 """Tokens per chunk of the chunked form, the reference's default
@@ -852,17 +853,29 @@ class GatedDeltaNet(nn.Module):
     def _project(self, x):
         """(mixed, z, b, a) of `x`: the conv's input `[B, S, 2K + V]`, the
         queries, keys and values flat over heads in that order, z
-        `[B, S, Hv*Dv]`, and b and a `[B, S, Hv]`."""
+        `[B, S, Hv*Dv]`, and b and a `[B, S, Hv]`.
+
+        Each projection is placed as the residual is, its rows where the
+        batch axes put them and its width whole: the rules split no delta
+        net width over the tensor axis, and the rule's `manual_map` takes
+        rows split. Unplaced, an fsdp mesh ran the layer head-split with
+        every row gathered to every device, its all-to-alls 8.5 GiB of a
+        Qwen3.5-9B step over FSDP 2."""
         B, S, _ = x.shape
+
+        def projected(dense):
+            return constrain(dense(x), RESIDUAL)
+
         if not self.fused_in_proj:
-            return self.in_proj_qkv(x), self.in_proj_z(x), self.in_proj_b(x), self.in_proj_a(x)
+            return (projected(self.in_proj_qkv), projected(self.in_proj_z), projected(self.in_proj_b),
+                    projected(self.in_proj_a))
         # One row group per key head: its q, its k, then the v and z of the
         # value heads it serves (modeling_qwen3_next.py:558-586).
         per_key = self.per_v * self.head_v_dim
-        qkvz = self.in_proj_qkvz(x).reshape(B, S, self.num_k_heads, 2 * self.head_k_dim + 2 * per_key)
+        qkvz = projected(self.in_proj_qkvz).reshape(B, S, self.num_k_heads, 2 * self.head_k_dim + 2 * per_key)
         query, key, value, z = jnp.split(
             qkvz, [self.head_k_dim, 2 * self.head_k_dim, 2 * self.head_k_dim + per_key], axis=-1)
-        ba = self.in_proj_ba(x).reshape(B, S, self.num_k_heads, 2 * self.per_v)
+        ba = projected(self.in_proj_ba).reshape(B, S, self.num_k_heads, 2 * self.per_v)
         b, a = jnp.split(ba, 2, axis=-1)
         mixed = jnp.concatenate([query.reshape(B, S, -1), key.reshape(B, S, -1), value.reshape(B, S, -1)],
                                 axis=-1)

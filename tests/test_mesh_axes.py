@@ -167,6 +167,44 @@ def test_tensor_parallelism_computes_latent_attentions_down_projections_once():
     assert flops(MeshSpec(tensor=4), jax.devices()[:4]) == pytest.approx(one, rel=1e-6)
 
 
+DELTA = {"class": "gated_delta_net", "fields": {
+    "linear_num_key_heads": 2, "linear_num_value_heads": 4, "linear_key_head_dim": 8,
+    "linear_value_head_dim": 8, "linear_conv_kernel_dim": 4}}
+
+
+@pytest.mark.mesh(devices=2)
+@pytest.mark.parametrize("fused", [False, True], ids=["delta-net", "fused-projections"])
+def test_a_delta_net_moves_no_activation_over_fsdp(fused):
+    """Over fsdp each device computes its own rows, so a layer gathers
+    parameters and moves no activation. The step's activation moves are the
+    vocabulary's (the token ids and hidden states its split head and
+    embedding exchange), so a decoder with a gated delta net layer moves
+    what an all-attention one moves. One 20-position row a device, as a long
+    run puts one: there an unplaced delta net ran head-split with the rows
+    gathered (`GatedDeltaNet._project`), Qwen3-Next's fused projections
+    before their reshape."""
+    length = 20
+    layers = {"layer_types": ("linear_attention", "full_attention"), "kinds": {"linear_attention": {
+        "mixer": {**DELTA, "fields": {**DELTA["fields"], "fused_in_proj": fused}}}}}
+
+    def moved(**hybrid) -> list:
+        model = models.build("causal_transformer", vocab_size=VOCAB, emb_features=32, num_layers=2,
+                             num_heads=4, num_kv_heads=2, mlp_features=64, max_seq_len=length, **hybrid)
+        mesh = MeshSpec(fsdp=2)
+        trainer = Trainer(LMObjective(model, length), optax.adam(1e-3), key=jax.random.key(0), mesh=mesh,
+                          layout=Layout(min_shard=TINY_SHARD, tolerance=1.0), checkpoints=None, tracker=None)
+        trainer.device_mesh = mesh.build(jax.devices()[:2])
+        state, _, _ = trainer.place()
+        assert_sharded(state.variables, trainer.device_mesh)
+        batch = {"text": np.ones((2, length + 1), np.int32)}
+        trainer.compile(state, shard_batch(trainer.device_mesh, batch))
+        # Every exchange of entries, and each gather of the step's positions.
+        return sorted((op, shapes) for op, shapes in sharded.collectives(trainer.executable.as_text())
+                      if op in sharded.MOVES and (op != "all-gather" or any(length in shape for shape in shapes)))
+
+    assert moved(**layers) == moved()
+
+
 @pytest.mark.parametrize(("bytes_per_second", "peak", "platform", "spreads"), [
     (None, None, None, False),
     (5.8e9, 71e12, "gpu", False),
