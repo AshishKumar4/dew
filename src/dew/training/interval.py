@@ -112,7 +112,6 @@ class Interval:
     compiling: float = 0.0
     compiles: int = 0
 
-    # The lifetime prefix survives logging; Book.tokens is only the unfinished interval.
 
     def count(self, batch: Batch, flops: StepFlops | None, loss: jax.Array, finite: jax.Array,
               committed: Committed | None, aux: Mapping[str, jax.Array] | None = None) -> None:
