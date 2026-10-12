@@ -710,9 +710,49 @@ def test_a_video_recipe_reads_frames_and_the_sound_around_them_at_its_audio_mode
         assert set(record) == {"video", "audio", "audio_valid", "caption"}
         assert record["video"].shape == (4, 16, 16, 3) and record["video"].dtype == np.uint8
         assert (record["video"] == 90).all()
-        assert record["audio"].shape == (6 * rate // 25,) and record["audio_valid"].all()
+        assert record["audio"].shape == (6 * rate // 25,) and record["audio"].dtype == np.float32
+        # Two seconds of sound under every clip: each window's 0.24 seconds are all the track's.
+        assert record["audio_valid"].dtype == bool and int(record["audio_valid"].sum()) == 6 * rate // 25
         assert np.allclose(record["audio"], 3000 / 32768, atol=1e-3)
         assert record["caption"] == "a video of a speaker"
+
+
+def test_a_video_recipe_reads_the_same_batches_at_any_worker_count_and_after_a_resume(tmp_path, monkeypatch):
+    """Clips whose frames and sound count up, so every drawn window shows: two workers give the
+    batches the main process gives, and a reader resumed from a saved position continues with the
+    batches an uninterrupted one reads, windows included."""
+    pytest.importorskip("moviepy.config", reason="needs the av extra")
+    from test_data_av import _mux
+    from transformers import AutoFeatureExtractor, Wav2Vec2FeatureExtractor
+
+    (tmp_path / "train").mkdir()
+    for index in range(6):
+        _mux(tmp_path / "train" / f"{index}.avi")
+    monkeypatch.setattr(AutoFeatureExtractor, "from_pretrained",
+                        lambda name: Wav2Vec2FeatureExtractor(sampling_rate=16000))
+    spec = VideoData(source=str(tmp_path / "train"), frames=4, frame_size=16, audio_padding=1)
+
+    def read(workers, count, state=None):
+        data = loader(spec, batch=2, read="memory", seed=7,
+                      loading=Loading(workers=workers, threads=1, read_buffer=2, worker_buffer=1))
+        reader = data.train(DataPartition())
+        try:
+            if state is not None:
+                reader.set_state(state)
+            return [next(reader) for _ in range(count)], reader.get_state()
+        finally:
+            reader.close()
+
+    single, _ = read(0, 4)
+    workers, _ = read(2, 4)
+    for one, many in zip(single, workers, strict=True):
+        for field in ("video", "audio", "audio_valid"):
+            np.testing.assert_array_equal(one[field], many[field])
+    assert any(not np.array_equal(batch["video"][0], batch["video"][1]) for batch in single)
+    _, saved = read(0, 2)
+    resumed, _ = read(0, 2, saved)
+    for expected, found in zip(single[2:], resumed, strict=True):
+        np.testing.assert_array_equal(expected["audio"], found["audio"])
 
 
 def keep_captions(captions):
