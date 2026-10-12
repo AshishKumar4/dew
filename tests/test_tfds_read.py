@@ -61,7 +61,7 @@ def test_a_prepared_source_describes_the_directory_and_split_it_reads():
         decoders={"image": tfds.decode.SkipDecoding()})
 
     assert str(FIXTURE) in source.describe() and ":all:" in source.describe()
-    assert other.snapshot() != source.snapshot()
+    assert other.fingerprint() != source.fingerprint()
 
 
 @pytest.mark.parametrize("workers", [0, 2])

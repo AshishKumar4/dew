@@ -7,7 +7,7 @@ import functools
 import inspect
 import threading
 from collections.abc import Callable, Mapping, Sequence
-from typing import Literal
+from typing import Any, Literal
 
 import grain.python as grain
 import numpy as np
@@ -235,7 +235,7 @@ class ColorJitter(grain.RandomMapTransform):
 class Processor(grain.MapTransform):
     """A Hugging Face image processor's `pixel_values` for the image in `field`, under `to`."""
 
-    processor: object
+    processor: Any
     field: str = "image"
     to: str = "pixel_values"
 
@@ -254,7 +254,7 @@ class Albumentations(grain.RandomMapTransform):
     in each process, so a record's draw is the same at any thread count and
     after a resume."""
 
-    transform: object
+    transform: Any
     field: str = "image"
 
     @functools.cached_property
@@ -280,7 +280,7 @@ class Torchvision(grain.RandomMapTransform):
     process, so the transform runs one record at a time in each process, the
     generator seeded inside that turn and restored after it."""
 
-    transform: object
+    transform: Any
     field: str = "image"
 
     def random_map(self, element: Batch, rng: np.random.Generator) -> Batch:

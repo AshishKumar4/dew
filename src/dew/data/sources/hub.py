@@ -130,7 +130,7 @@ class Hub(Dataset):
     def consumed(self, read: Read) -> Source:
         return self.files if read == "streamed" else self
 
-    def snapshot(self) -> Mapping[str, object]:
+    def fingerprint(self) -> Mapping[str, object]:
         """The pinned split Arrow is prepared from. Its identity is the same
         on any host, in any cache directory, whether or not Arrow was prepared
         there. A streamed read consumes `files`, whose snapshot names its

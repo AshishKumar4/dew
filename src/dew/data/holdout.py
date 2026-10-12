@@ -7,7 +7,7 @@ import functools
 import hashlib
 import itertools
 from collections.abc import Callable, Mapping
-from typing import Protocol, runtime_checkable
+from typing import Protocol, cast, runtime_checkable
 
 import numpy as np
 
@@ -42,8 +42,8 @@ class _SliceRecords:
     def describe(self) -> str:
         return f"{self.source.describe()}[{self.start}:{self.stop}]"
 
-    def snapshot(self) -> Mapping[str, object]:
-        return {**self.source.snapshot(), "slice": [self.start, self.stop]}
+    def fingerprint(self) -> Mapping[str, object]:
+        return {**self.source.fingerprint(), "slice": [self.start, self.stop]}
 
     def supports(self, read: Read) -> bool:
         return read != "streamed" and self.source.supports(read)
@@ -72,9 +72,12 @@ class _SliceRecords:
 def _inside(row: Batch | bytes, low: float, high: float, key: str | None) -> bool:
     """Whether `row`'s identity falls in [`low`, `high`) of the unit interval: the hash of its
     `key` field, or of its whole content, the same wherever and however the row is read."""
-    if key is not None and not (isinstance(row, Mapping) and key in row):
+    if key is None:
+        identity = encode(row)
+    elif isinstance(row, Mapping) and key in row:
+        identity = encode(row[key])
+    else:
         raise ValueError(f"a holdout by {key!r} reads that field, which this record lacks")
-    identity = encode(row if key is None else row[key])
     hashed = int.from_bytes(hashlib.sha256(identity).digest()[:8], "big")
     return int(low * 2**64) <= hashed < int(high * 2**64)
 
@@ -118,8 +121,8 @@ class _HashSource:
         part = f"[{self.low},{self.high}),held={self.held},key={self.key}"
         return f"{self.source.describe()} hash holdout={part}"
 
-    def snapshot(self) -> Mapping[str, object]:
-        return {**self.source.snapshot(), "holdout": [self.low, self.high], "held": self.held,
+    def fingerprint(self) -> Mapping[str, object]:
+        return {**self.source.fingerprint(), "holdout": [self.low, self.high], "held": self.held,
                 "key": self.key}
 
     def supports(self, read: Read) -> bool:
@@ -130,7 +133,7 @@ class _HashSource:
 
         rows = self.source.records(read)
         keys = tuple(index for index in range(len(rows))
-                     if _inside(rows[index], self.low, self.high, self.key) == self.held)
+                     if _inside(cast("Batch", rows[index]), self.low, self.high, self.key) == self.held)
         return grain.MapDataset.source(keys).map(_SelectedRow(rows))
 
     def metadata(self) -> Mapping[str, object]:
@@ -152,7 +155,7 @@ class _HashSource:
 
 def _rebased(dataset: Dataset, store: Callable[[Source], Source]) -> Pipeline:
     """`dataset` with each of its stores read through `store`, its steps unchanged."""
-    chain = dataset if isinstance(dataset, Pipeline) else Pipeline(dataset)
+    chain = dataset.chain()
     source = chain.source
     if isinstance(source, (Mixture, Phases)):
         children = tuple(_rebased(child, store) for child in source.pipelines)

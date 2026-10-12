@@ -10,7 +10,7 @@ pipeline slices over its readers and workers and interleaves.
 A source states facts about itself (`metadata`, `lengths`) and never scans to
 find them: a step that needs a global fact reads it here or from config, and
 a streamed source without it is refused before the run opens. `describe` and
-`snapshot` are its identity: the first is what a saved position names, the
+`fingerprint` are its identity: the first is what a saved position names, the
 second what a cache's key and a run's plan record (the URI, the resolved
 revision, each file's size and ETag).
 """
@@ -74,7 +74,7 @@ class Source(Protocol):
         """A stable description: store, URI, revision and split, never an address."""
         ...
 
-    def snapshot(self) -> Mapping[str, object]:
+    def fingerprint(self) -> Mapping[str, object]:
         """The store's identity for a cache key and a run's plan: the URI, the
         resolved revision, and each file's size and ETag or generation."""
         ...

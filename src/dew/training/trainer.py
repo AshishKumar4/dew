@@ -385,7 +385,7 @@ def _batched(held: Dataset, train: Pipeline) -> Pipeline:
     """`held` batched as `train` is, every record scored, where it states no batch of its own."""
     from dew.data.pipeline import BatchStage
 
-    chain = held if isinstance(held, Pipeline) else Pipeline(held)
+    chain = held.chain()
     if any(isinstance(stage, BatchStage) for stage in chain.stages):
         return chain
     size = next((stage.size for stage in train.stages if isinstance(stage, BatchStage)), None)
@@ -1435,13 +1435,14 @@ class Trainer(Generic[Loss, Effects]):
         from dew.data.compile import compile, validation as validated
 
         objective = self.objective.data()
-        train = _endless(data if isinstance(data, Pipeline) else Pipeline(data))
+        train = _endless(data.chain())
         held = validation if isinstance(validation, Dataset) else None
         loader = compile(train, validation=None if held is None else _batched(held, train),
-                         objective=objective)
+                         objective=objective, provision=True)
         if not isinstance(validation, Mapping):
             return loader, None
-        return loader, {name: validated(_batched(entry, train), batch=loader.batch, objective=objective)
+        return loader, {name: validated(_batched(entry, train), batch=loader.batch, objective=objective,
+                                        provision=True)
                         if isinstance(entry, Dataset) else entry for name, entry in validation.items()}
 
     def _training_loop(self, plan: _FitPlan, run: _FitRun, profiler: Profiler | None,

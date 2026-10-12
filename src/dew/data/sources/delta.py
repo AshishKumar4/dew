@@ -35,7 +35,7 @@ class Delta(Files):
     def paths(self) -> tuple[str, ...]:
         return tuple(self.table.file_uris())
 
-    def snapshot(self) -> Mapping[str, object]:
+    def fingerprint(self) -> Mapping[str, object]:
         return {
             "store": "delta",
             "uri": self.url,

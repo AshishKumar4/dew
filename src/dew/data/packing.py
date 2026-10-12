@@ -190,8 +190,8 @@ class PackedSource:
         plan = dataclasses.replace(self.plan, source=documents) if isinstance(self.plan, _Held) else self.plan
         return dataclasses.replace(self, documents=documents, plan=plan)
 
-    def snapshot(self) -> Mapping[str, object]:
-        return {"source": self.documents.snapshot(), "packing": self.order_fingerprints()}
+    def fingerprint(self) -> Mapping[str, object]:
+        return {"source": self.documents.fingerprint(), "packing": self.order_fingerprints()}
 
     def order_fingerprints(self) -> Mapping[str, str]:
         return self.plan.fingerprints()

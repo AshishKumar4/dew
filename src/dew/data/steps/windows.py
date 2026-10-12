@@ -76,8 +76,8 @@ class WindowSource:
     def describe(self) -> str:
         return f"{self.original.describe()} causal windows={self.length},stride={self.stride}"
 
-    def snapshot(self) -> Mapping[str, object]:
-        return {**self.original.snapshot(), "window": self.length, "stride": self.stride}
+    def fingerprint(self) -> Mapping[str, object]:
+        return {**self.original.fingerprint(), "window": self.length, "stride": self.stride}
 
     def supports(self, read: Read) -> bool:
         return self.original.supports(read)

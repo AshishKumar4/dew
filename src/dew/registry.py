@@ -276,8 +276,9 @@ class Aliases[T: Callable[..., Any], Built](Mapping[str, T]):
         ("data:text"), rather than by its class."""
         import tyro
 
-        return functools.reduce(operator.or_, (typing.Annotated[self[name], tyro.conf.subcommand(name)]
-                                               for name in self))
+        annotated = typing.cast(Any, typing.Annotated)
+        members = (annotated[self[name], tyro.conf.subcommand(name)] for name in self)
+        return functools.reduce(operator.or_, members)
 
 
 def declared_type(member: type, field: str) -> Annotation:

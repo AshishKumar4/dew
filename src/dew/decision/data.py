@@ -163,8 +163,8 @@ class _DecisionSource:
     def describe(self) -> str:
         return self.source.describe()
 
-    def snapshot(self) -> Mapping[str, object]:
-        return {**self.source.snapshot(), **({"descriptor": self.descriptor} if self.descriptor else {})}
+    def fingerprint(self) -> Mapping[str, object]:
+        return {**self.source.fingerprint(), **({"descriptor": self.descriptor} if self.descriptor else {})}
 
     def supports(self, read: Read) -> bool:
         return self.source.supports(read)
@@ -307,7 +307,7 @@ class Decisions:
         elif isinstance(self.validation, Pipeline):
             evaluated = self.validation
         elif isinstance(self.validation, Split):
-            held_source = _DecisionSource(_named_split(dataset.source, self.validation), table=table)
+            held_source = _DecisionSource(_named_split(dataset.source, self.validation.name), table=table)
             evaluated = Pipeline(held_source).map(Configured(_ParseConfigured(table), needs=()))
         elif isinstance(self.validation, Sequence) and not isinstance(self.validation, str):
             rows = tuple({"example": Example.of(row)} for row in self.validation)

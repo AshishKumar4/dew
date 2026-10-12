@@ -27,8 +27,8 @@ class Concatenate:
     def consumed(self, read: Read) -> Concatenate:
         return dataclasses.replace(self, sources=tuple(_consumed(source, read) for source in self.sources))
 
-    def snapshot(self) -> Mapping[str, object]:
-        return {"concatenate": [source.snapshot() for source in self.sources]}
+    def fingerprint(self) -> Mapping[str, object]:
+        return {"concatenate": [source.fingerprint() for source in self.sources]}
 
     def supports(self, read: Read) -> bool:
         return all(source.supports(read) for source in self.sources)

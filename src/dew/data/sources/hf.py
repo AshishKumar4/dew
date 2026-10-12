@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, cast
 
 import grain.python as grain
 import numpy as np
@@ -13,6 +14,9 @@ from dew.data.pipeline import Dataset
 
 from .base import Read, Shard, ShardManifest
 from .memory import _record
+
+if TYPE_CHECKING:
+    import datasets
 
 
 @dataclass(frozen=True, eq=False)
@@ -24,7 +28,7 @@ class HF(Dataset):
     `name` is its identity in a run's plan, a cache's key and its logs, its
     fingerprint by default."""
 
-    dataset: object
+    dataset: Any
     name: str | None = None
 
     @property
@@ -36,7 +40,7 @@ class HF(Dataset):
     def describe(self) -> str:
         return f"hf:{self.name or getattr(self.dataset, '_fingerprint', None) or type(self.dataset).__name__}"
 
-    def snapshot(self) -> Mapping[str, object]:
+    def fingerprint(self) -> Mapping[str, object]:
         return {"store": "hf-datasets", "name": self.describe(), **self.metadata()}
 
     def supports(self, read: Read) -> bool:
@@ -92,17 +96,17 @@ class _StreamedIterator(grain.DatasetIterator):
         self._rows = iter(dataset)
 
     def __next__(self) -> Batch:
-        return _record(next(self._rows))
+        return cast("Batch", _record(next(self._rows)))
 
-    def get_state(self) -> dict:
+    def get_state(self) -> dict[str, Any]:
         return self._dataset.state_dict()
 
-    def set_state(self, state: dict) -> None:
+    def set_state(self, state: Mapping[str, Any]) -> None:
         self._dataset.load_state_dict(state)
         self._rows = iter(self._dataset)
 
 
-def from_hf(dataset: object, name: str | None = None) -> HF:
+def from_hf(dataset: datasets.Dataset | datasets.IterableDataset, name: str | None = None) -> HF:
     """A Hugging Face `datasets.Dataset` or `IterableDataset` as a Dew
     dataset (`HF`). An `IterableDataset` resumes exactly from its own
     `state_dict` only unshuffled, since its shuffle buffer is not part of that

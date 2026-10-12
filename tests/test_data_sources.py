@@ -27,14 +27,14 @@ from dew.data.storage import Store
 def test_memory_columns_snapshot_changes_with_content():
     first = Memory({"x": np.arange(5), "y": np.arange(5) * 3}, shard_rows=2)
     changed = Memory({"x": np.arange(5) + 1, "y": np.arange(5) * 3}, shard_rows=2)
-    assert first.snapshot() != changed.snapshot()
+    assert first.fingerprint() != changed.fingerprint()
     assert first.supports("streamed")
     rows = [row for shard in first.manifest().shards for row in first.manifest().reader(shard)]
     assert [row["x"] for row in rows] == list(range(5))
     with pytest.raises(ValueError, match="different row counts"):
         len(Memory({"x": [1], "y": [1, 2]}).records("indexed"))
-    assert Memory([{"x": np.int16(4)}]).snapshot() != Memory([{"x": np.int32(4)}]).snapshot()
-    assert Memory([{"x": 1}], shard_rows=1).snapshot() != Memory([{"x": 1}], shard_rows=2).snapshot()
+    assert Memory([{"x": np.int16(4)}]).fingerprint() != Memory([{"x": np.int32(4)}]).fingerprint()
+    assert Memory([{"x": 1}], shard_rows=1).fingerprint() != Memory([{"x": 1}], shard_rows=2).fingerprint()
 
 
 def test_pinned_hub_revision_never_falls_through_to_a_different_conversion(monkeypatch):
@@ -108,6 +108,7 @@ def moving_hub_conversion(monkeypatch, tmp_path, request):
     prepared = datasets.Dataset.from_dict(columns(0))
     builder = SimpleNamespace(
         cache_dir=str(tmp_path),
+        config=SimpleNamespace(data_files=None),
         info=SimpleNamespace(features=None, splits={"train": SimpleNamespace(num_examples=32)}),
         as_dataset=lambda **kwargs: prepared,
     )
@@ -127,12 +128,12 @@ def test_a_conversion_that_moves_under_one_default_commit_is_another_snapshot(mo
         return compile(streamed, read="streamed", loading=Loading(workers=0)).plan
 
     source = Hub("owner/data")
-    snapshot = source.files.snapshot()
+    snapshot = source.files.fingerprint()
     saved = plan()
     assert saved.manifest.source["sources"] == [snapshot]
     moving_hub_conversion.append("second")
     assert source.files.url == ("hf://datasets/owner/data@first/default/train/0000.parquet",)
-    assert source.files.snapshot() == snapshot != Hub("owner/data").files.snapshot()
+    assert source.files.fingerprint() == snapshot != Hub("owner/data").files.fingerprint()
     with pytest.raises(ValueError, match=r"saved data plan (source|order) changed"):
         plan().check(saved.record())
 
@@ -314,7 +315,7 @@ def test_tfds_source_metadata_and_decoder_identity_need_no_data_scan():
     assert decoded.metadata()["class_names"]["label"] == tuple(
         (root / "label.labels.txt").read_text().splitlines()
     )
-    assert decoded.snapshot() != raw.snapshot()
+    assert decoded.fingerprint() != raw.fingerprint()
     assert isinstance(raw.records("indexed")[0]["image"], bytes)
     assert raw.with_split("test").metadata()["rows"] == 4
 
@@ -343,9 +344,9 @@ def test_tfds_label_definitions_participate_in_source_identity(tmp_path):
 
     fixture = Path(__file__).parent / "fixtures" / "tfds" / "dew_images" / "1.0.0"
     shutil.copytree(fixture, tmp_path, dirs_exist_ok=True)
-    before = TFDS("dew_images", path=str(tmp_path)).snapshot()
+    before = TFDS("dew_images", path=str(tmp_path)).fingerprint()
     (tmp_path / "label.labels.txt").write_text("rouge\nbleu\n")
-    after = TFDS("dew_images", path=str(tmp_path)).snapshot()
+    after = TFDS("dew_images", path=str(tmp_path)).fingerprint()
     assert before != after
 
 
@@ -878,7 +879,7 @@ def test_published_file_facts_avoid_metadata_probes_and_verify_the_index(monkeyp
     monkeypatch.setattr(fs, "info", unexpected)
     assert source.supports("indexed")
     assert source.metadata()["rows"] == 2
-    assert source.snapshot()["files"][0]["version"] == facts[root.url]["sha256"]
+    assert source.fingerprint()["files"][0]["version"] == facts[root.url]["sha256"]
     assert source.records("indexed")[1] == {"id": 1}
 
 
@@ -899,7 +900,7 @@ def test_torch_source_refuses_streaming_and_cache_without_content_identity():
 
     with pytest.raises(ValueError, match="explicit content identity"):
         Cache(f"memory://torch-cache-{uuid4().hex}").mapped(
-            grain.MapDataset.source(rows.records("indexed")), Manifest(rows.snapshot()), rows
+            grain.MapDataset.source(rows.records("indexed")), Manifest(rows.fingerprint()), rows
         )
 
 
@@ -911,7 +912,7 @@ def test_delta_snapshot_pins_version_and_discovers_partition_columns(tmp_path):
     root = str(tmp_path / "delta")
     write_deltalake(root, pa.table({"value": [1, 2], "split": ["train", "held"]}), partition_by=["split"])
     first = Delta(root)
-    snapshot = first.snapshot()
+    snapshot = first.fingerprint()
     write_deltalake(root, pa.table({"value": [3], "split": ["train"]}), mode="append")
     rows = Delta(root, version=snapshot["version"]).records("indexed")
     assert sorted(rows[index]["value"] for index in range(len(rows))) == [1, 2]
@@ -1026,8 +1027,8 @@ class _StreamOnly:
     def describe(self):
         return f"stream-only {self.memory.describe()}"
 
-    def snapshot(self):
-        return self.memory.snapshot()
+    def fingerprint(self):
+        return self.memory.fingerprint()
 
     def supports(self, read):
         return read == "streamed"

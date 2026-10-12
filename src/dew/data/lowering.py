@@ -216,7 +216,7 @@ class _Rows:
 
 
 @dataclasses.dataclass(frozen=True)
-class _Groups(pygrain.experimental.FlatMapTransform):
+class _Groups:
     """A `map_batches` step over one group: its records, as Grain's flat map takes them."""
 
     stage: Batched

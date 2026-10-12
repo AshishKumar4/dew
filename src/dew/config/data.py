@@ -117,8 +117,8 @@ class _RandomSource:
     def describe(self) -> str:
         return f"{self.source.describe()} random holdout={self.split!r},held={self.held}"
 
-    def snapshot(self) -> Mapping[str, object]:
-        return {**self.source.snapshot(), "holdout": dataclasses.asdict(self.split), "held": self.held}
+    def fingerprint(self) -> Mapping[str, object]:
+        return {**self.source.fingerprint(), "holdout": dataclasses.asdict(self.split), "held": self.held}
 
     def supports(self, read: Read) -> bool:
         return read != "streamed" and self.source.supports(read)
@@ -457,8 +457,8 @@ class _PromptFacts:
     def describe(self) -> str:
         return self.source.describe()
 
-    def snapshot(self) -> Mapping[str, object]:
-        return self.source.snapshot()
+    def fingerprint(self) -> Mapping[str, object]:
+        return self.source.fingerprint()
 
     def supports(self, read: Read) -> bool:
         return self.source.supports(read)
