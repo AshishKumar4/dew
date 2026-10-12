@@ -169,29 +169,15 @@ class TextToImage:
     grid: Callable[[int], tuple[Process, jax.Array]] | None = None
     final_denoise: bool = True
     finish: Callable[[Variables, jax.Array], jax.Array] | None = None
-    blank: Callable[[dict], dict] | None = None
-    """A function that returns the task's own unconditional branch in the
-    dtypes of the conditional branch it is given. Whoever built this task
-    encoded the branch once (`DiffusionObjective.blank_conditions`). None
-    means each call encodes the unconditional prompt itself, for a source
-    that has no encoded branch."""
 
     def __post_init__(self) -> None:
         # A tree split for training, an adapter's, is read whole.
         object.__setattr__(self, "variables", freeze(dict(thaw(self.variables))))
 
     def bind(self, variables: Variables) -> TextToImage:
-        """Return this task with `variables` as its weights.
-
-        When encoder leaves change, the unconditional branch is encoded again,
-        lazily on first use. When only the denoiser's weights change, the
-        branch already encoded is kept."""
-        from dew.objectives.diffusion.objective import FixedBlank
-
-        blank = self.blank
-        if isinstance(blank, FixedBlank):
-            blank = blank.rebind(variables.get("encoders", {}))
-        return replace(self, variables=variables, blank=blank)
+        """Return this task with `variables` as its weights, its encoders' included: each call
+        encodes its prompts and its blank with the towers it holds."""
+        return replace(self, variables=variables)
 
     def quantized(self, spec: Quantization) -> TextToImage:
         """Return this task with its denoiser's weights quantized as `spec` says.
@@ -219,8 +205,7 @@ class TextToImage:
         autoencoder, variables = objective.published_autoencoder(variables)
         return cls(objective.model, objective.process, objective.inputs,
                    without_loss_heads(variables), autoencoder,
-                   steps=objective.steps, guidance=objective.guidance, solver=objective.solver,
-                   blank=objective._fixed_blank.rebind(variables.get("encoders", {})))
+                   steps=objective.steps, guidance=objective.guidance, solver=objective.solver)
 
     @classmethod
     def from_run(cls, directory: str, *, ema: bool | None = None, step: int | str | None = None,
@@ -239,12 +224,6 @@ class TextToImage:
         under `layout`, the way the trainer places them. Without it, they go
         onto a default `MeshSpec()` over the current pool's devices.
 
-        The configured unconditional prompt is encoded the way an objective's
-        pipeline encodes it: eagerly, at the matmul precision recorded when the
-        objective was built. The record must have a `condition_precision`
-        field, which is None when the objective used JAX's default, whatever
-        precision the caller's context sets.
-
         `dtype` sets the compute dtype of the model, the encoders and the VAE.
         `param_dtype` sets the dtype the parameters are stored in; None keeps
         the checkpoint's dtypes exactly. `trust` names the packages outside
@@ -254,7 +233,7 @@ class TextToImage:
         from dew.diffusion.process import Process
         from dew.inference.tasks import run_record
         from dew.nn.autoencoders import AutoEncoder
-        from dew.objectives.diffusion.objective import FixedBlank, without_loss_heads
+        from dew.objectives.diffusion.objective import without_loss_heads
         from dew.records import integer, json_value, record as fields, text
         from dew.registry import from_record, objectives, solvers
 
@@ -292,14 +271,11 @@ class TextToImage:
                                 fields(solver_record['fields'], 'solver fields'))
         recorded = json_value(record['guidance'], 'guidance')
         guidance = None if recorded is None else from_record(Guidance, recorded, dtypes=False)
-        precision = record['condition_precision']
-        precision = None if precision is None else text(precision, 'condition_precision')
         process = from_record(Process, json_value(record['process'], 'process'), dtypes=False)
         return cls(config.build(), process,
                    inputs, without_loss_heads(params), autoencoder,
                    steps=integer(record['sampling_steps'], 'sampling_steps'),
-                   guidance=guidance, solver=solver,
-                   blank=FixedBlank(inputs, params.get("encoders", {}), precision))
+                   guidance=guidance, solver=solver)
 
     @classmethod
     def from_pretrained(cls, repo_id: str, *, revision: str | None = None,
@@ -359,15 +335,14 @@ class TextToImage:
     def _conditions(self) -> tuple[tuple[str, object], ...]:
         return tuple((keyword, condition.encoder) for keyword, condition in self.inputs.conditions.items())
 
-    def _unconditional(self, tokens, plan: RowPlan, given: dict, *, configured: bool) -> dict:
-        """The unconditional branch: the value already encoded for the task's
-        own unconditional prompt, and an encode of the caller's negatives."""
-        if configured and self.blank is not None:
-            return self.blank(given)
+    def _unconditional(self, tokens, plan: RowPlan) -> dict:
+        """The unconditional branch: the task's own blank prompt or the caller's negatives, encoded
+        by the task's towers as the training step encodes its blank (`DiffusionObjective.encode`)."""
         leaves = jax.tree.leaves(tokens)
         if leaves and leaves[0].shape[0] != 1:
             return _encode(plan.sharding)(self._conditions, self.variables, plan.place(plan.pad(tokens)))
-        return _encode(None)(self._conditions, self.variables, jax.tree.map(jnp.asarray, tokens))
+        # Host tokens, which reach the encoders' devices as the call places them.
+        return _encode(None)(self._conditions, self.variables, jax.tree.map(np.asarray, tokens))
 
 
     def prepare(
@@ -434,7 +409,7 @@ class TextToImage:
             multihost_utils.assert_equal(settled.signature,
                                          "image input shapes and sampling must agree across processes")
         with region("inference.image.prepare"):
-            given, null, initial_state = self._encoded(settled, configured=unconditional is None)
+            given, null, initial_state = self._encoded(settled)
         owns_grid = self.grid is not None or times is not None
         return DenoisingInputs(initial_state, given, null, rows=plan.rows,
                                grid_steps=count if owns_grid else None,
@@ -636,8 +611,7 @@ class TextToImage:
             samples["mask"] = (value >= (128 if value.dtype == np.uint8 else 0.5)).astype(np.float32)
         return samples
 
-    def _encoded(self, settled: _Resolved, *, configured: bool
-                 ) -> tuple[dict, dict, jax.Array]:
+    def _encoded(self, settled: _Resolved) -> tuple[dict, dict, jax.Array]:
         """The two encoded conditioning branches and the initial state.
 
         With no caller-supplied pixels the state is fresh noise. With any,
@@ -656,7 +630,7 @@ class TextToImage:
             null = (jax.device_put(settled.null_tokens) if single
                     else plan.place(plan.pad(settled.null_tokens)))
         else:
-            null = self._unconditional(settled.null_tokens, plan, given, configured=configured)
+            null = self._unconditional(settled.null_tokens, plan)
         if not settled.samples:
             return given, null, _noise(plan.sharding)(process, plan.keys(settled.request),
                                                       settled.shape)
