@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING, Protocol, runtime_checkable
 import grain.experimental as gx
 import grain.python as pygrain
 import numpy as np
+from grain._src.python.dataset.transformations.batch import make_batch
 
 from dew.data.analysis import _LOCAL, _at, _cache_manifest, _drops, _identity, _Lowering, _name, _until
 from dew.data.dataset import Batch, DataPartition, FilledBatch, Loading, _Grouped
@@ -648,17 +649,15 @@ class _Build:
             # Batched by index before the reader starts, as Grain's own indexed
             # pipelines are, so each read in flight is a whole batch and each
             # worker reads whole batches of its own.
-            batched = rows.map(_Payload()).batch(size, drop_remainder=drop, batch_fn=batch_stage.batch_fn)
+            batched = rows.batch(size, drop_remainder=drop, batch_fn=_Batched(batch_stage.batch_fn))
             stream = _as_iter(batched, self.loading)
             for stage in pipeline.stages[: pipeline.stages.index(batch_stage)]:
                 if isinstance(stage, Prefetch):
                     advanced, _ = self.stage(stream, None, stage, pipeline, partition)
                     stream = _as_iter(advanced, self.loading)
         else:
-            stream = (
-                _as_iter(rows, self.loading)
-                .map(_Payload())
-                .batch(size, drop_remainder=drop, batch_fn=batch_stage.batch_fn)
+            stream = _as_iter(rows, self.loading).batch(
+                size, drop_remainder=drop, batch_fn=_Batched(batch_stage.batch_fn)
             )
         if not self.training and fill:
             stream = stream.map(
@@ -750,8 +749,42 @@ def _workers(pipeline: Pipeline, loading: Loading) -> int:
 
 @dataclasses.dataclass(frozen=True)
 class _Payload:
+    """A row without the private fields Dew's own steps carry to the batch."""
+
     def __call__(self, row: Batch) -> Batch:
         return {name: value for name, value in row.items() if not name.startswith("_dew_")}
+
+
+@runtime_checkable
+class _SharedOutput(Protocol):
+    """A batch function that can write its batches into shared memory, which
+    Grain asks of a batch read by worker processes."""
+
+    def enable_shared_memory_output(self) -> None: ...
+
+
+@dataclasses.dataclass
+class _Batched:
+    """The batch step: each row's private fields dropped (`_Payload`), then
+    the rows stacked by the pipeline's `batch_fn`, or by Grain's own batch,
+    into shared memory once Grain asks for it. The strip runs inside the
+    batch, so it adds no Grain stage of its own; rows carry their private
+    fields up to it, for the grouping and counting that read them."""
+
+    batch_fn: Callable[[Sequence[Batch]], Batch] | None
+    shared: bool = False
+
+    def enable_shared_memory_output(self) -> None:
+        if self.batch_fn is None:
+            self.shared = True
+        elif isinstance(self.batch_fn, _SharedOutput):
+            self.batch_fn.enable_shared_memory_output()
+
+    def __call__(self, rows: Sequence[Batch]) -> Batch:
+        payload = [_Payload()(row) for row in rows]
+        if self.batch_fn is not None:
+            return self.batch_fn(payload)
+        return make_batch(payload, output_to_shared_memory=self.shared)
 
 
 @dataclasses.dataclass(frozen=True)
