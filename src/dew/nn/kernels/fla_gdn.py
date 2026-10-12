@@ -900,17 +900,17 @@ def chunk_bwd_dqkwg(q, k, v, w, g, h, dv, do, dh, *, scale: float, chunk: int = 
     tokens = batch * length
     spans = sequences(batch, length, chunk=chunk) if spans is None else spans
     aligned = _aligned(spans, batch, length, chunk)
-    keys = pl.BlockSpec((tokens, None, bk), lambda i_k, i_t, i_h: (0, i_h, i_k))
-    values = pl.BlockSpec((tokens, group, columns), lambda i_k, i_t, i_h: (0, i_h, 0))
-    memory = pl.BlockSpec((None, group, bk, columns), lambda i_k, i_t, i_h: (i_t, i_h, i_k, 0))
+    keys = pl.BlockSpec((tokens, None, bk), lambda i_k, i_h, i_t: (0, i_h, i_k))
+    values = pl.BlockSpec((tokens, group, columns), lambda i_k, i_h, i_t: (0, i_h, 0))
+    memory = pl.BlockSpec((None, group, bk, columns), lambda i_k, i_h, i_t: (i_t, i_h, i_k, 0))
     dq, dk, dw, dg = pl.pallas_call(
         functools.partial(_dqkwg_kernel, chunk=chunk, aligned=aligned, scale=scale, bv=bv, exact=interpret),
-        grid=(width // bk, spans.chunks.shape[0], key_heads),
-        in_specs=[pl.BlockSpec((None, 2), lambda i_k, i_t, i_h: (i_t, 0)), keys, keys, values,
-                  pl.BlockSpec((tokens, group), lambda i_k, i_t, i_h: (0, i_h)), memory, values, memory,
+        grid=(width // bk, key_heads, spans.chunks.shape[0]),
+        in_specs=[pl.BlockSpec((None, 2), lambda i_k, i_h, i_t: (i_t, 0)), keys, keys, values,
+                  pl.BlockSpec((tokens, group), lambda i_k, i_h, i_t: (0, i_h)), memory, values, memory,
                   values],
-        out_specs=[keys, keys, pl.BlockSpec((tokens, group, bk), lambda i_k, i_t, i_h: (0, i_h, i_k)),
-                   pl.BlockSpec((None, tokens, group), lambda i_k, i_t, i_h: (i_k, 0, i_h))],
+        out_specs=[keys, keys, pl.BlockSpec((tokens, group, bk), lambda i_k, i_h, i_t: (0, i_h, i_k)),
+                   pl.BlockSpec((None, tokens, group), lambda i_k, i_h, i_t: (i_k, 0, i_h))],
         out_shape=[jax.ShapeDtypeStruct((tokens, key_heads, width), q.dtype),
                    jax.ShapeDtypeStruct((tokens, key_heads, width), k.dtype),
                    jax.ShapeDtypeStruct((tokens, value_heads, width), w.dtype),
