@@ -798,3 +798,21 @@ def test_a_stage_axis_under_a_model_with_no_pipeline_is_refused():
 
     with pytest.raises(ValueError, match="runs no pipeline, so every stage would compute"):
         trainer.compile(state, batch)
+
+
+def test_a_copy_or_transpose_at_a_kernel_calls_edge_is_found_through_its_tuple():
+    """`sharded.boundary_copies` finds a copy feeding a Triton call and a transposing fusion reading
+    its result through a tuple element, and nothing that only reads the result in place."""
+    text = """ENTRY %main {
+  %p0 = bf16[8,64]{1,0} parameter(0)
+  %copy.1 = bf16[8,64]{0,1} copy(bf16[8,64]{1,0} %p0)
+  %cc = (bf16[8,64]{1,0}, f32[8]{0}) custom-call(bf16[8,64]{0,1} %copy.1), \
+custom_call_target="__gpu$xla.gpu.triton"
+  %gte = bf16[8,64]{1,0} get-tuple-element((bf16[8,64]{1,0}, f32[8]{0}) %cc), index=0
+  %transpose_fusion.2 = bf16[64,8]{1,0} fusion(bf16[8,64]{1,0} %gte), kind=kLoop, calls=%fused
+  %sum = bf16[8,64]{1,0} add(bf16[8,64]{1,0} %gte, bf16[8,64]{1,0} %gte)
+  ROOT %gemm = (bf16[64,8]{1,0}, s8[0]{0}) custom-call(bf16[64,8]{1,0} %transpose_fusion.2), \
+custom_call_target="__cublas$gemm"
+}"""
+    assert sharded.boundary_copies(text) == ["copy.1 -> cc", "cc -> transpose_fusion.2"]
+
