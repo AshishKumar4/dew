@@ -129,20 +129,24 @@ def test_a_gpu_runs_the_kernels_both_ways():
     with generation.assumed("sm80"):
         assert kernels(jax.grad(loss), x) == {"short_conv_forward", "short_conv_backward"}
         assert not kernels(lambda x: jax.jvp(loss, (x,), (x,)), x)
-    assert not kernels(jax.grad(loss), x)
+    with generation.assumed("cpu"):
+        assert not kernels(jax.grad(loss), x)
 
 
-@pytest.mark.parametrize("dtype, parts, taps, reason", [
-    (jnp.float64, DELTA, 4, "float64"),
-    (jnp.bfloat16, ((48, 48), (48, None)), 4, "normalised heads"),
-    (jnp.bfloat16, ((32, 16), (32, 32)), 4, "normalised heads"),
-    (jnp.bfloat16, DELTA, 12, "12 taps"),
+@pytest.mark.parametrize("dtype, out, parts, taps, reason", [
+    (jnp.float64, jnp.float64, DELTA, 4, "float64"),
+    (jnp.float32, jnp.float64, DELTA, 4, "into float64"),
+    (jnp.bfloat16, jnp.bfloat16, ((48, 48), (48, None)), 4, "one block"),
+    (jnp.bfloat16, jnp.bfloat16, ((32, 16), (32, 32)), 4, "one block"),
+    # One key head of 16 and a value head of 8: no 16-channel block holds the values.
+    (jnp.bfloat16, jnp.bfloat16, ((16, 16), (16, 16), (8, None)), 4, "one block"),
+    (jnp.bfloat16, jnp.bfloat16, DELTA, 12, "12 taps"),
 ])
-def test_the_kernels_name_what_they_do_not_take(dtype, parts, taps, reason):
-    with jax.enable_x64(new_val=dtype == jnp.float64):
+def test_the_kernels_name_what_they_do_not_take(dtype, out, parts, taps, reason):
+    with jax.enable_x64(new_val=jnp.float64 in (dtype, out)):
         x = jnp.zeros((1, 8, sum(width for width, _ in parts)), dtype)
         with generation.assumed("sm80"):
-            refused = conv_refusal(x, jnp.zeros((x.shape[-1], taps), jnp.float32), parts)
+            refused = conv_refusal(x, jnp.zeros((x.shape[-1], taps), jnp.float32), parts, out)
     assert refused is not None and reason in refused
 
 

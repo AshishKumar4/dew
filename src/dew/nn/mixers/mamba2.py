@@ -405,8 +405,9 @@ class Mamba2(nn.Module):
             if valid is not None:
                 out = jnp.where(valid[:, :, None], out, 0)
         elif shards > 1:
+            # Wide across the shards, so a halo's gradient and its shard's own add before rounding.
             out = _over_sequence(functools.partial(_sequence_mix, scan=scan, axis=SEQUENCE_AXIS),
-                                 shards, mixed, dt, segment_ids, (taps, bias, *heads))
+                                 shards, mixed.astype(wide), dt, segment_ids, (taps, bias, *heads))
         else:
             out = _sequence_mix(mixed, dt, segment_ids, (taps, bias, *heads), scan=scan)
         return self.out_proj(self.norm(out, gate))

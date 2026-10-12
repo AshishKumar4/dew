@@ -144,6 +144,10 @@ FAMILIES = {
     ('swiglu', 'pallas'): ("step", {"swiglu_forward", "swiglu_backward"}),
 }
 
+ONE_PATH = {"short_conv_forward", "short_conv_backward"}
+"""The Pallas kernels a step runs on every Triton GPU, with no KERNELS row to choose them: the short
+conv's (`causal_conv1d`)."""
+
 GPUS = sorted({generation for generation, target in TARGETS.items()
                if generation.startswith('sm') and target.kernels}
               | {'sm80', 'sm120'}, key=lambda generation: int(generation[2:]))
@@ -194,14 +198,14 @@ def test_the_compensated_norm_vjp_lowers_for_both_gpu_generations(generation):
 def test_the_clef_step_lowers_for_the_gpu_with_every_kernel_its_generation_chooses(generation, tmp_path):
     """c58's and c57's step, the Clef recipe's decision step over a Qwen 3.5 hybrid, lowered on this CPU
     for their GPUs, an A100 and a G4 (tools/clef_step.py): it lowers, and it calls the Triton kernels
-    of every Pallas choice the generation's KERNELS row names for its layers, so none was
-    interpreted or refused."""
+    of every Pallas choice the generation's KERNELS row names for its layers and the ones every GPU
+    runs, so none was interpreted or refused."""
     done = subprocess.run([sys.executable, str(ROOT / "tools" / "clef_step.py"), "--lower-for", generation,
                            "--work", str(tmp_path)], capture_output=True, text=True, cwd=ROOT, timeout=1500,
                           env={**os.environ, "JAX_PLATFORMS": "cpu"})
     assert done.returncode == 0, done.stderr[-4000:]
     kernels = json.loads(done.stdout.splitlines()[-1])["kernels"]
-    assert set(kernels) == set().union(*(FAMILIES[key][1] for key in chosen(generation, "step")))
+    assert set(kernels) == ONE_PATH.union(*(FAMILIES[key][1] for key in chosen(generation, "step")))
 
 
 def _experts_lowered(generation: str, implementation: str):

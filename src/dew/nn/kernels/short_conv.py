@@ -42,6 +42,9 @@ an fp32 register of each of four warps' threads."""
 STEPS = 64
 """Tokens of a run: its K-1 extra tokens are 5% of 64 at the K of 4 every mixer uses."""
 
+SUMMED = 2
+"""Tokens whose taps' gradients a run sums before adding them to its compensated total."""
+
 WARPS = 4
 
 WIDEST_TAPS = 8
@@ -58,25 +61,28 @@ def block_width(channels: int, parts) -> int | None:
         return None
     if heads:
         block = heads.pop()
-        return block if block & (block - 1) == 0 and block <= 256 else None
+        fits = block & (block - 1) == 0 and block <= 256 and not any(width % block for width, _ in parts)
+        return block if fits else None
     block = 128
     while block > 1 and any(width % block for width, _ in parts):
         block //= 2
     return block if block >= 16 else None
 
 
-def refusal(x, taps, parts) -> str | None:
-    """Why the kernels do not take a conv of `x` `[B, T, C]` by `taps` `[C, K]` into `parts`, or None
-    where they do."""
+def refusal(x, taps, parts, dtype) -> str | None:
+    """Why the kernels do not take a conv of `x` `[B, T, C]` by `taps` `[C, K]` into `parts` in `dtype`,
+    or None where they do."""
     channels = x.shape[-1]
     return generation.first_refusal(
         (x.ndim == 3 and x.shape[1] > 0, f"a conv over {x.shape}; the kernels take [B, T, C]"),
-        (jnp.dtype(x.dtype) in DTYPES, f"{x.dtype} inputs; the kernels read float32, bfloat16 or float16"),
+        (jnp.dtype(x.dtype) in DTYPES and jnp.dtype(dtype) in DTYPES,
+         f"{x.dtype} inputs into {jnp.dtype(dtype)}; the kernels read and write float32, bfloat16 or "
+         "float16, summing in float32"),
         (2 <= taps.shape[-1] <= WIDEST_TAPS, f"{taps.shape[-1]} taps; the kernels unroll 2 to {WIDEST_TAPS}"),
         (sum(width for width, _ in parts) == channels, f"pieces {parts} of {channels} channels"),
         (block_width(channels, parts) is not None,
-         f"pieces {parts}: normalised heads of one power-of-two width up to 256, and every piece a "
-         "multiple of a block of 16 to 128 channels"),
+         f"pieces {parts}: every piece a multiple of one block, the normalised heads' power-of-two width "
+         "up to 256, else 16 to 128 channels"),
     )
 
 
@@ -203,8 +209,8 @@ def _backward_kernel(*refs, layout, block: int, segments: int, steps: int, count
                 mask=kept & (piece == number), other=0).astype(jnp.float32)
         return total
 
-    def step(index, carry):
-        history, later, tap_sums, bias_sum = carry
+    def step(index, carry, sums):
+        history, later = carry
         tokens = starts + index
         current = _rows(x_ref, tokens, columns, length)
         window = (*history, current)
@@ -220,11 +226,11 @@ def _backward_kernel(*refs, layout, block: int, segments: int, steps: int, count
             along = jnp.sum(out * grad, axis=1, keepdims=True)
             grad = jnp.where(normalised, scale * grad - (scale * scale * scale * along) * out, grad)
         if activation:
-            grad = grad * gate * (1.0 + pre * (1.0 - gate))
+            # silu's derivative as XLA's autodiff rounds it, the closer of the forms to float64.
+            grad = grad * gate + (grad * pre) * (gate * (1.0 - gate))
         # The token's own run sums its taps' and bias's gradients; the K-1 past the run are the next's.
         owned = jnp.where(((index < steps) & (tokens < length))[:, None], grad, 0.0)
-        tap_sums = tuple(total + owned * inputs for total, inputs in zip(tap_sums, window, strict=True))
-        bias_sum = bias_sum + owned
+        sums = (*(total + owned * inputs for total, inputs in zip(sums[:-1], window, strict=True)), sums[-1] + owned)
         # Token `tokens - (K - 1)` reads this one through the last tap and the K-1 before through the others.
         gradients = (*later, grad)
         dx = gradients[0] * taps[count - 1][None, :]
@@ -233,20 +239,36 @@ def _backward_kernel(*refs, layout, block: int, segments: int, steps: int, count
         emitted = tokens - (count - 1)
         plgpu.store(dx_ref.at[jnp.maximum(emitted, 0)[:, None], columns[None, :]], dx.astype(dx_ref.dtype),
                     mask=((index >= count - 1) & (emitted < length))[:, None])
-        return window[1:], gradients[1:], tap_sums, bias_sum
+        return (window[1:], gradients[1:]), sums
 
-    carry = (history, (zero,) * (count - 1), (zero,) * count, zero)
-    _, _, tap_sums, bias_sum = jax.lax.fori_loop(0, steps + count - 1, step, carry)
-    for tap, total in enumerate(tap_sums):
+    # The taps' and bias's sums run in two levels: SUMMED tokens one after another, then those partial
+    # sums compensated (Kahan), so a run's 64 tokens round no worse than XLA's sum over the batch.
+    zeros = (zero,) * (count + 1)
+
+    def summed(outer, state):
+        carry, totals, lost = state
+        carry, sums = jax.lax.fori_loop(0, SUMMED, lambda inner, inner_state: step(
+            outer * SUMMED + inner, *inner_state), (carry, zeros))
+        corrected = tuple(part - error for part, error in zip(sums, lost, strict=True))
+        added = tuple(total + part for total, part in zip(totals, corrected, strict=True))
+        lost = tuple((new - total) - part for new, total, part in zip(added, totals, corrected, strict=True))
+        return carry, added, lost
+
+    carry = (history, (zero,) * (count - 1))
+    carry, totals, lost = jax.lax.fori_loop(0, steps // SUMMED, summed, (carry, zeros, zeros))
+    totals = tuple(total - error for total, error in zip(totals, lost, strict=True))
+    jax.lax.fori_loop(steps, steps + count - 1, lambda index, state: step(index, *state), (carry, zeros))
+    for tap, total in enumerate(totals[:count]):
         dw_ref[tap, columns] = jnp.sum(total, axis=0)
     if db_ref:
-        db_ref[0][columns] = jnp.sum(bias_sum, axis=0)
+        db_ref[0][columns] = jnp.sum(totals[count], axis=0)
 
 
 def _config(length: int, segments: int | None, steps: int | None) -> tuple[int, int]:
+    """Runs a tile and tokens a run, whole multiples of SUMMED."""
     segments = SEGMENTS if segments is None else segments
     steps = min(STEPS, pl.cdiv(length, segments)) if steps is None else steps
-    return segments, steps
+    return segments, SUMMED * pl.cdiv(steps, SUMMED)
 
 
 def _specs(x, w, bias, valid, block: int, segments: int, steps: int):
