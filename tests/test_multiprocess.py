@@ -580,7 +580,8 @@ def packed_checkpoint(tmp_path_factory):
     assert len(positions) == 1, "the processes saved different global positions"
     saved = json.loads(positions.pop())[ENVELOPE]
     assert saved["records"] == POOL_STEPS * worker.BATCH
-    assert "PackedWindows" in saved["order"], "the order has to name the packing"
+    assert any(stage.startswith("Pack(") for stage in json.loads(saved["order"])["stages"]), (
+        "the order has to name the packing")
     return {"run_dir": directory / "run", "corpus": corpus, "reports": reports}
 
 

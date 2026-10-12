@@ -419,6 +419,16 @@ def test_shares_agree_on_one_identity_and_resume_only_their_own_rows():
         second.close()
 
 
+def test_a_memory_read_counts_a_missing_row_alike_with_or_without_a_cache():
+    """A row the source holds as None is left out and counted missing,
+    whether the memory read fills a cache with it or not."""
+    stored = Memory([{"id": np.int32(0)}, None, {"id": np.int32(2)}])
+    for pipeline in (Pipeline(stored), Pipeline(stored).cache(Cache(f"memory://{uuid4().hex}"))):
+        data = compile(pipeline.batch(1), read="memory", loading=READ)
+        assert data.records == 2
+        assert [count.rejected["missing"] for count in data.counts.values()] == [1]
+
+
 def test_a_cached_indexed_root_is_cut_into_disjoint_shares_that_repeat():
     """Each share of a cached indexed read takes its own rows of the source,
     and a training read with no repeat stage goes on past one pass."""
@@ -433,6 +443,28 @@ def test_a_cached_indexed_root_is_cut_into_disjoint_shares_that_repeat():
     assert not set(read[0]) & set(read[1])
     assert sorted(set(read[0]) | set(read[1])) == list(range(1, 9))
     assert all(sorted(rows) == sorted(list(set(rows)) * 2) for rows in read)
+
+
+def test_a_per_share_position_resumes_against_the_same_rows_cached_elsewhere():
+    """The saved plan names a cache by the rows it serves, so a per-share
+    position saved with the cache in one place resumes with it in another."""
+    def reader():
+        cached = Pipeline(source(8)).map(Shift(1), identity="shift@1").cache(Cache(f"memory://{uuid4().hex}"))
+        return compile(cached.batch(2), loading=READ).train(DataPartition())
+
+    saved = reader()
+    try:
+        take(saved, 1)
+        state = saved.get_state()
+        expected = take(saved, 2)
+    finally:
+        saved.close()
+    resumed = reader()
+    try:
+        resumed.set_state(state)
+        assert take(resumed, 2) == expected
+    finally:
+        resumed.close()
 
 
 def test_a_limit_counts_the_whole_order_and_a_prefetch_never_moves_the_share_cut():
@@ -514,6 +546,16 @@ def test_record_steps_before_an_interleave_run_inside_each_shard():
 class Laid:
     def __call__(self, element):
         return {"image": np.resize(np.asarray(element["text"]), (2, 4))}
+
+
+def test_the_saved_order_names_the_stages_a_memory_read_ran_as_an_indexed_read_does():
+    """The canonical order a resume checks is the pipeline as written,
+    whichever read runs its packing. A memory read packs before it orders,
+    and its order still names the pack."""
+    documents = [{"text": np.arange(size, dtype=np.int32)} for size in (8, 1, 8)]
+    packed = Pipeline(Memory(documents)).pack(8, bins=1).shuffle(0, window=2).repeat().batch(1)
+    orders = [compile(packed, read=read, loading=READ).plan.order["stages"] for read in ("memory", "indexed")]
+    assert orders[0] == orders[1] and orders[0][0].startswith("Pack(")
 
 
 def test_a_memory_read_counts_valid_targets_where_it_packs():
