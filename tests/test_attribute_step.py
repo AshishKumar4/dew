@@ -77,9 +77,9 @@ ROWS = {
                                      "{3,2,1,0} %bitcast.13109.0",
                                      "jit(step)/transpose(jvp(JointSchemaHead))/evidence_layers_1/attention/"
                                      "dot_product_attention_bwd:"), "attention"),
-    "Pallas recurrence": (row("pallas_call.525", "%pallas_call.525 = (f32[6144,64,128]{2,1,0}) custom-call("
-                              "f32[6144,64,128]{2,1,0} %bitcast.478.0",
-                              LAYER + "gated_delta_prep_backward/pallas_call:"), "pallas"),
+    "Pallas recurrence": (row("pallas_call.525", "%pallas_call.525 = (bf16[8,3072,16,128]{3,2,1,0}) "
+                              "custom-call(bf16[8,3072,16,128]{3,2,1,0} %bitcast.478.0",
+                              LAYER + "fla_chunk_bwd_dqkwg/pallas_call:"), "pallas"),
     "weight-gradient GEMM": (row("custom-call.1589", "%custom-call.1589 = (bf16[1024,3584]{1,0}, "
                                  "s8[4194304]{0}) custom-call(bf16[24576,1024]{1,0} %bitcast.remat.237",
                                  LAYER.replace("_mix/self_attn/", "mlp/up_proj/") + "transpose:"), "gemm"),
@@ -133,7 +133,7 @@ def test_without_the_module_an_op_is_kinded_from_its_own_name_and_opcode(case, k
 
 
 @pytest.mark.parametrize("framework, source, part", [
-    (LAYER + "gated_delta_prep_backward/pallas_call:", "dew/nn/linear.py:450:31", "gdn"),
+    (LAYER + "fla_chunk_bwd_dqkwg/pallas_call:", "dew/nn/kernels/fla_gdn.py:700:22", "gdn"),
     (LAYER + "jit(softplus)/mul:", "dew/nn/linear.py:689:48", "gdn"),
     (LAYER + "self_attn._attended/ffi_call:", "dew/nn/attention.py:854:15", "attention"),
     ("jit(step)/transpose(jvp(JointSchemaHead))/evidence_layers_1/attention/dot_product_attention_bwd:",
