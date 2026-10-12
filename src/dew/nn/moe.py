@@ -36,6 +36,7 @@ from jax.sharding import PartitionSpec as P
 from .activations import gelu_exact, gelu_tanh, relu2, silu
 from .blocks import normal_kernel
 from .flops import MissingFlopsCount, counted_flops, projection_flops
+from .kernels import norm_swiglu
 from .kernels.generation import backend, measured_kernel, ran_kernel, triton_runs
 from .kernels.grouped_matmul import grouped_projection, ragged_dot_refusal, xla_ragged_dot
 from .precision import at_least_fp32, rounded_operand, rounded_to
@@ -522,14 +523,20 @@ GatedActivation = str | Situ
 """A gated MLP's activation: 'swiglu', 'geglu' or 'geglu_exact' by name, or a `Situ`."""
 
 
-def gated_product(activation: GatedActivation) -> Callable[[jax.Array, jax.Array], jax.Array]:
+def gated_product(activation: GatedActivation, *, implementation: str = 'auto'
+                  ) -> Callable[[jax.Array, jax.Array], jax.Array]:
     """The product a gated MLP takes of its gate and up projections, rounded
     where torch rounds `act_fn(gate) * up`: the activation (silu 'swiglu', tanh
     gelu 'geglu', erf gelu 'geglu_exact') runs in fp32 and rounds to the gate's
     dtype, and the product rounds again. Every rounding is explicit
     (`rounded_to`), the inputs' included: left to XLA, a third of Qwen3-0.6B's
     bf16 products differed from transformers' by up to 2 ulp. fp32 and wider
-    round nowhere. A `Situ` computes its own product."""
+    round nowhere. A `Situ` computes its own product. SwiGLU's
+    `implementation` defaults to the generation's measured kernel; explicit
+    'pallas' interprets on CPU. GeGLU and SiTU remain XLA products."""
+    if implementation not in norm_swiglu.IMPLEMENTATIONS:
+        raise ValueError(f"implementation must be one of {norm_swiglu.IMPLEMENTATIONS}, "
+                         f"got {implementation!r}")
     if isinstance(activation, Situ):
         return activation
     gates = {"swiglu": silu, "geglu": gelu_tanh, "geglu_exact": exact_gelu}
@@ -550,6 +557,8 @@ def gated_product(activation: GatedActivation) -> Callable[[jax.Array, jax.Array
         return rounded_to(activated * up_fp32, dtype).astype(dtype)
 
     def product(gate: jax.Array, up: jax.Array) -> jax.Array:
+        if activation == 'swiglu' and norm_swiglu.swiglu_kernel(implementation, gate, up) == 'pallas':
+            return norm_swiglu.swiglu(gate, up)
         if jnp.finfo(jnp.result_type(gate, up)).bits >= 32:
             return activate(gate) * up
         return rounded_product(gate, up)
