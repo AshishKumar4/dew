@@ -105,6 +105,18 @@ type LogicalAxisRules = tuple[tuple[str, MeshAxes], ...]
 # vocabulary, which shares no array with a residual, splits fsdp times
 # tensor ways.
 #
+# fsdp alone stores a split: a parameter it splits is gathered whole for
+# every use, so which dimension it takes changes no product, only how the
+# shards lie in memory. Among the dimensions a rule names it alone for, it
+# takes the array's leading one that no other axis took (`logical_spec`),
+# whatever the rule order: each shard is then one block of the row-major
+# array, so its gather concatenates and its gradient's reduce-scatter cuts.
+# Split on the mlp width, the gate and up projections transposed their
+# gradients for every update: Llama-3.1-8B over FSDP 2 on two H100 SXMs
+# stepped in 537.8 ms, and in 488.0 split on the residual width.
+# A name whose rule pairs fsdp with tensor (the vocabulary, the heads) splits
+# for a computation, and its rule order stands.
+#
 # The activation_ names place what a step computes rather than what it
 # stores, by the same table: rows over the batch axes, positions over the
 # sequence axis, and the widths of Megatron's split over tensor. The residual
@@ -448,7 +460,9 @@ def logical_spec(axes: LogicalAxes, shape: tuple[int, ...], *,
     it, so that rule is set aside for this array: the name takes its next
     rule, or none, and the mesh axis goes to the next dimension that names
     it. For example, an odd vocabulary shards the embedding on its width and
-    keeps the table in the layout.
+    keeps the table in the layout. fsdp, placed by a rule that names it
+    alone, then moves to the leading dimension such a rule names, that no
+    other axis took and that it divides (`DEFAULT_RULES`).
     """
     rules = axis_rules() if rules is None else rules
     mesh = jax.sharding.get_abstract_mesh() if mesh is None else mesh
@@ -475,6 +489,13 @@ def logical_spec(axes: LogicalAxes, shape: tuple[int, ...], *,
         if not blocked:
             break
         left = [rule for rule in left if rule not in blocked]
+    # fsdp alone takes the leading dimension a rule names it alone for and no
+    # other axis took (`DEFAULT_RULES`).
+    alone = {name for name, assignment in rules if mesh_axes(assignment) == (FSDP_AXIS,)}
+    stored = [dim for dim, (name, used, size) in enumerate(zip(axes, assigned, shape, strict=True))
+              if name in alone and used in ((), (FSDP_AXIS,)) and size % mesh.shape.get(FSDP_AXIS, 1) == 0]
+    if (FSDP_AXIS,) in assigned and assigned.index((FSDP_AXIS,)) in stored:
+        assigned[assigned.index((FSDP_AXIS,))], assigned[stored[0]] = (), (FSDP_AXIS,)
     entries = [used[0] if len(used) == 1 else used or None for used in assigned]
     while entries and entries[-1] is None:
         entries.pop()
