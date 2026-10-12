@@ -239,7 +239,7 @@ def test_qwen35_pair_run_exits_nonzero_when_dew_is_slower(tmp_path, monkeypatch,
 def test_reference_work_is_the_trainers_training_flops_at_the_same_shape(tmp_path, monkeypatch, family):
     """A shifted target column is real data, but contributes no extra model token."""
     from dew.interop import translate_config
-    from dew.telemetry.records import WorkloadWork
+    from dew.telemetry.workload import WorkloadWork
     from dew.training.model_flops import TRAINING_FLOPS, prepare_counts
 
     monkeypatch.syspath_prepend(str(REPO_ROOT / "tools" / "reference_runs"))
@@ -285,7 +285,7 @@ def test_dit_work_includes_the_native_conditioning_geometry(monkeypatch):
 def test_qwen35_work_counts_the_shared_smoke_geometry(monkeypatch, tmp_path):
     """The config-only count must see the convolution that HF builds by default."""
     from dew.nn.flops import counted_flops
-    from dew.telemetry.records import WorkloadWork
+    from dew.telemetry.workload import WorkloadWork
 
     monkeypatch.syspath_prepend(str(REPO_ROOT / "tools" / "reference_runs"))
     writer = load("reference_runs/work")
@@ -323,7 +323,7 @@ def test_reference_reads_work_without_importing_dew_or_jax(tmp_path):
     import subprocess
     import sys
 
-    from dew.telemetry.records import WorkloadWork
+    from dew.telemetry.workload import WorkloadWork
 
     work = WorkloadWork(1234.0, 8, "analytic, real tokens, causal half", "native-config", (2, 5))
     path = tmp_path / "work.json"
