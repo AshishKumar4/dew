@@ -999,6 +999,8 @@ typer==0.27.3
 typing-extensions==4.16.0
     # via
     #   dewml (pyproject.toml)
+    #   aiohttp
+    #   aiosignal
     #   alembic
     #   anyio
     #   etils
@@ -1006,6 +1008,7 @@ typing-extensions==4.16.0
     #   flax
     #   graphene
     #   grpcio
+    #   httpx2
     #   huggingface-hub
     #   jupyter-client
     #   lm-eval
@@ -1018,8 +1021,10 @@ typing-extensions==4.16.0
     #   orbax-checkpoint
     #   pydantic
     #   pydantic-core
+    #   referencing
     #   simple-parsing
     #   sqlalchemy
+    #   starlette
     #   torch
     #   typeguard
     #   typing-inspection
