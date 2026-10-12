@@ -93,6 +93,10 @@ class ArrayRecords:
             shard = bisect.bisect_right(self.ends, index)
             with self._lock:
                 if shard not in self._opened:
+                    if len(self._opened) >= _MAX_OPEN_SHARDS:
+                        _, removed = self._opened.popitem(last=False)
+                        if not removed.reads:
+                            removed.reader.close()
                     opened = ArrayRecords(
                         (self.urls[shard],), self.storage_options, record_codec=self.record_codec
                     )
@@ -102,10 +106,6 @@ class ArrayRecords:
                             f"ArrayRecord {self.urls[shard]} differs from its producer's row count"
                         )
                     self._opened[shard] = _OpenedShard(opened)
-                    if len(self._opened) > _MAX_OPEN_SHARDS:
-                        _, removed = self._opened.popitem(last=False)
-                        if not removed.reads:
-                            removed.reader.close()
                 self._opened.move_to_end(shard)
                 opened_shard = self._opened[shard]
                 opened_shard.reads += 1

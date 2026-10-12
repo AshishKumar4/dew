@@ -632,6 +632,27 @@ def test_arrayrecords_refuse_a_mirror_without_room_for_the_read_width(arrayrecor
         source.close()
 
 
+def test_arrayrecords_release_an_idle_mirror_before_opening_its_replacement(arrayrecord_paths, tmp_path):
+    from dew.data.sources.records import ArrayRecords
+
+    root = Store(f"memory://bounded-record-mirror-{uuid4().hex}")
+    shards = [root.child(f"{index}.array_record") for index in range(len(arrayrecord_paths))]
+    for shard, path in zip(shards, arrayrecord_paths, strict=True):
+        shard.write(Path(path).read_bytes())
+    capacity = sum(Path(path).stat().st_size for path in arrayrecord_paths[:-1])
+    source = ArrayRecords(
+        [shard.url for shard in shards],
+        {"dewcache": {"cache_storage": str(tmp_path / "mirror"), "max_bytes": capacity}},
+        counts=(8,) * len(shards),
+    )
+    try:
+        for _ in range(2):
+            for shard in range(len(shards)):
+                assert source[8 * shard] == f"{shard}:0".encode()
+    finally:
+        source.close()
+
+
 def test_jsonl_offset_index_is_mapped_and_reopened_instead_of_pickled_as_rows():
     import pickle
 
