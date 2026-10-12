@@ -160,9 +160,14 @@ def _forward_kernel(*refs, layout, block: int, segments: int, steps: int, count:
     taps, bias = _taps(w_ref, b_ref, columns, count)
     history = tuple(_rows(x_ref, starts - count + 1 + tap, columns, length) for tap in range(count - 1))
 
-    def step(index, history):
+    def load(tokens):
+        return _rows(x_ref, tokens, columns, length), _kept(valid_ref, tokens, length)
+
+    def step(index, carry):
+        history, (current, kept) = carry
         tokens = starts + index
-        current = _rows(x_ref, tokens, columns, length)
+        # The next token's loads go out before this one's arithmetic, which hides their latency.
+        ahead = load(tokens + 1)
         window = (*history, current)
         y = _preactivation(window, taps, bias)
         if activation:
@@ -170,7 +175,6 @@ def _forward_kernel(*refs, layout, block: int, segments: int, steps: int, count:
         if any(norm for _, norm in layout):
             scale = jax.lax.rsqrt(jnp.sum(y * y, axis=1, keepdims=True) + eps)
             y = jnp.where(normalised, y * scale, y)
-        kept = _kept(valid_ref, tokens, length)
         y = jnp.where(kept[:, None], y, 0.0)
         inside = (tokens < length)[:, None]
         for number, ((first, _), out_ref) in enumerate(zip(layout, out_refs, strict=True)):
@@ -178,9 +182,9 @@ def _forward_kernel(*refs, layout, block: int, segments: int, steps: int, count:
             local = (columns - first * block) % width
             plgpu.store(out_ref.at[tokens[:, None], local[None, :]], y.astype(out_ref.dtype),
                         mask=inside & (piece == number))
-        return window[1:]
+        return window[1:], ahead
 
-    jax.lax.fori_loop(0, steps, step, history)
+    jax.lax.fori_loop(0, steps, step, (history, load(starts)))
 
 
 def _backward_kernel(*refs, layout, block: int, segments: int, steps: int, count: int, length: int,
@@ -206,13 +210,16 @@ def _backward_kernel(*refs, layout, block: int, segments: int, steps: int, count
                 mask=kept & (piece == number), other=0).astype(jnp.float32)
         return total
 
+    def load(tokens):
+        return _rows(x_ref, tokens, columns, length), cotangent(tokens)
+
     def step(index, carry):
-        history, later, sums, lost = carry
+        history, later, sums, lost, (current, grad) = carry
         tokens = starts + index
-        current = _rows(x_ref, tokens, columns, length)
+        # The next token's loads go out before this one's arithmetic, which hides their latency.
+        ahead = load(tokens + 1)
         window = (*history, current)
         pre = _preactivation(window, taps, bias)
-        grad = cotangent(tokens)
         if activation:
             gate = jax.nn.sigmoid(pre)
             out = pre * gate
@@ -240,11 +247,11 @@ def _backward_kernel(*refs, layout, block: int, segments: int, steps: int, count
         emitted = tokens - (count - 1)
         plgpu.store(dx_ref.at[jnp.maximum(emitted, 0)[:, None], columns[None, :]], dx.astype(dx_ref.dtype),
                     mask=((index >= count - 1) & (emitted < length))[:, None])
-        return window[1:], gradients[1:], added, lost
+        return window[1:], gradients[1:], added, lost, ahead
 
     zeros = (zero,) * (count + 1)
-    carry = (history, (zero,) * (count - 1), zeros, zeros)
-    _, _, totals, lost = jax.lax.fori_loop(0, steps + count - 1, step, carry)
+    carry = (history, (zero,) * (count - 1), zeros, zeros, load(starts))
+    _, _, totals, lost, _ = jax.lax.fori_loop(0, steps + count - 1, step, carry)
     totals = tuple(total - error for total, error in zip(totals, lost, strict=True))
     for tap, total in enumerate(totals[:count]):
         dw_ref[tap, columns] = jnp.sum(total, axis=0)
