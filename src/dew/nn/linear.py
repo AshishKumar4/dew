@@ -43,7 +43,7 @@ from dew.nn.kernels import delta_rule, fla_gdn, short_conv
 from .attention import FORWARD_MODE, gated_rms_normalized
 from .blocks import normal_kernel
 from .flops import conv_flops, delta_flops, projection_flops
-from .inputs import AttentionMetadata, valid_order
+from .inputs import AttentionMetadata, Coordinates, coordinates_of, valid_order
 from .kernels import generation
 from .kernels.generation import first_refusal, measured_kernel, ran_kernel, triton_runs
 from .precision import asks_default_precision, at_least_fp32, compensated_add
@@ -173,22 +173,6 @@ def conv_refusal(x, kernel, parts, dtype) -> str | None:
     ) or short_conv.refusal(x, kernel, parts, dtype)
 
 
-def document_starts(segments, before=None, valid=None):
-    """`[B, S]`: whether each token's segment differs from the one before it.
-    `before` `[B]` is the segment of the token ahead of the first; None
-    takes the first token's own, a row that continues whatever preceded it.
-    With `valid` `[B, S]`, "before" is the previous real token, across any
-    padding slots between, and a padding slot starts nothing."""
-    if valid is None:
-        before = segments[:, 0] if before is None else before
-        previous = jnp.concatenate([before[:, None], segments[:, :-1]], axis=1)
-        return segments != previous
-    rank, source = _stream_order(valid)
-    compact = jnp.take_along_axis(segments, source, axis=1, mode='fill', fill_value=-1)
-    starts = document_starts(compact, before)
-    return valid & jnp.take_along_axis(starts, jnp.maximum(rank, 0), axis=1)
-
-
 def document_conv1d(history, x, history_segments, segments, taps, bias=None):
     """The causal depthwise conv of `causal_conv1d` over `x` `[B, S, D]`
     behind `history` `[B, K-1, D]`, where a tap reads a token only if it
@@ -266,8 +250,8 @@ def _behind(x, *, kernel, held, bias, valid=None, parts=None, dtype=None):
 
 
 def held_scan(module: nn.Module, mixed, taps, bias, scan, state_shape: tuple[int, ...], *, decode: bool,
-              valid, segments=None, state: str = 'ssm_state', state_dtype=None, conv_dtype=None,
-              right_padded: bool = False, parts=None, dtype=None):
+              coordinates: Coordinates, state: str = 'ssm_state', state_dtype=None, conv_dtype=None,
+              parts=None, dtype=None):
     """The conv and scan of a mixer that holds per-row state: a decode step or
     prefill advancing `module`'s flax cache, `conv_state` `[B, K-1, D]` held
     in `conv_dtype` and `state` `[B, *state_shape]` held in `state_dtype`
@@ -276,10 +260,10 @@ def held_scan(module: nn.Module, mixed, taps, bias, scan, state_shape: tuple[int
     `scan(convolved, *, starts, valid, held)` the rest, given the convolved
     `[B, S, D]` in `dtype` (`mixed`'s where None), or its `parts` where given
     (`causal_conv1d`), and the held state as it is stored and returning
-    `(output, final state)`. None for the allocation-only decode call. Packed
-    `segments` reset the conv and the state at each document's first real
-    token; the held state counts as the call's first document, which it
-    continues. `right_padded` is `held_conv1d`'s."""
+    `(output, final state)`. None for the allocation-only decode call. The
+    tokens' `coordinates` say which are real and which start a packed
+    document, where the conv and the state reset; the held state counts as
+    the call's first document, which it continues."""
     batch = mixed.shape[0]
     held = conv_state = None
     if decode:
@@ -289,14 +273,15 @@ def held_scan(module: nn.Module, mixed, taps, bias, scan, state_shape: tuple[int
         held = module.variable('cache', state, jnp.zeros, (batch, *state_shape), state_dtype or mixed.dtype)
         if not allocated:
             return None
+    valid = coordinates.valid
     mixed, history = held_conv1d(mixed, taps, valid,
                                  None if conv_state is None else conv_state.value.astype(mixed.dtype),
-                                 bias=bias, segments=segments, right_padded=right_padded, parts=parts,
-                                 dtype=dtype)
+                                 bias=bias, segments=coordinates.segments,
+                                 right_padded=coordinates.right_padded, parts=parts, dtype=dtype)
     if conv_state is not None:
         conv_state.value = history.astype(conv_state.value.dtype)
-    starts = None if segments is None else document_starts(segments, valid=valid)
-    out, final = scan(mixed, starts=starts, valid=valid, held=None if held is None else held.value)
+    out, final = scan(mixed, starts=coordinates.starts, valid=valid,
+                      held=None if held is None else held.value)
     if held is not None:
         held.value = final.astype(held.value.dtype)
     return out
@@ -539,7 +524,7 @@ def chunk_gated_delta_rule(query, key, value, g, beta, state=None, chunk_size: i
     `starts` `[B, S]` marks packed documents' first tokens, each starting
     from a zero memory (`state` continues a row's first document): fla's
     varlen sequences on the port, at most `max_segments` documents a row
-    (static, `AttentionMetadata.max_segments`), and the recurrence reset at
+    (static, `Coordinates.max_segments`), and the recurrence reset at
     each start in the portable math.
     """
     if value.shape[2] % key.shape[2]:
@@ -549,7 +534,7 @@ def chunk_gated_delta_rule(query, key, value, g, beta, state=None, chunk_size: i
                                  else (x.astype(projected) for x in (query, key, value, beta)))
     if starts is not None and max_segments is None:
         raise ValueError("packed documents need max_segments, the most a row holds "
-                         "(AttentionMetadata.max_segments), to bound the port's sequences")
+                         "(Coordinates.max_segments), to bound the port's sequences")
     if on_the_port(rows, keys, values):
         return fla_rule(rows, keys, values, g, gates, state, starts=starts, max_segments=max_segments)
     group = value.shape[2] // key.shape[2]
@@ -902,12 +887,10 @@ class GatedDeltaNet(nn.Module):
     def __call__(self, x, decode: bool = False,
                  positions=None, segment_ids=None, kv_store=None,
                  attention_metadata: AttentionMetadata | None = None):
-        del positions, kv_store
+        del positions, segment_ids, kv_store
         B, S, _ = x.shape
-        valid = None if attention_metadata is None else attention_metadata.valid
-        if valid is not None and valid.shape != (B, S):
-            raise ValueError(f"row validity must be {(B, S)}, got {valid.shape}")
-        max_segments = None if attention_metadata is None else attention_metadata.max_segments
+        tokens = coordinates_of(attention_metadata, B, S)
+        valid = tokens.valid
         mixed, z, b, a = self._project(x)
         key_dim = self.key_features
         operand = mixed.dtype
@@ -938,7 +921,8 @@ class GatedDeltaNet(nn.Module):
                 # fla's layer hands its rule the projections' dtype, the
                 # queries and keys on their own heads and beta beside them.
                 return chunk_gated_delta_rule(query, key, value, g, beta, state, self.chunk_size,
-                                              projected=operand, starts=starts, max_segments=max_segments)
+                                              projected=operand, starts=starts,
+                                              max_segments=tokens.max_segments)
             query, key = self._expand_kv(query), self._expand_kv(key)
             if S == 1 and held is not None and delta_rule.fits(held):
                 return decode_gated_delta_rule(query, key, value, g, beta, held,
@@ -960,9 +944,8 @@ class GatedDeltaNet(nn.Module):
         heads = ((key_dim, self.head_k_dim), (key_dim, self.head_k_dim), (self.value_features, None))
         out = held_scan(self, mixed, self.conv1d()[0], None, scan,
                         (self.num_v_heads, self.head_k_dim, self.head_v_dim), decode=decode,
-                        valid=valid, segments=segment_ids, state='recurrent_state', state_dtype=stored,
+                        coordinates=tokens, state='recurrent_state', state_dtype=stored,
                         conv_dtype=jnp.promote_types(operand, stored),
-                        right_padded=attention_metadata is not None and attention_metadata.right_padded,
                         parts=heads, dtype=operand if ported else wide)
         if out is None:
             return self.out_proj(jnp.zeros((B, S, self.value_features), self.dtype))

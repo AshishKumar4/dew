@@ -164,7 +164,7 @@ class CLIPTextTransformer(nn.Module):
         hidden_states = (self.token_embedding(input_ids)
                          + self.position_embedding(jnp.arange(length)))
         metadata = None if attention_mask is None else AttentionMetadata(
-            coordinates=coordinates(*input_ids.shape, valid=jnp.asarray(attention_mask) != 0))
+            coordinates=coordinates(valid=jnp.asarray(attention_mask) != 0))
         for layer in self.layers:
             hidden_states = layer(hidden_states, attention_metadata=metadata)
         hidden_states = self.final_layer_norm(hidden_states)
@@ -769,7 +769,7 @@ class T5EncoderTransformer(nn.Module):
         valid = None if attention_mask is None else jnp.asarray(attention_mask) != 0
         for index, layer in enumerate(self.layers):
             metadata = AttentionMetadata(
-                coordinates=None if valid is None else coordinates(*valid.shape, valid=valid),
+                coordinates=None if valid is None else coordinates(valid=valid),
                 position_bias=tables[index % len(tables)])
             hidden_states = layer(hidden_states, train, attention_metadata=metadata)
         return self.dropout(self.final_norm(hidden_states), deterministic=not train)

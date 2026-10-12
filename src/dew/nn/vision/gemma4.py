@@ -152,7 +152,7 @@ class Gemma4VisionTransformer(nn.Module):
         table = jnp.asarray(self.position_table, hidden_states.dtype)
         positional = table[0, safe[..., 0]] + table[1, safe[..., 1]]
         hidden_states = hidden_states + jnp.where(valid[..., None], positional, 0)
-        metadata = AttentionMetadata(coordinates=coordinates(*valid.shape, valid=valid),
+        metadata = AttentionMetadata(coordinates=coordinates(valid=valid),
                                      rotary_positions=pixel_position_ids)
         for layer in self.layers:
             hidden_states = layer(hidden_states, attention_metadata=metadata)

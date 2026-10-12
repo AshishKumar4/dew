@@ -24,6 +24,7 @@ from reference_error import assert_leaves_as_exact
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.layer_plan import LayerKind
+from dew.nn.inputs import coordinates
 from dew.nn.mixers import AttentionMixer, MixerBase, MixerContext
 from dew.registry import mixers, models
 
@@ -182,8 +183,8 @@ def packed_and_alone(model, variables, tokens, cotangent):
     positions = jnp.concatenate([jnp.arange(length)[None] for length in DOCUMENTS], axis=1)
 
     def packed(variables):
-        return model.apply(variables, tokens, positions=positions, segment_ids=segments,
-                           max_segments=len(DOCUMENTS))
+        return model.apply(variables, tokens, coordinates=coordinates(
+            segments=segments, positions=positions, max_segments=len(DOCUMENTS)))
 
     def alone(variables):
         starts = (0, *itertools.accumulate(DOCUMENTS))

@@ -40,7 +40,7 @@ from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.blocks import normal_kernel
 from dew.nn.flops import conv_flops, projection_flops, ssd_flops
-from dew.nn.inputs import AttentionMetadata
+from dew.nn.inputs import AttentionMetadata, coordinates_of
 from dew.nn.linear import DepthwiseConv1d, held_scan
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.precision import at_least_fp32
@@ -169,11 +169,10 @@ class Mamba(nn.Module):
     @nn.compact
     def __call__(self, x, decode: bool = False, positions=None, segment_ids=None, kv_store=None,
                  attention_metadata: AttentionMetadata | None = None):
-        del positions, kv_store
+        del positions, segment_ids, kv_store
         batch, length, _ = x.shape
-        valid = None if attention_metadata is None else attention_metadata.valid
-        if valid is not None and valid.shape != (batch, length):
-            raise ValueError(f"row validity must be {(batch, length)}, got {valid.shape}")
+        tokens = coordinates_of(attention_metadata, batch, length)
+        valid = tokens.valid
         shards = sequence_shards()
         if shards > 1:
             raise LayoutRefused(
@@ -188,9 +187,7 @@ class Mamba(nn.Module):
         taps, bias = self.conv1d()
         out = held_scan(self, mixed, taps, bias, self._scan,
                         (self.intermediate_size, self.state_size),
-                        decode=decode, valid=valid, segments=segment_ids, state_dtype=wide, conv_dtype=wide,
-                        dtype=wide,
-                        right_padded=attention_metadata is not None and attention_metadata.right_padded)
+                        decode=decode, coordinates=tokens, state_dtype=wide, conv_dtype=wide, dtype=wide)
         if out is None:
             # Allocation only: init_cache's dummy token must not consume a
             # position or leave state behind.

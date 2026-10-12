@@ -55,9 +55,9 @@ from jax.sharding import PartitionSpec as P
 
 from dew.nn.blocks import normal_kernel
 from dew.nn.flops import conv_flops, projection_flops, ssd_flops
-from dew.nn.inputs import AttentionMetadata
+from dew.nn.inputs import AttentionMetadata, coordinates_of
 from dew.nn.kernels.ssd import ssd_chunk_scan, ssd_kernel_platform
-from dew.nn.linear import DepthwiseConv1d, causal_conv1d, document_conv1d, document_starts, held_scan
+from dew.nn.linear import DepthwiseConv1d, causal_conv1d, document_conv1d, held_scan
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.precision import at_least_fp32
 from dew.nn.sharding import (
@@ -364,11 +364,10 @@ class Mamba2(nn.Module):
     @nn.compact
     def __call__(self, x, decode: bool = False, positions=None, segment_ids=None, kv_store=None,
                  attention_metadata: AttentionMetadata | None = None):
-        del positions, kv_store
+        del positions, segment_ids, kv_store
         batch, length, _ = x.shape
-        valid = None if attention_metadata is None else attention_metadata.valid
-        if valid is not None and valid.shape != (batch, length):
-            raise ValueError(f"row validity must be {(batch, length)}, got {valid.shape}")
+        tokens = coordinates_of(attention_metadata, batch, length)
+        valid = tokens.valid
         if valid is not None:
             x = jnp.where(valid[:, :, None], x, 0)
         projected = self.in_proj(x)
@@ -395,9 +394,7 @@ class Mamba2(nn.Module):
                     "state per row. Run them on a mesh with sequence=1.")
             out = held_scan(self, mixed, taps, bias, functools.partial(scan, dt=dt, heads=heads),
                             (self.num_heads, self.head_dim, self.state_size),
-                            decode=decode, valid=valid, segments=segment_ids, state_dtype=wide,
-                            conv_dtype=wide, dtype=wide,
-                            right_padded=attention_metadata is not None and attention_metadata.right_padded)
+                            decode=decode, coordinates=tokens, state_dtype=wide, conv_dtype=wide, dtype=wide)
             if out is None:
                 # Allocation only, as the delta net: init_cache's dummy token
                 # must not consume a position or leave state behind.
@@ -407,9 +404,10 @@ class Mamba2(nn.Module):
         elif shards > 1:
             # Wide across the shards, so a halo's gradient and its shard's own add before rounding.
             out = _over_sequence(functools.partial(_sequence_mix, scan=scan, axis=SEQUENCE_AXIS),
-                                 shards, mixed.astype(wide), dt, segment_ids, (taps, bias, *heads))
+                                 shards, mixed.astype(wide), dt, tokens.segments, tokens.starts,
+                                 (taps, bias, *heads))
         else:
-            out = _sequence_mix(mixed, dt, segment_ids, (taps, bias, *heads), scan=scan)
+            out = _sequence_mix(mixed, dt, tokens.segments, tokens.starts, (taps, bias, *heads), scan=scan)
         return self.out_proj(self.norm(out, gate))
 
 
@@ -454,12 +452,12 @@ def _ssd(convolved, dt, heads, *, num_heads: int, head_dim: int, n_groups: int,
     return out.reshape(batch, length, intermediate), final
 
 
-def _sequence_mix(mixed, dt, segments, weights, *, scan, axis: str | None = None):
+def _sequence_mix(mixed, dt, segments, starts, weights, *, scan, axis: str | None = None):
     """The conv and the scan over whole training sequences, or over this
     shard's slice of them inside a `shard_map` that holds `axis` manual.
 
     `mixed` `[B, S, conv_dim]` the projection, convolved in at least fp32,
-    `dt` `[B, S, H]` in fp32, `segments` `[B, S]` or None, `weights` the
+    `dt` `[B, S, H]` in fp32, `segments` `[B, S]` and their documents' `starts` or None, `weights` the
     conv's taps and bias and the heads' `dt_bias`, `A` and `D`. Under `axis`
     the conv reads the previous shard's last `K-1` tokens and segments by one
     `ppermute` (zeros on the first) and the scan is corrected for the earlier
@@ -480,23 +478,20 @@ def _sequence_mix(mixed, dt, segments, weights, *, scan, axis: str | None = None
     wide = at_least_fp32(mixed.dtype)
     if segments is None and forward is None:
         convolved = causal_conv1d(mixed, taps, bias=bias, dtype=wide)
-        starts = None
     elif segments is None:
         stream = jnp.concatenate([history, mixed], axis=1)
         convolved = causal_conv1d(stream, taps, bias=bias, dtype=wide)[:, width:]
-        starts = None
     else:
         if forward is None:
             before = jnp.broadcast_to(segments[:, :1], (batch, width))
         else:
             before = jax.lax.ppermute(segments[:, length - width:], axis, forward)
         convolved = document_conv1d(history, mixed, before, segments, taps, bias)
-        starts = document_starts(segments, before[:, -1])
     out, _ = scan(convolved, dt, (dt_bias, A, D), starts=starts, axis=axis)
     return out
 
 
-def _over_sequence(mix, shards: int, mixed, dt, segments, weights):
+def _over_sequence(mix, shards: int, mixed, dt, segments, starts, weights):
     """Run `mix` (`_sequence_mix` under the sequence axis) in a `manual_map`
     that splits the rows and the sequence as the rule table places a
     `[batch, length, ...]` activation, with the weights whole on every
@@ -508,8 +503,8 @@ def _over_sequence(mix, shards: int, mixed, dt, segments, weights):
             f"mamba2 splits the sequence of {length} tokens {shards} ways over the "
             "mesh's sequence axis, and it does not divide")
     tokens = logical_spec(("activation_batch", "activation_length"), mixed.shape[:2])
-    split = manual_map(mix, (tokens, tokens, tokens, P()), tokens)
-    return split(mixed, dt, segments, weights)
+    split = manual_map(mix, (tokens, tokens, tokens, tokens, P()), tokens)
+    return split(mixed, dt, segments, starts, weights)
 
 
 def _log_head_index(key, shape):

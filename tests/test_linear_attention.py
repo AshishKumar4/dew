@@ -36,7 +36,7 @@ import pytest
 from flax import linen as nn
 from reference_error import assert_as_exact_as_the_reference
 
-from dew.nn.inputs import AttentionMetadata
+from dew.nn.inputs import AttentionMetadata, coordinates
 from dew.nn.linear import (
     GatedDeltaNet,
     _masked_conv1d,
@@ -506,7 +506,7 @@ def test_the_layer_reads_a_holed_row_as_the_row_without_its_holes(reference, geo
 
     alone = module.apply(variables, hidden)
     holed = module.apply(variables, spread,
-                         attention_metadata=AttentionMetadata(valid=valid))
+                         attention_metadata=AttentionMetadata(coordinates=coordinates(valid=valid)))
 
     assert largest(holed[:, kept], alone) < 1e-5
     assert jnp.array_equal(holed[:, jnp.asarray([2, 3, 6])],
@@ -558,7 +558,8 @@ def test_a_right_padded_layer_keeps_its_real_tokens_states(reference, geometry):
     def gathers(metadata) -> int:
         return call(metadata).lower(hidden).compile().as_text().count(" gather(")
 
-    masked, declared = AttentionMetadata(valid=valid), AttentionMetadata(valid=valid, right_padded=True)
+    masked = AttentionMetadata(coordinates=coordinates(valid=valid))
+    declared = AttentionMetadata(coordinates=coordinates(valid=valid, right_padded=True))
 
     assert largest(call(declared)(hidden), call(masked)(hidden)) < 1e-6
     assert jnp.array_equal(call(declared)(hidden)[0, 6:], jnp.zeros_like(hidden[0, 6:]))
