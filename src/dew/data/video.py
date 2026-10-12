@@ -42,13 +42,12 @@ def fit_frames(frames: np.ndarray, size: int) -> np.ndarray:
                      for frame in frames])
 
 
-def fetch(url: str = "url", to: str = "mp4", *, timeout: float = 30.0, retries: int = 2,
-          max_bytes: int = 256 * 2**20) -> Fetch:
+def fetch(url: str = "url", to: str = "mp4", *, timeout: float = 30.0, max_bytes: int = 256 * 2**20) -> Fetch:
     """A record step that fetches the clip at the record's `url` field into
     `to` as bytes, as `images.fetch` does an image."""
     from dew.data.sources.urls import Fetch
 
-    return Fetch(url, to, timeout, retries, max_bytes)
+    return Fetch(url, to, timeout, max_bytes)
 
 
 def decode_clip(frames: int = 16, *, size: int = 256, fps: float = 25.0, field: str = "mp4",

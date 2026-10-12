@@ -113,15 +113,16 @@ def augment_image(augment: Augment | None, image: np.ndarray,
     return np.rint(pixels).astype(np.uint8)
 
 
-def fetch(url: str = "url", to: str = "jpg", *, timeout: float = 10.0, retries: int = 2,
-          max_bytes: int = 64 * 2**20) -> Fetch:
-    """A record step that fetches the image at the record's `url` field into
-    `to` as bytes; a failed fetch is counted and dropped. An indexed read runs
-    `Loading.threads` fetches at once in each worker. The bytes are volatile:
-    a `.cache(...)` after the fetch keeps them for exact resume."""
+def fetch(url: str = "url", to: str = "jpg", *, timeout: float = 10.0, max_bytes: int = 64 * 2**20) -> Fetch:
+    """A record step (`filter_map`) that fetches the image at the record's
+    `url` field into `to` as bytes, in one attempt of at most `timeout`; a
+    failed fetch is counted and dropped, a transient one fetched again on a
+    later pass. An indexed read runs `Loading.threads` fetches at once in each
+    worker. The bytes are volatile: a published cache after the fetch keeps
+    them for exact resume."""
     from dew.data.sources.urls import Fetch
 
-    return Fetch(url, to, timeout, retries, max_bytes)
+    return Fetch(url, to, timeout, max_bytes)
 
 
 def decode(field: str = "jpg", to: str = "image") -> DecodeImage:
