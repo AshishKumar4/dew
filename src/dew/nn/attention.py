@@ -26,7 +26,7 @@ from jax.sharding import PartitionSpec as P
 from dew.telemetry.devices import deterministic_ops_requested
 
 from .attention_sinks import attention_with_sinks
-from .flops import attention_flops, projection_flops, real_lengths
+from .flops import attention_flops, cross_attention_flops, projection_flops
 from .kernels import decode_attention, generation, norm_swiglu
 from .kernels.generation import bf16_dot_runs, device_generation, first_refusal, measured_kernel, ran_kernel
 from .kv_cache import Append, KVCache, KVStore, filled_slots
@@ -2041,14 +2041,10 @@ class NormalAttention(nn.Module):
     @nn.nowrap
     def cross_flops(self, lengths, context_lengths, context_features: int) -> float:
         """Cross-attention with the context geometry supplied by its owner."""
-        query, context = real_lengths(lengths), real_lengths(context_lengths)
-        if query.shape != context.shape:
-            raise ValueError("cross-attention FLOPs need matching query/context rows")
-        inner = self.heads * self.dim_head
         maps = self.projections(context_features)
         return (sum(projection_flops(lengths, *maps[name]) for name in ('to_q', 'to_out_0'))
                 + sum(projection_flops(context_lengths, *maps[name]) for name in ('to_k', 'to_v'))
-                + 4 * inner * float(np.sum(query * context)))
+                + cross_attention_flops(lengths, context_lengths, self.heads, self.dim_head, self.dim_head))
 
     def setup(self):
         maps = self.projections()

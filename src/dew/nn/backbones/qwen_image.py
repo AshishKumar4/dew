@@ -31,7 +31,14 @@ from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.attention import RMSNorm, scaled_dot_product_attention
 from dew.nn.blocks import sinusoidal_time
-from dew.nn.flops import MissingFlopsCount, matching_lengths, patch_lengths, projection_flops
+from dew.nn.flops import (
+    MissingFlopsCount,
+    attention_flops,
+    cross_attention_flops,
+    matching_lengths,
+    patch_lengths,
+    projection_flops,
+)
 from dew.nn.precision import at_least_fp32
 from dew.nn.rope import axis_tables
 from dew.nn.sharding import logical_axes
@@ -140,9 +147,12 @@ class _Block(nn.Module):
         image, context = matching_lengths(lengths, context_lengths)
         joined = (image + context).astype(np.int64)
         count = self._attention().stream_flops(joined, None, self.features)
-        # The text queries read no image keys and only their causal text half.
-        omitted = 4 * self.heads * self.head_dim * np.sum(image * context + 0.5 * context * context)
-        return count + self._feed_forward().model_flops(joined) - float(omitted)
+        heads, key, value = self.heads, self.head_dim, self.head_dim
+        count -= attention_flops(joined, heads, key, value, causal=False)
+        count += (attention_flops(lengths, heads, key, value, causal=False)
+                  + cross_attention_flops(lengths, context_lengths, heads, key, value)
+                  + attention_flops(context_lengths, heads, key, value, causal=True))
+        return count + self._feed_forward().model_flops(joined)
 
     @nn.compact
     def __call__(self, x, modulation, rotation, lengths, image: int):

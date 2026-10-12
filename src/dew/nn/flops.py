@@ -114,7 +114,18 @@ def attention_flops(lengths: np.ndarray, heads: int, key: int, value: int, *, ca
         work = np.floor(length / chunk) * pairs(chunk) + pairs(np.remainder(length, chunk))
     else:
         work = pairs(length)
-    return float(2 * heads * (key + value) * np.sum(work))
+    return _attention_products(work, heads, key, value)
+
+
+def cross_attention_flops(lengths: np.ndarray, context_lengths: np.ndarray,
+                           heads: int, key: int, value: int) -> float:
+    """QK and AV over independent query/key rows, rather than a joined square."""
+    query, context = matching_lengths(lengths, context_lengths)
+    return _attention_products(query * context, heads, key, value)
+
+
+def _attention_products(pairs: np.ndarray, heads: int, key: int, value: int) -> float:
+    return float(2 * heads * (key + value) * np.sum(pairs))
 
 
 def delta_flops(lengths: np.ndarray, heads: int, key: int, value: int) -> float:
