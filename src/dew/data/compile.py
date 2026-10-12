@@ -852,7 +852,6 @@ def publish(
         raise TypeError("publish needs a Cache destination")
     if isinstance(pipeline.source, (Mixture, Phases)):
         raise ValueError("publish each source prefix before mixing")
-    (pipeline,) = _prepared((pipeline,), read, provision=provision)
     planned = _at(pipeline.stages, Pack)
     builder = None
     if planned is not None:
@@ -863,6 +862,7 @@ def publish(
             raise ValueError("publication accepts one terminal packing stage after the cached prefix")
         builder = PackingPlan(packing)
         pipeline = dataclasses.replace(pipeline, stages=pipeline.stages[:planned])
+    (pipeline,) = _prepared((pipeline,), read, provision=provision)
     source = pipeline.source
     if isinstance(source, (Mixture, Phases)):
         raise ValueError("configured publication needs one physical source")
