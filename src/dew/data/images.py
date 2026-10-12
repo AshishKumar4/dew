@@ -4,8 +4,13 @@ from __future__ import annotations
 
 import dataclasses
 import importlib
+from typing import TYPE_CHECKING
 
 import numpy as np
+
+if TYPE_CHECKING:
+    from dew.data.sources.urls import Fetch
+    from dew.data.steps.image import DecodeImage, MaxAspect, MinSide, NotFlat
 
 
 def import_opencv() -> None:
@@ -89,3 +94,43 @@ def augment_image(augment: Augment | None, image: np.ndarray,
     factors = np.asarray([rng.uniform(low, high) for low, high in _JITTER_RANGES])
     pixels = jitter_host(image.astype(np.float32), factors, rng.permutation(3))
     return np.rint(pixels).astype(np.uint8)
+
+
+def fetch(url: str = "url", to: str = "jpg", *, timeout: float = 10.0, retries: int = 2,
+          max_bytes: int = 64 * 2**20) -> Fetch:
+    """A record step that fetches the image at the record's `url` field into
+    `to` as bytes; a failed fetch is counted and dropped. An indexed read runs
+    `Loading.threads` fetches at once in each worker. The bytes are volatile:
+    a `.cache(...)` after the fetch keeps them for exact resume."""
+    from dew.data.sources.urls import Fetch
+
+    return Fetch(url, to, timeout, retries, max_bytes)
+
+
+def decode(field: str = "jpg", to: str = "image") -> DecodeImage:
+    """A record step that decodes the image in `field` to RGB uint8 pixels
+    under `to`; bytes that are no image are counted and dropped."""
+    from dew.data.steps.image import DecodeImage
+
+    return DecodeImage(field, to=to)
+
+
+def min_side(size: int, field: str = "image") -> MinSide:
+    """A filter keeping pixels at least `size` on their shorter side."""
+    from dew.data.steps.image import MinSide
+
+    return MinSide(size, field)
+
+
+def max_aspect(ratio: float, field: str = "image") -> MaxAspect:
+    """A filter keeping pixels at most `ratio` times as long as wide."""
+    from dew.data.steps.image import MaxAspect
+
+    return MaxAspect(ratio, field)
+
+
+def not_flat(field: str = "image") -> NotFlat:
+    """A filter dropping pixels of one flat colour."""
+    from dew.data.steps.image import NotFlat
+
+    return NotFlat(field)

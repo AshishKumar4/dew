@@ -6,7 +6,7 @@ import dataclasses
 import inspect
 import math
 from collections.abc import Callable, Mapping, Sequence
-from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Concatenate, Literal, Protocol, runtime_checkable
 
 import grain.python as pygrain
 import numpy as np
@@ -332,6 +332,11 @@ class Pipeline:
     def then(self, *stages: Stage) -> Pipeline:
         return dataclasses.replace(self, stages=(*self.stages, *stages))
 
+    def pipe[**Options](self, stages: Callable[Concatenate[Pipeline, Options], Pipeline],
+                        *args: Options.args, **kwargs: Options.kwargs) -> Pipeline:
+        """`stages(self, *args, **kwargs)`: a function that adds stages, such as `images.decode`."""
+        return stages(self, *args, **kwargs)
+
     def map(
         self, *steps: RecordStep | Configured, identity: str | None = None, rejects: bool | None = None
     ) -> Pipeline:
@@ -369,9 +374,11 @@ class Pipeline:
         return self.then(MapWithIndex(step, identity, _rejects(step)))
 
     def filter(
-        self, predicate: Callable[[Batch], bool], *, reason: str = "filtered", identity: str | None = None
+        self, predicate: Callable[[Batch], bool], *, reason: str | None = None, identity: str | None = None
     ) -> Pipeline:
-        return self.then(Filter(predicate, reason, identity))
+        """Keep the records `predicate` accepts; the rest are counted under
+        `reason`, by default the predicate's own (`images.min_side`'s "too_small")."""
+        return self.then(Filter(predicate, reason or getattr(predicate, "reason", "filtered"), identity))
 
     def flat_map(self, step: Expansion, *, identity: str | None = None) -> Pipeline:
         return self.then(FlatMap(step, identity))

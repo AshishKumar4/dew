@@ -36,9 +36,11 @@ class Fetch:
     def __call__(self, record: Mapping[str, object]):
         from dew.data.pipeline import Rejected
 
-        url = record.get(self.field)
+        if self.field not in record:
+            raise ValueError(f"Fetch reads its url from {self.field!r}; the record has {sorted(record)}")
+        url = record[self.field]
         if not isinstance(url, str):
-            raise ValueError(f"Fetch needs a string field {self.field!r}")
+            return Rejected("invalid_url")
         for attempt in range(self.retries + 1):
             try:
                 request = urllib.request.Request(url, headers={"User-Agent": "dew-data/1"})
