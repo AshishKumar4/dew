@@ -1,8 +1,9 @@
 """Whether a training step fits its devices, and the rungs that make it fit.
 
 The trainer compiles a step, reads its memory from the executable and each
-device's free bytes, and climbs the objective's recomputation ladder until
-the step fits everywhere; these are those measurements and the ladder.
+device's free bytes, and climbs the objective's recomputation ladder or
+splits the step's batch until the step fits everywhere
+(`dew.training.planning`); these are those measurements and the ladder.
 """
 
 from __future__ import annotations
@@ -99,24 +100,6 @@ def compiled_if_it_fits(program: jax.stages.Lowered, options: jax.stages.Compile
         return None
 
 
-def fitting_default(program: jax.stages.Lowered, executable: jax.stages.Compiled | None,
-                    mesh: Mesh, held: int, refusals: list[RuntimeError]
-                    ) -> tuple[jax.stages.Compiled | None, bool]:
-    """Fall back to the step compiled under XLA's default options if only that one fits.
-
-    It returns the step to run and whether it fits; `held` is as in `step_fits`
-    and `refusals` as in `compiled_if_it_fits`. Turning the Triton GEMM fusions
-    back on can need fewer temporaries, so XLA's defaults are tried before the
-    ladder's first rung.
-    """
-    default = compiled_if_it_fits(program, None, refusals)
-    if not step_fits(default, mesh, held):
-        return executable, False
-    _log.warning("the step fits the devices only with XLA's default options (Triton GEMM fusions, "
-                 "merged dots); compiling it with them")
-    return default, True
-
-
 def split_share(params: Variables) -> float:
     """The share of the bytes of `params`, placed arrays, every collection a
     frozen split keeps among them, that a parameter axis splits
@@ -174,10 +157,12 @@ def climb_to[LossT, EffectsT](objective: Objective[LossT, EffectsT], rung: Mappi
 
 
 def head_tile_of[LossT, EffectsT](objective: Objective[LossT, EffectsT]) -> tuple[int, int] | None:
-    """The tile the objective's vocabulary head computes its backward in
-    (`ProgramModule.head_tile`), or None for a head that keeps its whole
-    logits or an objective with no head."""
-    return next((entry.head_tile for entry in objective.program_key() if entry.head_tile is not None), None)
+    """The tile the vocabulary head the objective trains computes its
+    backward in (`ProgramModule.head_tile`), or None for a head that keeps
+    its whole logits or an objective that trains no head: what `tile_head`
+    moves and `restore_head_tile` sets."""
+    return next((entry.head_tile for entry in objective.program_key()
+                 if entry.trained and entry.head_tile is not None), None)
 
 
 def recompute_record[LossT, EffectsT](objective: Objective[LossT, EffectsT]) -> JSON:
@@ -188,6 +173,17 @@ def recompute_record[LossT, EffectsT](objective: Objective[LossT, EffectsT]) -> 
     records = [entry.module.recompute_record() if isinstance(entry.module, Recomputing) else None
                for entry in objective.program_key() if entry.trained]
     return records[0] if len(records) == 1 else records or None
+
+
+def rung_record[LossT, EffectsT](objective: Objective[LossT, EffectsT],
+                                 xla_defaults: bool) -> dict[str, JSON]:
+    """The rung of the fit ladder a step compiles at, as a checkpoint records
+    it: the objective's head tile, its trained modules' remat
+    (`recompute_record`) and whether the step keeps XLA's default options,
+    the half rung above each. Each decides the program a step runs."""
+    tile = head_tile_of(objective)
+    return {'head_tile': None if tile is None else list(tile), 'remat': recompute_record(objective),
+            'xla_defaults': xla_defaults}
 
 
 def step_headroom(executable: jax.stages.Compiled, devices: Sequence, held: int = 0) -> int | None:
@@ -310,8 +306,9 @@ def fits_everywhere(headroom: int | None) -> bool:
     return min((value for value in from_every_process(headroom) if value is not None), default=0) >= 0
 
 
-def step_fits(executable: jax.stages.Compiled | None, mesh: Mesh, held: int = 0) -> bool:
-    """Whether the compiled step fits in the free memory of every device of `mesh`.
+def step_fits(executable: jax.stages.Compiled | None, mesh: Mesh, held: int = 0) -> tuple[bool, int | None]:
+    """Whether the compiled step fits in the free memory of every device of `mesh`,
+    and this process's headroom (`step_headroom`), None where it reads none.
 
     Each device must also hold `held` more bytes, and the processes that hold
     them agree on the answer. A step that XLA refused for memory
@@ -319,7 +316,8 @@ def step_fits(executable: jax.stages.Compiled | None, mesh: Mesh, held: int = 0)
     agreement.
     """
     local = [device for device in mesh.devices.flat if device.process_index == jax.process_index()]
-    return fits_everywhere(-1 if executable is None else step_headroom(executable, local, held=held))
+    headroom = None if executable is None else step_headroom(executable, local, held=held)
+    return fits_everywhere(-1 if executable is None else headroom), headroom
 
 
 def refuse_wide_floats(state: TrainState, mesh: Mesh) -> None:
@@ -345,28 +343,43 @@ def refuse_wide_floats(state: TrainState, mesh: Mesh) -> None:
             "nextafter. Store the parameters in float32 on a TPU, or train them on a CPU or a GPU.")
 
 
-def recompute_more[LossT, EffectsT](objective: Objective[LossT, EffectsT]) -> bool:
+def recompute_more[LossT, EffectsT](objective: Objective[LossT, EffectsT],
+                                    base: tuple[int, int] | None = None) -> bool:
     """Move the objective one rung up its ladder, and return whether there was a rung to move to.
 
-    A head that keeps its whole logits for the backward pass moves to the
-    generation's tile first (`LMObjective.head_tile`); after that, each
-    module the objective trains recomputes one rung more where its own
-    ladder goes on (`Recomputing.recompute_more`).
+    At each remat rung a head that keeps its whole logits for the backward
+    pass, or the run's own tile `base`, comes first, then the generation's
+    tile (`LMObjective.head_tile`); after that, each module the objective
+    trains recomputes one rung more (`remat_more`), with the head back at
+    `base`. A tiled head costs less than recomputing more, and more than the
+    whole logits: Llama-3.1-8B at 2 x 4096 on two H100s ran 563.0 ms a step
+    tiled under 'minimal' and 540.0 ms whole, at the same 66.5 GiB peak.
     """
-    moved = objective.tile_head()
-    if moved is not None:
-        _log.warning(
-            "the step does not fit the devices with the whole logits kept; compiling it again with %s", moved
-        )
-        return True
+    if head_tile_of(objective) == base:
+        moved = objective.tile_head()
+        if moved is not None:
+            _log.warning("the step does not fit the devices with the whole logits kept; compiling it again "
+                         "with %s", moved)
+            return True
+    current = recompute_record(objective)
+    if not remat_more(objective):
+        return False
+    if head_tile_of(objective) != base:
+        objective.restore_head_tile(base)
+    _log.warning("the step does not fit the devices under remat %r; compiling it again under %r",
+                 current, recompute_record(objective))
+    return True
+
+
+def remat_more[LossT, EffectsT](objective: Objective[LossT, EffectsT]) -> bool:
+    """Move each module the objective trains one rung up its own remat ladder
+    where it goes on (`Recomputing.recompute_more`), and return whether any
+    moved."""
     entries = objective.program_key()
     stronger = [entry.module.recompute_more() if entry.trained and isinstance(entry.module, Recomputing)
                 else None for entry in entries]
     if all(module is None for module in stronger):
         return False
-    current = recompute_record(objective)
     objective.substitute([entry.module if module is None else module
                           for module, entry in zip(stronger, entries, strict=True)])
-    _log.warning("the step does not fit the devices under remat %r; compiling it again under %r",
-                 current, recompute_record(objective))
     return True

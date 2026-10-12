@@ -20,7 +20,7 @@ from flax import linen as nn
 from jax.sharding import NamedSharding, PartitionSpec as P
 
 from ..mla import INDEXER_COLLECTION
-from ..sharding import STAGE_AXIS
+from ..sharding import STAGE_AXIS, microbatched
 from .decoder_block import DecoderBlock
 from .layer_plan import LayerSpec, group_layers, group_name
 
@@ -528,21 +528,8 @@ def _stage_sharding(ndim: int) -> NamedSharding:
                          P(STAGE_AXIS, *([P.UNCONSTRAINED] * (ndim - 1))))
 
 
-def _microbatched(value, axis: int, count: int):
-    """`[.., rows, ..]` as `[count, .., rows / count, ..]`: microbatch m takes
-    rows m, m + count, m + 2 * count, ...
-
-    A batch splits over its devices in blocks of consecutive rows. Strided,
-    each microbatch keeps a share of every block where the block is, as long
-    as `count` divides a block; cut into consecutive runs, each microbatch
-    would sit in one block and move to the devices of every other."""
-    shape = value.shape
-    split = value.reshape((*shape[:axis], shape[axis] // count, count, *shape[axis + 1:]))
-    return jnp.moveaxis(split, axis + 1, 0)
-
-
 def _whole(value, axis: int):
-    """The batch `_microbatched` cut, back in one piece and in its order."""
+    """The batch `microbatched` cut, back in one piece and in its order."""
     moved = jnp.moveaxis(value, 0, axis + 1)
     shape = moved.shape
     return moved.reshape((*shape[:axis], shape[axis] * shape[axis + 1], *shape[axis + 2:]))
@@ -568,7 +555,7 @@ def run_pipeline(model: nn.Module, view: StackView, x, *, train: bool, positions
     stages, count = view.stages, view.microbatches
     per_stage = view.per_stage
     batch_axis = 1 if model.altup is not None else 0
-    micro = functools.partial(_microbatched, count=count)
+    micro = functools.partial(microbatched, count=count)
     x = micro(x, batch_axis)
     per_row = [None if value is None else micro(jnp.asarray(value), 0)
                for value in (positions, segment_ids)]

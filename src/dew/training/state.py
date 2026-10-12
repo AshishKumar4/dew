@@ -41,11 +41,13 @@ class Accumulation:
 class TrainState:
     """Holds everything a run must checkpoint to resume where it stopped.
 
-    It keeps three separate counters. `step` counts attempts, and together
-    with the root `key`, which never changes, it determines the next
-    training draw. `microstep` counts accepted microbatches, and the
-    objective's schedules read it. `updates` counts committed updates, and
-    the optimizer's and the EMA's schedules read it.
+    It keeps three separate counters. `step` counts attempted steps, and
+    together with the root `key`, which never changes, and a microbatch's
+    place in its step, it determines each training draw. `microstep` counts
+    accepted microbatches, which a step's batch is read in one or more of
+    (`Trainer.compile`), and the objective's schedules read it per step.
+    `updates` counts committed updates, and the optimizer's and the EMA's
+    schedules read it.
 
     The loss scaler (`scale`) and the partial accumulation window
     (`accumulation`) are numerical state too, so they are saved in the same
