@@ -507,13 +507,13 @@ def test_a_bf16_layer_with_wide_keys_hands_the_port_its_narrowed_operands(monkey
     assert called and set(called) == {jnp.dtype(jnp.bfloat16)}
 
 
-def test_a_remat_policy_saves_the_ports_named_residuals_and_changes_no_gradient(monkeypatch):
+def test_a_remat_policy_saves_the_ports_named_residuals_and_changes_no_gradient(monkeypatch, capsys):
     """A block's remat policy may keep the rule's output and the port's saved decay and inverse
     (`decoder_block.RESIDUALS`): under `jax.checkpoint` with that policy the layer saves those three
     for its backward, and off a GPU computes the gradients it computes without one, bitwise. A GPU
     compiles the remat step as another program, whose roundings differ: on an H100 even the XLA
     math's A_log gradient moved by 5.4e-5 relative between the two, the remat one nearer float64."""
-    from jax.ad_checkpoint import saved_residuals
+    from jax.ad_checkpoint import print_saved_residuals
 
     from dew.nn.backbones.decoder_block import RematPolicy
 
@@ -525,7 +525,9 @@ def test_a_remat_policy_saves_the_ports_named_residuals_and_changes_no_gradient(
     def loss(params):
         return jnp.sum(layer.apply(params, x) ** 2)
 
-    saved = " ".join(source for _, source in saved_residuals(jax.checkpoint(loss, policy=policy), params))
+    capsys.readouterr()
+    print_saved_residuals(jax.checkpoint(loss, policy=policy), params)
+    saved = capsys.readouterr().out
     for name in ("context", "delta_decay", "delta_inverse"):
         assert f"named '{name}'" in saved, (name, saved)
     if jax.default_backend() == "gpu":
