@@ -8,6 +8,8 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
+from dew.data.pipeline import Dataset
+
 from ..dataset import Batch, Records, describe
 from .base import Read, ShardManifest
 
@@ -74,7 +76,7 @@ class TorchRecords:
 
 
 @dataclass(frozen=True)
-class Torch:
+class Torch(Dataset):
     """A map-style torch dataset, with explicit content identity for artifacts."""
 
     dataset: TorchDataset

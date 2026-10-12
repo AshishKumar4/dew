@@ -12,10 +12,10 @@ import grain.python as pygrain
 import numpy as np
 
 from dew.data.dataset import Batch, LengthGroups
-from dew.data.sources.base import Source
 
 if TYPE_CHECKING:
     from dew.data.cache import Cache, Generation
+    from dew.data.sources.base import Source
 
 
 @dataclasses.dataclass(frozen=True)
@@ -310,31 +310,47 @@ class Phases:
             previous = boundary
 
 
-@dataclasses.dataclass(frozen=True)
-class Pipeline:
-    """A source and the stages that read it, in the order they are written.
+class Dataset:
+    """Records a run reads: a store (`Files`, `Hub`, `TFDS`, `Memory`,
+    `Torch`), or a store with the steps the verbs added, in the order they
+    are written. A dataset never changes; every verb returns a new one.
+    `Trainer.fit` and `iterate` lower it to Grain.
 
-    Every stage is one of `Stage`'s kinds, built by a method here, and the
-    compiler takes each where it stands or refuses it before a reader opens:
-    record steps (`map`, `random_map`, `map_with_index`, `filter`,
-    `flat_map`), order stages (`shuffle`, `repeat`, `slice`, `take`), layout
-    (`token_split` for a token holdout, `pack`, `windows`, `group`), a `cache`
-    (which reads a published generation in place of the steps it already ran),
-    batching (`batch`, `rebatch`) and host steps after the batch (`map_batch`;
-    a recipe's caption encoder, `EncodeCaptions`, binds there to the
-    objective's tokenizer).
+    The verb shows the cardinality: `map` is one record to one, `random_map`
+    one to one with a generator, `filter` one to none or one, `flat_map`
+    one to many; dataset-level stages, such as `text.pack`, are functions
+    of a dataset applied with `pipe`. The compiler takes each stage where it
+    stands or refuses it before a reader opens.
     """
 
-    source: Source | Mixture | Phases
-    stages: tuple[Stage, ...] = ()
-    name: str | None = None
-
     def then(self, *stages: Stage) -> Pipeline:
-        return dataclasses.replace(self, stages=(*self.stages, *stages))
+        """This dataset with `stages` after its own."""
+        return Pipeline(self, stages)
 
-    def pipe[**Options](self, stages: Callable[Concatenate[Pipeline, Options], Pipeline],
-                        *args: Options.args, **kwargs: Options.kwargs) -> Pipeline:
-        """`stages(self, *args, **kwargs)`: a function that adds stages, such as `images.decode`."""
+    def holdout(self, fraction: float | None = None, *, records: int | None = None, split: str | None = None,
+                **named: float) -> tuple[Dataset, ...]:
+        """This dataset split into the records a run trains on and the ones it
+        scores, with the steps it has replayed on each, so hold out before
+        preparing.
+
+        `holdout(0.01)` returns (train, held), and `holdout(val=0.0005,
+        test=0.0005)` the remainder and one dataset per name, in order: a
+        record goes to the part its identity hashes into, the same in every
+        run, on every machine and after every resume. `records=n` holds out the
+        first n records, and `split="validation"` the store's own split.
+        """
+        from dew.data.holdout import holdout
+
+        return holdout(self, fraction, records=records, split=split, **named)
+
+    def named(self, name: str) -> Pipeline:
+        """This dataset under `name`, which its counts log under in a mix."""
+        chain = self if isinstance(self, Pipeline) else Pipeline(self)
+        return dataclasses.replace(chain, name=name)
+
+    def pipe[**Options](self, stages: Callable[Concatenate[Dataset, Options], Dataset],
+                        *args: Options.args, **kwargs: Options.kwargs) -> Dataset:
+        """`stages(self, *args, **kwargs)`: a dataset-level stage, such as `text.pack`."""
         return stages(self, *args, **kwargs)
 
     def map(
@@ -400,17 +416,6 @@ class Pipeline:
 
     def shard_by_host(self) -> Pipeline:
         return self.then(ShardByHost())
-
-    def mix(
-        self,
-        *others: Pipeline,
-        weights: Sequence[float] | None = None,
-        tokens: Callable[[Batch], int] | None = None,
-    ) -> Pipeline:
-        pipelines = (self, *others)
-        return Pipeline(
-            Mixture(pipelines, tuple(weights) if weights is not None else (1.0,) * len(pipelines), tokens)
-        )
 
     def interleave(self, cycle_length: int = 16) -> Pipeline:
         return self.then(Interleave(cycle_length))
@@ -484,6 +489,33 @@ class Pipeline:
 
     def map_batch(self, *steps: HostStep, identity: str | None = None) -> Pipeline:
         return self.then(*(MapBatch(step, identity) for step in steps))
+
+
+@dataclasses.dataclass(frozen=True)
+class Pipeline(Dataset):
+    """A dataset's store and the stages its verbs added; what every verb returns."""
+
+    source: Source | Mixture | Phases
+    stages: tuple[Stage, ...] = ()
+    name: str | None = None
+
+    def then(self, *stages: Stage) -> Pipeline:
+        return dataclasses.replace(self, stages=(*self.stages, *stages))
+
+
+def mix(datasets: Sequence[Dataset], weights: Sequence[float] | None = None, *,
+        tokens: Callable[[Batch], int] | None = None) -> Pipeline:
+    """`datasets` read together, each filling its share of a step, as Grain's
+    `mix`: `weights` are the shares, equal by default. With `tokens`, a share
+    counts each record's tokens rather than its records. Each member logs
+    under its name, its store's by default (`Dataset.named`)."""
+    if not datasets:
+        raise ValueError("mix needs at least one dataset")
+    shares = (1.0,) * len(datasets) if weights is None else tuple(float(weight) for weight in weights)
+    if len(shares) != len(datasets):
+        raise ValueError(f"mix has {len(datasets)} datasets and {len(shares)} weights")
+    chains = tuple(dataset if isinstance(dataset, Pipeline) else Pipeline(dataset) for dataset in datasets)
+    return Pipeline(Mixture(chains, shares, tokens))
 
 
 @dataclasses.dataclass(frozen=True)

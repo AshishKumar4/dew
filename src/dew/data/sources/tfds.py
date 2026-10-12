@@ -20,6 +20,7 @@ from etils import epath
 from filelock import FileLock
 
 from dew.cache import dew_cache_dir
+from dew.data.pipeline import Dataset
 
 from ..dataset import Records
 from .base import Read, Shard, ShardManifest
@@ -186,7 +187,7 @@ def read_only_builder(path: str, *, name: str | None, config: str | None, versio
 
 
 @dataclasses.dataclass(frozen=True)
-class TFDS:
+class TFDS(Dataset):
     """A prepared TFDS split, read with TFDS's native ArrayRecord data source."""
 
     name: str

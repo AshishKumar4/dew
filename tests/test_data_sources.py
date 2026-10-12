@@ -419,7 +419,7 @@ def test_arrow_discovers_hive_partitions_and_pushes_projection_and_predicate():
         partitioning_flavor="hive",
         max_rows_per_group=3,
     )
-    files = Files(root.url, format="parquet", columns=("value", "split"), filter=ds.field("value") >= 15)
+    files = Files(root.url, format="parquet", columns=("value", "split"), where=ds.field("value") >= 15)
     assert not files.supports("indexed")
     actual = [row for shard in files.manifest().shards for row in files.manifest().reader(shard)]
     assert actual == [{"value": index, "split": "held"} for index in range(15, 20)]
