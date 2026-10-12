@@ -28,13 +28,13 @@ from __future__ import annotations
 
 import ast
 import types
-import urllib.request
 from pathlib import Path
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import torch
+from reference_source import definitions, fetched, ran
 
 from dew.nn.backbones import CausalTransformer
 
@@ -51,17 +51,13 @@ USER, ASSISTANT = 2, 3
 def entropy() -> object:
     """`entropy_from_logits` from trl/trainer/utils.py, which those
     statements call."""
-    text = urllib.request.urlopen(TRL + "utils.py").read().decode()
-    node = next(node for node in ast.parse(text).body
-                if isinstance(node, ast.FunctionDef) and node.name == "entropy_from_logits")
-    scope = {"torch": torch, "F": torch.nn.functional}
-    exec(compile(ast.Module(body=[node], type_ignores=[]), "utils.py", "exec"), scope)
-    return scope["entropy_from_logits"]
+    return definitions(TRL + "utils.py", {"entropy_from_logits"},
+                       {"torch": torch, "F": torch.nn.functional})["entropy_from_logits"]
 
 
 def accuracy_statements() -> list[ast.stmt]:
     """`compute_loss`'s statements from the entropy to the accuracy."""
-    text = urllib.request.urlopen(TRL + "sft_trainer.py").read().decode()
+    text = fetched(TRL + "sft_trainer.py")
     method = next(node for node in ast.walk(ast.parse(text))
                   if isinstance(node, ast.FunctionDef) and node.name == "compute_loss")
     block = next(node for node in ast.walk(method) if isinstance(node, ast.With)
@@ -80,7 +76,7 @@ def trl_accuracy(statements, logits: np.ndarray, labels: np.ndarray) -> dict:
              "shift_logits": torch.as_tensor(logits)[..., :-1, :],
              "shift_labels": torch.as_tensor(labels)[..., 1:]}
     with torch.no_grad():
-        exec(compile(ast.Module(body=statements, type_ignores=[]), "sft_trainer.py", "exec"), scope)
+        ran(statements, scope, "sft_trainer.py")
     return {"correct": int(scope["correct_tokens"].sum()), "total": int(scope["total_sum"]),
             "accuracy": float(scope["accuracy"])}
 

@@ -31,12 +31,12 @@ import ast
 import contextlib
 import dataclasses
 import types
-import urllib.request
 from pathlib import Path
 
 import jax
 import numpy as np
 import torch
+from reference_source import fetched, ran, selected
 
 COMMIT = "c112c526d193436838c98d81455ee51f90309470"
 FIXTURE = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "mdlm" / "loss.npz"
@@ -47,27 +47,18 @@ MASK = VOCAB - 1
 
 
 def source(path: str) -> str:
-    url = f"https://raw.githubusercontent.com/kuleshov-group/mdlm/{COMMIT}/{path}"
-    return urllib.request.urlopen(url).read().decode()
+    return fetched(f"https://raw.githubusercontent.com/kuleshov-group/mdlm/{COMMIT}/{path}")
 
 
 def published(names: set[str] = METHODS) -> types.SimpleNamespace:
     """MDLM's `Diffusion` as a class of the methods `names`, with the
     functions and classes they name."""
-    tree = ast.parse(source("diffusion.py"))
-    diffusion = next(node for node in tree.body
-                     if isinstance(node, ast.ClassDef) and node.name == "Diffusion")
-    methods = [node for node in diffusion.body
-               if isinstance(node, ast.FunctionDef) and node.name in names]
-    found = {node.name for node in methods}
-    assert found == names, names - found
-    module = [node for node in tree.body if isinstance(node, ast.FunctionDef | ast.ClassDef)
-              and node.name in {"_sample_categorical", "Loss"}]
+    text = source("diffusion.py")
+    methods = selected(text, names, within="Diffusion", filename="diffusion.py")
+    module = selected(text, {"_sample_categorical", "Loss"}, filename="diffusion.py")
     module.append(ast.ClassDef(name="MDLM", bases=[], keywords=[], body=methods, decorator_list=[]))
-    scope = {"torch": torch, "np": np, "dataclass": dataclasses.dataclass,
-             "utils": types.SimpleNamespace(print_nans=lambda *_: None)}
-    exec(compile(ast.fix_missing_locations(ast.Module(body=module, type_ignores=[])), "diffusion.py", "exec"),
-         scope)
+    scope = ran(module, {"torch": torch, "np": np, "dataclass": dataclasses.dataclass,
+                         "utils": types.SimpleNamespace(print_nans=lambda *_: None)}, "diffusion.py")
     noise: dict = {}
     exec(source("noise_schedule.py"), noise)
     return types.SimpleNamespace(MDLM=scope["MDLM"], LogLinearNoise=noise["LogLinearNoise"])
