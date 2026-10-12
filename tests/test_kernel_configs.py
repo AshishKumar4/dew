@@ -21,19 +21,15 @@ def test_the_training_shapes_reach_the_ports_widest_heads():
 
 def test_each_triton_gpu_takes_the_table_its_block_holds():
     """An A100's configs on every generation whose block holds as much shared memory, the 99 KB
-    tables on the rest; fla's measured A100 choices on sm80, and Blackwell's two-warp forward h and
-    two-warp, four-stage WY backward on sm120."""
+    tables on the rest, and the RTX PRO 6000's own bf16 picks, measured on a G4, on sm120."""
     assert fla_gdn.CONFIGS[("sm80", "bfloat16")] is fla_gdn._SM80_BF16
     assert fla_gdn.CONFIGS[("sm90", "bfloat16")] is fla_gdn._SM80_BF16
     for target in ("sm86", "sm89"):
         assert fla_gdn.CONFIGS[(target, "bfloat16")] is fla_gdn._SMALL_BF16
         assert fla_gdn.CONFIGS[(target, "float32")] is fla_gdn._SMALL_FP32
-    assert fla_gdn.CONFIGS[("sm120", "bfloat16")] == {**fla_gdn._SMALL_BF16, **fla_gdn._BLACKWELL}
+    assert fla_gdn.CONFIGS[("sm120", "bfloat16")] is fla_gdn._BLACKWELL_BF16
+    assert fla_gdn.CONFIGS[("sm120", "float32")] is fla_gdn._SMALL_FP32
     assert ("sm75", "bfloat16") not in fla_gdn.CONFIGS
-    assert fla_gdn.CONFIGS[("sm120", "bfloat16")]["chunk_fwd_h"]["warps"] == 2
-    for dtype in ("bfloat16", "float32"):
-        wy = fla_gdn.CONFIGS[("sm120", dtype)]["prepare_wy_repr_bwd"]
-        assert (wy["warps"], wy["stages"]) == (2, 4)
 
 
 def test_a_config_takes_the_labs_overrides_and_clips_to_the_operands():
