@@ -383,8 +383,8 @@ def group_normalized(x, scale, bias, groups: int, epsilon: float, activation, re
     (`_moment_normalized`). `activation` (None for none) runs on the result
     before its one cast to `dtype`."""
     grouped = x.reshape(*x.shape[:-1], groups, x.shape[-1] // groups)
-    affine = [None if value is None else value.reshape(grouped.shape[-2:]) for value in (scale, bias)]
-    y = _moment_normalized(grouped, *affine, (*range(1, x.ndim - 1), x.ndim), epsilon, requested)
+    scale, bias = (None if value is None else value.reshape(grouped.shape[-2:]) for value in (scale, bias))
+    y = _moment_normalized(grouped, scale, bias, (*range(1, x.ndim - 1), x.ndim), epsilon, requested)
     y = y.reshape(x.shape)
     return (y if activation is None else activation(y)).astype(dtype)
 
