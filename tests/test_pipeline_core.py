@@ -461,6 +461,21 @@ def test_a_cached_indexed_root_is_cut_into_disjoint_shares_that_repeat():
     assert all(sorted(rows) == sorted(list(set(rows)) * 2) for rows in read)
 
 
+def test_a_mixture_cut_per_share_reads_each_corpus_in_disjoint_shares():
+    """A filter after a mixture cuts its order per share, and then every
+    corpus it mixes is cut per share too: two shares never read one row."""
+    other = Memory(tuple({"id": np.int32(100 + index)} for index in range(16)))
+    mixed = Pipeline(source(16)).mix(Pipeline(other), weights=(1, 1))
+    data = compile(mixed.filter(lambda row: int(row["id"]) % 2 > 0, identity="odd@1").batch(2), loading=READ)
+    shares = [data.train(DataPartition(index, 2)) for index in range(2)]
+    try:
+        read = [[value for batch in take(reader, 4) for value in batch["id"]] for reader in shares]
+    finally:
+        for reader in shares:
+            reader.close()
+    assert not set(read[0]) & set(read[1])
+
+
 def test_a_per_share_position_resumes_against_the_same_rows_cached_elsewhere():
     """The saved plan names a cache by the rows it serves, so a per-share
     position saved with the cache in one place resumes with it in another."""

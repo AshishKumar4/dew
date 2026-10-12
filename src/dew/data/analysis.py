@@ -333,7 +333,8 @@ class _Lowering:
     that cannot keep the global contract; otherwise one global order is cut
     just before batching, after every stage that defines it, so a prefetch
     never moves the cut and a limit counts the whole order. `children` are the
-    analyses of a mixture's or phases' pipelines, in order.
+    analyses of a mixture's or phases' pipelines, in order, each cut where
+    the order that mixes them is (`_cut`).
 
     `cache` is the cache stage, once every step before it is bound, and the
     stages before `eager` (after that cache) are the ones a memory read runs
@@ -392,6 +393,7 @@ def _analyzed(
             for child in nested
         )
     per_share = per_share or any(child.per_share for child in children)
+    children = tuple(_cut(child, per_share) for child in children)
     steps = (*ancestry, *stages)
     split = _at(stages[eager:], TokenSplit) is not None or any(child.split for child in children)
     if per_share and split and not any(isinstance(stage, Configured) for stage in steps):
@@ -449,6 +451,13 @@ def _analyzed(
         order,
         endless,
     )
+
+
+def _cut(lowering: _Lowering, per_share: bool) -> _Lowering:
+    """A mixed corpus's analysis, cut where the order that mixes it is cut:
+    per share when that order is, so each corpus reads only its share."""
+    children = tuple(_cut(child, per_share) for child in lowering.children)
+    return dataclasses.replace(lowering, per_share=per_share, children=children)
 
 
 def _checked(
