@@ -37,7 +37,7 @@ from dew.data.analysis import (
     _steps,
     _until,
 )
-from dew.data.dataset import Batch, DataPartition, FilledBatch, Loading, _Grouped, _WorkerBatches
+from dew.data.dataset import Batch, DataPartition, FilledBatch, Loading, _Grouped
 from dew.data.mix import Accepted, PrimedMix, SearchBudget, TokenDeficit, primed_maps, token_weights
 from dew.data.pipeline import (
     Artifact,
@@ -640,7 +640,7 @@ class _Build:
         batch_stage = next(stage for stage in pipeline.stages if isinstance(stage, BatchStage))
         shared_size = partition.rows(batch_stage.size)
         size = batch_stage.size if canonical else shared_size
-        workers = _workers(pipeline, self.loading)
+        drop = batch_stage.drop_remainder if self.training else False
         empty = False
         if isinstance(rows, pygrain.MapDataset):
             if self.training and not any(isinstance(stage, (Repeat, Limit)) for stage in _steps(pipeline)):
@@ -652,23 +652,21 @@ class _Build:
             empty = not self.training and not len(rows) and bool(len(whole))
             if empty:
                 rows = whole[:1]
-            if workers:
-                rows = _WorkerBatches(rows, size, workers, remainder=not self.training)
-        stream = _as_iter(rows, self.loading)
-        if self.global_order:
+            # Batched by index before the reader starts, as Grain's own indexed
+            # pipelines are, so each read in flight is a whole batch and each
+            # worker reads whole batches of its own.
+            batched = rows.map(_Payload()).batch(size, drop_remainder=drop, batch_fn=batch_stage.batch_fn)
+            stream = _as_iter(batched, self.loading)
             for stage in pipeline.stages[: pipeline.stages.index(batch_stage)]:
                 if isinstance(stage, Prefetch):
                     advanced, _ = self.stage(stream, None, stage, pipeline, partition)
                     stream = _as_iter(advanced, self.loading)
-        stream = (
-            stream
-            .map(_Payload())
-            .batch(
-                size,
-                drop_remainder=batch_stage.drop_remainder if self.training else False,
-                batch_fn=batch_stage.batch_fn,
+        else:
+            stream = (
+                _as_iter(rows, self.loading)
+                .map(_Payload())
+                .batch(size, drop_remainder=drop, batch_fn=batch_stage.batch_fn)
             )
-        )
         if not self.training and fill:
             stream = stream.map(
                 _FillShare(partition, batch_stage.size) if canonical else FilledBatch(size, real=not empty)
