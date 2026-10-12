@@ -182,8 +182,8 @@ def _kind(ba: tokamax.BoundArguments) -> str:
 def _pick(ba: tokamax.BoundArguments) -> AutotuningData | None:
     """The pick tokamax's cache holds for `ba` (its key's shapes), where
     `ba`'s space holds its fastest config; any other is no pick."""
-    data = ba.cached_autotuning_data
-    return data if data is not None and data.fastest_config in ba.autotuning_configs else None
+    stored = ba.cached_autotuning_data
+    return stored if stored is not None and stored.fastest_config in ba.autotuning_configs else None
 
 
 def _bucketed(spec: jax.ShapeDtypeStruct) -> jax.ShapeDtypeStruct:
