@@ -944,8 +944,8 @@ def test_a_nested_mixture_counts_its_epoch_from_each_part():
     """A mixture of a corpus and a mixture ends its epoch when the first of its
     parts comes round, the inner mixture counted the same way: the inner one
     of 8 and 4 rows at even weights in 16, the outer of 12 and 16 in 32."""
-    inner = Pipeline(source(8)).mix(Pipeline(source(4)), weights=(1, 1))
-    nested = Pipeline(source(12)).mix(inner, weights=(1, 1))
+    inner = mix([Pipeline(source(8)), Pipeline(source(4))], weights=(1, 1))
+    nested = mix([Pipeline(source(12)), inner], weights=(1, 1))
     assert compile(nested.batch(2), loading=READ).records == 32
 
 
