@@ -18,10 +18,10 @@ import traceback
 import typing
 from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, Self
+from typing import Literal, Self
 
-if TYPE_CHECKING:
-    from dew.records import JSON
+from dew.pool import PREEMPTED_EXIT
+from dew.records import JSON
 
 _log = logging.getLogger(__name__)
 
@@ -194,15 +194,29 @@ class FitEnded:
     error: str | None = None
     traceback: str | None = None
 
+    @property
+    def exit_code(self) -> int:
+        """Trackers record the same success or preemption a launcher sees."""
+        return {'completed': 0, 'lowered': 0, 'preempted': PREEMPTED_EXIT,
+                'failed': 1, 'interrupted': 1}[self.status]
+
+    @property
+    def terminal_status(self) -> Literal['FINISHED', 'KILLED', 'FAILED']:
+        """A service's run state follows the same process exit semantics."""
+        statuses: Mapping[int, Literal['FINISHED', 'KILLED', 'FAILED']] = {
+            0: 'FINISHED', PREEMPTED_EXIT: 'KILLED', 1: 'FAILED'}
+        return statuses[self.exit_code]
+
     @classmethod
     def outcome(cls, seconds: float, error: BaseException | None, *, preempted: bool = False,
                 lowered: bool = False) -> FitEnded:
         """A run's end: its first step lowered for another device in place of
-        training (`TrainerConfig.lower_for`), an error, else stopped at a
-        preemption notice with its checkpoint written, else completed."""
+        training (`TrainerConfig.lower_for`), a failure, else stopped at a
+        preemption notice with its checkpoint written, else completed. A
+        successful SystemExit carries the same outcome as a return."""
         if lowered:
             return cls('lowered', seconds)
-        if error is None:
+        if error is None or (isinstance(error, SystemExit) and error.code in (0, None)):
             return cls('preempted' if preempted else 'completed', seconds)
         return cls('interrupted' if isinstance(error, KeyboardInterrupt) else 'failed', seconds,
                    f'{type(error).__name__}: {error}', ''.join(traceback.format_exception(error)))
