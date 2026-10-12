@@ -37,6 +37,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from deepseek_v41_kernels import E2M1
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURE = ROOT / "tests" / "fixtures" / "codecs" / "deepseek_kernels.npz"
@@ -83,7 +84,8 @@ def fp4_rows(rng) -> np.ndarray:
     rows[3, 35] = -0.0
     rows[4, :2] = [0.7495, 6.0]               # reaches the 0.75 tie through bfloat16
     rows[5, :2] = [2.0 ** -120, -(2.0 ** -122)]
-    rows[6, :8] = [1.25, 1.75, 2.5, 3.5, 5.0, -0.25, -0.75, 4.5]  # every E2M1 midpoint
+    midpoints = ((E2M1[1:] + E2M1[:-1]) / 2).tolist()
+    rows[6, :8] = [*midpoints[2:], *(-value for value in midpoints[:2]), 4.5]  # every E2M1 midpoint
     rows[7, :2] = [7.0, -6.5]                 # past E2M1's 6 under the group's scale
     return rows.astype(np.float32)
 
