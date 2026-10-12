@@ -54,11 +54,6 @@ def _hopper() -> bool:
     return f"sm{jax.devices('gpu')[0].compute_capability.replace('.', '')}" in _three
 
 
-KEY_LENGTHS = _three
-"""The GPU generations whose kernel ends each row's keys at a length (`flash_mha`'s `key_lengths`):
-FlashAttention-3's. FlashAttention-2's backward takes no lengths."""
-
-
 def _splits(work: int, slots: int, blocks: int) -> int:
     """How many pieces the forward splits the keys into: flash_attn_jax's
     heuristic, the C++ library's, which the scratch buffers are sized by."""
@@ -143,27 +138,24 @@ def _absent(dtype):
     return jnp.zeros((0,), dtype)
 
 
-def _forward3(query, key, value, queries, keys, used, longest, scale, causal):
+def _forward3(query, key, value, starts, longest, scale, causal):
     """FlashAttention-3's forward over `[B, S, H, D]` arrays, or over packed `[T, H, D]` ones whose
-    sequences start at the cumulative offsets `queries` and `keys` (both empty for a batch) and hold at
-    most `longest` (queries, keys) tokens. `used` ends each sequence's keys at a count (empty where
-    every key counts): the port's `seqused_k`."""
+    sequences start at the cumulative offsets `starts` (empty for a batch) and hold at most `longest`
+    tokens."""
     q, k, v = _padded(query, key, value)
-    packed = queries.size > 0
+    packed = starts.size > 0
     heads = q.shape[-2]
     lse = (heads, q.shape[0]) if packed else (q.shape[0], heads, q.shape[1])
-    longest = longest or (q.shape[1], k.shape[1])
     out, lse, _, _ = jax.ffi.ffi_call("dew_flash3_mha_fwd", (
         jax.ShapeDtypeStruct(q.shape, q.dtype),
         jax.ShapeDtypeStruct(lse, jnp.float32),
         jax.ShapeDtypeStruct((1, 1, 1, 1), jnp.float32),
         jax.ShapeDtypeStruct((1, 1, 1), jnp.float32),
-    ))(q, k, v, _absent(q.dtype), _absent(q.dtype), _absent(q.dtype), queries, keys,
-       _absent(jnp.int32), _absent(jnp.int32), used, *(_absent(jnp.int32),) * 3,
-       _absent(q.dtype), _absent(q.dtype), _absent(jnp.int32), *(_absent(jnp.float32),) * 3,
-       _absent(jnp.int32),
-       max_seqlen_q=np.int64(longest[0]), max_seqlen_q_has_value=True,
-       max_seqlen_k=np.int64(longest[1]), max_seqlen_k_has_value=True,
+    ))(q, k, v, _absent(q.dtype), _absent(q.dtype), _absent(q.dtype), starts, starts,
+       *(_absent(jnp.int32),) * 6, _absent(q.dtype), _absent(q.dtype), _absent(jnp.int32),
+       *(_absent(jnp.float32),) * 3, _absent(jnp.int32),
+       max_seqlen_q=np.int64(longest or q.shape[1]), max_seqlen_q_has_value=True,
+       max_seqlen_k=np.int64(longest or k.shape[1]), max_seqlen_k_has_value=True,
        softmax_scale_val=np.float64(scale), softmax_scale_has_value=True, pack_gqa_val=False,
        pack_gqa_has_value=False, is_causal=causal, window_size_left=np.int64(-1),
        window_size_right=np.int64(-1), attention_chunk=np.int64(0), softcap=np.float64(0.0),
@@ -171,65 +163,54 @@ def _forward3(query, key, value, queries, keys, used, longest, scale, causal):
     return out[..., :query.shape[-1]], lse
 
 
-def _backward3(grad, query, key, value, out, lse, queries, keys, used, longest, scale, causal):
-    """FlashAttention-3's backward, whose key and value gradients come per key head. It writes no
-    gradient for a key past its sequence's count, so those are zeroed here."""
+def _backward3(grad, query, key, value, out, lse, starts, longest, scale, causal):
+    """FlashAttention-3's backward, whose key and value gradients come per key head."""
     width = query.shape[-1]
     g, q, k, v, o = _padded(grad, query, key, value, out)
     heads = q.shape[-2]
     # Two scratch buffers of rows per head, each sequence's queries rounded up to the backward's row
-    # block, which the port picks from 64, 80, 96 and 128 by width and mask, and with lengths or
-    # offsets one block more over all of them: 128 rows a sequence and 128 more hold any layout.
-    tokens, sequences = ((q.shape[0], queries.shape[0] - 1) if queries.size > 0
+    # block, which the port picks from 64, 80, 96 and 128 by width and mask, and packed one block
+    # more over all of them: 128 rows a sequence and 128 more hold either layout.
+    tokens, sequences = ((q.shape[0], starts.shape[0] - 1) if starts.size > 0
                          else (q.shape[0] * q.shape[1], q.shape[0]))
-    scratch = (heads * (tokens + 128 * (sequences + 1)),)
-    longest = longest or (q.shape[1], k.shape[1])
     dq, dk, dv, _, _ = jax.ffi.ffi_call("dew_flash3_mha_bwd", (
         jax.ShapeDtypeStruct(q.shape, q.dtype),
         jax.ShapeDtypeStruct(k.shape, q.dtype),
         jax.ShapeDtypeStruct(v.shape, q.dtype),
-        jax.ShapeDtypeStruct(scratch, jnp.float32),
-        jax.ShapeDtypeStruct(scratch, jnp.float32),
-    ))(g, q, k, v, o, lse, queries, keys, _absent(jnp.int32), used,
-       max_seqlen_q_val=np.int64(longest[0]), max_seqlen_q_has_value=True,
-       max_seqlen_k_val=np.int64(longest[1]), max_seqlen_k_has_value=True,
+        jax.ShapeDtypeStruct((heads * (tokens + 128 * (sequences + 1)),), jnp.float32),
+        jax.ShapeDtypeStruct((heads * (tokens + 128 * (sequences + 1)),), jnp.float32),
+    ))(g, q, k, v, o, lse, starts, starts, _absent(jnp.int32), _absent(jnp.int32),
+       max_seqlen_q_val=np.int64(longest or q.shape[1]), max_seqlen_q_has_value=True,
+       max_seqlen_k_val=np.int64(longest or k.shape[1]), max_seqlen_k_has_value=True,
        softmax_scale_val=np.float64(scale), softmax_scale_has_value=True, is_causal=causal,
        window_size_left=np.int64(-1), window_size_right=np.int64(-1), softcap=np.float64(0.0),
        deterministic=False, sm_margin=np.int64(0))
-    if used.size > 0:
-        index = jnp.arange(k.shape[0])
-        sequence = jnp.searchsorted(keys, index, side="right") - 1
-        kept = (index - keys[sequence] < used[sequence])[:, None, None]
-        dk, dv = jnp.where(kept, dk, 0), jnp.where(kept, dv, 0)
     return dq[..., :width], dk[..., :width], dv[..., :width]
 
 
-@functools.partial(jax.custom_vjp, nondiff_argnums=(6, 7, 8))
-def _attend3(query, key, value, queries, keys, used, longest, scale, causal):
-    return _forward3(query, key, value, queries, keys, used, longest, scale, causal)[0]
+@functools.partial(jax.custom_vjp, nondiff_argnums=(4, 5, 6))
+def _attend3(query, key, value, starts, longest, scale, causal):
+    return _forward3(query, key, value, starts, longest, scale, causal)[0]
 
 
-def _attend3_forward(query, key, value, queries, keys, used, longest, scale, causal):
-    out, lse = _forward3(query, key, value, queries, keys, used, longest, scale, causal)
-    return out, (query, key, value, out, lse, queries, keys, used)
+def _attend3_forward(query, key, value, starts, longest, scale, causal):
+    out, lse = _forward3(query, key, value, starts, longest, scale, causal)
+    return out, (query, key, value, out, lse, starts)
 
 
 def _attend3_backward(longest, scale, causal, residuals, grad):
-    query, key, value, out, lse, queries, keys, used = residuals
-    dq, dk, dv = _backward3(grad, query, key, value, out, lse, queries, keys, used, longest, scale, causal)
-    return (dq, dk, dv, *(np.zeros(x.shape, jax.dtypes.float0) for x in (queries, keys, used)))
+    query, key, value, out, lse, starts = residuals
+    dq, dk, dv = _backward3(grad, query, key, value, out, lse, starts, longest, scale, causal)
+    return dq, dk, dv, np.zeros(starts.shape, jax.dtypes.float0)
 
 
 _attend3.defvjp(_attend3_forward, _attend3_backward)
 
 
-def flash_mha(query, key, value, softmax_scale: float | None = None, is_causal: bool = False,
-              key_lengths=None):
+def flash_mha(query, key, value, softmax_scale: float | None = None, is_causal: bool = False):
     """Attention of `query` over `key` and `value`, `[B, S, H, D]`, scaled by
     `softmax_scale` (1/sqrt(D) by default). A causal mask is aligned to the
-    last key, as FlashAttention aligns it. `key_lengths`, int32 `[B]`, ends
-    each row's keys there, on a GPU of `KEY_LENGTHS` and without the causal
-    mask, which would align to a row's last key, not its last slot."""
+    last key, as FlashAttention aligns it."""
     if query.dtype not in (jnp.bfloat16, jnp.float16) or not query.dtype == key.dtype == value.dtype:
         raise ValueError(f"flash_mha takes bf16 or fp16 inputs of one dtype, not {query.dtype}, "
                          f"{key.dtype} and {value.dtype}")
@@ -237,21 +218,9 @@ def flash_mha(query, key, value, softmax_scale: float | None = None, is_causal: 
         raise ValueError(f"flash_mha takes key heads that divide the query's and heads up to 256 wide, "
                          f"not query {query.shape}, key {key.shape} and value {value.shape}")
     scale = 1.0 / math.sqrt(query.shape[-1]) if softmax_scale is None else softmax_scale
-    if key_lengths is not None and (is_causal or not _hopper()):
-        raise ValueError(f"flash_mha takes key lengths on {', '.join(KEY_LENGTHS)} and without the causal "
-                         f"mask")
-    if not _hopper():
-        return _attend(query, key, value, float(scale), bool(is_causal))
-    if key_lengths is None:
-        absent = _absent(jnp.int32)
-        return _attend3(query, key, value, absent, absent, absent, None, float(scale), bool(is_causal))
-    # The port's backward over a batch ends keys at their lengths only through offsets (with lengths
-    # alone, a short row's query gradient comes out wrong), so the rows go packed, one a sequence.
-    batch, queries, keys = query.shape[0], query.shape[1], key.shape[1]
-    rows = jnp.arange(batch + 1, dtype=jnp.int32)
-    out = _attend3(*(x.reshape(-1, *x.shape[2:]) for x in (query, key, value)), rows * queries, rows * keys,
-                   jnp.asarray(key_lengths, jnp.int32), (queries, keys), float(scale), False)
-    return out.reshape(query.shape[:-1] + (out.shape[-1],))
+    if _hopper():
+        return _attend3(query, key, value, _absent(jnp.int32), None, float(scale), bool(is_causal))
+    return _attend(query, key, value, float(scale), bool(is_causal))
 
 
 def _varlen_forward(query, key, value, starts, longest, scale, causal):
@@ -326,6 +295,5 @@ def flash_mha_varlen(query, key, value, cu_seqlens, max_seqlen: int, softmax_sca
     scale = 1.0 / math.sqrt(query.shape[-1]) if softmax_scale is None else softmax_scale
     starts = jnp.asarray(cu_seqlens, jnp.int32)
     if _hopper():
-        return _attend3(query, key, value, starts, starts, _absent(jnp.int32), (int(max_seqlen),) * 2,
-                        float(scale), bool(is_causal))
+        return _attend3(query, key, value, starts, int(max_seqlen), float(scale), bool(is_causal))
     return _attend_packed(query, key, value, starts, int(max_seqlen), float(scale), bool(is_causal))
