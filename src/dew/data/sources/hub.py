@@ -12,7 +12,7 @@ import numpy as np
 
 from dew.data.dataset import Records
 
-from .base import Read, ShardManifest
+from .base import Read, ShardManifest, Source
 from .files import Files, Format
 from .memory import _record
 
@@ -53,11 +53,11 @@ class Hub:
     @cached_property
     def streamed(self) -> str | None:
         """The immutable revision the split's shards are streamed from, pinned
-        once, so the snapshot and the shard URLs name the same files. It is
+        once, so the shard URLs name the same files on every read. It is
         the resolved commit, or for the default revision when that commit
         holds no native Parquet, Arrow or JSONL files of the split, the commit
         its Parquet conversion (refs/convert/parquet) holds. The conversion
-        moves on its own, so the snapshot names it apart from the commit. A
+        moves on its own, so its shard URLs name that commit. A
         repo with neither has no shards to stream, and its split is read only
         from prepared Arrow."""
         from huggingface_hub import HfApi
@@ -115,17 +115,18 @@ class Hub:
     def describe(self) -> str:
         return f"hf:{self.repo}@{self.commit}:{self.config}:{self.split}"
 
+    def consumed(self, read: Read) -> Source:
+        return self.files if read == "streamed" else self
+
     def snapshot(self) -> Mapping[str, object]:
-        """The pinned split: the resolved commit Arrow is prepared from, and the
-        commit its shards are streamed from, if any (`streamed`). The commits
-        fix every file the split is read or prepared from, so the snapshot is
-        the same on any host, in any cache directory, whether or not Arrow was
-        prepared there."""
+        """The pinned split Arrow is prepared from. Its identity is the same
+        on any host, in any cache directory, whether or not Arrow was prepared
+        there. A streamed read consumes `files`, whose snapshot names its
+        physical shards at their own pinned commit."""
         return {
             "store": "hf",
             "repo": self.repo,
             "revision": self.commit,
-            "streamed": self.streamed,
             "config": self.config,
             "split": self.split,
         }

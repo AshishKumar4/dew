@@ -95,4 +95,13 @@ class Source(Protocol):
         ...
 
 
-__all__ = ["READS", "Read", "Shard", "ShardManifest", "Source"]
+@runtime_checkable
+class Consumed(Protocol):
+    """A source whose read of a given kind goes through another source."""
+
+    def consumed(self, read: Read) -> Source:
+        """The source a read of this one reads its records from."""
+        ...
+
+
+__all__ = ["READS", "Consumed", "Read", "Shard", "ShardManifest", "Source"]
