@@ -58,7 +58,8 @@ def flash_here():
     generation = kernels.device_generation()
     architectures = flash_architectures() or ()
     if not flash_built_for(generation, architectures):
-        pytest.skip(f"the installed dew_flash_attn holds code for {', '.join(architectures)}, not {generation}")
+        pytest.skip(f"the installed dew_flash_attn holds code for {', '.join(architectures)}, "
+                    f"not {generation}")
     return flash
 
 
