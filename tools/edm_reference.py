@@ -17,10 +17,8 @@ result computed in float64 and in float32.
 
 from __future__ import annotations
 
-import ast
 import json
 import os
-import urllib.request
 from pathlib import Path
 
 os.environ["JAX_PLATFORMS"] = "cpu"
@@ -28,6 +26,7 @@ os.environ["JAX_PLATFORMS"] = "cpu"
 import jax
 import numpy as np
 import torch
+from reference_source import defined_in, fetched
 
 COMMIT = "008a4e5316c8e3bfe61a62f874bddba254295afb"
 SOURCE = f"https://raw.githubusercontent.com/NVlabs/edm/{COMMIT}/generate.py"
@@ -58,13 +57,8 @@ def edm_sampler(dtype: str):
     computing in `dtype`: as published at float64, and its float32 twin with
     the two casts it makes retargeted, whose distance from the first is the
     rounding error a float32 walk of the same algorithm makes."""
-    text = urllib.request.urlopen(SOURCE).read().decode()
-    tree = ast.parse(text)
-    function = next(node for node in tree.body
-                    if isinstance(node, ast.FunctionDef) and node.name == "edm_sampler")
-    scope = {"torch": torch, "np": np}
-    exec(ast.get_source_segment(text, function).replace("torch.float64", f"torch.{dtype}"), scope)
-    return scope["edm_sampler"]
+    text = fetched(SOURCE).replace("torch.float64", f"torch.{dtype}")
+    return defined_in(text, {"edm_sampler"}, {"torch": torch, "np": np}, filename=SOURCE)["edm_sampler"]
 
 
 def main() -> None:

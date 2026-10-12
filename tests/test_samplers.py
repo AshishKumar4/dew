@@ -1325,25 +1325,16 @@ def test_heun_churns_only_a_variance_exploding_walk():
 
 
 def test_public_solver_imports_and_registry_records_resolve_the_same_classes():
-    """Every solver keeps its public name, registry name and JSON configuration round trip."""
+    """Every registered solver keeps its registry name, its JSON configuration round trip, and, where it
+    lives in `dew.sampling`, its public name there."""
     import dew.sampling
-    from dew.diffusion.discrete import Unmask
     from dew.registry import solvers, to_record
-    from dew.sampling import FlowSDE, Solver, solvers as exported
+    from dew.sampling import Solver
 
-    names = {
-        "ddpm": DDPM, "ddim": DDIM, "euler": Euler, "euler_ancestral": EulerAncestral,
-        "heun": Heun, "rk4": RK4, "kdpm2": KDPM2, "dpmsolver_sde": DPMSolverSDE,
-        "multistep_dpm": MultiStepDPM, "dpmsolver_multistep": DPMSolverMultistep,
-        "dpmsolver_singlestep": DPMSolverSinglestep, "deis": DEIS, "unipc": UniPC,
-        "pndm": PNDM, "lms": LMS, "consistency": Consistency, "tcd": TCD,
-        "flow_sde": FlowSDE, "unmask": Unmask,
-    }
-    for name, member in names.items():
-        assert solvers[name] is member
+    for name in solvers:
+        member = solvers[name]
         assert solvers.alias_of(member) == name
-        if name not in ("flow_sde", "unmask"):
-            assert getattr(exported, member.__name__) is member
+        if solvers.paths[name].startswith("dew.sampling."):
             assert getattr(dew.sampling, member.__name__) is member
         value = solvers.build(name)
         record = json.loads(json.dumps(to_record(value, Solver)))

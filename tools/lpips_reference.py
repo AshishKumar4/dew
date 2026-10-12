@@ -26,7 +26,6 @@ come from is replaced: `models.vgg16(weights=IMAGENET1K_V1)` and
 
 from __future__ import annotations
 
-import ast
 import hashlib
 import urllib.request
 from collections import namedtuple
@@ -34,6 +33,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from reference_source import definitions
 from torchvision import models
 
 REPAE = "https://raw.githubusercontent.com/End2End-Diffusion/REPA-E/2ad4e9f69234c109497fb41d3e5e555de7b4b0de/"
@@ -75,8 +75,8 @@ def drawn_weights(seed: int = 0) -> tuple[dict[str, np.ndarray], dict[str, np.nd
 
 def lpips_class(vgg: dict[str, torch.Tensor], linear: dict[str, torch.Tensor]) -> type:
     """REPA-E's `LPIPS` with its module scope, reading these weights."""
-    text = urllib.request.urlopen(REPAE + "loss/lpips.py").read().decode()
-    names = {"LPIPS", "ScalingLayer", "NetLinLayer", "vgg16", "normalize_tensor", "spatial_average"}
+    names = {"LPIPS", "ScalingLayer", "NetLinLayer", "vgg16", "normalize_tensor", "spatial_average",
+             "_LPIPS_MEAN", "_LPIPS_STD"}
 
     def vgg16(weights=None):
         network = models.vgg16(weights=None)
@@ -87,14 +87,7 @@ def lpips_class(vgg: dict[str, torch.Tensor], linear: dict[str, torch.Tensor]) -
              "models": type("models", (), {"vgg16": staticmethod(vgg16),
                                            "VGG16_Weights": models.VGG16_Weights}),
              "get_ckpt_path": None}
-    tree = ast.parse(text)
-    for node in tree.body:
-        if isinstance(node, ast.Assign) and any(getattr(target, "id", "") in ("_LPIPS_MEAN", "_LPIPS_STD")
-                                                  for target in node.targets):
-            exec(compile(ast.Module(body=[node], type_ignores=[]), "lpips.py", "exec"), scope)
-        if isinstance(node, (ast.ClassDef, ast.FunctionDef)) and node.name in names:
-            exec(compile(ast.Module(body=[node], type_ignores=[]), "lpips.py", "exec"), scope)
-    published = scope["LPIPS"]
+    published = definitions(REPAE + "loss/lpips.py", names, scope)["LPIPS"]
 
     class Loaded(published):
         def load_pretrained(self):
