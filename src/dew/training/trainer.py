@@ -1567,7 +1567,8 @@ class Trainer(Generic[Loss, Effects]):
             raise ValueError(
                 "checkpoint_every asks for checkpoints and this trainer has no "
                 "checkpointer; pass Checkpoints(directory) to write any")
-        if plan.finished(current, run.stop_control) and checkpoints is not None and checkpoints.latest is not None:
+        if (plan.finished(current, run.stop_control)
+                and checkpoints is not None and checkpoints.latest is not None):
             return True
         if not plan.finished(current, run.stop_control):
             run.source = plan.dataset.train(DataPartition.of(mesh))
@@ -1755,7 +1756,8 @@ class Trainer(Generic[Loss, Effects]):
                 run.stopped = True
                 run.stop_control['stop_reason'] = 'validation plateau'
                 self._display.note("Stopped: validation plateau")
-        if (plan.checkpoint_final or run.checkpoint_due) and checkpoints is not None and interval.last_saved != current:
+        if ((plan.checkpoint_final or run.checkpoint_due)
+                and checkpoints is not None and interval.last_saved != current):
             # The in-loop saves are conditional, so the state the run ends
             # on may never have been written. It goes out under its real
             # step: a step-0 checkpoint holding the final weights would

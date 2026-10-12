@@ -731,7 +731,8 @@ class TrainerConfig:
         if self.epochs is None:
             if self.total_tokens is not None:
                 return None
-            raise ValueError("the run length is --trainer.steps or --trainer.epochs or --trainer.total-tokens")
+            raise ValueError("the run length is --trainer.steps or --trainer.epochs "
+                             "or --trainer.total-tokens")
         if dataset.steps_per_epoch is None:
             raise ValueError(
                 "epochs need a dataset with a record count; this one streams without "
