@@ -206,6 +206,14 @@ vision = ["torchvision>=0.29"]
 # JAX. torchax 0.0.13 fails to import on torch 2.14; this nightly is the build
 # the fallback's tests ran against.
 torchax = ["torch>=2.14,<2.15", "torchax==0.0.14.dev20260922"]
+# The test suite's one environment: every package a test file imports, so no test skips for want
+# of one. CI's jobs, armada's (tools/armada/install.sh), the GPU nodes' and dew-ops' GPU jobs install
+# it under constraints.txt, beside CPU torch (tools/install_host_torch.sh). tokamax is not Dew's
+# dependency (docs/installation.md); the MoE tests run its grouped matmul.
+ci = ["dewml[test,av,tfds,metrics,plots,inference-clients,serve,vision,quantization,profile,torchax,gguf]",
+      "tokamax"]
+# The tutorial notebooks' environment (.github/workflows/tutorials.yml).
+tutorials = ["dewml[streaming,interop,plots]", "nbclient", "nbformat", "ipykernel"]
 
 [tool.ruff]
 target-version = "py312"

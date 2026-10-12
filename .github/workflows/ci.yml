@@ -23,13 +23,6 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  # Every optional dependency a test file imports, so no test skips for want of
-  # one: the lint job type checks against them, and tools/armada/install.sh
-  # installs the same set for the suite, which fails a test that skips on a
-  # missing import.
-  EXTRAS: test,av,tfds,metrics,plots,inference-clients,serve,vision,quantization,profile,torchax,gguf
-
 jobs:
   # A commit this workflow passed on another push, as one proved on
   # ci/integration before main takes it, is not proved again: lint, types and
@@ -73,7 +66,7 @@ jobs:
     - name: Install dependencies
       run: |
         sh tools/install_host_torch.sh --system
-        uv pip install --system flake8 -e ".[$EXTRAS]" -c constraints.txt
+        uv pip install --system flake8 -e ".[ci]" -c constraints.txt
     - name: Lint with flake8
       run: |
         # stop the build if there are Python syntax errors or undefined names; the
@@ -127,8 +120,9 @@ jobs:
     - name: Install dependencies
       run: |
         sh tools/install_host_torch.sh --system
-        # pyright resolves every import in src/dew, the optional readers' included.
-        uv pip install --system -e ".[$EXTRAS]" -c constraints.txt
+        # pyright resolves every import in src/dew, the optional readers' included: the
+        # test suite's environment (pyproject.toml's `ci` extra) holds every one.
+        uv pip install --system -e ".[ci]" -c constraints.txt
     - name: Type check
       run: uvx pyright@1.1.406 --pythonpath "$(which python)" src/dew
 
