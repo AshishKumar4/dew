@@ -38,7 +38,7 @@ from steady_state import steady_state
 
 from dew import position
 from dew.artifacts import Representations
-from dew.checkpoints import STATE_LEAVES, Ranking
+from dew.checkpoints import Ranking
 from dew.config import OptimConfig
 from dew.data import DataPartition
 from dew.objectives.base import Aux, EMASpec, Objective, freeze, merge, select, under
@@ -55,6 +55,7 @@ from dew.training import (
 )
 from dew.training.interval import Book, Interval
 from dew.training.optim import Cosine, Power
+from dew.training.state import CHECKPOINTED
 from dew.training.transaction import write_back
 
 
@@ -1007,7 +1008,7 @@ def test_a_checkpoint_that_stores_the_ema_as_itself_still_restores(tmp_path):
     the weights hold it as plain arrays, and read back as they were written."""
     state = awkward_state()
     written = ocp.CheckpointManager(str(tmp_path / "run"), item_handlers=ocp.PyTreeCheckpointHandler())
-    written.save(0, args=ocp.args.PyTreeSave({name: getattr(state, name) for name in STATE_LEAVES}))
+    written.save(0, args=ocp.args.PyTreeSave({name: getattr(state, name) for name in CHECKPOINTED}))
     written.wait_until_finished()
 
     checkpoints = Checkpoints(str(tmp_path / "run"))
