@@ -14,6 +14,7 @@ import numpy as np
 from dew.data.dataset import Batch, Records
 from dew.data.pipeline import Dataset, Mixture, Phases, Pipeline, Rejected
 from dew.data.sources.base import Read, Shard, ShardManifest, Source, _consumed
+from dew.data.sources.codec import encode
 
 
 @runtime_checkable
@@ -68,8 +69,11 @@ class _SliceRecords:
         raise ValueError("a records= holdout reads by index; hold out fractions of a stream")
 
 
-def _hashed(shard: str, index: int) -> int:
-    return int.from_bytes(hashlib.sha256(f"{shard}:{index}".encode()).digest()[:8], "big")
+def _inside(row: Batch | bytes, low: float, high: float) -> bool:
+    """Whether `row`'s identity, the hash of its content, falls in [`low`, `high`) of the unit
+    interval: the same wherever and however the row is read, and one part for equal rows."""
+    hashed = int.from_bytes(hashlib.sha256(encode(row)).digest()[:8], "big")
+    return int(low * 2**64) <= hashed < int(high * 2**64)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -77,11 +81,9 @@ class _HashRows:
     low: float
     high: float
     held: bool
-    shard: str = "index"
 
-    def __call__(self, index: int, row: Batch) -> Batch | Rejected:
-        inside = int(self.low * 2**64) <= _hashed(self.shard, index) < int(self.high * 2**64)
-        return row if inside == self.held else Rejected("holdout")
+    def __call__(self, row: Batch) -> Batch | Rejected:
+        return row if _inside(row, self.low, self.high) == self.held else Rejected("holdout")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -94,9 +96,9 @@ class _SelectedRow:
 
 @dataclasses.dataclass(frozen=True)
 class _HashSource:
-    """The rows of `source` whose identity hashes into [`low`, `high`) of the
+    """The rows of `source` whose content hashes into [`low`, `high`) of the
     unit interval (`held`), or the rows that do not: a row is in exactly one
-    part, the same in every run, on every machine and after every resume."""
+    part, the same in every run, read, machine and resume."""
 
     source: Source
     low: float
@@ -119,9 +121,8 @@ class _HashSource:
         import grain.python as grain
 
         rows = self.source.records(read)
-        low, high = int(self.low * 2**64), int(self.high * 2**64)
         keys = tuple(index for index in range(len(rows))
-                     if (low <= _hashed("index", index) < high) == self.held)
+                     if _inside(rows[index], self.low, self.high) == self.held)
         return grain.MapDataset.source(keys).map(_SelectedRow(rows))
 
     def metadata(self) -> Mapping[str, object]:
@@ -137,10 +138,8 @@ class _HashSource:
     def _reader(self, manifest: ShardManifest, shard: Shard):
         from dew.data.mix import Accepted
 
-        return Accepted(
-            manifest.reader(shard).map_with_index(_HashRows(self.low, self.high, self.held, shard.id)),
-            self.describe(),
-        )
+        rows = manifest.reader(shard).map(_HashRows(self.low, self.high, self.held))
+        return Accepted(rows, self.describe())
 
 
 def _rebased(dataset: Dataset, store: Callable[[Source], Source]) -> Pipeline:

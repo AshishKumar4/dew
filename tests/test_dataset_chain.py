@@ -31,7 +31,7 @@ def test_a_mix_reads_memory_grain_and_files_members_at_their_shares(tmp_path):
     stream = data.train(DataPartition())
     try:
         origins = np.concatenate([batch["origin"] for batch in itertools.islice(stream, 32)])
-        accepted = {key.removeprefix("data/accepted/"): count for key, count in stream.statistics().items()
+        accepted = {key.removeprefix("data/accepted/"): count for key, count in data.statistics().items()
                     if key.startswith("data/accepted/")}
     finally:
         stream.close()
