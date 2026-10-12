@@ -585,9 +585,10 @@ def shard_batch(mesh: Mesh, batch: Batch) -> Batch:
     """Assemble this process's share of each array into a globally sharded one.
 
     The placed batch owns its memory because reader buffers are borrowed until
-    the next batch and CPU placement can alias host arrays. Borrowed host
-    leaves are copied once before transfer. JAX 0.11.2 drops copy_semantics
-    in pxla._shard_np_array, so may_alias=False would still alias those leaves.
+    the next batch. CPU placement copies each borrowed host leaf once, since
+    JAX 0.11.2 drops copy_semantics in pxla._shard_np_array and ignores
+    may_alias=False for NumPy inputs. Accelerator transfers copy by construction
+    and release the borrowed host buffer when the transfer completes.
 
     The share is the one `DataPartition.of(mesh)` names: that share's rows, each
     whole in every other dimension. A pool assembles one leaf per process,
@@ -608,8 +609,10 @@ def shard_batch(mesh: Mesh, batch: Batch) -> Batch:
     request, belongs where the caller's own collectives are issued.
     """
     batch = filled_validity(batch) if jax.process_count() > 1 else batch
+    cpu = all(device.platform == "cpu" for device in mesh.devices.flat)
     batch = jax.tree.map(
-        lambda leaf: leaf if isinstance(leaf, jax.Array) else np.array(leaf, copy=True), batch)
+        lambda leaf: leaf if isinstance(leaf, jax.Array) else (
+            np.array(leaf, copy=True) if cpu else np.asarray(leaf)), batch)
     count = DataPartition.of(mesh).count
     shardings = batch_shardings(mesh, batch)
     if jax.process_count() == 1:
