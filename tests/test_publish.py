@@ -79,6 +79,8 @@ class TrackedRun(Run):
         self.summary, self.history = {}, []
         self.config = types.SimpleNamespace(update=lambda value, **_: self.configuration.update(value))
         self.configuration = {}
+        self.exit_codes = []
+        self.preempting = False
 
     def define_metric(self, *_, **__):
         pass
@@ -86,8 +88,11 @@ class TrackedRun(Run):
     def log(self, value, **_):
         self.history.append(value)
 
-    def finish(self, **_):
-        pass
+    def mark_preempting(self):
+        self.preempting = True
+
+    def finish(self, exit_code=0, **_):
+        self.exit_codes.append(exit_code)
 
 
 @pytest.mark.parametrize('publish', [False, True])
