@@ -125,6 +125,8 @@ class Encoding:
             )
         encoded = rows[0]
         length = self.layout.max_len
+        if not self.layout.fits(encoded):
+            raise ValueError(f"the row needs {len(encoded.tokens)} tokens, more than max_len={length}")
         row: Batch = {
             "tokens": _padded(encoded.tokens, length, self.specials.pad),
             "valid": _padded((True,) * len(encoded.tokens), length, fill=False),
@@ -241,12 +243,9 @@ class Fit(pygrain.MapTransform):
         if not labels:
             return Rejected("unlabelled")
         asked = example.questions if self.layout.joint else {name: example.questions[name] for name in labels}
-        try:
-            laid = self.layout.rows(self.tokenizer, self.specials, example.state, asked)
-        except ValueError as error:
-            if self.layout.joint and "schema needs" in str(error):
-                return Rejected("unfit")
-            raise
+        laid = self.layout.rows(self.tokenizer, self.specials, example.state, asked)
+        if not all(map(self.layout.fits, laid)):
+            return Rejected("unfit")
         fitted = tuple(
             FittedRow(
                 example,
@@ -390,10 +389,11 @@ class DecisionObjective(Objective[Ratio]):
     each row's right option, with `label_smoothing` spread evenly over its
     options. `shuffle_options` and `none_of_the_above` augment the rows as
     `Encoding` describes, and `data` supplies their pipeline steps. With `bucket`, the
-    training stream batches rows of like length (`LengthGroups`) and cuts each
-    batch after its longest row, rounded up to a multiple of `bucket`, so a
-    step pays for little more than its tokens instead of `max_len` per row;
-    each length compiles its own step, and the stream is read on one process.
+    training stream and the validation pass batch rows of like length
+    (`LengthGroups`) and cut each batch after its longest row, rounded up to a
+    multiple of `bucket`, so a step pays for little more than its tokens
+    instead of `max_len` per row; each length compiles its own step, and both
+    are read on one process.
 
     Evaluation returns the model's `Decisions` on the validation rows, which
     `Accuracy`, `ECE`, `AURC` and the scoring rules read, its probabilities
@@ -603,7 +603,8 @@ class DecisionObjective(Objective[Ratio]):
         return jax.jit(lambda variables, inputs: self.model.logits(variables, inputs))
 
     def data(self, tokenizer: Tokenizer | None = None) -> ObjectiveData:
-        """Fit rows before mixing, augment training layouts, and cut training batches."""
+        """Fit rows before mixing, augment training layouts, and group and cut
+        training and evaluation batches alike."""
         vocabulary = self.tokenizer if tokenizer is None else tokenizer
         training = ConfigureLayout(
             self.layout, vocabulary, self.specials, self.shuffle_options, self.none_of_the_above, train=True
@@ -611,11 +612,13 @@ class DecisionObjective(Objective[Ratio]):
         evaluating = dataclasses.replace(training, train=False)
         fit = Fit(self.layout, vocabulary, self.specials)
         expand = () if self.layout.joint else (QuestionRows(),)
+        cut = () if self.bucket is None else (_Cut(self.bucket, self.layout.max_len),)
         return ObjectiveData(
             train=(fit, *expand, Configured(training, needs=("slots",), scope="run", random=True)),
             evaluate=(fit, *expand, Configured(evaluating, needs=("slots",), scope="run")),
             group=None if self.bucket is None else LengthGroups(StoredLength()),
-            train_batch=() if self.bucket is None else (_Cut(self.bucket, self.layout.max_len),),
+            train_batch=cut,
+            evaluate_batch=cut,
         )
 
     def inference_record(self):

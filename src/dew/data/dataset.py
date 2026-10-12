@@ -874,10 +874,18 @@ class _Grouped(pygrain.MapDataset[Batch]):
         else:
             records = [self._parent[start + offset] for offset in range(size)]
             lengths = [0 if record is None else self._groups.length(record) for record in records]
-        ranked = np.argsort(lengths, kind="stable")
-        batches = [ranked[first : first + self._rows] for first in range(0, size, self._rows)]
-        shuffled = np.random.default_rng([self._seed, start]).permutation(len(batches))
-        return np.concatenate([batches[index] for index in shuffled])
+        return _window_order(lengths, self._rows, np.random.default_rng([self._seed, start]))
+
+
+def _window_order(lengths: Sequence[int], rows: int, rng: np.random.Generator) -> np.ndarray:
+    """The order of a window's records by `lengths`, cut into batches of
+    `rows`, the whole batches in an order drawn from `rng`. A finite pass's
+    last window can end in a part batch, which stays last: put among the
+    whole ones, it would move every batch boundary after it."""
+    ranked = np.argsort(lengths, kind="stable")
+    whole = len(ranked) // rows * rows
+    batches = ranked[:whole].reshape(-1, rows)
+    return np.concatenate([batches[rng.permutation(len(batches))].reshape(-1), ranked[whole:]])
 
 
 class FilledBatch(pygrain.MapTransform):

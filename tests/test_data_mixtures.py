@@ -242,10 +242,13 @@ class Halved:
 
 
 def test_a_cut_stream_maps_every_batch_and_is_read_by_one_process():
-    stream = compile(two_corpora().batch(4).map_batch(Halved()), read="memory", loading=READ).train
-    assert [len(batch) for batch in taken(stream(DataPartition()), 3)] == [2, 2, 2]
-    with pytest.raises(ValueError, match="one reader"):
-        stream(DataPartition(0, 2))
+    """The training stream and the validation pass alike."""
+    held = Pipeline(Memory(Indexed(3, 6)), name="held").batch(4).map_batch(Halved())
+    data = compile(two_corpora().batch(4).map_batch(Halved()), validation=held, read="memory", loading=READ)
+    assert [len(batch) for batch in taken(data.train(DataPartition()), 3)] == [2, 2, 2]
+    for reader in (data.train, data.val):
+        with pytest.raises(ValueError, match="one reader"):
+            reader(DataPartition(0, 2))
 
 
 def test_a_validation_pass_over_a_mixture_reads_each_record_at_most_once():

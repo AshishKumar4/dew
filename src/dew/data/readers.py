@@ -22,6 +22,7 @@ from dew.data.dataset import (
     LengthGroups,
     Position,
     Reader,
+    _window_order,
     rows_of,
 )
 from dew.data.mix import CorpusCounts, state_counts
@@ -46,10 +47,12 @@ class _GroupedIterator(pygrain.DatasetIterator[Batch]):
                 held.append(next(self._read))
             except StopIteration:
                 break
-        ranked = sorted(held, key=self._groups.length)
-        batches = [ranked[start : start + self._rows] for start in range(0, len(ranked), self._rows)]
-        order = np.random.default_rng([self._seed, self._window]).permutation(len(batches))
-        self._buffer = [value for index in order for value in batches[index]]
+        order = _window_order(
+            [self._groups.length(value) for value in held],
+            self._rows,
+            np.random.default_rng([self._seed, self._window]),
+        )
+        self._buffer = [held[index] for index in order]
         self._emitted = 0
 
     def __next__(self) -> Batch:

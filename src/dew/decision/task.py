@@ -301,6 +301,10 @@ class Decide:
     def _encoded(self, state: JSON, questions: Mapping[str, Question],
                  media: Sequence[int] = ()) -> list[Encoded]:
         rows = self.layout.rows(self.tokenizer, self.specials, state, questions, media=media)
+        for row in rows:
+            if not self.layout.fits(row):
+                raise ValueError(f"the schema needs {len(row.tokens)} tokens besides the state, more than "
+                                 f"the maximum context length, max_len={self.layout.max_len}")
         for laid in (laid for row in rows for laid in row.questions):
             count = len(questions[laid.name].options)
             if len(laid.options) != count:

@@ -305,6 +305,67 @@ def test_a_bucketed_stream_cuts_each_batch_just_past_its_longest_row():
                                plain.scalar_loss(variables, batch, step)[0], rtol=1e-6)
 
 
+HELD = [Example(f"{index}" if index % 3 == 0 else f"{index} " + "x" * (12 + index), {"team": INTENT},
+                {"team": ("billing", "technical", "sales")[index // 3 % 3]}) for index in range(18)]
+"""Under `LAYOUT`, six rows of 52 or 53 tokens and twelve of 66 to 83, no two alike."""
+
+
+@pytest.mark.parametrize(("bucket", "batching", "cut"), [
+    (8, {"batch": 4}, lambda longest: min(LAYOUT.max_len, -(-longest // 8) * 8)),
+    (None, {"batch": None, "tokens": 192, "lengths": (64, 96)}, lambda longest: 64 if longest <= 64 else 96),
+], ids=["rows", "tokens"])
+def test_a_held_pass_is_cut_as_training_is_and_scores_every_row_once(bucket, batching, cut):
+    """Eighteen held rows in batches of four cut at the next multiple of
+    eight past their longest row, or in a token budget's two lengths: each
+    batch is cut as a training batch is rather than padded to max_len, and
+    holds rows of like length. Every row is read once, the last batch's
+    repeats count nothing, and each row's probabilities and the pass's log
+    loss are those of every row in one uncut batch."""
+    from dew.objectives.base import Step
+    from dew.training.distributed import MeshSpec
+    from dew.training.evaluation import Evaluation
+
+    def built(**fields):
+        return DecisionObjective(tiny_backbone(), tokenizer=TOKENIZER, specials=SPECIALS, layout=LAYOUT,
+                                 shuffle_options=False, **fields)
+
+    plain, cutting = built(), built(bucket=bucket)
+    variables = plain.init(jax.random.key(0))
+    step = Step(jnp.asarray(0), jax.random.key(0), None)
+
+    def scored(objective, batch) -> list:
+        """Each real row's tokens and probabilities."""
+        found = np.asarray(objective.evaluate(variables, batch, step).probabilities)[:, 0]
+        real = np.asarray(batch.get(VALID_ROWS, np.ones(len(found), bool)))
+        return [(tuple(np.asarray(tokens)[np.asarray(valid)].tolist()), row) for tokens, valid, row, kept
+                in zip(batch["tokens"], batch["valid"], found, real, strict=True) if kept]
+
+    recipe = DecisionRecipe(source=HELD, validation=HELD)
+    oracle = load(recipe, batch=len(HELD), read="memory", objective=plain.data())
+    data = load(recipe, read="memory", objective=cutting.data(), **batching)
+    (whole,) = list(oracle.val(DataPartition()))
+    expected = dict(scored(plain, whole))
+    batches = list(data.val(DataPartition()))
+    spans, seen = [], []
+    for batch in batches:
+        lengths = np.sum(batch["valid"], axis=1)
+        assert batch["tokens"].shape[1] == cut(int(lengths.max()))
+        spans.append((int(lengths.min()), int(lengths.max())))
+        seen.extend(scored(cutting, batch))
+    assert min(batch["tokens"].shape[1] for batch in batches) < LAYOUT.max_len
+    spans.sort()
+    assert all(below[1] <= above[0] for below, above in itertools.pairwise(spans)), spans
+    assert sorted(key for key, _ in seen) == sorted(expected)
+    # Within float32 rounding: a cut row's attention sums over fewer padded keys.
+    for key, found in seen:
+        np.testing.assert_allclose(found, expected[key], rtol=1e-5)
+    mesh = MeshSpec().build(jax.local_devices()[:1])
+    passes = [Evaluation.run(objective, variables, reader, key=0, metrics=[LogLoss()], mesh=mesh)
+              for objective, reader in ((cutting, data.val), (plain, oracle.val))]
+    assert [result.records for result in passes] == [len(HELD), len(HELD)]
+    assert passes[0].scores["val/log_loss"] == pytest.approx(passes[1].scores["val/log_loss"], rel=1e-5)
+
+
 def tiny_backbone() -> CausalTransformer:
     return CausalTransformer(vocab_size=256, emb_features=32, num_layers=2, num_heads=2, mlp_features=48,
                              max_seq_len=128, attention_impl="xla")
