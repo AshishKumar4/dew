@@ -247,11 +247,15 @@ def _attend(query, key, value, sinks, starts, longest, scale, causal, window):
 
 def _attend_forward(query, key, value, sinks, starts, longest, scale, causal, window):
     out, lse = _forward(query, key, value, starts, longest, scale, causal, window)
-    if sinks is not None:
-        # A sink adds e^s to each row's denominator and nothing to its sum of values, so the
-        # kernel's output scales by the share the keys keep.
-        out = (out.astype(jnp.float32) * _kept(lse, starts, query.shape[0], sinks)).astype(out.dtype)
-    return out, (query, key, value, sinks, starts, out, lse)
+    if sinks is None:
+        return out, (query, key, value, sinks, starts, out, lse)
+    # A sink adds e^s to each row's denominator and nothing to its sum of values, so the kernel's
+    # output scales by the share the keys keep.
+    return _sunk(out, lse, starts, sinks), (query, key, value, sinks, starts, out, lse)
+
+
+def _sunk(out, lse, starts, sinks):
+    return (out.astype(jnp.float32) * _kept(lse, starts, out.shape[0], sinks)).astype(out.dtype)
 
 
 def _attend_backward(longest, scale, causal, window, residuals, grad):
@@ -260,12 +264,14 @@ def _attend_backward(longest, scale, causal, window, residuals, grad):
     if sinks is not None:
         # The weights with the sink are the kernel's times the kept share, so the kernel's own
         # backward of the scaled output takes the gradient times that share, and the sink's logit
-        # takes minus the share it holds times each row's gradient along the output.
+        # takes minus the share it holds times each row's gradient along the scaled output. That
+        # product scales the kernel's output in fp32, rounded once, as the kernel wrote it.
         kept = _kept(lse, starts, query.shape[0], sinks)
-        along = jnp.sum(grad.astype(jnp.float32) * out.astype(jnp.float32), axis=-1, keepdims=True)
+        along = kept * jnp.sum(grad.astype(jnp.float32) * out.astype(jnp.float32), axis=-1, keepdims=True)
         rows = tuple(axis for axis in range(kept.ndim) if axis != kept.ndim - 2)
         dsinks = -jnp.sum((1 - kept) * along, axis=rows).astype(sinks.dtype)
         grad = (grad.astype(jnp.float32) * kept).astype(grad.dtype)
+        out = _sunk(out, lse, starts, sinks)
     dq, dk, dv = _backward(grad, query, key, value, out, lse, starts, longest, scale, causal, window)
     offsets = None if starts is None else np.zeros(starts.shape, jax.dtypes.float0)
     return dq, dk, dv, dsinks, offsets
