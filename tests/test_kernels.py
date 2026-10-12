@@ -361,6 +361,12 @@ def float64_attention(query, key, value, causal):
     return jnp.einsum('hqk,khd->qhd', jax.nn.softmax(logits, axis=-1), value)
 
 
+def output_and_gradients(attend, cotangent, *arrays):
+    """`attend`'s output and the gradients of its inputs under `cotangent`, as float64 host arrays."""
+    out, pull = jax.vjp(attend, *arrays)
+    return [np.asarray(x, np.float64) for x in (out, *pull(cotangent))]
+
+
 @on_gpu
 @pytest.mark.parametrize("head_dim", [128, 256])
 @pytest.mark.parametrize("causal", [True, False])
@@ -380,21 +386,20 @@ def test_packed_sequences_attend_within_themselves_as_far_from_float64_as_one_at
     _, key, value = qkv((int(starts[-1]), 2, head_dim), seed=1)
     cotangent = qkv((int(starts[-1]), 8, head_dim), seed=2)[0]
 
-    def grads(attend, cotangent, *arrays):
-        out, pull = jax.vjp(attend, *arrays)
-        return [np.asarray(x, np.float64) for x in (out, *pull(cotangent))]
-
-    packed = grads(lambda q, k, v: flash.flash_mha_varlen(q, k, v, starts, max(lengths), is_causal=causal),
-                   cotangent, query, key, value)
+    packed = output_and_gradients(
+        lambda q, k, v: flash.flash_mha_varlen(q, k, v, starts, max(lengths), is_causal=causal),
+        cotangent, query, key, value)
     for begin, end in itertools.pairwise(starts):
         if begin == end:
             continue
         pieces = (query[begin:end], key[begin:end], value[begin:end])
-        dense = grads(lambda q, k, v: flash.flash_mha(q[None], k[None], v[None], is_causal=causal)[0],
-                      cotangent[begin:end], *pieces)
+        dense = output_and_gradients(
+            lambda q, k, v: flash.flash_mha(q[None], k[None], v[None], is_causal=causal)[0],
+            cotangent[begin:end], *pieces)
         with jax.enable_x64(new_val=True):
             wide = [jnp.asarray(np.asarray(x, np.float64)) for x in (*pieces, cotangent[begin:end])]
-            truth = grads(functools.partial(float64_attention, causal=causal), wide[3], *wide[:3])
+            truth = output_and_gradients(functools.partial(float64_attention, causal=causal), wide[3],
+                                         *wide[:3])
         for name, got, theirs, want in zip(("o", "dq", "dk", "dv"), (x[begin:end] for x in packed), dense,
                                            truth, strict=True):
             if distance(theirs, want) == 0:  # a one-token document's attention is exact either way
@@ -416,19 +421,16 @@ def test_flash_is_as_exact_as_the_xla_kernel_from_float64(head_dim, without_dete
     _, key, value = qkv((1, 1024, 2, head_dim), seed=1)
     cotangent = qkv((1, 1024, 8, head_dim), seed=2)[0]
 
-    def grads(attend, cotangent, *arrays):
-        out, pull = jax.vjp(attend, *arrays)
-        return [np.asarray(x, np.float64) for x in (out, *pull(cotangent))]
-
     def kernel(implementation):
         return jax.jit(lambda q, k, v: scaled_dot_product_attention(
             q, k, v, implementation=implementation, causal=True))
 
-    fused = grads(kernel('flash'), cotangent, query, key, value)
-    reference = grads(kernel('xla'), cotangent, query, key, value)
+    fused = output_and_gradients(kernel('flash'), cotangent, query, key, value)
+    reference = output_and_gradients(kernel('xla'), cotangent, query, key, value)
     with jax.enable_x64(new_val=True):
         wide = [jnp.asarray(np.asarray(x[0], np.float64)) for x in (query, key, value, cotangent)]
-        truth = grads(functools.partial(float64_attention, causal=True), wide[3], *wide[:3])
+        truth = output_and_gradients(functools.partial(float64_attention, causal=True), wide[3],
+                                     *wide[:3])
     for name, got, theirs, want in zip(("o", "dq", "dk", "dv"), fused, reference, truth, strict=True):
         assert_as_exact_as_the_reference(got[0], theirs[0], want, name)
 

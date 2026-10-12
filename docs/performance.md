@@ -1068,9 +1068,14 @@ output and the query gradient). Qwen3.5-0.8B itself at 8 x 3072 on the H100 SXM 
 a step, its attention from 92.0 to 29.4 ms of device time, with `tools/attribute_step.py`.
 Calls with key lengths, such as Clef's decision head, stay on cuDNN: FlashAttention-3 ends keys at
 lengths only through packed offsets, and on Qwen3.5-0.8B it took 1.29 ms where cuDNN took 1.10. So
-`KERNELS['attention']` names flash for sm90. The kernel row reproduces with
-`PYTHONPATH=src python tools/benchmark_attention.py --implementations xla cudnn flash
---sequence-lengths 3072 --head-dims 256 --kv-groups 4 --causal True`.
+`KERNELS['attention']` names flash for sm90. The xla, jax.nn cuDNN, tokamax Triton and
+FlashAttention-3 rows reproduce with `PYTHONPATH=src python tools/benchmark_attention.py
+--implementations xla jax_cudnn triton flash --sequence-lengths 3072 --head-dims 256 --batch-size 8
+--heads 8 --kv-groups 4 --causal True` (tokamax installed). The others came from the same inputs
+through their own packages: `tokamax.dot_product_attention(..., implementation='mosaic')`, Transformer
+Engine's `transformer_engine.jax.flax.DotProductAttention` (built from source for CUDA 13), the
+FlashAttention-2 wheel rebuilt for sm90, and torch's `F.scaled_dot_product_attention` under the cuDNN
+backend and `kernels.get_kernel("kernels-community/flash-attn3").flash_attn_func`.
 
 ### Splash's tiles on the TPU, 2026-10-02
 

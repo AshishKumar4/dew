@@ -31,21 +31,7 @@ add_library(dew_flash_attn SHARED ffi.cpp
 target_include_directories(dew_flash_attn PRIVATE
     "${UPSTREAM}/csrc" "${UPSTREAM}/csrc/flash_attn" "${UPSTREAM}/csrc/flash_attn/src"
     "${UPSTREAM}/csrc/cutlass/include")
-# The library reports the architectures it holds code for (dew_flash_attn.ARCHITECTURES), so Dew asks
-# the installed wheel rather than knowing each release's list.
-list(JOIN CMAKE_CUDA_ARCHITECTURES "," ARCHITECTURES)
-set(DEFINES FLASHATTENTION_DISABLE_DROPOUT=1 FLASHATTENTION_DISABLE_ALIBI=1
-    DEW_FLASH_ARCHITECTURES="${ARCHITECTURES}")
-target_compile_definitions(dew_flash_attn PRIVATE ${DEFINES})
-target_compile_options(dew_flash_attn PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:
-    -O3 --use_fast_math --expt-relaxed-constexpr --expt-extended-lambda
-    -U__CUDA_NO_HALF_OPERATORS__ -U__CUDA_NO_HALF_CONVERSIONS__ -U__CUDA_NO_HALF2_OPERATORS__
-    -U__CUDA_NO_BFLOAT16_CONVERSIONS__>)
-target_link_libraries(dew_flash_attn PRIVATE CUDA::cudart)
-# The CUDA runtime comes from the nvidia wheel jax's CUDA plugin installs beside this one: CUDA 12's
-# nvidia/cuda_runtime/lib, CUDA 13's nvidia/cu13/lib.
-set_target_properties(dew_flash_attn PROPERTIES
-    INSTALL_RPATH "$ORIGIN/../nvidia/cuda_runtime/lib:$ORIGIN/../nvidia/cu13/lib" BUILD_WITH_INSTALL_RPATH ON)
+target_compile_definitions(dew_flash_attn PRIVATE FLASHATTENTION_DISABLE_DROPOUT=1 FLASHATTENTION_DISABLE_ALIBI=1)
 
 # FlashAttention-3 for sm90a, the instantiations a training call reaches: bf16 and fp16, heads of
 # 64, 128 and 256 (flash.cpp rounds 96 up to 128 and 192 up to 256 with those two disabled), with
@@ -70,15 +56,24 @@ target_include_directories(dew_flash_attn3 PRIVATE
 set_target_properties(dew_flash_attn3 PROPERTIES CUDA_ARCHITECTURES 90a-real CXX_STANDARD 20 CUDA_STANDARD 20)
 list(TRANSFORM FLASH3_DISABLED PREPEND FLASHATTENTION_DISABLE_ OUTPUT_VARIABLE DEFINES3)
 target_compile_definitions(dew_flash_attn3 PRIVATE ${DEFINES3} FLASHATTENTION_DISABLE_DROPOUT=1
-    CUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED CUTLASS_ENABLE_GDC_FOR_SM90 CUTLASS_DEBUG_TRACE_LEVEL=0 NDEBUG
-    DEW_FLASH_ARCHITECTURES="90a-real")
-target_compile_options(dew_flash_attn3 PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:
-    -O3 --use_fast_math --expt-relaxed-constexpr --expt-extended-lambda
-    -U__CUDA_NO_HALF_OPERATORS__ -U__CUDA_NO_HALF_CONVERSIONS__ -U__CUDA_NO_HALF2_OPERATORS__
-    -U__CUDA_NO_BFLOAT16_CONVERSIONS__>)
+    CUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED CUTLASS_ENABLE_GDC_FOR_SM90 CUTLASS_DEBUG_TRACE_LEVEL=0 NDEBUG)
 # Its calls to its own functions stay inside it, so loaded beside libdew_flash_attn.so, whose port
 # exports the same names, neither binds the other's.
 target_link_options(dew_flash_attn3 PRIVATE -Wl,-Bsymbolic)
-target_link_libraries(dew_flash_attn3 PRIVATE CUDA::cudart)
-set_target_properties(dew_flash_attn3 PROPERTIES
-    INSTALL_RPATH "$ORIGIN/../nvidia/cuda_runtime/lib:$ORIGIN/../nvidia/cu13/lib" BUILD_WITH_INSTALL_RPATH ON)
+
+foreach(library dew_flash_attn dew_flash_attn3)
+  # Each library reports the architectures it holds code for (dew_flash_attn.ARCHITECTURES), so Dew
+  # asks the installed wheel rather than knowing each release's list.
+  get_target_property(compiled ${library} CUDA_ARCHITECTURES)
+  list(JOIN compiled "," ARCHITECTURES)
+  target_compile_definitions(${library} PRIVATE DEW_FLASH_ARCHITECTURES="${ARCHITECTURES}")
+  target_compile_options(${library} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:
+      -O3 --use_fast_math --expt-relaxed-constexpr --expt-extended-lambda
+      -U__CUDA_NO_HALF_OPERATORS__ -U__CUDA_NO_HALF_CONVERSIONS__ -U__CUDA_NO_HALF2_OPERATORS__
+      -U__CUDA_NO_BFLOAT16_CONVERSIONS__>)
+  target_link_libraries(${library} PRIVATE CUDA::cudart)
+  # The CUDA runtime comes from the nvidia wheel jax's CUDA plugin installs beside this one: CUDA 12's
+  # nvidia/cuda_runtime/lib, CUDA 13's nvidia/cu13/lib.
+  set_target_properties(${library} PROPERTIES
+      INSTALL_RPATH "$ORIGIN/../nvidia/cuda_runtime/lib:$ORIGIN/../nvidia/cu13/lib" BUILD_WITH_INSTALL_RPATH ON)
+endforeach()
