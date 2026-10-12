@@ -557,6 +557,17 @@ def test_a_nested_mixture_counts_its_epoch_from_each_part():
     assert compile(nested.batch(2), loading=READ).records == 32
 
 
+def test_a_streamed_training_read_with_a_random_step_and_no_repeat_never_runs_out():
+    """A training order that writes no repeat repeats for ever, as its plan
+    says, whether or not a random step reads its rows."""
+    reader = compile(Pipeline(source(8)).random_map(Draw()).batch(4), read="streamed",
+                     loading=READ).train(DataPartition())
+    try:
+        assert reader.endless and len(take(reader, 6)) == 6
+    finally:
+        reader.close()
+
+
 def test_the_saved_order_names_the_stages_a_memory_read_ran_as_an_indexed_read_does():
     """The canonical order a resume checks is the pipeline as written,
     whichever read runs its packing. A memory read packs before it orders,
