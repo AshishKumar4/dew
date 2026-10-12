@@ -110,7 +110,8 @@ type LogicalAxisRules = tuple[tuple[str, MeshAxes], ...]
 # shards lie in memory. Among the dimensions a rule names it alone for, it
 # takes the array's leading one that no other axis took (`logical_spec`),
 # whatever the rule order: each shard is then one block of the row-major
-# array, so its gather concatenates and its gradient's reduce-scatter cuts.
+# array, so its gather concatenates and its gradient's reduce-scatter cuts,
+# as PyTorch's FSDP2 splits every parameter on dim 0 (`fully_shard`).
 # Split on the mlp width, the gate and up projections transposed their
 # gradients for every update: Llama-3.1-8B over FSDP 2 on two H100 SXMs
 # stepped in 537.8 ms, and in 488.0 split on the residual width.

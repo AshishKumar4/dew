@@ -859,8 +859,8 @@ class GatedDeltaNet(nn.Module):
         batch axes put them and its width whole: the rules split no delta
         net width over the tensor axis, and the rule's `manual_map` takes
         rows split. Unplaced, an fsdp mesh ran the layer head-split with
-        every row gathered to every device, its all-to-alls 8.5 GiB of a
-        Qwen3.5-9B step over FSDP 2."""
+        every row gathered to every device, its all-to-alls 8.4 GiB of a
+        Qwen3.5-9B step over FSDP 2 (docs/performance.md)."""
         B, S, _ = x.shape
 
         def projected(dense):

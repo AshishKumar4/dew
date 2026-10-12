@@ -1660,6 +1660,58 @@ cd <dew checkout> && JAX_PLATFORMS=cuda XLA_FLAGS= XLA_PYTHON_CLIENT_MEM_FRACTIO
   --attention auto --lr-init 0 --warmup 16
 ```
 
+### fsdp splits a parameter's leading dimension, 2026-10-12
+
+A parameter fsdp splits is gathered whole for every use, so which of its
+dimensions fsdp takes changes no product, only how the shards lie in
+memory. It now takes the leading dimension its rules name it alone for
+(`dew.nn.sharding.DEFAULT_RULES`). Before, rule order put fsdp on the gate
+and up projections' mlp width, their minor dimension, and each update read
+their reduce-scattered gradients transposed. The 8B's profile with the
+collective options spent 65 ms of each device's 524 ms step in transpose
+fusions, 43.5 of them in 64 optimizer updates of 0.68 ms. Same 8B, mesh,
+data and command as above, at ecaa727d9 (the collective options), 55 timed
+steps, alternated:
+
+| split | step ms | MFU | peak GB |
+|---|---|---|---|
+| rule order (gate, up on the mlp width) | 538.0, 537.5 | 37.1%, 37.2% | 71.5 |
+| leading dimension | 488.3, 487.6 | 40.9%, 41.0% | 65.3 |
+
+The losses agree to the run-to-run spread (1e-4 relative). On Qwen3.5-9B
+with rank-256 factors over FSDP 2 (below), the frozen base's gate, up and
+delta-net input projections split their leading dimension too: 446.8 to
+434.7 ms a step, its layout kernels 37.8 to 18.0 ms a device.
+
+### The delta net over fsdp, 2026-10-12
+
+Over an fsdp mesh GSPMD placed the gated delta net's projections head-split
+with the rows gathered: each device ran both rows' delta rule, and the step
+moved 8.4 GiB of all-to-alls and 2.8 GiB of activation gathers. Each
+projection now keeps the residual's placement
+(`GatedDeltaNet._project`). Qwen3.5-9B with its middle eight layers (12 to
+20) run twice, rank-256 factors over a frozen bf16 base, one 3072-token row
+a GPU, minimal remat, two H100 80GB HBM3 SXMs over NVLink, land/gdn-unit
+102918039, the median of steps 100 to 220:
+
+| run | step ms | peak GiB |
+|---|---|---|
+| FSDP 2, before | 481.3 | 25.0 |
+| FSDP 2, projections placed | 446.8 | 25.8 |
+| and leading-dimension splits | 434.7 | 25.1 |
+
+The profile's delta-net time fell from 175 to 95 ms over both devices, and
+every all-to-all and activation gather left the step.
+
+```
+cd <dew checkout> && PYTHONPATH=src python recipes/decision/clef.py --mixture.root <mix> --trainer.name run \
+  --pretrained Qwen/Qwen3.5-9B --revision c202236235762e1c871ad0ccb60c8ee5ba337b9a --max-len 3072 \
+  --max-state-tokens 1024 --trainer.batch-size 2 --trainer.steps 220 --trainer.eval-every 220 \
+  --trainer.checkpoint-every None --trainer.log-every 1 --no-calibrate --optim.schedule.warmup-steps 10 \
+  --lora.rank 256 --param-dtype bfloat16 --loop-steps 2 --loop-layers 12 20 --remat minimal \
+  --trainer.mesh.fsdp 2
+```
+
 ## UNet batch scaling
 
 These numbers show where the unet, the architecture whose step is least
