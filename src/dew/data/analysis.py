@@ -251,6 +251,17 @@ _LOCAL = (Map, MapWithIndex, Filter, FlatMap)
 """The deterministic record steps that run before a cache or an interleave,
 inside the reader of each input or shard."""
 
+def _order_at(stages: Sequence[Stage], read: Read) -> tuple[int, bool]:
+    """Where a recipe's default order goes, and whether the rows there are
+    indexed so one shuffle can order them all. A memory read orders the rows
+    its deterministic steps made, before the first random step; any other
+    read orders the source's rows right after the cache that keys them, and
+    a cache's rows reach an indexed read as a stream."""
+    if read == "memory":
+        return next((index for index, stage in enumerate(stages) if _random(stage)), len(stages)), True
+    cache = _at(stages, Artifact)
+    return (0, read == "indexed") if cache is None else (cache + 1, False)
+
 
 def _random(stage: Stage) -> bool:
     """Whether a stage draws from the record rng, so what it makes differs
@@ -287,21 +298,44 @@ def _written(source: Source, stages: Sequence[Stage]) -> tuple[Stage, ...]:
 @dataclasses.dataclass(frozen=True)
 class _Lowering:
     """What a pipeline's stages mean for its lowering, analyzed once in one
-    walk (`_analyzed`), which also refuses what no lowering takes.
+    walk (`_analyzed`), which also refuses what no lowering takes. The memory
+    executor, the Grain lowering and the plan read these decisions and scan
+    the stages for none of them.
 
     `per_share` cuts the order into shares at the read, for an iterator order
     that cannot keep the global contract; otherwise one global order is cut
     just before batching, after every stage that defines it, so a prefetch
-    never moves the cut and a limit counts the whole order. `cache` is the
-    cache stage a memory read fills, and the stages before `eager` (after that
-    cache) are the ones a memory read runs over the whole source. `order` is
-    the canonical order a resume must find unchanged, and `endless` whether
-    the training order never runs out.
+    never moves the cut and a limit counts the whole order. `children` are the
+    analyses of a mixture's or phases' pipelines, in order.
+
+    `cache` is the cache stage, once every step before it is bound, and the
+    stages before `eager` (after that cache) are the ones a memory read runs
+    over the whole source. `interleave` is the interleave a streamed read
+    flattens its shards at, after running the record steps before it inside
+    each shard.
+
+    `repeated` says whether any of its steps repeats the order; a training
+    read of an order that repeats nowhere repeats it for ever, at its root.
+    A streamed read repeats at its root in place of the first written repeat
+    (`absorbed`) when no random step comes before it, and its root reads
+    `epochs` epochs when it trains: the absorbed repeat's, one when a repeat
+    stays where it is written, and endless when none is written.
+
+    `split` says whether a token split runs in the lowered order rather than
+    in a memory read's eager pass. `order` is the canonical order a resume
+    must find unchanged, and `endless` whether the training order never runs
+    out.
     """
 
     per_share: bool
+    children: tuple[_Lowering, ...]
     cache: int | None
     eager: int
+    interleave: int | None
+    repeated: bool
+    absorbed: int | None
+    epochs: int | None
+    split: bool
     order: Mapping[str, object]
     endless: bool
 
@@ -309,9 +343,12 @@ class _Lowering:
 def _analyzed(
     pipeline: Pipeline, read: Read, *, validation: bool = False, promotion: bool = False
 ) -> _Lowering:
+    """The analysis of `pipeline` at `read`. A token split in an order cut
+    per share is refused once the steps are bound, since an unbound
+    configured step may still be one a memory read runs eagerly."""
     source = pipeline.source
     nested = source.pipelines if isinstance(source, (Mixture, Phases)) else ()
-    children = [_analyzed(child, read, validation=validation, promotion=promotion) for child in nested]
+    children = tuple(_analyzed(child, read, validation=validation, promotion=promotion) for child in nested)
     ancestry = tuple(stage for child in nested for stage in _steps(child))
     stages = pipeline.stages
     cache = _at(stages, Artifact)
@@ -326,11 +363,24 @@ def _analyzed(
             isinstance(child.source, (Mixture, Phases)) or "valid_targets" not in child.source.metadata()
             for child in nested
         )
+    per_share = per_share or any(child.per_share for child in children)
     steps = (*ancestry, *stages)
+    split = _at(stages[eager:], TokenSplit) is not None or any(child.split for child in children)
+    if per_share and split and not any(isinstance(stage, Configured) for stage in steps):
+        raise ValueError(f"token split in {_name(pipeline)} needs a global record order, not one per share")
     repeats = [stage.epochs for stage in steps if isinstance(stage, Repeat)]
     endless = not any(isinstance(stage, Limit) for stage in steps) and (
         not repeats or any(epochs is None for epochs in repeats)
     )
+    written = next(((index, stage) for index, stage in enumerate(stages) if isinstance(stage, Repeat)), None)
+    absorbed = (
+        written
+        if read == "streamed"
+        and written is not None
+        and not any(isinstance(stage, RandomMap) for stage in stages[: written[0]])
+        else None
+    )
+    epochs = None if written is None else 1 if absorbed is None else absorbed[1].epochs
     if isinstance(source, Phases):
         order: Mapping[str, object] = {
             "phases": [child.order for child in children],
@@ -358,7 +408,19 @@ def _analyzed(
                 dataclasses.asdict(stage) for stage in written if isinstance(stage, TokenBudget)
             ],
         }
-    return _Lowering(per_share or any(child.per_share for child in children), cache, eager, order, endless)
+    return _Lowering(
+        per_share,
+        children,
+        cache,
+        eager,
+        _at(stages, Interleave),
+        bool(repeats),
+        None if absorbed is None else absorbed[0],
+        epochs,
+        split,
+        order,
+        endless,
+    )
 
 
 def _checked(

@@ -31,6 +31,7 @@ from dew.data.analysis import (
     _identity,
     _leaves,
     _name,
+    _order_at,
     _preferred_read,
     _promoted,
     _steps,
@@ -78,7 +79,6 @@ from dew.data.pipeline import (
     Stage,
     TokenBudget,
     TokenGeometry,
-    TokenSplit,
     Volatile,
     Workers,
     _rejects,
@@ -428,8 +428,6 @@ def compile(
         if validation_counts and not any(count.accepted for count in validation_counts.values()):
             validation = None
     build = _Build(read, loading, seed, batch, budget, _analyzed(train, read), training=True)
-    if not build.global_order and any(isinstance(stage, TokenSplit) for stage in _steps(train)):
-        raise ValueError(f"token split in {_name(train)} needs a global record order, not one per share")
     return _compiled(
         train,
         validation,
@@ -752,11 +750,10 @@ def _objective_branch(pipeline: Pipeline, objective: ObjectiveData, *, train: bo
                 stages=(*suffixes[0], *branch.stages),
             )
     ordering = tuple(stage for stage in branch.stages if isinstance(stage, (Shuffle, Repeat)))
-    if ordering and read == "memory" and _at(branch.stages, RandomMap) is not None:
-        without = tuple(stage for stage in branch.stages if not isinstance(stage, (Shuffle, Repeat)))
-        first_random = _until(without, RandomMap)
-        stages = (*without[:first_random], *ordering, *without[first_random:])
-        branch = dataclasses.replace(branch, stages=stages)
+    without = tuple(stage for stage in branch.stages if not isinstance(stage, (Shuffle, Repeat)))
+    at, _ = _order_at(without, read)
+    if ordering and read == "memory" and at < len(without):
+        branch = dataclasses.replace(branch, stages=(*without[:at], *ordering, *without[at:]))
     if (
         train
         and objective.group is not None
