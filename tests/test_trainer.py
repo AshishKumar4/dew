@@ -568,6 +568,43 @@ def test_native_frozen_variables_train_save_and_resume_as_plain_ones(tmp_path):
     for got, want in zip(jax.tree.leaves((resumed.variables, resumed.opt_state)),
                          jax.tree.leaves((plain.variables, plain.opt_state)), strict=True):
         np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+def test_a_runs_checkpoint_opens_with_orbax_alone(tmp_path):
+    """A step is one Orbax PyTree item: Orbax's own manager reads the state's
+    fields by name, the PRNG key as a key, and an EMA leaf the metadata
+    lists as byte planes decodes to the run's average bit for bit, as the
+    checkpoint guide says."""
+    import orbax.checkpoint as ocp
+
+    trainer, _, _ = held_lm_trainer(checkpoints=Checkpoints(str(tmp_path)))
+    state, _, _ = trainer.place()
+    batch = {"text": jnp.tile(jnp.arange(1, 6, dtype=jnp.int32)[None], (jax.device_count(), 1))}
+    step = trainer.compile(state, batch)
+    for _ in range(2):
+        state, *_ = step(state, batch)
+    trainer.checkpoints.save(int(state.step), state)
+    trainer.checkpoints.wait()
+
+    manager = ocp.CheckpointManager(str(tmp_path), item_handlers=ocp.PyTreeCheckpointHandler())
+    tree = manager.restore(manager.latest_step(), args=ocp.args.PyTreeRestore())
+    deltas = manager.metadata(manager.latest_step()).custom_metadata["ema_deltas"]
+    assert int(tree["step"]) == int(state.step) == 2
+    np.testing.assert_array_equal(jax.random.key_data(tree["key"]), jax.random.key_data(state.key))
+    for got, want in zip(jax.tree.leaves(tree["variables"]), jax.tree.leaves(state.variables), strict=True):
+        np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+    weights = {jax.tree_util.keystr(path): np.asarray(leaf)
+               for path, leaf in jax.tree_util.tree_flatten_with_path(tree["variables"])[0]}
+    averages = dict(jax.tree_util.tree_flatten_with_path(state.ema)[0])
+    decoded = 0
+    for path, stored in jax.tree_util.tree_flatten_with_path(tree["ema"])[0]:
+        name, want = jax.tree_util.keystr(path), np.asarray(averages[path])
+        if name in deltas:
+            live = weights[name]
+            unsigned = np.dtype(f"uint{8 * live.dtype.itemsize}")
+            planes = np.asarray(stored)
+            bits = sum(planes[k].astype(unsigned) << unsigned.type(8 * k) for k in range(len(planes)))
+            stored, decoded = (live.view(unsigned) ^ bits).view(live.dtype), decoded + 1
+        np.testing.assert_array_equal(np.asarray(stored), want)
+    assert decoded == len(deltas) > 0
 
 
 def test_overlapping_token_windows_resume_in_a_fresh_trainer_bit_exactly(tmp_path):
