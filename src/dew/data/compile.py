@@ -50,7 +50,7 @@ from dew.data.dataset import (
     Records,
     weight_counts,
 )
-from dew.data.lowering import _as_iter, _Build, _epoch_records, _Locality, _TokenSplit, _workers
+from dew.data.lowering import _as_iter, _Build, _epoch_records, _Locality, _split_spans, _workers
 from dew.data.materialize import _materialize, _Memory
 from dew.data.mix import CorpusCounts, SearchBudget
 from dew.data.pipeline import (
@@ -80,7 +80,6 @@ from dew.data.pipeline import (
     Stage,
     TokenBudget,
     TokenGeometry,
-    TokenSplit,
     Volatile,
     Workers,
     _rejects,
@@ -278,23 +277,6 @@ def _budget_rows(budget: TokenBudget) -> int:
     return budget.tokens // min(lengths)
 
 
-def _token_spans(pipeline: Pipeline, build: _Build) -> Iterator[list[tuple[int, int, int]]]:
-    """The spans each token split left to the lowering keeps, in the order
-    `_steps` walks them: the lowering's own split (`_TokenSplit`) of the
-    indexed order before it, so they are the documents and token offsets a
-    reader of the plan trains on."""
-    if isinstance(pipeline.source, (Mixture, Phases)):
-        for child in pipeline.source.pipelines:
-            yield from _token_spans(child, build)
-    for at, stage in enumerate(pipeline.stages):
-        if isinstance(stage, TokenSplit):
-            before = dataclasses.replace(pipeline, stages=pipeline.stages[:at])
-            rows, _ = build.records(before, DataPartition())
-            if not isinstance(rows, pygrain.MapDataset):
-                raise ValueError(f"token split in {_name(pipeline)} needs a finite indexed order")
-            yield _TokenSplit(rows, stage).spans
-
-
 def _derived(pipeline: Pipeline, build: _Build) -> Mapping[str, str]:
     seed, read = build.seed, build.read
     arrays: dict[str, str] = {}
@@ -318,7 +300,7 @@ def _derived(pipeline: Pipeline, build: _Build) -> Mapping[str, str]:
             arrays[f"{index}/valid_targets"] = fingerprint(
                 integer(metadata["valid_targets"], "valid_targets")
             )
-    splits = list(_token_spans(pipeline, build))
+    splits = list(_split_spans(pipeline, build))
     if splits:
         arrays["token_spans"] = fingerprint(json_value(splits, "token spans"))
     return arrays
