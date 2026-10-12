@@ -97,6 +97,16 @@ def test_multiple_directions_and_threshold(tmp_path):
     assert {entry.step for entry in run.checkpoints.kept()} == {3, 5, 6}
 
 
+def test_a_terminal_winner_is_saved_without_the_unconditional_final_policy(tmp_path):
+    metric = Value('value', Shown(better='higher'))
+    run = trainer(tmp_path / 'run')
+    state = run.fit(data(), steps=2, log_every=1, eval_every=1, metrics=[metric],
+                    best=metric, checkpoint_final=False, restore_best=True)
+    assert run.checkpoints.best == 2
+    assert int(state.step) == 2
+    assert float(state.variables['params']['w']) == pytest.approx(.36)
+
+
 def test_missing_and_undeclared_metrics_are_refused_before_training(tmp_path):
     metric = Value('accuracy', Shown())
     with pytest.raises(ValueError, match='passed in metrics'):

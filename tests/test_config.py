@@ -339,6 +339,11 @@ def test_a_run_can_disable_final_checkpoint_saving(tmp_path):
     assert Checkpoints(str(tmp_path / "no-final")).latest is None
 
 
+def test_publishing_requires_a_final_checkpoint_policy():
+    with pytest.raises(ValueError, match="checkpoint_final"):
+        TrainerConfig(publish=True, wandb=dew.config.Wandb(project="test"), checkpoint_final=False)
+
+
 def test_a_dataset_at_another_batch_than_the_run_is_refused(tmp_path, capsys):
     """The batch is one number: the recipes load the data at
     `trainer.batch_size` and `train` refuses a dataset that reads another,

@@ -173,6 +173,14 @@ def test_an_explicit_state_starts_a_token_count_with_its_own_reader(tmp_path):
     assert int(trainer.fit(Data(), total_tokens=30, state=state).step) == 3
 
 
+def test_a_step_only_prefix_keeps_lifetime_real_tokens(tmp_path):
+    first = make_trainer(tmp_path, objective=TokenRegression())
+    first.fit(Data(), steps=2, log_every=1)
+    assert first.checkpoints.control(2)["tokens"] == 24
+    resumed = make_trainer(tmp_path, objective=TokenRegression())
+    assert int(resumed.fit(Data(), total_tokens=30, log_every=1).step) == 3
+
+
 def test_an_optim_config_is_built_over_the_updates_fit_makes():
     """Four steps of two microbatches are two updates: the run is the config built over two, bit
     for bit, not over four. Before fit there is no length to build it over."""
@@ -1052,6 +1060,13 @@ def local_trainer(tmp_path, **kwargs):
         checkpoints=Checkpoints(str(tmp_path / "run"), keep=4,
                                 local_directory=str(tmp_path / "local"), local_every=2),
         **kwargs)
+
+
+def test_terminal_local_cadence_does_not_need_a_final_persistent_save(tmp_path):
+    trainer = local_trainer(tmp_path)
+    trainer.fit(Data(), steps=2, checkpoint_final=False)
+    assert Checkpoints(str(tmp_path / "local")).latest == 2
+    assert trainer.checkpoints.latest is None
 
 
 def stop_at_local_step(trainer, stop: int):
