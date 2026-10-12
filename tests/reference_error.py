@@ -98,6 +98,14 @@ def equations(graph):
             yield from equations(value)
 
 
+def within(error, bound) -> bool:
+    """Whether every `error` is at most its `bound`, both finite. Written as the
+    passing condition, so a NaN or infinite error never passes, nor does an
+    infinite allowance from a reference that diverged."""
+    error, bound = np.asarray(error, np.float64), np.asarray(bound, np.float64)
+    return bool(np.all(np.isfinite(error) & np.isfinite(bound) & (error <= bound)))
+
+
 def assert_fp32_reduction_bound(dew, reference, magnitudes, terms: int) -> None:
     """Two fp32 reductions differ by at most 2 gamma_n sum(abs(products)).
 
@@ -109,7 +117,7 @@ def assert_fp32_reduction_bound(dew, reference, magnitudes, terms: int) -> None:
     gamma = roundoffs / (1 - roundoffs)
     error = np.abs(np.asarray(dew, np.float64) - np.asarray(reference, np.float64))
     bound = 2 * gamma * np.asarray(magnitudes, np.float64)
-    assert np.all(error <= bound), (float(error.max()), float(bound.max()))
+    assert within(error, bound), (float(error.max()), float(bound.max()))
 
 
 def distance(value, truth) -> float:
@@ -122,7 +130,7 @@ def assert_as_exact_as_the_reference(dew, reference, truth, label: str) -> None:
     """Dew within FACTOR times the reference's RMS distance from float64."""
     mine, theirs = distance(dew, truth), distance(reference, truth)
     assert theirs > 0, f"{label}: the reference equals float64, so it measures nothing"
-    assert mine <= FACTOR * theirs, (
+    assert within(mine, FACTOR * theirs), (
         f"{label}: dew is {mine:.3e} from float64 (rms), the reference {theirs:.3e} "
         f"(ratio {mine / theirs:.2f}, allowed {FACTOR})")
 
@@ -161,12 +169,12 @@ def assert_leaves_as_exact(dew, reference, truth, *, reductions: int = 1,
         size = distance(true, 0)
         scale = invariants.get(name, size)
         if name in invariants:
-            assert size <= spread * resolution * scale, (
+            assert within(size, spread * resolution * scale), (
                 f"{name}: declared invariant has float64 RMS {size:.3e}, above cancellation resolution "
                 f"{spread * resolution * scale:.3e} (terms {scale:.3e})")
         own = spread * unit * scale
         bar = FACTOR * max(distance(theirs, true), own)
-        if distance(mine, true) > bar:
+        if not within(distance(mine, true), bar):
             over.append(f"{name}: {distance(mine, true):.3e} from float64 (rms), "
                         f"the reference {distance(theirs, true):.3e}, allowed {bar:.3e}")
     assert not over, "\n".join(over)
@@ -201,7 +209,7 @@ def assert_as_exact_over_orders(dew, reference, label: str) -> None:
     dew, reference = np.asarray(dew, np.float64), np.asarray(reference, np.float64)
     assert dew.shape == reference.shape == (ORDERS,), f"{label}: {dew.shape} and {reference.shape} orders"
     mine, theirs = float(np.sqrt(np.mean(dew ** 2))), float(np.sqrt(np.mean(reference ** 2)))
-    assert mine <= FACTOR * theirs, (
+    assert within(mine, FACTOR * theirs), (
         f"{label}: dew is {mine:.3e} from float64 (rms over {ORDERS} orders), the reference "
         f"{theirs:.3e} (ratio {mine / theirs:.2f}, allowed {FACTOR})")
 
@@ -217,7 +225,7 @@ def assert_computes_the_oracle(reference_in_float64, truth, label: str, *, round
     leaves the float64 runs a few ulps apart all the same."""
     eps = float(np.finfo(np.float64).eps)
     apart, scale = distance(reference_in_float64, truth), float(np.sqrt(np.mean(np.square(truth))))
-    assert apart <= FACTOR * roundings * eps * scale, (
+    assert within(apart, FACTOR * roundings * eps * scale), (
         f"{label}: the reference in float64 is {apart:.3e} from the oracle (rms), more than float64 "
         f"rounding over {roundings} steps of its scale {scale:.3e}")
 
@@ -264,6 +272,6 @@ def assert_rounds_where_the_reference_does(dew, reference, truth, label: str) ->
     """Dew within a quarter of the reference's RMS rounding error of the
     reference's own output."""
     apart, theirs = distance(dew, reference), distance(reference, truth)
-    assert apart <= theirs / 4, (
+    assert within(apart, theirs / 4), (
         f"{label}: dew is {apart:.3e} from the reference (rms), whose own error is {theirs:.3e} "
         f"(ratio {apart / theirs:.2f}, allowed 0.25)")
