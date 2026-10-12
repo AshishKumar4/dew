@@ -164,6 +164,7 @@ def test_tokamax_takes_the_calls_it_takes_before_flash(monkeypatch, generation, 
     monkeypatch.setattr(jax, 'default_backend', lambda: 'gpu')
     monkeypatch.setattr(attention, 'bf16_dot_runs', lambda: True)
     monkeypatch.setattr(kernels.generation, 'device_generation', lambda: generation)
+    monkeypatch.setattr(attention, 'device_generation', lambda: generation)
     found = util.find_spec
     monkeypatch.setattr(util, 'find_spec', lambda name: object() if name == 'tokamax' else found(name))
     monkeypatch.setattr(attention, 'flash_architectures', lambda: ('sm80', 'sm120'))
