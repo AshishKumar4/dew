@@ -770,7 +770,7 @@ def export_config(model) -> Mapping[str, object]:
     sliding = model.kind_of('sliding_attention') if 'sliding_attention' in types else None
     local_theta = None if sliding is None or sliding.rope_theta == model.rope_theta else sliding.rope_theta
     # Gemma3TextConfig and Olmo3Config give an unstated sliding base their
-    # own default rather than rope_theta (`read_rope`'s local_default), so a
+    # own default rather than rope_theta (`RopeSpelling.local_theta`), so a
     # sliding model of theirs states both bases.
     if sliding is not None and family.export_model_type in ('gemma3_text', 'olmo3'):
         local_theta = sliding.rope_theta or model.rope_theta

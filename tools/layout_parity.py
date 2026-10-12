@@ -402,7 +402,7 @@ def _trainer(case, fields: dict[str, int], *, one_device: bool = False, accumula
             abstract = jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype), held)
             refuse_wide_floats(abstract, self.device_mesh)
             shardings = self.shardings(abstract)
-            self.layout.check(abstract.variables, shardings.variables, self.device_mesh)
+            self.check(abstract.variables, shardings.variables)
             # The mesh axes the variables split over, with their sizes: an
             # initializer drawn under a split the case has not drawn under
             # yet could come out different, so that split draws its own.
