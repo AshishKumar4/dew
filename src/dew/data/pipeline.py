@@ -120,6 +120,26 @@ class Bound:
 
 
 @dataclasses.dataclass(frozen=True)
+class Batched:
+    """A function of `size` records at a time, which returns any number of
+    records, as Hugging Face's `map(batched=True)`; the last group of a
+    finite pass may be smaller."""
+
+    step: Callable[[list[Batch]], Sequence[Batch]]
+    size: int
+    identity: str | None = None
+
+
+@dataclasses.dataclass(frozen=True)
+class Native:
+    """A function of the Grain dataset the stages before it make, for a Grain
+    operation Dew does not name; the rows after it are read per share."""
+
+    function: Callable[[pygrain.MapDataset | pygrain.IterDataset], pygrain.MapDataset | pygrain.IterDataset]
+    identity: str | None = None
+
+
+@dataclasses.dataclass(frozen=True)
 class Map:
     step: RecordStep
     identity: str | None = None
@@ -277,6 +297,8 @@ type Stage = (
     | Configured
     | TokenSplit
     | TokenBudget
+    | Native
+    | Batched
 )
 
 
@@ -507,8 +529,18 @@ class Dataset:
     def group(self, length: Callable[[Batch], int], *, window: int = 64) -> Pipeline:
         return self.then(Group(LengthGroups(length, window)))
 
-    def map_batch(self, *steps: HostStep, identity: str | None = None) -> Pipeline:
-        return self.then(*(MapBatch(step, identity) for step in steps))
+    def map_batches(self, step: HostStep | Callable[[list[Batch]], Sequence[Batch]], *,
+                    size: int | None = None, identity: str | None = None) -> Pipeline:
+        """With `size`, `step` reads a list of `size` records and returns a list
+        of records, any number, as Hugging Face's `map(batched=True)` (a batched
+        tokenizer, a filter that looks at neighbours), and the chain goes on
+        record by record: `pack`, `mix` and `batch` still follow. Without
+        `size`, after `batch`, `step` runs on each training batch on the host."""
+        if size is None:
+            return self.then(MapBatch(step, identity))
+        if size < 1:
+            raise ValueError(f"map_batches reads groups of at least one record, not {size}")
+        return self.then(Batched(step, size, identity))
 
     def publish(self, url: str):
         """Run this dataset's deterministic steps once over every record and
@@ -524,9 +556,37 @@ class Dataset:
         """Each record with its field `old` under the name `new`, as `rename(caption="txt")`."""
         return self.map(_Renamed(tuple(names.items())), identity=f"dew.rename:{sorted(names.items())}")
 
-    def select(self, *fields: str) -> Pipeline:
+    def keep(self, *fields: str) -> Pipeline:
         """Each record with `fields` alone."""
-        return self.map(_Selected(fields), identity=f"dew.select:{list(fields)}")
+        return self.map(_Kept(fields), identity=f"dew.keep:{list(fields)}")
+
+    def pipe_grain(self, function: Callable[[pygrain.MapDataset | pygrain.IterDataset],
+                                            pygrain.MapDataset | pygrain.IterDataset],
+                   *, identity: str | None = None) -> Pipeline:
+        """`function` of the Grain dataset this chain makes, for a Grain
+        operation Dew does not name (`zip`, Grain's own interleave,
+        `FlatMapMapDataset`). The chain after it is read per share and
+        checkpoints through Grain's own state; `identity` names it in a run's
+        plan, its code and closure by default."""
+        return self.then(Native(function, identity))
+
+    def stats(self, records: int = 1000) -> dict[str, float]:
+        """The counts a run logs, from a fresh reader's first `records`
+        records: attempted, accepted, and dropped by reason, per source."""
+        from dew.data.compile import compile
+        from dew.data.dataset import DataPartition
+
+        chain = self if isinstance(self, Pipeline) else Pipeline(self)
+        if any(isinstance(stage, (BatchStage, TokenBudget)) for stage in chain.stages):
+            raise ValueError("stats counts records; take them before the batch")
+        loader = compile(chain.repeat().batch(1), read=chain.mode, **_loading(chain))
+        reader = loader.train(DataPartition())
+        try:
+            for _ in range(records):
+                next(reader)
+            return dict(loader.statistics())
+        finally:
+            reader.close()
 
     def read(self, mode: Read) -> Pipeline:
         """Read the stores this way, rather than as they prefer: "memory" holds
@@ -596,7 +656,7 @@ class _Renamed:
 
 
 @dataclasses.dataclass(frozen=True)
-class _Selected:
+class _Kept:
     fields: tuple[str, ...]
 
     def __call__(self, record: Batch) -> Batch:
@@ -626,11 +686,18 @@ def _shown(value: object) -> object:
 
 
 def mix(datasets: Sequence[Dataset], weights: Sequence[float] | None = None, *,
-        tokens: Callable[[Batch], int] | None = None) -> Pipeline:
+        by: Literal["records", "tokens"] = "records", field: str = "text") -> Pipeline:
     """`datasets` read together, each filling its share of a step, as Grain's
-    `mix`: `weights` are the shares, equal by default. With `tokens`, a share
-    counts each record's tokens rather than its records. Each member logs
-    under its name, its store's by default (`Dataset.named`)."""
+    `mix`: `weights` are the shares, equal by default, counted in records,
+    or with `by="tokens"` in the valid target tokens of each member's `field`.
+    Each member logs under its name, its store's by default (`Dataset.named`)."""
+    tokens = None
+    if by == "tokens":
+        from dew.data.steps.text import ValidTargets
+
+        tokens = ValidTargets(field)
+    elif by != "records":
+        raise ValueError(f"mix weighs records or tokens, not {by!r}")
     if not datasets:
         raise ValueError("mix needs at least one dataset")
     shares = (1.0,) * len(datasets) if weights is None else tuple(float(weight) for weight in weights)

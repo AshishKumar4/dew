@@ -29,6 +29,7 @@ from typing import Protocol, get_args, runtime_checkable
 
 from dew.data.pipeline import (
     Artifact,
+    Batched,
     BatchStage,
     Configured,
     Filter,
@@ -40,6 +41,7 @@ from dew.data.pipeline import (
     MapBatch,
     MapWithIndex,
     Mixture,
+    Native,
     Pack,
     Phases,
     Pipeline,
@@ -243,6 +245,10 @@ def _identity(stage: Stage, *, cache: bool = False) -> StepIdentity:
         return identity
     if isinstance(stage, Filter):
         return StepIdentity.of(stage.predicate, stage.identity, cache=cache)
+    if isinstance(stage, Native):
+        return StepIdentity.of(stage.function, stage.identity, cache=cache)
+    if isinstance(stage, Batched):
+        return StepIdentity.of(stage.step, stage.identity, cache=cache)
     return StepIdentity.of(stage)
 
 
@@ -329,7 +335,7 @@ def _random(stage: Stage) -> bool:
 def _drops(stage: Stage) -> bool:
     """Whether a stage can drop or make rows, so the rows after it are not
     the rows before it, one for one."""
-    return isinstance(stage, (Filter, FlatMap, Pack, Windows)) or (
+    return isinstance(stage, (Filter, FlatMap, Pack, Windows, Native, Batched)) or (
         isinstance(stage, (Map, MapWithIndex, RandomMap)) and stage.rejects
     )
 

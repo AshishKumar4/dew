@@ -99,7 +99,7 @@ def test_global_position_resumes_across_share_counts_with_rng():
 
 def test_host_steps_are_branch_scoped_and_common_steps_run_on_both():
     prefix = Pipeline(source(8))
-    data = compile(prefix.batch(4).map_batch(Shift(10)), validation=prefix.batch(4),
+    data = compile(prefix.batch(4).map_batches(Shift(10)), validation=prefix.batch(4),
                    host=(Shift(100),), loading=READ)
     train = data.train(DataPartition())
     held = data.val(DataPartition())
@@ -136,7 +136,7 @@ def test_cache_refuses_random_prefix_before_opening_the_artifact():
 
 def test_map_batch_before_batch_and_random_validation_are_named_refusals():
     with pytest.raises(ValueError, match=r"map_batch.*batch"):
-        compile(Pipeline(source()).map_batch(Shift(1)).batch(4), loading=READ)
+        compile(Pipeline(source()).map_batches(Shift(1)).batch(4), loading=READ)
     with pytest.raises(ValueError, match=r"validation.*Draw.*canonical"):
         compile(Pipeline(source()).batch(4),
                 validation=Pipeline(source()).shuffle(0).random_map(Draw()).batch(4), loading=READ)

@@ -102,3 +102,51 @@ def test_dropped_records_are_the_same_whole_sharded_and_resumed():
         finally:
             resumed.close()
     assert b'"third"' in state
+
+
+def tokenized_in_batches(rows: list[dict]) -> list[dict]:
+    """A preprocessing batch: one call for several records, as a batched tokenizer runs, which
+    keeps the even ones."""
+    doubled = 2 * np.asarray([row["i"] for row in rows])
+    return [{"i": row["i"], "doubled": twice} for row, twice in zip(rows, doubled,
+                                                                    strict=True) if row["i"] % 2 == 0]
+
+
+def test_map_batches_runs_on_groups_and_the_chain_goes_on_by_record_through_a_resume():
+    """A step over groups of five records, which returns fewer, then the training batch: each kept
+    record once, the batched work done, and a resumed reader continues exactly."""
+    chain = Memory(rows("a", 30)).shuffle(4).repeat().map_batches(tokenized_in_batches, size=5).batch(5)
+    data = compile(chain, read="indexed", loading=READ)
+    reader = data.train(DataPartition())
+    try:
+        first = [next(reader) for _ in range(3)]
+        state = reader.get_state()
+        rest = [next(reader)["i"].tolist() for _ in range(3)]
+    finally:
+        reader.close()
+    assert sorted(np.concatenate([batch["i"] for batch in first]).tolist()) == list(range(0, 30, 2))
+    assert all(np.array_equal(batch["doubled"], 2 * batch["i"]) for batch in first)
+    resumed = data.train(DataPartition())
+    try:
+        resumed.set_state(state)
+        assert [next(resumed)["i"].tolist() for _ in range(3)] == rest
+    finally:
+        resumed.close()
+
+
+def test_stats_counts_a_fresh_pass_and_mix_weighs_tokens():
+    """stats reads a fresh reader and reports its drops by reason; a mix by tokens gives each member
+    its share of target tokens, not of records."""
+    counts = Memory(rows("a", 40)).filter_map(drop_thirds).stats(10)
+    assert any(key.endswith("/third") and value > 0 for key, value in counts.items())
+    short = Memory([{"text": np.arange(3, dtype=np.int32), "origin": "short"} for _ in range(64)])
+    long = Memory([{"text": np.arange(9, dtype=np.int32), "origin": "long"} for _ in range(64)])
+    mixed = mix([short.shuffle(0).repeat(), long.shuffle(1).repeat()], by="tokens")
+    data = compile(mixed.keep("origin").batch(8), read="indexed", loading=READ)
+    reader = data.train(DataPartition())
+    try:
+        origins = np.concatenate([next(reader)["origin"] for _ in range(40)])
+    finally:
+        reader.close()
+    # Three-token records carry two targets each, nine-token records eight: equal targets, four short to one long.
+    assert np.mean(origins == "short") == pytest.approx(0.8, abs=0.05)
