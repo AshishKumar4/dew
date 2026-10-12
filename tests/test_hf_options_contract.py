@@ -222,3 +222,47 @@ else:
     result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
                             env={**os.environ, "PYTHONPATH": "src"}, timeout=30, check=False)
     assert result.returncode == 0, result.stderr
+
+
+def test_a_memory_read_of_a_hub_image_split_holds_its_encoded_images(tmp_path, monkeypatch):
+    """A Hub image split's records are the encoded images it stores, which
+    the image steps decode: a memory read of the flowers set held every
+    decoded image (9.3 GB for 6,552 of them, tutorial 01), where this holds
+    the split. The images still come out decoded, resized and exact."""
+    import io
+
+    import datasets
+    import numpy as np
+    from huggingface_hub import HfApi
+    from huggingface_hub.hf_api import GitRefs
+    from PIL import Image as PILImage
+
+    from dew.data import DataPartition, Images, Loading, load
+
+    pixels = [np.full((8, 8, 3), 30 * index, np.uint8) for index in range(4)]
+    encoded = []
+    for value in pixels:
+        buffer = io.BytesIO()
+        PILImage.fromarray(value).save(buffer, format="PNG")
+        encoded.append({"bytes": buffer.getvalue(), "path": None})
+    rows = tmp_path / "images.parquet"
+    datasets.Dataset.from_dict({"image": encoded}).cast_column("image", datasets.Image()).to_parquet(rows)
+    builder = datasets.load_dataset_builder("parquet", data_files={"train": str(rows)},
+                                            cache_dir=str(tmp_path / "arrow"))
+    builder.download_and_prepare()
+    monkeypatch.setattr(HfApi, "dataset_info", lambda self, repo_id, **kwargs: SimpleNamespace(sha="frozen"))
+    monkeypatch.setattr(HfApi, "list_repo_files", lambda self, repo_id, **kwargs: ["train.tar"])
+    monkeypatch.setattr(HfApi, "list_repo_refs",
+                        lambda self, repo_id, **kwargs: GitRefs(branches=[], converts=[], tags=[]))
+    monkeypatch.setattr(datasets, "load_dataset_builder", lambda *args, **kwargs: builder)
+    held = Hub("acme/images").records("memory")
+    assert [held[index]["image"]["bytes"] for index in range(4)] == [value["bytes"] for value in encoded]
+    data = load(Images(Hub("acme/images"), image_size=8, augment=None), batch=4, read="memory",
+                loading=Loading(workers=0, threads=1, read_buffer=1))
+    reader = data.train(DataPartition())
+    try:
+        batch = next(reader)
+    finally:
+        reader.close()
+    assert sorted(int(image[0, 0, 0]) for image in batch["image"]) == [0, 30, 60, 90]
+
