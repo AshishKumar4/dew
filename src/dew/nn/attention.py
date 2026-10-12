@@ -294,7 +294,7 @@ def _xla_rms_normalized(x, scale, epsilon: float, dtype, scale_offset: bool, sca
 
 
 def rms_normalized(x, scale, epsilon: float, dtype, scale_offset: bool, scale_after_cast: bool,
-                   fp32_statistics: bool, *, implementation: str = 'auto'):
+                   fp32_statistics: bool, *, implementation: str = 'auto', axes=None):
     """Normalize the last axis and apply an optional vector weight.
 
     `scale_offset` adds one to the stored weight; `scale_after_cast` rounds
@@ -305,11 +305,51 @@ def rms_normalized(x, scale, epsilon: float, dtype, scale_offset: bool, scale_af
     narrow input, weight and per-row inverse RMS, not fp32 activations.
     Unsupported variants run the checkpointed XLA reference instead
     (`norm_swiglu.rms_kernel`), including float64 and input-dtype statistics.
+    `axes`, `x`'s logical axes, place the kernel's rows on a mesh; without
+    them a split mesh runs XLA.
     """
-    chosen = norm_swiglu.rms_kernel(implementation, x, scale, dtype, fp32_statistics)
+    return stream_rms_normalized(x, None, scale, epsilon, dtype, scale_offset, scale_after_cast,
+                                 fp32_statistics, implementation=implementation, axes=axes)[1]
+
+
+def stream_rms_normalized(x, branch, scale, epsilon: float, dtype, scale_offset: bool,
+                          scale_after_cast: bool, fp32_statistics: bool, *, implementation: str = 'auto',
+                          axes=None):
+    """A pre-norm block's seam: the residual stream `x` plus `branch` (None
+    adds nothing) and that stream's `rms_normalized`, as `(stream, normed)`.
+
+    The caller carries the returned stream on, so the fused kernel
+    (`norm_swiglu.stream_rms_norm`) owns both ends of the norm: its forward
+    reads the two addends once and writes the sum beside the norm, and its
+    reverse adds the stream's own cotangent to the norm's in the same pass.
+    XLA's add and norm are the portable path and the oracle.
+    """
+    chosen = norm_swiglu.rms_kernel(implementation, x, scale, dtype, fp32_statistics, branch=branch,
+                                    axes=axes)
     if chosen == 'pallas':
-        return norm_swiglu.rms_norm(x, scale, epsilon, dtype, scale_offset, scale_after_cast)
-    return _xla_rms_normalized(x, scale, epsilon, dtype, scale_offset, scale_after_cast, fp32_statistics)
+        return norm_swiglu.stream_rms_norm(x, branch, scale, epsilon, dtype, scale_offset, scale_after_cast,
+                                           axes=axes)
+    stream = x if branch is None else x + branch
+    return stream, _xla_rms_normalized(stream, scale, epsilon, dtype, scale_offset, scale_after_cast,
+                                       fp32_statistics)
+
+
+def gated_rms_normalized(x, gate, scale, epsilon: float, dtype, activation: str, *,
+                         implementation: str = 'auto', axes=None):
+    """Qwen3-Next's gated norm (`Qwen3NextRMSNormGated`,
+    modeling_qwen3_next.py:57-74): `x` normalized in fp32, times `scale`,
+    times `activation(gate)` ('silu' or 'sigmoid'), cast once to `dtype`.
+    The fused kernel (`norm_swiglu.gated_rms_norm`) reads both inputs once a
+    pass; XLA's arithmetic is the portable path and the oracle. `axes`, the
+    inputs' logical axes, place the kernel's rows on a mesh.
+    """
+    chosen = norm_swiglu.gated_rms_kernel(implementation, x, gate, scale, dtype, activation, axes=axes)
+    if chosen == 'pallas':
+        return norm_swiglu.gated_rms_norm(x, gate, scale, epsilon, dtype, activation, axes=axes)
+    wide = at_least_fp32(x.dtype)
+    y = unweighted_rmsnorm(x.astype(wide), epsilon, implementation='xla') * scale.astype(wide)
+    gate = gate.astype(wide)
+    return (y * (jax.nn.silu(gate) if activation == 'silu' else jax.nn.sigmoid(gate))).astype(dtype)
 
 
 @functools.partial(normalized_in_fp32, static_argnums=(3, 4))
@@ -380,15 +420,23 @@ class RMSNorm(nn.Module):
     dtype: Dtype | None = None
     implementation: str = 'auto'
 
+    def __call__(self, x, *, axes=None):
+        """The norm of `x`. `axes`, `x`'s logical axes, place the fused kernel on a mesh."""
+        return self.seam(x, axes=axes)[1]
+
     @nn.compact
-    def __call__(self, x):
+    def seam(self, x, branch=None, *, axes=None):
+        """A pre-norm block's residual seam: `(stream, normed)` for the stream
+        `x + branch` (`x` for a None branch) and its norm, whose fused kernel
+        owns the add and the stream's cotangent (`stream_rms_normalized`)."""
         dtype = self.dtype if self.dtype is not None else x.dtype
         scale = self.param(
             'scale',
             nn.initializers.zeros if self.scale_offset else nn.initializers.ones,
             (x.shape[-1],), jnp.float32) if self.with_scale else None
-        return rms_normalized(x, scale, self.epsilon, dtype, self.scale_offset,
-                              self.scale_after_cast, self.fp32_statistics, implementation=self.implementation)
+        return stream_rms_normalized(x, branch, scale, self.epsilon, dtype, self.scale_offset,
+                                     self.scale_after_cast, self.fp32_statistics,
+                                     implementation=self.implementation, axes=axes)
 
 
 class LayerNorm(nn.Module):

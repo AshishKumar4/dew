@@ -1,63 +1,101 @@
-"""Row RMSNorm and elementwise SwiGLU, with hand-written reverse passes.
+"""Row RMSNorm, its residual seam and its gated form, and elementwise SwiGLU,
+with hand-written reverse passes.
 
-Qwen3.5-0.8B's decision step (A100-80, 8 x 3072 tokens, 936 ms) spent 49 ms in
-norms, 44.6 ms in reduction fusions, and 31.7 ms in SwiGLU. Liger's torch
-reference spent 12.5 ms in all reductions and 19.2 ms in SwiGLU. These
-kernels follow linkedin/Liger-Kernel's ops/rms_norm.py and ops/swiglu.py:
-save only a row's inverse RMS, accumulate weight gradients per program,
-and recompute sigmoid from the two narrow SwiGLU inputs in reverse.
+The kernels follow linkedin/Liger-Kernel's ops/rms_norm.py, ops/fused_add_rms_norm.py
+and ops/swiglu.py: save only a row's inverse RMS, accumulate weight gradients
+per program, and recompute sigmoid from the two narrow SwiGLU inputs in
+reverse. The gated norm is Qwen3-Next's output norm (fla's FusedRMSNormGated
+computes the same function).
+
+The norm alone lost to XLA's fusions on a Qwen3.5-0.8B step (a Clef full fine-tune,
+4 x 3072 rows, A100-40, main 2215b81fc): the norms cost 16.3 ms a step against
+XLA's 12.5. Its reverse pass ran at 44% of HBM bandwidth, the residual
+stream's gradient joined it in a separate 72 MiB pass that XLA had fused into
+its own reverse fusion, and a latency-bound third kernel summed the weight
+gradient. So the norm owns a pre-norm block's seam (`stream_rms_norm`): its
+forward reads the stream and the branch once and writes their sum beside the
+norm, and its reverse adds the stream's own cotangent to the norm's in the
+one pass. Each program keeps its weight-gradient sums in a register tile,
+elementwise, and XLA sums the programs' compensated pairs.
+
+Device time per call at Qwen3.5-0.8B's shapes (4 x 3072 rows of 1024, bf16; the gated
+norm over 16 heads of 128, its bar fla 0.5.2's FusedRMSNormGated in the Liger
+column) against XLA's fusions of the same math, and the torch bar (torch
+2.11/2.14, Liger 0.8.4), each in one session: the forward, then its reverse
+after "/" with the forward recomputed or after ";" alone, in us.
+
+    A100-SXM4-40GB          XLA            fused          Inductor       Liger (fla)
+    seam (add + norm)       103 / 200      76 / 187       76 / 179       76 / 299
+    gated norm              123 ; 343      118 ; 224      116 ; 218      114 ; 198
+    SwiGLU                  235 ; 361      193 ; 320      196 ; 319      195 ; 324
+    H100 80GB HBM3 (SXM)
+    seam (add + norm)       44 / 89        36 / 81        36 / 88        35 / 163
+    gated norm              59 ; 149       52 ; 101       53 ; 105       51 ; 96
+    SwiGLU                  113 ; 171      87 ; 147       88 ; 146       88 ; 147
+
+In Qwen3.5-0.8B's profiled step the norms took 19.0 ms on the A100 and 18.6 ms on the
+H100 SXM under XLA and 15.4 and 13.7 fused; SwiGLU 12.7 and 16.0 against
+12.4 and 13.6. The gated norm's reverse is the one behind its bar (fla's,
+by 13% on the A100 and 5% on the H100).
 
 Dew's portable rounded_to also rounds cotangents. These fused VJPs instead
 use Liger's numerical contract: fp32 intermediate gradients and one cast at
-each gradient output. Forwards retain the model's cast sites, including
-cast-before-scale RMSNorm and SiLU rounded before the up product. RMSNorm's
-weight gradient reads that forward's rounded activation; SwiGLU's backward
-recomputes SiLU in fp32, as Liger does. At c53's [257,127] bf16 shape, Liger's
-norm dx was 1.26e-3 RMS from float64 against the rounded VJP's 1.78e-3;
-SwiGLU's gate gradient was 1.00e-3 against 1.45e-3 (A100). No generation
-selects these kernels until c53 measures their physical GPU kernel times.
+each gradient output, the stream's cotangent included. Forwards retain the
+model's cast sites, including cast-before-scale RMSNorm and SiLU rounded
+before the up product, and the seam's sum rounds as the block's own add does.
+RMSNorm's weight gradient reads that forward's rounded activation; SwiGLU's
+backward recomputes SiLU in fp32, as Liger does. At c53's [257,127] bf16
+shape, Liger's norm dx was 1.26e-3 RMS from float64 against the rounded VJP's
+1.78e-3; SwiGLU's gate gradient was 1.00e-3 against 1.45e-3 (A100).
 
 The fp32 activation/input-gradient tests hold relative differences below
-1e-5. Weight gradients keep Liger's rounded forward coefficient. Their
-whole-function RMS error uses the project's unchanged 2x-XLA float64
-budget. Accumulation is separately judged by the exact float64 sum of
-the identical rounded factors, within XLA's sum error plus one final
-rounding, and at 24,576 rows within 2 ulp outright. The
-A100 verify found a 24,576-row fp32 dscale at 4.91e-3 RMS from float64,
-against XLA's 1.22e-3. Both accumulation levels now retain separate fp32
-Neumaier sums/corrections, instead of a left fold followed by plain sum.
-The bf16 tests compare outputs and every gradient against float64, not
-bitwise against XLA's differently rounded autodiff. Forward midpoint flips
-can also differ by one ulp because reductions group differently. c53 keeps
-both distances and maximum-relative differences in its measurement report.
+1e-5. Every output and gradient keeps the project's 2x-XLA float64 budget.
+Weight-gradient accumulation is separately judged by the exact float64 sum
+of the identical rounded factors, within XLA's sum error plus one final
+rounding, and at 24,576 rows within 2 ulp outright: every product is kept
+exactly as an fp32 pair and compensated (Neumaier) into its program's tile,
+the tile's rows meet pairwise with their roundings kept, and the programs'
+pairs meet by Knuth's TwoSum (an A100's earlier left fold was 4.91e-3 RMS
+from float64 at 24,576 rows against XLA's 1.22e-3). The bf16 tests compare
+outputs and every gradient against float64, not bitwise against XLA's
+differently rounded autodiff.
 """
-
 import functools
 import math
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
+from jax.custom_derivatives import CustomVJPPrimal, SymbolicZero
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import triton as plgpu
 from jax.interpreters.ad import JVPTracer
 
-from ..precision import rounded_to
-from ..sharding import seen_whole
+from ..precision import at_least_fp32, compensated_add, rounded_to
+from ..sharding import logical_spec, manual_map
 from . import generation
 from .generation import first_refusal
 
 IMPLEMENTATIONS = ('auto', 'xla', 'pallas')
 DTYPES = (jnp.dtype(jnp.float32), jnp.dtype(jnp.bfloat16))
-ROW_ELEMENTS = 4096
-MAX_PROGRAMS = 256
+ROW_ELEMENTS = 2048
+MAX_PROGRAMS = 1024
+ROW_BLOCKS = 12
 ELEMENT_BLOCK = 1024
-SCALE_BLOCK = 128
+
+
+def _programs(rows: int, width: int) -> int:
+    """The reverse pass's programs: each walks at least `ROW_BLOCKS` row
+    blocks, so the two fp32 partial rows it writes stay a small share of
+    what it reads, up to `MAX_PROGRAMS`."""
+    return max(1, min(MAX_PROGRAMS, pl.cdiv(rows, _row_block(width) * ROW_BLOCKS)))
 
 
 def _row_block(width: int) -> int:
-    """At most sixteen rows, with the live register tile bounded at 4096
-    elements except when a single row is wider. A 4096-wide norm takes one
-    row rather than spilling four copies of every backward intermediate."""
+    """At most sixteen rows, with the live register tile bounded at
+    `ROW_ELEMENTS` elements except when a single row is wider. A 4096-wide
+    norm takes one row rather than spilling copies of every backward
+    intermediate."""
     return min(16, max(1, ROW_ELEMENTS // pl.next_power_of_2(width)))
 
 
@@ -67,7 +105,7 @@ def _round(x, dtype, interpret: bool):
     return rounded_to(x, dtype) if interpret else x.astype(dtype).astype(x.dtype)
 
 
-def _compensated_add(total, correction, value, *, interpret: bool) -> tuple[jax.Array, jax.Array]:
+def _neumaier_add(total, correction, value, *, interpret: bool) -> tuple[jax.Array, jax.Array]:
     """Neumaier's fp32 sum: keep the lost low bits even under cancellation.
 
     Explicit add/sub rounding protects the residual from compiler fusion
@@ -151,182 +189,383 @@ def _selected(choice: str, implementation: str, refusal: str | None) -> str:
     return 'pallas' if reason is None else generation.ran_kernel(choice, 'xla', reason)
 
 
-def rms_kernel(implementation: str, x, scale, dtype, fp32_statistics: bool, *,
-                inverse_after_cast: bool = False) -> str:
-    """Resolve RMSNorm without changing its arithmetic or collecting a split
-    feature axis. Float64 and input-dtype statistics belong to XLA."""
-    return _selected('rms_norm', implementation, first_refusal(
-        (not any(isinstance(operand, JVPTracer) for operand in (x, scale)),
+def _split() -> bool:
+    """Whether a mesh axis the context leaves to the partitioner splits anything."""
+    mesh = jax.sharding.get_abstract_mesh()
+    return any(mesh.shape[name] > 1 for name in mesh.axis_names if name not in mesh.manual_axes)
+
+
+def _placed(axes, operands, *, whole_last: bool) -> bool:
+    """Whether the kernel can run on its `operands`' shards: none varies in a
+    `shard_map` that checks varying axes, and on a split mesh the caller
+    names the first one's logical axes (`axes`), which with `whole_last`
+    leave its last axis whole."""
+    if any(jax.typeof(operand).mat.varying for operand in operands if operand is not None):
+        return False
+    if not _split():
+        return True
+    first = operands[0]
+    return axes is not None and (not whole_last or len(logical_spec(axes, first.shape)) < first.ndim)
+
+
+def _per_shard(local, axes, operands, replicated):
+    """`local(*operands)` as it runs: whole where no mesh axis splits, else on
+    each shard (`manual_map`), the operands placed as `axes` names and those
+    marked `replicated` (a norm's weight) whole on every shard, so the weight's
+    gradient sums over the shards. Every output takes the first operand's place."""
+    if not _split():
+        return local(*operands)
+    spec = logical_spec(axes, operands[0].shape)
+    specs = tuple(None if operand is None else jax.sharding.PartitionSpec() if whole else spec
+                  for operand, whole in zip(operands, replicated, strict=True))
+    return manual_map(local, specs, spec)(*operands)
+
+
+def _norm_refusal(x, scale, dtype, axes, operands) -> str | None:
+    """Why the norm kernels cannot take `x` (and its weight `scale`, and the
+    other `operands`), or None: what every fused norm variant needs."""
+    return first_refusal(
+        (not any(isinstance(operand, JVPTracer) for operand in (x, scale, *operands)),
          "a JVP trace needs forward-mode derivatives; the RMSNorm kernel implements a VJP"),
-        (not inverse_after_cast, "unweighted_rmsnorm rounds the inverse, not the normalized activation"),
-        (fp32_statistics, "input-dtype statistics round each reduction step; the kernel reduces in fp32"),
         (x.dtype in DTYPES and jnp.dtype(dtype) in DTYPES,
          f"RMSNorm input {x.dtype} and output {dtype}; the kernel supports float32 and bfloat16"),
         (bool(x.shape) and x.size > 0, "RMSNorm needs nonempty rows with a feature axis"),
         (bool(x.shape) and 0 < x.shape[-1] <= 8192, "RMSNorm's register tile holds at most 8192 features"),
         (scale is None or (scale.shape == x.shape[-1:] and scale.dtype in DTYPES),
          "the kernel takes a float32 or bfloat16 vector scale, not a broadcast affine tensor"),
-        (seen_whole(x) and (scale is None or seen_whole(scale)),
-         "a mesh axis splits RMSNorm's operands; the kernel sees local whole rows"),
-    ))
+        (all(operand is None or (operand.shape == x.shape and operand.dtype == x.dtype)
+             for operand in operands),
+         "a residual branch or a gate must match the normalized input's shape and dtype"),
+        (_placed(axes, (x, scale, *operands), whole_last=True),
+         "a mesh splits RMSNorm's operands by axes the caller does not name or across its features, or "
+         "a shard_map that checks varying axes holds them, and a Pallas call states no varying type"),
+    )
 
 
-def swiglu_kernel(implementation: str, gate, up) -> str:
+def rms_kernel(implementation: str, x, scale, dtype, fp32_statistics: bool, *,
+                inverse_after_cast: bool = False, branch=None, axes=None) -> str:
+    """Resolve RMSNorm without changing its arithmetic or collecting a split
+    feature axis. Float64 and input-dtype statistics belong to XLA, and so
+    does a residual `branch` the stream's own add would broadcast or cast.
+    `axes`, `x`'s logical axes, places the kernel on a mesh (`_placed`)."""
+    return _selected('rms_norm', implementation, first_refusal(
+        (not inverse_after_cast, "unweighted_rmsnorm rounds the inverse, not the normalized activation"),
+        (fp32_statistics, "input-dtype statistics round each reduction step; the kernel reduces in fp32"),
+    ) or _norm_refusal(x, scale, dtype, axes, (branch,)))
+
+
+def gated_rms_kernel(implementation: str, x, gate, scale, dtype, activation: str, *, axes=None) -> str:
+    """Resolve the gated RMSNorm (`gated_rms_norm`), the one kernel family
+    `KERNELS` names 'rms_norm'; other gates keep their XLA arithmetic."""
+    return _selected('rms_norm', implementation, first_refusal(
+        (activation in ('silu', 'sigmoid'), f"the gated kernel gates by silu or sigmoid, not {activation!r}"),
+    ) or _norm_refusal(x, scale, dtype, axes, (gate,)))
+
+
+def swiglu_kernel(implementation: str, gate, up, *, axes=None, packed: bool = False) -> str:
     """Resolve the SiLU product only. GeGLU and SiTU keep their own XLA
-    arithmetic; broadcasting or mixed operand dtypes also stay there."""
+    arithmetic; broadcasting or mixed operand dtypes also stay there, and so
+    do a packed projection's halves, which XLA reads in place.
+    `axes`, the operands' logical axes, places the kernel on a mesh (`_placed`)."""
     return _selected('swiglu', implementation, first_refusal(
+        (not packed, "the gate and up are halves of one packed projection, which the kernel would copy out"),
         (not any(isinstance(operand, JVPTracer) for operand in (gate, up)),
          "a JVP trace needs forward-mode derivatives; the SwiGLU kernel implements a VJP"),
         (gate.dtype in DTYPES and gate.dtype == up.dtype,
          "SwiGLU needs matching float32 or bfloat16 operands"),
         (gate.shape == up.shape and bool(gate.shape) and gate.size > 0,
          "SwiGLU needs nonempty equal shapes, not broadcasting"),
-        (seen_whole(gate) and seen_whole(up),
-         "a mesh axis splits SwiGLU's operands; the kernel sees local whole arrays"),
+        (_placed(axes, (gate, up), whole_last=False),
+         "a mesh splits SwiGLU's operands by axes the caller does not name, or a shard_map that checks "
+         "varying axes holds them, and a Pallas call states no varying type"),
     ))
 
 
-def _weight(scale_ref, columns, width: int, offset: bool, interpret: bool):
-    scale = plgpu.load(scale_ref.at[columns], mask=columns < width, other=0)
+def _weight(scale_ref, columns, width: int, offset: bool, stored, interpret: bool):
+    weight = plgpu.load(scale_ref.at[columns], mask=columns < width, other=0).astype(jnp.float32)
     # The offset adds in the stored weight's dtype, including a bf16 weight.
-    weight = scale.astype(jnp.float32)
-    return _round(weight + 1.0, scale.dtype, interpret) if offset else weight
+    return _round(weight + 1.0, stored, interpret) if offset else weight
 
 
-def _rms_forward(x_ref, scale_ref, y_ref, inverse_ref, *, epsilon: float,
-                 offset: bool, after_cast: bool, interpret: bool):
+def _activated(gate, activation: str) -> tuple[jax.Array, jax.Array]:
+    """A gated norm's fp32 gate `act(gate)` and its derivative, for 'silu' or 'sigmoid'."""
+    sigmoid = jax.nn.sigmoid(gate)
+    if activation == 'sigmoid':
+        return sigmoid, sigmoid * (1.0 - sigmoid)
+    activated = gate * sigmoid
+    return activated, activated * (1.0 - sigmoid) + sigmoid
+
+
+def _rms_forward(x_ref, branch_ref, scale_ref, gate_ref, y_ref, stream_ref, inverse_ref, *, epsilon: float,
+                 offset: bool, stored, after_cast: bool, activation: str, interpret: bool):
     rows, width = x_ref.shape
     columns = jnp.arange(pl.next_power_of_2(width))
     row_block = _row_block(width)
     row = pl.program_id(0) * row_block + jnp.arange(row_block)
+    at = (row[:, None], columns[None, :])
     mask = (row[:, None] < rows) & (columns[None, :] < width)
-    x = plgpu.load(x_ref.at[row[:, None], columns[None, :]], mask=mask, other=0).astype(jnp.float32)
+    x = plgpu.load(x_ref.at[at], mask=mask, other=0).astype(jnp.float32)
+    if branch_ref is not None:
+        # The residual sum rounds to the stream's dtype, as the block's own add does.
+        branch = plgpu.load(branch_ref.at[at], mask=mask, other=0)
+        x = _round(x + branch.astype(jnp.float32), stream_ref.dtype, interpret)
+        plgpu.store(stream_ref.at[at], x.astype(stream_ref.dtype), mask=mask)
     # XLA's mean multiplies by the fp32 reciprocal, not an fp32 division.
     inverse = jax.lax.rsqrt(jnp.sum(x * x, axis=1) * (1.0 / width) + epsilon)
     y = x * inverse[:, None]
     if scale_ref is not None:
         if after_cast:
             y = _round(y, y_ref.dtype, interpret)
-        y = y * _weight(scale_ref, columns, width, offset, interpret)[None, :]
-    plgpu.store(y_ref.at[row[:, None], columns[None, :]], y.astype(y_ref.dtype), mask=mask)
+        y = y * _weight(scale_ref, columns, width, offset, stored, interpret)[None, :]
+    if gate_ref is not None:
+        # The gate multiplies the weighted norm in fp32, before the one cast.
+        y = y * _activated(plgpu.load(gate_ref.at[at], mask=mask, other=0).astype(jnp.float32), activation)[0]
+    plgpu.store(y_ref.at[at], y.astype(y_ref.dtype), mask=mask)
     plgpu.store(inverse_ref.at[row], inverse, mask=row < rows)
 
 
-def _rms_backward(x_ref, scale_ref, inverse_ref, dy_ref, dx_ref, partial_ref, correction_ref, *,
-                  offset: bool, after_cast: bool, interpret: bool):
+def _pairwise(values, *, interpret: bool) -> tuple[jax.Array, jax.Array]:
+    """A power-of-two tile's rows summed pairwise, each level's rounding
+    kept: the fp32 sum per column and the low bits it lost."""
+    lost = jnp.zeros_like(values)
+    while values.shape[0] > 1:
+        left, right = jnp.split(values, 2, axis=0)
+        left_lost, right_lost = jnp.split(lost, 2, axis=0)
+        values, lost = _neumaier_add(left, left_lost + right_lost, right, interpret=interpret)
+    return values.reshape(values.shape[1:]), lost.reshape(lost.shape[1:])
+
+
+def _rms_backward(x_ref, scale_ref, gate_ref, inverse_ref, dy_ref, stream_ref, dx_ref, dgate_ref, partial_ref,
+                  correction_ref, *, offset: bool, stored, after_cast: bool, activation: str,
+                  interpret: bool):
     rows, width = x_ref.shape
     columns = jnp.arange(pl.next_power_of_2(width))
     groups = pl.num_programs(0)
     group = pl.program_id(0)
     row_block = _row_block(width)
-    weight = _weight(scale_ref, columns, width, offset, interpret) if scale_ref is not None else 1.0
+    weight = _weight(scale_ref, columns, width, offset, stored, interpret) if scale_ref is not None else 1.0
 
     def block(i, accumulated):
         row = (i * groups + group) * row_block + jnp.arange(row_block)
+        at = (row[:, None], columns[None, :])
         mask = (row[:, None] < rows) & (columns[None, :] < width)
-        x = plgpu.load(x_ref.at[row[:, None], columns[None, :]], mask=mask, other=0).astype(jnp.float32)
-        dy = plgpu.load(dy_ref.at[row[:, None], columns[None, :]], mask=mask, other=0).astype(jnp.float32)
+        x = plgpu.load(x_ref.at[at], mask=mask, other=0).astype(jnp.float32)
+        dy = plgpu.load(dy_ref.at[at], mask=mask, other=0).astype(jnp.float32)
         inverse = plgpu.load(inverse_ref.at[row], mask=row < rows, other=0)
+        normalized = x * inverse[:, None]
+        if after_cast:
+            normalized = _round(normalized, dy_ref.dtype, interpret)
+        if gate_ref is not None:
+            # The gate's cotangent reads the weighted norm; the norm's, the gated one.
+            activated, slope = _activated(plgpu.load(gate_ref.at[at], mask=mask, other=0).astype(jnp.float32),
+                                          activation)
+            dgate = dy * (normalized * weight) * slope
+            plgpu.store(dgate_ref.at[at], dgate.astype(dgate_ref.dtype), mask=mask)
+            dy = dy * activated
         m = dy * weight
         # The two x contributions are kept separate, as XLA's square VJP is.
         correction = (-0.5 * jnp.sum(m * x, axis=1)) * (inverse * inverse * inverse) * (1.0 / width)
         dx = m * inverse[:, None] + (2.0 * x) * correction[:, None]
-        plgpu.store(dx_ref.at[row[:, None], columns[None, :]], dx.astype(dx_ref.dtype), mask=mask)
-        if scale_ref is not None:
-            # Reduce every term accurately, not a rounded row-block sum
-            # whose error compensation at the outer level cannot recover.
-            for lane in range(row_block):
-                at = (i * groups + group) * row_block + lane
-                valid = (at < rows) & (columns < width)
-                value = plgpu.load(x_ref.at[at, columns], mask=valid, other=0).astype(jnp.float32)
-                cotangent = plgpu.load(dy_ref.at[at, columns], mask=valid, other=0).astype(jnp.float32)
-                rstd = plgpu.load(inverse_ref.at[at], mask=at < rows, other=0)
-                normalized = value * rstd
-                if after_cast:
-                    normalized = _round(normalized, dy_ref.dtype, interpret)
-                product, low = _product_parts(cotangent, normalized, interpret=interpret)
-                accumulated = _compensated_add(accumulated[0], accumulated[1], product, interpret=interpret)
-                accumulated = _compensated_add(accumulated[0], accumulated[1], low, interpret=interpret)
-        return accumulated
+        if stream_ref is not None:
+            # The stream's own cotangent joins in fp32, one rounding for the sum.
+            dx = dx + plgpu.load(stream_ref.at[at], mask=mask, other=0).astype(jnp.float32)
+        plgpu.store(dx_ref.at[at], dx.astype(dx_ref.dtype), mask=mask)
+        if scale_ref is None:
+            return accumulated
+        # Every product exact as a pair, compensated (Neumaier) into the
+        # program's own tile of sums: elementwise, nothing crosses threads
+        # until the tile's rows meet pairwise once, after the loop.
+        product, low = _product_parts(dy, normalized, interpret=interpret)
+        total, kept = _neumaier_add(accumulated[0], accumulated[1], product, interpret=interpret)
+        return total, kept + low
 
+    shape = (row_block, columns.shape[0])
     partial, correction = jax.lax.fori_loop(0, pl.cdiv(rows, groups * row_block), block,
-                                           (jnp.zeros(columns.shape, jnp.float32),
-                                            jnp.zeros(columns.shape, jnp.float32)))
+                                           (jnp.zeros(shape, jnp.float32), jnp.zeros(shape, jnp.float32)))
     if partial_ref is not None:
+        partial, lost = _pairwise(partial, interpret=interpret)
         plgpu.store(partial_ref.at[group, columns], partial, mask=columns < width)
-        plgpu.store(correction_ref.at[group, columns], correction, mask=columns < width)
+        plgpu.store(correction_ref.at[group, columns], lost + jnp.sum(correction, axis=0),
+                    mask=columns < width)
 
 
-def _rms_scale_reduce(partial_ref, correction_ref, scale_ref, *, interpret: bool):
-    """Combine both fp32 parts before the only final cast to the scale dtype."""
-    groups, width = partial_ref.shape
-    columns = pl.program_id(0) * SCALE_BLOCK + jnp.arange(SCALE_BLOCK)
-    def group(i, accumulated):
-        high = plgpu.load(partial_ref.at[i, columns], mask=columns < width, other=0)
-        low = plgpu.load(correction_ref.at[i, columns], mask=columns < width, other=0)
-        added = _compensated_add(accumulated[0], accumulated[1], high, interpret=interpret)
-        return _compensated_add(added[0], added[1], low, interpret=interpret)
-    total, correction = jax.lax.fori_loop(0, groups, group,
-                                         (jnp.zeros(columns.shape, jnp.float32),
-                                          jnp.zeros(columns.shape, jnp.float32)))
-    plgpu.store(scale_ref.at[columns], (total + correction).astype(scale_ref.dtype), mask=columns < width)
+def _scale_sum(partial, correction):
+    """The programs' compensated parts summed over programs as compensated
+    pairs (`compensated_add`), one XLA column reduction."""
+    zero = jnp.zeros((), jnp.float32)
+    total, lost = jax.lax.reduce((partial, correction), (zero, zero), compensated_add, (0,))
+    return total + lost
 
 
-def _rms_with_inverse(x, scale, epsilon: float, dtype, offset: bool, after_cast: bool,
-                      interpret: bool):
+class _Norm(NamedTuple):
+    """One fused norm's static arithmetic: everything but its operands. The
+    weight reaches the kernels in fp32, `stored` its own dtype, in which the
+    offset adds; the activation gates only a norm called with a gate."""
+    epsilon: float
+    dtype: jnp.dtype
+    offset: bool
+    stored: jnp.dtype
+    after_cast: bool
+    activation: str
+    interpret: bool
+
+
+def _flat(value):
+    return None if value is None else value.reshape(math.prod(value.shape[:-1]), value.shape[-1])
+
+
+def _rms_with_inverse(x, branch, scale, gate, norm: _Norm):
+    """`(stream, y)` and the per-row inverse RMS, the stream `x + branch`, or `x` itself."""
     rows, width = math.prod(x.shape[:-1]), x.shape[-1]
-    y, inverse = pl.pallas_call(
-        functools.partial(_rms_forward, epsilon=epsilon, offset=offset, after_cast=after_cast,
-                          interpret=interpret),
+    y, stream, inverse = pl.pallas_call(
+        functools.partial(_rms_forward, epsilon=norm.epsilon, offset=norm.offset, stored=norm.stored,
+                          after_cast=norm.after_cast, activation=norm.activation, interpret=norm.interpret),
         grid=(pl.cdiv(rows, _row_block(width)),),
-        out_shape=(jax.ShapeDtypeStruct((rows, width), dtype),
+        out_shape=(jax.ShapeDtypeStruct((rows, width), norm.dtype),
+                   None if branch is None else jax.ShapeDtypeStruct((rows, width), x.dtype),
                    jax.ShapeDtypeStruct((rows,), jnp.float32)),
         compiler_params=plgpu.CompilerParams(num_warps=4, num_stages=1),
-        interpret=interpret, name="rms_norm_forward",
-    )(x.reshape(rows, width), scale)
-    return y.reshape(x.shape), inverse
+        interpret=norm.interpret, name="rms_norm_forward",
+    )(_flat(x), _flat(branch), scale, _flat(gate))
+    return (x if branch is None else stream.reshape(x.shape), y.reshape(x.shape)), inverse
 
 
-def _rms(x, scale, epsilon: float, dtype, offset: bool, after_cast: bool, interpret: bool):
-    return _rms_with_inverse(x, scale, epsilon, dtype, offset, after_cast, interpret)[0]
-
-
-def _rms_fwd(x, scale, epsilon: float, dtype, offset: bool, after_cast: bool, interpret: bool):
-    y, inverse = _rms_with_inverse(x, scale, epsilon, dtype, offset, after_cast, interpret)
-    return y, (x, scale, inverse)
-
-
-def _rms_bwd(epsilon: float, dtype, offset: bool, after_cast: bool, interpret: bool, residual, dy):
-    del epsilon, dtype
-    x, scale, inverse = residual
-    rows, width = math.prod(x.shape[:-1]), x.shape[-1]
-    groups = min(MAX_PROGRAMS, pl.cdiv(rows, _row_block(width)))
+def _rms_backward_call(stream, scale, gate, inverse, dy, ds, norm: _Norm):
+    """The stream's cotangent (the norm's plus `ds`, None for none), the
+    gate's and the weight's."""
+    if dy is None:
+        zeros = [None if value is None else jnp.zeros_like(value) for value in (stream, gate, scale)]
+        return (zeros[0] if ds is None else ds), zeros[1], zeros[2]
+    rows, width = math.prod(stream.shape[:-1]), stream.shape[-1]
+    groups = _programs(rows, width)
     partial_shape = None if scale is None else jax.ShapeDtypeStruct((groups, width), jnp.float32)
-    dx, partial, correction = pl.pallas_call(
-        functools.partial(_rms_backward, offset=offset, after_cast=after_cast, interpret=interpret),
+    dx, dgate, partial, correction = pl.pallas_call(
+        functools.partial(_rms_backward, offset=norm.offset, stored=norm.stored, after_cast=norm.after_cast,
+                          activation=norm.activation, interpret=norm.interpret),
         grid=(groups,),
-        out_shape=(jax.ShapeDtypeStruct((rows, width), x.dtype), partial_shape, partial_shape),
+        out_shape=(jax.ShapeDtypeStruct((rows, width), stream.dtype),
+                   None if gate is None else jax.ShapeDtypeStruct((rows, width), gate.dtype),
+                   partial_shape, partial_shape),
         compiler_params=plgpu.CompilerParams(num_warps=4, num_stages=1),
-        interpret=interpret, name="rms_norm_backward",
-    )(x.reshape(rows, width), scale, inverse, dy.reshape(rows, width))
-    dscale = None if scale is None else pl.pallas_call(
-        functools.partial(_rms_scale_reduce, interpret=interpret), grid=(pl.cdiv(width, SCALE_BLOCK),),
-        out_shape=jax.ShapeDtypeStruct((width,), scale.dtype),
-        compiler_params=plgpu.CompilerParams(num_warps=4, num_stages=1),
-        interpret=interpret, name="rms_norm_scale_backward",
-    )(partial, correction)
-    return dx.reshape(x.shape), dscale
+        interpret=norm.interpret, name="rms_norm_backward",
+    )(_flat(stream), scale, _flat(gate), inverse, _flat(dy), _flat(ds))
+    dscale = None if scale is None else _scale_sum(partial, correction)
+    return dx.reshape(stream.shape), None if gate is None else dgate.reshape(gate.shape), dscale
 
 
-_rms_vjp = jax.custom_vjp(_rms, nondiff_argnums=(2, 3, 4, 5, 6))
-_rms_vjp.defvjp(_rms_fwd, _rms_bwd)
+def _cotangent(value):
+    return None if isinstance(value, SymbolicZero) else value
 
 
-def rms_norm(x, scale, epsilon: float, dtype, offset: bool, after_cast: bool):
-    """The fused RMSNorm and its VJP. It interprets where no Triton GPU runs
+def _primal(value):
+    return value.value if isinstance(value, CustomVJPPrimal) else value
+
+
+def _stream_rms(x, scale, norm: _Norm):
+    return _rms_with_inverse(x, None, scale, None, norm)[0]
+
+
+def _stream_rms_fwd(x, scale, norm: _Norm):
+    x, scale = _primal(x), _primal(scale)
+    outputs, inverse = _rms_with_inverse(x, None, scale, None, norm)
+    return outputs, (x, scale, inverse)
+
+
+def _stream_rms_bwd(norm: _Norm, residual, cotangents):
+    stream, scale, inverse = residual
+    ds, dy = map(_cotangent, cotangents)
+    dx, _, dscale = _rms_backward_call(stream, scale, None, inverse, dy, ds, norm)
+    return dx, dscale
+
+
+_stream_rms_vjp = jax.custom_vjp(_stream_rms, nondiff_argnums=(2,))
+_stream_rms_vjp.defvjp(_stream_rms_fwd, _stream_rms_bwd, symbolic_zeros=True)
+
+
+def _sum_rms(x, branch, scale, norm: _Norm):
+    return _rms_with_inverse(x, branch, scale, None, norm)[0]
+
+
+def _sum_rms_fwd(x, branch, scale, norm: _Norm):
+    x, branch, scale = _primal(x), _primal(branch), _primal(scale)
+    outputs, inverse = _rms_with_inverse(x, branch, scale, None, norm)
+    return outputs, (outputs[0], scale, inverse)
+
+
+def _sum_rms_bwd(norm: _Norm, residual, cotangents):
+    stream, scale, inverse = residual
+    ds, dy = map(_cotangent, cotangents)
+    dstream, _, dscale = _rms_backward_call(stream, scale, None, inverse, dy, ds, norm)
+    # The sum's two addends share its cotangent: one buffer, read by both.
+    return dstream, dstream, dscale
+
+
+_sum_rms_vjp = jax.custom_vjp(_sum_rms, nondiff_argnums=(3,))
+_sum_rms_vjp.defvjp(_sum_rms_fwd, _sum_rms_bwd, symbolic_zeros=True)
+
+
+def _gated_rms(x, gate, scale, norm: _Norm):
+    return _rms_with_inverse(x, None, scale, gate, norm)[0][1]
+
+
+def _gated_rms_fwd(x, gate, scale, norm: _Norm):
+    (_, y), inverse = _rms_with_inverse(x, None, scale, gate, norm)
+    return y, (x, gate, scale, inverse)
+
+
+def _gated_rms_bwd(norm: _Norm, residual, dy):
+    x, gate, scale, inverse = residual
+    return _rms_backward_call(x, scale, gate, inverse, dy, None, norm)
+
+
+_gated_rms_vjp = jax.custom_vjp(_gated_rms, nondiff_argnums=(3,))
+_gated_rms_vjp.defvjp(_gated_rms_fwd, _gated_rms_bwd)
+
+
+def _norm(epsilon: float, dtype, offset: bool, after_cast: bool, scale, activation: str = 'silu') -> _Norm:
+    stored = jnp.dtype(jnp.float32 if scale is None else scale.dtype)
+    return _Norm(float(epsilon), jnp.dtype(dtype), offset, stored, after_cast, activation,
+                 not generation.triton_runs())
+
+
+def _widened(scale):
+    """The weight in fp32 for the kernels, so its gradient is summed over a
+    mesh's row shards before the cast back to its own dtype rounds it."""
+    return None if scale is None else scale.astype(at_least_fp32(scale.dtype))
+
+
+def stream_rms_norm(x, branch, scale, epsilon: float, dtype, offset: bool, after_cast: bool, *, axes=None):
+    """The pre-norm seam fused: `(stream, y)`, the stream `x + branch` (or
+    `x` itself for a None branch) and its RMSNorm. The forward reads both
+    addends once and writes the sum beside the norm; the reverse takes the
+    stream's own cotangent into the norm's pass, so the sum of the two
+    gradients is never a separate pass over the stream. An unused stream
+    output costs nothing in reverse. It interprets where no Triton GPU runs
     it (`generation.triton_runs`), as the CPU suite does, and lowers for the
     assumed GPU within `generation.assumed`, as the GDN kernels decide."""
-    return _rms_vjp(x, scale, epsilon, dtype, offset, after_cast, not generation.triton_runs())
+    norm = _norm(epsilon, dtype, offset, after_cast, scale)
+
+    def local(x, branch, scale):
+        if branch is None:
+            return _stream_rms_vjp(x, scale, norm)
+        return _sum_rms_vjp(x, branch, scale, norm)
+
+    return _per_shard(local, axes, (x, branch, _widened(scale)), (False, False, True))
+
+
+def rms_norm(x, scale, epsilon: float, dtype, offset: bool, after_cast: bool, *, axes=None):
+    """The fused RMSNorm and its VJP alone: `stream_rms_norm`'s norm."""
+    return stream_rms_norm(x, None, scale, epsilon, dtype, offset, after_cast, axes=axes)[1]
+
+
+def gated_rms_norm(x, gate, scale, epsilon: float, dtype, activation: str, *, axes=None):
+    """The gated RMSNorm fused, Qwen3-Next's: `x` normalized in fp32, times
+    `scale`, times `activation(gate)` ('silu' or 'sigmoid'), cast once to
+    `dtype`. The reverse pass reads `x`, `gate` and the cotangent once and
+    writes both input gradients beside the weight's partial sums."""
+    norm = _norm(epsilon, dtype, offset=False, after_cast=False, scale=scale, activation=activation)
+    return _per_shard(lambda x, gate, scale: _gated_rms_vjp(x, gate, scale, norm), axes,
+                      (x, gate, _widened(scale)), (False, False, True))
 
 
 def _swiglu_forward(gate_ref, up_ref, y_ref, *, interpret: bool):
@@ -381,6 +620,8 @@ _swiglu_vjp = jax.custom_vjp(_swiglu, nondiff_argnums=(2,))
 _swiglu_vjp.defvjp(_swiglu_fwd, _swiglu_bwd)
 
 
-def swiglu(gate, up):
-    """The fused SiLU product and its VJP, interpreted or lowered as `rms_norm` is."""
-    return _swiglu_vjp(gate, up, not generation.triton_runs())
+def swiglu(gate, up, *, axes=None):
+    """The fused SiLU product and its VJP, interpreted or lowered and placed
+    on a mesh as `stream_rms_norm` is."""
+    interpret = not generation.triton_runs()
+    return _per_shard(lambda gate, up: _swiglu_vjp(gate, up, interpret), axes, (gate, up), (False, False))
