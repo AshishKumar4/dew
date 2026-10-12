@@ -35,10 +35,11 @@ from dew.data.pipeline import (
     Pipeline,
     Record,
     Rejected,
+    Stage,
     TokenSplit,
     Windows,
 )
-from dew.data.plan import StepIdentity, fingerprint
+from dew.data.plan import fingerprint
 from dew.data.sources.base import Read, ShardManifest, Source
 from dew.records import JSON, integer, json_value, record
 
@@ -54,7 +55,7 @@ class _Memory:
     facts: Mapping[str, object] = dataclasses.field(default_factory=dict)
     identifiers: tuple[tuple[int, ...], ...] = ()
     inputs: int = 0
-    prefix: tuple[StepIdentity, ...] = ()
+    ran: tuple[Stage, ...] = ()
 
     def describe(self) -> str:
         return self.original.describe()
@@ -63,7 +64,7 @@ class _Memory:
         return {
             "materialized": self.original.snapshot(),
             "derived": self.derived,
-            "steps": [dataclasses.asdict(step) for step in self.prefix],
+            "steps": [dataclasses.asdict(_identity(stage)) for stage in self.ran],
         }
 
     def supports(self, read: Read) -> bool:
@@ -319,7 +320,7 @@ def _memory_order(
             facts,
             tuple(identifier for identifier, _ in rows),
             inputs,
-            tuple(_identity(stage) for stage in pipeline.stages[:consumed]),
+            pipeline.stages[:consumed],
         ),
         stages=remaining,
     )
