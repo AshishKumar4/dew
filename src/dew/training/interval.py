@@ -124,9 +124,10 @@ class Interval:
         self.model_counted |= TRAINING_FLOPS in aux
         self.tokens_counted |= TOKENS in aux
         assert self.fresh is not None
-        self.book = bookkeep(self.book, loss, finite, committed,
-                             aux.get(TRAINING_FLOPS, self.fresh.training), aux.get(TOKENS, self.fresh.tokens))
-        return self.book
+        counted: Book = bookkeep(self.book, loss, finite, committed,
+                                aux.get(TRAINING_FLOPS, self.fresh.training), aux.get(TOKENS, self.fresh.tokens))
+        self.book = counted
+        return counted
 
     def check_finite(self, step: int, display: TrainingDisplay) -> None:
         """Raise RuntimeError once the loss has been non-finite for
