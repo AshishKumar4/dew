@@ -481,6 +481,28 @@ def test_an_indexed_read_batches_the_records_memory_holds_in_full_batches():
     assert sorted(value for batch in batches for value in batch["id"]) == [0, 0, 2, 2, 3, 3]
 
 
+def _numbered(index: int, row: dict) -> dict:
+    return {**row, "at": np.int32(index)}
+
+
+def test_map_with_index_reads_each_row_at_its_source_position_in_every_epoch():
+    """Grain counts an index on across the epochs a repeat reads, but a row's
+    source position is its place in the source: four rows read twice over
+    are numbered by their ids both times, held whole or as the records
+    memory holds."""
+    whole = Pipeline(source(4))
+    missing = Pipeline(Memory([{"id": np.int32(0)}, None, {"id": np.int32(2)}, {"id": np.int32(3)}]))
+    for pipeline, rows in ((whole, 4), (missing, 3)):
+        numbered = pipeline.map_with_index(_numbered, identity="at@1")
+        data = compile(numbered.batch(2), read="indexed", loading=READ)
+        reader = data.train(DataPartition())
+        try:
+            batches = take(reader, rows)
+        finally:
+            reader.close()
+        assert all(batch["at"] == batch["id"] for batch in batches)
+
+
 def test_a_cached_indexed_root_is_cut_into_disjoint_shares_that_repeat():
     """Each share of a cached indexed read takes its own rows of the source,
     and a training read with no repeat stage goes on past one pass."""

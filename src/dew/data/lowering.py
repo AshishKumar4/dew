@@ -160,12 +160,16 @@ def _unplaced(value: Record) -> Record:
 class _Placed:
     """The source position of each row a read numbers from `start`, or of each
     output a cache holds for it; a materialized source states its rows'
-    positions (`identifiers`)."""
+    positions (`identifiers`). An indexed root numbers `rows` rows, and Grain
+    counts its index on across the epochs a repeat reads, so the position is
+    that of the row the index reads in its epoch."""
 
     start: int = 0
     identifiers: tuple[tuple[int, ...], ...] = ()
+    rows: int | None = None
 
     def __call__(self, index: int, value: Record | tuple[Record, ...]) -> Record | tuple[Record, ...]:
+        index = index if self.rows is None else index % self.rows
         position = self.identifiers[index][0] if self.identifiers else self.start + index
         if isinstance(value, tuple):
             return tuple(_placed(output, position) for output in value)
@@ -422,14 +426,16 @@ class _Build:
                 stored = pygrain.MapDataset.source(present).seed(self.seed)
                 identifiers = tuple((int(position),) for position in present.positions)
                 lengths = None if lengths is None else np.asarray(lengths)[present.positions]
-            rows = stored.map_with_index(_Placed(identifiers=identifiers)) if last >= 0 else stored
+            placed = _Placed(identifiers=identifiers, rows=len(stored))
+            rows = stored.map_with_index(placed) if last >= 0 else stored
             measured = None if lengths is None else pygrain.MapDataset.source(lengths)
             if measured is not None:
                 measured = self.shared(measured, pipeline, partition)
             return self.shared(rows, pipeline, partition), measured, 0
         filled, manifest, prefix = _fill(pipeline, source, cache, self.read)
         cached = filled.mapped(stored, manifest, source, transform=prefix)
-        view = self.shared(cached.map_with_index(_Placed()) if last > cache else cached, pipeline, partition)
+        placed = cached.map_with_index(_Placed(rows=len(cached))) if last > cache else cached
+        view = self.shared(placed, pipeline, partition)
         rows = cached.iterated(view, pygrain.ReadOptions(self.loading.threads, self.loading.read_buffer))
         flat = gx.FlatMapIterDataset(rows, _CachedOutputs())
         return Accepted(flat, _name(pipeline), budget=self.budget), None, cache + 1
