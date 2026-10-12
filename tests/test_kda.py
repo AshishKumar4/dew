@@ -303,14 +303,15 @@ def test_prefill_then_token_steps_reproduce_the_parallel_layer():
 def test_padded_rows_preserve_the_memory_and_the_history():
     """A padded slot writes nothing: the layer over a packed row with a gap
     equals the layer over the same tokens contiguous, on the real tokens."""
-    from dew.nn.inputs import AttentionMetadata
+    from dew.nn.inputs import AttentionMetadata, coordinates
 
     module, _, variables = layer_and_params(-5.0)
     x = jnp.asarray(np.random.RandomState(7).randn(1, 6, E), jnp.float32)
     valid = jnp.array([[True, True, False, True, True, False]])
     compact = x[:, jnp.array([0, 1, 3, 4])]
 
-    gapped = module.apply(variables, x, attention_metadata=AttentionMetadata(valid=valid))
+    gapped = module.apply(variables, x,
+                          attention_metadata=AttentionMetadata(coordinates=coordinates(valid=valid)))
     wanted = module.apply(variables, compact)
 
     assert scaled(np.asarray(gapped)[:, [0, 1, 3, 4]], np.asarray(wanted)) < BOUND
