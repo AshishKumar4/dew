@@ -47,6 +47,7 @@ from dew.data.dataset import (
     stream_endless,
     stream_identity,
 )
+from dew.data.pipeline import Dataset, Pipeline
 from dew.nn.flops import MissingFlopsCount
 from dew.nn.kernels.generation import assumed, gpu_mesh, gpu_target, measured_kernel
 from dew.nn.sharding import (
@@ -366,6 +367,30 @@ def _suites(dataset: Loader, validation: Mapping[str, Reader | EvalSuite] | None
         suites[name] = EvalSuite(suite.data, tuple(suite.metrics) or tuple(metrics),
                                  eval_every if suite.every is None else suite.every)
     return suites
+
+
+def _endless(chain: Pipeline) -> Pipeline:
+    """`chain` read endlessly: a repeat before its batch where it has none."""
+    from dew.data.pipeline import BatchStage, Repeat, TokenBudget
+
+    if any(isinstance(stage, Repeat) for stage in chain.stages):
+        return chain
+    batching = [index for index, stage in enumerate(chain.stages) if isinstance(stage, (BatchStage, TokenBudget))]
+    at = batching[0] if batching else len(chain.stages)
+    return dataclasses.replace(chain, stages=(*chain.stages[:at], Repeat(None), *chain.stages[at:]))
+
+
+def _batched(held: Dataset, train: Pipeline) -> Pipeline:
+    """`held` batched as `train` is, every record scored, where it states no batch of its own."""
+    from dew.data.pipeline import BatchStage
+
+    chain = held if isinstance(held, Pipeline) else Pipeline(held)
+    if any(isinstance(stage, BatchStage) for stage in chain.stages):
+        return chain
+    size = next((stage.size for stage in train.stages if isinstance(stage, BatchStage)), None)
+    if size is None:
+        raise ValueError("a validation dataset without a batch takes the training batch, which states none")
+    return chain.batch(size, drop_remainder=False)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1275,10 +1300,11 @@ class Trainer(Generic[Loss, Effects]):
 
     def fit(
         self,
-        dataset: Loader,
+        data: Dataset | Loader,
         *,
         steps: int | None = None,
-        total_tokens: int | None = None,
+        epochs: int | None = None,
+        tokens: int | None = None,
         log_every: int = 100,
         eval_every: int | None = None,
         checkpoint_every: int | datetime.timedelta | None = None,
@@ -1287,7 +1313,7 @@ class Trainer(Generic[Loss, Effects]):
         preview: bool = False,
         best: str | Metric | TrainingScalar | types.MethodType | Best | Sequence[Best] | None = None,
         stop: Plateau | None = None,
-        validation: Mapping[str, Reader | EvalSuite] | None = None,
+        validation: Dataset | Mapping[str, Dataset | Reader | EvalSuite] | None = None,
         restore_best: bool = False,
         state: TrainState | None = None,
     ) -> TrainState:
@@ -1300,7 +1326,7 @@ class Trainer(Generic[Loss, Effects]):
         Every `log_every` steps, the tracker receives the loss, the objective's
         metrics and the throughput.
 
-        `total_tokens` stops at the first microbatch that reaches this real-token
+        `tokens` stops at the first microbatch that reaches this real-token
         budget, from the same counter as `train/tokens`, persisted in checkpoints.
         Padding never counts. With both caps the first reached ends the run;
         with `steps=None`, a decaying schedule needs its own step horizon.
@@ -1327,11 +1353,15 @@ class Trainer(Generic[Loss, Effects]):
         Previews are generated only when `preview=True` and a tracker receives them;
         scalar reporting never triggers preview work.
         """
-        if steps is None and total_tokens is None:
-            raise ValueError("fit needs steps or total_tokens to name the run length")
+        if steps is epochs is tokens is None or None not in (steps, epochs):
+            raise ValueError("fit's run length is steps= or epochs=, or tokens=, which also caps either")
+        if tokens is not None and not self.objective.counts_tokens:
+            raise ValueError("tokens= needs an objective that counts real tokens")
+        dataset, validation = self._loaded(data, validation)
+        if epochs is not None:
+            steps = dataset.epoch_steps(epochs)
+        total_tokens = tokens
         count_compilation_cache()
-        if total_tokens is not None and not self.objective.counts_tokens:
-            raise ValueError("total_tokens needs an objective that counts real tokens")
         updates = None if steps is None else steps // self.accumulation
         if self._config is not None:
             built = self._config.build(updates)
@@ -1391,6 +1421,27 @@ class Trainer(Generic[Loss, Effects]):
                 step="best",
             )
         return trained
+
+    def _loaded(self, data: Dataset | Loader,
+                validation: Dataset | Mapping[str, Dataset | Reader | EvalSuite] | None,
+                ) -> tuple[Loader, Mapping[str, Reader | EvalSuite] | None]:
+        """`data` and each validation dataset compiled with the objective's own
+        stages (`Objective.data`). A training dataset without a repeat repeats
+        before its batch, so the run's length is its steps, epochs or tokens;
+        a validation dataset without a batch takes the training batch."""
+        if isinstance(data, Loader):
+            return data, validation  # type: ignore[return-value]
+        from dew.data.compile import compile, validation as validated
+
+        objective = self.objective.data()
+        train = _endless(data if isinstance(data, Pipeline) else Pipeline(data))
+        held = validation if isinstance(validation, Dataset) else None
+        loader = compile(train, validation=None if held is None else _batched(held, train),
+                         objective=objective)
+        if not isinstance(validation, Mapping):
+            return loader, None
+        return loader, {name: validated(_batched(entry, train), batch=loader.batch, objective=objective)
+                        if isinstance(entry, Dataset) else entry for name, entry in validation.items()}
 
     def _training_loop(self, plan: _FitPlan, run: _FitRun, profiler: Profiler | None,
                        tracer: Profiler | None, profile: ProfileWindow | None,

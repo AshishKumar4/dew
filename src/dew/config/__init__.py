@@ -1252,7 +1252,7 @@ class RunConfig:
                 dynamic_scale=trainer.dynamic_scale, checkpoints=checkpoints, tracker=tracker,
                 rollout=rollout, profile=trainer.profile, lower_for=trainer.lower_for,
             ).fit(
-                dataset, steps=steps, total_tokens=trainer.total_tokens,
+                dataset, steps=steps, tokens=trainer.total_tokens,
                 log_every=trainer.log_every,
                 eval_every=trainer.eval_interval(dataset),
                 checkpoint_every=trainer.checkpoint_interval(dataset),
