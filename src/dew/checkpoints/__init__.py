@@ -649,22 +649,24 @@ def _item_metadata(metadata: ocp.metadata.StepMetadata) -> Variables:
 def _read(want, dtype) -> ocp.ArrayRestoreArgs:
     """How a stored leaf is read for its template leaf `want` (None where
     there is none): in `dtype`, which Orbax casts it to on the host, where
-    `want` places it, or on the host where nothing places it or JAX cannot
-    hold that dtype (a float64 saved with x64 on, read with it off). A
-    step's leaves read in the template's dtype; a stored collection's in its
-    own, which its digest checks, and `_placed` casts and places them."""
-    sharding = getattr(want, 'sharding', None)
-    wide = not jnp.issubdtype(dtype, jax.dtypes.prng_key) and np.dtype(dtype).itemsize == 8
-    if sharding is None or (wide and not jax.config.jax_enable_x64):
+    `want` places it (a leaf `want` does not place, where it was saved), or
+    on the host where there is no template or JAX cannot hold that dtype now
+    (a float64 saved with x64 on, read with it off). A step's leaves read in
+    the template's dtype; a stored collection's in its own, which its digest
+    checks, and `_placed` casts and places them. A key reads as its data."""
+    if jnp.issubdtype(dtype, jax.dtypes.prng_key):
+        return ocp.ArrayRestoreArgs(sharding=getattr(want, 'sharding', None))
+    if want is None or jax.dtypes.canonicalize_dtype(dtype) != np.dtype(dtype):
         return ocp.ArrayRestoreArgs(restore_type=np.ndarray)
-    return ocp.ArrayRestoreArgs(sharding=sharding, dtype=dtype)
+    return ocp.ArrayRestoreArgs(sharding=getattr(want, 'sharding', None), dtype=dtype)
 
 
 def _placed(tree, template):
     """`tree`'s read leaves as `template` holds them, in its dtypes and
-    placements. A key comes back as its key data, which `request_key` types."""
+    placements. A concrete template leaf the checkpoint lacks comes back
+    itself, and a key as its key data, which `request_key` types."""
     def placed(leaf, want):
-        if jnp.issubdtype(want.dtype, jax.dtypes.prng_key) or (
+        if leaf is want or jnp.issubdtype(want.dtype, jax.dtypes.prng_key) or (
                 isinstance(leaf, jax.Array) and leaf.dtype == want.dtype):
             return leaf
         value = jnp.asarray(leaf).astype(want.dtype)
@@ -673,21 +675,14 @@ def _placed(tree, template):
     return jax.tree.map(placed, tree, template)
 
 
-def _named(path) -> tuple[str, ...]:
-    """A tree path as its keys' names, which a template's and Orbax's
-    metadata spell alike whatever node types hold them."""
-    return tuple(str(getattr(entry, 'key', getattr(entry, 'name', getattr(entry, 'idx', entry))))
-                 for entry in path)
-
-
 def _refuse_reshaped(template, stored, where: str) -> None:
     """Refuse the leaves of `template` that `stored` (Orbax's metadata) holds
     in another shape, by their names; a key is stored as its key data."""
-    held = {_named(path): tuple(meta.shape) for path, meta in jax.tree_util.tree_flatten_with_path(stored)[0]}
-    wrong = [f"{jax.tree_util.keystr(path)} {held[_named(path)]} for {tuple(want.shape)}"
-             for path, want in jax.tree_util.tree_flatten_with_path(template)[0]
-             if not jnp.issubdtype(want.dtype, jax.dtypes.prng_key)
-             and held.get(_named(path), tuple(want.shape)) != tuple(want.shape)]
+    held = ocp.tree.to_flat_dict(stored)
+    wrong = [f"{'/'.join(name)} {tuple(held[name].shape)} for {tuple(want.shape)}"
+             for name, want in ocp.tree.to_flat_dict(template).items()
+             if name in held and not jnp.issubdtype(want.dtype, jax.dtypes.prng_key)
+             and tuple(held[name].shape) != tuple(want.shape)]
     if wrong:
         raise ValueError(f"The checkpoint at {where} holds {', '.join(wrong[:6])}"
                          f"{f' and {len(wrong) - 6} more' if len(wrong) > 6 else ''}: restore it into "
@@ -1269,11 +1264,19 @@ class Checkpoints:
             "frozen": frozen,
             "tree": mapping,
         }
-        # The retention policy reads this step's record without waiting for its metadata to commit.
+        # The retention policy reads this step's record without waiting for its
+        # metadata to commit; a save Orbax refuses leaves the step's record as it was.
+        committed = self._custom_cache.pop(step, None)
         self._custom_cache[step] = copy.deepcopy(custom)
-        with region("checkpoint.submit"):
-            persistent.save(step, args=ocp.args.PyTreeSave(state_tree), metrics=scores, force=True,
-                            custom_metadata=custom)
+        try:
+            with region("checkpoint.submit"):
+                persistent.save(step, args=ocp.args.PyTreeSave(state_tree), metrics=scores, force=True,
+                                custom_metadata=custom)
+        except BaseException:
+            self._custom_cache.pop(step)
+            if committed is not None:
+                self._custom_cache[step] = committed
+            raise
         self._pending = (step, scores)
         self._frozen_pending = {digest for held in frozen.values() for digest in held.values()}
         # Pinned-host state is written before returning; the docstring says why.
