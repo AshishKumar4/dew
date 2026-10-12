@@ -191,7 +191,7 @@ class Family:
     """The `dew.registry.models` name this is a variant of; None for a model nothing registers."""
     facts: frozenset[str]
     vocab: int
-    loader: Callable[[], Loaded] = field(compare=False)
+    load: Callable[[], Loaded] = field(compare=False)
     inputs: Callable[[], InputSpec] | None = field(default=None, compare=False)
     """A denoiser's sample field and conditions; None for a token model."""
 
@@ -201,7 +201,7 @@ class Family:
 
 def built(name: str, **config) -> Callable[[], Loaded]:
     """A registered family at a tiny hand-written config, with a fresh tree."""
-    def loader() -> Loaded:
+    def load() -> Loaded:
         model = models.build(name, **config)
         return Loaded(model, model)
     return loader
@@ -209,16 +209,16 @@ def built(name: str, **config) -> Callable[[], Loaded]:
 
 def released(directory: str) -> Callable[[], Loaded]:
     """A committed tiny checkpoint in a released family's own format, loaded offline."""
-    def loader() -> Loaded:
+    def load() -> Loaded:
         source = Pretrained.load(FIXTURES / directory, dtype="float32", attention_impl="reference")
         return Loaded(source, source.model, source.variables, source.text_processor)
     return loader
 
 
-def adapted(loader: Callable[[], Loaded], *modules: str) -> Callable[[], Loaded]:
-    """`loader`'s model under a rank-2 LoRA on `modules`, its base frozen."""
+def adapted(load: Callable[[], Loaded], *modules: str) -> Callable[[], Loaded]:
+    """`load`'s model under a rank-2 LoRA on `modules`, its base frozen."""
     def adapt() -> Loaded:
-        held = loader()
+        held = load()
         variables = held.variables or held.model.init(jax.random.key(0), jnp.zeros((1, SEQ), jnp.int32))
         adapter = LoRA(rank=2, modules=modules).apply(held.model, variables, key=1)
         return Loaded(adapter, adapter.model, adapter.variables)
@@ -226,7 +226,7 @@ def adapted(loader: Callable[[], Loaded], *modules: str) -> Callable[[], Loaded]
 
 
 def user(module, **fields) -> Callable[[], Loaded]:
-    def loader() -> Loaded:
+    def load() -> Loaded:
         model = module(**fields)
         return Loaded(model, model)
     return loader

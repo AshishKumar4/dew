@@ -268,7 +268,7 @@ def test_the_recipe_continues_a_pretrained_decoder(tmp_path):
 
 
 def test_a_pretrained_run_starts_from_the_checkpoints_weights(tmp_path):
-    """Zero steps hold what the checkpoint carries, leaf for leaf: the loader
+    """Zero steps hold what the checkpoint carries, leaf for leaf: the load
     is a continuation, not a fresh init of the same shape."""
     from dew.interop import Pretrained
 
@@ -469,7 +469,7 @@ def test_a_trained_export_round_trips_with_its_tokenizer(tmp_path):
     The checkpoint is exported with the tokenizer its ids came from, the
     recipe continues it for a step, `Pretrained.save` writes the trained
     weights back out, and the second directory is loaded again: it carries
-    the same tokenizer files, so the loader hands back a processor and a text
+    the same tokenizer files, so the load hands back a processor and a text
     prompt generates text without the caller naming a tokenizer anywhere.
     An export that only recorded a `tokenizer_name` lands here as a
     `processor` of None, which is also what leaves a directory that

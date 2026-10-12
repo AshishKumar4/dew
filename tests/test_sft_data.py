@@ -4,7 +4,7 @@
 same template and conversation. The reference is tests/fixtures/rl/chat.npz,
 written by tools/parity_chat.py from TRL 1.12's SFT path with
 `assistant_only_loss=True` on the tiny tokenizer under
-tests/fixtures/tokenizers/tiny-chat. `ChatData` packs those roles beside
+tests/fixtures/tokenizers/tiny-chat. `Chat` packs those roles beside
 the ids, and the packer and chunker keep the four per-token fields aligned.
 """
 

@@ -138,7 +138,8 @@ def test_dew_pipeline_loads_a_packages_run_only_when_trusted(tmp_path):
     run = tmp_path / "run"
     train = ("import jax, numpy as np, optax\n"
              "from dew import Checkpoints, Trainer\n"
-             "from dew.data import Loading, RecordsData, loader\n"
+             "from dew.config.data import RecordsData, loader\n"
+             "from dew.data import Loading\n"
              "from toypackage.models import Shift\n"
              "rows = RecordsData(source={'x': np.full((8,), 3.0, np.float32)})\n"
              "loading = Loading(workers=0, threads=1, read_buffer=1)\n"
@@ -238,7 +239,7 @@ class ActivityRun(RunConfig):
 
     def prepare(self):
         rows = np.random.default_rng(0).normal(size=(64, 8)).astype(np.float32)
-        from dew.config.data import RecordsData, loader
+        from dew.config.data import Records, loader
 
         data = loader(RecordsData(source={"x": rows}, validation={"x": rows[:20]}),
                       batch=self.trainer.batch_size,

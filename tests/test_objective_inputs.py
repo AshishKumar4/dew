@@ -66,7 +66,7 @@ def decoder(**fields):
 
 
 def corpus_windows(corpus: Path) -> TextData:
-    """TextData over a byte corpus written to `corpus`, what the LM recipe trains on."""
+    """Text over a byte corpus written to `corpus`, what the LM recipe trains on."""
     documents = tuple({"text": "the quick brown fox jumps over the lazy dog " * 8} for _ in range(4))
     return TextData(source=documents, seq_len=SEQ_LEN, token_holdout=HoldOut(fraction=0.25))
 
@@ -120,7 +120,7 @@ def packed(objective_for):
 
 
 def preference_pairs():
-    """The chain recipe's DPO stage: `PreferenceData` at `seq_len`, DPO one below."""
+    """The chain recipe's DPO stage: `Preferences` at `seq_len`, DPO one below."""
     pair = {"chosen": [1, 2, 3, 4], "rejected": [1, 2, 5],
             "chosen_mask": [0, 0, 1, 1], "rejected_mask": [0, 0, 1]}
     spec = PreferenceData(source=tuple(json.loads(row) for row in (json.dumps(pair),) * 4), seq_len=6)

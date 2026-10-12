@@ -109,7 +109,7 @@ class _Indexed:
 
 @dataclasses.dataclass(frozen=True)
 class Indexed:
-    """RecordsData that carry their own index, untouched, so a test can read
+    """Records that carry their own index, untouched, so a test can read
     which records a batch holds. The plumbing is the one every spec uses."""
 
     length: int = 32
@@ -666,7 +666,7 @@ def test_clip_start_falls_back_to_the_only_valid_offset():
 
 
 # ---------------------------------------------------------------------------------
-# VideoData datasets
+# Video datasets
 # ---------------------------------------------------------------------------------
 
 def _voxceleb_tree(root, split="train", identities=("id00012", "id00015")):
@@ -812,7 +812,7 @@ class Augmenting:
     loading: Loading = dataclasses.field(default_factory=lambda: Loading(workers=0))
     batch: int = 4
     splits: dict[str, int] = dataclasses.field(default_factory=dict)
-    """RecordsData each named split holds, for a spec that has more than one."""
+    """Records each named split holds, for a spec that has more than one."""
 
     def source(self, split=None):
         return _Images(self.length if split is None else self.splits[split],
@@ -1554,7 +1554,7 @@ def test_a_run_over_a_grain_dataset_trains_and_resumes_where_it_stopped(tmp_path
 
 
 # ---------------------------------------------------------------------------------
-# RecordsData held in memory, and where a default run reads
+# Records held in memory, and where a default run reads
 # ---------------------------------------------------------------------------------
 
 def _pid_of(index):
