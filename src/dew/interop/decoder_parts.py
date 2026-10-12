@@ -501,24 +501,26 @@ def _rope_records(hf_config: Mapping[str, object], spelling: RopeSpelling
     None where one record serves every layer."""
     scaling, parameters = hf_config.get('rope_scaling'), hf_config.get('rope_parameters')
     base = hf_config.get('rope_theta')
+    stated = hf_config.get('layer_types')
+    kinds = {*(records.strings(stated, 'layer_types') if stated is not None else ()),
+             'full_attention', 'sliding_attention'}
+    record = records.record(parameters, 'rope_parameters') if parameters is not None else {}
+    nested = not record or set(record) <= kinds
     if spelling.per_kind:
-        nested = dict(records.record(parameters, 'rope_parameters')) if parameters is not None else {}
-        full = dict(records.record(nested.get('full_attention') or {'rope_type': 'default'},
-                                   'rope_parameters.full_attention'))
+        # A flat record lands on the full layers, as a legacy rope_scaling does.
+        full = dict(records.record(record.get('full_attention') or {'rope_type': 'default'},
+                                   'rope_parameters.full_attention') if nested else record)
         if scaling is not None:
             full.update(records.record(scaling, 'rope_scaling'))
         full.setdefault('rope_theta', spelling.theta if base is None else base)
-        sliding = dict(records.record(nested.get('sliding_attention') or {'rope_type': 'default'},
-                                      'rope_parameters.sliding_attention'))
-        stated = hf_config.get(spelling.local_field) if spelling.local_field is not None else None
-        sliding.setdefault('rope_theta', stated if stated is not None else
+        sliding = dict(records.record((record.get('sliding_attention') if nested else None)
+                                      or {'rope_type': 'default'}, 'rope_parameters.sliding_attention'))
+        local = hf_config.get(spelling.local_field) if spelling.local_field is not None else None
+        sliding.setdefault('rope_theta', local if local is not None else
                            spelling.local_theta if spelling.local_theta is not None else full['rope_theta'])
         return ('rope_parameters.full_attention', full), ('rope_parameters.sliding_attention', sliding)
     field = 'rope_scaling' if scaling else 'rope_parameters'
     record = records.record(scaling or parameters or {}, field)
-    stated = hf_config.get('layer_types')
-    kinds = {*(records.strings(stated, 'layer_types') if stated is not None else ()),
-             'full_attention', 'sliding_attention'}
     theta = spelling.theta if base is None else base
     if record and set(record) <= kinds:
         full = dict(records.record(record.get('full_attention') or {}, f'{field}.full_attention'))
