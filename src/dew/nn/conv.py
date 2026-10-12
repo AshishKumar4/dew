@@ -36,13 +36,14 @@ import jax
 import jax.numpy as jnp
 from flax import linen as nn
 from flax.linen.dtypes import promote_dtype
-from flax.linen.linear import PromoteDtypeFn
+from flax.linen.linear import PromoteDtypeFn, canonicalize_padding
 from flax.typing import ConvGeneralDilatedT
 from jax.extend import core
 from jax.interpreters import ad, batching, mlir
 from jax.sharding import PartitionSpec as P
 from jax.typing import DTypeLike
 
+from .flops import conv_flops
 from .sharding import SEQUENCE_AXIS, STAGE_AXIS, auto_part, logical_spec, mesh_axes
 
 # A linear boundary must survive in tangents and cotangents too: dropping it
@@ -239,6 +240,33 @@ class Conv(nn.Conv):
 
     promote_dtype: PromoteDtypeFn = _promoted_whole
     conv_general_dilated: ConvGeneralDilatedT | None = _conv_general_dilated
+
+    @nn.nowrap
+    def spatial_shape(self, shape: tuple[int, ...]) -> tuple[int, ...]:
+        """The native convolution's output geometry, without allocating its arrays."""
+        spatial = shape[:-1]
+        kernel = (self.kernel_size,) if isinstance(self.kernel_size, int) else tuple(self.kernel_size)
+        strides = ((self.strides,) * len(kernel) if isinstance(self.strides, int) else
+                   (1,) * len(kernel) if self.strides is None else tuple(self.strides))
+        dilation = ((self.kernel_dilation,) * len(kernel) if isinstance(self.kernel_dilation, int) else
+                    (1,) * len(kernel) if self.kernel_dilation is None else tuple(self.kernel_dilation))
+        effective = tuple((tap - 1) * rate + 1 for tap, rate in zip(kernel, dilation, strict=True))
+        padding = canonicalize_padding(self.padding, len(kernel))
+        if isinstance(padding, str):
+            if padding == 'VALID':
+                padding = ((0, 0),) * len(kernel)
+            else:
+                return (*tuple((size + step - 1) // step
+                               for size, step in zip(spatial, strides, strict=True)), self.features)
+        sizes = tuple((size + sum(pad) - tap) // step + 1
+                      for size, tap, step, pad in zip(spatial, effective, strides, padding, strict=True))
+        return (*sizes, self.features)
+
+    @nn.nowrap
+    def model_flops(self, lengths, input_channels: int) -> float:
+        """Learned convolution products at the caller's real output positions."""
+        taps = self.kernel_size if isinstance(self.kernel_size, int) else math.prod(self.kernel_size)
+        return conv_flops(lengths, input_channels, self.features, taps, groups=self.feature_group_count)
 
     def __call__(self, inputs: jax.Array) -> jax.Array:
         spatial = 1 if isinstance(self.kernel_size, int) else len(self.kernel_size)

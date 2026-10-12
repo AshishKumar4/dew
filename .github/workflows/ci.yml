@@ -205,20 +205,20 @@ jobs:
   test:
     runs-on: ubuntu-latest
     # The suite runs on armada (.armada.json, tools/armada/ci.py): both
-    # Pythons as tasks of about three minutes each on Dew's own armada
-    # deployment, on the fewest of up to 200 containers that
-    # finish as soon, sized from the last runs' usage: at 375, the platform
-    # killed 164 of 268 containers at their first command. Tasks share XLA's
+    # Pythons as tasks of about five minutes each on Dew's own armada
+    # deployment, on at most 48 containers, which leaves the account's
+    # container limit to its other projects: about 1,200 container-seconds
+    # each, four times the heaviest task, so the heaviest-first queue ends
+    # level with no task run twice (a simulation of the run 922 rows made:
+    # 300 s tasks 1,467 s, 180 s tasks with the eight heaviest twice 1,548 s).
+    # A straggler at the end runs again (task.speculative). Tasks share XLA's
     # compilations through the dew-xla-cache Worker (tests/remote_cache.py).
-    # Its URL and token are the ARMADA_URL and ARMADA_TOKEN secrets. The eight
-    # heaviest tasks run twice from the start (task.hedge): the first copy to
-    # answer decides, a copy's red is the task's verdict, and a slow copy
-    # holds nothing up.
+    # Its URL and token are the ARMADA_URL and ARMADA_TOKEN secrets.
     # This job sends the commit, waits, and prints each red row's output; a
     # failed test, a test skipped on a missing import and a file left
     # unreported each fail it. A commit armada already graded green, as one
     # proved on ci/integration before main takes it, is not run again.
-    timeout-minutes: 40
+    timeout-minutes: 60
     steps:
     - uses: actions/checkout@v4
       with:
