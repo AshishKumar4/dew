@@ -59,6 +59,7 @@ from dew.nn.inputs import AttentionMetadata
 from dew.nn.kernels.ssd import ssd_chunk_scan, ssd_kernel_platform
 from dew.nn.linear import DepthwiseConv1d, causal_conv1d, document_conv1d, document_starts, held_scan
 from dew.nn.mixer_base import MixerBase, MixerContext
+from dew.nn.mixers.mamba import inverse_softplus_step
 from dew.nn.precision import at_least_fp32
 from dew.nn.sharding import (
     SEQUENCE_AXIS,
@@ -354,7 +355,7 @@ class Mamba2(nn.Module):
         # softplus of a step drawn between its default time_step_min and
         # max, D ones (init_mamba2_weights, modeling_mamba2.py:428-442).
         self.A_log = self.param('A_log', _log_head_index, (self.num_heads,))
-        self.dt_bias = self.param('dt_bias', _inverse_softplus_step, (self.num_heads,))
+        self.dt_bias = self.param('dt_bias', inverse_softplus_step, (self.num_heads,))
         self.D = self.param('D', nn.initializers.ones, (self.num_heads,), jnp.float32)
         self.norm = MambaRMSNormGated(
             epsilon=self.norm_eps, groups=self.norm_groups, dtype=self.dtype, name='norm')
@@ -516,16 +517,6 @@ def _log_head_index(key, shape):
     """`A_log = log(1..H)`, the S4D-real init (modeling_mamba2.py:430-431)."""
     del key
     return jnp.log(jnp.arange(1, shape[0] + 1, dtype=jnp.float32))
-
-
-def _inverse_softplus_step(key, shape):
-    """`init_mamba2_weights`' dt_bias (modeling_mamba2.py:434-442) at the
-    reference config's defaults: a step log-uniform between time_step_min
-    0.001 and time_step_max 0.1, floored at time_step_floor 1e-4, then the
-    inverse of softplus so the forward's softplus recovers it."""
-    step = jnp.exp(jax.random.uniform(key, shape) * (jnp.log(0.1) - jnp.log(0.001)) + jnp.log(0.001))
-    step = jnp.maximum(step, 1e-4)
-    return step + jnp.log(-jnp.expm1(-step))
 
 
 @dataclasses.dataclass(frozen=True)
