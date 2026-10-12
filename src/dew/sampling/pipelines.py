@@ -341,7 +341,8 @@ class TextToImage:
         leaves = jax.tree.leaves(tokens)
         if leaves and leaves[0].shape[0] != 1:
             return _encode(plan.sharding)(self._conditions, self.variables, plan.place(plan.pad(tokens)))
-        return _encode(None)(self._conditions, self.variables, jax.tree.map(jnp.asarray, tokens))
+        # Host tokens, which reach the encoders' devices as the call places them.
+        return _encode(None)(self._conditions, self.variables, jax.tree.map(np.asarray, tokens))
 
 
     def prepare(
