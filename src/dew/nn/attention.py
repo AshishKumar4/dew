@@ -12,6 +12,7 @@ import functools
 import importlib
 import importlib.util
 import math
+from collections.abc import Callable
 from typing import Literal
 
 import jax
@@ -259,16 +260,18 @@ def normalized_in_fp32(normalize, static_argnums: tuple[int, ...] = ()):
                           static_argnums=static_argnums)
 
 
-@functools.partial(normalized_in_fp32, static_argnums=(2, 3, 4, 5, 6))
+@functools.partial(normalized_in_fp32, static_argnums=(2, 3, 4, 5, 6, 7))
 def _xla_rms_normalized(x, scale, epsilon: float, dtype, scale_offset: bool, scale_after_cast: bool,
-                        fp32_statistics: bool):
+                        fp32_statistics: bool, activation=None):
     """Normalize `x` by its root mean square, then apply `scale`.
 
     The families differ on which side of the cast the weight goes, which
     `scale_after_cast` picks. `scale` of None is the weightless norm.
     `fp32_statistics` of False computes the square, the mean and the
-    normalization in the input's dtype.
+    normalization in the input's dtype. `activation` (None for none) runs
+    on the result before its last cast to `dtype`, as `GroupNorm`'s does.
     """
+    activated = (lambda y: y) if activation is None else activation
     if fp32_statistics:
         y = x.astype(at_least_fp32(x.dtype))
         y = y * jax.lax.rsqrt(jnp.mean(jnp.square(y), axis=-1, keepdims=True) + epsilon)
@@ -281,7 +284,7 @@ def _xla_rms_normalized(x, scale, epsilon: float, dtype, scale_offset: bool, sca
     if scale is None:
         # A pure normalization with no learned weight, as Gemma 4 norms
         # its values (modeling_gemma4.py, Gemma4RMSNorm with_scale=False).
-        return y.astype(dtype)
+        return activated(y).astype(dtype)
     weight = (1.0 + scale) if scale_offset else scale
     if scale_after_cast:
         # The reference casts the activations, then multiplies by its weight:
@@ -289,8 +292,8 @@ def _xla_rms_normalized(x, scale, epsilon: float, dtype, scale_offset: bool, sca
         # that the next layer rounds. Rounding in place keeps both roundings
         # under jit, where XLA drops a narrowing cast that a widening one
         # follows, and keeps the weight's product and gradient in fp32.
-        return rounded_to(rounded_to(y, dtype) * weight, dtype).astype(dtype)
-    return (y * weight).astype(dtype)
+        return rounded_to(activated(rounded_to(y, dtype) * weight), dtype).astype(dtype)
+    return activated(y * weight).astype(dtype)
 
 
 def rms_normalized(x, scale, epsilon: float, dtype, scale_offset: bool, scale_after_cast: bool,
@@ -314,7 +317,7 @@ def rms_normalized(x, scale, epsilon: float, dtype, scale_offset: bool, scale_af
 
 def stream_rms_normalized(x, branch, scale, epsilon: float, dtype, scale_offset: bool,
                           scale_after_cast: bool, fp32_statistics: bool, *, implementation: str = 'auto',
-                          axes=None):
+                          axes=None, activation=None):
     """A pre-norm block's seam: the residual stream `x` plus `branch` (None
     adds nothing) and that stream's `rms_normalized`, as `(stream, normed)`.
 
@@ -322,16 +325,17 @@ def stream_rms_normalized(x, branch, scale, epsilon: float, dtype, scale_offset:
     (`norm_swiglu.stream_rms_norm`) owns both ends of the norm: its forward
     reads the two addends once and writes the sum beside the norm, and its
     reverse adds the stream's own cotangent to the norm's in the same pass.
-    XLA's add and norm are the portable path and the oracle.
+    XLA's add and norm are the portable path and the oracle. `activation`
+    (None for none) runs on the norm before its last cast, on XLA's path.
     """
     chosen = norm_swiglu.rms_kernel(implementation, x, scale, dtype, fp32_statistics, branch=branch,
-                                    axes=axes)
+                                    axes=axes, activated=activation is not None)
     if chosen == 'pallas':
         return norm_swiglu.stream_rms_norm(x, branch, scale, epsilon, dtype, scale_offset, scale_after_cast,
                                            axes=axes)
     stream = x if branch is None else x + branch
     return stream, _xla_rms_normalized(stream, scale, epsilon, dtype, scale_offset, scale_after_cast,
-                                       fp32_statistics)
+                                       fp32_statistics, activation)
 
 
 def gated_rms_normalized(x, gate, scale, epsilon: float, dtype, activation: str, *,
@@ -352,26 +356,45 @@ def gated_rms_normalized(x, gate, scale, epsilon: float, dtype, activation: str,
     return (y * (jax.nn.silu(gate) if activation == 'silu' else jax.nn.sigmoid(gate))).astype(dtype)
 
 
-@functools.partial(normalized_in_fp32, static_argnums=(3, 4))
-def layer_normalized(x, scale, bias, epsilon: float, dtype):
-    """Normalize `x` over its last axis, op for op as flax computes it.
-
-    E[x] and E[x^2] are reduced in fp32 and the variance comes from the
-    pair, clipped at zero. The weight folds into the inverse deviation
-    before it meets the centered activations. `scale` and `bias` of None
-    are the affine-free norm.
-    """
-    y = x.astype(at_least_fp32(x.dtype))
-    row_mean = jnp.mean(y, axis=-1)
-    variance = jnp.maximum(0.0, jnp.mean(jax.lax.square(y), axis=-1) - jax.lax.square(row_mean))
-    scaling = jax.lax.rsqrt(jnp.expand_dims(variance, -1) + epsilon)
-    width = (1,) * (x.ndim - 1) + (-1,)
+def _moment_normalized(x, scale, bias, axes: tuple[int, ...], epsilon: float, requested):
+    """`x` normalized over `axes` op for op as flax computes it, reduced in
+    the module's `requested` dtype, else `x`'s, at least fp32
+    (flax.linen.normalization._compute_stats): E[x] and E[x^2], the variance
+    their difference clipped at zero, the weight folded into the inverse
+    deviation before it meets the centered activations. `scale` and `bias`
+    (None for none) broadcast against `x`'s trailing axes."""
+    statistics = at_least_fp32(x.dtype if requested is None else requested)
+    reduced = x.astype(statistics)
+    mean = jnp.mean(reduced, axis=axes, keepdims=True)
+    variance = jnp.maximum(0.0, jnp.mean(jax.lax.square(reduced), axis=axes, keepdims=True)
+                           - jax.lax.square(mean))
+    scaling = jax.lax.rsqrt(variance + epsilon)
     if scale is not None:
-        scaling = scaling * jnp.reshape(scale, width)
-    y = (y - jnp.expand_dims(row_mean, -1)) * scaling
-    if bias is not None:
-        y = y + jnp.reshape(bias, width)
-    return y.astype(dtype)
+        scaling = scaling * scale
+    # flax centers the input as it arrived, promoted with the statistics' dtype.
+    y = (x.astype(jnp.promote_types(x.dtype, statistics)) - mean) * scaling
+    return y if bias is None else y + bias
+
+
+@functools.partial(normalized_in_fp32, static_argnums=(3, 4, 5, 6, 7))
+def group_normalized(x, scale, bias, groups: int, epsilon: float, activation, requested, dtype):
+    """`x` `[batch, ..., channels]` normalized over each of `groups` channel
+    groups and every axis but the batch, as flax's `GroupNorm`
+    (`_moment_normalized`). `activation` (None for none) runs on the result
+    before its one cast to `dtype`."""
+    grouped = x.reshape(*x.shape[:-1], groups, x.shape[-1] // groups)
+    scale, bias = (None if value is None else value.reshape(grouped.shape[-2:]) for value in (scale, bias))
+    y = _moment_normalized(grouped, scale, bias, (*range(1, x.ndim - 1), x.ndim), epsilon, requested)
+    y = y.reshape(x.shape)
+    return (y if activation is None else activation(y)).astype(dtype)
+
+
+@functools.partial(normalized_in_fp32, static_argnums=(3, 4, 5))
+def layer_normalized(x, scale, bias, epsilon: float, requested, dtype):
+    """Normalize `x` over its last axis as flax's `LayerNorm`
+    (`_moment_normalized`). `scale` and `bias` of None are the affine-free
+    norm."""
+    return _moment_normalized(x, scale, bias, (-1,), epsilon, requested).astype(dtype)
 
 
 def l2_normalized(x, eps: float = 1e-12):
@@ -410,7 +433,8 @@ class RMSNorm(nn.Module):
     `scale_after_cast` reproduces. The two agree at fp32 and differ under bf16.
     `fp32_statistics=False` with `scale_after_cast` is timm's `RmsNorm2d`
     order, x * rsqrt(mean(x^2) + eps) * w in the input dtype. The backward pass
-    keeps the input in its own dtype (`normalized_in_fp32`).
+    keeps the input in its own dtype (`normalized_in_fp32`). `activation`
+    (None for none) runs on the norm before its last cast, as `GroupNorm`'s.
     """
     epsilon: float = 1e-5
     scale_offset: bool = False
@@ -419,6 +443,7 @@ class RMSNorm(nn.Module):
     fp32_statistics: bool = True
     dtype: Dtype | None = None
     implementation: str = 'auto'
+    activation: Callable[[jax.Array], jax.Array] | None = None
 
     def __call__(self, x, *, axes=None):
         """The norm of `x`. `axes`, `x`'s logical axes, place the fused kernel on a mesh."""
@@ -436,7 +461,8 @@ class RMSNorm(nn.Module):
             (x.shape[-1],), jnp.float32) if self.with_scale else None
         return stream_rms_normalized(x, branch, scale, self.epsilon, dtype, self.scale_offset,
                                      self.scale_after_cast, self.fp32_statistics,
-                                     implementation=self.implementation, axes=axes)
+                                     implementation=self.implementation, axes=axes,
+                                     activation=self.activation)
 
 
 class LayerNorm(nn.Module):
@@ -460,7 +486,34 @@ class LayerNorm(nn.Module):
                            self.param_dtype) if self.use_scale else None
         bias = self.param('bias', nn.initializers.zeros, width,
                           self.param_dtype) if self.use_bias else None
-        return layer_normalized(x, scale, bias, self.epsilon,
+        return layer_normalized(x, scale, bias, self.epsilon, self.dtype,
+                                canonicalize_dtype(x, scale, bias, dtype=self.dtype))
+
+
+class GroupNorm(nn.Module):
+    """Flax's `nn.GroupNorm` over the last axis, op for op and with its
+    parameter tree, and an `activation` applied to its fp32 output before
+    the one cast to `dtype`.
+
+    Diffusers' norms keep their fp32 affine output into the activation and
+    the next layer casts its result (vae_flax.py:154 and its UNet), so a
+    norm that rounded first and activated after would round where they do
+    not. The backward pass keeps the input as it arrived
+    (`normalized_in_fp32`), so the activation's fp32 input is recomputed,
+    not stored.
+    """
+    num_groups: int = 32
+    epsilon: float = 1e-6
+    activation: Callable[[jax.Array], jax.Array] | None = None
+    dtype: Dtype | None = None
+    param_dtype: Dtype = jnp.float32
+
+    @nn.compact
+    def __call__(self, x):
+        width = (x.shape[-1],)
+        scale = self.param('scale', nn.initializers.ones, width, self.param_dtype)
+        bias = self.param('bias', nn.initializers.zeros, width, self.param_dtype)
+        return group_normalized(x, scale, bias, self.num_groups, self.epsilon, self.activation, self.dtype,
                                 canonicalize_dtype(x, scale, bias, dtype=self.dtype))
 
 
