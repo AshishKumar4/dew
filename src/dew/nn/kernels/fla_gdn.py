@@ -199,6 +199,25 @@ def _dot(a, b, *, exact: bool, ieee: bool = False):
     return jnp.dot(a, b, preferred_element_type=jnp.float32, precision=precision)
 
 
+def _tril_inverse(diagonal, index):
+    """`(I + D)^-1` of a strictly lower square block `D`, row by row: fla's forward substitution
+    (chunk_fwd.py's solve, chunk_intra.py's for Kimi's delta attention). `index` is the block's
+    `arange` of rows, which the caller's other masks share."""
+    sub = diagonal.shape[0]
+    inverse = -diagonal
+    for i in range(2, sub):
+        row = jnp.sum(jnp.where((index == i)[:, None], -diagonal, 0.0), axis=0)
+        row = jnp.where(index < i, row, 0.0)
+        row = row + jnp.sum(row[:, None] * inverse, axis=0)
+        inverse = jnp.where((index == i)[:, None], row[None, :], inverse)
+    return inverse + (index[:, None] == index[None, :])
+
+
+def _tf32_dot(a, b):
+    """`a @ b` of fp32 blocks at TF32, fla's SOLVE_TRIL_DOT_PRECISION on an sm80 or later."""
+    return jnp.dot(a, b, preferred_element_type=jnp.float32, precision=jax.lax.Precision.DEFAULT)
+
+
 def _kkt_solve_kernel(k_ref, g_ref, beta_ref, a_ref, *, sub: int, bk: int, exact: bool):
     """fla's `chunk_gated_delta_rule_fwd_kkt_solve_kernel` (fla/ops/gated_delta_rule/chunk_fwd.py:40-
     321) for one chunk of one head: `(I + A)^-1` for `A = tril(beta_s (k_s . k_t) exp2(g_s - g_t), -1)`,
@@ -226,22 +245,10 @@ def _kkt_solve_kernel(k_ref, g_ref, beta_ref, a_ref, *, sub: int, bk: int, exact
 
     blocks = {(i, j): block(i, j) for i in range(count) for j in range(i + 1)}
 
-    def inverted(diagonal):
-        """`(I + D)^-1` of a strictly lower block, row by row: fla's forward substitution."""
-        inverse = -diagonal
-        for i in range(2, sub):
-            row = jnp.sum(jnp.where((index == i)[:, None], -diagonal, 0.0), axis=0)
-            row = jnp.where(index < i, row, 0.0)
-            row = row + jnp.sum(row[:, None] * inverse, axis=0)
-            inverse = jnp.where((index == i)[:, None], row[None, :], inverse)
-        return inverse + (index[:, None] == index[None, :])
-
-    precision = jax.lax.Precision.DEFAULT
-
     def tf32(a, b):
-        return jnp.dot(a, b, preferred_element_type=jnp.float32, precision=precision)
+        return _tf32_dot(a, b)
 
-    inverse = {(i, i): inverted(blocks[i, i]) for i in range(count)}
+    inverse = {(i, i): _tril_inverse(blocks[i, i], index) for i in range(count)}
     for distance in range(1, count):
         for i in range(distance, count):
             j = i - distance
