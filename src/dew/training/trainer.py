@@ -84,7 +84,6 @@ from dew.telemetry.instrumentation import (
     compilation_cache_counts,
     count_compilation_cache,
     model_flops_utilization,
-    step_flops,
 )
 from dew.telemetry.profile import region
 from dew.telemetry.records import (
@@ -139,7 +138,7 @@ from dew.training.model_flops import (
 )
 from dew.training.narrow import narrowed, narrowed_paths
 from dew.training.planning import Candidate, Planned, Timer, plan_step, settled, splits, whole_step
-from dew.training.rungs import keep_rung, recorded_rung
+from dew.training.rungs import keep_rung, plan_flops, recorded_rung
 from dew.training.runtime import Preempted, PreemptionNotice
 from dew.training.selection import Best
 from dew.training.state import Accumulation, TrainState
@@ -1123,15 +1122,13 @@ class Trainer(Generic[Loss, Effects]):
         shaped = self._at_base_rung(batch)
         resumed, self._resumed_rung = self._resumed_rung if shaped is None else shaped, None
         with self._traced_on(mesh, links) as schedule:
-            planned = self._planned(state, batch, mesh, schedule, resumed, timed)
+            planned, flops = self._planned(state, batch, mesh, schedule, resumed, timed)
             split, candidate, self.executable = planned.split, planned.candidate, planned.executable
             self.program = candidate.program
             self._split = split
             self._shape_rungs[batch_layout(batch)] = self._rung()
-            flops = step_flops(self.executable)
-            self.step_flops = (None if flops is None else
-                               StepFlops(split * flops.model, split * flops.hardware))
-            self.flops_per_step = None if self.step_flops is None else self.step_flops.hardware
+            self.step_flops = flops and StepFlops(split * flops.model, split * flops.hardware)
+            self.flops_per_step = self.step_flops and self.step_flops.hardware
             self.memory = memory_record(self.executable, self._local_devices(), candidate.held, fits=True)
             self.links = links
         return self._runner(planned, mesh)
@@ -1163,13 +1160,13 @@ class Trainer(Generic[Loss, Effects]):
                 return (current, *(outputs[0] if split == 1 else whole_step(outputs)))
         return run
 
-    def _planned(self, state: TrainState, batch: Batch, mesh: Mesh, schedule: Schedule,
-                 resumed: JSON, timed: Callable[[list[CompiledStep]], list[float]] | None) -> Planned:
-        """The plan `compile` reads `batch` in (`plan_step`), from the run's
-        splits (`splits`), the faster by `timed` of a frontier of two, with
-        `plan` its record and the objective at its rung. A plan recorded
-        beside the compilation cache (`recorded_rung`) is the first
-        candidate, kept untimed; `resumed` is a checkpoint's rung."""
+    def _planned(self, state: TrainState, batch: Batch, mesh: Mesh, schedule: Schedule, resumed: JSON,
+                 timed: Callable[[list[CompiledStep]], list[float]] | None,
+                 ) -> tuple[Planned, StepFlops | None]:
+        """The plan `compile` reads `batch` in (`plan_step`), from the run's splits (`splits`), the
+        faster by `timed` of a frontier of two, with `plan` its record and the objective at its rung,
+        and a microbatch's FLOPs (`plan_flops`). A plan recorded beside the compilation cache
+        (`recorded_rung`) is the first candidate, kept untimed; `resumed` is a checkpoint's rung."""
         replicated = NamedSharding(mesh, P())
         placement = batch_shardings(mesh, batch)
         candidates = splits(self._rows, batch, mesh, self.mesh, self._split)
@@ -1178,22 +1175,22 @@ class Trainer(Generic[Loss, Effects]):
         def lower(split: int) -> Candidate:
             return self._candidate(state, batch, schedule, placement, replicated, split)
 
-        lowered = {candidates[0]: lower(candidates[0])}
-        record_path, key, recorded = recorded_rung(lowered[candidates[0]].program, mesh)
+        # Read before anything traces, so a recorded rung is the first one lowered.
+        record_path, key, recorded = recorded_rung(self.objective.program_key(), (state, batch), mesh)
         before = self._rung()
         self._climb_to(recorded)
         self._resumed_rung = None
         if self._rung() != before:
-            lowered.clear()
             _log.warning("taking an earlier run's plan; delete %s to decide again", record_path)
         first = None if recorded is None else record(recorded, 'recorded plan').get('split', 1)
+        misses = compilation_cache_counts()['train/cache_misses']
         plans, probes = plan_step(
             lower, lambda candidate: step_compiler_options(
                 self.objective, device_tokens(self.objective, candidate.micro, shards),
                 FROZEN in candidate.prepared.variables),
             candidates, candidates.index(first) if isinstance(first, int) and first in candidates else 0,
             objective=self.objective, mesh=mesh, xla_defaults=self._xla_defaults,
-            base=None if self._base_rung is None else self._base_rung[1], resumed=resumed, lowered=lowered,
+            base=None if self._base_rung is None else self._base_rung[1], resumed=resumed,
             frontier=timed is not None and recorded is None)
         seconds = timed([self._runner(plan, mesh) for plan in plans]) if len(plans) > 1 and timed else []
         # Every process runs the plan process zero timed fastest.
@@ -1201,12 +1198,15 @@ class Trainer(Generic[Loss, Effects]):
         self.objective.substitute(list(planned.modules))
         self.objective.restore_head_tile(planned.tile)
         self._xla_defaults = planned.xla_defaults
+        chosen = {**self._rung(), 'split': planned.split}
+        compiled = compilation_cache_counts()['train/cache_misses'] > misses
+        flops = plan_flops(recorded, chosen, compiled, planned.executable)
         if record_path is not None:
-            keep_rung(record_path, key, {**self._rung(), 'split': planned.split})
+            keep_rung(record_path, key, {**chosen, 'flops': flops and [flops.model, flops.hardware]})
         self.plan = settled(planned, plans, seconds, probes)
         if planned.split != candidates[0] or seconds:
             _log.warning("the step fits the devices in the plan %s", self.plan)
-        return planned
+        return planned, flops
 
     def _candidate(self, state: TrainState, batch: Batch, schedule: Schedule, placement, replicated,
                    split: int) -> Candidate:

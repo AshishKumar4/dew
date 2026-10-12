@@ -19,7 +19,7 @@ from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import REMAT_POLICIES
 from dew.nn.sharding import LayoutRefused
 from dew.objectives.lm import LMObjective
-from dew.training import Trainer, memory, planning, trainer as trainer_module
+from dew.training import Trainer, memory, planning, rungs, trainer as trainer_module
 from dew.training.distributed import Layout, MeshSpec, microbatch
 from dew.training.planning import Timer, planned, splits
 
@@ -147,8 +147,9 @@ def test_a_batch_that_does_not_fit_whole_is_split_before_anything_is_recomputed(
 
 
 def test_a_later_run_starts_its_search_at_the_plan_an_earlier_one_recorded(monkeypatch):
-    """The plan is recorded beside the compilation cache, so a restart
-    compiles the recorded candidate first, from the cache, and keeps it."""
+    """The plan is recorded beside the compilation cache, read before the step
+    traces, so a restart compiles the recorded candidate first, from the
+    cache, and keeps it, with the FLOPs the first run counted."""
     _, temps = trained(lm(split=1), steps=0)
     _, halves = trained(lm(split=2), steps=0)
     room(monkeypatch, (temps + halves) // 2)
@@ -156,8 +157,12 @@ def test_a_later_run_starts_its_search_at_the_plan_an_earlier_one_recorded(monke
     trained(first, steps=0)
     room(monkeypatch, 2 * temps)
     again = lm()
+    counted = []
+    monkeypatch.setattr(rungs, "step_flops", lambda executable: counted.append(executable))
     trained(again, steps=0)
     assert [probe["split"] for probe in again.plan["probes"]] == [first.plan["split"]]
+    # Every program came from the cache, so the step's FLOPs are the record's, its text unread.
+    assert counted == [] and again.step_flops == first.step_flops
 
 
 def test_a_pinned_split_is_read_as_given_and_its_state_holds_it():
