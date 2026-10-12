@@ -605,15 +605,18 @@ class Loader:
     def epoch_steps(self, epochs: int = 1) -> int:
         """Return the number of steps that `epochs` passes over the records take.
 
+        A batch ramp grows the batch over the run's first records once, so its
+        smaller early steps count once across all the passes, not once a pass.
         A stream without a record count has no epoch, so a run over it must
         give its length in steps instead.
         """
-        if self.steps_per_epoch is None:
+        if self.records is None:
             raise ValueError(
                 "epochs need a dataset with a record count; this one streams "
                 "without one, so give the run length in steps"
             )
-        return epochs * self.steps_per_epoch
+        records = epochs * self.records
+        return records // self.batch if self.ramp is None else self.ramp.steps_for(records, self.batch)
 
 
 CAPTION = "caption"

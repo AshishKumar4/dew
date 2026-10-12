@@ -765,11 +765,11 @@ class TrainerConfig:
                 return None
             raise ValueError("the run length is --trainer.steps or --trainer.epochs "
                              "or --trainer.total-tokens")
-        if dataset.steps_per_epoch is None:
+        if dataset.records is None:
             raise ValueError(
                 "epochs need a dataset with a record count; this one streams without "
                 "one, so give the run length as --trainer.steps")
-        return self.epochs * dataset.steps_per_epoch
+        return dataset.epoch_steps(self.epochs)
 
     def eval_interval(self, dataset: Loader) -> int | None:
         """Return the steps between validation passes over `data`, or None for never."""
