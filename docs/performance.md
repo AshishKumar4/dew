@@ -1616,6 +1616,40 @@ Dew does not set the variable. To compare bytes across processes on such a
 machine, set it, or pin every process to one core type (`taskset -c 0-15`
 for the 12900K's P-cores).
 
+### Collectives over several GPUs, 2026-10-12
+
+A GPU step whose mesh spans more than one device compiles with NVIDIA
+JAX-Toolbox's collective options (`dew.training.memory.COLLECTIVES`): the
+latency-hiding scheduler, all-reduce and all-gather combined up to 1 GiB and
+reduce-scatter up to 128 MiB, while-loop double buffering, and
+combine-by-dim off. A flag the run names stands. Llama-3.1-8B (random
+weights) over FSDP 2 on two H100 80GB HBM3 SXMs joined by NVLink, 2 x 4096
+tokens a step, JAX 0.11.2.post3, `XLA_FLAGS` empty, the trainer's own fit
+(a 1024 x 8192 head tile and minimal remat), 55 timed steps each, alternated:
+
+| ref | step ms | MFU |
+|---|---|---|
+| main 0290b93b2 | 557.3, 558.5 | 35.8% |
+| with the options, dfb40da61 | 537.9, 537.9 | 37.2% |
+
+That's 3.6% less time a step. The same options passed as `XLA_FLAGS`, with
+whole logits and minimal remat, took 539.3 to 519.5 ms (two runs each). With
+Toolbox's whole bundle, the step's all-gathers and reduce-scatters fell from
+376 and 162 to 48 and 66, on the same bytes. The bundle's other two options
+stay out: command buffers off cost 0.7% beside these, and XLA's
+rematerialization pass off changed nothing. Toolbox also names three
+pipelined-collective flags, which this XLA accepts in `XLA_FLAGS` and
+ignores; no compile accepts them as options. On one GPU there's nothing to
+combine: a dense 1.1B Llama on one H100 SXM ran within 0.4% with the whole
+bundle.
+
+```
+cd <dew checkout> && JAX_PLATFORMS=cuda XLA_FLAGS= XLA_PYTHON_CLIENT_MEM_FRACTION=0.90 PYTHONPATH=src \
+  python tools/reference_runs/dew_lm.py --model <Llama-3.1-8B config checkpoint> --data <2 x 4096 windows.npz> \
+  --work work.json --out run.json --batch 2 --mesh fsdp --dtype bfloat16 --steps 80 --timing-warmup 20 \
+  --attention auto --lr-init 0 --warmup 16
+```
+
 ## UNet batch scaling
 
 These numbers show where the unet, the architecture whose step is least
