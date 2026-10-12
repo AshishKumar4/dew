@@ -268,12 +268,21 @@ GIVEN = """import dataclasses
 
 
 @dataclasses.dataclass(frozen=True)
+class Shifted:
+    by: int
+    rejects = False
+
+    def __call__(self, row):
+        return {**row, "id": row["id"] + self.by}
+
+
+@dataclasses.dataclass(frozen=True)
 class Given:
-    step: object
+    by: int
     version: int = 1
 
     def __call__(self, metadata):
-        return self.step
+        return Shifted(self.by)
 """
 
 
@@ -283,14 +292,14 @@ def test_an_edit_to_a_configured_factorys_module_alone_is_environment(tmp_path, 
     that file that leaves the factory alone changes only the environment, so
     an exact resume reads on, where the plan names the step and where a
     memory read's rows name the steps that made them; the same factory
-    configured otherwise is refused."""
+    configured otherwise, to make the same step, is refused."""
     module = tmp_path / f"given_{uuid4().hex}.py"
     module.write_text(GIVEN)
     monkeypatch.syspath_prepend(str(tmp_path))
     given = importlib.import_module(module.stem).Given
 
     def reader(version):
-        configured = Configured(given(Shift(1), version), needs=())
+        configured = Configured(given(1, version), needs=())
         pipeline = Pipeline(source(8)).map(configured).shuffle(0).repeat().batch(2)
         return compile(pipeline, read=read, loading=READ).train(DataPartition())
 
@@ -301,7 +310,7 @@ def test_an_edit_to_a_configured_factorys_module_alone_is_environment(tmp_path, 
         expected = take(first, 2)
     finally:
         first.close()
-    module.write_text(GIVEN + "# an edit that leaves Given alone\n")
+    module.write_text(GIVEN + "# an edit that changes no code\n")
     edited = reader(1)
     try:
         edited.set_state(state)

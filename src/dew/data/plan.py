@@ -149,8 +149,8 @@ class Manifest:
     """The dependency manifest shared by an execution plan and its cache.
 
     `ran` are the steps a memory read already ran into a source it holds.
-    That source's snapshot names them by what they compute, so only their
-    modules reach the record from here, in the environment."""
+    That source's snapshot names them by what they compute, so the semantic
+    record leaves them out and the environment takes their modules."""
 
     source: Mapping[str, object]
     steps: tuple[StepIdentity, ...] = ()
