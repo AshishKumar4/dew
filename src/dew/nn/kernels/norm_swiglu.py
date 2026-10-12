@@ -263,13 +263,15 @@ def _norm_refusal(x, scale, dtype, axes, operands) -> str | None:
 
 
 def rms_kernel(implementation: str, x, scale, dtype, fp32_statistics: bool, *,
-                inverse_after_cast: bool = False, branch=None, axes=None) -> str:
+                inverse_after_cast: bool = False, branch=None, axes=None, activated: bool = False) -> str:
     """Resolve RMSNorm without changing its arithmetic or collecting a split
     feature axis. Float64 and input-dtype statistics belong to XLA, and so
-    does a residual `branch` the stream's own add would broadcast or cast.
-    `axes`, `x`'s logical axes, places the kernel on a mesh (`_placed`)."""
+    do a residual `branch` the stream's own add would broadcast or cast and
+    an activation after the norm. `axes`, `x`'s logical axes, places the
+    kernel on a mesh (`_placed`)."""
     return _selected('rms_norm', implementation, first_refusal(
         (not inverse_after_cast, "unweighted_rmsnorm rounds the inverse, not the normalized activation"),
+        (not activated, "the norm is followed by an activation, which the kernel does not apply"),
         (fp32_statistics, "input-dtype statistics round each reduction step; the kernel reduces in fp32"),
     ) or _norm_refusal(x, scale, dtype, axes, (branch,)))
 
