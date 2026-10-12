@@ -707,7 +707,7 @@ class TextToImage:
             assert prepared.rows is not None
             plan = RowPlan.over(mesh, prepared.rows)
             generated = _run(plan.sharding)(self.model, process, self.autoencoder, self.finish, count,
-                                         solver, chosen, self.final_denoise, times, decode, self.variables,
+                                         self.final_denoise, times, decode, solver, chosen, self.variables,
                                          prepared.conditions, prepared.unconditional,
                                          prepared.noise, jax.random.fold_in(request, 1))
         return replace(generated, rows=plan.rows)
@@ -830,9 +830,11 @@ def _noise(rows: jax.sharding.NamedSharding | None):
 
 @functools.cache
 def _run(rows: jax.sharding.NamedSharding | None):
-    # Rebinding weights must not change the static compilation identity.
-    def run(model, process, autoencoder, finish, steps, solver, guidance, final_denoise, times, decode,
-            params, given, null, x_T, key):
+    # Rebinding weights must not change the static compilation identity, nor a
+    # solver's or guidance's numbers: they are pytrees whose structure is static
+    # and whose numbers (a guidance scale, a Brownian seed) are data.
+    def run(model, process, autoencoder, finish, steps, final_denoise, times, decode,
+            solver, guidance, params, given, null, x_T, key):
         variables = {name: value for name, value in params.items() if name not in ("encoders", "autoencoder")}
         denoise = process.denoiser(model, variables, given, None if guidance is None else null)
         with jax.ensure_compile_time_eval():
@@ -850,5 +852,5 @@ def _run(rows: jax.sharding.NamedSharding | None):
         if finish is not None:
             images = finish(params, images)
         return Images(images, latents=latents)
-    return jax.jit(run, static_argnums=(0, 1, 2, 3, 4, 5, 6, 7, 8, 9),
-                   in_shardings=(None, rows, None, rows, None), out_shardings=rows)
+    return jax.jit(run, static_argnums=(0, 1, 2, 3, 4, 5, 6, 7),
+                   in_shardings=(None, None, None, rows, None, rows, None), out_shardings=rows)
