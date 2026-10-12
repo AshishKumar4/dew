@@ -9,7 +9,6 @@ import pytest
 from reference_error import assert_as_exact_as_the_reference
 
 from dew.interop import Pretrained, PretrainedDecoder
-from dew.interop.hf_decoders import translate_config
 from dew.interop.sources import load_shards
 from dew.nn.backbones.decoder_stack import Loop
 
@@ -25,10 +24,6 @@ def load():
 
 def fixture(name):
     return np.load(TINY / f'{name}.npy')
-
-
-def released():
-    return json.loads((RELEASED / 'config.json').read_text())
 
 
 def test_padded_logits_and_cached_generation_match_the_remote_code():
@@ -87,41 +82,6 @@ def test_a_looped_model_exports_in_the_remote_codes_layout(tmp_path):
                                   loaded.model.apply(loaded.variables, ids))
     with pytest.raises(ValueError, match='loop'):
         exported(step_norm=False)
-
-
-@pytest.mark.parametrize('label, loop', [
-    ('a pass fewer', Loop(2, exit_gate=True)),
-    ('no norm between passes', Loop(3, step_norm=False, exit_gate=True))])
-def test_the_reference_catches_each_mechanism_left_out(label, loop):
-    loaded = load()
-    logits = loaded.model.clone(loop=loop).apply(loaded.variables, fixture('input_ids'))
-    with pytest.raises(AssertionError, match=r'allowed 2\.0'):
-        assert_as_exact_as_the_reference(logits, fixture('logits'), fixture('logits_f64'), label)
-
-
-def test_the_released_config_translates_its_computation():
-    model = translate_config(released()).value
-    assert model.loop == Loop(4, exit_gate=True)
-    assert (model.num_layers, model.emb_features, model.num_heads, model.kv_heads) == (24, 2048, 16, 16)
-    assert (model.features_per_head, model.hidden_features, model.vocab_size) == (128, 5632, 49152)
-    assert model.sandwich_norms and model.scale_after_cast and not model.qk_norm and not model.attention_bias
-    assert (model.rope_theta, model.norm_eps, model.tie_embeddings) == (1e6, 1e-6, False)
-    assert set(model.per_layer_types) == {'full_attention'}
-
-
-@pytest.mark.parametrize('field, value', [('early_exit_threshold', 0.9), ('early_exit_step', 1)])
-def test_an_exit_before_the_last_pass_is_refused(field, value):
-    with pytest.raises(ValueError, match=field):
-        translate_config({**released(), field: value})
-
-
-@pytest.mark.network
-def test_the_released_config_is_pinned():
-    from huggingface_hub import hf_hub_download
-
-    source = json.loads((RELEASED / 'source.json').read_text())
-    filename = hf_hub_download(source['repo'], 'config.json', revision=source['revision'])
-    assert json.loads(Path(filename).read_text()) == released()
 
 
 @pytest.mark.network

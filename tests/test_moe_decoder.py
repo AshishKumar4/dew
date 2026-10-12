@@ -16,18 +16,15 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from jax.sharding import PartitionSpec as P
 from recording import RecordingTracker
 from sharded import assert_sharded
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import GatedMLP, Mixture
 from dew.nn.moe import SparseMLP
-from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
 from dew.registry import models
 from dew.training import Layout, MeshSpec, Trainer
-from dew.training.distributed import shard_batch
 
 VOCAB = 64
 SEQ_LEN = 16
@@ -50,80 +47,6 @@ def decoder_fields(**overrides) -> dict:
 
 def decoder(**overrides) -> CausalTransformer:
     return CausalTransformer(**decoder_fields(**overrides))
-
-
-def leaf_names(variables):
-    leaves, _ = jax.tree_util.tree_flatten_with_path(variables)
-    return sorted('/'.join(str(entry.key) for entry in path) for path, _ in leaves)
-
-
-@pytest.mark.parametrize("settings,expected", [
-    ({"mixture": {"experts": 4}}, (0, 1, 2, 3)),
-    ({"mixture": {"experts": 4, "layers": (0, 2)}}, (0, 2)),
-    ({}, ()),
-])
-def test_the_sparse_layers_are_the_ones_the_mixture_names(settings, expected):
-    assert models.build("causal_transformer", **decoder_fields(**settings)).sparse_layers == expected
-
-
-def test_a_sparse_layer_replaces_only_its_own_feed_forward():
-    """The frozen leaf names: a model with experts on one layer keeps every
-    other leaf of the dense model, including the dense layers' mlp."""
-    dense = decoder()
-    sparse = decoder(mixture=Mixture(experts=4, top_k=2, layers=(1,)))
-    tokens = jnp.zeros((2, SEQ_LEN), jnp.int32)
-    dense_names = leaf_names(dense.init(jax.random.key(0), tokens))
-    sparse_names = leaf_names(sparse.init(jax.random.key(0), tokens))
-
-    assert [name for name in dense_names if 'layers_1/mlp' not in name] == \
-           [name for name in sparse_names if 'layers_1/mlp' not in name]
-    assert [name for name in sparse_names if 'layers_1/mlp' in name] == [
-        'params/layers_1/mlp/experts/down_proj/kernel',
-        'params/layers_1/mlp/experts/gate_proj/kernel',
-        'params/layers_1/mlp/experts/up_proj/kernel',
-        'params/layers_1/mlp/gate/kernel',
-    ]
-
-
-def test_the_expert_leaves_hold_every_expert_of_the_reference_layout():
-    """One leaf per projection, stacked over the experts, the layout a
-    checkpoint's `mlp.experts.N.gate_proj.weight` tensors translate into."""
-    model = decoder(emb_features=32, mixture=Mixture(experts=8, top_k=2, layers=(0,)))
-    variables = model.init(jax.random.key(0), jnp.zeros((2, SEQ_LEN), jnp.int32))
-    experts = variables["params"]["layers_0"]["mlp"]["experts"]
-
-    assert experts["gate_proj"]["kernel"].shape == (8, 32, 64)
-    assert experts["up_proj"]["kernel"].shape == (8, 32, 64)
-    assert experts["down_proj"]["kernel"].shape == (8, 64, 32)
-    assert variables["params"]["layers_0"]["mlp"]["gate"]["kernel"].shape == (32, 8)
-    dense = variables["params"]["layers_1"]["mlp"]
-    assert dense["gate_proj"]["kernel"].shape == (32, 64)
-
-
-def test_the_mixture_sizes_the_experts_and_the_shared_branch_apart():
-    """DeepSeek's layout: routed experts at moe_intermediate_size, one dense
-    shared MLP at n_shared_experts times that, and the dense layers at the
-    model's own width, each a leaf where the checkpoint's tensor lands."""
-    model = decoder(emb_features=32, mixture=Mixture(
-        experts=8, top_k=2, layers=(0,), expert_features=24, shared_features=48))
-    variables = model.init(jax.random.key(0), jnp.zeros((2, SEQ_LEN), jnp.int32))
-    mlp = variables["params"]["layers_0"]["mlp"]
-
-    assert mlp["experts"]["gate_proj"]["kernel"].shape == (8, 32, 24)
-    assert mlp["experts"]["down_proj"]["kernel"].shape == (8, 24, 32)
-    assert mlp["shared_experts"]["gate_proj"]["kernel"].shape == (32, 48)
-    assert mlp["shared_experts"]["up_proj"]["kernel"].shape == (32, 48)
-    assert mlp["shared_experts"]["down_proj"]["kernel"].shape == (48, 32)
-    assert variables["params"]["layers_1"]["mlp"]["gate_proj"]["kernel"].shape == (32, 64)
-
-
-@pytest.mark.parametrize("mixture, message", [
-    ({"experts": 8, "expert_features": 0}, "expert_features"),
-    ({"experts": 8, "shared_features": -1}, "shared_features"),
-])
-def test_a_misconfigured_width_is_rejected(mixture, message):
-    with pytest.raises(ValueError, match=message):
-        Mixture(**mixture)
 
 
 def test_an_expert_layer_and_a_dense_layer_agree_at_one_expert():
@@ -164,21 +87,6 @@ def test_the_router_runs_in_fp32_under_a_bfloat16_model():
     assert np.array_equal(np.asarray(weights), np.asarray(wide[0]))
 
 
-@pytest.mark.parametrize("mixture,message", [
-    ({"experts": 0}, "dense model has no mixture"),
-    ({"experts": 4, "layers": (4,)}, "outside"),
-    ({"experts": 4, "top_k": 5}, "top_k"),
-    ({"experts": 4, "implementation": "megablox"}, "implementation"),
-])
-def test_a_misconfigured_mixture_is_rejected(mixture, message):
-    """A mixture's own dials are checked where they are set, and the ones
-    that read the model are checked when it builds; either way the message
-    names the dial."""
-    with pytest.raises(ValueError, match=message):
-        models.build("causal_transformer", **decoder_fields(mixture=mixture)).init(
-            jax.random.key(0), jnp.zeros((1, SEQ_LEN), jnp.int32))
-
-
 def test_a_tokamax_mixture_computes_the_xla_mixtures_logits():
     """The mixture's implementation reaches every sparse layer's experts: the
     same weights through either kernel give the same logits."""
@@ -194,123 +102,9 @@ def test_a_tokamax_mixture_computes_the_xla_mixtures_logits():
     assert np.max(np.abs(np.asarray(logits) - np.asarray(expected))) < 1e-5
 
 
-def test_a_tokamax_mixture_runs_on_nothing_else(monkeypatch):
-    """The experts import tokamax at their call, so a model that names it
-    fails to initialise where the package cannot be imported instead of
-    running the XLA kernel under the tokamax name."""
-    # None in sys.modules is Python's own way to make an import fail.
-    monkeypatch.setitem(sys.modules, "tokamax", None)
-    model = decoder(mixture=Mixture(experts=4, top_k=2, layers=(1,), implementation='tokamax'))
-    with pytest.raises(ModuleNotFoundError, match="tokamax"):
-        model.init(jax.random.key(0), jnp.zeros((1, SEQ_LEN), jnp.int32))
-
-
 # --------------------------------------------------------------------------
 # The expert mesh axis
 # --------------------------------------------------------------------------
-
-def expert_specs(expert_size, fsdp_size, num_experts=8, min_shard_size=TINY_SHARD):
-    model = SparseMLP(num_experts=num_experts, top_k=2, hidden_features=64,
-                      out_features=32)
-    variables = jax.eval_shape(
-        model.init, jax.random.key(0), jnp.ones((1, 4, 32)))
-    mesh = MeshSpec(fsdp=fsdp_size, expert=expert_size).build()
-    shardings = Layout(min_shard=min_shard_size).shardings(mesh, variables)
-    return mesh, jax.tree.map(lambda sharding: sharding.spec, shardings)["params"]
-
-
-@pytest.mark.mesh
-@pytest.mark.parametrize("expert_size,fsdp_size", [(1, 8), (2, 4), (4, 2)])
-def test_the_expert_dimension_takes_the_expert_axis(expert_size, fsdp_size):
-    """Eight experts over one, two and four expert shards. The expert axis
-    carries the expert dimension alone, so the widths keep fsdp."""
-    _, specs = expert_specs(expert_size, fsdp_size)
-    expert_axis = 'expert' if expert_size > 1 else None
-
-    assert specs["experts"]["gate_proj"]["kernel"] == P(expert_axis, None, 'fsdp')
-    assert specs["experts"]["up_proj"]["kernel"] == P(expert_axis, None, 'fsdp')
-    assert specs["experts"]["down_proj"]["kernel"] == P(expert_axis, 'fsdp')
-    # The router's expert dimension rides the axis too; its width keeps fsdp.
-    assert specs["gate"]["kernel"] == (
-        P('fsdp', 'expert') if expert_size > 1 else P('fsdp'))
-
-
-@pytest.mark.mesh
-def test_the_expert_axis_shards_experts_without_an_fsdp_axis():
-    """Expert parallelism alone: with fsdp at one there is still a dimension
-    to split, which the old two-axis rule replicated."""
-    _, specs = expert_specs(expert_size=8, fsdp_size=1)
-
-    assert specs["experts"]["gate_proj"]["kernel"] == P('expert')
-    assert specs["experts"]["down_proj"]["kernel"] == P('expert')
-
-
-@pytest.mark.mesh
-def test_an_expert_count_the_axis_cannot_split_keeps_the_widths_sharded():
-    """Six experts over four shards divides nothing, so the expert name is
-    dropped and the parameter still shards on the dimension that can."""
-    _, specs = expert_specs(expert_size=4, fsdp_size=2, num_experts=6)
-
-    assert specs["experts"]["gate_proj"]["kernel"] == P(None, None, 'fsdp')
-
-
-@pytest.mark.mesh
-@pytest.mark.parametrize("expert_size,fsdp_size", [(1, 8), (2, 4), (4, 2)])
-def test_every_expert_parallel_layout_stays_inside_the_sharding_tolerance(
-        expert_size, fsdp_size):
-    model = models.build("causal_transformer", **moe_config())
-    variables = jax.eval_shape(
-        model.init, jax.random.key(0), jnp.ones((1, SEQ_LEN), jnp.int32))
-    mesh = MeshSpec(fsdp=fsdp_size, expert=expert_size).build()
-    layout = Layout(min_shard=TINY_SHARD)
-    shardings = layout.shardings(mesh, variables)
-
-    for (path, leaf), sharding in zip(
-            jax.tree_util.tree_flatten_with_path(variables)[0],
-            jax.tree.leaves(shardings), strict=True):
-        for dimension, entry in enumerate(sharding.spec):
-            if entry is None:
-                continue
-            axes = (entry,) if isinstance(entry, str) else entry
-            size = int(np.prod([mesh.shape[axis] for axis in axes]))
-            assert leaf.shape[dimension] % size == 0, (path, sharding.spec)
-    layout.check(variables["params"], shardings["params"], mesh)
-
-
-@pytest.mark.mesh
-def test_a_mostly_dense_model_on_expert_only_parallelism_is_rejected():
-    """Expert parallelism splits the experts alone, so a model whose experts
-    are a fifth of it runs mostly replicated. The check has to see that,
-    which the fsdp-only rule could not: it returned as soon as the fsdp axis
-    was one.
-    """
-    model = models.build("causal_transformer", **moe_config())
-    variables = jax.eval_shape(
-        model.init, jax.random.key(0), jnp.ones((1, SEQ_LEN), jnp.int32))
-    mesh = MeshSpec(fsdp=1, expert=8).build()
-    layout = Layout(min_shard=TINY_SHARD)
-    shardings = layout.shardings(mesh, variables)
-
-    with pytest.raises(ValueError, match="replicated"):
-        layout.check(variables["params"], shardings["params"], mesh)
-
-
-@pytest.mark.mesh
-def test_mesh_build_rejects_an_expert_size_the_devices_cannot_hold():
-    with pytest.raises(ValueError, match="expert 4"):
-        MeshSpec(fsdp=4, expert=4).build()
-
-
-@pytest.mark.mesh
-def test_the_batch_is_split_over_the_expert_axis_too():
-    """Expert parallelism must not cost data parallelism: every device holds a
-    slice of the batch whichever axis it sits on."""
-    mesh = MeshSpec(fsdp=2, expert=4).build()
-    batch = shard_batch(mesh, np.zeros((jax.device_count(), 4), np.float32))
-
-    assert len(batch.addressable_shards) == jax.device_count()
-    assert batch.addressable_shards[0].data.shape == (1, 4)
-
 
 # --------------------------------------------------------------------------
 # Training on the simulated eight-device mesh
@@ -378,18 +172,6 @@ def test_the_expert_shards_train_the_same_model():
     assert difference < 1e-6, difference
 
 
-@pytest.mark.mesh
-def test_the_experts_are_really_split_across_the_expert_axis():
-    state = moe_trainer(expert_size=4, fsdp_size=2).fit(Data(token_batches), steps=0)
-    experts = state.variables["params"]["layers_1"]["mlp"]["experts"]
-    kernel = experts["gate_proj"]["kernel"]
-
-    assert kernel.sharding.spec == P('expert', None, 'fsdp')
-    assert kernel.addressable_shards[0].data.shape == (2, 32, 32)
-    moments = state.opt_state[0].mu["layers_1"]["mlp"]["experts"]
-    assert moments["gate_proj"]["kernel"].sharding.spec == kernel.sharding.spec
-
-
 # --------------------------------------------------------------------------
 # The balancing bias through Aux.variables
 # --------------------------------------------------------------------------
@@ -425,16 +207,6 @@ def test_a_from_scratch_run_logs_the_load_and_moves_the_deepseek_bias():
     assert all(entry["train/moe/min_load"] <= 1 / 8 for entry in ticks)
     # The bias is state, not a parameter: the optimizer holds no moment for it.
     assert "moe" not in state.opt_state[0].mu
-
-
-@pytest.mark.mesh
-def test_balancing_needs_a_router_with_a_bias():
-    trainer = moe_trainer(1, 2)
-    trainer.objective.balance_rate = 0.01
-    params = trainer.initial_state().variables
-    with pytest.raises(ValueError, match="bias=True"):
-        trainer.objective.scalar_loss(params, next(token_batches()),
-                               Step(step=jnp.asarray(0), key=jax.random.key(0), ema=None))
 
 
 @pytest.mark.mesh

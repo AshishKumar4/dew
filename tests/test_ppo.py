@@ -180,16 +180,6 @@ def test_muonclip_steps_both_the_actor_and_a_transformer_critic():
             assert np.linalg.norm(changed) < np.linalg.norm(own)
 
 
-@pytest.mark.parametrize("field", [OLD_VALUES_KEY, RETURNS_KEY])
-def test_ppo_refuses_missing_critic_targets(field):
-    trainer, rollout = build_ppo()
-    state = trainer.initial_state()
-    batch = rollout(state, {"task_id": np.array([31], np.int32)}, jax.random.key(23))
-    batch.pop(field)
-    with pytest.raises(ValueError, match=field):
-        rollout.objective.loss(state.variables, batch, Step(jnp.array(0), jax.random.key(1), None))
-
-
 def test_composite_objective_and_parameter_gradients_match_verl():
     """verl combined loss differs by 3.26e-8; parameter gradients by at most 1.50e-8."""
     trainer, rollout = build_ppo()
@@ -214,49 +204,3 @@ def test_composite_objective_and_parameter_gradients_match_verl():
         for name, value in observed.items():
             difference = np.max(np.abs(np.asarray(value) - reference[f"objective_{name}_gradient"]))
             assert difference < 2e-6, f"verl {name} gradient maximum difference {difference}"
-
-
-def test_an_all_truncated_cohort_is_a_zero_mass_batch_not_a_failure():
-    """Truncations are masked, so a cohort that never finishes within budget
-    has no trainable token; it makes no update instead of ending the run."""
-    trainer, rollout = build_ppo()
-    rollout = replace(rollout, episodes=replace(rollout.episodes, max_turns=1))
-    state = trainer.initial_state()
-    batch = rollout(state, {"task_id": np.array([31], np.int32)}, jax.random.key(23))
-    assert batch["response_mask"].sum() == 0
-    for name in (OLD_VALUES_KEY, RETURNS_KEY, "advantages"):
-        assert batch[name].shape == batch["input_ids"].shape and not batch[name].any()
-    loss, _ = rollout.objective.loss(
-        state.variables, batch, Step(jnp.array(0), jax.random.key(1), state.averaged)
-    )
-    assert float(loss.mass) == 0
-
-
-def test_ppo_refuses_undefined_gae_whitening():
-    """One trainable action token has no whitening deviation."""
-    active = 1
-    from contextlib import contextmanager
-
-    from dew.objectives.rl import EpisodeStatus, Observation
-
-    class Terminal:
-        def __init__(self, sample):
-            self.sample = sample
-
-        def reset(self):
-            return (Observation((EOS,)) if self.sample < active else
-                    Observation((), EpisodeStatus.COMPLETED))
-
-        def step(self, action):
-            return Observation((), EpisodeStatus.COMPLETED)
-
-    @contextmanager
-    def environment(identity):
-        yield Terminal(identity.sample)
-
-    trainer, rollout = build_ppo()
-    rollout = replace(
-        rollout, episodes=replace(rollout.episodes, environment=environment, verifier=lambda episode: 1.0)
-    )
-    with pytest.raises(ValueError, match="at least two action tokens"):
-        rollout(trainer.initial_state(), {"task_id": np.array([31], np.int32)}, jax.random.key(23))

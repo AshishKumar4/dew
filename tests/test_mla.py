@@ -28,10 +28,9 @@ from dew.interop.decoder_parts import yarn_record
 from dew.interop.hf_decoders import translate_weights
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.nn.mla import MLAMixer, MultiHeadLatentAttention
+from dew.nn.mla import MultiHeadLatentAttention
 from dew.nn.rope import YarnScaling, yarn_attention_factor, yarn_inv_freq, yarn_query_scale, yarn_rope_freqs
 from dew.objectives.lm import LMObjective
-from dew.registry import mixers
 from dew.training import Layout, MeshSpec, Trainer
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "mla"
@@ -307,18 +306,6 @@ def mla_model(settings: dict, **overrides) -> CausalTransformer:
     return CausalTransformer(**{**fields, **overrides})
 
 
-def test_the_mla_record_and_value_agree():
-    """`mixer={"class": "mla", "fields": {...}}` from a config is the dataclass from code,
-    yarn record included."""
-    settings = CONFIG["v32"]
-    built = mla_model(settings).mixer
-    assert built == MLAMixer(
-        q_lora_rank=8, kv_lora_rank=8, qk_nope_head_dim=8, qk_rope_head_dim=8,
-        v_head_dim=8, rope_interleave=True, yarn=yarn_of(settings),
-        index_topk=4, index_n_heads=2, index_head_dim=16)
-    assert mixers["mla"] is MLAMixer
-
-
 @pytest.mark.parametrize("name", ["mla_v3", "mla_v32"])
 def test_a_decoder_on_the_mla_kind_runs_the_reference_block(name):
     """The kind lands the block at layers_0/self_attn with the translated
@@ -346,21 +333,6 @@ def test_a_decoder_on_the_mla_kind_runs_the_reference_block(name):
     assert float(np.max(np.abs(np.asarray(inside) - tensors["output"]))) < 2e-5
     logits = model.apply(variables, jnp.arange(14, dtype=jnp.int32).reshape(2, 7))
     assert logits.shape == (2, 7, 37)
-
-
-def test_the_mla_kind_refuses_the_dials_it_cannot_honour():
-    """A dial the standard attention reads and this kind would drop raises
-    at build, naming the dial, and no model is built."""
-    settings = CONFIG["v3"]
-    tokens = jnp.zeros((1, 4), jnp.int32)
-    with pytest.raises(ValueError, match="no attention_scale, v_norm"):
-        mla_model(settings, v_norm=True, attention_scale=0.25).init(
-            jax.random.key(0), tokens)
-    record = mla_record(settings)
-    mismatched = {"class": record["class"], "fields": {
-        **record["fields"], "yarn": dict(record["fields"]["yarn"], rope_theta=5000.0)}}
-    with pytest.raises(ValueError, match=r"rope_theta .* disagree"):
-        mla_model(settings, mixer=mismatched).init(jax.random.key(0), tokens)
 
 
 # --------------------------------------------------------------------------

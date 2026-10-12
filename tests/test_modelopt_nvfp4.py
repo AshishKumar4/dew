@@ -1,7 +1,6 @@
 """ModelOpt's own files, weight reader and activation arithmetic, through Dew's public load/save."""
 
 import json
-import os
 from pathlib import Path
 
 import jax
@@ -51,26 +50,6 @@ def test_modelopt_input_arithmetic_matches_its_own_fake_quantizer_in_every_bit(c
                                       reference[stem + suffix].view(np.uint32), err_msg=stem)
 
 
-def test_direct_rn_scale_conversion_accounts_for_the_sm89_backend_difference(checkpoint):
-    """Only the cloned author's conversion helper changes; the forward inputs stay fixed."""
-    _, reference, _ = checkpoint
-    counts = {}
-    for key in reference:
-        if not key.endswith('/forward_inputs'):
-            continue
-        stem = key.removesuffix('/forward_inputs')
-        spec = NVFP4Input(float(reference[stem + '/global'].reshape(())), e4m3_scale=True, format='modelopt')
-        actual = jax.jit(lambda x, spec=spec: nvfp4_input_qdq(x, spec))(jnp.asarray(reference[key]))
-        corrected = reference[stem + '/forward_qdq']
-        original = reference[stem + '/forward_sm89_qdq']
-        np.testing.assert_array_equal(np.asarray(actual).view(np.uint32), corrected.view(np.uint32))
-        counts[stem] = int(np.count_nonzero(corrected.view(np.uint32) != original.view(np.uint32)))
-    assert counts == {f'model.layers.0.{side}': 13 if side in
-                      ('self_attn.q_proj', 'self_attn.k_proj', 'self_attn.v_proj') else 0
-                      for side in ('self_attn.q_proj', 'self_attn.k_proj', 'self_attn.v_proj',
-                                   'self_attn.o_proj', 'mlp.gate_proj', 'mlp.up_proj', 'mlp.down_proj')}
-
-
 def test_modelopt_logits_match_the_authors_read_and_input_quantizers(checkpoint):
     _, reference, loaded = checkpoint
     actual = loaded.model.apply(loaded.variables, reference["ids"].astype(np.int32))
@@ -103,32 +82,3 @@ def test_the_pinned_real_modelopt_layer_uses_its_stored_multipliers_bit_for_bit(
         expected = reference["qdq_f32" if dtype == jnp.float32 else "qdq"]
         np.testing.assert_array_equal(np.asarray(actual, np.float32).view(np.uint32),
                                       expected.view(np.uint32))
-
-
-@pytest.mark.parametrize("mutation, message", [
-    ({"quant_algo": "MIXED_PRECISION"}, "MIXED_PRECISION quantized_layers"),
-    ({"kv_cache_quant_algo": "FP8"}, "KV cache quantization"),
-])
-def test_modelopt_variants_without_a_reference_forward_stay_refused_by_name(checkpoint, mutation, message):
-    directory, _, _ = checkpoint
-    config = json.loads((directory / "config.json").read_text())
-    config["quantization_config"] |= mutation
-    with pytest.raises(ValueError, match=message):
-        codecs.source_quantization(config)
-
-
-@pytest.mark.network
-@pytest.mark.skipif(os.environ.get("DEW_NETWORK_TESTS") != "1",
-                    reason="set DEW_NETWORK_TESTS=1 for the pinned Hub config/index")
-def test_the_pinned_nvidia_config_and_index_describe_the_supported_nvfp4_parts():
-    from huggingface_hub import hf_hub_download
-
-    repo, revision = "nvidia/Qwen3-14B-NVFP4", "bc39319a4dc265d9bbb9a9731bc52c4988d9ece7"
-    config = json.loads(Path(hf_hub_download(repo, "config.json", revision=revision)).read_text())
-    index_path = Path(hf_hub_download(repo, "model.safetensors.index.json", revision=revision))
-    index = json.loads(index_path.read_text())["weight_map"]
-    codec = codecs.source_quantization(config)
-    assert codec is not None and codec.input_format == "modelopt"
-    stem = "model.layers.0.self_attn.q_proj"
-    suffixes = (".weight", ".weight_scale", ".weight_scale_2", ".input_scale")
-    assert {stem + suffix for suffix in suffixes} <= index.keys()

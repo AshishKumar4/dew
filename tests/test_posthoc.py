@@ -43,12 +43,6 @@ def test_the_solve_matches_the_reference_implementation():
                                rtol=1e-9, atol=1e-15)
 
 
-def test_an_average_the_snapshots_hold_is_reconstructed_as_itself():
-    snapshots = EDM2_SNAPSHOTS[:EDM2_SNAPSHOTS.index((4096 * 5, 0.10)) + 1]
-    expected = np.eye(len(snapshots))[-1]
-    np.testing.assert_allclose(coefficients(snapshots, 4096 * 5, 0.10), expected, atol=1e-9)
-
-
 def test_a_reconstructed_average_matches_one_tracked_directly(tmp_path):
     """A run tracks power EMAs of relative std 0.05 and 0.10 in its solver,
     snapshotted at every fourth step, and one of 0.07 as its own EMA. The

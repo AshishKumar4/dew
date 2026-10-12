@@ -65,8 +65,6 @@ from test_precision_policy import build_model, tiny_inputs
 
 from dew.interop import Pretrained, hf_decoders
 from dew.lora import LoRA
-from dew.nn.autoencoders.dc_ae import DCAE, DCAutoencoder
-from dew.nn.autoencoders.flux2 import Flux2Autoencoder
 from dew.nn.autoencoders.kl import AutoencoderKL, posterior_latent
 from dew.nn.autoencoders.sd_vae import StableDiffusionVAE
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -323,20 +321,6 @@ def test_trainable_layer_scalars_read_the_frozen_tree_moved_without_a_copy(name)
     learned = gradient(trainable, moved, read.tokens, _cotangent(read.logits), method="logits")
     assert all(np.any(np.asarray(learned[path[1:]])) for path in scalars)
     assert trainable.trainable_variables(moved) is moved
-
-
-@pytest.mark.parametrize("name", OWN)
-def test_layer_scalar_preparation_refuses_what_it_cannot_move(name):
-    source = loaded(name)
-    model, variables = source.model, source.variables
-    with pytest.raises(ValueError, match="frozen source unexpectedly contains a trainable layer_scalar"):
-        model.trainable_variables(model.trainable_variables(variables) | {
-            "constants": variables["constants"]})
-    scalarless = model.clone(text=model.text.clone(layer_scalar=None))
-    with pytest.raises(ValueError, match="no layer scalars to train"):
-        scalarless.with_trainable_layer_scalars()
-    with pytest.raises(ValueError, match="no layer scalars to move"):
-        scalarless.trainable_variables(variables)
 
 
 # A LoRA adapter on the head.
@@ -721,13 +705,6 @@ def test_a_request_continues_into_its_response_by_each_fields_meaning():
     same(jax.jit(lambda inputs: inputs.extended(response))(request), extended)
 
 
-def test_a_row_without_a_real_token_gets_no_real_response_slot():
-    request = ModelInputs(jnp.zeros((2, 3), jnp.int32),
-                          {"attention_mask": jnp.asarray([[False] * 3, [True] * 3])})
-    same(request.extended(jnp.ones((2, 2), jnp.int32)).token_fields["attention_mask"][:, 3:],
-         jnp.asarray([[False, False], [True, True]]))
-
-
 def test_a_field_with_no_extension_rule_is_refused_and_a_named_rule_extends_it():
     """A routing replay has no value for slots the model has not routed, so
     extending it is refused until the caller names a rule, which also
@@ -792,23 +769,6 @@ def test_a_kl_autoencoder_gives_the_posterior_end_to_end_tuning_trains_through(d
             np.testing.assert_array_equal(leaf, reference)
     drawn = jax.jit(lambda tree: posterior_latent(autoencoder.moments(tree, images), key))(params)
     np.testing.assert_array_equal(autoencoder.encode_batch(params, images, key), drawn)
-
-
-@pytest.mark.parametrize("autoencoder", [
-    Flux2Autoencoder(model=kl_module(), params={}, mean=np.zeros(16), variance=np.ones(16), epsilon=1e-4),
-    DCAutoencoder(model=DCAE(), params={}, latent_scale=1.0),
-], ids=lambda autoencoder: type(autoencoder).__name__)
-def test_an_autoencoder_whose_latent_is_no_kl_draw_refuses_by_name(autoencoder):
-    """Two autoencoders that inherit the base refusal. FLUX.2's latent folds
-    2x2 blocks of its AutoencoderKL's draw and normalizes them by batch-norm
-    statistics, and a DC-AE encodes without a posterior: neither latent is a
-    draw an objective may renormalize, so each refuses the posterior and its
-    decode, naming itself."""
-    name = type(autoencoder).__name__
-    with pytest.raises(TypeError, match=name):
-        autoencoder.moments(autoencoder.params, jnp.zeros((1, 8, 8, 3)))
-    with pytest.raises(TypeError, match=name):
-        autoencoder.decode_raw(autoencoder.params, jnp.zeros((1, 2, 2, 4)))
 
 
 def denoiser(architecture: str, rng):

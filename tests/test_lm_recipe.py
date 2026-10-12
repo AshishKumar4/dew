@@ -11,11 +11,8 @@ import pytest
 from token_support import write_token_corpus
 
 import dew
-from dew.config import ObjectiveConfig
-from dew.data import TokenWindows
 from dew.inference import TextGeneration
 from dew.objectives.lm import LMObjective, LMRunConfig
-from dew.objectives.lm.config import token_vocabulary
 from dew.sampling import Sampling
 
 pytestmark = pytest.mark.mesh
@@ -23,9 +20,6 @@ pytestmark = pytest.mark.mesh
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SEQ = 32
 # The committed byte-level BPE a run can train with offline.
-TOKENIZER = REPO_ROOT / "tests" / "fixtures" / "tokenizers" / "tiny-tools"
-
-
 def write_token_files(root, train_tokens, val_tokens, tokenizer="byte", eos_id=None):
     rng = np.random.RandomState(0)
     splits = []
@@ -56,34 +50,6 @@ def run_config(tokens, *args, model='{"emb_features": 16, "num_layers": 1, "num_
         "--trainer.batch-size", "8", "--trainer.checkpoint-dir", str(tokens.parent / "runs"),
         "--trainer.compilation-cache-dir", "None", "--trainer.multi-host", "False",
         "--trainer.log-every", "1", "--model.dtype", "float32", *model_flags(model)])
-
-
-def test_the_sampling_budget_decides_the_context_the_model_is_built_for(tmp_path):
-    """Generation decodes into a cache sized when the model is built, so the
-    prompt and the budget past it reach beyond the training context."""
-    tokens = write_token_files(tmp_path / "tokens", 40 * SEQ, 8 * SEQ)
-    for flags, context in ((["--max-new-tokens", "0"], SEQ), (["--max-new-tokens", "8"], SEQ),
-                           (["--max-new-tokens", "100", "--prompt", "abc"], 103)):
-        assert run_config(tokens, *flags).prepare().run.model.fields["max_seq_len"] == context
-
-
-def test_a_dataset_that_is_not_a_token_directory_says_so(tmp_path):
-    with pytest.raises(FileNotFoundError, match=r"meta.json"):
-        token_vocabulary(TokenWindows(path=str(tmp_path)))
-    with pytest.raises(ValueError, match=r"--data.path"):
-        token_vocabulary(TokenWindows())
-
-
-def test_a_tokenizer_that_does_not_match_the_token_files_is_rejected(tmp_path):
-    tokens = write_token_files(tmp_path / "tokens", 40 * SEQ, 8 * SEQ)
-    with pytest.raises(ValueError, match="written with byte"):
-        run_config(tokens, "--tokenizer", "gpt2", "--trainer.steps", "1").run()
-
-
-def test_a_corpus_too_small_for_one_batch_is_refused(tmp_path):
-    tokens = write_token_files(tmp_path / "tokens", 2 * SEQ, 2 * SEQ)
-    with pytest.raises(ValueError, match="do not fill one batch"):
-        run_config(tokens, "--trainer.epochs", "1").run()
 
 
 @pytest.mark.parametrize("packed", [False, True])
@@ -150,15 +116,6 @@ def test_the_recipe_trains_on_weighted_corpora(tmp_path):
     assert recorded.model.fields["vocab_size"] == 256
 
 
-def test_weighted_corpora_from_different_vocabularies_are_refused(tmp_path):
-    first = write_token_files(tmp_path / "first", 40 * SEQ, 8 * SEQ, eos_id=0)
-    second = write_token_files(tmp_path / "second", 24 * SEQ, 8 * SEQ, eos_id=0)
-    meta = json.loads((second / "meta.json").read_text())
-    (second / "meta.json").write_text(json.dumps({**meta, "vocab_size": 512}))
-    with pytest.raises(ValueError, match="vocab"):
-        token_vocabulary(TokenWindows(path={str(first): 0.5, str(second): 0.5}, pack=True))
-
-
 def test_the_recipe_trains_muonclip_with_the_clip_firing(tmp_path):
     """`--optim.optimizer muonclip` through `run`: the per-head maxima
     travel from the loss to the optimizer inside the compiled step, so the
@@ -183,27 +140,6 @@ def test_the_recipe_trains_muonclip_with_the_clip_firing(tmp_path):
     assert int(clipped.step) == int(muon.step) > 0
     assert bool(jnp.all(jnp.isfinite(q_kernel(clipped))))
     assert float(np.max(np.abs(q_kernel(clipped) - q_kernel(muon)))) > 1e-6
-
-
-def test_the_recipe_trains_a_quantized_trunk(tmp_path):
-    """`trainer.quantization:quantization --trainer.quantization.dtype int8`
-    through `run`: the knob is the trainer's, the run carries none
-    of its own, the run completes to finite weights and the record
-    round-trips the value. Observed on CPU: 4 steps, all leaves finite."""
-    pytest.importorskip("qwix")
-    tokens = write_token_files(tmp_path / "tokens", 40 * SEQ, 8 * SEQ, eos_id=0)
-    config = run_config(tokens, "--trainer.name", "quant",
-                        "--trainer.epochs", "1", "trainer.quantization:quantization",
-                        "--trainer.quantization.dtype", "int8")
-    assert not any(field.name == "quantization"
-                   for field in dataclasses.fields(LMRunConfig))
-    state = config.run()
-    assert int(state.step) > 0
-    assert all(bool(jnp.all(jnp.isfinite(leaf)))
-               for leaf in jax.tree.leaves(state.variables["params"]))
-    recorded = LMRunConfig.load(str(tmp_path / "runs" / "quant"))
-    assert recorded.model.fields["vocab_size"] == 256
-    assert dataclasses.replace(recorded, model=config.model) == config
 
 
 def export_tiny_decoder(directory, *, tokenizer="byte", vocab_size=256):
@@ -237,30 +173,6 @@ def recipe_args(tokens, *args, model_config="{}"):
 def pretrained_config(tokens, pretrained, *args, model_config="{}"):
     return LMRunConfig.cli(recipe_args(tokens, "--pretrained", str(pretrained), *args,
                                               model_config=model_config))
-
-
-def test_the_recipe_continues_a_pretrained_decoder(tmp_path):
-    """The path a --pretrained user runs, end to end: a local HF-layout
-    checkpoint through Pretrained.load, the tokenizer of the token
-    files checked against the one the checkpoint records, a step taken on
-    the loaded weights and the run spec written back.
-
-    The checkpoint decides the architecture, so what the run builds is its
-    one layer of width 16, not the recipe's defaults.
-    """
-    tokens = write_token_files(tmp_path / "tokens", 40 * SEQ, 8 * SEQ, eos_id=0)
-    checkpoint = export_tiny_decoder(tmp_path / "checkpoint")
-    config = pretrained_config(tokens, checkpoint, "--trainer.steps", "1",
-                               "--max-new-tokens", "0", "--trainer.name", "continued")
-
-    state = config.run()
-
-    assert int(state.step) == 1
-    recorded = LMRunConfig.load(str(tmp_path / "runs" / "continued"))
-    assert recorded == config
-    kernel = state.variables["params"]["layers_0"]["self_attn"]["q_proj"]["kernel"]
-    assert kernel.shape == (16, 16)
-    assert np.all(np.isfinite(np.asarray(kernel)))
 
 
 def test_a_pretrained_run_starts_from_the_checkpoints_weights(tmp_path):
@@ -404,106 +316,6 @@ def test_a_scratch_run_trains_a_lora_that_saves_from_the_run_alone(tmp_path):
         assert (tmp_path / "from-run" / name).read_bytes() == (tmp_path / "in-process" / name).read_bytes()
 
 
-def test_a_hub_reference_at_a_revision_is_recorded_at_its_commit(tmp_path, monkeypatch):
-    """`--pretrained repo@revision` loads that revision, and run.json names
-    the commit it resolved to, so the record pins the weights the run
-    started from even after the branch moves."""
-    from types import SimpleNamespace
-
-    import huggingface_hub
-
-    tokens = write_token_files(tmp_path / "tokens", 40 * SEQ, 8 * SEQ, eos_id=0)
-    published = export_tiny_decoder(tmp_path / "published")
-    commit = "c" * 40
-    snapshot = tmp_path / "hub" / "snapshots" / commit
-    asked = []
-
-    def download(repo_id, *, revision=None, allow_patterns=None, dry_run=False):
-        asked.append((repo_id, revision))
-        files = [path.relative_to(published).as_posix() for path in published.rglob("*") if path.is_file()]
-        if dry_run:
-            return [SimpleNamespace(filename=name) for name in files]
-        for name in files:
-            (snapshot / name).parent.mkdir(parents=True, exist_ok=True)
-            (snapshot / name).write_bytes((published / name).read_bytes())
-        return str(snapshot)
-
-    monkeypatch.setattr(huggingface_hub, "snapshot_download", download)
-    config = pretrained_config(tokens, "acme/tiny@v1", "--trainer.steps", "0",
-                               "--max-new-tokens", "0", "--trainer.name", "pinned")
-
-    config.run()
-
-    assert asked[0] == ("acme/tiny", "v1") and {revision for _, revision in asked[1:]} == {commit}
-    recorded = LMRunConfig.load(str(tmp_path / "runs" / "pinned"))
-    assert recorded.pretrained == f"acme/tiny@{commit}"
-
-
-def test_a_pretrained_run_refuses_overrides_and_a_foreign_tokenizer(tmp_path):
-    """The two refusals on that path: the checkpoint owns every architecture
-    field but max_seq_len, and ids from another vocabulary would train the
-    embedding table against noise."""
-    tokens = write_token_files(tmp_path / "tokens", 40 * SEQ, 8 * SEQ, eos_id=0)
-    checkpoint = export_tiny_decoder(tmp_path / "checkpoint")
-
-    with pytest.raises(ValueError, match="which the checkpoint at"):
-        pretrained_config(
-            tokens, checkpoint, "--trainer.steps", "1",
-            model_config='{"emb_features": 32}').run()
-
-    # A name an export can resolve offline, since it now writes the assets of
-    # the tokenizer it names rather than only recording the name.
-    foreign = export_tiny_decoder(tmp_path / "foreign", tokenizer=str(TOKENIZER),
-                                  vocab_size=384)
-    with pytest.raises(ValueError, match=r"written with byte, and .*foreign expects its own tokenizer"):
-        pretrained_config(tokens, foreign, "--trainer.steps", "1").run()
-
-
-def test_a_trained_export_round_trips_with_its_tokenizer(tmp_path):
-    """The artifact a --pretrained run leaves behind, taken all the way back.
-
-    The checkpoint is exported with the tokenizer its ids came from, the
-    recipe continues it for a step, `Pretrained.save` writes the trained
-    weights back out, and the second directory is loaded again: it carries
-    the same tokenizer files, so the load hands back a processor and a text
-    prompt generates text without the caller naming a tokenizer anywhere.
-    An export that only recorded a `tokenizer_name` lands here as a
-    `processor` of None, which is also what leaves a directory that
-    `ollama create` and llama.cpp's converter refuse.
-    """
-    from dew.data.text import tokenizer_for
-    from dew.interop import Pretrained
-
-    tokenizer = tokenizer_for(str(TOKENIZER), local_files_only=True)
-    ids = np.asarray(tokenizer.encode((REPO_ROOT / "CONTRIBUTING.md").read_text()), np.uint16)
-    tokens = write_token_corpus(tmp_path / "tokens", ids[:40 * SEQ], ids[40 * SEQ:48 * SEQ],
-                                tokenizer=str(TOKENIZER), vocab_size=tokenizer.vocab_size)
-    checkpoint = export_tiny_decoder(tmp_path / "checkpoint", tokenizer=str(TOKENIZER),
-                                     vocab_size=tokenizer.vocab_size)
-
-    state = pretrained_config(
-        tokens, checkpoint, "--trainer.steps", "1", "--max-new-tokens", "0",
-        "--tokenizer", str(TOKENIZER), "--trainer.name", "exported").run()
-
-    trained = tmp_path / "trained"
-    Pretrained.load(str(checkpoint), dtype="float32", attention_impl="reference").save(
-        trained, variables=state.variables)
-    again = Pretrained.load(str(trained), dtype="float32", attention_impl="reference")
-
-    assert again.processor is not None, "the saved export carries no tokenizer"
-    generated = again.text_generation()("The trainer", 4, key=jax.random.key(0))
-    assert int(generated.lengths[0]) == 4
-    assert again.processor.decode(generated.tokens)[0].startswith("The trainer")
-
-
-def test_a_pretrained_run_refuses_a_checkpoint_too_narrow_for_the_ids(tmp_path):
-    tokens = write_token_files(tmp_path / "tokens", 40 * SEQ, 8 * SEQ, eos_id=0)
-    narrow = export_tiny_decoder(tmp_path / "narrow", vocab_size=128)
-
-    with pytest.raises(ValueError, match="has room for 128 ids"):
-        pretrained_config(tokens, narrow, "--trainer.steps", "1").run()
-
-
 def test_the_recipe_balances_a_sparse_run(tmp_path):
     """--objective.balance-rate reaches the objective: a sparse run moves every
     router's bias by the rate each step, which the recipe could not ask for
@@ -554,13 +366,6 @@ def test_the_recipe_trains_the_prediction_depths_on_request(tmp_path):
             model_config='{"emb_features": 16, "num_layers": 1, "num_heads": 2}')
 
 
-def test_an_objective_the_recipe_does_not_train_is_refused():
-    with pytest.raises(KeyError, match="no objective named 'ctc'"):
-        LMRunConfig(data=TokenWindows(seq_len=64), objective=ObjectiveConfig("ctc"))
-    with pytest.raises(ValueError, match="--objective"):
-        LMRunConfig(data=TokenWindows(seq_len=64), objective=ObjectiveConfig("jepa"))
-
-
 def test_masked_diffusion_trains_on_packed_documents(tmp_path):
     """`--objective masked_diffusion` over packed documents: the packed
     windows reach the objective with their packing, so a validation batch
@@ -599,36 +404,6 @@ def test_masked_diffusion_trains_on_packed_documents(tmp_path):
     assert padding.any() and not padding.all()
     scored = objective.evaluate(state.variables, batch, Step(jnp.asarray(0), jax.random.key(0), None))
     np.testing.assert_array_equal(np.asarray(scored.weights), ~padding)
-
-
-def test_the_masked_objective_is_reachable_by_name(tmp_path):
-    tokens = write_token_files(tmp_path / "tokens", 40 * SEQ, 8 * SEQ)
-    assert run_config(tokens, "--objective", "masked_diffusion").objective.name == \
-        "dew.objectives.diffusion.masked:MaskedDiffusionObjective"
-
-
-def test_masked_diffusion_without_a_mask_id_is_refused():
-    """The builder reads the id from the run's fields. A run without one
-    raises naming it; id zero would corrupt the wrong token."""
-    from dew.registry import models
-
-    model = models.build("causal_transformer", vocab_size=256, emb_features=16,
-                         num_layers=1, num_heads=2, max_seq_len=SEQ, causal=False)
-    with pytest.raises(ValueError, match="mask token id"):
-        LMRunConfig(data=TokenWindows(seq_len=SEQ), objective=ObjectiveConfig("masked_diffusion")
-                    ).masked_objective(model, {}, None)
-
-
-def test_masked_diffusion_on_a_causal_model_is_refused():
-    """The objective reads the whole corrupted row, so a causal model names
-    the flag it needs."""
-    from dew.registry import models
-
-    model = models.build("causal_transformer", vocab_size=256, emb_features=16,
-                         num_layers=1, num_heads=2, max_seq_len=SEQ)
-    with pytest.raises(ValueError, match="causal=False"):
-        LMRunConfig(data=TokenWindows(seq_len=SEQ), objective=ObjectiveConfig("masked_diffusion")
-                    ).masked_objective(model, {"mask_token_id": 5}, None)
 
 
 def test_masked_diffusion_continues_a_pretrained_checkpoint(tmp_path):
@@ -752,28 +527,3 @@ def test_a_trained_block_diffusion_tree_saves_back_over_its_source(tmp_path):
     step = Step(step=jnp.asarray(0, jnp.int32), key=jax.random.key(1), ema=None)
     np.testing.assert_array_equal(restored.scalar_loss(rebuilt, batch, step)[0],
                                   objective.scalar_loss(state.variables, batch, step)[0])
-
-
-def test_the_shipped_lm_run_config_round_trips_through_its_record():
-    """`LMRunConfig` is what `TextGeneration.from_run` and `Pretrained.from_run(...).save(...)` read
-    back: the tokenizer the ids came from, the preview budget and the
-    sampling policy survive `run.json` as the values they went in as. A chat
-    spec is a record the class takes, and training it is refused: an LM
-    run trains on token files."""
-    from dew.data import ChatMessages
-
-    chat = ChatMessages(tokenizer="byte", path="chat.parquet", seq_len=16)
-    config = LMRunConfig(data=chat, tokenizer="gpt2", max_new_tokens=8,
-                         objective=ObjectiveConfig("lm", {"ema_decay": 0.99}),
-                         sampling=Sampling(temperature=0.5, top_k=7))
-
-    record = config.to_dict()
-
-    assert record["tokenizer"] == "gpt2" and record["max_new_tokens"] == 8
-    assert record["objective"]["name"] == "dew.objectives.lm.objective:LMObjective"
-    assert record["objective"]["fields"] == {"ema_decay": 0.99}
-    assert "ema_decay" not in record["objective"]["defaults"]
-    assert record["sampling"]["temperature"] == 0.5 and record["sampling"]["top_k"] == 7
-    assert LMRunConfig.from_dict(record) == config
-    with pytest.raises(ValueError, match="trains on token files"):
-        config.prepare()

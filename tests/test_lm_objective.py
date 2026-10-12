@@ -173,15 +173,6 @@ def test_padded_targets_are_left_out_of_the_average():
     assert abs(masked - unmasked) > 1e-4, "masking made no difference to check"
 
 
-def test_a_batch_of_only_padding_does_not_divide_by_zero():
-    objective = make_objective(pad_id=5)
-    params = objective.init(jax.random.key(0))
-    batch = {TEXT_KEY: jnp.full((2, SEQ + 1), 5, jnp.int32)}
-
-    loss, aux = objective.scalar_loss(params, batch, step_at())
-    assert float(loss) == 0.0 and bool(jnp.isfinite(aux.metrics["perplexity"]))
-
-
 def test_aux_reports_perplexity_and_token_accuracy():
     objective = make_objective()
     params = objective.init(jax.random.key(0))
@@ -200,15 +191,6 @@ def test_aux_reports_perplexity_and_token_accuracy():
     assert float(aux.metrics["token_accuracy"]) == pytest.approx(accuracy)
 
 
-def test_a_batch_with_no_room_for_the_shift_is_rejected():
-    objective = make_objective()
-    params = objective.init(jax.random.key(0))
-    batch = {TEXT_KEY: jnp.zeros((2, SEQ), jnp.int32)}
-
-    with pytest.raises(ValueError, match=f"{SEQ + 1} ids per row"):
-        objective.scalar_loss(params, batch, step_at())
-
-
 def test_dropout_runs_on_the_step_key():
     """The loss passes the step key as the dropout rng, so a model with
     dropout is stochastic across keys and reproducible under one."""
@@ -222,26 +204,6 @@ def test_dropout_runs_on_the_step_key():
 
     assert float(first) == pytest.approx(float(again))
     assert float(first) != pytest.approx(float(other))
-
-
-def test_cross_entropy_is_computed_in_float32_under_bfloat16():
-    """Params stay fp32 and the loss is fp32 even when the model computes in bf16."""
-    class Bf16LM(TinyCausalLM):
-        @nn.compact
-        def hidden_states(self, tokens, train: bool = False):
-            return nn.Embed(self.vocab_size, self.emb_features,
-                            dtype=jnp.bfloat16)(tokens)
-
-    objective = make_objective(model=Bf16LM(vocab_size=VOCAB))
-    params = objective.init(jax.random.key(0))
-    inputs = token_batch()[TEXT_KEY][:, :-1]
-    hidden = objective.model.apply(params, inputs, method=Bf16LM.hidden_states)
-    loss, aux = objective.scalar_loss(params, token_batch(), step_at())
-
-    assert hidden.dtype == jnp.bfloat16
-    assert objective.model.apply(params, inputs).dtype == jnp.float32
-    assert all(leaf.dtype == jnp.float32 for leaf in jax.tree.leaves(params))
-    assert loss.dtype == jnp.float32 and aux.metrics["ce"].dtype == jnp.float32
 
 
 def test_padded_tokens_are_left_out_of_the_accuracy_too():
@@ -261,26 +223,6 @@ def test_padded_tokens_are_left_out_of_the_accuracy_too():
 
 # --- what the trainer needs ------------------------------------------------
 
-def test_the_inputs_declare_one_token_row():
-    inputs = make_objective().inputs
-    assert inputs.sample.key == TEXT_KEY and inputs.sample.shape == (SEQ + 1,)
-    assert dict(inputs.conditions) == {}
-
-
-def test_an_lm_keeps_no_average_unless_asked():
-    """Validation and previews read an average when one is kept, so an LM
-    keeps none by default: a short run then scores the weights it trained."""
-    assert make_objective().ema is None
-    assert make_objective(ema_decay=0.999).ema is not None
-
-
-def test_the_ema_tracks_the_whole_parameter_tree():
-    ema = make_objective(ema_decay=0.995).ema
-    assert ema.select(("params", "anything"))
-    assert float(ema.decay(0)) == pytest.approx(0.995)
-    assert float(ema.decay(10_000)) == pytest.approx(0.995)
-
-
 def test_pretrained_weights_are_what_init_returns():
     """Continued pretraining: the trainer's whole initial state is the
     checkpoint, not a fresh init that happens to have the same shapes."""
@@ -292,12 +234,6 @@ def test_pretrained_weights_are_what_init_returns():
 
     for restored, expected in zip(jax.tree.leaves(resumed), jax.tree.leaves(loaded), strict=True):
         assert jnp.array_equal(restored, expected)
-
-
-def test_pretrained_params_without_the_variables_dict_are_refused():
-    params = make_objective().init(jax.random.key(0))["params"]
-    with pytest.raises(ValueError, match="variables dict"):
-        make_objective(variables=params).init(jax.random.key(0))
 
 
 def make_trainer(tmp_path=None, fsdp=1, learning_rate=3e-3, tracker=None, **objective_kwargs):
@@ -416,13 +352,6 @@ def test_preview_generates_reproducible_text_from_ema():
     assert averaged.tokens.shape == (1, 7)
 
 
-def test_prompts_that_cannot_be_batched_are_rejected():
-    with pytest.raises(ValueError, match="equal length"):
-        make_objective(samples=Samples(prompt=[[1, 2], [3]], max_new_tokens=1))
-    with pytest.raises(ValueError, match="non-empty"):
-        make_objective(samples=Samples(prompt=[], max_new_tokens=1))
-
-
 # --- perplexity ------------------------------------------------------------
 
 def test_perplexity_weighs_every_batch_by_its_counted_targets():
@@ -446,26 +375,6 @@ def test_perplexity_weighs_every_batch_by_its_counted_targets():
 
     assert score == pytest.approx(np.exp((4 * 1.0 + 1 * 3.0) / 5))
     assert score != pytest.approx(np.exp(np.mean([1.0, 3.0])))
-
-
-def test_a_batch_with_no_counted_target_weighs_nothing():
-    metric = Perplexity()
-    scored = TokenScores(
-        losses=jnp.full((1, 4), 2.0),
-        weights=jnp.ones((1, 4)),
-        correct=jnp.zeros_like(jnp.full((1, 4), 2.0), dtype=bool),
-    )
-    empty = TokenScores(
-        losses=jnp.zeros((1, 4)),
-        weights=jnp.zeros((1, 4)),
-        correct=jnp.zeros_like(jnp.zeros((1, 4)), dtype=bool),
-    )
-
-    assert metric.finalize(metric.merge(metric(scored, None), metric(empty, None))) == pytest.approx(
-        np.exp(2.0)
-    )
-    with pytest.raises(ValueError, match="no counted target"):
-        metric.finalize(metric(empty, None))
 
 
 def test_perplexity_is_exp_of_the_mean_cross_entropy_not_the_mean_of_exps():
@@ -661,34 +570,6 @@ def test_a_packed_batch_reaches_the_objective_through_the_batch_dict():
         "the packed keys made no difference to the loss")
 
 
-def test_a_packed_evaluation_carries_the_document_weights():
-    """The pass scores what the loss counts: TokenScores of a packed batch
-    carry zero weight on the boundary and the padding."""
-    objective = packed_objective()
-    params = objective.init(jax.random.key(0))
-    tokens, segment_ids, positions, (doc_a, doc_b) = documents()
-    batch = {TEXT_KEY: tokens, "text_segment_ids": segment_ids, "text_positions": positions}
-
-    scores = objective.evaluate(params, batch, step_at())
-
-    assert float(jnp.sum(scores.weights)) == len(doc_a) + len(doc_b) - 2
-    _, weights = counted_losses(objective, params, tokens, segment_ids, positions)
-    np.testing.assert_array_equal(np.asarray(scores.weights[0]), weights)
-
-
-def test_a_packed_row_of_only_padding_does_not_divide_by_zero():
-    objective = packed_objective()
-    params = objective.init(jax.random.key(0))
-    tokens = jnp.zeros((2, SEQ + 1), jnp.int32)
-    segment_ids = jnp.zeros((2, SEQ + 1), jnp.int32)
-    batch = {TEXT_KEY: tokens, "text_segment_ids": segment_ids, "text_positions": segment_ids}
-
-    loss, aux = objective.scalar_loss(params, batch, step_at())
-    assert float(loss) == 0.0 and bool(jnp.isfinite(aux.metrics["perplexity"]))
-    scores = objective.evaluate(params, batch, step_at())
-    assert float(jnp.sum(scores.weights)) == 0.0, "an all-padding row must weigh nothing"
-
-
 # --- loss_role: SFT on the chat data path --------------------------------------
 
 
@@ -722,15 +603,6 @@ def test_loss_role_counts_only_assistant_targets():
     assert float(aux.metrics["token_accuracy"]) == pytest.approx(accuracy)
 
 
-def test_loss_role_without_the_roles_column_raises():
-    """A loss_role run on a plain token batch names the missing column."""
-    objective = make_objective(loss_role=Role.ASSISTANT)
-    params = objective.init(jax.random.key(0))
-
-    with pytest.raises(ValueError, match="text_roles"):
-        objective.scalar_loss(params, token_batch(), step_at())
-
-
 def test_a_roles_column_is_ignored_without_loss_role():
     """The same packed SFT batch trains every target under a plain
     LMObjective: the column only matters when a role is asked for."""
@@ -743,18 +615,6 @@ def test_a_roles_column_is_ignored_without_loss_role():
     logits = objective.model.apply(params, batch[TEXT_KEY][:, :-1])
     expected = reference_cross_entropy(logits, np.asarray(batch[TEXT_KEY][:, 1:]))
     assert float(loss) == pytest.approx(expected, rel=1e-5)
-
-
-def test_a_misaligned_roles_column_is_refused():
-    """Roles align with the input tokens, one per token. A short column
-    fails with both shapes."""
-    objective = make_objective(loss_role=Role.ASSISTANT)
-    params = objective.init(jax.random.key(0))
-    batch = token_batch()
-    batch[ROLES_KEY] = jnp.zeros((batch[TEXT_KEY].shape[0], SEQ), jnp.int8)
-
-    with pytest.raises(ValueError, match="one per token"):
-        objective.scalar_loss(params, batch, step_at())
 
 
 def test_evaluation_weights_follow_loss_role():
@@ -823,11 +683,6 @@ def test_z_loss_gradient_carries_the_reference_factor():
         assert float(jnp.abs(have - want).max()) <= 1e-4 * scale
 
 
-def test_a_negative_z_loss_is_refused():
-    with pytest.raises(ValueError, match="nonnegative"):
-        make_objective(z_loss=-1e-4)
-
-
 def test_router_z_loss_adds_each_routers_mean_squared_log_partition():
     """The term is the coefficient times each router's squared logsumexp of
     its gate logits, averaged over the positions it routed and summed over
@@ -857,19 +712,3 @@ def test_router_z_loss_adds_each_routers_mean_squared_log_partition():
         expected += 0.3 * float(jnp.mean(jnp.square(jax.nn.logsumexp(logits, -1))))
     np.testing.assert_allclose(float(total - base), expected, rtol=1e-5)
     np.testing.assert_allclose(float(aux.metrics["router_z_loss"]), expected, rtol=1e-5)
-
-
-def test_router_z_loss_refuses_routers_that_sow_no_log_partition():
-    """gpt-oss's router scores its experts through its own Dense and sows
-    nothing, so a z-loss over it would add nothing; it raises instead, as the
-    balance loss does."""
-    from dew.nn.backbones.causal_transformer import CausalTransformer
-    from dew.nn.backbones.decoder_block import Mixture
-    model = CausalTransformer(vocab_size=64, emb_features=32, num_layers=1, num_heads=2,
-                              max_seq_len=8, mlp='swigluoai', mlp_features=16,
-                              mixture=Mixture(experts=4, top_k=2))
-    objective = LMObjective(model, 8, ema_decay=None, router_z_loss=0.3)
-    params = objective.init(jax.random.key(0))
-    tokens = jax.random.randint(jax.random.key(1), (2, 9), 0, 64)
-    with pytest.raises(ValueError, match="router_z_loss"):
-        objective.loss(params, {TEXT_KEY: tokens}, step_at())

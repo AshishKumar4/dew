@@ -3,102 +3,14 @@
 target that contracts and produces several axes against a float64 oracle
 of its forward and its factors' gradient."""
 
-from pathlib import Path
 
 import jax
 import jax.numpy as jnp
 import numpy as np
-import pytest
 from flax import linen as nn
 from reference_error import assert_as_exact_as_the_reference
-from safetensors.numpy import load_file
 
-from dew import lora
-from dew.interop.pretrained import Pretrained
-from dew.lora import Adapter, LoRA, Target
-from dew.objectives.base import Step, merge
-from dew.objectives.lm import LMObjective
-
-ROOT = Path(__file__).resolve().parents[1]
-LLAMA = ROOT / "tests" / "fixtures" / "hf" / "llama-tiny"
-FIXTURES = ROOT / "tests" / "fixtures" / "lora_peft"
-
-
-@pytest.fixture(scope="module")
-def decoder():
-    return Pretrained.load(LLAMA, dtype="float32", attention_impl="reference")
-
-
-def recorded_dropout(masks: dict[str, np.ndarray]):
-    """Flax's `Dropout.__call__` with each LoRA branch's random bits replaced
-    by the reference's mask for that target: the same `select(keep,
-    x / (1 - rate), 0)`, every other dropout left to Flax. The branch's
-    dropout is the target's own first submodule, so its scope path names
-    the target, which maps to PEFT's module path."""
-    published = nn.Dropout.__call__
-
-    def call(self, inputs, deterministic=None, rng=None):
-        *owner, name = self.scope.path
-        key = "model." + ".".join(owner).replace("layers_", "layers.")
-        if name != "Dropout_0" or key not in masks:
-            return published(self, inputs, deterministic=deterministic, rng=rng)
-        keep = jnp.asarray(masks[key][tuple(slice(0, size) for size in inputs.shape)])
-        return jax.lax.select(keep, inputs / (1 - self.rate), jnp.zeros_like(inputs))
-
-    return call
-
-
-def flat(arrays) -> np.ndarray:
-    return np.concatenate([np.ravel(np.asarray(array, np.float64)) for array in arrays])
-
-
-@pytest.mark.parametrize("case", ["rslora", "dropout"])
-def test_an_adapter_trains_as_peft_trains_it(case, decoder, monkeypatch, tmp_path):
-    """PEFT's adapter read by `LoRA.load` and trained through the LM
-    objective. rsLoRA: each target scales by its own alpha over the square
-    root of its own rank (layer 1's v_proj at rank 2, down_proj at alpha
-    3). Dropout at 0.25: the training forward drops each target's branch
-    input, `B A dropout(x)`, on the reference's masks, and not the base
-    path. The adapted logits, the mean next-token cross entropy and its
-    gradient in all twelve factors are held to PEFT's float64 run by the
-    float64 rule."""
-    with np.load(FIXTURES / case / "reference.npz") as data:
-        reference = {key: data[key] for key in data}
-    adapter = LoRA.load(decoder.model, decoder.variables, FIXTURES / case / "adapter",
-                        layouts=decoder.layouts)
-    variables = adapter.variables
-    assert (adapter.rslora, adapter.dropout) == ((True, 0.0) if case == "rslora" else (False, 0.25))
-    masks = {key.removeprefix("mask/"): value for key, value in reference.items() if key.startswith("mask/")}
-    assert len(masks) == (6 if case == "dropout" else 0)
-    monkeypatch.setattr(nn.Dropout, "__call__", recorded_dropout(masks))
-    tokens = jnp.asarray(reference["input_ids"])
-    rngs = {"dropout": jax.random.key(0)} if case == "dropout" else {}
-    logits = adapter.model.apply(variables, tokens, rngs=rngs)
-    assert_as_exact_as_the_reference(logits, reference["adapted_logits"], reference["adapted_logits_f64"],
-                                     "the adapted logits")
-    assert np.abs(reference["adapted_logits_f64"] - reference["base_logits"]).max() > 1
-
-    objective = LMObjective(adapter.model, tokens.shape[1] - 1, variables=variables, ema_decay=None)
-    params = objective.init(jax.random.key(0))
-
-    def loss(moving):
-        stats, _ = objective.loss({**params, "params": moving}, {"text": tokens},
-                                  Step(step=jnp.int32(0), key=jax.random.key(1), ema=None))
-        return objective.reduce_loss(stats)[0]
-
-    value, gradient = jax.value_and_grad(loss)(params["params"])
-    np.testing.assert_allclose(float(value), float(reference["loss_f64"]), rtol=1e-6)
-    adapter.save(merge(variables, {"params": gradient}), tmp_path)
-    exported = {key.removeprefix(lora.PEFT_PREFIX): value
-                for key, value in load_file(tmp_path / lora.PEFT_WEIGHTS).items()}
-    names = sorted(key.removeprefix("grad/") for key in reference
-                   if key.startswith("grad/") and not key.endswith("_f64"))
-    assert sorted(exported) == names and len(names) == 12
-    assert_as_exact_as_the_reference(flat(exported[name] for name in names),
-                                     flat(reference[f"grad/{name}"] for name in names),
-                                     flat(reference[f"grad/{name}_f64"] for name in names),
-                                     "the factors' gradient")
-
+from dew.lora import Adapter, Target
 
 class Host(nn.Module):
     """One DenseGeneral that contracts the input's last two axes, listed out

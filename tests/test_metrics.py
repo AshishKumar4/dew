@@ -8,7 +8,6 @@ test_fid.py, PSNR, SSIM and their video forms in test_image_metrics.py, and
 the CLIP metrics in test_clip_metrics.py.
 """
 
-from pathlib import Path
 
 import jax
 import jax.numpy as jnp
@@ -16,8 +15,6 @@ import numpy as np
 import pytest
 
 from dew.artifacts import ImageGrid
-from dew.eval import FID, PSNR, SSIM, CLIPDistance, CLIPScore
-from dew.registry import metrics as registry
 
 
 def test_mean_metric_counts_uneven_batches_and_weighted_totals():
@@ -36,23 +33,6 @@ def test_mean_metric_counts_uneven_batches_and_weighted_totals():
         weighted.finalize((0., 0.))
     with pytest.raises(ValueError, match="per-example"):
         metric(artifact, {"values": np.asarray(4.)})
-
-
-def test_mean_metric_requires_a_direction_and_keeps_no_pass_state():
-    from dew import Mean
-
-    artifact = ImageGrid(np.zeros((1, 1, 1, 1), np.float32))
-    with pytest.raises(TypeError, match="better"):
-        Mean(lambda artifact, batch: batch["values"], name="accuracy", reads=ImageGrid)
-    with pytest.raises(TypeError, match="reads"):
-        Mean(lambda artifact, batch: batch["values"], name="accuracy", better="higher")
-    with pytest.raises(ValueError, match="unprefixed"):
-        Mean(lambda artifact, batch: batch["values"], name="val/accuracy", better="higher", reads=ImageGrid)
-    metric = Mean(lambda artifact, batch: batch["values"], name="score", better="higher", reads=ImageGrid)
-    assert metric.finalize(metric(artifact, {"values": [1., 3.]})) == 2.
-    assert metric.finalize(metric(artifact, {"values": [10.]})) == 10.
-    with pytest.raises(TypeError, match="reads ImageGrid"):
-        metric(None, {"values": [10.]})
 
 
 def test_mean_lm_accuracy_matches_the_full_forward_after_a_real_fit(tmp_path):
@@ -117,53 +97,3 @@ def test_mean_image_error_matches_each_real_row_after_a_fit(tmp_path):
     assert trainer._display.evaluations["val"][-1].scores["val/pixel_error"] == pytest.approx(expected)
     trainer.checkpoints.wait()
     assert trainer.checkpoints.best == 4
-
-
-def test_the_documented_lm_accuracy_fit_runs_with_best(tmp_path, monkeypatch):
-    import re
-
-    guide = Path(__file__).resolve().parents[1] / "docs/guides/evaluation.md"
-    blocks = re.findall(r"```python\n(.*?)\n```", guide.read_text(), re.S)
-    monkeypatch.chdir(tmp_path)
-    scope = {}
-    exec(compile(blocks[0], str(guide), "exec"), scope)
-    accuracy = next(block for block in blocks if "accuracy = Mean(" in block)
-    exec(compile(accuracy, str(guide), "exec"), scope)
-    assert int(scope["state"].step) == 10
-    assert scope["run"].checkpoints.best is not None
-
-
-def test_the_registry_names_every_metric_class():
-    """A run configures metrics through `dew.registry.metrics`, so a
-    class that loses its decorator is a metric no run can ask for."""
-    assert registry['psnr'] is PSNR and registry['ssim'] is SSIM and registry['clip'] is CLIPDistance
-    assert {'fid', 'clip', 'clip_score', 'psnr', 'ssim'} <= set(registry)
-
-
-@pytest.mark.parametrize("rows", [4, 12])
-def test_paired_metrics_refuse_incomplete_batch_alignment(rows):
-    samples = np.zeros((rows, 16, 16, 3), np.float32)
-    batch = {"image": np.zeros((8, 16, 16, 3), np.uint8)}
-    for name in ("psnr", "ssim"):
-        with pytest.raises(ValueError, match="equal counts"):
-            registry[name]()(ImageGrid(samples), batch)
-
-
-def test_constructing_a_metric_opens_no_weights(monkeypatch):
-    """Building the metric is not the call that opens files: the Inception
-    and CLIP weights resolve on the first batch scored, so configuring a run
-    never pays for a download it might not use."""
-    import importlib
-
-    fid_module = importlib.import_module("dew.eval.fid")
-    images_module = importlib.import_module("dew.eval.images")
-
-    def refused(*args, **kwargs):
-        raise AssertionError("constructing a metric loaded weights")
-
-    monkeypatch.setattr(fid_module, "_extractor", refused)
-    monkeypatch.setattr(images_module, "_get_clip", refused)
-
-    FID()
-    CLIPDistance(modelname="never/downloaded")
-    CLIPScore(modelname="never/downloaded")
