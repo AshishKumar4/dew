@@ -527,6 +527,22 @@ def test_raw_token_arrayrecords_require_explicit_lengths_for_indexed_reads(tmp_p
     assert reopened.tokens[2:15].tolist() == list(range(2, 15))
 
 
+def test_a_filtered_parquet_with_lengths_packs_as_its_rows_stream(tmp_path):
+    """A predicate keeps a parquet store from being read by index, so its
+    stated lengths plan no packing: its streamed rows pack as they arrive,
+    the windows holding only the rows the predicate keeps."""
+    import pyarrow.parquet as pq
+
+    from dew.data.compile import iterate
+    from dew.data.pipeline import Pipeline
+
+    rows = [{"text": [index] * 3, "length": 3, "keep": index % 2} for index in range(8)]
+    pq.write_table(pa.Table.from_pylist(rows), tmp_path / "rows.parquet")
+    kept = Files(str(tmp_path / "rows.parquet"), columns=("text",), filter=ds.field("keep") == 1)
+    windows = list(iterate(Pipeline(kept).pack(6), read="streamed", loading=Loading(workers=0)))
+    assert sorted({int(token) for window in windows for token in window["text"] if token}) == [1, 3, 5, 7]
+
+
 def test_a_run_that_states_no_read_reads_as_its_sources_choose(tmp_path):
     """Records held in memory read from memory, a store that reads by index
     reads by index and a stream streams, when the run states no read; a read
