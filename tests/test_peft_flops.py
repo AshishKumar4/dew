@@ -18,8 +18,9 @@ from dew.decision.objective import DecisionObjective
 from dew.interop import Pretrained
 from dew.lora import LoRA
 from dew.nn.backbones.decoder_stack import Loop
-from dew.nn.flops import MissingFlopsCount, dense_training_flops, projection_flops
+from dew.nn.flops import MissingFlopsCount, counted_flops, dense_training_flops, projection_flops
 from dew.nn.inputs import ModelInputs
+from dew.nn.protocols import CountedTraining
 from dew.objectives.base import FROZEN
 from dew.objectives.lm import LMObjective
 from dew.training import Trainer
@@ -114,7 +115,7 @@ def test_clef_head_remains_trainable_while_backbone_is_adapted():
     assert objective.training_flops(None, batch) == expected
 
 
-def test_unknown_adapted_family_is_refused_instead_of_being_counted_as_full_ft():
+def test_unknown_adapted_family_claims_no_work_and_an_explicit_count_is_refused():
     class Unknown(nn.Module):
         @nn.compact
         def __call__(self, x):
@@ -122,8 +123,9 @@ def test_unknown_adapted_family_is_refused_instead_of_being_counted_as_full_ft()
     model = Unknown()
     variables = model.init(jax.random.key(405), jnp.ones((2, 8)))
     adapted = LoRA(rank=2, modules=("layer",)).apply(model, variables, key=505)
+    assert not isinstance(adapted.model, CountedTraining)
     with pytest.raises(MissingFlopsCount, match="Unknown"):
-        adapted.model.training_flops(np.array([1, 1]))
+        counted_flops(adapted.model, np.array([1, 1]))
 
 
 def test_native_multimodal_qwen_adapter_counts_text_without_its_unused_image_tower():

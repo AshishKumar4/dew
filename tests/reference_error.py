@@ -46,6 +46,8 @@ arithmetic in float64 is held to the oracle first, within the float64
 rounding of the computation itself (`assert_computes_the_oracle`).
 """
 
+from collections.abc import Mapping
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -96,6 +98,14 @@ def equations(graph):
             yield from equations(value)
 
 
+def within(error, bound) -> bool:
+    """Whether every `error` is at most its `bound`, both finite. Written as the
+    passing condition, so a NaN or infinite error never passes, nor does an
+    infinite allowance from a reference that diverged."""
+    error, bound = np.asarray(error, np.float64), np.asarray(bound, np.float64)
+    return bool(np.all(np.isfinite(error) & np.isfinite(bound) & (error <= bound)))
+
+
 def assert_fp32_reduction_bound(dew, reference, magnitudes, terms: int) -> None:
     """Two fp32 reductions differ by at most 2 gamma_n sum(abs(products)).
 
@@ -107,7 +117,7 @@ def assert_fp32_reduction_bound(dew, reference, magnitudes, terms: int) -> None:
     gamma = roundoffs / (1 - roundoffs)
     error = np.abs(np.asarray(dew, np.float64) - np.asarray(reference, np.float64))
     bound = 2 * gamma * np.asarray(magnitudes, np.float64)
-    assert np.all(error <= bound), (float(error.max()), float(bound.max()))
+    assert within(error, bound), (float(error.max()), float(bound.max()))
 
 
 def distance(value, truth) -> float:
@@ -120,13 +130,14 @@ def assert_as_exact_as_the_reference(dew, reference, truth, label: str) -> None:
     """Dew within FACTOR times the reference's RMS distance from float64."""
     mine, theirs = distance(dew, truth), distance(reference, truth)
     assert theirs > 0, f"{label}: the reference equals float64, so it measures nothing"
-    assert mine <= FACTOR * theirs, (
+    assert within(mine, FACTOR * theirs), (
         f"{label}: dew is {mine:.3e} from float64 (rms), the reference {theirs:.3e} "
         f"(ratio {mine / theirs:.2f}, allowed {FACTOR})")
 
 
 
-def assert_leaves_as_exact(dew, reference, truth, *, reductions: int = 1) -> None:
+def assert_leaves_as_exact(dew, reference, truth, *, reductions: int = 1,
+                           invariants: Mapping[str, float] | None = None) -> None:
     """Each leaf of the tree `dew` within FACTOR times the matching leaf of
     `reference`'s RMS distance from float64 (`truth`), the three trees alike.
 
@@ -136,25 +147,35 @@ def assert_leaves_as_exact(dew, reference, truth, *, reductions: int = 1) -> Non
     rounding below it is luck, not a bar, and a leaf that lost a term still
     fails by orders of magnitude.
 
-    A leaf zero in float64 to its resolution of the tree (the gradient of a
-    parameter the loss is invariant to: a softmax's key bias, a bias every
-    option's logit shares) has no size of its own; both runs give it the
-    rounding of terms that cancel, and it is held to float32's resolution of
-    the tree, the same rule over the tree's largest leaf. A leaf float64
-    holds nonzero has no such floor, so a small true gradient that vanished
-    fails."""
+    `invariants` declares leaves by `jax.tree_util.keystr` path, with the RMS
+    of the sum of absolute terms that cancel in each leaf. For a bias these
+    are the loss's cotangents of the biased projection, before their sum
+    over batch and positions: the bias broadcasts over those axes, so its
+    gradient sums those cotangents. Their absolute sum measures the size
+    before cancellation. Only these leaves get sqrt(reductions) eps32 of
+    that size as a floor; their float64 RMS must be within sqrt(reductions)
+    eps64 of it, or the declaration fails. Every other leaf's floor uses
+    its own float64 RMS, however small a representable gradient is."""
     unit, resolution = float(np.finfo(np.float32).eps), float(np.finfo(np.float64).eps)
     spread = np.sqrt(reductions)
-    scale = max(distance(leaf, 0) for leaf in jax.tree.leaves(truth))
+    invariants = invariants or {}
+    paths = jax.tree_util.tree_leaves_with_path(dew)
+    missing = invariants.keys() - {jax.tree_util.keystr(path) for path, _ in paths}
+    assert not missing, f"declared invariant leaves absent from the tree: {sorted(missing)}"
     over = []
-    leaves = zip(jax.tree_util.tree_leaves_with_path(dew), jax.tree.leaves(reference), jax.tree.leaves(truth),
-                 strict=True)
+    leaves = zip(paths, jax.tree.leaves(reference), jax.tree.leaves(truth), strict=True)
     for (path, mine), theirs, true in leaves:
+        name = jax.tree_util.keystr(path)
         size = distance(true, 0)
-        own = spread * unit * (size if size > spread * resolution * scale else scale)
+        scale = invariants.get(name, size)
+        if name in invariants:
+            assert within(size, spread * resolution * scale), (
+                f"{name}: declared invariant has float64 RMS {size:.3e}, above cancellation resolution "
+                f"{spread * resolution * scale:.3e} (terms {scale:.3e})")
+        own = spread * unit * scale
         bar = FACTOR * max(distance(theirs, true), own)
-        if distance(mine, true) > bar:
-            over.append(f"{jax.tree_util.keystr(path)}: {distance(mine, true):.3e} from float64 (rms), "
+        if not within(distance(mine, true), bar):
+            over.append(f"{name}: {distance(mine, true):.3e} from float64 (rms), "
                         f"the reference {distance(theirs, true):.3e}, allowed {bar:.3e}")
     assert not over, "\n".join(over)
 
@@ -188,7 +209,7 @@ def assert_as_exact_over_orders(dew, reference, label: str) -> None:
     dew, reference = np.asarray(dew, np.float64), np.asarray(reference, np.float64)
     assert dew.shape == reference.shape == (ORDERS,), f"{label}: {dew.shape} and {reference.shape} orders"
     mine, theirs = float(np.sqrt(np.mean(dew ** 2))), float(np.sqrt(np.mean(reference ** 2)))
-    assert mine <= FACTOR * theirs, (
+    assert within(mine, FACTOR * theirs), (
         f"{label}: dew is {mine:.3e} from float64 (rms over {ORDERS} orders), the reference "
         f"{theirs:.3e} (ratio {mine / theirs:.2f}, allowed {FACTOR})")
 
@@ -204,7 +225,7 @@ def assert_computes_the_oracle(reference_in_float64, truth, label: str, *, round
     leaves the float64 runs a few ulps apart all the same."""
     eps = float(np.finfo(np.float64).eps)
     apart, scale = distance(reference_in_float64, truth), float(np.sqrt(np.mean(np.square(truth))))
-    assert apart <= FACTOR * roundings * eps * scale, (
+    assert within(apart, FACTOR * roundings * eps * scale), (
         f"{label}: the reference in float64 is {apart:.3e} from the oracle (rms), more than float64 "
         f"rounding over {roundings} steps of its scale {scale:.3e}")
 
@@ -251,6 +272,6 @@ def assert_rounds_where_the_reference_does(dew, reference, truth, label: str) ->
     """Dew within a quarter of the reference's RMS rounding error of the
     reference's own output."""
     apart, theirs = distance(dew, reference), distance(reference, truth)
-    assert apart <= theirs / 4, (
+    assert within(apart, theirs / 4), (
         f"{label}: dew is {apart:.3e} from the reference (rms), whose own error is {theirs:.3e} "
         f"(ratio {apart / theirs:.2f}, allowed 0.25)")
