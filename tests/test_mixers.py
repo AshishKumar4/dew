@@ -173,18 +173,24 @@ def test_models_build_takes_kind_mixer_records():
 DOCUMENTS = (5, 7)
 """Two packed documents' lengths: the first shorter than a conv's history would carry, both uneven."""
 
+PADDING = 3
+"""Segment-0 slots after the documents, the packer's tail."""
+
 
 def packed_and_alone(model, variables, tokens, cotangent):
-    """Logits and parameter gradients of `tokens` `[1, sum(DOCUMENTS)]` run packed (segment ids and
-    positions restarting per document) and of each document run alone, the latter concatenated."""
+    """Logits and parameter gradients of the documents' `tokens` `[1, sum(DOCUMENTS)]` run packed
+    (segment ids and positions restarting per document, then PADDING segment-0 slots whose logits
+    the loss ignores) and of each document run alone, the latter concatenated."""
     total = sum(DOCUMENTS)
-    segments = jnp.concatenate([jnp.full((1, length), i + 1, jnp.int32)
-                                for i, length in enumerate(DOCUMENTS)], axis=1)
-    positions = jnp.concatenate([jnp.arange(length)[None] for length in DOCUMENTS], axis=1)
+    documents = [jnp.full((1, length), i + 1, jnp.int32) for i, length in enumerate(DOCUMENTS)]
+    segments = jnp.concatenate([*documents, jnp.zeros((1, PADDING), jnp.int32)], axis=1)
+    positions = jnp.concatenate([*(jnp.arange(length)[None] for length in DOCUMENTS),
+                                 jnp.zeros((1, PADDING), jnp.int32)], axis=1)
+    row = jnp.concatenate([tokens, jnp.zeros((1, PADDING), tokens.dtype)], axis=1)
 
     def packed(variables):
-        return model.apply(variables, tokens, coordinates=coordinates(
-            segments=segments, positions=positions, max_segments=len(DOCUMENTS)))
+        return model.apply(variables, row, coordinates=coordinates(
+            segments=segments, positions=positions, max_segments=len(DOCUMENTS) + 1))[:, :total]
 
     def alone(variables):
         starts = (0, *itertools.accumulate(DOCUMENTS))
@@ -212,8 +218,9 @@ def test_a_packed_row_computes_what_its_documents_compute_alone(kind):
     """Every mixer in the registry: a row packing two documents (segment ids, positions restarting)
     gives each document's logits and the parameters' gradients its documents give run one at a time,
     within the float64 gate, so no layer carries a conv history, a recurrent state or attention across
-    a document boundary. The float64 truth is the documents run alone in float64, the fp32 runs at
-    IEEE products, as the rule's references take theirs."""
+    a document boundary, nor between the documents and the segment-0 padding after them. The
+    float64 truth is the documents run alone in float64, the fp32 runs at IEEE products, as the
+    rule's references take theirs."""
     fields, overrides = KIND_FIELDS.get(kind, ({}, {}))
     model = tiny(mixer=mixers.build(kind, **fields), max_seq_len=32, **overrides)
     tokens = jax.random.randint(jax.random.key(3), (1, sum(DOCUMENTS)), 0, VOCAB)

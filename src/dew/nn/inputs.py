@@ -244,8 +244,9 @@ class Coordinates:
 
     `positions` `[B, S]` is each real token's place in its document, counted
     over real tokens. `segments` numbers each row's packed documents from 1,
-    0 on a padding slot, which a layer reading the segments keeps out;
-    `valid` is the caller's mask of real tokens; `starts` marks each
+    0 on the padding slots after them, which run as a document of their own,
+    so no layer carries a real document's state or history into them or
+    back; `valid` is the caller's mask of real tokens; `starts` marks each
     document's first real token but a
     row's first, which continues whatever state the row holds. Each is None
     where it holds nothing (one document a row, every token real, no start),
@@ -280,7 +281,7 @@ def coordinates(shape: tuple[int, int] | None = None, *, segments=None, valid=No
         if field is not None and field.shape != shape:
             raise ValueError(f"token coordinates are {shape}, got {name} {field.shape}")
     starts = None if segments is None else document_starts(
-        segments, segments != 0 if valid is None else valid & (segments != 0))
+        segments, jnp.ones(shape, bool) if valid is None else valid)
     if positions is None:
         real = jnp.ones(shape, bool) if valid is None else valid
         real = real if segments is None else real & (segments != 0)
