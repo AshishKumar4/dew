@@ -6,6 +6,7 @@ import json
 import math
 import subprocess
 import sys
+from contextlib import nullcontext
 
 import jax
 import numpy as np
@@ -17,7 +18,8 @@ from PIL import Image
 import dew.artifacts
 from dew.artifacts import Decisions, ImageGrid, Representations, TextSamples, TokenScores, VideoGrid
 from dew.data import Dataset
-from dew.telemetry.records import RunRecord, json_value
+from dew.pool import PREEMPTED_EXIT
+from dew.telemetry.records import FitEnded, RunRecord, json_value
 from dew.training import Checkpoints, LocalTracker, Trackers, Trainer
 
 
@@ -300,6 +302,57 @@ def mlflow_store(tmp_path, monkeypatch):
     pytest.importorskip('mlflow')
     monkeypatch.setenv('MLFLOW_ALLOW_FILE_STORE', 'true')
     return (tmp_path / 'mlruns').as_uri()
+
+
+@pytest.fixture
+def tracked_runs(tmp_path, monkeypatch):
+    import wandb
+    from test_publish import TrackedRun
+
+    from dew.training import MLflowTracker, WandbTracker
+
+    run = TrackedRun()
+    monkeypatch.setattr(wandb, 'init', lambda **_: run)
+    mlflow = MLflowTracker('dew-outcomes', uri=mlflow_store(tmp_path, monkeypatch))
+    return run, mlflow, Trackers(WandbTracker('dew-outcomes', offline=True), mlflow)
+
+
+@pytest.mark.parametrize('unwind', [False, True])
+@pytest.mark.parametrize('status,exit_code,terminal_status', [
+    ('completed', 0, 'FINISHED'), ('lowered', 0, 'FINISHED'),
+    ('preempted', PREEMPTED_EXIT, 'KILLED'), ('failed', 1, 'FAILED'), ('interrupted', 1, 'FAILED'),
+])
+def test_trackers_finish_with_the_recorded_outcome(tracked_runs, status, exit_code, terminal_status, unwind):
+    run, mlflow, sinks = tracked_runs
+    with (pytest.raises(SystemExit) if unwind else nullcontext()), sinks:
+        sinks.artifact(FitEnded(status, 1.), 2)
+        client, run_id = mlflow.run
+        if unwind:
+            raise SystemExit(exit_code)
+    assert run.exit_codes == [exit_code]
+    assert run.preempting is (status == 'preempted')
+    assert client.get_run(run_id).info.status == terminal_status
+
+
+@pytest.mark.parametrize('code,exit_code,terminal_status', [
+    (0, 0, 'FINISHED'), (None, 0, 'FINISHED'), (2, 1, 'FAILED'), ('stopped', 1, 'FAILED'),
+])
+def test_trackers_use_the_contexts_process_exit_code(tracked_runs, code, exit_code, terminal_status):
+    run, mlflow, sinks = tracked_runs
+    with pytest.raises(SystemExit) as caught, sinks:
+        sinks.artifact(FitEnded('completed', 1.), 2)
+        client, run_id = mlflow.run
+        raise SystemExit(code)
+    assert caught.value.code == code
+    assert run.exit_codes == [exit_code]
+    assert client.get_run(run_id).info.status == terminal_status
+
+
+@pytest.mark.parametrize('code', [0, None])
+def test_successful_process_exit_is_a_completed_fit(code):
+    outcome = FitEnded.outcome(1., SystemExit(code))
+    assert outcome.status == 'completed'
+    assert outcome.error is None and outcome.traceback is None
 
 
 def test_mlflow_run_holds_the_fit_read_back_with_mlflows_client(tmp_path, monkeypatch):
