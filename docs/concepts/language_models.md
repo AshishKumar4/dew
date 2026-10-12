@@ -357,7 +357,6 @@ To keep training, build the bundle's objective and feed the trainer `{"text": in
 
 ```python
 import optax
-from dew.data.dataset import Dataset
 from dew.data.dataset import Loader
 from dew.training import Layout, MeshSpec
 

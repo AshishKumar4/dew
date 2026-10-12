@@ -16,12 +16,12 @@ def pictures(count: int = 48) -> Memory:
 
 def stage(kind: str):
     if kind == "albumentations":
-        import albumentations as A
+        A = pytest.importorskip("albumentations")
 
         return images.albumentations(A.Compose([A.HorizontalFlip(p=0.5), A.RandomBrightnessContrast(p=1.0),
                                                 A.RandomCrop(16, 16)]))
     if kind == "torchvision":
-        from torchvision.transforms import v2
+        v2 = pytest.importorskip("torchvision.transforms.v2")
 
         return images.torchvision(v2.Compose([v2.RandomHorizontalFlip(), v2.ColorJitter(0.4, 0.4, 0.4),
                                               v2.RandomCrop(16)]))

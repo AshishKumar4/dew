@@ -18,7 +18,7 @@ def test_hub_builder_uses_the_resolved_commit_and_named_configuration(tmp_path, 
     requested = []
     marker = tmp_path / "dataset_info.json"
     marker.write_text("{}")
-    expected = SimpleNamespace(cache_dir=str(tmp_path),
+    expected = SimpleNamespace(cache_dir=str(tmp_path), config=SimpleNamespace(data_files=None),
                                as_dataset=lambda **kwargs: SimpleNamespace(cache_files=[]))
     monkeypatch.setattr(HfApi, "dataset_info", lambda self, repo_id, **kwargs: SimpleNamespace(sha="frozen"))
     monkeypatch.setattr(datasets, "load_dataset_builder", lambda repo, **kwargs:
@@ -199,7 +199,9 @@ def test_an_unprepared_arrow_store_is_refused_without_preparation(tmp_path, monk
     from huggingface_hub import HfApi
 
     prepared = []
-    builder = SimpleNamespace(cache_dir=str(tmp_path), download_and_prepare=lambda: prepared.append(True))
+    builder = SimpleNamespace(cache_dir=str(tmp_path), config=SimpleNamespace(data_files=None),
+                              info=SimpleNamespace(download_size=None),
+                              download_and_prepare=lambda: prepared.append(True))
     monkeypatch.setattr(HfApi, "dataset_info", lambda self, repo_id, **kwargs: SimpleNamespace(sha="frozen"))
     monkeypatch.setattr(datasets, "load_dataset_builder", lambda *args, **kwargs: builder)
     source = Hub("acme/records")
