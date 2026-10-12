@@ -5,14 +5,11 @@
 import dataclasses
 from collections.abc import Mapping
 
-import numpy as np
 from flax import linen as nn
 
 from dew import records
 from dew._model_types import _QWEN35_VISION_TYPES
-from dew.interop.weights import checkpoint_array, translate_parameters
 from dew.nn.text_encoders import TOWER_ACTIVATIONS
-from dew.objectives.base import Variables
 from dew.registry import Record
 
 from .common import ProjectorBase, TowerBase, TowerGeometry, _vision_section
@@ -123,24 +120,6 @@ def qwen35_vision_path(hf_name: str) -> tuple[str, ...] | None:
     if path is None:
         raise ValueError(f"unknown tensor name {hf_name!r}")
     return path
-
-
-def translate_qwen35_vision_weights(
-    hf_tensors: Mapping[str, np.ndarray], *, param_dtype: str = "float32"
-) -> Variables:
-    """Qwen 3.5 vision tensors into a trunk parameter tree.
-
-    The patch convolution carries [out, in, time, h, w] and lands as one map;
-    the trunk's buffer already holds the viewed channel order, so the rows
-    are a plain reshape and every other leaf rides the shared transpose.
-    """
-    rest = {name: tensor for name, tensor in hf_tensors.items()
-            if name != "patch_embed.proj.weight"}
-    params = translate_parameters(rest, qwen35_vision_path, param_dtype)
-    conv = checkpoint_array(hf_tensors["patch_embed.proj.weight"], param_dtype)
-    params.setdefault("patch_embed", {})["kernel"] = np.ascontiguousarray(
-        conv.transpose(1, 2, 3, 4, 0).reshape(-1, conv.shape[0]))
-    return params
 
 
 def translate_qwen35_vision_config(hf_config: Mapping[str, object]) -> Record:

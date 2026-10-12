@@ -5,12 +5,9 @@
 import dataclasses
 from collections.abc import Mapping
 
-import numpy as np
 from flax import linen as nn
 
 from dew import records
-from dew.interop.weights import checkpoint_array, translate_parameters
-from dew.objectives.base import Variables
 from dew.registry import Record
 
 from .common import ProjectorBase, TowerBase, TowerGeometry, _vision_section
@@ -91,7 +88,6 @@ class MiMoProjector(ProjectorBase):
                               width=grown, out_width=self.out_width, bias=False)
 
 
-_TENSORS = {"patch_embed.proj.weight": ("patch_embed", "kernel")}
 _BLOCK_NORMS = {"norm1": "input_layernorm", "norm2": "post_attention_layernorm"}
 _BLOCK_MAPS = {("attn", "qkv"): ("self_attn", "qkv_proj"), ("attn", "proj"): ("self_attn", "o_proj"),
                ("mlp", "gate_proj"): ("mlp", "gate_proj"), ("mlp", "up_proj"): ("mlp", "up_proj"),
@@ -104,8 +100,8 @@ def mimo_vision_path(hf_name: str) -> tuple[str, ...] | None:
     parts = hf_name.split(".")
     if parts[0] == "merger":
         return None
-    path = _TENSORS.get(hf_name)
-    if path is None and len(parts) > 3 and parts[0] == "blocks" and parts[1].isdigit():
+    path = None
+    if len(parts) > 3 and parts[0] == "blocks" and parts[1].isdigit():
         block, leaf = f"blocks_{parts[1]}", parts[-1]
         if parts[2:] == ["attn", "sinks"]:
             path = (f"sinks_{parts[1]}",)
@@ -116,18 +112,6 @@ def mimo_vision_path(hf_name: str) -> tuple[str, ...] | None:
     if path is None:
         raise ValueError(f"unknown tensor name {hf_name!r}")
     return path
-
-
-def translate_mimo_vision_weights(hf_tensors: Mapping[str, np.ndarray], *,
-                                  param_dtype: str = "float32") -> Variables:
-    """MiMo ViT tensors into a trunk parameter tree; its patch convolution `[out, in, time, h, w]`
-    lands as one map over the processor's channel, time and pixel order."""
-    rest = {name: tensor for name, tensor in hf_tensors.items() if name != "patch_embed.proj.weight"}
-    params = translate_parameters(rest, mimo_vision_path, param_dtype)
-    conv = checkpoint_array(hf_tensors["patch_embed.proj.weight"], param_dtype)
-    params.setdefault("patch_embed", {})["kernel"] = np.ascontiguousarray(
-        conv.transpose(1, 2, 3, 4, 0).reshape(-1, conv.shape[0]))
-    return params
 
 
 def translate_mimo_vision_config(hf_config: Mapping[str, object]) -> Record:

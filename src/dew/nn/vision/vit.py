@@ -15,13 +15,16 @@ Each family's reference, transformers 5.16.1's `models/qwen3_5/modeling_qwen3_5.
 
 import dataclasses
 import functools
+from collections.abc import Callable, Mapping
 from typing import Literal
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
+from dew.interop.weights import ParamTree, checkpoint_array, translate_parameters
 from dew.nn.activations import activation as named_activation
 from dew.nn.attention import LayerNorm
 from dew.nn.backbones.decoder_block import BlockWiring, DecoderBlock, GatedMLP
@@ -327,3 +330,22 @@ class MergeProjector(nn.Module):
         dense = functools.partial(nn.Dense, use_bias=self.bias, dtype=self.dtype, precision=self.precision)
         out = dense(self.out_width, name="fc2")(act(dense(self.width, name="fc1")(grouped)))
         return act(out) if self.activation_after else out
+
+
+PATCH_CONVOLUTION = "patch_embed.proj.weight"
+"""Where the Qwen-style towers keep their patch map: a `[out, in, time, h, w]` convolution."""
+
+
+def translate_vit_weights(hf_tensors: Mapping[str, np.ndarray],
+                          path_of: Callable[[str], tuple[str, ...] | None],
+                          param_dtype: str = "float32") -> ParamTree:
+    """A trunk's parameters from its tensors through its family's `path_of`, the patch convolution
+    `PATCH_CONVOLUTION`, where the checkpoint has one, landing as one Dense map over the processor's
+    channel, time and pixel order."""
+    params = translate_parameters({name: tensor for name, tensor in hf_tensors.items()
+                                   if name != PATCH_CONVOLUTION}, path_of, param_dtype)
+    if PATCH_CONVOLUTION in hf_tensors:
+        conv = checkpoint_array(hf_tensors[PATCH_CONVOLUTION], param_dtype)
+        params.setdefault("patch_embed", {})["kernel"] = np.ascontiguousarray(
+            conv.transpose(1, 2, 3, 4, 0).reshape(-1, conv.shape[0]))
+    return params
