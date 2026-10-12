@@ -58,13 +58,15 @@ def test_the_output_kernel_computes_flas_expression(dtype, shape, config):
     assert relative(got, want) < (2e-2 if dtype == jnp.bfloat16 else 1e-5)
 
 
+@pytest.mark.parametrize("columns", [(), (128,)])
 @pytest.mark.parametrize("reverse", [False, True])
-def test_the_cumsum_kernel_is_flas_chunk_local_cumsum(reverse):
-    """Within each chunk of each head, the inclusive sum (from the end for the gradient), fp32, then
-    the base-2 scale: as numpy computes it."""
-    g = -jnp.exp(jax.random.normal(jax.random.key(3), (2, 192, 3)) - 3.0)
+def test_the_cumsum_kernel_is_flas_chunk_local_cumsum(reverse, columns):
+    """Within each chunk of each head, and each key dimension of a decay per key dimension (fla's
+    vector kernel), the inclusive sum (from the end for the gradient), fp32, then the base-2 scale: as
+    numpy computes it."""
+    g = -jnp.exp(jax.random.normal(jax.random.key(3), (2, 192, 3, *columns)) - 3.0)
     got = fla_gdn.chunk_local_cumsum(g, scale=fla_gdn.RCP_LN2, reverse=reverse, interpret=INTERPRETED)
-    chunks = np.asarray(g, np.float64).reshape(2, 3, 64, 3)
+    chunks = np.asarray(g, np.float64).reshape(2, 3, 64, 3, *columns)
     summed = np.cumsum(chunks[:, :, ::-1], axis=2)[:, :, ::-1] if reverse else np.cumsum(chunks, axis=2)
     want = (summed * fla_gdn.RCP_LN2).reshape(g.shape)
     assert got.dtype == jnp.float32

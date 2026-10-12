@@ -139,11 +139,12 @@ def kernel_config(kernel: str, shape: Mapping[str, int], dtype, *, target: str |
 
 def _cumsum_kernel(s_ref, o_ref, *, scale: float | None, reverse: bool):
     """fla's `chunk_local_cumsum_scalar_kernel` (fla/ops/utils/cumsum.py:33-73) for one chunk of one
-    head: the inclusive cumulative sum in fp32, from the end where `reverse`, then `scale`."""
+    head: the inclusive cumulative sum over its tokens in fp32, of each column of a gate per key
+    dimension (fla's vector kernel, :90-133) too, from the end where `reverse`, then `scale`."""
     step = s_ref[...].astype(jnp.float32)
-    total = jnp.cumsum(step)
+    total = jnp.cumsum(step, axis=0)
     if reverse:
-        total = -total + jnp.sum(step) + step
+        total = -total + jnp.sum(step, axis=0) + step
     if scale is not None:
         total = total * scale
     o_ref[...] = total.astype(o_ref.dtype)
@@ -151,20 +152,25 @@ def _cumsum_kernel(s_ref, o_ref, *, scale: float | None, reverse: bool):
 
 def chunk_local_cumsum(g, *, chunk: int = 64, scale: float | None = None, reverse: bool = False,
                        warps: int | None = None, stages: int | None = None, interpret: bool = False):
-    """`g` `[B, T, H]` cumulated within each chunk of `chunk` tokens, fp32: fla's `chunk_local_cumsum`
-    of a per-head gate (cumsum.py:262-300), `scale` RCP_LN2 for the forward's base-2 decay, `reverse`
-    for its gradient. fla autotunes only `num_warps` over 1, 2, 4 and 8 here."""
+    """`g` `[B, T, H]`, or `[B, T, H, K]` per key dimension, cumulated within each chunk of `chunk`
+    tokens, fp32: fla's `chunk_local_cumsum` (cumsum.py:262-341), `scale` RCP_LN2 for the forward's
+    base-2 decay, `reverse` for its gradient. fla autotunes only `num_warps` over 1, 2, 4 and 8 here."""
     from jax.experimental.pallas import triton as plgpu
 
     config = kernel_config("chunk_local_cumsum", {"chunk": chunk, "width": 1, "columns": 1}, g.dtype,
                            warps=warps, stages=stages)
     warps, stages = config["warps"], config["stages"]
 
-    batch, length, heads = g.shape
-    spec = pl.BlockSpec((None, chunk, None), lambda i_t, bh: (bh // heads, i_t, bh % heads))
+    batch, length, heads, *columns = (int(size) for size in g.shape)
+    # A decay per key dimension in 64-column blocks, fla's vector kernel's BS.
+    blocks = [min(64, width) for width in columns]
+    tiles = [width // block for width, block in zip(columns, blocks, strict=True)]
+    spec = pl.BlockSpec((None, chunk, None, *blocks),
+                        lambda i_t, bh, *i_k: (bh // heads, i_t, bh % heads, *i_k))
     return pl.pallas_call(
         functools.partial(_cumsum_kernel, scale=scale, reverse=reverse),
-        grid=(length // chunk, batch * heads), in_specs=[spec], out_specs=spec,
+        grid=(length // chunk, batch * heads, *tiles),
+        in_specs=[spec], out_specs=spec,
         out_shape=jax.ShapeDtypeStruct(g.shape, jnp.float32),
         compiler_params=plgpu.CompilerParams(num_warps=warps, num_stages=stages),
         interpret=interpret, name="fla_chunk_local_cumsum",
