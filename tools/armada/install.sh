@@ -9,6 +9,6 @@ set -eu
 EXTRAS=test,av,tfds,metrics,plots,inference-clients,serve,vision,quantization,profile,torchax,gguf
 for python in 3.12 3.14; do
   uv venv -q --python "$python" ".venv-$python"
-  VIRTUAL_ENV=".venv-$python" uv pip install -q torch torchvision --index-url https://download.pytorch.org/whl/cpu
+  VIRTUAL_ENV=".venv-$python" sh tools/install_host_torch.sh -q
   VIRTUAL_ENV=".venv-$python" uv pip install -q -e ".[$EXTRAS]" tokamax -c constraints.txt
 done
