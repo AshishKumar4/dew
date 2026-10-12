@@ -48,6 +48,9 @@ from dew.interop.verify import (
     verify_mapping,
 )
 
+# CI runs this file in tasks of its own: torchax renames torch's privateuse1 backend process-wide.
+pytestmark = pytest.mark.torchax
+
 TIER2 = "tier 2: verified mapping"
 TORCHAX = 'fallback="torchax"'
 TINY = {"hidden_size": 64, "num_hidden_layers": 4, "num_attention_heads": 4, "num_key_value_heads": 2,

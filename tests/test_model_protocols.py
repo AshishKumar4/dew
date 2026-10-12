@@ -76,6 +76,9 @@ from dew.nn.protocols import IntervalModel, OutputTable, Recomputing, RequiresTe
 from dew.objectives.lm.chunked import head_logits
 from dew.registry import models
 
+# CI runs this file in tasks of its own: torchax renames torch's privateuse1 backend process-wide.
+pytestmark = pytest.mark.torchax
+
 FIXTURES = Path(__file__).parent / "fixtures" / "hf"
 DTYPES = ("float32", "bfloat16")
 ROWS, LENGTH = 2, 9

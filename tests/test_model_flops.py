@@ -20,12 +20,13 @@ from jax.extend import core as jaxpr_core
 from recording import RecordingTracker
 
 from dew.data.text import ByteTokenizer
-from dew.decision.head import DecisionHead, JointSchemaHead
+from dew.decision.head import DecisionHead, Head, JointSchemaHead
 from dew.decision.layout import DecisionInputs, Specials, StateFirstLayout
 from dew.decision.objective import DecisionObjective
 from dew.diffusion import presets
 from dew.inputs import Field, InputSpec
 from dew.interop.hf_decoders import translate_config
+from dew.lora import LoRA
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import GatedMLP, RematPolicy
 from dew.nn.backbones.decoder_stack import Loop
@@ -51,7 +52,7 @@ from dew.nn.mixers.mamba import Mamba, selective_scan
 from dew.nn.mixers.mamba2 import Mamba2, recurrent_ssd
 from dew.nn.mla import MultiHeadLatentAttention
 from dew.nn.moe import SparseMLP
-from dew.nn.protocols import Counted, CountedLogits
+from dew.nn.protocols import Counted, CountedDecisions, CountedLogits, CountedTraining
 from dew.nn.ssm import BidirectionalS5Layer, S5Layer, _scanned_directions
 from dew.objectives.diffusion import DiffusionObjective
 from dew.objectives.lm import LMObjective
@@ -229,8 +230,9 @@ def test_decision_head_charges_options_and_evidence_not_a_vocabulary():
     scorer = (8 * 16 * 16 + 2 * 16 + 6 * 16 + 2 * 8) * 8
     pooling = 2 * 8 * (2 * (1 + 2 * 2) + 5 * (2 + 2 * 6))
     assert clef.decision_flops(LENGTHS, questions, options) == projected + evidence + scorer + pooling
-    with pytest.raises(MissingFlopsCount, match=r"JointSchemaHead.*decision_flops"):
-        clef.model_flops(LENGTHS)
+    assert isinstance(clef, CountedDecisions) and not isinstance(clef, Counted)
+    with pytest.raises(MissingFlopsCount, match=r"JointSchemaHead.*model_flops"):
+        counted_flops(clef, LENGTHS)
 
 
 def test_missing_family_is_named_instead_of_falling_back_to_hlo():
@@ -264,6 +266,71 @@ def test_decision_objective_supplies_the_layout_geometry_to_the_head():
     wanted = model.model_flops(LENGTHS) + head.decision_flops(LENGTHS, np.array([1, 2]), np.array([2, 6]))
     assert objective.model_flops(None, batch) == wanted
     assert objective.model_flops(objective.model, batch) == wanted
+
+
+def test_uncounted_decision_head_refuses_a_direct_count():
+    objective = DecisionObjective(decoder(), head=Head(), tokenizer=ByteTokenizer(),
+                                  specials=Specials(begin=None, separator=10, marker=0,
+                                                    marker_text="\x00", pad=255),
+                                  layout=StateFirstLayout(max_len=16))
+    assert not isinstance(objective.model.head, CountedDecisions)
+    batch = {"valid": np.ones((2, 8), bool)}
+    for count in (objective.model_flops, objective.training_flops):
+        with pytest.raises(MissingFlopsCount, match=r"Head.*decision_flops"):
+            count(None, batch)
+
+
+def test_adapted_decision_backbone_counts_training_work_without_claiming_an_lm_head():
+    class Trunk(nn.Module):
+        @nn.compact
+        def hidden_states(self, tokens, *, train=False, **fields):
+            return nn.Dense(8, use_bias=False)(nn.Embed(16, 8)(tokens))
+
+        def __call__(self, tokens, *, train=False):
+            return self.hidden_states(tokens, train=train)
+
+        @nn.nowrap
+        def model_flops(self, lengths):
+            return projection_flops(lengths, 8, 8)
+
+        @nn.nowrap
+        def parameter_flops(self, lengths):
+            return self.model_flops(lengths)
+
+        @nn.nowrap
+        def matrix_usage(self, path, lengths, *, logits=False):
+            return np.zeros_like(lengths) if logits else lengths
+
+    model = Trunk()
+    variables = model.init(jax.random.key(0), jnp.ones((2, 8), jnp.int32))
+    adapter = LoRA(1, ("Dense_0",)).apply(model, variables, key=1)
+    assert isinstance(adapter.model, CountedTraining)
+    assert not isinstance(adapter.model, CountedLogits)
+    head = DecisionHead(8, layers=0)
+    objective = DecisionObjective(adapter, head=head, tokenizer=ByteTokenizer(),
+                                  specials=Specials(begin=None, separator=10, marker=0,
+                                                    marker_text="\x00", pad=255),
+                                  layout=StateFirstLayout(max_len=8))
+    batch = {"valid": np.arange(8)[None, :] < LENGTHS[:, None],
+             "questions": np.ones((2, 1), bool), "options": np.ones((2, 1, 2), bool)}
+    frozen = 4 * 8 * 8 * np.sum(LENGTHS)
+    factors = 6 * (8 + 8) * np.sum(LENGTHS)
+    head_work = head.decision_flops(LENGTHS, np.ones(2, np.int64), np.full(2, 2, np.int64))
+    assert objective.training_flops(None, batch) == frozen + factors + 3 * head_work
+
+
+def test_diffusion_uncertainty_weighting_refuses_its_uncounted_head():
+    model = SimpleDiT(emb_features=8, num_layers=1, num_heads=2, patch_size=2)
+    objective = DiffusionObjective(model, presets.Flow(), inputs=InputSpec(sample=Field("images", (4, 4, 3))),
+                                   autoencoder=None, uncertainty=8, ema_decay=None)
+    with pytest.raises(MissingFlopsCount, match="uncertainty work"):
+        objective.training_flops(None, {"images": np.zeros((2, 4, 4, 3), np.float32)})
+
+
+def test_lm_trained_prediction_depths_refuse_their_uncounted_geometry():
+    objective = LMObjective(decoder(num_nextn_predict_layers=1), seq_len=6, mtp_weight=1.0)
+    with pytest.raises(MissingFlopsCount, match="prediction-depth geometry"):
+        objective.training_flops(None, packed_batch())
 
 
 @pytest.mark.mesh(devices=2)
@@ -609,20 +676,28 @@ def test_training_work_assembly_is_distinct_from_forward_model_count():
     assert objective.training_flops(None, batch) == 3 * objective.model_flops(None, batch)
 
 
-def test_qwen35_reference_uses_the_counted_real_token_backbone_convention():
+def test_qwen35_reference_uses_the_counted_real_token_backbone_convention(monkeypatch):
     """The reference workload has no vocabulary projection, only its backbone.
 
     Translate its committed released config without allocating any weights;
     8x3072 real rows and the same 6HDkDv recurrent convention must give the
-    number both device runners publish, rather than an independent literal.
+    work record both device runners publish.
     """
-    from tools.reference_runs.qwen35 import FLOPS_PER_STEP
+    from tool_support import REPO_ROOT, load
+
+    monkeypatch.syspath_prepend(str(REPO_ROOT / "tools" / "reference_runs"))
+    writer = load("reference_runs/work")
+    runner = load("reference_runs/dew_qwen35_step")
 
     path = Path(__file__).parent / "fixtures" / "hf" / "qwen35-0.8b" / "config.json"
     config = json.loads(path.read_text())
     model = translate_config(config["text_config"]).value
-    counted = int(3 * counted_flops(model, np.full((8,), 3072, np.int64)))
-    assert counted == FLOPS_PER_STEP, (counted, FLOPS_PER_STEP, counted - FLOPS_PER_STEP)
+    batch = {"tokens": np.zeros((8, 3072), np.int32)}
+    objective = runner.BackboneLoss(model, None, np.ones(model.emb_features, np.float32), 3072)
+    record = writer.measure(objective, batch)
+    assert record.training_flops_per_step == 3 * counted_flops(model, np.full((8,), 3072, np.int64))
+    assert record.training_flops_per_step == objective.training_flops(None, batch)
+    assert record.tokens_per_step == 8 * 3072
 
 
 def _kernels(variables) -> dict[tuple[str, ...], tuple[int, ...]]:

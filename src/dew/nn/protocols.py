@@ -56,9 +56,9 @@ if TYPE_CHECKING:
     from dew.nn.mla import MLAMixer
     from dew.records import JSON
 
-__all__ = ["AffineHead", "BlockDenoiser", "CacheCapacity", "Counted", "CountedImages", "CountedLogits",
-           "CountedMatrixUsage", "CountedParameters", "CountedTraining",
-           "DecoderTraining", "DenoisingModel",
+__all__ = ["AffineHead", "BlockDenoiser", "CacheCapacity", "Counted", "CountedDecisions", "CountedImages",
+           "CountedLogits", "CountedLogitsTraining", "CountedMatrixUsage", "CountedParameters",
+           "CountedTraining", "DecoderTraining", "DenoisingModel",
            "HiddenStates", "IntervalModel", "LayerScalars", "Logits", "LogitsFromHidden", "Looping",
            "ModelKwarg", "OutputTable", "ProjectionGroup", "Recomputing", "RematChoosing", "RequiresText",
            "Serving", "TimeScaled", "TokenModel", "TritonGemm"]
@@ -128,9 +128,14 @@ class CountedMatrixUsage(Protocol):
 
 @runtime_checkable
 class CountedTraining(Protocol):
-    """An adapted token model's training work, including its factors, not 3*forward."""
+    """An adapted backbone's training work, including its factors, not 3*forward."""
 
     def training_flops(self, lengths: np.ndarray) -> float: ...
+
+
+@runtime_checkable
+class CountedLogitsTraining(CountedTraining, Protocol):
+    """An adapted LM head's training work, separately from its backbone."""
 
     def logits_training_flops(self, lengths: np.ndarray) -> float: ...
 
@@ -159,6 +164,13 @@ class CountedImages(Protocol):
                     text_features: int | None = None) -> float: ...
 
     def image_lengths(self, sample_shape: tuple[int, ...], rows: int) -> np.ndarray: ...
+
+
+@runtime_checkable
+class CountedDecisions(Protocol):
+    """A decision head counts the layout's real questions and options with its rows."""
+
+    def decision_flops(self, lengths: np.ndarray, questions: np.ndarray, options: np.ndarray) -> float: ...
 
 
 @runtime_checkable
