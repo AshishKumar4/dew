@@ -14,7 +14,7 @@ import optax
 import pytest
 
 from dew.checkpoints import Checkpoints
-from dew.data import Loading, Text, load
+from dew.data import Loading, TokenWindows
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import REMAT_POLICIES
 from dew.nn.sharding import LayoutRefused
@@ -218,8 +218,8 @@ def token_files(directory):
 
 
 def windows(corpus):
-    return load(Text(source=str(corpus), seq_len=4, stride=1), batch=8, read="memory", seed=7,
-                loading=Loading(workers=0, threads=1, read_buffer=1), validation_records=4 * 8)
+    return TokenWindows(path=str(corpus), seq_len=4, stride=1, seed=7, val_batches=4,
+                        loading=Loading(workers=0, threads=1, read_buffer=1)).load(batch=8)
 
 
 def windowed(directory, split):
