@@ -406,7 +406,7 @@ class Pretrained:
              revision: str | None = None, gguf_file: str | None = None,
              single_file: str | None = None, dduf_file: str | None = None,
              mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None,
-             fallback: str | None = None) -> Self:
+             fallback: str | None = None, weights: bool = True) -> Self:
         """Load a source as a native Flax model with explicit parameter trees, as the kind of source it is.
 
         `name_or_dir` is a local HF directory or a Hub model ID. Decoder, tower and
@@ -458,11 +458,17 @@ class Pretrained:
 
         Called on a specific kind (`PretrainedDecoder.load`), it refuses a source of
         another kind and names that kind.
+
+        Without `weights`, the variables are their shapes and dtypes alone
+        (`jax.ShapeDtypeStruct`), read from the source's headers through the same
+        translation: what a run that resumes from its own checkpoint builds its state
+        around (`TrainerConfig.resumes`), as MaxText loads its base parameters only
+        for a run with no checkpoint.
         """
         return cls._load(name_or_dir, dtype=dtype, param_dtype=param_dtype, attention_impl=attention_impl,
                          max_seq_len=max_seq_len, revision=revision, gguf_file=gguf_file,
                          single_file=single_file, dduf_file=dduf_file, mesh=mesh, layout=layout,
-                         fallback=fallback)
+                         fallback=fallback, weights=weights)
 
     @classmethod
     def _load(cls, name_or_dir: str | Path, *, dtype: DTypeLike = jnp.bfloat16,
@@ -471,12 +477,16 @@ class Pretrained:
               revision: str | None = None, gguf_file: str | None = None, single_file: str | None = None,
               dduf_file: str | None = None,
               mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None, fallback: str | None = None,
-              prepare: Callable[[nn.Module, Variables], Variables] | None = None) -> Self:
+              prepare: Callable[[nn.Module, Variables], Variables] | None = None,
+              weights: bool = True) -> Self:
         """Share the source reader with inference's pre-placement projection packing."""
         if fallback not in (None, "torchax"):
             raise ValueError(f"fallback={fallback!r} names no loader; the one fallback is 'torchax', "
                              "tier 3 through transformers' PyTorch forward")
         streaming = mesh is not None or layout is not None
+        if streaming and not weights:
+            raise ValueError("a source loaded without its weights has nothing to place; the restore that "
+                             "fills it places it, so pass no mesh or layout")
 
         def placed(variables: Variables) -> Variables:
             return place(variables, mesh, layout) if streaming else variables
@@ -497,13 +507,18 @@ class Pretrained:
                                       dtype=dtype, attention_impl=attention_impl, param_dtype=param_dtype,
                                       streaming=streaming)
         if loaded is None:
+            # Without its weights, a decoder's leaves are translated as streaming translates them, each
+            # a view of its stored tensor that nothing reads.
             loaded = _load_native_source(name_or_dir, directory, commit, gguf_file=gguf_file, placed=placed,
-                                         streaming=streaming, dtype=dtype, param_dtype=param_dtype,
-                                         attention_impl=attention_impl, max_seq_len=max_seq_len,
-                                         prepare=prepare)
+                                         streaming=streaming or not weights, dtype=dtype,
+                                         param_dtype=param_dtype, attention_impl=attention_impl,
+                                         max_seq_len=max_seq_len, prepare=prepare)
         if not isinstance(loaded, cls):
             raise TypeError(f"{name_or_dir} is a {type(loaded).__name__} source, not a {cls.__name__}; "
                             f"load it with {type(loaded).__name__}.load or Pretrained.load")
+        if not weights:
+            loaded = replace(loaded, variables=jax.tree.map(
+                lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype), loaded.variables))
         return loaded
 
     @property

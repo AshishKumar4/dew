@@ -98,7 +98,7 @@ def _qwen3_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFie
     DeepSeek-R1-0528-Qwen3-8B ships it.
     """
     rope = read_rope(hf_config, used, records.integer(hf_config.get(
-        'max_position_embeddings', DEFAULT_MAX_SEQ_LEN), 'max_position_embeddings'), local=False)
+        'max_position_embeddings', DEFAULT_MAX_SEQ_LEN), 'max_position_embeddings'))
     return base_config(hf_config, used, qk_norm=True, rope=rope,
                         layer_types=qwen_layer_types(hf_config, used), reads=_QWEN_READS)
 
