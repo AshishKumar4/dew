@@ -103,28 +103,16 @@ class Hub:
         return f"hf:{self.repo}@{self.commit}:{self.config}:{self.split}"
 
     def snapshot(self) -> Mapping[str, object]:
-        identity = {
+        """The pinned split. The resolved commit fixes every file the split is
+        read or prepared from, so the snapshot is the same on any host, in any
+        cache directory, whether or not Arrow was prepared there."""
+        return {
             "store": "hf",
             "repo": self.repo,
             "revision": self.commit,
             "config": self.config,
             "split": self.split,
         }
-        builder = self.__dict__.get("builder")
-        if builder is not None and Path(builder.cache_dir, "dataset_info.json").is_file():
-            from dew.data.storage import Store
-
-            dataset = builder.as_dataset(split=self.split)
-            identity["shards"] = [
-                {
-                    "uri": entry["filename"],
-                    "version": Store(entry["filename"]).resolve()[0].ukey(entry["filename"]),
-                }
-                for entry in dataset.cache_files
-            ]
-        else:
-            identity["shards"] = self.files.snapshot()
-        return identity
 
     def supports(self, read: Read) -> bool:
         if read == "streamed":
