@@ -9,13 +9,13 @@ sharding moves values, never changes them.
 """
 
 import math
-import re
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+import sharded
 from jax.sharding import NamedSharding, PartitionSpec as P
 from recording import RecordingTracker
 from sharded import assert_sharded
@@ -241,12 +241,7 @@ def test_cross_attention_spends_communication_only_where_the_sequence_link_pays(
         result = jax.device_get(executable(*inputs))
         flops = compiled_flops(executable)
         assert flops is not None
-        moved = 0
-        for line in executable.as_text().splitlines():
-            match = COLLECTIVE.match(line)
-            if match:
-                moved += sum(ITEMSIZE[dtype] * math.prod(int(size) for size in dims.split(",") if size)
-                             for dtype, dims in TYPED.findall(match["shape"]))
+        moved = sharded.collective_bytes(executable.as_text(), sharded.COLLECTIVE_OPS)
         return result, flops * sequence * tensor, moved
 
     expected, _, _ = compiled(1, 1, Link(None, None, "cpu"))
@@ -478,49 +473,15 @@ def test_a_dit_steps_under_a_tensor_axis():
     layout.check(placed["params"], shardings["params"], mesh)
 
 
-COLLECTIVE = re.compile(
-    r"^\s*(?:ROOT\s+)?%\S+\s+=\s+(?P<shape>.+?)\s+"
-    r"(?P<op>all-reduce|all-gather|reduce-scatter|all-to-all|collective-permute)(?:-start)?\(")
-ARRAY = re.compile(r"[a-z]+\d*\[([\d,]*)\]")
-TYPED = re.compile(r"([a-z]+\d*)\[([\d,]*)\]")
-ITEMSIZE = {
-    "pred": 1,
-    "s8": 1,
-    "u8": 1,
-    "bf16": 2,
-    "f16": 2,
-    "f32": 4,
-    "s32": 4,
-    "u32": 4,
-    "f64": 8,
-    "s64": 8,
-}
-
-
 def collectives(spec, model):
     """`(op, result shapes)` of every collective one loss-and-gradient step of
     an LM objective over `model` compiles to under `spec` on four devices."""
-    found = []
-    for line in step_text(spec, model).splitlines():
-        match = COLLECTIVE.match(line)
-        if match:
-            shapes = [tuple(int(size) for size in dims.split(",") if size)
-                      for dims in ARRAY.findall(match["shape"])]
-            found.append((match["op"], shapes))
-    return found
+    return sharded.collectives(step_text(spec, model))
 
 
 def collective_bytes(spec, model, ops):
-    """Bytes of the results of every collective among `ops` the step
-    compiles to: a measure no combining of collectives into one, or
-    flattening of their operands, changes."""
-    total = 0
-    for line in step_text(spec, model).splitlines():
-        match = COLLECTIVE.match(line)
-        if match and match["op"] in ops:
-            total += sum(ITEMSIZE[dtype] * math.prod(int(size) for size in dims.split(",") if size)
-                         for dtype, dims in TYPED.findall(match["shape"]))
-    return total
+    """Bytes of the results of every collective among `ops` the step compiles to."""
+    return sharded.collective_bytes(step_text(spec, model), ops)
 
 
 def step_text(spec, model):

@@ -8,15 +8,15 @@ import numpy as np
 import pytest
 from kernel_compile import compile_kernels
 
-from dew.nn.kernels import fla_gdn, generation
-from dew.nn.linear import chunk_gated_delta_rule, fla_refusal, l2norm
+from dew.nn.kernels import fla_gdn
 
 pytestmark = pytest.mark.kernel
 
 
-def test_the_training_shapes_reach_the_ports_widest_heads():
-    assert max(shape[side] for shape in support.TRAINING_SHAPES.values()
-               for side in ("width", "columns")) == fla_gdn.WIDEST == 128
+def test_the_compiled_shapes_reach_the_widest_keys_and_values_the_port_takes():
+    shapes = support.COMPILED_SHAPES.values()
+    assert max(shape["width"] for shape in shapes) == fla_gdn.WIDEST_KEYS == 256
+    assert max(shape["columns"] for shape in shapes) == fla_gdn.WIDEST == 128
 
 
 def test_each_triton_gpu_takes_the_table_its_block_holds():
@@ -43,15 +43,15 @@ def test_a_config_takes_the_labs_overrides_and_clips_to_the_operands():
 
 
 @pytest.mark.parametrize("target", ["sm80", "sm120"])
-def test_the_kernel_cases_lower_each_kernel_on_abstract_training_operands(target):
+def test_the_kernel_cases_lower_each_kernel_on_abstract_operands(target):
     cases = list(support.kernel_cases(target))
-    # Nine kernels at two dtypes and two shapes, plus the four reverse cumsums.
-    assert len(cases) == 40 and len({case.name for case in cases}) == 40
+    # Nine kernels at two dtypes and three shapes, plus the six reverse cumsums.
+    assert len(cases) == 60 and len({case.name for case in cases}) == 60
     for case in cases:
         fn, args = case.call()
         assert fn.keywords["interpret"] is False
         assert args and all(isinstance(arg, jax.ShapeDtypeStruct) for arg in args)
-        assert args[0].shape[0] in (4, 8) and args[0].shape[1] == 3072
+        assert (args[0].shape[0], args[0].shape[1]) in ((8, 3072), (4, 3072), (1, 512))
         assert case.name.startswith(target + "/")
 
 
@@ -72,50 +72,12 @@ def test_the_shared_dot_preserves_narrow_products_with_fp32_accumulation():
     np.testing.assert_array_equal(np.asarray(got), np.asarray(expected))
 
 
-def test_the_fla_rule_refuses_keys_wider_than_its_configs_and_falls_back_cleanly(monkeypatch):
-    monkeypatch.setattr(generation, "device_generation", lambda: "sm120")
-    q = l2norm(jax.random.normal(jax.random.key(83), (1, 64, 1, 256)))
-    k = l2norm(jax.random.normal(jax.random.key(89), q.shape))
-    v = jax.random.normal(jax.random.key(97), (1, 64, 2, 128))
-    g, beta = jnp.full(v.shape[:3], -0.1), jnp.full(v.shape[:3], 0.5)
-    assert fla_gdn.rule_refusal(k, k, v, 64) == (
-        "keys 256 and values 128 wide; the port's configs compile for at most 128")
-    assert fla_refusal(k, k, v, 64) is not None
-    got = chunk_gated_delta_rule(q, k, v, g, beta, implementation="fla")
-    want = chunk_gated_delta_rule(q, k, v, g, beta, implementation="xla")
-    for mine, theirs in zip(got, want, strict=True):
-        np.testing.assert_array_equal(np.asarray(mine), np.asarray(theirs))
-
-
-def test_the_fla_rule_refuses_a_key_head_serving_no_power_of_two_value_heads(monkeypatch):
-    monkeypatch.setattr(generation, "device_generation", lambda: "sm120")
-    k, v = jnp.zeros((1, 64, 1, 128), jnp.bfloat16), jnp.zeros((1, 64, 3, 128), jnp.bfloat16)
-    assert fla_gdn.rule_refusal(k, k, v, 64) == "3 value heads a key head; dqkwg's block holds a power of two"
-
-
-def test_a_rule_with_float32_queries_over_bf16_keys_runs_xla_not_the_port():
-    q = l2norm(jax.random.normal(jax.random.key(101), (1, 64, 1, 64)))
-    k = l2norm(jax.random.normal(jax.random.key(103), q.shape)).astype(jnp.bfloat16)
-    v = jax.random.normal(jax.random.key(107), (1, 64, 2, 64)).astype(jnp.bfloat16)
-    g, beta = jnp.full(v.shape[:3], -0.1), jnp.full(v.shape[:3], 0.5, jnp.bfloat16)
-    got = chunk_gated_delta_rule(q, k, v, g, beta, implementation="fla")
-    want = chunk_gated_delta_rule(q, k, v, g, beta, implementation="xla")
-    for mine, theirs in zip(got, want, strict=True):
-        np.testing.assert_array_equal(np.asarray(mine), np.asarray(theirs))
-
-
-def test_the_fla_rule_refuses_a_gpu_without_its_configs(monkeypatch):
-    monkeypatch.setattr(generation, "device_generation", lambda: "sm75")
-    k, v = jnp.zeros((1, 64, 1, 128), jnp.bfloat16), jnp.zeros((1, 64, 2, 128), jnp.bfloat16)
-    assert fla_gdn.rule_refusal(k, k, v, 64) == "the port has no bfloat16 configs for sm75"
-
-
-def test_the_fla_rule_refuses_a_dtype_without_configs_where_it_interprets_too(monkeypatch):
-    monkeypatch.setattr(generation, "device_generation", lambda: "cpu")
-    with jax.enable_x64(new_val=True):
-        k, v = jnp.zeros((1, 64, 1, 64), jnp.float64), jnp.zeros((1, 64, 2, 64), jnp.float64)
-        assert fla_gdn.rule_refusal(k, k, v, 64) == "the port has no float64 configs for cpu"
-        assert fla_refusal(k, k, v, 64) == "the port has no float64 configs for cpu"
+def test_wide_keys_cap_an_a100s_dhu_at_two_stages():
+    shape = {"width": 256, "columns": 128}
+    assert fla_gdn.kernel_config("chunk_bwd_dhu", shape, jnp.bfloat16, target="sm80")["stages"] == 2
+    assert fla_gdn.kernel_config("chunk_bwd_dhu", shape, jnp.bfloat16, target="sm120")["stages"] == 1
+    assert fla_gdn.kernel_config("chunk_bwd_dhu", {"width": 128, "columns": 128}, jnp.bfloat16,
+                                 target="sm80")["stages"] == 3
 
 
 @pytest.mark.parametrize("target", ["sm80", "sm89", "sm120"])
