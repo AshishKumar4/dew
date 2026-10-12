@@ -369,6 +369,9 @@ def offline(out):
     info = HfApi.dataset_info
     HfApi.dataset_info = lambda self, repo, **options: (
         SimpleNamespace(sha="offline-fixture") if repo in builders else info(self, repo, **options))
+    listing = HfApi.list_repo_files
+    HfApi.list_repo_files = lambda self, repo, **options: (
+        ["train.parquet"] if repo in builders else listing(self, repo, **options))
     datasets.load_dataset_builder = lambda repo, **options: (
         builders[repo] if repo in builders else builder(repo, **options))
     decoders = {"Qwen/Qwen3-0.6B", "HuggingFaceTB/SmolLM2-135M-Instruct"}
