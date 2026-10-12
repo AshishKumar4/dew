@@ -661,7 +661,8 @@ class Images:
     def pipelines(self) -> tuple[Pipeline, Pipeline | None, tuple[HostStep, ...]]:
         from dew.data.sources.tfds import TFDS
 
-        size = self.image_size if self.staging_size is None else self.staging_size
+        # No augmentation stages nothing larger than the output: the record resizes to it directly.
+        size = self.image_size if self.staging_size is None or self.augment is None else self.staging_size
         source = _source(self.source, split=self.split)
         if isinstance(source, TFDS):
             import tensorflow_datasets as tfds
