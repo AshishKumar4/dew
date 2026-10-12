@@ -7,8 +7,9 @@ import grain.python as grain
 import numpy as np
 import pytest
 
-from dew.data import DataPartition, Dataset, Files, Loading, Memory, from_grain, mix
+from dew.data import Dataset, Files, Loading, Memory, from_grain, mix
 from dew.data.compile import compile, iterate
+from dew.data.dataset import DataPartition
 
 READ = Loading(workers=0, threads=1, read_buffer=2, worker_buffer=1)
 

@@ -715,6 +715,10 @@ def objective_steps(pipeline: Pipeline, objective: ObjectiveData, *, train: bool
     for step in objective.train if train else objective.evaluate:
         if isinstance(step, Expansion):
             pipeline = pipeline.flat_map(step)
+        elif isinstance(step, Configured):
+            pipeline = pipeline.then(step)
+        elif _rejects(step):
+            pipeline = pipeline.filter_map(step)
         elif isinstance(step, pygrain.RandomMapTransform):
             pipeline = pipeline.random_map(step)
         else:

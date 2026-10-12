@@ -7,10 +7,12 @@ import numpy as np
 import pytest
 from PIL import Image
 
-from dew.data import DataPartition, Loading, Memory, Pipeline, Rejected, compile, images, video
+from dew.data import Loading, Memory, Rejected, images, video
 from dew.data.cache import Cache
-from dew.data.compile import iterate, publish
+from dew.data.compile import compile, iterate, publish
+from dew.data.dataset import DataPartition
 from dew.data.mix import SearchBudget
+from dew.data.pipeline import Pipeline
 from dew.data.sources.urls import Fetch
 from dew.data.steps.image import DecodeImage, Resize
 from dew.objectives.base import VALID_ROWS
@@ -24,7 +26,7 @@ def catalog(root: Path, count: int = 16) -> Pipeline:
         path = root / f"image-{index}.png"
         Image.fromarray(np.full((8, 8, 3), index + 1, np.uint8)).save(path)
         rows.append({"url": path.as_uri(), "caption": f"sample {index}", "label": index})
-    return Pipeline(Memory(rows)).map(Fetch(output="image", retries=0), DecodeImage(), Resize(8))
+    return Pipeline(Memory(rows)).filter_map(Fetch(output="image", retries=0), DecodeImage()).map(Resize(8))
 
 
 def test_fetch_preserves_the_catalog_and_reads_exact_bytes(tmp_path):
@@ -39,8 +41,8 @@ def test_failed_fetches_are_counted_before_batches(tmp_path):
     prefix = catalog(tmp_path)
     rows = [{"url": (tmp_path / "missing").as_uri(), "label": -1},
             *prefix.source.records("indexed")]
-    pipeline = Pipeline(Memory(rows)).shuffle(7).repeat().map(
-        Fetch(output="image", retries=0), DecodeImage(), Resize(8)).batch(4)
+    pipeline = Pipeline(Memory(rows)).shuffle(7).repeat().filter_map(
+        Fetch(output="image", retries=0), DecodeImage()).map(Resize(8)).batch(4)
     data = compile(pipeline, read="indexed", loading=READ)
     stream = data.train(DataPartition())
     try:
@@ -65,7 +67,7 @@ def test_an_oversized_object_is_rejected_before_decode(tmp_path):
 
 
 def test_an_all_rejected_catalog_exhausts_its_search_budget(tmp_path):
-    pipeline = Pipeline(Memory([{"url": (tmp_path / "missing").as_uri()}])).repeat().map(
+    pipeline = Pipeline(Memory([{"url": (tmp_path / "missing").as_uri()}])).repeat().filter_map(
         Fetch(output="image", retries=0), DecodeImage()).batch(4)
     data = compile(pipeline, read="indexed", loading=READ,
                    budget=SearchBudget(consecutive=8, seconds=2))
@@ -80,7 +82,7 @@ def test_an_all_rejected_catalog_exhausts_its_search_budget(tmp_path):
 @pytest.mark.parametrize("workers", [0, 2])
 def test_real_workers_fetch_pixels_without_losing_validation_rows(tmp_path, workers):
     prefix = catalog(tmp_path, 13)
-    data = compile(Pipeline(prefix.source).shuffle(3).repeat().map(*(
+    data = compile(Pipeline(prefix.source).shuffle(3).repeat().filter_map(*(
                        stage.step for stage in prefix.stages)).batch(4), validation=prefix.batch(4),
                    read="indexed", loading=Loading(workers=workers, threads=1, read_buffer=2,
                                                    worker_buffer=1))
@@ -132,14 +134,14 @@ def rejected(stream) -> dict[str, float]:
 
 def worth_training_on(pipeline: Pipeline) -> Pipeline:
     """The old url loader's checks, as stages."""
-    return (pipeline.map(images.decode()).filter(images.min_side(16)).filter(images.max_aspect(2.4))
+    return (pipeline.filter_map(images.decode()).filter(images.min_side(16)).filter(images.max_aspect(2.4))
             .filter(images.not_flat()))
 
 
 def test_a_web_image_flow_trains_on_the_good_images_and_counts_each_drop_by_reason(tmp_path):
     """Fetched in four threads, decoded and checked: only the good images reach a batch, and the
     reader's counts name every reason a url was dropped."""
-    fetched = Pipeline(Memory(web_table(tmp_path))).shuffle(5).repeat().map(images.fetch(retries=0))
+    fetched = Pipeline(Memory(web_table(tmp_path))).shuffle(5).repeat().filter_map(images.fetch(retries=0))
     data = compile(worth_training_on(fetched).map(Resize(16)).batch(4), read="indexed",
                    loading=Loading(workers=0, threads=4, read_buffer=8, worker_buffer=1))
     stream = data.train(DataPartition())
@@ -159,13 +161,13 @@ def test_fetched_bytes_published_once_train_and_resume_exactly_after_every_url_d
     exactly. A url that fails transiently would be fetched again, so it keeps a table from
     publishing; this one fails only permanently."""
     table = [row for row in web_table(tmp_path) if not str(row["url"]).endswith("gone.png")]
-    generation = publish(Pipeline(Memory(table)).map(images.fetch(retries=0)), Cache(str(tmp_path / "cache")),
+    generation = publish(Pipeline(Memory(table)).filter_map(images.fetch(retries=0)), Cache(str(tmp_path / "cache")),
                          read="indexed", loading=READ)
     originals = {row["label"]: np.asarray(Image.open(row["url"].removeprefix("file://")).convert("RGB"))
                  for row in table[:8]}
     for path in tmp_path.glob("*.png"):
         path.unlink()
-    pipeline = worth_training_on(Pipeline(Memory(table)).map(images.fetch(retries=0)).cache(generation)
+    pipeline = worth_training_on(Pipeline(Memory(table)).filter_map(images.fetch(retries=0)).cache(generation)
                                  .shuffle(5).repeat()).batch(4)
     data = compile(pipeline, read="indexed", loading=READ)
     stream = data.train(DataPartition())
@@ -195,8 +197,8 @@ def test_a_web_video_flow_decodes_frames_from_fetched_bytes(tmp_path):
     clip = Path(_clip(tmp_path, audio=False))
     (tmp_path / "broken.mp4").write_bytes(b"not a video")
     table = [{"url": clip.as_uri(), "caption": "a fade"}, {"url": (tmp_path / "broken.mp4").as_uri()}]
-    pipeline = (Pipeline(Memory(table)).shuffle(2).repeat().map(video.fetch(retries=0))
-                .random_map(video.decode(frames=8, size=16)).batch(2))
+    pipeline = (Pipeline(Memory(table)).shuffle(2).repeat().filter_map(video.fetch(retries=0))
+                .filter_map(video.decode_clip(8, size=16)).batch(2))
     data = compile(pipeline, read="indexed", loading=READ)
     stream = data.train(DataPartition())
     try:

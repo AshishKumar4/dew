@@ -392,7 +392,7 @@ class ChatData:
             if self.long == "chunk":
                 pipeline = pipeline.flat_map(Chunks(self.seq_len + 1, ("text", "text_roles")))
             else:
-                pipeline = pipeline.map(
+                pipeline = pipeline.filter_map(
                     LengthPolicy(self.seq_len + 1, long=self.long, aligned=("text_roles",))
                 )
             return pipeline.pack(self.seq_len + 1, fields=("text", "text_roles"), bins=self.packing_bins)
@@ -569,7 +569,7 @@ class ImageData:
         caption = images.caption(*templates, classes=classes, columns=self.caption_columns)
 
         def prepared(chain: Pipeline, staging: int) -> Pipeline:
-            return (chain.map(images.decode(self.field, to="image")).random_map(caption)
+            return (chain.filter_map(images.decode(self.field, to="image")).random_map(caption)
                     .map(images.resize(staging, "bicubic")))
 
         train = prepared(train, size)
@@ -626,8 +626,8 @@ class VideoData:
         audio = video.audio(self.audio_model)
         decoder = video.decode_clip(self.frames, size=self.frame_size, audio_padding=self.audio_padding,
                                     sample_rate=audio.processor.sampling_rate)
-        train = train.random_map(decoder).map(audio)
-        held = None if held is None else held.random_map(decoder).map(audio)
+        train = train.filter_map(decoder).map(audio)
+        held = None if held is None else held.filter_map(decoder).map(audio)
         return train, held, (EncodeCaptions(),)
 
 

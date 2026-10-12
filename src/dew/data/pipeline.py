@@ -355,25 +355,35 @@ class Dataset:
         """`stages(self, *args, **kwargs)`: a dataset-level stage, such as `text.pack`."""
         return stages(self, *args, **kwargs)
 
-    def map(
-        self, *steps: RecordStep | Configured, identity: str | None = None, rejects: bool | None = None
-    ) -> Pipeline:
+    def map(self, *steps: RecordStep | Configured, identity: str | None = None) -> Pipeline:
+        """One record to one: each step returns its record's replacement. A
+        step that drops records (returns `Rejected`) goes through `filter_map`."""
         for step in steps:
             if isinstance(step, pygrain.RandomMapTransform):
-                raise ValueError(
-                    f"stochastic step {type(step).__name__} needs random_map after the cache prefix"
-                )
-        return self.then(
-            *(
-                step
-                if isinstance(step, Configured)
-                else Map(step, identity, _rejects(step) if rejects is None else rejects)
-                for step in steps
-            )
-        )
+                raise TypeError(f"{_named_step(step)} draws from a generator; apply it with random_map")
+            if not isinstance(step, Configured) and _declares_rejects(step):
+                raise TypeError(f"{_named_step(step)} drops records; apply it with filter_map")
+        return self.then(*(step if isinstance(step, Configured) else Map(step, identity) for step in steps))
 
     def random_map(self, *steps: RandomStep, identity: str | None = None) -> Pipeline:
-        return self.then(*(RandomMap(step, identity, _rejects(step)) for step in steps))
+        """One record to one, each step drawing from the record's generator
+        (`fn(record, rng)` or a `grain.RandomMapTransform`), the same draws on
+        every read and resume."""
+        for step in steps:
+            if _declares_rejects(step):
+                raise TypeError(f"{_named_step(step)} drops records; apply it with filter_map")
+        return self.then(*(RandomMap(step, identity) for step in steps))
+
+    def filter_map(self, *steps: RecordStep | pygrain.RandomMapTransform,
+                   identity: str | None = None) -> Pipeline:
+        """One record to none or one: each step returns its record's
+        replacement or `Rejected(reason)`, which drops it, counted by reason
+        in the reader's checkpointed counts, as `images.fetch` and
+        `images.decode` do. A `grain.RandomMapTransform` draws from the
+        record's generator."""
+        return self.then(*(RandomMap(step, identity, rejects=True)
+                           if isinstance(step, pygrain.RandomMapTransform)
+                           else Map(step, identity, rejects=True) for step in steps))
 
     def map_with_index(
         self, step: Callable[[int, Batch], Batch | Rejected], *, identity: str | None = None
@@ -599,6 +609,23 @@ class ObjectiveData:
     group: LengthGroups | None = None
     train_batch: tuple[HostStep, ...] = ()
     evaluate_batch: tuple[HostStep, ...] = ()
+
+
+def _named_step(step: object) -> str:
+    return getattr(step, "__qualname__", None) or type(step).__name__
+
+
+def _declares_rejects(step: object) -> bool:
+    """Whether `step` says it drops records: a `rejects` flag, or a return annotation naming `Rejected`."""
+    if isinstance(step, Rejecting):
+        return bool(step.rejects)
+    method = (step.map if isinstance(step, pygrain.MapTransform) else
+              step.random_map if isinstance(step, pygrain.RandomMapTransform) else step)
+    try:
+        returned = inspect.signature(method).return_annotation
+    except (TypeError, ValueError):
+        return False
+    return returned is not inspect.Signature.empty and "Rejected" in str(returned)
 
 
 def _rejects(step: RecordStep | RandomStep | Callable[[int, Batch], Batch | Rejected]) -> bool:
