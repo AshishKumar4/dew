@@ -141,8 +141,12 @@ def _name(pipeline: Pipeline) -> str:
 
 
 def _identity(stage: Stage, *, cache: bool = False) -> StepIdentity:
+    """What a stage runs, as the plan's manifest and a cache's key record it.
+    A cache stage is its kind alone. The plan names the rows a cache serves
+    by their key (`Cache.reference`), and where the cache lives is no part of
+    the data, so a run resumes against the same rows cached anywhere."""
     if isinstance(stage, Artifact):
-        return StepIdentity(f"dew.data.cache.{type(stage.cache).__name__}", stage.cache.url, exact=True)
+        return StepIdentity(f"dew.data.cache.{type(stage.cache).__name__}", "", exact=True)
     if isinstance(stage, Configured):
         return StepIdentity.of(stage.factory, cache=cache)
     if isinstance(stage, (Map, RandomMap, MapWithIndex, FlatMap, MapBatch)):
