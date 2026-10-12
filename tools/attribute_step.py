@@ -58,7 +58,8 @@ PARTS = (
                   r"[Dd]ecision"),
     ("optimizer", r"optax|adam|[Mm]uon|apply_updates|clip_by|update_moment|scale_by|opt_state|"
                   r"training/transaction\.py"),
-    ("gdn", r"nn/linear\.py|nn/kernels/delta_|nn/kda\.py|GatedDeltaNet|gated_delta|chunk_delta|KimiDelta"),
+    ("gdn", r"nn/linear\.py|nn/kernels/(fla_gdn|delta_rule)|nn/kda\.py|GatedDeltaNet|gated_delta|chunk_delta|"
+            r"KimiDelta|fla_chunk|fla_kkt|fla_recompute|fla_prepare"),
     ("lora", r"[Ll]o[Rr][Aa]|lora_a|lora_b"),
     ("norm", r"layernorm|_norm/|/norm\d?/|RMSNorm|LayerNorm"),
     ("attention", r"nn/attention\.py|nn/mixers/attention\.py|flash_attn|decode_attention|nn/rope\.py|"

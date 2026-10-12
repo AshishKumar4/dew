@@ -14,8 +14,8 @@ recipes/decision/clef.py's own run at its defaults, bfloat16 compute, LoRA
 on every projection and Clef's joint head. The backbone is the size of a
 test fixture: the tiny Qwen 3.5's three Gated DeltaNet layers and one
 full-attention layer, with 64-wide key and value heads, which the gated
-delta rule's kernels take (`dew.nn.kernels.delta_chunks.refusal`), so
-`KERNELS` chooses on it as on the 0.8B. `--like` gives its four layers another checkpoint's widths instead
+delta rule's port takes (`dew.nn.linear.port_refusal`), so the step runs
+the GPU's kernels on it as on the 0.8B. `--like` gives its four layers another checkpoint's widths instead
 (`GEOMETRY`, from that checkpoint's config alone), the heads and widths a
 kernel's choices and refusals read, and `--max-len` and `--batch` its rows.
 
