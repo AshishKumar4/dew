@@ -1411,11 +1411,13 @@ together. The whole rule's float64 RMS ratios were at most 1.002 at default
 precision and 1.324 at highest, with bitwise repeats.
 
 Both kernels are gone (2026-10-12). Dew's port of fla 0.5.2's nine kernels
-(`dew.nn.kernels.fla_gdn`) runs the gated delta rule on every GPU of sm80
-or later, on any heads, dtypes, chunk sizes and mesh, with keys up to 256
-wide in bf16 or fp16 and 128 in fp32 (`dew.nn.linear.fla_rule`). The XLA
-math stays for CPUs, TPUs, older GPUs, forward-mode traces, float64 and
-wider keys, and as the tests' oracle (`port_refusal` names the GPU cases).
+(`dew.nn.kernels.fla_gdn`) runs the gated delta rule on every GPU whose
+target row names it (`'gated_delta_rule': 'fla'` on sm80, sm89, sm90 and
+sm120, where it was measured; the row is what qualification reads), on any
+heads, dtypes, chunk sizes and mesh, with keys up to 256 wide in bf16 or
+fp16 and 128 in fp32 (`dew.nn.linear.fla_rule`). The XLA math stays for
+CPUs, TPUs, unmeasured GPUs, forward-mode traces, float64 and wider keys,
+and as the tests' oracle (`port_refusal` names each case).
 On a G4 the port's bf16 forward ran 1.32 and 1.18 ms at the 0.8B's (8 x
 3072 tokens, 16 key and 16 value heads of 128) and the 9B's (4 x 3072, 16
 and 32) shapes against fla's 2.66 and 2.37 (kernel lab `fwd` job,
