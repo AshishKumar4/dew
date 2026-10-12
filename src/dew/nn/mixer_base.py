@@ -13,7 +13,7 @@ the run's dtype and kernel choices, so a new kind needs no backbone branch.
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
@@ -100,6 +100,26 @@ class MixerContext:
     output_init_std: float | None = None
     """The std of the projection back to the residual stream, which a
     depth-scaled init shrinks; None follows `init_std`."""
+
+    def policies(self) -> dict[str, bool]:
+        """Whether this layer asks each of the attention policies that change
+        what a mixer computes, beyond its geometry: a mixer implements each it
+        is asked or refuses it by name (`refuse`), never computes without it."""
+        return {
+            "force_fp32_for_softmax": not self.force_fp32_for_softmax,
+            "attn_logit_softcap": self.attn_logit_softcap is not None,
+            "attention_sinks": self.attention_sinks,
+            "value_scale": self.value_scale is not None,
+            "o_proj_bias": bool(self.o_proj_bias),
+            "attention_dropout_rate": bool(self.attention_dropout_rate),
+        }
+
+    def refuse(self, kind: str, asked: Mapping[str, bool], why: str) -> None:
+        """Raise naming every entry of `asked` this layer sets, none of which
+        mixer `kind` implements: `why`."""
+        names = sorted(name for name, value in asked.items() if value)
+        if names:
+            raise ValueError(f"the {kind} mixer has no {', '.join(names)}: {why}")
 
 
 class MixerBase:
