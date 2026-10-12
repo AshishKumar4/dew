@@ -420,15 +420,17 @@ def test_rule_override_changes_only_declared_axes():
     assert specs["embed"]["patch_embed"]["Conv_0"]["kernel"] == P()
 
 
-def test_default_rules_keep_the_shape_heuristic_for_the_dit():
-    """The declared table reproduces the largest-divisible-axis choice on the
-    DiT's shapes, so declaring the model moved none of its leaves."""
+def test_default_rules_split_every_dit_leaf_the_shape_heuristic_splits():
+    """The declared table splits each of the DiT's leaves that the
+    largest-divisible-axis heuristic splits, so declaring the model left none
+    whole; a kernel's split may sit on another dimension, its leading one
+    (`DEFAULT_RULES`)."""
     variables = dit_variables()
     shardings = Layout(rules=DEFAULT_RULES, min_shard=1).shardings(
         MeshSpec(fsdp=2).build(), variables)
     expected = jax.tree.map(
-        lambda leaf: parameter_spec(leaf.shape, fsdp_size=2, min_shard_size=1), variables)
-    assert jax.tree.map(lambda sharding: sharding.spec, shardings) == expected
+        lambda leaf: bool(parameter_spec(leaf.shape, fsdp_size=2, min_shard_size=1)), variables)
+    assert jax.tree.map(lambda sharding: bool(sharding.spec), shardings) == expected
 
 
 def test_a_rule_onto_an_axis_of_size_one_shards_nothing():
@@ -694,7 +696,7 @@ def test_muon_masked_optimizer_state_shards_with_its_parameters():
     assert placeholders, "muon left no masked placeholder for the derivation to carry"
 
     kernel = state.variables["params"]["dit_block_0"]["mlp"]["layers_0"]["kernel"]
-    assert kernel.sharding.spec == P(None, "fsdp")
+    assert kernel.sharding.spec == P("fsdp")
     moment_specs = {leaf.sharding.spec for leaf in jax.tree.leaves(state.opt_state)}
     assert kernel.sharding.spec in moment_specs
 

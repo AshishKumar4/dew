@@ -75,10 +75,34 @@ def test_the_default_mesh_places_like_the_three_axis_one():
 
     assert specs["embed_tokens"]["embedding"] == P("fsdp")
     assert specs["layers_0"]["self_attn"]["q_proj"]["kernel"] == P("fsdp")
-    assert specs["layers_0"]["mlp"]["gate_proj"]["kernel"] == P(None, "fsdp")
+    assert specs["layers_0"]["mlp"]["gate_proj"]["kernel"] == P("fsdp")
     Layout(min_shard=TINY_SHARD).check(
         variables()["params"],
         Layout(min_shard=TINY_SHARD).shardings(mesh, variables())["params"], mesh)
+
+
+DELTA = {"class": "gated_delta_net", "fields": {
+    "linear_num_key_heads": 2, "linear_num_value_heads": 4, "linear_key_head_dim": 8,
+    "linear_value_head_dim": 8, "linear_conv_kernel_dim": 4}}
+
+
+@pytest.mark.parametrize("hybrid", [{}, {"layer_types": ("linear_attention", "full_attention"),
+                                         "kinds": {"linear_attention": {"mixer": DELTA}}}],
+                         ids=["attention", "delta-net"])
+def test_fsdp_alone_splits_each_kernels_leading_dimension(hybrid):
+    """fsdp alone stores a split, so each kernel's shard is a block of its
+    rows: the gate and up projections and the delta net's input projections
+    split the residual width they read, not the width a rule names first.
+    The head keeps its vocabulary split, which its loss computes on."""
+    model = models.build("causal_transformer", vocab_size=VOCAB, emb_features=32, num_layers=2, num_heads=4,
+                         num_kv_heads=2, mlp_features=64, max_seq_len=SEQ_LEN, tie_embeddings=False, **hybrid)
+    shardings = Layout(min_shard=TINY_SHARD).shardings(MeshSpec(fsdp=8).build(), jax.eval_shape(
+        model.init, jax.random.key(0), jnp.ones((1, SEQ_LEN), jnp.int32)))
+    specs = {jax.tree_util.keystr(path): sharding.spec
+             for path, sharding in jax.tree_util.tree_leaves_with_path(shardings["params"])
+             if sharding.spec and "kernel" in jax.tree_util.keystr(path)}
+    assert specs.pop("['lm_head']['kernel']") == P(None, "fsdp")
+    assert specs and set(specs.values()) == {P("fsdp")}, specs
 
 
 def test_the_default_rules_split_the_megatron_widths_on_the_tensor_axis():
@@ -165,11 +189,6 @@ def test_tensor_parallelism_computes_latent_attentions_down_projections_once():
 
     one = flops(MeshSpec(), jax.devices()[:1])
     assert flops(MeshSpec(tensor=4), jax.devices()[:4]) == pytest.approx(one, rel=1e-6)
-
-
-DELTA = {"class": "gated_delta_net", "fields": {
-    "linear_num_key_heads": 2, "linear_num_value_heads": 4, "linear_key_head_dim": 8,
-    "linear_value_head_dim": 8, "linear_conv_kernel_dim": 4}}
 
 
 @pytest.mark.mesh(devices=2)
