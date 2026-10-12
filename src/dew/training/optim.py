@@ -747,6 +747,7 @@ class Cosine(ScheduleBase):
     step `decay_steps`, or at the run's end when that is None.
 
     It is `optax.warmup_cosine_decay_schedule`.
+    `warmup_steps` must be smaller than the decay horizon in schedule steps.
     """
 
     peak: float
@@ -756,9 +757,13 @@ class Cosine(ScheduleBase):
     decay_steps: int | None = None
 
     def values(self, steps: int) -> optax.Schedule:
+        decay_steps = steps if self.decay_steps is None else self.decay_steps
+        if self.warmup_steps >= decay_steps:
+            raise ValueError(f"Cosine needs warmup_steps={self.warmup_steps} smaller than "
+                             f"decay_steps={decay_steps}")
         return optax.warmup_cosine_decay_schedule(
             init_value=self.init, peak_value=self.peak, warmup_steps=self.warmup_steps,
-            decay_steps=steps if self.decay_steps is None else self.decay_steps,
+            decay_steps=decay_steps,
             end_value=self.end)
 
 
