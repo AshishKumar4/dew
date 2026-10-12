@@ -357,7 +357,7 @@ def test_unsupported_source_controls_report_their_reason(task):
         "no compile": ({"disable_compile": True}, "always runs compiled"),
         "capacity": ({"max_cache_len": 4096}, "max_seq_len"),
     }
-    for (active, reason) in refusals.values():
+    for (active, _reason) in refusals.values():
         with pytest.raises(ValueError):
             replace(source, generation_config=active).text_generation()
 
@@ -454,7 +454,7 @@ def test_an_explicit_policy_replaces_the_chain_the_source_could_not_build(task):
     np.testing.assert_array_equal(overridden([[1, 2]], 2, key=jax.random.key(0), n=1
                                              ).behavior_log_probs, 0)
     # A control the task still owns keeps refusing under the same override.
-    for active, reason in (({"max_time": 5.0}, "host clock"),
+    for active, _reason in (({"max_time": 5.0}, "host clock"),
                            ({"output_scores": True}, "per-step distributions"),
                            ({"a_future_control": 3}, "does not know this control")):
         with pytest.raises(ValueError):

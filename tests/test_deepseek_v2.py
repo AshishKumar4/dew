@@ -56,7 +56,8 @@ def test_router_reproduces_the_deepseek_v2_group_limited_choice():
     assert np.allclose(np.sum(np.asarray(normalized), axis=-1), 2.5, atol=1e-5)
     assert not np.allclose(np.sum(tensors["router_weights"], axis=-1), 2.5, atol=1e-3)
     _, grouped = v2_router(group_score="top2").apply(router_variables(tensors), hidden)
-    assert not np.array_equal(np.sort(np.asarray(grouped), axis=-1), np.sort(tensors["router_indices"], axis=-1))
+    assert not np.array_equal(np.sort(np.asarray(grouped), axis=-1),
+                              np.sort(tensors["router_indices"], axis=-1))
 
 
 def test_the_objective_adds_every_sparse_layers_balance_loss():

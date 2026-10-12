@@ -12,6 +12,7 @@ from reference_error import assert_as_exact_as_the_reference
 
 from dew.lora import Adapter, Target
 
+
 class Host(nn.Module):
     """One DenseGeneral that contracts the input's last two axes, listed out
     of order, into a (5, 6) output."""

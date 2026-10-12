@@ -14,7 +14,6 @@ from affine_run import TimingRegression as Regression, batches
 from dew.config import RunConfig, TrainerConfig
 from dew.config.sweep import GridSearch
 from dew.data import Dataset
-from dew.telemetry.records import TrialFinished
 from dew.training import LocalTracker
 
 SPACE = {'optim.learning_rate': [0.1, 0.01], 'optim.clip_grads': [0.0, 1.0]}

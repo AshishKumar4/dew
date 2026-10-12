@@ -1165,7 +1165,8 @@ def test_right_padded_rows_attend_causally_with_no_mask(rng, causal):
     valid = jnp.arange(SEQ)[None, :] < jnp.asarray([[7], [SEQ]])
 
     def states(**declared):
-        return model.apply(params, ids, attention_mask=valid, method=CausalTransformer.hidden_states, **declared)
+        return model.apply(params, ids, attention_mask=valid,
+                           method=CausalTransformer.hidden_states, **declared)
 
     masked = states()
     declared = states(right_padded=True)
@@ -1229,3 +1230,22 @@ def test_the_rotary_rotates_the_halves_as_rotate_half_does(dtype, pairs, scale, 
         assert mine.dtype == theirs.dtype == dtype
         assert_as_exact_as_the_reference(np.asarray(mine, np.float64), np.asarray(theirs, np.float64),
                                          np.asarray(want), label)
+
+
+def test_param_tree_mirrors_the_hf_decoder_layout(rng):
+    """The interop map has to be a rename, so the tree is a fixed contract."""
+    model = tiny()
+    params = model.init(rng, tokens(rng))['params']
+    paths = sorted('.'.join(str(entry.key) for entry in path)
+                   for path, _ in jax.tree_util.tree_flatten_with_path(params)[0])
+    layer = ['input_layernorm.scale',
+             'mlp.down_proj.kernel', 'mlp.gate_proj.kernel', 'mlp.up_proj.kernel',
+             'post_attention_layernorm.scale',
+             'self_attn.k_norm.scale', 'self_attn.k_proj.kernel',
+             'self_attn.o_proj.kernel', 'self_attn.q_norm.scale',
+             'self_attn.q_proj.kernel', 'self_attn.v_proj.kernel']
+    assert paths == sorted(
+        ['embed_tokens.embedding', 'norm.scale']
+        + [f'layers_{index}.{leaf}' for index in (0, 1) for leaf in layer])
+    # tie_embeddings=True is the reason there is no lm_head to rename
+    assert 'lm_head' not in params

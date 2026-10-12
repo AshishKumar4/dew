@@ -15,6 +15,7 @@ import pytest
 
 from dew.interop.streaming import SourceLeaf
 
+
 @pytest.mark.parametrize("dtype", ["float32", "float16", "bfloat16"])
 def test_a_transposed_read_across_many_tiles_is_the_strided_copy_bit_for_bit(dtype):
     """A transposed leaf is read and cast in its stored layout, then swapped
@@ -42,7 +43,8 @@ def test_a_transposed_read_across_many_tiles_is_the_strided_copy_bit_for_bit(dty
         assert stacked.read(index).tobytes() == expected.tobytes(), index
 
     small_members = tuple(rng.standard_normal((6, 4)).astype(np.float32) for _ in range(3))
-    small = SourceLeaf.stack([SourceLeaf((one,), storage, transposed=True) for one in small_members], "experts")
+    small = SourceLeaf.stack(
+        [SourceLeaf((one,), storage, transposed=True) for one in small_members], "experts")
     whole_small = np.stack([one.T for one in small_members]).astype(storage)
     np.testing.assert_array_equal(small.read(), whole_small)
     for index in [(slice(1, 3), slice(None), slice(2, 4)), (slice(0, 1), slice(1, 3), slice(None)),

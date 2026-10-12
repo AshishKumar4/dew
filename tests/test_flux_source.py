@@ -149,7 +149,7 @@ def test_the_guidance_input_follows_the_checkpoints_own_embedder(source):
             condition = DenoisingCondition(
                 jnp.asarray(arrays[f"{name}.context"]), jnp.asarray(arrays[f"{name}.pooled"]),
                 guidance=None if wanted else jnp.full((latent.shape[0],), 3.5, jnp.float32))
-            match = "needs it" if wanted else "no guidance embedder"
+
             with pytest.raises(ValueError):
                 model.apply({"params": params}, latent, jnp.asarray(arrays[f"{name}.times"]),
                             condition)

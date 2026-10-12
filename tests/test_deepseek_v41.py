@@ -133,7 +133,8 @@ def test_the_quantizers_round_fp32_input_as_the_stand_ins(source):
     _, _, reference = source
     for site, quantize in QUANTIZERS.items():
         actual = np.asarray(jax.jit(quantize)(jnp.asarray(reference[f"qat_{site}_in"])))
-        np.testing.assert_array_equal(actual.view(np.uint32), reference[f"qat_{site}_out"].view(np.uint32), err_msg=site)
+        np.testing.assert_array_equal(actual.view(np.uint32),
+                                      reference[f"qat_{site}_out"].view(np.uint32), err_msg=site)
 
 
 def test_the_engram_hash_is_the_releases_int64_arithmetic():

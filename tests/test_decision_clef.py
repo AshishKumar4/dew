@@ -16,7 +16,20 @@ from safetensors.numpy import load_file
 
 from dew.checkpoints import Checkpoints
 from dew.data.text import HFTokenizer
-from dew.decision import Choice, ChoiceAnswer, Decide, DecisionInputs, DecisionObjective, Encoded, Example, JointLayout, Noul, Question, Specials, TopProbability
+from dew.decision import (
+    Choice,
+    ChoiceAnswer,
+    Decide,
+    DecisionInputs,
+    DecisionObjective,
+    Encoded,
+    Example,
+    JointLayout,
+    Noul,
+    Question,
+    Specials,
+    TopProbability,
+)
 from dew.decision.calibration import softmax
 from dew.decision.clef import ClefHead
 from dew.decision.images import Images

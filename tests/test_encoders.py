@@ -12,7 +12,6 @@ import pytest
 from dew.inputs import Condition, Field, InputSpec
 from dew.nn.dit import ConditioningEmbed, TextContext, masked_mean
 
-
 ############################################################################################################
 # Text pooling reads the mask (T23)
 ############################################################################################################

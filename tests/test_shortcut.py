@@ -10,6 +10,7 @@ import optax
 from dew.diffusion import presets
 from dew.objectives.diffusion.few_step import ShortcutObjective
 
+
 def test_a_run_config_trains_a_shortcut_model_on_its_own_targets():
     from diffusion_stubs import batch_for
 

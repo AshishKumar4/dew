@@ -33,7 +33,15 @@ from dew.checkpoints import STATE_LEAVES, Ranking
 from dew.config import OptimConfig
 from dew.data import DataPartition
 from dew.objectives.base import Aux, EMASpec, Objective, merge, under
-from dew.training import Checkpoints, Layout, MeshSpec, Trainer, TrainState, ema_update
+from dew.training import (
+    Checkpoints,
+    Layout,
+    MeshSpec,
+    Trainer,
+    TrainState,
+    ema_update,
+    trainer as trainer_module,
+)
 from dew.training.optim import Cosine, Power
 
 
@@ -204,7 +212,8 @@ def test_typed_root_key_round_trips_and_resumes_bit_exactly(tmp_path):
     assert restored.key.dtype == prefix.key.dtype
     assert int(prefix.step) == int(restored.step) == 2
     for field in ("variables", "opt_state", "ema"):
-        for before, after in zip(jax.tree.leaves(getattr(prefix, field)), jax.tree.leaves(getattr(restored, field)), strict=True):
+        for before, after in zip(jax.tree.leaves(getattr(prefix, field)),
+                                 jax.tree.leaves(getattr(restored, field)), strict=True):
             np.testing.assert_array_equal(np.asarray(before), np.asarray(after), err_msg=field)
     assert json.loads(position)["index"] == 2
     np.testing.assert_array_equal(jax.random.key_data(restored.key), jax.random.key_data(prefix.key))
@@ -987,3 +996,72 @@ def test_a_step_compiles_from_its_arrays_shapes_before_they_are_placed():
     advanced, loss, _, finite, _, _ = jax.block_until_ready(compiled(state, batch))
     assert loss == pytest.approx(float(expected), rel=1e-6)
     assert int(advanced.step) == 1 and bool(finite)
+
+
+def test_a_failing_metric_fails_the_validation_pass():
+    class Broken:
+        name = "broken"
+        reads = Representations
+
+        def __call__(self, artifact, batch):
+            raise ZeroDivisionError("metric over an empty batch")
+
+        def merge(self, accumulated, contribution):
+            return accumulated + contribution
+
+        def finalize(self, accumulated):
+            return accumulated
+
+    with pytest.raises(ZeroDivisionError):
+        make_trainer(objective=Features()).fit(Data(val=val_batches(1)), steps=1,
+                                               log_every=1, eval_every=1, metrics=(Broken(),))
+
+class ManualClock:
+    """Both clocks the trainer reads, advanced by hand."""
+
+    def __init__(self):
+        self.now = 0.0
+
+    def time(self):
+        return self.now
+
+    def perf_counter(self):
+        return self.now
+
+def test_the_first_log_tick_measures_steps_not_the_compile(monkeypatch):
+    """Every interval, the first one included, reports the time its steps
+    took; placement and compile are outside every window and never land in
+    train/step_time_ms, and the goodput numbers at the end count them as the
+    time to the first step."""
+    clock = ManualClock()
+    monkeypatch.setattr(trainer_module, "time", clock)
+    tracker = RecordingTracker()
+    trainer = make_trainer(tracker=tracker)
+    place, compile_step = trainer.place, trainer.compile
+
+    def slow_place():
+        clock.now += 20.0
+        return place()
+
+    def compile_then_time_each_step(*args):
+        executable = compile_step(*args)
+        clock.now += 100.0
+
+        def timed(*step_args):
+            outputs = executable(*step_args)
+            clock.now += 1.0
+            return outputs
+        return timed
+
+    monkeypatch.setattr(trainer, "place", slow_place)
+    monkeypatch.setattr(trainer, "compile", compile_then_time_each_step)
+    trainer.fit(Data(endless), steps=3, log_every=1)
+
+    ticks = [s for _, s in tracker.scalars if "train/step_time_ms" in s]
+    assert [s["train/step_time_ms"] for s in ticks] == pytest.approx([1000.0] * 3)
+    # Placement (20), the compile (100) and the first step (1) make the time
+    # to the first step; the two steps after it are the 2 of 123 seconds in steps.
+    goodput = [(step, s) for step, s in tracker.scalars if "goodput/step_fraction" in s]
+    assert [step for step, _ in goodput] == [3]
+    assert goodput[0][1]["goodput/time_to_first_step_s"] == pytest.approx(121.0)
+    assert goodput[0][1]["goodput/step_fraction"] == pytest.approx(2 / 123)

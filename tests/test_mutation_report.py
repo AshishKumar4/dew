@@ -2,7 +2,6 @@
 
 import json
 
-
 from tools.mutation import source_digest, summarize
 
 

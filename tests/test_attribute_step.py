@@ -11,7 +11,6 @@ import json
 
 from tool_support import load
 
-
 attribute = load("attribute_step")
 
 MODULE = """HloModule jit_step

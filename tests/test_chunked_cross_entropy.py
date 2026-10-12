@@ -32,6 +32,7 @@ from dew.nn.precision import rounded_operand, rounded_to
 from dew.objectives.lm import chunked
 from dew.objectives.lm.chunked import chunked_cross_entropy, vocabulary_chunks
 
+
 @pytest.mark.parametrize('dtype', [jnp.float32, jnp.bfloat16])
 @pytest.mark.parametrize('tied', [False, True])
 def test_vocabulary_bias_is_fp32_after_tied_or_untied_head_products(dtype, tied):
