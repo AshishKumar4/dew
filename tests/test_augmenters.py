@@ -415,3 +415,15 @@ def test_a_record_comes_out_the_same_with_and_without_worker_processes(tmp_path)
 
     assert sorted(serial) == list(range(RECORDS))
     assert serial == parallel
+
+
+def test_a_host_crop_reaches_the_output_size_without_a_flip_or_a_jitter():
+    """Crop geometry is its own: a staged image crops and resizes to the output size whether or
+    not a flip or a jitter rides along, and a crop scale at equal sizes still crops."""
+    image = np.random.default_rng(0).integers(0, 256, (2 * SCALE, 2 * SCALE, 3), dtype=np.uint8)
+    for crop in ((1.0, 1.0), (0.8, 1.0)):
+        out = ImageRecord(SCALE, 2 * SCALE, crop_scale=crop).random_map({"image": image}, _record_rng(0))
+        assert out["image"].shape == (SCALE, SCALE, 3)
+    small = image[:SCALE, :SCALE]
+    cropped = ImageRecord(SCALE, SCALE, crop_scale=(0.5, 0.5)).random_map({"image": small}, _record_rng(0))
+    assert cropped["image"].shape == (SCALE, SCALE, 3) and not np.array_equal(cropped["image"], small)
