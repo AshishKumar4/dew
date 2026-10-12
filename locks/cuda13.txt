@@ -353,7 +353,7 @@ itsdangerous==2.2.0
     # via flask
 jaraco-functools==4.6.0
     # via cheroot
-jax @ https://github.com/AshishKumar4/jax/archive/19a48d1decce77ee228334d56f7a9f78bf6f478b.tar.gz
+jax @ https://github.com/AshishKumar4/jax/archive/7527048f5499b30e97c748d2d1b56056f62917ea.tar.gz
     # via
     #   -c constraints.txt
     #   dewml (pyproject.toml)
