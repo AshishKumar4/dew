@@ -167,8 +167,10 @@ class Records(Protocol):
 
     A record is one example's fields, in the shape `Batch` names, or the
     packed bytes an ArrayRecord file holds, which the spec's own transform
-    unpacks into fields. A Grain dataset returns None for an index its padding
-    covers, and Grain's reader skips those instead of batching them.
+    unpacks into fields. A record may be missing (None). A memory read and a
+    cache leave a missing record out and count it, records held in memory
+    leave it out of an order batched by index, and a stream skips it; any
+    other source read in an order batched by index must hold every record.
 
     Grain's own `RandomAccessDataSource` declares the same two methods with the
     record as a type parameter. That parameter is invariant, so a source
