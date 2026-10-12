@@ -63,10 +63,16 @@ def main() -> None:
                       lower_for=generation.device_generation())
     state = jax.eval_shape(trainer.initial_state, trainer.objective.initializer, trainer.key)
     batch = {"text": jax.ShapeDtypeStruct((arguments.batch, arguments.seq + 1), jnp.int32)}
-    try:
-        trainer.compile(state, batch)
-    except Lowered as lowered:
-        tuning.tune(lowered.lowered)
+
+    def step() -> jax.stages.Lowered:
+        """The first step, which `compile` under `lower_for` lowers and raises."""
+        try:
+            trainer.compile(state, batch)
+        except Lowered as lowered:
+            return lowered.lowered
+        raise AssertionError("a trainer under lower_for raises its lowered step")
+
+    tuning.tune(step)
     kind = jax.devices()[0].device_kind
     path = cache.kernel_picks_path(kind)
     with open(path) as file:
