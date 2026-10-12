@@ -16,6 +16,7 @@ from affine_run import Affine, Data
 from flax import linen as nn
 
 from dew.config import ModelConfig, ObjectiveConfig, RunConfig, TrainerConfig
+from dew.data import Loading, Memory, Pipeline, compile
 from dew.inputs import Field, InputSpec
 from dew.objectives.base import VALID_ROWS, Step
 from dew.objectives.supervised import Accuracy, CrossEntropy, Supervised
@@ -93,8 +94,11 @@ def test_a_lambda_loss_is_refused_where_the_run_states_it():
 
 def test_a_run_stating_another_objectives_arguments_refuses_to_train():
     run = RunConfig(objective=ObjectiveConfig("lm", {"ema_decay": 0.9}), trainer=TrainerConfig(batch_size=8))
+    records = batch()
+    rows = [{name: value[index] for name, value in records.items()} for index in range(8)]
+    data = compile(Pipeline(Memory(rows)).repeat().batch(8), read="memory", loading=Loading(workers=0))
     with pytest.raises(ValueError, match=r"states the arguments of .*LMObjective"):
-        run.train(Supervised(Affine(), squared, inputs=INPUTS), Data(), name="mismatched")
+        run.train(Supervised(Affine(), squared, inputs=INPUTS), data, name="mismatched")
 
 
 def test_set_reads_each_value_as_its_field_reads_a_flag():
