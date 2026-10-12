@@ -62,17 +62,24 @@ _SMALL_BF16 = {**_SM80_BF16,
 _SMALL_FP32 = {**_SMALL_BF16, **_FP32_WY,
                "chunk_fwd_h": {"bv": 64, "warps": 2, "stages": 1},
                "chunk_bwd_dhu": {"bv": 32, "warps": 4, "stages": 1}}
-# Blackwell's two-warp, four-stage WY backward, the one config fla validated there (wy_fast.py:18-22,
-# #913) until Triton 3.8 fixes the race the others hit.
-_BLACKWELL = {"prepare_wy_repr_bwd": {"bk": 64, "bv": 64, "warps": 2, "stages": 4}}
+# The RTX PRO 6000's (sm120) bf16 picks, each the fastest of its sweep on a G4 at the 0.8B and 9B
+# shapes (kernel lab, 2026-10-12, 4653d4451), ms at 0.8B / 9B against the 99 KB table's: forward h
+# 0.447 / 0.423 against 0.463 / 0.445, fla 0.471 / 0.449; dhu 1.06 / 1.02 against 2.05 / 3.24;
+# dqkwg 0.85 / 0.77 against 1.36 / 1.36, fla 0.91 / 1.01; WY backward 0.88 / 0.97 against 1.77 /
+# 1.67. The WY backward stores dk once, so it has no store to race and takes four warps.
+_BLACKWELL_BF16 = {**_SMALL_BF16,
+                   "chunk_fwd_h": {"bv": 32, "warps": 4, "stages": 2},
+                   "chunk_bwd_dhu": {"bv": 32, "warps": 4, "stages": 1},
+                   "chunk_bwd_dqkwg": {"bk": 128, "bv": 64, "warps": 8, "stages": 1},
+                   "prepare_wy_repr_bwd": {"bk": 64, "bv": 64, "warps": 4, "stages": 2}}
 
 
 def _declared(name: str, target: generation.GpuTarget, dtype: str) -> dict:
     wide = (target.shared_limit or 0) >= (generation.TARGETS["sm80"].shared_limit or 0)
-    table = {("bfloat16", True): _SM80_BF16, ("float32", True): _SM80_FP32,
-             ("bfloat16", False): _SMALL_BF16, ("float32", False): _SMALL_FP32}[dtype, wide]
-    # fla's IS_NVIDIA_BLACKWELL: compute capability 10.x or 12.x.
-    return {**table, **_BLACKWELL} if int(name[2:]) >= 100 else table
+    if name == "sm120" and dtype == "bfloat16":
+        return _BLACKWELL_BF16
+    return {("bfloat16", True): _SM80_BF16, ("float32", True): _SM80_FP32,
+            ("bfloat16", False): _SMALL_BF16, ("float32", False): _SMALL_FP32}[dtype, wide]
 
 
 CONFIGS = {(name, dtype): _declared(name, target, dtype)

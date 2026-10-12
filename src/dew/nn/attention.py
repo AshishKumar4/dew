@@ -833,10 +833,19 @@ FLASH_MAX_HEAD_DIM = 256
 FLASH_MAX_BACKWARD_HEAD_DIM = 192
 
 
-def flash_built_for(generation: str) -> bool:
-    """Whether the dew_flash_attn wheel holds code `generation` runs: sm80's, which every 8.x
-    part runs, or sm120's (kernels/flash_attn/CMakeLists.txt)."""
-    return generation.startswith('sm8') or generation == 'sm120'
+def flash_architectures() -> tuple[str, ...] | None:
+    """The GPU generations the installed dew_flash_attn holds code for, as the wheel reports them
+    (its build's CUDA architectures), or None where it is not installed. A wheel from before it
+    reported them, 0.1.0, holds sm80's alone."""
+    if importlib.util.find_spec('dew_flash_attn') is None:
+        return None
+    return getattr(importlib.import_module('dew_flash_attn'), 'ARCHITECTURES', ('sm80',))
+
+
+def flash_built_for(generation: str, architectures: tuple[str, ...]) -> bool:
+    """Whether a wheel built for `architectures` holds code `generation` runs: its own, or sm80's on
+    any 8.x part, which runs it."""
+    return generation in architectures or (generation.startswith('sm8') and 'sm80' in architectures)
 
 
 def flash_refusal(query, key, causal=False, sliding_window=None, mask=None, bias=None, softcap=None,
@@ -847,9 +856,10 @@ def flash_refusal(query, key, causal=False, sliding_window=None, mask=None, bias
     than sm80, whose backward takes no wider), a causal call is square, the
     call has no window, mask, bias, softcap or sinks, no deterministic ops are
     asked for, which its backward's atomic sum of the query gradient would
-    not keep, and dew_flash_attn is installed."""
+    not keep, and the installed dew_flash_attn holds code for this GPU."""
     head_dim = query.shape[-1]
     generation = device_generation()
+    architectures = flash_architectures()
     narrow = generation.startswith('sm8') and generation != 'sm80'
     widest = FLASH_MAX_BACKWARD_HEAD_DIM if narrow else FLASH_MAX_HEAD_DIM
     return first_refusal(
@@ -864,7 +874,9 @@ def flash_refusal(query, key, causal=False, sliding_window=None, mask=None, bias
         (softcap is None, "the call has a logit softcap"),
         (sinks is None, "the call has attention sinks"),
         (not deterministic_ops_requested(), "--xla_gpu_deterministic_ops is set"),
-        (importlib.util.find_spec('dew_flash_attn') is not None, "dew_flash_attn is not installed"),
+        (architectures is not None, "dew_flash_attn is not installed"),
+        (architectures is None or flash_built_for(generation, architectures),
+         f"the installed dew_flash_attn holds no code for {generation}"),
     )
 
 
@@ -872,17 +884,16 @@ def flash_attention(query, key, value, causal: bool):
     """FlashAttention-2 (dew_flash_attn, kernels/flash_attn) over `[B, S, H, D]`
     arrays at jax.nn's default scale. Its causal mask is aligned to the last
     key, where jax.nn's is aligned to the first, so a causal call is square.
-    On a mesh it runs per shard, as `triton_attention` does. The wheel holds
-    sm80 code, which compute capability 8.x runs, and sm120 code
-    (`flash_built_for`), and no other device runs either."""
+    On a mesh it runs per shard, as `triton_attention` does. It runs where
+    the installed wheel holds code for the device (`flash_built_for`)."""
     generation = device_generation()
-    if not flash_built_for(generation):
-        raise ValueError(f"FlashAttention-2 is built for sm8x and sm120 and this device is {generation}; "
-                         "use attention_impl 'cudnn' or 'xla'")
-    try:
-        flash = importlib.import_module('dew_flash_attn')
-    except ImportError as e:
-        raise ValueError("attention 'flash' needs dew_flash_attn (docs/installation.md)") from e
+    architectures = flash_architectures()
+    if architectures is None:
+        raise ValueError("attention 'flash' needs dew_flash_attn (docs/installation.md)")
+    if not flash_built_for(generation, architectures):
+        raise ValueError(f"the installed dew_flash_attn holds code for {', '.join(architectures)} and this "
+                         f"device is {generation}; use attention_impl 'cudnn' or 'xla'")
+    flash = importlib.import_module('dew_flash_attn')
 
     def local(query, key, value):
         return flash.flash_mha(query, key, value, is_causal=causal)

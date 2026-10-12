@@ -14,6 +14,10 @@ import jax.numpy as jnp
 import numpy as np
 
 _library = ctypes.cdll.LoadLibrary(str(Path(__file__).with_name("libdew_flash_attn.so")))
+_library.dew_flash_architectures.restype = ctypes.c_char_p
+ARCHITECTURES = tuple(f"sm{entry.split('-')[0]}"
+                      for entry in _library.dew_flash_architectures().decode().split(","))
+"""The GPU generations the library holds code for, as its build compiled them ('sm80', 'sm120')."""
 for _name in ("dew_flash_mha_fwd", "dew_flash_mha_bwd",
               "dew_flash_mha_varlen_fwd", "dew_flash_mha_varlen_bwd"):
     jax.ffi.register_ffi_target(_name, jax.ffi.pycapsule(getattr(_library, _name)), platform="CUDA")

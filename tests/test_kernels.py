@@ -146,7 +146,8 @@ def test_auto_sends_a_plain_cudnn_call_to_tokamax_when_it_is_installed(monkeypat
     found = util.find_spec
     # dew_flash_attn, which 'auto' prefers on an A100, is out of this test.
     monkeypatch.setattr(util, 'find_spec', lambda name: object() if name == 'tokamax' and installed
-                        else None if name in ('tokamax', 'dew_flash_attn') else found(name))
+                        else None if name == 'tokamax' else found(name))
+    monkeypatch.setattr(attention, 'flash_architectures', lambda: None)
     query = jnp.zeros((1, 128, 4, call.pop("head_dim", 64)), jnp.bfloat16)
     assert attention.resolve_implementation('auto', query, query, **call) == chosen
 
@@ -163,30 +164,45 @@ def test_tokamax_takes_the_calls_it_takes_before_flash(monkeypatch, generation, 
     monkeypatch.setattr(jax, 'default_backend', lambda: 'gpu')
     monkeypatch.setattr(attention, 'bf16_dot_runs', lambda: True)
     monkeypatch.setattr(kernels.generation, 'device_generation', lambda: generation)
+    monkeypatch.setattr(attention, 'device_generation', lambda: generation)
     found = util.find_spec
-    monkeypatch.setattr(util, 'find_spec', lambda name: object() if name in ('tokamax', 'dew_flash_attn')
-                        else found(name))
+    monkeypatch.setattr(util, 'find_spec', lambda name: object() if name == 'tokamax' else found(name))
+    monkeypatch.setattr(attention, 'flash_architectures', lambda: ('sm80', 'sm120'))
     chosen = [attention.resolve_implementation('auto', query, query, causal=True)
               for query in (jnp.zeros((1, 128, 4, width), jnp.bfloat16) for width in (64, 128))]
     assert chosen == ['triton', 'flash']
 
 
+WHEEL = ("sm80", "sm120")
+"""The architectures dew_flash_attn 0.1.1 reports."""
+
+
+@pytest.mark.parametrize("generation, architectures, built", [
+    ("sm80", WHEEL, True), ("sm86", WHEEL, True), ("sm89", ("sm80",), True), ("sm120", WHEEL, True),
+    ("sm120", ("sm80",), False), ("sm90", WHEEL, False), ("sm100", WHEEL, False)])
+def test_flash_runs_where_the_installed_wheel_holds_code_for_the_gpu(generation, architectures, built):
+    """FlashAttention-2 runs on a GPU the installed wheel's own architectures cover, an 8.x part
+    running sm80's code: 0.1.0's sm80 alone leaves an RTX PRO 6000 (sm120) to the other kernels."""
+    from dew.nn import attention
+    assert attention.flash_built_for(generation, architectures) == built
+
+
 @pytest.mark.parametrize("generation, installed, call, chosen, refusal", [
-    ("sm80", True, {}, "flash", None),
-    ("sm80", True, {"causal": True}, "flash", None),
-    ("sm80", True, {"head_dim": 256}, "flash", None),
-    ("sm80", True, {"causal": True, "keys": 256}, "cudnn", "a causal call has more keys than queries"),
-    ("sm80", True, {"keys": 256}, "flash", None),
-    ("sm80", True, {"sliding_window": 64, "causal": True}, "cudnn", "the call has a sliding window"),
-    ("sm80", True, {"mask": jnp.ones((1, 1, 128, 128), bool)}, "cudnn", "the call has a mask"),
-    ("sm80", True, {"softcap": 30.0}, "xla", "the call has a logit softcap"),
-    ("sm80", True, {"dtype": jnp.float32}, "xla", "the query is float32"),
-    ("sm80", False, {}, "cudnn", "dew_flash_attn is not installed"),
-    ("sm89", True, {}, "flash", None),
-    ("sm89", True, {"head_dim": 192}, "flash", None),
-    ("sm89", True, {"head_dim": 256}, "xla", "the heads are 256 wide"),
-    ("sm90", True, {}, "cudnn", None),
-    ("sm120", True, {}, "cudnn", None),
+    ("sm80", WHEEL, {}, "flash", None),
+    ("sm80", WHEEL, {"causal": True}, "flash", None),
+    ("sm80", WHEEL, {"head_dim": 256}, "flash", None),
+    ("sm80", WHEEL, {"causal": True, "keys": 256}, "cudnn", "a causal call has more keys than queries"),
+    ("sm80", WHEEL, {"keys": 256}, "flash", None),
+    ("sm80", WHEEL, {"sliding_window": 64, "causal": True}, "cudnn", "the call has a sliding window"),
+    ("sm80", WHEEL, {"mask": jnp.ones((1, 1, 128, 128), bool)}, "cudnn", "the call has a mask"),
+    ("sm80", WHEEL, {"softcap": 30.0}, "xla", "the call has a logit softcap"),
+    ("sm80", WHEEL, {"dtype": jnp.float32}, "xla", "the query is float32"),
+    ("sm80", None, {}, "cudnn", "dew_flash_attn is not installed"),
+    ("sm89", WHEEL, {}, "flash", None),
+    ("sm89", WHEEL, {"head_dim": 192}, "flash", None),
+    ("sm89", WHEEL, {"head_dim": 256}, "xla", "the heads are 256 wide"),
+    ("sm90", WHEEL, {}, "cudnn", None),
+    ("sm120", WHEEL, {}, "cudnn", None),
 ])
 def test_auto_sends_a_plain_call_to_flash_where_it_was_measured(monkeypatch, caplog, generation, installed,
                                                                 call, chosen, refusal,
@@ -206,8 +222,8 @@ def test_auto_sends_a_plain_call_to_flash_where_it_was_measured(monkeypatch, cap
     monkeypatch.setattr(attention, 'device_generation', lambda: generation)
     monkeypatch.setattr(kernels.generation, '_logged', set())
     found = util.find_spec
-    monkeypatch.setattr(util, 'find_spec', lambda name: (object() if installed else None)
-                        if name == 'dew_flash_attn' else None if name == 'tokamax' else found(name))
+    monkeypatch.setattr(util, 'find_spec', lambda name: None if name == 'tokamax' else found(name))
+    monkeypatch.setattr(attention, 'flash_architectures', lambda: installed)
     query = jnp.zeros((1, 128, 4, call.pop("head_dim", 128)), call.pop("dtype", jnp.bfloat16))
     key = jnp.zeros((1, call.pop("keys", 128), *query.shape[2:]), query.dtype)
     assert [attention.resolve_implementation('auto', query, key, **call) for _ in range(2)] == [chosen] * 2
@@ -218,14 +234,14 @@ def test_auto_sends_a_plain_call_to_flash_where_it_was_measured(monkeypatch, cap
 
 @pytest.mark.parametrize("generation", ["sm90", "sm100", "sm75", "cpu"])
 def test_flash_refuses_a_device_its_wheel_has_no_code_for(monkeypatch, generation, without_deterministic_ops):
-    """The wheel holds sm80 code, which compute capability 8.x runs, and
-    sm120 code: an explicit 'flash' on any other device is refused by name,
-    before a CUDA launch could fail without one."""
+    """An explicit 'flash' on a device the installed wheel holds no code for
+    is refused by name, before a CUDA launch could fail without one."""
     from dew.nn import attention, kernels
     monkeypatch.setattr(kernels.generation, 'device_generation', lambda: generation)
     monkeypatch.setattr(attention, 'device_generation', lambda: generation)
+    monkeypatch.setattr(attention, 'flash_architectures', lambda: WHEEL)
     query = jnp.zeros((1, 128, 4, 64), jnp.bfloat16)
-    with pytest.raises(ValueError, match=f"built for sm8x and sm120 and this device is {generation}"):
+    with pytest.raises(ValueError, match=f"holds code for sm80, sm120 and this device is {generation}"):
         attention.flash_attention(query, query, query, causal=True)
 
 
@@ -322,22 +338,16 @@ def float64_attention(query, key, value, causal):
     return jnp.einsum('hqk,khd->qhd', jax.nn.softmax(logits, axis=-1), value)
 
 
-def relative_distance(got, want) -> tuple[float, float]:
-    """RMS and largest distance of `got` from `want`, relative to `want`'s RMS and largest magnitude."""
-    error = np.asarray(got, np.float64) - want
-    return (float(np.sqrt(np.mean(error ** 2) / np.mean(want ** 2))),
-            float(np.abs(error).max() / np.abs(want).max()))
-
-
 @on_gpu
 @pytest.mark.parametrize("head_dim", [128, 256])
 @pytest.mark.parametrize("causal", [True, False])
 def test_packed_sequences_attend_within_themselves_as_far_from_float64_as_one_at_a_time(
         head_dim, causal, without_deterministic_ops):
     """Documents packed back to back, one a single token, with an empty sequence between two: each
-    document's output and its three input gradients lie no farther from float64 attention than
-    FlashAttention-2's own on that document alone, in the worse of two runs of it, whose atomic
-    query gradient varies from run to run."""
+    document's output and its three input gradients lie within tests/reference_error.py's rule of
+    FlashAttention-2's own on that document alone, both measured from float64. Not bitwise: on one
+    short document the dense forward splits its keys across blocks (`_splits`) and the packed one
+    does not, so the two round differently (on an RTX 4080, 1.0003 to 1.012 times apart in RMS)."""
     flash = pytest.importorskip("dew_flash_attn")
     if head_dim > 192 and kernels.device_generation() in ('sm86', 'sm87', 'sm89'):
         pytest.skip("FlashAttention-2's backward takes heads over 192 wide only on sm80, sm90 and sm1xx")
@@ -357,16 +367,17 @@ def test_packed_sequences_attend_within_themselves_as_far_from_float64_as_one_at
         if begin == end:
             continue
         pieces = (query[begin:end], key[begin:end], value[begin:end])
-        dense = [grads(lambda q, k, v: flash.flash_mha(q[None], k[None], v[None], is_causal=causal)[0],
-                       cotangent[begin:end], *pieces) for _ in range(2)]
+        dense = grads(lambda q, k, v: flash.flash_mha(q[None], k[None], v[None], is_causal=causal)[0],
+                      cotangent[begin:end], *pieces)
         with jax.enable_x64(new_val=True):
             wide = [jnp.asarray(np.asarray(x, np.float64)) for x in (*pieces, cotangent[begin:end])]
             truth = grads(functools.partial(float64_attention, causal=causal), wide[3], *wide[:3])
-        for name, got, runs, want in zip(("o", "dq", "dk", "dv"), (x[begin:end] for x in packed),
-                                         zip(*dense, strict=True), truth, strict=True):
-            bound = [max(pair) for pair in zip(*(relative_distance(run, want) for run in runs), strict=True)]
-            measured = relative_distance(got, want)
-            assert measured[0] <= bound[0] and measured[1] <= bound[1], (name, begin, measured, bound)
+        for name, got, theirs, want in zip(("o", "dq", "dk", "dv"), (x[begin:end] for x in packed), dense,
+                                           truth, strict=True):
+            if distance(theirs, want) == 0:  # a one-token document's attention is exact either way
+                np.testing.assert_array_equal(got, theirs)
+            else:
+                assert_as_exact_as_the_reference(got, theirs, want, f"{name} of the document at {begin}")
 
 
 def key_length_call(implementation, query, key, value, lengths, **kwargs):
