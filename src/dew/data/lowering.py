@@ -626,6 +626,20 @@ class _Build:
     def batches(
         self, pipeline: Pipeline, partition: DataPartition, offset: int = 0, *, fill: bool = True
     ) -> pygrain.DatasetIterator[Batch]:
+        """This share's batches, through the stages after the batch."""
+        batching = next(stage for stage in pipeline.stages if isinstance(stage, (BatchStage, TokenBudget)))
+        stream = self.batched(pipeline, partition, offset, fill=fill)
+        return iter(self.after_batch(stream, pipeline, partition, batching))
+
+    def batched(
+        self, pipeline: Pipeline, partition: DataPartition, offset: int = 0, *, fill: bool = True
+    ) -> pygrain.IterDataset:
+        """This share's batches as the reader reads them, before the stages
+        after the batch, which automatic loading also sizes its buffers by
+        (`Loading.resolved`). A global order is batched by index before the
+        reader starts, as Grain's own indexed pipelines are, so each read in
+        flight is a whole batch and each worker reads whole batches of its
+        own; any other order is batched as its rows arrive."""
         budget = next((stage for stage in pipeline.stages if isinstance(stage, TokenBudget)), None)
         if budget is not None:
             return self.token_batches(pipeline, partition, budget)
@@ -646,9 +660,6 @@ class _Build:
             empty = not self.training and not len(rows) and bool(len(whole))
             if empty:
                 rows = whole[:1]
-            # Batched by index before the reader starts, as Grain's own indexed
-            # pipelines are, so each read in flight is a whole batch and each
-            # worker reads whole batches of its own.
             batched = rows.batch(size, drop_remainder=drop, batch_fn=_Batched(batch_stage.batch_fn))
             stream = _as_iter(batched, self.loading)
             for stage in pipeline.stages[: pipeline.stages.index(batch_stage)]:
@@ -663,7 +674,7 @@ class _Build:
             stream = stream.map(
                 _FillShare(partition, batch_stage.size) if canonical else FilledBatch(size, real=not empty)
             )
-        return iter(self.after_batch(stream, pipeline, partition, batch_stage))
+        return stream
 
     def after_batch(
         self,
@@ -686,7 +697,7 @@ class _Build:
 
     def token_batches(
         self, pipeline: Pipeline, partition: DataPartition, budget: TokenBudget
-    ) -> pygrain.DatasetIterator[Batch]:
+    ) -> pygrain.IterDataset:
         from dew.data.batching import TokenBatches
 
         if partition.count > 1:
@@ -694,8 +705,7 @@ class _Build:
                 "token-budget batching requires one share until a synchronized shape schedule is supplied"
             )
         rows, _ = self.records(pipeline, partition)
-        stream = TokenBatches(_as_iter(rows, self.loading), budget, partition, self.seed)
-        return iter(self.after_batch(stream, pipeline, partition, budget))
+        return TokenBatches(_as_iter(rows, self.loading), budget, partition, self.seed)
 
 
 def _epoch_records(train: Pipeline, build: _Build) -> int | None:

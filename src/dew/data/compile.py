@@ -480,8 +480,8 @@ def _compiled(
         ),
     )
     if loading.workers == "auto":
-        tuning, _ = build.records(train, DataPartition())
-        loading = loading.resolved(_as_iter(tuning, dataclasses.replace(loading, workers=0)))
+        tuning = dataclasses.replace(build, loading=dataclasses.replace(loading, workers=0))
+        loading = loading.resolved(tuning.batched(train, DataPartition()))
         build = dataclasses.replace(build, loading=loading)
     train_host = tuple(stage.step for stage in train.stages if isinstance(stage, MapBatch)) + host
     statistics = _Statistics(counts)
@@ -832,8 +832,9 @@ def validation(
     lowering = _analyzed(pipeline, read, validation=True)
     build = _Build(read, loading, seed, batch, budget, lowering, training=False)
     if loading.workers == "auto":
-        rows, _ = build.records(pipeline, DataPartition())
-        build = dataclasses.replace(build, loading=loading.resolved(_as_iter(rows, loading)))
+        tuning = dataclasses.replace(build, loading=dataclasses.replace(loading, workers=0))
+        loading = loading.resolved(tuning.batched(pipeline, DataPartition()))
+        build = dataclasses.replace(build, loading=loading)
     stages = tuple(stage.step for stage in pipeline.stages if isinstance(stage, MapBatch)) + host
     return functools.partial(_validation_reader, pipeline=pipeline, build=build, host=stages)
 

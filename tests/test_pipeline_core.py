@@ -173,6 +173,26 @@ def test_worker_processes_read_a_global_order_in_the_batches_one_process_reads()
     assert batches(2) == batches(0)
 
 
+def test_automatic_loading_sizes_an_indexed_read_buffer_by_the_batches_it_holds(monkeypatch):
+    """An indexed order's read buffer holds whole batches, so automatic
+    loading sizes it by a batch: 2 MiB holds four batches of eight 64 KiB
+    rows, where sized by a row it would hold sixteen."""
+    import grain.experimental as gx
+
+    chosen = []
+    pick = gx.pick_performance_config
+
+    def recorded(*args, **kwargs):
+        config = pick(*args, **kwargs)
+        chosen.append(config.read_options.prefetch_buffer_size)
+        return config
+
+    monkeypatch.setattr(gx, "pick_performance_config", recorded)
+    rows = Memory(tuple({"x": np.zeros(16384, np.float32)} for _ in range(64)))
+    compile(Pipeline(rows).repeat().batch(8), loading=Loading(workers="auto", ram_budget_mb=2, max_workers=1))
+    assert chosen == [4]
+
+
 def test_token_deficit_mix_counts_targets_and_restores_delivered_counts():
     corpora = [grain.MapDataset.source([{"id": tag, "targets": targets}]).repeat().to_iter_dataset()
                for tag, targets in [(0, 2), (1, 7)]]
