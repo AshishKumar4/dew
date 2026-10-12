@@ -206,14 +206,14 @@ def test_training_values_are_selected_through_the_objective(tmp_path):
 
 def test_time_cadence_and_recorded_duration(tmp_path):
     from dew.config import TrainerConfig
-    from dew.data import Dataset
+    from dew.data import Loader
 
     assert TrainerConfig(checkpoint_every="30m").checkpoint_interval(
-        Dataset(lambda p: iter(()), None, records=4, batch=2)
+        Loader(lambda p: iter(()), None, records=4, batch=2)
     ) == datetime.timedelta(minutes=30)
     with pytest.raises(ValueError, match='positive'):
         TrainerConfig(checkpoint_every="0m").checkpoint_interval(
-            Dataset(lambda p: iter(()), None, records=4, batch=2)
+            Loader(lambda p: iter(()), None, records=4, batch=2)
         )
     with pytest.raises(TypeError, match='code-only'):
         TrainerConfig(best=Best(lambda m: 0))

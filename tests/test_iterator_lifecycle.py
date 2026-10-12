@@ -18,7 +18,7 @@ import pytest
 from affine_run import TimingRegression as Regression, batches
 
 from dew.artifacts import Representations
-from dew.data import DataPartition, Dataset
+from dew.data import DataPartition, Loader
 from dew.data.dataset import mapped
 from dew.data.readers import _Host
 from dew.training import Checkpoints, MeshSpec, ProfileWindow, Trainer
@@ -234,7 +234,7 @@ def test_repeated_bounded_fit_releases_each_source_and_reuses_checkpointer(tmp_p
     checkpoints = Checkpoints(str(tmp_path))
     trainer = Trainer(Regression(), optax.sgd(0.01), key=jax.random.key(0),
                       checkpoints=checkpoints)
-    data = Dataset(lambda partition: start(), None, None, 8)
+    data = Loader(lambda partition: start(), None, None, 8)
     for target in (1, 3):
         state = trainer.fit(data, steps=target, checkpoint_every=1)
         assert int(state.step) == target
@@ -251,7 +251,7 @@ def test_unexpected_training_eof_still_closes_and_does_not_save_success(tmp_path
     trainer = Trainer(Regression(), optax.sgd(0.01), key=jax.random.key(0),
                       checkpoints=checkpoints)
     with pytest.raises(StopIteration):
-        trainer.fit(Dataset(lambda partition: source, None, None, 8), steps=2)
+        trainer.fit(Loader(lambda partition: source, None, None, 8), steps=2)
     assert source.closed.is_set()
     assert checkpoints.latest is None
 
@@ -283,7 +283,7 @@ def test_metric_failure_closes_owned_iterators_before_it_escapes(steps):
 
     trainer = Trainer(Evaluated(), optax.sgd(0.01), key=jax.random.key(0))
     with pytest.raises(np.linalg.LinAlgError):
-        trainer.fit(Dataset(lambda partition: training(), lambda partition: validation, None, 8),
+        trainer.fit(Loader(lambda partition: training(), lambda partition: validation, None, 8),
                     steps=steps, eval_every=1, metrics=(InvalidMetric(),))
     assert train.closed.is_set() == (steps > 0)
     assert validation.closed.is_set()
@@ -333,7 +333,7 @@ def test_fit_attempts_every_cleanup_without_masking_tracker_error(tmp_path, monk
                       checkpoints=Waiting(str(tmp_path)), tracker=Tracker(),
                       profile=ProfileWindow(str(tmp_path / "trace"), steps=5, warmup=0))
     with pytest.raises(LookupError) as raised:
-        trainer.fit(Dataset(lambda partition: source, None, None, 8), steps=2, log_every=1)
+        trainer.fit(Loader(lambda partition: source, None, None, 8), steps=2, log_every=1)
     assert raised.value is primary
     assert source.closed.is_set() and stopped.is_set() and waited.is_set()
     notes = "\n".join(primary.__notes__)
@@ -357,7 +357,7 @@ def test_checkpointability_refusal_finalizes_the_untransferred_source(tmp_path):
     trainer = Trainer(Regression(), optax.sgd(0.01), key=jax.random.key(0),
                       checkpoints=Checkpoints(str(tmp_path)))
     with pytest.raises(ValueError, match="get_state"):
-        trainer.fit(Dataset(lambda partition: Uncheckpointable(), None, None, 8), steps=1, checkpoint_every=1)
+        trainer.fit(Loader(lambda partition: Uncheckpointable(), None, None, 8), steps=1, checkpoint_every=1)
     assert closed.is_set()
 
 def test_constructor_starts_no_unowned_source_work():
@@ -373,7 +373,7 @@ def test_sigint_during_fit_restoration_closes_only_after_restoration_returns(tmp
     checkpoints = Checkpoints(str(tmp_path))
     trainer = Trainer(Regression(), optax.sgd(0.01), key=jax.random.key(0),
                       checkpoints=checkpoints)
-    trainer.fit(Dataset(lambda partition: Source(), None, None, 8), steps=1)
+    trainer.fit(Loader(lambda partition: Source(), None, None, 8), steps=1)
     entered, stopped = threading.Event(), threading.Event()
 
     class Restoring(Source):
@@ -403,7 +403,7 @@ def test_sigint_during_fit_restoration_closes_only_after_restoration_returns(tmp
     sender.start()
     try:
         with pytest.raises(KeyboardInterrupt):
-            trainer.fit(Dataset(lambda partition: source, None, None, 8), steps=2)
+            trainer.fit(Loader(lambda partition: source, None, None, 8), steps=2)
         assert source.closed.is_set()
         assert len(set(source.owners)) == 1
         assert source.owners[0] != threading.get_ident()

@@ -14,7 +14,7 @@ from affine_run import raw_leaf
 from flax import struct
 
 from dew.checkpoints import Checkpoints
-from dew.data import DataPartition, Dataset
+from dew.data import DataPartition, Loader
 from dew.objectives import Aux, EMASpec, Objective, Ratio
 from dew.objectives.base import under
 from dew.training import Trainer
@@ -154,7 +154,7 @@ class Stream:
 @pytest.mark.parametrize("cut", [1, 2])
 def test_partial_checkpoint_replays_exact_realized_records(tmp_path, composite, cut):
     checkpoints = Checkpoints(str(tmp_path / "run"))
-    data = Dataset(lambda partition: Stream(), None, batch=2 * jax.device_count(), records=None)
+    data = Loader(lambda partition: Stream(), None, batch=2 * jax.device_count(), records=None)
     trainer(composite, checkpoints=checkpoints).fit(data, steps=cut)
     resumed = trainer(composite, checkpoints=checkpoints).fit(data, steps=4)
     assert float(resumed.scale.scale) == 65536.

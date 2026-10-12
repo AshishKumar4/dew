@@ -22,7 +22,7 @@ import dew
 import dew.nn.backbones  # registers the models
 from dew.artifacts import VideoGrid
 from dew.config import ModelConfig, ObjectiveConfig, TrainerConfig
-from dew.data import ByteTokenizer, Dataset, Images as ImageRecipe, Video
+from dew.data import ByteTokenizer, Images as ImageRecipe, Loader, Video
 from dew.diffusion import FlowMatchPredictionTransform
 from dew.diffusion.presets import EDM, Flow
 from dew.diffusion.schedules import FlowMatchingScheduler
@@ -95,7 +95,7 @@ def make_run(
     checkpoints = Checkpoints(str(directory), keep=1)
     trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.PRNGKey(0),
                       checkpoints=checkpoints)
-    state = trainer.fit(Dataset(train=lambda partition: Stream(), val=None, records=None, batch=8),
+    state = trainer.fit(Loader(train=lambda partition: Stream(), val=None, records=None, batch=8),
                         steps=steps, log_every=100, checkpoint_every=steps)
     checkpoints.wait()
     config.save(str(directory))
@@ -357,7 +357,7 @@ def test_an_unconditional_unet_takes_a_step():
 
     state = Trainer(objective, optax.adam(1e-3),
                     key=jax.random.PRNGKey(0)).fit(
-        Dataset(train=lambda partition: batches(), val=None, records=None, batch=8), steps=1, log_every=100)
+        Loader(train=lambda partition: batches(), val=None, records=None, batch=8), steps=1, log_every=100)
 
     assert int(state.step) == 1
     leaves = jax.tree.leaves(state.variables["params"])
@@ -447,7 +447,7 @@ def make_lm_run(directory, *, mesh=None, ema_decay=0.9, max_seq_len=16):
     checkpoints = Checkpoints(str(directory), keep=1)
     trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.PRNGKey(0), checkpoints=checkpoints,
                       mesh=MeshSpec() if mesh is None else mesh)
-    state = trainer.fit(Dataset(train=lambda partition: Stream(), val=None, records=None, batch=8),
+    state = trainer.fit(Loader(train=lambda partition: Stream(), val=None, records=None, batch=8),
                         steps=2, log_every=100, checkpoint_every=2)
     checkpoints.wait()
     (directory / "run.json").write_text(json.dumps({
@@ -641,7 +641,7 @@ def test_a_quantized_runs_record_re_wraps_the_model_it_rebuilds(tmp_path):
                               eval_every=None, checkpoint_every=1, compilation_cache_dir=None,
                               quantization=Quantization()))
     state = config.train(LMObjective(config.model.build(), seq, ema_decay=0.9),
-                         Dataset(lambda partition: Stream(), None, None, batch), name="run")
+                         Loader(lambda partition: Stream(), None, None, batch), name="run")
     Checkpoints(str(tmp_path / "run")).wait()
 
     record = json.loads((tmp_path / "run" / "run.json").read_text())["fields"]

@@ -25,7 +25,7 @@ from episode_support import (
 from flax import linen as nn
 from rl_support import clipped_surrogate, token_mean
 
-from dew.data import Dataset
+from dew.data import Loader
 from dew.objectives.base import Step
 from dew.objectives.rl import EpisodeRollout, PPOObjective, PPORollout, ValueHead
 from dew.objectives.rl.ppo import OLD_VALUES_KEY, RETURNS_KEY
@@ -110,7 +110,7 @@ def test_episode_gae_crosses_turns_without_discounting_observations_or_padding()
 def test_ppo_trains_policy_and_critic_with_a_frozen_policy_reference():
     trainer, rollout = build_ppo()
     initial = trainer.initial_state()
-    data = Dataset(
+    data = Loader(
         train=lambda partition: itertools.repeat({"task_id": np.arange(jax.device_count(), dtype=np.int32)}),
         val=None,
         records=None,

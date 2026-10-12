@@ -26,7 +26,7 @@ from recording import RecordingTracker
 
 from dew.artifacts import ImageGrid, Representations, TokenScores, VideoGrid
 from dew.config import ModelConfig, ObjectiveConfig
-from dew.data import Dataset, Images
+from dew.data import Images, Loader
 from dew.diffusion import presets
 from dew.inputs import Condition, ConditionEncoder, Field, InputSpec
 from dew.nn.attention import Stage
@@ -385,7 +385,7 @@ def run_case(case: Case, tmp_path, fsdp):
     artifact, shape = expected_artifact(case)
     source = batches(case, encoder)
 
-    data = Dataset(train=lambda partition: source(),
+    data = Loader(train=lambda partition: source(),
                    val=lambda partition: (batch for batch in [next(source())]),
                    batch=BATCH, records=None)
     state = trainer.fit(data, steps=2, log_every=1, eval_every=1,

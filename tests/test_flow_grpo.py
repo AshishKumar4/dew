@@ -448,7 +448,7 @@ def test_group_normalization_preserves_small_differences_on_large_reward_offset(
 def test_float64_callback_distinctions_reach_a_real_policy_update():
     import itertools
 
-    from dew.data import Dataset
+    from dew.data import Loader
     from dew.nn.backbones.dit import SimpleDiT
 
     count = jax.device_count()
@@ -465,7 +465,7 @@ def test_float64_callback_distinctions_reach_a_real_policy_update():
     initial = trainer.place()[0]
     source = {"image": np.zeros((count, 4, 4, 1), np.uint8)}
     collected = rollout(initial, source, jax.random.key(92))
-    data = Dataset(train=lambda partition: itertools.repeat(source), val=None, records=count, batch=count)
+    data = Loader(train=lambda partition: itertools.repeat(source), val=None, records=count, batch=count)
     final = trainer.fit(data, steps=1, log_every=1)
     assert int(final.updates) == 1
     change = float(optax.tree.norm(jax.tree.map(
@@ -483,7 +483,7 @@ def test_conditioned_prompt_only_evaluation_preview_and_trainer_consumers():
     import itertools
 
     from dew.artifacts import ImageGrid
-    from dew.data import Dataset
+    from dew.data import Loader
     from dew.inputs import CharTable, Condition
     from dew.nn.backbones.dit import SimpleDiT
 
@@ -530,7 +530,7 @@ def test_conditioned_prompt_only_evaluation_preview_and_trainer_consumers():
     np.testing.assert_allclose(evaluated.images, np.clip(expected, -1, 1), atol=2e-6)
     assert previewed.images.shape == (min(4, count), 4, 4, 1)
     assert len(previewed.captions) == min(4, count)
-    data = Dataset(
+    data = Loader(
         train=lambda partition: itertools.repeat(prompts),
         val=lambda partition: iter((prompts, prompts)),
         records=count,

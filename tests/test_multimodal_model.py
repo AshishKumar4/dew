@@ -21,7 +21,7 @@ import optax
 import pytest
 from safetensors.numpy import load_file
 
-from dew.data.dataset import Dataset
+from dew.data.dataset import Loader
 from dew.interop.pretrained import Pretrained
 from dew.nn.inputs import ModelInputs
 from dew.nn.mixers.attention import AttentionMixer
@@ -137,7 +137,7 @@ def test_trainer_update_exports_and_reloads_the_complete_model(source, tmp_path)
                             ema_decay=None, pad_id=0)
     rows = 2 * jax.device_count()
     training_inputs = inputs.take_rows(jnp.arange(rows) % 2)
-    data = Dataset(
+    data = Loader(
         train=lambda partition: iter([{"text": training_inputs}]), val=None, records=rows, batch=rows
     )
     trainer = Trainer(objective, optax.sgd(reference["learning_rate"]), key=jax.random.key(3),
@@ -369,7 +369,7 @@ def test_gemma4_standardization_buffers_are_frozen_by_real_adamw_training(tmp_pa
     repeated = inputs.take_rows(jnp.arange(rows) % 2)
     objective = LMObjective(loaded, tokens.shape[1] - 1,
                             ema_decay=None, pad_id=0)
-    data = Dataset(train=lambda partition: iter([{"text": repeated}]), val=None, records=rows, batch=rows)
+    data = Loader(train=lambda partition: iter([{"text": repeated}]), val=None, records=rows, batch=rows)
     trainer = Trainer(objective, optax.adamw(1e-3, weight_decay=0.1), key=jax.random.key(12),
                       mesh=MeshSpec(), layout=Layout(min_shard=2**30))
     state = trainer.fit(data, steps=1, log_every=1)

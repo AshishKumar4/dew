@@ -41,7 +41,7 @@ from dew.data.dataset import (
     Checkpointable,
     Closeable,
     DataPartition,
-    Dataset,
+    Loader,
     RampedStream,
     Reader,
     stream_endless,
@@ -351,7 +351,7 @@ class _MetricValues[Statistics, Additions](Mapping):
         return len(self.scores)
 
 
-def _suites(dataset: Dataset, validation: Mapping[str, Reader | EvalSuite] | None,
+def _suites(dataset: Loader, validation: Mapping[str, Reader | EvalSuite] | None,
             metrics: Sequence[Metric], eval_every: int | None) -> dict[str, EvalSuite]:
     """Every split `fit` validates, by name, with its metrics and cadence
     resolved: `dataset.val` alone is the one suite `val`."""
@@ -372,7 +372,7 @@ def _suites(dataset: Dataset, validation: Mapping[str, Reader | EvalSuite] | Non
 class _FitPlan:
     """What one `Trainer.fit` call was asked for."""
 
-    dataset: Dataset
+    dataset: Loader
     steps: int | None
     log_every: int
     eval_every: int | None
@@ -1275,7 +1275,7 @@ class Trainer(Generic[Loss, Effects]):
 
     def fit(
         self,
-        dataset: Dataset,
+        dataset: Loader,
         *,
         steps: int | None = None,
         total_tokens: int | None = None,
@@ -1923,7 +1923,7 @@ class Trainer(Generic[Loss, Effects]):
             elapsed_seconds=sum(report.elapsed_seconds for report in evaluations),
         )
 
-    def _preflight(self, dataset: Dataset, stop, suites: Mapping[str, EvalSuite], *,
+    def _preflight(self, dataset: Loader, stop, suites: Mapping[str, EvalSuite], *,
                    preview: bool, loss: bool) -> None:
         """The refusals `fit` makes before it places anything: validation
         nothing reads, and a pipeline's batch, whose placement could take

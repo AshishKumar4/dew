@@ -24,7 +24,7 @@ import numpy as np
 import optax
 import pytest
 
-from dew.data import DataPartition, Dataset
+from dew.data import DataPartition, Loader
 from dew.inference import NativeRolloutServer, TextGeneration
 from dew.inference.serving import Server
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -119,7 +119,7 @@ def scheduler(source, publisher=None, stream=((1, 2), (3, 4), (5, 6)), **options
     records = []
     options = {"groups": 2, "max_lag": 1, "ahead": 1, "width": WIDTH, "rows": ROWS, **options}
     rollout = RolloutScheduler(Objective(), source, publisher or Publisher(), log=records.append, **options)
-    data = rollout.tasks(Dataset(train=lambda partition: batches(*stream), val=None, records=None, batch=2))
+    data = rollout.tasks(Loader(train=lambda partition: batches(*stream), val=None, records=None, batch=2))
     return rollout, data, records
 
 
@@ -552,7 +552,7 @@ def test_a_trainer_run_trains_through_multi_turn_environments_on_the_native_serv
     scheduler = RolloutScheduler(target, episodes, server, width=width, rows=2 * tasks, groups=2,
                                  max_lag=2, ahead=1, sync_every=2, log=records.append)
     stream = scheduler.tasks(
-        Dataset(
+        Loader(
             train=lambda partition: (
                 {"task_id": np.arange(tasks, dtype=np.int32) + step * tasks} for step in range(100)
             ),

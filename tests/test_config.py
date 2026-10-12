@@ -14,7 +14,7 @@ from flax import linen as nn
 import dew.config
 import dew.nn.backbones
 from dew.config import ModelConfig, OptimConfig, RunConfig, TrainerConfig
-from dew.data import Dataset
+from dew.data import Loader
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.vision import GemmaProjector, SiglipVision
 from dew.objectives.diffusion import DiffusionRunConfig
@@ -332,9 +332,9 @@ def test_a_record_that_names_a_field_the_value_does_not_have_is_refused():
 
 
 def _data(records=48, batch=8):
-    """A Dataset value with nothing behind it: the intervals read only its
+    """A Loader value with nothing behind it: the intervals read only its
     record count and its batch."""
-    return Dataset(train=lambda partition: iter(()), val=None, records=records, batch=batch)
+    return Loader(train=lambda partition: iter(()), val=None, records=records, batch=batch)
 
 
 def test_an_interval_is_steps_a_pass_or_never():
@@ -361,7 +361,7 @@ def test_a_run_records_its_token_budget_and_final_checkpoint_policy(tmp_path):
 def test_a_run_can_disable_final_checkpoint_saving(tmp_path):
     run = RunConfig(trainer=TrainerConfig(steps=1, checkpoint_final=False, batch_size=8,
                     checkpoint_dir=str(tmp_path), eval_every=None, checkpoint_every=None))
-    data = Dataset(lambda partition: batches(), None, None, 8)
+    data = Loader(lambda partition: batches(), None, None, 8)
     assert int(run.train(Regression(), data, name="no-final").step) == 1
     assert Checkpoints(str(tmp_path / "no-final")).latest is None
 
@@ -380,9 +380,9 @@ def test_a_dataset_at_another_batch_than_the_run_is_refused(tmp_path, capsys):
         eval_every=None, checkpoint_every=None))
 
     with pytest.raises(ValueError, match="batch-size is 8 and this dataset reads 16"):
-        run.train(Regression(), Dataset(lambda partition: batches(), None, None, 16), name="batch")
+        run.train(Regression(), Loader(lambda partition: batches(), None, None, 16), name="batch")
 
-    state = run.train(Regression(), Dataset(lambda partition: batches(), None, None, 8), name="batch")
+    state = run.train(Regression(), Loader(lambda partition: batches(), None, None, 8), name="batch")
     assert int(state.step) == 1
     output = capsys.readouterr().out
     assert "Experiment_Name: batch" in output
@@ -398,7 +398,7 @@ def test_train_scores_every_named_validation_split(tmp_path):
     held = next(batches())
     splits = {"val": lambda partition: iter([held]),
               "test": lambda partition: iter([{"x": held["x"], "y": held["y"] + 1}])}
-    run.train(Regression(), Dataset(lambda partition: batches(), None, None, 8), name="splits",
+    run.train(Regression(), Loader(lambda partition: batches(), None, None, 8), name="splits",
               validation=splits)
     rows = [json.loads(line) for line in
             (tmp_path / "runs" / "splits" / "tracking" / "scalars.jsonl").read_text().splitlines()]
@@ -423,7 +423,7 @@ def test_train_runs_the_trainer_its_config_describes(tmp_path):
         dynamic_scale=True, mesh=MeshSpec(fsdp=2), layout=Layout(min_shard=1, tolerance=1.0),
         profile=ProfileWindow(str(trace), steps=1, warmup=1), eval_every=None, checkpoint_every=None)
 
-    state = RunConfig(trainer=config).train(Regression(), Dataset(lambda partition: batches(), None, None, 8),
+    state = RunConfig(trainer=config).train(Regression(), Loader(lambda partition: batches(), None, None, 8),
                                             name="built")
 
     assert any(not leaf.sharding.is_fully_replicated for leaf in jax.tree.leaves(state.variables))

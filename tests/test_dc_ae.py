@@ -212,7 +212,7 @@ def test_a_latent_run_trains_behind_the_dc_ae_and_leaves_it_frozen(source):
     from diffusion_stubs import STUB_TEXT
 
     from dew.config import ModelConfig, ObjectiveConfig, TrainerConfig
-    from dew.data import Dataset, Images
+    from dew.data import Images, Loader
     from dew.objectives.diffusion import DiffusionRunConfig, PretrainedAutoencoder, TextCondition
     from dew.sampling import Euler
     from dew.training import Trainer
@@ -238,7 +238,7 @@ def test_a_latent_run_trains_behind_the_dc_ae_and_leaves_it_frozen(source):
     trainer = Trainer(objective, optax.adam(1e-2), key=jax.random.PRNGKey(0))
     initial = trainer.initial_state()
     state = trainer.fit(
-        Dataset(train=lambda partition: iter(lambda: batch, None), val=None, records=None, batch=8),
+        Loader(train=lambda partition: iter(lambda: batch, None), val=None, records=None, batch=8),
         steps=2,
         log_every=100,
     )

@@ -21,7 +21,7 @@ from pathlib import Path
 import numpy as np
 from process_support import prepare_worker
 
-from dew.data import Dataset, Loading
+from dew.data import Loader, Loading
 from dew.data.recipes import load
 from dew.telemetry.records import RECORD_TYPES
 from dew.training.evaluation import Evaluation
@@ -633,7 +633,7 @@ def mode_fit(args) -> dict:
         available = sum(1 for _ in val(DataPartition.of(trainer.device_mesh)))
     from dew.training import Best
     counter = Batches()
-    state = trainer.fit(Dataset(open_train, val=val, batch=BATCH, records=args.records),
+    state = trainer.fit(Loader(open_train, val=val, batch=BATCH, records=args.records),
                         steps=args.steps, log_every=1,
                         eval_every=args.steps if args.tokens else None,
                         checkpoint_every=args.save_every, metrics=(counter,) if args.tokens else (),
@@ -669,7 +669,7 @@ def mode_pool_refusals(args) -> dict:
     import orbax.checkpoint as ocp
     from affine_run import FEATURES, Regression
 
-    from dew.data import Dataset, Memory, Pipeline, compile
+    from dew.data import Loader, Memory, Pipeline, compile
     from dew.training import Checkpoints, MeshSpec, Trainer
 
     rank = jax.process_index()
@@ -700,12 +700,12 @@ def mode_pool_refusals(args) -> dict:
             x = np.ones((BATCH // jax.process_count(), FEATURES), np.float32)
             return {name: value for name, value in {"x": x, "y": 2 * x[:, :2]}.items() if name in self.fields}
 
-    def stream(count: int, shift: int, identity: str | None = None) -> Dataset:
+    def stream(count: int, shift: int, identity: str | None = None) -> Loader:
         return compile(Pipeline(corpus(count, shift, identity)).shuffle(0).repeat().batch(BATCH), seed=0,
                        loading=Loading(workers=0))
 
-    def reads(fail: bool = False, fields: tuple[str, ...] = ("x", "y"), ends: int | None = None) -> Dataset:
-        return Dataset(lambda partition: Reads(fail, fields, ends), None, batch=BATCH, records=None)
+    def reads(fail: bool = False, fields: tuple[str, ...] = ("x", "y"), ends: int | None = None) -> Loader:
+        return Loader(lambda partition: Reads(fail, fields, ends), None, batch=BATCH, records=None)
 
     def trained(data, checkpoints=None, **flags) -> str | None:
         trainer = Trainer(Regression(), optax.sgd(1e-2), key=jax.random.key(0), mesh=MeshSpec(),
@@ -776,7 +776,7 @@ def mode_profile_failure(args) -> dict:
                       profile=ProfileWindow(str(profile_dir), steps=2, warmup=0))
     error = None
     try:
-        trainer.fit(Dataset(lambda partition: iter(loader), None, batch=BATCH, records=None),
+        trainer.fit(Loader(lambda partition: iter(loader), None, batch=BATCH, records=None),
                     steps=args.steps, log_every=1)
     except BaseException as failure:
         error = failure
@@ -827,7 +827,7 @@ def mode_validate(args) -> dict:
     import jax
     import optax
 
-    from dew.data import Dataset
+    from dew.data import Loader
     from dew.diffusion import presets
     from dew.eval import CLIPDistance
     from dew.inputs import Condition, Field, InputSpec
@@ -851,7 +851,7 @@ def mode_validate(args) -> dict:
     trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(0),
                       mesh=MeshSpec(fsdp=args.fsdp_size), layout=Layout(min_shard=TINY),
                       checkpoints=None, tracker=scored)
-    data = Dataset(train=lambda partition: iter([batch] * args.steps), val=lambda partition: iter([batch]),
+    data = Loader(train=lambda partition: iter([batch] * args.steps), val=lambda partition: iter([batch]),
                    records=BATCH * args.steps, batch=BATCH)
     state = trainer.fit(data, steps=args.steps, log_every=1, eval_every=args.steps,
                         metrics=(CLIPDistance(modelname=tiny), GlobalMean()), preview=True)
@@ -875,7 +875,7 @@ def mode_tracked(args) -> dict:
     import jax
     import optax
 
-    from dew.data import Dataset
+    from dew.data import Loader
     from dew.training import Layout, MeshSpec, Trainer
     from dew.training.tracker import render
 
@@ -901,7 +901,7 @@ def mode_tracked(args) -> dict:
     trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(0),
                       mesh=MeshSpec(fsdp=args.fsdp_size), layout=Layout(min_shard=TINY),
                       checkpoints=None, tracker=Drawing())
-    data = Dataset(train=lambda partition: iter([batch] * args.steps), val=lambda partition: iter([batch]),
+    data = Loader(train=lambda partition: iter([batch] * args.steps), val=lambda partition: iter([batch]),
                    records=BATCH * args.steps, batch=BATCH)
     state = trainer.fit(data, steps=args.steps, log_every=1, eval_every=args.steps, preview=True)
     return {"process_index": jax.process_index(), "drawn": drawn,
@@ -1098,7 +1098,7 @@ def mode_evaluation_contract(args) -> dict:
     import jax
     import optax
 
-    from dew.data import Dataset
+    from dew.data import Loader
     from dew.training import Trainer
 
     rank = jax.process_index()
@@ -1109,7 +1109,7 @@ def mode_evaluation_contract(args) -> dict:
     objective = Numerical()
     trainer = Trainer(objective, optax.sgd(.01), key=jax.random.key(37))
     state, _, _ = trainer.place()
-    data = Dataset(train=lambda partition: batches(), val=lambda partition: validation(), records=8, batch=8)
+    data = Loader(train=lambda partition: batches(), val=lambda partition: validation(), records=8, batch=8)
     results = {}
     for failure in ("normal", "repeat", "untracked", "preview_only", "uneven", "empty",
                     "no_consumer", "mismatch", "duplicates", "metric", "preview", "finalize",
@@ -1142,7 +1142,7 @@ def mode_evaluation_replicas(args) -> dict:
     import optax
 
     from dew.artifacts import Representations
-    from dew.data import Dataset
+    from dew.data import Loader
     from dew.objectives.base import Aux, Objective
     from dew.training import MeshSpec, Trainer
 
@@ -1174,7 +1174,7 @@ def mode_evaluation_replicas(args) -> dict:
     state, _, _ = trainer.place()
     batch = {"a_metadata": np.asarray(7), "a_python": 9,
              "x": np.arange(3, dtype=np.float32)[:, None]}
-    data = Dataset(
+    data = Loader(
         train=lambda partition: iter([batch]), val=lambda partition: iter([batch]), records=3, batch=3
     )
     measured = Evaluation.run(trainer.objective, state.variables, data.val, metrics=(Count(),),
@@ -1255,7 +1255,7 @@ def mode_builtin_preview_failures(args) -> dict:
     import jax
     import optax
 
-    from dew.data import Dataset
+    from dew.data import Loader
     from dew.inference import TextGeneration
     from dew.training import Trainer
 
@@ -1282,7 +1282,7 @@ def mode_builtin_preview_failures(args) -> dict:
                     finally:
                         closed.append(case)
 
-                data = Dataset(train=lambda partition: validation(), val=lambda partition: validation(),
+                data = Loader(train=lambda partition: validation(), val=lambda partition: validation(),
                                records=6, batch=6)
 
                 sample_failure = _builtin_sampler_failure(kind, phase, source, rank, fault)
@@ -1479,7 +1479,7 @@ def mode_rollout(args) -> dict:
     import optax
     from jax.experimental import multihost_utils
 
-    from dew.data import Dataset
+    from dew.data import Loader
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.objectives.rl import GRPOObjective, SampledRollout
     from dew.sampling import Sampling, generate
@@ -1546,7 +1546,7 @@ def mode_rollout(args) -> dict:
     single = None
     if processes == 1:
         single = rolled
-    data = Dataset(train=lambda partition: iter([local]), val=None, records=rows * processes,
+    data = Loader(train=lambda partition: iter([local]), val=None, records=rows * processes,
                    batch=rows * processes)
     final = trainer.fit(data, steps=1, log_every=1, checkpoint_every=None)
     dump_params(args.out.with_suffix(".npz"), final.variables["params"])
@@ -2272,7 +2272,7 @@ def mode_matrix(args) -> dict:
     batches = []
     train = tapped(data.train, lambda batch: batches.append(hashlib.sha256(b"".join(
         np.ascontiguousarray(batch[name]).tobytes() for name in sorted(batch))).hexdigest()))
-    state = trainer.fit(Dataset(train, None, batch=BATCH, records=MATRIX_RECORDS),
+    state = trainer.fit(Loader(train, None, batch=BATCH, records=MATRIX_RECORDS),
                         steps=args.steps, log_every=1,
                         checkpoint_every=args.save_every)
     dump_params(args.out.with_suffix(".npz"), state.variables)

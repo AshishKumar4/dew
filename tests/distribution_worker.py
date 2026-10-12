@@ -90,7 +90,7 @@ def main() -> None:
     from sharded import split_axes
 
     from dew.checkpoints import Checkpoints
-    from dew.data import DataPartition, Dataset
+    from dew.data import DataPartition, Loader
     from dew.objectives.lm import LMObjective
     from dew.registry import models
     from dew.training import Layout, MeshSpec, Trainer
@@ -142,7 +142,7 @@ def main() -> None:
                       mesh=MeshSpec(**json.loads(args.mesh)), layout=Layout(min_shard=TINY_SHARD),
                       checkpoints=None if args.checkpoints is None else Checkpoints(str(args.checkpoints)),
                       tracker=losses)
-    state = trainer.fit(Dataset(train=Stream if args.vary else share, val=None, records=None, batch=BATCH),
+    state = trainer.fit(Loader(train=Stream if args.vary else share, val=None, records=None, batch=BATCH),
                         steps=args.steps, log_every=1)
     # Every leaf of the trained state whole, in a fixed order, so two runs'
     # states compare by one hash.

@@ -55,7 +55,7 @@ from test_precision_policy import PER_ARCH, TINY
 
 import dew
 from dew.checkpoints import Checkpoints
-from dew.data import DataPartition, Dataset
+from dew.data import DataPartition, Loader
 from dew.data.preferences import IDS_KEY as PAIR_IDS_KEY, MASK_KEY as PAIR_MASK_KEY
 from dew.data.prompts import LENGTH_KEY, PROMPT_KEY
 from dew.data.recipes import load
@@ -495,7 +495,7 @@ def assert_trains(objective, batch: Mapping, directory: Path, *, evaluated: Mapp
     initial = trainer.initial_state()
     started = jax.device_get(initial.variables["params"])
     if data is None:
-        data = Dataset(lambda partition: itertools.repeat(batch), None, batch=ROWS, records=None)
+        data = Loader(lambda partition: itertools.repeat(batch), None, batch=ROWS, records=None)
     state = trainer.fit(data, steps=1, log_every=1, state=initial)
     checkpoints.wait()
     losses = [scalars["train/loss"] for _, scalars in tracker.scalars if "train/loss" in scalars]

@@ -35,7 +35,7 @@ from episode_support import (
     verify,
 )
 
-from dew.data import Dataset
+from dew.data import Loader
 from dew.objectives.base import Step
 from dew.objectives.rl import GRPOObjective
 from dew.objectives.rl.episodes import EpisodeCancelled, EpisodeFailure, EpisodeStatus
@@ -241,7 +241,7 @@ def run(directory, steps, records, accumulation=1):
     trainer, rollout = build(record=records.append, accumulation=accumulation)
     trainer.rollout = rollout
     trainer.checkpoints = Checkpoints(str(directory))
-    data = Dataset(train=lambda partition: Tasks(), val=None, records=None, batch=jax.device_count())
+    data = Loader(train=lambda partition: Tasks(), val=None, records=None, batch=jax.device_count())
     return trainer.fit(data, steps=steps, log_every=1)
 
 
@@ -302,7 +302,7 @@ def test_aborted_episode_leaves_the_previous_trainer_checkpoint_intact(tmp_path,
     trainer, rollout = build(Harness(failure), record=records.append)
     trainer.rollout = rollout
     trainer.checkpoints = Checkpoints(str(directory))
-    data = Dataset(train=lambda partition: Tasks(), val=None, records=None, batch=jax.device_count())
+    data = Loader(train=lambda partition: Tasks(), val=None, records=None, batch=jax.device_count())
     exception = EpisodeFailure if failure == "tool" else EpisodeCancelled
 
     with pytest.raises(exception):

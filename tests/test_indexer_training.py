@@ -21,7 +21,7 @@ import pytest
 from recording import RecordingTracker
 from reference_error import assert_as_exact_as_the_reference
 
-from dew.data.dataset import Dataset
+from dew.data.dataset import Loader
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.inputs import ModelInputs
 from dew.nn.mla import INDEXER, indexer_kl
@@ -530,7 +530,7 @@ def test_the_warmup_trains_through_the_trainer():
     # differently from an eager one at the last bit.
     initial, _, _ = trainer.place()
 
-    state = trainer.fit(Dataset(lambda partition: token_batches(), None, batch=8, records=None),
+    state = trainer.fit(Loader(lambda partition: token_batches(), None, batch=8, records=None),
                         steps=3, log_every=1)
 
     assert jax.tree.structure(state.opt_state) == jax.tree.structure(

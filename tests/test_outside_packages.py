@@ -173,7 +173,7 @@ from flax import linen as nn
 from flax import struct
 
 from dew.config import Prepared, RunConfig, TrainerConfig
-from dew.data import Dataset, Loading
+from dew.data import Loader, Loading
 from dew.objectives.base import Objective, mean_of_totals, merge_totals
 from dew.training import DEFAULT_RULES, Layout, MeshSpec
 

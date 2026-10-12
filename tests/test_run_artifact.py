@@ -14,7 +14,7 @@ import pytest
 
 from dew.checkpoints import Checkpoints
 from dew.config import ModelConfig
-from dew.data import Dataset, Loading, Memory, Pipeline, compile
+from dew.data import Loader, Loading, Memory, Pipeline, compile
 from dew.diffusion import schedules, transforms
 from dew.diffusion.process import Process
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -227,7 +227,7 @@ def test_an_adapted_policy_run_loads_and_saves_the_policy_it_trained(kind, tmp_p
         batch["behavior_log_probs"] = batch["old_log_probs"]
         values = np.asarray(objective.values(before.variables, batch))
         batch.update(old_values=values, returns=values + mask)
-    data = Dataset(train=lambda partition: iter([batch, batch]), val=None, records=2 * count, batch=count)
+    data = Loader(train=lambda partition: iter([batch, batch]), val=None, records=2 * count, batch=count)
     state = trainer.fit(data, steps=2, log_every=100, checkpoint_every=None)
     checkpoints = Checkpoints(str(tmp_path / "run"))
     checkpoints.save(int(state.step), state, None, artifact=objective.inference_record())

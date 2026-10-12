@@ -48,7 +48,7 @@ from dew.cache import default_compilation_cache_dir, dew_cache_dir
 from dew.checkpoints import RUN_FILE, Checkpoints, Keep
 from dew.config.sweep import RandomSearch, Search, Space, read_ledger, write_ledger
 from dew.coordination import agree_process_phase, agreed
-from dew.data import Augment, Dataset, HoldOut, Images, Loading, Ramp, Read, Recipe, load
+from dew.data import Augment, HoldOut, Images, Loader, Loading, Ramp, Read, Recipe, load
 from dew.data.dataset import Reader, ramped, record_argument
 from dew.files import write_atomically
 from dew.lora import AdapterRecord, LoRA
@@ -754,7 +754,7 @@ class TrainerConfig:
         return (Best(self.best),) if isinstance(self.best, str) else (
             self.best if isinstance(self.best, tuple) else (self.best,))
 
-    def total_steps(self, dataset: Dataset) -> int | None:
+    def total_steps(self, dataset: Loader) -> int | None:
         """Return the step cap from `steps` or `epochs`, None for a token-only run."""
         if self.steps is not None:
             return self.steps
@@ -769,11 +769,11 @@ class TrainerConfig:
                 "one, so give the run length as --trainer.steps")
         return self.epochs * dataset.steps_per_epoch
 
-    def eval_interval(self, dataset: Dataset) -> int | None:
+    def eval_interval(self, dataset: Loader) -> int | None:
         """Return the steps between validation passes over `data`, or None for never."""
         return self._interval(self.eval_every, dataset, "eval-every")
 
-    def checkpoint_interval(self, dataset: Dataset) -> int | datetime.timedelta | None:
+    def checkpoint_interval(self, dataset: Loader) -> int | datetime.timedelta | None:
         """Return the steps, or a recorded duration such as 30m, between checkpoints."""
         value = self.checkpoint_every
         if isinstance(value, datetime.timedelta):
@@ -783,7 +783,7 @@ class TrainerConfig:
         return self._interval(self.checkpoint_every, dataset, "checkpoint-every")
 
     @staticmethod
-    def _interval(value, dataset: Dataset, field_name: str) -> int | None:
+    def _interval(value, dataset: Loader, field_name: str) -> int | None:
         if value is None or isinstance(value, int):
             return value
         if dataset.steps_per_epoch is None:
@@ -1167,7 +1167,7 @@ class RunConfig:
         return dataclasses.replace(self, objective=dataclasses.replace(
             stated, defaults={**stated.defaults, **resolved}))
 
-    def train(self, objective: Objective[Loss, Effects], dataset: Dataset, *, name: str,
+    def train(self, objective: Objective[Loss, Effects], dataset: Loader, *, name: str,
               metrics: Sequence[Metric] = (), rollout: Rollout | None = None,
               summary: Mapping[str, object] | None = None,
               validation: Mapping[str, Reader] | None = None,

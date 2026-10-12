@@ -19,7 +19,7 @@ from flax.traverse_util import flatten_dict
 from jax.extend import core as jaxpr_core
 from recording import RecordingTracker
 
-from dew.data.dataset import Dataset
+from dew.data.dataset import Loader
 from dew.data.text import ByteTokenizer
 from dew.decision.head import DecisionHead, Head, JointSchemaHead
 from dew.decision.layout import DecisionInputs, Specials, StateFirstLayout
@@ -648,7 +648,7 @@ def test_accumulation_two_logs_the_real_tokens_of_both_microbatches():
     tracker = RecordingTracker()
     objective = LMObjective(decoder().clone(num_layers=1), seq_len=6, pad_id=0)
     trainer = Trainer(objective, optax.sgd(0.01), key=0, accumulation=2, tracker=tracker)
-    trainer.fit(Dataset(batches, None, batch=8, records=16), steps=2, log_every=2)
+    trainer.fit(Loader(batches, None, batch=8, records=16), steps=2, log_every=2)
     ticks = [scalars for _, scalars in tracker.scalars if "train/tokens" in scalars]
     assert len(ticks) == 1
     assert ticks[0]["train/tokens"] * 2 == 8 * (3 + 5)

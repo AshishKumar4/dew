@@ -23,7 +23,7 @@ def main() -> None:
 
     from dew.artifacts import ImageGrid
     from dew.coordination import collective_host
-    from dew.data import Dataset
+    from dew.data import Loader
     from dew.diffusion import FlowMatchingScheduler, FlowMatchPredictionTransform, Process
     from dew.inputs import CharTable, Condition, Field, InputSpec
     from dew.nn.backbones.dit import SimpleDiT
@@ -101,7 +101,7 @@ def main() -> None:
     compared = collective_host((scores, reassembled["old_log_probs"], reassembled["rewards"],
                                 reassembled["advantages"]), phase="flow test likelihoods")
     error = float(np.max(np.abs(compared[0] - compared[1])))
-    data = Dataset(
+    data = Loader(
         train=lambda partition: itertools.repeat(local),
         val=lambda partition: iter((local,)),
         records=4,

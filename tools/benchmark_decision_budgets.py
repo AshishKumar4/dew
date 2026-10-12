@@ -25,7 +25,7 @@ from dew.data.dataset import (
     Checkpointable,
     Closeable,
     DataPartition,
-    Dataset,
+    Loader,
     Loading,
     Reader,
     Stoppable,
@@ -229,7 +229,7 @@ class BenchmarkRun(DecisionRunConfig):
     profile_directory: str | None = None
 
     def train[Loss, Effects](
-        self, objective: Objective[Loss, Effects], dataset: Dataset, *, name: str,
+        self, objective: Objective[Loss, Effects], dataset: Loader, *, name: str,
         metrics: Sequence[Metric] = (), rollout: Rollout | None = None,
         summary: Mapping[str, object] | None = None, validation: Mapping[str, Reader] | None = None,
         after: Callable[[TrainState, str], None] | None = None,
