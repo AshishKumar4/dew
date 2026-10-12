@@ -23,6 +23,10 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  # The armada runner every armada job uses.
+  ARMADA: github:AshishKumar4/armada#3d0b707de58afc0c753244581ac49dfb4036d60d
+
 jobs:
   # A commit this workflow passed on another push, as one proved on
   # ci/integration before main takes it, is not proved again: lint, types and
@@ -177,7 +181,7 @@ jobs:
       # release carries the fix, and the patched jax and its refusal can go.
       run: |
         "$RUNNER_TEMP/clean/bin/pip" install --quiet pytest
-        DEW_UPSTREAM_JAX=1 "$RUNNER_TEMP/clean/bin/python" -m pytest -q -p no:cacheprovider -rxX \
+        DEW_UPSTREAM_JAX=1 "$RUNNER_TEMP/clean/bin/python" -m pytest -q -rxX \
           tests/test_distribution.py::test_a_pools_second_run_loads_what_its_first_compiled
     - name: Resolve the accelerator extras
       run: |
@@ -221,7 +225,7 @@ jobs:
         ARMADA_URL: ${{ secrets.ARMADA_URL }}
         ARMADA_TOKEN: ${{ secrets.ARMADA_TOKEN }}
       run: |
-        armada="bunx --bun github:AshishKumar4/armada#3d0b707de58afc0c753244581ac49dfb4036d60d"
+        armada="bunx --bun $ARMADA"
         # Its own deadline sits below this job's 40 minutes, so a hang is armada's named error.
         $armada verdict ${{ github.sha }} || $armada run ${{ github.sha }} --deadline=1800 \
           --label="${{ github.ref_name }}"
@@ -248,11 +252,11 @@ jobs:
         ARMADA_URL: ${{ secrets.ARMADA_URL }}
         ARMADA_TOKEN: ${{ secrets.ARMADA_TOKEN }}
       run: |
-        armada="bunx --bun github:AshishKumar4/armada#3d0b707de58afc0c753244581ac49dfb4036d60d"
+        armada="bunx --bun $ARMADA"
         # A gang member lost before the start fails it within 300 s (armada#22), and the job within 30 min.
         echo '[{"gang": 4, "select": "layouts and dense"}, {"gang": 4, "select": "layouts and moe"},
               {"gang": 4, "select": "not layouts"}]' \
           | $armada map --commit=${{ github.sha }} --items=- --pool=12 --size=medium \
           --deadline=1800 --gang-start-timeout=300 \
-          --label="${{ github.ref_name }}" -- .venv-3.12/bin/python -m pytest -q -p no:cacheprovider \
+          --label="${{ github.ref_name }}" -- .venv-3.12/bin/python -m pytest -q \
           -m "not network" -k "{select}" -rfE --tb=short --basetemp=/tmp/dew-gang tests/test_multihost.py
