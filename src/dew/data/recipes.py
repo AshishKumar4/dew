@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Annotated, Literal, Protocol, TypeAliasType, r
 import numpy as np
 import tyro
 
-from dew.data.analysis import _order_at, _preferred_read, _promoted, _random, _until
+from dew.data.analysis import _cache_at, _order_at, _preferred_read, _promoted, _until
 from dew.data.compile import compile
 from dew.data.dataset import Batch, DataPhase, Dataset, Loading, Records as IndexedRecords, record_argument
 from dew.data.pipeline import Configured, HostStep, Mixture, ObjectiveData, Phases, Pipeline, Rejected, Stage
@@ -836,18 +836,9 @@ def _batched(
 
 
 def _cached(pipeline: Pipeline, cache: Cache | Generation | str) -> Pipeline:
-    from dew.data.pipeline import MapBatch, Pack, Windows
-
     if isinstance(pipeline.source, (Mixture, Phases)):
         children = tuple(_cached(child, cache) for child in pipeline.source.pipelines)
         return dataclasses.replace(pipeline, source=dataclasses.replace(pipeline.source, pipelines=children))
-    at = next(
-        (
-            index
-            for index, stage in enumerate(pipeline.stages)
-            if isinstance(stage, (MapBatch, Pack, Windows)) or _random(stage)
-        ),
-        len(pipeline.stages),
-    )
+    at = _cache_at(pipeline.stages)
     prefix = dataclasses.replace(pipeline, stages=pipeline.stages[:at]).cache(cache)
     return dataclasses.replace(prefix, stages=(*prefix.stages, *pipeline.stages[at:]))

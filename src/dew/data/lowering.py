@@ -263,8 +263,8 @@ def _fill(pipeline: Pipeline, source: Source, at: int, read: Read) -> tuple[Cach
     record steps before it that fill it, from which memory, indexed and
     streamed reads all open the cache."""
     artifact, prefix = pipeline.stages[at], pipeline.stages[:at]
-    if not isinstance(artifact, Artifact) or any(not isinstance(stage, _LOCAL) for stage in prefix):
-        raise ValueError(f"cache prefix in {_name(pipeline)} must hold only deterministic record steps")
+    if not isinstance(artifact, Artifact):
+        raise ValueError(f"stage {at} of {_name(pipeline)} is not a cache")
     return _filled(artifact), _cache_manifest(source, prefix, read), _Prefix(prefix)
 
 

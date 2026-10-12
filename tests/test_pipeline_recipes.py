@@ -91,3 +91,26 @@ def test_chat_default_truncates_and_chunking_preserves_later_assistant_tokens():
     reader = chunked.train(DataPartition())
     assert any(np.any(batch["text_roles"] == 3) for batch in itertools.islice(reader, chunked.records))
     reader.close()
+
+
+def test_a_cached_token_holdout_caches_the_documents_before_the_split(tmp_path):
+    """A recipe's cache holds the deterministic steps before its token split,
+    so a cached memory read of a token holdout holds out what the uncached
+    read holds out."""
+    import json
+    from uuid import uuid4
+
+    from dew.data import HoldOut
+    from dew.data.cache import Cache
+
+    (tmp_path / "text.jsonl").write_text(
+        "".join(json.dumps({"text": f"document {index} " * 6}) + "\n" for index in range(8)))
+    recipe = Text(source=str(tmp_path / "text.jsonl"), seq_len=8, token_holdout=HoldOut(fraction=0.25))
+
+    def held(cache):
+        loaded = load(recipe, batch=2, read="memory", cache=cache, loading=READ)
+        assert loaded.val is not None
+        return [{name: np.asarray(value).tolist() for name, value in batch.items()}
+                for batch in loaded.val(DataPartition())]
+
+    assert held(Cache(f"memory://{uuid4().hex}")) == held(None)

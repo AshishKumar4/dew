@@ -262,6 +262,19 @@ _ROOTED = (*_LOCAL, Configured, Artifact, Interleave, Shuffle, Pack, Windows, Pr
 counts the rows or draws from the record rng, so they read one continuous
 stream whose shards reshuffle each epoch."""
 
+
+def _cacheable(stage: Stage) -> bool:
+    """Whether a cache can hold what `stage` makes: a deterministic record
+    step, or a configured one, which binds to such a step."""
+    return isinstance(stage, (*_LOCAL, Configured)) and not _random(stage)
+
+
+def _cache_at(stages: Sequence[Stage]) -> int:
+    """The end of the longest prefix of `stages` a cache can hold, where a
+    recipe's cache goes and before which `_checked` requires any cache."""
+    return next((index for index, stage in enumerate(stages) if not _cacheable(stage)), len(stages))
+
+
 def _order_at(stages: Sequence[Stage], read: Read) -> tuple[int, bool]:
     """Where a recipe's default order goes, and whether the rows there are
     indexed so one shuffle can order them all. A memory read orders the rows
@@ -488,6 +501,9 @@ def _checked(
                 raise ValueError(
                     f"cache prefix in {name} contains random step {random}; cache before stochastic steps"
                 )
+            mixed = isinstance(pipeline.source, (Mixture, Phases))
+            if not mixed and _cache_at(pipeline.stages[:index]) < index:
+                raise ValueError(f"cache prefix in {name} must hold only deterministic record steps")
             for earlier in prefix:
                 _identity(earlier, cache=True)
         if isinstance(stage, Shuffle) and stage.window is None and not indexed and not promotion:
