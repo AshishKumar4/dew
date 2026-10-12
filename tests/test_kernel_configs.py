@@ -83,10 +83,9 @@ def test_wide_keys_cap_an_a100s_dhu_at_two_stages():
 @pytest.mark.parametrize("target", ["sm80", "sm89", "sm120"])
 def test_every_declared_kernel_config_compiles_on_tritons_compiler_within_its_block(target):
     """Each declared config at each declared shape, lowered as on the GPU and compiled by pip's Triton
-    for its capability on this CPU (tests/kernel_compile.py): it compiles, within the bound, to
-    no more shared memory than its GPU's block holds. A kernel that does not compile (a two-result
-    inline asm, a mixed-dtype dot) or compiles pathologically slowly (an IEEE fp32 dot on sm80) fails
-    here and never reaches a GPU."""
+    for its capability on this CPU (tests/kernel_compile.py): it compiles, to no more shared memory
+    than its GPU's block holds. A kernel that does not compile (a two-result inline asm, a mixed-dtype
+    dot) fails here and never reaches a GPU."""
     pytest.importorskip("triton")
     found = compile_kernels(support.kernel_cases(target), target)
     assert found, "the compile gate must not be vacuous"
