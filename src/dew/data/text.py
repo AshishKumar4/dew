@@ -290,9 +290,10 @@ def tokenizer_name(tokenizer: str | PreTrainedTokenizerBase) -> str:
 
 
 def tokenize(tokenizer: str | PreTrainedTokenizerBase = "byte", *, field: str = "text",
-             eos: bool = True) -> Tokenize:
+             eos: bool | None = None) -> Tokenize:
     """A record step that encodes the text in `field` to token ids under
-    "text", each document ended by the tokenizer's EOS where `eos`.
+    "text", each document ended by the tokenizer's EOS with `eos`, or where
+    the tokenizer has one with None.
     `tokenizer` is "byte" (Dew's utf-8 vocabulary), a Hub repo or directory,
     or a transformers tokenizer object."""
     from dew.data.steps.text import Tokenize

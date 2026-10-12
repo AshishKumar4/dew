@@ -17,9 +17,12 @@ from dew.data.text import ByteTokenizer, HFTokenizer, tokenizer_for
 
 @dataclasses.dataclass(frozen=True)
 class Tokenize(grain.MapTransform):
+    """The text in `field` as token ids under "text", each document ended by
+    the tokenizer's EOS with `eos`, or where the tokenizer has one with None."""
+
     tokenizer: str = "byte"
     field: str = "text"
-    eos: bool = False
+    eos: bool | None = False
 
     @functools.cached_property
     def vocabulary(self) -> ByteTokenizer | HFTokenizer:
@@ -37,7 +40,7 @@ class Tokenize(grain.MapTransform):
             raise ValueError(f"Tokenize field {self.field!r} must contain text")
         tokenizer = self.vocabulary
         ids = tokenizer.encode(value)
-        if self.eos and ids:
+        if (self.eos or (self.eos is None and tokenizer.eos_id is not None)) and ids:
             if tokenizer.eos_id is None:
                 raise ValueError(f"tokenizer {self.tokenizer} has no EOS id")
             ids.append(tokenizer.eos_id)
