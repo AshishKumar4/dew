@@ -46,7 +46,7 @@ import os
 import threading
 import time
 from collections.abc import Callable, Hashable, Iterator, Mapping
-from typing import ClassVar
+from typing import ClassVar, cast
 
 import filelock
 import jax
@@ -191,14 +191,20 @@ def _bucketed(spec: jax.ShapeDtypeStruct) -> jax.ShapeDtypeStruct:
     return jax.ShapeDtypeStruct((1 << max(spec.shape[0] - 1, 0).bit_length(), *spec.shape[1:]), spec.dtype)
 
 
-def _measured(ba: tokamax.BoundArguments) -> AutotuningData:
+def _kernel_times(cupti, executable, *args) -> list[tuple[str, float]]:
+    """Each kernel's name and device milliseconds over one run of `executable`
+    (CUPTI); none where it launched none."""
+    _, kernels = cupti.measure(executable, aggregate=False)(*args)
+    return cast(list[tuple[str, float]], kernels or [])
+
+
+def _measured(op: KernelOp, ba: tokamax.BoundArguments) -> AutotuningData:
     """Every config of `ba`'s launch (at its key's shapes), each compiled on a
     thread and timed alone: the device time CUPTI reads for the launch's own
     kernels, each run after `FLUSH_BYTES` are read, so every config starts
     with its operands out of cache."""
     from jax.experimental.mosaic.gpu import profiler
 
-    op = ba.op
     leaves, tree = jax.tree.flatten((ba.args, ba.kwargs),
                                     is_leaf=lambda leaf: isinstance(leaf, jax.ShapeDtypeStruct))
     places = [index for index, leaf in enumerate(leaves) if isinstance(leaf, jax.ShapeDtypeStruct)]
@@ -206,7 +212,7 @@ def _measured(ba: tokamax.BoundArguments) -> AutotuningData:
     flush = jnp.zeros(FLUSH_BYTES // 4, jnp.float32)
     cupti = profiler.Cupti(finalize=False)
     evicting = jax.jit(jnp.sum).lower(flush).compile()
-    flushes = {name for name, _ in cupti.measure(evicting, aggregate=False)(flush)[1]}
+    flushes = {name for name, _ in _kernel_times(cupti, evicting, flush)}
 
     def compiled(config):
         configured = op.replace(config=config)
@@ -228,8 +234,8 @@ def _measured(ba: tokamax.BoundArguments) -> AutotuningData:
 
     def launched(executable) -> float:
         """Milliseconds the launch's kernels ran, the flush's left out."""
-        _, kernels = cupti.measure(executable, aggregate=False)(flush, arrays)
-        return sum(milliseconds for name, milliseconds in kernels if name not in flushes)
+        return sum(milliseconds for name, milliseconds in _kernel_times(cupti, executable, flush, arrays)
+                   if name not in flushes)
 
     timings: dict[Hashable, tokamax.BenchmarkData | Exception] = {}
     with concurrent.futures.ThreadPoolExecutor(os.cpu_count()) as pool:
@@ -300,27 +306,27 @@ def tune(jitted: jax.stages.Wrapped, *args) -> bool:
     lowered as the caller lowers it, which JAX's cache answers."""
     if not generation.triton_runs():
         return False
-    found = [ba.op.keyed(ba) for ba in tokamax.autotuning.get_bound_args(jitted, *args)
-             if isinstance(ba.op, KernelOp)]
+    found = [(op, op.keyed(ba)) for ba in tokamax.autotuning.get_bound_args(jitted, *args)
+             if isinstance(op := ba.op, KernelOp)]
     if not found:
         return False
-    kind = _kind(found[0])
+    kind = _kind(found[0][1])
 
     def decided() -> str | None:
         if jax.process_index() != 0:
             return None
         decisions, measured = [], []
-        for ba in found:
+        for op, ba in found:
             if (fastest := _pick(ba)) is not None:
                 decisions.append((ba, fastest))
             elif cache.measures_picks():
-                timings = _measured(ba)
+                timings = _measured(op, ba)
                 if timings.prune_errors():
                     measured.append((ba, timings))
                     decisions.append((ba, timings.prune()))
                 else:
                     _log.warning("no config of %s compiled or ran; it keeps its heuristic: %s",
-                                 type(ba.op).__name__, next(iter(timings.values()), None))
+                                 type(op).__name__, next(iter(timings.values()), None))
         if measured:
             _store(tokamax.AutotuningResult(kind, tuple(measured)))
         return tokamax.AutotuningResult(kind, tuple(decisions)).dumps()
@@ -329,8 +335,8 @@ def tune(jitted: jax.stages.Wrapped, *args) -> bool:
     settled = {(ba.op, ba.autotuning_cache_key): fastest
                for ba, fastest in _kernel_launches(tokamax.AutotuningResult.loads(text))}
     changed = False
-    for ba in found:
-        picks, key = ba.op.get_autotuning_cache(kind), ba.autotuning_cache_key
+    for op, ba in found:
+        picks, key = op.get_autotuning_cache(kind), ba.autotuning_cache_key
         fastest = settled.get((ba.op, key))
         if _config(_pick(ba)) != _config(fastest):
             changed = True
