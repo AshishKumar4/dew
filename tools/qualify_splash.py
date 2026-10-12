@@ -42,7 +42,7 @@ from __future__ import annotations
 
 import json
 import os
-import time
+import statistics
 from dataclasses import dataclass
 
 # tests/conftest.py defaults the platform to cpu, and it is imported after
@@ -57,6 +57,7 @@ import numpy as np
 import tyro
 
 from dew.nn.attention import pallas_flash_attention, scaled_dot_product_attention
+from dew.nn.kernels.tuning import samples
 
 KERNELS = ('splash', 'flash', 'xla')
 SHAPES = ('causal', 'softcap', 'sinks', 'packed', 'packed_window')
@@ -133,12 +134,7 @@ def kernel_fn(kernel: str, arguments: dict[str, object]):
 
 def timed(run, *arrays, warmup: int, steps: int) -> float:
     """Milliseconds per call, after the compile and a warm cache."""
-    for _ in range(warmup):
-        jax.block_until_ready(run(*arrays))
-    start = time.perf_counter()
-    for _ in range(steps):
-        jax.block_until_ready(run(*arrays))
-    return (time.perf_counter() - start) * 1e3 / steps
+    return statistics.mean(samples(run, *arrays, warmup=warmup, repeats=steps)) * 1e3
 
 
 def compiled(fn, *arrays):

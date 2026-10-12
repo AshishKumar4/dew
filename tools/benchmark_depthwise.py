@@ -12,7 +12,6 @@ production dispatch has no performance flag.
 import argparse
 import json
 import statistics
-import time
 from functools import partial
 from pathlib import Path
 
@@ -21,6 +20,7 @@ import jax.numpy as jnp
 import numpy as np
 
 import dew.nn.conv as conv
+from dew.nn.kernels.tuning import samples
 
 
 def reference(x, kernel, dilation, *, layout='NHWC', precision=jax.lax.Precision.HIGHEST):
@@ -41,16 +41,8 @@ def vjp(operation, x, kernel, cotangent):
 
 def timed(operation, args, repeats):
     executable = jax.jit(operation).lower(*args).compile()
-    for _ in range(5):
-        jax.block_until_ready(executable(*args))
-    samples = []
-    for _ in range(5):
-        start = time.perf_counter()
-        for _ in range(repeats):
-            result = executable(*args)
-        jax.block_until_ready(result)
-        samples.append((time.perf_counter() - start) * 1000 / repeats)
-    return {'median_ms': statistics.median(samples), 'min_ms': min(samples), 'max_ms': max(samples)}
+    measured = [seconds * 1e3 for seconds in samples(executable, *args, warmup=5, repeats=5, calls=repeats)]
+    return {'median_ms': statistics.median(measured), 'min_ms': min(measured), 'max_ms': max(measured)}
 
 
 def kernels(args):

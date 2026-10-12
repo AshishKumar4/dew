@@ -33,6 +33,7 @@ from benchmark_cases import Case
 from benchmark_models import batches, build_trainer
 
 from dew.config import OptimConfig
+from dew.nn.kernels.tuning import samples
 from dew.nn.moe import expert_projection
 from dew.telemetry.profile import capture_options
 from dew.training.distributed import DevicePrefetchIterator
@@ -42,16 +43,10 @@ SEQUENCE = 1024
 
 
 def timed(function, arguments, repeats: int) -> dict[str, float]:
-    """Ratio, minimum and median wall time of `function`, each call synced."""
-    for _ in range(5):
-        jax.block_until_ready(function(*arguments))
-    samples = []
-    for _ in range(repeats):
-        start = time.perf_counter()
-        jax.block_until_ready(function(*arguments))
-        samples.append((time.perf_counter() - start) * 1e3)
-    return {"mean_ms": float(np.mean(samples)), "min_ms": float(np.min(samples)),
-            "median_ms": float(np.median(samples))}
+    """Mean, minimum and median wall time of `function`, each call synced."""
+    measured = np.asarray(samples(function, *arguments, warmup=5, repeats=repeats)) * 1e3
+    return {"mean_ms": float(np.mean(measured)), "min_ms": float(np.min(measured)),
+            "median_ms": float(np.median(measured))}
 
 
 def peak_bytes() -> int | None:
@@ -131,14 +126,15 @@ def adam(args: argparse.Namespace) -> dict[str, object]:
     state = solver.init(params)
     for _ in range(3):
         params, state = run(params, state, grads)
-    samples = []
+    # The update threads its donated state through each call, which `samples` cannot.
+    updates = []
     for _ in range(args.repeats):
         start = time.perf_counter()
         params, state = run(params, state, grads)
         jax.block_until_ready((params, state))
-        samples.append((time.perf_counter() - start) * 1e3)
+        updates.append((time.perf_counter() - start) * 1e3)
     return {"state_dtype": args.state_dtype, "params": sum(leaf.size for leaf in params.values()),
-            "update_mean_ms": float(np.mean(samples)), "update_min_ms": float(np.min(samples)),
+            "update_mean_ms": float(np.mean(updates)), "update_min_ms": float(np.min(updates)),
             "state_bytes": sum(leaf.size * leaf.dtype.itemsize for leaf in jax.tree.leaves(state))}
 
 
@@ -151,7 +147,8 @@ def case_for(path: str, batch: int, args: argparse.Namespace | None) -> Case:
     if path == "dit":
         # DiT-L/2's width and depth on 64x64 inputs, 1024 tokens a sample.
         config: dict[str, object] = {"patch_size": 2, "emb_features": 1024, "num_layers": 24,
-                                     "num_heads": 16, "mlp_ratio": 4, "remat": remat != "none"}
+                                     "num_heads": 16, "mlp_ratio": 4,
+                                     "remat": False if remat in (None, "none") else remat}
         return Case("simple_dit", config, dtype="bfloat16", batch_size=batch,
                                    image_size=64)
     if path == "lm-dense":
@@ -169,13 +166,6 @@ def case_for(path: str, batch: int, args: argparse.Namespace | None) -> Case:
 
 
 def step(args: argparse.Namespace) -> dict[str, object]:
-    if args.path == "dit" and args.remat == "full":
-        # A DiT's remat is a flag for the dots policy; full recomputation is
-        # that block under no policy.
-        import functools
-
-        import dew.nn.backbones.dit as dit
-        dit.remat_block = functools.partial(dit.remat_block, policy=None)
     case = case_for(args.path, args.batch, args)
     trainer = build_trainer(case, optimizer=OptimConfig(
         optimizer="adam", learning_rate=1e-4, state_dtype=args.state_dtype).build(1000))

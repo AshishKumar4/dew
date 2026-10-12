@@ -16,13 +16,14 @@ Usage:
 import argparse
 import json
 import statistics
-import time
 from collections.abc import Callable
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
+
+from dew.nn.kernels.tuning import samples
 
 
 def _siglip() -> tuple[nn.Module, tuple[int, ...]]:
@@ -69,14 +70,7 @@ def measure(name: str, warmup: int, repeats: int) -> float:
     inputs = jnp.asarray(np.random.default_rng(0).normal(size=shape), jnp.float32)
     variables = jax.jit(module.init)(jax.random.key(0), inputs)
     forward = jax.jit(module.apply)
-    for _ in range(warmup):
-        jax.block_until_ready(forward(variables, inputs))
-    times = []
-    for _ in range(repeats):
-        started = time.perf_counter()
-        jax.block_until_ready(forward(variables, inputs))
-        times.append(1e3 * (time.perf_counter() - started))
-    return statistics.median(times)
+    return 1e3 * statistics.median(samples(forward, variables, inputs, warmup=warmup, repeats=repeats))
 
 
 def main() -> None:
