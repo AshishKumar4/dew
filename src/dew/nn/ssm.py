@@ -173,7 +173,9 @@ class S5Layer(nn.Module):
         dt = jnp.exp(log_dt)
         A_diag = -jnp.exp(log_A_real) + 1j * A_imag
         A_bar = jnp.exp(A_diag * dt)
-        B_bar = ((A_bar[:, None] - 1.0) / (A_diag[:, None] + 1e-8)) * (B_re + 1j * B_im)
+        # S5's own hold has no guard (Smith et al. 2023, appendix): A's real part, -exp(log_A_real), is
+        # never zero.
+        B_bar = ((A_bar[:, None] - 1.0) / A_diag[:, None]) * (B_re + 1j * B_im)
         return A_bar, B_bar, C_re + 1j * C_im, D
 
     def __call__(self, u):
