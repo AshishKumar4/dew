@@ -438,7 +438,7 @@ def test_a_trained_step_keeps_the_frozen_buffer_and_exports_for_the_source(sourc
         return float(loss.total / loss.mass)
 
     before = value(initial.variables)
-    state, _, _, _, accepted = trainer.compile(initial, batch)(initial, batch)
+    state, _, _, _, accepted, _ = trainer.compile(initial, batch)(initial, batch)
     assert bool(accepted)
     assert value(state.variables) < before
     # The step moved weights and left the buffer alone.

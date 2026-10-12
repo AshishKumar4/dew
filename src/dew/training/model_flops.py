@@ -48,6 +48,14 @@ def prepare_counts[Loss, Effects](objective: Objective[Loss, Effects], batch: Ba
     return counted
 
 
+def uncounted(batch: Batch) -> Batch:
+    """`batch` with its work unknown: NaN where counted work would be, so a
+    step keeps its program and the global sum reports none (`step_counts`)."""
+    rows = rows_of(batch)
+    return {**batch, FORWARD_FLOPS: np.full((rows,), np.nan, np.float32),
+            TRAINING_FLOPS: np.full((rows,), np.nan, np.float32)}
+
+
 def step_counts(batch: Batch) -> dict[str, jax.Array]:
     """Global device-side sums, returned with the step's other scalar metrics."""
     return {name: jnp.sum(batch[name], dtype=jnp.float32)

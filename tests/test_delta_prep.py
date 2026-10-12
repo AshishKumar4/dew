@@ -23,6 +23,8 @@ from dew.nn.linear import (
     strictly_lower_inverse,
 )
 
+pytestmark = pytest.mark.kernel
+
 
 def prep_operands(shape, *, aligned=False):
     batch, heads, chunks, size, width, columns = shape
@@ -105,7 +107,7 @@ def test_saved_inverse_is_bounded_even_when_the_keys_align(aligned):
 def test_prep_refusals_name_the_reason_once(monkeypatch, caplog, shape, reason):
     from dew.nn import linear
 
-    monkeypatch.setitem(kernels.KERNELS, "gated_delta_rule", {"sm80": "pallas"})
+    monkeypatch.setitem(kernels.gpu_target('sm80').kernels, 'gated_delta_rule', 'pallas')
     monkeypatch.setattr(kernels.generation, "device_generation", lambda: "sm80")
     monkeypatch.setattr(kernels.generation, "_logged", set())
     monkeypatch.setattr(linear, "triton_runs", lambda: True)

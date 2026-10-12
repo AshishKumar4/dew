@@ -18,7 +18,8 @@ and loss, embedding, norm, optimizer, other) and direction (forward, backward, n
 read from the op itself (`kind_of`): GEMM, attention, Pallas/Triton, layout (transposes and
 copies), slicing, gathers and scatters, reductions, elementwise, collectives; both together; GEMMs
 by the time they lose against the device's peak (time - flops / peak); the costliest layout
-moves and ops with framework name and source line; the device's idle time; with `--entry`, the
+moves and ops with framework name and source line, each with its HBM traffic a step (XProf's
+measured HBM bandwidth over the op's time); the device's idle time; with `--entry`, the
 step's model FLOPs over its device time against the peak. Without `--hlo`, a custom call or a
 fusion is kinded from its name alone, which cannot tell FlashAttention's call from any other.
 
@@ -34,14 +35,19 @@ It reads text and JSON only, through Dew's own readers: the HLO parser the FLOP 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import html
-import io
 import json
 import re
+import resource
+import shutil
 import tarfile
+import tempfile
 from collections import defaultdict
+from collections.abc import Iterable, Iterator
 from pathlib import Path
 
+from dew.nn.kernels.generation import gpu_target
 from dew.telemetry.instrumentation import HloInstruction, custom_call_kind, hlo_instructions
 from dew.telemetry.profile import report_table
 
@@ -158,7 +164,7 @@ def heaviest(groups: dict) -> list:
 
 
 def attribute_time(trace: Path, steps: int, model_flops: float | None,
-                   ops: dict[str, HloInstruction] | None = None) -> dict:
+                   ops: dict[str, HloInstruction] | None = None, device: str | None = None) -> dict:
     capture = capture_of(trace)
     reports = capture / "reports"
     rows = report_table(reports / "hlo_stats.json")[1]
@@ -167,7 +173,16 @@ def attribute_time(trace: Path, steps: int, model_flops: float | None,
                 "XLA_FLAGS=--xla_gpu_enable_command_buffer= so XProf can attribute kernels"}
     roofline = json.loads((reports / "roofline_model.json").read_text())
     roofline = roofline[0] if isinstance(roofline, list) else roofline
-    peak = float(roofline.get("p", {}).get("peak_flop_rate", 0) or 0)
+    # Dew's dense bf16 peak, the MFU denominator every run reports. XProf's roofline peak is a
+    # different kind of figure (on an RTX PRO 6000, 3,742 TFLOP/s, sparse low precision), kept for
+    # reference only: a device Dew's table does not name gets no peak-derived field at all.
+    target = gpu_target(device) if device else None
+    known = None if target is None else target.bf16_peak
+    peak = known / 1e9 if known else None
+    fp8_peak = None if target is None or target.fp8_peak is None else target.fp8_peak / 1e9
+    peak_source = (f"dew.nn.kernels.generation.gpu_target for {device}" if known
+                   else f"unknown device: {device}" if device else "no device named")
+    xprof_peak = float(roofline.get("p", {}).get("peak_flop_rate", 0) or 0) or None
     programs = defaultdict(float)
     for row in rows:
         programs[str(row.get("program_id"))] += float(row["total_self_time"])
@@ -176,6 +191,7 @@ def attribute_time(trace: Path, steps: int, model_flops: float | None,
     by_kind: dict = defaultdict(float)
     by_part_kind: dict = defaultdict(lambda: defaultdict(float))
     gemms, layouts, everything = [], [], []
+    fp8_gflop = 0.0
     for row in (row for row in rows if str(row.get("program_id")) == step):
         name = str(row.get("tf_op_name") or "")
         us = float(row["total_self_time"]) / steps
@@ -189,24 +205,40 @@ def attribute_time(trace: Path, steps: int, model_flops: float | None,
         by_part[part][direction] += us
         by_kind[kind] += us
         by_part_kind[part][kind] += us
-        gflops = float(row.get("normalized_flop_rate") or row.get("model_flop_rate") or 0)
+        # The compiler's FLOPs over the measured time: the work done. XProf's normalized rate
+        # scales them by bf16's peak over the op's precision's, its own guess of that precision
+        # (an fp32 dot as non-tensor-core arithmetic, though it runs as TF32), which put the later Qwen3.5-0.8B step's
+        # GEMMs at 1.127 of the A100's peak.
+        gflops = float(row.get("model_flop_rate") or 0)
+        # XProf's HBM bandwidth is GiB/s over the op's own time, so the op moves that much a step.
+        hbm_mib = float(row.get("hbm_bw") or 0) * us * 1e-6 * 1024
         record = {"us": round(us, 1), "part": part, "direction": direction, "kind": kind,
                   "hlo": row.get("hlo_op_name"), "framework": name[:200], "count": row.get("occurrences"),
-                  "gflops": round(gflops, 1), "bound_by": row.get("bound_by"), "source": source}
+                  "gflops": round(gflops, 1), "hbm_mib": round(hbm_mib, 1), "bound_by": row.get("bound_by"),
+                  "source": source}
         everything.append(record)
-        if kind == "gemm" and peak:
-            record["lost_us"] = round(us * max(0.0, 1 - gflops / peak), 1)
-            gemms.append(record)
+        if kind == "gemm":
+            record["precision"] = gemm_precision(row, known)
+            # Model FLOPs exclude remat's recompute, so an FP8 GEMM's recomputed copy is not charged.
+            if record["precision"] == "fp8" and not (known is not None and known.recomputed):
+                fp8_gflop += gflops * us * 1e-6
+            # Each GEMM against its own precision's peak, as mfu_mixed counts it.
+            limit = fp8_peak if record["precision"] == "fp8" else peak
+            if limit:
+                record["fraction_of_peak"] = round(gflops / limit, 3)
+                record["lost_us"] = round(us * max(0.0, 1 - gflops / limit), 1)
+                gemms.append(record)
         if kind == "layout":
             layouts.append(record)
     device_us = sum(by_kind.values())
     _, operations = report_table(reports / "framework_op_stats.json")
     idle_us = sum(float(row["total_self_time"]) for row in operations
                   if row.get("host_or_device") == "Device" and row.get("type") == "IDLE") / steps
-    gemm_us = by_kind.get("gemm", 0.0)
-    gemm_work = sum(record["us"] * record["gflops"] for record in gemms)
+    judged_us = sum(record["us"] for record in gemms)
+    judged = sum(record["us"] * record["fraction_of_peak"] for record in gemms)
     result = {
-        "capture": str(capture), "steps": steps, "peak_gflops": peak, "step_program": step,
+        "capture": str(capture), "steps": steps, "peak_gflops": peak, "peak_source": peak_source,
+        "xprof_peak_gflops": xprof_peak, "step_program": step,
         "programs_ms": {program: round(us / 1e3 / steps, 3)
                         for program, us in sorted(programs.items(), key=lambda item: -item[1])[:6]},
         "device_ms_per_step": round(device_us / 1e3, 3),
@@ -215,61 +247,103 @@ def attribute_time(trace: Path, steps: int, model_flops: float | None,
                        for part, directions in heaviest(by_part)},
         "by_kind_ms": ms(by_kind),
         "by_part_kind_ms": {part: ms(kinds) for part, kinds in heaviest(by_part_kind)},
-        "gemm_fraction_of_peak": round(gemm_work / gemm_us / peak, 3) if gemm_us and peak else None,
-        "gemm_lost_ms": round(sum(record["lost_us"] for record in gemms) / 1e3, 3),
+        "gemm_fraction_of_peak": round(judged / judged_us, 3) if judged_us else None,
+        "gemm_lost_ms": round(sum(record["lost_us"] for record in gemms) / 1e3, 3) if peak else None,
         "gemms_by_lost_time": sorted(gemms, key=lambda record: -record["lost_us"])[:25],
         "layout_moves": sorted(layouts, key=lambda record: -record["us"])[:25],
         "top_ops": sorted(everything, key=lambda record: -record["us"])[:40],
         "xprof_steps": report_table(reports / "input_pipeline_analyzer.json", 1)[1][:8],
     }
-    if model_flops and peak:
-        result["model_flops_per_step"] = model_flops
-        result["mfu_of_device_time"] = round(model_flops / (device_us * 1e-6) / (peak * 1e9), 4)
+    if model_flops:
+        # Utilization names its precision and denominator. mfu_bf16: model FLOPs over the bf16 peak,
+        # which is utilization only when every GEMM is bf16 and otherwise a bf16-equivalent
+        # throughput. mfu_mixed: each GEMM's FLOPs over its own precision's peak, the true
+        # utilization, null where an FP8 GEMM runs on a device with no FP8 peak in Dew's table.
+        seconds = device_us * 1e-6
+        fp8 = fp8_gflop * 1e9
+        result.update(model_flops_per_step=model_flops, fp8_gemm_flops_per_step=fp8,
+                      bf16_equiv_throughput_tflops=round(model_flops / seconds / 1e12, 2))
+        result["mfu_bf16_of_device_time"] = round(model_flops / seconds / (peak * 1e9), 4) if peak else None
+        if peak and not fp8:
+            result["mfu_mixed_of_device_time"] = result["mfu_bf16_of_device_time"]
+        elif peak and fp8_peak and fp8 <= model_flops:
+            share = ((model_flops - fp8) / (peak * 1e9) + fp8 / (fp8_peak * 1e9)) / seconds
+            result["mfu_mixed_of_device_time"] = round(share, 4)
+        else:
+            result["mfu_mixed_of_device_time"] = None
     return result
+
+
+def gemm_precision(row: dict, known: HloInstruction | None) -> str:
+    """'fp8' for a GEMM that multiplies FP8 operands (cuBLASLt's f8 matmul, or f8 operand types in
+    its expression), else 'bf16': the peak its FLOPs count against."""
+    target = known.target if known is not None else ""
+    expression = str(row.get("hlo_op_expression") or "")
+    return "fp8" if "$f8" in target or re.search(r"\bf8e[45]m", expression) else "bf16"
 
 
 # ---- memory, from XLA's dump ------------------------------------------------------------------
 
 
-def dump_files(hlo: Path, module: str) -> dict[str, str]:
+@contextlib.contextmanager
+def dump_files(hlo: Path, module: str) -> Iterator[dict]:
     """The newest `module`'s after-optimizations HLO, live-range, buffer-assignment and
-    memory-usage-report texts, by suffix (the HLO's is `.txt`)."""
+    memory-usage-report files, by suffix (the HLO's is `.txt`), as paths read a line at a
+    time (`lines`): from a .tgz only those four are extracted, to a directory that lasts
+    the context. A dump holds every compile of the step, each tens of megabytes."""
     suffixes = (".txt", "-live-range.txt", "-buffer-assignment.txt", "-memory-usage-report.txt")
-    texts: dict[str, dict[str, str]] = defaultdict(dict)
+    pattern = re.compile(rf"module_(\d+)\.{re.escape(module)}\..*after_optimizations((?:-[a-z-]+)?\.txt)$")
 
-    def take(name: str, read) -> None:
-        base = name.rsplit("/", 1)[-1]
-        match = re.match(rf"module_(\d+)\.{re.escape(module)}\..*after_optimizations((?:-[a-z-]+)?\.txt)$",
-                         base)
-        if match and match.group(2) in suffixes:
-            texts[match.group(1)][match.group(2)] = read()
+    def wanted(name: str) -> tuple[int, str] | None:
+        match = pattern.match(name.rsplit("/", 1)[-1])
+        return (int(match.group(1)), match.group(2)) if match and match.group(2) in suffixes else None
 
-    if hlo.is_file():
-        with tarfile.open(hlo) as archive:
-            for member in archive.getmembers():
-                if member.isfile():
-                    take(member.name, lambda member=member: io.TextIOWrapper(
-                        archive.extractfile(member), errors="replace").read())
-    else:
-        for path in hlo.rglob(f"module_*.{module}.*after_optimizations*.txt"):
-            take(str(path), lambda path=path: path.read_text(errors="replace"))
-    if not texts:
-        raise SystemExit(f"no {module} after-optimizations dumps under {hlo}")
-    newest = max(texts, key=int)
-    return {"module_number": newest, **texts[newest]}
+    with contextlib.ExitStack() as stack:
+        if hlo.is_file():
+            archive = stack.enter_context(tarfile.open(hlo))
+            found = [(key, member) for member in archive.getmembers()
+                     if member.isfile() and (key := wanted(member.name))]
+        else:
+            found = [(key, path) for path in hlo.rglob(f"module_*.{module}.*after_optimizations*.txt")
+                     if (key := wanted(str(path)))]
+        if not found:
+            raise SystemExit(f"no {module} after-optimizations dumps under {hlo}")
+        newest = max(number for (number, _), _ in found)
+        directory = Path(stack.enter_context(tempfile.TemporaryDirectory()))
+        files: dict = {"module_number": str(newest)}
+        for (number, suffix), source in found:
+            if number != newest:
+                continue
+            if isinstance(source, Path):
+                files[suffix] = source
+                continue
+            target = directory / f"module{suffix}"
+            with archive.extractfile(source) as reader, target.open("wb") as writer:
+                shutil.copyfileobj(reader, writer)
+            files[suffix] = target
+        yield files
 
 
-def peak_breakdown(text: str) -> tuple[int, list[tuple[str, int]]]:
+def lines(path: Path | None) -> Iterator[str]:
+    """`path`'s lines without their newlines, read as they stream; none for no path."""
+    if path is None:
+        return
+    with path.open(errors="replace") as stream:
+        for line in stream:
+            yield line.rstrip("\n")
+
+
+def peak_breakdown(text: str | Iterable[str]) -> tuple[int, list[tuple[str, int]]]:
     """The live-range dump's peak bytes and its "Stack trace breakdown for peak usage" as
     (label, bytes the node itself holds): an op's op_name path, or an argument's tree path
     (`p/params/in_proj_qkv/kernel`)."""
-    _, _, tree = text.partition("Stack trace breakdown for peak usage:")
-    if not tree:
-        return 0, []
-    first, _, rest = tree.partition("\n")
-    peak = int(re.sub(r"\D", "", first))
-    leaves, stack = [], []
-    for line in rest.splitlines():
+    marker = "Stack trace breakdown for peak usage:"
+    peak, leaves, stack, inside = 0, [], [], False
+    for line in text.splitlines() if isinstance(text, str) else text:
+        if not inside:
+            if marker in line:
+                inside, peak = True, int(re.sub(r"\D", "", line.partition(marker)[2]) or 0)
+            continue
         match = re.match(r"^([\s│├└─]*)(.+?) \(\d+\.\d+%, total: [\d ]+ bytes, current: ([\d ]+) bytes", line)
         if not match:
             if line.strip() and not line.startswith(" "):
@@ -306,28 +380,34 @@ def role_of(label: str) -> str:
     return "other ops"
 
 
-def allocations(text: str) -> dict[str, int]:
+def allocations(text: str | Iterable[str]) -> dict[str, int]:
     kinds: dict[str, int] = defaultdict(int)
-    for size, attributes in re.findall(r"^allocation \d+: size (\d+), (.*)$", text, re.M):
+    for line in text.splitlines() if isinstance(text, str) else text:
+        match = re.match(r"^allocation \d+: size (\d+), (.*)$", line)
+        if match is None:
+            continue
         kind = next((name for name in ("preallocated-temp", "parameter", "constant", "thread-local",
-                                       "maybe-live-out") if name in attributes), "other")
-        kinds[kind] += int(size)
+                                       "maybe-live-out") if name in match.group(2)), "other")
+        kinds[kind] += int(match.group(1))
     return dict(kinds)
 
 
-def attribute_memory(files: dict[str, str]) -> dict:
-    peak, leaves = peak_breakdown(files.get("-live-range.txt", ""))
+def attribute_memory(files: dict) -> dict:
+    """The peak's bytes by role and part, from `dump_files`'s files, each read as it streams."""
+    peak, leaves = peak_breakdown(lines(files.get("-live-range.txt")))
     groups: dict = defaultdict(int)
     for label, size in leaves:
         groups[(role_of(label), part_of(label))] += size
-    total = re.search(r"Total bytes: (\d+)", files.get("-memory-usage-report.txt", ""))
+    total = next(filter(None, (re.search(r"Total bytes: (\d+)", line)
+                               for line in lines(files.get("-memory-usage-report.txt")))), None)
+    held = allocations(lines(files.get("-buffer-assignment.txt")))
     gib = 1 << 30
     return {
         "module_number": files["module_number"],
         "peak_gib": round(peak / gib, 3),
         "total_bytes_gib": round(int(total.group(1)) / gib, 3) if total else None,
         "allocations_gib": {kind: round(size / gib, 3)
-                            for kind, size in allocations(files.get("-buffer-assignment.txt", "")).items()},
+                            for kind, size in held.items()},
         "peak_by_role_and_part_gib": [
             {"role": role, "part": part, "gib": round(size / gib, 3),
              "share": round(size / peak, 4) if peak else None}
@@ -346,24 +426,29 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--steps", type=int, default=1)
     parser.add_argument("--entry", type=Path, help="entry.json carrying model_flops_per_step")
     parser.add_argument("--module", default="jit_step")
+    parser.add_argument("--device", help="the device kind, where --entry does not name it")
     args = parser.parse_args(argv)
-    flops = None
+    flops, device = None, args.device
     if args.entry and args.entry.exists():
-        flops = json.loads(args.entry.read_text()).get("model_flops_per_step")
+        entry = json.loads(args.entry.read_text())
+        flops, device = entry.get("model_flops_per_step"), device or entry.get("device")
     result = {}
-    files = dump_files(args.hlo, args.module) if args.hlo else {}
-    if args.trace:
-        result["time"] = attribute_time(args.trace, args.steps, flops,
-                                        hlo_instructions(files[".txt"]) if ".txt" in files else None)
-    if files:
-        result["memory"] = attribute_memory(files)
+    with dump_files(args.hlo, args.module) if args.hlo else contextlib.nullcontext({}) as files:
+        if args.trace:
+            ops = hlo_instructions(lines(files[".txt"])) if ".txt" in files else None
+            result["time"] = attribute_time(args.trace, args.steps, flops, ops, device)
+            result["time"]["hlo_module"] = files.get("module_number")
+        if files:
+            result["memory"] = attribute_memory(files)
+    result["peak_rss_gib"] = round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 2**20, 3)
     args.out.write_text(json.dumps(result, indent=1))
     time = result.get("time", {})
     if "by_part_ms" in time:
         print(f"time: {time['device_ms_per_step']} ms device a step, "
               f"{time['device_idle_ms_per_step']} ms idle, "
               f"GEMMs at {time['gemm_fraction_of_peak']} of peak, {time['gemm_lost_ms']} ms lost to it, "
-              f"MFU of device time {time.get('mfu_of_device_time')}")
+              f"MFU of device time: bf16 {time.get('mfu_bf16_of_device_time')}, "
+              f"mixed {time.get('mfu_mixed_of_device_time')}")
         for part, directions in time["by_part_ms"].items():
             print(f"  {part:10s} " + "  ".join(f"{d} {ms:.2f}" for d, ms in directions.items()))
         print("  kinds: " + ", ".join(f"{k} {ms:.2f}" for k, ms in time["by_kind_ms"].items()))

@@ -27,6 +27,7 @@ import numpy as np
 
 from dew.artifacts import (
     Artifact,
+    Decisions,
     ImageGrid,
     Representations,
     TextSamples,
@@ -34,7 +35,6 @@ from dew.artifacts import (
     VideoGrid,
     uint8_pixels,
 )
-from dew.pool import PREEMPTED_EXIT
 from dew.telemetry.records import RECORD_TYPES, FitEnded, Record, RunRecord, json_value
 
 if TYPE_CHECKING:
@@ -96,6 +96,26 @@ def _gif(clip: np.ndarray) -> bytes:
     return buffer.getvalue()
 
 
+DECISION_ROWS = 256
+"""The most scored questions a tracker shows of one `Decisions` preview."""
+
+
+def _decided(value: Decisions) -> list[list[float | int]]:
+    """A decision preview as rows of [row, question, label, predicted, probability of the label], for the
+    questions with a known answer and real options, the first `DECISION_ROWS` of them."""
+    probabilities, labels = _home(value.probabilities), _home(value.labels)
+    asked = _home(value.scored) & np.any(_home(value.options), axis=-1)
+    predicted = np.argmax(probabilities, axis=-1)
+    return [[int(row), int(question), int(labels[row, question]), int(predicted[row, question]),
+             float(probabilities[row, question, labels[row, question]])]
+            for row, question in np.argwhere(asked)[:DECISION_ROWS]]
+
+
+def _counted_losses(value: TokenScores) -> np.ndarray:
+    """The per-token losses of the targets that count."""
+    return _home(value.losses)[_home(value.weights) > 0].astype(np.float64)
+
+
 def _spread(value: Representations) -> np.ndarray:
     """The per-dimension spread of a batch of representations.
 
@@ -151,6 +171,24 @@ def _(value: Representations) -> Payload:
     import wandb
 
     return {"val/representation_std": wandb.Histogram(_spread(value).tolist())}
+
+
+@render.register
+def _(value: TokenScores) -> Payload:
+    import wandb
+
+    losses = _counted_losses(value)
+    return {"val/token_losses": wandb.Histogram(losses.tolist())} if losses.size else {}
+
+
+@render.register
+def _(value: Decisions) -> Payload:
+    import wandb
+
+    table = wandb.Table(columns=["row", "question", "label", "predicted", "p_label"])
+    for row in _decided(value):
+        table.add_data(*row)
+    return {"val/decisions": table}
 
 
 class _OwnedTracker:
@@ -220,7 +258,7 @@ class WandbTracker(_OwnedTracker):
                 if value.status == "preempted":
                     # W&B keeps a preempting run resumable under its id.
                     self.run.mark_preempting()
-                self._exit_code = {"completed": 0, "preempted": PREEMPTED_EXIT}.get(value.status, 1)
+                self._exit_code = value.exit_code
             return
         self.run.log({**self.render(value), "train/step": step})
 
@@ -234,8 +272,8 @@ class WandbTracker(_OwnedTracker):
 
     def __exit__(self, exc_type, exc, tb) -> None:
         # A fit that ended preempted raises Preempted, and keeps its code.
-        if exc is not None and self._exit_code == 0:
-            self._exit_code = 1
+        if self._exit_code == 0:
+            self._exit_code = FitEnded.outcome(0., exc).exit_code
         super().__exit__(exc_type, exc, tb)
 
 
@@ -394,6 +432,14 @@ def _(value: TokenScores, prefix: Path) -> list[Path]:
     return [path]
 
 
+@_write_preview.register
+def _(value: Decisions, prefix: Path) -> list[Path]:
+    path = prefix.with_suffix('.npz')
+    np.savez(path, probabilities=_home(value.probabilities), options=_home(value.options),
+             labels=_home(value.labels), ordinal=_home(value.ordinal), scored=_home(value.scored))
+    return [path]
+
+
 class MLflowTracker(_OwnedTracker):
     """An MLflow run in `experiment`, opened on the first value logged into it.
 
@@ -441,7 +487,7 @@ class MLflowTracker(_OwnedTracker):
             client.log_dict(run, {'step': step, 'value': json_value(value)},
                             f'records/{type(value).__name__}-{step}.json')
             if isinstance(value, FitEnded):
-                self._status = {'completed': 'FINISHED', 'preempted': 'KILLED'}.get(value.status, 'FAILED')
+                self._status = value.terminal_status
             return
         with tempfile.TemporaryDirectory() as directory:
             for path in _write_preview(value, Path(directory) / f'preview-{step}'):
@@ -458,8 +504,8 @@ class MLflowTracker(_OwnedTracker):
 
     def __exit__(self, exc_type, exc, tb) -> None:
         # A fit that ended preempted raises Preempted, and keeps its status.
-        if exc is not None and self._status == 'FINISHED':
-            self._status = 'FAILED'
+        if self._status == 'FINISHED':
+            self._status = FitEnded.outcome(0., exc).terminal_status
         super().__exit__(exc_type, exc, tb)
 
 
@@ -586,16 +632,38 @@ def _(value: TextSamples):
         {'prompt': value.prompt, 'texts': list(texts)}))])
 
 
-@_summarize.register
-def _(value: Representations):
+def _histogram(tag: str, values: np.ndarray):
+    """A histogram-plugin summary value of `values`, in 30 buckets."""
     from tensorboard.compat.proto.summary_pb2 import HistogramProto, Summary
 
-    spread = _spread(value).astype(np.float64)
-    counts, edges = np.histogram(spread, bins=30)
-    return Summary(value=[Summary.Value(tag='val/representation_std', histo=HistogramProto(
-        min=spread.min(), max=spread.max(), num=spread.size, sum=spread.sum(),
-        sum_squares=(spread ** 2).sum(), bucket_limit=edges[1:].tolist(),
-        bucket=counts.tolist()))])
+    counts, edges = np.histogram(values, bins=30)
+    return Summary.Value(tag=tag, histo=HistogramProto(
+        min=values.min(), max=values.max(), num=values.size, sum=values.sum(),
+        sum_squares=(values ** 2).sum(), bucket_limit=edges[1:].tolist(), bucket=counts.tolist()))
+
+
+@_summarize.register
+def _(value: Representations):
+    from tensorboard.compat.proto.summary_pb2 import Summary
+
+    return Summary(value=[_histogram('val/representation_std', _spread(value).astype(np.float64))])
+
+
+@_summarize.register
+def _(value: TokenScores):
+    from tensorboard.compat.proto.summary_pb2 import Summary
+
+    losses = _counted_losses(value)
+    return Summary(value=[_histogram('val/token_losses', losses)] if losses.size else [])
+
+
+@_summarize.register
+def _(value: Decisions):
+    from tensorboard.compat.proto.summary_pb2 import Summary
+
+    rows = _decided(value)
+    return Summary(value=[_text('val/decisions', json.dumps(
+        {'columns': ['row', 'question', 'label', 'predicted', 'p_label'], 'rows': rows}))])
 
 
 class Trackers(_OwnedTracker):

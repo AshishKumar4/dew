@@ -205,20 +205,21 @@ def test_the_causal_conv_matches_f_conv1d(reference):
     short mixer (modeling_qwen3_next.py:345-365): position s reads s-K+1..s.
     Largest observed difference 2.4e-07."""
     taps = jnp.asarray(reference["conv.weight"][:, 0, :])
-    out = causal_conv1d(jnp.asarray(reference["conv.input"]), taps)
+    # The reference's tensors are channel-major, [B, D, S]; Dew's time-major.
+    out = causal_conv1d(jnp.swapaxes(jnp.asarray(reference["conv.input"]), 1, 2), taps)
 
-    assert largest(out, reference["conv.output"]) < 1e-5
+    assert largest(jnp.swapaxes(out, 1, 2), reference["conv.output"]) < 1e-5
 
 
 def test_the_conv_reads_no_future_column(reference):
     """Causality of the short mixer, stated as a property: changing the last
     column moves nothing before it."""
-    x = jnp.asarray(reference["conv.input"])
+    x = jnp.swapaxes(jnp.asarray(reference["conv.input"]), 1, 2)
     taps = jnp.asarray(reference["conv.weight"][:, 0, :])
-    moved = x.at[:, :, -1].set(x[:, :, -1] + 3.0)
+    moved = x.at[:, -1].set(x[:, -1] + 3.0)
 
-    assert jnp.array_equal(causal_conv1d(x, taps)[..., :-1], causal_conv1d(moved, taps)[..., :-1])
-    assert not jnp.allclose(causal_conv1d(x, taps)[..., -1], causal_conv1d(moved, taps)[..., -1])
+    assert jnp.array_equal(causal_conv1d(x, taps)[:, :-1], causal_conv1d(moved, taps)[:, :-1])
+    assert not jnp.allclose(causal_conv1d(x, taps)[:, -1], causal_conv1d(moved, taps)[:, -1])
 
 
 def layer_params(reference):
@@ -355,20 +356,20 @@ def scan_masked_conv1d(x, kernel, valid, state=None):
     One window per physical slot, the history advancing only on a real
     token. It stays here as the reference the compacted form reproduces.
     """
-    batch, channels, _ = x.shape
+    batch, _, channels = x.shape
     width = kernel.shape[1] - 1
     if state is None:
-        state = jnp.zeros((batch, channels, width), x.dtype)
+        state = jnp.zeros((batch, width, channels), x.dtype)
 
     def step(history, inputs):
         token, active = inputs
-        window = jnp.concatenate([history, token[:, :, None]], axis=-1)
-        output = nn.silu(jnp.sum(window * kernel[None, :, :], axis=-1))
-        history = jnp.where(active[:, None, None], window[:, :, 1:], history)
+        window = jnp.concatenate([history, token[:, None, :]], axis=1)
+        output = nn.silu(jnp.sum(window * kernel.T[None], axis=1))
+        history = jnp.where(active[:, None, None], window[:, 1:], history)
         return history, jnp.where(active[:, None], output, 0.0)
 
-    state, output = jax.lax.scan(step, state, (jnp.moveaxis(x, 2, 0), valid.T))
-    return jnp.moveaxis(output, 0, 2), state
+    state, output = jax.lax.scan(step, state, (jnp.moveaxis(x, 1, 0), valid.T))
+    return jnp.moveaxis(output, 0, 1), state
 
 
 def masked_operands(rows, kernel_width, *, channels=3, history=True, seed=0):
@@ -376,11 +377,11 @@ def masked_operands(rows, kernel_width, *, channels=3, history=True, seed=0):
     valid = np.asarray(rows, bool)
     batch, length = valid.shape
     keys = jax.random.split(jax.random.key(seed), 4)
-    x = jax.random.normal(keys[0], (batch, channels, length), jnp.float32)
+    x = jax.random.normal(keys[0], (batch, length, channels), jnp.float32)
     kernel = jax.random.normal(keys[1], (channels, kernel_width), jnp.float32)
-    state = (jax.random.normal(keys[2], (batch, channels, kernel_width - 1), jnp.float32)
+    state = (jax.random.normal(keys[2], (batch, kernel_width - 1, channels), jnp.float32)
              if history else None)
-    cotangent = jax.random.normal(keys[3], (batch, channels, length), jnp.float32)
+    cotangent = jax.random.normal(keys[3], (batch, length, channels), jnp.float32)
     return x, kernel, state, jnp.asarray(valid), cotangent
 
 
@@ -441,11 +442,11 @@ def test_the_masked_conv_reads_across_a_gap():
 
     for row in range(x.shape[0]):
         kept = np.flatnonzero(np.asarray(valid[row]))
-        compacted = causal_conv1d(x[row:row + 1, :, kept], kernel)
-        assert largest(out[row:row + 1, :, kept], compacted) < 1e-5
+        compacted = causal_conv1d(x[row:row + 1, kept], kernel)
+        assert largest(out[row:row + 1, kept], compacted) < 1e-5
 
-    physical = jnp.where(valid[:, None, :], causal_conv1d(
-        jnp.where(valid[:, None, :], x, 0), kernel), 0)
+    physical = jnp.where(valid[:, :, None], causal_conv1d(
+        jnp.where(valid[:, :, None], x, 0), kernel), 0)
     assert largest(physical, out) > 1.0
 
 
@@ -459,8 +460,8 @@ def test_a_padded_slot_carries_no_output_and_no_gradient(case):
     grad = jax.grad(lambda value: jnp.sum(
         _masked_conv1d(value, kernel, valid, state)[0] * cotangent))(x)
 
-    assert jnp.array_equal(jnp.where(valid[:, None, :], 0.0, out), jnp.zeros_like(out))
-    assert jnp.array_equal(jnp.where(valid[:, None, :], 0.0, grad), jnp.zeros_like(grad))
+    assert jnp.array_equal(jnp.where(valid[:, :, None], 0.0, out), jnp.zeros_like(out))
+    assert jnp.array_equal(jnp.where(valid[:, :, None], 0.0, grad), jnp.zeros_like(grad))
     paused = ~jnp.any(valid, axis=1)
     assert state is not None
     assert jnp.array_equal(carried[paused], state[paused])
@@ -475,10 +476,10 @@ def test_the_masked_conv_splits_at_a_call_boundary():
     whole, carried = _masked_conv1d(x, kernel, valid, state)
 
     cut = 6
-    head, history = _masked_conv1d(x[:, :, :cut], kernel, valid[:, :cut], state)
-    tail, final = _masked_conv1d(x[:, :, cut:], kernel, valid[:, cut:], history)
+    head, history = _masked_conv1d(x[:, :cut], kernel, valid[:, :cut], state)
+    tail, final = _masked_conv1d(x[:, cut:], kernel, valid[:, cut:], history)
 
-    assert largest(jnp.concatenate([head, tail], axis=2), whole) < 1e-5
+    assert largest(jnp.concatenate([head, tail], axis=1), whole) < 1e-5
     assert largest(final, carried) < 1e-5
 
 

@@ -15,16 +15,18 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
+from flax.traverse_util import flatten_dict
 from jax.extend import core as jaxpr_core
 from recording import RecordingTracker
 
 from dew.data.text import ByteTokenizer
-from dew.decision.head import DecisionHead, JointSchemaHead
+from dew.decision.head import DecisionHead, Head, JointSchemaHead
 from dew.decision.layout import DecisionInputs, Specials, StateFirstLayout
 from dew.decision.objective import DecisionObjective
 from dew.diffusion import presets
 from dew.inputs import Field, InputSpec
 from dew.interop.hf_decoders import translate_config
+from dew.lora import LoRA
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import GatedMLP, RematPolicy
 from dew.nn.backbones.decoder_stack import Loop
@@ -50,7 +52,7 @@ from dew.nn.mixers.mamba import Mamba, selective_scan
 from dew.nn.mixers.mamba2 import Mamba2, recurrent_ssd
 from dew.nn.mla import MultiHeadLatentAttention
 from dew.nn.moe import SparseMLP
-from dew.nn.protocols import Counted, CountedLogits
+from dew.nn.protocols import Counted, CountedDecisions, CountedLogits, CountedTraining
 from dew.nn.ssm import BidirectionalS5Layer, S5Layer, _scanned_directions
 from dew.objectives.diffusion import DiffusionObjective
 from dew.objectives.lm import LMObjective
@@ -58,8 +60,8 @@ from dew.objectives.rl.preference import DPOObjective
 from dew.telemetry.instrumentation import StepFlops
 from dew.training import MeshSpec
 from dew.training.distributed import DevicePrefetchIterator
+from dew.training.interval import Interval
 from dew.training.model_flops import FORWARD_FLOPS, TOKENS, TRAINING_FLOPS, prepare_counts, step_counts
-from dew.training.trainer import _Interval
 
 LENGTHS = np.asarray([2, 5], np.int64)
 
@@ -228,8 +230,9 @@ def test_decision_head_charges_options_and_evidence_not_a_vocabulary():
     scorer = (8 * 16 * 16 + 2 * 16 + 6 * 16 + 2 * 8) * 8
     pooling = 2 * 8 * (2 * (1 + 2 * 2) + 5 * (2 + 2 * 6))
     assert clef.decision_flops(LENGTHS, questions, options) == projected + evidence + scorer + pooling
-    with pytest.raises(MissingFlopsCount, match=r"JointSchemaHead.*decision_flops"):
-        clef.model_flops(LENGTHS)
+    assert isinstance(clef, CountedDecisions) and not isinstance(clef, Counted)
+    with pytest.raises(MissingFlopsCount, match=r"JointSchemaHead.*model_flops"):
+        counted_flops(clef, LENGTHS)
 
 
 def test_missing_family_is_named_instead_of_falling_back_to_hlo():
@@ -265,6 +268,71 @@ def test_decision_objective_supplies_the_layout_geometry_to_the_head():
     assert objective.model_flops(objective.model, batch) == wanted
 
 
+def test_uncounted_decision_head_refuses_a_direct_count():
+    objective = DecisionObjective(decoder(), head=Head(), tokenizer=ByteTokenizer(),
+                                  specials=Specials(begin=None, separator=10, marker=0,
+                                                    marker_text="\x00", pad=255),
+                                  layout=StateFirstLayout(max_len=16))
+    assert not isinstance(objective.model.head, CountedDecisions)
+    batch = {"valid": np.ones((2, 8), bool)}
+    for count in (objective.model_flops, objective.training_flops):
+        with pytest.raises(MissingFlopsCount, match=r"Head.*decision_flops"):
+            count(None, batch)
+
+
+def test_adapted_decision_backbone_counts_training_work_without_claiming_an_lm_head():
+    class Trunk(nn.Module):
+        @nn.compact
+        def hidden_states(self, tokens, *, train=False, **fields):
+            return nn.Dense(8, use_bias=False)(nn.Embed(16, 8)(tokens))
+
+        def __call__(self, tokens, *, train=False):
+            return self.hidden_states(tokens, train=train)
+
+        @nn.nowrap
+        def model_flops(self, lengths):
+            return projection_flops(lengths, 8, 8)
+
+        @nn.nowrap
+        def parameter_flops(self, lengths):
+            return self.model_flops(lengths)
+
+        @nn.nowrap
+        def matrix_usage(self, path, lengths, *, logits=False):
+            return np.zeros_like(lengths) if logits else lengths
+
+    model = Trunk()
+    variables = model.init(jax.random.key(0), jnp.ones((2, 8), jnp.int32))
+    adapter = LoRA(1, ("Dense_0",)).apply(model, variables, key=1)
+    assert isinstance(adapter.model, CountedTraining)
+    assert not isinstance(adapter.model, CountedLogits)
+    head = DecisionHead(8, layers=0)
+    objective = DecisionObjective(adapter, head=head, tokenizer=ByteTokenizer(),
+                                  specials=Specials(begin=None, separator=10, marker=0,
+                                                    marker_text="\x00", pad=255),
+                                  layout=StateFirstLayout(max_len=8))
+    batch = {"valid": np.arange(8)[None, :] < LENGTHS[:, None],
+             "questions": np.ones((2, 1), bool), "options": np.ones((2, 1, 2), bool)}
+    frozen = 4 * 8 * 8 * np.sum(LENGTHS)
+    factors = 6 * (8 + 8) * np.sum(LENGTHS)
+    head_work = head.decision_flops(LENGTHS, np.ones(2, np.int64), np.full(2, 2, np.int64))
+    assert objective.training_flops(None, batch) == frozen + factors + 3 * head_work
+
+
+def test_diffusion_uncertainty_weighting_refuses_its_uncounted_head():
+    model = SimpleDiT(emb_features=8, num_layers=1, num_heads=2, patch_size=2)
+    objective = DiffusionObjective(model, presets.Flow(), inputs=InputSpec(sample=Field("images", (4, 4, 3))),
+                                   autoencoder=None, uncertainty=8, ema_decay=None)
+    with pytest.raises(MissingFlopsCount, match="uncertainty work"):
+        objective.training_flops(None, {"images": np.zeros((2, 4, 4, 3), np.float32)})
+
+
+def test_lm_trained_prediction_depths_refuse_their_uncounted_geometry():
+    objective = LMObjective(decoder(num_nextn_predict_layers=1), seq_len=6, mtp_weight=1.0)
+    with pytest.raises(MissingFlopsCount, match="prediction-depth geometry"):
+        objective.training_flops(None, packed_batch())
+
+
 @pytest.mark.mesh(devices=2)
 def test_prefetch_counts_on_worker_then_step_reduces_global_rows():
     objective = LMObjective(decoder(), seq_len=6, pad_id=0)
@@ -285,18 +353,18 @@ def test_prefetch_counts_on_worker_then_step_reduces_global_rows():
 
 
 def test_interval_accumulates_work_with_its_loss_and_resets_only_at_logs():
-    interval = _Interval(last_log_time=0, last_saved=None)
+    interval = Interval(last_log_time=0, last_saved=None)
     loss = jnp.asarray(1.0)
     for forward, tokens in ((100, 4), (200, 3)):
         interval.count({"rows": np.ones((2, 1))}, StepFlops(10, 20), loss,
-                        jnp.asarray(a=True), {FORWARD_FLOPS: jnp.asarray(forward),
-                                             TRAINING_FLOPS: jnp.asarray(3 * forward),
-                                             TOKENS: jnp.asarray(tokens)})
-    np.testing.assert_array_equal(np.asarray(interval.book[3:]), [900, 7])
+                        jnp.asarray(a=True), None, {FORWARD_FLOPS: jnp.asarray(forward),
+                                                   TRAINING_FLOPS: jnp.asarray(3 * forward),
+                                                   TOKENS: jnp.asarray(tokens)})
+    np.testing.assert_array_equal(np.asarray([interval.book.training, interval.book.tokens]), [900, 7])
     interval.saved(2)
-    np.testing.assert_array_equal(np.asarray(interval.book[3:]), [900, 7])
+    np.testing.assert_array_equal(np.asarray([interval.book.training, interval.book.tokens]), [900, 7])
     interval.logged(3.0)
-    np.testing.assert_array_equal(np.asarray(interval.book[3:]), [0, 0])
+    np.testing.assert_array_equal(np.asarray([interval.book.training, interval.book.tokens]), [0, 0])
     assert not interval.model_counted and not interval.tokens_counted
 
 
@@ -383,7 +451,8 @@ def producer(producers, variable):
 
 
 def convolution_tap(equation, producers):
-    """The explicit depthwise conv's [D,K] column times a shifted [B,D,T].
+    """The explicit depthwise conv's [D,K] column times a window of the
+    activations shifted along time, [B,T,D] (the time-major layout) or [B,D,T].
 
     Dew avoids conv_general_dilated for this op; the two slices still expose
     its tap geometry independently of the model's declared kernel size.
@@ -395,13 +464,15 @@ def convolution_tap(equation, producers):
         if isinstance(variable, jaxpr_core.Literal):
             continue
         source = producer(producers, variable)
-        while source is not None and source.primitive.name in ("broadcast_in_dim", "convert_element_type"):
+        while source is not None and source.primitive.name in (
+                "broadcast_in_dim", "convert_element_type", "squeeze", "reshape"):
             source = producer(producers, source.invars[0])
         if source is not None and source.primitive.name == "slice":
             original, selected = source.invars[0].aval.shape, source.outvars[0].aval.shape
             if len(original) == 2 and original[1] > 1 and selected == (original[0], 1):
                 tapped = True
-            if len(original) == 3 and original[:2] == selected[:2] and original[-1] > selected[-1]:
+            narrowed = [axis for axis in range(len(original)) if original[axis] != selected[axis]]
+            if len(original) == 3 and len(narrowed) == 1 and narrowed[0] in (1, 2):
                 shifted = True
     return tapped and shifted
 
@@ -508,14 +579,14 @@ def test_microbatches_two_sum_real_tokens_before_interval_throughput():
     from dew.training import Trainer
 
     objective = LMObjective(decoder(), seq_len=6, pad_id=0)
-    interval = _Interval(last_log_time=0, last_saved=None)
+    interval = Interval(last_log_time=0, last_saved=None)
     for inputs in (np.array([[1, 2, 3, 0, 0, 0, 0]], np.int32),
                    np.array([[1, 2, 3, 4, 5, 0, 0]], np.int32)):
         counted = prepare_counts(objective, {"text": inputs}, count_model=True)
         aux = step_counts(jax.tree.map(jnp.asarray, counted))
-        interval.count(counted, StepFlops(10, 20), jnp.asarray(1.0), jnp.asarray(a=True), aux)
+        interval.count(counted, StepFlops(10, 20), jnp.asarray(1.0), jnp.asarray(a=True), None, aux)
     trainer = Trainer(objective, optax.sgd(0.01), key=0, accumulation=2)
-    totals = np.asarray(interval.book[3:])
+    totals = np.asarray([interval.book.training, interval.book.tokens])
     assert totals[1] == 8
     metrics = trainer._throughput(2, 2, 2, interval.flops,
                                   training_flops=float(totals[0]), tokens=float(totals[1]))
@@ -605,17 +676,118 @@ def test_training_work_assembly_is_distinct_from_forward_model_count():
     assert objective.training_flops(None, batch) == 3 * objective.model_flops(None, batch)
 
 
-def test_qwen35_reference_uses_the_counted_real_token_backbone_convention():
+def test_qwen35_reference_uses_the_counted_real_token_backbone_convention(monkeypatch):
     """The reference workload has no vocabulary projection, only its backbone.
 
     Translate its committed released config without allocating any weights;
     8x3072 real rows and the same 6HDkDv recurrent convention must give the
-    number both device runners publish, rather than an independent literal.
+    work record both device runners publish.
     """
-    from tools.reference_runs.qwen35 import FLOPS_PER_STEP
+    from tool_support import REPO_ROOT, load
+
+    monkeypatch.syspath_prepend(str(REPO_ROOT / "tools" / "reference_runs"))
+    writer = load("reference_runs/work")
+    runner = load("reference_runs/dew_qwen35_step")
 
     path = Path(__file__).parent / "fixtures" / "hf" / "qwen35-0.8b" / "config.json"
     config = json.loads(path.read_text())
     model = translate_config(config["text_config"]).value
-    counted = int(3 * counted_flops(model, np.full((8,), 3072, np.int64)))
-    assert counted == FLOPS_PER_STEP, (counted, FLOPS_PER_STEP, counted - FLOPS_PER_STEP)
+    batch = {"tokens": np.zeros((8, 3072), np.int32)}
+    objective = runner.BackboneLoss(model, None, np.ones(model.emb_features, np.float32), 3072)
+    record = writer.measure(objective, batch)
+    assert record.training_flops_per_step == 3 * counted_flops(model, np.full((8,), 3072, np.int64))
+    assert record.training_flops_per_step == objective.training_flops(None, batch)
+    assert record.tokens_per_step == 8 * 3072
+
+
+def _kernels(variables) -> dict[tuple[str, ...], tuple[int, ...]]:
+    """Every Dense kernel's shape a module's init builds, by its path."""
+    return {path[:-1]: value.shape for path, value in flatten_dict(variables["params"]).items()
+            if path[-1] == "kernel"}
+
+
+@pytest.mark.parametrize("fused", [False, True])
+def test_delta_net_builds_exactly_the_projections_it_counts(fused):
+    model = GatedDeltaNet(32, 2, 4, 8, 8, fused_in_proj=fused)
+    variables = jax.eval_shape(model.init, jax.random.key(82), jnp.ones((1, 1, 32)))
+    assert _kernels(variables) == {(name,): shape for name, shape in model.projections().items()}
+
+
+@pytest.mark.parametrize("activation,packed", [("swiglu", False), ("swiglu", True), ("gelu", False)])
+def test_mlp_builds_its_projections_and_packs_its_group_from_them(activation, packed):
+    model = GatedMLP(48, 32, activation=activation, packed=packed)
+    variables = jax.eval_shape(model.init, jax.random.key(83), jnp.ones((1, 1, 32)))
+    declared = {(name,): shape for name, shape in model.projections().items()}
+    groups = model.apply(variables, method="projection_groups")
+    if activation == "gelu":
+        assert groups == ()
+    else:
+        (group,) = groups
+        assert group.widths == tuple(model.projections()[name][1] for name in group.members)
+        if packed:
+            del declared[("gate_proj",)], declared[("up_proj",)]
+            declared[(group.packed,)] = (32, sum(group.widths))
+    assert _kernels(variables) == declared
+
+
+@pytest.mark.parametrize("packed,k_eq_v,kv_shared,output_gate,value_dim", [
+    (False, False, False, False, 8), (True, False, False, True, 8), (False, False, False, False, 4),
+    (False, True, False, False, 8), (False, False, True, False, 8)])
+def test_attention_builds_only_the_projections_it_declares(packed, k_eq_v, kv_shared, output_gate, value_dim):
+    model = CausalSelfAttention(32, 4, 2, 8, 8, packed=packed, k_eq_v=k_eq_v, kv_shared=kv_shared,
+                                kv_store_key="provider", output_gate=output_gate, value_head_dim=value_dim,
+                                attention_impl="reference")
+    keys, values = jnp.ones((1, 1, 2, 8)), jnp.ones((1, 1, 2, value_dim))
+    store = {"provider": (keys, values, jnp.zeros((1, 1), jnp.int32))}
+    variables = jax.eval_shape(lambda: model.init(jax.random.key(84), jnp.ones((1, 1, 32)), kv_store=store))
+    declared = {(name,): shape for name, shape in model.projections().items()}
+    groups = model.apply(variables, method="projection_groups")
+    if kv_shared or k_eq_v:
+        assert groups == ()
+    else:
+        (group,) = groups
+        assert group.widths == (64 if output_gate else 32, 16, 2 * value_dim)
+        if packed:
+            for name in group.members:
+                del declared[(name,)]
+            declared[(group.packed,)] = (32, sum(group.widths))
+    assert _kernels(variables) == declared
+
+
+def test_packed_attention_refuses_a_layer_without_its_own_values():
+    model = CausalSelfAttention(32, 4, 2, 8, 8, packed=True, k_eq_v=True, attention_impl="reference")
+    with pytest.raises(ValueError, match="packed qkv_proj"):
+        jax.eval_shape(model.init, jax.random.key(85), jnp.ones((1, 1, 32)))
+
+
+@pytest.mark.parametrize("size,layers,mlp,linear,attention", [
+    ("0.8B", 24,
+     {"gate_proj": (1024, 3584), "up_proj": (1024, 3584), "down_proj": (3584, 1024)},
+     {"in_proj_qkv": (1024, 6144), "in_proj_z": (1024, 2048), "in_proj_b": (1024, 16),
+      "in_proj_a": (1024, 16), "out_proj": (2048, 1024)},
+     {"q_proj": (1024, 4096), "k_proj": (1024, 512), "v_proj": (1024, 512), "o_proj": (2048, 1024)}),
+    ("9B", 32,
+     {"gate_proj": (4096, 12288), "up_proj": (4096, 12288), "down_proj": (12288, 4096)},
+     {"in_proj_qkv": (4096, 8192), "in_proj_z": (4096, 4096), "in_proj_b": (4096, 32),
+      "in_proj_a": (4096, 32), "out_proj": (4096, 4096)},
+     {"q_proj": (4096, 8192), "k_proj": (4096, 1024), "v_proj": (4096, 1024), "o_proj": (4096, 4096)}),
+], ids=["qwen35-0.8b", "qwen35-9b"])
+def test_qwen35_layers_build_the_projections_the_frozen_base_was_measured_on(size, layers, mlp, linear,
+                                                                              attention):
+    """The FP8 frozen base's A/B at 316cce053 covered these layer projections
+    (`dense_matrices` there, its packed alternatives aside); built from the
+    one declaration they are unchanged, so that measurement still applies."""
+    path = Path(__file__).parent / "fixtures" / "hf" / "qwen35-0.8b" / "config.json"
+    config = json.loads(path.read_text())["text_config"]
+    if size == "9B":
+        config.update(hidden_size=4096, intermediate_size=12288, num_hidden_layers=32, num_attention_heads=16,
+                      num_key_value_heads=4, linear_num_value_heads=32, tie_word_embeddings=False,
+                      layer_types=["linear_attention"] * 3 + ["full_attention"] * 1)
+        config["layer_types"] *= 8
+    model = translate_config(config).value
+    variables = jax.eval_shape(model.init, jax.random.key(86), jnp.ones((1, 8), jnp.int32))
+    built = {path: shape for path, shape in _kernels(variables).items() if path[0].startswith("layers_")}
+    expected = {(f"layers_{index}", owner, name): shape for index in range(layers)
+                for owner, sites in (("mlp", mlp), ("self_attn", attention if index % 4 == 3 else linear))
+                for name, shape in sites.items()}
+    assert built == expected

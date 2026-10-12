@@ -41,6 +41,7 @@ from collections.abc import Mapping
 from typing import TYPE_CHECKING, Protocol, Self, runtime_checkable
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn, struct
 from flax.typing import PrecisionLike, VariableDict
@@ -55,9 +56,9 @@ if TYPE_CHECKING:
     from dew.nn.mla import MLAMixer
     from dew.records import JSON
 
-__all__ = ["AffineHead", "BlockDenoiser", "CacheCapacity", "Counted", "CountedImages", "CountedLogits",
-           "CountedMatrixUsage", "CountedParameters", "CountedTraining",
-           "DecoderTraining", "DenoisingModel",
+__all__ = ["AffineHead", "BlockDenoiser", "CacheCapacity", "Counted", "CountedDecisions", "CountedImages",
+           "CountedLogits", "CountedLogitsTraining", "CountedMatrixUsage", "CountedParameters",
+           "CountedTraining", "DecoderTraining", "DenoisingModel",
            "HiddenStates", "IntervalModel", "LayerScalars", "Logits", "LogitsFromHidden", "Looping",
            "ModelKwarg", "OutputTable", "ProjectionGroup", "Recomputing", "RematChoosing", "RequiresText",
            "Serving", "TimeScaled", "TokenModel", "TritonGemm"]
@@ -127,9 +128,14 @@ class CountedMatrixUsage(Protocol):
 
 @runtime_checkable
 class CountedTraining(Protocol):
-    """An adapted token model's training work, including its factors, not 3*forward."""
+    """An adapted backbone's training work, including its factors, not 3*forward."""
 
     def training_flops(self, lengths: np.ndarray) -> float: ...
+
+
+@runtime_checkable
+class CountedLogitsTraining(CountedTraining, Protocol):
+    """An adapted LM head's training work, separately from its backbone."""
 
     def logits_training_flops(self, lengths: np.ndarray) -> float: ...
 
@@ -158,6 +164,13 @@ class CountedImages(Protocol):
                     text_features: int | None = None) -> float: ...
 
     def image_lengths(self, sample_shape: tuple[int, ...], rows: int) -> np.ndarray: ...
+
+
+@runtime_checkable
+class CountedDecisions(Protocol):
+    """A decision head counts the layout's real questions and options with its rows."""
+
+    def decision_flops(self, lengths: np.ndarray, questions: np.ndarray, options: np.ndarray) -> float: ...
 
 
 @runtime_checkable
@@ -265,6 +278,18 @@ class ProjectionGroup:
     packed: str
     members: tuple[str, ...]
     widths: tuple[int, ...]
+
+    @classmethod
+    def of(cls, path: tuple[str, ...], packed: str, members: tuple[str, ...],
+           projections: Mapping[str, tuple[int, int]]) -> Self:
+        """The group of `members`, their widths read from the module's own
+        `projections()`, `{name: (inputs, outputs)}`, the geometry its setup builds."""
+        return cls(path, packed, members, tuple(projections[name][1] for name in members))
+
+    def split(self, out: jax.Array) -> tuple[jax.Array, ...]:
+        """The members' outputs from the packed projection's `out`, in member order."""
+        ends = np.cumsum(self.widths)[:-1]
+        return tuple(jnp.split(out, [int(end) for end in ends], axis=-1))
 
     def held(self, params: Mapping) -> bool:
         """Whether `params`, the parameters at `path`, hold the group packed or every member."""

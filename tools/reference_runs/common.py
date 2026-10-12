@@ -1,5 +1,4 @@
-"""What both sides of a reference run share: the record, the schedule and
-the FLOP count.
+"""What both sides of a reference run share: the records and the schedule.
 
 The torch generators run in a venv without Dew, the Dew generators in one
 without torch, so this module imports numpy and the standard library only,
@@ -33,16 +32,22 @@ EVIDENCE = Path(os.environ.get(
     "REFERENCE_RUNS_DIR", Path.home() / ".cache/dew/verification-evidence/reference-runs"))
 
 
-def _peaks():
-    """dew.telemetry.peaks, read by path: a reference run's venv need not hold Dew."""
-    path = Path(__file__).resolve().parents[2] / "src/dew/telemetry/peaks.py"
-    spec = importlib.util.spec_from_file_location("dew_telemetry_peaks", path)
+def _native(name: str, source: str):
+    """Read Dew's host-only records and target table without its backend import policy."""
+    path = Path(__file__).resolve().parents[2] / "src/dew" / source
+    spec = importlib.util.spec_from_file_location(name, path)
     module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
 
 
-peak_flops = _peaks().peak_flops
+gpu_target = _native("dew_gpu_targets", "nn/kernels/generation.py").gpu_target
+WorkloadWork = _native("dew_workload", "telemetry/workload.py").WorkloadWork
+
+
+def peak_flops(device_kind: str) -> float | None:
+    return gpu_target(device_kind).bf16_peak
 
 
 def register_plain_causal_sdpa() -> str:
@@ -84,56 +89,6 @@ def warmup_cosine(step: int, *, init: float, peak: float, warmup: int, decay_ste
     span = decay_steps - warmup
     progress = min(step - warmup, span) / span
     return end + (peak - end) * 0.5 * (1 + math.cos(math.pi * progress))
-
-
-def train_flops_per_token(config: Mapping, seq: int) -> float:
-    """Model FLOPs of one trained token, forward and backward, from an HF
-    config.json: 6 per multiply-add-pair of every matmul weight a token
-    passes through, plus the attention scores and values at 12 L H Q T (the
-    causal half is not taken off, as torchtitan and the PaLM appendix count).
-
-    A tied embedding counts once, as the head's matmul; the lookup is not a
-    matmul. A routed layer counts its router and `num_experts_per_tok`
-    experts, the work a token does, not the parameters it owns."""
-    kind = config["model_type"]
-    hidden, vocab, layers = config["hidden_size"], config["vocab_size"], config["num_hidden_layers"]
-    head = hidden * vocab
-    if kind == "mamba2":
-        inner = config["expand"] * hidden
-        heads, groups, state = config["num_heads"], config["n_groups"], config["state_size"]
-        in_proj = hidden * (2 * inner + 2 * groups * state + heads)
-        out_proj = inner * hidden
-        # The SSD recurrence's state update and readout: two multiply-adds
-        # per (channel, state) pair per token, counted like a matmul weight.
-        scan = 2 * inner * state
-        return 6.0 * (layers * (in_proj + out_proj + scan) + head)
-    heads, kv_heads = config["num_attention_heads"], config["num_key_value_heads"]
-    head_dim = config.get("head_dim") or hidden // heads
-    attention = hidden * head_dim * (2 * heads + 2 * kv_heads)
-    if kind in ("qwen3_moe", "mixtral"):
-        experts = config.get("num_experts") or config["num_local_experts"]
-        active = config["num_experts_per_tok"]
-        width = config.get("moe_intermediate_size") or config["intermediate_size"]
-        mlp = hidden * experts + active * 3 * hidden * width
-    else:
-        mlp = 3 * hidden * config["intermediate_size"]
-    matmul = layers * (attention + mlp) + head
-    return 6.0 * matmul + 12.0 * layers * heads * head_dim * seq
-
-
-def dit_train_flops_per_image(model: Mapping, height: int, width: int, channels: int = 3) -> float:
-    """Model FLOPs of one trained image through the SimpleDiT: 6 per
-    multiply-add of every per-token matmul (patch in and out, q/k/v/o, the
-    MLP) and of the attention scores and values over the image's patches.
-    The per-image conditioning path (time embedding, adaLN modulation) is
-    one row per image and is left out."""
-    patch, width_features = model["patch_size"], model["emb_features"]
-    tokens = (height // patch) * (width // patch)
-    per_token = model["num_layers"] * (
-        4 * width_features ** 2 + 2 * model["mlp_ratio"] * width_features ** 2
-        + 2 * tokens * width_features)
-    per_token += 2 * patch * patch * channels * width_features
-    return 6.0 * per_token * tokens
 
 
 def kernel_summary(kernels: Sequence[tuple[str, int, int, int]], steps: int) -> dict:

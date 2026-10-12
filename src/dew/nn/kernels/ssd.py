@@ -33,6 +33,8 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 from jax.typing import DTypeLike
 
+from . import generation
+
 _log = logging.getLogger(__name__)
 
 MIN_WIDTH = 8
@@ -101,7 +103,7 @@ def ssd_kernel_platform(chunk_size: int, head_dim: int, state_size: int, *,
 
     The choice is logged once per geometry.
     """
-    backend = jax.default_backend()
+    backend = generation.backend()
     platform = backend if ssd_kernel_runs(chunk_size, head_dim, state_size, backend,
                                           dtype=dtype) else None
     _announce(backend, chunk_size, head_dim, state_size, platform)

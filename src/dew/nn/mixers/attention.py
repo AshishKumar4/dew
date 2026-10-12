@@ -38,6 +38,7 @@ from dew.nn.attention import (
 from dew.nn.blocks import normal_kernel
 from dew.nn.flops import attention_flops, projection_flops
 from dew.nn.inputs import Admitted, AttentionMetadata
+from dew.nn.kernels.generation import backend
 from dew.nn.kv_cache import TABLE, Append, KVCache, KVStore, filled_slots, rotated, write_cache
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.precision import at_least_fp32, scaled
@@ -232,25 +233,25 @@ class CausalSelfAttention(nn.Module):
         dense = functools.partial(
             self.linear, use_bias=self.attention_bias, dtype=self.dtype, precision=self.precision,
             **normal_kernel(self.init_std))
-        # The gate doubles the query projection: the reference chunks its
-        # output in half, one half the query and the other the gate the
-        # branch multiplies by (modeling_qwen3_5.py:670-673, 701).
-        query_width = self.num_heads * self.head_dim * (2 if self.output_gate else 1)
+        projections = self.projections()
         if self._packed():
             # A Server packs its constant weights once, not on every decode
             # step. The ordinary parameter tree remains the training layout.
-            self.qkv_proj = dense(query_width + self.num_kv_heads * (self.head_dim + self.value_dim),
-                                  name='qkv_proj')
+            group = self._group()
+            if group is None:
+                raise ValueError("a packed qkv_proj holds the layer's own keys and values, which a "
+                                 "KV-sharing or keys-are-values layer does not project")
+            self.qkv_proj = dense(sum(group.widths), name=group.packed)
         else:
-            self.q_proj = dense(query_width, name='q_proj')
+            self.q_proj = dense(projections['q_proj'][1], name='q_proj')
         # A sharing layer reads another layer's keys and values, so it owns
         # no projections or key norm of its own, as the reference skips them
         # (modeling_gemma4.py, Gemma4TextAttention.__init__).
         if not self.kv_shared and not self._packed():
-            self.k_proj = dense(self.num_kv_heads * self.head_dim, name='k_proj')
+            self.k_proj = dense(projections['k_proj'][1], name='k_proj')
             if not self.k_eq_v:
-                self.v_proj = dense(self.num_kv_heads * self.value_dim, name='v_proj')
-        self.o_proj = dense(self.emb_features, name='o_proj', use_bias=(
+                self.v_proj = dense(projections['v_proj'][1], name='v_proj')
+        self.o_proj = dense(projections['o_proj'][1], name='o_proj', use_bias=(
             self.attention_bias if self.o_proj_bias is None else self.o_proj_bias),
             **normal_kernel(self.init_std if self.output_init_std is None else self.output_init_std))
         if self.qk_norm:
@@ -290,12 +291,8 @@ class CausalSelfAttention(nn.Module):
     @nn.nowrap
     def model_flops(self, lengths) -> float:
         """Query/output maps and unshared K/V maps, plus QK and AV."""
-        query = self.num_heads * self.head_dim * (2 if self.output_gate else 1)
-        kv = 0 if self.kv_shared else self.num_kv_heads * (
-            self.head_dim + (0 if self.k_eq_v else self.value_dim))
-        output = self.num_heads * self.value_dim
         window = self.sliding_window if self.causal or self.bidirectional_window else None
-        return (projection_flops(lengths, self.emb_features, query + kv + output)
+        return (sum(projection_flops(lengths, *shape) for shape in self.projections().values())
                 + attention_flops(lengths, self.num_heads, self.head_dim, self.value_dim, causal=self.causal,
                                   window=window, chunk=self.attention_chunk))
 
@@ -307,17 +304,37 @@ class CausalSelfAttention(nn.Module):
                                    causal=self.causal, window=window, chunk=self.attention_chunk)
         return self.model_flops(lengths) - products
 
-    def projection_groups(self) -> tuple[ProjectionGroup, ...]:
-        """Its query, key and value projections packed as `qkv_proj`
-        (`ProjectionSites`), which `setup` reads in their place, where it
-        projects keys and values of its own and its variables hold them."""
-        if self.kv_shared or self.k_eq_v:
-            return ()
+    @nn.nowrap
+    def projections(self) -> dict[str, tuple[int, int]]:
+        """The attention's maps as `{name: (inputs, outputs)}`, keys and
+        values absent where the layer shares them or the keys are the values:
+        what setup builds, the count reads and the packed group
+        (`_group`) concatenates."""
+        # The gate doubles the query projection: the reference chunks its
+        # output in half, one half the query and the other the gate the
+        # branch multiplies by (modeling_qwen3_5.py:670-673, 701).
         query = self.num_heads * self.head_dim * (2 if self.output_gate else 1)
-        group = ProjectionGroup(tuple(self.path), 'qkv_proj', ('q_proj', 'k_proj', 'v_proj'),
-                                (query, self.num_kv_heads * self.head_dim,
-                                 self.num_kv_heads * self.value_dim))
-        return (group,) if group.held(self.variables.get('params', {})) else ()
+        sites = {'q_proj': (self.emb_features, query),
+                 'o_proj': (self.num_heads * self.value_dim, self.emb_features)}
+        if not self.kv_shared:
+            sites['k_proj'] = (self.emb_features, self.num_kv_heads * self.head_dim)
+            if not self.k_eq_v:
+                sites['v_proj'] = (self.emb_features, self.num_kv_heads * self.value_dim)
+        return sites
+
+    def _group(self) -> ProjectionGroup | None:
+        """Its query, key and value projections of the layer's input, packed
+        as `qkv_proj`, where it projects keys and values of its own."""
+        if self.kv_shared or self.k_eq_v:
+            return None
+        return ProjectionGroup.of(tuple(self.path), 'qkv_proj', ('q_proj', 'k_proj', 'v_proj'),
+                                  self.projections())
+
+    def projection_groups(self) -> tuple[ProjectionGroup, ...]:
+        """Its group (`_group`) where its variables hold it (`ProjectionSites`),
+        which `setup` reads packed in the members' place."""
+        group = self._group()
+        return (group,) if group is not None and group.held(self.variables.get('params', {})) else ()
 
     def _rot_dim(self) -> int | None:
         """Head dims the rotary rotates, or None for all of them.
@@ -493,10 +510,9 @@ class CausalSelfAttention(nn.Module):
         # The projections and the kernel's output carry the names a remat
         # policy saves or offloads (decoder_block.RESIDUALS).
         projected_kv = None
-        if self._packed():
-            width = self.num_heads * self.head_dim * (2 if self.output_gate else 1)
-            projected, key, value = jnp.split(
-                self.qkv_proj(x), (width, width + self.num_kv_heads * self.head_dim), axis=-1)
+        group = self._group()
+        if group is not None and self._packed():
+            projected, key, value = group.split(self.qkv_proj(x))
             projected_kv = (key, value)
         else:
             projected = self.q_proj(x)
@@ -945,7 +961,7 @@ class CausalSelfAttention(nn.Module):
         take the gathered rows, which the attention core widens."""
         if self.value_dim != self.head_dim:
             return False
-        if jax.default_backend() != 'gpu':
+        if backend() != 'gpu':
             return self.attention_impl in ('auto', 'tpu')
         return (self.attention_impl in ('auto', 'cudnn')
                 and cudnn_runs(query, self.attn_logit_softcap)
