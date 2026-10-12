@@ -207,18 +207,15 @@ def test_the_run_length_is_steps_or_epochs():
     with pytest.raises(ValueError, match="set one"):
         TrainerConfig(steps=10, epochs=1)
 
-    class Streamed:
-        steps_per_epoch = None
+    streamed = Loader(train=lambda partition: iter(()), val=None, records=None, batch=4)
+    sized = Loader(train=lambda partition: iter(()), val=None, records=100, batch=4)
 
-    class Sized:
-        steps_per_epoch = 25
-
-    assert TrainerConfig(steps=10).total_steps(Sized()) == 10
-    assert TrainerConfig(epochs=4).total_steps(Sized()) == 100
+    assert TrainerConfig(steps=10).total_steps(sized) == 10
+    assert TrainerConfig(epochs=4).total_steps(sized) == 100
     with pytest.raises(ValueError, match="record count"):
-        TrainerConfig(epochs=4).total_steps(Streamed())
+        TrainerConfig(epochs=4).total_steps(streamed)
     with pytest.raises(ValueError, match=r"--trainer.steps or --trainer.epochs"):
-        TrainerConfig().total_steps(Sized())
+        TrainerConfig().total_steps(sized)
 
 
 def test_the_cli_parses_the_mesh_the_layout_and_a_dataset_subcommand():

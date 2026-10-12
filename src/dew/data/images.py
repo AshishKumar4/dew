@@ -154,9 +154,11 @@ def not_flat(field: str = "image") -> NotFlat:
     return NotFlat(field)
 
 
-def resize(size: int | tuple[int, int], method: Interpolation = "area", *, field: str = "image") -> Resize:
+def resize(size: int | tuple[int, int], method: Interpolation | None = None, *,
+           field: str = "image") -> Resize:
     """A record step that resizes the pixels in `field` to `size`, a square
-    side or (height, width), with OpenCV's `method` interpolation."""
+    side or (height, width), with OpenCV's `method` interpolation, by default
+    area down and bicubic up."""
     from dew.data.steps.image import Resize
 
     return Resize(size, method, field)
@@ -195,14 +197,13 @@ def color_jitter(brightness: float = 0.2, contrast: float = 0.05, saturation: fl
     return ColorJitter(brightness, contrast, saturation, field)
 
 
-def caption(*templates: str, classes: tuple[str, ...] = (),
-            columns: tuple[str, ...] = ("caption", "text", "txt")) -> Caption:
-    """A random step that writes "caption": one of `templates`, drawn per
-    record, formatted with the record's fields ("{label}" is the class name
-    `classes` gives its label), or with none, the first of `columns` it has."""
+def caption(template: str | None = None, *, classes: tuple[str, ...] = ()) -> Caption:
+    """A record step that writes "caption": `template` formatted with the
+    record's fields ("{label}" is the class name `classes` gives its label),
+    or with none, the record's own caption or text."""
     from dew.data.steps.image import Caption
 
-    return Caption(templates, classes, columns)
+    return Caption(template, classes)
 
 
 def processor(image_processor: object, *, field: str = "image", to: str = "pixel_values") -> Processor:
