@@ -234,6 +234,13 @@ def test_causal_transformer_axes_land_on_the_dimensions_they_name():
     assert embed["embed_tokens"]["embedding"] == P(None, "fsdp")
     assert embed["lm_head"]["kernel"] == P("fsdp")
 
+    # fsdp takes the leading width either rule names, and a name whose first
+    # rule keeps it whole stays whole.
+    both = declared_specs(variables, (("mlp", "fsdp"), ("embed", "fsdp")))["layers_0"]["mlp"]
+    assert both["gate_proj"]["kernel"] == P("fsdp")
+    whole = declared_specs(variables, (("embed", None), ("mlp", "fsdp"), ("embed", "fsdp")))
+    assert whole["layers_0"]["mlp"]["gate_proj"]["kernel"] == P(None, "fsdp")
+
 
 def test_dit_axes_land_on_the_dimensions_they_name():
     """The same for the DiT stack, whose attention kernels carry three axes."""
