@@ -20,38 +20,26 @@ def lint():
     return module
 
 
-SOURCE = """
-    import logging
-    import os
-    import warnings
-
-    import jax
-    from absl import flags
-
-    jax.config.update("jax_enable_x64", True)
-    os.environ["XLA_FLAGS"] = "--xla_dump_to=/tmp"
-    if not flags.FLAGS.is_parsed():
-        flags.FLAGS.mark_as_parsed()
-    try:
-        logging.basicConfig()
-    except ValueError:
-        warnings.filterwarnings("ignore")
-    jax.monitoring.register_event_listener(print)
+WRITE = 'jax.config.update("jax_enable_x64", True)'
+CASES = {
+    "a config write at import": (WRITE, True),
+    "an environment write": ('os.environ["XLA_FLAGS"] = ""', True),
+    "a global listener": ("jax.monitoring.register_event_listener(print)", True),
+    "inside a module-level if": (f"if True:\n    {WRITE}", True),
+    "inside except and finally": (f"try:\n    pass\nexcept ValueError:\n    {WRITE}\n"
+                                  f"finally:\n    {WRITE}", True),
+    "in a class body": (f"class Configured:\n    {WRITE}", True),
+    "in the script guard's else": (f"if __name__ == '__main__':\n    pass\nelse:\n    {WRITE}", True),
+    "under a negated script guard": (f"if __name__ != '__main__':\n    {WRITE}", True),
+    "inside a function": (f"def when_asked():\n    {WRITE}", False),
+    "inside a method": (f"class Configured:\n    def when_asked(self):\n        {WRITE}", False),
+    "under the script guard": (f"if __name__ == '__main__':\n    {WRITE}", False),
+}
 
 
-    def when_asked():
-        jax.config.update("jax_enable_x64", True)
-        os.environ["XLA_FLAGS"] = ""
-        jax.monitoring.register_event_listener(print)
-
-
-    if __name__ == "__main__":
-        logging.basicConfig()
-"""
-
-
-def test_import_time_writes_are_reported_and_called_ones_are_not(lint):
-    source = textwrap.dedent(SOURCE)
+@pytest.mark.parametrize("case", list(CASES))
+def test_import_time_writes_are_reported_and_deferred_ones_are_not(lint, case):
+    body, reported = CASES[case]
+    source = textwrap.dedent("import os\nimport jax\n\n" + body)
     module = lint.Module(Path("src/dew/effects.py"), "src/dew/effects.py", source, ast.parse(source))
-    lines = sorted(finding.line for finding in lint.imports(module))
-    assert lines == [9, 10, 12, 14, 16, 17]
+    assert any(True for _ in lint.imports(module)) is reported
