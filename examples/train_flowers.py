@@ -15,8 +15,8 @@ from PIL import Image
 from dew import Checkpoints, Field, InputSpec, Trainer, sample
 from dew.artifacts import uint8_pixels
 from dew.config import OptimConfig
-from dew.data import TFDS, Loading
 from dew.config.data import Augment, ImageData, loader
+from dew.data import TFDS, Loading
 from dew.diffusion.presets import EDM
 from dew.nn.backbones import SimpleDiT
 from dew.objectives.diffusion import DiffusionObjective

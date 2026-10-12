@@ -12,8 +12,8 @@ import jax.numpy as jnp
 import tyro
 
 from dew.config import OptimConfig
-from dew.data import TFDS
 from dew.config.data import Augment, HoldOut, ImageData, loader
+from dew.data import TFDS
 from dew.inputs import Field
 from dew.interop import save_params
 from dew.objectives.jepa import (

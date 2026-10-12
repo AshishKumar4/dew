@@ -30,8 +30,8 @@ import tyro
 
 import dew
 from dew.config import OptimConfig
-from dew.data import Loading
 from dew.config.data import ChatData, loader
+from dew.data import Loading
 from dew.interop import PretrainedBlockDecoder
 from dew.lora import LoRA
 from dew.objectives.diffusion.block import BlockDiffusionObjective

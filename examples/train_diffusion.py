@@ -14,8 +14,8 @@ from PIL import Image
 
 from dew.artifacts import uint8_pixels
 from dew.config import OptimConfig
-from dew.data import TFDS
 from dew.config.data import Augment, HoldOut, ImageData, loader
+from dew.data import TFDS
 from dew.data.steps.image import EncodeCaptions
 from dew.diffusion import presets
 from dew.inputs import CLIPText, Condition, Field, InputSpec

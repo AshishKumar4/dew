@@ -63,8 +63,8 @@ import jax.numpy as jnp
 import tyro
 
 from dew.config import OptimConfig
-from dew.data import HFTokenizer, Loading
 from dew.config.data import PromptData, loader
+from dew.data import HFTokenizer, Loading
 from dew.inference import (
     NativeRolloutServer,
     OpenAICompletion,

@@ -35,8 +35,8 @@ from PIL import Image
 import dew
 from dew.artifacts import uint8_pixels
 from dew.config import ModelConfig, ObjectiveConfig, OptimConfig, TrainerConfig
-from dew.data import TFDS, Files, Loading
 from dew.config.data import Augment, HoldOut, ImageData, loader
+from dew.data import TFDS, Files, Loading
 from dew.data.dataset import DataPartition
 from dew.data.sources.codec import pack_dict_of_byte_arrays
 from dew.data.steps.image import EncodeCaptions
