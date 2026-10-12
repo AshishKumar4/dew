@@ -839,6 +839,28 @@ class GlobalMean:
         return accumulated[0] / accumulated[1]
 
 
+def text_to_image(args):
+    """A tiny text-to-image diffusion objective over the committed CLIP
+    fixture, and this process's share of a batch of its images and prompts."""
+    from dew.diffusion import presets
+    from dew.inputs import Condition, Field, InputSpec
+    from dew.inputs.encoders import CLIPText
+    from dew.nn.backbones.dit import SimpleDiT
+    from dew.objectives.diffusion import DiffusionObjective
+
+    encoder = CLIPText.from_pretrained(str(FIXTURES / "clip" / "tiny"))
+    rows = BATCH // args.processes
+    mine = slice(args.process_id * rows, (args.process_id + 1) * rows)
+    batch = {"image": global_images()[mine],
+             "text": {name: value[mine] for name, value in encoder.tokenize(PROMPTS).items()}}
+    objective = DiffusionObjective(
+        SimpleDiT(patch_size=4, emb_features=32, num_layers=1, num_heads=2, mlp_ratio=1),
+        presets.Flow(),
+        InputSpec(Field("image", (RES, RES, 3)), {"textcontext": Condition(encoder)}),
+        guidance=None, steps=2)
+    return objective, batch
+
+
 def mode_validate(args) -> dict:
     """A real diffusion validation pass in the pool, scored by the clip metric.
 
@@ -851,25 +873,11 @@ def mode_validate(args) -> dict:
     import optax
 
     from dew.data import Dataset
-    from dew.diffusion import presets
     from dew.eval import CLIPDistance
-    from dew.inputs import Condition, Field, InputSpec
-    from dew.inputs.encoders import CLIPText
-    from dew.nn.backbones.dit import SimpleDiT
-    from dew.objectives.diffusion import DiffusionObjective
     from dew.training import Layout, MeshSpec, Trainer
 
     tiny = str(FIXTURES / "clip" / "tiny")
-    encoder = CLIPText.from_pretrained(tiny)
-    rows = BATCH // args.processes
-    mine = slice(args.process_id * rows, (args.process_id + 1) * rows)
-    batch = {"image": global_images()[mine],
-             "text": {name: value[mine] for name, value in encoder.tokenize(PROMPTS).items()}}
-    objective = DiffusionObjective(
-        SimpleDiT(patch_size=4, emb_features=32, num_layers=1, num_heads=2, mlp_ratio=1),
-        presets.Flow(),
-        InputSpec(Field("image", (RES, RES, 3)), {"textcontext": Condition(encoder)}),
-        guidance=None, steps=2)
+    objective, batch = text_to_image(args)
     scored = ScoreRecorder()
     trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(0),
                       mesh=MeshSpec(fsdp=args.fsdp_size), layout=Layout(min_shard=TINY),
@@ -1208,53 +1216,25 @@ def mode_evaluation_replicas(args) -> dict:
 
 
 def mode_evaluation_clocks(args) -> dict:
-    """Each rank evaluates from its own clocks, rank 1's ahead of rank 0's:
-    a draw that reads the schedule step and the event's key. Every rank
-    reports root's step and identity, and root's scores."""
+    """Each rank evaluates the text-to-image diffusion objective's validation
+    loss from its own clocks, rank 1's ahead of rank 0's: the loss draws its
+    noise and times from the event's key. Every rank reports root's step
+    and identity, and root's scores."""
     import jax
-    import jax.numpy as jnp
     import optax
 
-    from dew.artifacts import Representations
     from dew.data import Dataset
-    from dew.objectives.base import Aux, Objective
-    from dew.training import Trainer
+    from dew.training import Layout, MeshSpec, Trainer
 
-    class Drawn(Objective):
-        def init(self, key, variables=None):
-            return {"params": {"offset": jnp.zeros(())}}
-
-        def loss(self, variables, batch, step):
-            return variables["params"]["offset"] ** 2, Aux({})
-
-        def evaluate(self, params, batch, step):
-            noise = jax.random.normal(step.key, batch["x"].shape) + step.step
-            return Representations(features=noise, labels=batch["x"][:, 0])
-
-    class Total:
-        name, reads = "total", Representations
-
-        def __call__(self, artifact, batch):
-            return float(jnp.sum(artifact.features))
-
-        def merge(self, accumulated, contribution):
-            return accumulated + contribution
-
-        def finalize(self, accumulated):
-            return accumulated
-
-    trainer = Trainer(Drawn(), optax.sgd(.01), key=jax.random.key(0))
+    objective, batch = text_to_image(args)
+    trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(0), mesh=MeshSpec(),
+                      layout=Layout(min_shard=TINY), checkpoints=None, tracker=None)
     state, _, _ = trainer.place()
-    # Four rows, each process its share of them.
-    share = 4 // jax.process_count()
-    rows = np.arange(4, dtype=np.float32)[jax.process_index() * share:][:share, None]
-    batch = {"x": rows}
-    data = Dataset(train=lambda partition: iter([batch]), val=lambda partition: iter([batch]), records=4,
-                   batch=4)
+    data = Dataset(train=lambda partition: iter([batch]), val=lambda partition: iter([batch]),
+                   records=BATCH, batch=BATCH)
     ahead = 4 * jax.process_index()
-    result = Evaluation.run(trainer.objective, state.variables, data.val, metrics=(Total(),), key=state.key,
-                            step=5 + ahead, schedule_step=jnp.asarray(3 + ahead, jnp.int32),
-                            mesh=trainer.device_mesh)
+    result = Evaluation.run(trainer.objective, state.variables, data.val, key=state.key, loss=True,
+                            step=5 + ahead, schedule_step=np.int32(3 + ahead), mesh=trainer.device_mesh)
     return {"step": result.step, "event": list(result.event_key), "scores": result.scalars}
 
 
