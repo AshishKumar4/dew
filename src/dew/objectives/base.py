@@ -44,6 +44,7 @@ from dew.records import JSON
 
 if TYPE_CHECKING:
     from flax import linen as nn
+    from jax.sharding import Mesh
     from jax.typing import DTypeLike
 
     from dew.inference.tasks import BlockGeneration, MaskedGeneration, Processor, TextGeneration
@@ -378,7 +379,7 @@ class SavedTask(Protocol):
 
     @classmethod
     def from_run(cls, directory: str, *, ema: bool | None = None, step: int | str | None = None,
-                 mesh: MeshSpec | None = None, layout: Layout | None = None,
+                 mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None,
                  dtype: DTypeLike | None = None, param_dtype: DTypeLike | None = None) -> Self: ...
 
 
@@ -943,7 +944,7 @@ class Objective(ABC, Generic[Loss, Effects]):
 
     @classmethod
     def _saved_variables(cls, directory: str, *, step: int | str | None, ema: bool | None,
-                         mesh: MeshSpec | None = None, layout: Layout | None = None,
+                         mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None,
                          param_dtype: DTypeLike | None = None,
                          parameter_roots: tuple[tuple[str, ...], ...] = (("params",), (FROZEN,))
                          ) -> Variables:

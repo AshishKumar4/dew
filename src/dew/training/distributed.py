@@ -24,16 +24,16 @@ from dew.coordination import agreed, broadcast_from_process_zero, from_every_pro
 from dew.data.dataset import Budgeted, Checkpointable, Closeable, DataPartition, Stoppable
 from dew.nn.inputs import filled_validity
 from dew.nn.sharding import (
-    BATCH_AXES,
+    DATA_AXIS,
     DEFAULT_RULES,
-    EXPERT_AXIS,
     FSDP_AXIS,
     MESH_AXES,
     SEQUENCE_AXIS,
-    TENSOR_AXIS,
+    STAGE_AXIS,
     LayoutRefused,
     LogicalAxisRules,
     MeshAxes,
+    batch_axes,
     boxed,
     boxed_axes,
     current_boxes,
@@ -45,17 +45,24 @@ from dew.nn.sharding import (
 from dew.objectives.base import Batch, Variables
 from dew.telemetry.profile import region
 
-# The axes a parameter can be split over. A dimension named 'exp' takes the
-# expert axis, the widths of Megatron's split take tensor, everything else
-# takes fsdp. The data and sequence axes split the batch, and the stage axis
-# holds the pipeline's stages of the layer stack. None of the three ever
-# places a parameter, which is why `Layout` refuses a parameter placed there.
-PARAMETER_AXES = (EXPERT_AXIS, FSDP_AXIS, TENSOR_AXIS)
+# The role axes no parameter splits over: data holds a batch's replicas,
+# sequence its positions, and stage the pipeline's stages of the layer stack,
+# which the decoder places itself. `Layout` refuses a parameter placed there.
+# Every other axis a mesh has, Dew's own (expert, fsdp, tensor) or a native
+# mesh's, holds a parameter where the rules put one.
+UNSPLIT_AXES = (DATA_AXIS, SEQUENCE_AXIS, STAGE_AXIS)
 
-# The batch's rows split over the batch axes and its sequence dimension over
-# the sequence axis. Every stage sees the whole batch, since the pipeline
-# hands its microbatches from stage to stage itself.
-BATCH_SPEC = P(BATCH_AXES, SEQUENCE_AXIS)
+
+def parameter_axes(names) -> tuple[str, ...]:
+    """The mesh axes among `names` (a mesh's `axis_names`) a parameter can
+    split over: all but `UNSPLIT_AXES`."""
+    return tuple(axis for axis in names if axis not in UNSPLIT_AXES)
+
+
+def device_mesh(mesh: MeshSpec | Mesh) -> Mesh:
+    """The device mesh `mesh` names: a native `jax.sharding.Mesh` as it is,
+    whatever its axes, or the one a `MeshSpec` builds."""
+    return mesh if isinstance(mesh, Mesh) else mesh.build()
 
 type Placement[TreeT] = TreeT
 """`TreeT`'s own structure, with a `NamedSharding` at every leaf.
@@ -83,14 +90,8 @@ class MeshSpec:
     """Devices the batch's sequence dimension is split over; 1 keeps whole sequences."""
     stage: int = 1
     """Pipeline stages the layer stack is split into, each on its own devices.
-    1 runs the whole stack on every device."""
-    microbatches: int | None = None
-    """Microbatches a step feeds through the stages, a positive multiple of
-    `stage`. None means one per stage, the smallest schedule, and any other
-    value needs `stage` above 1. Each stage works on one microbatch while
-    the next stage works on the previous one, so more microbatches shrink
-    the idle time at the start and end of a step, and make each iteration's
-    matmuls smaller."""
+    1 runs the whole stack on every device. How many microbatches a step
+    feeds through them is the trainer's (`Trainer.microbatches`)."""
     replicas: int = 1
     """Groups of hosts the data axis spans, for hybrid sharded data
     parallelism. Every other axis, fsdp included, stays inside one group. So
@@ -116,16 +117,6 @@ class MeshSpec:
             raise ValueError(f"stage counts pipeline stages, got {self.stage}")
         if self.replicas < 1:
             raise ValueError(f"replicas counts host groups, got {self.replicas}")
-        if self.microbatches is None:
-            return
-        if self.stage == 1:
-            raise ValueError(
-                f"microbatches ({self.microbatches}) feed the stage axis, and "
-                "stage is 1; set stage above 1 or leave microbatches unset")
-        if self.microbatches < self.stage or self.microbatches % self.stage:
-            raise ValueError(
-                f"microbatches must be a positive multiple of stage "
-                f"({self.stage}), got {self.microbatches}")
 
     def build(self, devices: list | None = None) -> Mesh:
         """Build the six-axis device mesh this spec describes.
@@ -286,21 +277,20 @@ def hybrid_devices(spec: MeshSpec, shape: tuple[int, ...], devices: list) -> np.
         ici, dcn, devices, process_is_granule=by_process, allow_split_physical_axes=True)
 
 
-def batch_divisor(mesh: Mesh, spec: MeshSpec) -> int:
+def batch_divisor(mesh: Mesh, microbatches: int) -> int:
     """Return the row count every global batch must be a multiple of.
 
-    A batch's rows are sharded over the batch axes as whole rows, and a
-    pipelined step cuts each device's rows again into `spec`'s microbatches,
-    one per stage when unset: microbatch m takes rows m, m + M, ..., which
-    is a share of every device's rows only where M divides them. A batch
-    that divides by neither is refused where it is placed or traced.
+    A batch's rows are sharded over the row axes (`batch_axes`) as whole
+    rows, and a pipelined step cuts each device's rows again into
+    `microbatches`: microbatch m takes rows m, m + M, ..., which is a share
+    of every device's rows only where M divides them. A batch that divides
+    by neither is refused where it is placed or traced.
 
     `Trainer.fit` checks a batch against this before it places anything,
     and a batch ramp's every stage, since a later stage would otherwise fail
     an hour in.
     """
-    shards = math.prod(mesh.shape[axis] for axis in BATCH_AXES)
-    return shards * (spec.microbatches or spec.stage)
+    return math.prod(mesh.shape[axis] for axis in batch_axes(mesh)) * microbatches
 
 
 def parameter_spec(shape: tuple, fsdp_size: int, min_shard_size: int) -> P:
@@ -391,19 +381,19 @@ class Layout:
     tolerance: float = 0.02
     host: tuple[str, ...] = ()
     host_parameters: tuple[str, ...] = ()
+    data_axes: tuple[str, ...] = ()
+    """The axes a batch's rows split over, ahead of the rules' own
+    `activation_batch` entries: a native mesh's names for its data-parallel
+    axes, which the run's data shares, its batch placement and its row
+    counts read (`dew.nn.sharding.batch_axes`). Empty leaves the rules as
+    they are."""
 
     def __post_init__(self):
         if not 0.0 <= self.tolerance <= 1.0:
             raise ValueError(
                 f"sharding tolerance must be between 0 and 1, got {self.tolerance}")
-        rules = _rule_table(self.rules)
-        for name, axes in rules:
-            unknown = [axis for axis in mesh_axes(axes) if axis not in MESH_AXES]
-            if unknown:
-                raise ValueError(
-                    f"rule {name!r} names {unknown}, which no mesh has; the axes are "
-                    f"{list(MESH_AXES)}")
-        object.__setattr__(self, "rules", rules)
+        object.__setattr__(self, "rules", _rule_table(self.rules))
+        object.__setattr__(self, "data_axes", tuple(self.data_axes))
         host = tuple(self.host)
         unknown = sorted(set(host) - set(HOST_RESIDENT))
         if unknown:
@@ -415,10 +405,20 @@ class Layout:
 
     @property
     def axis_rules(self) -> LogicalAxisRules:
-        """The rules as the (name, axes) pairs flax reads, in precedence order."""
+        """The rules as the (name, axes) pairs flax reads, in precedence order,
+        `data_axes` first."""
         rules = self.rules
         assert isinstance(rules, tuple), "__post_init__ keeps the rules as pairs"
-        return rules
+        return ((("activation_batch", self.data_axes),) if self.data_axes else ()) + rules
+
+    def _refuse_unknown(self, mesh: Mesh | AbstractMesh) -> None:
+        """Refuse rules naming an axis `mesh` lacks, unless it is one of Dew's
+        role axes (`MESH_AXES`), which a mesh without them treats as size 1."""
+        unknown = sorted({axis for _, assignment in self.axis_rules for axis in mesh_axes(assignment)}
+                         - set(mesh.axis_names) - set(MESH_AXES))
+        if unknown:
+            raise ValueError(f"the rules name the axes {unknown}, which this mesh, with axes "
+                             f"{list(mesh.axis_names)}, does not have")
 
     def shardings[TreeT](self, mesh: Mesh, tree: TreeT) -> Placement[TreeT]:
         """Return a NamedSharding for each leaf of `tree`, from the axes its module declared.
@@ -434,10 +434,11 @@ class Layout:
         Flax metadata that a caller's own module attached is removed, because
         the state the trainer creates from these shardings holds plain arrays.
         Raises ValueError when the rules place a leaf on the data, sequence or
-        stage axis.
+        stage axis (`UNSPLIT_AXES`), or name an axis the mesh lacks.
         """
-        fsdp_size = mesh.shape[FSDP_AXIS]
-        sharded_devices = math.prod(mesh.shape[axis] for axis in PARAMETER_AXES)
+        self._refuse_unknown(mesh)
+        fsdp_size = mesh.shape.get(FSDP_AXIS, 1)
+        sharded_devices = math.prod(mesh.shape[axis] for axis in parameter_axes(mesh.axis_names))
 
         def leaf_sharding(path, value):
             axes = declared_axes(path, value.ndim)
@@ -448,13 +449,11 @@ class Layout:
                 spec = P()
             else:
                 spec = logical_spec(axes, value.shape, rules=self.axis_rules, mesh=mesh)
-            outside = sorted({axis for entry in spec for axis in mesh_axes(entry)}
-                             - set(PARAMETER_AXES))
+            outside = sorted({axis for entry in spec for axis in mesh_axes(entry)} & set(UNSPLIT_AXES))
             if outside:
                 raise ValueError(
-                    f"the rules place {_variable_path(path)} on {outside}; parameters "
-                    f"split over {list(PARAMETER_AXES)}, the data and sequence axes "
-                    f"split the batch, and the stage axis holds the pipeline")
+                    f"the rules place {_variable_path(path)} on {outside}; the data and "
+                    f"sequence axes split the batch, and the stage axis holds the pipeline")
             return NamedSharding(mesh, spec)
 
         with self._declared(tree):
@@ -472,8 +471,8 @@ class Layout:
         axes = declared_axes(path, value.ndim)
         if axes is None:
             return {FSDP_AXIS}
-        return {axis for name, assignment in self.axis_rules if name in axes
-                for axis in mesh_axes(assignment) if axis in PARAMETER_AXES}
+        return set(parameter_axes(axis for name, assignment in self.axis_rules if name in axes
+                                  for axis in mesh_axes(assignment)))
 
     def offloaded[TreeT](self, mesh: Mesh, tree: TreeT) -> Placement[TreeT]:
         """Return `shardings`, with the memory kind each leaf's path asks for.
@@ -539,11 +538,11 @@ class Layout:
                 f"parameter on the device. Place the weights for generation with a "
                 f"dew.inference.LayerBanks source's place, or use host=('variables',) for a "
                 f"CPU-owned training transaction and drop the inference-only patterns")
-        if all(mesh.shape[axis] == 1 for axis in PARAMETER_AXES):
+        if all(mesh.shape[axis] == 1 for axis in parameter_axes(mesh.axis_names)):
             return
 
         path_leaves, _ = jax.tree_util.tree_flatten_with_path(nn.unbox(params))
-        splits = {axis for axis in PARAMETER_AXES if mesh.shape[axis] > 1}
+        splits = {axis for axis in parameter_axes(mesh.axis_names) if mesh.shape[axis] > 1}
         with self._declared(params):
             splittable = [bool(self._splitting(path, param) & splits) for path, param in path_leaves]
         shardable_elements = 0
@@ -555,7 +554,7 @@ class Layout:
                 continue
             shardable_elements += elements
             if any(axis in mesh_axes(assignment)
-                   for assignment in sharding.spec for axis in PARAMETER_AXES):
+                   for assignment in sharding.spec for axis in parameter_axes(mesh.axis_names)):
                 continue
             replicated.append((elements, jax.tree_util.keystr(path), param.shape))
 
@@ -577,25 +576,28 @@ class Layout:
 def batch_shardings(mesh: Mesh | AbstractMesh, batch: Batch) -> Placement[Batch]:
     """Return a sharding for each leaf of `batch`, chosen from the leaf's shape.
 
-    Rows split over the data, expert and fsdp axes. A leaf of rank 2 or 3 holds
-    a sequence per row: token ids, segment ids, positions, encoded tokens. Its
-    second dimension splits over the sequence axis when the axis divides it,
-    and otherwise stays whole, the way `logical_spec` drops a name no dimension
-    can split. An image or a video is not a sequence, so only its rows split.
+    Rows split over the row axes, those the rules in context give
+    `activation_batch` (`batch_axes`): data, expert and fsdp by default. A
+    leaf of rank 2 or 3 holds a sequence per row: token ids, segment ids,
+    positions, encoded tokens. Its second dimension splits over the sequence
+    axis when the mesh has one that divides it, and otherwise stays whole,
+    the way `logical_spec` drops a name no dimension can split. An image or
+    a video is not a sequence, so only its rows split.
 
     This only decides placement and never changes values. Until a model
     constrains its attention to the sequence axis, a sequence split here is
     gathered again inside the model. Only the shape is read, so a leaf that is
     already a global array costs no transfer.
     """
-    rows, sequence = BATCH_SPEC
-    sequence_size = mesh.shape[SEQUENCE_AXIS]
+    rows = batch_axes(mesh) or None
+    sequence = SEQUENCE_AXIS if SEQUENCE_AXIS in mesh.axis_names else None
+    sequence_size = mesh.shape.get(SEQUENCE_AXIS, 1)
 
     def leaf_sharding(leaf):
         shape = np.shape(leaf)
         if not shape:
             return NamedSharding(mesh, P())
-        if len(shape) in (2, 3) and shape[1] % sequence_size == 0:
+        if sequence is not None and len(shape) in (2, 3) and shape[1] % sequence_size == 0:
             return NamedSharding(mesh, P(rows, sequence))
         return NamedSharding(mesh, P(rows))
 
@@ -756,6 +758,9 @@ class DevicePrefetchIterator:
         self._cleanup_error: BaseException | None = None
         self.source_state = source_state
         self._prepare = prepare
+        # The worker places batches by the rules its creator reads, which flax
+        # keeps per thread (`batch_shardings`).
+        self._rules = nn.get_logical_axis_rules()
         self._thread = threading.Thread(target=self._prefetch, name="dew-prefetch", daemon=True)
         self._withdraw_exit: Callable[[], None] | None = None
         # No source work may start until the caller owns this object. In
@@ -824,7 +829,7 @@ class DevicePrefetchIterator:
                     state = source.get_state() if source is not None else None
                     if source is not None and not isinstance(state, bytes):
                         state = json.dumps(state).encode()
-                with region("data.place"):
+                with region("data.place"), nn.logical_axis_rules(self._rules):
                     if self._prepare is not None:
                         batch = self._prepare(batch)
                     placed = shard_batch(mesh, batch)

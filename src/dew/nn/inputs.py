@@ -16,7 +16,7 @@ from flax import struct
 from jax.core import Tracer
 
 from dew.coordination import agreed
-from dew.nn.sharding import DATA_AXIS, EXPERT_AXIS, FSDP_AXIS, TENSOR_AXIS
+from dew.nn.sharding import batch_axes
 
 if TYPE_CHECKING:
     from PIL.Image import Image
@@ -43,8 +43,6 @@ type ModelKwarg = jax.Array | Mapping[str, jax.Array] | bool | None
 type FieldExtension = Callable[[jax.Array, jax.Array, int], jax.Array]
 
 PredictionPhase = Literal["ordinary", "extend", "draft"]
-BATCH_AXES = (DATA_AXIS, EXPERT_AXIS, FSDP_AXIS, TENSOR_AXIS)
-"""The mesh axes a request's rows split over: every axis but sequence and stage."""
 
 
 def pad_token_rows(rows: Sequence[Sequence[int]] | np.ndarray, *, pad_id: int = 0,
@@ -582,7 +580,8 @@ class RowPlan:
     """Where one request's rows sit while a task runs.
 
     Without a mesh every array stays on the default device. On a mesh, rows
-    split over its batch axes. Each process contributes ``count`` rows, its
+    split over its row axes, those the rules in context give
+    `activation_batch` (`batch_axes`). Each process contributes ``count`` rows, its
     ``rows`` real ones followed by repeats that pad them to a multiple of its
     devices on those axes, so every device holds the same shape and every
     collective lines up. Results keep that sharding, and ``host`` reads a
@@ -600,7 +599,7 @@ class RowPlan:
         if mesh is None:
             return cls(None, rows, rows, 0, 1)
         processes, process = jax.process_count(), jax.process_index()
-        batch_devices = math.prod(mesh.shape[axis] for axis in BATCH_AXES)
+        batch_devices = math.prod(mesh.shape[axis] for axis in batch_axes(mesh))
         if batch_devices % processes:
             raise ValueError("the batch axes of the mesh do not split evenly over the processes")
         local_devices = batch_devices // processes
@@ -610,7 +609,8 @@ class RowPlan:
     def sharding(self) -> jax.sharding.NamedSharding | None:
         if self.mesh is None:
             return None
-        return jax.sharding.NamedSharding(self.mesh, jax.sharding.PartitionSpec(BATCH_AXES))
+        return jax.sharding.NamedSharding(self.mesh, jax.sharding.PartitionSpec(
+            batch_axes(self.mesh) or None))
 
     @property
     def global_rows(self) -> int:

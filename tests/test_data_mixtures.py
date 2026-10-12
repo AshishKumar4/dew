@@ -989,7 +989,7 @@ def test_a_ramp_stage_the_pipeline_cannot_cut_into_microbatches_is_refused():
     six microbatches hold batches of twenty-four, six rows a device, and
     stages of eight and sixteen are not ones."""
     trainer = Trainer(Regression(), optax.sgd(0.5), key=jax.random.key(0),
-                      mesh=MeshSpec(stage=2, microbatches=6),
+                      mesh=MeshSpec(stage=2), microbatches=6,
                       layout=Layout(min_shard=1, tolerance=1.0))
 
     with pytest.raises(ValueError, match=r"\[8, 16\].*multiple of 24"):
@@ -1007,7 +1007,7 @@ def test_a_batch_the_pipeline_cannot_cut_into_microbatches_is_refused_before_it_
     from dew.nn.sharding import LayoutRefused
 
     trainer = Trainer(Regression(), optax.sgd(0.5), key=jax.random.key(0),
-                      mesh=MeshSpec(fsdp=2, stage=2, microbatches=4),
+                      mesh=MeshSpec(fsdp=2, stage=2), microbatches=4,
                       layout=Layout(min_shard=1, tolerance=1.0))
 
     with pytest.raises(LayoutRefused, match=r"multiple of 16 rows, 16 the nearest above 8 or "

@@ -41,6 +41,8 @@ from dew.sampling.text import Bounded, Criteria, Generation, Sampling, Transform
 from dew.telemetry.profile import region
 
 if TYPE_CHECKING:
+    from jax.sharding import Mesh
+
     from dew.config import ModelConfig
     from dew.training.distributed import Layout, MeshSpec
     from dew.training.quantization import Quantization
@@ -470,7 +472,7 @@ class TextGeneration:
 
     @classmethod
     def from_run(cls, directory: str, *, ema: bool | None = None, step: int | str | None = None,
-                 mesh: MeshSpec | None = None, layout: Layout | None = None,
+                 mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None,
                  dtype: DTypeLike | None = None, param_dtype: DTypeLike | None = None,
                  trust: Sequence[str] = ()) -> TextGeneration:
         """Load the causal language-model run in `directory` as a task.
@@ -503,7 +505,7 @@ class TextGeneration:
     @classmethod
     def from_pretrained(cls, repo_id: str, *, revision: str | None = None,
                         ema: bool | None = None, step: int | str | None = None,
-                        mesh: MeshSpec | None = None, layout: Layout | None = None,
+                        mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None,
                         dtype: DTypeLike | None = None,
                         param_dtype: DTypeLike | None = None, trust: Sequence[str] = ()) -> TextGeneration:
         """Load a run directory published to the Hugging Face Hub.
@@ -575,7 +577,7 @@ class BlockGeneration:
 
     @classmethod
     def from_run(cls, directory: str, *, ema: bool | None = None, step: int | str | None = None,
-                 mesh: MeshSpec | None = None, layout: Layout | None = None,
+                 mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None,
                  dtype: DTypeLike | None = None, param_dtype: DTypeLike | None = None,
                  trust: Sequence[str] = ()) -> BlockGeneration:
         """Load the block-diffusion run in `directory` as a task.
@@ -605,7 +607,7 @@ class BlockGeneration:
     @classmethod
     def from_pretrained(cls, repo_id: str, *, revision: str | None = None,
                         ema: bool | None = None, step: int | str | None = None,
-                        mesh: MeshSpec | None = None, layout: Layout | None = None,
+                        mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None,
                         dtype: DTypeLike | None = None,
                         param_dtype: DTypeLike | None = None, trust: Sequence[str] = ()) -> BlockGeneration:
         """Load a run directory published to the Hugging Face Hub.
@@ -670,7 +672,7 @@ class MaskedGeneration:
 
     @classmethod
     def from_run(cls, directory: str, *, ema: bool | None = None, step: int | str | None = None,
-                 mesh: MeshSpec | None = None, layout: Layout | None = None,
+                 mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None,
                  dtype: DTypeLike | None = None, param_dtype: DTypeLike | None = None,
                  trust: Sequence[str] = ()) -> MaskedGeneration:
         """Load the masked-diffusion run in `directory` as a task.
@@ -714,7 +716,7 @@ class MaskedGeneration:
     @classmethod
     def from_pretrained(cls, repo_id: str, *, revision: str | None = None,
                         ema: bool | None = None, step: int | str | None = None,
-                        mesh: MeshSpec | None = None, layout: Layout | None = None,
+                        mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None,
                         dtype: DTypeLike | None = None,
                         param_dtype: DTypeLike | None = None, trust: Sequence[str] = ()) -> MaskedGeneration:
         """Load a run directory published to the Hugging Face Hub.

@@ -218,10 +218,12 @@ def main() -> None:
     data = TokenWindows(path=str(tokens), seq_len=SEQ_LEN).load(batch=batch_size)
     model = CausalTransformer(**shape["model"], vocab_size=256, max_seq_len=SEQ_LEN + 1,
                               dtype=getattr(jnp, dtype), attention_impl="auto", scan_layers=args.scan_layers)
-    mesh = MeshSpec(**mesh_of(shape["mesh"], jax.device_count()))
+    fields = mesh_of(shape["mesh"], jax.device_count())
+    microbatches = fields.pop("microbatches", None)
     trainer = Trainer(LMObjective(model, SEQ_LEN, ema_decay=None),
-                      optax.adamw(shape["lr"], weight_decay=0.1), key=jax.random.key(0), mesh=mesh,
-                      layout=Layout(), checkpoints=None, tracker=None)
+                      optax.adamw(shape["lr"], weight_decay=0.1), key=jax.random.key(0),
+                      mesh=MeshSpec(**fields), microbatches=microbatches, layout=Layout(), checkpoints=None,
+                      tracker=None)
     if args.diloco:
         # Each host's own devices: its steps sum nothing over the hosts.
         trainer.device_mesh = MeshSpec().build(jax.local_devices())

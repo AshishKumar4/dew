@@ -180,7 +180,7 @@ def test_recomputed_pipeline_preserves_updates_and_sown_values(shape, scan):
     remat = plain.clone(remat='full')
     # Eight rows split four ways over data x fsdp hold two a device, which
     # two microbatches divide.
-    mesh_spec = MeshSpec(fsdp=2, stage=2, microbatches=2)
+    mesh_spec = MeshSpec(fsdp=2, stage=2)
     mesh = mesh_spec.build()
     tokens = shard_batch(mesh, batch())
     variables = plain.init(jax.random.key(0), batch()["text"][:, :-1])
@@ -188,7 +188,7 @@ def test_recomputed_pipeline_preserves_updates_and_sown_values(shape, scan):
     run, solver = training_step(plain)
     rerun, _ = training_step(remat)
     state = solver.init(variables["params"])
-    with jax.set_mesh(mesh), pipeline_microbatches(mesh_spec.microbatches):
+    with jax.set_mesh(mesh), pipeline_microbatches(2):
         left = run(variables, state, tokens, jax.random.key(7))
         right = rerun(variables, state, tokens, jax.random.key(7))
     assert abs(float(left[2] - right[2])) < 2e-5

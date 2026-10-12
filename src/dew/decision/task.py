@@ -59,6 +59,8 @@ from dew.objectives.base import Metric, Objective, Variables
 from dew.records import JSON, json_value, record
 
 if TYPE_CHECKING:
+    from jax.sharding import Mesh
+
     from dew.training.distributed import Layout as Placement, MeshSpec
 
 TASK_FILE = "decide.json"
@@ -165,7 +167,7 @@ class Decide:
 
     @classmethod
     def from_run(cls, directory: str, *, ema: bool | None = None, step: int | str | None = None,
-                 mesh: "MeshSpec | None" = None, layout: "Placement | None" = None,
+                 mesh: "MeshSpec | Mesh | None" = None, layout: "Placement | None" = None,
                  dtype: DTypeLike | None = None, param_dtype: DTypeLike | None = None) -> Self:
         """Load the `DecisionObjective` run in `directory` as a task.
 

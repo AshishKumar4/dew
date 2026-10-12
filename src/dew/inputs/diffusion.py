@@ -24,6 +24,7 @@ from dew.objectives.base import Variables
 from dew.registry import dtype_name
 
 if TYPE_CHECKING:
+    from jax.sharding import Mesh
     from transformers import CLIPTokenizer, PreTrainedTokenizerBase
 
     from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -203,7 +204,7 @@ class DiffusionConditioner(ConditionEncoder[str | Mapping[str, object]]):
     def from_pretrained(cls, checkpoint: str, *, dtype: str | None = "bfloat16",
                         param_dtype: str = "float32", revision: str | None = None,
                         attention_impl: str = "auto", params: Variables | None = None,
-                        mesh: MeshSpec | None = None, layout: Layout | None = None):
+                        mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None):
         from dew.interop.pipeline_assembly import load_diffusion_conditioner
 
         return load_diffusion_conditioner(checkpoint, cls, dtype=dtype, param_dtype=param_dtype,
@@ -406,7 +407,7 @@ class _LanguageText(ConditionEncoder[str | Mapping[str, object]]):
     def from_pretrained(cls, checkpoint: str, *, dtype: str | None = "bfloat16",
                         param_dtype: str = "float32", revision: str | None = None,
                         attention_impl: str = "auto", tokens: int = 512,
-                        params: Variables | None = None, mesh: MeshSpec | None = None,
+                        params: Variables | None = None, mesh: MeshSpec | Mesh | None = None,
                         layout: Layout | None = None):
         from dew.interop.pipeline_assembly import load_diffusion_conditioner
 

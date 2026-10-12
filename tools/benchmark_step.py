@@ -86,7 +86,7 @@ from benchmark_models import (
     image_tokens as image_tokens,
     media_row as media_row,
     media_values as media_values,
-    mesh_spec,
+    trainer_mesh,
 )
 from trace_window import device_events, kernel_category, length, overlap, union, window_split
 
@@ -129,7 +129,7 @@ def mesh_from_json(text: str) -> dict[str, int]:
     parsed = json.loads(text)
     if not isinstance(parsed, dict):
         raise ValueError("--mesh is a JSON object of MeshSpec fields")
-    mesh_spec(parsed)
+    trainer_mesh(parsed)
     return parsed
 
 

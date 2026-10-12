@@ -25,11 +25,10 @@ from pathlib import Path
 import numpy as np
 import pytest
 from lane_environment import outside_any_cluster
-from sharded import PARAMETER_AXES
 
 from dew.nn.sharding import MESH_AXES
 from dew.training import MeshSpec
-from dew.training.distributed import hybrid_devices
+from dew.training.distributed import hybrid_devices, parameter_axes
 
 # Needs the eight simulated CPU devices conftest configures, except the tests
 # that name fewer: those of stand-in devices need none, and a four-GPU run
@@ -86,7 +85,7 @@ def train(tmp_path: Path, mesh: dict, processes: int, devices: int = 8) -> dict:
                   devices=devices // processes)
     assert done.returncode == 0, done.stdout + done.stderr
     record = json.loads(out.read_text())
-    wanted = {axis for axis in PARAMETER_AXES if record["mesh"].get(axis, 1) > 1}
+    wanted = {axis for axis in parameter_axes(record["mesh"]) if record["mesh"][axis] > 1}
     assert wanted <= set(record["split_axes"]), (wanted, record["split_axes"])
     return record
 

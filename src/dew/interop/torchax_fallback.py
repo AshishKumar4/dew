@@ -45,7 +45,7 @@ from dew.interop.weights import AUTO
 from dew.nn.protocols import OutputTable
 from dew.nn.sharding import LogicalAxes, logical_spec, parameter_path
 from dew.registry import resolve_dtype
-from dew.training.distributed import PARAMETER_AXES, Layout, Placement
+from dew.training.distributed import Layout, Placement, parameter_axes
 
 if TYPE_CHECKING:
     import torch
@@ -115,7 +115,7 @@ class TorchLayout(Layout):
 
     def shardings[TreeT](self, mesh: Mesh, tree: TreeT) -> Placement[TreeT]:
         placed = super().shardings(mesh, tree)
-        sharded_devices = math.prod(mesh.shape[axis] for axis in PARAMETER_AXES)
+        sharded_devices = math.prod(mesh.shape[axis] for axis in parameter_axes(mesh.axis_names))
 
         def leaf_sharding(path, value, heuristic: NamedSharding) -> NamedSharding:
             names = parameter_path(path)
