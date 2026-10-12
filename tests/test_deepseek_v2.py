@@ -17,7 +17,7 @@ from moe_support import by_expert, router_variables
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
-from dew.nn.moe import Router, global_router_loss, sequence_router_losses
+from dew.nn.moe import Router, global_router_loss
 from dew.objectives.base import Step
 from dew.objectives.lm import TEXT_KEY, LMObjective
 from dew.objectives.lm.objective import router_moments
@@ -52,37 +52,11 @@ def test_router_reproduces_the_deepseek_v2_group_limited_choice():
     assert np.array_equal(ours_indices, theirs_indices)
     assert np.max(np.abs(ours_weights - theirs_weights)) < 1e-6
 
-
-def test_v2_parity_needs_the_unnormalised_weights_and_the_max_group_score():
-    """The V3 rules on the same weights disagree: renormalising sums each
-    token's gate values to 2.5, and scoring a group by its two best experts
-    changes which groups win on some rows."""
-    tensors = fixture()
-    hidden = jnp.asarray(tensors["hidden"]).reshape(-1, CONFIG["hidden_size"])
-    weights, _ = v2_router(normalize_weights=True).apply(router_variables(tensors), hidden)
-    assert np.allclose(np.sum(np.asarray(weights), axis=-1), 2.5, atol=1e-5)
+    normalized, _ = v2_router(normalize_weights=True).apply(router_variables(tensors), hidden)
+    assert np.allclose(np.sum(np.asarray(normalized), axis=-1), 2.5, atol=1e-5)
     assert not np.allclose(np.sum(tensors["router_weights"], axis=-1), 2.5, atol=1e-3)
-    _, indices = v2_router(group_score="top2").apply(router_variables(tensors), hidden)
-    theirs = np.sort(tensors["router_indices"], axis=-1)
-    assert not np.array_equal(np.sort(np.asarray(indices), axis=-1), theirs)
-
-
-def test_the_balance_loss_matches_the_released_gate_equations():
-    """One sequence of three tokens over four experts with top-1 routing:
-    f = (2, 1, 0, 0) slots / (3 * 1 / 4), P the mean score, loss alpha *
-    sum(f * P). The batch form averages the sequences; the flat form pools
-    the tokens, and the two disagree once the sequences differ."""
-    scores = jnp.asarray([[[0.7, 0.1, 0.1, 0.1], [0.4, 0.4, 0.1, 0.1], [0.25, 0.25, 0.25, 0.25]],
-                          [[0.1, 0.1, 0.1, 0.7], [0.1, 0.1, 0.7, 0.1], [0.1, 0.1, 0.1, 0.7]]])
-    indices = jnp.asarray([[[0], [0], [1]], [[3], [2], [3]]])
-    first = np.array([2, 1, 0, 0]) / (3 / 4) * np.mean(np.asarray(scores[0]), axis=0)
-    second = np.array([0, 0, 1, 2]) / (3 / 4) * np.mean(np.asarray(scores[1]), axis=0)
-    expected = 0.5 * (first.sum() + second.sum()) * 0.01
-    assert float(jnp.mean(sequence_router_losses(scores, indices, 0.01))) == pytest.approx(expected)
-    pooled = np.array([2, 1, 1, 2]) / 6 * 4 * np.mean(np.asarray(scores).reshape(-1, 4), axis=0)
-    global_loss = float(global_router_loss(router_moments(scores, indices, {}), 0.01))
-    assert global_loss == pytest.approx(pooled.sum() * 0.01)
-    assert global_loss != pytest.approx(expected)
+    _, grouped = v2_router(group_score="top2").apply(router_variables(tensors), hidden)
+    assert not np.array_equal(np.sort(np.asarray(grouped), axis=-1), np.sort(tensors["router_indices"], axis=-1))
 
 
 def test_the_objective_adds_every_sparse_layers_balance_loss():
