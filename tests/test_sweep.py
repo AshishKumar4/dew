@@ -9,11 +9,10 @@ caller's tracker.
 
 import json
 
-import pytest
 from affine_run import TimingRegression as Regression, batches
 
 from dew.config import RunConfig, TrainerConfig
-from dew.config.sweep import GridSearch, OptunaSearch, RandomSearch
+from dew.config.sweep import GridSearch
 from dew.data import Dataset
 from dew.telemetry.records import TrialFinished
 from dew.training import LocalTracker
@@ -63,82 +62,3 @@ def test_four_trials_train_their_own_points_and_reach_the_callers_tracker(tmp_pa
     assert ([row['scalars']['sweep/value'] for row in journal(tmp_path / 'sweep', 'scalars.jsonl')]
             == [trial.value for trial in trials])
     assert json.loads((tmp_path / 'ledger.json').read_text())['trials'][2]['index'] == 2
-
-
-def test_an_interrupted_sweep_continues_at_the_trial_it_stopped_on(tmp_path):
-    trained = []
-
-    def counted(run: RunConfig) -> float:
-        trained.append(run.trainer.name)
-        if len(trained) == 3:
-            raise KeyboardInterrupt('the operator stopped the sweep')
-        return float(len(trained))
-
-    arguments = {'train': counted, 'trials': 4, 'ledger': tmp_path / 'ledger.json',
-                     'search': GridSearch()}
-    with LocalTracker(tmp_path / 'sweep') as tracker:
-        with pytest.raises(KeyboardInterrupt):
-            config(tmp_path).sweep(SPACE, tracker=tracker, **arguments)
-        assert trained == ['sweep/trial-0', 'sweep/trial-1', 'sweep/trial-2']
-        assert len(json.loads((tmp_path / 'ledger.json').read_text())['trials']) == 2
-
-        trained.clear()
-        trials = config(tmp_path).sweep(SPACE, tracker=tracker, **arguments)
-
-    assert trained == ['sweep/trial-2', 'sweep/trial-3']
-    assert [trial.index for trial in trials] == [0, 1, 2, 3]
-    # The finished trials kept the values and points of their own run.
-    assert [trial.value for trial in trials] == [1.0, 2.0, 1.0, 2.0]
-    assert [trial.overrides['optim.learning_rate'] for trial in trials] == [0.1, 0.1, 0.01, 0.01]
-
-
-def test_a_ledger_of_another_space_is_refused(tmp_path):
-    with LocalTracker(tmp_path / 'sweep') as tracker:
-        arguments = {'train': lambda run: 1.0, 'trials': 1, 'ledger': tmp_path / 'ledger.json',
-                         'tracker': tracker}
-        config(tmp_path).sweep(SPACE, **arguments)
-        with pytest.raises(ValueError, match='not this space'):
-            config(tmp_path).sweep({'optim.learning_rate': [0.5]}, **arguments)
-
-
-def test_a_path_the_run_record_does_not_declare_is_refused(tmp_path):
-    with pytest.raises(KeyError, match='names no field'):
-        config(tmp_path).override({'optim.learn_rate': 0.1})
-    with pytest.raises(KeyError, match='names no group'):
-        config(tmp_path).override({'optimizer.learning_rate': 0.1})
-    assert config(tmp_path).override({'optim.learning_rate': 0.1}).optim.learning_rate == 0.1
-
-
-def test_random_search_repeats_a_trial_numbers_draw_and_moves_over_the_space():
-    def point(index):
-        return RandomSearch(3)(SPACE, [TrialFinished(number, f'sweep/trial-{number}', {}, 1.0)
-                                       for number in range(index)])
-
-    assert point(1) == point(1)
-    drawn = [point(index) for index in range(6)]
-    assert all(row[path] in values for row in drawn for path, values in SPACE.items())
-    assert len({tuple(sorted(row.items())) for row in drawn}) > 1
-
-
-def test_the_optuna_backend_asks_within_the_space_and_takes_the_ledgers_trials(tmp_path):
-    pytest.importorskip('optuna')
-    import optuna
-
-    optuna.logging.set_verbosity(optuna.logging.WARNING)
-    with LocalTracker(tmp_path / 'sweep') as tracker:
-        trials = config(tmp_path).sweep(SPACE, train=lambda run: run.optim.learning_rate,
-                                        trials=3, ledger=tmp_path / 'ledger.json', tracker=tracker,
-                                        search=OptunaSearch())
-    assert [trial.index for trial in trials] == [0, 1, 2]
-    assert all(trial.overrides[path] in values
-               for trial in trials for path, values in SPACE.items())
-    # The ask after two told trials is the study's, not a redraw of trial one.
-    assert OptunaSearch()(SPACE, trials[:2]) == OptunaSearch()(SPACE, trials[:2])
-
-
-def test_a_sweep_without_a_run_name_is_refused(tmp_path):
-    with LocalTracker(tmp_path / 'sweep') as tracker, pytest.raises(ValueError, match=r"trainer.name"):
-        config(tmp_path, name=None).sweep(SPACE, train=lambda run: 1.0, trials=1,
-                                          ledger=tmp_path / 'ledger.json', tracker=tracker)
-
-

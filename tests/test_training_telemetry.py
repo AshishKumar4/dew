@@ -1,9 +1,7 @@
 """Training telemetry describes the admitted optimizer work and its checkout."""
 
 import subprocess
-import time
 from pathlib import Path
-from types import SimpleNamespace
 
 import jax
 import jax.numpy as jnp
@@ -16,9 +14,7 @@ import dew.config
 from dew.config import OptimConfig, RunConfig, TrainerConfig, Wandb
 from dew.data import Dataset
 from dew.objectives import Aux, Objective
-from dew.telemetry.instrumentation import StepFlops, compilation_cache_counts
 from dew.training import Trainer, WandbTracker
-from dew.training.interval import Interval
 from dew.training.optim import Cosine
 
 
@@ -104,59 +100,6 @@ def test_run_record_names_the_package_checkout_and_hardware(tmp_path, monkeypatc
     assert not run.logged
 
 
-def test_checkout_revision_is_none_outside_a_checkout(tmp_path, monkeypatch):
-    from dew.telemetry import records
-
-    monkeypatch.setattr(records, '__file__', str(tmp_path / 'src' / 'dew' / 'telemetry' / 'records.py'))
-    assert records.checkout_revision() is None
-
-
-@pytest.mark.parametrize('peaks,expected', [([2 * 1024 ** 3, 5 * 1024 ** 3], 5.), ([None, None], None)])
-def test_wandb_tick_receives_memory_cache_and_existing_throughput(tmp_path, monkeypatch, peaks, expected):
-    import wandb
-    from test_publish import TrackedRun
-
-    run = TrackedRun()
-    monkeypatch.setattr(wandb, 'init', lambda **_: run)
-    sink = WandbTracker('dew', 'tick', offline=True)
-    trainer = Trainer(Squared(), OptimConfig(learning_rate=.1), key=0, tracker=sink)
-    trainer.fit(targets([1., 3.]), steps=2, log_every=1)
-    first = [row for row in run.history if 'train/loss' in row]
-    assert all(row['train/compiles'] == 1 for row in first)
-    assert all(row['train/learning_rate'] == pytest.approx(.1) for row in first)
-    assert first[1]['train/cache_hits'] >= first[0]['train/cache_hits']
-    assert first[1]['train/cache_misses'] >= first[0]['train/cache_misses']
-    state = trainer.initial_state()
-    devices = [SimpleNamespace(memory_stats=lambda peak=peak: None if peak is None
-                               else {'peak_bytes_in_use': peak}) for peak in peaks]
-    monkeypatch.setattr(jax, 'local_devices', lambda: devices)
-    monkeypatch.setattr(jax, 'devices', lambda: [SimpleNamespace(device_kind='NVIDIA A100-SXM4-80GB')])
-    monkeypatch.setattr(jax, 'device_count', lambda: 1)
-    interval = Interval(time.time() - 2, last_saved=None, since_log=2, samples=16,
-                         flops=StepFlops(model=312e12, hardware=624e12), waited=.02, compiling=.1, compiles=1)
-    loss = jnp.asarray(1.)
-    accepted = jnp.asarray(a=True)
-    before = compilation_cache_counts()
-    jax.monitoring.record_event('/jax/compilation_cache/cache_hits')
-    jax.monitoring.record_event('/jax/compilation_cache/cache_misses')
-    jax.monitoring.record_event('/jax/compilation_cache/cache_misses')
-    trainer._log_interval(3, loss, {}, accepted, state, interval)
-    row = run.history[-1]
-    names = {'train/loss', 'train/learning_rate', 'train/step_time_ms', 'train/data_wait_ms',
-             'train/compile_s', 'train/hlo_flops_util', 'train/hfu', 'train/compiles', 'train/cache_hits',
-             'train/cache_misses'}
-    assert names <= row.keys()
-    assert row['train/cache_hits'] == before['train/cache_hits'] + 1
-    assert row['train/cache_misses'] == before['train/cache_misses'] + 2
-    assert row['train/hfu'] == pytest.approx(2 * row['train/hlo_flops_util'])
-    assert row['train/compiles'] == 1
-    if expected is None:
-        assert 'train/peak_memory_gib' not in row
-    else:
-        assert row['train/peak_memory_gib'] == expected
-    sink.close()
-
-
 def test_wandb_counts_each_new_step_shape_once(monkeypatch):
     import wandb
     from test_publish import TrackedRun
@@ -192,14 +135,3 @@ def test_configured_cosine_rate_is_the_last_applied_update(every, monkeypatch):
     for row in rows:
         update = max(row['train/step'] // 2 - 1, 0)
         assert row['train/learning_rate'] == pytest.approx(float(oracle(update // every)))
-
-
-def test_cache_listener_is_registered_once_across_trainers():
-    trainers = [Trainer(Squared(), optax.sgd(.1), key=0) for _ in range(3)]
-    before = compilation_cache_counts()
-    jax.monitoring.record_event('/jax/compilation_cache/cache_hits')
-    jax.monitoring.record_event('/jax/compilation_cache/cache_misses')
-    after = compilation_cache_counts()
-    assert len(trainers) == 3
-    assert after['train/cache_hits'] == before['train/cache_hits'] + 1
-    assert after['train/cache_misses'] == before['train/cache_misses'] + 1

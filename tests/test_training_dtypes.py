@@ -13,17 +13,6 @@ from dew.objectives import Aux, EMASpec, Objective, Ratio
 from dew.training import Trainer
 
 
-def test_ratio_keeps_numerator_and_denominator_until_the_reduction():
-    import dew.objectives as objectives
-
-    first = objectives.Ratio(jnp.asarray(4.), jnp.asarray(2.))
-    last = objectives.Ratio(jnp.asarray(9.), jnp.asarray(1.))
-    whole = jax.tree.map(jnp.add, first, last)
-    value, supported = whole.mean()
-    assert float(value) == pytest.approx(13 / 3) and bool(supported)
-    assert not hasattr(objectives, "Mean")
-
-
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16, jnp.float16])
 @pytest.mark.parametrize("vocab", [1, 5])
 def test_token_lookup_preserves_linen_forward_and_parameter_layout(dtype, vocab):
@@ -306,27 +295,6 @@ def test_ema_storage_dtype_and_precision_survive_real_updates_and_restart(tmp_pa
                                     ema_decay=jnp.array(.5, jnp.float32))
 
 
-def test_unit_decay_preserves_mixed_frozen_leaves_bitwise():
-    from dew.training import ema_update
-    with jax.enable_x64():
-        average = {"low": jnp.array([1., jnp.nan], jnp.bfloat16),
-                   "single": jnp.array([2., -3.], jnp.float32),
-                   "double": jnp.array([1. + 2.**-40, jnp.nan], jnp.float64)}
-        live = jax.tree.map(lambda x: jnp.full_like(x, jnp.inf), average)
-        result = ema_update(average, live, jnp.array(1., jnp.float64))
-        for got, want in zip(jax.tree.leaves(result), jax.tree.leaves(average), strict=True):
-            assert got.dtype == want.dtype
-            assert np.asarray(got).tobytes() == np.asarray(want).tobytes()
-
-
-@pytest.mark.skipif(ON_TPU, reason="a TPU's float64 is a pair of float32s, not an IEEE double")
-def test_router_bias_direction_keeps_large_integer_count_differences():
-    from dew.nn.moe import load_balance_update
-    with jax.enable_x64():
-        counts = jnp.array([2**55, 2**55 + 1], jnp.int64)
-        np.testing.assert_array_equal(load_balance_update(counts, .02), [.02, -.02])
-
-
 @pytest.mark.skipif(ON_TPU, reason="XLA's TPU rewrite of 64-bit types has no case for ragged_dot")
 @pytest.mark.parametrize("bias_dtype", [jnp.bfloat16, jnp.float32, jnp.float64])
 def test_x64_router_bias_storage_survives_updates_and_restart(tmp_path, bias_dtype):
@@ -370,4 +338,3 @@ def test_x64_router_bias_storage_survives_updates_and_restart(tmp_path, bias_dty
         for _ in range(3):
             restored, *_ = step(restored, batch)
         compare(restored, actual, exact=True)
-

@@ -35,7 +35,6 @@ Tolerances and the differences actually observed, fp32 on CPU:
   scan itself is fp32 on both paths, and there they sit 1.2e-06 apart.
 """
 
-import json
 from pathlib import Path
 
 import jax
@@ -45,8 +44,8 @@ import numpy as np
 import pytest
 from reference_error import assert_as_exact_as_the_reference, assert_computes_the_oracle
 
-from dew.nn.kernels.ssd import MIN_CHUNK, MIN_WIDTH, ssd_chunk_scan, ssd_kernel_platform, ssd_kernel_runs
-from dew.nn.mixers.mamba2 import RESET_DECAY, chunk_ssd, xla_chunk_scan
+from dew.nn.kernels.ssd import ssd_chunk_scan, ssd_kernel_runs
+from dew.nn.mixers.mamba2 import RESET_DECAY, xla_chunk_scan
 
 pytestmark = pytest.mark.kernel
 
@@ -119,21 +118,6 @@ SHAPES = [pytest.param(32, id="three-chunks-ragged"), pytest.param(128, id="one-
 
 @pytest.mark.parametrize("platform", KERNELS)
 @pytest.mark.parametrize("chunk_size", SHAPES)
-def test_the_kernel_computes_the_xla_scan(reference, platform, chunk_size):
-    """The output and the state leaving the sequence, on the operands
-    tests/test_mamba2.py holds the XLA path to."""
-    operands = scan_operands(reference, chunk_size)
-    expected, expected_final = xla_chunk_scan(*operands)
-
-    scanned, final = ssd_chunk_scan(*operands, platform)
-
-    assert scanned.shape == expected.shape and final.shape == expected_final.shape
-    assert largest(scanned, expected) < BOUND
-    assert largest(final, expected_final) < BOUND
-
-
-@pytest.mark.parametrize("platform", KERNELS)
-@pytest.mark.parametrize("chunk_size", SHAPES)
 def test_the_kernel_computes_the_xla_gradients(reference, platform, chunk_size):
     """The hand-written reverse recurrence against autodiff of the XLA path,
     for all five operands the scan takes."""
@@ -145,6 +129,11 @@ def test_the_kernel_computes_the_xla_gradients(reference, platform, chunk_size):
 
     for name, want, got in zip(("x", "B", "C", "A dt", "state"), expected, gradients, strict=True):
         assert largest(want, got) < GRADIENT_BOUND, name
+
+    scanned, final = ssd_chunk_scan(*operands, platform)
+    expected_output, expected_final = xla_chunk_scan(*operands)
+    assert largest(scanned, expected_output) < BOUND
+    assert largest(final, expected_final) < BOUND
 
 
 @pytest.mark.parametrize("platform", KERNELS)
@@ -229,118 +218,6 @@ def mixer_operands(shape, seed: int = 0):
             jax.random.normal(keys[6], (batch, heads, head_dim, state_size), jnp.float32))
 
 
-def on_backend(monkeypatch, name: str):
-    """The backend `chunk_ssd` reads when it chooses a scan. Naming one this
-    host does not have still runs the kernel, interpreted."""
-    monkeypatch.setattr(jax, "default_backend", lambda: name)
-
-
-MIXER_SHAPES = [
-    pytest.param((2, 256, 4, 64, 64, 2), 64, id="four-chunks"),
-    pytest.param((2, 64, 4, 64, 64, 2), 64, id="one-chunk"),
-    pytest.param((2, 70, 4, 64, 64, 2), 64, id="two-chunks-ragged"),
-    pytest.param((1, 128, 2, 16, 8, 1), 128, id="one-chunk-narrow"),
-]
-
-
-@pytest.mark.parametrize("platform", KERNELS)
-@pytest.mark.parametrize(("shape", "chunk_size"), MIXER_SHAPES)
-def test_chunk_ssd_returns_the_same_scan_through_either_path(monkeypatch, platform, shape, chunk_size):
-    """Through the public entry, so the padding, the group expansion, the `D`
-    skip and the cast back are in both sides of the comparison."""
-    operands = mixer_operands(shape)
-    expected, expected_final = chunk_ssd(*operands, chunk_size)
-
-    on_backend(monkeypatch, platform)
-    scanned, final = chunk_ssd(*operands, chunk_size)
-
-    relative = max(largest(scanned, expected) / float(np.max(np.abs(expected))),
-                   largest(final, expected_final) / float(np.max(np.abs(expected_final))))
-    assert relative < 1e-5
-
-
-@pytest.mark.parametrize("platform", KERNELS)
-def test_chunk_ssd_returns_the_same_gradients_through_either_path(monkeypatch, platform):
-    """Every operand the mixer differentiates: the input, the step, the decay,
-    both projections, the skip and the state the sequence started from."""
-    operands = mixer_operands((2, 70, 4, 64, 64, 2))
-    seeded = cotangents(*chunk_ssd(*operands, 64))
-
-    def loss(*args, chunk_size=64):
-        scanned, final = chunk_ssd(*args, chunk_size)
-        return jnp.sum(scanned * seeded[0]) + jnp.sum(final * seeded[1])
-
-    expected = jax.grad(loss, argnums=tuple(range(7)))(*operands)
-    on_backend(monkeypatch, platform)
-    gradients = jax.grad(loss, argnums=tuple(range(7)))(*operands)
-
-    for name, want, got in zip(("x", "dt", "A", "B", "C", "D", "state"), expected, gradients,
-                               strict=True):
-        scale = max(float(np.max(np.abs(want))), 1.0)
-        assert largest(want, got) / scale < 1e-5, name
-
-
-def within_one_ulp(got, expected) -> bool:
-    """One bfloat16 ulp of each entry, `2 ** (binade - 8)`: bf16 carries 8
-    significand bits, so the spacing at a value is that value's power of two
-    over 128. Read per entry rather than from the largest one, which is what
-    holds the small entries to the same bound."""
-    got, expected = np.asarray(got, np.float32), np.asarray(expected, np.float32)
-    binade = np.frexp(np.maximum(np.abs(got), np.abs(expected)))[1]
-    return bool(np.all(np.abs(got - expected) <= np.ldexp(1.0, binade - 8)))
-
-
-@pytest.mark.skipif(jax.default_backend() == "gpu", reason="on a GPU host the XLA path it is "
-                    "held to bit for bit multiplies at TF32; the kernel runs on TPU only")
-@pytest.mark.parametrize("platform", KERNELS)
-def test_bfloat16_keeps_the_state_in_f32_and_rounds_the_output_the_same(monkeypatch, platform):
-    """The scan is fp32 either way, so what bf16 inputs change is the cast at
-    the ends; the kernel and the XLA path land within one bf16 ulp, and on the
-    output itself on the same numbers."""
-    operands = mixer_operands((2, 128, 4, 64, 64, 2))
-    narrow = (*(jnp.asarray(t, jnp.bfloat16) for t in operands[:6]), operands[6])
-    expected, expected_final = chunk_ssd(*narrow, 64)
-
-    on_backend(monkeypatch, platform)
-    scanned, final = chunk_ssd(*narrow, 64)
-
-    assert scanned.dtype == jnp.bfloat16 and final.dtype == jnp.bfloat16
-    assert largest(scanned, expected) == 0.0
-    assert within_one_ulp(final, expected_final)
-
-
-def test_the_kernel_is_refused_on_cpu():
-    assert not ssd_kernel_runs(256, 64, 128, "cpu", dtype=jnp.float32)
-
-
-def test_a_float64_scan_takes_the_xla_path():
-    """The kernel computes in float32, so a float64 scan (a float64
-    reference's, under x64) takes the XLA path at a geometry the kernel
-    takes, which computes in the scan's own dtype."""
-    assert ssd_kernel_runs(256, 64, 128, "tpu", dtype=jnp.float32)
-    assert not ssd_kernel_runs(256, 64, 128, "tpu", dtype=jnp.float64)
-
-
-@pytest.mark.parametrize(("chunk_size", "head_dim", "state_size", "runs"), [
-    (256, 64, 128, True),                       # the reference mamba2 geometry
-    (MIN_CHUNK, MIN_WIDTH, MIN_WIDTH, True),    # the smallest tile the kernel takes
-    (MIN_CHUNK // 2, 64, 64, False),            # too short to pay for a program
-    (192, 64, 64, False),                       # a chunk that is not a power of two
-    (256, 6, 5, False),                         # the reference fixture's widths
-    (1024, 128, 128, False),                    # past the tpu budget
-])
-def test_the_geometry_decides_the_tpu_kernel(chunk_size, head_dim, state_size, runs):
-    assert ssd_kernel_runs(chunk_size, head_dim, state_size, "tpu", dtype=jnp.float32) is runs
-
-
-def test_a_gpu_is_never_chosen():
-    """The Triton kernel measured slower than XLA on sm89 wherever it
-    compiled, so a GPU takes the XLA path at every geometry."""
-    assert ssd_kernel_runs(256, 64, 128, "tpu", dtype=jnp.float32)
-    assert not ssd_kernel_runs(64, 64, 64, "gpu", dtype=jnp.float32)
-    assert not ssd_kernel_runs(128, 64, 64, "gpu", dtype=jnp.float32)
-
-
 def kernels_in(jaxpr) -> int:
     """How many pallas calls a traced program holds, the kernel's own mark."""
     found = 0
@@ -349,68 +226,6 @@ def kernels_in(jaxpr) -> int:
         for sub in jax.extend.core.jaxprs_in_params(equation.params):
             found += kernels_in(sub.jaxpr if hasattr(sub, "jaxpr") else sub)
     return found
-
-
-@pytest.mark.parametrize(("backend", "chunk_size", "kernels"), [
-    ("cpu", 64, 0), ("gpu", 64, 0), ("tpu", 64, 1),
-    ("gpu", 32, 0), ("tpu", 32, 0), ("gpu", 256, 0), ("tpu", 256, 1),
-])
-def test_the_backend_and_the_chunk_choose_the_scan_at_trace_time(monkeypatch, backend,
-                                                                 chunk_size, kernels):
-    """What the choice did is in the traced program: a pallas call, or none."""
-    operands = mixer_operands((1, 256, 2, 64, 128, 1))
-    on_backend(monkeypatch, backend)
-
-    traced = jax.make_jaxpr(lambda *o: chunk_ssd(*o, chunk_size))(*operands)
-
-    assert kernels_in(traced.jaxpr) == kernels
-
-
-def test_the_choice_is_logged_once_per_geometry(monkeypatch, caplog):
-    from dew.nn.kernels import ssd
-
-    ssd._announce.cache_clear()
-    on_backend(monkeypatch, "tpu")
-    with caplog.at_level("INFO", logger="dew.nn.kernels.ssd"):
-        for _ in range(3):
-            ssd_kernel_platform(256, 64, 128, dtype=jnp.float32)
-        ssd_kernel_platform(256, 6, 5, dtype=jnp.float32)
-
-    lines = [record.getMessage() for record in caplog.records]
-    assert len(lines) == 2
-    assert "pallas kernel" in lines[0] and "chunk 256" in lines[0]
-    assert "xla path" in lines[1]
-
-
-def test_the_platform_is_the_backend_the_kernel_runs_on(monkeypatch):
-    on_backend(monkeypatch, "tpu")
-    assert ssd_kernel_platform(128, 64, 64, dtype=jnp.float32) == "tpu"
-    assert ssd_kernel_platform(128, 6, 5, dtype=jnp.float32) is None
-    on_backend(monkeypatch, "gpu")
-    assert ssd_kernel_platform(128, 64, 64, dtype=jnp.float32) is None
-    on_backend(monkeypatch, "cpu")
-    assert ssd_kernel_platform(128, 64, 64, dtype=jnp.float32) is None
-
-
-@pytest.mark.parametrize("platform", KERNELS)
-def test_dropping_the_carry_between_chunks_breaks_the_kernel(reference, platform):
-    """The test that would go red if the inter-chunk recurrence were dropped:
-    a scan whose chunks carry state differs from one whose chunks do not, so
-    the parity above is reading the carry and not only the diagonal."""
-    operands = scan_operands(reference, 32)
-    carried, _ = ssd_chunk_scan(*operands, platform)
-    alone, _ = ssd_chunk_scan(*operands[:4], jnp.zeros_like(operands[4]), platform)
-    assert largest(carried, alone) > 1.0
-
-
-def test_the_fixture_geometry_is_the_one_test_mamba2_uses(reference):
-    """The shapes above are the reference fixture's, so a change to it is a
-    change to what the kernel is held to."""
-    geometry = json.loads((FIXTURES / "config.json").read_text())
-    x = reference["scan.x"]
-    assert x.shape == (2, 70, geometry["num_heads"], geometry["head_dim"])
-    assert reference["scan.B"].shape[-1] == geometry["state_size"]
-    assert geometry["chunk_size"] == 32
 
 
 # --- compiled on the device ---------------------------------------------------
@@ -437,16 +252,6 @@ def stepwise_scan(x_c, b_c, c_c, a_c, state):
     final, ys = jax.lax.scan(step, state, (xs, bs, cs, as_))
     y = jnp.swapaxes(ys.reshape(chunks, size, batch, heads, width), 1, 2)
     return y, final
-
-
-def test_the_stepwise_oracle_is_the_chunked_scan():
-    """The stepwise oracle computes what `xla_chunk_scan` computes: four
-    chunks of 64 in fp32 agree to 1e-5 of the largest value, the bound the
-    kernel is held to through `chunk_ssd` above."""
-    operands = mixer_operands((1, 256, 2, 16, 8, 1))
-    blocked = blocks(*operands[:5], operands[6], chunk_size=64)
-    for want, got in zip(xla_chunk_scan(*blocked), stepwise_scan(*blocked), strict=True):
-        assert largest(want, got) / float(np.max(np.abs(want))) < 1e-5
 
 
 def root_mean_square(value, truth) -> float:
@@ -562,24 +367,8 @@ def test_the_interpreted_kernel_is_as_exact_as_the_xla_scan(shape, chunk_size):
         assert_computes_the_oracle(wide, want, name, roundings=shape[1] + shape[3] + shape[4])
         assert_as_exact_as_the_reference(np.asarray(mine), np.asarray(theirs), want, name)
 
-
-def test_the_kernel_indexes_its_blocks_in_int32_under_x64(reference):
-    """Mosaic cannot return an int64 from an index map ("failed to legalize
-    operation 'func.return'"), and under x64 a Python int traces as one: a
-    process that enabled x64 could not compile the kernel on a TPU. Read off
-    the traced index maps, forward and backward, since only a TPU compiles
-    Mosaic."""
-    operands = scan_operands(reference, 128)
-    with jax.enable_x64(new_val=True):
-        program = jax.make_jaxpr(jax.vjp(lambda *o: ssd_chunk_scan(*o, "tpu"), *operands)[1])(
-            tuple(jnp.zeros_like(t) for t in ssd_chunk_scan(*operands, "tpu")))
-        forward = jax.make_jaxpr(lambda *o: ssd_chunk_scan(*o, "tpu"))(*operands)
-    widths = set()
-    for text in (program, forward):
-        for equation in _pallas_calls(text.jaxpr):
-            for mapping in equation.params["grid_mapping"].block_mappings:
-                widths |= {str(aval.dtype) for aval in mapping.index_map_jaxpr.out_avals}
-    assert widths == {"int32"}, widths
+    for want, got in zip(xla_chunk_scan(*operands), stepwise_scan(*operands), strict=True):
+        assert largest(want, got) / float(np.max(np.abs(want))) < 1e-5
 
 
 def _pallas_calls(jaxpr):

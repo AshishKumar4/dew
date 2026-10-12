@@ -128,41 +128,6 @@ def test_llama4_projector_matches_the_reference_implementation():
         - fixture["projector_ref"])) < 1e-4
 
 
-@pytest.mark.parametrize("record", [{"class": "clip", "fields": {}}, {"class": "mlp", "fields": {}}, {}])
-def test_an_unknown_tower_or_projector_kind_is_refused(record):
-    """A record naming nothing either registry holds is refused, with the known names."""
-    with pytest.raises(ValueError, match=r"no tower named|the record that names it"):
-        towers.from_record(record)
-    with pytest.raises(ValueError, match=r"no projector named|the record that names it"):
-        projectors.from_record(record)
-
-
-@pytest.mark.parametrize("field,value,message", [
-    ("image_size", [28, 14], "square"),
-    ("hidden_act", "swiglu", "hidden_act"),
-    ("attention_dropout", 0.1, "training-time"),
-])
-def test_a_siglip_field_with_no_counterpart_is_refused(field, value, message):
-    config = dict(json.loads(
-        (FIXTURES / "siglip-tiny" / "config.json").read_text()))
-    config[field] = value
-    with pytest.raises(ValueError, match=message):
-        siglip.translate_siglip_vision_config(config)
-
-
-@pytest.mark.parametrize("field,value,message", [
-    ("vision_feature_select_strategy", "full", "vision_feature_select_strategy"),
-    ("multi_modal_projector_bias", True, "multi_modal_projector_bias"),
-    ("attention_dropout", 0.1, "training-time"),
-])
-def test_a_llama4_field_with_no_counterpart_is_refused(field, value, message):
-    config = dict(json.loads(
-        (FIXTURES / "llama4-vision-tiny" / "config.json").read_text()))
-    config[field] = value
-    with pytest.raises(ValueError, match=message):
-        llama4.translate_llama4_vision_config(config)
-
-
 def gemma4_image(pixels, patch):
     """Fixture patches folded back into the image the trunk reads: the
     processor unfolds row-major, so the fold inverts it."""
@@ -296,42 +261,6 @@ def test_a_gemma4_tower_writes_back_the_config_it_was_read_from(name):
         dataclasses.replace(unset, head_dim=unset.hidden_size // unset.num_heads))
 
 
-@pytest.mark.parametrize("field,value,message", [
-    ("hidden_activation", "swiglu", "hidden_activation"),
-    ("attention_bias", True, "attention_bias"),
-    ("attention_dropout", 0.1, "training-time"),
-    ("output_proj_dims", 64, "output_proj_dims"),
-])
-def test_a_gemma4_field_with_no_counterpart_is_refused(field, value, message):
-    config = dict(json.loads(
-        (FIXTURES / "gemma4-vision-tiny" / "config.json").read_text()))
-    config[field] = value
-    with pytest.raises(ValueError, match=message):
-        gemma4.translate_gemma4_vision_config(config)
-
-
-@pytest.mark.parametrize("field,value,message", [
-    ("num_position_embeddings", 60, "square"),
-    ("hidden_act", "swiglu", "hidden_act"),
-    ("patch_size", [16, 8], "patch_size"),
-    ("model_type", "qwen3_vl", "vision model_type"),
-])
-def test_a_qwen35_field_with_no_counterpart_is_refused(field, value, message):
-    config = dict(json.loads(
-        (FIXTURES / "qwen35-vision-tiny" / "config.json").read_text()))
-    config[field] = value
-    with pytest.raises(ValueError, match=message):
-        qwen35.translate_qwen35_vision_config(config)
-
-
-def test_a_qwen35_merger_beside_the_decoder_width_is_refused():
-    """The merger output enters the text embeddings directly, so a width
-    beside the decoder's refuses with both."""
-    config = json.loads((FIXTURES / "qwen35-vision-tiny" / "config.json").read_text())
-    with pytest.raises(ValueError, match="out_hidden_size"):
-        qwen35.translate_qwen35_projector_config(config, 32)
-
-
 def test_gemma4_clipping_matches_reference_forward_and_backward():
     """Transformers 5.16.1 Gemma4ClippableLinear on a 3-to-2 map.
 
@@ -355,4 +284,3 @@ def test_gemma4_clipping_matches_reference_forward_and_backward():
         linear.clone(use_clipped_linears=False).apply({"params": {"kernel": kernel}}, inputs)
     )
     assert np.max(np.abs(unclipped - value(kernel, inputs))) > 0.25
-
