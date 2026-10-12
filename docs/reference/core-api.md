@@ -140,7 +140,7 @@ compile(train, *, validation=None, host=(), objective=None, read="indexed",
         provision=False, loading=Loading(), seed=0)
 Dataset(train, val, records, batch, ramp=None)
 DataPartition(index=0, count=1, readers=1, reader=0)
-Loading(workers=0, threads=64, read_buffer=128, worker_buffer=2)
+Loading(workers=0, threads=16, read_buffer=16, worker_buffer=2)
 ```
 
 A recipe is a frozen value implementing `Recipe.pipelines()`: it returns the training Pipeline, an optional finite validation Pipeline and common host steps. The aliases are `records`, `text`, `chat`, `prompts`, `preferences`, `images`, `video` and `decisions`. Source URLs belong in `source`; `load` refuses a bare URI.
