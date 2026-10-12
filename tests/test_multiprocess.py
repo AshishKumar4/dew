@@ -1262,6 +1262,19 @@ def test_evaluation_counts_rows_once_across_replicated_process_axes(tmp_path, ax
 
 
 @pytest.mark.distributed
+def test_ranks_whose_clocks_differ_evaluate_at_roots(tmp_path):
+    """Rank 1's step and schedule step run ahead of rank 0's. Both report
+    root's step and event identity, and a diffusion validation loss, which
+    draws its noise from the event key, scores as one process at root's
+    clocks scores it, to the pool's reduction order."""
+    reports = run_pool("evaluation_clocks", tmp_path, 2, devices=1)
+    alone = run_pool("evaluation_clocks", tmp_path / "alone", 1, devices=2)[0]
+    assert reports[0] == reports[1], reports
+    assert (reports[0]["step"], reports[0]["event"]) == (alone["step"], alone["event"]) == (5, alone["event"])
+    assert reports[0]["scores"] == pytest.approx(alone["scores"], rel=1e-5), (reports, alone)
+
+
+@pytest.mark.distributed
 def test_builtin_previews_coordinate_nested_setup_generation_and_transfer_failures(tmp_path):
     reports = run_pool("builtin_preview_failures", tmp_path, 2, devices=1)
     for kind in ("lm", "diffusion", "masked"):

@@ -756,6 +756,14 @@ class TrainerConfig:
         return (Best(self.best),) if isinstance(self.best, str) else (
             self.best if isinstance(self.best, tuple) else (self.best,))
 
+    def resumes(self) -> bool:
+        """Whether this run continues from a checkpoint of its own: a named run whose directory holds a
+        step a resume reads (`Checkpoints.latest`). Its weights then come from that step, so the source
+        it started from need not be read (`Pretrained.load`'s `weights`)."""
+        if self.name is None:
+            return False
+        return Checkpoints(os.path.join(self.checkpoint_dir, self.name), keep=self.keep).latest is not None
+
     def total_steps(self, dataset: Loader) -> int | None:
         """Return the step cap from `steps` or `epochs`, None for a token-only run."""
         if self.steps is not None:

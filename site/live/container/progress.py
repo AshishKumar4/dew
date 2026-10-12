@@ -17,11 +17,11 @@ import io
 import json
 import queue
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
 from typing import Any
 
 import jax
 import numpy as np
+from flax import struct
 from PIL import Image
 
 # Stable Diffusion's VAE latents (sd-vae-ft-mse, as the model is trained on)
@@ -40,9 +40,10 @@ def _report(denoised: Any) -> None:
     _steps.put(np.asarray(denoised[0], np.float32))
 
 
-@dataclass(frozen=True)
+@struct.dataclass
 class ReportingSolver:
-    """`inner`, sending each step's clean prediction to `_report`."""
+    """`inner`, sending each step's clean prediction to `_report`; a pytree
+    around it, as a call takes its solver as data."""
 
     inner: Any
 

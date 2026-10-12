@@ -32,7 +32,7 @@ from dew.inference import RunProcessor, TextGeneration
 from dew.inputs import Field, unit_range
 from dew.objectives.base import merge
 from dew.objectives.diffusion import DiffusionRunConfig, PretrainedAutoencoder, TextCondition
-from dew.sampling import APG, CFG, CFGPlusPlus, Euler, Heun, TextToImage
+from dew.sampling import APG, CFG, CFGPlusPlus, DPMSolverSDE, Euler, Heun, TextToImage
 from dew.sampling.pipelines import Images
 from dew.training import Checkpoints, Trainer
 
@@ -157,9 +157,7 @@ def test_repeated_image_requests_reuse_their_programs_and_read_back_only_results
     """Prompts of the same count and sampling settings after the first run
     the programs it compiled, and nothing comes back to the host but the
     images (`steady_state`). A request's prompts and key reach the device
-    as it arrives, so only reads are held. Unguided: the task's cached
-    blank conditions sit on one device and move to the mesh at every
-    guided request."""
+    as it arrives, so only reads are held."""
     make_run(tmp_path)
     pipe = TextToImage.from_run(str(tmp_path))
     keys = [jax.random.key(index) for index in range(3)]
@@ -301,6 +299,32 @@ def test_sampler_and_guidance_are_call_arguments(tmp_path):
     assert np.array_equal(pipe(["x"], steps=8, guidance=None, solver=Heun(), key=key).host().images, plain)
     assert np.array_equal(pipe(["x"], steps=8, guidance=4.0, solver=Heun(), key=key).host().images,
                           pipe(["x"], steps=8, guidance=CFG(4.0), solver=Heun(), key=key).host().images)
+
+
+def test_another_guidance_scale_seed_or_grid_reuses_the_compiled_walk(tmp_path):
+    """A request's CFG scale, a Brownian solver's seed and an explicit grid's values are data to the
+    image walk: another value changes the sample and runs the program the first value compiled."""
+    from dew.sampling import pipelines
+
+    make_run(tmp_path)
+    loaded = TextToImage.from_run(str(tmp_path))
+    pipe = dataclasses.replace(loaded, variables=jax.tree.map(lambda leaf: leaf + 0.05, loaded.variables))
+    grid = np.asarray(pipe.process.times(8), np.float32)
+    nudged = grid.copy()
+    nudged[4] = 0.5 * (grid[3] + grid[4])
+
+    def draw(scale=4.0, seed=1, times=None):
+        prepared = pipe.prepare(["x"], key=0, steps=8, times=times)
+        return pipe(prepared, steps=8, guidance=CFG(scale), solver=DPMSolverSDE(seed=seed),
+                    key=jax.random.PRNGKey(1)).host().images
+
+    first = draw(times=grid)
+    compiled = pipelines._run(None)._cache_size()
+    for other in (draw(scale=2.0, times=grid), draw(seed=2, times=grid), draw(times=nudged)):
+        assert not np.allclose(other, first)
+    assert np.array_equal(draw(times=grid), first)
+    assert np.array_equal(draw(), first)
+    assert pipelines._run(None)._cache_size() == compiled
 
 
 def test_the_run_record_refuses_a_field_it_does_not_know(tmp_path):
@@ -956,14 +980,7 @@ def test_saved_diffusion_precision_reconstructs_owners_without_source_weights(
         TextToImage.from_objective(objective, expected_params),
         model=objective.model.clone(dtype=target),
         inputs=inputs,
-        autoencoder=expected_vae,
-        # The unconditional branch is encoded from the weights the task is
-        # built over, so the oracle encodes it from the restored ones too.
-        blank=lambda given: jax.tree.map(
-            lambda held, value: jnp.asarray(held, value.dtype),
-            {"textcontext": expected_encoder.encode(
-                expected_params["encoders"]["textcontext"],
-                expected_encoder.tokenize([condition.unconditional]))}, given))
+        autoencoder=expected_vae)
 
     np.testing.assert_array_equal(restored(["a red bird"], steps=2, key=5).host().images,
                                   reference(["a red bird"], steps=2, key=5).host().images)
@@ -1057,53 +1074,40 @@ def test_saved_bare_encoder_weights_follow_storage_without_changing_compute(tmp_
 
 
 
-@pytest.mark.parametrize("precision", ["highest", None])
-def test_restored_bf16_clip_blank_and_samples_are_the_objectives_bits(tmp_path, precision):
-    """The checkpoint's task and the objective's pipeline encode the empty
-    CLIP prompt with the same eager arithmetic, not a fused one-row JIT.
-    Keep the denoiser float32 and CLIP bf16, as the published hybrid DiT is.
-    The construction precision travels with the artifact, not the caller's
-    context at restore.
-    """
+def test_a_restored_task_reads_the_training_steps_blank_to_the_bit(tmp_path):
+    """Fit, save, restore, sample: the restored task's unconditional branch is the one the training
+    step encoded (`DiffusionObjective.blank_conditions` over the step's own towers), to the bit, with a
+    bf16 CLIP as the published hybrid DiT has, and the task samples as the objective's own does."""
     from pathlib import Path
 
     config = stating(dataclasses.replace(
         run_config(tmp_path, preset=Flow()),
         text=TextCondition(encoder="clip_text", checkpoint=str(Path(__file__).parent / "fixtures/clip/tiny"),
                            dtype="bfloat16")), guidance=CFG(5.0), ema_decay=None)
-    with jax.default_matmul_precision(precision):
-        objective = config.build()
+    objective = config.build()
     trainer = Trainer(objective, optax.adam(1e-2), key=jax.random.key(0))
     state = trainer.initial_state()
     batch = {"image": np.full((jax.device_count(), RES, RES, 3), 180, np.uint8),
              **objective.inputs.tokenize(["a bird"] * jax.device_count())}
     state, *_ = trainer.compile(state, batch)(state, batch)
     checkpoints = Checkpoints(str(tmp_path))
-    artifact = objective.inference_record()
-    assert artifact["condition_precision"] == precision
-    checkpoints.save(1, state, None, artifact=artifact)
+    checkpoints.save(1, state, None, artifact=objective.inference_record())
     checkpoints.wait()
     original = objective.pipeline(state, ema=False)
-    with jax.default_matmul_precision("default" if precision == "highest" else "highest"):
-        restored = TextToImage.from_run(str(tmp_path), ema=False)
+    restored = TextToImage.from_run(str(tmp_path), ema=False)
 
-    prepared = original.prepare(["a bird", "a cat"], key=0, steps=8)
-    assert restored.blank is not None
-    assert restored.blank.precision == precision
-    want = objective.blank_conditions(prepared.conditions)
-    got = restored.blank(prepared.conditions)
-    for actual, expected in zip(jax.tree.leaves(got), jax.tree.leaves(want), strict=True):
+    prepared = restored.prepare(["a bird", "a cat"], key=0, steps=8)
+    stepped = jax.jit(objective.blank_conditions)(state.variables, prepared.conditions)
+    for actual, expected in zip(jax.tree.leaves(prepared.unconditional), jax.tree.leaves(stepped),
+                                strict=True):
         np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
     np.testing.assert_array_equal(restored(["a bird", "a cat"], steps=8, key=0).host().images,
                                   original(["a bird", "a cat"], steps=8, key=0).host().images)
 
 
-def test_binding_new_encoder_weights_recomputes_the_warmed_blank(tmp_path):
-    """A restored task warms both branches, then binds a new encoder tree.
-    Its conditional and unconditional features and samples match a fresh
-    task over those weights, not the old cached unconditional features.
-    Binding only a denoiser update preserves the cache.
-    """
+def test_binding_new_encoder_weights_encodes_both_branches_with_them(tmp_path):
+    """A restored task binds a new encoder tree: its conditional and unconditional features and
+    samples match a fresh task over those weights, not the old ones."""
     from pathlib import Path
 
     config = stating(dataclasses.replace(
@@ -1121,13 +1125,7 @@ def test_binding_new_encoder_weights_recomputes_the_warmed_blank(tmp_path):
     checkpoints.wait()
     restored = TextToImage.from_run(str(tmp_path), ema=False)
     prompts = ["a bird", "a cat"]
-    old = restored.prepare(prompts, key=0, steps=8)
-    assert restored.blank is not None
-    old_blank = restored.blank(old.conditions)
-
-    denoiser_update = {**restored.variables, "params": jax.tree.map(lambda value: value + 0.03125,
-                                                             restored.variables["params"])}
-    assert restored.bind(denoiser_update).blank is restored.blank
+    old_blank = restored.prepare(prompts, key=0, steps=8).unconditional
     encoders = jax.tree.map(lambda value: value + 0.03125, restored.variables["encoders"])
     changed = {**restored.variables, "encoders": encoders}
     rebound = restored.bind(changed)
@@ -1135,9 +1133,7 @@ def test_binding_new_encoder_weights_recomputes_the_warmed_blank(tmp_path):
     fresh = TextToImage.from_objective(fresh_objective, changed)
     bound_inputs = rebound.prepare(prompts, key=0, steps=8)
     fresh_inputs = fresh.prepare(prompts, key=0, steps=8)
-    assert rebound.blank is not None and fresh.blank is not None
-    new_blank = rebound.blank(bound_inputs.conditions)
-    expected_blank = fresh.blank(fresh_inputs.conditions)
+    new_blank, expected_blank = bound_inputs.unconditional, fresh_inputs.unconditional
     assert any(not np.array_equal(np.asarray(left), np.asarray(right))
                for left, right in zip(jax.tree.leaves(old_blank), jax.tree.leaves(new_blank), strict=True))
     for actual, expected in zip(jax.tree.leaves((bound_inputs.conditions, new_blank)),

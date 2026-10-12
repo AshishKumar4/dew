@@ -15,16 +15,13 @@ import numpy as np
 import pytest
 
 from dew.interop.codecs import MXFP4, dequantize_mxfp4, quantize_mxfp4
+from dew.nn.fake_quant import E2M1
 from dew.nn.gpt_oss import GptOssMLP
 
 FIXTURES = Path(__file__).parent / "fixtures" / "gpt_oss"
 
 ENCODER = FIXTURES / "mxfp4_encoder.npz"
 """Weights and the blocks and scales transformers' encoder wrote for them, by domain."""
-
-E2M1 = np.array([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], np.float32)
-"""Every E2M1 magnitude, in code order."""
-
 
 def released_decode(blocks: np.ndarray, scales: np.ndarray) -> np.ndarray:
     """dew's bytes through the released reader, at the bf16 it ships."""
@@ -87,7 +84,7 @@ def test_mxfp4_encodes_every_codepoint_and_the_released_reader_agrees():
     """One group holding all sixteen E2M1 values twice, so its scale is 1 and
     each value is its own code. atol 0, observed difference 0, both zeros
     kept apart."""
-    weight = np.tile(np.concatenate([E2M1, -E2M1]), 2).reshape(1, 32, 1)
+    weight = np.tile(E2M1, 2).reshape(1, 32, 1)
     blocks, scales = quantize_mxfp4(weight)
 
     assert (blocks.shape, blocks.dtype) == ((1, 1, 1, 16), np.uint8)

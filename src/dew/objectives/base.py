@@ -673,11 +673,14 @@ class Objective(ABC, Generic[Loss, Effects]):
         return tree
 
     def _compiled_program(self, name: str, function: Callable, *, static_argnames: tuple[str, ...] = ()):
-        """Reuse a program only while this objective's modules and head tiles stay fixed.
+        """Reuse a program only while this objective's modules and head tiles stay fixed, and under the
+        context it traced in (`trace_context`).
 
         Fit's ladder replaces the immutable Flax model and may change a
-        tiled head. Argument shapes alone cannot identify those programs.
-        Keep only the current specialization, not a history of old models.
+        tiled head. Argument shapes alone cannot identify those programs, nor
+        can they the pipeline's microbatch count, the layout's rules or the
+        links a model decides from. Keep only the current specialization, not
+        a history of old models.
         """
         programs = tuple((program.module, program.head_tile) for program in self.program_key())
         cached = vars(self).get('_program_cache')
@@ -686,14 +689,17 @@ class Objective(ABC, Generic[Loss, Effects]):
                                                                                       strict=True)):
             cached = (programs, {})
             self._program_cache = cached
-        if name not in cached[1]:
+        from dew.nn.sharding import trace_context
+
+        key = (name, trace_context())
+        if key not in cached[1]:
             # A fresh callable gives JAX a fresh trace even for the same bound method.
             @functools.wraps(function)
             def run(*args, **kwargs):
                 return function(*args, **kwargs)
 
-            cached[1][name] = jax.jit(run, static_argnames=static_argnames)
-        return cached[1][name]
+            cached[1][key] = jax.jit(run, static_argnames=static_argnames)
+        return cached[1][key]
 
     @property
     def _validation_loss(self):

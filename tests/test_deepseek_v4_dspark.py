@@ -38,6 +38,8 @@ from reference_error import FACTOR, assert_as_exact_as_the_reference, distance
 from dew.interop import Pretrained
 from dew.interop.hf_decoders import families, translate_config
 from dew.nn.inputs import ModelInputs
+from dew.objectives.lm import LMObjective
+from dew.objectives.lm.objective import router_counts
 from dew.registry import models
 from dew.sampling import Sample, Sampling, Speculative, generate
 from tools.deepseek_v41_numerics import cached_run, decided, forward
@@ -197,6 +199,23 @@ def test_speculative_decoding_drafts_with_dspark_and_emits_the_greedy_walk(sourc
 @pytest.mark.network
 @pytest.mark.skipif(not os.environ.get("DEW_NETWORK_TESTS"),
                     reason="DEW_NETWORK_TESTS=1 reads deepseek-ai/DeepSeek-V4-Flash-0731's config and index")
+def test_load_balancing_moves_the_routers_the_trunk_ran_and_no_other(source):
+    """The drafter's stages keep balancing biases of their own, which an LM
+    forward does not run; counting and moving the biases follows the routers
+    the forward sowed choices for, so the trunk's move and the stages' stay."""
+    objective = LMObjective(source.model, 8, balance_rate=1e-3)
+    tokens = jax.random.randint(jax.random.key(0), (2, 9), 0, source.model.vocab_size)
+    sown = objective.token_scores(source.variables, tokens, routing=True).routing
+    counts = router_counts(source.variables["moe"], sown)
+    ran = {path[0] for path in flatten_dict(counts)}
+    stored = {path[0] for path in flatten_dict(source.variables["moe"])}
+    assert ran and ran < stored and all(name.startswith("layers_") for name in ran)
+    moved = flatten_dict(objective.apply_effects(source.variables, counts)["moe"])
+    for path, bias in flatten_dict(source.variables["moe"]).items():
+        unchanged = np.array_equal(np.asarray(moved[path]), np.asarray(bias))
+        assert unchanged == (path[0] not in ran), path
+
+
 def test_the_released_config_and_index_are_the_pinned_ones():
     """The committed config and tensor names are the release's at the pinned
     revision, and DeepSeek-V4-Flash-DSpark ships the same config.json, so the

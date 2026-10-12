@@ -24,6 +24,7 @@ from dew.data.dataset import Loader
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import GatedMLP, Mixture
 from dew.nn.moe import SparseMLP
+from dew.nn.sharding import LayoutRefused
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
 from dew.registry import models
@@ -224,12 +225,13 @@ def expert_specs(expert_size, fsdp_size, num_experts=8, min_shard_size=TINY_SHAR
 @pytest.mark.parametrize("expert_size,fsdp_size", [(1, 8), (2, 4), (4, 2)])
 def test_the_expert_dimension_takes_the_expert_axis(expert_size, fsdp_size):
     """Eight experts over one, two and four expert shards. The expert axis
-    carries the expert dimension alone, so the widths keep fsdp."""
+    carries the expert dimension alone, so the widths keep fsdp, on the
+    leading one (`dew.nn.sharding.DEFAULT_RULES`)."""
     _, specs = expert_specs(expert_size, fsdp_size)
     expert_axis = 'expert' if expert_size > 1 else None
 
-    assert specs["experts"]["gate_proj"]["kernel"] == P(expert_axis, None, 'fsdp')
-    assert specs["experts"]["up_proj"]["kernel"] == P(expert_axis, None, 'fsdp')
+    assert specs["experts"]["gate_proj"]["kernel"] == P(expert_axis, 'fsdp')
+    assert specs["experts"]["up_proj"]["kernel"] == P(expert_axis, 'fsdp')
     assert specs["experts"]["down_proj"]["kernel"] == P(expert_axis, 'fsdp')
     # The router's expert dimension rides the axis too; its width keeps fsdp.
     assert specs["gate"]["kernel"] == (
@@ -252,7 +254,7 @@ def test_an_expert_count_the_axis_cannot_split_keeps_the_widths_sharded():
     dropped and the parameter still shards on the dimension that can."""
     _, specs = expert_specs(expert_size=4, fsdp_size=2, num_experts=6)
 
-    assert specs["experts"]["gate_proj"]["kernel"] == P(None, None, 'fsdp')
+    assert specs["experts"]["gate_proj"]["kernel"] == P(None, 'fsdp')
 
 
 @pytest.mark.mesh
@@ -279,20 +281,27 @@ def test_every_expert_parallel_layout_stays_inside_the_sharding_tolerance(
 
 
 @pytest.mark.mesh
-def test_a_mostly_dense_model_on_expert_only_parallelism_is_rejected():
-    """Expert parallelism splits the experts alone, so a model whose experts
-    are a fifth of it runs mostly replicated. The check has to see that,
-    which the fsdp-only rule could not: it returned as soon as the fsdp axis
-    was one.
-    """
-    model = models.build("causal_transformer", **moe_config())
-    variables = jax.eval_shape(
-        model.init, jax.random.key(0), jnp.ones((1, SEQ_LEN), jnp.int32))
-    mesh = MeshSpec(fsdp=1, expert=8).build()
+def test_an_expert_mesh_keeps_dense_weights_whole_and_an_fsdp_mesh_that_divides_nothing_is_refused():
+    """The check counts a weight only where a rule could split it over one
+    of the mesh's axes. An expert-only mesh splits the experts alone and
+    keeps a mixture's dense weights whole, as a data axis keeps every weight
+    whole, so it passes; an fsdp axis that divides none of the widths its
+    rules name leaves them all replicated, and is refused."""
+    variables = jax.eval_shape(models.build("causal_transformer", **moe_config()).init,
+                               jax.random.key(0), jnp.ones((1, SEQ_LEN), jnp.int32))
     layout = Layout(min_shard=TINY_SHARD)
+    mesh = MeshSpec(fsdp=1, expert=8).build()
     shardings = layout.shardings(mesh, variables)
+    assert {sharding.spec for sharding in jax.tree.leaves(shardings)} >= {P(), P("expert")}
+    layout.check(variables["params"], shardings["params"], mesh)
 
-    with pytest.raises(ValueError, match="replicated"):
+    odd = {**moe_config(), "vocab_size": 36, "emb_features": 36, "mlp_features": 36, "num_heads": 3,
+           "num_kv_heads": 3, "mixture": {"experts": 3, "top_k": 2, "layers": (1,)}}
+    variables = jax.eval_shape(models.build("causal_transformer", **odd).init,
+                               jax.random.key(0), jnp.ones((1, SEQ_LEN), jnp.int32))
+    mesh = MeshSpec(fsdp=8).build()
+    shardings = layout.shardings(mesh, variables)
+    with pytest.raises(LayoutRefused):
         layout.check(variables["params"], shardings["params"], mesh)
 
 
@@ -377,8 +386,8 @@ def test_the_experts_are_really_split_across_the_expert_axis():
     experts = state.variables["params"]["layers_1"]["mlp"]["experts"]
     kernel = experts["gate_proj"]["kernel"]
 
-    assert kernel.sharding.spec == P('expert', None, 'fsdp')
-    assert kernel.addressable_shards[0].data.shape == (2, 32, 32)
+    assert kernel.sharding.spec == P('expert', 'fsdp')
+    assert kernel.addressable_shards[0].data.shape == (2, 16, 64)
     moments = state.opt_state[0].mu["layers_1"]["mlp"]["experts"]
     assert moments["gate_proj"]["kernel"].sharding.spec == kernel.sharding.spec
 

@@ -135,7 +135,8 @@ class MaskedDiffusionObjective(Objective[Ratio]):
         return ObjectiveData(train=(geometry,), evaluate=(geometry,))
 
     def task_record(self) -> Mapping[str, JSON]:
-        """The row length, tokenizer, process, solver and sampling steps."""
+        """The row length, response budget, tokenizer, process, solver and sampling steps: the
+        task's own."""
         from dew.inference.tasks import recorded_tokenizer
         from dew.registry import to_record
         return {'seq_len': self.seq_len, 'max_new_tokens': self.seq_len,
@@ -146,12 +147,12 @@ class MaskedDiffusionObjective(Objective[Ratio]):
     def build_task(self, variables: Variables, *,
                    processor: Processor | None | Omitted = OMITTED) -> MaskedGeneration:
         """Return the model over `variables` as a full-response MDLM task, with this
-        objective's solver and steps."""
+        objective's solver, steps and row length as its budget, as `task_record` saves them."""
         from dew.inference.tasks import MaskedGeneration
 
         return MaskedGeneration(self.model, variables, self.process,
                                 self.processor if processor is OMITTED else processor,
-                                solver=self.solver, steps=self.steps)
+                                solver=self.solver, steps=self.steps, max_new_tokens=self.seq_len)
 
     def fresh_variables(self, key: jax.Array, held: Variables | None) -> Variables:
         return self.model.init(key, jnp.zeros((1, self.seq_len), jnp.int32))

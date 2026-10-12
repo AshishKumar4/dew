@@ -219,6 +219,21 @@ def test_the_layer_computes_the_zero_order_hold_recurrence(case, form):
     assert np.all(np.abs(actual - expected) <= bound)
 
 
+def test_a_float64_layer_discretizes_and_recurs_in_float64(case, form):
+    """`S5Layer(dtype=float64)` over fp32 inputs and parameters computes in float64: every output
+    within the fp32 test's K of float64's unit roundoff of its absolute terms, which an fp32
+    discretization or recurrence would miss by about 2^29."""
+    layer, params, u, _ = case
+    p, u64 = float64_params(params), np.asarray(u, np.float64)
+    expected, _ = forward(p, u64, EXACT)
+    bound = forward_chain(u.shape[1]) * float(np.finfo(np.float64).eps) / 2 * forward(p, u64, MAGNITUDES)[0]
+    with jax.enable_x64(new_val=True):
+        actual = layer.clone(dtype=jnp.float64).apply({"params": params}, u)
+        assert actual.dtype == jnp.float64
+
+    assert np.all(np.abs(np.asarray(actual) - expected) <= bound)
+
+
 def test_the_layer_gradients_are_the_recurrence_gradients(case, form):
     """Every parameter's and the input's gradient within K u of its absolute
     terms, K = 376 at 16 positions."""
