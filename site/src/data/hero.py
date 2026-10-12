@@ -11,7 +11,7 @@ steps = 1000
 tokens = None
 
 # Begin command line
-import argparse
+import argparse  # noqa: E402
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--steps", type=int, default=steps)
