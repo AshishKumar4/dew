@@ -33,7 +33,8 @@ def test_a_csv_fine_tunes_a_laya_checkpoint_into_a_calibrated_run(tmp_path):
         writer.writerows(tickets)
     # The command line `laya-train --data tickets.csv` is, with this run's sizes.
     config = DecisionRunConfig.cli([
-        "--data.source", str(table), "--data.validation", json.dumps({"class": "dew.data.recipes:HoldOut",
+        "--data.source", str(table), "--data-read", "memory", "--data.validation", json.dumps({
+            "class": "dew.data.recipes:HoldOut",
             "fields": {"fraction": 0.5, "by": "random", "most": 400}}), "--data.question", "team",
         "--loading.workers", "0", "--pretrained", str(TINY), "--objective.loss", json.dumps(
             {"class": "dew.decision.scoring:Combined",
