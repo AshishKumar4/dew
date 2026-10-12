@@ -436,7 +436,7 @@ def test_unmasked_denoisers_count_the_conditioners_physical_padded_span(family):
     encoder = CharTable.from_pretrained(tokens=4, features=8)
     tokens = encoder.tokenize(["a"])
     work = encoder.conditioning_flops(tokens)
-    np.testing.assert_array_equal(work.lengths, [1])
+    np.testing.assert_array_equal(work.lengths, [2])
     np.testing.assert_array_equal(work.spans, [4])
     image, time = jnp.ones((1, 4, 4, 3)), jnp.ones((1,))
     text = encoder.encode(encoder.params, tokens)
@@ -485,7 +485,7 @@ def test_masked_condition_dropout_counts_blank_geometry_or_refuses_an_unknown_dr
         with pytest.raises(MissingFlopsCount, match="post-dropout context lengths"):
             objective.model_flops(None, batch)
     else:
-        lengths = np.array([0 if probability == 1 else 4])
+        lengths = np.array([1 if probability == 1 else 4])
         assert objective.model_flops(None, batch) == model.multisequence_flops(np.array([4]), lengths)
 
 
