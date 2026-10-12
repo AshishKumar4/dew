@@ -10,8 +10,8 @@ or an expert matmul reads, so one device at a pool's per-device batch holds
 the launches each of the pool's devices runs. Run it on a GPU it has to
 itself (`gpu-run`, never `-n 0.5`, where nothing is measured):
 
-    gpu-run python tools/kernel_picks.py --hub Qwen/Qwen3-30B-A3B --batch 2 --seq 4096
-    gpu-run python tools/kernel_picks.py --fields model1b.json --batch 2 --seq 2048
+    gpu-run python tools/kernel_picks.py --config Qwen/Qwen3-30B-A3B --batch 2 --seq 4096
+    gpu-run python tools/kernel_picks.py --config path/to/checkpoint --batch 2 --seq 2048
 """
 
 from __future__ import annotations
@@ -36,21 +36,19 @@ from dew.training._lowering import Lowered
 
 
 def model_of(arguments) -> CausalTransformer:
-    """The decoder a Hub repo's config.json translates to, or the fields a file holds, in `--dtype`."""
-    if arguments.hub:
-        with open(hf_hub_download(arguments.hub, "config.json")) as file:
-            config = json.load(file)
-        fields = dict(translate_config(config.get("text_config", config)))
-    else:
-        fields = json.loads(Path(arguments.fields).read_text())
+    """The decoder a checkpoint's config.json translates to, in `--dtype`: a
+    local directory's, or a Hub repo's, of which nothing else is read."""
+    local = Path(arguments.config) / "config.json"
+    path = local if local.is_file() else hf_hub_download(arguments.config, "config.json")
+    config = json.loads(Path(path).read_text())
+    fields = dict(translate_config(config.get("text_config", config)))
     return CausalTransformer(**{**fields, "dtype": jnp.dtype(arguments.dtype)})
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    source = parser.add_mutually_exclusive_group(required=True)
-    source.add_argument("--hub", help="a Hub decoder repo, of which only config.json is read")
-    source.add_argument("--fields", help="a JSON file of CausalTransformer fields")
+    parser.add_argument("--config", required=True,
+                        help="a decoder checkpoint's directory or Hub repo; only its config.json is read")
     parser.add_argument("--batch", type=int, required=True, help="sequences a device holds")
     parser.add_argument("--seq", type=int, required=True)
     parser.add_argument("--dtype", default="bfloat16")
