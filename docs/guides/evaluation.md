@@ -17,13 +17,13 @@ import numpy as np
 
 from dew import Trainer
 from dew.config import OptimConfig
-from dew.data import Dataset
+from dew.data.dataset import Loader
 from dew.nn.backbones import CausalTransformer
 from dew.objectives.lm import LMObjective, Perplexity
 
 train_tokens = np.tile(np.array([0, 1, 2, 3, 0, 1, 2, 3, 0], np.int32), (8, 1))
 val_tokens = np.tile(np.array([1, 2, 3, 0, 1, 2, 3, 0, 1], np.int32), (8, 1))
-data = Dataset(train=lambda partition: itertools.repeat({"text": train_tokens}),
+data = Loader(train=lambda partition: itertools.repeat({"text": train_tokens}),
                val=lambda partition: iter([{"text": val_tokens}]), records=8, batch=8)
 model = CausalTransformer(vocab_size=4, emb_features=16, num_layers=1,
                           num_heads=2, mlp_features=32, max_seq_len=16,
@@ -86,7 +86,8 @@ artifact whose type `reads` names. This LM metric measures top-1 accuracy
 from the logits, and the run ranks its checkpoints by it:
 
 ```python
-from dew.data import Loading, Records, load
+from dew.data import Loading
+from dew.config.data import RecordsData, loader
 from dew import Checkpoints, Mean
 from dew.artifacts import TokenScores
 
@@ -95,7 +96,7 @@ accuracy = Mean(
     reads=TokenScores, name="accuracy", better="higher",
 )
 language_model = LMObjective(model, seq_len=8, ema_decay=None)
-accuracy_data = load(Records(source={"text": train_tokens}, validation={"text": val_tokens}), batch=8, read="memory", loading=Loading(workers=0))
+accuracy_data = loader(RecordsData(source={"text": train_tokens}, validation={"text": val_tokens}), batch=8, read="memory", loading=Loading(workers=0))
 run = Trainer(language_model, OptimConfig(optimizer="adam", learning_rate=0.01), key=jax.random.key(0),
               checkpoints=Checkpoints("runs/lm-accuracy"))
 state = run.fit(
@@ -185,13 +186,13 @@ The example continues the previous one and reuses `objective`, `data`, `Perplexi
 from dew import Evaluation, LocalTracker
 from dew.config import ModelConfig, OptimConfig, RunConfig, TrainerConfig
 from dew.config.sweep import GridSearch
-from dew.data import Text
+from dew.config.data import TextData
 
 config = RunConfig(
     # The run records the model it trains, and the batches above stand in
     # for the dataset this names.
     model=ModelConfig.from_model(objective.model),
-    data=Text(source="", seq_len=8),
+    data=TextData(source="", seq_len=8),
     optim=OptimConfig(optimizer="adam"),
     trainer=TrainerConfig(name="lm-rate", checkpoint_dir="runs/sweep", steps=10, batch_size=8,
                           eval_every=None, checkpoint_every=None),

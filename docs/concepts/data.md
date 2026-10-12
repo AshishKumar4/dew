@@ -9,13 +9,15 @@ This example needs NumPy and an installed Dew checkout. It downloads nothing.
 ```python
 import numpy as np
 
-from dew.data import DataPartition, Loading, Records, load
+from dew.data import Loading
+from dew.config.data import RecordsData, loader
+from dew.data.dataset import DataPartition
 
 x = np.arange(32, dtype=np.float32).reshape(16, 2)
 y = x.sum(axis=1, keepdims=True)
-recipe = Records(source={"features": x, "target": y},
+recipe = RecordsData(source={"features": x, "target": y},
                  validation={"features": x[:8], "target": y[:8]})
-data = load(recipe, batch=8, seed=0, read="memory", loading=Loading(workers=0))
+data = loader(recipe, batch=8, seed=0, read="memory", loading=Loading(workers=0))
 stream = data.train(DataPartition())
 try:
     first = next(stream)
@@ -72,15 +74,16 @@ For example, a prepared image source is:
 
 <!-- not run: needs prepared TFDS data -->
 ```python
-from dew.data import Augment, Images, Loading, Split, TFDS, load
+from dew.data import Loading, TFDS
+from dew.config.data import Augment, ImageData, Split, loader
 
-flowers = Images(
+flowers = ImageData(
     source=TFDS("oxford_flowers102", path="data/oxford_flowers102/2.1.1", split="train"),
     validation=Split("validation"), image_size=128,
     caption_templates=("a photo of a {}",),
     augment=Augment(flip=True, jitter=True),
 )
-data = load(flowers, batch=32, read="memory", loading=Loading(workers=0))
+data = loader(flowers, batch=32, read="memory", loading=Loading(workers=0))
 ```
 
 A named Hub source takes `repo`, `config`, `revision`, `split` and `cache_dir`. A direct Parquet URL uses `Files`. For a large corpus, prepare the source separately or use its streamed Parquet files.
@@ -93,7 +96,9 @@ A recipe shares deterministic prefix steps between training and evaluation. Rand
 
 ```python
 import numpy as np
-from dew.data import Loading, Memory, Pipeline, compile
+from dew.data import Loading, Memory
+from dew.data.compile import compile
+from dew.data.pipeline import Pipeline
 
 records = [{"x": np.float32(index)} for index in range(24)]
 train = Pipeline(Memory(records[8:])).shuffle(7).repeat().batch(4)
@@ -118,7 +123,10 @@ For conditional image training, pass `host=(EncodeCaptions(objective.inputs.toke
 To produce token records, export a deterministic prefix. This example downloads nothing:
 
 ```python
-from dew.data import ByteTokenizer, Loading, Memory, Pipeline, Text, export, load
+from dew.data import ByteTokenizer, Loading, Memory
+from dew.config.data import TextData, loader
+from dew.data.pipeline import Pipeline
+from dew.data.sinks import export
 import tempfile
 from dew.data.steps.text import Tokenize
 
@@ -130,7 +138,7 @@ export(prefix, token_store, format="array_record", length_field="text",
        metadata={"token_store": True, "tokenizer": "byte",
                  "vocab_size": tokenizer.vocab_size, "dtype": "int32",
                  "eos_id": tokenizer.eos_id})
-data = load(Text(source=token_store, seq_len=32, pack="first-fit"),
+data = loader(TextData(source=token_store, seq_len=32, pack="first-fit"),
             batch=4, read="memory", loading=Loading(workers=0))
 ```
 

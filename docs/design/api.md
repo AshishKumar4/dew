@@ -241,9 +241,10 @@ class Dataset:
     @property
     def steps_per_epoch(self) -> int | None: ...
 
-from dew.data import Images, TFDS, load
+from dew.data import TFDS
+from dew.config.data import ImageData, loader
 
-data = load(Images(source=TFDS("oxford_flowers102"), image_size=128),
+data = loader(ImageData(source=TFDS("oxford_flowers102"), image_size=128),
             batch=32, read="memory", provision=True)
 ```
 

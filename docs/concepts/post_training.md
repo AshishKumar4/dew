@@ -29,7 +29,8 @@ import numpy as np
 
 from dew import Dataset, Trainer
 from dew.config import OptimConfig
-from dew.data import ByteTokenizer, Loading, Preferences
+from dew.data import ByteTokenizer, Loading
+from dew.config.data import PreferenceData
 from dew.data.chat import Role
 from dew.nn.backbones import CausalTransformer
 from dew.objectives.lm import LMObjective
@@ -55,7 +56,7 @@ response = tokenizer.encode(" He kicked it.")
 row = np.array(prompt + response, dtype=np.int32)
 roles = np.array([Role.USER] * len(prompt) + [Role.ASSISTANT] * len(response), dtype=np.int8)
 sft_batch = {"text": np.tile(row, (8, 1)), "text_roles": np.tile(roles, (8, 1))}
-sft_data = Dataset(train=lambda partition: itertools.repeat(sft_batch), val=None,
+sft_data = Loader(train=lambda partition: itertools.repeat(sft_batch), val=None,
                    records=8, batch=8)
 sft_objective = LMObjective(model, seq_len=len(row) - 1, variables=base,
                             loss_role=Role.ASSISTANT)
@@ -76,13 +77,14 @@ Trained 20 steps in 0:00:01: first step after 1.08 s, then 84.1 step/s
 A pair is two sequences with the same prompt, one followed by the chosen response and the other by the rejected one. The masks mark response tokens with 1.
 
 ```python
-from dew.data import Loading, Preferences, load
+from dew.data import Loading
+from dew.config.data import PreferenceData, loader
 rejected = tokenizer.encode(" He kicked kicked.")
 pair = {"chosen": prompt + response, "rejected": prompt + rejected,
         "chosen_mask": [0] * len(prompt) + [1] * len(response),
         "rejected_mask": [0] * len(prompt) + [1] * len(rejected)}
 width = max(len(pair["chosen"]), len(pair["rejected"]))
-pairs = load(Preferences(source=tuple(json.loads(row) for row in (json.dumps(pair),) * 8), seq_len=width), batch=8, read="memory", loading=Loading(workers=0, threads=1, read_buffer=2), validation_records=(4) * (8))
+pairs = loader(PreferenceData(source=tuple(json.loads(row) for row in (json.dumps(pair),) * 8), seq_len=width), batch=8, read="memory", loading=Loading(workers=0, threads=1, read_buffer=2), validation_records=(4) * (8))
 dpo = DPOObjective(model, seq_len=width - 1, beta=0.1, variables=sft_state.variables)
 dpo_state = Trainer(dpo, OptimConfig(optimizer="adam", learning_rate=1e-3), key=jax.random.key(2)).fit(
     pairs, steps=10, log_every=5)
@@ -117,7 +119,7 @@ def reward(data_source, completion, ground_truth, extra_info):
     return sum(character.isalpha() for character in completion) / 8
 
 
-rl_data = Dataset(train=lambda partition: itertools.repeat(prompt_batch), val=None,
+rl_data = Loader(train=lambda partition: itertools.repeat(prompt_batch), val=None,
                   records=8, batch=8)
 rl_objective = GRPOObjective(model, seq_len=len(story) + 7, beta=0.01,
                              variables=dpo_state.variables)
@@ -200,7 +202,8 @@ import numpy as np
 
 from dew import Trainer
 from dew.config import OptimConfig
-from dew.data import Loading, Preferences, load
+from dew.data import Loading
+from dew.config.data import PreferenceData, loader
 from dew.nn.backbones import CausalTransformer
 from dew.objectives.rl import DPOObjective
 
@@ -211,8 +214,8 @@ rows = [
      "chosen_mask": [0, 0, 1, 1], "rejected_mask": [0, 0, 1, 1]},
 ]
 row_width = 4
-spec = Preferences(source=rows * 4, seq_len=row_width, pad_id=0)
-data = load(spec, batch=8, read="memory", loading=Loading(workers=0))
+spec = PreferenceData(source=rows * 4, seq_len=row_width, pad_id=0)
+data = loader(spec, batch=8, read="memory", loading=Loading(workers=0))
 model = CausalTransformer(vocab_size=8, emb_features=16, num_layers=1,
                           num_heads=2, mlp_features=32, max_seq_len=row_width)
 objective = DPOObjective(model, seq_len=row_width - 1, beta=0.1)
@@ -251,9 +254,10 @@ Messages go through the Hugging Face tokenizer's chat template, and `thinking` s
 
 ```python
 import json
-from dew.data import Loading, Prompts, load
+from dew.data import Loading
+from dew.config.data import PromptData, loader
 
-data = load(Prompts(source=({"prompt": "dew"},) * 8, tokenizer="byte", max_prompt_len=8),
+data = loader(PromptData(source=({"prompt": "dew"},) * 8, tokenizer="byte", max_prompt_len=8),
             batch=8, read="memory", loading=Loading(workers=0))
 ```
 
@@ -515,7 +519,7 @@ import jax
 import numpy as np
 import optax
 from dew import Trainer
-from dew.data import Dataset
+from dew.data.dataset import Loader
 from dew.objectives.rl import EpisodeRollout, PPOObjective, PPORollout, ValueHead
 
 sys.path.insert(0, str(Path(dew.__file__).parents[2] / "tests"))
@@ -530,7 +534,7 @@ episodes = EpisodeRollout(objective.policy(objective.init(key)), Harness(), veri
                           groups=4, sampling=SAMPLING)
 trainer = Trainer(objective, optax.sgd(.05), key=key,
                   rollout=PPORollout(objective, episodes, gamma=.97, lam=.9))
-data = Dataset(train=lambda partition: itertools.repeat({
+data = Loader(train=lambda partition: itertools.repeat({
     "task_id": np.arange(jax.device_count(), dtype=np.int32)}),
     val=None, records=None, batch=jax.device_count())
 state = trainer.fit(data, steps=2, log_every=1)
@@ -560,7 +564,7 @@ import jax
 import numpy as np
 from dew import Field, InputSpec, Trainer
 from dew.config import OptimConfig
-from dew.data import Dataset
+from dew.data.dataset import Loader
 from dew.diffusion.presets import Flow
 from dew.nn.backbones import SimpleDiT
 from dew.objectives.rl import FlowGRPOObjective, FlowRollout
@@ -576,7 +580,7 @@ def brightness(images, batch):
 
 rollout = FlowRollout(objective, brightness, groups=4, steps=5, train_steps=2)
 batch = {"image": np.zeros((2, 4, 4, 1), dtype=np.uint8)}
-data = Dataset(train=lambda partition: itertools.repeat(batch), val=None, records=2, batch=2)
+data = Loader(train=lambda partition: itertools.repeat(batch), val=None, records=2, batch=2)
 trainer = Trainer(objective, OptimConfig(optimizer="adam", learning_rate=1e-3), key=jax.random.key(0), rollout=rollout)
 state = trainer.fit(data, steps=2, log_every=1)
 print(int(state.updates))

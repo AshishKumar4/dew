@@ -16,7 +16,7 @@ import numpy as np
 
 from dew import Field, InputSpec, Trainer
 from dew.config import OptimConfig
-from dew.data import Dataset
+from dew.data.dataset import Loader
 from dew.diffusion.presets import Flow
 from dew.nn.backbones.dit import SimpleDiT
 from dew.objectives.base import Step
@@ -26,7 +26,7 @@ from dew.sampling import Euler
 images = np.zeros((8, 8, 8, 3), dtype=np.uint8)
 images[:, :, ::2, :] = 255
 batch = {"image": images}
-data = Dataset(train=lambda partition: itertools.repeat(batch), val=None, records=8, batch=8)
+data = Loader(train=lambda partition: itertools.repeat(batch), val=None, records=8, batch=8)
 model = SimpleDiT(patch_size=4, emb_features=16, num_layers=1, num_heads=2,
                   mlp_ratio=2, dtype=jnp.float32, attention_impl="xla")
 objective = DiffusionObjective(model, Flow(), InputSpec(Field("image", (8, 8, 3))),

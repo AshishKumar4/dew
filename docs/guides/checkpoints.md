@@ -19,7 +19,7 @@ import optax
 from flax import linen as nn
 
 from dew import Checkpoints, Trainer
-from dew.data import Dataset
+from dew.data.dataset import Loader
 from dew.objectives.base import Aux, Objective
 
 
@@ -56,7 +56,7 @@ class Batches:
         self.index = int(state.decode())
 
 
-data = Dataset(train=lambda partition: Batches(), val=None, records=None, batch=8)
+data = Loader(train=lambda partition: Batches(), val=None, records=None, batch=8)
 with tempfile.TemporaryDirectory(prefix="dew-checkpoint-") as directory:
     checkpoints = Checkpoints(directory)
     trainer = Trainer(Regression(), optax.sgd(0.1), key=jax.random.key(0),

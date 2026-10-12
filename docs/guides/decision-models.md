@@ -87,7 +87,8 @@ from dew.config import OptimConfig
 from dew.decision import ECE, Accuracy, Brier, Choice, DecisionObjective, Decisions, LogLoss
 from dew.interop import Pretrained
 from dew.lora import LoRA
-from dew.data import HoldOut, Hub, load
+from dew.data import Hub
+from dew.config.data import HoldOut, loader
 
 qwen = Pretrained.load("Qwen/Qwen3-0.6B").adapt(LoRA(rank=16, modules=("q_proj", "v_proj")), key=0)
 banking77 = Decisions(source=Hub("mteb/banking77"), label="label_text", question="intent",
@@ -95,7 +96,7 @@ banking77 = Decisions(source=Hub("mteb/banking77"), label="label_text", question
                       validation=HoldOut(fraction=0.1, by="random", most=400))
 
 objective = DecisionObjective(qwen, loss=LogLoss() + 0.5 * Brier())
-data = load(banking77, batch=32, read="memory", provision=True, objective=objective.data())
+data = loader(banking77, batch=32, read="memory", provision=True, objective=objective.data())
 state = Trainer(objective, OptimConfig(learning_rate=1e-4), key=0).fit(
     data, steps=2_000, eval_every=500, metrics=[Accuracy(), ECE()])
 

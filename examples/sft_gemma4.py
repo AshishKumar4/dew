@@ -12,7 +12,7 @@ them, and the run directory itself scores through the harness:
     python -m dew.eval --model dew --model_args run=runs/gemma4-sft/checkpoints/gemma4-sft \\
         --tasks hellaswag --limit 64
 
-The `Chat` recipe reads the Hub dataset through its `hf://` source, so the URL
+The `ChatData` recipe reads the Hub dataset through its `hf://` source, so the URL
 on the command line is what the run trains on: it renders every conversation
 with the checkpoint's own chat template and packs them into windows.
 
@@ -28,7 +28,9 @@ import jax.numpy as jnp
 import tyro
 
 from dew.config import ModelConfig, OptimConfig, TrainerConfig
-from dew.data import Chat, HFTokenizer, Loading, Read, load
+from dew.data import HFTokenizer, Loading
+from dew.config.data import ChatData, loader
+from dew.data.sources import Read
 from dew.data.chat import Role
 from dew.inference import RunProcessor
 from dew.interop import PretrainedDecoder
@@ -86,7 +88,7 @@ def run_config(config: Config, tokenizer: str, chat: str) -> LMRunConfig:
     split = config.split if config.rows is None else f"{config.split}[:{config.rows}]"
     return LMRunConfig(
         data_read=config.data_read,
-        data=Chat(tokenizer=tokenizer, source=chat, validation=chat, column=config.column,
+        data=ChatData(tokenizer=tokenizer, source=chat, validation=chat, column=config.column,
                   split=split, seq_len=config.sequence_length, long="chunk"),
         validation_records=config.batch_size,
         loading=Loading(workers=0, threads=1, read_buffer=2,
@@ -139,7 +141,7 @@ def main(config: Config) -> Path:
     # rebuild the checkpoint's own architecture at the precision it trained in.
     run = replace(run, model=ModelConfig.from_model(source.model))
 
-    data = load(run.data, batch=run.trainer.batch_size, read=run.data_read,
+    data = loader(run.data, batch=run.trainer.batch_size, read=run.data_read,
                 provision=run.provision, loading=run.loading,
                 validation_records=run.validation_records)
     name = config.out.name

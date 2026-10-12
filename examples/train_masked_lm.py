@@ -33,7 +33,10 @@ import tyro
 
 import dew
 from dew.config import ModelConfig, ObjectiveConfig, OptimConfig, TrainerConfig
-from dew.data import ByteTokenizer, Files, HFTokenizer, HoldOut, Hub, Loading, Pipeline, Text, iterate, load
+from dew.data import ByteTokenizer, Files, HFTokenizer, Hub, Loading
+from dew.config.data import HoldOut, TextData, loader
+from dew.data.compile import iterate
+from dew.data.pipeline import Pipeline
 from dew.data.steps.text import Tokenize
 from dew.objectives.diffusion.masked import MaskedDiffusionObjective
 from dew.objectives.lm import LMRunConfig, Perplexity
@@ -90,13 +93,13 @@ def smoke_config(config: Config) -> tuple[Config, Files]:
 
 
 def main(config: Config) -> Path:
-    source = Hub(config.dataset, config=config.config, revision=config.revision)
+    source = Hub(config.dataset, name=config.config, revision=config.revision)
     if config.smoke:
         config, source = smoke_config(config)
     tokenizer = ByteTokenizer() if config.tokenizer == "byte" else HFTokenizer(config.tokenizer)
     # The window is one id shorter than a row: Text adds the id a
     # next-token target shifts by, and MDLM denoises the whole row.
-    data = Text(source=source, tokenizer=config.tokenizer, eos=True,
+    data = TextData(source=source, tokenizer=config.tokenizer, eos=True,
                 seq_len=config.sequence_length - 1, token_holdout=HoldOut(fraction=0.01))
     name = f"mdlm-{config.dataset.rsplit('/', 1)[-1].lower()}"
     trainer = TrainerConfig(name=name, checkpoint_dir=str(config.out / "checkpoints"), keep=1,
@@ -126,7 +129,7 @@ def main(config: Config) -> Path:
     run_dir = config.out / "checkpoints" / name
     task = dew.pipeline(str(run_dir))
     task = replace(task, eos_token_ids=() if tokenizer.eos_id is None else (tokenizer.eos_id,))
-    whole = load(data, batch=config.batch_size, read="memory", loading=run.loading)
+    whole = loader(data, batch=config.batch_size, read="memory", loading=run.loading)
     scored = Evaluation.run(MaskedDiffusionObjective(task.model, task.process, config.sequence_length),
                             task.variables, whole.val, key=jax.random.key(0), metrics=[Perplexity()],
                             loss=True)

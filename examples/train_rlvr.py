@@ -63,7 +63,8 @@ import jax.numpy as jnp
 import tyro
 
 from dew.config import OptimConfig
-from dew.data import HFTokenizer, Loading, Prompts, load
+from dew.data import HFTokenizer, Loading
+from dew.config.data import PromptData, loader
 from dew.inference import (
     NativeRolloutServer,
     OpenAICompletion,
@@ -576,7 +577,7 @@ def main(config: Config) -> dict:
             lambda text: words.tokenizer.encode(text, add_special_tokens=False),
             config,
         )
-    data = load(Prompts(tokenizer=tokenizer,
+    data = loader(PromptData(tokenizer=tokenizer,
         source=tuple(json.loads(row) for row in records(config.tasks, config.seed)),
                         thinking=config.thinking, max_prompt_len=config.prompt_tokens, long="truncate",
                         pad_id=sampling.pad_token_id), batch=config.prompts, read="memory",

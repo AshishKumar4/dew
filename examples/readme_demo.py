@@ -19,7 +19,9 @@ import tyro
 from dew import Checkpoints, Field, InputSpec, Trainer
 from dew.artifacts import uint8_pixels
 from dew.config import OptimConfig
-from dew.data import Loader, Loading, Preferences, Text, load
+from dew.data import Loading
+from dew.config.data import PreferenceData, TextData, loader
+from dew.data.dataset import Loader
 from dew.diffusion.presets import Flow
 from dew.nn.backbones import CausalTransformer, SimpleDiT
 from dew.objectives.base import Step
@@ -46,7 +48,7 @@ def language_model(out: Path):
         "tokenizer": "demo-symbols", "vocab_size": 8, "dtype": "uint8",
         "train_tokens": 1024, "val_tokens": 128, "eos_id": None,
     }))
-    data = load(Text(source=str(tokens), seq_len=8), batch=8, read="memory",
+    data = loader(TextData(source=str(tokens), seq_len=8), batch=8, read="memory",
                 validation_records=8, loading=Loading(workers=0, threads=1, read_buffer=2))
     model = CausalTransformer(
         vocab_size=8, emb_features=16, num_layers=1,
@@ -85,7 +87,7 @@ def preferences(model, pretrained):
     """Start DPO from the trained policy; freeze that policy as the reference."""
     row = {"chosen": [1, 2, 3, 4], "rejected": [1, 2, 6, 4],
            "chosen_mask": [0, 0, 1, 1], "rejected_mask": [0, 0, 1, 1]}
-    data = load(Preferences(source=(row,) * 8, seq_len=4), batch=8, read="memory",
+    data = loader(PreferenceData(source=(row,) * 8, seq_len=4), batch=8, read="memory",
                 loading=Loading(workers=0, threads=1, read_buffer=2))
     # The objective predicts three next tokens from each four-ID sequence.
     objective = DPOObjective(model, seq_len=3, beta=0.1, variables=pretrained)

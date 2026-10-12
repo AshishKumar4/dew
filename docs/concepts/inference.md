@@ -12,7 +12,8 @@ import dataclasses
 import jax
 import numpy as np
 
-from dew import Dataset, Trainer
+from dew import Trainer
+from dew.data.dataset import Loader
 from dew.config import OptimConfig
 from dew.data import ByteTokenizer
 from dew.inference import RunProcessor
@@ -24,7 +25,7 @@ tokenizer = ByteTokenizer()
 ids = np.array(tokenizer.encode("One day, Lily saw a big dog in the park. "
                                 "The dog wanted to play. " * 40), dtype=np.int32)
 rows = np.stack([ids[i:i + 65] for i in range(0, 16 * 64, 64)])
-data = Dataset(train=lambda partition: iter([{"text": rows}] * 200), val=None,
+data = Loader(train=lambda partition: iter([{"text": rows}] * 200), val=None,
                records=16, batch=16)
 model = CausalTransformer(vocab_size=tokenizer.vocab_size,
                           emb_features=64, num_layers=2, num_heads=2, mlp_features=256,

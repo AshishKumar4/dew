@@ -20,7 +20,8 @@ import itertools
 import jax
 import numpy as np
 
-from dew import Dataset, Trainer
+from dew import Trainer
+from dew.data.dataset import Loader
 from dew.config import OptimConfig
 from dew.nn.backbones import CausalTransformer
 from dew.objectives.lm import LMObjective
@@ -29,7 +30,7 @@ from dew.training import MeshSpec
 model = CausalTransformer(vocab_size=512, emb_features=256, num_layers=2,
                           num_heads=4, mlp_features=1024, max_seq_len=64)
 rows = np.random.default_rng(0).integers(0, 512, (16, 65), dtype=np.int32)
-data = Dataset(train=lambda partition: itertools.repeat({"text": rows}), val=None,
+data = Loader(train=lambda partition: itertools.repeat({"text": rows}), val=None,
                records=16, batch=16)
 trainer = Trainer(LMObjective(model, seq_len=64), OptimConfig(learning_rate=1e-3), key=jax.random.key(0),
                   mesh=MeshSpec(fsdp=2, tensor=2))
