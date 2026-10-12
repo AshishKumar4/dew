@@ -24,6 +24,7 @@ cumulated in base 2; gradients of q, k, the decay and beta accumulate in fp32.
 from __future__ import annotations
 
 import functools
+import math
 from collections.abc import Mapping
 
 import jax
@@ -124,7 +125,8 @@ def intra_diagonal(q, k, g, beta, *, scale: float, bh: int | None = None, warps:
     batch, length, key_heads, width = k.shape
     value_heads = beta.shape[2]
     group = value_heads // key_heads
-    bh = min(config["bh"] if bh is None else bh, value_heads) if group == 1 else 1
+    # A block of value heads that divides them, as fla's ceil(HV / BH) grid masks its tail.
+    bh = math.gcd(config["bh"] if bh is None else bh, value_heads) if group == 1 else 1
     blocks = value_heads // bh
 
     def keyed(i_t, b_h):
@@ -558,7 +560,9 @@ def _bwd_intra_kernel(q_ref, k_ref, g_ref, beta_ref, daqk_ref, dakk_ref, dq_ref,
 
     def after(j, dkt):
         behind = jnp.exp2(tile(g_ref, j * SUB) - closing)
-        weighted = tile(k_ref, j * SUB) * beta_ref[pl.ds(j * SUB, SUB)].astype(jnp.float32)[:, None]
+        # k beta in the operands' dtype, as fla's b_kb, then widened by the decay.
+        later = pl.ds(j * SUB, SUB)
+        weighted = (k_ref[later, :] * beta_ref[later][:, None]).astype(jnp.float32)
         dkt = dkt + _tf32_dot(scores(daqk_ref, j * SUB, first).T, tile(q_ref, j * SUB) * behind)
         return dkt + _tf32_dot(scores(dakk_ref, j * SUB, first).T, weighted * behind)
 
