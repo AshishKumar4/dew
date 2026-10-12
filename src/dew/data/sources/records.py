@@ -12,10 +12,13 @@ from functools import cached_property
 
 import grain.python as grain
 
-from dew.data.dataset import Batch
+from dew.data.dataset import Batch, Loading
 from dew.data.storage import Store
 
 from .codec import decode
+
+
+_MAX_OPEN_SHARDS = Loading().threads
 
 
 @dataclass
@@ -25,6 +28,12 @@ class _OpenedShard:
 
 
 class ArrayRecords:
+    """Read shards concurrently, retaining as many readers as default read threads.
+
+    Shuffled indexed reads reuse the LRU across Loading's in-flight read width.
+    Non-native shards need a mirror with room for that many physical shards.
+    """
+
     def __init__(
         self,
         urls: Sequence[str],
@@ -43,7 +52,7 @@ class ArrayRecords:
             raise ValueError("ArrayRecord counts must name every physical shard with a nonnegative row count")
         self._pins = []
         self._opened: OrderedDict[int, _OpenedShard] = OrderedDict()
-        self._lock = threading.RLock()
+        self._lock = threading.Lock()
 
     @cached_property
     def ends(self) -> tuple[int, ...]:
@@ -64,7 +73,10 @@ class ArrayRecords:
                 pin = fs.open(path, "rb")
                 if not isinstance(pin.name, str):
                     pin.close()
-                    raise ValueError(f"ArrayRecord {url} needs a mirror large enough to hold one shard")
+                    raise ValueError(
+                        f"ArrayRecord {url} needs mirror room for {_MAX_OPEN_SHARDS} physical shards "
+                        "(Loading's default read threads)"
+                    )
                 self._pins.append(pin)
                 paths.append(pin.name)
         return grain.ArrayRecordDataSource(paths)
@@ -90,7 +102,7 @@ class ArrayRecords:
                             f"ArrayRecord {self.urls[shard]} differs from its producer's row count"
                         )
                     self._opened[shard] = _OpenedShard(opened)
-                    if len(self._opened) > 2:
+                    if len(self._opened) > _MAX_OPEN_SHARDS:
                         _, removed = self._opened.popitem(last=False)
                         if not removed.reads:
                             removed.reader.close()
@@ -125,7 +137,7 @@ class ArrayRecords:
         self.__dict__.update(state)
         self._pins = []
         self._opened = OrderedDict()
-        self._lock = threading.RLock()
+        self._lock = threading.Lock()
 
     def close(self) -> None:
         with self._lock:
