@@ -9,7 +9,7 @@ import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
-from dew.nn.attention import FlaxFeedForward, LayerNorm, NormalAttention
+from dew.nn.attention import FlaxFeedForward, GroupNorm, LayerNorm, NormalAttention
 from dew.nn.blocks import ResidualBlock, sinusoidal_time
 from dew.nn.conv import Conv
 from dew.nn.flops import MissingFlopsCount, projection_flops
@@ -123,7 +123,7 @@ class _SpatialAttention(nn.Module):
     @nn.compact
     def __call__(self, x, context, *, train=False):
         residual = x
-        x = nn.GroupNorm(self.norm_groups, epsilon=self.norm_epsilon, dtype=self.dtype, name="norm")(x)
+        x = GroupNorm(self.norm_groups, epsilon=self.norm_epsilon, dtype=self.dtype, name="norm")(x)
         batch, height, width, channels = x.shape
         if self.linear_projection:
             x = x.reshape(batch, height * width, channels)
@@ -392,6 +392,7 @@ class UNet2DCondition(nn.Module):
                 approximate_gelu=self.approximate_gelu,
                 name=f"up_{index}",
             ), x, time, context, inputs, upsample_shape=target, train=train)
-        norm = nn.GroupNorm(self.norm_groups, epsilon=self.norm_epsilon, dtype=self.dtype, name="output_norm")
-        x = operations.normalized(x, norm, nn.silu)
+        norm = GroupNorm(self.norm_groups, epsilon=self.norm_epsilon, activation=nn.silu, dtype=self.dtype,
+                         name="output_norm")
+        x = operations.normalized(x, norm)
         return operations.project(self._convolution(self.out_channels, name="output"), x)

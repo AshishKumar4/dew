@@ -19,16 +19,15 @@ float64, at norm_p 0 and 1.
 
 from __future__ import annotations
 
-import ast
 import json
 import types
-import urllib.request
 from pathlib import Path
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
+from reference_source import definitions
 
 jax.config.update("jax_enable_x64", val=True)
 
@@ -90,12 +89,9 @@ class Draws:
 
 
 def published(draws: Draws, dtype) -> type:
-    text = urllib.request.urlopen(MEANFLOW).read().decode()
-    scope = {"nn": nn, "jax": types.SimpleNamespace(**{**vars(jax), "random": draws}), "jnp": Numpy(),
-             "models_dit": types.SimpleNamespace(Tiny=lambda **kwargs: Tiny(name=kwargs["name"]))}
-    for node in ast.parse(text).body:
-        if isinstance(node, ast.ClassDef) and node.name == "MeanFlow":
-            exec(ast.get_source_segment(text, node), scope)
+    scope = definitions(MEANFLOW, ("MeanFlow",), {
+        "nn": nn, "jax": types.SimpleNamespace(**{**vars(jax), "random": draws}), "jnp": Numpy(),
+        "models_dit": types.SimpleNamespace(Tiny=lambda **kwargs: Tiny(name=kwargs["name"]))})
 
     class Recorded(scope["MeanFlow"]):
         def _logit_normal_dist(self, bz):

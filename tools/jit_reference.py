@@ -9,23 +9,18 @@ weights land in Flax's layout beside the tokens, in float64 and float32.
 
 from __future__ import annotations
 
-import ast
-import urllib.request
 from pathlib import Path
 
 import numpy as np
 import torch
+from reference_source import definitions
 
 MODEL = "https://raw.githubusercontent.com/LTH14/JiT/cbc743a2ada5e9762697da2c83f8c4f8379e8c17/model_jit.py"
 FIXTURE = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "jit"
 
 
 def main() -> None:
-    text = urllib.request.urlopen(MODEL).read().decode()
-    scope = {"nn": torch.nn}
-    for node in ast.parse(text).body:
-        if isinstance(node, ast.ClassDef) and node.name == "BottleneckPatchEmbed":
-            exec(ast.get_source_segment(text, node), scope)
+    scope = definitions(MODEL, ("BottleneckPatchEmbed",), {"nn": torch.nn})
     torch.manual_seed(0)
     embed = scope["BottleneckPatchEmbed"](img_size=16, patch_size=8, in_chans=3, pca_dim=5, embed_dim=12)
     pixels = torch.randn(2, 3, 16, 16)

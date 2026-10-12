@@ -6,7 +6,6 @@ kinds carry their own rope rather than the model.
 
 from __future__ import annotations
 
-import dataclasses
 from collections.abc import Mapping
 
 from dew import records
@@ -14,13 +13,15 @@ from dew.interop.decoder_parts import (
     DEFAULT_MAX_SEQ_LEN,
     DecoderFamily,
     DecoderFields,
+    RopeSpelling,
     base_config,
     read_rope,
     specified_layer_types,
 )
 
-_SLIDING_THETA = 500000.0
-"""Olmo3Config's rope_theta default, which a flat config leaves on the sliding entry."""
+_SPELLING = RopeSpelling(theta=500000.0, per_kind=True, local_theta=500000.0)
+"""Olmo3Config's rope: a record per layer type at its `default_theta`, which a
+flat rope_theta never reaches on the sliding entry (configuration_olmo3.py:84, 101-126)."""
 
 
 def _olmo3_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:
@@ -39,18 +40,15 @@ def _olmo3_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFie
     where the reference moves it (configuration_olmo3.py:110-113): the released
     7B checkpoints put a YaRN there and the sliding layers rotate plainly.
     A flat `rope_theta` moves there too, so the sliding layers of a flat
-    config rotate at the class's own base, `_SLIDING_THETA`, whatever
-    rope_theta says (500000 in both on the released 7B).
+    config rotate at the class's own base whatever rope_theta says (500000 in
+    both on the released 7B).
     """
     layers = records.integer(hf_config['num_hidden_layers'], 'num_hidden_layers')
     layer_types = specified_layer_types(hf_config, used, tuple(
         'sliding_attention' if (index + 1) % 4 else 'full_attention'
         for index in range(layers)))
     ropes = read_rope(hf_config, used, records.integer(hf_config.get(
-        'max_position_embeddings', DEFAULT_MAX_SEQ_LEN), 'max_position_embeddings'),
-        local=False, local_default=_SLIDING_THETA)
-    if ropes.scaling is not None and not isinstance(hf_config.get('rope_parameters'), Mapping):
-        ropes = dataclasses.replace(ropes, full_only=True)
+        'max_position_embeddings', DEFAULT_MAX_SEQ_LEN), 'max_position_embeddings'), _SPELLING)
     config = base_config(hf_config, used, qk_norm=True, layer_types=layer_types,
                           scale_after_cast=False, rope=ropes)
     config.update(sandwich_norms=True, pre_norms=False, qk_norm_scope='projection')
@@ -66,4 +64,5 @@ OLMO3 = DecoderFamily(
     lambda model: {},
     sandwich_norms=True,
     preserve_source_layout=True,
+    defaults={'rms_norm_eps': 1e-5},
 )
