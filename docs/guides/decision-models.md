@@ -153,7 +153,7 @@ Two recipes train a model that answers questions it has not seen, as Jev, Laya a
 python recipes/decision/contamination.py --out eval-index.npz --jsonl suite-rows.jsonl.gz \
     --hub LocalLLaMA/typed-decisions@d0e2f0c4:all/test-00000-of-00001.parquet
 python recipes/decision/sources.py --out data/mixture --decontaminate eval-index.npz
-python recipes/decision/encoder.py --mixture.root data/mixture --trainer.checkpoint-dir runs
+python recipes/decision/encoder.py --data.source data/mixture --trainer.checkpoint-dir runs
 ```
 
 `sources.py` writes the sets both recipes train on, each pinned to a commit, as JSON-lines rows that `Example.of` reads:
