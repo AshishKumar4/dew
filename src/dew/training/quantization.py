@@ -849,20 +849,16 @@ def _providers() -> tuple[type, type]:
         drops (qwix/_src/providers/qt.py:96-97,130-132, ptq.py:177-180,244):
         a result dtype by widening the operands to it, exact for the
         narrower floats it accumulates, and an output sharding by
-        constraining the result where the provider drops it. An accumulation
-        precision past the default has no such form and is refused by name."""
+        constraining the result where the provider drops it. A matmul that
+        pins an accumulation precision past the default, as Dew's fp32
+        zones and its vocabulary head do, has no quantized form and runs
+        unquantized at that precision."""
 
         keeps_out_sharding: ClassVar[bool] = False
 
-        def _quantizes(self, op: str, precision) -> bool:
+        def _matched(self, op: str) -> bool:
             rule, _ = self._get_current_rule_and_op_id(op, only_rule=True)
-            if rule is None or rule.weight_qtype is None:
-                return False
-            if not asks_default_precision(precision):
-                raise ValueError(f"a quantized {op} at {rule.module_path!r} asks for precision {precision}, "
-                                 "which Qwix's quantized matmul does not take; leave the matmul out of the "
-                                 "quantization patterns or drop the request")
-            return True
+            return rule is not None and rule.weight_qtype is not None
 
         def dot_general(self, lhs, rhs, dimension_numbers, precision=None,
                         preferred_element_type=None, *, out_sharding=None):
@@ -870,9 +866,13 @@ def _providers() -> tuple[type, type]:
                 return jax.lax.dot_general(lhs, rhs, dimension_numbers, precision=precision,
                                            preferred_element_type=preferred_element_type,
                                            out_sharding=out_sharding)
-            if not self._quantizes("dot_general", precision):
+            if not self._matched("dot_general"):
                 return super().dot_general(lhs, rhs, dimension_numbers, precision,
                                            preferred_element_type, out_sharding=out_sharding)
+            if not asks_default_precision(precision):
+                return jax.lax.dot_general(lhs, rhs, dimension_numbers, precision=precision,
+                                           preferred_element_type=preferred_element_type,
+                                           out_sharding=out_sharding)
             kept = out_sharding if self.keeps_out_sharding else None
             out = super().dot_general(*_widened((lhs, rhs), preferred_element_type), dimension_numbers,
                                       out_sharding=kept)
@@ -881,8 +881,10 @@ def _providers() -> tuple[type, type]:
         def einsum(self, einsum_str, *operands, **kwargs):
             if not _real(*(operand.dtype for operand in operands)):
                 return jnp.einsum(einsum_str, *operands, **kwargs)
-            if not self._quantizes("einsum", kwargs.get("precision")):
+            if not self._matched("einsum"):
                 return super().einsum(einsum_str, *operands, **kwargs)
+            if not asks_default_precision(kwargs.get("precision")):
+                return jnp.einsum(einsum_str, *operands, **kwargs)
             preferred = kwargs.pop("preferred_element_type", None)
             out_sharding = kwargs.pop("out_sharding", None)
             kwargs.pop("precision", None)
