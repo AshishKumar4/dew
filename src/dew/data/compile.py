@@ -29,6 +29,7 @@ from dew.data.analysis import (
     _capabilities,
     _identity,
     _leaves,
+    _manifest,
     _name,
     _order_at,
     _preferred_read,
@@ -55,6 +56,7 @@ from dew.data.mix import CorpusCounts, SearchBudget
 from dew.data.pipeline import (
     Artifact,
     BatchStage,
+    Bound,
     Configured,
     Expansion,
     FlatMap,
@@ -83,7 +85,7 @@ from dew.data.pipeline import (
     Workers,
     _rejects,
 )
-from dew.data.plan import Manifest, Plan, StepIdentity, fingerprint
+from dew.data.plan import Plan, StepIdentity, fingerprint
 from dew.data.readers import _CanonicalPass, _Host, _PerShare, _Statistics
 from dew.data.sources.base import Read, ShardManifest, Source
 from dew.records import JSON, integer, json_value, record
@@ -214,11 +216,7 @@ def _configured(
                 f"{_name(pipeline)} step {_identity(stage).name} needs metadata {missing}; "
                 "provide producer metadata, recipe fields or read='memory'"
             )
-        binding = {
-            "factory": dataclasses.asdict(_identity(stage)),
-            "scope": stage.scope,
-            "values": {key: metadata[key] for key in stage.needs},
-        }
+        binding = Bound(stage, {key: metadata[key] for key in stage.needs})
         resolved = stage.factory(metadata)
         if isinstance(resolved, pygrain.RandomMapTransform) != stage.random:
             raise ValueError(
@@ -481,8 +479,10 @@ def _compiled(
         build.batch,
         build.global_order,
     )
-    manifest = Manifest.of(
-        {"sources": [source.snapshot() for _, source in _leaves(original)]},
+    sources = [source for _, source in _leaves(original)]
+    manifest = _manifest(
+        {"sources": [source.snapshot() for source in sources]},
+        sources,
         (
             *(_identity(stage) for stage in _steps(original) if not isinstance(stage, (Workers, Prefetch))),
             *(StepIdentity.of(step) for step in host),
@@ -741,7 +741,8 @@ def objective_steps(pipeline: Pipeline, objective: ObjectiveData, *, train: bool
 def _objective_order(pipeline: Pipeline, objective: ObjectiveData) -> Pipeline:
     def shared(stage: Stage) -> bool:
         return isinstance(stage, RandomMap) and (
-            stage.configured.get("scope") == "run" or any(stage.step is step for step in objective.train)
+            (stage.configured is not None and stage.configured.step.scope == "run")
+            or any(stage.step is step for step in objective.train)
         )
 
     selected: tuple[Stage, ...] = ()

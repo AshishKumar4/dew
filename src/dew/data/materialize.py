@@ -61,10 +61,13 @@ class _Memory:
         return self.original.describe()
 
     def snapshot(self) -> Mapping[str, object]:
+        """The rows as a memory read made them: the source it read, the
+        derived order facts and the steps it ran, by what they compute. The
+        manifest records those steps' modules in its environment."""
         return {
             "materialized": self.original.snapshot(),
             "derived": self.derived,
-            "steps": [dataclasses.asdict(_identity(stage)) for stage in self.ran],
+            "steps": [_identity(stage).semantic() for stage in self.ran],
         }
 
     def supports(self, read: Read) -> bool:

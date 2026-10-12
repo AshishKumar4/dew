@@ -1,6 +1,7 @@
 """The pipeline's observable order, branch scope and exact positions."""
 
 import dataclasses
+import importlib
 import itertools
 import json
 import os
@@ -16,7 +17,7 @@ from dew.data.cache import Cache
 from dew.data.compile import compile, iterate, publish
 from dew.data.dataset import DataPartition, Loading
 from dew.data.mix import SearchBudget, TokenDeficit, token_weights
-from dew.data.pipeline import Artifact, Pipeline, Rejected
+from dew.data.pipeline import Artifact, Configured, Pipeline, Rejected
 from dew.data.plan import Manifest, Plan, StepIdentity, fingerprint
 from dew.data.sources import Files, Memory
 from dew.objectives.base import VALID_ROWS
@@ -258,6 +259,59 @@ def test_an_exact_resume_refuses_a_step_that_makes_other_values():
     other = reader(2)
     try:
         with pytest.raises(ValueError, match="saved data plan steps changed"):
+            other.set_state(state)
+    finally:
+        other.close()
+
+
+GIVEN = """import dataclasses
+
+
+@dataclasses.dataclass(frozen=True)
+class Given:
+    step: object
+    version: int = 1
+
+    def __call__(self, metadata):
+        return self.step
+"""
+
+
+@pytest.mark.parametrize("read", ["indexed", "memory"])
+def test_an_edit_to_a_configured_factorys_module_alone_is_environment(tmp_path, monkeypatch, read):
+    """A configured step's factory comes from a module of its own. An edit to
+    that file that leaves the factory alone changes only the environment, so
+    an exact resume reads on, where the plan names the step and where a
+    memory read's rows name the steps that made them; the same factory
+    configured otherwise is refused."""
+    module = tmp_path / f"given_{uuid4().hex}.py"
+    module.write_text(GIVEN)
+    monkeypatch.syspath_prepend(str(tmp_path))
+    given = importlib.import_module(module.stem).Given
+
+    def reader(version):
+        configured = Configured(given(Shift(1), version), needs=())
+        pipeline = Pipeline(source(8)).map(configured).shuffle(0).repeat().batch(2)
+        return compile(pipeline, read=read, loading=READ).train(DataPartition())
+
+    first = reader(1)
+    try:
+        next(first)
+        state = first.get_state()
+        expected = take(first, 2)
+    finally:
+        first.close()
+    module.write_text(GIVEN + "# an edit that leaves Given alone\n")
+    edited = reader(1)
+    try:
+        edited.set_state(state)
+        assert edited.manifest_changes == ("modules",)
+        assert take(edited, 2) == expected
+    finally:
+        edited.close()
+    other = reader(2)
+    try:
+        with pytest.raises(ValueError, match=r"saved data plan (steps|source) changed"):
             other.set_state(state)
     finally:
         other.close()

@@ -109,11 +109,20 @@ class Configured:
 
 
 @dataclasses.dataclass(frozen=True)
+class Bound:
+    """The configured step a record step was resolved from, with the
+    metadata values its factory read."""
+
+    step: Configured
+    values: Mapping[str, object]
+
+
+@dataclasses.dataclass(frozen=True)
 class Map:
     step: RecordStep
     identity: str | None = None
     rejects: bool = False
-    configured: Mapping[str, object] = dataclasses.field(default_factory=dict)
+    configured: Bound | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -121,7 +130,7 @@ class RandomMap:
     step: RandomStep
     identity: str | None = None
     rejects: bool = False
-    configured: Mapping[str, object] = dataclasses.field(default_factory=dict)
+    configured: Bound | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -142,7 +151,7 @@ class Filter:
 class FlatMap:
     step: Expansion
     identity: str | None = None
-    configured: Mapping[str, object] = dataclasses.field(default_factory=dict)
+    configured: Bound | None = None
 
 
 @dataclasses.dataclass(frozen=True)
