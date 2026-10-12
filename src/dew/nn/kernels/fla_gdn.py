@@ -171,6 +171,20 @@ def sequences(batch: int, length: int, cu_seqlens=None, *, chunk: int = 64) -> S
                      xp.stack([first, lengths, offsets[:-1]], axis=1).astype(np.int32))
 
 
+def _aligned(spans: Sequences, batch: int, length: int, chunk: int) -> bool:
+    """Whether every chunk starts on a multiple of `chunk`: the rows' own spans over whole chunks."""
+    return (length % chunk == 0 and spans.spans.shape[0] == batch
+            and spans.chunks.shape[0] == batch * length // chunk)
+
+
+def _chunk_of(chunk_ref, chunk: int, aligned: bool):
+    """A chunk's first token and count (`Sequences.chunks`). Where `aligned`, Triton is told the
+    first token is a multiple of `chunk`, as it infers of fla's fixed-length offsets, so a chunk's
+    loads and stores vectorize; a packed document's chunks start anywhere, as fla's varlen do."""
+    start, taken = chunk_ref[0], chunk_ref[1]
+    return (pl.multiple_of(start, chunk) if aligned else start), taken
+
+
 def _rows(ref, start, size, *rest):
     """The `size` rows from `start` of `ref`, with whatever trailing index `rest` takes."""
     return ref.at[(pl.ds(start, size), *rest)]
@@ -213,11 +227,11 @@ def _flat(*arrays):
     return tuple(x.reshape(x.shape[0] * x.shape[1], *x.shape[2:]) for x in arrays)
 
 
-def _cumsum_kernel(chunk_ref, s_ref, o_ref, *, chunk: int, scale: float | None, reverse: bool):
+def _cumsum_kernel(chunk_ref, s_ref, o_ref, *, chunk: int, aligned: bool, scale: float | None, reverse: bool):
     """fla's `chunk_local_cumsum_scalar_kernel` (fla/ops/utils/cumsum.py:33-73) for one chunk of one
     head: the inclusive cumulative sum over its tokens in fp32, of each column of a gate per key
     dimension (fla's vector kernel, :90-133) too, from the end where `reverse`, then `scale`."""
-    start, count = chunk_ref[0], chunk_ref[1]
+    start, count = _chunk_of(chunk_ref, chunk, aligned)
 
     @pl.when(count > 0)
     def _():
@@ -245,12 +259,13 @@ def chunk_local_cumsum(g, *, chunk: int = 64, scale: float | None = None, revers
 
     batch, length, heads, *columns = (int(size) for size in g.shape)
     spans = sequences(batch, length, chunk=chunk) if spans is None else spans
+    aligned = _aligned(spans, batch, length, chunk)
     # A decay per key dimension in 64-column blocks, fla's vector kernel's BS.
     blocks = [min(64, width) for width in columns]
     tiles = [width // block for width, block in zip(columns, blocks, strict=True)]
     spec = pl.BlockSpec((batch * length, None, *blocks), lambda i_t, h, *i_k: (0, h, *i_k))
     out = pl.pallas_call(
-        functools.partial(_cumsum_kernel, chunk=chunk, scale=scale, reverse=reverse),
+        functools.partial(_cumsum_kernel, chunk=chunk, aligned=aligned, scale=scale, reverse=reverse),
         grid=(spans.chunks.shape[0], heads, *tiles),
         in_specs=[_CHUNK, spec], out_specs=spec,
         out_shape=jax.ShapeDtypeStruct((batch * length, heads, *columns), jnp.float32),
@@ -309,7 +324,8 @@ def _tf32_dot(a, b):
     return jnp.dot(a, b, preferred_element_type=jnp.float32, precision=jax.lax.Precision.DEFAULT)
 
 
-def _kkt_solve_kernel(chunk_ref, k_ref, g_ref, beta_ref, a_ref, *, chunk: int, sub: int, bk: int,
+def _kkt_solve_kernel(chunk_ref, k_ref, g_ref, beta_ref, a_ref, *, chunk: int, aligned: bool, sub: int,
+                      bk: int,
                       exact: bool):
     """fla's `chunk_gated_delta_rule_fwd_kkt_solve_kernel` (fla/ops/gated_delta_rule/chunk_fwd.py:40-
     321) for one chunk of one head: `(I + A)^-1` for `A = tril(beta_s (k_s . k_t) exp2(g_s - g_t), -1)`,
@@ -317,7 +333,7 @@ def _kkt_solve_kernel(chunk_ref, k_ref, g_ref, beta_ref, a_ref, *, chunk: int, s
     key columns `bk` at a time; the gate and beta scale them; forward substitution inverts each
     diagonal block; and neighbouring inverses merge as `-X_i A_ij X_j`, the merge's products at TF32
     as fla's SOLVE_TRIL_DOT_PRECISION takes them on an sm80 or later."""
-    start, taken = chunk_ref[0], chunk_ref[1]
+    start, taken = _chunk_of(chunk_ref, chunk, aligned)
 
     @pl.when(taken > 0)
     def _():
@@ -386,9 +402,11 @@ def kkt_solve(k, g, beta, *, chunk: int = 64, sub: int = 16, bk: int | None = No
     group = value_heads // key_heads
     tokens = batch * length
     spans = sequences(batch, length, chunk=chunk) if spans is None else spans
+    aligned = _aligned(spans, batch, length, chunk)
     gated = pl.BlockSpec((tokens, None), lambda i_t, h: (0, h))
     solved = pl.pallas_call(
-        functools.partial(_kkt_solve_kernel, chunk=chunk, sub=sub, bk=min(bk, width), exact=interpret),
+        functools.partial(_kkt_solve_kernel, chunk=chunk, aligned=aligned, sub=sub, bk=min(bk, width),
+                          exact=interpret),
         grid=(spans.chunks.shape[0], value_heads),
         in_specs=[_CHUNK, pl.BlockSpec((tokens, None, width), lambda i_t, h: (0, h // group, 0)), gated,
                   gated],
@@ -400,12 +418,13 @@ def kkt_solve(k, g, beta, *, chunk: int = 64, sub: int = 16, bk: int | None = No
     return solved.reshape(batch, length, value_heads, chunk)
 
 
-def _w_u_kernel(chunk_ref, k_ref, v_ref, beta_ref, a_ref, g_ref, w_ref, u_ref, *, chunk: int, bk: int,
+def _w_u_kernel(chunk_ref, k_ref, v_ref, beta_ref, a_ref, g_ref, w_ref, u_ref, *, chunk: int,
+                aligned: bool, bk: int,
                 bv: int, exact: bool):
     """fla's `recompute_w_u_fwd_kernel` (fla/ops/gated_delta_rule/wy_fast.py:39-103) for one chunk
     of one head: `u = A (v * beta)` and `w = A (k * beta * exp2(g))`, each operand rounded to its
     input dtype before the product and `A`'s product with `v` at IEEE fp32 (`allow_tf32=False`)."""
-    start, taken = chunk_ref[0], chunk_ref[1]
+    start, taken = _chunk_of(chunk_ref, chunk, aligned)
 
     @pl.when(taken > 0)
     def _():
@@ -448,13 +467,15 @@ def recompute_w_u(k, v, beta, a, g, *, chunk: int = 64, bk: int | None = None, b
     group = value_heads // key_heads
     tokens = batch * length
     spans = sequences(batch, length, chunk=chunk) if spans is None else spans
+    aligned = _aligned(spans, batch, length, chunk)
 
     def headed(size):
         return pl.BlockSpec((tokens, None, size), lambda i_t, h: (0, h, 0))
 
     gate = pl.BlockSpec((tokens, None), lambda i_t, h: (0, h))
     w, u = pl.pallas_call(
-        functools.partial(_w_u_kernel, chunk=chunk, bk=min(bk, width), bv=min(bv, columns), exact=interpret),
+        functools.partial(_w_u_kernel, chunk=chunk, aligned=aligned, bk=min(bk, width),
+                          bv=min(bv, columns), exact=interpret),
         grid=(spans.chunks.shape[0], value_heads),
         in_specs=[_CHUNK, pl.BlockSpec((tokens, None, width), lambda i_t, h: (0, h // group, 0)),
                   headed(columns), gate, headed(chunk), gate],
@@ -467,15 +488,17 @@ def recompute_w_u(k, v, beta, a, g, *, chunk: int = 64, bk: int | None = None, b
     return w.reshape(batch, length, value_heads, width), u.reshape(v.shape)
 
 
-def _span(span_ref, length: int):
+def _span(span_ref, length: int, chunk: int, aligned: bool):
     """A sequence's first token, count and first chunk (`Sequences.spans`), its row in a call of rows
     `length` long, and whether it starts its row (taking the row's initial memory) and ends it
-    (giving the row's final memory)."""
+    (giving the row's final memory). `aligned` as `_chunk_of`."""
     start, count, offset = span_ref[0], span_ref[1], span_ref[2]
+    start = pl.multiple_of(start, chunk) if aligned else start
     return start, count, offset, start // length, start % length == 0, (start + count) % length == 0
 
 
 def _h_kernel(span_ref, k_ref, u_ref, w_ref, g_ref, h0_ref, h_ref, corrected_ref, ht_ref, *, chunk: int,
+              aligned: bool,
               length: int, exact: bool, per_key: bool = False):
     """fla's `chunk_gated_delta_rule_fwd_kernel_h_blockdim64` (fla/ops/common/chunk_delta_h.py:50-
     343) for one sequence's head and `BV` value columns, its chunks in order. The memory is fp32 in
@@ -487,7 +510,7 @@ def _h_kernel(span_ref, k_ref, u_ref, w_ref, g_ref, h0_ref, h_ref, corrected_ref
     `per_key` is fla's USE_GK branch: `g_ref` holds a decay per key dimension `[T, K]`, which gates
     the memory's rows by `exp2(g_last)` and not the values, whose keys carry their own decay. A row's
     first sequence starts from its initial memory and its last stores the final one."""
-    start, count, offset, row, first, last_in_row = _span(span_ref, length)
+    start, count, offset, row, first, last_in_row = _span(span_ref, length, chunk, aligned)
     slices = k_ref.shape[-1] // 64
 
     @pl.when(count > 0)
@@ -546,6 +569,7 @@ def chunk_fwd_h(k, w, u, g, h0, *, chunk: int = 64, bv: int | None = None, spans
     group = value_heads // key_heads
     tokens = batch * length
     spans = sequences(batch, length, chunk=chunk) if spans is None else spans
+    aligned = _aligned(spans, batch, length, chunk)
     chunks = spans.chunks.shape[0]
 
     def head(i_v, sh):
@@ -554,7 +578,7 @@ def chunk_fwd_h(k, w, u, g, h0, *, chunk: int = 64, bv: int | None = None, spans
     per_key = g.ndim == 4
     rows = pl.BlockSpec((batch, None, width, bv), lambda i_v, sh: (0, head(i_v, sh), 0, i_v))
     h, corrected, final = pl.pallas_call(
-        functools.partial(_h_kernel, chunk=chunk, length=length, exact=interpret,
+        functools.partial(_h_kernel, chunk=chunk, aligned=aligned, length=length, exact=interpret,
                           **({"per_key": True} if per_key else {})),
         grid=(columns // bv, spans.spans.shape[0] * value_heads),
         in_specs=[pl.BlockSpec((None, 3), lambda i_v, sh: (sh // value_heads, 0)),
@@ -584,7 +608,7 @@ def _per_row(h, batch: int, length: int, chunk: int, spans: Sequences):
 
 
 def _dhu_kernel(span_ref, q_ref, k_ref, w_ref, g_ref, dht_ref, do_ref, dv_ref, dh_ref, dh0_ref, dv2_ref, *,
-                chunk: int, length: int, scale: float, exact: bool, per_key: bool = False):
+                chunk: int, aligned: bool, length: int, scale: float, exact: bool, per_key: bool = False):
     """fla's `chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64` (chunk_delta_h.py:359-669) for one
     sequence's head and `BV` value columns, chunks in reverse. Each stores the gradient of the memory
     it leaves into, `dh`, then `dv2 = dv + (k dh) exp2(g_last - g)` (dh cast to k's dtype), then
@@ -594,7 +618,7 @@ def _dhu_kernel(span_ref, q_ref, k_ref, w_ref, g_ref, dht_ref, do_ref, dv_ref, d
     gradient's rows by `exp2(g_last)`, and neither `dv2` nor the queries, which carry their own decay,
     are gated; the query product stays in q's dtype. A row's last sequence starts from the final
     memory's gradient and its first stores the initial memory's."""
-    start, count, offset, row, first, last_in_row = _span(span_ref, length)
+    start, count, offset, row, first, last_in_row = _span(span_ref, length, chunk, aligned)
     slices = k_ref.shape[-1] // 64
     chunks = -(-count // chunk)
 
@@ -672,6 +696,7 @@ def chunk_bwd_dhu(q, k, w, g, dht, do, dv, *, scale: float, chunk: int = 64, bv:
     group = value_heads // key_heads
     tokens = batch * length
     spans = sequences(batch, length, chunk=chunk) if spans is None else spans
+    aligned = _aligned(spans, batch, length, chunk)
     chunks = spans.chunks.shape[0]
 
     def head(i_v, sh):
@@ -682,7 +707,8 @@ def chunk_bwd_dhu(q, k, w, g, dht, do, dv, *, scale: float, chunk: int = 64, bv:
     rows = pl.BlockSpec((batch, None, width, bv), lambda i_v, sh: (0, head(i_v, sh), 0, i_v))
     per_key = g.ndim == 4
     dh, dh0, dv2 = pl.pallas_call(
-        functools.partial(_dhu_kernel, chunk=chunk, length=length, scale=scale, exact=interpret,
+        functools.partial(_dhu_kernel, chunk=chunk, aligned=aligned, length=length, scale=scale,
+                          exact=interpret,
                           **({"per_key": True} if per_key else {})),
         grid=(columns // bv, spans.spans.shape[0] * value_heads),
         in_specs=[pl.BlockSpec((None, 3), lambda i_v, sh: (sh // value_heads, 0)), keys, keys,
@@ -701,12 +727,13 @@ def chunk_bwd_dhu(q, k, w, g, dht, do, dv, *, scale: float, chunk: int = 64, bv:
     return _per_row(dh, batch, length, chunk, spans), dh0, dv2.reshape(dv.shape)
 
 
-def _dv_local_kernel(chunk_ref, q_ref, k_ref, g_ref, do_ref, dv_ref, *, chunk: int, scale: float, bk: int,
+def _dv_local_kernel(chunk_ref, q_ref, k_ref, g_ref, do_ref, dv_ref, *, chunk: int, aligned: bool,
+                     scale: float, bk: int,
                      bv: int, exact: bool):
     """fla's `chunk_bwd_kernel_dv_local` (fla/ops/common/chunk_o.py:452-526) for one chunk of one
     head: the corrected values' gradient from the chunk's own output, `dv = A do` with
     `A[s, t] = scale (k_s . q_t) exp2(g_t - g_s)` for `s <= t`, cast to `do`'s dtype for the product."""
-    start, taken = chunk_ref[0], chunk_ref[1]
+    start, taken = _chunk_of(chunk_ref, chunk, aligned)
 
     @pl.when(taken > 0)
     def _():
@@ -744,10 +771,12 @@ def chunk_bwd_dv_local(q, k, g, do, *, scale: float, chunk: int = 64, bk: int | 
     group = value_heads // key_heads
     tokens = batch * length
     spans = sequences(batch, length, chunk=chunk) if spans is None else spans
+    aligned = _aligned(spans, batch, length, chunk)
     keys = pl.BlockSpec((tokens, None, width), lambda i_t, h: (0, h // group, 0))
     values = pl.BlockSpec((tokens, None, columns), lambda i_t, h: (0, h, 0))
     dv = pl.pallas_call(
-        functools.partial(_dv_local_kernel, chunk=chunk, scale=scale, bk=min(bk, width), bv=min(bv, columns),
+        functools.partial(_dv_local_kernel, chunk=chunk, aligned=aligned, scale=scale, bk=min(bk, width),
+                          bv=min(bv, columns),
                           exact=interpret),
         grid=(spans.chunks.shape[0], value_heads),
         in_specs=[_CHUNK, keys, keys, pl.BlockSpec((tokens, None), lambda i_t, h: (0, h)), values],
@@ -784,7 +813,7 @@ def _state_inner_product(memory, memory_grad):
 
 
 def _dqkwg_kernel(chunk_ref, q_ref, k_ref, v_ref, g_ref, h_ref, do_ref, dh_ref, dv_ref, dq_ref, dk_ref,
-                  dw_ref, dg_ref, *, chunk: int, scale: float, bv: int, exact: bool):
+                  dw_ref, dg_ref, *, chunk: int, aligned: bool, scale: float, bv: int, exact: bool):
     """fla's `chunk_bwd_kernel_dqkwg` (fla/ops/common/chunk_o.py:159-331) for one chunk of one key
     head and `BK` key columns, over the value heads it serves in turn: over the value columns `bv` at
     a time, `ds = do v^T`, `dq = do h^T`, `dk = v dh^T`, `dw = -dv h^T` and `sum(h dh)`; then the
@@ -792,7 +821,7 @@ def _dqkwg_kernel(chunk_ref, q_ref, k_ref, v_ref, g_ref, h_ref, do_ref, dh_ref, 
     taking the memory's. The value heads' `dq` and `dk` sum in fp32 and round to their dtype once,
     where fla rounds each value head's and sums them after. The heads are a loop, not unrolled, so a
     program holds one head's accumulators at a time."""
-    start, taken = chunk_ref[0], chunk_ref[1]
+    start, taken = _chunk_of(chunk_ref, chunk, aligned)
 
     @pl.when(taken > 0)
     def _():
@@ -862,11 +891,12 @@ def chunk_bwd_dqkwg(q, k, v, w, g, h, dv, do, dh, *, scale: float, chunk: int = 
     group = value_heads // key_heads
     tokens = batch * length
     spans = sequences(batch, length, chunk=chunk) if spans is None else spans
+    aligned = _aligned(spans, batch, length, chunk)
     keys = pl.BlockSpec((tokens, None, bk), lambda i_k, i_t, i_h: (0, i_h, i_k))
     values = pl.BlockSpec((tokens, group, columns), lambda i_k, i_t, i_h: (0, i_h, 0))
     memory = pl.BlockSpec((None, group, bk, columns), lambda i_k, i_t, i_h: (i_t, i_h, i_k, 0))
     dq, dk, dw, dg = pl.pallas_call(
-        functools.partial(_dqkwg_kernel, chunk=chunk, scale=scale, bv=bv, exact=interpret),
+        functools.partial(_dqkwg_kernel, chunk=chunk, aligned=aligned, scale=scale, bv=bv, exact=interpret),
         grid=(width // bk, spans.chunks.shape[0], key_heads),
         in_specs=[pl.BlockSpec((None, 2), lambda i_k, i_t, i_h: (i_t, 0)), keys, keys, values,
                   pl.BlockSpec((tokens, group), lambda i_k, i_t, i_h: (0, i_h)), memory, values, memory,
@@ -894,6 +924,7 @@ def _wy_gate_sum(d_gate, weighted):
 
 
 def _wy_bwd_kernel(chunk_ref, k_ref, v_ref, beta_ref, g_ref, a_ref, dw_ref, du_ref, *refs, chunk: int,
+                   aligned: bool,
                    bk: int, bv: int, group: int | None, exact: bool):
     """fla's `prepare_wy_repr_bwd_kernel` (fla/ops/gated_delta_rule/wy_fast.py:119-243) for one
     chunk of one head. With `X = (I + L)^-1` (fla's `A`), `w = X (k beta exp2(g))` and
@@ -907,7 +938,7 @@ def _wy_bwd_kernel(chunk_ref, k_ref, v_ref, beta_ref, g_ref, a_ref, dw_ref, du_r
     of each key head's group, where fla adds the two stored gradients in a pass of their own
     (chunk.py:244)."""
     earlier_ref, (dk_ref, dv_ref, db_ref, dg_ref) = (refs[0], refs[1:]) if group else (None, refs)
-    start, taken = chunk_ref[0], chunk_ref[1]
+    start, taken = _chunk_of(chunk_ref, chunk, aligned)
     first_of_group = pl.program_id(1) % (group or 1) == 0
 
     @pl.when(taken > 0)
@@ -987,6 +1018,7 @@ def prepare_wy_repr_bwd(k, v, beta, g, a, dw, du, dk=None, *, chunk: int = 64, b
     group = value_heads // key_heads
     tokens = batch * length
     spans = sequences(batch, length, chunk=chunk) if spans is None else spans
+    aligned = _aligned(spans, batch, length, chunk)
 
     def headed(size):
         return pl.BlockSpec((tokens, None, size), lambda i_t, h: (0, h, 0))
@@ -995,8 +1027,8 @@ def prepare_wy_repr_bwd(k, v, beta, g, a, dw, du, dk=None, *, chunk: int = 64, b
     keys = pl.BlockSpec((tokens, None, width), lambda i_t, h: (0, h // group, 0))
     earlier = () if dk is None else (dk,)
     dk, dv, db, dg = pl.pallas_call(
-        functools.partial(_wy_bwd_kernel, chunk=chunk, bk=min(bk, width), bv=min(bv, columns),
-                          group=group if earlier else None, exact=interpret),
+        functools.partial(_wy_bwd_kernel, chunk=chunk, aligned=aligned, bk=min(bk, width),
+                          bv=min(bv, columns), group=group if earlier else None, exact=interpret),
         grid=(spans.chunks.shape[0], value_heads),
         in_specs=[_CHUNK, keys, headed(columns), gate, gate, headed(chunk), headed(width), headed(columns),
                   *(keys for _ in earlier)],
@@ -1013,13 +1045,14 @@ def prepare_wy_repr_bwd(k, v, beta, g, a, dw, du, dk=None, *, chunk: int = 64, b
     return dk, dv.reshape(v.shape), db.reshape(beta.shape), dg.reshape(g.shape)
 
 
-def _o_kernel(chunk_ref, q_ref, k_ref, v_ref, h_ref, g_ref, o_ref, *, chunk: int, scale: float, bk: int,
+def _o_kernel(chunk_ref, q_ref, k_ref, v_ref, h_ref, g_ref, o_ref, *, chunk: int, aligned: bool,
+              scale: float, bk: int,
               exact: bool):
     """fla's `chunk_fwd_kernel_o` (fla/ops/common/chunk_o.py:43-147) for one chunk of one head and
     `BV` value columns: `o = scale * ((q h) exp2(g) + tril((q k^T) exp2(g_s - g_t)) v)`, the key
     columns walked `bk` at a time into fp32 accumulators, `A` cast to the values' dtype for its
     product, as fla does."""
-    start, taken = chunk_ref[0], chunk_ref[1]
+    start, taken = _chunk_of(chunk_ref, chunk, aligned)
 
     @pl.when(taken > 0)
     def _():
@@ -1064,10 +1097,12 @@ def chunk_fwd_o(q, k, v, h, g, *, scale: float, chunk: int = 64, bk: int | None 
     group = value_heads // key_heads
     tokens = batch * length
     spans = sequences(batch, length, chunk=chunk) if spans is None else spans
+    aligned = _aligned(spans, batch, length, chunk)
     keyed = pl.BlockSpec((tokens, None, width), lambda i_v, i_t, i_h: (0, i_h // group, 0))
     valued = pl.BlockSpec((tokens, None, bv), lambda i_v, i_t, i_h: (0, i_h, i_v))
     out = pl.pallas_call(
-        functools.partial(_o_kernel, chunk=chunk, scale=scale, bk=min(bk, width), exact=interpret),
+        functools.partial(_o_kernel, chunk=chunk, aligned=aligned, scale=scale, bk=min(bk, width),
+                          exact=interpret),
         grid=(columns // bv, spans.chunks.shape[0], value_heads),
         in_specs=[pl.BlockSpec((None, 2), lambda i_v, i_t, i_h: (i_t, 0)), keyed, keyed, valued,
                   pl.BlockSpec((None, None, width, bv), lambda i_v, i_t, i_h: (i_t, i_h, 0, i_v)),
