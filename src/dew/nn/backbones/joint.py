@@ -351,7 +351,7 @@ class DoubleStreamBlock(nn.Module):
         if self.dual_attention:
             shift2, scale2, gate2 = image_mods[6:]
             attended2, _ = self._attention("attn2")(modulate(normalized, shift2, scale2))
-            image = image + gate2[:, None] * attended2
+            image = image + gate2[:, None] * dropout(attended2)
         image = image + gate_mlp[:, None] * dropout(self._feed_forward("ff")(
             modulate(norm(image), shift_mlp, scale_mlp)))
         if self.context_pre_only:
