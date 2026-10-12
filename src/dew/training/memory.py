@@ -40,13 +40,7 @@ COLLECTIVES = {
 }
 """NVIDIA JAX-Toolbox's collective options for a GPU step over several devices: the scheduler overlaps
 each collective with compute, the collectives combine into few large ones, and the layer loop double
-buffers them. (Toolbox also names three pipelined-collective flags, which this XLA takes in XLA_FLAGS
-and ignores: none is an option a compile accepts.) On two H100 SXMs over NVLink, Llama-3.1-8B (FSDP 2,
-2 x 4096 tokens, remat minimal) ran 3.7% faster with them, 539.3 to 519.5 ms a step (MFU 37.0% to
-38.4%, two runs each within 0.3%); with Toolbox's whole bundle its all-gathers and reduce-scatters fell
-from 376 and 162 to 48 and 66 on the same bytes. The bundle's other two options stay out: command
-buffers off cost 0.7%, and XLA's rematerialization pass off changed nothing. One GPU has no collectives
-to combine (Llama 1.1B: the whole bundle within 0.4%)."""
+buffers them. Measured in docs/performance.md, "Collectives over several GPUs"."""
 
 
 def step_compiler_options(objective, tokens: float, frozen: bool,
