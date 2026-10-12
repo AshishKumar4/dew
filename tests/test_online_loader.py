@@ -7,9 +7,8 @@ import numpy as np
 import pytest
 from PIL import Image
 
-from dew.data import Loading, Memory, Rejected, images, video
-from dew.data.cache import Cache
-from dew.data.compile import compile, iterate, publish
+from dew.data import Files, Loading, Memory, Rejected, images, video
+from dew.data.compile import compile, iterate
 from dew.data.dataset import DataPartition
 from dew.data.mixing import SearchBudget
 from dew.data.pipeline import Pipeline
@@ -155,20 +154,16 @@ def test_a_web_image_flow_trains_on_the_good_images_and_counts_each_drop_by_reas
     assert set(dropped) == {"too_small", "too_elongated", "flat", "undecodable", "transient", "invalid_url"}
 
 
-def test_fetched_bytes_published_once_train_and_resume_exactly_after_every_url_dies(tmp_path):
-    """A published fetch is the bytes the run reads: with every url gone, a run over the cached
-    generation trains on the original pixels, and resuming from a saved position continues it
-    exactly. A url that fails transiently would be fetched again, so it keeps a table from
-    publishing; this one fails only permanently."""
-    table = [row for row in web_table(tmp_path) if not str(row["url"]).endswith("gone.png")]
-    fetched = Pipeline(Memory(table)).filter_map(images.fetch())
-    generation = publish(fetched, Cache(str(tmp_path / "cache")), read="indexed", loading=READ)
+def test_a_snapshot_of_fetched_bytes_trains_and_resumes_exactly_after_every_url_dies(tmp_path):
+    """A snapshot seals what a fetch got: with every url gone, a run reading it back with Files
+    trains on the original pixels, and resuming from a saved position continues it exactly."""
+    table = web_table(tmp_path)
+    Memory(table).filter_map(images.fetch()).snapshot(str(tmp_path / "snapshot"))
     originals = {row["label"]: np.asarray(Image.open(row["url"].removeprefix("file://")).convert("RGB"))
                  for row in table[:8]}
     for path in tmp_path.glob("*.png"):
         path.unlink()
-    pipeline = worth_training_on(Pipeline(Memory(table)).filter_map(images.fetch()).cache(generation)
-                                 .shuffle(5).repeat()).batch(4)
+    pipeline = worth_training_on(Files(str(tmp_path / "snapshot")).shuffle(5).repeat()).batch(4)
     data = compile(pipeline, read="indexed", loading=READ)
     stream = data.train(DataPartition())
     try:
