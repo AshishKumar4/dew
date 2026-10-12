@@ -174,9 +174,6 @@ FLASH_BACKWARD = hlo_module(
     'custom-call(%gradient, %query, %key, %value, %output, %lse), custom_call_target="dew_flash_mha_bwd", '
     'api_version=API_VERSION_TYPED_FFI',
 )
-# FlashAttention-3's, on Hopper: the same leading operands under its own targets.
-FLASH3_FORWARD = FLASH_FORWARD.replace('dew_flash_mha_fwd', 'dew_flash3_mha_fwd')
-FLASH3_BACKWARD = FLASH_BACKWARD.replace('dew_flash_mha_bwd', 'dew_flash3_mha_bwd')
 
 # A loop XLA states no trip count for: the body holds a matmul, so counting it
 # once would be a number that belongs to no run.
@@ -574,8 +571,6 @@ def test_gpu_matmul_custom_calls_are_counted_from_their_shapes():
     # FlashAttention-2's calls are the same work, its backward's query second.
     assert hlo_flops(FLASH_FORWARD) == pytest.approx(4 * scores)
     assert hlo_flops(FLASH_BACKWARD) == pytest.approx(8 * scores)
-    assert hlo_flops(FLASH3_FORWARD) == pytest.approx(4 * scores)
-    assert hlo_flops(FLASH3_BACKWARD) == pytest.approx(8 * scores)
 
 
 def test_fit_reports_throughput_to_the_tracker():

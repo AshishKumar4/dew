@@ -35,7 +35,7 @@ ARCHITECTURES = _two + _three
 for _name in ("dew_flash_mha_fwd", "dew_flash_mha_bwd",
               "dew_flash_mha_varlen_fwd", "dew_flash_mha_varlen_bwd"):
     jax.ffi.register_ffi_target(_name, jax.ffi.pycapsule(getattr(_library, _name)), platform="CUDA")
-for _name in ("dew_flash3_mha_fwd", "dew_flash3_mha_bwd"):
+for _name in ("dew_flash3_mha_fwd", "dew_flash3_mha_bwd", "dew_flash3_mha_varlen_fwd", "dew_flash3_mha_varlen_bwd"):
     jax.ffi.register_ffi_target(_name, jax.ffi.pycapsule(getattr(_library3, _name)), platform="CUDA")
 
 
@@ -81,7 +81,49 @@ def _attributes(scale: float, causal: bool) -> dict:
             "window_size_left": np.int64(-1), "window_size_right": np.int64(-1)}
 
 
+def _forward3(query, key, value, starts, longest, scale, causal):
+    """FlashAttention-3's forward over `[B, S, H, D]` arrays, or, given cumulative offsets `starts`,
+    over packed `[T, H, D]` ones whose sequences hold at most `longest` tokens."""
+    q, k, v = _padded(query, key, value)
+    heads = q.shape[-2]
+    packed = starts is not None
+    results = (jax.ShapeDtypeStruct(q.shape, q.dtype),
+               jax.ShapeDtypeStruct((heads, q.shape[0]) if packed else (q.shape[0], heads, q.shape[1]),
+                                    jnp.float32),
+               jax.ShapeDtypeStruct((1, 1, 1, 1), jnp.float32), jax.ShapeDtypeStruct((1, 1, 1), jnp.float32))
+    attributes = {"softmax_scale": np.float64(scale), "is_causal": causal}
+    if packed:
+        out, lse, _, _ = jax.ffi.ffi_call("dew_flash3_mha_varlen_fwd", results)(
+            q, k, v, starts, max_seqlen=np.int64(longest), **attributes)
+    else:
+        out, lse, _, _ = jax.ffi.ffi_call("dew_flash3_mha_fwd", results)(q, k, v, **attributes)
+    return out[..., :query.shape[-1]], lse
+
+
+def _backward3(grad, query, key, value, out, lse, starts, longest, scale, causal):
+    """FlashAttention-3's backward, whose key and value gradients come per key head."""
+    width = query.shape[-1]
+    g, q, k, v, o = _padded(grad, query, key, value, out)
+    packed = starts is not None
+    # Two scratch buffers of rows per head, each sequence's queries rounded up to the backward's row
+    # block, which the port picks from 64, 80, 96 and 128 by width and mask, and packed one block
+    # more over all of them: 128 rows a sequence and 128 more hold either layout.
+    tokens, sequences = (q.shape[0], starts.shape[0] - 1) if packed else (q.shape[0] * q.shape[1], q.shape[0])
+    scratch = jax.ShapeDtypeStruct((q.shape[-2] * (tokens + 128 * (sequences + 1)),), jnp.float32)
+    results = (jax.ShapeDtypeStruct(q.shape, q.dtype), jax.ShapeDtypeStruct(k.shape, q.dtype),
+               jax.ShapeDtypeStruct(v.shape, q.dtype), scratch, scratch)
+    attributes = {"softmax_scale": np.float64(scale), "is_causal": causal}
+    if packed:
+        dq, dk, dv, _, _ = jax.ffi.ffi_call("dew_flash3_mha_varlen_bwd", results)(
+            g, q, k, v, o, lse, starts, max_seqlen=np.int64(longest), **attributes)
+    else:
+        dq, dk, dv, _, _ = jax.ffi.ffi_call("dew_flash3_mha_bwd", results)(g, q, k, v, o, lse, **attributes)
+    return dq[..., :width], dk[..., :width], dv[..., :width]
+
+
 def _forward(query, key, value, scale, causal):
+    if _hopper():
+        return _forward3(query, key, value, None, None, scale, causal)
     batch, queries, heads, width = query.shape
     keys = key.shape[1]
     block = 256 if width <= 64 else 128 if width <= 128 else 64
@@ -98,6 +140,8 @@ def _forward(query, key, value, scale, causal):
 
 
 def _backward(grad, query, key, value, out, lse, scale, causal):
+    if _hopper():
+        return _backward3(grad, query, key, value, out, lse, None, None, scale, causal)
     batch, queries, heads, width = query.shape
     keys, key_heads = key.shape[1], key.shape[2]
     g, q, k, v, o = _padded(grad, query, key, value, out)
@@ -133,80 +177,6 @@ def _attend_backward(scale, causal, residuals, grad):
 _attend.defvjp(_attend_forward, _attend_backward)
 
 
-def _absent(dtype):
-    """An operand FlashAttention-3's port reads as not given: it takes an empty buffer for each."""
-    return jnp.zeros((0,), dtype)
-
-
-def _forward3(query, key, value, starts, longest, scale, causal):
-    """FlashAttention-3's forward over `[B, S, H, D]` arrays, or over packed `[T, H, D]` ones whose
-    sequences start at the cumulative offsets `starts` (empty for a batch) and hold at most `longest`
-    tokens."""
-    q, k, v = _padded(query, key, value)
-    packed = starts.size > 0
-    heads = q.shape[-2]
-    lse = (heads, q.shape[0]) if packed else (q.shape[0], heads, q.shape[1])
-    out, lse, _, _ = jax.ffi.ffi_call("dew_flash3_mha_fwd", (
-        jax.ShapeDtypeStruct(q.shape, q.dtype),
-        jax.ShapeDtypeStruct(lse, jnp.float32),
-        jax.ShapeDtypeStruct((1, 1, 1, 1), jnp.float32),
-        jax.ShapeDtypeStruct((1, 1, 1), jnp.float32),
-    ))(q, k, v, _absent(q.dtype), _absent(q.dtype), _absent(q.dtype), starts, starts,
-       *(_absent(jnp.int32),) * 6, _absent(q.dtype), _absent(q.dtype), _absent(jnp.int32),
-       *(_absent(jnp.float32),) * 3, _absent(jnp.int32),
-       max_seqlen_q=np.int64(longest or q.shape[1]), max_seqlen_q_has_value=True,
-       max_seqlen_k=np.int64(longest or k.shape[1]), max_seqlen_k_has_value=True,
-       softmax_scale_val=np.float64(scale), softmax_scale_has_value=True, pack_gqa_val=False,
-       pack_gqa_has_value=False, is_causal=causal, window_size_left=np.int64(-1),
-       window_size_right=np.int64(-1), attention_chunk=np.int64(0), softcap=np.float64(0.0),
-       is_rotary_interleaved=False, num_splits=np.int64(1), sm_margin=np.int64(0))
-    return out[..., :query.shape[-1]], lse
-
-
-def _backward3(grad, query, key, value, out, lse, starts, longest, scale, causal):
-    """FlashAttention-3's backward, whose key and value gradients come per key head."""
-    width = query.shape[-1]
-    g, q, k, v, o = _padded(grad, query, key, value, out)
-    heads = q.shape[-2]
-    # Two scratch buffers of rows per head, each sequence's queries rounded up to the backward's row
-    # block, which the port picks from 64, 80, 96 and 128 by width and mask, and packed one block
-    # more over all of them: 128 rows a sequence and 128 more hold either layout.
-    tokens, sequences = ((q.shape[0], starts.shape[0] - 1) if starts.size > 0
-                         else (q.shape[0] * q.shape[1], q.shape[0]))
-    dq, dk, dv, _, _ = jax.ffi.ffi_call("dew_flash3_mha_bwd", (
-        jax.ShapeDtypeStruct(q.shape, q.dtype),
-        jax.ShapeDtypeStruct(k.shape, q.dtype),
-        jax.ShapeDtypeStruct(v.shape, q.dtype),
-        jax.ShapeDtypeStruct((heads * (tokens + 128 * (sequences + 1)),), jnp.float32),
-        jax.ShapeDtypeStruct((heads * (tokens + 128 * (sequences + 1)),), jnp.float32),
-    ))(g, q, k, v, o, lse, starts, starts, _absent(jnp.int32), _absent(jnp.int32),
-       max_seqlen_q_val=np.int64(longest or q.shape[1]), max_seqlen_q_has_value=True,
-       max_seqlen_k_val=np.int64(longest or k.shape[1]), max_seqlen_k_has_value=True,
-       softmax_scale_val=np.float64(scale), softmax_scale_has_value=True, is_causal=causal,
-       window_size_left=np.int64(-1), window_size_right=np.int64(-1), softcap=np.float64(0.0),
-       deterministic=False, sm_margin=np.int64(0))
-    return dq[..., :width], dk[..., :width], dv[..., :width]
-
-
-@functools.partial(jax.custom_vjp, nondiff_argnums=(4, 5, 6))
-def _attend3(query, key, value, starts, longest, scale, causal):
-    return _forward3(query, key, value, starts, longest, scale, causal)[0]
-
-
-def _attend3_forward(query, key, value, starts, longest, scale, causal):
-    out, lse = _forward3(query, key, value, starts, longest, scale, causal)
-    return out, (query, key, value, out, lse, starts)
-
-
-def _attend3_backward(longest, scale, causal, residuals, grad):
-    query, key, value, out, lse, starts = residuals
-    dq, dk, dv = _backward3(grad, query, key, value, out, lse, starts, longest, scale, causal)
-    return dq, dk, dv, np.zeros(starts.shape, jax.dtypes.float0)
-
-
-_attend3.defvjp(_attend3_forward, _attend3_backward)
-
-
 def flash_mha(query, key, value, softmax_scale: float | None = None, is_causal: bool = False):
     """Attention of `query` over `key` and `value`, `[B, S, H, D]`, scaled by
     `softmax_scale` (1/sqrt(D) by default). A causal mask is aligned to the
@@ -218,12 +188,12 @@ def flash_mha(query, key, value, softmax_scale: float | None = None, is_causal: 
         raise ValueError(f"flash_mha takes key heads that divide the query's and heads up to 256 wide, "
                          f"not query {query.shape}, key {key.shape} and value {value.shape}")
     scale = 1.0 / math.sqrt(query.shape[-1]) if softmax_scale is None else softmax_scale
-    if _hopper():
-        return _attend3(query, key, value, _absent(jnp.int32), None, float(scale), bool(is_causal))
     return _attend(query, key, value, float(scale), bool(is_causal))
 
 
 def _varlen_forward(query, key, value, starts, longest, scale, causal):
+    if _hopper():
+        return _forward3(query, key, value, starts, longest, scale, causal)
     heads, width = query.shape[1:]
     sequences = starts.shape[0] - 1
     q, k, v = _padded(query, key, value)
@@ -239,6 +209,8 @@ def _varlen_forward(query, key, value, starts, longest, scale, causal):
 
 
 def _varlen_backward(grad, query, key, value, out, lse, starts, longest, scale, causal):
+    if _hopper():
+        return _backward3(grad, query, key, value, out, lse, starts, longest, scale, causal)
     total, heads, width = query.shape
     key_heads = key.shape[1]
     sequences = starts.shape[0] - 1
@@ -294,6 +266,4 @@ def flash_mha_varlen(query, key, value, cu_seqlens, max_seqlen: int, softmax_sca
                          f"{value.shape}")
     scale = 1.0 / math.sqrt(query.shape[-1]) if softmax_scale is None else softmax_scale
     starts = jnp.asarray(cu_seqlens, jnp.int32)
-    if _hopper():
-        return _attend3(query, key, value, starts, int(max_seqlen), float(scale), bool(is_causal))
     return _attend_packed(query, key, value, starts, int(max_seqlen), float(scale), bool(is_causal))
