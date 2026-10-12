@@ -32,6 +32,7 @@ import grain.python as pygrain
 import jax
 import numpy as np
 import tyro
+from absl import flags
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from dew import position
@@ -42,6 +43,11 @@ from dew.nn.sharding import BATCH_AXES, LayoutRefused
 from dew.objectives.base import VALID_ROWS, Batch
 
 _log = logging.getLogger(__name__)
+
+# Grain's worker processes read absl flags, which a script without absl.app never
+# parsed; importing Dew's data layer marks them parsed, as `absl.app` would.
+if not flags.FLAGS.is_parsed():
+    flags.FLAGS.mark_as_parsed()
 
 if TYPE_CHECKING:
     from dew.data.mix import CorpusCounts

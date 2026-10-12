@@ -26,7 +26,6 @@ from typing import TYPE_CHECKING, Protocol, runtime_checkable
 import grain.experimental as gx
 import grain.python as pygrain
 import numpy as np
-from absl import flags
 from grain._src.python.dataset.transformations.batch import make_batch
 
 from dew.data.analysis import (
@@ -551,9 +550,6 @@ class _Build:
                 _as_iter(rows, self.loading), prefetch_buffer_size=stage.buffer
             )
         elif isinstance(stage, Workers):
-            # grain's workers read absl flags, which a script without absl.app never parsed.
-            if not flags.FLAGS.is_parsed():
-                flags.FLAGS.mark_as_parsed()
             rows = _as_iter(rows, self.loading).mp_prefetch(
                 pygrain.MultiprocessingOptions(
                     num_workers=stage.count, per_worker_buffer_size=stage.buffer
