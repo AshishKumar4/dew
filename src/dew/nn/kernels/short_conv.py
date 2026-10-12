@@ -42,9 +42,6 @@ an fp32 register of each of four warps' threads."""
 STEPS = 64
 """Tokens of a run: its K-1 extra tokens are 5% of 64 at the K of 4 every mixer uses."""
 
-SUMMED = 2
-"""Tokens whose taps' gradients a run sums before adding them to its compensated total."""
-
 WARPS = 4
 
 WIDEST_TAPS = 8
@@ -209,8 +206,8 @@ def _backward_kernel(*refs, layout, block: int, segments: int, steps: int, count
                 mask=kept & (piece == number), other=0).astype(jnp.float32)
         return total
 
-    def step(index, carry, sums):
-        history, later = carry
+    def step(index, carry):
+        history, later, sums, lost = carry
         tokens = starts + index
         current = _rows(x_ref, tokens, columns, length)
         window = (*history, current)
@@ -228,9 +225,13 @@ def _backward_kernel(*refs, layout, block: int, segments: int, steps: int, count
         if activation:
             # silu's derivative as XLA's autodiff rounds it, the closer of the forms to float64.
             grad = grad * gate + (grad * pre) * (gate * (1.0 - gate))
-        # The token's own run sums its taps' and bias's gradients; the K-1 past the run are the next's.
+        # The token's own run sums its taps' and bias's gradients, compensated (Kahan) so a run's tokens
+        # round no worse than XLA's sum over the batch; the K-1 past the run are the next run's.
         owned = jnp.where(((index < steps) & (tokens < length))[:, None], grad, 0.0)
-        sums = (*(total + owned * inputs for total, inputs in zip(sums[:-1], window, strict=True)), sums[-1] + owned)
+        terms = (*(owned * inputs for inputs in window), owned)
+        corrected = tuple(term - error for term, error in zip(terms, lost, strict=True))
+        added = tuple(total + term for total, term in zip(sums, corrected, strict=True))
+        lost = tuple((new - total) - term for new, total, term in zip(added, sums, corrected, strict=True))
         # Token `tokens - (K - 1)` reads this one through the last tap and the K-1 before through the others.
         gradients = (*later, grad)
         dx = gradients[0] * taps[count - 1][None, :]
@@ -239,25 +240,12 @@ def _backward_kernel(*refs, layout, block: int, segments: int, steps: int, count
         emitted = tokens - (count - 1)
         plgpu.store(dx_ref.at[jnp.maximum(emitted, 0)[:, None], columns[None, :]], dx.astype(dx_ref.dtype),
                     mask=((index >= count - 1) & (emitted < length))[:, None])
-        return (window[1:], gradients[1:]), sums
+        return window[1:], gradients[1:], added, lost
 
-    # The taps' and bias's sums run in two levels: SUMMED tokens one after another, then those partial
-    # sums compensated (Kahan), so a run's 64 tokens round no worse than XLA's sum over the batch.
     zeros = (zero,) * (count + 1)
-
-    def summed(outer, state):
-        carry, totals, lost = state
-        carry, sums = jax.lax.fori_loop(0, SUMMED, lambda inner, inner_state: step(
-            outer * SUMMED + inner, *inner_state), (carry, zeros))
-        corrected = tuple(part - error for part, error in zip(sums, lost, strict=True))
-        added = tuple(total + part for total, part in zip(totals, corrected, strict=True))
-        lost = tuple((new - total) - part for new, total, part in zip(added, totals, corrected, strict=True))
-        return carry, added, lost
-
-    carry = (history, (zero,) * (count - 1))
-    carry, totals, lost = jax.lax.fori_loop(0, steps // SUMMED, summed, (carry, zeros, zeros))
+    carry = (history, (zero,) * (count - 1), zeros, zeros)
+    _, _, totals, lost = jax.lax.fori_loop(0, steps + count - 1, step, carry)
     totals = tuple(total - error for total, error in zip(totals, lost, strict=True))
-    jax.lax.fori_loop(steps, steps + count - 1, lambda index, state: step(index, *state), (carry, zeros))
     for tap, total in enumerate(totals[:count]):
         dw_ref[tap, columns] = jnp.sum(total, axis=0)
     if db_ref:
@@ -265,10 +253,9 @@ def _backward_kernel(*refs, layout, block: int, segments: int, steps: int, count
 
 
 def _config(length: int, segments: int | None, steps: int | None) -> tuple[int, int]:
-    """Runs a tile and tokens a run, whole multiples of SUMMED."""
     segments = SEGMENTS if segments is None else segments
     steps = min(STEPS, pl.cdiv(length, segments)) if steps is None else steps
-    return segments, SUMMED * pl.cdiv(steps, SUMMED)
+    return segments, steps
 
 
 def _specs(x, w, bias, valid, block: int, segments: int, steps: int):
