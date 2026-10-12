@@ -32,8 +32,9 @@ import jax
 import jax.numpy as jnp
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
+from jax.interpreters.ad import JVPTracer
 
-from dew.nn.kernels import delta_chunks, delta_prep, delta_rule, fla_gdn
+from dew.nn.kernels import delta_chunks, delta_prep, delta_rule, fla_gdn, short_conv
 
 from .attention import FORWARD_MODE, unweighted_rmsnorm
 from .blocks import normal_kernel
@@ -50,7 +51,11 @@ recurrent form agree at any size; the size only trades memory for
 parallelism, and 64 is what the reference's kernels assume."""
 
 
-def l2norm(x, eps: float = 1e-6):
+L2NORM_EPS = 1e-6
+"""`l2norm`'s epsilon under the root, the FLA library's."""
+
+
+def l2norm(x, eps: float = L2NORM_EPS):
     """The FLA library's normalisation of q and k, which the reference
     applies inside the rule (`l2norm`, modeling_qwen3_next.py:368-371):
     unit keys and queries per head, so `q k^T` is a cosine and the
@@ -59,7 +64,7 @@ def l2norm(x, eps: float = 1e-6):
     return x * inv
 
 
-def causal_conv1d(x, kernel, activation: bool = True, bias=None):
+def causal_conv1d(x, kernel, activation: bool = True, bias=None, *, valid=None, parts=None, dtype=None):
     """Depthwise causal conv over `[B, S, D]` with the `[D, K]` taps.
 
     The reference pads `K - 1` zeros to the left
@@ -73,20 +78,76 @@ def causal_conv1d(x, kernel, activation: bool = True, bias=None):
     projections give it and the scans read it: the reference's channel-major
     `[B, D, S]` cost each mixer a transpose of its widest activation in and
     out, forward and backward.
+
+    The sum, bias and silu run in at least fp32 and round once, to `dtype`
+    (x's where None), so a mixer hands over its projection as it comes and
+    asks for the width its scan runs in. `valid` `[B, S]` zeroes the outputs
+    of padding slots. `parts` `((width, head), ...)` returns the channels as
+    those consecutive pieces, a piece with a `head` l2-normalised over each
+    `head` channels (`l2norm`), the queries and keys of a delta rule: each
+    piece is the array its scan reads, not a slice of one to copy out.
+
+    On a GPU that runs Dew's Triton kernels all of it is one kernel forward
+    and one backward (`short_conv`), which save only `x`; elsewhere, and for
+    a conv they turn down (`conv_refusal`), `xla_conv1d`.
     """
+    dtype = x.dtype if dtype is None else jnp.dtype(dtype)
+    pieces = ((x.shape[-1], None),) if parts is None else tuple(parts)
+    if conv_refusal(x, kernel, pieces) is None:
+        out = short_conv.conv(x, kernel, bias, None if valid is None else jnp.asarray(valid, jnp.int8),
+                              pieces, activation, L2NORM_EPS, dtype, False)
+        return out[0] if parts is None else out
+    return xla_conv1d(x, kernel, activation, bias, valid=valid, parts=parts, dtype=dtype)
+
+
+def xla_conv1d(x, kernel, activation: bool = True, bias=None, *, valid=None, parts=None, dtype=None):
+    """`causal_conv1d`'s arithmetic in XLA: a CPU's and a TPU's, and the
+    oracle of the GPU's kernels."""
+    dtype = x.dtype if dtype is None else jnp.dtype(dtype)
     _, K = kernel.shape
     length = x.shape[1]
-    padded = jnp.pad(x, ((0, 0), (K - 1, 0), (0, 0))).astype(jnp.promote_types(x.dtype, jnp.float32))
-    taps = kernel.astype(padded.dtype)
+    wide = jnp.promote_types(at_least_fp32(x.dtype), dtype)
+    padded = jnp.pad(x, ((0, 0), (K - 1, 0), (0, 0))).astype(wide)
+    taps = kernel.astype(wide)
     windows = padded[:, :length] * taps[:, 0]
     for tap in range(1, K):
         windows = windows + padded[:, tap:tap + length] * taps[:, tap]
-    windows = windows.astype(x.dtype)
     if bias is not None:
-        windows = windows + bias.astype(windows.dtype)
+        windows = windows + bias.astype(wide)
     if activation:
         windows = nn.silu(windows)
-    return windows
+    if valid is not None:
+        windows = jnp.where(valid[:, :, None], windows, 0)
+    return conv_pieces(windows, parts, dtype)
+
+
+def conv_pieces(convolved, parts, dtype):
+    """`convolved` `[B, S, D]` as `causal_conv1d` returns it for `parts`
+    (the whole, where None), in `dtype`: each piece split off in order and
+    the `head`-wide groups of a normalised one l2-normalised."""
+    if parts is None:
+        return convolved.astype(dtype)
+    pieces, first = [], 0
+    for width, head in parts:
+        piece = convolved[..., first:first + width]
+        first += width
+        if head is not None:
+            piece = l2norm(piece.reshape(*piece.shape[:-1], -1, head)).reshape(piece.shape)
+        pieces.append(piece.astype(dtype))
+    return tuple(pieces)
+
+
+def conv_refusal(x, kernel, parts) -> str | None:
+    """Why `short_conv`'s kernels do not take `causal_conv1d` of `x` by
+    `kernel` into `parts` here, or None where they do: a GPU they compile
+    for, reverse mode, an operand no mesh axis splits, and the shapes and
+    dtypes they take (`short_conv.refusal`)."""
+    return first_refusal(
+        (triton_runs(), "the kernels need a GPU of sm80 or later"),
+        (not FORWARD_MODE.get() and not isinstance(x, JVPTracer),
+         "a JVP trace needs forward-mode derivatives; the kernels implement a VJP"),
+        (seen_whole(x), "a mesh axis splits the conv's operands, and the kernels see whole arrays"),
+    ) or short_conv.refusal(x, kernel, parts)
 
 
 def document_starts(segments, before=None, valid=None):
@@ -111,12 +172,14 @@ def document_conv1d(history, x, history_segments, segments, taps, bias=None):
     shares the output token's segment: each packed document convolves as if
     zeros preceded it, as mamba_ssm's `causal_conv1d_fn(seq_idx=...)` does.
     `taps` `[D, K]`, `history_segments` `[B, K-1]`, `segments` `[B, S]`;
-    silu after the bias."""
+    silu after the bias, in at least fp32."""
     width = taps.shape[1] - 1
     length = x.shape[1]
     stream = jnp.concatenate([history, x], axis=1)
+    stream = stream.astype(at_least_fp32(stream.dtype))
     stream_segments = jnp.concatenate([history_segments, segments], axis=1)
-    out = jnp.zeros_like(x) if bias is None else jnp.broadcast_to(bias, x.shape)
+    out = (jnp.zeros(x.shape, stream.dtype) if bias is None
+           else jnp.broadcast_to(bias.astype(stream.dtype), x.shape))
     for tap in range(width + 1):
         same = stream_segments[:, tap:tap + length] == segments
         out = out + taps[:, tap] * jnp.where(same[..., None], stream[:, tap:tap + length], 0)
@@ -135,48 +198,61 @@ def _stream_order(valid):
     return rank, jnp.where(jnp.arange(length)[None, :] < counts[:, None], order, length).astype(jnp.int32)
 
 
-def held_conv1d(x, kernel, valid, held=None, *, bias=None, segments=None, right_padded: bool = False):
+def held_conv1d(x, kernel, valid, held=None, *, bias=None, segments=None, right_padded: bool = False,
+                parts=None, dtype=None):
     """`[B, S, D]` convolved causally after the `held` history, `[B, K - 1, D]`
     or None for none, and the history the next call holds: a linear-attention
     or state-space layer's conv over its decode cache, padded slots read and
     advanced by none (`_masked_conv1d`). `bias` is added before the silu, and
-    packed `segments` convolve each document alone.
+    packed `segments` convolve each document alone; `parts` and `dtype` are
+    `causal_conv1d`'s.
 
     `right_padded` says each row's `valid` slots are its first
     (`AttentionMetadata.right_padded`). Its real tokens then follow the held
     ones with no gap, so the row convolves as it stands and its padding is
     zeroed after: the masked conv's values, without its two gathers over
     every slot and their scattered gradients."""
+    width = kernel.shape[-1] - 1
+    conv = functools.partial(_behind, kernel=kernel, held=held, bias=bias, parts=parts, dtype=dtype)
     if valid is not None and right_padded and segments is None:
-        width = kernel.shape[-1] - 1
         empty = jnp.zeros((x.shape[0], width, x.shape[2]), x.dtype)
-        start = rows_like(empty, x) if held is None else held
-        stream = jnp.concatenate([start, x], axis=1)
+        stream = jnp.concatenate([rows_like(empty, x) if held is None else held, x], axis=1)
         valid = jnp.asarray(valid, bool)
-        convolved = causal_conv1d(stream, kernel, bias=bias)[:, width:]
         # The K-1 rows that end at the row's last real token.
         ends = jnp.sum(valid, axis=1, dtype=jnp.int32)
         rows = (ends[:, None] + jnp.arange(width)[None, :])[:, :, None]
-        history = jnp.take_along_axis(stream, rows, axis=1)
-        return jnp.where(valid[:, :, None], convolved, 0), history
+        return conv(x, valid=valid), jnp.take_along_axis(stream, rows, axis=1)
     if valid is not None or segments is not None:
         valid = jnp.ones(x.shape[:2], bool) if valid is None else valid
-        return _masked_conv1d(x, kernel, valid, held, bias=bias, segments=segments)
+        return _masked_conv1d(x, kernel, valid, held, bias=bias, segments=segments, parts=parts, dtype=dtype)
     history = x if held is None else jnp.concatenate([held, x], axis=1)
-    return (causal_conv1d(history, kernel, bias=bias)[:, -x.shape[1]:],
-            history[:, -(kernel.shape[-1] - 1):])
+    return conv(x), history[:, -width:]
+
+
+def _behind(x, *, kernel, held, bias, valid=None, parts=None, dtype=None):
+    """`causal_conv1d` of `x` after the `held` history `[B, K - 1, D]`, or
+    after the conv's own zeros where None."""
+    if held is None:
+        return causal_conv1d(x, kernel, bias=bias, valid=valid, parts=parts, dtype=dtype)
+    width = held.shape[1]
+    if valid is not None:
+        valid = jnp.pad(valid, ((0, 0), (width, 0)), constant_values=True)
+    out = causal_conv1d(jnp.concatenate([held, x], axis=1), kernel, bias=bias, valid=valid, parts=parts,
+                        dtype=dtype)
+    return jax.tree.map(lambda piece: piece[:, width:], out)
 
 
 def held_scan(module: nn.Module, mixed, taps, bias, scan, state_shape: tuple[int, ...], *, decode: bool,
               valid, segments=None, state: str = 'ssm_state', state_dtype=None, conv_dtype=None,
-              right_padded: bool = False):
+              right_padded: bool = False, parts=None, dtype=None):
     """The conv and scan of a mixer that holds per-row state: a decode step or
     prefill advancing `module`'s flax cache, `conv_state` `[B, K-1, D]` held
     in `conv_dtype` and `state` `[B, *state_shape]` held in `state_dtype`
     (both `mixed`'s dtype where None), or rows with padding slots. `mixed`
-    `[B, S, D]` is the conv's input, convolved in its own dtype and layout,
-    and `scan(convolved, *, starts, valid, held)` the rest, given the
-    convolved `[B, S, D]` and the held state as it is stored and returning
+    `[B, S, D]` is the conv's input in its own dtype and layout, and
+    `scan(convolved, *, starts, valid, held)` the rest, given the convolved
+    `[B, S, D]` in `dtype` (`mixed`'s where None), or its `parts` where given
+    (`causal_conv1d`), and the held state as it is stored and returning
     `(output, final state)`. None for the allocation-only decode call. Packed
     `segments` reset the conv and the state at each document's first real
     token; the held state counts as the call's first document, which it
@@ -192,7 +268,8 @@ def held_scan(module: nn.Module, mixed, taps, bias, scan, state_shape: tuple[int
             return None
     mixed, history = held_conv1d(mixed, taps, valid,
                                  None if conv_state is None else conv_state.value.astype(mixed.dtype),
-                                 bias=bias, segments=segments, right_padded=right_padded)
+                                 bias=bias, segments=segments, right_padded=right_padded, parts=parts,
+                                 dtype=dtype)
     if conv_state is not None:
         conv_state.value = history.astype(conv_state.value.dtype)
     starts = None if segments is None else document_starts(segments, valid=valid)
@@ -202,7 +279,7 @@ def held_scan(module: nn.Module, mixed, taps, bias, scan, state_shape: tuple[int
     return out
 
 
-def _masked_conv1d(x, kernel, valid, state=None, bias=None, segments=None):
+def _masked_conv1d(x, kernel, valid, state=None, bias=None, segments=None, parts=None, dtype=None):
     """Convolve real tokens without advancing a paused row's history.
 
     The j-th real token of a row reads the K-1 real tokens before it, whatever
@@ -213,7 +290,8 @@ def _masked_conv1d(x, kernel, valid, state=None, bias=None, segments=None):
     (`document_conv1d`); the held `state` belongs to the first real token's
     document. Masking an ordinary convolution's input instead reads the zeros in
     a gap (5.0 off in fp32 on nine slots with holes at 2, 5 and 6,
-    test_the_masked_conv_reads_across_a_gap).
+    test_the_masked_conv_reads_across_a_gap). `parts` and `dtype` are
+    `causal_conv1d`'s, applied to the real tokens' outputs.
     """
     batch, _, channels = x.shape
     width = kernel.shape[1] - 1
@@ -231,7 +309,7 @@ def _masked_conv1d(x, kernel, valid, state=None, bias=None, segments=None):
         # The history in front carries the K-1 taps the first real token
         # reads, so row width + j of the convolution is the output of real
         # token j.
-        convolved = causal_conv1d(stream, kernel, bias=bias)[:, width:]
+        convolved = causal_conv1d(stream, kernel, bias=bias, dtype=at_least_fp32(x.dtype))[:, width:]
     else:
         ordered = jnp.take_along_axis(segments, source, axis=1, mode='fill', fill_value=-1)
         held = jnp.broadcast_to(ordered[:, :1], (batch, width))
@@ -240,7 +318,8 @@ def _masked_conv1d(x, kernel, valid, state=None, bias=None, segments=None):
     # The K-1 stream rows from the row's token count on are the history it leaves.
     history = jnp.take_along_axis(
         stream, ((rank[:, -1] + 1)[:, None] + jnp.arange(width)[None, :])[:, :, None], axis=1)
-    return jnp.where(valid[:, :, None], output, 0), history
+    output = jnp.where(valid[:, :, None], output, 0)
+    return conv_pieces(output, parts, x.dtype if dtype is None else dtype), history
 
 
 def _compensated_add(left, right):
@@ -754,13 +833,12 @@ class GatedDeltaNet(nn.Module):
             B, S, H * self.per_v, D)
 
     def _project(self, x):
-        """(query, key, value, z, b, a) of `x`, flat over heads: `[B, S, H*D]`
-        for the four wide ones and `[B, S, Hv]` for b and a."""
+        """(mixed, z, b, a) of `x`: the conv's input `[B, S, 2K + V]`, the
+        queries, keys and values flat over heads in that order, z
+        `[B, S, Hv*Dv]`, and b and a `[B, S, Hv]`."""
         B, S, _ = x.shape
         if not self.fused_in_proj:
-            key_dim = self.key_features
-            query, key, value = jnp.split(self.in_proj_qkv(x), [key_dim, 2 * key_dim], axis=-1)
-            return query, key, value, self.in_proj_z(x), self.in_proj_b(x), self.in_proj_a(x)
+            return self.in_proj_qkv(x), self.in_proj_z(x), self.in_proj_b(x), self.in_proj_a(x)
         # One row group per key head: its q, its k, then the v and z of the
         # value heads it serves (modeling_qwen3_next.py:558-586).
         per_key = self.per_v * self.head_v_dim
@@ -769,8 +847,9 @@ class GatedDeltaNet(nn.Module):
             qkvz, [self.head_k_dim, 2 * self.head_k_dim, 2 * self.head_k_dim + per_key], axis=-1)
         ba = self.in_proj_ba(x).reshape(B, S, self.num_k_heads, 2 * self.per_v)
         b, a = jnp.split(ba, 2, axis=-1)
-        return (query.reshape(B, S, -1), key.reshape(B, S, -1), value.reshape(B, S, -1),
-                z.reshape(B, S, -1), b.reshape(B, S, -1), a.reshape(B, S, -1))
+        mixed = jnp.concatenate([query.reshape(B, S, -1), key.reshape(B, S, -1), value.reshape(B, S, -1)],
+                                axis=-1)
+        return mixed, z.reshape(B, S, -1), b.reshape(B, S, -1), a.reshape(B, S, -1)
 
     @nn.compact
     def __call__(self, x, decode: bool = False,
@@ -781,36 +860,37 @@ class GatedDeltaNet(nn.Module):
         valid = None if attention_metadata is None else attention_metadata.valid
         if valid is not None and valid.shape != (B, S):
             raise ValueError(f"row validity must be {(B, S)}, got {valid.shape}")
-        query, key, value, z, b, a = self._project(x)
+        mixed, z, b, a = self._project(x)
         key_dim = self.key_features
-        operand = query.dtype
+        operand = mixed.dtype
 
         # fp32 on purpose, as the reference notes: an fp16 A can make exp
         # underflow to -inf (modeling_qwen3_next.py:652-653); at least fp32,
         # so a float64 model's stays float64 (`at_least_fp32`).
-        wide = at_least_fp32(query.dtype)
+        wide = at_least_fp32(operand)
         beta = nn.sigmoid(b.astype(wide))
         g = -jnp.exp(self.A_log.astype(wide)) * nn.softplus(a.astype(wide) + self.dt_bias.astype(wide))
         if valid is not None:
             # exp(0)=1 and beta=0 preserve recurrent memory for invalid input.
             beta = jnp.where(valid[:, :, None], beta, 0.0)
             g = jnp.where(valid[:, :, None], g, 0.0)
+        # fla's layer hands its rule the projections' dtype, the queries and
+        # keys on their own heads and beta beside them; the other rules take
+        # the wide operands. The conv rounds once, to the dtype its rule takes.
+        widths = (self.head_k_dim, self.head_k_dim, self.head_v_dim)
+        fla = S > 1 and gated_rule(self.implementation) == 'fla' and fla_refusal(
+            *(self._split_heads(part, width) for part, width in
+              zip(jnp.split(mixed, [key_dim, 2 * key_dim], axis=-1), widths, strict=True)),
+            self.chunk_size) is None
 
         def scan(convolved, *, starts, valid, held):
             del starts
-            query, key, value = jnp.split(convolved, [key_dim, 2 * key_dim], axis=-1)
-            query = l2norm(self._split_heads(query, self.head_k_dim))
-            key = l2norm(self._split_heads(key, self.head_k_dim))
-            value = self._split_heads(value, self.head_v_dim)
+            query, key, value = (self._split_heads(part, width)
+                                 for part, width in zip(convolved, widths, strict=True))
             state = None if held is None else held.astype(wide)
-            if S > 1 and gated_rule(self.implementation) == 'fla':
-                # fla's layer hands its rule the projections' dtype, the
-                # queries and keys on their own heads and beta beside them;
-                # a call the port turns down keeps the wide operands below.
-                rows, keys, values, gates = (x.astype(operand) for x in (query, key, value, beta))
-                if fla_refusal(rows, keys, values, self.chunk_size) is None:
-                    return chunk_gated_delta_rule(rows, keys, values, g, gates, state, self.chunk_size,
-                                                  self.implementation)
+            if fla:
+                return chunk_gated_delta_rule(query, key, value, g, beta.astype(operand), state,
+                                              self.chunk_size, self.implementation)
             query, key = self._expand_kv(query), self._expand_kv(key)
             if S == 1 and held is not None and delta_rule.fits(held):
                 return decode_gated_delta_rule(query, key, value, g, beta, held,
@@ -827,15 +907,18 @@ class GatedDeltaNet(nn.Module):
         # their dtype at no cost; the recurrent state is held as the
         # docstring says. The first decode-mode call only allocates, the way
         # open_kv_cache's is: init_cache's dummy token must not consume a
-        # position or leave state behind.
+        # position or leave state behind. The conv normalises the queries
+        # and keys (`l2norm`).
         stored = (jnp.promote_types(self.dtype, jnp.bfloat16)
                   if self.dtype is not None and asks_default_precision(self.precision, configured=True)
                   else wide)
-        out = held_scan(self, jnp.concatenate([query, key, value], axis=-1).astype(wide), self.conv1d()[0],
-                        None, scan, (self.num_v_heads, self.head_k_dim, self.head_v_dim), decode=decode,
+        heads = ((key_dim, self.head_k_dim), (key_dim, self.head_k_dim), (self.value_features, None))
+        out = held_scan(self, mixed, self.conv1d()[0], None, scan,
+                        (self.num_v_heads, self.head_k_dim, self.head_v_dim), decode=decode,
                         valid=valid, state='recurrent_state', state_dtype=stored,
-                        conv_dtype=jnp.promote_types(query.dtype, stored),
-                        right_padded=attention_metadata is not None and attention_metadata.right_padded)
+                        conv_dtype=jnp.promote_types(operand, stored),
+                        right_padded=attention_metadata is not None and attention_metadata.right_padded,
+                        parts=heads, dtype=operand if fla else wide)
         if out is None:
             return self.out_proj(jnp.zeros((B, S, self.value_features), self.dtype))
 
