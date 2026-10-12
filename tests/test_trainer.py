@@ -210,7 +210,8 @@ def test_resumed_tokens_stay_exact_above_float32_integer_resolution(tmp_path, ca
     first.fit(dataset(LargeTokenRows), steps=65, log_every=cadence)
     assert first.checkpoints.control(65)["tokens"] == 65 * 262143
     resumed = make_trainer(tmp_path, objective=LargeTokenRegression())
-    assert int(resumed.fit(dataset(LargeTokenRows), total_tokens=65 * 262143 + 1, log_every=cadence).step) == 66
+    state = resumed.fit(dataset(LargeTokenRows), total_tokens=65 * 262143 + 1, log_every=cadence)
+    assert int(state.step) == 66
 
 
 def test_an_optim_config_is_built_over_the_updates_fit_makes():
