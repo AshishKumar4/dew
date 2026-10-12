@@ -189,7 +189,8 @@ def test_the_encoder_recipe_trains_a_fresh_head_on_a_decontaminated_mixture(tmp_
     assert scored["sources"]["rows"]["rows"] == made["rows"]["rows"]["held"]
     assert scored["sources"]["hard"]["rows"] == 2
     for source, metrics in scored["sources"].items():
-        assert set(metrics) == {"rows", "questions", "log_loss", "infinite", "accuracy"}
+        assert set(metrics) == {"rows", "unfit", "questions", "log_loss", "infinite", "accuracy"}
+        assert metrics["unfit"] == 0
         expected = []
         for line in (mixture / f"{source}.held.jsonl").read_text().split("\n")[:-1]:
             example = Example.of(json.loads(line))
@@ -257,7 +258,8 @@ def test_the_clef_recipe_trains_a_joint_head_under_lora_on_a_frozen_decoder(tmp_
     """The Clef recipe end to end on the tiny Qwen 3.5: LoRA on its attention,
     Gated DeltaNet and MLP projections, a fresh joint head reading every
     question of a row; an example whose questions alone pass the row's 1,024
-    tokens is dropped and counted; the run reloads as a task."""
+    tokens is dropped and counted, by training and by the held-out scorer
+    alike; the run reloads as a task."""
     from flax.traverse_util import flatten_dict
 
     from dew.objectives.base import FROZEN
@@ -276,7 +278,15 @@ def test_the_clef_recipe_trains_a_joint_head_under_lora_on_a_frozen_decoder(tmp_
                                     "--head.routing-layers", "1", "--max-len", "1024", *storage],
                                    default=clef.run_config())
     config.run()
-    assert sum(_summary(tmp_path / "runs" / "run")["unfit"].values()) == 1
+    unfit = _summary(tmp_path / "runs" / "run")["unfit"]
+    assert sum(unfit.values()) == 1
+    made = json.loads((mixture / "mixture.json").read_text())
+    (mixture / "long.held.jsonl").write_text("".join(json.dumps(row) + "\n" for row in (rows[1], rows[-1])))
+    made["rows"]["long"] = {"train": 0, "held": 2}
+    (mixture / "mixture.json").write_text(json.dumps(made))
+    scored = _module("benchmark").held(tmp_path / "runs" / "run", mixture)["sources"]
+    assert scored["rows"]["unfit"] == unfit["held out"]
+    assert (scored["long"]["rows"], scored["long"]["unfit"], scored["long"]["questions"]) == (2, 1, 2)
     decide = Decide.from_run(str(tmp_path / "runs" / "run"))
     frozen = flatten_dict(decide.variables[FROZEN])
     kernels = [value for path, value in frozen.items() if path[-1] == "kernel"]

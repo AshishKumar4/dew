@@ -632,9 +632,7 @@ def _training_reader(
     partition.rows(build.batch)
     if plan.volatile and partition.readers > 1:
         raise ValueError("volatile pipeline requires one reader per share until its bytes are persisted")
-    for step in host:
-        if partition.count > 1 and isinstance(step, SingleReader) and step.single_reader:
-            raise ValueError(f"host stage {type(step).__name__} requires one reader for its batch shape")
+    _one_shape(host, partition)
     opened: Iterator[Batch]
     if build.global_order:
         opened = GlobalStream(
@@ -672,6 +670,7 @@ def _training_reader(
 def _validation_reader(
     partition: DataPartition, *, pipeline: Pipeline, build: _Build, host: tuple[HostStep, ...]
 ) -> Iterator[Batch]:
+    _one_shape(host, partition)
     opened: Iterator[Batch]
     if not build.global_order:
         build = dataclasses.replace(build, loading=dataclasses.replace(build.loading, workers=0))
@@ -682,6 +681,15 @@ def _validation_reader(
     else:
         opened = build.batches(pipeline, partition)
     return _Host(opened, host) if host else opened
+
+
+def _one_shape(host: tuple[HostStep, ...], partition: DataPartition) -> None:
+    """Refuse more than one share to a host step that shapes each batch from
+    its own rows (`SingleReader`), since each share's batch would take a
+    shape of its own."""
+    for step in host:
+        if partition.count > 1 and isinstance(step, SingleReader) and step.single_reader:
+            raise ValueError(f"host stage {type(step).__name__} requires one reader for its batch shape")
 
 
 def objective_steps(pipeline: Pipeline, objective: ObjectiveData, *, train: bool, read: Read) -> Pipeline:
@@ -756,11 +764,7 @@ def _objective_branch(pipeline: Pipeline, objective: ObjectiveData, *, train: bo
     at, _ = _order_at(without, read)
     if ordering and read == "memory" and at < len(without):
         branch = dataclasses.replace(branch, stages=(*without[:at], *ordering, *without[at:]))
-    if (
-        train
-        and objective.group is not None
-        and not any(isinstance(stage, TokenBudget) for stage in branch.stages)
-    ):
+    if objective.group is not None and not any(isinstance(stage, TokenBudget) for stage in branch.stages):
         at = _until(branch.stages, (RandomMap, BatchStage, TokenBudget))
         branch = dataclasses.replace(
             branch, stages=(*branch.stages[:at], Group(objective.group), *branch.stages[at:])
