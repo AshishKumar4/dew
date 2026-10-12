@@ -561,7 +561,7 @@ def test_flux_conditioner_pooled_width_is_unprojected_and_its_composition_matche
     directory = Path(__file__).parent / "fixtures" / "t5" / "tiny"
     t5 = T5Text.from_pretrained(str(directory), max_length=2)
     conditioner = DiffusionConditioner((clip,), (t5.tokenizer,), ("clip",),
-        {"clip": {"text_model": clip_variables["params"]}, "t5": t5.params},
+        {"clip": {"text_model": clip_variables["params"]}, "t5": t5.params["params"]},
         "tiny-flux", 4, 4, t5.transformer.emb_features, composition="flux",
         t5=T5Segment(t5.transformer, t5.tokenizer, "t5", 2))
     tokens = {"input_ids": ids[:, None, :], "t5_input_ids": ids,
