@@ -21,7 +21,7 @@ from pathlib import Path
 import numpy as np
 from process_support import prepare_worker
 
-from dew.data import Loading
+from dew.data import Dataset, Loading
 from dew.data.recipes import load
 from dew.telemetry.records import RECORD_TYPES
 from dew.training.evaluation import Evaluation
@@ -156,20 +156,6 @@ def jepa_objective():
                       num_layers=1, num_heads=2, mlp_ratio=1),
         MultiBlockMask.for_grid(grid, num_targets=1, scale=(0.2, 0.5)),
         sample=Field("image", (RES, RES, 3)))
-
-
-class Data:
-    """The `Dataset` contract the trainer reads, over readers of a partition."""
-
-    def __init__(self, train, val=None, batch=BATCH, records=None):
-        self._train, self.val, self.batch, self.records = train, val, batch, records
-
-    def train(self, partition):
-        return self._train(partition)
-
-    @property
-    def steps_per_epoch(self):
-        return None if self.records is None else self.records // self.batch
 
 
 def as_numpy(tree):
@@ -621,7 +607,7 @@ def mode_fit(args) -> dict:
         available = sum(1 for _ in val(DataPartition.of(trainer.device_mesh)))
     from dew.training import Best
     counter = Batches()
-    state = trainer.fit(Data(open_train, val=val, records=args.records),
+    state = trainer.fit(Dataset(open_train, val=val, batch=BATCH, records=args.records),
                         steps=args.steps, log_every=1,
                         eval_every=args.steps if args.tokens else None,
                         checkpoint_every=args.save_every, metrics=(counter,) if args.tokens else (),
@@ -692,8 +678,8 @@ def mode_pool_refusals(args) -> dict:
         return compile(Pipeline(corpus(count, shift)).shuffle(0).repeat().batch(BATCH), seed=0,
                        loading=Loading(workers=0))
 
-    def reads(fail: bool = False, fields: tuple[str, ...] = ("x", "y"), ends: int | None = None) -> Data:
-        return Data(lambda partition: Reads(fail, fields, ends))
+    def reads(fail: bool = False, fields: tuple[str, ...] = ("x", "y"), ends: int | None = None) -> Dataset:
+        return Dataset(lambda partition: Reads(fail, fields, ends), None, batch=BATCH, records=None)
 
     def trained(data, checkpoints=None, **flags) -> str | None:
         trainer = Trainer(Regression(), optax.sgd(1e-2), key=jax.random.key(0), mesh=MeshSpec(),
@@ -763,7 +749,8 @@ def mode_profile_failure(args) -> dict:
                       profile=ProfileWindow(str(profile_dir), steps=2, warmup=0))
     error = None
     try:
-        trainer.fit(Data(lambda partition: iter(loader)), steps=args.steps, log_every=1)
+        trainer.fit(Dataset(lambda partition: iter(loader), None, batch=BATCH, records=None),
+                    steps=args.steps, log_every=1)
     except BaseException as failure:
         error = failure
     recovered = agree_process_phase(None, phase="after profiling failure")
@@ -2258,7 +2245,8 @@ def mode_matrix(args) -> dict:
     batches = []
     train = tapped(data.train, lambda batch: batches.append(hashlib.sha256(b"".join(
         np.ascontiguousarray(batch[name]).tobytes() for name in sorted(batch))).hexdigest()))
-    state = trainer.fit(Data(train, records=MATRIX_RECORDS), steps=args.steps, log_every=1,
+    state = trainer.fit(Dataset(train, None, batch=BATCH, records=MATRIX_RECORDS),
+                        steps=args.steps, log_every=1,
                         checkpoint_every=args.save_every)
     dump_params(args.out.with_suffix(".npz"), state.variables)
     _, position = restored_state(trainer)

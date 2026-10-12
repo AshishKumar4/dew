@@ -62,7 +62,7 @@ class AffineVelocity(nn.Module):
 
 
 def test_checkpointed_flow_validation_refuses_implicit_loss_before_placing(tmp_path):
-    from affine_run import Data
+    from affine_run import dataset
 
     from dew.training import Best, Checkpoints
 
@@ -75,12 +75,12 @@ def test_checkpointed_flow_validation_refuses_implicit_loss_before_placing(tmp_p
 
     trainer = Unplaced(objective, optax.sgd(.01), key=jax.random.key(0),
                        checkpoints=Checkpoints(str(tmp_path / "flow")))
-    data = Data(val=lambda: iter(({"image": np.zeros((8, 2), np.float32)},)))
+    data = dataset(val=lambda: iter(({"image": np.zeros((8, 2), np.float32)},)))
     with pytest.raises(ValueError, match=r"Flow-GRPO.*Best.*no validation"):
         trainer.fit(data, steps=1, eval_every=1)
     # Both remedies in the refusal pass preflight; no model is placed here.
     with pytest.raises(AssertionError, match="training reached placement"):
-        trainer.fit(Data(), steps=1)
+        trainer.fit(dataset(), steps=1)
     with pytest.raises(AssertionError, match="training reached placement"):
         trainer.fit(data, steps=1, eval_every=1,
                     best=Best(objective.scalars.reward, mode="max"))

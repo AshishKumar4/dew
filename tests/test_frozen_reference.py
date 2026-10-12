@@ -21,6 +21,7 @@ import optax
 import pytest
 from affine_run import FEATURES, Regression
 
+from dew.data.dataset import Dataset
 from dew.training import Checkpoints, Layout, Trainer, ema_update
 
 
@@ -45,15 +46,6 @@ class Counting:
 
     def set_state(self, state):
         self.index = json.loads(state)["index"]
-
-
-class Data:
-    """The `Dataset` contract the trainer reads: a train stream and its batch."""
-
-    batch = 8
-
-    def train(self, partition):
-        return Counting()
 
 
 def make_trainer(tmp_path=None, **kwargs):
@@ -124,12 +116,13 @@ def test_a_resumed_run_restores_the_frozen_reference(tmp_path):
     # The placed init is what fit starts from; the eager init rounds the
     # random draws differently on a GPU.
     initial = frozen_bytes(trainer.place()[0])
-    trainer.fit(Data(), steps=2, log_every=1)
+    data = Dataset(lambda partition: Counting(), None, batch=8, records=None)
+    trainer.fit(data, steps=2, log_every=1)
 
     resumed = make_trainer(tmp_path)
     state, _, _ = resumed.place()
 
     assert int(state.step) == 2
     assert frozen_bytes(state) == initial
-    resumed.fit(Data(), steps=4, log_every=1)
+    resumed.fit(data, steps=4, log_every=1)
     assert frozen_bytes(resumed.place()[0]) == initial

@@ -11,7 +11,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from affine_run import Counting, Data, val_batches
+from affine_run import Counting, dataset, val_batches
 
 from dew.artifacts import TokenScores
 from dew.checkpoints import Checkpoints, Keep, Ranking
@@ -62,7 +62,7 @@ def data():
     def validation():
         for batch in val_batches(1)():
             yield {**batch, 'validation': np.ones(len(batch['x']), bool)}
-    return Data(train=train, val=validation)
+    return dataset(train=train, val=validation)
 
 
 def trainer(path, keep=1):
@@ -107,7 +107,7 @@ def test_missing_and_undeclared_metrics_are_refused_before_training(tmp_path):
 
 def test_ranked_loss_and_periodic_retention(tmp_path):
     run = trainer(tmp_path / 'run', keep=Keep(latest=1, every=2))
-    state = run.fit(Data(train=data()._train), steps=1, log_every=1)
+    state = run.fit(dataclasses.replace(data(), val=None), steps=1, log_every=1)
     checkpoints = run.checkpoints
     for step, loss in [(2, .1), (3, .9), (4, .7), (5, .8)]:
         checkpoints.save(step, state.replace(step=jnp.int32(step)), None, ranking=Ranking('train/loss', loss))
@@ -225,7 +225,7 @@ def test_named_config_selector_roundtrips_and_refuses_callable():
 
 def test_unranked_first_tracker_does_not_select_a_different_trackers_best(tmp_path):
     run = trainer(tmp_path / 'run')
-    state = run.fit(Data(train=data()._train), steps=1, log_every=1)
+    state = run.fit(dataclasses.replace(data(), val=None), steps=1, log_every=1)
     checkpoints = Checkpoints(str(tmp_path / 'isolated'))
     checkpoints.save(1, state, None, ranking=[Ranking('fid', float('nan')), Ranking('clip', 1., mode='max')])
     checkpoints.wait()
@@ -235,7 +235,7 @@ def test_unranked_first_tracker_does_not_select_a_different_trackers_best(tmp_pa
 
 def test_training_selector_aggregate_uses_bound_objective_loss(tmp_path):
     run = trainer(tmp_path / 'run')
-    run.fit(Data(train=data()._train), steps=4, log_every=1, eval_every=1, checkpoint_every=4,
+    run.fit(dataclasses.replace(data(), val=None), steps=4, log_every=1, eval_every=1, checkpoint_every=4,
             best=Best(lambda m: m[run.objective.loss]))
     assert run.checkpoints.best == 4
 
@@ -374,7 +374,7 @@ def test_recorded_retention_and_cadence_roundtrip_without_losing_microseconds():
 
 def test_committed_metadata_is_cached_and_deleted_steps_leave_the_cache(tmp_path, monkeypatch):
     run = trainer(tmp_path / 'run')
-    state = run.fit(Data(train=data()._train), steps=1, log_every=1)
+    state = run.fit(dataclasses.replace(data(), val=None), steps=1, log_every=1)
     checkpoints = Checkpoints(str(tmp_path / 'isolated'), keep=1)
     checkpoints.save(1, state, None, ranking=Ranking('value', 1.))
     checkpoints.wait()

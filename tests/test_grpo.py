@@ -203,7 +203,7 @@ def test_checkpointed_policy_fit_validates_source_prompts(tmp_path, kind):
     import itertools
 
     import optax
-    from affine_run import Data
+    from affine_run import dataset
     from flax import linen as nn
     from recording import RecordingTracker
 
@@ -232,7 +232,7 @@ def test_checkpointed_policy_fit_validates_source_prompts(tmp_path, kind):
     trainer = Trainer(objective, optax.sgd(0.), key=jax.random.key(0), tracker=tracker,
                       checkpoints=Checkpoints(str(tmp_path / kind)),
                       rollout=lambda state, batch, key: packed)
-    data = Data(train=lambda: itertools.repeat(source), val=lambda: iter((validation,)), batch=rows)
+    data = dataset(train=lambda: itertools.repeat(source), val=lambda: iter((validation,)), batch=rows)
     final = trainer.fit(data, steps=1, eval_every=1)
     reported = [scalars["val/loss"] for _, scalars in tracker.scalars if "val/loss" in scalars]
     assert reported and np.isfinite(reported).all()

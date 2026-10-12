@@ -237,9 +237,9 @@ class ImageRecord(grain.RandomMapTransform):
             image = as_rgb(np.asarray(image))
         image = resize_image(image, self.staging_size)
         if self.backend == "host":
-            if (self.flip or self.jitter) and (
-                self.crop_scale != (1.0, 1.0) or self.staging_size != self.size
-            ):
+            # The crop geometry is its own: a crop scale or a staging size above the output crops and
+            # resizes to `size` whether or not a flip or a jitter rides along.
+            if self.crop_scale != (1.0, 1.0) or self.staging_size != self.size:
                 image = RandomCrop(self.size, self.crop_scale, self.flip, self.jitter).random_map(
                     {"image": image}, rng
                 )["image"]
