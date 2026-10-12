@@ -93,7 +93,7 @@ def causal_conv1d(x, kernel, activation: bool = True, bias=None, *, valid=None, 
     """
     dtype = x.dtype if dtype is None else jnp.dtype(dtype)
     pieces = ((x.shape[-1], None),) if parts is None else tuple(parts)
-    if conv_refusal(x, kernel, pieces) is None:
+    if conv_refusal(x, kernel, pieces, dtype) is None:
         out = short_conv.conv(x, kernel, bias, None if valid is None else jnp.asarray(valid, jnp.int8),
                               pieces, activation, L2NORM_EPS, dtype, False)
         return out[0] if parts is None else out
@@ -137,17 +137,18 @@ def conv_pieces(convolved, parts, dtype):
     return tuple(pieces)
 
 
-def conv_refusal(x, kernel, parts) -> str | None:
+def conv_refusal(x, kernel, parts, dtype) -> str | None:
     """Why `short_conv`'s kernels do not take `causal_conv1d` of `x` by
-    `kernel` into `parts` here, or None where they do: a GPU they compile
-    for, reverse mode, an operand no mesh axis splits, and the shapes and
+    `kernel` into `parts` in `dtype` here, or None where they do: a GPU they
+    compile for, reverse mode (a caller differentiating forward sets
+    `FORWARD_MODE`), an operand no mesh axis splits, and the shapes and
     dtypes they take (`short_conv.refusal`)."""
     return first_refusal(
         (triton_runs(), "the kernels need a GPU of sm80 or later"),
         (not FORWARD_MODE.get() and not isinstance(x, JVPTracer),
          "a JVP trace needs forward-mode derivatives; the kernels implement a VJP"),
         (seen_whole(x), "a mesh axis splits the conv's operands, and the kernels see whole arrays"),
-    ) or short_conv.refusal(x, kernel, parts)
+    ) or short_conv.refusal(x, kernel, parts, dtype)
 
 
 def document_starts(segments, before=None, valid=None):
