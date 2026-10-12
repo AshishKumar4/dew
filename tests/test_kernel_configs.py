@@ -45,8 +45,8 @@ def test_a_config_takes_the_labs_overrides_and_clips_to_the_operands():
 @pytest.mark.parametrize("target", ["sm80", "sm120"])
 def test_the_kernel_cases_lower_each_kernel_on_abstract_operands(target):
     cases = list(support.kernel_cases(target))
-    # Nine kernels at two dtypes and three shapes, plus the six reverse cumsums.
-    assert len(cases) == 60 and len({case.name for case in cases}) == 60
+    # Nine kernels at two dtypes and two shapes and at bf16's widest keys, plus the five reverse cumsums.
+    assert len(cases) == 50 and len({case.name for case in cases}) == 50
     for case in cases:
         fn, args = case.call()
         assert fn.keywords["interpret"] is False
@@ -72,11 +72,8 @@ def test_the_shared_dot_preserves_narrow_products_with_fp32_accumulation():
     np.testing.assert_array_equal(np.asarray(got), np.asarray(expected))
 
 
-def test_wide_keys_cap_an_a100s_dhu_at_two_stages_and_its_fp32_forward_h_at_32_columns():
+def test_wide_keys_cap_an_a100s_dhu_at_two_stages():
     shape = {"width": 256, "columns": 128}
-    assert fla_gdn.kernel_config("chunk_fwd_h", shape, jnp.float32, target="sm80")["bv"] == 32
-    assert fla_gdn.kernel_config("chunk_fwd_h", {"width": 128, "columns": 128}, jnp.float32,
-                                 target="sm80")["bv"] == 64
     assert fla_gdn.kernel_config("chunk_bwd_dhu", shape, jnp.bfloat16, target="sm80")["stages"] == 2
     assert fla_gdn.kernel_config("chunk_bwd_dhu", shape, jnp.bfloat16, target="sm120")["stages"] == 1
     assert fla_gdn.kernel_config("chunk_bwd_dhu", {"width": 128, "columns": 128}, jnp.bfloat16,

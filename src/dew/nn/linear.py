@@ -464,15 +464,17 @@ def port_refusal(query, key, value) -> str | None:
     (`triton_runs`) and every shape, dtype, chunk size and mesh, except
     inside `jax.jvp`'s traces (`FORWARD_MODE`), which the port's custom VJP
     gives no tangent; float64 operands, whose rule is the reference math
-    itself; and keys wider than fla's kernels take."""
+    itself; and keys wider than the port takes in their dtype."""
+    widest = fla_gdn.WIDEST_KEYS if jnp.result_type(query, key, value).itemsize == 2 else fla_gdn.WIDEST
     return first_refusal(
         (triton_runs(), "the port's kernels need a GPU of sm80 or later"),
         (not FORWARD_MODE.get(), "forward_mode_attention traces for jax.jvp, which the port's custom VJP "
                                  "gives no tangent"),
         (all(jnp.dtype(x.dtype) != jnp.float64 for x in (query, key, value)),
          "float64 operands, whose rule is the reference math itself"),
-        (key.shape[-1] <= fla_gdn.WIDEST_KEYS,
-         f"keys {key.shape[-1]} wide; fla's kernels take at most {fla_gdn.WIDEST_KEYS}"),
+        (key.shape[-1] <= widest,
+         f"keys {key.shape[-1]} wide; the port takes at most {widest} in "
+         f"{jnp.result_type(query, key, value).name}"),
     )
 
 

@@ -85,8 +85,8 @@ def _declared(name: str, target: generation.GpuTarget, dtype: str) -> dict:
 
 # Keys wider than 128 hold a wider memory, so their kernels take at most these fields, each a choice
 # fla's autotuner offers: on an A100 three-stage dhu took 177,160 bytes of 166,912 at 256-wide keys
-# and fp32's 64-column forward h 196,868 (CPU compile).
-_WIDE_KEYS = {"chunk_bwd_dhu": {"stages": 2}, "chunk_fwd_h": {"bv": 32}}
+# (CPU compile).
+_WIDE_KEYS = {"chunk_bwd_dhu": {"stages": 2}}
 
 CONFIGS = {(name, dtype): _declared(name, target, dtype)
            for name, target in generation.TARGETS.items()
@@ -100,8 +100,10 @@ WIDEST = 128
 128-wide heads (tests/fla_gdn_support.py's COMPILED_SHAPES); wider values split into more heads."""
 
 WIDEST_KEYS = 256
-"""The widest keys the port takes, fla's own bound (chunk_delta_h.py's four 64-wide blocks of the
-memory): its configs compile for 256-wide keys too, and keys cannot split."""
+"""The widest 16-bit keys the port takes, fla's own bound (chunk_delta_h.py's four 64-wide blocks of
+the memory), for which its configs compile too; keys cannot split. fp32 keys take at most WIDEST: at
+256 an A100's fp32 forward h needs 172,292 shared bytes at its narrowest tile and an RTX 4000's fp32
+WY backward compiles past the suite's minute (CPU compile)."""
 
 
 def _rule_shape(key, value, chunk):

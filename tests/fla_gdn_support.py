@@ -19,7 +19,7 @@ COMPILED_SHAPES = {
                   "width": 256, "columns": 128, "chunk": 64},
 }
 """The shapes every declared config compiles at: the training shapes, whose heads are `fla_gdn.WIDEST`
-wide, and the widest keys the port takes (`fla_gdn.WIDEST_KEYS`)."""
+wide, and the widest keys the port takes in 16 bits (`fla_gdn.WIDEST_KEYS`)."""
 
 
 class KernelCase(NamedTuple):
@@ -70,6 +70,8 @@ def kernel_cases(target: str) -> Iterator[KernelCase]:
             continue
         for kernel in table:
             for shape_name, shape in COMPILED_SHAPES.items():
+                if shape["width"] > fla_gdn.WIDEST and dtype == "float32":
+                    continue
                 config = fla_gdn.kernel_config(kernel, shape, dtype, target=target)
                 flags = "-".join(f"{key}{value}" for key, value in sorted(config.items()))
                 for reverse in ((False, True) if kernel == "chunk_local_cumsum" else (False,)):
