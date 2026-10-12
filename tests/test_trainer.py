@@ -181,6 +181,37 @@ def test_a_step_only_prefix_keeps_lifetime_real_tokens(tmp_path):
     assert int(resumed.fit(Data(), total_tokens=30, log_every=1).step) == 3
 
 
+class LargeTokenRegression(Regression):
+    counts_tokens = True
+
+    def real_lengths(self, batch):
+        return batch["real_length"]
+
+
+class LargeTokenRows(Counting):
+    def __next__(self):
+        batch = super().__next__()
+        lengths = np.full(BATCH, 32768, np.int64)
+        lengths[-1] -= 1
+        return {**batch, "real_length": lengths}
+
+
+@pytest.mark.parametrize("cadence", [1, 100])
+def test_a_token_budget_stays_exact_above_float32_integer_resolution(cadence):
+    trainer = make_trainer(objective=LargeTokenRegression())
+    state = trainer.fit(Data(LargeTokenRows), total_tokens=65 * 262143 + 1, log_every=cadence)
+    assert int(state.step) == 66
+
+
+@pytest.mark.parametrize("cadence", [1, 100])
+def test_resumed_tokens_stay_exact_above_float32_integer_resolution(tmp_path, cadence):
+    first = make_trainer(tmp_path, objective=LargeTokenRegression())
+    first.fit(Data(LargeTokenRows), steps=65, log_every=cadence)
+    assert first.checkpoints.control(65)["tokens"] == 65 * 262143
+    resumed = make_trainer(tmp_path, objective=LargeTokenRegression())
+    assert int(resumed.fit(Data(LargeTokenRows), total_tokens=65 * 262143 + 1, log_every=cadence).step) == 66
+
+
 def test_an_optim_config_is_built_over_the_updates_fit_makes():
     """Four steps of two microbatches are two updates: the run is the config built over two, bit
     for bit, not over four. Before fit there is no length to build it over."""
@@ -1470,14 +1501,21 @@ class ManualClock:
         return self.now
 
 
-def test_the_first_log_tick_measures_steps_not_the_compile(monkeypatch):
+@pytest.mark.parametrize("report_seconds", [0.0, 1.0])
+def test_the_first_log_tick_measures_steps_not_the_compile(monkeypatch, report_seconds):
     """Every interval, the first one included, reports the time its steps
     took; placement and compile are outside every window and never land in
     train/step_time_ms, and the goodput numbers at the end count them as the
     time to the first step."""
     clock = ManualClock()
     monkeypatch.setattr(trainer_module, "time", clock)
-    tracker = RecordingTracker()
+    class SlowTracker(RecordingTracker):
+        def log(self, scalars, step):
+            super().log(scalars, step)
+            if "train/loss" in scalars:
+                clock.now += report_seconds
+
+    tracker = SlowTracker()
     trainer = make_trainer(tracker=tracker)
     place, compile_step = trainer.place, trainer.compile
 
@@ -1500,13 +1538,15 @@ def test_the_first_log_tick_measures_steps_not_the_compile(monkeypatch):
     trainer.fit(Data(endless), steps=3, log_every=1)
 
     ticks = [s for _, s in tracker.scalars if "train/step_time_ms" in s]
-    assert [s["train/step_time_ms"] for s in ticks] == pytest.approx([1000.0] * 3)
+    assert [s["train/step_time_ms"] for s in ticks] == pytest.approx([
+        1000.0, (1 + report_seconds) * 1000.0, (1 + report_seconds) * 1000.0])
     # Placement (20), the compile (100) and the first step (1) make the time
     # to the first step; the two steps after it are the 2 of 123 seconds in steps.
     goodput = [(step, s) for step, s in tracker.scalars if "goodput/step_fraction" in s]
     assert [step for step, _ in goodput] == [3]
     assert goodput[0][1]["goodput/time_to_first_step_s"] == pytest.approx(121.0)
-    assert goodput[0][1]["goodput/step_fraction"] == pytest.approx(2 / 123)
+    assert goodput[0][1]["goodput/step_fraction"] == pytest.approx(
+        (2 + 3 * report_seconds) / (123 + 3 * report_seconds))
 
 
 def test_goodput_counts_evaluations_and_checkpoints_as_time_outside_steps(monkeypatch, tmp_path):
