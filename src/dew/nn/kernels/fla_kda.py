@@ -193,12 +193,18 @@ def _intra_solve_kernel(q_ref, k_ref, g_ref, beta_ref, aqkd_ref, akkd_ref, aqk_r
             held.append((key, gate))
         return [found[pair] for pair in pairs]
 
+    def window(i, j):
+        return pl.ds(i * SUB, SUB), pl.ds(j * SUB, SUB)
+
     found = jax.lax.fori_loop(0, blocks, block, [(zero, zero)] * len(pairs))
-    qks, kks = {}, {}
+    # Aqk is stored before the solve, so none of it is held through the solve.
+    kks = {}
     for (i, j), (qk, kk) in zip(pairs, found, strict=True):
-        qks[i, j] = qk * scale
+        aqk_ref[window(i, j)] = (qk * scale).astype(aqk_ref.dtype)
+        aqk_ref[window(j, i)] = zero.astype(aqk_ref.dtype)
         kks[i, j] = kk * beta_ref[pl.ds(i * SUB, SUB)].astype(jnp.float32)[:, None]
     for i in range(count):
+        aqk_ref[window(i, i)] = aqkd_ref[pl.ds(i * SUB, SUB), :]
         kks[i, i] = akkd_ref[pl.ds(i * SUB, SUB), :]
     inverse = {(i, i): _tril_inverse(kks[i, i], index) for i in range(count)}
     for distance in range(1, count):
@@ -211,12 +217,7 @@ def _intra_solve_kernel(q_ref, k_ref, g_ref, beta_ref, aqkd_ref, akkd_ref, aqk_r
                 inverse[i, j] = -_tf32_dot(inverse[i, i], inner)
     for i in range(count):
         for j in range(count):
-            window = (pl.ds(i * SUB, SUB), pl.ds(j * SUB, SUB))
-            if j == i:
-                aqk_ref[window] = aqkd_ref[pl.ds(i * SUB, SUB), :]
-            else:
-                aqk_ref[window] = (qks[i, j] if j < i else zero).astype(aqk_ref.dtype)
-            akk_ref[window] = (inverse[i, j] if j <= i else zero).astype(akk_ref.dtype)
+            akk_ref[window(i, j)] = (inverse[i, j] if j <= i else zero).astype(akk_ref.dtype)
 
 
 def intra_solve(q, k, g, beta, *, scale: float, chunk: int = 64, bk: int | None = None,
