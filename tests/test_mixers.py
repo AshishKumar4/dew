@@ -164,3 +164,32 @@ def test_models_build_takes_kind_mixer_records():
     ids = jnp.asarray([[1, 2, 3, 4]], jnp.int32)
     params = expected.init(jax.random.key(0), ids)
     assert jnp.array_equal(model.apply(params, ids), expected.apply(params, ids))
+
+
+POLICY_VALUES = {"force_fp32_for_softmax": False, "attn_logit_softcap": 30.0, "attention_sinks": True,
+                 "value_scale": 0.5, "o_proj_bias": True, "attention_dropout_rate": 0.1}
+"""A value each attention policy (`MixerContext.policies`) asks with."""
+
+
+@pytest.mark.parametrize("kind", sorted(mixers.paths))
+@pytest.mark.parametrize("policy", sorted(POLICY_VALUES))
+def test_every_attention_mixer_implements_or_refuses_each_policy_it_is_asked(kind, policy):
+    """A layer asking an attention policy builds a mixer that takes it as an argument, or refuses
+    it by name; no attention-family kind builds without it. Recurrent and feed-forward kinds attend
+    nothing, so the attention policies are not theirs."""
+    context = MixerContext(emb_features=64, num_heads=4, num_kv_heads=2, head_dim=16, max_seq_len=32)
+    asked = dataclasses.replace(context, **{policy: POLICY_VALUES[policy]})
+    assert asked.policies()[policy] and not context.policies()[policy]
+    value = mixers.build(kind)
+    try:
+        factory = value.build(context)
+    except ValueError:
+        pytest.skip(f"{kind} needs fields of its own to build")
+    if not isinstance(factory, functools.partial) or "attention_impl" not in factory.keywords:
+        pytest.skip(f"{kind} attends nothing")
+    try:
+        factory = value.build(asked)
+    except ValueError as refused:
+        assert policy in str(refused)
+        return
+    assert factory.keywords.get(policy) == POLICY_VALUES[policy]
