@@ -29,12 +29,33 @@ from dew.training.state import TrainState
 _log = logging.getLogger(__name__)
 
 
-def step_compiler_options(objective, tokens: float, frozen: bool) -> jax.stages.CompilerOptions | None:
+COLLECTIVES = {
+    'xla_gpu_enable_latency_hiding_scheduler': True,
+    'xla_gpu_all_reduce_combine_threshold_bytes': 1 << 30,
+    'xla_gpu_all_gather_combine_threshold_bytes': 1 << 30,
+    'xla_gpu_reduce_scatter_combine_threshold_bytes': 1 << 27,
+    'xla_gpu_enable_pipelined_all_gather': True,
+    'xla_gpu_enable_pipelined_reduce_scatter': True,
+    'xla_gpu_enable_pipelined_all_reduce': True,
+    'xla_gpu_enable_while_loop_double_buffering': True,
+    'xla_gpu_enable_all_gather_combine_by_dim': False,
+    'xla_gpu_enable_reduce_scatter_combine_by_dim': False,
+}
+"""NVIDIA JAX-Toolbox's collective options for a GPU step over several devices: the scheduler overlaps
+each collective with compute, and the collectives combine into few large ones and pipeline across the
+layer loop. On two H100 SXMs over NVLink, Llama-3.1-8B (FSDP 2, 2 x 4096 tokens, remat minimal) ran
+2.9% faster with Toolbox's bundle (540.0 to 524.3 ms), its all-gathers and reduce-scatters from 376 and
+162 to 48 and 66 with the same bytes. One GPU has no collectives to combine (Llama 1.1B: within 0.4%)."""
+
+
+def step_compiler_options(objective, tokens: float, frozen: bool,
+                          devices: int) -> jax.stages.CompilerOptions | None:
     """Return the XLA options for this objective's training step on this device.
 
     Each option applies unless the run set that flag itself. `tokens` is the
-    number of tokens one device steps (`device_tokens`), and `frozen` says
-    whether the step trains next to frozen weights.
+    number of tokens one device steps (`device_tokens`), `frozen` says
+    whether the step trains next to frozen weights, and `devices` is how
+    many the step spans: over several GPUs it takes `COLLECTIVES`.
 
     On a GPU, dots that share an input (q, k and v; gate and up) run separately.
     XLA's dot merger would run them as one GEMM over their weights, concatenated
@@ -65,6 +86,8 @@ def step_compiler_options(objective, tokens: float, frozen: bool) -> jax.stages.
     """
     generation = device_generation()
     options: dict[str, bool | int] = {}
+    if generation.startswith('sm') and devices > 1:
+        options.update({name: value for name, value in COLLECTIVES.items() if xla_flag(name) is None})
     small = tokens <= 128
     if (generation.startswith('sm') and xla_flag('xla_gpu_dot_merger_threshold_mb') is None
             and not (frozen and small)):
