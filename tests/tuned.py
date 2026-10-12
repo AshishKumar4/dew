@@ -7,8 +7,8 @@ import tokamax
 
 
 def each_config(kernel, function, *args) -> list:
-    """Every config of `kernel`'s space at the shapes `function(*args)`
-    launches it with, in field order."""
+    """Every config of `kernel`'s space at the keys of the shapes
+    `function(*args)` launches it with, in field order."""
     found = tokamax.autotuning.get_bound_args(jax.jit(function), *args)
-    return sorted({config for ba in found if type(ba.op) is kernel for config in ba.autotuning_configs},
-                  key=dataclasses.astuple)
+    return sorted({config for ba in found if type(ba.op) is kernel
+                   for config in ba.op.keyed(ba).autotuning_configs}, key=dataclasses.astuple)

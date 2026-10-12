@@ -86,6 +86,17 @@ def kernel_picks_path(device_kind: str) -> str:
     return os.path.join(autotune_dir(default_compilation_cache_dir()), 'kernels', f"{name}.json")
 
 
+KERNEL_TUNES = jax.make_user_context(0)
+"""How many times this process's kernel picks changed (`dew.nn.kernels.tuning.tune`):
+a context JAX keys its trace and compile caches on, so a program lowered
+after picks change traces again. Made at `import dew`, as JAX makes a user
+context only beside no other JAX call."""
+
+KERNEL_PINS = jax.make_user_context(())
+"""The `(kernel, config)` pairs `dew.nn.kernels.tuning.pinned` holds in this
+thread, keyed on as `KERNEL_TUNES` is."""
+
+
 def measures_picks() -> bool:
     """Whether this process may measure GPU picks and store them, XLA's and
     the kernels' alike: not beside other work on its GPU, where `gpu-run -n
