@@ -725,7 +725,7 @@ class TrainerConfig:
             self.best if isinstance(self.best, tuple) else (self.best,))
 
     def total_steps(self, dataset: Dataset) -> int | None:
-        """Return the run's length in steps, from `steps` or from `epochs` over `data`."""
+        """Return the step cap from `steps` or `epochs`, None for a token-only run."""
         if self.steps is not None:
             return self.steps
         if self.epochs is None:

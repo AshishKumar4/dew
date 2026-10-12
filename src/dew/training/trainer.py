@@ -1402,14 +1402,14 @@ class Trainer(Generic[Loss, Effects]):
         an array whose buffers the step consumed."""
         if initial is None:
             state, shardings, position = self.place()
+            if checkpoints is not None and checkpoints.latest is not None:
+                run.stop_control = checkpoints.control(checkpoints.latest)
         else:
             shardings = self.shardings(initial)
             self.layout.check(initial.variables, shardings.variables, self.device_mesh)
             state = jax.device_put(initial, shardings)
             position = None
         run.last_checkpoint = time.perf_counter()
-        if checkpoints is not None and checkpoints.latest is not None:
-            run.stop_control = checkpoints.control(checkpoints.latest)
         run.tokens_at_log = int(run.stop_control.get("tokens", 0))
         if self._opened(plan, run, state, position):
             return state, True
