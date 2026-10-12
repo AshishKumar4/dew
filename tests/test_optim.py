@@ -35,7 +35,7 @@ def test_cosine_names_the_warmup_and_decay_horizon_it_cannot_fit(warmup, updates
 def test_cosine_uses_its_explicit_horizon_when_the_run_has_no_step_cap():
     schedule = Cosine(peak=1.0, warmup_steps=2, decay_steps=4).schedule(None)
     np.testing.assert_array_equal([float(schedule(i)) for i in (0, 2, 4)], [0, 1, 0])
-    with pytest.raises(ValueError, match="Cosine.*decay_steps"):
+    with pytest.raises(ValueError, match=r"Cosine.*decay_steps"):
         Cosine(peak=1.0, warmup_steps=2).schedule(None)
 
 
