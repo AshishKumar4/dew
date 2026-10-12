@@ -83,9 +83,10 @@ def _declared(name: str, target: generation.GpuTarget, dtype: str) -> dict:
             ("bfloat16", False): _SMALL_BF16, ("float32", False): _SMALL_FP32}[dtype, wide]
 
 
-# Keys wider than 128 hold a wider memory: an A100's three-stage dhu took 177,160 bytes of its
-# 166,912 at 256-wide keys (CPU compile), so there it runs at most two, a stage fla's autotuner offers.
-_WIDE_KEY_STAGES = {"chunk_bwd_dhu": 2}
+# Keys wider than 128 hold a wider memory, so their kernels take at most these fields, each a choice
+# fla's autotuner offers: on an A100 three-stage dhu took 177,160 bytes of 166,912 at 256-wide keys
+# and fp32's 64-column forward h 196,868 (CPU compile).
+_WIDE_KEYS = {"chunk_bwd_dhu": {"stages": 2}, "chunk_fwd_h": {"bv": 32}}
 
 CONFIGS = {(name, dtype): _declared(name, target, dtype)
            for name, target in generation.TARGETS.items()
@@ -117,12 +118,12 @@ def _config_key(dtype, target: str | None = None) -> tuple[str, str]:
 
 def kernel_config(kernel: str, shape: Mapping[str, int], dtype, *, target: str | None = None,
                   **overrides: int | None) -> dict[str, int]:
-    """`kernel`'s config for `dtype` on `target` (`_config_key`), its stages capped for keys wider
-    than 128 (`_WIDE_KEY_STAGES`); overrides (the lab's) replace its fields. Blocks are clipped to the
+    """`kernel`'s config for `dtype` on `target` (`_config_key`), capped for keys wider than 128
+    (`_WIDE_KEYS`); overrides (the lab's) replace its fields. Blocks are clipped to the
     keys' `width` and values' `columns`."""
     config = dict(CONFIGS[_config_key(dtype, target)][kernel])
-    if shape["width"] > WIDEST and kernel in _WIDE_KEY_STAGES:
-        config["stages"] = min(config["stages"], _WIDE_KEY_STAGES[kernel])
+    if shape["width"] > WIDEST:
+        config.update({key: min(config[key], cap) for key, cap in _WIDE_KEYS.get(kernel, {}).items()})
     config.update({key: value for key, value in overrides.items() if value is not None})
     return {key: min(value, shape["width"] if key == "bk" else shape["columns"]) if key in ("bk", "bv")
             else value for key, value in config.items()}
