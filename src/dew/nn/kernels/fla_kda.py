@@ -172,18 +172,26 @@ def _intra_solve_kernel(q_ref, k_ref, g_ref, beta_ref, aqkd_ref, akkd_ref, aqk_r
     pairs = [(i, j) for i in range(count) for j in range(i)]
 
     def block(c, sums):
-        """One block of key columns for every pair, each sub-chunk's tiles loaded once, as fla's loop."""
+        """One block of key columns for every pair in fla's order: each row's sub-chunk loaded after the
+        rows before it are summed, and the earlier sub-chunks' keys and decays held."""
         columns = pl.ds(c * bk, bk)
-        tiles = [tuple(ref[pl.ds(i * SUB, SUB), columns].astype(jnp.float32) for ref in (q_ref, k_ref, g_ref))
-                 for i in range(count)]
-        origins = [g_ref[i * SUB, columns].astype(jnp.float32)[None, :] for i in range(count)]
-        ahead = [(query * jnp.exp2(gate - origin), key * jnp.exp2(gate - origin))
-                 for (query, key, gate), origin in zip(tiles, origins, strict=True)]
-        found = []
-        for (i, j), (qk, kk) in zip(pairs, sums, strict=True):
-            behind = (tiles[j][1] * jnp.exp2(origins[i] - tiles[j][2])).T
-            found.append((qk + _tf32_dot(ahead[i][0], behind), kk + _tf32_dot(ahead[i][1], behind)))
-        return found
+
+        def load(ref, i):
+            return ref[pl.ds(i * SUB, SUB), columns].astype(jnp.float32)
+
+        found = dict(zip(pairs, sums, strict=True))
+        held = [(load(k_ref, 0), load(g_ref, 0))]
+        for i in range(1, count):
+            key, gate = load(k_ref, i), load(g_ref, i)
+            origin = g_ref[i * SUB, columns].astype(jnp.float32)[None, :]
+            ahead = jnp.exp2(gate - origin)
+            read, written = load(q_ref, i) * ahead, key * ahead
+            for j, (earlier, decay) in enumerate(held):
+                behind = (earlier * jnp.exp2(origin - decay)).T
+                qk, kk = found[i, j]
+                found[i, j] = (qk + _tf32_dot(read, behind), kk + _tf32_dot(written, behind))
+            held.append((key, gate))
+        return [found[pair] for pair in pairs]
 
     found = jax.lax.fori_loop(0, blocks, block, [(zero, zero)] * len(pairs))
     qks, kks = {}, {}
