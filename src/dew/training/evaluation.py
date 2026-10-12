@@ -231,11 +231,18 @@ def _event(key: jax.Array, step: int | jax.Array, schedule_step: int | jax.Array
         (step, step if schedule_step is None else schedule_step, dict(training or {})),
         phase="evaluation clocks",
     )
-    at, schedule_at = broadcast_from_process_zero([int(step_home), np.asarray(schedule_home).item()])
+
+    def root_clocks() -> list | None:
+        # Root's clocks as root holds them; a clock root cannot read is refused on every rank.
+        schedule = np.asarray(schedule_home)
+        return ([int(step_home), schedule.item(), schedule.dtype.name] if jax.process_index() == 0
+                else None)
+
+    at, schedule_at, dtype = broadcast_from_process_zero(agreed("evaluation clocks", root_clocks))
 
     def event() -> tuple[Step, jax.Array]:
         event_key = _folded(_folded(key, 0x4556414C), at)
-        schedule = jax.device_put(np.asarray(schedule_at, np.asarray(schedule_home).dtype))
+        schedule = jax.device_put(np.asarray(schedule_at, np.dtype(dtype)))
         return Step(step=schedule, key=event_key, ema=averaged), jax.random.key_data(event_key)
 
     context, event_data = agreed("evaluation context", event)
