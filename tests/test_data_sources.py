@@ -55,6 +55,46 @@ def test_pinned_hub_revision_never_falls_through_to_a_different_conversion(monke
     assert latest.url == ("hf://datasets/owner/data@converted/data/train-00000.parquet",)
 
 
+def test_a_conversion_that_moves_under_one_default_commit_is_another_snapshot(monkeypatch):
+    """A default revision without native shards streams the commit its
+    Parquet conversion holds, and that branch can move while the default
+    commit stays. One source pins the commit once, so its shard URLs and its
+    snapshot name the same files, and a plan saved before the branch moved is
+    refused on an exact resume."""
+    from types import SimpleNamespace
+
+    import datasets
+    from huggingface_hub import HfApi
+
+    from dew.data import Pipeline, compile
+    from dew.data.sources import Hub
+
+    converted = ["first"]
+
+    def metadata(self, repo, revision=None):
+        return SimpleNamespace(sha=converted[-1] if revision == "refs/convert/parquet" else "original")
+
+    def listing(self, repo, *, repo_type, revision):
+        return ["train.tar"] if revision == "original" else ["default/train/0000.parquet"]
+
+    def plan():
+        streamed = Pipeline(Hub("owner/data")).batch(2)
+        return compile(streamed, read="streamed", loading=Loading(workers=0)).plan
+
+    monkeypatch.setattr(HfApi, "dataset_info", metadata)
+    monkeypatch.setattr(HfApi, "list_repo_files", listing)
+    builder = SimpleNamespace(info=SimpleNamespace(features=None, splits=None))
+    monkeypatch.setattr(datasets, "load_dataset_builder", lambda *args, **kwargs: builder)
+    source = Hub("owner/data")
+    snapshot = source.snapshot()
+    saved = plan()
+    converted.append("second")
+    assert source.files.url == ("hf://datasets/owner/data@first/default/train/0000.parquet",)
+    assert source.snapshot() == snapshot != Hub("owner/data").snapshot()
+    with pytest.raises(ValueError, match="saved data plan source changed"):
+        plan().check(saved.record())
+
+
 @pytest.mark.parametrize("format", ["jsonl", "arrow", "parquet"])
 def test_hub_native_shards_keep_the_requested_revision(monkeypatch, format):
     from types import SimpleNamespace

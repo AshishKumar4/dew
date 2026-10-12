@@ -27,7 +27,7 @@ def test_hub_builder_uses_the_resolved_commit_and_named_configuration(tmp_path, 
     assert source.builder is expected
     assert requested == [("acme/records", {"name": "named", "revision": "frozen", "cache_dir": "arrow"})]
     assert source.snapshot() == {"store": "hf", "repo": "acme/records", "revision": "frozen",
-                                 "config": "named", "split": "validation"}
+                                 "streamed": "frozen", "config": "named", "split": "validation"}
 
 
 def test_a_split_prepared_in_two_caches_is_one_snapshot_and_one_plan(tmp_path, monkeypatch):
