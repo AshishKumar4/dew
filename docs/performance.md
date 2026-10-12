@@ -2783,9 +2783,24 @@ The kernel-matrix rows time forward plus backward at jax 0.11.2, checked against
 
 I rejected a pure-JAX loop of dense per-tile products. On the RTX 4080 it was 2.2x faster than XLA for the projection alone (6.67 ms), but it doubled the step's temporaries (4.22 GiB against 2.17 at batch 1), and on the v6e it was 2.2x slower than XLA (1.71 ms against 0.79).
 
-The Pallas kernels are JAX's own `gmm` and `tgmm` from the jax-v0.11.2 source tree, vendored because no wheel ships them and called through a custom VJP. jax 0.11.2 deprecates the Pallas Triton backend they run on and warns at every lowering. They stay the sm80 to sm89 path anyway, because JAX's Mosaic GPU grouped matmul (`pallas/ops/gpu/ragged_dot_mgpu.py`) uses wgmma and fails to compile on the RTX 4080, and tokamax's sm80 Mosaic config exceeds Ada's shared memory. Dew does not silence the warning, so filtering it is up to you. Moving this path to Mosaic GPU on sm90 and later is open, and waits for Hopper hardware to measure on. On a mesh the kernels run inside `shard_map` on each device's share of the sorted rows. That path is checked for parity on an 8-device CPU mesh and not measured on multiple GPUs.
+The Pallas kernels are JAX's own `gmm` and `tgmm` from the jax-v0.11.2 source tree, vendored because no wheel ships them and called through a custom VJP. jax 0.11.2 deprecates the Pallas Triton backend they run on and warns at every lowering. They are the sm80 to sm90 path anyway, because JAX's Mosaic GPU grouped matmul (`pallas/ops/gpu/ragged_dot_mgpu.py`) uses wgmma and fails to compile on the RTX 4080, tokamax's sm80 Mosaic config exceeds Ada's shared memory, and on an H100 tokamax's Mosaic GPU kernel only matched their forward (below). Dew does not silence the warning, so filtering it is up to you. On a mesh the kernels run inside `shard_map` on each device's share of the sorted rows. That path is checked for parity on an 8-device CPU mesh and not measured on multiple GPUs.
 
-On TPU, tokamax's `mosaic_tpu_v2` is within 1% of XLA on the step. tokamax's default dispatch picks its v1 kernel there, which is 13x slower, so Dew names the kernel.
+On TPU, tokamax's `mosaic_tpu_v2` is within 1% of XLA on the step. tokamax's default dispatch picks its v1 kernel there, which is 13x slower, so Dew names the kernel. With XLA as fast or faster on a v6e at the step and at 128 experts, TPUs run XLA, and Dew has no tokamax grouped matmul.
+
+At real MoE shapes on an H100 SXM and an A100 40 GB (2026-10-12, jax 0.11.2, torch 2.14.1), `tools/benchmark_kernels.py projection` timed forward and forward plus backward, median of 30, in ms. Every Dew row lies at the same distance from the float64 oracle as XLA's or closer. `--rows R --experts E --width W --features F`:
+
+| GPU | shape (rows, width to features, experts) | XLA | Pallas | tokamax Mosaic GPU | torch `_grouped_mm` |
+|---|---|---:|---:|---:|---:|
+| H100 SXM | 8192, 2048 to 768, 128 (Qwen3-30B-A3B) | 5.40 / 33.5 | 0.72 / 1.60 | 0.67 / 28.9 | 0.19 / 1.01 |
+| H100 SXM | 32768, 2048 to 768, 128 | 20.5 / 138 | 1.15 / 2.83 | 0.93 / 119 | 0.26 / 1.38 |
+| H100 SXM | 8192, 4096 to 14336, 8 (Mixtral) | 10.6 / 62.6 | 4.58 / 12.0 | 4.88 / 57.9 | 1.46 / 5.44 |
+| H100 SXM | 32768, 4096 to 14336, 8 | 39.9 / 245 | 15.0 / 42.1 | 16.2 / 264 | 5.42 / 18.0 |
+| A100 40 GB | 8192, 2048 to 768, 128 | 15.1 / 82.7 | 1.62 / 4.04 | | 1.87 / 5.80 |
+| A100 40 GB | 32768, 2048 to 768, 128 | | 2.62 / 7.37 | | 2.27 / 7.29 |
+| A100 40 GB | 8192, 4096 to 14336, 8 | 30.0 / 157 | 11.9 / 37.0 | | 5.21 / 14.5 |
+| A100 40 GB | 32768, 4096 to 14336, 8 | | 36.1 / 129 | | 15.1 / 47.4 |
+
+tokamax's kernel differentiates through XLA, so its backward is XLA's; on an A100 it registers only its XLA path, as its Triton kernel imports jax_triton. So `KERNELS['grouped_matmul']` names Pallas for sm90 as for sm80 to sm89. torch's CUTLASS grouped GEMM is 1.6 to 3.8 times faster than the Pallas kernels on the H100 and 2.5 times faster at Mixtral's width on the A100; matching it needs a grouped GEMM of Dew's own on those parts, which is open.
 
 ### bf16 Adam state: `OptimConfig.state_dtype`
 
