@@ -111,7 +111,7 @@ if TYPE_CHECKING:
     type DataSpec = RunData
     type ScheduleSpec = ScheduleBase
 else:
-    DataSpec = datasets.union
+    DataSpec = datasets.subcommands
     ScheduleSpec = schedules.union
 
 
@@ -1088,7 +1088,7 @@ class RunConfig:
         return value
 
     @classmethod
-    def loader(cls, directory: str, *, trust: Sequence[str] = ()) -> Self:
+    def load(cls, directory: str, *, trust: Sequence[str] = ()) -> Self:
         """Read the run a directory's `run.json` records, or the file itself,
         as the class it names, which must be this one or derive from it.
         `trust` names the packages outside Dew the record may import."""
@@ -1206,7 +1206,7 @@ class RunConfig:
             raise ValueError(
                 f"--trainer.batch-size is {self.trainer.batch_size} and this dataset "
                 f"reads {dataset.batch} records a step; load it with "
-                f"loader(batch={self.trainer.batch_size})")
+                f"load(batch={self.trainer.batch_size})")
         if dataset.batch_tokens != self.trainer.batch_tokens:
             raise ValueError(f"dataset.batch_tokens is {dataset.batch_tokens}, but trainer.batch_tokens is "
                              f"{self.trainer.batch_tokens}; compile data with the trainer's token budget")

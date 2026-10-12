@@ -52,7 +52,9 @@ class DecodeClip(grain.RandomMapTransform):
                     sound = {"audio": audio}
         except (OSError, ValueError):
             return Rejected("undecodable")
-        return {**element, self.to: fit_frames(frames, self.size), **sound}
+        # The decoded frames replace the clip they came from.
+        kept = {key: value for key, value in element.items() if key != self.field}
+        return {**kept, self.to: fit_frames(frames, self.size), **sound}
 
     @staticmethod
     def _path(clip: bytes | str, held: contextlib.ExitStack) -> str:

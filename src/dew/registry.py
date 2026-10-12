@@ -270,6 +270,15 @@ class Aliases[T: Callable[..., Any], Built](Mapping[str, T]):
         """The union of the members' types, for a tyro subcommand over the kind."""
         return functools.reduce(operator.or_, self.values())
 
+    @property
+    def subcommands(self) -> object:
+        """The members' union with each subcommand named as the kind names it
+        ("data:text"), rather than by its class."""
+        import tyro
+
+        return functools.reduce(operator.or_, (typing.Annotated[self[name], tyro.conf.subcommand(name)]
+                                               for name in self))
+
 
 def declared_type(member: type, field: str) -> Annotation:
     """Resolve one field's annotation, without evaluating unrelated ones."""
@@ -301,6 +310,8 @@ def _union_members(annotation: Annotation) -> tuple[Annotation, ...]:
     annotation = resolve_alias(annotation)
     if typing.get_origin(annotation) in (Union, types.UnionType):
         return tuple(inner for member in typing.get_args(annotation) for inner in _union_members(member))
+    if typing.get_origin(annotation) is typing.Annotated:
+        return _union_members(typing.get_args(annotation)[0])
     return (annotation,)
 
 

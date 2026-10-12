@@ -74,7 +74,7 @@ DEFAULT_MODEL_CONFIG = {
 
 @dataclasses.dataclass(frozen=True)
 class TextCondition:
-    """TextData conditioning: which registered encoder reads the batch's tokens, and from which checkpoint."""
+    """Text conditioning: which registered encoder reads the batch's tokens, and from which checkpoint."""
 
     encoder: str = "clip_text"
     checkpoint: str = DEFAULT_MODEL
@@ -509,4 +509,4 @@ class DiffusionRunConfig(RunConfig):
 
 if not TYPE_CHECKING:
     PresetSpec = presets.union
-    CaptionedSpec = datasets.union
+    CaptionedSpec = datasets.subcommands
