@@ -447,7 +447,7 @@ class OptimConfig:
     Empty keeps none.
     """
 
-    def build(self, steps: int) -> optax.GradientTransformation:
+    def build(self, steps: int | None) -> optax.GradientTransformation:
         """Build the optimizer this config describes, with its schedule, parameter groups and clipping.
 
         `steps` is the run's length in updates, which the schedule decays over unless the
@@ -603,6 +603,14 @@ class TrainerConfig:
     steps: int | None = None
     epochs: int | None = None
     """The run length as passes over the data; `steps` sets it directly instead."""
+    total_tokens: int | None = None
+    """Stop after this many real tokens across all microbatches, including before a resume.
+
+    Uses the counter reported as `train/tokens`, without padding. The final
+    microbatch may cross the budget. With `steps` or `epochs`, the first cap
+    reached ends the run. A token-only run needs a constant learning rate or
+    a schedule with its own explicit step horizon.
+    """
     log_every: int = 100
     eval_every: int | Literal["epoch"] | None = "epoch"
     """The steps between validation passes.
@@ -716,12 +724,14 @@ class TrainerConfig:
         return (Best(self.best),) if isinstance(self.best, str) else (
             self.best if isinstance(self.best, tuple) else (self.best,))
 
-    def total_steps(self, dataset: Dataset) -> int:
+    def total_steps(self, dataset: Dataset) -> int | None:
         """Return the run's length in steps, from `steps` or from `epochs` over `data`."""
         if self.steps is not None:
             return self.steps
         if self.epochs is None:
-            raise ValueError("the run length is --trainer.steps or --trainer.epochs")
+            if self.total_tokens is not None:
+                return None
+            raise ValueError("the run length is --trainer.steps or --trainer.epochs or --trainer.total-tokens")
         if dataset.steps_per_epoch is None:
             raise ValueError(
                 "epochs need a dataset with a record count; this one streams without "
@@ -1192,7 +1202,7 @@ class RunConfig:
                 dynamic_scale=trainer.dynamic_scale, checkpoints=checkpoints, tracker=tracker,
                 rollout=rollout, profile=trainer.profile, lower_for=trainer.lower_for,
             ).fit(
-                dataset, steps=steps,
+                dataset, steps=steps, total_tokens=trainer.total_tokens,
                 log_every=trainer.log_every,
                 eval_every=trainer.eval_interval(dataset),
                 checkpoint_every=trainer.checkpoint_interval(dataset),

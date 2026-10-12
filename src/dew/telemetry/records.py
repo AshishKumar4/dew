@@ -92,7 +92,7 @@ class RunRecord:
     name: str
     config: JSON
     summary: JSON
-    steps: int
+    steps: int | None
     packages: Mapping[str, str]
     dew_sha: str | None = dataclasses.field(default_factory=checkout_revision)
     device_kind: str | None = None
@@ -103,7 +103,7 @@ class RunRecord:
 @dataclasses.dataclass(frozen=True)
 class FitStarted:
     start_step: int
-    target_steps: int
+    target_steps: int | None
     resumed_from: str | None
     parameters: int
     devices: int
@@ -115,6 +115,7 @@ class FitStarted:
     tensor) splits."""
     seed: int | None = None
     """None: no integer seed recorded (a JAX key was supplied, or the record predates the field)."""
+    total_tokens: int | None = None
 
 
 @dataclasses.dataclass(frozen=True)

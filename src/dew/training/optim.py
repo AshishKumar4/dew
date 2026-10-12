@@ -585,7 +585,7 @@ class ParamGroup:
                                  f"higher value, got {self.bounds}")
 
     def solver(self, make: Callable[..., optax.GradientTransformation],
-               learning_rate: float | optax.Schedule, steps: int,
+               learning_rate: float | optax.Schedule, steps: int | None,
                opts: Mapping[str, object]) -> optax.GradientTransformation:
         """Build this group's optimizer: `make(learning_rate, **opts)` with the
         group's `b1` schedule and `bounds`, over a run of `steps` updates.
@@ -725,18 +725,24 @@ class ScheduleBase:
         if self.every < 1:
             raise ValueError(f"a schedule advances once every 1 or more updates, not {self.every}")
 
-    def schedule(self, steps: int) -> optax.Schedule:
+    def schedule(self, steps: int | None) -> optax.Schedule:
         """Return the value at each update of a run of `steps` updates, as an optax schedule."""
         if self.every == 1:
             return self.values(steps)
-        own = steps // self.every
-        if own < 1:
+        own = None if steps is None else steps // self.every
+        if own is not None and own < 1:
             raise ValueError(f"a run of {steps} updates never advances a schedule that steps once "
                              f"every {self.every}")
         values, every = self.values(own), self.every
         return lambda count: values(jnp.asarray(count) // every)
 
-    def values(self, steps: int) -> optax.Schedule:
+    def _horizon(self, steps: int | None, field: str) -> int:
+        """Resolve a decay's step horizon, which a token budget cannot supply."""
+        if steps is None:
+            raise ValueError(f"{type(self).__name__} needs {field} or trainer.steps as its step horizon")
+        return steps
+
+    def values(self, steps: int | None) -> optax.Schedule:
         """Return the value at each of the schedule's own steps, over `steps` of them."""
         raise NotImplementedError
 
@@ -756,8 +762,8 @@ class Cosine(ScheduleBase):
     init: float = 0.0
     decay_steps: int | None = None
 
-    def values(self, steps: int) -> optax.Schedule:
-        decay_steps = steps if self.decay_steps is None else self.decay_steps
+    def values(self, steps: int | None) -> optax.Schedule:
+        decay_steps = self._horizon(steps if self.decay_steps is None else self.decay_steps, "decay_steps")
         if self.warmup_steps >= decay_steps:
             raise ValueError(f"Cosine needs warmup_steps={self.warmup_steps} smaller than "
                              f"decay_steps={decay_steps}")
@@ -794,13 +800,14 @@ class Power(ScheduleBase):
     c: float = 1.0
     tail: PowerTail | None = None
 
-    def values(self, steps: int) -> optax.Schedule:
+    def values(self, steps: int | None) -> optax.Schedule:
         tail = self.tail
         if tail is None:
             return power_schedule(self.peak, self.warmup_steps, self.a, self.b, self.c)
         return power_schedule(
             self.peak, self.warmup_steps, self.a, self.b, self.c, decay_start=tail.start,
-            decay_end=steps if tail.steps is None else tail.steps, end_value=tail.end)
+            decay_end=self._horizon(steps if tail.steps is None else tail.steps, "tail.steps"),
+            end_value=tail.end)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -818,9 +825,10 @@ class Linear(ScheduleBase):
     decay_steps: int | None = None
     end: float = 0.0
 
-    def values(self, steps: int) -> optax.Schedule:
+    def values(self, steps: int | None) -> optax.Schedule:
         return linear_schedule(self.peak, self.warmup_steps, self.decay_start,
-                               steps if self.decay_steps is None else self.decay_steps,
+                               self._horizon(steps if self.decay_steps is None else self.decay_steps,
+                                             "decay_steps"),
                                end_value=self.end)
 
 
@@ -847,7 +855,8 @@ class OneCycle(ScheduleBase):
     end: float | None = None
     warmup_fraction: float = 0.3
 
-    def values(self, steps: int) -> optax.Schedule:
+    def values(self, steps: int | None) -> optax.Schedule:
+        steps = self._horizon(steps, "trainer.steps")
         init = self.peak / 25 if self.init is None else self.init
         end = init / 1e4 if self.end is None else self.end
         # torch's phase ends, kept as floats as torch keeps them.
@@ -886,8 +895,8 @@ class Exponential(ScheduleBase):
     decay_steps: int | None = None
     offset: float = 0.0
 
-    def values(self, steps: int) -> optax.Schedule:
-        span = steps if self.decay_steps is None else self.decay_steps
+    def values(self, steps: int | None) -> optax.Schedule:
+        span = self._horizon(steps if self.decay_steps is None else self.decay_steps, "decay_steps")
         if span <= 0 or self.init <= 0 or self.end <= 0:
             raise ValueError(f"an exponential decay needs positive steps, init and end, got "
                              f"{span}, {self.init} and {self.end}")
