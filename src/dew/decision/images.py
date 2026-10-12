@@ -31,8 +31,8 @@ class Images:
     @classmethod
     def of(cls, processor: Processor, images: Sequence[Image.Image], text: str) -> Self:
         """Run `processor` over `images`, each standing in the text as `text`."""
-        values = processor.reference(text=[text * len(images) + "\n"], images=list(images),
-                                     return_tensors="np")
+        values = processor.media(text=[text * len(images) + "\n"], images=list(images),
+                                 return_tensors="np")
         ids = np.asarray(values["input_ids"])
         arrays = {name: np.asarray(value) for name, value in values.items()
                   if name not in ("input_ids", "attention_mask")}
