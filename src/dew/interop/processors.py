@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from functools import cached_property
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Protocol, TypedDict, TypeGuard, Unpack
 
@@ -161,7 +162,8 @@ def _row_start(reference: HostProcessor) -> int | None:
 class Processor:
     """Runs a checkpoint's own processor on the host and arranges its outputs as native model inputs.
 
-    The checkpoint's processor does the resizing, normalization and
+    `reference` is the checkpoint's tokenizer. Media requests load and
+    retain its full processor, which owns resizing, normalization and
     special-token expansion. Dew arranges its outputs into row-aligned
     arrays; it does not reproduce the checkpoint's image preprocessing
     algorithms. Calling it with text, and optionally `images`, `audio` or
@@ -178,6 +180,25 @@ class Processor:
     record: Mapping[str, object]
     vocab_size: int
     source: str | None = None
+    directory: Path | None = None
+    """Where this process reads the files. Only `source` records their identity."""
+
+    @cached_property
+    def _media_reference(self) -> HostProcessor:
+        if self.directory is None:
+            raise ValueError("this source ships no media processor")
+        from transformers import AutoProcessor
+
+        options = {"backend": "pil"} if self.config.get("model_type") == "gemma3" else {}
+        return AutoProcessor.from_pretrained(str(self.directory), local_files_only=True, **options)
+
+    def media(self, *, images: Media | None = None,
+              **kwargs: Unpack[ProcessorCall]) -> Mapping[str, object]:
+        """Return the source's media fields before Dew aligns them to model rows."""
+        # An audio-only processor takes no images keyword at all.
+        if images is None:
+            return self._media_reference(**kwargs)
+        return self._media_reference(images=images, **kwargs)
 
     def __call__(self, text: str | Sequence[str], *, images: Media | None = None,
                  audio: Media | None = None, videos: Media | None = None,
@@ -208,11 +229,7 @@ class Processor:
             arguments["videos"] = videos
         if video_metadata is not None:
             arguments["video_metadata"] = video_metadata
-        # An audio-only processor takes no images keyword at all, so the
-        # absent one is left out of the call rather than passed as None.
-        if images is None:
-            return self._from_tensors(self.reference(**arguments))
-        return self._from_tensors(self.reference(images=images, **arguments))
+        return self._from_tensors(self.media(images=images, **arguments))
 
     def chat(self, messages: Sequence[Mapping[str, object]], *, add_generation_prompt: bool = True,
              **template_options: JSON) -> ModelInputs:
@@ -222,7 +239,14 @@ class Processor:
         `reasoning_effort` and `preserve_thinking`. Messages with media go
         through the same processor and numeric normalization as plain text.
         """
-        values = self.reference.apply_chat_template(
+        from dew.data.chat import ContentPart
+
+        media = any(isinstance(part, Mapping) and ContentPart.parse(part, "chat").needs_processor
+                    for message in messages for content in (message.get("content"),)
+                    if isinstance(content, Sequence) and not isinstance(content, str)
+                    for part in content)
+        reference = self._media_reference if media else self.reference
+        values = reference.apply_chat_template(
             messages, tokenize=True, return_dict=True, return_tensors="pt",
             add_generation_prompt=add_generation_prompt, **template_options)
         if not isinstance(values, Mapping):
@@ -600,5 +624,12 @@ class Processor:
         return _row_start(self.reference)
 
     def save_pretrained(self, directory: str | Path) -> None:
-        """Save the processor and tokenizer this object uses to `directory`."""
+        """Save the tokenizer and the source's unchanged media processor files."""
         self.reference.save_pretrained(str(directory))
+        if self.directory is not None:
+            # Copying keeps the source bytes and avoids loading optional media backends.
+            for pattern in ("*processor*.json", "chat_template.*", "chat_templates/*.jinja"):
+                for path in self.directory.glob(pattern):
+                    target = Path(directory) / path.relative_to(self.directory)
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_bytes(path.read_bytes())
