@@ -58,7 +58,7 @@ from ..hyper_connections import (
     expand_streams,
     first_stream,
 )
-from ..inputs import AttentionMetadata, LayerInputs, PredictionPhase
+from ..inputs import AttentionMetadata, LayerInputs, PredictionPhase, coordinates
 from ..kv_cache import KVCache
 from ..mixers import AttentionMixer, MixerBase, MixerContext
 from ..mixers.mamba2 import Mamba2Mixer
@@ -1460,7 +1460,7 @@ class CausalTransformer(nn.Module):
                 if segment_ids is not None:
                     valid = valid & (segment_ids[:, :-depth] == segment_ids[:, depth:])
             metadata = AttentionMetadata(
-                valid=valid,
+                coordinates=None if valid is None else coordinates(*valid.shape, valid=valid),
                 image_groups=None if image_groups is None else image_groups[:, depth:],
                 rotary_positions=None if rotary_positions is None else rotary_positions[:, depth:])
             hidden = block(hidden[:, :-1], embeds[:, depth:], train=train,
@@ -1501,8 +1501,10 @@ class CausalTransformer(nn.Module):
         state, prediction = self.mtp[depth].states(
             hidden, embeds, positions=positions, decode=decode,
             prediction_phase=prediction_phase if self.index_share_for_mtp_iteration else "ordinary",
-            attention_metadata=AttentionMetadata(valid=attention_mask,
-                                                 rotary_positions=rotary_positions))
+            attention_metadata=AttentionMetadata(
+                coordinates=None if attention_mask is None else coordinates(*attention_mask.shape,
+                                                                            valid=attention_mask),
+                rotary_positions=rotary_positions))
         return self._logits(state), prediction
 
     def token_embeddings(self, tokens):
@@ -1645,7 +1647,7 @@ class CausalTransformer(nn.Module):
           holds (`dew.nn.inputs.AttentionMetadata.max_segments`).
         """
         attention_metadata = self._attention_metadata(
-            tokens, decode, positions, attention_mask, image_groups, rotary_positions,
+            tokens, decode, positions, segment_ids, attention_mask, image_groups, rotary_positions,
             attention_pairwise_mask, attention_key_positions, media_mask, admitted, right_padded,
             max_segments)
         # The stack's entry and exit sit where the batch does, so neither the
@@ -1700,7 +1702,7 @@ class CausalTransformer(nn.Module):
                      reduce_fn=lambda _, value: value, init_fn=lambda: None)
         return hidden, prediction
 
-    def _attention_metadata(self, tokens, decode: bool, positions, attention_mask, image_groups,
+    def _attention_metadata(self, tokens, decode: bool, positions, segment_ids, attention_mask, image_groups,
                             rotary_positions, pairwise_mask, key_positions,
                             media_mask, admitted=None,
                             right_padded: bool = False,
@@ -1720,15 +1722,19 @@ class CausalTransformer(nn.Module):
             media_mask = None
         engram_ids = (None if self.engram is None
                       else self.engram_hashes(tokens, attention_mask, positions, decode, media_mask))
-        if (attention_mask is None and image_groups is None and rotary_positions is None
+        packed = segment_ids is not None or attention_mask is not None or right_padded
+        if (not packed and image_groups is None and rotary_positions is None
                 and pairwise_mask is None and key_positions is None and not self.hash_layers
-                and engram_ids is None and media_mask is None and admitted is None and max_segments is None):
+                and engram_ids is None and media_mask is None and admitted is None):
             return None
         return AttentionMetadata(
-            valid=attention_mask, image_groups=image_groups, rotary_positions=rotary_positions,
+            coordinates=coordinates(*tokens.shape[:2], segments=segment_ids, valid=attention_mask,
+                                    positions=positions, max_segments=max_segments, right_padded=right_padded)
+            if packed else None,
+            image_groups=image_groups, rotary_positions=rotary_positions,
             pairwise_mask=pairwise_mask, key_positions=key_positions,
             token_ids=tokens if self.hash_layers else None, engram_ids=engram_ids, media=media_mask,
-            admitted=admitted, right_padded=right_padded, max_segments=max_segments)
+            admitted=admitted)
 
     def looped(self, x, **stack):
         """Run the layer stack over `x` once, or as `loop` says: the layers before

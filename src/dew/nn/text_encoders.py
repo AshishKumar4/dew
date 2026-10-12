@@ -47,7 +47,7 @@ from dew.nn.attention import LayerNorm, RMSNorm
 from dew.nn.backbones.decoder_block import BlockWiring, DecoderBlock, GatedMLP
 from dew.nn.conv import Conv
 from dew.nn.flops import matching_lengths, patch_lengths
-from dew.nn.inputs import AttentionMetadata
+from dew.nn.inputs import AttentionMetadata, coordinates
 from dew.nn.mixers.attention import CausalSelfAttention
 from dew.nn.sharding import logical_axes
 from dew.registry import resolve_dtype
@@ -164,7 +164,7 @@ class CLIPTextTransformer(nn.Module):
         hidden_states = (self.token_embedding(input_ids)
                          + self.position_embedding(jnp.arange(length)))
         metadata = None if attention_mask is None else AttentionMetadata(
-            valid=jnp.asarray(attention_mask) != 0)
+            coordinates=coordinates(*input_ids.shape, valid=jnp.asarray(attention_mask) != 0))
         for layer in self.layers:
             hidden_states = layer(hidden_states, attention_metadata=metadata)
         hidden_states = self.final_layer_norm(hidden_states)
@@ -768,7 +768,9 @@ class T5EncoderTransformer(nn.Module):
         tables = [jnp.transpose(table(buckets), (2, 0, 1))[None] for table in self.relative_attention_bias]
         valid = None if attention_mask is None else jnp.asarray(attention_mask) != 0
         for index, layer in enumerate(self.layers):
-            metadata = AttentionMetadata(valid=valid, position_bias=tables[index % len(tables)])
+            metadata = AttentionMetadata(
+                coordinates=None if valid is None else coordinates(*valid.shape, valid=valid),
+                position_bias=tables[index % len(tables)])
             hidden_states = layer(hidden_states, train, attention_metadata=metadata)
         return self.dropout(self.final_norm(hidden_states), deterministic=not train)
 
