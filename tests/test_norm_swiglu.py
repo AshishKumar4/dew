@@ -214,9 +214,10 @@ def test_every_config_of_the_norm_kernels_holds_the_float64_gate(kernel, dtype, 
     for config in configs:
         with tuning.pinned({kernel: config}):
             actual = jax.jit(functools.partial(evaluated, functions[1]))((x, scale), seed)
+            # The factors this config's forward rounded, which its weight gradient sums.
+            coefficient = scale_coefficient(x, dtype, after_cast=True)
         try:
-            gated(("y", "x", "scale"), actual, reference, truth, seed,
-                  scale_coefficient(x, dtype, after_cast=True))
+            gated(("y", "x", "scale"), actual, reference, truth, seed, coefficient)
         except AssertionError as error:
             error.add_note(f"{kernel.__name__} at {config}")
             raise
