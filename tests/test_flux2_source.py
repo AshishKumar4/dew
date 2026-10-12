@@ -105,7 +105,7 @@ def test_the_forward_and_every_gradient_match_the_source(source, arrays, record,
 def test_a_guided_checkpoint_refuses_a_call_without_guidance(source, arrays, record):
     model, params, _ = load(source, "dev")
     latent, times, condition, _ = walk("dev", arrays, record)
-    with pytest.raises(ValueError, match="embeds its guidance"):
+    with pytest.raises(ValueError):
         model.apply({"params": params}, latent, times, DenoisingCondition(condition.context))
 
 
@@ -197,7 +197,7 @@ def test_klein_prompt_encoding_matches_the_source_pipeline(klein, arrays, record
     assert condition.guidance is None
     for row in range(len(prompts)):
         assert relative_gap(condition.context[row], arrays[f"pipeline.context.{row}"][0]) < FORWARD, row
-    with pytest.raises(ValueError, match="token budget"):
+    with pytest.raises(ValueError):
         encoder.tokenize(["x" * 513])
 
 

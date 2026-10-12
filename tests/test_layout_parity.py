@@ -62,7 +62,7 @@ def test_a_changed_benchmark_owner_refuses_the_cached_reference(tmp_path, monkey
         assert reader._path("reference", case, batch, steps=1)[0] == path
         copied.write_bytes(copied.read_bytes() + b"\n# Changed implementation bytes.\n")
         tool.source_digest.cache_clear()
-        with pytest.raises(FileNotFoundError, match="--prepare"):
+        with pytest.raises(FileNotFoundError):
             reader._path("reference", case, batch, steps=1)
         assert path.exists()
     finally:

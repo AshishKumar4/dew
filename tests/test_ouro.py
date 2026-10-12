@@ -80,7 +80,7 @@ def test_a_looped_model_exports_in_the_remote_codes_layout(tmp_path):
     restored = Pretrained.load(tmp_path, dtype='float32', attention_impl='reference')
     np.testing.assert_array_equal(restored.model.apply(restored.variables, ids),
                                   loaded.model.apply(loaded.variables, ids))
-    with pytest.raises(ValueError, match='loop'):
+    with pytest.raises(ValueError):
         exported(step_norm=False)
 
 

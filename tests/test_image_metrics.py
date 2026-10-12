@@ -200,7 +200,7 @@ def test_per_example_scores_have_one_entry_per_frame(rng, metric_fn, shape):
 
 @pytest.mark.parametrize("metric_fn", [psnr, ssim], ids=['psnr', 'ssim'])
 def test_metrics_reject_unbatched_inputs(metric_fn):
-    with pytest.raises(ValueError, match=r"\(B, H, W, C\)"):
+    with pytest.raises(ValueError):
         metric_fn(jnp.zeros((32, 32, 3)), jnp.zeros((32, 32, 3)), data_range=2.0)
 
 

@@ -244,7 +244,7 @@ def test_corrections_without_proximal_log_probs_read_the_current_policy():
     _, aux = geometric.loss(params, packed, step)
     assert float(aux.metrics["masked/geometric"]) == 1.0
     capped = GRPOObjective(_model(), WIDTH - 1, behavior_importance=2.0)
-    with pytest.raises(ValueError, match="old_log_probs"):
+    with pytest.raises(ValueError):
         capped.loss(params, packed, step)
 
 

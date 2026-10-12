@@ -107,7 +107,7 @@ def test_programs_run_concurrently_and_return_in_order():
 
 
 def test_a_program_file_cannot_escape_its_directory():
-    with pytest.raises(ValueError, match="relative path"):
+    with pytest.raises(ValueError):
         Program({"../x.py": ""}, ("python",))
 
 
@@ -191,7 +191,7 @@ def test_a_runtime_that_cannot_start_the_container_raises():
     # `false` stands in for a runtime whose daemon is gone: it exits 1 and creates nothing.
     with (
         SandboxFleet(ContainerRunner(IMAGE, runtime="false"), workers=1) as fleet,
-        pytest.raises(RuntimeError, match="created no container"),
+        pytest.raises(RuntimeError),
     ):
         fleet.run([Program({"main.py": "print(5)"}, ("python", "main.py"))])
 

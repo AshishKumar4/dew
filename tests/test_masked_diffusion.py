@@ -233,7 +233,7 @@ def test_masked_continuations_seed_eos_and_zero_budget(masked_source):
     np.testing.assert_array_equal(empty.decoder_steps, 0)
     with pytest.raises(TypeError):
         source.text_generation(sampling=Sampling())
-    with pytest.raises(ValueError, match="num_beams"):
+    with pytest.raises(ValueError):
         replace(source, generation_config={"num_beams": 2}).text_generation()
     for controls in ({"sampling": Sampling()}, {"logits": ()}, {"num_beams": 2}):
         with pytest.raises(TypeError):

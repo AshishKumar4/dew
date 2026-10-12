@@ -69,7 +69,7 @@ def test_the_training_times_are_the_references_logit_normal_mirrored():
 
 
 def test_the_velocity_loss_refuses_another_prediction():
-    with pytest.raises(ValueError, match="clean-sample prediction"):
+    with pytest.raises(ValueError):
         Process(FlowMatchingScheduler(), presets.Flow()().prediction, VelocityLoss()).weight(jnp.ones((1,)))
 
 

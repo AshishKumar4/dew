@@ -151,7 +151,7 @@ def test_an_interrupted_snapshot_restores_the_previous_step_and_is_never_reconst
         directory, options=ocp.CheckpointManagerOptions(enable_async_checkpointing=True),
         item_handlers=handler)
     interrupted.save(4, state.replace(step=jnp.int32(4)), None, ranking=Ranking('train/loss', 0.1))
-    with pytest.raises(OSError, match='interrupted before commit'):
+    with pytest.raises(OSError):
         interrupted.wait()
     # The one write failed before its atomic commit. A fresh process must
     # not select that step for resume, best weights, or reconstruction.

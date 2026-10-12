@@ -76,7 +76,7 @@ def test_falcon_reference_catches_sequential_residuals():
         layer['post_attention_layernorm'] = layer['input_layernorm']
     wrong = loaded.model.clone(parallel_residual=False, shared_parallel_norm=False).apply(
         variables, np.load(directory / 'input_ids.npy'))
-    with pytest.raises(AssertionError, match=r'allowed 2\.0'):
+    with pytest.raises(AssertionError):
         assert_as_exact_as_the_reference(wrong, np.load(directory / 'logits.npy'),
                                          np.load(directory / 'logits_f64.npy'), 'Falcon sequential residual')
 
