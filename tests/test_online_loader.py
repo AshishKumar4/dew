@@ -156,8 +156,9 @@ def test_a_web_image_flow_trains_on_the_good_images_and_counts_each_drop_by_reas
 def test_fetched_bytes_published_once_train_and_resume_exactly_after_every_url_dies(tmp_path):
     """A published fetch is the bytes the run reads: with every url gone, a run over the cached
     generation trains on the original pixels, and resuming from a saved position continues it
-    exactly."""
-    table = web_table(tmp_path)
+    exactly. A url that fails transiently would be fetched again, so it keeps a table from
+    publishing; this one fails only permanently."""
+    table = [row for row in web_table(tmp_path) if not str(row["url"]).endswith("gone.png")]
     generation = publish(Pipeline(Memory(table)).map(images.fetch(retries=0)), Cache(str(tmp_path / "cache")),
                          read="indexed", loading=READ)
     originals = {row["label"]: np.asarray(Image.open(row["url"].removeprefix("file://")).convert("RGB"))
