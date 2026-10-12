@@ -84,6 +84,11 @@ class _Picks(dict):
         return None
 
 
+# tokamax's `get_bound_args` for a lowered program: its annotation's ParamSpec,
+# for a callable's arguments, is one pyright cannot solve without any.
+_bound_args: Callable[[jax.stages.Lowered], tuple[tokamax.BoundArguments, ...]] = (
+    tokamax.autotuning.get_bound_args)
+
 _PICKS: dict[tuple[tokamax.Op, str], _Picks] = {}
 _LOADED: set[str] = set()
 _LOADING = threading.Lock()
@@ -315,7 +320,7 @@ def tune(lowered: jax.stages.Lowered) -> bool:
     picks changed, so the caller lowers again to compile with them."""
     if not generation.triton_runs():
         return False
-    found = [(op, op.keyed(ba)) for ba in tokamax.autotuning.get_bound_args(lowered)
+    found = [(op, op.keyed(ba)) for ba in _bound_args(lowered)
              if isinstance(op := ba.op, KernelOp)]
     if not found:
         return False
