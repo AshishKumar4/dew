@@ -12,6 +12,7 @@ Read `CONTRIBUTING.md` for design, reference parity, code, tests, and writing st
 - Fix a failure where its cause lives, in the shared piece, not in the script or test that hit it, and remove the special case or copy that allowed it.
 - Compose on the existing primitive. Before adding code, find the piece that already does the job; one concept has one implementation and one source of truth (for example `GpuTarget` for device facts and `KERNELS` for kernel choices).
 - Duplication is banned everywhere, not only in `src/`: a dependency list, version pin, table, flag set, test list, policy or algorithm exists in one place. CI workflows, installers, armada recipes, private tooling and docs read or generate from that one owner. A second hand-kept copy is a bug, and a head that adds one does not land.
+- Code composes on itself: one path per job, no parallel implementations, and as few branches and special cases as the problem allows. When a design grows branches, step back and look at it from another angle (the data, the caller, the hardware, the math); a cleaner formulation usually removes them.
 - Put optimizations in the shared core so every model family and backend benefits. Keep model- or hardware-specific code small and say why it cannot be general.
 - Activations cross layer-to-kernel interfaces as `[batch, time, heads, head_dim]`. A kernel adapts to that layout; layer code does not permute activations for a kernel. Other tensors keep their own meaning.
 
