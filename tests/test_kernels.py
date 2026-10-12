@@ -187,7 +187,7 @@ def test_tokamax_takes_the_calls_it_takes_before_flash(monkeypatch, generation, 
 
 
 WHEEL = ("sm80", "sm90", "sm120")
-"""The architectures dew_flash_attn 0.2.0 reports."""
+"""The architectures dew_flash_attn 0.3.0 reports."""
 
 BEFORE_HOPPER = ("sm80", "sm120")
 """The architectures dew_flash_attn 0.1.1 reports, without FlashAttention-3."""
