@@ -110,18 +110,26 @@ def test_the_kkt_solve_kernel_inverts_flas_matrix(dtype, shape):
     assert relative(got, want) < (2e-2 if dtype == jnp.bfloat16 else 2e-3)
 
 
+def cumulated_decay(key, batch, length, value_heads, width=None):
+    """A base-2 decay cumulated within each 64-token chunk, per head `[B, T, HV]` or per key dimension
+    `[B, T, HV, K]` (fla's gk)."""
+    shape = (batch, length, value_heads) + (() if width is None else (width,))
+    step = -jnp.exp(jax.random.normal(key, shape) - 3.0) * fla_gdn.RCP_LN2
+    return jnp.cumsum(step.reshape(batch, length // 64, 64, *shape[2:]), axis=2).reshape(shape)
+
+
+@pytest.mark.parametrize("per_key", [False, True])
 @pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float32])
 @pytest.mark.parametrize("shape", [(1, 192, 2, 2, 64, 64), (1, 128, 1, 2, 128, 64)])
-def test_the_h_kernel_is_flas_recurrence(dtype, shape):
+def test_the_h_kernel_is_flas_recurrence(dtype, shape, per_key):
     """fla's fwd_h, the memory each chunk enters, the corrected values and the final memory, against
-    a scan over chunks with the same roundings."""
+    a scan over chunks with the same roundings: a decay per head, or per key dimension (USE_GK)."""
     batch, length, key_heads, value_heads, width, columns = shape
     keys = jax.random.split(jax.random.key(8), 5)
     k = l2norm(jax.random.normal(keys[0], (batch, length, key_heads, width))).astype(dtype)
     w = (0.1 * jax.random.normal(keys[1], (batch, length, value_heads, width))).astype(dtype)
     u = jax.random.normal(keys[2], (batch, length, value_heads, columns)).astype(dtype)
-    step = -jnp.exp(jax.random.normal(keys[3], (batch, length, value_heads)) - 3.0) * fla_gdn.RCP_LN2
-    g = jnp.cumsum(step.reshape(batch, length // 64, 64, value_heads), axis=2).reshape(step.shape)
+    g = cumulated_decay(keys[3], batch, length, value_heads, width if per_key else None)
     h0 = 0.1 * jax.random.normal(keys[4], (batch, value_heads, width, columns))
     got = fla_gdn.chunk_fwd_h(k, w, u, g, h0, interpret=INTERPRETED)
     want = support.reference_h(k, w, u, g, h0)
@@ -130,18 +138,19 @@ def test_the_h_kernel_is_flas_recurrence(dtype, shape):
         assert relative(mine, theirs) < (2e-2 if dtype == jnp.bfloat16 else 1e-5), name
 
 
+@pytest.mark.parametrize("per_key", [False, True])
 @pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float32])
 @pytest.mark.parametrize("shape", [(1, 192, 2, 2, 64, 64), (1, 128, 1, 2, 128, 64)])
-def test_the_dhu_kernel_is_flas_reverse_recurrence(dtype, shape):
+def test_the_dhu_kernel_is_flas_reverse_recurrence(dtype, shape, per_key):
     """fla's bwd_dhu: the memory gradient each chunk leaves into, the initial memory's gradient and
-    the corrected values' full gradient, against a reverse scan with the same roundings."""
+    the corrected values' full gradient, against a reverse scan with the same roundings: a decay per
+    head, or per key dimension (USE_GK)."""
     batch, length, key_heads, value_heads, width, columns = shape
     keys = jax.random.split(jax.random.key(9), 7)
     q = l2norm(jax.random.normal(keys[0], (batch, length, key_heads, width))).astype(dtype)
     k = l2norm(jax.random.normal(keys[1], (batch, length, key_heads, width))).astype(dtype)
     w = (0.1 * jax.random.normal(keys[2], (batch, length, value_heads, width))).astype(dtype)
-    step = -jnp.exp(jax.random.normal(keys[3], (batch, length, value_heads)) - 3.0) * fla_gdn.RCP_LN2
-    g = jnp.cumsum(step.reshape(batch, length // 64, 64, value_heads), axis=2).reshape(step.shape)
+    g = cumulated_decay(keys[3], batch, length, value_heads, width if per_key else None)
     dht = 0.1 * jax.random.normal(keys[4], (batch, value_heads, width, columns))
     do = jax.random.normal(keys[5], (batch, length, value_heads, columns)).astype(dtype)
     dv = jax.random.normal(keys[6], (batch, length, value_heads, columns)).astype(dtype)

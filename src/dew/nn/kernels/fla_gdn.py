@@ -366,14 +366,17 @@ def _gated_state_write(key, gated, *, exact: bool):
     return update
 
 
-def _h_kernel(k_ref, u_ref, w_ref, g_ref, h0_ref, h_ref, corrected_ref, ht_ref, *, chunk: int, exact: bool):
+def _h_kernel(k_ref, u_ref, w_ref, g_ref, h0_ref, h_ref, corrected_ref, ht_ref, *, chunk: int, exact: bool,
+              per_key: bool = False):
     """fla's `chunk_gated_delta_rule_fwd_kernel_h_blockdim64` (fla/ops/common/chunk_delta_h.py:50-
     343) for one row's head and `BV` value columns, its chunks in order. The memory is fp32 in
     64-key slices; each chunk stores the memory it enters in `h`'s dtype, then the corrected values
     `u - w h` (fla's `v_new`; `h` cast to `w`'s dtype for the product), gates them by
     `exp2(g_last - g)` and the memory by `exp2(g_last)`, casts the gated values to `k`'s dtype and
     adds `k^T v` to the memory. Narrow inputs keep the gated-value residual as a second bf16/fp16
-    part on chip: h remains fp32, while h/corrected HBM outputs keep fla's original storage dtypes."""
+    part on chip: h remains fp32, while h/corrected HBM outputs keep fla's original storage dtypes.
+    `per_key` is fla's USE_GK branch: `g_ref` holds a decay per key dimension `[T, K]`, which gates
+    the memory's rows by `exp2(g_last)` and not the values, whose keys carry their own decay."""
     length, width = k_ref.shape
     slices = width // 64
     state = [h0_ref[pl.ds(i * 64, 64), :].astype(jnp.float32) for i in range(slices)]
@@ -386,6 +389,11 @@ def _h_kernel(k_ref, u_ref, w_ref, g_ref, h0_ref, h_ref, corrected_ref, ht_ref, 
                         for i in range(slices))
         corrected = u_ref[rows, :].astype(jnp.float32) - predicted
         corrected_ref[rows, :] = corrected.astype(corrected_ref.dtype)
+        if per_key:
+            last = n * chunk + chunk - 1
+            return [state[i] * jnp.exp2(g_ref[last, pl.ds(i * 64, 64)].astype(jnp.float32))[:, None]
+                    + _gated_state_write(k_ref[rows, pl.ds(i * 64, 64)], corrected, exact=exact)
+                    for i in range(slices)]
         gate = g_ref[rows].astype(jnp.float32)
         last = g_ref[n * chunk + chunk - 1].astype(jnp.float32)
         gated = corrected * jnp.exp2(last - gate)[:, None]
@@ -403,9 +411,10 @@ def chunk_fwd_h(k, w, u, g, h0, *, chunk: int = 64, bv: int | None = None,
     """`(h, corrected, final)`: the memory each chunk enters `[B, T // chunk, HV, K, V]` in `k`'s dtype,
     the corrected values `[B, T, HV, V]` in `u`'s and the final memory `[B, HV, K, V]` fp32: fla's
     `chunk_gated_delta_rule_fwd_h` (chunk_delta_h.py:672-737) with an initial state. `k` `[B, T, H,
-    K]`, `w` `[B, T, HV, K]`, `u` `[B, T, HV, V]`, `g` the base-2 cumulated decay `[B, T, HV]`, `h0`
-    `[B, HV, K, V]` fp32. `K` a multiple of 64 (fla's blockdim64 kernel takes up to 256). On an
-    A100 fla's autotuner chose BV 32, 4 warps, 3 stages (c53)."""
+    K]`, `w` `[B, T, HV, K]`, `u` `[B, T, HV, V]`, `g` the base-2 cumulated decay `[B, T, HV]`, or
+    per key dimension `[B, T, HV, K]` (fla's `gk`, Kimi's delta attention), `h0` `[B, HV, K, V]` fp32.
+    `K` a multiple of 64 (fla's blockdim64 kernel takes up to 256). On an A100 fla's autotuner chose
+    BV 32, 4 warps, 3 stages (c53)."""
     from jax.experimental.pallas import triton as plgpu
 
     config = kernel_config("chunk_fwd_h", _rule_shape(k, u, chunk), k.dtype,
@@ -435,13 +444,15 @@ def chunk_fwd_h(k, w, u, g, h0, *, chunk: int = 64, bv: int | None = None,
         return bh // value_heads, 0, bh % value_heads, 0, i_v
 
     chunks = length // chunk
+    per_key = g.ndim == 4
     return pl.pallas_call(
-        functools.partial(_h_kernel, chunk=chunk, exact=interpret),
+        functools.partial(_h_kernel, chunk=chunk, exact=interpret, **({"per_key": True} if per_key else {})),
         grid=(columns // bv, batch * value_heads),
         in_specs=[pl.BlockSpec((None, length, None, width), keyed),
                   pl.BlockSpec((None, length, None, bv), valued),
                   pl.BlockSpec((None, length, None, width), whole),
-                  pl.BlockSpec((None, length, None), gated),
+                  pl.BlockSpec((None, length, None, width), whole) if per_key
+                  else pl.BlockSpec((None, length, None), gated),
                   pl.BlockSpec((None, None, width, bv), state)],
         out_specs=[pl.BlockSpec((None, chunks, None, width, bv), states),
                    pl.BlockSpec((None, length, None, bv), valued),
@@ -455,12 +466,14 @@ def chunk_fwd_h(k, w, u, g, h0, *, chunk: int = 64, bv: int | None = None,
 
 
 def _dhu_kernel(q_ref, k_ref, w_ref, g_ref, dht_ref, do_ref, dv_ref, dh_ref, dh0_ref, dv2_ref, *,
-                chunk: int, scale: float, exact: bool):
+                chunk: int, scale: float, exact: bool, per_key: bool = False):
     """fla's `chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64` (chunk_delta_h.py:359-669) for one
     row's head and `BV` value columns, chunks in reverse. Each stores the gradient of the memory it
     leaves into, `dh`, then `dv2 = dv + (k dh) exp2(g_last - g)` (dh cast to k's dtype), then
     `dh = dh exp2(g_last) + scale (q exp2(g))^T do - w^T dv2`, the query product in fp32 and the w
-    product with dv2 cast to w's dtype, as fla's dtypes fall."""
+    product with dv2 cast to w's dtype, as fla's dtypes fall. `per_key` is fla's USE_GK branch:
+    `g_ref` `[T, K]` decays the gradient's rows by `exp2(g_last)`, and neither `dv2` nor the
+    queries, which carry their own decay, are gated; the query product stays in q's dtype."""
     length, width = k_ref.shape
     slices = width // 64
     grad = [dht_ref[pl.ds(i * 64, 64), :].astype(jnp.float32) for i in range(slices)]
@@ -471,6 +484,9 @@ def _dhu_kernel(q_ref, k_ref, w_ref, g_ref, dht_ref, do_ref, dv_ref, dh_ref, dh0
         rows = pl.ds(n * chunk, chunk)
         for i in range(slices):
             dh_ref[n, pl.ds(i * 64, 64), :] = grad[i].astype(dh_ref.dtype)
+        if per_key:
+            return _dhu_per_key_step(q_ref, k_ref, w_ref, g_ref, do_ref, dv_ref, dv2_ref, grad, n, rows,
+                                     chunk=chunk, scale=scale, exact=exact)
         gate = g_ref[rows].astype(jnp.float32)
         last = g_ref[n * chunk + chunk - 1].astype(jnp.float32)
         out_grad = do_ref[rows, :]
@@ -493,13 +509,36 @@ def _dhu_kernel(q_ref, k_ref, w_ref, g_ref, dht_ref, do_ref, dv_ref, dh_ref, dh0
         dh0_ref[pl.ds(i * 64, 64), :] = grad[i].astype(dh0_ref.dtype)
 
 
+def _dhu_per_key_step(q_ref, k_ref, w_ref, g_ref, do_ref, dv_ref, dv2_ref, grad, n, rows, *, chunk: int,
+                      scale: float, exact: bool):
+    """One chunk of `_dhu_kernel`'s USE_GK branch: `dv2 = dv + k dh`, `dh = dh exp2(g_last)[:, None] +
+    scale q^T do - w^T dv2`."""
+    slices = len(grad)
+    out_grad = do_ref[rows, :]
+    dv = sum(_dot(k_ref[rows, pl.ds(i * 64, 64)], grad[i].astype(k_ref.dtype), exact=exact)
+             for i in range(slices))
+    dv = dv + dv_ref[rows, :].astype(jnp.float32)
+    dv2_ref[rows, :] = dv.astype(dv2_ref.dtype)
+    last = n * chunk + chunk - 1
+
+    def moved(i):
+        read = q_ref[rows, pl.ds(i * 64, 64)]
+        written = w_ref[rows, pl.ds(i * 64, 64)]
+        return (_dot(read.T, out_grad.astype(read.dtype), exact=exact) * scale
+                - _dot(written.T, dv.astype(written.dtype), exact=exact))
+
+    return [grad[i] * jnp.exp2(g_ref[last, pl.ds(i * 64, 64)].astype(jnp.float32))[:, None] + moved(i)
+            for i in range(slices)]
+
+
 def chunk_bwd_dhu(q, k, w, g, dht, do, dv, *, scale: float, chunk: int = 64, bv: int | None = None,
                   warps: int | None = None, stages: int | None = None, interpret: bool = False):
     """`(dh, dh0, dv2)`: the gradient of the memory each chunk leaves into `[B, T // chunk, HV, K, V]`
     in `q`'s dtype, of the initial memory `[B, HV, K, V]` fp32, and the corrected values' full
     gradient `[B, T, HV, V]` in `dv`'s: fla's `chunk_gated_delta_rule_bwd_dhu` (chunk_delta_h.py:740-
     794). `dht` `[B, HV, K, V]` fp32 is the final memory's gradient and `dv` the corrected values'
-    from the output alone (`chunk_bwd_dv_local`). fla's A100 choice: BV 32, 4 warps, 3 stages (c53)."""
+    from the output alone (`chunk_bwd_dv_local`); `g` `[B, T, HV]`, or `[B, T, HV, K]` per key
+    dimension (fla's `gk`). fla's A100 choice: BV 32, 4 warps, 3 stages (c53)."""
     from jax.experimental.pallas import triton as plgpu
 
     config = kernel_config("chunk_bwd_dhu", _rule_shape(k, do, chunk), k.dtype,
@@ -532,11 +571,14 @@ def chunk_bwd_dhu(q, k, w, g, dht, do, dv, *, scale: float, chunk: int = 64, bv:
     keys = pl.BlockSpec((None, length, None, width), keyed)
     values = pl.BlockSpec((None, length, None, bv), valued)
     memory = pl.BlockSpec((None, None, width, bv), state)
+    per_key = g.ndim == 4
     return pl.pallas_call(
-        functools.partial(_dhu_kernel, chunk=chunk, scale=scale, exact=interpret),
+        functools.partial(_dhu_kernel, chunk=chunk, scale=scale, exact=interpret,
+                          **({"per_key": True} if per_key else {})),
         grid=(columns // bv, batch * value_heads),
         in_specs=[keys, keys, pl.BlockSpec((None, length, None, width), whole),
-                  pl.BlockSpec((None, length, None), gated), memory, values, values],
+                  pl.BlockSpec((None, length, None, width), whole) if per_key
+                  else pl.BlockSpec((None, length, None), gated), memory, values, values],
         out_specs=[pl.BlockSpec((None, chunks, None, width, bv), states), memory, values],
         out_shape=[jax.ShapeDtypeStruct((batch, chunks, value_heads, width, columns), q.dtype),
                    jax.ShapeDtypeStruct((batch, value_heads, width, columns), jnp.float32),
