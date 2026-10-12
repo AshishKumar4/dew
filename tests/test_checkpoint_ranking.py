@@ -485,3 +485,15 @@ def test_tile_head_invalidates_validation_trace_for_the_same_batch_shape():
     objective.model = objective.model.clone(remat=None)
     Evaluation.run(objective, variables, reader, key=jax.random.key(0), loss=True)
     assert objective.traces == 3
+    # So does the context the model reads as it traces (`trace_context`): the
+    # layout's rules and the pipeline's microbatch count, and returning to one
+    # finds its program again.
+    from flax import linen as nn
+
+    from dew.nn.sharding import DEFAULT_RULES, pipeline_microbatches
+    with nn.logical_axis_rules((("vocab", None), *DEFAULT_RULES)):
+        Evaluation.run(objective, variables, reader, key=jax.random.key(0), loss=True)
+    with pipeline_microbatches(2):
+        Evaluation.run(objective, variables, reader, key=jax.random.key(0), loss=True)
+    Evaluation.run(objective, variables, reader, key=jax.random.key(0), loss=True)
+    assert objective.traces == 5
