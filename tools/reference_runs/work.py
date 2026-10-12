@@ -20,7 +20,7 @@ from flax import linen as nn
 
 from dew.objectives.base import Batch, Objective
 from dew.registry import to_record
-from dew.telemetry.records import WorkloadWork
+from dew.telemetry.workload import WorkloadWork
 
 
 def measure(objective: Objective, batch: Batch) -> WorkloadWork:
