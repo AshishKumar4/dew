@@ -526,6 +526,23 @@ def _per_feature(scales: jax.Array, ndim: int, batch: int, feature: int, feature
     return (repeated if batch < feature else repeated.T).reshape(shape)
 
 
+def _widened(operands, preferred: jax.typing.DTypeLike | None) -> tuple:
+    """`operands` with each float array narrower than `preferred` widened to
+    it, which holds its values exactly; a quantized weight passes as it is."""
+    if preferred is None:
+        return tuple(operands)
+    wide = jnp.dtype(preferred)
+    return tuple(operand.astype(wide) if isinstance(operand, jax.Array | np.ndarray)
+                 and jnp.issubdtype(operand.dtype, jnp.floating) and operand.dtype.itemsize < wide.itemsize
+                 else operand for operand in operands)
+
+
+def _honoured(out: jax.Array, preferred: jax.typing.DTypeLike | None, out_sharding) -> jax.Array:
+    """A quantized product in the result dtype and sharding its call asked for."""
+    out = out if preferred is None else out.astype(preferred)
+    return out if out_sharding is None else jax.lax.with_sharding_constraint(out, out_sharding)
+
+
 def _real(*dtypes: jax.typing.DTypeLike) -> bool:
     """Whether no dtype is complex; Qwix quantizes real values only."""
     return not any(jnp.issubdtype(dtype, jnp.complexfloating) for dtype in dtypes)
@@ -791,49 +808,55 @@ def _providers() -> tuple[type, type]:
 
     class ComplexInFloat(qwix.QuantizationProvider):
         """Passes a matmul with a complex operand through unquantized, and
-        refuses by name a quantized one whose call asks for what Qwix 0.1.8
-        drops: an accumulation precision or result dtype (both providers'
-        dots and einsums), or an output sharding (all but the serving
-        dot), qwix/_src/providers/qt.py:96-97,130-132 and ptq.py:177-180,244."""
+        honours the call's contract on a quantized one, which Qwix 0.1.8
+        drops (qwix/_src/providers/qt.py:96-97,130-132, ptq.py:177-180,244):
+        a result dtype by widening the operands to it, exact for the
+        narrower floats it accumulates, and an output sharding by
+        constraining the result where the provider drops it. An accumulation
+        precision past the default has no such form and is refused by name."""
 
         keeps_out_sharding: ClassVar[bool] = False
 
-        def _refuse_dropped(self, op: str, precision, preferred_element_type, out_sharding) -> None:
+        def _quantizes(self, op: str, precision) -> bool:
             rule, _ = self._get_current_rule_and_op_id(op, only_rule=True)
             if rule is None or rule.weight_qtype is None:
-                return
-            asked = {"precision": not asks_default_precision(precision),
-                     "preferred_element_type": preferred_element_type is not None,
-                     "out_sharding": out_sharding is not None and not (
-                         op == "dot_general" and self.keeps_out_sharding)}
-            dropped = [name for name, held in asked.items() if held]
-            if dropped:
-                raise ValueError(f"a quantized {op} at {rule.module_path!r} asks for {', '.join(dropped)}, "
-                                 "which Qwix's quantized matmul drops; leave the matmul out of the "
+                return False
+            if not asks_default_precision(precision):
+                raise ValueError(f"a quantized {op} at {rule.module_path!r} asks for precision {precision}, "
+                                 "which Qwix's quantized matmul does not take; leave the matmul out of the "
                                  "quantization patterns or drop the request")
+            return True
 
         def dot_general(self, lhs, rhs, dimension_numbers, precision=None,
                         preferred_element_type=None, *, out_sharding=None):
-            if _real(lhs.dtype, rhs.dtype):
-                self._refuse_dropped("dot_general", precision, preferred_element_type, out_sharding)
+            if not _real(lhs.dtype, rhs.dtype):
+                return jax.lax.dot_general(lhs, rhs, dimension_numbers, precision=precision,
+                                           preferred_element_type=preferred_element_type,
+                                           out_sharding=out_sharding)
+            if not self._quantizes("dot_general", precision):
                 return super().dot_general(lhs, rhs, dimension_numbers, precision,
                                            preferred_element_type, out_sharding=out_sharding)
-            return jax.lax.dot_general(lhs, rhs, dimension_numbers, precision=precision,
-                                       preferred_element_type=preferred_element_type,
-                                       out_sharding=out_sharding)
+            kept = out_sharding if self.keeps_out_sharding else None
+            out = super().dot_general(*_widened((lhs, rhs), preferred_element_type), dimension_numbers,
+                                      out_sharding=kept)
+            return _honoured(out, preferred_element_type, None if kept is not None else out_sharding)
 
         def einsum(self, einsum_str, *operands, **kwargs):
-            if _real(*(operand.dtype for operand in operands)):
-                self._refuse_dropped("einsum", kwargs.get("precision"), kwargs.get("preferred_element_type"),
-                                     kwargs.get("out_sharding"))
+            if not _real(*(operand.dtype for operand in operands)):
+                return jnp.einsum(einsum_str, *operands, **kwargs)
+            if not self._quantizes("einsum", kwargs.get("precision")):
                 return super().einsum(einsum_str, *operands, **kwargs)
-            return jnp.einsum(einsum_str, *operands, **kwargs)
+            preferred = kwargs.pop("preferred_element_type", None)
+            out_sharding = kwargs.pop("out_sharding", None)
+            kwargs.pop("precision", None)
+            out = super().einsum(einsum_str, *_widened(operands, preferred), **kwargs)
+            return _honoured(out, preferred, out_sharding)
 
     class QtProvider(group_scaled, ComplexInFloat, _grouped_convolution_gradient()):
         pass
 
     class PtqProvider(group_scaled, ComplexInFloat, qwix.PtqProvider):
-        keeps_out_sharding: ClassVar[bool] = True
+        keeps_out_sharding: ClassVar[bool] = True  # ptq.py:180 passes it on
 
         def __init__(self, rules: Sequence[object]) -> None:
             super().__init__(
