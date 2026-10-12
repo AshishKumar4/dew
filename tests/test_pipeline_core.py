@@ -445,6 +445,28 @@ def test_a_cached_indexed_root_is_cut_into_disjoint_shares_that_repeat():
     assert all(sorted(rows) == sorted(list(set(rows)) * 2) for rows in read)
 
 
+def test_a_per_share_position_resumes_against_the_same_rows_cached_elsewhere():
+    """The saved plan names a cache by the rows it serves, so a per-share
+    position saved with the cache in one place resumes with it in another."""
+    def reader():
+        cached = Pipeline(source(8)).map(Shift(1), identity="shift@1").cache(Cache(f"memory://{uuid4().hex}"))
+        return compile(cached.batch(2), loading=READ).train(DataPartition())
+
+    saved = reader()
+    try:
+        take(saved, 1)
+        state = saved.get_state()
+        expected = take(saved, 2)
+    finally:
+        saved.close()
+    resumed = reader()
+    try:
+        resumed.set_state(state)
+        assert take(resumed, 2) == expected
+    finally:
+        resumed.close()
+
+
 def test_a_limit_counts_the_whole_order_and_a_prefetch_never_moves_the_share_cut():
     """24 records with prefetch(4).take(12) train on the same 12 records on one
     share or two."""
