@@ -82,16 +82,20 @@ def _rule(dtype: jnp.dtype) -> Tile:
 
 
 def _tiles(dtype: jnp.dtype, staged: Callable[[Tile], int]) -> set[Tile]:
-    """Every tile the tuner may measure: the ones an A100 sweep found
-    fastest lie inside, and a tile whose staged operands overflow the GPU's
-    shared memory is left out. `staged` counts the elements one depth step
-    loads, and Pallas Triton's pipeline holds `stages - 1` such steps: an
-    A100 refuses exactly that many bytes."""
-    limit = generation.gpu_target().shared_limit or 99 * 1024
+    """Every tile the tuner may measure: the ones the A100 and H100 sweeps
+    found fastest lie inside, and a tile whose staged operands overflow the
+    GPU's shared memory is left out. `staged` counts the elements one depth
+    step loads. Pallas Triton's pipeline holds `stages - 1` such steps, and
+    on Hopper `stages` where it pipelines a wgmma, which reads one step while
+    the next loads; an A100 and an H100 refuse exactly those bytes, so a
+    Hopper tile is sized for the larger."""
+    target = generation.gpu_target()
+    limit = target.shared_limit or 99 * 1024
+    held = 0 if target.generation == 'sm90' else 1
     width = jnp.dtype(dtype).itemsize
     tiles = (Tile(*shape) for shape in itertools.product((64, 128, 256), (128, 256), (32, 64, 128),
                                                          (4, 8), (2, 3, 4)))
-    return {tile for tile in tiles if staged(tile) * width * (tile.stages - 1) <= limit}
+    return {tile for tile in tiles if staged(tile) * width * (tile.stages - held) <= limit}
 
 
 def _sizes(specs: list[jax.ShapeDtypeStruct], seed: int, rows: int) -> jax.Array:
