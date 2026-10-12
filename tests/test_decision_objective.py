@@ -274,8 +274,13 @@ def test_a_bucketed_stream_cuts_each_batch_just_past_its_longest_row():
     def read(**fields):
         objective = DecisionObjective(tiny_backbone(), tokenizer=TOKENIZER, specials=SPECIALS, layout=LAYOUT,
                                       shuffle_options=False, **fields)
-        return objective, list(itertools.islice(load(DecisionRecipe(source=rows), batch=2, read="memory",
-            objective=objective.data()).train(DataPartition()), 64))
+        data = load(DecisionRecipe(source=rows), batch=2, read="memory", objective=objective.data())
+        stream = data.train(DataPartition())
+        try:
+            return objective, [{name: np.array(value, copy=True) for name, value in batch.items()}
+                               for batch in itertools.islice(stream, 64)]
+        finally:
+            stream.close()
 
     def held(batches):
         return sorted(tuple(row[valid]) for batch in batches for row, valid
@@ -283,7 +288,9 @@ def test_a_bucketed_stream_cuts_each_batch_just_past_its_longest_row():
 
     plain, whole = read()
     bucketed, cut = read(bucket=8)
-    assert bucketed.inputs is None
+    assert bucketed.inputs.sample.key == "tokens"
+    assert bucketed.inputs.sample.shape == (LAYOUT.max_len,)
+    assert bucketed.inputs.sample.variable_axes == (0,)
     for batch in cut:
         size, longest = batch["tokens"].shape[1], int(np.sum(batch["valid"], axis=1).max())
         assert size % 8 == 0 and longest <= size < longest + 8

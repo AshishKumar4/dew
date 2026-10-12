@@ -338,12 +338,13 @@ SECTIONS = {function.__name__: function for function in
 
 def offline(out):
     """Serve the Hub names the cells read from small fixtures, without the network."""
-    import datasets
-    from PIL import Image
-    from huggingface_hub import HfApi
     from types import SimpleNamespace
 
-    import dew.data.text
+    import datasets
+    import huggingface_hub
+    from huggingface_hub import HfApi
+    from PIL import Image
+
     import dew.interop.hub as hub
     from dew.data import ByteTokenizer
     from dew.decision import Decide
@@ -353,7 +354,7 @@ def offline(out):
 
     os.environ["XDG_CACHE_HOME"] = str(out / "cache")
     images = [Image.new("RGB", (32, 32), (255, 0, 255))] * 320
-    tables = {"winglian/tiny-shakespeare": {"text": ["dew trains jax models. " * 100] * 4},
+    tables = {"winglian/tiny-shakespeare": {"text": ["token5 token7 token9 token11 " * 100] * 4},
               "uoft-cs/cifar10": {"img": images, "label": [0] * len(images)}}
     builder = datasets.load_dataset_builder
     builders = {}
@@ -370,10 +371,14 @@ def offline(out):
         SimpleNamespace(sha="offline-fixture") if repo in builders else info(self, repo, **options))
     datasets.load_dataset_builder = lambda repo, **options: (
         builders[repo] if repo in builders else builder(repo, **options))
-    # One tiny decoder, which reads bytes, stands in for each the cells load.
     decoders = {"Qwen/Qwen3-0.6B", "HuggingFaceTB/SmolLM2-135M-Instruct"}
-    tokenizer_for = dew.data.text.tokenizer_for
-    dew.data.text.tokenizer_for = lambda name: tokenizer_for("byte" if name in decoders else name)
+    # Its 256 word ids fit the decoder fixture, with distinct targets in the fixture corpus.
+    tokenizer_files = ROOT / "tests/fixtures/hf/qwen35-native-tiny"
+    model_info, snapshot = HfApi.model_info, huggingface_hub.snapshot_download
+    HfApi.model_info = lambda self, repo, **options: (
+        SimpleNamespace(sha="offline-fixture") if repo in decoders else model_info(self, repo, **options))
+    huggingface_hub.snapshot_download = lambda repo, **options: (
+        str(tokenizer_files) if repo in decoders else snapshot(repo, **options))
     load, generation = PretrainedDecoder.load.__func__, PretrainedDecoder.text_generation
 
     def tiny(cls, name, **options):
