@@ -136,7 +136,7 @@ class TokenRegression(Regression):
 def test_a_real_token_budget_counts_each_microbatch_without_padding(log_every, accumulation):
     tracker = RecordingTracker()
     trainer = make_trainer(objective=TokenRegression(), tracker=tracker, accumulation=accumulation)
-    state = trainer.fit(Data(), total_tokens=30, log_every=log_every)
+    state = trainer.fit(dataset(), total_tokens=30, log_every=log_every)
     assert int(state.step) == 3  # Eight rows of lengths 1, 2, 3 cross 30 at 48.
     if log_every == 1:
         assert [scalars["train/tokens"] for _, scalars in tracker.scalars if "train/tokens" in scalars] == [
@@ -144,7 +144,7 @@ def test_a_real_token_budget_counts_each_microbatch_without_padding(log_every, a
 
 
 def test_a_token_budget_and_step_cap_stop_at_the_first_reached():
-    state = make_trainer(objective=TokenRegression()).fit(Data(), steps=2, total_tokens=30)
+    state = make_trainer(objective=TokenRegression()).fit(dataset(), steps=2, total_tokens=30)
     assert int(state.step) == 2
 
 
@@ -152,34 +152,34 @@ def test_a_token_budget_and_step_cap_stop_at_the_first_reached():
                                        Cosine(peak=.1, warmup_steps=1, decay_steps=8)])
 def test_a_token_only_run_uses_the_schedules_own_horizon(schedule):
     config = OptimConfig(schedule=schedule)
-    state = make_trainer(objective=TokenRegression(), optimizer=config).fit(Data(), total_tokens=30)
+    state = make_trainer(objective=TokenRegression(), optimizer=config).fit(dataset(), total_tokens=30)
     assert int(state.step) == 3
 
 
 def test_a_token_budget_resumes_its_count_from_the_checkpoint(tmp_path):
     first = make_trainer(tmp_path, objective=TokenRegression())
-    assert int(first.fit(Data(), steps=2, total_tokens=30, log_every=1).step) == 2
+    assert int(first.fit(dataset(), steps=2, total_tokens=30, log_every=1).step) == 2
     assert first.checkpoints.control(2)["tokens"] == 24
     resumed = make_trainer(tmp_path, objective=TokenRegression())
-    assert int(resumed.fit(Data(), total_tokens=30, log_every=1).step) == 3
+    assert int(resumed.fit(dataset(), total_tokens=30, log_every=1).step) == 3
     assert resumed.checkpoints.control(3)["tokens"] == 48
     complete = make_trainer(tmp_path, objective=TokenRegression())
-    assert int(complete.fit(Data(), total_tokens=30).step) == 3
+    assert int(complete.fit(dataset(), total_tokens=30).step) == 3
 
 
 def test_an_explicit_state_starts_a_token_count_with_its_own_reader(tmp_path):
-    make_trainer(tmp_path, objective=TokenRegression()).fit(Data(), steps=2, total_tokens=30)
+    make_trainer(tmp_path, objective=TokenRegression()).fit(dataset(), steps=2, total_tokens=30)
     trainer = make_trainer(tmp_path, objective=TokenRegression())
     state = trainer.initial_state()
-    assert int(trainer.fit(Data(), total_tokens=30, state=state).step) == 3
+    assert int(trainer.fit(dataset(), total_tokens=30, state=state).step) == 3
 
 
 def test_a_step_only_prefix_keeps_lifetime_real_tokens(tmp_path):
     first = make_trainer(tmp_path, objective=TokenRegression())
-    first.fit(Data(), steps=2, log_every=1)
+    first.fit(dataset(), steps=2, log_every=1)
     assert first.checkpoints.control(2)["tokens"] == 24
     resumed = make_trainer(tmp_path, objective=TokenRegression())
-    assert int(resumed.fit(Data(), total_tokens=30, log_every=1).step) == 3
+    assert int(resumed.fit(dataset(), total_tokens=30, log_every=1).step) == 3
 
 
 class LargeTokenRegression(Regression):
@@ -200,17 +200,17 @@ class LargeTokenRows(Counting):
 @pytest.mark.parametrize("cadence", [1, 100])
 def test_a_token_budget_stays_exact_above_float32_integer_resolution(cadence):
     trainer = make_trainer(objective=LargeTokenRegression())
-    state = trainer.fit(Data(LargeTokenRows), total_tokens=65 * 262143 + 1, log_every=cadence)
+    state = trainer.fit(dataset(LargeTokenRows), total_tokens=65 * 262143 + 1, log_every=cadence)
     assert int(state.step) == 66
 
 
 @pytest.mark.parametrize("cadence", [1, 100])
 def test_resumed_tokens_stay_exact_above_float32_integer_resolution(tmp_path, cadence):
     first = make_trainer(tmp_path, objective=LargeTokenRegression())
-    first.fit(Data(LargeTokenRows), steps=65, log_every=cadence)
+    first.fit(dataset(LargeTokenRows), steps=65, log_every=cadence)
     assert first.checkpoints.control(65)["tokens"] == 65 * 262143
     resumed = make_trainer(tmp_path, objective=LargeTokenRegression())
-    assert int(resumed.fit(Data(LargeTokenRows), total_tokens=65 * 262143 + 1, log_every=cadence).step) == 66
+    assert int(resumed.fit(dataset(LargeTokenRows), total_tokens=65 * 262143 + 1, log_every=cadence).step) == 66
 
 
 def test_an_optim_config_is_built_over_the_updates_fit_makes():
@@ -454,7 +454,7 @@ def test_fit_checkpoints_the_final_step(tmp_path):
 @pytest.mark.parametrize("cadence, steps, expected", [(None, 5, set()), (2, 5, {2, 4}), (2, 6, {2, 4, 6})])
 def test_final_checkpoint_policy_is_independent_of_the_cadence(tmp_path, cadence, steps, expected):
     trainer = make_trainer(tmp_path, keep=4)
-    trainer.fit(Data(), steps=steps, checkpoint_every=cadence, checkpoint_final=False)
+    trainer.fit(dataset(), steps=steps, checkpoint_every=cadence, checkpoint_final=False)
     assert set(trainer.checkpoints._open().all_steps()) == expected
 
 
@@ -1104,7 +1104,7 @@ def local_trainer(tmp_path, **kwargs):
 
 def test_terminal_local_cadence_does_not_need_a_final_persistent_save(tmp_path):
     trainer = local_trainer(tmp_path)
-    trainer.fit(Data(), steps=2, checkpoint_final=False)
+    trainer.fit(dataset(), steps=2, checkpoint_final=False)
     restored, _, _ = local_trainer(tmp_path).place()
     assert int(restored.step) == 2
     assert not os.path.exists(tmp_path / "run" / "2")
