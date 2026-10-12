@@ -11,8 +11,8 @@ from flax import linen as nn
 
 from dew.nn.flops import counted_flops
 from dew.nn.mixer_base import MixerBase, MixerContext
-from dew.nn.moe import Routes, SparseMLP
-from dew.nn.protocols import ProjectionGroup, RoutesExperts, declared_groups
+from dew.nn.moe import SparseMLP
+from dew.nn.protocols import ProjectionGroup, Routes, RoutesExperts, declared_groups
 
 if TYPE_CHECKING:
     from dew.nn.backbones.decoder_block import GatedMLP, Mixture
@@ -41,7 +41,7 @@ class _MLP(nn.Module):
                  attention_metadata=None, routes: Routes | None = None):
         # Tokenwise: no position, document, cache or metadata changes what an MLP computes.
         del decode, positions, segment_ids, kv_store, attention_metadata
-        if isinstance(self.feedforward, SparseMLP):
+        if isinstance(self.feedforward, RoutesExperts) and self.feedforward.routes_experts:
             return self.feedforward(x, routes=routes)
         return self.feedforward(x)
 
