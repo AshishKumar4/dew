@@ -623,6 +623,9 @@ def test_expert_jvp_refuses_swiglu_once_and_matches_xla(monkeypatch, caplog):
     monkeypatch.setattr(kernels.generation, "device_generation", lambda: "sm80")
     monkeypatch.setattr(kernels.generation, "triton_runs", lambda: True)
     monkeypatch.setattr(kernels.generation, "_logged", set())
+    # A GPU whose row names the kernel logs the reference's own refusal;
+    # only the calls under this generation count.
+    caplog.clear()
     for _ in range(2):
         actual = jax.jvp(function, (x,), (jnp.ones_like(x),))
         for mine, theirs in zip(actual, reference, strict=True):
