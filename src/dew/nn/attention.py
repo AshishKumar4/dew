@@ -26,7 +26,7 @@ from jax.sharding import PartitionSpec as P
 from dew.telemetry.devices import deterministic_ops_requested
 
 from .attention_sinks import attention_with_sinks
-from .flops import attention_flops, projection_flops, real_lengths
+from .flops import attention_flops, cross_attention_flops, projection_flops
 from .kernels import decode_attention, generation, norm_swiglu
 from .kernels.generation import bf16_dot_runs, device_generation, first_refusal, measured_kernel, ran_kernel
 from .kv_cache import Append, KVCache, KVStore, filled_slots
@@ -294,7 +294,7 @@ def _xla_rms_normalized(x, scale, epsilon: float, dtype, scale_offset: bool, sca
 
 
 def rms_normalized(x, scale, epsilon: float, dtype, scale_offset: bool, scale_after_cast: bool,
-                   fp32_statistics: bool, *, implementation: str = 'auto'):
+                   fp32_statistics: bool, *, implementation: str = 'auto', axes=None):
     """Normalize the last axis and apply an optional vector weight.
 
     `scale_offset` adds one to the stored weight; `scale_after_cast` rounds
@@ -305,11 +305,51 @@ def rms_normalized(x, scale, epsilon: float, dtype, scale_offset: bool, scale_af
     narrow input, weight and per-row inverse RMS, not fp32 activations.
     Unsupported variants run the checkpointed XLA reference instead
     (`norm_swiglu.rms_kernel`), including float64 and input-dtype statistics.
+    `axes`, `x`'s logical axes, place the kernel's rows on a mesh; without
+    them a split mesh runs XLA.
     """
-    chosen = norm_swiglu.rms_kernel(implementation, x, scale, dtype, fp32_statistics)
+    return stream_rms_normalized(x, None, scale, epsilon, dtype, scale_offset, scale_after_cast,
+                                 fp32_statistics, implementation=implementation, axes=axes)[1]
+
+
+def stream_rms_normalized(x, branch, scale, epsilon: float, dtype, scale_offset: bool,
+                          scale_after_cast: bool, fp32_statistics: bool, *, implementation: str = 'auto',
+                          axes=None):
+    """A pre-norm block's seam: the residual stream `x` plus `branch` (None
+    adds nothing) and that stream's `rms_normalized`, as `(stream, normed)`.
+
+    The caller carries the returned stream on, so the fused kernel
+    (`norm_swiglu.stream_rms_norm`) owns both ends of the norm: its forward
+    reads the two addends once and writes the sum beside the norm, and its
+    reverse adds the stream's own cotangent to the norm's in the same pass.
+    XLA's add and norm are the portable path and the oracle.
+    """
+    chosen = norm_swiglu.rms_kernel(implementation, x, scale, dtype, fp32_statistics, branch=branch,
+                                    axes=axes)
     if chosen == 'pallas':
-        return norm_swiglu.rms_norm(x, scale, epsilon, dtype, scale_offset, scale_after_cast)
-    return _xla_rms_normalized(x, scale, epsilon, dtype, scale_offset, scale_after_cast, fp32_statistics)
+        return norm_swiglu.stream_rms_norm(x, branch, scale, epsilon, dtype, scale_offset, scale_after_cast,
+                                           axes=axes)
+    stream = x if branch is None else x + branch
+    return stream, _xla_rms_normalized(stream, scale, epsilon, dtype, scale_offset, scale_after_cast,
+                                       fp32_statistics)
+
+
+def gated_rms_normalized(x, gate, scale, epsilon: float, dtype, activation: str, *,
+                         implementation: str = 'auto', axes=None):
+    """Qwen3-Next's gated norm (`Qwen3NextRMSNormGated`,
+    modeling_qwen3_next.py:57-74): `x` normalized in fp32, times `scale`,
+    times `activation(gate)` ('silu' or 'sigmoid'), cast once to `dtype`.
+    The fused kernel (`norm_swiglu.gated_rms_norm`) reads both inputs once a
+    pass; XLA's arithmetic is the portable path and the oracle. `axes`, the
+    inputs' logical axes, place the kernel's rows on a mesh.
+    """
+    chosen = norm_swiglu.gated_rms_kernel(implementation, x, gate, scale, dtype, activation, axes=axes)
+    if chosen == 'pallas':
+        return norm_swiglu.gated_rms_norm(x, gate, scale, epsilon, dtype, activation, axes=axes)
+    wide = at_least_fp32(x.dtype)
+    y = unweighted_rmsnorm(x.astype(wide), epsilon, implementation='xla') * scale.astype(wide)
+    gate = gate.astype(wide)
+    return (y * (jax.nn.silu(gate) if activation == 'silu' else jax.nn.sigmoid(gate))).astype(dtype)
 
 
 @functools.partial(normalized_in_fp32, static_argnums=(3, 4))
@@ -380,15 +420,23 @@ class RMSNorm(nn.Module):
     dtype: Dtype | None = None
     implementation: str = 'auto'
 
+    def __call__(self, x, *, axes=None):
+        """The norm of `x`. `axes`, `x`'s logical axes, place the fused kernel on a mesh."""
+        return self.seam(x, axes=axes)[1]
+
     @nn.compact
-    def __call__(self, x):
+    def seam(self, x, branch=None, *, axes=None):
+        """A pre-norm block's residual seam: `(stream, normed)` for the stream
+        `x + branch` (`x` for a None branch) and its norm, whose fused kernel
+        owns the add and the stream's cotangent (`stream_rms_normalized`)."""
         dtype = self.dtype if self.dtype is not None else x.dtype
         scale = self.param(
             'scale',
             nn.initializers.zeros if self.scale_offset else nn.initializers.ones,
             (x.shape[-1],), jnp.float32) if self.with_scale else None
-        return rms_normalized(x, scale, self.epsilon, dtype, self.scale_offset,
-                              self.scale_after_cast, self.fp32_statistics, implementation=self.implementation)
+        return stream_rms_normalized(x, branch, scale, self.epsilon, dtype, self.scale_offset,
+                                     self.scale_after_cast, self.fp32_statistics,
+                                     implementation=self.implementation, axes=axes)
 
 
 class LayerNorm(nn.Module):
@@ -2058,27 +2106,31 @@ class NormalAttention(nn.Module):
     attention_impl: str = "auto"  # an AttentionImpl
 
     @nn.nowrap
+    def projections(self, context_features: int | None = None) -> dict[str, tuple[int, int]]:
+        inner = self.heads * self.dim_head
+        context = self.query_dim if context_features is None else context_features
+        return {'to_q': (self.query_dim, inner), 'to_k': (context, inner), 'to_v': (context, inner),
+                'to_out_0': (inner, self.query_dim)}
+
+    @nn.nowrap
     def model_flops(self, lengths) -> float:
         """Self-attention maps and its full QK/AV products on real rows."""
-        inner = self.heads * self.dim_head
-        return (4 * projection_flops(lengths, self.query_dim, inner)
+        return (sum(projection_flops(lengths, *shape) for shape in self.projections().values())
                 + attention_flops(lengths, self.heads, self.dim_head, self.dim_head, causal=False))
 
     @nn.nowrap
     def cross_flops(self, lengths, context_lengths, context_features: int) -> float:
         """Cross-attention with the context geometry supplied by its owner."""
-        query, context = real_lengths(lengths), real_lengths(context_lengths)
-        if query.shape != context.shape:
-            raise ValueError("cross-attention FLOPs need matching query/context rows")
-        inner = self.heads * self.dim_head
-        return (2 * projection_flops(lengths, self.query_dim, inner)
-                + 2 * projection_flops(context_lengths, context_features, inner)
-                + 4 * inner * float(np.sum(query * context)))
+        maps = self.projections(context_features)
+        return (sum(projection_flops(lengths, *maps[name]) for name in ('to_q', 'to_out_0'))
+                + sum(projection_flops(context_lengths, *maps[name]) for name in ('to_k', 'to_v'))
+                + cross_attention_flops(lengths, context_lengths, self.heads, self.dim_head, self.dim_head))
 
     def setup(self):
+        maps = self.projections()
         dense = functools.partial(
             nn.DenseGeneral,
-            features=[self.heads, self.dim_head],
+            features=[self.heads, maps['to_q'][1] // self.heads],
             axis=-1,
             precision=self.precision,
             use_bias=self.use_bias if self.qkv_bias is None else self.qkv_bias,
@@ -2093,7 +2145,7 @@ class NormalAttention(nn.Module):
             self.k_norm = RMSNorm(epsilon=1e-6, dtype=self.dtype, name="k_norm")
 
         self.proj_attn = nn.DenseGeneral(
-            self.query_dim,
+            maps['to_out_0'][1],
             axis=(-2, -1),
             precision=self.precision,
             use_bias=self.use_bias,
@@ -2147,9 +2199,16 @@ class FlaxGEGLU(nn.Module):
     precision: PrecisionLike = jax.lax.Precision.DEFAULT
     approximate: bool = True
 
+    @nn.nowrap
+    def projections(self) -> dict[str, tuple[int, int]]:
+        return {"proj": (self.dim, self.dim * 4 * 2)}
+
+    @nn.nowrap
+    def model_flops(self, lengths) -> float:
+        return projection_flops(lengths, *self.projections()["proj"])
+
     def setup(self):
-        inner_dim = self.dim * 4
-        self.proj = nn.Dense(inner_dim * 2, dtype=self.dtype, precision=self.precision)
+        self.proj = nn.Dense(self.projections()["proj"][1], dtype=self.dtype, precision=self.precision)
 
     def __call__(self, hidden_states):
         hidden_states = self.proj(hidden_states)
@@ -2174,13 +2233,19 @@ class FlaxFeedForward(nn.Module):
     @nn.nowrap
     def model_flops(self, lengths) -> float:
         """GEGLU's gate/up and down projections, with its fourfold hidden width."""
-        return 3 * projection_flops(lengths, self.dim, 4 * self.dim)
+        return (FlaxGEGLU(self.dim, parent=None).model_flops(lengths)
+                + projection_flops(lengths, *self.projections()["net_2"]))
+
+    @nn.nowrap
+    def projections(self) -> dict[str, tuple[int, int]]:
+        inner = FlaxGEGLU(self.dim, parent=None).projections()["proj"][1] // 2
+        return {"net_2": (inner, self.dim)}
 
     def setup(self):
         self.net_0 = FlaxGEGLU(
             self.dim, dtype=self.dtype, precision=self.precision, approximate=self.approximate_gelu
         )
-        self.net_2 = nn.Dense(self.dim, dtype=self.dtype, precision=self.precision)
+        self.net_2 = nn.Dense(self.projections()["net_2"][1], dtype=self.dtype, precision=self.precision)
         self.dropout_layer = nn.Dropout(self.dropout)
 
     def __call__(self, hidden_states, *, train: bool = False):
@@ -2208,6 +2273,17 @@ class BasicTransformerBlock(nn.Module):
     force_fp32_for_softmax: bool = True
     norm_epsilon: float = 1e-4
     attention_impl: str = "auto"  # an AttentionImpl
+
+    @nn.nowrap
+    def cross_flops(self, lengths, context_lengths, context_features: int) -> float:
+        """The configured attention branches and optional GEGLU maps."""
+        attention = NormalAttention(self.query_dim, self.heads, self.dim_head, parent=None)
+        count = attention.cross_flops(lengths, context_lengths, context_features)
+        if not self.only_pure_attention:
+            if not self.use_cross_only:
+                count += attention.model_flops(lengths)
+            count += FlaxFeedForward(self.query_dim, parent=None).model_flops(lengths)
+        return count
 
     def setup(self):
         attention = functools.partial(
@@ -2302,6 +2378,19 @@ class TransformerBlock(nn.Module):
     norm_inputs: bool = True
     explicitly_add_residual: bool = True
     norm_epsilon: float = 1e-4
+
+    @nn.nowrap
+    def cross_flops(self, lengths, input_features: int, context_lengths=None,
+                    context_features: int | None = None) -> float:
+        """Stage projections and its self/cross/FFN branches at actual widths."""
+        inner = self.heads * self.dim_head if self.use_projection else input_features
+        context_lengths = lengths if context_lengths is None else context_lengths
+        context_features = inner if context_features is None else context_features
+        block = BasicTransformerBlock(inner, self.heads, self.dim_head,
+                                       use_cross_only=not self.use_self_and_cross,
+                                       only_pure_attention=self.only_pure_attention, parent=None)
+        count = block.cross_flops(lengths, context_lengths, context_features)
+        return count + (2 * projection_flops(lengths, input_features, inner) if self.use_projection else 0)
 
     @nn.compact
     def __call__(self, x, context=None):

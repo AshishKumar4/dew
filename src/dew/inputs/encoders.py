@@ -25,6 +25,7 @@ from typing_extensions import TypeVar
 
 from dew.nn.blocks import table_rows
 from dew.nn.dit import TextContext
+from dew.nn.flops import counted_flops
 from dew.nn.text_encoders import (
     DEFAULT_MODEL,
     DEFAULT_T5_MODEL,
@@ -50,6 +51,23 @@ Encoded = TypeVar("Encoded", default=object)
 """The conditioning value a modality's encoder produces: a `TextContext`, a
 `DenoisingCondition`, an array. An encoder that leaves it unstated promises
 its callers nothing about the value beyond what it hands the model."""
+
+
+@dataclass(frozen=True)
+class ConditionWork:
+    """A condition encoder's forward FLOPs and the sequence its denoiser reads.
+
+    The output lengths may differ from encoded input (system prompts
+    cropped, CLIP and T5 concatenated, or visible zero tokens retained).
+    Keeping both under the encoder makes its geometry the encode contract.
+    """
+
+    flops: float
+    lengths: np.ndarray
+    spans: np.ndarray
+    features: int
+    pooled_features: int | None = None
+    time_ids: int | None = None
 
 
 class ConditionEncoder(ABC, Generic[Raw, Encoded]):
@@ -173,6 +191,12 @@ class _TextTower(ConditionEncoder[str, TextContext]):
                                 truncation=True, return_tensors="np")
         return {"input_ids": np.asarray(tokens["input_ids"], np.int32),
                 "attention_mask": np.asarray(tokens["attention_mask"], np.int32)}
+
+    def conditioning_flops(self, tokens) -> ConditionWork:
+        lengths = np.sum(np.asarray(tokens["attention_mask"]) != 0, axis=-1, dtype=np.int64)
+        spans = np.full(lengths.shape, np.shape(tokens["input_ids"])[1], np.int64)
+        return ConditionWork(counted_flops(self.transformer, lengths), lengths, spans,
+                             self.transformer.emb_features)
 
     def encode(self, params, tokens) -> TextContext:
         mask = jnp.asarray(tokens["attention_mask"])
@@ -309,6 +333,11 @@ class CharTable(ConditionEncoder[str, TextContext]):
             ids[row, :len(codes)] = codes
             mask[row, :len(codes)] = 1
         return {"input_ids": ids, "attention_mask": mask}
+
+    def conditioning_flops(self, tokens) -> ConditionWork:
+        lengths = np.sum(np.asarray(tokens["attention_mask"]) != 0, axis=-1, dtype=np.int64)
+        return ConditionWork(0.0, lengths, np.full(lengths.shape, np.shape(tokens["input_ids"])[1], np.int64),
+                             self.features)
 
     def encode(self, params, tokens) -> TextContext:
         table = params["table"]

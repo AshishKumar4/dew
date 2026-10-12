@@ -11,6 +11,8 @@ Read `CONTRIBUTING.md` for design, reference parity, code, tests, and writing st
 - Fix a failure by design, not by a guard. Derive a fact from its one source instead of passing it in and checking it, order steps so races cannot occur, and give each fact one owner. Add a conditional, timeout or assert only when no design change removes the need; timeouts belong at external boundaries such as networks and cloud allocation.
 - Fix a failure where its cause lives, in the shared piece, not in the script or test that hit it, and remove the special case or copy that allowed it.
 - Compose on the existing primitive. Before adding code, find the piece that already does the job; one concept has one implementation and one source of truth (for example `GpuTarget` for device facts and `KERNELS` for kernel choices).
+- Duplication is banned everywhere, not only in `src/`: a dependency list, version pin, table, flag set, test list, policy or algorithm exists in one place. CI workflows, installers, armada recipes, private tooling and docs read or generate from that one owner. A second hand-kept copy is a bug, and a head that adds one does not land.
+- Code composes on itself: one path per job, no parallel implementations, and as few branches and special cases as the problem allows. When a design grows branches, step back and look at it from another angle (the data, the caller, the hardware, the math); a cleaner formulation usually removes them.
 - Put optimizations in the shared core so every model family and backend benefits. Keep model- or hardware-specific code small and say why it cannot be general.
 - Activations cross layer-to-kernel interfaces as `[batch, time, heads, head_dim]`. A kernel adapts to that layout; layer code does not permute activations for a kernel. Other tensors keep their own meaning.
 
@@ -23,6 +25,7 @@ Read `CONTRIBUTING.md` for design, reference parity, code, tests, and writing st
 - Deliver one head per area of work, landed when that piece is complete and gated; fold small fixes into it rather than landing them separately. Merge `main` into an active head at least daily and before landing.
 - Land complete work early. A change whose correctness the CPU suite proves lands without waiting on unrelated GPU measurements; a default changes only with the measurement that justifies it.
 - Give a finished large head two or three independent reviews in parallel, each with a different focus, instead of reviewing small pieces one by one.
+- A review checks the head against the whole project, not only its diff: for every list, table, helper or policy the head adds, it searches the repository and the private tooling for an existing owner. A duplicate it finds blocks the head.
 - Keep private development tooling (personal cloud runners and session drivers, provisioning scripts, one-off session scripts) out of this repository. Tooling that Dew's own CI, tests, docs or users need, such as the CI entry points and the profiling and attribution tools, stays here.
 
 ## Verification

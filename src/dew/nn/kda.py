@@ -41,7 +41,6 @@ from .linear import (
     RMSNormGated,
     chunk_delta_rule,
     held_scan,
-    l2norm,
     recurrent_delta_rule,
 )
 from .mixer_base import MixerBase, MixerContext
@@ -179,18 +178,20 @@ class KimiDeltaAttention(nn.Module):
 
         def scan(convolved, *, starts, valid, held):
             del starts, valid
-            query, key, value = (part.reshape(B, S, self.num_heads, self.head_dim)
-                                 for part in jnp.split(convolved, 3, axis=-1))
+            query, key, value = (part.reshape(B, S, self.num_heads, self.head_dim) for part in convolved)
             rule = recurrent_delta_rule if S == 1 else functools.partial(
                 chunk_kimi_delta_rule, chunk_size=self.chunk_size)
-            return rule(l2norm(query), l2norm(key), value, g, beta, held)
+            return rule(query, key, value, g, beta, held)
 
         # The decode state is GatedDeltaNet's pair, here in fp32; the
-        # allocation-only call returns before any state is written.
-        out = held_scan(self, projected.astype(wide), taps, None, scan,
+        # allocation-only call returns before any state is written. The conv
+        # normalises the queries and keys (`l2norm`).
+        heads = ((self.qkv_features, self.head_dim),) * 2 + ((self.qkv_features, None),)
+        out = held_scan(self, projected, taps, None, scan,
                         (self.num_heads, self.head_dim, self.head_dim), decode=decode, valid=valid,
-                        state='recurrent_state',
-                        right_padded=attention_metadata is not None and attention_metadata.right_padded)
+                        state='recurrent_state', state_dtype=wide, conv_dtype=wide,
+                        right_padded=attention_metadata is not None and attention_metadata.right_padded,
+                        parts=heads, dtype=wide)
         if out is None:
             return self.o_proj(jnp.zeros((B, S, self.qkv_features), self.dtype))
         gate = self.g_proj(x) if self.full_rank_gate else self.g_b_proj(self.g_a_proj(x))

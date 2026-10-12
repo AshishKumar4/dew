@@ -15,8 +15,9 @@ import jax.numpy as jnp
 import numpy as np
 
 from dew.diffusion.process import DenoisingCondition
-from dew.inputs.encoders import ConditionEncoder
+from dew.inputs.encoders import ConditionEncoder, ConditionWork
 from dew.nn.blocks import torch_nearest_resize
+from dew.nn.flops import counted_flops, projection_flops
 from dew.nn.safety import CLIPSafetyHead
 from dew.nn.text_encoders import CLIPTextTransformer, T5EncoderTransformer
 from dew.objectives.base import Variables
@@ -166,6 +167,38 @@ class DiffusionConditioner(ConditionEncoder[str | Mapping[str, object]]):
     param_dtype: str = "float32"
     keyword: ClassVar[str] = "conditioning"
 
+    def conditioning_flops(self, tokens) -> ConditionWork:
+        """Count each native tower and pooled projection using the pipeline's masks.
+
+        These CLIP/T5 calls are unmasked: their EOS/zero slots are visible
+        model inputs, unlike masked batch padding. Their output sequences
+        are concatenated for SD3 and only T5 is read by Flux.
+        """
+        ids = np.asarray(tokens["input_ids"])
+        rows = np.ones((ids.shape[0],), np.int64)
+        clip_lengths = rows * ids.shape[-1]
+        count = sum(counted_flops(tower, clip_lengths) for tower in self.towers)
+        t5_lengths = rows * (np.shape(tokens["t5_input_ids"])[-1] if self.t5 is not None else ids.shape[-1])
+        if self.t5 is not None:
+            count += counted_flops(self.t5.tower, t5_lengths)
+        projected = (self.names[-1:] if self.composition == "clip_pooled" else
+                     self.names if self.composition == "sd3" else ())
+        for name in projected:
+            kernel = self.params[name]["text_projection"]["kernel"]
+            count += projection_flops(rows, kernel.shape[0], kernel.shape[1])
+        lengths = (t5_lengths if self.composition == "flux" else
+                   clip_lengths + t5_lengths if self.composition == "sd3" else clip_lengths)
+        pooled, time_ids = None, None
+        if self.composition == "flux":
+            pooled = self.towers[0].emb_features
+        elif self.composition == "sd3":
+            pooled = sum(self.params[name]["text_projection"]["kernel"].shape[1] for name in self.names)
+        if self.composition == "clip_pooled":
+            pooled = self.params[self.names[-1]]["text_projection"]["kernel"].shape[1]
+            time_ids = (np.shape(tokens["time_ids"])[-1] if "time_ids" in tokens
+                        else len(self.time_id_values))
+        return ConditionWork(count, lengths, lengths, self.context_width, pooled, time_ids)
+
     @classmethod
     def from_pretrained(cls, checkpoint: str, *, dtype: str | None = "bfloat16",
                         param_dtype: str = "float32", revision: str | None = None,
@@ -241,15 +274,14 @@ class DiffusionConditioner(ConditionEncoder[str | Mapping[str, object]]):
                 return_tensors="np").input_ids
         return tokens
 
-    def time_ids(self, count, dtype):
-        """Return SDXL's micro-conditioning for `count` rows.
-
-        Each row is the original size, a zero crop offset, then the target
-        size or, for the refiner, its aesthetic score.
-        """
+    @property
+    def time_id_values(self) -> tuple[int | float, ...]:
         size = (self.height, self.width)
-        values = (*size, 0, 0, *((6.0,) if self.aesthetics else size))
-        return jnp.broadcast_to(jnp.asarray(values, dtype), (count, len(values)))
+        return (*size, 0, 0, *((6.0,) if self.aesthetics else size))
+
+    def time_ids(self, count, dtype):
+        """The original size, zero crop, and target size or aesthetic score per row."""
+        return jnp.broadcast_to(jnp.asarray(self.time_id_values, dtype), (count, len(self.time_id_values)))
 
     def _clip(self, params, ids) -> list[_TextFeatures]:
         outputs = []
@@ -440,6 +472,14 @@ class QwenImageConditioner(_LanguageText):
         return {"input_ids": np.asarray(encoded.input_ids, np.int32),
                 "attention_mask": np.asarray(encoded.attention_mask, np.int32)}
 
+    def conditioning_flops(self, tokens) -> ConditionWork:
+        lengths = np.sum(np.asarray(tokens["attention_mask"]) != 0, axis=-1, dtype=np.int64)
+        # The tower's causal prefix includes the system prompt that the
+        # denoiser never sees; cropping does not remove that encoder work.
+        count = counted_flops(self.tower, lengths)
+        spans = np.full(lengths.shape, np.shape(tokens["input_ids"])[1] - self.drop, np.int64)
+        return ConditionWork(count, np.maximum(lengths - self.drop, 0), spans, self.tower.emb_features)
+
     def encode(self, params, tokens) -> DenoisingCondition:
         states = jnp.asarray(self.tower.apply({"params": params["text_encoder"]["params"]},
                                               jnp.asarray(tokens["input_ids"]), method=_residual_states))
@@ -517,6 +557,12 @@ class HiddenStatesConditioner(_LanguageText):
             tokens["guidance"] = np.asarray(guidance, np.float32)
         return tokens
 
+    def conditioning_flops(self, tokens) -> ConditionWork:
+        lengths = np.sum(np.asarray(tokens["attention_mask"]) != 0, axis=-1, dtype=np.int64)
+        spans = np.full(lengths.shape, np.shape(tokens["input_ids"])[1], np.int64)
+        return ConditionWork(counted_flops(self.tower, lengths), lengths, spans,
+                             self.tower.emb_features * len(self.layers))
+
     def encode(self, params, tokens) -> DenoisingCondition:
         from dew.nn.backbones.causal_transformer import INTERMEDIATES, layer_output, layer_outputs
 
@@ -547,6 +593,7 @@ class WanConditioner(_LanguageText):
     zeros included, so the condition carries no mask.
     """
 
+
     def tokenize(self, texts: Sequence[str | Mapping[str, object]]):
         try:
             import ftfy
@@ -562,6 +609,13 @@ class WanConditioner(_LanguageText):
                                  add_special_tokens=True, return_tensors="np")
         return {"input_ids": np.asarray(encoded.input_ids, np.int32),
                 "attention_mask": np.asarray(encoded.attention_mask, np.int32)}
+
+    def conditioning_flops(self, tokens) -> ConditionWork:
+        lengths = np.sum(np.asarray(tokens["attention_mask"]) != 0, axis=-1, dtype=np.int64)
+        # The encoder masks padding, but Wan reads its zero-filled fixed
+        # output budget without a mask; those keys remain in its softmax.
+        output = np.full(lengths.shape, np.shape(tokens["input_ids"])[1], np.int64)
+        return ConditionWork(counted_flops(self.tower, lengths), lengths, output, self.tower.emb_features)
 
     def encode(self, params, tokens) -> DenoisingCondition:
         mask = jnp.asarray(tokens["attention_mask"])
