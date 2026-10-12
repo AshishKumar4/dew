@@ -685,7 +685,7 @@ def test_a_video_recipe_reads_frames_and_the_sound_around_them_at_its_audio_mode
                  audio_padding=1)
 
     train, _, _ = spec.pipelines()
-    records = list(train.iterate())
+    records = list(train.repeat(1).iterate())
 
     assert len(records) == len(clips)
     for record in records:

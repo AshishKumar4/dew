@@ -38,23 +38,16 @@ class DecodeAudio(grain.MapTransform):
         from dew.data.sources.av_utils import audio_window, media_info
 
         start, stop = window(element, self.clip)
-        first = start - self.context
         samples = round((stop - start + 2 * self.context) * self.sample_rate)
         try:
             with contextlib.ExitStack() as held:
                 path = local_file(element[self.field], held)
                 _, _, sound = media_info(path)
-                wave = (audio_window(path, max(first, 0.0), (stop + self.context) - max(first, 0.0),
-                                     self.sample_rate) if sound else np.zeros(0, np.float32))
+                wave, valid = (audio_window(path, start - self.context, stop - start + 2 * self.context,
+                                            self.sample_rate) if sound else
+                               (np.zeros(samples, np.float32), np.zeros(samples, bool)))
         except (OSError, ValueError):
             return Rejected("undecodable")
-        # A window that opens before the file's start reads from it, the samples before it absent.
-        lead = min(samples, round(max(-first, 0.0) * self.sample_rate))
-        wave = wave[:samples - lead]
-        valid = np.zeros(samples, bool)
-        valid[lead:lead + len(wave)] = True
         if not valid.all() and self.missing == "reject":
             return Rejected("no audio" if not sound else "audio shorter than the clip")
-        full = np.zeros(samples, np.float32)
-        full[lead:lead + len(wave)] = wave
-        return {**element, self.to: full, f"{self.to}_valid": valid}
+        return {**element, self.to: wave, f"{self.to}_valid": valid}
