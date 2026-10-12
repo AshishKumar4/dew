@@ -842,7 +842,9 @@ def _initial(rows: jax.sharding.NamedSharding | None):
     """The solver's state before a walk's first step, on the concrete `grid`: its checks and tables
     read the grid's values, so this small program is a grid's own and the walk's is every grid's."""
     def initial(solver, process, grid, x_T, key):
-        return solver.init(x_T, jnp.asarray(grid, jnp.float32), process, key=key)
+        with jax.ensure_compile_time_eval():
+            times = jnp.asarray(grid, jnp.float32)
+        return solver.init(x_T, times, process, key=key)
     return jax.jit(initial, static_argnums=(0, 1, 2), in_shardings=(rows, None))
 
 
