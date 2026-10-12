@@ -20,7 +20,7 @@ from dew.data.dataset import rows_of
 from dew.objectives.base import Batch
 from dew.telemetry.instrumentation import NO_FLOPS, StepFlops
 from dew.training.display import TrainingDisplay
-from dew.training.model_flops import TOKENS, TRAINING_FLOPS
+from dew.training.model_flops import TOKENS, TRAINING_FLOPS, _TokenCount
 from dew.training.transaction import Committed
 
 # Consecutive non-finite losses that stop a run.
@@ -54,13 +54,13 @@ def fresh_book(loss: jax.Array) -> Book:
     """
     dtype = jnp.promote_types(loss.dtype, jnp.float32)
     zeros = (np.zeros((), dtype), np.zeros((), np.int32), np.zeros((), np.int32),
-             np.zeros((), dtype), np.zeros((), dtype), np.zeros((), dtype), np.zeros((), np.int32))
+             np.zeros((), dtype), np.zeros((2,), np.uint32), np.zeros((), dtype), np.zeros((), np.int32))
     return Book(*jax.device_put(zeros, loss.sharding))
 
 
 @jax.jit
 def bookkeep(book: Book, loss: jax.Array, finite: jax.Array, committed: Committed | None, training=0.0,
-             tokens=0.0) -> Book:
+             tokens=(0, 0)) -> Book:
     """Advance the loop's counters for one step in a single dispatch.
 
     Loss counters and commit telemetry advance together, without reading
@@ -72,7 +72,7 @@ def bookkeep(book: Book, loss: jax.Array, finite: jax.Array, committed: Committe
     if committed is not None:
         norms, commits = norms + committed.norm.astype(dtype), commits + committed.count
     return Book(book.loss + loss.astype(dtype), bad_run, jnp.maximum(book.worst_bad_run, bad_run),
-                book.training + training, book.tokens + tokens, norms, commits)
+                book.training + training, _TokenCount.add(book.tokens, tokens), norms, commits)
 
 
 @dataclasses.dataclass
@@ -155,7 +155,7 @@ class Interval:
     @property
     def real_tokens(self) -> int:
         """Lifetime real tokens from completed logs and the current device counter."""
-        current = (int(jax.device_get(self.book.tokens))
+        current = (_TokenCount.host(jax.device_get(self.book.tokens))
                    if self.tokens_counted and self.book is not None else 0)
         return self.tokens_before_log + current
 
