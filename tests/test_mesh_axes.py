@@ -24,6 +24,7 @@ from dew.data import Dataset
 from dew.nn.backbones.dit import SimpleDiT
 from dew.nn.blocks import Upsample
 from dew.nn.conv import Conv
+from dew.nn.sharding import declared_axes
 from dew.nn.ssm import SpatialFusionConv
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
@@ -84,25 +85,6 @@ def test_the_default_mesh_places_like_the_three_axis_one():
 DELTA = {"class": "gated_delta_net", "fields": {
     "linear_num_key_heads": 2, "linear_num_value_heads": 4, "linear_key_head_dim": 8,
     "linear_value_head_dim": 8, "linear_conv_kernel_dim": 4}}
-
-
-@pytest.mark.parametrize("hybrid", [{}, {"layer_types": ("linear_attention", "full_attention"),
-                                         "kinds": {"linear_attention": {"mixer": DELTA}}}],
-                         ids=["attention", "delta-net"])
-def test_fsdp_alone_splits_each_kernels_leading_dimension(hybrid):
-    """fsdp alone stores a split, so each kernel's shard is a block of its
-    rows: the gate and up projections and the delta net's input projections
-    split the residual width they read, not the width a rule names first.
-    The head keeps its vocabulary split, which its loss computes on."""
-    model = models.build("causal_transformer", vocab_size=VOCAB, emb_features=32, num_layers=2, num_heads=4,
-                         num_kv_heads=2, mlp_features=64, max_seq_len=SEQ_LEN, tie_embeddings=False, **hybrid)
-    shardings = Layout(min_shard=TINY_SHARD).shardings(MeshSpec(fsdp=8).build(), jax.eval_shape(
-        model.init, jax.random.key(0), jnp.ones((1, SEQ_LEN), jnp.int32)))
-    specs = {jax.tree_util.keystr(path): sharding.spec
-             for path, sharding in jax.tree_util.tree_leaves_with_path(shardings["params"])
-             if sharding.spec and "kernel" in jax.tree_util.keystr(path)}
-    assert specs.pop("['lm_head']['kernel']") == P(None, "fsdp")
-    assert specs and set(specs.values()) == {P("fsdp")}, specs
 
 
 def test_the_default_rules_split_the_megatron_widths_on_the_tensor_axis():
@@ -193,35 +175,45 @@ def test_tensor_parallelism_computes_latent_attentions_down_projections_once():
 
 @pytest.mark.mesh(devices=2)
 @pytest.mark.parametrize("fused", [False, True], ids=["delta-net", "fused-projections"])
-def test_a_delta_net_moves_no_activation_over_fsdp(fused):
-    """Over fsdp each device computes its own rows, so a layer gathers
-    parameters and moves no activation. The step's activation moves are the
-    vocabulary's (the token ids and hidden states its split head and
-    embedding exchange), so a decoder with a gated delta net layer moves
-    what an all-attention one moves. One 20-position row a device, as a long
-    run puts one: there an unplaced delta net ran head-split with the rows
-    gathered (`GatedDeltaNet._project`), Qwen3-Next's fused projections
-    before their reshape."""
+def test_an_fsdp_step_splits_leading_dimensions_and_moves_no_activation(fused):
+    """A hybrid decoder's step over fsdp alone, one 20-position row a device
+    as a long run puts one. fsdp stores a split, so each kernel's shard is a
+    block of its rows: each declared kernel, the gate and up projections and
+    the delta net's input projections among them, splits the residual width
+    it reads, not the width a rule names first; the head keeps its
+    vocabulary split, which its loss computes on. Each device computes its own rows, so the step's
+    activation moves are the vocabulary's (the token ids and hidden states
+    its split head and embedding exchange), what an all-attention decoder
+    moves: unplaced, the delta net ran head-split with the rows gathered
+    (`GatedDeltaNet._project`), Qwen3-Next's fused projections before their
+    reshape."""
     length = 20
     layers = {"layer_types": ("linear_attention", "full_attention"), "kinds": {"linear_attention": {
         "mixer": {**DELTA, "fields": {**DELTA["fields"], "fused_in_proj": fused}}}}}
 
-    def moved(**hybrid) -> list:
+    def stepped(**hybrid) -> tuple[dict, list]:
         model = models.build("causal_transformer", vocab_size=VOCAB, emb_features=32, num_layers=2,
-                             num_heads=4, num_kv_heads=2, mlp_features=64, max_seq_len=length, **hybrid)
+                             num_heads=4, num_kv_heads=2, mlp_features=64, max_seq_len=length,
+                             tie_embeddings=False, **hybrid)
         mesh = MeshSpec(fsdp=2)
         trainer = Trainer(LMObjective(model, length), optax.adam(1e-3), key=jax.random.key(0), mesh=mesh,
-                          layout=Layout(min_shard=TINY_SHARD, tolerance=1.0), checkpoints=None, tracker=None)
+                          layout=Layout(min_shard=TINY_SHARD), checkpoints=None, tracker=None)
         trainer.device_mesh = mesh.build(jax.devices()[:2])
-        state, _, _ = trainer.place()
-        assert_sharded(state.variables, trainer.device_mesh)
-        batch = {"text": np.ones((2, length + 1), np.int32)}
-        trainer.compile(state, shard_batch(trainer.device_mesh, batch))
+        state, shardings, _ = trainer.place()
+        trainer.compile(state, shard_batch(trainer.device_mesh, {"text": np.ones((2, length + 1), np.int32)}))
+        specs = {jax.tree_util.keystr(path): sharding.spec
+                 for path, sharding in jax.tree_util.tree_leaves_with_path(shardings.variables["params"])
+                 if sharding.spec and "kernel" in jax.tree_util.keystr(path) and declared_axes(path, 2)}
         # Every exchange of entries, and each gather of the step's positions.
-        return sorted((op, shapes) for op, shapes in sharded.collectives(trainer.executable.as_text())
-                      if op in sharded.MOVES and (op != "all-gather" or any(length in shape for shape in shapes)))
+        moved = sorted((op, shapes) for op, shapes in sharded.collectives(trainer.executable.as_text())
+                       if op in sharded.MOVES
+                       and (op != "all-gather" or any(length in shape for shape in shapes)))
+        return specs, moved
 
-    assert moved(**layers) == moved()
+    specs, moved = stepped(**layers)
+    assert specs.pop("['lm_head']['kernel']") == P(None, "fsdp")
+    assert set(specs.values()) == {P("fsdp")}, specs
+    assert moved == stepped()[1]
 
 
 @pytest.mark.parametrize(("bytes_per_second", "peak", "platform", "spreads"), [
