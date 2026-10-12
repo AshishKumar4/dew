@@ -10,7 +10,11 @@ import numpy as np
 import pytest
 
 from dew.config import RunConfig, TrainerConfig
-from dew.data import TFDS, DataPartition, Files, HoldOut, Loading, Memory, Pipeline, Records, compile, load
+from dew.config.data import HoldOut, RecordsData, loader
+from dew.data import TFDS, Files, Loading, Memory
+from dew.data.compile import compile
+from dew.data.dataset import DataPartition
+from dew.data.pipeline import Pipeline
 from dew.objectives.base import VALID_ROWS
 
 READ = Loading(workers=0, threads=1, read_buffer=4, worker_buffer=1)
@@ -45,11 +49,11 @@ def jsonl(tmp_path):
                                  "data/rows.parquet"])
 def test_load_requires_an_alias_or_a_typed_recipe(uri):
     with pytest.raises(ValueError, match="recipe or alias"):
-        load(uri, batch=4)
+        loader(uri, batch=4)
 
 
 def test_recipe_sources_round_trip_in_a_run_record(tmp_path):
-    recipe = Records(source=Files(str(tmp_path / "rows.parquet"), format="parquet"),
+    recipe = RecordsData(source=Files(str(tmp_path / "rows.parquet"), format="parquet"),
                      validation=Files(str(tmp_path / "held.parquet"), format="parquet"))
     run = RunConfig(data=recipe, loading=READ, trainer=TrainerConfig(steps=1))
     assert RunConfig.from_dict(json.loads(json.dumps(run.to_dict()))) == run
@@ -57,8 +61,8 @@ def test_recipe_sources_round_trip_in_a_run_record(tmp_path):
 
 def test_indexed_jsonl_refuses_to_build_an_index_without_provisioning(jsonl):
     with pytest.raises((ValueError, FileNotFoundError), match=r"index|provision"):
-        load(Records(source=jsonl), batch=4, read="indexed", loading=READ)
-    data = load(Records(source=jsonl), batch=4, read="indexed", provision=True, loading=READ)
+        loader(RecordsData(source=jsonl), batch=4, read="indexed", loading=READ)
+    data = loader(RecordsData(source=jsonl), batch=4, read="indexed", provision=True, loading=READ)
     stream = data.train(DataPartition())
     try:
         assert sorted(value for batch in indices(stream, 6) for value in batch) == list(range(24))
@@ -69,7 +73,7 @@ def test_indexed_jsonl_refuses_to_build_an_index_without_provisioning(jsonl):
 def test_a_held_out_slice_provisions_the_source_it_reads(jsonl):
     """A held-out slice and the rows after it read their source by index, so provision=True
     builds that source's index rather than refusing the slices, which have none of their own."""
-    data = load(Records(source=jsonl, validation=HoldOut(records=4)), batch=4, read="indexed",
+    data = loader(RecordsData(source=jsonl, validation=HoldOut(records=4)), batch=4, read="indexed",
                 provision=True, loading=READ)
     stream, held = data.train(DataPartition()), data.val(DataPartition())
     try:
@@ -82,8 +86,8 @@ def test_a_held_out_slice_provisions_the_source_it_reads(jsonl):
 
 def test_memory_and_provisioned_indexed_sources_produce_identical_epochs(jsonl):
     jsonl.provision()
-    memory = load(Records(source=jsonl), batch=4, seed=7, read="memory", loading=READ)
-    indexed = load(Records(source=jsonl), batch=4, seed=7, read="indexed", loading=READ)
+    memory = loader(RecordsData(source=jsonl), batch=4, seed=7, read="memory", loading=READ)
+    indexed = loader(RecordsData(source=jsonl), batch=4, seed=7, read="indexed", loading=READ)
     left, right = memory.train(DataPartition()), indexed.train(DataPartition())
     try:
         for _ in range(12):
@@ -107,7 +111,7 @@ def test_a_native_prepared_tfds_split_reads_without_provisioning():
 def test_a_validation_pass_ends_with_each_record_scored_once(jsonl, read, workers):
     if read == "indexed":
         jsonl.provision()
-    data = load(Records(source=jsonl, validation=jsonl), batch=8, read=read,
+    data = loader(RecordsData(source=jsonl, validation=jsonl), batch=8, read=read,
                 loading=Loading(workers=workers, threads=1, read_buffer=4, worker_buffer=1))
     assert data.val is not None
     stream = data.val(DataPartition())
@@ -144,7 +148,7 @@ def test_validation_takes_accepted_rows_before_the_share_cut(jsonl, read):
 def test_a_shuffled_stream_restores_its_exact_next_batches(jsonl, read, workers):
     if read == "indexed":
         jsonl.provision()
-    data = load(Records(source=jsonl), batch=4, read=read, seed=19,
+    data = loader(RecordsData(source=jsonl), batch=4, read=read, seed=19,
                 loading=Loading(workers=workers, threads=1, read_buffer=4, worker_buffer=1))
     stream = data.train(DataPartition())
     try:
@@ -162,14 +166,14 @@ def test_a_shuffled_stream_restores_its_exact_next_batches(jsonl, read, workers)
 
 
 def test_a_per_share_position_refuses_another_worker_topology(jsonl):
-    data = load(Records(source=jsonl), batch=4, read="streamed", loading=READ)
+    data = loader(RecordsData(source=jsonl), batch=4, read="streamed", loading=READ)
     stream = data.train(DataPartition())
     try:
         next(stream)
         state = stream.get_state()
     finally:
         stream.close()
-    other = load(Records(source=jsonl), batch=4, read="streamed",
+    other = loader(RecordsData(source=jsonl), batch=4, read="streamed",
                  loading=Loading(workers=2, threads=1, read_buffer=4, worker_buffer=1)).train(DataPartition())
     try:
         with pytest.raises(ValueError, match=r"worker|topology|plan"):
@@ -199,7 +203,7 @@ def test_per_record_rng_draws_agree_with_plain_grain(draw, seed):
 
 def test_record_holdouts_are_disjoint_from_every_training_epoch():
     rows = [{"index": np.int32(index)} for index in range(24)]
-    data = load(Records(source=rows, validation=HoldOut(records=8)), batch=4,
+    data = loader(RecordsData(source=rows, validation=HoldOut(records=8)), batch=4,
                 read="memory", loading=READ)
     assert data.val is not None
     training, held = data.train(DataPartition()), data.val(DataPartition())

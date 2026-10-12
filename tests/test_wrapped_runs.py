@@ -14,7 +14,7 @@ import pytest
 
 import dew
 from dew.config import ModelConfig, TrainerConfig
-from dew.data import Loader
+from dew.data.dataset import Loader
 from dew.interop import Pretrained
 from dew.lora import AdapterRecord, LoRA
 from dew.nn.backbones.causal_transformer import CausalTransformer

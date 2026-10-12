@@ -20,7 +20,7 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 from recording import RecordingTracker
 from sharded import assert_sharded
 
-from dew.data import Loader
+from dew.data.dataset import Loader
 from dew.nn.backbones.dit import SimpleDiT
 from dew.nn.blocks import Upsample
 from dew.nn.conv import Conv

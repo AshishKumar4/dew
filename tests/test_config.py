@@ -14,7 +14,7 @@ from flax import linen as nn
 import dew.config
 import dew.nn.backbones
 from dew.config import ModelConfig, OptimConfig, RunConfig, TrainerConfig
-from dew.data import Loader
+from dew.data.dataset import Loader
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.vision import GemmaProjector, SiglipVision
 from dew.objectives.diffusion import DiffusionRunConfig
@@ -94,10 +94,10 @@ def test_a_registered_arrayrecord_spec_round_trips(tmp_path):
     """A registered recipe records its concrete type and source, so the
     fields that from_dict could not rebuild. Registered, it records as
     {'name', 'fields'} like every other dataset and loads back."""
-    from dew.data import Images
+    from dew.config.data import ImageData
 
     config = RunConfig(
-        data=Images(source=str(tmp_path), image_size=8),
+        data=ImageData(source=str(tmp_path), image_size=8),
         trainer=TrainerConfig(steps=1))
     loaded = RunConfig.from_dict(json.loads(json.dumps(config.to_dict())))
 
@@ -108,10 +108,10 @@ def test_a_registered_arrayrecord_spec_round_trips(tmp_path):
 def test_an_unregistered_member_fails_at_write_not_at_reload(tmp_path):
     """A spec the registry does not know cannot be written: to_dict raises
     now, instead of saving a record from_dict can never load back."""
-    from dew.data import Images
+    from dew.config.data import ImageData
 
     @dataclasses.dataclass(frozen=True)
-    class Unregistered(Images):
+    class Unregistered(ImageData):
         pass
 
     config = RunConfig(

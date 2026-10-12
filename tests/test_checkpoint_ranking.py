@@ -206,7 +206,7 @@ def test_training_values_are_selected_through_the_objective(tmp_path):
 
 def test_time_cadence_and_recorded_duration(tmp_path):
     from dew.config import TrainerConfig
-    from dew.data import Loader
+    from dew.data.dataset import Loader
 
     assert TrainerConfig(checkpoint_every="30m").checkpoint_interval(
         Loader(lambda p: iter(()), None, records=4, batch=2)

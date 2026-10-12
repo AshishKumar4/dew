@@ -6,7 +6,8 @@ from token_support import encoded_token_fixture
 
 from dew import Trainer
 from dew.config import OptimConfig
-from dew.data import Loading, Text, load
+from dew.config.data import TextData, loader
+from dew.data import Loading
 from dew.nn.backbones import CausalTransformer
 from dew.objectives.lm import LMObjective
 
@@ -20,9 +21,9 @@ def test_the_caps_print_what_they_changed_before_the_run(tmp_path, monkeypatch, 
     spec = importlib.util.spec_from_file_location("live_training", ROOT / "live_training.py")
     live_training = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(live_training)
-    capped_load, capped_fit = live_training.capped_load(load), live_training.capped_fit(Trainer.fit)
+    capped_load, capped_fit = live_training.capped_load(loader), live_training.capped_fit(Trainer.fit)
 
-    data = capped_load(Text(source=str(tokens), tokenizer="byte", seq_len=16), batch=64,
+    data = capped_load(TextData(source=str(tokens), tokenizer="byte", seq_len=16), batch=64,
                        read="memory", loading=Loading(workers=0))
     model = CausalTransformer(vocab_size=256, emb_features=16, num_layers=1, num_heads=2,
                               mlp_features=32, max_seq_len=32)

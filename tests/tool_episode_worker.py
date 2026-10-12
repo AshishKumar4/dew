@@ -20,7 +20,7 @@ def main() -> None:
     from episode_support import Harness, SquareSession, build
 
     from dew.coordination import collective_host
-    from dew.data import Loader
+    from dew.data.dataset import Loader
     from dew.objectives.rl import EpisodeStatus, Observation
     from dew.training.distributed import shard_batch
 

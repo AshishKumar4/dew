@@ -14,7 +14,10 @@ import pytest
 
 from dew.checkpoints import Checkpoints
 from dew.config import ModelConfig
-from dew.data import Loader, Loading, Memory, Pipeline, compile
+from dew.data import Loading, Memory
+from dew.data.compile import compile
+from dew.data.dataset import Loader
+from dew.data.pipeline import Pipeline
 from dew.diffusion import schedules, transforms
 from dew.diffusion.process import Process
 from dew.nn.backbones.causal_transformer import CausalTransformer

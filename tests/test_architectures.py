@@ -26,7 +26,8 @@ from recording import RecordingTracker
 
 from dew.artifacts import ImageGrid, Representations, TokenScores, VideoGrid
 from dew.config import ModelConfig, ObjectiveConfig
-from dew.data import Images, Loader
+from dew.config.data import ImageData
+from dew.data.dataset import Loader
 from dew.diffusion import presets
 from dew.inputs import Condition, ConditionEncoder, Field, InputSpec
 from dew.nn.attention import Stage
@@ -518,7 +519,7 @@ JSON_UNET = {"emb_features": 32, "feature_depths": [8, 16], "norm_groups": 4,
 def unet_run(fields):
     return DiffusionRunConfig(
         model=ModelConfig("unet", {**fields, "dtype": "float32", "attention_impl": "reference"}),
-        data=Images(source="tfds://oxford_flowers102", image_size=8), text=None,
+        data=ImageData(source="tfds://oxford_flowers102", image_size=8), text=None,
         objective=ObjectiveConfig("diffusion", {"guidance": None, "solver": Euler(), "steps": SAMPLER_STEPS}))
 
 

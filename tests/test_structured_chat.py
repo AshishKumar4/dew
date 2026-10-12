@@ -20,9 +20,10 @@ import numpy as np
 import pytest
 from transformers import AutoTokenizer
 
-from dew.data import Chat, Checkpointable, DataPartition, Loading, Prompts
+from dew.config.data import ChatData, PromptData, loader
+from dew.data import Loading
 from dew.data.chat import ROLES_KEY, Conversation, Role, render_conversation
-from dew.data.recipes import load
+from dew.data.dataset import Checkpointable, DataPartition
 
 TOKENIZERS = Path(__file__).resolve().parent / "fixtures" / "tokenizers"
 TOOLS_TOKENIZER = TOKENIZERS / "tiny-tools"
@@ -118,12 +119,12 @@ def test_prompt_sources_keep_structured_chat(tmp_path, tokenizer_path, storage):
 
         path = tmp_path / "prompts.parquet"
         pq.write_table(pa.Table.from_pylist([row]), path)
-        source = Prompts(source=str(path), tokenizer=str(tokenizer_path), max_prompt_len=1024)
+        source = PromptData(source=str(path), tokenizer=str(tokenizer_path), max_prompt_len=1024)
     else:
-        source = Prompts(source=tuple(json.loads(row) for row in (json.dumps(row),)),
+        source = PromptData(source=tuple(json.loads(row) for row in (json.dumps(row),)),
             tokenizer=str(tokenizer_path), max_prompt_len=1024)
 
-    batch = next(load(source, batch=1, read="memory", loading=Loading(workers=0),
+    batch = next(loader(source, batch=1, read="memory", loading=Loading(workers=0),
         validation_records=4 * (1)).train(DataPartition()))
 
     expected = tokenizer.apply_chat_template(
@@ -139,10 +140,10 @@ def test_prompt_media_is_refused_before_truncation():
     row = {"prompt": [{"role": "user", "content": [
         {"type": "image", "url": "file:///map.png"},
         {"type": "text", "text": "Weather in Paris?"}]}]}
-    spec = Prompts(source=tuple(json.loads(row) for row in (json.dumps(row),)),
+    spec = PromptData(source=tuple(json.loads(row) for row in (json.dumps(row),)),
         tokenizer=str(TOOLS_TOKENIZER), max_prompt_len=4)
     with pytest.raises(ValueError, match=r"prompt message 0.*image.*processor"):
-        next(load(spec, batch=1, read="memory", loading=Loading(workers=0),
+        next(loader(spec, batch=1, read="memory", loading=Loading(workers=0),
             validation_records=4 * (1)).train(DataPartition()))
 
 
@@ -174,9 +175,9 @@ def test_structured_packing_resumes_exact_tokens_and_masks(tmp_path, tools_token
                          hf["assistant_masks"]))
     path = tmp_path / "sft.parquet"
     pq.write_table(pa.Table.from_pylist(rows), path)
-    spec = Chat(source=str(path), tokenizer=str(TOOLS_TOKENIZER), seq_len=511, packing_bins=1,
+    spec = ChatData(source=str(path), tokenizer=str(TOOLS_TOKENIZER), seq_len=511, packing_bins=1,
         validation=str(path), long="chunk")
-    data = load(spec, batch=1, read="memory", loading=Loading(workers=0))
+    data = loader(spec, batch=1, read="memory", loading=Loading(workers=0))
     assert data.val is not None
     stream = data.val(DataPartition())
     assert isinstance(stream, Checkpointable)
@@ -184,7 +185,7 @@ def test_structured_packing_resumes_exact_tokens_and_masks(tmp_path, tools_token
     first = next(stream)
     position = stream.get_state()
     remaining = list(stream)
-    fresh = load(spec, batch=1, read="memory", loading=Loading(workers=0))
+    fresh = loader(spec, batch=1, read="memory", loading=Loading(workers=0))
     assert fresh.val is not None
     restored = fresh.val(DataPartition())
     assert isinstance(restored, Checkpointable)
@@ -424,7 +425,7 @@ def test_structured_rows_pack_with_their_tools(tmp_path, tools_tokenizer):
     ids, roles = render(tools_tokenizer, messages, [WEATHER])
     window = 512
 
-    data = load(Chat(source=str(path), tokenizer=str(TOOLS_TOKENIZER), seq_len=window - 1,
+    data = loader(ChatData(source=str(path), tokenizer=str(TOOLS_TOKENIZER), seq_len=window - 1,
         packing_bins=1, validation=str(path), long="chunk"), batch=1, read="memory",
             loading=Loading(workers=0), validation_records=4 * (1))
     assert data.val is not None
@@ -450,7 +451,7 @@ def test_rows_without_a_tools_column_render_plain(tmp_path, tools_tokenizer):
     pq.write_table(pa.table({"prompt": [messages]}), path)
     ids, roles = render(tools_tokenizer, messages)
 
-    data = load(Chat(source=str(path), tokenizer=str(TOOLS_TOKENIZER), seq_len=511, packing_bins=1,
+    data = loader(ChatData(source=str(path), tokenizer=str(TOOLS_TOKENIZER), seq_len=511, packing_bins=1,
         validation=str(path), long="chunk"), batch=1, read="memory", loading=Loading(workers=0),
             validation_records=4 * (1))
     assert data.val is not None
@@ -470,7 +471,7 @@ def test_jsonl_rows_pack_the_way_the_same_rows_do_in_parquet(tmp_path, tools_tok
         json.dumps({"messages": messages, "tools": [WEATHER]}) + "\n" for _ in range(2)))
     ids, roles = render(tools_tokenizer, messages, [WEATHER])
 
-    data = load(Chat(source=str(path), tokenizer=str(TOOLS_TOKENIZER), seq_len=1023, packing_bins=1,
+    data = loader(ChatData(source=str(path), tokenizer=str(TOOLS_TOKENIZER), seq_len=1023, packing_bins=1,
         validation=str(path), long="chunk"), batch=1, read="memory", loading=Loading(workers=0),
             validation_records=4 * (1))
 
@@ -502,7 +503,7 @@ def test_a_prepared_hub_split_packs_the_same_conversations(tmp_path, monkeypatch
     monkeypatch.setattr(HfApi, "dataset_info", lambda self, repo_id, **kwargs: SimpleNamespace(sha="abc123"))
     monkeypatch.setattr(hf_datasets, "load_dataset_builder", lambda *args, **kwargs: builder)
     source = Hub("acme/chat", revision="abc123", cache_dir=str(tmp_path / "arrow"))
-    data = load(Chat(source=source, validation=dataclasses.replace(source, split="test"),
+    data = loader(ChatData(source=source, validation=dataclasses.replace(source, split="test"),
                      tokenizer=str(TOOLS_TOKENIZER), seq_len=1023, packing_bins=1, long="chunk"),
                 batch=1, read="memory", loading=Loading(workers=0))
     assert data.val is not None
@@ -521,7 +522,7 @@ def test_a_source_that_holds_no_conversation_column_says_what_it_holds(tmp_path)
     path = tmp_path / "chat.jsonl"
     path.write_text(json.dumps({"conversation": [], "tools": None}) + "\n")
     with pytest.raises(ValueError, match=r"messages|prompt|conversation"):
-        load(Chat(source=str(path), tokenizer=str(CHAT_TOKENIZER)), batch=1, read="memory",
+        loader(ChatData(source=str(path), tokenizer=str(CHAT_TOKENIZER)), batch=1, read="memory",
             loading=Loading(workers=0))
 
 

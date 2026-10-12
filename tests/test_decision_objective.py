@@ -14,8 +14,8 @@ import pytest
 
 from dew.artifacts import Decisions
 from dew.checkpoints import Checkpoints
-from dew.data import DataPartition
-from dew.data.recipes import load
+from dew.config.data import loader
+from dew.data.dataset import DataPartition
 from dew.data.text import ByteTokenizer
 from dew.decision import (
     AURC,
@@ -248,7 +248,7 @@ def test_the_loss_scores_a_soft_target_as_its_rule_does():
             for index in range(8)]
     objective = DecisionObjective(tiny_backbone(), tokenizer=TOKENIZER, specials=SPECIALS, layout=LAYOUT,
                                   shuffle_options=False)
-    data = load(DecisionRecipe(source=soft, validation=soft), batch=8, read="memory",
+    data = loader(DecisionRecipe(source=soft, validation=soft), batch=8, read="memory",
         objective=objective.data())
     (batch,) = list(data.val(DataPartition()))
     batch = {name: value for name, value in batch.items() if name != VALID_ROWS}
@@ -284,7 +284,7 @@ def test_a_mixture_fills_each_step_at_its_weights():
     eight holds six rows of the first and two of the second."""
     small = [Example(f"zz {index}", {"team": INTENT}, {"team": "sales"}) for index in range(3)]
     objective = DecisionObjective(tiny_backbone(), tokenizer=TOKENIZER, specials=SPECIALS, layout=LAYOUT)
-    data = load(DecisionRecipe(source={"large": EXAMPLES * 5, "small": small},
+    data = loader(DecisionRecipe(source={"large": EXAMPLES * 5, "small": small},
                           weights={"large": 3.0, "small": 1.0}, validation=EXAMPLES),
                 batch=8, read="memory", objective=objective.data())
     stream = iter(data.train(DataPartition()))
@@ -307,7 +307,7 @@ def test_a_bucketed_stream_cuts_each_batch_just_past_its_longest_row():
     def read(**fields):
         objective = DecisionObjective(tiny_backbone(), tokenizer=TOKENIZER, specials=SPECIALS, layout=LAYOUT,
                                       shuffle_options=False, **fields)
-        data = load(DecisionRecipe(source=rows), batch=2, read="memory", objective=objective.data())
+        data = loader(DecisionRecipe(source=rows), batch=2, read="memory", objective=objective.data())
         stream = data.train(DataPartition())
         try:
             return objective, [{name: np.array(value, copy=True) for name, value in batch.items()}
@@ -374,8 +374,8 @@ def test_a_held_pass_is_cut_as_training_is_and_scores_every_row_once(bucket, bat
                 in zip(batch["tokens"], batch["valid"], found, real, strict=True) if kept]
 
     recipe = DecisionRecipe(source=HELD, validation=HELD)
-    oracle = load(recipe, batch=len(HELD), read="memory", objective=plain.data())
-    data = load(recipe, read="memory", objective=cutting.data(), **batching)
+    oracle = loader(recipe, batch=len(HELD), read="memory", objective=plain.data())
+    data = loader(recipe, read="memory", objective=cutting.data(), **batching)
     (whole,) = list(oracle.val(DataPartition()))
     expected = dict(scored(plain, whole))
     batches = list(data.val(DataPartition()))
@@ -420,7 +420,7 @@ def test_lora_trains_its_factors_and_the_head_over_a_fixed_base_and_reloads_from
     adapter = LoRA(rank=4, modules=("q_proj", "v_proj")).apply(model, base, key=1)
     objective = DecisionObjective(adapter, tokenizer=TOKENIZER, specials=SPECIALS, layout=LAYOUT,
                                   loss=LogLoss() + 0.5 * Brier())
-    data = load(DecisionRecipe(source=EXAMPLES, validation=EXAMPLES), batch=8, read="memory",
+    data = loader(DecisionRecipe(source=EXAMPLES, validation=EXAMPLES), batch=8, read="memory",
         objective=objective.data())
     checkpoints = Checkpoints(str(tmp_path), keep=1)
     start = objective.init(jax.random.key(2))
@@ -455,11 +455,11 @@ def test_a_held_out_row_fewer_than_a_batch_counts_once_in_the_loss_and_the_metri
     from dew.training.evaluation import Evaluation
 
     objective = DecisionObjective(tiny_backbone(), tokenizer=TOKENIZER, specials=SPECIALS, layout=LAYOUT)
-    data = load(DecisionRecipe(source=EXAMPLES, validation=EXAMPLES[:1]), batch=8, read="memory",
+    data = loader(DecisionRecipe(source=EXAMPLES, validation=EXAMPLES[:1]), batch=8, read="memory",
         objective=objective.data())
     variables = objective.init(jax.random.key(0))
     result = Evaluation.run(objective, variables, data.val, key=0, metrics=(Accuracy(),), loss=True)
-    alone = load(DecisionRecipe(source=EXAMPLES, validation=EXAMPLES[:1]), batch=1, read="memory",
+    alone = loader(DecisionRecipe(source=EXAMPLES, validation=EXAMPLES[:1]), batch=1, read="memory",
         objective=objective.data())
     (row,) = list(alone.val(DataPartition()))
     row = {name: value for name, value in row.items() if name != VALID_ROWS}
@@ -502,7 +502,7 @@ def test_a_saved_vision_run_answers_image_rows(tmp_path, separate_tokenizer):
     task = Decide(base.model, base.init(jax.random.key(0)), layout, tokenizer, base.specials,
                   processor=source.processor)
     objective = DecisionObjective(task)
-    data = load(DecisionRecipe(source=EXAMPLES), batch=8, read="memory", objective=objective.data())
+    data = loader(DecisionRecipe(source=EXAMPLES), batch=8, read="memory", objective=objective.data())
     run = tmp_path / "run"
     checkpoints = Checkpoints(str(run), keep=1)
     state = Trainer(objective, optax.adam(1e-3), key=0, checkpoints=checkpoints).fit(
@@ -542,7 +542,7 @@ def test_a_saved_byte_decision_run_records_no_tokenizer_backed_processor(tmp_pat
     task = Decide(base.model, base.init(jax.random.key(0)), LAYOUT, TOKENIZER, SPECIALS,
                   processor=source.processor)
     objective = DecisionObjective(task)
-    data = load(DecisionRecipe(source=EXAMPLES), batch=8, read="memory", objective=objective.data())
+    data = loader(DecisionRecipe(source=EXAMPLES), batch=8, read="memory", objective=objective.data())
     run = tmp_path / "run"
     checkpoints = Checkpoints(str(run), keep=1)
     state = Trainer(objective, optax.adam(1e-3), key=0, checkpoints=checkpoints).fit(
@@ -568,7 +568,7 @@ def test_calibration_counts_33_validation_rows_once_at_batch_32():
     held = [Example(f"charged twice {index}", {"team": INTENT}, {"team": "billing"})
             for index in range(33)]
     objective = DecisionObjective(tiny_backbone(), tokenizer=TOKENIZER, specials=SPECIALS, layout=LAYOUT)
-    data = load(DecisionRecipe(source=EXAMPLES * 4, validation=held), batch=32, read="memory",
+    data = loader(DecisionRecipe(source=EXAMPLES * 4, validation=held), batch=32, read="memory",
                 objective=objective.data())
     task = Decide(objective.model, objective.init(jax.random.key(0)), LAYOUT, TOKENIZER, SPECIALS)
 
@@ -584,7 +584,7 @@ def test_a_calibration_comes_back_with_the_weights_it_was_fitted_on(tmp_path):
     on; trained further, the run's latest weights refuse it rather than
     reuse it stale."""
     objective = DecisionObjective(tiny_backbone(), tokenizer=TOKENIZER, specials=SPECIALS, layout=LAYOUT)
-    data = load(DecisionRecipe(source=EXAMPLES, validation=EXAMPLES), batch=8, read="memory",
+    data = loader(DecisionRecipe(source=EXAMPLES, validation=EXAMPLES), batch=8, read="memory",
         objective=objective.data())
     checkpoints = Checkpoints(str(tmp_path), keep=2)
     trainer = Trainer(objective, optax.adam(1e-3), key=0, checkpoints=checkpoints)
@@ -621,7 +621,7 @@ def test_diffusion_gemma_reads_each_row_once_whole_and_reloads_from_the_run(tmp_
     chosen = DecisionObjective(model, tokenizer=TOKENIZER, specials=SPECIALS).layout
     assert isinstance(chosen, StateFirstLayout)
     objective = DecisionObjective(model, tokenizer=TOKENIZER, specials=SPECIALS, layout=LAYOUT)
-    data = load(DecisionRecipe(source=EXAMPLES, validation=EXAMPLES), batch=8, read="memory",
+    data = loader(DecisionRecipe(source=EXAMPLES, validation=EXAMPLES), batch=8, read="memory",
         objective=objective.data())
     checkpoints = Checkpoints(str(tmp_path), keep=1)
     state = Trainer(objective, optax.adam(1e-2), key=0, checkpoints=checkpoints).fit(

@@ -23,7 +23,7 @@ def test_hub_builder_uses_the_resolved_commit_and_named_configuration(tmp_path, 
     monkeypatch.setattr(HfApi, "dataset_info", lambda self, repo_id, **kwargs: SimpleNamespace(sha="frozen"))
     monkeypatch.setattr(datasets, "load_dataset_builder", lambda repo, **kwargs:
                         requested.append((repo, kwargs)) or expected)
-    source = Hub("acme/records", split="validation", config="named", revision="release", cache_dir="arrow")
+    source = Hub("acme/records", split="validation", name="named", revision="release", cache_dir="arrow")
     assert source.builder is expected
     assert requested == [("acme/records", {"name": "named", "revision": "frozen", "cache_dir": "arrow"})]
     assert source.snapshot() == {"store": "hf", "repo": "acme/records", "revision": "frozen",
@@ -38,7 +38,9 @@ def test_a_split_prepared_in_two_caches_is_one_snapshot_and_one_plan(tmp_path, m
     import datasets
     from huggingface_hub import HfApi
 
-    from dew.data import Loading, Pipeline, compile
+    from dew.data import Loading
+    from dew.data.compile import compile
+    from dew.data.pipeline import Pipeline
 
     rows = tmp_path / "rows.parquet"
     datasets.Dataset.from_dict({"id": list(range(8))}).to_parquet(rows)
@@ -70,7 +72,10 @@ def test_a_split_with_no_shards_and_no_conversion_reads_indexed_but_not_streamed
     from huggingface_hub.errors import RevisionNotFoundError
     from huggingface_hub.hf_api import GitRefs
 
-    from dew.data import DataPartition, Loading, Pipeline, compile
+    from dew.data import Loading
+    from dew.data.compile import compile
+    from dew.data.dataset import DataPartition
+    from dew.data.pipeline import Pipeline
 
     def metadata(self, repo_id, revision=None, **kwargs):
         if revision == "refs/convert/parquet":
@@ -106,7 +111,10 @@ def test_a_prepared_arrow_read_resumes_when_only_the_parquet_conversion_moves(tm
     from huggingface_hub import HfApi
     from huggingface_hub.hf_api import GitRefInfo, GitRefs
 
-    from dew.data import DataPartition, Loading, Pipeline, compile
+    from dew.data import Loading
+    from dew.data.compile import compile
+    from dew.data.dataset import DataPartition
+    from dew.data.pipeline import Pipeline
 
     rows = tmp_path / "rows.parquet"
     datasets.Dataset.from_dict({"id": list(range(8))}).to_parquet(rows)
@@ -153,7 +161,10 @@ def test_an_indexed_hub_read_does_not_list_refs_or_files(tmp_path, monkeypatch):
     import datasets
     from huggingface_hub import HfApi
 
-    from dew.data import DataPartition, Loading, Pipeline, compile
+    from dew.data import Loading
+    from dew.data.compile import compile
+    from dew.data.dataset import DataPartition
+    from dew.data.pipeline import Pipeline
 
     rows = tmp_path / "rows.parquet"
     datasets.Dataset.from_dict({"id": list(range(8))}).to_parquet(rows)
@@ -178,7 +189,7 @@ def test_an_indexed_hub_read_does_not_list_refs_or_files(tmp_path, monkeypatch):
 
 
 def test_hub_bindings_are_frozen():
-    source = Hub("acme/records", config="named")
+    source = Hub("acme/records", name="named")
     with pytest.raises(FrozenInstanceError):
         source.config = "another"
 
@@ -209,7 +220,7 @@ def absent(name, *args, **kwargs):
     return original(name, *args, **kwargs)
 builtins.__import__ = absent
 from dew.data.sources.hub import Hub
-source = Hub('acme/records', config='named', revision='frozen')
+source = Hub('acme/records', name='named', revision='frozen')
 source.__dict__['commit'] = 'frozen'
 try:
     source.builder
@@ -237,7 +248,9 @@ def test_a_memory_read_of_a_hub_image_split_holds_its_encoded_images(tmp_path, m
     from huggingface_hub.hf_api import GitRefs
     from PIL import Image as PILImage
 
-    from dew.data import DataPartition, Images, Loading, load
+    from dew.config.data import ImageData, loader
+    from dew.data import Loading
+    from dew.data.dataset import DataPartition
 
     pixels = [np.full((8, 8, 3), 30 * index, np.uint8) for index in range(4)]
     encoded = []
@@ -257,7 +270,7 @@ def test_a_memory_read_of_a_hub_image_split_holds_its_encoded_images(tmp_path, m
     monkeypatch.setattr(datasets, "load_dataset_builder", lambda *args, **kwargs: builder)
     held = Hub("acme/images").records("memory")
     assert [held[index]["image"]["bytes"] for index in range(4)] == [value["bytes"] for value in encoded]
-    data = load(Images(Hub("acme/images"), image_size=8, augment=None), batch=4, read="memory",
+    data = loader(ImageData(Hub("acme/images"), image_size=8, augment=None), batch=4, read="memory",
                 loading=Loading(workers=0, threads=1, read_buffer=1))
     reader = data.train(DataPartition())
     try:

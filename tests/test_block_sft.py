@@ -17,8 +17,9 @@ import optax
 import pytest
 from safetensors.numpy import load_file
 
-from dew import Loader, Trainer
+from dew import Trainer
 from dew.checkpoints import Checkpoints
+from dew.data.dataset import Loader
 from dew.interop import Pretrained
 from dew.interop.diffusion_gemma import translate_weights
 from dew.nn.inputs import ModelInputs

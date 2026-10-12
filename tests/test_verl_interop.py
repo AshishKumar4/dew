@@ -15,7 +15,8 @@ import numpy as np
 import pyarrow.parquet as pq
 import pytest
 
-from dew.data import Loading, Prompts
+from dew.config.data import PromptData
+from dew.data import Loading
 from dew.data.compile import iterate
 from dew.data.prompts import INFO_KEY, SOURCE_KEY, TRUTH_KEY
 from dew.objectives.rl.sessions import (
@@ -166,7 +167,7 @@ def test_native_rows_group_as_verl_interleaves_its_samples():
 
 def test_the_verl_rl_parquet_reads_its_nested_ground_truth():
     table = pq.read_table(PARQUET).to_pylist()
-    pipeline, _, _ = Prompts(source=str(PARQUET), tokenizer="tests/fixtures/tokenizers/tiny-tools",
+    pipeline, _, _ = PromptData(source=str(PARQUET), tokenizer="tests/fixtures/tokenizers/tiny-tools",
                              max_prompt_len=512, long="truncate").pipelines()
     rows = list(iterate(pipeline, read="memory", loading=Loading(workers=0)))
     for index, expected in enumerate(table):

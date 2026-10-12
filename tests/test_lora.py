@@ -33,7 +33,7 @@ from reference_error import assert_as_exact_as_the_reference
 from safetensors.numpy import load_file, save_file
 
 from dew import lora
-from dew.data import Loader
+from dew.data.dataset import Loader
 from dew.diffusion.process import DenoisingCondition
 from dew.inputs.diffusion import _text_features
 from dew.interop.pretrained import Pretrained

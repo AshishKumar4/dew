@@ -10,7 +10,7 @@ import pytest
 from model_support import decoder
 from rl_support import clipped_surrogate
 
-from dew.data import Loader
+from dew.data.dataset import Loader
 from dew.nn.inputs import ModelInputs
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective

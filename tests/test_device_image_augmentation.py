@@ -10,7 +10,9 @@ import numpy as np
 import pytest
 from steady_state import guarded, steady_state
 
-from dew.data import Augment, DataPartition, Images, Loading, Memory, load
+from dew.config.data import Augment, ImageData, loader
+from dew.data import Loading, Memory
+from dew.data.dataset import DataPartition
 
 TORCHVISION = np.load(Path(__file__).resolve().parent / "fixtures" / "colour_jitter" / "torchvision.npz")
 
@@ -21,13 +23,14 @@ READ = Loading(workers=0, threads=1, read_buffer=2)
 def spec(*, backend="device", augment=True, crop_scale=(1.0, 1.0), staging_size=None):
     rows = [{"image": np.random.default_rng(index).integers(
         0, 256, (19, 23, 3), dtype=np.uint8), "label": index} for index in range(24)]
-    return Images(source=Memory(rows), image_size=12, caption="a flower", staging_size=staging_size,
+    return ImageData(source=Memory(rows), image_size=12, caption="a flower", staging_size=staging_size,
                   augment=Augment(flip=True, jitter=True, crop_scale=crop_scale,
                       backend=backend) if augment else None)
 
 
 def test_device_pipeline_returns_resident_uint8_and_resumes_exactly():
-    data = load(spec(backend="device", crop_scale=(0.5, 0.9)), batch=4, read="memory", seed=37, loading=READ)
+    data = loader(spec(backend="device", crop_scale=(0.5, 0.9)), batch=4, read="memory", seed=37,
+                  loading=READ)
     stream = data.train(DataPartition())
     resumed = data.train(DataPartition())
     try:
@@ -150,8 +153,8 @@ def test_model_float64_mode_changes_no_data_draw():
 
 
 def test_device_none_keeps_the_old_resize_bit_identical():
-    host = load(spec(augment=False), batch=4, read="memory", seed=37, loading=READ).train(DataPartition())
-    device = load(spec(augment=False, backend="device"), batch=4, read="memory", seed=37,
+    host = loader(spec(augment=False), batch=4, read="memory", seed=37, loading=READ).train(DataPartition())
+    device = loader(spec(augment=False, backend="device"), batch=4, read="memory", seed=37,
         loading=READ).train(DataPartition())
     try:
         np.testing.assert_array_equal(next(device)["image"], next(host)["image"])
@@ -163,7 +166,7 @@ def test_device_none_keeps_the_old_resize_bit_identical():
 def test_device_pixels_are_not_fetched_back_when_the_trainer_places_them():
     from dew.training.distributed import MeshSpec, shard_batch
 
-    stream = load(spec(backend="device"), batch=4, read="memory", seed=37,
+    stream = loader(spec(backend="device"), batch=4, read="memory", seed=37,
         loading=READ).train(DataPartition())
     try:
         batch = next(stream)
@@ -179,9 +182,9 @@ def test_device_pixels_are_not_fetched_back_when_the_trainer_places_them():
 def test_device_draws_follow_record_keys_across_threads_and_partitions():
     original = spec(backend="device", crop_scale=(0.6, 0.9))
     threaded = Loading(workers=0, threads=4, read_buffer=8)
-    whole = load(original, batch=4, read="memory", seed=37, loading=READ).train(DataPartition())
-    parallel = load(original, batch=4, read="memory", seed=37, loading=threaded).train(DataPartition())
-    shares = [load(original, batch=4, read="memory", seed=37, loading=READ).train(DataPartition(index=i,
+    whole = loader(original, batch=4, read="memory", seed=37, loading=READ).train(DataPartition())
+    parallel = loader(original, batch=4, read="memory", seed=37, loading=threaded).train(DataPartition())
+    shares = [loader(original, batch=4, read="memory", seed=37, loading=READ).train(DataPartition(index=i,
         count=2)) for i in range(2)]
     try:
         for _ in range(3):
@@ -201,8 +204,8 @@ def test_device_draws_follow_record_keys_across_threads_and_partitions():
 def test_grain_workers_only_decode_and_keep_the_parent_device_draws():
     original = spec(backend="device", crop_scale=(0.6, 0.9))
     worker_loading = Loading(workers=1, threads=1, read_buffer=2)
-    parent = load(original, batch=4, read="memory", seed=37, loading=READ).train(DataPartition())
-    worker = load(original, batch=4, read="memory", seed=37, loading=worker_loading).train(DataPartition())
+    parent = loader(original, batch=4, read="memory", seed=37, loading=READ).train(DataPartition())
+    worker = loader(original, batch=4, read="memory", seed=37, loading=worker_loading).train(DataPartition())
     try:
         for _ in range(3):
             expected, actual = next(parent), next(worker)
@@ -230,7 +233,7 @@ def test_a_device_augmented_stream_steadies_into_compiled_reads_the_loop_waits_o
     from dew.training.distributed import DevicePrefetchIterator, MeshSpec
 
     mesh = MeshSpec().build([jax.devices()[0]])
-    stream = load(spec(backend="device", crop_scale=(0.5, 0.9)), batch=4, read="memory", seed=37,
+    stream = loader(spec(backend="device", crop_scale=(0.5, 0.9)), batch=4, read="memory", seed=37,
         loading=READ).train(DataPartition())
     with DevicePrefetchIterator(stream, mesh) as prefetch:
         for _ in range(3):

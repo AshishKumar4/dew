@@ -18,8 +18,7 @@ import pytest
 from affine_run import TimingRegression as Regression, batches
 
 from dew.artifacts import Representations
-from dew.data import DataPartition, Loader
-from dew.data.dataset import mapped
+from dew.data.dataset import DataPartition, Loader, mapped
 from dew.data.readers import _Host
 from dew.training import Checkpoints, MeshSpec, ProfileWindow, Trainer
 from dew.training.distributed import DevicePrefetchIterator

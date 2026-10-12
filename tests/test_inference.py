@@ -22,7 +22,9 @@ import dew
 import dew.nn.backbones  # registers the models
 from dew.artifacts import VideoGrid
 from dew.config import ModelConfig, ObjectiveConfig, TrainerConfig
-from dew.data import ByteTokenizer, Images as ImageRecipe, Loader, Video
+from dew.config.data import ImageData as ImageRecipe, VideoData
+from dew.data import ByteTokenizer
+from dew.data.dataset import Loader
 from dew.diffusion import FlowMatchPredictionTransform
 from dew.diffusion.presets import EDM, Flow
 from dew.diffusion.schedules import FlowMatchingScheduler
@@ -369,7 +371,7 @@ def test_build_eval_metrics_follows_the_sample_field(tmp_path):
     factories read that grid there, and an image-only metric raises a
     ValueError naming it in `build_eval_metrics`, before the trainer."""
     video = dataclasses.replace(run_config(tmp_path),
-                                data=Video(source="clips", frame_size=8, frames=2),
+                                data=VideoData(source="clips", frame_size=8, frames=2),
                                 val_metrics=("psnr",))
     (metric,) = video.build_eval_metrics()
     images = np.zeros((2, 2, 8, 8, 3), np.uint8)

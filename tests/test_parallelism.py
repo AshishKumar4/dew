@@ -19,8 +19,9 @@ from recording import RecordingTracker
 from sharded import assert_sharded
 
 from dew.artifacts import Representations
-from dew.data import DataPartition, Loader, Loading
-from dew.data.recipes import load
+from dew.config.data import loader
+from dew.data import Loading
+from dew.data.dataset import DataPartition, Loader
 from dew.inputs import unit_range
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.dit import SimpleDiT
@@ -611,14 +612,14 @@ def test_prefetch_iterator_resumes_a_packed_dataset_iterator(tmp_path):
     position as a dict where the DataLoader reports JSON bytes. A checkpoint
     holds bytes, so the position has to arrive as bytes and go back as a
     dict."""
-    from dew.data import Text
+    from dew.config.data import TextData
 
     documents = np.concatenate([np.arange(1, 9), [0]] * 40).astype(np.uint16)
     (tmp_path / "train.bin").write_bytes(documents.tobytes())
     (tmp_path / "val.bin").write_bytes(documents.tobytes())
     (tmp_path / "meta.json").write_text(json.dumps(
         {"tokenizer": "byte", "vocab_size": 256, "dtype": "uint16", "eos_id": 0}))
-    data = load(Text(source=str(tmp_path), pack="first-fit", seq_len=8, packing_bins=2),
+    data = loader(TextData(source=str(tmp_path), pack="first-fit", seq_len=8, packing_bins=2),
         batch=jax.device_count(), read="memory", seed=0, loading=Loading(workers=0),
             validation_records=4 * (jax.device_count()))
 

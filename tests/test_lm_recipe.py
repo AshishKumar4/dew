@@ -12,7 +12,9 @@ from token_support import write_token_corpus
 
 import dew
 from dew.config import ObjectiveConfig
-from dew.data import Loading, Text, load
+from dew.config.data import TextData, loader
+from dew.data import Loading
+from dew.data.dataset import Loader
 from dew.inference import TextGeneration
 from dew.objectives.lm import LMObjective, LMRunConfig
 from dew.objectives.lm.config import token_vocabulary
@@ -70,9 +72,9 @@ def test_the_sampling_budget_decides_the_context_the_model_is_built_for(tmp_path
 def test_a_dataset_that_is_not_a_token_directory_says_so(tmp_path):
     (tmp_path / "train.bin").write_bytes(bytes(range(64)))
     with pytest.raises(FileNotFoundError, match="producer metadata"):
-        token_vocabulary(Text(source=str(tmp_path)))
+        token_vocabulary(TextData(source=str(tmp_path)))
     with pytest.raises(ValueError, match=r"--data.source"):
-        token_vocabulary(Text(source=""))
+        token_vocabulary(TextData(source=""))
 
 
 def test_a_tokenizer_that_does_not_match_the_token_files_is_rejected(tmp_path):
@@ -102,7 +104,7 @@ def test_the_recipe_trains_on_tokenized_files(tmp_path, packed):
 
     state = config.run()
 
-    data = load(config.data, batch=8, read="memory", loading=Loading(workers=0))
+    data = loader(config.data, batch=8, read="memory", loading=Loading(workers=0))
     assert data.steps_per_epoch is not None and int(state.step) == data.steps_per_epoch > 0
     run = tmp_path / "runs" / "run"
     assert (run / str(int(state.step))).is_dir()
@@ -158,7 +160,7 @@ def test_weighted_corpora_from_different_vocabularies_are_refused(tmp_path):
     meta = json.loads((second / "meta.json").read_text())
     (second / "meta.json").write_text(json.dumps({**meta, "vocab_size": 512}))
     with pytest.raises(ValueError, match="vocab"):
-        token_vocabulary(Text(source={str(first): 0.5, str(second): 0.5}, pack="first-fit"))
+        token_vocabulary(TextData(source={str(first): 0.5, str(second): 0.5}, pack="first-fit"))
 
 
 def test_the_recipe_trains_muonclip_with_the_clip_firing(tmp_path):
@@ -266,7 +268,7 @@ def test_the_recipe_continues_a_pretrained_decoder(tmp_path):
 
 
 def test_a_pretrained_run_starts_from_the_checkpoints_weights(tmp_path):
-    """Zero steps hold what the checkpoint carries, leaf for leaf: the load
+    """Zero steps hold what the checkpoint carries, leaf for leaf: the loader
     is a continuation, not a fresh init of the same shape."""
     from dew.interop import Pretrained
 
@@ -467,7 +469,7 @@ def test_a_trained_export_round_trips_with_its_tokenizer(tmp_path):
     The checkpoint is exported with the tokenizer its ids came from, the
     recipe continues it for a step, `Pretrained.save` writes the trained
     weights back out, and the second directory is loaded again: it carries
-    the same tokenizer files, so the load hands back a processor and a text
+    the same tokenizer files, so the loader hands back a processor and a text
     prompt generates text without the caller naming a tokenizer anywhere.
     An export that only recorded a `tokenizer_name` lands here as a
     `processor` of None, which is also what leaves a directory that
@@ -558,9 +560,9 @@ def test_the_recipe_trains_the_prediction_depths_on_request(tmp_path):
 
 def test_an_objective_the_recipe_does_not_train_is_refused():
     with pytest.raises(KeyError, match="no objective named 'ctc'"):
-        LMRunConfig(data=Text(source="", seq_len=64), objective=ObjectiveConfig("ctc"))
+        LMRunConfig(data=TextData(source="", seq_len=64), objective=ObjectiveConfig("ctc"))
     with pytest.raises(ValueError, match="--objective"):
-        LMRunConfig(data=Text(source="", seq_len=64), objective=ObjectiveConfig("jepa"))
+        LMRunConfig(data=TextData(source="", seq_len=64), objective=ObjectiveConfig("jepa"))
 
 
 def test_masked_diffusion_trains_on_packed_documents(tmp_path):
@@ -597,7 +599,7 @@ def test_masked_diffusion_trains_on_packed_documents(tmp_path):
     assert int(state.updates) == 2
     original = Pretrained.load(str(checkpoint), dtype="float32", attention_impl="xla")
     objective = config.masked_objective(original.model, original.model_config, None)
-    batch = next(iter(load(config.data, batch=8, read="memory",
+    batch = next(iter(loader(config.data, batch=8, read="memory",
         loading=Loading(workers=0)).val(DataPartition())))
     padding = np.asarray(batch["text_segment_ids"]) == 0
     assert padding.any() and not padding.all()
@@ -619,7 +621,7 @@ def test_masked_diffusion_without_a_mask_id_is_refused():
     model = models.build("causal_transformer", vocab_size=256, emb_features=16,
                          num_layers=1, num_heads=2, max_seq_len=SEQ, causal=False)
     with pytest.raises(ValueError, match="mask token id"):
-        LMRunConfig(data=Text(source="", seq_len=SEQ), objective=ObjectiveConfig("masked_diffusion")
+        LMRunConfig(data=TextData(source="", seq_len=SEQ), objective=ObjectiveConfig("masked_diffusion")
                     ).masked_objective(model, {}, None)
 
 
@@ -631,7 +633,7 @@ def test_masked_diffusion_on_a_causal_model_is_refused():
     model = models.build("causal_transformer", vocab_size=256, emb_features=16,
                          num_layers=1, num_heads=2, max_seq_len=SEQ)
     with pytest.raises(ValueError, match="causal=False"):
-        LMRunConfig(data=Text(source="", seq_len=SEQ), objective=ObjectiveConfig("masked_diffusion")
+        LMRunConfig(data=TextData(source="", seq_len=SEQ), objective=ObjectiveConfig("masked_diffusion")
                     ).masked_objective(model, {"mask_token_id": 5}, None)
 
 
@@ -732,7 +734,7 @@ def test_a_trained_block_diffusion_tree_saves_back_over_its_source(tmp_path):
     export is refused (tests/test_block_sft.py)."""
     import optax
 
-    from dew import Loader, Trainer
+    from dew import Trainer
     from dew.interop import Pretrained
     from dew.objectives.base import Step, thaw
     from dew.objectives.diffusion.block import BlockDiffusionObjective
@@ -765,9 +767,9 @@ def test_the_shipped_lm_run_config_round_trips_through_its_record():
     sampling policy survive `run.json` as the values they went in as. A chat
     spec is a record the class takes, and training it is refused: an LM
     run trains on token files."""
-    from dew.data import Chat
+    from dew.config.data import ChatData
 
-    chat = Chat(source="chat.parquet", tokenizer="byte", seq_len=16, long="chunk")
+    chat = ChatData(source="chat.parquet", tokenizer="byte", seq_len=16, long="chunk")
     config = LMRunConfig(data=chat, tokenizer="gpt2", max_new_tokens=8,
                          objective=ObjectiveConfig("lm", {"ema_decay": 0.99}),
                          sampling=Sampling(temperature=0.5, top_k=7))
@@ -780,5 +782,5 @@ def test_the_shipped_lm_run_config_round_trips_through_its_record():
     assert "ema_decay" not in record["objective"]["defaults"]
     assert record["sampling"]["temperature"] == 0.5 and record["sampling"]["top_k"] == 7
     assert LMRunConfig.from_dict(record) == config
-    with pytest.raises(ValueError, match="trains on a Text recipe"):
+    with pytest.raises(ValueError, match="trains on a TextData recipe"):
         config.prepare()

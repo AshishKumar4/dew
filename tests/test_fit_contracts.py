@@ -7,7 +7,10 @@ import pytest
 from recording import RecordingTracker
 
 from dew.artifacts import Representations
-from dew.data import DataPartition, Memory, Pipeline, compile
+from dew.data import Memory
+from dew.data.compile import compile
+from dew.data.dataset import DataPartition
+from dew.data.pipeline import Pipeline
 from dew.eval.common import Mean
 from dew.inputs import Field, InputSpec
 from dew.objectives.base import Aux, Objective, Ratio, Step

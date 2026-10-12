@@ -22,7 +22,8 @@ from flax import linen as nn
 from model_support import flat_tree
 
 from dew.checkpoints import Checkpoints
-from dew.data import ByteTokenizer, Loader
+from dew.data import ByteTokenizer
+from dew.data.dataset import Loader
 from dew.diffusion.discrete import MDLM, Unmask
 from dew.inference import RunProcessor, pipeline
 from dew.interop import Pretrained

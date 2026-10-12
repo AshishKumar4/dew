@@ -36,7 +36,7 @@ def records():
 
 
 def batches():
-    return Pipeline(records()).map(Geometry(), rejects=False).shuffle(7).repeat().batch(
+    return Pipeline(records()).map(Geometry()).shuffle(7).repeat().batch(
         tokens=64, lengths=(4, 8, 16))
 
 
@@ -78,7 +78,7 @@ def test_token_budget_restores_mid_window_without_buffer_in_checkpoint():
 
 def test_token_budget_validation_keeps_partial_rows_with_a_mask():
     validation = Pipeline(Memory(({"id": np.int32(0), "length": np.int32(14)},))).map(
-        Geometry(), rejects=False).batch(tokens=64, lengths=(4, 8, 16), drop_remainder=False)
+        Geometry()).batch(tokens=64, lengths=(4, 8, 16), drop_remainder=False)
     data = compile(batches(), validation=validation, read="memory", loading=READ)
     reader = data.val(DataPartition())
     try:

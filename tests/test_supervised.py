@@ -16,7 +16,9 @@ from affine_run import Affine, dataset
 from flax import linen as nn
 
 from dew.config import ModelConfig, ObjectiveConfig, RunConfig, TrainerConfig
-from dew.data import Loading, Memory, Pipeline, compile
+from dew.data import Loading, Memory
+from dew.data.compile import compile
+from dew.data.pipeline import Pipeline
 from dew.inputs import Field, InputSpec
 from dew.objectives.base import VALID_ROWS, Step
 from dew.objectives.supervised import Accuracy, CrossEntropy, Supervised

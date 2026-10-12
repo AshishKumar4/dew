@@ -10,7 +10,7 @@ import jax
 import numpy as np
 from episode_support import build
 
-from dew.data import Loader
+from dew.data.dataset import Loader
 from dew.objectives.rl import EpisodeJournal
 from dew.rl.sandbox import SandboxLimits, SubprocessEnvironment
 

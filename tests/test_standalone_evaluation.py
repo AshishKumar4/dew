@@ -10,8 +10,9 @@ import pytest
 from jax.sharding import NamedSharding, PartitionSpec as P
 from steady_state import steady_state
 
-from dew import Evaluation, Loader, Trainer
+from dew import Evaluation, Trainer
 from dew.artifacts import TextSamples, TokenScores
+from dew.data.dataset import Loader
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.objectives.base import Aux, Objective
 from dew.objectives.lm import LMObjective, Perplexity, Samples
