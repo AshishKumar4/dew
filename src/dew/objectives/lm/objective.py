@@ -35,7 +35,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn, struct
-from flax.traverse_util import flatten_dict, unflatten_dict
+from flax.traverse_util import unflatten_dict
 
 from dew.artifacts import Artifact, TextSamples, TokenScores
 from dew.coordination import agreed, collective_host
@@ -259,10 +259,10 @@ def _indexer_kls(sown: Variables) -> list[jax.Array]:
     return kls
 
 
-def _leaf_paths(tree: Variables) -> set[tuple[str, ...]]:
-    """Return the dict-key path of every leaf of a variables subtree."""
-    return {tuple(entry.key for entry in path)
-            for path, _ in jax.tree_util.tree_leaves_with_path(tree)}
+def _leaves(tree: Variables) -> dict[tuple[str, ...], jax.Array]:
+    """Every leaf of a variables subtree, by its dict-key path."""
+    return {tuple(entry.key for entry in path): leaf
+            for path, leaf in jax.tree_util.tree_leaves_with_path(tree)}
 
 
 def _prepared(tokens: ModelInputs | jax.Array, segment_ids: jax.Array | None = None,
@@ -370,14 +370,6 @@ def text_preview[S](phase: str, setup: Callable[[], S | None],
 ROUTER_BIAS = "e_score_correction_bias"
 
 
-def _at(tree: Variables, path: tuple[str, ...]) -> jax.Array | None:
-    """The leaf at `path` in `tree`, or None where `tree` holds none."""
-    *branches, leaf = path
-    for key in branches:
-        tree = tree.get(key, {})
-    return tree.get(leaf)
-
-
 def router_counts(moe: Variables, routing: Variables) -> Variables:
     """Count the slots each router the forward ran selected, at the path of
     the balancing bias it keeps in `moe`.
@@ -386,12 +378,13 @@ def router_counts(moe: Variables, routing: Variables) -> Variables:
     a router the forward skipped (a prediction depth left out, a draft stage)
     counts nothing; one that selects by a hash table keeps no bias and
     counts nothing either."""
+    biases = _leaves(moe)
     counts = {}
     for path, node in _sown_nodes(routing, "indices"):
-        bias = _at(moe, (*path, ROUTER_BIAS))
-        if bias is not None:
+        if (*path, ROUTER_BIAS) in biases:
             (indices,) = node["indices"]
-            counts[(*path, ROUTER_BIAS)] = jnp.bincount(indices.ravel(), length=bias.shape[0])
+            counts[(*path, ROUTER_BIAS)] = jnp.bincount(indices.ravel(),
+                                                        length=biases[(*path, ROUTER_BIAS)].shape[0])
     return unflatten_dict(counts)
 
 
@@ -809,7 +802,7 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         if self.indexer is not None:
             tree = thaw(tree)
             drawn = jax.eval_shape(self.fresh_variables, key, None)
-            missing = _leaf_paths(drawn["params"]) - _leaf_paths(tree["params"])
+            missing = _leaves(drawn["params"]).keys() - _leaves(tree["params"]).keys()
             if self._warmup and missing:
                 outside = sorted("/".join(path) for path in missing if not _is_indexer(path))
                 if outside:
@@ -1317,8 +1310,9 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         if rate is None:
             raise ValueError("router count effects require balance_rate")
         moe = variables["moe"]
-        balanced = {path: _updated_bias(_at(moe, path), count, rate)
-                    for path, count in flatten_dict(effects).items()}
+        biases = _leaves(moe)
+        balanced = {path: _updated_bias(biases[path], count, rate)
+                    for path, count in _leaves(effects).items()}
         return {"moe": merge(moe, unflatten_dict(balanced))}
 
     def evaluate(self, params, batch, step: Step):
