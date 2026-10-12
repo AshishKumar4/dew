@@ -54,3 +54,44 @@ def test_holdout_puts_each_record_in_one_part_by_its_identity_the_same_in_every_
     first, held = Memory(rows("c", 10)).holdout(records=3)
     assert [int(row["i"]) for row in iterate(held, read="memory")] == [0, 1, 2]
     assert [int(row["i"]) for row in iterate(first, read="memory")] == list(range(3, 10))
+
+
+def drop_odd(row: dict) -> dict:
+    """Keep even rows, dropping the rest as a fetch drops a dead url."""
+    from dew.data import Rejected
+
+    return row if row["i"] % 2 == 0 else Rejected("odd")
+
+
+drop_odd.__annotations__["return"] = "dict | Rejected"
+
+
+def test_dropped_records_are_the_same_whole_sharded_and_resumed():
+    """A mix whose members drop records: two shares read together what one reads, a resumed
+    reader continues where it stopped, and the drop counts are part of the saved position."""
+    members = [Memory(rows(origin, 40)).filter_map(drop_odd).shuffle(index).repeat()
+               for index, origin in enumerate(("a", "b"))]
+    data = compile(mix(members).batch(8), read="indexed", loading=READ)
+
+    def keys(batch):
+        return sorted(zip(batch["origin"].tolist(), batch["i"].tolist(), strict=True))
+
+    whole = data.train(DataPartition())
+    halves = [data.train(DataPartition(index, 2)) for index in range(2)]
+    try:
+        batches = [next(whole) for _ in range(6)]
+        assert all(int(i) % 2 == 0 for batch in batches for i in batch["i"])
+        for batch in batches:
+            assert keys(batch) == sorted(sum((keys(next(half)) for half in halves), []))
+        state, dropped = whole.get_state(), data.statistics()
+        rest = [keys(next(whole)) for _ in range(3)]
+    finally:
+        for reader in (whole, *halves):
+            reader.close()
+    resumed = data.train(DataPartition())
+    try:
+        resumed.set_state(state)
+        assert [keys(next(resumed)) for _ in range(3)] == rest
+    finally:
+        resumed.close()
+    assert dropped == {} or any(key.endswith("/odd") and value > 0 for key, value in dropped.items())
