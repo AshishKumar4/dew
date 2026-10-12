@@ -468,59 +468,97 @@ def _at_base(scaling: Ramp | None, theta: float) -> Ramp | None:
     return NativeFields(YarnScaling, {**scaling, 'rope_theta': theta})
 
 
-def read_rope(hf_config: Mapping[str, object], used: set,
-          yarn_max_pos: int | None = None, *, local: bool = True,
-          local_default: float | None = None) -> Ropes:
-    """Read the rope of any of the three HF spellings.
+@dataclass(frozen=True)
+class RopeSpelling:
+    """How a family's config class turns the stored rope fields into its
+    rope records, as its `convert_rope_params_to_dict` does (transformers
+    v5.16.1 modeling_rope_utils.py:742-797 and the overrides named below)."""
 
-    Flat rope_theta with rope_scaling beside it, gemma3 text configs with
-    rope_local_base_freq, and nested per-layer-type rope_parameters all read
-    here. A nested config's full_attention entry is the model's
-    rope and its sliding_attention entry the sliding kind's, base and ramp
-    alike (OLMo 3 puts its rope_scaling on full_attention alone,
-    configuration_olmo3.py:110-113). `yarn_max_pos` opts the caller's
-    family into the YaRN ramp, as `_rope_entry` describes. `local` says
-    whether the family's reference reads `rope_local_base_freq` (Gemma 3's
-    legacy spelling); where it does not, the field is left unread.
-    `local_default` is the sliding layers' base the family's config class
-    keeps when a flat spelling states only `rope_theta`: Gemma3TextConfig
-    rotates them at 10000 and Olmo3Config at 500000 whatever rope_theta says,
-    since the flat field moves onto the full-attention entry alone.
+    theta: float = 10000.0
+    """The class's `default_theta`: the base an omitted rope_theta means."""
+    per_kind: bool = False
+    """The class keeps a record per layer type whatever the file spells, and
+    a legacy rope_scaling updates the full_attention record in place
+    (configuration_gemma3.py:136-163, configuration_gemma3n.py:179-206,
+    configuration_olmo3.py:101-126). Otherwise a rope_scaling replaces
+    rope_parameters whole, and a record nests only where its keys are
+    layer types."""
+    local_theta: float | None = None
+    """A per-kind class's default base for its sliding record."""
+    local_field: str | None = None
+    """The flat field a per-kind class reads its sliding base from
+    (Gemma 3's rope_local_base_freq)."""
+
+
+PLAIN_SPELLING = RopeSpelling()
+"""The mixin's own spelling, which most config classes keep: one record, at 10000 when unnamed."""
+
+
+def _rope_records(hf_config: Mapping[str, object], spelling: RopeSpelling
+                  ) -> tuple[tuple[str, dict], tuple[str, dict] | None]:
+    """The full layers' and the sliding layers' effective rope records, each
+    with the field it is read under, in the order the class resolves them;
+    None where one record serves every layer."""
+    scaling, parameters = hf_config.get('rope_scaling'), hf_config.get('rope_parameters')
+    base = hf_config.get('rope_theta')
+    if spelling.per_kind:
+        nested = dict(records.record(parameters, 'rope_parameters')) if parameters is not None else {}
+        full = dict(records.record(nested.get('full_attention') or {'rope_type': 'default'},
+                                   'rope_parameters.full_attention'))
+        if scaling is not None:
+            full.update(records.record(scaling, 'rope_scaling'))
+        full.setdefault('rope_theta', spelling.theta if base is None else base)
+        sliding = dict(records.record(nested.get('sliding_attention') or {'rope_type': 'default'},
+                                      'rope_parameters.sliding_attention'))
+        stated = hf_config.get(spelling.local_field) if spelling.local_field is not None else None
+        sliding.setdefault('rope_theta', stated if stated is not None else
+                           spelling.local_theta if spelling.local_theta is not None else full['rope_theta'])
+        return ('rope_parameters.full_attention', full), ('rope_parameters.sliding_attention', sliding)
+    field = 'rope_scaling' if scaling else 'rope_parameters'
+    record = records.record(scaling or parameters or {}, field)
+    stated = hf_config.get('layer_types')
+    kinds = {*(records.strings(stated, 'layer_types') if stated is not None else ()),
+             'full_attention', 'sliding_attention'}
+    theta = spelling.theta if base is None else base
+    if record and set(record) <= kinds:
+        full = dict(records.record(record.get('full_attention') or {}, f'{field}.full_attention'))
+        full.setdefault('rope_theta', theta)
+        if record.get('sliding_attention') is None:
+            return (f'{field}.full_attention', full), None
+        sliding = dict(records.record(record['sliding_attention'], f'{field}.sliding_attention'))
+        sliding.setdefault('rope_theta', theta)
+        return (f'{field}.full_attention', full), (f'{field}.sliding_attention', sliding)
+    return (field, {**record, 'rope_theta': record.get('rope_theta', theta)}), None
+
+
+def read_rope(hf_config: Mapping[str, object], used: set, yarn_max_pos: int | None = None,
+              spelling: RopeSpelling = PLAIN_SPELLING) -> Ropes:
+    """Read the rope of any HF spelling as the family's config class resolves it.
+
+    The class's records come first (`RopeSpelling`): flat rope_theta with a
+    rope_scaling or rope_parameters beside it, Gemma 3's rope_local_base_freq,
+    and per-layer-type records all land as one effective record per kind,
+    a record that names its type as plain clearing an earlier ramp. Each is
+    then parsed once (`_rope_entry`): the full layers' base and ramp are the
+    model's, the sliding layers' their kind's where they differ. YaRN reads
+    `yarn_max_pos`, as `_rope_entry` describes.
     """
     used.update(('rope_theta', 'rope_parameters', 'rope_scaling'))
-    if local:
-        used.add('rope_local_base_freq')
-    rope_parameters = hf_config.get('rope_parameters')
-
-    if isinstance(rope_parameters, Mapping) and 'rope_theta' not in rope_parameters:
-        full = _rope_entry(rope_parameters.get('full_attention'),
-                           'rope_parameters.full_attention', yarn_max_pos)
-        sliding = _rope_entry(rope_parameters.get('sliding_attention'),
-                              'rope_parameters.sliding_attention', yarn_max_pos)
-        theta = full.theta or 10000.0
-        sliding_theta = sliding.theta or theta
-        full_ramp = _at_base(full.scaling, theta)
-        sliding_ramp = _at_base(sliding.scaling, sliding_theta)
-        return Ropes(theta, full_ramp, None if sliding_theta == theta else sliding_theta,
-                      None if sliding_ramp == full_ramp else sliding_ramp,
-                      full_only=full.scaling is not None and sliding.scaling is None)
-
-    # Either flat field may carry the base frequency and the ramp;
-    # transformers prefers rope_scaling when both are present
-    # (convert_rope_params_to_dict), so it is read last.
-    theta, scaling = None, None
-    for key in ('rope_parameters', 'rope_scaling'):
-        entry = hf_config.get(key)
-        if isinstance(entry, Mapping):
-            rope = _rope_entry(entry, key, yarn_max_pos)
-            theta = rope.theta or theta
-            scaling = rope.scaling or scaling
-    if theta is None:
-        theta = records.number(hf_config.get('rope_theta', 10000.0), 'rope_theta')
-    stated = hf_config.get('rope_local_base_freq') if local else None
-    if stated is None:
-        return Ropes(theta, _at_base(scaling, theta), None if local_default == theta else local_default)
-    return Ropes(theta, _at_base(scaling, theta), records.number(stated, 'rope_local_base_freq'))
+    if spelling.local_field is not None:
+        used.add(spelling.local_field)
+    (full_field, full_record), sliding = _rope_records(hf_config, spelling)
+    full = _rope_entry(full_record, full_field, yarn_max_pos)
+    theta = records.number(full_record['rope_theta'], f'{full_field} rope_theta')
+    full_ramp = _at_base(full.scaling, theta)
+    if sliding is None:
+        return Ropes(theta, full_ramp)
+    sliding_field, sliding_record = sliding
+    local = _rope_entry(sliding_record, sliding_field, yarn_max_pos)
+    sliding_theta = records.number(sliding_record['rope_theta'], f'{sliding_field} rope_theta')
+    sliding_ramp = _at_base(local.scaling, sliding_theta)
+    return Ropes(theta, full_ramp, None if sliding_theta == theta else sliding_theta,
+                  None if sliding_ramp == full_ramp else sliding_ramp,
+                  full_only=full.scaling is not None and local.scaling is None)
 
 
 def specified_layer_types(hf_config: Mapping[str, object], used: set[str],
@@ -638,7 +676,9 @@ def _mlp_features(hf_config: Mapping[str, object]) -> int | tuple[int, ...]:
 
 
 _OPTIONAL_FIELDS = frozenset({'layer_types', 'sliding_window', 'rope_local_base_freq', 'attention_bias'})
-"""Fields `base_config` reads for a family whose reference reads them."""
+"""Fields `base_config` reads for a family whose reference reads them, and
+accepts unread at a value that computes nothing. rope_local_base_freq is
+read by the families whose class reads it, through their `RopeSpelling`."""
 
 
 def _neutral(hf_config: Mapping[str, object], field: str) -> bool:
@@ -654,7 +694,8 @@ def base_config(hf_config: Mapping[str, object], used: set[str], *,
                  rope: Ropes | None = None,
                  qk_norm: bool = False, scale_after_cast: bool = True,
                  tie_embeddings: bool = False,
-                 reads: frozenset[str] = _OPTIONAL_FIELDS) -> DecoderFields:
+                 reads: frozenset[str] = frozenset({'layer_types', 'sliding_window', 'attention_bias'})
+                 ) -> DecoderFields:
     """Read the projection geometry and decoder fields every family shares.
 
     A ramp both kinds share is the model's; a ramp the full layers alone
@@ -685,7 +726,7 @@ def base_config(hf_config: Mapping[str, object], used: set[str], *,
         refuse(f"hidden_act {activation!r}",
                 f"the gated MLP supports {sorted(ACTIVATIONS)}")
 
-    ropes = read_rope(hf_config, used, local='rope_local_base_freq' in reads) if rope is None else rope
+    ropes = read_rope(hf_config, used) if rope is None else rope
     rope_theta, rope_local_theta = ropes.theta, ropes.local_theta
     if 'layer_types' in reads:
         layer_types = specified_layer_types(hf_config, used, layer_types)
@@ -800,7 +841,8 @@ def translate_family_config(hf_config: Mapping[str, object],
         refuse("mlp_bias=True", "the gated MLP is bias-free")
 
     used = {'model_type', 'use_bidirectional_attention', 'mlp_bias', 'num_hidden_layers'}
-    config = family.translate_config(hf_config, used)
+    # An omitted field is the config class's default; an explicit null stays null.
+    config = family.translate_config({**family.defaults, **hf_config}, used)
 
     return config, _unread(hf_config, used)
 
@@ -1317,6 +1359,11 @@ class DecoderFamily:
     """Reads a media bundle released under the family's own model_type, which
     keeps the decoder's tensors unprefixed and `wrapper_projector_names` beside them."""
     wrapper_projector_names: tuple[str, ...] = ()
+    defaults: Mapping[str, object] = field(default_factory=dict)
+    """The computational fields the family's config class fills where a file
+    omits them, which the shared readers would otherwise default for every
+    family alike: Gemma's GELU, Gemma 2's caps and query scalar, OLMo 3's
+    norm epsilon. Rope bases are the class's `RopeSpelling`."""
 
     def prepare_weights(self, tensors: Mapping[str, np.ndarray],
                         config: Mapping[str, object] | None = None) -> Mapping[str, np.ndarray]:
