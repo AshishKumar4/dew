@@ -138,6 +138,7 @@ TRAINED = """
 import json, os, sys
 import jax, numpy as np, optax
 import dew.nn.backbones
+from dew import cache
 from dew.objectives.lm import LMObjective
 from dew.registry import models
 from dew.training import Trainer

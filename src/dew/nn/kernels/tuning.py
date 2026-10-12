@@ -35,7 +35,6 @@ import contextlib
 import dataclasses
 import logging
 import os
-import tempfile
 import time
 from collections.abc import Callable, Hashable, Iterator, Mapping
 from typing import ClassVar
@@ -233,9 +232,10 @@ def _stored(picks: tokamax.AutotuningResult) -> None:
         if os.path.exists(path):
             with open(path) as file:
                 picks = tokamax.AutotuningResult.load(file) | picks
-        with tempfile.NamedTemporaryFile('w', dir=os.path.dirname(path), delete=False) as file:
+        # Written aside and moved in, so a reader never sees half a file.
+        with open(path + '.partial', 'w') as file:
             file.write(picks.dumps(prune_errors=True))
-        os.replace(file.name, path)
+        os.replace(path + '.partial', path)
 
 
 def tune(jitted: jax.stages.Wrapped, *args) -> bool:
