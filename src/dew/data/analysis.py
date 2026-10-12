@@ -104,11 +104,19 @@ def _preferred_read(pipelines: Sequence[Pipeline], *, provision: bool) -> Read:
     that wraps one), indexed for a store that reads by index, and streamed
     otherwise, and a mixture takes the least eager of its corpora's
     preferences. The run reads by the first read, from that preference toward
-    the more eager ones, that it can take (`_takes`). A CSV prefers a stream,
-    but a random holdout of it cannot be streamed and a token split needs a
-    finite indexed order, so without an index, or provision= to build one,
-    the run reads it into memory. When no read is left, the preference
-    stands, and the preparation refuses it with its own remedy.
+    the more eager ones, that it can take (`_takes`).
+
+    A source that cannot take the preferred read until it is provisioned
+    stops the walk there, so the preparation refuses it and names
+    provisioning: a token store without its length index prefers a stream it
+    cannot read, and provision=True builds the index rather than reading the
+    store whole into memory. Past the preference, where the stages need a
+    more eager read than the sources prefer, a read a source takes only once
+    provisioned is passed over: JSON lines with a token split, which needs a
+    finite indexed order, and a CSV with a random holdout, which cannot be
+    streamed, read into memory when they have no index. When no read is
+    left, the preference stands, and the preparation refuses it with its own
+    remedy.
     """
     promoted = tuple(_promoted(pipeline) for pipeline in pipelines)
     chosen: list[Read] = []
@@ -122,20 +130,19 @@ def _preferred_read(pipelines: Sequence[Pipeline], *, provision: bool) -> Read:
             chosen.append("indexed" if source.supports("indexed") else "streamed")
     preferred = READS.index(max(chosen, key=READS.index))
     for read in READS[preferred::-1]:
-        if _takes(promoted, read, provision=provision):
+        missing = _unsupported(promoted, read)
+        provisionable = all(isinstance(source, _Provisionable) for source in missing)
+        if read == READS[preferred] and missing and provisionable and not provision:
+            return read
+        if (not missing or (provision and provisionable)) and _lowers(promoted, read):
             return read
     return READS[preferred]
 
 
-def _takes(pipelines: Sequence[Pipeline], read: Read, *, provision: bool) -> bool:
-    """Whether a run can read `pipelines` by `read`: every source takes it, a
-    wrapping source answering for what it wraps, or is provisioned for it, and
-    the analysis lowers every stage at it. The analysis's refusals are the one
-    statement of what a read takes, so this asks them and states none of its
-    own."""
-    missing = _unsupported(pipelines, read)
-    if missing and not (provision and all(isinstance(source, _Provisionable) for source in missing)):
-        return False
+def _lowers(pipelines: Sequence[Pipeline], read: Read) -> bool:
+    """Whether the analysis lowers every stage of `pipelines` at `read`. Its
+    refusals are the one statement of what a read takes, so this asks them
+    and states none of its own."""
     try:
         for pipeline in pipelines:
             _analyzed(pipeline, read)
