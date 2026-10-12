@@ -59,6 +59,47 @@ def test_a_split_prepared_in_two_caches_is_one_snapshot_and_one_plan(tmp_path, m
     assert unprepared.snapshot() == sources[0].snapshot()
 
 
+def test_a_split_with_no_shards_and_no_conversion_reads_indexed_but_not_streamed(tmp_path, monkeypatch):
+    """A default revision whose split has no native shards, in a repo with no
+    Parquet conversion, has nothing to stream. That is a capability it lacks:
+    its snapshot names no streamed commit, its prepared Arrow compiles and
+    reads by index, and a streamed read is refused as unavailable."""
+    import datasets
+    import httpx
+    from huggingface_hub import HfApi
+    from huggingface_hub.errors import RevisionNotFoundError
+    from huggingface_hub.hf_api import GitRefs
+
+    from dew.data import DataPartition, Loading, Pipeline, compile
+
+    def metadata(self, repo_id, revision=None, **kwargs):
+        if revision == "refs/convert/parquet":
+            url = f"https://huggingface.co/api/datasets/{repo_id}/revision/refs%2Fconvert%2Fparquet"
+            response = httpx.Response(404, request=httpx.Request("GET", url))
+            raise RevisionNotFoundError("404 Client Error: Revision Not Found", response=response)
+        return SimpleNamespace(sha="frozen")
+
+    rows = tmp_path / "rows.parquet"
+    datasets.Dataset.from_dict({"id": list(range(8))}).to_parquet(rows)
+    builder = datasets.load_dataset_builder("parquet", data_files={"train": str(rows)},
+                                            cache_dir=str(tmp_path / "arrow"))
+    builder.download_and_prepare()
+    monkeypatch.setattr(HfApi, "dataset_info", metadata)
+    monkeypatch.setattr(HfApi, "list_repo_files", lambda self, repo_id, **kwargs: ["train.tar"])
+    monkeypatch.setattr(HfApi, "list_repo_refs",
+                        lambda self, repo_id, **kwargs: GitRefs(branches=[], converts=[], tags=[]))
+    monkeypatch.setattr(datasets, "load_dataset_builder", lambda *args, **kwargs: builder)
+    assert Hub("acme/records").snapshot()["streamed"] is None
+    pipeline = Pipeline(Hub("acme/records")).batch(2)
+    reader = compile(pipeline, read="indexed", loading=Loading(workers=0)).train(DataPartition())
+    try:
+        assert sorted(int(value) for _ in range(4) for value in next(reader)["id"]) == list(range(8))
+    finally:
+        reader.close()
+    with pytest.raises(ValueError, match=r"read='streamed' is unavailable for hf:acme/records@frozen"):
+        compile(Pipeline(Hub("acme/records")).batch(2), read="streamed", loading=Loading(workers=0))
+
+
 def test_hub_bindings_are_frozen():
     source = Hub("acme/records", config="named")
     with pytest.raises(FrozenInstanceError):
