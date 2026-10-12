@@ -178,11 +178,12 @@ def _aligned(spans: Sequences, batch: int, length: int, chunk: int) -> bool:
 
 
 def _chunk_of(chunk_ref, chunk: int, aligned: bool):
-    """A chunk's first token and count (`Sequences.chunks`). Where `aligned`, Triton is told the
-    first token is a multiple of `chunk`, as it infers of fla's fixed-length offsets, so a chunk's
-    loads and stores vectorize; a packed document's chunks start anywhere, as fla's varlen do."""
+    """A chunk's first token and count (`Sequences.chunks`). Where `aligned` every chunk is whole and
+    starts on a multiple of `chunk`, as fla's fixed-length chunks do: the count is the constant
+    `chunk`, so its loads and stores take no mask (`_read`), and Triton is told the alignment. A
+    packed document's chunks start anywhere and end where it does, as fla's varlen ones."""
     start, taken = chunk_ref[0], chunk_ref[1]
-    return (pl.multiple_of(start, chunk) if aligned else start), taken
+    return (pl.multiple_of(start, chunk), chunk) if aligned else (start, taken)
 
 
 def _rows(ref, start, size, *rest):
@@ -196,9 +197,12 @@ def _row_mask(view, count):
 
 
 def _read(view, count):
-    """`view`'s rows below `count`, zeros past them: fla's boundary-checked loads."""
+    """`view`'s rows below `count`, zeros past them: fla's boundary-checked loads, none where `count`
+    is a constant covering the view."""
     from jax.experimental.pallas import triton as plgpu
 
+    if isinstance(count, int) and count >= view.shape[0]:
+        return view[...]
     return plgpu.load(view, mask=_row_mask(view, count), other=0)
 
 
@@ -207,14 +211,20 @@ def _gates(g_ref, start, taken, size, offset=0, *rest):
     last real row's: it decays nothing further, so every causal pair's `exp2(g_t - g_s)` stays at most
     1 where fla's zero fill, which it masks, could overflow."""
     view = _rows(g_ref, start + offset, size, *rest)
+    values = _read(view, taken - offset).astype(jnp.float32)
+    if isinstance(taken, int) and taken - offset >= size:
+        return values
     last = g_ref[(start + taken - 1, *rest)].astype(jnp.float32)
-    return jnp.where(_row_mask(view, taken - offset), _read(view, taken - offset).astype(jnp.float32), last)
+    return jnp.where(_row_mask(view, taken - offset), values, last)
 
 
 def _write(view, count, value):
     """`value` into `view`'s rows below `count`, none past them."""
     from jax.experimental.pallas import triton as plgpu
 
+    if isinstance(count, int) and count >= view.shape[0]:
+        view[...] = value.astype(view.dtype)
+        return
     plgpu.store(view, value.astype(view.dtype), mask=_row_mask(view, count))
 
 
@@ -493,7 +503,9 @@ def _span(span_ref, length: int, chunk: int, aligned: bool):
     `length` long, and whether it starts its row (taking the row's initial memory) and ends it
     (giving the row's final memory). `aligned` as `_chunk_of`."""
     start, count, offset = span_ref[0], span_ref[1], span_ref[2]
-    start = pl.multiple_of(start, chunk) if aligned else start
+    if aligned:
+        # The rows' own spans: each `length` long, whole chunks from a multiple of `chunk`.
+        start, count = pl.multiple_of(start, chunk), length
     return start, count, offset, start // length, start % length == 0, (start + count) % length == 0
 
 
@@ -520,7 +532,7 @@ def _h_kernel(span_ref, k_ref, u_ref, w_ref, g_ref, h0_ref, h_ref, corrected_ref
 
         def step(n, state):
             begin = start + n * chunk
-            taken = jnp.minimum(chunk, count - n * chunk)
+            taken = chunk if aligned else jnp.minimum(chunk, count - n * chunk)
 
             def read(ref, *rest):
                 return _read(_rows(ref, begin, chunk, *rest), taken)
@@ -630,7 +642,7 @@ def _dhu_kernel(span_ref, q_ref, k_ref, w_ref, g_ref, dht_ref, do_ref, dv_ref, d
         def step(r, grad):
             n = chunks - 1 - r
             begin = start + n * chunk
-            taken = jnp.minimum(chunk, count - n * chunk)
+            taken = chunk if aligned else jnp.minimum(chunk, count - n * chunk)
 
             def read(ref, *rest):
                 return _read(_rows(ref, begin, chunk, *rest), taken)
