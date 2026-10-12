@@ -16,16 +16,18 @@ import numpy as np
 import optax
 import pytest
 import sharded
-from jax.sharding import NamedSharding, PartitionSpec as P
+from flax import linen as nn
+from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from model_support import TINY_DECODER
 from recording import RecordingTracker
 from sharded import assert_sharded
 
+from dew.checkpoints import Checkpoints
 from dew.data import Dataset
 from dew.nn.backbones.dit import SimpleDiT
 from dew.nn.blocks import Upsample
 from dew.nn.conv import Conv
-from dew.nn.sharding import declared_axes
+from dew.nn.sharding import batch_axes, declared_axes
 from dew.nn.ssm import SpatialFusionConv
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
@@ -243,6 +245,72 @@ def test_a_delta_net_step_over_fsdp_and_tensor_trains_what_one_device_trains():
                         stepped(MeshSpec(), 1, **delta_layers(fused=False))[2])
 
 
+NATIVE_RULES = {"embed": ("zero", "zero2"), "mlp": "zero", "heads": "zero", "kv": "zero", "vocab": "zero",
+                "linear": "zero"}
+"""A layout of a native mesh's own axes: two fsdp levels, `zero` and
+`zero2`, beside a `replica` axis no parameter takes."""
+
+
+def native_trainer(mesh, layout, directory, **hybrid) -> Trainer:
+    model = tiny(max_seq_len=LENGTH, tie_embeddings=False, **hybrid)
+    return Trainer(LMObjective(model, LENGTH), optax.sgd(1e-2), key=jax.random.key(0), mesh=mesh,
+                   layout=layout, checkpoints=None if directory is None else Checkpoints(str(directory)),
+                   tracker=None)
+
+
+def native_steps(trainer: Trainer, steps: int):
+    """`steps` SGD steps from the trainer's placed (or resumed) state, the
+    batch placed under its layout's rules as the trainer places one."""
+    batch = {"text": np.random.default_rng(0).integers(0, VOCAB, (8, LENGTH + 1)).astype(np.int32)}
+    state, _, _ = trainer.place()
+    with nn.logical_axis_rules(trainer.layout.axis_rules):
+        placed = shard_batch(trainer.device_mesh, batch)
+    step = trainer.compile(state, placed)
+    for _ in range(steps):
+        state, *_ = step(state, placed)
+    return state
+
+
+@pytest.mark.mesh(devices=8)
+@pytest.mark.parametrize("hybrid", [False, True], ids=["attention", "delta-net"])
+def test_a_native_mesh_of_its_own_axes_trains_saves_and_resumes_as_one_device(tmp_path, hybrid):
+    """A `jax.sharding.Mesh` of axes Dew does not name, two fsdp levels and
+    a replica axis, under a layout whose rules name them and whose
+    `data_axes` split the rows over all three: the parameters split over
+    both fsdp levels, and two steps, a save and a resumed third step train
+    what one device trains in three, as a `MeshSpec` mesh does."""
+    layers = delta_layers(fused=False) if hybrid else {}
+    native = Mesh(np.asarray(jax.devices()[:8]).reshape(2, 2, 2), ("replica", "zero", "zero2"))
+    layout = Layout(rules=NATIVE_RULES, data_axes=("replica", "zero", "zero2"), min_shard=TINY_SHARD)
+    with nn.logical_axis_rules(layout.axis_rules):
+        assert batch_axes(native) == ("replica", "zero", "zero2")
+
+    first = native_steps(native_trainer(native, layout, tmp_path / "run", **layers), 2)
+    assert {"zero", "zero2"} <= sharded.split_axes(first.variables["params"])
+    saved = Checkpoints(str(tmp_path / "run"))
+    saved.save(2, first)
+    saved.wait()
+    resumed = native_steps(native_trainer(native, layout, tmp_path / "run", **layers), 1)
+    assert int(resumed.step) == 3
+
+    plain = Layout(min_shard=TINY_SHARD)
+    whole = native_steps(native_trainer(Mesh(np.asarray(jax.devices()[:1]), ("data",)), plain, None,
+                                        **layers), 3)
+    spec = native_steps(native_trainer(MeshSpec(fsdp=2), plain, None, **layers), 3)
+    for state in (resumed, spec):
+        assert_trains_alike(*jax.device_get((state.variables["params"], whole.variables["params"])))
+
+
+def test_a_rule_naming_an_axis_the_mesh_lacks_is_refused_by_name():
+    """Dew's role axes a mesh lacks are size 1; any other name a rule uses
+    must be the mesh's, or the layout says which."""
+    mesh = Mesh(np.asarray(jax.devices()[:1]), ("zero",))
+    variables = jax.eval_shape(tiny().init, jax.random.key(0), jnp.ones((1, SEQ_LEN), jnp.int32))
+    Layout(rules={"embed": ("zero", "fsdp")}).shardings(mesh, variables)
+    with pytest.raises(ValueError, match="zer0"):
+        Layout(rules={"embed": "zer0"}).shardings(mesh, variables)
+
+
 @pytest.mark.parametrize(("bytes_per_second", "peak", "platform", "spreads"), [
     (None, None, None, False),
     (5.8e9, 71e12, "gpu", False),
@@ -380,7 +448,7 @@ def test_a_width_the_sequence_axis_cannot_split_stays_replicated():
     mesh = MeshSpec(fsdp=4, sequence=2).build()
     batch = shard_batch(mesh, np.zeros((BATCH, SEQ_LEN + 1), np.float32))
 
-    assert batch.sharding.spec == P(("data", "expert", "fsdp"))
+    assert batch.sharding.spec == P(batch_axes(mesh))
     assert batch.addressable_shards[0].data.shape == (BATCH // 4, SEQ_LEN + 1)
 
 
@@ -392,8 +460,8 @@ def test_an_image_batch_never_takes_the_sequence_axis():
     images = np.zeros((BATCH, 8, 8, 3), np.float32)
     batch = shard_batch(mesh, {"image": images, "label": np.zeros((BATCH,), np.int32)})
 
-    assert batch["image"].sharding.spec == P(("data", "expert", "fsdp"))
-    assert batch["label"].sharding.spec == P(("data", "expert", "fsdp"))
+    assert batch["image"].sharding.spec == P(batch_axes(mesh))
+    assert batch["label"].sharding.spec == P(batch_axes(mesh))
     assert batch_shardings(mesh, batch)["image"].spec == batch["image"].sharding.spec
 
 
@@ -415,11 +483,11 @@ def token_batches():
         yield batch
 
 
-def run_losses(mesh, layout, steps):
+def run_losses(mesh, layout, steps, microbatches=None):
     tracker = RecordingTracker()
     trainer = Trainer(
         LMObjective(tiny(), SEQ_LEN), optax.adam(1e-3), key=jax.random.key(0),
-        mesh=mesh, layout=layout, tracker=tracker)
+        mesh=mesh, layout=layout, microbatches=microbatches, tracker=tracker)
     state = trainer.fit(Dataset(train=lambda partition: token_batches(), val=None, records=None, batch=BATCH),
                         steps=steps, log_every=1)
     assert_sharded(state.variables["params"], trainer.device_mesh)
@@ -444,8 +512,8 @@ TOPOLOGIES = {
     "sequence": (MeshSpec(fsdp=4, sequence=2), dense_layout()),
     "data_sequence": (MeshSpec(fsdp=2, sequence=2), dense_layout()),
     "both": (MeshSpec(fsdp=2, tensor=2, sequence=2), dense_layout()),
-    "stage": (MeshSpec(fsdp=2, stage=2, microbatches=2), dense_layout()),
-    "stage_tensor": (MeshSpec(fsdp=2, tensor=2, stage=2, microbatches=2), dense_layout()),
+    "stage": (MeshSpec(fsdp=2, stage=2), dense_layout(), 2),
+    "stage_tensor": (MeshSpec(fsdp=2, tensor=2, stage=2), dense_layout(), 2),
 }
 
 
@@ -453,7 +521,7 @@ TOPOLOGIES = {
 def test_every_topology_trains_the_same_losses(name):
     """Thirty steps on each topology: finite, descending, and equal to 1e-6."""
     steps = 30
-    losses = run_losses(*TOPOLOGIES[name], steps)
+    losses = run_losses(*TOPOLOGIES[name][:2], steps, *TOPOLOGIES[name][2:])
 
     assert len(losses) == steps and np.all(np.isfinite(losses))
     assert losses[-1] < losses[0] / 2, losses
@@ -462,7 +530,7 @@ def test_every_topology_trains_the_same_losses(name):
 def test_topologies_agree_with_data_parallel():
     """The largest difference across the topologies, with its number."""
     steps = 30
-    runs = {name: np.array(run_losses(*spec, steps)) for name, spec in TOPOLOGIES.items()}
+    runs = {name: np.array(run_losses(*spec[:2], steps, *spec[2:])) for name, spec in TOPOLOGIES.items()}
 
     difference = max(
         np.max(np.abs(first - second))
@@ -732,7 +800,7 @@ def test_a_pipeline_moves_no_microbatch_between_the_batch_shards():
     microbatch over the shards again. Strided, each keeps its rows where
     they are."""
     hidden = BATCH * SEQ_LEN * 32
-    moved = [shape for op, shapes in collectives(MeshSpec(fsdp=2, stage=2, microbatches=2), tiny())
+    moved = [shape for op, shapes in collectives(MeshSpec(fsdp=2, stage=2), tiny())
              if op in ("all-gather", "all-to-all") for shape in shapes]
 
     assert not [shape for shape in moved if math.prod(shape) >= hidden], moved

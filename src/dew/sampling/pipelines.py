@@ -34,6 +34,7 @@ from dew.telemetry.profile import region
 ArrayT = TypeVar("ArrayT", bound=jax.Array | np.ndarray, default=jax.Array, covariant=True)
 
 if TYPE_CHECKING:
+    from jax.sharding import Mesh
     from PIL.Image import Image as PILImage
 
     from dew.objectives.diffusion import DiffusionObjective
@@ -224,7 +225,7 @@ class TextToImage:
 
     @classmethod
     def from_run(cls, directory: str, *, ema: bool | None = None, step: int | str | None = None,
-                 mesh: MeshSpec | None = None, layout: Layout | None = None,
+                 mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None,
                  dtype: DTypeLike | None = None, param_dtype: DTypeLike | None = None,
                  trust: Sequence[str] = ()) -> TextToImage:
         """Load the run in `directory`, built from its `run.json` the way the recipe built it.
@@ -303,7 +304,7 @@ class TextToImage:
 
     @classmethod
     def from_pretrained(cls, repo_id: str, *, revision: str | None = None,
-                        ema: bool | None = None, mesh: MeshSpec | None = None,
+                        ema: bool | None = None, mesh: MeshSpec | Mesh | None = None,
                         layout: Layout | None = None, dtype: DTypeLike | None = None,
                         param_dtype: DTypeLike | None = None, trust: Sequence[str] = ()) -> TextToImage:
         """Download a run directory from the Hugging Face Hub and load it with `from_run`.

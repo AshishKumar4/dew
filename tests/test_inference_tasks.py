@@ -406,7 +406,7 @@ def test_a_placed_diffusion_gemma_task_keeps_its_rows_sharded_and_draws_the_same
     with one row per device there is no padding, so the batch-wide canvas
     draw matches the single-device one row for row."""
     from dew.inference.pipeline import place
-    from dew.nn.inputs import BATCH_AXES
+    from dew.nn.sharding import batch_axes
     from dew.training import Layout, MeshSpec
 
     loaded = Pretrained.load(FIXTURES / "diffusion-gemma-workflow", dtype="float32", attention_impl="xla",
@@ -416,7 +416,7 @@ def test_a_placed_diffusion_gemma_task_keeps_its_rows_sharded_and_draws_the_same
     assert any("fsdp" in str(leaf.sharding.spec) for leaf in jax.tree.leaves(placed.variables))
     prompts = ["<bos> t5 t7 t9 t11", "<bos> t6 t8 t10 t12"] * (jax.device_count() // 2)
     result = placed(prompts, 7, key=11)
-    assert result.tokens.sharding.spec == jax.sharding.PartitionSpec(BATCH_AXES)
+    assert result.tokens.sharding.spec == jax.sharding.PartitionSpec(batch_axes(result.tokens.sharding.mesh))
     assert result.rows == len(prompts) and result.prompt_width == 5
     rows = result.host()
     np.testing.assert_array_equal(rows.tokens, plain(prompts, 7, key=11).host().tokens)

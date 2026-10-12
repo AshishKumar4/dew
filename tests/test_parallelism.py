@@ -486,10 +486,10 @@ def test_a_rule_onto_an_axis_of_size_one_shards_nothing():
 def test_a_rule_onto_an_axis_that_places_no_parameter_is_refused():
     """The data and sequence axes split the batch: a parameter the rules
     place on either would be gathered on every use, and placing one there
-    names it. A misspelt axis is refused at construction, before any rule is
-    read, since the activations' rules share the table."""
-    with pytest.raises(ValueError, match=r"names \['fspd'\], which no mesh has"):
-        Layout(rules={"embed": "fspd"})
+    names it. A misspelt axis, one the mesh lacks that is none of Dew's
+    roles, is refused where the layout first meets the mesh."""
+    with pytest.raises(ValueError, match=r"the rules name the axes \['fspd'\]"):
+        Layout(rules={"embed": "fspd"}).shardings(MeshSpec(fsdp=2).build(), dit_variables())
     with pytest.raises(ValueError, match=r"the rules place params/.* on \['data'\]"):
         Layout(rules={"mlp": "data"}, min_shard=1).shardings(
             MeshSpec(fsdp=2).build(), dit_variables())

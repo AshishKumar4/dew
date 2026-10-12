@@ -15,6 +15,7 @@ from pathlib import Path
 import jax
 import jax.numpy as jnp
 import numpy as np
+import optax
 import pytest
 from reference_error import widened
 from sharded import assert_sharded
@@ -25,7 +26,7 @@ from dew.nn.sharding import pipeline_microbatches
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
 from dew.registry import models
-from dew.training import Layout, MeshSpec
+from dew.training import Layout, MeshSpec, Trainer
 from dew.training.distributed import shard_batch
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "hf"
@@ -338,10 +339,11 @@ def token_batch(rows: int = BATCH):
 PIPELINED_ROWS = 16
 
 
-def loss_and_grads(objective, spec, variables, batch, devices=None):
+def loss_and_grads(objective, spec, variables, batch, devices=None, microbatches=None):
     """The objective's loss, metrics and gradients on `spec`'s mesh over
-    `devices` (every device by default), with the pipeline's schedule in
-    context the way the trainer's compiled step puts it there."""
+    `devices` (every device by default), with the pipeline's schedule of
+    `microbatches` in context the way the trainer's compiled step puts it
+    there."""
     mesh = spec.build(devices)
     layout = Layout(min_shard=TINY_SHARD)
     placed = jax.device_put(variables, layout.shardings(mesh, variables))
@@ -352,7 +354,7 @@ def loss_and_grads(objective, spec, variables, batch, devices=None):
     def loss(params):
         return objective.scalar_loss({**variables, "params": params}, batch, step)
 
-    with jax.set_mesh(mesh), pipeline_microbatches(spec.microbatches):
+    with jax.set_mesh(mesh), pipeline_microbatches(microbatches):
         (value, aux), grads = jax.jit(jax.value_and_grad(loss, has_aux=True))(placed["params"])
     return (float(value), {name: float(number) for name, number in aux.metrics.items()},
             jax.tree.map(np.asarray, grads))
@@ -379,7 +381,7 @@ def test_a_pipeline_over_two_stages_has_the_loss_and_gradient_of_one(build, bala
 
     loss, metrics, grads = loss_and_grads(objective, MeshSpec(fsdp=4), variables, batch)
     piped, piped_metrics, piped_grads = loss_and_grads(
-        objective, MeshSpec(fsdp=2, stage=2, microbatches=4), variables, batch)
+        objective, MeshSpec(fsdp=2, stage=2), variables, batch, microbatches=4)
 
     assert abs(loss - piped) < 1e-5, (loss, piped)
     assert same_metrics(metrics, piped_metrics), (metrics, piped_metrics)
@@ -400,7 +402,7 @@ def test_a_pipeline_trains_an_exchange_dispatch():
 
     loss, _, grads = loss_and_grads(objective, MeshSpec(expert=2, fsdp=2), variables, batch)
     piped, _, piped_grads = loss_and_grads(
-        objective, MeshSpec(expert=2, stage=2, microbatches=4), variables, batch)
+        objective, MeshSpec(expert=2, stage=2), variables, batch, microbatches=4)
 
     assert abs(loss - piped) < 1e-5, (loss, piped)
     difference = largest_difference(grads, piped_grads)
@@ -418,7 +420,7 @@ def test_a_scanned_pipeline_has_the_loss_and_gradient_of_the_plain_loop():
     loss, _, grads = loss_and_grads(LMObjective(tiny(), SEQ_LEN), MeshSpec(fsdp=4), variables, batch)
     piped, _, piped_grads = loss_and_grads(
         LMObjective(tiny(scan_layers=True), SEQ_LEN),
-        MeshSpec(fsdp=2, stage=2, microbatches=2), variables, batch)
+        MeshSpec(fsdp=2, stage=2), variables, batch, microbatches=2)
 
     assert abs(loss - piped) < 1e-5, (loss, piped)
     difference = largest_difference(grads, piped_grads)
@@ -437,7 +439,7 @@ def test_a_pipeline_under_a_bf16_policy_trains_the_loss_of_the_plain_loop():
 
     loss, _, _ = loss_and_grads(LMObjective(model, SEQ_LEN), MeshSpec(fsdp=4), variables, batch)
     piped, _, piped_grads = loss_and_grads(
-        LMObjective(model, SEQ_LEN), MeshSpec(fsdp=2, stage=2, microbatches=4), variables, batch)
+        LMObjective(model, SEQ_LEN), MeshSpec(fsdp=2, stage=2), variables, batch, microbatches=4)
 
     assert abs(loss - piped) < 1e-2 * max(1.0, abs(loss)), (loss, piped)
     assert all(np.isfinite(leaf).all() for leaf in jax.tree.leaves(piped_grads))
@@ -467,22 +469,23 @@ def test_a_pipeline_refuses_a_stack_it_cannot_split_evenly():
 
 @mesh_lane
 def test_a_pipeline_refuses_a_schedule_that_does_not_fit_the_batch():
-    """Eight rows do not make sixteen microbatches, and microbatches are a
-    multiple of the stages; both are refused before anything runs."""
+    """Eight rows do not make sixteen microbatches, and the trainer's
+    microbatches are a multiple of the stages a stage axis holds; each is
+    refused before anything runs."""
     model = tiny()
     variables = model.init(jax.random.key(0), jnp.ones((1, SEQ_LEN), jnp.int32))
     with pytest.raises(ValueError, match="microbatch count that divides the rows"):
-        loss_and_grads(LMObjective(model, SEQ_LEN), MeshSpec(fsdp=4, stage=2, microbatches=16),
-                       variables, token_batch())
-    with pytest.raises(ValueError, match="multiple of stage"):
-        MeshSpec(stage=2, microbatches=3)
-    with pytest.raises(ValueError, match="stage is 1"):
-        MeshSpec(microbatches=4)
+        loss_and_grads(LMObjective(model, SEQ_LEN), MeshSpec(fsdp=4, stage=2), variables, token_batch(),
+                       microbatches=16)
+    for mesh, microbatches in ((MeshSpec(stage=2), 3), (MeshSpec(), 4)):
+        trainer = Trainer(LMObjective(model, SEQ_LEN), optax.sgd(0.1), key=0, mesh=mesh,
+                          microbatches=microbatches, checkpoints=None, tracker=None)
+        with pytest.raises(ValueError, match="microbatches"):
+            trainer.microbatches  # noqa: B018 - the property refuses
 
 
 @pytest.mark.mesh(devices=4)
-@pytest.mark.parametrize("spec", [MeshSpec(stage=4, microbatches=4),
-                                  MeshSpec(stage=2, sequence=2, microbatches=4)],
+@pytest.mark.parametrize("spec", [MeshSpec(stage=4), MeshSpec(stage=2, sequence=2)],
                          ids=["stage4", "stage2_sequence2"])
 def test_a_pipeline_whose_rows_no_axis_splits_computes_the_whole_stacks_step(spec):
     """On four devices, four stages, or two beside a sequence axis of two,
@@ -501,7 +504,7 @@ def test_a_pipeline_whose_rows_no_axis_splits_computes_the_whole_stacks_step(spe
     objective, four = LMObjective(model, 16), jax.devices()[:4]
 
     loss, _, grads = loss_and_grads(objective, MeshSpec(), variables, batch, four)
-    piped, _, piped_grads = loss_and_grads(objective, spec, variables, batch, four)
+    piped, _, piped_grads = loss_and_grads(objective, spec, variables, batch, four, microbatches=4)
 
     assert abs(loss - piped) < 1e-5, (loss, piped)
     difference = largest_difference(grads, piped_grads)
@@ -518,8 +521,8 @@ def test_a_pipeline_refuses_microbatches_that_do_not_divide_a_devices_rows():
     model = tiny()
     variables = model.init(jax.random.key(0), jnp.ones((1, SEQ_LEN), jnp.int32))
     with pytest.raises(ValueError, match="2 rows a device, which 4 microbatches do not divide"):
-        loss_and_grads(LMObjective(model, SEQ_LEN), MeshSpec(fsdp=4, stage=2, microbatches=4),
-                       variables, token_batch())
+        loss_and_grads(LMObjective(model, SEQ_LEN), MeshSpec(fsdp=4, stage=2), variables, token_batch(),
+                       microbatches=4)
 
 
 @mesh_lane

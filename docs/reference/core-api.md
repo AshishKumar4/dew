@@ -47,12 +47,12 @@ InputSpec(sample, conditions={}, mask=None)
 Import these from `dew.training`:
 
 ```text
-MeshSpec(fsdp=1, expert=1, tensor=1, sequence=1, stage=1, microbatches=None, replicas=1)
-Layout(rules=DEFAULT_RULES, min_shard=65536, tolerance=0.02, host=(), host_parameters=())
+MeshSpec(fsdp=1, expert=1, tensor=1, sequence=1, stage=1, replicas=1, explicit=())
+Layout(rules=DEFAULT_RULES, min_shard=65536, tolerance=0.02, host=(), host_parameters=(), data_axes=())
 MeshSpec(...).build(devices=None)
 ```
 
-`MeshSpec.build` uses the supplied devices, or JAX's visible devices. The specified factors must divide the device count, and data parallelism takes the remaining factor. Explicit pipeline microbatches require `stage > 1` and a positive multiple of the stage count. With `replicas` above 1, `build` makes a hybrid mesh whose data axis spans that many groups of granules (TPU slices, GPU hosts or NVLink domains, or processes whose devices all share one slice), and every other axis stays inside a group; see [training on several nodes](../guides/multi-node.md#mesh-layout-across-nodes). A sequence axis above 1 splits every attention call's positions, and each call chooses between the all-to-all and the gather exchange from its shape.
+`MeshSpec.build` uses the supplied devices, or JAX's visible devices. The specified factors must divide the device count, and data parallelism takes the remaining factor. `Trainer(microbatches=...)` sets a pipelined step's microbatches, a positive multiple of the stage count; a trainer also takes a native `jax.sharding.Mesh` in place of a `MeshSpec` ([distributed](../concepts/distributed.md#a-native-mesh)). With `replicas` above 1, `build` makes a hybrid mesh whose data axis spans that many groups of granules (TPU slices, GPU hosts or NVLink domains, or processes whose devices all share one slice), and every other axis stays inside a group; see [training on several nodes](../guides/multi-node.md#mesh-layout-across-nodes). A sequence axis above 1 splits every attention call's positions, and each call chooses between the all-to-all and the gather exchange from its shape.
 
 `Layout` has these fields:
 

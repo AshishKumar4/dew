@@ -426,7 +426,7 @@ def _trainer(case, fields: dict[str, int], *, one_device: bool = False, accumula
             return jax.device_put(jax.tree.map(lambda leaf: leaf.copy(), held), shardings), shardings, None
 
     trainer = Drawn(bench.build_objective(case), optax.chain(stash(), optax.adam(1e-3)),
-                      key=jax.random.key(0), mesh=bench.mesh_spec(fields),
+                      key=jax.random.key(0), **bench.trainer_mesh(fields),
                       layout=Layout(min_shard=case.fsdp_min_param_size, tolerance=1.0),
                       accumulation=accumulation, checkpoints=None, tracker=None)
     if one_device:

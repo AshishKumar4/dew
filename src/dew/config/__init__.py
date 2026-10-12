@@ -642,6 +642,9 @@ class TrainerConfig:
     """
     dynamic_scale: bool = False
     mesh: MeshSpec = dataclasses.field(default_factory=MeshSpec)
+    microbatches: int | None = None
+    """Microbatches a pipelined step feeds through the mesh's stages, a
+    multiple of `mesh.stage`; unset feeds one a stage."""
     layout: Layout = dataclasses.field(default_factory=Layout)
     profile: ProfileWindow | None = None
     """One profiler window: the steps to trace, the warmup before them and the output directory.
@@ -1194,12 +1197,13 @@ class RunConfig:
                         processes=jax.process_count()), 0)
 
             agreed("run metadata", record_run)
-            # The trainer holds mesh, layout, accumulation, dynamic_scale and
-            # profile; prepare_process read the process fields, and the rest
-            # are fit's arguments or built the checkpoints and the tracker.
+            # The trainer holds mesh, microbatches, layout, accumulation,
+            # dynamic_scale and profile; prepare_process read the process
+            # fields, and the rest are fit's arguments or built the
+            # checkpoints and the tracker.
             state = Trainer(
-                objective, self.optim, key=trainer.key,
-                mesh=trainer.mesh, layout=trainer.layout, accumulation=trainer.accumulation,
+                objective, self.optim, key=trainer.key, mesh=trainer.mesh,
+                microbatches=trainer.microbatches, layout=trainer.layout, accumulation=trainer.accumulation,
                 dynamic_scale=trainer.dynamic_scale, checkpoints=checkpoints, tracker=tracker,
                 rollout=rollout, profile=trainer.profile, lower_for=trainer.lower_for,
             ).fit(

@@ -1495,7 +1495,11 @@ class Checkpoints:
         from dew.inference.banks import banked_placement, placed_rows, shape_rows, spread
         from dew.objectives.base import FROZEN, merge
         from dew.registry import resolve_dtype
-        from dew.training.distributed import Layout as DefaultLayout, MeshSpec as DefaultMesh
+        from dew.training.distributed import (
+            Layout as DefaultLayout,
+            MeshSpec as DefaultMesh,
+            device_mesh as resolve_mesh,
+        )
 
         target = resolve_dtype(param_dtype)
         step = self.pinned(step)
@@ -1506,7 +1510,7 @@ class Checkpoints:
         averaged = stored.get("ema") is not None if ema is None else ema
         if averaged:
             template["ema"] = stored["ema"]
-        device_mesh = (DefaultMesh() if mesh is None else mesh).build()
+        device_mesh = resolve_mesh(DefaultMesh() if mesh is None else mesh)
         chosen_layout = DefaultLayout() if layout is None else layout
         # A CPU-owned run stores its frozen collection banked; the layout places
         # its layers, and each bank reads onto its first layer's placement.

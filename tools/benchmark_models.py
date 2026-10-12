@@ -90,13 +90,16 @@ class _DenoisingTextTable(ConditionEncoder[str]):
                 "guidance": self.guidance, "masked": self.masked}
 
 
-def mesh_spec(mesh: Mapping[str, int]) -> MeshSpec:
-    """The `MeshSpec` a case's mesh record names, refusing a field it lacks."""
+def trainer_mesh(mesh: Mapping[str, int]) -> dict[str, object]:
+    """The trainer's `mesh` and `microbatches` a case's mesh record names: its
+    MeshSpec fields and the pipeline's microbatches, refusing a field it lacks."""
     fields = {f.name for f in dataclasses.fields(MeshSpec)}
-    unknown = sorted(set(mesh) - fields)
+    unknown = sorted(set(mesh) - fields - {"microbatches"})
     if unknown:
-        raise ValueError(f"mesh has no field {unknown}; MeshSpec's fields are {sorted(fields)}")
-    return MeshSpec(**mesh)
+        raise ValueError(f"mesh has no field {unknown}; it names MeshSpec's fields {sorted(fields)} "
+                         f"and microbatches")
+    return {"mesh": MeshSpec(**{name: value for name, value in mesh.items() if name != "microbatches"}),
+            "microbatches": mesh.get("microbatches")}
 
 
 def media_values(case: Case) -> tuple[str, TowerBase, ProjectorBase, int]:
@@ -254,7 +257,7 @@ def build_trainer(case: Case, attention_impl: str = 'auto',
     checkpoints, on the case's device order."""
     trainer = Trainer(
         build_objective(case, attention_impl), optimizer or optax.adam(1e-4), key=jax.random.key(0),
-        mesh=mesh_spec(case.mesh), layout=Layout(min_shard=case.fsdp_min_param_size),
+        **trainer_mesh(case.mesh), layout=Layout(min_shard=case.fsdp_min_param_size),
         accumulation=case.accumulation, checkpoints=None, tracker=None)
     if case.device_order is not None:
         by_id = {device.id: device for device in jax.devices()}
