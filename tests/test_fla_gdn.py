@@ -12,7 +12,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import assert_leaves_as_exact
+from reference_error import assert_leaves_as_exact, widened
 from sharded import assert_runs_per_shard, boundary_copies
 
 from dew.nn import linear
@@ -510,8 +510,10 @@ def test_a_bf16_layer_with_wide_keys_hands_the_port_its_narrowed_operands(monkey
 
 def test_a_remat_policy_saves_the_ports_named_residuals_and_changes_no_gradient(monkeypatch):
     """A block's remat policy may keep the rule's output and the port's saved decay and inverse
-    (`decoder_block.RESIDUALS`); the layer under `jax.checkpoint` with that policy gives the
-    gradients it gives without one, bitwise."""
+    (`decoder_block.RESIDUALS`): the layer under `jax.checkpoint` with that policy computes its
+    gradients within tests/reference_error.py's rule of the layer without one, both measured from
+    the layer in float64. Not bitwise on a GPU: the recomputed forward is another program, whose
+    GEMMs XLA may give other algorithms."""
     from dew.nn.backbones.decoder_block import RematPolicy
 
     policy = RematPolicy(save=("context", "delta_decay", "delta_inverse")).checkpoint_policy()
@@ -519,15 +521,16 @@ def test_a_remat_policy_saves_the_ports_named_residuals_and_changes_no_gradient(
     x = jax.random.normal(jax.random.key(71), (1, 64, 64))
     params = layer.init(jax.random.key(73), x)
 
-    def loss(params):
+    def loss(params, x):
         return jnp.sum(layer.apply(params, x) ** 2)
 
-    want = jax.jit(jax.grad(loss))(params)
-    got = jax.jit(jax.grad(jax.checkpoint(loss, policy=policy)))(params)
-    for (path, mine), theirs in zip(jax.tree_util.tree_leaves_with_path(got), jax.tree.leaves(want),
-                                    strict=True):
-        np.testing.assert_array_equal(np.asarray(mine), np.asarray(theirs),
-                                      err_msg=jax.tree_util.keystr(path))
+    want = jax.jit(jax.grad(loss))(params, x)
+    got = jax.jit(jax.grad(jax.checkpoint(loss, policy=policy)))(params, x)
+    cpu = jax.devices("cpu")[0]
+    with jax.enable_x64(new_val=True), jax.default_device(cpu):
+        truth = jax.grad(loss)(*jax.device_put(widened((params, x)), cpu))
+    assert_leaves_as_exact(jax.tree.map(np.asarray, got), jax.tree.map(np.asarray, want),
+                           jax.tree.map(np.asarray, truth))
 
 
 def test_a_gpu_the_targets_do_not_list_runs_the_99_kb_tables():
@@ -537,27 +540,24 @@ def test_a_gpu_the_targets_do_not_list_runs_the_99_kb_tables():
 
 
 @pytest.mark.parametrize("chunk_size", [32, 64])
-def test_the_rule_at_any_chunk_size_and_mixed_dtypes_is_the_math_on_the_port(monkeypatch, chunk_size):
-    """`chunk_gated_delta_rule` where a GPU runs the port, at any chunk size the caller names (the
-    rule's value does not depend on it) and with float32 queries over bf16 keys and values, which
-    the port takes in their common dtype: as near the rule in float64 as the portable math's
-    output and final memory at that chunk size (tests/reference_error.py)."""
+def test_the_rule_on_the_port_takes_any_chunk_size_and_mixed_dtypes_in_their_common_dtype(monkeypatch,
+                                                                                        chunk_size):
+    """`chunk_gated_delta_rule` where a GPU runs the port, at any chunk size the caller names, which
+    reaches only the portable math (the rule's value does not depend on it), and with float32
+    queries over bf16 keys and values, which the port takes in their common dtype: bitwise the port
+    on those operands cast to float32 first."""
     keys = jax.random.split(jax.random.key(41), 5)
     q = l2norm(jax.random.normal(keys[0], (1, 96, 1, 64)))
     k = l2norm(jax.random.normal(keys[1], q.shape)).astype(jnp.bfloat16)
     v = jax.random.normal(keys[2], (1, 96, 2, 64)).astype(jnp.bfloat16)
     g = -jnp.exp(jax.random.normal(keys[3], v.shape[:3]) - 3.0)
     beta = jax.nn.sigmoid(jax.random.normal(keys[4], v.shape[:3]))
-    monkeypatch.setattr(linear, "triton_runs", lambda: False)
-    want, want_final = linear.chunk_gated_delta_rule(q, k, v, g, beta, chunk_size=chunk_size)
     monkeypatch.setattr(linear, "triton_runs", lambda: True)
-    got, got_final = linear.chunk_gated_delta_rule(q, k, v, g, beta, chunk_size=chunk_size)
-    assert got.dtype == want.dtype == jnp.float32
-    with jax.enable_x64(new_val=True):
-        operands = wide(jnp.repeat(q, 2, axis=2), jnp.repeat(k, 2, axis=2), v, g, beta)
-        truth = [np.asarray(x) for x in rule_math(*operands, jnp.zeros((1, 2, 64, 64)))]
-    assert_leaves_as_exact([np.asarray(got), np.asarray(got_final)],
-                           [np.asarray(want), np.asarray(want_final)], truth)
+    got = linear.chunk_gated_delta_rule(q, k, v, g, beta, chunk_size=chunk_size)
+    want = fla_rule(q, k.astype(jnp.float32), v.astype(jnp.float32), g, beta)
+    for mine, theirs in zip(got, want, strict=True):
+        assert mine.dtype == jnp.float32
+        np.testing.assert_array_equal(np.asarray(mine), np.asarray(theirs))
 
 
 @pytest.mark.mesh(devices=2)
