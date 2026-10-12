@@ -26,17 +26,7 @@ import grain.experimental as gx
 import grain.python as pygrain
 import numpy as np
 
-from dew.data.analysis import (
-    _LOCAL,
-    _at,
-    _cache_manifest,
-    _drops,
-    _identity,
-    _Lowering,
-    _name,
-    _steps,
-    _until,
-)
+from dew.data.analysis import _LOCAL, _at, _cache_manifest, _drops, _identity, _Lowering, _name, _until
 from dew.data.dataset import Batch, DataPartition, FilledBatch, Loading, _Grouped
 from dew.data.mix import Accepted, PrimedMix, SearchBudget, TokenDeficit, primed_maps, token_weights
 from dew.data.pipeline import (
@@ -370,7 +360,10 @@ class _Build:
         source = pipeline.source
         if not isinstance(source, Mixture):
             raise ValueError("phases need the global phased lowering")
-        built = [self.records(child, partition) for child in source.pipelines]
+        built = [
+            dataclasses.replace(self, lowering=analysis).records(child, partition)
+            for child, analysis in zip(source.pipelines, self.lowering.children, strict=True)
+        ]
         parents, lengths = zip(*built, strict=True)
         if all(isinstance(parent, pygrain.MapDataset) for parent in parents):
             mapped = [parent for parent in parents if isinstance(parent, pygrain.MapDataset)]
@@ -402,7 +395,7 @@ class _Build:
         """The root of an indexed read, cut to its share by index (`shared`),
         and through its cache when it has one, with the stages it consumed."""
         stored = pygrain.MapDataset.source(source.records(self.read)).seed(self.seed)
-        cache = _at(pipeline.stages, Artifact)
+        cache = self.lowering.cache
         if cache is None:
             identifiers = source.identifiers if isinstance(source, _Materialized) else ()
             rows = stored.map_with_index(_Placed(identifiers=identifiers)) if last >= 0 else stored
@@ -426,7 +419,7 @@ class _Build:
         before an interleave run inside each shard, which the interleave
         flattens where it is written."""
         stages = pipeline.stages
-        cache, interleave = _at(stages, Artifact), _at(stages, Interleave)
+        cache, interleave = self.lowering.cache, self.lowering.interleave
         start = 0 if cache is None else cache + 1
         shards = source.manifest()
         if cache is not None:
@@ -452,21 +445,21 @@ class _Build:
         if self.global_order or not self.training:
             return rows
         rows = rows[partition.index :: partition.count]
-        return rows if any(isinstance(stage, Repeat) for stage in pipeline.stages) else rows.repeat(None)
+        return rows if self.lowering.repeated else rows.repeat(None)
 
     def streamed(
         self, shards: ShardManifest, pipeline: Pipeline, partition: DataPartition
     ) -> pygrain.IterDataset:
         from dew.data.shards import streamed
 
-        cycle = next((stage.cycle_length for stage in pipeline.stages if isinstance(stage, Interleave)), 1)
+        interleave = None if self.lowering.interleave is None else pipeline.stages[self.lowering.interleave]
         return streamed(
             shards,
             partition=partition,
             seed=self.seed if self.training else None,
-            cycle_length=cycle,
+            cycle_length=interleave.cycle_length if isinstance(interleave, Interleave) else 1,
             loading=self.loading,
-            epochs=_epochs(pipeline) if self.training else 1,
+            epochs=self.lowering.epochs if self.training else 1,
         ).seed(self.seed)
 
     def records(self, pipeline: Pipeline, partition: DataPartition) -> tuple[Rows, pygrain.MapDataset | None]:
@@ -486,7 +479,7 @@ class _Build:
         for index, stage in enumerate(pipeline.stages[consumed:], start=consumed):
             if isinstance(stage, (BatchStage, TokenBudget, MapBatch, Rebatch)):
                 break
-            if self.read == "streamed" and isinstance(stage, Repeat) and _root_repeat(pipeline):
+            if index == self.lowering.absorbed:
                 continue
             if isinstance(stage, Prefetch) and self.global_order:
                 continue
@@ -643,7 +636,7 @@ class _Build:
         drop = batch_stage.drop_remainder if self.training else False
         empty = False
         if isinstance(rows, pygrain.MapDataset):
-            if self.training and not any(isinstance(stage, (Repeat, Limit)) for stage in _steps(pipeline)):
+            if self.training and self.lowering.endless and not self.lowering.repeated:
                 rows = rows.repeat(None)
             elif self.training and not self.lowering.endless:
                 rows = rows[: len(rows) // batch_stage.size * batch_stage.size]
@@ -714,10 +707,13 @@ def _epoch_records(train: Pipeline, build: _Build) -> int | None:
     if not build.global_order:
         return None
 
-    def counted(pipeline: Pipeline) -> int | None:
+    def counted(pipeline: Pipeline, build: _Build) -> int | None:
         source = pipeline.source
         if isinstance(source, Mixture):
-            sizes = [counted(child) for child in source.pipelines]
+            sizes = [
+                counted(child, dataclasses.replace(build, lowering=analysis))
+                for child, analysis in zip(source.pipelines, build.lowering.children, strict=True)
+            ]
             known = [size for size in sizes if size is not None]
             if len(known) != len(sizes):
                 return None
@@ -728,7 +724,7 @@ def _epoch_records(train: Pipeline, build: _Build) -> int | None:
         rows, _ = build.records(dataclasses.replace(pipeline, stages=pipeline.stages[:at]), DataPartition())
         return len(rows) if isinstance(rows, pygrain.MapDataset) else None
 
-    return counted(train)
+    return counted(train, build)
 
 
 def _weights(mixture: Mixture) -> Sequence[float]:
@@ -749,21 +745,6 @@ def _weights(mixture: Mixture) -> Sequence[float]:
 def _workers(pipeline: Pipeline, loading: Loading) -> int:
     return next(
         (stage.count for stage in pipeline.stages if isinstance(stage, Workers)), loading.worker_count
-    )
-
-
-def _root_repeat(pipeline: Pipeline) -> bool:
-    """Whether a streamed read repeats at its root: its repeat comes before any
-    random step, or it writes none and a training read never runs out."""
-    at = _at(pipeline.stages, Repeat)
-    return at is None or not any(isinstance(stage, RandomMap) for stage in pipeline.stages[:at])
-
-
-def _epochs(pipeline: Pipeline) -> int | None:
-    return (
-        next((stage.epochs for stage in pipeline.stages if isinstance(stage, Repeat)), None)
-        if _root_repeat(pipeline)
-        else 1
     )
 
 

@@ -14,20 +14,10 @@ from typing import TYPE_CHECKING, Annotated, Literal, Protocol, TypeAliasType, r
 import numpy as np
 import tyro
 
-from dew.data.analysis import _at, _preferred_read, _promoted, _random, _until
+from dew.data.analysis import _order_at, _preferred_read, _promoted, _random, _until
 from dew.data.compile import compile
 from dew.data.dataset import Batch, DataPhase, Dataset, Loading, Records as IndexedRecords, record_argument
-from dew.data.pipeline import (
-    Artifact,
-    Configured,
-    HostStep,
-    Mixture,
-    ObjectiveData,
-    Phases,
-    Pipeline,
-    Rejected,
-    Stage,
-)
+from dew.data.pipeline import Configured, HostStep, Mixture, ObjectiveData, Phases, Pipeline, Rejected, Stage
 from dew.records import integer
 
 if TYPE_CHECKING:
@@ -811,15 +801,8 @@ def _ordered(pipeline: Pipeline, read: Read, seed: int) -> Pipeline:
     if isinstance(pipeline.source, (Mixture, Phases)):
         children = tuple(_ordered(child, read, seed) for child in pipeline.source.pipelines)
         return dataclasses.replace(pipeline, source=dataclasses.replace(pipeline.source, pipelines=children))
-    if read == "memory":
-        stages = pipeline.stages
-        at = next((index for index, stage in enumerate(stages) if _random(stage)), len(stages))
-        order = Pipeline(pipeline.source).shuffle(seed).repeat().stages
-    else:
-        cache = _at(pipeline.stages, Artifact)
-        at = 0 if cache is None else cache + 1
-        window = 64 if read == "streamed" or cache is not None else None
-        order = Pipeline(pipeline.source).shuffle(seed, window=window).repeat().stages
+    at, indexed = _order_at(pipeline.stages, read)
+    order = Pipeline(pipeline.source).shuffle(seed, window=None if indexed else 64).repeat().stages
     return dataclasses.replace(pipeline, stages=(*pipeline.stages[:at], *order, *pipeline.stages[at:]))
 
 
