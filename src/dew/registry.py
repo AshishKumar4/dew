@@ -55,7 +55,7 @@ if TYPE_CHECKING:
     from _typeshed import DataclassInstance
     from flax import linen as nn
 
-    from dew.data.recipes import Recipe
+    from dew.config.data import RunData as Recipe
     from dew.diffusion.presets import Preset
     from dew.inputs.encoders import ConditionEncoder
     from dew.nn.mixers import MixerBase
@@ -1139,16 +1139,16 @@ solvers: Aliases[type[Solver[Any]], Solver[Any]] = Aliases("solver", {
     "unmask": "dew.diffusion.discrete:Unmask",
 })
 datasets: Aliases[type[Recipe], Recipe] = Aliases("dataset", {
-    "chat": "dew.data.recipes:Chat",
+    "chat": "dew.config.data:ChatData",
     "decisions": "dew.decision.data:Decisions",
-    "images": "dew.data.recipes:Images",
-    "preferences": "dew.data.recipes:Preferences",
-    "prompts": "dew.data.recipes:Prompts",
-    "records": "dew.data.recipes:Records",
-    "text": "dew.data.recipes:Text",
-    "tiny_shakespeare": "dew.data.recipes:TinyShakespeare",
-    "video": "dew.data.recipes:Video",
-}, base="dew.data.recipes:Recipe")
+    "images": "dew.config.data:ImageData",
+    "preferences": "dew.config.data:PreferenceData",
+    "prompts": "dew.config.data:PromptData",
+    "records": "dew.config.data:RecordsData",
+    "text": "dew.config.data:TextData",
+    "tiny_shakespeare": "dew.config.data:TinyShakespeareData",
+    "video": "dew.config.data:VideoData",
+}, base="dew.config.data:RunData")
 encoders: Aliases[type[ConditionEncoder[Any]], ConditionEncoder[Any]] = Aliases("encoder", {
     "char_table": "dew.inputs.encoders:CharTable",
     "clip_text": "dew.inputs.encoders:CLIPText",

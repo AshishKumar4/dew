@@ -11,7 +11,7 @@ from __future__ import annotations
 import dataclasses
 
 from dew.config import JsonDict, ModelConfig, ObjectiveConfig, OptimConfig, Prepared, RunConfig
-from dew.data import Images, Video, load
+from dew.config.data import ImageData, VideoData, loader
 from dew.inputs import Field
 from dew.registry import models
 
@@ -52,9 +52,9 @@ class JepaRunConfig(RunConfig):
     def sample(self) -> Field:
         """The batch field the encoder reads, at the resolution the data comes in."""
         spec = self.data
-        if isinstance(spec, Images):
+        if isinstance(spec, ImageData):
             return Field("image", (spec.image_size, spec.image_size, 3))
-        if isinstance(spec, Video):
+        if isinstance(spec, VideoData):
             return Field("video", (spec.frames, spec.frame_size, spec.frame_size, 3))
         raise ValueError(f"a JEPA run trains on image or video datasets, not {type(spec).__name__}")
 
@@ -63,7 +63,7 @@ class JepaRunConfig(RunConfig):
         and the probes, around the objective the run names. The predictor
         computes as the encoder does, its compute dtype and attention kernel."""
         self = dataclasses.replace(self, trainer=self.trainer.derived())
-        dataset = load(self.data, batch=self.trainer.batch_size, tokens=self.trainer.batch_tokens,
+        dataset = loader(self.data, batch=self.trainer.batch_size, tokens=self.trainer.batch_tokens,
                        read=self.data_read,
                        provision=self.provision, seed=self.data_seed, loading=self.loading,
                        validation_records=self.validation_records)

@@ -13,18 +13,22 @@ import numpy as np
 from dew.data.dataset import Records
 from dew.data.pipeline import Dataset
 
-from .base import Read, ShardManifest, Source
+from .base import Read, ShardManifest, Source, preparing
 from .files import Files, Format
 from .memory import _record
 
 
 @dataclass(frozen=True)
 class Hub(Dataset):
-    """A pinned Hub split. Preparing Arrow is always an explicit operation."""
+    """A pinned split of a Hub dataset: `name` is its configuration, as
+    `datasets.load_dataset(repo, name=)` takes it, and `columns` the fields
+    each record keeps (all where None). Read whole or by index from the
+    Arrow cache it prepares, or streamed from the repo's own shards."""
 
     repo: str
+    name: str | None = None
     split: str = "train"
-    config: str | None = None
+    columns: tuple[str, ...] | None = None
     revision: str | None = None
     cache_dir: str | None = None
 
@@ -48,7 +52,7 @@ class Hub(Dataset):
             raise ImportError("HF Arrow reads need pip install 'dewml[streaming]'") from error
 
         return load_dataset_builder(
-            self.repo, name=self.config, revision=self.commit, cache_dir=self.cache_dir
+            self.repo, name=self.name, revision=self.commit, cache_dir=self.cache_dir
         )
 
     @property
@@ -91,7 +95,7 @@ class Hub(Dataset):
             )
         revision, paths, format = selection
         urls = tuple(f"hf://datasets/{self.repo}@{revision}/{path}" for path in paths)
-        return Files(urls, format=format)
+        return Files(urls, format=format, columns=self.columns)
 
     def _selected(self, revision: str) -> tuple[list[str], Format]:
         from huggingface_hub import HfApi
@@ -108,14 +112,15 @@ class Hub(Dataset):
                     or Path(path).name.startswith(self.split + "-")
                     or Path(path).stem == self.split
                 )
-                and (self.config is None or f"/{self.config}/" in "/" + path)
+                and (self.name is None or f"/{self.name}/" in "/" + path)
             ]
             if matches:
                 return matches, format
         return [], "parquet"
 
     def describe(self) -> str:
-        return f"hf:{self.repo}@{self.commit}:{self.config}:{self.split}"
+        selected = f":{list(self.columns)}" if self.columns else ""
+        return f"hf:{self.repo}@{self.commit}:{self.name}:{self.split}{selected}"
 
     def consumed(self, read: Read) -> Source:
         return self.files if read == "streamed" else self
@@ -129,7 +134,8 @@ class Hub(Dataset):
             "store": "hf",
             "repo": self.repo,
             "revision": self.commit,
-            "config": self.config,
+            "config": self.name,
+            "columns": None if self.columns is None else list(self.columns),
             "split": self.split,
         }
 
@@ -139,6 +145,7 @@ class Hub(Dataset):
         return Path(self.builder.cache_dir, "dataset_info.json").is_file()
 
     def provision(self) -> Hub:
+        preparing(self, self.builder.info.download_size, self.builder.cache_dir)
         self.builder.download_and_prepare()
         return self
 
@@ -156,6 +163,8 @@ class Hub(Dataset):
 
         if not isinstance(dataset, Dataset):
             raise TypeError(f"{self.describe()} did not resolve to one split")
+        if self.columns is not None:
+            dataset = dataset.select_columns(list(self.columns))
         for name, feature in dataset.features.items():
             if isinstance(feature, Image) and feature.decode:
                 dataset = dataset.cast_column(name, Image(decode=False))

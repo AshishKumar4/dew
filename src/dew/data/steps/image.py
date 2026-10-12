@@ -15,7 +15,7 @@ from numpy.typing import ArrayLike
 
 from dew.data.dataset import Batch
 from dew.data.image_codec import decode_image
-from dew.data.images import Augment, as_rgb, augment_image, import_opencv, resize_image
+from dew.data.images import as_rgb, import_opencv
 from dew.data.pipeline import Rejected
 
 
@@ -267,18 +267,26 @@ class Torchvision(grain.RandomMapTransform):
 
 
 @dataclasses.dataclass(frozen=True)
-class Caption(grain.MapTransform):
-    template: str | None = None
-    classes: tuple[str, ...] = ()
+class Caption(grain.RandomMapTransform):
+    """A record's "caption": one of `templates`, drawn from the record's
+    generator, formatted with its fields, where "{label}" is the class name
+    `classes` gives its label; with no templates, the first of `columns` the
+    record has."""
 
-    def map(self, element: Batch) -> Batch:
-        if self.template is None:
-            caption = str(element.get("caption", element.get("text", "")))
+    templates: tuple[str, ...] = ()
+    classes: tuple[str, ...] = ()
+    columns: tuple[str, ...] = ("caption", "text", "txt")
+
+    def random_map(self, element: Batch, rng: np.random.Generator) -> Batch:
+        if not self.templates:
+            caption = next((str(element[key]) for key in self.columns if key in element), "")
         else:
             label = element.get("label", "")
             if self.classes:
                 label = self.classes[int(label)]
-            caption = self.template.format(**{**element, "label": label})
+            template = self.templates[int(rng.integers(len(self.templates)))] if len(self.templates) > 1 \
+                else self.templates[0]
+            caption = template.format(**{**element, "label": label})
         return {**element, "caption": caption}
 
 
@@ -303,6 +311,8 @@ class EncodeCaptions:
 
     def __call__(self, batch: Batch) -> Batch:
         held = dict(batch)
+        if "caption" not in held:
+            return held
         captions = [str(value) for value in held.pop("caption")]
         return held if self.reader is None else {**held, **self.reader(captions)}
 
@@ -330,97 +340,4 @@ class DeviceAugment:
             functools.partial(
                 augment_batch, size=self.size, crop_scale=self.crop_scale, flip=self.flip, jitter=self.jitter
             )
-        )
-
-
-@dataclasses.dataclass(frozen=True)
-class ImageRecord(grain.RandomMapTransform):
-    size: int
-    staging_size: int
-    field: str = "image"
-    caption: str | None = None
-    templates: tuple[str, ...] = ()
-    columns: tuple[str, ...] = ("caption", "text")
-    classes: tuple[str, ...] = ()
-    flip: bool = False
-    jitter: bool = False
-    crop_scale: tuple[float, float] = (1.0, 1.0)
-    backend: Literal["host", "device"] = "host"
-
-    def __post_init__(self) -> None:
-        if min(self.size, self.staging_size) < 1:
-            raise ValueError("image size and staging_size must be positive")
-        if self.backend not in ("host", "device"):
-            raise ValueError("image augmentation backend must be host or device")
-        if len(self.crop_scale) != 2 or not 0 < self.crop_scale[0] <= self.crop_scale[1] <= 1:
-            raise ValueError("crop_scale must satisfy 0 < low <= high <= 1")
-        import_opencv()
-
-    def __setstate__(self, state: Mapping[str, object]) -> None:
-        import_opencv()
-        for name, value in state.items():
-            object.__setattr__(self, name, value)
-
-    def random_map(self, element: Batch | bytes, rng: np.random.Generator) -> Batch:
-        import_opencv()
-        if isinstance(element, bytes):
-            from dew.data.sources.codec import unpack_dict_of_byte_arrays
-
-            decoded = unpack_dict_of_byte_arrays(element)
-            if "shape" in decoded:
-                height, width = np.frombuffer(decoded["shape"], np.int32)
-                pixels = np.frombuffer(decoded["image"], np.uint8).reshape(int(height), int(width), 3)
-                label = None if "label" not in decoded else int(np.frombuffer(decoded["label"], np.int32)[0])
-                element = {"image": pixels, "caption": decoded["caption"].decode(), "label": label}
-            else:
-                element = {"image": decoded["jpg"], "caption": decoded["txt"].decode()}
-        image = element[self.field]
-        label = element.get("label")
-        if self.classes and label is None:
-            raise ValueError("caption classes need an image label")
-        described = label if not self.classes else self.classes[int(element["label"])]
-        image = _payload(image)
-        if self.templates:
-            chosen = self.templates[int(rng.integers(len(self.templates)))]
-            caption = chosen.format(described, label=described)
-        elif self.caption is not None:
-            caption = self.caption.format(**{**element, "label": described})
-        elif not self.columns:
-            caption = ""
-        else:
-            caption = next((str(element[key]) for key in self.columns if key in element), "")
-        if isinstance(image, bytes):
-            image = decode_image(image, at_least=self.staging_size)
-        else:
-            image = as_rgb(np.asarray(image))
-        image = resize_image(image, self.staging_size)
-        if self.backend == "host":
-            # The crop geometry is its own: a crop scale or a staging size above the output crops and
-            # resizes to `size` whether or not a flip or a jitter rides along.
-            if self.crop_scale != (1.0, 1.0) or self.staging_size != self.size:
-                image = RandomCrop(self.size, self.crop_scale, self.flip, self.jitter).random_map(
-                    {"image": image}, rng
-                )["image"]
-            else:
-                image = augment_image(Augment(self.flip, self.jitter), image, rng)
-        held: Batch = {"image": image, "caption": caption}
-        if self.backend == "device":
-            held["image_augmentation_key"] = rng.integers(0, 2**32, size=2, dtype=np.uint32)
-        if label is not None:
-            held["label"] = np.int32(label)
-        return held
-
-
-@dataclasses.dataclass(frozen=True)
-class ConfigureImage:
-    image: ImageRecord
-
-    def __call__(self, metadata: Mapping[str, object]) -> ImageRecord:
-        from dew.records import record, strings
-
-        labels = record(metadata.get("class_names", {}), "class names").get("label")
-        return (
-            self.image
-            if self.image.classes or labels is None
-            else dataclasses.replace(self.image, classes=strings(labels, "class_names.label"))
         )

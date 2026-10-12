@@ -194,13 +194,14 @@ def color_jitter(brightness: float = 0.2, contrast: float = 0.05, saturation: fl
     return ColorJitter(brightness, contrast, saturation, field)
 
 
-def caption(template: str | None = None, *, classes: tuple[str, ...] = ()) -> Caption:
-    """A record step that writes "caption": the record's caption or text, or
-    `template` formatted with its fields, "{label}" being the class name
-    `classes` gives a label."""
+def caption(*templates: str, classes: tuple[str, ...] = (),
+            columns: tuple[str, ...] = ("caption", "text", "txt")) -> Caption:
+    """A random step that writes "caption": one of `templates`, drawn per
+    record, formatted with the record's fields ("{label}" is the class name
+    `classes` gives its label), or with none, the first of `columns` it has."""
     from dew.data.steps.image import Caption
 
-    return Caption(template, classes)
+    return Caption(templates, classes, columns)
 
 
 def processor(image_processor: object, *, field: str = "image", to: str = "pixel_values") -> Processor:

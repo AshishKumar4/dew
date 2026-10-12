@@ -24,7 +24,7 @@ import jax
 import jax.numpy as jnp
 
 from dew.config import DataSpec, ModelConfig, ObjectiveConfig, OptimConfig, Prepared, RunConfig
-from dew.data import Text, load
+from dew.config.data import TextData, loader
 from dew.data.sources import source
 from dew.data.text import HFTokenizer, tokenizer_for
 from dew.records import integer, text
@@ -43,7 +43,7 @@ class LMRunConfig(RunConfig):
     block_diffusion (the official DiffusionGemma fine-tuning objective)."""
     model: ModelConfig = dataclasses.field(
         default_factory=lambda: ModelConfig("causal_transformer", {"dtype": "bfloat16"}))
-    data: DataSpec = dataclasses.field(default_factory=lambda: Text(source=""))
+    data: DataSpec = dataclasses.field(default_factory=lambda: TextData(source=""))
     """The produced token store a run trains on (data:text). First-fit packing
     keeps document boundaries; weighted stores and phases share one vocabulary."""
     optim: OptimConfig = dataclasses.field(
@@ -141,7 +141,7 @@ class LMRunConfig(RunConfig):
             objective = self.objective.build(
                 model=model if source is None else source, seq_len=tokens.seq_len, variables=variables,
                 samples=samples, processor=self.processor(), qk_stats=self.optim.optimizer == "muonclip")
-        loaded = load(tokens, batch=self.trainer.batch_size, tokens=self.trainer.batch_tokens,
+        loaded = loader(tokens, batch=self.trainer.batch_size, tokens=self.trainer.batch_tokens,
                       lengths=() if self.trainer.batch_tokens is None else (
                           tokens.seq_len + (kind != "lm"),),
                       read=self.data_read, provision=self.provision,
@@ -159,10 +159,10 @@ class LMRunConfig(RunConfig):
         validation = () if self.trainer.eval_interval(loaded) is None else (Perplexity(),)
         return Prepared(run, lambda name: run.train(objective, loaded, name=name, metrics=validation))
 
-    def tokens(self) -> Text:
+    def tokens(self) -> TextData:
         """The token files this run trains on; any other data is refused."""
-        if not isinstance(self.data, Text):
-            raise ValueError("an LM run trains on a Text recipe: data:text")
+        if not isinstance(self.data, TextData):
+            raise ValueError("an LM run trains on a TextData recipe: data:text")
         return self.data
 
     def processor(self):
@@ -259,7 +259,7 @@ class LMRunConfig(RunConfig):
                                     processor=self.processor())
 
 
-def token_vocabulary(tokens: Text) -> tuple[str, int]:
+def token_vocabulary(tokens: TextData) -> tuple[str, int]:
     """One vocabulary shared by every source and phase of a text recipe."""
     values = [phase.path for phase in tokens.phases] if tokens.phases else [tokens.source]
     leaves = [leaf for value in values for leaf in (sorted(value) if isinstance(value, Mapping) else [value])]

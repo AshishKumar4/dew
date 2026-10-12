@@ -26,7 +26,7 @@ from dew.data.pipeline import Dataset
 from dew.data.storage import Store
 from dew.records import integer, record
 
-from .base import Read, Shard, ShardManifest
+from .base import Read, Shard, ShardManifest, preparing
 from .index import ArrayIndex
 
 type Format = Literal["jsonl", "text", "csv", "parquet", "arrow", "array_record", "files", "webdataset"]
@@ -290,6 +290,8 @@ class Files(Dataset):
             return self._provision_arrayrecord()
         if self.kind not in ("jsonl", "text", "csv"):
             raise ValueError(f"{self.describe()} has no provisionable offset index")
+        stores = [Store(url, self.storage_options).resolve() for url in self.paths]
+        preparing(self, sum(fs.size(path) for fs, path in stores), "an offset index beside each file")
         for url in self.paths:
             fs, path = Store(url, self.storage_options).resolve()
             offsets = []

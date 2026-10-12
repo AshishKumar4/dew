@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import dataclasses
 import functools
-import hashlib
 import json
 import random
 from collections.abc import Mapping, Sequence
@@ -16,29 +15,20 @@ import tyro
 
 from dew.data.analysis import _cache_at, _order_at, _preferred_read, _promoted, _until
 from dew.data.compile import compile
-from dew.data.dataset import Batch, DataPhase, Loader, Loading, Records as IndexedRecords, record_argument
-from dew.data.pipeline import (
-    Configured,
-    HostStep,
-    Mixture,
-    ObjectiveData,
-    Phases,
-    Pipeline,
-    Rejected,
-    Stage,
-    mix,
-)
+from dew.data.dataset import Batch, DataPhase, Loader, Loading, record_argument
+from dew.data.holdout import _HashSource, _named_split, _SelectedRow, _SliceRecords
+from dew.data.pipeline import Configured, HostStep, Mixture, ObjectiveData, Phases, Pipeline, Stage, mix
 from dew.records import integer
 
 if TYPE_CHECKING:
     from dew.data.cache import Cache, Generation
     from dew.data.sources.files import Format
-from dew.data.sources.base import Read, Shard, ShardManifest, Source, _consumed
+from dew.data import images, video
+from dew.data.sources.base import Read, ShardManifest, Source, _consumed
 from dew.data.steps.chat import ConfigurePrompt, PreferencePair, RenderChat
 from dew.data.steps.generic import Formatting
-from dew.data.steps.image import ConfigureImage, DeviceAugment, EncodeCaptions, ImageRecord
+from dew.data.steps.image import EncodeCaptions
 from dew.data.steps.text import Chunks, LengthPolicy, Tokenize, ValidTargets
-from dew.data.steps.video import Audio, DecodeClip, VideoPath
 
 type SourceValue = Source | str | Sequence[Batch] | Mapping[str, Sequence]
 type Validation = HoldOut | Split | Pipeline | Source | str | Sequence[Batch] | Mapping[str, Sequence] | None
@@ -105,122 +95,6 @@ class Split:
     name: str = "validation"
 
 
-@runtime_checkable
-class _SplitSource(Protocol):
-    def with_split(self, name: str) -> Source: ...
-
-
-@dataclasses.dataclass(frozen=True)
-class _SliceRecords:
-    source: Source
-    start: int
-    stop: int | None = None
-
-    def consumed(self, read: Read) -> _SliceRecords:
-        return dataclasses.replace(self, source=_consumed(self.source, read))
-
-    def describe(self) -> str:
-        return f"{self.source.describe()}[{self.start}:{self.stop}]"
-
-    def snapshot(self) -> Mapping[str, object]:
-        return {**self.source.snapshot(), "slice": [self.start, self.stop]}
-
-    def supports(self, read: Read) -> bool:
-        return read != "streamed" and self.source.supports(read)
-
-    def records(self, read: Read):
-        from dew.data.dataset import SourceSlice
-
-        records = self.source.records(read)
-        stop = len(records) if self.stop is None else self.stop
-        if not 0 <= self.start <= stop <= len(records):
-            raise ValueError(f"{self.describe()} exceeds the source's {len(records)} records")
-        return SourceSlice(records, self.start, stop)
-
-    def metadata(self) -> Mapping[str, object]:
-        stated = self.source.metadata()
-        return {**stated, **({"held_out": self.start} if self.start else {})}
-
-    def lengths(self) -> np.ndarray | None:
-        lengths = self.source.lengths()
-        return None if lengths is None else lengths[self.start : self.stop]
-
-    def manifest(self) -> ShardManifest:
-        raise ValueError("indexed HoldOut needs an index; use fraction= with by='hash' for a stream")
-
-
-@dataclasses.dataclass(frozen=True)
-class _HashRows:
-    fraction: float
-    held: bool
-    shard: str = "index"
-
-    def __call__(self, index: int, row: Batch) -> Batch | Rejected:
-        digest = hashlib.sha256(f"{self.shard}:{index}".encode()).digest()
-        accepted = int.from_bytes(digest[:8], "big") < int(self.fraction * 2**64)
-        return row if accepted == self.held else Rejected("holdout")
-
-
-@dataclasses.dataclass(frozen=True)
-class _HashSource:
-    source: Source
-    fraction: float
-    held: bool
-
-    def consumed(self, read: Read) -> _HashSource:
-        return dataclasses.replace(self, source=_consumed(self.source, read))
-
-    def describe(self) -> str:
-        return f"{self.source.describe()} hash holdout={self.fraction},held={self.held}"
-
-    def snapshot(self) -> Mapping[str, object]:
-        return {**self.source.snapshot(), "holdout": self.fraction, "held": self.held}
-
-    def supports(self, read: Read) -> bool:
-        return read != "indexed" and self.source.supports(read)
-
-    def records(self, read: Read):
-        import grain.python as grain
-
-        rows = self.source.records(read)
-        keys = tuple(
-            index
-            for index in range(len(rows))
-            if (
-                int.from_bytes(hashlib.sha256(f"index:{index}".encode()).digest()[:8], "big")
-                < int(self.fraction * 2**64)
-            )
-            == self.held
-        )
-        return grain.MapDataset.source(keys).map(_SelectedRow(rows))
-
-    def metadata(self) -> Mapping[str, object]:
-        return self.source.metadata()
-
-    def lengths(self) -> np.ndarray | None:
-        return None
-
-    def manifest(self) -> ShardManifest:
-        manifest = self.source.manifest()
-        return dataclasses.replace(manifest, reader=functools.partial(self._reader, manifest))
-
-    def _reader(self, manifest: ShardManifest, shard: Shard):
-        from dew.data.mix import Accepted
-
-        return Accepted(
-            manifest.reader(shard).map_with_index(_HashRows(self.fraction, self.held, shard.id)),
-            self.describe(),
-        )
-
-
-@dataclasses.dataclass(frozen=True)
-class _SelectedRow:
-    rows: IndexedRecords
-
-    def __call__(self, index: int) -> Batch | bytes | None:
-        return self.rows[index]
-
-
 @dataclasses.dataclass(frozen=True)
 class _RandomSource:
     source: Source
@@ -276,12 +150,9 @@ def _source(
     return source(value, split=split, format=format)
 
 
-def _named_split(source: Source, split: Split) -> Source:
-    """`source`'s own split `split.name`, through its `with_split`; a source with no native splits
-    refuses it by name."""
-    if not isinstance(source, _SplitSource):
-        raise ValueError(f"source {source.describe()} has no native split {split.name!r}")
-    return source.with_split(split.name)
+def _split(source: Source, split: Split) -> Source:
+    """`source`'s own split `split.name`."""
+    return _named_split(source, split.name)
 
 
 def _branches(
@@ -304,8 +175,8 @@ def _branches(
         elif validation.by == "hash":
             if validation.fraction is None:
                 raise ValueError("hash HoldOut needs fraction=")
-            train = Pipeline(_HashSource(source, validation.fraction, held=False), prefix)
-            held = _HashSource(source, validation.fraction, held=True)
+            train = Pipeline(_HashSource(source, 0.0, validation.fraction, held=False), prefix)
+            held = _HashSource(source, 0.0, validation.fraction, held=True)
         else:
             count = validation.records
             if count is None:
@@ -318,7 +189,7 @@ def _branches(
             train = Pipeline(_SliceRecords(source, count), prefix)
             held = _SliceRecords(source, 0, count) if count else None
     elif isinstance(validation, Split):
-        held = _named_split(source, validation)
+        held = _split(source, validation)
     elif validation is not None:
         held = _source(validation, format=format)
     evaluated = None if held is None else Pipeline(held, prefix)
@@ -326,7 +197,7 @@ def _branches(
 
 
 @runtime_checkable
-class Recipe(Protocol):
+class RunData(Protocol):
     def pipelines(self) -> tuple[Pipeline, Pipeline | None, tuple[HostStep, ...]]: ...
 
 
@@ -350,7 +221,7 @@ def _host_stages(defaults: tuple[HostStep, ...], explicit: tuple[HostStep, ...])
 
 
 @dataclasses.dataclass(frozen=True)
-class Records:
+class RecordsData:
     source: Annotated[SourceValue, source_argument(SourceValue)]
     validation: Annotated[Validation, source_argument(Validation)] = None
     split: str = "train"
@@ -362,7 +233,7 @@ class Records:
 
 
 @dataclasses.dataclass(frozen=True)
-class Text:
+class TextData:
     source: Annotated[SourceValue | Mapping[str, float], source_argument(SourceValue)] = ""
     tokenizer: str = "byte"
     seq_len: int = 256
@@ -387,7 +258,7 @@ class Text:
 
         if self.phases:
             if self.source:
-                raise ValueError("Text takes source or phases, not both")
+                raise ValueError("TextData takes source or phases, not both")
             branches = [
                 dataclasses.replace(self, source=phase.path, phases=()).pipelines() for phase in self.phases
             ]
@@ -406,7 +277,7 @@ class Text:
         ):
             branches = [dataclasses.replace(self, source=path).pipelines() for path in sorted(self.source)]
             if not branches:
-                raise ValueError("Text mixture has no corpora")
+                raise ValueError("TextData mixture has no corpora")
             weighted = {
                 path: float(weight)
                 for path, weight in self.source.items()
@@ -503,7 +374,7 @@ class Text:
 
 
 @dataclasses.dataclass(frozen=True)
-class Chat:
+class ChatData:
     source: Annotated[SourceValue, source_argument(SourceValue)]
     tokenizer: str
     seq_len: int = 256
@@ -534,7 +405,7 @@ class Chat:
 
 
 @dataclasses.dataclass(frozen=True)
-class Prompts:
+class PromptData:
     source: Annotated[SourceValue, source_argument(SourceValue)]
     tokenizer: str
     max_prompt_len: int = 256
@@ -621,7 +492,7 @@ class _PromptFacts:
 
 
 @dataclasses.dataclass(frozen=True)
-class Preferences:
+class PreferenceData:
     source: Annotated[SourceValue, source_argument(SourceValue)]
     seq_len: int = 256
     pad_id: int = 0
@@ -638,8 +509,8 @@ TINY_SHAKESPEARE = "https://raw.githubusercontent.com/karpathy/char-rnn/master/d
 
 
 @dataclasses.dataclass(frozen=True)
-class TinyShakespeare(Text):
-    """Karpathy's tiny Shakespeare corpus as a byte-level `Text` recipe, one
+class TinyShakespeareData(TextData):
+    """Karpathy's tiny Shakespeare corpus as a byte-level `TextData` recipe, one
     line a document, the corpus the language-model examples train on."""
 
     source: Annotated[SourceValue | Mapping[str, float], source_argument(SourceValue)] = TINY_SHAKESPEARE
@@ -659,7 +530,7 @@ class Augment:
 
 
 @dataclasses.dataclass(frozen=True)
-class Images:
+class ImageData:
     source: Annotated[SourceValue, source_argument(SourceValue)]
     image_size: int = 128
     staging_size: int | None = None
@@ -694,39 +565,31 @@ class Images:
             from dew.data.storage import Store
 
             classes = tuple(Store(self.labels).read().decode().splitlines())
-        transform = ImageRecord(
-            self.image_size,
-            size,
-            self.field,
-            self.caption,
-            self.caption_templates,
-            self.caption_columns,
-            classes,
-            flip=augment is not None and augment.flip,
-            jitter=augment is not None and augment.jitter,
-            crop_scale=(1.0, 1.0) if augment is None else augment.crop_scale,
-            backend="host" if augment is None else augment.backend,
-        )
-        train = train.map(Configured(ConfigureImage(transform), needs=(), random=True))
-        if augment is not None and augment.backend == "device":
-            train = train.map_batch(
-                DeviceAugment(self.image_size, augment.crop_scale, augment.flip, augment.jitter)
-            )
-        if held is not None:
-            evaluated = dataclasses.replace(
-                transform,
-                staging_size=self.image_size,
-                backend="host",
-                flip=False,
-                jitter=False,
-                crop_scale=(1.0, 1.0),
-            )
-            held = held.map(Configured(ConfigureImage(evaluated), needs=(), random=True))
+        templates = self.caption_templates or (() if self.caption is None else (self.caption,))
+        caption = images.caption(*templates, classes=classes, columns=self.caption_columns)
+
+        def prepared(chain: Pipeline, staging: int) -> Pipeline:
+            return (chain.map(images.decode(self.field, to="image")).random_map(caption)
+                    .map(images.resize(staging, "bicubic")))
+
+        train = prepared(train, size)
+        if augment is not None and augment.backend == "host":
+            if augment.crop_scale != (1.0, 1.0) or size != self.image_size:
+                train = train.random_map(images.random_resized_crop(self.image_size, scale=augment.crop_scale,
+                                                                    ratio=(1.0, 1.0)))
+            if augment.flip:
+                train = train.random_map(images.flip())
+            if augment.jitter:
+                train = train.random_map(images.color_jitter())
+        elif augment is not None:
+            train = train.random_map(images.augmentation_key()).map_batch(images.device_augment(
+                self.image_size, crop_scale=augment.crop_scale, flip=augment.flip, jitter=augment.jitter))
+        held = None if held is None else prepared(held, self.image_size)
         return train, held, (EncodeCaptions(),)
 
 
 @dataclasses.dataclass(frozen=True)
-class Video:
+class VideoData:
     source: Annotated[SourceValue, source_argument(SourceValue)]
     frames: int = 16
     frame_size: int = 256
@@ -758,17 +621,31 @@ class Video:
                 source,
                 url=tuple(path for path in source.paths if PurePosixPath(path).suffix.lower() in extensions),
             )
-        prefix = Pipeline(source).map(VideoPath(self.caption)).stages
+        prefix = Pipeline(source).map(_VideoRow(self.caption)).stages
         train, held = _branches(source, self.validation, split=self.split, prefix=prefix)
-        audio = Audio(self.audio_model)
-        decoder = DecodeClip(self.frames, self.frame_size, self.audio_padding, audio.processor.sampling_rate)
+        audio = video.audio(self.audio_model)
+        decoder = video.decode_clip(self.frames, size=self.frame_size, audio_padding=self.audio_padding,
+                                    sample_rate=audio.processor.sampling_rate)
         train = train.random_map(decoder).map(audio)
         held = None if held is None else held.random_map(decoder).map(audio)
         return train, held, (EncodeCaptions(),)
 
 
-def load(
-    recipe: Recipe | str,
+@dataclasses.dataclass(frozen=True)
+class _VideoRow:
+    """A listed clip's path as the decoder reads it, and its caption."""
+
+    caption: str = ""
+
+    def __call__(self, element: Batch) -> Batch:
+        from dew.records import text
+
+        path = text(element.get("video_path", element.get("path")), "video_path")
+        return {"mp4": path, "caption": element.get("caption", self.caption)}
+
+
+def loader(
+    recipe: RunData | str,
     *,
     batch: int | None = None,
     tokens: int | None = None,
@@ -793,7 +670,7 @@ def load(
         from dew.registry import datasets
 
         resolved = datasets.build(recipe, **fields)
-        if not isinstance(resolved, Recipe):
+        if not isinstance(resolved, RunData):
             raise TypeError(f"dataset alias {recipe!r} does not name a Pipeline recipe")
         recipe = resolved
     elif fields:
@@ -804,7 +681,7 @@ def load(
         if unknown:
             raise ValueError(f"unknown recipe fields {sorted(unknown)}")
         recipe = dataclasses.replace(recipe, **fields)
-    if not isinstance(recipe, Recipe):
+    if not isinstance(recipe, RunData):
         raise TypeError("load expects a typed recipe with pipelines()")
     train, held, shared = recipe.pipelines()
     if held is not None and validation_records is not None:
