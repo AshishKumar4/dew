@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import dataclasses
+
 import jax
 import optax
 from flax import struct
@@ -9,7 +11,7 @@ from flax.training.dynamic_scale import DynamicScale
 
 from dew.objectives.base import Aux, Batch, Step, Variables, merge
 
-__all__ = ["Accumulation", "Aux", "Step", "TrainState", "Variables"]
+__all__ = ["CHECKPOINTED", "Accumulation", "Aux", "Step", "TrainState", "Variables"]
 
 
 @struct.dataclass
@@ -61,7 +63,7 @@ class TrainState:
     scale: DynamicScale | None
     window_size: jax.Array
     accumulation: Accumulation | None = None
-    compute: Variables | None = None
+    compute: Variables | None = struct.field(default=None, metadata={'checkpointed': False})
     """The lower-precision copies of the parameters that the forward pass reads, such as bf16 copies
     of fp32 weights, written by the update (`dew.training.narrow`).
 
@@ -80,3 +82,9 @@ class TrainState:
                 "the objective keeps no EMA, so there are no averaged weights; "
                 "read state.variables")
         return merge(self.variables, self.ema)
+
+
+CHECKPOINTED = tuple(field.name for field in dataclasses.fields(TrainState)
+                     if field.metadata.get('checkpointed', True))
+"""The train-state fields a checkpoint holds, by their names; a field its
+declaration marks `checkpointed=False` is rebuilt on resume."""

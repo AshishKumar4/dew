@@ -338,14 +338,24 @@ def test_validation_loss_uses_exactly_the_ema_weights_of_the_evaluated_state():
 
 
 def test_record_metrics_and_keep_predicate_accept_unhashable_metric_objects(tmp_path):
+    """The predicate reads a step's metrics by their objects and sees the
+    record `kept` lists for that step, its ranking included."""
     metric = Value('value', Shown(better='lower'))
-    run = trainer(tmp_path / 'run', keep=Keep(latest=1, where=lambda c: c.metrics[metric] < .4))
+    seen = {}
+
+    def where(kept):
+        seen[kept.step] = kept
+        return kept.metrics[metric] < .4
+
+    run = trainer(tmp_path / 'run', keep=Keep(latest=1, where=where))
     run.fit(data(), steps=6, log_every=1, eval_every=1, checkpoint_every=1,
             metrics=[metric], best=Best(metric, mode='max'))
     retained = run.checkpoints.kept()
     assert {entry.step for entry in retained} == {1, 2, 6}
     for entry in retained:
         assert entry.metrics[metric] == entry.metrics['val/value']
+        assert entry.ranked_by is not None
+        assert dataclasses.replace(seen[entry.step], metrics=entry.metrics) == entry
     class WithCe(Overfit):
         shown: ClassVar = {'ce': Shown(better='lower')}
     objective = WithCe()

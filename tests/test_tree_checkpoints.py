@@ -103,10 +103,11 @@ def test_keep_retains_latest_periodic_and_best_tree_steps(tmp_path):
 
 
 def test_a_template_of_another_shape_is_refused(tmp_path):
+    """By the leaf's name, its stored shape and the shape asked."""
     checkpoints = Checkpoints(str(tmp_path))
     checkpoints.save(1, {"v": jnp.zeros((4,))})
     checkpoints.wait()
-    with pytest.raises(ValueError, match="holds a mapping that does not fit"):
+    with pytest.raises(ValueError, match=r"holds \['v'\] \(4,\) for \(5,\)"):
         checkpoints.restore(template({"v": jnp.zeros((5,))}))
 
 
