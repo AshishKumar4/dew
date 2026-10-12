@@ -485,7 +485,7 @@ Adapter.merge(variables) -> variables;  Adapter.save(variables, path)
 Pretrained.save(directory, *, variables=None, max_shard_size="5GB")
 Pretrained.push_to_hub(repo_id, *, variables=None, private=False, commit_message=..., max_shard_size="5GB")
 TextToImage(model, process, inputs, params, autoencoder=None, steps=50, guidance=None,
-            solver=DDIM(), grid=None, final_denoise=True, finish=None, blank=None)
+            solver=DDIM(), grid=None, final_denoise=True, finish=None)
 TextToImage.from_objective(objective, variables) -> TextToImage
 TextToImage.from_run(directory, *, ema=None, step=None, mesh=None, layout=None, dtype=None,
                      param_dtype=None)
@@ -519,7 +519,7 @@ An explicit `sampling=` replaces the policy and the chain, and the controls behi
 
 `TextToImage` keeps the objective's or source's `steps`, `guidance` and `solver` defaults. `prepare` encodes the prompts and draws their noise once, placed for the task's mesh. `Images.images` is `[rows, H, W, C]` in [-1, 1], and `host()` reads a process's rows back. For a source whose solver pairs its own sigma and model-time tables, `grid(steps)` returns the process and the explicit time grid that a trajectory of that length steps through. The noise prior follows that process, so `prepare` takes the same `steps`. `final_denoise=False` ends a trajectory at the last grid point without the final clean prediction. `sample(denoise, x_T, steps=None, *, solver, guidance=None, key, times=None, final_denoise=True)` in `dew.sampling` takes the same two controls; pass exactly one of `steps` and `times`, and an explicit grid decides the trajectory's length.
 
-For a source that ships a checker or an output transform, `finish(params, images)` runs it on the decoded images under the same placement. `blank` is the task's unconditional branch, encoded once by whatever built the task (`DiffusionObjective.blank_conditions`); `None` encodes it on every call. Rebinding keeps every task's compilation identity.
+For a source that ships a checker or an output transform, `finish(params, images)` runs it on the decoded images under the same placement. Each call encodes the task's own unconditional prompt with the encoders it holds, as the training step encodes its blank (`DiffusionObjective.blank_conditions`). Rebinding keeps every task's compilation identity.
 
 `Server.from_task(task, slots=, capacity=)` serves a `TextGeneration` task with continuous batching over one resident KV cache. It holds `slots` rows of `capacity` cache slots each, admits queued requests into free rows, and runs one compiled step over every row per iteration. Every request runs the task's bound policy and draws with the key it was submitted with, so a served request draws the same tokens as the same request run alone. `submit` returns a ticket that resolves to the request's `Generation`, `step` runs one iteration, and `run` steps until the queue and the rows are empty. Calling the server with a batch of prompts submits them and runs them.
 

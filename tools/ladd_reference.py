@@ -47,16 +47,15 @@ kept `u`s in float32 and float64.
 
 from __future__ import annotations
 
-import ast
 import json
 import math
 import types
-import urllib.request
 from pathlib import Path
 
 import jax
 import numpy as np
 import torch
+from reference_source import definitions
 from torch.nn.utils.spectral_norm import SpectralNorm
 
 STYLEGAN_T = ("https://raw.githubusercontent.com/autonomousvision/stylegan-t/"
@@ -67,23 +66,6 @@ SETTINGS = {"batch": 4, "side": 4, "channels": 3, "width": 6, "cmap_dim": 8, "ti
             "student_times": [1.0, 0.75, 0.5, 0.25], "renoise_times": [1.0, 1.0], "distillation_weight": 2.5,
             "r1_weight": 0.5, "layers": ["layer_a", "layer_b"], "key": 5}
 """R1's weight is far above ADD's 1e-5, so its term moves the loss."""
-
-
-def definitions(url: str, names: tuple[str, ...], scope: dict, *, within: str | None = None) -> dict:
-    """The named top-level definitions (or methods of the class `within`) of
-    the file at `url`, run as published."""
-    text = urllib.request.urlopen(url).read().decode()
-    body = ast.parse(text).body
-    if within is not None:
-        body = next(node for node in body if isinstance(node, ast.ClassDef) and node.name == within).body
-    for node in body:
-        if isinstance(node, (ast.FunctionDef, ast.ClassDef)) and node.name in names:
-            source = ast.get_source_segment(text, node)
-            if within is not None:
-                first, *rest = source.splitlines()
-                source = "\n".join([first, *(line[4:] for line in rest)])
-            exec(source, scope)
-    return scope
 
 
 class Precision:
