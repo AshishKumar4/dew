@@ -1,19 +1,19 @@
 {
 	"about": "The screen profile.py left on a terminal, written by site/scripts/capture_snippets.py.",
 	"arguments": [],
-	"script_sha256": "eecbc9e45a5dee77d0ddb567f077169b434d92e0912c522f1c7aa86966ef93de",
+	"script_sha256": "55d092f336ae37928849f2fc888757b4f2f534a38c2837e8fe41d75e83631505",
 	"meta": {
-		"where": "an 8-vCPU Linux container",
+		"where": "a 4-vCPU Cloudflare container",
 		"python": "3.12.15",
 		"jax": "0.11.2.post3",
 		"flax": "0.12.10",
 		"optax": "0.2.8",
-		"dew": "fccc08172cf3de7ac3b563474d0ffba27d331731",
-		"date": "2026-10-10"
+		"dew": "7ae1f47abb752d0f34adf02d4e41d8015868beb1",
+		"date": "2026-10-12"
 	},
 	"hero": {
 		"returncode": 0,
-		"seconds": 15.8,
+		"seconds": 31.4,
 		"columns": 96,
 		"screen": [
 			[
@@ -133,7 +133,7 @@
 					"dim": true
 				},
 				{
-					"text": "  100%  15.9"
+					"text": "  100%  12.8"
 				},
 				{
 					"text": " step/s",
@@ -198,7 +198,7 @@
 					"dim": true
 				},
 				{
-					"text": "5 steps in 0:00:02             "
+					"text": "5 steps in 0:00:03             "
 				},
 				{
 					"text": "\u2502",
@@ -218,7 +218,7 @@
 					"dim": true
 				},
 				{
-					"text": "after 2.20 s                   "
+					"text": "after 3.07 s                   "
 				},
 				{
 					"text": "\u2502",
@@ -238,7 +238,7 @@
 					"dim": true
 				},
 				{
-					"text": "21.7 step/s                    "
+					"text": "17.0 step/s                    "
 				},
 				{
 					"text": "\u2502",
@@ -258,7 +258,7 @@
 					"dim": true
 				},
 				{
-					"text": "7.7% of the wall time in steps "
+					"text": "7.1% of the wall time in steps "
 				},
 				{
 					"text": "\u2502",
