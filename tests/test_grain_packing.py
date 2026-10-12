@@ -7,7 +7,10 @@ import numpy as np
 import pytest
 from grain.experimental import FirstFitPackIterDataset
 
-from dew.data import DataPartition, Loading, Memory, Pipeline, validation
+from dew.data import Loading, Memory
+from dew.data.compile import validation
+from dew.data.dataset import DataPartition
+from dew.data.pipeline import Pipeline
 from dew.data.tokens import DocumentChunks, PackedWindows
 
 READ = Loading(workers=0, threads=1, read_buffer=0, worker_buffer=1)

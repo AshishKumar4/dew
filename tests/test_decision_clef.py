@@ -15,7 +15,7 @@ from reference_error import assert_as_exact_as_the_reference
 from safetensors.numpy import load_file
 
 from dew.checkpoints import Checkpoints
-from dew.data.recipes import load
+from dew.config.data import loader
 from dew.data.text import HFTokenizer
 from dew.decision import (
     Choice,
@@ -207,7 +207,7 @@ def test_a_clef_release_fine_tunes_and_reloads_from_the_run(tmp_path):
     # Training pads every row to the layout's max_len; Clef serves up to 16384.
     objective = DecisionObjective(Decide.from_pretrained(release, attention_impl="xla"),
                                   layout=JointLayout(max_len=1024))
-    data = load(Decisions(source=examples, validation=examples), batch=8, read="memory",
+    data = loader(Decisions(source=examples, validation=examples), batch=8, read="memory",
         objective=objective.data())
     run = tmp_path / "run"
     checkpoints = Checkpoints(str(run), keep=1)

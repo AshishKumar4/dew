@@ -118,7 +118,8 @@ def moving_hub_conversion(monkeypatch, tmp_path, request):
 def test_a_conversion_that_moves_under_one_default_commit_is_another_snapshot(moving_hub_conversion):
     """One source pins its conversion once; a new source refuses the old plan
     after that conversion moves under the same default commit."""
-    from dew.data import Pipeline, compile
+    from dew.data.compile import compile
+    from dew.data.pipeline import Pipeline
     from dew.data.sources import Hub
 
     def plan():
@@ -141,7 +142,7 @@ def test_a_conversion_that_moves_under_one_default_commit_is_another_snapshot(mo
     ("concatenate", "indexed"), ("slice", "indexed"), ("random", "indexed"), ("hash", "memory"),
 ])
 def test_wrapped_hub_resume_checks_the_conversion_only_when_consumed(moving_hub_conversion, wrapper, read):
-    from dew.data.recipes import HoldOut, Records, load
+    from dew.config.data import HoldOut, RecordsData, loader
     from dew.data.sources import Hub
     from dew.data.sources.concatenate import Concatenate
 
@@ -154,7 +155,7 @@ def test_wrapped_hub_resume_checks_the_conversion_only_when_consumed(moving_hub_
             HoldOut(records=8, by="index" if wrapper == "slice" else "random")
             if wrapper in ("slice", "random") else None
         )
-        return load(Records(source, validation=holdout), batch=2, read=read, loading=Loading(workers=0))
+        return loader(RecordsData(source, validation=holdout), batch=2, read=read, loading=Loading(workers=0))
 
     data = loaded()
     reader = data.train(DataPartition())
@@ -191,17 +192,17 @@ def test_wrapped_hub_resume_checks_the_conversion_only_when_consumed(moving_hub_
 def test_metadata_wrapped_hub_resume_keeps_facts_and_checks_consumed_files(
     moving_hub_conversion, recipe, read
 ):
-    from dew.data.recipes import Prompts, load
+    from dew.config.data import PromptData, loader
     from dew.data.sources import Hub
     from dew.decision.data import Decisions
 
     def loaded():
         source = Hub("owner/data")
         configured = (
-            Prompts(source, "byte", max_prompt_len=4, reward_bytes=None if read == "memory" else 8)
+            PromptData(source, "byte", max_prompt_len=4, reward_bytes=None if read == "memory" else 8)
             if recipe == "prompts" else Decisions(source, options=("a", "b"))
         )
-        return load(configured, batch=2, read=read, loading=Loading(workers=0))
+        return loader(configured, batch=2, read=read, loading=Loading(workers=0))
 
     reader = loaded().train(DataPartition())
     try:
@@ -283,7 +284,8 @@ def test_hub_refuses_streaming_when_the_chosen_revision_has_no_shards_of_the_spl
     from huggingface_hub import HfApi
     from huggingface_hub.hf_api import GitRefInfo, GitRefs
 
-    from dew.data import Pipeline, compile
+    from dew.data.compile import compile
+    from dew.data.pipeline import Pipeline
     from dew.data.sources import Hub
 
     conversion = GitRefInfo(name="parquet", ref="refs/convert/parquet", target_commit="converted")
@@ -1056,20 +1058,20 @@ def test_a_source_read_only_as_a_stream_packs_its_rows_as_they_arrive():
 
 
 def test_a_run_that_states_no_read_reads_as_its_sources_choose(tmp_path):
-    """Records held in memory read from memory, a store that reads by index
+    """RecordsData held in memory read from memory, a store that reads by index
     reads by index and a stream streams, when the run states no read; a read
     it states wins over each."""
     import pyarrow.parquet as pq
 
     from dew.config import RunConfig
-    from dew.data import Records, load
+    from dew.config.data import RecordsData, loader
 
     rows = [{"value": index} for index in range(8)]
     pq.write_table(pa.Table.from_pylist(rows), tmp_path / "rows.parquet")
     (tmp_path / "rows.jsonl").write_text("".join(json.dumps(row) + "\n" for row in rows))
 
     def read(source, stated=RunConfig.data_read):
-        loaded = load(Records(source=source), batch=2, read=stated, loading=Loading(workers=0))
+        loaded = loader(RecordsData(source=source), batch=2, read=stated, loading=Loading(workers=0))
         assert loaded.plan is not None
         return loaded.plan.order["read"]
 
@@ -1083,11 +1085,11 @@ def test_a_run_that_states_no_read_takes_the_first_read_its_sources_can_all_take
     """A CSV with no index prefers a stream, but its random holdout cannot be
     streamed and the CSV cannot be read by index, so the run reads it into
     memory and trains on the half the holdout leaves."""
-    from dew.data import HoldOut, Records, load
+    from dew.config.data import HoldOut, RecordsData, loader
 
     (tmp_path / "rows.csv").write_text("text\n" + "".join(f"row {index}\n" for index in range(8)))
     split = HoldOut(fraction=0.5, by="random")
-    loaded = load(Records(source=str(tmp_path / "rows.csv"), validation=split), batch=2, read=None,
+    loaded = loader(RecordsData(source=str(tmp_path / "rows.csv"), validation=split), batch=2, read=None,
                   loading=Loading(workers=0))
     assert loaded.plan is not None and loaded.plan.order["read"] == "memory"
     assert loaded.records == 4
@@ -1097,12 +1099,12 @@ def test_a_token_holdout_with_no_stated_read_reads_unindexed_text_into_memory(tm
     """A token split needs a finite indexed order, which JSON lines without an
     index can neither stream nor read by index, so the run reads them into
     memory and holds out the first quarter of their tokens."""
-    from dew.data import HoldOut, Text, load
+    from dew.config.data import HoldOut, TextData, loader
 
     documents = [{"text": f"document {index} " * 6} for index in range(8)]
     (tmp_path / "text.jsonl").write_text("".join(json.dumps(document) + "\n" for document in documents))
-    recipe = Text(source=str(tmp_path / "text.jsonl"), seq_len=8, token_holdout=HoldOut(fraction=0.25))
-    loaded = load(recipe, batch=2, read=None, loading=Loading(workers=0))
+    recipe = TextData(source=str(tmp_path / "text.jsonl"), seq_len=8, token_holdout=HoldOut(fraction=0.25))
+    loaded = loader(recipe, batch=2, read=None, loading=Loading(workers=0))
     assert loaded.plan is not None and loaded.plan.order["read"] == "memory"
     assert loaded.val is not None and loaded.records
 
@@ -1114,12 +1116,12 @@ def test_a_token_holdout_over_an_indexed_store_reads_into_memory_when_no_read_is
     follows the split."""
     import pyarrow.parquet as pq
 
-    from dew.data import HoldOut, Text, load
+    from dew.config.data import HoldOut, TextData, loader
 
     rows = [{"text": f"document {index} " * 6} for index in range(8)]
     pq.write_table(pa.Table.from_pylist(rows), tmp_path / "rows.parquet")
-    recipe = Text(source=str(tmp_path / "rows.parquet"), seq_len=8, token_holdout=HoldOut(fraction=0.25))
-    loaded = load(recipe, batch=2, read=None, loading=Loading(workers=0))
+    recipe = TextData(source=str(tmp_path / "rows.parquet"), seq_len=8, token_holdout=HoldOut(fraction=0.25))
+    loaded = loader(recipe, batch=2, read=None, loading=Loading(workers=0))
     assert loaded.plan is not None and loaded.plan.order["read"] == "memory"
 
 
@@ -1130,7 +1132,7 @@ def test_a_default_read_is_judged_on_the_order_the_recipe_adds_at_that_read(tmp_
     the split, rather than choosing indexed for the recipe as written."""
     import pyarrow.parquet as pq
 
-    from dew.data import load
+    from dew.config.data import loader
     from dew.data.pipeline import Pipeline
 
     class Split:
@@ -1139,7 +1141,7 @@ def test_a_default_read_is_judged_on_the_order_the_recipe_adds_at_that_read(tmp_
 
     rows = [{"text": [index] * 4} for index in range(8)]
     pq.write_table(pa.Table.from_pylist(rows), tmp_path / "rows.parquet")
-    loaded = load(Split(), batch=1, read=None, loading=Loading(workers=0))
+    loaded = loader(Split(), batch=1, read=None, loading=Loading(workers=0))
     assert loaded.plan is not None and loaded.plan.order["read"] == "memory"
 
 
@@ -1149,7 +1151,7 @@ def test_a_token_store_without_its_length_index_is_refused_naming_provisioning(t
     refusal names provisioning, and provision=True builds the index."""
     from array_record.python.array_record_module import ArrayRecordWriter
 
-    from dew.data import Text, load
+    from dew.config.data import TextData, loader
 
     Store(str(tmp_path)).child("meta.json").write(json.dumps({
         "tokenizer": "byte", "dtype": "uint16", "vocab_size": 256, "train_tokens": 40, "eos_id": None,
@@ -1159,7 +1161,7 @@ def test_a_token_store_without_its_length_index_is_refused_naming_provisioning(t
         writer.write(np.arange(start, start + 10, dtype=np.uint16).tobytes())
     writer.close()
     with pytest.raises(ValueError, match="provision"):
-        load(Text(source=str(tmp_path), seq_len=4), batch=1, read=None, loading=Loading(workers=0))
-    loaded = load(Text(source=str(tmp_path), seq_len=4), batch=1, read=None, provision=True,
+        loader(TextData(source=str(tmp_path), seq_len=4), batch=1, read=None, loading=Loading(workers=0))
+    loaded = loader(TextData(source=str(tmp_path), seq_len=4), batch=1, read=None, provision=True,
                   loading=Loading(workers=0))
     assert loaded.plan is not None and loaded.plan.order["read"] == "streamed"

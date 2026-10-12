@@ -11,7 +11,9 @@ from pathlib import Path
 
 import pytest
 
-from dew.data import DataPartition, Loading, Memory, Split, load
+from dew.config.data import Split, loader
+from dew.data import Loading, Memory
+from dew.data.dataset import DataPartition
 from dew.data.text import HFTokenizer
 from dew.decision import Choice, Decide, DecisionObjective, Decisions, Example, JointLayout, Noul
 from dew.decision.config import DecisionRunConfig
@@ -125,7 +127,7 @@ def test_a_decision_mixture_from_its_manifest_reads_by_index_by_default(tmp_path
     """The produced mixture states an offset index for each set, so a run that
     states no read reads it by index rather than loading it whole."""
     mixture = _mixture(tmp_path, _requests(24, joint=False), [], held=4)
-    loaded = load(Decisions(str(mixture)), batch=4, read=DecisionRunConfig.data_read,
+    loaded = loader(Decisions(str(mixture)), batch=4, read=DecisionRunConfig.data_read,
                   loading=Loading(workers=0))
     assert loaded.plan is not None and loaded.plan.order["read"] == "indexed"
 
@@ -213,7 +215,7 @@ def test_the_fit_check_leaves_out_a_set_none_of_whose_rows_fit():
     too_many = Choice("Which?", [f"option {index}" for index in range(200)])
     long = [Example(f"long {index}", {"team": too_many}, {"team": 0}) for index in range(3)]
     recipe = Decisions(source={"short": short, "long": long}, weights={"short": 1.0, "long": 2.0})
-    data = load(recipe, batch=2, read="memory", objective=objective.data(), loading=Loading(workers=0))
+    data = loader(recipe, batch=2, read="memory", objective=objective.data(), loading=Loading(workers=0))
     assert data.records == len(short)
     assert data.counts["long"].accepted == 0 and data.counts["long"].rejected["unfit"] == len(long)
     stream = data.train(DataPartition())
@@ -222,7 +224,7 @@ def test_the_fit_check_leaves_out_a_set_none_of_whose_rows_fit():
     finally:
         stream.close()
     with pytest.raises(ValueError, match=r"fit|accepted|empty"):
-        refused = load(Decisions(source={"long": long}, weights={"long": 1.0}), batch=2,
+        refused = loader(Decisions(source={"long": long}, weights={"long": 1.0}), batch=2,
                        read="memory", objective=objective.data(), loading=Loading(workers=0))
         next(refused.train(DataPartition()))
 
@@ -240,7 +242,7 @@ def test_the_clef_recipe_defaults_build_token_budget_batches():
                 for size in (160, 768, 1_536, 3_072)] * 64
     objective = DecisionObjective(Decide.from_pretrained(TINY), layout=JointLayout(max_len=run.max_len),
                                   shuffle_options=False)
-    data = load(Decisions(source=examples), batch=trainer.batch_size, tokens=trainer.batch_tokens,
+    data = loader(Decisions(source=examples), batch=trainer.batch_size, tokens=trainer.batch_tokens,
                 lengths=run.bucket_lengths, objective=objective.data(), read="memory",
                 loading=Loading(workers=0))
     assert data.batch_tokens == 16_384

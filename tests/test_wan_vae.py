@@ -381,13 +381,14 @@ def test_an_unsupported_config_is_refused(source, change):
 
 
 def test_a_video_run_denoises_wan_latents_and_samples_whole_clips(source):
-    """A Video recipe behind the Wan VAE denoises 1 + k latent frames
+    """A VideoData recipe behind the Wan VAE denoises 1 + k latent frames
     for clips of 1 + 4k, trains, and samples clips of the length it read."""
     import optax
     from diffusion_stubs import STUB_TEXT
 
     from dew.config import ModelConfig, ObjectiveConfig, TrainerConfig
-    from dew.data import Loader, Video
+    from dew.config.data import VideoData
+    from dew.data.dataset import Loader
     from dew.objectives.diffusion import DiffusionRunConfig, PretrainedAutoencoder, TextCondition
     from dew.sampling import Euler
     from dew.training import Trainer
@@ -398,7 +399,7 @@ def test_a_video_run_denoises_wan_latents_and_samples_whole_clips(source):
             {"patch_size": 1, "emb_features": 16, "num_layers": 1, "num_heads": 2, "mlp_ratio": 1,
              "dtype": "float32", "attention_impl": "reference"},
         ),
-        data=Video(source="clips", frame_size=32, frames=9),
+        data=VideoData(source="clips", frame_size=32, frames=9),
         trainer=TrainerConfig(batch_size=8, steps=1),
         val_metrics=(),
         text=TextCondition(encoder=STUB_TEXT, checkpoint="stub-clip"),

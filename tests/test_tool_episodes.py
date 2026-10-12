@@ -35,7 +35,7 @@ from episode_support import (
     verify,
 )
 
-from dew.data import Loader
+from dew.data.dataset import Loader
 from dew.objectives.base import Step
 from dew.objectives.rl import GRPOObjective
 from dew.objectives.rl.episodes import EpisodeCancelled, EpisodeFailure, EpisodeStatus

@@ -1016,13 +1016,13 @@ def diffusion_run(directory, batch=RUN_BATCH, **trainer):
     """The smallest unconditional diffusion run: a tiny DiT over 8-pixel
     images, one step, nothing written but the record."""
     from dew.config import ModelConfig, TrainerConfig
-    from dew.data import Images
+    from dew.config.data import ImageData
     from dew.objectives.diffusion import DiffusionRunConfig
 
     return DiffusionRunConfig(
         model=ModelConfig("simple_dit", {"patch_size": 4, "emb_features": 16,
                                          "num_layers": 1, "num_heads": 2, "dtype": "float32"}),
-        data=Images(source="tfds://oxford_flowers102", split="all", image_size=RES), text=None,
+        data=ImageData(source="tfds://oxford_flowers102", split="all", image_size=RES), text=None,
             val_metrics=(),
         trainer=TrainerConfig(name="quantized", checkpoint_dir=str(directory), batch_size=batch,
                               steps=1, eval_every=None, checkpoint_every=None,
@@ -1038,7 +1038,7 @@ def test_the_trainer_knob_quantizes_the_objective_a_run_trains(tmp_path):
     rules reached the matmuls. Observed on CPU: 2.7e-05 on activations of
     order 1e-2, against 0.0 for a run trained without the knob."""
     pytest.importorskip("qwix")
-    from dew.data import Loader
+    from dew.data.dataset import Loader
 
     batch = RUN_BATCH
     config = diffusion_run(tmp_path, batch, quantization=Quantization())
@@ -1087,7 +1087,7 @@ def test_the_trainer_knob_quantizes_what_a_distillation_trains_and_not_its_teach
 def test_an_objective_that_trains_no_single_model_is_refused(tmp_path):
     """The wrap needs a module to wrap; an objective that keeps none is
     refused by name, before the run writes anything."""
-    from dew.data import Loader
+    from dew.data.dataset import Loader
     from dew.objectives.base import Aux, Objective
 
     class Modelless(Objective):

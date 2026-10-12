@@ -24,7 +24,7 @@ import numpy as np
 import optax
 import pytest
 
-from dew.data import DataPartition, Loader
+from dew.data.dataset import DataPartition, Loader
 from dew.inference import NativeRolloutServer, TextGeneration
 from dew.inference.serving import Server
 from dew.nn.backbones.causal_transformer import CausalTransformer

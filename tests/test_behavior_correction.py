@@ -65,7 +65,7 @@ def test_corrected_objective_changes_a_real_trainer_update():
 
     import optax
 
-    from dew.data import Loader
+    from dew.data.dataset import Loader
     from dew.training import Trainer
 
     original, rollout = build()

@@ -560,7 +560,9 @@ import numpy as np
 import optax
 
 from dew.checkpoints import Checkpoints
-from dew.data import ByteTokenizer, Loading, Memory, Pipeline, compile
+from dew.data import ByteTokenizer, Loading, Memory
+from dew.data.compile import compile
+from dew.data.pipeline import Pipeline
 from dew.inference import RunProcessor
 from dew.nn.backbones import CausalTransformer
 from dew.objectives.{module} import {objective}

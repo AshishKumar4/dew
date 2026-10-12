@@ -38,7 +38,9 @@ import numpy as np
 import pytest
 from model_support import flat_tree
 
-from dew.data import Memory, Pipeline, compile
+from dew.data import Memory
+from dew.data.compile import compile
+from dew.data.pipeline import Pipeline
 from dew.interop import Pretrained, PretrainedDecoder
 from tools import masked_diffusion_export_reference as tool
 

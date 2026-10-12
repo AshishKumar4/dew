@@ -55,10 +55,10 @@ from test_precision_policy import PER_ARCH, TINY
 
 import dew
 from dew.checkpoints import Checkpoints
-from dew.data import DataPartition, Loader
+from dew.config.data import loader
+from dew.data.dataset import DataPartition, Loader
 from dew.data.preferences import IDS_KEY as PAIR_IDS_KEY, MASK_KEY as PAIR_MASK_KEY
 from dew.data.prompts import LENGTH_KEY, PROMPT_KEY
-from dew.data.recipes import load
 from dew.data.text import ByteTokenizer
 from dew.decision import Choice, DecisionObjective, Example, MarkerLayout, Specials, StateFirstLayout
 from dew.decision.data import Decisions
@@ -191,7 +191,7 @@ class Family:
     """The `dew.registry.models` name this is a variant of; None for a model nothing registers."""
     facts: frozenset[str]
     vocab: int
-    load: Callable[[], Loaded] = field(compare=False)
+    loader: Callable[[], Loaded] = field(compare=False)
     inputs: Callable[[], InputSpec] | None = field(default=None, compare=False)
     """A denoiser's sample field and conditions; None for a token model."""
 
@@ -201,24 +201,24 @@ class Family:
 
 def built(name: str, **config) -> Callable[[], Loaded]:
     """A registered family at a tiny hand-written config, with a fresh tree."""
-    def load() -> Loaded:
+    def loader() -> Loaded:
         model = models.build(name, **config)
         return Loaded(model, model)
-    return load
+    return loader
 
 
 def released(directory: str) -> Callable[[], Loaded]:
     """A committed tiny checkpoint in a released family's own format, loaded offline."""
-    def load() -> Loaded:
+    def loader() -> Loaded:
         source = Pretrained.load(FIXTURES / directory, dtype="float32", attention_impl="reference")
         return Loaded(source, source.model, source.variables, source.text_processor)
-    return load
+    return loader
 
 
-def adapted(load: Callable[[], Loaded], *modules: str) -> Callable[[], Loaded]:
-    """`load`'s model under a rank-2 LoRA on `modules`, its base frozen."""
+def adapted(loader: Callable[[], Loaded], *modules: str) -> Callable[[], Loaded]:
+    """`loader`'s model under a rank-2 LoRA on `modules`, its base frozen."""
     def adapt() -> Loaded:
-        held = load()
+        held = loader()
         variables = held.variables or held.model.init(jax.random.key(0), jnp.zeros((1, SEQ), jnp.int32))
         adapter = LoRA(rank=2, modules=modules).apply(held.model, variables, key=1)
         return Loaded(adapter, adapter.model, adapter.variables)
@@ -226,10 +226,10 @@ def adapted(load: Callable[[], Loaded], *modules: str) -> Callable[[], Loaded]:
 
 
 def user(module, **fields) -> Callable[[], Loaded]:
-    def load() -> Loaded:
+    def loader() -> Loaded:
         model = module(**fields)
         return Loaded(model, model)
-    return load
+    return loader
 
 
 def torch_fallback() -> Loaded:
@@ -655,7 +655,7 @@ def decision(family: Family, directory: Path) -> None:
     layout = (StateFirstLayout if CAUSAL in family.facts else MarkerLayout)(
         max_len=48, head_max_len=32, option_tokens=4)
     objective = DecisionObjective(held.given, tokenizer=tokenizer, specials=specials, layout=layout)
-    data = load(Decisions(source=EXAMPLES, validation=EXAMPLES), batch=ROWS, read="memory",
+    data = loader(Decisions(source=EXAMPLES, validation=EXAMPLES), batch=ROWS, read="memory",
         objective=objective.data())
     batch = next(iter(data.train(DataPartition())))
     trained = assert_trains(objective, batch, directory, data=data)

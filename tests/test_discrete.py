@@ -10,7 +10,7 @@ import optax
 import pytest
 from flax import linen as nn
 
-from dew.data import Loader
+from dew.data.dataset import Loader
 from dew.diffusion import EpsilonPredictionTransform, Process
 from dew.diffusion.discrete import MDLM, DiscreteProcess, LogLinear, Unmask
 from dew.diffusion.schedules import CosineNoiseScheduler

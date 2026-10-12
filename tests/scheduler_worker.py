@@ -39,7 +39,7 @@ def main() -> None:
     import optax
     from jax.experimental import multihost_utils
 
-    from dew.data import DataPartition, Loader
+    from dew.data.dataset import DataPartition, Loader
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.objectives.rl import GRPOObjective
     from dew.objectives.rl.scheduler import RolloutScheduler

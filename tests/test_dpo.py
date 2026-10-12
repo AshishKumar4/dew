@@ -6,7 +6,7 @@ must match TRL 1.12's DPO path with the defaults (`sigmoid` loss,
 tools/parity_dpo.py writes by running TRL's own `DPOTrainer._compute_loss`
 on fixed logits. `DPOObjective` composes that term with the
 chunked head's per-token log-probabilities, reading the reference from the
-frozen `step.ema`, and `Preferences` stacks the batches it trains on.
+frozen `step.ema`, and `PreferenceData` stacks the batches it trains on.
 """
 
 import json
@@ -19,10 +19,11 @@ import pytest
 from reference_error import assert_as_exact_as_the_reference
 from rl_support import TinyHead
 
-from dew.data import DataPartition, Loading, Preferences
+from dew.config.data import PreferenceData, loader
+from dew.data import Loading
 from dew.data.compile import iterate
+from dew.data.dataset import DataPartition
 from dew.data.preferences import IDS_KEY, MASK_KEY
-from dew.data.recipes import load
 from dew.objectives.base import Step
 from dew.objectives.rl import DPOObjective
 from dew.rl import preference_logsigmoid_terms
@@ -229,7 +230,7 @@ def records(*rows):
 
 
 def preference_rows(rows, pad_id, width):
-    recipe = Preferences(source=tuple(json.loads(row) for row in rows), seq_len=width, pad_id=pad_id)
+    recipe = PreferenceData(source=tuple(json.loads(row) for row in rows), seq_len=width, pad_id=pad_id)
     pipeline, _, _ = recipe.pipelines()
     return list(iterate(pipeline, read="memory", loading=Loading(workers=0)))
 
@@ -275,7 +276,7 @@ def test_an_incomplete_row_is_refused():
     with pytest.raises(ValueError, match="record of named fields"):
         preference_rows(records([1, 2]), 0, 4)[0]
     with pytest.raises(ValueError, match=r"accepted|pairs|empty"):
-        load(Preferences(source=(), seq_len=4), batch=1, read="memory", loading=Loading(workers=0))
+        loader(PreferenceData(source=(), seq_len=4), batch=1, read="memory", loading=Loading(workers=0))
 
 
 def test_parquet_pairs_batch_in_pairs(tmp_path):
@@ -288,7 +289,7 @@ def test_parquet_pairs_batch_in_pairs(tmp_path):
         "chosen_mask": [[0, 0, 1, 1]], "rejected_mask": [[0, 0, 1]],
     }), path)
 
-    data = load(Preferences(source=str(path), seq_len=4), batch=1, read="memory",
+    data = loader(PreferenceData(source=str(path), seq_len=4), batch=1, read="memory",
         loading=Loading(workers=0), validation_records=4 * (1))
 
     assert data.records == 1
@@ -305,7 +306,7 @@ def test_varied_rows_pad_to_one_window():
     rows = records(
         {"chosen": [1, 2, 3, 4], "rejected": [5]},
         {"chosen": [6], "rejected": [7, 8]})
-    data = load(Preferences(source=tuple(json.loads(row) for row in rows), seq_len=4), batch=2,
+    data = loader(PreferenceData(source=tuple(json.loads(row) for row in rows), seq_len=4), batch=2,
         read="memory", loading=Loading(workers=0), validation_records=4 * (2))
 
     batch = next(data.train(DataPartition()))
@@ -332,9 +333,9 @@ def test_parquet_without_sides_is_refused(tmp_path):
     path = tmp_path / "nopairs.parquet"
     pq.write_table(pa.table({"chosen": [[1]]}), path)
     with pytest.raises(ValueError, match="both chosen and rejected"):
-        load(Preferences(source=str(path)), batch=1, read="memory", validation_records=4 * (1))
+        loader(PreferenceData(source=str(path)), batch=1, read="memory", validation_records=4 * (1))
 
 
 def test_unknown_recipe_fields_are_refused_before_reading_pairs():
     with pytest.raises(ValueError, match="unknown fields"):
-        load("preferences", source=(PAIR,), batch=2, read="memory", records=(PAIR,))
+        loader("preferences", source=(PAIR,), batch=2, read="memory", records=(PAIR,))

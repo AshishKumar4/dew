@@ -16,8 +16,19 @@ import pyarrow.parquet as pq
 import pytest
 from array_record.python.array_record_module import ArrayRecordWriter
 
+from dew.config.data import (
+    Augment,
+    ChatData,
+    HoldOut,
+    ImageData,
+    PreferenceData,
+    PromptData,
+    RecordsData,
+    TextData,
+    VideoData,
+    loader,
+)
 from dew.data.dataset import DataPartition, DataPhase, Loading
-from dew.data.recipes import Augment, Chat, HoldOut, Images, Preferences, Prompts, Records, Text, Video, load
 from dew.data.sources.codec import pack_dict_of_byte_arrays
 from dew.data.sources.files import Files
 from dew.data.sources.tfds import TFDS
@@ -120,25 +131,27 @@ def recipes(tmp_path_factory):
                 for index in range(40)]
     augment = Augment(backend="host", jitter=True)
     return {
-        "text_windows": (Text(tokens, seq_len=16), {"validation_records": 16}),
-        "text_packed": (Text(tokens, seq_len=16, pack="first-fit"), {"validation_records": 16}),
-        "text_phases": (Text(phases=(DataPhase(tokens, 3), DataPhase(other)), seq_len=16),
+        "text_windows": (TextData(tokens, seq_len=16), {"validation_records": 16}),
+        "text_packed": (TextData(tokens, seq_len=16, pack="first-fit"), {"validation_records": 16}),
+        "text_phases": (TextData(phases=(DataPhase(tokens, 3), DataPhase(other)), seq_len=16),
                         {"validation_records": 16}),
-        "chat": (Chat(conversations, "tests/fixtures/tokenizers/tiny-chat", seq_len=64, long="chunk",
+        "chat": (ChatData(conversations, "tests/fixtures/tokenizers/tiny-chat", seq_len=64, long="chunk",
                        validation=conversations), {"validation_records": 16}),
-        "prompts": (Prompts(prompts, "byte", max_prompt_len=16, long="truncate"), {}),
-        "preferences": (Preferences(pairs, seq_len=16), {}),
-        "images_memory": (Images(pixels, image_size=16, augment=augment, validation=HoldOut(records=16)), {}),
-        "images_arrayrecord": (Images(Files(image_root, format="array_record"), image_size=16,
+        "prompts": (PromptData(prompts, "byte", max_prompt_len=16, long="truncate"), {}),
+        "preferences": (PreferenceData(pairs, seq_len=16), {}),
+        "images_memory": (ImageData(pixels, image_size=16, augment=augment, validation=HoldOut(records=16)),
+                          {}),
+        "images_arrayrecord": (ImageData(Files(image_root, format="array_record"), image_size=16,
                                       augment=augment, validation=HoldOut(records=16)), {}),
-        "images_hf": (Images(Files(image_file), image_size=16, augment=augment,
+        "images_hf": (ImageData(Files(image_file), image_size=16, augment=augment,
                               validation=HoldOut(records=16)), {}),
-        "images_tfds": (Images(TFDS("dew_images", split="all", path="tests/fixtures/tfds/dew_images/1.0.0"),
+        "images_tfds": (ImageData(TFDS("dew_images", split="all",
+                                       path="tests/fixtures/tfds/dew_images/1.0.0"),
                                 image_size=8, augment=augment, caption_templates=("a photo of a {}",),
                                 validation=HoldOut(records=4)), {}),
-        "hub_records": (Records(Files(str(table))), {}),
-        "tfds_records": (Records(TFDS("dew_images", path="tests/fixtures/tfds/dew_images/1.0.0")), {}),
-        "videos_local": (Video(clips, frames=4, frame_size=16, audio_padding=1, audio_model=audio,
+        "hub_records": (RecordsData(Files(str(table))), {}),
+        "tfds_records": (RecordsData(TFDS("dew_images", path="tests/fixtures/tfds/dew_images/1.0.0")), {}),
+        "videos_local": (VideoData(clips, frames=4, frame_size=16, audio_padding=1, audio_model=audio,
                                 caption="clip", validation=HoldOut(records=4)), {}),
         "decision_table": (Decisions(examples, validation=examples[:5]), {"objective": objective.data()}),
         "decision_mix": (Decisions({"a": examples, "b": examples[:8]}, weights={"a": 3, "b": 1},
@@ -153,7 +166,7 @@ def test_loader_batches_positions_and_rng_match_the_frozen_reference(recipes, na
     with gzip.open(GOLD, "rt") as source:
         expected = json.load(source)["cases"][name][f"workers={workers},shares={shares}"]
     recipe, fields = recipes[name]
-    loaded = load(recipe, batch=4, read="memory", seed=7,
+    loaded = loader(recipe, batch=4, read="memory", seed=7,
                   loading=Loading(workers=workers, threads=1, read_buffer=4, worker_buffer=1), **fields)
     assert loaded.records == expected["records"]
     assert loaded.held_out == expected["held_out"]

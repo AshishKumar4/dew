@@ -12,8 +12,10 @@ import pytest
 from diffusion_stubs import RES, STUB_TEXT
 
 from dew.config import RunConfig, ScheduleSpec
-from dew.data import Augment, Files, HoldOut, Images, Loader, Loading, Text, export
-from dew.data.dataset import record_argument
+from dew.config.data import Augment, HoldOut, ImageData, TextData
+from dew.data import Files, Loading
+from dew.data.dataset import Loader, record_argument
+from dew.data.sinks import export
 from dew.diffusion.presets import Flow
 from dew.objectives.diffusion import DiffusionRunConfig
 from dew.objectives.jepa import JepaRunConfig
@@ -56,9 +58,9 @@ def test_the_default_dataset_takes_flags_without_naming_its_subcommand():
 def test_another_dataset_is_its_subcommand():
     config = parse(LMRunConfig, ["data:text", "--data.source", "d", "--data.pack", "first-fit",
                                  "--data.seq-len", "64", "--data.packing-bins", "2"])
-    assert config.data == Text(source="d", seq_len=64, packing_bins=2, pack="first-fit")
-    with pytest.raises(ValueError, match="trains on a Text recipe"):
-        LMRunConfig(data=Images(source="tfds://oxford_flowers102")).prepare()
+    assert config.data == TextData(source="d", seq_len=64, packing_bins=2, pack="first-fit")
+    with pytest.raises(ValueError, match="trains on a TextData recipe"):
+        LMRunConfig(data=ImageData(source="tfds://oxford_flowers102")).prepare()
 
 
 def test_a_spec_field_the_dataset_lacks_is_a_command_line_error():
@@ -84,7 +86,7 @@ def test_a_run_config_round_trips_through_its_json_record(name):
 def test_a_run_over_url_datasets_round_trips_through_its_json_record():
     """A diffusion run may train on any hub table of urls; its record has to
     name the sources, so the run and its solvers rebuild from run.json."""
-    config = DiffusionRunConfig(data=Images(source=Files("hf://datasets/user/images/train.parquet",
+    config = DiffusionRunConfig(data=ImageData(source=Files("hf://datasets/user/images/train.parquet",
         format="parquet"), image_size=64))
 
     record = json.loads(json.dumps(config.to_dict()))
@@ -161,7 +163,7 @@ def test_the_diffusion_entrypoint_runs_without_a_tracker_and_saves_its_run_spec(
     # A validation pass needs a consumer; psnr scores samples against the
     # batch and downloads nothing, unlike the default clip metric.
     config = dataclasses.replace(config, val_metrics=("psnr",), loading=Loading(workers=0),
-                                 data=Images(source=str(inputs), validation=HoldOut(records=batch),
+                                 data=ImageData(source=str(inputs), validation=HoldOut(records=batch),
                                              image_size=RES, augment=None))
 
     state = config.run()
@@ -240,7 +242,7 @@ def test_the_jepa_entrypoint_runs_without_a_tracker_and_saves_its_run_spec(tmp_p
     )
 
     config = dataclasses.replace(config, loading=Loading(workers=0),
-                                 data=Images(source=str(inputs), image_size=size, augment=None))
+                                 data=ImageData(source=str(inputs), image_size=size, augment=None))
 
     state = config.run()
 

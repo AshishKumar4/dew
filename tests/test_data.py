@@ -23,25 +23,20 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from dew.data import (
+from dew.config.data import HoldOut, ImageData, RecordsData, RunData, TextData, VideoData, loader
+from dew.data import Loading, Memory, images
+from dew.data.compile import compile, validation
+from dew.data.dataset import (
     Checkpointable,
     DataPartition,
-    HoldOut,
-    Images,
-    Loading,
-    Memory,
-    Pipeline,
-    Recipe,
-    Records,
-    Text,
-    Video,
-    compile,
-    images,
-    load,
+    Forwarding,
+    GlobalStream,
+    RecordsData as IndexedRows,
+    SourceSlice,
+    describe,
 )
-from dew.data.compile import validation
-from dew.data.dataset import Forwarding, GlobalStream, Records as IndexedRows, SourceSlice, describe
 from dew.data.image_codec import decode_image
+from dew.data.pipeline import Pipeline
 from dew.data.plan import Manifest, Plan
 from dew.data.sinks import export
 from dew.data.sources import Torch, av_utils, source as stored_source
@@ -73,7 +68,7 @@ def test_an_unknown_recipe_field_is_refused_before_opening_data():
 
 def test_a_recipe_and_an_explicit_pipeline_read_the_same_records():
     rows = [{"index": np.int32(index)} for index in range(16)]
-    recipe = load(Records(source=rows), batch=4, seed=9, read="memory", **WORKERS)
+    recipe = loader(RecordsData(source=rows), batch=4, seed=9, read="memory", **WORKERS)
     direct = compile(Pipeline(Memory(rows)).shuffle(9).repeat().batch(4), seed=9, read="memory", **WORKERS)
     left, right = recipe.train(DataPartition()), direct.train(DataPartition())
     try:
@@ -88,9 +83,9 @@ def test_a_run_config_stores_a_recipe_and_its_loading_options(tmp_path):
 
     (tmp_path / "train.bin").write_bytes(np.arange(64, dtype=np.uint16).tobytes())
     (tmp_path / "val.bin").write_bytes(np.arange(64, dtype=np.uint16).tobytes())
-    config = RunConfig(data=Text(source=str(tmp_path), seq_len=8), loading=Loading(workers=0))
-    spec: Recipe = config.data
-    data = load(spec, batch=2, read="memory", loading=config.loading)
+    config = RunConfig(data=TextData(source=str(tmp_path), seq_len=8), loading=Loading(workers=0))
+    spec: RunData = config.data
+    data = loader(spec, batch=2, read="memory", loading=config.loading)
     assert data.batch == 2
     stream = data.train(DataPartition())
     try:
@@ -114,7 +109,7 @@ class _Indexed:
 
 @dataclasses.dataclass(frozen=True)
 class Indexed:
-    """Records that carry their own index, untouched, so a test can read
+    """RecordsData that carry their own index, untouched, so a test can read
     which records a batch holds. The plumbing is the one every spec uses."""
 
     length: int = 32
@@ -151,13 +146,14 @@ def _bounded(iterator, limit):
 
 
 def test_a_dataset_without_a_held_out_split_has_no_validation_pass():
-    data = load(Indexed(batch=8), batch=8, read="indexed", seed=0, loading=Loading(workers=0))
+    data = loader(Indexed(batch=8), batch=8, read="indexed", seed=0, loading=Loading(workers=0))
     assert data.records == 32 and data.batch == 8 and data.steps_per_epoch == 4
     assert data.val is None
 
 
 def test_the_validation_split_is_ordered_and_disjoint_from_train():
-    data = load(Indexed(val_batches=1, batch=8), batch=8, read="indexed", seed=0, loading=Loading(workers=0))
+    data = loader(Indexed(val_batches=1, batch=8), batch=8, read="indexed", seed=0,
+                  loading=Loading(workers=0))
 
     assert data.records == 24  # the held-out records leave the train stream
     assert data.steps_per_epoch == 3
@@ -182,7 +178,7 @@ def test_a_validation_pass_reads_every_held_out_record_once(workers):
     and the unbounded num_epochs a run leaves at None let it read that slice
     again to do so.
     """
-    data = load(Indexed(val_batches=3, loading=Loading(workers=workers), batch=8), batch=8,
+    data = loader(Indexed(val_batches=3, loading=Loading(workers=workers), batch=8), batch=8,
         read="indexed", seed=0, loading=Loading(workers=workers))
 
     batches, ended = _bounded(data.val(DataPartition()), 12)
@@ -196,9 +192,9 @@ def test_a_validation_pass_reads_every_held_out_record_once(workers):
 def test_a_validation_split_cannot_swallow_every_record():
     """One record and a held-out one would leave nothing to train on."""
     with pytest.raises(ValueError, match="has no accepted rows"):
-        load(Indexed(val_batches=4, batch=8), batch=8, read="indexed", seed=0, loading=Loading(workers=0))
+        loader(Indexed(val_batches=4, batch=8), batch=8, read="indexed", seed=0, loading=Loading(workers=0))
     with pytest.raises(ValueError, match="has no accepted rows"):
-        load(Indexed(length=1, val_batches=1, batch=1), batch=1, read="indexed", seed=0,
+        loader(Indexed(length=1, val_batches=1, batch=1), batch=1, read="indexed", seed=0,
             loading=Loading(workers=0))
 
 
@@ -218,7 +214,7 @@ def test_a_named_validation_split_is_its_own_records_and_costs_training_none():
     spec = Augmenting(length=16, splits={"test": 8}, image_size=8, augment=None,
                       val_split="test", val_batches=1, **WORKERS)
 
-    data = load(dataclasses.replace(spec, batch=4), batch=4, read="indexed", seed=spec.seed,
+    data = loader(dataclasses.replace(spec, batch=4), batch=4, read="indexed", seed=spec.seed,
         loading=spec.loading, host=(EncodeCaptions(keep_captions),))
 
     assert data.records == 16, "a named split holds nothing out of training"
@@ -236,9 +232,9 @@ def test_val_batches_bounds_a_named_split_and_none_scores_all_of_it():
     fields = dict(length=16, splits={"test": 8}, image_size=8, augment=None,
                   val_split="test", **WORKERS)
 
-    bounded_pass = load(Augmenting(val_batches=1, **fields, batch=4), batch=4, read="indexed", seed=0,
+    bounded_pass = loader(Augmenting(val_batches=1, **fields, batch=4), batch=4, read="indexed", seed=0,
         **WORKERS)
-    whole_pass = load(Augmenting(val_batches=None, **fields, batch=4), batch=4, read="indexed", seed=0,
+    whole_pass = loader(Augmenting(val_batches=None, **fields, batch=4), batch=4, read="indexed", seed=0,
         **WORKERS)
 
     assert bounded_pass.val is not None and whole_pass.val is not None
@@ -252,7 +248,7 @@ def test_without_a_named_split_the_head_hold_out_is_unchanged():
     spec = Augmenting(length=16, image_size=8, augment=None, val_batches=1,
                       **WORKERS)
 
-    data = load(dataclasses.replace(spec, batch=4), batch=4, read="indexed", seed=spec.seed,
+    data = loader(dataclasses.replace(spec, batch=4), batch=4, read="indexed", seed=spec.seed,
         loading=spec.loading, host=(EncodeCaptions(keep_captions),))
 
     assert data.records == 12 and data.steps_per_epoch == 3
@@ -269,12 +265,12 @@ def test_a_dataset_of_one_pile_refuses_a_split_it_cannot_name(tmp_path):
     rows = [{"image": images.resize_image(_Images(8)[index]["image"], 8), "label": index,
              "caption": f"record {index}"} for index in range(8)]
     export(rows, str(tmp_path), format="array_record")
-    from dew.data import Split
+    from dew.config.data import Split
 
-    spec = Images(source=str(tmp_path), image_size=8, augment=None, validation=HoldOut(records=2))
-    assert load(spec, batch=2, read="memory", **WORKERS).records == 6
+    spec = ImageData(source=str(tmp_path), image_size=8, augment=None, validation=HoldOut(records=2))
+    assert loader(spec, batch=2, read="memory", **WORKERS).records == 6
     with pytest.raises(ValueError, match="split"):
-        load(dataclasses.replace(spec, validation=Split("test")), batch=2, read="memory", **WORKERS)
+        loader(dataclasses.replace(spec, validation=Split("test")), batch=2, read="memory", **WORKERS)
 
 
 class _Endless:
@@ -297,16 +293,16 @@ class Unsized:
         source = _Endless()
         rows = [{"image": source[index]["image"], "label": source[index]["index"]}
                 for index in range(self.count)]
-        return Images(source=rows, image_size=self.image_size, augment=None).pipelines()
+        return ImageData(source=rows, image_size=self.image_size, augment=None).pipelines()
 
 
 def test_a_source_without_a_length_needs_an_explicit_count():
     """The factory guessed a million records for such a source, so the
     sampler drew indices past the data and the run reported the guess."""
     with pytest.raises(ValueError, match="count="):
-        load(Unsized(**WORKERS, batch=8), batch=8, read="indexed", seed=0, **WORKERS)
+        loader(Unsized(**WORKERS, batch=8), batch=8, read="indexed", seed=0, **WORKERS)
 
-    data = load(Unsized(count=16, val_batches=None, image_size=4, **WORKERS, batch=8), batch=8,
+    data = loader(Unsized(count=16, val_batches=None, image_size=4, **WORKERS, batch=8), batch=8,
         read="indexed", seed=0, **WORKERS)
     assert data.records == 16
     assert sorted(int(i) for batch in itertools.islice(data.train(DataPartition()), 2)
@@ -317,11 +313,12 @@ def test_a_count_past_the_end_of_the_source_is_refused(tmp_path):
     """A count above the source became the sampler's record count, and the
     first index past the end raised inside a worker."""
     with pytest.raises(ValueError, match="count 33 is more than the 32 records"):
-        load(Augmenting(length=32, count=33, **WORKERS, batch=8), batch=8, read="indexed", seed=0, **WORKERS)
+        loader(Augmenting(length=32, count=33, **WORKERS, batch=8), batch=8, read="indexed", seed=0,
+               **WORKERS)
 
 
 def test_a_count_uses_the_head_of_the_source():
-    data = load(Indexed(count=16, batch=8), batch=8, read="indexed", seed=0, loading=Loading(workers=0))
+    data = loader(Indexed(count=16, batch=8), batch=8, read="indexed", seed=0, loading=Loading(workers=0))
     assert data.records == 16
     assert sorted(i for batch in _indices(data.train(DataPartition()), 2) for i in batch) == list(range(16))
 
@@ -329,7 +326,8 @@ def test_a_count_uses_the_head_of_the_source():
 def test_the_training_stream_repeats_instead_of_ending():
     """The trainer keeps asking for batches long after one pass over the
     records, and the next pass is the same records in another order."""
-    data = load(Indexed(val_batches=2, batch=8), batch=8, read="indexed", seed=0, loading=Loading(workers=0))
+    data = loader(Indexed(val_batches=2, batch=8), batch=8, read="indexed", seed=0,
+                  loading=Loading(workers=0))
 
     epoch = data.steps_per_epoch  # the sixteen training records, in two batches
     batches, ended = _bounded(data.train(DataPartition()), 3 * epoch)
@@ -342,14 +340,14 @@ def test_the_training_stream_repeats_instead_of_ending():
 
 
 def test_a_dataset_of_one_record_yields_batches_of_it():
-    data = load(Indexed(length=1, batch=1), batch=1, read="indexed", seed=0, loading=Loading(workers=0))
+    data = loader(Indexed(length=1, batch=1), batch=1, read="indexed", seed=0, loading=Loading(workers=0))
     assert _indices(data.train(DataPartition()), 2) == [[0], [0]]
 
 
 def test_the_training_iterator_carries_its_position():
     """A checkpoint records the iterator's state and a restored run resumes
     on the batch after it."""
-    data = load(Indexed(batch=8), batch=8, read="indexed", seed=0, loading=Loading(workers=0))
+    data = loader(Indexed(batch=8), batch=8, read="indexed", seed=0, loading=Loading(workers=0))
     first = data.train(DataPartition())
     # The trainer reads the protocol statically, and a caption stage that only
     # forwarded get_state through __getattr__ failed it while hasattr passed.
@@ -465,7 +463,7 @@ def test_a_global_batch_that_does_not_split_into_the_shares_is_refused():
         with pytest.raises(ValueError, match=rf"batch {batch} does not split into 8 equal shares"):
             DataPartition(0, 8).rows(batch)
         with pytest.raises(ValueError, match="8 equal shares"):
-            load(dataclasses.replace(data, batch=batch), batch=batch, read="indexed", seed=data.seed,
+            loader(dataclasses.replace(data, batch=batch), batch=batch, read="indexed", seed=data.seed,
                 loading=data.loading).train(DataPartition(3, 8))
     assert DataPartition(0, 8).rows(64) == 8
 
@@ -473,7 +471,8 @@ def test_a_global_batch_that_does_not_split_into_the_shares_is_refused():
 def test_each_share_reads_its_own_slice_of_the_validation_split():
     """Share p of n validates records p, p + n, ... of the split, in whole
     batches of the share's size."""
-    data = load(Indexed(val_batches=2, batch=8), batch=8, read="indexed", seed=0, loading=Loading(workers=0))
+    data = loader(Indexed(val_batches=2, batch=8), batch=8, read="indexed", seed=0,
+                  loading=Loading(workers=0))
 
     assert _indices(data.val(DataPartition(1, 2)), 3) == [[1, 3, 5, 7], [9, 11, 13, 15]]
 
@@ -482,7 +481,7 @@ def test_the_readers_of_one_share_read_the_same_records():
     """Processes a sequence or a pipeline spans between them hold the same
     rows, so they read one share, and read it alike: that is what makes
     their copies of the batch agree."""
-    data = load(Indexed(length=32, batch=8), batch=8, read="indexed", seed=0, loading=Loading(workers=0))
+    data = loader(Indexed(length=32, batch=8), batch=8, read="indexed", seed=0, loading=Loading(workers=0))
     first = data.train(DataPartition(1, 2, readers=2))
     second = data.train(DataPartition(1, 2, readers=2))
 
@@ -502,7 +501,7 @@ def _steps(processes, count, *, position=None, length=32, seed=0, batch=8):
     """
     read, saved = [], []
     for index in range(processes):
-        stream = load(Indexed(length=length, seed=seed, batch=batch), batch=batch, read="indexed",
+        stream = loader(Indexed(length=length, seed=seed, batch=batch), batch=batch, read="indexed",
             seed=seed, loading=Loading(workers=0)).train
         iterator = stream(DataPartition(index, processes))
         if position is not None:
@@ -559,7 +558,7 @@ def test_a_position_over_another_order_is_refused():
     _, saved = _steps(2, 3)
 
     for other in ({"length": 64}, {"seed": 1}):
-        stream = load(Indexed(**other, batch=8), batch=8, read="indexed", seed=other.get("seed", 0),
+        stream = loader(Indexed(**other, batch=8), batch=8, read="indexed", seed=other.get("seed", 0),
                       loading=Loading(workers=0)).train(DataPartition())
         with pytest.raises(ValueError, match="saved data plan order changed"):
             stream.set_state(saved[0])
@@ -570,7 +569,7 @@ def test_a_shard_offset_cannot_resume_a_global_stream():
     """A stream whose windows come out of one shard reports where that shard
     stopped. Handing such a position to a stream that reads its records
     globally would resume it somewhere else, so it is refused by name."""
-    stream = load(Indexed(batch=8), batch=8, read="indexed", seed=0,
+    stream = loader(Indexed(batch=8), batch=8, read="indexed", seed=0,
         loading=Loading(workers=0)).train(DataPartition())
 
     with pytest.raises(ValueError, match="one process's own offset into its shard"):
@@ -584,8 +583,8 @@ def test_a_held_out_slice_keeps_the_identity_of_the_corpus_it_cuts():
     rows = [{"index": np.int32(index)} for index in range(16)]
 
     def stream(name):
-        recipe = Records(source=Memory(rows, identity=name), validation=HoldOut(records=4))
-        return load(recipe, batch=4, read="indexed", loading=Loading(threads=1, read_buffer=1)).train(
+        recipe = RecordsData(source=Memory(rows, identity=name), validation=HoldOut(records=4))
+        return loader(recipe, batch=4, read="indexed", loading=Loading(threads=1, read_buffer=1)).train(
             DataPartition())
 
     saved = stream("flowers")
@@ -604,12 +603,12 @@ def test_a_held_out_slice_keeps_the_identity_of_the_corpus_it_cuts():
 def test_records_listed_in_memory_are_described_by_their_count_not_their_contents():
     """A list has a repr, and it is every record: a saved position held it all."""
     rows = [{"x": np.full(64, index, np.float32)} for index in range(512)]
-    stream = load(Records(source=rows), batch=8, read="memory").train(DataPartition())
+    stream = loader(RecordsData(source=rows), batch=8, read="memory").train(DataPartition())
     next(stream)
 
     saved = stream.get_state()
     assert len(saved) < 4096
-    larger = load(Records(source=rows * 4), batch=8, read="memory", loading=Loading(workers=0)).train(
+    larger = loader(RecordsData(source=rows * 4), batch=8, read="memory", loading=Loading(workers=0)).train(
         DataPartition())
     try:
         next(larger)
@@ -667,7 +666,7 @@ def test_clip_start_falls_back_to_the_only_valid_offset():
 
 
 # ---------------------------------------------------------------------------------
-# Video datasets
+# VideoData datasets
 # ---------------------------------------------------------------------------------
 
 def _voxceleb_tree(root, split="train", identities=("id00012", "id00015")):
@@ -712,7 +711,7 @@ def test_video_records_flow_through_the_audio_video_transform(tmp_path, monkeypa
     from transformers import AutoFeatureExtractor, Wav2Vec2FeatureExtractor
 
     _voxceleb_tree(tmp_path)
-    spec = Video(source=str(tmp_path), caption="a video of a speaker", frame_size=32, frames=4,
+    spec = VideoData(source=str(tmp_path), caption="a video of a speaker", frame_size=32, frames=4,
         audio_padding=1)
     frame_samples = 640
     seen = {}
@@ -756,7 +755,7 @@ def test_a_clip_is_decoded_at_the_rate_its_audio_model_reads(tmp_path, monkeypat
     from transformers import AutoFeatureExtractor, Wav2Vec2FeatureExtractor
 
     _voxceleb_tree(tmp_path)
-    spec = Video(source=str(tmp_path), frame_size=32, frames=4, audio_padding=1)
+    spec = VideoData(source=str(tmp_path), frame_size=32, frames=4, audio_padding=1)
 
     def fake_read_av_random_clip(video_path, *, num_frames, audio_padding, seed, sample_rate=16000,
                                  fps=25.0):
@@ -813,7 +812,7 @@ class Augmenting:
     loading: Loading = dataclasses.field(default_factory=lambda: Loading(workers=0))
     batch: int = 4
     splits: dict[str, int] = dataclasses.field(default_factory=dict)
-    """Records each named split holds, for a spec that has more than one."""
+    """RecordsData each named split holds, for a spec that has more than one."""
 
     def source(self, split=None):
         return _Images(self.length if split is None else self.splits[split],
@@ -886,7 +885,7 @@ def _rows(batch):
 
 def _augmented(worker_count, length=16, batch=4, seed=3):
     """{record index: (pixels, caption)} for one epoch at this worker count."""
-    data = load(Augmenting(length=length, image_size=8, seed=seed, val_batches=None,
+    data = loader(Augmenting(length=length, image_size=8, seed=seed, val_batches=None,
                       loading=Loading(workers=worker_count, threads=1, read_buffer=1,
                                       worker_buffer=1), batch=batch), batch=batch, read="indexed",
                                           seed=seed, loading=Loading(workers=worker_count, threads=1,
@@ -915,7 +914,7 @@ def test_the_close_budget_is_the_sources_worker_count():
     """A grain pipeline joins its workers one by one, so the prefetch close
     waits what the stream's Loading says, through every wrapper over it."""
     loading = Loading(workers=8, threads=1, read_buffer=1)
-    stream = load(Augmenting(length=16, image_size=8, seed=3, val_batches=None,
+    stream = loader(Augmenting(length=16, image_size=8, seed=3, val_batches=None,
                         loading=loading, batch=4), batch=4, read="indexed", seed=3, loading=loading,
                             host=(EncodeCaptions(keep_captions),)).train(DataPartition())
     assert isinstance(stream, Forwarding)
@@ -968,7 +967,7 @@ def test_a_stream_whose_workers_are_slow_to_stop_closes_within_grains_bound(capl
 
     loading = Loading(workers=4, threads=1, read_buffer=1, worker_buffer=1)
     data = Lingering(length=64, image_size=8, seed=3, val_batches=None, loading=loading)
-    stream = load(dataclasses.replace(data, batch=4), batch=4, read="indexed", seed=data.seed,
+    stream = loader(dataclasses.replace(data, batch=4), batch=4, read="indexed", seed=data.seed,
         loading=data.loading).train(DataPartition())
     prefetch = DevicePrefetchIterator(stream, MeshSpec().build(jax.devices()[:1]))
     # grain interleaves its workers' batches in turn: one batch from each
@@ -1071,7 +1070,7 @@ def test_an_interrupted_epoch_resumes_on_exactly_the_records_it_had_not_seen(
     count.
     """
     def loader():
-        return load(Augmenting(image_size=8, seed=3, val_batches=2,
+        return loader(Augmenting(image_size=8, seed=3, val_batches=2,
                           loading=Loading(workers=worker_count, threads=1, read_buffer=1,
                                           worker_buffer=1), batch=4), batch=4, read="indexed", seed=3,
                                               loading=Loading(workers=worker_count, threads=1, read_buffer=1,
@@ -1098,7 +1097,7 @@ _DEFAULT_VALIDATED_PARTITION = DataPartition()
 
 def _validated(length, val_batches, batch, partition=_DEFAULT_VALIDATED_PARTITION, **read):
     """{record index: (pixels, caption)} for one share's validation pass."""
-    data = load(Augmenting(length=length, image_size=8, seed=3, val_batches=val_batches,
+    data = loader(Augmenting(length=length, image_size=8, seed=3, val_batches=val_batches,
                       loading=Loading(workers=0, worker_buffer=1, **read), batch=batch), batch=batch,
                           read="indexed", seed=3, loading=Loading(workers=0, worker_buffer=1, **read),
                               host=(EncodeCaptions(keep_captions),))
@@ -1150,7 +1149,7 @@ def test_a_prepared_set_is_the_deterministic_half_of_the_transform(tmp_path):
                       metadata={"image_size": 8})
     assert manifest["rows"] == 16 and manifest["metadata"]["image_size"] == 8
     assert len(manifest["files"]) == 2
-    data = load(Images(source=str(tmp_path), image_size=8, augment=None), batch=4, read="memory",
+    data = loader(ImageData(source=str(tmp_path), image_size=8, augment=None), batch=4, read="memory",
                 **WORKERS, host=(EncodeCaptions(keep_captions),))
     seen = {}
     stream = data.train(DataPartition())
@@ -1240,7 +1239,7 @@ def test_a_record_that_cannot_be_read_stops_the_stream(worker_count):
     """The source's own error has to reach the trainer. A pipeline that caught
     it would train on whatever it substituted, and a worker's exception is the
     easiest one to lose."""
-    data = load(Raising(length=8, bad=3, loading=Loading(workers=worker_count), batch=2), batch=2,
+    data = loader(Raising(length=8, bad=3, loading=Loading(workers=worker_count), batch=2), batch=2,
         read="indexed", seed=0, loading=Loading(workers=worker_count))
 
     delivered = []
@@ -1253,7 +1252,7 @@ def test_a_record_that_cannot_be_read_stops_the_stream(worker_count):
 
 
 def test_a_source_that_fails_on_every_record_raises_instead_of_an_empty_batch():
-    data = load(Raising(length=8, bad=None, batch=2), batch=2, read="indexed", seed=0,
+    data = loader(Raising(length=8, bad=None, batch=2), batch=2, read="indexed", seed=0,
         loading=Loading(workers=0))
 
     with pytest.raises(RuntimeError, match="is unreadable"):
@@ -1360,14 +1359,14 @@ def test_a_batch_carries_captions_and_each_encoder_tokenizes_them_its_own_way():
     from dew.inputs import CharTable, Condition, Field, InputSpec
 
     spec = Augmenting(length=8, image_size=8, val_batches=None, **WORKERS)
-    captions = next(load(dataclasses.replace(spec, batch=4), batch=4, read="indexed", seed=spec.seed,
+    captions = next(loader(dataclasses.replace(spec, batch=4), batch=4, read="indexed", seed=spec.seed,
         loading=spec.loading, host=(EncodeCaptions(keep_captions),)).train(DataPartition()))["caption"]
     assert captions.shape == (4,)
 
     def tokens(encoder):
         inputs = InputSpec(Field("image", (8, 8, 3)),
                            {"textcontext": Condition(encoder, field="text")})
-        batch = next(load(dataclasses.replace(spec, batch=4), batch=4, read="indexed", seed=spec.seed,
+        batch = next(loader(dataclasses.replace(spec, batch=4), batch=4, read="indexed", seed=spec.seed,
             loading=spec.loading, host=(EncodeCaptions(inputs.tokenize),)).train(DataPartition()))
         assert "caption" not in batch, "strings cannot ride a batch onto a device"
         return batch["text"]["input_ids"].shape
@@ -1386,7 +1385,7 @@ def test_a_run_with_no_condition_leaves_no_captions_in_the_batch():
     spec = Augmenting(length=8, image_size=8, val_batches=None, **WORKERS)
     inputs = InputSpec(Field("image", (8, 8, 3)))
 
-    batch = next(load(dataclasses.replace(spec, batch=4), batch=4, read="indexed", seed=spec.seed,
+    batch = next(loader(dataclasses.replace(spec, batch=4), batch=4, read="indexed", seed=spec.seed,
         loading=spec.loading, host=(EncodeCaptions(inputs.tokenize),)).train(DataPartition()))
 
     assert sorted(batch) == ["image", "label"]
@@ -1555,7 +1554,7 @@ def test_a_run_over_a_grain_dataset_trains_and_resumes_where_it_stopped(tmp_path
 
 
 # ---------------------------------------------------------------------------------
-# Records held in memory, and where a default run reads
+# RecordsData held in memory, and where a default run reads
 # ---------------------------------------------------------------------------------
 
 def _pid_of(index):
@@ -1585,7 +1584,7 @@ def _columns(length=12):
 
 
 def test_records_in_memory_are_reshuffled_every_epoch_and_each_read_once_per_epoch():
-    stream = load(Records(source=_columns()), batch=4, seed=3, read="memory").train(DataPartition())
+    stream = loader(RecordsData(source=_columns()), batch=4, seed=3, read="memory").train(DataPartition())
 
     epochs = [list(itertools.chain.from_iterable(_indices(stream, 3))) for _ in range(3)]
     for epoch in epochs:
@@ -1596,7 +1595,7 @@ def test_records_in_memory_are_reshuffled_every_epoch_and_each_read_once_per_epo
 
 def test_records_in_memory_follow_their_seed():
     def order(seed):
-        return _indices(load(Records(source=_columns()), batch=4, seed=seed,
+        return _indices(loader(RecordsData(source=_columns()), batch=4, seed=seed,
             read="memory").train(DataPartition()), 6)
 
     assert order(0) == order(0)
@@ -1611,9 +1610,9 @@ def test_columns_rows_and_a_torch_dataset_are_the_same_records():
     tensors = torch.utils.data.TensorDataset(torch.arange(12), torch.from_numpy(columns["x"]))
 
     first, *others = (next(data.train(DataPartition())) for data in (
-        load(Records(source=columns), batch=4, seed=0, read="memory"), load(Records(source=rows),
+        loader(RecordsData(source=columns), batch=4, seed=0, read="memory"), loader(RecordsData(source=rows),
             batch=4, seed=0, read="memory"),
-        load(Records(source=Torch(tensors, fields=("index", "x"))), batch=4, seed=0, read="memory",
+        loader(RecordsData(source=Torch(tensors, fields=("index", "x"))), batch=4, seed=0, read="memory",
             loading=Loading(workers=0))))
 
     assert first["x"].shape == (4, 2) and first["x"].dtype == np.float32
@@ -1637,26 +1636,26 @@ def test_a_torchvision_style_dataset_reads_its_tuples_as_named_fields():
         def __getitem__(self, index):
             return Image.fromarray(np.full((5, 5, 3), index, np.uint8)), index
 
-    batch = next(load(Records(source=Torch(Pictures(), fields=("image", "label")),
+    batch = next(loader(RecordsData(source=Torch(Pictures(), fields=("image", "label")),
         validation=Torch(Pictures(), fields=("image", "label"))), batch=4, read="memory",
             loading=Loading(workers=0)).val(DataPartition()))
 
     assert batch["image"].shape == (4, 5, 5, 3) and batch["image"].dtype == np.uint8
     np.testing.assert_array_equal(batch["image"][:, 0, 0, 0], batch["label"])
     with pytest.raises(TypeError, match="fields="):
-        load(Records(source=Torch(Pictures())), batch=4, read="memory", loading=Loading(workers=0))
+        loader(RecordsData(source=Torch(Pictures())), batch=4, read="memory", loading=Loading(workers=0))
     with pytest.raises(TypeError, match=r"loader\.dataset"):
-        load(Records(source=Torch(torch.utils.data.DataLoader(Pictures()))), batch=4, read="memory",
+        loader(RecordsData(source=Torch(torch.utils.data.DataLoader(Pictures()))), batch=4, read="memory",
             loading=Loading(workers=0))
 
 
 def test_columns_of_different_lengths_are_refused_by_name():
     with pytest.raises(ValueError, match=r"different row counts:.*'index': 4.*'x': 3"):
-        load(Records(source={"index": np.arange(4), "x": np.zeros((3, 2))}), batch=2, read="memory")
+        loader(RecordsData(source={"index": np.arange(4), "x": np.zeros((3, 2))}), batch=2, read="memory")
 
 
 def test_an_in_memory_stream_resumes_on_the_records_it_had_not_read():
-    data = load(Records(source=_columns()), batch=4, seed=0, read="memory")
+    data = loader(RecordsData(source=_columns()), batch=4, seed=0, read="memory")
     stream = data.train(DataPartition())
     _indices(stream, 2)
     state = stream.get_state()
@@ -1668,7 +1667,7 @@ def test_an_in_memory_stream_resumes_on_the_records_it_had_not_read():
 
 
 def test_process_shares_of_in_memory_records_split_every_global_batch():
-    data = load(Records(source=_columns()), batch=4, seed=0, read="memory")
+    data = loader(RecordsData(source=_columns()), batch=4, seed=0, read="memory")
     whole = _indices(data.train(DataPartition()), 3)
     halves = [_indices(data.train(DataPartition(index=index, count=2)), 3) for index in (0, 1)]
 
@@ -1679,7 +1678,7 @@ def test_process_shares_of_in_memory_records_split_every_global_batch():
 
 
 def test_held_out_records_are_one_ordered_pass():
-    data = load(Records(source=_columns(), validation=_columns(8)), batch=4, read="memory")
+    data = loader(RecordsData(source=_columns(), validation=_columns(8)), batch=4, read="memory")
 
     assert data.records == 12 and data.steps_per_epoch == 3
     assert data.val is not None
@@ -1688,7 +1687,7 @@ def test_held_out_records_are_one_ordered_pass():
 
 def test_held_out_records_too_few_for_one_batch_are_one_filled_batch():
     """Three records at a batch of four are one batch, its fourth row a repeat."""
-    batches = list(load(Records(source=_columns(), validation=_columns(3)), batch=4,
+    batches = list(loader(RecordsData(source=_columns(), validation=_columns(3)), batch=4,
         read="memory").val(DataPartition()))
 
     assert len(batches) == 1
@@ -1710,13 +1709,13 @@ def test_a_validation_split_needs_no_training_records():
 def test_records_whose_field_lengths_differ_are_refused_with_the_remedy():
     """Token ids of varying length are the usual cause, and grain's own
     message names the batch structure rather than what to change. Automatic
-    loading samples a batch to size its buffers, so the load refuses them;
+    loading samples a batch to size its buffers, so the loader refuses them;
     with loading set by hand, the first batch does."""
     rows = [{"text": np.arange(length, dtype=np.int32)} for length in (3, 5, 4, 6)]
     with pytest.raises(ValueError, match="cut or pad a variable-length field") as refused:
-        load(Records(source=rows), batch=2, read="memory")
+        loader(RecordsData(source=rows), batch=2, read="memory")
     assert "same structure" in str(refused.value.__cause__)
-    loaded = load(Records(source=rows), batch=2, read="memory", loading=Loading(workers=0))
+    loaded = loader(RecordsData(source=rows), batch=2, read="memory", loading=Loading(workers=0))
     stream = loaded.train(DataPartition())
     with pytest.raises(ValueError, match="cut or pad a variable-length field") as refused:
         next(stream)
@@ -1727,7 +1726,7 @@ def test_training_records_too_few_for_one_batch_are_refused():
     """An endless stream would fill a batch by repeating records inside it,
     and an epoch would be zero steps long."""
     with pytest.raises(ValueError, match="3 records, fewer than one batch of 4"):
-        load(Records(source=_columns(3)), batch=4, read="memory")
+        loader(RecordsData(source=_columns(3)), batch=4, read="memory")
 
 
 def test_a_run_over_records_in_memory_checkpoints_and_resumes_where_it_stopped(tmp_path):
@@ -1756,7 +1755,7 @@ def test_a_run_over_records_in_memory_checkpoints_and_resumes_where_it_stopped(t
             Regression(), optax.sgd(0.01), key=jax.random.key(0),
             layout=Layout(min_shard=1, tolerance=1.0),
             checkpoints=None if directory is None else Checkpoints(str(directory)))
-        return trainer.fit(load(Records(source=_columns(16)), batch=8, seed=0, read="memory"),
+        return trainer.fit(loader(RecordsData(source=_columns(16)), batch=8, seed=0, read="memory"),
                            steps=steps, log_every=1,
                            checkpoint_every=None if directory is None else 2)
 
@@ -1788,7 +1787,7 @@ def test_a_fit_over_a_dataset_that_held_validation_out_says_so_once(capsys):
 
     trainer = Trainer(Regression(), optax.sgd(0.01), key=jax.random.key(0),
                       layout=Layout(min_shard=1, tolerance=1.0))
-    data = load(Records(source=_columns(16)), batch=8, read="memory")
+    data = loader(RecordsData(source=_columns(16)), batch=8, read="memory")
 
     trainer.fit(dataclasses.replace(data, held_out=24), steps=2, log_every=1)
     noted = capsys.readouterr().out

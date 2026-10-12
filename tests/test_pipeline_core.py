@@ -17,7 +17,7 @@ from dew.data.cache import Cache
 from dew.data.compile import compile, iterate, publish
 from dew.data.dataset import DataPartition, Loading
 from dew.data.mixing import SearchBudget, TokenDeficit, token_weights
-from dew.data.pipeline import Artifact, Configured, Pipeline, Rejected
+from dew.data.pipeline import Artifact, Configured, Pipeline, Rejected, mix
 from dew.data.plan import Manifest, Plan, StepIdentity, fingerprint
 from dew.data.sources import Files, Memory
 from dew.objectives.base import VALID_ROWS
@@ -247,7 +247,7 @@ def test_an_exact_resume_refuses_a_step_that_makes_other_values():
     """Shift(1) and Shift(2) keep every row in its place, so the order and its
     derived facts agree; the step's identity is what says the rows differ."""
     def reader(by):
-        shifted = Pipeline(source(8)).map(Shift(by), rejects=False).shuffle(0).repeat().batch(2)
+        shifted = Pipeline(source(8)).map(Shift(by)).shuffle(0).repeat().batch(2)
         return compile(shifted, loading=READ).train(DataPartition())
 
     first = reader(1)
@@ -389,7 +389,7 @@ def test_a_lambda_step_needs_a_non_exact_resume_whether_or_not_memory_ran_it(rea
     configured step, the lambda is one of the steps the memory read already
     ran into the rows it holds, which the plan counts as it counts its own."""
     def compiled(resume):
-        lambdas = Pipeline(source(8)).map(lambda row: row, rejects=False)
+        lambdas = Pipeline(source(8)).map(lambda row: row)
         return compile(lambdas.map(Configured(Shifting(1), needs=())).batch(2),
                        read=read, loading=READ, resume=resume)
 
@@ -567,7 +567,7 @@ def test_map_with_index_reads_the_source_position_in_every_read(expansion):
 
 
 def test_map_with_index_is_refused_where_a_row_has_no_source_position():
-    mixed = Pipeline(source()).mix(Pipeline(source()), weights=(1, 1))
+    mixed = mix([Pipeline(source()), Pipeline(source())], weights=(1, 1))
     with pytest.raises(ValueError, match="map_with_index in mixture follows mix"):
         compile(mixed.map_with_index(Placed()).batch(4), loading=READ)
     windows = Pipeline(Memory([{"text": np.arange(9, dtype=np.int32)}])).windows(4)
@@ -718,7 +718,7 @@ def test_a_mixture_cut_per_share_reads_each_corpus_in_disjoint_shares():
     """A filter after a mixture cuts its order per share, and then every
     corpus it mixes is cut per share too: two shares never read one row."""
     other = Memory(tuple({"id": np.int32(100 + index)} for index in range(16)))
-    mixed = Pipeline(source(16)).mix(Pipeline(other), weights=(1, 1))
+    mixed = mix([Pipeline(source(16)), Pipeline(other)], weights=(1, 1))
     thirds = mixed.filter(lambda row: int(row["id"]) % 3 > 0, identity="thirds@1")
     data = compile(thirds.batch(2), loading=READ)
     shares = [data.train(DataPartition(index, 2)) for index in range(2)]
@@ -809,7 +809,6 @@ def test_a_resume_is_refused_where_the_same_token_split_keeps_other_documents(gr
         if grown == "by a step":
             pipeline = pipeline.map(
                 lambda row: {"text": np.resize(row["text"], first) if row["text"][0] == 0 else row["text"]},
-                rejects=False,
             )
         split = pipeline.token_split(0.25, held=False).batch(1)
         resume = "exact" if grown == "in the source" else "non-exact"
@@ -840,8 +839,8 @@ def test_a_token_split_on_a_mixture_within_a_mixture_records_its_spans():
                                                        dtype=np.int32)}
                                     for index, size in enumerate(sizes)]))
 
-        inner = corpus(0, (first, 4)).mix(corpus(100, (4, 4)), corpus(200, (4, 4)))
-        mixed = inner.token_split(0.25, held=False).mix(corpus(300, (4, 4)))
+        inner = mix([corpus(0, (first, 4)), corpus(100, (4, 4)), corpus(200, (4, 4))])
+        mixed = mix([inner.token_split(0.25, held=False), corpus(300, (4, 4))])
         return compile(mixed.batch(1), read="indexed", loading=READ).plan.derived["token_spans"]
 
     assert spans(4) != spans(8)
@@ -850,13 +849,14 @@ def test_a_token_split_on_a_mixture_within_a_mixture_records_its_spans():
 def test_a_recipe_reads_a_published_packing_before_its_default_order(tmp_path):
     """A typed recipe given a generation with a published packing plan reads
     that plan, and shuffles its windows, instead of packing again online."""
-    from dew.data import Text, load
+    from dew.config.data import TextData, loader
     from dew.data.steps.text import Chunks, Tokenize
 
     stored = Memory(tuple({"text": "x" * size} for size in (3, 7, 18, 2, 4, 12, 8, 1, 15, 6)))
     published = publish(Pipeline(stored).map(Tokenize()).flat_map(Chunks(9)).pack(9, bins=3),
                         Cache(str(tmp_path / "cache")), read="indexed", loading=READ)
-    data = load(Text(source=stored, seq_len=8, pack="first-fit", packing_bins=3), batch=2, cache=published,
+    data = loader(TextData(source=stored, seq_len=8, pack="first-fit", packing_bins=3), batch=2,
+                  cache=published,
                 read="indexed", loading=READ)
     assert data.plan is not None
     assert "packing" in data.plan.manifest.source["sources"][0]

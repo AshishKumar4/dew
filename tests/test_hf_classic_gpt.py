@@ -146,7 +146,7 @@ def test_exact_nanogpt_architecture_trains_through_dew(bias):
     import optax
 
     from dew import Trainer
-    from dew.data import Loader
+    from dew.data.dataset import Loader
     from dew.objectives.lm import LMObjective
 
     model = CausalTransformer(vocab_size=32, emb_features=16, num_layers=2, num_heads=2,

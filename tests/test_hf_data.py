@@ -9,7 +9,9 @@ import pyarrow.parquet as pq
 import pytest
 from PIL import Image
 
-from dew.data import Augment, DataPartition, Files, HoldOut, Images, Loading, load
+from dew.config.data import Augment, HoldOut, ImageData, loader
+from dew.data import Files, Loading
+from dew.data.dataset import DataPartition
 from dew.data.steps.image import EncodeCaptions
 from dew.objectives.base import VALID_ROWS
 
@@ -37,7 +39,7 @@ def image_table(path, count=16, *, struct=False):
 @pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
 def test_parquet_images_and_captions_reach_real_worker_batches(tmp_path, workers, read):
     source = image_table(tmp_path / "images.parquet")
-    data = load(Images(source=source, image_size=SCALE, augment=None, validation=source),
+    data = loader(ImageData(source=source, image_size=SCALE, augment=None, validation=source),
                 batch=4, read=read,
                 loading=Loading(workers=workers, threads=1, read_buffer=2, worker_buffer=1),
                 host=(EncodeCaptions(keep_captions),))
@@ -58,7 +60,7 @@ def test_parquet_images_and_captions_reach_real_worker_batches(tmp_path, workers
 
 def test_hugging_face_image_structs_decode_their_embedded_bytes(tmp_path):
     source = image_table(tmp_path / "hub-images.parquet", 4, struct=True)
-    data = load(Images(source=source, image_size=SCALE, augment=None), batch=4,
+    data = loader(ImageData(source=source, image_size=SCALE, augment=None), batch=4,
                 read="memory", loading=READ)
     stream = data.train(DataPartition())
     try:
@@ -72,7 +74,7 @@ def test_hugging_face_image_structs_decode_their_embedded_bytes(tmp_path):
 def test_a_second_validation_source_leaves_every_training_record_available(tmp_path):
     train = image_table(tmp_path / "train.parquet", 16)
     held = image_table(tmp_path / "held.parquet", 5)
-    data = load(Images(source=train, validation=held, image_size=SCALE, augment=None),
+    data = loader(ImageData(source=train, validation=held, image_size=SCALE, augment=None),
                 batch=4, read="memory", loading=READ)
     assert data.records == 16 and data.held_out == 0 and data.val is not None
     stream = data.val(DataPartition())
@@ -87,7 +89,7 @@ def test_a_second_validation_source_leaves_every_training_record_available(tmp_p
 
 def test_a_head_holdout_is_disjoint_from_the_training_epoch(tmp_path):
     source = image_table(tmp_path / "images.parquet", 16)
-    data = load(Images(source=source, validation=HoldOut(records=8), image_size=SCALE, augment=None),
+    data = loader(ImageData(source=source, validation=HoldOut(records=8), image_size=SCALE, augment=None),
                 batch=4, read="memory", loading=READ)
     assert data.records == 8 and data.val is not None
     training, validation = data.train(DataPartition()), data.val(DataPartition())
@@ -105,7 +107,7 @@ def test_validation_never_applies_the_training_crop_or_colour_jitter(tmp_path):
     source = image_table(tmp_path / "images.parquet", 8)
     images = []
     for augment in (None, Augment(flip=True, jitter=True, crop_scale=(0.5, 0.9))):
-        data = load(Images(source=source, validation=source, image_size=SCALE,
+        data = loader(ImageData(source=source, validation=source, image_size=SCALE,
                            staging_size=16, augment=augment), batch=4, read="memory", loading=READ)
         assert data.val is not None
         stream = data.val(DataPartition())
@@ -118,7 +120,8 @@ def test_validation_never_applies_the_training_crop_or_colour_jitter(tmp_path):
 
 def test_an_unconditional_batch_discards_host_caption_strings(tmp_path):
     source = image_table(tmp_path / "images.parquet", 4)
-    data = load(Images(source=source, image_size=SCALE, augment=None), batch=4, read="memory", loading=READ)
+    data = loader(ImageData(source=source, image_size=SCALE, augment=None), batch=4, read="memory",
+                  loading=READ)
     stream = data.train(DataPartition())
     try:
         batch = next(stream)

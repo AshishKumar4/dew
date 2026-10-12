@@ -7,7 +7,8 @@ from pathlib import Path
 
 import pytest
 
-from dew.data import Loading, iterate
+from dew.data import Loading
+from dew.data.compile import iterate
 from dew.decision import Choice, Decisions, Example
 
 RECIPES = Path(__file__).parents[1] / "recipes" / "decision"

@@ -25,7 +25,7 @@ from test_inference import make_run
 
 from dew import Checkpoints
 from dew.artifacts import uint8_pixels
-from dew.data import Loader
+from dew.data.dataset import Loader
 from dew.diffusion.presets import Flow
 from dew.inputs import Condition, Field, InputSpec
 from dew.interop import load_params

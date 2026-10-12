@@ -25,7 +25,7 @@ from episode_support import (
 from flax import linen as nn
 from rl_support import clipped_surrogate, token_mean
 
-from dew.data import Loader
+from dew.data.dataset import Loader
 from dew.objectives.base import Step
 from dew.objectives.rl import EpisodeRollout, PPOObjective, PPORollout, ValueHead
 from dew.objectives.rl.ppo import OLD_VALUES_KEY, RETURNS_KEY

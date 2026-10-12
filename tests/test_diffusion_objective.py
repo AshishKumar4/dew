@@ -17,7 +17,7 @@ from diffusion_stubs import FEATURES, RES, TOKENS, VOCAB, StubText
 from flax import linen as nn
 
 from dew.artifacts import ImageGrid, VideoGrid
-from dew.data import Loader
+from dew.data.dataset import Loader
 from dew.diffusion import broadcast_rates, expand, presets
 from dew.inputs import CharTable, CLIPText, Condition, Field, InputSpec, unit_range
 from dew.nn.backbones import SimpleDiT, SimpleMMDiT

@@ -21,8 +21,9 @@ from pathlib import Path
 import numpy as np
 from process_support import prepare_worker
 
-from dew.data import Loader, Loading
-from dew.data.recipes import load
+from dew.config.data import loader
+from dew.data import Loading
+from dew.data.dataset import Loader
 from dew.telemetry.records import RECORD_TYPES
 from dew.training.evaluation import Evaluation
 
@@ -211,7 +212,9 @@ def elastic_loader(records: int, workers: int):
     takes, so what a pool reading it exercises is a position every process
     reports alike and a pool of another size reads back.
     """
-    from dew.data import Memory, Pipeline, compile
+    from dew.data import Memory
+    from dew.data.compile import compile
+    from dew.data.pipeline import Pipeline
 
     class Indexed:
         """Records that say which they are, in the field the objective reads."""
@@ -356,10 +359,11 @@ def mode_data(args) -> dict:
     """One pass over the held-out split, which ends by itself."""
     import jax
 
-    from dew.data import DataPartition, Text
+    from dew.config.data import TextData
+    from dew.data.dataset import DataPartition
     from dew.training import MeshSpec
 
-    data = load(Text(source=args.tokens, seq_len=args.seq_len), batch=BATCH, read="memory",
+    data = loader(TextData(source=args.tokens, seq_len=args.seq_len), batch=BATCH, read="memory",
         loading=Loading(workers=args.workers, threads=1,
                                         read_buffer=8, worker_buffer=1))
     partition = DataPartition.of(MeshSpec().build())
@@ -383,10 +387,11 @@ def mode_data(args) -> dict:
 def mode_packed(args) -> dict:
     import jax
 
-    from dew.data import DataPartition, Text
+    from dew.config.data import TextData
+    from dew.data.dataset import DataPartition
     from dew.training import MeshSpec
 
-    data = load(Text(source=args.tokens, pack="first-fit", seq_len=args.seq_len), batch=BATCH,
+    data = loader(TextData(source=args.tokens, pack="first-fit", seq_len=args.seq_len), batch=BATCH,
         read="memory", loading=Loading(workers=args.workers,
                                         worker_buffer=1))
     partition = DataPartition.of(MeshSpec().build())
@@ -475,11 +480,11 @@ def mode_packed_fit(args) -> dict:
 
     import jax
 
-    from dew.data import Text
+    from dew.config.data import TextData
 
     trainer = token_trainer(args.name, args.run_dir, args.fsdp_size, args.seq_len)
     restored_step, restored = restored_state(trainer)
-    data = load(Text(source=args.tokens, pack="first-fit", seq_len=args.seq_len), batch=BATCH,
+    data = loader(TextData(source=args.tokens, pack="first-fit", seq_len=args.seq_len), batch=BATCH,
         read="memory", loading=Loading(workers=args.workers,
                                         worker_buffer=1), validation_records=(0) * (BATCH))
     seen: list = []
@@ -513,13 +518,13 @@ def restored_state(trainer):
 
 
 def mode_token_budget(args) -> dict:
-    from dew.data import Text, load
+    from dew.config.data import TextData, loader
 
     trainer = token_trainer(args.name, args.out.parent, fsdp=1, seq_len=4)
     trainer.checkpoints = None
     tracker = LossRecorder()
     trainer.tracker = tracker
-    data = load(Text(source=args.tokens, seq_len=4), batch=BATCH,
+    data = loader(TextData(source=args.tokens, seq_len=4), batch=BATCH,
                 loading=Loading(workers=0, threads=1, read_buffer=1))
     state = trainer.fit(data, tokens=80, log_every=1)
     return {"step": int(state.step), "updates": int(state.updates), "logged": len(tracker.losses)}
@@ -623,9 +628,10 @@ def mode_fit(args) -> dict:
         # The packed token split, whose documents are strided over the
         # processes before packing. The objective's evaluation ignores the
         # batch's contents, so the split only has to shard.
-        from dew.data import DataPartition, Text
+        from dew.config.data import TextData
+        from dew.data.dataset import DataPartition
 
-        data = load(Text(source=args.tokens, pack="first-fit", seq_len=args.seq_len), batch=BATCH,
+        data = loader(TextData(source=args.tokens, pack="first-fit", seq_len=args.seq_len), batch=BATCH,
             read="memory", loading=Loading(workers=args.workers),
                 validation_records=(args.val_steps) * (BATCH))
         val = data.val
@@ -669,7 +675,10 @@ def mode_pool_refusals(args) -> dict:
     import orbax.checkpoint as ocp
     from affine_run import FEATURES, Regression
 
-    from dew.data import Loader, Memory, Pipeline, compile
+    from dew.data import Memory
+    from dew.data.compile import compile
+    from dew.data.dataset import Loader
+    from dew.data.pipeline import Pipeline
     from dew.training import Checkpoints, MeshSpec, Trainer
 
     rank = jax.process_index()
@@ -827,7 +836,7 @@ def mode_validate(args) -> dict:
     import jax
     import optax
 
-    from dew.data import Loader
+    from dew.data.dataset import Loader
     from dew.diffusion import presets
     from dew.eval import CLIPDistance
     from dew.inputs import Condition, Field, InputSpec
@@ -875,7 +884,7 @@ def mode_tracked(args) -> dict:
     import jax
     import optax
 
-    from dew.data import Loader
+    from dew.data.dataset import Loader
     from dew.training import Layout, MeshSpec, Trainer
     from dew.training.tracker import render
 
@@ -1098,7 +1107,7 @@ def mode_evaluation_contract(args) -> dict:
     import jax
     import optax
 
-    from dew.data import Loader
+    from dew.data.dataset import Loader
     from dew.training import Trainer
 
     rank = jax.process_index()
@@ -1142,7 +1151,7 @@ def mode_evaluation_replicas(args) -> dict:
     import optax
 
     from dew.artifacts import Representations
-    from dew.data import Loader
+    from dew.data.dataset import Loader
     from dew.objectives.base import Aux, Objective
     from dew.training import MeshSpec, Trainer
 
@@ -1255,7 +1264,7 @@ def mode_builtin_preview_failures(args) -> dict:
     import jax
     import optax
 
-    from dew.data import Loader
+    from dew.data.dataset import Loader
     from dew.inference import TextGeneration
     from dew.training import Trainer
 
@@ -1479,7 +1488,7 @@ def mode_rollout(args) -> dict:
     import optax
     from jax.experimental import multihost_utils
 
-    from dew.data import Loader
+    from dew.data.dataset import Loader
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.objectives.rl import GRPOObjective, SampledRollout
     from dew.sampling import Sampling, generate
@@ -2240,8 +2249,10 @@ def matrix_data(read: str, cached: bool, rejecting: bool, packed: bool, cache_di
     a cache filled by the pool; online packing into eight-token windows; then
     a global shuffle where the order stays indexed and a windowed one where it
     streams."""
-    from dew.data import Memory, Pipeline, compile
+    from dew.data import Memory
     from dew.data.cache import Cache
+    from dew.data.compile import compile
+    from dew.data.pipeline import Pipeline
 
     records = [{"text": np.full(1 + index % 8, index, np.int32)} for index in range(MATRIX_RECORDS)]
     pipeline = Pipeline(Memory(records, shard_rows=16))

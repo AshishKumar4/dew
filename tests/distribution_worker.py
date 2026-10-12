@@ -90,7 +90,7 @@ def main() -> None:
     from sharded import split_axes
 
     from dew.checkpoints import Checkpoints
-    from dew.data import DataPartition, Loader
+    from dew.data.dataset import DataPartition, Loader
     from dew.objectives.lm import LMObjective
     from dew.registry import models
     from dew.training import Layout, MeshSpec, Trainer

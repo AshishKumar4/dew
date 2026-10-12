@@ -20,7 +20,8 @@ from flax import linen as nn
 from reference_error import assert_leaves_as_exact, distance, widened
 from safetensors.numpy import load_file
 
-from dew.data import DataPartition, load
+from dew.config.data import loader
+from dew.data.dataset import DataPartition
 from dew.data.text import ByteTokenizer, HFTokenizer
 from dew.decision import (
     Choice,
@@ -163,7 +164,7 @@ def test_a_ragged_batch_trains_on_compacted_options_as_on_the_grid():
         tokenizer=tokenizer, specials=specials, layout=JointLayout(max_len=length),
         head=JointSchemaHead(hidden_size=16, width=16, routing_layers=2, layers=1, heads=1, feedforward=24,
                              attention_impl="xla"), shuffle_options=False)
-    data = load(DecisionRecipe(source=examples, validation=examples), batch=len(examples),
+    data = loader(DecisionRecipe(source=examples, validation=examples), batch=len(examples),
                 read="memory", objective=objective.data())
     (slotted,) = list(data.val(DataPartition()))
     slotted = {name: value for name, value in slotted.items() if name != VALID_ROWS}

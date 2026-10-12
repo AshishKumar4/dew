@@ -16,7 +16,9 @@ import optax
 import pytest
 
 from dew.config import ModelConfig, ObjectiveConfig
-from dew.data import DataPartition, Images, Loading, Video, load
+from dew.config.data import ImageData, VideoData, loader
+from dew.data import Loading
+from dew.data.dataset import DataPartition
 from dew.data.steps.image import EncodeCaptions
 from dew.inputs import Condition, HFAudio
 from dew.objectives.base import Step
@@ -70,7 +72,7 @@ def test_the_audio_processor_pads_a_batch_to_its_longest_or_to_the_models_window
     """wav2vec2's extractor pads nothing unless asked, so a batch of two
     lengths comes back padded to the longer; Whisper's encoder reads a fixed
     30-second window, so even a short clip comes back at its 3000 frames."""
-    from dew.data import AutoAudioProcessor
+    from dew.data.processors import AutoAudioProcessor
 
     values = AutoAudioProcessor(modelname=str(towers / "wav2vec2"))([_tone(440, 0.025), _tone(440, 0.05)])
     features = AutoAudioProcessor(modelname=str(towers / "whisper"))(_tone(440, 0.05))
@@ -149,7 +151,7 @@ def test_an_audio_conditioned_video_run_learns_and_samples_from_audio(towers, tm
     pytest.importorskip("moviepy.config", reason="needs the av extra")
     for hertz in range(220, 1100, 110):
         _clip(tmp_path / f"{hertz}.avi", hertz)
-    data = Video(source=str(tmp_path), extensions=(".avi",), frame_size=8, frames=2,
+    data = VideoData(source=str(tmp_path), extensions=(".avi",), frame_size=8, frames=2,
                  audio_padding=1, audio_model=str(towers / "wav2vec2"))
     config = DiffusionRunConfig(
         model=ModelConfig("video_dit", {"patch_size": 4, "emb_features": 32, "num_layers": 1,
@@ -159,7 +161,7 @@ def test_an_audio_conditioned_video_run_learns_and_samples_from_audio(towers, tm
     objective = config.build()
     assert objective.inputs.conditions["textcontext"].encoder.seconds == data.audio_seconds
     assert DiffusionRunConfig.from_dict(config.to_dict()) == config
-    dataset = load(data, batch=8, read="memory", loading=Loading(workers=0),
+    dataset = loader(data, batch=8, read="memory", loading=Loading(workers=0),
                    host=(EncodeCaptions(objective.inputs.tokenize),))
     batch = next(dataset.train(DataPartition()))
     assert set(batch) == {"video", "audio"}
@@ -189,6 +191,7 @@ def test_audio_conditioning_is_refused_beside_text_or_without_clip_audio():
     """The audio takes the models' one context keyword, so a run naming text
     too is refused, and so is a dataset whose samples carry no audio."""
     with pytest.raises(ValueError, match="set text to None"):
-        DiffusionRunConfig(data=Video(source="clips"), audio=AudioCondition())
+        DiffusionRunConfig(data=VideoData(source="clips"), audio=AudioCondition())
     with pytest.raises(ValueError, match="carries none"):
-        DiffusionRunConfig(data=Images(source="tfds://oxford_flowers102"), text=None, audio=AudioCondition())
+        DiffusionRunConfig(data=ImageData(source="tfds://oxford_flowers102"), text=None,
+                           audio=AudioCondition())

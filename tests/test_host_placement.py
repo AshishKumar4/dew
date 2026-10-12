@@ -32,7 +32,7 @@ import pytest
 from affine_run import BATCH, Counting, Features, Regression, Spread, val_batches
 from process_support import run_pool
 
-from dew.data import Loader
+from dew.data.dataset import Loader
 from dew.inference.banks import CheckpointBanks, HeldBanks
 from dew.nn.backbones.decoder_stack import StackView
 from dew.objectives.lm import LMObjective

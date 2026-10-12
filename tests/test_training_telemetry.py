@@ -14,7 +14,7 @@ from recording import RecordingTracker
 
 import dew.config
 from dew.config import OptimConfig, RunConfig, TrainerConfig, Wandb
-from dew.data import Loader
+from dew.data.dataset import Loader
 from dew.objectives import Aux, Objective
 from dew.telemetry.instrumentation import StepFlops, compilation_cache_counts, count_compilation_cache
 from dew.training import Trainer, WandbTracker

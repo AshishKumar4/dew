@@ -23,7 +23,7 @@ def main() -> None:
 
     from dew.artifacts import ImageGrid
     from dew.coordination import collective_host
-    from dew.data import Loader
+    from dew.data.dataset import Loader
     from dew.diffusion import FlowMatchingScheduler, FlowMatchPredictionTransform, Process
     from dew.inputs import CharTable, Condition, Field, InputSpec
     from dew.nn.backbones.dit import SimpleDiT

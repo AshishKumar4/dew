@@ -17,7 +17,7 @@ from PIL import Image
 
 import dew.artifacts
 from dew.artifacts import Decisions, ImageGrid, Representations, TextSamples, TokenScores, VideoGrid
-from dew.data import Loader
+from dew.data.dataset import Loader
 from dew.pool import PREEMPTED_EXIT
 from dew.telemetry.records import FitEnded, RunRecord, json_value
 from dew.training import Checkpoints, LocalTracker, Trackers, Trainer

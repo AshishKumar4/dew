@@ -448,7 +448,7 @@ def test_group_normalization_preserves_small_differences_on_large_reward_offset(
 def test_float64_callback_distinctions_reach_a_real_policy_update():
     import itertools
 
-    from dew.data import Loader
+    from dew.data.dataset import Loader
     from dew.nn.backbones.dit import SimpleDiT
 
     count = jax.device_count()
@@ -483,7 +483,7 @@ def test_conditioned_prompt_only_evaluation_preview_and_trainer_consumers():
     import itertools
 
     from dew.artifacts import ImageGrid
-    from dew.data import Loader
+    from dew.data.dataset import Loader
     from dew.inputs import CharTable, Condition
     from dew.nn.backbones.dit import SimpleDiT
 

@@ -13,7 +13,9 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from dew.data import TFDS, DataPartition, HoldOut, Images, Loading, load
+from dew.config.data import HoldOut, ImageData, loader
+from dew.data import TFDS, Loading
+from dew.data.dataset import DataPartition
 from dew.data.image_codec import decode_image
 from dew.data.steps.image import ImageRecord
 
@@ -25,7 +27,7 @@ FIXTURE = Path(__file__).parent / "fixtures" / "tfds" / "dew_images" / "1.0.0"
 def test_prepared_records_carry_encoded_pixels_labels_and_caption_names():
     """The source hands out the bytes on disk; `record` decodes them, so a
     worker pays one decode at the resolution it needs and no more."""
-    spec = Images(source=TFDS("dew_images", path=str(FIXTURE), split="all",
+    spec = ImageData(source=TFDS("dew_images", path=str(FIXTURE), split="all",
         decoders={"image": tfds.decode.SkipDecoding()}), caption_templates=("a photo of a {}",))
     source = spec.source.records("indexed")
     assert len(source) == 20
@@ -64,7 +66,7 @@ def test_a_prepared_source_describes_the_directory_and_split_it_reads():
 
 @pytest.mark.parametrize("workers", [0, 2])
 def test_prepared_records_reach_grain_batches_without_split_overlap(workers):
-    data = load(Images(source=TFDS("dew_images", path=str(FIXTURE), split="all",
+    data = loader(ImageData(source=TFDS("dew_images", path=str(FIXTURE), split="all",
         decoders={"image": tfds.decode.SkipDecoding()}),
                        image_size=8, augment=None, validation=HoldOut(records=4),
                        caption_templates=("a photo of a {}",)), batch=4, read="memory",
@@ -87,7 +89,7 @@ def test_prepared_records_reach_grain_batches_without_split_overlap(workers):
 def test_explicit_caption_names_override_the_prepared_metadata(tmp_path):
     labels = tmp_path / "names.txt"
     labels.write_text("fern\nrose\n")
-    spec = Images(source=TFDS("dew_images", path=str(FIXTURE), split="all",
+    spec = ImageData(source=TFDS("dew_images", path=str(FIXTURE), split="all",
         decoders={"image": tfds.decode.SkipDecoding()}), labels=str(labels),
             caption_templates=("a photo of a {}",))
     source = spec.source.records("indexed")

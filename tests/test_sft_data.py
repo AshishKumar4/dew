@@ -4,7 +4,7 @@
 same template and conversation. The reference is tests/fixtures/rl/chat.npz,
 written by tools/parity_chat.py from TRL 1.12's SFT path with
 `assistant_only_loss=True` on the tiny tokenizer under
-tests/fixtures/tokenizers/tiny-chat. `Chat` packs those roles beside
+tests/fixtures/tokenizers/tiny-chat. `ChatData` packs those roles beside
 the ids, and the packer and chunker keep the four per-token fields aligned.
 """
 
@@ -15,9 +15,10 @@ import numpy as np
 import pytest
 from transformers import AutoTokenizer
 
-from dew.data import Chat, DataPartition, Loading
+from dew.config.data import ChatData, loader
+from dew.data import Loading
 from dew.data.chat import ROLES_KEY, Conversation, Role, render_conversation
-from dew.data.recipes import load
+from dew.data.dataset import DataPartition
 
 TOKENIZER = Path(__file__).resolve().parent / "fixtures" / "tokenizers" / "tiny-chat"
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "rl" / "chat.npz"
@@ -95,7 +96,7 @@ def test_a_packed_sft_batch_carries_four_aligned_fields(tmp_path, tokenizer):
         "the fixture tokenizer changed; re-derive the bins below")
     (a_ids, a_roles), (b_ids, b_roles), (c_ids, c_roles) = rendered
 
-    data = load(Chat(source=path, tokenizer=str(TOKENIZER), seq_len=window - 1, packing_bins=2,
+    data = loader(ChatData(source=path, tokenizer=str(TOKENIZER), seq_len=window - 1, packing_bins=2,
         validation=path, long="chunk"), batch=2, read="memory", loading=Loading(workers=0),
             validation_records=4 * (2))
     assert data.val is not None
@@ -132,7 +133,7 @@ def test_overlong_conversations_chunk_with_roles_aligned(tmp_path, tokenizer):
     assert len(ids) > window
     chunks = -(-len(ids) // window)
 
-    data = load(Chat(source=path, tokenizer=str(TOKENIZER), seq_len=window - 1, packing_bins=1,
+    data = loader(ChatData(source=path, tokenizer=str(TOKENIZER), seq_len=window - 1, packing_bins=1,
         validation=path, long="chunk"), batch=1, read="memory", loading=Loading(workers=0),
             validation_records=4 * (1))
     assert data.records == chunks, "one bin puts every chunk in a window of its own"
@@ -154,7 +155,7 @@ def test_the_train_stream_runs_end_to_end(tmp_path, tokenizer):
     rendered = {tuple(render(tokenizer, conversation)[0].tolist())
                 for conversation in (SHORT, MEDIUM, LONG)}
     columns = ("text", ROLES_KEY, "text_segment_ids", "text_positions")
-    data = load(Chat(source=path, tokenizer=str(TOKENIZER), seq_len=95, packing_bins=2, long="chunk"),
+    data = loader(ChatData(source=path, tokenizer=str(TOKENIZER), seq_len=95, packing_bins=2, long="chunk"),
         batch=2, read="memory", loading=Loading(workers=2), validation_records=4 * (2))
 
     batch = next(data.train(DataPartition()))
@@ -199,7 +200,7 @@ def test_a_conversation_starting_with_the_assistant_is_refused(tokenizer):
 
 def test_chat_messages_needs_a_parquet_path():
     with pytest.raises(ValueError, match=r"source '' needs format="):
-        load(Chat(source="", tokenizer=str(TOKENIZER), long="chunk"), batch=8, read="memory",
+        loader(ChatData(source="", tokenizer=str(TOKENIZER), long="chunk"), batch=8, read="memory",
             validation_records=4 * (8))
 
 
@@ -209,5 +210,5 @@ def test_an_empty_parquet_file_is_refused(tmp_path):
 
     pq.write_table(pa.table({"prompt": []}), tmp_path / "empty.parquet")
     with pytest.raises(ValueError, match="zero valid target tokens"):
-        load(Chat(source=str(tmp_path / "empty.parquet"), tokenizer=str(TOKENIZER), long="chunk"),
+        loader(ChatData(source=str(tmp_path / "empty.parquet"), tokenizer=str(TOKENIZER), long="chunk"),
             batch=8, read="memory", validation_records=4 * (8))

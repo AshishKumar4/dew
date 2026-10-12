@@ -29,7 +29,9 @@ from absl import flags
 if not flags.FLAGS.is_parsed():
     flags.FLAGS.mark_as_parsed()
 
-from dew.data import DataPartition, Images, Loading, images, load
+from dew.config.data import ImageData, loader
+from dew.data import Loading, images
+from dew.data.dataset import DataPartition
 from dew.data.sources.codec import unpack_dict_of_byte_arrays
 from dew.data.steps.image import EncodeCaptions, ImageRecord
 
@@ -123,14 +125,14 @@ def test_module_imports_and_constructs_without_torchvision(tmp_path):
             "sys.modules['transformers'] = None",
             "",
             "import numpy as np",
-            "from dew.data import Images",
+            "from dew.data import ImageData",
             "from dew.data.images import Augment, augment_image",
             "from dew.data.steps.image import ImageRecord",
             "",
             "labels = sys.argv[1]",
             "image = np.zeros((9, 11, 3), dtype=np.uint8)",
             "for augment in (None, Augment(flip=True, jitter=False), Augment(flip=True, jitter=True)):",
-            "    Images(source=(), labels=labels)",
+            "    ImageData(source=(), labels=labels)",
             "    ImageRecord(16, 16)",
             "    out = augment_image(augment, image, np.random.default_rng(0))",
             "    assert out.dtype == np.uint8 and out.shape == image.shape",
@@ -178,13 +180,13 @@ _READERS = "\n".join([
     "import dataclasses, io, sys",
     "import numpy as np",
     "from PIL import Image",
-    "from dew.data import DataPartition, Images, Loading, load",
+    "from dew.data import DataPartition, ImageData, Loading, loader",
     "buffer = io.BytesIO()",
     "Image.fromarray(np.arange(40 * 40 * 3, dtype=np.uint8).reshape(40, 40, 3)).save(",
     "    buffer, format='PNG')",
     "PNG = buffer.getvalue()",
     "",
-    "SPEC = Images(source=[{'image': PNG, 'caption': 'a picture'}] * 64, image_size=16, augment=None)",
+    "SPEC = ImageData(source=[{'image': PNG, 'caption': 'a picture'}] * 64, image_size=16, augment=None)",
 ])
 
 
@@ -192,7 +194,8 @@ def test_opening_an_image_loader_imports_opencv_before_its_readers_start():
     _fresh_process("\n".join([
         _READERS,
         "assert 'cv2' not in sys.modules",
-        "data = load(SPEC, batch=32, read='indexed', loading=Loading(workers=0, threads=32, read_buffer=64))",
+        "loading = Loading(workers=0, threads=32, read_buffer=64)",
+        "data = loader(SPEC, batch=32, read='indexed', loading=loading)",
         "assert 'cv2' in sys.modules",
         "batch = next(iter(data.train(DataPartition())))",
         "assert batch['image'].shape == (32, 16, 16, 3)",
@@ -292,12 +295,12 @@ def test_flip_jitter_mode_keeps_shape_and_dtype_and_changes_statistics(kind):
 def test_the_images_recipe_flips_and_jitters_by_default():
     """A recipe that names no augmentation trains on the draws an explicit
     flip and jitter makes, and a flip alone makes others."""
-    from dew.data import Augment
+    from dew.config.data import Augment
 
     rows = [{"image": _synthetic_image(index), "label": index} for index in range(RECORDS)]
 
     def trained(**fields):
-        data = load(Images(source=rows, image_size=SCALE, **fields), batch=4, read="memory", seed=7,
+        data = loader(ImageData(source=rows, image_size=SCALE, **fields), batch=4, read="memory", seed=7,
                     loading=Loading(workers=0))
         stream = data.train(DataPartition())
         try:
@@ -389,7 +392,7 @@ def _by_record(spec, worker_count):
     own slice of the index stream, so batch composition follows worker_count
     while record content must not.
     """
-    data = load(spec, batch=4, read="memory", seed=7,
+    data = loader(spec, batch=4, read="memory", seed=7,
                 loading=Loading(workers=worker_count, threads=1, read_buffer=1, worker_buffer=1),
                 host=(EncodeCaptions(keep_captions),))
     records = {}
@@ -403,9 +406,9 @@ def _by_record(spec, worker_count):
 def test_a_record_comes_out_the_same_with_and_without_worker_processes(tmp_path):
     labels_file = tmp_path / "indexed_labels.txt"
     labels_file.write_text("\n".join(f"flower{i:02d}" for i in range(RECORDS)) + "\n")
-    from dew.data import Augment
+    from dew.config.data import Augment
 
-    spec = Images(source=[{"image": _synthetic_image(index), "label": index} for index in range(RECORDS)],
+    spec = ImageData(source=[{"image": _synthetic_image(index), "label": index} for index in range(RECORDS)],
                   image_size=SCALE, labels=str(labels_file),
                   caption_templates=("a photo of a {}", "a photo of a {} flower"),
                   augment=Augment(flip=True, jitter=True, backend="host"))

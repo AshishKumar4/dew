@@ -17,7 +17,7 @@ import pytest
 
 import dew.io
 from dew.checkpoints import FROZEN_STORE, RUN_FILE, Checkpoints
-from dew.data import Records, load
+from dew.config.data import RecordsData, loader
 
 
 class Artifact:
@@ -123,7 +123,7 @@ def test_what_a_run_writes_after_training_is_published_only_on_request(tmp_path,
 
     batch = next(batches())
     rows = [{"x": x, "y": y} for x, y in zip(batch["x"], batch["y"], strict=True)]
-    config.train(Regression(), load(Records(source=rows), batch=8, loading=Loading(workers=0),
+    config.train(Regression(), loader(RecordsData(source=rows), batch=8, loading=Loading(workers=0),
         read="memory"), name="after",
                  after=calibrate)
     assert opened[0]['name'] == config.trainer.name
@@ -300,7 +300,7 @@ def test_a_published_lora_run_downloads_to_a_run_that_loads_and_restores(tmp_pat
     run = tmp_path / "run"
     checkpoints = Checkpoints(str(run))
     state = Trainer(objective, optax.sgd(1.0), key=0, checkpoints=checkpoints).fit(
-        load(Records(source=rows), batch=8, loading=Loading(workers=0, threads=1, read_buffer=1),
+        loader(RecordsData(source=rows), batch=8, loading=Loading(workers=0, threads=1, read_buffer=1),
             read="memory"),
         steps=2, checkpoint_every=1, log_every=100)
     checkpoints.wait()
