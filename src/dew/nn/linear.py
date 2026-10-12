@@ -27,21 +27,24 @@ value head.
 """
 
 import functools
+import math
 
 import jax
 import jax.numpy as jnp
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
+from jax.ad_checkpoint import checkpoint_name
 
-from dew.nn.kernels import delta_chunks, delta_prep, delta_rule, fla_gdn
+from dew.nn.kernels import delta_rule, fla_gdn
 
 from .attention import FORWARD_MODE, unweighted_rmsnorm
 from .blocks import normal_kernel
 from .flops import conv_flops, delta_flops, projection_flops
 from .inputs import AttentionMetadata, valid_order
-from .kernels.generation import first_refusal, measured_kernel, ran_kernel, triton_runs
+from .kernels import generation
+from .kernels.generation import first_refusal, ran_kernel, triton_runs
 from .precision import asks_default_precision, at_least_fp32
-from .sharding import logical_axes, rows_like, seen_whole
+from .sharding import HEADS, logical_axes, logical_spec, manual_map, mesh_axes, rows_like
 
 CHUNK_SIZE = 64
 """Tokens per chunk of the chunked form, the reference's default
@@ -256,15 +259,13 @@ def _compensated_add(left, right):
     return total, dropped + left_lo + right_lo
 
 
-def chunk_decay(g, *, halves: bool = False):
+def chunk_decay(g):
     """Cumulate per-chunk log decays and build the pairwise decay between positions.
 
     `g` is `[..., C, F]`: the C positions of a chunk and F decay channels.
     Returns the inclusive cumulative sum `gc` over C, `[..., C, F]`, and
     `decay[..., s, t, f] = exp(gc[s, f] - gc[t, f])` for s >= t, zero above
-    the diagonal, `[..., C, C, F]`. With `halves=True`, return the two halves
-    of the compensated sum instead; kernels form their own pairwise decay
-    on chip, and autodiff of the compensated sum remains in XLA.
+    the diagonal, `[..., C, C, F]`.
 
     The references subtract two fp32 cumulative sums, so every exponent
     carries the rounding of the chunk's whole accumulated magnitude, which
@@ -283,14 +284,6 @@ def chunk_decay(g, *, halves: bool = False):
     against 16.5).
     """
     hi, lo = jax.lax.associative_scan(_compensated_add, (g, jnp.zeros_like(g)), axis=g.ndim - 2)
-    if halves:
-        return hi, lo
-    return hi, _chunk_pairwise_decay(hi, lo)
-
-
-def _chunk_pairwise_decay(hi, lo):
-    """The decay between two compensated sums; kernels read the halves
-    instead, while the XLA products still need the full pairwise tensor."""
     chunk_size = hi.shape[-2]
     inclusive = jnp.tril(jnp.ones((chunk_size, chunk_size), jnp.bool_))[..., None]
     diff = ((hi[..., :, None, :] - hi[..., None, :, :]) + (lo[..., :, None, :] - lo[..., None, :, :]))
@@ -298,7 +291,7 @@ def _chunk_pairwise_decay(hi, lo):
     # differences can overflow, and an outer where alone leaves 0 * inf in
     # the decay gradient.
     diff = jnp.where(inclusive, diff, 0.0)
-    return jnp.where(inclusive, jnp.exp(diff), 0.0)
+    return hi, jnp.where(inclusive, jnp.exp(diff), 0.0)
 
 
 def strictly_lower_inverse(a):
@@ -382,44 +375,7 @@ def _paired(left, right, decay):
     return jnp.einsum('...sd,...td,...std->...st', left, right, decay)
 
 
-CHUNK_RECURRENCES = ('auto', 'xla', 'pallas')
-"""The recurrences `chunk_delta_rule` runs its memory across chunks on."""
-
-GATED_DELTA_RULES = (*CHUNK_RECURRENCES, 'fla')
-"""`chunk_gated_delta_rule`'s: those, and fla's whole rule on its own numbers."""
-
-
-def chunk_states_kernel(implementation: str, key, out_vals, gc) -> str:
-    """The recurrence and prep a chunked rule over these per-chunk keys,
-    values and decays runs: 'xla' or 'pallas' (`delta_chunks`, `delta_prep`),
-    whose fused in-chunk correction and memory recurrence decay per head.
-
-    'auto' takes the generation's measured one (`gpu_target().kernels['gated_delta_rule']`)
-    and 'xla' elsewhere. 'pallas' needs a GPU the kernels compile for,
-    operands they take (`delta_chunks.refusal`) and reverse mode, since under
-    `forward_mode_attention`, which traces for `jax.jvp`, the XLA scan gives
-    the tangent. A call it turns down runs 'xla', which `ran_kernel` logs
-    where 'pallas' was measured fastest. An explicit 'pallas' on a host
-    without a GPU interprets the kernels, as the CPU suite runs them.
-    """
-    if implementation not in CHUNK_RECURRENCES:
-        raise ValueError(f"implementation must be one of {list(CHUNK_RECURRENCES)}, got {implementation!r}")
-    chosen = measured_kernel('gated_delta_rule', 'xla') if implementation == 'auto' else implementation
-    # Where fla's whole rule is measured fastest, a chunk recurrence it does not run takes Dew's kernels.
-    chosen = 'pallas' if chosen == 'fla' else chosen
-    if chosen != 'pallas':
-        return chosen
-    placed = triton_runs() or (implementation == 'pallas' and jax.default_backend() == 'cpu')
-    refusal = first_refusal(
-        (placed, "the Pallas kernels need a GPU of sm80 or later"),
-        (not FORWARD_MODE.get(), "forward_mode_attention traces for jax.jvp, which the kernels lack"),
-        (gc.shape[-1] == 1, "the rule decays per key dimension, and the kernels per head"),
-    ) or delta_chunks.refusal(key, out_vals) or delta_prep.refusal(key, out_vals)
-    return 'pallas' if refusal is None else ran_kernel('gated_delta_rule', 'xla', refusal)
-
-
-def chunk_delta_rule(query, key, value, g, beta, state=None,
-                     chunk_size: int = CHUNK_SIZE, implementation: str = 'auto'):
+def chunk_delta_rule(query, key, value, g, beta, state=None, chunk_size: int = CHUNK_SIZE):
     """The chunked delta rule over [B, S, H, D] operands with the log decay
     `g` `[B, S, H, D]`, D one for a decay per head (the gated delta rule) or
     Dk for one per key dimension (Kimi Delta Attention); returns
@@ -428,13 +384,12 @@ def chunk_delta_rule(query, key, value, g, beta, state=None,
     `strictly_lower_inverse` builds from its diagonal blocks.
 
     Only the memory crosses chunks, so only its recurrence runs chunk after
-    chunk, on the recurrence `implementation` names (`chunk_states_kernel`).
-    Each chunk's output, the references' `attn_inter + attn @ v_new`, reads
-    the state that chunk entered and its corrected values, so it is computed
-    for every chunk at once after the recurrence. The two decays differ only
-    in how a pair of positions is weighed (`_paired`). Pallas also prepares
-    each chunk's correction on chip; the output stays in XLA, which was
-    measured faster than the fused output at every tested tile (c45, c46).
+    chunk (`xla_chunk_states`). Each chunk's output, the references'
+    `attn_inter + attn @ v_new`, reads the state that chunk entered and its
+    corrected values, so it is computed for every chunk at once after the
+    recurrence. The two decays differ only in how a pair of positions is
+    weighed (`_paired`). It is the portable math: a GPU runs the gated rule on
+    fla's kernels (`chunk_gated_delta_rule`), and this is their test oracle.
     """
     dtype, work = query.dtype, at_least_fp32(query.dtype)
     query, key, value, g, beta = (x.astype(work) for x in (query, key, value, g, beta))
@@ -450,28 +405,21 @@ def chunk_delta_rule(query, key, value, g, beta, state=None,
         moved = jnp.moveaxis(x, 2, 1)  # [B, H, S, ...]
         return moved.reshape(B, H, T // chunk_size, chunk_size, *moved.shape[3:])
 
-    q_c, k_c, v_c = chunks(query), chunks(key), chunks(value)
-    recurrence = chunk_states_kernel(implementation, k_c, v_c, chunks(g))
+    q_c, k_c = chunks(query), chunks(key)
+    kb_c, vb_c = chunks(key * beta[..., None]), chunks(value * beta[..., None])
     # The log decay cumulated within each chunk, the reference's
     # `g = g.cumsum(dim=-1)` (modeling_qwen3_next.py:417), and the decay
     # `exp(gc[s] - gc[t])` between positions s >= t, zero above the diagonal:
     # [B, H, NC, C, D], [B, H, NC, C, C, D].
-    if recurrence == 'pallas':
-        gc, lo = chunk_decay(chunks(g), halves=True)
-        decay = _chunk_pairwise_decay(gc, lo)
-        k_cumdecay, out_vals = delta_prep.chunk_prep(k_c, v_c, chunks(beta), gc[..., 0], lo[..., 0],
-                                                   not triton_runs())
-    else:
-        kb_c, vb_c = chunks(key * beta[..., None]), chunks(value * beta[..., None])
-        gc, decay = chunk_decay(chunks(g))
-        # The mask is strictly lower (tril, -1): the reference's masked_fill
-        # zeroes the diagonal too.
-        strict = jnp.tril(jnp.ones((chunk_size, chunk_size), jnp.bool_), -1)
-        attn = jnp.where(strict, -_paired(kb_c, k_c, decay), 0.0)
-        # The reference's `attn + I` operator after its row correction loop.
-        inv = strictly_lower_inverse(attn)
-        out_vals = inv @ vb_c  # the reference's `value = attn @ v_beta`
-        k_cumdecay = inv @ (kb_c * jnp.exp(gc))
+    gc, decay = chunk_decay(chunks(g))
+    # The mask is strictly lower (tril, -1): the reference's masked_fill
+    # zeroes the diagonal too.
+    strict = jnp.tril(jnp.ones((chunk_size, chunk_size), jnp.bool_), -1)
+    attn = jnp.where(strict, -_paired(kb_c, k_c, decay), 0.0)
+    # The reference's `attn + I` operator after its row correction loop.
+    inv = strictly_lower_inverse(attn)
+    out_vals = inv @ vb_c  # the reference's `value = attn @ v_beta`
+    k_cumdecay = inv @ (kb_c * jnp.exp(gc))
 
     state = jnp.zeros((B, H, Dk, Dv), work) if state is None else state.astype(work)
     # XLA:CPU workaround: under a jitted scan over the layers the chunk
@@ -480,11 +428,7 @@ def chunk_delta_rule(query, key, value, g, beta, state=None,
     # The barrier materializes the zero. Remove it when XLA:CPU no longer
     # returns an uninitialized scan carry here.
     state = jax.lax.optimization_barrier(state)
-    if recurrence == 'pallas':
-        entered, v_corrected, state = delta_chunks.chunk_states(
-            k_c, k_cumdecay, out_vals, gc[..., 0], state, not triton_runs())
-    else:
-        entered, v_corrected, state = xla_chunk_states(k_c, k_cumdecay, out_vals, gc, state)
+    entered, v_corrected, state = xla_chunk_states(k_c, k_cumdecay, out_vals, gc, state)
     # decay is zero above the diagonal, so this is the reference's inclusive
     # lower `masked_fill(triu(1), 0)`.
     core = (q_c * jnp.exp(gc)) @ entered + _paired(q_c, k_c, decay) @ v_corrected
@@ -493,78 +437,148 @@ def chunk_delta_rule(query, key, value, g, beta, state=None,
     return core.astype(dtype), state.astype(dtype)
 
 
-def chunk_gated_delta_rule(query, key, value, g, beta, state=None,
-                           chunk_size: int = CHUNK_SIZE, implementation: str = 'auto'):
-    """`torch_chunk_gated_delta_rule` (modeling_qwen3_next.py:374-453): the
-    chunked rule (`chunk_delta_rule`) with one log decay per head, `g`
-    `[B, S, H]`.
+def chunk_gated_delta_rule(query, key, value, g, beta, state=None, chunk_size: int = CHUNK_SIZE, *,
+                           projected=None):
+    """`torch_chunk_gated_delta_rule` (modeling_qwen3_next.py:374-453) with one
+    log decay per head, `g` `[B, S, H]`. Its queries and keys may sit on fewer
+    heads than the values, each serving `Hv // Hk` of them, as fla takes them.
 
-    'fla' runs fla 0.5.2's chunked rule on Dew's port of its kernels
-    (`fla_gdn`), on fla's numbers rather than Dew's: the operands in the dtype
-    they come in, so bf16 ones store the inverse, `w`, `u`, the memory each
-    chunk enters and the corrected values in bf16 with fp32 accumulation, the
-    decay fp32 and cumulated in base 2, the memory fp32 across chunks; the
-    output in the values' dtype and the final memory fp32. Its queries and
-    keys may sit on fewer heads than the values, each serving `Hv // Hk` of
-    them, as fla takes them; the other rules need them repeated. A call the
-    port turns down (`fla_refusal`) runs 'xla', which `ran_kernel` logs.
+    Where the port takes it (`port_refusal`), it is fla 0.5.2's chunked rule
+    on Dew's port of its kernels (`fla_rule`), on fla's numbers, its operands
+    and beta in `projected` where given, the dtype a layer's projections
+    hand fla's rule; elsewhere the portable math (`chunk_delta_rule`) on the
+    operands as they come, in `chunk_size` chunks, which the port's 64 need
+    not match: the rule's value does not depend on them.
     """
-    if implementation not in GATED_DELTA_RULES:
-        raise ValueError(f"implementation must be one of {list(GATED_DELTA_RULES)}, got {implementation!r}")
-    if gated_rule(implementation) == 'fla':
-        refusal = fla_refusal(query, key, value, chunk_size)
-        if refusal is None:
-            return _fla_rule(query, key, value, g, beta, state, chunk_size)
-        # 'auto' falls back to Dew's own measured kernels (`chunk_states_kernel`), an explicit 'fla' to XLA.
-        implementation = 'auto' if implementation == 'auto' else 'xla'
-        ran_kernel('gated_delta_rule', 'pallas' if implementation == 'auto' else 'xla', refusal)
+    if value.shape[2] % key.shape[2]:
+        raise ValueError(f"{value.shape[2]} value heads over {key.shape[2]} key heads: each key head serves "
+                         "a whole number of value heads")
+    rows, keys, values, gates = ((query, key, value, beta) if projected is None
+                                 else (x.astype(projected) for x in (query, key, value, beta)))
+    if on_the_port(rows, keys, values):
+        return fla_rule(rows, keys, values, g, gates, state)
     group = value.shape[2] // key.shape[2]
     if group > 1:
         query, key = (jnp.repeat(x, group, axis=2) for x in (query, key))
-    return chunk_delta_rule(query, key, value, g[..., None], beta, state, chunk_size, implementation)
+    return chunk_delta_rule(query, key, value, g[..., None], beta, state, chunk_size)
 
 
-def gated_rule(implementation: str) -> str:
-    """The rule `implementation` names, 'auto' resolved to the generation's measured one, 'xla' where
-    none is measured."""
-    return measured_kernel('gated_delta_rule', 'xla') if implementation == 'auto' else implementation
-
-
-def fla_refusal(query, key, value, chunk_size: int) -> str | None:
-    """Why the port does not take a rule over these `[B, S, Hk, Dk]` queries and
-    keys and `[B, S, Hv, Dv]` values, or None where it does: a GPU it compiles for, or
-    the CPU interpreting it; reverse mode; fla's 64-token chunks; key and
-    value widths its 64-wide blocks tile; whole key heads per value head; and
-    operands no mesh axis splits."""
-    width, columns = key.shape[-1], value.shape[-1]
+def port_refusal(query, key, value) -> str | None:
+    """Why a rule over these operands runs the portable math rather than the
+    port (`fla_rule`), or None where the port takes it: every GPU Triton runs
+    (`triton_runs`) and every shape, dtype, chunk size and mesh, except
+    inside `jax.jvp`'s traces (`FORWARD_MODE`), which the port's custom VJP
+    gives no tangent; inside a caller's `shard_map` that checks varying axes
+    over operands that vary, where a Pallas call, which states no varying
+    type for its results, cannot run; float64 operands, whose rule is the
+    reference math itself; and keys wider than the port takes in their
+    dtype."""
+    widest = fla_gdn.WIDEST_KEYS if jnp.result_type(query, key, value).itemsize == 2 else fla_gdn.WIDEST
     return first_refusal(
-        (triton_runs() or jax.default_backend() == 'cpu', "the port's kernels need a GPU of sm80 or later"),
-        (not FORWARD_MODE.get(), "forward_mode_attention traces for jax.jvp, which the port lacks"),
-        (chunk_size == 64, f"chunks of {chunk_size}; the port runs fla's 64"),
-        (width in (64, 128, 256) and columns % 64 == 0,
-         f"keys {width} and values {columns} wide; the port tiles keys of 64, 128 or 256 and values by 64"),
-        (value.shape[2] % key.shape[2] == 0, f"{value.shape[2]} value heads over {key.shape[2]} key heads"),
-        (seen_whole(key), "a mesh axis splits the rule's operands, and the kernels see whole arrays"),
-    ) or fla_gdn.rule_refusal(query, key, value, chunk_size)
+        (triton_runs(), "the port's kernels need a GPU of sm80 or later"),
+        (not FORWARD_MODE.get(), "forward_mode_attention traces for jax.jvp, which the port's custom VJP "
+                                 "gives no tangent"),
+        (not jax.typeof(value).mat.varying,
+         "a shard_map that checks varying axes holds the operands, and a Pallas call states no "
+         "varying type for its results"),
+        (all(jnp.dtype(x.dtype) != jnp.float64 for x in (query, key, value)),
+         "float64 operands, whose rule is the reference math itself"),
+        (key.shape[-1] <= widest,
+         f"keys {key.shape[-1]} wide; the port takes at most {widest} in "
+         f"{jnp.result_type(query, key, value).name}"),
+    )
 
 
-def _fla_rule(query, key, value, g, beta, state, chunk_size: int):
-    """`fla_gdn.chunk_gated_delta_rule` over a sequence of any length: padded
-    with tokens that neither decay (`g` zero) nor write (`beta` and the key
-    zero) to whole chunks, the output cut back."""
-    B, S, Hv, Dv = value.shape
-    Dk = key.shape[-1]
-    pad = (chunk_size - S % chunk_size) % chunk_size
+def on_the_port(query, key, value) -> bool:
+    """Whether the rule runs on the port; a GPU that runs it elsewhere logs
+    why the first time (`ran_kernel`)."""
+    refusal = port_refusal(query, key, value)
+    if refusal is not None and triton_runs():
+        ran_kernel('gated_delta_rule', 'xla', refusal, fastest='fla')
+    return refusal is None
 
-    def padded(x):
-        return jnp.pad(x, ((0, 0), (0, pad)) + ((0, 0),) * (x.ndim - 2))
 
-    query, key, value, beta = (padded(x) for x in (query, key, value, beta))
-    g = padded(g.astype(jnp.float32))
-    state = jnp.zeros((B, Hv, Dk, Dv), jnp.float32) if state is None else state.astype(jnp.float32)
-    out, final = fla_gdn.chunk_gated_delta_rule(query, key, value, g, beta, state, Dk ** -0.5, chunk_size,
-                                                not triton_runs())
-    return out[:, :S], final
+def fla_rule(query, key, value, g, beta, state=None):
+    """`fla_gdn.chunk_gated_delta_rule` for any call the portable math takes:
+    `[B, S, Hk, Dk]` queries and keys, `[B, S, Hv, Dv]` values, the log decay
+    `g` and `beta` `[B, S, Hv]`, the memory `[B, Hv, Dk, Dv]` or None.
+
+    The operands go to their common dtype, beta with them, as fla's layer
+    holds them. On a mesh the rule runs per shard (`manual_map`): rows where
+    the rules split them, and value heads with the key heads they read where
+    the head split divides the key heads, the time axis whole; a split that
+    does not divide them keeps the heads whole, so no key's gradient is
+    summed across shards after rounding. Each shard's call is shaped to the
+    kernels' blocks (`_blocked_rule`) and cut back. Off a GPU its kernels
+    interpret, as the CPU suite runs them.
+    """
+    dtype = jnp.result_type(query, key, value)
+    query, key, value, beta = (x.astype(dtype) for x in (query, key, value, beta))
+    g = g.astype(jnp.float32)
+    B, _, Hv, Dv = value.shape
+    state = (jnp.zeros((B, Hv, key.shape[-1], Dv), jnp.float32) if state is None
+             else state.astype(jnp.float32))
+    mesh = jax.sharding.get_abstract_mesh()
+    if mesh.empty or set(mesh.axis_names) <= set(mesh.manual_axes):
+        return _blocked_rule(query, key, value, g, beta, state)
+    spec = logical_spec(HEADS, value.shape)
+    rows, heads = (spec[i] if i < len(spec) else None for i in (0, 2))
+    if key.shape[2] % math.prod(mesh.shape[axis] for axis in mesh_axes(heads)):
+        heads = None
+    P = jax.sharding.PartitionSpec
+    four, three, memory = P(rows, None, heads, None), P(rows, None, heads), P(rows, heads, None, None)
+    return manual_map(_blocked_rule, (four, four, four, three, three, memory), (four, memory))(
+        query, key, value, g, beta, state)
+
+
+def _blocked_rule(query, key, value, g, beta, state):
+    """The port's rule on one shard, shaped to its kernels' blocks: values
+    wider than the port's widest split into more value heads of their key
+    head; value heads padded to a power of two per key head, which dqkwg's
+    block holds, with heads that neither write nor read (zero value, beta
+    and decay); keys and values padded with zero columns to 64, 128 or 256,
+    widths every block of the kernels' configs divides; the sequence padded
+    to whole chunks with tokens that neither decay nor write. None of them
+    changes a real output or gradient: every padded product is an exact
+    zero. The outputs are cut back."""
+    B, S, Hk, Dk = key.shape
+    Hv, Dv = value.shape[2:]
+    scale = Dk ** -0.5
+    split = -(-Dv // fla_gdn.WIDEST)
+    width = -(-Dv // split)
+    if split > 1:
+        value = _padded(value, 3, split * width).reshape(B, S, Hv * split, width)
+        g, beta = (jnp.repeat(x, split, axis=2) for x in (g, beta))
+        state = jnp.moveaxis(_padded(state, 3, split * width).reshape(B, Hv, Dk, split, width), 3, 2)
+        state = state.reshape(B, Hv * split, Dk, width)
+    served = value.shape[2] // Hk
+    group = 1 << (served - 1).bit_length()
+
+    def grouped(x, axis):
+        x = _padded(x.reshape(*x.shape[:axis], Hk, served, *x.shape[axis + 1:]), axis + 1, group)
+        return x.reshape(*x.shape[:axis], Hk * group, *x.shape[axis + 2:])
+
+    value, g, beta, state = grouped(value, 2), grouped(g, 2), grouped(beta, 2), grouped(state, 1)
+    blocks = (max(64, 1 << (Dk - 1).bit_length()), max(64, 1 << (value.shape[3] - 1).bit_length()))
+    query, key = (_padded(x, 3, blocks[0]) for x in (query, key))
+    value = _padded(value, 3, blocks[1])
+    state = _padded(_padded(state, 2, blocks[0]), 3, blocks[1])
+    length = -(-S // CHUNK_SIZE) * CHUNK_SIZE
+    query, key, value, g, beta = (_padded(x, 1, length) for x in (query, key, value, g, beta))
+    out, final = fla_gdn.chunk_gated_delta_rule(query, key, value, g, beta, state, scale, CHUNK_SIZE,
+                                                not generation.triton_runs())
+    out = out[:, :S, :, :width].reshape(B, S, Hk, group, width)[:, :, :, :served]
+    out = out.reshape(B, S, Hv, split * width)[..., :Dv]
+    final = final[:, :, :Dk, :width].reshape(B, Hk, group, Dk, width)[:, :, :served]
+    final = jnp.moveaxis(final.reshape(B, Hv, split, Dk, width), 2, 3).reshape(B, Hv, Dk, split * width)
+    return out, final[..., :Dv]
+
+
+def _padded(x, axis: int, size: int):
+    """`x` padded with zeros on the end of `axis` to `size`."""
+    if x.shape[axis] == size:
+        return x
+    return jnp.pad(x, [(0, size - x.shape[axis]) if i == axis else (0, 0) for i in range(x.ndim)])
 
 
 def recurrent_delta_rule(query, key, value, g, beta, state=None):
@@ -662,7 +676,6 @@ class GatedDeltaNet(nn.Module):
     norm_eps: float = 1e-6
     gate_activation: str = 'silu'  # the norm's gate: 'silu' | 'sigmoid', qwen4_exp's output_gate_type
     fused_in_proj: bool = False
-    implementation: str = 'auto'  # the chunked rule's, `chunk_gated_delta_rule`
     dtype: Dtype | None = None
     precision: PrecisionLike = None
 
@@ -721,9 +734,6 @@ class GatedDeltaNet(nn.Module):
             raise ValueError(
                 "the causal conv needs a history, so a kernel of at least 2, "
                 f"got {self.conv_kernel}")
-        if self.implementation not in GATED_DELTA_RULES:
-            raise ValueError(
-                f"implementation must be one of {list(GATED_DELTA_RULES)}, got {self.implementation!r}")
         if self.gate_activation not in ('silu', 'sigmoid'):
             raise ValueError(
                 "gate_activation must be 'silu' or 'sigmoid' (the reference's "
@@ -803,21 +813,15 @@ class GatedDeltaNet(nn.Module):
             key = l2norm(self._split_heads(key, self.head_k_dim))
             value = self._split_heads(value, self.head_v_dim)
             state = None if held is None else held.astype(wide)
-            if S > 1 and gated_rule(self.implementation) == 'fla':
+            if S > 1:
                 # fla's layer hands its rule the projections' dtype, the
-                # queries and keys on their own heads and beta beside them;
-                # a call the port turns down keeps the wide operands below.
-                rows, keys, values, gates = (x.astype(operand) for x in (query, key, value, beta))
-                if fla_refusal(rows, keys, values, self.chunk_size) is None:
-                    return chunk_gated_delta_rule(rows, keys, values, g, gates, state, self.chunk_size,
-                                                  self.implementation)
+                # queries and keys on their own heads and beta beside them.
+                return chunk_gated_delta_rule(query, key, value, g, beta, state, self.chunk_size,
+                                              projected=operand)
             query, key = self._expand_kv(query), self._expand_kv(key)
             if S == 1 and held is not None and delta_rule.fits(held):
                 return decode_gated_delta_rule(query, key, value, g, beta, held,
                                                None if valid is None else valid[:, 0])
-            if S > 1:
-                return chunk_gated_delta_rule(query, key, value, g, beta, state, self.chunk_size,
-                                              self.implementation)
             out, final = recurrent_gated_delta_rule(query, key, value, g, beta, state)
             if held is not None and held.dtype == jnp.bfloat16:
                 final = delta_rule.round_to_bf16(final, key[:, 0].astype(wide), value[:, 0].astype(wide))
@@ -838,6 +842,8 @@ class GatedDeltaNet(nn.Module):
                         right_padded=attention_metadata is not None and attention_metadata.right_padded)
         if out is None:
             return self.out_proj(jnp.zeros((B, S, self.value_features), self.dtype))
+        # The rule's output, attention's 'context' (a remat policy's `RESIDUALS`).
+        out = checkpoint_name(out, 'context')
 
         gate = z.reshape(B, S, -1, self.head_v_dim)
         out = self.norm(out, gate)  # the norm scales, then the activation gates

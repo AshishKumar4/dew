@@ -171,8 +171,8 @@ def _piece_bytes(token: str, mode: str | None, alphabet: dict[str, int] | None) 
 
 
 def vocabulary_of(tokenizer: Vocabulary | Referencing | Tokenizing, reader: str) -> Vocabulary:
-    """The tokenizer as it stands, or beneath a processor: dew's own processor
-    holds the source processor as `reference`, and that holds the tokenizer."""
+    """The tokenizer as it stands, or beneath a processor's `reference` or
+    `tokenizer` field."""
     source = tokenizer
     for _ in range(3):
         if isinstance(source, Vocabulary):
