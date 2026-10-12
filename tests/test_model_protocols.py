@@ -5,7 +5,7 @@ A loss, a probe or a server reads a token model through the capabilities in
 `output_table`. Each read stands for a forward the model already has, and
 these tests hold it to that forward: the logits to the call's, the head over
 the states to the logits, the table's product (the matrix a tiled loss
-contracts, `dew.objectives.lm.chunked.head_logits`) or else the exact head to
+contracts, `OutputTable.logits`) or else the exact head to
 the logits, the gradients to the call's, and no read writing a cache.
 
 The models are every family Dew loads. `dew.registry.models` holds classes,
@@ -73,7 +73,6 @@ from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.dit import TextContext
 from dew.nn.inputs import ModelInputs
 from dew.nn.protocols import IntervalModel, OutputTable, Recomputing, RequiresText, TimeScaled
-from dew.objectives.lm.chunked import head_logits
 from dew.registry import models
 
 # CI runs this file in tasks of its own: torchax renames torch's privateuse1 backend process-wide.
@@ -178,11 +177,10 @@ def reads(name: str, dtype: str) -> Reads:
 
 
 def contracted(hidden: jax.Array, table: OutputTable, variables) -> jax.Array:
-    """`head_logits` over `table`, whose matrix is one of `variables`' own
-    arrays: the stored parameter, which a loss keeps, and no copy of it."""
+    """`table.logits`, whose matrix is one of `variables`' own arrays: the
+    stored parameter, which a loss keeps, and no copy of it."""
     assert any(table.matrix is leaf for leaf in jax.tree.leaves(variables))
-    return head_logits(hidden, table.matrix, softcap=table.softcap, precision=table.precision,
-                       vocab_major=table.vocab_major, bias=table.bias)
+    return table.logits(hidden)
 
 
 def _cotangent(logits: jax.Array) -> jax.Array:

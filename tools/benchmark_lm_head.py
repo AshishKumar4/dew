@@ -36,11 +36,8 @@ from typing import Callable
 import jax
 import jax.numpy as jnp
 
-from dew.objectives.lm.chunked import (
-    chunked_cross_entropy,
-    head_logits,
-    vocabulary_chunks,
-)
+from dew.nn.protocols import OutputTable
+from dew.objectives.lm.chunked import chunked_cross_entropy, vocabulary_chunks
 
 # The loss owns the measured default; reading it keeps one source for it.
 DEFAULT_TILE = inspect.signature(chunked_cross_entropy).parameters["tile"].default
@@ -78,7 +75,7 @@ def finish(losses, predicted, log_z, targets, variant: Variant):
 
 
 def baseline(states, table, targets, variant: Variant):
-    logits = head_logits(states, table.T, softcap=variant.softcap, precision=None)
+    logits = OutputTable(table.T, vocab_major=False, softcap=variant.softcap).logits(states)
     log_z = jax.nn.logsumexp(logits, axis=-1)
     picked = jnp.take_along_axis(logits, targets[..., None], axis=-1)[..., 0]
     return finish(log_z - picked, jnp.argmax(logits, axis=-1), log_z, targets, variant)
@@ -103,7 +100,7 @@ def retained(states, table, targets, variant: Variant):
     predicted = jnp.zeros(labels.shape, jnp.int32)
 
     def tile(hidden, matrix, column):
-        logits = head_logits(hidden, matrix, softcap=variant.softcap, precision=None)
+        logits = OutputTable(matrix, vocab_major=False, softcap=variant.softcap).logits(hidden)
         picked = jnp.take_along_axis(logits, column[:, None], axis=-1)[:, 0]
         return (
             jax.nn.logsumexp(logits, axis=-1),

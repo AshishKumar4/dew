@@ -1038,7 +1038,7 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
 
         `scores` is `token_scores` over `tokens`, `[B, S + 1]`, and the result is
         `[B, S]`. At unit temperature without `support`, that is the raw policy,
-        `-scores.losses`. `temperature` divides the capped logits (`head_logits`).
+        `-scores.losses`. `temperature` divides the capped logits (`OutputTable.logits`).
         `support` is the per-row ragged `(ids, columns)` pair that `sessions.pack`
         builds, each `[B, C]`, where `columns` is the column in `tokens` of the id
         each kept id belongs to; a target with entries is renormalized over them

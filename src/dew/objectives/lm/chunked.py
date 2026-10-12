@@ -43,7 +43,15 @@ from flax.typing import PrecisionLike
 from jax.sharding import PartitionSpec as P
 
 from dew.nn.kernels.generation import device_generation
-from dew.nn.precision import at_least_fp32, head_product, rounded_operand, rounded_to, rounds_to_bf16
+from dew.nn.precision import (
+    at_least_fp32,
+    biased_logits,
+    capped_logits,
+    head_product,
+    rounded_operand,
+    rounded_to,
+    rounds_to_bf16,
+)
 from dew.nn.protocols import AffineHead, HiddenStates, LogitsFromHidden, OutputTable
 from dew.nn.sharding import logical_spec, mesh_axes
 
@@ -96,20 +104,6 @@ def _logits_cotangent(cotangent, precision: jax.lax.PrecisionLike):
     return cotangent.astype(jnp.bfloat16) if precision is BF16 else cotangent
 
 
-def _capped(logits, softcap, temperature: float = 1.0):
-    """Softcapped logits over a sampling temperature, which an engine applies
-    to what the model's head returns."""
-    if softcap is not None:
-        cap = jnp.asarray(softcap, logits.dtype)
-        logits = cap * jnp.tanh(logits / cap)
-    return logits / temperature
-
-
-def _biased_logits(logits, bias):
-    """The vocabulary bias after the product's rounding, in fp32 or wider."""
-    return logits if bias is None else logits + jnp.asarray(bias, logits.dtype)
-
-
 def head_table(model: nn.Module, variables) -> OutputTable | None:
     """`model`'s head over `variables` as one matrix (`AffineHead.output_table`),
     or None for a model whose head no matrix alone is, or that names none."""
@@ -130,27 +124,12 @@ def reads_states(model) -> bool:
 
 def model_logits(model, variables, hidden) -> jax.Array:
     """`model`'s logits of its final states `hidden` over `variables`: the
-    matrix `AffineHead.output_table` gives, contracted as the chunked head
-    contracts it (`head_logits`), or the model's exact head
+    matrix `AffineHead.output_table` gives (`OutputTable.logits`), or the model's exact head
     (`LogitsFromHidden`) where no matrix alone is the head."""
     table = head_table(model, variables)
     if table is None:
         return model.apply(variables, hidden, method="logits_from_hidden")
-    return head_logits(hidden, table.matrix, softcap=table.softcap, precision=table.precision,
-                       vocab_major=table.vocab_major, bias=table.bias)
-
-
-def head_logits(hidden, head_weight, *, softcap: float | None,
-                precision: PrecisionLike, vocab_major: bool = False,
-                temperature: float = 1.0, bias=None) -> jax.Array:
-    """`hidden @ head_weight` as the model's forward scores it: the states
-    against the `[features, vocab]` head (`[vocab, features]` with
-    `vocab_major`), accumulated in fp32, softcapped when the backbone caps;
-    `[..., vocab]` fp32. The product follows the states' dtype
-    (`dew.nn.precision.head_product`)."""
-    logits = head_product('...d,vd->...v' if vocab_major else '...d,dv->...v',
-                           hidden, head_weight, precision)
-    return _capped(_biased_logits(logits, bias), softcap, temperature)
+    return table.logits(hidden)
 
 
 def _without(logits, first, excluded):
@@ -227,7 +206,7 @@ def _chunk_terms(hidden, head_chunk, targets, start: int, stop: int,
                  softcap: float | None, precision: jax.lax.PrecisionLike,
                  predict: bool, temperature: float, excluded, bias=None) -> _ChunkTerms:
     """One tile's `_ChunkTerms`."""
-    logits = _without(_capped(_biased_logits(_tile_logits(hidden, head_chunk, precision), bias),
+    logits = _without(capped_logits(biased_logits(_tile_logits(hidden, head_chunk, precision), bias),
                               softcap, temperature), start, excluded)
 
     inside = (targets >= start) & (targets < stop)
@@ -364,8 +343,8 @@ def _bounded_head_bwd(chunks, tile, precision, predict, temperature, residuals, 
             token_partition = jax.lax.dynamic_slice_in_dim(d_partition, start, size)
 
             logits, pullback = jax.vjp(
-                lambda raw, cap: _capped(raw, cap, temperature),
-                _biased_logits(_tile_logits(states, matrix, precision), bias_tile), softcap)
+                lambda raw, cap: capped_logits(raw, cap, temperature),
+                biased_logits(_tile_logits(states, matrix, precision), bias_tile), softcap)
             # The maximum and the sum are the whole row's, so a tile's share of
             # the softmax needs no renormalisation, and a target outside the
             # tile one-hots to zero rather than to a wrapped column.
@@ -433,8 +412,8 @@ def _whole_head_terms(hidden, table, targets, excluded, softcap, precision, pred
     operands = _operand_dtype(precision, at_least_fp32(hidden.dtype))
     flat = hidden.reshape(-1, table.shape[1]).astype(operands)
     labels = targets.reshape(-1)
-    raw = _biased_logits(_tile_logits(flat, table.astype(operands), precision), bias)
-    logits = _without(_capped(raw, softcap, temperature), 0, excluded)
+    raw = biased_logits(_tile_logits(flat, table.astype(operands), precision), bias)
+    logits = _without(capped_logits(raw, softcap, temperature), 0, excluded)
     log_z, top, _ = _row_terms(logits, predict)
     # A target outside the vocabulary picks no column, as in `_chunk_terms`:
     # the vocabulary-split head shifts each shard's targets by its first row
@@ -474,7 +453,7 @@ def _whole_head_bwd(chunks, precision, predict, temperature, residuals, cotangen
     operands = _operand_dtype(precision, work)
     features = table.shape[1]
     d_loss, d_partition = loss_cotangent.reshape(-1), partition_cotangent.reshape(-1)
-    logits, pullback = jax.vjp(lambda raw, cap: _capped(raw, cap, temperature), raw, softcap)
+    logits, pullback = jax.vjp(lambda raw, cap: capped_logits(raw, cap, temperature), raw, softcap)
     probabilities = jnp.exp(_without(logits, 0, excluded) - log_z.reshape(-1)[:, None])
     selected = jax.nn.one_hot(targets.reshape(-1), table.shape[0], dtype=work)
     d_raw, d_cap = pullback((d_loss + d_partition)[:, None] * probabilities
@@ -578,7 +557,7 @@ def chunked_cross_entropy(hidden, head_weight, targets, chunks: int, *,
     instead of recomputing them, which is faster wherever they fit: on one
     A100, Qwen3-0.6B's head at 4096 tokens took 33.1 ms with the logits
     held, at 4.6 GiB, against 60.2 ms tiled (`LMObjective.head_tile`).
-    `temperature` divides the capped logits (`head_logits`), which
+    `temperature` divides the capped logits (`OutputTable.logits`), which
     scores the draws of a sampler at that temperature. `excluded` is a
     column the distribution gives no mass, left out of the partition and the
     prediction in every tile: a masked diffusion model's mask token, which
@@ -629,7 +608,7 @@ def chunked_cross_entropy(hidden, head_weight, targets, chunks: int, *,
         operands = _operand_dtype(effective, at_least_fp32(states.dtype))
         logits = jax.vmap(lambda state, row: _tile_logits(
             state[None].astype(operands), row[None], effective)[0, 0])(states, rows)
-        return _capped(_biased_logits(logits, bias), cap, temperature)
+        return capped_logits(biased_logits(logits, bias), cap, temperature)
 
     left_out = None if excluded is None else jnp.asarray(excluded, jnp.int32)
     mesh = jax.sharding.get_abstract_mesh()
@@ -817,7 +796,7 @@ def support_log_probs(hidden, head_weight, targets, support_ids, support_columns
         state = jnp.take_along_axis(hidden, jnp.maximum(owner, 0)[..., None], axis=1)
         # The full head's product (`head_product`), over the kept rows only.
         logits = head_product('bcd,bcd->bc', state, table[jnp.maximum(chosen, 0)], precision)
-        return _capped(_biased_logits(logits, None if bias is None else bias[jnp.maximum(chosen, 0)]),
+        return capped_logits(biased_logits(logits, None if bias is None else bias[jnp.maximum(chosen, 0)]),
                        softcap, temperature)
 
     pieces = (
