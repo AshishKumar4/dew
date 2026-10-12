@@ -283,6 +283,18 @@ class Plan:
             "exact": self.manifest.exact,
         }
 
+    def identity(self) -> str:
+        """What every process of a pool reads, which the pool agrees before any
+        reads: the order, as a reader can follow it, then a digest of the rest
+        of the plan but its environment and the share this process reads,
+        which only the position it saves keeps."""
+        recorded = self.record()
+        del recorded["environment"]
+        recorded["topology"] = json_value(
+            {name: value for name, value in self.topology.items() if name != "share"}, "topology"
+        )
+        return f"{json.dumps(recorded['order'], sort_keys=True)} under plan {fingerprint(recorded)}"
+
     def check(
         self, saved: Mapping[str, object], *, resume: Literal["exact", "non-exact"] = "exact"
     ) -> tuple[str, ...]:

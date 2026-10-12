@@ -990,9 +990,10 @@ class GlobalStream:
     stream restored before it is read does not start its workers twice.
 
     The offset alone would resume that many records into whatever order the
-    run now has, so `order` is saved with it and a restore whose order
-    disagrees is refused. `dew.position` defines the format that both this
-    class and `dew.checkpoints` read.
+    run now has, so the plan's order (`order`) and the plan are saved with
+    it and a restore whose plan disagrees is refused (`Plan.check`).
+    `dew.position` defines the format that both this class and
+    `dew.checkpoints` read.
     """
 
     endless = True
@@ -1001,17 +1002,16 @@ class GlobalStream:
         self,
         open_at: Callable[[int], pygrain.DatasetIterator[Batch]],
         batch: int,
-        order: str,
+        plan: Plan,
         loading: Loading,
         *,
-        plan: Plan | None = None,
         resume: Literal["exact", "non-exact"] = "exact",
         endless: bool = True,
     ):
         self._open = open_at
         self.endless = endless
         self._batch = batch
-        self._order = order
+        self._order = json.dumps(plan.order, sort_keys=True)
         self._records = 0
         self._reads: pygrain.DatasetIterator[Batch] | None = None
         self._loading = loading
@@ -1037,7 +1037,7 @@ class GlobalStream:
             position.Global(
                 records=self._records,
                 order=self._order,
-                plan=None if self._plan is None else self._plan.record(),
+                plan=self._plan.record(),
             )
         )
 
@@ -1051,15 +1051,15 @@ class GlobalStream:
         return self._order
 
     def identity(self) -> str:
-        """The order, which a pool agrees before it reads. A compiled order
-        names each corpus by its source's description (`Source.describe`), so
-        hosts whose copies of a corpus describe themselves differently are
-        refused."""
-        return self._order
+        """The plan's identity (`Plan.identity`), which a pool agrees before it
+        reads: hosts whose copies of a corpus hold other records, or whose
+        steps make other values, are refused however the sources describe
+        themselves."""
+        return self._plan.identity()
 
     def set_state(self, state: bytes) -> None:
         saved = position.read(state)
-        if self._plan is not None and saved.plan is not None:
+        if saved.plan is not None:
             self.manifest_changes = self._plan.check(saved.plan, resume=self._resume)
         if saved.completed:
             raise ValueError(

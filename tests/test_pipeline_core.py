@@ -475,6 +475,21 @@ def test_shares_agree_on_one_identity_and_resume_only_their_own_rows():
         second.close()
 
 
+def test_a_plan_identity_is_its_rows_on_any_host_and_share():
+    """A pool agrees on the plan's identity: processes that read other shares
+    of the same rows with other code agree, and processes whose source holds
+    other rows do not."""
+    manifest = Manifest({"rows": "one"}, revision="before")
+    plan = Plan("per-share", manifest, {"seed": 0}, topology={"shares": 2, "share": 0})
+    elsewhere = dataclasses.replace(
+        plan,
+        manifest=dataclasses.replace(manifest, revision="after", platform="another host"),
+        topology={"shares": 2, "share": 1},
+    )
+    other = dataclasses.replace(plan, manifest=dataclasses.replace(manifest, source={"rows": "two"}))
+    assert elsewhere.identity() == plan.identity() != other.identity()
+
+
 def test_a_memory_read_counts_a_missing_row_alike_with_or_without_a_cache():
     """A row the source holds as None is left out and counted missing,
     whether the memory read fills a cache with it or not."""

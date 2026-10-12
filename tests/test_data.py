@@ -42,6 +42,7 @@ from dew.data import (
 from dew.data.compile import validation
 from dew.data.dataset import Forwarding, GlobalStream, Records as IndexedRows, SourceSlice, describe
 from dew.data.image_codec import decode_image
+from dew.data.plan import Manifest, Plan
 from dew.data.sinks import export
 from dew.data.sources import Torch, av_utils, source as stored_source
 from dew.data.sources.av_utils import choose_clip_start
@@ -997,7 +998,7 @@ def test_a_stop_closes_grain_when_no_thread_can_announce_it(monkeypatch):
         def close(self):
             closed.append(True)
 
-    stream = GlobalStream(lambda offset: Reads(), 1, "one order", Loading(workers=2))
+    stream = GlobalStream(lambda offset: Reads(), 1, Plan("global", Manifest({}), {}), Loading(workers=2))
     next(stream)
     stream.close()
     assert closed == [True]

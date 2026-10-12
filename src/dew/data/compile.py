@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import dataclasses
 import functools
-import json
 from collections.abc import Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from typing import Literal, Protocol, runtime_checkable
@@ -640,9 +639,8 @@ def _training_reader(
         opened = GlobalStream(
             functools.partial(build.batches, pipeline, partition),
             build.batch,
-            json.dumps(plan.order, sort_keys=True),
+            plan,
             build.loading,
-            plan=plan,
             resume=resume,
             endless=build.lowering.endless,
         )
