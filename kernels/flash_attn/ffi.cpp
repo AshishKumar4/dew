@@ -6,6 +6,9 @@
 
 namespace ffi = xla::ffi;
 
+// The CUDA architectures the library holds code for, CMake's list joined by commas ("80-real,120-real").
+extern "C" const char* dew_flash_architectures() { return DEW_FLASH_ARCHITECTURES; }
+
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
     dew_flash_mha_fwd, mha_fwd_impl,
     ffi::Ffi::Bind()
