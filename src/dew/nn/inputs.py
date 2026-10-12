@@ -307,7 +307,7 @@ class LayerInputs:
     from a bank one layer at a time, or runs as a pipeline stage. `embeddings`
     is Gemma 3n/4's per-layer input signal. `experts` and `routed` are a
     routing replay's `[..., top_k]` expert ids and coverage
-    (`dew.nn.moe.Routes`), with `routed` broadcast over the layer axis.
+    (`dew.nn.protocols.Routes`), with `routed` broadcast over the layer axis.
     """
 
     embeddings: jax.Array | None = None
