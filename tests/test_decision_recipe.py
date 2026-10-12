@@ -109,7 +109,8 @@ def test_a_decision_mixture_from_its_manifest_reads_by_index_by_default(tmp_path
 
 def _flags(mixture: Path, runs: Path) -> list[str]:
     return ["--data.source", str(mixture), "--trainer.name", "run", "--trainer.checkpoint-dir", str(runs),
-            "--trainer.batch-size", "8", "--trainer.steps", "2", "--trainer.eval-every", "2",
+            "--trainer.batch-size", "8", "--trainer.batch-tokens", "None", "--trainer.update-tokens", "None",
+            "--trainer.steps", "2", "--trainer.eval-every", "2",
             "--trainer.checkpoint-every", "2", "--trainer.log-every", "1", "--trainer.multi-host", "False",
             "--trainer.compilation-cache-dir", "None", "--loading.workers", "0",
             "--model.dtype", "float32", "--optim.schedule.warmup-steps", "1", "--revision", "None"]
@@ -245,8 +246,9 @@ def test_the_clef_recipe_trains_a_joint_head_under_lora_on_a_frozen_decoder(tmp_
     storage = [] if param_dtype == "float32" else ["--param-dtype", param_dtype]
     flags = _flags(mixture, tmp_path / "runs")
     flags[flags.index("--trainer.batch-size") + 1] = "None"
-    flags[:0] = ["--data-read", "memory", "--trainer.batch-tokens", "8192",
-                "--trainer.update-tokens", "8192"]
+    flags[flags.index("--trainer.batch-tokens") + 1] = "8192"
+    flags[flags.index("--trainer.update-tokens") + 1] = "8192"
+    flags[:0] = ["--data-read", "memory"]
     config = DecisionRunConfig.cli([*flags, "--pretrained", str(QWEN),
                                     "--lora.rank", "4", "--head.width", "24", "--head.heads", "2",
                                     "--head.feedforward", "40", "--head.layers", "1",
