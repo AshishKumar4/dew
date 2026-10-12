@@ -30,6 +30,7 @@ import test_multiprocess as single  # noqa: E402
 from process_support import report_of, spawn, terminate, worker_env  # noqa: E402
 from test_multiprocess import (  # noqa: E402, F401
     local_flags,
+    test_a_real_token_budget_agrees_across_processes_after_logging_ticks,
     test_a_default_run_name_takes_its_timestamp_from_process_zero,
     test_four_processes_build_the_same_mesh_as_two,
     test_processes_read_disjoint_shards_that_cover_the_corpus,
