@@ -15,6 +15,7 @@ checkpoint that torch_qwen35_step --smoke --smoke-fixture DIR exported.
 """
 
 import argparse
+import dataclasses
 import importlib.metadata
 import os
 import statistics
@@ -25,9 +26,11 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from common import git_head, host, peak_flops, throughput, write_record
-from qwen35 import FLOPS_FORMULA, FLOPS_PER_STEP, MODEL, REVISION, WHOLE_PEAK_SCOPE, inputs, workload
+from qwen35 import MODEL, REVISION, WHOLE_PEAK_SCOPE, inputs, workload
+from work import measure
 
 from dew.config import OptimConfig
+from dew.inputs import Field, InputSpec
 from dew.interop import Pretrained
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.multimodal import MultimodalTransformer
@@ -45,10 +48,18 @@ class BackboneLoss(Objective):
     outputs are widened before squaring, exactly like torch's autocast linear.
     """
 
-    def __init__(self, model, variables, projection):
+    def __init__(self, model, variables, projection, sequence):
         self.model = model
         self.variables = variables
         self.projection = projection
+        self.inputs = InputSpec(sample=Field("tokens", (sequence,)))
+
+    counts_tokens = True
+
+    def real_lengths(self, batch):
+        """The hidden-state loss sees each complete, unpadded input row."""
+        rows, sequence = np.shape(batch["tokens"])
+        return np.full((rows,), sequence, np.int64)
 
     def loss(self, variables, batch, step):
         hidden = self.model.apply(variables, batch["tokens"], train=step.training,
@@ -60,6 +71,7 @@ class BackboneLoss(Objective):
 def arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", default="dew-qwen35-step.json")
+    parser.add_argument("--work", required=True, help="write the native count for this backbone workload")
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--smoke-fixture", type=Path)
     parser.add_argument("--warmup", type=int, default=20)
@@ -74,6 +86,20 @@ def arguments() -> argparse.Namespace:
     return args
 
 
+def backbone(source, revision: str | None, dtype: str):
+    """The unrematerialized text backbone of `source` through the recipe's loader: what this
+    runner trains, and what work.py counts for the full workload."""
+    bundle = Pretrained.load(source, revision=revision, dtype=dtype, param_dtype="float32")
+    model, variables = bundle.model, bundle.variables
+    if isinstance(model, MultimodalTransformer):
+        model = model.language_model
+        variables = {collection: tree["language_model"] for collection, tree in variables.items()
+                     if "language_model" in tree}
+    if not isinstance(model, CausalTransformer) or not model.tie_embeddings:
+        raise RuntimeError("expected the tied-embedding Qwen3.5 text backbone")
+    return model.clone(remat=None), variables
+
+
 def build(args):
     """Load through the recipe's loader and compile the real, unrematted trainer step."""
     if jax.device_count() != 1:
@@ -85,20 +111,13 @@ def build(args):
         raise RuntimeError(f"full reference requires A100-SXM4-80GB, found {device.device_kind}")
     if args.smoke:
         jax.config.update("jax_default_matmul_precision", "highest")
-    bundle = Pretrained.load(args.smoke_fixture if args.smoke else MODEL,
-                             revision=None if args.smoke else REVISION,
-                             dtype="float32" if args.smoke else "bfloat16", param_dtype="float32")
-    model, variables = bundle.model, bundle.variables
-    if isinstance(model, MultimodalTransformer):
-        model = model.language_model
-        variables = {collection: tree["language_model"] for collection, tree in variables.items()
-                     if "language_model" in tree}
-    if not isinstance(model, CausalTransformer) or not model.tie_embeddings:
-        raise RuntimeError("expected the tied-embedding Qwen3.5 text backbone")
-    model = model.clone(remat=None)
+    model, variables = (backbone(args.smoke_fixture, None, "float32") if args.smoke
+                        else backbone(MODEL, REVISION, "bfloat16"))
     batch, sequence = (2, 16) if args.smoke else (8, 3072)
     rows, projection = inputs(args.seed, model.vocab_size, model.emb_features, batch, sequence)
-    objective = BackboneLoss(model, variables, projection)
+    objective = BackboneLoss(model, variables, projection, sequence)
+    work = measure(objective, {"tokens": rows})
+    work.write(args.work)
     solver = OptimConfig(optimizer="adamw", b1=0.9, b2=0.999, optimizer_opts={"eps": 1e-8},
                           weight_decay=1e-4, clip_grads=0.0, state_dtype="float32",
                           schedule=Cosine(init=0.0, peak=2.5e-5, warmup_steps=10, end=0.0)).build(220)
@@ -111,7 +130,7 @@ def build(args):
     compile_seconds = time.perf_counter() - started
     if objective.model.remat is not None or trainer.host_master:
         raise RuntimeError("fit ladder changed the matched no-checkpointing, device-resident workload")
-    return trainer, state, compiled, placed, compile_seconds
+    return trainer, state, compiled, placed, compile_seconds, work
 
 
 def train(args, trainer, state, compiled, batch):
@@ -160,7 +179,7 @@ def train(args, trainer, state, compiled, batch):
 
 def run(args) -> dict:
     prepare_process(multi_host=False)
-    trainer, state, compiled, batch, compile_seconds = build(args)
+    trainer, state, compiled, batch, compile_seconds, work = build(args)
     seconds, peak_bytes, samples, checks = train(args, trainer, state, compiled, batch)
     rows, sequence = batch["tokens"].shape
     model = trainer.objective.model
@@ -170,6 +189,7 @@ def run(args) -> dict:
     timed = throughput(seconds, args.steps, rows * sequence, samples)
     record = {
         "schema": "dew.attribution.torch-reference.v1", "framework": "dew", "smoke": args.smoke,
+        "work": dataclasses.asdict(work),
         "session": args.session, "commit": git_head(Path.cwd()),
         "script_commit": git_head(Path(__file__).resolve().parents[2]), "host": host(),
         "environment": {"device": device_name,
@@ -183,8 +203,9 @@ def run(args) -> dict:
                    "parameter_count": checks["parameter_count"], "compile_backend": "Trainer / XLA"},
         "steady": {**timed, "window_tokens_per_s": timed["tokens_per_s"], "step_ms": median * 1000,
                    "tokens_per_s": rows * sequence / median,
-                   "mfu": None if peak is None else FLOPS_PER_STEP / median / peak,
-                   "window_mfu": None if peak is None else FLOPS_PER_STEP / (seconds / args.steps) / peak,
+                   "mfu": None if peak is None else work.training_flops_per_step / median / peak,
+                   "window_mfu": None if peak is None else work.training_flops_per_step
+                       / (seconds / args.steps) / peak,
                    "step_ms_samples": [sample * 1000 for sample in samples],
                    "samples_scope": "diagnostic synchronized pass after timing; not gate samples"},
         "memory": {"whole_peak_bytes": peak_bytes, "whole_peak_scope": WHOLE_PEAK_SCOPE,
@@ -193,8 +214,8 @@ def run(args) -> dict:
                    "peak_allocated_gib": None if peak_bytes is None else peak_bytes / 2**30,
                    "scope": WHOLE_PEAK_SCOPE},
         "time": {"compile_seconds": compile_seconds,
-                 "model_flops_per_step": None if args.smoke else FLOPS_PER_STEP,
-                 "flops_formula": FLOPS_FORMULA},
+                 "model_flops_per_step": work.training_flops_per_step,
+                 "flops_formula": work.basis},
         "checks": checks,
     }
     write_record(args.out, record)

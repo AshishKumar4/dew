@@ -60,8 +60,9 @@ def compare(records: dict[str, list[dict]], session: str, smoke: bool) -> dict:
     geometry = tuple(config[key] for key in ("vocab", "hidden", "batch", "sequence", "warmup", "steps"))
     if not smoke and geometry != (248320, 1024, 8, 3072, 20, 200):
         raise ValueError("the claim requires the full 8x3072, 20-warmup/200-step Qwen3.5 workload")
-    expected = workload(config["seed"], config["vocab"], config["hidden"], config["batch"],
-                        config["sequence"], smoke, config["warmup"], config["steps"])
+    expected = {**workload(config["seed"], config["vocab"], config["hidden"], config["batch"],
+                          config["sequence"], smoke, config["warmup"], config["steps"]),
+                "work": reference["work"]}
     for framework, rounds in records.items():
         for record in rounds:
             if record["framework"] != framework or record["session"] != session or record["smoke"] != smoke:
@@ -77,7 +78,7 @@ def compare(records: dict[str, list[dict]], session: str, smoke: bool) -> dict:
             if record["environment"]["device"] != reference["environment"]["device"]:
                 raise ValueError("records did not run on the same device kind")
             for field, value in expected.items():
-                if record["config"].get(field) != value:
+                if {**record["config"], "work": record["work"]}.get(field) != value:
                     raise ValueError(f"unmatched workload field {field}")
             if record["config"]["parameter_count"] != config["parameter_count"]:
                 raise ValueError("unmatched backbone parameter count")
@@ -139,6 +140,14 @@ def run(args) -> int:
               "commit": git_head(root), "host": host(), "started_ns": time.time_ns(),
               "records": records, "commands": [], "comparison": None}
     write_record(args.out, result)
+    environment = {**os.environ, "PYTHONPATH": str(root / "src")}
+    work = directory / "work.json"
+    command = [args.dew_python, str(Path(__file__).resolve().with_name("work.py")), "qwen35",
+               "--out", str(work)]
+    if args.smoke:
+        command += ["--smoke", "--dtype", "float32"]
+    counted = subprocess.run(command, cwd=root, env=environment, check=True)
+    result["commands"].append({"argv": command, "returncode": counted.returncode})
     for round_ in range(args.rounds):
         for framework in ("torch", "dew"):
             out = directory / f"{round_}-{framework}.json"
@@ -147,11 +156,10 @@ def run(args) -> int:
                 script = Path(__file__).resolve().with_name(script.name)
             command = [args.torch_python if framework == "torch" else args.dew_python,
                        str(script),
-                       "--out", str(out), "--seed", str(args.seed), "--session", session]
+                       "--out", str(out), "--work", str(work), "--seed", str(args.seed), "--session", session]
             if args.smoke:
                 command += ["--smoke", "--smoke-fixture", str(directory / f"tiny-{round_}"),
                             "--warmup", "3", "--steps", "4"]
-            environment = {**os.environ, "PYTHONPATH": str(root / "src")}
             done = subprocess.run(command, cwd=root, env=environment, check=False)
             result["commands"].append({"argv": command, "returncode": done.returncode})
             if done.returncode:
