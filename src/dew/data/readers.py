@@ -25,7 +25,7 @@ from dew.data.dataset import (
     _window_order,
     rows_of,
 )
-from dew.data.mix import CorpusCounts, state_counts
+from dew.data.mixing import CorpusCounts, state_counts
 from dew.data.pipeline import HostStep
 from dew.data.plan import Plan
 from dew.records import integer, record

@@ -52,7 +52,7 @@ from dew.data.dataset import (
 )
 from dew.data.lowering import _as_iter, _Build, _epoch_records, _Locality, _split_spans, _workers
 from dew.data.materialize import _materialize, _Memory
-from dew.data.mix import CorpusCounts, SearchBudget
+from dew.data.mixing import CorpusCounts, SearchBudget
 from dew.data.pipeline import (
     Artifact,
     BatchStage,

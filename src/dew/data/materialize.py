@@ -25,7 +25,7 @@ import numpy as np
 from dew.data.analysis import _analyzed, _identity, _name
 from dew.data.dataset import Batch, LengthGroups, Records
 from dew.data.lowering import _CachedOutputs, _fill, _Locality, _outputs, _packed, _Payload, _TokenSplit
-from dew.data.mix import CorpusCounts
+from dew.data.mixing import CorpusCounts
 from dew.data.pipeline import (
     FlatMap,
     Group,

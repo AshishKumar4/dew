@@ -40,7 +40,7 @@ from dew.data.analysis import (
     _until,
 )
 from dew.data.dataset import Batch, DataPartition, FilledBatch, Loading, Records, _Grouped, stacked
-from dew.data.mix import Accepted, PrimedMix, SearchBudget, TokenDeficit, primed_maps, token_weights
+from dew.data.mixing import Accepted, PrimedMix, SearchBudget, TokenDeficit, primed_maps, token_weights
 from dew.data.pipeline import (
     Artifact,
     BatchStage,
