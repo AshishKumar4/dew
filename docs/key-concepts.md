@@ -16,7 +16,8 @@ A Dew training run is built from four objects, each responsible for one part of 
 This trains a small decoder on one repeated sentence and generates from it. It downloads nothing and runs on a CPU.
 
 ```python
-from dew.data import Loading, Records, load
+from dew.data import Loading
+from dew.config.data import RecordsData, loader
 import jax
 import numpy as np
 
@@ -30,7 +31,7 @@ from dew.sampling import Sampling, generate
 tokenizer = ByteTokenizer()
 text = tokenizer.encode("dew trains jax models. " * 3)
 rows = np.tile(np.asarray(text[:65], np.int32), (8, 1))
-data = load(Records(source={"text": rows}), batch=8, read="memory", loading=Loading(workers=0))
+data = loader(RecordsData(source={"text": rows}), batch=8, read="memory", loading=Loading(workers=0))
 
 model = CausalTransformer(
     vocab_size=tokenizer.vocab_size,

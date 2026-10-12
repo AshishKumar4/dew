@@ -64,7 +64,8 @@ def report(out: str, line: dict) -> None:
 
 
 def main(options: Options) -> None:
-    from dew.data import HoldOut, Hub, load
+    from dew.data import Hub
+    from dew.config.data import HoldOut, loader
     from dew.data.compile import iterate
 
     table = Decisions(source=Hub(BANKING77[0], revision=BANKING77[1]), label="label_text", question="intent",
@@ -93,7 +94,7 @@ def main(options: Options) -> None:
         layout = StateFirstLayout(max_len=512, head_max_len=448, option_tokens=12)
         objective = DecisionObjective(qwen, loss=LogLoss() + 0.5 * Brier(), layout=layout)
 
-    data = load(Decisions(source=train, validation=held_out[:options.batch * 8]), batch=options.batch,
+    data = loader(Decisions(source=train, validation=held_out[:options.batch * 8]), batch=options.batch,
                 read="memory", objective=objective.data())
     checkpoints = Checkpoints(options.run, keep=1)
     state = Trainer(objective, OptimConfig(learning_rate=options.learning_rate), key=0,

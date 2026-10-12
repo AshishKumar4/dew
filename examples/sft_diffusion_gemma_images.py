@@ -5,7 +5,7 @@
 
 This trains a fresh DiffusionGemma, a byte-vocabulary text stack with a small
 Gemma 4 vision tower, with `BlockDiffusionObjective`, the published
-DiffusionGemma SFT loss. It starts from random weights; it does not load or
+DiffusionGemma SFT loss. It starts from random weights; it does not loader or
 fine-tune the released 26B-A4B checkpoint. Flowers has class labels rather
 than human captions, so each target is "a photo of a <class name>". The image
 sits in the clean prompt as placeholder slots that the vision tower's
@@ -34,7 +34,9 @@ import tyro
 
 import dew
 from dew.config import ModelConfig, ObjectiveConfig, OptimConfig, RunConfig, TrainerConfig
-from dew.data import Augment, ByteTokenizer, DataPartition, Files, Images, Loading, load
+from dew.data import ByteTokenizer, Files, Loading
+from dew.config.data import Augment, ImageData, loader
+from dew.data.dataset import DataPartition
 from dew.interop.diffusion_gemma import build
 from dew.nn.inputs import ModelInputs
 from dew.objectives.base import VALID_ROWS
@@ -201,7 +203,7 @@ def main(config: Config) -> Path:
     # Train on train + validation, score on test, which the run never reads.
     import pyarrow.parquet as pq
 
-    spec = Images(source=Files((files["train"], files["validation"]), format="parquet"),
+    spec = ImageData(source=Files((files["train"], files["validation"]), format="parquet"),
                   validation=Files(files["test"], format="parquet"), caption_columns=(),
                   image_size=config.image_size, staging_size=config.staging_size,
                   augment=Augment(flip=True, crop_scale=(0.6, 1.0)))
@@ -229,7 +231,7 @@ def main(config: Config) -> Path:
     prepare_process(run.trainer.wandb, run.trainer.multi_host, run.trainer.xla_flags,
                     run.trainer.compilation_cache_dir, layout=run.trainer.layout)
     objective = run.objective.build(model=model)
-    data = load(spec, batch=run.trainer.batch_size, read="memory", loading=run.loading,
+    data = loader(spec, batch=run.trainer.batch_size, read="memory", loading=run.loading,
                 host=(CaptionLayout(config, labels),))
     started = time.perf_counter()
     name = "flowers-caption"

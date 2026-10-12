@@ -187,12 +187,13 @@ The script prints the prepared version directory. Run that export line in the tr
 <!-- not run: needs the prepared TFDS directory the script above writes -->
 ```python
 import os
-from dew.data import Augment, HoldOut, Images, Loading, TFDS, load
+from dew.data import Loading, TFDS
+from dew.config.data import Augment, HoldOut, ImageData, loader
 
-recipe = Images(source=TFDS("oxford_flowers102", split="all", path=os.environ["DEW_FLOWERS_PATH"]),
+recipe = ImageData(source=TFDS("oxford_flowers102", split="all", path=os.environ["DEW_FLOWERS_PATH"]),
                 image_size=64, caption_templates=("a photo of a {}",),
                 augment=Augment(flip=True, jitter=True), validation=HoldOut(records=16))
-data = load(recipe, batch=4, read="memory", loading=Loading(workers=0))
+data = loader(recipe, batch=4, read="memory", loading=Loading(workers=0))
 ```
 
 For a run's CLI, --data.source accepts the JSON record of that TFDS value (class dew.data.sources.tfds:TFDS, fields name/path/split). Images uses TFDS's class-label metadata for its caption templates; labels names an explicit alternative label file. Missing shards are named errors. Non-local, non-GCS TFDS stores currently require an explicit local provision mirror; they are not silently materialized.

@@ -35,7 +35,9 @@ from PIL import Image
 import dew
 from dew.artifacts import uint8_pixels
 from dew.config import ModelConfig, ObjectiveConfig, OptimConfig, TrainerConfig
-from dew.data import TFDS, Augment, DataPartition, Files, HoldOut, Images, Loading, load
+from dew.data import TFDS, Files, Loading
+from dew.config.data import Augment, HoldOut, ImageData, loader
+from dew.data.dataset import DataPartition
 from dew.data.sources.codec import pack_dict_of_byte_arrays
 from dew.data.steps.image import EncodeCaptions
 from dew.diffusion.presets import EDM
@@ -109,7 +111,7 @@ def smoke_config(config: Config, out: Path) -> DiffusionRunConfig:
     return DiffusionRunConfig(
         model=ModelConfig.from_model(SimpleDiT(patch_size=4, emb_features=32, num_layers=1, num_heads=2,
                                                dtype=jnp.float32)),
-        data=Images(source=Files(str(out / "data" / "*.array_record"), format="array_record"),
+        data=ImageData(source=Files(str(out / "data" / "*.array_record"), format="array_record"),
                     image_size=16, augment=None,
                     validation=HoldOut(records=4)),
         validation_records=4,
@@ -135,7 +137,7 @@ def slice_config(config: Config) -> DiffusionRunConfig:
         raise ValueError("--data is the prepared record directory; --smoke writes its own")
     path = str(config.data.expanduser())
     records = (config.data / "manifest.json").is_file() or (config.data / "_dew_manifest.json").is_file()
-    prepared = Images(source=Files(path, format="array_record") if records else
+    prepared = ImageData(source=Files(path, format="array_record") if records else
                       TFDS("oxford_flowers102", split="all", path=path),
                       caption_templates=() if records else ("a photo of a {}",),
                       augment=Augment(flip=True, jitter=True))
@@ -161,7 +163,7 @@ def slice_config(config: Config) -> DiffusionRunConfig:
 
 def held_out(run: DiffusionRunConfig) -> np.ndarray:
     """The uint8 images of the validation pass, which the run never trained on."""
-    data = load(run.data, batch=run.trainer.batch_size, read=run.data_read, loading=run.loading,
+    data = loader(run.data, batch=run.trainer.batch_size, read=run.data_read, loading=run.loading,
                 validation_records=run.validation_records)
     if data.val is None:
         raise ValueError("scoring FID needs an explicit validation source or HoldOut")
@@ -190,7 +192,7 @@ def main(config: Config) -> Path:
         run = replace(run, trainer=replace(run.trainer, mesh=MeshSpec(fsdp=jax.device_count())))
 
     objective = run.build()
-    data = load(run.data, batch=run.trainer.batch_size, read=run.data_read, loading=run.loading,
+    data = loader(run.data, batch=run.trainer.batch_size, read=run.data_read, loading=run.loading,
                 validation_records=run.validation_records, host=(EncodeCaptions(objective.inputs.tokenize),))
     name = "smoke" if config.smoke else f"flowers-{config.image_size}"
     run.train(objective, data, name=name, metrics=run.build_eval_metrics(),

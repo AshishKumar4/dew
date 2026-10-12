@@ -31,7 +31,7 @@ from dew.data.dataset import (
     DataPartition,
     Forwarding,
     GlobalStream,
-    RecordsData as IndexedRows,
+    Records as IndexedRows,
     SourceSlice,
     describe,
 )

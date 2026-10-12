@@ -41,7 +41,8 @@ import tyro
 import dew
 from dew.artifacts import uint8_pixels
 from dew.config import ModelConfig, OptimConfig, TrainerConfig
-from dew.data import ByteTokenizer, Loading, Text, load
+from dew.data import ByteTokenizer, Loading
+from dew.config.data import TextData, loader
 from dew.data.sources.files import TokenFiles
 from dew.eval import FID, CLIPScore
 from dew.inference import RunProcessor, TextGeneration, TextToImage
@@ -113,7 +114,7 @@ def smoke_run(out: Path) -> tuple[Path, Path]:
                               attention_impl="reference")
     run = LMRunConfig(
         model=ModelConfig.from_model(model),
-        data=Text(source=str(tokens), validation=TokenFiles(str(tokens), split="val"), seq_len=32),
+        data=TextData(source=str(tokens), validation=TokenFiles(str(tokens), split="val"), seq_len=32),
         loading=Loading(workers=0, threads=1, read_buffer=2, worker_buffer=1),
         max_new_tokens=8,
         optim=OptimConfig(learning_rate=1e-3),
@@ -122,7 +123,7 @@ def smoke_run(out: Path) -> tuple[Path, Path]:
                               multi_host=False, compilation_cache_dir=None))
     objective = LMObjective(model, run.data.seq_len, ema_decay=0.9,
                             processor=RunProcessor(ByteTokenizer()))
-    run.train(objective, load(run.data, batch=run.trainer.batch_size, read=run.data_read,
+    run.train(objective, loader(run.data, batch=run.trainer.batch_size, read=run.data_read,
         loading=run.loading), name="smoke")
     return Path(run.trainer.checkpoint_dir) / "smoke", tokens
 
@@ -136,7 +137,7 @@ def perplexity(task: TextGeneration, config: Config) -> dict[str, float]:
     """
     if config.tokens is None:
         return {}
-    data = load(Text(source=str(config.tokens), validation=TokenFiles(str(config.tokens), split="val"),
+    data = loader(TextData(source=str(config.tokens), validation=TokenFiles(str(config.tokens), split="val"),
                      seq_len=config.sequence_length),
                 batch=config.batch_size, read="memory", validation_records=4 * config.batch_size,
                 loading=Loading(workers=0))

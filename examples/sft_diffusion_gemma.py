@@ -9,7 +9,7 @@ fetching one layer at a time. The 26B-A4B base has not been run through it:
         --chat data/tulu-3-sft.parquet --steps 2000
 
 `--chat` is an `hf://` Hub dataset, a `.jsonl` file or a parquet file of
-conversations, which is what the `Chat` recipe reads and renders with the
+conversations, which is what the `ChatData` recipe reads and renders with the
 checkpoint's own chat template. The run writes the PEFT adapter directory
 `Adapter.save` produces, which transformers loads, then loads the base again
 through `dew.pipeline`, merges the adapter into it and writes the decoded
@@ -30,7 +30,8 @@ import tyro
 
 import dew
 from dew.config import OptimConfig
-from dew.data import Chat, Loading, load
+from dew.data import Loading
+from dew.config.data import ChatData, loader
 from dew.interop import PretrainedBlockDecoder
 from dew.lora import LoRA
 from dew.objectives.diffusion.block import BlockDiffusionObjective
@@ -105,7 +106,7 @@ def main(config: Config) -> Path:
 
     # A packed window is seq_len + 1 ids wide, and the objective reads rows of
     # exactly prompt + canvases: the spec is asked for one less.
-    data = load(Chat(tokenizer=tokenizer, source=config.chat, long="chunk",
+    data = loader(ChatData(tokenizer=tokenizer, source=config.chat, long="chunk",
                      seq_len=sequence_length - 1), batch=config.batch_size, read="memory",
                 loading=Loading(workers=0, threads=1, read_buffer=2, worker_buffer=1))
 

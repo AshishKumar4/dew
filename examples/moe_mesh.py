@@ -41,7 +41,9 @@ from jax.sharding import NamedSharding
 
 from dew import Layout, MeshSpec, Trainer
 from dew.config import OptimConfig
-from dew.data import ByteTokenizer, DataPartition, Loading, Text, load
+from dew.data import ByteTokenizer, Loading
+from dew.config.data import TextData, loader
+from dew.data.dataset import DataPartition
 from dew.inference import RunProcessor, TextGeneration
 from dew.inference.serving import Server
 from dew.nn.backbones import CausalTransformer, Mixture
@@ -216,7 +218,7 @@ def all_to_all_ops(hlo: str) -> tuple[int, str]:
 def main(config: Config) -> None:
     config.out.mkdir(parents=True)
     write_tokens(config.out / "tokens", config.seed)
-    data = load(Text(source=str(config.out / "tokens"), seq_len=config.sequence_length),
+    data = loader(TextData(source=str(config.out / "tokens"), seq_len=config.sequence_length),
                 batch=config.batch_size, read="memory", validation_records=config.batch_size,
                 loading=Loading(workers=0, threads=1, read_buffer=2))
     model = CausalTransformer(

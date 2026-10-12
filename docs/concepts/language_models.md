@@ -40,17 +40,18 @@ print(len(ids) - held_out, "training tokens,", held_out, "validation tokens")
 This small self-contained fixture uses native binary token stores: `train.bin` and `val.bin` hold the token IDs back to back, and `meta.json` records the tokenizer, vocabulary size, dtype and counts. The validation split is the head of the stream.
 
 ```python
-from dew.data import load
+from dew.config.data import loader
 import jax
 
 from dew import Trainer
 from dew.config import OptimConfig
-from dew.data import Loading, Text
+from dew.data import Loading
+from dew.config.data import TextData
 from dew.nn.backbones import CausalTransformer
 from dew.objectives.lm import LMObjective, Perplexity
 from dew.sampling import Sampling, generate
 
-data = load(Text(source="data/stories-byte", seq_len=64), batch=16, read="memory", loading=Loading(workers=0), validation_records=(4) * (16))
+data = loader(TextData(source="data/stories-byte", seq_len=64), batch=16, read="memory", loading=Loading(workers=0), validation_records=(4) * (16))
 model = CausalTransformer(vocab_size=tokenizer.vocab_size,
                           emb_features=64, num_layers=2, num_heads=2, mlp_features=256,
                           max_seq_len=128)
@@ -141,7 +142,8 @@ That command publishes the complete input. Prepare held-out records separately a
 ```python
 from pathlib import Path
 import numpy as np
-from dew.data import ByteTokenizer, export
+from dew.data import ByteTokenizer
+from dew.data.sinks import export
 
 tokenizer = ByteTokenizer()
 ids = np.asarray(tokenizer.encode("The cat sat on the warm mat.\n" * 256), np.int32)
@@ -222,10 +224,11 @@ With gradient accumulation, the cross-entropy and multi-token-prediction (MTP) l
 
 <!-- not run: fine-tunes Qwen3-0.6B on a produced token store, which CI does not prepare -->
 ```python
-from dew.data import Loading, Text, load
+from dew.data import Loading
+from dew.config.data import TextData, loader
 from dew.interop import PretrainedDecoder
 
-data = load(Text(source="data/qwen3-tokens", seq_len=512), batch=4, read="memory", loading=Loading(workers=0), validation_records=(4) * (4))
+data = loader(TextData(source="data/qwen3-tokens", seq_len=512), batch=4, read="memory", loading=Loading(workers=0), validation_records=(4) * (4))
 bundle = PretrainedDecoder.load("Qwen/Qwen3-0.6B", max_seq_len=512)
 objective = LMObjective(bundle, seq_len=512)
 state = Trainer(objective, OptimConfig(learning_rate=1e-5), key=jax.random.key(0)).fit(data, steps=100)
@@ -355,12 +358,13 @@ To keep training, build the bundle's objective and feed the trainer `{"text": in
 ```python
 import optax
 from dew.data.dataset import Dataset
+from dew.data.dataset import Loader
 from dew.training import Layout, MeshSpec
 
 mm_objective = LMObjective(bundle, inputs.tokens.shape[1] - 1, pad_id=0)
 rows = 2 * jax.device_count()
 batch = inputs.take_rows(jax.numpy.arange(rows) % 2)
-mm_data = Dataset(train=lambda partition: iter([{"text": batch}]), val=None,
+mm_data = Loader(train=lambda partition: iter([{"text": batch}]), val=None,
                   records=rows, batch=rows)
 mm_trainer = Trainer(mm_objective, optax.sgd(1e-4), key=jax.random.key(3),
                      mesh=MeshSpec(), layout=Layout(min_shard=2**30))
@@ -392,11 +396,12 @@ An encoder takes `input_features` shaped `[B, T, F]` and a boolean `input_featur
 `MaskedDiffusionObjective` trains a bidirectional decoder to recover masked tokens under MDLM's negative ELBO. As in MDLM's SUBS parameterization, the mask token gets no probability mass, so its column is left out of the cross entropy's partition. LLaDA's published training script takes the cross entropy over the whole vocabulary, so its loss values differ from Dew's by that term. Each row holds exactly `seq_len` tokens, because there is no next-token shift; `Text(seq_len=63)`, whose rows hold 64 IDs, feeds a 64-token objective. The mask token needs an ID of its own, here the one after the last byte:
 
 ```python
-from dew.data import Loading, Text, load
+from dew.data import Loading
+from dew.config.data import TextData, loader
 from dew.diffusion.discrete import MDLM
 from dew.objectives.diffusion import MaskedDiffusionObjective
 
-masked_data = load(Text(source="data/stories-byte", seq_len=63), batch=16, read="memory", loading=Loading(workers=0), validation_records=(4) * (16))
+masked_data = loader(TextData(source="data/stories-byte", seq_len=63), batch=16, read="memory", loading=Loading(workers=0), validation_records=(4) * (16))
 mask_id = tokenizer.vocab_size
 process = MDLM(mask_id=mask_id)()
 masked_model = CausalTransformer(vocab_size=mask_id + 1,
@@ -490,12 +495,13 @@ A run of the image-reading model exports with `Pretrained.from_run(run).save(des
 
 ```python
 from dew.objectives.diffusion import BlockDiffusionObjective
+from dew.data.dataset import Loader
 
 sft_source = fixtures / "diffusion-gemma-sft"
 sft_bundle = PretrainedBlockDecoder.load(sft_source, dtype=jnp.float32, attention_impl="xla", max_seq_len=32)
 with np.load(sft_source / "reference.npz") as reference:
     train_tokens = np.tile(reference["tokens"], (jax.device_count(), 1))
-block_data = Dataset(train=lambda partition: iter([{"text": train_tokens}]), val=None,
+block_data = Loader(train=lambda partition: iter([{"text": train_tokens}]), val=None,
                      records=len(train_tokens), batch=len(train_tokens))
 block_objective = BlockDiffusionObjective(sft_bundle.model, prompt_length=4,
                                           num_canvases=2, variables=sft_bundle.variables)

@@ -14,7 +14,8 @@ import jax.numpy as jnp
 import tyro
 
 from dew.config import OptimConfig
-from dew.data import ByteTokenizer, Loading, Text, load
+from dew.data import ByteTokenizer, Loading
+from dew.config.data import TextData, loader
 from dew.data.sources.files import TokenFiles
 from dew.inference import RunProcessor
 from dew.nn.backbones import CausalTransformer
@@ -44,7 +45,7 @@ def main(config: Config):
     stored = TokenFiles(str(config.tokens))
     vocabulary = integer(stored.metadata()["vocab_size"], "vocab_size")
     tokenizer = ByteTokenizer()
-    data = load(Text(source=stored, seq_len=config.sequence_length), batch=config.batch_size,
+    data = loader(TextData(source=stored, seq_len=config.sequence_length), batch=config.batch_size,
                 read="memory", validation_records=4 * config.batch_size, loading=Loading(workers=4))
     steps = config.steps or data.epoch_steps(config.epochs)
 

@@ -14,7 +14,8 @@ from PIL import Image
 
 from dew.artifacts import uint8_pixels
 from dew.config import OptimConfig
-from dew.data import TFDS, Augment, HoldOut, Images, load
+from dew.data import TFDS
+from dew.config.data import Augment, HoldOut, ImageData, loader
 from dew.data.steps.image import EncodeCaptions
 from dew.diffusion import presets
 from dew.inputs import CLIPText, Condition, Field, InputSpec
@@ -50,7 +51,7 @@ def text_conditioned_inputs(image_size: int) -> InputSpec:
 
 def main(config: Config, data=None, inputs=None):
     inputs = inputs or text_conditioned_inputs(config.image_size)
-    data = data or load(Images(
+    data = data or loader(ImageData(
         source=TFDS("oxford_flowers102", split="all",
                     path=None if config.data_path is None else str(config.data_path.expanduser())),
         image_size=config.image_size,
