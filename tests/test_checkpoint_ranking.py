@@ -145,12 +145,13 @@ def test_terminal_local_resume_keeps_the_final_plateau_evaluation(tmp_path, chec
 
     def local():
         run = trainer(tmp_path / 'run')
-        run.checkpoints = Checkpoints(str(tmp_path / 'run'), local_directory=str(tmp_path / 'local'), local_every=2)
+        run.checkpoints = Checkpoints(str(tmp_path / 'run'), local_directory=str(tmp_path / 'local'),
+                                      local_every=2)
         return run
 
     first = local()
-    first.fit(data(), steps=2, log_every=1, eval_every=1, checkpoint_every=1, checkpoint_final=checkpoint_final,
-              metrics=[metric], stop=Plateau(metric, evals=3))
+    first.fit(data(), steps=2, log_every=1, eval_every=1, checkpoint_every=1,
+              checkpoint_final=checkpoint_final, metrics=[metric], stop=Plateau(metric, evals=3))
     assert first.checkpoints.control(2)['plateau:val/value']['bad'] == 1
     second = local()
     state = second.fit(data(), steps=10, log_every=1, eval_every=1, checkpoint_every=1,

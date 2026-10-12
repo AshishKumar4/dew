@@ -61,7 +61,14 @@ from dew.telemetry.instrumentation import StepFlops
 from dew.training import MeshSpec
 from dew.training.distributed import DevicePrefetchIterator
 from dew.training.interval import Interval
-from dew.training.model_flops import FORWARD_FLOPS, TOKENS, TRAINING_FLOPS, _TokenCount, prepare_counts, step_counts
+from dew.training.model_flops import (
+    FORWARD_FLOPS,
+    TOKENS,
+    TRAINING_FLOPS,
+    _TokenCount,
+    prepare_counts,
+    step_counts,
+)
 
 LENGTHS = np.asarray([2, 5], np.int64)
 
@@ -69,6 +76,17 @@ LENGTHS = np.asarray([2, 5], np.int64)
 def decoder(**kwargs):
     return CausalTransformer(vocab_size=64, emb_features=8, num_heads=2, num_kv_heads=1,
                              head_dim=4, num_layers=3, mlp_features=16, **kwargs)
+
+
+def test_integer_token_counts_carry_across_words_on_a_partitioned_batch():
+    from jax.sharding import NamedSharding, PartitionSpec
+
+    rows = _TokenCount.words([2**32 - 1, 2, 2**40, 0])
+    mesh = MeshSpec().build(jax.devices()[:2])
+    placed = jax.device_put(rows, NamedSharding(mesh, PartitionSpec("data")))
+    total = jax.jit(_TokenCount.sum)(placed)
+    assert _TokenCount.host(total) == 2**40 + 2**32 + 1
+    assert total.dtype == jnp.uint32
 
 
 def test_dense_and_attention_equations_use_each_real_length():
