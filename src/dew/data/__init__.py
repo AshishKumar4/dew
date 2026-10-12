@@ -10,7 +10,7 @@ from .cache import Cache, Generation
 from .chat import Role
 from .compile import compile, iterate, publish, validation
 from .dataset import Batch, Checkpointable, DataPartition, DataPhase, Loader, Loading, Ramp, Reader, Stage
-from .pipeline import Configured, ObjectiveData, Pipeline, Rejected
+from .pipeline import Configured, Dataset, ObjectiveData, Pipeline, Rejected, mix
 from .preferences import IDS_KEY, MASK_KEY
 from .processors import AutoAudioProcessor
 from .recipes import (
@@ -28,7 +28,7 @@ from .recipes import (
     load,
 )
 from .sinks import export
-from .sources import TFDS, Files, Hub, Memory, Read, Shard, ShardManifest, Source
+from .sources import TFDS, Files, Grain, Hub, Memory, Read, Shard, ShardManifest, Source, from_grain
 from .text import ByteTokenizer, HFTokenizer
 
 __all__ = [
@@ -45,8 +45,10 @@ __all__ = [
     "Configured",
     "DataPartition",
     "DataPhase",
+    "Dataset",
     "Files",
     "Generation",
+    "Grain",
     "HFTokenizer",
     "HoldOut",
     "Hub",
@@ -74,8 +76,10 @@ __all__ = [
     "Video",
     "compile",
     "export",
+    "from_grain",
     "iterate",
     "load",
+    "mix",
     "publish",
     "validation",
 ]
