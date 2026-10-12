@@ -109,6 +109,7 @@ The plain install includes Transformers, the Hugging Face Hub client and the ima
 | `profile` | The xprof profiler |
 | `quantization` | Qwix, for quantized training and serving (`dew.training.quantization`) |
 | `test` | The test suite's dependencies and pinned reference libraries |
+| `ci` | The test suite's whole environment: `test` and every extra a test file imports, with tokamax |
 
 ```bash
 uv pip install 'dewml[interop,streaming] @ git+https://github.com/AshishKumar4/dew'
@@ -142,10 +143,10 @@ cd dew
 uv venv --python 3.14
 source .venv/bin/activate
 sh tools/install_host_torch.sh
-uv pip install -e '.[test,av,tfds,metrics,plots,inference-clients,serve,vision,quantization,profile]' -c constraints.txt
+uv pip install -e '.[ci]' -c constraints.txt
 ```
 
-These are the extras CI installs, with the same JAX build CI uses: `constraints.txt` names the patched build of 0.11.2, which the multi-process cache tests need. PyTorch is used only by the reference tests and the image processors; Dew's model computation runs in JAX.
+The `ci` extra is the test suite's environment, every package a test file imports, as CI, the GPU nodes and the kernel lab's GPU jobs install it, with the same JAX build CI uses: `constraints.txt` names the patched build of 0.11.2, which the multi-process cache tests need. PyTorch is used only by the reference tests and the image processors; Dew's model computation runs in JAX.
 
 ## Bumping JAX
 

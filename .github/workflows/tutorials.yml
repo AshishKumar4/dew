@@ -72,7 +72,7 @@ jobs:
     - name: Install Dew and the notebooks' dependencies
       run: |
         sh tools/install_host_torch.sh --system
-        uv pip install --system -e ".[streaming,interop,plots]" nbclient nbformat ipykernel
+        uv pip install --system -e ".[tutorials]"
     - name: Cache the datasets and checkpoints the notebooks download
       uses: actions/cache@v4
       with:
