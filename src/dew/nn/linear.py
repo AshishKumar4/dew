@@ -45,7 +45,7 @@ from .blocks import normal_kernel
 from .flops import conv_flops, delta_flops, projection_flops
 from .inputs import AttentionMetadata, valid_order
 from .kernels import generation
-from .kernels.generation import first_refusal, ran_kernel, triton_runs
+from .kernels.generation import first_refusal, measured_kernel, ran_kernel, triton_runs
 from .precision import asks_default_precision, at_least_fp32, compensated_add
 from .sharding import HEADS, logical_axes, logical_spec, manual_map, mesh_axes, rows_like, seen_whole
 
@@ -551,8 +551,9 @@ def chunk_gated_delta_rule(query, key, value, g, beta, state=None, chunk_size: i
 
 def port_refusal(query, key, value) -> str | None:
     """Why a rule over these operands runs the portable math rather than the
-    port (`fla_rule`), or None where the port takes it: every GPU Triton runs
-    (`triton_runs`) and every shape, dtype, chunk size and mesh, except
+    port (`fla_rule`), or None where the port takes it: on every GPU whose
+    target row names it (`measured_kernel`, the table qualification reads)
+    and every shape, dtype, chunk size and mesh, except
     inside `jax.jvp`'s traces (`FORWARD_MODE`), which the port's custom VJP
     gives no tangent; inside a caller's `shard_map` that checks varying axes
     over operands that vary, where a Pallas call, which states no varying
@@ -561,7 +562,8 @@ def port_refusal(query, key, value) -> str | None:
     dtype."""
     widest = fla_gdn.WIDEST_KEYS if jnp.result_type(query, key, value).itemsize == 2 else fla_gdn.WIDEST
     return first_refusal(
-        (triton_runs(), "the port's kernels need a GPU of sm80 or later"),
+        (measured_kernel('gated_delta_rule', 'xla') == 'fla',
+         "the device's target row (generation.TARGETS) does not name the port"),
         (not FORWARD_MODE.get(), "forward_mode_attention traces for jax.jvp, which the port's custom VJP "
                                  "gives no tangent"),
         (not jax.typeof(value).mat.varying,
@@ -576,11 +578,11 @@ def port_refusal(query, key, value) -> str | None:
 
 
 def on_the_port(query, key, value) -> bool:
-    """Whether the rule runs on the port; a GPU that runs it elsewhere logs
-    why the first time (`ran_kernel`)."""
+    """Whether the rule runs on the port; a GPU whose row names it that runs
+    the rule elsewhere logs why the first time (`ran_kernel`)."""
     refusal = port_refusal(query, key, value)
-    if refusal is not None and triton_runs():
-        ran_kernel('gated_delta_rule', 'xla', refusal, fastest='fla')
+    if refusal is not None:
+        ran_kernel('gated_delta_rule', 'xla', refusal)
     return refusal is None
 
 

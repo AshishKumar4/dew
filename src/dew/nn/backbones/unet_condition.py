@@ -5,16 +5,21 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import jax.numpy as jnp
+import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.attention import FlaxFeedForward, LayerNorm, NormalAttention
-from dew.nn.blocks import ResidualBlock, sinusoidal_time, torch_nearest_resize
+from dew.nn.blocks import ResidualBlock, sinusoidal_time
 from dew.nn.conv import Conv
+from dew.nn.flops import MissingFlopsCount, projection_flops
 from dew.nn.precision import at_least_fp32
+
+from .spatial import SpatialCount, SpatialForward, SpatialShape
 
 if TYPE_CHECKING:
     from dew.diffusion.process import DenoisingCondition
+    from dew.inputs.encoders import ConditionWork
 
 
 @dataclass(frozen=True)
@@ -39,6 +44,10 @@ class _TimeMLP(nn.Module):
     features: int
     dtype: Dtype
     precision: PrecisionLike = None
+
+    @nn.nowrap
+    def model_flops(self, lengths, input_features: int) -> float:
+        return projection_flops(lengths, input_features + self.features, self.features)
 
     @nn.compact
     def __call__(self, x):
@@ -100,6 +109,17 @@ class _SpatialAttention(nn.Module):
     norm_epsilon: float = 1e-5
     approximate_gelu: bool = True
 
+    @nn.nowrap
+    def cross_flops(self, lengths, context_lengths, text_features: int) -> float:
+        """Spatial input/output maps and every configured transformer sublayer."""
+        width = self.stage.features
+        attention = NormalAttention(width, self.stage.heads, width // self.stage.heads, parent=None)
+        crossed = attention.cross_flops(lengths, context_lengths, text_features)
+        first = crossed if self.stage.cross_only else attention.model_flops(lengths)
+        feedforward = FlaxFeedForward(width, parent=None).model_flops(lengths)
+        return (2 * projection_flops(lengths, width, width)
+                + self.stage.depth * (first + crossed + feedforward))
+
     @nn.compact
     def __call__(self, x, context, *, train=False):
         residual = x
@@ -150,13 +170,24 @@ class _Level(nn.Module):
     attention_norm_epsilon: float = 1e-5
     approximate_gelu: bool = True
 
+    @nn.nowrap
+    def _resize_conv(self, **scope):
+        stride = (2, 2) if self.direction == "down" else (1, 1)
+        return Conv(self.stage.features, (3, 3), strides=stride, padding=((1, 1), (1, 1)),
+                    dtype=self.dtype, precision=self.precision, **scope)
+
     @nn.compact
     def __call__(self, x, time, context, skips=(), *, upsample_shape=None, train=False):
+        return self.walk(x, time, context, skips, upsample_shape=upsample_shape, train=train,
+                         operations=SpatialForward())
+
+    @nn.nowrap
+    def walk(self, x, time, context, skips=(), *, upsample_shape=None, train=False, operations):
         outputs = []
         for index in range(self.blocks):
             if self.direction == "up":
-                x = jnp.concatenate([x, skips[-(index + 1)]], axis=-1)
-            x = ResidualBlock(
+                x = operations.concatenate(x, skips[-(index + 1)])
+            x = operations.residual(ResidualBlock(
                 self.stage.features,
                 norm_groups=self.norm_groups,
                 norm_epsilon=self.norm_epsilon,
@@ -164,9 +195,9 @@ class _Level(nn.Module):
                 dtype=self.dtype,
                 precision=self.precision,
                 name=f"residual_{index}",
-            )(x, nn.silu(time), train=train)
+            ), x, operations.activated(time, nn.silu), train=train)
             if self.stage.cross_attention:
-                x = _SpatialAttention(
+                x = operations.attention(_SpatialAttention(
                     self.stage,
                     self.linear_projection,
                     self.dropout,
@@ -177,17 +208,15 @@ class _Level(nn.Module):
                     norm_epsilon=self.attention_norm_epsilon,
                     approximate_gelu=self.approximate_gelu,
                     name=f"attention_{index}",
-                )(x, context, train=train)
+                ), x, context, train=train)
             outputs.append(x)
         if self.resize:
             if self.direction == "up":
                 if upsample_shape is None:
                     raise ValueError("Upsampling requires the next skip spatial shape")
                 height, width = upsample_shape
-                x = torch_nearest_resize(x, height, width)
-            stride = (2, 2) if self.direction == "down" else (1, 1)
-            x = Conv(self.stage.features, (3, 3), strides=stride, padding=((1, 1), (1, 1)),
-                     dtype=self.dtype, precision=self.precision, name="resize")(x)
+                x = operations.resize(x, height, width)
+            x = operations.project(self._resize_conv(name="resize"), x)
             outputs.append(x)
         return x, tuple(outputs)
 
@@ -218,6 +247,55 @@ class UNet2DCondition(nn.Module):
     attention_norm_epsilon: float = 1e-5
     approximate_gelu: bool = True
 
+    @nn.nowrap
+    def model_flops(self, lengths) -> float:
+        raise MissingFlopsCount("UNet2DCondition needs spatial_flops with image/text/pooled geometry")
+
+    @property
+    def time_features(self) -> int:
+        return self.stages[0].features * 4
+
+    @nn.nowrap
+    def condition_lengths(self, lengths: np.ndarray, spans: np.ndarray) -> np.ndarray:
+        return spans
+
+    @nn.nowrap
+    def _convolution(self, features: int, **scope):
+        return Conv(features, (3, 3), dtype=self.dtype, precision=self.precision, **scope)
+
+    @nn.nowrap
+    def conditioned_spatial_flops(self, sample_shape: tuple[int, ...], rows: int,
+                                   condition: ConditionWork) -> float:
+        additional = None
+        if self.additional_time_features:
+            if condition.pooled_features is None or condition.time_ids is None:
+                raise MissingFlopsCount("UNet2DCondition needs pooled width and the number of time ids")
+            additional = condition.pooled_features + condition.time_ids * self.additional_time_features
+        lengths = self.condition_lengths(condition.lengths, condition.spans)
+        return self.spatial_flops(sample_shape, rows, lengths, condition.features,
+                                  additional_features=additional)
+
+    @nn.nowrap
+    def spatial_flops(self, sample_shape: tuple[int, ...], rows: int, context_lengths=None,
+                       text_features: int | None = None, *, additional_features: int | None = None) -> float:
+        """The residual/attention stage walk, including every resizer and skip width."""
+        if len(sample_shape) != 3 or context_lengths is None or text_features is None:
+            raise MissingFlopsCount("UNet2DCondition needs [height,width,channels] and text geometry")
+        height, width, _ = sample_shape
+        first = self.stages[0].features
+        row = np.ones((rows,), np.int64)
+        time = _TimeMLP(self.time_features, self.dtype, parent=None)
+        count = time.model_flops(row, first)
+        if self.additional_time_features:
+            if additional_features is None:
+                raise MissingFlopsCount("UNet2DCondition needs pooled width plus sinusoidal time-id width")
+            count += time.model_flops(row, additional_features)
+        operations = SpatialCount(context_lengths, text_features)
+        operations.flops = count
+        self.spatial_walk(SpatialShape((rows, height, width, self.in_channels)),
+                          SpatialShape((rows, self.time_features)), None, operations=operations)
+        return operations.flops
+
     @property
     def text_keyword(self) -> str:
         """Every call takes the text as `conditioning`, which every attention stage cross-attends to."""
@@ -236,7 +314,7 @@ class UNet2DCondition(nn.Module):
         first = self.stages[0].features
         time = sinusoidal_time(time, first, dtype=at_least_fp32(self.dtype), shift=self.frequency_shift,
                                cosine_first=self.cosine_first)
-        time = _TimeMLP(first * 4, self.dtype, self.precision, name="time")(time)
+        time = _TimeMLP(self.time_features, self.dtype, self.precision, name="time")(time)
         if self.additional_time_features:
             if conditioning.pooled is None or conditioning.time_ids is None:
                 raise ValueError("This UNet needs pooled text and size/aesthetic conditioning")
@@ -244,20 +322,27 @@ class UNet2DCondition(nn.Module):
                                   dtype=at_least_fp32(self.dtype), shift=self.frequency_shift,
                                   cosine_first=self.cosine_first)
             extra = jnp.concatenate([conditioning.pooled, ids.reshape(x.shape[0], -1)], axis=-1)
-            time = time + _TimeMLP(first * 4, self.dtype, self.precision, name="additional_time")(extra)
-        x = Conv(first, (3, 3), dtype=self.dtype, precision=self.precision, name="input")(x)
+            time = time + _TimeMLP(self.time_features, self.dtype, self.precision,
+                                   name="additional_time")(extra)
+        return self.spatial_walk(x, time, conditioning.context, train=train, operations=SpatialForward())
+
+    @nn.nowrap
+    def spatial_walk(self, x, time, context, *, train=False, operations):
+        first = self.stages[0].features
+        x = operations.project(self._convolution(first, name="input"), x)
         skips = [x]
         for index, stage in enumerate(self.stages):
-            x, outputs = _Level(stage, self.blocks_per_level, "down", index + 1 < len(self.stages),
+            x, outputs = operations.level(_Level(
+                stage, self.blocks_per_level, "down", index + 1 < len(self.stages),
                 self.linear_projection, self.dropout, self.dtype, self.precision, self.attention_impl,
                 norm_groups=self.norm_groups, norm_epsilon=self.norm_epsilon,
                 attention_norm_epsilon=self.attention_norm_epsilon, approximate_gelu=self.approximate_gelu,
-                name=f"down_{index}")(x, time, conditioning.context, train=train)
+                name=f"down_{index}"), x, time, context, train=train)
             skips.extend(outputs)
         if self.middle_attention:
             last = self.stages[-1]
             stage = UNetStage(last.features, last.heads, last.depth)
-            x = ResidualBlock(
+            x = operations.residual(ResidualBlock(
                 stage.features,
                 norm_groups=self.norm_groups,
                 norm_epsilon=self.norm_epsilon,
@@ -265,8 +350,8 @@ class UNet2DCondition(nn.Module):
                 dtype=self.dtype,
                 precision=self.precision,
                 name="middle_in",
-            )(x, nn.silu(time), train=train)
-            x = _SpatialAttention(
+            ), x, operations.activated(time, nn.silu), train=train)
+            x = operations.attention(_SpatialAttention(
                 stage,
                 self.linear_projection,
                 self.dropout,
@@ -277,8 +362,8 @@ class UNet2DCondition(nn.Module):
                 norm_epsilon=self.attention_norm_epsilon,
                 approximate_gelu=self.approximate_gelu,
                 name="middle_attention",
-            )(x, conditioning.context, train=train)
-            x = ResidualBlock(
+            ), x, context, train=train)
+            x = operations.residual(ResidualBlock(
                 stage.features,
                 norm_groups=self.norm_groups,
                 norm_epsilon=self.norm_epsilon,
@@ -286,12 +371,12 @@ class UNet2DCondition(nn.Module):
                 dtype=self.dtype,
                 precision=self.precision,
                 name="middle_out",
-            )(x, nn.silu(time), train=train)
+            ), x, operations.activated(time, nn.silu), train=train)
         for index, stage in enumerate(reversed(self.stages)):
             count = self.blocks_per_level + 1
             inputs, skips = tuple(skips[-count:]), skips[:-count]
             target = skips[-1].shape[1:3] if skips else None
-            x, _ = _Level(
+            x, _ = operations.level(_Level(
                 stage,
                 count,
                 "up",
@@ -306,7 +391,7 @@ class UNet2DCondition(nn.Module):
                 attention_norm_epsilon=self.attention_norm_epsilon,
                 approximate_gelu=self.approximate_gelu,
                 name=f"up_{index}",
-            )(x, time, conditioning.context, inputs, upsample_shape=target, train=train)
-        x = nn.silu(nn.GroupNorm(self.norm_groups, epsilon=self.norm_epsilon, dtype=self.dtype,
-                                  name="output_norm")(x))
-        return Conv(self.out_channels, (3, 3), dtype=self.dtype, precision=self.precision, name="output")(x)
+            ), x, time, context, inputs, upsample_shape=target, train=train)
+        norm = nn.GroupNorm(self.norm_groups, epsilon=self.norm_epsilon, dtype=self.dtype, name="output_norm")
+        x = operations.normalized(x, norm, nn.silu)
+        return operations.project(self._convolution(self.out_channels, name="output"), x)

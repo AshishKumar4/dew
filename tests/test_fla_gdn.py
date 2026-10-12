@@ -14,7 +14,7 @@ import numpy as np
 import pytest
 from sharded import assert_runs_per_shard, boundary_copies
 
-from dew.nn import linear
+from dew.nn import kernels, linear
 from dew.nn.kernels import fla_gdn
 from dew.nn.linear import GatedDeltaNet, fla_rule, l2norm
 
@@ -398,7 +398,7 @@ def test_inside_a_shard_map_that_checks_varying_axes_the_rule_names_why_it_runs_
     the reason and the rule runs the portable math."""
     from jax.sharding import Mesh, PartitionSpec
 
-    monkeypatch.setattr(linear, "triton_runs", lambda: True)
+    row_names_port(monkeypatch)
     refusals = []
 
     def rule(v):
@@ -412,10 +412,17 @@ def test_inside_a_shard_map_that_checks_varying_axes_the_rule_names_why_it_runs_
                         "no varying type for its results"]
 
 
+def row_names_port(monkeypatch, *, port: bool = True):
+    """The device's target row names the port for the rule where `port` (`measured_kernel`), as a
+    GPU's row does; off a GPU the port's kernels then interpret."""
+    monkeypatch.setattr(linear, "measured_kernel",
+                        lambda choice, default: "fla" if port and choice == "gated_delta_rule" else default)
+
+
 def layer_on(monkeypatch, *, port: bool, **fields):
-    """A GatedDeltaNet that runs the port where `port` (as a GPU decides, `triton_runs`; off a GPU its
-    kernels interpret) and the portable math where not."""
-    monkeypatch.setattr(linear, "triton_runs", lambda: port)
+    """A GatedDeltaNet that runs the port where `port` (as a GPU's target row decides,
+    `row_names_port`) and the portable math where not."""
+    row_names_port(monkeypatch, port=port)
     return GatedDeltaNet(emb_features=64, num_k_heads=1, num_v_heads=2, head_k_dim=64, head_v_dim=64,
                          **fields)
 
@@ -468,7 +475,7 @@ def test_a_gpu_runs_the_port_for_every_rule_but_forward_mode_float64_and_the_wid
     from dew.nn.attention import FORWARD_MODE
 
     x = jnp.zeros((1, 64, 1, 64), jnp.bfloat16)
-    monkeypatch.setattr(linear, "triton_runs", lambda: True)
+    row_names_port(monkeypatch)
     assert linear.port_refusal(x, x.astype(jnp.float32), jnp.zeros((1, 64, 3, 96), jnp.bfloat16)) is None
     token = FORWARD_MODE.set(True)
     try:
@@ -483,8 +490,20 @@ def test_a_gpu_runs_the_port_for_every_rule_but_forward_mode_float64_and_the_wid
     keys = jnp.zeros((1, 64, 1, 256), jnp.float32)
     assert linear.port_refusal(keys, keys, keys) == "keys 256 wide; the port takes at most 128 in float32"
     assert linear.port_refusal(keys.astype(jnp.bfloat16), keys.astype(jnp.bfloat16), x) is None
-    monkeypatch.setattr(linear, "triton_runs", lambda: False)
-    assert "need a GPU" in linear.port_refusal(x, x, x)
+    row_names_port(monkeypatch, port=False)
+    assert "does not name the port" in linear.port_refusal(x, x, x)
+
+
+@pytest.mark.parametrize("generation", sorted(name for name in kernels.TARGETS if name.startswith("sm")))
+def test_the_rule_runs_the_port_exactly_where_the_gpus_target_row_names_it(generation):
+    """Routing reads the row qualification reads (`generation.TARGETS`): a GPU generation whose row
+    names 'fla' for the rule runs the port, and one whose row does not runs the portable math and
+    says why."""
+    x = jnp.zeros((1, 64, 1, 64), jnp.bfloat16)
+    with kernels.assumed(generation):
+        refusal = linear.port_refusal(x, x, x)
+    named = kernels.TARGETS[generation].kernels.get("gated_delta_rule") == "fla"
+    assert (refusal is None) == named, refusal
 
 
 def test_a_bf16_layer_with_wide_keys_hands_the_port_its_narrowed_operands(monkeypatch):
@@ -498,7 +517,7 @@ def test_a_bf16_layer_with_wide_keys_hands_the_port_its_narrowed_operands(monkey
                                        jnp.repeat(key, 2, axis=2).astype(jnp.float32),
                                        value.astype(jnp.float32), g[..., None], beta.astype(jnp.float32))
 
-    monkeypatch.setattr(linear, "triton_runs", lambda: True)
+    row_names_port(monkeypatch)
     monkeypatch.setattr(linear, "fla_rule", recorded)
     layer = GatedDeltaNet(emb_features=64, num_k_heads=1, num_v_heads=2, head_k_dim=256, head_v_dim=64,
                           dtype=jnp.bfloat16)
@@ -559,7 +578,7 @@ def test_the_rule_on_the_port_takes_any_chunk_size_and_mixed_dtypes_in_their_com
     v = jax.random.normal(keys[2], (1, 96, 2, 64)).astype(jnp.bfloat16)
     g = -jnp.exp(jax.random.normal(keys[3], v.shape[:3]) - 3.0)
     beta = jax.nn.sigmoid(jax.random.normal(keys[4], v.shape[:3]))
-    monkeypatch.setattr(linear, "triton_runs", lambda: True)
+    row_names_port(monkeypatch)
     got = linear.chunk_gated_delta_rule(q, k, v, g, beta, chunk_size=chunk_size)
     want = fla_rule(q, k.astype(jnp.float32), v.astype(jnp.float32), g, beta)
     for mine, theirs in zip(got, want, strict=True):
