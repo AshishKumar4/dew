@@ -49,6 +49,7 @@ from dew.data.dataset import (
 )
 from dew.nn.flops import MissingFlopsCount
 from dew.nn.kernels.generation import assumed, gpu_mesh, gpu_target, measured_kernel
+from dew.nn.kernels.tuning import tune
 from dew.nn.sharding import (
     BATCH_AXES,
     SEQUENCE_AXIS,
@@ -1102,6 +1103,8 @@ class Trainer(Generic[Loss, Effects]):
             while True:
                 jitted = self._jitted(shapes, copies, shardings, placement, replicated)
                 self.program = jitted.lower(prepared, batch)
+                if tune(jitted, prepared, batch):
+                    continue
                 if not consulted:
                     consulted, before = True, self._rung()
                     record_path, key, recorded = recorded_rung(self.program, mesh)

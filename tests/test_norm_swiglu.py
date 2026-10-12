@@ -159,6 +159,7 @@ def test_rms_variants_and_every_gradient(dtype, scale_dtype, offset, after_cast)
 
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
 @pytest.mark.parametrize("shape", [(7, 1000), (3, 4096), (3, 257, 17)])
+@pytest.mark.usefixtures("config_extreme")
 def test_rms_ragged_widths_and_many_rows(dtype, shape):
     operands, seed = norm_operands(shape, dtype, jnp.float32)
     compare(norm_functions(dtype, offset=True, after_cast=True), operands, seed, ("y", "x", "scale"),
@@ -166,6 +167,7 @@ def test_rms_ragged_widths_and_many_rows(dtype, shape):
 
 
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
+@pytest.mark.usefixtures("config_extreme")
 def test_rms_weight_gradient_accumulates_a_full_step_of_rows(dtype):
     # Repeated tokens hold the row arithmetic fixed while the column sum
     # grows to Qwen3.5-0.8B's size, isolating partial-sum error from bf16 midpoint flips.
@@ -222,6 +224,7 @@ def stream_seam(implementation: str, dtype, joined: bool, offset: bool = True, a
 @pytest.mark.parametrize("joined", [False, True])
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
 @pytest.mark.parametrize("shape", [(2, 3, 31), (3, 257, 17), (5, 1000)])
+@pytest.mark.usefixtures("config_extreme")
 def test_stream_seam_takes_the_add_and_the_stream_cotangent(joined, dtype, shape):
     """The kernel's sum is XLA's to the bit; the norm and every gradient,
     the stream's cotangent folded into dx, hold the float64 gate."""
@@ -258,6 +261,7 @@ def test_stream_seam_takes_the_add_and_the_stream_cotangent(joined, dtype, shape
 @pytest.mark.parametrize("activation", ["silu", "sigmoid"])
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
 @pytest.mark.parametrize("shape", [(2, 3, 4, 31), (2, 64, 16, 128)])
+@pytest.mark.usefixtures("config_extreme")
 def test_gated_norm_and_every_gradient_hold_the_float64_gate(activation, dtype, shape):
     """Qwen3-Next's gated norm: the kernel's output and its input, gate and
     weight gradients each within the gate of XLA's float64 distance."""
@@ -345,6 +349,7 @@ def test_decoder_block_seams_run_the_fused_norm(monkeypatch):
 
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
 @pytest.mark.parametrize("shape", [(2, 3, 1000), (3, 4096), (3, 257, 17)])
+@pytest.mark.usefixtures("config_extreme")
 def test_swiglu_forward_and_both_gradients(dtype, shape):
     operands = tuple(jax.random.normal(jax.random.key(index), shape).astype(dtype) for index in (31, 32))
     seed = jax.random.normal(jax.random.key(33), shape).astype(dtype)
