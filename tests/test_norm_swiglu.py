@@ -298,17 +298,21 @@ def small_block():
     seed = jax.random.normal(jax.random.key(43), x.shape)
     step = jax.jit(jax.value_and_grad(lambda params, x: jnp.sum(block.apply(params, x) * seed),
                                       argnums=(0, 1)))
-    return block, params, x, step
+    return params, x, step
 
 
 def test_decoder_block_seams_keep_the_block_to_the_bit(monkeypatch):
     """XLA's seams are the old block's add, read and norm, bit for bit."""
-    from dew.nn.backbones.decoder_block import DecoderBlock
+    from dew.nn.backbones import decoder_block
 
-    block, params, x, step = small_block()
+    params, x, step = small_block()
     seams = step(params, x)
-    monkeypatch.setattr(DecoderBlock, "_seam", staticmethod(lambda state, norm: False))
-    _, _, _, old = small_block()
+
+    class Unseamed:
+        """No norm owns a seam: the block writes, reads and norms as before."""
+
+    monkeypatch.setattr(decoder_block, "SeamNorm", Unseamed)
+    *_, old = small_block()
     for mine, theirs in zip(jax.tree.leaves(seams), jax.tree.leaves(old(params, x)), strict=True):
         np.testing.assert_array_equal(mine, theirs)
 
@@ -320,7 +324,7 @@ def test_decoder_block_seams_run_the_fused_norm(monkeypatch):
     from dew.nn.kernels import norm_swiglu
 
     monkeypatch.setattr(norm_swiglu, "rms_kernel", lambda *args, **kwargs: "xla")
-    block, params, x, step = small_block()
+    params, x, step = small_block()
     reference = step(params, x)
     monkeypatch.setattr(norm_swiglu, "rms_kernel", lambda *args, **kwargs: "pallas")
     fused, joins = norm_swiglu.stream_rms_norm, []
@@ -330,7 +334,7 @@ def test_decoder_block_seams_run_the_fused_norm(monkeypatch):
         return fused(x, branch, *args, **kwargs)
 
     monkeypatch.setattr(norm_swiglu, "stream_rms_norm", recorded)
-    block, params, x, step = small_block()
+    params, x, step = small_block()
     joins.clear()
     jax.make_jaxpr(step)(params, x)
     # The input norm and the attention's query and key norms read; the MLP's norm joins.
@@ -417,7 +421,7 @@ def test_packed_halves_keep_xla_product_and_say_why(monkeypatch, caplog):
     for packed in (False, True):
         mlp = GatedMLP(hidden_features=16, out_features=8, packed=packed)
         params = mlp.init(jax.random.key(82), x)
-        graph = str(jax.make_jaxpr(lambda p: mlp.apply(p, x))(params))
+        graph = str(jax.make_jaxpr(mlp.apply)(params, x))
         assert ("swiglu_forward" in graph) == (not packed and jax.default_backend() == "gpu"), packed
     with monkeypatch.context() as patched:
         patched.setattr(kernels.generation, "triton_runs", lambda: True)
@@ -534,7 +538,8 @@ def test_seam_and_product_run_per_shard_as_on_one_device(split):
 
     def run(axes, hidden):
         seam = evaluated(lambda x, branch, scale: stream_rms_normalized(
-            x, branch, scale, 1e-5, x.dtype, True, True, True, implementation="pallas", axes=axes),
+            x, branch, scale, 1e-5, x.dtype, scale_offset=True, scale_after_cast=True, fp32_statistics=True,
+            implementation="pallas", axes=axes),
             (x, branch, scale), (ds, dy))
         product = evaluated(gated_product("swiglu", implementation="pallas", axes=hidden), (gate, up), dout)
         return seam, product

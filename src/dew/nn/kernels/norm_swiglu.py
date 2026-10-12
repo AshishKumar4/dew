@@ -1,37 +1,58 @@
-"""Row RMSNorm and elementwise SwiGLU, with hand-written reverse passes.
+"""Row RMSNorm, its residual seam and its gated form, and elementwise SwiGLU,
+with hand-written reverse passes.
 
-Qwen3.5-0.8B's decision step (A100-80, 8 x 3072 tokens, 936 ms) spent 49 ms in
-norms, 44.6 ms in reduction fusions, and 31.7 ms in SwiGLU. Liger's torch
-reference spent 12.5 ms in all reductions and 19.2 ms in SwiGLU. These
-kernels follow linkedin/Liger-Kernel's ops/rms_norm.py and ops/swiglu.py:
-save only a row's inverse RMS, accumulate weight gradients per program,
-and recompute sigmoid from the two narrow SwiGLU inputs in reverse.
+The kernels follow linkedin/Liger-Kernel's ops/rms_norm.py, ops/fused_add_rms_norm.py
+and ops/swiglu.py: save only a row's inverse RMS, accumulate weight gradients
+per program, and recompute sigmoid from the two narrow SwiGLU inputs in
+reverse. The gated norm is Qwen3-Next's output norm (fla's FusedRMSNormGated
+computes the same function).
+
+The norm alone lost to XLA's fusions on a Qwen3.5-0.8B step (a Clef full fine-tune,
+4 x 3072 rows, A100-40, main 2215b81fc): the norms cost 16.3 ms a step against
+XLA's 12.5. Its reverse pass ran at 44% of HBM bandwidth, the residual
+stream's gradient joined it in a separate 72 MiB pass that XLA had fused into
+its own reverse fusion, and a latency-bound third kernel summed the weight
+gradient. So the norm owns a pre-norm block's seam (`stream_rms_norm`): its
+forward reads the stream and the branch once and writes their sum beside the
+norm, and its reverse adds the stream's own cotangent to the norm's in the
+one pass. Each program keeps its weight-gradient sums in a register tile,
+elementwise, and XLA sums the programs' compensated pairs.
+
+Device time per call at Qwen3.5-0.8B's shapes (4 x 3072 rows of 1024, bf16; the gated
+norm over 16 heads of 128) against XLA's fusions of the same math, and the
+torch bar, each in one session: forward / forward and reverse, in us.
+
+    A100-SXM4-40GB          XLA            fused          Inductor       Liger
+    seam (add + norm)       103 / 200      76 / 187       76 / 179       76 / 299
+    gated norm (fwd; bwd)   123 ; 343      118 ; 224      -              -
+    SwiGLU (fwd; bwd)       235 ; 361      193 ; 320      196 ; 319      195 ; 324
+    H100 80GB HBM3 (SXM)
+    seam (add + norm)       44 / 89        36 / 81        36 / 88        35 / 163
+    gated norm (fwd; bwd)   59 ; 149       52 ; 101       -              -
+    SwiGLU (fwd; bwd)       113 ; 171      87 ; 147       88 ; 146       88 ; 147
 
 Dew's portable rounded_to also rounds cotangents. These fused VJPs instead
 use Liger's numerical contract: fp32 intermediate gradients and one cast at
-each gradient output. Forwards retain the model's cast sites, including
-cast-before-scale RMSNorm and SiLU rounded before the up product. RMSNorm's
-weight gradient reads that forward's rounded activation; SwiGLU's backward
-recomputes SiLU in fp32, as Liger does. At c53's [257,127] bf16 shape, Liger's
-norm dx was 1.26e-3 RMS from float64 against the rounded VJP's 1.78e-3;
-SwiGLU's gate gradient was 1.00e-3 against 1.45e-3 (A100). No generation
-selects these kernels until c53 measures their physical GPU kernel times.
+each gradient output, the stream's cotangent included. Forwards retain the
+model's cast sites, including cast-before-scale RMSNorm and SiLU rounded
+before the up product, and the seam's sum rounds as the block's own add does.
+RMSNorm's weight gradient reads that forward's rounded activation; SwiGLU's
+backward recomputes SiLU in fp32, as Liger does. At c53's [257,127] bf16
+shape, Liger's norm dx was 1.26e-3 RMS from float64 against the rounded VJP's
+1.78e-3; SwiGLU's gate gradient was 1.00e-3 against 1.45e-3 (A100).
 
 The fp32 activation/input-gradient tests hold relative differences below
-1e-5. Weight gradients keep Liger's rounded forward coefficient. Their
-whole-function RMS error uses the project's unchanged 2x-XLA float64
-budget. Accumulation is separately judged by the exact float64 sum of
-the identical rounded factors, within XLA's sum error plus one final
-rounding, and at 24,576 rows within 2 ulp outright. The
-A100 verify found a 24,576-row fp32 dscale at 4.91e-3 RMS from float64,
-against XLA's 1.22e-3. Both accumulation levels now retain separate fp32
-Neumaier sums/corrections, instead of a left fold followed by plain sum.
-The bf16 tests compare outputs and every gradient against float64, not
-bitwise against XLA's differently rounded autodiff. Forward midpoint flips
-can also differ by one ulp because reductions group differently. c53 keeps
-both distances and maximum-relative differences in its measurement report.
+1e-5. Every output and gradient keeps the project's 2x-XLA float64 budget.
+Weight-gradient accumulation is separately judged by the exact float64 sum
+of the identical rounded factors, within XLA's sum error plus one final
+rounding, and at 24,576 rows within 2 ulp outright: every product is kept
+exactly as an fp32 pair and compensated (Neumaier) into its program's tile,
+the tile's rows meet pairwise with their roundings kept, and the programs'
+pairs meet by Knuth's TwoSum (an A100's earlier left fold was 4.91e-3 RMS
+from float64 at 24,576 rows against XLA's 1.22e-3). The bf16 tests compare
+outputs and every gradient against float64, not bitwise against XLA's
+differently rounded autodiff.
 """
-
 import functools
 import math
 from typing import NamedTuple
@@ -268,7 +289,7 @@ def _activated(gate, activation: str) -> tuple[jax.Array, jax.Array]:
 
 
 def _rms_forward(x_ref, branch_ref, scale_ref, gate_ref, y_ref, stream_ref, inverse_ref, *, epsilon: float,
-                 offset: bool, after_cast: bool, activation: str | None, interpret: bool):
+                 offset: bool, after_cast: bool, activation: str, interpret: bool):
     rows, width = x_ref.shape
     columns = jnp.arange(pl.next_power_of_2(width))
     row_block = _row_block(width)
@@ -307,7 +328,7 @@ def _pairwise(values, *, interpret: bool) -> tuple[jax.Array, jax.Array]:
 
 
 def _rms_backward(x_ref, scale_ref, gate_ref, inverse_ref, dy_ref, stream_ref, dx_ref, dgate_ref, partial_ref,
-                  correction_ref, *, offset: bool, after_cast: bool, activation: str | None, interpret: bool):
+                  correction_ref, *, offset: bool, after_cast: bool, activation: str, interpret: bool):
     rows, width = x_ref.shape
     columns = jnp.arange(pl.next_power_of_2(width))
     groups = pl.num_programs(0)
@@ -378,12 +399,13 @@ def _scale_sum(partial, correction, dtype):
 
 
 class _Norm(NamedTuple):
-    """One fused norm's static arithmetic: everything but its operands."""
+    """One fused norm's static arithmetic: everything but its operands. The
+    activation gates only a norm called with a gate."""
     epsilon: float
     dtype: jnp.dtype
     offset: bool
     after_cast: bool
-    activation: str | None
+    activation: str
     interpret: bool
 
 
@@ -499,7 +521,7 @@ _gated_rms_vjp = jax.custom_vjp(_gated_rms, nondiff_argnums=(3,))
 _gated_rms_vjp.defvjp(_gated_rms_fwd, _gated_rms_bwd)
 
 
-def _norm(epsilon: float, dtype, offset: bool, after_cast: bool, activation: str | None = None) -> _Norm:
+def _norm(epsilon: float, dtype, offset: bool, after_cast: bool, activation: str = 'silu') -> _Norm:
     interpret = not generation.triton_runs()
     return _Norm(float(epsilon), jnp.dtype(dtype), offset, after_cast, activation, interpret)
 
