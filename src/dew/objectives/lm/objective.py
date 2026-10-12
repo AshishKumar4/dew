@@ -710,7 +710,7 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         counting totals and subtracting a depth would join across pad holes.
         """
         valid, documents = self._counted_tokens(batch)
-        result = []
+        depth_rows = []
         for depth in range(1, model.num_nextn_predict_layers + 1):
             span = valid.shape[1] - 1 - depth
             admitted = np.ones((valid.shape[0], span), bool)
@@ -723,8 +723,8 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
             admitted &= valid[:, depth + 1:depth + 1 + span]
             if documents is not None:
                 admitted &= segments == documents[:, depth + 1:depth + 1 + span]
-            result.append((inputs, self._row_lengths(admitted, segments)))
-        return result
+            depth_rows.append((inputs, self._row_lengths(admitted, segments)))
+        return depth_rows
 
     def _check_flop_geometry(self, batch: Batch) -> None:
         """Media needs its own FLOP count, but does not prevent counting token lengths."""
