@@ -7,7 +7,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from affine_run import Data, Regression
+from affine_run import Regression, dataset
 
 from dew.checkpoints import Checkpoints, Ranking
 from dew.config import OptimConfig, RunConfig
@@ -60,7 +60,7 @@ def test_a_reconstructed_average_matches_one_tracked_directly(tmp_path):
     trainer = Trainer(objective, power_profiles(optax.sgd(0.1), (0.05, 0.10)), key=jax.random.key(0),
                       layout=Layout(min_shard=1, tolerance=1.0),
                       checkpoints=Checkpoints(str(tmp_path / "run")))
-    state = trainer.fit(Data(), steps=96, log_every=96, checkpoint_every=4)
+    state = trainer.fit(dataset(), steps=96, log_every=96, checkpoint_every=4)
     trainer.checkpoints.wait()
 
     checkpoints = Checkpoints(str(tmp_path / "run"))
@@ -86,7 +86,7 @@ def test_a_checkpoint_writes_the_averages_once_and_restores_them(tmp_path):
     def trainer():
         return Trainer(Regression(), power_profiles(optax.sgd(0.1), (0.05, 0.10)), key=jax.random.key(0),
                        checkpoints=Checkpoints(str(tmp_path / "run")))
-    state = trainer().fit(Data(), steps=8, log_every=8, checkpoint_every=4)
+    state = trainer().fit(dataset(), steps=8, log_every=8, checkpoint_every=4)
     Checkpoints(str(tmp_path / "run")).wait()
 
     checkpoints = Checkpoints(str(tmp_path / "run"))
@@ -121,7 +121,7 @@ def test_a_run_record_names_its_profiles_and_the_solver_keeps_them():
 
 def test_a_local_checkpoint_keeps_the_profiles_in_its_state(tmp_path):
     trainer = Trainer(Regression(), power_profiles(optax.sgd(0.1), (0.05, 0.10)), key=jax.random.key(0))
-    state = trainer.fit(Data(), steps=2, log_every=2)
+    state = trainer.fit(dataset(), steps=2, log_every=2)
     checkpoints = Checkpoints(str(tmp_path / 'run'), local_directory=str(tmp_path / 'local'), local_every=1)
     checkpoints.save_local(2, state, None)
     checkpoints.wait()
@@ -138,7 +138,7 @@ def test_a_local_checkpoint_keeps_the_profiles_in_its_state(tmp_path):
 def test_an_interrupted_snapshot_restores_the_previous_step_and_is_never_reconstructed(tmp_path, monkeypatch):
     directory = str(tmp_path / 'run')
     trainer = Trainer(Regression(), power_profiles(optax.sgd(0.1), (0.05, 0.10)), key=jax.random.key(0))
-    state = trainer.fit(Data(), steps=2, log_every=2)
+    state = trainer.fit(dataset(), steps=2, log_every=2)
     checkpoints = Checkpoints(directory, keep=1)
     checkpoints.save(2, state, None, ranking=Ranking('train/loss', 0.2))
     checkpoints.wait()
@@ -205,7 +205,7 @@ def test_power_profiles_keeps_the_parameters_pytree(kind):
 
 def test_reconstruction_accumulates_bfloat16_weights_in_float32(tmp_path):
     trainer = Trainer(Regression(), power_profiles(optax.sgd(0.1), (0.05, 0.10)), key=jax.random.key(0))
-    state = trainer.fit(Data(), steps=2, log_every=2)
+    state = trainer.fit(dataset(), steps=2, log_every=2)
     averages = tuple(jax.tree.map(lambda leaf: leaf.astype(jnp.bfloat16), average)
                      for average in state.opt_state.averages)
     state = state.replace(variables=jax.tree.map(lambda leaf: leaf.astype(jnp.bfloat16), state.variables),

@@ -44,7 +44,6 @@ from dew.data.dataset import (
     Dataset,
     RampedStream,
     Reader,
-    Statistical,
     stream_endless,
     stream_identity,
 )
@@ -1530,9 +1529,7 @@ class Trainer(Generic[Loss, Effects]):
         self._count_work = gpu_target(started.device_kind).bf16_peak is not None
         self._refusal, self._unavailable_noted = None, False
         self._report(started, current)
-        # Read through the type that declares it: fit takes any object with a
-        # Dataset's readers, and a held-out count is not one of them.
-        if isinstance(plan.dataset, Dataset) and plan.dataset.held_out:
+        if plan.dataset.held_out:
             self._display.note(f"validation: {plan.dataset.held_out} records held out of train")
         if current > steps:
             raise ValueError(f"the run is at step {current}, past the {steps} asked for")
@@ -1604,8 +1601,7 @@ class Trainer(Generic[Loss, Effects]):
         if current % plan.log_every == 0:
             interval.check_finite(current, self._display)
             self._log_interval(current, loss, aux, accepted, state, interval,
-                               statistics=plan.dataset.statistics if isinstance(plan.dataset, Statistical)
-                               else dict)
+                               statistics=plan.dataset.statistics)
 
         if isinstance(plan.checkpoint_every, datetime.timedelta):
             # The clock is read at the log interval, where the step is already

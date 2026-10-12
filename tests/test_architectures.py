@@ -26,7 +26,7 @@ from recording import RecordingTracker
 
 from dew.artifacts import ImageGrid, Representations, TokenScores, VideoGrid
 from dew.config import ModelConfig, ObjectiveConfig
-from dew.data import Images
+from dew.data import Dataset, Images
 from dew.diffusion import presets
 from dew.inputs import Condition, ConditionEncoder, Field, InputSpec
 from dew.nn.attention import Stage
@@ -385,12 +385,10 @@ def run_case(case: Case, tmp_path, fsdp):
     artifact, shape = expected_artifact(case)
     source = batches(case, encoder)
 
-    class Data:
-        train = staticmethod(lambda partition: source())
-        val = staticmethod(lambda partition: (batch for batch in [next(source())]))
-        batch = BATCH
-
-    state = trainer.fit(Data(), steps=2, log_every=1, eval_every=1,
+    data = Dataset(train=lambda partition: source(),
+                   val=lambda partition: (batch for batch in [next(source())]),
+                   batch=BATCH, records=None)
+    state = trainer.fit(data, steps=2, log_every=1, eval_every=1,
                         metrics=(Spread(seen, artifact),), preview=True)
 
     assert dict(trainer.device_mesh.shape) == {"data": jax.device_count() // fsdp, "expert": 1,
