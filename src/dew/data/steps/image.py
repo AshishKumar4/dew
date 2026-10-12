@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import dataclasses
 import functools
 import inspect
@@ -161,6 +162,35 @@ class RandomCrop(grain.RandomMapTransform):
 
 
 @dataclasses.dataclass(frozen=True)
+class Bucket(grain.MapTransform):
+    """The pixels in `field` resized to cover the (height, width) of `sizes` nearest their aspect
+    ratio and cut to it at the centre, with that size's index under `to`, so records of one bucket
+    stack."""
+
+    sizes: tuple[tuple[int, int], ...]
+    method: Interpolation = "area"
+    field: str = "image"
+    to: str = "bucket"
+
+    def __post_init__(self) -> None:
+        if not self.sizes or any(height < 1 or width < 1 for height, width in self.sizes):
+            raise ValueError(f"buckets are positive (height, width) sizes, not {self.sizes}")
+
+    def map(self, element: Batch) -> Batch:
+        image = np.asarray(element[self.field])
+        height, width = image.shape[:2]
+        aspect = np.log(width / height)
+        index = int(np.argmin([abs(np.log(columns / rows) - aspect) for rows, columns in self.sizes]))
+        rows, columns = self.sizes[index]
+        scale = max(rows / height, columns / width)
+        height, width = max(rows, round(height * scale)), max(columns, round(width * scale))
+        image = _resized(image, height, width, self.method)
+        top, left = (height - rows) // 2, (width - columns) // 2
+        cut = image[top : top + rows, left : left + columns]
+        return {**element, self.field: cut, self.to: np.int32(index)}
+
+
+@dataclasses.dataclass(frozen=True)
 class RandomResizedCrop(grain.RandomMapTransform):
     """torchvision's RandomResizedCrop: a crop of `scale` of the area and
     `ratio` of aspect, drawn from the record's generator, resized to a `size`
@@ -247,30 +277,38 @@ class Processor(grain.MapTransform):
 _torch_rng = threading.Lock()
 
 
+class _ThreadCopy(threading.local):
+    """A thread's own copy of a stage's pipeline, made when the thread first runs the stage."""
+
+    transform: Any = None
+
+
 @dataclasses.dataclass(frozen=True, eq=False)
 class Albumentations(grain.RandomMapTransform):
     """An albumentations pipeline on the image in `field`, seeded from the
-    record's generator through `Compose.set_random_seed`, one record at a time
-    in each process, so a record's draw is the same at any thread count and
-    after a resume."""
+    record's generator through `Compose.set_random_seed`. Each reading thread
+    seeds and calls its own copy of the pipeline, so no other thread's seed,
+    from this stage or another holding the same pipeline, lands between the
+    two, and a record's draw is the same at any thread count and after a
+    resume."""
 
     transform: Any
     field: str = "image"
 
     @functools.cached_property
-    def _turn(self) -> threading.Lock:
-        """This stage's one lock in its process: the seed and the call it seeds go together."""
-        return threading.Lock()
+    def _copy(self) -> _ThreadCopy:
+        return _ThreadCopy()
 
     def random_map(self, element: Batch, rng: np.random.Generator) -> Batch:
-        with self._turn:
-            self.transform.set_random_seed(int(rng.integers(0, 2**32 - 1)))
-            augmented = self.transform(image=np.asarray(element[self.field]))["image"]
-        return {**element, self.field: augmented}
+        if self._copy.transform is None:
+            self._copy.transform = copy.deepcopy(self.transform)
+        transform = self._copy.transform
+        transform.set_random_seed(int(rng.integers(0, 2**32 - 1)))
+        return {**element, self.field: transform(image=np.asarray(element[self.field]))["image"]}
 
     def __getstate__(self) -> dict:
-        # A worker builds its own lock.
-        return {key: value for key, value in self.__dict__.items() if key != "_turn"}
+        # A worker makes its own copies.
+        return {key: value for key, value in self.__dict__.items() if key != "_copy"}
 
 
 @dataclasses.dataclass(frozen=True, eq=False)
@@ -334,6 +372,23 @@ class EncodeCaptions:
             return held
         captions = [str(value) for value in held.pop("caption")]
         return held if self.reader is None else {**held, **self.reader(captions)}
+
+
+@dataclasses.dataclass(frozen=True)
+class EncodeFields:
+    """Each batch with the fields `reader` encodes from it (`InputSpec.encode_fields`), as
+    `EncodeCaptions` does its captions."""
+
+    reader: Callable[[Batch], Batch] = dataclasses.field(repr=False)
+
+    @property
+    def identity(self) -> str:
+        reader = self.reader
+        kind = reader if inspect.ismethod(reader) or inspect.isfunction(reader) else type(reader)
+        return f"dew.encode-fields:{kind.__module__}.{kind.__qualname__}"
+
+    def __call__(self, batch: Batch) -> Batch:
+        return {**batch, **self.reader(batch)}
 
 
 @dataclasses.dataclass(frozen=True)

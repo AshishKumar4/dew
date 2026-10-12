@@ -1,13 +1,13 @@
-"""The audio-video clip reader, on a clip whose frames and audio carry
-their own index.
+"""The clip stages, on clips whose frames and sound carry their own index.
 
 Every frame of the synthesized clip is a flat grey of five times its index,
-and the audio under frame f is the constant sample 100 f, so a clip that
-comes back says which frames it holds and which frames its audio is under.
-The clip is muxed losslessly (ffv1 video, PCM audio at the reader's rate),
-so the audio has to come back sample-exact, beyond aligned. The reader
-needs moviepy, which is the `av` extra, and its bundled ffmpeg writes the
-fixture, so nothing here depends on a binary on PATH.
+and the sound under frame f is the constant sample 100 f, so a record says
+which frames it holds and which frames its sound is under. The clips are
+muxed losslessly in AVI (ffv1 video, PCM sound at the reader's rate), where
+ffmpeg's seek into the PCM track is sample-exact, so the sound comes back
+sample for sample, beyond aligned. The readers need moviepy, the `av` extra,
+and its bundled ffmpeg writes the fixtures, so nothing here depends on a
+binary on PATH.
 """
 
 import subprocess
@@ -15,7 +15,7 @@ import subprocess
 import numpy as np
 import pytest
 
-from dew.data.sources.av_utils import audio_window, choose_clip_start, read_av_random_clip
+from dew.data import Memory, audio, video
 
 moviepy_config = pytest.importorskip("moviepy.config", reason="needs the av extra")
 
@@ -23,111 +23,150 @@ FPS = 25
 SAMPLE_RATE = 16000
 SAMPLES_PER_FRAME = SAMPLE_RATE // FPS
 CLIP_FRAMES = 50
-# Small enough that a frame's cubic-free grey survives ffv1 exactly, and an
-# index recovered as round(grey / 5) is never ambiguous.
+# Small enough that a frame's grey survives ffv1 exactly, and an index
+# recovered as round(grey / 5) is never ambiguous.
 GREY_STEP = 5
 SAMPLE_STEP = 100
 
 
-def _clip(directory, name="clip.mkv", audio=True):
-    frames = np.stack([np.full((32, 32, 3), GREY_STEP * index, np.uint8)
-                       for index in range(CLIP_FRAMES)])
-    samples = np.repeat(np.arange(CLIP_FRAMES, dtype=np.int16) * SAMPLE_STEP, SAMPLES_PER_FRAME)
-    (directory / "frames.raw").write_bytes(frames.tobytes())
-    (directory / "audio.raw").write_bytes(samples.tobytes())
-    path = directory / name
-    video = ["-f", "rawvideo", "-pix_fmt", "rgb24", "-s", "32x32", "-r", str(FPS),
-             "-i", str(directory / "frames.raw")]
-    sound = (["-f", "s16le", "-ar", str(SAMPLE_RATE), "-ac", "1", "-i", str(directory / "audio.raw"),
-              "-c:a", "pcm_s16le"] if audio else ["-an"])
-    subprocess.run([moviepy_config.FFMPEG_BINARY, "-y", "-loglevel", "error", *video, *sound,
-                    "-c:v", "ffv1", str(path)], check=True)
+def _mux(path, *, frames=CLIP_FRAMES, sound=CLIP_FRAMES):
+    """A clip of `frames` frames over `sound` frames' worth of sound; either may be 0."""
+    inputs, codecs = [], []
+    if frames:
+        pixels = np.stack([np.full((32, 32, 3), GREY_STEP * index, np.uint8) for index in range(frames)])
+        path.with_suffix(".rgb").write_bytes(pixels.tobytes())
+        inputs += ["-f", "rawvideo", "-pix_fmt", "rgb24", "-s", "32x32", "-r", str(FPS),
+                   "-i", str(path.with_suffix(".rgb"))]
+        codecs += ["-c:v", "ffv1"]
+    if sound:
+        samples = np.repeat(np.arange(sound, dtype=np.int16) * SAMPLE_STEP, SAMPLES_PER_FRAME)
+        path.with_suffix(".pcm").write_bytes(samples.tobytes())
+        inputs += ["-f", "s16le", "-ar", str(SAMPLE_RATE), "-ac", "1", "-i", str(path.with_suffix(".pcm"))]
+        codecs += ["-c:a", "pcm_s16le"]
+    subprocess.run([moviepy_config.FFMPEG_BINARY, "-y", "-loglevel", "error", *inputs, *codecs, str(path)],
+                   check=True)
     return str(path)
 
 
 @pytest.fixture(scope="module")
-def clip(tmp_path_factory):
-    return _clip(tmp_path_factory.mktemp("av"))
+def media(tmp_path_factory):
+    root = tmp_path_factory.mktemp("av")
+    return {"clip": _mux(root / "clip.avi"), "sound": _mux(root / "sound.wav", frames=0),
+            "silent": _mux(root / "silent.avi", sound=0), "short": _mux(root / "short.avi", sound=20)}
+
+
+def _records(chain):
+    return list(chain.iterate())
 
 
 def _frame_indices(frames):
     return [round(int(frame[16, 16, 0]) / GREY_STEP) for frame in frames]
 
 
-def _audio_indices(audio):
-    return [round(float(np.median(row)) * 32768 / SAMPLE_STEP) for row in audio]
+def _sound(first, count):
+    """The fixture's samples from `first` on, `count` of them, as the reader returns them."""
+    index = np.arange(first, first + count)
+    return (index // SAMPLES_PER_FRAME * SAMPLE_STEP).astype(np.float32) / 32768
 
 
-@pytest.mark.parametrize("seed", [0, 3, 7])
-def test_a_clip_holds_the_frames_the_seed_picks_and_the_audio_under_them(clip, seed):
-    """Frames [start, start + N), audio rows [start - P, start + N + P), and
-    every audio row bit-exact: the clip is lossless and the reader asks
-    ffmpeg for the track at its own rate. Read through moviepy's audio
-    reader the rows came back scaled by 0.707 (its stereo upmix of a mono
-    track) and sampled off a 44.1 kHz stream, so no row was exact."""
-    start = choose_clip_start(CLIP_FRAMES, 8, 2, np.random.default_rng(seed))
-
-    frames, audio = read_av_random_clip(clip, num_frames=8, audio_padding=2, seed=seed)
-
-    assert frames.shape == (8, 32, 32, 3) and frames.dtype == np.uint8
-    assert audio.shape == (12, SAMPLES_PER_FRAME) and audio.dtype == np.float32
-    assert _frame_indices(frames) == list(range(start, start + 8))
-    assert _audio_indices(audio) == list(range(start - 2, start + 10))
-    expected = np.arange(start - 2, start + 10, dtype=np.float32)[:, None] * SAMPLE_STEP / 32768
-    assert np.array_equal(audio, np.broadcast_to(expected, audio.shape))
+def _sound_from(wave, first):
+    """Whether `wave` is the fixture's sound from sample `first`, to ffmpeg's rounding of the seek to
+    the nearest sample (one sample is 62.5 microseconds)."""
+    return any(np.array_equal(wave, _sound(first + shift, len(wave))) for shift in (-1, 0, 1))
 
 
-def test_the_same_seed_reads_the_same_clip_without_touching_the_global_rng(clip):
-    np.random.seed(99)
-    global_state = np.random.get_state()[1].copy()
+def test_a_clip_s_frames_and_sound_come_from_the_window_one_draw_picks(media):
+    """Every record draws its own window two frames clear of either end; its 8 frames are the
+    frames at the window's start and the 7 after, and its sound is the track from 2 frames before
+    the window to 2 after it, sample for sample. The clip arrives as bytes or as a path."""
+    with open(media["clip"], "rb") as file:
+        clip = file.read()
+    rows = [{"mp4": clip if index % 2 else media["clip"], "id": index} for index in range(8)]
+    chain = (Memory(rows).filter_map(video.pick_clip(8 / FPS, margin=2 / FPS))
+             .filter_map(video.decode(8, fps=FPS, size=32))
+             .filter_map(audio.decode(SAMPLE_RATE, context=2 / FPS))
+             .select_columns("clip", "video", "audio", "audio_valid"))
 
-    first = read_av_random_clip(clip, num_frames=8, audio_padding=1, seed=3)
-    second = read_av_random_clip(clip, num_frames=8, audio_padding=1, seed=3)
-    other = read_av_random_clip(clip, num_frames=8, audio_padding=1, seed=4)
+    records = _records(chain)
 
-    assert np.array_equal(first[0], second[0]) and np.array_equal(first[1], second[1])
-    assert not np.array_equal(first[0], other[0])
-    assert np.array_equal(global_state, np.random.get_state()[1])
-
-
-def test_an_audio_window_is_the_samples_between_its_times(clip):
-    """The window is cut by time, mono at the rate asked for; a clip a few
-    frames in starts at exactly that frame's first sample."""
-    window = audio_window(clip, 3 / FPS, 2 / FPS, SAMPLE_RATE)
-
-    assert window.shape == (2 * SAMPLES_PER_FRAME,) and window.dtype == np.float32
-    assert np.array_equal(
-        window[:SAMPLES_PER_FRAME], np.full(SAMPLES_PER_FRAME, 3 * SAMPLE_STEP / 32768, np.float32)
-    )
-    assert np.array_equal(
-        window[SAMPLES_PER_FRAME:], np.full(SAMPLES_PER_FRAME, 4 * SAMPLE_STEP / 32768, np.float32)
-    )
-
-
-def test_a_clip_longer_than_the_video_is_refused(clip):
-    with pytest.raises(ValueError, match="needs 54"):
-        read_av_random_clip(clip, num_frames=50, audio_padding=2, seed=0)
+    assert len(records) == 8
+    assert len({float(record["clip"][0]) for record in records}) == 8
+    for record in records:
+        start, stop = record["clip"]
+        assert start >= 2 / FPS and stop <= (CLIP_FRAMES - 2) / FPS and stop - start == pytest.approx(8 / FPS)
+        assert record["video"].shape == (8, 32, 32, 3) and record["video"].dtype == np.uint8
+        assert _frame_indices(record["video"]) == [int(FPS * (start + i / FPS) + 1e-5) for i in range(8)]
+        assert record["audio"].shape == (12 * SAMPLES_PER_FRAME,) and record["audio"].dtype == np.float32
+        assert _sound_from(record["audio"], round((start - 2 / FPS) * SAMPLE_RATE))
+        assert record["audio_valid"].all()
 
 
-def test_a_rate_that_is_not_whole_samples_per_frame_is_refused(clip):
-    with pytest.raises(ValueError, match="whole number"):
-        read_av_random_clip(clip, num_frames=8, audio_padding=2, seed=0, fps=30.0)
+def test_a_sound_file_reads_through_the_same_stages(media):
+    chain = (Memory([{"wav": media["sound"], "id": index} for index in range(4)])
+             .filter_map(video.pick_clip(0.5, field="wav"))
+             .filter_map(audio.decode(SAMPLE_RATE, field="wav")))
+
+    for record in _records(chain):
+        assert record["audio"].shape == (SAMPLE_RATE // 2,) and record["audio_valid"].all()
+        assert _sound_from(record["audio"], round(float(record["clip"][0]) * SAMPLE_RATE))
+        assert "video" not in record
 
 
-def test_a_video_without_audio_is_refused(tmp_path):
-    silent = _clip(tmp_path, name="silent.mkv", audio=False)
-    with pytest.raises(ValueError, match="does not contain any stream"):
-        read_av_random_clip(silent, num_frames=8, audio_padding=2, seed=0)
+def test_sound_a_window_lacks_is_rejected_or_silence_marked_invalid(media):
+    """A clip with no track, one whose track ends inside the window and a window whose context
+    opens before the file: rejected, or under `missing="silence"` held as silence that
+    `audio_valid` marks, the sound there is sample for sample where it is."""
+    window = np.asarray([0.6, 0.92])
+    rows = [{"mp4": media["silent"], "clip": window, "id": 0},
+            {"mp4": media["short"], "clip": window, "id": 1},
+            {"mp4": media["clip"], "clip": np.asarray([0.0, 0.32]), "id": 2},
+            {"mp4": media["clip"], "clip": window, "id": 3}]
+    context = 2 / FPS
+
+    def read(missing):
+        chain = Memory(rows).filter_map(audio.decode(SAMPLE_RATE, context=context, missing=missing))
+        return {int(record["id"]): record for record in _records(chain)}
+
+    assert list(read("reject")) == [3]
+    silence = read("silence")
+    silent, short, early, whole = (silence[index] for index in range(4))
+    samples = round((0.32 + 2 * context) * SAMPLE_RATE)
+    assert not silent["audio_valid"].any() and not silent["audio"].any()
+    # The short clip's sound ends at 0.8 seconds, 0.28 seconds into the widened window.
+    held = round(0.28 * SAMPLE_RATE)
+    assert short["audio_valid"].tolist() == [True] * held + [False] * (samples - held)
+    assert _sound_from(short["audio"][:held], round(0.52 * SAMPLE_RATE)) and not short["audio"][held:].any()
+    # The early window's context opens 2 frames before the file does.
+    lead = 2 * SAMPLES_PER_FRAME
+    assert early["audio_valid"].tolist() == [False] * lead + [True] * (samples - lead)
+    assert not early["audio"][:lead].any() and _sound_from(early["audio"][lead:], 0)
+    assert whole["audio_valid"].all() and _sound_from(whole["audio"], round(0.52 * SAMPLE_RATE))
 
 
-def test_a_missing_decoded_frame_reports_its_time(monkeypatch):
-    from contextlib import nullcontext
-    from types import SimpleNamespace
+def test_media_too_short_or_unreadable_is_dropped_and_frames_past_their_window_raise(media):
+    rows = [{"mp4": media["clip"], "id": 0}, {"mp4": b"not a clip" * 64, "id": 1}]
 
-    import moviepy
+    assert _records(Memory(rows).filter_map(video.pick_clip(3.0))) == []
+    picked = _records(Memory(rows).filter_map(video.pick_clip(1.0)))
+    assert [int(record["id"]) for record in picked] == [0]
+    with pytest.raises(ValueError, match="run past"):
+        video.decode(10, fps=FPS).map({"mp4": media["clip"], "clip": np.asarray([0.0, 8 / FPS])})
 
-    video = SimpleNamespace(duration=2.0, get_frame=lambda timestamp: None)
-    monkeypatch.setattr(moviepy, "VideoFileClip",
-                        lambda path, audio: nullcontext(video))
-    with pytest.raises(ValueError, match=r"missing.mp4 returned no video frame at"):
-        read_av_random_clip("missing.mp4", num_frames=1, audio_padding=0, seed=0)
+
+def test_a_window_is_the_record_s_own_draw():
+    """The same record draws the same window in any read, without the global generator."""
+    np.random.seed(1234)
+    state = np.random.get_state()[1].copy()
+    pick = video.pick_clip(0.4, margin=0.1)
+
+    from dew.data.sources import av_utils
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(av_utils, "media_info", lambda path: (2.0, True, True))
+        first = [pick.random_map({"mp4": "x"}, np.random.default_rng(seed))["clip"] for seed in range(64)]
+        again = [pick.random_map({"mp4": "x"}, np.random.default_rng(seed))["clip"] for seed in range(64)]
+
+    assert all(np.array_equal(a, b) for a, b in zip(first, again, strict=True))
+    starts = np.asarray([clip[0] for clip in first])
+    assert starts.min() >= 0.1 and starts.max() <= 2.0 - 0.4 - 0.1 and len(set(starts.tolist())) == 64
+    assert np.array_equal(state, np.random.get_state()[1])

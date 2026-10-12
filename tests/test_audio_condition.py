@@ -19,7 +19,6 @@ from dew.config import ModelConfig, ObjectiveConfig
 from dew.config.data import ImageData, VideoData, loader
 from dew.data import Loading
 from dew.data.dataset import DataPartition
-from dew.data.steps.image import EncodeCaptions
 from dew.inputs import Condition, HFAudio
 from dew.objectives.base import Step
 from dew.objectives.diffusion import AudioCondition, DiffusionRunConfig
@@ -162,9 +161,9 @@ def test_an_audio_conditioned_video_run_learns_and_samples_from_audio(towers, tm
     assert objective.inputs.conditions["textcontext"].encoder.seconds == data.audio_seconds
     assert DiffusionRunConfig.from_dict(config.to_dict()) == config
     dataset = loader(data, batch=8, read="memory", loading=Loading(workers=0),
-                   host=(EncodeCaptions(objective.inputs.tokenize),))
+                   host=objective.data().train_batch)
     batch = next(dataset.train(DataPartition()))
-    assert set(batch) == {"video", "audio"}
+    assert set(batch) == {"video", "audio", "audio_valid"} and set(batch["audio"]) == {"input_values"}
 
     keys = jax.random.split(jax.random.PRNGKey(7), 64)
     scored = jax.jit(lambda variables, key: objective.loss(

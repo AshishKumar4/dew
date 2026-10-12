@@ -122,9 +122,9 @@ class AudioCondition:
     """Audio conditioning on each clip, through the video dataset's own audio model.
 
     The dataset's `audio_model` names the `hf_audio` tower, whose feature
-    extractor already wrote the batch's `audio` field. The dataset's clip length
-    sets the waveform length used to encode every clip and the silent
-    unconditional input, so the two always agree.
+    extractor encodes the waveform in the batch's `audio` field on the host.
+    The dataset's clip length sets the waveform length used to encode every
+    clip and the silent unconditional input, so the two always agree.
     """
 
     encoder: ClassVar[str] = "hf_audio"

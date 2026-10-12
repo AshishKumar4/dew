@@ -289,12 +289,16 @@ class DiffusionObjective(Objective[Ratio]):
 
     def data(self, tokenizer=None) -> ObjectiveData:
         """Each batch's captions tokenized for the conditions, on the host, as
-        the step reads them; without text conditions, captions are dropped."""
+        the step reads them, and the fields other conditions read (a clip's
+        sound) encoded; without text conditions, captions are dropped."""
         from dew.data.pipeline import ObjectiveData
-        from dew.data.steps.image import EncodeCaptions
+        from dew.data.steps.image import EncodeCaptions, EncodeFields
 
-        captions = (EncodeCaptions(self.inputs.tokenize if self.inputs.conditions else None),)
-        return ObjectiveData(train_batch=captions, evaluate_batch=captions)
+        conditions = self.inputs.conditions.values()
+        steps = (EncodeCaptions(self.inputs.tokenize if conditions else None),
+                 *((EncodeFields(self.inputs.encode_fields),)
+                   if any(not condition.encoder.reads_captions for condition in conditions) else ()))
+        return ObjectiveData(train_batch=steps, evaluate_batch=steps)
 
     def real_lengths(self, batch: Batch) -> np.ndarray:
         """The denoiser's real patch-token lengths from the objective's latent shape."""
