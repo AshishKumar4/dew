@@ -62,6 +62,7 @@ from numpy.typing import ArrayLike, DTypeLike
 
 from dew import records
 from dew.interop.weights import checkpoint_array
+from dew.nn.fake_quant import E2M1, E2M1_MIDPOINTS
 
 # --------------------------------------------------------------------------
 # E2M1 codes under E8M0 exponents, shared by every FP4 format
@@ -70,14 +71,8 @@ from dew.interop.weights import checkpoint_array
 GROUP = 32
 """Inputs that share one E8M0 exponent in every MX format: 16 packed bytes."""
 
-E2M1 = np.array([0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6], np.float32)
-"""The value of each E2M1 code, in code order."""
-
 _E2M1_BYTES = np.stack((E2M1[np.arange(256) & 15], E2M1[np.arange(256) >> 4]), axis=-1)
-"""The two values each packed byte holds, low nibble first."""
-
-_E2M1_MIDPOINTS = (E2M1[:7] + E2M1[1:8]) / 2
-"""The magnitudes halfway between neighbouring E2M1 values, 0.25 up to 5."""
+"""The two values each packed byte holds, low nibble first (`E2M1`)."""
 
 _CODE_DTYPES = (np.dtype(np.uint8), np.dtype(np.int8))
 """Packed E2M1 pairs: U8 in GPT OSS and compressed-tensors, I8 in DeepSeek-V4."""
@@ -129,7 +124,7 @@ def encode_e2m1(quotients: np.ndarray, *, ties: Literal['even', 'away']) -> np.n
     if ties == 'even':
         codes = quotients.astype(ml_dtypes.float4_e2m1fn).view(np.uint8)
     else:
-        magnitudes = np.searchsorted(_E2M1_MIDPOINTS, np.abs(quotients), side='right')
+        magnitudes = np.searchsorted(E2M1_MIDPOINTS, np.abs(quotients), side='right')
         codes = magnitudes.astype(np.uint8) | (np.signbit(quotients).astype(np.uint8) << 3)
     return codes[..., 0::2] | (codes[..., 1::2] << 4)
 

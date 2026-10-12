@@ -18,6 +18,13 @@ def frequency_exponent(half: int, shift: float, max_period: float) -> torch.Tens
     return exponent / (half - shift)
 
 
+def torch_exp_disagreements(half: int) -> int:
+    """How many of a `half`-entry table's frequencies torch's float32 `exp`
+    rounds differently from the float64 one; the attribution a record carries."""
+    exponent = frequency_exponent(half, 0, 10000)
+    return int((torch.exp(exponent) != torch.exp(exponent.double()).float()).sum())
+
+
 def rounded_timestep_embedding(timesteps, embedding_dim, flip_sin_to_cos=False,
                                downscale_freq_shift=1, scale=1, max_period=10000):
     """The source's `get_timestep_embedding` with its exponential taken in

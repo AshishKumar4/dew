@@ -52,8 +52,12 @@ def power_decay(std: float) -> optax.Schedule:
     The decay is computed as exp((γ + 1) log1p(-1/t)). That keeps
     1 - decay, which is of order (γ + 1)/t, accurate in fp32 late in a run.
     """
-    power = exponent(std) + 1
+    return powered_decay(exponent(std) + 1)
 
+
+def powered_decay(power) -> optax.Schedule:
+    """The decay schedule of the power-function EMA whose γ + 1 is `power`,
+    a number or an array (`power_decay`)."""
     def decay(count):
         steps = jnp.asarray(count, jnp.float32) + 1
         return jnp.exp(power * jnp.log1p(-1 / steps))
