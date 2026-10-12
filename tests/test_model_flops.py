@@ -609,20 +609,28 @@ def test_training_work_assembly_is_distinct_from_forward_model_count():
     assert objective.training_flops(None, batch) == 3 * objective.model_flops(None, batch)
 
 
-def test_qwen35_reference_uses_the_counted_real_token_backbone_convention():
+def test_qwen35_reference_uses_the_counted_real_token_backbone_convention(monkeypatch):
     """The reference workload has no vocabulary projection, only its backbone.
 
     Translate its committed released config without allocating any weights;
     8x3072 real rows and the same 6HDkDv recurrent convention must give the
-    number both device runners publish, rather than an independent literal.
+    work record both device runners publish.
     """
-    from tools.reference_runs.qwen35 import FLOPS_PER_STEP
+    from tool_support import REPO_ROOT, load
+
+    monkeypatch.syspath_prepend(str(REPO_ROOT / "tools" / "reference_runs"))
+    writer = load("reference_runs/work")
+    runner = load("reference_runs/dew_qwen35_step")
 
     path = Path(__file__).parent / "fixtures" / "hf" / "qwen35-0.8b" / "config.json"
     config = json.loads(path.read_text())
     model = translate_config(config["text_config"]).value
-    counted = int(3 * counted_flops(model, np.full((8,), 3072, np.int64)))
-    assert counted == FLOPS_PER_STEP, (counted, FLOPS_PER_STEP, counted - FLOPS_PER_STEP)
+    batch = {"tokens": np.zeros((8, 3072), np.int32)}
+    objective = runner.BackboneLoss(model, None, np.ones(model.emb_features, np.float32), 3072)
+    record = writer.measure(objective, batch)
+    assert record.training_flops_per_step == 3 * counted_flops(model, np.full((8,), 3072, np.int64))
+    assert record.training_flops_per_step == objective.training_flops(None, batch)
+    assert record.tokens_per_step == 8 * 3072
 
 
 def _kernels(variables) -> dict[tuple[str, ...], tuple[int, ...]]:

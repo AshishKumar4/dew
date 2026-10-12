@@ -28,7 +28,7 @@ import numpy as np
 import optax
 import pytest
 from reference_error import assert_as_exact_as_the_reference
-from tool_support import load
+from tool_support import REPO_ROOT, load
 
 from dew.config import OptimConfig
 from dew.interop import Pretrained
@@ -121,6 +121,9 @@ def qwen35_records(smoke=False):
               "parameter_count": 23564}
     record = {
         "session": "session", "smoke": smoke, "commit": "commit", "config": config,
+        "work": {"training_flops_per_step": 1000.0, "tokens_per_step": batch * sequence,
+                 "basis": "analytic, real tokens", "model_identity": "matched-native-config",
+                 "batch_shape": [batch, sequence]},
         "host": {"hostname": "same-host", "cuda_visible_devices": None},
         "environment": {"device": "same-device", "packages": {}},
         "checks": {"loss_first": 0.39884394, "finite_losses": True, "no_timing_window_compilation": True},
@@ -208,6 +211,10 @@ def test_qwen35_pair_run_exits_nonzero_when_dew_is_slower(tmp_path, monkeypatch,
     def child(command, **kwargs):
         if command[0] == "git":
             return real_run(command, **kwargs)
+        if "work.py" in command[1]:
+            Path(command[command.index("--out") + 1]).write_text(json.dumps(records["torch"][0]["work"]))
+            calls.append("work")
+            return subprocess.CompletedProcess(command, 0)
         framework = "torch" if "torch_qwen35_step.py" in command[1] else "dew"
         index = sum(call == framework for call in calls)
         record = records[framework][index]
@@ -220,11 +227,117 @@ def test_qwen35_pair_run_exits_nonzero_when_dew_is_slower(tmp_path, monkeypatch,
     monkeypatch.setattr(pair.subprocess, "run", child)
     args = pair.arguments(["--torch-python", "torch-python", "--out", str(tmp_path / "pair.json")])
     assert pair.run(args) == code
-    assert calls == ["torch", "dew", "torch", "dew"]
+    assert calls == ["work", "torch", "dew", "torch", "dew"]
     written = json.loads(args.out.read_text())
     assert written["comparison"]["dew_over_torch"] == rate / 100
     assert written["comparison"]["performance_claim_passed"] is (code == 0)
-    assert len(written["commands"]) == 4
+    assert len(written["commands"]) == 5
+
+
+@pytest.mark.parametrize("family", ["qwen3-tiny", "mamba2-tiny", "mixtral-tiny", "qwen3-moe-tiny",
+                                    "qwen35-tiny"])
+def test_reference_work_is_the_trainers_training_flops_at_the_same_shape(tmp_path, monkeypatch, family):
+    """A shifted target column is real data, but contributes no extra model token."""
+    from dew.interop import translate_config
+    from dew.telemetry.workload import WorkloadWork
+    from dew.training.model_flops import TRAINING_FLOPS, prepare_counts
+
+    monkeypatch.syspath_prepend(str(REPO_ROOT / "tools" / "reference_runs"))
+    writer = load("reference_runs/work")
+    args = writer.arguments(["lm", "--config", str(FIXTURES / "hf" / family / "config.json"),
+                             "--batch", "2", "--seq", "4", "--dtype", "float32",
+                             "--attention", "xla", "--out", str(tmp_path / "work.json")])
+    work = args.count(args)
+    import json
+
+    fields = translate_config(json.loads(Path(args.config).read_text()))
+    fields.update(dtype="float32", attention_impl="xla")
+    objective = LMObjective(fields.value, seq_len=4, ema_decay=None)
+    batch = {TEXT_KEY: np.zeros((2, 5), np.int32)}
+    trainer = Trainer(objective, optax.adamw(1e-3), key=jax.random.key(0), tracker=None, checkpoints=None)
+    assert work.training_flops_per_step == trainer.objective.training_flops(None, batch)
+    counted = prepare_counts(trainer.objective, batch, count_model=True)
+    assert float(np.sum(counted[TRAINING_FLOPS])) == work.training_flops_per_step
+    assert work.tokens_per_step == 8
+    assert work.batch_shape == (2, 5)
+    work.write(args.out)
+    assert WorkloadWork.read(args.out) == work
+    identity = json.loads(work.model_identity)
+    assert identity["fields"]["emb_features"] == fields.value.emb_features
+
+
+def test_dit_work_includes_the_native_conditioning_geometry(monkeypatch):
+    from dew.nn.backbones.dit import SimpleDiT
+
+    monkeypatch.syspath_prepend(str(REPO_ROOT / "tools" / "reference_runs"))
+    runner = load("reference_runs/diffusion")
+    writer = load("reference_runs/work")
+    objective = runner.counting_objective((8, 8, 3), "float32", "xla")
+    batch = {"image": np.zeros((2, 8, 8, 3), np.uint8)}
+    work = writer.measure(objective, batch)
+    assert work.training_flops_per_step == objective.training_flops(None, batch)
+    assert work.tokens_per_step == 8
+    assert work.examples_per_step == 2
+    model = SimpleDiT(**runner.MODEL)
+    assert work.training_flops_per_step == 3 * model.image_flops(np.array([4, 4]), 3)
+
+
+def test_qwen35_work_counts_the_shared_smoke_geometry(monkeypatch, tmp_path):
+    """The config-only count must see the convolution that HF builds by default."""
+    from dew.nn.flops import counted_flops
+    from dew.telemetry.workload import WorkloadWork
+
+    monkeypatch.syspath_prepend(str(REPO_ROOT / "tools" / "reference_runs"))
+    writer = load("reference_runs/work")
+    args = writer.arguments(["qwen35", "--smoke", "--dtype", "float32",
+                             "--out", str(tmp_path / "work.json")])
+    work = args.count(args)
+    shared = load("reference_runs/qwen35")
+    from dew.interop import translate_config
+
+    model = translate_config(shared.config(smoke=True)).value
+    assert work.training_flops_per_step == 3 * counted_flops(model, np.array([16, 16]))
+    assert work.tokens_per_step == 32
+    assert work.batch_shape == (2, 16)
+    work.write(args.out)
+    assert WorkloadWork.read(args.out) == work
+
+
+@pytest.mark.parametrize("runner, argv", [
+    ("torch_lm", ["--model", "model", "--data", "data", "--out", "out", "--batch", "2",
+                  "--precision", "fp32"]),
+    ("maxtext_run", ["--model", "model", "--model-name", "qwen3-0.6b", "--out", "out",
+                     "--batch", "2", "--mesh", "data"]),
+])
+def test_reference_runner_requires_the_native_work_record(monkeypatch, capsys, runner, argv):
+    monkeypatch.syspath_prepend(str(REPO_ROOT / "tools" / "reference_runs"))
+    tool = load(f"reference_runs/{runner}")
+    with pytest.raises(SystemExit) as stopped:
+        tool.arguments(argv)
+    assert stopped.value.code == 2
+    assert "the following arguments are required: --work" in capsys.readouterr().err
+    assert tool.arguments([*argv, "--work", "work.json"]).work == "work.json"
+
+
+def test_reference_reads_work_without_importing_dew_or_jax(tmp_path):
+    import subprocess
+    import sys
+
+    from dew.telemetry.workload import WorkloadWork
+
+    work = WorkloadWork(1234.0, 8, "analytic, real tokens, causal half", "native-config", (2, 5))
+    path = tmp_path / "work.json"
+    work.write(path)
+    script = (
+        "import sys; sys.path.insert(0, sys.argv[1]); from common import WorkloadWork; "
+        "record = WorkloadWork.read(sys.argv[2]); "
+        "assert record.training_flops_per_step == 1234.0; "
+        "assert record.tokens_per_step == 8; assert record.batch_shape == (2, 5); "
+        "assert not ({\"dew\", \"jax\", \"flax\"} & sys.modules.keys())"
+    )
+    result = subprocess.run([sys.executable, "-c", script, str(REPO_ROOT / "tools" / "reference_runs"),
+                             str(path)], capture_output=True, text=True)
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_torch_reference_keeps_whole_run_peak_beside_reset_window_peak(monkeypatch):
