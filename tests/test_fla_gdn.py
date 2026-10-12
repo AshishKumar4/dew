@@ -512,8 +512,10 @@ def test_a_remat_policy_saves_the_ports_named_residuals_and_changes_no_gradient(
     """A block's remat policy may keep the rule's output and the port's saved decay and inverse
     (`decoder_block.RESIDUALS`): the layer under `jax.checkpoint` with that policy computes its
     gradients within tests/reference_error.py's rule of the layer without one, both measured from
-    the layer in float64. Not bitwise on a GPU: the recomputed forward is another program, whose
-    GEMMs XLA may give other algorithms."""
+    the layer in float64. At IEEE products: the recomputed forward is another program, and on an
+    H100 SXM XLA gave its TF32 GEMMs other algorithms, which put A_log's and dt_bias's gradients
+    4.6 and 5.1 times the plain step's distance from float64; the port's own products are the same
+    kernels in both."""
     from dew.nn.backbones.decoder_block import RematPolicy
 
     policy = RematPolicy(save=("context", "delta_decay", "delta_inverse")).checkpoint_policy()
@@ -524,8 +526,9 @@ def test_a_remat_policy_saves_the_ports_named_residuals_and_changes_no_gradient(
     def loss(params, x):
         return jnp.sum(layer.apply(params, x) ** 2)
 
-    want = jax.jit(jax.grad(loss))(params, x)
-    got = jax.jit(jax.grad(jax.checkpoint(loss, policy=policy)))(params, x)
+    with jax.default_matmul_precision("highest"):
+        want = jax.jit(jax.grad(loss))(params, x)
+        got = jax.jit(jax.grad(jax.checkpoint(loss, policy=policy)))(params, x)
     cpu = jax.devices("cpu")[0]
     with jax.enable_x64(new_val=True), jax.default_device(cpu):
         truth = jax.grad(loss)(*jax.device_put(widened((params, x)), cpu))
