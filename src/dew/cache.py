@@ -92,6 +92,13 @@ a context JAX keys its trace and compile caches on, so a program lowered
 after picks change traces again. Made at `import dew`, as JAX makes a user
 context only beside no other JAX call."""
 
+KERNEL_LAUNCHES = jax.make_user_context(default_value=False)
+"""Whether a traced kernel launch carries tokamax's description of itself
+(`dew.nn.kernels.tuning.launches`), keyed on as `KERNEL_TUNES` is. Only the
+lowering `tune` reads its launches from carries it: jaxlib 0.11.2 writes a
+compiled program holding it to the persistent cache and cannot read it back
+("Invalid metadata payload id")."""
+
 KERNEL_PINS = jax.make_user_context(())
 """The `(kernel, config)` pairs `dew.nn.kernels.tuning.pinned` holds in this
 thread, keyed on as `KERNEL_TUNES` is."""
