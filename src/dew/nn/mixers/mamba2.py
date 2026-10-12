@@ -53,6 +53,7 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 from jax.sharding import PartitionSpec as P
 
+from dew.nn.attention import unweighted_rmsnorm
 from dew.nn.blocks import normal_kernel
 from dew.nn.flops import conv_flops, projection_flops, ssd_flops
 from dew.nn.inputs import AttentionMetadata, coordinates_of
@@ -256,16 +257,10 @@ class MambaRMSNormGated(nn.Module):
     def __call__(self, x, gate):
         dtype = self.dtype if self.dtype is not None else x.dtype
         wide = at_least_fp32(x.dtype)
+        if self.groups < 1 or x.shape[-1] % self.groups:
+            raise ValueError(f"norm groups ({self.groups}) must divide the width ({x.shape[-1]})")
         y = x.astype(wide) * nn.silu(gate.astype(wide))
-        if self.groups == 1:
-            y = y * jax.lax.rsqrt(jnp.mean(jnp.square(y), axis=-1, keepdims=True) + self.epsilon)
-        else:
-            if self.groups < 1 or x.shape[-1] % self.groups:
-                raise ValueError(f"norm groups ({self.groups}) must divide the width ({x.shape[-1]})")
-            grouped = y.reshape(*y.shape[:-1], self.groups, y.shape[-1] // self.groups)
-            grouped = grouped * jax.lax.rsqrt(
-                jnp.mean(jnp.square(grouped), axis=-1, keepdims=True) + self.epsilon)
-            y = grouped.reshape(y.shape)
+        y = unweighted_rmsnorm(y.reshape(*y.shape[:-1], self.groups, -1), self.epsilon).reshape(y.shape)
         scale = self.param('weight', nn.initializers.ones, (x.shape[-1],), jnp.float32)
         return (scale.astype(dtype) * y.astype(dtype)).astype(dtype)
 

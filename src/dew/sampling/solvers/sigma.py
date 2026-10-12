@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 import jax
 import jax.numpy as jnp
+from flax import struct
 from jax import lax
 
 from dew.diffusion.schedules import expand
@@ -35,7 +34,7 @@ def _ancestral(sigma_t, sigma_s):
     sigma_up = (sigma_s ** 2 * (sigma_t ** 2 - sigma_s ** 2) / sigma_t ** 2) ** 0.5
     return (sigma_s ** 2 - sigma_up ** 2) ** 0.5, sigma_up
 
-@dataclass(frozen=True)
+@struct.dataclass
 class Euler:
     """The DDIM update written as an Euler step of the probability flow ODE.
     On a variance exploding schedule it is dx/dsigma = eps."""
@@ -48,7 +47,7 @@ class Euler:
         return stepped, state
 
 
-@dataclass(frozen=True)
+@struct.dataclass
 class EulerAncestral:
     """Euler with k-diffusion's ancestral noise injection (`get_ancestral_step`, eta 1).
 
@@ -70,7 +69,7 @@ class EulerAncestral:
         return x + dx * (sigma_down - sigma_t) + dW, state
 
 
-@dataclass(frozen=True)
+@struct.dataclass
 class Heun:
     """Heun's second-order method: an Euler step, the derivative re-evaluated at its end, and their average.
 
@@ -93,10 +92,10 @@ class Heun:
     limited prediction without the solver knowing about it.
     """
 
-    s_churn: float = 0.0
-    s_tmin: float = 0.0
-    s_tmax: float = float("inf")
-    s_noise: float = 1.0
+    s_churn: float = struct.field(pytree_node=False, default=0.0)
+    s_tmin: float = struct.field(pytree_node=False, default=0.0)
+    s_tmax: float = struct.field(pytree_node=False, default=float("inf"))
+    s_noise: float = struct.field(pytree_node=False, default=1.0)
 
     def init(self, x, times, process, *, key):
         if not self.s_churn:
@@ -144,7 +143,7 @@ class Heun:
         return lax.cond(jnp.all(sigma_s == 0), lambda _: x_euler, corrected, None), state
 
 
-@dataclass(frozen=True)
+@struct.dataclass
 class RK4:
     """Classical fourth-order Runge-Kutta over dx/dsigma = eps on a variance-exploding schedule.
 
@@ -171,7 +170,7 @@ class RK4:
         return x + (k1 + 2 * k2 + 2 * k3 + k4) * dt / 6, state
 
 
-@dataclass(frozen=True)
+@struct.dataclass
 class KDPM2:
     """k-diffusion's DPM-Solver-2 (`sample_dpm_2`), the update of Diffusers
     0.34.0's `KDPM2DiscreteScheduler`, and with `ancestral` its
@@ -185,7 +184,7 @@ class KDPM2:
     integrates a `GeneralizedNoiseScheduler`.
     """
 
-    ancestral: bool = False
+    ancestral: bool = struct.field(pytree_node=False, default=False)
 
     def init(self, x, times, process, *, key):
         return ()
@@ -216,7 +215,7 @@ class KDPM2:
 
         return lax.cond(jnp.all(sigma_s == 0), lambda _: denoised, midpoint, None), state
 
-@dataclass(frozen=True)
+@struct.dataclass
 class MultiStepDPM:
     """A third order multistep integrator of dx/dsigma = eps on a variance
     exploding schedule, from finite differences of the last three eps:
@@ -267,7 +266,7 @@ def _lagrange_integral(nodes: list, j: int, a, b):
     return integral / scale
 
 
-@dataclass(frozen=True)
+@struct.dataclass
 class LMS:
     """Linear multistep over dx/dsigma = (x - x_0) / sigma, k-diffusion's
     `sample_lms` and Diffusers 0.34.0's `LMSDiscreteScheduler`: the last
@@ -277,7 +276,7 @@ class LMS:
     `GeneralizedNoiseScheduler`.
     """
 
-    order: int = 4
+    order: int = struct.field(pytree_node=False, default=4)
 
     def __post_init__(self) -> None:
         if self.order < 1:

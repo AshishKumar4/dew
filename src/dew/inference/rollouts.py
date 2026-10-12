@@ -466,7 +466,7 @@ class OpenAIRolloutServer(_RequestServer):
     `--enable-deterministic-inference`.
 
     With `routing=True`, every draw records vLLM's routed experts for
-    routing replay (`dew.nn.moe.Routes`); the engine must run with
+    routing replay (`dew.nn.protocols.Routes`); the engine must run with
     `--enable-return-routed-experts`.
     """
 

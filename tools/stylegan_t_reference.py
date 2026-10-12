@@ -14,25 +14,16 @@ lands is the inputs, every weight in Flax's layout, the spectral norms'
 
 from __future__ import annotations
 
-import ast
-import urllib.request
 from pathlib import Path
 
 import numpy as np
 import torch
+from reference_source import definitions
 from torch.nn.utils.spectral_norm import SpectralNorm
 
 ROOT = "https://raw.githubusercontent.com/autonomousvision/stylegan-t/36ab80ce76237fefe03e65e9b3161c040ae888e3/"
 FIXTURE = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "stylegan_t"
 BATCH, LENGTH, CHANNELS, CONDITION = 16, 12, 8, 6
-
-
-def definitions(url: str, names: tuple[str, ...], scope: dict) -> dict:
-    text = urllib.request.urlopen(url).read().decode()
-    for node in ast.parse(text).body:
-        if isinstance(node, (ast.FunctionDef, ast.ClassDef)) and node.name in names:
-            exec(ast.get_source_segment(text, node), scope)
-    return scope
 
 
 def main() -> None:
