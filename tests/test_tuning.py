@@ -84,14 +84,15 @@ def test_a_steps_launches_take_pins_stored_picks_and_heuristics(tmp_path):
 
     usual = launches(jax.grad(loss, argnums=(0, 1, 2, 3, 4)), *operands(15))
     assert usual["rms_norm_forward"] == ((1,), 4) and usual["swiglu_forward"] == ((2,), 4)
-    ends = {}
-    for extreme in tuning.EXTREMES:
-        with tuning.pinned(extreme):
-            ends[extreme] = launches(jax.grad(loss, argnums=(0, 1, 2, 3, 4)), *operands(15))
-    assert ends["lowest"]["rms_norm_forward"] == ((15,), 1)
-    assert ends["highest"]["rms_norm_forward"] == ((1,), 8)
-    assert ends["lowest"]["swiglu_forward"] == ((6,), 1) and ends["highest"]["swiglu_forward"] == ((1,), 8)
-    assert ends["lowest"]["rms_norm_backward"] == ((15,), 2)
+    # A pinned config its space holds wins; one it does not hold (64 rows of a 64-wide norm) is passed over.
+    with tuning.pinned({norm_swiglu.RmsForward: norm_swiglu.RowsConfig(1, 1),
+                        norm_swiglu.RmsBackward: norm_swiglu.ReverseConfig(1, 256, 2),
+                        norm_swiglu.SwigluForward: norm_swiglu.BlockConfig(4096, 8)}):
+        pinned = launches(jax.grad(loss, argnums=(0, 1, 2, 3, 4)), *operands(15))
+    assert pinned["rms_norm_forward"] == ((15,), 1) and pinned["rms_norm_backward"] == ((15,), 2)
+    assert pinned["swiglu_forward"] == ((1,), 8) and pinned["swiglu_backward"] == usual["swiglu_backward"]
+    with tuning.pinned({norm_swiglu.RmsForward: norm_swiglu.RowsConfig(64, 2)}):
+        assert launches(jax.grad(loss, argnums=(0, 1, 2, 3, 4)), *operands(15)) == usual
 
     # The picks a GPU measured, stored for this device, as a fresh process finds them.
     picked = {norm_swiglu.RmsForward: norm_swiglu.RowsConfig(4, 2),
