@@ -7,6 +7,7 @@ import itertools
 import threading
 from collections import OrderedDict
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from functools import cached_property
 
 import grain.python as grain
@@ -15,6 +16,12 @@ from dew.data.dataset import Batch
 from dew.data.storage import Store
 
 from .codec import decode
+
+
+@dataclass
+class _OpenedShard:
+    reader: ArrayRecords
+    reads: int = 0
 
 
 class ArrayRecords:
@@ -35,7 +42,7 @@ class ArrayRecords:
         ):
             raise ValueError("ArrayRecord counts must name every physical shard with a nonnegative row count")
         self._pins = []
-        self._opened: OrderedDict[int, ArrayRecords] = OrderedDict()
+        self._opened: OrderedDict[int, _OpenedShard] = OrderedDict()
         self._lock = threading.RLock()
 
     @cached_property
@@ -82,12 +89,22 @@ class ArrayRecords:
                         raise ValueError(
                             f"ArrayRecord {self.urls[shard]} differs from its producer's row count"
                         )
-                    self._opened[shard] = opened
+                    self._opened[shard] = _OpenedShard(opened)
                     if len(self._opened) > 2:
                         _, removed = self._opened.popitem(last=False)
-                        removed.close()
+                        if not removed.reads:
+                            removed.reader.close()
                 self._opened.move_to_end(shard)
-                return self._opened[shard][index - (self.ends[shard - 1] if shard else 0)]
+                opened_shard = self._opened[shard]
+                opened_shard.reads += 1
+            try:
+                return opened_shard.reader[index - (self.ends[shard - 1] if shard else 0)]
+            finally:
+                with self._lock:
+                    opened_shard.reads -= 1
+                    # A reopened shard owns a different reader from an evicted in-flight read.
+                    if not opened_shard.reads and self._opened.get(shard) is not opened_shard:
+                        opened_shard.reader.close()
         payload = self.reader[index]
         if not self.record_codec:
             return payload
@@ -111,9 +128,11 @@ class ArrayRecords:
         self._lock = threading.RLock()
 
     def close(self) -> None:
-        for opened in self._opened.values():
-            opened.close()
-        self._opened.clear()
+        with self._lock:
+            for opened in self._opened.values():
+                if not opened.reads:
+                    opened.reader.close()
+            self._opened.clear()
         self.__dict__.pop("reader", None)
         for pin in self._pins:
             pin.close()
