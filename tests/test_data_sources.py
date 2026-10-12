@@ -1,5 +1,6 @@
 """Read-mode capabilities, range splits, partition discovery and shard resume."""
 
+import dataclasses
 import hashlib
 import io
 import json
@@ -527,20 +528,45 @@ def test_raw_token_arrayrecords_require_explicit_lengths_for_indexed_reads(tmp_p
     assert reopened.tokens[2:15].tolist() == list(range(2, 15))
 
 
-def test_a_filtered_parquet_with_lengths_packs_as_its_rows_stream(tmp_path):
-    """A predicate keeps a parquet store from being read by index, so its
-    stated lengths plan no packing: its streamed rows pack as they arrive,
-    the windows holding only the rows the predicate keeps."""
-    import pyarrow.parquet as pq
+@dataclasses.dataclass(frozen=True)
+class _StreamOnly:
+    """Memory documents that state their lengths but are read only as a
+    stream, as a store filtered by a predicate is."""
 
+    memory: Memory
+
+    def describe(self):
+        return f"stream-only {self.memory.describe()}"
+
+    def snapshot(self):
+        return self.memory.snapshot()
+
+    def supports(self, read):
+        return read == "streamed"
+
+    def records(self, read):
+        return self.memory.records(read)
+
+    def manifest(self):
+        return self.memory.manifest()
+
+    def metadata(self):
+        return self.memory.metadata()
+
+    def lengths(self):
+        return np.full(len(self.memory.records("streamed")), 3)
+
+
+def test_a_source_read_only_as_a_stream_packs_its_rows_as_they_arrive():
+    """A source that states its documents' lengths but cannot be read by
+    index plans no packing: its streamed rows pack as they arrive."""
     from dew.data.compile import iterate
     from dew.data.pipeline import Pipeline
 
-    rows = [{"text": [index] * 3, "length": 3, "keep": index % 2} for index in range(8)]
-    pq.write_table(pa.Table.from_pylist(rows), tmp_path / "rows.parquet")
-    kept = Files(str(tmp_path / "rows.parquet"), columns=("text",), filter=ds.field("keep") == 1)
-    windows = list(iterate(Pipeline(kept).pack(6), read="streamed", loading=Loading(workers=0)))
-    assert sorted({int(token) for window in windows for token in window["text"] if token}) == [1, 3, 5, 7]
+    documents = Memory(tuple({"text": np.full(3, index + 1, np.int32)} for index in range(4)))
+    packed = Pipeline(_StreamOnly(documents)).pack(6)
+    windows = list(iterate(packed, read="streamed", loading=Loading(workers=0)))
+    assert sorted({int(token) for window in windows for token in window["text"] if token}) == [1, 2, 3, 4]
 
 
 def test_a_run_that_states_no_read_reads_as_its_sources_choose(tmp_path):
