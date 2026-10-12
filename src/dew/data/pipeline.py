@@ -636,19 +636,18 @@ class Dataset:
     def iterate(self) -> Iterator[Batch]:
         """This dataset's records, or its batches where it batches, read as a
         run reads them: one pass, or endlessly after a `repeat`."""
-        from dew.data.compile import validation
-        from dew.data.dataset import Closeable, DataPartition, Loading
-        from dew.objectives.base import VALID_ROWS
+        from dew.data.compile import compile
+        from dew.data.dataset import Closeable, DataPartition
 
         chain = self.chain()
         batched = any(isinstance(stage, (BatchStage, TokenBudget)) for stage in chain.stages)
-        read = chain if batched else chain.batch(1, drop_remainder=False)
-        reader = validation(read, batch=1, read=chain.mode, provision=True,
-                            loading=chain.loading or Loading())(DataPartition())
+        # A run's own lowering, so random steps draw as training draws them.
+        loader = compile(chain if batched else chain.batch(1, drop_remainder=False), read=chain.mode,
+                         provision=True, loading=chain.loading)
+        reader = loader.train(DataPartition())
         try:
             for batch in reader:
-                yield batch if batched else {
-                    name: value[0] for name, value in batch.items() if name != VALID_ROWS}
+                yield batch if batched else {name: value[0] for name, value in batch.items()}
         finally:
             cast("Closeable", reader).close()
 

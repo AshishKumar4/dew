@@ -81,6 +81,7 @@ from dew.data.pipeline import (
     TokenBudget,
     TokenGeometry,
     Volatile,
+    Windows,
     Workers,
     _rejects,
 )
@@ -709,7 +710,10 @@ def objective_steps(pipeline: Pipeline, objective: ObjectiveData, *, train: bool
         if read == "memory"
         else (Group, BatchStage, TokenBudget)
     )
-    at = _until(pipeline.stages, boundary)
+    # The objective's steps read the rows a pack or window makes, never the documents it packs.
+    layouts = [index + 1 for index, stage in enumerate(pipeline.stages) if isinstance(stage, (Pack, Windows))]
+    laid = max(layouts, default=0)
+    at = laid + _until(pipeline.stages[laid:], boundary)
     suffix = pipeline.stages[at:]
     pipeline = dataclasses.replace(pipeline, stages=pipeline.stages[:at])
     for step in objective.train if train else objective.evaluate:

@@ -9,7 +9,7 @@ datasets. The stage libraries (`images`, `video`, `text`, `chat`, `prompts`,
 `Trainer.fit` reads a dataset as the run's mesh shares it.
 """
 
-from . import chat, images, preferences, prompts, text, video
+from . import chat, images, preferences, presets, prompts, text, video
 from .chat import Role
 from .dataset import Batch, Loading
 from .pipeline import Dataset, Rejected, concat, mix
@@ -39,6 +39,7 @@ __all__ = [
     "images",
     "mix",
     "preferences",
+    "presets",
     "prompts",
     "text",
     "video",
