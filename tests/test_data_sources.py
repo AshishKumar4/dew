@@ -7,7 +7,6 @@ import json
 import pickle
 import tarfile
 import threading
-import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from uuid import uuid4
@@ -602,36 +601,43 @@ def arrayrecord_paths(tmp_path):
 
 
 def test_arrayrecords_threaded_reads_overlap(arrayrecord_paths, monkeypatch):
+    import grain.python as grain
+
     from dew.data.sources import records
 
     source = records.ArrayRecords(arrayrecord_paths[:1], counts=(8,))
     active = maximum = 0
     lock = threading.Lock()
-    start = threading.Barrier(8)
+    entered = threading.Barrier(3)
+    released = threading.Event()
+    underlying_read = grain.ArrayRecordDataSource.__getitem__
 
-    class SlowReader(records.ArrayRecords):
-        def __getitem__(self, index):
-            nonlocal active, maximum
+    def blocked_read(reader, index):
+        nonlocal active, maximum
+        with lock:
+            active += 1
+            maximum = max(maximum, active)
+        try:
+            if index < 2:
+                entered.wait(timeout=5)
+                assert released.wait(timeout=5)
+            return underlying_read(reader, index)
+        finally:
             with lock:
-                active += 1
-                maximum = max(maximum, active)
-            try:
-                time.sleep(0.05)
-                return super().__getitem__(index)
-            finally:
-                with lock:
-                    active -= 1
+                active -= 1
 
-    monkeypatch.setattr(records, "ArrayRecords", SlowReader)
-
-    def read(index):
-        start.wait(timeout=5)
-        return source[index]
-
+    monkeypatch.setattr(grain.ArrayRecordDataSource, "__getitem__", blocked_read)
     try:
-        with ThreadPoolExecutor(8) as pool:
-            assert list(pool.map(read, range(8))) == [f"0:{index}".encode() for index in range(8)]
-        assert maximum > 1
+        with ThreadPoolExecutor(2) as pool:
+            pending = [pool.submit(source.__getitem__, index) for index in range(8)]
+            try:
+                entered.wait(timeout=5)
+                assert maximum == 2
+            finally:
+                released.set()
+            assert [future.result(timeout=5) for future in pending] == [
+                f"0:{index}".encode() for index in range(8)
+            ]
     finally:
         source.close()
 
