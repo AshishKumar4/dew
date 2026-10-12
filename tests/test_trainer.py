@@ -54,7 +54,7 @@ from dew.training import (
     trainer as trainer_module,
 )
 from dew.training.interval import Book, Interval
-from dew.training.optim import Cosine
+from dew.training.optim import Cosine, Power
 from dew.training.transaction import write_back
 
 
@@ -121,6 +121,95 @@ def test_train_state_exposes_the_whole_variables_tree():
 def test_fit_trains_to_the_step_it_was_asked_for():
     state = make_trainer().fit(Data(endless), steps=4, log_every=2)
     assert int(state.step) == 4
+
+
+class TokenRegression(Regression):
+    counts_tokens = True
+
+    def real_lengths(self, batch):
+        return batch["index"] + 1
+
+
+@pytest.mark.parametrize("log_every", [1, 4])
+@pytest.mark.parametrize("accumulation", [1, 2])
+def test_a_real_token_budget_counts_each_microbatch_without_padding(log_every, accumulation):
+    tracker = RecordingTracker()
+    trainer = make_trainer(objective=TokenRegression(), tracker=tracker, accumulation=accumulation)
+    state = trainer.fit(Data(), total_tokens=30, log_every=log_every)
+    assert int(state.step) == 3  # Eight rows of lengths 1, 2, 3 cross 30 at 48.
+    if log_every == 1:
+        assert [scalars["train/tokens"] for _, scalars in tracker.scalars if "train/tokens" in scalars] == [
+            8, 16, 24]
+
+
+def test_a_token_budget_and_step_cap_stop_at_the_first_reached():
+    state = make_trainer(objective=TokenRegression()).fit(Data(), steps=2, total_tokens=30)
+    assert int(state.step) == 2
+
+
+@pytest.mark.parametrize("schedule", [None, Power(peak=.1, warmup_steps=2, a=.1, b=0),
+                                       Cosine(peak=.1, warmup_steps=1, decay_steps=8)])
+def test_a_token_only_run_uses_the_schedules_own_horizon(schedule):
+    config = OptimConfig(schedule=schedule)
+    state = make_trainer(objective=TokenRegression(), optimizer=config).fit(Data(), total_tokens=30)
+    assert int(state.step) == 3
+
+
+def test_a_token_budget_resumes_its_count_from_the_checkpoint(tmp_path):
+    first = make_trainer(tmp_path, objective=TokenRegression())
+    assert int(first.fit(Data(), steps=2, total_tokens=30, log_every=1).step) == 2
+    assert first.checkpoints.control(2)["tokens"] == 24
+    resumed = make_trainer(tmp_path, objective=TokenRegression())
+    assert int(resumed.fit(Data(), total_tokens=30, log_every=1).step) == 3
+    assert resumed.checkpoints.control(3)["tokens"] == 48
+    complete = make_trainer(tmp_path, objective=TokenRegression())
+    assert int(complete.fit(Data(), total_tokens=30).step) == 3
+
+
+def test_an_explicit_state_starts_a_token_count_with_its_own_reader(tmp_path):
+    make_trainer(tmp_path, objective=TokenRegression()).fit(Data(), steps=2, total_tokens=30)
+    trainer = make_trainer(tmp_path, objective=TokenRegression())
+    state = trainer.initial_state()
+    assert int(trainer.fit(Data(), total_tokens=30, state=state).step) == 3
+
+
+def test_a_step_only_prefix_keeps_lifetime_real_tokens(tmp_path):
+    first = make_trainer(tmp_path, objective=TokenRegression())
+    first.fit(Data(), steps=2, log_every=1)
+    assert first.checkpoints.control(2)["tokens"] == 24
+    resumed = make_trainer(tmp_path, objective=TokenRegression())
+    assert int(resumed.fit(Data(), total_tokens=30, log_every=1).step) == 3
+
+
+class LargeTokenRegression(Regression):
+    counts_tokens = True
+
+    def real_lengths(self, batch):
+        return batch["real_length"]
+
+
+class LargeTokenRows(Counting):
+    def __next__(self):
+        batch = super().__next__()
+        lengths = np.full(BATCH, 32768, np.int64)
+        lengths[-1] -= 1
+        return {**batch, "real_length": lengths}
+
+
+@pytest.mark.parametrize("cadence", [1, 100])
+def test_a_token_budget_stays_exact_above_float32_integer_resolution(cadence):
+    trainer = make_trainer(objective=LargeTokenRegression())
+    state = trainer.fit(Data(LargeTokenRows), total_tokens=65 * 262143 + 1, log_every=cadence)
+    assert int(state.step) == 66
+
+
+@pytest.mark.parametrize("cadence", [1, 100])
+def test_resumed_tokens_stay_exact_above_float32_integer_resolution(tmp_path, cadence):
+    first = make_trainer(tmp_path, objective=LargeTokenRegression())
+    first.fit(Data(LargeTokenRows), steps=65, log_every=cadence)
+    assert first.checkpoints.control(65)["tokens"] == 65 * 262143
+    resumed = make_trainer(tmp_path, objective=LargeTokenRegression())
+    assert int(resumed.fit(Data(LargeTokenRows), total_tokens=65 * 262143 + 1, log_every=cadence).step) == 66
 
 
 def test_an_optim_config_is_built_over_the_updates_fit_makes():
@@ -358,6 +447,13 @@ def test_fit_checkpoints_the_final_step(tmp_path):
     assert trainer.checkpoints.latest == 4
     assert os.path.isdir(tmp_path / "run" / "4")
     assert not os.path.exists(tmp_path / "run" / "0")
+
+
+@pytest.mark.parametrize("cadence, steps, expected", [(None, 5, set()), (2, 5, {2, 4}), (2, 6, {2, 4, 6})])
+def test_final_checkpoint_policy_is_independent_of_the_cadence(tmp_path, cadence, steps, expected):
+    trainer = make_trainer(tmp_path, keep=4)
+    trainer.fit(Data(), steps=steps, checkpoint_every=cadence, checkpoint_final=False)
+    assert set(trainer.checkpoints._open().all_steps()) == expected
 
 
 def test_checkpoint_every_saves_on_its_own_cadence(tmp_path):
@@ -997,6 +1093,14 @@ def local_trainer(tmp_path, **kwargs):
         **kwargs)
 
 
+def test_terminal_local_cadence_does_not_need_a_final_persistent_save(tmp_path):
+    trainer = local_trainer(tmp_path)
+    trainer.fit(Data(), steps=2, checkpoint_final=False)
+    restored, _, _ = local_trainer(tmp_path).place()
+    assert int(restored.step) == 2
+    assert not os.path.exists(tmp_path / "run" / "2")
+
+
 def stop_at_local_step(trainer, stop: int):
     """Kill the run right after its local save of `stop` has landed."""
     class Stop(Exception):
@@ -1018,18 +1122,17 @@ def stop_at_local_step(trainer, stop: int):
 def test_the_local_checkpoint_is_written_on_its_own_cadence_and_keeps_the_newest(tmp_path):
     """Local every two, persistent every three: after eight steps the
     persistent directory holds 3, 6 and the final 8 with their losses, the
-    local one holds 6 alone (2 and 4 replaced, the end of the run being the
-    persistent save's), and the persistent directory holds nothing of the
+    local one holds 8 alone (2, 4 and 6 replaced), and the persistent directory holds nothing of the
     local cadence."""
     trainer = local_trainer(tmp_path)
     trainer.fit(Data(), steps=8, log_every=1, checkpoint_every=3)
     checkpoints = trainer.checkpoints
 
     assert sorted(checkpoints._open().all_steps()) == [3, 6, 8]
-    assert sorted(checkpoints._open_local().all_steps()) == [6]
+    assert sorted(checkpoints._open_local().all_steps()) == [8]
     assert checkpoints.best in (3, 6, 8)
     assert checkpoints.local_path == str(tmp_path / "local" / "process0")
-    assert (tmp_path / "local" / "process0" / "6" / "commit_success.txt").exists()
+    assert (tmp_path / "local" / "process0" / "8" / "commit_success.txt").exists()
     assert not (tmp_path / "local" / "process0" / "4").exists()
     assert not (tmp_path / "run" / "4").exists()
 
@@ -1398,14 +1501,21 @@ class ManualClock:
         return self.now
 
 
-def test_the_first_log_tick_measures_steps_not_the_compile(monkeypatch):
+@pytest.mark.parametrize("report_seconds", [0.0, 1.0])
+def test_the_first_log_tick_measures_steps_not_the_compile(monkeypatch, report_seconds):
     """Every interval, the first one included, reports the time its steps
     took; placement and compile are outside every window and never land in
     train/step_time_ms, and the goodput numbers at the end count them as the
     time to the first step."""
     clock = ManualClock()
     monkeypatch.setattr(trainer_module, "time", clock)
-    tracker = RecordingTracker()
+    class SlowTracker(RecordingTracker):
+        def log(self, scalars, step):
+            super().log(scalars, step)
+            if "train/loss" in scalars:
+                clock.now += report_seconds
+
+    tracker = SlowTracker()
     trainer = make_trainer(tracker=tracker)
     place, compile_step = trainer.place, trainer.compile
 
@@ -1428,13 +1538,15 @@ def test_the_first_log_tick_measures_steps_not_the_compile(monkeypatch):
     trainer.fit(Data(endless), steps=3, log_every=1)
 
     ticks = [s for _, s in tracker.scalars if "train/step_time_ms" in s]
-    assert [s["train/step_time_ms"] for s in ticks] == pytest.approx([1000.0] * 3)
+    assert [s["train/step_time_ms"] for s in ticks] == pytest.approx([
+        1000.0, (1 + report_seconds) * 1000.0, (1 + report_seconds) * 1000.0])
     # Placement (20), the compile (100) and the first step (1) make the time
     # to the first step; the two steps after it are the 2 of 123 seconds in steps.
     goodput = [(step, s) for step, s in tracker.scalars if "goodput/step_fraction" in s]
     assert [step for step, _ in goodput] == [3]
     assert goodput[0][1]["goodput/time_to_first_step_s"] == pytest.approx(121.0)
-    assert goodput[0][1]["goodput/step_fraction"] == pytest.approx(2 / 123)
+    assert goodput[0][1]["goodput/step_fraction"] == pytest.approx(
+        (2 + 3 * report_seconds) / (123 + 3 * report_seconds))
 
 
 def test_goodput_counts_evaluations_and_checkpoints_as_time_outside_steps(monkeypatch, tmp_path):

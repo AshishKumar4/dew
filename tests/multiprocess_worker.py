@@ -335,6 +335,16 @@ def mode_topology(args) -> dict:
     rows = BATCH // args.processes
     local = row_marked_batch()[args.process_id * rows:(args.process_id + 1) * rows]
     sharded = shard_batch(mesh, {"image": local})["image"]
+    size = rows * (1 << 17)
+    storage = np.empty(size * 4 + 63, np.uint8)
+    offset = -storage.ctypes.data % 64
+    source = storage[offset:offset + size * 4].view(np.float32).reshape(rows, -1)
+    source[:] = np.arange(args.process_id * rows, (args.process_id + 1) * rows)[:, None]
+    owned = shard_batch(mesh, {"tokens": source})["tokens"]
+    owned.block_until_ready()
+    aliases_reader = any(np.shares_memory(np.asarray(shard.data), source)
+                         for shard in owned.addressable_shards)
+    source.fill(-1)
     return {
         "process_index": jax.process_index(),
         "process_count": jax.process_count(),
@@ -349,6 +359,9 @@ def mode_topology(args) -> dict:
         "local_rows": sorted(
             {int(value) for shard in sharded.addressable_shards
              for value in np.asarray(shard.data)[:, 0, 0, 0]}),
+        "aliases_reader": aliases_reader,
+        "preserved_rows": sorted({int(value) for shard in owned.addressable_shards
+                                  for value in np.asarray(shard.data)[:, 0]}),
         "run_timestamp": runtime.run_timestamp(),
         "own_year": runtime.datetime.now().year,
     }
@@ -512,6 +525,19 @@ def restored_state(trainer):
         return None, None
     state, _, position = trainer.place()
     return int(jax.device_get(state.step)), None if position is None else position.decode()
+
+
+def mode_token_budget(args) -> dict:
+    from dew.data import TokenWindows
+
+    trainer = token_trainer(args.name, args.out.parent, fsdp=1, seq_len=4)
+    trainer.checkpoints = None
+    tracker = LossRecorder()
+    trainer.tracker = tracker
+    data = TokenWindows(path=args.tokens, seq_len=4, val_batches=0,
+                        loading=Loading(workers=0, threads=1, read_buffer=1)).load(batch=BATCH)
+    state = trainer.fit(data, total_tokens=80, log_every=1)
+    return {"step": int(state.step), "updates": int(state.updates), "logged": len(tracker.losses)}
 
 
 def mode_steps(args) -> dict:
@@ -2217,7 +2243,8 @@ def mode_whole_validation(args) -> dict:
     return {"passes": passes, "perplexity": perplexity(windows), "one": perplexity(windows, 1)}
 
 
-MODES = {"host_training": mode_host_training, "step_fits": mode_step_fits,
+MODES = {"token_budget": mode_token_budget,
+         "host_training": mode_host_training, "step_fits": mode_step_fits,
          "whole_validation": mode_whole_validation,
          "topology": mode_topology, "data": mode_data, "packed": mode_packed,
          "masked_generation": mode_masked_generation,
