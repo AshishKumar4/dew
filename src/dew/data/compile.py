@@ -86,7 +86,7 @@ from dew.data.pipeline import (
 )
 from dew.data.plan import Plan, StepIdentity, fingerprint
 from dew.data.readers import _CanonicalPass, _Host, _PerShare, _Statistics
-from dew.data.sources.base import Consumed, Read, ShardManifest, Source
+from dew.data.sources.base import Read, ShardManifest, Source, _consumed
 from dew.records import JSON, integer, json_value, record
 
 _DEFAULT_LOADING = Loading()
@@ -154,7 +154,7 @@ def _pin_sources(pipelines: Sequence[Pipeline], read: Read) -> tuple[Pipeline, .
     def pin(source: Source) -> _Facts:
         if isinstance(source, _Facts):
             return source
-        source = source.consumed(read) if isinstance(source, Consumed) else source
+        source = _consumed(source, read)
         if read == "memory":
             source.records(read)
         return _Facts(source, read, source.snapshot(), source.metadata())

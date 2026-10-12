@@ -97,11 +97,18 @@ class Source(Protocol):
 
 @runtime_checkable
 class Consumed(Protocol):
-    """A source whose read of a given kind goes through another source."""
+    """A source whose read of a given kind goes through another source.
+
+    Wrappers rebuild over their consumed children, retaining their own policy.
+    """
 
     def consumed(self, read: Read) -> Source:
         """The source a read of this one reads its records from."""
         ...
+
+
+def _consumed(source: Source, read: Read) -> Source:
+    return source.consumed(read) if isinstance(source, Consumed) else source
 
 
 __all__ = ["READS", "Consumed", "Read", "Shard", "ShardManifest", "Source"]

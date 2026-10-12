@@ -60,12 +60,8 @@ def test_pinned_hub_revision_never_falls_through_to_a_different_conversion(monke
     assert latest.url == ("hf://datasets/owner/data@converted/data/train-00000.parquet",)
 
 
-def test_a_conversion_that_moves_under_one_default_commit_is_another_snapshot(monkeypatch):
-    """A default revision without native shards streams the commit its
-    Parquet conversion holds, and that branch can move while the default
-    commit stays. One source pins the commit once, so its shard URLs and its
-    snapshot name the same files, and a plan saved before the branch moved is
-    refused on an exact resume."""
+@pytest.fixture
+def moving_hub_conversion(monkeypatch, tmp_path, request):
     from types import SimpleNamespace
 
     import datasets
@@ -73,14 +69,23 @@ def test_a_conversion_that_moves_under_one_default_commit_is_another_snapshot(mo
     from huggingface_hub import HfApi, HfFileSystem
     from huggingface_hub.hf_api import GitRefInfo, GitRefs
 
-    from dew.data import Pipeline, compile
-    from dew.data.sources import Hub
-
     converted = ["first"]
+    kind = getattr(request, "param", "records")
+
+    def columns(start):
+        indices = range(start, start + 32)
+        if kind == "prompts":
+            return {"prompt": [[index + 1, index + 2] for index in indices],
+                    "ground_truth": [str(index) for index in indices]}
+        if kind == "decisions":
+            return {"text": [f"row {index}" for index in indices],
+                    "label": ["a" if index % 2 else "b" for index in indices]}
+        return {"id": list(indices)}
+
     payloads = {}
     for commit, start in (("first", 0), ("second", 10)):
         sink = pa.BufferOutputStream()
-        pq.write_table(pa.table({"id": list(range(start, start + 8))}), sink)
+        pq.write_table(pa.table(columns(start)), sink)
         payloads[f"datasets/owner/data@{commit}/default/train/0000.parquet"] = sink.getvalue().to_pybytes()
 
     def header(self, path, **kwargs):
@@ -95,26 +100,131 @@ def test_a_conversion_that_moves_under_one_default_commit_is_another_snapshot(mo
     def listing(self, repo, *, repo_type, revision):
         return ["train.tar"] if revision == "original" else ["default/train/0000.parquet"]
 
-    def plan():
-        streamed = Pipeline(Hub("owner/data")).batch(2)
-        return compile(streamed, read="streamed", loading=Loading(workers=0)).plan
-
     monkeypatch.setattr(HfApi, "dataset_info", lambda self, repo, **kwargs: SimpleNamespace(sha="original"))
     monkeypatch.setattr(HfApi, "list_repo_files", listing)
     monkeypatch.setattr(HfApi, "list_repo_refs", refs)
     monkeypatch.setattr(HfFileSystem, "info", header)
     monkeypatch.setattr(HfFileSystem, "_open", lambda self, path, **kwargs: io.BytesIO(payloads[path]))
-    builder = SimpleNamespace(info=SimpleNamespace(features=None, splits=None))
+    (tmp_path / "dataset_info.json").write_text("{}")
+    prepared = datasets.Dataset.from_dict(columns(0))
+    builder = SimpleNamespace(
+        cache_dir=str(tmp_path),
+        info=SimpleNamespace(features=None, splits={"train": SimpleNamespace(num_examples=32)}),
+        as_dataset=lambda **kwargs: prepared,
+    )
     monkeypatch.setattr(datasets, "load_dataset_builder", lambda *args, **kwargs: builder)
+    return converted
+
+
+def test_a_conversion_that_moves_under_one_default_commit_is_another_snapshot(moving_hub_conversion):
+    """One source pins its conversion once; a new source refuses the old plan
+    after that conversion moves under the same default commit."""
+    from dew.data import Pipeline, compile
+    from dew.data.sources import Hub
+
+    def plan():
+        streamed = Pipeline(Hub("owner/data")).batch(2)
+        return compile(streamed, read="streamed", loading=Loading(workers=0)).plan
+
     source = Hub("owner/data")
     snapshot = source.files.snapshot()
     saved = plan()
     assert saved.manifest.source["sources"] == [snapshot]
-    converted.append("second")
+    moving_hub_conversion.append("second")
     assert source.files.url == ("hf://datasets/owner/data@first/default/train/0000.parquet",)
     assert source.files.snapshot() == snapshot != Hub("owner/data").files.snapshot()
     with pytest.raises(ValueError, match=r"saved data plan (source|order) changed"):
         plan().check(saved.record())
+
+
+@pytest.mark.parametrize("wrapper,read", [
+    ("hash", "streamed"), ("concatenate", "streamed"), ("concatenate_hash", "streamed"),
+    ("concatenate", "indexed"), ("slice", "indexed"), ("random", "indexed"), ("hash", "memory"),
+])
+def test_wrapped_hub_resume_checks_the_conversion_only_when_consumed(moving_hub_conversion, wrapper, read):
+    from dew.data.recipes import HoldOut, Records, load
+    from dew.data.sources import Hub
+    from dew.data.sources.concatenate import Concatenate
+
+    def loaded():
+        source = Hub("owner/data")
+        if wrapper.startswith("concatenate"):
+            source = Concatenate((source, Memory([{"id": index} for index in range(40, 48)])))
+        holdout = (
+            HoldOut(fraction=.25, by="hash") if wrapper.endswith("hash") else
+            HoldOut(records=8, by="index" if wrapper == "slice" else "random")
+            if wrapper in ("slice", "random") else None
+        )
+        return load(Records(source, validation=holdout), batch=2, read=read, loading=Loading(workers=0))
+
+    data = loaded()
+    reader = data.train(DataPartition())
+    try:
+        next(reader)
+        saved = reader.get_state()
+        expected = next(reader)["id"]
+    finally:
+        reader.close()
+    unchanged = loaded().train(DataPartition())
+    try:
+        unchanged.set_state(saved)
+        np.testing.assert_array_equal(next(unchanged)["id"], expected)
+    finally:
+        unchanged.close()
+    moving_hub_conversion.append("second")
+    moved = loaded().train(DataPartition())
+    try:
+        if read == "streamed":
+            with pytest.raises(ValueError, match=r"saved data plan (source|order) changed"):
+                moved.set_state(saved)
+        else:
+            moved.set_state(saved)
+            np.testing.assert_array_equal(next(moved)["id"], expected)
+    finally:
+        moved.close()
+
+
+@pytest.mark.parametrize("recipe,moving_hub_conversion,read", [
+    ("prompts", "prompts", "streamed"), ("prompts", "prompts", "indexed"), ("prompts", "prompts", "memory"),
+    ("decisions", "decisions", "streamed"), ("decisions", "decisions", "indexed"),
+    ("decisions", "decisions", "memory"),
+], indirect=["moving_hub_conversion"])
+def test_metadata_wrapped_hub_resume_keeps_facts_and_checks_consumed_files(
+    moving_hub_conversion, recipe, read
+):
+    from dew.data.recipes import Prompts, load
+    from dew.data.sources import Hub
+    from dew.decision.data import Decisions
+
+    def loaded():
+        source = Hub("owner/data")
+        configured = (
+            Prompts(source, "byte", max_prompt_len=4, reward_bytes=None if read == "memory" else 8)
+            if recipe == "prompts" else Decisions(source, options=("a", "b"))
+        )
+        return load(configured, batch=2, read=read, loading=Loading(workers=0))
+
+    reader = loaded().train(DataPartition())
+    try:
+        next(reader)
+        saved = reader.get_state()
+        expected = next(reader)
+    finally:
+        reader.close()
+    moving_hub_conversion.append("second")
+    moved = loaded().train(DataPartition())
+    try:
+        if read == "streamed":
+            with pytest.raises(ValueError, match=r"saved data plan (source|order) changed"):
+                moved.set_state(saved)
+        else:
+            moved.set_state(saved)
+            actual = next(moved)
+            assert actual.keys() == expected.keys()
+            for key in expected:
+                np.testing.assert_array_equal(actual[key], expected[key])
+    finally:
+        moved.close()
 
 
 @pytest.mark.parametrize("format", ["jsonl", "arrow", "parquet"])

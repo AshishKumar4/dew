@@ -22,7 +22,7 @@ from dew.data.cache import Generation
 from dew.data.dataset import Batch, Records
 from dew.data.pipeline import Pack
 from dew.data.plan import fingerprint
-from dew.data.sources.base import Read, Shard, ShardManifest, Source
+from dew.data.sources.base import Read, Shard, ShardManifest, Source, _consumed
 from dew.data.tokens import chunk_lengths, chunk_table, first_fit, packed_window
 from dew.records import record
 
@@ -184,6 +184,11 @@ class PackedSource:
 
     def describe(self) -> str:
         return f"{self.documents.describe()} {self.plan.kind} packing={self.plan.pack!r}"
+
+    def consumed(self, read: Read) -> PackedSource:
+        documents = _consumed(self.documents, "indexed" if read == "streamed" else read)
+        plan = dataclasses.replace(self.plan, source=documents) if isinstance(self.plan, _Held) else self.plan
+        return dataclasses.replace(self, documents=documents, plan=plan)
 
     def snapshot(self) -> Mapping[str, object]:
         return {"source": self.documents.snapshot(), "packing": self.order_fingerprints()}
