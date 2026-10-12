@@ -122,7 +122,8 @@ def room(monkeypatch, bytes_free):
     """Give every compile `bytes_free` for its temporaries, as XLA's memory analysis reads them."""
     monkeypatch.setattr(memory, "step_headroom", lambda executable, devices, held=0:
                         bytes_free - executable.memory_analysis().temp_size_in_bytes)
-    monkeypatch.setattr(trainer_module, "step_compiler_options", lambda objective, tokens, frozen, devices: None)
+    monkeypatch.setattr(trainer_module, "step_compiler_options",
+                        lambda objective, tokens, frozen, devices: None)
 
 
 def test_a_batch_that_does_not_fit_whole_is_split_before_anything_is_recomputed(monkeypatch):
@@ -261,7 +262,8 @@ def fitting(monkeypatch, trainer, fits):
     monkeypatch.setattr(trainer, "_candidate", recorded)
     monkeypatch.setattr(planning, "step_fits", lambda executable, mesh, held=0: (fits(
         lowered[-1], trainer.objective.model.remat, trainer.objective.head_tile is not None), 0))
-    monkeypatch.setattr(trainer_module, "step_compiler_options", lambda objective, tokens, frozen, devices: None)
+    monkeypatch.setattr(trainer_module, "step_compiler_options",
+                        lambda objective, tokens, frozen, devices: None)
 
 
 @pytest.mark.parametrize("seconds, split, remat", [([0.2, 0.1], 1, "minimal"), ([0.1, 0.2], 2, None)])
