@@ -18,8 +18,6 @@ generation's platform, and takes the GPU's path here. Two still read
 attention's cuDNN (`cudnn_runs`) and FlashAttention (`flash_refusal`) calls,
 CUDA kernels and not Pallas ones, whose trace asks the CUDA plugin for
 versions and libraries a CPU host lacks, so attention traces its XLA path.
-Nor can it lower tokamax's Triton ragged dot, the opt-in 'tokamax' grouped matmul's, which
-tokamax registers only on a host with a GPU.
 """
 
 from __future__ import annotations
