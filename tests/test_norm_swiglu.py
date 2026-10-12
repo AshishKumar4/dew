@@ -656,6 +656,8 @@ def test_expert_jvp_refuses_swiglu_once_and_matches_xla(monkeypatch, caplog):
         return expert.apply(params, x, weights, indices)
 
     reference = jax.jvp(function, (x,), (jnp.ones_like(x),))
+    # A GPU's own row may already have logged the reference's refusal.
+    caplog.clear()
     monkeypatch.setitem(kernels.gpu_target("sm80").kernels, "swiglu", "pallas")
     monkeypatch.setattr(kernels.generation, "device_generation", lambda: "sm80")
     monkeypatch.setattr(kernels.generation, "triton_runs", lambda: True)
