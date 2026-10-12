@@ -543,7 +543,7 @@ def test_routing_that_does_not_describe_the_tokens_is_rejected():
 
 @pytest.mark.parametrize('generation,gpu,chosen', [
     ('sm89', True, 'pallas'), ('sm86', True, 'pallas'), ('sm80', True, 'pallas'), ('sm75', False, 'xla'),
-    ('sm90', True, 'xla'), ('v6e', False, 'xla'), ('cpu', False, 'xla')])
+    ('sm90', True, 'pallas'), ('sm120', True, 'xla'), ('v6e', False, 'xla'), ('cpu', False, 'xla')])
 def test_auto_takes_the_measured_grouped_matmul_and_xla_elsewhere(monkeypatch, generation, gpu,
                                                                   chosen):
     """'auto' runs the Pallas kernels only on a generation they were measured
