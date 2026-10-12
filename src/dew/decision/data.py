@@ -300,7 +300,10 @@ class Decisions:
         elif isinstance(self.validation, Pipeline):
             evaluated = self.validation
         elif isinstance(self.validation, Split):
-            held_source = _DecisionSource(source(self.source, split=self.validation.name), table=table)
+            # The named split of the training source, opened as every recipe opens one (`_branches`):
+            # through the source's own `with_split`, refused for a source with no native splits.
+            _, named = _branches(self.source, self.validation, split=self.split, prefix=())
+            held_source = _DecisionSource(named.source, table=table)
             evaluated = Pipeline(held_source).map(Configured(_ParseConfigured(table), needs=()))
         elif isinstance(self.validation, Sequence) and not isinstance(self.validation, str):
             rows = tuple({"example": Example.of(row)} for row in self.validation)
