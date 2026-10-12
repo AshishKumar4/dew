@@ -40,7 +40,7 @@ from .kernels import norm_swiglu
 from .kernels.generation import backend, measured_kernel, ran_kernel, triton_runs
 from .kernels.grouped_matmul import grouped_projection, ragged_dot_refusal, xla_ragged_dot
 from .precision import at_least_fp32, rounded_operand, rounded_to
-from .protocols import ProjectionGroup, declared_groups
+from .protocols import ProjectionGroup, Routes, declared_groups
 from .sharding import (
     EXPERT_AXIS,
     STAGE_AXIS,
@@ -70,21 +70,6 @@ EXPERT_DISPATCHES = ('global', 'exchange')
 # experts sums to one, which cannot reach it, and in fp32 the term changes no
 # bit of a denominator above 1e-12.
 WEIGHT_SUM_EPSILON = 1e-20
-
-type Routes = tuple[jax.Array, jax.Array | None]
-"""A routing replay for one layer: `[..., top_k]` expert ids the rollout
-engine used, and `[...]` booleans marking the tokens its record covers (None
-for all of them).
-
-Routing replay (R3, arXiv 2510.11370; verl 12ebe0c `router_replay_patch.py`)
-trains a mixture on the engine's experts, so a top-k flip between the
-engine's numerics and the trainer's cannot move a token to experts that
-never produced its sample. Only the selection is replayed; the gate weights
-come from this forward's scores, so the router keeps its gradient. An
-uncovered token keeps the router's choice, as verl's replay mask does, and
-the sown `indices` are the replayed ones, so a balancing bias counts where
-the tokens went. The stack hands each layer its slice of a `[B, S, layers,
-top_k]` record (`CausalTransformer.hidden_states`)."""
 
 
 def chosen_experts(selected: Callable[[], jax.Array], shape: tuple[int, ...],

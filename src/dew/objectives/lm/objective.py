@@ -870,7 +870,7 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         layers, top_k]` ids aligned with `tokens`, and `[B, seq_len + 1]`
         booleans marking the ids the record covers (None for all). Every
         router selects those experts instead of its own top-k and still
-        weights them from its scores (`dew.nn.moe.Routes`); the stack slices
+        weights them from its scores (`dew.nn.protocols.Routes`); the stack slices
         the record by layer however it runs.
         """
         prepared = _prepared(tokens, segment_ids, positions)

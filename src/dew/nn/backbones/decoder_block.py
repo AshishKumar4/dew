@@ -511,7 +511,7 @@ class DecoderBlock(nn.Module):
     The `kv_store` call argument passes one dict down the stack for
     KV-sharing mixers. `per_layer_input` is the layer's slice of
     `LayerInputs`: its per-layer residual signal and, on a `routed` block, the
-    replayed experts (`dew.nn.moe.Routes`).
+    replayed experts (`dew.nn.protocols.Routes`).
 
     The residual takes one of four forms:
 
