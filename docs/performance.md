@@ -1406,10 +1406,17 @@ The rule's training time fell 10.1%, the mixer's 9.6%; fla's rule took
 1.36/3.61 ms. Temporary memory fell from 1254.8 to 1051.8 MiB for the rule
 and 1659.0 to 1387.7 for the mixer. Eighteen prep tiles did not beat the
 default 32-column, 4-warp, 2-stage tile (lowest repeat 8.25 ms). The single
-`KERNELS['gated_delta_rule'] = {'sm80': 'pallas'}` takes recurrence and prep
-together; other generations remain unmeasured, and KDA stays XLA. The
-whole rule's float64 RMS ratios were at most 1.002 at default precision
-and 1.324 at highest, with bitwise repeats.
+`KERNELS['gated_delta_rule'] = {'sm80': 'pallas'}` took recurrence and prep
+together. The whole rule's float64 RMS ratios were at most 1.002 at default
+precision and 1.324 at highest, with bitwise repeats.
+
+Both kernels are gone (2026-10-12). Dew's port of fla 0.5.2's nine kernels
+(`dew.nn.kernels.fla_gdn`) runs every GPU's gated delta rule, on any heads,
+widths up to fla's 256-wide keys, dtypes, chunk sizes and mesh
+(`dew.nn.linear.fla_rule`); the XLA math stays for CPUs, TPUs, forward-mode
+traces and float64, and as the tests' oracle. On a G4 the port's forward
+ran 1.32 and 1.18 ms at the 0.8B's and 9B's shapes against fla's 2.66 and
+2.37 (kernel lab, 4653d4451).
 
 With canonical metadata the call is exactly the plain call. Its outputs are
 bitwise equal to the no-metadata forward, and its parameter gradients are
