@@ -151,7 +151,7 @@ def train(case: Case, source: Pretrained, ids: np.ndarray):
     """
     import grain.python as pygrain
 
-    from dew.data.dataset import Dataset
+    from dew.data.dataset import Loader
     from dew.training import Trainer
 
     objective = LMObjective(source, seq_len=int(ids.shape[1]) - 1, ema_decay=None,
@@ -162,7 +162,7 @@ def train(case: Case, source: Pretrained, ids: np.ndarray):
     entries = [{"text": rows[row]} for row in range(count)]
     stream = (pygrain.MapDataset.source(entries).repeat().to_iter_dataset()
               .batch(count, drop_remainder=True))
-    data = Dataset(train=lambda partition: iter(stream), val=None, records=count, batch=count)
+    data = Loader(train=lambda partition: iter(stream), val=None, records=count, batch=count)
     state = Trainer(objective, optax.sgd(case.rate), key=jax.random.key(SEED)).fit(
         data, steps=1, log_every=1)
     return state

@@ -11,7 +11,7 @@ from flax import linen as nn
 from recording import RecordingTracker
 from test_model_flops import decoder, forward_products, packed_batch
 
-from dew.data.dataset import Dataset
+from dew.data.dataset import Loader
 from dew.data.text import ByteTokenizer
 from dew.decision.head import JointSchemaHead
 from dew.decision.layout import Specials, StateFirstLayout
@@ -247,7 +247,7 @@ def test_trainer_reads_training_work_once_from_the_existing_interval_record(monk
             yield {"text": tokens}
 
     trainer = Trainer(objective, optax.sgd(0.01), key=0, accumulation=2, tracker=tracker)
-    trainer.fit(Dataset(batches, None, batch=8, records=16), steps=2, log_every=2)
+    trainer.fit(Loader(batches, None, batch=8, records=16), steps=2, log_every=2)
     ticks = [scalars for _, scalars in tracker.scalars if "train/mfu" in scalars]
     assert len(ticks) == 1 and ticks[0]["train/mfu"] > 0
     assert ticks[0]["train/tokens"] * 2 == 8 * (3 + 5)

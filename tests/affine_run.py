@@ -11,7 +11,7 @@ import optax
 from flax import linen as nn
 
 from dew.artifacts import Representations
-from dew.data.dataset import Dataset
+from dew.data.dataset import Loader
 from dew.objectives.base import Aux, EMASpec, Objective
 
 BATCH = 8
@@ -79,9 +79,9 @@ class Counting:
         self.index = json.loads(state)["index"]
 
 
-def dataset(train=Counting, val=None, batch=BATCH) -> Dataset:
+def dataset(train=Counting, val=None, batch=BATCH) -> Loader:
     """A dataset over fresh train and validation iterators, without an epoch count."""
-    return Dataset(train=lambda partition: train(),
+    return Loader(train=lambda partition: train(),
                    val=None if val is None else lambda partition: val(),
                    batch=batch, records=None)
 

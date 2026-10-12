@@ -87,7 +87,7 @@ class Evaluation:
         Every process calls this with the same objective, metrics and numerical
         settings. `batches` is called with this process's share of the split
         (`DataPartition.of(mesh)`) and returns a fresh iterator, which this call
-        opens and closes; you can pass `Dataset.val` directly. Every batch holds
+        opens and closes; you can pass `Loader.val` directly. Every batch holds
         `VALID_ROWS` (all True when the reader marked none), and the objective's loss
         and the metrics count only the real rows. A process whose share runs out
         before the others' scores a copy of its last batch in which every row is a

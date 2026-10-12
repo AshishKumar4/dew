@@ -21,7 +21,7 @@ import optax
 import pytest
 from affine_run import FEATURES, Regression
 
-from dew.data.dataset import Dataset
+from dew.data.dataset import Loader
 from dew.training import Checkpoints, Layout, Trainer, ema_update
 
 
@@ -116,7 +116,7 @@ def test_a_resumed_run_restores_the_frozen_reference(tmp_path):
     # The placed init is what fit starts from; the eager init rounds the
     # random draws differently on a GPU.
     initial = frozen_bytes(trainer.place()[0])
-    data = Dataset(lambda partition: Counting(), None, batch=8, records=None)
+    data = Loader(lambda partition: Counting(), None, batch=8, records=None)
     trainer.fit(data, steps=2, log_every=1)
 
     resumed = make_trainer(tmp_path)

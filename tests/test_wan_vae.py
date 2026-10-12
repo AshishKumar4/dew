@@ -387,7 +387,7 @@ def test_a_video_run_denoises_wan_latents_and_samples_whole_clips(source):
     from diffusion_stubs import STUB_TEXT
 
     from dew.config import ModelConfig, ObjectiveConfig, TrainerConfig
-    from dew.data import Dataset, Video
+    from dew.data import Loader, Video
     from dew.objectives.diffusion import DiffusionRunConfig, PretrainedAutoencoder, TextCondition
     from dew.sampling import Euler
     from dew.training import Trainer
@@ -413,7 +413,7 @@ def test_a_video_run_denoises_wan_latents_and_samples_whole_clips(source):
         "text": objective.inputs.conditions["textcontext"].encoder.tokenize(list("abcdefgh")),
     }
     state = Trainer(objective, optax.adam(1e-3), key=jax.random.PRNGKey(0)).fit(
-        Dataset(train=lambda partition: iter(lambda: batch, None), val=None, records=None, batch=8),
+        Loader(train=lambda partition: iter(lambda: batch, None), val=None, records=None, batch=8),
         steps=1, log_every=100)
     sampled = objective.pipeline(state)(["a", "b"], key=0).host()
     assert sampled.images.shape == (2, 9, 32, 32, 3)

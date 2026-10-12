@@ -39,7 +39,7 @@ _unpartition_gpu_pool()
 
 if TYPE_CHECKING:  # the surface above, with its types, for checkers and editors
     from dew.artifacts import ImageGrid, Representations, TextSamples, TokenScores, VideoGrid
-    from dew.data import Dataset
+    from dew.data import Loader
     from dew.diffusion import Process
     from dew.eval import Mean
     from dew.inference import pipeline
@@ -81,7 +81,7 @@ _EXPORTS = {
     "Evaluation": "dew.training",
     "ProfileWindow": "dew.training",
     "Objective": "dew.objectives", "Supervised": "dew.objectives.supervised",
-    "Dataset": "dew.data",
+    "Loader": "dew.data",
     "Process": "dew.diffusion",
     "Mean": "dew.eval",
     "InputSpec": "dew.inputs", "Field": "dew.inputs", "Condition": "dew.inputs",
@@ -114,7 +114,6 @@ __all__ = [
     "Best",
     "Checkpoints",
     "Condition",
-    "Dataset",
     "EMASpec",
     "EvalSuite",
     "Evaluation",
@@ -123,6 +122,7 @@ __all__ = [
     "InputSpec",
     "Keep",
     "Layout",
+    "Loader",
     "LocalTracker",
     "MLflowTracker",
     "Mean",

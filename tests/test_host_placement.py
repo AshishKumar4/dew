@@ -32,7 +32,7 @@ import pytest
 from affine_run import BATCH, Counting, Features, Regression, Spread, val_batches
 from process_support import run_pool
 
-from dew.data import Dataset
+from dew.data import Loader
 from dew.inference.banks import CheckpointBanks, HeldBanks
 from dew.nn.backbones.decoder_stack import StackView
 from dew.objectives.lm import LMObjective
@@ -51,7 +51,7 @@ def fit(layout, directory, steps):
     # features stands in for the plain regression and a metric reads them.
     trainer = Trainer(Features(), optax.adam(0.1), key=jax.random.key(0), layout=layout,
                       checkpoints=checkpoints)
-    data = Dataset(
+    data = Loader(
         train=lambda partition: Counting(), val=lambda partition: val_batches()(), records=None, batch=BATCH
     )
     state = trainer.fit(data, steps=steps, log_every=1, eval_every=2, checkpoint_every=2,

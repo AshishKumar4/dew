@@ -14,7 +14,7 @@ from affine_run import TimingRegression as Regression, batches
 
 from dew.config import RunConfig, TrainerConfig
 from dew.config.sweep import GridSearch, OptunaSearch, RandomSearch
-from dew.data import Dataset
+from dew.data import Loader
 from dew.telemetry.records import TrialFinished
 from dew.training import LocalTracker
 
@@ -31,7 +31,7 @@ def train(run: RunConfig) -> float:
     """The loss the trial's own run ends on, through the normal entry point."""
     objective = Regression()
     assert run.trainer.name is not None
-    state = run.train(objective, Dataset(lambda partition: batches(), None, None, 8), name=run.trainer.name)
+    state = run.train(objective, Loader(lambda partition: batches(), None, None, 8), name=run.trainer.name)
     loss, _ = objective.loss(state.variables, next(batches()), state.step)
     return float(loss)
 

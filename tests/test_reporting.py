@@ -17,7 +17,7 @@ from PIL import Image
 
 import dew.artifacts
 from dew.artifacts import Decisions, ImageGrid, Representations, TextSamples, TokenScores, VideoGrid
-from dew.data import Dataset
+from dew.data import Loader
 from dew.pool import PREEMPTED_EXIT
 from dew.telemetry.records import FitEnded, RunRecord, json_value
 from dew.training import Checkpoints, LocalTracker, Trackers, Trainer
@@ -169,7 +169,7 @@ def test_fit_records_requests_not_durability_and_leaves_tracker_borrowed(tmp_pat
     local = LocalTracker(tmp_path / 'tracking')
     trainer = Trainer(Regression(), optax.sgd(0.01), key=jax.random.key(0), tracker=local,
                       checkpoints=Checkpoints(str(tmp_path / 'checkpoint')))
-    state = trainer.fit(Dataset(lambda partition: batches(), None, None, 8), steps=2, log_every=1)
+    state = trainer.fit(Loader(lambda partition: batches(), None, None, 8), steps=2, log_every=1)
     local.log({'after_fit': 1.}, 2)
     local.close()
     entries = records(tmp_path / 'tracking')
@@ -196,7 +196,7 @@ def test_failure_is_recorded_without_replacing_the_original(tmp_path):
         trainer = Trainer(Regression(), optax.sgd(.01), key=jax.random.key(0),
                           tracker=local, rollout=rollout)
         with pytest.raises(RuntimeError) as raised:
-            trainer.fit(Dataset(lambda partition: batches(), None, None, 8), steps=2)
+            trainer.fit(Loader(lambda partition: batches(), None, None, 8), steps=2)
         assert raised.value is error
     outcome = records(tmp_path)[-1]['value']
     assert outcome['status'] == 'failed' and 'rollout broke' in outcome['traceback']
@@ -223,7 +223,7 @@ def test_local_scalar_sink_does_not_enable_preview_computation(tmp_path, preview
 
     with LocalTracker(tmp_path) as sink:
         trainer = Trainer(Display(), optax.sgd(.01), key=jax.random.key(0), tracker=sink)
-        data = Dataset(lambda partition: batches(), lambda partition: iter([next(batches())]), None, 8)
+        data = Loader(lambda partition: batches(), lambda partition: iter([next(batches())]), None, 8)
         if preview:
             trainer.fit(data, steps=2, eval_every=1, preview=True)
         else:
@@ -292,7 +292,7 @@ def fit(tracker, objective=None):
     """Two logged steps of the small regression through `tracker`."""
     trainer = Trainer(objective or Regression(), optax.sgd(0.01), key=jax.random.key(0),
                       tracker=tracker)
-    return trainer.fit(Dataset(lambda partition: batches(), None, None, 8), steps=2, log_every=1)
+    return trainer.fit(Loader(lambda partition: batches(), None, None, 8), steps=2, log_every=1)
 
 
 def mlflow_store(tmp_path, monkeypatch):

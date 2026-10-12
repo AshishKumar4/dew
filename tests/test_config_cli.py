@@ -12,7 +12,7 @@ import pytest
 from diffusion_stubs import RES, STUB_TEXT
 
 from dew.config import RunConfig, ScheduleSpec
-from dew.data import Augment, Dataset, Files, HoldOut, Images, Loading, Text, export
+from dew.data import Augment, Files, HoldOut, Images, Loader, Loading, Text, export
 from dew.data.dataset import record_argument
 from dew.diffusion.presets import Flow
 from dew.objectives.diffusion import DiffusionRunConfig
@@ -97,11 +97,11 @@ def test_steps_and_epochs_are_one_choice():
     with pytest.raises(SystemExit):
         parse(RunConfig, ["--trainer.steps", "5", "--trainer.epochs", "1"])
     config = parse(RunConfig, ["--trainer.epochs", "2"])
-    data = Dataset(train=lambda partition: iter(()), val=None, records=100, batch=10)
+    data = Loader(train=lambda partition: iter(()), val=None, records=100, batch=10)
     assert config.trainer.total_steps(data) == 20
     with pytest.raises(ValueError, match=r"--trainer.steps"):
         config.trainer.total_steps(
-            Dataset(train=lambda partition: iter(()), val=None, records=None, batch=10)
+            Loader(train=lambda partition: iter(()), val=None, records=None, batch=10)
         )
 
 

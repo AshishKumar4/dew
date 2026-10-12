@@ -19,7 +19,7 @@ import tyro
 from dew import Checkpoints, Field, InputSpec, Trainer
 from dew.artifacts import uint8_pixels
 from dew.config import OptimConfig
-from dew.data import Dataset, Loading, Preferences, Text, load
+from dew.data import Loader, Loading, Preferences, Text, load
 from dew.diffusion.presets import Flow
 from dew.nn.backbones import CausalTransformer, SimpleDiT
 from dew.objectives.base import Step
@@ -104,7 +104,7 @@ def flow_images(out: Path):
     images = np.zeros((8, 8, 8, 3), dtype=np.uint8)
     images[:, :, ::2, :] = 255
     batch = {"image": images}
-    data = Dataset(train=lambda partition: itertools.repeat(batch), val=None,
+    data = Loader(train=lambda partition: itertools.repeat(batch), val=None,
                    records=8, batch=8)
     model = SimpleDiT(
         patch_size=4, emb_features=16, num_layers=1,

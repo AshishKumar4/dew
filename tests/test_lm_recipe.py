@@ -732,7 +732,7 @@ def test_a_trained_block_diffusion_tree_saves_back_over_its_source(tmp_path):
     export is refused (tests/test_block_sft.py)."""
     import optax
 
-    from dew import Dataset, Trainer
+    from dew import Loader, Trainer
     from dew.interop import Pretrained
     from dew.objectives.base import Step, thaw
     from dew.objectives.diffusion.block import BlockDiffusionObjective
@@ -743,7 +743,7 @@ def test_a_trained_block_diffusion_tree_saves_back_over_its_source(tmp_path):
                                         variables=source.variables)
     rows = 2 * jax.device_count()
     batch = {"text": np.random.default_rng(0).integers(3, 60, (rows, 12)).astype(np.int32)}
-    data = Dataset(train=lambda partition: iter([batch, batch]), val=None, records=rows, batch=rows)
+    data = Loader(train=lambda partition: iter([batch, batch]), val=None, records=rows, batch=rows)
 
     state = Trainer(objective, optax.sgd(0.05), key=jax.random.key(0)).fit(data, steps=1, log_every=1)
     source.save(tmp_path / "trained", variables=thaw(state.variables))

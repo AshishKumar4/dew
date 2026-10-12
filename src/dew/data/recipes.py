@@ -16,7 +16,7 @@ import tyro
 
 from dew.data.analysis import _cache_at, _order_at, _preferred_read, _promoted, _until
 from dew.data.compile import compile
-from dew.data.dataset import Batch, DataPhase, Dataset, Loading, Records as IndexedRecords, record_argument
+from dew.data.dataset import Batch, DataPhase, Loader, Loading, Records as IndexedRecords, record_argument
 from dew.data.pipeline import Configured, HostStep, Mixture, ObjectiveData, Phases, Pipeline, Rejected, Stage
 from dew.records import integer
 
@@ -772,7 +772,7 @@ def load(
     loading: Loading = _DEFAULT_LOADING,
     host: tuple[HostStep, ...] = (),
     **fields,
-) -> Dataset:
+) -> Loader:
     """Resolve a recipe alias and compile its training and evaluation pipelines.
     With no `read`, the recipe's sources choose it, as `compile` does."""
     if (batch is None) == (tokens is None):

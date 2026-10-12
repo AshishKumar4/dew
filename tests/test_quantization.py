@@ -1038,14 +1038,14 @@ def test_the_trainer_knob_quantizes_the_objective_a_run_trains(tmp_path):
     rules reached the matmuls. Observed on CPU: 2.7e-05 on activations of
     order 1e-2, against 0.0 for a run trained without the knob."""
     pytest.importorskip("qwix")
-    from dew.data import Dataset
+    from dew.data import Loader
 
     batch = RUN_BATCH
     config = diffusion_run(tmp_path, batch, quantization=Quantization())
     objective = config.build()
     plain = config.build()
 
-    state = config.train(objective, Dataset(lambda partition: image_batches(batch)(), None, None, batch),
+    state = config.train(objective, Loader(lambda partition: image_batches(batch)(), None, None, batch),
                          name="quantized")
 
     assert int(state.step) == 1
@@ -1087,7 +1087,7 @@ def test_the_trainer_knob_quantizes_what_a_distillation_trains_and_not_its_teach
 def test_an_objective_that_trains_no_single_model_is_refused(tmp_path):
     """The wrap needs a module to wrap; an objective that keeps none is
     refused by name, before the run writes anything."""
-    from dew.data import Dataset
+    from dew.data import Loader
     from dew.objectives.base import Aux, Objective
 
     class Modelless(Objective):
@@ -1101,7 +1101,7 @@ def test_an_objective_that_trains_no_single_model_is_refused(tmp_path):
     with pytest.raises(ValueError, match="Modelless trains none"):
         config.train(
             Modelless(),
-            Dataset(lambda partition: image_batches(RUN_BATCH)(), None, None, RUN_BATCH),
+            Loader(lambda partition: image_batches(RUN_BATCH)(), None, None, RUN_BATCH),
             name="quantized",
         )
     assert not (tmp_path / "quantized").exists()

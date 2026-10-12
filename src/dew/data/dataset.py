@@ -1,4 +1,4 @@
-"""The compiled `Dataset`, shared reader partitions and checkpoint contracts.
+"""The compiled `Loader`, shared reader partitions and checkpoint contracts.
 
 Every stream is opened for a `DataPartition`, the share of each global batch
 its reader reads. The trainer gets it from the mesh (`DataPartition.of`),
@@ -543,7 +543,7 @@ class Ramp:
 
 
 @dataclasses.dataclass(frozen=True)
-class Dataset:
+class Loader:
     """Opens the batches a run trains and validates on.
 
     `train(partition)` opens an endless shuffled stream. `val(partition)`
@@ -1315,7 +1315,7 @@ class RampedStream(Forwarding):
         super().close()
 
 
-def ramped(dataset: Dataset, ramp: Ramp) -> Dataset:
+def ramped(dataset: Loader, ramp: Ramp) -> Loader:
     """`dataset` with the training batch growing to `dataset.batch` over `ramp`.
 
     A validation pass keeps the whole batch, since a score over a growing
@@ -1357,11 +1357,11 @@ __all__ = [
     "Closeable",
     "DataPartition",
     "DataPhase",
-    "Dataset",
     "Forwarding",
     "GlobalStream",
     "Identified",
     "LengthGroups",
+    "Loader",
     "Loading",
     "PhasedStream",
     "Ramp",

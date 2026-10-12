@@ -39,7 +39,7 @@ def main() -> None:
     import optax
     from jax.experimental import multihost_utils
 
-    from dew.data import DataPartition, Dataset
+    from dew.data import DataPartition, Loader
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.objectives.rl import GRPOObjective
     from dew.objectives.rl.scheduler import RolloutScheduler
@@ -100,7 +100,7 @@ def main() -> None:
     # Two samples a task, two chains of four ids a row of eight.
     scheduler = RolloutScheduler(objective, Scripted(), Publisher(), width=8, rows=partition.rows(TASKS),
                                  groups=2, max_lag=1, ahead=1)
-    data = scheduler.tasks(Dataset(train=share, val=None, records=TASKS, batch=TASKS))
+    data = scheduler.tasks(Loader(train=share, val=None, records=TASKS, batch=TASKS))
     final = trainer.fit(data, steps=1, log_every=1, checkpoint_every=None)
     rows = multihost_utils.process_allgather({name: trained[0][name] for name in PACKED})
     leaves = {jax.tree_util.keystr(path): np.asarray(multihost_utils.process_allgather(leaf, tiled=True))

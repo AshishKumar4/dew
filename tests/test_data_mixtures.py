@@ -40,7 +40,7 @@ from dew.data import (
     compile,
     validation,
 )
-from dew.data.dataset import CAPTION, Dataset, GlobalStream, ramped, weight_counts
+from dew.data.dataset import CAPTION, GlobalStream, Loader, ramped, weight_counts
 from dew.data.plan import Manifest, Plan
 from dew.data.recipes import load
 from dew.data.steps.image import EncodeCaptions
@@ -719,7 +719,7 @@ def test_a_pass_over_the_data_is_more_steps_under_a_ramp():
     steps: sixteen at four, then eight at eight, is twenty-four steps where
     a flat batch of eight is twelve."""
     ramp = Ramp(start=4, increment=4, samples=64)
-    flat = Dataset(train=lambda partition: iter(()), val=None, records=96, batch=8)
+    flat = Loader(train=lambda partition: iter(()), val=None, records=96, batch=8)
 
     assert flat.steps_per_epoch == 12
     assert ramped(flat, ramp).steps_per_epoch == 20
@@ -730,14 +730,14 @@ def test_a_pass_over_the_data_is_more_steps_under_a_ramp():
 # The batch ramp over a real stream
 # --------------------------------------------------------------------------
 
-def indexed_data(records: int, batch: int, seed: int = 0) -> Dataset:
+def indexed_data(records: int, batch: int, seed: int = 0) -> Loader:
     """A dataset whose records say which they are, compiled to the global
     order every dataset reads through."""
     return compile(Pipeline(Memory(Indexed(1, records))).shuffle(seed).repeat().batch(batch), seed=seed,
                    loading=READ)
 
 
-def stitched_data(records: int, batch: int, seed: int) -> Dataset:
+def stitched_data(records: int, batch: int, seed: int) -> Loader:
     """The order `indexed_data` compiles, read straight off plain Grain at
     `batch` records a step, behind a position that counts records and so
     carries on at another batch."""
@@ -751,7 +751,7 @@ def stitched_data(records: int, batch: int, seed: int) -> Dataset:
         order = {"records": records, "reshuffled from seed": seed}
         return GlobalStream(open_at, batch, Plan("global", Manifest({}), order), READ)
 
-    return Dataset(train=train, val=None, records=records, batch=batch)
+    return Loader(train=train, val=None, records=records, batch=batch)
 
 
 def test_a_ramped_stream_reads_the_records_the_flat_stream_reads():
@@ -845,7 +845,7 @@ def test_a_ramp_reads_through_a_captioned_datasets_tokenized_stream():
     def lengths(captions):
         return {"length": np.asarray([len(caption) for caption in captions], np.int32)}
 
-    def captioned(batch: int) -> Dataset:
+    def captioned(batch: int) -> Loader:
         return compile(Pipeline(Memory(Captioned(1, 64))).shuffle(0).repeat().batch(batch).map_batch(
                            EncodeCaptions(lengths)), read="memory", seed=0, loading=READ)
 
@@ -888,7 +888,7 @@ class ShardOffset(OwnBatches):
 
 @pytest.mark.parametrize("stream", [OwnBatches, ShardOffset])
 def test_only_a_stream_whose_position_is_a_global_count_can_ramp(stream):
-    data = Dataset(train=lambda partition: stream(), val=None, records=64, batch=8)
+    data = Loader(train=lambda partition: stream(), val=None, records=64, batch=8)
     with pytest.raises(TypeError, match=stream.__name__):
         ramped(data, Ramp(start=4, increment=4, samples=16)).train(DataPartition())
 

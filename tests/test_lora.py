@@ -33,7 +33,7 @@ from reference_error import assert_as_exact_as_the_reference
 from safetensors.numpy import load_file, save_file
 
 from dew import lora
-from dew.data import Dataset
+from dew.data import Loader
 from dew.diffusion.process import DenoisingCondition
 from dew.inputs.diffusion import _text_features
 from dew.interop.pretrained import Pretrained
@@ -215,7 +215,7 @@ def test_an_adapted_head_trains_on_its_exact_logits(decoder, reference):
     np.testing.assert_allclose(first, optax.softmax_cross_entropy_with_integer_labels(
         logits, batch["text"][:, 1:]).mean(), rtol=1e-5)
 
-    data = Dataset(train=lambda partition: iter([{"text": tokens[np.arange(rows) % 2]}] * 3), val=None,
+    data = Loader(train=lambda partition: iter([{"text": tokens[np.arange(rows) % 2]}] * 3), val=None,
                    records=rows, batch=rows)
     state = trainer.fit(data, steps=3, log_every=3)
     assert objective.scalar_loss(state.variables, batch, step)[0] < first
@@ -235,7 +235,7 @@ def test_one_trainer_step_moves_the_adapter_and_nothing_else(decoder, loaded, re
     tokens = np.asarray(reference["input_ids"])
     rows = 2 * jax.device_count()
     objective = LMObjective(adapter.model, tokens.shape[1] - 1, variables=adapter.variables, ema_decay=None)
-    data = Dataset(
+    data = Loader(
         train=lambda partition: iter([{"text": tokens[np.arange(rows) % 2]}]),
         val=None,
         records=rows,
@@ -294,7 +294,7 @@ def test_a_source_fine_tunes_through_its_own_adapted_bundle(decoder, reference, 
                       layout=Layout(min_shard=2**30))
     initial = trainer.initial_state()
     state = trainer.fit(
-        Dataset(train=lambda partition: iter([batch, batch]), val=None, records=rows, batch=rows),
+        Loader(train=lambda partition: iter([batch, batch]), val=None, records=rows, batch=rows),
         steps=2,
         log_every=2,
     )
@@ -871,7 +871,7 @@ def test_a_pipeline_lora_run_moves_its_factors_and_nothing_else(family, pipeline
              **objective.inputs.tokenize([PROMPTS[row % 2] for row in range(rows)])}
     trainer = Trainer(objective, optax.sgd(1e-2), key=jax.random.key(3))
     initial = trainer.initial_state()
-    data = Dataset(train=lambda partition: iter([batch] * 3), val=None, records=rows, batch=rows)
+    data = Loader(train=lambda partition: iter([batch] * 3), val=None, records=rows, batch=rows)
     state = trainer.fit(data, steps=3, log_every=3)
 
     assert set(_flat(state.variables["params"])) == {
@@ -1100,7 +1100,7 @@ def test_a_custom_objective_trains_only_an_adapters_factors(decoder, reference):
     adapter = LoRA(rank=2, modules=("q_proj", "v_proj")).apply(decoder.model, decoder.variables, key=0,
                                                                layouts=decoder.layouts)
     rows = jax.device_count()
-    data = Dataset(train=lambda partition: iter([{"text": tokens[np.arange(rows) % 2]}] * 2), val=None,
+    data = Loader(train=lambda partition: iter([{"text": tokens[np.arange(rows) % 2]}] * 2), val=None,
                    records=rows, batch=rows)
     trainer = Trainer(Squared(adapter.model, adapter.variables), optax.sgd(0.1), key=0)
     initial = trainer.initial_state()

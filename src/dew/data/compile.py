@@ -41,9 +41,9 @@ from dew.data.dataset import (
     Batch,
     Closeable,
     DataPartition,
-    Dataset,
     GlobalReader,
     GlobalStream,
+    Loader,
     Loading,
     PhasedStream,
     Reader,
@@ -379,7 +379,7 @@ def compile(
     rejections: Literal["drop", "mask"] = "drop",
     budget: SearchBudget = _DEFAULT_BUDGET,
     resume: Literal["exact", "non-exact"] = "exact",
-) -> Dataset:
+) -> Loader:
     """Check every leaf before opening readers, then build both branches.
     With no `read`, the sources choose it (`_preferred_read`)."""
     branches = (train,) if validation is None else (train, validation)
@@ -454,7 +454,7 @@ def _compiled(
     counts: Mapping[str, CorpusCounts],
     validation_counts: Mapping[str, CorpusCounts],
     batch_tokens: int | None,
-) -> Dataset:
+) -> Loader:
     read, seed, loading, batch, global_order = (
         build.read,
         build.seed,
@@ -516,7 +516,7 @@ def _compiled(
     if records is not None and records < batch:
         raise ValueError(f"corpus {_name(train)} has {records} records, fewer than one batch of {batch}")
     held_out = sum(integer(source.metadata().get("held_out", 0), "held_out") for _, source in _leaves(train))
-    return Dataset(
+    return Loader(
         training,
         held_reader,
         records,
@@ -543,13 +543,13 @@ def _compile_phases(
     rejections: Literal["drop", "mask"],
     budget: SearchBudget,
     resume: Literal["exact", "non-exact"],
-) -> Dataset:
+) -> Loader:
     source = train.source
     if not isinstance(source, Phases):
         raise TypeError("phased compilation needs a Phases source")
     _tokenizer_contract((train,) if validation is None else (train, validation))
     consumed: dict[str, int] = {}
-    built: list[tuple[Dataset, int | None]] = []
+    built: list[tuple[Loader, int | None]] = []
     previous = 0
     for index, (pipeline, until) in enumerate(zip(source.pipelines, source.until_steps, strict=True)):
         continued = _continued(pipeline, consumed).then(*train.stages)
