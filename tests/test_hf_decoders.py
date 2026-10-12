@@ -676,6 +676,76 @@ def test_the_erf_gelu_is_not_the_tanh_gelu_on_gemma():
     assert 1e-4 < difference < 1e-2
 
 
+def _respelled(name, tmp_path, edit):
+    """The fixture's checkpoint under the config `edit` returns from its own."""
+    from shutil import copytree
+
+    directory = copytree(FIXTURES / name, tmp_path / name)
+    config = edit(fixture_config(name))
+    (directory / "config.json").write_text(json.dumps(config))
+    return directory
+
+
+def _reference_logits(name, directory):
+    """The reference logits the fixture shipped, beside what `directory` loads to."""
+    model, variables = fp32_decoder(directory)
+    ids = np.load(FIXTURES / name / "input_ids.npy")
+    return np.asarray(model.apply(variables, ids)), np.load(FIXTURES / name / "logits.npy")
+
+
+def _without(*fields):
+    return lambda config: {key: value for key, value in config.items() if key not in fields}
+
+
+@pytest.mark.parametrize("name, edit", [
+    # Gemma3TextConfig: GELU, global base 1e6 and local 1e4 by default.
+    ("gemma3-tiny", _without("rope_parameters", "hidden_activation", "attn_logit_softcapping")),
+    # Gemma2Config: GELU and a final cap of 30 by default.
+    ("gemma2-tiny", _without("hidden_activation", "final_logit_softcapping")),
+    # Olmo3Config: a record per kind at its default_theta of 500000.
+    ("olmo3-tiny", _without("rope_parameters")),
+    # A flat llama3 record whose base sits beside it, in either field.
+    ("llama31-tiny", lambda config: {**config, "rope_theta": config["rope_parameters"]["rope_theta"],
+                                     "rope_parameters": {key: value for key, value
+                                                         in config["rope_parameters"].items()
+                                                         if key != "rope_theta"}}),
+    ("llama31-tiny", lambda config: {**_without("rope_parameters")(config),
+                                     "rope_theta": config["rope_parameters"]["rope_theta"],
+                                     "rope_scaling": {key: value for key, value
+                                                      in config["rope_parameters"].items()
+                                                      if key != "rope_theta"}}),
+    # OLMo 3's class folds a legacy rope_scaling into the full layers' record.
+    ("olmo3-yarn-tiny", lambda config: {
+        **config,
+        "rope_parameters": {**config["rope_parameters"],
+                            "full_attention": {"rope_type": "default", "rope_theta": 500000.0}},
+        "rope_scaling": {key: value for key, value in config["rope_parameters"]["full_attention"].items()
+                         if key != "rope_theta"}}),
+])
+def test_a_source_spelled_another_way_computes_the_reference_logits(name, edit, tmp_path):
+    """A source that leaves its config class's defaults unstated, or spells
+    its rope another way the class reads, loads to the model the fully
+    spelled fixture is, and computes the reference's logits."""
+    ours, theirs = _reference_logits(name, _respelled(name, tmp_path, edit))
+    assert np.max(np.abs(ours - theirs)) < 1e-4
+
+
+def test_a_plain_rope_scaling_clears_the_ramp_rope_parameters_names(tmp_path):
+    """The mixin replaces rope_parameters with a stated rope_scaling whole,
+    so an explicit plain rope_scaling over a llama3 record is plain rope at
+    the default base, as that spelling stated alone is."""
+    plain = {"rope_type": "default"}
+    conflicting = _respelled("llama31-tiny", tmp_path / "conflicting",
+                             lambda config: {**config, "rope_scaling": plain})
+    alone = _respelled("llama31-tiny", tmp_path / "alone",
+                       lambda config: {**config, "rope_parameters": {**plain, "rope_theta": 10000.0}})
+    ids = np.load(FIXTURES / "llama31-tiny" / "input_ids.npy")
+    logits = [np.asarray(model.apply(variables, ids))
+              for model, variables in (fp32_decoder(conflicting), fp32_decoder(alone))]
+    np.testing.assert_array_equal(*logits)
+    assert np.max(np.abs(logits[0] - np.load(FIXTURES / "llama31-tiny" / "logits.npy"))) > 1e-3
+
+
 def test_a_rope_scaling_spelled_the_old_way_is_refused():
     """transformers reads rope_type from the older 'type' key too
     (modeling_rope_utils.py:785, 839), so a config that spells its Yarn
