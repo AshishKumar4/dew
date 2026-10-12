@@ -250,11 +250,17 @@ class SourceQuantization:
         """Decode each quantized weight in float32, keep it in `param_dtype`
         and drop its parts. Every other tensor passes through unchanged."""
         out = dict(tensors)
-        for name in self.names(tensors):
+        names = self.names(tensors)
+        for name in names:
             out[name] = checkpoint_array(self.decode(tensors, name), param_dtype)
             for partner in self.partners(name):
                 # An optional part (compressed-tensors' act-order index) may be absent.
                 out.pop(partner, None)
+        # Each format finds its weights by their scales, so a weight that lost its
+        # scale would load its codes as values; a dense weight is never stored so.
+        lost = [name for name, tensor in out.items() if name not in names and _encoded(name, tensor)]
+        if lost:
+            raise ValueError(f"{', '.join(lost)} arrive encoded and the checkpoint holds no scale for them")
         return out
 
     def requantize(self, tensors: Mapping[str, np.ndarray], names: Iterable[str]) -> dict[str, np.ndarray]:
@@ -270,6 +276,13 @@ class SourceQuantization:
                                  f"quantizing {name} would overwrite it")
             out.update(self.encode(name, np.asarray(out.pop(name))))
         return out
+
+
+def _encoded(name: str, tensor: np.ndarray) -> bool:
+    """Whether `tensor` holds codes rather than values: an FP8 array, or an
+    integer `weight`."""
+    dtype = np.dtype(tensor.dtype)
+    return dtype.name.startswith("float8") or (name.endswith("weight") and np.issubdtype(dtype, np.integer))
 
 
 def _paired(tensors: Mapping[str, np.ndarray], suffixes: tuple[str, ...], weight: str) -> tuple[str, ...]:

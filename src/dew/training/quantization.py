@@ -47,11 +47,12 @@ from __future__ import annotations
 import dataclasses
 import functools
 import importlib
+import inspect
 import math
 import re
 from collections.abc import Callable, Mapping, Sequence
 from types import ModuleType
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, ClassVar, Literal
 
 import jax
 import jax.numpy as jnp
@@ -60,6 +61,7 @@ from flax import core, linen as nn
 from flax.traverse_util import flatten_dict, unflatten_dict
 
 from dew.nn.kernels.generation import backend
+from dew.nn.precision import asks_default_precision
 
 if TYPE_CHECKING:
     from qwix import QuantizationProvider
@@ -78,15 +80,18 @@ CALIBRATIONS = ("absmax", "minmax", "rms", "fixed")
 """The weight calibration methods Qwix parses, before an optional `,args`
 suffix (`qwix/_src/qconfig.py`, `QuantizationRule`)."""
 
-# The entry methods a run's matmuls travel through, wrapped where the model
-# defines them. `__call__` covers sampling and scoring; the language-model
-# objective trains through `hidden_states` and its prediction depths through
-# `mtp_hidden_states`; text generation (`dew.sampling.text`) enters through
-# the rest. Qwix's interception is non-recursive over dynamic extent, so
-# `__call__` reaching `hidden_states` quantizes once.
-METHODS = ("__call__", "hidden_states", "mtp_hidden_states", "states_and_logits", "states_and_logits_at",
-           "init_cache", "init_mtp_cache", "init_draft_cache", "mtp_step", "token_embeddings", "draft",
-           "draft_context")
+def entry_methods(model: nn.Module) -> tuple[str, ...]:
+    """Every method of `model`'s class that a caller can enter it through,
+    the ones Qwix wraps: `__call__` and each public function the class or
+    its bases define below `nn.Module`, `setup` aside. Qwix's interception is
+    non-recursive over dynamic extent, so `__call__` reaching
+    `hidden_states` quantizes once."""
+    owned = [vars(layer) for layer in type(model).__mro__
+             if issubclass(layer, nn.Module) and layer is not nn.Module]
+    names = {name for space in owned for name, value in space.items()
+             if (name == "__call__" or not name.startswith("_")) and name != "setup"
+             and inspect.isfunction(value)}
+    return tuple(sorted(names))
 
 
 # MaxText's quantization settings, which these fields follow, are in its
@@ -164,7 +169,7 @@ class Quantization:
         """Return a copy of `model` whose trunk matmuls train in this spec's dtype.
 
         The copy is an instance of Qwix's subclass of the model's class, with
-        each method of `METHODS` that the model defines wrapped. Everything
+        each of its `entry_methods` wrapped. Everything
         the registry, the objective and the checkpoint code read from the
         model therefore still works. Invalid settings were already refused
         when the spec was constructed. Without Qwix installed, the call raises
@@ -173,9 +178,8 @@ class Quantization:
         return _qwix_wrapped(model, _providers()[0](_rules(self, training=True)), self)
 
 
-def _qwix_wrapped(model: nn.Module, provider: QuantizationProvider,
-                  wrapper: Quantization | InputQuantization) -> nn.Module:
-    """`model` with the matmuls of its `METHODS` under Qwix's `provider`, in
+def _qwix_wrapped(model: nn.Module, provider: QuantizationProvider, wrapper: Quantization) -> nn.Module:
+    """`model` with the matmuls of its `entry_methods` under Qwix's `provider`, in
     the class Qwix makes for the call, which names `wrapper` and the class it
     wraps (`dew.registry.WrapperClass`) for the model's record.
 
@@ -187,10 +191,8 @@ def _qwix_wrapped(model: nn.Module, provider: QuantizationProvider,
     held = next((layer for layer in type(model).__mro__ if "_unquantized_type" in vars(layer)), None)
     if held is not None:
         raise ValueError(f"{type(model).__name__} already computes under a Qwix quantization, which a "
-                         f"second one would replace; quantize the model once, a run's training "
-                         f"quantization or its checkpoint's input quantization")
-    methods = tuple(method for method in METHODS if hasattr(model, method))
-    wrapped = _qwix().quantize_model(model, provider, methods=methods)
+                         f"second one would replace; quantize the model once")
+    wrapped = _qwix().quantize_model(model, provider, methods=entry_methods(model))
     layer = type(wrapped)
     layer._dew_wrapped = type(model)
     layer._dew_wrapper = staticmethod(lambda: wrapper)
@@ -210,34 +212,59 @@ def _qwix(module: str = "qwix") -> ModuleType:
         ) from error
 
 
+QUANTIZATION = "quantization"
+"""The collection that holds a projection site's checkpoint quantization, at
+the site's own scope: every view of the variables (a scanned or staged
+stack, a packed group, a pipeline) carries it with the weights it scales."""
+
+INPUT_SCALES = {"fp8": "fp8_input_scale", "nvfp4": "nvfp4_input_global_scale"}
+"""Each input format's leaf in `QUANTIZATION`: ModelOpt's static FP8
+multiplier (amax/448) or the NVFP4 global scale, one float32 scalar a site."""
+
+
+@jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
-class NVFP4Input:
-    """One checkpoint Linear's stored global scale and published local-scale arithmetic."""
+class InputQuantizer:
+    """One projection site's checkpoint input quantizer: its stored scale and
+    the format's arithmetic, which `qdq` applies to the site's input.
 
-    global_scale: float
-    e4m3_scale: bool
-    format: Literal['compressed-tensors', 'modelopt'] = 'compressed-tensors'
+    `fp8` and `nvfp4` build one from a file's value and refuse an invalid
+    one; a site builds one from the scale its variables hold, which is what
+    traces under a scan or a jit.
+    """
 
-    def __post_init__(self) -> None:
-        if (not math.isfinite(self.global_scale) or self.global_scale < 0
-                or (self.global_scale == 0 and self.format == 'compressed-tensors')):
-            raise ValueError(f"NVFP4 input_global_scale must be positive and finite, got {self.global_scale}")
-        if self.format == 'modelopt' and not self.e4m3_scale:
+    scale: jax.Array
+    kind: Literal["fp8", "nvfp4"] = dataclasses.field(metadata={"static": True})
+    e4m3_scale: bool = dataclasses.field(default=True, metadata={"static": True})
+    """Whether NVFP4 rounds its local scales to E4M3."""
+    format: Literal["compressed-tensors", "modelopt"] = dataclasses.field(
+        default="compressed-tensors", metadata={"static": True})
+    """Whose NVFP4 local-scale arithmetic the input follows."""
+
+    @classmethod
+    def fp8(cls, scale: float) -> InputQuantizer:
+        """ModelOpt's static E4M3 input multiplier, amax/448 in its exported files."""
+        if not math.isfinite(scale) or scale <= 0:
+            raise ValueError(f"ModelOpt FP8 input_scale must be positive and finite, got {scale}")
+        return cls(jnp.float32(scale), "fp8")
+
+    @classmethod
+    def nvfp4(cls, global_scale: float, e4m3_scale: bool,
+              format: Literal["compressed-tensors", "modelopt"] = "compressed-tensors") -> InputQuantizer:
+        """One checkpoint Linear's stored global scale and published local-scale arithmetic."""
+        if (not math.isfinite(global_scale) or global_scale < 0
+                or (global_scale == 0 and format == "compressed-tensors")):
+            raise ValueError(f"NVFP4 input_global_scale must be positive and finite, got {global_scale}")
+        if format == "modelopt" and not e4m3_scale:
             raise ValueError("ModelOpt NVFP4 always rounds its local scales to E4M3")
+        return cls(jnp.float32(global_scale), "nvfp4", e4m3_scale, format)
+
+    def qdq(self, x: jax.Array) -> jax.Array:
+        """`x` quantized to the format and back, with the straight-through gradient."""
+        return fp8_input_qdq(x, self) if self.kind == "fp8" else nvfp4_input_qdq(x, self)
 
 
-@dataclasses.dataclass(frozen=True)
-class FP8Input:
-    """One ModelOpt static E4M3 input multiplier, amax/448 in its exported files."""
-
-    scale: float
-
-    def __post_init__(self) -> None:
-        if not math.isfinite(self.scale) or self.scale <= 0:
-            raise ValueError(f"ModelOpt FP8 input_scale must be positive and finite, got {self.scale}")
-
-
-def fp8_input_qdq(x: jax.Array, spec: FP8Input) -> jax.Array:
+def fp8_input_qdq(x: jax.Array, spec: InputQuantizer) -> jax.Array:
     """ModelOpt's static FP8 input QDQ using Qwix's E4M3 codes and stored scale.
 
     tensor_quant.py:_fp8_eager widens before scaling and returns the input
@@ -250,7 +277,7 @@ def fp8_input_qdq(x: jax.Array, spec: FP8Input) -> jax.Array:
 
     qarray = _qwix("qwix._src.core.qarray")
     values = jax.lax.stop_gradient(x).astype(jnp.float32)
-    amax = jnp.float32(spec.scale) * jnp.float32(448)
+    amax = jnp.asarray(spec.scale, jnp.float32) * jnp.float32(448)
     safe = jnp.where(amax <= jnp.float32(2 ** -24), 1, amax)
     # torch's scalar/tensor reverse divide is reciprocal then multiply.
     multiplier = _nvfp4_divide(jnp.float32(1), safe) * jnp.float32(448)
@@ -308,7 +335,7 @@ def _nvfp4_divide(numerator: jax.Array, denominator: jax.Array) -> jax.Array:
     return jnp.where(up, above, jnp.where(down, below, quotient))
 
 
-def nvfp4_input_qdq(x: jax.Array, spec: NVFP4Input) -> jax.Array:
+def nvfp4_input_qdq(x: jax.Array, spec: InputQuantizer) -> jax.Array:
     """CT 0.17.1's local input QDQ with Qwix's E2M1 QArray representation.
 
     A local amax/6 is computed in the input dtype, multiplied by the stored
@@ -343,7 +370,7 @@ def nvfp4_input_qdq(x: jax.Array, spec: NVFP4Input) -> jax.Array:
     # CT's local division must round before global scaling, including its bf16 cast.
     scale = jnp.asarray(
         rounded_operand(_nvfp4_divide(largest.astype(jnp.float32), divisor), x.dtype), jnp.float32)
-    overall = jnp.full(scale.shape, spec.global_scale, jnp.float32)
+    overall = jnp.full(scale.shape, spec.scale, jnp.float32)
     scale = scale * overall
     if spec.e4m3_scale:
         scale = jnp.clip(scale, 0, 448).astype(jnp.float8_e4m3fn).astype(jnp.float32)
@@ -360,7 +387,7 @@ def nvfp4_input_qdq(x: jax.Array, spec: NVFP4Input) -> jax.Array:
     return straight_through(x, rounded)
 
 
-def _modelopt_input_qdq(x: jax.Array, spec: NVFP4Input, qarray: ModuleType) -> jax.Array:
+def _modelopt_input_qdq(x: jax.Array, spec: InputQuantizer, qarray: ModuleType) -> jax.Array:
     """ModelOpt's direct-RN E4M3 scale rule, with Qwix's E2M1 representation.
 
     fp4_kernel_hopper.py:76-99 widens before amax, rounds amax/(6*g) to
@@ -382,7 +409,7 @@ def _modelopt_input_qdq(x: jax.Array, spec: NVFP4Input, qarray: ModuleType) -> j
     largest = jnp.max(jnp.abs(groups), -1)
     # At g=0 every effective scale falls below the 1e-5 guard and becomes 1;
     # a tiny positive stand-in keeps that result while avoiding 0/0 NaNs.
-    global_scale = jnp.float32(spec.global_scale if spec.global_scale > 0 else 1e-12)
+    global_scale = jnp.where(spec.scale > 0, spec.scale, 1e-12).astype(jnp.float32)
     denominator = jnp.full(largest.shape, 6, jnp.float32) * global_scale
     normalized = largest * _nvfp4_divide(jnp.ones_like(largest), denominator)
     saturated = jnp.minimum(normalized, 448)
@@ -401,42 +428,75 @@ class InputQuantization:
     loaded from a ModelOpt or compressed-tensors FP8 or NVFP4 checkpoint
     computes under (`dew.interop.Pretrained`), and a run of it records.
 
-    `inputs` maps each Linear's module path to its NVFP4 or FP8 input
-    scales. It is not a `Quantization`: nothing trains quantized, and the
-    weights already hold the values the source reader decoded.
+    Each quantized Linear holds its scale in its own `QUANTIZATION`
+    variables (`INPUT_SCALES`), so a scanned, staged or packed view of the
+    layers keeps it, and a site without one computes as it is. This record
+    holds what the files declare for every site at once: NVFP4's local-scale
+    rounding and arithmetic. It is not a `Quantization`: nothing trains
+    quantized, and the weights already hold the values the source reader
+    decoded.
     """
 
-    inputs: Mapping[str, NVFP4Input | FP8Input]
+    e4m3_scale: bool = True
+    """Whether NVFP4 sites round their local scales to E4M3."""
+    format: Literal["compressed-tensors", "modelopt"] = "compressed-tensors"
+    """Whose NVFP4 local-scale arithmetic the sites follow."""
+
+    def quantizer(self, module: nn.Module) -> InputQuantizer | None:
+        """The bound `module`'s input quantizer, from the scale its variables
+        hold, or None for a module that holds none."""
+        held = [kind for kind, leaf in INPUT_SCALES.items() if module.has_variable(QUANTIZATION, leaf)]
+        if not held:
+            return None
+        if len(held) > 1:
+            raise ValueError(f"{'/'.join(module.path)} holds {held} input scales; a Linear reads one")
+        scale = module.get_variable(QUANTIZATION, INPUT_SCALES[held[0]])
+        return InputQuantizer(scale, held[0], self.e4m3_scale, self.format)
 
     def apply(self, model: nn.Module) -> nn.Module:
-        """Return `model` quantizing each matched Linear's input to its declared
-        format and back with its scales, before the layer's dot.
+        """Return `model` quantizing each Linear's input to its declared format
+        and back with its scales, before the layer's dot.
 
-        The wrapper goes through Qwix, as the rest of this module does. The dot
-        itself is unchanged, so its dtype, accumulation precision and the bias
-        placement stay as the model defines them.
+        The quantizer runs at the call of every module that holds a scale,
+        under an interceptor `apply` installs, so every entry method of the
+        model runs it. The dot itself is unchanged, so its dtype,
+        accumulation precision, output sharding and the bias placement stay
+        as the model defines them.
         """
-        qwix = _qwix()
-        by_pattern = {re.escape(path): spec for path, spec in self.inputs.items()}
+        base, record = type(model), self
+        if any("_dew_input_quantization" in vars(layer) for layer in base.__mro__):
+            raise ValueError(f"{base.__name__} already computes under its checkpoint's input quantization")
 
-        class CheckpointInputs(qwix.QtProvider):
-            def dot_general(self, lhs, rhs, dimension_numbers, precision=None,
-                            preferred_element_type=None, *, out_sharding=None):
-                # Qwix 0.1.8's private lookup preserves the native scope these checkpoint scales bind.
-                rule, _ = self._get_current_rule_and_op_id('dot_general', only_rule=True)
-                if rule is not None:
-                    if dimension_numbers[0][0] != (lhs.ndim - 1,):
-                        raise ValueError(
-                            "checkpoint NVFP4 input QDQ requires the Linear's trailing input axis")
-                    spec = by_pattern[rule.module_path]
-                    lhs = (fp8_input_qdq(lhs, spec) if isinstance(spec, FP8Input)
-                           else nvfp4_input_qdq(lhs, spec))
-                return jax.lax.dot_general(lhs, rhs, dimension_numbers, precision=precision,
-                                           preferred_element_type=preferred_element_type,
-                                           out_sharding=out_sharding)
+        def quantize_inputs(next_fun, args, kwargs, context):
+            module = context.module
+            quantizer = record.quantizer(module) if context.method_name == "__call__" else None
+            if quantizer is None:
+                return next_fun(*args, **kwargs)
+            inputs, *rest = args
+            axis = getattr(module, "axis", -1)
+            axes = tuple(sorted(a % inputs.ndim for a in ((axis,) if isinstance(axis, int) else axis)))
+            if (not isinstance(module, nn.Dense | nn.DenseGeneral) or axes != (inputs.ndim - 1,)
+                    or getattr(module, "batch_dims", ())):
+                raise ValueError(f"{'/'.join(module.path)} holds an input scale, which a Linear "
+                                 "contracting its input's trailing axis alone reads")
+            return next_fun(quantizer.qdq(inputs), *rest, **kwargs)
 
-        rules = [qwix.QtRule(module_path=pattern, op_names=('dot_general',)) for pattern in by_pattern]
-        return _qwix_wrapped(model, CheckpointInputs(rules), self)
+        class InputQuantized(base):
+            _dew_input_quantization: ClassVar[bool] = True
+            _dew_wrapped: ClassVar[type[nn.Module]] = base
+
+            @staticmethod
+            def _dew_wrapper() -> InputQuantization:
+                return record
+
+            def apply(self, variables, *args, **kwargs):
+                with nn.intercept_methods(quantize_inputs):
+                    return super().apply(variables, *args, **kwargs)
+
+        InputQuantized.__name__ = InputQuantized.__qualname__ = base.__name__
+        return InputQuantized(**{field.name: getattr(model, field.name)
+                                 for field in dataclasses.fields(model)
+                                 if field.init and field.name not in ("parent", "name")})
 
 
 def _qtype(dtype: QuantizedDtype) -> jax.typing.DTypeLike:
@@ -730,11 +790,32 @@ def _providers() -> tuple[type, type]:
     group_scaled = _group_scaled_convolution()
 
     class ComplexInFloat(qwix.QuantizationProvider):
-        """Passes a matmul with a complex operand through unquantized."""
+        """Passes a matmul with a complex operand through unquantized, and
+        refuses by name a quantized one whose call asks for what Qwix 0.1.8
+        drops: an accumulation precision or result dtype (both providers'
+        dots and einsums), or an output sharding (all but the serving
+        dot), qwix/_src/providers/qt.py:96-97,130-132 and ptq.py:177-180,244."""
+
+        keeps_out_sharding: ClassVar[bool] = False
+
+        def _refuse_dropped(self, op: str, precision, preferred_element_type, out_sharding) -> None:
+            rule, _ = self._get_current_rule_and_op_id(op, only_rule=True)
+            if rule is None or rule.weight_qtype is None:
+                return
+            asked = {"precision": not asks_default_precision(precision),
+                     "preferred_element_type": preferred_element_type is not None,
+                     "out_sharding": out_sharding is not None and not (
+                         op == "dot_general" and self.keeps_out_sharding)}
+            dropped = [name for name, held in asked.items() if held]
+            if dropped:
+                raise ValueError(f"a quantized {op} at {rule.module_path!r} asks for {', '.join(dropped)}, "
+                                 "which Qwix's quantized matmul drops; leave the matmul out of the "
+                                 "quantization patterns or drop the request")
 
         def dot_general(self, lhs, rhs, dimension_numbers, precision=None,
                         preferred_element_type=None, *, out_sharding=None):
             if _real(lhs.dtype, rhs.dtype):
+                self._refuse_dropped("dot_general", precision, preferred_element_type, out_sharding)
                 return super().dot_general(lhs, rhs, dimension_numbers, precision,
                                            preferred_element_type, out_sharding=out_sharding)
             return jax.lax.dot_general(lhs, rhs, dimension_numbers, precision=precision,
@@ -743,6 +824,8 @@ def _providers() -> tuple[type, type]:
 
         def einsum(self, einsum_str, *operands, **kwargs):
             if _real(*(operand.dtype for operand in operands)):
+                self._refuse_dropped("einsum", kwargs.get("precision"), kwargs.get("preferred_element_type"),
+                                     kwargs.get("out_sharding"))
                 return super().einsum(einsum_str, *operands, **kwargs)
             return jnp.einsum(einsum_str, *operands, **kwargs)
 
@@ -750,6 +833,8 @@ def _providers() -> tuple[type, type]:
         pass
 
     class PtqProvider(group_scaled, ComplexInFloat, qwix.PtqProvider):
+        keeps_out_sharding: ClassVar[bool] = True
+
         def __init__(self, rules: Sequence[object]) -> None:
             super().__init__(
                 rules, _dot_general_fn=_scaled_in_float32(dot_general.dot_general),
@@ -829,8 +914,7 @@ def quantize_for_serving(model: nn.Module, variables: Variables, spec: Quantizat
     """
     rules = _rules(spec, training=False)
     qwix = _qwix()
-    methods = tuple(method for method in METHODS if hasattr(model, method))
-    served = qwix.quantize_model(model, _providers()[1](rules), methods=methods)
+    served = qwix.quantize_model(model, _providers()[1](rules), methods=entry_methods(model))
     def initialized(scope: core.Scope, supplied: Variables):
         # Initialization lets Qwix annotate each weight with its quantization
         # recipe. Seed the scope first so data-dependent module layouts, such

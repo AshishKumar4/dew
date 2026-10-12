@@ -23,6 +23,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
+from flax.traverse_util import unflatten_dict
 from jax.typing import DTypeLike
 
 from dew import records
@@ -1089,20 +1090,22 @@ def _decoded(tensors: Mapping[str, np.ndarray], config: Mapping[str, object], pa
     return tensors, quantized_tensors, scale_dtype, grid
 
 
-def _input_quantization(model: nn.Module, layouts: tuple[WeightLayout, ...],
-                        config: Mapping[str, object], grid: Mapping[str, np.ndarray]) -> nn.Module:
-    """Bind each stored input scale to its Linear's native Qwix scope.
+def _input_quantization(model: nn.Module, variables: Variables, layouts: tuple[WeightLayout, ...],
+                        config: Mapping[str, object], grid: Mapping[str, np.ndarray]
+                        ) -> tuple[nn.Module, Variables]:
+    """Write each stored input scale into its Linear's own `QUANTIZATION`
+    variables, and return the model computing under them.
 
     Expert stacks and concatenated projections need one quantizer per
     member, which this per-Linear binding cannot compute, so they are refused
     before returning a model with the wrong activation forward.
     """
-    from dew.training.quantization import FP8Input, InputQuantization, NVFP4Input
+    from dew.training.quantization import INPUT_SCALES, QUANTIZATION, InputQuantization, InputQuantizer
 
     codec = source_quantization(config)
     if codec is None or codec.input_scale_dtype is None:
-        return model
-    inputs: dict[str, FP8Input | NVFP4Input] = {}
+        return model, variables
+    sites: dict[tuple[str, ...], dict[str, np.ndarray]] = {}
     for layout in layouts:
         part = layout.name.removesuffix('.weight') + codec.input_suffix
         if part not in grid:
@@ -1115,16 +1118,18 @@ def _input_quantization(model: nn.Module, layouts: tuple[WeightLayout, ...],
         if scale.dtype != np.float32 or scale.size != 1:
             raise ValueError(f"{part} must be one float32 stored global scale, "
                              f"got {scale.dtype} {scale.shape}")
-        path = '/'.join(layout.paths[0][1:-1])
-        if codec.input_kind(layout.name) == 'fp8':
-            inputs[path] = FP8Input(float(scale.reshape(())))
-        else:
-            inputs[path] = NVFP4Input(float(scale.reshape(())), codec.input_scale_dtype == 'float8_e4m3fn',
-                                     format=codec.input_format)
-    if len(inputs) != sum(name.endswith(codec.input_suffix) for name in grid):
+        value = float(scale.reshape(()))
+        quantizer = (InputQuantizer.fp8(value) if codec.input_kind(layout.name) == 'fp8' else
+                     InputQuantizer.nvfp4(value, codec.input_scale_dtype == 'float8_e4m3fn',
+                                          format=codec.input_format))
+        sites[layout.paths[0][1:-1]] = {INPUT_SCALES[quantizer.kind]: scale.reshape(())}
+    if len(sites) != sum(name.endswith(codec.input_suffix) for name in grid):
         raise ValueError("NVFP4 input scales must each bind one Linear scope; "
                          "an unbound scale would drop QDQ")
-    return InputQuantization(inputs).apply(model)
+    scheme = InputQuantization(codec.input_scale_dtype == 'float8_e4m3fn', codec.input_format)
+    held = unflatten_dict({(*path, leaf): value for path, leaves in sites.items()
+                           for leaf, value in leaves.items()})
+    return scheme.apply(model), {**variables, QUANTIZATION: held}
 
 
 def _decoder_layouts(tensors: Mapping[str, np.ndarray], record: decoder_parts.DecoderFields, family: str,
@@ -1302,7 +1307,7 @@ def _load_native_source(name_or_dir: str | Path, directory: Path, commit: str | 
             # leave the same weights. A quantized source keeps its packed format
             # by going back over its source names (`weight_layouts`).
             export_adapter = _derived_weights
-    model = _input_quantization(model, layouts, config, grid)
+    model, variables = _input_quantization(model, variables, layouts, config, grid)
     source = str(name_or_dir) if commit is None else f"{name_or_dir}@{directory.name}"
     processor = source_processor(directory, config, record, model, gguf_path, source=source)
     generation_config = _generation_config(directory)
