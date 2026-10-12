@@ -186,9 +186,10 @@ class Mamba(nn.Module):
         # casts them, or in the model's own dtype where it is wider.
         wide = at_least_fp32(mixed.dtype)
         taps, bias = self.conv1d()
-        out = held_scan(self, mixed.astype(wide), taps, bias, self._scan,
+        out = held_scan(self, mixed, taps, bias, self._scan,
                         (self.intermediate_size, self.state_size),
-                        decode=decode, valid=valid, segments=segment_ids,
+                        decode=decode, valid=valid, segments=segment_ids, state_dtype=wide, conv_dtype=wide,
+                        dtype=wide,
                         right_padded=attention_metadata is not None and attention_metadata.right_padded)
         if out is None:
             # Allocation only: init_cache's dummy token must not consume a
