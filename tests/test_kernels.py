@@ -226,6 +226,9 @@ def test_flash_runs_where_the_installed_wheel_holds_code_for_the_gpu(generation,
     ("sm90", WHEEL, {"lengths": True}, "flash", None),
     ("sm90", WHEEL, {"lengths": True, "causal": True}, "cudnn",
      "the call has key lengths, which its kernel here does not take, or a causal mask beside them"),
+    ("sm90", WHEEL, {"lengths": True, "queries": 1}, "cudnn",
+     "a decode step's one query over its cache, which the wheel's FlashAttention-3 serves without "
+     "the split keys and packed heads it leaves out"),
     ("sm80", WHEEL, {"lengths": True}, "cudnn",
      "the call has key lengths, which its kernel here does not take, or a causal mask beside them"),
     ("sm120", WHEEL, {}, "cudnn", None),
@@ -251,7 +254,8 @@ def test_auto_sends_a_plain_call_to_flash_where_it_was_measured(monkeypatch, cap
     monkeypatch.setattr(util, 'find_spec', lambda name: None if name == 'tokamax' else found(name))
     monkeypatch.setattr(attention, 'flash_architectures', lambda: installed)
     monkeypatch.setattr(attention, 'flash_key_lengths', lambda: ("sm90",) if installed == WHEEL else ())
-    query = jnp.zeros((1, 128, 4, call.pop("head_dim", 128)), call.pop("dtype", jnp.bfloat16))
+    query = jnp.zeros((1, call.pop("queries", 128), 4, call.pop("head_dim", 128)),
+                      call.pop("dtype", jnp.bfloat16))
     key = jnp.zeros((1, call.pop("keys", 128), *query.shape[2:]), query.dtype)
     if call.pop("lengths", False):
         call["key_lengths"] = jnp.full((1,), 100, jnp.int32)
