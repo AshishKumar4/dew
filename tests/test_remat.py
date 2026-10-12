@@ -412,7 +412,8 @@ def test_a_step_that_does_not_fit_compiles_again_one_rung_up(monkeypatch, option
         return 0 if rung[1] == 'minimal' else -1
 
     monkeypatch.setattr(memory, 'step_headroom', headroom)
-    monkeypatch.setattr(trainer_module, 'step_compiler_options', lambda objective, rows, frozen: options)
+    monkeypatch.setattr(trainer_module, 'step_compiler_options',
+                        lambda objective, rows, frozen, devices: options)
     model = CausalTransformer(vocab_size=32, emb_features=8, num_layers=1, num_heads=1,
                               mlp_features=16, max_seq_len=8)
     trainer = Trainer(LMObjective(model, seq_len=4), optax.sgd(1e-3), key=jax.random.key(0))
@@ -445,7 +446,8 @@ def recording_runs(monkeypatch, fits):
         return 0 if fits.get(rung, True) else -1
 
     monkeypatch.setattr(memory, 'step_headroom', headroom)
-    monkeypatch.setattr(trainer_module, 'step_compiler_options', lambda objective, rows, frozen: None)
+    monkeypatch.setattr(trainer_module, 'step_compiler_options',
+                        lambda objective, rows, frozen, devices: None)
 
     def run():
         model = CausalTransformer(vocab_size=32, emb_features=8, num_layers=1, num_heads=1,
@@ -479,7 +481,8 @@ def shape_runs(monkeypatch, fits):
         return 0 if fits(rows, rung) else -1
 
     monkeypatch.setattr(memory, 'step_headroom', headroom)
-    monkeypatch.setattr(trainer_module, 'step_compiler_options', lambda objective, rows, frozen: None)
+    monkeypatch.setattr(trainer_module, 'step_compiler_options',
+                        lambda objective, rows, frozen, devices: None)
 
     def fresh():
         model = CausalTransformer(vocab_size=32, emb_features=8, num_layers=1, num_heads=1,
@@ -596,7 +599,8 @@ def refusing_trainer(monkeypatch, refused, error="RESOURCE_EXHAUSTED: Ran out of
 
     monkeypatch.setattr(jax.stages.Lowered, 'compile', compile)
     monkeypatch.setattr(memory, 'step_headroom', lambda executable, devices, held=0: 0)
-    monkeypatch.setattr(trainer_module, 'step_compiler_options', lambda objective, rows, frozen: None)
+    monkeypatch.setattr(trainer_module, 'step_compiler_options',
+                        lambda objective, rows, frozen, devices: None)
     model = CausalTransformer(vocab_size=32, emb_features=8, num_layers=1, num_heads=1,
                               mlp_features=16, max_seq_len=8)
     trainer = Trainer(LMObjective(model, seq_len=4), optax.sgd(1e-3), key=jax.random.key(0))

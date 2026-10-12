@@ -40,12 +40,10 @@ python tools/muonclip_reference.py megatron
 
 from __future__ import annotations
 
-import ast
 import importlib
 import json
 import sys
 import types
-import urllib.request
 from pathlib import Path
 
 import jax
@@ -136,16 +134,12 @@ def write_maxtext_fixture() -> None:
 
 def megatron_methods() -> dict:
     """`SelfAttention.clip_qk` and `_clip_linear_qkv`, as published."""
-    text = urllib.request.urlopen(MEGATRON).read().decode()
-    attention = next(node for node in ast.parse(text).body
-                     if isinstance(node, ast.ClassDef) and node.name == "SelfAttention")
-    methods = [node for node in attention.body if isinstance(node, ast.FunctionDef)
-               and node.name in ("clip_qk", "_clip_linear_qkv")]
     import torch
+    from reference_source import definitions
 
-    scope = {"torch": torch}
-    exec(compile(ast.Module(body=methods, type_ignores=[]), "attention.py", "exec"), scope)
-    return {name: scope[name] for name in ("clip_qk", "_clip_linear_qkv")}
+    names = ("clip_qk", "_clip_linear_qkv")
+    scope = definitions(MEGATRON, names, {"torch": torch}, within="SelfAttention")
+    return {name: scope[name] for name in names}
 
 
 def megatron_clip(methods: dict, kernels: dict, heads: int, kv_heads: int, maxima, dtype) -> dict:

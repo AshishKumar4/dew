@@ -17,7 +17,6 @@ the scheduler computes them, and on the same grid widened to float64.
 
 from __future__ import annotations
 
-import ast
 import inspect
 from pathlib import Path
 
@@ -25,6 +24,7 @@ import diffusers
 import numpy as np
 from diffusers import FlowMatchEulerDiscreteScheduler
 from diffusers.pipelines import flux
+from reference_source import defined_in
 
 FIXTURE = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "flow" / "resolution_shift.npz"
 CONSTANTS = {"flux": {"base_seq_len": 256, "max_seq_len": 4096, "base_shift": 0.5, "max_shift": 1.15},
@@ -35,12 +35,7 @@ TOKENS = (1, 4, 16, 64, 256, 1024, 2304, 4096, 9216, 16384)
 def calculate_shift():
     """The published `calculate_shift`, defined from the installed source."""
     path = Path(inspect.getfile(flux)).parent / "pipeline_flux.py"
-    tree = ast.parse(path.read_text())
-    tree.body = [node for node in tree.body
-                 if isinstance(node, ast.FunctionDef) and node.name == "calculate_shift"]
-    scope: dict = {}
-    exec(compile(tree, str(path), "exec"), scope)
-    return scope["calculate_shift"]
+    return defined_in(path.read_text(), {"calculate_shift"}, {}, filename=str(path))["calculate_shift"]
 
 
 def main() -> None:

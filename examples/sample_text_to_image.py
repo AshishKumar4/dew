@@ -5,7 +5,8 @@ model from the Hugging Face Hub:
 
     python examples/sample_text_to_image.py
 
-`--model` also takes a Dew run directory, read through `TextToImage.from_run`:
+`--model` takes another Hub repository, pinned as `repo@revision` or not, or a Dew run
+directory, read through `TextToImage.from_run`:
 
     python examples/sample_text_to_image.py --model RUN_DIR
 
@@ -31,6 +32,7 @@ import tyro
 from PIL import Image, ImageDraw, ImageFont
 
 from dew.artifacts import uint8_pixels
+from dew.interop import split_revision
 from dew.sampling import CFG, DPMSolverMultistep, EulerAncestral, Heun, TextToImage
 
 # Each sampler's solver, step count and classifier-free guidance.
@@ -43,10 +45,9 @@ SAMPLERS = {
 
 @dataclass
 class Config:
-    model: str = "dewml/hybrid-dit-176m"
-    """A Hugging Face Hub repository, or a local Dew run directory."""
-    revision: str | None = "f9f06d778860501a257a900ca58faabf853f03cc"
-    """The Hub commit or tag to load; local run directories do not use it."""
+    model: str = "dewml/hybrid-dit-176m@f9f06d778860501a257a900ca58faabf853f03cc"
+    """A Hugging Face Hub repository, `repo@revision` to pin a commit or tag, or a local Dew run
+    directory."""
     out: Path = Path("runs/sample-text-to-image")
     """A new directory for the images, grids and manifest."""
     prompts: tuple[str, ...] = (
@@ -64,10 +65,11 @@ class Config:
     keeps the one the loaded model is configured with (empty for the recorded model)."""
 
 
-def load(model: str, revision: str | None) -> TextToImage:
+def load(model: str) -> TextToImage:
     if Path(model).is_dir():
         return TextToImage.from_run(model)
-    return TextToImage.from_pretrained(model, revision=revision)
+    repo, revision = split_revision(model)
+    return TextToImage.from_pretrained(repo, revision=revision)
 
 
 def grid(title: str, prompts, seeds, images: np.ndarray) -> Image.Image:
@@ -99,7 +101,7 @@ def main(config: Config):
     out.mkdir(parents=True, exist_ok=False)
     prompts = list(config.prompts)
     started = time.perf_counter()
-    pipe = load(config.model, config.revision)
+    pipe = load(config.model)
     print(f"Loaded in {time.perf_counter() - started:.1f} s on {jax.devices()[0].device_kind}")
     manifest = {"model": config.model, "device": jax.devices()[0].device_kind,
                 "negative": config.negative, "batches": [], "images": []}

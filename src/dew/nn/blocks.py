@@ -11,7 +11,7 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 from jax.typing import DTypeLike
 
-from .attention import RMSNorm
+from .attention import GroupNorm, RMSNorm
 from .conv import Conv
 from .flops import projection_flops
 from .precision import at_least_fp32
@@ -321,9 +321,10 @@ class ResidualBlock(nn.Module):
 
     def setup(self):
         if self.norm_groups > 0:
-            norm = partial(nn.GroupNorm, self.norm_groups, epsilon=self.norm_epsilon, dtype=self.dtype)
+            norm = partial(GroupNorm, self.norm_groups, epsilon=self.norm_epsilon, activation=self.activation,
+                           dtype=self.dtype)
         else:
-            norm = partial(RMSNorm, epsilon=self.norm_epsilon, dtype=self.dtype)
+            norm = partial(RMSNorm, epsilon=self.norm_epsilon, activation=self.activation, dtype=self.dtype)
         self.norm1 = norm()
         self.norm2 = norm()
 
@@ -331,13 +332,13 @@ class ResidualBlock(nn.Module):
     def __call__(self, x: jax.Array, temb: jax.Array, *, train: bool = False):
         conv = partial(Conv, features=self.features, kernel_size=self.kernel_size,
                        strides=(1, 1), dtype=self.dtype, precision=self.precision)
-        out = conv(name="conv1")(self.activation(self.norm1(x)))
+        out = conv(name="conv1")(self.norm1(x))
 
         temb = nn.DenseGeneral(features=self.features, name="temb_projection",
                                dtype=self.dtype, precision=self.precision)(temb)
         out = out + temb[:, None, None, :]
 
-        out = self.activation(self.norm2(out))
+        out = self.norm2(out)
         if self.dropout:
             out = nn.Dropout(self.dropout)(out, deterministic=not train)
         out = conv(name="conv2")(out)
