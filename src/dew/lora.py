@@ -54,7 +54,7 @@ from dew.interop.safetensors_io import read_file, write_file
 from dew.interop.streaming import WeightLayout
 from dew.nn.backbones.layer_plan import group_layers
 from dew.nn.flops import MissingFlopsCount, counted_flops, parameter_flops, projection_flops
-from dew.nn.protocols import CountedLogits, CountedMatrixUsage
+from dew.nn.protocols import Counted, CountedLogits, CountedMatrixUsage
 from dew.objectives.base import Path, Variables, freeze, merge as overlay, select, thaw
 from dew.registry import wrapper_layers
 
@@ -409,34 +409,13 @@ class _Branch:
         return output + jnp.asarray(_scale(target, self.rslora), delta.dtype) * delta
 
 
-def _adapted(model: nn.Module, branch: _Branch, layouts: Mapping[str, WeightLayout]) -> nn.Module:
-    """Return `model` computing `branch` in every target module.
-
-    The result is an instance of a subclass of `model`'s class with the
-    same fields and methods, so it builds, checks and generates as the model
-    does; only `apply` and `init` change. `apply` folds `FROZEN` back into
-    `params` and runs under the interceptor; `init` (Flax's dispatches
-    through `init_with_output`) runs under it and splits what it draws, the
-    factors under `params` and the rest under `FROZEN`. `layouts` are the
-    bindings the class's record (`AdapterRecord`) writes beside the
-    targets; the record is written when a run asks for it, so an adapter a
-    run cannot record (a file's mixed ranks) still loads and computes.
-    """
+def _counted_adapter(model: nn.Module, branch: _Branch,
+                     layouts: Mapping[str, WeightLayout]) -> type[nn.Module]:
+    """An adapter adds analytical work only to capabilities its wrapped model declares."""
     base = type(model)
-    if isinstance(base, AdaptedClass):
-        raise ValueError("The model is already adapted")
-    factors = {(*path, factor) for path in branch.targets for factor in FACTORS}
     bindings = {layout.paths[0][:-1]: layout for layout in layouts.values() if len(layout.paths) == 1}
 
-    class Adapted(base):
-        # Staticmethods, or Flax would wrap the callables as module methods.
-        _dew_lora_interceptor: ClassVar[Interceptor] = staticmethod(branch)
-        _dew_wrapped: ClassVar[type[nn.Module]] = base
-
-        @staticmethod
-        def _dew_wrapper() -> AdapterRecord:
-            return _record(branch.targets, branch.rslora, branch.dropout, layouts)
-
+    class CountedAdapter(base):
         @nn.nowrap
         def _adapter_forward(self, lengths, *, logits: bool = False) -> float:
             original = unadapted(self)
@@ -462,13 +441,6 @@ def _adapted(model: nn.Module, branch: _Branch, layouts: Mapping[str, WeightLayo
             return counted_flops(unadapted(self), lengths) + self._adapter_forward(lengths)
 
         @nn.nowrap
-        def logits_flops(self, lengths) -> float:
-            original = unadapted(self)
-            if not isinstance(original, CountedLogits):
-                raise MissingFlopsCount(f"{type(original).__name__} has no declared vocabulary-head work")
-            return original.logits_flops(lengths) + self._adapter_forward(lengths, logits=True)
-
-        @nn.nowrap
         def training_flops(self, lengths) -> float:
             """Frozen base maps get 4N, factors 6N; state/attention retain 3*forward.
 
@@ -481,6 +453,14 @@ def _adapted(model: nn.Module, branch: _Branch, layouts: Mapping[str, WeightLayo
             learned = parameter_flops(original, lengths)
             return 3 * forward - learned + 3 * self._adapter_forward(lengths)
 
+    class LogitsAdapter(CountedAdapter):
+        @nn.nowrap
+        def logits_flops(self, lengths) -> float:
+            original = unadapted(self)
+            if not isinstance(original, CountedLogits):
+                raise MissingFlopsCount(f"{type(original).__name__} has no declared vocabulary-head work")
+            return original.logits_flops(lengths) + self._adapter_forward(lengths, logits=True)
+
         @nn.nowrap
         def logits_training_flops(self, lengths) -> float:
             original = unadapted(self)
@@ -488,12 +468,45 @@ def _adapted(model: nn.Module, branch: _Branch, layouts: Mapping[str, WeightLayo
                 raise MissingFlopsCount(f"{type(original).__name__} has no declared vocabulary-head work")
             return 2 * original.logits_flops(lengths) + 3 * self._adapter_forward(lengths, logits=True)
 
+    return (LogitsAdapter if isinstance(model, CountedLogits) else
+            CountedAdapter if isinstance(model, Counted) else base)
+
+
+def _adapted(model: nn.Module, branch: _Branch, layouts: Mapping[str, WeightLayout]) -> nn.Module:
+    """Return `model` computing `branch` in every target module.
+
+    The result is an instance of a subclass of `model`'s class with the
+    same fields and methods, so it builds, checks and generates as the model
+    does. Its count adds the branch only where the model supplies geometry.
+    `apply` folds `FROZEN` back into `params` and runs under the interceptor;
+    `init` (Flax's dispatches through `init_with_output`) runs under it and
+    splits what it draws, the factors under `params` and the rest under
+    `FROZEN`. `layouts` are the bindings the class's record (`AdapterRecord`)
+    writes beside the targets; the record is written when a run asks for it,
+    so an adapter a run cannot record (a file's mixed ranks) still loads and
+    computes.
+    """
+    base = type(model)
+    if isinstance(base, AdaptedClass):
+        raise ValueError("The model is already adapted")
+    factors = {(*path, factor) for path in branch.targets for factor in FACTORS}
+    adapted_base = _counted_adapter(model, branch, layouts)
+
+    class Adapted(adapted_base):
+        # Staticmethods, or Flax would wrap the callables as module methods.
+        _dew_lora_interceptor: ClassVar[Interceptor] = staticmethod(branch)
+        _dew_wrapped: ClassVar[type[nn.Module]] = base
+
+        @staticmethod
+        def _dew_wrapper() -> AdapterRecord:
+            return _record(branch.targets, branch.rslora, branch.dropout, layouts)
+
         def apply(self, variables, *args, **kwargs):
-            with nn.intercept_methods(self._dew_lora_interceptor):
+            with nn.intercept_methods(branch):
                 return super().apply(thaw(variables), *args, **kwargs)
 
         def init_with_output(self, *args, **kwargs):
-            with nn.intercept_methods(self._dew_lora_interceptor):
+            with nn.intercept_methods(branch):
                 output, variables = super().init_with_output(*args, **kwargs)
             return output, dict(freeze(variables, lambda path: path in factors))
 

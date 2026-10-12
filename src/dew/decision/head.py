@@ -27,7 +27,7 @@ from dew.decision.questions import KINDS, Choice, Noul, Score
 from dew.nn.activations import gelu_exact_torch
 from dew.nn.attention import NormalAttention, l2_normalized
 from dew.nn.backbones.decoder_block import BlockWiring, DecoderBlock, GatedMLP, decoder_norm
-from dew.nn.flops import MissingFlopsCount, attention_flops, projection_flops, real_lengths
+from dew.nn.flops import attention_flops, projection_flops, real_lengths
 from dew.nn.inputs import AttentionMetadata
 from dew.nn.mixer_base import MixerContext
 from dew.nn.mixers import AttentionMixer
@@ -53,16 +53,6 @@ class Head(nn.Module):
     reads_table: ClassVar[bool] = False
     width_field: ClassVar[str] = "features"
     """The field holding the width of the states the head reads."""
-
-    @nn.nowrap
-    def model_flops(self, lengths) -> float:
-        """A decision head needs question/option counts, not just row lengths."""
-        raise MissingFlopsCount(f"{type(self).__name__} requires decision_flops(lengths, questions, options)")
-
-    @nn.nowrap
-    def decision_flops(self, lengths, questions, options) -> float:
-        """Forward work with the layout's real question and option counts."""
-        raise MissingFlopsCount(f"{type(self).__name__} has no declared decision_flops")
 
     def record(self) -> JSON:
         """Return the head's name and the fields a run records."""
