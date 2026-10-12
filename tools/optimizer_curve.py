@@ -31,8 +31,9 @@ import tyro
 
 import dew.nn.backbones  # noqa: F401  (registers the kind)
 from dew.config import OptimConfig
-from dew.data import DataPartition, Loading, Text
-from dew.data.recipes import load
+from dew.config.data import TextData, loader
+from dew.data import Loading
+from dew.data.dataset import DataPartition
 from dew.objectives.lm import LMObjective
 from dew.registry import models
 from dew.training import MeshSpec, Trainer
@@ -99,7 +100,7 @@ def run(config: Comparison) -> Curve:
     vocab_size = int(meta["vocab_size"])
     # One worker and one read thread: the arms must see identical batches, and
     # a curve is not a throughput measurement.
-    data = load(Text(source=config.dataset, seq_len=config.sequence_length), batch=config.batch_size,
+    data = loader(TextData(source=config.dataset, seq_len=config.sequence_length), batch=config.batch_size,
         read="memory", seed=config.seed, loading=Loading(workers=0, threads=1, read_buffer=1,
                                         worker_buffer=1), validation_records=4 * (config.batch_size))
     fields = {"vocab_size": vocab_size, "emb_features": config.emb_features, "num_layers": config.num_layers,

@@ -31,7 +31,9 @@ import tensorflow_datasets as tfds
 import tyro
 from PIL import Image
 
-from dew.data import TFDS, Augment, DataPartition, Images, Loading, load
+from dew.config.data import Augment, ImageData, loader
+from dew.data import TFDS, Loading
+from dew.data.dataset import DataPartition
 from dew.data.image_augmentation import ImageParameters, apply_device, apply_host
 from dew.data.images import decode_image, resize_image
 
@@ -123,10 +125,10 @@ def augmentation_accuracy():
 
 
 def pipeline_timing(config, backend, crop_scale):
-    spec = Images(source=TFDS("oxford_flowers102", path=config.flowers, split="all"),
+    spec = ImageData(source=TFDS("oxford_flowers102", path=config.flowers, split="all"),
                   image_size=config.image_size, caption_templates=("a photo of a {}",),
                   augment=Augment(flip=True, jitter=True, backend=backend, crop_scale=crop_scale))
-    stream = load(spec, batch=config.batch, read="memory",
+    stream = loader(spec, batch=config.batch, read="memory",
                   loading=Loading(workers=0, threads=config.threads,
                       read_buffer=2 * config.batch)).train(DataPartition())
     consume = jax.jit(lambda pixels: jnp.mean(pixels.astype(jnp.float32)))
@@ -159,7 +161,7 @@ def training_timing(config, backend):
     from dew.training import Trainer
     from dew.training.distributed import DevicePrefetchIterator
 
-    spec = Images(source=TFDS("oxford_flowers102", path=config.flowers, split="all"),
+    spec = ImageData(source=TFDS("oxford_flowers102", path=config.flowers, split="all"),
                   image_size=config.image_size, caption_templates=("a photo of a {}",),
                   augment=Augment(flip=True, jitter=True, backend=backend))
     model = SimpleDiT(patch_size=16, emb_features=32, num_layers=1, num_heads=4,
@@ -169,7 +171,7 @@ def training_timing(config, backend):
                                   ema_decay=None)
     trainer = Trainer(objective, optax.adamw(1e-3), key=jax.random.key(0))
     state, _, _ = trainer.place()
-    source = load(spec, batch=config.batch, read="memory",
+    source = loader(spec, batch=config.batch, read="memory",
                   loading=Loading(workers=0, threads=config.threads, read_buffer=2 * config.batch)).train(
                       DataPartition.of(trainer.device_mesh))
     durations = []

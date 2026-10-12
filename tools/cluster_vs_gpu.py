@@ -39,7 +39,7 @@ import time
 import urllib.request
 from pathlib import Path
 
-from dew.data.recipes import load
+from dew.config.data import loader
 
 CORPUS = ("https://huggingface.co/datasets/roneneldan/TinyStories/resolve/"
           "f54c09fd23315a6f9c86f9dc80f725de7d8f9c64/TinyStories-valid.txt")
@@ -61,7 +61,8 @@ SHAPES = {
 
 def corpus(cache: Path) -> Path:
     """The pinned text as a produced ArrayRecord token store."""
-    from dew.data import ByteTokenizer, export
+    from dew.data import ByteTokenizer
+    from dew.data.sinks import export
     import numpy as np
 
     tokens = cache / "tokens"
@@ -211,7 +212,7 @@ def main() -> None:
     import optax
     from jax.experimental import multihost_utils
 
-    from dew.data import Text
+    from dew.config.data import TextData
     from dew.data.dataset import DataPartition
     from dew.nn.backbones import CausalTransformer
     from dew.objectives.lm import LMObjective
@@ -224,7 +225,7 @@ def main() -> None:
     target = shape["target"] if args.target is None else args.target
     tokens = corpus(args.cache)
     batch_size = shape["batch"] if args.batch is None else args.batch
-    data = load(Text(source=str(tokens), seq_len=SEQ_LEN), batch=batch_size, read="memory",
+    data = loader(TextData(source=str(tokens), seq_len=SEQ_LEN), batch=batch_size, read="memory",
         validation_records=4 * (batch_size))
     model = CausalTransformer(**shape["model"], vocab_size=256, max_seq_len=SEQ_LEN + 1,
                               dtype=getattr(jnp, dtype), attention_impl="auto", scan_layers=args.scan_layers)
