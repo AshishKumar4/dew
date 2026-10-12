@@ -20,6 +20,7 @@ Scope is per rule, because the rules are not all about the same thing:
 - SLOP008 is about the suite only.
 - SLOP010 is about the contract's consumers of its models, so it runs in
   `src/<package>`, against an index of the whole package.
+- SLOP013 is about what importing `src/<package>` does to the process.
 
 Every rule fails the gate, and none has a per-finding suppression.
 
@@ -96,6 +97,9 @@ SEAMS = ("subprocess", "socket", "urllib", "request", "http", "download", "hub",
          "fetch", "client", "urlopen", "snapshot")
 NARROWERS = {"Mapping", "MutableMapping", "dict", "Dict", "Sequence", "list", "tuple", "str",
              "int", "float", "bool", "bytes"}
+# Process-wide state a module must not change while it is imported.
+GLOBAL_WRITES = ("config.update", "environ.setdefault", "environ.update", "putenv", "basicConfig",
+                 "mark_as_parsed", "register_event_listener", "filterwarnings", "simplefilter")
 
 
 @dataclass(frozen=True)
@@ -772,7 +776,34 @@ def boundaries(module: Module, models: ModelIndex) -> Iterator[Finding]:
                           f"reads {member}, private to a model; ask for a public capability instead")
 
 
-CONTRACT_RULES = (contracts, suppressions, probes, names)
+def _module_level(body: Sequence[ast.stmt]) -> Iterator[ast.stmt]:
+    """The statements an import runs, through module-level if and try."""
+    for node in body:
+        if isinstance(node, ast.If) and _named(node.test.left if isinstance(node.test, ast.Compare)
+                                               else node.test) == "__name__":
+            continue
+        if isinstance(node, ast.If | ast.Try):
+            yield from _module_level(node.body)
+            yield from _module_level(node.orelse)
+            for handler in getattr(node, "handlers", []):
+                yield from _module_level(handler.body)
+        elif not isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
+            yield node
+
+
+def imports(module: Module) -> Iterator[Finding]:
+    """SLOP013: importing the module changes process-wide state."""
+    for statement in _module_level(module.tree.body):
+        for node in ast.walk(statement):
+            written = isinstance(node, ast.Assign) and any(
+                isinstance(target, ast.Subscript) and _named(target.value).endswith("environ")
+                for target in node.targets)
+            if written or (isinstance(node, ast.Call) and _named(node.func).endswith(GLOBAL_WRITES)):
+                yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP013",
+                              "changes process-wide state at import; do it where the caller asks for it")
+
+
+CONTRACT_RULES = (contracts, suppressions, probes, names, imports)
 UNIVERSAL_RULES = (swallowed, comments, size)
 
 
