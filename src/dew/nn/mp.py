@@ -114,6 +114,16 @@ class MPConv(nn.Module):
     features: int
     kernel_size: tuple[int, ...] = ()
 
+    @nn.nowrap
+    def spatial_shape(self, shape: tuple[int, ...]) -> tuple[int, ...]:
+        return (*shape[:-1], self.features)
+
+    @nn.nowrap
+    def model_flops(self, lengths, input_features: int) -> float:
+        """Dense or convolution products; weight normalization is pointwise work."""
+        from dew.nn.flops import conv_flops
+        return conv_flops(lengths, input_features, self.features, math.prod(self.kernel_size))
+
     @nn.compact
     def __call__(self, x: jax.Array, gain: jax.Array | float = 1.0) -> jax.Array:
         shape = (*self.kernel_size, x.shape[-1], self.features)

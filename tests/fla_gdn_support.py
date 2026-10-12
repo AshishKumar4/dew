@@ -141,7 +141,9 @@ def reference_kkt_solve(k, g, beta, *, chunk: int = 64):
 
 
 def reference_h(k, w, u, g, h0, *, chunk: int = 64):
-    """`chunk_fwd_h`'s math in XLA, a scan over chunks with the same roundings, products widened."""
+    """`chunk_fwd_h`'s math in XLA, a scan over chunks with the same roundings, products widened. A
+    `g` per key dimension `[B, T, HV, K]` decays the memory's rows and gates no value (fla's USE_GK)."""
+    per_key = g.ndim == 4
     group = u.shape[2] // k.shape[2]
     dtype = k.dtype
     k = jnp.repeat(k, group, axis=2)
@@ -158,7 +160,7 @@ def reference_h(k, w, u, g, h0, *, chunk: int = 64):
                                state.astype(weights.dtype).astype(jnp.float32), precision=exact)
         corrected = values.astype(jnp.float32) - predicted
         last = gate[:, -1]
-        gated = corrected * jnp.exp2(last[:, None] - gate)[..., None]
+        gated = corrected if per_key else corrected * jnp.exp2(last[:, None] - gate)[..., None]
         high = gated.astype(dtype)
         update = jnp.einsum('bchk,bchv->bhkv', keys.astype(jnp.float32), high.astype(jnp.float32),
                             precision=exact)
@@ -166,7 +168,8 @@ def reference_h(k, w, u, g, h0, *, chunk: int = 64):
             low = (gated - high.astype(jnp.float32)).astype(dtype)
             update += jnp.einsum('bchk,bchv->bhkv', keys.astype(jnp.float32), low.astype(jnp.float32),
                                  precision=exact)
-        state = state * jnp.exp2(last)[..., None, None] + update
+        decay = jnp.exp2(last)[..., None] if per_key else jnp.exp2(last)[..., None, None]
+        state = state * decay + update
         return state, (entered, corrected.astype(u.dtype))
 
     final, (h, corrected) = jax.lax.scan(step, h0.astype(jnp.float32),
@@ -175,7 +178,10 @@ def reference_h(k, w, u, g, h0, *, chunk: int = 64):
 
 
 def reference_dhu(q, k, w, g, dht, do, dv, *, scale: float, chunk: int = 64):
-    """`chunk_bwd_dhu`'s math in XLA, a reverse scan over chunks with the same roundings."""
+    """`chunk_bwd_dhu`'s math in XLA, a reverse scan over chunks with the same roundings. A `g` per
+    key dimension `[B, T, HV, K]` decays the gradient's rows and gates neither the values' gradient
+    nor the queries (fla's USE_GK)."""
+    per_key = g.ndim == 4
     group = do.shape[2] // q.shape[2]
     q_dtype, k_dtype = q.dtype, k.dtype
     q, k = (jnp.repeat(x, group, axis=2) for x in (q, k))
@@ -191,9 +197,11 @@ def reference_dhu(q, k, w, g, dht, do, dv, *, scale: float, chunk: int = 64):
         last = gate[:, -1]
         full = jnp.einsum('bchk,bhkv->bchv', keys.astype(jnp.float32),
                           grad.astype(k_dtype).astype(jnp.float32), precision=exact)
-        full = full * jnp.exp2(last[:, None] - gate)[..., None] + local.astype(jnp.float32)
-        read = queries.astype(jnp.float32) * jnp.exp2(gate)[..., None]
-        grad = (grad * jnp.exp2(last)[..., None, None]
+        if not per_key:
+            full = full * jnp.exp2(last[:, None] - gate)[..., None]
+        full = full + local.astype(jnp.float32)
+        read = queries.astype(jnp.float32) * (1.0 if per_key else jnp.exp2(gate)[..., None])
+        grad = (grad * (jnp.exp2(last)[..., None] if per_key else jnp.exp2(last)[..., None, None])
                 + jnp.einsum('bchk,bchv->bhkv', read, out_grad.astype(jnp.float32), precision=exact) * scale
                 - jnp.einsum('bchk,bchv->bhkv', weights.astype(jnp.float32),
                              full.astype(weights.dtype).astype(jnp.float32), precision=exact))
