@@ -154,19 +154,21 @@ def sequences(batch: int, length: int, cu_seqlens=None, *, chunk: int = 64) -> S
     """The spans of `cu_seqlens` (`[N + 1]` int32 over the `batch * length` tokens, each row's
     boundaries among them), or of the rows themselves where None. A traced `cu_seqlens` takes the most
     chunks its N sequences can split `batch * length` tokens into."""
+    # The rows' own spans are constants; a traced `cu_seqlens` takes the same arithmetic in XLA.
+    xp = np if cu_seqlens is None else jnp
     if cu_seqlens is None:
         cu_seqlens = np.arange(batch + 1, dtype=np.int32) * length
         count = batch * -(-length // chunk)
     else:
         count = -(-batch * length // chunk) + cu_seqlens.shape[0] - 1
     first, lengths = cu_seqlens[:-1], cu_seqlens[1:] - cu_seqlens[:-1]
-    offsets = jnp.concatenate([jnp.zeros(1, jnp.int32), jnp.cumsum(-(-lengths // chunk))]).astype(jnp.int32)
-    index = jnp.arange(count, dtype=jnp.int32)
-    owner = jnp.clip(jnp.searchsorted(offsets, index, side="right") - 1, 0, lengths.shape[0] - 1)
+    offsets = xp.concatenate([xp.zeros(1, np.int32), xp.cumsum(-(-lengths // chunk))]).astype(np.int32)
+    index = xp.arange(count, dtype=np.int32)
+    owner = xp.clip(xp.searchsorted(offsets, index, side="right") - 1, 0, lengths.shape[0] - 1)
     start = first[owner] + (index - offsets[owner]) * chunk
-    taken = jnp.where(index < offsets[-1], jnp.minimum(chunk, first[owner] + lengths[owner] - start), 0)
-    return Sequences(jnp.stack([start, taken], axis=1).astype(jnp.int32),
-                     jnp.stack([first, lengths, offsets[:-1]], axis=1).astype(jnp.int32))
+    taken = xp.where(index < offsets[-1], xp.minimum(chunk, first[owner] + lengths[owner] - start), 0)
+    return Sequences(xp.stack([start, taken], axis=1).astype(np.int32),
+                     xp.stack([first, lengths, offsets[:-1]], axis=1).astype(np.int32))
 
 
 def _rows(ref, start, size, *rest):
@@ -181,7 +183,9 @@ def _row_mask(view, count):
 
 def _read(view, count):
     """`view`'s rows below `count`, zeros past them: fla's boundary-checked loads."""
-    return pl.load(view, (slice(None),) * len(view.shape), mask=_row_mask(view, count), other=0)
+    from jax.experimental.pallas import triton as plgpu
+
+    return plgpu.load(view, mask=_row_mask(view, count), other=0)
 
 
 def _gates(g_ref, start, taken, size, offset=0, *rest):
@@ -195,7 +199,9 @@ def _gates(g_ref, start, taken, size, offset=0, *rest):
 
 def _write(view, count, value):
     """`value` into `view`'s rows below `count`, none past them."""
-    pl.store(view, (slice(None),) * len(view.shape), value.astype(view.dtype), mask=_row_mask(view, count))
+    from jax.experimental.pallas import triton as plgpu
+
+    plgpu.store(view, value.astype(view.dtype), mask=_row_mask(view, count))
 
 
 _CHUNK = pl.BlockSpec((None, 2), lambda i_t, *_: (i_t, 0))
