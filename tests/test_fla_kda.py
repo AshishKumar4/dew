@@ -33,6 +33,11 @@ CHUNKED = 64
 """The terms a chunk sums in another order than the portable math: the port's fp32 floor over the
 math's distance (`assert_leaves_as_exact`'s `reductions`)."""
 
+ON_A_GPU = pytest.mark.skipif(
+    jax.default_backend() == "gpu",
+    reason="on a GPU the port's fp32 products are fla's TF32 and its bar is fla's own distance "
+           "(test_the_port_is_as_exact_as_fla_at_the_training_shape); interpreted, they are exact")
+
 APART = {jnp.dtype(jnp.float32): 1e-4, jnp.dtype(jnp.bfloat16): 5e-2}
 """A layer's leaf's RMS distance from the portable math's, over its size: fp32 rounding of fla's chunked
 algebra, whose decay gradient sums cancelling terms the math does not, and bf16 storage, where fla
@@ -75,6 +80,7 @@ def gradients(rule, do, dht):
     return run
 
 
+@ON_A_GPU
 @pytest.mark.parametrize("key_heads, value_heads, width, columns, length", [
     (1, 2, 64, 64, 128),    # value heads sharing a key head, two whole chunks
     (2, 2, 64, 64, 100),    # a length off the chunk grid
@@ -104,7 +110,7 @@ def layer_on(monkeypatch, *, port: bool, **fields):
     return KimiDeltaAttention(emb_features=64, num_heads=2, head_dim=64, **fields)
 
 
-@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
+@pytest.mark.parametrize("dtype", [pytest.param(jnp.float32, marks=ON_A_GPU), jnp.bfloat16])
 def test_a_kimi_delta_attention_trains_on_the_port_as_on_the_math(monkeypatch, dtype):
     """The layer where a GPU runs the port, its conv rounding to the projections' dtype for it: its output
     and every parameter gradient the math's, within fla's rounding (`APART`)."""
