@@ -525,13 +525,18 @@ def ladder_lm_trainer(directory, fits):
     return trainer, objective, headroom
 
 
-def lm_windows(tmp_path):
+def lm_corpus(directory):
+    """Token files written once, so a resume reads the files its checkpoint names."""
+    tokens = (np.arange(97, dtype=np.uint16) * 7) % 32
+    tokens.tofile(directory / "train.bin")
+    tokens.tofile(directory / "val.bin")
+    return directory
+
+
+def lm_windows(corpus):
     from dew.data import Loading, Text
 
-    tokens = (np.arange(97, dtype=np.uint16) * 7) % 32
-    tokens.tofile(tmp_path / "train.bin")
-    tokens.tofile(tmp_path / "val.bin")
-    return load(Text(source=str(tmp_path), seq_len=4, stride=1), batch=8, read="memory", seed=7,
+    return load(Text(source=str(corpus), seq_len=4, stride=1), batch=8, read="memory", seed=7,
         loading=Loading(workers=0, threads=1, read_buffer=1), validation_records=4 * (8))
 
 
@@ -545,16 +550,17 @@ def test_a_resumed_run_compiles_the_rung_its_checkpoint_trained_on(tmp_path, mon
     def tiled_and_minimal(rung):
         return rung in ((True, 'minimal'), (True, 'full'))
 
+    corpus = lm_corpus(tmp_path)
     whole, _, headroom = ladder_lm_trainer(tmp_path / "whole", tiled_and_minimal)
     monkeypatch.setattr(memory, 'step_headroom', headroom)
-    expected = whole.fit(lm_windows(tmp_path), steps=4, checkpoint_every=2)
+    expected = whole.fit(lm_windows(corpus), steps=4, checkpoint_every=2)
     split, _, headroom = ladder_lm_trainer(tmp_path / "split", tiled_and_minimal)
     monkeypatch.setattr(memory, 'step_headroom', headroom)
-    split.fit(lm_windows(tmp_path), steps=2, checkpoint_every=2)
+    split.fit(lm_windows(corpus), steps=2, checkpoint_every=2)
 
     resumed, objective, headroom = ladder_lm_trainer(tmp_path / "split", lambda rung: True)
     monkeypatch.setattr(memory, 'step_headroom', headroom)
-    actual = resumed.fit(lm_windows(tmp_path), steps=4, checkpoint_every=2)
+    actual = resumed.fit(lm_windows(corpus), steps=4, checkpoint_every=2)
     assert (objective.head_tile is not None, memory.recompute_record(objective)) == (
         True, 'minimal')
     for left, right in zip(jax.tree.leaves(actual), jax.tree.leaves(expected), strict=True):
@@ -564,14 +570,15 @@ def test_a_resumed_run_compiles_the_rung_its_checkpoint_trained_on(tmp_path, mon
 def test_a_resumed_run_that_cannot_fit_its_checkpoints_rung_climbs_and_says_so(tmp_path, monkeypatch, caplog):
     """A process that cannot fit the rung its checkpoint trained on moves up
     the ladder, never down, and says the run now computes otherwise."""
+    corpus = lm_corpus(tmp_path)
     split, _, headroom = ladder_lm_trainer(tmp_path / "split", lambda rung: rung[0])
     monkeypatch.setattr(memory, 'step_headroom', headroom)
-    split.fit(lm_windows(tmp_path), steps=2, checkpoint_every=2)
+    split.fit(lm_windows(corpus), steps=2, checkpoint_every=2)
     caplog.clear()
 
     resumed, objective, headroom = ladder_lm_trainer(tmp_path / "split", lambda rung: rung == (True, 'full'))
     monkeypatch.setattr(memory, 'step_headroom', headroom)
-    resumed.fit(lm_windows(tmp_path), steps=3, checkpoint_every=2)
+    resumed.fit(lm_windows(corpus), steps=3, checkpoint_every=2)
     assert memory.recompute_record(objective) == 'full'
     assert "the rung its checkpoint trained on" in caplog.text
 

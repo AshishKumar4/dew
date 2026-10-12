@@ -3,10 +3,13 @@
 import dataclasses
 import itertools
 import json
+import os
 from uuid import uuid4
 
 import grain.python as grain
 import numpy as np
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 
 from dew.data.cache import Cache
@@ -15,7 +18,7 @@ from dew.data.dataset import DataPartition, Loading
 from dew.data.mix import SearchBudget, TokenDeficit, token_weights
 from dew.data.pipeline import Artifact, Pipeline, Rejected
 from dew.data.plan import Manifest, Plan, StepIdentity, fingerprint
-from dew.data.sources import Memory
+from dew.data.sources import Files, Memory
 from dew.objectives.base import VALID_ROWS
 
 READ = Loading(workers=0, threads=1, read_buffer=0, worker_buffer=1)
@@ -237,6 +240,59 @@ def test_dependency_change_preserves_global_resume_only_when_derived_order_match
     changed = dataclasses.replace(changed, derived={"accepted_ids": fingerprint([1, 3, 7])})
     with pytest.raises(ValueError, match="accepted_ids"):
         changed.check(plan.record())
+
+
+def test_an_exact_resume_refuses_a_step_that_makes_other_values():
+    """Shift(1) and Shift(2) keep every row in its place, so the order and its
+    derived facts agree; the step's identity is what says the rows differ."""
+    def reader(by):
+        shifted = Pipeline(source(8)).map(Shift(by), rejects=False).shuffle(0).repeat().batch(2)
+        return compile(shifted, loading=READ).train(DataPartition())
+
+    first = reader(1)
+    try:
+        next(first)
+        state = first.get_state()
+    finally:
+        first.close()
+    other = reader(2)
+    try:
+        with pytest.raises(ValueError, match="saved data plan steps changed"):
+            other.set_state(state)
+    finally:
+        other.close()
+
+
+def test_an_exact_resume_refuses_a_rewritten_file_whose_token_split_keeps_its_spans(tmp_path):
+    """A Parquet file rewritten with as many documents of the same lengths and
+    no length column leaves the token split's spans and every order fact
+    alike; the file's pinned version in the source snapshot refuses it."""
+    path = tmp_path / "documents.parquet"
+
+    def write(start):
+        staged = tmp_path / "staged.parquet"
+        documents = [list(range(start + 4 * index, start + 4 * index + 4)) for index in range(4)]
+        pq.write_table(pa.table({"text": documents}), staged)
+        os.replace(staged, path)
+
+    def reader():
+        split = Pipeline(Files(str(path))).token_split(0.25, held=False).batch(1)
+        return compile(split, read="indexed", loading=READ).train(DataPartition())
+
+    write(0)
+    first = reader()
+    try:
+        next(first)
+        state = first.get_state()
+    finally:
+        first.close()
+    write(100)
+    rewritten = reader()
+    try:
+        with pytest.raises(ValueError, match="saved data plan source changed"):
+            rewritten.set_state(state)
+    finally:
+        rewritten.close()
 
 
 def test_lambda_identity_requires_explicit_non_exact_resume():
@@ -468,6 +524,21 @@ def test_a_per_share_reader_states_its_loadings_stop_budget_without_opening():
     assert opened == []
 
 
+def test_a_plan_identity_is_its_rows_on_any_host_and_share():
+    """A pool agrees on the plan's identity: processes that read other shares
+    of the same rows with other code agree, and processes whose source holds
+    other rows do not."""
+    manifest = Manifest({"rows": "one"}, revision="before")
+    plan = Plan("per-share", manifest, {"seed": 0}, topology={"shares": 2, "share": 0})
+    elsewhere = dataclasses.replace(
+        plan,
+        manifest=dataclasses.replace(manifest, revision="after", platform="another host"),
+        topology={"shares": 2, "share": 1},
+    )
+    other = dataclasses.replace(plan, manifest=dataclasses.replace(manifest, source={"rows": "two"}))
+    assert elsewhere.identity() == plan.identity() != other.identity()
+
+
 def test_a_memory_read_counts_a_missing_row_alike_with_or_without_a_cache():
     """A row the source holds as None is left out and counted missing,
     whether the memory read fills a cache with it or not."""
@@ -608,6 +679,43 @@ def test_a_token_split_is_part_of_the_order_a_resume_checks():
             half.set_state(state)
     finally:
         half.close()
+
+
+@pytest.mark.parametrize("grown", ["in the source", "by a step"])
+def test_a_resume_is_refused_where_the_same_token_split_keeps_other_documents(grown):
+    """Four 4-token documents split at a quarter train on documents 1-3; with
+    the first grown to eight tokens the same split trains on its last three
+    tokens and on documents 1-3, so a resume after one row would read
+    document 1 again. The first document grows in the source, which keeps its
+    name and row count, or in a step without a stable identity, which a
+    non-exact resume cannot check; the split's spans in the derived order
+    refuse both."""
+    def reader(first):
+        sizes = (first if grown == "in the source" else 4, 4, 4, 4)
+        documents = [{"text": np.arange(4 * index, 4 * index + size, dtype=np.int32)}
+                     for index, size in enumerate(sizes)]
+        pipeline = Pipeline(Memory(documents, identity="docs"))
+        if grown == "by a step":
+            pipeline = pipeline.map(
+                lambda row: {"text": np.resize(row["text"], first) if row["text"][0] == 0 else row["text"]},
+                rejects=False,
+            )
+        split = pipeline.token_split(0.25, held=False).batch(1)
+        resume = "exact" if grown == "in the source" else "non-exact"
+        return compile(split, read="indexed", loading=READ, resume=resume).train(DataPartition())
+
+    four = reader(4)
+    try:
+        assert next(four)["text"].tolist() == [[4, 5, 6, 7]]
+        state = four.get_state()
+    finally:
+        four.close()
+    eight = reader(8)
+    try:
+        with pytest.raises(ValueError, match="derived order token_spans changed"):
+            eight.set_state(state)
+    finally:
+        eight.close()
 
 
 def test_a_recipe_reads_a_published_packing_before_its_default_order(tmp_path):

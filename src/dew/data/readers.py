@@ -27,7 +27,7 @@ from dew.data.dataset import (
 )
 from dew.data.mix import CorpusCounts, state_counts
 from dew.data.pipeline import HostStep
-from dew.data.plan import Plan, fingerprint
+from dew.data.plan import Plan
 from dew.records import integer, record
 
 
@@ -231,10 +231,9 @@ class _PerShare(Forwarding):
 
     def identity(self) -> str:
         """What every share of the pool reads, which the pool agrees before it
-        reads: the plan without this share's index, which only the position it
-        saves keeps, so a share resumes only its own rows."""
-        topology = {name: value for name, value in self._plan.topology.items() if name != "share"}
-        return fingerprint(dataclasses.replace(self._plan, topology=topology).record())
+        reads (`Plan.identity`): the plan without this share's index, which
+        only the position it saves keeps, so a share resumes only its own rows."""
+        return self._plan.identity()
 
     def statistics(self) -> Mapping[str, float]:
         if self._read is None:
