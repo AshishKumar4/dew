@@ -228,9 +228,9 @@ class InputQuantizer:
     """One projection site's checkpoint input quantizer: its stored scale and
     the format's arithmetic, which `qdq` applies to the site's input.
 
-    `fp8` and `nvfp4` build one from a file's value and refuse an invalid
-    one; a site builds one from the scale its variables hold, which is what
-    traces under a scan or a jit.
+    `fp8` and `nvfp4` build one from a file's value on the host and refuse
+    an invalid one; a site builds one from the scale its variables hold,
+    which is what traces under a scan or a jit.
     """
 
     scale: jax.Array
@@ -246,7 +246,7 @@ class InputQuantizer:
         """ModelOpt's static E4M3 input multiplier, amax/448 in its exported files."""
         if not math.isfinite(scale) or scale <= 0:
             raise ValueError(f"ModelOpt FP8 input_scale must be positive and finite, got {scale}")
-        return cls(jnp.float32(scale), "fp8")
+        return cls(np.float32(scale), "fp8")
 
     @classmethod
     def nvfp4(cls, global_scale: float, e4m3_scale: bool,
@@ -255,9 +255,8 @@ class InputQuantizer:
         if (not math.isfinite(global_scale) or global_scale < 0
                 or (global_scale == 0 and format == "compressed-tensors")):
             raise ValueError(f"NVFP4 input_global_scale must be positive and finite, got {global_scale}")
-        if format == "modelopt" and not e4m3_scale:
-            raise ValueError("ModelOpt NVFP4 always rounds its local scales to E4M3")
-        return cls(jnp.float32(global_scale), "nvfp4", e4m3_scale, format)
+        scheme = InputQuantization(e4m3_scale, format)
+        return cls(np.float32(global_scale), "nvfp4", scheme.e4m3_scale, scheme.format)
 
     def qdq(self, x: jax.Array) -> jax.Array:
         """`x` quantized to the format and back, with the straight-through gradient."""
@@ -431,8 +430,8 @@ class InputQuantization:
     Each quantized Linear holds its scale in its own `QUANTIZATION`
     variables (`INPUT_SCALES`), so a scanned, staged or packed view of the
     layers keeps it, and a site without one computes as it is. This record
-    holds what the files declare for every site at once: NVFP4's local-scale
-    rounding and arithmetic. It is not a `Quantization`: nothing trains
+    holds what the files declare: NVFP4's local-scale rounding and
+    arithmetic, and which sites are quantized in which format. It is not a `Quantization`: nothing trains
     quantized, and the weights already hold the values the source reader
     decoded.
     """
@@ -441,6 +440,29 @@ class InputQuantization:
     """Whether NVFP4 sites round their local scales to E4M3."""
     format: Literal["compressed-tensors", "modelopt"] = "compressed-tensors"
     """Whose NVFP4 local-scale arithmetic the sites follow."""
+    sites: tuple[tuple[str, Literal["fp8", "nvfp4"]], ...] = ()
+    """Each quantized Linear's scope in the stored variables tree, `/`-joined,
+    and its format: what `init` declares, so a model rebuilt from this record
+    initializes the scales a checkpoint restores. The values live in the
+    variables alone."""
+
+    def __post_init__(self) -> None:
+        if self.format == "modelopt" and not self.e4m3_scale:
+            raise ValueError("ModelOpt NVFP4 always rounds its local scales to E4M3")
+
+    def layer_sites(self, layer: str) -> tuple[tuple[str, Literal["fp8", "nvfp4"]], ...]:
+        """The quantized sites under the stored scope `layer` (`layers_3`),
+        relative to it, with their formats: what two otherwise like layers
+        must share to run as one scanned body or one stage position."""
+        prefix = layer + "/"
+        return tuple((path.removeprefix(prefix), kind) for path, kind in self.sites
+                     if path.startswith(prefix))
+
+    def declared(self) -> Variables:
+        """The `QUANTIZATION` collection `sites` declare, every scale 1 until
+        a checkpoint's values replace it."""
+        return unflatten_dict({(*path.split("/"), INPUT_SCALES[kind]): np.ones((), np.float32)
+                               for path, kind in self.sites})
 
     def quantizer(self, module: nn.Module) -> InputQuantizer | None:
         """The bound `module`'s input quantizer, from the scale its variables
@@ -472,11 +494,14 @@ class InputQuantization:
             quantizer = record.quantizer(module) if context.method_name == "__call__" else None
             if quantizer is None:
                 return next_fun(*args, **kwargs)
-            inputs, *rest = args
+            # A Linear's input arrives first or by its parameter's name.
+            inputs = args[0] if args else kwargs["inputs"]
             if not _trailing_contraction(module, inputs.ndim):
                 raise ValueError(f"{'/'.join(module.path)} holds an input scale, which a Linear "
                                  "contracting its input's trailing axis alone reads")
-            return next_fun(quantizer.qdq(inputs), *rest, **kwargs)
+            if args:
+                return next_fun(quantizer.qdq(inputs), *args[1:], **kwargs)
+            return next_fun(**{**kwargs, "inputs": quantizer.qdq(inputs)})
 
         class InputQuantized(base):
             _dew_input_quantization: ClassVar[bool] = True
@@ -489,6 +514,10 @@ class InputQuantization:
             def apply(self, variables, *args, **kwargs):
                 with nn.intercept_methods(quantize_inputs):
                     return super().apply(variables, *args, **kwargs)
+
+            def init_with_output(self, *args, **kwargs):
+                output, variables = super().init_with_output(*args, **kwargs)
+                return output, ({**variables, QUANTIZATION: record.declared()} if record.sites else variables)
 
         InputQuantized.__name__ = InputQuantized.__qualname__ = base.__name__
         return InputQuantized(**{field.name: getattr(model, field.name)
