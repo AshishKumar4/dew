@@ -180,8 +180,8 @@ def test_every_attention_mixer_implements_or_refuses_each_policy_it_is_asked(kin
     context = MixerContext(emb_features=64, num_heads=4, num_kv_heads=2, head_dim=16, max_seq_len=32)
     asked = dataclasses.replace(context, **{policy: POLICY_VALUES[policy]})
     assert asked.policies()[policy] and not context.policies()[policy]
-    value = mixers.build(kind)
     try:
+        value = mixers.build(kind)
         factory = value.build(context)
     except ValueError:
         pytest.skip(f"{kind} needs fields of its own to build")
