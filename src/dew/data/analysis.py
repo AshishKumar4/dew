@@ -380,10 +380,12 @@ class _Lowering:
     repeat's, one when a repeat stays where it is written, and endless when
     none is written.
 
-    `split` says whether a token split runs in the lowered order rather than
-    in a memory read's eager pass. `order` is the canonical order a resume
-    must find unchanged, and `endless` whether the training order never runs
-    out.
+    `splits` are the positions of the token splits that run in the lowered
+    order rather than in a memory read's eager pass, and `split` says whether
+    any does, here or in a corpus it mixes; the plan takes the spans each
+    keeps through this tree (`dew.data.lowering._split_spans`). `order` is the
+    canonical order a resume must find unchanged, and `endless` whether the
+    training order never runs out.
     """
 
     per_share: bool
@@ -394,9 +396,13 @@ class _Lowering:
     repeated: bool
     absorbed: int | None
     epochs: int | None
-    split: bool
+    splits: tuple[int, ...]
     order: Mapping[str, object]
     endless: bool
+
+    @property
+    def split(self) -> bool:
+        return bool(self.splits) or any(child.split for child in self.children)
 
 
 def _analyzed(
@@ -427,9 +433,6 @@ def _analyzed(
     per_share = per_share or any(child.per_share for child in children)
     children = tuple(_cut(child, per_share) for child in children)
     steps = (*ancestry, *stages)
-    split = _at(stages[eager:], TokenSplit) is not None or any(child.split for child in children)
-    if per_share and split and not validation and not any(isinstance(stage, Configured) for stage in steps):
-        raise ValueError(f"token split in {_name(pipeline)} needs a global record order, not one per share")
     repeats = [stage.epochs for stage in steps if isinstance(stage, Repeat)]
     endless = not any(isinstance(stage, Limit) for stage in steps) and (
         not repeats or any(epochs is None for epochs in repeats)
@@ -470,7 +473,7 @@ def _analyzed(
                 dataclasses.asdict(stage) for stage in written if isinstance(stage, TokenBudget)
             ],
         }
-    return _Lowering(
+    lowering = _Lowering(
         per_share,
         children,
         cache,
@@ -479,10 +482,14 @@ def _analyzed(
         bool(repeats),
         None if absorbed is None else absorbed[0],
         epochs,
-        split,
+        tuple(at for at, stage in enumerate(stages) if at >= eager and isinstance(stage, TokenSplit)),
         order,
         endless,
     )
+    configured = any(isinstance(stage, Configured) for stage in steps)
+    if per_share and lowering.split and not validation and not configured:
+        raise ValueError(f"token split in {_name(pipeline)} needs a global record order, not one per share")
+    return lowering
 
 
 def _cut(lowering: _Lowering, per_share: bool) -> _Lowering:

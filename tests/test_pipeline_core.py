@@ -772,6 +772,24 @@ def test_a_resume_is_refused_where_the_same_token_split_keeps_other_documents(gr
         eight.close()
 
 
+def test_a_token_split_on_a_mixture_within_a_mixture_records_its_spans():
+    """A split written on a mixture of three corpora, itself mixed with a
+    fourth, splits the inner mixture's order as the inner mixture's own
+    analysis builds it. Its spans are part of the derived order, and an inner
+    document grown from four tokens to eight changes them."""
+    def spans(first):
+        def corpus(start, sizes):
+            return Pipeline(Memory([{"text": np.arange(start + 10 * index, start + 10 * index + size,
+                                                       dtype=np.int32)}
+                                    for index, size in enumerate(sizes)]))
+
+        inner = corpus(0, (first, 4)).mix(corpus(100, (4, 4)), corpus(200, (4, 4)))
+        mixed = inner.token_split(0.25, held=False).mix(corpus(300, (4, 4)))
+        return compile(mixed.batch(1), read="indexed", loading=READ).plan.derived["token_spans"]
+
+    assert spans(4) != spans(8)
+
+
 def test_a_recipe_reads_a_published_packing_before_its_default_order(tmp_path):
     """A typed recipe given a generation with a published packing plan reads
     that plan, and shuffles its windows, instead of packing again online."""

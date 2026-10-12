@@ -20,7 +20,7 @@ from __future__ import annotations
 import dataclasses
 import functools
 import math
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 import grain.experimental as gx
@@ -763,6 +763,24 @@ def _epoch_records(train: Pipeline, build: _Build) -> int | None:
         return len(rows) if isinstance(rows, pygrain.MapDataset) else None
 
     return counted(train, build)
+
+
+def _split_spans(pipeline: Pipeline, build: _Build) -> Iterator[list[tuple[int, int, int]]]:
+    """The spans each token split in the lowered order keeps
+    (`_Lowering.splits`), those of the corpora a pipeline mixes first: the
+    lowering's own split (`_TokenSplit`) of the indexed order before it, built
+    with the analysis of the pipeline it is written in, so they are the
+    documents and token offsets a reader of the plan trains on."""
+    if isinstance(pipeline.source, (Mixture, Phases)):
+        for child, analysis in zip(pipeline.source.pipelines, build.lowering.children, strict=True):
+            yield from _split_spans(child, dataclasses.replace(build, lowering=analysis))
+    for at, split in enumerate(pipeline.stages):
+        if at in build.lowering.splits and isinstance(split, TokenSplit):
+            before = dataclasses.replace(pipeline, stages=pipeline.stages[:at])
+            rows, _ = build.records(before, DataPartition())
+            if not isinstance(rows, pygrain.MapDataset):
+                raise ValueError(f"token split in {_name(pipeline)} needs a finite indexed order")
+            yield _TokenSplit(rows, split).spans
 
 
 def _weights(mixture: Mixture) -> Sequence[float]:
