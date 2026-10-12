@@ -1104,7 +1104,7 @@ class Trainer(Generic[Loss, Effects]):
             while True:
                 jitted = self._jitted(shapes, copies, shardings, placement, replicated)
                 self.program = jitted.lower(prepared, batch)
-                if tune(jitted, prepared, batch):
+                if tune(self.program):
                     continue
                 if not consulted:
                     consulted, before = True, self._rung()
