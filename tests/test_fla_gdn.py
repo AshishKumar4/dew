@@ -344,7 +344,6 @@ def test_the_ported_rule_and_its_gradients_follow_the_recurrence(dtype, bound):
     (1, 3, 64, 64, 64),     # three value heads a key head, no power of two
     (2, 6, 32, 96, 70),     # keys narrower than a block, values no whole number of them
     (1, 2, 96, 160, 64),    # values wider than the port's widest, split into more heads
-    (1, 1, 256, 64, 64),    # the widest keys fla takes
 ])
 def test_dews_fla_rule_follows_the_recurrence_for_any_heads_widths_and_length(
         key_heads, value_heads, width, columns, length):
@@ -419,10 +418,27 @@ def test_a_gated_delta_net_on_fla_matches_it_on_xla(monkeypatch, dtype, bound):
         assert relative(mine, theirs) < bound, jax.tree_util.keystr(path)
 
 
+def test_dews_fla_rule_takes_fla_s_widest_keys_in_bf16():
+    """256-wide bf16 keys, fla's own bound, on the port: the output and final memory of the token
+    recurrence in float64, within bf16 storage's rounding."""
+    keys = jax.random.split(jax.random.key(59), 5)
+    q = l2norm(jax.random.normal(keys[0], (1, 64, 1, 256))).astype(jnp.bfloat16)
+    k = l2norm(jax.random.normal(keys[1], q.shape)).astype(jnp.bfloat16)
+    v = jax.random.normal(keys[2], (1, 64, 2, 64)).astype(jnp.bfloat16)
+    g = -jnp.exp(jax.random.normal(keys[3], v.shape[:3]) - 3.0)
+    beta = jax.nn.sigmoid(jax.random.normal(keys[4], v.shape[:3])).astype(jnp.bfloat16)
+    out, final = fla_rule(q, k, v, g, beta)
+    with jax.enable_x64(new_val=True):
+        operands = wide(jnp.repeat(q, 2, axis=2), jnp.repeat(k, 2, axis=2), v, g, beta)
+        want_out, want_final = (np.asarray(x) for x in rule_math(*operands, jnp.zeros((1, 2, 256, 64))))
+    assert relative(out, want_out) < 2e-2 and relative(final, want_final) < 2e-2
+
+
 def test_a_gpu_runs_the_port_for_every_rule_but_forward_mode_float64_and_the_widest_keys(monkeypatch):
     """Every rule a GPU traces runs on the port (`port_refusal`), whatever its chunk size, dtypes,
     heads or mesh, except inside `jax.jvp`'s traces, which its custom VJP gives no tangent, in
-    float64, whose rule is the reference math itself, and over keys wider than fla's 256."""
+    float64, whose rule is the reference math itself, and over keys wider than fla's 256 (128 in
+    fp32)."""
     from dew.nn.attention import FORWARD_MODE
 
     x = jnp.zeros((1, 64, 1, 64), jnp.bfloat16)
@@ -437,7 +453,10 @@ def test_a_gpu_runs_the_port_for_every_rule_but_forward_mode_float64_and_the_wid
         wide = jnp.zeros((1, 64, 1, 64), jnp.float64)
         assert "float64" in linear.port_refusal(wide, wide, wide)
     keys = jnp.zeros((1, 64, 1, 512), jnp.bfloat16)
-    assert linear.port_refusal(keys, keys, x) == "keys 512 wide; fla's kernels take at most 256"
+    assert linear.port_refusal(keys, keys, x) == "keys 512 wide; the port takes at most 256 in bfloat16"
+    keys = jnp.zeros((1, 64, 1, 256), jnp.float32)
+    assert linear.port_refusal(keys, keys, keys) == "keys 256 wide; the port takes at most 128 in float32"
+    assert linear.port_refusal(keys.astype(jnp.bfloat16), keys.astype(jnp.bfloat16), x) is None
     monkeypatch.setattr(linear, "triton_runs", lambda: False)
     assert "need a GPU" in linear.port_refusal(x, x, x)
 
