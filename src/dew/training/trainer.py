@@ -375,7 +375,8 @@ def _endless(chain: Pipeline) -> Pipeline:
 
     if any(isinstance(stage, Repeat) for stage in chain.stages):
         return chain
-    batching = [index for index, stage in enumerate(chain.stages) if isinstance(stage, (BatchStage, TokenBudget))]
+    batching = [index for index, stage in enumerate(chain.stages)
+                if isinstance(stage, (BatchStage, TokenBudget))]
     at = batching[0] if batching else len(chain.stages)
     return dataclasses.replace(chain, stages=(*chain.stages[:at], Repeat(None), *chain.stages[at:]))
 
