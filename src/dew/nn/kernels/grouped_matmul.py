@@ -22,8 +22,6 @@ products at half an A100's cuBLAS rate (a 4096 by 14336 expert's forward
 8.4).
 """
 
-from __future__ import annotations
-
 import dataclasses
 import functools
 import itertools
@@ -104,6 +102,8 @@ def _sizes(specs: list[jax.ShapeDtypeStruct], seed: int, rows: int) -> jax.Array
 
 
 class _GroupedLaunch(tuning.KernelOp):
+    # Annotations stay evaluated (no postponed annotations in this module):
+    # tokamax serializes a launch's arguments into the program by their types.
     config_cls: ClassVar[type[Tile]] = Tile
 
     def _get_heuristics_config(self, ba) -> Tile:
