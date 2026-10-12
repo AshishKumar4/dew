@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable
-from dataclasses import dataclass
 
 import jax
 import jax.numpy as jnp
@@ -124,7 +123,7 @@ def flow_transition(x: ArrayLike, velocity: ArrayLike, sigma: ArrayLike,
                               jnp.where(valid, variance, jnp.nan))
 
 
-@dataclass(frozen=True)
+@struct.dataclass
 class FlowSDE:
     """Samples a rectified-flow `Process` with Flow-GRPO's Euler-Maruyama solver.
 
@@ -134,7 +133,7 @@ class FlowSDE:
     `ValueError`.
     """
 
-    noise_level: float = 0.7
+    noise_level: float = struct.field(pytree_node=False, default=0.7)
 
     def validate(self, process: Process) -> None:
         if not isinstance(process.sampler_schedule, RectifiedFlow) or not isinstance(

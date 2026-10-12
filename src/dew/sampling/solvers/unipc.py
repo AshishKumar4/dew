@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Literal, NamedTuple
 
 import jax
 import jax.numpy as jnp
 import numpy as np
+from flax import struct
 
 from .common import _check_endpoint_domain, _push
 
@@ -137,7 +137,7 @@ def _unipc_tables(alpha: np.ndarray, sigma: np.ndarray, solver: UniPC) -> tuple[
     return corrector, predictor
 
 
-@dataclass(frozen=True)
+@struct.dataclass
 class UniPC:
     """UniPC, a unified predictor and corrector in lambda, as Diffusers 0.34.0's `UniPCMultistepScheduler`.
 
@@ -164,11 +164,11 @@ class UniPC:
     """
     # `_unipc_tables` solves the coefficient tables in `init`.
 
-    order: int = 2
-    solver_type: Literal["bh1", "bh2"] = "bh2"
-    predict_x0: bool = True
-    lower_order_final: bool = True
-    disable_corrector: tuple[int, ...] = ()
+    order: int = struct.field(pytree_node=False, default=2)
+    solver_type: Literal["bh1", "bh2"] = struct.field(pytree_node=False, default="bh2")
+    predict_x0: bool = struct.field(pytree_node=False, default=True)
+    lower_order_final: bool = struct.field(pytree_node=False, default=True)
+    disable_corrector: tuple[int, ...] = struct.field(pytree_node=False, default=())
 
     def __post_init__(self) -> None:
         if self.order < 1:

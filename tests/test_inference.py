@@ -30,7 +30,7 @@ from dew.inference import RunProcessor, TextGeneration
 from dew.inputs import Field, unit_range
 from dew.objectives.base import merge
 from dew.objectives.diffusion import DiffusionRunConfig, PretrainedAutoencoder, TextCondition
-from dew.sampling import APG, CFG, CFGPlusPlus, Euler, Heun, TextToImage
+from dew.sampling import APG, CFG, CFGPlusPlus, DPMSolverSDE, Euler, Heun, TextToImage
 from dew.sampling.pipelines import Images
 from dew.training import Checkpoints, Trainer
 
@@ -297,6 +297,32 @@ def test_sampler_and_guidance_are_call_arguments(tmp_path):
     assert np.array_equal(pipe(["x"], steps=8, guidance=None, solver=Heun(), key=key).host().images, plain)
     assert np.array_equal(pipe(["x"], steps=8, guidance=4.0, solver=Heun(), key=key).host().images,
                           pipe(["x"], steps=8, guidance=CFG(4.0), solver=Heun(), key=key).host().images)
+
+
+def test_another_guidance_scale_seed_or_grid_reuses_the_compiled_walk(tmp_path):
+    """A request's CFG scale, a Brownian solver's seed and an explicit grid's values are data to the
+    image walk: another value changes the sample and runs the program the first value compiled."""
+    from dew.sampling import pipelines
+
+    make_run(tmp_path)
+    loaded = TextToImage.from_run(str(tmp_path))
+    pipe = dataclasses.replace(loaded, variables=jax.tree.map(lambda leaf: leaf + 0.05, loaded.variables))
+    grid = np.asarray(pipe.process.times(8), np.float32)
+    nudged = grid.copy()
+    nudged[4] = 0.5 * (grid[3] + grid[4])
+
+    def draw(scale=4.0, seed=1, times=None):
+        prepared = pipe.prepare(["x"], key=0, steps=8, times=times)
+        return pipe(prepared, steps=8, guidance=CFG(scale), solver=DPMSolverSDE(seed=seed),
+                    key=jax.random.PRNGKey(1)).host().images
+
+    first = draw(times=grid)
+    compiled = pipelines._run(None)._cache_size()
+    for other in (draw(scale=2.0, times=grid), draw(seed=2, times=grid), draw(times=nudged)):
+        assert not np.allclose(other, first)
+    assert np.array_equal(draw(times=grid), first)
+    assert np.array_equal(draw(), first)
+    assert pipelines._run(None)._cache_size() == compiled
 
 
 def test_the_run_record_refuses_a_field_it_does_not_know(tmp_path):
