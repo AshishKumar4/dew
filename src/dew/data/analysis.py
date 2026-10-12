@@ -156,12 +156,13 @@ def _preferred_read(compiled: Callable[[Read], Sequence[Pipeline]], *, provision
 
 
 def _lowers(pipelines: Sequence[Pipeline], read: Read) -> bool:
-    """Whether the analysis lowers every stage of `pipelines` at `read`. Its
-    refusals are the one statement of what a read takes, so this asks them
-    and states none of its own."""
+    """Whether the analysis lowers every stage of `pipelines` at `read`, the
+    first as the run trains it and the rest as scored branches. Its refusals
+    are the one statement of what a read takes, so this asks them and states
+    none of its own."""
     try:
-        for pipeline in pipelines:
-            _analyzed(pipeline, read)
+        for index, pipeline in enumerate(pipelines):
+            _analyzed(pipeline, read, validation=index > 0)
     except ValueError:
         return False
     return True
@@ -372,9 +373,11 @@ class _Lowering:
 def _analyzed(
     pipeline: Pipeline, read: Read, *, validation: bool = False, promotion: bool = False
 ) -> _Lowering:
-    """The analysis of `pipeline` at `read`. A token split in an order cut
-    per share is refused once the steps are bound, since an unbound
-    configured step may still be one a memory read runs eagerly."""
+    """The analysis of `pipeline` at `read`, a scored branch with
+    `validation`. A token split in a training order cut per share is refused
+    once the steps are bound, since an unbound configured step may still be
+    one a memory read runs eagerly; a scored branch reads its whole order in
+    one canonical pass, so its split is whole."""
     source = pipeline.source
     nested = source.pipelines if isinstance(source, (Mixture, Phases)) else ()
     children = tuple(_analyzed(child, read, validation=validation, promotion=promotion) for child in nested)
@@ -396,7 +399,7 @@ def _analyzed(
     children = tuple(_cut(child, per_share) for child in children)
     steps = (*ancestry, *stages)
     split = _at(stages[eager:], TokenSplit) is not None or any(child.split for child in children)
-    if per_share and split and not any(isinstance(stage, Configured) for stage in steps):
+    if per_share and split and not validation and not any(isinstance(stage, Configured) for stage in steps):
         raise ValueError(f"token split in {_name(pipeline)} needs a global record order, not one per share")
     repeats = [stage.epochs for stage in steps if isinstance(stage, Repeat)]
     endless = not any(isinstance(stage, Limit) for stage in steps) and (

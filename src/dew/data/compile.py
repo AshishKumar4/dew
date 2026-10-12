@@ -500,7 +500,9 @@ def _compiled(
         else functools.partial(
             _validation_reader,
             pipeline=validation,
-            build=dataclasses.replace(build, lowering=_analyzed(validation, read), training=False),
+            build=dataclasses.replace(
+                build, lowering=_analyzed(validation, read, validation=True), training=False
+            ),
             host=tuple(stage.step for stage in validation.stages if isinstance(stage, MapBatch)) + host,
         )
     )
@@ -801,7 +803,8 @@ def iterate(
     (pipeline,) = _prepared((pipeline,), read, provision=provision, counts=({},))
     if read == "memory":
         pipeline = _materialize(pipeline, {}, training=False)
-    build = _Build(read, loading, 0, 1, budget, _analyzed(pipeline, read), training=False)
+    lowering = _analyzed(pipeline, read, validation=True)
+    build = _Build(read, loading, 0, 1, budget, lowering, training=False)
     rows, _ = build.records(pipeline, DataPartition())
     return _as_iter(rows, loading)
 
@@ -826,7 +829,8 @@ def validation(
     (pipeline,) = _prepared((pipeline,), read, provision=provision, objective=objective, counts=({},))
     if read == "memory":
         pipeline = _materialize(pipeline, {}, training=False)
-    build = _Build(read, loading, seed, batch, budget, _analyzed(pipeline, read), training=False)
+    lowering = _analyzed(pipeline, read, validation=True)
+    build = _Build(read, loading, seed, batch, budget, lowering, training=False)
     if loading.workers == "auto":
         rows, _ = build.records(pipeline, DataPartition())
         build = dataclasses.replace(build, loading=loading.resolved(_as_iter(rows, loading)))
