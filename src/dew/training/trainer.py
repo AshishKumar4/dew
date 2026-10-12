@@ -644,8 +644,25 @@ class Trainer(Generic[Loss, Effects]):
         state, the frozen collection is the exception: it stays where the realization
         reads it (`execution.resident`) for the whole run.
         """
-        with boxed(ruled_boxes(self._boxed_axes(), self.layout.axis_rules)):
+        with self._declared():
             return self._shardings(state)
+
+    def _declared(self):
+        """The context in which the layout reads the axes the objective's
+        modules box, as its rules place them."""
+        return boxed(ruled_boxes(self._boxed_axes(), self.layout.axis_rules))
+
+    def check(self, variables: Variables, placement: Placement[Variables]) -> None:
+        """`Layout.check` of `variables` placed by `placement`, read as the
+        layout placed them: in the axes the modules box, and a CPU-owned
+        run's frozen banks as their layers (`dew.inference.banks.spread`)."""
+        from dew.inference.banks import row_sharding, shape_rows, spread
+        if self.host_master and FROZEN in variables:
+            variables = {**variables, FROZEN: spread(variables[FROZEN], shape_rows)}
+            placement = {**placement, FROZEN: spread(
+                placement[FROZEN], lambda sharding, count: [row_sharding(sharding)] * count)}
+        with self._declared():
+            self.layout.check(variables, placement, self.device_mesh)
 
     def _shardings(self, state: TrainState) -> Placement[TrainState]:
         mesh = self.state_mesh
@@ -702,7 +719,7 @@ class Trainer(Generic[Loss, Effects]):
         abstract = jax.eval_shape(self.initial_state, initializer, key)
         refuse_wide_floats(abstract, self.device_mesh)
         shardings = self.shardings(abstract)
-        self.layout.check(abstract.variables, shardings.variables, self.device_mesh)
+        self.check(abstract.variables, shardings.variables)
         checkpoints = self.checkpoints
         # Each process lists the checkpoints itself, and on a shared
         # filesystem one listing can lag another's: every process resumes
@@ -1114,7 +1131,7 @@ class Trainer(Generic[Loss, Effects]):
                 shards = math.prod(mesh.shape[axis] for axis in BATCH_AXES)
                 options = None if self._xla_defaults else step_compiler_options(
                     self.objective, device_tokens(self.objective, batch, shards),
-                    FROZEN in prepared.variables)
+                    FROZEN in prepared.variables, mesh.devices.size)
                 self.executable = compiled_if_it_fits(self.program, options, refusals)
                 fits = step_fits(self.executable, mesh, held)
                 if not fits and options is not None:
@@ -1409,7 +1426,7 @@ class Trainer(Generic[Loss, Effects]):
                 run.stop_control = checkpoints.control(checkpoints.latest)
         else:
             shardings = self.shardings(initial)
-            self.layout.check(initial.variables, shardings.variables, self.device_mesh)
+            self.check(initial.variables, shardings.variables)
             state = jax.device_put(initial, shardings)
             position = None
         run.last_checkpoint = time.perf_counter()

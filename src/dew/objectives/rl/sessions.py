@@ -161,7 +161,7 @@ class Call:
     the dtype the engine sent; the last sampled id is never forwarded. vLLM
     calls this record `routed_experts` and SGLang
     `meta_info.routed_experts`, and the trainer replays it
-    (`dew.nn.moe.Routes`). `support` holds, for each sampled id, the token
+    (`dew.nn.protocols.Routes`). `support` holds, for each sampled id, the token
     ids the sampler's top-k/top-p filters kept (vLLM's `sampling_mask`).
     With a support, the behavior log-probability is the filtered one, and
     the trainer renormalizes over the same support. None means no filter.

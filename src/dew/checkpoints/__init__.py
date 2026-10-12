@@ -1577,7 +1577,7 @@ class Checkpoints:
             **template, "variables": {**template["variables"], FROZEN: spread(frozen, shape_rows)}}
         with sharding.boxed(self.boxed(step)):
             placement = {name: chosen_layout.shardings(device_mesh, tree) for name, tree in rows.items()}
-        chosen_layout.check(rows["variables"], placement["variables"], device_mesh)
+            chosen_layout.check(rows["variables"], placement["variables"], device_mesh)
         if frozen is not None:
             placement["variables"] = {**placement["variables"], FROZEN: banked_placement(
                 frozen, placement["variables"][FROZEN])}

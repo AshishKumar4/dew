@@ -2288,6 +2288,10 @@ APART = {"xla_gpu_dot_merger_threshold_mb": 0}
 
 @pytest.mark.parametrize("generation, flags, tokens, frozen, expected", [
     ("sm89", "", 4, False, {**APART, "xla_gpu_enable_triton_gemm": False}),
+    ("sm90", "", 1024, False, {**APART, **memory.COLLECTIVES}),
+    ("sm90", "--xla_gpu_enable_latency_hiding_scheduler=false", 1024, False,
+     {**APART, **{name: value for name, value in memory.COLLECTIVES.items()
+                  if name != "xla_gpu_enable_latency_hiding_scheduler"}}),
     ("sm86", "", 4, False, APART),
     ("sm86", "", 128, True, None),
     ("sm89", "", 128, True, {"xla_gpu_enable_triton_gemm": False}),
@@ -2304,9 +2308,10 @@ def test_a_gpu_training_step_compiles_its_dots_apart(monkeypatch, generation, fl
     merger would concatenate their weights every step, except a step beside
     frozen weights on 128 tokens or fewer a device (32 rows of 4 at most), which
     keeps the merger as decoding does; the Triton GEMM fusions go off on the
-    generations measured faster without them; a flag the run named stands.
-    The options are the step's own, so a process that also serves keeps the
-    merger there."""
+    generations measured faster without them; a step over several GPUs (here
+    the sm90 cases, over two) takes the combined, pipelined collectives; a
+    flag the run named stands. The options are the step's own, so a process
+    that also serves keeps the merger there."""
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.objectives.lm import LMObjective
     monkeypatch.setattr(memory, 'device_generation', lambda: generation)
@@ -2314,7 +2319,14 @@ def test_a_gpu_training_step_compiles_its_dots_apart(monkeypatch, generation, fl
     model = CausalTransformer(vocab_size=32, emb_features=8, num_layers=1, num_heads=1,
                               mlp_features=16, max_seq_len=8)
     objective = LMObjective(model, seq_len=4)
-    assert memory.step_compiler_options(objective, tokens, frozen) == expected
+    devices = 2 if generation == "sm90" else 1
+    assert memory.step_compiler_options(objective, tokens, frozen, devices) == expected
+
+
+def test_the_collective_options_are_options_xla_takes():
+    """Every collective option names a field of XLA's debug options, which a
+    compile refuses when it doesn't know one (on any backend)."""
+    jax.jit(lambda x: x + 1).lower(jnp.ones(3)).compile(dict(memory.COLLECTIVES))
 
 
 def test_a_frozen_step_tells_the_options_its_tokens_and_split(monkeypatch):
@@ -2326,7 +2338,7 @@ def test_a_frozen_step_tells_the_options_its_tokens_and_split(monkeypatch):
 
     seen = []
     monkeypatch.setattr(trainer_module, 'step_compiler_options',
-                        lambda objective, tokens, frozen: seen.append((tokens, frozen)))
+                        lambda objective, tokens, frozen, devices: seen.append((tokens, frozen, devices)))
     model = CausalTransformer(vocab_size=32, emb_features=8, num_layers=1, num_heads=1,
                               mlp_features=16, max_seq_len=8)
     fresh = LMObjective(model, seq_len=4).init(jax.random.key(0))
@@ -2336,7 +2348,7 @@ def test_a_frozen_step_tells_the_options_its_tokens_and_split(monkeypatch):
                           key=jax.random.key(0), checkpoints=None, tracker=None)
         state, _, _ = trainer.place()
         trainer.compile(state, {"text": jax.ShapeDtypeStruct((8, 5), jnp.int32)})
-        assert seen[-1] == (8 // len(jax.devices()) * 4, frozen)
+        assert seen[-1] == (8 // len(jax.devices()) * 4, frozen, len(jax.devices()))
 
 
 def test_a_step_without_tokens_compiles_whatever_its_batch_holds():
@@ -2354,7 +2366,7 @@ def test_the_step_runs_the_program_it_compiled(monkeypatch, tmp_path):
     from dew.training import trainer as trainer_module
 
     monkeypatch.setattr(trainer_module, 'step_compiler_options',
-                        lambda objective, tokens, frozen: {'xla_embed_ir_in_executable': False})
+                        lambda objective, tokens, frozen, devices: {'xla_embed_ir_in_executable': False})
     trainer, _, _ = held_lm_trainer()
     state, _, _ = trainer.place()
     batch = {"text": jnp.zeros((8, 5), jnp.int32)}

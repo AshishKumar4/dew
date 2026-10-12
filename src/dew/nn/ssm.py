@@ -117,8 +117,8 @@ class S5Layer(nn.Module):
 
     `A` is `state_dim` complex poles, stored as the log of the negative
     real part so the recurrence cannot grow. `dt` discretizes them per
-    pole, and the scan runs in at least fp32 whatever dtype the input
-    carries (`at_least_fp32`).
+    pole, and the discretization and scan run in the module's dtype (the
+    input's where None), at least fp32 (`compute_dtype`).
 
     The parameters are the poles `log_A_real`/`A_imag`, the input map
     `B_re`/`B_im`, the output map `C_re`/`C_im`, the skip `D` and the
@@ -161,28 +161,41 @@ class S5Layer(nn.Module):
             lambda key, shape: jax.random.uniform(key, shape, minval=jnp.log(0.001), maxval=jnp.log(0.1)),
             (self.state_dim,))
 
-    def operators(self) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    def operators(self, dtype) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
         """The zero-order hold of the recurrence, `(A_bar, B_bar, C, D)`:
         `A_bar = exp(A dt)` the `[N]` complex poles, `B_bar = (A_bar - 1) /
-        A * B` `[N, F]` and `C` `[F, N]` complex, and `D` the `[F]` skip."""
-        dt = jnp.exp(self.log_dt)
-        A_diag = -jnp.exp(self.log_A_real) + 1j * self.A_imag
+        A * B` `[N, F]` and `C` `[F, N]` complex, and `D` the `[F]` skip,
+        each from the parameters in the real compute `dtype`
+        (`compute_dtype`)."""
+        log_dt, log_A_real, A_imag, B_re, B_im, C_re, C_im, D = (
+            jnp.asarray(p, dtype) for p in (self.log_dt, self.log_A_real, self.A_imag, self.B_re, self.B_im,
+                                            self.C_re, self.C_im, self.D))
+        dt = jnp.exp(log_dt)
+        A_diag = -jnp.exp(log_A_real) + 1j * A_imag
         A_bar = jnp.exp(A_diag * dt)
-        B_bar = ((A_bar[:, None] - 1.0) / (A_diag[:, None] + 1e-8)) * (self.B_re + 1j * self.B_im)
-        return A_bar, B_bar, self.C_re + 1j * self.C_im, self.D
+        # S5's own hold has no guard (Smith et al. 2023, appendix): A's real part, -exp(log_A_real), is
+        # never zero.
+        B_bar = ((A_bar[:, None] - 1.0) / A_diag[:, None]) * (B_re + 1j * B_im)
+        return A_bar, B_bar, C_re + 1j * C_im, D
 
     def __call__(self, u):
         """Scan `u` `[B, S, F]` through the discretized poles into `[B, S, F]`."""
         F = u.shape[-1]
         assert self.features == F, f"S5Layer built for {self.features} features, got {F}"
-        y, = _directions(u, (self.operators(),), (False,), self.dtype if self.dtype is not None else u.dtype)
+        dtype = self.dtype if self.dtype is not None else u.dtype
+        y, = _directions(u, (self.operators(compute_dtype(dtype)),), (False,), dtype)
         return y
+
+
+def compute_dtype(dtype):
+    """The dtype an S5 scan discretizes and recurs in: its module's, at least fp32 (`at_least_fp32`)."""
+    return at_least_fp32(dtype)
 
 
 def _directions(u: jax.Array, operators, reversed_: tuple[bool, ...], dtype) -> list[jax.Array]:
     """Each direction's `Re(C x_k) + D u_k` in `dtype` over `u` `[B, S, F]`,
-    read in reverse where `reversed_` says, computed in at least fp32 by
-    backend. The split is measured, not chosen (docs/performance.md, the S5
+    read in reverse where `reversed_` says, computed in `compute_dtype(dtype)`
+    by backend. The split is measured, not chosen (docs/performance.md, the S5
     table).
 
     A GPU and the CPU run `_chunked_directions`, which won every shape
@@ -201,7 +214,7 @@ def _chunked_directions(u: jax.Array, operators, reversed_: tuple[bool, ...], dt
     input product as one real one, the backward recurrence over the reversed
     positions of its projected inputs rather than over a reversed copy of
     `u`."""
-    u = u.astype(at_least_fp32(u.dtype))
+    u = u.astype(compute_dtype(dtype))
     width = 2 * operators[0][0].shape[0]
     stacked = jnp.concatenate([jnp.concatenate([b.real, b.imag]) for _, b, _, _ in operators])
     projected = jnp.einsum('bsf,nf->bsn', u, stacked)
@@ -224,7 +237,7 @@ def _scanned_directions(u: jax.Array, operators, reversed_: tuple[bool, ...], dt
     out = []
     for (pole, b, c, d), backwards in zip(operators, reversed_, strict=True):
         read = jnp.flip(u, axis=1) if backwards else u
-        read = read.astype(at_least_fp32(read.dtype))
+        read = read.astype(compute_dtype(dtype))
         bu = jnp.einsum('bsf,nf->bsn', read, b)
         _, x = jax.lax.associative_scan(lambda e1, e2: (e1[0] * e2[0], e2[0] * e1[1] + e2[1]),
                                         (jnp.broadcast_to(pole[None, None, :], bu.shape), bu), axis=1)
@@ -252,9 +265,10 @@ class BidirectionalS5Layer(nn.Module):
     @nn.compact
     def __call__(self, u):
         # The input u has shape [B, S, F].
-        operators = tuple(S5Layer(features=self.features, state_dim=self.state_dim, dtype=self.dtype,
-                                  name=name).operators() for name in ("s5_forward", "s5_backward"))
         dtype = self.dtype if self.dtype is not None else u.dtype
+        operators = tuple(S5Layer(features=self.features, state_dim=self.state_dim, dtype=self.dtype,
+                                  name=name).operators(compute_dtype(dtype))
+                          for name in ("s5_forward", "s5_backward"))
         y_fwd, y_bwd = _directions(u, operators, (False, True), dtype)
         y_cat = jnp.concatenate([y_fwd, y_bwd], axis=-1)  # [B, S, 2F]
         return nn.Dense(features=self.features, dtype=self.dtype, name="out_proj")(y_cat)
