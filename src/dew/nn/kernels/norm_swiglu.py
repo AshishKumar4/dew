@@ -64,7 +64,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import triton as plgpu
 from jax.interpreters.ad import JVPTracer
 
-from ..precision import rounded_to
+from ..precision import at_least_fp32, compensated_add, rounded_to
 from ..sharding import logical_spec, manual_map
 from . import generation
 from .generation import first_refusal
@@ -98,7 +98,7 @@ def _round(x, dtype, interpret: bool):
     return rounded_to(x, dtype) if interpret else x.astype(dtype).astype(x.dtype)
 
 
-def _compensated_add(total, correction, value, *, interpret: bool) -> tuple[jax.Array, jax.Array]:
+def _neumaier_add(total, correction, value, *, interpret: bool) -> tuple[jax.Array, jax.Array]:
     """Neumaier's fp32 sum: keep the lost low bits even under cancellation.
 
     Explicit add/sub rounding protects the residual from compiler fusion
@@ -188,15 +188,17 @@ def _split() -> bool:
     return any(mesh.shape[name] > 1 for name in mesh.axis_names if name not in mesh.manual_axes)
 
 
-def _placed(axes, value, *, whole_last: bool) -> bool:
-    """Whether the kernel can run on `value`'s shards: outside a varying-typed
-    `shard_map`, and on a split mesh only where the caller names `value`'s
-    logical axes (`axes`), which with `whole_last` leave its last axis whole."""
-    if jax.typeof(value).mat.varying:
+def _placed(axes, operands, *, whole_last: bool) -> bool:
+    """Whether the kernel can run on its `operands`' shards: none varies in a
+    `shard_map` that checks varying axes, and on a split mesh the caller
+    names the first one's logical axes (`axes`), which with `whole_last`
+    leave its last axis whole."""
+    if any(jax.typeof(operand).mat.varying for operand in operands if operand is not None):
         return False
     if not _split():
         return True
-    return axes is not None and (not whole_last or len(logical_spec(axes, value.shape)) < value.ndim)
+    first = operands[0]
+    return axes is not None and (not whole_last or len(logical_spec(axes, first.shape)) < first.ndim)
 
 
 def _per_shard(local, axes, operands, replicated):
@@ -227,7 +229,7 @@ def _norm_refusal(x, scale, dtype, axes, operands) -> str | None:
         (all(operand is None or (operand.shape == x.shape and operand.dtype == x.dtype)
              for operand in operands),
          "a residual branch or a gate must match the normalized input's shape and dtype"),
-        (_placed(axes, x, whole_last=True),
+        (_placed(axes, (x, scale, *operands), whole_last=True),
          "a mesh splits RMSNorm's operands by axes the caller does not name or across its features, or "
          "a shard_map that checks varying axes holds them, and a Pallas call states no varying type"),
     )
@@ -266,17 +268,16 @@ def swiglu_kernel(implementation: str, gate, up, *, axes=None, packed: bool = Fa
          "SwiGLU needs matching float32 or bfloat16 operands"),
         (gate.shape == up.shape and bool(gate.shape) and gate.size > 0,
          "SwiGLU needs nonempty equal shapes, not broadcasting"),
-        (_placed(axes, gate, whole_last=False),
+        (_placed(axes, (gate, up), whole_last=False),
          "a mesh splits SwiGLU's operands by axes the caller does not name, or a shard_map that checks "
          "varying axes holds them, and a Pallas call states no varying type"),
     ))
 
 
-def _weight(scale_ref, columns, width: int, offset: bool, interpret: bool):
-    scale = plgpu.load(scale_ref.at[columns], mask=columns < width, other=0)
+def _weight(scale_ref, columns, width: int, offset: bool, stored, interpret: bool):
+    weight = plgpu.load(scale_ref.at[columns], mask=columns < width, other=0).astype(jnp.float32)
     # The offset adds in the stored weight's dtype, including a bf16 weight.
-    weight = scale.astype(jnp.float32)
-    return _round(weight + 1.0, scale.dtype, interpret) if offset else weight
+    return _round(weight + 1.0, stored, interpret) if offset else weight
 
 
 def _activated(gate, activation: str) -> tuple[jax.Array, jax.Array]:
@@ -289,7 +290,7 @@ def _activated(gate, activation: str) -> tuple[jax.Array, jax.Array]:
 
 
 def _rms_forward(x_ref, branch_ref, scale_ref, gate_ref, y_ref, stream_ref, inverse_ref, *, epsilon: float,
-                 offset: bool, after_cast: bool, activation: str, interpret: bool):
+                 offset: bool, stored, after_cast: bool, activation: str, interpret: bool):
     rows, width = x_ref.shape
     columns = jnp.arange(pl.next_power_of_2(width))
     row_block = _row_block(width)
@@ -308,7 +309,7 @@ def _rms_forward(x_ref, branch_ref, scale_ref, gate_ref, y_ref, stream_ref, inve
     if scale_ref is not None:
         if after_cast:
             y = _round(y, y_ref.dtype, interpret)
-        y = y * _weight(scale_ref, columns, width, offset, interpret)[None, :]
+        y = y * _weight(scale_ref, columns, width, offset, stored, interpret)[None, :]
     if gate_ref is not None:
         # The gate multiplies the weighted norm in fp32, before the one cast.
         y = y * _activated(plgpu.load(gate_ref.at[at], mask=mask, other=0).astype(jnp.float32), activation)[0]
@@ -323,18 +324,19 @@ def _pairwise(values, *, interpret: bool) -> tuple[jax.Array, jax.Array]:
     while values.shape[0] > 1:
         left, right = jnp.split(values, 2, axis=0)
         left_lost, right_lost = jnp.split(lost, 2, axis=0)
-        values, lost = _compensated_add(left, left_lost + right_lost, right, interpret=interpret)
+        values, lost = _neumaier_add(left, left_lost + right_lost, right, interpret=interpret)
     return values.reshape(values.shape[1:]), lost.reshape(lost.shape[1:])
 
 
 def _rms_backward(x_ref, scale_ref, gate_ref, inverse_ref, dy_ref, stream_ref, dx_ref, dgate_ref, partial_ref,
-                  correction_ref, *, offset: bool, after_cast: bool, activation: str, interpret: bool):
+                  correction_ref, *, offset: bool, stored, after_cast: bool, activation: str,
+                  interpret: bool):
     rows, width = x_ref.shape
     columns = jnp.arange(pl.next_power_of_2(width))
     groups = pl.num_programs(0)
     group = pl.program_id(0)
     row_block = _row_block(width)
-    weight = _weight(scale_ref, columns, width, offset, interpret) if scale_ref is not None else 1.0
+    weight = _weight(scale_ref, columns, width, offset, stored, interpret) if scale_ref is not None else 1.0
 
     def block(i, accumulated):
         row = (i * groups + group) * row_block + jnp.arange(row_block)
@@ -367,7 +369,7 @@ def _rms_backward(x_ref, scale_ref, gate_ref, inverse_ref, dy_ref, stream_ref, d
         # program's own tile of sums: elementwise, nothing crosses threads
         # until the tile's rows meet pairwise once, after the loop.
         product, low = _product_parts(dy, normalized, interpret=interpret)
-        total, kept = _compensated_add(accumulated[0], accumulated[1], product, interpret=interpret)
+        total, kept = _neumaier_add(accumulated[0], accumulated[1], product, interpret=interpret)
         return total, kept + low
 
     shape = (row_block, columns.shape[0])
@@ -380,30 +382,22 @@ def _rms_backward(x_ref, scale_ref, gate_ref, inverse_ref, dy_ref, stream_ref, d
                     mask=columns < width)
 
 
-def _two_sum(left, right):
-    """Two compensated fp32 sums `(high, low)` added: Knuth's TwoSum keeps the
-    rounding of the high parts exactly, the low parts and that error add."""
-    (left_high, left_low), (right_high, right_low) = left, right
-    total = left_high + right_high
-    virtual = total - left_high
-    lost = (left_high - (total - virtual)) + (right_high - virtual)
-    return total, (left_low + right_low) + lost
-
-
-def _scale_sum(partial, correction, dtype):
+def _scale_sum(partial, correction):
     """The programs' compensated parts summed over programs as compensated
-    pairs (`_two_sum`), one XLA column reduction, then the only cast."""
+    pairs (`compensated_add`), one XLA column reduction."""
     zero = jnp.zeros((), jnp.float32)
-    total, lost = jax.lax.reduce((partial, correction), (zero, zero), _two_sum, (0,))
-    return (total + lost).astype(dtype)
+    total, lost = jax.lax.reduce((partial, correction), (zero, zero), compensated_add, (0,))
+    return total + lost
 
 
 class _Norm(NamedTuple):
     """One fused norm's static arithmetic: everything but its operands. The
-    activation gates only a norm called with a gate."""
+    weight reaches the kernels in fp32, `stored` its own dtype, in which the
+    offset adds; the activation gates only a norm called with a gate."""
     epsilon: float
     dtype: jnp.dtype
     offset: bool
+    stored: jnp.dtype
     after_cast: bool
     activation: str
     interpret: bool
@@ -417,8 +411,8 @@ def _rms_with_inverse(x, branch, scale, gate, norm: _Norm):
     """`(stream, y)` and the per-row inverse RMS, the stream `x + branch`, or `x` itself."""
     rows, width = math.prod(x.shape[:-1]), x.shape[-1]
     y, stream, inverse = pl.pallas_call(
-        functools.partial(_rms_forward, epsilon=norm.epsilon, offset=norm.offset, after_cast=norm.after_cast,
-                          activation=norm.activation, interpret=norm.interpret),
+        functools.partial(_rms_forward, epsilon=norm.epsilon, offset=norm.offset, stored=norm.stored,
+                          after_cast=norm.after_cast, activation=norm.activation, interpret=norm.interpret),
         grid=(pl.cdiv(rows, _row_block(width)),),
         out_shape=(jax.ShapeDtypeStruct((rows, width), norm.dtype),
                    None if branch is None else jax.ShapeDtypeStruct((rows, width), x.dtype),
@@ -439,7 +433,7 @@ def _rms_backward_call(stream, scale, gate, inverse, dy, ds, norm: _Norm):
     groups = _programs(rows, width)
     partial_shape = None if scale is None else jax.ShapeDtypeStruct((groups, width), jnp.float32)
     dx, dgate, partial, correction = pl.pallas_call(
-        functools.partial(_rms_backward, offset=norm.offset, after_cast=norm.after_cast,
+        functools.partial(_rms_backward, offset=norm.offset, stored=norm.stored, after_cast=norm.after_cast,
                           activation=norm.activation, interpret=norm.interpret),
         grid=(groups,),
         out_shape=(jax.ShapeDtypeStruct((rows, width), stream.dtype),
@@ -448,7 +442,7 @@ def _rms_backward_call(stream, scale, gate, inverse, dy, ds, norm: _Norm):
         compiler_params=plgpu.CompilerParams(num_warps=4, num_stages=1),
         interpret=norm.interpret, name="rms_norm_backward",
     )(_flat(stream), scale, _flat(gate), inverse, _flat(dy), _flat(ds))
-    dscale = None if scale is None else _scale_sum(partial, correction, scale.dtype)
+    dscale = None if scale is None else _scale_sum(partial, correction)
     return dx.reshape(stream.shape), None if gate is None else dgate.reshape(gate.shape), dscale
 
 
@@ -521,9 +515,16 @@ _gated_rms_vjp = jax.custom_vjp(_gated_rms, nondiff_argnums=(3,))
 _gated_rms_vjp.defvjp(_gated_rms_fwd, _gated_rms_bwd)
 
 
-def _norm(epsilon: float, dtype, offset: bool, after_cast: bool, activation: str = 'silu') -> _Norm:
-    interpret = not generation.triton_runs()
-    return _Norm(float(epsilon), jnp.dtype(dtype), offset, after_cast, activation, interpret)
+def _norm(epsilon: float, dtype, offset: bool, after_cast: bool, scale, activation: str = 'silu') -> _Norm:
+    stored = jnp.dtype(jnp.float32 if scale is None else scale.dtype)
+    return _Norm(float(epsilon), jnp.dtype(dtype), offset, stored, after_cast, activation,
+                 not generation.triton_runs())
+
+
+def _widened(scale):
+    """The weight in fp32 for the kernels, so its gradient is summed over a
+    mesh's row shards before the cast back to its own dtype rounds it."""
+    return None if scale is None else scale.astype(at_least_fp32(scale.dtype))
 
 
 def stream_rms_norm(x, branch, scale, epsilon: float, dtype, offset: bool, after_cast: bool, *, axes=None):
@@ -535,14 +536,14 @@ def stream_rms_norm(x, branch, scale, epsilon: float, dtype, offset: bool, after
     output costs nothing in reverse. It interprets where no Triton GPU runs
     it (`generation.triton_runs`), as the CPU suite does, and lowers for the
     assumed GPU within `generation.assumed`, as the GDN kernels decide."""
-    norm = _norm(epsilon, dtype, offset, after_cast)
+    norm = _norm(epsilon, dtype, offset, after_cast, scale)
 
     def local(x, branch, scale):
         if branch is None:
             return _stream_rms_vjp(x, scale, norm)
         return _sum_rms_vjp(x, branch, scale, norm)
 
-    return _per_shard(local, axes, (x, branch, scale), (False, False, True))
+    return _per_shard(local, axes, (x, branch, _widened(scale)), (False, False, True))
 
 
 def rms_norm(x, scale, epsilon: float, dtype, offset: bool, after_cast: bool, *, axes=None):
@@ -555,9 +556,9 @@ def gated_rms_norm(x, gate, scale, epsilon: float, dtype, activation: str, *, ax
     `scale`, times `activation(gate)` ('silu' or 'sigmoid'), cast once to
     `dtype`. The reverse pass reads `x`, `gate` and the cotangent once and
     writes both input gradients beside the weight's partial sums."""
-    norm = _norm(epsilon, dtype, offset=False, after_cast=False, activation=activation)
-    return _per_shard(lambda x, gate, scale: _gated_rms_vjp(x, gate, scale, norm), axes, (x, gate, scale),
-                      (False, False, True))
+    norm = _norm(epsilon, dtype, offset=False, after_cast=False, scale=scale, activation=activation)
+    return _per_shard(lambda x, gate, scale: _gated_rms_vjp(x, gate, scale, norm), axes,
+                      (x, gate, _widened(scale)), (False, False, True))
 
 
 def _swiglu_forward(gate_ref, up_ref, y_ref, *, interpret: bool):

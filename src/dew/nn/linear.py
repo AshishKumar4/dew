@@ -40,7 +40,7 @@ from .blocks import normal_kernel
 from .flops import conv_flops, delta_flops, projection_flops
 from .inputs import AttentionMetadata, valid_order
 from .kernels.generation import first_refusal, measured_kernel, ran_kernel, triton_runs
-from .precision import asks_default_precision, at_least_fp32
+from .precision import asks_default_precision, at_least_fp32, compensated_add
 from .sharding import HEADS, logical_axes, rows_like
 
 CHUNK_SIZE = 64
@@ -243,19 +243,6 @@ def _masked_conv1d(x, kernel, valid, state=None, bias=None, segments=None):
     return jnp.where(valid[:, :, None], output, 0), history
 
 
-def _compensated_add(left, right):
-    """Add two double-float values, `(hi, lo)` pairs whose sum is the value:
-    `hi` is the rounded sum and `lo` carries what its rounding dropped
-    (Knuth's TwoSum), so a running sum keeps fp32's precision squared.
-    XLA reassociates no float arithmetic unless fast math is on; with it,
-    `lo` cancels to zero and the sum is the plain one."""
-    (left_hi, left_lo), (right_hi, right_lo) = left, right
-    total = left_hi + right_hi
-    part = total - left_hi
-    dropped = (left_hi - (total - part)) + (right_hi - part)
-    return total, dropped + left_lo + right_lo
-
-
 def chunk_decay(g, *, halves: bool = False):
     """Cumulate per-chunk log decays and build the pairwise decay between positions.
 
@@ -269,7 +256,7 @@ def chunk_decay(g, *, halves: bool = False):
     The references subtract two fp32 cumulative sums, so every exponent
     carries the rounding of the chunk's whole accumulated magnitude, which
     exp turns into a relative error on every decay. Here the cumulative sum
-    is compensated (`_compensated_add`) and the difference takes both
+    is compensated (`compensated_add`) and the difference takes both
     halves, so an exponent is as precise as its own range. On
     tests/fixtures/hf/kimi-linear-tiny that error dominated the gradient:
     over 16 orderings of the residual stream (an exact symmetry, so only the
@@ -282,7 +269,7 @@ def chunk_decay(g, *, halves: bool = False):
     47.6 against 48.0 ms, Qwen3.5-0.8B's gated delta net over 4096 16.3
     against 16.5).
     """
-    hi, lo = jax.lax.associative_scan(_compensated_add, (g, jnp.zeros_like(g)), axis=g.ndim - 2)
+    hi, lo = jax.lax.associative_scan(compensated_add, (g, jnp.zeros_like(g)), axis=g.ndim - 2)
     if halves:
         return hi, lo
     return hi, _chunk_pairwise_decay(hi, lo)
