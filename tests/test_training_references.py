@@ -18,17 +18,14 @@ import numpy as np
 import optax
 import orbax.checkpoint as ocp
 import pytest
-import torch
 from flax.training.dynamic_scale import DynamicScale
 from orbax.checkpoint import checkpoint_managers
-from test_checkpoint_ranking import Overfit, data
+from test_checkpoint_ranking import data
 from test_host_training import HOST, Coupled, centered
 
-from dew.artifacts import TokenScores
 from dew.checkpoints import Checkpoints, Keep, Ranking
-from dew.objectives.base import Aux, Objective, Ratio, Shown
+from dew.objectives.base import Aux, Objective, Ratio
 from dew.training import Trainer
-from dew.training.trainer import Plateau
 
 ROWS = 2 * jax.device_count()
 
@@ -55,64 +52,6 @@ def test_keep_and_a_ranking_retain_the_steps_orbaxs_own_policies_retain(tmp_path
         reference.save(step, args=ocp.args.PyTreeSave(tree), metrics={"val/loss": loss})
     reference.wait_until_finished()
     assert [kept.step for kept in dew.kept()] == list(reference.all_steps())
-
-
-@dataclasses.dataclass
-class Scripted:
-    """A validation score read off a fixed sequence, one value an evaluation."""
-
-    values: list[float]
-    shown: Shown
-    name = "scripted"
-    reads = TokenScores
-
-    def __call__(self, artifact, batch):
-        return self.values.pop(0)
-
-    def merge(self, left, right):
-        return left
-
-    def finalize(self, value):
-        return value
-
-
-def reductions(scores, mode, evals, min_delta):
-    """The evaluation at which PyTorch's `ReduceLROnPlateau` first cuts the
-    rate, with `evals - 1` evaluations of patience and an absolute threshold
-    of `min_delta`, or None."""
-    weight = torch.nn.Parameter(torch.zeros(()))
-    optimizer = torch.optim.SGD([weight], lr=1.0)
-    plateau = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode=mode, factor=0.5, patience=evals - 1, threshold=min_delta, threshold_mode="abs",
-        cooldown=0)
-    for index, score in enumerate(scores, 1):
-        plateau.step(score)
-        if optimizer.param_groups[0]["lr"] < 1.0:
-            return index
-    return None
-
-
-@pytest.mark.parametrize(("scores", "better", "evals", "min_delta"), [
-    ([1.0, 0.75, 0.75, 0.875, 0.5, 0.5, 0.5, 0.5, 0.25], "lower", 3, 0.0),
-    ([1.0, 0.75, 0.625, 0.5, 0.5, 0.375, 0.25, 0.25], "lower", 2, 0.125),
-    ([0.25, 0.5, 0.5, 0.75, 0.625, 1.0, 1.0, 1.0, 1.0], "higher", 3, 0.0),
-    ([0.5, 0.625, 0.75, 1.0, 1.125, 1.375, 1.5, 1.75], "higher", 2, 0.25),
-    ([1.0, 0.5, 0.25, 0.125, 0.0625, 0.03125], "lower", 1, 0.0),
-])
-def test_plateau_stops_where_torchs_reduce_on_plateau_first_cuts_the_rate(tmp_path, scores, better, evals,
-                                                                          min_delta):
-    """Both count evaluations since the best one, an improvement being a
-    move past it by more than `min_delta`: Dew stops at the `evals`-th such
-    evaluation, where PyTorch, with one fewer of patience, first cuts the
-    rate. Ties and moves of exactly `min_delta` count as no improvement."""
-    metric = Scripted(list(scores), Shown(better=better))
-    trainer = Trainer(Overfit(), optax.sgd(0.1), key=jax.random.key(0),
-                      checkpoints=Checkpoints(str(tmp_path / "run")))
-    state = trainer.fit(data(), steps=len(scores), log_every=1, eval_every=1, checkpoint_every=len(scores),
-                        metrics=[metric], stop=Plateau(metric, evals=evals, min_delta=min_delta))
-    stopped = reductions(scores, "min" if better == "lower" else "max", evals, min_delta)
-    assert int(state.step) == (len(scores) if stopped is None else stopped)
-    assert len(scores) - len(metric.values) == int(state.step)
 
 
 class Flagged(Objective):

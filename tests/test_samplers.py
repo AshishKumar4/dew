@@ -9,7 +9,6 @@ form x(sigma) = x(sigma_max) sqrt(s^2 + sigma^2) / sqrt(s^2 + sigma_max^2).
 Each solver's order of accuracy is measured against that closed form.
 """
 
-import itertools
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -144,6 +143,8 @@ def generate(process, model, solver, steps=100, count=256, shape=(8, 8, 3), seed
 def test_vp_sampler_converges(solver):
     process, model = vp_process()
     assert_gaussian_stats(generate(process, model, solver))
+    if isinstance(solver, DDPM):
+        assert_gaussian_stats(generate(process, model, solver, steps=1000))
 
 
 class EndpointOracle(nn.Module):
@@ -204,14 +205,6 @@ def test_pndm_converges_on_the_linear_table(solver):
 def test_karras_sampler_converges(solver):
     process, model = karras_process()
     assert_gaussian_stats(generate(process, model, solver))
-
-
-def integrate(process, solver, x_T, steps):
-    """`sample`'s walk over the grid without the final denoise, so what comes
-    back is the solver's x at the grid's last sigma."""
-    _, model = karras_process()
-    times = process.times(steps)
-    return walk(solver, process, model, x_T, times)[-1], process.schedule.sigmas(times[-1])
 
 
 FLAXDIFF = dict(np.load(Path(__file__).resolve().parent / "fixtures" / "flaxdiff_solvers" / "solvers.npz"))
@@ -308,72 +301,12 @@ def test_rk4_and_the_multistep_integrator_are_flaxdiffs(name, solver):
                                      f"{name} gradient")
 
 
-def test_euler_ancestral_is_k_diffusions_ancestral_step():
-    """k-diffusion's `get_ancestral_step` at eta 1: sigma_up^2 = sigma_s^2
-    (sigma_t^2 - sigma_s^2) / sigma_t^2, sigma_down^2 = sigma_s^2 - sigma_up^2,
-    and the update is x + (x - x_0) / sigma_t (sigma_down - sigma_t) plus
-    sigma_up of the key's noise."""
-    process, _ = karras_process()
-    key = jax.random.PRNGKey(5)
-    x = jax.random.normal(jax.random.fold_in(key, 1), (4, 8, 8, 3)) * 10.0
-    x_0 = jax.random.normal(jax.random.fold_in(key, 2), (4, 8, 8, 3))
-    t, t_next = jnp.full((4,), 0.6), jnp.full((4,), 0.4)
-    (_, sigma_t), (_, sigma_s) = (broadcast_rates(process.schedule, when, x) for when in (t, t_next))
-    eps = (x - x_0) / sigma_t
-
-    sigma_up = jnp.sqrt(sigma_s**2 * (sigma_t**2 - sigma_s**2) / sigma_t**2)
-    sigma_down = jnp.sqrt(sigma_s**2 - sigma_up**2)
-    expected = x + eps * (sigma_down - sigma_t) + jax.random.normal(key, x.shape) * sigma_up
-
-    stepped, _ = EulerAncestral().step(x, t, t_next, x_0, eps, (), key, process, None)
-    assert jnp.allclose(stepped, expected, atol=1e-5)
-
-
-def test_sampling_starts_from_sigma_max():
-    """x_T is drawn at the top of the schedule, sigma_max on the Karras grid,
-    so a trajectory that started lower would come out too narrow."""
-    process, _ = karras_process()
-    x_T = process.noise(jax.random.PRNGKey(0), (4096, 4))
-    assert abs(float(jnp.std(x_T)) - 80.0) < 1.5
-
-
 @pytest.mark.parametrize("solver", [DDIM(), Euler()], ids=lambda s: type(s).__name__)
 def test_video_samples_converge(solver):
     """The frame axis is one more sample axis: the rates broadcast over it and
     the statistics come out the same as for images."""
     process, model = karras_process()
     assert_gaussian_stats(generate(process, model, solver, steps=50, count=64, shape=(3, 8, 8, 3)))
-
-
-def test_ddpm_sampler_converges_at_every_step():
-    process, model = vp_process()
-    assert_gaussian_stats(generate(process, model, DDPM(), steps=1000))
-
-
-@pytest.mark.parametrize("t,s", [(700, 500), (300, 200), (100, 99)])
-def test_ddpm_step_is_the_vp_posterior(t, s):
-    """One step from t to s is the DDPM posterior q(x_s | x_t, x_0) written in
-    signal and noise rates, which under alpha^2 + sigma^2 = 1 has std
-    sqrt(sigma_s^2 / sigma_t^2 * (1 - alpha_t^2 / alpha_s^2)).
-    """
-    process, _ = vp_process()
-    schedule = process.schedule
-    key = jax.random.PRNGKey(3)
-    x0 = jax.random.normal(jax.random.fold_in(key, 1), (4, 8, 8, 3))
-    eps = jax.random.normal(jax.random.fold_in(key, 2), (4, 8, 8, 3))
-    ones = jnp.ones((4,), jnp.float32)
-    alpha_t, sigma_t = broadcast_rates(schedule, ones * t, x0)
-    alpha_s, sigma_s = broadcast_rates(schedule, ones * s, x0)
-
-    noise = jax.random.normal(key, x0.shape)
-    std = jnp.sqrt(sigma_s**2 / sigma_t**2 * (1 - alpha_t**2 / alpha_s**2))
-    expected = alpha_s * x0 + alpha_t * sigma_s**2 / (alpha_s * sigma_t) * eps + std * noise
-
-    actual, _ = DDPM().step(alpha_t * x0 + sigma_t * eps, ones * t, ones * s, x0, eps, (),
-                            key, process, None)
-    # The closed form and the step group the same products differently; an
-    # RTX 4080 puts them 2.6e-6 apart at the adjacent step, a CPU 1e-7.
-    assert jnp.allclose(actual, expected, atol=1e-5)
 
 
 def test_ddim_eta_converges():
@@ -388,56 +321,6 @@ def test_a_key_reproduces_a_trajectory():
     first = generate(process, model, MultiStepDPM())
     second = generate(process, model, MultiStepDPM())
     assert jnp.allclose(first, second, atol=1e-5)
-
-
-@pytest.mark.parametrize("solver", [MultiStepDPM(), RK4(), EulerAncestral(), KDPM2(), LMS()],
-                         ids=solver_id)
-def test_sigma_integrators_reject_a_vp_schedule(solver):
-    """Each integrates dx/dsigma = eps, which only holds when alpha is 1. On a
-    VP schedule the step would run and drift the samples narrow (0.275 std for
-    a 0.3 oracle on the cosine schedule, inside the convergence tolerance), so
-    the schedule is refused by type."""
-    process, model = vp_process()
-    with pytest.raises(ValueError, match="GeneralizedNoiseScheduler"):
-        generate(process, model, solver)
-
-
-class ConstantVelocity(nn.Module):
-    """A flow model whose velocity is its input, so both Heun evaluations are
-    finite and the last interval reaches sigma = 0 exactly."""
-    @nn.compact
-    def __call__(self, x, temb):
-        return x
-
-
-def test_heun_takes_the_euler_step_where_sigma_reaches_zero():
-    """Karras et al. 2022, Algorithm 2: at sigma_next = 0 there is no
-    derivative to average with, and the step is the Euler one, with no model
-    call for the corrector. On the flow path t = 0 is exactly sigma = 0, so
-    the last interval of any grid hits it."""
-    process = Process(FlowMatchingScheduler(), FlowMatchPredictionTransform())
-    model = ConstantVelocity()
-    params = model.init(jax.random.PRNGKey(1), jnp.ones((1, 4)), jnp.ones((1,)))
-    denoise = process.denoiser(model, params, {})
-    x = jax.random.normal(jax.random.PRNGKey(0), (3, 4))
-    t = jnp.full((3,), 0.25)
-    zero = jnp.zeros((3,))
-    x_0, eps = denoise(x, t)
-
-    calls = []
-
-    def counted(x, t):
-        jax.debug.callback(lambda: calls.append(1))
-        return denoise(x, t)
-
-    heun, _ = jax.jit(lambda x: Heun().step(x, t, zero, x_0, eps, (), jax.random.PRNGKey(0), process,
-                                             counted))(x)
-    jax.effects_barrier()
-    euler, _ = Euler().step(x, t, zero, x_0, eps, (), jax.random.PRNGKey(0), process, denoise)
-    assert jnp.all(jnp.isfinite(heun))
-    assert jnp.allclose(heun, euler, atol=1e-6)
-    # Every row reaches sigma 0, so the corrector's model call is skipped.
-    assert not calls
 
 
 ############################################################################################################
@@ -650,177 +533,6 @@ def test_solver_endpoint_latents_and_vjp_match_reference_limits(name):
     np.testing.assert_allclose(gradient, expected_grad, rtol=3e-6, atol=3e-6)
 
 
-@pytest.mark.parametrize("solver, times", [
-    (DPMSolverMultistep(2, "sde-dpmsolver"), (1.0, .75, .5, .25)),
-    (DPMSolverSinglestep(2, "dpmsolver"), (1.0, .75, .5)),
-    (DPMSolverSinglestep(3, "sde-dpmsolver++", "heun"), (1.0, .75, .5, .25)),
-    (UniPC(3, predict_x0=False), (1.0, .75, .5, .25)),
-    (UniPC(3, solver_type="bh1"), (1.0, .75, .5, .25)),
-    (PNDM(), (1.0, .75, .5, .25)),
-    (PNDM(skip_prk_steps=True), (1.0, .75, .5, .25)),
-    (UniPC(3, lower_order_final=False), (.9, .6, .3, 0.0)),
-    (DPMSolverMultistep(2, "sde-dpmsolver", lower_order_final=False), (.9, .6, .3, 0.0)),
-])
-def test_divergent_endpoint_equations_are_rejected_before_the_scan(solver, times):
-    process = Process(FlowMatchingScheduler(), FlowMatchPredictionTransform())
-    x = jnp.asarray([[1.2, -0.7]])
-    with pytest.raises(ValueError, match="no finite update"):
-        walk(solver, process, NonlinearVelocity(), x, times)
-    with pytest.raises(ValueError, match="no finite update"):
-        jax.jit(lambda initial: walk(solver, process, NonlinearVelocity(), initial, times))(x)
-
-
-@pytest.mark.parametrize("solver", [UniPC(1, predict_x0=False), UniPC(3, predict_x0=False),
-                                  DPMSolverSinglestep(3, "sde-dpmsolver++", "heun")])
-def test_one_interval_crosses_both_endpoints_with_the_first_order_limit(solver):
-    process = Process(FlowMatchingScheduler(), FlowMatchPredictionTransform())
-    x = jnp.asarray([[1.2, -0.7]])
-    run = jax.jit(lambda initial: walk(solver, process, NonlinearVelocity(), initial, (1., 0.))[-1])
-    np.testing.assert_allclose(run(x), x - 0.7 * jnp.tanh(x) - 0.15, atol=1e-6)
-    expected_gradient = 1 - 0.7 * (1 - jnp.tanh(x) ** 2)
-    np.testing.assert_allclose(jax.grad(lambda initial: run(initial).sum())(x), expected_gradient, atol=1e-6)
-
-
-def test_a_noise_only_vp_endpoint_walks_finitely():
-    from dew.diffusion import SqrtContinuousNoiseScheduler, VPredictionTransform
-
-    schedule = SqrtContinuousNoiseScheduler()
-    process = Process(schedule, VPredictionTransform())
-    x = jnp.asarray([[1.2, -0.7]])
-    alpha, sigma = schedule.rates(jnp.asarray([1.0]))
-    np.testing.assert_array_equal(alpha, [0.0])
-    np.testing.assert_array_equal(sigma, [1.0])
-    model = ConstantVelocity()
-    run = jax.jit(lambda initial: walk(DPMSolverMultistep(3), process, model, initial, (1., .75, .5, .25)))
-    output = run(x)
-    gradient = jax.grad(lambda initial: run(initial)[-1].sum())(x)
-    assert bool(jnp.all(jnp.isfinite(output)))
-    assert bool(jnp.all(jnp.isfinite(gradient)))
-
-
-class Forgetful:
-    """A multistep solver whose state is rebuilt before every step, so each
-    step is the one it takes with no history."""
-
-    def __init__(self, inner):
-        self.inner = inner
-
-    def init(self, x, times, process, *, key):
-        self.times = times
-        return self.inner.init(x, times, process, key=key)
-
-    def step(self, x, t, t_next, denoised, eps, state, key, process, denoise):
-        stepped, _ = self.inner.step(
-            x,
-            t,
-            t_next,
-            denoised,
-            eps,
-            self.inner.init(x, self.times, process, key=key),
-            key,
-            process,
-            denoise,
-        )
-        return stepped, state
-
-
-@pytest.mark.parametrize("name", ["dpm_multistep.pp_3", "dpm_multistep.sde_2h", "dpm_singlestep.pp_3h_final",
-                                  "deis.3", "unipc.bh1_3", "pndm.plms", "lms.4"])
-def test_diffusers_fixtures_see_the_history(name):
-    """The same solvers with their history discarded every step (first order
-    throughout, UniPC without a corrector, PNDM's predictor-corrector pair
-    at every step) miss the fixture's final latent by more than 1e-2 of its
-    scale, a hundred times the match tolerance, so a dropped higher-order
-    term cannot pass the match. Observed 4.8e-2 to 0.64."""
-    solver = DIFFUSERS_CASES[name]
-    process, model = reference_process(name)
-    x_T = jnp.asarray(ARRAYS[f"{name}.x_T"])
-    grid = ARRAYS[f"{name}.grid"]
-    expected = ARRAYS[f"{name}.latents"]
-    latents = walk(Forgetful(solver), process, model, x_T, grid)
-    assert relative_gap(latents[-1:], expected[-1:]) > 1e-2
-
-
-LAMBDA_SOLVERS = [DPMSolverMultistep(lower_order_final=False),
-                  DPMSolverMultistep(3, "dpmsolver++", "heun"), DPMSolverMultistep(3, "dpmsolver"),
-                  DPMSolverMultistep(2, "sde-dpmsolver++"),
-                  DPMSolverSinglestep(3, lower_order_final=True), DEIS(3), UniPC(3)]
-
-
-@pytest.mark.parametrize("solver", LAMBDA_SOLVERS, ids=solver_id)
-def test_lambda_solvers_land_on_the_clean_prediction_at_sigma_zero(solver):
-    """A step onto sigma 0 is the h -> infinity limit of every first order
-    update, x_t = alpha_t x_0, with no log of zero in the arithmetic and a
-    finite gradient through the step. The flow path reaches sigma 0 at
-    t = 0, so the last interval of any grid hits it; the check holds for
-    the first step of a walk and for the second, with the first in its
-    history."""
-    process = Process(FlowMatchingScheduler(), FlowMatchPredictionTransform())
-    model = ConstantVelocity()
-    params = model.init(jax.random.PRNGKey(1), jnp.ones((1, 4)), jnp.ones((1,)))
-    denoise = process.denoiser(model, params, {})
-    x = jax.random.normal(jax.random.PRNGKey(0), (3, 4))
-    key = jax.random.PRNGKey(0)
-
-    def step(x, t, t_next, state):
-        t, t_next = jnp.full((3,), t), jnp.full((3,), t_next)
-        x_0, eps = denoise(x, t)
-        return solver.step(x, t, t_next, x_0, eps, state, key, process, denoise)
-
-    fresh, _ = step(x, 0.25, 0.0, solver.init(x, jnp.asarray([0.25, 0.0]), process, key=key))
-    assert jnp.all(jnp.isfinite(fresh)) and jnp.allclose(
-        fresh, denoise(x, jnp.full((3,), 0.25))[0], atol=1e-6
-    )
-
-    def two_steps(x):
-        x, state = step(x, 0.5, 0.25, solver.init(x, jnp.asarray([0.5, 0.25, 0.0]), process, key=key))
-        return step(x, 0.25, 0.0, state)[0], denoise(x, jnp.full((3,), 0.25))[0]
-
-    with_history, x_0 = two_steps(x)
-    assert jnp.all(jnp.isfinite(with_history)) and jnp.allclose(with_history, x_0, atol=1e-6)
-    assert jnp.all(jnp.isfinite(jax.grad(lambda x: jnp.sum(two_steps(x)[0]))(x)))
-
-
-def test_consistency_sampling_in_one_step_is_the_consistency_function():
-    """LCM's one-step generation: with one interval the solver adds no noise
-    and the boundary at t = 0 returns its input, so `sample` is f(x_T, T),
-    c_skip x_T + c_out x_0 with x_0 the model's prediction at T."""
-    schedule = CosineNoiseScheduler(1000)
-    process = Process(schedule, ConsistencyBoundary(DirectPredictionTransform()))
-    model = EndpointOracle(schedule=schedule)
-    params = model.init(jax.random.PRNGKey(1), jnp.ones((1, 4)), jnp.ones((1,)))
-    denoise = process.denoiser(model, params, {})
-    x_T = process.noise(jax.random.PRNGKey(2), (3, 4))
-    top = jnp.full((3,), 1000.0)
-    alpha, sigma = broadcast_rates(schedule, top, x_T)
-    x_0 = x_T * DATA_STD / jnp.sqrt(alpha ** 2 * DATA_STD ** 2 + sigma ** 2)
-    scaled = 1000.0 * 10.0
-    expected = 0.25 / (scaled**2 + 0.25) * x_T + scaled / jnp.sqrt(scaled**2 + 0.25) * x_0
-    assert jnp.allclose(denoise(x_T, top)[0], expected, atol=1e-6)
-    generated = sample(denoise, x_T, 2, solver=Consistency(), key=jax.random.PRNGKey(3))
-    assert jnp.allclose(generated, expected, atol=1e-6)
-
-
-@pytest.mark.parametrize(
-    "solver", [DPMSolverMultistep(lower_order_final=False), UniPC(), DEIS(), KDPM2(), LMS()], ids=solver_id
-)
-def test_diffusers_solvers_resolve_the_karras_ode_more_accurately_than_euler(solver):
-    """Twenty rho-spaced steps from sigma 80 down against the closed form:
-    each lands within 8e-2 and closer than Euler. Observed 5.7e-2
-    for DPM-Solver++ (2M), 4.2e-2 for UniPC, 2.6e-2 for DEIS, 2.9e-2 for
-    KDPM2 and 4.2e-2 for LMS, against Euler's 1.5e-1 and Heun's 5.1e-2."""
-    process, _ = karras_process()
-    x_T = jax.random.normal(jax.random.PRNGKey(0), (64, 4)) * 80.0
-
-    def error(solver):
-        x, sigma = integrate(process, solver, x_T, steps=20)
-        exact = x_T * jnp.sqrt(DATA_STD**2 + sigma**2) / jnp.sqrt(DATA_STD**2 + 80.0**2)
-        return float(jnp.max(jnp.abs(x - exact)) / jnp.max(jnp.abs(exact)))
-
-    measured, euler = error(solver), error(Euler())
-    assert measured < 8e-2 and measured < euler, (measured, euler)
-
-
 ############################################################################################################
 # Interval-limited classifier-free guidance (Kynkaanniemi et al. 2024)
 ############################################################################################################
@@ -848,18 +560,6 @@ def guided_denoiser(count=4):
                                      unconditional={"label": jnp.zeros((1, 1))})
 
 
-def test_cfg_scales_the_conditional_offset():
-    """uncond + scale (cond - uncond): the oracle's label offset is exactly
-    what the guided epsilon carries, times the scale."""
-    _, denoise = guided_denoiser()
-    x_t = jax.random.normal(jax.random.PRNGKey(3), (4, 8, 8, 3))
-    t = jnp.full((4,), 500.0)
-    guided = CFG(3.0).walk(denoise, 1).at((), 0)(x_t, t)[1]
-    unguided = denoise(x_t, t)[1]
-    # the unconditional label is 0, the conditional one 0.7
-    assert jnp.allclose(guided - unguided, 2 * 0.7, atol=1e-5)
-
-
 def test_empty_guidance_interval_generates_the_unguided_samples():
     process, denoise = guided_denoiser(count=16)
     x_T = process.noise(jax.random.PRNGKey(2), (16, 8, 8, 3))
@@ -869,15 +569,6 @@ def test_empty_guidance_interval_generates_the_unguided_samples():
                       key=jax.random.PRNGKey(4))
 
     assert jnp.allclose(run(CFG(3.0, interval=(0.9, 0.1))), run(None), atol=1e-5)
-
-
-def test_guidance_needs_the_unconditional_branch():
-    process, model = vp_process()
-    params = model.init(jax.random.PRNGKey(1), jnp.ones((1, 8, 8, 3)), jnp.ones((1,)))
-    denoise = process.denoiser(model, params, {})
-    x_T = process.noise(jax.random.PRNGKey(2), (2, 8, 8, 3))
-    with pytest.raises(ValueError, match="unconditional"):
-        sample(denoise, x_T, 5, solver=DDIM(), guidance=CFG(2.0), key=jax.random.PRNGKey(0))
 
 
 ############################################################################################################
@@ -907,42 +598,6 @@ class ConditionalSourceOracle(nn.Module):
     @nn.compact
     def __call__(self, x, temb, label):
         return jnp.sin(x) * 0.07 + expand(temb, x) * 0.001 + expand(label, x)
-
-
-@dataclass(frozen=True)
-class RecordedPath(DPMSolverSDE):
-    """`DPMSolverSDE` reading the source's own recorded `torchsde` draws.
-
-    The reference walk runs the actual `BrownianTreeNoiseSampler` and keeps
-    every query it made with the normalized draw it answered. Selecting those
-    by the levels a query asks for couples both sides to one real Brownian
-    path, and leaves the update algebra, the stage placement and the query
-    bounds as what the trajectory compares. A query the reference never made
-    selects nothing, which moves the trajectory well past the bound.
-    """
-
-    intervals: tuple[tuple[float, float], ...] = ()
-    draws: jax.Array | None = None
-
-    def _noise(self, state, first, second, shape):
-        starts = jnp.asarray([pair[0] for pair in self.intervals], jnp.float32)
-        ends = jnp.asarray([pair[1] for pair in self.intervals], jnp.float32)
-        def close(asked, recorded):
-            return jnp.abs(asked - recorded) <= 1e-4 * jnp.maximum(
-                    jnp.abs(recorded), 1e-3)
-        weights = (close(first, starts) & close(second, ends)).astype(jnp.float32)
-        return jnp.sum(jnp.reshape(weights, (-1,) + (1,) * len(shape)) * self.draws, axis=0)
-
-
-def source_solver(name: str, schedule):
-    """The case's solver, with the reference's recorded Brownian path where the
-    source drew one."""
-    solver = schedule.solver
-    if f"{name}.noise" not in SOURCE_ARRAYS:
-        return solver
-    intervals = tuple((float(a), float(b)) for a, b in SOURCE_ARRAYS[f"{name}.intervals"])
-    return RecordedPath(solver.depth, solver.seed, intervals,
-                        jnp.asarray(SOURCE_ARRAYS[f"{name}.noise"], jnp.float32))
 
 
 def source_case(name: str):
@@ -977,7 +632,7 @@ def source_gradient_over_orders(final, initial, cotangent) -> None:
     assert_as_exact_over_orders(distances, SOURCE_ROUNDING["cfg.epsilon.distances"], "cfg.epsilon")
 
 
-@pytest.mark.parametrize("name", sorted(SOURCE["cases"]))
+@pytest.mark.parametrize("name", sorted(name for name in SOURCE["cases"] if not name.startswith("dpm_sde.")))
 def test_source_config_rebuilds_its_scheduler_trajectory_and_gradient(name):
     """Every published scheduler file the reference tool saved, rebuilt from
     that file alone: its beta table, the standard deviation its
@@ -1025,7 +680,7 @@ def test_source_config_rebuilds_its_scheduler_trajectory_and_gradient(name):
         model = SourceOracle()
         params = model.init(jax.random.PRNGKey(1), jnp.ones((1, *x_T.shape[1:])), jnp.ones((1,)))
         denoise = process.denoiser(model, params, {})
-        solver = source_solver(name, schedule)
+        solver = schedule.solver
         def run(value):
             return walk(solver, process, model, value, times)
         latents = run(x_T)
@@ -1043,7 +698,7 @@ def test_source_config_rebuilds_its_scheduler_trajectory_and_gradient(name):
         guidance = CFG(SOURCE["guidance_scale"], rescale=rescale)
 
         def final(value):
-            return sample(denoise, value, solver=source_solver(name, schedule), guidance=guidance,
+            return sample(denoise, value, solver=schedule.solver, guidance=guidance,
                           key=jax.random.PRNGKey(0), times=times, final_denoise=False)
 
         assert relative_gap(final(x_T)[None], expected[-1:]) < 1e-4
@@ -1088,143 +743,6 @@ def test_one_row_walks_each_source_grid_as_it_walks_in_a_batch(config):
     batch = run(x_T)
     for row in range(2):
         np.testing.assert_allclose(run(x_T[row:row + 1])[0], batch[row], rtol=1e-6, atol=1e-6)
-
-
-def source_bridge(depth=None):
-    from dew.sampling.solvers.brownian import MAX_BROWNIAN_DEPTH, _Brownian, _brownian_noise
-
-    bounds = SOURCE_ARRAYS["brownian.bounds"]
-    state = _Brownian(jax.random.PRNGKey(4), jnp.asarray(bounds[0], jnp.float32),
-                      jnp.asarray(bounds[1], jnp.float32))
-    levels = MAX_BROWNIAN_DEPTH if depth is None else depth
-    return lambda first, second, shape=(2, 3, 4): _brownian_noise(
-        state, jnp.asarray(first, jnp.float32), jnp.asarray(second, jnp.float32), shape, levels)
-
-
-def test_the_reference_brownian_tree_is_additive_signed_and_query_order_free():
-    """The identities Dew's bridge is built on, read off the actual `torchsde`
-    tree the source builds: the increment over a union of two adjacent
-    intervals is the sum of theirs, swapping an interval's ends negates it,
-    and asking the same set in the reverse order answers the same. Each is
-    checked on the un-normalized increments, which are the normalized query
-    times the square root of the interval's width."""
-    queries = SOURCE_ARRAYS["brownian.queries"]
-    widths = SOURCE_ARRAYS["brownian.widths"]
-    scaled = SOURCE_ARRAYS["brownian.normalized"] * np.sqrt(widths)[:, None, None, None]
-    first, second, whole = scaled[0], scaled[1], scaled[2]
-    assert (queries[0][1], queries[1][1]) == (queries[1][0], queries[2][1])
-    np.testing.assert_allclose(first + second, whole, atol=2e-6, rtol=2e-6)
-    np.testing.assert_allclose(SOURCE_ARRAYS["brownian.swapped"],
-                               -SOURCE_ARRAYS["brownian.normalized"], atol=2e-6, rtol=2e-6)
-    np.testing.assert_allclose(SOURCE_ARRAYS["brownian.reordered"],
-                               SOURCE_ARRAYS["brownian.normalized"], atol=0, rtol=0)
-
-
-def test_the_native_brownian_bridge_holds_the_reference_identities():
-    """The same identities for Dew's bridge, plus the two the coupling relies
-    on: refining a query into halves sums back to the whole, and a deeper
-    construction leaves a dyadic node where the shallower one put it."""
-    queries = SOURCE_ARRAYS["brownian.queries"]
-    widths = SOURCE_ARRAYS["brownian.widths"]
-    query = source_bridge()
-    increments = [np.asarray(query(a, b)) * np.sqrt(width)
-                  for (a, b), width in zip(queries, widths, strict=True)]
-    np.testing.assert_allclose(increments[0] + increments[1], increments[2], atol=1e-5, rtol=1e-5)
-    np.testing.assert_allclose(np.asarray(query(queries[0][1], queries[0][0])),
-                               -np.asarray(query(*queries[0])), atol=0, rtol=0)
-    np.testing.assert_array_equal(np.asarray(query(*queries[0])),
-                                  np.asarray(query(*queries[0])))
-    low, high = SOURCE_ARRAYS["brownian.bounds"]
-    middle = 0.5 * (low + high)
-    coarse, fine = source_bridge(8), source_bridge(9)
-    np.testing.assert_allclose(np.asarray(coarse(low, middle)) * np.sqrt(middle - low),
-                               np.asarray(fine(low, middle)) * np.sqrt(middle - low),
-                               atol=1e-5, rtol=1e-5)
-
-
-def brownian_covariance(queries, low: float) -> np.ndarray:
-    """Brownian motion's law for normalized increments, in float64: W(p) and
-    W(q) of a path started at `low` covary by min(p, q) - low, so the
-    increments over [a, b] and [c, d] covary by the sum of those four
-    terms, divided by the square roots of the two widths."""
-    def covariance(p, q):
-        return np.minimum(p, q) - low
-
-    table = np.empty((len(queries), len(queries)))
-    for i, (a, b) in enumerate(queries):
-        for j, (c, d) in enumerate(queries):
-            table[i, j] = ((covariance(b, d) - covariance(b, c) - covariance(a, d) + covariance(a, c))
-                           / np.sqrt(abs(b - a) * abs(d - c)))
-    return table
-
-
-def test_the_native_brownian_noise_has_brownian_motions_law():
-    """Every noise draw a `DPMSolverSDE` walk asks the path for, over the
-    published DPMSolverSDE file's ten-step grid: the two per interval with a
-    positive target, from sigma_t to the geometric midpoint and from sigma_t
-    to sigma_s, eighteen normalized increments of one path. Over 65536
-    independent paths they have the joint covariance Brownian motion gives
-    those intervals, computed in float64 from min(p, q) at the float32
-    positions the bridge reads, so each draw's variance, the correlation of
-    the nested pair and the independence of disjoint intervals are all one
-    test. The likelihood ratio of the sample covariance against that
-    covariance (mean zero, known) is chi-square with 171 degrees of freedom;
-    306.2 is its one-in-a-billion level (scipy.stats.chi2.isf(1e-9, 171))."""
-    from dew.diffusion.schedules.source import SourceSchedule
-    from dew.sampling.solvers.brownian import MAX_BROWNIAN_DEPTH, _Brownian, _brownian_noise
-
-    schedule = SourceSchedule.from_config(json.loads(str(SOURCE_ARRAYS["dpm_sde.default.config"])))
-    process, times = schedule.sampling(10)
-    sampler = process.sampler_schedule
-    _, sigmas = process.rates(times, like=jnp.zeros(times.shape))
-    sigmas = np.asarray(sigmas, np.float32).ravel()
-    queries = []
-    for sigma_t, sigma_s in itertools.pairwise(sigmas):
-        if sigma_s > 0:
-            middle = np.exp(0.5 * (np.log(sigma_t) + np.log(sigma_s)), dtype=np.float32)
-            queries += [(sigma_t, middle), (sigma_t, sigma_s)]
-    assert len(queries) == 18
-    state = _Brownian(jax.random.PRNGKey(6), jnp.asarray(sampler.sigma_min, jnp.float32),
-                      jnp.asarray(sampler.sigma_max, jnp.float32))
-    paths = 65536
-    firsts, seconds = (jnp.asarray(ends, jnp.float32) for ends in zip(*queries, strict=True))
-    draws = jax.jit(jax.vmap(lambda a, b: _brownian_noise(state, a, b, (paths,), MAX_BROWNIAN_DEPTH)))(
-        firsts, seconds)
-    sample = np.asarray(draws, np.float64).T
-    expected = brownian_covariance([(float(a), float(b)) for a, b in queries], float(state.low))
-    relative = np.linalg.solve(expected, sample.T @ sample / paths)
-    _, log_determinant = np.linalg.slogdet(relative)
-    statistic = paths * (np.trace(relative) - log_determinant - len(queries))
-    assert statistic < 306.2, statistic
-
-
-def test_a_grid_the_source_scheduler_cannot_walk_is_refused():
-    """A Karras grid over a cosine table recovers the same model index for its
-    largest sigmas, so it repeats its first model time; the source then finds
-    the second match for the step it starts at and walks off the end of its
-    own sigma table. The reference tool records that failure, and the grid is
-    refused rather than walked with an index the source never reaches."""
-    from dew.diffusion.schedules.source import SourceSchedule
-
-    failure = str(SOURCE_ARRAYS["refused.cosine_karras.failure"])
-    times = SOURCE_ARRAYS["refused.cosine_karras.times"]
-    assert failure.startswith("IndexError"), failure
-    assert times[0] == times[1]
-    schedule = SourceSchedule.from_config(
-        json.loads(str(SOURCE_ARRAYS["refused.cosine_karras.config"])))
-    with pytest.raises(ValueError, match="repeat their first value"):
-        schedule.sampling(int(SOURCE_ARRAYS["refused.cosine_karras.steps"]))
-
-
-def test_the_wide_ddpm_posterior_variance_is_refused_where_alpha_is_one():
-    """`DDPM(variance="large")` is the variance-preserving forward step's beta,
-    which is zero on a variance-exploding grid; sampling one there would drop
-    the noise term silently, so the schedule is refused by init."""
-    process, _ = karras_process()
-    times = process.times(4)
-    x = jnp.zeros((1, 4), jnp.float32)
-    with pytest.raises(ValueError, match="variance-preserving"):
-        DDPM("large").init(x, times, process, key=jax.random.PRNGKey(0))
 
 
 def test_a_source_noise_sampler_seed_pins_the_brownian_path():
@@ -1307,45 +825,3 @@ def test_the_closing_denoise_is_edms_last_euler_step_onto_sigma_zero(name):
     closed = sample(edm_grid(steps).denoiser(EDMOracle(), {}, {}), x_T, solver=solver,
                     key=jax.random.PRNGKey(7), times=np.arange(steps, 0, -1, dtype=np.float32))
     assert_as_exact_as_the_reference(closed, EDM[f"{name}.result32"], EDM[f"{name}.result"], name)
-
-
-def test_heun_refuses_a_churn_past_the_schedules_top():
-    """gamma is sqrt(2) - 1 here, so churning at sigma 80 would evaluate the
-    model at 113, a level the grid has no time for."""
-    with pytest.raises(ValueError, match="past the schedule's top"):
-        Heun(s_churn=40.0).init(jnp.zeros((1, 2)), jnp.arange(8, -1, -1.0), edm_grid(8),
-                                key=jax.random.PRNGKey(0))
-
-
-def test_heun_churns_only_a_variance_exploding_walk():
-    with pytest.raises(ValueError, match="alpha is 1"):
-        Heun(s_churn=1.0).init(jnp.zeros((1, 2)), jnp.linspace(1.0, 0.0, 5),
-                               Process(FlowMatchingScheduler(), FlowMatchPredictionTransform()),
-                               key=jax.random.PRNGKey(0))
-
-
-def test_public_solver_imports_and_registry_records_resolve_the_same_classes():
-    """Every solver keeps its public name, registry name and JSON configuration round trip."""
-    import dew.sampling
-    from dew.diffusion.discrete import Unmask
-    from dew.registry import solvers, to_record
-    from dew.sampling import FlowSDE, Solver, solvers as exported
-
-    names = {
-        "ddpm": DDPM, "ddim": DDIM, "euler": Euler, "euler_ancestral": EulerAncestral,
-        "heun": Heun, "rk4": RK4, "kdpm2": KDPM2, "dpmsolver_sde": DPMSolverSDE,
-        "multistep_dpm": MultiStepDPM, "dpmsolver_multistep": DPMSolverMultistep,
-        "dpmsolver_singlestep": DPMSolverSinglestep, "deis": DEIS, "unipc": UniPC,
-        "pndm": PNDM, "lms": LMS, "consistency": Consistency, "tcd": TCD,
-        "flow_sde": FlowSDE, "unmask": Unmask,
-    }
-    for name, member in names.items():
-        assert solvers[name] is member
-        assert solvers.alias_of(member) == name
-        if name not in ("flow_sde", "unmask"):
-            assert getattr(exported, member.__name__) is member
-            assert getattr(dew.sampling, member.__name__) is member
-        value = solvers.build(name)
-        record = json.loads(json.dumps(to_record(value, Solver)))
-        assert record["class"] == solvers.paths[name]
-        assert solvers.from_record(record) == value

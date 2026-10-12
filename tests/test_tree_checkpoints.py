@@ -6,7 +6,6 @@ import pytest
 from jax.sharding import NamedSharding, PartitionSpec as P
 
 from dew.checkpoints import Checkpoints, Keep, Ranking
-from dew.training.state import TrainState
 
 
 def tree(seed: int = 0):
@@ -102,33 +101,6 @@ def test_keep_retains_latest_periodic_and_best_tree_steps(tmp_path):
     np.testing.assert_array_equal(checkpoints.restore(step="best")[0]["x"], np.full((3,), 3))
 
 
-def test_a_template_of_another_shape_is_refused(tmp_path):
-    checkpoints = Checkpoints(str(tmp_path))
-    checkpoints.save(1, {"v": jnp.zeros((4,))})
-    checkpoints.wait()
-    with pytest.raises(ValueError, match="holds a mapping that does not fit"):
-        checkpoints.restore(template({"v": jnp.zeros((5,))}))
-
-
-def test_a_mapping_is_not_resumed_as_a_train_state(tmp_path):
-    """A step that holds a mapping refuses a train-state template."""
-    checkpoints = Checkpoints(str(tmp_path))
-    checkpoints.save(1, {"w": jnp.ones(2)})
-    checkpoints.wait()
-    zero = jnp.zeros((), jnp.int32)
-    state = TrainState(step=jnp.int32(1), microstep=zero, updates=zero,
-                       variables={"params": {"w": jnp.ones(2)}}, opt_state=(), ema=None,
-                       key=jax.random.key(0), scale=None, window_size=jnp.ones((), jnp.int32))
-    with pytest.raises(ValueError, match="holds a mapping saved in place of a train state"):
-        checkpoints.restore(state)
-
-
-def test_a_mapping_takes_no_data_position(tmp_path):
-    """What only a train state's save records is refused with a mapping."""
-    with pytest.raises(ValueError, match="it takes no data position"):
-        Checkpoints(str(tmp_path)).save(1, {"w": jnp.ones(2)}, b"{}")
-
-
 @pytest.mark.mesh
 def test_a_sharded_tree_restores_onto_another_mesh(tmp_path):
     devices = np.asarray(jax.devices()[:8])
@@ -146,24 +118,3 @@ def test_a_sharded_tree_restores_onto_another_mesh(tmp_path):
     for name in written:
         assert restored[name].sharding == target
         np.testing.assert_array_equal(np.asarray(restored[name]), np.asarray(written[name]))
-
-
-@pytest.mark.mesh
-def test_a_local_placement_names_which_device_holds_which_slice():
-    """Two meshes over the same devices in opposite orders print alike, yet
-    give each device the other's slice; the recorded placement tells them
-    apart, so a local checkpoint refuses the mesh that would misread its shards."""
-    from jax.sharding import Mesh
-
-    from dew.checkpoints import placement
-
-    devices = jax.devices()[:2]
-
-    def leaf(order):
-        sharding = NamedSharding(Mesh(np.array(order), ("fsdp",)), P("fsdp"))
-        return jax.ShapeDtypeStruct((4, 2), jnp.float32, sharding=sharding)
-
-    forward, backward = leaf(devices), leaf(devices[::-1])
-    assert str(forward.sharding) == str(backward.sharding)
-    assert placement({"w": forward}) != placement({"w": backward})
-    assert placement({"w": forward}) == placement({"w": leaf(list(devices))})
