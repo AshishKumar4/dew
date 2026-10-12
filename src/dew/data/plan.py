@@ -126,6 +126,14 @@ def _configuration(step: DataclassInstance) -> dict[str, JSON]:
     return configured
 
 
+_ENVIRONMENT = ("revision", "lock", "python", "platform", "clean")
+
+
+def _changed(saved: Mapping[str, object], current: Mapping[str, object]) -> tuple[str, ...]:
+    """The fields of a saved record that `current` does not repeat."""
+    return tuple(name for name in sorted(set(saved) | set(current)) if saved.get(name) != current.get(name))
+
+
 @dataclasses.dataclass(frozen=True)
 class Manifest:
     """The dependency manifest shared by an execution plan and its cache."""
@@ -211,6 +219,28 @@ class Manifest:
         recorded["steps"] = [json_value(dataclasses.asdict(step), "step") for step in self.steps]
         return recorded
 
+    def semantic(self) -> dict[str, JSON]:
+        """What the rows are, on any host: the pinned sources, each step's
+        identity and dependencies, the tokenizers and the fill."""
+        recorded = self.record()
+        recorded["steps"] = [
+            json_value({name: value for name, value in step.items() if name != "module_hash"}, "step")
+            for step in map(dataclasses.asdict, self.steps)
+        ]
+        return {name: value for name, value in recorded.items() if name not in _ENVIRONMENT}
+
+    def environment(self) -> dict[str, JSON]:
+        """The code and machine that ran the steps: Dew's revision and lock,
+        the interpreter, the platform and each external step module's bytes.
+        A step states a change to what it computes in its configuration or
+        declared identity; its module's bytes change with any edit to its
+        file, as Dew's revision does with any edit to Dew."""
+        recorded = self.record()
+        return {
+            **{name: recorded[name] for name in _ENVIRONMENT},
+            "modules": [step.module_hash for step in self.steps],
+        }
+
     @property
     def canonical(self) -> bytes:
         return _canonical(self.record())
@@ -242,7 +272,8 @@ class Plan:
         return {
             "version": self.version,
             "lowering": self.lowering,
-            "manifest": self.manifest.record(),
+            "manifest": self.manifest.semantic(),
+            "environment": self.manifest.environment(),
             "order": json_value(self.order, "order"),
             "derived": json_value(self.derived, "derived"),
             "topology": json_value(self.topology, "topology"),
@@ -255,6 +286,10 @@ class Plan:
     def check(
         self, saved: Mapping[str, object], *, resume: Literal["exact", "non-exact"] = "exact"
     ) -> tuple[str, ...]:
+        """Refuse a saved plan whose rows this plan does not make again: another
+        order, derived order fact, per-share topology or semantic manifest
+        (`Manifest.semantic`). A changed environment (`Manifest.environment`)
+        is returned and warned of, and refused for a per-share plan."""
         current = self.record()
         if (not self.manifest.exact or not saved.get("exact", False)) and resume != "non-exact":
             raise ValueError(
@@ -269,16 +304,19 @@ class Plan:
                 raise ValueError(f"saved data plan derived order {name} changed")
         if self.lowering == "per-share" and current["topology"] != saved.get("topology"):
             raise ValueError("saved per-share data plan topology changed (shares, workers or cycle length)")
-        old_manifest = record(saved.get("manifest"), "saved dependency manifest")
-        changes = tuple(
-            name
-            for name in sorted(set(old_manifest) | set(self.manifest.record()))
-            if old_manifest.get(name) != self.manifest.record().get(name)
+        changed = _changed(record(saved.get("manifest"), "saved data manifest"), self.manifest.semantic())
+        if changed:
+            raise ValueError(
+                f"saved data plan {', '.join(changed)} changed, so the records the saved position counts "
+                "are not this run's; resume with the sources, steps and tokenizers that wrote it"
+            )
+        changes = _changed(
+            record(saved.get("environment"), "saved data environment"), self.manifest.environment()
         )
         if changes and self.lowering == "per-share":
-            raise ValueError(f"saved per-share dependency manifest changed: {', '.join(changes)}")
+            raise ValueError(f"saved per-share data environment changed: {', '.join(changes)}")
         if changes:
-            _log.warning("data dependencies changed with identical derived order: %s", ", ".join(changes))
+            _log.warning("data environment changed under an unchanged plan: %s", ", ".join(changes))
         if self.volatile:
             _log.warning("resuming volatile data; fetched outcomes may differ")
         return changes

@@ -3,10 +3,13 @@
 import dataclasses
 import itertools
 import json
+import os
 from uuid import uuid4
 
 import grain.python as grain
 import numpy as np
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 
 from dew.data.cache import Cache
@@ -15,7 +18,7 @@ from dew.data.dataset import DataPartition, Loading
 from dew.data.mix import SearchBudget, TokenDeficit, token_weights
 from dew.data.pipeline import Artifact, Pipeline, Rejected
 from dew.data.plan import Manifest, Plan, StepIdentity, fingerprint
-from dew.data.sources import Memory
+from dew.data.sources import Files, Memory
 from dew.objectives.base import VALID_ROWS
 
 READ = Loading(workers=0, threads=1, read_buffer=0, worker_buffer=1)
@@ -201,6 +204,59 @@ def test_dependency_change_preserves_global_resume_only_when_derived_order_match
     changed = dataclasses.replace(changed, derived={"accepted_ids": fingerprint([1, 3, 7])})
     with pytest.raises(ValueError, match="accepted_ids"):
         changed.check(plan.record())
+
+
+def test_an_exact_resume_refuses_a_step_that_makes_other_values():
+    """Shift(1) and Shift(2) keep every row in its place, so the order and its
+    derived facts agree; the step's identity is what says the rows differ."""
+    def reader(by):
+        shifted = Pipeline(source(8)).map(Shift(by), rejects=False).shuffle(0).repeat().batch(2)
+        return compile(shifted, loading=READ).train(DataPartition())
+
+    first = reader(1)
+    try:
+        next(first)
+        state = first.get_state()
+    finally:
+        first.close()
+    other = reader(2)
+    try:
+        with pytest.raises(ValueError, match="saved data plan steps changed"):
+            other.set_state(state)
+    finally:
+        other.close()
+
+
+def test_an_exact_resume_refuses_a_rewritten_file_whose_token_split_keeps_its_spans(tmp_path):
+    """A Parquet file rewritten with as many documents of the same lengths and
+    no length column leaves the token split's spans and every order fact
+    alike; the file's pinned version in the source snapshot refuses it."""
+    path = tmp_path / "documents.parquet"
+
+    def write(start):
+        staged = tmp_path / "staged.parquet"
+        documents = [list(range(start + 4 * index, start + 4 * index + 4)) for index in range(4)]
+        pq.write_table(pa.table({"text": documents}), staged)
+        os.replace(staged, path)
+
+    def reader():
+        split = Pipeline(Files(str(path))).token_split(0.25, held=False).batch(1)
+        return compile(split, read="indexed", loading=READ).train(DataPartition())
+
+    write(0)
+    first = reader()
+    try:
+        next(first)
+        state = first.get_state()
+    finally:
+        first.close()
+    write(100)
+    rewritten = reader()
+    try:
+        with pytest.raises(ValueError, match="saved data plan source changed"):
+            rewritten.set_state(state)
+    finally:
+        rewritten.close()
 
 
 def test_lambda_identity_requires_explicit_non_exact_resume():
