@@ -6,6 +6,7 @@ the same treatment as the training maths.
 
 import itertools
 import os
+import threading
 import time
 
 import jax
@@ -699,21 +700,43 @@ def test_explicit_count_without_geometry_stays_strict(count):
             getattr(objective, count)(None, batch)
 
 
+class TickGatedTracker(RecordingTracker):
+    """Marks each step's tick, so an input can start a batch's delay only
+    when the loop has finished the step before and is about to ask for it."""
+
+    def __init__(self, steps):
+        super().__init__()
+        self.ticked = [threading.Event() for _ in range(steps + 1)]
+
+    def log(self, scalars, step):
+        super().log(scalars, step)
+        if "train/step_time_ms" in scalars:
+            self.ticked[step].set()
+
+
 def test_fit_reports_the_wait_on_input_and_a_later_compile():
-    """An input slower than the step shows as train/data_wait_ms once the
-    batches read ahead during the first compile are spent, and a batch of a
-    shape the loop has not met compiles inside its tick, which reports the
-    compile as train/compile_s; the ticks that compiled nothing report none."""
-    tracker = RecordingTracker()
+    """An input slower than the step shows as train/data_wait_ms, and a batch
+    of a shape the loop has not met compiles inside its tick, which reports the
+    compile as train/compile_s; the ticks that compiled nothing report none.
+
+    Each batch's 100 ms delay starts at the tick of the step before it, when
+    the loop is about to ask for it, so the loop waits nearly all of it however
+    long its own work between reads takes. A delay that ran beside the loop's
+    work would leave a wait of 100 ms less that work, which a loaded runner
+    stretched past 58 ms."""
+    steps = 10
+    tracker = TickGatedTracker(steps)
 
     def slow():
         rng = np.random.default_rng(0)
-        for rows in itertools.chain([BATCH] * 2, itertools.repeat(2 * BATCH)):
+        for index, rows in enumerate(itertools.chain([BATCH] * 2, itertools.repeat(2 * BATCH))):
+            if 0 < index <= steps:
+                tracker.ticked[index].wait()
             time.sleep(0.1)
             x = rng.normal(size=(rows, FEATURES)).astype(np.float32)
             yield {"x": x, "y": 2 * x[:, :2]}
 
-    make_trainer(tracker=tracker).fit(Data(slow), steps=10, log_every=1)
+    make_trainer(tracker=tracker).fit(Data(slow), steps=steps, log_every=1)
 
     ticks = [p for _, p in tracker.scalars if "train/step_time_ms" in p]
     assert len(ticks) == 10
