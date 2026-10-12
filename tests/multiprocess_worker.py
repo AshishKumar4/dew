@@ -1207,6 +1207,57 @@ def mode_evaluation_replicas(args) -> dict:
     return {"measured": measured, "no_consumer": unconsumed}
 
 
+def mode_evaluation_clocks(args) -> dict:
+    """Each rank evaluates from its own clocks, rank 1's ahead of rank 0's:
+    a draw that reads the schedule step and the event's key. Every rank
+    reports root's step and identity, and root's scores."""
+    import jax
+    import jax.numpy as jnp
+    import optax
+
+    from dew.artifacts import Representations
+    from dew.data import Dataset
+    from dew.objectives.base import Aux, Objective
+    from dew.training import Trainer
+
+    class Drawn(Objective):
+        def init(self, key, variables=None):
+            return {"params": {"offset": jnp.zeros(())}}
+
+        def loss(self, variables, batch, step):
+            return variables["params"]["offset"] ** 2, Aux({})
+
+        def evaluate(self, params, batch, step):
+            noise = jax.random.normal(step.key, batch["x"].shape) + step.step
+            return Representations(features=noise, labels=batch["x"][:, 0])
+
+    class Total:
+        name, reads = "total", Representations
+
+        def __call__(self, artifact, batch):
+            return float(jnp.sum(artifact.features))
+
+        def merge(self, accumulated, contribution):
+            return accumulated + contribution
+
+        def finalize(self, accumulated):
+            return accumulated
+
+    trainer = Trainer(Drawn(), optax.sgd(.01), key=jax.random.key(0))
+    state, _, _ = trainer.place()
+    # Four rows, each process its share of them.
+    share = 4 // jax.process_count()
+    rows = np.arange(4, dtype=np.float32)[jax.process_index() * share:][:share, None]
+    batch = {"x": rows}
+    data = Dataset(train=lambda partition: iter([batch]), val=lambda partition: iter([batch]), records=4,
+                   batch=4)
+    ahead = 4 * jax.process_index()
+    result = Evaluation.run(trainer.objective, state.variables, data.val, metrics=(Total(),), key=state.key,
+                            step=5 + ahead, schedule_step=jnp.asarray(3 + ahead, jnp.int32),
+                            mesh=trainer.device_mesh)
+    return {"step": result.step, "event": list(result.event_key), "scores": result.scalars}
+
+
 def _preview_objective(kind):
     """A preview-failure case's objective and a batch for it. A diffusion or masked
     objective's compiled sampler is a program of its own, which a case replaces
@@ -2258,6 +2309,7 @@ MODES = {"token_budget": mode_token_budget,
          "training_contract": mode_training_contract,
          "evaluation_contract": mode_evaluation_contract,
          "evaluation_replicas": mode_evaluation_replicas,
+         "evaluation_clocks": mode_evaluation_clocks,
          "builtin_preview_failures": mode_builtin_preview_failures,
          "profile_failure": mode_profile_failure, "pool_refusals": mode_pool_refusals}
 
