@@ -115,7 +115,7 @@ from dew.training.distributed import (
     prefetched_bytes,
     shard_batch,
 )
-from dew.training.evaluation import EvalSuite, Evaluation
+from dew.training.evaluation import EvalSuite, Evaluation, MetricScores
 from dew.training.interval import Interval
 from dew.training.memory import (
     climb_to,
@@ -299,58 +299,6 @@ class Plateau:
     def __post_init__(self):
         if self.evals < 1 or self.min_delta < 0 or not math.isfinite(self.min_delta):
             raise ValueError("Plateau needs evals >= 1 and min_delta >= 0")
-
-
-class _MetricValues[Statistics, Additions](Mapping):
-    def __init__(
-        self,
-        metrics: Sequence[Metric],
-        scores: Mapping[str, float],
-        objective: Objective[Statistics, Additions],
-    ):
-        self.objective = objective
-        self.metrics = tuple(metrics) + tuple(objective.scalars[name] for name in ('loss', *objective.shown)
-                                              if name == 'loss' or f'train/{name}' in scores)
-        self.scores = scores
-
-    def __getitem__(self, metric):
-        split = 'val'
-        if isinstance(metric, tuple):
-            split, metric = metric
-        if isinstance(metric, TrainingScalar):
-            if metric.owner is not self.objective:
-                raise KeyError("training score belongs to another objective")
-            return self.scores[f'train/{metric.name}']
-        if (
-            isinstance(metric, types.MethodType)
-            and metric.__name__ == "loss"
-            and metric.__self__ is self.objective
-        ):
-            return self.scores['train/loss']
-        if isinstance(metric, str):
-            if any(metric == f'{name}/{declared.name}' for name in {key.split('/')[0] for key in self.scores}
-                   for declared in self.metrics):
-                raise KeyError("index declared evaluation scores by metric object")
-            return self.scores[metric]
-        for declared in self.metrics:
-            if declared is metric:
-                return self.scores[f'{split}/{declared.name}']
-        raise KeyError("the score refers to a metric not passed to fit")
-
-    def __iter__(self):
-        for name in self.scores:
-            split, _, label = name.partition('/')
-            metric = next((metric for metric in self.metrics if metric.name == label), None)
-            yield (
-                name
-                if metric is None
-                else metric
-                if split == "val" or isinstance(metric, TrainingScalar)
-                else (split, metric)
-            )
-
-    def __len__(self):
-        return len(self.scores)
 
 
 def _suites(dataset: Dataset, validation: Mapping[str, Reader | EvalSuite] | None,
@@ -1974,7 +1922,7 @@ class Trainer(Generic[Loss, Effects]):
             else:
                 name = f'aggregate:{index}'
                 try:
-                    value = float(metric(_MetricValues(plan.scored, scores, self.objective)))
+                    value = float(metric(MetricScores(plan.scored, scores, self.objective)))
                 except KeyError:
                     value = float('nan')
             mode = selection.mode or 'min'
