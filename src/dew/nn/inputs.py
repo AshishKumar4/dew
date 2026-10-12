@@ -244,8 +244,9 @@ class Coordinates:
 
     `positions` `[B, S]` is each real token's place in its document, counted
     over real tokens. `segments` numbers each row's packed documents from 1,
-    0 on a padding slot; `valid` marks a real token, the caller's mask and a
-    nonzero segment; `starts` marks each document's first real token but a
+    0 on a padding slot, which a layer reading the segments keeps out;
+    `valid` is the caller's mask of real tokens; `starts` marks each
+    document's first real token but a
     row's first, which continues whatever state the row holds. Each is None
     where it holds nothing (one document a row, every token real, no start),
     which a layer's fast path reads as a static fact. `slots` is where a cache
@@ -273,17 +274,16 @@ def coordinates(shape: tuple[int, int] | None = None, *, segments=None, valid=No
     given = [x for x in (segments, valid, positions) if x is not None]
     shape = tuple(shape if shape is not None else jnp.shape(given[0]))[:2]
     length = shape[1]
-    if segments is not None:
-        segments = jnp.asarray(segments, jnp.int32)
-        valid = segments != 0 if valid is None else jnp.asarray(valid, bool) & (segments != 0)
-    elif valid is not None:
-        valid = jnp.asarray(valid, bool)
+    segments = None if segments is None else jnp.asarray(segments, jnp.int32)
+    valid = None if valid is None else jnp.asarray(valid, bool)
     for name, field in (("segments", segments), ("valid", valid)):
         if field is not None and field.shape != shape:
             raise ValueError(f"token coordinates are {shape}, got {name} {field.shape}")
-    starts = None if segments is None else document_starts(segments, valid)
+    starts = None if segments is None else document_starts(
+        segments, segments != 0 if valid is None else valid & (segments != 0))
     if positions is None:
         real = jnp.ones(shape, bool) if valid is None else valid
+        real = real if segments is None else real & (segments != 0)
         rank = jnp.cumsum(real, axis=1, dtype=jnp.int32) - 1
         first = 0 if starts is None else jax.lax.cummax(jnp.where(starts, rank, 0), axis=1)
         positions = jnp.where(real, rank - first, 0)
