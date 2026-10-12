@@ -460,10 +460,10 @@ def _sequence_mix(mixed, dt, segments, weights, *, scan, axis: str | None = None
 
     `mixed` `[B, S, conv_dim]` the projection, convolved in at least fp32,
     `dt` `[B, S, H]` in fp32, `segments` `[B, S]` or None, `weights` the
-    conv's taps and bias and the heads' `dt_bias`, `A` and `D`. Under `axis` the conv reads the previous shard's last `K-1` tokens
-    and segments by one `ppermute` (zeros on the first) and the scan is
-    corrected for the earlier shards' state (`_ssd`). A segment change resets
-    both wherever it falls."""
+    conv's taps and bias and the heads' `dt_bias`, `A` and `D`. Under `axis`
+    the conv reads the previous shard's last `K-1` tokens and segments by one
+    `ppermute` (zeros on the first) and the scan is corrected for the earlier
+    shards' state (`_ssd`). A segment change resets both wherever it falls."""
     taps, bias, dt_bias, A, D = weights
     width = taps.shape[1] - 1
     batch, length, channels = mixed.shape

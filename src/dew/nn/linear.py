@@ -95,7 +95,7 @@ def causal_conv1d(x, kernel, activation: bool = True, bias=None, *, valid=None, 
     pieces = ((x.shape[-1], None),) if parts is None else tuple(parts)
     if conv_refusal(x, kernel, pieces, dtype) is None:
         out = short_conv.conv(x, kernel, bias, None if valid is None else jnp.asarray(valid, jnp.int8),
-                              pieces, activation, L2NORM_EPS, dtype, False)
+                              pieces, activation=activation, eps=L2NORM_EPS, dtype=dtype, interpret=False)
         return out[0] if parts is None else out
     return xla_conv1d(x, kernel, activation, bias, valid=valid, parts=parts, dtype=dtype)
 
