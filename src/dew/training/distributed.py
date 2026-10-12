@@ -584,6 +584,10 @@ def batch_shardings(mesh: Mesh | AbstractMesh, batch: Batch) -> Placement[Batch]
 def shard_batch(mesh: Mesh, batch: Batch) -> Batch:
     """Assemble this process's share of each array into a globally sharded one.
 
+    The placed batch owns its memory. Reader buffers are borrowed until the
+    next batch, so placement copies them even when a CPU device could alias
+    their host memory.
+
     The share is the one `DataPartition.of(mesh)` names: that share's rows, each
     whole in every other dimension. A pool assembles one leaf per process,
     so every process has to hand this
@@ -610,7 +614,8 @@ def shard_batch(mesh: Mesh, batch: Batch) -> Batch:
         # for the tree: 74 us of host time a batch on an RTX 4080, and 174 on
         # 8 CPU devices, where a call per leaf took 105 and 222.
         return jax.device_put(jax.tree.map(
-            lambda leaf: leaf if isinstance(leaf, jax.Array) else np.asarray(leaf), batch), shardings)
+            lambda leaf: leaf if isinstance(leaf, jax.Array) else np.asarray(leaf), batch),
+            shardings, may_alias=False)
 
     def place(leaf, sharding: NamedSharding) -> jax.Array:
         # The share holds whole rows: `count` shares make the rows, and every
@@ -618,8 +623,21 @@ def shard_batch(mesh: Mesh, batch: Batch) -> Batch:
         # stage that spans processes picks its own slice out of it.
         local = leaf if isinstance(leaf, jax.Array) else np.asarray(leaf)
         shape = np.shape(local)
-        return jax.make_array_from_process_local_data(
-            sharding, local, (shape[0] * count, *shape[1:]) if shape else ())
+        global_shape = (shape[0] * count, *shape[1:]) if shape else ()
+        indices = sharding.addressable_devices_indices_map(global_shape)
+        shard_shape = sharding.shard_shape(global_shape)
+        # JAX's process-local constructor numbers the distinct shard starts
+        # within each dimension. Only rows are process-local here. Its callback
+        # placement can alias host views, so put these slices with ownership.
+        row_starts = sorted({index[0].start or 0 for index in indices.values() if index})
+        arrays = []
+        for device, index in indices.items():
+            assert index is not None
+            if shape and count > 1:
+                start = row_starts.index(index[0].start or 0) * shard_shape[0]
+                index = (slice(start, start + shard_shape[0]), *index[1:])
+            arrays.append(jax.device_put(local[index], device, may_alias=False))
+        return jax.make_array_from_single_device_arrays(global_shape, sharding, arrays)
 
     return jax.tree.map(place, batch, shardings)
 

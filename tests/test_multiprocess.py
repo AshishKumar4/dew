@@ -205,6 +205,13 @@ def test_the_global_batch_is_the_union_of_the_process_slices(two_processes):
     assert slices[0] == list(range(worker.BATCH // 2)), "process 0 did not get its own rows"
 
 
+@pytest.mark.distributed
+def test_process_placement_owns_its_reader_buffer(two_processes):
+    for report in two_processes:
+        assert not report["aliases_reader"]
+        assert report["preserved_rows"] == report["local_rows"]
+
+
 # --------------------------------------------------------------------------
 # The data pipeline across processes
 # --------------------------------------------------------------------------
