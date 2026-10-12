@@ -178,12 +178,14 @@ LENGTH = 20
 
 
 def stepped(mesh: MeshSpec, devices: int, **hybrid):
-    """One adam step of an untied tiny decoder on `mesh` over `devices`
+    """One SGD step of an untied tiny decoder on `mesh` over `devices`
     devices: its parameters' shardings, the compiled step's HLO, and the
-    loss and trained parameters."""
+    loss and trained parameters. SGD moves each parameter by its gradient
+    alone, where adam's normalized step turns a near-zero gradient's last
+    bits into a visible move."""
     batch = {"text": np.random.default_rng(0).integers(0, VOCAB, (2, LENGTH + 1)).astype(np.int32)}
     model = tiny(max_seq_len=LENGTH, tie_embeddings=False, **hybrid)
-    trainer = Trainer(LMObjective(model, LENGTH), optax.adam(1e-3), key=jax.random.key(0), mesh=mesh,
+    trainer = Trainer(LMObjective(model, LENGTH), optax.sgd(1e-2), key=jax.random.key(0), mesh=mesh,
                       layout=Layout(min_shard=TINY_SHARD), checkpoints=None, tracker=None)
     trainer.device_mesh = mesh.build(jax.devices()[:devices])
     state, shardings, _ = trainer.place()
