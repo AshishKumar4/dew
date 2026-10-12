@@ -520,6 +520,28 @@ def test_a_bf16_layer_with_wide_keys_hands_the_port_its_narrowed_operands(monkey
     assert called == [jnp.dtype(jnp.bfloat16)]
 
 
+def test_a_remat_policy_saves_the_ports_named_residuals_and_changes_no_gradient(monkeypatch):
+    """A block's remat policy may keep the rule's output and the port's saved decay and inverse
+    (`decoder_block.RESIDUALS`); the layer under `jax.checkpoint` with that policy gives the
+    gradients it gives without one, bitwise."""
+    from dew.nn.backbones.decoder_block import RematPolicy
+
+    policy = RematPolicy(save=("context", "delta_decay", "delta_inverse")).checkpoint_policy()
+    layer = layer_on(monkeypatch, port=True)
+    x = jax.random.normal(jax.random.key(71), (1, 64, 64))
+    params = layer.init(jax.random.key(73), x)
+
+    def loss(params):
+        return jnp.sum(layer.apply(params, x) ** 2)
+
+    want = jax.jit(jax.grad(loss))(params)
+    got = jax.jit(jax.grad(jax.checkpoint(loss, policy=policy)))(params)
+    for (path, mine), theirs in zip(jax.tree_util.tree_leaves_with_path(got), jax.tree.leaves(want),
+                                    strict=True):
+        np.testing.assert_array_equal(np.asarray(mine), np.asarray(theirs),
+                                      err_msg=jax.tree_util.keystr(path))
+
+
 def test_a_gpu_the_targets_do_not_list_runs_the_99_kb_tables():
     assert fla_gdn._config_key(jnp.bfloat16, target="sm100") == ("sm89", "bfloat16")
     assert fla_gdn._config_key(jnp.float16, target="sm120") == ("sm120", "bfloat16")
