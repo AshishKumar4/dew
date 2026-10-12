@@ -302,6 +302,27 @@ A persistent checkpoint can restore into a different, compatible placement throu
 
 Local checkpoints hold only the shards each process had, so they restore onto the placement they were written with. See [Training data](../concepts/data.md) for how datasets save their position.
 
+## Reading a checkpoint with Orbax alone
+
+A step directory is an ordinary Orbax checkpoint of one PyTree item, so Orbax opens it without Dew:
+
+<!-- not run: a fragment; the directory is a run's -->
+```python
+import orbax.checkpoint as ocp
+
+manager = ocp.CheckpointManager(directory, item_handlers=ocp.PyTreeCheckpointHandler())
+step = manager.latest_step()
+tree = manager.restore(step, args=ocp.args.PyTreeRestore())
+custom = manager.metadata(step).custom_metadata
+```
+
+`tree` holds the train state's fields by name (`step`, `microstep`, `updates`, `variables`, `opt_state`, `ema`, `key`, `scale`, `window_size`, `accumulation`) and, when the data iterator reported one, `position`; Orbax returns `key` as a typed PRNG key. Two things in it are Dew's encodings, each named in `custom`:
+
+- An EMA leaf whose path `custom["ema_deltas"]` lists holds byte planes (above): the average's bits are its weight's bits XOR the planes' bytes, plane `k` shifted left by `8 * k`, read as unsigned integers of the weight's width.
+- A collection of the variables or the EMA other than `params` lives in the run's `frozen/` store, one Orbax PyTree checkpoint per content digest; `custom["frozen"]` maps each tree's collection names to their digests, and `ocp.PyTreeCheckpointer().restore(directory / "frozen" / digest)` reads one.
+
+`Checkpoints.restore` reads all of this into a template's dtypes and placements, so a Dew run resumes through it; Orbax alone suits inspecting a run or carrying its weights elsewhere.
+
 ## Several hosts
 
 Every process of a pool writes its own shards of a persistent checkpoint. Process 0 writes the metadata and commits the step, and a restore reads shards that other processes wrote. So every process must read and write the same directory, on a shared filesystem or in a bucket. If each process wrote to a disk of its own, process 0 would commit steps without the other processes' shards, and those processes would see no step at all.
