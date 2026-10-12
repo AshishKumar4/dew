@@ -22,9 +22,11 @@ products at half an A100's cuBLAS rate (a 4096 by 14336 expert's forward
 8.4).
 """
 
+import abc
 import dataclasses
 import functools
 import itertools
+from collections.abc import Callable
 from typing import ClassVar
 
 import jax
@@ -79,16 +81,17 @@ def _rule(dtype: jnp.dtype) -> Tile:
     return Tile(**ragged_dot._hyperparam_selection_rule(np.dtype(dtype)), warps=4, stages=3)
 
 
-def _tiles(dtype: jnp.dtype) -> set[Tile]:
+def _tiles(dtype: jnp.dtype, staged: Callable[[Tile], int]) -> set[Tile]:
     """Every tile the tuner may measure: the ones an A100 sweep found
     fastest lie inside, and a tile whose staged operands overflow the GPU's
-    shared memory is left out."""
+    shared memory is left out. `staged` counts the elements one depth step
+    loads, and Pallas Triton's pipeline holds `stages - 1` such steps: an
+    A100 refuses exactly that many bytes."""
     limit = generation.gpu_target().shared_limit or 99 * 1024
     width = jnp.dtype(dtype).itemsize
-    return {Tile(m, n, k, warps, stages)
-            for m, n, k, warps, stages in itertools.product((64, 128, 256), (128, 256), (32, 64, 128),
-                                                            (4, 8), (2, 3, 4))
-            if (m * k + k * n) * width * stages <= limit}
+    tiles = (Tile(*shape) for shape in itertools.product((64, 128, 256), (128, 256), (32, 64, 128),
+                                                         (4, 8), (2, 3, 4)))
+    return {tile for tile in tiles if staged(tile) * width * (tile.stages - 1) <= limit}
 
 
 def _sizes(specs: list[jax.ShapeDtypeStruct], seed: int, rows: int) -> jax.Array:
@@ -111,7 +114,12 @@ class _GroupedLaunch(tuning.KernelOp):
         return _rule(ba.arguments['tokens'].dtype)
 
     def _get_autotuning_configs(self, ba) -> set[Tile]:
-        return _tiles(ba.arguments['tokens'].dtype)
+        return _tiles(ba.arguments['tokens'].dtype, self.staged)
+
+    @staticmethod
+    @abc.abstractmethod
+    def staged(tile: Tile) -> int:
+        """The elements of both operand tiles one depth step loads."""
 
     def operands(self, specs: list[jax.ShapeDtypeStruct], seed: int) -> list[jax.Array]:
         arrays = super().operands(specs, seed)
@@ -126,6 +134,10 @@ class Gmm(_GroupedLaunch):
     `kernel` `[groups, in, out]`, or of its transpose with `trans_rhs`."""
 
     ROWS: ClassVar[tuple[str, ...]] = ('tokens',)
+
+    @staticmethod
+    def staged(tile: Tile) -> int:
+        return (tile.block_m + tile.block_n) * tile.block_k
 
     def _fwd(self, tokens: jax.Array, kernel: jax.Array, sizes: jax.Array, *, out_dtype: str,
              trans_rhs: bool, interpret: bool, config: Tile, return_residuals: bool = False):
@@ -149,6 +161,10 @@ class Tgmm(_GroupedLaunch):
     kernel gradient `[groups, in, out]`."""
 
     ROWS: ClassVar[tuple[str, ...]] = ('tokens', 'cotangent')
+
+    @staticmethod
+    def staged(tile: Tile) -> int:
+        return tile.block_m * (tile.block_k + tile.block_n)
 
     def _fwd(self, tokens: jax.Array, cotangent: jax.Array, sizes: jax.Array, *, out_dtype: str,
              interpret: bool, config: Tile, return_residuals: bool = False):
