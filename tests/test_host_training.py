@@ -395,6 +395,36 @@ def test_a_host_step_differentiates_its_moving_leaves_only(monkeypatch):
     assert moving == every - 1
 
 
+def test_a_host_run_traces_its_forward_and_pullback_once():
+    """Every realization of a CPU-owned run, each step's and each microbatch
+    an accumulating window replays, runs one forward and one pullback
+    program. The retained forward hands back a pullback whose static part is
+    the same each attempt, where an eager vjp handed `_trainable_cotangent`
+    a new program to trace every time."""
+    import collections
+
+    traced = collections.Counter()
+
+    def count(event, duration, **metadata):
+        del duration
+        if event == "/jax/core/compile/jaxpr_trace_duration":
+            traced[metadata.get("fun_name")] += 1
+
+    jax.monitoring.register_event_duration_secs_listener(count)
+    try:
+        objective = LMObjective(decoder(), 8, head_chunks=1)
+        trainer = Trainer(objective, optax.adam(.01), key=jax.random.key(5), layout=HOST, accumulation=2)
+        state, _, _ = trainer.place()
+        batch = tokens()
+        step = trainer.compile(state, batch)
+        for _ in range(4):
+            state, *_ = step(state, batch)
+    finally:
+        jax.monitoring.unregister_event_duration_listener(count)
+    assert int(state.updates) == 2
+    assert (traced["_forward"], traced["_trainable_cotangent"]) == (1, 1), traced
+
+
 def test_streamed_banks_train_a_mixed_frozen_root_decoder_like_the_resident_stack(tmp_path):
     """Per-layer and per-leaf freezing through one banked decoder.
 
