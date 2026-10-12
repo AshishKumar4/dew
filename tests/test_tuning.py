@@ -78,7 +78,7 @@ import json
 from test_tuning import launches, operands, step
 from dew.nn.kernels import tuning
 print(json.dumps([{rows: launches(step(), *operands(rows)) for rows in (13, 15)},
-                  tuning.tune(step().lower(*operands(15)))]))
+                  tuning.tune(lambda: step().lower(*operands(15)))]))
 """
 
 
@@ -89,7 +89,9 @@ def test_a_steps_launches_take_pins_stored_picks_and_heuristics(tmp_path):
     process the picks stored for its device beside its compilation cache,
     for every token count in the bucket. Nothing measures on a CPU or beside
     other work on a GPU."""
-    found = tokamax.autotuning.get_bound_args(step(), *operands(15))
+    with tuning.launches():
+        found = tokamax.autotuning.get_bound_args(step(), *operands(15))
+        thirteen = tokamax.autotuning.get_bound_args(step(), *operands(13))
     ops = {type(ba.op): ba for ba in found}
     assert set(ops) == {norm_swiglu.RmsForward, norm_swiglu.RmsBackward, norm_swiglu.SwigluForward,
                         norm_swiglu.SwigluBackward}
@@ -97,8 +99,7 @@ def test_a_steps_launches_take_pins_stored_picks_and_heuristics(tmp_path):
     assert keys[norm_swiglu.RmsForward]["x"].shape == (16, 64)
     assert keys[norm_swiglu.RmsBackward]["dy"].shape == (16, 64)
     assert keys[norm_swiglu.SwigluBackward]["gate"].shape == (2048,)
-    assert keys == {type(ba.op): dict(ba.autotuning_cache_key)
-                    for ba in tokamax.autotuning.get_bound_args(step(), *operands(13))}
+    assert keys == {type(ba.op): dict(ba.autotuning_cache_key) for ba in thirteen}
 
     usual = launches(step(), *operands(15))
     assert usual["rms_norm_forward"] == ((1,), 4) and usual["swiglu_forward"] == ((2,), 4)
