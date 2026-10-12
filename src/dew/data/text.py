@@ -21,7 +21,7 @@ if TYPE_CHECKING:
     from jax.typing import ArrayLike
     from transformers import PreTrainedTokenizerBase
 
-    from dew.data.steps.text import Dropped, MinChars, Tokenize
+    from dew.data.steps.text import Chunks, Dropped, MinChars, Tokenize
 
 
 _load_lock = threading.Lock()
@@ -298,6 +298,16 @@ def tokenize(tokenizer: str | PreTrainedTokenizerBase = "byte", *, field: str = 
     from dew.data.steps.text import Tokenize
 
     return Tokenize(tokenizer_name(tokenizer), field, eos)
+
+
+def chunk(length: int, *, overlap: int = 0, fields: tuple[str, ...] = ("text",)) -> Chunks:
+    """An expansion (`flat_map`) that cuts a document's token `fields` into
+    pieces of at most `length`, overlapping by `overlap`, before `pack`, which
+    refuses a document longer than its window. For next-token training,
+    `overlap=1` keeps every target: pack to `length` with `seq_len=length`."""
+    from dew.data.steps.text import Chunks
+
+    return Chunks(length, fields, overlap)
 
 
 def drop(field: str = "caption", p: float = 0.1) -> Dropped:
