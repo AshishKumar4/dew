@@ -3,6 +3,7 @@
 Streamed-bank ownership and placement are Dew execution policies; Optax oracles the updates.
 """
 import dataclasses
+import json
 import os
 
 import jax
@@ -423,6 +424,60 @@ def test_a_host_run_traces_its_forward_and_pullback_once():
         jax.monitoring.unregister_event_duration_listener(count)
     assert int(state.updates) == 2
     assert (traced["_forward"], traced["_trainable_cotangent"]) == (1, 1), traced
+
+
+RESUMED = """
+import json, sys
+import jax, jax.numpy as jnp, optax
+events = []
+jax.monitoring.register_event_listener(lambda event, **_: events.append(event))
+from dew.training.runtime import prepare_process
+prepare_process(compilation_cache_dir=sys.argv[1])
+from dew.checkpoints import Checkpoints
+from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.objectives.lm import LMObjective
+from dew.training import Layout, Trainer
+host = sys.argv[3] == "host"
+model = CausalTransformer(vocab_size=16, emb_features=8, num_layers=2, num_heads=2, mlp_features=16,
+                          max_seq_len=8, scan_layers=True)
+trainer = Trainer(LMObjective(model, 8, head_chunks=1), optax.adam(.01), key=jax.random.key(5),
+                  layout=Layout(host=("variables",) if host else (), min_shard=1, tolerance=1.),
+                  checkpoints=Checkpoints(sys.argv[2]), tracker=None)
+state, _, _ = trainer.place()
+batch = {"text": jnp.tile(jnp.arange(1, 10, dtype=jnp.int32)[None], (jax.device_count(), 1))}
+before = len(events)
+run = trainer.compile(state, batch)
+for _ in range(2):
+    state, *_ = run(state, batch)
+jax.block_until_ready(state)
+window = events[before:]
+trainer.checkpoints.save(int(state.step), state)
+trainer.checkpoints.wait()
+print(json.dumps([window.count("/jax/compilation_cache/compile_requests_use_cache"),
+                  window.count("/jax/compilation_cache/cache_hits")]))
+"""
+
+
+@pytest.mark.parametrize("where", ["device", "host"])
+def test_a_resumed_run_loads_every_step_program_from_the_persistent_cache(tmp_path, where):
+    """A run resumed by a new process steps with the programs its first
+    process compiled: the restored state's leaves enter the step as the fresh
+    state's did, and a host run's forward and pullback are the same programs
+    each process. [lookups, hits] of the step's programs, first run then
+    resumed; a first host run hits programs its own placement compiled."""
+    import subprocess
+    import sys
+
+    from process_support import worker_env
+
+    runs = []
+    for _ in range(2):
+        command = [sys.executable, "-c", RESUMED, str(tmp_path / "cache"), str(tmp_path / "run"), where]
+        done = subprocess.run(command, capture_output=True, text=True, check=False, env=worker_env(1))
+        assert done.returncode == 0, done.stderr[-3000:]
+        runs.append(json.loads(done.stdout.strip().splitlines()[-1]))
+    lookups = runs[0][0]
+    assert lookups > 0 and runs[1] == [lookups, lookups], runs
 
 
 def test_streamed_banks_train_a_mixed_frozen_root_decoder_like_the_resident_stack(tmp_path):
