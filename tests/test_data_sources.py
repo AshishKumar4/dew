@@ -794,7 +794,7 @@ def test_arrayrecords_release_an_idle_mirror_before_opening_its_replacement(
         source.close()
 
 
-def test_arrayrecords_queue_a_missing_shard_when_every_retained_reader_is_busy(arrayrecord_paths, monkeypatch):
+def test_arrayrecords_wait_for_a_busy_reader_before_opening_a_missing_shard(arrayrecord_paths, monkeypatch):
     import grain.python as grain
 
     from dew.data.sources.records import ArrayRecords
