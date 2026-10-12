@@ -2218,7 +2218,7 @@ def mode_step_fits(args) -> dict:
     # own devices' memory, which a CPU device does not report.
     step = SimpleNamespace(memory_analysis=lambda: SimpleNamespace(
         output_size_in_bytes=100, alias_size_in_bytes=0, temp_size_in_bytes=100))
-    whole = step_fits(step, MeshSpec(fsdp=jax.device_count()).build())
+    whole, _ = step_fits(step, MeshSpec(fsdp=jax.device_count()).build())
     tight = [10, -1][args.process_id]
     return {"whole_mesh": whole, "tight": fits_everywhere(tight),
             "roomy": fits_everywhere(abs(tight)),

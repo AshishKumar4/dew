@@ -262,6 +262,20 @@ _LINKS: contextvars.ContextVar[Mapping[str, Link]] = contextvars.ContextVar(
     'links', default=types.MappingProxyType({}))
 
 
+def microbatched(value: jax.Array, axis: int, count: int) -> jax.Array:
+    """`[.., rows, ..]` as `[count, .., rows / count, ..]`: microbatch m takes
+    rows m, m + count, m + 2 * count, ...
+
+    A batch splits over its devices in blocks of consecutive rows. Strided,
+    each microbatch keeps a share of every block where the block is, as long
+    as `count` divides a block; cut into consecutive runs, each microbatch
+    would sit in one block and move to the devices of every other. A
+    pipeline's stages and a training step read in parts both cut so."""
+    shape = value.shape
+    split = value.reshape((*shape[:axis], shape[axis] // count, count, *shape[axis + 1:]))
+    return jnp.moveaxis(split, axis + 1, 0)
+
+
 @contextlib.contextmanager
 def measured_links(links: Mapping[str, Link]) -> Iterator[Mapping[str, Link]]:
     """Trace with `links`, each mesh axis's measured interconnect by axis

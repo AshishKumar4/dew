@@ -387,15 +387,16 @@ def _resident_memory_step():
 @pytest.mark.parametrize('options', [None, {'xla_embed_ir_in_executable': False}],
                          ids=['default', 'step_options'])
 def test_a_step_that_does_not_fit_compiles_again_one_rung_up(monkeypatch, options):
-    """A step that does not fit tiles the head first, then compiles again
-    under 'minimal', which fits, and stops there: a memory-tight step takes
-    the tiled head before any block is recomputed.
+    """A step whose batch the run reads whole (`split=1`) and that does not
+    fit tiles the head first, then compiles again under 'minimal' with the
+    whole logits, which fits, and stops there: a memory-tight step takes
+    the tiled head before any block is recomputed, and the whole logits
+    again at each rung it recomputes more.
 
     Where the device has step compiler options (the Triton GEMM fusions off
     on sm80 and sm89), a step that does not fit is compiled once more under
-    XLA's defaults before it climbs (`fitting_default`). So the headroom
-    answers by the rung it was compiled at, not by how many compiles came
-    before it."""
+    XLA's defaults, the half rung, before it climbs. So the headroom answers
+    by the rung it was compiled at, not by how many compiles came before it."""
     import optax
 
     from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -415,12 +416,12 @@ def test_a_step_that_does_not_fit_compiles_again_one_rung_up(monkeypatch, option
     monkeypatch.setattr(trainer_module, 'step_compiler_options', lambda objective, rows, frozen: options)
     model = CausalTransformer(vocab_size=32, emb_features=8, num_layers=1, num_heads=1,
                               mlp_features=16, max_seq_len=8)
-    trainer = Trainer(LMObjective(model, seq_len=4), optax.sgd(1e-3), key=jax.random.key(0))
+    trainer = Trainer(LMObjective(model, seq_len=4), optax.sgd(1e-3), key=jax.random.key(0), split=1)
     state, _, _ = trainer.place()
     trainer.compile(state, {'text': jnp.zeros((8, 5), jnp.int32)})
     # Each rung that does not fit is compiled once, or twice with options.
     tries = 1 if options is None else 2
-    assert compiled == [(False, None)] * tries + [(True, None)] * tries + [(True, 'minimal')]
+    assert compiled == [(False, None)] * tries + [(True, None)] * tries + [(False, 'minimal')]
     assert trainer.objective.model.remat == REMAT_POLICIES['minimal']
 
 
@@ -450,7 +451,8 @@ def recording_runs(monkeypatch, fits):
     def run():
         model = CausalTransformer(vocab_size=32, emb_features=8, num_layers=1, num_heads=1,
                                   mlp_features=16, max_seq_len=8)
-        current.append(Trainer(LMObjective(model, seq_len=4), optax.sgd(1e-3), key=jax.random.key(0)))
+        current.append(Trainer(LMObjective(model, seq_len=4), optax.sgd(1e-3), key=jax.random.key(0),
+                               split=1))
         state, _, _ = current[-1].place()
         current[-1].compile(state, {'text': jnp.zeros((8, 5), jnp.int32)})
         return current[-1]
@@ -484,7 +486,8 @@ def shape_runs(monkeypatch, fits):
     def fresh():
         model = CausalTransformer(vocab_size=32, emb_features=8, num_layers=1, num_heads=1,
                                   mlp_features=16, max_seq_len=8)
-        current.append(Trainer(LMObjective(model, seq_len=4), optax.sgd(1e-3), key=jax.random.key(0)))
+        current.append(Trainer(LMObjective(model, seq_len=4), optax.sgd(1e-3), key=jax.random.key(0),
+                               split=1))
         state, _, _ = current[-1].place()
         return current[-1], state
 
@@ -506,7 +509,8 @@ def test_each_shape_a_run_meets_climbs_from_the_runs_own_rung(monkeypatch):
     trainer, state = fresh()
     compile_rows(trainer, state, 16)
     compile_rows(trainer, state, 8)
-    assert compiled == [(16, False, None), (16, True, None), (16, True, 'minimal'), (8, False, None)]
+    assert compiled == [(16, False, None), (16, True, None), (16, False, 'minimal'), (16, True, 'minimal'),
+                        (8, False, None)]
 
 
 def test_a_checkpoint_records_each_shapes_rung_and_a_resumed_run_compiles_each_there(monkeypatch, tmp_path):
@@ -599,7 +603,7 @@ def refusing_trainer(monkeypatch, refused, error="RESOURCE_EXHAUSTED: Ran out of
     monkeypatch.setattr(trainer_module, 'step_compiler_options', lambda objective, rows, frozen: None)
     model = CausalTransformer(vocab_size=32, emb_features=8, num_layers=1, num_heads=1,
                               mlp_features=16, max_seq_len=8)
-    trainer = Trainer(LMObjective(model, seq_len=4), optax.sgd(1e-3), key=jax.random.key(0))
+    trainer = Trainer(LMObjective(model, seq_len=4), optax.sgd(1e-3), key=jax.random.key(0), split=1)
     return trainer, attempts
 
 
@@ -608,7 +612,7 @@ def test_a_step_xla_refuses_for_memory_compiles_again_one_rung_up(monkeypatch):
     refuses one that does not fit, so there is no executable to measure: on
     a v6e Qwen3-0.6B at 16 x 1024 tokens died at the bottom rung, 38.47G of
     temporaries for 31.24G of HBM. The refusal is the step not fitting, and
-    the ladder climbs: the head tiles, then the remat."""
+    the ladder climbs: the head tiles, then the remat, with the whole logits."""
     import numpy as np
 
     from dew.nn.backbones.decoder_block import REMAT_POLICIES
@@ -618,27 +622,28 @@ def test_a_step_xla_refuses_for_memory_compiles_again_one_rung_up(monkeypatch):
     batch = {'text': jnp.zeros((8, 5), jnp.int32)}
     executable = trainer.compile(state, batch)
 
-    assert attempts == [(False, None), (True, None), (True, 'minimal')]
+    assert attempts == [(False, None), (True, None), (False, 'minimal')]
     assert trainer.objective.model.remat == REMAT_POLICIES['minimal']
     state, loss, *_ = executable(state, batch)
     assert np.isfinite(float(loss))
-    assert trainer._rung() == {'head_tile': list(trainer.objective.head_tile), 'remat': 'minimal',
-                               'xla_defaults': False}
+    assert trainer._rung() == {'head_tile': None, 'remat': 'minimal', 'xla_defaults': False}
 
 
 def test_a_step_xla_refuses_at_every_rung_raises_its_refusal(monkeypatch):
-    """Where XLA refuses the last rung too, the run stops with the refusal it
-    already gave, with no compile of that rung again: on a large program each
-    one costs minutes."""
+    """Where XLA refuses the last rung too, the run stops naming every
+    candidate it compiled, from the refusal it already gave, with no compile
+    of that rung again: on a large program each one costs minutes."""
     remats = (None, 'minimal', 'save_dot_except_mlp', 'full')
     rungs = {(tiled, remat) for tiled in (False, True) for remat in remats}
     trainer, attempts = refusing_trainer(monkeypatch, rungs)
     state, _, _ = trainer.place()
 
-    with pytest.raises(jax.errors.JaxRuntimeError, match="RESOURCE_EXHAUSTED: Ran out of memory on HBM"):
+    with pytest.raises(RuntimeError, match="fits no plan of its batch: the last, 1 x 8 rows at remat "
+                       "'full', the head tiled, XLA refused for memory") as refused:
         trainer.compile(state, {'text': jnp.zeros((8, 5), jnp.int32)})
-    assert attempts == [(False, None), (True, None), (True, 'minimal'), (True, 'save_dot_except_mlp'),
-                        (True, 'full')]
+    assert isinstance(refused.value.__cause__, jax.errors.JaxRuntimeError)
+    assert "RESOURCE_EXHAUSTED: Ran out of memory on HBM" in str(refused.value.__cause__)
+    assert attempts == [(tiled, remat) for remat in remats for tiled in (False, True)]
 
 
 def test_a_compile_error_that_is_not_about_memory_is_not_a_rung(monkeypatch):
