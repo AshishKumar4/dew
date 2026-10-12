@@ -35,6 +35,8 @@ class ArrayRecords:
     Busy readers stay open until their reads drain. With as many readers as
     read threads, a thread asking for a new shard holds none, so at least one
     retained reader is idle and can release its mirror before the new open.
+    More read threads than retained readers queue on missing shard opens
+    until a reader drains.
     """
 
     def __init__(
@@ -55,7 +57,7 @@ class ArrayRecords:
             raise ValueError("ArrayRecord counts must name every physical shard with a nonnegative row count")
         self._pins = []
         self._opened: OrderedDict[int, _OpenedShard] = OrderedDict()
-        self._lock = threading.Lock()
+        self._lock = threading.Condition(threading.Lock())
 
     @cached_property
     def ends(self) -> tuple[int, ...]:
@@ -95,6 +97,12 @@ class ArrayRecords:
         if self.counts is not None:
             shard = bisect.bisect_right(self.ends, index)
             with self._lock:
+                while (
+                    shard not in self._opened
+                    and len(self._opened) >= _MAX_OPEN_SHARDS
+                    and all(opened.reads for opened in self._opened.values())
+                ):
+                    self._lock.wait()
                 if shard not in self._opened:
                     if len(self._opened) >= _MAX_OPEN_SHARDS:
                         idle = next(key for key, opened in self._opened.items() if not opened.reads)
@@ -117,8 +125,10 @@ class ArrayRecords:
                 with self._lock:
                     opened_shard.reads -= 1
                     # A reopened shard owns a different reader from an evicted in-flight read.
-                    if not opened_shard.reads and self._opened.get(shard) is not opened_shard:
-                        opened_shard.reader.close()
+                    if not opened_shard.reads:
+                        if self._opened.get(shard) is not opened_shard:
+                            opened_shard.reader.close()
+                        self._lock.notify_all()
         payload = self.reader[index]
         if not self.record_codec:
             return payload
@@ -139,7 +149,7 @@ class ArrayRecords:
         self.__dict__.update(state)
         self._pins = []
         self._opened = OrderedDict()
-        self._lock = threading.Lock()
+        self._lock = threading.Condition(threading.Lock())
 
     def close(self) -> None:
         with self._lock:
@@ -147,6 +157,7 @@ class ArrayRecords:
                 if not opened.reads:
                     opened.reader.close()
             self._opened.clear()
+            self._lock.notify_all()
         self.__dict__.pop("reader", None)
         for pin in self._pins:
             pin.close()
