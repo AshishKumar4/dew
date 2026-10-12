@@ -17,7 +17,6 @@ from dew.data.storage import Store
 
 from .codec import decode
 
-
 _MAX_OPEN_SHARDS = Loading().threads
 
 
