@@ -36,7 +36,6 @@ Two more fixtures:
 
 from __future__ import annotations
 
-import ast
 import copy
 import json
 import sys
@@ -47,6 +46,7 @@ from pathlib import Path
 import jax
 import numpy as np
 import torch
+from reference_source import definitions
 
 REPA = "https://raw.githubusercontent.com/sihyun-yu/REPA/67f714503e3892f993844aab088ffc5791c92613/"
 IREPA = "https://raw.githubusercontent.com/End2End-Diffusion/iREPA/99ad4ac234efe8de52ce157120f72856e836d09f/ldm/"
@@ -57,19 +57,6 @@ from reference_error import ORDERS, distance  # noqa: E402
 from residual_orders import orders  # noqa: E402
 
 GAMMA = 0.6
-
-
-def extracted(url: str, names: tuple[str, ...], scope: dict) -> dict:
-    """The named top-level definitions of the file at `url`, run as published."""
-    text = urllib.request.urlopen(url).read().decode()
-    for node in ast.parse(text).body:
-        if isinstance(node, ast.Assign):
-            defined = {target.id for target in node.targets if isinstance(target, ast.Name)}
-        else:
-            defined = {node.name} if isinstance(node, (ast.FunctionDef, ast.ClassDef)) else set()
-        if defined & set(names):
-            exec(ast.get_source_segment(text, node), scope)
-    return scope
 
 
 def projection_loss(zs, zs_tilde) -> torch.Tensor:
@@ -90,10 +77,10 @@ def dense(layer: torch.nn.Linear) -> dict:
 
 def main() -> None:
     FIXTURE.mkdir(parents=True, exist_ok=True)
-    repa = extracted(REPA + "models/sit.py", ("build_mlp",), {"nn": torch.nn})
-    irepa = extracted(IREPA + "models/sit.py", ("build_mlp", "ProjectionLayer", "ALL_PROJECTION_LAYER_TYPES"),
+    repa = definitions(REPA + "models/sit.py", ("build_mlp",), {"nn": torch.nn})
+    irepa = definitions(IREPA + "models/sit.py", ("build_mlp", "ProjectionLayer", "ALL_PROJECTION_LAYER_TYPES"),
                       {"nn": torch.nn, "math": __import__("math")})
-    zscore = extracted(IREPA + "utils.py", ("spatial_zscore",), {"torch": torch})["spatial_zscore"]
+    zscore = definitions(IREPA + "utils.py", ("spatial_zscore",), {"torch": torch})["spatial_zscore"]
     generator = torch.Generator().manual_seed(0)
     hidden = torch.randn(BATCH, SIDE * SIDE, WIDTH, generator=generator)
     features = torch.randn(BATCH, SIDE * SIDE, FEATURES, generator=generator) + 0.7
@@ -178,13 +165,13 @@ def composed() -> None:
                "block": generator.standard_normal((width, width)) * 0.5,
                "head": generator.standard_normal((width, flat)) * 0.4}
     encoder = generator.standard_normal((flat, settings["features"])) * 0.3
-    repa = extracted(REPA + "models/sit.py", ("build_mlp",), {"nn": torch.nn})
+    repa = definitions(REPA + "models/sit.py", ("build_mlp",), {"nn": torch.nn})
     torch.manual_seed(3)
     projector = repa["build_mlp"](width, settings["projector"], settings["features"])
     from torchvision.transforms import Normalize
-    preprocess = extracted(REPA + "train.py", ("preprocess_raw_image",),
+    preprocess = definitions(REPA + "train.py", ("preprocess_raw_image",),
                            {"torch": torch, "Normalize": Normalize, **TIMM})
-    loss_scope = extracted(REPA + "loss.py", ("SILoss", "mean_flat"), {"torch": torch, "np": np})
+    loss_scope = definitions(REPA + "loss.py", ("SILoss", "mean_flat"), {"torch": torch, "np": np})
     # DiffusionObjective.loss's draws: split(key, 5), times from the third key, noise the fourth.
     keys = jax.random.split(jax.random.key(settings["key"]), 5)
     times = np.array(jax.random.uniform(keys[2], (b,)))
@@ -259,12 +246,12 @@ def preprocessed() -> None:
     generator = np.random.default_rng(12)
     pixels = generator.integers(0, 256, (2, 256, 256, 3), dtype=np.uint8)
     from torchvision.transforms import Normalize
-    repa = extracted(REPA + "train.py", ("preprocess_raw_image",),
+    repa = definitions(REPA + "train.py", ("preprocess_raw_image",),
                      {"torch": torch, "Normalize": Normalize, **TIMM})
-    irepa = extracted(IREPA + "vision_encoder.py", ("DINOv2Encoder",),
+    irepa = definitions(IREPA + "vision_encoder.py", ("DINOv2Encoder",),
                       {"torch": torch, "Normalize": Normalize, "VisionEncoder": object, "Dict": dict,
                        "Optional": object, **TIMM})
-    zscore = extracted(IREPA + "utils.py", ("spatial_zscore",), {"torch": torch})["spatial_zscore"]
+    zscore = definitions(IREPA + "utils.py", ("spatial_zscore",), {"torch": torch})["spatial_zscore"]
     arrays = {"pixels": pixels, "gamma": np.asarray(GAMMA)}
     for dtype, suffix in ((torch.float64, "_f64"), (torch.float32, "")):
         raw = torch.as_tensor(pixels, dtype=dtype).permute(0, 3, 1, 2)

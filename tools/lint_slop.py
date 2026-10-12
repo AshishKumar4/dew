@@ -810,10 +810,14 @@ def imports(module: Module) -> Iterator[Finding]:
     """SLOP013: importing the module changes process-wide state."""
     for statement in _module_level(module.tree.body):
         for node in ast.walk(statement):
-            written = isinstance(node, ast.Assign) and any(
-                isinstance(target, ast.Subscript) and _named(target.value).endswith("environ")
-                for target in node.targets)
-            if written or (isinstance(node, ast.Call) and _named(node.func).endswith(GLOBAL_WRITES)):
+            if isinstance(node, ast.Assign):
+                written = any(isinstance(target, ast.Subscript) and _named(target.value).endswith("environ")
+                              for target in node.targets)
+            elif isinstance(node, ast.Call):
+                written = _named(node.func).endswith(GLOBAL_WRITES)
+            else:
+                continue
+            if written:
                 yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP013",
                               "changes process-wide state at import; do it where the caller asks for it")
 
