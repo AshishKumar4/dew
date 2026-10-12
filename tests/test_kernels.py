@@ -409,6 +409,38 @@ def test_packed_sequences_attend_within_themselves_as_far_from_float64_as_one_at
                 assert_as_exact_as_the_reference(got, theirs, want, f"{name} of the document at {begin}")
 
 
+@pytest.mark.mesh(devices=2)
+@pytest.mark.parametrize("axis, split", [("data", (0,)), ("tensor", (2,))])
+def test_flash_keeps_the_kernel_contract_on_a_mesh(axis, split, without_deterministic_ops):
+    """FlashAttention-2 over rows split two ways, or query heads split two ways with the key heads
+    they read, runs per shard (`sharded.assert_runs_per_shard`): the output and the three input
+    gradients within the float64 gate of one device's, no operand moved between devices and no
+    copy or transpose at the kernel's edge."""
+    from jax.sharding import Mesh, PartitionSpec
+    from sharded import assert_runs_per_shard
+
+    flash_here()
+    query, _, _ = qkv((2, 256, 4, 64))
+    _, key, value = qkv((2, 256, 2, 64), seed=1)
+    cotangent = qkv((2, 256, 4, 64), seed=2)[0]
+
+    def gradients(attend):
+        def run(q, k, v, do):
+            out, pull = jax.vjp(attend, q, k, v)
+            return out, *pull(do)
+
+        return run
+
+    with jax.enable_x64(new_val=True):
+        wide = [jnp.asarray(np.asarray(x, np.float64)) for x in (query, key, value, cotangent)]
+        attend = jax.vmap(functools.partial(float64_attention, causal=True))
+        truth = jax.tree.map(np.asarray, gradients(attend)(*wide))
+    spec = PartitionSpec(*(axis if dim in split else None for dim in range(3)))
+    mesh = Mesh(np.asarray(jax.devices()[:2]), (axis,))
+    flash = functools.partial(scaled_dot_product_attention, implementation='flash', causal=True)
+    assert_runs_per_shard(gradients(flash), (query, key, value, cotangent), [spec] * 4, mesh, truth)
+
+
 @on_gpu
 @pytest.mark.parametrize("head_dim", [128, 256])
 def test_flash_is_as_exact_as_the_xla_kernel_from_float64(head_dim, without_deterministic_ops):

@@ -6,6 +6,7 @@ speed against fla's kernels are the GPU session's (c53 onwards).
 """
 
 import functools
+import itertools
 
 import fla_gdn_support as support
 import jax
@@ -227,7 +228,7 @@ def test_the_state_write_retains_the_bf16_gated_value_residual_on_chip():
     """A gated value at a bf16 midpoint must not lose its residual before the fp32 state write."""
     key = jnp.ones((1, 1), jnp.bfloat16)
     gated = jnp.full((1, 1), 1.00390625, jnp.float32)
-    got = fla_gdn._gated_state_write(key, gated, exact=True)
+    got = fla_gdn._split_dot(key.T, gated, exact=True)
     assert got.dtype == jnp.float32
     assert float(got[0, 0]) == 1.00390625
     rounded = key.astype(jnp.float32).T @ gated.astype(jnp.bfloat16).astype(jnp.float32)
@@ -295,6 +296,29 @@ def test_the_wy_backward_kernel_is_the_gradient_of_flas_wy_representation():
         assert relative(mine, theirs) < 1e-4, name
 
 
+@pytest.mark.parametrize("value_heads", [2, 4])
+def test_the_wy_backward_adds_the_keys_gradient_so_far_once_per_key_head(value_heads):
+    """Given the query-side kernel's key gradient, the WY backward returns its own plus that one,
+    summed in fp32 before the one rounding, the earlier gradient counted once for each key head
+    whatever its group of value heads; the rest of its outputs are unchanged."""
+    batch, length, key_heads, width, columns = 1, 128, 2, 64, 64
+    keys = jax.random.split(jax.random.key(14), 8)
+    k = l2norm(jax.random.normal(keys[0], (batch, length, key_heads, width)))
+    v = jax.random.normal(keys[1], (batch, length, value_heads, columns))
+    beta = jax.nn.sigmoid(jax.random.normal(keys[2], (batch, length, value_heads)))
+    step = -jnp.exp(jax.random.normal(keys[3], (batch, length, value_heads)) - 3.0) * fla_gdn.RCP_LN2
+    g = jnp.cumsum(step.reshape(batch, length // 64, 64, value_heads), axis=2).reshape(step.shape)
+    a = jnp.tril(jax.random.normal(keys[4], (batch, length, value_heads, 64)) * 0.1)
+    dw = jax.random.normal(keys[5], (batch, length, value_heads, width))
+    du = jax.random.normal(keys[6], (batch, length, value_heads, columns))
+    earlier = jax.random.normal(keys[7], k.shape)
+    alone = fla_gdn.prepare_wy_repr_bwd(k, v, beta, g, a, dw, du, interpret=INTERPRETED)
+    joined = fla_gdn.prepare_wy_repr_bwd(k, v, beta, g, a, dw, du, earlier, interpret=INTERPRETED)
+    assert relative(joined[0], alone[0] + earlier) < 1e-6
+    for name, mine, theirs in zip(("dv", "db", "dg"), joined[1:], alone[1:], strict=True):
+        np.testing.assert_array_equal(np.asarray(mine), np.asarray(theirs), err_msg=name)
+
+
 def rule_math(q, k, v, g, beta, h0):
     """The gated delta rule token by token, in whatever dtype it is given: the reference both paths
     are held to, run in float64."""
@@ -329,7 +353,7 @@ def test_the_ported_rule_and_its_gradients_follow_the_recurrence(dtype, bound):
     scale = width ** -0.5
 
     def ported(*args):
-        out, final = fla_gdn.chunk_gated_delta_rule(*args, scale, 64, INTERPRETED)
+        out, final = fla_gdn.chunk_gated_delta_rule(*args, None, scale, 64, INTERPRETED)
         return jnp.sum(out.astype(jnp.float32) * do.astype(jnp.float32)) + jnp.sum(final * dht), (out, final)
 
     (_, (out, final)), grads = jax.value_and_grad(ported, argnums=(0, 1, 2, 3, 4, 5), has_aux=True)(
@@ -399,6 +423,63 @@ def test_dews_fla_rule_follows_the_recurrence_for_any_heads_widths_and_length(
     names = ("out", "final", "q", "k", "v", "g", "beta", "h0")
     for name, mine, theirs in zip(names, port, truth, strict=True):
         assert mine.shape == theirs.shape, name
+        assert relative(mine, theirs) < 1e-4, name
+
+
+def test_dews_fla_rule_runs_packed_documents_as_flas_varlen_sequences():
+    """Packed documents (`starts`, at most `max_segments` a row) as fla's varlen sequences: each
+    document from a zero memory but a row's first, from the row's, the row's final memory its last
+    document's; output, final memory and gradients within fp32 rounding of the token recurrence run
+    document by document in float64. Documents start on and off the chunk grid, one shorter than a
+    chunk and one longer."""
+    batch, length, key_heads, value_heads, width = 2, 150, 1, 2, 64
+    cuts = ((0, 37, 100), (0, 64))
+    starts = np.zeros((batch, length), bool)
+    for row, begins in enumerate(cuts):
+        starts[row, list(begins[1:])] = True
+    keys = jax.random.split(jax.random.key(19), 8)
+    q = l2norm(jax.random.normal(keys[0], (batch, length, key_heads, width)))
+    k = l2norm(jax.random.normal(keys[1], (batch, length, key_heads, width)))
+    v = jax.random.normal(keys[2], (batch, length, value_heads, width))
+    g = -jnp.exp(jax.random.normal(keys[3], (batch, length, value_heads)) - 3.0)
+    beta = jax.nn.sigmoid(jax.random.normal(keys[4], (batch, length, value_heads)))
+    h0 = 0.1 * jax.random.normal(keys[5], (batch, value_heads, width, width))
+    do = jax.random.normal(keys[6], v.shape)
+    dht = 0.1 * jax.random.normal(keys[7], h0.shape)
+    group = value_heads // key_heads
+
+    def documents(q, k, v, g, beta, h0):
+        """The recurrence document by document, each row's first from its memory."""
+        q, k = jnp.repeat(q, group, axis=2), jnp.repeat(k, group, axis=2)
+        outs, finals = [], []
+        for row, begins in enumerate(cuts):
+            state, pieces = h0[row:row + 1], []
+            for begin, end in itertools.pairwise((*begins, length)):
+                state = state if begin == 0 else jnp.zeros_like(state)
+                out, state = rule_math(*(x[row:row + 1, begin:end] for x in (q, k, v, g, beta)), state)
+                pieces.append(out)
+            outs.append(jnp.concatenate(pieces, axis=1))
+            finals.append(state)
+        return jnp.concatenate(outs), jnp.concatenate(finals)
+
+    def through(rule, do, dht):
+        def loss(*args):
+            out, final = rule(*args)
+            return jnp.sum(out * do) + jnp.sum(final * dht), (out, final)
+
+        def run(*args):
+            (_, (out, final)), grads = jax.value_and_grad(loss, argnums=range(6), has_aux=True)(*args)
+            return out, final, *grads
+
+        return run
+
+    packed = functools.partial(fla_rule, starts=jnp.asarray(starts), max_segments=3)
+    port = through(packed, do, dht)(q, k, v, g, beta, h0)
+    with jax.enable_x64(new_val=True):
+        operands = wide(q, k, v, g, beta, h0, do, dht)
+        truth = jax.tree.map(np.asarray, through(documents, *operands[6:])(*operands[:6]))
+    names = ("out", "final", "q", "k", "v", "g", "beta", "h0")
+    for name, mine, theirs in zip(names, port, truth, strict=True):
         assert relative(mine, theirs) < 1e-4, name
 
 
@@ -522,7 +603,8 @@ def test_a_bf16_layer_with_wide_keys_hands_the_port_its_narrowed_operands(monkey
     the fp32 ones its convolution leaves, so the port takes it."""
     called = []
 
-    def recorded(query, key, value, g, beta, state):
+    def recorded(query, key, value, g, beta, state, *, starts, max_segments):
+        del starts, max_segments  # an unpacked layer's
         called.append(key.dtype)
         return linear.chunk_delta_rule(jnp.repeat(query, 2, axis=2).astype(jnp.float32),
                                        jnp.repeat(key, 2, axis=2).astype(jnp.float32),

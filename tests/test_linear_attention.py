@@ -36,7 +36,7 @@ import pytest
 from flax import linen as nn
 from reference_error import assert_as_exact_as_the_reference
 
-from dew.nn.inputs import AttentionMetadata
+from dew.nn.inputs import AttentionMetadata, coordinates
 from dew.nn.linear import (
     GatedDeltaNet,
     _masked_conv1d,
@@ -506,7 +506,7 @@ def test_the_layer_reads_a_holed_row_as_the_row_without_its_holes(reference, geo
 
     alone = module.apply(variables, hidden)
     holed = module.apply(variables, spread,
-                         attention_metadata=AttentionMetadata(valid=valid))
+                         attention_metadata=AttentionMetadata(coordinates=coordinates(valid=valid)))
 
     assert largest(holed[:, kept], alone) < 1e-5
     assert jnp.array_equal(holed[:, jnp.asarray([2, 3, 6])],
@@ -546,23 +546,32 @@ def test_a_right_padded_row_convolves_as_the_masked_conv(case, history):
 
 def test_a_right_padded_layer_keeps_its_real_tokens_states(reference, geometry):
     """The mixer told its rows are right-padded gives the masked call's
-    outputs, zero at the padding, by the conv without the gather."""
+    outputs, zero at the padding, by the conv without the gather: as close
+    to float64 as the masked call is (tests/reference_error.py), the two
+    being separate programs, which a GPU rounds apart (1.7e-6 on an H100)."""
     module = layer(geometry)
     variables = layer_params(reference)
     hidden = jnp.asarray(reference["layer.hidden"])[:, :9]
     valid = jnp.arange(9)[None, :] < jnp.asarray([[6], [9]])
 
-    def call(metadata):
+    def call(metadata, variables=variables):
         return jax.jit(lambda hidden: module.apply(variables, hidden, attention_metadata=metadata))
 
     def gathers(metadata) -> int:
         return call(metadata).lower(hidden).compile().as_text().count(" gather(")
 
-    masked, declared = AttentionMetadata(valid=valid), AttentionMetadata(valid=valid, right_padded=True)
+    masked = AttentionMetadata(coordinates=coordinates(valid=valid))
+    declared = AttentionMetadata(coordinates=coordinates(valid=valid, right_padded=True))
+    mine, theirs = call(declared)(hidden), call(masked)(hidden)
 
-    assert largest(call(declared)(hidden), call(masked)(hidden)) < 1e-6
-    assert jnp.array_equal(call(declared)(hidden)[0, 6:], jnp.zeros_like(hidden[0, 6:]))
+    assert jnp.array_equal(mine[0, 6:], jnp.zeros_like(hidden[0, 6:]))
     assert gathers(declared) < gathers(masked)
+    cpu = jax.devices("cpu")[0]
+    with jax.enable_x64(new_val=True), jax.default_device(cpu):
+        wide = jax.tree.map(lambda x: jax.device_put(np.asarray(x, np.float64), cpu), variables)
+        truth = call(AttentionMetadata(coordinates=coordinates(valid=jax.device_put(np.asarray(valid), cpu))),
+                     wide)(jax.device_put(np.asarray(hidden, np.float64), cpu))
+    assert_as_exact_as_the_reference(mine, theirs, truth, "right-padded output")
 
 
 @pytest.mark.parametrize("chunk", [4, 16, 64])
