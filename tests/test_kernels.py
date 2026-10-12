@@ -145,7 +145,8 @@ def test_auto_sends_a_plain_cudnn_call_to_tokamax_when_it_is_installed(monkeypat
     found = util.find_spec
     # dew_flash_attn, which 'auto' prefers on an A100, is out of this test.
     monkeypatch.setattr(util, 'find_spec', lambda name: object() if name == 'tokamax' and installed
-                        else None if name in ('tokamax', 'dew_flash_attn') else found(name))
+                        else None if name == 'tokamax' else found(name))
+    monkeypatch.setattr(attention, 'flash_architectures', lambda: None)
     query = jnp.zeros((1, 128, 4, call.pop("head_dim", 64)), jnp.bfloat16)
     assert attention.resolve_implementation('auto', query, query, **call) == chosen
 
@@ -163,29 +164,43 @@ def test_tokamax_takes_the_calls_it_takes_before_flash(monkeypatch, generation, 
     monkeypatch.setattr(attention, 'bf16_dot_runs', lambda: True)
     monkeypatch.setattr(kernels.generation, 'device_generation', lambda: generation)
     found = util.find_spec
-    monkeypatch.setattr(util, 'find_spec', lambda name: object() if name in ('tokamax', 'dew_flash_attn')
-                        else found(name))
+    monkeypatch.setattr(util, 'find_spec', lambda name: object() if name == 'tokamax' else found(name))
+    monkeypatch.setattr(attention, 'flash_architectures', lambda: ('sm80', 'sm120'))
     chosen = [attention.resolve_implementation('auto', query, query, causal=True)
               for query in (jnp.zeros((1, 128, 4, width), jnp.bfloat16) for width in (64, 128))]
     assert chosen == ['triton', 'flash']
 
 
+WHEEL = ("sm80", "sm120")
+"""The architectures dew_flash_attn 0.1.1 reports."""
+
+
+@pytest.mark.parametrize("generation, architectures, built", [
+    ("sm80", WHEEL, True), ("sm86", WHEEL, True), ("sm89", ("sm80",), True), ("sm120", WHEEL, True),
+    ("sm120", ("sm80",), False), ("sm90", WHEEL, False), ("sm100", WHEEL, False)])
+def test_flash_runs_where_the_installed_wheel_holds_code_for_the_gpu(generation, architectures, built):
+    """FlashAttention-2 runs on a GPU the installed wheel's own architectures cover, an 8.x part
+    running sm80's code: 0.1.0's sm80 alone leaves an RTX PRO 6000 (sm120) to the other kernels."""
+    from dew.nn import attention
+    assert attention.flash_built_for(generation, architectures) == built
+
+
 @pytest.mark.parametrize("generation, installed, call, chosen, refusal", [
-    ("sm80", True, {}, "flash", None),
-    ("sm80", True, {"causal": True}, "flash", None),
-    ("sm80", True, {"head_dim": 256}, "flash", None),
-    ("sm80", True, {"causal": True, "keys": 256}, "cudnn", "a causal call has more keys than queries"),
-    ("sm80", True, {"keys": 256}, "flash", None),
-    ("sm80", True, {"sliding_window": 64, "causal": True}, "cudnn", "the call has a sliding window"),
-    ("sm80", True, {"mask": jnp.ones((1, 1, 128, 128), bool)}, "cudnn", "the call has a mask"),
-    ("sm80", True, {"softcap": 30.0}, "xla", "the call has a logit softcap"),
-    ("sm80", True, {"dtype": jnp.float32}, "xla", "the query is float32"),
-    ("sm80", False, {}, "cudnn", "dew_flash_attn is not installed"),
-    ("sm89", True, {}, "flash", None),
-    ("sm89", True, {"head_dim": 192}, "flash", None),
-    ("sm89", True, {"head_dim": 256}, "xla", "the heads are 256 wide"),
-    ("sm90", True, {}, "cudnn", None),
-    ("sm120", True, {}, "cudnn", None),
+    ("sm80", WHEEL, {}, "flash", None),
+    ("sm80", WHEEL, {"causal": True}, "flash", None),
+    ("sm80", WHEEL, {"head_dim": 256}, "flash", None),
+    ("sm80", WHEEL, {"causal": True, "keys": 256}, "cudnn", "a causal call has more keys than queries"),
+    ("sm80", WHEEL, {"keys": 256}, "flash", None),
+    ("sm80", WHEEL, {"sliding_window": 64, "causal": True}, "cudnn", "the call has a sliding window"),
+    ("sm80", WHEEL, {"mask": jnp.ones((1, 1, 128, 128), bool)}, "cudnn", "the call has a mask"),
+    ("sm80", WHEEL, {"softcap": 30.0}, "xla", "the call has a logit softcap"),
+    ("sm80", WHEEL, {"dtype": jnp.float32}, "xla", "the query is float32"),
+    ("sm80", None, {}, "cudnn", "dew_flash_attn is not installed"),
+    ("sm89", WHEEL, {}, "flash", None),
+    ("sm89", WHEEL, {"head_dim": 192}, "flash", None),
+    ("sm89", WHEEL, {"head_dim": 256}, "xla", "the heads are 256 wide"),
+    ("sm90", WHEEL, {}, "cudnn", None),
+    ("sm120", WHEEL, {}, "cudnn", None),
 ])
 def test_auto_sends_a_plain_call_to_flash_where_it_was_measured(monkeypatch, caplog, generation, installed,
                                                                 call, chosen, refusal,
@@ -205,8 +220,8 @@ def test_auto_sends_a_plain_call_to_flash_where_it_was_measured(monkeypatch, cap
     monkeypatch.setattr(attention, 'device_generation', lambda: generation)
     monkeypatch.setattr(kernels.generation, '_logged', set())
     found = util.find_spec
-    monkeypatch.setattr(util, 'find_spec', lambda name: (object() if installed else None)
-                        if name == 'dew_flash_attn' else None if name == 'tokamax' else found(name))
+    monkeypatch.setattr(util, 'find_spec', lambda name: None if name == 'tokamax' else found(name))
+    monkeypatch.setattr(attention, 'flash_architectures', lambda: installed)
     query = jnp.zeros((1, 128, 4, call.pop("head_dim", 128)), call.pop("dtype", jnp.bfloat16))
     key = jnp.zeros((1, call.pop("keys", 128), *query.shape[2:]), query.dtype)
     assert [attention.resolve_implementation('auto', query, key, **call) for _ in range(2)] == [chosen] * 2
@@ -217,14 +232,14 @@ def test_auto_sends_a_plain_call_to_flash_where_it_was_measured(monkeypatch, cap
 
 @pytest.mark.parametrize("generation", ["sm90", "sm100", "sm75", "cpu"])
 def test_flash_refuses_a_device_its_wheel_has_no_code_for(monkeypatch, generation, without_deterministic_ops):
-    """The wheel holds sm80 code, which compute capability 8.x runs, and
-    sm120 code: an explicit 'flash' on any other device is refused by name,
-    before a CUDA launch could fail without one."""
+    """An explicit 'flash' on a device the installed wheel holds no code for
+    is refused by name, before a CUDA launch could fail without one."""
     from dew.nn import attention, kernels
     monkeypatch.setattr(kernels.generation, 'device_generation', lambda: generation)
     monkeypatch.setattr(attention, 'device_generation', lambda: generation)
+    monkeypatch.setattr(attention, 'flash_architectures', lambda: WHEEL)
     query = jnp.zeros((1, 128, 4, 64), jnp.bfloat16)
-    with pytest.raises(ValueError, match=f"built for sm8x and sm120 and this device is {generation}"):
+    with pytest.raises(ValueError, match=f"holds code for sm80, sm120 and this device is {generation}"):
         attention.flash_attention(query, query, query, causal=True)
 
 

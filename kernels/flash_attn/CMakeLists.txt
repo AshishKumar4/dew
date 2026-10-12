@@ -26,7 +26,11 @@ add_library(dew_flash_attn SHARED ffi.cpp
 target_include_directories(dew_flash_attn PRIVATE
     "${UPSTREAM}/csrc" "${UPSTREAM}/csrc/flash_attn" "${UPSTREAM}/csrc/flash_attn/src"
     "${UPSTREAM}/csrc/cutlass/include")
-set(DEFINES FLASHATTENTION_DISABLE_DROPOUT=1 FLASHATTENTION_DISABLE_ALIBI=1)
+# The library reports the architectures it holds code for (dew_flash_attn.ARCHITECTURES), so Dew asks
+# the installed wheel rather than knowing each release's list.
+list(JOIN CMAKE_CUDA_ARCHITECTURES "," ARCHITECTURES)
+set(DEFINES FLASHATTENTION_DISABLE_DROPOUT=1 FLASHATTENTION_DISABLE_ALIBI=1
+    DEW_FLASH_ARCHITECTURES="${ARCHITECTURES}")
 target_compile_definitions(dew_flash_attn PRIVATE ${DEFINES})
 target_compile_options(dew_flash_attn PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:
     -O3 --use_fast_math --expt-relaxed-constexpr --expt-extended-lambda
