@@ -20,12 +20,12 @@ unevenly, so the float division MaxText makes decides a boundary.
 
 from __future__ import annotations
 
-import ast
 import json
 import math
 import types
-import urllib.request
 from pathlib import Path
+
+from reference_source import definitions
 
 COMMIT = "538fe7a3f3376d94cf3f04e77741aa6d7e8efa45"
 SOURCE = (f"https://raw.githubusercontent.com/AI-Hypercomputer/maxtext/{COMMIT}"
@@ -48,12 +48,7 @@ CASES = [
 
 
 def manager_class() -> type:
-    text = urllib.request.urlopen(SOURCE).read().decode()
-    node = next(node for node in ast.parse(text).body
-                if isinstance(node, ast.ClassDef) and node.name == "RampupBatchManager")
-    scope = {"math": math}
-    exec(compile(ast.Module(body=[node], type_ignores=[]), "rampup_batch.py", "exec"), scope)
-    return scope["RampupBatchManager"]
+    return definitions(SOURCE, {"RampupBatchManager"}, {"math": math})["RampupBatchManager"]
 
 
 def reads(manager, steps: int) -> list[int]:

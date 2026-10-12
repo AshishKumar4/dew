@@ -29,7 +29,14 @@ from dew.telemetry.devices import deterministic_ops_requested
 from .attention_sinks import attention_with_sinks
 from .flops import attention_flops, cross_attention_flops, projection_flops
 from .kernels import decode_attention, generation, norm_swiglu
-from .kernels.generation import bf16_dot_runs, device_generation, first_refusal, measured_kernel, ran_kernel
+from .kernels.generation import (
+    bf16_dot_runs,
+    device_generation,
+    first_refusal,
+    gpu_placed,
+    measured_kernel,
+    ran_kernel,
+)
 from .kv_cache import Append, KVCache, KVStore, filled_slots
 from .precision import (
     at_default_precision,
@@ -905,7 +912,7 @@ def cudnn_runs(query, softcap=None) -> bool:
     query alone and holds for the whole call.
     """
     head_dim = query.shape[-1]
-    return (jax.default_backend() == 'gpu' and bf16_dot_runs() and query.dtype in CUDNN_DTYPES
+    return (gpu_placed() and bf16_dot_runs() and query.dtype in CUDNN_DTYPES
             and head_dim % 8 == 0 and head_dim <= CUDNN_MAX_HEAD_DIM
             and softcap is None and not deterministic_ops_requested())
 
@@ -970,7 +977,7 @@ def flash_refusal(query, key, causal=False, sliding_window=None, mask=None, bias
     narrow = generation.startswith('sm8') and generation != 'sm80'
     widest = FLASH_MAX_BACKWARD_HEAD_DIM if narrow else FLASH_MAX_HEAD_DIM
     return first_refusal(
-        (jax.default_backend() == 'gpu' and measured_kernel('attention', 'cudnn') == 'flash',
+        (gpu_placed() and measured_kernel('attention', 'cudnn') == 'flash',
          "its target row names it for no other device"),
         (query.dtype in CUDNN_DTYPES, f"the query is {query.dtype}"),
         (head_dim % 8 == 0 and head_dim <= widest, f"the heads are {head_dim} wide"),
