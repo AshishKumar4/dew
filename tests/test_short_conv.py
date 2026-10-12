@@ -171,8 +171,9 @@ def test_the_kernels_are_as_exact_as_xla_at_the_training_shapes(model):
     want, want_grads = run(xla_conv1d, x, weights, None, None, parts, jnp.bfloat16, grads)
     exact, exact_grads = truth(x, weights, None, None, parts, grads)
     labels = ("q", "k", "v", "dx", "dtaps")
-    for label, mine, theirs, value in zip(labels, (*got, *got_grads), (*want, *want_grads),
-                                          (*exact, *exact_grads), strict=True):
+    # The gradients of the projection and the taps; there is no bias.
+    for label, mine, theirs, value in zip(labels, (*got, *got_grads[:2]), (*want, *want_grads[:2]),
+                                          (*exact, *exact_grads[:2]), strict=True):
         assert_as_exact_as_the_reference(mine, theirs, value, f"{model} {label}")
 
 
