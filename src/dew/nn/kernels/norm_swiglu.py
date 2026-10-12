@@ -36,7 +36,7 @@ after "/" with the forward recomputed or after ";" alone, in us.
 In Qwen3.5-0.8B's profiled step the norms took 19.0 ms on the A100 and 18.6 ms on the
 H100 SXM under XLA and 15.4 and 13.7 fused; SwiGLU 12.7 and 16.0 against
 12.4 and 13.6. The gated norm's reverse is the one behind its bar (fla's,
-by 12% on the A100 and 5% on the H100).
+by 13% on the A100 and 5% on the H100).
 
 Dew's portable rounded_to also rounds cotangents. These fused VJPs instead
 use Liger's numerical contract: fp32 intermediate gradients and one cast at
