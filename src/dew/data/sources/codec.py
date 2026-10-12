@@ -14,6 +14,7 @@ from collections.abc import Iterable, Mapping
 from decimal import Decimal
 from typing import TYPE_CHECKING
 
+import jax
 import numpy as np
 
 from dew.records import JSON
@@ -25,6 +26,7 @@ type Value = (
     JSON
     | bytes
     | np.ndarray
+    | jax.Array
     | np.generic
     | DataclassInstance
     | list[Value]
@@ -84,6 +86,9 @@ def unpack_dict_of_byte_arrays(payload: bytes) -> dict[str, bytes]:
 
 
 def _tree(value: Value, leaves: dict[str, bytes]) -> JSON:
+    if isinstance(value, jax.Array):
+        # A record a caller built with jax holds its values on a device; their host copy is the record.
+        value = np.asarray(value)
     if isinstance(value, np.generic):
         key = str(len(leaves))
         file = io.BytesIO()
