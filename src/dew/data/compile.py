@@ -381,7 +381,7 @@ def compile(
     """Check every leaf before opening readers, then build both branches.
     With no `read`, the sources choose it (`_preferred_read`)."""
     branches = (train,) if validation is None else (train, validation)
-    read = read or _preferred_read(branches, provision=provision)
+    read = read or _preferred_read(lambda _: branches, provision=provision)
     if isinstance(train.source, Phases):
         return _compile_phases(
             train,
@@ -820,7 +820,7 @@ def validation(
 ) -> Reader:
     """Compile one finite evaluation branch without constructing a training
     stream. With no `read`, the sources choose it (`_preferred_read`)."""
-    read = read or _preferred_read((pipeline,), provision=provision)
+    read = read or _preferred_read(lambda _: (pipeline,), provision=provision)
     if not any(isinstance(stage, BatchStage) for stage in pipeline.stages):
         pipeline = pipeline.batch(batch, drop_remainder=False)
     (pipeline,) = _prepared((pipeline,), read, provision=provision, objective=objective, counts=({},))

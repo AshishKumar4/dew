@@ -782,12 +782,18 @@ def load(
         train = _cached(train, cache)
         held = None if held is None else _cached(held, cache)
     train, held = _promoted(train), None if held is None else _promoted(held)
-    read = read or _preferred_read((train,) if held is None else (train, held), provision=provision)
-    train = _batched(_ordered(train, read, seed), batch, train=True, tokens=tokens, lengths=lengths)
-    held = None if held is None else _batched(held, batch, train=False, tokens=tokens, lengths=lengths)
+
+    def compiled(at: Read) -> tuple[Pipeline, ...]:
+        ordered = _batched(_ordered(train, at, seed), batch, train=True, tokens=tokens, lengths=lengths)
+        if held is None:
+            return (ordered,)
+        return ordered, _batched(held, batch, train=False, tokens=tokens, lengths=lengths)
+
+    read = read or _preferred_read(compiled, provision=provision)
+    branches = compiled(read)
     return compile(
-        train,
-        validation=held,
+        branches[0],
+        validation=branches[1] if len(branches) > 1 else None,
         host=_host_stages(shared, host),
         objective=objective,
         read=read,

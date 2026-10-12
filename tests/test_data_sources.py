@@ -579,6 +579,22 @@ def test_a_token_holdout_with_no_stated_read_reads_unindexed_text_into_memory(tm
     assert loaded.val is not None and loaded.records
 
 
+def test_a_token_holdout_over_an_indexed_store_reads_into_memory_when_no_read_is_stated(tmp_path):
+    """Parquet reads by index, but a recipe's default order repeats an indexed
+    read before its token split, which needs a finite order. Judged on the
+    pipelines each read would run, the run reads into memory, where the order
+    follows the split."""
+    import pyarrow.parquet as pq
+
+    from dew.data import HoldOut, Text, load
+
+    rows = [{"text": f"document {index} " * 6} for index in range(8)]
+    pq.write_table(pa.Table.from_pylist(rows), tmp_path / "rows.parquet")
+    recipe = Text(source=str(tmp_path / "rows.parquet"), seq_len=8, token_holdout=HoldOut(fraction=0.25))
+    loaded = load(recipe, batch=2, read=None, loading=Loading(workers=0))
+    assert loaded.plan is not None and loaded.plan.order["read"] == "memory"
+
+
 def test_a_token_store_without_its_length_index_is_refused_naming_provisioning(tmp_path):
     """A token store that cannot be read by span until its length index is
     built is not read whole into memory when the run states no read: the

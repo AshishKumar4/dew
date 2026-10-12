@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from typing import Protocol, get_args, runtime_checkable
 
@@ -103,9 +103,11 @@ def _promoted(pipeline: Pipeline) -> Pipeline:
     return dataclasses.replace(pipeline, source=source, stages=stages)
 
 
-def _preferred_read(pipelines: Sequence[Pipeline], *, provision: bool) -> Read:
+def _preferred_read(compiled: Callable[[Read], Sequence[Pipeline]], *, provision: bool) -> Read:
     """The read a run takes when it states none, decided here once for
-    compile, validation and load.
+    compile, validation and load. `compiled` gives the pipelines the run
+    would compile at each read, which differ where a recipe's default order
+    does (`_order_at`), so each read is judged on the pipelines it would run.
 
     Each source the run reads, after its published generations are promoted,
     prefers memory for records held in memory (`Memory`, through any source
@@ -126,9 +128,11 @@ def _preferred_read(pipelines: Sequence[Pipeline], *, provision: bool) -> Read:
     left, the preference stands, and the preparation refuses it with its own
     remedy.
     """
-    promoted = tuple(_promoted(pipeline) for pipeline in pipelines)
+    def promoted(read: Read) -> tuple[Pipeline, ...]:
+        return tuple(_promoted(pipeline) for pipeline in compiled(read))
+
     chosen: list[Read] = []
-    for source in (source for pipeline in promoted for _, source in _leaves(pipeline)):
+    for source in (source for pipeline in promoted(READS[-1]) for _, source in _leaves(pipeline)):
         held = source
         while isinstance(held, _Wrapping):
             held = held.source
@@ -138,11 +142,12 @@ def _preferred_read(pipelines: Sequence[Pipeline], *, provision: bool) -> Read:
             chosen.append("indexed" if source.supports("indexed") else "streamed")
     preferred = READS.index(max(chosen, key=READS.index))
     for read in READS[preferred::-1]:
-        missing = _unsupported(promoted, read)
+        pipelines = promoted(read)
+        missing = _unsupported(pipelines, read)
         provisionable = all(isinstance(source, _Provisionable) for source in missing)
         if read == READS[preferred] and missing and provisionable and not provision:
             return read
-        if (not missing or (provision and provisionable)) and _lowers(promoted, read):
+        if (not missing or (provision and provisionable)) and _lowers(pipelines, read):
             return read
     return READS[preferred]
 
