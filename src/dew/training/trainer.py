@@ -37,6 +37,7 @@ from typing_extensions import TypeVar as DefaultTypeVar
 
 from dew.checkpoints import Checkpoints, Ranking
 from dew.coordination import agree_process_phase, agreed, agreed_same
+from dew.data.compile import fitted
 from dew.data.dataset import (
     Checkpointable,
     Closeable,
@@ -47,7 +48,7 @@ from dew.data.dataset import (
     stream_endless,
     stream_identity,
 )
-from dew.data.pipeline import Dataset, Pipeline
+from dew.data.pipeline import Dataset
 from dew.nn.flops import MissingFlopsCount
 from dew.nn.kernels.generation import assumed, gpu_mesh, gpu_target, measured_kernel
 from dew.nn.sharding import (
@@ -367,31 +368,6 @@ def _suites(dataset: Loader, validation: Mapping[str, Reader | EvalSuite] | None
         suites[name] = EvalSuite(suite.data, tuple(suite.metrics) or tuple(metrics),
                                  eval_every if suite.every is None else suite.every)
     return suites
-
-
-def _endless(chain: Pipeline) -> Pipeline:
-    """`chain` read endlessly: a repeat before its batch where it has none."""
-    from dew.data.pipeline import BatchStage, Repeat, TokenBudget
-
-    if any(isinstance(stage, Repeat) for stage in chain.stages):
-        return chain
-    batching = [index for index, stage in enumerate(chain.stages)
-                if isinstance(stage, (BatchStage, TokenBudget))]
-    at = batching[0] if batching else len(chain.stages)
-    return dataclasses.replace(chain, stages=(*chain.stages[:at], Repeat(None), *chain.stages[at:]))
-
-
-def _batched(held: Dataset, train: Pipeline) -> Pipeline:
-    """`held` batched as `train` is, every record scored, where it states no batch of its own."""
-    from dew.data.pipeline import BatchStage
-
-    chain = held.chain()
-    if any(isinstance(stage, BatchStage) for stage in chain.stages):
-        return chain
-    size = next((stage.size for stage in train.stages if isinstance(stage, BatchStage)), None)
-    if size is None:
-        raise ValueError("a validation dataset without a batch takes the training batch, which states none")
-    return chain.batch(size, drop_remainder=False)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1318,7 +1294,7 @@ class Trainer(Generic[Loss, Effects]):
 
     def fit(
         self,
-        data: Dataset | Loader,
+        dataset: Dataset | Loader,
         *,
         steps: int | None = None,
         epochs: int | None = None,
@@ -1351,9 +1327,9 @@ class Trainer(Generic[Loss, Effects]):
 
         Every `eval_every` steps, and at the end, the validation split is scored. The
         objective's artifacts go to the tracker and to `metrics`, whose reductions are
-        logged as `val/<name>`. `validation` names several splits instead, each a
-        reader scored as `dataset.val` would be or an `EvalSuite` with its own
-        metrics and cadence, logged as `<name>/<metric>`.
+        logged as `val/<name>`. `validation` is that split as a Dataset, or names
+        several, each a Dataset, a reader scored as `dataset.val` would be or an
+        `EvalSuite` with its own metrics and cadence, logged as `<name>/<metric>`.
 
         Every `checkpoint_every` steps, the state and the data position are
         written; `checkpoint_final=True` also writes the final state, independently
@@ -1375,24 +1351,16 @@ class Trainer(Generic[Loss, Effects]):
             raise ValueError("fit's run length is steps= or epochs=, or tokens=, which also caps either")
         if tokens is not None and not self.objective.counts_tokens:
             raise ValueError("tokens= needs an objective that counts real tokens")
-        dataset, validation = self._loaded(data, validation)
+        loader, validation = fitted(dataset, validation, objective=self.objective.data())
         if epochs is not None:
-            steps = dataset.epoch_steps(epochs)
-        total_tokens = tokens
+            steps = loader.epoch_steps(epochs)
         count_compilation_cache()
-        updates = None if steps is None else steps // self.accumulation
-        if self._config is not None:
-            built = self._config.build(updates)
-            self._optimizer = self.objective.optimizer(built, accumulation=self.accumulation)
-            self._scheduled_rate = None
-            if self._config.schedule is not None and not self._config.param_groups:
-                schedule = self._config.schedule.schedule(updates)
-                self._scheduled_rate = jax.jit(lambda updates: schedule(jnp.maximum(updates - 1, 0)))
-        suites = _suites(dataset, validation, metrics, eval_every)
+        self._schedule(None if steps is None else steps // self.accumulation)
+        suites = _suites(loader, validation, metrics, eval_every)
         selection, stop = self._fit_policies(best, stop, metrics, suites, checkpoint_every, restore_best)
         if metrics and eval_every is None and validation is None:
             raise ValueError("metrics need eval_every to schedule their validation pass")
-        self._preflight(dataset, stop, suites, preview=preview,
+        self._preflight(loader, stop, suites, preview=preview,
                         loss=self.checkpoints is not None and not selection)
         preview = preview and self.tracker is not None
         run = _FitRun(time.perf_counter())
@@ -1405,19 +1373,10 @@ class Trainer(Generic[Loss, Effects]):
         tracer = profiler if profiler is not None else telemetry_profile.active_profile()
         try:
             plan = _FitPlan(
-                dataset=dataset,
-                steps=steps,
-                log_every=log_every,
-                eval_every=eval_every,
-                total_tokens=total_tokens,
-                checkpoint_every=checkpoint_every,
-                checkpoint_final=checkpoint_final,
+                dataset=loader, steps=steps, log_every=log_every, eval_every=eval_every, total_tokens=tokens,
+                checkpoint_every=checkpoint_every, checkpoint_final=checkpoint_final,
                 local_every=None if checkpoints is None else checkpoints.local_every,
-                metrics=metrics,
-                preview=preview,
-                best=selection,
-                stop=stop,
-                suites=suites,
+                metrics=metrics, preview=preview, best=selection, stop=stop, suites=suites,
             )
             trained, complete = self._training_loop(plan, run, profiler, tracer, profile, checkpoints, state)
             # The state a checkpoint would hold: the step rebuilds its narrow copies.
@@ -1440,27 +1399,16 @@ class Trainer(Generic[Loss, Effects]):
             )
         return trained
 
-    def _loaded(self, data: Dataset | Loader,
-                validation: Dataset | Mapping[str, Dataset | Reader | EvalSuite] | None,
-                ) -> tuple[Loader, Mapping[str, Reader | EvalSuite] | None]:
-        """`data` and each validation dataset compiled with the objective's own
-        stages (`Objective.data`). A training dataset without a repeat repeats
-        before its batch, so the run's length is its steps, epochs or tokens;
-        a validation dataset without a batch takes the training batch."""
-        if isinstance(data, Loader):
-            return data, validation  # type: ignore[return-value]
-        from dew.data.compile import compile, validation as validated
-
-        objective = self.objective.data()
-        train = _endless(data.chain())
-        held = validation if isinstance(validation, Dataset) else None
-        loader = compile(train, validation=None if held is None else _batched(held, train),
-                         objective=objective, provision=True)
-        if not isinstance(validation, Mapping):
-            return loader, None
-        return loader, {name: validated(_batched(entry, train), batch=loader.batch, objective=objective,
-                                        provision=True)
-                        if isinstance(entry, Dataset) else entry for name, entry in validation.items()}
+    def _schedule(self, updates: int | None) -> None:
+        """The configured optimizer and its logged rate, built for `updates` updates."""
+        if self._config is None:
+            return
+        built = self._config.build(updates)
+        self._optimizer = self.objective.optimizer(built, accumulation=self.accumulation)
+        self._scheduled_rate = None
+        if self._config.schedule is not None and not self._config.param_groups:
+            schedule = self._config.schedule.schedule(updates)
+            self._scheduled_rate = jax.jit(lambda updates: schedule(jnp.maximum(updates - 1, 0)))
 
     def _training_loop(self, plan: _FitPlan, run: _FitRun, profiler: Profiler | None,
                        tracer: Profiler | None, profile: ProfileWindow | None,
