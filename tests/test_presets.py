@@ -50,7 +50,7 @@ def test_images_train_a_denoiser_with_device_augmentation_and_validate_unaugment
     objective = DiffusionObjective(SimpleDiT(patch_size=4, emb_features=16, num_layers=1, num_heads=2,
                                              mlp_ratio=1),
                                    Flow(), InputSpec(Field("image", (16, 16, 3))), solver=Euler(), steps=2)
-    batch = next(train.pipe(presets.images(16, batch=8, augment=True)).iterate())
+    batch = next(train.shuffle(0).repeat().pipe(presets.images(16, batch=8, augment=True)).iterate())
     assert batch["image"].shape == (8, 16, 16, 3) and batch["image"].dtype == np.uint8
     assert batch["label"].shape == (8,)
     logged = trained(objective, train.shuffle(0).repeat().pipe(presets.images(16, batch=8, augment=True)),
