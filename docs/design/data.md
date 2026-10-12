@@ -94,7 +94,7 @@ Preparing a Hub dataset happens on first use, with one log line naming what is p
 | Execution | `workers(n)`, `threads(n)`, `prefetch(n)`, `read(mode)` |
 | Look | `take(n).show()`, `stats(records=n)` |
 
-Batched preprocessing is Hugging Face's own form: `map(fn, batched=True, batch_size=k)` hands `fn` a dict of columns (`{"text": [...k strings]}`) and expects the same number of rows back; `flat_map(fn, batched=True)` may return any number. The chain stays a stream of records, so `pack`, `mix` and `batch` still follow. After `batch(n)`, a `map` receives the training batch, as in Grain and tf.data.
+Batched preprocessing uses Hugging Face's form: `map(fn, batched=True, batch_size=k)` hands `fn` a dict of columns (`{"text": [...k strings]}`). One difference from Hugging Face: there, a batched `map` may return any number of rows; in Dew it must return the same number, and `flat_map(fn, batched=True)` is the one that may change it. The verb keeps saying how many records come out, which is what lets Dew keep exact global resume. A Hugging Face function that changes the row count goes through `flat_map(..., batched=True)` unchanged. The chain stays a stream of records, so `pack`, `mix` and `batch` still follow. After `batch(n)`, a `map` receives the training batch, as in Grain and tf.data.
 
 ## 4. Examples
 
