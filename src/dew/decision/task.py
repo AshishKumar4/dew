@@ -55,7 +55,7 @@ from dew.files import write_atomically
 from dew.inference.tasks import SHAPE_BUCKETS
 from dew.interop.processors import Processor
 from dew.nn.inputs import RowPlan, mesh_of
-from dew.objectives.base import Metric, Variables
+from dew.objectives.base import Metric, Objective, Variables
 from dew.records import JSON, json_value, record
 
 if TYPE_CHECKING:
@@ -174,9 +174,12 @@ class Decide:
         run. `ema` selects the averaged weights, and None uses them when the run kept
         them. `mesh` and `layout` place the weights as the trainer does, `dtype`
         overrides the compute dtype and `param_dtype` the storage dtype.
+        The image processor reloads from its recorded source independently of
+        the tokenizer that lays out the task's text.
         """
         from dew.data.text import tokenizer_for
         from dew.inference.tasks import run_record, saved_model
+        from dew.interop.pretrained import load_processor
         from dew.registry import from_record, objectives
 
         record, step = run_record(directory, step)
@@ -190,12 +193,17 @@ class Decide:
         tokenizer = record.get("tokenizer")
         if tokenizer is None:
             raise ValueError("the run records no tokenizer to lay its rows out with")
+        processor = None
+        saved_processor = record.get("processor")
+        if saved_processor is not None:
+            processor = load_processor(records.text(saved_processor, "processor"), backbone)
         variables = objectives[records.text(record["objective"], "objective")]._saved_variables(
             directory, step=step, ema=ema, mesh=mesh, layout=layout, param_dtype=param_dtype)
         averaged = Checkpoints(directory).stored(step).get("ema") is not None if ema is None else ema
         task = cls(model, variables, rows, tokenizer_for(records.text(tokenizer, "tokenizer")),
                    from_record(Specials, records.json_value(record["specials"], "specials")),
-                   name=str(epath.Path(directory).name), weights=Weights(step, averaged))
+                   name=str(epath.Path(directory).name), weights=Weights(step, averaged),
+                   processor=processor)
         saved = epath.Path(directory) / TASK_FILE
         if not saved.exists():
             return task
@@ -450,7 +458,8 @@ class Decide:
         for batch in reader(DataPartition()):
             inputs = laid_out(batch)
             logits = np.asarray(self._forward(self.variables, inputs))
-            answered = np.asarray(batch["scored"])
+            answered = (np.asarray(batch["scored"])
+                        & (np.asarray(Objective.row_weights(batch, len(logits))) > 0)[:, None])
             for row, slot in zip(*np.nonzero(answered), strict=True):
                 count = int(np.sum(batch["options"][row, slot]))
                 scored.append(Scored(KINDS[int(batch["kinds"][row, slot])].kind, logits[row, slot, :count],

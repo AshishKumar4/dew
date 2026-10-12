@@ -52,6 +52,21 @@ def test_the_plan_runs_every_file_on_the_floor_and_the_newest_python_on_its_own(
     assert "3.14:tests/test_heavy.py#collect" in rows
 
 
+def test_a_torchax_file_never_shares_a_task_with_a_torch_compile_user(ci, tmp_path):
+    """The two files armada dew-20261011231242-dd32ac90 ran in one task, light enough to pack
+    together: the torchax-marked one runs in a task of its own, beside other marked files only."""
+    files = {"test_reference_helpers.py": "def test_mxfp4(): pass\n",
+             "test_torchax_fallback.py": "import pytest\npytestmark = pytest.mark.torchax\n",
+             "test_audio_condition.py": "import pytest\npytestmark = pytest.mark.torchax\n"}
+    for name, text in files.items():
+        (tmp_path / "tests" / name).write_text(text)
+    (tmp_path / "tests/test_durations.json").write_text(json.dumps({}))
+    timings = {"files": {f"3.12:tests/{name}": 10.0 for name in files}}
+    floor = sorted(entry["tests"] for entry in ci.plan(120.0, timings) if entry["python"] == "3.12")
+    assert floor == ["tests/test_audio_condition.py tests/test_torchax_fallback.py",
+                     "tests/test_reference_helpers.py"]
+
+
 def test_a_collect_task_rows_each_file_red_where_it_would_not_import(ci, tmp_path):
     """The newest Python's collect-only task turns a file's row red where
     the file does not import or skips on a missing import, and keeps one
