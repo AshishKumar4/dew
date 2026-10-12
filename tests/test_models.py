@@ -17,7 +17,7 @@ from flax.traverse_util import flatten_dict
 from reference_error import assert_as_exact_as_the_reference
 
 from dew.diffusion.process import DenoisingCondition
-from dew.nn.attention import LayerNorm, Stage
+from dew.nn.attention import GroupNorm, LayerNorm, Stage
 from dew.nn.autoencoders.vae import FlaxDecoder, FlaxEncoder, translate_vae_weights
 from dew.nn.backbones.dit import SimpleDiT
 from dew.nn.backbones.joint import DoubleStreamBlock
@@ -85,6 +85,33 @@ def _vae_decoder():
     model = FlaxDecoder(out_channels=3, block_out_channels=(32, 64), layers_per_block=1, norm_num_groups=8,
                         dtype=jnp.bfloat16)
     return model, (jnp.ones((2, 8, 8, 4), jnp.bfloat16),), {}
+
+
+@pytest.mark.parametrize("channels", [(32, 32), (32, 64)], ids=["same", "widening"])
+def test_a_bf16_vae_block_rounds_where_diffusers_flax_vae_does(channels):
+    """In bf16, the VAE's residual block, its two norms ahead of swish, is
+    within the float64 gate of Diffusers' own Flax block on the same
+    weights: each norm keeps its fp32 result into swish and the next
+    convolution casts (vae_flax.py:154-209)."""
+    from diffusers.models import vae_flax
+
+    from dew.nn.autoencoders.vae import FlaxResnetBlock2D
+
+    ours = FlaxResnetBlock2D(*channels, groups=8)
+    theirs = vae_flax.FlaxResnetBlock2D(*channels, groups=8)
+    x = np.random.default_rng(5).standard_normal((2, 8, 8, channels[0])).astype(np.float32) * 3
+    params = theirs.init(jax.random.key(0), jnp.asarray(x))
+    assert jax.tree_util.tree_structure(ours.init(jax.random.key(0), jnp.asarray(x))) == \
+        jax.tree_util.tree_structure(params)
+    params = jax.tree.map(lambda leaf: leaf + 0.05 * jax.random.normal(jax.random.key(1), leaf.shape),
+                          params)
+    narrow = jnp.asarray(x, jnp.bfloat16)
+    actual = np.asarray(ours.clone(dtype=jnp.bfloat16).apply(params, narrow), np.float32)
+    reference = np.asarray(theirs.clone(dtype=jnp.bfloat16).apply(params, narrow), np.float32)
+    with jax.enable_x64():
+        wide = jax.tree.map(lambda leaf: jnp.asarray(np.asarray(leaf), jnp.float64), params)
+        truth = np.asarray(ours.clone(dtype=jnp.float64).apply(wide, jnp.asarray(x, jnp.float64)))
+    assert_as_exact_as_the_reference(actual, reference, truth, "bf16 VAE residual block")
 
 
 @pytest.mark.parametrize("batch", [1, 4])
@@ -794,6 +821,54 @@ def test_a_block_pattern_that_misses_a_layer_is_refused():
                                    num_heads=2, block_pattern=("ssm", "attn"))
     with pytest.raises(ValueError, match="2 entries for 4 layers"):
         hybrid.init(jax.random.PRNGKey(0), jnp.zeros((1, 8, 8, 3)), jnp.ones((1,)))
+
+
+@pytest.mark.parametrize("dtype", [None, jnp.bfloat16, jnp.float32])
+@pytest.mark.parametrize("shape", [(2, 6, 16), (2, 4, 5, 16)])
+def test_group_norm_matches_flax_bit_for_bit(rng, dtype, shape):
+    """Without an activation, `dew.nn.attention.GroupNorm` is flax's
+    `nn.GroupNorm` op for op, with its parameter tree: its statistics in the
+    module's dtype, else the input's, at least fp32, and its result cast by
+    flax's dtype rule."""
+    x = jax.random.normal(rng, shape, jnp.float32) * 3 + 1
+    x = x.astype(jnp.bfloat16) if dtype is jnp.bfloat16 else x
+    ours, reference = GroupNorm(4, epsilon=1e-5, dtype=dtype), nn.GroupNorm(4, epsilon=1e-5, dtype=dtype)
+    params, flax_params = ours.init(rng, x), reference.init(rng, x)
+    assert jax.tree_util.tree_structure(params) == jax.tree_util.tree_structure(flax_params)
+    params = jax.tree.map(lambda leaf: leaf + 0.1 * jax.random.normal(rng, leaf.shape), params)
+    found, expected = ours.apply(params, x), reference.apply(params, x)
+    assert found.dtype == expected.dtype
+    assert jnp.array_equal(found, expected)
+
+
+def test_norms_reduce_in_the_dtype_flax_requests():
+    """A float64 input under an fp32 module dtype reduces in fp32, as flax's
+    norms do: the mean of 1e8 and 1e8 + 1 rounds to 1e8 there."""
+    with jax.enable_x64():
+        x = jnp.asarray([[1e8, 1e8 + 1, 1e8, 1e8 + 1]], jnp.float64)
+        for ours, reference in ((GroupNorm(1, epsilon=1e-5, dtype=jnp.float32),
+                                 nn.GroupNorm(1, epsilon=1e-5, dtype=jnp.float32)),
+                                (LayerNorm(epsilon=1e-5, dtype=jnp.float32),
+                                 nn.LayerNorm(epsilon=1e-5, dtype=jnp.float32))):
+            params = reference.init(jax.random.key(0), x)
+            assert jnp.array_equal(ours.apply(params, x), reference.apply(params, x))
+
+
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
+def test_group_norm_activates_its_wide_output_before_its_one_cast(rng, dtype):
+    """The activation reads the fp32 affine result, as Diffusers' Flax VAE
+    and UNet compute it (vae_flax.py:154-163, a GroupNorm with no dtype
+    before swish), and the result rounds once to the module's dtype; the
+    gradient keeps the input as it arrived."""
+    x = (jax.random.normal(rng, (2, 4, 4, 16)) * 3).astype(dtype)
+    ours = GroupNorm(4, activation=nn.swish, dtype=dtype)
+    params = ours.init(rng, x)
+    wide = nn.swish(nn.GroupNorm(4).apply(params, x.astype(jnp.float32)))
+    assert jnp.array_equal(ours.apply(params, x), wide.astype(dtype))
+    # The pullback holds the input as it arrived, no wider activation.
+    _, pullback = jax.vjp(lambda x: ours.apply(params, x), x)
+    held = [leaf for leaf in jax.tree.leaves(pullback) if leaf.size == x.size]
+    assert held and {leaf.dtype for leaf in held} == {x.dtype}
 
 
 @pytest.mark.parametrize('use_scale,use_bias', [(False, False), (True, False), (True, True)])
