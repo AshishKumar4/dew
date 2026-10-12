@@ -6,6 +6,7 @@ from typing import overload
 import jax
 import jax.numpy as jnp
 from jax import lax
+from jax.core import Tracer
 from jax.typing import ArrayLike
 
 from dew.diffusion.discrete import DiscreteDenoiser
@@ -24,6 +25,7 @@ def sample[StateT](
     guidance: Guidance | None = None,
     key: int | jax.Array,
     times: ArrayLike | Sequence[float] | None = None,
+    initial: StateT | None = None,
     final_denoise: bool = True,
     record: None = None,
 ) -> jax.Array: ...
@@ -39,6 +41,7 @@ def sample[StateT, RecordT](
     guidance: Guidance | None = None,
     key: int | jax.Array,
     times: ArrayLike | Sequence[float] | None = None,
+    initial: StateT | None = None,
     final_denoise: bool = True,
     record: Callable[[jax.Array, StateT], RecordT],
 ) -> tuple[jax.Array, RecordT]: ...
@@ -53,6 +56,7 @@ def sample[StateT, RecordT](
     guidance: Guidance | None = None,
     key: int | jax.Array,
     times: ArrayLike | Sequence[float] | None = None,
+    initial: StateT | None = None,
     final_denoise: bool = True,
     record: Callable[[jax.Array, StateT], RecordT] | None = None,
 ) -> jax.Array | tuple[jax.Array, RecordT]:
@@ -70,6 +74,11 @@ def sample[StateT, RecordT](
     is allowed, and a single point takes no solver step.
     `final_denoise=False` returns the last point's state without the closing
     clean prediction, which is how those solvers end.
+
+    A caller that compiles one walk for many grids of a length passes `times`
+    as data, traced, with `initial`, the solver's state before the first step
+    that it built on the host from the concrete grid (`solver.init`), whose
+    checks and tables need the grid's values.
 
     `record` reads each step's new state and the solver's state after it,
     and the sample comes back with those readings stacked over the steps,
@@ -105,7 +114,11 @@ def sample[StateT, RecordT](
             times = jnp.asarray(times)
             if times.ndim != 1 or times.shape[0] < 1:
                 raise ValueError(f"times must be a descending grid of at least one point, got {times.shape}")
-        if bool(jnp.any(~jnp.isfinite(times))) or bool(jnp.any(jnp.diff(times) > 0)):
+        if isinstance(times, Tracer):
+            if initial is None:
+                raise ValueError("a traced grid needs the solver state its caller built from the "
+                                 "concrete grid (initial=)")
+        elif bool(jnp.any(~jnp.isfinite(times))) or bool(jnp.any(jnp.diff(times) > 0)):
             raise ValueError("times must be a finite descending grid")
     count = times.shape[0] - 1
     walk = Walk.over(denoise, guidance, count)
@@ -116,8 +129,9 @@ def sample[StateT, RecordT](
             raise ValueError("a record reads the steps, and a grid of one point takes none")
         return walk.at(guided, count)(x_T, jnp.full((batch,), times[0]))[0] if final_denoise else x_T
 
-    with jax.ensure_compile_time_eval():
-        initial = solver.init(x_T, times, process, key=key)
+    if initial is None:
+        with jax.ensure_compile_time_eval():
+            initial = solver.init(x_T, times, process, key=key)
 
     def scanned[ReadT](read: Callable[[jax.Array, StateT], ReadT]) -> tuple[jax.Array, ReadT]:
         """The sample, and `read` of every step stacked over the steps."""

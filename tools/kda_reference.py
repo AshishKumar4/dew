@@ -6,15 +6,14 @@ The fp32 inputs cross two chunks, end with padding and carry a nonzero initial s
 Run with torch and NumPy installed: python tools/kda_reference.py [output.json].
 """
 
-import ast
 import json
 import sys
-import urllib.request
 from pathlib import Path
 
 import numpy as np
 import torch
 import torch.nn.functional as F
+from reference_source import fetched, ran, selected
 
 REVISION = "93c8b7b485963a10800c91f55304db6be211c2bd"
 SOURCE = f"https://raw.githubusercontent.com/huggingface/transformers/{REVISION}/src/transformers/models/glm5_next/modeling_glm5_next.py"
@@ -23,16 +22,11 @@ INPUTS = ("query", "key", "value", "g", "beta", "state")
 
 
 def reference_functions() -> dict:
-    source = urllib.request.urlopen(SOURCE, timeout=60).read().decode()
-    names = {"l2norm", "chunk_kimi_delta_attention", "recurrent_kimi_delta_attention"}
-    functions = [node for node in ast.parse(source).body
-                 if isinstance(node, ast.FunctionDef) and node.name in names]
-    assert {node.name for node in functions} == names
+    functions = selected(fetched(SOURCE), {"l2norm", "chunk_kimi_delta_attention",
+                                           "recurrent_kimi_delta_attention"}, filename=SOURCE)
     for node in functions:
         node.decorator_list = []
-    scope = {"torch": torch, "F": F}
-    exec(compile(ast.Module(body=functions, type_ignores=[]), SOURCE, "exec"), scope)
-    return scope
+    return ran(functions, {"torch": torch, "F": F}, SOURCE)
 
 
 def main(destination: Path) -> None:

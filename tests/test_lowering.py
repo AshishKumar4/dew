@@ -16,14 +16,15 @@ from jax.sharding import Mesh
 from dew.nn.kernels.generation import (
     PALLAS_CHOICES,
     TARGETS,
-    UNLOWERABLE,
     assumed,
     backend,
     bf16_dot_runs,
     device_generation,
     gpu_mesh,
+    gpu_placed,
     gpu_target,
     measured_kernel,
+    placed_platform,
     triton_runs,
 )
 from dew.training._lowering import triton_kernels
@@ -56,8 +57,24 @@ def test_an_assumed_generation_names_its_platform(generation, platform):
     assert backend() == own == jax.default_backend()
 
 
+def test_the_platform_is_the_placements():
+    """A host-layout run builds its CPU-owned state under `jax.default_device` and steps it under
+    `jax.set_mesh` on a GPU host's CPU, where the Triton kernels interpret and no CUDA library is
+    asked; a step traced on a GPU's abstract mesh chooses for that GPU, and is this process's GPU
+    only on a GPU host."""
+    cpu = jax.devices('cpu')[0]
+    mesh = Mesh(np.array([cpu]), ('data',))
+    with jax.default_device(cpu):
+        assert (backend(), triton_runs(), gpu_placed()) == ('cpu', False, False)
+    with jax.set_mesh(mesh):
+        assert (backend(), triton_runs(), gpu_placed()) == ('cpu', False, False)
+    with jax.sharding.use_abstract_mesh(gpu_mesh(mesh, 'sm90')):
+        assert (placed_platform(), backend()) == ('gpu', 'gpu')
+        assert gpu_placed() == (jax.default_backend() == 'gpu')
+
+
 def test_a_platform_keyed_choice_takes_the_assumed_gpus_path():
-    """On this CPU, jax.nn's xla attention sums a long fp32 value product in one chain, so 'auto' takes
+    """On a CPU, jax.nn's xla attention sums a long fp32 value product in one chain, so 'auto' takes
     the reference path, and an explicit Pallas grouped matmul interprets. Under an assumed T4 both
     act as on the GPU: the xla path, and XLA's ragged dot, as a T4 compiles no Triton kernel."""
     from dew.nn.attention import VALUE_BLOCK, _xla_kernel_chains
@@ -65,11 +82,12 @@ def test_a_platform_keyed_choice_takes_the_assumed_gpus_path():
 
     query, key = jnp.zeros((1, 8, 2, 64)), jnp.zeros((1, VALUE_BLOCK + 1, 2, 64))
     operands = (jnp.bfloat16, jnp.bfloat16)
-    assert _xla_kernel_chains(query, key)
-    assert grouped_matmul_kernel('pallas', jnp.bfloat16, operands, None) == 'pallas'
-    with assumed('sm75'):
-        assert not _xla_kernel_chains(query, key)
-        assert grouped_matmul_kernel('pallas', jnp.bfloat16, operands, None) == 'xla'
+    with jax.default_device(jax.devices('cpu')[0]):
+        assert _xla_kernel_chains(query, key)
+        assert grouped_matmul_kernel('pallas', jnp.bfloat16, operands, None) == 'pallas'
+        with assumed('sm75'):
+            assert not _xla_kernel_chains(query, key)
+            assert grouped_matmul_kernel('pallas', jnp.bfloat16, operands, None) == 'xla'
 
 
 def test_the_gpu_mesh_keeps_the_axes_over_the_generations_devices():
@@ -121,23 +139,22 @@ def _doubled(x):
 
 
 def test_a_kernel_traced_for_an_assumed_gpu_lowers_to_a_named_triton_call():
-    """Traced under an assumed A100 on that GPU's mesh, a kernel lowers on this CPU to one Triton call,
-    by its name; traced for the CPU it interprets, and calls none."""
+    """Traced under an assumed A100 on that GPU's mesh, a kernel lowers on any host to one Triton call,
+    by its name; traced for a CPU it interprets, and calls none."""
     x = jax.ShapeDtypeStruct((64,), jnp.float32)
     mesh = gpu_mesh(Mesh(np.array(jax.devices()[:1]), ('data',)), 'sm80')
     with assumed('sm80'), jax.sharding.use_abstract_mesh(mesh):
         lowered = jax.jit(_doubled).trace(x).lower(lowering_platforms=('cuda',))
     assert triton_kernels(lowered) == {"doubled": 1}
-    assert triton_kernels(jax.jit(_doubled).lower(x)) == {}
+    with jax.default_device(jax.devices('cpu')[0]):
+        assert triton_kernels(jax.jit(_doubled).lower(x)) == {}
 
 
 # The Triton kernels each Pallas choice a KERNELS row can name lowers to, by their `pallas_call` names,
 # and the probe that runs them: the Clef recipe's step (tools/clef_step.py), or an expert layer's
-# forward and backward (`_experts_lowered`). None for a kernel whose Triton lowering no CPU reaches
-# (`dew.nn.kernels.generation.UNLOWERABLE`).
+# forward and backward (`_experts_lowered`).
 FAMILIES = {
     ('grouped_matmul', 'pallas'): ("experts", {"pallas_triton_ragged_dot", "tgmm_ragged_dot"}),
-    ('tokamax_grouped_matmul', 'triton'): ("experts", None),
     ('rms_norm', 'pallas'): ("step", {"rms_norm_forward", "rms_norm_backward"}),
     ('swiglu', 'pallas'): ("step", {"swiglu_forward", "swiglu_backward"}),
     ('gated_delta_rule', 'fla'): ("step", {"fla_chunk_local_cumsum", "fla_kkt_solve", "fla_recompute_w_u",
@@ -167,7 +184,6 @@ def test_every_pallas_choice_a_row_names_has_a_lowering_probe():
     named = {(choice, kernel) for target in TARGETS.values() for choice, kernel in target.kernels.items()
              if kernel in PALLAS_CHOICES}
     assert named <= set(FAMILIES), sorted(named - set(FAMILIES))
-    assert {key for key, (_, names) in FAMILIES.items() if names is None} == set(UNLOWERABLE)
 
 
 @pytest.mark.parametrize("generation", ["sm80", "sm120"])
@@ -236,15 +252,3 @@ def test_an_expert_layer_lowers_for_the_gpu_with_the_grouped_matmul_its_generati
     expected = set().union(*(FAMILIES[key][1] for key in chosen(generation, "experts")
                              if key[0] == 'grouped_matmul'))
     assert set(triton_kernels(_experts_lowered(generation, 'auto'))) == expected
-
-
-@pytest.mark.parametrize("generation", [generation for generation in GPUS
-                                        if 'tokamax_grouped_matmul' in dict(chosen(generation, "experts"))])
-def test_tokamax_lowers_for_the_gpu_its_row_names(generation):
-    """'tokamax', an opt-in implementation 'auto' never takes, names its Triton kernel per generation;
-    tokamax registers that kernel only on a host with a GPU, so a CPU's dry run skips it, and the
-    kernel lab's verify on the GPU runs it (tests/test_moe.py)."""
-    api = pytest.importorskip("tokamax._src.ops.ragged_dot.api")
-    if 'triton' not in api.IMPLEMENTATIONS:
-        pytest.skip("tokamax registers its Triton ragged dot only where a GPU is present")
-    assert triton_kernels(_experts_lowered(generation, 'tokamax'))

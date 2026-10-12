@@ -3,6 +3,7 @@
 Streamed-bank ownership and placement are Dew execution policies; Optax oracles the updates.
 """
 import dataclasses
+import json
 import os
 
 import jax
@@ -11,6 +12,7 @@ import numpy as np
 import optax
 import pytest
 from jax.sharding import AxisType, Mesh, NamedSharding, PartitionSpec as P
+from steady_state import steady_state
 from test_training_transactions import ShortScaleTrainer, Terms, Tiny, batches
 
 from dew.checkpoints import Checkpoints
@@ -393,6 +395,86 @@ def test_a_host_step_differentiates_its_moving_leaves_only(monkeypatch):
         updated(objective, tokens(), HOST)
     every, moving = differentiated
     assert moving == every - 1
+
+
+def test_a_warm_host_run_traces_nothing():
+    """Once a CPU-owned run has stepped through an accumulation window, the
+    next windows run the programs it compiled: an eager vjp handed the
+    pullback a new static function every realization, which traced again."""
+    objective = LMObjective(decoder(), 8, head_chunks=1)
+    trainer = Trainer(objective, optax.adam(.01), key=jax.random.key(5), layout=HOST, accumulation=2)
+    state, _, _ = trainer.place()
+    batch = tokens()
+    step = trainer.compile(state, batch)
+    for _ in range(2):
+        state, *_ = step(state, batch)
+    with steady_state(allow=("host_to_device", "device_to_host")):
+        for _ in range(4):
+            state, *_ = step(state, batch)
+    assert int(state.updates) == 3
+
+
+RESUMED = """
+import json, sys
+import jax, jax.numpy as jnp, numpy as np, optax
+events = []
+jax.monitoring.register_event_listener(lambda event, **_: events.append(event))
+from dew.training.runtime import prepare_process
+prepare_process(compilation_cache_dir=sys.argv[1])
+from dew.checkpoints import Checkpoints
+from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.objectives.lm import LMObjective
+from dew.training import Layout, Trainer
+directory, where, steps = sys.argv[2], sys.argv[3], int(sys.argv[4])
+model = CausalTransformer(vocab_size=16, emb_features=8, num_layers=2, num_heads=2, mlp_features=16,
+                          max_seq_len=8, scan_layers=True)
+trainer = Trainer(LMObjective(model, 8, head_chunks=1), optax.adam(.01), key=jax.random.key(5),
+                  layout=Layout(host=("variables",) if where == "host" else (), min_shard=1, tolerance=1.),
+                  checkpoints=None if directory == "-" else Checkpoints(directory), tracker=None)
+state, _, _ = trainer.place()
+started = int(state.step)
+batch = {"text": jnp.tile(jnp.arange(1, 10, dtype=jnp.int32)[None], (jax.device_count(), 1))}
+before = len(events)
+run = trainer.compile(state, batch)
+for _ in range(steps):
+    state, *_ = run(state, batch)
+jax.block_until_ready(state)
+window = events[before:]
+if directory != "-":
+    trainer.checkpoints.save(int(state.step), state)
+    trainer.checkpoints.wait()
+print(json.dumps({"started": started, "step": int(state.step),
+                  "leaves": [np.asarray(leaf, np.float64).tolist() for leaf in jax.tree.leaves(
+                      (state.variables, state.opt_state))],
+                  "cache": [window.count("/jax/compilation_cache/compile_requests_use_cache"),
+                            window.count("/jax/compilation_cache/cache_hits")]}))
+"""
+
+
+@pytest.mark.parametrize("where", ["device", "host"])
+def test_a_resumed_run_continues_on_the_programs_its_first_process_compiled(tmp_path, where):
+    """A run resumed by a new process continues where the first stopped, to
+    the parameters and optimizer state of a run that never stopped, on the
+    step programs the first process compiled and the persistent cache holds:
+    the restored state's leaves enter the step as the fresh state's did. The
+    first process may itself hit programs its placement compiled."""
+    import subprocess
+    import sys
+
+    from process_support import worker_env
+
+    def run(directory, steps):
+        command = [sys.executable, "-c", RESUMED, str(tmp_path / "cache"), str(directory), where, str(steps)]
+        done = subprocess.run(command, capture_output=True, text=True, check=False, env=worker_env(1))
+        assert done.returncode == 0, done.stderr[-3000:]
+        return json.loads(done.stdout.strip().splitlines()[-1])
+
+    first, resumed, whole = run(tmp_path / "run", 2), run(tmp_path / "run", 2), run("-", 4)
+    assert (first["started"], resumed["started"], resumed["step"]) == (0, 2, 4)
+    lookups, hits = resumed["cache"]
+    assert lookups == first["cache"][0] > 0 and hits == lookups, (first["cache"], resumed["cache"])
+    for got, want in zip(resumed["leaves"], whole["leaves"], strict=True):
+        np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
 
 
 def test_streamed_banks_train_a_mixed_frozen_root_decoder_like_the_resident_stack(tmp_path):

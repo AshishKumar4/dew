@@ -27,36 +27,30 @@ from __future__ import annotations
 import ast
 import sys
 import types
-import urllib.request
 from pathlib import Path
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import struct
+from reference_source import fetched, ran, selected
 
 jax.config.update("jax_enable_x64", val=True)
 
 COMMIT = "15c55b001304604147a2a8002a76cf5d4c32092f"
+FLAXDIFF = f"https://raw.githubusercontent.com/AshishKumar4/FlaxDiff/{COMMIT}/flaxdiff/"
 FIXTURE = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "flaxdiff_solvers" / "solvers.npz"
 STEPS, SIGMA_MAX, RHO, SIGMA_DATA = 12, 80.0, 7.0, 0.5
 SAMPLERS = {"rk4": ("rk4_sampler.py", "RK4Sampler"), "multistep": ("multistep_dpm.py", "MultiStepDPM")}
 
 
-def source(path: str) -> str:
-    url = f"https://raw.githubusercontent.com/AshishKumar4/FlaxDiff/{COMMIT}/flaxdiff/{path}"
-    return urllib.request.urlopen(url).read().decode()
-
-
-def definitions(path: str, names: set[str], *, wide: bool = False) -> list[ast.stmt]:
-    published_source = source(path)
+def statements(path: str, names: set[str], *, wide: bool = False,
+               within: str | None = None) -> list[ast.stmt]:
+    """The definitions `names` of FlaxDiff's `path` (`selected`), in float64 where `wide`."""
+    text = fetched(FLAXDIFF + path)
     if wide:
-        published_source = published_source.replace("jnp.float32", "jnp.float64")
-    tree = ast.parse(published_source)
-    found = [node for node in tree.body
-             if isinstance(node, ast.FunctionDef | ast.ClassDef) and node.name in names]
-    assert {node.name for node in found} == names, names - {node.name for node in found}
-    return found
+        text = text.replace("jnp.float32", "jnp.float64")
+    return selected(text, names, within=within, filename=f"flaxdiff/{path}")
 
 
 def published(*, wide: bool = False) -> dict:
@@ -65,26 +59,22 @@ def published(*, wide: bool = False) -> dict:
     in one namespace."""
     scope: dict = {"jax": jax, "jnp": jnp, "Union": object, "List": list, "Tuple": tuple, "Dict": dict,
                    "struct": struct, "tqdm": types.SimpleNamespace(tqdm=lambda steps: steps)}
-    exec(compile(ast.Module(body=definitions("utils.py", {"MarkovState", "RandomMarkovState", "clip_images"}),
-                            type_ignores=[]), "flaxdiff/utils.py", "exec"), scope)
-    schedules = definitions("schedulers/common.py", {"get_coeff_shapes_tuple", "reshape_rates",
-                                                     "NoiseScheduler", "GeneralizedNoiseScheduler"},
-                            wide=wide)
-    schedules += definitions("schedulers/karras.py", {"KarrasVENoiseScheduler"}, wide=wide)
-    exec(compile(ast.Module(body=schedules, type_ignores=[]), "flaxdiff/schedulers", "exec"), scope)
-    methods = [node for node in definitions("samplers/common.py", {"DiffusionSampler"}, wide=wide)[0].body
-               if isinstance(node, ast.FunctionDef)
-               and node.name in {"sample_step", "get_steps", "generate_samples"}]
-    assert len(methods) == 3, [node.name for node in methods]
+    ran(statements("utils.py", {"MarkovState", "RandomMarkovState", "clip_images"}), scope,
+        "flaxdiff/utils.py")
+    schedules = statements("schedulers/common.py", {"get_coeff_shapes_tuple", "reshape_rates",
+                                                    "NoiseScheduler", "GeneralizedNoiseScheduler"},
+                           wide=wide)
+    schedules += statements("schedulers/karras.py", {"KarrasVENoiseScheduler"}, wide=wide)
+    ran(schedules, scope, "flaxdiff/schedulers")
+    methods = statements("samplers/common.py", {"sample_step", "get_steps", "generate_samples"}, wide=wide,
+                         within="DiffusionSampler")
     holder = ast.parse("class DiffusionSampler:\n"
                        "    def __init__(self, noise_schedule):\n"
                        "        self.noise_schedule = noise_schedule\n").body[0]
     holder.body.extend(methods)
-    exec(compile(ast.Module(body=[holder], type_ignores=[]), "flaxdiff/samplers/common.py", "exec"),
-         scope)
+    ran([holder], scope, "flaxdiff/samplers/common.py")
     for path, name in SAMPLERS.values():
-        exec(compile(ast.Module(body=definitions(f"samplers/{path}", {name}), type_ignores=[]),
-                     f"flaxdiff/samplers/{path}", "exec"), scope)
+        ran(statements(f"samplers/{path}", {name}), scope, f"flaxdiff/samplers/{path}")
     return scope
 
 
