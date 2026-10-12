@@ -666,18 +666,9 @@ A run names its model as `ModelConfig(name, fields)` and its objective as `Objec
 
 `RunConfig.save` writes the run configuration. It is separate from the state checkpoint. [Recipes](../recipes.md) describes the configuration entry points and their side effects.
 
-`attention_impl` is a model field that names the attention kernel:
+`attention_impl` is a model field that names the attention kernel. Its names, what each runs, and the order in which `'auto'` takes them on each trace are declared once, by `AttentionImpl` in [dew/nn/attention.py](../../src/dew/nn/attention.py); each kernel's conditions are its own predicate there (`reference_only`, `triton_runs`, `flash_refusal`, `cudnn_runs`, `tpu_runs`).
 
-- `'reference'` is the einsum and softmax, and the only path that reads `dtype`, `precision` and `force_fp32_for_softmax`;
-- `'xla'` and `'cudnn'` are the two implementations of `jax.nn.dot_product_attention`;
-- `'tpu'` is the Pallas splash kernel;
-- `'auto'` resolves on each trace, so a configuration logged as `'auto'` also runs on the next machine.
-
-`'auto'` takes `'reference'` for a call that asks for arithmetic only that path performs: a matmul precision above DEFAULT, a softmax outside fp32, or a compute dtype other than the inputs'. `'auto'` and `'xla'` both take `'reference'` for float64 inputs (JAX's XLA attention otherwise narrows their softmax to float32) and for bf16 on a GPU older than sm80. Otherwise `'auto'` takes the first of these whose conditions hold:
-
-- `'cudnn'`, on a GPU of sm80 or later with bf16 or fp16 inputs, a query head width that is a multiple of 8 and at most 128, no softcap, no sinks and no `--xla_gpu_deterministic_ops`;
-- `'tpu'`, on a TPU backend with bf16 or fp32 inputs, query and key lengths that are multiples of 128 and at least 512, no additive bias, whole sequences at the kernel, and a mask splash can describe (the sequence-parallel all-to-all passes whole sequences to the kernel, and the key/value gather does not);
-- `'xla'`.
+`'auto'` and `'xla'` both take `'reference'` for float64 inputs, because JAX's XLA attention narrows their softmax to float32, and for bf16 on a GPU older than sm80, which rejects the bf16 dot algorithm it names.
 
 Splash's mask is a block-sparse descriptor built along with the executable, so a causal or sliding-window sequence skips the blocks its mask empties and does not pay for the whole rectangle. The head width is unconstrained, because the kernel pads it, but the query and key lengths have to be multiples of 128 for its mask blocks to tile them.
 

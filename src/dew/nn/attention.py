@@ -69,12 +69,15 @@ flash kernel (`triton_attention`), which needs tokamax installed
 the dew_flash_attn wheel (docs/installation.md). 'tpu' is the
 pallas splash kernel, with the older pallas flash kernel behind it for the
 calls splash's mask descriptor cannot carry.
-'auto', every module's default, resolves per trace (`resolve_implementation`):
-triton where cudnn's kernel runs and `triton_runs`; flash where
-`flash_refusal` finds none; cudnn where its kernel runs; tpu where splash's does;
-the reference path where the call asks for arithmetic only it honours; and
-xla anywhere else. A call off the kernel the device's target row (`gpu_target().kernels`)
-measured fastest is logged once a process with the reason (`ran_kernel`).
+'auto', every module's default, resolves per trace (`resolve_implementation`),
+so a configuration logged as 'auto' runs on the next machine too: the
+reference path where the call asks for arithmetic only it honours
+(`reference_only`), or where jax.nn's xla kernel would narrow or chain it;
+else triton where cudnn's kernel runs and `triton_runs`; flash where
+`flash_refusal` finds none; cudnn where its kernel runs (`cudnn_runs`); tpu
+where splash's does (`tpu_runs`); and xla anywhere else. A call off the kernel
+the device's target row (`gpu_target().kernels`) measured fastest is logged
+once a process with the reason (`ran_kernel`).
 """
 
 
