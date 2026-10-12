@@ -142,16 +142,22 @@ class Hub:
         return self
 
     def records(self, read: Read) -> Records:
+        """Each row as the split stores it: an image column's encoded bytes,
+        which the image steps decode, so a memory read holds the split, not
+        its decoded pixels."""
         if not self.supports(read):
             raise FileNotFoundError(
                 f"{self.describe()} has no prepared Arrow split at {self.builder.cache_dir}; "
                 "run dew data provision or set provision=True"
             )
         dataset = self.builder.as_dataset(split=self.split, in_memory=read == "memory")
-        from datasets import Dataset
+        from datasets import Dataset, Image
 
         if not isinstance(dataset, Dataset):
             raise TypeError(f"{self.describe()} did not resolve to one split")
+        for name, feature in dataset.features.items():
+            if isinstance(feature, Image) and feature.decode:
+                dataset = dataset.cast_column(name, Image(decode=False))
         return grain.MapDataset.source(dataset).map(_record)
 
     def manifest(self) -> ShardManifest:
