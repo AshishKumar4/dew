@@ -65,13 +65,24 @@ def test_a_conversion_that_moves_under_one_default_commit_is_another_snapshot(mo
     from types import SimpleNamespace
 
     import datasets
-    from huggingface_hub import HfApi
+    import pyarrow.parquet as pq
+    from huggingface_hub import HfApi, HfFileSystem
     from huggingface_hub.hf_api import GitRefInfo, GitRefs
 
     from dew.data import Pipeline, compile
     from dew.data.sources import Hub
 
     converted = ["first"]
+    payloads = {}
+    for commit, start in (("first", 0), ("second", 10)):
+        sink = pa.BufferOutputStream()
+        pq.write_table(pa.table({"id": list(range(start, start + 8))}), sink)
+        payloads[f"datasets/owner/data@{commit}/default/train/0000.parquet"] = sink.getvalue().to_pybytes()
+
+    def header(self, path, **kwargs):
+        payload = payloads[path]
+        return {"name": path, "type": "file", "size": len(payload),
+                "sha256": hashlib.sha256(payload).hexdigest()}
 
     def refs(self, repo, *, repo_type):
         conversion = GitRefInfo(name="parquet", ref="refs/convert/parquet", target_commit=converted[-1])
@@ -87,15 +98,18 @@ def test_a_conversion_that_moves_under_one_default_commit_is_another_snapshot(mo
     monkeypatch.setattr(HfApi, "dataset_info", lambda self, repo, **kwargs: SimpleNamespace(sha="original"))
     monkeypatch.setattr(HfApi, "list_repo_files", listing)
     monkeypatch.setattr(HfApi, "list_repo_refs", refs)
+    monkeypatch.setattr(HfFileSystem, "info", header)
+    monkeypatch.setattr(HfFileSystem, "_open", lambda self, path, **kwargs: io.BytesIO(payloads[path]))
     builder = SimpleNamespace(info=SimpleNamespace(features=None, splits=None))
     monkeypatch.setattr(datasets, "load_dataset_builder", lambda *args, **kwargs: builder)
     source = Hub("owner/data")
-    snapshot = source.snapshot()
+    snapshot = source.files.snapshot()
     saved = plan()
+    assert saved.manifest.source["sources"] == [snapshot]
     converted.append("second")
     assert source.files.url == ("hf://datasets/owner/data@first/default/train/0000.parquet",)
-    assert source.snapshot() == snapshot != Hub("owner/data").snapshot()
-    with pytest.raises(ValueError, match="saved data plan source changed"):
+    assert source.files.snapshot() == snapshot != Hub("owner/data").files.snapshot()
+    with pytest.raises(ValueError, match=r"saved data plan (source|order) changed"):
         plan().check(saved.record())
 
 

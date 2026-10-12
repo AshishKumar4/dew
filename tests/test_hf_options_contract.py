@@ -27,7 +27,7 @@ def test_hub_builder_uses_the_resolved_commit_and_named_configuration(tmp_path, 
     assert source.builder is expected
     assert requested == [("acme/records", {"name": "named", "revision": "frozen", "cache_dir": "arrow"})]
     assert source.snapshot() == {"store": "hf", "repo": "acme/records", "revision": "frozen",
-                                 "streamed": "frozen", "config": "named", "split": "validation"}
+                                 "config": "named", "split": "validation"}
 
 
 def test_a_split_prepared_in_two_caches_is_one_snapshot_and_one_plan(tmp_path, monkeypatch):
@@ -62,8 +62,8 @@ def test_a_split_prepared_in_two_caches_is_one_snapshot_and_one_plan(tmp_path, m
 def test_a_split_with_no_shards_and_no_conversion_reads_indexed_but_not_streamed(tmp_path, monkeypatch):
     """A default revision whose split has no native shards, in a repo with no
     Parquet conversion, has nothing to stream. That is a capability it lacks:
-    its snapshot names no streamed commit, its prepared Arrow compiles and
-    reads by index, and a streamed read is refused as unavailable."""
+    its prepared Arrow compiles and reads by index, and a streamed read is
+    refused as unavailable."""
     import datasets
     import httpx
     from huggingface_hub import HfApi
@@ -89,7 +89,7 @@ def test_a_split_with_no_shards_and_no_conversion_reads_indexed_but_not_streamed
     monkeypatch.setattr(HfApi, "list_repo_refs",
                         lambda self, repo_id, **kwargs: GitRefs(branches=[], converts=[], tags=[]))
     monkeypatch.setattr(datasets, "load_dataset_builder", lambda *args, **kwargs: builder)
-    assert Hub("acme/records").snapshot()["streamed"] is None
+    assert Hub("acme/records").streamed is None
     pipeline = Pipeline(Hub("acme/records")).batch(2)
     reader = compile(pipeline, read="indexed", loading=Loading(workers=0)).train(DataPartition())
     try:
@@ -98,6 +98,83 @@ def test_a_split_with_no_shards_and_no_conversion_reads_indexed_but_not_streamed
         reader.close()
     with pytest.raises(ValueError, match=r"read='streamed' is unavailable for hf:acme/records@frozen"):
         compile(Pipeline(Hub("acme/records")).batch(2), read="streamed", loading=Loading(workers=0))
+
+
+@pytest.mark.parametrize("read", ["indexed", "memory"])
+def test_a_prepared_arrow_read_resumes_when_only_the_parquet_conversion_moves(tmp_path, monkeypatch, read):
+    import datasets
+    from huggingface_hub import HfApi
+    from huggingface_hub.hf_api import GitRefInfo, GitRefs
+
+    from dew.data import DataPartition, Loading, Pipeline, compile
+
+    rows = tmp_path / "rows.parquet"
+    datasets.Dataset.from_dict({"id": list(range(8))}).to_parquet(rows)
+    builder = datasets.load_dataset_builder("parquet", data_files={"train": str(rows)},
+                                            cache_dir=str(tmp_path / "arrow"))
+    builder.download_and_prepare()
+    converted = ["first"]
+
+    def refs(self, repo_id, **kwargs):
+        ref = GitRefInfo(name="parquet", ref="refs/convert/parquet", target_commit=converted[-1])
+        return GitRefs(branches=[], converts=[ref], tags=[])
+
+    def listing(self, repo_id, *, revision, repo_type):
+        return ["train.tar"] if revision == "original" else ["default/train/0000.parquet"]
+
+    monkeypatch.setattr(HfApi, "dataset_info",
+                        lambda self, repo_id, **kwargs: SimpleNamespace(sha="original"))
+    monkeypatch.setattr(HfApi, "list_repo_files", listing)
+    monkeypatch.setattr(HfApi, "list_repo_refs", refs)
+    monkeypatch.setattr(datasets, "load_dataset_builder", lambda *args, **kwargs: builder)
+
+    def reader():
+        pipeline = Pipeline(Hub("acme/records")).shuffle(0).repeat().batch(2)
+        return compile(pipeline, read=read, loading=Loading(workers=0)).train(DataPartition())
+
+    first = reader()
+    try:
+        next(first)
+        state = first.get_state()
+        expected = next(first)["id"].tolist()
+    finally:
+        first.close()
+    converted.append("second")
+    resumed = reader()
+    try:
+        resumed.set_state(state)
+        assert resumed.manifest_changes == ()
+        assert next(resumed)["id"].tolist() == expected
+    finally:
+        resumed.close()
+
+
+def test_an_indexed_hub_read_does_not_list_refs_or_files(tmp_path, monkeypatch):
+    import datasets
+    from huggingface_hub import HfApi
+
+    from dew.data import DataPartition, Loading, Pipeline, compile
+
+    rows = tmp_path / "rows.parquet"
+    datasets.Dataset.from_dict({"id": list(range(8))}).to_parquet(rows)
+    builder = datasets.load_dataset_builder("parquet", data_files={"train": str(rows)},
+                                            cache_dir=str(tmp_path / "arrow"))
+    builder.download_and_prepare()
+
+    def unused(*args, **kwargs):
+        raise AssertionError("an indexed read does not use the repo's physical shards or conversion")
+
+    monkeypatch.setattr(HfApi, "dataset_info",
+                        lambda self, repo_id, **kwargs: SimpleNamespace(sha="original"))
+    monkeypatch.setattr(HfApi, "list_repo_files", unused)
+    monkeypatch.setattr(HfApi, "list_repo_refs", unused)
+    monkeypatch.setattr(datasets, "load_dataset_builder", lambda *args, **kwargs: builder)
+    pipeline = Pipeline(Hub("acme/records")).batch(2)
+    reader = compile(pipeline, read="indexed", loading=Loading(workers=0)).train(DataPartition())
+    try:
+        assert sorted(int(value) for _ in range(4) for value in next(reader)["id"]) == list(range(8))
+    finally:
+        reader.close()
 
 
 def test_hub_bindings_are_frozen():
