@@ -46,6 +46,7 @@ from dew.interop.weights import ParamTree, translate_parameters
 from dew.nn.attention import LayerNorm, RMSNorm
 from dew.nn.backbones.decoder_block import BlockWiring, DecoderBlock, GatedMLP
 from dew.nn.conv import Conv
+from dew.nn.flops import matching_lengths, patch_lengths
 from dew.nn.inputs import AttentionMetadata
 from dew.nn.mixers.attention import CausalSelfAttention
 from dew.nn.sharding import logical_axes
@@ -125,16 +126,29 @@ class CLIPTextTransformer(nn.Module):
     precision: PrecisionLike = None
     activation: str = "quick_gelu"
 
+    @property
+    def emb_features(self) -> int:
+        """The width of the hidden states exposed to a conditioner."""
+        return self.hidden_size
+
+    @nn.nowrap
+    def _layer(self, name=None):
+        return clip_layer(self.hidden_size, self.num_heads, self.intermediate_size,
+                          self.max_position_embeddings, causal=True, activation=self.activation,
+                          eps=self.layer_norm_eps, dtype=self.dtype, precision=self.precision, name=name)
+
+    @nn.nowrap
+    def model_flops(self, lengths) -> float:
+        """Causal text layers, excluding only token/position-table lookups."""
+        return self.num_layers * self._layer().model_flops(lengths)
+
     def setup(self):
         embed = functools.partial(nn.Embed, features=self.hidden_size, dtype=self.dtype)
         self.token_embedding = embed(self.vocab_size, name="token_embedding")
         self.position_embedding = embed(self.max_position_embeddings,
                                         name="position_embedding")
         self.layers = [
-            clip_layer(self.hidden_size, self.num_heads, self.intermediate_size,
-                       self.max_position_embeddings, causal=True, activation=self.activation,
-                       eps=self.layer_norm_eps, dtype=self.dtype, precision=self.precision,
-                       name=f"layers_{index}")
+            self._layer(name=f"layers_{index}")
             for index in range(self.num_layers)]
         self.final_layer_norm = LayerNorm(
             epsilon=self.layer_norm_eps, dtype=self.dtype, name="final_layer_norm")
@@ -189,25 +203,42 @@ class CLIPVisionTransformer(nn.Module):
     dtype: Dtype | None = None
     precision: PrecisionLike = None
 
+    @nn.nowrap
+    def _layer(self, name=None):
+        patches = (self.image_size // self.patch_size) ** 2
+        return clip_layer(self.hidden_size, self.num_heads, self.intermediate_size, patches + 1,
+                          eps=self.layer_norm_eps, dtype=self.dtype, precision=self.precision, name=name)
+
+    @nn.nowrap
+    def _patch_embedding(self, **scope):
+        return Conv(self.hidden_size, (self.patch_size, self.patch_size),
+                    strides=(self.patch_size, self.patch_size), padding="VALID", use_bias=False,
+                    dtype=self.dtype, precision=self.precision, **scope)
+
+    @nn.nowrap
+    def model_flops(self, lengths) -> float:
+        """The patch map and full-attention layers over patches and the class token."""
+        length, = matching_lengths(lengths)
+        return (self._patch_embedding(parent=None).model_flops(lengths, self.num_channels)
+                + self.num_layers * self._layer().model_flops((length + 1).astype(np.int64)))
+
+    @nn.nowrap
+    def image_lengths(self, sample_shape: tuple[int, ...], rows: int) -> np.ndarray:
+        return patch_lengths(sample_shape, (self.patch_size, self.patch_size), rows)
+
     def setup(self):
         patches = (self.image_size // self.patch_size) ** 2
         self.class_embedding = self.param(
             "class_embedding", nn.initializers.normal(self.hidden_size ** -0.5),
             (self.hidden_size,))
-        self.patch_embedding = Conv(
-            self.hidden_size, (self.patch_size, self.patch_size),
-            strides=(self.patch_size, self.patch_size), padding="VALID",
-            use_bias=False, dtype=self.dtype, precision=self.precision,
-            name="patch_embedding")
+        self.patch_embedding = self._patch_embedding(name="patch_embedding")
         self.position_embedding = nn.Embed(patches + 1, self.hidden_size,
                                            dtype=self.dtype, name="position_embedding")
         norm = functools.partial(LayerNorm, epsilon=self.layer_norm_eps,
                                  dtype=self.dtype)
         self.pre_layernorm = norm(name="pre_layernorm")
         self.layers = [
-            clip_layer(self.hidden_size, self.num_heads, self.intermediate_size, patches + 1,
-                       eps=self.layer_norm_eps, dtype=self.dtype, precision=self.precision,
-                       name=f"layers_{index}")
+            self._layer(name=f"layers_{index}")
             for index in range(self.num_layers)]
         self.post_layernorm = norm(name="post_layernorm")
 
@@ -690,6 +721,30 @@ class T5EncoderTransformer(nn.Module):
     dtype: Dtype | None = None
     precision: PrecisionLike = None
 
+    @property
+    def emb_features(self) -> int:
+        """The width of the hidden states exposed to a conditioner."""
+        return self.d_model
+
+    @nn.nowrap
+    def _layer(self, **scope):
+        attention = functools.partial(
+            CausalSelfAttention, emb_features=self.d_model, num_heads=self.num_heads,
+            num_kv_heads=self.num_heads, head_dim=self.head_dim, max_seq_len=0, causal=False, nope=True,
+            qk_norm=False, attention_scale=1.0, attention_dropout_rate=self.dropout_rate, dtype=self.dtype,
+            precision=self.precision)
+        mlp = functools.partial(GatedMLP, hidden_features=self.d_ff, out_features=self.d_model,
+                                activation=_T5_FEED_FORWARDS[self.feed_forward_proj],
+                                dropout_rate=self.dropout_rate, dtype=self.dtype, precision=self.precision)
+        return DecoderBlock(attention, mlp, self.d_model, BlockWiring(), norm_eps=self.layer_norm_epsilon,
+                            dropout_rate=self.dropout_rate, dtype=self.dtype,
+                            precision=self.precision, **scope)
+
+    @nn.nowrap
+    def model_flops(self, lengths) -> float:
+        """The same bidirectional attention and plain/gated feed-forward as the encoder."""
+        return self.num_layers * self._layer(parent=None).model_flops(lengths)
+
     def setup(self):
         if self.feed_forward_proj not in _T5_FEED_FORWARDS:
             raise ValueError(
@@ -699,18 +754,8 @@ class T5EncoderTransformer(nn.Module):
         self.relative_attention_bias = [
             nn.Embed(self.num_buckets, self.num_heads, name=f"relative_attention_bias_{index}")
             for index in range(self.num_layers if self.per_layer_bias else 1)]
-        attention = functools.partial(
-            CausalSelfAttention, emb_features=self.d_model, num_heads=self.num_heads,
-            num_kv_heads=self.num_heads, head_dim=self.head_dim, max_seq_len=0, causal=False, nope=True,
-            qk_norm=False, attention_scale=1.0, attention_dropout_rate=self.dropout_rate, dtype=self.dtype,
-            precision=self.precision)
-        mlp = functools.partial(GatedMLP, hidden_features=self.d_ff, out_features=self.d_model,
-                                activation=_T5_FEED_FORWARDS[self.feed_forward_proj],
-                                dropout_rate=self.dropout_rate, dtype=self.dtype, precision=self.precision)
         self.layers = [
-            DecoderBlock(attention, mlp, self.d_model, BlockWiring(), norm_eps=self.layer_norm_epsilon,
-                         dropout_rate=self.dropout_rate, dtype=self.dtype, precision=self.precision,
-                         name=f"layers_{index}")
+            self._layer(name=f"layers_{index}")
             for index in range(self.num_layers)]
         self.final_norm = RMSNorm(epsilon=self.layer_norm_epsilon, dtype=self.dtype, name="final_layer_norm")
         self.dropout = nn.Dropout(rate=self.dropout_rate)

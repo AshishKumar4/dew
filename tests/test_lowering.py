@@ -16,7 +16,6 @@ from jax.sharding import Mesh
 from dew.nn.kernels.generation import (
     PALLAS_CHOICES,
     TARGETS,
-    UNLOWERABLE,
     assumed,
     backend,
     bf16_dot_runs,
@@ -133,25 +132,21 @@ def test_a_kernel_traced_for_an_assumed_gpu_lowers_to_a_named_triton_call():
 
 # The Triton kernels each Pallas choice a KERNELS row can name lowers to, by their `pallas_call` names,
 # and the probe that runs them: the Clef recipe's step (tools/clef_step.py), or an expert layer's
-# forward and backward (`_experts_lowered`). None for a kernel whose Triton lowering no CPU reaches
-# (`dew.nn.kernels.generation.UNLOWERABLE`).
+# forward and backward (`_experts_lowered`).
 FAMILIES = {
     ('grouped_matmul', 'pallas'): ("experts", {"pallas_triton_ragged_dot", "tgmm_ragged_dot"}),
-    ('tokamax_grouped_matmul', 'triton'): ("experts", None),
     ('rms_norm', 'pallas'): ("step", {"rms_norm_forward", "rms_norm_backward"}),
     ('swiglu', 'pallas'): ("step", {"swiglu_forward", "swiglu_backward"}),
+    ('gated_delta_rule', 'fla'): ("step", {"fla_chunk_local_cumsum", "fla_kkt_solve", "fla_recompute_w_u",
+                                           "fla_chunk_fwd_h", "fla_chunk_fwd_o", "fla_chunk_bwd_dv_local",
+                                           "fla_chunk_bwd_dhu", "fla_chunk_bwd_dqkwg",
+                                           "fla_prepare_wy_repr_bwd"}),
 }
 
 GPUS = sorted({generation for generation, target in TARGETS.items()
                if generation.startswith('sm') and target.kernels}
               | {'sm80', 'sm120'}, key=lambda generation: int(generation[2:]))
 """Every CUDA generation a KERNELS row names, and the A100's and the G4's, which Dew's sessions take."""
-
-GATED_DELTA_RULE = {"fla_chunk_local_cumsum", "fla_kkt_solve", "fla_recompute_w_u", "fla_chunk_fwd_h",
-                    "fla_chunk_fwd_o", "fla_chunk_bwd_dv_local", "fla_chunk_bwd_dhu", "fla_chunk_bwd_dqkwg",
-                    "fla_prepare_wy_repr_bwd"}
-"""The port's kernels (dew.nn.kernels.fla_gdn), which every GPU step with a Gated DeltaNet calls: no
-KERNELS row chooses them, a GPU runs no other."""
 
 SHORT_CONV = {"short_conv_forward", "short_conv_backward"}
 """The short conv's kernels (`causal_conv1d`), which every GPU step with a recurrent mixer calls."""
@@ -169,7 +164,6 @@ def test_every_pallas_choice_a_row_names_has_a_lowering_probe():
     named = {(choice, kernel) for target in TARGETS.values() for choice, kernel in target.kernels.items()
              if kernel in PALLAS_CHOICES}
     assert named <= set(FAMILIES), sorted(named - set(FAMILIES))
-    assert {key for key, (_, names) in FAMILIES.items() if names is None} == set(UNLOWERABLE)
 
 
 @pytest.mark.parametrize("generation", ["sm80", "sm120"])
@@ -201,15 +195,14 @@ def test_the_compensated_norm_vjp_lowers_for_both_gpu_generations(generation):
 def test_the_clef_step_lowers_for_the_gpu_with_every_kernel_its_generation_chooses(generation, tmp_path):
     """c58's and c57's step, the Clef recipe's decision step over a Qwen 3.5 hybrid, lowered on this CPU
     for their GPUs, an A100 and a G4 (tools/clef_step.py): it lowers, and it calls the Triton kernels
-    of the gated delta rule's port, of the short conv and of every Pallas choice the generation's KERNELS
-    row names for its layers, so none was interpreted or refused."""
+    of the short conv and of every Pallas choice the generation's KERNELS row names for its layers, the
+    gated delta rule's port among them, so none was interpreted or refused."""
     done = subprocess.run([sys.executable, str(ROOT / "tools" / "clef_step.py"), "--lower-for", generation,
                            "--work", str(tmp_path)], capture_output=True, text=True, cwd=ROOT, timeout=1500,
                           env={**os.environ, "JAX_PLATFORMS": "cpu"})
     assert done.returncode == 0, done.stderr[-4000:]
     kernels = json.loads(done.stdout.splitlines()[-1])["kernels"]
-    assert set(kernels) == (GATED_DELTA_RULE | SHORT_CONV).union(
-        *(FAMILIES[key][1] for key in chosen(generation, "step")))
+    assert set(kernels) == SHORT_CONV.union(*(FAMILIES[key][1] for key in chosen(generation, "step")))
 
 
 def _experts_lowered(generation: str, implementation: str):
@@ -239,15 +232,3 @@ def test_an_expert_layer_lowers_for_the_gpu_with_the_grouped_matmul_its_generati
     expected = set().union(*(FAMILIES[key][1] for key in chosen(generation, "experts")
                              if key[0] == 'grouped_matmul'))
     assert set(triton_kernels(_experts_lowered(generation, 'auto'))) == expected
-
-
-@pytest.mark.parametrize("generation", [generation for generation in GPUS
-                                        if 'tokamax_grouped_matmul' in dict(chosen(generation, "experts"))])
-def test_tokamax_lowers_for_the_gpu_its_row_names(generation):
-    """'tokamax', an opt-in implementation 'auto' never takes, names its Triton kernel per generation;
-    tokamax registers that kernel only on a host with a GPU, so a CPU's dry run skips it, and the
-    kernel lab's verify on the GPU runs it (tests/test_moe.py)."""
-    api = pytest.importorskip("tokamax._src.ops.ragged_dot.api")
-    if 'triton' not in api.IMPLEMENTATIONS:
-        pytest.skip("tokamax registers its Triton ragged dot only where a GPU is present")
-    assert triton_kernels(_experts_lowered(generation, 'tokamax'))

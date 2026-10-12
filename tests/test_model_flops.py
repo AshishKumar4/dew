@@ -345,10 +345,37 @@ def test_diffusion_uncertainty_weighting_refuses_its_uncounted_head():
         objective.training_flops(None, {"images": np.zeros((2, 4, 4, 3), np.float32)})
 
 
-def test_lm_trained_prediction_depths_refuse_their_uncounted_geometry():
-    objective = LMObjective(decoder(num_nextn_predict_layers=1), seq_len=6, mtp_weight=1.0)
-    with pytest.raises(MissingFlopsCount, match="prediction-depth geometry"):
-        objective.training_flops(None, packed_batch())
+@pytest.mark.parametrize("mtp_weight", [None, 1.0])
+def test_lm_counts_only_the_prediction_depths_the_loss_trains(mtp_weight):
+    objective = LMObjective(decoder(num_nextn_predict_layers=1), seq_len=6, mtp_weight=mtp_weight)
+    batch = packed_batch()
+    trunk = (objective.model.model_flops(objective.real_lengths(batch))
+             + objective.model.logits_flops(objective._prediction_lengths(batch)))
+    depths = objective.model.prediction_flops(objective.real_lengths(batch),
+        prediction_lengths=objective._prediction_rows(objective.model, batch)) if mtp_weight else 0
+    assert objective.training_flops(None, batch) == 3 * (trunk + depths)
+
+
+@pytest.mark.parametrize("packed", [False, True])
+def test_prediction_depth_work_excludes_pad_holes_and_unscored_document_boundaries(packed):
+    model = decoder(num_nextn_predict_layers=2)
+    objective = LMObjective(model, seq_len=6, pad_id=0, mtp_weight=1.0)
+    ids = np.array([[1, 2, 0, 3, 4, 5, 0]], np.int32)
+    fields = {"attention_mask": ids != 0}
+    if packed:
+        fields["segment_ids"] = np.array([[1, 1, 0, 2, 2, 2, 0]], np.int32)
+    batch = {"text": ModelInputs(ids, token_fields=fields)}
+    rows = objective._prediction_rows(model, batch)
+    np.testing.assert_array_equal(rows[0][0], [1, 2] if packed else [3])
+    np.testing.assert_array_equal(rows[0][1], [1])
+    np.testing.assert_array_equal(rows[1][0], [1])
+    np.testing.assert_array_equal(rows[1][1], [] if packed else [0])
+    lengths = objective.real_lengths(batch)
+    desired = (model.model_flops(lengths) + model.logits_flops(np.array([3]))
+               + model.prediction_flops(lengths, prediction_lengths=rows))
+    assert objective.model_flops(None, batch) == desired
+    assert desired < (model.model_flops(lengths) + model.logits_flops(np.array([3]))
+                      + model.prediction_flops(lengths))
 
 
 @pytest.mark.mesh(devices=2)

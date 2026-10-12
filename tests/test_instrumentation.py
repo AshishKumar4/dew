@@ -4,6 +4,7 @@ None of the performance work is evaluable without these numbers, so they get
 the same treatment as the training maths.
 """
 
+import importlib.metadata
 import itertools
 import os
 import threading
@@ -584,7 +585,7 @@ def test_fit_reports_throughput_to_the_tracker():
     assert all(p["train/samples_per_sec"] > 0 for p in ticks)
 
 
-@pytest.mark.parametrize("kind", ["custom", "tokens", "lora", "dpo", "multistream"])
+@pytest.mark.parametrize("kind", ["custom", "tokens", "lora", "dpo"])
 def test_fit_without_analytical_work_trains_on_known_peak_hardware(monkeypatch, capsys, kind):
     from dew.nn.kernels import TARGETS, GpuTarget
 
@@ -608,12 +609,6 @@ def test_fit_without_analytical_work_trains_on_known_peak_hardware(monkeypatch, 
                 yield {IDS_KEY: ids, MASK_KEY: np.ones_like(ids, bool)}
 
         data = Data(pairs)
-    elif kind == "multistream":
-        # Counted as a decoder, but its residual streams' mixing declares no work.
-        model = models.build('causal_transformer', vocab_size=16, emb_features=8, num_layers=1, num_heads=1,
-                             mlp_features=16, max_seq_len=4, hyper_connections=HyperConnections(hc_mult=2))
-        objective = LMObjective(model, 4)
-        data = Data(lambda: token_batches(BATCH, 4, 16))
     tracker = RecordingTracker()
     trainer = Trainer(objective, optax.adam(1e-3), key=0, tracker=tracker)
     state = trainer.fit(data, steps=3, log_every=1)
@@ -655,7 +650,7 @@ def test_a_batch_that_cannot_be_counted_ends_mfu_and_the_run_trains_on(monkeypat
     assert capsys.readouterr().out.count("train/mfu is unavailable for StopsCounting: ") == 1
 
 
-@pytest.mark.parametrize("kind", ["custom", "lm", "lora"])
+@pytest.mark.parametrize("kind", ["custom", "lm", "lora", "multistream"])
 def test_fit_with_analytical_work_reports_mfu_on_known_peak_hardware(monkeypatch, capsys, kind):
     from dew.nn.kernels import TARGETS, GpuTarget
 
@@ -674,6 +669,8 @@ def test_fit_with_analytical_work_reports_mfu_on_known_peak_hardware(monkeypatch
         if kind == "lora":
             adapter = LoRA(1, ("q_proj",)).apply(objective.model, objective.init(jax.random.key(0)), key=1)
             objective.model, objective.variables = adapter.model, adapter.variables
+        elif kind == "multistream":
+            objective.model = objective.model.clone(hyper_connections=HyperConnections(hc_mult=2))
         trainer.tracker = tracker
         data = Data(lambda: token_batches(BATCH, 4, 16))
         batch = next(token_batches(BATCH, 4, 16))
@@ -751,6 +748,25 @@ def test_compilation_cache_directory_is_configured(tmp_path):
     enable_compilation_cache(path)
     assert os.path.isdir(path)
     assert jax.config.jax_compilation_cache_dir == path
+
+
+def test_the_gpu_autotuners_picks_persist_beside_the_executables_for_this_xla(tmp_path, monkeypatch):
+    """A later compile of the same fusions takes the picks without measuring
+    them; a directory the run names is its own."""
+    previous = jax.config.jax_compilation_cache_dir
+    try:
+        monkeypatch.setenv("XLA_FLAGS", "--xla_gpu_autotune_level=4")
+        enable_compilation_cache(str(tmp_path / "cache"))
+        picks = tmp_path / "cache" / "autotune" / f"jaxlib-{importlib.metadata.version('jaxlib')}"
+        assert os.environ["XLA_FLAGS"].split() == [
+            "--xla_gpu_autotune_level=4", f"--xla_gpu_per_fusion_autotune_cache_dir={picks}"]
+        assert picks.is_dir()
+        named = "--xla_gpu_per_fusion_autotune_cache_dir=/elsewhere"
+        monkeypatch.setenv("XLA_FLAGS", named)
+        enable_compilation_cache(str(tmp_path / "cache"))
+        assert os.environ["XLA_FLAGS"] == named
+    finally:
+        jax.config.update("jax_compilation_cache_dir", previous)
 
 
 def test_the_default_compilation_cache_is_the_directory_jax_is_configured_with(tmp_path, monkeypatch):

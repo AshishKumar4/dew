@@ -9,6 +9,7 @@ from functools import partial
 from typing import Literal, Self
 
 import jax.numpy as jnp
+import numpy as np
 from flax import linen as nn
 
 from dew.records import JSON
@@ -26,6 +27,7 @@ from ..dit import (
     restored_remat,
     stronger_remat,
 )
+from ..flops import MissingFlopsCount, matching_lengths, patch_lengths, projection_flops
 from ..precision import at_least_fp32
 from ..rope import rotary_freqs
 from ..scan_orders import hilbert_patchify, hilbert_unpatchify, unpatchify
@@ -70,13 +72,62 @@ class UViT(_TransformerOptions):
     image_size: int = 512
     scan_order: Literal["raster", "hilbert"] = "raster"
 
+    @nn.nowrap
+    def projections(self, input_channels: int = 0, text_features: int = 0) -> dict[str, tuple[int, int]]:
+        width = self.emb_features
+        maps = {'hilbert_projection': (self.patch_size**2 * input_channels, width),
+                'context_embed': (text_features, width), 'skip_linear': (2 * width, width),
+                'decoder_pred': (width, self.patch_size**2 * self.output_channels)}
+        if self.mlp_time_embed:
+            maps.update({'time_embed_0': (width, 4 * width), 'time_embed_2': (4 * width, width)})
+        return maps
+
+    @nn.nowrap
+    def model_flops(self, lengths) -> float:
+        raise MissingFlopsCount("UViT requires multimodal_flops with input channels and text geometry")
+
+    @nn.nowrap
+    def image_lengths(self, sample_shape: tuple[int, ...], rows: int) -> np.ndarray:
+        return patch_lengths(sample_shape, (self.patch_size, self.patch_size), rows)
+
+    @nn.nowrap
+    def multimodal_flops(self, lengths, context_lengths, input_channels: int,
+                         text_features: int) -> float:
+        """The time token, U-shaped skips, all input maps and final image convolution."""
+        image, text = matching_lengths(lengths, context_lengths)
+        joined, rows = (image + text + 1).astype(np.int64), np.ones(image.shape, np.int64)
+        width, patch = self.emb_features, self.patch_size**2
+        maps = self.projections(input_channels, text_features)
+        count = (projection_flops(lengths, *maps['hilbert_projection'])
+                 + projection_flops(context_lengths, *maps['context_embed']))
+        block = ModulatedBlock(width, self.num_heads, modulated=False, **self._block_options(), parent=None)
+        count += (self.num_layers + 1) * block.model_flops(joined)
+        count += (self.num_layers // 2) * projection_flops(joined, *maps['skip_linear'])
+        # decoder_pred reads time/text too, before __call__ slices to the image.
+        count += projection_flops(joined, *maps['decoder_pred'])
+        if self.mlp_time_embed:
+            count += sum(projection_flops(rows, *maps[name]) for name in ('time_embed_0', 'time_embed_2'))
+        if self.conv:
+            count += self._final_layer(parent=None).model_flops((image * patch).astype(np.int64),
+                                                               self.output_channels)
+        return count
+
+    @nn.nowrap
+    def image_flops(self, lengths, input_channels: int, text_features: int | None = None) -> float:
+        if text_features is not None:
+            raise MissingFlopsCount("UViT text tokens need multimodal_flops, not only a pooled width")
+        return self.multimodal_flops(lengths, np.zeros(np.shape(lengths), np.int64), input_channels, 0)
+
     def setup(self):
         if self.num_layers % 2:
             raise ValueError(f"UViT splits its layers into a down and an up half; {self.num_layers} "
                              "is odd")
-        dense = partial(nn.Dense, dtype=self.dtype, precision=self.precision)
+        maps = self.projections()
+        def dense(name, **options):
+            key = 'skip_linear' if name.startswith('skip_linear_') else name
+            return nn.Dense(maps[key][1], dtype=self.dtype, precision=self.precision, name=name, **options)
         if self.scan_order == "hilbert":
-            self.hilbert_proj = dense(self.emb_features, name="hilbert_projection")
+            self.hilbert_proj = dense("hilbert_projection")
         else:
             self.patch_embed = PatchEmbedding(patch_size=self.patch_size, embedding_dim=self.emb_features,
                                               dtype=self.dtype, precision=self.precision, name="patch_embed")
@@ -84,22 +135,23 @@ class UViT(_TransformerOptions):
         self.pos_embed = self.param("pos_embed", nn.initializers.truncated_normal(0.02),
                                     (1, 1 + self.text_tokens + patches, self.emb_features))
         if self.mlp_time_embed:
-            self.time_mlp = [dense(4 * self.emb_features, name="time_embed_0"),
-                             dense(self.emb_features, name="time_embed_2")]
-        self.context_embed = dense(self.emb_features, name="context_embed")
+            self.time_mlp = [dense("time_embed_0"), dense("time_embed_2")]
+        self.context_embed = dense("context_embed")
         block = partial(ModulatedBlock, features=self.emb_features, num_heads=self.num_heads, modulated=False,
                         qkv_bias=False, gelu_approximate=False, **self._block_options())
         half = self.num_layers // 2
         self.in_blocks = [block(name=f"in_blocks_{i}") for i in range(half)]
         self.mid_block = block(name="mid_block")
-        self.skip_linear = [dense(self.emb_features, name=f"skip_linear_{i}") for i in range(half)]
+        self.skip_linear = [dense(f"skip_linear_{i}") for i in range(half)]
         self.out_blocks = [block(name=f"out_blocks_{i}") for i in range(half)]
         self.norm = LayerNorm(epsilon=self.norm_epsilon, dtype=self.dtype, name="norm")
-        self.decoder_pred = dense(self.patch_size ** 2 * self.output_channels,
-                                  kernel_init=nn.initializers.zeros, name="decoder_pred")
+        self.decoder_pred = dense("decoder_pred", kernel_init=nn.initializers.zeros)
         if self.conv:
-            self.final_layer = Conv(self.output_channels, (3, 3), padding="SAME", dtype=self.dtype,
-                                    precision=self.precision, name="final_layer")
+            self.final_layer = self._final_layer(name="final_layer")
+
+    def _final_layer(self, **scope):
+        return Conv(self.output_channels, (3, 3), padding="SAME", dtype=self.dtype,
+                    precision=self.precision, **scope)
 
     def __call__(self, x, temb, textcontext=None, train: bool = False):
         _, H, W, _ = x.shape
@@ -173,6 +225,35 @@ class SimpleUDiT(_TransformerOptions):
     text_pooling: Literal["real", "all"] = "real"
 
     @nn.nowrap
+    def projections(self, input_channels: int = 0) -> dict[str, tuple[int, int]]:
+        return {'hilbert_projection': (self.patch_size**2 * input_channels, self.emb_features),
+                'up_dense': (2 * self.emb_features, self.emb_features)}
+
+    def _block(self, remat: RematChoice = False, **scope) -> ModulatedBlock:
+        return remat_block(ModulatedBlock, remat)(features=self.emb_features, num_heads=self.num_heads,
+                                                 dropout_rate=self.dropout_rate, adaln_silu=self.adaln_silu,
+                                                 **self._block_options(), **scope)
+
+    @nn.nowrap
+    def model_flops(self, lengths) -> float:
+        raise MissingFlopsCount("SimpleUDiT requires image_flops(lengths, input_channels, text_features)")
+
+    @nn.nowrap
+    def image_lengths(self, sample_shape: tuple[int, ...], rows: int) -> np.ndarray:
+        return patch_lengths(sample_shape, (self.patch_size, self.patch_size), rows)
+
+    @nn.nowrap
+    def image_flops(self, lengths, input_channels: int, text_features: int | None = None) -> float:
+        """Patch/time/pooled maps, modulated blocks and the up-path skip maps."""
+        return (PatchEmbedding(self.patch_size, self.emb_features, parent=None).model_flops(
+                    lengths, input_channels)
+                + self._conditioning(self.emb_features, text_pooling=self.text_pooling).model_flops(
+                    lengths, text_features)
+                + (self.num_layers + 1) * self._block(parent=None).model_flops(lengths)
+                + (self.num_layers // 2) * projection_flops(lengths, *self.projections()['up_dense'])
+                + self._output(self.patch_size, self.output_channels).model_flops(lengths, self.emb_features))
+
+    @nn.nowrap
     def recompute_record(self) -> JSON:
         return self.remat
 
@@ -199,26 +280,19 @@ class SimpleUDiT(_TransformerOptions):
         )
         if self.scan_order == "hilbert":
             self.hilbert_proj = nn.Dense(
-                features=self.emb_features,
+                features=self.projections()['hilbert_projection'][1],
                 dtype=self.dtype,
                 precision=self.precision,
                 name="hilbert_projection"
             )
         self.conditioning = self._conditioning(self.emb_features, text_pooling=self.text_pooling)
 
-        block = partial(
-            remat_block(ModulatedBlock, self.remat),
-            features=self.emb_features,
-            num_heads=self.num_heads,
-            dropout_rate=self.dropout_rate,
-            adaln_silu=self.adaln_silu,
-            **self._block_options(),
-        )
+        block = partial(self._block, self.remat)
         self.down_blocks = [block(name=f"down_block_{i}") for i in range(half_layers)]
         self.mid_block = block(name="mid_block")
         self.up_dense = [
             nn.DenseGeneral(
-                features=self.emb_features,
+                features=self.projections()['up_dense'][1],
                 dtype=self.dtype,
                 precision=self.precision,
                 name=f"up_dense_{i}"
