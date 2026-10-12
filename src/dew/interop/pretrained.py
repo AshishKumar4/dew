@@ -1100,12 +1100,18 @@ def _input_quantization(model: nn.Module, variables: Variables, layouts: tuple[W
     member, which this per-Linear binding cannot compute, so they are refused
     before returning a model with the wrong activation forward.
     """
-    from dew.training.quantization import INPUT_SCALES, QUANTIZATION, InputQuantization, InputQuantizer
+    from dew.training.quantization import (
+        INPUT_SCALES,
+        QUANTIZATION,
+        InputKind,
+        InputQuantization,
+        InputQuantizer,
+    )
 
     codec = source_quantization(config)
     if codec is None or codec.input_scale_dtype is None:
         return model, variables
-    sites: dict[tuple[str, ...], tuple[str, np.ndarray]] = {}
+    sites: dict[tuple[str, ...], tuple[InputKind, jax.Array]] = {}
     for layout in layouts:
         part = layout.name.removesuffix('.weight') + codec.input_suffix
         if part not in grid:
