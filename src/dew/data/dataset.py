@@ -334,10 +334,18 @@ class Loading:
     - `worker_buffer`: whole batches one worker holds ready for the training
       process.
 
-    A read is a whole batch where the order is indexed, which is cut into
-    batches by index before any reader starts, as Grain's own indexed
-    pipelines are, and a record where the order streams and is batched as it
-    arrives.
+    `threads` and `read_buffer` count the elements a read produces: a whole
+    batch where the order is indexed, which is cut into batches by index
+    before any reader starts, as Grain's own indexed pipelines are, and a
+    record where the order streams and is batched as it arrives.
+
+    The defaults, 16 reads in flight and 16 held ahead, keep enough reads in
+    flight for a remote store's latency while holding few batches. On an
+    8-core armada host with two workers, Dew read 128-pixel images at 0.91 to
+    1.04 times plain Grain under the same settings, within the run-to-run
+    noise of parity, and held about 32 batches, 50 MB for 32 such images, per
+    worker. 64 and 128 buffered 300 MB per worker and matched Grain only
+    because Grain itself slowed down there.
 
     Zero workers is Grain's own default: threads in the training process read
     the records. Each worker process imports the program again, so it costs
@@ -349,8 +357,8 @@ class Loading:
     """
 
     workers: int | Literal["auto"] = 0
-    threads: int = 64
-    read_buffer: int = 128
+    threads: int = 16
+    read_buffer: int = 16
     worker_buffer: int = 2
     ram_budget_mb: int | None = None
     max_workers: int | None = None
