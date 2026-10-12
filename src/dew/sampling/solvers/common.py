@@ -27,6 +27,11 @@ class Solver(Protocol[StateT]):
     `StateT` is that state: nothing for a one-step solver, the previous model
     outputs for a multistep one. It is a type parameter, so each solver's own
     state type is checked at its call sites.
+
+    A solver is a pytree, as a pipeline call takes it as data: a
+    `flax.struct.dataclass` whose numbers are fields and whose settings are
+    `struct.field(pytree_node=False)`, and a solver wrapping another holds it
+    as a field.
     """
 
     def init(self, x, times, process, *, key) -> StateT:

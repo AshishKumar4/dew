@@ -664,7 +664,7 @@ def test_s5_write_read_matches_the_native_scanned_path():
     module = S5Layer(8, 3)
     x = jnp.ones((2, 7, 8))
     variables = module.init(jax.random.key(204), x)
-    operators = module.bind(variables).operators()
+    operators = module.bind(variables).operators(jnp.float32)
     def forward(x, operators):
         return _scanned_directions(x, (operators,), (False,), x.dtype)
     assert module.model_flops(np.array([7, 7])) == forward_products(forward, x, operators)

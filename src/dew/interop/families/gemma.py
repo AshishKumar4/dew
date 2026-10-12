@@ -25,6 +25,7 @@ from dew.interop.decoder_parts import (
     DecoderFields,
     MixtureFields,
     Ropes,
+    RopeSpelling,
     base_config,
     decoder_kinds,
     decoder_tensors,
@@ -180,10 +181,15 @@ def _gemma2_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFi
     return config
 
 
+_GEMMA3_ROPE = RopeSpelling(theta=1000000.0, per_kind=True, local_theta=10000.0,
+                            local_field='rope_local_base_freq')
+"""Gemma3TextConfig's and Gemma3nTextConfig's rope: a record per layer type,
+the full layers at 1e6 and the sliding ones at rope_local_base_freq or 1e4
+(configuration_gemma3.py:102, 136-163; configuration_gemma3n.py:120, 179-206)."""
+
+
 def _gemma3_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:
-    # Gemma3TextConfig's rope_local_base_freq default: a config that states
-    # only rope_theta rotates its sliding layers at this base.
-    rope = read_rope(hf_config, used, local_default=10000.0)
+    rope = read_rope(hf_config, used, spelling=_GEMMA3_ROPE)
     config = base_config(hf_config, used, qk_norm=True, scale_after_cast=False, rope=rope,
                           tie_embeddings=True, layer_types=_gemma_layer_types(hf_config, used))
     _gemma_softcaps(hf_config, used, config)
@@ -205,24 +211,7 @@ def _gemma3n_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderF
             "full_attention" if (index + 1) % 5 == 0 else "sliding_attention"
             for index in range(records.integer(hf_config["num_hidden_layers"], "num_hidden_layers"))
         )
-    # Gemma3nTextConfig folds a flat rope_scaling into the full layers'
-    # entry (convert_rope_params_to_dict) and defaults the bases to 1e6 for
-    # the full layers and 1e4 for the sliding ones, spelled rope_theta and
-    # rope_local_base_freq by the released config and nested by a config
-    # transformers wrote.
-    nested = hf_config.get('rope_parameters')
-    scaling = hf_config.get('rope_scaling')
-    if isinstance(nested, Mapping) and 'rope_theta' not in nested and isinstance(scaling, Mapping):
-        full = nested.get('full_attention') or {}
-        hf_config = {**hf_config, 'rope_scaling': None,
-                     'rope_parameters': {**nested, 'full_attention': {**full, **scaling}}}
-    ropes = read_rope(hf_config, used)
-    if not isinstance(nested, Mapping) and 'rope_theta' not in hf_config:
-        ropes = dataclasses.replace(ropes, theta=1000000.0)
-    if ropes.local_theta is None and not (
-            (isinstance(nested, Mapping) and (nested.get('sliding_attention') or {}).get('rope_theta'))
-            or hf_config.get('rope_local_base_freq') is not None):
-        ropes = dataclasses.replace(ropes, local_theta=None if ropes.theta == 10000.0 else 10000.0)
+    ropes = read_rope(hf_config, used, spelling=_GEMMA3_ROPE)
     config = base_config(hf_config, used, qk_norm=True, scale_after_cast=False,
                           tie_embeddings=True, layer_types=layer_types, rope=ropes)
     layers = records.integer(config.get('num_layers'), 'num_layers')
@@ -598,6 +587,7 @@ GEMMA3N_TEXT = DecoderFamily(
     sandwich_norms=True,
     weight_path=_gemma3n_path,
     preserve_source_layout=True,
+    defaults={'hidden_activation': 'gelu_pytorch_tanh', 'final_logit_softcapping': 30.0},
 )
 
 GEMMA4_TEXT = DecoderFamily(
@@ -626,6 +616,7 @@ GEMMA3_TEXT = DecoderFamily(
     _gemma3_export,
     sandwich_norms=True,
     preserve_source_layout=False,
+    defaults={'hidden_activation': 'gelu_pytorch_tanh', 'query_pre_attn_scalar': 256},
 )
 
 GEMMA2 = DecoderFamily(
@@ -637,6 +628,8 @@ GEMMA2 = DecoderFamily(
     _gemma2_export,
     sandwich_norms=True,
     preserve_source_layout=False,
+    defaults={'hidden_activation': 'gelu_pytorch_tanh', 'query_pre_attn_scalar': 256,
+              'final_logit_softcapping': 30.0, 'attn_logit_softcapping': 50.0},
 )
 
 GEMMA = DecoderFamily(
@@ -647,4 +640,5 @@ GEMMA = DecoderFamily(
     'GemmaForCausalLM',
     lambda model: {},
     preserve_source_layout=False,
+    defaults={'hidden_act': 'gelu_pytorch_tanh'},
 )

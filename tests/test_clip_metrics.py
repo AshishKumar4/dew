@@ -59,11 +59,10 @@ def test_a_run_ranked_by_clip_distance_keeps_its_lowest():
     """CLIP distance is 1 - cos, so the best checkpoint is the closest one:
     the metric declares lower is better, and a selection by it minimizes."""
     from dew.training.selection import Best
-    from dew.training.trainer import Trainer
 
     metric = CLIPDistance(modelname="never/downloaded")
     assert metric.shown.better == "lower"
-    assert Trainer._best_selection(Best(metric), [metric]).mode == "min"
+    assert Best(metric).resolved([metric]).mode == "min"
 
 
 def test_clip_score_metric_clamps_the_reference_cosine():

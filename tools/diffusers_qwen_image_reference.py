@@ -34,13 +34,13 @@ Run in the isolated reference environment on CPU (torch 2.14.0, transformers
 from __future__ import annotations
 
 import json
-import math
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
 import torch
+from diffusers_reference_helpers import frequency_exponent, torch_exp_disagreements
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "tests" / "fixtures" / "hf" / "qwen-image-2.1-source"
@@ -81,13 +81,7 @@ def rounded_frequencies(model) -> None:
     once from float64, which Dew builds on the host."""
     projector = model.time_text_embed.time_proj
     half = projector.timestep_dim // 2
-    exponent = -math.log(10000) * torch.arange(half, dtype=torch.float32) / half
-    projector.freqs = torch.exp(exponent.double()).float()
-
-
-def exp_disagreements() -> int:
-    exponent = -math.log(10000) * torch.arange(128, dtype=torch.float32) / 128
-    return int((torch.exp(exponent) != torch.exp(exponent.double()).float()).sum())
+    projector.freqs = torch.exp(frequency_exponent(half, 0, 10000).double()).float()
 
 
 def transformer_call(model, packed, context, times, grid, mask=None):
@@ -228,8 +222,12 @@ def text_encoder(tok):
 
 
 def build_pipeline(root: Path):
-    from diffusers import (AutoencoderKLQwenImage21, FlowMatchEulerDiscreteScheduler,
-                           QwenImage21Pipeline, QwenImage21Transformer2DModel)
+    from diffusers import (
+        AutoencoderKLQwenImage21,
+        FlowMatchEulerDiscreteScheduler,
+        QwenImage21Pipeline,
+        QwenImage21Transformer2DModel,
+    )
 
     directory = root / "pipeline"
     proc = processor()
@@ -338,7 +336,7 @@ def main(destination: str) -> None:
     record = {"diffusers": diffusers.__version__, "diffusers_commit": DIFFUSERS_COMMIT,
               "transformers": transformers.__version__, "torch": torch.__version__,
               "base": BASE, "cases": cases,
-              "torch_exp_off_by_one_ulp": {"entries": 128, "count": exp_disagreements()},
+              "torch_exp_off_by_one_ulp": {"entries": 128, "count": torch_exp_disagreements(128)},
               "pipeline": {"config": PIPELINE, "vae": VAE, "prompts": PROMPTS,
                            "height": HEIGHT, "width": WIDTH,
                            "default_steps": defaults["num_inference_steps"].default,

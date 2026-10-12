@@ -91,7 +91,7 @@ def _modernbert_config(hf: Mapping[str, object], used: set[str]) -> DecoderField
         layer_types = tuple('sliding_attention' if index % every else 'full_attention'
                             for index in range(layers))
     if isinstance(hf.get('rope_parameters'), Mapping):
-        ropes = read_rope(hf, used, local=False)
+        ropes = read_rope(hf, used)
         if ropes.scaling is not None or ropes.local_scaling is not None:
             refuse('rope_parameters', 'ModernBERT rotates at its plain frequencies')
         theta, local_theta = ropes.theta, ropes.local_theta

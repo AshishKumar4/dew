@@ -45,11 +45,11 @@ import json
 import math
 import sys
 import types
-import urllib.request
 from pathlib import Path
 
 import numpy as np
 import torch
+from reference_source import definitions, fetched, selected
 
 GUIDERS = ("https://raw.githubusercontent.com/huggingface/diffusers/"
            "5ff8e59ff9fe81c6e2df4fb4c6ea0d97a5df5ab2/src/diffusers/guiders/")
@@ -83,42 +83,24 @@ CONDITIONAL, UNCONDITIONAL = 0.5, 0.35
 APG_SAMPLES = 1024
 
 
-def extracted(url: str, names: tuple[str, ...], scope: dict) -> dict:
-    """The named top-level definitions of the file at `url`, run as published."""
-    text = urllib.request.urlopen(url).read().decode()
-    for node in ast.parse(text).body:
-        if isinstance(node, (ast.FunctionDef, ast.ClassDef)) and node.name in names:
-            exec(ast.get_source_segment(text, node), scope)
-    return scope
-
-
 def members(url: str, owner: str, names: set[str]) -> list[str]:
     """The source of the named members of class `owner` in the file at
     `url`, decorators kept but for `register_to_config`, which only records
     the arguments for a config file."""
-    text = urllib.request.urlopen(url).read().decode()
-    found = {}
-    for node in ast.parse(text).body:
-        if isinstance(node, ast.ClassDef) and node.name == owner:
-            for member in node.body:
-                name = (member.name if isinstance(member, ast.FunctionDef)
-                        else member.targets[0].id if isinstance(member, ast.Assign)
-                        and isinstance(member.targets[0], ast.Name) else None)
-                if name in names:
-                    if isinstance(member, ast.FunctionDef):
-                        member.decorator_list = [decorator for decorator in member.decorator_list
-                                                 if ast.unparse(decorator) != "register_to_config"]
-                    found[name] = ast.unparse(member)
-    assert set(found) == names, names - set(found)
-    return list(found.values())
+    found = selected(fetched(url), names, within=owner, filename=url)
+    for member in found:
+        if isinstance(member, ast.FunctionDef):
+            member.decorator_list = [decorator for decorator in member.decorator_list
+                                     if ast.unparse(decorator) != "register_to_config"]
+    return [ast.unparse(member) for member in found]
 
 
 def guider() -> type:
     """Diffusers' `AdaptiveProjectedGuidance` as published, on a
     `BaseGuidance` holding its own published `__init__` and `set_state`."""
-    scope = extracted(GUIDERS + "adaptive_projected_guidance.py", ("MomentumBuffer", "normalized_guidance"),
+    scope = definitions(GUIDERS + "adaptive_projected_guidance.py", ("MomentumBuffer", "normalized_guidance"),
                       {"torch": torch, "math": math})
-    extracted(GUIDERS + "guider_utils.py", ("rescale_noise_cfg",), scope)
+    definitions(GUIDERS + "guider_utils.py", ("rescale_noise_cfg",), scope)
     scope["logger"] = types.SimpleNamespace(warning=lambda *_: None)
     scope["GuiderOutput"] = types.SimpleNamespace
     base = members(GUIDERS + "guider_utils.py", "BaseGuidance", {"__init__", "set_state"})
@@ -231,7 +213,7 @@ def main() -> None:
     for dtype, tail in ((torch.float64, ""), (torch.float32, "32")):
         # The run's precision wherever the sampler names one.
         names = types.SimpleNamespace(**{**vars(torch), "float64": dtype, "float32": dtype})
-        sampler = extracted(INTERVAL, ("edm_sampler",), {"torch": names, "np": np, "Any": object,
+        sampler = definitions(INTERVAL, ("edm_sampler",), {"torch": names, "np": np, "Any": object,
                                                          "Optional": object})["edm_sampler"]
         for name, case in INTERVAL_CASES.items():
             walked = sampler(Denoiser(CONDITIONAL), noise.to(dtype), uncond_net=Denoiser(UNCONDITIONAL),
@@ -239,7 +221,7 @@ def main() -> None:
             arrays[f"{name}.result{tail}"] = walked.double().numpy()
     np.savez(FIXTURE / "interval.npz", **arrays)
 
-    sampler = extracted(EDM2, ("edm_sampler",), {"torch": torch, "np": np})["edm_sampler"]
+    sampler = definitions(EDM2, ("edm_sampler",), {"torch": torch, "np": np})["edm_sampler"]
     noise = torch.randn(*SHAPE, generator=torch.Generator().manual_seed(4))
     settings = {"num_steps": 8, "guidance": 2.2, "strength": 0.5, "guide_strength": 0.35}
     walks = {}

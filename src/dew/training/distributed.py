@@ -6,6 +6,7 @@ import contextlib
 import dataclasses
 import fnmatch
 import functools
+import hashlib
 import json
 import logging
 import math
@@ -14,6 +15,7 @@ import statistics
 import threading
 import time
 from collections.abc import Callable, Iterator, Mapping
+from pathlib import Path
 
 import jax
 import numpy as np
@@ -23,6 +25,7 @@ from jax.sharding import AbstractMesh, AxisType, Mesh, NamedSharding, PartitionS
 
 from dew.coordination import agreed, broadcast_from_process_zero, from_every_process, stop_at_exit
 from dew.data.dataset import Budgeted, Checkpointable, Closeable, DataPartition, RampedStream, Stoppable
+from dew.files import write_atomically
 from dew.nn.inputs import filled_validity
 from dew.nn.sharding import (
     BATCH_AXES,
@@ -221,7 +224,16 @@ def link_bandwidth(mesh: Mesh, axis: str, size: int = 1 << 28) -> float:
     (DeepSeek-V3's residual gradient over 16384 tokens is 235 MB in bf16),
     past the sizes where a collective's latency counts: on 4x RTX 3090 an
     NVLink pair's all-gather moved 8.2 GB/s a device at 4 MiB and 31.0 at
-    128 MiB."""
+    128 MiB.
+
+    A pool keeps its figure beside the persistent compilation cache, by the
+    axis and the devices it spans, and a later pool on them takes it, a
+    resume among them: the decisions from it shape the step, and a figure
+    measured again moves by noise, across a threshold one time in some."""
+    record = _link_record(mesh, axis)
+    # Every process gathers, or none does: a pool measures unless each of its processes sees the figure.
+    if record is not None and all(from_every_process(record.exists())):
+        return min(from_every_process(float(json.loads(record.read_text())["bytes_per_second"])))
     ways = mesh.shape[axis]
     count = size // 4 // ways * ways
     sharding = NamedSharding(mesh, P(axis))
@@ -236,8 +248,23 @@ def link_bandwidth(mesh: Mesh, axis: str, size: int = 1 << 28) -> float:
         jax.block_until_ready(gather(source))
         if attempt >= 2:
             seconds.append(time.perf_counter() - began)
-    received = (ways - 1) / ways * count * 4 / statistics.median(seconds)
-    return min(from_every_process(received))
+    received = min(from_every_process((ways - 1) / ways * count * 4 / statistics.median(seconds)))
+    if record is not None and jax.process_index() == 0:
+        record.parent.mkdir(parents=True, exist_ok=True)
+        write_atomically(record, json.dumps({"bytes_per_second": received}))
+    return received
+
+
+def _link_record(mesh: Mesh, axis: str) -> Path | None:
+    """Where `link_bandwidth` keeps `mesh`'s `axis` figure: beside the persistent compilation cache,
+    named by the axis's width, the mesh's shape and its devices' kinds and processes, or nowhere when
+    the process keeps no cache."""
+    cache = jax.config.jax_compilation_cache_dir
+    if not cache:
+        return None
+    devices = sorted({(device.device_kind, device.process_index) for device in mesh.devices.flat})
+    name = json.dumps([axis, dict(mesh.shape), devices], sort_keys=True)
+    return Path(cache) / "dew-links" / f"{hashlib.sha256(name.encode()).hexdigest()}.json"
 
 
 def _slice(device) -> int:
@@ -552,8 +579,23 @@ class Layout:
                     f"split the batch, and the stage axis holds the pipeline")
             return NamedSharding(mesh, spec)
 
-        with boxed(ruled_boxes({**current_boxes(), **boxed_axes(tree)}, self.axis_rules)):
+        with self._declared(tree):
             return jax.tree_util.tree_map_with_path(leaf_sharding, nn.unbox(tree))
+
+    def _declared(self, tree):
+        """The context in which `declared_axes` reads the axes `tree`'s
+        modules declared, as the rules place them."""
+        return boxed(ruled_boxes({**current_boxes(), **boxed_axes(tree)}, self.axis_rules))
+
+    def _splitting(self, path, value) -> set[str]:
+        """The parameter axes the rules could split the leaf at `path` over:
+        those its declared names' rules name, or fsdp, which the shape
+        heuristic splits an undeclared leaf over."""
+        axes = declared_axes(path, value.ndim)
+        if axes is None:
+            return {FSDP_AXIS}
+        return {axis for name, assignment in self.axis_rules if name in axes
+                for axis in mesh_axes(assignment) if axis in PARAMETER_AXES}
 
     def offloaded[TreeT](self, mesh: Mesh, tree: TreeT) -> Placement[TreeT]:
         """Return `shardings`, with the memory kind each leaf's path asks for.
@@ -596,9 +638,12 @@ class Layout:
 
         MaxText measures the excess per-chip memory over perfect sharding
         across every parameter. This check takes the same ratio over the
-        parameters of at least `min_shard` elements only. Smaller ones are
-        replicated on purpose, so counting them would fail models that are
-        merely small.
+        parameters of at least `min_shard` elements whose rules name a
+        parameter axis this mesh splits. Smaller ones are replicated on
+        purpose, so counting them would fail models that are merely small;
+        one no rule splits over this mesh's axes is replicated by the mesh's
+        choice, as a data axis replicates every parameter, so an expert-only
+        mesh keeps a mixture's dense weights whole as data parallelism does.
 
         Raises `LayoutRefused` when the replicated fraction is above
         `tolerance`, naming the five largest replicated parameters, and
@@ -619,13 +664,16 @@ class Layout:
         if all(mesh.shape[axis] == 1 for axis in PARAMETER_AXES):
             return
 
-        path_leaves, _ = jax.tree_util.tree_flatten_with_path(params)
+        path_leaves, _ = jax.tree_util.tree_flatten_with_path(nn.unbox(params))
+        splits = {axis for axis in PARAMETER_AXES if mesh.shape[axis] > 1}
+        with self._declared(params):
+            splittable = [bool(self._splitting(path, param) & splits) for path, param in path_leaves]
         shardable_elements = 0
         replicated = []
-        for (path, param), sharding in zip(
-                path_leaves, jax.tree.leaves(shardings), strict=True):
+        for (path, param), sharding, ruled in zip(
+                path_leaves, jax.tree.leaves(shardings), splittable, strict=True):
             elements = int(np.prod(param.shape, dtype=np.int64))
-            if elements < self.min_shard:
+            if elements < self.min_shard or not ruled:
                 continue
             shardable_elements += elements
             if any(axis in mesh_axes(assignment)

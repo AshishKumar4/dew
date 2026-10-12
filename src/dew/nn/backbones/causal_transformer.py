@@ -1628,7 +1628,7 @@ class CausalTransformer(nn.Module):
         - `routed_experts` `[B, S, layers, top_k]` replays a rollout engine's
           routing (vLLM's `routed_experts`, SGLang's
           `meta_info.routed_experts`), and `routed` `[B, S]` marks the tokens
-          it covers (`dew.nn.moe.Routes`).
+          it covers (`dew.nn.protocols.Routes`).
         - `media_mask` [B, S] marks the positions a media encoder fills.
           Engram keeps them out of its n-grams, and a media-biased router
           selects for them.
