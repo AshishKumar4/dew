@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
+import base64
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
-from typing import Any, cast
 
 import grain.python as grain
 import numpy as np
@@ -13,6 +13,7 @@ from dew.data.dataset import Batch, Records
 from dew.data.pipeline import Dataset
 
 from .base import Read, Shard, ShardManifest
+from .codec import Value, decode, encode
 from .memory import _record
 
 
@@ -27,8 +28,8 @@ class Iterated(Dataset):
 
     factory: Callable[[], Iterator[Batch]]
     name: str
-    state: Callable[[Iterator[Batch]], object] | None = None
-    load_state: Callable[[Iterator[Batch], object], None] | None = None
+    state: Callable[[Iterator[Batch]], Value] | None = None
+    load_state: Callable[[Iterator[Batch], Value], None] | None = None
 
     def __post_init__(self) -> None:
         if (self.state is None) != (self.load_state is None):
@@ -78,29 +79,38 @@ class _StreamIterator(grain.DatasetIterator):
         self._rows = source.factory()
         self._read = 0
 
-    def __next__(self) -> Batch:
-        row = cast("Batch", _record(next(self._rows)))
-        self._read += 1
+    def __next__(self) -> Batch | bytes:
+        row = None
+        while row is None:
+            row = _record(next(self._rows))
+            self._read += 1
         return row
 
-    def get_state(self) -> dict[str, Any]:
+    def get_state(self) -> dict[str, int | str]:
         if self._source.state is None:
             return {"read": self._read}
-        return {"read": self._read, "state": self._source.state(self._rows)}
+        # Through the artifact codec, so arrays, NumPy scalars and bytes reach load_state as they were.
+        saved = encode(self._source.state(self._rows))
+        return {"read": self._read, "state": base64.b64encode(saved).decode()}
 
-    def set_state(self, state: Mapping[str, Any]) -> None:
+    def set_state(self, state: Mapping[str, object]) -> None:
+        read, saved = state["read"], state.get("state")
+        if not isinstance(read, int) or read < 0:
+            raise ValueError(f"an iterator's position is the count of records it read, not {read!r}")
         self._rows, self._read = self._source.factory(), 0
         if self._source.load_state is not None:
-            self._source.load_state(self._rows, state["state"])
-            self._read = int(state["read"])
+            if not isinstance(saved, str):
+                raise ValueError("this iterator resumes through load_state, and its position holds no state")
+            self._source.load_state(self._rows, decode(base64.b64decode(saved)))
+            self._read = read
             return
-        for _ in range(int(state["read"])):
+        while self._read < read:
             next(self)
 
 
 def from_iter(factory: Callable[[], Iterator[Batch]], *, name: str,
-              state: Callable[[Iterator[Batch]], object] | None = None,
-              load_state: Callable[[Iterator[Batch], object], None] | None = None) -> Iterated:
+              state: Callable[[Iterator[Batch]], Value] | None = None,
+              load_state: Callable[[Iterator[Batch], Value], None] | None = None) -> Iterated:
     """The records `factory()` iterates as a Dew dataset under `name`, resumed
     through the iterator's own `state` and `load_state` where it has them
     (`Iterated`)."""

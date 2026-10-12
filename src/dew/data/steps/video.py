@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import tempfile
+from collections.abc import Iterator
 
 import grain.python as grain
 import numpy as np
@@ -14,21 +15,25 @@ from dew.data.pipeline import Rejected
 from dew.data.video import fit_frames
 
 
-def local_file(value: bytes | str, held: contextlib.ExitStack) -> str:
+@contextlib.contextmanager
+def local_file(value: bytes | str) -> Iterator[str]:
     """A local file a decoder reads for a record's media `value`, its bytes or a local or remote path,
-    which `held` keeps until it closes."""
+    kept while the context is open."""
     if isinstance(value, bytes):
-        file = held.enter_context(tempfile.NamedTemporaryFile())  # noqa: SIM115
-        file.write(value)
-        file.flush()
-        return file.name
+        with tempfile.NamedTemporaryFile() as file:
+            file.write(value)
+            file.flush()
+            yield file.name
+        return
     path = str(value)
     if "://" in path and not path.startswith("file://"):
         from dew.data.storage import Store
 
         fs, target = Store(path if "::" in path else "dewcache::" + path).resolve()
-        return held.enter_context(fs.open(target, "rb")).name
-    return path.removeprefix("file://")
+        with fs.open(target, "rb") as cached:
+            yield cached.name
+        return
+    yield path.removeprefix("file://")
 
 
 def window(element: Batch, clip: str) -> tuple[float, float]:
@@ -55,8 +60,8 @@ class PickClip(grain.RandomMapTransform):
         from dew.data.sources.av_utils import media_info
 
         try:
-            with contextlib.ExitStack() as held:
-                duration, _, _ = media_info(local_file(element[self.field], held))
+            with local_file(element[self.field]) as path:
+                duration, _, _ = media_info(path)
         except (OSError, ValueError):
             if not self.rejects:
                 raise
@@ -95,8 +100,8 @@ class DecodeVideo(grain.MapTransform):
             raise ValueError(f"{self.frames} frames at {self.fps} fps run past the {stop - start}-second "
                              f"clip under {self.clip!r}; pick a longer clip or fewer frames")
         try:
-            with contextlib.ExitStack() as held:
-                frames = read_frames(local_file(element[self.field], held), start, self.frames, self.fps)
+            with local_file(element[self.field]) as path:
+                frames = read_frames(path, start, self.frames, self.fps)
         except (OSError, ValueError):
             if not self.rejects:
                 raise

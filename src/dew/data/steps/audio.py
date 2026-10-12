@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import contextlib
 import dataclasses
 from typing import Literal
 
@@ -42,8 +41,7 @@ class DecodeAudio(grain.MapTransform):
         start, stop = window(element, self.clip)
         samples = round((stop - start + 2 * self.context) * self.sample_rate)
         try:
-            with contextlib.ExitStack() as held:
-                path = local_file(element[self.field], held)
+            with local_file(element[self.field]) as path:
                 _, _, sound = media_info(path)
                 wave, valid = (audio_window(path, start - self.context, stop - start + 2 * self.context,
                                             self.sample_rate) if sound else

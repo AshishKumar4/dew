@@ -10,7 +10,7 @@ import json
 import random
 from collections.abc import Callable, Mapping, Sequence
 from types import UnionType
-from typing import TYPE_CHECKING, Literal, Protocol, TypeAliasType, cast, runtime_checkable
+from typing import TYPE_CHECKING, Literal, Protocol, TypeAliasType, runtime_checkable
 
 import numpy as np
 import tyro
@@ -140,8 +140,8 @@ class _HashSource:
         import grain.python as grain
 
         rows = self.source.records(read)
-        keys = tuple(index for index in range(len(rows))
-                     if _inside(cast("Batch", rows[index]), self.low, self.high, self.key) == self.held)
+        keys = tuple(index for index in range(len(rows)) if (row := rows[index]) is not None
+                     and _inside(row, self.low, self.high, self.key) == self.held)
         return grain.MapDataset.source(keys).map(_SelectedRow(rows))
 
     def metadata(self) -> Mapping[str, object]:
