@@ -563,3 +563,17 @@ def test_a_run_that_states_no_read_takes_the_first_read_its_sources_can_all_take
                   loading=Loading(workers=0))
     assert loaded.plan is not None and loaded.plan.order["read"] == "memory"
     assert loaded.records == 4
+
+
+def test_a_token_holdout_with_no_stated_read_reads_unindexed_text_into_memory(tmp_path):
+    """A token split needs a finite indexed order, which JSON lines without an
+    index can neither stream nor read by index, so the run reads them into
+    memory and holds out the first quarter of their tokens."""
+    from dew.data import HoldOut, Text, load
+
+    documents = [{"text": f"document {index} " * 6} for index in range(8)]
+    (tmp_path / "text.jsonl").write_text("".join(json.dumps(document) + "\n" for document in documents))
+    recipe = Text(source=str(tmp_path / "text.jsonl"), seq_len=8, token_holdout=HoldOut(fraction=0.25))
+    loaded = load(recipe, batch=2, read=None, loading=Loading(workers=0))
+    assert loaded.plan is not None and loaded.plan.order["read"] == "memory"
+    assert loaded.val is not None and loaded.records
