@@ -16,9 +16,10 @@ loads.
 
 With it installed, Dew's `attention_impl="auto"` runs FlashAttention-2
 on an A100 (sm80) for calls without a window, mask, bias or softcap and with
-heads up to 256 wide. `attention_impl="flash"` asks for it on any sm8x GPU.
+heads up to 256 wide. `attention_impl="flash"` asks for it on any sm8x or sm120 GPU.
 
-The kernels are compiled for sm80, which every compute capability 8.x runs.
+The kernels are compiled for sm80, which every compute capability 8.x runs, and for sm120, Blackwell's
+workstation and consumer parts (the RTX PRO 6000 and the RTX 50 series).
 
 Called directly:
 
@@ -30,3 +31,12 @@ out = flash_mha(query, key, value, is_causal=True)  # [B, S, H, D], bf16 or fp16
 
 Key heads may divide the query's (grouped-query attention). The backward pass
 is the kernel's own.
+
+Packed sequences, `[T, H, D]` with int32 offsets `cu_seqlens` `[N + 1]` from 0 to
+T, attend each within itself:
+
+```python
+from dew_flash_attn import flash_mha_varlen
+
+out = flash_mha_varlen(query, key, value, cu_seqlens, max_seqlen, is_causal=True)
+```

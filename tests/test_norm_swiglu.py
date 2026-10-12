@@ -25,7 +25,8 @@ import numpy as np
 import pytest
 from reference_error import assert_as_exact_as_the_reference, distance
 
-from dew.nn.attention import RMSNorm, rms_normalized
+from dew.nn import kernels
+from dew.nn.attention import RMSNorm, forward_mode_attention, gated_rms_normalized, rms_normalized, stream_rms_normalized
 from dew.nn.moe import gated_product
 
 pytestmark = pytest.mark.kernel
@@ -202,6 +203,138 @@ def test_rms_output_dtype_is_independent_of_input(input_dtype, output_dtype, aft
             coefficient=scale_coefficient(operands[0], output_dtype, after_cast))
 
 
+def stream_seam(implementation: str, dtype, joined: bool, offset: bool = True, after_cast: bool = True):
+    """The pre-norm seam `(stream, normed)` over `x`, plus `branch` where `joined`."""
+    def seam(x, branch, scale):
+        return stream_rms_normalized(x, branch if joined else None, scale, 1e-5, dtype, offset, after_cast,
+                                     fp32_statistics=True, implementation=implementation)
+    return seam
+
+
+@pytest.mark.parametrize("joined", [False, True])
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
+@pytest.mark.parametrize("shape", [(2, 3, 31), (3, 257, 17), (5, 1000)])
+def test_stream_seam_takes_the_add_and_the_stream_cotangent(joined, dtype, shape):
+    """The kernel's sum is XLA's to the bit; the norm and every gradient,
+    the stream's cotangent folded into dx, hold the float64 gate."""
+    (x, scale), dy = norm_operands(shape, dtype, jnp.float32)
+    branch = jax.random.normal(jax.random.key(26), shape).astype(dtype)
+    ds = jax.random.normal(jax.random.key(27), shape).astype(dtype)
+    operands, seed = (x, branch, scale), (ds, dy)
+    fused = stream_seam("pallas", dtype, joined)
+    assert "rms_norm_forward" in str(jax.make_jaxpr(fused)(*operands))
+    assert "rms_norm_backward" in str(jax.make_jaxpr(functools.partial(evaluated, fused))(operands, seed))
+    reference = jax.jit(functools.partial(evaluated, stream_seam("xla", dtype, joined)))(operands, seed)
+    actual = jax.jit(functools.partial(evaluated, fused))(operands, seed)
+    cpu = jax.devices("cpu")[0]
+    with jax.enable_x64(new_val=True), jax.default_device(cpu):
+        wide = jax.tree.map(lambda x: jnp.asarray(np.asarray(x, np.float64)), operands)
+        truth = evaluated(stream_seam("xla", jnp.float64, joined), wide,
+                          jax.tree.map(lambda x: jnp.asarray(np.asarray(x, np.float64)), seed))
+    (stream, normed), *gradients = actual
+    (reference_stream, reference_normed), *reference_gradients = reference
+    np.testing.assert_array_equal(stream, reference_stream)
+    labels = ("y", "x", "branch", "scale")
+    for label, mine, theirs, want in zip(labels, (normed, *gradients),
+                                         (reference_normed, *reference_gradients),
+                                         (truth[0][1], *truth[1:]), strict=True):
+        if label == "branch" and not joined:
+            assert not np.any(np.asarray(mine)) and not np.any(np.asarray(theirs))
+            continue
+        assert mine.dtype == theirs.dtype, label
+        if label == "scale":
+            assert_scale_accumulation(mine, theirs, scale_coefficient(stream, dtype, after_cast=True), dy)
+        assert_as_exact_as_the_reference(mine, theirs, want, label)
+
+
+@pytest.mark.parametrize("activation", ["silu", "sigmoid"])
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
+@pytest.mark.parametrize("shape", [(2, 3, 4, 31), (2, 64, 16, 128)])
+def test_gated_norm_and_every_gradient_hold_the_float64_gate(activation, dtype, shape):
+    """Qwen3-Next's gated norm: the kernel's output and its input, gate and
+    weight gradients each within the gate of XLA's float64 distance."""
+    x, gate, dy = (jax.random.normal(jax.random.key(index), shape).astype(dtype) for index in (51, 52, 53))
+    scale = 0.7 + 0.2 * jax.random.normal(jax.random.key(54), shape[-1:])
+    operands = (x, gate, scale)
+
+    def gated(implementation, output_dtype):
+        return lambda x, gate, scale: gated_rms_normalized(x, gate, scale, 1e-6, output_dtype, activation,
+                                                           implementation=implementation)
+
+    fused = gated("pallas", dtype)
+    assert "rms_norm_forward" in str(jax.make_jaxpr(fused)(*operands))
+    assert "rms_norm_backward" in str(jax.make_jaxpr(functools.partial(evaluated, fused))(operands, dy))
+    reference = jax.jit(functools.partial(evaluated, gated("xla", dtype)))(operands, dy)
+    actual = jax.jit(functools.partial(evaluated, fused))(operands, dy)
+    cpu = jax.devices("cpu")[0]
+    with jax.enable_x64(new_val=True), jax.default_device(cpu):
+        wide = jax.tree.map(lambda x: jnp.asarray(np.asarray(x, np.float64)), operands)
+        truth = evaluated(gated("xla", jnp.float64), wide, jnp.asarray(np.asarray(dy, np.float64)))
+    for label, mine, theirs, want in zip(("y", "x", "gate", "scale"), actual, reference, truth, strict=True):
+        assert mine.dtype == theirs.dtype, label
+        assert_as_exact_as_the_reference(mine, theirs, want, label)
+
+
+def small_block():
+    from dew.nn.backbones.decoder_block import BlockWiring, DecoderBlock, GatedMLP
+    from dew.nn.mixers import AttentionMixer, MixerContext
+
+    features = 32
+    mixer = AttentionMixer().build(MixerContext(
+        emb_features=features, num_heads=4, num_kv_heads=2, head_dim=8, max_seq_len=16))
+    block = DecoderBlock(mixer=mixer, feedforward=functools.partial(
+        GatedMLP, hidden_features=64, out_features=features), emb_features=features, scale_offset=True,
+        wiring=BlockWiring())
+    x = jax.random.normal(jax.random.key(41), (2, 16, features))
+    params = block.init(jax.random.key(42), x)
+    seed = jax.random.normal(jax.random.key(43), x.shape)
+    step = jax.jit(jax.value_and_grad(lambda params, x: jnp.sum(block.apply(params, x) * seed),
+                                      argnums=(0, 1)))
+    return params, x, step
+
+
+def test_decoder_block_seams_keep_the_block_to_the_bit(monkeypatch):
+    """XLA's seams are the old block's add, read and norm, bit for bit."""
+    from dew.nn.backbones import decoder_block
+
+    params, x, step = small_block()
+    seams = step(params, x)
+
+    class Unseamed:
+        """No norm owns a seam: the block writes, reads and norms as before."""
+
+    monkeypatch.setattr(decoder_block, "SeamNorm", Unseamed)
+    *_, old = small_block()
+    for mine, theirs in zip(jax.tree.leaves(seams), jax.tree.leaves(old(params, x)), strict=True):
+        np.testing.assert_array_equal(mine, theirs)
+
+
+def test_decoder_block_seams_run_the_fused_norm(monkeypatch):
+    """Both of a pre-norm block's norms run the fused seam: the input norm
+    passes the stream through, the post-attention norm takes the attention
+    branch's add, and the reverse pass folds each stream cotangent in."""
+    from dew.nn.kernels import norm_swiglu
+
+    monkeypatch.setattr(norm_swiglu, "rms_kernel", lambda *args, **kwargs: "xla")
+    params, x, step = small_block()
+    reference = step(params, x)
+    monkeypatch.setattr(norm_swiglu, "rms_kernel", lambda *args, **kwargs: "pallas")
+    fused, joins = norm_swiglu.stream_rms_norm, []
+
+    def recorded(x, branch, *args, **kwargs):
+        joins.append(branch is not None)
+        return fused(x, branch, *args, **kwargs)
+
+    monkeypatch.setattr(norm_swiglu, "stream_rms_norm", recorded)
+    params, x, step = small_block()
+    joins.clear()
+    jax.make_jaxpr(step)(params, x)
+    # The input norm and the attention's query and key norms read; the MLP's norm joins.
+    assert joins.count(True) == 1 and joins.count(False) == 3, joins
+    for mine, theirs in zip(jax.tree.leaves(step(params, x)), jax.tree.leaves(reference), strict=True):
+        assert relative(mine, theirs) < 1e-5
+
+
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
 @pytest.mark.parametrize("shape", [(2, 3, 1000), (3, 4096), (3, 257, 17)])
 def test_swiglu_forward_and_both_gradients(dtype, shape):
@@ -227,6 +360,33 @@ def test_rms_module_uses_the_same_fused_vjp(offset, after_cast, with_scale):
     assert "rms_norm_forward" in str(jax.make_jaxpr(module.apply)(params, x))
 
 
+def measured_on_this_host(monkeypatch, choice: str) -> None:
+    """This host's generation measures the Pallas kernel fastest for `choice`, so a call the
+    kernel turns down is logged (`ran_kernel`), as on a GPU whose target row names it."""
+    host = kernels.device_generation()
+    monkeypatch.setitem(kernels.TARGETS, host, kernels.GpuTarget(host, host, kernels={choice: "pallas"}))
+
+
+def test_packed_halves_keep_xla_product_and_say_why(monkeypatch, caplog):
+    """A packed gate_up projection's halves stay XLA's product, which reads
+    them in place; the kernel would copy each half out first."""
+    from dew.nn.backbones.decoder_block import GatedMLP
+
+    measured_on_this_host(monkeypatch, "swiglu")
+    monkeypatch.setattr(kernels.generation, "_logged", set())
+    x = jax.random.normal(jax.random.key(81), (2, 5, 8))
+    for packed in (False, True):
+        mlp = GatedMLP(hidden_features=16, out_features=8, packed=packed)
+        params = mlp.init(jax.random.key(82), x)
+        graph = str(jax.make_jaxpr(mlp.apply)(params, x))
+        assert ("swiglu_forward" in graph) == (not packed and jax.default_backend() == "gpu"), packed
+    with monkeypatch.context() as patched:
+        patched.setattr(kernels.generation, "triton_runs", lambda: True)
+        assert kernels.norm_swiglu.swiglu_kernel("auto", x, x, packed=True) == "xla"
+    logged = [record.getMessage() for record in caplog.records if record.name == kernels.generation.__name__]
+    assert any("packed projection" in message for message in logged), logged
+
+
 def test_swiglu_refuses_broadcast_mixed_and_wide_dtypes():
     from dew.nn.kernels import norm_swiglu
 
@@ -239,11 +399,123 @@ def test_swiglu_refuses_broadcast_mixed_and_wide_dtypes():
                                           gated_product("swiglu", implementation="xla")(gate, up))
 
 
+def test_auto_takes_the_generation_row_and_forward_mode_is_portable():
+    """Auto takes the device's measured kernel on a GPU Triton runs, XLA on a CPU."""
+    from dew.nn.kernels import norm_swiglu
+
+    def expected(choice):
+        on_gpu = kernels.generation.triton_runs()
+        return kernels.generation.measured_kernel(choice, "xla") if on_gpu else "xla"
+
+    x = jnp.ones((2, 17), jnp.float32)
+    assert norm_swiglu.rms_kernel("auto", x, None, x.dtype, fp32_statistics=True) == expected("rms_norm")
+    assert norm_swiglu.swiglu_kernel("auto", x, x) == expected("swiglu")
+    with forward_mode_attention():
+        assert norm_swiglu.rms_kernel("pallas", x, None, x.dtype, fp32_statistics=True) == "xla"
+        assert norm_swiglu.swiglu_kernel("pallas", x, x) == "xla"
+        jax.jvp(lambda x: rms_normalized(x, None, 1e-5, x.dtype, scale_offset=False,
+                                         scale_after_cast=False, fp32_statistics=True,
+                                         implementation="pallas"), (x,), (x,))
+        jax.jvp(gated_product("swiglu", implementation="pallas"), (x, x), (x, x))
+
+
 @pytest.mark.parametrize("name", ["geglu", "geglu_exact"])
 def test_other_gates_keep_their_arithmetic(name):
     gate, up = jnp.arange(17, dtype=jnp.float32) / 7 - 1, jnp.ones(17)
     np.testing.assert_array_equal(gated_product(name, implementation="pallas")(gate, up),
                                   gated_product(name, implementation="xla")(gate, up))
+
+
+@pytest.mark.mesh(devices=2)
+def test_split_mesh_operands_refuse_both_local_kernels_without_axes():
+    from dew.nn.kernels import norm_swiglu
+    from dew.training import MeshSpec
+
+    x = jnp.ones((2, 31), jnp.float32)
+    with jax.set_mesh(MeshSpec(fsdp=2).build(jax.devices()[:2])):
+        assert norm_swiglu.rms_kernel("pallas", x, None, x.dtype, fp32_statistics=True) == "xla"
+        assert norm_swiglu.swiglu_kernel("pallas", x, x) == "xla"
+    assert norm_swiglu.rms_kernel("pallas", x, None, x.dtype, fp32_statistics=True) == "pallas"
+    assert norm_swiglu.swiglu_kernel("pallas", x, x) == "pallas"
+
+
+@pytest.mark.mesh(devices=2)
+@pytest.mark.parametrize("split", ["fsdp", "tensor"])
+def test_seam_and_product_run_per_shard_as_on_one_device(split):
+    """Named logical axes place both kernels on a mesh: rows split, the norm's
+    features whole, and the weight's gradient summed over the shards."""
+    from dew.nn.sharding import MLP_HIDDEN, RESIDUAL
+    from dew.training import MeshSpec
+
+    (x, scale), dy = norm_operands((4, 8, 31), jnp.float32, jnp.float32)
+    branch, ds = (jax.random.normal(jax.random.key(index), x.shape) for index in (28, 29))
+    gate, up, dout = (jax.random.normal(jax.random.key(index), (4, 8, 24)) for index in (30, 31, 32))
+
+    def run(axes, hidden):
+        seam = evaluated(lambda x, branch, scale: stream_rms_normalized(
+            x, branch, scale, 1e-5, x.dtype, scale_offset=True, scale_after_cast=True, fp32_statistics=True,
+            implementation="pallas", axes=axes),
+            (x, branch, scale), (ds, dy))
+        product = evaluated(gated_product("swiglu", implementation="pallas", axes=hidden), (gate, up), dout)
+        return seam, product
+
+    alone = jax.jit(functools.partial(run, RESIDUAL, MLP_HIDDEN))()
+    with jax.set_mesh(MeshSpec(**{split: 2}).build(jax.devices()[:2])):
+        graph = str(jax.make_jaxpr(functools.partial(run, RESIDUAL, MLP_HIDDEN))())
+        assert graph.count("shard_map") >= 2 and "rms_norm_forward" in graph and "swiglu_forward" in graph
+        meshed = jax.jit(functools.partial(run, RESIDUAL, MLP_HIDDEN))()
+    for mine, theirs in zip(jax.tree.leaves(meshed), jax.tree.leaves(alone), strict=True):
+        assert relative(mine, theirs) < 1e-6
+
+
+@pytest.mark.mesh(devices=2)
+def test_a_narrow_weight_gradient_sums_its_shards_before_it_rounds():
+    """Rows split over two shards: each shard's bf16-rounded sum would lose
+    the 1/256 that the whole column's fp32 sum keeps (1 + 1/256 rounds to 1)."""
+    from dew.nn.sharding import RESIDUAL
+    from dew.training import MeshSpec
+
+    x = jnp.ones((4, 1, 1), jnp.float32)
+    dy = jnp.asarray([1.0, 1 / 256, -1.0, 0.0], jnp.float32).reshape(x.shape)
+    scale = jnp.ones((1,), jnp.bfloat16)
+
+    def dscale(x, scale):
+        return jax.vjp(lambda scale: rms_normalized(
+            x, scale, 0.0, x.dtype, scale_offset=False, scale_after_cast=False, fp32_statistics=True,
+            implementation="pallas", axes=RESIDUAL), scale)[1](dy)[0]
+
+    with jax.set_mesh(MeshSpec(fsdp=2).build(jax.devices()[:2])):
+        assert "shard_map" in str(jax.make_jaxpr(dscale)(x, scale))
+        meshed = jax.jit(dscale)(x, scale)
+    assert meshed.dtype == jnp.bfloat16
+    np.testing.assert_array_equal(np.asarray(meshed, np.float32), [1 / 256])
+
+
+@pytest.mark.mesh(devices=2)
+def test_any_varying_operand_refuses_both_kernels_in_a_checked_shard_map():
+    """A Pallas call states no varying type for its result, so a stream,
+    weight, branch, gate or up that varies inside a checking shard_map keeps
+    XLA, even where the first operand is replicated."""
+    from jax.sharding import PartitionSpec
+
+    from dew.nn.kernels import norm_swiglu
+    from dew.training import MeshSpec
+
+    mesh = MeshSpec(fsdp=2).build(jax.devices()[:2])
+    replicated, rows = jnp.ones((2, 8), jnp.float32), jnp.ones((4, 8), jnp.float32)
+    chosen = {}
+
+    def local(replicated, varying):
+        chosen["branch"] = norm_swiglu.rms_kernel("pallas", replicated, None, jnp.float32,
+                                                  fp32_statistics=True, branch=varying)
+        chosen["gate"] = norm_swiglu.gated_rms_kernel("pallas", replicated, varying, None, jnp.float32,
+                                                      "silu")
+        chosen["up"] = norm_swiglu.swiglu_kernel("pallas", replicated, varying)
+        return varying
+
+    jax.make_jaxpr(jax.shard_map(local, mesh=mesh, in_specs=(PartitionSpec(), PartitionSpec("fsdp")),
+                                 out_specs=PartitionSpec("fsdp")))(replicated, rows)
+    assert chosen == {"branch": "xla", "gate": "xla", "up": "xla"}, chosen
 
 
 def test_norm_jvp_without_a_context_uses_xla():

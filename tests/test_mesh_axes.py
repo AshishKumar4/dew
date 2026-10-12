@@ -8,14 +8,13 @@ did. A fit on each of the sim-mesh topologies trains the same losses:
 sharding moves values, never changes them.
 """
 
-import math
-import re
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+import sharded
 from jax.sharding import NamedSharding, PartitionSpec as P
 from recording import RecordingTracker
 from sharded import assert_sharded
@@ -43,8 +42,6 @@ VOCAB = 64
 SEQ_LEN = 16
 BATCH = 8
 TINY_SHARD = 256
-
-
 def tiny():
     return models.build(
         "causal_transformer", vocab_size=VOCAB, emb_features=32, num_layers=2,
@@ -156,12 +153,7 @@ def test_cross_attention_spends_communication_only_where_the_sequence_link_pays(
         result = jax.device_get(executable(*inputs))
         flops = compiled_flops(executable)
         assert flops is not None
-        moved = 0
-        for line in executable.as_text().splitlines():
-            match = COLLECTIVE.match(line)
-            if match:
-                moved += sum(ITEMSIZE[dtype] * math.prod(int(size) for size in dims.split(",") if size)
-                             for dtype, dims in TYPED.findall(match["shape"]))
+        moved = sharded.collective_bytes(executable.as_text(), sharded.COLLECTIVE_OPS)
         return result, flops * sequence * tensor, moved
 
     expected, _, _ = compiled(1, 1, Link(None, None, "cpu"))
@@ -314,24 +306,6 @@ def test_a_dit_steps_under_a_tensor_axis():
     layout.check(placed["params"], shardings["params"], mesh)
 
 
-COLLECTIVE = re.compile(
-    r"^\s*(?:ROOT\s+)?%\S+\s+=\s+(?P<shape>.+?)\s+"
-    r"(?P<op>all-reduce|all-gather|reduce-scatter|all-to-all|collective-permute)(?:-start)?\(")
-TYPED = re.compile(r"([a-z]+\d*)\[([\d,]*)\]")
-ITEMSIZE = {
-    "pred": 1,
-    "s8": 1,
-    "u8": 1,
-    "bf16": 2,
-    "f16": 2,
-    "f32": 4,
-    "s32": 4,
-    "u32": 4,
-    "f64": 8,
-    "s64": 8,
-}
-
-
 @pytest.mark.mesh(devices=4)
 def test_a_vocabulary_split_head_leaves_the_excluded_column_out_on_every_shard():
     """The masked objective leaves its mask column out of the partition. On
@@ -480,3 +454,45 @@ def test_a_convolution_whose_kernel_splits_its_input_channels_computes_one_devic
     magnitude = conv.apply({"params": jax.tree.map(np.abs, params)}, np.abs(x))
     np.testing.assert_array_less(np.abs(np.asarray(split) - np.asarray(alone)),
                                  terms * np.finfo(np.float32).eps * np.asarray(magnitude))
+
+
+def test_a_layout_pass_at_a_kernel_calls_edge_is_found_through_views_and_fusion_bodies():
+    """`sharded.boundary_copies` finds a copy feeding a Triton call through a bitcast, and a fusion
+    whose body only transposes reading its result through a tuple element, whatever its name; a
+    fusion that computes beside its transpose writes its result once and is not a layout pass."""
+    text = """HloModule module
+
+%only_moves (p.0: bf16[8,64]) -> bf16[64,8] {
+  %p.0 = bf16[8,64]{1,0} parameter(0)
+  ROOT %t.0 = bf16[64,8]{1,0} transpose(bf16[8,64]{1,0} %p.0), dimensions={1,0}
+}
+
+%computes (p.1: bf16[8,64]) -> bf16[64,8] {
+  %p.1 = bf16[8,64]{1,0} parameter(0)
+  %e.1 = bf16[8,64]{1,0} exponential(bf16[8,64]{1,0} %p.1)
+  ROOT %t.1 = bf16[64,8]{1,0} transpose(bf16[8,64]{1,0} %e.1), dimensions={1,0}
+}
+
+ENTRY %main (x: bf16[8,64]) -> (bf16[64,8], bf16[64,8]) {
+  %x = bf16[8,64]{1,0} parameter(0)
+  %copy.1 = bf16[8,64]{0,1} copy(bf16[8,64]{1,0} %x)
+  %view = bf16[8,64]{1,0} bitcast(bf16[8,64]{0,1} %copy.1)
+  %kernel = (bf16[8,64]{1,0}, f32[8]{0}) custom-call(bf16[8,64]{1,0} %view), \
+custom_call_target="__gpu$xla.gpu.triton"
+  %result = bf16[8,64]{1,0} get-tuple-element((bf16[8,64]{1,0}, f32[8]{0}) %kernel), index=0
+  %fusion.7 = bf16[64,8]{1,0} fusion(bf16[8,64]{1,0} %result), kind=kLoop, calls=%only_moves
+  %fusion.8 = bf16[64,8]{1,0} fusion(bf16[8,64]{1,0} %result), kind=kLoop, calls=%computes
+  ROOT %out = (bf16[64,8]{1,0}, bf16[64,8]{1,0}) tuple(bf16[64,8]{1,0} %fusion.7, bf16[64,8]{1,0} %fusion.8)
+}
+"""
+    assert sharded.boundary_copies(text) == ["copy.1 -> kernel", "kernel -> fusion.7"]
+
+
+def test_an_async_collective_counts_its_results_not_its_operands():
+    """An async `-start` names `(operands, results)`; only the results are the collective's bytes."""
+    text = """  %ag = ((bf16[4,8]{1,0}), bf16[8,8]{1,0}) all-gather-start(bf16[4,8]{1,0} %x), dimensions={0}
+  %rs = (f32[16]{0}, f32[8]{0}) reduce-scatter-start(f32[16]{0} %y), dimensions={0}
+  %ar = f32[8]{0} all-reduce(f32[8]{0} %z), to_apply=%add"""
+    assert sharded.collectives(text) == [("all-gather", [(8, 8)]), ("reduce-scatter", [(8,)]),
+                                         ("all-reduce", [(8,)])]
+    assert sharded.collective_bytes(text, sharded.COLLECTIVE_OPS) == 128 + 32 + 32

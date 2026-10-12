@@ -26,13 +26,7 @@ if WORLD < 2:
 
 import test_multiprocess as single  # noqa: E402
 from process_support import report_of, spawn, terminate
-from test_multiprocess import (
-    test_four_processes_build_the_same_mesh_as_two,
-    test_processes_read_disjoint_shards_that_cover_the_corpus,
-    test_the_global_batch_is_the_union_of_the_process_slices,
-    test_the_mesh_covers_every_process_in_the_pool,
-    two_processes,
-)
+from test_multiprocess import test_a_real_token_budget_agrees_across_processes_after_logging_ticks, test_four_processes_build_the_same_mesh_as_two, test_processes_read_disjoint_shards_that_cover_the_corpus, test_the_global_batch_is_the_union_of_the_process_slices, test_the_mesh_covers_every_process_in_the_pool, two_processes
 
 POOLS = count()
 """The pools this run has started: the n-th is the same pool on every rank, at the same ports."""

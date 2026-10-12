@@ -33,7 +33,7 @@ import numpy as np
 import pytest
 from flax import linen as nn
 from interop_support import assert_layout_tensors, extract_fixture, fixture_arrays
-from reference_error import assert_as_exact_as_the_reference
+from reference_error import assert_as_exact_as_the_reference, assert_no_less_exact
 
 from dew.diffusion.process import DenoisingCondition
 from dew.interop.diffusion import component_tensors, translate_wan_weights, wan_fields
@@ -342,7 +342,7 @@ def test_a_trained_wan_step_exports_and_reloads(pipeline, walk, tmp_path):
     pipeline.save(export, variables=state.variables)
     reloaded = Pretrained.load(str(export), dtype="float32", attention_impl="xla")
     assert reloaded.inputs.sample.shape == pipeline.inputs.sample.shape
-    assert value(reloaded.variables) == value(state.variables)
+    jax.tree.map(np.testing.assert_array_equal, reloaded.variables, state.variables)
 
     # Diffusers' own classes read the export: every component cleanly, the
     # pipeline whole, and its transformer recomputes the trained flow.
@@ -368,9 +368,18 @@ def test_a_trained_wan_step_exports_and_reloads(pipeline, walk, tmp_path):
                                      consumer.denoiser_prediction(export, call, wide=True), "trained Wan")
 
 
+def test_an_unchanged_sample_cannot_exceed_its_sources_measured_float64_error():
+    truth = np.asarray([np.pi, np.e], np.float64)
+    reference = truth.astype(np.float32)
+    changed = truth + 1.5 * (reference.astype(np.float64) - truth)
+    assert_no_less_exact(reference, reference, truth, "unchanged")
+    with pytest.raises(AssertionError, match="unchanged source"):
+        assert_no_less_exact(changed, reference, truth, "changed")
+
+
 def test_a_wan_lora_starts_as_the_source_and_trains_its_factors_alone(pipeline, walk):
     """An adapter binds the transformer's self- and cross-attention projections,
-    never UMT5's; with B at zero it samples exactly what the source does, and
+    never UMT5's; with B at zero it follows the source within its float64 rule, and
     a step moves every B while the base, the text encoder and the VAE stay
     bitwise where they were."""
     import optax
@@ -379,16 +388,24 @@ def test_a_wan_lora_starts_as_the_source_and_trains_its_factors_alone(pipeline, 
     from dew.objectives.base import FROZEN
     from dew.training import Trainer
 
-    prompts = walk[1]["prompts"]
+    _, record, arrays = walk
+    prompts = record["prompts"]
     tuned = pipeline.adapt(LoRA(rank=2, modules=("attn1.to_q", "attn1.to_v", "attn2.to_k", "attn2.to_out.0")),
                            key=0)
     assert {path[1] for path in tuned.adapter.targets} == {f"blocks_{index}" for index in range(2)}
     assert all(path[0] == "params" for path in tuned.adapter.targets)
 
     def sampled(task):
-        return np.asarray(task(prompts, steps=2, key=1).host().images)
+        prepared = task.prepare(prompts, initial=channels_last(arrays["x_T"]), key=0, steps=record["steps"])
+        return task(prepared, key=jax.random.PRNGKey(0)).host()
 
-    np.testing.assert_array_equal(sampled(tuned.text_to_image()), sampled(pipeline.text_to_image()))
+    original, adapted = sampled(pipeline.text_to_image()), sampled(tuned.text_to_image())
+    for row in range(len(prompts)):
+        truth = channels_last(arrays[f"latents_f64.{row}"][None])[0]
+        assert_no_less_exact(adapted.latents[row], original.latents[row], truth, f"zero-adapter latent {row}")
+        frames = [np.clip(np.asarray(walked.images[row]) / 2 + .5, 0.0, 1.0)
+                  for walked in (adapted, original)]
+        assert_no_less_exact(*frames, arrays[f"frames_f64.{row}"], f"zero-adapter frames {row}")
     objective = DiffusionObjective(tuned, ema_decay=None, unconditional_prob=0.0)
     batch = clip_batch(objective, prompts)
     trainer = Trainer(objective, optax.sgd(1e-1), key=jax.random.key(3))

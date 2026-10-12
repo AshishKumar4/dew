@@ -19,6 +19,9 @@ either, Dew without the decay lands at 1.1e-02 (ratio 22,000) and Dew
 without the clip at 1.9e-03 (ratio 4,000).
 """
 
+import os
+import subprocess
+import sys
 from pathlib import Path
 from typing import NamedTuple
 
@@ -359,3 +362,30 @@ def test_torch_reference_keeps_whole_run_peak_beside_reset_window_peak(monkeypat
     assert window.peak_allocated == 300
     assert window.peak_reserved == 400
     assert window.whole_peak_allocated == 500
+
+
+def test_the_dew_qwen35_runner_trains_its_compiled_step(tmp_path):
+    """The Dew side of the matched pair runs the trainer's compiled step as it returns: a tiny
+    Qwen3.5 backbone on one device, as the runner requires, warms up, times and samples a step
+    each, updating and staying finite."""
+    script = """
+import sys
+from types import SimpleNamespace
+from pathlib import Path
+import jax, jax.numpy as jnp
+sys.path[:0] = [sys.argv[1] + "/tests", sys.argv[1] + "/tools/reference_runs"]
+from tool_support import load
+from dew.interop import translate_config
+runner, shapes = load("reference_runs/dew_qwen35_step"), load("reference_runs/qwen35")
+model = translate_config(shapes.config(smoke=True)).value.clone(remat=None)
+variables = model.init(jax.random.key(17), jnp.zeros((1, 16), jnp.int32))
+args = SimpleNamespace(smoke=True, seed=17, work=Path(sys.argv[2]), warmup=1, steps=1)
+trainer, state, compiled, batch, _, _ = runner.compile_step(args, model, variables)
+seconds, _, samples, record = runner.train(args, trainer, state, compiled, batch)
+assert seconds > 0 and len(samples) == 1 and record["finite_losses"]
+"""
+    env = {**os.environ, "PYTHONPATH": str(REPO_ROOT / "src"), "JAX_PLATFORMS": "cpu",
+           "XLA_FLAGS": "--xla_force_host_platform_device_count=1"}
+    done = subprocess.run([sys.executable, "-c", script, str(REPO_ROOT), str(tmp_path / "work.json")],
+                          env=env, capture_output=True, text=True, timeout=600)
+    assert done.returncode == 0, done.stderr[-3000:]
