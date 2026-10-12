@@ -584,6 +584,12 @@ def batch_shardings(mesh: Mesh | AbstractMesh, batch: Batch) -> Placement[Batch]
 def shard_batch(mesh: Mesh, batch: Batch) -> Batch:
     """Assemble this process's share of each array into a globally sharded one.
 
+    The placed batch owns its memory because reader buffers are borrowed until
+    the next batch. CPU placement copies each borrowed host leaf once, since
+    JAX 0.11.2 drops copy_semantics in pxla._shard_np_array and ignores
+    may_alias=False for NumPy inputs. Accelerator transfers copy by construction
+    and release the borrowed host buffer when the transfer completes.
+
     The share is the one `DataPartition.of(mesh)` names: that share's rows, each
     whole in every other dimension. A pool assembles one leaf per process,
     so every process has to hand this
@@ -603,23 +609,25 @@ def shard_batch(mesh: Mesh, batch: Batch) -> Batch:
     request, belongs where the caller's own collectives are issued.
     """
     batch = filled_validity(batch) if jax.process_count() > 1 else batch
+    cpu = all(device.platform == "cpu" for device in mesh.devices.flat)
+    batch = jax.tree.map(
+        lambda leaf: leaf if isinstance(leaf, jax.Array) else (
+            np.array(leaf, copy=True) if cpu else np.asarray(leaf)), batch)
     count = DataPartition.of(mesh).count
     shardings = batch_shardings(mesh, batch)
     if jax.process_count() == 1:
         # The whole batch is this process's share, placed by one device_put
         # for the tree: 74 us of host time a batch on an RTX 4080, and 174 on
         # 8 CPU devices, where a call per leaf took 105 and 222.
-        return jax.device_put(jax.tree.map(
-            lambda leaf: leaf if isinstance(leaf, jax.Array) else np.asarray(leaf), batch), shardings)
+        return jax.device_put(batch, shardings)
 
     def place(leaf, sharding: NamedSharding) -> jax.Array:
         # The share holds whole rows: `count` shares make the rows, and every
         # other dimension is already whole, so a device of a sequence or a
         # stage that spans processes picks its own slice out of it.
-        local = leaf if isinstance(leaf, jax.Array) else np.asarray(leaf)
-        shape = np.shape(local)
+        shape = np.shape(leaf)
         return jax.make_array_from_process_local_data(
-            sharding, local, (shape[0] * count, *shape[1:]) if shape else ())
+            sharding, leaf, (shape[0] * count, *shape[1:]) if shape else ())
 
     return jax.tree.map(place, batch, shardings)
 
