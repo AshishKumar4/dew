@@ -47,7 +47,7 @@ from dew.nn.flops import MissingFlopsCount, counted_flops
 from dew.nn.inputs import ModelInputs
 from dew.nn.mla import INDEXER, INDEXER_COLLECTION
 from dew.nn.moe import RouterMoments, global_router_loss, load_balance_update, sequence_router_losses
-from dew.nn.protocols import CountedLogits, CountedTraining, DecoderTraining, Logits, TokenModel
+from dew.nn.protocols import CountedLogits, CountedLogitsTraining, DecoderTraining, Logits, TokenModel
 from dew.nn.sharding import LOGITS, constrain
 from dew.objectives.base import (
     OMITTED,
@@ -617,6 +617,16 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
 
     counts_tokens: ClassVar[bool] = True
 
+    def _missing_flops(self, model) -> str | None:
+        """What the forward and training counts both lack, or None."""
+        if type(self) is not LMObjective:
+            return f"{type(self).__name__} needs counts for its auxiliary model forwards"
+        if self.mtp_weight:
+            return "LMObjective needs the prediction-depth geometry when MTP is trained"
+        if not isinstance(model, CountedLogits):
+            return f"{type(model).__name__} does not declare logits_flops for the LM head"
+        return None
+
     def _counted_tokens(self, batch: Batch):
         """Host token geometry, with the same padding/packing fields as the loss."""
         raw = batch[TEXT_KEY]
@@ -650,26 +660,22 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
     def model_flops(self, model, batch: Batch) -> float:
         """Hidden states plus predictions within real documents; never padded logits."""
         model = self.model if model is None else model
-        if type(self) is not LMObjective:
-            raise MissingFlopsCount(f"{type(self).__name__} needs counts for its auxiliary model forwards")
+        missing = self._missing_flops(model)
+        if missing is not None:
+            raise MissingFlopsCount(missing)
         self._check_flop_geometry(batch)
-        if self.mtp_weight:
-            raise MissingFlopsCount("LMObjective needs the prediction-depth geometry when MTP is trained")
-        if not isinstance(model, CountedLogits):
-            raise MissingFlopsCount(f"{type(model).__name__} does not declare logits_flops for the LM head")
         lengths = self._prediction_lengths(batch)
         return counted_flops(model, self.real_lengths(batch)) + model.logits_flops(lengths)
 
     def training_flops(self, model, batch: Batch) -> float:
         """The adapted trunk and prediction head on actual token geometry."""
-        if type(self) is not LMObjective:
-            raise MissingFlopsCount(f"{type(self).__name__} needs counts for its auxiliary model forwards")
-        self._check_flop_geometry(batch)
         model = self.model if model is None else model
-        if not isinstance(model, CountedTraining):
+        missing = self._missing_flops(model)
+        if missing is not None:
+            raise MissingFlopsCount(missing)
+        self._check_flop_geometry(batch)
+        if not isinstance(model, CountedLogitsTraining):
             return super().training_flops(model, batch)
-        if self.mtp_weight:
-            raise MissingFlopsCount("adapted LMObjective needs prediction-depth parameter geometry")
         targets = self._prediction_lengths(batch)
         return model.training_flops(self.real_lengths(batch)) + model.logits_training_flops(targets)
 
