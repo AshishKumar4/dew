@@ -140,7 +140,7 @@ def test_wandb_tick_receives_memory_cache_and_existing_throughput(tmp_path, monk
     jax.monitoring.record_event('/jax/compilation_cache/cache_hits')
     jax.monitoring.record_event('/jax/compilation_cache/cache_misses')
     jax.monitoring.record_event('/jax/compilation_cache/cache_misses')
-    trainer._log_interval(3, loss, {}, accepted, state, interval)
+    trainer._log_interval(3, loss, {}, accepted, state, interval, statistics=dict)
     row = run.history[-1]
     names = {'train/loss', 'train/learning_rate', 'train/step_time_ms', 'train/data_wait_ms',
              'train/compile_s', 'train/hlo_flops_util', 'train/hfu', 'train/compiles', 'train/cache_hits',
