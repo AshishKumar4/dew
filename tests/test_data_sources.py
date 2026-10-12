@@ -577,3 +577,25 @@ def test_a_token_holdout_with_no_stated_read_reads_unindexed_text_into_memory(tm
     loaded = load(recipe, batch=2, read=None, loading=Loading(workers=0))
     assert loaded.plan is not None and loaded.plan.order["read"] == "memory"
     assert loaded.val is not None and loaded.records
+
+
+def test_a_token_store_without_its_length_index_is_refused_naming_provisioning(tmp_path):
+    """A token store that cannot be read by span until its length index is
+    built is not read whole into memory when the run states no read: the
+    refusal names provisioning, and provision=True builds the index."""
+    from array_record.python.array_record_module import ArrayRecordWriter
+
+    from dew.data import Text, load
+
+    Store(str(tmp_path)).child("meta.json").write(json.dumps({
+        "tokenizer": "byte", "dtype": "uint16", "vocab_size": 256, "train_tokens": 40, "eos_id": None,
+    }).encode())
+    writer = ArrayRecordWriter(str(tmp_path / "train-0.array_record"), "group_size:1")
+    for start in range(0, 40, 10):
+        writer.write(np.arange(start, start + 10, dtype=np.uint16).tobytes())
+    writer.close()
+    with pytest.raises(ValueError, match="provision"):
+        load(Text(source=str(tmp_path), seq_len=4), batch=1, read=None, loading=Loading(workers=0))
+    loaded = load(Text(source=str(tmp_path), seq_len=4), batch=1, read=None, provision=True,
+                  loading=Loading(workers=0))
+    assert loaded.plan is not None and loaded.plan.order["read"] == "streamed"
