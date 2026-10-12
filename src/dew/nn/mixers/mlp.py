@@ -41,7 +41,9 @@ class _MLP(nn.Module):
                  attention_metadata=None, routes: Routes | None = None):
         # Tokenwise: no position, document, cache or metadata changes what an MLP computes.
         del decode, positions, segment_ids, kv_store, attention_metadata
-        return self.feedforward(x) if routes is None else self.feedforward(x, routes=routes)
+        if isinstance(self.feedforward, SparseMLP):
+            return self.feedforward(x, routes=routes)
+        return self.feedforward(x)
 
     def projection_groups(self) -> tuple[ProjectionGroup, ...]:
         """The packed groups its feed-forward declares (`ProjectionSites`), in the scope they share."""
