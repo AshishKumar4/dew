@@ -17,7 +17,17 @@ import tyro
 from dew.data.analysis import _cache_at, _order_at, _preferred_read, _promoted, _until
 from dew.data.compile import compile
 from dew.data.dataset import Batch, DataPhase, Loader, Loading, Records as IndexedRecords, record_argument
-from dew.data.pipeline import Configured, HostStep, Mixture, ObjectiveData, Phases, Pipeline, Rejected, Stage
+from dew.data.pipeline import (
+    Configured,
+    HostStep,
+    Mixture,
+    ObjectiveData,
+    Phases,
+    Pipeline,
+    Rejected,
+    Stage,
+    mix,
+)
 from dew.records import integer
 
 if TYPE_CHECKING:
@@ -408,7 +418,7 @@ class Text:
             train = (
                 trains[0]
                 if len(trains) == 1
-                else trains[0].mix(*trains[1:], weights=weights, tokens=ValidTargets())
+                else mix(trains, weights, tokens=ValidTargets())
             )
             scored = [branch for branch in held if branch is not None]
             validation = (
@@ -416,7 +426,7 @@ class Text:
                 if not scored
                 else scored[0]
                 if len(scored) == 1
-                else scored[0].mix(*scored[1:], weights=weights)
+                else mix(scored, weights)
             )
             return train, validation, ()
         stored = _source(self.source, split=self.split)

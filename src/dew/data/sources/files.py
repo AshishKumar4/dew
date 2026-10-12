@@ -22,6 +22,7 @@ import pyarrow.dataset as ds
 import pyarrow.fs as pafs
 
 from dew.data.dataset import Batch, Records
+from dew.data.pipeline import Dataset
 from dew.data.storage import Store
 from dew.records import integer, record
 
@@ -89,7 +90,7 @@ def _fragment_rows(fragment) -> int:
 
 
 @dataclass(frozen=True)
-class Files:
+class Files(Dataset):
     """Files at URLs, with producer indexes or explicit provisioning for text.
 
     Parquet partitions are discovered with Arrow's Hive partitioning. A
@@ -101,7 +102,7 @@ class Files:
     format: Format | None = None
     index: str | None = None
     columns: tuple[str, ...] | None = None
-    filter: ds.Expression | None = None
+    where: ds.Expression | None = None
     partitioning: str | None = "hive"
     shard_bytes: int = 64 * 2**20
     storage_options: Mapping[str, object] | None = field(default=None, repr=False)
@@ -239,7 +240,7 @@ class Files:
             "store": self.kind,
             "files": files,
             "columns": self.columns,
-            "filter": str(self.filter),
+            "where": str(self.where),
             "partitioning": self.partitioning,
             "shard_bytes": self.shard_bytes,
             "manifest": None
@@ -262,7 +263,7 @@ class Files:
                 if not {"file", "gs", "gcs"}.intersection(protocols):
                     return False
             return True
-        if self.filter is not None:
+        if self.where is not None:
             return False
         if self.kind in ("arrow", "parquet"):
             return True
@@ -425,7 +426,7 @@ class Files:
         shards = []
         if self.kind in ("parquet", "arrow"):
             for number, fragment in enumerate(self.fragments):
-                rows = None if self.filter is not None else _fragment_rows(fragment)
+                rows = None if self.where is not None else _fragment_rows(fragment)
                 shards.append(Shard(f"{fragment.path}:{number}", fragment.path, number, number + 1, rows))
         elif self.kind == "array_record":
             shards.extend(Shard(url, url) for url in self.paths)
@@ -468,7 +469,7 @@ class Files:
             fs, _ = Store(url, self.storage_options).resolve()
             protocols = (fs.protocol,) if isinstance(fs.protocol, str) else fs.protocol
             remote |= "file" not in protocols and "memory" not in protocols
-        if self.kind in ("parquet", "arrow") and self.filter is None:
+        if self.kind in ("parquet", "arrow") and self.where is None:
             return tuple(_fragment_rows(fragment) for fragment in self.fragments), remote
         if self.kind in ("jsonl", "text", "csv") and self.supports("indexed"):
             indexed = _IndexedLines(self)
@@ -527,7 +528,7 @@ class Files:
             }
             counts = (
                 {"rows": sum(_fragment_rows(fragment) for fragment in self.fragments)}
-                if self.filter is None
+                if self.where is None
                 else {}
             )
             return {"class_names": names, **counts}
@@ -572,7 +573,7 @@ class _ArrowFragment:
                 self.__dict__["_table"] = self.source.fragments[self.index].to_table(
                     schema=self.source.arrow.schema,
                     columns=list(self.source.columns) if self.source.columns is not None else None,
-                    filter=self.source.filter,
+                    filter=self.source.where,
                 )
             return self.__dict__["_table"]
 
@@ -907,7 +908,7 @@ class TokenShards:
 
 
 @dataclass(frozen=True)
-class TokenFiles:
+class TokenFiles(Dataset):
     """A produced train/val token directory, with metadata and document boundaries."""
 
     url: str

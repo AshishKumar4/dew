@@ -11,7 +11,7 @@ from typing import Annotated
 import numpy as np
 
 from dew import records
-from dew.data.pipeline import Configured, HostStep, Pipeline
+from dew.data.pipeline import Configured, HostStep, Pipeline, mix
 from dew.data.recipes import HoldOut, SourceValue, Split, Validation, _branches, _named_split, source_argument
 from dew.data.sources.base import Read, ShardManifest, Source, _consumed
 from dew.decision.questions import Choice, Question
@@ -270,7 +270,7 @@ class Decisions:
                 for name, rows in sorted(self.source.items())
             ]
             weights = [self.weights.get(name, 1.0) for name in sorted(self.source)]
-            train = branches[0] if len(branches) == 1 else branches[0].mix(*branches[1:], weights=weights)
+            train = branches[0] if len(branches) == 1 else mix(branches, weights)
             held = (
                 None
                 if self.validation is None
@@ -389,7 +389,7 @@ class Decisions:
             weights.append(weight)
         if not training:
             raise ValueError(f"no corpus of {self.source} has a positive weight")
-        train = training[0] if len(training) == 1 else training[0].mix(*training[1:], weights=weights)
+        train = training[0] if len(training) == 1 else mix(training, weights)
         evaluated = (
             None
             if not held

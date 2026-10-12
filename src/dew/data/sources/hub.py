@@ -11,6 +11,7 @@ import grain.python as grain
 import numpy as np
 
 from dew.data.dataset import Records
+from dew.data.pipeline import Dataset
 
 from .base import Read, ShardManifest, Source
 from .files import Files, Format
@@ -18,7 +19,7 @@ from .memory import _record
 
 
 @dataclass(frozen=True)
-class Hub:
+class Hub(Dataset):
     """A pinned Hub split. Preparing Arrow is always an explicit operation."""
 
     repo: str

@@ -10,6 +10,7 @@ import grain.python as grain
 import numpy as np
 
 from dew.data.dataset import Batch, Records
+from dew.data.pipeline import Dataset
 
 from .base import Read, Shard, ShardManifest
 from .codec import fingerprint
@@ -48,7 +49,7 @@ class _Columns:
 
 
 @dataclass(frozen=True)
-class Memory:
+class Memory(Dataset):
     """Records, column arrays or an Arrow table, with immutable positional IDs."""
 
     values: Records | Sequence[Batch] | Mapping[str, Sequence]
