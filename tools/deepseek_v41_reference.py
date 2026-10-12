@@ -765,7 +765,9 @@ def write_kernels():
         blocks.append(x.bfloat16())
     x = torch.cat(blocks)
     x[3, :32] = 0
-    grid = torch.tensor([0, .25, .5, .75, 1, 1.25, 1.5, 1.75, 2, 2.5, 3, 3.5, 4, 5, 6], device=device)
+    e2m1 = importlib.import_module("tools.deepseek_v41_kernels").E2M1
+    # Every E2M1 magnitude and the midpoints between neighbours, ascending.
+    grid = torch.cat([e2m1, (e2m1[1:] + e2m1[:-1]) / 2]).sort().values.to(device)
     ties = torch.cat([grid, -grid, grid + 1e-3, grid - 1e-3]).clamp(-6, 6).repeat(3)[:64]
     t = torch.zeros(2, 32, device=device)
     t.view(-1)[:64] = ties
