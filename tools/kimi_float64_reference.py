@@ -45,11 +45,11 @@ import jax.numpy as jnp
 import numpy as np
 from safetensors.numpy import load_file
 
+from dew.nn.fake_quant import E2M1
+
 jax.config.update("jax_enable_x64", val=True)
 
 FIXTURES = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "hf"
-E2M1 = np.array([0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6])
-"""compressed-tensors' E2M1 values by code, the sign in bit 3."""
 LATENT_EPS = 1e-6
 """KimiRMSNorm's default epsilon, which MLA's latent norms keep (modeling_kimi_linear.py:368, 383)."""
 

@@ -40,7 +40,7 @@ class Llama4Mixer(MixerBase):
     attn_scale: float = 0.1
 
     def build(self, ctx: MixerContext) -> Callable[..., nn.Module]:
-        unsupported = {
+        ctx.refuse("llama4", {
             "qk_norm": ctx.qk_norm,
             "v_norm": ctx.v_norm,
             "k_eq_v": ctx.k_eq_v,
@@ -53,14 +53,8 @@ class Llama4Mixer(MixerBase):
             "output_gate": ctx.output_gate,
             "scale_offset": ctx.scale_offset,
             "kv_cache": ctx.kv_cache != KVCache(),
-        }
-        asked = sorted(name for name, value in unsupported.items() if value)
-        if asked:
-            raise ValueError(
-                f"the llama4 mixer has no {', '.join(asked)}: it norms queries "
-                "and keys with its own scale-free L2 norm under use_qk_norm, "
-                "scales by 1/sqrt(head_dim), rotates whole interleaved pairs "
-                "and attends by chunk rather than by window")
+        }, "it norms queries and keys with its own scale-free L2 norm under use_qk_norm, scales by "
+           "1/sqrt(head_dim), rotates whole interleaved pairs and attends by chunk rather than by window")
         if ctx.attention_chunk is not None and ctx.attention_chunk < 1:
             raise ValueError(f"attention_chunk_size is a positive chunk length, got {ctx.attention_chunk}; "
                              "None attends the whole sequence")
@@ -89,7 +83,11 @@ class Llama4Mixer(MixerBase):
             dtype=ctx.dtype,
             precision=ctx.precision,
             attention_impl=ctx.attention_impl,
-            force_fp32_for_softmax=ctx.force_fp32_for_softmax)
+            force_fp32_for_softmax=ctx.force_fp32_for_softmax,
+            attn_logit_softcap=ctx.attn_logit_softcap,
+            value_scale=ctx.value_scale,
+            o_proj_bias=ctx.o_proj_bias,
+            attention_dropout_rate=ctx.attention_dropout_rate)
 
 
 def default_no_rope_layers(num_layers: int, interval: int) -> tuple[int, ...]:

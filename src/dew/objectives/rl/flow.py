@@ -155,7 +155,7 @@ class FlowGRPOObjective(DiffusionObjective):
         the rollout's walk was: over its `rollout_steps` points, a
         transition's column being its step's index."""
         given = self.encoded_conditions(params, batch)
-        denoise = self.denoiser(params, given, self.blank_conditions(given))
+        denoise = self.denoiser(params, given, self.blank_conditions(params, given))
         points = jnp.asarray(batch["rollout_steps"], jnp.int32)
         return Walk.over(denoise, self.guidance, points[0] - 1)
 
@@ -325,7 +325,7 @@ class FlowRollout:
         """Sample one SDE trajectory per row and decode its final samples."""
         objective = self.objective
         given = objective.encoded_conditions(params, batch)
-        denoise = objective.denoiser(params, given, objective.blank_conditions(given))
+        denoise = objective.denoiser(params, given, objective.blank_conditions(params, given))
         noise_key, sample_key = jax.random.split(key)
         count = _source(objective.inputs, batch).shape[0]
         initial = objective.process.noise(noise_key, (count, *objective.latent_shape))

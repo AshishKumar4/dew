@@ -11,12 +11,11 @@ tokens and both results.
 
 from __future__ import annotations
 
-import ast
-import urllib.request
 from pathlib import Path
 
 import numpy as np
 import torch
+from reference_source import definitions
 
 ROUTER = ("https://raw.githubusercontent.com/CompVis/tread/"
           "d7f6911f3ebead658212e0f9e22b27e1da428ba3/routing_module.py")
@@ -24,11 +23,7 @@ FIXTURE = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "tread"
 
 
 def main() -> None:
-    text = urllib.request.urlopen(ROUTER).read().decode()
-    scope = {"torch": torch}
-    for node in ast.parse(text).body:
-        if isinstance(node, ast.ClassDef) and node.name == "Router":
-            exec(ast.get_source_segment(text, node), scope)
+    scope = definitions(ROUTER, ("Router",), {"torch": torch})
     router = scope["Router"]()
     torch.manual_seed(0)
     tokens = torch.randn(3, 16, 5)

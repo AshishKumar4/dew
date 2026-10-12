@@ -204,14 +204,21 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
         self.ema = EMASpec.constant(ema_decay)
         self.head_chunks = head_chunks
 
+    def _process(self):
+        """The task's process, over the canvas the model generates on: the one `build_task` samples
+        with and `task_record` saves."""
+        from dew.diffusion.block import BlockProcess
+
+        return BlockProcess(canvas_length=self.model.canvas_length, vocab_size=self.model.vocab_size)
+
     def task_record(self) -> Mapping[str, JSON]:
-        """The sequence length, canvas budget, tokenizer and block process."""
+        """The sequence length, canvas budget, tokenizer and block process: the task's own."""
         from dew.diffusion.block import BlockProcess
         from dew.inference.tasks import recorded_tokenizer
         from dew.registry import to_record
         return {'seq_len': self.sequence_length, 'max_new_tokens': self.canvas_size,
                 'tokenizer': recorded_tokenizer(self.processor),
-                'process': to_record(BlockProcess(self.canvas_size, self.model.vocab_size), BlockProcess)}
+                'process': to_record(self._process(), BlockProcess)}
 
     def build_task(self, variables: Variables, *,
                    processor: Processor | None | Omitted = OMITTED) -> BlockGeneration:
@@ -220,13 +227,11 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
         The sampler keeps the published defaults, and the caller sets the
         tokenizer's EOS ids.
         """
-        from dew.diffusion.block import BlockProcess
         from dew.inference.tasks import BlockGeneration
 
-        process = BlockProcess(canvas_length=self.model.canvas_length, vocab_size=self.model.vocab_size)
-        return BlockGeneration(self.model, variables, process,
+        return BlockGeneration(self.model, variables, self._process(),
                                self.processor if processor is OMITTED else processor,
-                               pad_token_id=self.pad_token_id)
+                               pad_token_id=self.pad_token_id, max_new_tokens=self.canvas_size)
 
     @property
     def bank_sites(self) -> tuple[DecoderBank, ...]:

@@ -102,6 +102,25 @@ def test_a_checkpoint_writes_the_averages_once_and_restores_them(tmp_path):
                                   strict=True):
             np.testing.assert_array_equal(np.asarray(held), np.asarray(expected))
 
+def test_a_resumed_run_tracks_its_averages_as_they_were_started(tmp_path):
+    """The averages a checkpoint holds keep decaying as their own profiles,
+    whatever stds the resuming run configures: four steps, a checkpoint, and
+    four more under other stds track what eight uninterrupted steps track,
+    bit for bit, and the snapshots name the profiles the averages follow."""
+    def trainer(stds, directory):
+        return Trainer(Regression(), power_profiles(optax.sgd(0.1), stds), key=jax.random.key(0),
+                       checkpoints=Checkpoints(str(directory)))
+
+    trainer((0.05, 0.10), tmp_path / "run").fit(Data(), steps=4, log_every=4, checkpoint_every=4)
+    resumed = trainer((0.06, 0.12), tmp_path / "run").fit(Data(), steps=8, log_every=4, checkpoint_every=4)
+    whole = trainer((0.05, 0.10), tmp_path / "whole").fit(Data(), steps=8, log_every=4, checkpoint_every=4)
+    for held, expected in zip(jax.tree.leaves(resumed.opt_state.averages),
+                              jax.tree.leaves(whole.opt_state.averages), strict=True):
+        np.testing.assert_array_equal(np.asarray(held), np.asarray(expected))
+    Checkpoints(str(tmp_path / "run")).wait()
+    assert Checkpoints(str(tmp_path / "run")).profile_metadata(8) == (8, pytest.approx((0.05, 0.10)))
+
+
 def test_a_run_record_names_its_profiles_and_the_solver_keeps_them():
     config = RunConfig(optim=OptimConfig(ema_profiles=(0.05, 0.10)))
     loaded = RunConfig.from_dict(json.loads(json.dumps(config.to_dict())))
