@@ -849,15 +849,6 @@ def _reported_architectures(wheel) -> tuple[str, ...]:
     return getattr(wheel, 'ARCHITECTURES', ('sm80',))
 
 
-def flash_key_lengths() -> tuple[str, ...]:
-    """The GPU generations whose kernel in the installed dew_flash_attn ends each row's keys at a length,
-    as the wheel reports them (FlashAttention-3's); none where it is not installed or predates the
-    report."""
-    if importlib.util.find_spec('dew_flash_attn') is None:
-        return ()
-    return getattr(importlib.import_module('dew_flash_attn'), 'KEY_LENGTHS', ())
-
-
 def flash_built_for(generation: str, architectures: tuple[str, ...]) -> bool:
     """Whether a wheel built for `architectures` holds code `generation` runs: its own, or sm80's on
     any 8.x part, which runs it."""
@@ -865,17 +856,14 @@ def flash_built_for(generation: str, architectures: tuple[str, ...]) -> bool:
 
 
 def flash_refusal(query, key, causal=False, sliding_window=None, mask=None, bias=None, softcap=None,
-                  sinks=None, key_lengths=None) -> str | None:
+                  sinks=None) -> str | None:
     """Why 'auto' does not send a call to FlashAttention (`flash_attention`),
     or None where it does: the GPU's target row names it, the query is bf16
     or fp16 with heads a multiple of 8 up to 256 wide (192 on sm8x parts other
     than sm80, whose backward takes no wider), a causal call is square, the
-    call has no window, mask, bias, softcap or sinks, its key lengths if any
-    are its only mask, without the causal one, over more than one query, on
-    a GPU whose kernel takes them (`flash_key_lengths`), no deterministic ops
-    are asked for, which its backward's atomic sum of the query gradient
-    would not keep, and the installed dew_flash_attn holds code for this
-    GPU. `mask` excludes the key lengths."""
+    call has no window, mask, bias, softcap or sinks, no deterministic ops are
+    asked for, which its backward's atomic sum of the query gradient would
+    not keep, and the installed dew_flash_attn holds code for this GPU."""
     head_dim = query.shape[-1]
     generation = device_generation()
     architectures = flash_architectures()
@@ -889,11 +877,6 @@ def flash_refusal(query, key, causal=False, sliding_window=None, mask=None, bias
         (not causal or query.shape[-3] == key.shape[-3], "a causal call has more keys than queries"),
         (sliding_window is None, "the call has a sliding window"),
         (mask is None, "the call has a mask"),
-        (key_lengths is None or (not causal and generation in flash_key_lengths()),
-         "the call has key lengths, which its kernel here does not take, or a causal mask beside them"),
-        (key_lengths is None or query.shape[-3] > 1,
-         "a decode step's one query over its cache, which the wheel's FlashAttention-3 serves without "
-         "the split keys and packed heads it leaves out"),
         (bias is None, "the call has a bias"),
         (softcap is None, "the call has a logit softcap"),
         (sinks is None, "the call has attention sinks"),
@@ -904,7 +887,7 @@ def flash_refusal(query, key, causal=False, sliding_window=None, mask=None, bias
     )
 
 
-def flash_attention(query, key, value, causal: bool, key_lengths=None):
+def flash_attention(query, key, value, causal: bool):
     """FlashAttention (dew_flash_attn, kernels/flash_attn) over `[B, S, H, D]`
     arrays at jax.nn's default scale. Its causal mask is aligned to the last
     key, where jax.nn's is aligned to the first, so a causal call is square.
@@ -919,18 +902,15 @@ def flash_attention(query, key, value, causal: bool, key_lengths=None):
                          f"device is {generation}; use attention_impl 'cudnn' or 'xla'")
     flash = importlib.import_module('dew_flash_attn')
 
-    def local(query, key, value, *lengths):
-        return flash.flash_mha(query, key, value, is_causal=causal,
-                               key_lengths=lengths[0] if lengths else None)
+    def local(query, key, value):
+        return flash.flash_mha(query, key, value, is_causal=causal)
 
-    extras = () if key_lengths is None else (key_lengths,)
     if jax.sharding.get_abstract_mesh().empty:
-        return local(query, key, value, *extras)
+        return local(query, key, value)
     kv_heads = math.lcm(key.shape[-2], _tensor_shards(query))
     key, value = repeat_kv_heads(key, kv_heads), repeat_kv_heads(value, kv_heads)
     queries, keys = logical_spec(HEADS, query.shape), logical_spec(KV_HEADS, key.shape)
-    specs = tuple(logical_spec(("activation_batch",), x.shape) for x in extras)
-    return manual_map(local, (queries, keys, keys, *specs), queries)(query, key, value, *extras)
+    return manual_map(local, (queries, keys, keys), queries)(query, key, value)
 
 
 def triton_attention(query, key, value, causal: bool):
@@ -1282,13 +1262,10 @@ def fused_attention(query, key, value, bias, mask, causal, sliding_window, imple
         out = cudnn_attention(query, key, value, bias, mask, causal, sliding_window,
                               key_value_seq_lengths)
     elif implementation in ('triton', 'flash'):
-        lengths = key_value_seq_lengths if implementation == 'flash' else None
-        if any(x is not None for x in (sinks, softcap, bias, mask, sliding_window)) or (
-                key_value_seq_lengths is not None and implementation == 'triton'):
+        if any(x is not None for x in (sinks, softcap, bias, mask, sliding_window, key_value_seq_lengths)):
             raise ValueError(
                 f"attention implementation '{implementation}' takes no sinks, softcap, bias, mask, "
-                f"window{'' if implementation == 'flash' else ' or key lengths'}; use attention_impl "
-                "'cudnn' or 'xla' for this call.")
+                "window or key lengths; use attention_impl 'cudnn' or 'xla' for this call.")
         if implementation == 'flash' and query.dtype not in CUDNN_DTYPES:
             raise ValueError(f"flash attention needs bf16 or fp16 inputs, the query is {query.dtype}")
         if implementation == 'flash' and causal and query.shape[-3] != key.shape[-3]:
@@ -1298,12 +1275,8 @@ def fused_attention(query, key, value, bias, mask, causal, sliding_window, imple
             raise ValueError("attention implementation 'flash' cannot run under --xla_gpu_deterministic_ops: "
                              "its backward sums the query gradient with atomics. "
                              "Use attention_impl 'xla'.")
-        if lengths is not None and (causal or device_generation() not in flash_key_lengths()):
-            raise ValueError(
-                f"flash attention takes key lengths on {', '.join(flash_key_lengths()) or 'no GPU'} and "
-                "without the causal mask; use attention_impl 'cudnn' or 'xla' for this call.")
-        out = (triton_attention(query, key, value, causal) if implementation == 'triton'
-               else flash_attention(query, key, value, causal, lengths))
+        attend = triton_attention if implementation == 'triton' else flash_attention
+        out = attend(query, key, value, causal)
     elif (implementation == 'xla' and mask is None and folds(query, key, bias, mask, causal, sliding_window)
           and key_value_seq_lengths is not None and decode_attention.fits(query, key)):
         out = decode_attention.attend(query, key, value, key_value_seq_lengths)
@@ -1371,8 +1344,7 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
     resolved = resolve_implementation(
         implementation, query, key, dtype=dtype, precision=precision,
         force_fp32_for_softmax=force_fp32_for_softmax, softcap=softcap, sinks=sinks,
-        causal=causal, sliding_window=sliding_window, mask=masked, bias=bias,
-        key_lengths=lengths if mask is None else None)
+        causal=causal, sliding_window=sliding_window, mask=masked, bias=bias)
     call = functools.partial(
         _attention_kernel, dtype=dtype, precision=precision, force_fp32_for_softmax=force_fp32_for_softmax,
         causal=causal, sliding_window=sliding_window, mask=mask, masked=masked, softcap=softcap,
@@ -1498,7 +1470,7 @@ def _xla_kernel_chains(query, key) -> bool:
 
 def resolve_implementation(implementation, query, key, *, dtype=None, precision=None,
                            force_fp32_for_softmax=True, softcap=None, sinks=None, causal=False,
-                           sliding_window=None, mask=None, bias=None, key_lengths=None) -> str:
+                           sliding_window=None, mask=None, bias=None) -> str:
     """The concrete kernel an `AttentionImpl` names for this call.
 
     Only 'auto' chooses, against the call's shapes and this machine's
@@ -1510,9 +1482,7 @@ def resolve_implementation(implementation, query, key, *, dtype=None, precision=
     where `cudnn_runs` and the call has no sinks and no bidirectional window,
     the tpu kernel where `tpu_runs`, and xla anywhere else; a call off flash
     where it was measured fastest is logged (`ran_kernel`). Any other name is returned as it is,
-    so an explicit kernel still refuses what it cannot honour by name. `mask` holds the call's key
-    lengths folded in, as the kernels that take no lengths read them; `key_lengths` are the lengths
-    where they are the call's only mask, which flash reads as they are.
+    so an explicit kernel still refuses what it cannot honour by name.
     """
     if implementation not in ('auto', 'reference', 'xla', 'cudnn', 'triton', 'flash', 'tpu'):
         raise ValueError(f"Unknown attention implementation: {implementation}")
@@ -1531,8 +1501,7 @@ def resolve_implementation(implementation, query, key, *, dtype=None, precision=
     # faster on the L4.
     if fused and triton_runs(query, sliding_window, mask, bias):
         return 'triton'
-    refusal = flash_refusal(query, key, causal, sliding_window, None if key_lengths is not None else mask,
-                            bias, softcap, sinks, key_lengths)
+    refusal = flash_refusal(query, key, causal, sliding_window, mask, bias, softcap, sinks)
     if refusal is None:
         return 'flash'
     if fused:
