@@ -6,11 +6,12 @@ import importlib.util
 import json
 import math
 import sys
+from collections.abc import Mapping
 from pathlib import Path
 
 import pytest
 
-from dew.data import DataPartition, Loading, load
+from dew.data import DataPartition, Loading, Memory, Split, load
 from dew.data.text import HFTokenizer
 from dew.decision import Choice, Decide, DecisionObjective, Decisions, Example, JointLayout, Noul
 from dew.decision.config import DecisionRunConfig
@@ -96,6 +97,28 @@ def _mixture(tmp_path: Path, rows: list[dict], evaluated: list[str], held: int) 
     items = [contamination.Evaluated((text,)) for text in evaluated]
     sources.write(mixture, out, contamination.Overlaps.of(items))
     return out
+
+
+@dataclasses.dataclass(frozen=True)
+class _NamedSplits(Memory):
+    """Memory rows with native named splits, as a Hub or TFDS source has them."""
+
+    splits: Mapping[str, tuple] = dataclasses.field(default_factory=dict)
+
+    def with_split(self, name: str) -> "_NamedSplits":
+        return dataclasses.replace(self, values=self.splits[name])
+
+
+def test_a_named_validation_split_reads_the_source_s_own_split():
+    """`Split("validation")` opens the training source's own named split through its
+    `with_split`, as every recipe opens one, and a source with no native splits refuses it."""
+    train = tuple({"text": f"train {index}", "label": "ab"[index % 2]} for index in range(4))
+    held = tuple({"text": f"held {index}", "label": "a"} for index in range(2))
+    named = _NamedSplits(train, splits={"train": train, "validation": held})
+    _, evaluated, _ = Decisions(source=named, validation=Split("validation"), question="team").pipelines()
+    assert list(evaluated.source.source.records("memory")) == list(held)
+    with pytest.raises(ValueError, match="no native split 'validation'"):
+        Decisions(source=Memory(train), validation=Split("validation"), question="team").pipelines()
 
 
 def test_a_decision_mixture_from_its_manifest_reads_by_index_by_default(tmp_path):
