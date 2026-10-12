@@ -224,17 +224,18 @@ def test_flash_runs_where_the_installed_wheel_holds_code_for_the_gpu(generation,
     ("sm90", WHEEL, {"mask": jnp.ones((1, 1, 128, 128), bool)}, "cudnn", "the call has a mask"),
     ("sm90", BEFORE_HOPPER, {}, "cudnn", "the installed dew_flash_attn holds no code for sm90"),
     ("sm90", BEFORE_HOPPER, {"head_dim": 256}, "xla", "the installed dew_flash_attn holds no code for sm90"),
-    ("sm120", WHEEL, {}, "cudnn", None),
+    ("sm120", WHEEL, {}, "flash", None),
+    ("sm120", WHEEL, {"head_dim": 256}, "flash", None),
 ])
 def test_auto_sends_a_plain_call_to_flash_where_it_was_measured(monkeypatch, caplog, generation, installed,
                                                                 call, chosen, refusal,
                                                                 without_deterministic_ops):
     """With dew_flash_attn installed, 'auto' takes FlashAttention where it
     was measured faster than cuDNN, for a bf16 call with no window, mask, bias
-    or softcap, heads up to 256 wide on sm80 and sm90 and 192 on the other
-    sm8x parts, whose backward takes no wider, and a square causal mask if any. A call it turns down
-    there logs why, once however often it is traced; on a device where it was
-    not measured, nothing is logged."""
+    or softcap, heads up to 256 wide on sm80, sm90 and sm120 and 192 on the
+    other sm8x parts, whose backward takes no wider, and a square causal mask
+    if any. A call it turns down there logs why, once however often it is
+    traced; on a device where it was not measured, nothing is logged."""
     from importlib import util
 
     from dew.nn import attention
