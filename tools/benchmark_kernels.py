@@ -60,8 +60,8 @@ def peak_bytes() -> int | None:
 
 
 def projection(args: argparse.Namespace) -> dict[str, object]:
-    rows, experts = 8192, 8
-    width, features = (768, 2048) if args.shape == "up" else (2048, 768)
+    rows, experts = args.rows, args.experts
+    width, features = (args.width, args.features) if args.shape == "up" else (args.features, args.width)
     rng = np.random.default_rng(0)
     sizes = np.floor(rng.dirichlet(np.ones(experts)) * rows).astype(np.int32)
     sizes[-1] += rows - sizes.sum()
@@ -214,6 +214,10 @@ def main(argv: list[str] | None = None) -> None:
     project = modes.add_parser("projection")
     project.add_argument("--implementation", default="auto")
     project.add_argument("--shape", choices=("up", "down"), default="up")
+    project.add_argument("--rows", type=int, default=8192, help="routed tokens, each top-k choice a row")
+    project.add_argument("--experts", type=int, default=8)
+    project.add_argument("--width", type=int, default=768, help="the model width an up projection reads")
+    project.add_argument("--features", type=int, default=2048, help="the expert width it writes")
     project.add_argument("--repeats", type=int, default=50)
     update = modes.add_parser("adam")
     update.add_argument("--state-dtype", choices=("float32", "bfloat16"), default="float32")
