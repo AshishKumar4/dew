@@ -75,7 +75,7 @@ def test_the_diffusion_flow_trains_restores_and_samples(tmp_path):
     source = json.dumps({"class": "dew.data.sources.tfds:TFDS",
                          "fields": {"name": "dew_images", "path": str(IMAGES), "split": "all"}})
     step(tmp_path, str(ROOT / "recipes" / "diffusion" / "train.py"), "data:images",
-         "--data.source", source, "--data.image-size", "8", "--data.augment", "None",
+         "--data.source", source, "--data.image-size", "8",
          "--data.validation", "None", "--loading.workers", "0", "--loading.threads", "1",
          "--loading.read-buffer", "2", "preset:flow", "--objective.solver", '{"class": "euler"}',
          "--objective.guidance", "None",
@@ -86,7 +86,8 @@ def test_the_diffusion_flow_trains_restores_and_samples(tmp_path):
          "--objective.ema-decay", "None", "--val-metrics", "--trainer.batch-size", "4",
          "--trainer.steps", "2",
          "--trainer.log-every", "1", "--trainer.eval-every", "None", "--trainer.checkpoint-every", "2",
-         "--trainer.checkpoint-dir", "runs", "--trainer.name", "demo", "--trainer.multi-host", "False")
+         "--trainer.checkpoint-dir", "runs", "--trainer.name", "demo", "--trainer.multi-host", "False",
+         "data.augment:none")
     sampled = step(tmp_path, "-c", (
         "import numpy as np\n"
         "from dew.inference import TextToImage\n"

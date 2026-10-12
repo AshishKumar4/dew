@@ -144,7 +144,7 @@ import numpy as np
 from dew.data import ByteTokenizer, export
 
 tokenizer = ByteTokenizer()
-ids = np.asarray(tokenizer.encode(Path("data/corpus.txt").read_text()), np.int32)
+ids = np.asarray(tokenizer.encode("The cat sat on the warm mat.\n" * 256), np.int32)
 held = int(len(ids) * 0.1)
 metadata = {"token_store": True, "tokenizer": "byte", "vocab_size": 256,
             "dtype": "int32", "eos_id": None}

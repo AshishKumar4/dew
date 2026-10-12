@@ -18,7 +18,7 @@ import numpy as np
 import pytest
 from safetensors.numpy import load_file
 
-from dew.data import DataPartition
+from dew.data import DataPartition, load
 from dew.data.text import ByteTokenizer, HFTokenizer
 from dew.decision import (
     Choice,
@@ -31,6 +31,7 @@ from dew.decision import (
     Specials,
 )
 from dew.decision.clef import ClefHead
+from dew.decision.data import Decisions as DecisionRecipe
 from dew.decision.layout import compacted
 from dew.decision.task import laid_out
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -132,7 +133,8 @@ def test_a_ragged_batch_trains_on_compacted_options_as_on_the_grid():
         tokenizer=tokenizer, specials=specials, layout=JointLayout(max_len=length),
         head=JointSchemaHead(hidden_size=16, width=16, routing_layers=2, layers=1, heads=1, feedforward=24,
                              attention_impl="xla"), shuffle_options=False)
-    data = objective.dataset(examples, batch=len(examples), validation=examples)
+    data = load(DecisionRecipe(source=examples, validation=examples), batch=len(examples),
+                read="memory", objective=objective.data())
     (slotted,) = list(data.val(DataPartition()))
     slotted = {name: value for name, value in slotted.items() if name != VALID_ROWS}
     options = np.asarray(slotted["options"])

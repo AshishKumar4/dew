@@ -201,6 +201,32 @@ def test_the_fit_check_leaves_out_a_set_none_of_whose_rows_fit():
         next(refused.train(DataPartition()))
 
 
+def test_the_clef_recipe_defaults_build_token_budget_batches():
+    import itertools
+
+    run = _module("clef").run_config()
+    trainer = run.trainer.derived()
+    assert trainer.batch_size is None
+    assert trainer.batch_tokens == trainer.update_tokens == 16_384
+    assert trainer.accumulation == 1 and run.bucket_lengths == ()
+    choice = Choice("Which?", ["first", "second"])
+    examples = [Example("x" * size, {"team": choice}, {"team": 0})
+                for size in (160, 768, 1_536, 3_072)] * 64
+    objective = DecisionObjective(Decide.from_pretrained(TINY), layout=JointLayout(max_len=run.max_len),
+                                  shuffle_options=False)
+    data = load(Decisions(source=examples), batch=trainer.batch_size, tokens=trainer.batch_tokens,
+                lengths=run.bucket_lengths, objective=objective.data(), read="memory",
+                loading=Loading(workers=0))
+    assert data.batch_tokens == 16_384
+    stream = data.train(DataPartition())
+    try:
+        batches = list(itertools.islice(stream, 8))
+    finally:
+        stream.close()
+    assert len({batch["tokens"].shape[1] for batch in batches}) <= 6
+    assert all(batch["tokens"].shape[0] * batch["tokens"].shape[1] == 16_384 for batch in batches)
+
+
 @pytest.mark.parametrize("param_dtype", ["float32", "bfloat16"])
 def test_the_clef_recipe_trains_a_joint_head_under_lora_on_a_frozen_decoder(tmp_path, param_dtype):
     """The Clef recipe end to end on the tiny Qwen 3.5: LoRA on its attention,
@@ -217,7 +243,11 @@ def test_the_clef_recipe_trains_a_joint_head_under_lora_on_a_frozen_decoder(tmp_
     mixture = _mixture(tmp_path, rows, ["nothing these rows share at all"], held=8)
     clef = _module("clef")
     storage = [] if param_dtype == "float32" else ["--param-dtype", param_dtype]
-    config = DecisionRunConfig.cli([*_flags(mixture, tmp_path / "runs"), "--pretrained", str(QWEN),
+    flags = _flags(mixture, tmp_path / "runs")
+    flags[flags.index("--trainer.batch-size") + 1] = "None"
+    flags[:0] = ["--data-read", "memory", "--trainer.batch-tokens", "8192",
+                "--trainer.update-tokens", "8192"]
+    config = DecisionRunConfig.cli([*flags, "--pretrained", str(QWEN),
                                     "--lora.rank", "4", "--head.width", "24", "--head.heads", "2",
                                     "--head.feedforward", "40", "--head.layers", "1",
                                     "--head.routing-layers", "1", "--max-len", "1024", *storage],
@@ -256,9 +286,11 @@ def test_a_bucketed_decision_run_resumes_bitwise_and_after_a_change_that_keeps_i
     mixture = _mixture(tmp_path, _requests(24, joint=True), ["nothing these rows share at all"], held=8)
     clef = _module("clef")
 
-    def run(directory: Path, steps: int, *changed: str):
+    def run(directory: Path, steps: int, *changed):
         flags = _flags(mixture, directory)
         flags[flags.index("--trainer.steps") + 1] = str(steps)
+        flags[flags.index("--trainer.batch-size") + 1] = "None"
+        flags += ["--trainer.batch-tokens", "8192", "--trainer.update-tokens", "8192"]
         flags += ["--pretrained", str(QWEN), "--lora.rank", "4", "--head.width", "24", "--head.heads", "2",
                   "--head.feedforward", "40", "--head.layers", "1", "--head.routing-layers", "1",
                   "--max-len", "1024", "--objective.bucket", "64", "--no-calibrate", *changed]

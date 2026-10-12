@@ -369,7 +369,7 @@ def test_build_eval_metrics_follows_the_sample_field(tmp_path):
     factories read that grid there, and an image-only metric raises a
     ValueError naming it in `build_eval_metrics`, before the trainer."""
     video = dataclasses.replace(run_config(tmp_path),
-                                data=Video(frame_size=8, frames=2),
+                                data=Video(source="clips", frame_size=8, frames=2),
                                 val_metrics=("psnr",))
     (metric,) = video.build_eval_metrics()
     images = np.zeros((2, 2, 8, 8, 3), np.uint8)
