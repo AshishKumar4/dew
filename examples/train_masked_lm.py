@@ -33,8 +33,8 @@ import tyro
 
 import dew
 from dew.config import ModelConfig, ObjectiveConfig, OptimConfig, TrainerConfig
-from dew.data import ByteTokenizer, Files, HFTokenizer, Hub, Loading
 from dew.config.data import HoldOut, TextData, loader
+from dew.data import ByteTokenizer, Files, HFTokenizer, Hub, Loading
 from dew.data.compile import iterate
 from dew.data.pipeline import Pipeline
 from dew.data.steps.text import Tokenize

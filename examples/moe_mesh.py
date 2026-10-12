@@ -41,8 +41,8 @@ from jax.sharding import NamedSharding
 
 from dew import Layout, MeshSpec, Trainer
 from dew.config import OptimConfig
-from dew.data import ByteTokenizer, Loading
 from dew.config.data import TextData, loader
+from dew.data import ByteTokenizer, Loading
 from dew.data.dataset import DataPartition
 from dew.inference import RunProcessor, TextGeneration
 from dew.inference.serving import Server

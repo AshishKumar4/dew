@@ -14,8 +14,8 @@ import jax.numpy as jnp
 import tyro
 
 from dew.config import OptimConfig
-from dew.data import ByteTokenizer, Loading
 from dew.config.data import TextData, loader
+from dew.data import ByteTokenizer, Loading
 from dew.data.sources.files import TokenFiles
 from dew.inference import RunProcessor
 from dew.nn.backbones import CausalTransformer

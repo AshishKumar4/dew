@@ -64,8 +64,8 @@ def report(out: str, line: dict) -> None:
 
 
 def main(options: Options) -> None:
-    from dew.data import Hub
     from dew.config.data import HoldOut, loader
+    from dew.data import Hub
     from dew.data.compile import iterate
 
     table = Decisions(source=Hub(BANKING77[0], revision=BANKING77[1]), label="label_text", question="intent",

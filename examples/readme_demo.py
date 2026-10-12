@@ -19,8 +19,8 @@ import tyro
 from dew import Checkpoints, Field, InputSpec, Trainer
 from dew.artifacts import uint8_pixels
 from dew.config import OptimConfig
-from dew.data import Loading
 from dew.config.data import PreferenceData, TextData, loader
+from dew.data import Loading
 from dew.data.dataset import Loader
 from dew.diffusion.presets import Flow
 from dew.nn.backbones import CausalTransformer, SimpleDiT
