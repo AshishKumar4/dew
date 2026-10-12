@@ -1289,7 +1289,7 @@ class Trainer(Generic[Loss, Effects]):
         restore_best: bool = False,
         state: TrainState | None = None,
     ) -> TrainState:
-        """Train to `steps` total steps, resuming from the latest checkpoint if the directory has one.
+        """Train until the step or real-token cap is reached, resuming the latest checkpoint.
 
         An explicit `state` takes precedence over initialization and checkpoint
         restoration; its input reader starts at the position `dataset` supplies, not
