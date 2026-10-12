@@ -192,7 +192,7 @@ class TrainingDisplay:
     title: str = ""
     header: list[tuple[str, str]] = dataclasses.field(default_factory=list)
     shown: Mapping[str, Shown] = dataclasses.field(default_factory=dict)
-    total: int = 0
+    total: int | None = 0
     first: int | None = None
     current: int = 0
     started: float = 0.0
@@ -243,7 +243,9 @@ class TrainingDisplay:
         self.header += [("batch", str(batch)), ("", precision)]
         console = Console()
         if not terminal(console):
-            self.note(f"Training {model} from step {started.start_step} to {started.target_steps}: "
+            target = (f"to {started.target_steps}" if started.target_steps is not None
+                      else f"for {started.total_tokens} real tokens")
+            self.note(f"Training {model} from step {started.start_step} {target}: "
                       + ", ".join(f"{label} {value}".strip() for label, value in self.header))
             return
         self.phase = "compiling"
@@ -282,9 +284,10 @@ class TrainingDisplay:
                 rows[name] = Row(rest or prefix, shown, collections.deque(maxlen=TREND))
             rows[name].values.append(value)
         if self.live is None:
-            line = f"step {step:>{len(str(self.total))}}/{self.total}  " + "  ".join(
+            target = "" if self.total is None else f"/{self.total}"
+            line = f"step {step}{target}  " + "  ".join(
                 f"{row.name} {number(row.values[-1], row.shown)}" for _, row in self.rows())
-            if (rate := self.rate()) and step < self.total:
+            if (rate := self.rate()) and self.total is not None and step < self.total:
                 line += f"  {duration((self.total - step) / rate)} left"
             self.note(line)
 
@@ -430,19 +433,22 @@ class TrainingDisplay:
         # The bar, with the step, the percentage, the rate and the times.
         rate = self.rate()
         elapsed = time.perf_counter() - self.started
-        fraction = self.current / max(self.total, 1)
+        fraction = None if self.total is None else self.current / max(self.total, 1)
         stats = Text()
-        stats.append(f"{self.current:>{len(str(self.total))}}", "bold").append(f"/{self.total}", LABEL)
-        stats.append(f"  {fraction:>4.0%}")
+        stats.append(str(self.current), "bold")
+        if fraction is not None:
+            stats.append(f"/{self.total}", LABEL).append(f"  {fraction:>4.0%}")
         if rate:
             stats.append(f"  {rate:.1f}" if rate >= 1 else f"  {1 / rate:.1f}")
             stats.append(" step/s" if rate >= 1 else " s/step", LABEL)
         stats.append(f"  {duration(elapsed)}")
-        if rate and self.current < self.total:
+        if rate and self.total is not None and self.current < self.total:
             stats.append(" + ", LABEL).append(duration((self.total - self.current) / rate))
             stats.append(" left", LABEL)
         room = inner - len(stats) - 2
-        if room >= 16:
+        if fraction is None:
+            parts.append(stats)
+        elif room >= 16:
             parts.append(Text.assemble(bar(fraction, room), "  ", stats))
         else:
             parts += [bar(fraction, inner), stats]
@@ -470,7 +476,7 @@ class TrainingDisplay:
     def state(self) -> Text:
         """The phase for the bottom border, with a spinner while it lasts."""
         if self.ended:
-            if self.current >= self.total:
+            if self.total is None or self.current >= self.total:
                 return Text.assemble(" ", ("✓ ", BETTER), ("finished", LABEL), " ")
             return Text.assemble(" ", ("■ ", WORSE), (f"stopped at step {self.current}", LABEL), " ")
         frame = self.spinner.render(time.perf_counter() - self.started)
