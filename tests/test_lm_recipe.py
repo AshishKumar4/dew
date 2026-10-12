@@ -259,8 +259,7 @@ def test_the_recipe_continues_a_pretrained_decoder(tmp_path):
 
     assert int(state.step) == 1
     recorded = LMRunConfig.load(str(tmp_path / "runs" / "continued"))
-    assert recorded.model.fields["vocab_size"] == 256
-    assert dataclasses.replace(recorded, model=config.model) == config
+    assert recorded == config
     kernel = state.variables["params"]["layers_0"]["self_attn"]["q_proj"]["kernel"]
     assert kernel.shape == (16, 16)
     assert np.all(np.isfinite(np.asarray(kernel)))
@@ -285,6 +284,36 @@ def test_a_pretrained_run_starts_from_the_checkpoints_weights(tmp_path):
         for entry in path:
             held = held[entry.key]
         np.testing.assert_array_equal(np.asarray(held), np.asarray(leaf))
+
+
+@pytest.mark.parametrize("lora", [False, True], ids=["full", "lora"])
+def test_a_pretrained_runs_record_trains_again(tmp_path, lora):
+    """A fine-tune's own run.json goes through `dew train` a second time.
+
+    The local checkpoint owns the geometry on both loads. Full fine-tuning
+    and LoRA each train a step, then the recorded run resumes to two steps
+    through the command's `--set trainer.steps=2`. The restored parameters
+    move again, so the replay reaches training rather than only parsing.
+    """
+    from dew.checkpoints import Checkpoints
+    from dew.cli.main import main
+
+    tokens = write_token_files(tmp_path / "tokens", 40 * SEQ, 8 * SEQ, eos_id=0)
+    checkpoint = export_tiny_decoder(tmp_path / "checkpoint")
+    adapter = ("--lora.rank", "4", "--lora.modules", "q_proj") if lora else ()
+    config = pretrained_config(tokens, checkpoint, "--trainer.steps", "1", "--max-new-tokens", "0",
+                               "--trainer.name", "replayed", *adapter)
+    state = config.run()
+    run = tmp_path / "runs" / "replayed"
+
+    assert main(["train", str(run / "run.json"), "--set", "trainer.steps=2"]) == 0
+
+    saved = Checkpoints(str(run))
+    assert saved.latest == 2
+    after = saved.variables(step=2)["params"]
+    assert any(not np.array_equal(np.asarray(before), np.asarray(again))
+               for before, again in zip(jax.tree.leaves(state.variables["params"]),
+                                         jax.tree.leaves(after), strict=True))
 
 
 def test_a_pretrained_run_stores_its_parameters_in_the_dtype_it_names(tmp_path):
