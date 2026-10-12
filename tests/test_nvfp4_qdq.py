@@ -13,6 +13,7 @@ from reference_error import assert_as_exact_as_the_reference
 
 from dew.interop import Pretrained, codecs
 from dew.interop.safetensors_io import read_weights
+from dew.nn.fake_quant import E2M1_MIDPOINTS
 from dew.training.quantization import NVFP4Input, _nvfp4_divide, nvfp4_input_qdq
 
 FIXTURE = Path(__file__).parent / "fixtures" / "codecs" / "nvfp4_qdq"
@@ -31,8 +32,7 @@ def test_the_quantizer_divider_is_ieee_fp32_across_its_scale_ranges():
     denominators = np.exp2(rng.uniform(-24, 24, count)).astype(np.float32)
     quotients = (rng.uniform(-8, 8, count) * np.exp2(rng.uniform(-24, 4, count))).astype(np.float32)
     numerators = (denominators.astype(np.float64) * quotients.astype(np.float64)).astype(np.float32)
-    boundaries = np.array([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5], np.float32)
-    q, b = rng.choice(boundaries, count // 2), denominators[:count // 2]
+    q, b = rng.choice(E2M1_MIDPOINTS, count // 2), denominators[:count // 2]
     a = (q.astype(np.float64) * b.astype(np.float64)).astype(np.float32)
     numerators = np.concatenate([numerators, a, np.nextafter(a, np.inf), np.nextafter(a, -np.inf)])
     denominators = np.concatenate([denominators, b, b, b])

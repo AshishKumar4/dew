@@ -19,7 +19,6 @@ from __future__ import annotations
 from abc import abstractmethod
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
-from functools import cached_property
 from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple, Protocol, runtime_checkable
 
 import jax
@@ -27,8 +26,6 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 from flax import linen as nn
-from flax.core import unfreeze
-from jax.core import eval_context
 
 from dew.artifacts import ImageGrid, VideoGrid
 from dew.coordination import agreed, collective_host
@@ -168,49 +165,6 @@ def check_solver(process, solver, steps: int) -> None:
         lambda x, key: solver.step(x, t, t_next, x, x, state, key, process,
                                     lambda x_t, t_: (x_t, x_t)),
         x, key)
-
-
-class FixedBlank:
-    """A configured unconditional branch, lazily encoded in eager mode.
-
-    The objective and a restored task use the same operations, outside any
-    caller trace, at their construction-time matmul precision. Encoding a
-    single empty prompt through a JIT instead can change bf16 rounding.
-    The small host result is cached; a call casts it to the conditional
-    branch's dtypes without re-encoding.
-    """
-
-    def __init__(self, inputs: InputSpec, encoders: Variables, precision):
-        self.inputs = inputs
-        self.encoders = unfreeze(dict(encoders))
-        self.precision = precision
-
-    @cached_property
-    def values(self) -> dict:
-        # eval_context leaves the caller's trace without enabling eager
-        # constant folding of Flax's discarded parameter initializers.
-        with eval_context(), jax.default_matmul_precision(self.precision):
-            tokens = {keyword: condition.encoder.tokenize([condition.unconditional])
-                      for keyword, condition in self.inputs.conditions.items()}
-            encoded = {keyword: condition.encoder.encode(self.encoders[keyword], tokens[keyword])
-                       for keyword, condition in self.inputs.conditions.items()}
-            return jax.tree.map(np.asarray, encoded)
-
-    def rebind(self, encoders: Variables) -> FixedBlank:
-        """Keep the cache when the bound encoder leaves are the same objects;
-        otherwise encode the new tree lazily at the recorded precision.
-        Identity checks do not synchronize device arrays or compare values.
-        """
-        previous, tree = jax.tree.flatten(self.encoders)
-        following, following_tree = jax.tree.flatten(unfreeze(dict(encoders)))
-        same_leaves = tree == following_tree and all(
-            left is right for left, right in zip(previous, following, strict=True))
-        if same_leaves:
-            return self
-        return FixedBlank(self.inputs, encoders, self.precision)
-
-    def __call__(self, like: dict) -> dict:
-        return jax.tree.map(lambda blank, value: jnp.asarray(blank, value.dtype), self.values, like)
 
 
 class TunedLatents(NamedTuple):
@@ -474,7 +428,6 @@ class DiffusionObjective(Objective[Ratio]):
         self.inputs = inputs
         self.autoencoder = autoencoder
         self.variables = variables
-        self._condition_precision = jax.config.jax_default_matmul_precision
         self.uncertainty = None if uncertainty is None else Uncertainty(uncertainty)
         self.alignment, self.representation = (None, None) if alignment is None else alignment.network(
             None if variables is None else variables.get(REPRESENTATION))
@@ -508,7 +461,6 @@ class DiffusionObjective(Objective[Ratio]):
                 'autoencoder': None if self.autoencoder is None else self.autoencoder.to_json(),
                 'solver': to_record(self.solver, Solver),
                 'guidance': to_record(self.guidance, Guidance | None), 'sampling_steps': self.steps,
-                'condition_precision': self._condition_precision,
                 # A tuned autoencoder's weights and statistics sit in the run's own tree.
                 'end_to_end': None if self.end_to_end is None else to_record(self.end_to_end, EndToEnd)}
 
@@ -553,23 +505,17 @@ class DiffusionObjective(Objective[Ratio]):
         return {keyword: condition.encoder.encode(encoders[keyword], tokens[keyword])
                 for keyword, condition in self.inputs.conditions.items()}
 
-    @cached_property
-    def _fixed_blank(self) -> FixedBlank:
-        return FixedBlank(self.inputs, self.encoder_params(), self._condition_precision)
-
     @property
     def unconditional_conditions(self) -> dict:
-        """The configured unconditional conditions, encoded on first use by the bound towers.
+        """The configured unconditional conditions, encoded by the bound towers (`encode`)."""
+        return self.encode(self.encoder_params())
 
-        They are encoded with the original eager operations at the precision the
-        towers were built with. Building or shape-checking a restored model does not
-        run the towers.
-        """
-        return self._fixed_blank.values
-
-    def blank_conditions(self, like: dict) -> dict:
-        """Return the cached unconditional conditions cast to the conditional dtypes."""
-        return self._fixed_blank(like)
+    def blank_conditions(self, params, like: dict) -> dict:
+        """The configured unconditional conditions, encoded by `params`' own towers and cast to the
+        conditional branch's dtypes in `like`: the one function a task over these weights encodes
+        its blank with too, so a step and the task read the same branch."""
+        return jax.tree.map(lambda blank, value: blank.astype(value.dtype),
+                            self.encode(params["encoders"]), like)
 
     def held_variables(self) -> Variables:
         """Return every array `init` starts from instead of drawing: the starting tree, or the frozen towers.
@@ -720,9 +666,7 @@ class DiffusionObjective(Objective[Ratio]):
         broadcast over the batch's rows. `dropout` blanks a drawn share of
         the batch's own rows, classifier-free guidance's training dropout."""
         given = self.encoded_conditions(params, batch)
-        # The unconditional prompt is fixed, so its encoding is a constant
-        # and the text tower runs over the batch alone, once per step.
-        unconditional = self.blank_conditions(given)
+        unconditional = self.blank_conditions(params, given)
         if dropout:
             count = batch[self.inputs.sample.key].shape[0]
             # A float32 draw, as the step's others are, at any precision.
