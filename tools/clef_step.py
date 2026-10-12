@@ -127,15 +127,16 @@ def run(tree: Path, work: Path, steps: int, generation: str | None, rows: Rows =
 
     built = backbone(tree, work / "backbone", rows.like, rows.revision)
     flags = ["--pretrained", str(built), "--revision", "None",
-             "--mixture.root", str(mixture(tree, work / "data")), "--max-len", str(rows.max_len),
+             "--data.source", str(mixture(tree, work / "data")), "--max-len", str(rows.max_len),
              "--lora.rank", "4", "--head.width", "24", "--head.heads", "2", "--head.feedforward", "40",
              "--head.layers", "1", "--head.routing-layers", "1",
              "--trainer.name", "clef-step", "--trainer.checkpoint-dir", str(work / "runs"),
-             "--trainer.batch-size", str(rows.batch), "--trainer.steps", str(steps),
+             "--trainer.batch-size", str(rows.batch), "--trainer.batch-tokens", "None",
+             "--trainer.update-tokens", "None", "--trainer.steps", str(steps),
              "--trainer.log-every", "1",
              "--trainer.eval-every", str(steps), "--trainer.checkpoint-every", str(steps),
              "--trainer.multi-host", "False", "--trainer.compilation-cache-dir", "None",
-             "--data.loading.workers", "0", "--optim.schedule.warmup-steps", "1", "--no-calibrate"]
+             "--loading.workers", "0", "--optim.schedule.warmup-steps", "1", "--no-calibrate"]
     if generation is not None:
         flags += ["--trainer.lower-for", generation]
     return DecisionRunConfig.cli(flags, default=recipe(tree, "clef").run_config()).run()
