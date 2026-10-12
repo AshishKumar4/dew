@@ -443,32 +443,18 @@ def test_swiglu_refuses_broadcast_mixed_and_wide_dtypes():
                                           gated_product("swiglu", implementation="xla")(gate, up))
 
 
-def test_auto_follows_a_call_placed_on_a_gpu_hosts_cpu(monkeypatch):
-    """Where the GPU's row names the Pallas kernel, a call placed on the host's CPU (a host-layout
-    run's CPU-owned state) takes XLA, and an explicit Pallas call interprets there."""
-    from dew.nn.kernels import norm_swiglu
-
-    measured_on_this_host(monkeypatch, "rms_norm")
-    monkeypatch.setattr(kernels.generation, "_logged", set())
-    monkeypatch.setattr(jax, "default_backend", lambda: "gpu")
-    x = jnp.ones((2, 17), jnp.float32)
-    assert norm_swiglu.rms_kernel("auto", x, None, x.dtype, fp32_statistics=True) == "pallas"
-    with jax.default_device(jax.devices("cpu")[0]):
-        assert norm_swiglu.rms_kernel("auto", x, None, x.dtype, fp32_statistics=True) == "xla"
-        assert norm_swiglu.rms_kernel("pallas", x, None, x.dtype, fp32_statistics=True) == "pallas"
-        assert not kernels.generation.triton_runs()
-
-
 @pytest.mark.gpu
-def test_a_gpu_hosts_cpu_runs_the_seams_its_placement_chooses():
+@pytest.mark.parametrize("implementation", ["auto", "pallas"])
+def test_a_gpu_hosts_cpu_runs_the_seams_its_placement_chooses(without_deterministic_ops, implementation):
     """On a GPU host, the norm, the SiLU product and attention placed on the CPU, eagerly under the
-    default device and in a JIT on a CPU mesh, as a host-layout run places its state, run there."""
+    default device and in a JIT on a CPU mesh, as a host-layout run places its state, run there:
+    'auto' takes no GPU kernel, and an explicit Pallas kernel interprets."""
     cpu = jax.devices("cpu")[0]
 
     def seams(x):
         y = rms_normalized(x, None, 1e-5, x.dtype, scale_offset=False, scale_after_cast=False,
-                           fp32_statistics=True)
-        y = gated_product("swiglu")(y, y).reshape(1, 4, 2, 64)
+                           fp32_statistics=True, implementation=implementation)
+        y = gated_product("swiglu", implementation=implementation)(y, y).reshape(1, 4, 2, 64)
         return attention.attention_kernel(y, y, y).astype(jnp.float32).sum()
 
     x = jax.device_put(jnp.linspace(-1, 1, 512, dtype=jnp.bfloat16).reshape(4, 128), cpu)

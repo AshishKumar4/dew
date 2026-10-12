@@ -57,24 +57,20 @@ def test_an_assumed_generation_names_its_platform(generation, platform):
     assert backend() == own == jax.default_backend()
 
 
-def test_a_call_placed_on_a_gpu_hosts_cpu_chooses_for_the_cpu(monkeypatch):
+def test_the_platform_is_the_placements():
     """A host-layout run builds its CPU-owned state under `jax.default_device` and steps it under
-    `jax.set_mesh` on a GPU host's CPU: the placement names the platform, not the default backend,
-    so the Triton kernels interpret there and no CUDA library is asked. An assumed GPU still answers
-    for itself, and a mesh of its abstract devices is this process's GPU only on a GPU host."""
+    `jax.set_mesh` on a GPU host's CPU, where the Triton kernels interpret and no CUDA library is
+    asked; a step traced on a GPU's abstract mesh chooses for that GPU, and is this process's GPU
+    only on a GPU host."""
     cpu = jax.devices('cpu')[0]
     mesh = Mesh(np.array([cpu]), ('data',))
-    with monkeypatch.context() as patched:
-        patched.setattr(jax, 'default_backend', lambda: 'gpu')
-        assert (backend(), triton_runs(), gpu_placed()) == ('gpu', True, True)
-        with jax.default_device(cpu):
-            assert (backend(), triton_runs(), gpu_placed()) == ('cpu', False, False)
-            with assumed('sm90'):
-                assert (backend(), triton_runs()) == ('gpu', True)
-        with jax.set_mesh(mesh):
-            assert (backend(), triton_runs(), gpu_placed()) == ('cpu', False, False)
+    with jax.default_device(cpu):
+        assert (backend(), triton_runs(), gpu_placed()) == ('cpu', False, False)
+    with jax.set_mesh(mesh):
+        assert (backend(), triton_runs(), gpu_placed()) == ('cpu', False, False)
     with jax.sharding.use_abstract_mesh(gpu_mesh(mesh, 'sm90')):
-        assert placed_platform() == 'gpu' and gpu_placed() == (jax.default_backend() == 'gpu')
+        assert (placed_platform(), backend()) == ('gpu', 'gpu')
+        assert gpu_placed() == (jax.default_backend() == 'gpu')
 
 
 def test_a_platform_keyed_choice_takes_the_assumed_gpus_path():
