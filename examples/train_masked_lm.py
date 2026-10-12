@@ -81,7 +81,7 @@ def smoke_config(config: Config) -> tuple[Config, Files]:
     `json` builder `datasets` ships, so nothing is downloaded."""
     config.out.mkdir(parents=True, exist_ok=True)
     rows = config.out / "smoke.jsonl"
-    rows.write_text("".join(json.dumps({"text": line}) for line in SMOKE_TEXT * 160))
+    rows.write_text("".join(json.dumps({"text": line}) + "\n" for line in SMOKE_TEXT * 160))
     source = Files(str(rows), format="jsonl")
     return replace(config, dataset="json", tokenizer="byte", sequence_length=32, batch_size=8,
                    steps=4, warmup_steps=1, model={"emb_features": 32, "num_layers": 1, "num_heads": 2},
@@ -108,7 +108,7 @@ def main(config: Config) -> Path:
         model=ModelConfig("causal_transformer", {
             **config.model, "causal": False, "mask_token_id": tokenizer.vocab_size,
             "dtype": "float32" if config.smoke else "bfloat16"}),
-        data=data, tokenizer=config.tokenizer, provision=not config.smoke,
+        data=data, data_read="memory", tokenizer=config.tokenizer, provision=not config.smoke,
         validation_records=None if config.val_batches is None else config.val_batches * config.batch_size,
         loading=Loading(workers=0, threads=4),
         objective=ObjectiveConfig("masked_diffusion", {

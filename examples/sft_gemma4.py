@@ -28,7 +28,7 @@ import jax.numpy as jnp
 import tyro
 
 from dew.config import ModelConfig, OptimConfig, TrainerConfig
-from dew.data import Chat, HFTokenizer, Loading, load
+from dew.data import Chat, HFTokenizer, Loading, Read, load
 from dew.data.chat import Role
 from dew.inference import RunProcessor
 from dew.interop import PretrainedDecoder
@@ -51,8 +51,10 @@ SMOKE_CONVERSATIONS = [
 @dataclass
 class Config:
     model: str = "google/gemma-4-E2B"
-    dataset: str = "allenai/tulu-3-sft-mixture"
-    """Hub chat dataset id, a parquet file or a .jsonl file of conversations."""
+    dataset: str = "hf://datasets/allenai/tulu-3-sft-mixture"
+    """A Hub source URL, Parquet file or JSONL conversations."""
+    data_read: Read = "memory"
+    """Materialize rendering and packing so four workers can share even one physical source shard."""
     split: str = "train"
     column: str = "messages"
     out: Path = Path("runs/gemma4-sft")
@@ -83,6 +85,7 @@ def run_config(config: Config, tokenizer: str, chat: str) -> LMRunConfig:
     # A row budget is the split slice `datasets` already understands.
     split = config.split if config.rows is None else f"{config.split}[:{config.rows}]"
     return LMRunConfig(
+        data_read=config.data_read,
         data=Chat(tokenizer=tokenizer, source=chat, validation=chat, column=config.column,
                   split=split, seq_len=config.sequence_length, long="chunk"),
         validation_records=config.batch_size,
