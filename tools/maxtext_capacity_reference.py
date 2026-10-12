@@ -16,7 +16,6 @@ Run with the Dew test environment's jax, on CPU:
     python tools/maxtext_capacity_reference.py OUTPUT.npz
 """
 
-import ast
 import hashlib
 import json
 import math
@@ -28,6 +27,7 @@ from pathlib import Path
 import jax
 import jax.numpy as jnp
 import numpy as np
+from reference_source import defined_in
 
 REPO, COMMIT = "AI-Hypercomputer/maxtext", "733b5a9147ed87ecf509fbb4779ed187f56c6045"
 PATH = "src/maxtext/layers/moe.py"
@@ -53,14 +53,10 @@ def generate_masks():
     found = hashlib.sha256(local.read_bytes()).hexdigest()
     if found != DIGEST:
         raise RuntimeError(f"{local} has SHA-256 {found}, not the pinned {DIGEST}")
-    tree = ast.parse(local.read_text())
-    [routed] = [node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "RoutedMoE"]
-    [method] = [node for node in routed.body
-                if isinstance(node, ast.FunctionDef) and node.name == "generate_masks"]
     namespace = {"math": math, "jax": jax, "jnp": jnp,
                  "max_logging": types.SimpleNamespace(log=lambda message: None)}
-    exec(compile(ast.Module([method], type_ignores=[]), str(local), "exec"), namespace)
-    return namespace["generate_masks"]
+    return defined_in(local.read_text(), {"generate_masks"}, namespace, within="RoutedMoE",
+                      filename=str(local))["generate_masks"]
 
 
 def main():

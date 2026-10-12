@@ -26,11 +26,13 @@ compressed-tensors 0.17.1. Run from the checkout:
     ~/.cache/dew/reference-venvs/kimi-k3/bin/python tools/compressed_tensors_mxfp4_reference.py
 """
 
+import itertools
 from pathlib import Path
 
 import numpy as np
 import torch
 from compressed_tensors.compressors.mxfp4.base import MXFP4PackedCompressor
+from compressed_tensors.compressors.nvfp4.helpers import FLOAT_TO_E2M1
 from compressed_tensors.quantization import QuantizationArgs, QuantizationScheme
 from compressed_tensors.quantization.utils.helpers import calculate_qparams
 
@@ -42,8 +44,9 @@ ARGS = QuantizationArgs(num_bits=4, type="float", strategy="group", group_size=3
                         symmetric=True, dynamic=False, scale_dtype=torch.uint8)
 SCHEME = QuantizationScheme(targets=["Linear"], weights=ARGS)
 
-TIES = [0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0]
-"""Halfway between neighbouring E2M1 magnitudes; each rounds to the even code."""
+TIES = [(lower + upper) / 2 for lower, upper in itertools.pairwise(FLOAT_TO_E2M1)]
+"""Halfway between neighbouring E2M1 magnitudes, the library's own table's;
+each rounds to the even code."""
 
 DTYPES = {"float32": torch.float32, "bfloat16": torch.bfloat16, "float16": torch.float16}
 """The dtypes the weight is encoded in, by the name the fixture keys carry."""

@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
+from flax import struct
 from jax import lax
 
 from .common import _sigma_integrator
@@ -90,7 +90,7 @@ def _sde_step(x, denoised, sigma, target):
     return (target / sigma) * x - jnp.expm1(jnp.log(target) - jnp.log(sigma)) * denoised
 
 
-@dataclass(frozen=True)
+@struct.dataclass
 class DPMSolverSDE:
     """Diffusers 0.34.0's `DPMSolverSDEScheduler`, k-diffusion's
     `sample_dpmpp_sde` midpoint solver over a Brownian tree.
@@ -120,17 +120,21 @@ class DPMSolverSDE:
     `seed` is the source's `noise_sampler_seed`: the path is then fixed by
     the checkpoint, independent of the walk's key. A Torch seed names no JAX
     stream, so it seeds this bridge rather than reproducing the reference tree.
+    It is the solver's one pytree leaf, so a compiled walk takes another seed
+    as data; the rest is static.
     """
 
-    depth: int = MAX_BROWNIAN_DEPTH
+    depth: int = struct.field(pytree_node=False, default=MAX_BROWNIAN_DEPTH)
     seed: int | None = None
 
     def __post_init__(self) -> None:
         if type(self.depth) is not int or not 1 <= self.depth <= MAX_BROWNIAN_DEPTH:
             raise ValueError(f"the Brownian bridge takes 1 to {MAX_BROWNIAN_DEPTH} levels, "
                              f"the mantissa of a float32 position, not {self.depth}")
-        if self.seed is not None and (type(self.seed) is not int or self.seed < 0):
-            raise ValueError(f"the noise sampler's seed is a nonnegative integer, not {self.seed}")
+        # A seed is data a compiled walk takes (a traced int32 under jit), so it fits 31 bits.
+        if (self.seed is not None and not isinstance(self.seed, jax.Array)
+                and (type(self.seed) is not int or not 0 <= self.seed < 2 ** 31)):
+            raise ValueError(f"the noise sampler's seed is an integer in [0, 2**31), not {self.seed}")
 
     def init(self, x, times, process, *, key):
         schedule = _sigma_integrator("DPMSolverSDE", process)

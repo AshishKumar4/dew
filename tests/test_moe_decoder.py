@@ -23,6 +23,7 @@ from sharded import assert_sharded
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import GatedMLP, Mixture
 from dew.nn.moe import SparseMLP
+from dew.nn.sharding import LayoutRefused
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
 from dew.registry import models
@@ -279,20 +280,27 @@ def test_every_expert_parallel_layout_stays_inside_the_sharding_tolerance(
 
 
 @pytest.mark.mesh
-def test_a_mostly_dense_model_on_expert_only_parallelism_is_rejected():
-    """Expert parallelism splits the experts alone, so a model whose experts
-    are a fifth of it runs mostly replicated. The check has to see that,
-    which the fsdp-only rule could not: it returned as soon as the fsdp axis
-    was one.
-    """
-    model = models.build("causal_transformer", **moe_config())
-    variables = jax.eval_shape(
-        model.init, jax.random.key(0), jnp.ones((1, SEQ_LEN), jnp.int32))
-    mesh = MeshSpec(fsdp=1, expert=8).build()
+def test_an_expert_mesh_keeps_dense_weights_whole_and_an_fsdp_mesh_that_divides_nothing_is_refused():
+    """The check counts a weight only where a rule could split it over one
+    of the mesh's axes. An expert-only mesh splits the experts alone and
+    keeps a mixture's dense weights whole, as a data axis keeps every weight
+    whole, so it passes; an fsdp axis that divides none of the widths its
+    rules name leaves them all replicated, and is refused."""
+    variables = jax.eval_shape(models.build("causal_transformer", **moe_config()).init,
+                               jax.random.key(0), jnp.ones((1, SEQ_LEN), jnp.int32))
     layout = Layout(min_shard=TINY_SHARD)
+    mesh = MeshSpec(fsdp=1, expert=8).build()
     shardings = layout.shardings(mesh, variables)
+    assert {sharding.spec for sharding in jax.tree.leaves(shardings)} >= {P(), P("expert")}
+    layout.check(variables["params"], shardings["params"], mesh)
 
-    with pytest.raises(ValueError, match="replicated"):
+    odd = {**moe_config(), "vocab_size": 36, "emb_features": 36, "mlp_features": 36, "num_heads": 3,
+           "num_kv_heads": 3, "mixture": {"experts": 3, "top_k": 2, "layers": (1,)}}
+    variables = jax.eval_shape(models.build("causal_transformer", **odd).init,
+                               jax.random.key(0), jnp.ones((1, SEQ_LEN), jnp.int32))
+    mesh = MeshSpec(fsdp=8).build()
+    shardings = layout.shardings(mesh, variables)
+    with pytest.raises(LayoutRefused):
         layout.check(variables["params"], shardings["params"], mesh)
 
 

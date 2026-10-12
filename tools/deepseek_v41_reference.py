@@ -9,7 +9,7 @@ DEEPSEEK_V41_REVISION, installs `tools/deepseek_v41_kernels.py` as their
 Run it in its own environment, never the project's:
 
     uv venv ~/.cache/dew/reference-venvs/deepseek-v41 --python 3.12
-    VIRTUAL_ENV=... uv pip install torch==2.10.0 numpy safetensors sympy \
+    VIRTUAL_ENV=... uv pip install torch==2.10.0 numpy ml_dtypes safetensors sympy \
         tokenizers transformers huggingface_hub tilelang==0.1.8
     PYTHONPATH=. ~/.cache/dew/reference-venvs/deepseek-v41/bin/python \
         tools/deepseek_v41_reference.py [--search N | --kernels | --vision | --fp64]
@@ -297,7 +297,6 @@ def draft(net, ids, main_hidden, start_pos):
 # tests do not read it; an L4 moves top-k rows by up to 1.5e-4.
 NOISE = {"window": 4.0e-6, "entries": 3.9e-6, "index": 4.1e-6, "selection": 1.2e-4}
 BLOCKS = {"window": 32, "entries": 16, "index": 32}
-E2M1_GRID = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
 E4M3_GRID = torch.unique(torch.arange(0, 127, dtype=torch.uint8).view(torch.float8_e4m3fn).float())
 
 
@@ -382,7 +381,7 @@ def quantizer_margins(site: str, x: torch.Tensor) -> dict[str, torch.Tensor]:
         e4m3 = site == "entries"
         quotient = kernels.fp4_quotient(amax, e4m3)
         floor = kernels.FP4_MAX * (2 ** -9 if e4m3 else 2 ** -126)
-        scale, grid, bound = kernels.fp4_scale(amax, e4m3), E2M1_GRID, kernels.FP4_MAX
+        scale, grid, bound = kernels.fp4_scale(amax, e4m3), kernels.E2M1, kernels.FP4_MAX
     quotient = quotient.double()[:, 0]
     if site == "entries":
         step_distance = _boundary_distance(quotient, E4M3_GRID)[0]
@@ -766,7 +765,9 @@ def write_kernels():
         blocks.append(x.bfloat16())
     x = torch.cat(blocks)
     x[3, :32] = 0
-    grid = torch.tensor([0, .25, .5, .75, 1, 1.25, 1.5, 1.75, 2, 2.5, 3, 3.5, 4, 5, 6], device=device)
+    e2m1 = importlib.import_module("tools.deepseek_v41_kernels").E2M1
+    # Every E2M1 magnitude and the midpoints between neighbours, ascending.
+    grid = torch.cat([e2m1, (e2m1[1:] + e2m1[:-1]) / 2]).sort().values.to(device)
     ties = torch.cat([grid, -grid, grid + 1e-3, grid - 1e-3]).clamp(-6, 6).repeat(3)[:64]
     t = torch.zeros(2, 32, device=device)
     t.view(-1)[:64] = ties

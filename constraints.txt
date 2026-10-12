@@ -1,6 +1,6 @@
 # The jax every CI and development install of Dew runs on:
 #
-#     pip install -e '.[test]' -c constraints.txt
+#     uv pip install -e '.[ci]' -c constraints.txt
 #
 # jax 0.11.2 with two cache-key fixes no release has yet (AshishKumar4/jax
 # branch v0.11.2-cache-key-pool-fingerprints): the multi-process key
@@ -12,7 +12,7 @@
 # the fix.
 jax @ https://github.com/AshishKumar4/jax/archive/7527048f5499b30e97c748d2d1b56056f62917ea.tar.gz
 
-# The tokamax CI installs beside Dew (tools/armada/install.sh); tokamax is not
+# The tokamax the test suite's environment installs (pyproject.toml's ci extra); tokamax is not
 # a dependency (docs/installation.md). 0.0.15 is the first release without
 # 0.0.13 and 0.0.14's typeguard==2.13.3, which tyro's typeguard>=4 excludes,
 # and its attention and grouped-matmul kernels are those of main at 47d3d663,

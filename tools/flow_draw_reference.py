@@ -38,6 +38,7 @@ import numpy as np
 import torch
 from diffusers import FlowMatchEulerDiscreteScheduler
 from diffusers.training_utils import compute_density_for_timestep_sampling, compute_loss_weighting_for_sd3
+from reference_source import selected, simple_statements
 
 from dew.diffusion.presets import Flow
 
@@ -82,22 +83,10 @@ def defaults(text: str) -> dict[str, object]:
 
 def statements(text: str) -> tuple[str, str]:
     """`get_sigmas` and the draw-to-weighting statements, as `main` holds them."""
-    main = next(node for node in ast.parse(text).body
-                if isinstance(node, ast.FunctionDef) and node.name == "main")
+    [main] = selected(text, {"main"})
     helper = next(node for node in ast.walk(main)
                   if isinstance(node, ast.FunctionDef) and node.name == "get_sigmas")
-    found = {}
-    for node in ast.walk(main):
-        compound = isinstance(node, ast.For | ast.If | ast.With | ast.While | ast.Try)
-        if isinstance(node, ast.stmt) and not compound:
-            source = ast.get_source_segment(text, node) or ""
-            for start in STATEMENTS:
-                if source.startswith(start) and start not in found:
-                    found[start] = source
-    missing = [start for start in STATEMENTS if start not in found]
-    if missing:
-        raise SystemExit(f"the script no longer holds {missing}")
-    return ast.get_source_segment(text, helper), "\n".join(found[start] for start in STATEMENTS)
+    return ast.get_source_segment(text, helper), "\n".join(simple_statements(text, main, STATEMENTS))
 
 
 @contextlib.contextmanager
