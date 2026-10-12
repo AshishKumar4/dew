@@ -584,7 +584,7 @@ def test_fit_reports_throughput_to_the_tracker():
     assert all(p["train/samples_per_sec"] > 0 for p in ticks)
 
 
-@pytest.mark.parametrize("kind", ["custom", "tokens", "lora", "dpo", "multistream"])
+@pytest.mark.parametrize("kind", ["custom", "tokens", "lora", "dpo"])
 def test_fit_without_analytical_work_trains_on_known_peak_hardware(monkeypatch, capsys, kind):
     from dew.nn.kernels import TARGETS, GpuTarget
 
@@ -608,12 +608,6 @@ def test_fit_without_analytical_work_trains_on_known_peak_hardware(monkeypatch, 
                 yield {IDS_KEY: ids, MASK_KEY: np.ones_like(ids, bool)}
 
         data = Data(pairs)
-    elif kind == "multistream":
-        # Counted as a decoder, but its residual streams' mixing declares no work.
-        model = models.build('causal_transformer', vocab_size=16, emb_features=8, num_layers=1, num_heads=1,
-                             mlp_features=16, max_seq_len=4, hyper_connections=HyperConnections(hc_mult=2))
-        objective = LMObjective(model, 4)
-        data = Data(lambda: token_batches(BATCH, 4, 16))
     tracker = RecordingTracker()
     trainer = Trainer(objective, optax.adam(1e-3), key=0, tracker=tracker)
     state = trainer.fit(data, steps=3, log_every=1)
@@ -655,7 +649,7 @@ def test_a_batch_that_cannot_be_counted_ends_mfu_and_the_run_trains_on(monkeypat
     assert capsys.readouterr().out.count("train/mfu is unavailable for StopsCounting: ") == 1
 
 
-@pytest.mark.parametrize("kind", ["custom", "lm", "lora"])
+@pytest.mark.parametrize("kind", ["custom", "lm", "lora", "multistream"])
 def test_fit_with_analytical_work_reports_mfu_on_known_peak_hardware(monkeypatch, capsys, kind):
     from dew.nn.kernels import TARGETS, GpuTarget
 
@@ -674,6 +668,8 @@ def test_fit_with_analytical_work_reports_mfu_on_known_peak_hardware(monkeypatch
         if kind == "lora":
             adapter = LoRA(1, ("q_proj",)).apply(objective.model, objective.init(jax.random.key(0)), key=1)
             objective.model, objective.variables = adapter.model, adapter.variables
+        elif kind == "multistream":
+            objective.model = objective.model.clone(hyper_connections=HyperConnections(hc_mult=2))
         trainer.tracker = tracker
         data = Data(lambda: token_batches(BATCH, 4, 16))
         batch = next(token_batches(BATCH, 4, 16))

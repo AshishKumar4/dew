@@ -10,6 +10,7 @@ from typing import Self
 
 import einops
 import jax.numpy as jnp
+import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
@@ -26,13 +27,16 @@ from ..dit import (
     rope_for_scan,
     stronger_remat,
 )
+from ..flops import MissingFlopsCount, matching_lengths, patch_lengths, projection_flops
 from ..precision import at_least_fp32
 from ..rope import rotary_freqs
 from .joint import DoubleStreamBlock
 
+PATCH_SIDE = 2
+
 
 def _block(stack: _AttentionStackOptions, remat: RematChoice, features: int, heads: int,
-           name: str) -> nn.Module:
+           name: str | None = None) -> DoubleStreamBlock:
     """One dual-stream block: `DoubleStreamBlock`, the block SD3 and Flux run,
     with the text first, adaLN-Zero modulation, the stack's layer norms and
     its queries' and keys' at 1e-6, rotate-half pairs, and its dropout."""
@@ -47,12 +51,38 @@ def _block(stack: _AttentionStackOptions, remat: RematChoice, features: int, hea
 class SimpleMMDiT(_DiTStackOptions):
     """SD3-style MM-DiT: a plain stack of dual-stream blocks, the image tokens
     rotated by their raster index (`rope_for_scan`)."""
+
+    @nn.nowrap
+    def model_flops(self, lengths) -> float:
+        raise MissingFlopsCount("SimpleMMDiT requires multimodal_flops with image/text input widths")
+
+    @nn.nowrap
+    def image_lengths(self, sample_shape: tuple[int, ...], rows: int) -> np.ndarray:
+        return patch_lengths(sample_shape, (self.patch_size, self.patch_size), rows)
+
+    @nn.nowrap
+    def multimodal_flops(self, lengths, context_lengths, input_channels: int, text_features: int) -> float:
+        """All input/output maps, pooled/time conditioning and joint blocks."""
+        matching_lengths(lengths, context_lengths)
+        width = self.emb_features
+        count = (self._embedding(self.patch_size, width, self.scan_order).model_flops(lengths, input_channels)
+                 + projection_flops(context_lengths, *self.projections(text_features)['txt_embed'])
+                 + self._conditioning(width).model_flops(lengths, text_features))
+        block = _block(self, remat=False, features=width, heads=self.num_heads)
+        return (count + self.num_layers * block.multisequence_flops(lengths, context_lengths)
+                + self._output(self.patch_size, self.output_channels, modulated=True).model_flops(
+                    lengths, width))
+
+    @nn.nowrap
+    def projections(self, text_features: int = 0) -> dict[str, tuple[int, int]]:
+        return {'txt_embed': (text_features, self.emb_features)}
+
     def setup(self):
         self.embed = self._embedding(self.patch_size, self.emb_features, self.scan_order)
         self.conditioning = self._conditioning(self.emb_features)
         # text tokens enter the sequence, so they need their own projection
         self.txt_embed = nn.Dense(
-            features=self.emb_features, dtype=self.dtype,
+            features=self.projections()['txt_embed'][1], dtype=self.dtype,
             precision=self.precision, name="txt_embed")
         self.blocks = [_block(self, self.remat, self.emb_features, self.num_heads, f"mmdit_block_{i}")
                        for i in range(self.num_layers)]
@@ -86,6 +116,10 @@ class PatchMerging(nn.Module):
     precision: PrecisionLike = None
     norm_epsilon: float = 1e-5
 
+    @nn.nowrap
+    def model_flops(self, lengths, input_features: int) -> float:
+        return projection_flops(lengths, PATCH_SIDE**2 * input_features, self.out_features)
+
     @nn.compact
     def __call__(self, x, H_patches, W_patches):
         B, _, C = x.shape
@@ -94,7 +128,7 @@ class PatchMerging(nn.Module):
         merged = einops.rearrange(
             x,
             'b (h p1) (w p2) c -> b h w (p1 p2 c)',
-            p1=2, p2=2
+            p1=PATCH_SIDE, p2=PATCH_SIDE
         )
         merged = LayerNorm(epsilon=self.norm_epsilon, dtype=self.dtype, name="norm")(merged)
         merged = nn.Dense(
@@ -104,8 +138,8 @@ class PatchMerging(nn.Module):
             name="projection"
         )(merged)
 
-        new_H = H_patches // 2
-        new_W = W_patches // 2
+        new_H = H_patches // PATCH_SIDE
+        new_W = W_patches // PATCH_SIDE
         merged = merged.reshape(B, new_H * new_W, self.out_features)
 
         return merged, new_H, new_W
@@ -119,11 +153,19 @@ class PatchExpanding(nn.Module):
     precision: PrecisionLike = None
     norm_epsilon: float = 1e-5
 
+    @property
+    def expanded_features(self) -> int:
+        return PATCH_SIDE**2 * self.out_features
+
+    @nn.nowrap
+    def model_flops(self, lengths, input_features: int) -> float:
+        return projection_flops(lengths, input_features, self.expanded_features)
+
     @nn.compact
     def __call__(self, x, H_patches, W_patches):
         B = x.shape[0]
 
-        expanded_features = 4 * self.out_features
+        expanded_features = self.expanded_features
         x = nn.Dense(
             features=expanded_features,
             dtype=self.dtype,
@@ -136,11 +178,11 @@ class PatchExpanding(nn.Module):
         expanded = einops.rearrange(
             x,
             'b h w (p1 p2 c) -> b (h p1) (w p2) c',
-            p1=2, p2=2, c=self.out_features
+            p1=PATCH_SIDE, p2=PATCH_SIDE, c=self.out_features
         )
 
-        new_H = H_patches * 2
-        new_W = W_patches * 2
+        new_H = H_patches * PATCH_SIDE
+        new_W = W_patches * PATCH_SIDE
         expanded = expanded.reshape(B, new_H * new_W, self.out_features)
 
         return expanded, new_H, new_W
@@ -159,6 +201,49 @@ class HierarchicalMMDiT(_AttentionStackOptions):
     num_layers: Sequence[int] = (4, 4, 14)  # Layers per stage, fine to coarse
     num_heads: Sequence[int] = (8, 12, 16)  # Heads per stage, fine to coarse
     remat: RematChoice = False
+
+    @nn.nowrap
+    def projections(self, text_features: int = 0) -> dict[str, tuple[int, int]]:
+        return {name: shape for stage, width in enumerate(self.emb_features)
+                for name, shape in ((f'cond_proj_stage{stage}', (self.emb_features[0], width)),
+                                    (f'txt_embed_stage{stage}', (text_features, width)),
+                                    (f'fusion_{stage}', (2 * width, width)))}
+
+    @nn.nowrap
+    def model_flops(self, lengths) -> float:
+        raise MissingFlopsCount("HierarchicalMMDiT requires multimodal_flops with image/text input widths")
+
+    @nn.nowrap
+    def image_lengths(self, sample_shape: tuple[int, ...], rows: int) -> np.ndarray:
+        coarsest = self.base_patch_size * PATCH_SIDE**(len(self.emb_features) - 1)
+        patch_lengths(sample_shape, (coarsest, coarsest), rows)
+        return patch_lengths(sample_shape, (self.base_patch_size, self.base_patch_size), rows)
+
+    @nn.nowrap
+    def multimodal_flops(self, lengths, context_lengths, input_channels: int, text_features: int) -> float:
+        """Per-stage streams, patch merges/expansions, skip maps and output."""
+        image, _ = matching_lengths(lengths, context_lengths)
+        rows, base = np.ones(image.shape, np.int64), self.emb_features[0]
+        if np.any(image % PATCH_SIDE**(2 * (len(self.emb_features) - 1))):
+            raise MissingFlopsCount("HierarchicalMMDiT needs whole patches at its coarsest stage")
+        count = (self._embedding(self.base_patch_size, base).model_flops(lengths, input_channels)
+                 + self._conditioning(base).model_flops(lengths, text_features))
+        maps = self.projections(text_features)
+        for stage, (width, layers, heads) in enumerate(zip(
+                self.emb_features, self.num_layers, self.num_heads, strict=True)):
+            level = (image / PATCH_SIDE**(2 * stage)).astype(np.int64)
+            count += (projection_flops(rows, *maps[f'cond_proj_stage{stage}'])
+                      + projection_flops(context_lengths, *maps[f'txt_embed_stage{stage}']))
+            block = _block(self, remat=False, features=width, heads=heads)
+            count += (1 if stage == len(self.emb_features) - 1 else 2) * layers * block.multisequence_flops(
+                level, context_lengths)
+            if stage < len(self.emb_features) - 1:
+                below = self.emb_features[stage + 1]
+                count += PatchMerging(below, parent=None).model_flops(level // PATCH_SIDE**2, width)
+                count += PatchExpanding(width, parent=None).model_flops(level // PATCH_SIDE**2, below)
+                count += projection_flops(level, *maps[f'fusion_{stage}'])
+        return count + self._output(self.base_patch_size, self.output_channels, modulated=True).model_flops(
+            lengths, base)
 
     @nn.nowrap
     def recompute_record(self) -> JSON:
@@ -217,7 +302,7 @@ class HierarchicalMMDiT(_AttentionStackOptions):
         self.fusion_layers = [
             nn.Sequential([
                 LayerNorm(epsilon=self.norm_epsilon, dtype=self.dtype),
-                nn.Dense(features=self.emb_features[s], dtype=self.dtype,
+                nn.Dense(features=self.projections()[f'fusion_{s}'][1], dtype=self.dtype,
                          precision=self.precision),
             ], name=f"fusion_{s}") for s in decoder_stages
         ]
@@ -238,13 +323,13 @@ class HierarchicalMMDiT(_AttentionStackOptions):
         # Base conditioning at the finest dim, projected per stage
         self.conditioning = self._conditioning(self.emb_features[0])
         self.cond_projs = [
-            nn.Dense(features=self.emb_features[i], dtype=self.dtype,
+            nn.Dense(features=self.projections()[f'cond_proj_stage{i}'][1], dtype=self.dtype,
                      precision=self.precision, name=f"cond_proj_stage{i}")
             for i in range(num_stages)
         ]
         # Per-stage text streams (dims differ per stage)
         self.txt_embeds = [
-            nn.Dense(features=self.emb_features[i], dtype=self.dtype,
+            nn.Dense(features=self.projections()[f'txt_embed_stage{i}'][1], dtype=self.dtype,
                      precision=self.precision, name=f"txt_embed_stage{i}")
             for i in range(num_stages)
         ]
@@ -263,11 +348,11 @@ class HierarchicalMMDiT(_AttentionStackOptions):
         _, H, W, _ = x.shape
         num_stages = len(self.emb_features)
         assert (
-            H % (self.base_patch_size * (2 ** (num_stages - 1))) == 0
-            and W % (self.base_patch_size * (2 ** (num_stages - 1))) == 0
+            H % (self.base_patch_size * (PATCH_SIDE ** (num_stages - 1))) == 0
+            and W % (self.base_patch_size * (PATCH_SIDE ** (num_stages - 1))) == 0
         ), (
             f"Image dimensions ({H},{W}) must be divisible by effective coarsest patch size "
-            f"{self.base_patch_size * (2 ** (num_stages - 1))}"
+            f"{self.base_patch_size * (PATCH_SIDE ** (num_stages - 1))}"
         )
 
         img, _ = self.embed(x)
