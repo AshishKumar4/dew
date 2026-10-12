@@ -11,13 +11,16 @@ remat names stay around it; the op is never differentiated.
 
 At trace time a launch takes, in order, a config pinned for its kernel
 (`pinned`), the pick measured for its key on this GPU model, and its
-heuristic. Picks are
-measured once, where a program is lowered before its compile (`tune`: the
-Trainer's step, the serving engine's), on the launches tokamax finds in the
-lowered program's metadata. Every config of a missing launch compiles on a
-thread pool and runs alone, timed by `samples` over rotated operands that
-together outgrow any L2 Dew targets, and the fastest is kept. A pool's
-process 0 measures and the others take its picks, so every process compiles
+heuristic, each only where the launch's declared space holds it; Dew
+resolves the config itself, so no tokamax policy measures or refuses inside
+a trace. Picks are measured once, where a program is lowered before its
+compile (`tune`: the Trainer's step, the serving engine's), on the launches
+tokamax finds in the lowered program's metadata. Every config of a missing
+launch compiles on a thread pool and runs alone, timed by `samples` over
+operand sets rotating through `ROTATION_BYTES`, and the fastest is kept; a
+launch too small to fill the rotation would be timed on cache hits, so it
+keeps its heuristic. A pool's process 0 decides every launch's pick, stored
+or measured, and the others take exactly those, so every process compiles
 the same program. Picks persist per GPU model and jaxlib beside XLA's own
 (`dew.cache.kernel_picks_path`), and only a process that has its GPU to itself
 measures (`dew.cache.measures_picks`); a CPU, an interpreted kernel or a shared
@@ -35,6 +38,7 @@ from __future__ import annotations
 import concurrent.futures
 import contextlib
 import dataclasses
+import functools
 import logging
 import os
 import time
@@ -50,6 +54,7 @@ import tokamax
 from tokamax._src.autotuning.autotuner import AutotuningData
 
 from dew import cache, coordination
+from dew.files import write_atomically
 
 from . import generation
 
@@ -60,14 +65,22 @@ ROTATION_BYTES = 256 << 20
 Dew's GPUs (an RTX PRO 6000's 128 MB), so no call finds the last one's
 operands in cache, as no training step does."""
 
-_STATE = jax.make_user_context((0, ()))
-"""(tunes, pins): how many times `tune` added picks in this process, and the
-pinned `(kernel, config)` pairs. JAX keys its trace and compile caches on it,
-so a program lowered again after picks arrive, or under other pins, is traced
-again."""
+ROTATION_SETS = 16
+"""The most operand sets one timed program holds. A launch whose sets cannot
+fill `ROTATION_BYTES` at this count keeps its heuristic."""
 
-_PICKS: dict[tuple[tokamax.Op, str], _Picks] = {}
+_PICKS: dict[tuple[tokamax.Op, str], dict[Hashable, AutotuningData]] = {}
 _LOADED: set[str] = set()
+
+
+@functools.cache
+def _state():
+    """`(tunes, pins)`: how many times `tune` changed this process's picks,
+    and the pinned `(kernel, config)` pairs, as a context JAX keys its trace
+    and compile caches on, so a program lowered again after picks change, or
+    under other pins, is traced again. Made at the first launch, pin or tune,
+    not at import."""
+    return jax.make_user_context((0, ()))
 
 
 def samples[T](fn: Callable[..., T], *args, warmup: int = 3, repeats: int = 10,
@@ -92,23 +105,6 @@ def samples[T](fn: Callable[..., T], *args, warmup: int = 3, repeats: int = 10,
     return measured
 
 
-class _Picks(dict):
-    """One op's picks on one GPU model, by key. A missing key reads as None,
-    which tokamax takes as a miss (`BoundArguments.cached_autotuning_data`)
-    without its warning, and is said once an op and GPU model."""
-
-    def __init__(self, name: str, kind: str):
-        super().__init__()
-        self.name, self.kind, self.said = name, kind, False
-
-    def __missing__(self, key) -> None:
-        if not self.said:
-            self.said = True
-            _log.info("%s has no measured config for a shape on %s; it takes its heuristic until a process "
-                      "with the GPU to itself lowers the step (dew.nn.kernels.tuning.tune)",
-                      self.name, self.kind)
-
-
 @dataclasses.dataclass(frozen=True)
 class KernelOp(tokamax.Op):
     """One Pallas launch whose config is measured per GPU model and shape.
@@ -128,17 +124,15 @@ class KernelOp(tokamax.Op):
     revision: int = 1
 
     def __call__(self, *args, **kwargs):
-        pin = dict(_STATE.value[1]).get(type(self))
-        op = self
-        if pin is not None and self.config is None and pin in self.bind(*args, **kwargs).autotuning_configs:
-            op = self.replace(config=pin)
-        return tokamax.Op.__call__(op, *args, **kwargs)
-
-    def get_autotuning_cache(self, device_kind: str | None = None) -> _Picks:
-        kind = device_kind or jax.devices()[0].device_kind
-        _load(kind)
-        op = self.replace(config=None, vjp=None)
-        return _PICKS.setdefault((op, kind), _Picks(type(self).__name__, kind))
+        if self.config is not None:
+            return tokamax.Op.__call__(self, *args, **kwargs)
+        ba = self.bind(*args, **kwargs)
+        space = ba.autotuning_configs
+        pin = dict(_state().value[1]).get(type(self))
+        picked = _picks(self, jax.devices()[0].device_kind).get(ba.autotuning_cache_key)
+        stored = None if picked is None else picked.fastest_config
+        config = next((choice for choice in (pin, stored) if choice in space), ba.heuristics_config)
+        return tokamax.Op.__call__(self.replace(config=config), *args, **kwargs)
 
     def _get_autotuning_cache_key(self, ba: tokamax.BoundArguments) -> Mapping[str, object]:
         key = super()._get_autotuning_cache_key(ba)
@@ -152,6 +146,13 @@ class KernelOp(tokamax.Op):
                 else jnp.zeros(spec.shape, spec.dtype) for key, spec in zip(keys, specs, strict=True)]
 
 
+def _picks(op: tokamax.Op, kind: str) -> dict[Hashable, AutotuningData]:
+    """`op`'s picks on GPUs of `kind` by key, each its fastest config's
+    timing, the store read in at the first lookup."""
+    _load(kind)
+    return _PICKS.setdefault((op.replace(config=None, vjp=None), kind), {})
+
+
 def _bucketed(spec: jax.ShapeDtypeStruct) -> jax.ShapeDtypeStruct:
     """`spec` with its leading (token) axis at the next power of two."""
     return jax.ShapeDtypeStruct((1 << max(spec.shape[0] - 1, 0).bit_length(), *spec.shape[1:]), spec.dtype)
@@ -159,13 +160,16 @@ def _bucketed(spec: jax.ShapeDtypeStruct) -> jax.ShapeDtypeStruct:
 
 def _measured(op: KernelOp, ba: tokamax.BoundArguments) -> AutotuningData:
     """Every config of `op`'s launch at `ba`, each compiled on a thread and
-    timed alone over operand sets that rotate through `ROTATION_BYTES`."""
+    timed alone over operand sets that rotate through `ROTATION_BYTES`; the
+    heuristic alone where the sets cannot fill it."""
     leaves, tree = jax.tree.flatten((ba.args, ba.kwargs),
                                     is_leaf=lambda leaf: isinstance(leaf, jax.ShapeDtypeStruct))
     places = [index for index, leaf in enumerate(leaves) if isinstance(leaf, jax.ShapeDtypeStruct)]
     specs = [leaves[index] for index in places]
-    held = sum(spec.size * spec.dtype.itemsize for spec in specs)
-    rotation = max(1, min(16, -(-ROTATION_BYTES // max(held, 1))))
+    held = max(1, sum(spec.size * spec.dtype.itemsize for spec in specs))
+    rotation = min(ROTATION_SETS, -(-ROTATION_BYTES // held))
+    fills = held * ROTATION_SETS >= ROTATION_BYTES
+    configs = list(ba.autotuning_configs) if fills else [ba.heuristics_config]
     sets = [op.operands(specs, seed) for seed in range(rotation)]
 
     def compiled(config):
@@ -187,7 +191,6 @@ def _measured(op: KernelOp, ba: tokamax.BoundArguments) -> AutotuningData:
         executable = lowered.compile()
         return executable, (middle - start) * 1e3, (time.perf_counter() - middle) * 1e3
 
-    configs = list(ba.autotuning_configs)
     timings: dict[Hashable, tokamax.BenchmarkData | Exception] = {}
     with concurrent.futures.ThreadPoolExecutor(os.cpu_count()) as pool:
         futures = {config: pool.submit(compiled, config) for config in configs}
@@ -204,77 +207,103 @@ def _measured(op: KernelOp, ba: tokamax.BoundArguments) -> AutotuningData:
     return AutotuningData(timings)
 
 
-def _added(picks: tokamax.AutotuningResult) -> None:
-    """Take `picks` into each launch's in-process cache."""
+def _config(fastest: AutotuningData | None) -> Hashable:
+    return None if fastest is None else fastest.fastest_config
+
+
+def _kernel_launches(picks: tokamax.AutotuningResult):
+    """`picks`' launches of Dew's kernels, each with its fastest config's timing."""
     for ba, timings in picks.data:
-        ba.op.get_autotuning_cache(picks.device_kind)[ba.autotuning_cache_key] = timings.prune()
+        if isinstance(ba.op, KernelOp) and timings.prune_errors():
+            yield ba, timings.prune()
 
 
 def _load(kind: str) -> None:
     """Read the picks stored for GPUs of `kind`, once a process, at its first
-    launch's lookup: no program traced before them, so none is traced again."""
+    lookup: no program traced before them, so none is traced again. A store
+    that no longer parses (a kernel left Dew) is measured anew."""
     if kind in _LOADED:
         return
     _LOADED.add(kind)
     path = cache.kernel_picks_path(kind)
-    if os.path.exists(path):
+    if not os.path.exists(path):
+        return
+    try:
         with open(path) as file:
-            _added(tokamax.AutotuningResult.load(file))
+            stored = tokamax.AutotuningResult.load(file)
+    except ValueError as error:
+        _log.warning("the kernel picks at %s no longer parse, so they are measured anew: %s", path, error)
+        return
+    for ba, fastest in _kernel_launches(stored):
+        _picks(ba.op, kind)[ba.autotuning_cache_key] = fastest
 
 
 def _stored(picks: tokamax.AutotuningResult) -> None:
-    """Merge `picks` into the stored picks for their GPU model, one writer at a time."""
+    """Merge `picks` into the stored picks for their GPU model, one writer at a
+    time, a launch's newer timings replacing its older (`write_atomically`)."""
     path = cache.kernel_picks_path(picks.device_kind)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with filelock.FileLock(path + '.lock'):
+        launches = []
         if os.path.exists(path):
-            with open(path) as file:
-                picks = tokamax.AutotuningResult.load(file) | picks
-        # Written aside and moved in, so a reader never sees half a file.
-        with open(path + '.partial', 'w') as file:
-            file.write(picks.dumps(prune_errors=True))
-        os.replace(path + '.partial', path)
+            with open(path) as file, contextlib.suppress(ValueError):
+                launches = list(tokamax.AutotuningResult.load(file).data)
+        merged = {(ba.op, ba.autotuning_cache_key): (ba, timings) for ba, timings in (*launches, *picks.data)}
+        write_atomically(path, tokamax.AutotuningResult(picks.device_kind, tuple(merged.values()))
+                         .dumps(prune_errors=True))
 
 
 def tune(jitted: jax.stages.Wrapped, *args) -> bool:
-    """Measure the launches of `jitted(*args)` that have no stored pick for
-    this GPU model, store the picks and take them on every process. True when
-    picks arrived, so the caller lowers again to compile with them. Only
-    process 0 measures; the others take what it measured. The program is
+    """Settle every launch's config in `jitted(*args)` across the pool: process
+    0 takes its stored pick, or measures one where it has its GPU to itself
+    (storing it), and every process takes exactly process 0's picks for the
+    program's launches. True on every process when any process's picks
+    changed, so the caller lowers again to compile with them. The program is
     lowered as the caller lowers it, which JAX's cache answers."""
-    kind = jax.devices()[0].device_kind
-    _load(kind)
-    if not (generation.triton_runs() and cache.measures_picks()):
+    if not generation.triton_runs():
         return False
+    kind = jax.devices()[0].device_kind
+    state = _state()
+    found = [(ba, ba.op) for ba in tokamax.autotuning.get_bound_args(jitted, *args)
+             if isinstance(ba.op, KernelOp)]
 
-    def measured() -> str | None:
+    def decided() -> str | None:
         if jax.process_index() != 0:
             return None
-        launches = []
-        for ba in tokamax.autotuning.get_bound_args(jitted, *args):
-            op = ba.op
-            if not isinstance(op, KernelOp) or ba.cached_autotuning_data is not None:
-                continue
-            timings = _measured(op, ba)
-            if timings.prune_errors():
-                launches.append((ba, timings))
-            else:
-                _log.warning("no config of %s compiled or ran; it keeps its heuristic: %s",
-                             type(ba.op).__name__, next(iter(timings.values()), None))
-        if not launches:
-            return None
-        _stored(tokamax.AutotuningResult(kind, tuple(launches)))
-        # The pool takes the fastest configs alone; the store keeps every time.
-        fastest = tuple((ba, timings.prune()) for ba, timings in launches)
-        return tokamax.AutotuningResult(kind, fastest).dumps()
+        decisions, measured = [], []
+        for ba, op in found:
+            if (fastest := _picks(op, kind).get(ba.autotuning_cache_key)) is not None:
+                decisions.append((ba, fastest))
+            elif cache.measures_picks():
+                timings = _measured(op, ba)
+                if timings.prune_errors():
+                    measured.append((ba, timings))
+                    decisions.append((ba, timings.prune()))
+                else:
+                    _log.warning("no config of %s compiled or ran; it keeps its heuristic: %s",
+                                 type(op).__name__, next(iter(timings.values()), None))
+        if measured:
+            _stored(tokamax.AutotuningResult(kind, tuple(measured)))
+        return tokamax.AutotuningResult(kind, tuple(decisions)).dumps()
 
-    text = coordination.broadcast_from_process_zero(coordination.agreed("measuring kernel configs", measured))
-    if text is None:
+    text = coordination.broadcast_from_process_zero(coordination.agreed("settling kernel configs", decided))
+    settled = {(ba.op, ba.autotuning_cache_key): fastest
+               for ba, fastest in _kernel_launches(tokamax.AutotuningResult.loads(text))}
+    changed = False
+    for ba, op in found:
+        picks, key = _picks(op, kind), ba.autotuning_cache_key
+        fastest = settled.get((op, key))
+        held = picks.get(key)
+        if _config(held) != _config(fastest):
+            changed = True
+            if fastest is None:
+                del picks[key]
+            else:
+                picks[key] = fastest
+    if not any(coordination.from_every_process(changed)):
         return False
-    _added(tokamax.AutotuningResult.loads(text))
-    # Programs traced before these picks arrived are traced again.
-    tunes, pin = _STATE.get_global()
-    _STATE.set_global((tunes + 1, pin))
+    tunes, pins = state.get_global()
+    state.set_global((tunes + 1, pins))
     return True
 
 
@@ -284,6 +313,7 @@ def pinned(configs: Mapping[type[KernelOp], Hashable]) -> Iterator[None]:
     config where its space at the launch's shapes holds it, any stored pick
     or heuristic set aside: for the float64 gate at every config of a space,
     and for a lab that times one."""
-    tunes, _ = _STATE.value
-    with _STATE((tunes, tuple(configs.items()))):
+    state = _state()
+    tunes, _ = state.value
+    with state((tunes, tuple(configs.items()))):
         yield
