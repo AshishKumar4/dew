@@ -61,7 +61,7 @@ def test_a_call_placed_on_a_gpu_hosts_cpu_chooses_for_the_cpu(monkeypatch):
     """A host-layout run builds its CPU-owned state under `jax.default_device` and steps it under
     `jax.set_mesh` on a GPU host's CPU: the placement names the platform, not the default backend,
     so the Triton kernels interpret there and no CUDA library is asked. An assumed GPU still answers
-    for itself, and a mesh of its abstract devices is no GPU of this process's."""
+    for itself, and a mesh of its abstract devices is this process's GPU only on a GPU host."""
     cpu = jax.devices('cpu')[0]
     mesh = Mesh(np.array([cpu]), ('data',))
     with monkeypatch.context() as patched:
@@ -74,7 +74,7 @@ def test_a_call_placed_on_a_gpu_hosts_cpu_chooses_for_the_cpu(monkeypatch):
         with jax.set_mesh(mesh):
             assert (backend(), triton_runs(), gpu_placed()) == ('cpu', False, False)
     with jax.sharding.use_abstract_mesh(gpu_mesh(mesh, 'sm90')):
-        assert placed_platform() == 'gpu' and not gpu_placed()
+        assert placed_platform() == 'gpu' and gpu_placed() == (jax.default_backend() == 'gpu')
 
 
 def test_a_platform_keyed_choice_takes_the_assumed_gpus_path():
