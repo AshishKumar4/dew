@@ -12,6 +12,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from reference_error import assert_leaves_as_exact
 from sharded import assert_runs_per_shard, boundary_copies
 
 from dew.nn import linear
@@ -348,8 +349,9 @@ def test_the_ported_rule_and_its_gradients_follow_the_recurrence(dtype, bound):
 def test_dews_fla_rule_follows_the_recurrence_for_any_heads_widths_and_length(
         key_heads, value_heads, width, columns, length):
     """`fla_rule`, the port as a GPU runs it, for calls its blocks do not fit as they come: padded to
-    them and cut back, through the custom VJP, the output, final memory and gradients of the token
-    recurrence on repeated keys in float64, within fp32 rounding."""
+    them and cut back, through the custom VJP, its output, final memory and gradients as near the
+    token recurrence in float64 as the portable math's at the same shapes
+    (tests/reference_error.py), the padding exact."""
     keys = jax.random.split(jax.random.key(17), 8)
     q = l2norm(jax.random.normal(keys[0], (1, length, key_heads, width)))
     k = l2norm(jax.random.normal(keys[1], (1, length, key_heads, width)))
@@ -361,32 +363,66 @@ def test_dews_fla_rule_follows_the_recurrence_for_any_heads_widths_and_length(
     dht = 0.1 * jax.random.normal(keys[7], (1, value_heads, width, columns))
     group = value_heads // key_heads
 
-    def dews(*args):
-        out, final = fla_rule(*args)
-        return jnp.sum(out * do) + jnp.sum(final * dht), (out, final)
+    def through(rule, do, dht):
+        def loss(*args):
+            out, final = rule(*args)
+            return jnp.sum(out * do) + jnp.sum(final * dht), (out, final)
 
-    (_, (out, final)), grads = jax.value_and_grad(dews, argnums=(0, 1, 2, 3, 4, 5), has_aux=True)(
-        q, k, v, g, beta, h0)
-    assert out.shape == v.shape and final.shape == h0.shape and final.dtype == jnp.float32
+        def run(*args):
+            gradient = jax.value_and_grad(loss, argnums=(0, 1, 2, 3, 4, 5), has_aux=True)
+            (_, (out, final)), grads = gradient(*args)
+            return out, final, *grads
+
+        return run
+
+    def portable(q, k, v, g, beta, h0):
+        return linear.chunk_delta_rule(jnp.repeat(q, group, axis=2), jnp.repeat(k, group, axis=2), v,
+                                       g[..., None], beta, h0)
+
+    port = through(fla_rule, do, dht)(q, k, v, g, beta, h0)
+    assert port[0].shape == v.shape and port[1].shape == h0.shape and port[1].dtype == jnp.float32
+    math = through(portable, do, dht)(q, k, v, g, beta, h0)
     with jax.enable_x64(new_val=True):
-        operands = wide(q, k, v, g, beta, h0)
-        wide_do, wide_dht = wide(do, dht)
+        operands = wide(q, k, v, g, beta, h0, do, dht)
 
         def repeated(q, k, *rest):
             return rule_math(jnp.repeat(q, group, axis=2), jnp.repeat(k, group, axis=2), *rest)
 
-        want_out, want_final = (np.asarray(x) for x in repeated(*operands))
-
-        def reference(*args):
-            o, f = repeated(*args)
-            return jnp.sum(o * wide_do) + jnp.sum(f * wide_dht)
-
-        want_grads = [np.asarray(x) for x in jax.grad(reference, argnums=(0, 1, 2, 3, 4, 5))(*operands)]
-    assert relative(out, want_out) < 1e-4
-    assert relative(final, want_final) < 1e-4
-    for name, mine, theirs in zip(("q", "k", "v", "g", "beta", "h0"), grads, want_grads, strict=True):
+        truth = jax.tree.map(np.asarray, through(repeated, *operands[6:])(*operands[:6]))
+    names = ("out", "final", "q", "k", "v", "g", "beta", "h0")
+    for name, mine, theirs in zip(names, port, truth, strict=True):
         assert mine.shape == theirs.shape, name
-        assert relative(mine, theirs) < 1e-4, name
+    assert_leaves_as_exact(jax.tree.map(np.asarray, port), jax.tree.map(np.asarray, math), truth)
+
+
+@pytest.mark.mesh(devices=2)
+def test_the_port_inside_a_shard_map_that_checks_varying_axes_is_one_devices_rule():
+    """`fla_rule` called inside a caller's `shard_map` with `check_vma=True` over split rows: its
+    outputs and gradients carry the rows' varying type (`fla_gdn._varying_like`, a Pallas call
+    states none) and equal the unsplit call's, bitwise."""
+    from jax.sharding import Mesh, PartitionSpec
+
+    keys = jax.random.split(jax.random.key(67), 5)
+    q = l2norm(jax.random.normal(keys[0], (2, 64, 1, 64)))
+    k = l2norm(jax.random.normal(keys[1], q.shape))
+    v = jax.random.normal(keys[2], (2, 64, 2, 64))
+    g = -jnp.exp(jax.random.normal(keys[3], v.shape[:3]) - 3.0)
+    beta = jax.nn.sigmoid(jax.random.normal(keys[4], v.shape[:3]))
+
+    def grads(q, k, v, g, beta):
+        def loss(*args):
+            out, final = fla_rule(*args)
+            return jnp.sum(out ** 2) + jnp.sum(final)
+
+        return jax.grad(loss, argnums=(0, 1, 2, 3, 4))(q, k, v, g, beta)
+
+    want = jax.jit(grads)(q, k, v, g, beta)
+    mesh = Mesh(np.asarray(jax.devices()[:2]), ("data",))
+    rows = PartitionSpec("data")
+    mapped = jax.shard_map(grads, mesh=mesh, in_specs=(rows,) * 5, out_specs=(rows,) * 5, check_vma=True)
+    got = jax.jit(mapped)(q, k, v, g, beta)
+    for name, mine, theirs in zip(("q", "k", "v", "g", "beta"), got, want, strict=True):
+        np.testing.assert_array_equal(np.asarray(mine), np.asarray(theirs), err_msg=name)
 
 
 def layer_on(monkeypatch, *, port: bool, **fields):
@@ -418,11 +454,14 @@ def test_a_gated_delta_net_on_fla_matches_it_on_xla(monkeypatch, dtype, bound):
         assert relative(mine, theirs) < bound, jax.tree_util.keystr(path)
 
 
-def test_dews_fla_rule_takes_fla_s_widest_keys_in_bf16():
-    """256-wide bf16 keys, fla's own bound, on the port: the output and final memory of the token
-    recurrence in float64, within bf16 storage's rounding."""
+@pytest.mark.parametrize("width", [192, 256])
+def test_dews_fla_rule_takes_wide_keys_up_to_fla_s_256_in_bf16(width):
+    """192- and 256-wide bf16 keys on the port, the 192 padded to 256, a width every key block of
+    the configs divides: the output and final memory of the token recurrence in float64, within
+    bf16 storage's rounding. A coverage check of the shapes; the port's accuracy against fla's own
+    is the GPU tier's float64 gate (the kernel lab's verify)."""
     keys = jax.random.split(jax.random.key(59), 5)
-    q = l2norm(jax.random.normal(keys[0], (1, 64, 1, 256))).astype(jnp.bfloat16)
+    q = l2norm(jax.random.normal(keys[0], (1, 64, 1, width))).astype(jnp.bfloat16)
     k = l2norm(jax.random.normal(keys[1], q.shape)).astype(jnp.bfloat16)
     v = jax.random.normal(keys[2], (1, 64, 2, 64)).astype(jnp.bfloat16)
     g = -jnp.exp(jax.random.normal(keys[3], v.shape[:3]) - 3.0)
@@ -430,7 +469,7 @@ def test_dews_fla_rule_takes_fla_s_widest_keys_in_bf16():
     out, final = fla_rule(q, k, v, g, beta)
     with jax.enable_x64(new_val=True):
         operands = wide(jnp.repeat(q, 2, axis=2), jnp.repeat(k, 2, axis=2), v, g, beta)
-        want_out, want_final = (np.asarray(x) for x in rule_math(*operands, jnp.zeros((1, 2, 256, 64))))
+        want_out, want_final = (np.asarray(x) for x in rule_math(*operands, jnp.zeros((1, 2, width, 64))))
     assert relative(out, want_out) < 2e-2 and relative(final, want_final) < 2e-2
 
 
@@ -461,11 +500,38 @@ def test_a_gpu_runs_the_port_for_every_rule_but_forward_mode_float64_and_the_wid
     assert "need a GPU" in linear.port_refusal(x, x, x)
 
 
+def test_a_bf16_layer_with_wide_keys_hands_the_port_its_narrowed_operands(monkeypatch):
+    """A bf16 GatedDeltaNet with 256-wide keys asks the port about the bf16 operands it hands it, not
+    the fp32 ones its convolution leaves, so the port takes it."""
+    called = []
+
+    def recorded(query, key, value, g, beta, state):
+        called.append(key.dtype)
+        return linear.chunk_delta_rule(jnp.repeat(query, 2, axis=2).astype(jnp.float32),
+                                       jnp.repeat(key, 2, axis=2).astype(jnp.float32),
+                                       value.astype(jnp.float32), g[..., None], beta.astype(jnp.float32))
+
+    monkeypatch.setattr(linear, "triton_runs", lambda: True)
+    monkeypatch.setattr(linear, "fla_rule", recorded)
+    layer = GatedDeltaNet(emb_features=64, num_k_heads=1, num_v_heads=2, head_k_dim=256, head_v_dim=64,
+                          dtype=jnp.bfloat16)
+    x = jnp.ones((1, 64, 64), jnp.bfloat16)
+    layer.apply(layer.init(jax.random.key(61), x), x)
+    assert called == [jnp.dtype(jnp.bfloat16)]
+
+
+def test_a_gpu_the_targets_do_not_list_runs_the_99_kb_tables():
+    assert fla_gdn._config_key(jnp.bfloat16, target="sm100") == ("sm89", "bfloat16")
+    assert fla_gdn._config_key(jnp.float16, target="sm120") == ("sm120", "bfloat16")
+    assert fla_gdn._config_key(jnp.float32, target="cpu") == ("sm80", "float32")
+
+
 @pytest.mark.parametrize("chunk_size", [32, 64])
 def test_the_rule_at_any_chunk_size_and_mixed_dtypes_is_the_math_on_the_port(monkeypatch, chunk_size):
     """`chunk_gated_delta_rule` where a GPU runs the port, at any chunk size the caller names (the
     rule's value does not depend on it) and with float32 queries over bf16 keys and values, which
-    the port takes in their common dtype: the portable math's output, within fp32 rounding."""
+    the port takes in their common dtype: as near the rule in float64 as the portable math's
+    output and final memory at that chunk size (tests/reference_error.py)."""
     keys = jax.random.split(jax.random.key(41), 5)
     q = l2norm(jax.random.normal(keys[0], (1, 96, 1, 64)))
     k = l2norm(jax.random.normal(keys[1], q.shape)).astype(jnp.bfloat16)
@@ -477,7 +543,11 @@ def test_the_rule_at_any_chunk_size_and_mixed_dtypes_is_the_math_on_the_port(mon
     monkeypatch.setattr(linear, "triton_runs", lambda: True)
     got, got_final = linear.chunk_gated_delta_rule(q, k, v, g, beta, chunk_size=chunk_size)
     assert got.dtype == want.dtype == jnp.float32
-    assert relative(got, want) < 1e-4 and relative(got_final, want_final) < 1e-4
+    with jax.enable_x64(new_val=True):
+        operands = wide(jnp.repeat(q, 2, axis=2), jnp.repeat(k, 2, axis=2), v, g, beta)
+        truth = [np.asarray(x) for x in rule_math(*operands, jnp.zeros((1, 2, 64, 64)))]
+    assert_leaves_as_exact([np.asarray(got), np.asarray(got_final)],
+                           [np.asarray(want), np.asarray(want_final)], truth)
 
 
 @pytest.mark.mesh(devices=2)

@@ -29,6 +29,7 @@ from jax.sharding import NamedSharding
 from reference_error import assert_leaves_as_exact
 
 from dew.nn.sharding import EXPERT_AXIS, FSDP_AXIS, TENSOR_AXIS
+from dew.telemetry.instrumentation import custom_call_kind, hlo_instructions
 
 PARAMETER_AXES = (FSDP_AXIS, TENSOR_AXIS, EXPERT_AXIS)
 """The mesh axes a `Layout` splits parameters over."""
@@ -125,37 +126,54 @@ def assert_runs_per_shard(fn, args, specs, mesh, truth, *, moves=()) -> None:
     assert_leaves_as_exact(jax.tree.map(np.asarray, split), jax.tree.map(np.asarray, whole), truth)
 
 
-INSTRUCTION = re.compile(
-    r"^\s*(?:ROOT\s+)?%(?P<name>\S+)\s+=\s+.+?\s(?P<op>[a-z][a-z0-9-]*)\((?P<operands>.*)\)")
-KERNEL_TARGETS = re.compile(r'custom_call_target="(__gpu\$xla\.gpu\.triton|dew_[a-z_]+)"')
-"""The custom calls a custom kernel lowers to: a Pallas-Triton call, or one of Dew's FFI handlers."""
+VIEWS = frozenset({"bitcast", "get-tuple-element", "tuple", "parameter"})
+"""Ops that move no data: a layout pass at a kernel's edge is seen through them."""
+
+
+def _relays_out(instruction) -> bool:
+    """Whether an instruction is a pass over an array that only re-lays it out: a copy or transpose,
+    or a fusion of nothing but those and views (one with real work beside a transpose writes the
+    array it computes in the layout asked, at no extra pass)."""
+    if instruction.op in ("copy", "transpose"):
+        return True
+    return (instruction.op == "fusion" and bool(instruction.fused & {"copy", "transpose"})
+            and instruction.fused <= {"copy", "transpose", "reshape", *VIEWS})
 
 
 def boundary_copies(text: str) -> list[str]:
-    """Each copy or transpose in compiled HLO `text` (an instruction of that opcode, or a fusion XLA
-    named for one) that produces an operand of a kernel call (`KERNEL_TARGETS`) or reads one of its
-    results, directly or through a tuple element: XLA re-laying out an array at the kernel's edge."""
-    ops, readers, kernels = {}, {}, set()
-    for line in text.splitlines():
-        match = INSTRUCTION.match(line)
-        if not match:
-            continue
-        name, op = match["name"], match["op"]
-        ops[name] = op
-        for operand in re.findall(r"%([\w.-]+)", match["operands"]):
+    """Each layout pass (`_relays_out`) in compiled HLO `text` that produces an operand of a kernel
+    call (a Pallas-Triton call or one of Dew's FFI handlers) or reads one of its results, through any
+    views (`VIEWS`): XLA re-laying out an array at the kernel's edge. Read with the profiler's own
+    HLO parser (`dew.telemetry.instrumentation.hlo_instructions`)."""
+    instructions = hlo_instructions(text)
+    readers: dict[str, list[str]] = {}
+    for name, instruction in instructions.items():
+        for operand in instruction.operands:
             readers.setdefault(operand, []).append(name)
-        if op == "custom-call" and KERNEL_TARGETS.search(line):
-            kernels.add((name, tuple(re.findall(r"%([\w.-]+)", match["operands"]))))
 
-    def moves(name):
-        return ops.get(name) in ("copy", "transpose") or (
-            ops.get(name) == "fusion" and re.search(r"copy|transpose", name) is not None)
+    def producers(name: str):
+        instruction = instructions.get(name)
+        if instruction is not None and instruction.op in VIEWS - {"parameter"}:
+            for operand in instruction.operands:
+                yield from producers(operand)
+        else:
+            yield name
+
+    def consumers(name: str):
+        for reader in readers.get(name, ()):
+            if instructions[reader].op in VIEWS:
+                yield from consumers(reader)
+            else:
+                yield reader
 
     found = []
-    for kernel, operands in kernels:
-        found += [f"{operand} -> {kernel}" for operand in operands if moves(operand)]
-        results = [kernel, *(reader for reader in readers.get(kernel, ())
-                             if ops.get(reader) == "get-tuple-element")]
-        found += [f"{kernel} -> {reader}" for result in results for reader in readers.get(result, ())
-                  if moves(reader)]
+    for name, instruction in instructions.items():
+        if instruction.op != "custom-call" or not (
+                custom_call_kind(instruction.target) == "triton" or instruction.target.startswith("dew_")):
+            continue
+        found += [f"{producer} -> {name}" for operand in instruction.operands
+                  for producer in producers(operand)
+                  if producer in instructions and _relays_out(instructions[producer])]
+        found += [f"{name} -> {consumer}" for consumer in consumers(name)
+                  if _relays_out(instructions[consumer])]
     return found
