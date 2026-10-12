@@ -217,7 +217,13 @@ QUANTIZATION = "quantization"
 the site's own scope: every view of the variables (a scanned or staged
 stack, a packed group, a pipeline) carries it with the weights it scales."""
 
-INPUT_SCALES = {"fp8": "fp8_input_scale", "nvfp4": "nvfp4_input_global_scale"}
+InputKind = Literal["fp8", "nvfp4"]
+"""A checkpoint input quantizer's format: ModelOpt's static FP8, or NVFP4."""
+
+InputFormat = Literal["compressed-tensors", "modelopt"]
+"""Whose NVFP4 local-scale arithmetic a checkpoint's inputs follow."""
+
+INPUT_SCALES: dict[InputKind, str] = {"fp8": "fp8_input_scale", "nvfp4": "nvfp4_input_global_scale"}
 """Each input format's leaf in `QUANTIZATION`: ModelOpt's static FP8
 multiplier (amax/448) or the NVFP4 global scale, one float32 scalar a site."""
 
@@ -234,11 +240,10 @@ class InputQuantizer:
     """
 
     scale: jax.Array
-    kind: Literal["fp8", "nvfp4"] = dataclasses.field(metadata={"static": True})
+    kind: InputKind = dataclasses.field(metadata={"static": True})
     e4m3_scale: bool = dataclasses.field(default=True, metadata={"static": True})
     """Whether NVFP4 rounds its local scales to E4M3."""
-    format: Literal["compressed-tensors", "modelopt"] = dataclasses.field(
-        default="compressed-tensors", metadata={"static": True})
+    format: InputFormat = dataclasses.field(default="compressed-tensors", metadata={"static": True})
     """Whose NVFP4 local-scale arithmetic the input follows."""
 
     @classmethod
@@ -246,17 +251,17 @@ class InputQuantizer:
         """ModelOpt's static E4M3 input multiplier, amax/448 in its exported files."""
         if not math.isfinite(scale) or scale <= 0:
             raise ValueError(f"ModelOpt FP8 input_scale must be positive and finite, got {scale}")
-        return cls(np.float32(scale), "fp8")
+        return cls(jnp.asarray(scale, jnp.float32), "fp8")
 
     @classmethod
     def nvfp4(cls, global_scale: float, e4m3_scale: bool,
-              format: Literal["compressed-tensors", "modelopt"] = "compressed-tensors") -> InputQuantizer:
+              format: InputFormat = "compressed-tensors") -> InputQuantizer:
         """One checkpoint Linear's stored global scale and published local-scale arithmetic."""
         if (not math.isfinite(global_scale) or global_scale < 0
                 or (global_scale == 0 and format == "compressed-tensors")):
             raise ValueError(f"NVFP4 input_global_scale must be positive and finite, got {global_scale}")
         scheme = InputQuantization(e4m3_scale, format)
-        return cls(np.float32(global_scale), "nvfp4", scheme.e4m3_scale, scheme.format)
+        return cls(jnp.asarray(global_scale, jnp.float32), "nvfp4", scheme.e4m3_scale, scheme.format)
 
     def qdq(self, x: jax.Array) -> jax.Array:
         """`x` quantized to the format and back, with the straight-through gradient."""
@@ -438,9 +443,9 @@ class InputQuantization:
 
     e4m3_scale: bool = True
     """Whether NVFP4 sites round their local scales to E4M3."""
-    format: Literal["compressed-tensors", "modelopt"] = "compressed-tensors"
+    format: InputFormat = "compressed-tensors"
     """Whose NVFP4 local-scale arithmetic the sites follow."""
-    sites: tuple[tuple[str, Literal["fp8", "nvfp4"]], ...] = ()
+    sites: tuple[tuple[str, InputKind], ...] = ()
     """Each quantized Linear's scope in the stored variables tree, `/`-joined,
     and its format: what `init` declares, so a model rebuilt from this record
     initializes the scales a checkpoint restores. The values live in the
@@ -450,7 +455,7 @@ class InputQuantization:
         if self.format == "modelopt" and not self.e4m3_scale:
             raise ValueError("ModelOpt NVFP4 always rounds its local scales to E4M3")
 
-    def layer_sites(self, layer: str) -> tuple[tuple[str, Literal["fp8", "nvfp4"]], ...]:
+    def layer_sites(self, layer: str) -> tuple[tuple[str, InputKind], ...]:
         """The quantized sites under the stored scope `layer` (`layers_3`),
         relative to it, with their formats: what two otherwise like layers
         must share to run as one scanned body or one stage position."""
@@ -467,7 +472,8 @@ class InputQuantization:
     def quantizer(self, module: nn.Module) -> InputQuantizer | None:
         """The bound `module`'s input quantizer, from the scale its variables
         hold, or None for a module that holds none."""
-        held = [kind for kind, leaf in INPUT_SCALES.items() if module.has_variable(QUANTIZATION, leaf)]
+        held: list[InputKind] = [kind for kind, leaf in INPUT_SCALES.items()
+                                 if module.has_variable(QUANTIZATION, leaf)]
         if not held:
             return None
         if len(held) > 1:
