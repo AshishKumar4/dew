@@ -186,7 +186,7 @@ def test_an_input_quantized_run_resumes_from_its_record_where_two_steps_would_en
                              attention_impl="reference")
 
     def run(directory, steps, record=None):
-        config = record or LMRunConfig(trainer=TrainerConfig(
+        config = record or LMRunConfig(model=ModelConfig.from_model(source.model), trainer=TrainerConfig(
             checkpoint_dir=str(directory), batch_size=BATCH, steps=steps, eval_every=None,
             checkpoint_every=1, compilation_cache_dir=None))
         objective = (LMObjective(record.model.build(), SEQ) if record
@@ -198,6 +198,7 @@ def test_an_input_quantized_run_resumes_from_its_record_where_two_steps_would_en
     whole = run(tmp_path / "whole", 2)
     run(tmp_path / "stopped", 1)
     record = RunConfig.load(str(tmp_path / "stopped" / "run"))
+    assert isinstance(record, LMRunConfig) and isinstance(record.model.wrappers[0], InputQuantization)
     resumed = run(tmp_path / "stopped", 2, dataclasses.replace(
         record, trainer=dataclasses.replace(record.trainer, steps=2)))
     assert int(resumed.step) == int(whole.step) == 2
