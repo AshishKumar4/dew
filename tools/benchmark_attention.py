@@ -13,9 +13,12 @@ dew_flash_attn wheel: FlashAttention-3 on Hopper, FlashAttention-2 on sm8x
 and sm120. The fifth, `triton`, is tokamax's
 Pallas-Triton flash attention, called directly through
 `tokamax.dot_product_attention`; Dew has no route to it, and this tool is
-where the case for one is measured. Batch and head counts are picked so
-every implementation sees the same token x head count, which is the fair
-comparison at a fixed sequence length.
+where the case for one is measured. The sixth, `jax_cudnn`, is
+`jax.nn.dot_product_attention`'s cuDNN call, which takes heads wider than
+Dew's cudnn path does. Batch and head counts are picked so every
+implementation sees the same token x head count, which is the fair
+comparison at a fixed sequence length; `--batch-size` and `--heads` fix a
+model's own shape instead.
 
 Usage:
     python tools/benchmark_attention.py
@@ -37,7 +40,7 @@ import jax
 import jax.numpy as jnp
 import tyro
 
-IMPLEMENTATIONS = ('reference', 'xla', 'cudnn', 'flash', 'triton')
+IMPLEMENTATIONS = ('reference', 'xla', 'cudnn', 'flash', 'triton', 'jax_cudnn')
 # B chosen so batch * sequence * heads is constant across the sequence sweep:
 # 512k query tokens at every row, so a slower row is a slower kernel, not a
 # smaller one.
@@ -54,6 +57,10 @@ class BenchmarkConfig:
     causal: tuple[bool, ...] = (False, True)
     kv_groups: int = 1
     """Query heads per key/value head; 1 is multi-head attention."""
+    batch_size: Optional[int] = None
+    """Rows per call; by default each sequence length's own, which keeps tokens*heads fixed."""
+    heads: Optional[int] = None
+    """Query heads; by default what the tokens*heads budget leaves at the batch and length."""
     sliding_window: Optional[int] = None
     softcap: Optional[float] = None
     """Gemma 2's tanh logit cap. Only the reference, xla and triton paths take it."""
@@ -76,6 +83,9 @@ class BenchmarkConfig:
 def attention_fn(implementation: str, config: BenchmarkConfig, causal: bool, dtype=None):
     from dew.nn.attention import scaled_dot_product_attention
     window, softcap = config.sliding_window, config.softcap
+    if implementation == 'jax_cudnn':
+        # jax.nn's own cuDNN call, which takes heads wider than Dew's cudnn path does.
+        return lambda q, k, v: jax.nn.dot_product_attention(q, k, v, is_causal=causal, implementation='cudnn')
     if implementation == 'triton':
         # tokamax is not a dependency (docs/concepts/moe.md), so it is
         # imported at the call.
@@ -118,7 +128,7 @@ def measure(case: dict, config: BenchmarkConfig) -> dict:
     not is a served row with `backward_reason`.
     """
     seq, head_dim = case['sequence_length'], case['head_dim']
-    heads = max(1, TOKEN_HEAD_BUDGET // (seq * case['batch_size']))
+    heads = config.heads or max(1, TOKEN_HEAD_BUDGET // (seq * case['batch_size']))
     if heads % config.kv_groups:
         raise ValueError(f"{heads} query heads at S={seq} do not split into "
                          f"kv_groups={config.kv_groups}")
@@ -195,7 +205,7 @@ def cases(config: BenchmarkConfig) -> list[dict]:
                         'sequence_length': seq,
                         'head_dim': head_dim,
                         'causal': causal,
-                        'batch_size': batch_for.get(seq, 2),
+                        'batch_size': config.batch_size or batch_for.get(seq, 2),
                     })
     return rows
 

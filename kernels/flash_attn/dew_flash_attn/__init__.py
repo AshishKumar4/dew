@@ -32,11 +32,22 @@ _library3, _three = _load("libdew_flash_attn3.so", "dew_flash3_architectures")
 ARCHITECTURES = _two + _three
 """The GPU generations the libraries hold code for, as their builds compiled them ('sm80', 'sm90',
 'sm120')."""
-for _name in ("dew_flash_mha_fwd", "dew_flash_mha_bwd",
-              "dew_flash_mha_varlen_fwd", "dew_flash_mha_varlen_bwd"):
-    jax.ffi.register_ffi_target(_name, jax.ffi.pycapsule(getattr(_library, _name)), platform="CUDA")
-for _name in ("dew_flash3_mha_fwd", "dew_flash3_mha_bwd", "dew_flash3_mha_varlen_fwd", "dew_flash3_mha_varlen_bwd"):
-    jax.ffi.register_ffi_target(_name, jax.ffi.pycapsule(getattr(_library3, _name)), platform="CUDA")
+
+
+@functools.cache
+def _registered() -> None:
+    """Both libraries' FFI targets, registered with jax once, at the first call that needs them:
+    importing the package to read ARCHITECTURES leaves jax's registry as it was."""
+    for library, prefix in ((_library, "dew_flash_mha"), (_library3, "dew_flash3_mha")):
+        for suffix in ("_fwd", "_bwd", "_varlen_fwd", "_varlen_bwd"):
+            name = prefix + suffix
+            jax.ffi.register_ffi_target(name, jax.ffi.pycapsule(getattr(library, name)), platform="CUDA")
+
+
+def _call(name: str, results):
+    """`jax.ffi.ffi_call` of one of the libraries' targets."""
+    _registered()
+    return jax.ffi.ffi_call(name, results)
 
 
 def _round(x: int, multiple: int) -> int:
@@ -93,10 +104,10 @@ def _forward3(query, key, value, starts, longest, scale, causal):
                jax.ShapeDtypeStruct((1, 1, 1, 1), jnp.float32), jax.ShapeDtypeStruct((1, 1, 1), jnp.float32))
     attributes = {"softmax_scale": np.float64(scale), "is_causal": causal}
     if packed:
-        out, lse, _, _ = jax.ffi.ffi_call("dew_flash3_mha_varlen_fwd", results)(
+        out, lse, _, _ = _call("dew_flash3_mha_varlen_fwd", results)(
             q, k, v, starts, max_seqlen=np.int64(longest), **attributes)
     else:
-        out, lse, _, _ = jax.ffi.ffi_call("dew_flash3_mha_fwd", results)(q, k, v, **attributes)
+        out, lse, _, _ = _call("dew_flash3_mha_fwd", results)(q, k, v, **attributes)
     return out[..., :query.shape[-1]], lse
 
 
@@ -114,10 +125,10 @@ def _backward3(grad, query, key, value, out, lse, starts, longest, scale, causal
                jax.ShapeDtypeStruct(v.shape, q.dtype), scratch, scratch)
     attributes = {"softmax_scale": np.float64(scale), "is_causal": causal}
     if packed:
-        dq, dk, dv, _, _ = jax.ffi.ffi_call("dew_flash3_mha_varlen_bwd", results)(
+        dq, dk, dv, _, _ = _call("dew_flash3_mha_varlen_bwd", results)(
             g, q, k, v, o, lse, starts, max_seqlen=np.int64(longest), **attributes)
     else:
-        dq, dk, dv, _, _ = jax.ffi.ffi_call("dew_flash3_mha_bwd", results)(g, q, k, v, o, lse, **attributes)
+        dq, dk, dv, _, _ = _call("dew_flash3_mha_bwd", results)(g, q, k, v, o, lse, **attributes)
     return dq[..., :width], dk[..., :width], dv[..., :width]
 
 
@@ -130,7 +141,7 @@ def _forward(query, key, value, scale, causal):
     blocks = max(1, -(-keys // block))
     splits = _splits(batch * heads * max(1, -(-queries // 64)), _multiprocessors() * 2, blocks)
     q, k, v = _padded(query, key, value)
-    out, lse, _, _ = jax.ffi.ffi_call("dew_flash_mha_fwd", (
+    out, lse, _, _ = _call("dew_flash_mha_fwd", (
         jax.ShapeDtypeStruct(q.shape, q.dtype),
         jax.ShapeDtypeStruct((batch, heads, queries), jnp.float32),
         jax.ShapeDtypeStruct((splits, batch, queries, heads, _round(width, 32)), jnp.float32),
@@ -146,7 +157,7 @@ def _backward(grad, query, key, value, out, lse, scale, causal):
     keys, key_heads = key.shape[1], key.shape[2]
     g, q, k, v, o = _padded(grad, query, key, value, out)
     padded = q.shape[-1]
-    dq, dk, dv, _, _ = jax.ffi.ffi_call("dew_flash_mha_bwd", (
+    dq, dk, dv, _, _ = _call("dew_flash_mha_bwd", (
         jax.ShapeDtypeStruct(q.shape, q.dtype),
         jax.ShapeDtypeStruct((batch, keys, heads, padded), q.dtype),
         jax.ShapeDtypeStruct((batch, keys, heads, padded), q.dtype),
@@ -198,7 +209,7 @@ def _varlen_forward(query, key, value, starts, longest, scale, causal):
     sequences = starts.shape[0] - 1
     q, k, v = _padded(query, key, value)
     # The packed forward never splits the keys, so its split scratch is a token buffer.
-    out, lse, _, _ = jax.ffi.ffi_call("dew_flash_mha_varlen_fwd", (
+    out, lse, _, _ = _call("dew_flash_mha_varlen_fwd", (
         jax.ShapeDtypeStruct(q.shape, q.dtype),
         jax.ShapeDtypeStruct((sequences, heads, longest), jnp.float32),
         jax.ShapeDtypeStruct((1, 1, 1, 1, 1), jnp.float32),
@@ -218,7 +229,7 @@ def _varlen_backward(grad, query, key, value, out, lse, starts, longest, scale, 
     padded = q.shape[-1]
     attributes = _attributes(scale, causal)
     attributes["softmax_scale"] = np.float32(scale)
-    dq, dk, dv, _, _ = jax.ffi.ffi_call("dew_flash_mha_varlen_bwd", (
+    dq, dk, dv, _, _ = _call("dew_flash_mha_varlen_bwd", (
         jax.ShapeDtypeStruct(q.shape, q.dtype),
         jax.ShapeDtypeStruct((key.shape[0], heads, padded), q.dtype),
         jax.ShapeDtypeStruct((key.shape[0], heads, padded), q.dtype),
