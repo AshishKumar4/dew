@@ -1193,7 +1193,8 @@ class Trainer(Generic[Loss, Effects]):
             return self._candidate(state, batch, schedule, placement, replicated, split)
 
         # Read before anything traces, so a recorded rung is the first one lowered.
-        record_path, key, recorded = recorded_rung(self.objective.program_key(), (state, batch), mesh)
+        record_path, key, recorded = recorded_rung(self.objective.program_key(), (state, batch), candidates,
+                                                   mesh)
         before = self._rung()
         self._climb_to(recorded)
         self._resumed_rung = None
@@ -1887,8 +1888,8 @@ class Trainer(Generic[Loss, Effects]):
             return choice
 
         selection = tuple(
-            owned(Best(choice) if isinstance(choice, str) else choice).resolved(metrics, splits)
-            for choice in raw
+            (chosen if isinstance(chosen, Best) else Best(chosen)).resolved(metrics, splits)
+            for chosen in (owned(Best(choice) if isinstance(choice, str) else choice) for choice in raw)
         )
         labels = [(choice.split, choice.metric) for choice in selection
                   if isinstance(choice._source, (Metric, TrainingScalar))]
