@@ -114,9 +114,9 @@ class MixerContext:
             "attention_dropout_rate": bool(self.attention_dropout_rate),
         }
 
-    def refuse(self, kind: str, asked: Mapping[str, bool], why: str) -> None:
-        """Raise naming every entry of `asked` this layer sets, none of which
-        mixer `kind` implements: `why`."""
+    def refuse(self, kind: str, asked: Mapping[str, object], why: str) -> None:
+        """Raise naming every entry of `asked` this layer sets (a truthy value:
+        a flag on, a field given), none of which mixer `kind` implements: `why`."""
         names = sorted(name for name, value in asked.items() if value)
         if names:
             raise ValueError(f"the {kind} mixer has no {', '.join(names)}: {why}")
