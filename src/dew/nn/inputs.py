@@ -239,6 +239,62 @@ class ModelInputs:
 
 
 @struct.dataclass
+class Coordinates:
+    """Where each token of a batch sits, built once (`coordinates`) and read by every token mixer.
+
+    `segments` `[B, S]` numbers each row's packed documents from 1, 0 on a
+    padding slot; `valid` marks a real token, the caller's mask and a nonzero
+    segment; `positions` is each real token's place in its document, counted
+    over real tokens; `starts` marks each document's first real token but a
+    row's first, which continues whatever state the row holds. `slots` is
+    where a cache writes each real token, -1 for padding, which the model
+    fills from its cache's cursor; None for an uncached call. `max_segments`
+    bounds the documents a row holds, the packer's static plan or the row's
+    length, and `right_padded` says every row's real tokens come first.
+    """
+
+    segments: jax.Array
+    valid: jax.Array
+    positions: jax.Array
+    starts: jax.Array
+    slots: jax.Array | None = None
+    max_segments: int = struct.field(pytree_node=False, default=1)
+    right_padded: bool = struct.field(pytree_node=False, default=False)
+
+
+def coordinates(batch: int, length: int, *, segments=None, valid=None, positions=None,
+                max_segments: int | None = None, right_padded: bool = False) -> Coordinates:
+    """The `Coordinates` of `[batch, length]` tokens from what the batch carries: packed `segments`
+    (one document a row where None), a `valid` mask, explicit `positions` (each document's real
+    tokens counted from 0 where None) and the packer's `max_segments` (the row length where None)."""
+    shape = (batch, length)
+    segments = jnp.ones(shape, jnp.int32) if segments is None else jnp.asarray(segments, jnp.int32)
+    valid = segments != 0 if valid is None else jnp.asarray(valid, bool) & (segments != 0)
+    if segments.shape != shape or valid.shape != shape:
+        raise ValueError(f"token coordinates are {shape}, got segments {segments.shape} and valid "
+                         f"{valid.shape}")
+    starts = document_starts(segments, valid)
+    if positions is None:
+        rank = jnp.cumsum(valid, axis=1, dtype=jnp.int32) - 1
+        first = jax.lax.cummax(jnp.where(starts, rank, 0), axis=1)
+        positions = jnp.where(valid, rank - first, 0)
+    return Coordinates(segments, valid, jnp.asarray(positions, jnp.int32), starts,
+                       max_segments=length if max_segments is None else max_segments,
+                       right_padded=right_padded)
+
+
+def document_starts(segments, valid):
+    """`[B, S]`: each real token whose segment differs from the previous real token's in its row, a
+    row's first real token continuing what precedes the row and a padding slot starting nothing."""
+    order, _ = valid_order(valid)
+    rank = jnp.cumsum(valid, axis=1, dtype=jnp.int32) - 1
+    compact = jnp.take_along_axis(segments, order, axis=1)
+    changed = jnp.concatenate([jnp.zeros_like(compact[:, :1], bool), compact[:, 1:] != compact[:, :-1]],
+                              axis=1)
+    return valid & jnp.take_along_axis(changed, jnp.maximum(rank, 0), axis=1)
+
+
+@struct.dataclass
 class AttentionMetadata:
     """Per-token data the layers read alongside their inputs, independent of physical cache-slot addresses.
 
