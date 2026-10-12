@@ -235,9 +235,14 @@ def _measured(op: KernelOp, ba: tokamax.BoundArguments) -> AutotuningData:
     read = {}
     with concurrent.futures.ThreadPoolExecutor(os.cpu_count()) as pool:
         futures = {config: pool.submit(compiled, config) for config in ba.autotuning_configs}
-    # One CUPTI subscription reads every run; the flush's own read, last,
-    # detaches it, so a profiler can subscribe after.
+    # One CUPTI subscription reads every run, the flush's own first. CUPTI
+    # takes one subscriber, so beside an open profile capture none is
+    # measured and the launch keeps its heuristic until a later compile.
     cupti = profiler.Cupti(finalize=False)
+    try:
+        flushes = {name for name, _ in _kernel_times(cupti, evicting, flush)}
+    except RuntimeError as error:
+        return AutotuningData(dict.fromkeys(ba.autotuning_configs, error))
     try:
         for config, future in futures.items():
             try:
@@ -248,7 +253,8 @@ def _measured(op: KernelOp, ba: tokamax.BoundArguments) -> AutotuningData:
                 continue
             read[config] = runs, lowering, compiling
     finally:
-        flushes = {name for name, _ in _kernel_times(profiler.Cupti(), evicting, flush)}
+        # A finalizing read detaches the subscription, so a profiler can subscribe after.
+        _kernel_times(profiler.Cupti(), evicting, flush)
     for config, (runs, lowering, compiling) in read.items():
         times = tuple(sum(milliseconds for name, milliseconds in run if name not in flushes) for run in runs)
         timings[config] = tokamax.BenchmarkData(compile_time_ms=compiling, lower_time_ms=lowering,
@@ -340,12 +346,12 @@ def tune(lowered: jax.stages.Lowered) -> bool:
     changed = False
     for op, ba in found:
         picks, key = op.get_autotuning_cache(kind), ba.autotuning_cache_key
-        fastest = settled.get((ba.op, key))
-        if _config(_pick(ba)) != _config(fastest):
-            changed = True
-            picks.pop(key, None)
-            if fastest is not None:
-                picks[key] = fastest
+        fastest, held = settled.get((ba.op, key)), _config(_pick(ba))
+        picks.pop(key, None)
+        if fastest is not None:
+            picks[key] = fastest
+        # The pick resolution reads, which tokamax's ignore-cache setting keeps None.
+        changed |= _config(_pick(ba)) != held
     if not any(coordination.from_every_process(changed)):
         return False
     cache.KERNEL_TUNES.set_global(cache.KERNEL_TUNES.get_global() + 1)
