@@ -908,6 +908,7 @@ def _wy_bwd_kernel(chunk_ref, k_ref, v_ref, beta_ref, g_ref, a_ref, dw_ref, du_r
     (chunk.py:244)."""
     earlier_ref, (dk_ref, dv_ref, db_ref, dg_ref) = (refs[0], refs[1:]) if group else (None, refs)
     start, taken = chunk_ref[0], chunk_ref[1]
+    first_of_group = pl.program_id(1) % (group or 1) == 0
 
     @pl.when(taken > 0)
     def _():
@@ -959,7 +960,7 @@ def _wy_bwd_kernel(chunk_ref, k_ref, v_ref, beta_ref, g_ref, a_ref, dw_ref, du_r
             full = through_w + (d_key * beta[:, None] + _dot(scaled.T.astype(d_l.dtype), d_l, exact=exact).T)
             if earlier_ref is not None:
                 earlier = read(earlier_ref, columns).astype(jnp.float32)
-                full += jnp.where(pl.program_id(1) % group == 0, earlier, 0.0)
+                full += jnp.where(first_of_group, earlier, 0.0)
             _write(_rows(dk_ref, start, chunk, columns), taken, full)
         _write(_rows(db_ref, start, chunk), taken, d_beta)
         weighted = d_l.astype(jnp.float32) * (products * beta[:, None])
