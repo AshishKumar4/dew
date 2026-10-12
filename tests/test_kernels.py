@@ -223,6 +223,11 @@ def test_flash_runs_where_the_installed_wheel_holds_code_for_the_gpu(generation,
     ("sm90", WHEEL, {"head_dim": 256}, "flash", None),
     ("sm90", BEFORE_HOPPER, {}, "cudnn", "the installed dew_flash_attn holds no code for sm90"),
     ("sm90", BEFORE_HOPPER, {"head_dim": 256}, "xla", "the installed dew_flash_attn holds no code for sm90"),
+    ("sm90", WHEEL, {"lengths": True}, "flash", None),
+    ("sm90", WHEEL, {"lengths": True, "causal": True}, "cudnn",
+     "the call has key lengths, which its kernel here does not take, or a causal mask beside them"),
+    ("sm80", WHEEL, {"lengths": True}, "cudnn",
+     "the call has key lengths, which its kernel here does not take, or a causal mask beside them"),
     ("sm120", WHEEL, {}, "cudnn", None),
 ])
 def test_auto_sends_a_plain_call_to_flash_where_it_was_measured(monkeypatch, caplog, generation, installed,
@@ -245,8 +250,12 @@ def test_auto_sends_a_plain_call_to_flash_where_it_was_measured(monkeypatch, cap
     found = util.find_spec
     monkeypatch.setattr(util, 'find_spec', lambda name: None if name == 'tokamax' else found(name))
     monkeypatch.setattr(attention, 'flash_architectures', lambda: installed)
+    monkeypatch.setattr(attention, 'flash_key_lengths', lambda: ("sm90",) if installed == WHEEL else ())
     query = jnp.zeros((1, 128, 4, call.pop("head_dim", 128)), call.pop("dtype", jnp.bfloat16))
     key = jnp.zeros((1, call.pop("keys", 128), *query.shape[2:]), query.dtype)
+    if call.pop("lengths", False):
+        call["key_lengths"] = jnp.full((1,), 100, jnp.int32)
+        call["mask"] = attention.with_key_lengths(None, call["key_lengths"], key.shape[1])
     assert [attention.resolve_implementation('auto', query, key, **call) for _ in range(2)] == [chosen] * 2
     logged = [record.getMessage() for record in caplog.records if record.name == kernels.generation.__name__]
     measured = f"attention runs {chosen!r}, not 'flash', the kernel measured fastest on {generation}"
@@ -270,10 +279,12 @@ def test_flash_refuses_a_device_its_wheel_has_no_code_for(monkeypatch, generatio
     ({"mask": jnp.ones((1, 1, 128, 128), bool)}, "takes no sinks"),
     ({"dtype": jnp.float32}, "bf16 or fp16"),
     ({"causal": True, "keys": 256}, "as many queries as keys"),
+    ({"key_value_seq_lengths": jnp.full((1,), 64, jnp.int32)}, "takes key lengths on"),
 ])
 def test_flash_refuses_what_it_cannot_take_by_name(call, refusal, without_deterministic_ops):
-    """An explicit 'flash' names the mask, fp32 input or causal mask over
-    more keys than queries it cannot take, before it imports anything."""
+    """An explicit 'flash' names the mask, fp32 input, causal mask over
+    more keys than queries or key lengths its kernel here does not end keys
+    at, before it imports anything."""
     query = jnp.zeros((1, 128, 4, 64), call.pop("dtype", jnp.bfloat16))
     key = jnp.zeros((1, call.pop("keys", 128), 4, 64), query.dtype)
     arguments = {"bias": None, "mask": None, "causal": False, "sliding_window": None, "softcap": None,
@@ -486,6 +497,52 @@ def test_cudnn_takes_key_lengths_and_agrees_with_xla(q_len, kv_len, causal, as_m
     for got, want in zip(fused, reference, strict=True):
         assert got.shape == want.shape
         assert np.abs(got - want).max() <= 2 ** -6 * np.abs(want).max()
+
+
+def float64_key_length_attention(query, key, value, lengths):
+    """Attention of `[B, S, H, D]` arrays as float64 math, each row's keys ended at its length."""
+    group = query.shape[2] // key.shape[2]
+    key, value = jnp.repeat(key, group, axis=2), jnp.repeat(value, group, axis=2)
+    logits = jnp.einsum('bqhd,bkhd->bhqk', query, key) / np.sqrt(query.shape[-1])
+    kept = (jnp.arange(key.shape[1]) < lengths[:, None])[:, None, None, :]
+    return jnp.einsum('bhqk,bkhd->bqhd', jax.nn.softmax(jnp.where(kept, logits, -jnp.inf), axis=-1), value)
+
+
+@on_gpu
+@pytest.mark.parametrize("q_len, kv_len, heads, kv_heads, head_dim", [
+    (512, 1024, 16, 16, 64),  # the decision head's queries over a row's padded tokens
+    (333, 333, 8, 2, 256),    # grouped 256-wide heads over the padded keys of their own row
+])
+def test_flash_takes_key_lengths_as_exact_as_xla_from_float64(q_len, kv_len, heads, kv_heads, head_dim,
+                                                              without_deterministic_ops):
+    """Where the installed kernel ends rows' keys at their lengths (FlashAttention-3 on Hopper), flash
+    takes a call's key lengths: its output and three input gradients lie within
+    tests/reference_error.py's rule of the xla kernel's, both measured from float64, and no key past a
+    row's length gets a gradient."""
+    from dew.nn.attention import flash_key_lengths
+    flash_here()
+    if kernels.device_generation() not in flash_key_lengths():
+        pytest.skip(f"the installed dew_flash_attn ends keys at lengths on {flash_key_lengths()}, "
+                    f"not {kernels.device_generation()}")
+    query, _, _ = qkv((2, q_len, heads, head_dim))
+    _, key, value = qkv((2, kv_len, kv_heads, head_dim), seed=1)
+    lengths = jnp.asarray([kv_len, kv_len // 3], jnp.int32)
+    fused = key_length_call('flash', query, key, value, lengths)
+    reference = key_length_call('xla', query, key, value, lengths)
+
+    def loss(q, k, v):
+        out = float64_key_length_attention(q, k, v, jnp.asarray(lengths))
+        return jnp.sum(out ** 2), out
+
+    with jax.enable_x64(new_val=True):
+        wide = [jnp.asarray(np.asarray(x, np.float64)) for x in (query, key, value)]
+        (_, out), grads = jax.value_and_grad(loss, argnums=(0, 1, 2), has_aux=True)(*wide)
+        truth = [np.asarray(x) for x in (out, *grads)]
+    for name, got, theirs, want in zip(("o", "dq", "dk", "dv"), fused, reference, truth, strict=True):
+        assert_as_exact_as_the_reference(got, theirs, want, name)
+    past = np.arange(kv_len)[None, :] >= np.asarray(lengths)[:, None]
+    for gradient in fused[2:]:
+        assert not gradient[past].any()
 
 
 @on_gpu
