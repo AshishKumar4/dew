@@ -51,10 +51,11 @@ def test_a_scan_copies_its_stacked_layers_not_its_constants():
     assert paths == {("stacked",): jnp.dtype(jnp.bfloat16)}
 
 
-def _trained(monkeypatch, generations, optimizer, steps=3, mesh=None):
+def _trained(monkeypatch, generations, optimizer, steps=3, mesh=None, padded=0):
     """A tied bf16 decoder over fp32 parameters, trained `steps` steps on
-    one batch, with copies on the generations named, on `mesh` with every
-    parameter split where it divides."""
+    one batch and then `padded` steps on a batch of padding alone, with
+    copies on the generations named, on `mesh` with every parameter split
+    where it divides."""
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.nn.kernels import TARGETS, gpu_target
     from dew.objectives.lm import TEXT_KEY, LMObjective
@@ -68,14 +69,14 @@ def _trained(monkeypatch, generations, optimizer, steps=3, mesh=None):
     model = CausalTransformer(vocab_size=64, emb_features=32, num_layers=2, num_heads=2, num_kv_heads=1,
                               mlp="swiglu", mlp_features=64, max_seq_len=16, qk_norm=True,
                               tie_embeddings=True, dtype=jnp.bfloat16)
-    trainer = Trainer(LMObjective(model, seq_len=8), optimizer, key=jax.random.key(0),
+    trainer = Trainer(LMObjective(model, seq_len=8, pad_id=0), optimizer, key=jax.random.key(0),
                       mesh=mesh or MeshSpec(), layout=Layout(min_shard=1, tolerance=1.0))
     state = trainer.initial_state()
-    batch = {TEXT_KEY: jnp.asarray(np.random.default_rng(0).integers(0, 64, (8, 9)), jnp.int32)}
+    batch = {TEXT_KEY: jnp.asarray(np.random.default_rng(0).integers(1, 64, (8, 9)), jnp.int32)}
     step = trainer.compile(state, batch)
     losses = []
-    for _ in range(steps):
-        state, loss, *_ = step(state, batch)
+    for current in [batch] * steps + [{TEXT_KEY: jnp.zeros_like(batch[TEXT_KEY])}] * padded:
+        state, loss, *_ = step(state, current)
         losses.append(np.asarray(loss))
     return state, losses
 
@@ -107,6 +108,25 @@ def test_the_tied_decoder_reads_its_kernels_through_copies_with_the_same_gradien
         np.testing.assert_array_equal(a, b)
     # The copies are the cast of the parameters the last update wrote.
     for a, b in zip(jax.tree.leaves(narrow.compute), jax.tree.leaves(narrowed(narrow.variables, paths)),
+                    strict=True):
+        np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
+
+
+def test_a_skipped_update_keeps_the_copies_of_the_parameters_it_kept(monkeypatch):
+    """A batch of padding alone has nothing to predict, so its step commits
+    no update: the parameters stay as the last update wrote them, and so do
+    their copies. Adam's moments would have moved every parameter had the
+    update been taken, so copies cast from the update the step discarded
+    would differ from the parameters it kept."""
+    trained, _ = _trained(monkeypatch, {device_generation()}, optax.adam(1e-2), steps=2)
+    skipped, _ = _trained(monkeypatch, {device_generation()}, optax.adam(1e-2), steps=2, padded=1)
+    assert int(skipped.updates) == int(trained.updates) == 2
+    for a, b in zip(jax.tree.leaves(trained.variables), jax.tree.leaves(skipped.variables), strict=True):
+        np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
+    paths = {tuple(key.key for key in path)[1:]: leaf.dtype
+             for path, leaf in jax.tree_util.tree_flatten_with_path(skipped.compute)[0]}
+    assert paths
+    for a, b in zip(jax.tree.leaves(skipped.compute), jax.tree.leaves(narrowed(skipped.variables, paths)),
                     strict=True):
         np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
 

@@ -950,12 +950,8 @@ def source_processor(directory: Path, config: Mapping[str, object], record: Mapp
     """
     processor_files = any((directory / name).exists()
                           for name in ("processor_config.json", "preprocessor_config.json"))
-    if _media_wrapper(config) and processor_files:
-        from transformers import AutoProcessor
-        options = {"backend": "pil"} if config.get("model_type") == "gemma3" else {}
-        reference = AutoProcessor.from_pretrained(str(directory), local_files_only=True, **options)
-        return Processor(reference, config, record, model.vocab_size, source=source)
-    if (directory / "tokenizer_config.json").exists() or gguf_path is not None:
+    media = _media_wrapper(config) and processor_files
+    if media or (directory / "tokenizer_config.json").exists() or gguf_path is not None:
         from dew.data.text import load_tokenizer
         # A GGUF repo ships none; the file carries its tokenizer.
         tokenizer = (gguf.tokenizer(gguf_path) if gguf_path is not None
@@ -963,7 +959,8 @@ def source_processor(directory: Path, config: Mapping[str, object], record: Mapp
                      else load_tokenizer(str(directory), local_files_only=True))
         if not hosts(tokenizer):
             raise TypeError(f"the tokenizer in {directory} lacks a host processor operation")
-        return Processor(tokenizer, config, record, model.vocab_size)
+        return Processor(tokenizer, config, record, model.vocab_size,
+                         source=source if media else None, directory=directory if media else None)
     return None
 
 

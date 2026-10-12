@@ -137,6 +137,11 @@ class ContentPart:
     def as_template(self) -> Mapping[str, object]:
         return {"type": self.type, **self.fields}
 
+    @property
+    def needs_processor(self) -> bool:
+        """Whether this part needs processing beyond a text tokenizer."""
+        return self.type != "text"
+
 
 @dataclasses.dataclass(frozen=True)
 class ToolCall:
@@ -340,7 +345,7 @@ class Conversation:
             texts: list[str] = []
             for part in message.content:
                 at = f"{where} message {index}"
-                if part.type != "text":
+                if part.needs_processor:
                     raise ValueError(
                         f"{at}: content part {part.type!r} requires a processor; "
                         "text tokenizers accept only text parts")
