@@ -32,7 +32,6 @@ import grain.python as pygrain
 import jax
 import numpy as np
 import tyro
-from absl import flags
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from dew import position
@@ -49,10 +48,6 @@ if TYPE_CHECKING:
     from dew.data.plan import Plan
 
 
-# grain's worker processes read absl flags; a script that never runs absl.app
-# would crash on any worker_count > 0 with UnparsedFlagAccessError.
-if not flags.FLAGS.is_parsed():
-    flags.FLAGS.mark_as_parsed()
 
 
 @dataclasses.dataclass(frozen=True)
