@@ -8,7 +8,7 @@ import optax
 from recording import RecordingTracker
 
 from dew import Field, InputSpec, Trainer
-from dew.data import Memory, presets
+from dew.data import Memory, mix, presets
 from dew.data.chat import Role
 from dew.diffusion.presets import Flow
 from dew.nn.backbones import CausalTransformer, SimpleDiT
@@ -93,5 +93,23 @@ def test_sft_renders_conversations_and_trains_on_the_assistant_turns():
     objective = LMObjective(model, seq_len=48, loss_role=Role.ASSISTANT)
     logged = trained(objective, train.shuffle(0).repeat().pipe(presets.sft(str(CHAT), seq_len=48, batch=8)),
                      held.pipe(presets.sft(str(CHAT), seq_len=48, batch=8)), metrics=(Perplexity(),))
+    finite(logged, "train/loss")
+    finite(logged, "val/perplexity")
+
+
+def test_lm_over_a_mixture_of_raw_stores_tokenizes_and_packs_after_mixing():
+    """Two raw text stores mixed, then the lm preset: the documents are mixed first, then tokenized
+    and packed together, and the run's own token steps read the packed rows."""
+    stories = Memory([{"text": "once upon a time " * (1 + index % 3),
+                       "origin": "stories"} for index in range(32)])
+    code = Memory([{"text": "def f(x): return x " * (1 + index % 2),
+                    "origin": "code"} for index in range(32)])
+    chain = mix([stories.shuffle(0).repeat(), code.shuffle(1).repeat()], weights=[0.5, 0.5])
+    model = CausalTransformer(vocab_size=256, emb_features=32, num_layers=1, num_heads=2, mlp_features=64,
+                              max_seq_len=64)
+    held = mix([stories, code]).pipe(presets.lm("byte", seq_len=32, batch=8))
+    logged = trained(LMObjective(model, seq_len=32), chain.pipe(presets.lm("byte", seq_len=32, batch=8)),
+                     held,
+                     metrics=(Perplexity(),))
     finite(logged, "train/loss")
     finite(logged, "val/perplexity")

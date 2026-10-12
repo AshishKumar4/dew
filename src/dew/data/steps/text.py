@@ -44,7 +44,8 @@ class Tokenize(grain.MapTransform):
             if tokenizer.eos_id is None:
                 raise ValueError(f"tokenizer {self.tokenizer} has no EOS id")
             ids.append(tokenizer.eos_id)
-        return {"text": np.asarray(ids, np.int32), "_dew_length": len(ids)}
+        kept = {key: value for key, value in element.items() if key != self.field}
+        return {**kept, "text": np.asarray(ids, np.int32), "_dew_length": len(ids)}
 
 
 @dataclasses.dataclass(frozen=True)

@@ -47,7 +47,8 @@ class RenderChat(grain.MapTransform):
         messages = element.get(self.column, element.get("prompt"))
         conversation = Conversation.parse(messages, element.get("tools"), self.tokenizer)
         ids, roles = render_conversation(self.vocabulary.tokenizer, conversation, self.tokenizer)
-        return {"text": ids, "text_roles": roles}
+        kept = {key: value for key, value in element.items() if key not in (self.column, "prompt", "tools")}
+        return {**kept, "text": ids, "text_roles": roles}
 
 
 @dataclasses.dataclass(frozen=True)
