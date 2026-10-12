@@ -78,7 +78,11 @@ class LengthPolicy(grain.MapTransform):
     long: Literal["truncate", "drop"] = "truncate"
     side: Literal["left", "right"] = "right"
     aligned: tuple[str, ...] = ()
-    rejects = True
+
+    @property
+    def rejects(self) -> bool:
+        """Whether a long record is dropped (`filter_map`) rather than cut (`map`)."""
+        return self.long == "drop"
 
     def map(self, element: Batch) -> Batch | Rejected:
         count = len(element[self.field])

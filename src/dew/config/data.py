@@ -626,8 +626,8 @@ class VideoData:
         audio = video.audio(self.audio_model)
         decoder = video.decode_clip(self.frames, size=self.frame_size, audio_padding=self.audio_padding,
                                     sample_rate=audio.processor.sampling_rate)
-        train = train.filter_map(decoder).map(audio)
-        held = None if held is None else held.filter_map(decoder).map(audio)
+        train = train.random_filter_map(decoder).map(audio)
+        held = None if held is None else held.random_filter_map(decoder).map(audio)
         return train, held, (EncodeCaptions(),)
 
 
