@@ -1,8 +1,8 @@
 """A decision model on a frozen decoder under LoRA with Clef's joint head, as Clef is built.
 
     python recipes/decision/sources.py --out data/mixture --decontaminate eval-index.npz
-    python recipes/decision/clef.py --mixture.root data/mixture --trainer.checkpoint-dir runs
-    python recipes/decision/clef.py --mixture.root data/mixture --pretrained Qwen/Qwen3.5-9B \\
+    python recipes/decision/clef.py --data.source data/mixture --trainer.checkpoint-dir runs
+    python recipes/decision/clef.py --data.source data/mixture --pretrained Qwen/Qwen3.5-9B \\
         --revision c202236235762e1c871ad0ccb60c8ee5ba337b9a --lora.rank 256
 
 Qwen3.5-4B (Apache-2.0) stays frozen under rank-64 LoRA factors on every
@@ -18,7 +18,8 @@ third command is the size-matched comparison with Clef-flash, for an H100.
 It reads the same sets as the encoder recipe, with the same proper scoring
 rules. An example whose questions alone pass 4,096 tokens is dropped and
 counted (`DecisionRunConfig`'s summary, `unfit`). AdamW at 1e-4 warms up
-over 400 steps and decays on a cosine to step 12,000, with 4 rows a step;
+over 400 steps and decays on a cosine to step 12,000, with 16,384-token
+micro-batch and update budgets;
 where a step does not fit the device, the trainer recomputes more of each
 block and compiles it again.
 """
