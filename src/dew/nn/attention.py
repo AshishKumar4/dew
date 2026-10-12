@@ -362,13 +362,15 @@ def _moment_normalized(x, scale, bias, axes: tuple[int, ...], epsilon: float, st
     variance their difference clipped at zero, the weight folded into the
     inverse deviation before it meets the centered activations. `scale` and
     `bias` (None for none) broadcast against `x`'s trailing axes."""
-    y = x.astype(statistics)
-    mean = jnp.mean(y, axis=axes, keepdims=True)
-    variance = jnp.maximum(0.0, jnp.mean(jax.lax.square(y), axis=axes, keepdims=True) - jax.lax.square(mean))
+    reduced = x.astype(statistics)
+    mean = jnp.mean(reduced, axis=axes, keepdims=True)
+    variance = jnp.maximum(0.0, jnp.mean(jax.lax.square(reduced), axis=axes, keepdims=True)
+                           - jax.lax.square(mean))
     scaling = jax.lax.rsqrt(variance + epsilon)
     if scale is not None:
         scaling = scaling * scale
-    y = (y - mean) * scaling
+    # flax centers the input as it arrived, promoted with the statistics' dtype.
+    y = (x.astype(jnp.promote_types(x.dtype, statistics)) - mean) * scaling
     return y if bias is None else y + bias
 
 

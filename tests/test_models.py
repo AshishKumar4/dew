@@ -87,20 +87,19 @@ def _vae_decoder():
     return model, (jnp.ones((2, 8, 8, 4), jnp.bfloat16),), {}
 
 
-@pytest.mark.parametrize("part", ["encoder", "decoder"])
-def test_a_bf16_vae_rounds_where_diffusers_flax_vae_does(part):
-    """In bf16, Dew's VAE is within the float64 gate of Diffusers' own Flax
-    VAE on the same weights: every norm keeps its fp32 result into swish and
-    the next layer casts (vae_flax.py:154-209, 546, 662)."""
+@pytest.mark.parametrize("channels", [(32, 32), (32, 64)], ids=["same", "widening"])
+def test_a_bf16_vae_block_rounds_where_diffusers_flax_vae_does(channels):
+    """In bf16, the VAE's residual block, its two norms ahead of swish, is
+    within the float64 gate of Diffusers' own Flax block on the same
+    weights: each norm keeps its fp32 result into swish and the next
+    convolution casts (vae_flax.py:154-209)."""
     from diffusers.models import vae_flax
 
-    fields = {"block_out_channels": (32, 64), "layers_per_block": 1, "norm_num_groups": 8}
-    if part == "encoder":
-        ours, theirs = FlaxEncoder(out_channels=4, **fields), vae_flax.FlaxEncoder(out_channels=4, **fields)
-        x = np.random.default_rng(5).standard_normal((2, 16, 16, 3)).astype(np.float32)
-    else:
-        ours, theirs = FlaxDecoder(out_channels=3, **fields), vae_flax.FlaxDecoder(out_channels=3, **fields)
-        x = np.random.default_rng(5).standard_normal((2, 8, 8, 4)).astype(np.float32)
+    from dew.nn.autoencoders.vae import FlaxResnetBlock2D
+
+    ours = FlaxResnetBlock2D(*channels, groups=8)
+    theirs = vae_flax.FlaxResnetBlock2D(*channels, groups=8)
+    x = np.random.default_rng(5).standard_normal((2, 8, 8, channels[0])).astype(np.float32) * 3
     params = theirs.init(jax.random.key(0), jnp.asarray(x))
     assert jax.tree_util.tree_structure(ours.init(jax.random.key(0), jnp.asarray(x))) == \
         jax.tree_util.tree_structure(params)
@@ -112,7 +111,7 @@ def test_a_bf16_vae_rounds_where_diffusers_flax_vae_does(part):
     with jax.enable_x64():
         wide = jax.tree.map(lambda leaf: jnp.asarray(np.asarray(leaf), jnp.float64), params)
         truth = np.asarray(ours.clone(dtype=jnp.float64).apply(wide, jnp.asarray(x, jnp.float64)))
-    assert_as_exact_as_the_reference(actual, reference, truth, f"bf16 VAE {part}")
+    assert_as_exact_as_the_reference(actual, reference, truth, "bf16 VAE residual block")
 
 
 @pytest.mark.parametrize("batch", [1, 4])
