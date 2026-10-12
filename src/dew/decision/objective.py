@@ -125,6 +125,8 @@ class Encoding:
             )
         encoded = rows[0]
         length = self.layout.max_len
+        if not self.layout.fits(encoded):
+            raise ValueError(f"the row needs {len(encoded.tokens)} tokens, more than max_len={length}")
         row: Batch = {
             "tokens": _padded(encoded.tokens, length, self.specials.pad),
             "valid": _padded((True,) * len(encoded.tokens), length, fill=False),
@@ -241,12 +243,9 @@ class Fit(pygrain.MapTransform):
         if not labels:
             return Rejected("unlabelled")
         asked = example.questions if self.layout.joint else {name: example.questions[name] for name in labels}
-        try:
-            laid = self.layout.rows(self.tokenizer, self.specials, example.state, asked)
-        except ValueError as error:
-            if self.layout.joint and "schema needs" in str(error):
-                return Rejected("unfit")
-            raise
+        laid = self.layout.rows(self.tokenizer, self.specials, example.state, asked)
+        if not all(map(self.layout.fits, laid)):
+            return Rejected("unfit")
         fitted = tuple(
             FittedRow(
                 example,
