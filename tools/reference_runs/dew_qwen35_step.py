@@ -113,6 +113,11 @@ def build(args):
         jax.config.update("jax_default_matmul_precision", "highest")
     model, variables = (backbone(args.smoke_fixture, None, "float32") if args.smoke
                         else backbone(MODEL, REVISION, "bfloat16"))
+    return compile_step(args, model, variables)
+
+
+def compile_step(args, model, variables):
+    """The real, unrematted trainer step on `model`'s rows, compiled, and its work record written."""
     batch, sequence = (2, 16) if args.smoke else (8, 3072)
     rows, projection = inputs(args.seed, model.vocab_size, model.emb_features, batch, sequence)
     objective = BackboneLoss(model, variables, projection, sequence)
@@ -138,13 +143,13 @@ def train(args, trainer, state, compiled, batch):
     losses, finite = [], []
     first_before = np.asarray(jax.tree.leaves(state.variables)[0]).copy() if args.smoke else None
     for _ in range(args.warmup):
-        state, loss, _, valid, _ = compiled(state, batch)
+        state, loss, _, valid, _, _ = compiled(state, batch)
         losses.append(loss)
         finite.append(valid)
     jax.block_until_ready(state)
     started = time.perf_counter()
     for _ in range(args.steps):
-        state, loss, _, valid, _ = compiled(state, batch)
+        state, loss, _, valid, _, _ = compiled(state, batch)
         losses.append(loss)
         finite.append(valid)
     jax.block_until_ready(state)
@@ -155,7 +160,7 @@ def train(args, trainer, state, compiled, batch):
     samples = []
     for _ in range(args.steps):
         started = time.perf_counter()
-        state, loss, _, valid, _ = compiled(state, batch)
+        state, loss, _, valid, _, _ = compiled(state, batch)
         jax.block_until_ready(state)
         samples.append(time.perf_counter() - started)
         losses.append(loss)
