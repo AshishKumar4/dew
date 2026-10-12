@@ -467,15 +467,14 @@ class Text:
         def windows(source, stride):
             if self.pack is None:
                 return Pipeline(WindowSource(source, source.tokens, self.seq_len, stride))
-            if source.tokens.eos_id is None:
-                raise ValueError(
-                    f"packed text needs producer document boundaries or EOS: {source.describe()}"
-                )
-            return (
-                Pipeline(source)
-                .flat_map(Documents(source.tokens.eos_id))
-                .pack(self.seq_len + 1, bins=self.packing_bins, policy=self.pack)
-            )
+            documents = Pipeline(source)
+            if source.document_ends() is None:
+                if source.tokens.eos_id is None:
+                    raise ValueError(
+                        f"packed text needs producer document boundaries or EOS: {source.describe()}"
+                    )
+                documents = documents.flat_map(Documents(source.tokens.eos_id))
+            return documents.pack(self.seq_len + 1, bins=self.packing_bins, policy=self.pack)
 
         return (
             windows(sources[0], self.seq_len if self.stride is None else self.stride),

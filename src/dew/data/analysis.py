@@ -71,28 +71,35 @@ class _Wrapping(Protocol):
 
 
 def _promoted(pipeline: Pipeline) -> Pipeline:
-    """The pipeline reading each published generation it caches as a source,
-    in place of the steps the generation already ran, and its published
-    packing in place of the pack stage that follows it."""
+    """The pipeline as the run reads it. Each published generation it caches
+    is read as a source, in place of the steps the generation already ran,
+    with its published packing in place of the pack stage that follows it.
+    A first-fit pack directly on a source that states its documents'
+    lengths reads that source's planned windows (`PlannedSource`), by the
+    plan a published generation stores, so the windows are indexed and the
+    order is global in every read."""
     from dew.data.cache import Generation
+    from dew.data.packing import PackedSource, PlannedSource, plan_name
 
-    source = pipeline.source
+    source, stages = pipeline.source, pipeline.stages
     if isinstance(source, (Mixture, Phases)):
         source = dataclasses.replace(source, pipelines=tuple(_promoted(child) for child in source.pipelines))
-    for index, stage in enumerate(pipeline.stages):
+    for index, stage in enumerate(stages):
         if isinstance(stage, Artifact) and isinstance(stage.cache, Generation):
-            from dew.data.packing import PackedSource, plan_name
-
-            suffix = pipeline.stages[index + 1 :]
-            promoted: Source = stage.cache.source()
-            if suffix and isinstance(suffix[0], Pack):
-                pack = suffix[0]
-                plans = record(stage.cache.manifest.get("plan", {}), "published plans")
-                if plan_name(pack, "accepted") in plans:
-                    promoted = PackedSource(promoted, stage.cache, pack)
-                    suffix = suffix[1:]
-            return dataclasses.replace(pipeline, source=promoted, stages=suffix)
-    return dataclasses.replace(pipeline, source=source)
+            source, stages = stage.cache.source(), stages[index + 1 :]
+            plans = record(stage.cache.manifest.get("plan", {}), "published plans")
+            if stages and isinstance(stages[0], Pack) and plan_name(stages[0], "accepted") in plans:
+                source, stages = PackedSource(source, stage.cache, stages[0]), stages[1:]
+            break
+    pack = stages[0] if stages else None
+    if (
+        isinstance(pack, Pack)
+        and pack.policy == "first-fit"
+        and not isinstance(source, (Mixture, Phases))
+        and source.lengths() is not None
+    ):
+        source, stages = PlannedSource(source, pack), stages[1:]
+    return dataclasses.replace(pipeline, source=source, stages=stages)
 
 
 def _preferred_read(pipelines: Sequence[Pipeline], *, provision: bool) -> Read:
