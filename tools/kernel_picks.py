@@ -39,7 +39,8 @@ def model_of(arguments) -> CausalTransformer:
     """The decoder a checkpoint's config.json translates to, in `--dtype`: a
     local directory's, or a Hub repo's, of which nothing else is read."""
     local = Path(arguments.config) / "config.json"
-    path = local if local.is_file() else hf_hub_download(arguments.config, "config.json")
+    path = local if local.is_file() else hf_hub_download(arguments.config, "config.json",
+                                                         revision=arguments.revision)
     config = json.loads(Path(path).read_text())
     fields = dict(translate_config(config.get("text_config", config)))
     return CausalTransformer(**{**fields, "dtype": jnp.dtype(arguments.dtype)})
@@ -49,6 +50,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--config", required=True,
                         help="a decoder checkpoint's directory or Hub repo; only its config.json is read")
+    parser.add_argument("--revision", help="the Hub repo's commit")
     parser.add_argument("--batch", type=int, required=True, help="sequences a device holds")
     parser.add_argument("--seq", type=int, required=True)
     parser.add_argument("--dtype", default="bfloat16")
