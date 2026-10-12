@@ -86,7 +86,8 @@ class BenchmarkConfig:
 
 
 def attention_fn(implementation: str, config: BenchmarkConfig, causal: bool, sinks=None, dtype=None):
-    from dew.nn.attention import local_attention, scaled_dot_product_attention
+    from dew.nn.attention import scaled_dot_product_attention
+    from dew.nn.local_attention import local_attention
     window, softcap = config.sliding_window, config.softcap
     if sinks is not None and implementation in ('jax_cudnn', 'triton'):
         raise ValueError(f"{implementation} takes no attention sinks")

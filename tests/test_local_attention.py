@@ -14,9 +14,10 @@ import pytest
 from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_mask as splash
 
 from dew.nn import attention
-from dew.nn.attention import local_attention, scaled_dot_product_attention
+from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.kernels import bf16_dot_runs
+from dew.nn.local_attention import local_attention
 
 
 def dense_reference(query, key, value, keep):
