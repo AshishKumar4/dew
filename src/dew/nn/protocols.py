@@ -253,11 +253,13 @@ class CountedImages(Protocol):
 class CountedSequences(Protocol):
     """A joint/cross-attention backbone with separate image and text geometry.
 
-    Image channels and text feature width are the module's own configuration;
-    the objective supplies independent real lengths and the known sample shape.
+    The objective supplies independent lengths and the actual image, context
+    and pooled widths, because Dense input axes are inferred from the arrays.
     """
 
-    def multisequence_flops(self, lengths: np.ndarray, context_lengths: np.ndarray) -> float: ...
+    def multisequence_flops(self, lengths: np.ndarray, context_lengths: np.ndarray, *,
+                            input_channels: int, text_features: int,
+                            pooled_features: int | None = None) -> float: ...
 
     def image_lengths(self, sample_shape: tuple[int, ...], rows: int) -> np.ndarray: ...
 

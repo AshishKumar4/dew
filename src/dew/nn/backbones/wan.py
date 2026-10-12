@@ -240,13 +240,14 @@ class WanTransformer(nn.Module):
         return patch_lengths(sample_shape, tuple(self.patch_size), rows)
 
     @nn.nowrap
-    def multisequence_flops(self, lengths, context_lengths) -> float:
+    def multisequence_flops(self, lengths, context_lengths, *, input_channels: int,
+                            text_features: int, pooled_features: int | None = None) -> float:
         """Every video/text/time projection and the shared sixfold time modulation."""
         image, _ = matching_lengths(lengths, context_lengths)
         rows = np.ones(image.shape, np.int64)
         patch = int(np.prod(self.patch_size))
-        count = (projection_flops(lengths, patch * self.in_channels, self.features)
-                 + embedding_flops(context_lengths, self.text_dim, self.features)
+        count = (projection_flops(lengths, patch * input_channels, self.features)
+                 + embedding_flops(context_lengths, text_features, self.features)
                  + embedding_flops(rows, self.freq_dim, self.features)
                  + self._modulation().model_flops(rows))
         block = WanBlock(self.features, self.num_attention_heads, self.ffn_dim, parent=None)

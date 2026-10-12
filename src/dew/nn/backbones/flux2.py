@@ -182,12 +182,13 @@ class Flux2Transformer(nn.Module):
         return patch_lengths(sample_shape, (1, 1), rows)
 
     @nn.nowrap
-    def multisequence_flops(self, lengths, context_lengths) -> float:
-        """Static input widths and one shared modulation, not one per block."""
+    def multisequence_flops(self, lengths, context_lengths, *, input_channels: int,
+                            text_features: int, pooled_features: int | None = None) -> float:
+        """Actual input widths and one shared modulation, not one per block."""
         image, context = matching_lengths(lengths, context_lengths)
         rows = np.ones(image.shape, np.int64)
-        count = (projection_flops(lengths, self.in_channels, self.features)
-                 + projection_flops(context_lengths, self.joint_attention_dim, self.features))
+        count = (projection_flops(lengths, input_channels, self.features)
+                 + projection_flops(context_lengths, text_features, self.features))
         time = embedding_flops(rows, self.timestep_guidance_channels, self.features)
         count += (1 + self.guidance_embeds) * time
         count += sum(Modulation(self.features, pieces, parent=None).model_flops(rows)

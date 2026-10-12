@@ -119,14 +119,17 @@ class SD3Transformer(nn.Module):
         return patch_lengths(sample_shape, (self.patch_size, self.patch_size), rows)
 
     @nn.nowrap
-    def multisequence_flops(self, lengths, context_lengths) -> float:
+    def multisequence_flops(self, lengths, context_lengths, *, input_channels: int,
+                            text_features: int, pooled_features: int | None = None) -> float:
         """Patch/text/pooled/time maps and SD3.5's selected dual-attention layers."""
+        if pooled_features is None:
+            raise MissingFlopsCount("SD3Transformer needs the actual pooled conditioning width")
         image, _ = matching_lengths(lengths, context_lengths)
         rows = np.ones(image.shape, np.int64)
-        count = (projection_flops(lengths, self.patch_size**2 * self.in_channels, self.features)
-                 + projection_flops(context_lengths, self.joint_attention_dim, self.caption_projection_dim)
+        count = (projection_flops(lengths, self.patch_size**2 * input_channels, self.features)
+                 + projection_flops(context_lengths, text_features, self.caption_projection_dim)
                  + embedding_flops(rows, TIME_FEATURES, self.features)
-                 + embedding_flops(rows, self.pooled_projection_dim, self.features))
+                 + embedding_flops(rows, pooled_features, self.features))
         for index in range(self.num_layers):
             block = DoubleStreamBlock(self.features, self.heads, self.head_dim,
                                        context_pre_only=index == self.num_layers - 1,

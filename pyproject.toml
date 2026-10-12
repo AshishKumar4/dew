@@ -175,8 +175,9 @@ streaming = ["datasets"]
 eval-harness = ["lm_eval>=0.4.10"]
 # Prepared TFDS ArrayRecords; dataset preparation has its own environment.
 tfds = ["tensorflow-datasets>=4.9.10"]
-# Flax <-> safetensors conversion (dew.interop)
-interop = ["safetensors"]
+# Pretrained loading and Flax <-> safetensors conversion (dew.interop).
+# Multimodal HF processors, including Qwen3.5's, use torchvision on the host.
+interop = ["safetensors", "torchvision>=0.29"]
 # PyTorch on the host, never for a JAX computation: unpickling pytorch_model.bin
 # once into Dew's cache (dew.interop.pickles), and the tier-2 check that runs
 # transformers' own model for an unregistered decoder (dew.interop.verify).

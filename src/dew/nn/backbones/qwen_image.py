@@ -216,9 +216,9 @@ class QwenImageTransformer(nn.Module):
         return "conditioning"
 
     @nn.nowrap
-    def projections(self) -> dict[str, tuple[int, int]]:
+    def projections(self, input_channels: int) -> dict[str, tuple[int, int]]:
         width = self.features
-        return {'img_in': (self.in_channels, width), 'modulation': (width, 4 * width),
+        return {'img_in': (input_channels, width), 'modulation': (width, 4 * width),
                 'norm_out_linear': (width, width), 'proj_out': (width, self.out_channels)}
 
     @nn.nowrap
@@ -231,13 +231,14 @@ class QwenImageTransformer(nn.Module):
         return patch_lengths(sample_shape, (1, 1), rows)
 
     @nn.nowrap
-    def multisequence_flops(self, lengths, context_lengths) -> float:
+    def multisequence_flops(self, lengths, context_lengths, *, input_channels: int,
+                            text_features: int, pooled_features: int | None = None) -> float:
         """Text's two input maps and the shared time-zero row are included."""
         image, _ = matching_lengths(lengths, context_lengths)
         rows, timed = np.ones(image.shape, np.int64), np.ones((len(image) + 1,), np.int64)
-        maps = self.projections()
+        maps = self.projections(input_channels)
         count = (projection_flops(lengths, *maps['img_in'])
-                 + _TextIn(self.features, parent=None).model_flops(context_lengths, self.context_in_dim)
+                 + _TextIn(self.features, parent=None).model_flops(context_lengths, text_features)
                  + embedding_flops(timed, TIME_FEATURES, self.features)
                  + projection_flops(timed, *maps['modulation'])
                  + projection_flops(rows, *maps['norm_out_linear'])
@@ -268,7 +269,7 @@ class QwenImageTransformer(nn.Module):
         valid = (jnp.ones((batch, text), bool) if conditioning.mask is None
                  else jnp.broadcast_to(jnp.asarray(conditioning.mask, bool), (batch, text)))
         lengths = jnp.sum(valid, axis=1, dtype=jnp.int32)
-        maps = self.projections()
+        maps = self.projections(x.shape[-1])
         image = _dense(maps['img_in'][1], "img_in", self.dtype, self.precision)(
             x.reshape(batch, image_tokens, x.shape[-1]))
         context = _TextIn(self.features, self.eps, dtype=self.dtype, precision=self.precision,
