@@ -2460,7 +2460,7 @@ def test_the_step_runs_the_program_it_compiled(monkeypatch, tmp_path):
         assert events, "the public compile must reach the compilation event listener"
         # Input placement is separate from executing the compiled transaction.
         assert trainer.executable is not None
-        state, batch = jax.device_put((state, batch), trainer.executable.input_shardings[0])
+        state, batch = jax.device_put((state, batch), trainer.executable.input_shardings[0][:2])
         jax.block_until_ready((state, batch))
         events.clear()
         jax.block_until_ready(step(state, batch))
