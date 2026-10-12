@@ -371,9 +371,10 @@ class _FitPlan:
     """What one `Trainer.fit` call was asked for."""
 
     dataset: Dataset
-    steps: int
+    steps: int | None
     log_every: int
     eval_every: int | None
+    total_tokens: int | None
     checkpoint_every: int | datetime.timedelta | None
     checkpoint_final: bool
     local_every: int | None
@@ -387,6 +388,11 @@ class _FitPlan:
     @property
     def validation(self) -> bool:
         return bool(self.suites)
+
+    def finished(self, step: int, control: Mapping) -> bool:
+        """Whether either run-length cap has been reached."""
+        return ((self.steps is not None and step >= self.steps)
+                or (self.total_tokens is not None and control.get("tokens", 0) >= self.total_tokens))
 
     @property
     def scored(self) -> tuple[Metric, ...]:
@@ -415,6 +421,7 @@ class _FitRun:
     evaluation: Evaluation | None = None
     last_checkpoint: float = 0.0
     stop_control: dict = dataclasses.field(default_factory=dict)
+    tokens_at_log: int = 0
     stopped: bool = False
     training: dict[str, jax.Array] = dataclasses.field(default_factory=dict)
     source: Iterator[Batch] | None = None
@@ -1267,7 +1274,8 @@ class Trainer(Generic[Loss, Effects]):
         self,
         dataset: Dataset,
         *,
-        steps: int,
+        steps: int | None = None,
+        total_tokens: int | None = None,
         log_every: int = 100,
         eval_every: int | None = None,
         checkpoint_every: int | datetime.timedelta | None = None,
@@ -1288,6 +1296,11 @@ class Trainer(Generic[Loss, Effects]):
 
         Every `log_every` steps, the tracker receives the loss, the objective's
         metrics and the throughput.
+
+        `total_tokens` stops at the first microbatch that reaches this real-token
+        budget, from the same counter as `train/tokens`, persisted in checkpoints.
+        Padding never counts. With both caps the first reached ends the run;
+        with `steps=None`, a decaying schedule needs its own step horizon.
 
         Every `eval_every` steps, and at the end, the validation split is scored. The
         objective's artifacts go to the tracker and to `metrics`, whose reductions are
@@ -1311,12 +1324,17 @@ class Trainer(Generic[Loss, Effects]):
         Previews are generated only when `preview=True` and a tracker receives them;
         scalar reporting never triggers preview work.
         """
+        if steps is None and total_tokens is None:
+            raise ValueError("fit needs steps or total_tokens to name the run length")
+        if total_tokens is not None and not self.objective.counts_tokens:
+            raise ValueError("total_tokens needs an objective that counts real tokens")
+        updates = None if steps is None else steps // self.accumulation
         if self._config is not None:
-            built = self._config.build(steps // self.accumulation)
+            built = self._config.build(updates)
             self._optimizer = self.objective.optimizer(built, accumulation=self.accumulation)
             self._scheduled_rate = None
             if self._config.schedule is not None and not self._config.param_groups:
-                schedule = self._config.schedule.schedule(steps // self.accumulation)
+                schedule = self._config.schedule.schedule(updates)
                 self._scheduled_rate = jax.jit(lambda updates: schedule(jnp.maximum(updates - 1, 0)))
         suites = _suites(dataset, validation, metrics, eval_every)
         selection, stop = self._fit_policies(best, stop, metrics, suites, checkpoint_every, restore_best)
@@ -1339,6 +1357,7 @@ class Trainer(Generic[Loss, Effects]):
                 steps,
                 log_every,
                 eval_every,
+                total_tokens,
                 checkpoint_every,
                 checkpoint_final,
                 None if checkpoints is None else checkpoints.local_every,
@@ -1390,6 +1409,7 @@ class Trainer(Generic[Loss, Effects]):
         run.last_checkpoint = time.perf_counter()
         if checkpoints is not None and checkpoints.latest is not None:
             run.stop_control = checkpoints.control(checkpoints.latest)
+        run.tokens_at_log = int(run.stop_control.get("tokens", 0))
         if self._opened(plan, run, state, position):
             return state, True
         compiled: dict[Shapes, tuple[CompiledStep, StepFlops | None]] = {}
@@ -1397,7 +1417,7 @@ class Trainer(Generic[Loss, Effects]):
             run.current if checkpoints is not None and checkpoints.latest is not None else None))
         seen = 0
         run.notice = PreemptionNotice()
-        while run.current < plan.steps:
+        while not plan.finished(run.current, run.stop_control):
             # The window's capture opens before this iteration's first
             # read, so the step row records the read it waits on rather
             # than a compile that ran before capture began.
@@ -1453,6 +1473,9 @@ class Trainer(Generic[Loss, Effects]):
                 self._display.step(run.current)
                 seen += 1
                 interval.count(batch, measured_flops, loss, finite, committed, aux)
+                if plan.total_tokens is not None:
+                    assert interval.book is not None
+                    run.stop_control["tokens"] = run.tokens_at_log + int(jax.device_get(interval.book.tokens))
                 if run.first_step is None:
                     loss.block_until_ready()
                     run.first_step = time.perf_counter() - run.started
@@ -1527,7 +1550,7 @@ class Trainer(Generic[Loss, Effects]):
             sum(leaf.size for leaf in jax.tree.leaves(state.variables["params"])), mesh.devices.size,
             jax.devices()[0].device_kind, jax.process_count(), dict(mesh.shape),
             split_share(state.variables),
-            seed=self.seed)
+            seed=self.seed, total_tokens=plan.total_tokens)
         # On a device with a known peak, the run counts its batches' work
         # for train/mfu while they can be counted (`_counted_batch`).
         self._count_work = gpu_target(started.device_kind).bf16_peak is not None
@@ -1537,16 +1560,16 @@ class Trainer(Generic[Loss, Effects]):
         # Dataset's readers, and a held-out count is not one of them.
         if isinstance(plan.dataset, Dataset) and plan.dataset.held_out:
             self._display.note(f"validation: {plan.dataset.held_out} records held out of train")
-        if current > steps:
+        if steps is not None and current > steps:
             raise ValueError(f"the run is at step {current}, past the {steps} asked for")
 
         if plan.checkpoint_every and checkpoints is None:
             raise ValueError(
                 "checkpoint_every asks for checkpoints and this trainer has no "
                 "checkpointer; pass Checkpoints(directory) to write any")
-        if current == steps and checkpoints is not None and checkpoints.latest is not None:
+        if plan.finished(current, run.stop_control) and checkpoints is not None and checkpoints.latest is not None:
             return True
-        if current < steps:
+        if not plan.finished(current, run.stop_control):
             run.source = plan.dataset.train(DataPartition.of(mesh))
             self._check_stream(run.source, mesh, plan.dataset.batch,
                                checkpointing=bool(plan.checkpoint_every or plan.local_every or (
@@ -1600,13 +1623,15 @@ class Trainer(Generic[Loss, Effects]):
         """The cadenced work after one step of `fit`: the log, the validation,
         the checkpoints, and the preemption notice. Returns whether the
         notice stops the run at this step, whose checkpoint is then written."""
-        current, steps, checkpoints = run.current, plan.steps, self.checkpoints
+        current, checkpoints = run.current, self.checkpoints
+        ending = plan.finished(current, run.stop_control)
         aux = {name: value for name, value in aux.items()
                if name not in (FORWARD_FLOPS, TRAINING_FLOPS, TOKENS)}
         run.training = {'train/loss': loss, **{f'train/{name}': value for name, value in aux.items()}}
         if current % plan.log_every == 0:
             interval.check_finite(current, self._display)
             self._log_interval(current, loss, aux, accepted, state, interval)
+            run.tokens_at_log = int(run.stop_control.get("tokens", 0))
 
         if isinstance(plan.checkpoint_every, datetime.timedelta):
             # The clock is read at the log interval, where the step is already
@@ -1622,7 +1647,7 @@ class Trainer(Generic[Loss, Effects]):
         due = plan.due(current)
         evaluation_due = bool(due) or bool(plan.eval_every and current % plan.eval_every == 0)
         ranked = bool((plan.validation or plan.best or plan.stop) and checkpoint_due)
-        if current < steps and (evaluation_due or ranked):
+        if not ending and (evaluation_due or ranked):
             with region("evaluate"):
                 # A checkpoint that ranks the steps reads every suite's score.
                 names = None if ranked else due
@@ -1644,7 +1669,7 @@ class Trainer(Generic[Loss, Effects]):
         # On its own clock, not the logging one, so that a cadence
         # which does not divide log_every still fires.
         if (plan.checkpoint_every and checkpoints is not None
-                and checkpoint_due and current < steps) or (candidate and current < steps):
+                and checkpoint_due and not ending) or (candidate and not ending):
             assert checkpoints is not None
             run.other += self._saved_checkpoint(
                 checkpoints,
@@ -1663,7 +1688,7 @@ class Trainer(Generic[Loss, Effects]):
             )
             run.last_checkpoint = time.perf_counter()
         if (plan.local_every and checkpoints is not None
-                and current % plan.local_every == 0 and current < steps):
+                and current % plan.local_every == 0 and not ending):
             run.other += self._saved_local_checkpoint(
                 checkpoints, current, state, position, control=run.stop_control)
         # Asked at every step on every process, as JAX's agreement
@@ -1671,7 +1696,7 @@ class Trainer(Generic[Loss, Effects]):
         if run.stopped:
             return True
         assert run.notice is not None
-        if current < steps and run.notice.reached(current):
+        if not ending and run.notice.reached(current):
             if checkpoints is not None and interval.last_saved != current:
                 run.other += self._saved_checkpoint(
                     checkpoints,
