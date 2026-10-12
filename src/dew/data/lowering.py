@@ -755,12 +755,10 @@ def _workers(pipeline: Pipeline, loading: Loading) -> int:
 
 
 def _root_repeat(pipeline: Pipeline) -> bool:
-    for stage in pipeline.stages:
-        if isinstance(stage, RandomMap):
-            return False
-        if isinstance(stage, Repeat):
-            return True
-    return True
+    """Whether a streamed read repeats at its root: its repeat comes before any
+    random step, or it writes none and a training read never runs out."""
+    at = _at(pipeline.stages, Repeat)
+    return at is None or not any(isinstance(stage, RandomMap) for stage in pipeline.stages[:at])
 
 
 def _epochs(pipeline: Pipeline) -> int | None:
