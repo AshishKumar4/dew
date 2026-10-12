@@ -66,6 +66,20 @@ def test_indexed_jsonl_refuses_to_build_an_index_without_provisioning(jsonl):
         stream.close()
 
 
+def test_a_held_out_slice_provisions_the_source_it_reads(jsonl):
+    """A held-out slice and the rows after it read their source by index, so provision=True
+    builds that source's index rather than refusing the slices, which have none of their own."""
+    data = load(Records(source=jsonl, validation=HoldOut(records=4)), batch=4, read="indexed",
+                provision=True, loading=READ)
+    stream, held = data.train(DataPartition()), data.val(DataPartition())
+    try:
+        assert sorted(value for batch in indices(stream, 5) for value in batch) == list(range(4, 24))
+        assert [value for batch in held for value in batch["index"]] == [0, 1, 2, 3]
+    finally:
+        stream.close()
+        held.close()
+
+
 def test_memory_and_provisioned_indexed_sources_produce_identical_epochs(jsonl):
     jsonl.provision()
     memory = load(Records(source=jsonl), batch=4, seed=7, read="memory", loading=READ)
