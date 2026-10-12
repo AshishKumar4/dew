@@ -904,10 +904,11 @@ the numerics of the fp32 head, and the precision rule refuses it anyway.)
 Correction, 2026-09-22, checked against current main. The jitted `bookkeep`
 from the first class-1 row is on main (`src/dew/training/trainer.py`, called
 from `Trainer.fit`). The class-5 row about `objective.py:141` no longer
-matches the code. The diffusion objective encodes the unconditional prompt
-once, when it is built, and each step only casts that stored encoding to the
-batch's dtypes (`DiffusionObjective.blank_conditions` in
-`src/dew/objectives/diffusion/objective.py`).
+matches the code. Correction, 2026-10-12: each step encodes the unconditional
+prompt's one row with the step's own towers (`DiffusionObjective.blank_conditions`
+in `src/dew/objectives/diffusion/objective.py`), so a restored tree conditions
+both branches; the cached encoding it replaced was baked into the step from the
+towers the objective was built with.
 
 ### Comparison with PyTorch
 
@@ -1037,6 +1038,45 @@ softcap or sinks and a square causal mask, since FlashAttention-2 aligns its
 causal mask to the last key where jax.nn aligns it to the first. Its backward
 sums the query gradient with atomics, so a run with
 `--xla_gpu_deterministic_ops` stays off it.
+
+### FlashAttention-3 on Hopper, 2026-10-12
+
+On an H100, Qwen3.5-0.8B's full-attention layers (8 query heads over 2 key heads of 256) ran
+XLA's composed attention: cuDNN takes heads up to 128 wide in Dew, and FlashAttention-2's wheel
+held no Hopper code. The dew_flash_attn wheel now carries FlashAttention-3 for sm90a as a second
+library, built from flash-attn3-jax's torch-free port of Dao-AILab's hopper/ kernels (BSD-3), and
+`flash_mha` runs it on an sm90 GPU and FlashAttention-2 elsewhere. The build leaves out split keys,
+paged and appended caches, softcap, sliding windows, packed GQA, fp8 and the 96 and 192 widths,
+which round up to 128 and 256.
+
+Qwen3.5-0.8B's attention call, 8 x 3072 tokens, causal, bf16, forward and backward, on an H100 SXM (jax
+0.11.2, one session, median of 20):
+
+| kernel | ms |
+|---|---:|
+| Dew's xla (what `'auto'` ran) | 12.61 |
+| FlashAttention-2 built for sm90 | 4.66 |
+| tokamax 0.0.16 Pallas Triton | 11.47 |
+| tokamax 0.0.16 Mosaic GPU, untuned | 8.00 |
+| cuDNN through `jax.nn` (and tokamax's cudnn) | 3.33 |
+| Transformer Engine 2.20.2's JAX fused attention (cuDNN) | 3.09 |
+| FlashAttention-3 (Dew's wheel) | 2.69 |
+| torch 2.14 cuDNN SDPA | 2.96 |
+| torch 2.14 FlashAttention-3 (kernels-community build) | 2.58 |
+
+Every output and gradient lay at the same distance from float64 (1.59e-4 and 1.68e-4 RMS for the
+output and the query gradient). Qwen3.5-0.8B itself at 8 x 3072 on the H100 SXM went from 396.1 to 336.7 ms
+a step, its attention from 92.0 to 29.4 ms of device time, with `tools/attribute_step.py`.
+Calls with key lengths, such as Clef's decision head, stay on cuDNN: FlashAttention-3 ends keys at
+lengths only through packed offsets, and on Qwen3.5-0.8B it took 1.29 ms where cuDNN took 1.10. So
+`KERNELS['attention']` names flash for sm90. The xla, jax.nn cuDNN, tokamax Triton and
+FlashAttention-3 rows reproduce with `PYTHONPATH=src python tools/benchmark_attention.py
+--implementations xla jax_cudnn triton flash --sequence-lengths 3072 --head-dims 256 --batch-size 8
+--heads 8 --kv-groups 4 --causal True` (tokamax installed). The others came from the same inputs
+through their own packages: `tokamax.dot_product_attention(..., implementation='mosaic')`, Transformer
+Engine's `transformer_engine.jax.flax.DotProductAttention` (built from source for CUDA 13), the
+FlashAttention-2 wheel rebuilt for sm90, and torch's `F.scaled_dot_product_attention` under the cuDNN
+backend and `kernels.get_kernel("kernels-community/flash-attn3").flash_attn_func`.
 
 ### FlashAttention-2 on the RTX PRO 6000, 2026-10-11
 
@@ -1634,6 +1674,109 @@ alone, and the differences are within the spread between two processes.
 Dew does not set the variable. To compare bytes across processes on such a
 machine, set it, or pin every process to one core type (`taskset -c 0-15`
 for the 12900K's P-cores).
+
+### Collectives over several GPUs, 2026-10-12
+
+A GPU step whose mesh spans more than one device compiles with NVIDIA
+JAX-Toolbox's collective options (`dew.training.memory.COLLECTIVES`): the
+latency-hiding scheduler, all-reduce and all-gather combined up to 1 GiB and
+reduce-scatter up to 128 MiB, and combine-by-dim off. A flag the run names
+stands. Llama-3.1-8B (random
+weights) over FSDP 2 on two H100 80GB HBM3 SXMs joined by NVLink, 2 x 4096
+tokens a step, JAX 0.11.2.post3, `XLA_FLAGS` empty, the trainer's own fit
+(a 1024 x 8192 head tile and minimal remat), 55 timed steps each, alternated:
+
+| ref | step ms | MFU |
+|---|---|---|
+| main 0290b93b2 | 557.3, 558.5 | 35.8% |
+| with the options, dfb40da61 | 537.9, 537.9 | 37.2% |
+
+That's 3.6% less time a step. The same options passed as `XLA_FLAGS`, with
+whole logits and minimal remat, took 539.3 to 519.5 ms (two runs each). With
+Toolbox's whole bundle, the step's all-gathers and reduce-scatters fell from
+376 and 162 to 48 and 66, on the same bytes. The bundle's other two options
+stay out: command buffers off cost 0.7% beside these, and XLA's
+rematerialization pass off changed nothing. Toolbox also names three
+pipelined-collective flags, which this XLA accepts in `XLA_FLAGS` and
+ignores; no compile accepts them as options. On one GPU there's nothing to
+combine: a dense 1.1B Llama on one H100 SXM ran within 0.4% with the whole
+bundle. Toolbox's while-loop double buffering stays out too: the 8B, whose
+layers Dew unrolls, stepped in 479.4 and 479.1 ms with it and 479.5 and
+479.2 without (84ec3a043's parent), and it failed XLA's schedule check
+(`hlo_schedule.cc:463`) in a two-process GPU pool's step.
+
+```
+cd <dew checkout> && JAX_PLATFORMS=cuda XLA_FLAGS= XLA_PYTHON_CLIENT_MEM_FRACTION=0.90 PYTHONPATH=src \
+  python tools/reference_runs/dew_lm.py --model <Llama-3.1-8B config checkpoint> --data <2 x 4096 windows.npz> \
+  --work work.json --out run.json --batch 2 --mesh fsdp --dtype bfloat16 --steps 80 --timing-warmup 20 \
+  --attention auto --lr-init 0 --warmup 16
+```
+
+The options cost Qwen3.5-9B with rank-256 factors over FSDP 2 (below) 3.6%
+at e3c90a968. There the delta net's activation exchanges, on the step's
+critical path, waited behind combined gathers of the frozen base. With the
+projections placed and every split on its leading dimension, the options
+are within the run-to-run spread there and win elsewhere. All-gathers
+combined to 128 MiB, MaxText's GPU value, lose on the 8B:
+
+| step, FSDP 2, leading-dimension splits | no options | options | all-gathers at 128 MiB |
+|---|---|---|---|
+| Llama-3.1-8B, ms (two runs) | 508.3, 507.8 | 488.6, 489.0 | 501.4, 500.5 |
+| 9B LoRA, ms (one run) | 434.7 | 437.4 | 431.9 |
+
+Three runs of the 9B's FSDP 2 arm at e3c90a968 spread 0.8%.
+
+### fsdp splits a parameter's leading dimension, 2026-10-12
+
+A parameter fsdp splits is gathered whole for every use, so which of its
+dimensions fsdp takes changes no product, only how the shards lie in
+memory. It now takes the leading dimension its rules name it alone for
+(`dew.nn.sharding.DEFAULT_RULES`). Before, rule order put fsdp on the gate
+and up projections' mlp width, their minor dimension, and each update read
+their reduce-scattered gradients transposed. The 8B's profile with the
+collective options spent 65 ms of each device's 524 ms step in transpose
+fusions, 43.5 of them in 64 optimizer updates of 0.68 ms. Same 8B, mesh,
+data and command as above, at ecaa727d9 (the collective options), 55 timed
+steps, alternated:
+
+| split | step ms | MFU | peak GB |
+|---|---|---|---|
+| rule order (gate, up on the mlp width) | 538.0, 537.5 | 37.1%, 37.2% | 71.5 |
+| leading dimension | 488.3, 487.6 | 40.9%, 41.0% | 65.3 |
+
+The losses agree to the run-to-run spread (1e-4 relative). On Qwen3.5-9B
+with rank-256 factors over FSDP 2 (below), the frozen base's gate, up and
+delta-net input projections split their leading dimension too: 446.8 to
+434.7 ms a step, its layout kernels 37.8 to 18.0 ms a device.
+
+### The delta net over fsdp, 2026-10-12
+
+Over an fsdp mesh GSPMD placed the gated delta net's projections head-split
+with the rows gathered: each device ran both rows' delta rule, and the step
+moved 8.4 GiB of all-to-alls and 2.8 GiB of activation gathers. Each
+projection now keeps the residual's placement
+(`GatedDeltaNet._project`). Qwen3.5-9B with its middle eight layers (12 to
+20) run twice, rank-256 factors over a frozen bf16 base, one 3072-token row
+a GPU, minimal remat, two H100 80GB HBM3 SXMs over NVLink, land/gdn-unit
+102918039, the median of steps 100 to 220:
+
+| run | step ms | peak GiB |
+|---|---|---|
+| FSDP 2, before | 481.3 | 25.0 |
+| FSDP 2, projections placed | 446.8 | 25.8 |
+| and leading-dimension splits | 434.7 | 25.1 |
+
+The profile's delta-net time fell from 175 to 95 ms over both devices, and
+every all-to-all and activation gather left the step.
+
+```
+cd <dew checkout> && PYTHONPATH=src python recipes/decision/clef.py --mixture.root <mix> --trainer.name run \
+  --pretrained Qwen/Qwen3.5-9B --revision c202236235762e1c871ad0ccb60c8ee5ba337b9a --max-len 3072 \
+  --max-state-tokens 1024 --trainer.batch-size 2 --trainer.steps 220 --trainer.eval-every 220 \
+  --trainer.checkpoint-every None --trainer.log-every 1 --no-calibrate --optim.schedule.warmup-steps 10 \
+  --lora.rank 256 --param-dtype bfloat16 --loop-steps 2 --loop-layers 12 20 --remat minimal \
+  --trainer.mesh.fsdp 2
+```
 
 ## UNet batch scaling
 

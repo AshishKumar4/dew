@@ -26,16 +26,15 @@ is the float32 run's rounding.
 
 from __future__ import annotations
 
-import ast
 import contextlib
 import functools
 import sys
 import types
-import urllib.request
 from pathlib import Path
 
 import numpy as np
 import torch
+from reference_source import fetched, ran, selected
 
 EDM = "008a4e5316c8e3bfe61a62f874bddba254295afb"
 EDM2 = "4bf8162f601bcc09472ce8a32dd0cbe8889dc8fc"
@@ -62,17 +61,16 @@ def published(repo: str, commit: str, path: str, dtype: str,
     top-level classes and functions of it (a training loop's loss class
     without the loop's own imports)."""
     url = f"https://raw.githubusercontent.com/{repo}/{commit}/{path}"
-    source = urllib.request.urlopen(url).read().decode()
+    source = fetched(url).replace("torch.float32", f"torch.{dtype}")
     module = types.ModuleType(Path(path).stem)
-    if keep is not None:
-        tree = ast.parse(source)
-        tree.body = [node for node in tree.body
-                     if isinstance(node, ast.ClassDef | ast.FunctionDef) and node.name in keep]
-        for node in tree.body:
-            node.decorator_list = []
-        source = ast.unparse(tree)
-        module.__dict__.update(torch=torch, np=np)
-    exec(source.replace("torch.float32", f"torch.{dtype}"), module.__dict__)
+    if keep is None:
+        exec(source, module.__dict__)
+        return module
+    kept = selected(source, keep, filename=url)
+    for node in kept:
+        node.decorator_list = []
+    module.__dict__.update(torch=torch, np=np)
+    ran(kept, module.__dict__, url)
     return module
 
 

@@ -76,9 +76,6 @@ def arguments() -> argparse.Namespace:
     parser.add_argument("--dtype", choices=("bfloat16", "float32"), required=True)
     parser.add_argument("--mesh", choices=("data", "fsdp", "expert"), default="data",
                         help="the axis the devices form; data=1 device is the single-GPU run")
-    parser.add_argument("--tolerance", type=float, default=None,
-                        help="Layout's sharding tolerance; an expert mesh keeps the dense weights "
-                             "replicated, as DDP does, which the default 2%% refuses")
     parser.add_argument("--dispatch", choices=("global", "exchange"), default=None,
                         help="MoE: the mixture's token dispatch; the checkpoint's model runs 'global', "
                              "and 'exchange' sends tokens to the expert axis's devices (all-to-all)")
@@ -137,7 +134,7 @@ def build(args: argparse.Namespace) -> Run:
     from dew.interop import Pretrained
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.objectives.lm import TEXT_KEY, LMObjective
-    from dew.training import Layout, MeshSpec, Trainer
+    from dew.training import MeshSpec, Trainer
     from dew.training.distributed import batch_shardings
     from dew.training.optim import Cosine, ParamGroup
 
@@ -169,9 +166,8 @@ def build(args: argparse.Namespace) -> Run:
         param_groups=(ParamGroup("all", ("*",)),)).build(schedule_steps)
     devices = jax.device_count()
     mesh = {"data": MeshSpec(), "fsdp": MeshSpec(fsdp=devices), "expert": MeshSpec(expert=devices)}[args.mesh]
-    layout = Layout() if args.tolerance is None else Layout(tolerance=args.tolerance)
     trainer = Trainer(objective, optax.chain(recorded_norm(), solver), key=jax.random.key(0),
-                      mesh=mesh, layout=layout, checkpoints=None, tracker=None)
+                      mesh=mesh, checkpoints=None, tracker=None)
     state, _, _ = trainer.place()
     del pretrained
     placement = batch_shardings(trainer.device_mesh, {TEXT_KEY: windows[:args.batch]})

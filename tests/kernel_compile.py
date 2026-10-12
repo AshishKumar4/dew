@@ -17,22 +17,19 @@ from jax.sharding import Mesh
 
 from dew.nn.kernels.generation import assumed, gpu_mesh, gpu_target
 
-COMPILE_SECONDS = 60.0
-"""The CPU time one kernel config's Triton compile may take, ptxas's with it: 8 to 40 seconds,
-where an IEEE fp32 dot on sm80 took ptxas 209 seconds to past 15 minutes. CPU time, not wall:
-a busy host stretches the wall time of every compile, and a gate that measured it would fail
-the compile it slowed. A compile still running at ten times the bound is stopped."""
+HUNG = 600.0
+"""Wall seconds after which a compile's child session is stopped as hung: the process boundary's
+guard, not a bound on the kernel. How long a compile takes on a shared CPU says nothing about it."""
 
 _TRITON_CALL = "__gpu$xla.gpu.triton"
-_COMPILE = """import json, resource, sys
+_COMPILE = """import json, sys
 import triton
 from triton.backends.compiler import GPUTarget
 
 entry = json.loads(sys.argv[1])
 kernel = triton.compile(entry["path"], target=GPUTarget("cuda", entry["capability"], 32),
                         options={"num_warps": entry["warps"], "num_stages": entry["stages"]})
-used = [resource.getrusage(who) for who in (resource.RUSAGE_SELF, resource.RUSAGE_CHILDREN)]
-print(json.dumps({"shared": kernel.metadata.shared, "seconds": sum(u.ru_utime + u.ru_stime for u in used)}))
+print(json.dumps({"shared": kernel.metadata.shared}))
 """
 
 
@@ -69,43 +66,38 @@ def _triton_calls(lowered: jax.stages.Lowered) -> list[dict]:
     return found
 
 
-def _compiled(entry: dict, seconds: float) -> dict:
-    """One Triton call compiled by pip's Triton in a child of its own session: its shared bytes and
-    the CPU seconds it and ptxas took, or why it has none. The whole session is stopped at ten
-    times `seconds` of wall time."""
+def _compiled(entry: dict) -> dict:
+    """One Triton call compiled by pip's Triton in a child of its own session: its shared bytes, or why
+    it has none. A session still running at HUNG seconds is stopped."""
     child = subprocess.Popen([sys.executable, "-c", _COMPILE, json.dumps(entry)], stdout=subprocess.PIPE,
                              stderr=subprocess.STDOUT, text=True, start_new_session=True)
     try:
-        output, _ = child.communicate(timeout=10 * seconds)
+        output, _ = child.communicate(timeout=HUNG)
     except subprocess.TimeoutExpired:
         os.killpg(child.pid, signal.SIGKILL)
         child.communicate()
-        return {"error": f"no compile within {10 * seconds:.0f} s of wall time", "seconds": seconds}
+        return {"error": f"its compile hung past {HUNG:.0f} s"}
     if child.returncode:
-        failed = f"Triton's compile failed ({child.returncode}): {output.strip()[-800:]}"
-        return {"error": failed, "seconds": 0.0}
-    found = json.loads(output.strip().splitlines()[-1])
-    if found["seconds"] > seconds:
-        found["error"] = f"its compile took {found['seconds']:.0f} CPU seconds, past {seconds:.0f}"
-    return found
+        return {"error": f"Triton's compile failed ({child.returncode}): {output.strip()[-800:]}"}
+    return json.loads(output.strip().splitlines()[-1])
 
 
-def compile_kernels(cases, generation: str, seconds: float = COMPILE_SECONDS) -> list[dict]:
+def compile_kernels(cases, generation: str) -> list[dict]:
     """Each case (`name`, `call()` giving the kernel and abstract operands) on the CUDA `generation`,
     lowered as on that GPU on this host (`assumed`, `gpu_mesh`) and compiled by pip's Triton for its
     capability, never run: its name, the generation's block limit, and the shared bytes Triton allocates (the
-    most of any call it makes), or the error. A compile past `seconds` of CPU time fails.
+    most of any call it makes), or the error.
 
-    A cheap first filter, not a GPU's verdict: a kernel that does not compile, compiles past its
-    bound, or takes more shared memory than its GPU's block holds fails here, before a GPU is paid
-    for. Identical IR compiles once; compiles run one to each CPU this process may use."""
+    A cheap first filter, not a GPU's verdict: a kernel that does not compile or takes more shared
+    memory than its GPU's block holds fails here, before a GPU is paid for. Identical IR compiles once;
+    compiles run one to each CPU this process may use."""
     found: list[dict] = []
     calls: dict[str, tuple[dict, list[dict]]] = {}
     with tempfile.TemporaryDirectory(prefix="dew-compile-") as scratch:
         mesh = gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), generation)
         for case in cases:
             record: dict = {"name": case.name, "generation": generation,
-                            "limit": gpu_target(generation).shared_limit, "shared": 0, "seconds": 0.0}
+                            "limit": gpu_target(generation).shared_limit, "shared": 0}
             found.append(record)
             fn, args = case.call()
             try:
@@ -125,10 +117,9 @@ def compile_kernels(cases, generation: str, seconds: float = COMPILE_SECONDS) ->
                 calls[key][1].append(record)
         with concurrent.futures.ThreadPoolExecutor(max_workers=len(os.sched_getaffinity(0))) as pool:
             entries = [entry for entry, _ in calls.values()]
-            outcomes = list(pool.map(lambda entry: _compiled(entry, seconds), entries))
+            outcomes = list(pool.map(_compiled, entries))
     for (_, records), outcome in zip(calls.values(), outcomes, strict=True):
         for record in records:
-            record["seconds"] = max(record["seconds"], outcome["seconds"])
             if "error" in outcome:
                 record.setdefault("error", outcome["error"])
             else:
