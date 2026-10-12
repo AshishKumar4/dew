@@ -9,9 +9,14 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    import torch
+
     from dew.data.sources.urls import Fetch
     from dew.data.steps.image import (
         Albumentations,
+        Augmentation,
         AugmentationKey,
         Caption,
         CenterCrop,
@@ -19,6 +24,7 @@ if TYPE_CHECKING:
         DecodeImage,
         DeviceAugment,
         Flip,
+        ImageProcessor,
         Interpolation,
         MaxAspect,
         MinSide,
@@ -206,7 +212,8 @@ def caption(template: str | None = None, *, classes: tuple[str, ...] = ()) -> Ca
     return Caption(template, classes)
 
 
-def processor(image_processor: object, *, field: str = "image", to: str = "pixel_values") -> Processor:
+def processor(image_processor: ImageProcessor, *, field: str = "image",
+              to: str = "pixel_values") -> Processor:
     """A record step that runs a Hugging Face image processor on the image in
     `field`, its `pixel_values` under `to`."""
     from dew.data.steps.image import Processor
@@ -214,7 +221,7 @@ def processor(image_processor: object, *, field: str = "image", to: str = "pixel
     return Processor(image_processor, field, to)
 
 
-def albumentations(transform: object, *, field: str = "image") -> Albumentations:
+def albumentations(transform: Augmentation, *, field: str = "image") -> Albumentations:
     """A random step that runs an albumentations pipeline on the image in
     `field`, seeded from the record's generator, so its draws repeat exactly
     on resume and at any thread or worker count."""
@@ -223,7 +230,7 @@ def albumentations(transform: object, *, field: str = "image") -> Albumentations
     return Albumentations(transform, field)
 
 
-def torchvision(transform: object, *, field: str = "image") -> Torchvision:
+def torchvision(transform: Callable[[torch.Tensor], torch.Tensor], *, field: str = "image") -> Torchvision:
     """A random step that runs a torchvision v2 transform on the image in
     `field` (HWC uint8 in and out), seeded from the record's generator."""
     from dew.data.steps.image import Torchvision

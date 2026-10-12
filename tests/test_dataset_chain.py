@@ -7,7 +7,7 @@ import grain.python as grain
 import numpy as np
 import pytest
 
-from dew.data import Dataset, Files, Loading, Memory, from_grain, from_iter, mix, text
+from dew.data import Dataset, Files, Loading, Memory, from_grain, from_hf, from_iter, mix, text
 from dew.data.compile import compile, iterate
 from dew.data.dataset import DataPartition
 
@@ -175,8 +175,9 @@ class Countdown:
 def test_an_iterator_resumes_through_its_own_state_or_by_replaying():
     """A stateful iterator resumes through state= and load_state=, and one without them by
     replaying the records it already gave; both continue exactly where they stopped."""
-    for source in (from_iter(Countdown, name="countdown", state=lambda it: it.next,
-                             load_state=lambda it, saved: setattr(it, "next", saved)),
+    # The state is a NumPy array, as a library's own state often holds, through the JSON checkpoint.
+    for source in (from_iter(Countdown, name="countdown", state=lambda it: np.array([it.next]),
+                             load_state=lambda it, saved: setattr(it, "next", int(saved[0]))),
                    from_iter(Countdown, name="replayed")):
         reader = compile(source.repeat().batch(4), read="streamed", loading=READ).train(DataPartition())
         try:
@@ -192,6 +193,16 @@ def test_an_iterator_resumes_through_its_own_state_or_by_replaying():
             assert [next(resumed)["i"].tolist() for _ in range(3)] == rest
         finally:
             resumed.close()
+
+
+def test_a_hugging_face_stream_that_shuffles_through_its_own_buffer_is_refused():
+    """Hugging Face's state_dict leaves its shuffle buffer's rows out, so a stream that
+    shuffles through it cannot resume exactly: it is refused, also under a later map."""
+    datasets = pytest.importorskip("datasets")
+    stream = datasets.IterableDataset.from_generator(lambda: ({"i": i} for i in range(40)))
+    assert [row["i"] for row in from_hf(stream, name="counting").iterate()] == list(range(40))
+    with pytest.raises(ValueError, match="shuffle"):
+        from_hf(stream.shuffle(seed=0, buffer_size=8).map(lambda row: row), name="shuffled")
 
 
 def test_chunks_cut_long_documents_keeping_every_target():

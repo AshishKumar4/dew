@@ -59,6 +59,7 @@ from dew.data.pipeline import (
     BatchStage,
     Bound,
     Configured,
+    Dataset,
     Expansion,
     Filter,
     FlatMap,
@@ -834,6 +835,61 @@ def iterate(
     build = _Build(read, loading, 0, 1, budget, lowering, training=False)
     rows, _ = build.records(pipeline, DataPartition())
     return _as_iter(rows, loading)
+
+
+def fitted[Entry](
+    dataset: Dataset | Loader,
+    validation: Dataset | Mapping[str, Dataset | Entry] | None,
+    *,
+    objective: ObjectiveData,
+) -> tuple[Loader, Mapping[str, Reader | Entry] | None]:
+    """`dataset` and each validation dataset as `Trainer.fit` reads them,
+    compiled with the objective's own stages, their stores provisioned. A
+    training dataset without a repeat repeats before its batch, so a run's
+    length is its steps, epochs or tokens; a validation dataset without a
+    batch takes the training batch, and is read and loaded as it asks. A
+    Loader is already compiled, and an entry that is no Dataset (a reader,
+    an evaluation suite) is passed on as it is."""
+    if isinstance(dataset, Dataset):
+        train = _endless(dataset.chain())
+        if isinstance(validation, Dataset):
+            return compile(train, validation=_batched(validation.chain(), train), objective=objective,
+                           provision=True), None
+        loader = compile(train, objective=objective, provision=True)
+    else:
+        loader = dataset
+    named = {"val": validation} if isinstance(validation, Dataset) else validation
+    if named is None:
+        return loader, None
+    return loader, {name: _held(entry.chain(), loader.batch, objective) if isinstance(entry, Dataset)
+                    else entry for name, entry in named.items()}
+
+
+def _endless(chain: Pipeline) -> Pipeline:
+    """`chain` read endlessly: a repeat before its batch where it has none."""
+    if any(isinstance(stage, Repeat) for stage in chain.stages):
+        return chain
+    batching = [index for index, stage in enumerate(chain.stages)
+                if isinstance(stage, (BatchStage, TokenBudget))]
+    at = batching[0] if batching else len(chain.stages)
+    return dataclasses.replace(chain, stages=(*chain.stages[:at], Repeat(None), *chain.stages[at:]))
+
+
+def _batched(held: Pipeline, train: Pipeline) -> Pipeline:
+    """`held` batched as `train` is, every record scored, where it states no batch of its own."""
+    if any(isinstance(stage, (BatchStage, TokenBudget)) for stage in held.stages):
+        return held
+    size = next((stage.size for stage in train.stages if isinstance(stage, BatchStage)), None)
+    if size is None:
+        raise ValueError("a validation dataset without a batch takes the training batch, which states none")
+    return held.batch(size, drop_remainder=False)
+
+
+def _held(chain: Pipeline, batch: int, objective: ObjectiveData) -> Reader:
+    """`chain` read once to validate on, batched by `batch` where it states no
+    batch, read and loaded as it asks."""
+    return validation(chain, batch=batch, objective=objective, read=chain.mode,
+                      loading=chain.loading or _DEFAULT_LOADING, provision=True)
 
 
 def validation(

@@ -271,12 +271,14 @@ class Aliases[T: Callable[..., Any], Built](Mapping[str, T]):
         return functools.reduce(operator.or_, self.values())
 
     @property
-    def subcommands(self) -> object:
+    def subcommands(self) -> Annotation:
         """The members' union with each subcommand named as the kind names it
         ("data:text"), rather than by its class."""
         import tyro
 
-        annotated = typing.cast(Any, typing.Annotated)
+        # The special form subscripted at runtime, where each member is a value rather than a
+        # type expression, which a type checker reads `typing.Annotated[...]` as.
+        annotated = vars(typing)["Annotated"]
         members = (annotated[self[name], tyro.conf.subcommand(name)] for name in self)
         return functools.reduce(operator.or_, members)
 

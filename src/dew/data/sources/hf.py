@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any
 
 import grain.python as grain
 import numpy as np
@@ -17,6 +17,7 @@ from .memory import _record
 
 if TYPE_CHECKING:
     import datasets
+    from datasets.iterable_dataset import _BaseExamplesIterable
 
 
 @dataclass(frozen=True, eq=False)
@@ -38,7 +39,13 @@ class HF(Dataset):
         return isinstance(self.dataset, IterableDataset)
 
     def describe(self) -> str:
-        return f"hf:{self.name or getattr(self.dataset, '_fingerprint', None) or type(self.dataset).__name__}"
+        from datasets import Dataset as Arrow
+
+        if self.name:
+            return f"hf:{self.name}"
+        if isinstance(self.dataset, Arrow):
+            return f"hf:{self.dataset._fingerprint}"
+        return f"hf:{type(self.dataset).__name__}"
 
     def fingerprint(self) -> Mapping[str, object]:
         return {"store": "hf-datasets", "name": self.describe(), **self.metadata()}
@@ -95,14 +102,17 @@ class _StreamedIterator(grain.DatasetIterator):
         self._dataset = dataset
         self._rows = iter(dataset)
 
-    def __next__(self) -> Batch:
-        return cast("Batch", _record(next(self._rows)))
+    def __next__(self) -> Batch | bytes:
+        row = None
+        while row is None:
+            row = _record(next(self._rows))
+        return row
 
-    def get_state(self) -> dict[str, Any]:
+    def get_state(self) -> Mapping[str, object]:
         return self._dataset.state_dict()
 
-    def set_state(self, state: Mapping[str, Any]) -> None:
-        self._dataset.load_state_dict(state)
+    def set_state(self, state: Mapping[str, object]) -> None:
+        self._dataset.load_state_dict(dict(state))
         self._rows = iter(self._dataset)
 
 
@@ -113,7 +123,19 @@ def from_hf(dataset: datasets.Dataset | datasets.IterableDataset, name: str | No
     state; shuffle it with the chain's `shuffle(window=)` instead."""
     from datasets import IterableDataset
 
-    if isinstance(dataset, IterableDataset) and getattr(dataset, "_shuffling", None) is not None:
+    if isinstance(dataset, IterableDataset) and _buffer_shuffled(dataset._ex_iterable):
         raise ValueError("an IterableDataset's own shuffle loses its buffer on resume; pass it unshuffled "
                          "and shuffle with the chain's shuffle(window=)")
     return HF(dataset, name)
+
+
+def _buffer_shuffled(layer: _BaseExamplesIterable) -> bool:
+    """At the Hugging Face boundary: whether `layer`, an IterableDataset's
+    examples, or any layer it reads (a map's one, an interleave's several) is
+    the shuffle buffer, whose rows and draws HF's `state_dict` leaves out."""
+    from datasets.iterable_dataset import BufferShuffledExamplesIterable
+
+    if isinstance(layer, BufferShuffledExamplesIterable):
+        return True
+    read = [getattr(layer, "ex_iterable", None), *getattr(layer, "ex_iterables", ())]
+    return any(_buffer_shuffled(inner) for inner in read if inner is not None)

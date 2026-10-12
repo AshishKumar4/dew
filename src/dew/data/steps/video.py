@@ -6,6 +6,7 @@ import contextlib
 import dataclasses
 import functools
 import tempfile
+from collections.abc import Iterator
 
 import grain.python as grain
 import numpy as np
@@ -40,8 +41,7 @@ class DecodeClip(grain.RandomMapTransform):
 
         clip, seed = element[self.field], int(rng.integers(0, 2**32 - 1))
         try:
-            with contextlib.ExitStack() as held:
-                path = self._path(clip, held)
+            with self._local(clip) as path:
                 if self.audio_padding is None:
                     frames, _ = read_random_frames(path, num_frames=self.frames, padding=0, seed=seed,
                                                    fps=self.fps)
@@ -60,20 +60,24 @@ class DecodeClip(grain.RandomMapTransform):
         return {**kept, self.to: fit_frames(frames, self.size), **sound}
 
     @staticmethod
-    def _path(clip: bytes | str, held: contextlib.ExitStack) -> str:
-        """A local file the decoder reads, which `held` keeps until it closes."""
+    @contextlib.contextmanager
+    def _local(clip: bytes | str) -> Iterator[str]:
+        """A local file the decoder reads, kept while the context is open."""
         if isinstance(clip, bytes):
-            file = held.enter_context(tempfile.NamedTemporaryFile())  # noqa: SIM115
-            file.write(clip)
-            file.flush()
-            return file.name
+            with tempfile.NamedTemporaryFile() as file:
+                file.write(clip)
+                file.flush()
+                yield file.name
+            return
         path = str(clip)
         if "://" in path and not path.startswith("file://"):
             from dew.data.storage import Store
 
             fs, target = Store(path if "::" in path else "dewcache::" + path).resolve()
-            return held.enter_context(fs.open(target, "rb")).name
-        return path.removeprefix("file://")
+            with fs.open(target, "rb") as cached:
+                yield cached.name
+            return
+        yield path.removeprefix("file://")
 
 
 @dataclasses.dataclass(frozen=True)
