@@ -5,8 +5,10 @@ cmake_minimum_required(VERSION 3.24)
 project(dew_flash_attn LANGUAGES CXX CUDA)
 
 set(UPSTREAM "${CMAKE_CURRENT_SOURCE_DIR}/upstream" CACHE PATH "flash_attn_jax checkout")
-# sm80 code runs on every compute capability 8.x; FlashAttention-2 is not Hopper's kernel.
-set(CMAKE_CUDA_ARCHITECTURES 80-real)
+# sm80 code runs on every compute capability 8.x, and sm120 code on Blackwell's workstation and consumer
+# parts (the RTX PRO 6000 and RTX 50 series), which run Ampere's MMA instructions but not sm80 code.
+# FlashAttention-2 is not Hopper's or the datacenter Blackwell's kernel.
+set(CMAKE_CUDA_ARCHITECTURES 80-real 120-real)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_STANDARD 17)
@@ -24,7 +26,11 @@ add_library(dew_flash_attn SHARED ffi.cpp
 target_include_directories(dew_flash_attn PRIVATE
     "${UPSTREAM}/csrc" "${UPSTREAM}/csrc/flash_attn" "${UPSTREAM}/csrc/flash_attn/src"
     "${UPSTREAM}/csrc/cutlass/include")
-set(DEFINES FLASHATTENTION_DISABLE_DROPOUT=1 FLASHATTENTION_DISABLE_ALIBI=1)
+# The library reports the architectures it holds code for (dew_flash_attn.ARCHITECTURES), so Dew asks
+# the installed wheel rather than knowing each release's list.
+list(JOIN CMAKE_CUDA_ARCHITECTURES "," ARCHITECTURES)
+set(DEFINES FLASHATTENTION_DISABLE_DROPOUT=1 FLASHATTENTION_DISABLE_ALIBI=1
+    DEW_FLASH_ARCHITECTURES="${ARCHITECTURES}")
 target_compile_definitions(dew_flash_attn PRIVATE ${DEFINES})
 target_compile_options(dew_flash_attn PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:
     -O3 --use_fast_math --expt-relaxed-constexpr --expt-extended-lambda

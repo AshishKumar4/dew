@@ -378,7 +378,7 @@ class Mamba2(nn.Module):
         # casts them (modeling_mamba2.py:271, 305), or in the model's own
         # dtype where it is wider (`at_least_fp32`).
         wide = at_least_fp32(mixed.dtype)
-        mixed, dt = mixed.astype(wide), dt.astype(wide)
+        dt = dt.astype(wide)
         taps, bias = self.conv1d()
         heads = (jnp.asarray(self.dt_bias, wide), -jnp.exp(self.A_log.astype(wide)),
                  jnp.asarray(self.D, wide))
@@ -395,7 +395,8 @@ class Mamba2(nn.Module):
                     "state per row. Run them on a mesh with sequence=1.")
             out = held_scan(self, mixed, taps, bias, functools.partial(scan, dt=dt, heads=heads),
                             (self.num_heads, self.head_dim, self.state_size),
-                            decode=decode, valid=valid, segments=segment_ids,
+                            decode=decode, valid=valid, segments=segment_ids, state_dtype=wide,
+                            conv_dtype=wide, dtype=wide,
                             right_padded=attention_metadata is not None and attention_metadata.right_padded)
             if out is None:
                 # Allocation only, as the delta net: init_cache's dummy token
@@ -404,8 +405,9 @@ class Mamba2(nn.Module):
             if valid is not None:
                 out = jnp.where(valid[:, :, None], out, 0)
         elif shards > 1:
+            # Wide across the shards, so a halo's gradient and its shard's own add before rounding.
             out = _over_sequence(functools.partial(_sequence_mix, scan=scan, axis=SEQUENCE_AXIS),
-                                 shards, mixed, dt, segment_ids, (taps, bias, *heads))
+                                 shards, mixed.astype(wide), dt, segment_ids, (taps, bias, *heads))
         else:
             out = _sequence_mix(mixed, dt, segment_ids, (taps, bias, *heads), scan=scan)
         return self.out_proj(self.norm(out, gate))
@@ -456,12 +458,12 @@ def _sequence_mix(mixed, dt, segments, weights, *, scan, axis: str | None = None
     """The conv and the scan over whole training sequences, or over this
     shard's slice of them inside a `shard_map` that holds `axis` manual.
 
-    `mixed` `[B, S, conv_dim]` and `dt` `[B, S, H]` in fp32, `segments` `[B, S]`
-    or None, `weights` the conv's taps and bias and the heads' `dt_bias`, `A`
-    and `D`. Under `axis` the conv reads the previous shard's last `K-1` tokens
-    and segments by one `ppermute` (zeros on the first) and the scan is
-    corrected for the earlier shards' state (`_ssd`). A segment change resets
-    both wherever it falls."""
+    `mixed` `[B, S, conv_dim]` the projection, convolved in at least fp32,
+    `dt` `[B, S, H]` in fp32, `segments` `[B, S]` or None, `weights` the
+    conv's taps and bias and the heads' `dt_bias`, `A` and `D`. Under `axis`
+    the conv reads the previous shard's last `K-1` tokens and segments by one
+    `ppermute` (zeros on the first) and the scan is corrected for the earlier
+    shards' state (`_ssd`). A segment change resets both wherever it falls."""
     taps, bias, dt_bias, A, D = weights
     width = taps.shape[1] - 1
     batch, length, channels = mixed.shape
@@ -475,8 +477,13 @@ def _sequence_mix(mixed, dt, segments, weights, *, scan, axis: str | None = None
         shards = jax.lax.axis_size(axis)
         forward = [(shard, shard + 1) for shard in range(shards - 1)]
         history = jax.lax.ppermute(mixed[:, length - width:], axis, forward)
-    if segments is None:
-        convolved = causal_conv1d(jnp.concatenate([history, mixed], axis=1), taps, bias=bias)[:, width:]
+    wide = at_least_fp32(mixed.dtype)
+    if segments is None and forward is None:
+        convolved = causal_conv1d(mixed, taps, bias=bias, dtype=wide)
+        starts = None
+    elif segments is None:
+        stream = jnp.concatenate([history, mixed], axis=1)
+        convolved = causal_conv1d(stream, taps, bias=bias, dtype=wide)[:, width:]
         starts = None
     else:
         if forward is None:

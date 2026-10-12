@@ -846,12 +846,13 @@ def test_router_z_loss_adds_each_routers_mean_squared_log_partition():
 
     # The oracle: each layer's gate logits recomputed from its kernel and
     # the normed input the router saw, captured by flax's intermediates.
-    _, state = model.apply(params, tokens[:, :-1], capture_intermediates=True,
-                           mutable=["intermediates"])
+    # The block's norm owns its residual seam, which returns the stream beside the normed input.
+    _, state = model.apply(params, tokens[:, :-1], mutable=["intermediates"],
+                           capture_intermediates=lambda module, method: method == "seam")
     expected = 0.0
     for index in range(2):
         layer = state["intermediates"][f"layers_{index}"]
-        normed = layer["post_attention_layernorm"]["__call__"][0]
+        normed = layer["post_attention_layernorm"]["seam"][0][1]
         kernel = params["params"][f"layers_{index}"]["mlp"]["gate"]["kernel"]
         logits = normed.astype(jnp.float32) @ kernel
         expected += 0.3 * float(jnp.mean(jnp.square(jax.nn.logsumexp(logits, -1))))
