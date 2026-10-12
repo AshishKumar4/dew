@@ -59,7 +59,14 @@ from dew.telemetry.instrumentation import StepFlops
 from dew.training import MeshSpec
 from dew.training.distributed import DevicePrefetchIterator
 from dew.training.interval import Interval
-from dew.training.model_flops import FORWARD_FLOPS, TOKENS, TRAINING_FLOPS, prepare_counts, step_counts
+from dew.training.model_flops import (
+    FORWARD_FLOPS,
+    TOKENS,
+    TRAINING_FLOPS,
+    _TokenCount,
+    prepare_counts,
+    step_counts,
+)
 
 LENGTHS = np.asarray([2, 5], np.int64)
 
@@ -67,6 +74,17 @@ LENGTHS = np.asarray([2, 5], np.int64)
 def decoder(**kwargs):
     return CausalTransformer(vocab_size=64, emb_features=8, num_heads=2, num_kv_heads=1,
                              head_dim=4, num_layers=3, mlp_features=16, **kwargs)
+
+
+def test_integer_token_counts_carry_across_words_on_a_partitioned_batch():
+    from jax.sharding import NamedSharding, PartitionSpec
+
+    rows = _TokenCount.words([2**32 - 1, 2, 2**40, 0])
+    mesh = MeshSpec().build(jax.devices()[:2])
+    placed = jax.device_put(rows, NamedSharding(mesh, PartitionSpec("data")))
+    total = jax.jit(_TokenCount.sum)(placed)
+    assert _TokenCount.host(total) == 2**40 + 2**32 + 1
+    assert total.dtype == jnp.uint32
 
 
 def test_dense_and_attention_equations_use_each_real_length():
@@ -215,7 +233,7 @@ def test_host_row_counts_add_to_objectives_total_without_padding():
     objective = LMObjective(decoder(), seq_len=6, pad_id=0)
     batch = packed_batch()
     counted = prepare_counts(objective, batch, count_model=True)
-    np.testing.assert_array_equal(counted[TOKENS], [4, 3])
+    np.testing.assert_array_equal(counted[TOKENS], _TokenCount.words([4, 3]))
     assert counted[FORWARD_FLOPS].sum() == objective.model_flops(None, batch)
     assert counted["text"] is batch["text"]
     with pytest.raises(ValueError, match="reserved"):
@@ -292,7 +310,7 @@ def test_prefetch_counts_on_worker_then_step_reduces_global_rows():
     with DevicePrefetchIterator(iter([batch]), mesh, prepare=prepare) as source:
         placed = next(source)
         measured = jax.jit(step_counts)(placed)
-        assert float(measured[TOKENS]) == 7
+        assert _TokenCount.host(measured[TOKENS]) == 7
         assert float(measured[FORWARD_FLOPS]) == objective.model_flops(None, batch)
     assert threads == ["dew-prefetch"]
 
@@ -304,12 +322,12 @@ def test_interval_accumulates_work_with_its_loss_and_resets_only_at_logs():
         interval.count({"rows": np.ones((2, 1))}, StepFlops(10, 20), loss,
                         jnp.asarray(a=True), None, {FORWARD_FLOPS: jnp.asarray(forward),
                                                    TRAINING_FLOPS: jnp.asarray(3 * forward),
-                                                   TOKENS: jnp.asarray(tokens)})
-    np.testing.assert_array_equal(np.asarray([interval.book.training, interval.book.tokens]), [900, 7])
+                                                   TOKENS: jnp.asarray(_TokenCount.words(tokens))})
+    assert float(interval.book.training) == 900 and _TokenCount.host(interval.book.tokens) == 7
     interval.saved(2)
-    np.testing.assert_array_equal(np.asarray([interval.book.training, interval.book.tokens]), [900, 7])
+    assert float(interval.book.training) == 900 and _TokenCount.host(interval.book.tokens) == 7
     interval.logged(3.0)
-    np.testing.assert_array_equal(np.asarray([interval.book.training, interval.book.tokens]), [0, 0])
+    assert float(interval.book.training) == 0 and _TokenCount.host(interval.book.tokens) == 0
     assert not interval.model_counted and not interval.tokens_counted
 
 
@@ -480,24 +498,19 @@ def test_recurrent_state_macs_are_algorithm_independent_and_scan_aware(kind):
         assert counted == 4 * batch * length * channels * key
 
 
-@pytest.mark.parametrize("model,padding_work", [
-    (GatedDeltaNet(8, 2, 2, 4, 3), 0), (KimiDeltaAttention(8, 2, 4), 0),
-    (Mamba(8, 16, state_size=3, chunk_size=1), 0),
-    (Mamba2(8, 2, 4, state_size=3, chunk_size=1), 2 * 2 * 14 * 4 * 3),
-    (MultiHeadLatentAttention(8, 2, 16, 4, 3, 2, 2, 3, causal=False, attention_impl="reference"), 0),
+@pytest.mark.parametrize("model", [
+    GatedDeltaNet(8, 2, 2, 4, 3), KimiDeltaAttention(8, 2, 4), Mamba(8, 16, state_size=3, chunk_size=1),
+    Mamba2(8, 2, 4, state_size=3, chunk_size=1),
+    MultiHeadLatentAttention(8, 2, 16, 4, 3, 2, 2, 3, causal=False, attention_impl="reference"),
 ])
-def test_remaining_recurrent_and_latent_modules_match_token_paths(model, padding_work):
-    """One-token recurrence has no chunk-prep products.
-
-    Mamba-2 computes throwaway convolution outputs over K-1 padded history
-    positions, before slicing. That exact 2*B*conv_features*K*(K-1) jaxpr
-    overhead is not MFU; model plus it must equal the full traced product
-    count, with no tolerance to hide a missing learned projection.
-    """
+def test_remaining_recurrent_and_latent_modules_match_token_paths(model):
+    """One-token recurrence has no chunk-prep products, and the convs
+    compute no outputs over their zero history: the model's count is the
+    full traced product count, with no tolerance to hide a missing learned
+    projection."""
     x = jnp.ones((2, 1, 8))
     variables = model.init(jax.random.key(202), x)
-    assert model.model_flops(np.array([1, 1])) + padding_work == forward_products(
-        model.apply, variables, x, state_mac=True)
+    assert model.model_flops(np.array([1, 1])) == forward_products(model.apply, variables, x, state_mac=True)
 
 
 @pytest.mark.parametrize("kind", ["sparse", "gpt_oss", "gemma4"])

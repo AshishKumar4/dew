@@ -24,7 +24,7 @@ from dew.inputs import unit_range
 from dew.nn.backbones.dit import SimpleDiT
 from dew.objectives.base import Aux, EMASpec, Objective
 from dew.training import Checkpoints, Layout, MeshSpec, Trainer
-from dew.training.distributed import DevicePrefetchIterator
+from dew.training.distributed import DevicePrefetchIterator, shard_batch
 
 # Needs the eight simulated CPU devices conftest configures; the GPU lane skips it.
 pytestmark = pytest.mark.mesh
@@ -216,6 +216,24 @@ def test_a_restored_run_places_its_boxed_parameters_by_their_names(tmp_path):
 # --------------------------------------------------------------------------
 # Batch placement and prefetch
 # --------------------------------------------------------------------------
+
+@pytest.mark.parametrize("devices", [1, 8])
+def test_placed_batch_owns_its_reader_buffer(devices):
+    # CPU zero-copy needs aligned storage; each row and device slice stays aligned.
+    size = 1 << 20
+    storage = np.empty(size * 4 + 63, np.uint8)
+    offset = -storage.ctypes.data % 64
+    source = storage[offset:offset + size * 4].view(np.float32).reshape(8, -1)
+    source.fill(7)
+    mesh = MeshSpec().build(jax.devices()[:devices])
+    placed = shard_batch(mesh, {"tokens": source})["tokens"]
+    placed.block_until_ready()
+
+    for shard in placed.addressable_shards:
+        assert not np.shares_memory(np.asarray(shard.data), source)
+    source.fill(-1)
+    np.testing.assert_array_equal(np.asarray(placed), np.full(source.shape, 7, np.float32))
+
 
 def test_prefetch_iterator_preserves_order_and_terminates():
     mesh = MeshSpec().build()
