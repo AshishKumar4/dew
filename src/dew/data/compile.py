@@ -372,9 +372,9 @@ def compile(
     validation: Pipeline | None = None,
     host: tuple[HostStep, ...] = (),
     objective: ObjectiveData | None = None,
-    read: Read | None = "indexed",
-    provision: bool = False,
-    loading: Loading = _DEFAULT_LOADING,
+    read: Read | None = None,
+    provision: bool = True,
+    loading: Loading | None = None,
     seed: int = 0,
     rejections: Literal["drop", "mask"] = "drop",
     budget: SearchBudget = _DEFAULT_BUDGET,
@@ -383,7 +383,8 @@ def compile(
     """Check every leaf before opening readers, then build both branches.
     With no `read`, the sources choose it (`_preferred_read`)."""
     branches = (train,) if validation is None else (train, validation)
-    read = read or _preferred_read(lambda _: branches, provision=provision)
+    read = read or train.mode or _preferred_read(lambda _: branches, provision=provision)
+    loading = loading or train.loading or _DEFAULT_LOADING
     if isinstance(train.source, Phases):
         return _compile_phases(
             train,
