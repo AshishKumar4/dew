@@ -315,7 +315,7 @@ def test_another_guidance_scale_seed_or_grid_reuses_the_compiled_walk(tmp_path):
 
     def draw(scale=4.0, seed=1, times=None):
         prepared = pipe.prepare(["x"], key=0, steps=8, times=times)
-        return pipe(prepared, guidance=CFG(scale), solver=DPMSolverSDE(seed=seed),
+        return pipe(prepared, steps=8, guidance=CFG(scale), solver=DPMSolverSDE(seed=seed),
                     key=jax.random.PRNGKey(1)).host().images
 
     first = draw(times=grid)
