@@ -61,7 +61,7 @@ from dew.telemetry.instrumentation import StepFlops
 from dew.training import MeshSpec
 from dew.training.distributed import DevicePrefetchIterator
 from dew.training.interval import Interval
-from dew.training.model_flops import FORWARD_FLOPS, TOKENS, TRAINING_FLOPS, prepare_counts, step_counts
+from dew.training.model_flops import FORWARD_FLOPS, TOKENS, TRAINING_FLOPS, _TokenCount, prepare_counts, step_counts
 
 LENGTHS = np.asarray([2, 5], np.int64)
 
@@ -244,7 +244,7 @@ def test_host_row_counts_add_to_objectives_total_without_padding():
     objective = LMObjective(decoder(), seq_len=6, pad_id=0)
     batch = packed_batch()
     counted = prepare_counts(objective, batch, count_model=True)
-    np.testing.assert_array_equal(counted[TOKENS], [4, 3])
+    np.testing.assert_array_equal(counted[TOKENS], _TokenCount.words([4, 3]))
     assert counted[FORWARD_FLOPS].sum() == objective.model_flops(None, batch)
     assert counted["text"] is batch["text"]
     with pytest.raises(ValueError, match="reserved"):
@@ -347,7 +347,7 @@ def test_prefetch_counts_on_worker_then_step_reduces_global_rows():
     with DevicePrefetchIterator(iter([batch]), mesh, prepare=prepare) as source:
         placed = next(source)
         measured = jax.jit(step_counts)(placed)
-        assert float(measured[TOKENS]) == 7
+        assert _TokenCount.host(measured[TOKENS]) == 7
         assert float(measured[FORWARD_FLOPS]) == objective.model_flops(None, batch)
     assert threads == ["dew-prefetch"]
 
@@ -359,12 +359,12 @@ def test_interval_accumulates_work_with_its_loss_and_resets_only_at_logs():
         interval.count({"rows": np.ones((2, 1))}, StepFlops(10, 20), loss,
                         jnp.asarray(a=True), None, {FORWARD_FLOPS: jnp.asarray(forward),
                                                    TRAINING_FLOPS: jnp.asarray(3 * forward),
-                                                   TOKENS: jnp.asarray(tokens)})
-    np.testing.assert_array_equal(np.asarray([interval.book.training, interval.book.tokens]), [900, 7])
+                                                   TOKENS: jnp.asarray(_TokenCount.words(tokens))})
+    assert float(interval.book.training) == 900 and _TokenCount.host(interval.book.tokens) == 7
     interval.saved(2)
-    np.testing.assert_array_equal(np.asarray([interval.book.training, interval.book.tokens]), [900, 7])
+    assert float(interval.book.training) == 900 and _TokenCount.host(interval.book.tokens) == 7
     interval.logged(3.0)
-    np.testing.assert_array_equal(np.asarray([interval.book.training, interval.book.tokens]), [0, 0])
+    assert float(interval.book.training) == 0 and _TokenCount.host(interval.book.tokens) == 0
     assert not interval.model_counted and not interval.tokens_counted
 
 
@@ -586,7 +586,7 @@ def test_microbatches_two_sum_real_tokens_before_interval_throughput():
         aux = step_counts(jax.tree.map(jnp.asarray, counted))
         interval.count(counted, StepFlops(10, 20), jnp.asarray(1.0), jnp.asarray(a=True), None, aux)
     trainer = Trainer(objective, optax.sgd(0.01), key=0, accumulation=2)
-    totals = np.asarray([interval.book.training, interval.book.tokens])
+    totals = [float(interval.book.training), _TokenCount.host(interval.book.tokens)]
     assert totals[1] == 8
     metrics = trainer._throughput(2, 2, 2, interval.flops,
                                   training_flops=float(totals[0]), tokens=float(totals[1]))

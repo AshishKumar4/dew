@@ -131,6 +131,7 @@ from dew.training.model_flops import (
     FORWARD_FLOPS,
     TOKENS,
     TRAINING_FLOPS,
+    _TokenCount,
     model_batch,
     prepare_counts,
     step_counts,
@@ -422,6 +423,7 @@ class _FitRun:
     last_checkpoint: float = 0.0
     checkpoint_due: bool = False
     stop_control: dict = dataclasses.field(default_factory=dict)
+    last_local_saved: int | None = None
     stopped: bool = False
     training: dict[str, jax.Array] = dataclasses.field(default_factory=dict)
     source: Iterator[Batch] | None = None
@@ -1655,10 +1657,6 @@ class Trainer(Generic[Loss, Effects]):
         )
         if not ending:
             self._saves(plan, run, interval, state, position, scores, evaluation_due=evaluation_due)
-        if (plan.local_every and checkpoints is not None
-                and current % plan.local_every == 0):
-            run.other += self._saved_local_checkpoint(
-                checkpoints, current, state, position, interval, control=run.stop_control)
         # Asked at every step on every process, as JAX's agreement
         # needs; the last step ends the run on its own.
         if run.stopped:
@@ -1701,6 +1699,11 @@ class Trainer(Generic[Loss, Effects]):
                 and not (final and plan.checkpoint_final) and bool(winners)
                 and all(rank.weights_only for rank in winners))
             run.last_checkpoint = time.perf_counter()
+        if (plan.local_every and checkpoints is not None and current % plan.local_every == 0
+                and run.last_local_saved != current):
+            run.other += self._saved_local_checkpoint(
+                checkpoints, current, state, position, interval, control=run.stop_control)
+            run.last_local_saved = current
 
     def _wind_down(self, plan: _FitPlan, run: _FitRun, interval: Interval, state: TrainState,
                    shardings: Placement[TrainState], position, profiler: Profiler | None) -> None:
@@ -2210,13 +2213,13 @@ class Trainer(Generic[Loss, Effects]):
         runs only at the logging cadence, and its value joins the same host
         read; no optimizer or checkpoint state is added for reporting.
         """
+        now = time.time()
         def report() -> None:
             if jax.process_index() != 0:
                 return
             # The interval's numbers need the loss on the host, so this is
             # where the loop waits on the device.
             loss.block_until_ready()
-            now = time.time()
             rate = learning_rate(state.opt_state)
             if (rate is None and self._config is not None and self._config.schedule is None
                     and not self._config.param_groups):
@@ -2246,7 +2249,8 @@ class Trainer(Generic[Loss, Effects]):
                        **self._throughput(now - interval.last_log_time, interval.since_log,
                                           interval.samples, interval.flops, waited=interval.waited,
                                           compiling=interval.compiling, training_flops=read["training_flops"],
-                                          tokens=read["tokens"])}
+                                          tokens=None if read["tokens"] is None
+                                          else _TokenCount.host(read["tokens"]))}
             scalars["train/accepted"] = float(read["accepted"])
             if read['committed'] is not None:
                 norms, commits = read['committed']
@@ -2270,7 +2274,7 @@ class Trainer(Generic[Loss, Effects]):
 
         with region("log"):
             agreed("training reporting", report)
-        interval.logged(time.time())
+        interval.logged(now)
 
     def _reported_outcome(self, error: BaseException | None, run: _FitRun) -> BaseException | None:
         """Agree the run's cleanup, report its goodput and its outcome.
