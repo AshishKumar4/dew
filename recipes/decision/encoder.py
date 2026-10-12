@@ -1,7 +1,7 @@
 """A decision model on a pretrained encoder with a fresh head, as Laya and OpenDecider-nano are built.
 
     python recipes/decision/sources.py --out data/mixture --decontaminate eval-index.npz
-    python recipes/decision/encoder.py --mixture.root data/mixture --trainer.checkpoint-dir runs
+    python recipes/decision/encoder.py --data.source data/mixture --trainer.checkpoint-dir runs
 
 ModernBERT-large (Apache-2.0, 396M parameters) is trained whole under a
 fresh Laya head, reading Laya's layout: the question, a marker before each
