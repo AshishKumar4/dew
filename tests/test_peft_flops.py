@@ -15,13 +15,17 @@ from dew.data.text import ByteTokenizer
 from dew.decision.head import JointSchemaHead
 from dew.decision.layout import Specials, StateFirstLayout
 from dew.decision.objective import DecisionObjective
+from dew.diffusion import presets
+from dew.inputs import Field, InputSpec
 from dew.interop import Pretrained
 from dew.lora import LoRA
 from dew.nn.backbones.decoder_stack import Loop
+from dew.nn.backbones.dit import SimpleDiT
 from dew.nn.flops import MissingFlopsCount, counted_flops, dense_training_flops, projection_flops
 from dew.nn.inputs import ModelInputs
 from dew.nn.protocols import CountedTraining
 from dew.objectives.base import FROZEN
+from dew.objectives.diffusion import DiffusionObjective
 from dew.objectives.lm import TEXT_KEY, LMObjective
 from dew.training import Trainer
 from dew.training.model_flops import FORWARD_FLOPS, TOKENS, TRAINING_FLOPS, prepare_counts
@@ -103,12 +107,24 @@ def test_adapted_prediction_depths_count_their_maps_and_the_reused_head():
         logits = adapted.model.apply(variables, hidden, method="logits_from_hidden")
         return logits, adapted.model.apply(variables, hidden, tokens, method="mtp_logits")
 
-    objective = LMObjective(adapted, seq_len=6, mtp_weight=1.0)
+    objective = LMObjective(adapted.model, variables=adapted.variables, seq_len=6, mtp_weight=1.0)
     batch = {TEXT_KEY: np.ones((1, 7), np.int32)}
     upper = 2 * model.num_heads * model.head_dim * (model.num_layers * 6**2 + 5**2 + 4**2)
     assert objective.model_flops(None, batch) == forward_products(forward, adapted.variables, tokens) - upper
     assert objective.training_flops(None, batch) == (adapted.model.training_flops(lengths)
         + adapted.model.logits_training_flops(lengths) + adapted.model.prediction_training_flops(lengths))
+
+
+def test_adapted_image_geometry_refuses_inherited_native_work_without_matrix_usage():
+    model = SimpleDiT(emb_features=8, num_layers=1, num_heads=2, patch_size=2)
+    image, time = jnp.ones((1, 4, 4, 3)), jnp.ones((1,))
+    variables = model.init(jax.random.key(410), image, time)
+    adapted = LoRA(rank=2, alpha=4, modules=("final_proj",)).apply(model, variables, key=510)
+    objective = DiffusionObjective(adapted.model, presets.Flow(), InputSpec(Field("images", (4, 4, 3))),
+                                   variables=adapted.variables, autoencoder=None, ema_decay=None)
+    for count in (objective.model_flops, objective.training_flops):
+        with pytest.raises(MissingFlopsCount, match="adapter matrix usage"):
+            count(None, {"images": np.asarray(image)})
 
 
 def test_objective_assembles_peft_training_work_without_three_times_forward():

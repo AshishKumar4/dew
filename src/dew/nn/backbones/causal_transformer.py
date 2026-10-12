@@ -969,40 +969,49 @@ class CausalTransformer(nn.Module):
         return count
 
     @nn.nowrap
-    def prediction_flops(self, lengths) -> float:
+    def prediction_flops(self, lengths, *, prediction_lengths=None) -> float:
         """Each trained prediction depth shortens the real sequence by one token."""
-        return self._prediction_flops(lengths, counted_flops)
+        return self._prediction_flops(lengths, counted_flops, prediction_lengths)
 
     @nn.nowrap
-    def prediction_parameter_flops(self, lengths) -> float:
+    def prediction_parameter_flops(self, lengths, *, prediction_lengths=None) -> float:
         """The same shortened depth forwards' learned matrices, head included."""
-        return self._prediction_flops(lengths, parameter_flops)
+        return self._prediction_flops(lengths, parameter_flops, prediction_lengths)
 
     @nn.nowrap
-    def _prediction_flops(self, lengths, counter) -> float:
+    def _prediction_rows(self, lengths, prediction_lengths):
+        if prediction_lengths is not None:
+            return prediction_lengths
+        return [(shorter, shorter) for depth in range(1, self.num_nextn_predict_layers + 1)
+                for shorter in (np.maximum(np.asarray(lengths) - depth, 0),)]
+
+    @nn.nowrap
+    def _prediction_flops(self, lengths, counter, prediction_lengths) -> float:
         types, factories = self.per_layer_types, self.feedforward_factories()
         kinds = self.layer_kinds(types)
         mixer = self.mixer if self.mixer is not None else AttentionMixer()
         blocks = self._prediction_depths(types, kinds, mixer, factories[0], factories[1], BlockWiring())
         count = 0.0
-        for depth, block in enumerate(blocks, start=1):
-            shorter = np.maximum(np.asarray(lengths) - depth, 0)
-            count += counter(block, shorter) + self.logits_flops(shorter)
+        rows = self._prediction_rows(lengths, prediction_lengths)
+        for block, (inputs, outputs) in zip(blocks, rows, strict=True):
+            count += counter(block, inputs) + self.logits_flops(outputs)
         return count
 
     @nn.nowrap
-    def prediction_matrix_usage(self, path: tuple[str, ...], lengths):
+    def prediction_matrix_usage(self, path: tuple[str, ...], lengths, *, prediction_lengths=None):
         """Each depth's maps run once; the shared head runs on every shorter state."""
         relative = path[1:] if path and path[0] == 'params' else path
         if not relative:
             raise MissingFlopsCount("CausalTransformer prediction matrix has no native scope")
         lengths = np.asarray(lengths)
+        rows = self._prediction_rows(lengths, prediction_lengths)
         if relative[0].startswith('mtp_'):
-            depth = int(relative[0].removeprefix('mtp_')) + 1
-            return np.maximum(lengths - depth, 0)
+            depth = int(relative[0].removeprefix('mtp_'))
+            copies = (self.mtp_hyper_connections.hc_mult
+                      if relative[1] == 'h_proj' and self.mtp_hyper_connections is not None else 1)
+            return rows[depth][0] * copies
         if relative[0] in ('lm_head', 'head_dense'):
-            return sum((np.maximum(lengths - depth, 0)
-                        for depth in range(1, self.num_nextn_predict_layers + 1)), np.zeros_like(lengths))
+            return np.concatenate([np.empty((0,), np.int64), *(outputs for _, outputs in rows)])
         return np.zeros_like(lengths)
 
     @nn.nowrap

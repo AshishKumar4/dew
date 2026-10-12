@@ -336,7 +336,10 @@ def test_diffusion_objective_counts_one_real_encoder_and_the_conditioned_denoise
 
     count = objective.model_flops(None, {"images": np.asarray(image), "text": tokens})
     assert count == forward_products(forward, variables, encoder.params, image, time, tokens)
-    assert objective.training_flops(None, {"images": np.asarray(image), "text": tokens}) == 3 * count
+    encoded = encoder.conditioning_flops(tokens)
+    denoised = model.image_flops(np.array([4]), 3, encoded.features)
+    training = objective.training_flops(None, {"images": np.asarray(image), "text": tokens})
+    assert training == 3 * denoised + encoded.flops
 
 
 def test_multiple_conditions_refuse_the_unknown_composition():
@@ -406,7 +409,7 @@ def test_prediction_depths_and_the_lm_objective_match_every_forward_product(dept
 
 def test_multistream_prediction_projects_each_carried_stream_and_collapses_its_output():
     attention = partial(CausalSelfAttention, emb_features=8, num_heads=2, num_kv_heads=2,
-                        head_dim=4, causal=False, nope=True, attention_impl="reference")
+                        head_dim=4, max_seq_len=8, causal=False, nope=True, attention_impl="reference")
     model = MTPBlock(attention, partial(GatedMLP, hidden_features=16, out_features=8), 8, BlockWiring(),
                      hyper_connections=HyperConnections(hc_mult=2, head="weighted"))
     streams, embeds = jnp.ones((1, 4, 2, 8)), jnp.ones((1, 4, 8))
