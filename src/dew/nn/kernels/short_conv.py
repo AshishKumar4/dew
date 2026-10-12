@@ -43,7 +43,7 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 
 from . import generation
-from .norm_swiglu import _compensated_add, _product_parts
+from .norm_swiglu import _neumaier_add, _product_parts
 
 SEGMENTS = 8
 """Rows of a program's tile, each its own run of tokens: with a 128-channel block, 1024 elements, eight
@@ -160,10 +160,10 @@ def _preactivation(window, taps, bias, *, interpret: bool):
     total, correction = tap_product(window[0], taps[0])
     for inputs, tap in zip(window[1:], taps[1:], strict=True):
         product, error = tap_product(inputs, tap)
-        total, correction = _compensated_add(total, correction, product, interpret=interpret)
+        total, correction = _neumaier_add(total, correction, product, interpret=interpret)
         correction = correction + error
     if bias is not None:
-        total, correction = _compensated_add(total, correction, jnp.broadcast_to(bias[None, :], total.shape),
+        total, correction = _neumaier_add(total, correction, jnp.broadcast_to(bias[None, :], total.shape),
                                              interpret=interpret)
     return total + correction
 
