@@ -27,7 +27,7 @@ from dew.telemetry.devices import deterministic_ops_requested
 
 from .attention_sinks import attention_with_sinks
 from .flops import attention_flops, projection_flops, real_lengths
-from .kernels import decode_attention
+from .kernels import decode_attention, generation, norm_swiglu
 from .kernels.generation import bf16_dot_runs, device_generation, first_refusal, measured_kernel, ran_kernel
 from .kv_cache import Append, KVCache, KVStore, filled_slots
 from .precision import (
@@ -73,8 +73,8 @@ calls splash's mask descriptor cannot carry.
 triton where cudnn's kernel runs and `triton_runs`; flash where
 `flash_refusal` finds none; cudnn where its kernel runs; tpu where splash's does;
 the reference path where the call asks for arithmetic only it honours; and
-xla anywhere else. A call off the kernel `KERNELS` measured fastest on the
-device is logged once a process with the reason (`ran_kernel`).
+xla anywhere else. A call off the kernel the device's target row (`gpu_target().kernels`)
+measured fastest is logged once a process with the reason (`ran_kernel`).
 """
 
 
@@ -260,8 +260,8 @@ def normalized_in_fp32(normalize, static_argnums: tuple[int, ...] = ()):
 
 
 @functools.partial(normalized_in_fp32, static_argnums=(2, 3, 4, 5, 6))
-def rms_normalized(x, scale, epsilon: float, dtype, scale_offset: bool, scale_after_cast: bool,
-                   fp32_statistics: bool):
+def _xla_rms_normalized(x, scale, epsilon: float, dtype, scale_offset: bool, scale_after_cast: bool,
+                        fp32_statistics: bool):
     """Normalize `x` by its root mean square, then apply `scale`.
 
     The families differ on which side of the cast the weight goes, which
@@ -291,6 +291,25 @@ def rms_normalized(x, scale, epsilon: float, dtype, scale_offset: bool, scale_af
         # follows, and keeps the weight's product and gradient in fp32.
         return rounded_to(rounded_to(y, dtype) * weight, dtype).astype(dtype)
     return (y * weight).astype(dtype)
+
+
+def rms_normalized(x, scale, epsilon: float, dtype, scale_offset: bool, scale_after_cast: bool,
+                   fp32_statistics: bool, *, implementation: str = 'auto'):
+    """Normalize the last axis and apply an optional vector weight.
+
+    `scale_offset` adds one to the stored weight; `scale_after_cast` rounds
+    the normalized activation before multiplying and rounds the product
+    again. `fp32_statistics=False` retains the input-dtype arithmetic.
+    `implementation` selects the generation's measured kernel by default;
+    explicit 'pallas' interprets on CPU. The fused VJP retains only the
+    narrow input, weight and per-row inverse RMS, not fp32 activations.
+    Unsupported variants run the checkpointed XLA reference instead
+    (`norm_swiglu.rms_kernel`), including float64 and input-dtype statistics.
+    """
+    chosen = norm_swiglu.rms_kernel(implementation, x, scale, dtype, fp32_statistics)
+    if chosen == 'pallas':
+        return norm_swiglu.rms_norm(x, scale, epsilon, dtype, scale_offset, scale_after_cast)
+    return _xla_rms_normalized(x, scale, epsilon, dtype, scale_offset, scale_after_cast, fp32_statistics)
 
 
 @functools.partial(normalized_in_fp32, static_argnums=(3, 4))
@@ -325,13 +344,17 @@ def l2_normalized(x, eps: float = 1e-12):
     return x / jnp.sqrt(jnp.maximum(jnp.sum(jnp.square(x), axis=-1, keepdims=True), eps * eps))
 
 
-def unweighted_rmsnorm(x, eps: float):
+def unweighted_rmsnorm(x, eps: float, *, implementation: str = 'auto'):
     """Normalize the last axis by its root mean square, with no learned weight.
 
     The reduction runs in fp32 and the inverse deviation is cast back
     before it multiplies, which is what `DeepseekV4UnweightedRMSNorm`
-    (modeling_deepseek_v4.py:66-72) and its GLM twin do.
+    (modeling_deepseek_v4.py:66-72) and its GLM twin do. The fused RMSNorm
+    rounds the normalized activation instead, so this variant refuses it
+    through the kernel table and retains XLA's input-dtype product and VJP.
     """
+    norm_swiglu.rms_kernel(implementation, x, None, x.dtype, fp32_statistics=True,
+                           inverse_after_cast=True)
     fp32 = x.astype(at_least_fp32(x.dtype))
     inverse = jax.lax.rsqrt(jnp.mean(jnp.square(fp32), axis=-1, keepdims=True) + eps)
     return x * inverse.astype(x.dtype)
@@ -355,6 +378,7 @@ class RMSNorm(nn.Module):
     with_scale: bool = True
     fp32_statistics: bool = True
     dtype: Dtype | None = None
+    implementation: str = 'auto'
 
     @nn.compact
     def __call__(self, x):
@@ -364,7 +388,7 @@ class RMSNorm(nn.Module):
             nn.initializers.zeros if self.scale_offset else nn.initializers.ones,
             (x.shape[-1],), jnp.float32) if self.with_scale else None
         return rms_normalized(x, scale, self.epsilon, dtype, self.scale_offset,
-                              self.scale_after_cast, self.fp32_statistics)
+                              self.scale_after_cast, self.fp32_statistics, implementation=self.implementation)
 
 
 class LayerNorm(nn.Module):
@@ -812,7 +836,7 @@ FLASH_MAX_BACKWARD_HEAD_DIM = 192
 def flash_refusal(query, key, causal=False, sliding_window=None, mask=None, bias=None, softcap=None,
                   sinks=None) -> str | None:
     """Why 'auto' does not send a call to FlashAttention-2 (`flash_attention`),
-    or None where it does: `KERNELS` names it for the GPU, the query is bf16
+    or None where it does: the GPU's target row names it, the query is bf16
     or fp16 with heads a multiple of 8 up to 256 wide (192 off sm80, whose
     backward alone takes wider ones), a causal call is square, the call has
     no window, mask, bias, softcap or sinks, no deterministic ops are asked
@@ -822,7 +846,7 @@ def flash_refusal(query, key, causal=False, sliding_window=None, mask=None, bias
     widest = FLASH_MAX_HEAD_DIM if device_generation() == 'sm80' else FLASH_MAX_BACKWARD_HEAD_DIM
     return first_refusal(
         (jax.default_backend() == 'gpu' and measured_kernel('attention', 'cudnn') == 'flash',
-         "KERNELS names it for no other device"),
+         "its target row names it for no other device"),
         (query.dtype in CUDNN_DTYPES, f"the query is {query.dtype}"),
         (head_dim % 8 == 0 and head_dim <= widest, f"the heads are {head_dim} wide"),
         (not causal or query.shape[-3] == key.shape[-3], "a causal call has more keys than queries"),
@@ -917,7 +941,7 @@ def weighted_values(equation, weights, value, *, precision=None) -> jax.Array:
     if equation != '...hqk,...khd->...qhd':
         raise ValueError(f"weighted_values takes flax's value product, got {equation!r}")
     weights = weights.astype(value.dtype)
-    if value.dtype != jnp.float32 or value.shape[-3] <= VALUE_BLOCK or jax.default_backend() != 'cpu':
+    if value.dtype != jnp.float32 or value.shape[-3] <= VALUE_BLOCK or generation.backend() != 'cpu':
         return jnp.einsum(equation, weights, value, precision=precision)
     return _blocked_values(weights, value, precision)
 
@@ -1117,7 +1141,7 @@ def folds(query, key, bias, mask, causal, sliding_window) -> bool:
     few query positions over keys of the query's heads, masked by key
     lengths at most, such as a decode step's grouped query
     (`CausalSelfAttention._decode_attention`) where cudnn does not run."""
-    return (jax.default_backend() == 'gpu' and query.shape[-2] == key.shape[-2]
+    return (generation.backend() == 'gpu' and query.shape[-2] == key.shape[-2]
             and query.shape[-3] * key.shape[-2] <= FOLDED_PAIRS
             and bias is None and mask is None and not causal and sliding_window is None)
 
@@ -1241,7 +1265,7 @@ def fused_attention(query, key, value, bias, mask, causal, sliding_window, imple
             mask = with_key_lengths(mask, key_value_seq_lengths, key.shape[-3])
         out = tpu_attention(query, key, value, bias, mask, causal, sliding_window,
                             softcap=softcap, sinks=sinks, segment_ids=segment_ids,
-                            interpret=jax.default_backend() != 'tpu')
+                            interpret=generation.backend() != 'tpu')
     return out if v_head_dim == out.shape[-1] else out[..., :v_head_dim]
 
 
@@ -1400,7 +1424,7 @@ def _xla_kernel_narrows(query) -> bool:
     fp32"), and names the BF16_BF16_F32 algorithm for a bf16 one, which a GPU
     older than sm80 rejects at run time, past jax's own fallback."""
     return query.dtype == jnp.float64 or (
-        query.dtype == jnp.bfloat16 and jax.default_backend() == 'gpu' and not bf16_dot_runs())
+        query.dtype == jnp.bfloat16 and generation.backend() == 'gpu' and not bf16_dot_runs())
 
 
 def _xla_kernel_chains(query, key) -> bool:
@@ -1408,7 +1432,7 @@ def _xla_kernel_chains(query, key) -> bool:
     product over more than VALUE_BLOCK keys in one chain, as YNNPACK,
     XLA:CPU's dot, does, so 'auto' and 'xla' take the reference path, whose
     `weighted_values` sums it in blocks."""
-    return query.dtype == jnp.float32 and key.shape[-3] > VALUE_BLOCK and jax.default_backend() == 'cpu'
+    return query.dtype == jnp.float32 and key.shape[-3] > VALUE_BLOCK and generation.backend() == 'cpu'
 
 
 def resolve_implementation(implementation, query, key, *, dtype=None, precision=None,
@@ -1761,7 +1785,7 @@ def tpu_runs(query, key, *, causal=False, sliding_window=None, mask=None, bias=N
     would gather the queries back. `exchanged_heads_attention` calls the kernel
     inside a `shard_map` where `sequence_shards` is 1, so splash takes those.
     """
-    if jax.default_backend() != 'tpu' or query.dtype not in SPLASH_DTYPES:
+    if generation.backend() != 'tpu' or query.dtype not in SPLASH_DTYPES:
         return False
     if sequence_shards() > 1 or bias is not None:
         return False

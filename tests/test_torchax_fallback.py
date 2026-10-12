@@ -34,6 +34,9 @@ from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
 from dew.training import MeshSpec, Trainer
 
+# CI runs this file in tasks of its own: torchax renames torch's privateuse1 backend process-wide.
+pytestmark = pytest.mark.torchax
+
 pytest.importorskip("torchax")
 
 SEQ = 16

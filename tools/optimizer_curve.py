@@ -121,7 +121,7 @@ def run(config: Comparison) -> Curve:
         losses: list[float] = []
         start = time.perf_counter()
         for step in range(config.steps):
-            state, loss, _, is_finite, _ = train_step(state, next(source))
+            state, loss, _, is_finite, _, _ = train_step(state, next(source))
             losses.append(float(loss))
             if not bool(is_finite):
                 raise RuntimeError(f"loss went non-finite at step {step}")

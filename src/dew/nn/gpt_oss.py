@@ -120,9 +120,9 @@ class GptOssMLP(nn.Module):
         """Router and only the selected experts' three projections."""
         if self.capacity_factor is not None:
             raise MissingFlopsCount("GptOssMLP needs admitted expert counts when capacity drops tokens")
+        expert = GptOssExperts(self.hidden_size, self.intermediate_size, self.num_local_experts, parent=None)
         return (projection_flops(lengths, self.hidden_size, self.num_local_experts)
-                + 3 * self.num_experts_per_tok * projection_flops(
-                    lengths, self.hidden_size, self.intermediate_size)
+                + self.num_experts_per_tok * expert.model_flops(lengths)
                 + projection_flops(lengths, self.num_experts_per_tok, self.hidden_size))
 
     @nn.compact

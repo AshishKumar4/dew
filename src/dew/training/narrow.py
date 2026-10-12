@@ -19,7 +19,7 @@ read. A call the loss passes the weight into unchanged (`pjit`, a
 rematerialized region, a scan over stacked layers) is followed; any other
 use, a custom VJP's included, keeps it.
 
-Where: `KERNELS['narrow_copies']`, the CUDA generations it was measured to
+Where: `gpu_target().kernels['narrow_copies']`, the CUDA generations it was measured to
 pay on (docs/performance.md). A TPU fuses the cast into the matmul, so the
 copy there only adds writes. The gradients are the cast's on split meshes
 as partitioned for the CPU (tests/test_narrow.py); a multi-GPU run over

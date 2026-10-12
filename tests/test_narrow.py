@@ -56,10 +56,15 @@ def _trained(monkeypatch, generations, optimizer, steps=3, mesh=None):
     one batch, with copies on the generations named, on `mesh` with every
     parameter split where it divides."""
     from dew.nn.backbones.causal_transformer import CausalTransformer
-    from dew.nn.kernels import KERNELS
+    from dew.nn.kernels import TARGETS, gpu_target
     from dew.objectives.lm import TEXT_KEY, LMObjective
     from dew.training import Layout, MeshSpec, Trainer
-    monkeypatch.setitem(KERNELS, "narrow_copies", dict.fromkeys(generations, "on"))
+    for target in TARGETS.values():
+        monkeypatch.delitem(target.kernels, 'narrow_copies', raising=False)
+    for generation in generations:
+        target = gpu_target(generation)
+        monkeypatch.setitem(TARGETS, generation, target)
+        monkeypatch.setitem(target.kernels, 'narrow_copies', 'on')
     model = CausalTransformer(vocab_size=64, emb_features=32, num_layers=2, num_heads=2, num_kv_heads=1,
                               mlp="swiglu", mlp_features=64, max_seq_len=16, qk_norm=True,
                               tie_embeddings=True, dtype=jnp.bfloat16)

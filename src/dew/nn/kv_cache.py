@@ -41,6 +41,7 @@ import jax
 import jax.numpy as jnp
 from flax import linen as nn
 
+from dew.nn.kernels.generation import backend
 from dew.nn.scatter import DROPPED
 
 KVDtype = Literal["int8", "float8_e4m3fn"]
@@ -207,7 +208,7 @@ def as_words(x: jax.Array) -> jax.Array:
     tiles two-byte arrays on another axis.
     """
     per_word = 4 // x.dtype.itemsize
-    if jax.default_backend() != 'gpu' or x.dtype == jnp.bool_ or per_word < 2 or x.shape[-1] % per_word:
+    if backend() != 'gpu' or x.dtype == jnp.bool_ or per_word < 2 or x.shape[-1] % per_word:
         return x
     pairs = x.reshape(*x.shape[:-1], x.shape[-1] // per_word, per_word)
     return jax.lax.bitcast_convert_type(pairs, jnp.uint32)
@@ -442,9 +443,9 @@ class KVStore:
         if (page_size is None or self.layout.quantized is not None
                 or self.layout.groups != 1 or self.dtype != jnp.bfloat16):
             return False
-        if jax.default_backend() == "tpu":
+        if backend() == "tpu":
             return True
-        if jax.default_backend() != "gpu":
+        if backend() != "gpu":
             return False
         from dew.nn.attention import FORWARD_MODE
         from dew.nn.kernels import decode_attention
@@ -460,7 +461,7 @@ class KVStore:
         same scale every other attention path applies. On a GPU, a `softcap`
         raises `ValueError`.
         """
-        if jax.default_backend() == "gpu":
+        if backend() == "gpu":
             if softcap is not None:
                 raise ValueError("the GPU paged decode kernel does not apply a logit softcap")
             return _gpu_paged(query, self._get("cached_key"), self._get("cached_value"),

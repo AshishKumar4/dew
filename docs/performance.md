@@ -226,9 +226,11 @@ base runs and the head runs in no round is broken, a row neither runs leaves the
 battery incomplete, and a row either tree measured in only some rounds, or as
 NaN, an infinity or zero, is partial and not judged on the rounds that ran; all
 three fail the gate, as a regression does. `report` writes the table and exits 1
-on any of them. Every commit
-promoted to main that touches `src` passes the gate on a Colab A100 first, and
-its table is kept in `tools/measurements/perf_gate/<head>-vs-<base>.md`:
+on any of them. The battery runs once for each release candidate on a Colab
+A100, and as an A/B, base against head, for a deliberate change to a hot path
+(a kernel, the trainer's step, the input pipeline); a promotion to main does
+not run it. Each table is kept in
+`tools/measurements/perf_gate/<head>-vs-<base>.md`:
 
 ```
 python tools/perf_gate.py run --base main=<tree> --head head=<tree> --rounds 3 \

@@ -6,10 +6,10 @@ the suite spends most of its time in XLA: a parallelism-matrix cell ran 367
 s cold and 99 s with its compilations cached. With DEW_XLA_CACHE_URL and
 DEW_XLA_CACHE_TOKEN set (.armada.json), `install` puts `RemoteCache` over
 JAX's own cache: a local miss is fetched from the URL, the dew-xla-cache
-Worker (tools/r2_store/dew-xla-cache.jsonc), and an entry that took at least `REMOTE_SECONDS`
-to compile is written to both. Entries are keyed under jax's and jaxlib's
-versions, the backend and the Python minor, beside JAX's own key of the
-program and its flags.
+Worker (deployed from the private dew-ops repository), and an entry that took
+at least `REMOTE_SECONDS` to compile is written to both. Entries are keyed
+under jax's and jaxlib's versions, the backend and the Python minor, beside
+JAX's own key of the program and its flags.
 
 A test that runs a model eagerly compiles thousands of small programs, each
 quicker than `REMOTE_SECONDS`, so never in the remote: asking the Worker about each

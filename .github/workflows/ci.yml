@@ -206,7 +206,7 @@ jobs:
     runs-on: ubuntu-latest
     # The suite runs on armada (.armada.json, tools/armada/ci.py): both
     # Pythons as tasks of about three minutes each on Dew's own armada
-    # deployment (armada-dew2), on the fewest of up to 200 containers that
+    # deployment, on the fewest of up to 200 containers that
     # finish as soon, sized from the last runs' usage: at 375, the platform
     # killed 164 of 268 containers at their first command. Tasks share XLA's
     # compilations through the dew-xla-cache Worker (tests/remote_cache.py).
@@ -231,27 +231,38 @@ jobs:
         ARMADA_URL: ${{ secrets.ARMADA_URL }}
         ARMADA_TOKEN: ${{ secrets.ARMADA_TOKEN }}
       run: |
-        armada="bunx --bun github:AshishKumar4/armada#b2bf6df719e64c0992f51e52d877af91d63b49e6"
-        $armada verdict ${{ github.sha }} || $armada run ${{ github.sha }} --label="${{ github.ref_name }}"
+        armada="bunx --bun github:AshishKumar4/armada#3d0b707de58afc0c753244581ac49dfb4036d60d"
+        # Its own deadline sits below this job's 40 minutes, so a hang is armada's named error.
+        $armada verdict ${{ github.sha }} || $armada run ${{ github.sha }} --deadline=1800 \
+          --label="${{ github.ref_name }}"
 
   multihost:
+    needs: proven
+    if: needs.proven.outputs.run == ''
     runs-on: ubuntu-latest
     # tests/test_multihost.py runs the multi-process pools across four
     # containers of an armada gang, one host each, which reach each other
-    # through armada-dew2's relay: collectives, the coordinator and local
-    # checkpoints cross separate machines, as no one-host test does.
+    # through armada's relay: collectives, the coordinator and local
+    # checkpoints cross separate machines, as no one-host test does. Three
+    # gangs run side by side, the two models' layout parity and the rest
+    # (each about 5 min, where one gang took 12-23). A commit proven on
+    # another push (ci/integration before main) is not run again.
     timeout-minutes: 40
     steps:
     - uses: actions/checkout@v4
       with:
         fetch-depth: 0
     - uses: oven-sh/setup-bun@v2
-    - name: Run the multi-host tests across an armada gang
+    - name: Run the multi-host tests across three armada gangs
       env:
         ARMADA_URL: ${{ secrets.ARMADA_URL }}
         ARMADA_TOKEN: ${{ secrets.ARMADA_TOKEN }}
       run: |
-        armada="bunx --bun github:AshishKumar4/armada#b2bf6df719e64c0992f51e52d877af91d63b49e6"
-        echo '[{"gang": 4}]' | $armada map --commit=${{ github.sha }} --items=- --pool=4 --size=medium \
+        armada="bunx --bun github:AshishKumar4/armada#3d0b707de58afc0c753244581ac49dfb4036d60d"
+        # A gang member lost before the start fails it within 300 s (armada#22), and the job within 30 min.
+        echo '[{"gang": 4, "select": "layouts and dense"}, {"gang": 4, "select": "layouts and moe"},
+              {"gang": 4, "select": "not layouts"}]' \
+          | $armada map --commit=${{ github.sha }} --items=- --pool=12 --size=medium \
+          --deadline=1800 --gang-start-timeout=300 \
           --label="${{ github.ref_name }}" -- .venv-3.12/bin/python -m pytest -q -p no:cacheprovider \
-          -m "not network" -rfE --tb=short --basetemp=/tmp/dew-gang tests/test_multihost.py
+          -m "not network" -k "{select}" -rfE --tb=short --basetemp=/tmp/dew-gang tests/test_multihost.py

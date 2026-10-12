@@ -24,6 +24,9 @@ from dew.objectives.diffusion import AudioCondition, DiffusionRunConfig
 from dew.sampling import CFG
 from dew.training import Trainer
 
+# CI runs this file in tasks of its own: torchax renames torch's privateuse1 backend process-wide.
+pytestmark = pytest.mark.torchax
+
 torch = pytest.importorskip("torch")
 pytest.importorskip("torchax")
 

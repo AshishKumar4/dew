@@ -114,6 +114,12 @@ class PatchEmbedding(nn.Module):
     precision: PrecisionLike = None
     bottleneck: int | None = None
 
+    @nn.nowrap
+    def model_flops(self, lengths, input_channels: int) -> float:
+        projected = self.bottleneck or self.embedding_dim
+        return (projection_flops(lengths, self.patch_size**2 * input_channels, projected)
+                + (projection_flops(lengths, projected, self.embedding_dim) if self.bottleneck else 0))
+
     @nn.compact
     def __call__(self, x):
         batch, height, width, _ = x.shape
@@ -175,6 +181,11 @@ class PatchSequenceEmbed(nn.Module):
     dtype: Dtype | None = None
     precision: PrecisionLike = None
     bottleneck: int | None = None
+
+    @nn.nowrap
+    def model_flops(self, lengths, input_channels: int) -> float:
+        return PatchEmbedding(self.patch_size, self.emb_features, bottleneck=self.bottleneck,
+                               parent=None).model_flops(lengths, input_channels)
 
     def setup(self):
         assert self.scan_order in SCAN_ORDERS, f"Unknown scan order {self.scan_order}"
@@ -241,6 +252,14 @@ class ConditioningEmbed(nn.Module):
     interval: bool = False
     time_scale: float = 16
 
+    @nn.nowrap
+    def model_flops(self, lengths, text_features: int | None = None) -> float:
+        rows, width = np.ones(np.shape(lengths), np.int64), self.emb_features
+        expanded = self.mlp_ratio * width
+        time = TimeProjection(expanded, parent=None).model_flops(rows, width)
+        count = (1 + self.interval) * (time + projection_flops(rows, expanded, width))
+        return count + (projection_flops(rows, text_features, width) if text_features is not None else 0)
+
     def setup(self):
         def time_embedding(name: str) -> nn.Sequential:
             return nn.Sequential([
@@ -285,6 +304,14 @@ class PatchSequenceOutput(nn.Module):
     norm_epsilon: float = 1e-5
     dtype: Dtype | None = None
     precision: PrecisionLike = None
+
+    @nn.nowrap
+    def model_flops(self, lengths, input_features: int) -> float:
+        count = projection_flops(lengths, input_features, self.patch_size**2 * self.output_channels)
+        if self.modulated:
+            count += projection_flops(np.ones(np.shape(lengths), np.int64),
+                                       input_features, 2 * input_features)
+        return count
 
     @nn.compact
     def __call__(self, tokens, inv_idx, H, W, conditioning=None):
@@ -430,15 +457,18 @@ class _TransformerOptions(nn.Module, kw_only=True):
                 'force_fp32_for_softmax': self.force_fp32_for_softmax,
                 'norm_epsilon': self.norm_epsilon, 'attention_impl': self.attention_impl}
 
+    @nn.nowrap
     def _embedding(self, patch_size: int, features: int, scan_order: str = 'raster',
                    *, bottleneck: int | None = None) -> PatchSequenceEmbed:
         return PatchSequenceEmbed(patch_size=patch_size, emb_features=features, scan_order=scan_order,
                                   dtype=self.dtype, precision=self.precision, bottleneck=bottleneck)
 
+    @nn.nowrap
     def _conditioning(self, features: int, **options: Unpack[_ConditioningOptions]) -> ConditioningEmbed:
         return ConditioningEmbed(emb_features=features, mlp_ratio=self.mlp_ratio,
                                  dtype=self.dtype, precision=self.precision, **options)
 
+    @nn.nowrap
     def _output(self, patch_size: int, channels: int, *, modulated: bool = False) -> PatchSequenceOutput:
         return PatchSequenceOutput(patch_size=patch_size, output_channels=channels, modulated=modulated,
                                    norm_epsilon=self.norm_epsilon, dtype=self.dtype, precision=self.precision)

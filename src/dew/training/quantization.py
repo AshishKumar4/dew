@@ -59,6 +59,8 @@ import numpy as np
 from flax import core, linen as nn
 from flax.traverse_util import flatten_dict, unflatten_dict
 
+from dew.nn.kernels.generation import backend
+
 if TYPE_CHECKING:
     from qwix import QuantizationProvider
 
@@ -475,7 +477,7 @@ def _refuse_grouped_on_gpu() -> None:
     says where; in int8 on the A100 the 176M text-to-image model's CLIP score
     fell from 0.247 to 0.137). The refusal covers every GPU, dtype and group
     width until an H100 is measured."""
-    if jax.default_backend() == "gpu":
+    if backend() == "gpu":
         raise ValueError(
             "Dew refuses to quantize a grouped convolution's activations on a GPU. Measured with jax "
             "0.11.2: in int8, one input channel per group gives wrong values without an error on the "
