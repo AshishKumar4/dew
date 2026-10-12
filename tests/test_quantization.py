@@ -14,6 +14,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from flax import linen as nn
 from reference_error import assert_fp32_reduction_bound
 
 from dew.config import ObjectiveConfig, OptimConfig
@@ -535,7 +536,7 @@ def test_a_quantized_text_task_matches_qwix_direct_logits_and_generation(dtype, 
 
     from dew.inference import TextGeneration
     from dew.sampling import Sampling
-    from dew.training.quantization import METHODS
+    from dew.training.quantization import entry_methods
 
     qwix = pytest.importorskip("qwix")
     model = tiny()
@@ -549,7 +550,7 @@ def test_a_quantized_text_task_matches_qwix_direct_logits_and_generation(dtype, 
     rules = [qwix.QuantizationRule(module_path=".*_proj", weight_qtype=qtype,
                                   act_qtype=None if weight_only else qtype, **fields)]
     reference = qwix.quantize_model(model, qwix.PtqProvider(rules),
-                                    methods=tuple(method for method in METHODS if hasattr(model, method)))
+                                    methods=entry_methods(model))
     abstract = jax.eval_shape(functools.partial(reference.init, jax.random.key(0),
                                                jnp.zeros((1, 1), jnp.int32)))
     expected_variables = {
@@ -600,7 +601,7 @@ def test_a_quantized_image_task_matches_qwix_direct_prediction_and_samples(flux_
     and the VAE keep their weights, leaf for leaf."""
     import functools
 
-    from dew.training.quantization import METHODS
+    from dew.training.quantization import entry_methods
 
     qwix = pytest.importorskip("qwix")
     task = flux_task
@@ -610,7 +611,7 @@ def test_a_quantized_image_task_matches_qwix_direct_prediction_and_samples(flux_
     rules = [qwix.QuantizationRule(module_path=".*", weight_qtype=qtype,
                                   act_qtype=None if weight_only else qtype, **fields)]
     reference = qwix.quantize_model(task.model, qwix.PtqProvider(rules),
-                                    methods=tuple(name for name in METHODS if hasattr(task.model, name)))
+                                    methods=entry_methods(task.model))
     example = task.prepare("", key=0, steps=1)
     own = {name: tree for name, tree in task.variables.items() if name not in ("encoders", "autoencoder")}
     abstract = jax.eval_shape(functools.partial(reference.init, jax.random.key(0), example.noise,
@@ -662,7 +663,7 @@ def test_quantizing_host_weights_keeps_numpy_storage_and_matches_qwix():
 
     from dew.inference import TextGeneration
     from dew.sampling import Sampling
-    from dew.training.quantization import METHODS
+    from dew.training.quantization import entry_methods
 
     qwix = pytest.importorskip("qwix")
     model = tiny()
@@ -676,7 +677,7 @@ def test_quantizing_host_weights_keeps_numpy_storage_and_matches_qwix():
     reference = qwix.quantize_model(model, qwix.PtqProvider([
         qwix.QuantizationRule(module_path=".*_proj", weight_qtype=jnp.int8,
                               op_names=("dot_general", "einsum", "dot"))]),
-        methods=tuple(method for method in METHODS if hasattr(model, method)))
+        methods=entry_methods(model))
     abstract = jax.eval_shape(functools.partial(reference.init, jax.random.key(0),
                                                jnp.zeros((1, 1), jnp.int32)))
     reference_variables = {**host, "params": qwix.quantize_params(resident["params"], abstract["params"])}
@@ -1104,3 +1105,43 @@ def test_an_objective_that_trains_no_single_model_is_refused(tmp_path):
             name="quantized",
         )
     assert not (tmp_path / "quantized").exists()
+
+
+class _Contracted(nn.Module):
+    """One quantized Dense, then an einsum that asks for an fp32 result from bf16 operands."""
+
+    @nn.compact
+    def __call__(self, x):
+        y = nn.Dense(16, dtype=jnp.bfloat16, param_dtype=jnp.bfloat16)(x)
+        table = self.param("table", nn.initializers.normal(), (16, 8), jnp.bfloat16)
+        return jnp.einsum("bd,dv->bv", y, table, preferred_element_type=jnp.float32)
+
+
+def test_a_quantized_matmul_keeps_the_result_dtype_its_call_asks_for():
+    """Qwix's quantized einsum drops `preferred_element_type`; the provider
+    widens the operands to it instead, exactly for bf16, so the product
+    comes out in fp32 as the unquantized one does."""
+    pytest.importorskip("qwix")
+    x = jnp.ones((2, 8), jnp.bfloat16)
+    model = Quantization().apply(_Contracted())
+    variables = model.init(jax.random.key(0), x)
+    assert model.apply(variables, x).dtype == jnp.float32
+
+
+def test_a_matmul_that_pins_its_precision_runs_unquantized_at_it():
+    """An accumulation precision past the default has no quantized form, so a
+    matmul that pins one, as an fp32 zone does, runs at it unquantized: its
+    output is the unquantized model's, where the default-precision one moves."""
+    pytest.importorskip("qwix")
+    x = jnp.linspace(-2, 2, 16, dtype=jnp.float32).reshape(2, 8).astype(jnp.bfloat16)
+
+    def outputs(precision):
+        model = nn.Dense(16, dtype=jnp.bfloat16, param_dtype=jnp.bfloat16, precision=precision)
+        variables = model.init(jax.random.key(0), x)
+        return (np.asarray(Quantization().apply(model).apply(variables, x), np.float32),
+                np.asarray(model.apply(variables, x), np.float32))
+
+    pinned, plain = outputs("highest")
+    np.testing.assert_array_equal(pinned, plain)
+    quantized, plain = outputs(None)
+    assert not np.array_equal(quantized, plain)
