@@ -12,7 +12,7 @@ import functools
 import importlib
 import importlib.util
 import math
-from typing import Literal
+from typing import Literal, get_args
 
 import jax
 import jax.numpy as jnp
@@ -1531,7 +1531,7 @@ def resolve_implementation(implementation, query, key, *, dtype=None, precision=
     where it was measured fastest is logged (`ran_kernel`). Any other name is returned as it is,
     so an explicit kernel still refuses what it cannot honour by name.
     """
-    if implementation not in ('auto', 'reference', 'xla', 'cudnn', 'triton', 'flash', 'tpu'):
+    if implementation not in get_args(AttentionImpl):
         raise ValueError(f"Unknown attention implementation: {implementation}")
     if implementation in ('auto', 'xla') and (_xla_kernel_narrows(query) or _xla_kernel_chains(query, key)):
         return 'reference'
