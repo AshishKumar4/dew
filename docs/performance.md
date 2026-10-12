@@ -1038,6 +1038,52 @@ causal mask to the last key where jax.nn aligns it to the first. Its backward
 sums the query gradient with atomics, so a run with
 `--xla_gpu_deterministic_ops` stays off it.
 
+### FlashAttention-3 on Hopper, 2026-10-12
+
+On an H100, Qwen3.5-0.8B's full-attention layers (8 query heads over 2 key heads of 256) ran
+XLA's composed attention: cuDNN takes heads up to 128 wide in Dew, and FlashAttention-2's wheel
+held no Hopper code. The dew_flash_attn wheel now carries FlashAttention-3 for sm90a as a second
+library, built from flash-attn3-jax's torch-free port of Dao-AILab's hopper/ kernels (BSD-3), and
+`flash_mha` runs it on an sm90 GPU and FlashAttention-2 elsewhere. The build leaves out split keys,
+paged and appended caches, softcap, sliding windows, packed GQA, fp8 and the 96 and 192 widths,
+which round up to 128 and 256.
+
+Qwen3.5-0.8B's attention call, 8 x 3072 tokens, causal, bf16, forward and backward, on an H100 SXM (jax
+0.11.2, one session, median of 20):
+
+| kernel | ms |
+|---|---:|
+| Dew's xla (what `'auto'` ran) | 12.61 |
+| FlashAttention-2 built for sm90 | 4.66 |
+| tokamax 0.0.16 Pallas Triton | 11.47 |
+| tokamax 0.0.16 Mosaic GPU, untuned | 8.00 |
+| cuDNN through `jax.nn` (and tokamax's cudnn) | 3.33 |
+| Transformer Engine 2.20.2's JAX fused attention (cuDNN) | 3.09 |
+| FlashAttention-3 (Dew's wheel) | 2.69 |
+| torch 2.14 cuDNN SDPA | 2.96 |
+| torch 2.14 FlashAttention-3 (kernels-community build) | 2.58 |
+
+Every output and gradient lay at the same distance from float64 (1.59e-4 and 1.68e-4 RMS for the
+output and the query gradient). Qwen3.5-0.8B itself at 8 x 3072 on the H100 SXM went from 396.1 to 336.7 ms
+a step, its attention from 92.0 to 29.4 ms of device time, with `tools/attribute_step.py`.
+Calls with key lengths, such as Clef's decision head, stay on cuDNN: FlashAttention-3 ends keys at
+lengths only through packed offsets, and on Qwen3.5-0.8B it took 1.29 ms where cuDNN took 1.10. So
+`KERNELS['attention']` names flash for sm90. The xla, jax.nn cuDNN, tokamax Triton and
+FlashAttention-3 rows reproduce with `PYTHONPATH=src python tools/benchmark_attention.py
+--implementations xla jax_cudnn triton flash --sequence-lengths 3072 --head-dims 256 --batch-size 8
+--heads 8 --kv-groups 4 --causal True` (tokamax installed). The others came from the same inputs
+through their own packages: `tokamax.dot_product_attention(..., implementation='mosaic')`, Transformer
+Engine's `transformer_engine.jax.flax.DotProductAttention` (built from source for CUDA 13), the
+FlashAttention-2 wheel rebuilt for sm90, and torch's `F.scaled_dot_product_attention` under the cuDNN
+backend and `kernels.get_kernel("kernels-community/flash-attn3").flash_attn_func`.
+
+### FlashAttention-2 on the RTX PRO 6000, 2026-10-11
+
+At Qwen3.5's attention (B 2 and 4 x 3072 tokens, 16 query and 4 key heads of 256, causal bf16), where
+cuDNN refuses heads over 128, the wheel's sm120 build ran forward and backward in 3.27 and 6.32 ms
+against XLA's 9.84 and 19.34 on a G4, its float64 distances those of FlashAttention-2 in torch, so
+sm120's row names 'flash'.
+
 ### Splash's tiles on the TPU, 2026-10-02
 
 Splash attention took 34 ms of Dew's 156 ms Qwen3-0.6B step at 8 x 1024
@@ -1411,11 +1457,13 @@ together. The whole rule's float64 RMS ratios were at most 1.002 at default
 precision and 1.324 at highest, with bitwise repeats.
 
 Both kernels are gone (2026-10-12). Dew's port of fla 0.5.2's nine kernels
-(`dew.nn.kernels.fla_gdn`) runs the gated delta rule on every GPU of sm80
-or later, on any heads, dtypes, chunk sizes and mesh, with keys up to 256
-wide in bf16 or fp16 and 128 in fp32 (`dew.nn.linear.fla_rule`). The XLA
-math stays for CPUs, TPUs, older GPUs, forward-mode traces, float64 and
-wider keys, and as the tests' oracle (`port_refusal` names the GPU cases).
+(`dew.nn.kernels.fla_gdn`) runs the gated delta rule on every GPU whose
+target row names it (`'gated_delta_rule': 'fla'` on sm80, sm89, sm90 and
+sm120, where it was measured; the row is what qualification reads), on any
+heads, dtypes, chunk sizes and mesh, with keys up to 256 wide in bf16 or
+fp16 and 128 in fp32 (`dew.nn.linear.fla_rule`). The XLA math stays for
+CPUs, TPUs, unmeasured GPUs, forward-mode traces, float64 and wider keys,
+and as the tests' oracle (`port_refusal` names each case).
 On a G4 the port's bf16 forward ran 1.32 and 1.18 ms at the 0.8B's (8 x
 3072 tokens, 16 key and 16 value heads of 128) and the 9B's (4 x 3072, 16
 and 32) shapes against fla's 2.66 and 2.37 (kernel lab `fwd` job,
