@@ -33,7 +33,7 @@ import numpy as np
 import pytest
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.nn.inputs import AttentionMetadata, ModelInputs
+from dew.nn.inputs import AttentionMetadata, ModelInputs, coordinates
 from dew.nn.mixers.mamba2 import Mamba2, Mamba2Mixer, chunk_ssd, recurrent_ssd, segment_sum
 from dew.objectives.lm import LMObjective
 from dew.registry import mixers
@@ -257,7 +257,8 @@ def test_padded_rows_preserve_the_state_and_the_history(reference, geometry):
     valid = jnp.asarray([[1] * 12, [1, 1, 0, 1, 1, 0, 0, 1, 1, 1, 0, 1]], bool)
     compact = hidden[1][valid[1]][None]
 
-    padded = jnp.asarray(module.apply(variables, hidden, attention_metadata=AttentionMetadata(valid=valid)))
+    metadata = AttentionMetadata(coordinates=coordinates(valid=valid))
+    padded = jnp.asarray(module.apply(variables, hidden, attention_metadata=metadata))
     plain = jnp.asarray(module.apply(variables, hidden[:1]))
     closed = jnp.asarray(module.apply(variables, compact))
 

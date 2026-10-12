@@ -151,7 +151,7 @@ class DecisionHead(Head):
         x = states + self.type_embedding(inputs.kinds[:, 0])[:, None, :].astype(states.dtype)
         valid = inputs.valid
         metadata = AttentionMetadata(
-            coordinates=None if valid is None else coordinates(*valid.shape, valid=valid))
+            coordinates=None if valid is None else coordinates(valid=valid))
         for block in self.blocks:
             x = block(x, train=train, attention_metadata=metadata)
             if not isinstance(x, jax.Array):

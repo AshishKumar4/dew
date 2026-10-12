@@ -31,7 +31,7 @@ from transformers.models.glm5_next.configuration_glm5_next import Glm5NextTextCo
 from transformers.models.glm5_next.modeling_glm5_next import Glm5NextTextAttention
 
 from dew.nn.dsa_kpool import KPoolSparseAttention, KPoolSparseAttentionMixer
-from dew.nn.inputs import AttentionMetadata
+from dew.nn.inputs import AttentionMetadata, coordinates
 from dew.nn.mixers import MixerContext
 from dew.registry import mixers
 from tools.hf_reference import scatter_weights
@@ -148,7 +148,7 @@ def test_the_block_matches_the_reference_and_is_sparse():
     assert boundary_gap(block, torch.from_numpy(hidden), torch.from_numpy(valid)) > 1e-3
     wanted = reference_output(block, hidden, valid)
     variables = translated(block)
-    metadata = AttentionMetadata(valid=jnp.asarray(valid))
+    metadata = AttentionMetadata(coordinates=coordinates(valid=jnp.asarray(valid)))
 
     ours = np.asarray(module().apply(variables, jnp.asarray(hidden), attention_metadata=metadata))
     assert scaled(ours[valid], wanted[valid]) < BOUND
@@ -169,8 +169,8 @@ def test_the_block_matches_the_reference_with_biased_projections():
     assert set(variables['params']['q_a_proj']) == {'kernel', 'bias'}
     assert set(variables['params']['q_b_proj']) == {'kernel'}
 
-    ours = module(attention_bias=True).apply(
-        variables, jnp.asarray(hidden), attention_metadata=AttentionMetadata(valid=jnp.asarray(valid)))
+    metadata = AttentionMetadata(coordinates=coordinates(valid=jnp.asarray(valid)))
+    ours = module(attention_bias=True).apply(variables, jnp.asarray(hidden), attention_metadata=metadata)
     assert scaled(np.asarray(ours)[valid], wanted[valid]) < BOUND
 
 
@@ -189,7 +189,7 @@ def test_the_gradients_match_torch_autograd():
     assert x.grad is not None
 
     variables = translated(block)
-    metadata = AttentionMetadata(valid=jnp.asarray(valid))
+    metadata = AttentionMetadata(coordinates=coordinates(valid=jnp.asarray(valid)))
 
     def loss(x, variables):
         out = module().apply(variables, x, attention_metadata=metadata)
@@ -219,7 +219,9 @@ def decode_steps(block_module, variables, hidden, valid, prefill: int):
     row_valid = None if valid is None else jnp.asarray(valid)
 
     def metadata(start, stop):
-        return None if row_valid is None else AttentionMetadata(valid=row_valid[:, start:stop])
+        if row_valid is None:
+            return None
+        return AttentionMetadata(coordinates=coordinates(valid=row_valid[:, start:stop]))
 
     _, allocated = block_module.apply(variables, x[:, :1], decode=True, mutable=["cache"])
     assert not bool(jnp.any(allocated["cache"]["cache_index"]))
@@ -296,7 +298,7 @@ def test_a_budget_the_pool_does_not_divide_is_refused():
 def selection_step(block, variables, cache, x, valid, phase):
     return jax.jit(lambda state, values, active: block.apply(
         {**variables, "cache": state}, values, decode=True,
-        attention_metadata=AttentionMetadata(valid=active),
+        attention_metadata=AttentionMetadata(coordinates=coordinates(valid=active)),
         prediction_phase=phase, mutable=["cache"]))(cache, x, valid)
 
 

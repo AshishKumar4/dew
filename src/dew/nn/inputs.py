@@ -264,13 +264,15 @@ class Coordinates:
     right_padded: bool = struct.field(pytree_node=False, default=False)
 
 
-def coordinates(batch: int, length: int, *, segments=None, valid=None, positions=None,
+def coordinates(shape: tuple[int, int] | None = None, *, segments=None, valid=None, positions=None,
                 max_segments: int | None = None, right_padded: bool = False) -> Coordinates:
     """The `Coordinates` of `[batch, length]` tokens from what the batch carries: packed `segments`
     (one document a row where None), a `valid` mask (every token real where None), explicit
     `positions` (each document's real tokens counted from 0 where None) and the packer's
-    `max_segments` (the row length where None)."""
-    shape = (batch, length)
+    `max_segments` (the row length where None). `shape` is the first given field's where None."""
+    given = [x for x in (segments, valid, positions) if x is not None]
+    shape = tuple(shape if shape is not None else jnp.shape(given[0]))[:2]
+    length = shape[1]
     if segments is not None:
         segments = jnp.asarray(segments, jnp.int32)
         valid = segments != 0 if valid is None else jnp.asarray(valid, bool) & (segments != 0)
@@ -295,7 +297,7 @@ def coordinates_of(metadata: AttentionMetadata | None, batch: int, length: int) 
     """The call's `Coordinates`: its metadata's, else those of whole rows of real tokens."""
     if metadata is not None and metadata.coordinates is not None:
         return metadata.coordinates
-    return coordinates(batch, length)
+    return coordinates((batch, length))
 
 
 def document_starts(segments, valid):
