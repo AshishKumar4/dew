@@ -212,7 +212,8 @@ def test_a_packed_row_computes_what_its_documents_compute_alone(kind):
     """Every mixer in the registry: a row packing two documents (segment ids, positions restarting)
     gives each document's logits and the parameters' gradients its documents give run one at a time,
     within the float64 gate, so no layer carries a conv history, a recurrent state or attention across
-    a document boundary. The float64 truth is the documents run alone in float64."""
+    a document boundary. The float64 truth is the documents run alone in float64, the fp32 runs at
+    IEEE products, as the rule's references take theirs."""
     fields, overrides = KIND_FIELDS.get(kind, ({}, {}))
     model = tiny(mixer=mixers.build(kind, **fields), max_seq_len=32, **overrides)
     tokens = jax.random.randint(jax.random.key(3), (1, sum(DOCUMENTS)), 0, VOCAB)
@@ -222,7 +223,8 @@ def test_a_packed_row_computes_what_its_documents_compute_alone(kind):
         with pytest.raises(ValueError, match=REFUSED[kind]):
             packed_and_alone(model, variables, tokens, cotangent)
         return
-    (packed, packed_grads), (alone, alone_grads) = packed_and_alone(model, variables, tokens, cotangent)
+    with jax.default_matmul_precision("highest"):
+        (packed, packed_grads), (alone, alone_grads) = packed_and_alone(model, variables, tokens, cotangent)
     with jax.enable_x64(new_val=True):
         wide = jax.tree.map(lambda x: jnp.asarray(np.asarray(x, np.float64)), variables)
         _, (truth, truth_grads) = packed_and_alone(model.clone(dtype=jnp.float64), wide, tokens,
