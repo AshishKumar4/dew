@@ -29,6 +29,7 @@ import torch
 from compressed_tensors.quantization import QuantizationArgs, QuantizationScheme, QuantizationStatus
 from compressed_tensors.quantization.lifecycle.forward import forward_quantize
 from compressed_tensors.quantization.utils.helpers import generate_gparam
+from compressed_tensors_mxfp4_reference import TIES
 from diffusers_wan_reference import float64
 from nvfp4_storage_reference import ARGS, compress
 from safetensors.torch import save_file
@@ -103,8 +104,7 @@ def checkpoint(e4m3: bool) -> None:
     probe[0] = 0
     probe[1] = -0.0
     probe[2, :16] = 1e-20
-    probe[3, :16] = torch.tensor([0, -0.0, 0.25, -0.25, 0.75, -0.75, 1.25, -1.25,
-                                  1.75, -1.75, 2.5, -2.5, 3.5, -3.5, 5, -5])
+    probe[3, :16] = torch.tensor([0, -0.0, *(value for tie in TIES for value in (tie, -tie))])
     module = model.model.layers[0].self_attn.q_proj
     with torch.no_grad():
         arrays["probe/inputs"] = probe.numpy()

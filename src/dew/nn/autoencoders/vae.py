@@ -18,17 +18,13 @@ import jax.numpy as jnp
 import numpy as np
 
 from dew.interop.weights import ParamTree, translate_parameters
-from dew.nn.attention import scaled_dot_product_attention
+from dew.nn.attention import GroupNorm, scaled_dot_product_attention
 from dew.nn.conv import Conv
 
 
 def _conv(features: int, dtype, name: str) -> Conv:
     """A 3x3 convolution padded to keep the size."""
     return Conv(features, (3, 3), strides=(1, 1), padding=((1, 1), (1, 1)), dtype=dtype, name=name)
-
-
-def _group_norm(groups: int, dtype, name: str) -> nn.GroupNorm:
-    return nn.GroupNorm(num_groups=groups, epsilon=1e-6, dtype=dtype, name=name)
 
 
 class FlaxUpsample2D(nn.Module):
@@ -73,9 +69,11 @@ class FlaxResnetBlock2D(nn.Module):
     @nn.compact
     def __call__(self, hidden_states):
         residual = hidden_states
-        hidden_states = nn.swish(_group_norm(self.groups, self.dtype, "norm1")(hidden_states))
+        hidden_states = GroupNorm(self.groups, activation=nn.swish, dtype=self.dtype,
+                                  name="norm1")(hidden_states)
         hidden_states = _conv(self.out_channels, self.dtype, "conv1")(hidden_states)
-        hidden_states = nn.swish(_group_norm(self.groups, self.dtype, "norm2")(hidden_states))
+        hidden_states = GroupNorm(self.groups, activation=nn.swish, dtype=self.dtype,
+                                  name="norm2")(hidden_states)
         hidden_states = _conv(self.out_channels, self.dtype, "conv2")(hidden_states)
         if self.in_channels != self.out_channels:
             residual = Conv(self.out_channels, kernel_size=(1, 1), strides=(1, 1), padding="VALID",
@@ -102,7 +100,7 @@ class FlaxAttentionBlock(nn.Module):
     def __call__(self, hidden_states):
         residual = hidden_states
         batch, height, width, channels = hidden_states.shape
-        hidden_states = _group_norm(self.num_groups, self.dtype, "group_norm")(hidden_states)
+        hidden_states = GroupNorm(self.num_groups, dtype=self.dtype, name="group_norm")(hidden_states)
         hidden_states = hidden_states.reshape((batch, height * width, channels))
         query, key, value = (nn.Dense(self.channels, dtype=self.dtype, name=name)(hidden_states)[:, :, None]
                              for name in ("query", "key", "value"))
@@ -178,7 +176,8 @@ class FlaxEncoder(nn.Module):
                             "down" if index != len(channels) - 1 else None, self.dtype,
                             name=f"down_blocks_{index}")(sample)
         sample = FlaxUNetMidBlock2D(channels[-1], self.norm_num_groups, self.dtype, name="mid_block")(sample)
-        sample = nn.swish(_group_norm(self.norm_num_groups, self.dtype, "conv_norm_out")(sample))
+        sample = GroupNorm(self.norm_num_groups, activation=nn.swish, dtype=self.dtype,
+                           name="conv_norm_out")(sample)
         return _conv(2 * self.out_channels, self.dtype, "conv_out")(sample)
 
 
@@ -204,7 +203,8 @@ class FlaxDecoder(nn.Module):
             sample = _Level(channels[max(index - 1, 0)], width, self.layers_per_block + 1,
                             self.norm_num_groups, "up" if index != len(channels) - 1 else None, self.dtype,
                             name=f"up_blocks_{index}")(sample)
-        sample = nn.swish(_group_norm(self.norm_num_groups, self.dtype, "conv_norm_out")(sample))
+        sample = GroupNorm(self.norm_num_groups, activation=nn.swish, dtype=self.dtype,
+                           name="conv_norm_out")(sample)
         return _conv(self.out_channels, self.dtype, "conv_out")(sample)
 
 

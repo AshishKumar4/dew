@@ -23,7 +23,7 @@ from dew.data import DataPartition, Loading
 from dew.inputs import unit_range
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.dit import SimpleDiT
-from dew.nn.sharding import DECLARED, logical_axes
+from dew.nn.sharding import DECLARED, LayoutRefused, logical_axes
 from dew.objectives.base import Aux, EMASpec, Objective
 from dew.training import Checkpoints, Layout, MeshSpec, Trainer
 from dew.training.distributed import DEFAULT_RULES, DevicePrefetchIterator, parameter_spec, shard_batch
@@ -234,6 +234,13 @@ def test_causal_transformer_axes_land_on_the_dimensions_they_name():
     assert embed["embed_tokens"]["embedding"] == P(None, "fsdp")
     assert embed["lm_head"]["kernel"] == P("fsdp")
 
+    # fsdp takes the leading width either rule names, and a name whose first
+    # rule keeps it whole stays whole.
+    both = declared_specs(variables, (("mlp", "fsdp"), ("embed", "fsdp")))["layers_0"]["mlp"]
+    assert both["gate_proj"]["kernel"] == P("fsdp")
+    whole = declared_specs(variables, (("embed", None), ("mlp", "fsdp"), ("embed", "fsdp")))
+    assert whole["layers_0"]["mlp"]["gate_proj"]["kernel"] == P(None, "fsdp")
+
 
 def test_dit_axes_land_on_the_dimensions_they_name():
     """The same for the DiT stack, whose attention kernels carry three axes."""
@@ -411,6 +418,37 @@ def test_a_restored_run_places_its_boxed_parameters_by_their_names(tmp_path):
     assert params["foreign"]["kernel"].sharding.spec == P("fsdp")
 
 
+class SevenWide(nn.Module):
+    @nn.compact
+    def __call__(self, x):
+        return nn.Dense(7, use_bias=False, name="readout", kernel_init=nn.with_logical_partitioning(
+            nn.initializers.lecun_normal(), (None, "vocab")))(x)
+
+
+class SevenWideReadout(BoxedReadout):
+    def init(self, key, variables=None):
+        return SevenWide().init(key, jnp.ones((1, 16)))
+
+    def loss(self, variables, batch, step):
+        features = batch["image"].reshape(batch["image"].shape[0], -1)[:, :16].astype(jnp.float32) / 255
+        return jnp.sum(SevenWide().apply(variables, features) ** 2), Aux({})
+
+
+@pytest.mark.mesh
+def test_the_trainer_checks_a_boxed_width_by_its_own_names():
+    """A module's boxed vocabulary that its rule puts on an expert-only mesh
+    is placed and checked by those names, though the state holds it
+    unboxed: eight wide it splits, seven wide it stays whole, which the
+    check refuses, where read as undeclared it would have counted as a
+    width the mesh splits nothing of."""
+    layout = Layout(min_shard=1, rules=(("vocab", "expert"),))
+    Trainer(BoxedReadout(), optax.adam(1e-3), key=jax.random.key(0), mesh=MeshSpec(expert=8),
+            layout=layout).place()
+    with pytest.raises(LayoutRefused):
+        Trainer(SevenWideReadout(), optax.adam(1e-3), key=jax.random.key(0), mesh=MeshSpec(expert=8),
+                layout=layout).place()
+
+
 def test_rule_override_changes_only_declared_axes():
     specs = declared_specs(dit_variables(), {"mlp": "fsdp"})
 
@@ -420,15 +458,17 @@ def test_rule_override_changes_only_declared_axes():
     assert specs["embed"]["patch_embed"]["Conv_0"]["kernel"] == P()
 
 
-def test_default_rules_keep_the_shape_heuristic_for_the_dit():
-    """The declared table reproduces the largest-divisible-axis choice on the
-    DiT's shapes, so declaring the model moved none of its leaves."""
+def test_default_rules_split_every_dit_leaf_the_shape_heuristic_splits():
+    """The declared table splits each of the DiT's leaves that the
+    largest-divisible-axis heuristic splits, so declaring the model left none
+    whole; a kernel's split may sit on another dimension, its leading one
+    (`DEFAULT_RULES`)."""
     variables = dit_variables()
     shardings = Layout(rules=DEFAULT_RULES, min_shard=1).shardings(
         MeshSpec(fsdp=2).build(), variables)
     expected = jax.tree.map(
-        lambda leaf: parameter_spec(leaf.shape, fsdp_size=2, min_shard_size=1), variables)
-    assert jax.tree.map(lambda sharding: sharding.spec, shardings) == expected
+        lambda leaf: bool(parameter_spec(leaf.shape, fsdp_size=2, min_shard_size=1)), variables)
+    assert jax.tree.map(lambda sharding: bool(sharding.spec), shardings) == expected
 
 
 def test_a_rule_onto_an_axis_of_size_one_shards_nothing():
@@ -712,7 +752,7 @@ def test_muon_masked_optimizer_state_shards_with_its_parameters():
     assert placeholders, "muon left no masked placeholder for the derivation to carry"
 
     kernel = state.variables["params"]["dit_block_0"]["mlp"]["layers_0"]["kernel"]
-    assert kernel.sharding.spec == P(None, "fsdp")
+    assert kernel.sharding.spec == P("fsdp")
     moment_specs = {leaf.sharding.spec for leaf in jax.tree.leaves(state.opt_state)}
     assert kernel.sharding.spec in moment_specs
 

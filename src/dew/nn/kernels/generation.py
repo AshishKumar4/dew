@@ -256,14 +256,33 @@ def bf16_dot_runs() -> bool:
     return not generation.startswith('sm') or int(generation[2:]) >= BF16_GPU
 
 
+def placed_platform() -> str:
+    """The platform of the devices the context places a call on: the set mesh's, else the default
+    device's (`jax.default_device`), else `jax.default_backend()`, 'gpu' for CUDA's and ROCm's. A
+    host-layout run builds and steps its CPU-owned state on a GPU host's CPU, and every choice keyed
+    on the platform follows it there."""
+    import jax
+    device = jax.sharding.get_abstract_mesh().abstract_device or jax.config.jax_default_device
+    if device is None:
+        return jax.default_backend()
+    platform = device if isinstance(device, str) else device.platform
+    return 'gpu' if platform in ('cuda', 'rocm') else platform
+
+
+def gpu_placed() -> bool:
+    """Whether a call runs on this process's own GPU: what a CUDA library call needs, which its trace
+    asks the installed plugin about, where `backend()` also takes an assumed GPU."""
+    import jax
+    return jax.default_backend() == 'gpu' and placed_platform() == 'gpu'
+
+
 def backend() -> str:
-    """The platform a call's code is chosen for: `jax.default_backend()`, or within `assumed` the
+    """The platform a call's code is chosen for: `placed_platform()`, or within `assumed` the
     assumed generation's, 'gpu' for an `smXY` and 'tpu' for a TPU's, so a choice keyed on the
     platform acts as on that device while a step traces for it on another."""
-    import jax
     generation = ASSUMED.get()
     if generation is None:
-        return jax.default_backend()
+        return placed_platform()
     if generation.startswith('sm'):
         return 'gpu'
     if generation in TARGETS and TARGETS[generation].device_kind.startswith('TPU '):

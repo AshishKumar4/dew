@@ -44,7 +44,7 @@ from .attention import (
     max_attention_logits,
     scaled_dot_product_attention,
 )
-from .inputs import AttentionMetadata, PredictionPhase
+from .inputs import AttentionMetadata, PredictionPhase, valid_order
 from .kv_cache import KVCache
 from .mixer_base import MixerBase, MixerContext
 from .mla import INDEXER, open_mla_cache
@@ -53,10 +53,16 @@ from .sharding import RESIDUAL, constrain, down_projection
 from .sparse_selection import selection_mask
 
 
-def _first_valid(valid, total: int):
-    """Each row's first valid slot, or `total` on a row without one
-    (modeling_glm5_next.py:940-944)."""
-    return jnp.where(jnp.any(valid, axis=-1), jnp.argmax(valid.astype(jnp.int32), axis=-1), total)
+def _real_slots(valid, count: int):
+    """The physical slot of each row's first `count` real tokens in order, the
+    order the cache compacts them in (`valid_order`), -1 past a row's real
+    tokens. A left-padded row's are its first valid slot onward
+    (modeling_glm5_next.py:940-944); a row with a hole skips it, as its
+    cached prefill does."""
+    order, real = valid_order(valid)
+    compact = jnp.arange(count)
+    slots = order[:, jnp.minimum(compact, valid.shape[-1] - 1)]
+    return jnp.where(compact[None] < real[:, None], slots, -1)
 
 
 # wq_b, wk, k_norm and weights_proj carry the V3.2 indexer's declarations
@@ -127,17 +133,15 @@ class KPoolIndexer(nn.Module):
         valid = valid[..., 0] > 0
         batch, total = valid.shape
         pools = -(-total // self.kpool)
-        first = _first_valid(valid, total)
-        indices = first[:, None, None] + jnp.arange(pools * self.kpool).reshape(1, pools, self.kpool)
-        safe = jnp.clip(indices, 0, total - 1).reshape(batch, pools * self.kpool)
+        indices = _real_slots(valid, pools * self.kpool)
+        safe = jnp.maximum(indices, 0)
         grouped_keys = jnp.take_along_axis(keys, safe[..., None], axis=1).reshape(
             batch, pools, self.kpool, self.head_dim)
         grouped_gate = jnp.take_along_axis(gate_scores, safe[..., None], axis=1).reshape(
             batch, pools, self.kpool, self.head_dim)
-        grouped_valid = jnp.take_along_axis(valid, safe, axis=1).reshape(batch, pools, self.kpool)
-        grouped_valid = jnp.logical_and(grouped_valid, indices < total)
+        indices = indices.reshape(batch, pools, self.kpool)
+        grouped_valid = indices >= 0
         pool_valid = jnp.all(grouped_valid, axis=-1)
-        indices = jnp.where(grouped_valid, indices, -1)
         wide = at_least_fp32(grouped_gate.dtype)
         logits = grouped_gate.astype(wide) + self.index_kpool_compress_ape.astype(wide)
         logits = jnp.where(grouped_valid[..., None], logits, -jnp.inf)
@@ -149,17 +153,20 @@ class KPoolIndexer(nn.Module):
     def _tail(self, visible, valid):
         """Each query's incomplete pool as token indices, `[B, S, kpool - 1]`,
         -1 where there is none (`append_visible_tail`,
-        modeling_glm5_next.py:974-1024): the `visible_count % kpool` tokens
-        after the last complete pool the query sees."""
-        _, _, total = visible.shape
-        first = _first_valid(valid, total)
+        modeling_glm5_next.py:974-1024): the `visible_count % kpool` real
+        tokens after the last complete pool the query sees, in the pools'
+        order (`_real_slots`)."""
+        batch, queries, total = visible.shape
+        slots = _real_slots(valid, total)
         visible_count = jnp.sum(visible, axis=-1, dtype=jnp.int32)
         tail_count = visible_count % self.kpool
         offsets = jnp.arange(self.kpool - 1)
-        tail = (first[:, None] + visible_count - tail_count)[..., None] + offsets
-        allowed = jnp.logical_and(offsets < tail_count[..., None], tail < total)
-        tail_visible = jnp.take_along_axis(visible, jnp.clip(tail, 0, total - 1), axis=-1)
-        return jnp.where(jnp.logical_and(allowed, tail_visible), tail, -1)
+        compact = (visible_count - tail_count)[..., None] + offsets
+        tail = jnp.take_along_axis(jnp.broadcast_to(slots[:, None], (batch, queries, total)),
+                                   jnp.minimum(compact, total - 1), axis=-1)
+        allowed = jnp.logical_and(offsets < tail_count[..., None], compact < total)
+        tail_visible = jnp.take_along_axis(visible, jnp.maximum(tail, 0), axis=-1)
+        return jnp.where(allowed & (tail >= 0) & tail_visible, tail, -1)
 
     def select_indices(self, x, q_resid, packed, visible):
         """Complete selected token indices `[B, S, N]`, -1 for an empty slot.
@@ -409,7 +416,9 @@ class KPoolSparseAttentionMixer(MixerBase):
             raise ValueError(
                 "kpool_sparse_attention requires causal=True; its indexer selects among "
                 "the keys at or before each query")
-        unsupported = {
+        ctx.refuse("kpool_sparse_attention", {
+            **ctx.policies(),
+            "force_fp32_for_softmax": False,  # forwarded
             "v_norm": ctx.v_norm,
             "k_eq_v": ctx.k_eq_v,
             "sliding_window": ctx.sliding_window,
@@ -419,13 +428,8 @@ class KPoolSparseAttentionMixer(MixerBase):
             "kv_shared": ctx.kv_shared,
             "output_gate": ctx.output_gate,
             "kv_cache": ctx.kv_cache != KVCache(),
-        }
-        asked = sorted(name for name, value in unsupported.items() if value)
-        if asked:
-            raise ValueError(
-                f"the kpool_sparse_attention mixer has no {', '.join(asked)}: the layer "
-                "scales by its nope head dim, rotates nothing, attends its own selection "
-                "of the whole sequence and norms its latents, not its values")
+        }, "the layer scales by its nope head dim, rotates nothing, attends its own selection of the "
+           "whole sequence and norms its latents, not its values")
         return functools.partial(
             KPoolSparseAttention,
             emb_features=ctx.emb_features,
