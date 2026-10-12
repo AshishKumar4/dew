@@ -19,17 +19,24 @@ one pass. Each program keeps its weight-gradient sums in a register tile,
 elementwise, and XLA sums the programs' compensated pairs.
 
 Device time per call at Qwen3.5-0.8B's shapes (4 x 3072 rows of 1024, bf16; the gated
-norm over 16 heads of 128) against XLA's fusions of the same math, and the
-torch bar, each in one session: forward / forward and reverse, in us.
+norm over 16 heads of 128, its bar fla 0.5.2's FusedRMSNormGated in the Liger
+column) against XLA's fusions of the same math, and the torch bar (torch
+2.11/2.14, Liger 0.8.4), each in one session: the forward, then its reverse
+after "/" with the forward recomputed or after ";" alone, in us.
 
-    A100-SXM4-40GB          XLA            fused          Inductor       Liger
+    A100-SXM4-40GB          XLA            fused          Inductor       Liger (fla)
     seam (add + norm)       103 / 200      76 / 187       76 / 179       76 / 299
-    gated norm (fwd; bwd)   123 ; 343      118 ; 224      -              -
-    SwiGLU (fwd; bwd)       235 ; 361      193 ; 320      196 ; 319      195 ; 324
+    gated norm              123 ; 343      118 ; 224      116 ; 218      114 ; 198
+    SwiGLU                  235 ; 361      193 ; 320      196 ; 319      195 ; 324
     H100 80GB HBM3 (SXM)
     seam (add + norm)       44 / 89        36 / 81        36 / 88        35 / 163
-    gated norm (fwd; bwd)   59 ; 149       52 ; 101       -              -
-    SwiGLU (fwd; bwd)       113 ; 171      87 ; 147       88 ; 146       88 ; 147
+    gated norm              59 ; 149       52 ; 101       53 ; 105       51 ; 96
+    SwiGLU                  113 ; 171      87 ; 147       88 ; 146       88 ; 147
+
+In Qwen3.5-0.8B's profiled step the norms took 19.0 ms on the A100 and 18.6 ms on the
+H100 SXM under XLA and 15.4 and 13.7 fused; SwiGLU 12.7 and 16.0 against
+12.4 and 13.6. The gated norm's reverse is the one behind its bar (fla's,
+by 12% on the A100 and 5% on the H100).
 
 Dew's portable rounded_to also rounds cotangents. These fused VJPs instead
 use Liger's numerical contract: fp32 intermediate gradients and one cast at
