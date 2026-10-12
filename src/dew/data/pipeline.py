@@ -329,8 +329,8 @@ class Dataset:
         """This dataset with `stages` after its own."""
         return Pipeline(self, stages)
 
-    def holdout(self, fraction: float | None = None, *, records: int | None = None, split: str | None = None,
-                **named: float) -> tuple[Dataset, ...]:
+    def holdout(self, fraction: float | None = None, *, key: str | None = None, records: int | None = None,
+                split: str | None = None, **named: float) -> tuple[Dataset, ...]:
         """This dataset split into the records a run trains on and the ones it
         scores, with the steps it has replayed on each, so hold out before
         preparing.
@@ -338,12 +338,15 @@ class Dataset:
         `holdout(0.01)` returns (train, held), and `holdout(val=0.0005,
         test=0.0005)` the remainder and one dataset per name, in order: a
         record goes to the part its identity hashes into, the same in every
-        run, on every machine and after every resume. `records=n` holds out the
-        first n records, and `split="validation"` the store's own split.
+        run, on every machine and after every resume. `key` names the field
+        that identifies a document (an id or a url), so its versions and
+        chunks land together; without one, a record's identity is its whole
+        content. `records=n` holds out the first n records, and
+        `split="validation"` the store's own split.
         """
         from dew.data.holdout import holdout
 
-        return holdout(self, fraction, records=records, split=split, **named)
+        return holdout(self, fraction, key=key, records=records, split=split, **named)
 
     def named(self, name: str) -> Pipeline:
         """This dataset under `name`, which its counts log under in a mix."""
@@ -502,10 +505,6 @@ class Dataset:
     def map_batch(self, *steps: HostStep, identity: str | None = None) -> Pipeline:
         return self.then(*(MapBatch(step, identity) for step in steps))
 
-    def unbatch(self) -> Pipeline:
-        """Each row of each batch record as a record of its own."""
-        return self.then(FlatMap(_Unbatched()))
-
     def publish(self, url: str):
         """Run this dataset's deterministic steps once over every record and
         commit the result at `url` as a versioned generation, which `cache`
@@ -599,13 +598,6 @@ class _Selected:
         return {name: record[name] for name in self.fields}
 
 
-@dataclasses.dataclass(frozen=True)
-class _Unbatched:
-    def flat_map(self, batch: Batch) -> list[Batch]:
-        rows = len(next(iter(batch.values())))
-        return [{name: value[row] for name, value in batch.items()} for row in range(rows)]
-
-
 def concat(datasets: Sequence[Dataset]) -> Pipeline:
     """The records of `datasets`, stores read one after another, as one dataset."""
     from dew.data.sources.concatenate import Concatenate
@@ -657,16 +649,8 @@ def _named_step(step: object) -> str:
 
 
 def _declares_rejects(step: object) -> bool:
-    """Whether `step` says it drops records: a `rejects` flag, or a return annotation naming `Rejected`."""
-    if isinstance(step, Rejecting):
-        return bool(step.rejects)
-    method = (step.map if isinstance(step, pygrain.MapTransform) else
-              step.random_map if isinstance(step, pygrain.RandomMapTransform) else step)
-    try:
-        returned = inspect.signature(method).return_annotation
-    except (TypeError, ValueError):
-        return False
-    return returned is not inspect.Signature.empty and "Rejected" in str(returned)
+    """Whether `step` says it drops records, with a `rejects` flag (`images.fetch`, `images.decode`)."""
+    return isinstance(step, Rejecting) and bool(step.rejects)
 
 
 def _rejects(step: RecordStep | RandomStep | Callable[[int, Batch], Batch | Rejected]) -> bool:

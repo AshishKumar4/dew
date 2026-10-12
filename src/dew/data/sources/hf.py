@@ -103,6 +103,13 @@ class _StreamedIterator(grain.DatasetIterator):
 
 
 def from_hf(dataset: object, name: str | None = None) -> HF:
-    """A Hugging Face `datasets.Dataset` or `IterableDataset`, its `.map()`s
-    already applied, as a Dew dataset (`HF`)."""
+    """A Hugging Face `datasets.Dataset` or `IterableDataset` as a Dew
+    dataset (`HF`). An `IterableDataset` resumes exactly from its own
+    `state_dict` only unshuffled, since its shuffle buffer is not part of that
+    state; shuffle it with the chain's `shuffle(window=)` instead."""
+    from datasets import IterableDataset
+
+    if isinstance(dataset, IterableDataset) and getattr(dataset, "_shuffling", None) is not None:
+        raise ValueError("an IterableDataset's own shuffle loses its buffer on resume; pass it unshuffled "
+                         "and shuffle with the chain's shuffle(window=)")
     return HF(dataset, name)

@@ -69,10 +69,13 @@ class _SliceRecords:
         raise ValueError("a records= holdout reads by index; hold out fractions of a stream")
 
 
-def _inside(row: Batch | bytes, low: float, high: float) -> bool:
-    """Whether `row`'s identity, the hash of its content, falls in [`low`, `high`) of the unit
-    interval: the same wherever and however the row is read, and one part for equal rows."""
-    hashed = int.from_bytes(hashlib.sha256(encode(row)).digest()[:8], "big")
+def _inside(row: Batch | bytes, low: float, high: float, key: str | None) -> bool:
+    """Whether `row`'s identity falls in [`low`, `high`) of the unit interval: the hash of its
+    `key` field, or of its whole content, the same wherever and however the row is read."""
+    if key is not None and not (isinstance(row, Mapping) and key in row):
+        raise ValueError(f"a holdout by {key!r} reads that field, which this record lacks")
+    identity = encode(row if key is None else row[key])
+    hashed = int.from_bytes(hashlib.sha256(identity).digest()[:8], "big")
     return int(low * 2**64) <= hashed < int(high * 2**64)
 
 
@@ -81,9 +84,10 @@ class _HashRows:
     low: float
     high: float
     held: bool
+    key: str | None = None
 
     def __call__(self, row: Batch) -> Batch | Rejected:
-        return row if _inside(row, self.low, self.high) == self.held else Rejected("holdout")
+        return row if _inside(row, self.low, self.high, self.key) == self.held else Rejected("holdout")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -96,23 +100,27 @@ class _SelectedRow:
 
 @dataclasses.dataclass(frozen=True)
 class _HashSource:
-    """The rows of `source` whose content hashes into [`low`, `high`) of the
-    unit interval (`held`), or the rows that do not: a row is in exactly one
-    part, the same in every run, read, machine and resume."""
+    """The rows of `source` whose identity (its `key` field, or its content)
+    hashes into [`low`, `high`) of the unit interval (`held`), or the rows
+    that do not: a row is in exactly one part, the same in every run, read,
+    machine and resume."""
 
     source: Source
     low: float
     high: float
     held: bool
+    key: str | None = None
 
     def consumed(self, read: Read) -> _HashSource:
         return dataclasses.replace(self, source=_consumed(self.source, read))
 
     def describe(self) -> str:
-        return f"{self.source.describe()} hash holdout=[{self.low},{self.high}),held={self.held}"
+        part = f"[{self.low},{self.high}),held={self.held},key={self.key}"
+        return f"{self.source.describe()} hash holdout={part}"
 
     def snapshot(self) -> Mapping[str, object]:
-        return {**self.source.snapshot(), "holdout": [self.low, self.high], "held": self.held}
+        return {**self.source.snapshot(), "holdout": [self.low, self.high], "held": self.held,
+                "key": self.key}
 
     def supports(self, read: Read) -> bool:
         return read != "indexed" and self.source.supports(read)
@@ -122,7 +130,7 @@ class _HashSource:
 
         rows = self.source.records(read)
         keys = tuple(index for index in range(len(rows))
-                     if _inside(rows[index], self.low, self.high) == self.held)
+                     if _inside(rows[index], self.low, self.high, self.key) == self.held)
         return grain.MapDataset.source(keys).map(_SelectedRow(rows))
 
     def metadata(self) -> Mapping[str, object]:
@@ -138,7 +146,7 @@ class _HashSource:
     def _reader(self, manifest: ShardManifest, shard: Shard):
         from dew.data.mixing import Accepted
 
-        rows = manifest.reader(shard).map(_HashRows(self.low, self.high, self.held))
+        rows = manifest.reader(shard).map(_HashRows(self.low, self.high, self.held, self.key))
         return Accepted(rows, self.describe())
 
 
@@ -154,8 +162,8 @@ def _rebased(dataset: Dataset, store: Callable[[Source], Source]) -> Pipeline:
     return dataclasses.replace(chain, source=source)
 
 
-def holdout(dataset: Dataset, fraction: float | None = None, *, records: int | None = None,
-            split: str | None = None, **named: float) -> tuple[Pipeline, ...]:
+def holdout(dataset: Dataset, fraction: float | None = None, *, key: str | None = None,
+            records: int | None = None, split: str | None = None, **named: float) -> tuple[Pipeline, ...]:
     """`Dataset.holdout`."""
     if sum(form is not None for form in (fraction, records, split)) + bool(named) != 1:
         raise ValueError("holdout takes one of a fraction, records=, split= or named fractions")
@@ -171,7 +179,7 @@ def holdout(dataset: Dataset, fraction: float | None = None, *, records: int | N
     if any(not 0 < share < 1 for share in shares) or sum(shares) >= 1:
         raise ValueError(f"held-out fractions are each in (0, 1) and sum under 1, not {shares}")
     bounds = np.concatenate([[0.0], np.cumsum(shares)]).tolist()
-    trained = _rebased(dataset, lambda source: _HashSource(source, 0.0, bounds[-1], held=False))
-    held = (functools.partial(_HashSource, low=low, high=high, held=True)
+    trained = _rebased(dataset, lambda source: _HashSource(source, 0.0, bounds[-1], held=False, key=key))
+    held = (functools.partial(_HashSource, low=low, high=high, held=True, key=key)
             for low, high in itertools.pairwise(bounds))
     return (trained, *(_rebased(dataset, part) for part in held))
