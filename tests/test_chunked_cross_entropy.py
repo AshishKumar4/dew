@@ -31,6 +31,7 @@ from reference_error import equations
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.precision import rounded_operand, rounded_to
+from dew.nn.protocols import OutputTable
 from dew.objectives.lm import chunked
 from dew.objectives.lm.chunked import chunked_cross_entropy, vocabulary_chunks
 
@@ -53,8 +54,7 @@ def test_vocabulary_bias_is_fp32_after_tied_or_untied_head_products(dtype, tied)
         logits = model.apply(variables, ids)
         states = model.apply(variables, ids, method='hidden_states')
         table = model.apply(variables, method='output_table')
-        actual = chunked.head_logits(states, table.matrix, softcap=None, precision=None,
-                                     vocab_major=table.vocab_major, bias=bias)
+        actual = OutputTable(table.matrix, table.vocab_major, bias).logits(states)
         np.testing.assert_array_equal(actual, logits)
         for tile in (None, (2, 11)):
             losses, predicted, _ = chunked_cross_entropy(states, table.matrix, ids, 4, tile=tile,
@@ -64,6 +64,27 @@ def test_vocabulary_bias_is_fp32_after_tied_or_untied_head_products(dtype, tied)
             np.testing.assert_array_equal(predicted, logits.argmax(-1))
     assert variables['params']['head_bias'].dtype == jnp.float32
     assert not np.array_equal(np.asarray(bias), np.asarray(bias.astype(jnp.bfloat16), np.float32))
+
+
+@pytest.mark.parametrize('tied', [False, True])
+def test_a_bf16_models_table_scores_states_handed_over_in_fp32_as_its_head_does(tied):
+    """A table carries its model's compute dtype, so states that reach a
+    scorer widened to fp32 (a fallback's or a tool's) multiply the head as the
+    model's own bf16 head multiplies them: bitwise its logits."""
+    model = CausalTransformer(vocab_size=97, emb_features=24, num_layers=1, num_heads=3,
+                              mlp_features=32, max_seq_len=8, tie_embeddings=tied, dtype=jnp.bfloat16,
+                              qk_norm=False, attention_impl='reference')
+    ids = jnp.asarray([[2, 7, 3], [11, 4, 9]], jnp.int32)
+    variables = model.init(jax.random.key(0), ids)
+    with jax.default_matmul_precision('default'):
+        logits = model.apply(variables, ids)
+        states = model.apply(variables, ids, method='hidden_states')
+        table = model.apply(variables, method='output_table')
+        widened = states.astype(jnp.float32) + jnp.float32(2.0 ** -12)
+        rounded = OutputTable(table.matrix, table.vocab_major, compute=jnp.bfloat16).logits(widened)
+        np.testing.assert_array_equal(rounded, OutputTable(table.matrix, table.vocab_major).logits(
+            widened.astype(jnp.bfloat16)))
+        np.testing.assert_array_equal(OutputTable(table.matrix, table.vocab_major).logits(states), logits)
 
 
 @pytest.mark.parametrize('dtype', [jnp.float32, jnp.bfloat16])
@@ -77,7 +98,7 @@ def test_vocabulary_bias_gradient_matches_full_logits_under_the_float64_rule(dty
     bias = jax.random.normal(jax.random.key(3), (37,), jnp.float32) / 17
     with jax.default_matmul_precision('default'):
         def full(offset):
-            logits = chunked.head_logits(states, matrix, softcap=None, precision=None, bias=offset)
+            logits = OutputTable(matrix, vocab_major=False, bias=offset).logits(states)
             return optax.softmax_cross_entropy_with_integer_labels(logits, targets).mean()
 
         def bounded(offset):
@@ -467,7 +488,7 @@ RAGGED_VOCAB, RAGGED_TOKENS = 2053, 131
 
 def oracle(hidden, head, targets, softcap=None, precision=None):
     """The full-vocabulary losses and log partitions, one big logits tensor."""
-    logits = chunked.head_logits(hidden, head, softcap=softcap, precision=precision)
+    logits = OutputTable(head, vocab_major=False, softcap=softcap, precision=precision).logits(hidden)
     log_z = jax.nn.logsumexp(logits, axis=-1)
     picked = jnp.take_along_axis(logits, targets[..., None], axis=-1)[..., 0]
     return log_z - picked, log_z
@@ -554,7 +575,7 @@ def test_an_excluded_column_takes_no_mass_in_the_loss_the_prediction_or_the_grad
     head = head.at[:, excluded].set(jnp.abs(head).max(axis=1) * 4)
 
     def full(states, matrix):
-        logits = chunked.head_logits(states, matrix, softcap=None, precision=precision)
+        logits = OutputTable(matrix, vocab_major=False, precision=precision).logits(states)
         logits = logits.at[..., excluded].set(-jnp.inf)
         log_z = jax.nn.logsumexp(logits, axis=-1)
         losses = log_z - jnp.take_along_axis(logits, targets[..., None], axis=-1)[..., 0]

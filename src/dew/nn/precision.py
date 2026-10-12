@@ -213,8 +213,22 @@ def head_dot_general(dtype: Dtype | None, precision: PrecisionLike = None):
     return dot_general
 
 
+def biased_logits(logits: jax.Array, bias: jax.Array | None) -> jax.Array:
+    """The vocabulary bias after the product's rounding, in fp32 or wider."""
+    return logits if bias is None else logits + jnp.asarray(bias, logits.dtype)
+
+
+def capped_logits(logits: jax.Array, softcap, temperature: float = 1.0) -> jax.Array:
+    """Softcapped logits over a sampling temperature, which an engine applies
+    to what the model's head returns."""
+    if softcap is not None:
+        cap = jnp.asarray(softcap, logits.dtype)
+        logits = cap * jnp.tanh(logits / cap)
+    return logits / temperature
+
+
 def head_product(subscripts: str, hidden: jax.Array, head: jax.Array,
-                 precision: PrecisionLike = None) -> jax.Array:
+                 precision: PrecisionLike = None, *, compute: DTypeLike | None = None) -> jax.Array:
     """`jnp.einsum(subscripts, hidden, head)` as a vocabulary head computes
     it, with accumulation and a result at least fp32.
 
@@ -227,9 +241,11 @@ def head_product(subscripts: str, hidden: jax.Array, head: jax.Array,
     below seed noise) and saves 13% of a 3-layer decoder's step. It does move
     layout parity (a 4 x RTX 3090 bf16 MoE read 5758 of its bound against 0.41
     in fp32), so a run comparing layouts or resuming onto another mesh sets
-    `matmul_precision` "highest", whose head is fp32."""
-    if rounds_to_bf16(hidden.dtype, precision):
-        logits = jnp.einsum(subscripts, hidden.astype(jnp.float32), _algorithm_operand(head),
+    `matmul_precision` "highest", whose head is fp32. `compute`, the model's
+    compute dtype where the states arrive in another, decides in their place."""
+    if rounds_to_bf16(hidden.dtype if compute is None else compute, precision):
+        states = _algorithm_operand(hidden.astype(jnp.float32))
+        logits = jnp.einsum(subscripts, states, _algorithm_operand(head),
                             precision=jax.lax.DotAlgorithmPreset.BF16_BF16_F32,
                             preferred_element_type=jnp.float32)
         return bf16_logits(logits)
