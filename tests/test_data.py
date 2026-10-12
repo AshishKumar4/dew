@@ -36,7 +36,7 @@ from dew.data.dataset import (
     describe,
 )
 from dew.data.image_codec import decode_image
-from dew.data.pipeline import Pipeline
+from dew.data.pipeline import MapBatch, Pipeline
 from dew.data.plan import Manifest, Plan
 from dew.data.sinks import export
 from dew.data.sources import Torch, av_utils, source as stored_source
@@ -851,9 +851,9 @@ class Augmenting:
         training = Pipeline(Memory(train)).random_map(self.transform())
         if self.augmentation_backend == "device":
             mode = self.augment
-            training = training.map_batches(DeviceAugment(self.image_size,
+            training = training.then(MapBatch(DeviceAugment(self.image_size,
                 self.crop_scale if mode else (1.0, 1.0),
-                False if mode is None else mode.flip, False if mode is None else mode.jitter))
+                False if mode is None else mode.flip, False if mode is None else mode.jitter)))
         validation = (None if held is None else
                       Pipeline(Memory(held)).random_map(self.transform(training=False)))
         return training, validation, (EncodeCaptions(),)

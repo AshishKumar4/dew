@@ -104,18 +104,22 @@ def test_dropped_records_are_the_same_whole_sharded_and_resumed():
     assert b'"third"' in state
 
 
-def tokenized_in_batches(rows: list[dict]) -> list[dict]:
+def tokenized_in_batches(columns: dict[str, list]) -> dict[str, list]:
     """A preprocessing batch: one call for several records, as a batched tokenizer runs, which
     keeps the even ones."""
-    doubled = 2 * np.asarray([row["i"] for row in rows])
-    return [{"i": row["i"], "doubled": twice} for row, twice in zip(rows, doubled,
-                                                                    strict=True) if row["i"] % 2 == 0]
+    kept = [i for i in columns["i"] if i % 2 == 0]
+    return {"i": kept, "doubled": [2 * i for i in kept]}
 
 
-def test_map_batches_runs_on_groups_and_the_chain_goes_on_by_record_through_a_resume():
+def test_a_batched_step_runs_on_groups_and_the_chain_goes_on_by_record_through_a_resume():
     """A step over groups of five records, which returns fewer, then the training batch: each kept
-    record once, the batched work done, and a resumed reader continues exactly."""
-    chain = Memory(rows("a", 30)).shuffle(4).repeat().map_batches(tokenized_in_batches, size=5).batch(5)
+    record once, the batched work done, and a resumed reader continues exactly. A batched map must
+    keep its row count."""
+    with pytest.raises(ValueError, match="keeps the 5 rows"):
+        next(compile(Memory(rows("a", 10)).map(tokenized_in_batches, batched=True, batch_size=5).batch(2),
+                     read="memory", loading=READ).train(DataPartition()))
+    chain = (Memory(rows("a", 30)).shuffle(4).repeat()
+             .flat_map(tokenized_in_batches, batched=True, batch_size=5).batch(5))
     data = compile(chain, read="indexed", loading=READ)
     reader = data.train(DataPartition())
     try:
@@ -142,7 +146,7 @@ def test_stats_counts_a_fresh_pass_and_mix_weighs_tokens():
     short = Memory([{"text": np.arange(3, dtype=np.int32), "origin": "short"} for _ in range(64)])
     long = Memory([{"text": np.arange(9, dtype=np.int32), "origin": "long"} for _ in range(64)])
     mixed = mix([short.shuffle(0).repeat(), long.shuffle(1).repeat()], by="tokens")
-    data = compile(mixed.keep("origin").batch(8), read="indexed", loading=READ)
+    data = compile(mixed.select_columns("origin").batch(8), read="indexed", loading=READ)
     reader = data.train(DataPartition())
     try:
         origins = np.concatenate([next(reader)["origin"] for _ in range(40)])

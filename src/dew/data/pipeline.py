@@ -121,13 +121,20 @@ class Bound:
 
 @dataclasses.dataclass(frozen=True)
 class Batched:
-    """A function of `size` records at a time, which returns any number of
-    records, as Hugging Face's `map(batched=True)`; the last group of a
-    finite pass may be smaller."""
+    """A function of `size` records at a time, read as a dict of columns, each
+    a list, as Hugging Face's `map(batched=True)`: with `same_rows`, its
+    columns of as many rows join the records' own; otherwise they are the
+    records that replace the group. The last group of a finite pass may be
+    smaller."""
 
-    step: Callable[[list[Batch]], Sequence[Batch]]
+    step: Callable[[dict[str, list]], dict[str, Sequence]]
     size: int
     identity: str | None = None
+    same_rows: bool = True
+
+    def __post_init__(self) -> None:
+        if self.size < 1:
+            raise ValueError(f"a batched step reads at least one record at a time, not {self.size}")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -380,9 +387,22 @@ class Dataset:
         """`stages(self, *args, **kwargs)`: a dataset-level stage, such as `text.pack`."""
         return stages(self, *args, **kwargs)
 
-    def map(self, *steps: RecordStep | Configured, identity: str | None = None) -> Pipeline:
+    def map(self, *steps: RecordStep | Configured | HostStep, batched: bool = False, batch_size: int = 1000,
+            identity: str | None = None) -> Pipeline:
         """One record to one: each step returns its record's replacement. A
-        step that drops records (returns `Rejected`) goes through `filter_map`."""
+        step that drops records (returns `Rejected`) goes through `filter_map`.
+
+        With `batched`, a step reads `batch_size` records at a time as a dict
+        of columns, each a list, and returns columns of as many rows, which
+        replace or join the record's own (Hugging Face's `map(batched=True)`).
+        After `batch`, a step reads each training batch on the host.
+        """
+        if self.batched:
+            if batched:
+                raise ValueError("after batch, map already reads the training batch")
+            return self.then(*(MapBatch(step, identity) for step in steps))
+        if batched:
+            return self.then(*(Batched(step, batch_size, identity) for step in steps))
         for step in steps:
             if isinstance(step, pygrain.RandomMapTransform):
                 raise TypeError(f"{_named_step(step)} draws from a generator; apply it with random_map")
@@ -396,24 +416,19 @@ class Dataset:
         every read and resume."""
         for step in steps:
             if _declares_rejects(step):
-                raise TypeError(f"{_named_step(step)} drops records; apply it with random_filter_map")
+                raise TypeError(f"{_named_step(step)} drops records; apply it with filter_map")
         return self.then(*(RandomMap(step, identity) for step in steps))
 
-    def filter_map(self, *steps: RecordStep, identity: str | None = None) -> Pipeline:
+    def filter_map(self, *steps: RecordStep | pygrain.RandomMapTransform,
+                   identity: str | None = None) -> Pipeline:
         """One record to none or one: each step returns its record's
         replacement or `Rejected(reason)`, which drops it, counted by reason
         in the reader's checkpointed counts, as `images.fetch` and
-        `images.decode` do."""
-        for step in steps:
-            if isinstance(step, pygrain.RandomMapTransform):
-                raise TypeError(f"{_named_step(step)} draws from a generator; use random_filter_map")
-        return self.then(*(Map(step, identity, rejects=True) for step in steps))
-
-    def random_filter_map(self, *steps: RandomStep, identity: str | None = None) -> Pipeline:
-        """`filter_map` for steps that draw from the record's generator
-        (`fn(record, rng)` or a `grain.RandomMapTransform`), as
-        `video.decode_clip` picks a random start and drops a clip that fails."""
-        return self.then(*(RandomMap(step, identity, rejects=True) for step in steps))
+        `images.decode` do. A `grain.RandomMapTransform` draws from the
+        record's generator."""
+        return self.then(*(RandomMap(step, identity, rejects=True) if isinstance(step,
+                                                                                 pygrain.RandomMapTransform)
+                           else Map(step, identity, rejects=True) for step in steps))
 
     def map_with_index(
         self, step: Callable[[int, Batch], Batch | Rejected], *, identity: str | None = None
@@ -438,8 +453,21 @@ class Dataset:
         `reason`, by default the predicate's own (`images.min_side`'s "too_small")."""
         return self.then(Filter(predicate, reason or getattr(predicate, "reason", "filtered"), identity))
 
-    def flat_map(self, step: Expansion, *, identity: str | None = None) -> Pipeline:
+    def flat_map(self, step: Expansion | Callable[[dict[str, list]], dict[str, list]], *,
+                 batched: bool = False,
+                 batch_size: int = 1000, identity: str | None = None) -> Pipeline:
+        """One record to any number: the step returns a record's records. With
+        `batched`, it reads `batch_size` records at a time as a dict of columns
+        and returns columns of any length, the records that replace them."""
+        if batched:
+            return self.then(Batched(step, batch_size, identity, same_rows=False))
         return self.then(FlatMap(step, identity))
+
+    @property
+    def batched(self) -> bool:
+        """Whether this chain has made its training batch, after which `map` reads batches."""
+        return isinstance(self, Pipeline) and any(isinstance(stage, (BatchStage, TokenBudget))
+                                                  for stage in self.stages)
 
     def shuffle(
         self, seed: int = 0, *, window: int | None = None, block_shards: int | None = None
@@ -529,19 +557,6 @@ class Dataset:
     def group(self, length: Callable[[Batch], int], *, window: int = 64) -> Pipeline:
         return self.then(Group(LengthGroups(length, window)))
 
-    def map_batches(self, step: HostStep | Callable[[list[Batch]], Sequence[Batch]], *,
-                    size: int | None = None, identity: str | None = None) -> Pipeline:
-        """With `size`, `step` reads a list of `size` records and returns a list
-        of records, any number, as Hugging Face's `map(batched=True)` (a batched
-        tokenizer, a filter that looks at neighbours), and the chain goes on
-        record by record: `pack`, `mix` and `batch` still follow. Without
-        `size`, after `batch`, `step` runs on each training batch on the host."""
-        if size is None:
-            return self.then(MapBatch(step, identity))
-        if size < 1:
-            raise ValueError(f"map_batches reads groups of at least one record, not {size}")
-        return self.then(Batched(step, size, identity))
-
     def snapshot(self, url: str, *, format: Literal["array_record", "parquet"] = "array_record",
                  rows_per_shard: int = 100_000) -> Mapping[str, object]:
         """Run this dataset once over every record and seal what it makes at
@@ -553,15 +568,20 @@ class Dataset:
         chain = self if isinstance(self, Pipeline) else Pipeline(self)
         return export(chain, url, format=format, rows_per_shard=rows_per_shard)
 
-    def rename(self, **names: str) -> Pipeline:
-        """Each record with its field `old` under the name `new`, as `rename(caption="txt")`."""
-        return self.map(_Renamed(tuple(names.items())), identity=f"dew.rename:{sorted(names.items())}")
+    def rename_columns(self, names: Mapping[str, str]) -> Pipeline:
+        """Each record with its field `old` under the name `new`, as `rename_columns({"txt": "caption"})`."""
+        moves = tuple((new, old) for old, new in names.items())
+        return self.map(_Renamed(moves), identity=f"dew.rename_columns:{sorted(moves)}")
 
-    def keep(self, *fields: str) -> Pipeline:
-        """Each record with `fields` alone."""
-        return self.map(_Kept(fields), identity=f"dew.keep:{list(fields)}")
+    def select_columns(self, *names: str) -> Pipeline:
+        """Each record with the fields `names` alone."""
+        return self.map(_Kept(names), identity=f"dew.select_columns:{list(names)}")
 
-    def pipe_grain(self, function: Callable[[pygrain.MapDataset | pygrain.IterDataset],
+    def remove_columns(self, *names: str) -> Pipeline:
+        """Each record without the fields `names`."""
+        return self.map(_Removed(names), identity=f"dew.remove_columns:{list(names)}")
+
+    def grain(self, function: Callable[[pygrain.MapDataset | pygrain.IterDataset],
                                             pygrain.MapDataset | pygrain.IterDataset],
                    *, identity: str | None = None) -> Pipeline:
         """`function` of the Grain dataset this chain makes, for a Grain
@@ -654,6 +674,14 @@ class _Renamed:
         moved = {old for _, old in self.names}
         return {**{key: value for key, value in record.items() if key not in moved},
                 **{new: record[old] for new, old in self.names}}
+
+
+@dataclasses.dataclass(frozen=True)
+class _Removed:
+    fields: tuple[str, ...]
+
+    def __call__(self, record: Batch) -> Batch:
+        return {name: value for name, value in record.items() if name not in self.fields}
 
 
 @dataclasses.dataclass(frozen=True)

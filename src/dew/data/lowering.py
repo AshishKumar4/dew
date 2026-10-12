@@ -223,7 +223,20 @@ class _Groups(pygrain.experimental.FlatMapTransform):
     max_fan_out: int = 1 << 20
 
     def flat_map(self, group: list[Record]) -> Sequence[Record]:
-        return list(self.stage.step([record(value, "map_batches input") for value in group]))
+        rows = [record(value, "batched input") for value in group]
+        columns = {name: [row[name] for row in rows] for name in rows[0]}
+        made = dict(self.stage.step(columns))
+        counts = {len(values) for values in made.values()}
+        if len(counts) > 1:
+            raise ValueError(f"a batched step returned columns of different lengths, {sorted(counts)}")
+        count = counts.pop() if counts else 0
+        if self.stage.same_rows:
+            if count != len(rows):
+                raise ValueError(f"map(batched=True) keeps the {len(rows)} rows it reads, and its step "
+                                 f"returned {count}; flat_map(batched=True) changes the count")
+            return [{**row, **{name: values[index] for name, values in made.items()}}
+                    for index, row in enumerate(rows)]
+        return [{name: values[index] for name, values in made.items()} for index in range(count)]
 
 
 @dataclasses.dataclass(frozen=True)
