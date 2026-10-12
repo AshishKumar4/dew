@@ -22,7 +22,6 @@ import json
 import logging
 import math
 import os
-import sys
 import threading
 import typing
 from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -330,10 +329,15 @@ class Loading:
     Each knob counts something different:
 
     - `workers`: worker processes;
-    - `threads`: record reads one worker keeps in flight;
-    - `read_buffer`: records one worker reads ahead;
+    - `threads`: reads one worker keeps in flight;
+    - `read_buffer`: reads one worker holds ahead;
     - `worker_buffer`: whole batches one worker holds ready for the training
-      process, since a worker stacks the records it read into batches.
+      process.
+
+    A read is a whole batch where the order is indexed, which is cut into
+    batches by index before any reader starts, as Grain's own indexed
+    pipelines are, and a record where the order streams and is batched as it
+    arrives.
 
     Zero workers is Grain's own default: threads in the training process read
     the records. Each worker process imports the program again, so it costs
@@ -783,47 +787,6 @@ def weight_counts(shares: Sequence[float], records: int) -> tuple[int, ...]:
         counts.append(left - rest)
         left, remaining = rest, remaining - proportion
     return tuple(counts)
-
-
-class _WorkerBatches[Record](pygrain.MapDataset[Record]):
-    """`parent` re-indexed so each grain worker reads whole, contiguous batches.
-
-    Grain gives worker i every index where i == index % W. Index
-    `q*W*B + p*W + w` is record p of batch `q*W + w`, so worker w batches
-    inside its own process. The training process interleaves the workers
-    round-robin, which restores batch order 0, 1, 2, ...
-
-    The length is padded to whole rounds of one batch per worker. An index
-    past the parent's last whole batch, or with `remainder` past its last
-    record, answers None, which grain's reader skips.
-    """
-
-    _MUTATES_ELEMENT_SPEC = False
-
-    def __init__(
-        self, parent: pygrain.MapDataset[Record], batch: int, workers: int, *, remainder: bool = False
-    ):
-        super().__init__(parent)
-        self._batch, self._workers = batch, workers
-        self._whole = -(-len(parent) // batch) if remainder else len(parent) // batch
-        self._length = min(math.ceil(self._whole / workers) * workers * batch, sys.maxsize)
-
-    def __len__(self) -> int:
-        return self._length
-
-    @overload
-    def __getitem__(self, index: slice) -> pygrain.MapDataset[Record]: ...
-    @overload
-    def __getitem__(self, index: int) -> Record | None: ...
-
-    def __getitem__(self, index: int | slice) -> Record | pygrain.MapDataset[Record] | None:
-        if isinstance(index, slice):
-            return self.slice(index)
-        worker, within = index % self._workers, index // self._workers
-        round_, row = divmod(within, self._batch)
-        which = round_ * self._workers + worker
-        record = which * self._batch + row
-        return None if which >= self._whole or record >= len(self._parent) else self._parent[record]
 
 
 @dataclasses.dataclass(frozen=True)

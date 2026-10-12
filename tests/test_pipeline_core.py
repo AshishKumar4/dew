@@ -157,6 +157,22 @@ def test_worker_boundary_keeps_downstream_record_steps_and_exact_positions(worke
         resumed.close()
 
 
+def test_worker_processes_read_a_global_order_in_the_batches_one_process_reads():
+    """Each worker reads whole batches of an indexed order by index, and the
+    reader interleaves them back into the order one process reads."""
+    pipeline = Pipeline(source()).shuffle(5).repeat().batch(4)
+
+    def batches(workers):
+        reader = compile(pipeline, seed=5, loading=dataclasses.replace(READ, workers=workers)).train(
+            DataPartition())
+        try:
+            return take(reader, 9)
+        finally:
+            reader.close()
+
+    assert batches(2) == batches(0)
+
+
 def test_token_deficit_mix_counts_targets_and_restores_delivered_counts():
     corpora = [grain.MapDataset.source([{"id": tag, "targets": targets}]).repeat().to_iter_dataset()
                for tag, targets in [(0, 2), (1, 7)]]
