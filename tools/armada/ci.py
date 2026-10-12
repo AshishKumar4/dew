@@ -146,10 +146,16 @@ def split(tests: list[float], seconds: float, target: float) -> list[float]:
     return [sum(tests[run.start:run.stop]) * scale for run in groups(tests, count) if run]
 
 
+APART = re.compile(r"\bpytest\.mark\.torchax\b")
+"""A file marked `torchax` imports torchax, which renames torch's privateuse1 backend to "jax" for
+the whole process, so a torch.compile in a later file of its task fails (test_reference_helpers'
+MXFP4, armada dew-20261011231242-dd32ac90): its tasks hold only files so marked."""
+
+
 def plan(target: float, timings: dict) -> list[dict]:
     """The matrix's entries: about `target` seconds of files each, for each Python. A file nothing has
     timed runs alone, so however long it takes it holds up no other file, and its time is known from
-    then on."""
+    then on. Files marked `torchax` (`APART`) share tasks only with one another."""
     every = sorted(str(path) for path in Path("tests").glob("test_*.py") if str(path) not in SKIPPED)
     recorded = recorded_tests()
     entries = []
@@ -165,13 +171,15 @@ def plan(target: float, timings: dict) -> list[dict]:
                           for group, weight in enumerate(cut, start=1)]
         light = {name: seconds for name, seconds in timed.items()
                  if seconds is not None and seconds <= target}
-        bins: list[tuple[float, int, list[str]]] = [
-            (0.0, index, []) for index in range(max(math.ceil(sum(light.values()) / target), 1))]
-        for name, seconds in sorted(light.items(), key=lambda item: (-item[1], item[0])):
-            held, index, names = heapq.heappop(bins)
-            heapq.heappush(bins, (held + seconds, index, [*names, name]))
-        tasks += [(sorted(names), "", held) for held, _, names in sorted(bins, key=lambda bin_: bin_[1])
-                  if names]
+        apart = {name for name in light if APART.search(Path(name).read_text())}
+        for family in (sorted(set(light) - apart), sorted(apart)):
+            count = max(math.ceil(sum(light[name] for name in family) / target), 1)
+            bins: list[tuple[float, int, list[str]]] = [(0.0, index, []) for index in range(count)]
+            for name in sorted(family, key=lambda name: (-light[name], name)):
+                held, index, names = heapq.heappop(bins)
+                heapq.heappush(bins, (held + light[name], index, [*names, name]))
+            tasks += [(sorted(names), "", held) for held, _, names in sorted(bins, key=lambda bin_: bin_[1])
+                      if names]
         for index, (names, group, weight) in enumerate(tasks, start=1):
             entries.append({"name": f"{python}-{index}", "python": python, "tests": " ".join(names),
                             "split": group, "rows": [row(python, name, group) for name in names],
