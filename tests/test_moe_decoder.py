@@ -224,12 +224,13 @@ def expert_specs(expert_size, fsdp_size, num_experts=8, min_shard_size=TINY_SHAR
 @pytest.mark.parametrize("expert_size,fsdp_size", [(1, 8), (2, 4), (4, 2)])
 def test_the_expert_dimension_takes_the_expert_axis(expert_size, fsdp_size):
     """Eight experts over one, two and four expert shards. The expert axis
-    carries the expert dimension alone, so the widths keep fsdp."""
+    carries the expert dimension alone, so the widths keep fsdp, on the
+    leading one (`dew.nn.sharding.DEFAULT_RULES`)."""
     _, specs = expert_specs(expert_size, fsdp_size)
     expert_axis = 'expert' if expert_size > 1 else None
 
-    assert specs["experts"]["gate_proj"]["kernel"] == P(expert_axis, None, 'fsdp')
-    assert specs["experts"]["up_proj"]["kernel"] == P(expert_axis, None, 'fsdp')
+    assert specs["experts"]["gate_proj"]["kernel"] == P(expert_axis, 'fsdp')
+    assert specs["experts"]["up_proj"]["kernel"] == P(expert_axis, 'fsdp')
     assert specs["experts"]["down_proj"]["kernel"] == P(expert_axis, 'fsdp')
     # The router's expert dimension rides the axis too; its width keeps fsdp.
     assert specs["gate"]["kernel"] == (
@@ -252,7 +253,7 @@ def test_an_expert_count_the_axis_cannot_split_keeps_the_widths_sharded():
     dropped and the parameter still shards on the dimension that can."""
     _, specs = expert_specs(expert_size=4, fsdp_size=2, num_experts=6)
 
-    assert specs["experts"]["gate_proj"]["kernel"] == P(None, None, 'fsdp')
+    assert specs["experts"]["gate_proj"]["kernel"] == P(None, 'fsdp')
 
 
 @pytest.mark.mesh
@@ -392,8 +393,8 @@ def test_the_experts_are_really_split_across_the_expert_axis():
     experts = state.variables["params"]["layers_1"]["mlp"]["experts"]
     kernel = experts["gate_proj"]["kernel"]
 
-    assert kernel.sharding.spec == P('expert', None, 'fsdp')
-    assert kernel.addressable_shards[0].data.shape == (2, 32, 32)
+    assert kernel.sharding.spec == P('expert', 'fsdp')
+    assert kernel.addressable_shards[0].data.shape == (2, 16, 64)
     moments = state.opt_state[0].mu["layers_1"]["mlp"]["experts"]
     assert moments["gate_proj"]["kernel"].sharding.spec == kernel.sharding.spec
 
