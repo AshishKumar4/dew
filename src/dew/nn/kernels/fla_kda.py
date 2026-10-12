@@ -169,25 +169,29 @@ def _intra_solve_kernel(q_ref, k_ref, g_ref, beta_ref, aqkd_ref, akkd_ref, aqk_r
     index = jnp.arange(SUB)
     zero = jnp.zeros((SUB, SUB), jnp.float32)
 
-    def tile(ref, rows, c):
-        return ref[pl.ds(rows, SUB), pl.ds(c * bk, bk)].astype(jnp.float32)
+    pairs = [(i, j) for i in range(count) for j in range(i)]
 
-    def below(i, j):
-        def block(c, sums):
-            origin = g_ref[i * SUB, pl.ds(c * bk, bk)].astype(jnp.float32)[None, :]
-            ahead = jnp.exp2(tile(g_ref, i * SUB, c) - origin)
-            behind = (tile(k_ref, j * SUB, c) * jnp.exp2(origin - tile(g_ref, j * SUB, c))).T
-            return (sums[0] + _tf32_dot(tile(q_ref, i * SUB, c) * ahead, behind),
-                    sums[1] + _tf32_dot(tile(k_ref, i * SUB, c) * ahead, behind))
+    def block(c, sums):
+        """One block of key columns for every pair, each sub-chunk's tiles loaded once, as fla's loop."""
+        columns = pl.ds(c * bk, bk)
+        tiles = [tuple(ref[pl.ds(i * SUB, SUB), columns].astype(jnp.float32) for ref in (q_ref, k_ref, g_ref))
+                 for i in range(count)]
+        origins = [g_ref[i * SUB, columns].astype(jnp.float32)[None, :] for i in range(count)]
+        ahead = [(query * jnp.exp2(gate - origin), key * jnp.exp2(gate - origin))
+                 for (query, key, gate), origin in zip(tiles, origins, strict=True)]
+        found = []
+        for (i, j), (qk, kk) in zip(pairs, sums, strict=True):
+            behind = (tiles[j][1] * jnp.exp2(origins[i] - tiles[j][2])).T
+            found.append((qk + _tf32_dot(ahead[i][0], behind), kk + _tf32_dot(ahead[i][1], behind)))
+        return found
 
-        qk, kk = jax.lax.fori_loop(0, blocks, block, (zero, zero))
-        return qk * scale, kk * beta_ref[pl.ds(i * SUB, SUB)].astype(jnp.float32)[:, None]
-
+    found = jax.lax.fori_loop(0, blocks, block, [(zero, zero)] * len(pairs))
     qks, kks = {}, {}
+    for (i, j), (qk, kk) in zip(pairs, found, strict=True):
+        qks[i, j] = qk * scale
+        kks[i, j] = kk * beta_ref[pl.ds(i * SUB, SUB)].astype(jnp.float32)[:, None]
     for i in range(count):
         kks[i, i] = akkd_ref[pl.ds(i * SUB, SUB), :]
-        for j in range(i):
-            qks[i, j], kks[i, j] = below(i, j)
     inverse = {(i, i): _tril_inverse(kks[i, i], index) for i in range(count)}
     for distance in range(1, count):
         for i in range(distance, count):
@@ -199,12 +203,12 @@ def _intra_solve_kernel(q_ref, k_ref, g_ref, beta_ref, aqkd_ref, akkd_ref, aqk_r
                 inverse[i, j] = -_tf32_dot(inverse[i, i], inner)
     for i in range(count):
         for j in range(count):
-            block = (pl.ds(i * SUB, SUB), pl.ds(j * SUB, SUB))
+            window = (pl.ds(i * SUB, SUB), pl.ds(j * SUB, SUB))
             if j == i:
-                aqk_ref[block] = aqkd_ref[pl.ds(i * SUB, SUB), :]
+                aqk_ref[window] = aqkd_ref[pl.ds(i * SUB, SUB), :]
             else:
-                aqk_ref[block] = (qks[i, j] if j < i else zero).astype(aqk_ref.dtype)
-            akk_ref[block] = (inverse[i, j] if j <= i else zero).astype(akk_ref.dtype)
+                aqk_ref[window] = (qks[i, j] if j < i else zero).astype(aqk_ref.dtype)
+            akk_ref[window] = (inverse[i, j] if j <= i else zero).astype(akk_ref.dtype)
 
 
 def intra_solve(q, k, g, beta, *, scale: float, chunk: int = 64, bk: int | None = None,
