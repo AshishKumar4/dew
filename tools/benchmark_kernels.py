@@ -126,14 +126,15 @@ def adam(args: argparse.Namespace) -> dict[str, object]:
     state = solver.init(params)
     for _ in range(3):
         params, state = run(params, state, grads)
-    samples = []
+    # The update threads its donated state through each call, which `samples` cannot.
+    updates = []
     for _ in range(args.repeats):
         start = time.perf_counter()
         params, state = run(params, state, grads)
         jax.block_until_ready((params, state))
-        samples.append((time.perf_counter() - start) * 1e3)
+        updates.append((time.perf_counter() - start) * 1e3)
     return {"state_dtype": args.state_dtype, "params": sum(leaf.size for leaf in params.values()),
-            "update_mean_ms": float(np.mean(samples)), "update_min_ms": float(np.min(samples)),
+            "update_mean_ms": float(np.mean(updates)), "update_min_ms": float(np.min(updates)),
             "state_bytes": sum(leaf.size * leaf.dtype.itemsize for leaf in jax.tree.leaves(state))}
 
 
