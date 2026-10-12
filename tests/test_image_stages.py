@@ -10,7 +10,8 @@ from dew.data.dataset import DataPartition
 
 def pictures(count: int = 48) -> Memory:
     rng = np.random.default_rng(0)
-    return Memory([{"image": rng.integers(0, 256, (24, 32, 3), np.uint8), "id": index} for index in range(count)])
+    return Memory([{"image": rng.integers(0, 256, (24, 32, 3), np.uint8), "id": index}
+                   for index in range(count)])
 
 
 def stage(kind: str):
