@@ -25,6 +25,94 @@ from dew.sampling import Sampling, generate
 ROOT = Path(__file__).parent / "fixtures" / "hf"
 
 
+def test_a_media_source_trains_and_saves_text_without_loading_media(monkeypatch, tmp_path):
+    import optax
+    from transformers import AutoProcessor
+
+    from dew.data.dataset import Dataset
+    from dew.data.text import load_tokenizer
+    from dew.training import Layout, MeshSpec, Trainer
+
+    directory = ROOT / "qwen38-dense-tiny"
+    tokenizer = load_tokenizer(str(directory), local_files_only=True)
+
+    def load_media(*args, **kwargs):
+        pytest.fail("text-only preprocessing constructed a media processor")
+
+    monkeypatch.setattr(AutoProcessor, "from_pretrained", load_media)
+    loaded = Pretrained.load(directory, dtype="float32", attention_impl="xla")
+    processor = loaded.processor
+    assert processor is not None and processor.source == str(directory)
+    texts = ["token4 token5", "token4 token5 token6"]
+    expected = tokenizer(text=texts, padding=True, truncation=False, return_tensors="np")
+    inputs = processor(texts)
+    np.testing.assert_array_equal(inputs.tokens, expected["input_ids"])
+    assert processor.decode(inputs.tokens) == tokenizer.batch_decode(
+        expected["input_ids"], skip_special_tokens=True)
+    np.testing.assert_array_equal(processor(texts[0]).tokens[0], tokenizer.encode(texts[0]))
+    for content in ("token4", [{"type": "text", "text": "token4"}]):
+        messages = [{"role": "user", "content": content}]
+        rendered = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        assert processor.reference.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True) == rendered
+        expected_chat = tokenizer.apply_chat_template(
+            messages, tokenize=True, return_dict=True, return_tensors="np", add_generation_prompt=True)
+        np.testing.assert_array_equal(processor.chat(messages).tokens, expected_chat["input_ids"])
+
+    objective = LMObjective(loaded, inputs.tokens.shape[1] - 1, ema_decay=None,
+                            pad_id=tokenizer.pad_token_id)
+    rows = 2 * jax.device_count()
+    batch = inputs.take_rows(jnp.arange(rows) % 2)
+    data = Dataset(train=lambda partition: iter([{"text": batch}]), val=None, records=rows, batch=rows)
+    state = Trainer(objective, optax.sgd(1e-3), key=jax.random.key(0), mesh=MeshSpec(),
+                    layout=Layout(min_shard=2**30)).fit(data, steps=1, log_every=1)
+    assert any(np.any(np.asarray(before) != np.asarray(after)) for before, after in zip(
+        jax.tree.leaves(loaded.variables), jax.tree.leaves(state.variables), strict=True))
+    exported = tmp_path / "exported"
+    loaded.save(exported, variables=state.variables)
+    for name in ("preprocessor_config.json", "video_preprocessor_config.json", "chat_template.jinja"):
+        assert (exported / name).read_bytes() == (directory / name).read_bytes()
+    restored = Pretrained.load(exported, dtype="float32", attention_impl="xla")
+    assert restored.processor is not None
+    np.testing.assert_array_equal(restored.processor(texts).tokens, inputs.tokens)
+    assert restored.processor.decode(inputs.tokens) == processor.decode(inputs.tokens)
+
+
+def test_media_requests_reuse_the_source_processor(monkeypatch):
+    from transformers import AutoProcessor
+
+    directory = ROOT / "qwen38-dense-tiny"
+    references = []
+    load = AutoProcessor.from_pretrained
+
+    def load_media(*args, **kwargs):
+        reference = load(*args, **kwargs)
+        references.append(reference)
+        return reference
+
+    monkeypatch.setattr(AutoProcessor, "from_pretrained", load_media)
+    loaded = Pretrained.load(directory, dtype="float32", attention_impl="reference")
+    processor = loaded.processor
+    assert processor is not None
+    processor("token4")
+    assert not references
+    image = np.load(directory / "images.npy")[0]
+    prompt = json.loads((directory / "prompts.json").read_text())[0]
+    first = processor(prompt, images=[image])
+    second = processor(prompt, images=[image])
+    assert len(references) == 1
+    np.testing.assert_array_equal(first.tokens, second.tokens)
+    np.testing.assert_array_equal(first.conditioning["pixel_values"], second.conditioning["pixel_values"])
+    messages = [{"role": "user", "content": [
+        {"type": "image", "image": image}, {"type": "text", "text": "token4"}]}]
+    actual = processor.chat(messages)
+    expected = references[0].apply_chat_template(
+        messages, tokenize=True, return_dict=True, return_tensors="pt", add_generation_prompt=True)
+    np.testing.assert_array_equal(actual.tokens, expected["input_ids"].numpy())
+    assert actual.conditioning
+    assert len(references) == 1
+
+
 @pytest.fixture(scope="module", params=["dense", "moe"])
 def source(request):
     if request.param == "dense":
