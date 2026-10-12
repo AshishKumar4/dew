@@ -692,6 +692,25 @@ def _tensor_shards(query) -> int:
                      for axis in mesh_axes(_entry(logical_spec(HEADS, query.shape), 2)))
 
 
+def _split_with_queries(key, value, split: int):
+    """`key` and `value` with their heads repeated to the least common multiple
+    of their count and `split`, the ways the mesh splits the query heads, so
+    each shard holds the key heads its query heads read."""
+    heads = math.lcm(key.shape[-2], split)
+    return repeat_kv_heads(key, heads), repeat_kv_heads(value, heads)
+
+
+def _per_shard(local, query, key, value):
+    """`local(query, key, value)`, a kernel with no partitioning rule, on each
+    shard's rows and heads (`manual_map`), the key heads repeated until the
+    tensor axes split them as they split the query's; whole off a mesh."""
+    if jax.sharding.get_abstract_mesh().empty:
+        return local(query, key, value)
+    key, value = _split_with_queries(key, value, _tensor_shards(query))
+    queries, keys = logical_spec(HEADS, query.shape), logical_spec(KV_HEADS, key.shape)
+    return manual_map(local, (queries, keys, keys), queries)(query, key, value)
+
+
 def _four_dimensional(x):
     """A mask or a bias `[.., Q, K]` broadcastable to `[B, H, Q, K]`, as four
     dimensions; a broadcast dimension of 1 divides by no mesh axis, so the
@@ -730,8 +749,7 @@ def exchanged_heads_attention(kernel, query, key, value, shards: int, *, causal,
             f"({query.shape[1]}, {key.shape[1]}) {shards} ways, and one of them does "
             "not divide. `gathered_keys_attention` takes any head count and key "
             "length; `sequence_parallel_attention` picks it for such a call.")
-    kv_heads = math.lcm(key.shape[-2], split)
-    key, value = repeat_kv_heads(key, kv_heads), repeat_kv_heads(value, kv_heads)
+    key, value = _split_with_queries(key, value, split)
     keys = logical_spec(KV_HEADS, key.shape)
 
     # After the all-to-all a shard holds its tensor shard's heads split again
@@ -777,9 +795,7 @@ def gathered_keys_attention(kernel, query, key, value, shards: int, *, causal,
     and the caller's rotary angles stay exact.
     """
     q_len, kv_len = query.shape[1], key.shape[1]
-    # Each tensor shard's query heads beside the key heads they read.
-    kv_heads = math.lcm(key.shape[-2], _tensor_shards(query))
-    key, value = repeat_kv_heads(key, kv_heads), repeat_kv_heads(value, kv_heads)
+    key, value = _split_with_queries(key, value, _tensor_shards(query))
 
     reordered = causal or sliding_window is not None or mask is not None
     if reordered:
@@ -938,8 +954,8 @@ def flash_attention(query, key, value, causal: bool):
     """FlashAttention-2 (dew_flash_attn, kernels/flash_attn) over `[B, S, H, D]`
     arrays at jax.nn's default scale. Its causal mask is aligned to the last
     key, where jax.nn's is aligned to the first, so a causal call is square.
-    On a mesh it runs per shard, as `triton_attention` does. It runs where
-    the installed wheel holds code for the device (`flash_built_for`)."""
+    On a mesh it runs per shard (`_per_shard`). It runs where the installed
+    wheel holds code for the device (`flash_built_for`)."""
     generation = device_generation()
     architectures = flash_architectures()
     if architectures is None:
@@ -949,15 +965,8 @@ def flash_attention(query, key, value, causal: bool):
                          f"device is {generation}; use attention_impl 'cudnn' or 'xla'")
     flash = importlib.import_module('dew_flash_attn')
 
-    def local(query, key, value):
-        return flash.flash_mha(query, key, value, is_causal=causal)
-
-    if jax.sharding.get_abstract_mesh().empty:
-        return local(query, key, value)
-    kv_heads = math.lcm(key.shape[-2], _tensor_shards(query))
-    key, value = repeat_kv_heads(key, kv_heads), repeat_kv_heads(value, kv_heads)
-    queries, keys = logical_spec(HEADS, query.shape), logical_spec(KV_HEADS, key.shape)
-    return manual_map(local, (queries, keys, keys), queries)(query, key, value)
+    return _per_shard(lambda query, key, value: flash.flash_mha(query, key, value, is_causal=causal),
+                      query, key, value)
 
 
 def triton_attention(query, key, value, causal: bool):
@@ -965,10 +974,9 @@ def triton_attention(query, key, value, causal: bool):
     tokamax's heuristic config, with jax.nn's default scale of 1/sqrt(D).
 
     It takes grouped key heads and any length itself. A Pallas call has no
-    partitioning rule, so on a mesh it runs inside `manual_map` on each
-    shard's rows and heads, with the key heads repeated until the tensor
-    axes split them as they split the query's. tokamax is not a dependency
-    of Dew (docs/installation.md says how to install it), so it is imported here.
+    partitioning rule, so on a mesh it runs per shard (`_per_shard`).
+    tokamax is not a dependency of Dew (docs/installation.md says how to
+    install it), so it is imported here.
     """
     try:
         tokamax = importlib.import_module('tokamax')
@@ -976,16 +984,8 @@ def triton_attention(query, key, value, causal: bool):
         raise ValueError("attention implementation 'triton' needs tokamax: "
                          "uv pip install 'tokamax>=0.0.15' (docs/installation.md)") from e
 
-    def local(query, key, value):
-        return tokamax.dot_product_attention(query, key, value, is_causal=causal,
-                                             implementation='triton')
-
-    if jax.sharding.get_abstract_mesh().empty:
-        return local(query, key, value)
-    kv_heads = math.lcm(key.shape[-2], _tensor_shards(query))
-    key, value = repeat_kv_heads(key, kv_heads), repeat_kv_heads(value, kv_heads)
-    queries, keys = logical_spec(HEADS, query.shape), logical_spec(KV_HEADS, key.shape)
-    return manual_map(local, (queries, keys, keys), queries)(query, key, value)
+    return _per_shard(lambda query, key, value: tokamax.dot_product_attention(
+        query, key, value, is_causal=causal, implementation='triton'), query, key, value)
 
 
 VALUE_BLOCK = 256
@@ -1702,8 +1702,7 @@ def _local_over_sequence(kernel, query, key, value, shards: int, *, window, chun
     span = window if window is not None else chunk
     assert span is not None
     queries = logical_spec(HEADS, query.shape)
-    kv_heads = math.lcm(key.shape[2], _tensor_shards(query))
-    key, value = repeat_kv_heads(key, kv_heads), repeat_kv_heads(value, kv_heads)
+    key, value = _split_with_queries(key, value, _tensor_shards(query))
     keys = logical_spec(KV_HEADS, key.shape)
     fields = {}
     if positions is not None:
