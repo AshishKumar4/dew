@@ -9,6 +9,7 @@ tokenizer on first use, so a host without the hub cache still imports
 from __future__ import annotations
 
 import dataclasses
+import functools
 import hashlib
 import threading
 from collections.abc import Mapping, Sequence
@@ -24,55 +25,52 @@ _load_lock = threading.Lock()
 _loaded: dict[tuple[str, str | None, bool], PreTrainedTokenizerBase] = {}
 
 
+_TOKENIZER_FILES = ["*.json", "*.jinja", "*.model", "*.txt", "*.tiktoken"]
+"""The files a tokenizer's loader can read: its vocabulary, merges and templates."""
+
+
 @dataclasses.dataclass(frozen=True)
 class PinnedTokenizer:
-    """A tokenizer resolved once to immutable files (`pin_tokenizer`): the
-    snapshot a step's identity hashes and the directory it reads its
-    vocabulary and templates from, which are one revision by construction."""
+    """A Hugging Face tokenizer resolved once to immutable files
+    (`pin_tokenizer`): the snapshot its identity hashes and the directory it
+    reads its vocabulary and templates from, which are one revision by
+    construction."""
 
     snapshot: Mapping[str, object]
-    directory: str | None
-    """The snapshot's local directory, or None for the byte vocabulary."""
-
-    def load(self) -> ByteTokenizer | HFTokenizer:
-        if self.directory is None:
-            return ByteTokenizer()
-        return HFTokenizer(self.directory, local_files_only=True)
+    directory: str
 
     def transformers(self) -> PreTrainedTokenizerBase:
-        """The transformers tokenizer of these files, whose chat template renders conversations."""
-        if self.directory is None:
-            raise ValueError("chat templates need a Hugging Face tokenizer, not the byte vocabulary")
-        return load_tokenizer(self.directory, local_files_only=True)
+        """The transformers tokenizer of these files, whose chat template
+        renders conversations. A directory is read where it is, so the load
+        reaches no hub, and it is the one load every reader of the directory
+        shares (`load_tokenizer`)."""
+        return load_tokenizer(self.directory)
 
 
-def pin_tokenizer(name: str) -> PinnedTokenizer:
-    """Resolve `name` once: the byte vocabulary, a local directory, or a hub
-    repo (optionally `repo@revision`) downloaded at its resolved revision,
-    with every file its loader can read hashed."""
+def pin_tokenizer(name: str, *, local_files_only: bool = False) -> PinnedTokenizer:
+    """Resolve `name` once: a local directory, or a hub repo (optionally
+    `repo@revision`) downloaded at the commit its revision names, with every
+    file its loader can read hashed. The Hub cache keeps a commit's files in
+    a directory named for the commit, which is the revision recorded; offline
+    (`HF_HUB_OFFLINE`), or with `local_files_only`, the name resolves to the
+    commit the local cache holds."""
     if name == "byte":
-        return PinnedTokenizer({"name": "byte", "encoding": "utf-8", "eos": 255}, None)
+        raise ValueError("'byte' names Dew's byte vocabulary (ByteTokenizer), which has no tokenizer files")
     directory = Path(name)
-    resolved = None
-    repo = None
+    repo = resolved = None
     if not directory.is_dir():
-        from huggingface_hub import HfApi, snapshot_download
+        from huggingface_hub import snapshot_download
 
         repo, separator, revision = name.rpartition("@")
-        repo = repo if separator else name
-        resolved = HfApi().model_info(repo, revision=revision if separator else None).sha
-        directory = Path(snapshot_download(repo, revision=resolved,
-                         allow_patterns=["*.json", "*.jinja", "*.model", "*.txt", "*.tiktoken"]))
+        repo, revision = (repo, revision) if separator else (name, None)
+        directory = Path(snapshot_download(repo, revision=revision, allow_patterns=_TOKENIZER_FILES,
+                                           local_files_only=local_files_only))
+        resolved = directory.name
     files = {str(path.relative_to(directory)): hashlib.sha256(path.read_bytes()).hexdigest()
-             for pattern in ("*.json", "*.jinja", "*.model", "*.txt", "*.tiktoken")
+             for pattern in _TOKENIZER_FILES
              for path in directory.rglob(pattern) if path.is_file()}
-    snapshot = {"name": None if resolved is None else repo, "revision": resolved, "files": files}
+    snapshot = {"name": repo, "revision": resolved, "files": files}
     return PinnedTokenizer(snapshot, str(directory))
-
-
-def tokenizer_snapshot(name: str) -> Mapping[str, object]:
-    """Pin the tokenizer and every local template file its loader can read."""
-    return pin_tokenizer(name).snapshot
 
 
 def load_tokenizer(name: str, *, revision: str | None = None,
@@ -163,7 +161,7 @@ class ByteTokenizer:
         self.bos_id = None
 
     def dependencies(self) -> Mapping[str, object]:
-        return tokenizer_snapshot("byte")
+        return {"name": "byte", "encoding": "utf-8", "eos": 255}
 
     def encode(self, text: str, *, add_special_tokens: bool = True) -> list[int]:
         """Return the text's utf-8 bytes as ids.
@@ -181,24 +179,33 @@ class ByteTokenizer:
 
 
 class HFTokenizer:
-    """A Hugging Face tokenizer, loaded from its hub name or local directory
+    """A Hugging Face tokenizer, resolved from its hub name or local directory
     on first use.
 
-    Because it loads lazily, `import dew.data.text` (and `import dew.data`)
-    does not import `transformers` or look anything up on the hub until a
-    caller uses the tokenizer.
+    It resolves its name once (`pinned`), and its identity (`dependencies`)
+    and every encoding read that one resolution, here and in any process it
+    is pickled to, so a hub name that moves, or another revision of it a
+    process already loaded, never encodes rows under the identity of this
+    one. Because it resolves lazily, `import dew.data.text` (and
+    `import dew.data`) does not import `transformers` or look anything up on
+    the hub until a caller uses the tokenizer.
     """
 
     def __init__(self, name: str, *, local_files_only: bool = False):
         self.name = name
         self.local_files_only = local_files_only
 
+    @functools.cached_property
+    def pinned(self) -> PinnedTokenizer:
+        """The name resolved once to immutable files (`pin_tokenizer`)."""
+        return pin_tokenizer(self.name, local_files_only=self.local_files_only)
+
     def dependencies(self) -> Mapping[str, object]:
-        return tokenizer_snapshot(self.name)
+        return self.pinned.snapshot
 
     @property
     def tokenizer(self) -> PreTrainedTokenizerBase:
-        return load_tokenizer(self.name, local_files_only=self.local_files_only)
+        return self.pinned.transformers()
 
     @property
     def vocab_size(self) -> int:
@@ -250,7 +257,7 @@ class HFTokenizer:
         return f"{self.__class__.__name__}(name={self.name!r})"
 
 
-def tokenizer_for(name: str, *, local_files_only: bool = False):
+def tokenizer_for(name: str, *, local_files_only: bool = False) -> ByteTokenizer | HFTokenizer:
     """Builds the tokenizer `name` asks for.
 
     `byte` is dew's own utf-8 vocabulary; any other name is the HF tokenizer

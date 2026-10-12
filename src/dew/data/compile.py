@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import dataclasses
 import functools
-import json
 from collections.abc import Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from typing import Literal, Protocol, runtime_checkable
@@ -50,7 +49,7 @@ from dew.data.dataset import (
     Records,
     weight_counts,
 )
-from dew.data.lowering import _as_iter, _Build, _epoch_records, _Locality, _workers
+from dew.data.lowering import _as_iter, _Build, _epoch_records, _Locality, _TokenSplit, _workers
 from dew.data.materialize import _materialize, _Memory
 from dew.data.mix import CorpusCounts, SearchBudget
 from dew.data.pipeline import (
@@ -79,6 +78,7 @@ from dew.data.pipeline import (
     Stage,
     TokenBudget,
     TokenGeometry,
+    TokenSplit,
     Volatile,
     Workers,
     _rejects,
@@ -280,7 +280,25 @@ def _budget_rows(budget: TokenBudget) -> int:
     return budget.tokens // min(lengths)
 
 
-def _derived(pipeline: Pipeline, seed: int, read: Read) -> Mapping[str, str]:
+def _token_spans(pipeline: Pipeline, build: _Build) -> Iterator[list[tuple[int, int, int]]]:
+    """The spans each token split left to the lowering keeps, in the order
+    `_steps` walks them: the lowering's own split (`_TokenSplit`) of the
+    indexed order before it, so they are the documents and token offsets a
+    reader of the plan trains on."""
+    if isinstance(pipeline.source, (Mixture, Phases)):
+        for child in pipeline.source.pipelines:
+            yield from _token_spans(child, build)
+    for at, stage in enumerate(pipeline.stages):
+        if isinstance(stage, TokenSplit):
+            before = dataclasses.replace(pipeline, stages=pipeline.stages[:at])
+            rows, _ = build.records(before, DataPartition())
+            if not isinstance(rows, pygrain.MapDataset):
+                raise ValueError(f"token split in {_name(pipeline)} needs a finite indexed order")
+            yield _TokenSplit(rows, stage).spans
+
+
+def _derived(pipeline: Pipeline, build: _Build) -> Mapping[str, str]:
+    seed, read = build.seed, build.read
     arrays: dict[str, str] = {}
     for index, (leaf, source) in enumerate(_leaves(pipeline)):
         if isinstance(source, _Memory):
@@ -302,6 +320,9 @@ def _derived(pipeline: Pipeline, seed: int, read: Read) -> Mapping[str, str]:
             arrays[f"{index}/valid_targets"] = fingerprint(
                 integer(metadata["valid_targets"], "valid_targets")
             )
+    splits = list(_token_spans(pipeline, build))
+    if splits:
+        arrays["token_spans"] = fingerprint(json_value(splits, "token spans"))
     return arrays
 
 
@@ -471,7 +492,7 @@ def _compiled(
         "global" if global_order else "per-share",
         manifest,
         {"read": read, "seed": seed, **build.lowering.order},
-        _derived(train, seed, read),
+        _derived(train, build),
         cache=_cache_references(original, read),
         volatile=any(
             isinstance(stage.step, Volatile) and stage.step.volatile
@@ -638,9 +659,8 @@ def _training_reader(
         opened = GlobalStream(
             functools.partial(build.batches, pipeline, partition),
             build.batch,
-            json.dumps(plan.order, sort_keys=True),
+            plan,
             build.loading,
-            plan=plan,
             resume=resume,
             endless=build.lowering.endless,
         )

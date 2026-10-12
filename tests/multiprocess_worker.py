@@ -633,9 +633,9 @@ def mode_fit(args) -> dict:
 def mode_pool_refusals(args) -> dict:
     """What a pool refuses on every process before any trains on it, each a
     fit of the affine regression over a stream that differs on process 1
-    only: other records of the same length, another length,
-    a first read that fails there, a stream that runs out after one batch
-    there, and a batch without a field. A resume
+    only: other records of the same length, the same with one name for both
+    copies, another length, a first read that fails there, a stream that
+    runs out after one batch there, and a batch without a field. A resume
     from a newest checkpoint the processes list differently is refused as
     well. Each outcome is the error's text, or None for a fit that trained."""
     import jax
@@ -648,11 +648,11 @@ def mode_pool_refusals(args) -> dict:
 
     rank = jax.process_index()
 
-    def corpus(count: int, shift: int) -> Memory:
-        """Records each process holds its own copy of, with no name of their
-        own, so the source describes them by their contents."""
+    def corpus(count: int, shift: int, identity: str | None = None) -> Memory:
+        """Records each process holds its own copy of, described by their
+        contents unless `identity` names them."""
         x = np.repeat(np.arange(shift, count + shift, dtype=np.float32)[:, None], FEATURES, axis=1)
-        return Memory({"x": x, "y": 2 * x[:, :2]})
+        return Memory({"x": x, "y": 2 * x[:, :2]}, identity=identity)
 
     class Reads:
         """Batches of this process's rows, failing at the first read, running
@@ -674,8 +674,8 @@ def mode_pool_refusals(args) -> dict:
             x = np.ones((BATCH // jax.process_count(), FEATURES), np.float32)
             return {name: value for name, value in {"x": x, "y": 2 * x[:, :2]}.items() if name in self.fields}
 
-    def stream(count: int, shift: int) -> Dataset:
-        return compile(Pipeline(corpus(count, shift)).shuffle(0).repeat().batch(BATCH), seed=0,
+    def stream(count: int, shift: int, identity: str | None = None) -> Dataset:
+        return compile(Pipeline(corpus(count, shift, identity)).shuffle(0).repeat().batch(BATCH), seed=0,
                        loading=Loading(workers=0))
 
     def reads(fail: bool = False, fields: tuple[str, ...] = ("x", "y"), ends: int | None = None) -> Dataset:
@@ -694,6 +694,7 @@ def mode_pool_refusals(args) -> dict:
     outcomes = {
         "same": trained(stream(64, 0)),
         "content": trained(stream(64, int(other))),
+        "named": trained(stream(64, int(other), "shared")),
         "count": trained(stream(64 + 32 * other, 0)),
         "first_read": trained(reads(fail=other)),
         "eof": trained(reads(ends=1 if other else None)),
