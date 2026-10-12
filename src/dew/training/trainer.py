@@ -1114,7 +1114,7 @@ class Trainer(Generic[Loss, Effects]):
                 shards = math.prod(mesh.shape[axis] for axis in BATCH_AXES)
                 options = None if self._xla_defaults else step_compiler_options(
                     self.objective, device_tokens(self.objective, batch, shards),
-                    FROZEN in prepared.variables)
+                    FROZEN in prepared.variables, mesh.devices.size)
                 self.executable = compiled_if_it_fits(self.program, options, refusals)
                 fits = step_fits(self.executable, mesh, held)
                 if not fits and options is not None:
