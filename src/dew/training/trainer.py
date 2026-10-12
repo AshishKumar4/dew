@@ -134,6 +134,7 @@ from dew.training.model_flops import (
     model_batch,
     prepare_counts,
     step_counts,
+    uncounted,
 )
 from dew.training.narrow import narrowed, narrowed_paths
 from dew.training.rungs import keep_rung, recorded_rung
@@ -515,7 +516,8 @@ class Trainer(Generic[Loss, Effects]):
         self.links: dict[str, Link] = {}
         self._bandwidths: dict[tuple[Mesh, str], float | None] = {}
         self._display = TrainingDisplay()
-        self._count_work: bool | None = False
+        self._count_work = False
+        self._refusal: str | None = None
         # The fit ladder's rung beyond the objective's own head and remat: a
         # step that fit only under XLA's default options keeps them for later
         # compiles. A resumed run starts at its checkpoint's rung, and says so
@@ -1521,9 +1523,10 @@ class Trainer(Generic[Loss, Effects]):
             jax.devices()[0].device_kind, jax.process_count(), dict(mesh.shape),
             split_share(state.variables),
             seed=self.seed)
-        # On a device with a known peak, the first batch's count decides
-        # whether the run reports train/mfu (`_counted_batch`).
-        self._count_work = None if gpu_target(started.device_kind).bf16_peak is not None else False
+        # On a device with a known peak, the run counts its batches' work
+        # for train/mfu while they can be counted (`_counted_batch`).
+        self._count_work = gpu_target(started.device_kind).bf16_peak is not None
+        self._refusal = None
         self._report(started, current)
         # Read through the type that declares it: fit takes any object with a
         # Dataset's readers, and a held-out count is not one of them.
@@ -2067,23 +2070,23 @@ class Trainer(Generic[Loss, Effects]):
     def _counted_batch(self, batch: Batch) -> Batch:
         """Prepare host counts before placement, never fetch a device batch to count it.
 
-        The run's first batch resolves whether analytical work is available:
-        its count is the capability, so a model or objective that cannot
-        declare its work (`MissingFlopsCount`) leaves train/mfu unavailable
-        for the run, noted once with the count's own reason, and trains. One
-        thread prepares batches, the prefetch worker or a rollout's caller.
-        A count asked of the objective directly stays strict.
+        The count is the capability: from the first batch whose work the
+        model or objective cannot declare (`MissingFlopsCount`, as a media
+        row's tower), this process counts no more, notes the count's reason
+        once and trains on. Its batches keep their work columns, as unknown
+        work (`uncounted`), so every process runs one step program and the
+        step's global sum leaves train/mfu unreported pool-wide. One thread
+        prepares batches, the prefetch worker or a rollout's caller. A count
+        asked of the objective directly stays strict.
         """
-        if self._count_work is None:
+        if self._count_work and self._refusal is None:
             try:
-                counted = prepare_counts(self.objective, batch, count_model=True)
+                return prepare_counts(self.objective, batch, count_model=True)
             except MissingFlopsCount as missing:
-                self._count_work = False
+                self._refusal = str(missing)
                 self._display.note(f"train/mfu is unavailable for {type(self.objective).__name__}: {missing}")
-            else:
-                self._count_work = True
-                return counted
-        return prepare_counts(self.objective, batch, count_model=self._count_work)
+        counted = prepare_counts(self.objective, batch, count_model=False)
+        return counted if self._refusal is None else uncounted(counted)
 
     def _rolled_out(self, state: TrainState, batch: Batch) -> tuple[Batch, float]:
         """Sample one batch through the rollout, with the seconds it took.
@@ -2225,6 +2228,13 @@ class Trainer(Generic[Loss, Effects]):
                 "tokens": (interval.book.tokens if interval.tokens_counted and interval.book is not None
                            else None),
                 "rollout": {} if self.rollout is None else dict(_rollout_metrics(self.rollout))})
+            work = read["training_flops"]
+            if work is not None and not math.isfinite(work) and self._refusal is None:
+                # Another process refused a count (`_counted_batch`); the global
+                # sum carried it here, and this process stops counting too.
+                self._refusal = "another process's batch could not be counted"
+                self._display.note(f"train/mfu is unavailable for {type(self.objective).__name__}: "
+                                   f"{self._refusal}")
             scalars = {"train/loss": float(read["loss"]),
                        **{f"train/{k}": float(v) for k, v in read["aux"].items()},
                        **self._throughput(now - interval.last_log_time, interval.since_log,
@@ -2438,7 +2448,9 @@ class Trainer(Generic[Loss, Effects]):
         if tokens is not None:
             scalars["train/tokens"] = float(tokens) / steps
             scalars["train/tokens_per_s"] = float(tokens) / stepping
-        if training_flops is not None:
+        # A batch whose work could not be counted carries NaN (`_counted_batch`),
+        # so an interval holding one, on any process, reports no train/mfu.
+        if training_flops is not None and math.isfinite(training_flops):
             per_device = float(training_flops) / self.device_mesh.devices.size
             utilization = model_flops_utilization(per_device / steps, step_time)
             if utilization is not None:

@@ -531,13 +531,12 @@ def _counted_adapter(model: nn.Module, branch: _Branch,
                 raise MissingFlopsCount(f"{type(original).__name__} has no declared vocabulary-head work")
             return 2 * original.logits_flops(lengths) + 3 * self._adapter_forward(lengths, logits=True)
 
-    # The factors' work reads each target's matrix usage and the frozen base's
-    # parameter work, so the adapter counts only where the model declares all three.
-    if not all(isinstance(model, protocol) for protocol in (Counted, CountedMatrixUsage, CountedParameters)):
-        return _refusing_counts(model, base, Counted, CountedParameters, CountedLogits, CountedTraining,
-                                CountedLogitsTraining, CountedPredictions, CountedPredictionParameters,
-                                CountedPredictionTraining)
-    return LogitsAdapter if isinstance(model, CountedLogits) else CountedAdapter
+    if isinstance(model, CountedLogits):
+        return LogitsAdapter
+    if isinstance(model, Counted):
+        return CountedAdapter
+    return _refusing_counts(model, base, CountedParameters, CountedTraining, CountedLogitsTraining,
+                            CountedPredictions, CountedPredictionParameters, CountedPredictionTraining)
 
 
 def _adapted(model: nn.Module, branch: _Branch, layouts: Mapping[str, WeightLayout]) -> nn.Module:
