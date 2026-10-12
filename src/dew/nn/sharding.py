@@ -478,7 +478,8 @@ def logical_spec(axes: LogicalAxes, shape: tuple[int, ...], *,
     left: list[tuple[str, MeshAxes]] = []
     stored: set[str] = set()
     for name, assignment in rules:
-        if assignment is not None and not (used := splitting(assignment)):
+        used = splitting(assignment)
+        if assignment is not None and not used:
             continue
         if all(name != kept for kept, _ in left) and mesh_axes(assignment) == (FSDP_AXIS,):
             stored.add(name)
