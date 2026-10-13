@@ -71,6 +71,7 @@ if TYPE_CHECKING:
     from types import TracebackType
 
     import httpx
+    import jax
 
 _logger = logging.getLogger(__name__)
 
@@ -475,7 +476,8 @@ class HarborSource:
         self._exit_hook = functools.partial(_stop_all, self._records, self._lock, grace)
         atexit.register(self._exit_hook)
 
-    def submit(self, task: Task, samples: int, *, version: int) -> list[Future[Session]]:
+    def submit(self, task: Task, samples: int, *, version: int, key: jax.Array) -> list[Future[Session]]:
+        del key  # the agent's own requests draw through the gateway, which takes no key
         directory = task.data.get(HARBOR_KEY)
         if not isinstance(directory, (str, os.PathLike)) or not Path(directory).is_dir():
             raise ValueError(f"task {task.id!r} names no Harbor task directory under data[{HARBOR_KEY!r}]")
