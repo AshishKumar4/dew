@@ -259,10 +259,9 @@ def _carried(equation) -> list[int]:
     floats = [index for index, var in enumerate(operands) if _real(var)]
     if name in CARRIES or _body(equation) is not None or name in ("scan", "while", "cond"):
         return floats
-    summed = [operands[0].aval.shape[axis] for axis in equation.params.get("axes", ())]
-    if name == "reduce_sum" and np.prod(summed) == 1:
+    if name == "reduce_sum":
         # A sum over unit axes adds nothing: it moves its operand, as a broadcast's transpose does.
-        return floats
+        return floats if all(operands[0].aval.shape[axis] == 1 for axis in equation.params["axes"]) else []
     if name in ("mul", "div"):
         return floats
     return []
