@@ -18,6 +18,7 @@ from collections.abc import Callable, Iterator, Mapping
 from pathlib import Path
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
 from jax.experimental import mesh_utils, multihost_utils
@@ -745,6 +746,26 @@ def with_host(placed: Batch, host: Batch) -> Batch:
     """`placed` with the host fields put back where they were."""
     return {**placed, **{name: with_host(placed[name], value) if isinstance(value, Mapping) else value
                          for name, value in host.items()}}
+
+
+Signature = tuple[jax.tree_util.PyTreeDef, tuple[jax.ShapeDtypeStruct, ...]]
+"""A batch's abstract signature, the key a compiled step is held under: its
+tree, which holds each node's static fields, and each leaf's shape and
+dtype. A fixed batch has one; a ramped batch has one per stage of its ramp,
+each compiled on the first step that reads it."""
+
+
+def batch_signature(batch: Batch) -> Signature:
+    """The abstract signature of a batch of arrays or their shapes (`jax.ShapeDtypeStruct`)."""
+    leaves, tree = jax.tree.flatten(batch)
+    return tree, tuple(jax.ShapeDtypeStruct(np.shape(leaf), jnp.result_type(leaf)) for leaf in leaves)
+
+
+def batch_layout(batch: Batch) -> str:
+    """A batch's fields, each with its dtype and global shape; the batch may be
+    arrays or their abstract shapes (`jax.ShapeDtypeStruct`)."""
+    return ", ".join(f"{jax.tree_util.keystr(path)} {jnp.result_type(leaf)}{list(np.shape(leaf))}"
+                     for path, leaf in jax.tree_util.tree_leaves_with_path(batch))
 
 
 def batch_shardings(mesh: Mesh | AbstractMesh, batch: Batch) -> Placement[Batch]:
