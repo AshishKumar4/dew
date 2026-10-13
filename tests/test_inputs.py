@@ -91,6 +91,16 @@ def test_shard_batch_preserves_resident_nested_inputs_without_host_transfer():
     assert placed["weight"].sharding == NamedSharding(mesh, P())
 
 
+def test_a_char_table_named_after_a_checkpoint_is_refused_not_drawn_at_random():
+    """`--text.encoder char_table` with a CLIP checkpoint left in `--text.checkpoint` used to draw a
+    random table silently; the name the table records is the one it takes."""
+    from dew.inputs import CharTable
+
+    assert CharTable.from_pretrained("char_table").to_json()["checkpoint"] == "char_table"
+    with pytest.raises(ValueError, match="openai/clip-vit-base-patch32"):
+        CharTable.from_pretrained("openai/clip-vit-base-patch32")
+
+
 def test_char_table_compute_override_preserves_supplied_storage():
     import jax.numpy as jnp
 
