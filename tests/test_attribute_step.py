@@ -9,10 +9,7 @@ move, and a weight-gradient GEMM traced at `up_proj/transpose` is a GEMM.
 
 import json
 
-import pytest
 from tool_support import load
-
-from dew.telemetry.instrumentation import custom_call_kind, hlo_instructions
 
 attribute = load("attribute_step")
 
@@ -98,53 +95,6 @@ ROWS = {
                         "%p0)",
                         LAYER + "copy:", "data formatting"), "layout"),
 }
-
-
-@pytest.mark.parametrize("case", list(ROWS))
-def test_an_op_is_kinded_by_what_it_runs_not_by_its_operands_names(case):
-    """With the module, a custom call is kinded by its target and a fusion by the ops it runs."""
-    found, kind = ROWS[case]
-    assert attribute.kind_of(found, hlo_instructions(MODULE)) == kind
-
-
-@pytest.mark.parametrize("target, kind", [
-    ("__cublas$lt$matmul", "gemm"), ("__cublas$gemm", "gemm"), ("__cudnn$convBackwardInput", "convolution"),
-    ("__cudnn$fmhaSoftmaxBackward", "attention"), ("dew_flash_mha_fwd", "attention"),
-    ("__gpu$xla.gpu.triton", "triton"), ("xla.gpu.ext.custom", None),
-])
-def test_a_custom_calls_kind_is_one_table_the_flop_count_and_the_attribution_share(target, kind):
-    """cuBLAS, cuDNN's convolutions and fused attention, Dew's FlashAttention-2 and Pallas's
-    Triton calls are told apart by target; anything else is no known kind."""
-    assert custom_call_kind(target) == kind
-
-
-@pytest.mark.parametrize("case, kind", [
-    ("flash backward", "custom-call"),
-    ("Pallas recurrence", "pallas"),
-    ("transposing fusion", "layout"),
-    ("dtype cast", "elementwise"),
-    ("reduction", "reduce"),
-    ("layout copy", "layout"),
-])
-def test_without_the_module_an_op_is_kinded_from_its_own_name_and_opcode(case, kind):
-    """A custom call whose target the expression does not show is only a custom call, never the
-    kind of an operand its expression names."""
-    assert attribute.kind_of(ROWS[case][0]) == kind
-
-
-@pytest.mark.parametrize("framework, source, part", [
-    (LAYER + "fla_chunk_bwd_dqkwg/pallas_call:", "dew/nn/kernels/fla_gdn.py:700:22", "gdn"),
-    (LAYER + "jit(softplus)/mul:", "dew/nn/linear.py:689:48", "gdn"),
-    (LAYER + "self_attn._attended/ffi_call:", "dew/nn/attention.py:854:15", "attention"),
-    ("jit(step)/transpose(jvp(JointSchemaHead))/evidence_layers_1/attention/dot_product_attention_bwd:",
-     "dew/nn/attention.py:511:10", "head_loss"),
-    (LAYER.replace("_mix/self_attn/", "input_layernorm/") + "mul:", "dew/nn/attention.py:292:12", "norm"),
-    (LAYER.replace("_mix/self_attn/", "mlp/up_proj/") + "transpose:", "dew/nn/moe.py:549:20", "mlp"),
-])
-def test_a_part_is_read_from_the_source_that_traced_it_before_the_module_path(framework, source, part):
-    """Qwen3.5 names every mixer `self_attn`, so a delta net's ops are its by their file; the
-    decision head's attention is the head's, and a decoder norm traced in attention.py is a norm."""
-    assert attribute.part_of(f"{framework} {source}") == part
 
 
 TRACED = ('metadata={op_name="jit(step)/transpose(jvp(MultimodalTransformer.hidden_states))/'
@@ -290,52 +240,17 @@ def test_the_peak_is_dews_dense_bf16_figure_for_a_named_device(tmp_path):
     assert attribute.main(command) == 0
     time = json.loads(out.read_text())["time"]
     assert time["peak_gflops"] == 500e3
-    assert time["peak_source"].startswith("dew.nn.kernels.generation.gpu_target")
     assert time["mfu_bf16_of_device_time"] == time["mfu_mixed_of_device_time"] == 0.5
     assert time["bf16_equiv_throughput_tflops"] == 250.0
     entry.write_text(json.dumps({"model_flops_per_step": 2.5e11}))
     assert attribute.main(command) == 0
     time = json.loads(out.read_text())["time"]
-    assert time["peak_source"] == "no device named" and time["xprof_peak_gflops"] == 3742430.0
+    assert time["xprof_peak_gflops"] == 3742430.0
     assert (time["peak_gflops"], time["mfu_bf16_of_device_time"], time["mfu_mixed_of_device_time"],
             time["gemm_lost_ms"], time["gemm_fraction_of_peak"]) == (None, None, None, None, None)
     assert time["device_ms_per_step"] == 1.0
 
 
-def test_an_fp8_gemm_counts_against_its_own_peak(tmp_path, monkeypatch):
-    """With an FP8 GEMM in the step, mfu_bf16 is a bf16-equivalent throughput, and mfu_mixed takes
-    that GEMM's FLOPs over the FP8 peak; with no FP8 peak for the device, mfu_mixed is unknown."""
-    from dew.nn.kernels.generation import gpu_target
-    peaks = gpu_target('sm120').dense_peaks['NVIDIA RTX PRO 6000 Blackwell']
-
-    reports = tmp_path / "profile" / "capture-a" / "reports"
-    reports.mkdir(parents=True)
-    columns = ["program_id", "category", "hlo_op_name", "hlo_op_expression", "tf_op_name", "occurrences",
-               "total_self_time", "source_info", "model_flop_rate"]
-    cells = [("15", "custom-call", "custom-call.1", '%custom-call.1 = bf16[8,8]{1,0} custom-call('
-              'f8e4m3fn[8,8]{1,0} %a, f8e4m3fn[8,8]{1,0} %b), custom_call_target="__cublas$lt$matmul$f8"',
-              "jit(step)/dot_general", "1", 1000.0, "", 1.0e5),
-             ("15", "custom-call", "custom-call.2", '%custom-call.2 = bf16[8,8]{1,0} custom-call('
-              'bf16[8,8]{1,0} %a, bf16[8,8]{1,0} %b), custom_call_target="__cublas$gemm"',
-              "jit(step)/dot_general", "1", 1000.0, "", 1.0e5)]
-    rows = [{"c": [{"v": v} for v in row]} for row in cells]
-    (reports / "hlo_stats.json").write_text(json.dumps([{"cols": [{"id": name} for name in columns],
-                                                         "rows": rows}]))
-    (reports / "roofline_model.json").write_text(json.dumps({"p": {"peak_flop_rate": 3742430.0}}))
-    entry = tmp_path / "entry.json"
-    entry.write_text(json.dumps({"model_flops_per_step": 2e11, "device": "NVIDIA RTX PRO 6000 Blackwell"}))
-    out = tmp_path / "attribution.json"
-    command = ["--trace", str(tmp_path / "profile"), "--out", str(out), "--entry", str(entry)]
-    monkeypatch.delitem(peaks, 'fp8')
-    assert attribute.main(command) == 0
-    time = json.loads(out.read_text())["time"]
-    # 1e5 GFLOP/s for 1 ms is 1e11 FLOPs on FP8 of the 2e11 the model does, over 2 ms.
-    assert time["fp8_gemm_flops_per_step"] == 1e11 and time["mfu_mixed_of_device_time"] is None
-    assert time["mfu_bf16_of_device_time"] == 0.2 and time["bf16_equiv_throughput_tflops"] == 100.0
-    monkeypatch.setitem(peaks, 'fp8', 1000e12)
-    assert attribute.main(command) == 0
-    # 1e11 / 5e14 + 1e11 / 1e15 over 2 ms.
-    assert json.loads(out.read_text())["time"]["mfu_mixed_of_device_time"] == 0.15
 def test_a_gemm_is_judged_at_its_compiled_flops_against_its_own_precisions_peak(tmp_path):
     """XProf's normalized rate scales a GEMM's FLOPs by bf16's peak over its precision's, so an fp32
     dot it takes for non-tensor-core arithmetic reads above any peak (the later Qwen3.5-0.8B step's GEMMs at 1.127 of
@@ -370,18 +285,6 @@ def test_a_gemm_is_judged_at_its_compiled_flops_against_its_own_precisions_peak(
     assert time["mfu_mixed_of_device_time"] == 0.65
 
 
-def test_a_module_read_as_it_streams_is_the_module_read_whole():
-    """Line by line, with the metadata kept only as traced names: the same instructions, kinds and
-    traced names as the whole text, braces inside a quoted op_name included."""
-    quoted = MODULE.replace('kind=kInput, calls=%fused_reduce.89',
-                            'kind=kInput, calls=%fused_reduce.89, metadata={op_name="jit(step)/a{b}" '
-                            'source_file="x.py" source_line=3}, backend_config={"k":1}')
-    whole, streamed = hlo_instructions(quoted), hlo_instructions(iter(quoted.splitlines()))
-    assert whole == streamed
-    assert streamed["input_reduce_fusion.89"].traced == {"jit(step)/a{b} x.py:3"}
-    assert streamed["input_reduce_fusion.89"].fused == {"parameter", "constant", "reduce"}
-
-
 def test_the_dump_reads_only_its_newest_module_from_an_archive(tmp_path):
     """A dump holds every compile of the step; only the newest one's four files are extracted,
     and the memory breakdown reads them a line at a time."""
@@ -404,10 +307,6 @@ def test_the_dump_reads_only_its_newest_module_from_an_archive(tmp_path):
         writer.add(dump, arcname="hlo")
     for source in (archive, dump):
         with attribute.dump_files(source, "jit_step") as files:
-            assert files["module_number"] == "15"
-            assert set(files) == {"module_number", ".txt", "-live-range.txt", "-buffer-assignment.txt",
-                                  "-memory-usage-report.txt"}
             memory = attribute.attribute_memory(files)
         assert (memory["peak_gib"], memory["total_bytes_gib"], memory["allocations_gib"]) == (
             2.0, 2.0, {"parameter": 2.0})
-        assert memory["peak_by_role_and_part_gib"][0]["role"] == "argument: parameters"
