@@ -12,10 +12,9 @@ import numpy as np
 import pytest
 
 from dew.config.data import HoldOut, ImageData, loader
-from dew.data import TFDS, Loading
+from dew.data import TFDS, Loading, Memory, images
 from dew.data.dataset import DataPartition
 from dew.data.image_codec import decode_image
-from dew.data.steps.image import ImageRecord
 
 tfds = pytest.importorskip("tensorflow_datasets", reason="needs the tfds extra")
 
@@ -34,9 +33,10 @@ def test_prepared_records_carry_encoded_pixels_labels_and_caption_names():
         assert isinstance(record["image"], bytes)
         np.testing.assert_array_equal(decode_image(record["image"]), np.full((8, 8, 3), index + 10, np.uint8))
         assert record["label"] == index % 2
-        result = ImageRecord(8, 8, templates=spec.caption_templates, classes=("red",
-            "blue")).random_map(record, np.random.default_rng(0))
-        caption, label = result["caption"], result["label"]
+        result = next(Memory([record]).map(images.decode("image", rejects=False))
+                      .random_map(images.caption(templates=spec.caption_templates,
+                                                 classes=("red", "blue"))).batch(1).iterate())
+        caption, label = result["caption"][0], result["label"][0]
         assert ("red" if label == 0 else "blue") in caption.split()
     test_split = TFDS("dew_images", path=str(FIXTURE), split="test",
         decoders={"image": tfds.decode.SkipDecoding()}).records("indexed")
