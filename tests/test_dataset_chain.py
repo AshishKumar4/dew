@@ -408,7 +408,7 @@ def test_an_iterator_resumes_through_its_own_state_or_by_replaying():
     # The state is a NumPy array, as a library's own state often holds, through the JSON checkpoint.
     for source in (from_iter(Countdown, name="countdown", state=lambda it: np.array([it.next]),
                              load_state=lambda it, saved: setattr(it, "next", int(saved[0]))),
-                   from_iter(Countdown, name="replayed")):
+                   from_iter(Countdown, name="replayed", replay=True)):
         reader = compile(source.repeat().batch(4), read="streamed", loading=READ).train(DataPartition())
         try:
             first = [next(reader)["i"].tolist() for _ in range(3)]
@@ -423,6 +423,28 @@ def test_an_iterator_resumes_through_its_own_state_or_by_replaying():
             assert [next(resumed)["i"].tolist() for _ in range(3)] == rest
         finally:
             resumed.close()
+
+
+def test_an_iterator_without_a_position_or_a_declared_replay_does_not_resume():
+    """A stateless iterator that declares no replay reads and reports how far
+    it read, but refuses to resume, naming itself and both remedies; one
+    resuming through state= cannot also declare a replay."""
+    source = from_iter(Countdown, name="undeclared")
+    reader = compile(source.repeat().batch(4), read="streamed", loading=READ).train(DataPartition())
+    try:
+        next(reader)
+        state = reader.get_state()
+    finally:
+        reader.close()
+    resumed = compile(source.repeat().batch(4), read="streamed", loading=READ).train(DataPartition())
+    try:
+        with pytest.raises(ValueError, match=r"iter:undeclared keeps no position and declares no replay"):
+            resumed.set_state(state)
+            next(resumed)
+    finally:
+        resumed.close()
+    with pytest.raises(ValueError, match="not both"):
+        from_iter(Countdown, name="both", state=lambda it: 0, load_state=lambda it, saved: None, replay=True)
 
 
 def test_a_hugging_face_stream_resumes_exactly_and_its_own_shuffle_is_refused():

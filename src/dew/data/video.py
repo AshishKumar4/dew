@@ -1,13 +1,8 @@
-"""Audio-video datasets: a directory tree of clips, one random clip per record.
+"""Video records: a directory tree of clips, a clip window drawn once, and its frames.
 
-A record is a video file and a caption. The transform reads `frames` frames
-from a random offset with the audio around them, resizes the frames and
-featurises the audio for the audio model. Records leave as
-`{"video": uint8 [frames, size, size, 3], "caption": str, "audio": {...}}`,
-where the audio dict holds the audio model's own feature keys next to
-`full_audio`, the padded waveform cut into one row per frame.
-`load(tokenize=)` is where a run's condition reads the captions. The AV
-reader and the audio processor are imported on use.
+`pick_clip` draws a record's time window, `decode` reads its frames and
+`dew.data.audio.decode` its sound over the same window, so frames and audio
+come from one draw. The AV reader is imported on use.
 """
 
 from __future__ import annotations
@@ -18,7 +13,7 @@ import numpy as np
 
 if TYPE_CHECKING:
     from dew.data.sources.urls import Fetch
-    from dew.data.steps.video import Audio, DecodeClip
+    from dew.data.steps.video import DecodeVideo, PickClip
 
 
 def fit_frames(frames: np.ndarray, size: int) -> np.ndarray:
@@ -38,19 +33,20 @@ def fetch(url: str = "url", to: str = "mp4", *, timeout: float = 30.0, max_bytes
     return Fetch(url, to, timeout, max_bytes)
 
 
-def decode_clip(frames: int = 16, *, size: int = 256, fps: float = 25.0, field: str = "mp4",
-                to: str = "video", audio_padding: int | None = None, sample_rate: int = 16_000) -> DecodeClip:
-    """A random record step that decodes `frames` frames at `fps` from a
-    random start of the clip in `field`, bytes or a path, each fitted into a
-    `size` square, under `to`; with `audio_padding`, the sound under them
-    too (`DecodeClip`). A clip that does not decode is counted and dropped."""
-    from dew.data.steps.video import DecodeClip
+def pick_clip(seconds: float, *, margin: float = 0.0, field: str = "mp4", to: str = "clip") -> PickClip:
+    """A random record step that draws a `seconds`-long window of the media in `field`, bytes or a
+    path, `margin` seconds clear of either end, under `to` as `[start, stop]` seconds
+    (`PickClip`). Media shorter than the window, or that does not read, is counted and dropped."""
+    from dew.data.steps.video import PickClip
 
-    return DecodeClip(frames, size, fps, field, to, audio_padding, sample_rate)
+    return PickClip(seconds, margin, field, to)
 
 
-def audio(features: str = "facebook/wav2vec2-base-960h") -> Audio:
-    """A record step that featurizes a decoded clip's "audio" for the audio model `features`."""
-    from dew.data.steps.video import Audio
+def decode(frames: int = 16, *, fps: float = 25.0, size: int = 256, field: str = "mp4", clip: str = "clip",
+           to: str = "video") -> DecodeVideo:
+    """A record step that decodes `frames` frames at `fps` from the start of the window `pick_clip`
+    wrote under `clip`, each fitted into a `size` square, uint8 under `to` (`DecodeVideo`). A clip
+    that does not decode is counted and dropped."""
+    from dew.data.steps.video import DecodeVideo
 
-    return Audio(features)
+    return DecodeVideo(frames, fps, size, field, clip, to)
