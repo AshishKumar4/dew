@@ -30,6 +30,7 @@ from dew.nn.attention import RMSNorm
 from dew.nn.blocks import sinusoidal_time
 from dew.nn.flops import MissingFlopsCount, matching_lengths, patch_lengths, projection_flops
 from dew.nn.precision import at_least_fp32
+from dew.nn.rope import axis_tables
 from dew.nn.scan_orders import patchify, unpatchify
 from dew.nn.sharding import logical_axes
 
@@ -46,24 +47,16 @@ FREQUENCIES = 256
 modulate by: `min(dim, 256)`."""
 
 
-def rotary_table(dim: int, length: int, theta: float) -> tuple[np.ndarray, np.ndarray]:
-    """Return one axis of `RopeEmbedder.precompute_freqs_cis`: cosines and sines `[length, dim // 2]`.
-
-    There is one angle per channel pair at each integer position. The angles
-    are float64 products rounded to float32, and the source takes their
-    float32 cosine and sine.
-    """
-    frequencies = 1.0 / theta ** (np.arange(0, dim, 2, dtype=np.float64) / dim)
-    angles = np.outer(np.arange(length, dtype=np.float64), frequencies).astype(np.float32).astype(np.float64)
-    return np.cos(angles).astype(np.float32), np.sin(angles).astype(np.float32)
-
-
 def _rotation(positions, axes: Sequence[int], lengths: Sequence[int], theta: float, dtype):
     """The rotary cosines and sines for integer `positions` `[B, S, 3]` in
-    `dtype`, one per channel pair, `[B, S, sum(axes) // 2]`."""
+    `dtype`, one per channel pair, `[B, S, sum(axes) // 2]`, looked up in
+    each axis's table of `RopeEmbedder.precompute_freqs_cis`: `[length, dim // 2]`
+    over the integer ids below `length`, float32 angles of float64 products
+    and their float32 cosines and sines."""
     cosines, sines = [], []
     for index, (dim, length) in enumerate(zip(axes, lengths, strict=True)):
-        cos_table, sin_table = rotary_table(dim, length, theta)
+        cos_table, sin_table = axis_tables(np.arange(length)[:, None], (dim,), theta,
+                                           dtype=np.float64, stored=np.float32)
         cosines.append(jnp.asarray(cos_table, dtype)[positions[..., index]])
         sines.append(jnp.asarray(sin_table, dtype)[positions[..., index]])
     return jnp.concatenate(cosines, axis=-1), jnp.concatenate(sines, axis=-1)
@@ -298,4 +291,4 @@ class ZImageTransformer(nn.Module):
         return -unpatchify(out, 2, *x.shape[1:])
 
 
-__all__ = ["ZImageBlock", "ZImageTransformer", "rotary_table"]
+__all__ = ["ZImageBlock", "ZImageTransformer"]
