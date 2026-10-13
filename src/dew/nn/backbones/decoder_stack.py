@@ -375,6 +375,18 @@ def _stack_leaves(*trees):
     return jax.tree.map(lambda *leaves: jnp.stack(leaves), *trees)
 
 
+def _refuse_unlike(collection: str, trees: Sequence, names: Sequence[str]) -> None:
+    """Refuse layers one scanned run or the stages' like positions read whose
+    `collection` differs in structure, as layers a checkpoint quantizes
+    differently do; the run reads one body for all of them."""
+    structures = [jax.tree.structure(tree) for tree in trees]
+    unlike = [name for name, structure in zip(names, structures, strict=True) if structure != structures[0]]
+    if unlike:
+        raise ValueError(f"collection {collection!r} differs between {names[0]} and {', '.join(unlike)}, "
+                         "which one scanned run or pipeline stage reads as like layers; run these layers "
+                         "unscanned on one stage")
+
+
 @dataclasses.dataclass(frozen=True)
 class StackView:
     """Converts the layer stack's variables between their stored layout and the one its loops read.
@@ -442,6 +454,8 @@ class StackView:
                         f"collection {collection!r} holds some of the layers "
                         f"{sorted(layer for stage in names for layer in stage)} and not "
                         "the others; a run reads every one of its layers or none")
+                _refuse_unlike(collection, [tree[layer] for stage in names for layer in stage],
+                               [layer for stage in names for layer in stage])
                 runs = [_stack_leaves(*[tree.pop(layer) for layer in stage]) if count > 1
                         else tree.pop(stage[0]) for stage in names]
                 if self.stages == 1:

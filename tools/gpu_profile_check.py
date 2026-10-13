@@ -30,7 +30,6 @@ import os
 import statistics
 import subprocess
 import sys
-import time
 from pathlib import Path
 
 COMMAND_BUFFERS_OFF = "--xla_gpu_enable_command_buffer="
@@ -45,6 +44,7 @@ def capture(out: Path) -> dict:
     from trace_window import device_events, length, union
 
     import dew
+    from dew.nn.kernels.tuning import samples
     from dew.telemetry.profile import attributed_ops
 
     def layers(x, weights):
@@ -56,13 +56,7 @@ def capture(out: Path) -> dict:
     step = jax.jit(jax.grad(loss))
     weights = jax.random.normal(jax.random.key(0), (4, 256, 256), jnp.float32) * 0.05
     x = jax.random.normal(jax.random.key(1), (64, 256), jnp.float32)
-    for _ in range(5):
-        jax.block_until_ready(step(weights, x))
-    walls = []
-    for _ in range(10):
-        began = time.perf_counter()
-        jax.block_until_ready(step(weights, x))
-        walls.append(time.perf_counter() - began)
+    walls = samples(step, weights, x, warmup=5, repeats=10)
     with dew.Profiler(out) as profiler:
         for _ in range(STEPS):
             jax.block_until_ready(step(weights, x))

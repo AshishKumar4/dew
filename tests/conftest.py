@@ -110,3 +110,4 @@ def caplog(caplog):
 @pytest.fixture
 def rng():
     return jax.random.PRNGKey(0)
+

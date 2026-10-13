@@ -31,6 +31,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 from flax import linen as nn
+from flax.core import unfreeze
 from flax.training import dynamic_scale as dynamic_scale_lib
 from jax.sharding import AbstractMesh, Mesh, NamedSharding, PartitionSpec as P
 from typing_extensions import TypeVar as DefaultTypeVar
@@ -48,6 +49,7 @@ from dew.data.dataset import (
 )
 from dew.nn.flops import MissingFlopsCount
 from dew.nn.kernels.generation import assumed, gpu_mesh, gpu_target, measured_kernel
+from dew.nn.kernels.tuning import tune
 from dew.nn.sharding import (
     BATCH_AXES,
     SEQUENCE_AXIS,
@@ -112,7 +114,7 @@ from dew.training.distributed import (
     prefetched_bytes,
     shard_batch,
 )
-from dew.training.evaluation import EvalSuite, Evaluation
+from dew.training.evaluation import EvalSuite, Evaluation, MetricScores
 from dew.training.interval import Interval
 from dew.training.memory import (
     climb_to,
@@ -296,58 +298,6 @@ class Plateau:
     def __post_init__(self):
         if self.evals < 1 or self.min_delta < 0 or not math.isfinite(self.min_delta):
             raise ValueError("Plateau needs evals >= 1 and min_delta >= 0")
-
-
-class _MetricValues[Statistics, Additions](Mapping):
-    def __init__(
-        self,
-        metrics: Sequence[Metric],
-        scores: Mapping[str, float],
-        objective: Objective[Statistics, Additions],
-    ):
-        self.objective = objective
-        self.metrics = tuple(metrics) + tuple(objective.scalars[name] for name in ('loss', *objective.shown)
-                                              if name == 'loss' or f'train/{name}' in scores)
-        self.scores = scores
-
-    def __getitem__(self, metric):
-        split = 'val'
-        if isinstance(metric, tuple):
-            split, metric = metric
-        if isinstance(metric, TrainingScalar):
-            if metric.owner is not self.objective:
-                raise KeyError("training score belongs to another objective")
-            return self.scores[f'train/{metric.name}']
-        if (
-            isinstance(metric, types.MethodType)
-            and metric.__name__ == "loss"
-            and metric.__self__ is self.objective
-        ):
-            return self.scores['train/loss']
-        if isinstance(metric, str):
-            if any(metric == f'{name}/{declared.name}' for name in {key.split('/')[0] for key in self.scores}
-                   for declared in self.metrics):
-                raise KeyError("index declared evaluation scores by metric object")
-            return self.scores[metric]
-        for declared in self.metrics:
-            if declared is metric:
-                return self.scores[f'{split}/{declared.name}']
-        raise KeyError("the score refers to a metric not passed to fit")
-
-    def __iter__(self):
-        for name in self.scores:
-            split, _, label = name.partition('/')
-            metric = next((metric for metric in self.metrics if metric.name == label), None)
-            yield (
-                name
-                if metric is None
-                else metric
-                if split == "val" or isinstance(metric, TrainingScalar)
-                else (split, metric)
-            )
-
-    def __len__(self):
-        return len(self.scores)
 
 
 def _suites(dataset: Dataset, validation: Mapping[str, Reader | EvalSuite] | None,
@@ -602,7 +552,10 @@ class Trainer(Generic[Loss, Effects]):
         # Static metadata, the same on every trace of the state: the
         # placement reads it from here rather than tracing init again.
         self._boxed = boxed_axes(initialized)
-        params = nn.unbox(initialized)
+        # The state holds its trees as dicts, whichever Flax container (a
+        # FrozenDict) the objective's tree came in, so its placement, its
+        # updates and its restores share one structure.
+        params = unfreeze(nn.unbox(initialized))
         if "params" not in params:
             raise ValueError(
                 f"the objective's tree has no params collection, only {sorted(params)}; "
@@ -1244,8 +1197,10 @@ class Trainer(Generic[Loss, Effects]):
              if built is None and field is not None])
         jitted = self._jitted(shapes, copies, shardings, placement, replicated, split)
         part = jax.ShapeDtypeStruct((), jnp.int32, sharding=replicated)
-        return Candidate(micro, shapes, copies, shardings, prepared, held,
-                         jitted.lower(prepared, batch, part))
+        lower = functools.partial(jitted.lower, prepared, batch, part)
+        # The lowering after `tune` reads the launch configs it settled.
+        tune(lower)
+        return Candidate(micro, shapes, copies, shardings, prepared, held, lower())
 
     def _prepared(self, state: TrainState, batch: Batch, schedule: Schedule, window: int):
         """The loss's shapes (None under a custom step), the narrow copies and the state's shapes
@@ -1508,6 +1463,8 @@ class Trainer(Generic[Loss, Effects]):
             if checkpoints is not None and checkpoints.latest is not None:
                 run.stop_control = checkpoints.control(checkpoints.latest)
         else:
+            # A supplied state's trees are held as dicts too (`initial_state`).
+            initial = dataclasses.replace(initial, variables=unfreeze(dict(initial.variables)))
             shardings = self.shardings(initial)
             self.check(initial.variables, shardings.variables)
             state = jax.device_put(initial, shardings)
@@ -1926,7 +1883,7 @@ class Trainer(Generic[Loss, Effects]):
             else:
                 name = f'aggregate:{index}'
                 try:
-                    value = float(metric(_MetricValues(plan.scored, scores, self.objective)))
+                    value = float(metric(MetricScores(plan.scored, scores, self.objective)))
                 except KeyError:
                     value = float('nan')
             mode = selection.mode or 'min'
