@@ -35,7 +35,8 @@ itself and what every file shares (`shared`: the environment's locks, the
 CI tools, every non-Python file under tests/ and src/, and the names of every
 Python file there, so a file a scanner would find changes every key). The
 plan recomputes each file's key from its record at the commit it plans, and
-leaves out a file whose every row's key matches, which ran green on exactly
+leaves out a file whose every row's key matches on every CPU class the pool has
+shown (float32 results differ by microarchitecture), which ran green on exactly
 these inputs. A file that started another process is never skipped, since no
 event saw that process's code. The records live in the dew-xla-cache Worker
 under `testcache/`; with DEW_TEST_CACHE=off, or without its URL and token, the
@@ -140,11 +141,32 @@ def cache_key(common: str, name: str, depends: list[str]) -> str:
     return digest.hexdigest()
 
 
-def cache_url(python: str, row_name: str) -> str:
-    """Where the record of `row_name` lives: the Worker's key alphabet has no colon or hash."""
+def cpu_class() -> str:
+    """This host's CPU microarchitecture (vendor, family, model). XLA:CPU emits the same code on every
+    host, but hardware estimate instructions (vrsqrtps) differ between microarchitectures, so float32
+    results, and thus numerical verdicts, belong to the class that produced them."""
+    fields = {}
+    for line in Path("/proc/cpuinfo").read_text().splitlines():
+        key, _, value = line.partition(":")
+        if key.strip() in ("vendor_id", "cpu family", "model") and key.strip() not in fields:
+            fields[key.strip()] = value.strip()
+    return "-".join(fields.get(key, "unknown") for key in ("vendor_id", "cpu family", "model"))
+
+
+def cache_url(python: str, row_name: str, cpu: str) -> str:
+    """Where the record of `row_name` on CPU class `cpu` lives: the Worker's key alphabet has no colon
+    or hash."""
     _, name, split = parsed_row(row_name)
-    return (f"{os.environ['DEW_XLA_CACHE_URL'].rstrip('/')}/{CACHE_PREFIX}/{python}/{name}/"
+    return (f"{os.environ['DEW_XLA_CACHE_URL'].rstrip('/')}/{CACHE_PREFIX}/{python}/{cpu}/{name}/"
             + ("-of-".join(split.split("/")) if split else "whole"))
+
+
+def cpu_classes(python: str, token: str) -> list[str]:
+    """Every CPU class a task has recorded from, so a cached verdict counts only if it holds on each
+    class the pool can place a task on."""
+    base = os.environ["DEW_XLA_CACHE_URL"].rstrip("/")
+    listing = cache_request(f"{base}/?list={CACHE_PREFIX}/{python}/classes/", token)
+    return sorted(json.loads(listing)["keys"]) if listing else []
 
 
 def cache_request(url: str, token: str, data: bytes | None = None) -> bytes | None:
@@ -167,8 +189,15 @@ def cache_request(url: str, token: str, data: bytes | None = None) -> bytes | No
 
 def cached_files(python: str, timed: dict[str, float | None], recorded: dict[str, list[float]],
                  target: float) -> set[str]:
-    """The files of `timed` whose every row, as the plan would split them, ran green on these inputs."""
+    """The files of `timed` whose every row, as the plan would split them, ran green on these inputs on
+    every CPU class the pool has shown."""
     common = shared(python)
+    token = os.environ.get("DEW_TEST_CACHE_TOKEN") or os.environ.get("DEW_XLA_CACHE_TOKEN")
+    if os.environ.get("DEW_TEST_CACHE") == "off" or not token or "DEW_XLA_CACHE_URL" not in os.environ:
+        return set()
+    classes = cpu_classes(python, token)
+    if not classes:
+        return set()
 
     def rows_of(name: str) -> list[str]:
         seconds = timed[name]
@@ -178,17 +207,17 @@ def cached_files(python: str, timed: dict[str, float | None], recorded: dict[str
         return [row(python, name, f"{group}/{count}") for group in range(1, count + 1)]
 
     with concurrent.futures.ThreadPoolExecutor(32) as pool:
-        hits = pool.map(lambda name: cached(python, rows_of(name), common), timed)
+        def unchanged(name: str) -> bool:
+            return all(cached(python, rows_of(name), common, cpu, token) for cpu in classes)
+
+        hits = pool.map(unchanged, timed)
         return {name for name, hit in zip(timed, hits, strict=True) if hit}
 
 
-def cached(python: str, rows: list[str], common: str) -> bool:
-    """Whether every one of a file's `rows` ran green on exactly these inputs."""
-    token = os.environ.get("DEW_TEST_CACHE_TOKEN") or os.environ.get("DEW_XLA_CACHE_TOKEN")
-    if os.environ.get("DEW_TEST_CACHE") == "off" or not token or "DEW_XLA_CACHE_URL" not in os.environ:
-        return False
+def cached(python: str, rows: list[str], common: str, cpu: str, token: str) -> bool:
+    """Whether every one of a file's `rows` ran green on exactly these inputs on CPU class `cpu`."""
     for row_name in rows:
-        record = cache_request(cache_url(python, row_name), token)
+        record = cache_request(cache_url(python, row_name, cpu), token)
         if record is None:
             return False
         recorded = json.loads(record)
@@ -464,12 +493,15 @@ def record(python: str, rows: list[dict], executed_report: Path, common: str) ->
     if not token or "DEW_XLA_CACHE_URL" not in os.environ or not executed_report.is_file():
         return
     executed = json.loads(executed_report.read_text())
+    cpu = cpu_class()
+    base = os.environ["DEW_XLA_CACHE_URL"].rstrip("/")
+    cache_request(f"{base}/{CACHE_PREFIX}/{python}/classes/{cpu}", token, b"1")
     for row_ in rows:
         name = parsed_row(row_["name"])[1]
         depends = executed.get(name)
         if row_["exitCode"] == 0 and depends is not None:
             body = json.dumps({"key": cache_key(common, name, depends), "depends": depends}).encode()
-            cache_request(cache_url(python, row_["name"]), token, body)
+            cache_request(cache_url(python, row_["name"], cpu), token, body)
 
 
 def durations(verdicts: list[dict], before: dict[str, float]) -> dict[str, float]:
