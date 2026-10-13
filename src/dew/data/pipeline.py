@@ -541,6 +541,9 @@ class Dataset:
         bins: int = 32,
         policy: Literal["first-fit", "best-fit", "concat"] = "first-fit",
     ) -> Pipeline:
+        """Records laid end to end in rows of `seq_len` tokens: each row holds
+        the per-token `fields` of the records it packs; a field that is one
+        value a record has no place in a row of several and is left out."""
         return self.then(Pack(seq_len, fields, bins, policy))
 
     def windows(

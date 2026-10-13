@@ -24,7 +24,7 @@ import numpy as np
 
 from dew.data.analysis import _analyzed, _identity, _name
 from dew.data.dataset import Batch, LengthGroups, Records
-from dew.data.lowering import _CachedOutputs, _fill, _Locality, _outputs, _packed, _Payload, _TokenSplit
+from dew.data.lowering import _CachedOutputs, _fill, _Locality, _outputs, _packed, _TokenSplit
 from dew.data.mixing import CorpusCounts
 from dew.data.pipeline import (
     FlatMap,
@@ -41,6 +41,7 @@ from dew.data.pipeline import (
 )
 from dew.data.plan import fingerprint
 from dew.data.sources.base import Read, ShardManifest, Source
+from dew.data.steps.generic import Fields
 from dew.records import JSON, integer, json_value, record
 
 _log = logging.getLogger(__name__)
@@ -190,7 +191,8 @@ def _memory_stages(
             derived[f"accepted_before_pack_{consumed}"] = fingerprint(
                 [list(identifier) for identifier, _ in rows]
             )
-            documents = tuple(_Payload()(record(value, "packing document")) for _, value in rows)
+            kept = Fields(stage.fields)
+            documents = tuple(kept.map(record(value, "packing document")) for _, value in rows)
             sizes = np.asarray([len(value[stage.fields[0]]) for value in documents], np.int64)
             if stage.policy == "first-fit":
                 packed = PackedWindows(
