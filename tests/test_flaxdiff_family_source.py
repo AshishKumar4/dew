@@ -107,6 +107,10 @@ def dew_path(cls: str, name: str) -> tuple[str, ...]:
     if mmdit_block(cls, name):
         block, module, *rest = path
         return (block, *MMDIT_MODULES[module], *(MMDIT_LAYERS.get(part, part) for part in rest))
+    if "mlp" in path[:-1]:
+        # A DiT block's MLP, FlaxDiff's `nn.Sequential`, under `GatedMLP`'s names.
+        at = path.index("mlp") + 1
+        path = (*path[:at], MMDIT_LAYERS.get(path[at], path[at]), *path[at + 1:])
     if cls in UNETS:
         # FlaxDiff's ConvLayer wraps the convolution Dew's Conv is, and its
         # middle stage projects with a 1x1 convolution where Dew's is dense.
