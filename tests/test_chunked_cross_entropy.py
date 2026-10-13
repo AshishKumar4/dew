@@ -33,6 +33,12 @@ from dew.nn.protocols import OutputTable
 from dew.objectives.lm import chunked
 from dew.objectives.lm.chunked import chunked_cross_entropy, vocabulary_chunks
 
+EXERCISED = {jnp.float32: 'highest', jnp.bfloat16: 'default'}
+"""The matmul precision each compute dtype's head is compared under: bf16's
+default, the bf16 product it exists for, and fp32's highest. At the default
+an A100 runs each fp32 dot at TF32 or at fp32 as XLA picks for the program,
+so a whole head and its tiles would differ by TF32's rounding."""
+
 
 @pytest.mark.parametrize('dtype', [jnp.float32, jnp.bfloat16])
 @pytest.mark.parametrize('tied', [False, True])
@@ -46,7 +52,7 @@ def test_vocabulary_bias_is_fp32_after_tied_or_untied_head_products(dtype, tied)
     variables = model.init(jax.random.key(0), ids)
     bias = jax.random.normal(jax.random.key(3), (97,), jnp.float32) / 17
     variables['params']['head_bias'] = bias
-    with jax.default_matmul_precision('default'):
+    with jax.default_matmul_precision(EXERCISED[dtype]):
         logits = model.apply(variables, ids)
         states = model.apply(variables, ids, method='hidden_states')
         table = model.apply(variables, method='output_table')
@@ -79,7 +85,7 @@ def test_a_checkpoints_head_input_quantization_reaches_every_head_that_scores_it
     ids = jnp.asarray([[2, 7, 3, 5], [11, 4, 9, 1]], jnp.int32)
     variables = model.init(jax.random.key(0), ids)
     variables[QUANTIZATION]['lm_head'][INPUT_SCALES[kind]] = jnp.asarray(0.37, jnp.float32)
-    with jax.default_matmul_precision('default'):
+    with jax.default_matmul_precision(EXERCISED[dtype]):
         logits = model.apply(variables, ids)
         states = model.apply(variables, ids, method='hidden_states')
         table = chunked.head_table(model, variables)
@@ -121,7 +127,11 @@ def test_vocabulary_bias_gradient_matches_full_logits_under_the_float64_rule(dty
 
     from dew.nn.precision import head_product
 
+    # Sums exact in any order: a tile's product is then the whole product on
+    # any device, as the oracle takes it, where an fp32 sum's last bit, which
+    # a GPU's tile shape picks, can move a bf16 logit a whole bf16 step.
     states, matrix, targets = inputs(vocab=37, features=16, tokens=(2, 5), dtype=dtype)
+    states, matrix = eighths(states, matrix)
     bias = jax.random.normal(jax.random.key(3), (37,), jnp.float32) / 17
     with jax.default_matmul_precision('default'):
         def full(offset):
