@@ -4,7 +4,7 @@
     python3 tools/armada/ci.py plan --target=SECONDS --timings=FILE
     python3 tools/armada/ci.py task --python=3.12 --tests="tests/a.py tests/b.py" --split=[G/N] --out=FILE
     python3 tools/armada/ci.py durations VERDICT...
-    python3 tools/armada/ci.py gpu-tier
+    python3 tools/armada/ci.py gpu-tier [--evidence]
 
 The plan prints a task matrix for each Python CI proves. Whole test files are
 packed heaviest first into the lightest of the tasks, each near `target`
@@ -567,7 +567,8 @@ def main() -> int:
     running.add_argument("--out", type=Path, required=True)
     running.add_argument("--deadline", type=float, default=1680.0,
                          help="seconds before armada's own task timeout (.armada.json) to interrupt at")
-    operations.add_parser("gpu-tier")
+    choosing = operations.add_parser("gpu-tier")
+    choosing.add_argument("--evidence", action="store_true", help="each file's backend reads and marks too")
     recording = operations.add_parser("durations")
     recording.add_argument("verdicts", type=Path, nargs="+",
                            help="green runs' verdicts, the newest first: armada verdict <sha> --json")
@@ -580,7 +581,7 @@ def main() -> int:
         return 0
     if args.operation == "gpu-tier":
         for name, evidence in gpu_tier(PYTHONS[0]).items():
-            print(name, *evidence, sep="\t")
+            print(name, *(evidence if args.evidence else ()), sep="\t")
         return 0
     if args.operation == "plan":
         timings = json.loads(args.timings.read_text()) if args.timings.is_file() else {}
