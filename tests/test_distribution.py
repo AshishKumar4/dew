@@ -712,11 +712,11 @@ def test_a_pool_refuses_a_checkpoint_directory_its_processes_do_not_share(tmp_pa
                "from dew.checkpoints import Checkpoints\n"
                "host = os.path.join(sys.argv[1], 'host' + os.environ['DEW_PROCESS_ID'])\n"
                "checkpoints = Checkpoints(os.path.join(host, 'run'))\n"
-               "print('latest', checkpoints.latest)\n"
+               "print('latest', checkpoints.latest, flush=True)\n"
                "checkpoints.save(1, {'params': {'w': jnp.zeros(1)}})\n")
     done = launch("--processes-per-host", "2", "--", sys.executable, "-c", program,
                   str(tmp_path), devices=1, timeout=300)
-    assert done.returncode != 0, done.stdout + done.stderr
+    assert done.returncode != 0 and done.stdout.count("latest None") == 2, done.stdout + done.stderr
 
 
 def test_a_failed_process_stops_the_pool_with_its_exit_code():
