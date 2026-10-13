@@ -75,7 +75,7 @@ def test_a_checkpoints_head_input_quantization_reaches_every_head_that_scores_it
 
     model = InputQuantization(format='modelopt', sites=(('lm_head', kind),)).apply(CausalTransformer(
         vocab_size=97, emb_features=32, num_layers=1, num_heads=2, mlp_features=32, max_seq_len=8,
-        head_bias=True, dtype=dtype, qk_norm=False, attention_impl='reference'))
+        head_bias=True, tie_embeddings=False, dtype=dtype, qk_norm=False, attention_impl='reference'))
     ids = jnp.asarray([[2, 7, 3, 5], [11, 4, 9, 1]], jnp.int32)
     variables = model.init(jax.random.key(0), ids)
     variables[QUANTIZATION]['lm_head'][INPUT_SCALES[kind]] = jnp.asarray(0.37, jnp.float32)
@@ -192,7 +192,7 @@ def test_a_quantized_split_head_scores_as_one_device_and_moves_no_head_sized_arr
 
     model = InputQuantization(format='modelopt', sites=(('lm_head', 'fp8'),)).apply(CausalTransformer(
         vocab_size=512, emb_features=16, num_layers=1, num_heads=2, mlp_features=16, max_seq_len=4,
-        qk_norm=False, attention_impl='reference'))
+        tie_embeddings=False, qk_norm=False, attention_impl='reference'))
     tokens = jnp.arange(20, dtype=jnp.int32).reshape(4, 5)
     variables = model.init(jax.random.key(0), tokens[:, :-1])
     variables[QUANTIZATION]['lm_head'][INPUT_SCALES['fp8']] = jnp.asarray(0.02, jnp.float32)
