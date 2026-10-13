@@ -23,7 +23,7 @@ from dew.data.dataset import Batch, Records
 from dew.data.pipeline import Pack
 from dew.data.plan import fingerprint
 from dew.data.sources.base import Read, Shard, ShardManifest, Source, _consumed
-from dew.data.tokens import chunk_lengths, chunk_table, first_fit, packed_window
+from dew.data.tokens import first_fit, packed_window
 from dew.records import record
 
 
@@ -39,8 +39,9 @@ def plan_windows(lengths: np.ndarray, pack: Pack) -> Mapping[str, np.ndarray]:
     out."""
     if pack.policy != "first-fit":
         raise ValueError("indexed packing currently needs policy='first-fit'")
-    chunk_sizes = chunk_lengths(lengths, pack.seq_len)
-    documents, offsets = chunk_table(lengths, pack.seq_len)
+    chunk_sizes = np.asarray(lengths, np.int64)
+    documents = np.arange(len(chunk_sizes), dtype=np.int64)
+    offsets = np.zeros(len(chunk_sizes), np.int64)
     order, starts = first_fit(chunk_sizes, pack.seq_len, pack.bins)
     targets = np.asarray(
         [

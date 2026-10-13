@@ -252,7 +252,7 @@ def test_dropped_records_are_the_same_whole_sharded_and_resumed():
     kept = {(origin, i) for origin in ("a", "b") for i in range(30) if i % 3}
 
     def keys(batch):
-        return set(zip(batch["origin"].tolist(), batch["i"].tolist(), strict=True))
+        return set(zip(batch["origin"], batch["i"].tolist(), strict=True))
 
     whole = data.train(DataPartition())
     halves = [data.train(DataPartition(index, 2)) for index in range(2)]
