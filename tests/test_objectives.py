@@ -312,6 +312,22 @@ def test_a_supplied_rule_is_computed_only_where_something_differentiates():
     np.testing.assert_array_equal(jax.grad(statistic)(params, x)["w"], jnp.sin(x).sum(0))
 
 
+def test_a_loss_mean_is_as_exact_as_numpys_float32_mean():
+    """Each of 64 rows' mean over 6144 squares, a small JEPA loss's count, within the float64 gate:
+    one reduction over every element left such a mean a float32 ulp from float64, several times
+    numpy's distance, and the gate refused the JEPA loss on some weights. The batch's mean holds too."""
+    from reference_error import assert_as_exact_as_the_reference
+
+    squares = np.square(np.random.default_rng(0).normal(1.2, 1.0, size=(64, 6144))).astype(np.float32)
+    ratio = Objective.row_mean(jnp.asarray(squares), {}, axis=1)
+    rows = np.asarray(ratio.total / ratio.mass)
+    assert_as_exact_as_the_reference(rows, squares.mean(axis=1), squares.astype(np.float64).mean(axis=1),
+                                     "row means")
+    whole = Objective.row_mean(jnp.asarray(squares), {})
+    assert_as_exact_as_the_reference(np.asarray([whole.total / whole.mass]), np.asarray([squares.mean()]),
+                                     np.asarray([squares.astype(np.float64).mean()]), "batch mean")
+
+
 def test_row_weights_count_the_real_rows_of_a_pass_and_every_row_of_training():
     """The last batch of a pass over five records at four a batch holds one
     real record and three repeats, weighted 1 and 0; a training batch carries
