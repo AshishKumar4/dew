@@ -449,6 +449,9 @@ class RMSNorm(nn.Module):
     order, x * rsqrt(mean(x^2) + eps) * w in the input dtype. The backward pass
     keeps the input in its own dtype (`normalized_in_fp32`). `activation`
     (None for none) runs on the norm before its last cast, as `GroupNorm`'s.
+    `groups` takes the statistics over each of that many equal, contiguous
+    parts of the axis, under one weight over the whole axis, as
+    `K2HorizonRMSNorm` does (modeling_k2_horizon.py:613-636).
     """
     epsilon: float = 1e-5
     scale_offset: bool = False
@@ -458,6 +461,7 @@ class RMSNorm(nn.Module):
     dtype: Dtype | None = None
     implementation: str = 'auto'
     activation: Callable[[jax.Array], jax.Array] | None = None
+    groups: int = 1
 
     def __call__(self, x, *, axes=None):
         """The norm of `x`. `axes`, `x`'s logical axes, place the fused kernel on a mesh."""
@@ -473,10 +477,23 @@ class RMSNorm(nn.Module):
             'scale',
             nn.initializers.zeros if self.scale_offset else nn.initializers.ones,
             (x.shape[-1],), jnp.float32) if self.with_scale else None
-        return stream_rms_normalized(x, branch, scale, self.epsilon, dtype, self.scale_offset,
-                                     self.scale_after_cast, self.fp32_statistics,
-                                     implementation=self.implementation, axes=axes,
-                                     activation=self.activation)
+        if self.groups == 1:
+            return stream_rms_normalized(x, branch, scale, self.epsilon, dtype, self.scale_offset,
+                                         self.scale_after_cast, self.fp32_statistics,
+                                         implementation=self.implementation, axes=axes,
+                                         activation=self.activation)
+        if x.shape[-1] % self.groups:
+            raise ValueError(f"a {x.shape[-1]}-wide norm splits into no {self.groups} equal groups")
+
+        def grouped(value):
+            return None if value is None else value.reshape(*value.shape[:-1], self.groups, -1)
+
+        # The groups' own last axis: the one norm body reduces over it, under the weight laid out alike.
+        stream, normed = stream_rms_normalized(
+            grouped(x), grouped(branch), grouped(scale), self.epsilon, dtype, self.scale_offset,
+            self.scale_after_cast, self.fp32_statistics, implementation=self.implementation,
+            activation=self.activation)
+        return stream.reshape(x.shape), normed.reshape(x.shape)
 
 
 class LayerNorm(nn.Module):
