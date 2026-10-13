@@ -899,7 +899,14 @@ def gathered_keys_attention(kernel, query, key, value, shards: int, *, causal,
 
 
 CUDNN_DTYPES = (jnp.bfloat16, jnp.float16)
-CUDNN_MAX_HEAD_DIM = 128
+
+
+def cudnn_max_head_dim() -> int:
+    """The widest head jax's cuDNN attention takes on this GPU: 256 from Hopper
+    on and 128 before it, jax's own bound (`H_max` in
+    jax/_src/cudnn/fused_attention_stablehlo.py)."""
+    generation = device_generation()
+    return 256 if generation.startswith('sm') and int(generation[2:]) >= 90 else 128
 
 
 def cudnn_runs(query, softcap=None) -> bool:
@@ -907,8 +914,9 @@ def cudnn_runs(query, softcap=None) -> bool:
 
     It needs a gpu of sm80 or later (cuDNN refuses bf16 and fp16 below it:
     "SDPA FP16/BF16 requires SM80"), one of cudnn's two dtypes, a head
-    dimension it tiles, and no logit softcap, which no fused kernel applies. Only 'auto'
-    asks this; an explicit 'cudnn' refuses by name instead.
+    dimension it tiles (`cudnn_max_head_dim`), and no logit softcap, which no
+    fused kernel applies. Only 'auto' asks this; an explicit 'cudnn' refuses
+    by name instead.
 
     A run under `--xla_gpu_deterministic_ops` is excluded as well. Under
     that flag XLA's cudnn attention backward path crashes at execution time
@@ -921,7 +929,7 @@ def cudnn_runs(query, softcap=None) -> bool:
     """
     head_dim = query.shape[-1]
     return (gpu_placed() and bf16_dot_runs() and query.dtype in CUDNN_DTYPES
-            and head_dim % 8 == 0 and head_dim <= CUDNN_MAX_HEAD_DIM
+            and head_dim % 8 == 0 and head_dim <= cudnn_max_head_dim()
             and softcap is None and not deterministic_ops_requested())
 
 
@@ -1392,10 +1400,11 @@ def fused_attention(query, key, value, bias, mask, causal, sliding_window, imple
                 f"{query.dtype}. Set dtype bfloat16, or attention_impl 'xla' to "
                 "keep this precision.")
         head_dim = query.shape[-1]
-        if head_dim % 8 or head_dim > CUDNN_MAX_HEAD_DIM:
+        widest = cudnn_max_head_dim()
+        if head_dim % 8 or head_dim > widest:
             raise ValueError(
                 f"cudnn attention needs a head dimension that is a multiple of 8 "
-                f"and at most {CUDNN_MAX_HEAD_DIM}, got {head_dim}; use attention_impl "
+                f"and at most {widest} on this GPU, got {head_dim}; use attention_impl "
                 "'xla' for this shape.")
         if sliding_window is not None and not causal:
             raise ValueError(
