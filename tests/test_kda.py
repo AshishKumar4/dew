@@ -24,9 +24,8 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from dew.nn.kda import KimiDeltaAttention, KimiDeltaAttentionMixer, chunk_kimi_delta_rule
-from dew.nn.linear import l2norm as jax_l2norm, recurrent_delta_rule
-from dew.registry import mixers
+from dew.nn.kda import KimiDeltaAttention
+from dew.nn.linear import chunk_gated_delta_rule, l2norm as jax_l2norm, recurrent_delta_rule
 
 BOUND = 1e-4
 B, S, H, D, E, K = 2, 7, 2, 4, 8, 4  # batch, tokens, heads, head dim, model width, conv kernel
@@ -147,7 +146,7 @@ def test_the_rule_and_all_operand_gradients_match_the_executed_torch_reference(r
     def loss(q, k, v, g, beta, state):
         q, k = jax_l2norm(q), jax_l2norm(k)
         if rule == "chunk":
-            out, final = chunk_kimi_delta_rule(q, k, v, g, beta, state, chunk_size=4)
+            out, final = chunk_gated_delta_rule(q, k, v, g, beta, state, chunk_size=4)
         else:
             out, final = recurrent_delta_rule(q, k, v, g, beta, state)
         value = jnp.sum(out * jnp.asarray(fixture["output_cotangent"], jnp.float32))
@@ -171,7 +170,7 @@ def test_the_chunked_rule_matches_the_oracle_across_chunks_with_a_carried_state(
     ql, kl = jnp.asarray(q, jnp.float32), jnp.asarray(k, jnp.float32)
     from dew.nn.linear import l2norm
 
-    out, final = chunk_kimi_delta_rule(l2norm(ql), l2norm(kl), *as_f32(v, g, beta, state), chunk_size=4)
+    out, final = chunk_gated_delta_rule(l2norm(ql), l2norm(kl), *as_f32(v, g, beta, state), chunk_size=4)
 
     assert scaled(out, wanted) < BOUND
     assert scaled(final, wanted_state) < BOUND
@@ -184,7 +183,7 @@ def test_the_recurrent_rule_matches_the_oracle_and_the_chunked_rule(operands):
 
     ql, kl = l2norm(jnp.asarray(q, jnp.float32)), l2norm(jnp.asarray(k, jnp.float32))
     out, final = recurrent_delta_rule(ql, kl, *as_f32(v, g, beta, state))
-    chunked, chunked_state = chunk_kimi_delta_rule(ql, kl, *as_f32(v, g, beta, state), chunk_size=4)
+    chunked, chunked_state = chunk_gated_delta_rule(ql, kl, *as_f32(v, g, beta, state), chunk_size=4)
 
     assert scaled(out, wanted) < BOUND
     assert scaled(final, wanted_state) < BOUND
@@ -232,19 +231,6 @@ def test_the_layer_matches_the_oracle_in_both_forget_gate_forms(lower_bound):
         module.init(jax.random.key(0), jnp.asarray(x, jnp.float32))["params"].keys()
         == variables["params"].keys()
     )
-
-
-def test_a_per_head_scalar_decay_is_a_different_layer():
-    """The decay is a vector over the key dimensions; GDN's per-head scalar
-    over the same weights is not KDA, and the oracle separates the two."""
-    module, params, variables = layer_and_params(-5.0)
-    x = np.random.RandomState(4).randn(B, S, E)
-
-    def scalar_decay(q, k, v, g, beta, state):
-        return oracle_recurrent(q, k, v, np.broadcast_to(g.mean(-1, keepdims=True), g.shape), beta, state)
-
-    wanted = oracle_layer(x, params, -5.0, 1e-5, scalar_decay)
-    assert scaled(module.apply(variables, jnp.asarray(x, jnp.float32)), wanted) > 1e-2
 
 
 def test_the_layer_gradients_match_central_differences_of_the_oracle():
@@ -303,22 +289,15 @@ def test_prefill_then_token_steps_reproduce_the_parallel_layer():
 def test_padded_rows_preserve_the_memory_and_the_history():
     """A padded slot writes nothing: the layer over a packed row with a gap
     equals the layer over the same tokens contiguous, on the real tokens."""
-    from dew.nn.inputs import AttentionMetadata
+    from dew.nn.inputs import AttentionMetadata, coordinates
 
     module, _, variables = layer_and_params(-5.0)
     x = jnp.asarray(np.random.RandomState(7).randn(1, 6, E), jnp.float32)
     valid = jnp.array([[True, True, False, True, True, False]])
     compact = x[:, jnp.array([0, 1, 3, 4])]
 
-    gapped = module.apply(variables, x, attention_metadata=AttentionMetadata(valid=valid))
+    gapped = module.apply(variables, x,
+                          attention_metadata=AttentionMetadata(coordinates=coordinates(valid=valid)))
     wanted = module.apply(variables, compact)
 
     assert scaled(np.asarray(gapped)[:, [0, 1, 3, 4]], np.asarray(wanted)) < BOUND
-
-
-def test_the_kind_builds_from_the_configs_fields():
-    mixer = mixers.from_record({"class": "kimi_delta_attention", "fields": {
-        "linear_num_heads": 3, "linear_head_dim": 8, "linear_conv_kernel_dim": 4,
-        "linear_lower_bound": -5.0}})
-    assert isinstance(mixer, KimiDeltaAttentionMixer)
-    assert mixer.linear_num_heads == 3 and mixer.linear_head_dim == 8

@@ -16,6 +16,8 @@ import numpy as np
 from dew.data.dataset import Batch, LengthGroups
 
 if TYPE_CHECKING:
+    import jax
+
     from dew.data.cache import Cache, Generation
     from dew.data.dataset import Loading
     from dew.data.sources.base import Read, Source
@@ -280,9 +282,21 @@ class Group:
     groups: LengthGroups
 
 
+class DeviceStep:
+    """A step over the training batch that runs inside the compiled training
+    step, on the accelerator, rather than in the reader: pure and traceable,
+    a batch of arrays in and out, its randomness only from per-record key
+    fields (`images.augmentation_key`), so its draws are the same at any
+    split, microbatch or pool size and on resume. The reader leaves the fields
+    it reads in the batch it delivers (`Loader.device`)."""
+
+    def __call__(self, batch: Mapping[str, jax.Array]) -> dict[str, jax.Array]:
+        raise NotImplementedError
+
+
 @dataclasses.dataclass(frozen=True)
 class MapBatch:
-    step: HostStep
+    step: HostStep | DeviceStep
     identity: str | None = None
 
 
@@ -422,6 +436,14 @@ class Dataset:
             hosts = [step for step in steps if _host(step)]
             if len(hosts) < len(steps):
                 raise TypeError("after batch, map takes functions of the training batch that keep every row")
+            # A device step runs in the compiled training step, after every host step the reader runs:
+            # a host step written after one would read what it had not yet made. The objective's own
+            # batch steps read the fields it leaves alone, and attach after it (`compile`).
+            written = [stage.step for stage in self.chain().stages if isinstance(stage, MapBatch)] + hosts
+            first = next((index for index, step in enumerate(written) if isinstance(step, DeviceStep)), None)
+            if first is not None and not all(isinstance(step, DeviceStep) for step in written[first:]):
+                raise ValueError(f"{type(written[first]).__name__} runs in the compiled training step, after "
+                                 "every host step of the batch; map the host steps before it")
             return self.then(*(MapBatch(step, identity) for step in hosts))
         if batched:
             return self.then(*(Batched(step, batch_size, identity) for step in _columns(steps)))
@@ -541,6 +563,9 @@ class Dataset:
         bins: int = 32,
         policy: Literal["first-fit", "best-fit", "concat"] = "first-fit",
     ) -> Pipeline:
+        """Records laid end to end in rows of `seq_len` tokens: each row holds
+        the per-token `fields` of the records it packs; a field that is one
+        value a record has no place in a row of several and is left out."""
         return self.then(Pack(seq_len, fields, bins, policy))
 
     def windows(
@@ -655,12 +680,17 @@ class Dataset:
         as a validation pass reads it, or endlessly after a `repeat`, as
         training reads it, where random steps after a shuffle or a drop may
         draw."""
-        from dew.data.compile import compile, validation
+        from dew.data.compile import _batch_steps, compile, validation
         from dew.data.dataset import Closeable, DataPartition, Loading
         from dew.objectives.base import VALID_ROWS
 
         chain = self.chain()
         batched = any(isinstance(stage, (BatchStage, TokenBudget)) for stage in chain.stages)
+        # Device steps run here, on the batches read, as the compiled training step runs them.
+        _, device = _batch_steps(chain)
+        chain = dataclasses.replace(chain, stages=tuple(
+            stage for stage in chain.stages
+            if not (isinstance(stage, MapBatch) and isinstance(stage.step, DeviceStep))))
         read = chain if batched else chain.batch(1, drop_remainder=False)
         if any(isinstance(stage, Repeat) for stage in chain.stages):
             # An endless chain reads as training reads it, random steps drawing as they draw there.
@@ -672,6 +702,8 @@ class Dataset:
                                 loading=chain.loading or Loading())(DataPartition())
         try:
             for batch in reader:
+                for step in device:
+                    batch = step(batch)
                 yield batch if batched else {
                     name: value[0] for name, value in batch.items() if name != VALID_ROWS}
         finally:

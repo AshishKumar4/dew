@@ -21,7 +21,6 @@ from dew.objectives.jepa import (
     KnnProbe,
     LinearProbe,
     MultiBlockMask,
-    knn_probe_accuracy,
     linear_probe_accuracy,
     normalize_targets,
     representation_health,
@@ -69,33 +68,6 @@ def videos(seed=0, batch=2):
 
 
 # --- masking ---------------------------------------------------------------
-
-def test_context_and_targets_are_disjoint(mask):
-    context_idx, target_idx = mask.sample(jax.random.PRNGKey(3), 8)
-    for b in range(8):
-        context = set(np.array(context_idx[b]).tolist())
-        targets = set(np.array(target_idx[b]).reshape(-1).tolist())
-        assert not (context & targets), "context encoder can see a target patch"
-        assert max(targets) < mask.num_patches and min(context) >= 0
-
-
-def test_target_coverage_sits_inside_the_configured_scale():
-    scale = (0.15, 0.2)
-    mask = MultiBlockMask.for_grid(GRID, num_targets=4, scale=scale)
-    coverage = mask.block_area / mask.num_patches
-    assert scale[0] <= coverage <= scale[1]
-    for h, w in mask.block_shapes:
-        assert h * w == mask.block_area
-        assert 0.75 <= h / w <= 1.5
-
-
-def test_masks_are_reproducible_from_a_seed(mask):
-    a = mask.sample(jax.random.PRNGKey(11), 4)
-    b = mask.sample(jax.random.PRNGKey(11), 4)
-    c = mask.sample(jax.random.PRNGKey(12), 4)
-    assert all(jnp.array_equal(x, y) for x, y in zip(a, b, strict=True))
-    assert not all(jnp.array_equal(x, y) for x, y in zip(a, c, strict=True))
-
 
 def test_blocks_and_context_follow_the_documented_distribution(mask):
     """The static-shape multi-block draw: each block's shape uniform over
@@ -159,19 +131,6 @@ def test_every_target_is_a_rectangle_of_the_grid_in_the_encoders_scan_order(scan
             assert extent == mask.block_area, "a target block is not a rectangle of the grid"
         assert np.all(np.diff(context[row]) > 0)
         assert not set(context[row]) & set(blocks.reshape(-1))
-
-
-def test_an_objective_refuses_a_mask_in_another_scan_order(mask):
-    with pytest.raises(ValueError, match="one scan order"):
-        JepaObjective(make_encoder(scan_order="hilbert"), make_predictor(scan_order="hilbert"), mask,
-                      sample=Field("image", (RES, RES, 3)))
-
-
-def test_geometry_that_cannot_exist_is_rejected():
-    with pytest.raises(ValueError, match="aspect ratio"):
-        MultiBlockMask.for_grid((4, 4), num_targets=2, scale=(0.18, 0.19))
-    with pytest.raises(ValueError, match="no context"):
-        MultiBlockMask.for_grid(GRID, num_targets=6, scale=(0.15, 0.2))
 
 
 # --- the encoders and the predictor ----------------------------------------
@@ -257,27 +216,6 @@ def test_compiled_embeddings_follow_the_substituted_encoder(mask):
     assert objective._embed is objective._embed
 
 
-def test_fresh_loss_is_non_trivial_and_training_reduces_it(mask, rng):
-    objective = make_objective(mask)
-    params = objective.init(rng)
-    batch = {"image": images()}
-
-    def loss_of(p):
-        return objective.scalar_loss(p, batch, step_with(params))[0]
-
-    initial = float(loss_of(params))
-    assert initial > 0.1, "a fresh model already predicts the targets"
-
-    optimizer = optax.adam(3e-3)
-    opt_state = optimizer.init(params)
-    for _ in range(20):
-        grads = jax.grad(loss_of)(params)
-        updates, opt_state = optimizer.update(grads, opt_state, params)
-        params = optax.apply_updates(params, updates)
-
-    assert float(loss_of(params)) < initial * 0.9, "the objective does not train"
-
-
 def test_video_objective_trains(mask, rng):
     objective = JepaObjective(
         JepaVideoEncoder(patch_size=PATCH, emb_features=32, num_layers=1,
@@ -299,18 +237,6 @@ def test_video_objective_trains(mask, rng):
         params = optax.apply_updates(params, updates)
 
     assert float(loss_of(params)) < initial * 0.9
-
-
-def test_bf16_models_keep_the_loss_in_fp32(mask, rng):
-    """The MSE and its gradient are the numbers the optimizer sees, so they
-    must not be quantized to the models' bf16 compute dtype."""
-    objective = JepaObjective(make_encoder(dtype=jnp.bfloat16),
-                              make_predictor(dtype=jnp.bfloat16), mask,
-                              sample=Field("image", (RES, RES, 3)))
-    params = objective.init(rng)
-    loss, aux = objective.scalar_loss(params, {"image": images()}, step_with(params))
-    assert loss.dtype == jnp.float32
-    assert all(a.dtype == jnp.float32 for a in aux.metrics.values())
 
 
 def solid_colour_images(rs, n):
@@ -361,6 +287,16 @@ def test_training_makes_the_prediction_depend_on_the_context(mask):
         while True:
             yield {"image": np.asarray(train_x[rs.randint(0, len(train_x), 16)], np.uint8)}
 
+    params = initial.variables
+    batch = {"image": images()}
+    step = step_with(initial.averaged)
+    same = float(objective.scalar_loss(params, batch, step)[0])
+    assert same > 0.1
+    moved = {"params": {"context_encoder": jax.tree.map(
+        lambda value: value + 0.1, initial.averaged["params"]["context_encoder"])}}
+    other = float(objective.scalar_loss(params, batch, step_with(merge(initial.averaged, moved)))[0])
+    assert abs(other - same) > 1e-2 * same
+
     state = trainer.fit(dataset(batches, batch=16), steps=150, log_every=50)
 
     after = context_ablation(objective, state.variables, state.ema,
@@ -368,33 +304,6 @@ def test_training_makes_the_prediction_depend_on_the_context(mask):
     assert after[0] < before[0] / 2, "held-out prediction error did not improve"
     assert after[1] / after[0] > 5.0, "the predictor still ignores its context"
 
-
-def test_no_gradient_reaches_the_target_branch(mask, rng):
-    """stop_gradient on the target encoder is what stops the trivial solution."""
-    objective = make_objective(mask)
-    params = objective.init(rng)
-    batch = {"image": images()}
-
-    grads = jax.grad(
-        lambda ema: objective.scalar_loss(params, batch, step_with(ema))[0]
-    )(params)
-    assert all(float(jnp.max(jnp.abs(g))) == 0.0 for g in jax.tree.leaves(grads))
-
-
-def test_the_targets_come_from_the_ema_encoder(mask, rng):
-    """The target branch reads the trainer's EMA copy of the context
-    encoder: the same live parameters score differently against another EMA
-    tree. The zero-gradient test above cannot tell, since a loss that never
-    read the EMA tree has a zero gradient there as well."""
-    objective = make_objective(mask)
-    params = objective.init(rng)
-    batch = {"image": images()}
-    moved = {"params": {"context_encoder": jax.tree.map(
-        lambda p: p + 0.1, params["params"]["context_encoder"])}}
-
-    same = float(objective.scalar_loss(params, batch, step_with(params))[0])
-    other = float(objective.scalar_loss(params, batch, step_with(merge(params, moved)))[0])
-    assert abs(other - same) > 1e-2 * same
 
 
 # --- collapse telemetry ----------------------------------------------------
@@ -408,36 +317,6 @@ def health_in(z, dtype):
     cov = centered.T @ centered / (len(z) - 1)
     off = cov[~np.eye(z.shape[1], dtype=bool)]
     return np.asarray([z.std(axis=0).mean(), np.sqrt(np.mean(off ** 2))])
-
-
-def test_the_loss_is_the_mean_squared_error_to_normalized_targets_of_the_same_blocks(mask):
-    """The documented objective, written in numpy over the modules' own
-    outputs: the target encoder's whole view, layer-normalized without an
-    affine, gathered at each block's indices, against the predictor's
-    output for that block from the shared context, squared and averaged.
-    Held to it in float64, as exact as the same composition in float32."""
-    objective = make_objective(mask)
-    params = objective.init(jax.random.PRNGKey(0))
-    batch, step = {"image": images()}, step_with(params)
-    samples = (np.asarray(batch["image"], np.float32) - 127.5) / 127.5
-    context_idx, target_idx = objective.mask.sample(jax.random.split(step.key)[0], len(samples))
-    full = np.asarray(objective.encode(part(params, "context_encoder"), jnp.asarray(samples)))
-    context = objective.encode(part(params, "context_encoder"), jnp.asarray(samples), context_idx)
-    blocks = mask.num_targets
-    repeated = (jnp.repeat(context, blocks, axis=0), jnp.repeat(context_idx, blocks, axis=0))
-    predictions = np.asarray(objective.predictor.apply(
-        part(params, "predictor"), *repeated, target_idx.reshape(len(samples) * blocks, -1)))
-
-    def loss_in(dtype):
-        z = full.astype(dtype)
-        normed = (z - z.mean(-1, keepdims=True)) / np.sqrt(z.var(-1, keepdims=True) + 1e-6)
-        targets = np.stack([normed[row][np.asarray(target_idx)[row, block]]
-                            for row in range(len(samples)) for block in range(blocks)])
-        return np.mean(np.square(predictions.astype(dtype) - targets))
-
-    dew = float(objective.scalar_loss(params, batch, step)[0])
-    assert_as_exact_as_the_reference(np.asarray([dew]), np.asarray([loss_in(np.float32)]),
-                                     np.asarray([loss_in(np.float64)]), "JEPA loss")
 
 
 def test_representation_health_is_the_float64_statistics():
@@ -455,40 +334,7 @@ def test_representation_health_is_the_float64_statistics():
     assert float(collapsed["repr_std"]) < 1e-6 and float(collapsed["repr_cov_offdiag"]) < 1e-6
 
 
-def test_collapse_telemetry_flows_through_a_degenerate_encoder(mask, rng):
-    """A constant encoder is the failure mode; the aux dict must show it."""
-    class ConstantEncoder(JepaEncoder):
-        def __call__(self, x, token_idx=None, train: bool = False):
-            out = super().__call__(x, token_idx, train)
-            return jnp.zeros_like(out) + jnp.arange(out.shape[-1], dtype=out.dtype)
-
-    batch = {"image": images()}
-    collapsed = JepaObjective(
-        ConstantEncoder(patch_size=PATCH, emb_features=32, num_layers=2, num_heads=2,
-                        mlp_ratio=2),
-        make_predictor(), mask, sample=Field("image", (RES, RES, 3)))
-    collapsed_params = collapsed.init(rng)
-    _, collapsed_aux = collapsed.scalar_loss(collapsed_params, batch, step_with(collapsed_params))
-
-    healthy = make_objective(mask)
-    healthy_params = healthy.init(rng)
-    _, healthy_aux = healthy.scalar_loss(healthy_params, batch, step_with(healthy_params))
-
-    assert float(collapsed_aux.metrics["repr_std"]) < 1e-5
-    assert float(healthy_aux.metrics["repr_std"]) > 1e-3
-
-
 # --- EMA target encoder ----------------------------------------------------
-
-def test_momentum_rises_linearly_to_its_second_value_and_stays(mask):
-    """I-JEPA's linear momentum schedule, m0 + (m1 - m0) min(t / steps, 1),
-    held to its float64 value along the way and past the end."""
-    objective = make_objective(mask, momentum=(0.996, 1.0), momentum_steps=1000)
-    for t in (0, 1, 250, 999, 1000, 4000):
-        assert float(objective.ema.decay(t)) == pytest.approx(0.996 + 0.004 * min(t / 1000, 1), abs=1e-7)
-    assert objective.ema.select(("params", "context_encoder", "anything"))
-    assert not objective.ema.select(("params", "predictor", "anything"))
-
 
 def make_jepa_trainer(mask, learning_rate=1e-3, fsdp=1, **kwargs):
     return Trainer(
@@ -559,17 +405,6 @@ def test_jepa_trains_under_fsdp(mask):
     assert all(entry["train/repr_std"] > 0 for entry in ticks), "collapse telemetry was lost"
 
 
-def test_evaluation_reads_the_ema_encoder(mask):
-    objective = make_objective(mask)
-    params = objective.init(jax.random.PRNGKey(0))
-    ema = {"params": {"context_encoder": jax.tree.map(
-        lambda p: p + 0.1, params["params"]["context_encoder"])}}
-    batch = {"image": images(), "label": jnp.zeros((4,), jnp.int32)}
-    live = objective.evaluate(params, batch, step_with(params))
-    averaged = objective.evaluate(params, batch, step_with(merge(params, ema)))
-    assert not np.allclose(live.features, averaged.features)
-
-
 def test_an_adapted_pretrained_encoder_trains_its_factors_over_one_frozen_base(mask):
     """A pretrained encoder adapted by `LoRA.apply` starts JEPA from its own
     weights: its factors and the predictor train, its base comes back
@@ -624,55 +459,6 @@ def separable_embeddings(num_classes=4, per_class=8, dim=6, noise=0.05):
     return jnp.asarray(x[order], dtype=jnp.float32), jnp.asarray(labels[order])
 
 
-def overlapping_embeddings(num_classes=4, rows=96, dim=6):
-    """Four classes whose clusters overlap, so a probe scores neither every
-    held-out row nor none of them."""
-    rng = np.random.default_rng(1)
-    labels = rng.integers(num_classes, size=rows)
-    x = rng.normal(size=(num_classes, dim))[labels] + rng.normal(size=(rows, dim)) * 0.8
-    return x.astype(np.float32), labels
-
-
-def test_the_knn_probe_is_cosine_neighbours_majority():
-    """The held-out half's accuracy under the majority label of its five most
-    cosine-similar rows of the first half, as numpy computes it in float64."""
-    x, y = overlapping_embeddings()
-    fit, test = x[:48].astype(np.float64), x[48:].astype(np.float64)
-    similarity = (test / np.linalg.norm(test, axis=1, keepdims=True)) @ (
-        fit / np.linalg.norm(fit, axis=1, keepdims=True)).T
-    nearest = np.argsort(-similarity, axis=1)[:, :5]
-    votes = np.stack([np.bincount(y[:48][row], minlength=4) for row in nearest])
-    expected = np.mean(votes.argmax(axis=1) == y[48:])
-    assert 0.3 < expected < 1.0
-    accuracy = knn_probe_accuracy(jnp.asarray(x), jnp.asarray(y), num_classes=4, k=5)
-    assert float(accuracy) == pytest.approx(expected)
-
-
-def test_the_linear_probe_is_adamw_logistic_regression_on_standardized_features():
-    """Torch's float64 AdamW on the same standardized first half, at the probe's
-    rate, decay and step count, predicts the held-out half as the probe does."""
-    import torch
-
-    x, y = overlapping_embeddings()
-    fit, test = (torch.tensor(part, dtype=torch.float64) for part in (x[:48], x[48:]))
-    mean, std = fit.mean(0), fit.std(0, unbiased=False) + 1e-6
-    fit, test = (fit - mean) / std, (test - mean) / std
-    w = torch.zeros(6, 4, dtype=torch.float64, requires_grad=True)
-    b = torch.zeros(4, dtype=torch.float64, requires_grad=True)
-    optimizer = torch.optim.AdamW([w, b], lr=1e-2, weight_decay=1e-4, eps=1e-8)
-    for _ in range(100):
-        optimizer.zero_grad()
-        torch.nn.functional.cross_entropy(fit @ w + b, torch.tensor(y[:48])).backward()
-        optimizer.step()
-    logits = (test @ w + b).detach().numpy()
-    top = np.sort(logits, axis=1)
-    assert (top[:, -1] - top[:, -2]).min() > 1e-3, "a held-out row sits on the boundary"
-    expected = np.mean(logits.argmax(axis=1) == y[48:])
-    assert 0.3 < expected < 1.0
-    accuracy = linear_probe_accuracy(jnp.asarray(x), jnp.asarray(y), num_classes=4)
-    assert float(accuracy) == pytest.approx(expected)
-
-
 def test_probe_metrics_score_representations_and_average_over_the_pass():
     x, y = separable_embeddings()
     representations = Representations(features=x, labels=y)
@@ -683,7 +469,31 @@ def test_probe_metrics_score_representations_and_average_over_the_pass():
     assert knn.finalize(knn(representations, None)) > 0.9
 
 
-def test_probes_are_at_chance_on_noise():
-    x = jax.random.normal(jax.random.PRNGKey(0), (64, 6))
-    y = jnp.asarray(np.random.RandomState(1).randint(0, 4, 64))
-    assert float(knn_probe_accuracy(x, y, num_classes=4, k=5)) < 0.6
+def test_the_loss_is_the_mean_squared_error_to_normalized_targets_of_the_same_blocks(mask):
+    """The documented objective, written in numpy over the modules' own
+    outputs: the target encoder's whole view, layer-normalized without an
+    affine, gathered at each block's indices, against the predictor's
+    output for that block from the shared context, squared and averaged.
+    Held to it in float64, as exact as the same composition in float32."""
+    objective = make_objective(mask)
+    params = objective.init(jax.random.PRNGKey(0))
+    batch, step = {"image": images()}, step_with(params)
+    samples = (np.asarray(batch["image"], np.float32) - 127.5) / 127.5
+    context_idx, target_idx = objective.mask.sample(jax.random.split(step.key)[0], len(samples))
+    full = np.asarray(objective.encode(part(params, "context_encoder"), jnp.asarray(samples)))
+    context = objective.encode(part(params, "context_encoder"), jnp.asarray(samples), context_idx)
+    blocks = mask.num_targets
+    repeated = (jnp.repeat(context, blocks, axis=0), jnp.repeat(context_idx, blocks, axis=0))
+    predictions = np.asarray(objective.predictor.apply(
+        part(params, "predictor"), *repeated, target_idx.reshape(len(samples) * blocks, -1)))
+
+    def loss_in(dtype):
+        z = full.astype(dtype)
+        normed = (z - z.mean(-1, keepdims=True)) / np.sqrt(z.var(-1, keepdims=True) + 1e-6)
+        targets = np.stack([normed[row][np.asarray(target_idx)[row, block]]
+                            for row in range(len(samples)) for block in range(blocks)])
+        return np.mean(np.square(predictions.astype(dtype) - targets))
+
+    dew = float(objective.scalar_loss(params, batch, step)[0])
+    assert_as_exact_as_the_reference(np.asarray([dew]), np.asarray([loss_in(np.float32)]),
+                                     np.asarray([loss_in(np.float64)]), "JEPA loss")

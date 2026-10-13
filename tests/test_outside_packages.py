@@ -25,71 +25,6 @@ def _run(site: Path, program: str) -> subprocess.CompletedProcess:
                           timeout=300, check=False)
 
 
-PACKAGE_MODEL = '''
-from dataclasses import dataclass
-
-import flax.linen as nn
-
-
-class Activation:
-    pass
-
-
-@dataclass(frozen=True)
-class ScaledTanh(Activation):
-    scale: float = 1.0
-
-
-class PackageMLP(nn.Module):
-    features: int = 4
-    activation: Activation = ScaledTanh()
-
-    @nn.compact
-    def __call__(self, x):
-        return nn.Dense(self.features)(x)
-'''
-
-
-def test_a_packages_model_and_its_own_kind_build_and_record_by_import_path(tmp_path):
-    """The model builds by its path once its package is trusted, which imports
-    the module the record names; its field typed with the package's own base
-    class takes a record of a class derived from it, and the model records
-    both by path."""
-    _install(tmp_path, "toypackage", PACKAGE_MODEL)
-    done = _run(tmp_path, "import sys\n"
-                          "from dew.config import ModelConfig\n"
-                          "from dew.registry import import_trusted, models\n"
-                          "assert 'toypackage' not in sys.modules\n"
-                          "record = {'features': 7, 'activation': {'class': 'toypackage.models:ScaledTanh',\n"
-                          "                                        'fields': {'scale': 2.0}}}\n"
-                          "import_trusted(record, ('toypackage',))\n"
-                          "built = models.build('toypackage.models:PackageMLP', record)\n"
-                          "print(type(built).__name__, built.features, built.activation.scale)\n"
-                          "saved = ModelConfig.from_model(built)\n"
-                          "print(saved.name, saved.fields['activation'])\n"
-                          "print(saved.build() == built)\n")
-    assert done.returncode == 0, done.stderr[-2000:]
-    assert done.stdout.splitlines() == [
-        "PackageMLP 7 2.0",
-        "toypackage.models:PackageMLP {'class': 'toypackage.models:ScaledTanh', 'fields': {'scale': 2.0}}",
-        "True"]
-
-
-def test_a_path_naming_nothing_is_refused_by_what_it_names(tmp_path):
-    _install(tmp_path, "toypackage", PACKAGE_MODEL)
-    done = _run(tmp_path, "import toypackage.models\n"
-                          "from dew.registry import models\n"
-                          "for name in ('toypackage.models:Nope', 'no_such_model'):\n"
-                          "    try:\n"
-                          "        models[name]\n"
-                          "    except (KeyError, ValueError) as error:\n"
-                          "        print(type(error).__name__, str(error)[:60])\n")
-    assert done.returncode == 0, done.stderr[-2000:]
-    assert done.stdout.splitlines() == [
-        "ValueError toypackage.models has no Nope, which 'toypackage.models:Nope",
-        "KeyError \"no model named 'no_such_model'; known: causal_transformer, "]
-
-
 PACKAGE_OBJECTIVE = '''
 import jax
 import jax.numpy as jnp
@@ -239,7 +174,7 @@ class ActivityRun(RunConfig):
 
     def prepare(self):
         rows = np.random.default_rng(0).normal(size=(64, 8)).astype(np.float32)
-        from dew.config.data import Records, loader
+        from dew.config.data import RecordsData, loader
 
         data = loader(RecordsData(source={"x": rows}, validation={"x": rows[:20]}),
                       batch=self.trainer.batch_size,

@@ -23,18 +23,22 @@ from pathlib import Path
 import jax
 import numpy as np
 
-from dew.data import ImageDataset
 
+def memory_images(pixels, loading):
+    from dew.data import ImageDataset
 
-@dataclasses.dataclass(frozen=True)
-class InMemoryImages(ImageDataset):
-    pixels: tuple = ()
+    @dataclasses.dataclass(frozen=True)
+    class InMemoryImages(ImageDataset):
+        pixels: tuple = ()
 
-    def source(self, split=None):
-        return self.pixels
+        def source(self, split=None):
+            return self.pixels
 
-    def record(self, element, rng):
-        return element["image"], element["caption"], element["label"]
+        def record(self, element, rng):
+            return element["image"], element["caption"], element["label"]
+
+    return InMemoryImages(pixels=pixels, image_size=16, augmentation_backend="host", seed=7,
+                          loading=loading).load(batch=4)
 
 
 def digest(batch):
@@ -61,7 +65,7 @@ def _read(reader, count):
 
 
 def capture(factory: Callable, workers: int, shares: int):
-    from dew.data import DataPartition, Loading
+    from dew.data.dataset import DataPartition, Loading
 
     data = factory(Loading(workers=workers, threads=1, read_buffer=4, worker_buffer=1))
     rows = []
@@ -334,9 +338,7 @@ def fixtures(root: Path):
         "preferences": lambda loading: PreferencePairs(
             records=pairs, seq_len=16, seed=7, loading=loading
         ).load(batch=4),
-        "images_memory": lambda loading: InMemoryImages(
-            pixels=pixels, image_size=16, augmentation_backend="host", seed=7, loading=loading
-        ).load(batch=4),
+        "images_memory": lambda loading: memory_images(pixels, loading),
         "images_arrayrecord": lambda loading: ArrayRecordImages(
             path=str(image_root), image_size=16, augmentation_backend="host", seed=7, loading=loading
         ).load(batch=4),

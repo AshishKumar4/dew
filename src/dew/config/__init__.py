@@ -76,6 +76,7 @@ from dew.training.distributed import Layout, MeshSpec
 from dew.training.optim import (
     BF16_STATE_OPTIMIZERS,
     OPTIMIZER_MAP,
+    Optimizer,
     ParamGroup,
     ScheduleBase,
     param_labels,
@@ -396,7 +397,7 @@ def _flag_json(text: str) -> JSON:
 class OptimConfig:
     """Holds the optimizer, learning-rate schedule and gradient clipping."""
 
-    optimizer: Literal["adam", "adamw", "lamb", "muon", "muonclip"] = "adamw"
+    optimizer: Optimizer = "adamw"
     optimizer_opts: JsonDict = dataclasses.field(default_factory=dict)
     learning_rate: float = 2.7e-4
     """The constant rate, when no schedule is named."""

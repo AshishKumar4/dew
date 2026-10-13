@@ -31,19 +31,22 @@ def streamed(
         raise ValueError("empty_shard_budget must be positive")
     workers = loading.workers if isinstance(loading.workers, int) else 1
     required = partition.count * max(workers, 1)
-    if len(manifest.shards) < required:
+    shards = manifest.shards
+    if len(shards) < required and manifest.subdivide is not None:
+        shards = manifest.subdivide(required)
+    if len(shards) < required:
         raise ValueError(
-            f"stream has {len(manifest.shards)} physical shards for {required} readers × workers; "
+            f"stream has {len(shards)} physical shards for {required} readers × workers; "
             "produce more shards or reduce readers/workers"
         )
-    root = grain.MapDataset.source(manifest.shards)
+    root = grain.MapDataset.source(shards)
     if seed is not None:
         root = root.shuffle(seed=seed)
     if epochs != 1:
         root = root.repeat(epochs)
     root = root[partition.index :: partition.count]
     return _ShardPass(
-        root, manifest.reader, cycle_length, loading, empty_shard_budget, name or manifest.shards[0].uri
+        root, manifest.reader, cycle_length, loading, empty_shard_budget, name or shards[0].uri
     )
 
 

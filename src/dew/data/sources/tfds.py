@@ -7,6 +7,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import posixpath
 import shutil
 import subprocess
 import sys
@@ -67,8 +68,8 @@ tfds.builder(name, data_dir=data_dir, config=config, version=version).download_a
 """
 
 
-def prepared(name: str, *, config: str | None = None, version: str | None = None) -> str:
-    """Dew's own TFDS data_dir, `dew_cache_dir()/tfds`, holding `name`.
+def prepared(name: str, *, config: str | None = None, version: str | None = None) -> bool:
+    """Whether `name` was prepared into Dew's own data_dir, `dew_cache_dir()/tfds`.
 
     A missing name is prepared there by `download_and_prepare` in a
     separate process of the same interpreter with no GPU visible, since
@@ -89,7 +90,7 @@ def prepared(name: str, *, config: str | None = None, version: str | None = None
         return True
 
     if held():
-        return directory
+        return False
     if importlib.util.find_spec("tensorflow") is None:
         raise FileNotFoundError(
             f"No prepared {name!r} in {directory}, and preparing it needs TensorFlow, "
@@ -97,20 +98,21 @@ def prepared(name: str, *, config: str | None = None, version: str | None = None
         )
     os.makedirs(directory, exist_ok=True)
     with FileLock(os.path.join(directory, ".prepare.lock")):
-        if not held():
-            done = subprocess.run(
-                [sys.executable, "-c", _PREPARING, name, directory, config or "", version or ""],
-                env={**os.environ, "CUDA_VISIBLE_DEVICES": ""},
-                capture_output=True,
-                text=True,
-                check=False,
+        if held():
+            return False
+        done = subprocess.run(
+            [sys.executable, "-c", _PREPARING, name, directory, config or "", version or ""],
+            env={**os.environ, "CUDA_VISIBLE_DEVICES": ""},
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if done.returncode:
+            raise RuntimeError(
+                f"preparing {name!r} into {directory} failed:\n"
+                + "\n".join(done.stderr.splitlines()[-20:])
             )
-            if done.returncode:
-                raise RuntimeError(
-                    f"preparing {name!r} into {directory} failed:\n"
-                    + "\n".join(done.stderr.splitlines()[-20:])
-                )
-    return directory
+    return True
 
 
 def read_only_builder(path: str, *, name: str | None, config: str | None, version: str | None):
@@ -237,11 +239,17 @@ class TFDS(Dataset):
         return f"tfds:{self.name}/{self.config}:{self.version}:{self.split}:{self.path}"
 
     def fingerprint(self) -> Mapping[str, object]:
-        from dew.data.storage import Store
+        return self._snapshot
+
+    @cached_property
+    def _snapshot(self) -> Mapping[str, object]:
+        from dew.data.storage import Store, content_version, local
 
         directory = str(self.builder.data_path)
         metadata = Store(directory.rstrip("/") + "/dataset_info.json").read()
         fs, prefix = Store(directory).resolve()
+        # A local copy is named by its content, so hosts that mounted it at different paths agree.
+        mounted = local(fs)
         definitions = {}
         for path in fs.find(prefix):
             if path.endswith((".json", ".labels.txt")):
@@ -266,7 +274,10 @@ class TFDS(Dataset):
                         f"Missing prepared ArrayRecord shard {instruction.filename!r}; "
                         "copy the complete split or provision it again"
                     ) from error
-                files.append({"uri": store.url, "bytes": header["size"], "version": fs.ukey(path)})
+                files.append(
+                    {"uri": posixpath.relpath(path, prefix), "bytes": header["size"],
+                     "version": content_version(fs, path, header["size"])}
+                    if mounted else {"uri": store.url, "bytes": header["size"], "version": fs.ukey(path)})
         if self.remote:
             mirrored = json.loads(Path(self.directory, "READY").read_text())
             files = mirrored["files"]
@@ -275,12 +286,12 @@ class TFDS(Dataset):
             "name": self.name,
             "split": self.split,
             "shard_rows": self.shard_rows,
-            "directory": self.path if self.remote else directory,
+            **({} if mounted else {"directory": self.path if self.remote else directory}),
             "metadata_sha256": hashlib.sha256(metadata).hexdigest(),
             "definitions": definitions,
             "files": files,
             "decoders": _decoder_record(self.decoders),
-            "original": self.path,
+            **({} if mounted else {"original": self.path}),
         }
 
     def supports(self, read: Read) -> bool:
@@ -293,25 +304,28 @@ class TFDS(Dataset):
     def provision(self) -> TFDS:
         if self.remote:
             preparing(self, None, self.directory)
-            self._mirror()
-            return self
-        if self.path is not None:
-            raise ValueError(
-                f"TFDS {self.name!r} path={self.path!r} is read-only; prepare that directory "
-                "with TFDS or omit path to use Dew's preparation directory"
-            )
-        preparing(self, None, os.path.join(dew_cache_dir(), "tfds"))
-        prepared(self.name, config=self.config, version=self.version)
+            changed = self._mirror()
+        else:
+            if self.path is not None:
+                raise ValueError(
+                    f"TFDS {self.name!r} path={self.path!r} is read-only; prepare that directory "
+                    "with TFDS or omit path to use Dew's preparation directory"
+                )
+            preparing(self, None, os.path.join(dew_cache_dir(), "tfds"))
+            changed = prepared(self.name, config=self.config, version=self.version)
+        if changed:
+            self.__dict__.pop("builder", None)
+            self.__dict__.pop("_snapshot", None)
         return self
 
-    def _mirror(self) -> None:
+    def _mirror(self) -> bool:
         from dew.data.storage import Store
 
         destination = Path(self.directory)
         destination.parent.mkdir(parents=True, exist_ok=True)
         with FileLock(str(destination) + ".lock"):
             if (destination / "READY").is_file():
-                return
+                return False
             root = Store(str(self.path))
             fs, path = root.resolve()
             if not fs.exists(path.rstrip("/") + "/dataset_info.json"):
@@ -361,6 +375,7 @@ class TFDS(Dataset):
                     json.dumps({"source": self.path, "split": self.split, "files": copied})
                 )
                 shutil.move(staged, destination)
+        return True
 
     def records(self, read: Read) -> Records:
         if not self.supports(read):

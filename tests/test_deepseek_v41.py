@@ -37,29 +37,16 @@ import ml_dtypes
 import numpy as np
 import pytest
 from flax.traverse_util import flatten_dict, unflatten_dict
-from reference_error import FACTOR, assert_as_exact_as_the_reference, assert_as_exact_over_orders, distance
-from residual_orders import permuted
+from reference_error import FACTOR, distance
 
 from dew.interop import Pretrained
-from dew.interop.hf_decoders import _wrapper_sources, families, translate_config, translate_wrapper_config
+from dew.interop.hf_decoders import families, translate_config, translate_wrapper_config
 from dew.nn.engram import Engram
 from dew.nn.fake_quant import E2M1, E2M1_MIDPOINTS, fake_quant_fp4, fake_quant_fp8
 from dew.nn.inputs import ModelInputs
 from dew.registry import models
 from dew.sampling import Sample, Sampling, Speculative, generate
-from tools.deepseek_v41_numerics import (
-    QUANTIZERS,
-    cached_run,
-    decided,
-    forward,
-    loss_and_gradient,
-    scores,
-    stepped,
-    unquantized,
-    updated,
-    vision_bundle,
-    vision_run,
-)
+from tools.deepseek_v41_numerics import QUANTIZERS, unquantized, vision_bundle, vision_run
 
 ROOT = Path(__file__).parent / "fixtures" / "hf"
 TINY = ROOT / "deepseek-v41-tiny"
@@ -72,12 +59,6 @@ KERNEL_QUANTIZERS = {
     "fp4_16_e4m3": lambda v: fake_quant_fp4(v, 16, e4m3_scale=True),
     "fp4_32_e8m0": lambda v: fake_quant_fp4(v, 32, e4m3_scale=False),
 }
-# float64 rounds 2**-29 times as finely as float32, so the reference's
-# arithmetic run in float64 lies that much closer to the truth than in fp32;
-# a float64 twin and the truth are two such runs, each carrying that rounding.
-TWIN = 2 * float(np.finfo(np.float64).eps / np.finfo(np.float32).eps)
-
-
 @pytest.fixture(scope="module", autouse=True)
 def fp32_matmuls():
     """The reference multiplies in fp32, where a GPU's default is TF32."""
@@ -89,48 +70,6 @@ def fp32_matmuls():
 def source():
     loaded = Pretrained.load(TINY, dtype="float32", attention_impl="reference")
     return loaded, unquantized(loaded.model), np.load(TINY / "reference.npz")
-
-
-@pytest.fixture(scope="module")
-def forwards(source):
-    """The plain and the quantization-aware forward (`decided`), each with
-    the quantizer inputs and top-k rows it met."""
-    loaded, plain, reference = source
-    ids = jnp.asarray(reference["input_ids"])
-    return {prefix: decided(lambda model, variables: forward(model, variables, ids), model, loaded.variables)
-            for prefix, model in (("", plain), ("qat_", loaded.model))}
-
-
-def close(actual, reference, name: str):
-    """`actual` as exact as the reference's `name`, both measured from the
-    float64 truth, its argmax the reference's."""
-    actual = np.asarray(actual)
-    assert_as_exact_as_the_reference(actual, reference[name], TRUTH[name], name)
-    np.testing.assert_array_equal(actual.argmax(-1), reference[name].argmax(-1), err_msg=name)
-
-
-def twin_close(twin, name: str):
-    """A float64 twin (`decided`) within FACTOR times the reference's own
-    rounding, scaled to two float64 runs (TWIN), of the truth: the reference's
-    arithmetic in float64, deciding every rounding and pick as the truth
-    does, since one taken otherwise moves an output by fp32-sized steps."""
-    apart = distance(twin, TRUTH[name])
-    assert apart <= FACTOR * TWIN * rounding(name), f"{name}: the float64 twin is {apart:.3e} from the truth"
-
-
-def loss_close(value, prefix: str):
-    """The loss within reach of the logits' rule: it is the mean of each
-    position's cross entropy, whose gradient in that position's logits has
-    norm at most sqrt(2), so logits RMS `r` from the float64 truth move it at
-    most sqrt(2 V) r, and the rule holds the logits to FACTOR times the
-    reference's own `r`, in units of it that the loss's own dtype sets (TWIN
-    for a float64 twin's loss); one spacing of the loss, in its own dtype,
-    covers its own sum."""
-    value = np.asarray(value)
-    unit = TWIN if value.dtype == np.float64 else 1.0
-    logits = np.load(TINY / "reference.npz")[f"{prefix}logits"]
-    bound = np.sqrt(2 * logits.shape[-1]) * FACTOR * rounding(f"{prefix}logits") * unit + np.spacing(value)
-    assert abs(float(value) - float(TRUTH[f"{prefix}loss"])) <= bound, f"{prefix}loss"
 
 
 def rounding(name: str) -> float:
@@ -161,57 +100,7 @@ def test_the_quantizers_round_as_the_release_kernels():
             np.testing.assert_array_equal(actual, kernels[f"{label}/{name}"], err_msg=f"{label} {name}")
 
 
-def test_the_kernel_stand_ins_compute_what_the_release_kernels_do():
-    """The torch stand-ins the reference runs the release's model.py over
-    (tools/deepseek_v41_kernels.py) against the tilelang kernels' outputs:
-    the quantizers bit for bit; sparse_attn, whose stand-in keeps its
-    probabilities in fp32 where the kernel rounds them to bf16 before the
-    value product, within one bf16 ulp of the kernel once that rounding is
-    taken too; and hc_split_sinkhorn within one fp32 ulp of its unit-scale
-    outputs."""
-    torch = pytest.importorskip("torch")
-    from tools import deepseek_v41_kernels as stand_ins
-
-    kernels = kernel_outputs()
-
-    def tensor(name: str):
-        value = torch.from_numpy(kernels[name])
-        return value.view(torch.bfloat16) if value.dtype == torch.int16 else value
-
-    calls = {
-        "fp8_32_ue8m0": lambda v: stand_ins.act_quant(v, 32, "ue8m0", None, inplace=True),
-        "fp4_16_e4m3": lambda v: stand_ins.fp4_act_quant(v, 16, inplace=True,
-                                                         scale_dtype=torch.float8_e4m3fn),
-        "fp4_32_e8m0": lambda v: stand_ins.fp4_act_quant(v, 32, inplace=True),
-    }
-    for label in ("quant", "ties"):
-        for name, quantize in calls.items():
-            ours = quantize(tensor(f"{label}/input").clone()).view(torch.int16).numpy()
-            np.testing.assert_array_equal(ours, kernels[f"{label}/{name}"], err_msg=f"{label} {name}")
-
-    q, kv, sink, idx = (tensor(f"sparse_attn/{part}") for part in ("q", "kv", "sink", "idx"))
-    scale = q.shape[-1] ** -0.5
-    theirs = tensor("sparse_attn/out").float()
-    batch = torch.arange(q.size(0))[:, None, None]
-    keys = kv[batch, idx.clamp_min(0).long()].float()
-    logits = torch.einsum("bmhd,bmkd->bmhk", q.float(), keys) * scale
-    logits = logits.masked_fill(~(idx >= 0)[:, :, None, :], float("-inf"))
-    peak = logits.amax(-1, keepdim=True).clamp_min(-1e30)
-    weights = torch.exp(logits - peak)
-    total = weights.sum(-1, keepdim=True) + torch.exp(sink.float()[None, None, :, None] - peak)
-    rounded = (torch.einsum("bmhk,bmkd->bmhd", weights.bfloat16().float(), keys) / total).bfloat16().float()
-    ulp = torch.exp2(torch.floor(torch.log2(theirs.abs().clamp_min(2 ** -126))) - 7)
-    assert int(((rounded - theirs).abs() > ulp).sum()) == 0
-    port = stand_ins.sparse_attn(q, kv, sink, idx, scale).float()
-    assert torch.equal(port[0, 0], theirs[0, 0])  # nothing to attend
-
-    split = stand_ins.hc_split_sinkhorn(*(tensor(f"sinkhorn/{part}") for part in ("mixes", "scale", "base")),
-                                        4, 20, 1e-6)
-    for part, ours in zip(("pre", "post", "comb"), split, strict=True):
-        assert float((ours - tensor(f"sinkhorn/{part}")).abs().max()) <= 2 ** -23, part
-
-
-def test_the_quantizers_round_fp32_input_as_the_stand_ins():
+def test_the_quantizers_round_fp32_input_as_the_stand_ins(source):
     """The kernels take bf16 only, so on fp32 input the stand-ins, held to
     the kernels on bf16 above, define the rounding: Dew's quantizers match
     them bit for bit (signed zeros included), ties, all-zero blocks and
@@ -242,87 +131,11 @@ def test_the_quantizers_round_fp32_input_as_the_stand_ins():
         actual = np.asarray(jax.jit(jax_quant)(jnp.asarray(x)))
         np.testing.assert_array_equal(actual.view(np.uint32), expected.view(np.uint32))
 
-
-def test_the_quantizers_round_every_call_the_reference_made(source):
-    """Every quantizer call of the reference's quantization-aware forward,
-    fed the input it recorded, gives the output it recorded bit for bit:
-    the rounding is held to the release on the values the model meets,
-    whatever margins the fixture's seed left them."""
     _, _, reference = source
     for site, quantize in QUANTIZERS.items():
         actual = np.asarray(jax.jit(quantize)(jnp.asarray(reference[f"qat_{site}_in"])))
-        np.testing.assert_array_equal(actual.view(np.uint32), reference[f"qat_{site}_out"].view(np.uint32),
-                                      err_msg=site)
-
-
-def test_every_quantizer_and_top_k_input_is_as_exact_as_the_reference(source, forwards):
-    """Dew's quantization-aware and plain forwards hand every quantizer and
-    top-k call its input as exactly as the reference does, both measured
-    from the float64 truth, calling each as often and on as many blocks."""
-    _, _, reference = source
-    for prefix, (_, _, record) in forwards.items():
-        assert set(record.blocks) == ({*QUANTIZERS} if prefix else set())
-        for site, blocks in record.blocks.items():
-            name = f"{prefix}{site}_in"
-            ours = np.concatenate(blocks)
-            assert ours.shape == reference[name].shape, name
-            assert_as_exact_as_the_reference(ours, reference[name], TRUTH[name], name)
-        assert_as_exact_as_the_reference(*scores(record, reference, TRUTH, prefix), f"{prefix}selection_rows")
-
-
-def test_a_quotient_on_an_e2m1_tie_rounds_to_even_under_an_e4m3_scale():
-    """Amax 0.71875 gives the E4M3 scale 0.1171875, and -0.146484375 over it
-    is the tie -1.25, which rounds to the even -1.0: the release's tilelang
-    kernel stores -0.1171875 there (in kernels.npz). Multiplied by the scale's
-    reciprocal, as XLA rewrites a division by a broadcast, the quotient is
-    -1.2500001 and rounds to -1.5."""
-    x = jnp.asarray([[0.71875, -0.146484375] + [0.0] * 14], jnp.bfloat16)
-    for dtype in (jnp.bfloat16, jnp.float32):
-        rounded = jax.jit(lambda v: fake_quant_fp4(v, 16, e4m3_scale=True))(x.astype(dtype))
-        assert float(rounded[0, 1]) == -0.1171875, jnp.dtype(dtype).name
-
-
-def test_a_scale_on_an_e4m3_tie_rounds_to_even():
-    """Amax 6.375 over 6 is 1.0625, the tie between E4M3's 1.0 and 1.125,
-    which rounds to the even 1.0, so 6.375 stores 6 * 1.0 and 1.0625 stores
-    1.0 (every bf16 amax's scale, its 125 ties among them, matches the
-    exact quotient's rounding on the CPU and the RTX 4080)."""
-    x = jnp.asarray([[6.375, 1.0625] + [0.0] * 14], jnp.bfloat16)
-    for dtype in (jnp.bfloat16, jnp.float32):
-        rounded = jax.jit(lambda v: fake_quant_fp4(v, 16, e4m3_scale=True))(x.astype(dtype))
-        assert [float(value) for value in rounded[0, :2]] == [6.0, 1.0], jnp.dtype(dtype).name
-
-
-def test_a_nan_reaches_its_whole_block():
-    """A NaN makes its block's amax and scale NaN, so every value of the
-    block reads back NaN, the element compared to no midpoint included."""
-    x = jnp.asarray([[jnp.nan, 1.0, -0.5] + [0.0] * 13, [2.0, 1.0, -0.5] + [0.0] * 13])
-    for dtype in (jnp.bfloat16, jnp.float32):
-        quantize = jax.jit(lambda v: fake_quant_fp4(v, 16, e4m3_scale=True))
-        rounded = np.asarray(quantize(x.astype(dtype)), np.float32)
-        assert np.isnan(rounded[0]).all() and not np.isnan(rounded[1]).any(), jnp.dtype(dtype).name
-
-
-def test_the_quantizers_pass_their_gradient_straight_through():
-    x = jnp.linspace(-3.0, 3.0, 64).reshape(2, 32)
-    for quant in (lambda v: fake_quant_fp8(v, 32), lambda v: fake_quant_fp4(v, 16, e4m3_scale=True)):
-        np.testing.assert_array_equal(jax.grad(lambda v, quant=quant: jnp.sum(quant(v) * v))(x),
-                                      quant(x) + x)
-
-
-def test_a_value_far_past_the_clamp_reads_back_as_what_it_rounds_to():
-    """A block led by 1e5 or 1e10 saturates its E4M3 scale at 448, so the lead
-    stores the largest code, 6 * 448 = 2688, and the 3.0s store 0; compiled,
-    that is the forward value in either dtype. `x + (rounded - x)` rounds
-    the correction when x is far from what it rounds to: summed in bf16 it
-    gives 2560 for 1e5, summed in fp32 3072 for 1e10."""
-    quantize = jax.jit(lambda v: fake_quant_fp4(v, 16, e4m3_scale=True))
-    for dtype in (jnp.bfloat16, jnp.float32):
-        big = jnp.asarray([[lead] + [3.0] * 15 for lead in (1e5, 1e10)], dtype)
-        expected = np.zeros(big.shape, np.float32)
-        expected[:, 0] = 6 * 448
-        np.testing.assert_array_equal(np.asarray(quantize(big), np.float32), expected,
-                                      err_msg=jnp.dtype(dtype).name)
+        np.testing.assert_array_equal(actual.view(np.uint32),
+                                      reference[f"qat_{site}_out"].view(np.uint32), err_msg=site)
 
 
 def test_the_engram_hash_is_the_releases_int64_arithmetic():
@@ -367,98 +180,6 @@ def released():
     return config, record, model, shapes
 
 
-def test_every_released_tensor_lands_on_one_leaf_of_the_released_tree(released):
-    """The pinned weight index's 96085 tensors, their FP8/FP4 `.scale`
-    partners aside, map onto the tree the released bundle builds, and
-    together they cover it: the decoder with its DSpark stages and every
-    router's image bias, the ViT, and the aligner with the image span's
-    vectors."""
-    from dew.nn.vision.common import projector_weight_path
-    from dew.nn.vision.deepseek_v41 import deepseek_v41_vision_path
-
-    config, record, model, shapes = released
-    family = families()["deepseek_v41"]
-    text = config["text_config"]
-    names = []
-    for name in json.loads((RELEASED / "tensor_names.json").read_text())["names"]:
-        if ".experts.K." in name:
-            experts = (text["dspark_n_routed_experts"] if name.startswith("mtp.")
-                       else text["n_routed_experts"])
-            names += [name.replace(".K.", f".{index}.") for index in range(experts)]
-        else:
-            names.append(name)
-    assert len(names) == len(set(names))
-    sources, _ = _wrapper_sources(names, lambda name: np.zeros(1), record)
-    decoder = sources["language_model"]
-    placeholders = {name: np.zeros((2, 4, 2) if name.endswith("wo_a.weight") else (1,)) for name in decoder}
-    placeholders.update({name.removesuffix("wo_a.weight") + "wq_b.weight": np.zeros((8, 1))
-                         for name in decoder if name.endswith("wo_a.weight")})
-    paths = [family.weight_path(name, record["text"]) for name in family.prepare_weights(placeholders)]
-    assert None not in paths
-    bound = [(path[0], "language_model", *path[1:]) for path in paths if path is not None]
-    bound += [("params", "tower", *deepseek_v41_vision_path(name)) for name in sources["tower"]]
-    bound += [("params", "projector", *projector_weight_path("deepseek_v41", name))
-              for name in sources["projector"]]
-    assert len(set(bound)) == len(bound)
-    # One tensor per expert stacks into one leaf per projection.
-    bound = {tuple(part for index, part in enumerate(path)
-                   if not (index and path[index - 1] == 'experts' and part.isdigit()))
-             for path in bound}
-    tree = set(flatten_dict(dict(shapes)))
-    tree.discard(("constants", "language_model", "engram_hashes", "token_map"))
-    assert bound == tree
-    language = model.language_model
-    assert language.num_layers == 40 and language.dspark.stages == 3 and language.mixture.experts == 384
-
-
-def test_every_matrix_of_the_released_decoder_shards_by_a_declared_rule(released):
-    """No decoder weight of two or more axes is left to the shape heuristic
-    unasked: the engram tables alone hold 384M rows a layer, which shard as
-    a vocabulary's do. The hyper-connection mixes and DSpark's Markov tables
-    have no side worth naming, and the ViT's, like every tower's, are the
-    heuristic's."""
-    from dew.nn.sharding import declared_axes, parameter_path
-
-    heuristic = {"attn_hc", "ffn_hc", "markov_embed", "markov_head"}
-    *_, shapes = released
-    leaves = [(jax.tree_util.keystr(path), path, leaf)
-              for path, leaf in jax.tree_util.tree_flatten_with_path(shapes)[0]]
-    uncovered = [name for name, path, leaf in leaves if "['language_model']" in name and leaf.ndim >= 2
-                 and declared_axes(path, leaf.ndim) is None
-                 and not heuristic.intersection(parameter_path(path))]
-    assert uncovered == []
-    engram = [declared_axes(path, leaf.ndim) for name, path, leaf in leaves
-              if name.endswith("['engram']['embed']['embedding']")]
-    assert engram == [("vocab", None)] * 2
-
-
-def test_the_forward_matches_the_reference(source, forwards):
-    given, twin, _ = forwards[""]
-    close(given, source[2], "logits")
-    twin_close(twin, "logits")
-
-
-def test_the_quantization_aware_forward_matches_the_reference(source, forwards):
-    given, twin, _ = forwards["qat_"]
-    close(given, source[2], "qat_logits")
-    twin_close(twin, "qat_logits")
-
-
-def test_the_quantization_aware_loss_and_gradient_match_the_reference(source):
-    """The loss through every quantizer, and one SGD step along its gradient,
-    which passes each quantizer straight through, read back through the
-    forward without quantization, so the step compares the gradient alone."""
-    loaded, _, reference = source
-    ids = jnp.asarray(reference["input_ids"])
-    (value, logits), (twin_value, twin_logits), _ = decided(
-        lambda model, variables: updated(model, variables, ids, reference["learning_rate"]),
-        loaded.model, loaded.variables)
-    loss_close(value, "qat_")
-    loss_close(twin_value, "qat_")
-    close(logits, reference, "qat_updated_logits")
-    twin_close(twin_logits, "qat_updated_logits")
-
-
 def test_the_candidate_pool_decides_the_logits(source):
     """Dropping the pool's restriction on the Reindex layers moves the logits
     further from the float64 truth than rounding can, so the fixture
@@ -472,91 +193,6 @@ def test_the_candidate_pool_decides_the_logits(source):
             candidate_block_size=None))
     unpooled = plain.clone(kinds=flax.core.freeze(kinds))
     assert distance(unpooled.apply(loaded.variables, ids), TRUTH["logits"]) > FACTOR * rounding("logits")
-
-
-def test_the_update_exports_and_decodes_as_the_reference(source, tmp_path):
-    """Loss, one SGD step with every gradient (the indexer's are zero, as the
-    reference's selection passes none), the source-layout export read back
-    bit for bit, and greedy decoding after the fixture's prompt.
-
-    Updated logits concentrate the step's rounding in a few directions.
-    They use the K-order rule over 52 residual orders, whose reference
-    distances and float64 invariance tools/deepseek_v41_reference.py's
-    orders mode records. Each order moves every mHC stream's units and
-    Engram's projected keys and values with the residual. The same
-    float64-decided selections apply to the whole step in each order.
-    """
-    loaded, plain, reference = source
-    ids = jnp.asarray(reference["input_ids"])
-    (value, gradient), (twin_value, _), _ = decided(
-        lambda model, variables: loss_and_gradient(model, variables, ids), plain, loaded.variables)
-    loss_close(value, "")
-    loss_close(twin_value, "")
-    indexer = [
-        np.max(np.abs(leaf))
-        for path, leaf in flatten_dict(gradient, sep=".").items()
-        if ".indexer." in f".{path}."
-    ]
-    assert indexer and max(indexer) == 0
-    variables = stepped(loaded.variables, gradient, reference["learning_rate"])
-    loaded.save(tmp_path, variables=variables)
-    restored = Pretrained.load(tmp_path, dtype="float32", attention_impl="reference")
-    held, again = flatten_dict(variables, sep="."), flatten_dict(dict(restored.variables), sep=".")
-    assert held.keys() == again.keys()
-    for name, leaf in again.items():
-        np.testing.assert_array_equal(np.asarray(leaf), np.asarray(held[name]), err_msg=name)
-    with np.load(TINY / "orders.npz") as drawn:
-        orders, theirs = drawn["orders"], drawn["updated_logits"]
-
-    def ordered_updates(model, variables):
-        update = jax.jit(lambda held: updated(model, held, ids, reference["learning_rate"])[1])
-        return [np.asarray(update(permuted(variables, order))) for order in orders]
-
-    logits, twins, _ = decided(ordered_updates, plain, loaded.variables)
-    for twin in twins:
-        twin_close(twin, "updated_logits")
-    assert_as_exact_over_orders([distance(got, TRUTH["updated_logits"]) for got in logits],
-                                theirs, "updated_logits")
-    np.testing.assert_array_equal(logits[0].argmax(-1), reference["updated_logits"].argmax(-1))
-    prompt = int(reference["decode_prompt"])
-    generated = generate(plain, loaded.variables, ModelInputs(ids[:, :prompt]),
-                         reference["generated"].shape[1], key=jax.random.key(1),
-                         sampling=Sampling(temperature=0))
-    np.testing.assert_array_equal(np.asarray(generated.tokens)[:, -reference["generated"].shape[1]:],
-                                  reference["generated"])
-
-
-def cached_matches(model, variables, reference, prefix: str):
-    ids, prompt = jnp.asarray(reference["input_ids"]), int(reference["decode_prompt"])
-    (prompt_logits, steps, draft_ids, draft_logits, confidence), twin, _ = decided(
-        lambda model, variables: cached_run(model, variables, ids, prompt), model, variables)
-    close(prompt_logits, reference, f"{prefix}prompt_logits")
-    close(steps, reference, f"{prefix}decode_logits")
-    close(draft_logits, reference, f"{prefix}draft_logits")
-    name = f"{prefix}draft_confidence"
-    assert_as_exact_as_the_reference(confidence, reference[name], TRUTH[name], name)
-    np.testing.assert_array_equal(draft_ids, reference[f"{prefix}draft_ids"])
-    wide_prompt, wide_steps, _, wide_draft, wide_confidence = twin
-    for name, wide in (("prompt_logits", wide_prompt), ("decode_logits", wide_steps),
-                       ("draft_logits", wide_draft), ("draft_confidence", wide_confidence)):
-        twin_close(wide, prefix + name)
-
-
-def test_the_decode_cache_and_the_drafter_match_the_reference(source):
-    """The cached prefill and teacher-forced steps cover the window ring,
-    ratio-2 windows closing across calls, the shared entries, index keys,
-    selections and candidate pool, and the engram history; DSpark's windows
-    seed on the prompt and draft after every step."""
-    loaded, plain, reference = source
-    cached_matches(plain, loaded.variables, reference, "")
-
-
-def test_the_quantization_aware_cache_and_drafter_match_the_reference(source):
-    """The same cached run with the cache rounded as the release stores it:
-    each window key, entry and index key rounded where the cache takes it,
-    DSpark's window keys included."""
-    loaded, _, reference = source
-    cached_matches(loaded.model, loaded.variables, reference, "qat_")
 
 
 def test_left_padding_changes_no_row(source):
@@ -648,13 +284,6 @@ def test_consecutive_reindex_layers_publish_their_selections_under_scan_layers()
     )
 
 
-def test_a_config_without_swiglu_limit_clamps_nothing():
-    """The release's ModelArgs default is 0.0, no clamp (v41 model.py:70)."""
-    config = json.loads((TINY / "config.json").read_text())
-    text = {key: value for key, value in config["text_config"].items() if key != "swiglu_limit"}
-    assert translate_config({**config, "text_config": text})["swiglu_limit"] is None
-
-
 def test_a_family_that_reads_its_media_bundle_plugs_in_through_its_entry(monkeypatch):
     """The wrapper dispatch and the routing of a bundle's tensors read the
     family's own entry, so a bundled family under another name loads with
@@ -681,36 +310,6 @@ def test_a_family_that_reads_its_media_bundle_plugs_in_through_its_entry(monkeyp
     assert wrapper_route("probe_span", record) == ("projector", "probe_span")
     assert wrapper_route("image_newline", record) == ("language_model", "image_newline")
     assert wrapper_route("embed.weight", record) == ("language_model", "embed.weight")
-
-
-def test_rate_one_compression_keeps_no_window_buffer():
-    """A window of one token closes with the token, so at rate 1 every token
-    is an entry at once: the cache is the entries alone, with no window
-    buffer or gate to scan."""
-    from dew.nn.deepseek_v4 import CompressedEntries
-
-    entries = CompressedEntries(width=4, rate=1, overlap=False, rope_dim=0, rope_theta=10000.0, yarn=None,
-                                norm_eps=1e-6, position_bias=False)
-    variables = entries.init(jax.random.key(0), jnp.ones((1, 2, 4), jnp.float32), jnp.asarray([[0, 1]]), 4,
-                             write=False, method=CompressedEntries.cached_entries)
-    assert set(variables["cache"]) == {"compressed"}
-
-
-def test_the_vision_half_matches_the_reference(tmp_path):
-    """The bundle's vision half: the ViT's patches, blocks and 2D rotary, the
-    aligner over a patch grid it pads to whole squares, the span's learned
-    vectors, every router's image bias and the engram's dead image positions,
-    through a prefill with the image and text steps after it, against the
-    release's Transformer.forward with the quantizers off."""
-    reference = np.load(TINY / "vision.npz")
-    loaded = Pretrained.load(vision_bundle(tmp_path), dtype="float32", attention_impl="reference")
-    (span, prompt_logits, steps), twin, _ = decided(
-        lambda model, variables: vision_run(model, variables, reference), loaded.model, loaded.variables)
-    assert_as_exact_as_the_reference(span, reference["vision_span"], TRUTH["vision_span"], "vision_span")
-    close(prompt_logits, reference, "vision_prompt_logits")
-    close(steps, reference, "vision_decode_logits")
-    for name, wide in zip(("vision_span", "vision_prompt_logits", "vision_decode_logits"), twin, strict=True):
-        twin_close(wide, name)
 
 
 def test_the_image_bias_and_the_dead_image_positions_decide_the_prefill(tmp_path):

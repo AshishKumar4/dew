@@ -27,10 +27,25 @@ than leaving the task without a verdict. Each row also carries its tests' own
 times, from which `durations` rewrites tests/test_durations.json: given green
 runs' verdicts (`armada verdict <sha> --json`), the newest first, it records
 each test of the newest at its least time as the floor's Python ran it.
+
+The test cache skips a file whose inputs are unchanged since it ran green. A
+green row records the checkout's Python files its tests executed
+(tools/armada/executed.py) and its key, a hash of those files, the file
+itself and what every file shares (`shared`: the environment's locks, the
+CI tools, every non-Python file under tests/ and src/, and the names of every
+Python file there, so a file a scanner would find changes every key). The
+plan recomputes each file's key from its record at the commit it plans, and
+leaves out a file whose every row's key matches, which ran green on exactly
+these inputs. A file that started another process is never skipped, since no
+event saw that process's code. The records live in the dew-xla-cache Worker
+under `testcache/`; with DEW_TEST_CACHE=off, or without its URL and token, the
+plan runs every file.
 """
 
 import argparse
+import concurrent.futures
 import contextlib
+import hashlib
 import heapq
 import json
 import math
@@ -41,6 +56,8 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
@@ -74,6 +91,110 @@ SKIPPED = {"tests/test_gen_api.py", "tests/test_multihost.py"}
 """CI runs the first in the lint job, under the griffe it pins, and the second in the multihost job,
 across the containers of an armada gang."""
 DURATIONS = Path("tests/test_durations.json")
+SHARED = ("pyproject.toml", "constraints.txt", ".armada.json", "tools/armada/ci.py", "tools/armada/split.py",
+          "tools/armada/executed.py", str(DURATIONS))
+"""The files every test file's key covers whole, beside tests/ and src/ and the environment's own
+inputs, which .armada.json names (`environment_files`)."""
+
+
+def environment_files() -> list[str]:
+    """The files .armada.json builds the tasks' environments from: each environment's setup and
+    install scripts and its snapshot key's files. A shell script runs no Python a record could see."""
+    if not Path(".armada.json").is_file():  # a project armada does not run, as the CI tool's tests make
+        return []
+    config = json.loads(Path(".armada.json").read_text())
+    environments = [config["environment"], *config.get("environments", {}).values()]
+    return sorted({name for environment in environments
+                   for name in (environment.get("setup"), environment.get("install"),
+                                *environment.get("key", ()))
+                   if name})
+CACHE_PREFIX = "testcache"
+
+
+def shared(python: str) -> str:
+    """The hash of what every test file's run shares: `python`, the `SHARED` files, every non-Python
+    file under tests/ and src/, and the names of every Python file there."""
+    digest = hashlib.sha256(python.encode())
+    for top in ("tests", "src"):
+        for path in sorted(Path(top).rglob("*")):
+            if not path.is_file() or "__pycache__" in path.parts:
+                continue
+            digest.update(str(path).encode())
+            if path.suffix != ".py":
+                digest.update(hashlib.sha256(path.read_bytes()).digest())
+    for name in (*SHARED, *environment_files()):
+        digest.update(name.encode() + contents(name))
+    return digest.hexdigest()
+
+
+def contents(name: str) -> bytes:
+    """The hash of file `name`'s bytes, or b"missing"."""
+    return hashlib.sha256(Path(name).read_bytes()).digest() if Path(name).is_file() else b"missing"
+
+
+def cache_key(common: str, name: str, depends: list[str]) -> str:
+    """The key of test file `name` whose run executed `depends`: those files' contents and `common`."""
+    digest = hashlib.sha256(common.encode())
+    for path in sorted({name, *depends}):
+        digest.update(path.encode() + contents(path))
+    return digest.hexdigest()
+
+
+def cache_url(python: str, row_name: str) -> str:
+    """Where the record of `row_name` lives: the Worker's key alphabet has no colon or hash."""
+    _, name, split = parsed_row(row_name)
+    return (f"{os.environ['DEW_XLA_CACHE_URL'].rstrip('/')}/{CACHE_PREFIX}/{python}/{name}/"
+            + ("-of-".join(split.split("/")) if split else "whole"))
+
+
+def cache_request(url: str, token: str, data: bytes | None = None) -> bytes | None:
+    """GET (or with `data`, PUT) `url`: None on a miss, and on a failure, which it reports and which
+    costs only a rerun."""
+    headers = {"Authorization": f"Bearer {token}", "User-Agent": "dew-ci-test-cache"}
+    method = "PUT" if data is not None else "GET"
+    request = urllib.request.Request(url, data=data, method=method, headers=headers)
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            return response.read()
+    except urllib.error.HTTPError as error:
+        if error.code != 404:
+            print(f"the test cache answered {error.code} to {method} {url}", file=sys.stderr)
+        return None
+    except (urllib.error.URLError, TimeoutError, OSError) as error:
+        print(f"the test cache is unreachable ({error}); {method} {url} skipped", file=sys.stderr)
+        return None
+
+
+def cached_files(python: str, timed: dict[str, float | None], recorded: dict[str, list[float]],
+                 target: float) -> set[str]:
+    """The files of `timed` whose every row, as the plan would split them, ran green on these inputs."""
+    common = shared(python)
+
+    def rows_of(name: str) -> list[str]:
+        seconds = timed[name]
+        if seconds is None or seconds <= target:
+            return [row(python, name, "")]
+        count = len(split(recorded.get(name, []), seconds, target))
+        return [row(python, name, f"{group}/{count}") for group in range(1, count + 1)]
+
+    with concurrent.futures.ThreadPoolExecutor(32) as pool:
+        hits = pool.map(lambda name: cached(python, rows_of(name), common), timed)
+        return {name for name, hit in zip(timed, hits, strict=True) if hit}
+
+
+def cached(python: str, rows: list[str], common: str) -> bool:
+    """Whether every one of a file's `rows` ran green on exactly these inputs."""
+    token = os.environ.get("DEW_TEST_CACHE_TOKEN") or os.environ.get("DEW_XLA_CACHE_TOKEN")
+    if os.environ.get("DEW_TEST_CACHE") == "off" or not token or "DEW_XLA_CACHE_URL" not in os.environ:
+        return False
+    for row_name in rows:
+        record = cache_request(cache_url(python, row_name), token)
+        if record is None:
+            return False
+        recorded = json.loads(record)
+        if recorded["key"] != cache_key(common, parsed_row(row_name)[1], recorded["depends"]):
+            return False
+    return True
 
 
 def recorded_tests() -> dict[str, list[float]]:
@@ -101,6 +222,13 @@ def weights(files: list[str], timings: dict, python: str = PYTHONS[0]) -> dict[s
 
 def row(python: str, name: str, split: str) -> str:
     return f"{python}:{name}" + (f"#{split}" if split else "")
+
+
+def parsed_row(row_name: str) -> tuple[str, str, str]:
+    """`row`'s (python, name, split) back from its name."""
+    python, rest = row_name.split(":", 1)
+    name, _, split = rest.partition("#")
+    return python, name, split
 
 
 def starts(weights: list[int], capacity: int) -> list[int]:
@@ -162,6 +290,9 @@ def plan(target: float, timings: dict) -> list[dict]:
     for python in PYTHONS:
         files = every if python == PYTHONS[0] else [name for name in every if name in NEWEST_FILES]
         timed = weights(files, timings, python)
+        unchanged = cached_files(python, timed, recorded, target)
+        print(f"{python}: {len(unchanged)} of {len(files)} files ran green on these inputs", file=sys.stderr)
+        timed = {name: seconds for name, seconds in timed.items() if name not in unchanged}
         tasks: list[tuple[list[str], str, float]] = [
             ([name], "", target) for name, seconds in timed.items() if seconds is None]
         for name, seconds in timed.items():
@@ -252,6 +383,9 @@ def task(python: str, tests: list[str], split: str, out: Path, deadline: float, 
     container's pace), which pytest's case times leave out. Weighed by case times, tasks planned
     at 300 seconds ran a median of 392."""
     began = time.monotonic()
+    # Before any test writes under tests/, the inputs as the plan saw them.
+    common = shared(python)
+    executed_report = out.with_name(f"{out.name}.executed.json")
     report = out.with_name(f"{out.name}.junit.xml")
     report.unlink(missing_ok=True)
     grouping = ["-p", "split", f"--ci-group={split}"] if split else []
@@ -259,7 +393,7 @@ def task(python: str, tests: list[str], split: str, out: Path, deadline: float, 
     # log holds every test that finished when a task is cut short.
     command = [f".venv-{python}/bin/python", "-u", "-m", "pytest", "-q", "-m", "not network", "-rfE",
                "--tb=short", "--continue-on-collection-errors", "-o", "faulthandler_timeout=600",
-               f"--junitxml={report}", *tests, *grouping]
+               "-p", "executed", f"--junitxml={report}", *tests, *grouping]
     # pytest leads a process group of its own, so what its tests start ends with it. Its output is
     # streamed as it comes by a reader of its own, which nothing waits on past pytest's end: a test's
     # child holding the pipe open (a pool worker, a server) cannot keep the verdict from being written.
@@ -267,7 +401,8 @@ def task(python: str, tests: list[str], split: str, out: Path, deadline: float, 
     # split.py, the plugin that keeps a split file's group, imports from beside this file.
     path = os.pathsep.join(filter(None, [str(Path(__file__).resolve().parent), os.environ.get("PYTHONPATH")]))
     done = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                            start_new_session=True, env={**os.environ, "PYTHONPATH": path})
+                            start_new_session=True,
+                            env={**os.environ, "PYTHONPATH": path, "DEW_EXECUTED": str(executed_report)})
 
     def read() -> None:
         for line in done.stdout or ():
@@ -317,14 +452,30 @@ def task(python: str, tests: list[str], split: str, out: Path, deadline: float, 
                      "tests": {node_of(case): float(case.get("time") or 0) for case in own},
                      "timings": {row(python, name, ""): seconds}})
     out.write_text(json.dumps({"rows": rows}))
+    record(python, rows, executed_report, common)
     return 0
 
 
-def durations(verdicts: list[dict]) -> dict[str, float]:
+def record(python: str, rows: list[dict], executed_report: Path, common: str) -> None:
+    """Keep each green row's key and the files its tests executed (`cached` reads them back)."""
+    token = os.environ.get("DEW_XLA_CACHE_TOKEN")
+    if not token or "DEW_XLA_CACHE_URL" not in os.environ or not executed_report.is_file():
+        return
+    executed = json.loads(executed_report.read_text())
+    for row_ in rows:
+        name = parsed_row(row_["name"])[1]
+        depends = executed.get(name)
+        if row_["exitCode"] == 0 and depends is not None:
+            body = json.dumps({"key": cache_key(common, name, depends), "depends": depends}).encode()
+            cache_request(cache_url(python, row_["name"]), token, body)
+
+
+def durations(verdicts: list[dict], before: dict[str, float]) -> dict[str, float]:
     """Each test of the first of green runs' `verdicts`, the newest, at its least time over them all,
     as their floor's Python ran it: what it takes where nothing slows it. A container can run three
     times as slowly as the rest of its run, and a run's compilations can miss the shared cache, and
-    neither moves a test's time. A test the newest run did not have is gone."""
+    neither moves a test's time. A test of a file the newest run ran, which that run did not have, is
+    gone; a file the newest run skipped as unchanged (the test cache) keeps its times from `before`."""
     times: dict[str, list[float]] = {}
     for verdict in verdicts:
         rows = verdict["rows"]
@@ -337,9 +488,12 @@ def durations(verdicts: list[dict]) -> dict[str, float]:
         for row in floor:
             for node, seconds in row["tests"].items():
                 times.setdefault(node, []).append(seconds)
-    newest = {node for row in verdicts[0]["rows"] if row["name"].startswith(f"{PYTHONS[0]}:")
-              for node in row["tests"]}
-    return {node: round(min(seconds), 3) for node, seconds in sorted(times.items()) if node in newest}
+    newest_rows = [row for row in verdicts[0]["rows"] if row["name"].startswith(f"{PYTHONS[0]}:")]
+    newest = {node for row in newest_rows for node in row["tests"]}
+    ran = {parsed_row(row["name"])[1] for row in newest_rows}
+    kept = {node: seconds for node, seconds in before.items() if node.split("::")[0] not in ran}
+    return dict(sorted({**kept, **{node: round(min(seconds), 3) for node, seconds in times.items()
+                                   if node in newest}}.items()))
 
 
 def main() -> int:
@@ -360,7 +514,8 @@ def main() -> int:
                            help="green runs' verdicts, the newest first: armada verdict <sha> --json")
     args = parser.parse_args()
     if args.operation == "durations":
-        recorded = durations([json.loads(path.read_text()) for path in args.verdicts])
+        before = json.loads(DURATIONS.read_text()) if DURATIONS.is_file() else {}
+        recorded = durations([json.loads(path.read_text()) for path in args.verdicts], before)
         DURATIONS.write_text(json.dumps(dict(sorted(recorded.items())), indent=0) + "\n")
         print(f"{len(recorded)} tests, {sum(recorded.values()):.0f} s, in {DURATIONS}")
         return 0

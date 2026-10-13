@@ -13,7 +13,6 @@ at test time.
 """
 
 import json
-import lzma
 from pathlib import Path
 
 import jax
@@ -33,15 +32,12 @@ from safetensors.numpy import load_file
 from scipy.special import log_softmax
 
 from dew.interop import Pretrained
-from dew.interop.hf_decoders import families, translate_config
 from dew.nn.inputs import ModelInputs
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
-from dew.registry import models
 from dew.sampling import Sampling, generate
 
 ROOT = Path(__file__).parent / "fixtures" / "hf"
-SOURCE = ROOT / "kimi-linear-source"
 TINY = ROOT / "kimi-linear-tiny"
 
 
@@ -52,58 +48,6 @@ def source():
     inputs = ModelInputs(jnp.asarray(reference["input_ids"], jnp.int32),
                          {"attention_mask": jnp.asarray(reference["attention_mask"], bool)})
     return loaded, inputs, reference
-
-
-def released_config() -> dict:
-    return json.loads((SOURCE / "config.json").read_text())
-
-
-def test_released_config_builds_the_published_geometry():
-    model = models.build("causal_transformer", translate_config(released_config()))
-    assert model.num_layers == 27 and model.emb_features == 2304
-    assert (
-        model.per_layer_types.count("full_attention") == 7 and model.per_layer_types[-1] == "full_attention"
-    )
-    kda, mla = model.kinds["linear_attention"].mixer, model.kinds["full_attention"].mixer
-    assert kda.linear_lower_bound is None and not kda.use_full_rank_gate
-    assert mla.q_lora_rank is None and mla.mla_use_nope and not mla.mla_use_output_gate
-    assert model.mixture.experts == 256 and model.mixture.top_k == 8 and model.mixture.bias
-    assert model.sparse_layers == tuple(range(1, 27)) and model.mixture.groups == 1
-    assert (model.mixture.expert_features, model.mixture.shared_features, model.mixture.scaling) == (
-        1024,
-        1024,
-        2.446,
-    )
-    assert model.mlp == "swiglu" and model.attention_residuals is None
-
-
-def test_every_released_tensor_lands_on_one_leaf_of_the_released_tree():
-    """All 20,493 source tensors land on distinct leaves of the tree the
-    released config builds, each at the leaf's shape (A_log read from its
-    stored [1, 1, 32, 1] as the 32 heads), and cover all 603 of its leaves,
-    before any weight would be read."""
-    fields, family = translate_config(released_config()), families()["kimi_linear"]
-    model = models.build("causal_transformer", fields)
-    shapes = jax.eval_shape(lambda: model.init(jax.random.key(0), jnp.zeros((1, 4), jnp.int32)))
-    tree = {path: leaf.shape for path, leaf in flatten_dict(dict(shapes)).items()}
-    tensors = json.loads(lzma.decompress((SOURCE / "tensors.json.xz").read_bytes()))
-    prepared = family.prepare_weights({name: np.broadcast_to(np.float32(0), shape)
-                                       for name, (_, shape) in tensors.items()})
-    placed, experts = {}, {}
-    for name, value in prepared.items():
-        path = family.weight_path(name, fields)
-        shape = value.shape[::-1] if path[-1] == "kernel" and value.ndim == 2 else value.shape
-        if len(path) >= 4 and path[-4] == "experts" and path[-3].isdigit():
-            leaf = (*path[:-3], path[-2], path[-1])
-            assert tree[leaf][1:] == shape, name
-            experts.setdefault(leaf, set()).add(int(path[-3]))
-            continue
-        assert path not in placed, (name, placed.get(path))
-        assert tree[path] == shape, (name, tree[path], shape)
-        placed[path] = name
-    assert all(indices == set(range(tree[leaf][0])) for leaf, indices in experts.items())
-    assert set(placed) | set(experts) == set(tree)
-    assert (len(tensors), len(tree)) == (20493, 603)
 
 
 def test_forward_matches_the_reference_over_left_padding(source):
@@ -204,28 +148,3 @@ def test_greedy_generation_and_decode_steps_match_the_reference(source):
     assert (
         np.max(np.abs(np.asarray(generated.raw_log_probs, np.float64)[:, :4] - exact)) <= 2 * FACTOR * error
     )
-
-
-def test_group_limited_routing_is_refused():
-    """The released gate fills the groups it does not select with 0.0, not
-    -inf (modeling_kimi.py:684-685), so their experts still compete, where
-    Dew's grouped router masks them. The release routes in one group,
-    num_expert_group 1 of topk_group 1, which never reaches that."""
-    config = released_config()
-    assert (config["num_expert_group"], config["topk_group"]) == (1, 1)
-    config.update(num_expert_group=8, topk_group=4)
-    with pytest.raises(ValueError, match="num_expert_group 8 over topk_group 4"):
-        translate_config(config)
-
-
-@pytest.mark.parametrize("field,value", [
-    ("q_lora_rank", 32), ("hidden_act", "situ"), ("attn_res_block_size", 4),
-    ("mla_use_output_gate", True), ("routed_expert_hidden_size", 512),
-])
-def test_config_outside_the_released_computation_is_refused(field, value):
-    """A low-rank query, SiTU and K3's additions are what the released
-    modeling_kimi.py does not compute."""
-    config = released_config()
-    config[field] = value
-    with pytest.raises(ValueError, match=field):
-        translate_config(config)

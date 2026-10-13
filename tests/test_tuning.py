@@ -16,7 +16,7 @@ from process_support import REPO_ROOT
 from reference_error import equations
 
 from dew import cache
-from dew.nn.attention import stream_rms_normalized
+from dew.nn.attention import rms_normalized, stream_rms_normalized
 from dew.nn.kernels import norm_swiglu, tuning
 from dew.nn.moe import gated_product
 
@@ -29,6 +29,11 @@ def loss(x, branch, scale, gate, up):
                                            scale_after_cast=False, fp32_statistics=True,
                                            implementation="pallas")
     return jnp.sum(stream * normed) + jnp.sum(gated_product("swiglu", implementation="pallas")(gate, up))
+
+
+def plain(x, scale):
+    return rms_normalized(x, scale, 1e-6, x.dtype, scale_offset=True, scale_after_cast=False,
+                          fp32_statistics=True, implementation="pallas")
 
 
 def step():
@@ -63,22 +68,32 @@ def fresh(script: str, *arguments: str, cache_dir, flags: str) -> list:
 
 STORED = """
 import json, os, sys
-import tokamax
 from dew import cache
 from dew.files import write_atomically
-picks = tokamax.AutotuningResult.loads(sys.argv[1])
-path = cache.kernel_picks_path(picks.device_kind)
+path = cache.kernel_picks_path(json.loads(sys.argv[1])["device_kind"])
 os.makedirs(os.path.dirname(path), exist_ok=True)
 write_atomically(path, sys.argv[1])
 print(json.dumps([path]))
 """
 
+FOREIGN = "dew.nn.kernels.another_branch.Kernel"
+"""A kernel another checkout stores and this one cannot read."""
+
+
+def with_foreign(text: str) -> str:
+    """A store's JSON with one more launch, of a kernel this checkout lacks."""
+    stored = json.loads(text)
+    entry = json.loads(json.dumps(stored["data"][0]))
+    entry[0]["op"]["__type"] = FOREIGN
+    return json.dumps({**stored, "data": [*stored["data"], entry]})
+
+
 READ = """
 import json
 from test_tuning import launches, operands, step
 from dew.nn.kernels import tuning
-print(json.dumps([{rows: launches(step(), *operands(rows)) for rows in (13, 15)},
-                  tuning.tune(lambda: step().lower(*operands(15)))]))
+print(json.dumps([{rows: launches(step(), *operands(rows)) for rows in (13, 15, 40)},
+                  tuning.settled(tuning.tune(lambda: step().lower(*operands(15))))]))
 """
 
 
@@ -87,8 +102,9 @@ def test_a_steps_launches_take_pins_stored_picks_and_heuristics(tmp_path):
     lowered program, keyed with their token axis at a power of two. Each
     takes its heuristic, a pinned config its space holds, and in a fresh
     process the picks stored for its device beside its compilation cache,
-    for every token count in the bucket. Nothing measures on a CPU or beside
-    other work on a GPU."""
+    for every token count in the bucket, and a token count stored for no
+    bucket the nearest bucket's, beside a launch of a kernel only another
+    checkout has. Nothing measures on a CPU or beside other work on a GPU."""
     with tuning.launches():
         found = tokamax.autotuning.get_bound_args(step(), *operands(15))
         thirteen = tokamax.autotuning.get_bound_args(step(), *operands(13))
@@ -120,17 +136,22 @@ def test_a_steps_launches_take_pins_stored_picks_and_heuristics(tmp_path):
               norm_swiglu.SwigluBackward: norm_swiglu.BlockConfig(256, 1)}
     timing = tokamax.BenchmarkData(compile_time_ms=1.0, lower_time_ms=1.0, evaluation_times_ms=(1.0,),
                                    metadata={})
-    picks = tokamax.AutotuningResult(jax.devices()[0].device_kind, tuple(
-        (ba, tuning.AutotuningData({picked[type(ba.op)]: timing})) for ba in found))
+    # A plain norm's pick beside them: a launch with no branch, which the seam's nearest search passes over.
+    with tuning.launches():
+        [alone] = tokamax.autotuning.get_bound_args(jax.jit(plain), operands(15)[0], operands(15)[2])
+    picks = tokamax.AutotuningResult(jax.devices()[0].device_kind, (
+        *((ba, tuning.AutotuningData({picked[type(ba.op)]: timing})) for ba in found),
+        (alone, tuning.AutotuningData({norm_swiglu.RowsConfig(2, 1): timing}))))
     flags = f"{os.environ.get('XLA_FLAGS', '')} {READ_ONLY}".strip()
-    [path] = fresh(STORED, picks.dumps(), cache_dir=tmp_path / "cache", flags=flags)
+    [path] = fresh(STORED, with_foreign(picks.dumps()), cache_dir=tmp_path / "cache", flags=flags)
     assert path.startswith(str(tmp_path / "cache" / "autotune" / "jaxlib-")) and path.endswith(".json")
     stored, tuned = fresh(READ, cache_dir=tmp_path / "cache", flags=flags)
-    for rows in ("13", "15"):
+    for rows in ("13", "15", "40"):
         assert stored[rows]["rms_norm_forward"] == [[-(-int(rows) // 4)], 2]
-        assert stored[rows]["rms_norm_backward"] == [[-(-int(rows) // 2)], 8]
         assert stored[rows]["swiglu_backward"] == [[-(-int(rows) * 96 // 256)], 1]
-    assert tuned is False
+    for rows in ("13", "15"):
+        assert stored[rows]["rms_norm_backward"] == [[-(-int(rows) // 2)], 8]
+    assert tuned is True
     assert os.listdir(os.path.dirname(path)) == [os.path.basename(path)]
 
 
@@ -156,25 +177,54 @@ print(json.dumps([path, os.stat(path).st_mtime_ns if os.path.exists(path) else N
 """
 
 
+MEASURED = """
+import json, os, sys
+import jax
+from test_tuning import operands, step
+from dew import cache
+from dew.nn.kernels import tuning
+launches = tuning.tune(lambda: step().lower(*operands(int(sys.argv[1]))), measure=True)
+path = cache.kernel_picks_path(jax.devices()[0].device_kind)
+stamp = os.stat(path).st_mtime_ns if os.path.exists(path) else None
+print(json.dumps([path, stamp, tuning.settled(launches)]))
+"""
+
+
 @pytest.mark.gpu
-def test_a_trainer_on_a_gpu_to_itself_measures_its_launches_once_and_a_shared_one_reads(tmp_path):
-    """A language model's step compiled by the Trainer on a GPU it has to
-    itself measures each of its launches over every config of its space,
-    stores every time and keeps the fastest, and compiles with them. The next
-    process compiling that step measures nothing, and one beside other work
-    on its GPU (gpu-run -n 0.5) compiles a new shape and adds no picks."""
+def test_only_an_explicit_pass_on_a_gpu_to_itself_measures_and_it_measures_each_launch_once(tmp_path):
+    """A language model's step compiled by the Trainer measures nothing. An
+    explicit pass (`tune(..., measure=True)`) on a GPU it has to itself
+    measures each launch over every config of its space, stores every time
+    and keeps the fastest; the next pass measures nothing, and one beside
+    other work on its GPU (gpu-run -n 0.5) adds no picks for a new shape."""
     if not cache.measures_picks():
         pytest.skip("measuring needs the GPU to itself: gpu-run without -n")
     inherited = os.environ.get("XLA_FLAGS", "")
-    path, measured = fresh(TRAINED, "2048", cache_dir=tmp_path / "cache", flags=inherited)
+    path, untouched = fresh(TRAINED, "2048", cache_dir=tmp_path / "cache", flags=inherited)
+    assert untouched is None
+    # Another checkout's launch, which the pass reads past and keeps.
+    with tuning.launches():
+        found = tokamax.autotuning.get_bound_args(step(), *operands(15))
+    timing = tokamax.BenchmarkData(compile_time_ms=1.0, lower_time_ms=1.0, evaluation_times_ms=(1.0,),
+                                   metadata={})
+    seed = tokamax.AutotuningResult(jax.devices()[0].device_kind, (
+        (found[0], tuning.AutotuningData({found[0].heuristics_config: timing})),))
+    foreign = json.loads(with_foreign(seed.dumps()))["data"][-1]
+    fresh(STORED, json.dumps({**json.loads(seed.dumps()), "data": [foreign]}), cache_dir=tmp_path / "cache",
+          flags=inherited)
+    path, measured, settled = fresh(MEASURED, "2048", cache_dir=tmp_path / "cache", flags=inherited)
+    assert settled is True
     with open(path) as file:
-        stored = tokamax.AutotuningResult.load(file)
+        written = json.load(file)
+    assert foreign in written["data"]
+    stored = tokamax.AutotuningResult.loads(json.dumps(
+        {**written, "data": [entry for entry in written["data"] if entry != foreign]}))
     kinds = {type(ba.op) for ba, _ in stored.data}
     assert {norm_swiglu.RmsForward, norm_swiglu.RmsBackward} <= kinds
     for ba, timings in stored.data:
         assert len(timings) > 1, type(ba.op)
         assert all(data.median_evaluation_time_ms > 0 for data in timings.values())
         assert timings.fastest_config in ba.autotuning_configs
-    assert fresh(TRAINED, "2048", cache_dir=tmp_path / "cache", flags=inherited) == [path, measured]
-    assert fresh(TRAINED, "1024", cache_dir=tmp_path / "cache",
-                 flags=f"{inherited} {READ_ONLY}".strip()) == [path, measured]
+    assert fresh(MEASURED, "2048", cache_dir=tmp_path / "cache", flags=inherited) == [path, measured, True]
+    assert fresh(MEASURED, "1024", cache_dir=tmp_path / "cache",
+                 flags=f"{inherited} {READ_ONLY}".strip()) == [path, measured, False]

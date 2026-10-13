@@ -39,9 +39,9 @@ READS: tuple[Read, ...] = ("memory", "indexed", "streamed")
 
 @dataclasses.dataclass(frozen=True)
 class Shard:
-    """One physical piece of a streamed source: a file, a byte or row range of
-    one, or a Parquet row group. `id` is immutable across runs (path and
-    range, or a Hub revision and path), so a cache keys rows by `(id, row)`."""
+    """One piece of a streamed source: a file, a byte or row range of one,
+    a Parquet row group, or a disjoint row share. `id` is immutable across runs
+    (path and range, or a Hub revision and path), so a cache keys rows by `(id, row)`."""
 
     id: str
     uri: str
@@ -60,10 +60,16 @@ def preparing(source: Source, size: int | None, into: str) -> None:
 class ShardManifest:
     """A streamed source's shards, in canonical order, and the reader that
     opens one: a picklable function returning a checkpointable grain
-    `IterDataset` over the shard's records in order."""
+    `IterDataset` over the shard's records in order.
+
+    When physical shards cannot fill the readers and workers, `subdivide`
+    receives the needed count and returns exactly that many `Shard`s, each
+    a disjoint part of these records with an exact per-part position read
+    by the same `reader`. None keeps the physical-shard requirement."""
 
     shards: tuple[Shard, ...]
     reader: Callable[[Shard], pygrain.IterDataset]
+    subdivide: Callable[[int], tuple[Shard, ...]] | None = None
 
 
 @runtime_checkable

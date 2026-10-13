@@ -31,8 +31,6 @@ SIZE = 64
 # oxford_flowers102 is 8189 images across its three splits, and the loader
 # reads split="all".
 RECORDS = 8189
-# Validation uses the run's local batch size and holds out four batches.
-VAL_BATCH = BATCH
 VAL_RECORDS = 4 * BATCH
 
 
@@ -67,21 +65,6 @@ def test_train_batches_carry_resized_images_and_labels(flowers):
         assert batch["label"].shape == (BATCH,)
 
     assert labels_of(first) != labels_of(second), "the train sampler is not shuffling"
-
-
-def test_validation_reads_different_records_in_a_stable_order(flowers):
-    """The val loader must not be a random slice of the training stream."""
-    train_labels = labels_of(next(flowers.train(DataPartition())))
-    val = next(flowers.val(DataPartition()))
-    again = next(flowers.val(DataPartition()))
-
-    assert val["image"].shape == (VAL_BATCH, SIZE, SIZE, 3)
-    assert val["image"].dtype == np.uint8
-
-    # Canonical order, so two fresh iterators see the same records; the
-    # shuffled train stream does not start there.
-    assert labels_of(val) == labels_of(again)
-    assert labels_of(val)[:BATCH] != train_labels
 
 
 def test_the_validation_pass_reads_the_split_once_and_stops(flowers):

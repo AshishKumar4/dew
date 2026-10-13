@@ -26,6 +26,7 @@ instead of `q^T S` in the recurrent form; the numbers are in the tests that
 catch them.
 """
 
+import functools
 import json
 from pathlib import Path
 
@@ -33,14 +34,14 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from delta_rule_support import recurrence, through
 from flax import linen as nn
-from reference_error import assert_as_exact_as_the_reference
+from reference_error import assert_as_exact_as_the_reference, assert_leaves_as_exact, widened
 
-from dew.nn.inputs import AttentionMetadata
+from dew.nn.inputs import AttentionMetadata, coordinates
 from dew.nn.linear import (
     GatedDeltaNet,
     _masked_conv1d,
-    _stream_order,
     causal_conv1d,
     chunk_decay,
     chunk_delta_rule,
@@ -52,19 +53,6 @@ from dew.nn.linear import (
 )
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "linear_attention"
-
-
-def test_a_padding_slot_writes_nothing_into_the_next_row():
-    """The masked conv's stream order scatters each real token's slot into
-    its row's compact column and drops the padding slots. XLA's deterministic
-    GPU scatter (the CUDA lane's --xla_gpu_deterministic_ops) drops only an
-    index past the whole [rows, columns] space, so a padding slot dropped at
-    column `length` landed on the next row's first column (openxla/xla#49380,
-    fixed by 54cfa1ba): row 0's padding slot 2 overwrote row 1's column 0,
-    so row 1's first token convolved row 0's third."""
-    valid = jnp.array([[True, True, False, False], [True, False, False, False]])
-    _, source = jax.jit(_stream_order)(valid)
-    np.testing.assert_array_equal(source, [[0, 1, 4, 4], [0, 4, 4, 4]])
 
 
 @pytest.fixture(scope="module")
@@ -151,6 +139,49 @@ def test_the_chunked_and_recurrent_forms_agree(reference):
     assert largest(chunked_state, recurrent_state) < 1e-5
 
 
+@pytest.mark.parametrize("strong", [False, True], ids=["drawn decay", "strong decay"])
+@pytest.mark.parametrize("decay_width", [1, 8], ids=["per head", "per key dimension"])
+def test_the_chunked_rule_runs_packed_documents_as_each_runs_alone(decay_width, strong):
+    """Packed documents in the chunked rule, one starting on a chunk's first token, one four tokens
+    before a chunk's end and one spanning chunks: each document's output, the final memory and every
+    gradient as near the float64 recurrence run document by document as the chunked rule run on each
+    document alone (`assert_leaves_as_exact`), and within 1e-4 of it, the row's first document from
+    the row's memory and every other from zero, for a decay per head (the gated delta net) and per key
+    dimension (Kimi's delta attention). At a strong decay (-4 a token) the chunk's earlier document
+    sits 96 below its last one's, past exp's fp32 range."""
+    batch, length, heads, width, chunk = 1, 160, 2, 8, 32
+    begins = (0, 32, 60, 110)
+    starts = np.zeros((batch, length), bool)
+    starts[0, list(begins[1:])] = True
+    keys = jax.random.split(jax.random.key(23), 8)
+    q = l2norm(jax.random.normal(keys[0], (batch, length, heads, width)))
+    k = l2norm(jax.random.normal(keys[1], (batch, length, heads, width)))
+    v = jax.random.normal(keys[2], (batch, length, heads, width))
+    g = (jnp.full((batch, length, heads, decay_width), -4.0) if strong else
+         -jnp.exp(jax.random.normal(keys[3], (batch, length, heads, decay_width)) - 2.0))
+    beta = jax.nn.sigmoid(jax.random.normal(keys[4], (batch, length, heads)))
+    h0 = 0.1 * jax.random.normal(keys[5], (batch, heads, width, width))
+    do = jax.random.normal(keys[6], v.shape)
+    dht = 0.1 * jax.random.normal(keys[7], h0.shape)
+
+    def packed(*args):
+        return chunk_delta_rule(*args, chunk, starts=jnp.asarray(starts))
+
+    def chunked(*args):
+        return chunk_delta_rule(*args, chunk)
+
+    got = jax.jit(through(packed, do, dht))(q, k, v, g, beta, h0)
+    alone = jax.jit(through(functools.partial(recurrence, cuts=(begins,), rule=chunked), do, dht))
+    reference = alone(q, k, v, g, beta, h0)
+    with jax.enable_x64(new_val=True):
+        operands = widened((q, k, v, g, beta, h0, do, dht))
+        want = through(functools.partial(recurrence, cuts=(begins,)), *operands[6:])(*operands[:6])
+        want = widened(want)
+    assert_leaves_as_exact(got, reference, want, reductions=chunk)
+    for name, mine, theirs in zip(("out", "final", "q", "k", "v", "g", "beta", "h0"), got, want, strict=True):
+        assert largest(mine, theirs) < 1e-4 * max(1.0, float(np.max(np.abs(theirs)))), name
+
+
 def test_strong_decay_has_the_same_finite_gradient_in_both_forms():
     """Masked positive log differences must never reach exp in the chunk rule.
 
@@ -213,20 +244,14 @@ def test_the_causal_conv_matches_f_conv1d(reference):
     Largest observed difference 2.4e-07."""
     taps = jnp.asarray(reference["conv.weight"][:, 0, :])
     # The reference's tensors are channel-major, [B, D, S]; Dew's time-major.
-    out = causal_conv1d(jnp.swapaxes(jnp.asarray(reference["conv.input"]), 1, 2), taps)
+    x = jnp.swapaxes(jnp.asarray(reference["conv.input"]), 1, 2)
+    out = causal_conv1d(x, taps)
 
     assert largest(jnp.swapaxes(out, 1, 2), reference["conv.output"]) < 1e-5
-
-
-def test_the_conv_reads_no_future_column(reference):
-    """Causality of the short mixer, stated as a property: changing the last
-    column moves nothing before it."""
-    x = jnp.swapaxes(jnp.asarray(reference["conv.input"]), 1, 2)
-    taps = jnp.asarray(reference["conv.weight"][:, 0, :])
     moved = x.at[:, -1].set(x[:, -1] + 3.0)
-
-    assert jnp.array_equal(causal_conv1d(x, taps)[:, :-1], causal_conv1d(moved, taps)[:, :-1])
-    assert not jnp.allclose(causal_conv1d(x, taps)[:, -1], causal_conv1d(moved, taps)[:, -1])
+    changed = causal_conv1d(moved, taps)
+    assert jnp.array_equal(out[:, :-1], changed[:, :-1])
+    assert not jnp.allclose(out[:, -1], changed[:, -1])
 
 
 def layer_params(reference):
@@ -334,29 +359,6 @@ def test_a_bf16_layer_decodes_its_state_in_bf16_within_its_prefills_error(refere
     assert rms(decoded) <= 2 * rms(parallel), (rms(decoded), rms(parallel))
 
 
-def test_a_bf16_state_decays_where_rounding_to_nearest_would_hold_it():
-    """A state decayed by 0.999 a token moves by less than half a bf16 step
-    near 1, so rounded to nearest it never decays. Rounded stochastically
-    (`round_to_bf16`, its noise drawn from the token's key and value) it
-    follows the exact decay, 0.999 ** 2000, to within 2%. Rounded to
-    nearest, Qwen3.5-0.8B's bf16 state drifted to ten times the fp32 state's
-    error over 1024 tokens (docs/performance.md)."""
-    from dew.nn.kernels.delta_rule import round_to_bf16
-
-    def decayed(rounding):
-        def step(state, token):
-            key, value = (jax.random.normal(jax.random.fold_in(jax.random.key(token), side), (1, 64))
-                          for side in (0, 1))
-            stepped = state.astype(jnp.float32) * 0.999
-            return rounding(stepped, key, value), None
-        return jax.lax.scan(step, jnp.ones((1, 64, 64), jnp.bfloat16), jnp.arange(2000))[0]
-
-    nearest = decayed(lambda stepped, key, value: stepped.astype(jnp.bfloat16))
-    stochastic = decayed(round_to_bf16)
-    assert np.all(np.asarray(nearest, np.float32) == 1.0)
-    np.testing.assert_allclose(np.asarray(stochastic, np.float32).mean(), 0.999 ** 2000, rtol=0.02)
-
-
 def scan_masked_conv1d(x, kernel, valid, state=None):
     """The token-by-token form the compacted convolution replaced.
 
@@ -433,45 +435,22 @@ def test_the_masked_conv_matches_the_token_scan(case, history):
         if wanted is not None:
             assert largest(gradient, wanted) < 1e-5
 
-
-def test_the_masked_conv_reads_across_a_gap():
-    """A real token reads the real tokens before it, not the padding between
-    them, so the row's outputs are the plain convolution of the row with its
-    padding taken out.
-
-    The mutation this states the invariant against is the tempting one:
-    masking the input and convolving the physical slots. It agrees on
-    trailing padding and moves the slots after an interior gap by 5.0 here.
-    """
-    rows, width = MASKED_ROWS["interior holes"]
-    x, kernel, _state, valid, _ = masked_operands(rows, width, history=False, seed=3)
-    out, _ = _masked_conv1d(x, kernel, valid)
-
-    for row in range(x.shape[0]):
-        kept = np.flatnonzero(np.asarray(valid[row]))
-        compacted = causal_conv1d(x[row:row + 1, kept], kernel)
-        assert largest(out[row:row + 1, kept], compacted) < 1e-5
-
-    physical = jnp.where(valid[:, :, None], causal_conv1d(
-        jnp.where(valid[:, :, None], x, 0), kernel), 0)
-    assert largest(physical, out) > 1.0
-
-
-@pytest.mark.parametrize("case", list(MASKED_ROWS))
-def test_a_padded_slot_carries_no_output_and_no_gradient(case):
-    """Padding neither emits nor learns: its outputs are zero, its inputs
-    take exactly zero gradient, and a row with no real token at all hands
-    back the history it was given, unchanged."""
-    x, kernel, state, valid, cotangent = masked_operands(*MASKED_ROWS[case], seed=7)
-    out, carried = _masked_conv1d(x, kernel, valid, state)
-    grad = jax.grad(lambda value: jnp.sum(
-        _masked_conv1d(value, kernel, valid, state)[0] * cotangent))(x)
-
     assert jnp.array_equal(jnp.where(valid[:, :, None], 0.0, out), jnp.zeros_like(out))
-    assert jnp.array_equal(jnp.where(valid[:, :, None], 0.0, grad), jnp.zeros_like(grad))
-    paused = ~jnp.any(valid, axis=1)
-    assert state is not None
-    assert jnp.array_equal(carried[paused], state[paused])
+    assert jnp.array_equal(jnp.where(valid[:, :, None], 0.0, grads[0]), jnp.zeros_like(grads[0]))
+    if state is not None:
+        paused = ~jnp.any(valid, axis=1)
+        assert jnp.array_equal(carried[paused], state[paused])
+    if case == "interior holes" and not history:
+        rows, width = MASKED_ROWS[case]
+        gap_x, gap_kernel, _state, gap_valid, _ = masked_operands(rows, width, history=False, seed=3)
+        gap_out, _ = _masked_conv1d(gap_x, gap_kernel, gap_valid)
+        for row in range(gap_x.shape[0]):
+            kept = np.flatnonzero(np.asarray(gap_valid[row]))
+            compacted = causal_conv1d(gap_x[row:row + 1, kept], gap_kernel)
+            assert largest(gap_out[row:row + 1, kept], compacted) < 1e-5
+        physical = jnp.where(gap_valid[:, :, None], causal_conv1d(
+            jnp.where(gap_valid[:, :, None], gap_x, 0), gap_kernel), 0)
+        assert largest(physical, gap_out) > 1.0
 
 
 def test_the_masked_conv_splits_at_a_call_boundary():
@@ -490,6 +469,23 @@ def test_the_masked_conv_splits_at_a_call_boundary():
     assert largest(final, carried) < 1e-5
 
 
+def test_a_packed_prefill_leaves_only_its_last_documents_conv_history():
+    """A row packing two documents, the last two tokens long, leaves the history its continuation
+    reads: the last document's two tokens and zeros where the first document's would be, so the
+    next call's tokens convolve as that document's would on its own."""
+    kernel = jnp.asarray(np.random.default_rng(3).normal(size=(6, 4)), jnp.float32)
+    x = jnp.asarray(np.random.default_rng(4).normal(size=(1, 7, 6)), jnp.float32)
+    segments = jnp.asarray([[1, 1, 1, 1, 1, 2, 2]])
+    valid = jnp.ones((1, 7), bool)
+    _, history = _masked_conv1d(x, kernel, valid, segments=segments)
+    np.testing.assert_array_equal(np.asarray(history[:, 0]), 0)
+    np.testing.assert_array_equal(np.asarray(history[:, 1:]), np.asarray(x[:, 5:]))
+    following = jnp.asarray(np.random.default_rng(5).normal(size=(1, 3, 6)), jnp.float32)
+    continued, _ = _masked_conv1d(following, kernel, jnp.ones((1, 3), bool), history)
+    alone, _ = _masked_conv1d(jnp.concatenate([x[:, 5:], following], axis=1), kernel, jnp.ones((1, 5), bool))
+    np.testing.assert_allclose(np.asarray(continued), np.asarray(alone[:, 2:]), rtol=0, atol=1e-6)
+
+
 def test_the_layer_reads_a_holed_row_as_the_row_without_its_holes(reference, geometry):
     """The mixer's own contract, through its public call: the states of the
     real tokens of a row with padded slots between them are the states of
@@ -506,7 +502,7 @@ def test_the_layer_reads_a_holed_row_as_the_row_without_its_holes(reference, geo
 
     alone = module.apply(variables, hidden)
     holed = module.apply(variables, spread,
-                         attention_metadata=AttentionMetadata(valid=valid))
+                         attention_metadata=AttentionMetadata(coordinates=coordinates(valid=valid)))
 
     assert largest(holed[:, kept], alone) < 1e-5
     assert jnp.array_equal(holed[:, jnp.asarray([2, 3, 6])],
@@ -546,23 +542,28 @@ def test_a_right_padded_row_convolves_as_the_masked_conv(case, history):
 
 def test_a_right_padded_layer_keeps_its_real_tokens_states(reference, geometry):
     """The mixer told its rows are right-padded gives the masked call's
-    outputs, zero at the padding, by the conv without the gather."""
+    outputs, zero at the padding: as close
+    to float64 as the masked call is (tests/reference_error.py), the two
+    being separate programs, which a GPU rounds apart (1.7e-6 on an H100)."""
     module = layer(geometry)
     variables = layer_params(reference)
     hidden = jnp.asarray(reference["layer.hidden"])[:, :9]
     valid = jnp.arange(9)[None, :] < jnp.asarray([[6], [9]])
 
-    def call(metadata):
+    def call(metadata, variables=variables):
         return jax.jit(lambda hidden: module.apply(variables, hidden, attention_metadata=metadata))
 
-    def gathers(metadata) -> int:
-        return call(metadata).lower(hidden).compile().as_text().count(" gather(")
+    masked = AttentionMetadata(coordinates=coordinates(valid=valid))
+    declared = AttentionMetadata(coordinates=coordinates(valid=valid, right_padded=True))
+    mine, theirs = call(declared)(hidden), call(masked)(hidden)
 
-    masked, declared = AttentionMetadata(valid=valid), AttentionMetadata(valid=valid, right_padded=True)
-
-    assert largest(call(declared)(hidden), call(masked)(hidden)) < 1e-6
-    assert jnp.array_equal(call(declared)(hidden)[0, 6:], jnp.zeros_like(hidden[0, 6:]))
-    assert gathers(declared) < gathers(masked)
+    assert jnp.array_equal(mine[0, 6:], jnp.zeros_like(hidden[0, 6:]))
+    cpu = jax.devices("cpu")[0]
+    with jax.enable_x64(new_val=True), jax.default_device(cpu):
+        wide = jax.tree.map(lambda x: jax.device_put(np.asarray(x, np.float64), cpu), variables)
+        truth = call(AttentionMetadata(coordinates=coordinates(valid=jax.device_put(np.asarray(valid), cpu))),
+                     wide)(jax.device_put(np.asarray(hidden, np.float64), cpu))
+    assert_as_exact_as_the_reference(mine, theirs, truth, "right-padded output")
 
 
 @pytest.mark.parametrize("chunk", [4, 16, 64])

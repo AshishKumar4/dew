@@ -47,7 +47,7 @@ from dew.nn.attention import LayerNorm, RMSNorm
 from dew.nn.backbones.decoder_block import BlockWiring, DecoderBlock, GatedMLP
 from dew.nn.conv import Conv
 from dew.nn.flops import matching_lengths, patch_lengths
-from dew.nn.inputs import AttentionMetadata
+from dew.nn.inputs import AttentionMetadata, coordinates
 from dew.nn.mixers.attention import CausalSelfAttention
 from dew.nn.sharding import logical_axes
 from dew.registry import resolve_dtype
@@ -57,52 +57,81 @@ DEFAULT_MODEL = "openai/clip-vit-large-patch14"
 
 
 class CLIPTowerOutput(NamedTuple):
-    """What the reference returns from either tower: the whole sequence, and
-    the pooled row.
+    """What the reference returns from either tower: the whole sequence, the
+    pooled row, and for the text tower `hidden_states`, the embeddings and
+    each layer's output before the final norm (`output_hidden_states=True`),
+    of which SDXL's and SD3's pipelines read the one before the last layer.
 
     The names are the reference's, because the conditioning encoder reads
     `last_hidden_state` off whatever model it holds.
     """
     last_hidden_state: jax.Array
     pooler_output: jax.Array
+    hidden_states: tuple[jax.Array, ...] = ()
 
 
-_ACTIVATIONS = {"quick_gelu": "quick_gelu", "gelu_pytorch_tanh": "gelu", "gelu": "gelu_exact"}
+TOWER_ACTIVATIONS = {"quick_gelu": "quick_gelu", "gelu_pytorch_tanh": "gelu", "gelu": "gelu_exact"}
 """A tower's `hidden_act` as the ungated feed-forward names it
 (`dew.nn.activations.UNGATED`): torch's erf GELU for 'gelu'."""
+
+
+def checked_image(pixel_values, channels: int, size: int) -> jax.Array:
+    """NCHW `pixel_values` as an array, refused unless they are the `channels` x `size` x `size`
+    images a fixed-size tower's checkpoint was trained with."""
+    pixel_values = jnp.asarray(pixel_values)
+    expected = (channels, size, size)
+    if pixel_values.ndim != 4 or pixel_values.shape[1:] != expected:
+        raise ValueError(f"pixel_values of {'x'.join(map(str, pixel_values.shape[1:]))} are not the "
+                         f"{'x'.join(map(str, expected))} this checkpoint was trained with")
+    return pixel_values
+
+
+def tower_activation(hidden_act: str) -> str:
+    """The feed-forward activation a tower's `hidden_act` names (`TOWER_ACTIVATIONS`); any other
+    name is refused."""
+    if hidden_act not in TOWER_ACTIVATIONS:
+        raise ValueError(f"activation {hidden_act!r} is not expressible: this layer runs "
+                         f"{', '.join(TOWER_ACTIVATIONS)}")
+    return TOWER_ACTIVATIONS[hidden_act]
 
 
 def clip_layer(width: int, heads: int, hidden: int, positions: int, *, causal: bool = False,
                activation: str = "quick_gelu", eps: float = 1e-5, rotary_axes: tuple[int, ...] | None = None,
                rotary_pairs: Literal["half", "adjacent"] = "half", rope_theta: float = 10000.0,
-               packed: bool = False, dtype: Dtype | None = None, precision: PrecisionLike = None,
+               packed: bool = False, kv_heads: int | None = None, head_dim: int | None = None,
+               norm_type: Literal["rms", "layer", "fast_layer"] = "fast_layer", norm_bias: bool = True,
+               mlp_bias: bool = True, mlp_packed: bool = False, window: int | None = None,
+               dtype: Dtype | None = None, precision: PrecisionLike = None,
                name: str | None = None) -> DecoderBlock:
-    """One encoder layer of CLIP, SigLIP, Llama 4's vision tower or Qwen 3.5's
-    as the decoder block runs it: a layer norm with its bias before the
-    attention and before the MLP, both residual. The norms take flax's
-    one-pass variance (`decoder_norm`'s 'fast_layer'), as Dew's towers
-    always ran; torch's exact one reduces twice.
+    """One encoder layer of a text or vision tower as the decoder block runs it: CLIP's, SigLIP's,
+    Llama 4's, and every `dew.nn.vision.vit` layout's (`vit_block`): a norm before the attention
+    and before the feed-forward, both residual.
 
-    The attention is causal in CLIP's text tower and full elsewhere, with a
-    bias on all four maps and `positions` the longest sequence it reads. The
-    vision towers rotate it by their patch grid (`rotary_axes`, Llama 4's in
-    adjacent pairs), and Qwen 3.5's stores its queries, keys and values in one
-    map (`packed`). The MLP is two biased maps around the checkpoint's
-    `hidden_act`, `activation`.
+    By default CLIP's: layer norms with their bias, taking flax's one-pass variance
+    (`decoder_norm`'s 'fast_layer'), as Dew's towers always ran (torch's exact one reduces twice);
+    attention with a bias on all four maps, `positions` the longest sequence it reads; and two
+    biased maps around `activation` (a feed-forward activation; `tower_activation` reads a
+    checkpoint's `hidden_act`). The attention is causal in CLIP's text tower and full elsewhere,
+    over `window` places either side where given; the vision towers rotate it by their patch grid
+    (`rotary_axes`, Llama 4's in adjacent pairs). A layout sets the rest: grouped `kv_heads`, a
+    `head_dim` beside `width // heads`, RMS norms or no norm bias, an unbiased or gated
+    feed-forward whose gate and up maps are one (`mlp_packed`), and queries, keys and values in
+    one map (`packed`).
     """
-    if activation not in _ACTIVATIONS:
-        raise ValueError(f"activation {activation!r} is not expressible: this layer runs "
-                         f"{', '.join(_ACTIVATIONS)}")
+    head_dim = width // heads if head_dim is None else head_dim
     attention = functools.partial(
-        CausalSelfAttention, emb_features=width, num_heads=heads, num_kv_heads=heads, head_dim=width // heads,
-        max_seq_len=positions, causal=causal, nope=rotary_axes is None, qk_norm=False, attention_bias=True,
-        rotary_axes=rotary_axes, rotary_pairs=rotary_pairs, rope_theta=rope_theta, packed=packed,
+        CausalSelfAttention, emb_features=width, num_heads=heads,
+        num_kv_heads=heads if kv_heads is None else kv_heads,
+        head_dim=head_dim, max_seq_len=positions, causal=causal, nope=rotary_axes is None, qk_norm=False,
+        attention_bias=True, rotary_axes=rotary_axes, rotary_pairs=rotary_pairs, rope_theta=rope_theta,
+        packed=packed,
+        # A window keeps the keys within `window` places: |q - k| < window + 1 (`window_sides`).
+        sliding_window=None if window is None else window + 1, bidirectional_window=window is not None,
         dtype=dtype, precision=precision)
-    mlp = functools.partial(GatedMLP, hidden_features=hidden, out_features=width,
-                            activation=_ACTIVATIONS[activation], use_bias=True, dtype=dtype,
-                            precision=precision)
-    return DecoderBlock(attention, mlp, width, BlockWiring(), norm_eps=eps, norm_type="fast_layer",
-                        norm_bias=True, dtype=dtype, precision=precision, name=name)
+    mlp = functools.partial(GatedMLP, hidden_features=hidden, out_features=width, activation=activation,
+                            use_bias=mlp_bias, packed=mlp_packed, dtype=dtype, precision=precision)
+    return DecoderBlock(attention, mlp, width, BlockWiring(), norm_eps=eps, norm_type=norm_type,
+                        norm_bias=norm_bias, dtype=dtype, precision=precision, name=name)
 
 
 @logical_axes({("token_embedding",): ("vocab", "embed"), ("position_embedding",): (None, "embed")})
@@ -134,7 +163,8 @@ class CLIPTextTransformer(nn.Module):
     @nn.nowrap
     def _layer(self, name=None):
         return clip_layer(self.hidden_size, self.num_heads, self.intermediate_size,
-                          self.max_position_embeddings, causal=True, activation=self.activation,
+                          self.max_position_embeddings, causal=True,
+                          activation=tower_activation(self.activation),
                           eps=self.layer_norm_eps, dtype=self.dtype, precision=self.precision, name=name)
 
     @nn.nowrap
@@ -164,9 +194,11 @@ class CLIPTextTransformer(nn.Module):
         hidden_states = (self.token_embedding(input_ids)
                          + self.position_embedding(jnp.arange(length)))
         metadata = None if attention_mask is None else AttentionMetadata(
-            valid=jnp.asarray(attention_mask) != 0)
+            coordinates=coordinates(valid=jnp.asarray(attention_mask) != 0))
+        states = [hidden_states]
         for layer in self.layers:
             hidden_states = layer(hidden_states, attention_metadata=metadata)
+            states.append(hidden_states)
         hidden_states = self.final_layer_norm(hidden_states)
 
         if self.eos_token_id == 2:
@@ -178,8 +210,7 @@ class CLIPTextTransformer(nn.Module):
             index = jnp.argmax(input_ids, axis=-1)
         else:
             index = jnp.argmax(input_ids == self.eos_token_id, axis=-1)
-        return CLIPTowerOutput(hidden_states,
-                               hidden_states[jnp.arange(batch), index])
+        return CLIPTowerOutput(hidden_states, hidden_states[jnp.arange(batch), index], tuple(states))
 
 
 @logical_axes({("patch_embedding",): (None, None, None, "embed"), ("position_embedding",): (None, "embed")})
@@ -243,14 +274,8 @@ class CLIPVisionTransformer(nn.Module):
         self.post_layernorm = norm(name="post_layernorm")
 
     def __call__(self, pixel_values) -> CLIPTowerOutput:
-        pixel_values = jnp.asarray(pixel_values)
-        batch, channels, height, width = pixel_values.shape
-        expected = (self.num_channels, self.image_size, self.image_size)
-        if (channels, height, width) != expected:
-            raise ValueError(
-                f"pixel_values of {channels}x{height}x{width} are not the "
-                f"{'x'.join(map(str, expected))} this checkpoint was trained with")
-
+        pixel_values = checked_image(pixel_values, self.num_channels, self.image_size)
+        batch = pixel_values.shape[0]
         # torch convolves channels first; nn.Conv takes them last.
         patches = self.patch_embedding(jnp.transpose(pixel_values, (0, 2, 3, 1)))
         patches = patches.reshape(batch, -1, self.hidden_size)
@@ -768,7 +793,9 @@ class T5EncoderTransformer(nn.Module):
         tables = [jnp.transpose(table(buckets), (2, 0, 1))[None] for table in self.relative_attention_bias]
         valid = None if attention_mask is None else jnp.asarray(attention_mask) != 0
         for index, layer in enumerate(self.layers):
-            metadata = AttentionMetadata(valid=valid, position_bias=tables[index % len(tables)])
+            metadata = AttentionMetadata(
+                coordinates=None if valid is None else coordinates(valid=valid),
+                position_bias=tables[index % len(tables)])
             hidden_states = layer(hidden_states, train, attention_metadata=metadata)
         return self.dropout(self.final_norm(hidden_states), deterministic=not train)
 

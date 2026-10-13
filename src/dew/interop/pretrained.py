@@ -27,8 +27,7 @@ from flax.traverse_util import unflatten_dict
 from jax.typing import DTypeLike
 
 from dew import records
-from dew._model_types import QWEN35_TEXT_TYPES, QWEN35_TYPES
-from dew.coordination import agreed
+from dew._model_types import QWEN35_TYPES
 from dew.diffusion.process import Process
 from dew.diffusion.schedules.source import SourceSchedule
 from dew.inference import BlockGeneration, MaskedGeneration, TextGeneration
@@ -44,6 +43,7 @@ from dew.interop.generation_config import (
     generation_config_of,
     generation_limit,
     pad_id,
+    read_generation_config,
     return_sequences,
     source_decoding,
 )
@@ -1166,24 +1166,6 @@ def _decoder_layouts(tensors: Mapping[str, np.ndarray], record: decoder_parts.De
     return tuple(bindings), retained
 
 
-def _generation_config(directory: Path) -> Mapping[str, object]:
-    """The source's generation_config.json, or {} when it has none."""
-    generation_path = directory / "generation_config.json"
-    generation_config = json.loads(generation_path.read_text()) if generation_path.exists() else {}
-
-    def policy_read() -> None:
-        """Refuse a generation_config.json that is not an object.
-
-        Loading for training or export does not opt into the source sampler;
-        active policy support is checked when the caller creates its task.
-        """
-        if not isinstance(generation_config, dict):
-            raise ValueError("generation_config.json must contain an object")
-
-    agreed("pretrained generation policy", policy_read)
-    return generation_config
-
-
 class _Built(NamedTuple):
     """A decoder source built and bound: the model, its variables, the
     record it was translated to, what it was built from, and the source
@@ -1203,18 +1185,13 @@ def _wrapper_source(config: Mapping[str, object], tensors: Mapping[str, np.ndarr
     """A multimodal wrapper: the decoder under its text_config and the towers beside it."""
     record = decoders.translate_wrapper_config(config)
     text_fields = _wrapper_text_fields(config, record, max_seq_len)
-    # The Transformers conditional classes ignore auxiliary prediction
-    # layers. A released config advertises a depth even when its checkpoint
-    # contains only the trunk; a source with mtp.* retains its actual depth.
-    if (record['text_model_type'] in QWEN35_TEXT_TYPES
-            and not any(name.startswith(('mtp.', 'model.mtp.')) for name in tensors)):
-        text_fields['num_nextn_predict_layers'] = 0
-        record['text']['num_nextn_predict_layers'] = 0
+    parts = decoders.translate_wrapper_weights(tensors, record, param_dtype=param_dtype, lazy=lazy)
+    for fields in (text_fields, record['text']):
+        decoders.held_depths(fields, parts["language_model"]["params"])
     text = NativeFields(CausalTransformer, {**text_fields, "dtype": dtype, "attention_impl": attention_impl})
     wrapper: decoder_parts.WrapperFields = {**record, "text": text}
     language_model = from_record(CausalTransformer, wrapper["text"])
     model = _wrapper_model(config, record, language_model, dtype=dtype)
-    parts = decoders.translate_wrapper_weights(tensors, record, param_dtype=param_dtype, lazy=lazy)
     variables = native_variables({**parts, "language_model": decoders.with_constants(
         parts["language_model"], record["text"], directory)})
     layouts, retained = _wrapper_layouts(tensors, record, variables)
@@ -1253,10 +1230,11 @@ def _decoder_source(config: Mapping[str, object], tensors: Mapping[str, np.ndarr
         family = verified.family
     if max_seq_len is not None:
         record["max_seq_len"] = max_seq_len
-    built = {**record, "dtype": dtype, "attention_impl": attention_impl}
-    model = from_record(CausalTransformer, built)
     variables = decoders.with_constants(decoders.translate_weights(
         tensors, record, family, param_dtype=param_dtype, lazy=lazy), record, directory)
+    decoders.held_depths(record, variables["params"])
+    built = {**record, "dtype": dtype, "attention_impl": attention_impl}
+    model = from_record(CausalTransformer, built)
     decoder_parts.check_decoder_tree(variables, model)
     # The bindings are what an adapter loader resolves source names through
     # and what a quantized source is written back through, so a
@@ -1331,7 +1309,7 @@ def _load_native_source(name_or_dir: str | Path, directory: Path, commit: str | 
     model, variables = _input_quantization(model, variables, layouts, config, grid)
     source = str(name_or_dir) if commit is None else f"{name_or_dir}@{directory.name}"
     processor = source_processor(directory, config, record, model, gguf_path, source=source)
-    generation_config = _generation_config(directory)
+    generation_config = read_generation_config(directory)
 
     # Dew's byte vocabulary has no files: an export names it in
     # generation_config.json, and the name is the whole record of it.

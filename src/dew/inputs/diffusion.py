@@ -8,7 +8,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
-from typing import TYPE_CHECKING, ClassVar, Literal, NamedTuple
+from typing import TYPE_CHECKING, ClassVar, Literal
 
 import jax
 import jax.numpy as jnp
@@ -19,7 +19,7 @@ from dew.inputs.encoders import ConditionEncoder, ConditionWork
 from dew.nn.blocks import torch_nearest_resize
 from dew.nn.flops import counted_flops, projection_flops
 from dew.nn.safety import CLIPSafetyHead
-from dew.nn.text_encoders import CLIPTextTransformer, T5EncoderTransformer
+from dew.nn.text_encoders import CLIPTextTransformer, CLIPTowerOutput, T5EncoderTransformer
 from dew.objectives.base import Variables
 from dew.registry import dtype_name
 
@@ -71,35 +71,6 @@ def latent_image_conditions(autoencoder, params, pixels, mask, key):
     mask = torch_nearest_resize(mask, *latent.shape[1:3])
     return {"mask": mask, "masked_image": latent}
 
-
-
-class _TextFeatures(NamedTuple):
-    """The three states a family reads off one CLIP tower."""
-
-    last: jax.Array
-    penultimate: jax.Array
-    pooled: jax.Array
-
-
-def _text_features(tower, ids):
-    """The CLIP tower's last, penultimate and pooled states for `ids`.
-
-    The layers run here rather than through the tower's own call because the
-    families that read the penultimate hidden states need the value from
-    before the last layer, which a plain forward does not keep.
-
-    The pooled slot is the tower's own: the checkpoints whose eos id is 2
-    take the largest id in the row, which is that eos, and the rest take the
-    first position that equals the eos id.
-    """
-    hidden = tower.token_embedding(ids) + tower.position_embedding(jnp.arange(ids.shape[1]))
-    penultimate = hidden  # the state before the last layer; the embedding when there is none
-    for layer in tower.layers:
-        penultimate = hidden
-        hidden = layer(hidden)
-    hidden = tower.final_layer_norm(hidden)
-    index = jnp.argmax(ids if tower.eos_token_id == 2 else ids == tower.eos_token_id, axis=-1)
-    return _TextFeatures(hidden, penultimate, hidden[jnp.arange(ids.shape[0]), index])
 
 
 Composition = Literal["clip", "clip_pooled", "sd3", "flux"]
@@ -203,12 +174,16 @@ class DiffusionConditioner(ConditionEncoder[str | Mapping[str, object]]):
     def from_pretrained(cls, checkpoint: str, *, dtype: str | None = "bfloat16",
                         param_dtype: str = "float32", revision: str | None = None,
                         attention_impl: str = "auto", params: Variables | None = None,
-                        mesh: MeshSpec | None = None, layout: Layout | None = None):
+                        mesh: MeshSpec | None = None, layout: Layout | None = None,
+                        height: int | None = None, width: int | None = None):
+        """The pipeline's conditioning; `height` and `width` replace the image size its
+        time ids state, which is the size the pipeline renders unless a load gave another."""
         from dew.interop.pipeline_assembly import load_diffusion_conditioner
 
         return load_diffusion_conditioner(checkpoint, cls, dtype=dtype, param_dtype=param_dtype,
                                           revision=revision, attention_impl=attention_impl, params=params,
-                                          mesh=mesh, layout=layout)
+                                          mesh=mesh, layout=layout,
+                                          size=None if height is None or width is None else (height, width))
 
     @property
     def stacked(self) -> bool:
@@ -283,12 +258,13 @@ class DiffusionConditioner(ConditionEncoder[str | Mapping[str, object]]):
         """The original size, zero crop, and target size or aesthetic score per row."""
         return jnp.broadcast_to(jnp.asarray(self.time_id_values, dtype), (count, len(self.time_id_values)))
 
-    def _clip(self, params, ids) -> list[_TextFeatures]:
+    def _clip(self, params, ids) -> list[CLIPTowerOutput]:
+        """Each CLIP tower's output on its ids, unmasked as the pipelines call them."""
         outputs = []
         for index, (name, tower) in enumerate(zip(self.names, self.towers, strict=True)):
             output = tower.apply({"params": params[name]["text_model"]},
-                                 ids[:, index] if self.stacked else ids, method=_text_features)
-            assert isinstance(output, _TextFeatures)
+                                 ids[:, index] if self.stacked else ids)
+            assert isinstance(output, CLIPTowerOutput)
             outputs.append(output)
         return outputs
 
@@ -319,10 +295,10 @@ class DiffusionConditioner(ConditionEncoder[str | Mapping[str, object]]):
         rows, zero = ids.shape[0], jnp.asarray(tokens["zero_condition"])
         outputs = self._clip(params, ids)
         if self.composition == "clip":
-            return DenoisingCondition(self._zeroed(outputs[0].last, zero))
+            return DenoisingCondition(self._zeroed(outputs[0].last_hidden_state, zero))
         if self.composition == "clip_pooled":
-            hidden = jnp.concatenate([value.penultimate for value in outputs], axis=-1)
-            pooled = self._projected(params, self.names[-1], outputs[-1].pooled)
+            hidden = jnp.concatenate([value.hidden_states[-2] for value in outputs], axis=-1)
+            pooled = self._projected(params, self.names[-1], outputs[-1].pooler_output)
             time_ids = tokens.get("time_ids")
             if time_ids is None:
                 time_ids = self.time_ids(rows, hidden.dtype)
@@ -333,21 +309,21 @@ class DiffusionConditioner(ConditionEncoder[str | Mapping[str, object]]):
             return DenoisingCondition(self._zeroed(hidden, zero),
                                       self._zeroed(pooled, zero), time_ids)
         if self.composition == "flux":
-            hidden = self._t5_states(params, tokens, rows, outputs[0].pooled.dtype)
+            hidden = self._t5_states(params, tokens, rows, outputs[0].pooler_output.dtype)
             # Flux reads the CLIP pooled vector unprojected.
-            pooled = outputs[0].pooled
+            pooled = outputs[0].pooler_output
             guidance = (None if self.guidance is None
                         else jnp.asarray(tokens["guidance"], hidden.dtype))
             return DenoisingCondition(self._zeroed(hidden, zero),
                                       self._zeroed(pooled, zero), guidance=guidance)
         # sd3: the CLIP states padded out to the joint width, the T5 segment
         # after them along the sequence, and both projected pooled vectors.
-        clip = jnp.concatenate([value.penultimate for value in outputs], axis=-1)
+        clip = jnp.concatenate([value.hidden_states[-2] for value in outputs], axis=-1)
         padded = jnp.pad(clip, ((0, 0), (0, 0), (0, self.context_width - clip.shape[-1])))
         hidden = jnp.concatenate(
             [padded, self._t5_states(params, tokens, rows, clip.dtype)], axis=1)
         pooled = jnp.concatenate(
-            [self._projected(params, name, value.pooled)
+            [self._projected(params, name, value.pooler_output)
              for name, value in zip(self.names, outputs, strict=True)], axis=-1)
         return DenoisingCondition(self._zeroed(hidden, zero), self._zeroed(pooled, zero))
 
@@ -357,7 +333,7 @@ class DiffusionConditioner(ConditionEncoder[str | Mapping[str, object]]):
 
     def to_json(self):
         return {"checkpoint": self.checkpoint, "dtype": dtype_name(self.towers[0].dtype),
-                "param_dtype": self.param_dtype}
+                "param_dtype": self.param_dtype, "height": self.height, "width": self.width}
 
     def save_assets(self, destination: Path) -> None:
         """Write into `destination` the tokenizer files an exported directory keeps beside the weights."""
@@ -445,8 +421,6 @@ class QwenImageConditioner(_LanguageText):
     the template's closing turn would go with it.
     """
 
-    height: int
-    width: int
     drop: int = field(init=False)
     """The system turn's token count, which the pipeline derives the same way."""
 
@@ -513,8 +487,6 @@ class HiddenStatesConditioner(_LanguageText):
     cut, since the template's closing turn would go with it.
     """
 
-    height: int
-    width: int
     template: Literal["mistral3", "qwen3"]
     layers: tuple[int, ...]
     thinking: bool = False

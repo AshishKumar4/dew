@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import dataclasses
 import json
-import weakref
 from collections.abc import Callable, Iterator, Mapping
+from types import MappingProxyType
 from typing import Literal
 
 import grain.python as pygrain
@@ -177,7 +177,16 @@ class _CanonicalPass:
         self._source = None
 
 
+@dataclasses.dataclass
+class _PublishedCounts:
+    """Reader-owned snapshots retained without retaining its Grain iterator."""
+
+    metrics: Mapping[str, float] = dataclasses.field(default_factory=lambda: MappingProxyType({}))
+
+
 class _PerShare(Forwarding):
+    """Lazy Grain reader with owner-published positions and counters."""
+
     @property
     def endless(self) -> bool:
         return self._endless
@@ -203,8 +212,14 @@ class _PerShare(Forwarding):
         self._endless = endless
         self._read: pygrain.DatasetIterator[Batch] | None = None
         self._saved: Mapping[str, object] | None = None
+        self._state: Mapping[str, object] | None = None
+        self._statistics = _PublishedCounts()
 
-    def _forwarded(self) -> pygrain.DatasetIterator[Batch]:
+    def _forwarded(self) -> pygrain.DatasetIterator[Batch] | None:
+        return self._read
+
+    def _reader(self) -> pygrain.DatasetIterator[Batch]:
+        """Open and restore the reader on its iteration thread."""
         if self._read is None:
             self._read = self._open()
             if self._saved is not None:
@@ -215,12 +230,29 @@ class _PerShare(Forwarding):
         return self
 
     def __next__(self) -> Batch:
-        return next(self._forwarded())
+        reader = self._reader()
+        try:
+            value = next(reader)
+        except StopIteration:
+            self._publish(reader.get_state())
+            raise
+        self._publish(reader.get_state())
+        return value
+
+    def _publish(self, state: Mapping[str, object]) -> None:
+        self._state = state
+        self._statistics.metrics = MappingProxyType({
+            key: value
+            for counts in state_counts(state).values()
+            for key, value in counts.metrics().items()
+        })
 
     def get_state(self) -> bytes:
-        return json.dumps(
-            {"dew_data_plan": self._plan.record(), "iterator": self._forwarded().get_state()}
-        ).encode()
+        state = self._state
+        if state is None:
+            state = self._reader().get_state()
+            self._publish(state)
+        return json.dumps({"dew_data_plan": self._plan.record(), "iterator": state}).encode()
 
     def set_state(self, state: bytes) -> None:
         decoded = record(json.loads(state), "saved per-share position")
@@ -228,6 +260,7 @@ class _PerShare(Forwarding):
         saved = record(decoded.get("iterator"), "saved Grain iterator")
         self.close()
         self._saved = saved
+        self._statistics.metrics = MappingProxyType({})
 
     def identity(self) -> str:
         """What every share of the pool reads, which the pool agrees before it
@@ -236,35 +269,29 @@ class _PerShare(Forwarding):
         return self._plan.identity()
 
     def statistics(self) -> Mapping[str, float]:
-        if self._read is None:
-            return {}
-        return {
-            key: value
-            for counts in state_counts(self._read.get_state()).values()
-            for key, value in counts.metrics().items()
-        }
+        """The immutable counters last published by the reading thread."""
+        return self._statistics.metrics
 
     def close(self) -> None:
         if self._read is not None:
             self._read.close()
             self._read = None
+        self._state = None
 
 
 class _Statistics:
     def __init__(self, counts: Mapping[str, CorpusCounts]):
         self._counts = counts
-        self._readers: list[weakref.ReferenceType[_PerShare]] = []
+        self._published: list[_PublishedCounts] = []
 
     def observe(self, stream: _PerShare) -> None:
-        self._readers.append(weakref.ref(stream))
+        self._published.append(stream._statistics)
 
     def __call__(self) -> Mapping[str, float]:
         scalars = {key: value for counts in self._counts.values() for key, value in counts.metrics().items()}
-        for reference in self._readers:
-            stream = reference()
-            if stream is not None:
-                for name, value in stream.statistics().items():
-                    scalars[name] = max(scalars.get(name, 0.0), value)
+        for published in self._published:
+            for name, value in published.metrics.items():
+                scalars[name] = max(scalars.get(name, 0.0), value)
         return scalars
 
 

@@ -1,7 +1,6 @@
 """Image recipes decode Arrow records and preserve captions and held-out rows."""
 
 import io
-import itertools
 
 import numpy as np
 import pyarrow as pa
@@ -9,7 +8,7 @@ import pyarrow.parquet as pq
 import pytest
 from PIL import Image
 
-from dew.config.data import Augment, HoldOut, ImageData, loader
+from dew.config.data import Augment, ImageData, loader
 from dew.data import Files, Loading
 from dew.data.dataset import DataPartition
 from dew.data.steps.image import EncodeCaptions
@@ -87,20 +86,32 @@ def test_a_second_validation_source_leaves_every_training_record_available(tmp_p
                            for batch in batches]).tolist() == list(range(5))
 
 
-def test_a_head_holdout_is_disjoint_from_the_training_epoch(tmp_path):
-    source = image_table(tmp_path / "images.parquet", 16)
-    data = loader(ImageData(source=source, validation=HoldOut(records=8), image_size=SCALE, augment=None),
-                batch=4, read="memory", loading=READ)
-    assert data.records == 8 and data.val is not None
-    training, validation = data.train(DataPartition()), data.val(DataPartition())
+def test_an_uncaptioned_class_dataset_reads_as_rgb_whatever_mode_it_stores(tmp_path):
+    payloads = []
+    for index in range(4):
+        grey = np.full((12, 12), 16 * index, np.uint8)
+        rgb = np.dstack([grey] * 3)
+        stored = (Image.fromarray(grey),
+                  Image.fromarray(grey.astype(np.uint16) * 256 + 255),
+                  Image.fromarray(rgb).quantize(),
+                  Image.fromarray(np.dstack([rgb, grey * 0])))[index]
+        with io.BytesIO() as output:
+            stored.save(output, format="PNG")
+            payloads.append(output.getvalue())
+    path = tmp_path / "classes.parquet"
+    pq.write_table(pa.table({"img": payloads, "label": list(range(4))}), path)
+    source = Files(str(path), format="parquet")
+    data = loader(ImageData(source=source, field="img", validation=source, image_size=SCALE,
+                            augment=None), batch=4, read="memory", loading=READ)
+    stream = data.val(DataPartition())
     try:
-        train_labels = np.concatenate([batch["label"] for batch in itertools.islice(training, 2)])
-        held_labels = np.concatenate([batch["label"] for batch in validation])
+        batch = next(stream)
     finally:
-        training.close()
-        validation.close()
-    assert sorted(train_labels.tolist()) == list(range(8, 16))
-    assert held_labels.tolist() == list(range(8))
+        stream.close()
+    assert batch["image"].shape == (4, SCALE, SCALE, 3) and batch["image"].dtype == np.uint8
+    np.testing.assert_array_equal(batch["image"][:, 0, 0], np.repeat([[0], [16], [32], [255]], 3, 1))
+    np.testing.assert_array_equal(batch["label"], [0, 1, 2, 3])
+    assert "caption" not in batch
 
 
 def test_validation_never_applies_the_training_crop_or_colour_jitter(tmp_path):

@@ -13,9 +13,12 @@ from dew.interop.decoder_parts import (
     Packed,
     Renames,
     decoder_tensors,
+    fixed_attention_buffer,
+    hf_ungated,
     refuse,
     renamed_name,
     renamed_path,
+    ungated_mlp,
 )
 from dew.interop.safetensors_io import LazyTensors
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -138,15 +141,7 @@ def _gptj_prepare(tensors: Mapping[str, np.ndarray],
         if name.endswith(('.attn.q_proj.weight', '.attn.k_proj.weight')):
             grouped = tensor.reshape(heads, head_dim, *tensor.shape[1:])
             prepared[name] = grouped[:, _gptj_order(head_dim, rotated)].reshape(tensor.shape)
-        elif name.endswith('.attn.bias'):
-            if (tensor.ndim != 4 or tensor.shape[:2] != (1, 1)
-                    or tensor.shape[-2] != tensor.shape[-1]
-                    or not np.array_equal(tensor, np.tril(np.ones_like(tensor)))):
-                raise ValueError(f'{name} must hold the fixed triangular causal mask')
-            del prepared[name]
-        elif name.endswith('.attn.masked_bias'):
-            if tensor.shape != () or float(tensor) != -1e9:
-                raise ValueError(f'{name} must hold the historical negative mask sentinel')
+        elif fixed_attention_buffer(name, tensor, 'attn', (-1e9,)):
             del prepared[name]
     return prepared
 
@@ -201,10 +196,8 @@ def gpt2_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
     if hf.get('reorder_and_upcast_attn'):
         refuse('reorder_and_upcast_attn', 'the reordered GPT-2 attention arithmetic is not represented')
     activation = records.text(hf.get('activation_function', 'gelu_new'), 'activation_function')
-    activations = {'gelu_new': 'gelu', 'gelu_fast': 'gelu', 'gelu_pytorch_tanh': 'gelu',
-                   'gelu': 'gelu_exact', 'relu': 'relu'}
-    if activation not in activations:
-        refuse(f'activation_function={activation!r}', 'the ungated MLP uses GELU or ReLU')
+    mlp = ungated_mlp(activation, ('gelu_new', 'gelu_fast', 'gelu_pytorch_tanh', 'gelu', 'relu'),
+                      'activation_function', 'GPT-2')
     if hidden % heads:
         refuse('n_embd/n_head', 'the hidden width must divide into whole attention heads')
     return native_fields(CausalTransformer)(
@@ -212,7 +205,7 @@ def gpt2_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
         emb_features=hidden, num_layers=layers, num_heads=heads,
         num_kv_heads=heads, head_dim=hidden // heads,
         mlp_features=records.integer(hf.get('n_inner') or 4 * hidden, 'n_inner'),
-        mlp=activations[activation], mlp_bias=True,
+        mlp=mlp, mlp_bias=True,
         norm_type='layer', norm_bias=True,
         norm_eps=records.number(hf.get('layer_norm_epsilon', 1e-5), 'layer_norm_epsilon'),
         qk_norm=False, attention_bias=True,
@@ -231,19 +224,9 @@ def _gpt2_prepare(tensors: Mapping[str, np.ndarray],
     prepared = {}
     for name, tensor in tensors.items():
         # The original gpt2 safetensors stores the bare GPT2Model and its
-        # old persistent causal buffers. They describe the fixed mask,
-        # not learned attention biases; altered buffers cannot be loaded.
-        if name.endswith('.attn.bias'):
-            if (tensor.ndim != 4 or tensor.shape[:2] != (1, 1)
-                    or tensor.shape[-2] != tensor.shape[-1]
-                    or not np.array_equal(tensor, np.tril(np.ones_like(tensor)))):
-                raise ValueError(f'{name} must hold the fixed triangular causal mask')
-            continue
-        if name.endswith('.attn.masked_bias'):
-            if tensor.shape != () or tensor != -1e4:
-                raise ValueError(f'{name} must hold the historical -10000 mask sentinel')
-            continue
-        prepared[_nested(name)] = tensor
+        # old persistent causal buffers.
+        if not fixed_attention_buffer(name, tensor, 'attn', (-1e4,)):
+            prepared[_nested(name)] = tensor
     return prepared
 
 
@@ -251,7 +234,7 @@ def _nested(name: str) -> str:
     return 'transformer.' + name if name.startswith(('h.', 'wte.', 'wpe.', 'ln_f.')) else name
 
 
-_GPT2_NAMES: Renames = (
+GPT2_NAMES: Renames = (
     ('transformer.wte', 'model.embed_tokens'), ('transformer.wpe', 'model.embed_positions'),
     ('transformer.ln_f', 'model.norm'), ('transformer.h', 'model.layers'),
     ('ln_1', 'input_layernorm'), ('ln_2', 'post_attention_layernorm'),
@@ -273,18 +256,16 @@ def _gpt2_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | Non
     # has three leaves, and the fixed buffers are validated by preparation.
     if '.attn.c_attn.' in name or name.endswith(('.attn.bias', '.attn.masked_bias')):
         return None
-    return renamed_path(_GPT2_NAMES, name, config)
+    return renamed_path(GPT2_NAMES, name, config)
 
 
 def gpt2_export(model: CausalTransformer) -> Mapping[str, object]:
-    activation = model.mlp
-    if not isinstance(activation, str) or activation not in ('gelu', 'gelu_exact', 'relu'):
-        refuse('mlp', 'GPT-2 requires an ungated GELU or ReLU feed-forward')
+    activation = hf_ungated(model.mlp, 'GPT-2')
     config: dict[str, object] = {
         'n_embd': model.emb_features, 'n_layer': model.num_layers, 'n_head': model.num_heads,
         'n_inner': model.hidden_features, 'n_positions': model.position_embedding_size or model.max_seq_len,
         'layer_norm_epsilon': model.norm_eps,
-        'activation_function': {'gelu': 'gelu_new', 'gelu_exact': 'gelu', 'relu': 'relu'}[activation],
+        'activation_function': activation,
         'scale_attn_weights': model.attention_scale is None,
         'attn_pdrop': model.attention_dropout_rate,
         'embd_pdrop': model.embedding_dropout_rate, 'resid_pdrop': model.dropout_rate,
@@ -323,7 +304,7 @@ GPT2 = DecoderFamily(
     'GPT2LMHeadModel',
     gpt2_export,
     weight_path=_gpt2_path,
-    export_path=partial(renamed_name, _GPT2_NAMES),
+    export_path=partial(renamed_name, GPT2_NAMES),
     prepare=_gpt2_prepare,
     packed=_GPT2_PACKED,
     preserve_source_layout=False,

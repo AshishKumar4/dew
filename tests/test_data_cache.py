@@ -6,7 +6,7 @@ import os
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from uuid import uuid4
 
 import fsspec
@@ -14,6 +14,7 @@ import grain.python as grain
 import pytest
 
 from dew.data.cache import Cache
+from dew.data.pipeline import Rejected
 from dew.data.sources import Memory
 from dew.data.storage import Store
 
@@ -31,6 +32,67 @@ class Manifest:
 
 def _cache(**kwargs):
     return Cache(f"memory://artifact-{uuid4().hex}", **kwargs)
+
+
+@dataclass
+class CountedStep:
+    """A fixed map or changing fetch, with per-row call counts."""
+
+    volatile: bool = False
+    reject_first: bool = False
+    permanent: bool = True
+    calls: dict[int, int] = field(default_factory=dict, repr=False)
+
+    def __call__(self, row):
+        row_id = row["id"]
+        attempt = self.calls.get(row_id, 0) + 1
+        self.calls[row_id] = attempt
+        if self.reject_first and row_id == 0 and attempt == 1:
+            return Rejected("not_ready", permanent=self.permanent)
+        return {**row, "value": attempt if self.volatile else row_id + 10}
+
+
+def _cached_passes(step, directory, records=8, read="indexed"):
+    from dew.data.compile import compile
+    from dew.data.dataset import DataPartition, Loading
+
+    source = Memory([{"id": index} for index in range(records)])
+    prefix = (source.filter_map(step, identity="counted@1") if step.reject_first
+              else source.map(step, identity="counted@1"))
+    chain = prefix.cache(str(directory))
+    if records > 2:
+        chain = chain.take(2)
+    chain = chain.repeat(2).batch(1)
+    loader = compile(chain, read=read, loading=Loading(workers=0, threads=1, read_buffer=1))
+    reader = loader.train(DataPartition())
+    try:
+        return [(int(batch["id"][0]), int(batch["value"][0])) for batch in reader]
+    finally:
+        reader.close()
+
+
+@pytest.mark.parametrize("records", [2, 8])
+@pytest.mark.parametrize("read", ["indexed", "streamed"])
+def test_volatile_cache_reruns_prefix_on_later_passes(tmp_path, records, read):
+    step = CountedStep(volatile=True)
+    assert _cached_passes(step, tmp_path, records, read) == [(0, 1), (1, 1), (0, 2), (1, 2)]
+    assert step.calls[0] == step.calls[1] == 2
+    assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize("permanent", [True, False])
+@pytest.mark.parametrize("read", ["indexed", "streamed"])
+def test_volatile_cache_retries_rejected_rows_on_later_passes(tmp_path, permanent, read):
+    step = CountedStep(volatile=True, reject_first=True, permanent=permanent)
+    assert _cached_passes(step, tmp_path, read=read) == [(1, 1), (2, 1), (0, 2), (1, 2)]
+    assert step.calls[0] == step.calls[1] == 2
+    assert not list(tmp_path.iterdir())
+
+
+def test_deterministic_cache_serves_prefix_on_later_passes(tmp_path):
+    step = CountedStep()
+    assert _cached_passes(step, tmp_path) == [(0, 10), (1, 11), (0, 10), (1, 11)]
+    assert step.calls[0] == step.calls[1] == 1
 
 
 def test_expansion_publication_certifies_empty_and_nonempty_inputs():

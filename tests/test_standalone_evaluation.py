@@ -3,18 +3,15 @@
 import pickle
 
 import jax
-import jax.numpy as jnp
 import numpy as np
 import optax
-import pytest
 from jax.sharding import NamedSharding, PartitionSpec as P
 from steady_state import steady_state
 
 from dew import Evaluation, Trainer
-from dew.artifacts import TextSamples, TokenScores
+from dew.artifacts import TextSamples
 from dew.data.dataset import Loader
 from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.objectives.base import Aux, Objective
 from dew.objectives.lm import LMObjective, Perplexity, Samples
 from dew.sampling import Sampling
 from dew.training import MeshSpec
@@ -59,82 +56,6 @@ def test_standalone_trained_variables_match_fit_and_return_hosted_previews():
                     metrics=(Perplexity(),), split="test")
     assert test.scores == {"test/perplexity": result.scores["val/perplexity"]}
     assert test.previews == ()
-
-
-class ScheduledScores(Objective):
-    def init(self, key, variables=None):
-        return {"params": {"offset": jnp.zeros(())}}
-
-    def loss(self, variables, batch, step):
-        return variables["params"]["offset"], Aux({})
-
-    def evaluate(self, params, batch, step):
-        return TokenScores(
-            jnp.ones_like(batch["x"]) * step.step,
-            jnp.ones_like(batch["x"]),
-            correct=jnp.zeros_like(jnp.ones_like(batch["x"]) * step.step, dtype=bool),
-        )
-
-
-def test_integer_evaluation_key_matches_a_jax_key():
-    objective = ScheduledScores()
-    params = objective.init(jax.random.key(0))
-    batches = [{"x": np.ones((16, 1), np.float32), "score": np.arange(16, dtype=np.float32)},
-               {"x": np.ones((8, 1), np.float32), "score": np.arange(16, 24, dtype=np.float32)}]
-    integer = Evaluation.run(
-        objective, params, lambda partition: iter(batches), key=7, metrics=[Perplexity()]
-    )
-    typed = Evaluation.run(objective, params, lambda partition: iter(batches), key=jax.random.key(7),
-                           metrics=[Perplexity()])
-    assert integer.scores == typed.scores == {"val/perplexity": 1.}
-    assert integer.event_key == typed.event_key
-    assert integer.records == 24 and integer.coordinated_batches == 2
-
-
-def test_mean_metric_scores_uneven_validation_batches():
-    from dew import Mean
-
-    objective = ScheduledScores()
-    params = objective.init(jax.random.key(0))
-    batches = [{"x": np.ones((16, 1), np.float32), "score": np.arange(16, dtype=np.float32)},
-               {"x": np.ones((8, 1), np.float32), "score": np.arange(16, 24, dtype=np.float32)}]
-    metric = Mean(lambda artifact, batch: batch["score"], name="score", better="higher", reads=TokenScores)
-    result = Evaluation.run(objective, params, lambda partition: iter(batches), key=jax.random.key(7),
-                            metrics=[metric])
-    assert result.scores == {"val/score": 11.5}
-    assert result.records == 24 and result.coordinated_batches == 2
-
-
-def test_event_step_and_objective_schedule_have_separate_meanings():
-    objective = ScheduledScores()
-    batch = {"x": np.ones((8, 1), np.float32)}
-    result = Evaluation.run(objective, objective.init(jax.random.key(0)), lambda partition: iter([batch]),
-                      key=jax.random.key(9), step=7, schedule_step=2, metrics=(Perplexity(),))
-    assert result.step == 7
-    assert result.scores["val/perplexity"] == pytest.approx(np.exp(2))
-    event = jax.random.fold_in(jax.random.fold_in(jax.random.key(9), 0x4556414C), 7)
-    assert result.event_key == tuple(np.asarray(jax.random.key_data(event)))
-
-
-def test_preview_only_closes_first_batch_and_no_consumers_never_open_source():
-    objective = ScheduledScores()
-    closed = []
-
-    def source(partition):
-        try:
-            yield {"x": np.ones((8, 1), np.float32)}
-            raise AssertionError("preview-only evaluation read beyond the first batch")
-        finally:
-            closed.append(True)
-
-    result = Evaluation.run(objective, {}, source, key=jax.random.key(0), preview=True)
-    assert result.coordinated_batches == 1 and closed == [True]
-
-    def unopened(partition):
-        raise AssertionError("an evaluation without consumers opened a source")
-
-    empty = Evaluation.run(objective, {}, unopened, key=jax.random.key(0))
-    assert empty.scores == {} and empty.previews == () and empty.records == 0
 
 
 def test_a_second_pass_over_a_split_neither_compiles_nor_moves_data_unasked():

@@ -16,10 +16,10 @@ build on are `dew.interop.decoder_parts`; read the table for the covered
 families rather than a copy here.
 
 A multimodal wrapper config raises a ValueError naming its model_type.
-DeepSeek's released checkpoints carry `num_nextn_predict_layers: 1` with no
-`mtp.*` weights, so translation builds the base model the weights describe. A
-config field that changes what the model computes and has no dew counterpart
-raises a ValueError naming it.
+A model builds the prediction depths its weights hold (`held_depths`),
+whatever depth its config names. A config field
+that changes what the model computes and has no dew counterpart raises a
+ValueError naming it.
 """
 
 import dataclasses
@@ -314,8 +314,9 @@ def wrapper_route(name: str, record: WrapperFields) -> tuple[str, str]:
         return "language_model", tail if tail.startswith(
             ("model.", "lm_head.weight", "mtp.")
         ) else f"model.{tail}"
-    if bare.startswith(projector_prefix):
-        return "projector", bare[len(projector_prefix):]
+    for prefix in (projector_prefix,) if isinstance(projector_prefix, str) else projector_prefix:
+        if bare.startswith(prefix):
+            return "projector", bare[len(prefix):]
     if bare.startswith(tower_prefix):
         return "tower", bare[len(tower_prefix):]
     if audio and bare.startswith("embed_audio."):
@@ -539,6 +540,24 @@ def _stack_experts(params: LazyTree) -> None:
                 leaves.append(leaf)
             stacked[projection] = {'kernel': SourceLeaf.stack(leaves, f"{layer} experts' {projection}")}
         mlp['experts'] = stacked
+
+
+def held_depths(fields: dict, params: Mapping[str, object]) -> None:
+    """Set `fields` to build the prediction depths `params`, translated
+    weights, hold. A released config names its depths whether or not its
+    checkpoint holds them, and transformers builds and saves the trunk alone
+    (re-saves of DeepSeek-V3 and Qwen3.5), so a checkpoint holding none of
+    the depths its config names is the trunk it holds; one holding some
+    loads them, and refuses a missing one."""
+    if fields.get("num_nextn_predict_layers") and not any(str(name).startswith("mtp_") for name in params):
+        # The trunk alone: no depth, nor the kinds and residual streams only depths build.
+        dspark = fields.get("dspark")
+        kept = {*fields.get("layer_types", ()),
+                *([dspark["layer_type"]] if isinstance(dspark, Mapping) else [])}
+        fields.update(num_nextn_predict_layers=0, mtp_layer_type=None, mtp_feedforward_type=None,
+                      mtp_hyper_connections=None)
+        if isinstance(fields.get("kinds"), Mapping):
+            fields["kinds"] = {name: kind for name, kind in fields["kinds"].items() if name in kept}
 
 
 def translate_weights(
@@ -830,13 +849,16 @@ def export_config(model) -> Mapping[str, object]:
 
 
 _RUNTIME_FIELDS = frozenset({
-    'parent', 'name', 'dtype', 'precision', 'attention_impl', 'kv_cache', 'remat', 'scan_layers',
-    'bank_layers', 'dropout_rate', 'embedding_dropout_rate', 'attention_dropout_rate',
-    'max_seq_len', 'mask_token_id', 'layer_scalar', 'scale_after_cast'})
+    'parent', 'name', 'dtype', 'precision', 'force_fp32_for_softmax', 'attention_impl', 'kv_cache', 'remat',
+    'scan_layers', 'bank_layers', 'dropout_rate', 'embedding_dropout_rate', 'attention_dropout_rate',
+    'initializer_range', 'depth_scaled_init', 'max_seq_len', 'mask_token_id', 'layer_scalar',
+    'scale_after_cast'})
 """CausalTransformer fields that say how a model runs or trains, not what it
-computes. `layer_scalar` is whether Gemma 4's scalars train; either way the
-forward multiplies by them. `scale_after_cast` orders a norm's scale and its
-cast to the compute dtype, which are the same product in fp32."""
+computes: precision and kernels, dropout, and the initialization a loaded
+model's weights replace. `layer_scalar` is whether Gemma 4's scalars train;
+either way the forward multiplies by them. `scale_after_cast` orders a
+norm's scale and its cast to the compute dtype, which are the same product
+in fp32."""
 
 _RESOLVED: Mapping[str, Callable[[CausalTransformer], object]] = {
     "num_kv_heads": lambda model: model.kv_heads,

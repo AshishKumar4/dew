@@ -43,6 +43,21 @@ def fingerprint(value: JSON | Mapping[str, object] | np.ndarray) -> str:
     return hashlib.sha256(_canonical(value)).hexdigest()
 
 
+def _identified_sources(value: dict[str, JSON] | list[JSON] | str | int | float | bool | None) -> None:
+    """Require declared content identities throughout a source snapshot."""
+    if isinstance(value, dict):
+        identity = value.get("identity")
+        if value.get("identity_required") is True and (not isinstance(identity, str) or not identity):
+            raise ValueError(
+                f"source {value.get('store', 'adapter')} needs an explicit content identity"
+            )
+        for child in value.values():
+            _identified_sources(child)
+    elif isinstance(value, list):
+        for child in value:
+            _identified_sources(child)
+
+
 @dataclasses.dataclass(frozen=True)
 class StepIdentity:
     """What a step computes (`semantic`), and the bytes of each external
@@ -167,6 +182,9 @@ class Manifest:
     schema: int = 1
     clean: bool = True
 
+    def __post_init__(self) -> None:
+        _identified_sources(json_value(self.source, "source"))
+
     @classmethod
     def of(
         cls,
@@ -273,6 +291,16 @@ class Manifest:
         return all(step.exact for step in (*self.ran, *self.steps))
 
 
+def _unplaced(order: dict[str, JSON] | list[JSON] | str | int | float | bool | None) -> JSON:
+    """`order` without its sources' descriptions, which name where a host
+    mounted them, its corpora's and phases' included."""
+    if isinstance(order, dict):
+        return {name: _unplaced(value) for name, value in order.items() if name != "source"}
+    if isinstance(order, list):
+        return [_unplaced(value) for value in order]
+    return order
+
+
 @dataclasses.dataclass(frozen=True)
 class Plan:
     """Order-defining fields checked before a restored iterator opens readers."""
@@ -306,9 +334,12 @@ class Plan:
         """What every process of a pool reads, which the pool agrees before any
         reads: the order, as a reader can follow it, then a digest of the rest
         of the plan but its environment and the share this process reads,
-        which only the position it saves keeps."""
+        which only the position it saves keeps. The order's sources are named
+        by the manifest's content, not by their descriptions: hosts that mount
+        one dataset at different paths read the same records."""
         recorded = self.record()
         del recorded["environment"]
+        recorded["order"] = _unplaced(recorded["order"])
         recorded["topology"] = json_value(
             {name: value for name, value in self.topology.items() if name != "share"}, "topology"
         )

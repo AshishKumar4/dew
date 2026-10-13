@@ -57,6 +57,48 @@ def hf_activation(activation: GatedActivation) -> str:
     return _HF_ACTIVATIONS[activation]
 
 
+UNGATED_ACTIVATIONS = {'gelu': 'gelu_exact', 'gelu_new': 'gelu', 'gelu_fast': 'gelu',
+                       'gelu_pytorch_tanh': 'gelu', 'relu': 'relu'}
+"""The ungated activations the classic families' configs name for an MLP or
+a head, as Dew's: transformers' erf GELU, its tanh approximations and ReLU."""
+
+
+def ungated_mlp(activation: str, accepted: Collection[str], field: str, family: str) -> str:
+    """Dew's name for the `activation` a `family` config's `field` names,
+    refused unless among the spellings `accepted`, those its reference reads."""
+    if activation not in accepted:
+        refuse(f'{field}={activation!r}', f'{family} reads only {sorted(accepted)}')
+    return UNGATED_ACTIVATIONS[activation]
+
+
+def fixed_attention_buffer(name: str, tensor: np.ndarray, attention: str,
+                           sentinels: Collection[float]) -> bool:
+    """Whether `name` is one of a classic family's fixed attention buffers,
+    under its `attention` module: `bias`, the triangular causal mask, or
+    `masked_bias`, a mask sentinel among `sentinels`, which each family's
+    releases spell their own. They describe the fixed mask, not learned
+    biases, so an altered one is refused."""
+    if name.endswith(f'.{attention}.bias'):
+        if (tensor.ndim != 4 or tensor.shape[:2] != (1, 1)
+                or tensor.shape[-2] != tensor.shape[-1]
+                or not np.array_equal(tensor, np.tril(np.ones_like(tensor)))):
+            raise ValueError(f'{name} must hold the fixed triangular causal mask')
+        return True
+    if name.endswith(f'.{attention}.masked_bias'):
+        if tensor.shape != () or float(tensor) not in sentinels:
+            raise ValueError(f'{name} must hold a historical mask sentinel, one of {sorted(sentinels)}')
+        return True
+    return False
+
+
+def hf_ungated(mlp: GatedActivation | None, family: str, tanh: str = 'gelu_new') -> str:
+    """The activation a classic `family`'s config names Dew's ungated `mlp`
+    by, its tanh GELU spelled `tanh`; any other `mlp` is refused."""
+    if isinstance(mlp, str) and mlp in ('gelu', 'gelu_exact', 'relu'):
+        return tanh if mlp == 'gelu' else _HF_ACTIVATIONS[mlp]
+    return refuse('mlp', f'{family} writes only an ungated GELU or ReLU')
+
+
 GEMMA3_MODEL_TYPE = 'gemma3_text'
 QWEN35 = 'qwen3_5_text'
 
@@ -1000,6 +1042,72 @@ def renamed_name(renames: Renames, dew_name: str, config: Mapping[str, object]) 
     """`hf_tensor_name` respelled in the family's own names: `renamed_path` backwards."""
     name = hf_tensor_name(dew_name, config)
     return None if name is None else renamed(name, renames, export=True)
+
+
+type BlockPath = Callable[[str], tuple[str, ...] | None]
+"""A family's path for one block tensor, named as its trunk's layer 0's."""
+
+
+def _declared_depth(name: str, index: int | str | None, declared: int) -> int:
+    """`index`, a depth's number or its digits, refused unless it is one of the `declared` depths."""
+    depth = int(index) if isinstance(index, str) and index.isdigit() else index
+    if not isinstance(depth, int) or not 0 <= depth < declared:
+        raise ValueError(f"{name} names an undeclared prediction depth")
+    return depth
+
+
+def prediction_path(name: str, prefix: str, index: int | str | None, declared: int, tail: str,
+                    leaves: Mapping[str, tuple[str, ...]], block: BlockPath) -> tuple[str, ...] | None:
+    """The path of `name`, a tensor of prediction depth (or drafting stage)
+    `index` under the variables' `{prefix}_{index}`: its own leaf in
+    `leaves` by its `tail`, or its block's, which `block` places as the
+    trunk's layer 0's and this rebases. An index past the `declared` count
+    names no depth the model builds, and is refused by name; the families
+    keep their own spellings and architectures."""
+    depth = _declared_depth(name, index, declared)
+    if tail in leaves:
+        return ('params', f'{prefix}_{depth}', *leaves[tail])
+    path = block(tail)
+    return None if path is None else (path[0], f'{prefix}_{depth}', 'block', *path[2:])
+
+
+PREDICTION_INPUTS: Mapping[str, tuple[str, ...]] = {
+    'enorm.weight': ('enorm', 'scale'), 'hnorm.weight': ('hnorm', 'scale'),
+    'eh_proj.weight': ('eh_proj', 'kernel')}
+"""A prediction depth's normed inputs and their fused projection, by the
+tensor names DeepSeek-V3 and Nemotron-H's releases share."""
+PREDICTION_LEAVES: Mapping[str, tuple[str, ...]] = {
+    **PREDICTION_INPUTS, 'shared_head.norm.weight': ('final_norm', 'scale')}
+"""A DeepSeek-V3 prediction depth's own leaves, by its tensor names after
+`model.layers.{num_layers + d}.` (`layer_depth_path`)."""
+
+
+def layer_depth_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
+    """The path of `name` in DeepSeek-V3's layout, which GLM's MoE releases
+    share: prediction depth d at `model.layers.{num_layers + d}.*`, its own
+    leaves (`PREDICTION_LEAVES`), a block named as a trunk layer's, and
+    copies of the trunk's embedding and head, which map to the trunk's
+    leaves (`translate_weights` checks the copies). A tied trunk keeps the
+    head in the embedding, which stores the same [vocab, features] the copy
+    does; an untied one has the head's own kernel, which stores its
+    transpose. Any other name is the trunk's, `dew_path`'s."""
+    parts = name.split('.')
+    trunk = records.integer(config['num_layers'], 'num_layers')
+    if not (len(parts) >= 4 and parts[:2] == ['model', 'layers'] and parts[2].isdigit()
+            and int(parts[2]) >= trunk):
+        return dew_path(name, config)
+    tail = '.'.join(parts[3:])
+    depths = records.integer(config.get('num_nextn_predict_layers', 0), 'num_nextn_predict_layers')
+    depth = _declared_depth(name, int(parts[2]) - trunk, depths)
+    if tail == 'embed_tokens.weight':
+        return ('params', 'embed_tokens', 'embedding')
+    if tail == 'shared_head.head.weight':
+        return (('params', 'embed_tokens', 'embedding') if config['tie_embeddings']
+                else ('params', 'lm_head', 'kernel'))
+    return prediction_path(name, 'mtp', depth, depths, tail, PREDICTION_LEAVES,
+                           lambda block: dew_path('model.layers.0.' + block, config))
+
+
 
 
 def _param_path(parts: list[str], config: Mapping[str, object]) -> tuple[str, ...] | None:

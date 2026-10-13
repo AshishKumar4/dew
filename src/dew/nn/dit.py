@@ -12,7 +12,7 @@ sandwich; the model files arrange blocks.
 import inspect
 import math
 from collections.abc import Sequence
-from typing import Literal, Self, TypedDict, Unpack
+from typing import TYPE_CHECKING, Literal, Self, TypedDict, Unpack, get_args
 
 import jax
 import jax.numpy as jnp
@@ -24,12 +24,13 @@ from dew.records import JSON
 
 from .activations import gelu_exact_torch, gelu_tanh
 from .attention import LayerNorm, NormalAttention
-from .blocks import FourierEmbedding, TimeProjection
+from .blocks import FourierEmbedding, TimeProjection, modulation
 from .conv import Conv
 from .flops import MissingFlopsCount, counted_flops, projection_flops, real_lengths
 from .precision import at_least_fp32, fp32_result_dot_general
 from .rope import rotary_freqs
 from .scan_orders import (
+    ScanOrder,
     build_2d_sincos_pos_embed,
     hilbert_indices,
     hilbert_patchify,
@@ -41,8 +42,6 @@ from .scan_orders import (
 )
 from .sharding import MLP_HIDDEN, RESIDUAL, constrain, logical_axes
 from .ssm import BidirectionalS5Layer, S5Layer, SpatialFusionConv
-
-SCAN_ORDERS = ('raster', 'hilbert', 'zigzag')
 
 # The rotary base every model here rotates with, RoFormer's.
 ROPE_THETA = 10000.0
@@ -83,13 +82,21 @@ def scan_ordered_pos_embed(emb_dim: int, H_P: int, W_P: int, scan_order: str):
     return pos_embed if order is None else pos_embed[order]
 
 
+BLOCK_MIXERS = ('ssm', 'attn')
+"""The mixers a hybrid layer can name: an S5 scan or attention."""
+
+
 def build_block_pattern(num_layers: int, ssm_attention_ratio: str = "3:1",
                         block_pattern: Sequence[str] | None = None):
-    """Per-layer mixer choice from a ratio string like '3:1', 'all-ssm', 'all-attn'."""
+    """Per-layer mixer choice (`BLOCK_MIXERS`) from a ratio string like '3:1', 'all-ssm', 'all-attn',
+    or a `block_pattern` naming every layer's, any other name refused."""
     if block_pattern is not None:
         if len(block_pattern) != num_layers:
             raise ValueError("block_pattern names every layer's mixer; got "
                              f"{len(block_pattern)} entries for {num_layers} layers")
+        unknown = sorted(set(block_pattern) - set(BLOCK_MIXERS))
+        if unknown:
+            raise ValueError(f"block_pattern names {unknown}; a hybrid layer is one of {list(BLOCK_MIXERS)}")
         return list(block_pattern)
     if ssm_attention_ratio == "all-ssm":
         return ['ssm'] * num_layers
@@ -158,13 +165,8 @@ class AdaLNParams(nn.Module):
     def __call__(self, conditioning):
         if conditioning.ndim == 2:
             conditioning = jnp.expand_dims(conditioning, axis=1)
-        return nn.Dense(
-            features=6 * self.features,
-            dtype=self.dtype,
-            precision=self.precision,
-            kernel_init=nn.initializers.zeros,
-            name="ada_proj"
-        )(nn.silu(conditioning) if self.silu else conditioning)
+        return modulation(conditioning, self.features, 6, name="ada_proj", silu=self.silu, zero_init=True,
+                          dtype=self.dtype, precision=self.precision)
 
 
 @logical_axes({("patch_embed", "Conv_0"): (None, None, None, "embed")})
@@ -188,7 +190,7 @@ class PatchSequenceEmbed(nn.Module):
                                parent=None).model_flops(lengths, input_channels)
 
     def setup(self):
-        assert self.scan_order in SCAN_ORDERS, f"Unknown scan order {self.scan_order}"
+        assert self.scan_order in get_args(ScanOrder), f"Unknown scan order {self.scan_order}"
         if self.scan_order == 'raster':
             self.patch_embed = PatchEmbedding(
                 patch_size=self.patch_size,
@@ -323,13 +325,9 @@ class PatchSequenceOutput(nn.Module):
             assert conditioning is not None, "modulated output head needs the conditioning vector"
             if conditioning.ndim == 2:
                 conditioning = jnp.expand_dims(conditioning, axis=1)
-            shift, scale = jnp.split(nn.Dense(
-                features=2 * features,
-                dtype=self.dtype,
-                precision=self.precision,
-                kernel_init=nn.initializers.zeros,
-                name="final_ada_proj",
-            )(nn.silu(conditioning)), 2, axis=-1)
+            projected = modulation(conditioning, features, 2, name="final_ada_proj", zero_init=True,
+                                   dtype=self.dtype, precision=self.precision)
+            shift, scale = jnp.split(projected, 2, axis=-1)
             x_out = x_out * (1 + scale) + shift
 
         x_out = nn.Dense(
@@ -401,6 +399,29 @@ def restored_remat(remat: RematChoice, record: JSON) -> RematChoice | None:
     """`record`'s rung where it is above `remat`'s, or None to keep `remat`."""
     here, there = _remat_rung(remat), _remat_rung(record)
     return None if here is None or there is None or there <= here else DIFFUSION_REMAT[there]
+
+
+class RematLadder(nn.Module):
+    """A diffusion stack's own climb of the remat ladder (`Recomputing`): its `remat` field, one
+    `DIFFUSION_REMAT` rung at a time, and the rung a record restores. Whatever the stack's geometry,
+    the climb reads that one field, which each stack declares where its own fields sit."""
+
+    if TYPE_CHECKING:
+        remat: RematChoice
+
+    @nn.nowrap
+    def recompute_record(self) -> JSON:
+        return self.remat
+
+    @nn.nowrap
+    def recompute_more(self) -> Self | None:
+        stronger = stronger_remat(self.remat)
+        return None if stronger is None else self.clone(remat=stronger)
+
+    @nn.nowrap
+    def restore_recompute(self, record: JSON) -> Self:
+        restored = restored_remat(self.remat, record)
+        return self if restored is None else self.clone(remat=restored)
 
 
 def remat_block(block_cls, enabled: RematChoice, policy: str | None = 'dots'):
@@ -487,28 +508,14 @@ class _AttentionStackOptions(_TransformerOptions, kw_only=True):
         return {**super()._block_options(), 'dropout_rate': self.dropout_rate, 'qk_norm': self.qk_norm}
 
 
-class _DiTStackOptions(_AttentionStackOptions):
+class _DiTStackOptions(RematLadder, _AttentionStackOptions):
     output_channels: int = 3
     patch_size: int = 16
     emb_features: int = 768
     num_layers: int = 12
     num_heads: int = 12
     remat: RematChoice = False
-    scan_order: Literal['raster', 'hilbert', 'zigzag'] = 'raster'
-
-    @nn.nowrap
-    def recompute_record(self) -> JSON:
-        return self.remat
-
-    @nn.nowrap
-    def recompute_more(self) -> Self | None:
-        stronger = stronger_remat(self.remat)
-        return None if stronger is None else self.clone(remat=stronger)
-
-    @nn.nowrap
-    def restore_recompute(self, record: JSON) -> Self:
-        restored = restored_remat(self.remat, record)
-        return self if restored is None else self.clone(remat=restored)
+    scan_order: ScanOrder = 'raster'
 
 
 class _TokenStackOptions(_AttentionBlockOptions):
@@ -638,7 +645,7 @@ class ModulatedBlock(nn.Module):
                 features=self.features, state_dim=self.ssm_state_dim, dtype=self.dtype, name="ssm"
             )
             if self.use_2d_fusion:
-                assert self.scan_order in SCAN_ORDERS, f"Unknown scan_order {self.scan_order}"
+                assert self.scan_order in get_args(ScanOrder), f"Unknown scan_order {self.scan_order}"
                 self.spatial_fusion = SpatialFusionConv(
                     features=self.features,
                     dilations=(1, 2, 3),
@@ -710,6 +717,24 @@ class ModulatedBlock(nn.Module):
         mlp_output = self.dropout(mlp_output, deterministic=not train)
 
         return constrain(skip + gate_mlp * mlp_output, RESIDUAL)
+
+
+def factorized_walk(tokens: jax.Array, frames: int, head_dim: int, layers) -> jax.Array:
+    """A clip's `[B*T, S, F]` tokens through interleaved spatial and temporal layers, as the factorized
+    video stacks run them (VideoDiT, V-JEPA's `FactorizedTokenStack`): each `(spatial, temporal)`
+    pair's `spatial(tokens)` reads each frame's tokens, then `temporal(tokens, rotation)` each token's
+    frames under a rotary over frame index, and the tokens return to frame-major order."""
+    batch = tokens.shape[0] // frames
+    patches, features = tokens.shape[1:]
+    rotation = rotary_freqs(jnp.arange(frames), head_dim, ROPE_THETA, dtype=at_least_fp32(tokens.dtype))
+    for spatial, temporal in layers:
+        tokens = spatial(tokens)
+        tokens = tokens.reshape(batch, frames, patches, features).transpose(0, 2, 1, 3).reshape(
+            batch * patches, frames, features)
+        tokens = temporal(tokens, rotation)
+        tokens = tokens.reshape(batch, patches, frames, features).transpose(0, 2, 1, 3).reshape(
+            batch * frames, patches, features)
+    return tokens
 
 
 def rope_for_scan(tokens: jax.Array, head_dim: int, scan_order: str):

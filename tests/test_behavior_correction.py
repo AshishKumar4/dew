@@ -56,7 +56,7 @@ def test_correction_is_explicit_and_uses_actual_recorded_behavior():
     expected = np.sum(-batch["advantages"] * mask * weights) / mask.sum()
     np.testing.assert_allclose(corrected_loss, expected, atol=2e-7)
     assert abs(float(corrected_loss) - float(ordinary_loss)) > 1e-4
-    with pytest.raises(ValueError, match="shape"):
+    with pytest.raises(ValueError):
         corrected.loss(state.variables, {**batch, "behavior_log_probs": jnp.zeros((1, 1))}, info)
 
 

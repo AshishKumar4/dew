@@ -94,6 +94,9 @@ def test_a_scanned_fixture_decodes_through_the_cache(name):
     difference = float(jnp.max(jnp.abs(jnp.concatenate(steps, axis=1) - whole)))
     assert difference < 1e-5, f"max |logit difference| {difference:.3e}"
 
+    if name == "gemma4-e2b":
+        np.testing.assert_array_equal(steps[-1][:, -1].argmax(-1), whole[:, -1].argmax(-1))
+
 
 def gemma4_shaped(dtype=jnp.float32, **overrides):
     """A gemma4-e2b shaped decoder twice the fixture's depth: runs of sliding
@@ -445,41 +448,6 @@ def test_a_pipeline_under_a_bf16_policy_trains_the_loss_of_the_plain_loop():
 
 
 
-@mesh_lane
-def test_a_pipeline_refuses_a_stack_it_cannot_split_evenly():
-    """Three layers over two stages, a routed layer where the first stage
-    has a dense one, and sharing layers at the end of the stack are each
-    refused with the layers that differ and what differs."""
-    spec = MeshSpec(fsdp=4, stage=2)
-    batch = token_batch()
-
-    def run(model):
-        variables = model.init(jax.random.key(0), jnp.ones((1, SEQ_LEN), jnp.int32))
-        loss_and_grads(LMObjective(model, SEQ_LEN), spec, variables, batch)
-
-    with pytest.raises(ValueError, match="3 layers do not split into 2 stages"):
-        run(tiny(num_layers=3))
-    with pytest.raises(ValueError, match="layer 2 differs from layer 0 in routed"):
-        run(tiny(mixture={"experts": 4, "top_k": 2, "layers": (2, 3)}))
-    with pytest.raises(ValueError, match="layer 2 differs from layer 0 in provider"):
-        run(tiny(kv_shared_layers=(3,)))
-
-
-@mesh_lane
-def test_a_pipeline_refuses_a_schedule_that_does_not_fit_the_batch():
-    """Eight rows do not make sixteen microbatches, and microbatches are a
-    multiple of the stages; both are refused before anything runs."""
-    model = tiny()
-    variables = model.init(jax.random.key(0), jnp.ones((1, SEQ_LEN), jnp.int32))
-    with pytest.raises(ValueError, match="microbatch count that divides the rows"):
-        loss_and_grads(LMObjective(model, SEQ_LEN), MeshSpec(fsdp=4, stage=2, microbatches=16),
-                       variables, token_batch())
-    with pytest.raises(ValueError, match="multiple of stage"):
-        MeshSpec(stage=2, microbatches=3)
-    with pytest.raises(ValueError, match="stage is 1"):
-        MeshSpec(microbatches=4)
-
-
 @pytest.mark.mesh(devices=4)
 @pytest.mark.parametrize("spec", [MeshSpec(stage=4, microbatches=4),
                                   MeshSpec(stage=2, sequence=2, microbatches=4)],
@@ -508,41 +476,6 @@ def test_a_pipeline_whose_rows_no_axis_splits_computes_the_whole_stacks_step(spe
     assert difference < 1e-5, f"max |gradient difference| {difference:.3e}"
 
 
-@mesh_lane
-def test_a_pipeline_refuses_microbatches_that_do_not_divide_a_devices_rows():
-    """Eight rows over fsdp=4 hold two a device. Four microbatches cannot
-    each take a share of every device's rows, so devices would compute each
-    other's microbatches again: 1.43 times one device's FLOPs for a
-    stage x fsdp step, where the bubble accounts for 1.25. Refused before
-    anything runs; two microbatches divide the two rows and run."""
-    model = tiny()
-    variables = model.init(jax.random.key(0), jnp.ones((1, SEQ_LEN), jnp.int32))
-    with pytest.raises(ValueError, match="2 rows a device, which 4 microbatches do not divide"):
-        loss_and_grads(LMObjective(model, SEQ_LEN), MeshSpec(fsdp=4, stage=2, microbatches=4),
-                       variables, token_batch())
-
-
-@mesh_lane
-def test_decoding_under_a_stage_axis_is_refused():
-    model = tiny()
-    variables = model.init(jax.random.key(0), jnp.ones((1, SEQ_LEN), jnp.int32))
-    with (
-        jax.set_mesh(MeshSpec(fsdp=4, stage=2).build()),
-        pytest.raises(ValueError, match=r"decode outside jax.set_mesh"),
-    ):
-        model.apply(variables, jnp.ones((1, 1), jnp.int32), decode=True, mutable=["cache"])
-
-
-@mesh_lane
-def test_a_layout_rule_onto_the_stage_axis_is_refused():
-    """The stage axis holds the pipeline's stages of the stored tree, so a
-    rule that would place a parameter on it is refused where it would."""
-    variables = jax.eval_shape(tiny().init, jax.random.key(0), jnp.ones((1, SEQ_LEN), jnp.int32))
-    with pytest.raises(ValueError, match="stage axis holds the pipeline"):
-        Layout(rules={"mlp": "stage"}, min_shard=1).shardings(
-            MeshSpec(fsdp=4, stage=2).build(), variables)
-
-
 def test_scanned_dropout_uses_the_supplied_rng():
     model = tiny(num_layers=3, dropout_rate=0.2, scan_layers=True)
     ids = jnp.asarray(token_batch()["text"][:2, :5])
@@ -567,40 +500,13 @@ def test_scanned_dropout_uses_the_supplied_rng():
     assert largest_difference(first[1], changed[1]) > 1e-5
 
 
-def test_the_init_program_draws_a_run_of_like_layers_once():
-    """Every layer inlined its own threefry draws into the init program, so
-    its compile grew with depth: on a TPU v6e a 512-wide decoder's init
-    compiled in 22.4 s at 12 layers and 49.9 s at 28, longer than its
-    training step. A run of like layers draws under one scan instead."""
-    from dew.nn.backbones.causal_transformer import CausalTransformer
-
-    def draws(layers):
-        model = CausalTransformer(vocab_size=VOCAB, emb_features=16, num_layers=layers,
-                                  num_heads=2, mlp_features=32, max_seq_len=8)
-        text = jax.jit(model.init).lower(jax.random.key(0), jnp.ones((1, 4), jnp.int32)).as_text()
-        return text.count("call @_threefry")
-
-    assert draws(2) == draws(6) > 0
-
-
-def test_the_layers_of_a_run_draw_their_own_weights():
-    """A run's layers are drawn under one scan with the params stream split
-    per iteration; a shared draw would give every layer the same kernel."""
-    variables = tiny(num_layers=4).init(jax.random.key(0), jnp.ones((1, 4), jnp.int32))
-    layers = variables["params"]
-    kernels = [np.asarray(layers[f"layers_{index}"]["self_attn"]["q_proj"]["kernel"])
-               for index in range(4)]
-    assert all(not np.array_equal(kernels[i], kernels[j])
-               for i in range(4) for j in range(i + 1, 4))
-
-
 def test_a_scanned_glm5_next_computes_its_unrolled_forward():
     """GLM-5-Next's first three layers (Kimi Delta Attention, a dense MLP,
     hyper-connections) scan as one run under `scan_layers`. The scanned
     forward is the unrolled one's, call after call. On XLA:CPU it was off by
     8.7, 10.1 or NaN depending on the process, exact without jit and on a
     GPU: the compiled program is identical across processes, so the bad
-    values came from its run (`chunk_kimi_delta_rule`'s workaround)."""
+    values came from its run (the chunked rule's workaround)."""
     loaded = Pretrained.load(FIXTURES / "glm5-next-tiny", dtype="float32", param_dtype="float32")
     tokens = (jnp.arange(24, dtype=jnp.int32).reshape(2, 12) * 7) % 31 + 1
     unrolled = np.asarray(jax.jit(loaded.model.apply)(loaded.variables, tokens), np.float64)

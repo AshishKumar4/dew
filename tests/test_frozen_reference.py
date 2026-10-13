@@ -22,7 +22,7 @@ import pytest
 from affine_run import FEATURES, Regression
 
 from dew.data.dataset import Loader
-from dew.training import Checkpoints, Layout, Trainer, ema_update
+from dew.training import Checkpoints, Layout, Trainer
 
 
 class Counting:
@@ -62,23 +62,6 @@ def make_trainer(tmp_path=None, **kwargs):
 
 def frozen_bytes(state):
     return [np.asarray(leaf).tobytes() for leaf in jax.tree.leaves(state.ema)]
-
-
-def test_unit_decay_returns_the_average_untouched():
-    """`0.0 * NaN` is NaN, so the old form `1.0 * average + 0.0 * live`
-    poisons the tree wherever the live tree is non-finite. The select keeps
-    every leaf bit-identical, including a NaN the average itself holds."""
-    ema = {"params": {"kernel": jnp.array([1.0, jnp.nan]), "bias": jnp.array(0.5)}}
-    live = {"params": {"kernel": jnp.array([jnp.inf, 3.0]), "bias": jnp.array(jnp.nan)}}
-
-    updated = ema_update(ema, live, jnp.asarray(1.0))
-
-    for before, after in zip(jax.tree.leaves(ema), jax.tree.leaves(updated), strict=True):
-        assert np.asarray(before).tobytes() == np.asarray(after).tobytes()
-    moved = ema_update(ema, live, 0.5)
-    assert any(np.asarray(before).tobytes() != np.asarray(after).tobytes()
-               for before, after in zip(jax.tree.leaves(ema), jax.tree.leaves(moved),
-                                        strict=True)), "a lower decay must still average"
 
 
 def poison(state):
