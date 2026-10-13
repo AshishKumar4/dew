@@ -109,7 +109,7 @@ The plain install includes Transformers, the Hugging Face Hub client and the ima
 | `profile` | The xprof profiler |
 | `quantization` | Qwix, for quantized training and serving (`dew.training.quantization`) |
 | `test` | The test suite's dependencies and pinned reference libraries |
-| `ci` | The test suite's whole environment: `test` and every extra a test file imports, with tokamax |
+| `ci` | The test suite's whole environment: `test` and every extra a test file imports |
 
 ```bash
 uv pip install 'dewml[interop,streaming] @ git+https://github.com/AshishKumar4/dew'
@@ -133,7 +133,7 @@ The `profile` extra installs XProf 2.23.1 or a later release, never 2.23.2. XPro
 
 FlashAttention comes as Dew's own wheel, `dew-flash-attn-cu12` or `dew-flash-attn-cu13` (kernels/flash_attn), for the CUDA major of your jax: FlashAttention-2 for sm8x and sm120, and FlashAttention-3 for Hopper (sm90). The `cuda12` and `cuda13` extras install it on Linux x86_64, the one platform it is built for. With it installed, `"auto"` runs it on the GPUs whose measured kernel it is, for the calls `dew.nn.attention.flash_refusal` admits; a call it turns down on such a GPU is logged once, with why.
 
-tokamax is not a dependency. With it installed, `"auto"` runs its Pallas-Triton attention on sm80 and later for heads up to 64 wide (`dew.nn.attention.triton_runs`). Install it with `uv pip install 'tokamax>=0.0.15'`. Earlier releases pin `typeguard==2.13.3`, which tyro excludes, so installing one breaks every recipe's command line.
+tokamax 0.0.15 or later comes with Dew: Dew's Pallas kernels measure their configs through it (`dew.nn.kernels.tuning`), and `"auto"` runs its Pallas-Triton attention on sm80 and later for heads up to 64 wide (`dew.nn.attention.triton_runs`). Earlier releases pin `typeguard==2.13.3`, which tyro excludes, so installing one by hand breaks every recipe's command line.
 
 ## Development install
 
