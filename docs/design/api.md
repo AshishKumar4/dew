@@ -248,7 +248,7 @@ data = loader(ImageData(source=TFDS("oxford_flowers102"), image_size=128),
             batch=32, read="memory", provision=True)
 ```
 
-One registry replaces `datasetMap`, `onlineDatasetMap` and `mediaDatasetMap` (`data/registry.py`). The per-process batch size is computed in one place that raises on `batch % processes` (done in `f3ea98b`). `fit` refuses `checkpoint_every` on a stream without `get_state`.
+One registry replaces `datasetMap`, `onlineDatasetMap` and `mediaDatasetMap` (`data/registry.py`). The per-process batch size is computed in one place that raises on `batch % processes` (done in `f3ea98b`). A stream without `get_state` resumes by reading again the batches it read, and refuses where those differ (`Replayed`).
 
 ### 3.8 Distributed
 
