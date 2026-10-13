@@ -19,8 +19,6 @@ autotuner lists for it that fit the GPU's block (`_space`), fla's picks for 99 K
 explicit block/warp/stage overrides for the lab.
 """
 
-from __future__ import annotations
-
 import dataclasses
 import functools
 import operator
@@ -1192,7 +1190,7 @@ class PrepareWyReprBwd(_Launch):
         gate = pl.BlockSpec((tokens, None), lambda i_t, h: (0, h))
         keys = pl.BlockSpec((tokens, None, width), lambda i_t, h: (0, h // group, 0))
         earlier = () if dk is None else (dk,)
-        dk, dv, db, dg = pl.pallas_call(
+        parts, dv, db, dg = pl.pallas_call(
             functools.partial(_wy_bwd_kernel, chunk=chunk, aligned=aligned, bk=min(bk, width),
                               bv=min(bv, columns), group=group if earlier else None, exact=interpret),
             grid=(spans.chunks.shape[0], value_heads),
@@ -1209,8 +1207,8 @@ class PrepareWyReprBwd(_Launch):
             compiler_params=plgpu.CompilerParams(num_warps=warps, num_stages=stages),
             interpret=interpret, name="fla_prepare_wy_repr_bwd",
         )(spans.chunks, *_flat(k, v, beta, g, a, dw, du, *earlier))
-        dk = dk.reshape(batch, length, key_heads, group, width).sum(3).astype(k.dtype) if group > 1 else \
-            dk.reshape(k.shape)
+        dk = parts.reshape(batch, length, key_heads, group, width).sum(3).astype(k.dtype) if group > 1 else \
+            parts.reshape(k.shape)
         return (dk, dv.reshape(v.shape), db.reshape(beta.shape), dg.reshape(g.shape)), None
 
 
