@@ -692,8 +692,6 @@ class DeepseekV4Attention(nn.Module):
         cache = None
         cached_key = None
         if decode:
-            if segment_ids is not None:
-                raise ValueError("decode accepts row validity, not packed segment_ids")
             if valid is None and length > self.max_seq_len:
                 raise ValueError(f"{length} tokens exceed max_seq_len={self.max_seq_len}")
             slots, allocated = cache_positions(self, batch, length, valid)
