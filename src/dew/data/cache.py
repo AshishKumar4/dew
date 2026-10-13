@@ -12,7 +12,7 @@ import threading
 import time
 import uuid
 import weakref
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from contextlib import ExitStack, closing
 from dataclasses import dataclass, field
@@ -258,7 +258,8 @@ class Cache:
         completions, shards = _sealed(root, pins)
         if current is not None:
             _retain_committed(root, current, completions, shards, pins)
-        expected = tuple(_source_ids(source, streamed=any(row.startswith("[") for row in completions)))
+        expected = tuple(_source_ids(source, streamed=any(row.startswith("[") for row in completions),
+                                     completed=completions))
         expected_keys = {_row_key(row) for row in expected}
         missing, extra = expected_keys - completions.keys(), completions.keys() - expected_keys
         if missing or extra:
@@ -456,11 +457,18 @@ def _completion(entry: Mapping[str, object], encoded: Batch | bytes | None) -> N
         raise ValueError(f"cache completion metadata differs for {entry['id']}")
 
 
-def _source_ids(source: Source, *, streamed: bool = False) -> Iterator[RowId]:
+def _source_ids(source: Source, *, streamed: bool = False,
+                completed: Iterable[str] = ()) -> Iterator[RowId]:
+    """The store's input IDs, refusing subdivided fills before reopening it."""
     if not streamed and source.supports("indexed"):
         yield from range(len(source.records("indexed")))
         return
     manifest = source.manifest()
+    if manifest.subdivide is not None:
+        store_shards = {shard.id for shard in manifest.shards}
+        if any(isinstance(row, list) and row[0] not in store_shards for row in map(json.loads, completed)):
+            raise ValueError("cache publication needs the store's own shards; "
+                             "row-wise node splits cannot be published")
     for shard in manifest.shards:
         if shard.rows is not None:
             yield from ((shard.id, index) for index in range(shard.rows))
