@@ -1,7 +1,6 @@
 """`DecisionObjective`: training a decision model on labelled questions."""
 
 import dataclasses
-import functools
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -474,9 +473,9 @@ class DecisionObjective(Objective[Ratio]):
         return Decisions(probabilities=probabilities, options=inputs.options, labels=batch["labels"],
                          ordinal=inputs.kinds == _SCORE, scored=batch["scored"])
 
-    @functools.cached_property
+    @property
     def _logits(self):
-        return jax.jit(lambda variables, inputs: self.model.logits(variables, inputs))
+        return self.program('logits', lambda variables, inputs: self.model.logits(variables, inputs))
 
     def dataset(self, examples: Labelled | DecisionTable | Mapping[str, Weighted], *, batch: int,
                 validation: Labelled | None = None, seed: int = 0, loading: Loading | None = None) -> Dataset:

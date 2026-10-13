@@ -452,7 +452,7 @@ class DiffusionObjective(Objective[Ratio]):
 
     @property
     def _sample(self):
-        return self._compiled_program('sample', self._sample_impl, static_argnames=("count",))
+        return self.program('sample', self._sample_impl, static_argnames=("count",))
 
     def task_record(self) -> Mapping[str, JSON]:
         """The process, input encoders, autoencoder and sampling convention."""

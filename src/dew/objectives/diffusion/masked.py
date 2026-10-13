@@ -125,7 +125,7 @@ class MaskedDiffusionObjective(Objective[Ratio]):
 
     @property
     def _sample(self):
-        return self._compiled_program('sample', self._sample_impl, static_argnames=("count",))
+        return self.program('sample', self._sample_impl, static_argnames=("count",))
 
     def task_record(self) -> Mapping[str, JSON]:
         """The row length, response budget, tokenizer, process, solver and sampling steps: the
