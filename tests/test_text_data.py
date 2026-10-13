@@ -363,6 +363,118 @@ def test_an_input_inside_the_export_directory_is_read_and_left_alone(tmp_path):
 # Packed documents
 # ---------------------------------------------------------------------------------
 
+@pytest.mark.parametrize("read", ["indexed", "streamed", "memory"])
+@pytest.mark.parametrize("eos_id,ends,segments", [
+    (0, [4, 7, 9], [1, 1, 1, 1, 2, 2, 2, 3, 3]),
+    (9, [9], [1] * 9),
+])
+def test_a_document_runs_through_its_eos_and_the_tail_past_the_last_is_one_too(
+        tmp_path, read, eos_id, ends, segments):
+    stream = np.asarray([10, 11, 12, 0, 20, 21, 0, 30, 31], np.uint16)
+    write_token_corpus(tmp_path, stream, stream, eos_id=eos_id)
+    stored = TokenFiles(str(tmp_path))
+    np.testing.assert_array_equal(stored.document_ends(), ends)
+    np.testing.assert_array_equal(stored.lengths(), np.diff(ends, prepend=0))
+    records = stored.records(read)
+    assert [records[index]["text"].tolist() for index in range(len(records))] == [
+        stream[start:stop].tolist() for start, stop in zip([0, *ends[:-1]], ends, strict=True)]
+    data = loader(TextData(source=stored, pack="first-fit", seq_len=15, packing_bins=1),
+                  batch=1, read=read, loading=Loading(workers=0, threads=1, read_buffer=1))
+    (window,) = _read(data.val(DataPartition()))
+    assert window["text"].tolist() == [*stream, *[0] * 7]
+    assert window["text_segment_ids"].tolist() == [*segments, *[0] * 7]
+
+
+def test_a_store_without_a_document_index_packs_its_documents_by_one_planned_order(tmp_path):
+    """The old 65,536-token boundary must not cut a document or change the packed windows."""
+    documents = [[10 + index] * (1100 + index % 5) for index in range(60)]
+    directory, tokens = _document_dir(tmp_path / "store", documents)
+    assert len(tokens) > 65536
+    provisioned = shutil.copytree(directory, tmp_path / "provisioned")
+    TokenFiles(str(provisioned)).provision()
+    for read in ("indexed", "streamed", "memory"):
+        found = TokenFiles(str(directory)).records(read)
+        held = TokenFiles(str(provisioned)).records(read)
+        assert len(found) == len(documents) == len(held)
+        for index in range(len(documents)):
+            assert found[index]["text"].tolist() == held[index]["text"].tolist() == [*documents[index], 0]
+    loading = Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1)
+    recipe = TextData(source=str(directory), pack="first-fit", seq_len=4095, packing_bins=2)
+    loaded = {read: loader(recipe, batch=2, read=read, loading=loading)
+              for read in ("indexed", "streamed", "memory")}
+    assert all(data.plan.lowering == "global" for data in loaded.values())
+    assert len({data.records for data in loaded.values()}) == 1
+    rows = {read: sorted(tuple(tuple(row[key].tolist()) for key in
+                              ("text", "text_segment_ids", "text_positions"))
+                         for row in _read(data.train(DataPartition()), data.steps_per_epoch))
+            for read, data in loaded.items()}
+    assert rows["indexed"] == rows["streamed"] == rows["memory"]
+    assert not (directory / "train.documents.npy").exists()
+
+
+@pytest.mark.parametrize("read", ["indexed", "streamed", "memory"])
+def test_a_store_without_an_eos_id_is_one_document_windows_read_and_only_packing_refuses(tmp_path, read):
+    stream = np.arange(65555, dtype=np.uint32)
+    write_token_corpus(tmp_path, stream, stream)
+    stored = TokenFiles(str(tmp_path))
+    assert not stored.documented and stored.document_ends() is None
+    records = stored.records(read)
+    assert len(records) == 1
+    np.testing.assert_array_equal(records[0]["text"], stream)
+    loading = Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1)
+    data = loader(TextData(source=stored, seq_len=8), batch=1, read=read, loading=loading)
+    assert data.records == (len(stream) - 1) // 8
+    assert [row["text"].tolist() for row in _read(data.val(DataPartition()), 2)] == [
+        stream[start:start + 9].tolist() for start in (0, 8)]
+    with pytest.raises(ValueError, match="producer document boundaries or EOS"):
+        loader(TextData(source=stored, pack="first-fit", seq_len=8), batch=1, read=read, loading=loading)
+
+
+def test_a_memory_records_read_keeps_documents_lazy_after_one_boundary_scan(tmp_path, monkeypatch):
+    stream = np.asarray([10, 11, 12, 0, 20, 21, 0, 30, 31], np.uint16)
+    write_token_corpus(tmp_path, stream, eos_id=0)
+    stored = TokenFiles(str(tmp_path))
+    spans = []
+    read = np.memmap.__getitem__
+
+    def recording(self, span):
+        spans.append((span.start, span.stop))
+        return read(self, span)
+
+    monkeypatch.setattr(np.memmap, "__getitem__", recording)
+    assert stored.documented and not spans
+    ends = stored.document_ends()
+    for mode in ("indexed", "streamed", "memory"):
+        assert len(stored.records(mode)) == 3
+    assert stored.document_ends() is ends
+    np.testing.assert_array_equal(stored.lengths(), [4, 3, 2])
+    assert spans == [(0, len(stream))]
+
+
+def test_a_document_index_is_derived_without_changing_the_local_content_identity(tmp_path):
+    directory, _ = _document_dir(tmp_path / "store", [[10, 11], [20, 21, 22]])
+    before = TokenFiles(str(directory)).fingerprint()
+    TokenFiles(str(directory)).provision()
+    provisioned = TokenFiles(str(directory)).fingerprint()
+    copied = shutil.copytree(directory, tmp_path / "other-mount" / "tokens")
+    assert before == provisioned == TokenFiles(str(copied)).fingerprint()
+    assert not {"documents", "chunk_tokens", "url"} & before.keys()
+
+
+def test_a_producer_document_index_allows_packing_without_an_eos_id(tmp_path):
+    stream = np.asarray([10, 11, 20, 21, 22], np.uint16)
+    write_token_corpus(tmp_path, stream, stream)
+    for split in ("train", "val"):
+        np.save(tmp_path / f"{split}.documents.npy", np.asarray([2, 5], np.int64), allow_pickle=False)
+    stored = TokenFiles(str(tmp_path))
+    assert stored.documented and stored.tokens.eos_id is None
+    data = loader(TextData(source=stored, pack="first-fit", seq_len=7), batch=1, read="indexed",
+                  loading=Loading(workers=0, threads=1, read_buffer=1))
+    (window,) = _read(data.val(DataPartition()))
+    assert window["text"].tolist() == [*stream, 0, 0, 0]
+    assert window["text_segment_ids"].tolist() == [1, 1, 2, 2, 2, 0, 0, 0]
+
+
 def test_packed_loader_fills_windows_with_whole_documents(tmp_path):
     seq_len = 8  # windows of 9 ids
     # 4, 6 and 5 ids once each eos is counted: first fit puts 4 + 5 in one
@@ -602,34 +714,36 @@ def _documents_in(row):
     return spans
 
 
-def test_memory_packing_never_rereads_the_store(tmp_path, monkeypatch):
-    documents = [list(range(1, 40)), [2, 3], list(range(5, 30))]
-    tokens = np.concatenate([np.asarray([*document, PACK_EOS], np.int64) for document in documents])
-    _token_dir(tmp_path, train_tokens=0, body=tokens, eos_id=PACK_EOS)
-    (tmp_path / "val.bin").write_bytes(tokens.astype(np.uint16).tobytes())
-    data = loader(TextData(source=str(tmp_path), pack="first-fit", seq_len=7, packing_bins=2),
+@pytest.mark.parametrize("name", ["bin", "records", "packed_records"])
+@pytest.mark.parametrize("pack", [None, "first-fit"])
+def test_memory_windows_and_packing_never_reread_the_store(stores, monkeypatch, name, pack):
+    import grain.python as grain
+
+    root, fields = stores
+    stored = TokenFiles(str(root / name), field=fields[name]["field"])
+    recipe = TextData(source=stored, pack=pack, seq_len=7, packing_bins=2)
+    train, _, _ = recipe.pipelines()
+    if pack is not None:
+        assert train.source is stored and len(train.stages) == 1
+    data = loader(recipe,
                   batch=2, read="memory",
                   loading=Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1))
-    spans = []
-    read = np.memmap.__getitem__
 
-    def recording(self, span):
-        spans.append(span.stop - span.start)
-        return read(self, span)
+    def reread(self, index):
+        pytest.fail("a materialized memory read went back to its token store")
 
-    monkeypatch.setattr(np.memmap, "__getitem__", recording)
+    monkeypatch.setattr(np.memmap, "__getitem__", reread)
+    monkeypatch.setattr(grain.ArrayRecordDataSource, "__getitem__", reread)
     stream = data.train(DataPartition())
     try:
         next(stream)
     finally:
         stream.close()
-    before = len(spans)
     stream = data.train(DataPartition())
     try:
         windows = list(itertools.islice(stream, 10))
     finally:
         stream.close()
-    assert len(spans) == before
     assert all(batch["text"].shape == (2, 8) for batch in windows)
 
 

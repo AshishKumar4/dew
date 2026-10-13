@@ -169,7 +169,7 @@ class TextData:
         return train, held, ()
 
     def _token_pipelines(self, stored) -> tuple[Pipeline, Pipeline | None, tuple[HostStep, ...]]:
-        from dew.data.steps.windows import Documents, WindowSource
+        from dew.data.steps.windows import WindowSource
 
         held = self.validation
         if isinstance(held, Split):
@@ -185,14 +185,11 @@ class TextData:
         def windows(source, stride):
             if self.pack is None:
                 return Pipeline(WindowSource(source, source.tokens, self.seq_len, stride))
-            documents = Pipeline(source)
-            if source.document_ends() is None:
-                if source.tokens.eos_id is None:
-                    raise ValueError(
-                        f"packed text needs producer document boundaries or EOS: {source.describe()}"
-                    )
-                documents = documents.flat_map(Documents(source.tokens.eos_id))
-            return documents.pack(self.seq_len + 1, bins=self.packing_bins, policy=self.pack)
+            if not source.documented:
+                raise ValueError(
+                    f"packed text needs producer document boundaries or EOS: {source.describe()}"
+                )
+            return Pipeline(source).pack(self.seq_len + 1, bins=self.packing_bins, policy=self.pack)
 
         return (
             windows(sources[0], self.seq_len if self.stride is None else self.stride),
