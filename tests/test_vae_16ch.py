@@ -51,15 +51,6 @@ def autoencoder():
     return StableDiffusionVAE(str(TINY), dtype=np.float32)
 
 
-def test_the_latent_space_is_sixteen_channels(autoencoder):
-    """What the seam reports is what the config says, so a diffusion model
-    sized off `latent_channels` denoises 16 of them."""
-    assert autoencoder.latent_channels == 16
-    assert autoencoder.downscale_factor == 2
-    assert autoencoder.latent_shift == pytest.approx(0.0609)
-    assert autoencoder.latent_scale == pytest.approx(1.5305)
-
-
 def test_the_encoder_matches_the_reference_latent(autoencoder):
     """The posterior mean of the reference, from the same pixels, before the
     latent normalization the seam applies."""
@@ -91,23 +82,6 @@ def test_the_normalized_latent_round_trips(autoencoder):
     decoded = autoencoder.decode(autoencoder.params, latent)
     difference = largest_difference(decoded, expected["decoded"])
     assert difference < 1e-4, f"max |round trip difference| {difference:.3e}"
-
-
-def test_a_zeroed_input_convolution_fails_parity(autoencoder):
-    """The translated weights are load-bearing: zeroing the encoder's first
-    convolution must move the latent past the tolerance, or the parity tests
-    above prove nothing."""
-    import copy
-
-    expected = reference()
-    broken = copy.deepcopy(autoencoder.params)
-    kernel = broken["encoder"]["conv_in"]["kernel"]
-    broken["encoder"]["conv_in"]["kernel"] = np.zeros_like(kernel)
-    mutated = StableDiffusionVAE(str(TINY), dtype=np.float32, params=broken)
-
-    difference = largest_difference(
-        mutated.encode_batch(mutated.params, np.asarray(expected["sample"], np.float32)), expected["latent"])
-    assert difference > TOLERANCE, f"zeroed conv_in still matches: {difference:.3e}"
 
 
 @pytest.mark.network

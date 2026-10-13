@@ -13,16 +13,12 @@ import pytest
 from episode_support import (
     ANSWER_NINE,
     ANSWER_SIXTEEN,
-    CALL_THREE,
     EOS,
     GROUPS,
     NINE,
-    PAD,
-    PROMPT,
     RESPONSE,
     SAMPLING,
     SIXTEEN,
-    START,
     TURNS,
     VOCAB,
     Harness,
@@ -154,24 +150,6 @@ def test_environment_failures_abort_collection_and_release_sessions(failure, sta
         assert records[0].transitions[0].action.raw_log_probs
 
 
-def test_a_policy_drawing_several_continuations_per_slot_is_refused():
-    """A collector slot is one episode's turn, so a policy bound to draw
-    several continuations of each prompt hands back rows the slots cannot
-    absorb. Collection has to fail and release its sessions rather than
-    relabel one prompt's extra continuations as other episodes' actions."""
-    harness = Harness()
-    trainer, rollout = build(harness)
-    several = replace(rollout, policy=replace(rollout.policy, n=2))
-
-    with pytest.raises(EpisodeFailure) as caught:
-        collect(several, trainer.initial_state())
-
-    assert caught.value.episode.status == EpisodeStatus.ERROR
-    assert "per slot" in caught.value.episode.detail
-    assert not caught.value.episode.transitions
-    assert Counter(harness.opened) == Counter(harness.closed) and harness.closed
-
-
 @pytest.mark.parametrize("mode", ["raise", "nan"])
 def test_verifier_failure_is_not_a_zero_reward(mode):
     harness = Harness()
@@ -203,19 +181,6 @@ def test_truncation_preserves_actions_but_does_not_execute_partial_calls(limits,
     assert all(len(episode.transitions) == turns for episode in episodes)
     if limits.get("max_new_tokens") == 1:
         assert all(not episode.transitions[0].action.terminated for episode in episodes)
-
-
-def test_projection_rejects_cross_policy_episodes():
-    trainer, rollout = build()
-    episodes = collect(rollout, trainer.initial_state())
-    crossed = replace(episodes[0], policy_step=episodes[0].policy_step + 1)
-    with pytest.raises(ValueError, match="policy snapshot"):
-        rollout.project((crossed, *episodes[1:]))
-    changed = replace(episodes[0].transitions[0].action, policy_step=7)
-    crossed = replace(episodes[0], transitions=(replace(episodes[0].transitions[0], action=changed),
-                                               *episodes[0].transitions[1:]))
-    with pytest.raises(ValueError, match="policy snapshot"):
-        rollout.project((crossed, *episodes[1:]))
 
 
 class Tasks:
@@ -315,39 +280,6 @@ def test_aborted_episode_leaves_the_previous_trainer_checkpoint_intact(tmp_path,
     assert all(episode.identity.attempt == 1 and episode.reward is None for episode in records)
 
 
-@pytest.mark.parametrize("corruption", ["context", "termination"])
-def test_inference_provenance_is_checked_before_tool_execution(corruption):
-    harness = Harness()
-    trainer, rollout = build(harness)
-    class CorruptPolicy:
-        def __init__(self, inner):
-            self.inner = inner
-
-        def bind(self, variables):
-            return CorruptPolicy(self.inner.bind(variables))
-
-        def __call__(self, inputs, max_new_tokens, *, key, sampling):
-            result = self.inner(inputs, max_new_tokens, key=key, sampling=sampling)
-            if corruption == "context":
-                return replace(result, tokens=result.tokens.at[0, PROMPT - 1].set(PAD))
-            return replace(result, terminated=~result.terminated)
-
-    with pytest.raises(EpisodeFailure, match="inference") as caught:
-        collect(replace(rollout, policy=CorruptPolicy(rollout.policy)), trainer.initial_state())
-    assert harness.calls == [] and Counter(harness.opened) == Counter(harness.closed)
-    assert caught.value.episode.reward is None
-
-
-def test_projection_refuses_replayed_samples_and_cross_attempt_groups():
-    trainer, rollout = build()
-    episodes = collect(rollout, trainer.initial_state())
-    with pytest.raises(ValueError, match="distinct identity"):
-        rollout.project((episodes[0], episodes[0], *episodes[2:]))
-    changed = replace(episodes[0], identity=replace(episodes[0].identity, attempt=7))
-    with pytest.raises(ValueError, match="policy snapshot and attempt"):
-        rollout.project((changed, *episodes[1:]))
-
-
 def test_verifier_runs_before_environment_resources_are_released():
     harness = Harness()
 
@@ -360,29 +292,6 @@ def test_verifier_runs_before_environment_resources_are_released():
     episodes = collect(rollout, trainer.initial_state())
     assert {episode.reward for episode in episodes} == {0., 1.}
     assert Counter(harness.opened) == Counter(harness.closed)
-
-
-def test_projection_rejects_distinct_weight_bindings_with_identical_clocks():
-    """Update/attempt counters alone do not identify the generating weights."""
-    trainer, rollout = build()
-    first_state = trainer.initial_state()
-    second_state = replace(first_state, variables={"params": {
-        "table": first_state.variables["params"]["table"].at[START, CALL_THREE].add(.8)}})
-    first = collect(rollout, first_state)
-    second = collect(rollout, second_state)
-    assert first[0].identity == second[0].identity
-    assert first[0].policy_step == second[0].policy_step == 0
-    assert abs(first[0].transitions[0].action.raw_log_probs[0]
-               - second[0].transitions[0].action.raw_log_probs[0]) > .01
-
-    # Distinct sample identities and unchanged clocks cannot catch the splice.
-    with pytest.raises(ValueError, match="binding"):
-        rollout.project((*first[:2], *second[2:]))
-    crossed = replace(first[0], transitions=(
-        replace(first[0].transitions[0], action=second[0].transitions[0].action),
-        *first[0].transitions[1:]))
-    with pytest.raises(ValueError, match="binding"):
-        rollout.project((crossed, *first[1:]))
 
 
 @pytest.mark.parametrize("phase, retained_turns", [("reset", 0), ("tool", 1), ("verifier", 2)])

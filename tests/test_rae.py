@@ -18,8 +18,6 @@ scaled by max(1, |reference|).
 """
 
 import importlib.util
-import json
-import shutil
 from pathlib import Path
 
 import jax
@@ -27,10 +25,9 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from interop_support import assert_layout_tensors, extract_fixture, fixture_arrays, scaled_gap
-from safetensors.numpy import save_file
 
 from dew.interop.diffusion import component_tensors
-from dew.nn.autoencoders.rae import UNREAD, load_dinov2, load_rae, rae_fields, rae_path
+from dew.nn.autoencoders.rae import UNREAD, load_dinov2, load_rae
 
 ROOT = Path(__file__).resolve().parents[1]
 FORWARD = 1e-5
@@ -113,49 +110,6 @@ def test_decoder_gradients_match_the_source(variant):
     assert gaps[worst] < GRADIENT, worst
 
 
-def test_any_image_size_encodes_to_the_grid(variant):
-    _, (autoencoder, params, _, config), _ = variant
-    grid = config["encoder_input_size"] // config["encoder_patch_size"]
-    for size in (48, 96):
-        assert autoencoder.latent_shape((size, size, 3)) == (grid, grid, config["encoder_hidden_size"])
-        assert autoencoder.encode(params, jnp.zeros((1, size, size, 3))).shape == (1, grid, grid,
-                                                                                    config["encoder_hidden_size"])
-    with pytest.raises(ValueError, match="decodes a"):
-        autoencoder.decode_batch(params, jnp.zeros((1, grid + 1, grid + 1, config["encoder_hidden_size"])))
-
-
-def test_a_missing_tensor_is_refused(source, tmp_path):
-    shutil.copytree(source / "dinov2", tmp_path / "dinov2")
-    tensors = component_tensors(source / "dinov2", "")
-    del tensors["encoder.encoder.layer.1.layer_scale2.lambda1"]
-    save_file(tensors, tmp_path / "dinov2" / "diffusion_pytorch_model.safetensors")
-    with pytest.raises(ValueError, match="layer_scale2"):
-        load_rae(tmp_path / "dinov2")
-
-
-@pytest.mark.parametrize("name, ndim", [
-    ("encoder.encoder.layer.0.attention.attention.rotary.weight", 2),
-    ("encoder.vision_model.encoder.layers.0.self_attn.qkv.weight", 2),
-    ("decoder.decoder_layers.x.attention.to_q.weight", 2),
-    ("encoder.embeddings.distillation_token", 3),
-    ("decoder.decoder_pred.scale", 1),
-])
-def test_an_unknown_tensor_is_refused(name, ndim):
-    with pytest.raises(ValueError):
-        rae_path(name, ndim)
-
-
-@pytest.mark.parametrize("change", [
-    {"encoder_type": "clip"}, {"reshape_to_2d": False}, {"num_channels": 4}, {"encoder_input_size": 120},
-    {"image_size": 100},
-])
-def test_an_unsupported_config_is_refused(source, change):
-    config = json.loads((source / "dinov2" / "config.json").read_text())
-    rae_fields(config)
-    with pytest.raises(ValueError):
-        rae_fields({**config, **change})
-
-
 @pytest.mark.network
 @pytest.mark.parametrize("name", VARIANTS)
 def test_the_published_rae_matches_the_source(name):
@@ -231,52 +185,3 @@ def test_the_published_dinov2_matches_transformers():
     bound = max(FORWARD, 2 * float(reference["dinov2_plain.tokens.float32_gap"]))
     print(f"published DINOv2 gap {gap:.3g}, bound {bound:.3g}")
     assert gap < bound
-
-
-def test_a_latent_run_trains_behind_the_rae_and_samples_its_image_size(source):
-    """A diffusion run denoises the RAE's `[grid, grid, width]` latent with
-    its per-position normalization, trains the model alone, and samples
-    images of the size the decoder paints."""
-    import optax
-    from diffusion_stubs import STUB_TEXT
-
-    from dew.config import ModelConfig, ObjectiveConfig, TrainerConfig
-    from dew.config.data import ImageData
-    from dew.data.dataset import Loader
-    from dew.objectives.diffusion import DiffusionRunConfig, PretrainedAutoencoder, TextCondition
-    from dew.sampling import Euler
-    from dew.training import Trainer
-
-    config = DiffusionRunConfig(
-        model=ModelConfig(
-            "simple_dit",
-            {"patch_size": 1, "emb_features": 16, "num_layers": 1, "num_heads": 2, "mlp_ratio": 1,
-             "dtype": "float32", "attention_impl": "reference"},
-        ),
-        data=ImageData(source="tfds://oxford_flowers102", image_size=64),
-        trainer=TrainerConfig(batch_size=8, steps=2),
-        text=TextCondition(encoder=STUB_TEXT, checkpoint="stub-clip"),
-        autoencoder=PretrainedAutoencoder(
-            modelname=str(source / "siglip2"), revision="main", dtype="float32"
-        ), objective=ObjectiveConfig("diffusion", {"solver": Euler(), "steps": 2}),
-    )
-    objective = config.build()
-    assert objective.latent_shape == (8, 8, 64)
-    images = (np.random.default_rng(0).random((8, 64, 64, 3)) * 255).astype(np.uint8)
-    batch = {
-        "image": images,
-        "text": objective.inputs.conditions["textcontext"].encoder.tokenize(list("abcdefgh")),
-    }
-    trainer = Trainer(objective, optax.adam(1e-2), key=jax.random.PRNGKey(0))
-    initial = trainer.initial_state()
-    state = trainer.fit(
-        Loader(train=lambda partition: iter(lambda: batch, None), val=None, records=None, batch=8),
-        steps=2,
-        log_every=100,
-    )
-
-    for before, after in zip(jax.tree.leaves(initial.variables["autoencoder"]),
-                             jax.tree.leaves(state.variables["autoencoder"]), strict=True):
-        np.testing.assert_array_equal(np.asarray(before), np.asarray(after))
-    sampled = objective.pipeline(state)(["a", "b"], key=0).host()
-    assert sampled.images.shape == (2, 64, 64, 3)

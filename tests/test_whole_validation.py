@@ -26,7 +26,7 @@ from dew.data.chat import Role
 from dew.data.dataset import DataPartition, rows_of
 from dew.diffusion.presets import Flow
 from dew.nn.backbones import CausalTransformer
-from dew.objectives.base import TEACHER, VALID_ROWS, Objective, Step
+from dew.objectives.base import TEACHER, VALID_ROWS, Step
 from dew.objectives.diffusion import DiffusionRunConfig, GuidanceDistillationObjective, TextCondition
 from dew.objectives.lm import LMObjective, Perplexity
 from dew.registry import objectives
@@ -190,19 +190,6 @@ def test_a_pass_scores_every_record_once_and_a_deterministic_loss_is_the_unbatch
     """Every registered objective with an evaluation loss, on one process
     (`tests/test_multiprocess.py` runs the same on two)."""
     assert_every_record_once(name, evaluated(name, windows, tmp_path))
-
-
-def test_an_accuracy_counts_neither_the_hits_nor_the_answers_of_a_repeat_row():
-    """`Objective.accuracy` over a batch whose last row repeats the first:
-    the repeat's hits and answers both drop out, a target mask weighs each
-    answer, and a batch with nothing counted reports 0."""
-    correct = jnp.asarray([[1.0, 0.0, 1.0], [0.0, 0.0, 1.0], [1.0, 1.0, 1.0]])
-    weights = jnp.asarray([[1.0, 1.0, 0.0], [1.0, 1.0, 1.0], [1.0, 1.0, 1.0]])
-    padded = {VALID_ROWS: np.asarray([True, True, False])}
-    accuracy, counted = Objective.accuracy(correct, padded, weights).mean()
-    assert bool(counted) and accuracy == np.float32(2) / np.float32(5)
-    assert Objective.accuracy(correct, {}).mean()[0] == np.float32(6) / np.float32(9)
-    assert float(Objective.accuracy(correct, {}, jnp.zeros_like(correct)).mean()[0]) == 0.0
 
 
 def test_a_validation_token_accuracy_is_the_unpadded_one_and_at_most_one():

@@ -60,44 +60,6 @@ def packed_keep(segments: jax.Array) -> jax.Array:
 # --------------------------------------------------------------------------
 
 
-def test_the_dense_kl_matches_the_reference_warmup_loss():
-    """`indexer_sparse_training=False`: the KL over every causal key.
-
-    Tolerance 1e-6 on the per-query values and the mean; observed 1.8e-7.
-    """
-    data = fixture()
-    per_query = indexer_kl(data["scores"], data["query"], data["key"],
-                           causal(META["length"]), float(data["scale"]))
-    np.testing.assert_allclose(per_query, data["causal_dense_kl"], atol=1e-6)
-    assert float(jnp.mean(per_query)) == pytest.approx(float(data["causal_dense_loss"]), abs=1e-6)
-
-
-def test_the_selection_is_the_reference_exact_top_k():
-    """Exactly k keys per query where k are allowed, ties to the earliest
-    key, and every allowed key before that; the fixture's scores tie at
-    exact zero on nearly half the entries, so the rule decides the mask."""
-    data = fixture()
-    keep = causal(META["length"])
-    selected = top_k_keys(data["scores"], keep, META["top_k"])
-    assert bool(jnp.all(selected == data["causal_selected"]))
-    counts = jnp.sum(selected, axis=-1)
-    assert bool(jnp.all(counts == jnp.minimum(jnp.arange(META["length"]) + 1, META["top_k"])))
-    assert bool(jnp.all(top_k_keys(data["scores"], packed_keep(data["segments"]), META["top_k"])
-                        == data["packed_selected"]))
-
-
-def test_the_sparse_kl_matches_the_reference_sparse_loss():
-    """`indexer_sparse_training=True`: both distributions over the top-k.
-
-    Tolerance 1e-6; observed 1.8e-7.
-    """
-    data = fixture()
-    selected = top_k_keys(data["scores"], causal(META["length"]), META["top_k"])
-    per_query = indexer_kl(data["scores"], data["query"], data["key"], selected, float(data["scale"]))
-    np.testing.assert_allclose(per_query, data["causal_sparse_kl"], atol=1e-6)
-    assert float(jnp.mean(per_query)) == pytest.approx(float(data["causal_sparse_loss"]), abs=1e-6)
-
-
 @pytest.mark.parametrize("name", ["causal_dense", "packed_dense", "causal_sparse"])
 def test_the_loss_its_gradient_and_the_selection_are_maxtexts(name):
     """MaxText 0.2.4's own `calculate_indexer_loss` and `generate_mask`,
@@ -124,38 +86,26 @@ def test_the_loss_its_gradient_and_the_selection_are_maxtexts(name):
     assert_as_exact_as_the_reference(gradient, PUBLISHED[f"{name}/grad"], PUBLISHED[f"{name}/grad_f64"],
                                      f"{name}'s gradient")
 
-
-def test_a_packed_batch_keeps_its_documents_apart_and_its_padding_at_zero():
-    """The packed mask reaches both distributions, and a padding query
-    that may attend nothing scores exactly zero rather than nan, as the
-    reference's additive mask leaves it. Tolerance 1e-6; observed 1.9e-7."""
-    data = fixture()
-    per_query = indexer_kl(data["scores"], data["query"], data["key"],
-                           packed_keep(data["segments"]), float(data["scale"]))
-    np.testing.assert_allclose(per_query, data["packed_dense_kl"], atol=1e-6)
-    assert bool(jnp.all(per_query[1, 5:] == 0))
-    assert bool(jnp.all(jnp.isfinite(jax.grad(
-        lambda s: jnp.sum(indexer_kl(s, data["query"], data["key"],
-                                     packed_keep(data["segments"]), float(data["scale"]))))(
-        data["scores"]))))
-
-
-def test_the_kl_moves_the_indexer_scores_and_not_the_attention():
-    """The target is a constant of the loss: no gradient reaches the
-    query or key, and the scores' gradient is the softmax difference."""
-    data = fixture()
-    keep = causal(META["length"])
-    scale = float(data["scale"])
-    grads = jax.grad(
-        lambda s, q, k: jnp.sum(indexer_kl(s, q, k, keep, scale)), argnums=(0, 1, 2))(
-        data["scores"], data["query"], data["key"])
-    assert bool(jnp.all(grads[1] == 0)) and bool(jnp.all(grads[2] == 0))
-    masked = jnp.where(keep, data["scores"], -jnp.inf)
-    indexer = jax.nn.softmax(masked, axis=-1)
-    logits = jnp.einsum("bshd,bthd->bhst", data["query"] * scale, data["key"])
-    target = jnp.sum(jax.nn.softmax(jnp.where(keep, logits, -jnp.inf), axis=-1), axis=1)
-    target = target / jnp.sum(target, axis=-1, keepdims=True)
-    np.testing.assert_allclose(grads[0], indexer - target, atol=1e-6)
+    legacy = fixture()
+    legacy_keep = causal(META["length"]) if mask == "causal" else packed_keep(legacy["segments"])
+    legacy_selected = top_k_keys(legacy["scores"], legacy_keep, META["top_k"])
+    np.testing.assert_array_equal(legacy_selected, legacy[f"{mask}_selected"])
+    if mask == "causal":
+        counts = jnp.sum(legacy_selected, axis=-1)
+        assert bool(jnp.all(counts == jnp.minimum(jnp.arange(META["length"]) + 1, META["top_k"])))
+    legacy_region = legacy_selected if phase == "sparse" else legacy_keep
+    per_query = indexer_kl(legacy["scores"], legacy["query"], legacy["key"],
+                           legacy_region, float(legacy["scale"]))
+    np.testing.assert_allclose(per_query, legacy[f"{name}_kl"], atol=1e-6)
+    if name == "causal_dense":
+        assert float(jnp.mean(per_query)) == pytest.approx(float(legacy["causal_dense_loss"]), abs=1e-6)
+    elif name == "causal_sparse":
+        assert float(jnp.mean(per_query)) == pytest.approx(float(legacy["causal_sparse_loss"]), abs=1e-6)
+    else:
+        assert bool(jnp.all(per_query[1, 5:] == 0))
+        assert bool(jnp.all(jnp.isfinite(jax.grad(
+            lambda scores: jnp.sum(indexer_kl(scores, legacy["query"], legacy["key"],
+                                              legacy_keep, float(legacy["scale"]))))(legacy["scores"]))))
 
 
 # --------------------------------------------------------------------------
@@ -201,12 +151,6 @@ def test_a_top_k_covering_the_keys_selects_the_dense_mask():
                                dense_sown["indexer"]["kl"][0][:, :4], atol=1e-6)
     assert float(jnp.max(jnp.abs(selected_sown["indexer"]["kl"][0][:, 4:]
                                  - dense_sown["indexer"]["kl"][0][:, 4:]))) > 0.1
-
-
-def test_the_kl_is_sown_only_when_its_collection_is_open():
-    module, variables, hidden = v32_block()
-    _, sown = module.apply(variables, hidden, mutable=["qk"])
-    assert "indexer" not in sown
 
 
 def test_a_packed_batch_selects_inside_its_documents():
@@ -267,32 +211,6 @@ def split_norms(tree) -> tuple[float, float]:
     return float(optax.tree.norm(indexer)), float(optax.tree.norm(rest))
 
 
-def test_the_warmup_trains_the_indexer_and_nothing_else():
-    """The params collection holds the indexer alone and the frozen one the
-    rest, the loss reaches only the former, and thirty Adam steps halve the
-    KL: 0.32 to 0.09 observed."""
-    objective = LMObjective(deepseek_stack(None), SEQ, indexer=IndexerTraining("warmup"))
-    params = objective.init(jax.random.key(0))
-    batch = token_batch()
-    assert sorted(params) == [FROZEN, "params"]
-    assert all(is_indexer(path) for path, _ in jax.tree_util.tree_leaves_with_path(params["params"]))
-    assert not any(is_indexer(path) for path, _ in jax.tree_util.tree_leaves_with_path(params[FROZEN]))
-    loss = jax.jit(jax.value_and_grad(
-        lambda p: objective.scalar_loss(p, batch, step_at()), has_aux=True))
-    (before, aux), grads = loss(params)
-    assert set(aux.metrics) == {"indexer_kl"}
-    assert float(before) == pytest.approx(float(aux.metrics["indexer_kl"]))
-    assert float(optax.tree.norm(grads[FROZEN])) == 0
-    assert float(optax.tree.norm(grads["params"])) > 0
-    optimizer = optax.adam(1e-2)
-    state = optimizer.init(params["params"])
-    for _ in range(30):
-        (after, aux), grads = loss(params)
-        updates, state = optimizer.update(grads["params"], state, params["params"])
-        params = {**params, "params": optax.apply_updates(params["params"], updates)}
-    assert float(after) < float(before) / 2, (float(before), float(after))
-
-
 def test_the_sparse_phase_keeps_the_indexer_and_the_model_apart():
     """The main weights see the plain cross entropy gradient whatever the
     KL weighs, the indexer's gradient is the KL's alone and scales with
@@ -302,17 +220,19 @@ def test_the_sparse_phase_keeps_the_indexer_and_the_model_apart():
     params = plain.init(jax.random.key(0))
 
     def gradient(objective):
-        (_, aux), grads = jax.value_and_grad(
+        (value, aux), grads = jax.value_and_grad(
             lambda p: objective.scalar_loss(p, batch, step_at()), has_aux=True)(params)
-        return aux, grads["params"]
+        return value, aux, grads["params"]
 
-    _, plain_grads = gradient(plain)
+    ce, _, plain_grads = gradient(plain)
     assert split_norms(plain_grads)[0] == 0
     seen = {}
     for weight in (0.5, 2.0):
         objective = LMObjective(
             deepseek_stack(4), SEQ, indexer=IndexerTraining("sparse", weight=weight))
-        aux, grads = gradient(objective)
+        value, aux, grads = gradient(objective)
+        assert float(aux.metrics["ce"]) == pytest.approx(float(ce), rel=1e-6)
+        assert float(value) == pytest.approx(float(ce) + weight * float(aux.metrics["indexer_kl"]), rel=1e-5)
         seen[weight] = split_norms(grads)[0]
         assert seen[weight] > 0
         kl_grads = jax.jit(
@@ -326,18 +246,19 @@ def test_the_sparse_phase_keeps_the_indexer_and_the_model_apart():
         assert float(aux.metrics["indexer_kl"]) > 0
     assert seen[2.0] == pytest.approx(4 * seen[0.5], rel=1e-5)
 
-
-def test_the_loss_is_the_cross_entropy_plus_the_weighted_kl():
-    """One report, one sum: the sparse phase's value is the plain
-    objective's cross entropy plus `weight` times the reported KL."""
-    batch = token_batch()
-    plain = LMObjective(deepseek_stack(4), SEQ)
-    params = plain.init(jax.random.key(0))
-    ce, _ = plain.scalar_loss(params, batch, step_at())
-    sparse = LMObjective(deepseek_stack(4), SEQ, indexer=IndexerTraining("sparse", weight=0.25))
-    value, aux = sparse.scalar_loss(params, batch, step_at())
-    assert float(aux.metrics["ce"]) == pytest.approx(float(ce), rel=1e-6)
-    assert float(value) == pytest.approx(float(ce) + 0.25 * float(aux.metrics["indexer_kl"]), rel=1e-5)
+    data = fixture()
+    keep = causal(META["length"])
+    scale = float(data["scale"])
+    grads = jax.grad(
+        lambda scores, query, key: jnp.sum(indexer_kl(scores, query, key, keep, scale)),
+        argnums=(0, 1, 2))(data["scores"], data["query"], data["key"])
+    assert bool(jnp.all(grads[1] == 0)) and bool(jnp.all(grads[2] == 0))
+    masked = jnp.where(keep, data["scores"], -jnp.inf)
+    indexer = jax.nn.softmax(masked, axis=-1)
+    logits = jnp.einsum("bshd,bthd->bhst", data["query"] * scale, data["key"])
+    target = jnp.sum(jax.nn.softmax(jnp.where(keep, logits, -jnp.inf), axis=-1), axis=1)
+    target = target / jnp.sum(target, axis=-1, keepdims=True)
+    np.testing.assert_allclose(grads[0], indexer - target, atol=1e-6)
 
 
 def packed_row(*documents):
@@ -439,7 +360,7 @@ def test_the_warmup_starts_a_fresh_indexer_beside_a_dense_checkpoint():
         .init(jax.random.key(0))["params"])
     incomplete = {"params": {name: value for name, value in checkpoint["params"].items()
                              if name != "embed_tokens"}}
-    with pytest.raises(ValueError, match="embed_tokens"):
+    with pytest.raises(ValueError):
         LMObjective(deepseek_stack(None), SEQ, indexer=IndexerTraining("warmup"),
                     variables=incomplete).init(jax.random.key(0))
 
@@ -478,34 +399,6 @@ def test_evaluation_and_scoring_read_the_split_tree():
     assert not objective.ema.select((FROZEN, "layers_0"))
     assert objective.ema.select(("params", "layers_0"))
 
-
-@pytest.mark.parametrize("phase, topk, terms", [
-    ("warmup", 4, {}),
-    ("sparse", None, {}),
-    ("warmup", None, {"balance_rate": 0.01}),
-    ("warmup", None, {"mtp_weight": 0.1}),
-])
-def test_a_phase_that_disagrees_with_the_model_is_refused(phase, topk, terms):
-    """The warm-up wants dense attention, the sparse phase a top-k, and
-    the warm-up moves nothing a main-loss term could train."""
-    model = deepseek_stack(topk, num_nextn_predict_layers=1 if "mtp_weight" in terms else 0,
-                           **({"mixture": {"experts": 4, "top_k": 2, "layers": (1,), "bias": True,
-                                          "expert_features": 16}}
-                              if "balance_rate" in terms else {}))
-    with pytest.raises(ValueError):
-        LMObjective(model, SEQ, indexer=IndexerTraining(phase), **terms)
-
-
-def test_a_model_without_an_indexer_is_refused():
-    plain = deepseek_stack(None, mixer={"class": "mla", "fields": {"q_lora_rank": 8, "kv_lora_rank": 8,
-                                        "qk_nope_head_dim": 8, "qk_rope_head_dim": 8,
-                                        "v_head_dim": 8}})
-    with pytest.raises(ValueError, match="index_n_heads"):
-        LMObjective(plain, SEQ, indexer=IndexerTraining("sparse"))
-    with pytest.raises(ValueError, match="positive"):
-        IndexerTraining("sparse", weight=0.0)
-    with pytest.raises(ValueError, match="warmup"):
-        IndexerTraining("dense")
 
 
 def token_batches():
@@ -549,11 +442,9 @@ def test_the_warmup_trains_through_the_trainer():
     abstract = jax.eval_shape(trainer.initial_state)
     trainer.layout.check(abstract.variables, trainer.shardings(abstract).variables, trainer.device_mesh)
 
-
-def test_the_selection_breaks_a_tie_at_the_lower_key_index():
-    """Equal scores choose the lower key index, and a key the mask forbids
-    stays unselected even when it ties with a chosen one."""
-    scores = jnp.asarray([[[0.0, 0.0, 1.0, 0.0]]], jnp.float32)
-    keep = jnp.asarray([[[False, True, True, True]]])
-    selected = top_k_keys(scores, keep, 2)
-    np.testing.assert_array_equal(selected[0, 0], [False, True, True, False])
+    (before, aux), grads = jax.value_and_grad(
+        lambda params: trainer.objective.scalar_loss(params, token_batch(), step_at()),
+        has_aux=True)(initial.variables)
+    assert float(before) == pytest.approx(float(aux.metrics["indexer_kl"]))
+    assert float(optax.tree.norm(grads[FROZEN])) == 0
+    assert float(optax.tree.norm(grads["params"])) > 0

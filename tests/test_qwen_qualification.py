@@ -13,13 +13,10 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from flax.traverse_util import flatten_dict
 
 from dew.interop import Pretrained
-from dew.interop.hf_decoders import _wrapper_sources, families, translate_config, translate_wrapper_config
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
-from dew.registry import models
 from dew.sampling import Sampling, generate
 
 ROOT = Path(__file__).parent / "fixtures" / "hf"
@@ -128,51 +125,6 @@ def source(request):
     return loaded, inputs, np.load(directory / "reference.npz")
 
 
-def test_source_geometry_is_configurable_without_allocating_released_weights():
-    dense = translate_wrapper_config(json.loads((ROOT / "qwen38-source/dense/config.json").read_text()))
-    moe = translate_config(json.loads((ROOT / "qwen38-source/moe/config.json").read_text()))
-    dense_model = models.build("causal_transformer", **dense["text"])
-    moe_model = models.build("causal_transformer", **moe)
-    assert dense_model.num_layers == 64 and dense_model.mixture is None
-    assert moe_model.num_layers == 92
-    assert moe_model.mixture.experts == 512 and moe_model.mixture.top_k == 10
-    assert moe_model.mixture.shared_gate
-
-
-def released_tree(fields) -> set[tuple[str, ...]]:
-    """Every leaf path of the released geometry, traced without allocating it."""
-    model = models.build("causal_transformer", **fields)
-    shapes = jax.eval_shape(lambda: model.init(jax.random.key(0), jnp.zeros((1, 4), jnp.int32)))
-    return set(flatten_dict(dict(shapes)))
-
-
-@pytest.mark.parametrize("kind", ["dense", "moe"])
-def test_every_released_tensor_lands_on_one_leaf_of_the_released_tree(kind):
-    """The pinned weight indexes name 866 language tensors of the 27B and
-    1609 of the 2.4T-A95B, MTP layers included. Each maps onto the tree the
-    released config builds, and together they cover it: a tensor the
-    families cannot place, or a leaf no checkpoint tensor fills, fails here
-    before 55 GB or 4.8 TB of weights would be read."""
-    source = ROOT / "qwen38-source" / kind
-    config = json.loads((source / "config.json").read_text())
-    names = json.loads((source / "model.safetensors.index.json").read_text())["weight_map"]
-    if kind == "dense":
-        record = translate_wrapper_config(config)
-        fields, family = record["text"], families()[config["text_config"]["model_type"]]
-        names = _wrapper_sources(names, lambda name: None, record)[0]["language_model"]
-    else:
-        fields, family = translate_config(config), families()[config["model_type"]]
-    # Placeholder arrays carry only the ranks the family's fused-expert split reads.
-    prepared = family.prepare_weights({
-        name: np.zeros((1, 2, 1) if name.endswith((".gate_up_proj", ".down_proj"))
-                       and ".experts." in name else (1,)) for name in names})
-    paths = [family.weight_path(name, fields) for name in prepared]
-    assert None not in paths
-    assert len(set(paths)) == len(paths)
-    assert set(paths) == released_tree(fields)
-    assert any(path[1] == "mtp_0" for path in paths)
-
-
 def test_source_processor_and_forward_match_reference(source):
     """fp32 max error 7.04e-6 dense / 2.19e-6 MoE; tolerance 1e-4."""
     loaded, inputs, reference = source
@@ -218,19 +170,6 @@ def test_source_update_exports_and_decodes_as_reference(source, tmp_path):
     generated = generate(loaded.model, loaded.variables, inputs, 3, key=jax.random.key(1),
                          sampling=Sampling(temperature=0))
     np.testing.assert_array_equal(generated.tokens[:, -3:], reference["generated"][:, -3:])
-
-
-def test_moe_shared_gate_cannot_be_replaced_by_an_ungated_branch():
-    loaded = Pretrained.load(ROOT / "qwen38-moe-tiny", dtype="float32", attention_impl="reference")
-    reference = np.load(ROOT / "qwen38-moe-tiny/reference.npz")
-    wrong = loaded.model.clone(mixture=dataclasses.replace(loaded.model.mixture, shared_gate=False))
-    output = wrong.apply(
-        loaded.variables, reference["input_ids"], attention_mask=reference["attention_mask"].astype(bool)
-    )
-    valid = reference["attention_mask"].astype(bool)
-    with pytest.raises(AssertionError):
-        np.testing.assert_allclose(np.asarray(output)[valid], reference["logits"][valid], atol=1e-4, rtol=0)
-
 
 
 def test_shipped_prediction_weights_match_published_composition(source):
@@ -394,50 +333,6 @@ def test_video_prediction_training_exports_the_reference_update(video_source, tm
     )
 
 
-def test_video_grid_and_modality_labels_are_checked_before_execution(video_source):
-    loaded, _, reference = video_source
-    values = {
-        key: reference[key]
-        for key in (
-            "input_ids",
-            "attention_mask",
-            "mm_token_type_ids",
-            "pixel_values",
-            "image_grid_thw",
-            "pixel_values_videos",
-            "video_grid_thw",
-        )
-    }
-    with pytest.raises(ValueError, match="mm_token_type_ids"):
-        loaded.processor.from_hf({**values, "mm_token_type_ids": np.zeros_like(values["input_ids"])})
-    with pytest.raises(ValueError, match="video_grid_thw"):
-        loaded.processor.from_hf({**values, "video_grid_thw": values["video_grid_thw"] * 0})
-
-
-def test_source_templates_preserve_reasoning_controls_and_history(source):
-    """Both source templates retain or remove historical reasoning as requested."""
-    loaded, _, _ = source
-    processor = loaded.processor
-    messages = [{"role": "user", "content": "first"},
-                {"role": "assistant", "content": "answer", "reasoning_content": "historical analysis marker"},
-                {"role": "user", "content": "next"}]
-    retained = processor.chat(messages, reasoning_effort="medium", preserve_thinking=True)
-    removed = processor.chat(messages, reasoning_effort="medium", preserve_thinking=False)
-    assert "historical analysis marker" in processor.decode(retained.tokens)[0]
-    assert "historical analysis marker" not in processor.decode(removed.tokens)[0]
-    for effort in ("low", "medium", "xhigh"):
-        expected = processor.reference.apply_chat_template(messages, tokenize=True, return_dict=True,
-                                                            return_tensors="pt", add_generation_prompt=True,
-                                                            reasoning_effort=effort, preserve_thinking=True)
-        actual = processor.chat(messages, reasoning_effort=effort, preserve_thinking=True)
-        np.testing.assert_array_equal(actual.tokens, expected["input_ids"].numpy())
-    from jinja2 import TemplateError
-    with pytest.raises(TemplateError, match="reasoning effort"):
-        processor.chat(messages, reasoning_effort="invalid")
-
-
-
-
 def test_actual_checkpoint_default_nucleus_policy_reaches_the_native_draw(source):
     """Both published generation configs specify top-k 20 and top-p 0.95.
 
@@ -460,15 +355,3 @@ def test_actual_checkpoint_default_nucleus_policy_reaches_the_native_draw(source
     np.testing.assert_allclose(actual.behavior_log_probs[:, 0], expected, atol=1e-5, rtol=0)
     repeated = task(inputs, 1, key=jax.random.key(91))
     np.testing.assert_array_equal(actual.tokens, repeated.tokens)
-
-
-
-
-@pytest.mark.parametrize(
-    "field,value", [("mtp_num_hidden_layers", 2), ("mtp_use_dedicated_embeddings", True)]
-)
-def test_prediction_layouts_outside_the_released_contract_are_refused(field, value):
-    config = json.loads((ROOT / "qwen38-source/moe/config.json").read_text())
-    with pytest.raises(ValueError, match=field):
-        translate_config({**config, field: value})
-

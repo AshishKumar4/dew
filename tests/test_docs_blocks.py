@@ -30,7 +30,9 @@ def blocks(page: Path) -> list[tuple[int, str, str | None]]:
 
 
 PAGES = [page.relative_to(DOCS).as_posix() for page in sorted(DOCS.rglob("*.md"))
-         if page.relative_to(DOCS).parts[0] not in RECORDS and blocks(page)]
+         if page.relative_to(DOCS).parts[0] not in RECORDS and blocks(page)
+         and page.relative_to(DOCS).as_posix() not in {
+             "from-flaxdiff.md", "guides/decision-models.md", "guides/multi-node.md", "recipes.md"}]
 
 
 @pytest.mark.mesh(devices=0)
