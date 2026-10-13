@@ -12,7 +12,7 @@ from dew.nn.attention import (
     open_kv_cache,
     scaled_dot_product_attention,
 )
-from dew.nn.inputs import AttentionMetadata
+from dew.nn.inputs import AttentionMetadata, coordinates
 from dew.nn.linear import GatedDeltaNet
 from dew.nn.mla import MultiHeadLatentAttention
 
@@ -72,7 +72,7 @@ def test_mixer_prefill_and_resume_follow_each_rows_real_tokens(kind):
     cache = module.apply(params, hidden[:, :1], decode=True, mutable=["cache"])[1]["cache"]
     apply = jax.jit(lambda state, x, valid: module.apply(
         {**params, "cache": state}, x, decode=True,
-        attention_metadata=AttentionMetadata(valid=valid), mutable=["cache"]))
+        attention_metadata=AttentionMetadata(coordinates=coordinates(valid=valid)), mutable=["cache"]))
     prefill = hidden[:, :3].at[0, :2].set(50.0)
     actual, mutated = apply(cache, prefill, jnp.array([[False, False, True], [True, True, True]]))
     histories = [hidden[0:1, 2:3], hidden[1:2, :3]]
