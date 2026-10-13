@@ -32,8 +32,6 @@ own autotuner lists for it (`_space`), mamba_ssm's pick at Nemotron 3's shapes o
 (`HEURISTICS`).
 """
 
-from __future__ import annotations
-
 import dataclasses
 import functools
 from typing import ClassVar
