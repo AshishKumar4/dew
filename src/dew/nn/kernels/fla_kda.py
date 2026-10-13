@@ -26,7 +26,6 @@ cumulated in base 2; gradients of q, k, the decay and beta accumulate in fp32.
 import dataclasses
 import functools
 import math
-from typing import ClassVar
 
 import jax
 import jax.numpy as jnp
@@ -42,7 +41,6 @@ from dew.nn.kernels.fla_gdn import (
     _chunk_of,
     _chunk_states,
     _dot,
-    _dtype,
     _flat,
     _gates,
     _Launch,
@@ -65,6 +63,9 @@ def _space(kernel: str, wide: bool) -> frozenset[Tiles]:
     wy_fast.py:247-256, gla/chunk.py:335-344, chunk_bwd.py:331), narrower value blocks where a GPU's
     block holds 99 KB."""
     return {
+        # fla autotunes BH over 1, 2, 4, 8 and warps over 1, 2, 4, 8 (chunk_intra_token_parallel.py:13-20).
+        "intra_diagonal": frozenset(Tiles(0, 0, warps, 1, bh) for bh in (1, 2, 4, 8)
+                                    for warps in (1, 2, 4, 8)),
         "intra_solve": _tiles([(32, 0), (64, 0)], (1, 2, 4), (1,)),
         "recompute_w_u": _tiles([(64, 64)], (2, 4), (2, 3, 4)),
         "chunk_fwd_o": _tiles([(32, 64), (64, 64)] + ([(32, 128), (64, 128)] if wide else []), (2, 4, 8),
@@ -76,6 +77,7 @@ def _space(kernel: str, wide: bool) -> frozenset[Tiles]:
 
 
 _A100 = {
+    "intra_diagonal": Tiles(0, 0, 4, 1, bh=4),
     # Measured on an A100-40GB at Kimi Linear's 1 x 4096 x 32 x 128 bf16: the solve 0.98 -> 0.80 ms,
     # the backward intra kernel 2.49 -> 1.98 ms, the output 0.25 -> 0.23 ms.
     "intra_solve": Tiles(32, 0, 1, 1),
@@ -100,15 +102,6 @@ class _KdaLaunch(_Launch):
 
     def space(self, wide: bool) -> frozenset[Tiles]:
         return _space(self.NAME, wide)
-
-
-@dataclasses.dataclass(frozen=True)
-class HeadTiles:
-    """The diagonal kernel's tiles: value heads a program, warps and stages."""
-
-    bh: int
-    warps: int
-    stages: int
 
 
 def _intra_diagonal_kernel(chunk_ref, q_ref, k_ref, g_ref, beta_ref, aqk_ref, akk_ref, *, chunk: int,
@@ -148,29 +141,18 @@ def _intra_diagonal_kernel(chunk_ref, q_ref, k_ref, g_ref, beta_ref, aqk_ref, ak
 class IntraDiagonal(_KdaLaunch):
     """`intra_diagonal`'s launch (tuning.KernelOp): its value heads a program, warps and stages."""
 
-    config_cls: ClassVar[type[HeadTiles]] = HeadTiles
     NAME = "intra_diagonal"
     KEYS, VALUES = "k", None
 
-    def _get_heuristics_config(self, ba) -> HeadTiles:
-        return self._heads(ba, HeadTiles(4, 4, 1))
-
-    def _get_autotuning_configs(self, ba) -> set[HeadTiles]:
-        if _dtype(ba.arguments["k"]) == "float32":
-            return {self._get_heuristics_config(ba)}
-        # fla autotunes BH over 1, 2, 4, 8 and warps over 1, 2, 4, 8 (chunk_intra_token_parallel.py:13-20).
-        return {self._heads(ba, HeadTiles(bh, warps, 1)) for bh in (1, 2, 4, 8) for warps in (1, 2, 4, 8)}
-
-    @staticmethod
-    def _heads(ba, tiles: HeadTiles) -> HeadTiles:
+    def _tiles(self, ba, tiles: Tiles) -> Tiles:
         """A block of value heads that divides them, one where value heads share a key head, as fla's
         ceil(HV / BH) grid masks its tail."""
         value_heads, key_heads = ba.arguments["beta"].shape[2], ba.arguments["k"].shape[2]
         bh = math.gcd(tiles.bh, value_heads) if value_heads == key_heads else 1
-        return HeadTiles(bh, tiles.warps, tiles.stages)
+        return dataclasses.replace(tiles, bh=bh)
 
     def _fwd(self, q: jax.Array, k: jax.Array, g: jax.Array, beta: jax.Array, chunk_spans: jax.Array,
-             sequence_spans: jax.Array, *, chunk: int, scale: float, interpret: bool, config: HeadTiles,
+             sequence_spans: jax.Array, *, chunk: int, scale: float, interpret: bool, config: Tiles,
              return_residuals: bool = False):
         from jax.experimental.pallas import triton as plgpu
 
