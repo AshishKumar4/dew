@@ -739,7 +739,10 @@ def mode_pool_refusals(args) -> dict:
     outcomes["latest"] = Checkpoints(str(Path(args.run_dir) / "saved")).latest
     if other:
         # A listing of the shared directory taken before step 2 was committed.
-        ocp.CheckpointManager.latest_step = lambda manager: 1
+        listing = type(ocp.step.standard_name_format())
+        listed = listing.find_all
+        listing.find_all = lambda name_format, base: (found for found in listed(name_format, base)
+                                                       if found.step != 2)
     resumed = Trainer(Regression(), optax.sgd(1e-2), key=jax.random.key(0), mesh=MeshSpec(),
                       checkpoints=Checkpoints(str(Path(args.run_dir) / "saved")))
     try:
