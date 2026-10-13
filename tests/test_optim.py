@@ -686,6 +686,35 @@ def test_every_optimizer_the_config_names_is_built():
     assert set(OPTIMIZER_MAP) == set(typing.get_args(Optimizer))
 
 
+@pytest.mark.parametrize("optimizer", ["adam", "adamw", "lamb", "muon", "muonclip"])
+@pytest.mark.parametrize("form", ["constant", "schedule", "groups"])
+def test_rates_of_one_schedule_lower_to_one_update(optimizer, form):
+    """Two runs at different rates of one schedule's shape, a group's
+    multiplier and its own schedule included, lower the same update: the
+    rate is an operand in the optimizer's state, not a constant in its
+    program. The updates still differ, by the rates."""
+    params = decoder_params()["params"]
+    grads = fixed_gradients(params)
+
+    def config(rate):
+        schedule = None if form == "constant" else Cosine(peak=rate, warmup_steps=2, end=rate / 10, init=rate / 4)
+        groups = () if form != "groups" else (
+            ParamGroup("kernels", ("*kernel",), learning_rate_multiplier=rate * 100,
+                       schedule=Linear(peak=rate * 2, warmup_steps=1, end=rate / 8)),
+            ParamGroup("rest", ("*",)))
+        return OptimConfig(optimizer=optimizer, learning_rate=rate, schedule=schedule, param_groups=groups)
+
+    programs, updates = [], []
+    for rate in (1e-3, 4e-3):
+        solver = config(rate).build(10)
+        state = solver.init(params)
+        programs.append(jax.jit(solver.update).lower(grads, state, params).as_text())
+        updates.append(solver.update(grads, state, params)[0])
+    assert programs[0] == programs[1]
+    assert any(not np.array_equal(left, right) for left, right in
+               zip(jax.tree.leaves(updates[0]), jax.tree.leaves(updates[1]), strict=True))
+
+
 @pytest.mark.parametrize(("optimizer", "schedule"), [
     ("lamb", Cosine(peak=1e-2, warmup_steps=2, end=1e-3, init=1e-4)),
     ("adam", Linear(peak=3e-3, warmup_steps=2, decay_start=3, end=1e-4)),
