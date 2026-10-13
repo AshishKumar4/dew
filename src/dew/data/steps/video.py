@@ -1,10 +1,9 @@
-"""Clip decoding and audio features as record transforms."""
+"""A clip's time window, drawn once, and its frames as record transforms."""
 
 from __future__ import annotations
 
 import contextlib
 import dataclasses
-import functools
 import tempfile
 from collections.abc import Iterator
 
@@ -13,85 +12,98 @@ import numpy as np
 
 from dew.data.dataset import Batch
 from dew.data.pipeline import Rejected
-from dew.data.processors import AutoAudioProcessor
 from dew.data.video import fit_frames
 
 
-@dataclasses.dataclass(frozen=True)
-class DecodeClip(grain.RandomMapTransform):
-    """`frames` consecutive frames at `fps` from a random start of the clip in
-    `field` (its bytes, or a local or remote path), each fitted into a `size`
-    square, under `to`; with `audio_padding`, the sound under them and
-    `audio_padding` frames either side as one row a frame under "audio", at
-    `sample_rate`. A clip that does not decode, is too short, or has no sound
-    where it is asked for is rejected."""
+@contextlib.contextmanager
+def local_file(value: bytes | str) -> Iterator[str]:
+    """A local file a decoder reads for a record's media `value`, its bytes or a local or remote path,
+    kept while the context is open."""
+    if isinstance(value, bytes):
+        with tempfile.NamedTemporaryFile() as file:
+            file.write(value)
+            file.flush()
+            yield file.name
+        return
+    path = str(value)
+    if "://" in path and not path.startswith("file://"):
+        from dew.data.storage import Store
 
-    frames: int = 16
-    size: int = 256
-    fps: float = 25.0
+        fs, target = Store(path if "::" in path else "dewcache::" + path).resolve()
+        with fs.open(target, "rb") as cached:
+            yield cached.name
+        return
+    yield path.removeprefix("file://")
+
+
+def window(element: Batch, clip: str) -> tuple[float, float]:
+    """The `(start, stop)` seconds of the window `pick_clip` wrote under `clip`."""
+    start, stop = np.asarray(element[clip], np.float64)
+    return float(start), float(stop)
+
+
+@dataclasses.dataclass(frozen=True)
+class PickClip(grain.RandomMapTransform):
+    """A window of `seconds` drawn from the record's rng within the media in `field` (a video or a sound
+    file, its bytes or a path), `margin` seconds clear of either end, written under `to` as float64
+    `[start, stop]` seconds for every decoder of the record to read; it stacks as any field does. Media
+    too short for the window, or that does not read, is rejected."""
+
+    seconds: float
+    margin: float = 0.0
     field: str = "mp4"
-    to: str = "video"
-    audio_padding: int | None = None
-    sample_rate: int = 16_000
+    to: str = "clip"
     rejects: bool = True
-    """Whether a clip that does not decode is dropped (`filter_map`) rather than an error."""
+    """Whether media that does not read or is too short is dropped (`filter_map`) rather than an error."""
 
     def random_map(self, element: Batch, rng: np.random.Generator) -> Batch | Rejected:
-        from dew.data.sources.av_utils import read_av_random_clip, read_random_frames
+        from dew.data.sources.av_utils import media_info
 
-        clip, seed = element[self.field], int(rng.integers(0, 2**32 - 1))
         try:
-            with self._local(clip) as path:
-                if self.audio_padding is None:
-                    frames, _ = read_random_frames(path, num_frames=self.frames, padding=0, seed=seed,
-                                                   fps=self.fps)
-                    sound = {}
-                else:
-                    frames, audio = read_av_random_clip(path, num_frames=self.frames,
-                                                        audio_padding=self.audio_padding, seed=seed,
-                                                        sample_rate=self.sample_rate, fps=self.fps)
-                    sound = {"audio": audio}
+            with local_file(element[self.field]) as path:
+                duration, _, _ = media_info(path)
         except (OSError, ValueError):
             if not self.rejects:
                 raise
             return Rejected("undecodable")
-        # The decoded frames replace the clip they came from.
-        kept = {key: value for key, value in element.items() if key != self.field}
-        return {**kept, self.to: fit_frames(frames, self.size), **sound}
-
-    @staticmethod
-    @contextlib.contextmanager
-    def _local(clip: bytes | str) -> Iterator[str]:
-        """A local file the decoder reads, kept while the context is open."""
-        if isinstance(clip, bytes):
-            with tempfile.NamedTemporaryFile() as file:
-                file.write(clip)
-                file.flush()
-                yield file.name
-            return
-        path = str(clip)
-        if "://" in path and not path.startswith("file://"):
-            from dew.data.storage import Store
-
-            fs, target = Store(path if "::" in path else "dewcache::" + path).resolve()
-            with fs.open(target, "rb") as cached:
-                yield cached.name
-            return
-        yield path.removeprefix("file://")
+        latest = duration - self.seconds - self.margin
+        # A nanosecond of slack: a clip that fits exactly, 0.48 - 0.32 - 0.08 seconds, is short by roundoff.
+        if latest < self.margin - 1e-9:
+            if not self.rejects:
+                raise ValueError(f"{duration}-second media holds no {self.seconds}-second clip {self.margin} "
+                                 "seconds clear of either end")
+            return Rejected("shorter than the clip")
+        start = float(rng.uniform(self.margin, max(latest, self.margin)))
+        return {**element, self.to: np.asarray([start, start + self.seconds])}
 
 
 @dataclasses.dataclass(frozen=True)
-class Audio(grain.MapTransform):
-    model: str = "facebook/wav2vec2-base-960h"
+class DecodeVideo(grain.MapTransform):
+    """`frames` frames at `fps` from the start of the window under `clip`, read from the video in
+    `field`, each fitted into a `size` square, under `to`. The frames must fit the window: one shorter
+    than `frames / fps` raises, as no record could pass. A clip that does not decode is rejected."""
 
-    @functools.cached_property
-    def processor(self) -> AutoAudioProcessor:
-        return AutoAudioProcessor(tensor_type="np", modelname=self.model)
+    frames: int = 16
+    fps: float = 25.0
+    size: int = 256
+    field: str = "mp4"
+    clip: str = "clip"
+    to: str = "video"
+    rejects: bool = True
+    """Whether a clip that does not decode is dropped (`filter_map`) rather than an error."""
 
-    def map(self, element: Batch) -> Batch:
-        audio = np.asarray(element["audio"])
-        features = self.processor(audio.reshape(-1))
-        return {
-            **element,
-            "audio": {**{key: value[0] for key, value in features.items()}, "full_audio": audio},
-        }
+    def map(self, element: Batch) -> Batch | Rejected:
+        from dew.data.sources.av_utils import read_frames
+
+        start, stop = window(element, self.clip)
+        if start + self.frames / self.fps > stop + 1e-9:
+            raise ValueError(f"{self.frames} frames at {self.fps} fps run past the {stop - start}-second "
+                             f"clip under {self.clip!r}; pick a longer clip or fewer frames")
+        try:
+            with local_file(element[self.field]) as path:
+                frames = read_frames(path, start, self.frames, self.fps)
+        except (OSError, ValueError):
+            if not self.rejects:
+                raise
+            return Rejected("undecodable")
+        return {**element, self.to: fit_frames(frames, self.size)}
