@@ -42,6 +42,7 @@ import jax.numpy as jnp
 from flax import linen as nn, struct
 
 from dew.diffusion.process import Denoiser
+from dew.diffusion.schedules import expand
 from dew.nn.precision import compensated_add
 
 Predict = Callable[[jax.Array, jax.Array], tuple[jax.Array, jax.Array]]
@@ -127,6 +128,14 @@ def _interval(interval) -> tuple[float, float]:
     return start, stop
 
 
+def guide(conditional: jax.Array, unconditional: jax.Array, scale) -> jax.Array:
+    """Classifier-free guidance's affine combination, unconditional + scale (conditional -
+    unconditional), of two predictions of one sample: `scale` one value, or one per row. Every
+    guidance here combines through it: the samplers' (CFG, CFG++, autoguidance's weaker model in
+    the unconditional's place) and the distillations' teacher targets."""
+    return unconditional + expand(scale, conditional) * (conditional - unconditional)
+
+
 @struct.dataclass
 class CFG:
     """Interval-limited classifier-free guidance.
@@ -164,7 +173,7 @@ class CFG:
     def _guided(self, denoise: Denoiser, scale: jax.Array) -> Predict:
         def guided(x, t):
             output, unconditional = denoise.raw_both(x, t)
-            combined = unconditional + scale * (output - unconditional)
+            combined = guide(output, unconditional, scale)
             if self.rescale:
                 axes = tuple(range(1, combined.ndim))
                 deviation = jnp.std(output, axis=axes, keepdims=True, ddof=1)
@@ -206,7 +215,7 @@ class CFGPlusPlus:
     def _guided(self, denoise: Denoiser, scale: jax.Array) -> Predict:
         def guided(x, t):
             output, unconditional = denoise.raw_both(x, t)
-            clean, _ = denoise.convert(x, t, unconditional + scale * (output - unconditional))
+            clean, _ = denoise.convert(x, t, guide(output, unconditional, scale))
             _, noise = denoise.convert(x, t, unconditional)
             return clean, noise
 
@@ -359,13 +368,13 @@ class Autoguidance:
                              "denoiser's variables")
         main = replace(denoise, unconditional=None,
                        params={name: tree for name, tree in denoise.params.items() if name != "guide"})
-        guide = replace(denoise, model=self.model, params=denoise.params["guide"], unconditional=None)
+        weaker = replace(denoise, model=self.model, params=denoise.params["guide"], unconditional=None)
         scales = _scales(self.scale, self.interval, steps)
 
         def guided(scale):
             def predict(x, t):
-                output, weak = main.raw(x, t), guide.raw(x, t)
-                return denoise.convert(x, t, weak + scale * (output - weak))
+                output, weak = main.raw(x, t), weaker.raw(x, t)
+                return denoise.convert(x, t, guide(output, weak, scale))
 
             return predict
 

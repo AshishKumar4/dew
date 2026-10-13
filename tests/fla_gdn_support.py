@@ -1,6 +1,7 @@
 """fla_gdn's test support: each kernel's math in XLA, per chunk, with the kernel's casts, and its declared
-configs as abstract calls for the compile test."""
+tiles as abstract calls for the compile test."""
 
+import dataclasses
 import functools
 from collections.abc import Callable, Iterator
 from typing import NamedTuple
@@ -8,7 +9,7 @@ from typing import NamedTuple
 import jax
 import jax.numpy as jnp
 
-from dew.nn.kernels import fla_gdn
+from dew.nn.kernels import fla_gdn, generation
 
 COMPILED_SHAPES = {
     "0.8b": {"batch": 8, "length": 3072, "key_heads": 16, "value_heads": 16,
@@ -63,16 +64,16 @@ def _case_call(kernel, config, shape, dtype, *, reverse=False):
 
 
 def kernel_cases(target: str) -> Iterator[KernelCase]:
-    """Each kernel at the config `target` runs it with (`fla_gdn.kernel_config`) for both dtypes at
-    each shape, and the reverse cumsum, for the compile test."""
-    for (name, dtype), table in fla_gdn.CONFIGS.items():
-        if name != target:
-            continue
-        for kernel in table:
+    """Each kernel at the tiles `target` runs it with unmeasured (`fla_gdn.HEURISTICS`) for both dtypes
+    at each shape, and the reverse cumsum, for the compile test."""
+    with generation.assumed(target):
+        wide = fla_gdn._wide()
+    for dtype in ("bfloat16", "float32"):
+        for kernel, tiles in fla_gdn.HEURISTICS[dtype, wide].items():
+            config = {field: value for field, value in dataclasses.asdict(tiles).items() if value}
             for shape_name, shape in COMPILED_SHAPES.items():
                 if shape["width"] > fla_gdn.WIDEST and dtype == "float32":
                     continue
-                config = fla_gdn.kernel_config(kernel, shape, dtype, target=target)
                 flags = "-".join(f"{key}{value}" for key, value in sorted(config.items()))
                 for reverse in ((False, True) if kernel == "chunk_local_cumsum" else (False,)):
                     name = f"{target}/{kernel}/{dtype}/{flags}/{shape_name}" + "/reverse" * reverse

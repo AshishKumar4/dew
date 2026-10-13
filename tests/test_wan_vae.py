@@ -149,7 +149,12 @@ def test_the_autoencoder_walks_in_chunks_and_holds_one_chunk(loaded):
     beyond the pixels it returns does not grow with the clip: from 3 latent
     frames to 17, XLA's temporaries grow by less than twice the added
     pixels (the scan's stacked frames and their join), where the one-pass
-    decode's grow by its activations, many times that."""
+    decode's grow by its activations: at least the full-resolution
+    activation its last convolution reads over the added frames, which the
+    one pass holds whole and a chunk never does. That much and no more is
+    certain on every backend; how many more activations XLA keeps live
+    depends on the convolution algorithms autotuning picks (an A100 under
+    load kept 8 such, CPU over 10)."""
     autoencoder, params, _, _ = loaded
     model = autoencoder.model
 
@@ -163,9 +168,12 @@ def test_the_autoencoder_walks_in_chunks_and_holds_one_chunk(loaded):
 
     chunked = {frames: temporaries(autoencoder._decode, frames) for frames in (3, 17)}
     one_pass = {frames: temporaries(whole, frames) for frames in (3, 17)}
-    added_pixels = 4 * (17 - 3) * 128 * 192 * 3 * 4
+    added_frames = 4 * (17 - 3) * 128 * 192
+    added_pixels = added_frames * 3 * 4
+    activation = added_frames * model.base * model.multipliers[0] * 4
+    assert 2 * added_pixels < activation, "the full-resolution width must exceed the bound it is set against"
     assert chunked[17] - chunked[3] < 2 * added_pixels, (chunked, one_pass)
-    assert one_pass[17] - one_pass[3] > 10 * added_pixels, (chunked, one_pass)
+    assert one_pass[17] - one_pass[3] > activation, (chunked, one_pass)
     latents = np.random.default_rng(0).standard_normal((1, 3, 4, 6, model.latent)).astype(np.float32)
     np.testing.assert_array_equal(np.asarray(autoencoder.decode_video(params, latents)),
                                   np.asarray(jax.jit(lambda p, z: chunked_decode(model, {"params": p}, z))(
