@@ -57,14 +57,17 @@ DEFAULT_MODEL = "openai/clip-vit-large-patch14"
 
 
 class CLIPTowerOutput(NamedTuple):
-    """What the reference returns from either tower: the whole sequence, and
-    the pooled row.
+    """What the reference returns from either tower: the whole sequence, the
+    pooled row, and for the text tower `hidden_states`, the embeddings and
+    each layer's output before the final norm (`output_hidden_states=True`),
+    of which SDXL's and SD3's pipelines read the one before the last layer.
 
     The names are the reference's, because the conditioning encoder reads
     `last_hidden_state` off whatever model it holds.
     """
     last_hidden_state: jax.Array
     pooler_output: jax.Array
+    hidden_states: tuple[jax.Array, ...] = ()
 
 
 TOWER_ACTIVATIONS = {"quick_gelu": "quick_gelu", "gelu_pytorch_tanh": "gelu", "gelu": "gelu_exact"}
@@ -165,8 +168,10 @@ class CLIPTextTransformer(nn.Module):
                          + self.position_embedding(jnp.arange(length)))
         metadata = None if attention_mask is None else AttentionMetadata(
             valid=jnp.asarray(attention_mask) != 0)
+        states = [hidden_states]
         for layer in self.layers:
             hidden_states = layer(hidden_states, attention_metadata=metadata)
+            states.append(hidden_states)
         hidden_states = self.final_layer_norm(hidden_states)
 
         if self.eos_token_id == 2:
@@ -178,8 +183,7 @@ class CLIPTextTransformer(nn.Module):
             index = jnp.argmax(input_ids, axis=-1)
         else:
             index = jnp.argmax(input_ids == self.eos_token_id, axis=-1)
-        return CLIPTowerOutput(hidden_states,
-                               hidden_states[jnp.arange(batch), index])
+        return CLIPTowerOutput(hidden_states, hidden_states[jnp.arange(batch), index], tuple(states))
 
 
 @logical_axes({("patch_embedding",): (None, None, None, "embed"), ("position_embedding",): (None, "embed")})
