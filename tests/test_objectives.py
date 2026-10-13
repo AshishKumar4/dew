@@ -314,8 +314,8 @@ def test_a_supplied_rule_is_computed_only_where_something_differentiates():
 
 def test_a_loss_mean_is_as_exact_as_numpys_float32_mean():
     """Each of 64 rows' mean over 6144 squares, a small JEPA loss's count, within the float64 gate:
-    one reduction over every element left such a mean a float32 ulp from float64, several times
-    numpy's distance, and the gate refused the JEPA loss on some weights. The batch's mean holds too."""
+    one reduction over every element left such a sum a float32 step from the correctly rounded one,
+    and the JEPA loss a float32 ulp from float64 on some weights, several times numpy's distance."""
     from reference_error import assert_as_exact_as_the_reference
 
     squares = np.square(np.random.default_rng(0).normal(1.2, 1.0, size=(64, 6144))).astype(np.float32)
@@ -323,9 +323,11 @@ def test_a_loss_mean_is_as_exact_as_numpys_float32_mean():
     rows = np.asarray(ratio.total / ratio.mass)
     assert_as_exact_as_the_reference(rows, squares.mean(axis=1), squares.astype(np.float64).mean(axis=1),
                                      "row means")
-    whole = Objective.row_mean(jnp.asarray(squares), {})
-    assert_as_exact_as_the_reference(np.asarray([whole.total / whole.mass]), np.asarray([squares.mean()]),
-                                     np.asarray([squares.astype(np.float64).mean()]), "batch mean")
+    # Each row's sum is the correctly rounded one, and its derivative is the plain sum's, ones.
+    correct = squares.astype(np.float64).sum(axis=1).astype(np.float32)
+    np.testing.assert_array_equal(np.asarray(ratio.total), correct)
+    gradient = jax.grad(lambda x: Objective.row_mean(x, {}).total)(jnp.asarray(squares))
+    np.testing.assert_array_equal(np.asarray(gradient), np.ones_like(squares))
 
 
 def test_row_weights_count_the_real_rows_of_a_pass_and_every_row_of_training():
