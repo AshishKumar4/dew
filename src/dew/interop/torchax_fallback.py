@@ -314,6 +314,8 @@ def load(name_or_dir: str | Path, directory: Path, revision: str | None, *, dtyp
     except ImportError as error:
         raise ImportError(f"fallback='torchax' needs torch, torchax and transformers: {INSTALL}") from error
     directory = sources.snapshot(str(name_or_dir), revision)
+    # Before transformers, whose reader fails on a malformed file without naming it.
+    generation_config = read_generation_config(directory)
     storage = "auto" if param_dtype == AUTO else getattr(torch, param_dtype)
     model = AutoModelForCausalLM.from_pretrained(str(directory), dtype=storage, local_files_only=True)
     model.eval()
@@ -340,7 +342,6 @@ def load(name_or_dir: str | Path, directory: Path, revision: str | None, *, dtyp
     module = TorchCausalLM(graph, vocab, dtype=resolve_dtype(dtype))
     source = str(name_or_dir) if revision is None else f"{name_or_dir}@{revision}"
     processor = source_processor(directory, config, config, module, source=source)
-    generation_config = read_generation_config(directory)
     versions = {name: importlib.metadata.version(name) for name in ("transformers", "torchax", "torch")}
     warnings.warn(
         f"{name_or_dir} loads as tier 3 (fallback='torchax'): transformers {versions['transformers']}'s "
