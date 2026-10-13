@@ -164,7 +164,8 @@ def _preferred_read(compiled: Callable[[Read], Sequence[Pipeline]], *, provision
             chosen.append("memory")
         else:
             indexed = source.supports("indexed") or (
-                not source.supports("streamed") and _provisioner(source, "indexed") is not None
+                not source.supports("streamed") and _provisioner(source, "streamed") is None
+                and _provisioner(source, "indexed") is not None
             )
             chosen.append("indexed" if indexed else "streamed")
     preferred = READS.index(max(chosen, key=READS.index))
@@ -594,14 +595,12 @@ def _checked(
         if isinstance(stage, Workers):
             if workers:
                 raise ValueError(f"pipeline {name} contains workers more than once")
-            if host:
-                raise ValueError(f"workers in {name} must precede map_batch")
             workers = True
         if isinstance(stage, MapBatch):
             if not batched:
                 raise ValueError(f"map_batch in {name} must follow batch")
             host = True
-        elif host:
+        elif host and not isinstance(stage, (Workers, Prefetch)):
             raise ValueError(f"{type(stage).__name__} in {name} follows the host map_batch stage")
         prefix.append(stage)
     return per_share
