@@ -27,7 +27,7 @@ from flax.traverse_util import unflatten_dict
 from jax.typing import DTypeLike
 
 from dew import records
-from dew._model_types import QWEN35_TEXT_TYPES, QWEN35_TYPES
+from dew._model_types import QWEN35_TYPES
 from dew.coordination import agreed
 from dew.diffusion.process import Process
 from dew.diffusion.schedules.source import SourceSchedule
@@ -1204,18 +1204,13 @@ def _wrapper_source(config: Mapping[str, object], tensors: Mapping[str, np.ndarr
     """A multimodal wrapper: the decoder under its text_config and the towers beside it."""
     record = decoders.translate_wrapper_config(config)
     text_fields = _wrapper_text_fields(config, record, max_seq_len)
-    # The Transformers conditional classes ignore auxiliary prediction
-    # layers. A released config advertises a depth even when its checkpoint
-    # contains only the trunk; a source with mtp.* retains its actual depth.
-    if (record['text_model_type'] in QWEN35_TEXT_TYPES
-            and not any(name.startswith(('mtp.', 'model.mtp.')) for name in tensors)):
-        text_fields['num_nextn_predict_layers'] = 0
-        record['text']['num_nextn_predict_layers'] = 0
+    parts = decoders.translate_wrapper_weights(tensors, record, param_dtype=param_dtype, lazy=lazy)
+    for fields in (text_fields, record['text']):
+        decoders.held_depths(fields, parts["language_model"]["params"])
     text = NativeFields(CausalTransformer, {**text_fields, "dtype": dtype, "attention_impl": attention_impl})
     wrapper: decoder_parts.WrapperFields = {**record, "text": text}
     language_model = from_record(CausalTransformer, wrapper["text"])
     model = _wrapper_model(config, record, language_model, dtype=dtype)
-    parts = decoders.translate_wrapper_weights(tensors, record, param_dtype=param_dtype, lazy=lazy)
     variables = native_variables({**parts, "language_model": decoders.with_constants(
         parts["language_model"], record["text"], directory)})
     layouts, retained = _wrapper_layouts(tensors, record, variables)
@@ -1254,10 +1249,11 @@ def _decoder_source(config: Mapping[str, object], tensors: Mapping[str, np.ndarr
         family = verified.family
     if max_seq_len is not None:
         record["max_seq_len"] = max_seq_len
-    built = {**record, "dtype": dtype, "attention_impl": attention_impl}
-    model = from_record(CausalTransformer, built)
     variables = decoders.with_constants(decoders.translate_weights(
         tensors, record, family, param_dtype=param_dtype, lazy=lazy), record, directory)
+    decoders.held_depths(record, variables["params"])
+    built = {**record, "dtype": dtype, "attention_impl": attention_impl}
+    model = from_record(CausalTransformer, built)
     decoder_parts.check_decoder_tree(variables, model)
     # The bindings are what an adapter loader resolves source names through
     # and what a quantized source is written back through, so a

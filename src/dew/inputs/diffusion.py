@@ -204,12 +204,16 @@ class DiffusionConditioner(ConditionEncoder[str | Mapping[str, object]]):
     def from_pretrained(cls, checkpoint: str, *, dtype: str | None = "bfloat16",
                         param_dtype: str = "float32", revision: str | None = None,
                         attention_impl: str = "auto", params: Variables | None = None,
-                        mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None):
+                        mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None,
+                        height: int | None = None, width: int | None = None):
+        """The pipeline's conditioning; `height` and `width` replace the image size its
+        time ids state, which is the size the pipeline renders unless a load gave another."""
         from dew.interop.pipeline_assembly import load_diffusion_conditioner
 
         return load_diffusion_conditioner(checkpoint, cls, dtype=dtype, param_dtype=param_dtype,
                                           revision=revision, attention_impl=attention_impl, params=params,
-                                          mesh=mesh, layout=layout)
+                                          mesh=mesh, layout=layout,
+                                          size=None if height is None or width is None else (height, width))
 
     @property
     def stacked(self) -> bool:
@@ -358,7 +362,7 @@ class DiffusionConditioner(ConditionEncoder[str | Mapping[str, object]]):
 
     def to_json(self):
         return {"checkpoint": self.checkpoint, "dtype": dtype_name(self.towers[0].dtype),
-                "param_dtype": self.param_dtype}
+                "param_dtype": self.param_dtype, "height": self.height, "width": self.width}
 
     def save_assets(self, destination: Path) -> None:
         """Write into `destination` the tokenizer files an exported directory keeps beside the weights."""
@@ -446,8 +450,6 @@ class QwenImageConditioner(_LanguageText):
     the template's closing turn would go with it.
     """
 
-    height: int
-    width: int
     drop: int = field(init=False)
     """The system turn's token count, which the pipeline derives the same way."""
 
@@ -514,8 +516,6 @@ class HiddenStatesConditioner(_LanguageText):
     cut, since the template's closing turn would go with it.
     """
 
-    height: int
-    width: int
     template: Literal["mistral3", "qwen3"]
     layers: tuple[int, ...]
     thinking: bool = False

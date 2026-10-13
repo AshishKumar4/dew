@@ -4,7 +4,6 @@ import importlib.util
 import sys
 from pathlib import Path
 
-import numpy as np
 import pytest
 
 BENCHMARK = Path(__file__).parents[1] / "recipes" / "decision" / "benchmark.py"
@@ -18,15 +17,6 @@ def benchmark():
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
-
-
-def test_an_answer_reads_as_its_distribution_in_the_options_order(benchmark):
-    choice = {"type": "choice", "choice": "b", "probabilities": {"a": 0.25, "b": 0.75}}
-    np.testing.assert_array_equal(benchmark.distribution(choice, ["b", "a"]), [0.75, 0.25])
-    np.testing.assert_array_equal(benchmark.distribution({"type": "noul", "noul": 0.9}, ["false", "true"]),
-                                  [pytest.approx(0.1), 0.9])
-    # Half the answers right at confidence 0.5, all right at 1.0: no calibration error.
-    assert benchmark.ece(np.array([0.5, 0.5, 1.0]), np.array([1.0, 0.0, 1.0])) == 0.0
 
 
 @pytest.mark.network

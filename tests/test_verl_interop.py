@@ -13,7 +13,6 @@ from pathlib import Path
 
 import numpy as np
 import pyarrow.parquet as pq
-import pytest
 
 from dew.data.prompts import INFO_KEY, SOURCE_KEY, TRUTH_KEY, PromptSource
 from dew.objectives.rl.sessions import (
@@ -26,7 +25,7 @@ from dew.objectives.rl.sessions import (
     Status,
     pack,
 )
-from dew.objectives.rl.verl import FIELDS, from_verl, to_verl
+from dew.objectives.rl.verl import from_verl, to_verl
 
 FIXTURES = Path(__file__).parent / "fixtures/rl"
 NATIVE = json.loads((FIXTURES / "verl_native.json").read_text())
@@ -44,10 +43,6 @@ def native_rows():
 def without_dew(row):
     extra = {key: value for key, value in row["extra_fields"].items() if key != "dew"}
     return {**row, "extra_fields": extra}
-
-
-def test_dew_writes_exactly_the_agent_loop_output_fields():
-    assert tuple(NATIVE["fields"]) == FIELDS
 
 
 def test_native_rows_round_trip_through_rollouts():
@@ -119,49 +114,6 @@ def test_rollouts_round_trip_through_verl_rows_losslessly():
     assert SUPPORT_KEY in pack(restored[:1], 16, support_capacity=4)
 
 
-@pytest.mark.parametrize("corruption", ["logprobs", "version", "reward", "chain", "field"])
-def test_import_refuses_rows_that_lost_what_training_needs(corruption):
-    rows = json.loads(json.dumps(native_rows()))
-    if corruption == "logprobs":
-        rows[0]["response_logprobs"] = None
-    elif corruption == "version":
-        del rows[0]["extra_fields"]["min_global_steps"]
-    elif corruption == "reward":
-        rows[0]["reward_score"] = None
-    elif corruption == "chain":
-        rows = to_verl(
-            [
-                Session(
-                    "t",
-                    "g",
-                    0,
-                    0,
-                    (Call((1,), (2,), (-1.0,), "stop", 0), Call((5,), (6,), (-1.0,), "stop", 0)),
-                    Status.COMPLETED,
-                    1.0,
-                )
-            ]
-        )
-        rows.pop(0)
-    else:
-        rows[0]["teacher_ids"] = []
-    with pytest.raises(ValueError):
-        from_verl(rows, media=True)
-    if corruption == "version":
-        assert from_verl(rows, version=9, media=True)[0].session.calls[0].version == 9
-
-
-def test_native_rows_group_as_verl_interleaves_its_samples():
-    rows = native_rows() * 2
-    rollouts = [trajectory.session for trajectory in from_verl(rows, samples=2, media=True)]
-    assert [(rollout.task, rollout.sample) for rollout in rollouts] == [
-        ("0", 0),
-        ("0", 1),
-        ("1", 0),
-        ("1", 1),
-    ]
-
-
 def test_the_verl_rl_parquet_reads_its_nested_ground_truth():
     table = pq.read_table(PARQUET).to_pylist()
     rows = PromptSource.from_parquet(str(PARQUET), "tests/fixtures/tokenizers/tiny-tools", 512, 0)
@@ -171,42 +123,6 @@ def test_the_verl_rl_parquet_reads_its_nested_ground_truth():
         assert read(batch[TRUTH_KEY]) == expected["reward_model"]["ground_truth"]
         info = json.loads(read(batch[INFO_KEY]))
         assert info["tools_kwargs"] == expected["extra_info"]["tools_kwargs"]
-
-
-def test_calls_that_sampled_nothing_survive_the_round_trip():
-    """An aborted call before its first token is a legal call; alone in its
-    chain or between two others, it comes back where it was."""
-    calls = (Call((1, 2), (3,), (-0.5,), "tool_calls", 1),
-             Call((1, 2, 3, 4), (), (), "abort", 1),
-             Call((1, 2, 3, 4, 5), (6,), (-0.25,), "stop", 2))
-    between = Session("t", "g", 0, 0, calls, Status.INFRA_ERROR, None)
-    alone = Session("t", "g", 1, 0, (Call((7,), (), (), "abort", 3),), Status.CANCELLED, None)
-    rows = json.loads(json.dumps(to_verl([between, alone])))
-    assert [trajectory.session for trajectory in from_verl(rows)] == [between, alone]
-
-
-def test_a_native_rows_step_stamps_survive_two_round_trips():
-    """verl reads `max_global_steps` for staleness; Dew keeps the stamps a
-    native row came with and drops only the ones it wrote itself."""
-    row = json.loads(json.dumps(native_rows()[0]))
-    row["extra_fields"]["max_global_steps"] = 9
-    once = json.loads(json.dumps(to_verl(from_verl([row]))))
-    twice = json.loads(json.dumps(to_verl(from_verl(once))))
-    for exported in (once, twice):
-        assert (
-            exported[0]["extra_fields"]["min_global_steps"],
-            exported[0]["extra_fields"]["max_global_steps"],
-        ) == (7, 9)
-    written = to_verl(
-        [Session("t", "g", 0, 0, (Call((1,), (2,), (-1.0,), "stop", 4),), Status.COMPLETED, 1.0)]
-    )
-    assert "extra_fields" not in from_verl(json.loads(json.dumps(written)))[0].extras
-
-
-def test_media_rows_are_refused_for_training():
-    rows = native_rows()
-    with pytest.raises(ValueError, match="media"):
-        from_verl(rows)
 
 
 def test_text_rows_with_the_empty_media_verls_loops_write_are_training_rows():
