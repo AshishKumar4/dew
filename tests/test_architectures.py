@@ -22,6 +22,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from flax import linen as nn
 from recording import RecordingTracker
 from reference_error import assert_leaves_as_exact
 
@@ -32,6 +33,7 @@ from dew.diffusion import presets
 from dew.inputs import Condition, ConditionEncoder, Field, InputSpec
 from dew.nn.attention import Stage
 from dew.nn.dit import TextContext
+from dew.objectives.base import Step
 from dew.objectives.diffusion import DiffusionObjective, DiffusionRunConfig
 from dew.objectives.jepa import JepaObjective, MultiBlockMask
 from dew.objectives.lm import LMObjective
@@ -334,7 +336,8 @@ def make_objective(case: Case, model, encoder):
                               guidance=CFG(2.0), solver=Euler())
 
 
-LINEAR = optax.sgd(1e-2, momentum=0.9)
+LEARNING_RATE, MOMENTUM = 1e-2, 0.9
+LINEAR = optax.sgd(LEARNING_RATE, momentum=MOMENTUM)
 """The optimizer the layouts are compared under: SGD with momentum moves the
 parameters and the momentum by each gradient linearly, so a layout's state
 differs from one device's by its gradients' rounding alone. Adam divides by
@@ -428,6 +431,76 @@ def truth(case: Case, tmp_path, initial):
     return trainer.fit(Data(), steps=2, state=wider)
 
 
+def decay_terms(objective, variables, batch, index: int) -> dict[tuple[str, ...], np.ndarray]:
+    """Each gated delta net layer's `A_log` gradient as its terms summed
+    absolutely, by head, in float64: the decay g = -exp(A_log) softplus(z),
+    z = a + dt_bias, enters the rule at every row and position, so the
+    gradient sums dL/dg g there, which is dL/da softplus(z) / sigmoid(z)
+    read through the `a` projection. Keyed by the layer's module path."""
+    step = Step(step=jnp.asarray(index), key=jax.random.key(0), ema=None)
+    values: dict[tuple[str, ...], jax.Array] = {}
+
+    def loss(offsets, record=None):
+        def project(next_fun, args, kwargs, context):
+            value = next_fun(*args, **kwargs)
+            path = context.module.scope.path
+            if context.method_name == "__call__" and path[-1:] == ("in_proj_a",):
+                if record is not None:
+                    record[path[:-1]] = value
+                return value + offsets.get(path[:-1], 0)
+            return value
+
+        with nn.intercept_methods(project):
+            return objective.scalar_loss(variables, batch, step)[0]
+
+    loss({}, values)
+    cotangents = jax.grad(loss)({path: jnp.zeros_like(value) for path, value in values.items()})
+    terms = {}
+    for path, cotangent in cotangents.items():
+        layer = variables["params"]
+        for part in path:
+            layer = layer[part]
+        z = values[path] + layer["dt_bias"]
+        term = cotangent * jax.nn.softplus(z) / jax.nn.sigmoid(z)
+        terms[path] = np.sum(np.abs(np.asarray(term)), axis=(0, 1))
+    return terms
+
+
+def decay_invariants(case: Case, tmp_path, initial, exact) -> dict[str, dict[str, float]]:
+    """`assert_leaves_as_exact`'s invariants for each gated delta net
+    `A_log` of a language model's two SGD steps, by state tree: the leaf moves
+    by -lr ((1 + momentum) g1 + g2) and the momentum holds momentum g1 + g2,
+    so their terms are those of the two steps' gradients (`decay_terms`),
+    measured in float64 at the parameters each step reads."""
+    if not case.is_lm:
+        return {}
+    trainer, _ = make_trainer(case, tmp_path / "terms", 1, devices=1)
+    batch = {"text": jnp.asarray(next(batches(case, None)())["text"])}
+    with jax.enable_x64(new_val=True):
+        wide = jax.tree.map(lambda leaf: leaf.astype(jnp.float64) if jnp.issubdtype(leaf.dtype, jnp.floating)
+                            else leaf, initial.variables)
+        first = decay_terms(trainer.objective, wide, batch, 0)
+        if not first:
+            return {}
+        step = Step(step=jnp.asarray(0), key=jax.random.key(0), ema=None)
+        gradient = jax.grad(lambda params: trainer.objective.scalar_loss(
+            {**wide, "params": params}, batch, step)[0])(wide["params"])
+        moved = {**wide, "params": jax.tree.map(lambda leaf, step: leaf - LEARNING_RATE * step,
+                                                wide["params"], gradient)}
+        second = decay_terms(trainer.objective, moved, batch, 1)
+    scales = {"variables": {path: LEARNING_RATE * ((1 + MOMENTUM) * first[path] + second[path])
+                            for path in first},
+              "opt_state": {path: MOMENTUM * first[path] + second[path] for path in first}}
+    declared = {}
+    for name, by_path in scales.items():
+        for key, _ in jax.tree_util.tree_leaves_with_path(getattr(exact, name)):
+            text = jax.tree_util.keystr(key)
+            for path, scale in by_path.items():
+                if text.endswith("".join(f"['{part}']" for part in (*path, "A_log"))):
+                    declared.setdefault(name, {})[text] = float(np.sqrt(np.mean(scale ** 2)))
+    return declared
+
+
 @pytest.mark.parametrize("case", CASES, ids=IDS)
 def test_architecture_trains_on_every_layout_as_on_one_device(case, tmp_path):
     """One device, 8x1 data parallelism (every parameter replicated, the
@@ -470,10 +543,12 @@ def test_architecture_trains_on_every_layout_as_on_one_device(case, tmp_path):
     adam = make_trainer(case, tmp_path / "adam", 4, optimizer=optax.adam(1e-3))[0].place()[0].opt_state[0]
     for moment in (adam.mu, adam.nu):
         assert param_specs == [leaf.sharding.spec for leaf in jax.tree.leaves(moment)]
+    invariants = decay_invariants(case, tmp_path, initial, exact)
     for layout in (replicated, state):
         for name in ("variables", "opt_state", "ema"):
             assert_leaves_as_exact(*jax.device_get((getattr(layout, name), getattr(alone, name))),
-                                   getattr(exact, name), reductions=reductions)
+                                   getattr(exact, name), reductions=reductions,
+                                   invariants=invariants.get(name))
 
 
 # --------------------------------------------------------------------------
