@@ -12,6 +12,8 @@ sampler runs in test_lm_recipe.
 """
 
 
+import re
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -713,3 +715,40 @@ def test_router_z_loss_adds_each_routers_mean_squared_log_partition():
         expected += 0.3 * float(jnp.mean(jnp.square(jax.nn.logsumexp(logits, -1))))
     np.testing.assert_allclose(float(total - base), expected, rtol=1e-5)
     np.testing.assert_allclose(float(aux.metrics["router_z_loss"]), expected, rtol=1e-5)
+
+
+def test_a_training_steps_head_contracts_the_vocabulary_three_times_and_matches_the_tiled_head():
+    """A training step's loss takes its head's gradient in the forward
+    (`fused_head_loss`): beside blocks recomputed in the backward, the step
+    contracts the vocabulary three times, the logits, the states' gradient and
+    the head's, none again, and its loss and gradients are the per-token
+    head's, z-loss and padding included."""
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    vocab = 61
+    model = CausalTransformer(vocab_size=vocab, emb_features=24, num_layers=2, num_heads=2, mlp_features=32,
+                              max_seq_len=8, tie_embeddings=False, remat="full", qk_norm=False,
+                              attention_impl="reference")
+    tokens = jax.random.randint(jax.random.key(1), (2, 9), 0, vocab).at[1, 6:].set(0)
+    fused = LMObjective(model, 8, ema_decay=None, z_loss=1e-3, pad_id=0)
+    params = fused.init(jax.random.key(0))
+
+    def loss(objective, *, training):
+        step = Step(jnp.asarray(0), jax.random.key(1), None, training=training)
+
+        def scalar(params):
+            stats, _ = objective.loss(params, {TEXT_KEY: tokens}, step)
+            return objective.reduce_loss(stats)[0]
+        return scalar
+
+    program = jax.jit(jax.grad(loss(fused, training=True))).lower(params).compile().as_text()
+    # A product that writes or reads a vocabulary-sized array: [.., vocab, ..] beside dot( or convolution(.
+    sized = rf"\[[^\]]*\b{vocab}\b[^\]]*\]"
+    contractions = [line for line in program.splitlines()
+                    if re.search(rf"= \w+{sized}\S* (dot|convolution)\(", line)
+                    or re.search(rf" (dot|convolution)\(.*\w+{sized}", line)]
+    assert len(contractions) == 3, contractions
+    with jax.default_matmul_precision("highest"):
+        mine = jax.value_and_grad(loss(fused, training=True))(params)
+        theirs = jax.value_and_grad(loss(fused, training=False))(params)
+    for left, right in zip(jax.tree.leaves(mine), jax.tree.leaves(theirs), strict=True):
+        np.testing.assert_allclose(left, right, rtol=2e-5, atol=2e-6)
