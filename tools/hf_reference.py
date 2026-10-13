@@ -589,7 +589,6 @@ def write_nemotron_h(*, moe: bool = False, latent: bool = False) -> None:
     expert; the latent case leaves top-k weights unnormalized.
     """
     from diffusers_wan_reference import float64
-    from unittest.mock import patch
     import transformers
 
     torch.manual_seed(0)
@@ -614,13 +613,7 @@ def write_nemotron_h(*, moe: bool = False, latent: bool = False) -> None:
     write_tiny(name, model, seed=2024)
     directory = FIXTURES / name
     ids = torch.from_numpy(np.load(directory / "input_ids.npy")).long()
-    type_ = torch.Tensor.type
-
-    def wide_type(tensor, dtype=None, **kwargs):
-        # Nemotron's router pins .type(torch.float32), beyond the shared cast widener.
-        return type_(tensor, torch.float64 if dtype == torch.float32 else dtype, **kwargs)
-
-    with float64(), patch.object(torch.Tensor, "type", wide_type), torch.no_grad():
+    with float64(), torch.no_grad():
         truth = model.double()(input_ids=ids, use_cache=False).logits.double().numpy()
     np.save(directory / "logits_f64.npy", truth)
     (directory / "source.json").write_text(json.dumps({

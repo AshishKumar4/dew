@@ -31,6 +31,8 @@ from dew.interop.decoder_parts import (
     Ropes,
     base_config,
     dew_path,
+    layer_depth_path,
+    prediction_path,
     read_rope_theta,
     record_float,
     record_int,
@@ -342,12 +344,12 @@ def deepseek_config(hf_config: Mapping[str, object], used: set[str], *,
             'index_head_dim': records.integer(hf_config['index_head_dim'], 'index_head_dim'),
         }
         used.update(('index_topk', 'index_n_heads', 'index_head_dim'))
-    # The released checkpoints ship no mtp.* weights (91991 tensors on
-    # DeepSeek-V3 and 92425 on V3.2-Exp, none of them MTP) and
-    # transformers builds no MTP module, so the field describes nothing
-    # the weights hold and the base model is what loads. Weight
-    # translation raises on mtp.* tensors, so a checkpoint that ships them
-    # fails at load.
+    # The released checkpoints ship the prediction depth as the layer past
+    # the trunk, model.layers.61.* (1564 of DeepSeek-V3's 91991 tensors,
+    # 1571 of V3.2-Exp's 92425): `layer_depth_path` reads it. transformers
+    # builds no MTP module and saves the trunk alone, and a model builds
+    # the depths its weights hold (`dew.interop.pretrained`).
+    config['num_nextn_predict_layers'] = record_int(hf_config, 'num_nextn_predict_layers', 0)
     # The fp8 scales name the stored dtype. dew loads the dequantized
     # weights, and the reader names an unreadable dtype where it meets one.
     # ep_size is a runtime parallel hint.
@@ -623,10 +625,9 @@ def _v4_rope(entry: Mapping[str, object], field: str, head_dim: int, width: int,
     The entry's own `partial_rotary_factor` sizes its table, and so the
     slice the layers on it rotate (modeling_deepseek_v4.py:131-134); one
     naming another width than the model's has no counterpart in a mixer
-    that rotates one. A YaRN entry changes the frequencies alone here, so
-    an `attention_factor` other than the 1.0 V4's own configs force
-    refuses: the reference multiplies its cos and sin by it (:151-152),
-    and an entry that names none derives a factor that does.
+    that rotates one. A YaRN entry's `attention_factor` scales cos and sin
+    (:151-152): the flat spelling's 1.0 leaves them alone, and a nested
+    entry that names none derives YaRN's own.
     """
     fraction = record_float(entry, 'partial_rotary_factor', 1.0)
     if int(head_dim * fraction) != width:
@@ -643,10 +644,6 @@ def _v4_rope(entry: Mapping[str, object], field: str, head_dim: int, width: int,
     if rope_type != 'yarn':
         refuse(f"{field} rope_type {rope_type!r}",
                 "the mixer applies plain or YaRN rotary positions")
-    if entry.get('attention_factor') != 1.0:
-        refuse(f"{field} attention_factor {entry.get('attention_factor')!r}",
-                "V4's rotary scales its cos and sin by this factor, and its "
-                "own configs set the 1.0 that leaves them alone")
     ramp = {key: value for key, value in entry.items()
             if key != 'partial_rotary_factor'}
     ramp.setdefault('original_max_position_embeddings', max_pos)
@@ -989,6 +986,15 @@ _V4_DSPARK_LEAVES: dict[str, tuple[str, ...]] = {
     'hc_head_scale': ('hc_head', 'hc_scale')}
 
 
+# A V4 prediction depth's own leaves under `mtp.{depth}.`, beside its block
+# (official inference/model.py, MTPBlock).
+_V4_PREDICTION_LEAVES: dict[str, tuple[str, ...]] = {
+    'norm.weight': ('final_norm', 'scale'),
+    **{f'{norm}.weight': (norm, 'scale') for norm in ('enorm', 'hnorm')},
+    **{f'{proj}.weight': (proj, 'kernel') for proj in ('e_proj', 'h_proj')},
+    **{f'hc_head_{leaf}': ('hc_head', f'hc_{leaf}') for leaf in ('fn', 'base', 'scale')}}
+
+
 def dspark_path(name: str, config: Mapping[str, object], leaves: Mapping[str, tuple[str, ...]],
                  layer_path: Callable[[str, Mapping[str, object]], tuple[str, ...] | None]
                  ) -> tuple[str, ...] | None:
@@ -997,13 +1003,8 @@ def dspark_path(name: str, config: Mapping[str, object], leaves: Mapping[str, tu
     parts = name.split('.')
     dspark = config.get('dspark')
     stages = dspark['stages'] if isinstance(dspark, Mapping) else 0
-    if len(parts) < 3 or not parts[1].isdigit() or int(parts[1]) >= stages:
-        raise ValueError(f"{name} names an undeclared DSpark stage")
-    stage, tail = f'dspark_{parts[1]}', '.'.join(parts[2:])
-    if tail in leaves:
-        return ('params', stage, *leaves[tail])
-    path = layer_path('layers.0.' + tail, config)
-    return None if path is None else (path[0], stage, 'block', *path[2:])
+    return prediction_path(name, 'dspark', parts[1] if len(parts) >= 3 else None, stages, '.'.join(parts[2:]),
+                           leaves, lambda tail: layer_path('layers.0.' + tail, config))
 
 
 def _deepseek_v4_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
@@ -1029,26 +1030,16 @@ def _deepseek_v4_path(name: str, config: Mapping[str, object]) -> tuple[str, ...
         return dspark_path(name, config, _V4_DSPARK_LEAVES, _deepseek_v4_path)
     if name.startswith('mtp.'):
         parts = name.split('.')
-        if (
-            len(parts) < 3
-            or not parts[1].isdigit()
-            or int(parts[1]) >= record_int(config, "num_nextn_predict_layers", 0)
-        ):
-            raise ValueError(f"{name} names an undeclared prediction depth")
-        depth = f'mtp_{parts[1]}'
-        tail = '.'.join(parts[2:])
-        if tail == 'norm.weight':
-            return ('params', depth, 'final_norm', 'scale')
-        if tail in ('enorm.weight', 'hnorm.weight'):
-            return ('params', depth, parts[2], 'scale')
-        if tail in ('e_proj.weight', 'h_proj.weight'):
-            return ('params', depth, parts[2], 'kernel')
-        if tail in ('hc_head_fn', 'hc_head_base', 'hc_head_scale'):
-            return ('params', depth, 'hc_head', tail.replace('hc_head_', 'hc_', 1))
-        path = _deepseek_v4_path('layers.0.' + tail, config)
-        if path is None:
-            raise ValueError(f"{name} has no prediction-block parameter")
-        return (path[0], depth, 'block', *path[2:])
+
+        def block(tail: str) -> tuple[str, ...]:
+            path = _deepseek_v4_path('layers.0.' + tail, config)
+            if path is None:
+                raise ValueError(f"{name} has no prediction-block parameter")
+            return path
+
+        return prediction_path(name, 'mtp', parts[1] if len(parts) >= 3 else None,
+                               record_int(config, "num_nextn_predict_layers", 0), '.'.join(parts[2:]),
+                               _V4_PREDICTION_LEAVES, block)
     name = _DEEPSEEK_V4_TRUNK.get(name, name)
     if name.startswith('layers.'):
         name = 'model.' + name
@@ -1136,6 +1127,7 @@ DEEPSEEK_V32 = DecoderFamily(
     'deepseek_v32',
     'DeepseekV32ForCausalLM',
     lambda model: {},
+    weight_path=layer_depth_path,
     preserve_source_layout=True,
 )
 
@@ -1150,6 +1142,7 @@ DEEPSEEK_V2 = DecoderFamily(
     'deepseek_v2',
     'DeepseekV2ForCausalLM',
     lambda model: {},
+    weight_path=layer_depth_path,
     preserve_source_layout=True,
 )
 
@@ -1163,6 +1156,7 @@ KIMI_K2 = DecoderFamily(
     'deepseek_v3',
     'DeepseekV3ForCausalLM',
     lambda model: {},
+    weight_path=layer_depth_path,
     preserve_source_layout=True,
 )
 
@@ -1188,5 +1182,6 @@ DEEPSEEK_V3 = DecoderFamily(
     'deepseek_v3',
     'DeepseekV3ForCausalLM',
     lambda model: {},
+    weight_path=layer_depth_path,
     preserve_source_layout=True,
 )

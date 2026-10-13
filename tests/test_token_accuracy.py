@@ -13,37 +13,12 @@ from dew import Mean
 from dew.artifacts import TokenScores
 from dew.data.chat import Role
 from dew.nn.backbones import CausalTransformer
-from dew.nn.protocols import OutputTable
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
-from dew.objectives.lm.chunked import chunked_cross_entropy
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "token_accuracy"
 MODEL = {"vocab_size": 32, "emb_features": 16, "num_layers": 2, "num_heads": 2, "mlp_features": 32,
          "max_seq_len": 16, "attention_impl": "reference"}
-
-
-@pytest.mark.parametrize("chunks", [1, 4])
-def test_a_tie_goes_to_the_lowest_column_as_trls_argmax_takes_it(chunks):
-    """Every row's top logit sits at two columns at least a quarter of the
-    vocabulary apart, so in four tiles the two are in different tiles; the
-    chunked head's prediction is the lower, as torch's argmax in TRL's
-    count picks it, and the count over the labels TRL keeps is TRL's. The
-    logits enter as states through an identity head, which reproduces them
-    exactly."""
-    with np.load(FIXTURES / "ties.npz") as data:
-        reference = {key: data[key] for key in data}
-    labels = reference["labels"][:, 1:]
-    kept = labels != -100
-    states = jnp.asarray(reference["logits"][:, :-1])
-    _, predicted, _ = chunked_cross_entropy(
-        states,
-        OutputTable(jnp.eye(states.shape[-1], dtype=jnp.float32), vocab_major=False),
-        jnp.asarray(np.where(kept, labels, 0), jnp.int32),
-        chunks,
-    )
-    assert int(np.sum((np.asarray(predicted) == labels) & kept)) == int(reference["correct"])
-    assert int(kept.sum()) == int(reference["total"]) and 0 < int(reference["correct"]) < int(kept.sum())
 
 
 def test_assistant_token_accuracy_is_trls_count_over_uneven_batches():

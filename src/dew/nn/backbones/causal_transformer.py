@@ -68,6 +68,7 @@ from ..inputs import (
 from ..kv_cache import KVCache
 from ..mixers import AttentionMixer, MixerBase, MixerContext
 from ..mixers.mamba2 import Mamba2Mixer
+from ..mixers.mlp import MLPMixer
 from ..mla import MLAMixer
 from ..moe import GatedActivation, Situ
 from ..precision import at_least_fp32, biased_logits, capped_logits, head_dot_general, head_product, scaled
@@ -311,6 +312,11 @@ class CausalTransformer(nn.Module):
     """The layer kind the prediction depths build their mixer from. It need not
     occur in the trunk. None uses the full-attention kind when the pattern has
     one, and the first layer's kind otherwise."""
+    mtp_feedforward_type: str | None = None
+    """The layer kind whose MLP mixer (`MLPMixer`) builds the prediction
+    depths' feed-forward, as Nemotron-H's step pairs an attention block with
+    a routed MLP block. None routes like the last layer, and is dense
+    otherwise."""
     mtp_hyper_connections: HyperConnections | None = None
     """The residual streams of the prediction depths. None gives the depths
     plain residuals and normalized trunk inputs. Setting it opts the depth into
@@ -591,7 +597,10 @@ class CausalTransformer(nn.Module):
         )
         if self.dspark is not None:
             prediction_kinds.add(self.dspark.layer_type)
-        unnamed = sorted(set(self.kinds or {}) - set(types) - prediction_kinds)
+        # The depths' feed-forward kind fills no mixer slot, so only its name is checked here.
+        feeding = ({self.mtp_feedforward_type} if self.num_nextn_predict_layers and self.mtp_feedforward_type
+                   else set())
+        unnamed = sorted(set(self.kinds or {}) - set(types) - prediction_kinds - feeding)
         if unnamed:
             raise ValueError(
                 f"kinds {unnamed} name no layer of this model, whose pattern is "
@@ -1269,7 +1278,14 @@ class CausalTransformer(nn.Module):
         mtp_mixer = prediction_mixer.build(self.mixer_context(
             kinds[mtp_type], mtp_type, kv_shared=False))
         widths = self.mlp_widths
+        feeding = self.mtp_feedforward_type
+        feeder = None if feeding is None else self.kind_of(feeding).mixer
+        if feeding is not None and not isinstance(feeder, MLPMixer):
+            raise ValueError(f"mtp_feedforward_type {feeding!r} builds its feed-forward from an MLPMixer, "
+                             f"and the kind's mixer is {type(feeder).__name__}")
         mtp_feedforward = (
+            feeder.feedforward(self.mixer_context(self.kind_of(feeding), feeding, kv_shared=False))
+            if isinstance(feeder, MLPMixer) and feeding is not None else
             routed if routed is not None and self.num_layers - 1 in self.sparse_layers else
             None if widths[-1] == 0 else
             # The last layer's width: the one width of every model with

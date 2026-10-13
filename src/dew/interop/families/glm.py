@@ -25,11 +25,11 @@ from dew.interop.decoder_parts import (
     Ropes,
     base_config,
     check_decoder_tree,
-    dew_path,
     fixed_fields,
     fixed_mixture,
     hf_tensor_name,
     kind_mixers,
+    layer_depth_path,
     plain_partial_rope,
     record_float,
     record_int,
@@ -320,7 +320,7 @@ def _glm5_next_export_weights(family: DecoderFamily, model: CausalTransformer,
                 tail = ['shared_head', 'norm', 'scale']
         else:
             target = hf_tensor_name('.'.join(path), config)
-            if target is None or _glm4_moe_path(target, fields) != (collection, *original):
+            if target is None or layer_depth_path(target, fields) != (collection, *original):
                 refuse(name, 'the source has no matching persistent leaf')
             tensors[target] = np.ascontiguousarray(leaf.T if path[-1] == 'kernel' else leaf)
             continue
@@ -329,7 +329,7 @@ def _glm5_next_export_weights(family: DecoderFamily, model: CausalTransformer,
             for expert, value in enumerate(leaf):
                 target = prefix + f'mlp.experts.{expert}.{tail[2]}.weight'
                 expected = (collection, *original[:-2], str(expert), *original[-2:])
-                if _glm4_moe_path(target, fields) != expected:
+                if layer_depth_path(target, fields) != expected:
                     refuse(name, 'the expert tensor has no matching source path')
                 tensors[target] = np.ascontiguousarray(value.T)
             continue
@@ -338,7 +338,7 @@ def _glm5_next_export_weights(family: DecoderFamily, model: CausalTransformer,
         else:
             ending = 'weight' if tail[-1] in ('kernel', 'scale') else tail[-1]
             target = prefix + '.'.join([*tail[:-1], ending])
-        if _glm4_moe_path(target, fields) != (collection, *original):
+        if layer_depth_path(target, fields) != (collection, *original):
             refuse(name, 'the source has no matching persistent leaf')
         if target in tensors:
             refuse(name, f'duplicate source tensor {target}')
@@ -376,49 +376,6 @@ def _glm4_moe_config(hf_config: Mapping[str, object], used: set[str]) -> Decoder
         ),
     )
     return config
-
-
-def _glm4_moe_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
-    """Return the variables-tree path for one GLM tensor name.
-
-    GLM's MTP depths are the layers past num_hidden_layers, one block each.
-    Depth d arrives as model.layers.{num_layers + d}.*: its own enorm, hnorm,
-    eh_proj and shared_head.norm around a decoder block named like any layer,
-    plus copies of the trunk's embedding and head. The depth shares those two
-    here as in the reference, and `translate_weights` checks the copies.
-
-    The copies map to the trunk's own leaves, since the tree holds one
-    embedding and one head for the trunk and every depth. A trained export
-    therefore writes the copies from the weights the depth read.
-    """
-    parts = name.split('.')
-    if not (len(parts) >= 4 and parts[:2] == ['model', 'layers'] and parts[2].isdigit()
-            and int(parts[2]) >= records.integer(config['num_layers'], 'num_layers')):
-        return dew_path(name, config)
-    if int(parts[2]) >= records.integer(config["num_layers"], "num_layers") + records.integer(
-        config.get("num_nextn_predict_layers", 0), "num_nextn_predict_layers"
-    ):
-        raise ValueError(f"{name} names an undeclared prediction depth")
-    depth = f"mtp_{int(parts[2]) - records.integer(config['num_layers'], 'num_layers')}"
-    tail = parts[3:]
-    if tail == ['embed_tokens', 'weight']:
-        return ('params', 'embed_tokens', 'embedding')
-    if tail == ['shared_head', 'head', 'weight']:
-        # A tied trunk keeps the head in the embedding, which stores the
-        # same [vocab, features] the copy does; an untied one has the
-        # head's own kernel, which stores its transpose.
-        return (('params', 'embed_tokens', 'embedding') if config['tie_embeddings']
-                else ('params', 'lm_head', 'kernel'))
-    if tail == ['shared_head', 'norm', 'weight']:
-        return ('params', depth, 'final_norm', 'scale')
-    if len(tail) == 2 and tail[0] in ('enorm', 'hnorm') and tail[1] == 'weight':
-        return ('params', depth, tail[0], 'scale')
-    if tail == ['eh_proj', 'weight']:
-        return ('params', depth, 'eh_proj', 'kernel')
-    path = dew_path('.'.join(['model', 'layers', '0', *tail]), config)
-    if path is None:
-        return None
-    return (path[0], depth, 'block', *path[2:])
 
 
 def _glm_indexer_types(hf_config: Mapping[str, object], layers: int, used: set[str]) -> tuple[str, ...]:
@@ -514,7 +471,7 @@ GLM5_NEXT_TEXT = DecoderFamily(
     'glm5_next_text',
     'Glm5NextTextForCausalLM',
     _glm5_next_export,
-    weight_path=_glm4_moe_path,
+    weight_path=layer_depth_path,
     export_weights=_glm5_next_export_weights,
     preserve_source_layout=True,
 )
@@ -530,7 +487,7 @@ GLM4_MOE = DecoderFamily(
     'glm4_moe',
     'Glm4MoeForCausalLM',
     lambda model: {},
-    weight_path=_glm4_moe_path,
+    weight_path=layer_depth_path,
     preserve_source_layout=True,
 )
 
@@ -548,6 +505,6 @@ GLM_MOE_DSA = DecoderFamily(
     'glm_moe_dsa',
     'GlmMoeDsaForCausalLM',
     lambda model: {},
-    weight_path=_glm4_moe_path,
+    weight_path=layer_depth_path,
     preserve_source_layout=True,
 )
