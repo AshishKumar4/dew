@@ -347,15 +347,16 @@ QKV_RESIDUALS = ('q_proj', 'k_proj', 'v_proj', 'kv_proj')
 ATTENTION_RESIDUALS = (*QKV_RESIDUALS, 'o_proj')
 MLP_RESIDUALS = ('gate_proj', 'up_proj', 'down_proj')
 DELTA_RESIDUALS = ('delta_decay', 'delta_inverse')
-RESIDUALS = (*ATTENTION_RESIDUALS, 'context', *DELTA_RESIDUALS, *MLP_RESIDUALS)
+RESIDUALS = (*ATTENTION_RESIDUALS, 'context', 'conv', *DELTA_RESIDUALS, *MLP_RESIDUALS)
 """The values a block names as it runs, each after the projection that
 produced it: `kv_proj` is latent attention's fused `kv_b_proj`, `context`
 the attention kernel's or the gated delta rule's output before `o_proj`,
-`delta_decay` and `delta_inverse` the rule's cumulated decay and chunk
-inverse the port saves for its backward (`dew.nn.kernels.fla_gdn`), and the
-MLP names cover the dense MLP and the routed experts alike. A remat policy
-picks from these; a name off the list is a typo that would otherwise
-recompute silently."""
+`conv` a linear-attention or SSM mixer's short conv output (`causal_conv1d`,
+its queries, keys and values for a delta rule), `delta_decay` and
+`delta_inverse` the rule's cumulated decay and chunk inverse the port saves
+for its backward (`dew.nn.kernels.fla_gdn`), and the MLP names cover the
+dense MLP and the routed experts alike. A remat policy picks from these; a
+name off the list is a typo that would otherwise recompute silently."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -400,6 +401,7 @@ class RematPolicy:
 
 REMAT_POLICIES: Mapping[str, RematPolicy] = {
     'full': RematPolicy(),
+    'minimal_with_conv': RematPolicy(save=(*ATTENTION_RESIDUALS, 'conv', *MLP_RESIDUALS)),
     'minimal': RematPolicy(save=ATTENTION_RESIDUALS + MLP_RESIDUALS),
     'minimal_with_context': RematPolicy(save=(*ATTENTION_RESIDUALS, 'context', *MLP_RESIDUALS)),
     'save_dot_except_mlp': RematPolicy(save=ATTENTION_RESIDUALS),
@@ -443,14 +445,17 @@ def remat_policy(
 
 
 DECODER_REMAT: tuple[RematPolicy | None, ...] = (
-    None, REMAT_POLICIES['minimal'], REMAT_POLICIES['save_dot_except_mlp'], REMAT_POLICIES['full'])
+    None, REMAT_POLICIES['minimal_with_conv'], REMAT_POLICIES['minimal'],
+    REMAT_POLICIES['save_dot_except_mlp'], REMAT_POLICIES['full'])
 """What a decoder recomputes in its backward pass when its step does not fit,
 weakest first; each rung is slower and holds less (docs/performance.md). On
 Qwen 3.5-0.8B at 8 x 3072 on an A100, 'minimal' cost 14.7% a token over none
 and kept 13.5 GiB of temporaries, 'save_dot_except_mlp' 18.4% and 6.4 GiB,
-none 59 GiB. A decoder's own remat is where it starts, and it moves up one
-rung at a time (`CausalTransformer.recompute_more`), never past a policy the
-ladder names."""
+none 59 GiB; 'minimal_with_conv' keeps a linear-attention or SSM layer's
+short conv output beside 'minimal''s. A decoder's own remat is where it
+starts, and it moves up one rung at a time (`CausalTransformer.recompute_more`),
+past a rung that keeps nothing more of its layers' names than the next, never
+past a policy the ladder names."""
 
 
 def remat_record(remat: RematPolicy | None) -> JSON:
