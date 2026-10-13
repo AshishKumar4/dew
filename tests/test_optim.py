@@ -697,7 +697,8 @@ def test_rates_of_one_schedule_lower_to_one_update(optimizer, form):
     grads = fixed_gradients(params)
 
     def config(rate):
-        schedule = None if form == "constant" else Cosine(peak=rate, warmup_steps=2, end=rate / 10, init=rate / 4)
+        schedule = (None if form == "constant"
+                    else Cosine(peak=rate, warmup_steps=2, end=rate / 10, init=rate / 4))
         groups = () if form != "groups" else (
             ParamGroup("kernels", ("*kernel",), learning_rate_multiplier=rate * 100,
                        schedule=Linear(peak=rate * 2, warmup_steps=1, end=rate / 8)),
