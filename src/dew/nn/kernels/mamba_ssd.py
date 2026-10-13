@@ -81,8 +81,10 @@ class _Launch(tuning.KernelOp):
         return ba.arguments[name].shape[axis]
 
     def _fitted(self, ba, tiles: Tiles) -> Tiles:
-        """`tiles` with each block clipped to what it spans and `heads` to a group's."""
-        blocks = [block if span is None else min(block, self._size(ba, span))
+        """`tiles` with each block clipped to the largest power of two dividing what it spans (all of a
+        power-of-two width, 8 of Mamba-2 130M's 24 heads), so the blocks tile it whole, and `heads` to
+        a group's."""
+        blocks = [block if span is None else min(block, (size := self._size(ba, span)) & -size)
                   for block, span in zip((tiles.bm, tiles.bn, tiles.bk), self.SPANS, strict=True)]
         heads = tiles.heads and min(tiles.heads, ba.arguments[self.HEADS].shape[2] // ba.arguments["groups"])
         return dataclasses.replace(tiles, bm=blocks[0], bn=blocks[1], bk=blocks[2], heads=heads)
