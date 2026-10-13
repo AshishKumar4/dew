@@ -723,6 +723,8 @@ class MLAMixer(MixerBase):
     values norm, a window, an attention scale, a partial rotary) are refused.
     """
 
+    residuals = ('q_proj', 'k_proj', 'v_proj', 'kv_proj', 'o_proj', 'context')
+
     q_lora_rank: int | None = None
     kv_lora_rank: int = 512
     qk_nope_head_dim: int = 128
