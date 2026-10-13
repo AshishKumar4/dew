@@ -16,6 +16,7 @@ from affine_run import Counting, dataset, val_batches
 from dew.artifacts import TokenScores
 from dew.checkpoints import Checkpoints, Keep, Ranking
 from dew.objectives.base import Aux, Objective, Shown
+from dew.telemetry.records import FitEnded
 from dew.training import Trainer
 from dew.training.trainer import Best, Plateau
 
@@ -195,6 +196,47 @@ def test_restore_best_returns_the_whole_earlier_state(tmp_path):
     assert int(state.step) == 3
     assert int(state.updates) == 3
     assert float(state.variables['params']['w']) == pytest.approx(.488)
+
+
+def test_a_finished_run_fit_again_returns_its_best_state(tmp_path):
+    """A second fit to the step the run already reached trains nothing and
+    still returns the best state restore_best asks for, as the first did."""
+    trainer(tmp_path / 'run').fit(data(), steps=8, log_every=1, eval_every=1, checkpoint_every=4)
+    again = trainer(tmp_path / 'run')
+    state = again.fit(data(), steps=8, log_every=1, eval_every=1, checkpoint_every=4, restore_best=True)
+    assert again.checkpoints.latest == 8 and again.checkpoints.best == 3
+    assert int(state.step) == 3
+    assert float(state.variables['params']['w']) == pytest.approx(.488)
+
+
+class Outcomes:
+    """A tracker that keeps the run's reported end."""
+
+    def __init__(self):
+        self.ended = []
+
+    def log(self, scalars, step):
+        pass
+
+    def artifact(self, value, step):
+        if isinstance(value, FitEnded):
+            self.ended.append(value.status)
+
+    def close(self):
+        pass
+
+
+def test_a_best_state_that_cannot_be_restored_ends_the_run_failed(tmp_path):
+    """restore_best selects the state inside the run's lifecycle: when no
+    step qualifies, the trackers hear a failed run, not a completed one."""
+    metric = Value('value', Shown(better='lower'))
+    tracker = Outcomes()
+    run = Trainer(Overfit(), optax.sgd(0.1), key=jax.random.key(0),
+                  checkpoints=Checkpoints(str(tmp_path / 'run')), tracker=tracker)
+    with pytest.raises(FileNotFoundError):
+        run.fit(data(), steps=2, log_every=1, eval_every=1, metrics=[metric],
+                best=Best(metric, threshold=-1.0), checkpoint_final=False, restore_best=True)
+    assert tracker.ended == ['failed']
 
 
 @pytest.mark.parametrize("aggregate", [False, True])
