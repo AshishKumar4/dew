@@ -79,6 +79,8 @@ from dew.training.optim import (
     ScheduleBase,
     param_labels,
     power_profiles,
+    scaled,
+    scaled_solver,
     weight_decay_mask,
 )
 from dew.training.quantization import InputQuantization, Quantization, quantize_trunk
@@ -456,9 +458,10 @@ class OptimConfig:
         `optax.multi_transform`, each on its own schedule (the config's when it names
         none) times its multiplier, with its own weight decay, `b1` schedule and bounds
         (`ParamGroup.solver`); the global-norm clip still reads every gradient
-        together, before the groups split them.
+        together, before the groups split them. Each solver holds its rate's
+        scale in its state (`dew.training.optim.scaled_solver`), so runs at
+        rates of one schedule's shape compile one step.
         """
-        learning_rate = self.learning_rate if self.schedule is None else self.schedule.schedule(steps)
         opts = dict(self.optimizer_opts)
         if {'b1', 'b2'} & opts.keys():
             raise ValueError("b1 and b2 are fields of OptimConfig, not optimizer_opts")
@@ -478,14 +481,12 @@ class OptimConfig:
             solvers = {}
             for group in self.param_groups:
                 decay = {} if group.weight_decay is None else {'weight_decay': group.weight_decay}
-                rate = learning_rate if group.schedule is None else group.schedule.schedule(steps)
-                solvers[group.name] = group.solver(
-                    make, _scaled(rate, group.learning_rate_multiplier), steps, {**opts, **decay})
+                solvers[group.name] = group.solver(make, self.rate, steps, {**opts, **decay})
             solver = optax.multi_transform(solvers, param_labels(self.param_groups))
         else:
             if self.optimizer not in ('muon', 'muonclip'):
                 opts['mask'] = weight_decay_mask
-            solver = make(learning_rate, **opts)
+            solver = scaled_solver(make, *scaled(self.rate), steps, opts)
 
         if self.clip_grads > 0:
             solver = optax.chain(optax.clip_by_global_norm(self.clip_grads), solver)
@@ -497,14 +498,20 @@ class OptimConfig:
             solver = power_profiles(solver, self.ema_profiles)
         return solver
 
+    @property
+    def rate(self) -> float | ScheduleBase:
+        """The run's learning rate: the schedule, else the constant rate."""
+        return self.learning_rate if self.schedule is None else self.schedule
 
-def _scaled(learning_rate: float | optax.Schedule, multiplier: float) -> float | optax.Schedule:
-    if multiplier == 1.0:
-        return learning_rate
-    if callable(learning_rate):
-        schedule = learning_rate
-        return lambda count: multiplier * schedule(count)
-    return multiplier * learning_rate
+    def rate_scales(self) -> dict[str | None, float]:
+        """The rate scale each of `build`'s solvers holds in its state
+        (`dew.training.optim.scaled_solver`), by param group, or under None
+        for the one solver of a config without groups. A resumed run sets
+        them over its checkpoint's (`with_rate_scales`), so the configured
+        rate is the one it steps at."""
+        if not self.param_groups:
+            return {None: scaled(self.rate)[0]}
+        return {group.name: group.rate(self.rate)[0] for group in self.param_groups}
 
 
 @dataclasses.dataclass(frozen=True)
