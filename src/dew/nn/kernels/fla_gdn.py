@@ -944,7 +944,8 @@ def _wy_bwd_kernel(chunk_ref, k_ref, v_ref, beta_ref, g_ref, a_ref, dw_ref, du_r
     `group`, the value heads per key head, is given when the keys' gradient so far (`refs[0]`, the
     query-side kernel's) is an operand: it joins the sum before that store in the first value head
     of each key head's group, where fla adds the two stored gradients in a pass of their own
-    (chunk.py:244)."""
+    (chunk.py:244). A group of more than one stores each head's part in fp32 (`dk_ref`'s dtype),
+    which the caller sums and rounds once."""
     earlier_ref, (dk_ref, dv_ref, db_ref, dg_ref) = (refs[0], refs[1:]) if group else (None, refs)
     start, taken = _chunk_of(chunk_ref, chunk, aligned)
     first_of_group = pl.program_id(1) % (group or 1) == 0
@@ -1041,7 +1042,8 @@ def prepare_wy_repr_bwd(k, v, beta, g, a, dw, du, dk=None, *, chunk: int = 64, b
         in_specs=[_CHUNK, keys, headed(columns), gate, gate, headed(chunk), headed(width), headed(columns),
                   *(keys for _ in earlier)],
         out_specs=[headed(width), headed(columns), gate, gate],
-        out_shape=[jax.ShapeDtypeStruct((tokens, value_heads, width), k.dtype),
+        # A group's parts stay fp32 until their sum rounds once.
+        out_shape=[jax.ShapeDtypeStruct((tokens, value_heads, width), jnp.float32 if group > 1 else k.dtype),
                    jax.ShapeDtypeStruct((tokens, value_heads, columns), v.dtype),
                    jax.ShapeDtypeStruct((tokens, value_heads), beta.dtype),
                    jax.ShapeDtypeStruct((tokens, value_heads), g.dtype)],

@@ -427,8 +427,10 @@ class DecisionObjective(Objective[Ratio]):
         if "backbone" not in parts:
             parts["backbone"] = self.model.backbone.init(backbone_key, tokens)
         if "head" not in parts:
-            width, dtype = DecisionModel.head_size(self.model.backbone)
-            states = jnp.zeros((1, self.layout.max_len, width), dtype or jnp.float32)
+            # The width the head was built for (its parameters read the states' width, not their dtype),
+            # not a trace of the backbone inside every trace of the state.
+            head = self.model.head
+            states = jnp.zeros((1, self.layout.max_len, getattr(head, head.width_field)), jnp.float32)
             one = jnp.ones((1, 1), bool)
             inputs = DecisionInputs(tokens=tokens, valid=jnp.ones_like(tokens, bool),
                                     kinds=jnp.zeros((1, 1), jnp.int32), questions=one,

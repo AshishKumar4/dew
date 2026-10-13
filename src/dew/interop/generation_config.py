@@ -15,18 +15,40 @@ refused by name. The masked-diffusion families' fields are audited apart
 from __future__ import annotations
 
 import functools
+import json
 from collections.abc import Mapping
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Literal
 
 import jax.numpy as jnp
 from flax import linen as nn
 
 from dew import records
+from dew.coordination import agreed
 from dew.records import JSON
 from dew.sampling import decoding
 from dew.sampling.strategies import Beam, Speculative, Strategy
 from dew.sampling.text import Bounded, Predicting, Sampling, ordered_transforms, with_ids_of
+
+
+def read_generation_config(directory: Path) -> Mapping[str, object]:
+    """The source's generation_config.json, or {} when it has none, which
+    every loading route reads its decoding policy from.
+
+    One that is not an object is refused, by every process alike. Loading
+    for training or export does not opt into the source sampler; active
+    policy support is checked when the caller creates its task.
+    """
+    generation_path = directory / "generation_config.json"
+    generation_config = json.loads(generation_path.read_text()) if generation_path.exists() else {}
+
+    def policy_read() -> None:
+        if not isinstance(generation_config, dict):
+            raise ValueError("generation_config.json must contain an object")
+
+    agreed("pretrained generation policy", policy_read)
+    return generation_config
 
 
 def _generation_value(config: Mapping[str, object], generation_config: Mapping[str, object],
