@@ -33,7 +33,7 @@ from dew.nn.precision import at_least_fp32
 from dew.nn.scan_orders import patchify, unpatchify
 from dew.nn.sharding import logical_axes
 
-from .decoder_block import GatedMLP
+from ..mlp import GatedMLP
 from .joint import JointAttention, layer_norm
 
 if TYPE_CHECKING:

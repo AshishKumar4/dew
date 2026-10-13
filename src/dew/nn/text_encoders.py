@@ -44,11 +44,12 @@ from dew import records
 from dew.interop.config_records import NativeFields, native_fields
 from dew.interop.weights import ParamTree, translate_parameters
 from dew.nn.attention import LayerNorm, RMSNorm
-from dew.nn.backbones.decoder_block import BlockWiring, DecoderBlock, GatedMLP
+from dew.nn.backbones.decoder_block import BlockWiring, DecoderBlock
 from dew.nn.conv import Conv
 from dew.nn.flops import matching_lengths, patch_lengths
 from dew.nn.inputs import AttentionMetadata
 from dew.nn.mixers.attention import CausalSelfAttention
+from dew.nn.mlp import GatedMLP
 from dew.nn.sharding import logical_axes
 from dew.registry import resolve_dtype
 

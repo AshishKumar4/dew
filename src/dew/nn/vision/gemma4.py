@@ -15,9 +15,10 @@ from flax.typing import Dtype, PrecisionLike
 from dew import records
 from dew.interop.weights import translate_parameters
 from dew.nn.attention import RMSNorm
-from dew.nn.backbones.decoder_block import BlockWiring, DecoderBlock, GatedMLP
+from dew.nn.backbones.decoder_block import BlockWiring, DecoderBlock
 from dew.nn.inputs import AttentionMetadata
 from dew.nn.mixers.attention import CausalSelfAttention
+from dew.nn.mlp import GatedMLP
 from dew.objectives.base import Variables
 from dew.registry import Record
 

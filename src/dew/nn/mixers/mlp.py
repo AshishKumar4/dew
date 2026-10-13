@@ -15,7 +15,8 @@ from dew.nn.moe import SparseMLP
 from dew.nn.protocols import ProjectionGroup, Routes, RoutesExperts, declared_groups
 
 if TYPE_CHECKING:
-    from dew.nn.backbones.decoder_block import GatedMLP, Mixture
+    from dew.nn.backbones.decoder_block import Mixture
+    from dew.nn.mlp import GatedMLP
 
 
 class _MLP(nn.Module):
@@ -91,7 +92,7 @@ class MLPMixer(MixerBase):
         depth's, `CausalTransformer.mtp_feedforward_type`)."""
         # decoder_block imports the mixer registry while its classes are being defined.
         from dew.nn.attention import RMSNorm
-        from dew.nn.backbones.decoder_block import GatedMLP
+        from dew.nn.mlp import GatedMLP
 
         dense = functools.partial(
             GatedMLP, out_features=ctx.emb_features,
