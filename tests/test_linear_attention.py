@@ -47,6 +47,7 @@ from dew.nn.linear import (
     held_conv1d,
     l2norm,
     recurrent_gated_delta_rule,
+    strictly_lower_inverse,
 )
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "linear_attention"
@@ -475,6 +476,44 @@ def test_a_right_padded_row_convolves_as_the_masked_conv(case, history):
     for gradient, wanted in zip(grads, want_grads, strict=True):
         if wanted is not None:
             assert largest(gradient, wanted) < 1e-6
+
+
+def test_a_right_padded_layer_keeps_its_real_tokens_states(reference, geometry):
+    """The mixer told its rows are right-padded gives the masked call's
+    outputs, zero at the padding: as close
+    to float64 as the masked call is (tests/reference_error.py), the two
+    being separate programs, which a GPU rounds apart (1.7e-6 on an H100)."""
+    module = layer(geometry)
+    variables = layer_params(reference)
+    hidden = jnp.asarray(reference["layer.hidden"])[:, :9]
+    valid = jnp.arange(9)[None, :] < jnp.asarray([[6], [9]])
+
+    def call(metadata, variables=variables):
+        return jax.jit(lambda hidden: module.apply(variables, hidden, attention_metadata=metadata))
+
+    masked = AttentionMetadata(coordinates=coordinates(valid=valid))
+    declared = AttentionMetadata(coordinates=coordinates(valid=valid, right_padded=True))
+    mine, theirs = call(declared)(hidden), call(masked)(hidden)
+
+    assert jnp.array_equal(mine[0, 6:], jnp.zeros_like(hidden[0, 6:]))
+    cpu = jax.devices("cpu")[0]
+    with jax.enable_x64(new_val=True), jax.default_device(cpu):
+        wide = jax.tree.map(lambda x: jax.device_put(np.asarray(x, np.float64), cpu), variables)
+        truth = call(AttentionMetadata(coordinates=coordinates(valid=jax.device_put(np.asarray(valid), cpu))),
+                     wide)(jax.device_put(np.asarray(hidden, np.float64), cpu))
+    assert_as_exact_as_the_reference(mine, theirs, truth, "right-padded output")
+
+
+@pytest.mark.parametrize("chunk", [4, 16, 64])
+def test_the_chunk_inverse_is_exact_where_its_series_cancels(chunk):
+    """Every key the same and beta one make A every -1 below the diagonal:
+    (I - A)^-1 is I minus the subdiagonal, entries of at most 1, while the
+    series' powers of A grow as binomials (to 1.8e17 at 64), which summed
+    in fp32 left Qwen3.5-0.8B's fifth delta-rule layer 1e24 off on a
+    256-token prompt and its logits NaN."""
+    a = -jnp.tril(jnp.ones((2, chunk, chunk), jnp.float32), -1)
+    want = np.eye(chunk) - np.eye(chunk, k=-1)
+    np.testing.assert_allclose(strictly_lower_inverse(a), np.broadcast_to(want, a.shape), atol=1e-6)
 
 
 def test_a_decay_deep_in_a_chunk_keeps_its_own_precision():
