@@ -138,17 +138,26 @@ class TorchGraph:
     `head` names the output head's weight when the logits are exactly
     `hidden @ head.T`, checked at load; None when the model adds anything
     (a bias, a scale, a softcap). `persistent` names the buffers the source
-    checkpoint stores.
+    checkpoint stores. The module runs in eval mode, so `training_only`
+    names what it computes only in a training forward (`_training_only`),
+    and a training forward of a model that has any is refused.
     """
 
     module: JittableModule
     head: str | None
     persistent: tuple[str, ...]
+    training_only: tuple[str, ...] = ()
 
     def __call__(self, params: Mapping[str, jax.Array], buffers: Mapping[str, jax.Array],
-                 tokens: jax.Array) -> tuple[jax.Array, jax.Array]:
+                 tokens: jax.Array, *, train: bool) -> tuple[jax.Array, jax.Array]:
         """The logits and the output head's input states for `tokens`."""
         import torchax
+
+        if train and self.training_only:
+            raise ValueError(
+                f"fallback='torchax' runs transformers' eval forward, and this model computes "
+                f"{', '.join(self.training_only)} only in training; set them to 0 in its config, "
+                f"or train a family Dew loads natively")
 
         env = torchax.default_env()
         arguments = env.j2t_iso((dict(params), dict(buffers), tokens))
@@ -195,8 +204,8 @@ class TorchCausalLM(nn.Module):
     `init` has no initializer to draw from, so the module starts from the
     loaded variables only. Floating parameters are cast to `dtype` for the
     forward, which keeps them in their stored dtype as masters; buffers keep
-    theirs. The torch module runs in eval mode, so dropout is off whatever
-    `train` says.
+    theirs. The torch module runs in eval mode, so a training forward is
+    refused where the model would compute anything else in one (`TorchGraph`).
 
     `hidden_states` and `output_table` are the pair `LMObjective` scores
     through, so the vocabulary-sized logits are never built whole. Only a
@@ -228,13 +237,13 @@ class TorchCausalLM(nn.Module):
         return None
 
     def __call__(self, tokens, train: bool = False) -> jax.Array:
-        logits, _ = self._run(tokens)
+        logits, _ = self._run(tokens, train)
         return logits.astype(jnp.float32)
 
     def hidden_states(self, tokens, train: bool = False, **packing) -> jax.Array:
         """The states the output head reads, `[B, S, features]`."""
         _refuse_packing(packing)
-        _, hidden = self._run(tokens)
+        _, hidden = self._run(tokens, train)
         return hidden
 
     def logits(self, tokens, *, train: bool = False, **packing) -> jax.Array:
@@ -250,7 +259,7 @@ class TorchCausalLM(nn.Module):
         return OutputTable(self.variables["params"][self.graph.head], vocab_major=True,
                            precision=self.precision)
 
-    def _run(self, tokens) -> tuple[jax.Array, jax.Array]:
+    def _run(self, tokens, train: bool) -> tuple[jax.Array, jax.Array]:
         if self.is_initializing():
             raise ValueError(
                 "a torchax model has no initializer; apply it to the variables "
@@ -258,7 +267,7 @@ class TorchCausalLM(nn.Module):
         held = self.variables
         params = {name: self._compute(leaf) for name, leaf in held["params"].items()}
         buffers = {name: jnp.asarray(leaf) for name, leaf in held.get("buffers", {}).items()}
-        return self.graph(params, buffers, jnp.asarray(tokens))
+        return self.graph(params, buffers, jnp.asarray(tokens), train=train)
 
     def _compute(self, leaf) -> jax.Array:
         value = jnp.asarray(leaf)
@@ -335,7 +344,7 @@ def load(name_or_dir: str | Path, directory: Path, revision: str | None, *, dtyp
     vocab = int(head_weight.shape[0])
     # Torch's copies are no longer read: the forward runs on the arrays above.
     torch.nn.Module.to(model, "meta")
-    graph = TorchGraph(jittable, head_name, persistent)
+    graph = TorchGraph(jittable, head_name, persistent, _training_only(model))
     module = TorchCausalLM(graph, vocab, dtype=resolve_dtype(dtype))
     source = str(name_or_dir) if revision is None else f"{name_or_dir}@{revision}"
     processor = source_processor(directory, config, config, module, source=source)
@@ -351,6 +360,24 @@ def load(name_or_dir: str | Path, directory: Path, revision: str | None, *, dtyp
     built = {**config, "dtype": dtype, "fallback": "torchax", **versions}
     return PretrainedFallback(module, {"params": params, "buffers": buffers}, processor, config, directory,
                               built, generation_config, export_adapter=graph.export, revision=revision)
+
+
+def _training_only(model: torch.nn.Module) -> tuple[str, ...]:
+    """What `model` computes only in a training forward: an `nn.Dropout` of a
+    positive rate, a positive rate a module hands the functional dropout
+    (`attention_dropout`, Falcon's `hidden_dropout`, `*_pdrop`), and a
+    router's jitter (`jitter_noise`)."""
+    found = []
+    for name, module in model.named_modules():
+        if isinstance(module, torch.nn.Dropout):
+            if module.p > 0:
+                found.append(f"{name} (p={module.p})")
+            continue
+        for attribute, rate in vars(module).items():
+            if (attribute.endswith(("dropout", "pdrop")) or attribute == "jitter_noise") \
+                    and isinstance(rate, float) and rate > 0:
+                found.append(f"{name}.{attribute}={rate}")
+    return tuple(found)
 
 
 def _plain_head(model: PreTrainedModel, weight: torch.Tensor) -> bool:
