@@ -644,10 +644,10 @@ Dew's own envelope is bytes, and Grain reports a JSON object, which
 class Checkpointable(Protocol):
     """A data stream that can report where it stopped and resume from there.
 
-    Grain's iterators satisfy this, and so does `GlobalStream`. `Trainer.fit`
-    refuses a run that asks for checkpoints over a stream without these
-    methods. The state itself is opaque here; `dew.position` tells which of its
-    two kinds a checkpoint holds.
+    Grain's iterators satisfy this, and so does `GlobalStream`; a `Loader`
+    reads a training stream without these methods through `Replayed`, which
+    resumes it by replay. The state itself is opaque here; `dew.position`
+    tells which of its two kinds a checkpoint holds.
     """
 
     def get_state(self) -> Position: ...

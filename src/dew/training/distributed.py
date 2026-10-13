@@ -838,8 +838,8 @@ class DevicePrefetchIterator:
     iterator, so it must be thread-safe and must not block.
 
     `source_state`, when given, is a saved position the worker restores before
-    its first read; if the source is not checkpointable, the first `next`
-    raises TypeError. After each batch the iterator returns, `source_state`
+    its first read, which a positioned source takes (every `Loader`'s training
+    stream is one). After each batch the iterator returns, `source_state`
     holds the source's position after that batch.
 
     `prepare`, when supplied, transforms the source's host batch before
@@ -923,8 +923,7 @@ class DevicePrefetchIterator:
         batch = state = placed = None
         try:
             if not self._stop.is_set() and self.source_state is not None:
-                if source is None:
-                    raise TypeError(f"{self._source_name} cannot resume from a saved position")
+                assert source is not None, "a Loader's training stream reports its position (Replaying)"
                 saved = self.source_state
                 source.set_state(saved if isinstance(source.get_state(), bytes)
                                  else json.loads(saved))
