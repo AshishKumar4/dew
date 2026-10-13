@@ -1029,9 +1029,13 @@ def prediction_path(name: str, prefix: str, index: object, declared: int, tail: 
     return None if path is None else (path[0], f'{prefix}_{depth}', 'block', *path[2:])
 
 
-PREDICTION_LEAVES: Mapping[str, tuple[str, ...]] = {
+PREDICTION_INPUTS: Mapping[str, tuple[str, ...]] = {
     'enorm.weight': ('enorm', 'scale'), 'hnorm.weight': ('hnorm', 'scale'),
-    'eh_proj.weight': ('eh_proj', 'kernel'), 'shared_head.norm.weight': ('final_norm', 'scale')}
+    'eh_proj.weight': ('eh_proj', 'kernel')}
+"""A prediction depth's normed inputs and their fused projection, by the
+tensor names DeepSeek-V3 and Nemotron-H's releases share."""
+PREDICTION_LEAVES: Mapping[str, tuple[str, ...]] = {
+    **PREDICTION_INPUTS, 'shared_head.norm.weight': ('final_norm', 'scale')}
 """A DeepSeek-V3 prediction depth's own leaves, by its tensor names after
 `model.layers.{num_layers + d}.` (`layer_depth_path`)."""
 

@@ -459,7 +459,7 @@ def _kimi_k25_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] |
     """
     decoder = 'language_model.model.'
     if name.startswith(decoder):
-        return layer_depth_path("model." + name[len(decoder):], config)
+        return dew_path('model.' + name[len(decoder):], config)
     if name == 'language_model.lm_head.weight':
         return dew_path('lm_head.weight', config)
     if name.startswith(('vision_tower.', 'mm_projector.')):

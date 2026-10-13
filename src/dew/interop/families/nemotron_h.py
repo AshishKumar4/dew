@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING
 from dew import records
 from dew.interop import mamba2
 from dew.interop.config_records import native_fields
-from dew.interop.decoder_parts import DecoderFamily, Packed, prediction_path
+from dew.interop.decoder_parts import PREDICTION_INPUTS, DecoderFamily, Packed, prediction_path
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.backbones.layer_plan import LayerKind
@@ -180,13 +180,13 @@ def _prediction_step(hf_config: Mapping[str, object]) -> tuple[str, ...]:
     """The kinds of one prediction step's blocks: the one whose mixer the step
     builds, then the MLP kind feeding forward, as `MTPBlock` holds them.
     transformers defaults the list to [full_attention, moe] and reads the
-    legacy pattern string in its place."""
+    legacy pattern string where the list is unset or that default
+    (NemotronHConfig.__post_init__)."""
     stated = hf_config.get("mtp_layers_block_type")
-    if stated is not None:
-        step = tuple(_LEGACY.get(kind, kind) for kind in records.strings(stated, "mtp_layers_block_type"))
-    else:
-        pattern = records.text(hf_config.get("mtp_hybrid_override_pattern", "*E"),
-                               "mtp_hybrid_override_pattern")
+    step = (("full_attention", "moe") if stated is None else
+            tuple(_LEGACY.get(kind, kind) for kind in records.strings(stated, "mtp_layers_block_type")))
+    if step == ("full_attention", "moe") and hf_config.get("mtp_hybrid_override_pattern") is not None:
+        pattern = records.text(hf_config["mtp_hybrid_override_pattern"], "mtp_hybrid_override_pattern")
         if unknown := sorted(set(pattern) - _PATTERN.keys()):
             raise ValueError(f"mtp_hybrid_override_pattern has unknown block kinds {unknown}")
         step = tuple(_PATTERN[kind] for kind in pattern)
@@ -200,9 +200,7 @@ def _prediction_step(hf_config: Mapping[str, object]) -> tuple[str, ...]:
 # A prediction step's own leaves: its first block's input maps, and its last
 # block's final norm (vLLM nemotron_h_mtp.py, has_start_projections and
 # has_end_norm).
-_STEP_START: Mapping[str, tuple[str, ...]] = {
-    "enorm.weight": ("enorm", "scale"), "hnorm.weight": ("hnorm", "scale"),
-    "eh_proj.weight": ("eh_proj", "kernel")}
+_STEP_START = PREDICTION_INPUTS
 _STEP_END: Mapping[str, tuple[str, ...]] = {"final_layernorm.weight": ("final_norm", "scale")}
 # Each block of a step by its place in it: its pre-norm and the `MTPBlock`
 # block's slot its mixer fills.

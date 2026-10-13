@@ -586,11 +586,15 @@ class CausalTransformer(nn.Module):
         if len(types) != self.num_layers:
             raise ValueError(
                 f"layer_types has {len(types)} entries for {self.num_layers} layers")
-        prediction_kinds = ({kind for kind in (self.mtp_layer_type, self.mtp_feedforward_type) if kind}
-                            if self.num_nextn_predict_layers else set())
+        prediction_kinds = (
+            {self.mtp_layer_type} if self.num_nextn_predict_layers and self.mtp_layer_type else set()
+        )
         if self.dspark is not None:
             prediction_kinds.add(self.dspark.layer_type)
-        unnamed = sorted(set(self.kinds or {}) - set(types) - prediction_kinds)
+        # The depths' feed-forward kind fills no mixer slot, so only its name is checked here.
+        feeding = ({self.mtp_feedforward_type} if self.num_nextn_predict_layers and self.mtp_feedforward_type
+                   else set())
+        unnamed = sorted(set(self.kinds or {}) - set(types) - prediction_kinds - feeding)
         if unnamed:
             raise ValueError(
                 f"kinds {unnamed} name no layer of this model, whose pattern is "
@@ -1269,12 +1273,12 @@ class CausalTransformer(nn.Module):
             kinds[mtp_type], mtp_type, kv_shared=False))
         widths = self.mlp_widths
         feeding = self.mtp_feedforward_type
-        feeder = None if feeding is None else kinds[feeding].mixer
+        feeder = None if feeding is None else self.kind_of(feeding).mixer
         if feeding is not None and not isinstance(feeder, MLPMixer):
             raise ValueError(f"mtp_feedforward_type {feeding!r} builds its feed-forward from an MLPMixer, "
                              f"and the kind's mixer is {type(feeder).__name__}")
         mtp_feedforward = (
-            feeder.feedforward(self.mixer_context(kinds[feeding], feeding, kv_shared=False))
+            feeder.feedforward(self.mixer_context(self.kind_of(feeding), feeding, kv_shared=False))
             if isinstance(feeder, MLPMixer) and feeding is not None else
             routed if routed is not None and self.num_layers - 1 in self.sparse_layers else
             None if widths[-1] == 0 else
