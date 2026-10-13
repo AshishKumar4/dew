@@ -51,7 +51,7 @@ def dew_path(name: str) -> tuple[str, ...]:
         if layer.startswith("norm"):
             return (*block, layer, NORM[rest[-1]])
         if layer == "mlp":
-            return (*block, "mlp", {"fc1": "layers_0", "fc2": "layers_2"}[rest[0]], DENSE[rest[-1]])
+            return (*block, "mlp", {"fc1": "up_proj", "fc2": "down_proj"}[rest[0]], DENSE[rest[-1]])
         if rest[0] == "proj":
             return (*block, "attention", "to_out_0", DENSE[rest[-1]])
         return (*block, "attention", "qkv", rest[-1])
