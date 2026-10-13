@@ -22,6 +22,7 @@ import pyarrow as pa
 import pyarrow.dataset as ds
 import pyarrow.fs as pafs
 from fsspec.spec import AbstractFileSystem
+from fsspec.utils import infer_compression
 
 from dew.data.dataset import Batch, Records
 from dew.data.pipeline import Dataset
@@ -35,6 +36,8 @@ type Format = Literal["jsonl", "text", "csv", "parquet", "arrow", "array_record"
 
 
 def _format(url: str) -> Format:
+    if url.lower().endswith((".jsonl.gz", ".jsonl.zst")):
+        return "jsonl"
     suffix = PurePosixPath(url).suffix.lower()
     formats: dict[str, Format] = {
         ".jsonl": "jsonl",
@@ -101,6 +104,21 @@ def _fragment_rows(fragment) -> int:
     if isinstance(fragment, ds.ParquetFileFragment):
         return sum(group.num_rows for group in fragment.row_groups)
     return fragment.count_rows()
+
+
+def _open_lines(fs: AbstractFileSystem, path: str):
+    compression = infer_compression(path.lower())
+    file = fs.open(path, "rb", compression=compression)
+    return io.BufferedReader(file) if compression == "zstd" else file
+
+
+def _seek_lines(file: BinaryIO, offset: int) -> None:
+    if file.seekable():
+        file.seek(offset)
+        return
+    while file.tell() < offset:
+        if not file.read(min(offset - file.tell(), 2**20)):
+            raise ValueError("file reader position exceeds its decompressed stream")
 
 
 @dataclass(frozen=True)
@@ -201,14 +219,14 @@ class Files(Dataset):
                 extensions = {
                     "parquet": ".parquet",
                     "arrow": ".arrow",
-                    "jsonl": ".jsonl",
+                    "jsonl": (".jsonl", ".jsonl.gz", ".jsonl.zst"),
                     "text": ".txt",
                     "csv": ".csv",
                     "array_record": ".array_record",
                     "webdataset": ".tar",
                 }
                 if self.kind != "files":
-                    names = [name for name in names if name.endswith(extensions[self.kind])]
+                    names = [name for name in names if name.lower().endswith(extensions[self.kind])]
             else:
                 names = [path]
             found.extend(fs.unstrip_protocol(name) for name in names if fs.isfile(name))
@@ -308,6 +326,8 @@ class Files(Dataset):
 
     @staticmethod
     def _index_url(url: str) -> str:
+        if infer_compression(url.lower()) is not None:
+            return url + ".index.npy"
         return url.rsplit(".", 1)[0] + ".index.npy"
 
     def provision(self) -> Files:
@@ -320,7 +340,7 @@ class Files(Dataset):
         for url in self.paths:
             fs, path = Store(url, self.storage_options).resolve()
             offsets = []
-            with fs.open(path, "rb") as file:
+            with _open_lines(fs, path) as file:
                 if self.kind == "csv":
                     reader = csv.DictReader(_CsvLines(file))
                     _ = reader.fieldnames
@@ -462,6 +482,10 @@ class Files(Dataset):
         else:
             for url in self.paths:
                 size = integer(self._header(url)["size"], "file bytes")
+                if infer_compression(url.lower()) is not None:
+                    # Compressed bytes cannot be cut at logical record offsets.
+                    shards.append(Shard(f"{url}:0", url))
+                    continue
                 step = self.shard_bytes if self.kind in ("jsonl", "text") else max(size, 1)
                 if step < 1:
                     raise ValueError("file shard_bytes must be positive")
@@ -667,7 +691,7 @@ class _IndexedLines:
         headers = []
         for url in self.source.paths:
             fs, path = Store(url, self.source.storage_options).resolve()
-            with fs.open(path, "rb") as file:
+            with _open_lines(fs, path) as file:
                 headers.append(tuple(next(csv.reader(_CsvLines(file)))))
         return tuple(headers)
 
@@ -683,7 +707,13 @@ class _IndexedLines:
         fs, path = Store(self.source.paths[shard], self.source.storage_options).resolve()
         names = self.fieldnames[shard] if self.source.kind == "csv" else None
         offset = int(entry["offset"])
-        payload = fs.cat_file(path, start=offset, end=offset + int(entry["bytes"]))
+        compression = infer_compression(path.lower())
+        if compression is not None:
+            with _open_lines(fs, path) as file:
+                _seek_lines(file, offset)
+                payload = file.read(int(entry["bytes"]))
+        else:
+            payload = fs.cat_file(path, start=offset, end=offset + int(entry["bytes"]))
         if names is not None:
             return next(csv.DictReader(io.StringIO(payload.decode()), fieldnames=names))
         return json.loads(payload) if self.source.kind == "jsonl" else {"text": payload.decode()}
@@ -715,8 +745,9 @@ class _LineIterator(grain.DatasetIterator):
     def __init__(self, source: Files, shard: Shard):
         super().__init__()
         self.source, self.shard = source, shard
-        fs, path = Store(shard.uri, source.storage_options).resolve()
-        self.file = fs.open(path, "rb")
+        self.fs, self.path = Store(shard.uri, source.storage_options).resolve()
+        self.compression = infer_compression(self.path.lower())
+        self.file = _open_lines(self.fs, self.path)
         self.csv = csv.DictReader(_CsvLines(self.file)) if source.kind == "csv" else None
         if self.csv is not None:
             _ = self.csv.fieldnames
@@ -748,7 +779,13 @@ class _LineIterator(grain.DatasetIterator):
         offset = state["offset"]
         if not isinstance(offset, int) or offset < self.shard.start:
             raise ValueError(f"invalid file reader position for {self.shard.id}")
-        self.file.seek(offset)
+        if self.compression is not None:
+            # Zstandard streams seek forward only; restoration starts from a fresh decoder.
+            self.file.close()
+            self.file = _open_lines(self.fs, self.path)
+            if self.csv is not None:
+                self.csv = csv.DictReader(_CsvLines(self.file), fieldnames=self.csv.fieldnames)
+        _seek_lines(self.file, offset)
 
     def close(self) -> None:
         self.file.close()

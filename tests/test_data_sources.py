@@ -374,6 +374,47 @@ def test_jsonl_ranges_cover_rows_once_even_at_line_boundaries():
     assert list(resumed) == expected
 
 
+@pytest.mark.parametrize("extension", ["gz", "zst"])
+@pytest.mark.parametrize("transport", ["local", "memory"])
+@pytest.mark.parametrize("discovery", ["inferred", "explicit", "directory"])
+def test_compressed_jsonl_reads_and_resumes_in_every_read_mode(tmp_path, extension, transport, discovery):
+    import gzip
+
+    import zstandard
+
+    rows = [{"id": index, "text": "long escaped\nline " * 30} for index in range(30)]
+    payload = b"\n" + b"\n\n".join(json.dumps(row).encode() for row in rows)
+    compressed = gzip.compress(payload) if extension == "gz" else zstandard.ZstdCompressor().compress(payload)
+    root = Store(str(tmp_path) if transport == "local" else f"memory://compressed-{uuid4().hex}")
+    file = root.child(f"rows.jsonl.{extension}")
+    file.write(compressed)
+    url = root.url if discovery == "directory" else file.url
+    files = Files(url, format=None if discovery == "inferred" else "jsonl", shard_bytes=7)
+    manifest = files.manifest()
+    assert len(manifest.shards) == 1
+    reader = iter(manifest.reader(manifest.shards[0]))
+    try:
+        assert next(reader) == rows[0]
+        saved = reader.get_state()
+        assert list(reader) == rows[1:]
+        reader.set_state(saved)
+        assert list(reader) == rows[1:]
+    finally:
+        reader.close()
+    resumed = iter(manifest.reader(manifest.shards[0]))
+    try:
+        resumed.set_state(saved)
+        assert list(resumed) == rows[1:]
+    finally:
+        resumed.close()
+    assert list(files.records("memory")) == rows
+    files.provision()
+    assert files.supports("indexed")
+    indexed = files.records("indexed")
+    assert len(indexed) == len(rows)
+    assert [indexed[index] for index in (29, 0, 15, 29)] == [rows[index] for index in (29, 0, 15, 29)]
+
+
 def test_csv_quoted_newlines_are_never_byte_split():
     root = Store(f"memory://csv-{uuid4().hex}/rows.csv")
     root.write(b'id,text\n0,"two\nlines"\n1,"last"\n')
