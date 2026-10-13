@@ -73,8 +73,9 @@ from dew.nn.protocols import (
     CountedTraining,
     CountedVideo,
 )
-from dew.objectives.base import Path, Variables, freeze, merge as overlay, select, thaw
+from dew.objectives.base import FROZEN, Path, Variables, freeze, merge as overlay, select, thaw
 from dew.registry import wrapper_layers
+from dew.training.quantization import QUANTIZATION, InputQuantization, measured_fp8_sites
 
 PEFT_CONFIG = "adapter_config.json"
 PEFT_WEIGHTS = "adapter_model.safetensors"
@@ -155,7 +156,8 @@ class LoRA:
             raise ValueError("modules names at least one projection")
 
     def apply(self, model: nn.Module, variables: Variables, *, key: int | jax.Array,
-              layouts: Mapping[str, WeightLayout] | None = None) -> Adapter:
+              layouts: Mapping[str, WeightLayout] | None = None,
+              fp8_base: InputQuantization | None = None) -> Adapter:
         """Attach this adapter to `model` over `variables` and draw its factors.
 
         `layouts` maps module names to tree paths: `Pretrained.layouts` for a loaded
@@ -163,10 +165,17 @@ class LoRA:
         its names. An entry of `modules` that matches no projection is refused. A is
         drawn per module from `key` in sorted name order, the way PEFT draws it, and B
         is zero, so the adapted model computes exactly what the source does.
+
+        `fp8_base` (`fp8_base`'s measurement) runs its frozen sites' products in
+        FP8: their kernels are packed from the base this adapter freezes, and the
+        model computes them under the record, inside the adapter's branch. FP8
+        changes the function, by about E4M3's rounding of each operand.
         """
         from dew.nn.inputs import request_key
 
         _refuse_unadaptable(model)
+        if fp8_base is not None:
+            model = fp8_base.joined(model)
         variables = thaw(variables)
         bound = _named(bound_layouts(model, variables, layouts or {}), self.modules)
         scaling = 2.0 * self.rank if self.alpha is None else float(self.alpha)
@@ -180,6 +189,23 @@ class LoRA:
             _insert_factors(leaves, factors.module, INIT_A(factor_key, shape_a, jnp.float32),
                             INIT_B(factor_key, shape_b, jnp.float32))
         return Adapter.bound(model, overlay(variables, leaves), targets, self.rslora, self.dropout, bound)
+
+    def fp8_base(self, model: nn.Module, variables: Variables, *, tokens: int,
+                 modules: Sequence[str] | None = None,
+                 layouts: Mapping[str, WeightLayout] | None = None) -> InputQuantization:
+        """Measure which projections of the base this adapter freezes run
+        faster in FP8 on this GPU at `tokens` rows a step, and return the
+        record `apply` takes as its `fp8_base` (`measured_fp8_sites`).
+
+        `modules` names the projections as `modules` does (this adapter's own
+        when None) and `layouts` resolves them as `apply` does. The
+        measurement holds the GPU; a run records its result, so a rerun
+        reproduces the choice without measuring.
+        """
+        bound = _named(bound_layouts(model, thaw(variables), layouts or {}),
+                       self.modules if modules is None else tuple(modules))
+        sites = tuple("/".join(layout.paths[0][1:-1]) for layout in bound.values())
+        return measured_fp8_sites(thaw(variables), sites, tokens)
 
     @staticmethod
     def load(model: nn.Module, variables: Variables, path: str | FilePath, *,
@@ -242,8 +268,8 @@ class Adapter:
         """
         adapted = _adapted(model, _Branch(targets, rslora, dropout), layouts)
         factors = {(*path, factor) for path in targets for factor in FACTORS}
-        return cls(adapted, freeze(thaw(variables), lambda path: path in factors), targets, rslora, dropout,
-                   layouts)
+        return cls(adapted, _fp8_packed(model, freeze(thaw(variables), lambda path: path in factors)),
+                   targets, rslora, dropout, layouts)
 
     @classmethod
     def from_run(cls, directory: str | FilePath, *, step: int | str | None = None,
@@ -561,6 +587,17 @@ def _counted_adapter(model: nn.Module, branch: _Branch,
                             CountedPredictions, CountedPredictionParameters, CountedPredictionTraining)
 
 
+def _fp8_packed(model: nn.Module, variables: Variables) -> Variables:
+    """`variables` with the frozen FP8 kernels of the record `model` computes
+    under packed from its `FROZEN` base (`InputQuantization.packed`), the
+    only kernels an adapter never trains."""
+    record = type(model)._dew_wrapper() if "_dew_input_quantization" in vars(type(model)) else None
+    if record is None or not record.frozen_fp8:
+        return variables
+    packed = record.packed(variables[FROZEN])
+    return {**variables, QUANTIZATION: overlay(variables.get(QUANTIZATION, {}), packed)}
+
+
 def _adapted(model: nn.Module, branch: _Branch, layouts: Mapping[str, WeightLayout]) -> nn.Module:
     """Return `model` computing `branch` in every target module.
 
@@ -597,7 +634,7 @@ def _adapted(model: nn.Module, branch: _Branch, layouts: Mapping[str, WeightLayo
         def init_with_output(self, *args, **kwargs):
             with nn.intercept_methods(branch):
                 output, variables = super().init_with_output(*args, **kwargs)
-            return output, dict(freeze(variables, lambda path: path in factors))
+            return output, _fp8_packed(model, dict(freeze(variables, lambda path: path in factors)))
 
     Adapted.__name__ = Adapted.__qualname__ = base.__name__
     return Adapted(**{field.name: getattr(model, field.name)
