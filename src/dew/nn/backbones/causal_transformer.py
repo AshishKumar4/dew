@@ -1452,7 +1452,8 @@ class CausalTransformer(nn.Module):
     def mtp_hidden_states(self, hidden, tokens, train: bool = False,
                           positions=None, segment_ids=None, input_embeddings=None,
                           attention_mask=None,
-                          image_groups=None, rotary_positions=None):
+                          image_groups=None, rotary_positions=None,
+                          coordinates: Coordinates | None = None):
         """Return one final-normed state array per shifted prediction depth.
 
         Each depth combines the preceding hidden state with the next token's
@@ -1464,6 +1465,13 @@ class CausalTransformer(nn.Module):
         """
         if self.mtp and tokens.shape[1] <= len(self.mtp):
             raise ValueError("prediction depths need a sequence longer than their depth count")
+        if coordinates is None and (segment_ids is not None or attention_mask is not None
+                                    or positions is not None):
+            coordinates = build_coordinates(tokens.shape, segments=segment_ids, valid=attention_mask,
+                                            positions=positions)
+        if coordinates is not None:
+            segment_ids, positions, attention_mask = (coordinates.segments, coordinates.positions,
+                                                     coordinates.valid)
         embeds = self._prepared(self.token_embeddings(tokens), input_embeddings)
         # A depth restricts its keys only where the caller's validity or a
         # document boundary does. With neither, every shifted pair is real,
@@ -1482,10 +1490,11 @@ class CausalTransformer(nn.Module):
                     valid = valid & (segment_ids[:, :-depth] == segment_ids[:, depth:])
             segments, places = (None if field is None else field[:, depth:]
                                 for field in (segment_ids, positions))
-            given = valid is not None or segments is not None or places is not None
             metadata = AttentionMetadata(
-                coordinates=build_coordinates((hidden.shape[0], hidden.shape[1] - 1), valid=valid,
-                                              segments=segments, positions=places) if given else None,
+                # Cross-document pairs leave holes even when the token rows were right-padded.
+                coordinates=None if coordinates is None else build_coordinates(
+                    (hidden.shape[0], hidden.shape[1] - 1), segments=segments, valid=valid, positions=places,
+                    max_segments=coordinates.max_segments),
                 image_groups=None if image_groups is None else image_groups[:, depth:],
                 rotary_positions=None if rotary_positions is None else rotary_positions[:, depth:])
             hidden = block(hidden[:, :-1], embeds[:, depth:], train=train, attention_metadata=metadata)

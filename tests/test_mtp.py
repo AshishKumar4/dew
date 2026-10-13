@@ -191,10 +191,11 @@ def packed_row():
     return jnp.asarray(ids), jnp.asarray(segments), jnp.asarray(positions)
 
 
-def test_packing_carried_by_the_model_inputs_scores_the_depths_the_same():
+@pytest.mark.parametrize("depths", [1, 2])
+def test_packing_carried_by_the_model_inputs_scores_the_depths_the_same(depths):
     """Coordinates may ride the `ModelInputs` instead of beside the batch's
     token ids, and the losses are the same number either way."""
-    objective = LMObjective(tiny(num_nextn_predict_layers=1), SEQ, mtp_weight=0.3)
+    objective = LMObjective(tiny(num_nextn_predict_layers=depths), SEQ, mtp_weight=0.3)
     params = objective.init(jax.random.key(0))
     ids, segments, positions = packed_row()
     laid = coordinates(segments=segments, positions=positions, max_segments=ids.shape[1],
@@ -207,6 +208,13 @@ def test_packing_carried_by_the_model_inputs_scores_the_depths_the_same():
 
     assert float(by_inputs.metrics["ce"]) == float(by_columns.metrics["ce"])
     assert float(by_inputs.metrics["mtp_ce"]) == float(by_columns.metrics["mtp_ce"])
+    options = {"train": True, "depths": True, "rngs": {"dropout": step_at().key}}
+    supplied = objective.token_scores(params, carried[TEXT_KEY], **options)
+    explicit = objective.token_scores(params, ids, segment_ids=segments, positions=positions, **options)
+    for ours, reference in zip((supplied.losses, supplied.weights, *supplied.depths),
+                              (explicit.losses, explicit.weights, *explicit.depths), strict=True):
+        for left, right in zip(jax.tree.leaves(ours), jax.tree.leaves(reference), strict=True):
+            np.testing.assert_allclose(left, right, rtol=1e-6, atol=1e-6)
 
 
 def test_a_routed_depth_balances_only_when_the_depths_run():
