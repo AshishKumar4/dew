@@ -33,6 +33,8 @@ class Llama4Mixer(MixerBase):
     through the context.
     """
 
+    residuals = ('q_proj', 'k_proj', 'v_proj', 'kv_proj', 'o_proj', 'context')
+
     use_rope: bool = True
     use_qk_norm: bool = True
     attn_temperature_tuning: bool = True

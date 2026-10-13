@@ -1014,6 +1014,8 @@ class AttentionMixer(MixerBase):
     (`{"name": "attention", "fields": {"nope": true}}`).
     """
 
+    residuals = ('q_proj', 'k_proj', 'v_proj', 'kv_proj', 'o_proj', 'context')
+
     bidirectional_images: bool = False
     mrope_section: tuple[int, int, int] | None = None
     nope: bool = False
