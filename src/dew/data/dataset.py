@@ -917,14 +917,10 @@ def rows_of(batch: Mapping[str, object]) -> int:
 
     A batch may carry a field that is one value for the whole step rather
     than one per record, and that field says nothing about how many records
-    there are. Any mapping of fields answers, so the trainer's own batch type
-    reaches this as it is.
+    there are; a batch of such fields alone holds none. Any mapping of
+    fields answers, so the trainer's own batch type reaches this as it is.
     """
-    for leaf in jax.tree.leaves(batch):
-        shape = np.shape(leaf)
-        if shape:
-            return shape[0]
-    raise ValueError("a batch of scalars holds no records")
+    return next((np.shape(leaf)[0] for leaf in jax.tree.leaves(batch) if np.shape(leaf)), 0)
 
 
 _UNSTACKED = "Expected all input elements to have the same structure"

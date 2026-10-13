@@ -19,9 +19,9 @@ It reads the same sets as the encoder recipe, with the same proper scoring
 rules. An example whose questions alone pass 4,096 tokens is dropped and
 counted (`DecisionRunConfig`'s summary, `unfit`). AdamW at 1e-4 warms up
 over 400 steps and decays on a cosine to step 12,000, with 16,384-token
-micro-batch and update budgets;
-where a step does not fit the device, the trainer recomputes more of each
-block and compiles it again.
+micro-batch and update budgets; where a step does not fit the device, the
+trainer reads its batch in microbatches before it recomputes more of each
+block.
 """
 
 from encoder import RULES

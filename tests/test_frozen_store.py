@@ -210,3 +210,76 @@ def test_a_collection_saved_with_x64_on_restores_with_it_off(tmp_path):
     np.testing.assert_array_equal(held, table)
     variables = Checkpoints(str(tmp_path / "run")).variables(ema=False)
     np.testing.assert_array_equal(np.asarray(variables["constants"]["table"]), table.astype(np.float32))
+
+
+RETYPED = """
+import json, sys
+import jax, jax.numpy as jnp, numpy as np
+from jax.sharding import NamedSharding, PartitionSpec as P
+from dew.checkpoints import Checkpoints
+from dew.objectives.base import FROZEN
+from dew.training import MeshSpec
+
+mesh = MeshSpec(fsdp=2).build(jax.devices()[:2])
+run = Checkpoints(sys.argv[1])
+stored = run.stored()["variables"]
+host, _ = run.restore()
+
+def typed(leaf, shape=None):
+    shape = leaf.shape if shape is None else shape
+    split = P("fsdp") if shape and shape[0] % 2 == 0 else P()
+    return jax.ShapeDtypeStruct(shape, jnp.bfloat16, sharding=NamedSharding(mesh, split))
+
+def refused(template):
+    try:
+        Checkpoints(sys.argv[1]).restore(template)
+    except ValueError:
+        return True
+    return False
+
+template = {"step": jax.ShapeDtypeStruct((), jnp.float32, sharding=NamedSharding(mesh, P())),
+            "variables": jax.tree.map(typed, stored)}
+restored, _ = run.restore(template)
+leaves = jax.tree.leaves(restored["variables"])
+wanted = jax.tree.leaves(template["variables"])
+frozen = stored[FROZEN]
+layer = next(iter(frozen))
+kernel = jax.tree_util.tree_leaves_with_path(frozen)[0]
+reshaped = jax.tree_util.tree_map_with_path(
+    lambda path, leaf: typed(leaf, leaf.shape[::-1]) if path == kernel[0] else typed(leaf), frozen)
+factor = jax.tree_util.tree_leaves_with_path(stored["params"])[0]
+print(json.dumps({
+    "typed": all(leaf.dtype == want.dtype and leaf.sharding == want.sharding
+                 for leaf, want in zip(leaves, wanted, strict=True)),
+    "step": restored["step"].dtype == jnp.float32,
+    "values": all(np.array_equal(np.asarray(leaf, np.float32),
+                                 np.asarray(jnp.asarray(back, jnp.bfloat16), np.float32))
+                  for leaf, back in zip(leaves, jax.tree.leaves(host["variables"]), strict=True)),
+    "lacking": refused({"variables": {FROZEN: {**frozen, "layers_9": frozen[layer]}}}),
+    "frozen_shape": refused({"variables": {FROZEN: reshaped}}),
+    "step_shape": refused({"variables": {"params": jax.tree_util.tree_map_with_path(
+        lambda path, leaf: typed(leaf, leaf.shape[::-1]) if path == factor[0] else typed(leaf),
+        stored["params"])}}),
+}))
+"""
+
+
+def test_a_run_restores_in_a_new_process_onto_another_mesh_and_dtype(tmp_path):
+    """A LoRA run's checkpoint read by a new process onto a two-device fsdp
+    mesh in bf16: the step's leaves and the store's frozen base come back in
+    the template's dtype and placement, scalars too, with the stored values;
+    a template asking the store for a collection's missing layer, or either
+    path for a leaf in another shape, is refused."""
+    import json
+    import subprocess
+    import sys
+
+    from process_support import worker_env
+
+    adapted_run(tmp_path / "run", 2)
+    done = subprocess.run([sys.executable, "-c", RETYPED, str(tmp_path / "run")], capture_output=True,
+                          text=True, check=False, env=worker_env(2))
+    assert done.returncode == 0, done.stderr[-3000:]
+    read = json.loads(done.stdout.strip().splitlines()[-1])
+    outcomes = ("typed", "step", "values", "lacking", "frozen_shape", "step_shape")
+    assert read == dict.fromkeys(outcomes, True), read

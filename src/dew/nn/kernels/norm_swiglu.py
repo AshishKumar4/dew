@@ -60,9 +60,10 @@ from float64 at 24,576 rows against XLA's 1.22e-3). The bf16 tests compare
 outputs and every gradient against float64, not bitwise against XLA's
 differently rounded autodiff.
 """
+import dataclasses
 import functools
 import math
-from typing import NamedTuple
+from typing import ClassVar, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -73,30 +74,49 @@ from jax.interpreters.ad import JVPTracer
 
 from ..precision import at_least_fp32, compensated_add, rounded_to
 from ..sharding import logical_spec, manual_map
-from . import generation
+from . import generation, tuning
 from .generation import first_refusal
 
 IMPLEMENTATIONS = ('auto', 'xla', 'pallas')
 DTYPES = (jnp.dtype(jnp.float32), jnp.dtype(jnp.bfloat16))
 ROW_ELEMENTS = 2048
-MAX_PROGRAMS = 1024
+"""The heuristic forward's and reverse's register tile, in elements a program holds of a step's rows."""
 ROW_BLOCKS = 12
+"""The heuristic reverse's row blocks a program walks at least, so the two fp32
+partial rows it writes stay a small share of what it reads."""
+MAX_PROGRAMS = 1024
 ELEMENT_BLOCK = 1024
 
 
-def _programs(rows: int, width: int) -> int:
-    """The reverse pass's programs: each walks at least `ROW_BLOCKS` row
-    blocks, so the two fp32 partial rows it writes stay a small share of
-    what it reads, up to `MAX_PROGRAMS`."""
-    return max(1, min(MAX_PROGRAMS, pl.cdiv(rows, _row_block(width) * ROW_BLOCKS)))
-
-
 def _row_block(width: int) -> int:
-    """At most sixteen rows, with the live register tile bounded at
+    """The heuristic's rows a program holds: at most sixteen, the tile at most
     `ROW_ELEMENTS` elements except when a single row is wider. A 4096-wide
     norm takes one row rather than spilling copies of every backward
     intermediate."""
     return min(16, max(1, ROW_ELEMENTS // pl.next_power_of_2(width)))
+
+
+@dataclasses.dataclass(frozen=True)
+class RowsConfig:
+    """The forward's rows a program normalizes at once, and its warps."""
+    rows: int
+    warps: int
+
+
+@dataclasses.dataclass(frozen=True)
+class ReverseConfig:
+    """The reverse's rows a step, its programs and their warps: rows and
+    programs first, which order the weight gradient's sums."""
+    rows: int
+    programs: int
+    warps: int
+
+
+@dataclasses.dataclass(frozen=True)
+class BlockConfig:
+    """SwiGLU's elements a program and its warps."""
+    block: int
+    warps: int
 
 
 def _round(x, dtype, interpret: bool):
@@ -298,11 +318,10 @@ def _activated(gate, activation: str) -> tuple[jax.Array, jax.Array]:
     return activated, activated * (1.0 - sigmoid) + sigmoid
 
 
-def _rms_forward(x_ref, branch_ref, scale_ref, gate_ref, y_ref, stream_ref, inverse_ref, *, epsilon: float,
-                 offset: bool, stored, after_cast: bool, activation: str, interpret: bool):
+def _rms_forward(x_ref, branch_ref, scale_ref, gate_ref, y_ref, stream_ref, inverse_ref, *, row_block: int,
+                 epsilon: float, offset: bool, stored, after_cast: bool, activation: str, interpret: bool):
     rows, width = x_ref.shape
     columns = jnp.arange(pl.next_power_of_2(width))
-    row_block = _row_block(width)
     row = pl.program_id(0) * row_block + jnp.arange(row_block)
     at = (row[:, None], columns[None, :])
     mask = (row[:, None] < rows) & (columns[None, :] < width)
@@ -338,40 +357,47 @@ def _pairwise(values, *, interpret: bool) -> tuple[jax.Array, jax.Array]:
 
 
 def _rms_backward(x_ref, scale_ref, gate_ref, inverse_ref, dy_ref, stream_ref, dx_ref, dgate_ref, partial_ref,
-                  correction_ref, *, offset: bool, stored, after_cast: bool, activation: str,
+                  correction_ref, *, row_block: int, offset: bool, stored, after_cast: bool, activation: str,
                   interpret: bool):
     rows, width = x_ref.shape
     columns = jnp.arange(pl.next_power_of_2(width))
     groups = pl.num_programs(0)
     group = pl.program_id(0)
-    row_block = _row_block(width)
     weight = _weight(scale_ref, columns, width, offset, stored, interpret) if scale_ref is not None else 1.0
 
     def block(i, accumulated):
         row = (i * groups + group) * row_block + jnp.arange(row_block)
         at = (row[:, None], columns[None, :])
         mask = (row[:, None] < rows) & (columns[None, :] < width)
-        x = plgpu.load(x_ref.at[at], mask=mask, other=0).astype(jnp.float32)
-        dy = plgpu.load(dy_ref.at[at], mask=mask, other=0).astype(jnp.float32)
+
+        def streamed(ref):
+            # Read once and never again: first out of L2, so the weight and
+            # the partial sums stay. All three are issued before the row
+            # reduction waits on any of them.
+            return plgpu.load(ref.at[at], mask=mask, other=0, eviction_policy="evict_first")
+
+        x = streamed(x_ref).astype(jnp.float32)
+        dy = streamed(dy_ref).astype(jnp.float32)
+        ds = None if stream_ref is None else streamed(stream_ref)
         inverse = plgpu.load(inverse_ref.at[row], mask=row < rows, other=0)
         normalized = x * inverse[:, None]
         if after_cast:
             normalized = _round(normalized, dy_ref.dtype, interpret)
         if gate_ref is not None:
             # The gate's cotangent reads the weighted norm; the norm's, the gated one.
-            activated, slope = _activated(plgpu.load(gate_ref.at[at], mask=mask, other=0).astype(jnp.float32),
-                                          activation)
+            activated, slope = _activated(streamed(gate_ref).astype(jnp.float32), activation)
             dgate = dy * (normalized * weight) * slope
-            plgpu.store(dgate_ref.at[at], dgate.astype(dgate_ref.dtype), mask=mask)
+            plgpu.store(dgate_ref.at[at], dgate.astype(dgate_ref.dtype), mask=mask,
+                        eviction_policy="evict_first")
             dy = dy * activated
         m = dy * weight
         # The two x contributions are kept separate, as XLA's square VJP is.
         correction = (-0.5 * jnp.sum(m * x, axis=1)) * (inverse * inverse * inverse) * (1.0 / width)
         dx = m * inverse[:, None] + (2.0 * x) * correction[:, None]
-        if stream_ref is not None:
+        if ds is not None:
             # The stream's own cotangent joins in fp32, one rounding for the sum.
-            dx = dx + plgpu.load(stream_ref.at[at], mask=mask, other=0).astype(jnp.float32)
-        plgpu.store(dx_ref.at[at], dx.astype(dx_ref.dtype), mask=mask)
+            dx = dx + ds.astype(jnp.float32)
+        plgpu.store(dx_ref.at[at], dx.astype(dx_ref.dtype), mask=mask, eviction_policy="evict_first")
         if scale_ref is None:
             return accumulated
         # Every product exact as a pair, compensated (Neumaier) into the
@@ -404,12 +430,88 @@ class _Norm(NamedTuple):
     weight reaches the kernels in fp32, `stored` its own dtype, in which the
     offset adds; the activation gates only a norm called with a gate."""
     epsilon: float
-    dtype: jnp.dtype
+    dtype: str
     offset: bool
-    stored: jnp.dtype
+    stored: str
     after_cast: bool
     activation: str
     interpret: bool
+
+
+@dataclasses.dataclass(frozen=True)
+class RmsForward(tuning.KernelOp):
+    """The norm's forward launch over `[rows, width]` (`_rms_forward`): the
+    normed rows, the stream `x + branch` where a branch joins, and each
+    row's inverse RMS."""
+
+    config_cls: ClassVar[type[RowsConfig]] = RowsConfig
+    ROWS: ClassVar[tuple[str, ...]] = ('x', 'branch', 'gate')
+
+    def _fwd(self, x: jax.Array, branch: jax.Array | None, scale: jax.Array | None, gate: jax.Array | None, *,
+             epsilon: float, dtype: str, offset: bool, stored: str, after_cast: bool, activation: str,
+             interpret: bool, config: RowsConfig, return_residuals: bool = False):
+        rows, width = x.shape
+        return pl.pallas_call(
+            functools.partial(_rms_forward, row_block=config.rows, epsilon=epsilon, offset=offset,
+                              stored=jnp.dtype(stored), after_cast=after_cast, activation=activation,
+                              interpret=interpret),
+            grid=(pl.cdiv(rows, config.rows),),
+            out_shape=(jax.ShapeDtypeStruct((rows, width), jnp.dtype(dtype)),
+                       None if branch is None else jax.ShapeDtypeStruct((rows, width), x.dtype),
+                       jax.ShapeDtypeStruct((rows,), jnp.float32)),
+            compiler_params=plgpu.CompilerParams(num_warps=config.warps, num_stages=1),
+            interpret=interpret, name="rms_norm_forward",
+        )(x, branch, scale, gate), None
+
+    def _get_heuristics_config(self, ba) -> RowsConfig:
+        return RowsConfig(_row_block(ba.arguments['x'].shape[1]), 4)
+
+    def _get_autotuning_configs(self, ba) -> set[RowsConfig]:
+        width = pl.next_power_of_2(ba.arguments['x'].shape[1])
+        return {RowsConfig(rows, warps) for rows in (1, 2, 4, 8, 16, 32)
+                if rows == 1 or rows * width <= 16384 for warps in (1, 2, 4, 8)}
+
+
+@dataclasses.dataclass(frozen=True)
+class RmsBackward(tuning.KernelOp):
+    """The norm's reverse launch (`_rms_backward`): the input's gradient with
+    the stream's own cotangent `ds` added, the gate's, and each program's
+    compensated partial sums of the weight's."""
+
+    config_cls: ClassVar[type[ReverseConfig]] = ReverseConfig
+    ROWS: ClassVar[tuple[str, ...]] = ('x', 'gate', 'inverse', 'dy', 'ds')
+
+    def _fwd(self, x: jax.Array, scale: jax.Array | None, gate: jax.Array | None, inverse: jax.Array,
+             dy: jax.Array, ds: jax.Array | None, *, offset: bool, stored: str, after_cast: bool,
+             activation: str, interpret: bool, config: ReverseConfig, return_residuals: bool = False):
+        rows, width = x.shape
+        groups = max(1, min(config.programs, pl.cdiv(rows, config.rows)))
+        partial = None if scale is None else jax.ShapeDtypeStruct((groups, width), jnp.float32)
+        return pl.pallas_call(
+            functools.partial(_rms_backward, row_block=config.rows, offset=offset, stored=jnp.dtype(stored),
+                              after_cast=after_cast, activation=activation, interpret=interpret),
+            grid=(groups,),
+            out_shape=(jax.ShapeDtypeStruct((rows, width), x.dtype),
+                       None if gate is None else jax.ShapeDtypeStruct((rows, width), gate.dtype),
+                       partial, partial),
+            compiler_params=plgpu.CompilerParams(num_warps=config.warps, num_stages=1),
+            interpret=interpret, name="rms_norm_backward",
+        )(x, scale, gate, inverse, dy, ds), None
+
+    def _get_heuristics_config(self, ba) -> ReverseConfig:
+        rows, width = ba.arguments['x'].shape
+        block = _row_block(width)
+        return ReverseConfig(block, max(1, min(MAX_PROGRAMS, pl.cdiv(rows, block * ROW_BLOCKS))), 4)
+
+    def _get_autotuning_configs(self, ba) -> set[ReverseConfig]:
+        width = pl.next_power_of_2(ba.arguments['x'].shape[1])
+        return {ReverseConfig(rows, programs, warps) for rows in (1, 2, 4, 8, 16)
+                if rows == 1 or rows * width <= 8192
+                for programs in (256, 512, 1024, 2048) for warps in (2, 4, 8)}
+
+
+_RMS_FORWARD = RmsForward()
+_RMS_BACKWARD = RmsBackward()
 
 
 def _flat(value):
@@ -418,17 +520,7 @@ def _flat(value):
 
 def _rms_with_inverse(x, branch, scale, gate, norm: _Norm):
     """`(stream, y)` and the per-row inverse RMS, the stream `x + branch`, or `x` itself."""
-    rows, width = math.prod(x.shape[:-1]), x.shape[-1]
-    y, stream, inverse = pl.pallas_call(
-        functools.partial(_rms_forward, epsilon=norm.epsilon, offset=norm.offset, stored=norm.stored,
-                          after_cast=norm.after_cast, activation=norm.activation, interpret=norm.interpret),
-        grid=(pl.cdiv(rows, _row_block(width)),),
-        out_shape=(jax.ShapeDtypeStruct((rows, width), norm.dtype),
-                   None if branch is None else jax.ShapeDtypeStruct((rows, width), x.dtype),
-                   jax.ShapeDtypeStruct((rows,), jnp.float32)),
-        compiler_params=plgpu.CompilerParams(num_warps=4, num_stages=1),
-        interpret=norm.interpret, name="rms_norm_forward",
-    )(_flat(x), _flat(branch), scale, _flat(gate))
+    y, stream, inverse = _RMS_FORWARD(_flat(x), _flat(branch), scale, _flat(gate), **norm._asdict())
     return (x if branch is None else stream.reshape(x.shape), y.reshape(x.shape)), inverse
 
 
@@ -438,19 +530,9 @@ def _rms_backward_call(stream, scale, gate, inverse, dy, ds, norm: _Norm):
     if dy is None:
         zeros = [None if value is None else jnp.zeros_like(value) for value in (stream, gate, scale)]
         return (zeros[0] if ds is None else ds), zeros[1], zeros[2]
-    rows, width = math.prod(stream.shape[:-1]), stream.shape[-1]
-    groups = _programs(rows, width)
-    partial_shape = None if scale is None else jax.ShapeDtypeStruct((groups, width), jnp.float32)
-    dx, dgate, partial, correction = pl.pallas_call(
-        functools.partial(_rms_backward, offset=norm.offset, stored=norm.stored, after_cast=norm.after_cast,
-                          activation=norm.activation, interpret=norm.interpret),
-        grid=(groups,),
-        out_shape=(jax.ShapeDtypeStruct((rows, width), stream.dtype),
-                   None if gate is None else jax.ShapeDtypeStruct((rows, width), gate.dtype),
-                   partial_shape, partial_shape),
-        compiler_params=plgpu.CompilerParams(num_warps=4, num_stages=1),
-        interpret=norm.interpret, name="rms_norm_backward",
-    )(_flat(stream), scale, _flat(gate), inverse, _flat(dy), _flat(ds))
+    dx, dgate, partial, correction = _RMS_BACKWARD(
+        _flat(stream), scale, _flat(gate), inverse, _flat(dy), _flat(ds), offset=norm.offset,
+        stored=norm.stored, after_cast=norm.after_cast, activation=norm.activation, interpret=norm.interpret)
     dscale = None if scale is None else _scale_sum(partial, correction)
     return dx.reshape(stream.shape), None if gate is None else dgate.reshape(gate.shape), dscale
 
@@ -525,8 +607,8 @@ _gated_rms_vjp.defvjp(_gated_rms_fwd, _gated_rms_bwd)
 
 
 def _norm(epsilon: float, dtype, offset: bool, after_cast: bool, scale, activation: str = 'silu') -> _Norm:
-    stored = jnp.dtype(jnp.float32 if scale is None else scale.dtype)
-    return _Norm(float(epsilon), jnp.dtype(dtype), offset, stored, after_cast, activation,
+    stored = jnp.dtype(jnp.float32 if scale is None else scale.dtype).name
+    return _Norm(float(epsilon), jnp.dtype(dtype).name, offset, stored, after_cast, activation,
                  not generation.triton_runs())
 
 
@@ -570,8 +652,8 @@ def gated_rms_norm(x, gate, scale, epsilon: float, dtype, activation: str, *, ax
                       (x, gate, _widened(scale)), (False, False, True))
 
 
-def _swiglu_forward(gate_ref, up_ref, y_ref, *, interpret: bool):
-    index = pl.program_id(0) * ELEMENT_BLOCK + jnp.arange(ELEMENT_BLOCK)
+def _swiglu_forward(gate_ref, up_ref, y_ref, *, block: int, interpret: bool):
+    index = pl.program_id(0) * block + jnp.arange(block)
     mask = index < gate_ref.shape[0]
     gate = plgpu.load(gate_ref.at[index], mask=mask, other=0).astype(jnp.float32)
     up = plgpu.load(up_ref.at[index], mask=mask, other=0).astype(jnp.float32)
@@ -579,8 +661,8 @@ def _swiglu_forward(gate_ref, up_ref, y_ref, *, interpret: bool):
     plgpu.store(y_ref.at[index], (activated * up).astype(y_ref.dtype), mask=mask)
 
 
-def _swiglu_backward(gate_ref, up_ref, dy_ref, dg_ref, du_ref, *, interpret: bool):
-    index = pl.program_id(0) * ELEMENT_BLOCK + jnp.arange(ELEMENT_BLOCK)
+def _swiglu_backward(gate_ref, up_ref, dy_ref, dg_ref, du_ref, *, block: int, interpret: bool):
+    index = pl.program_id(0) * block + jnp.arange(block)
     mask = index < gate_ref.shape[0]
     gate = plgpu.load(gate_ref.at[index], mask=mask, other=0).astype(jnp.float32)
     up = plgpu.load(up_ref.at[index], mask=mask, other=0).astype(jnp.float32)
@@ -592,14 +674,60 @@ def _swiglu_backward(gate_ref, up_ref, dy_ref, dg_ref, du_ref, *, interpret: boo
     plgpu.store(du_ref.at[index], (dy * activated).astype(up_ref.dtype), mask=mask)
 
 
+@dataclasses.dataclass(frozen=True)
+class _Elementwise(tuning.KernelOp):
+    """An elementwise launch over flat operands: `ELEMENT_BLOCK` elements and
+    four warps a program unless measured."""
+
+    config_cls: ClassVar[type[BlockConfig]] = BlockConfig
+
+    def _get_heuristics_config(self, ba) -> BlockConfig:
+        return BlockConfig(ELEMENT_BLOCK, 4)
+
+    def _get_autotuning_configs(self, ba) -> set[BlockConfig]:
+        return {BlockConfig(block, warps) for block in (256, 512, 1024, 2048, 4096) for warps in (1, 2, 4, 8)}
+
+
+@dataclasses.dataclass(frozen=True)
+class SwigluForward(_Elementwise):
+    """SwiGLU's forward launch over flat `gate` and `up` (`_swiglu_forward`)."""
+
+    ROWS: ClassVar[tuple[str, ...]] = ('gate', 'up')
+
+    def _fwd(self, gate: jax.Array, up: jax.Array, *, interpret: bool, config: BlockConfig,
+             return_residuals: bool = False):
+        return pl.pallas_call(
+            functools.partial(_swiglu_forward, block=config.block, interpret=interpret),
+            grid=(pl.cdiv(gate.size, config.block),), out_shape=jax.ShapeDtypeStruct(gate.shape, gate.dtype),
+            compiler_params=plgpu.CompilerParams(num_warps=config.warps, num_stages=1),
+            interpret=interpret, name="swiglu_forward",
+        )(gate, up), None
+
+
+@dataclasses.dataclass(frozen=True)
+class SwigluBackward(_Elementwise):
+    """SwiGLU's reverse launch (`_swiglu_backward`): both inputs' gradients."""
+
+    ROWS: ClassVar[tuple[str, ...]] = ('gate', 'up', 'dy')
+
+    def _fwd(self, gate: jax.Array, up: jax.Array, dy: jax.Array, *, interpret: bool, config: BlockConfig,
+             return_residuals: bool = False):
+        return pl.pallas_call(
+            functools.partial(_swiglu_backward, block=config.block, interpret=interpret),
+            grid=(pl.cdiv(gate.size, config.block),),
+            out_shape=(jax.ShapeDtypeStruct(gate.shape, gate.dtype),
+                       jax.ShapeDtypeStruct(up.shape, up.dtype)),
+            compiler_params=plgpu.CompilerParams(num_warps=config.warps, num_stages=1),
+            interpret=interpret, name="swiglu_backward",
+        )(gate, up, dy), None
+
+
+_SWIGLU_FORWARD = SwigluForward()
+_SWIGLU_BACKWARD = SwigluBackward()
+
+
 def _swiglu(gate, up, interpret: bool):
-    y = pl.pallas_call(
-        functools.partial(_swiglu_forward, interpret=interpret), grid=(pl.cdiv(gate.size, ELEMENT_BLOCK),),
-        out_shape=jax.ShapeDtypeStruct((gate.size,), gate.dtype),
-        compiler_params=plgpu.CompilerParams(num_warps=4, num_stages=1),
-        interpret=interpret, name="swiglu_forward",
-    )(gate.reshape(-1), up.reshape(-1))
-    return y.reshape(gate.shape)
+    return _SWIGLU_FORWARD(gate.reshape(-1), up.reshape(-1), interpret=interpret).reshape(gate.shape)
 
 
 def _swiglu_fwd(gate, up, interpret: bool):
@@ -608,13 +736,7 @@ def _swiglu_fwd(gate, up, interpret: bool):
 
 def _swiglu_bwd(interpret: bool, residual, dy):
     gate, up = residual
-    dg, du = pl.pallas_call(
-        functools.partial(_swiglu_backward, interpret=interpret), grid=(pl.cdiv(gate.size, ELEMENT_BLOCK),),
-        out_shape=(jax.ShapeDtypeStruct((gate.size,), gate.dtype),
-                   jax.ShapeDtypeStruct((up.size,), up.dtype)),
-        compiler_params=plgpu.CompilerParams(num_warps=4, num_stages=1),
-        interpret=interpret, name="swiglu_backward",
-    )(gate.reshape(-1), up.reshape(-1), dy.reshape(-1))
+    dg, du = _SWIGLU_BACKWARD(gate.reshape(-1), up.reshape(-1), dy.reshape(-1), interpret=interpret)
     return dg.reshape(gate.shape), du.reshape(up.shape)
 
 
