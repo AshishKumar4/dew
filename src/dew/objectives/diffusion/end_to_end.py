@@ -33,6 +33,7 @@ import numpy as np
 from flax import linen as nn
 from jax.typing import ArrayLike
 
+from dew.nn.autoencoders.kl import posterior_moments
 from dew.objectives.base import Batch, Objective, Variables
 
 if TYPE_CHECKING:
@@ -242,8 +243,7 @@ class EndToEnd:
 
         # At least float32, and a float64 run stays float64.
         dtype = jnp.promote_types(jnp.result_type(moments, reconstruction), jnp.float32)
-        mean, log_variance = jnp.split(moments.astype(dtype), 2, axis=-1)
-        log_variance = jnp.clip(log_variance, -30.0, 20.0)
+        mean, log_variance = posterior_moments(moments.astype(dtype))
         axes = tuple(range(1, mean.ndim))
         kl = mean_of(0.5 * jnp.sum(jnp.square(mean) + jnp.exp(log_variance) - 1.0 - log_variance, axis=axes))
         reconstruction = reconstruction.astype(dtype)
