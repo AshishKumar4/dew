@@ -80,8 +80,10 @@ pool's entries. One name each, since every layer reads the latest (section
 _rotate_rope = functools.partial(rotate, pairs='adjacent', span='trailing')
 """V4's rotary: the trailing rope channels of a head or an entry turn in
 interleaved pairs that land back in place, the nope channels before them
-untouched (modeling_deepseek_v4.py:326-350), so a rotation by the negated
-sine undoes it, which the attention output relies on."""
+untouched (modeling_deepseek_v4.py:326-350). The attention output turns
+back by the negated sine, the conjugate rotation, which undoes it at a YaRN
+amplitude of 1 and scales the slice by its square otherwise, as the
+reference's does."""
 
 
 def pool_windows(kv, gate, position_bias, rate: int, overlap: bool):
