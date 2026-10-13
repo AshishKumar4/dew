@@ -15,6 +15,7 @@ import threading
 from concurrent.futures import Future
 from contextlib import contextmanager
 
+import jax
 import numpy as np
 import pytest
 
@@ -26,6 +27,11 @@ from dew.sampling import Sampling
 
 EOS = 9
 SAMPLING = Sampling(temperature=1.0, eos_token_ids=EOS)
+KEY = jax.random.key(7)
+
+
+def words(key):
+    return tuple(int(word) for word in jax.random.key_data(key))
 
 
 class Server:
@@ -33,7 +39,7 @@ class Server:
 
     def __init__(self, tokens=(5, EOS), raw=True, sampling=SAMPLING, hold=False):
         self.version, self.tokens, self.raw, self._sampling, self.hold = 0, tokens, raw, sampling, hold
-        self.held, self.prompts = [], []
+        self.held, self.prompts, self.keys = [], [], []
 
     @property
     def sampling(self):
@@ -41,6 +47,7 @@ class Server:
 
     def submit(self, prompt, max_new_tokens, *, key):
         self.prompts.append(tuple(prompt))
+        self.keys.append(words(key))
         future = Future()
         draw = Draw(tuple(prompt), self.tokens, (-.5,) * len(self.tokens),
                     (-.4,) * len(self.tokens) if self.raw else None, self.tokens[-1] == EOS, self.version)
@@ -103,10 +110,12 @@ def test_a_multi_turn_session_keeps_each_calls_version_and_packs_into_one_chain(
         server.version = steps  # a weight push lands after every tool step
 
     episodes = source(server, factory(entered, exited, on_step=push))
-    rollout = episodes.submit(Task("3"), 1, version=0)[0].result(timeout=10)
+    rollout = episodes.submit(Task("3"), 1, version=0, key=KEY)[0].result(timeout=10)
     episodes.close()
     assert rollout.status == Status.COMPLETED and rollout.reward == 3.0
     assert [call.version for call in rollout.calls] == [0, 1, 2]
+    # Turn t of sample 0 draws under fold_in(fold_in(key, 0), t), the key's own stream.
+    assert server.keys == [words(jax.random.fold_in(jax.random.fold_in(KEY, 0), turn)) for turn in range(3)]
     assert [call.prompt_ids for call in rollout.calls] == [
         (1, 2),
         (1, 2, 5, EOS, 4),
@@ -139,7 +148,7 @@ def test_every_call_of_a_multi_turn_session_carries_its_draws_engine_records():
             return done
 
     episodes = source(Recording(), factory([], []))
-    session = episodes.submit(Task("3"), 1, version=0)[0].result(timeout=10)
+    session = episodes.submit(Task("3"), 1, version=0, key=KEY)[0].result(timeout=10)
     episodes.close()
     assert [int(call.routed_experts[0, 0, 0]) for call in session.calls] == [2, 5, 8]
     assert all(call.support == ((5, 6), (EOS,)) for call in session.calls)
@@ -152,7 +161,7 @@ def test_every_call_of_a_multi_turn_session_carries_its_draws_engine_records():
 def test_an_environment_failure_is_an_unscored_infra_error(fail, detail):
     entered, exited = [], []
     episodes = source(Server(), factory(entered, exited, fail=fail))
-    rollout = episodes.submit(Task("1"), 1, version=0)[0].result(timeout=10)
+    rollout = episodes.submit(Task("1"), 1, version=0, key=KEY)[0].result(timeout=10)
     episodes.close()
     assert rollout.status == Status.INFRA_ERROR and rollout.reward is None and detail in rollout.detail
     assert len(rollout.calls) == 1 and exited == entered
@@ -163,7 +172,7 @@ def test_a_verifier_crash_is_an_infra_error():
         raise TimeoutError("verifier sandbox timed out")
 
     episodes = source(Server(), factory([], []), verifier=crash)
-    rollout = episodes.submit(Task("1"), 1, version=0)[0].result(timeout=10)
+    rollout = episodes.submit(Task("1"), 1, version=0, key=KEY)[0].result(timeout=10)
     episodes.close()
     assert rollout.status == Status.INFRA_ERROR and "verifier sandbox timed out" in rollout.detail
 
@@ -175,7 +184,7 @@ def test_a_verifier_crash_is_an_infra_error():
 ])
 def test_limits_truncate_and_the_truncation_is_still_scored(server, options, calls, detail):
     episodes = source(server, factory([], []), **options)
-    rollout = episodes.submit(Task("1"), 1, version=0)[0].result(timeout=10)
+    rollout = episodes.submit(Task("1"), 1, version=0, key=KEY)[0].result(timeout=10)
     episodes.close()
     assert rollout.status == Status.TRUNCATED and detail in rollout.detail
     assert len(rollout.calls) == calls and rollout.reward == float(calls)
@@ -185,7 +194,7 @@ def test_a_cancelled_session_stops_mid_draw_and_releases_its_environment():
     server = Server(hold=True)
     entered, exited = [], []
     episodes = source(server, factory(entered, exited))
-    future = episodes.submit(Task("1"), 1, version=0)[0]
+    future = episodes.submit(Task("1"), 1, version=0, key=KEY)[0]
     while not server.held:
         threading.Event().wait(0.01)
     episodes.cancel([future])
@@ -198,11 +207,11 @@ def test_a_server_without_raw_likelihoods_under_a_transforming_policy_is_refused
     server = Server(raw=False, sampling=Sampling(temperature=0.7, eos_token_ids=EOS))
     episodes = source(server, factory([], []))
     with pytest.raises(ValueError):
-        episodes.submit(Task("1"), 1, version=0)[0].result(timeout=10)
+        episodes.submit(Task("1"), 1, version=0, key=KEY)[0].result(timeout=10)
     episodes.close()
     # At temperature one without filters the behavior likelihoods are the raw ones.
     episodes = source(Server(raw=False), factory([], []))
-    assert episodes.submit(Task("1"), 1, version=0)[0].result(timeout=10).status == Status.COMPLETED
+    assert episodes.submit(Task("1"), 1, version=0, key=KEY)[0].result(timeout=10).status == Status.COMPLETED
     episodes.close()
 
 
@@ -224,13 +233,15 @@ def test_the_prompt_source_scores_decoded_text_without_eos_and_masks_the_budget_
 
     [task] = prompt_tasks(prompt_batch())
     assert task.data["prompt"] == (1, 2)
-    prompts = PromptSource(Server(), reward, decode=lambda ids: " ".join(map(str, ids)), max_new_tokens=4)
-    rollouts = [future.result(timeout=10) for future in prompts.submit(task, 2, version=0)]
+    server = Server()
+    prompts = PromptSource(server, reward, decode=lambda ids: " ".join(map(str, ids)), max_new_tokens=4)
+    rollouts = [future.result(timeout=10) for future in prompts.submit(task, 2, version=0, key=KEY)]
     assert seen == [("math", "5", "5")] * 2
+    assert server.keys == [words(jax.random.fold_in(KEY, sample)) for sample in range(2)]
     assert all(r.status == Status.COMPLETED and r.reward == 1.0 for r in rollouts)
 
     long = PromptSource(Server(tokens=(5, 6, 7, 8)), reward, decode=str, max_new_tokens=4)
-    assert long.submit(task, 1, version=0)[0].result(timeout=10).status == Status.TRUNCATED
+    assert long.submit(task, 1, version=0, key=KEY)[0].result(timeout=10).status == Status.TRUNCATED
     prompts.close()
     long.close()
 
@@ -251,7 +262,7 @@ def test_the_prompt_sources_calls_carry_the_draws_routing_into_the_packed_batch(
 
     [task] = prompt_tasks(prompt_batch())
     prompts = PromptSource(Routed(), lambda *_: 1.0, decode=str, max_new_tokens=4)
-    sessions = [future.result(timeout=10) for future in prompts.submit(task, 2, version=0)]
+    sessions = [future.result(timeout=10) for future in prompts.submit(task, 2, version=0, key=KEY)]
     prompts.close()
     batch = pack(sessions, 8)
     assert (batch[ROUTED_EXPERTS_KEY][:, :3] == 3).all()
@@ -266,10 +277,10 @@ def test_a_failed_draw_or_reward_is_an_infra_error():
 
     [task] = prompt_tasks(prompt_batch())
     drawn = PromptSource(Failing(), lambda *_: 1.0, decode=str, max_new_tokens=4)
-    rollout = drawn.submit(task, 1, version=0)[0].result(timeout=10)
+    rollout = drawn.submit(task, 1, version=0, key=KEY)[0].result(timeout=10)
     assert rollout.status == Status.INFRA_ERROR and "engine restarted" in rollout.detail
     scored = PromptSource(Server(), lambda *_: float("nan"), decode=str, max_new_tokens=4)
-    rollout = scored.submit(task, 1, version=0)[0].result(timeout=10)
+    rollout = scored.submit(task, 1, version=0, key=KEY)[0].result(timeout=10)
     assert rollout.status == Status.INFRA_ERROR and "non-finite" in rollout.detail
     drawn.close()
     scored.close()
@@ -285,7 +296,7 @@ def test_a_prompt_source_failure_outside_the_reward_resolves_the_future_instead_
 
     [task] = prompt_tasks(prompt_batch())
     prompts = PromptSource(Server(), lambda *_: 1.0, decode=decode, max_new_tokens=4)
-    future = prompts.submit(task, 1, version=0)[0]
+    future = prompts.submit(task, 1, version=0, key=KEY)[0]
     with pytest.raises(Interrupted):
         future.result(timeout=10)
     prompts.close()
