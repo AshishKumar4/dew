@@ -16,6 +16,7 @@ lands one fp32 ulp (4.8e-7) from torch's; `LOSS` is two.
 import json
 import math
 import os
+import shutil
 
 import jax
 import jax.numpy as jnp
@@ -170,6 +171,11 @@ def test_the_fallback_refuses_what_it_cannot_run(source, loaded, tmp_path):
     with pytest.raises(ValueError, match=r"float weights only.*awq"):
         Pretrained.load(tmp_path, fallback="torchax")
     assert not hasattr(loaded, "text_generation")
+    listed = tmp_path / "listed"
+    shutil.copytree(source[0], listed)
+    (listed / "generation_config.json").write_text("[]")
+    with pytest.raises(ValueError, match=r"generation_config\.json must contain an object"):
+        Pretrained.load(listed, fallback="torchax")
 
 
 GPT2 = ("openai-community/gpt2", "607a30d783dfa663caf39e06633721c8d4cfcd7e")
