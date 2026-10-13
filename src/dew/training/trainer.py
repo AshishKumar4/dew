@@ -1508,11 +1508,8 @@ class Trainer(Generic[Loss, Effects]):
                 if not compiled and self.rollout is None and inputs is not None:
                     # A rollout writes the batch its loss reads, from prompts it reads itself.
                     agreed("training input declaration", functools.partial(inputs.check, batch))
-                if batch_shapes(batch) not in compiled:
-                    # A compile holds the devices idle anyway, and its seconds are the next interval's.
-                    self._read_taken(run)
                 known, began = len(compiled), time.perf_counter()
-                train_step, measured_flops, state = self._compiled_for(compiled, state, batch)
+                train_step, measured_flops, state = self._compiled_for(compiled, state, batch, run)
                 interval.compiles = len(compiled)
                 if not known:
                     # Rebound once the step is compiled, so the first tick
@@ -2130,9 +2127,10 @@ class Trainer(Generic[Loss, Effects]):
         return batch, time.perf_counter() - began
 
     def _compiled_for(self, compiled: dict[Shapes, tuple[CompiledStep, StepFlops | None]], state: TrainState,
-                      batch: Batch) -> tuple[CompiledStep, StepFlops | None, TrainState]:
+                      batch: Batch, run: _FitRun) -> tuple[CompiledStep, StepFlops | None, TrainState]:
         """Return the step compiled for this batch's shapes, compiling on first sight, and the state
-        to step, a fresh copy where the plan timed steps on it (`Timer`).
+        to step, a fresh copy where the plan timed steps on it (`Timer`). A compile reads `run`'s
+        pending log first: it holds the devices idle anyway, and its seconds are the next interval's.
 
         A ramped run reads a new shape at every stage, so `compiled` keeps
         one step per stage with the FLOPs measured for it.
@@ -2140,6 +2138,7 @@ class Trainer(Generic[Loss, Effects]):
         timer = Timer(state, batch)
         shapes = batch_shapes(batch)
         if shapes not in compiled:
+            self._read_taken(run)
             # A process whose reader changed a field or a shape would compile
             # a program whose collectives its peers' never meet.
             agreed_same("training batch layout", lambda: batch_layout(batch))
