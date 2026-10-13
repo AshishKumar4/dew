@@ -728,6 +728,24 @@ class ModulatedBlock(nn.Module):
         return constrain(skip + gate_mlp * mlp_output, RESIDUAL)
 
 
+def factorized_walk(tokens: jax.Array, frames: int, head_dim: int, layers) -> jax.Array:
+    """A clip's `[B*T, S, F]` tokens through interleaved spatial and temporal layers, as the factorized
+    video stacks run them (VideoDiT, V-JEPA's `FactorizedTokenStack`): each `(spatial, temporal)`
+    pair's `spatial(tokens)` reads each frame's tokens, then `temporal(tokens, rotation)` each token's
+    frames under a rotary over frame index, and the tokens return to frame-major order."""
+    batch = tokens.shape[0] // frames
+    patches, features = tokens.shape[1:]
+    rotation = rotary_freqs(jnp.arange(frames), head_dim, ROPE_THETA, dtype=at_least_fp32(tokens.dtype))
+    for spatial, temporal in layers:
+        tokens = spatial(tokens)
+        tokens = tokens.reshape(batch, frames, patches, features).transpose(0, 2, 1, 3).reshape(
+            batch * patches, frames, features)
+        tokens = temporal(tokens, rotation)
+        tokens = tokens.reshape(batch, patches, frames, features).transpose(0, 2, 1, 3).reshape(
+            batch * frames, patches, features)
+    return tokens
+
+
 def rope_for_scan(tokens: jax.Array, head_dim: int, scan_order: str):
     """RoPE frequencies for the `[B, S, F]` tokens in `scan_order`, in the
     arithmetic they rotate in: the rotation at every index for raster, where
