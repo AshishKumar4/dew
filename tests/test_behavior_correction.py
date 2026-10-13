@@ -65,7 +65,7 @@ def test_corrected_objective_changes_a_real_trainer_update():
 
     import optax
 
-    from dew.data import Dataset
+    from dew.data.dataset import Loader
     from dew.training import Trainer
 
     original, rollout = build()
@@ -78,7 +78,7 @@ def test_corrected_objective_changes_a_real_trainer_update():
         objective = GRPOObjective(original.objective.model, PROMPT + RESPONSE - 1,
                                   behavior_importance=cap)
         trainer = Trainer(objective, optax.sgd(.05), key=jax.random.key(19))
-        data = Dataset(train=lambda partition: itertools.repeat(batch), val=None, records=None,
+        data = Loader(train=lambda partition: itertools.repeat(batch), val=None, records=None,
                        batch=batch["input_ids"].shape[0])
         final = trainer.fit(data, steps=1, log_every=1)
         assert int(final.updates) == 1

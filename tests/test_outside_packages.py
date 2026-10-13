@@ -73,10 +73,12 @@ def test_dew_pipeline_loads_a_packages_run_only_when_trusted(tmp_path):
     run = tmp_path / "run"
     train = ("import jax, numpy as np, optax\n"
              "from dew import Checkpoints, Trainer\n"
-             "from dew.data import Dataset, Loading\n"
+             "from dew.config.data import RecordsData, loader\n"
+             "from dew.data import Loading\n"
              "from toypackage.models import Shift\n"
-             "data = Dataset.from_records({'x': np.full((8,), 3.0, np.float32)}, batch=8,\n"
-             "                            loading=Loading(workers=0, threads=1, read_buffer=1))\n"
+             "rows = RecordsData(source={'x': np.full((8,), 3.0, np.float32)})\n"
+             "loading = Loading(workers=0, threads=1, read_buffer=1)\n"
+             "data = loader(rows, batch=8, read='memory', loading=loading)\n"
              "trainer = Trainer(Shift(), optax.sgd(0.5), key=jax.random.key(0),\n"
              f"                  checkpoints=Checkpoints({str(run)!r}))\n"
              "state = trainer.fit(data, steps=3, log_every=3, checkpoint_every=3)\n"
@@ -108,7 +110,8 @@ from flax import linen as nn
 from flax import struct
 
 from dew.config import Prepared, RunConfig, TrainerConfig
-from dew.data import Dataset, Loading
+from dew.data import Loading
+from dew.data.dataset import Loader
 from dew.objectives.base import Objective, mean_of_totals, merge_totals
 from dew.training import DEFAULT_RULES, Layout, MeshSpec
 
@@ -171,8 +174,11 @@ class ActivityRun(RunConfig):
 
     def prepare(self):
         rows = np.random.default_rng(0).normal(size=(64, 8)).astype(np.float32)
-        data = Dataset.from_records({"x": rows}, batch=self.trainer.batch_size, validation={"x": rows[:20]},
-                                    loading=Loading(workers=0, threads=1, read_buffer=1))
+        from dew.config.data import RecordsData, loader
+
+        data = loader(RecordsData(source={"x": rows}, validation={"x": rows[:20]}),
+                      batch=self.trainer.batch_size,
+                    read="memory", loading=Loading(workers=0, threads=1, read_buffer=1))
         objective = Rate(self.model.build(), self.target)
         return Prepared(self, lambda name: self.train(objective, data, name=name, metrics=(MeanRate(),)))
 '''
