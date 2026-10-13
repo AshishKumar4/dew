@@ -38,7 +38,7 @@ from flax.typing import Dtype, PrecisionLike
 from jax.ad_checkpoint import checkpoint_name
 from jax.interpreters.ad import JVPTracer
 
-from dew.nn.kernels import delta_rule, fla_gdn, short_conv
+from dew.nn.kernels import delta_rule, fla_gdn, fla_kda, short_conv
 
 from .attention import FORWARD_MODE, gated_rms_normalized
 from .blocks import normal_kernel
@@ -568,8 +568,10 @@ def chunk_delta_rule(query, key, value, g, beta, state=None, chunk_size: int = C
 def chunk_gated_delta_rule(query, key, value, g, beta, state=None, chunk_size: int = CHUNK_SIZE, *,
                            projected=None, starts=None, max_segments: int | None = None):
     """`torch_chunk_gated_delta_rule` (modeling_qwen3_next.py:374-453) with one
-    log decay per head, `g` `[B, S, H]`. Its queries and keys may sit on fewer
-    heads than the values, each serving `Hv // Hk` of them, as fla takes them.
+    log decay per head, `g` `[B, S, H]`, or `chunk_kimi_delta_attention`
+    (modeling_glm5_next.py:482-578) with one per key dimension, `[B, S, H,
+    Dk]`. Its queries and keys may sit on fewer heads than the values, each
+    serving `Hv // Hk` of them, as fla takes them.
 
     Where the port takes it (`port_refusal`), it is fla 0.5.2's chunked rule
     on Dew's port of its kernels (`fla_rule`), on fla's numbers, its operands
@@ -597,7 +599,8 @@ def chunk_gated_delta_rule(query, key, value, g, beta, state=None, chunk_size: i
     group = value.shape[2] // key.shape[2]
     if group > 1:
         query, key = (jnp.repeat(x, group, axis=2) for x in (query, key))
-    return chunk_delta_rule(query, key, value, g[..., None], beta, state, chunk_size, starts=starts)
+    return chunk_delta_rule(query, key, value, g.reshape(*value.shape[:3], -1), beta, state, chunk_size,
+                            starts=starts)
 
 
 def port_refusal(query, key, value) -> str | None:
@@ -638,11 +641,13 @@ def on_the_port(query, key, value) -> bool:
 
 
 def fla_rule(query, key, value, g, beta, state=None, *, starts=None, max_segments: int | None = None):
-    """`fla_gdn.chunk_gated_delta_rule` for any call the portable math takes:
+    """The port's chunked rule for any call the portable math takes:
     `[B, S, Hk, Dk]` queries and keys, `[B, S, Hv, Dv]` values, the log decay
-    `g` and `beta` `[B, S, Hv]`, the memory `[B, Hv, Dk, Dv]` or None, and
-    packed documents' first tokens `starts` `[B, S]`, at most `max_segments`
-    a row, as fla's varlen sequences.
+    `g` `[B, S, Hv]` per head (`fla_gdn.chunk_gated_delta_rule`) or `[B, S,
+    Hv, Dk]` per key dimension (Kimi's delta attention, `fla_kda.chunk_kda`),
+    `beta` `[B, S, Hv]`, the memory `[B, Hv, Dk, Dv]` or None, and packed
+    documents' first tokens `starts` `[B, S]`, at most `max_segments` a row,
+    as fla's varlen sequences.
 
     The operands go to their common dtype, beta with them, as fla's layer
     holds them. On a mesh the rule runs per shard (`manual_map`): rows where
@@ -670,8 +675,8 @@ def fla_rule(query, key, value, g, beta, state=None, *, starts=None, max_segment
         heads = None
     P = jax.sharding.PartitionSpec
     four, three, memory = P(rows, None, heads, None), P(rows, None, heads), P(rows, heads, None, None)
-    return manual_map(blocked, (four, four, four, three, three, memory, P(rows, None)), (four, memory))(
-        query, key, value, g, beta, state, starts)
+    return manual_map(blocked, (four, four, four, P(*four[:g.ndim]), three, memory, P(rows, None)),
+                      (four, memory))(query, key, value, g, beta, state, starts)
 
 
 def _blocked_rule(query, key, value, g, beta, state, starts, *, max_segments: int | None):
@@ -680,10 +685,12 @@ def _blocked_rule(query, key, value, g, beta, state, starts, *, max_segments: in
     head; value heads padded to a power of two per key head, which dqkwg's
     block holds, with heads that neither write nor read (zero value, beta
     and decay); keys and values padded with zero columns to 64, 128 or 256,
-    widths every block of the kernels' configs divides. None of them changes
-    a real output or gradient: every padded product is an exact zero. The
-    outputs are cut back. Packed documents (`starts`, with `max_segments`)
-    are fla's varlen sequences over the shard's rows (`_cu_seqlens`)."""
+    widths every block of the kernels' configs divides, a decay per key
+    dimension with them. None of them changes a real output or gradient:
+    every padded product is an exact zero. The outputs are cut back. Packed
+    documents (`starts`, with `max_segments`) are fla's varlen sequences over
+    the shard's rows (`_cu_seqlens`). The decay's shape picks the port: per
+    head fla's gated delta rule, per key dimension its Kimi delta attention."""
     B, S, Hk, Dk = key.shape
     Hv, Dv = value.shape[2:]
     scale = Dk ** -0.5
@@ -704,11 +711,14 @@ def _blocked_rule(query, key, value, g, beta, state, starts, *, max_segments: in
     value, g, beta, state = grouped(value, 2), grouped(g, 2), grouped(beta, 2), grouped(state, 1)
     blocks = (max(64, 1 << (Dk - 1).bit_length()), max(64, 1 << (value.shape[3] - 1).bit_length()))
     query, key = (_padded(x, 3, blocks[0]) for x in (query, key))
+    per_key = g.ndim == 4
+    g = _padded(g, 3, blocks[0]) if per_key else g
     value = _padded(value, 3, blocks[1])
     state = _padded(_padded(state, 2, blocks[0]), 3, blocks[1])
     cu_seqlens = None if max_segments is None else _cu_seqlens(starts, max_segments)
-    out, final = fla_gdn.chunk_gated_delta_rule(query, key, value, g, beta, state, cu_seqlens, scale,
-                                                CHUNK_SIZE, not generation.triton_runs())
+    port = fla_kda.chunk_kda if per_key else fla_gdn.chunk_gated_delta_rule
+    out, final = port(query, key, value, g, beta, state, cu_seqlens, scale, CHUNK_SIZE,
+                      not generation.triton_runs())
     out = out[..., :width].reshape(B, S, Hk, group, width)[:, :, :, :served]
     out = out.reshape(B, S, Hv, split * width)[..., :Dv]
     final = final[:, :, :Dk, :width].reshape(B, Hk, group, Dk, width)[:, :, :served]
