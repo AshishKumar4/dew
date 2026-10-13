@@ -32,8 +32,15 @@ class ImageParameters(NamedTuple):
 _GREY = (0.2989, 0.587, 0.114)
 """torchvision's `rgb_to_grayscale` weights, which its contrast and
 saturation blend against."""
-_LOW = (0.8, 0.95, 0.8)
-_HIGH = (1.2, 1.05, 1.2)
+
+
+def jitter_ranges(brightness: float = 0.2, contrast: float = 0.05,
+                  saturation: float = 0.2) -> tuple[tuple[float, float], ...]:
+    """Brightness, contrast and saturation factor bounds."""
+    return tuple((max(0.0, 1 - spread), 1 + spread) for spread in (brightness, contrast, saturation))
+
+
+_LOW, _HIGH = tuple(zip(*jitter_ranges(), strict=True))
 
 
 def draw_device(key: jax.Array, shape: tuple[int, ...], *, flip: bool, jitter: bool,

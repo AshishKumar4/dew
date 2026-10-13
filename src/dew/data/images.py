@@ -92,11 +92,6 @@ class Augment:
     jitter: bool
 
 
-# ColorJitter(brightness=0.2, contrast=0.05, saturation=0.2, hue=0): the three
-# factors' uniform ranges, applied in a random order per record.
-_JITTER_RANGES = ((0.8, 1.2), (0.95, 1.05), (0.8, 1.2))
-
-
 def augment_image(augment: Augment | None, image: np.ndarray,
                   rng: np.random.Generator) -> np.ndarray:
     """Flips and colour-jitters `image`, seeded by the record's own rng.
@@ -114,9 +109,9 @@ def augment_image(augment: Augment | None, image: np.ndarray,
     if not augment.jitter:
         return np.ascontiguousarray(image)
 
-    from .image_augmentation import jitter_host
+    from .image_augmentation import jitter_host, jitter_ranges
 
-    factors = np.asarray([rng.uniform(low, high) for low, high in _JITTER_RANGES])
+    factors = np.asarray([rng.uniform(low, high) for low, high in jitter_ranges()])
     pixels = jitter_host(image.astype(np.float32), factors, rng.permutation(3))
     return np.rint(pixels).astype(np.uint8)
 

@@ -251,10 +251,10 @@ class ColorJitter(grain.RandomMapTransform):
     field: str = "image"
 
     def random_map(self, element: Batch, rng: np.random.Generator) -> Batch:
-        from dew.data.image_augmentation import jitter_host
+        from dew.data.image_augmentation import jitter_host, jitter_ranges
 
-        spreads = (self.brightness, self.contrast, self.saturation)
-        factors = np.asarray([rng.uniform(max(0.0, 1 - spread), 1 + spread) for spread in spreads])
+        ranges = jitter_ranges(self.brightness, self.contrast, self.saturation)
+        factors = np.asarray([rng.uniform(low, high) for low, high in ranges])
         pixels = jitter_host(np.asarray(element[self.field]).astype(np.float32), factors, rng.permutation(3))
         return {**element, self.field: np.rint(pixels).astype(np.uint8)}
 
@@ -345,7 +345,7 @@ class Torchvision(grain.RandomMapTransform):
 
 @dataclasses.dataclass(frozen=True)
 class Caption(grain.MapTransform):
-    """A record's caption, from its columns or a template with its class label."""
+    """A record's caption and int32 numeric labels, from columns or a class template."""
 
     template: str | None = None
     classes: tuple[str, ...] = ()
@@ -361,7 +361,10 @@ class Caption(grain.MapTransform):
             caption = next((str(element[key]) for key in self.columns if key in element), "")
         else:
             caption = self.template.format(label, **{**element, "label": label})
-        return {**element, "caption": caption}
+        held = {**element, "caption": caption}
+        if element.get("label") is not None and np.asarray(element["label"]).dtype.kind in "biuf":
+            held["label"] = np.int32(element["label"])
+        return held
 
 
 @dataclasses.dataclass(frozen=True)
