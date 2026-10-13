@@ -46,12 +46,27 @@ class AutoencoderKL(nn.Module):
 
     @classmethod
     def from_diffusers(cls, config: Mapping[str, object], dtype: Dtype) -> AutoencoderKL:
-        """The model a diffusers `AutoencoderKL` config describes, computing in `dtype`."""
+        """The model a diffusers `AutoencoderKL` config describes, computing in `dtype`. The stack
+        computes SiLU, attention in the bottleneck, a decoder writing the image's channels and the
+        plain encoder and decoder levels; a config asking for anything else is refused by name."""
         from dew import records
         from dew.interop.diffusion import flag
 
+        channels = records.integers(config["block_out_channels"], "block_out_channels")
+        refused = [name for name, holds in (
+            ("act_fn", config.get("act_fn", "silu") == "silu"),
+            ("mid_block_add_attention", flag(config, "mid_block_add_attention", default=True)),
+            ("out_channels", config.get("out_channels", 3) == config["in_channels"]),
+            *((field, records.strings(config.get(field) or [block] * len(channels), field)
+               == (block,) * len(channels))
+              for field, block in (("down_block_types", "DownEncoderBlock2D"),
+                                   ("up_block_types", "UpDecoderBlock2D"))),
+        ) if not holds]
+        if refused:
+            named = ", ".join(f"{name}={config.get(name)!r}" for name in refused)
+            raise ValueError(f"the KL autoencoder does not compute {named}")
         decoder = config.get("decoder_block_out_channels")
-        return cls(channels=records.integers(config["block_out_channels"], "block_out_channels"),
+        return cls(channels=channels,
                    latent_channels=records.integer(config["latent_channels"], "latent_channels"),
                    image_channels=records.integer(config["in_channels"], "in_channels"),
                    blocks_per_level=records.integer(config["layers_per_block"], "layers_per_block"),
