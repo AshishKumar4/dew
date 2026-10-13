@@ -38,7 +38,7 @@ from flax.typing import Dtype, PrecisionLike
 from jax.ad_checkpoint import checkpoint_name
 from jax.interpreters.ad import JVPTracer
 
-from dew.nn.kernels import delta_rule, fla_gdn, short_conv
+from dew.nn.kernels import delta_rule, fla_gdn, fla_kda, short_conv
 
 from .attention import FORWARD_MODE, gated_rms_normalized
 from .blocks import normal_kernel
@@ -385,7 +385,7 @@ def _masked_conv1d(x, kernel, valid, state=None, bias=None, segments=None, parts
     return conv_pieces(output, parts, x.dtype if dtype is None else dtype), history
 
 
-def chunk_decay(g):
+def chunk_decay(g, documents=None):
     """Cumulate per-chunk log decays and build the pairwise decay between positions.
 
     `g` is `[..., C, F]`: the C positions of a chunk and F decay channels.
@@ -408,10 +408,32 @@ def chunk_decay(g):
     costs about 1% (on an RTX 4080, Kimi Linear's KDA layer over 1024 tokens
     47.6 against 48.0 ms, Qwen3.5-0.8B's gated delta net over 4096 16.3
     against 16.5).
+
+    With packed `documents` `[..., C, 1]` (each position's document within
+    its chunk), the sum restarts at each document's first position and pairs
+    of positions in different documents weigh zero, masked before exp: a
+    document's decays are its own tokens' alone, the ones it computes run by
+    itself.
     """
-    hi, lo = jax.lax.associative_scan(compensated_add, (g, jnp.zeros_like(g)), axis=g.ndim - 2)
+    zeros = jnp.zeros_like(g)
+    if documents is None:
+        hi, lo = jax.lax.associative_scan(compensated_add, (g, zeros), axis=g.ndim - 2)
+    else:
+        def segmented(left, right):
+            (left_start, *left_sum), (right_start, *right_sum) = left, right
+            total = compensated_add(left_sum, right_sum)
+            restarted = (jnp.where(right_start, kept, summed)
+                         for kept, summed in zip(right_sum, total, strict=True))
+            return left_start | right_start, *restarted
+
+        changed = jnp.concatenate([jnp.ones_like(documents[..., :1, :], bool),
+                                   documents[..., 1:, :] != documents[..., :-1, :]], axis=-2)
+        _, hi, lo = jax.lax.associative_scan(segmented, (jnp.broadcast_to(changed, g.shape), g, zeros),
+                                             axis=g.ndim - 2)
     chunk_size = hi.shape[-2]
     inclusive = jnp.tril(jnp.ones((chunk_size, chunk_size), jnp.bool_))[..., None]
+    if documents is not None:
+        inclusive = inclusive & (documents[..., :, None, :] == documents[..., None, :, :])
     diff = ((hi[..., :, None, :] - hi[..., None, :, :]) + (lo[..., :, None, :] - lo[..., None, :, :]))
     # Masked before exp, as the references do. The unused positive
     # differences can overflow, and an outer where alone leaves 0 * inf in
@@ -466,7 +488,7 @@ def strictly_lower_inverse(a):
     return inverse.reshape(*lead, width, width)
 
 
-def xla_chunk_states(key, k_cumdecay, out_vals, gc, state):
+def xla_chunk_states(key, k_cumdecay, out_vals, gc, state, written=None, kept=None):
     """The memory crossing chunks, the one sequential part of the chunked
     rule, as a `lax.scan`: per chunk the reference's corrected values
     `v_new = value - k_cumdecay @ S` and its write `S * exp(gc[-1]) +
@@ -479,16 +501,25 @@ def xla_chunk_states(key, k_cumdecay, out_vals, gc, state):
     `[B, H, Dk, Dv]` enters the first chunk. Returns the state each chunk
     entered `[B, H, NC, Dk, Dv]`, each chunk's corrected values
     `[B, H, NC, C, Dv]` and the state leaving the last chunk.
+
+    With packed documents, `written` `[B, 1, NC, C, 1]` marks the tokens of
+    each chunk's last document, the only ones its write keeps, and `kept`
+    `[B, 1, NC, 1, 1]` the chunks no document starts in, the only ones the
+    memory they entered passes through.
     """
     def one_chunk(s, step):
-        k_i, kd_i, v_i, gc_i = step
+        k_i, kd_i, v_i, gc_i, own_i, kept_i = step
         v_corrected = v_i - kd_i @ s
         last = gc_i[..., -1:, :]
-        written = k_i * jnp.exp(last - gc_i)
-        return (s * jnp.swapaxes(jnp.exp(last), -1, -2) + jnp.swapaxes(written, -1, -2) @ v_corrected,
-                (s, v_corrected))
+        # Another document's decay is no difference of the last one's: masked before exp, which it
+        # would overflow (exp(140) * 0 is NaN), as chunk_decay masks its unused differences.
+        written_i = k_i * jnp.exp(jnp.where(own_i > 0, last - gc_i, 0.0)) * own_i
+        return (s * jnp.swapaxes(jnp.exp(last), -1, -2) * kept_i
+                + jnp.swapaxes(written_i, -1, -2) @ v_corrected, (s, v_corrected))
+    ones = jnp.ones((1, 1, gc.shape[2], 1, 1), gc.dtype)
+    masks = tuple(ones if x is None else x.astype(gc.dtype) for x in (written, kept))
     final, (entered, corrected) = jax.lax.scan(
-        one_chunk, state, tuple(jnp.moveaxis(x, 2, 0) for x in (key, k_cumdecay, out_vals, gc)))
+        one_chunk, state, tuple(jnp.moveaxis(x, 2, 0) for x in (key, k_cumdecay, out_vals, gc, *masks)))
     return jnp.moveaxis(entered, 0, 2), jnp.moveaxis(corrected, 0, 2), final
 
 
@@ -501,7 +532,7 @@ def _paired(left, right, decay):
     return jnp.einsum('...sd,...td,...std->...st', left, right, decay)
 
 
-def chunk_delta_rule(query, key, value, g, beta, state=None, chunk_size: int = CHUNK_SIZE):
+def chunk_delta_rule(query, key, value, g, beta, state=None, chunk_size: int = CHUNK_SIZE, *, starts=None):
     """The chunked delta rule over [B, S, H, D] operands with the log decay
     `g` `[B, S, H, D]`, D one for a decay per head (the gated delta rule) or
     Dk for one per key dimension (Kimi Delta Attention); returns
@@ -516,6 +547,13 @@ def chunk_delta_rule(query, key, value, g, beta, state=None, chunk_size: int = C
     recurrence. The two decays differ only in how a pair of positions is
     weighed (`_paired`). It is the portable math: a GPU runs the gated rule on
     fla's kernels (`chunk_gated_delta_rule`), and this is their test oracle.
+
+    `starts` `[B, S]` marks packed documents' first tokens, each from a zero
+    memory: within a chunk each document's decays are its own (`chunk_decay`),
+    a token reads the memory the chunk entered only in the document that
+    memory belongs to, and the chunk's write keeps only its last document's
+    tokens, the memory it entered passing through only where no document
+    starts in it. A document computes as it would alone.
     """
     dtype, work = query.dtype, at_least_fp32(query.dtype)
     query, key, value, g, beta = (x.astype(work) for x in (query, key, value, g, beta))
@@ -533,11 +571,21 @@ def chunk_delta_rule(query, key, value, g, beta, state=None, chunk_size: int = C
 
     q_c, k_c = chunks(query), chunks(key)
     kb_c, vb_c = chunks(key * beta[..., None]), chunks(value * beta[..., None])
+    document = first = written = kept = None
+    if starts is not None:
+        # Each token's document within its row, per chunk, [B, 1, NC, C, 1], and the document the
+        # memory each chunk enters belongs to: its first token's, unless that token starts one.
+        begins = jnp.pad(jnp.asarray(starts, jnp.int32), ((0, 0), (0, pad)))
+        document = jnp.cumsum(begins, axis=1).reshape(B, 1, T // chunk_size, chunk_size, 1)
+        entered_document = document[..., :1, :] - begins.reshape(document.shape)[..., :1, :]
+        first = document == entered_document
+        written = document == document[..., -1:, :]
+        kept = document[..., -1:, :] == entered_document
     # The log decay cumulated within each chunk, the reference's
     # `g = g.cumsum(dim=-1)` (modeling_qwen3_next.py:417), and the decay
     # `exp(gc[s] - gc[t])` between positions s >= t, zero above the diagonal:
     # [B, H, NC, C, D], [B, H, NC, C, C, D].
-    gc, decay = chunk_decay(chunks(g))
+    gc, decay = chunk_decay(chunks(g), document)
     # The mask is strictly lower (tril, -1): the reference's masked_fill
     # zeroes the diagonal too.
     strict = jnp.tril(jnp.ones((chunk_size, chunk_size), jnp.bool_), -1)
@@ -545,7 +593,8 @@ def chunk_delta_rule(query, key, value, g, beta, state=None, chunk_size: int = C
     # The reference's `attn + I` operator after its row correction loop.
     inv = strictly_lower_inverse(attn)
     out_vals = inv @ vb_c  # the reference's `value = attn @ v_beta`
-    k_cumdecay = inv @ (kb_c * jnp.exp(gc))
+    entering = jnp.exp(gc) if first is None else jnp.exp(gc) * first
+    k_cumdecay = inv @ (kb_c * entering)
 
     state = jnp.zeros((B, H, Dk, Dv), work) if state is None else state.astype(work)
     # XLA:CPU workaround: under a jitted scan over the layers the chunk
@@ -554,10 +603,10 @@ def chunk_delta_rule(query, key, value, g, beta, state=None, chunk_size: int = C
     # The barrier materializes the zero. Remove it when XLA:CPU no longer
     # returns an uninitialized scan carry here.
     state = jax.lax.optimization_barrier(state)
-    entered, v_corrected, state = xla_chunk_states(k_c, k_cumdecay, out_vals, gc, state)
+    entered, v_corrected, state = xla_chunk_states(k_c, k_cumdecay, out_vals, gc, state, written, kept)
     # decay is zero above the diagonal, so this is the reference's inclusive
     # lower `masked_fill(triu(1), 0)`.
-    core = (q_c * jnp.exp(gc)) @ entered + _paired(q_c, k_c, decay) @ v_corrected
+    core = (q_c * entering) @ entered + _paired(q_c, k_c, decay) @ v_corrected
     # core: [B, H, NC, C, Dv] -> [B, H, NC*C, Dv] -> [B, S, H, Dv]
     core = jnp.moveaxis(core.reshape(B, H, T, Dv), 1, 2)[:, :S]
     return core.astype(dtype), state.astype(dtype)
@@ -566,8 +615,10 @@ def chunk_delta_rule(query, key, value, g, beta, state=None, chunk_size: int = C
 def chunk_gated_delta_rule(query, key, value, g, beta, state=None, chunk_size: int = CHUNK_SIZE, *,
                            projected=None, starts=None, max_segments: int | None = None):
     """`torch_chunk_gated_delta_rule` (modeling_qwen3_next.py:374-453) with one
-    log decay per head, `g` `[B, S, H]`. Its queries and keys may sit on fewer
-    heads than the values, each serving `Hv // Hk` of them, as fla takes them.
+    log decay per head, `g` `[B, S, H]`, or `chunk_kimi_delta_attention`
+    (modeling_glm5_next.py:482-578) with one per key dimension, `[B, S, H,
+    Dk]`. Its queries and keys may sit on fewer heads than the values, each
+    serving `Hv // Hk` of them, as fla takes them.
 
     Where the port takes it (`port_refusal`), it is fla 0.5.2's chunked rule
     on Dew's port of its kernels (`fla_rule`), on fla's numbers, its operands
@@ -595,9 +646,8 @@ def chunk_gated_delta_rule(query, key, value, g, beta, state=None, chunk_size: i
     group = value.shape[2] // key.shape[2]
     if group > 1:
         query, key = (jnp.repeat(x, group, axis=2) for x in (query, key))
-    if starts is not None:
-        return recurrent_delta_rule(query, key, value, g[..., None], beta, state, starts=starts)
-    return chunk_delta_rule(query, key, value, g[..., None], beta, state, chunk_size)
+    return chunk_delta_rule(query, key, value, g.reshape(*value.shape[:3], -1), beta, state, chunk_size,
+                            starts=starts)
 
 
 def port_refusal(query, key, value) -> str | None:
@@ -638,11 +688,13 @@ def on_the_port(query, key, value) -> bool:
 
 
 def fla_rule(query, key, value, g, beta, state=None, *, starts=None, max_segments: int | None = None):
-    """`fla_gdn.chunk_gated_delta_rule` for any call the portable math takes:
+    """The port's chunked rule for any call the portable math takes:
     `[B, S, Hk, Dk]` queries and keys, `[B, S, Hv, Dv]` values, the log decay
-    `g` and `beta` `[B, S, Hv]`, the memory `[B, Hv, Dk, Dv]` or None, and
-    packed documents' first tokens `starts` `[B, S]`, at most `max_segments`
-    a row, as fla's varlen sequences.
+    `g` `[B, S, Hv]` per head (`fla_gdn.chunk_gated_delta_rule`) or `[B, S,
+    Hv, Dk]` per key dimension (Kimi's delta attention, `fla_kda.chunk_kda`),
+    `beta` `[B, S, Hv]`, the memory `[B, Hv, Dk, Dv]` or None, and packed
+    documents' first tokens `starts` `[B, S]`, at most `max_segments` a row,
+    as fla's varlen sequences.
 
     The operands go to their common dtype, beta with them, as fla's layer
     holds them. On a mesh the rule runs per shard (`manual_map`): rows where
@@ -670,8 +722,8 @@ def fla_rule(query, key, value, g, beta, state=None, *, starts=None, max_segment
         heads = None
     P = jax.sharding.PartitionSpec
     four, three, memory = P(rows, None, heads, None), P(rows, None, heads), P(rows, heads, None, None)
-    return manual_map(blocked, (four, four, four, three, three, memory, P(rows, None)), (four, memory))(
-        query, key, value, g, beta, state, starts)
+    return manual_map(blocked, (four, four, four, P(*four[:g.ndim]), three, memory, P(rows, None)),
+                      (four, memory))(query, key, value, g, beta, state, starts)
 
 
 def _blocked_rule(query, key, value, g, beta, state, starts, *, max_segments: int | None):
@@ -680,10 +732,12 @@ def _blocked_rule(query, key, value, g, beta, state, starts, *, max_segments: in
     head; value heads padded to a power of two per key head, which dqkwg's
     block holds, with heads that neither write nor read (zero value, beta
     and decay); keys and values padded with zero columns to 64, 128 or 256,
-    widths every block of the kernels' configs divides. None of them changes
-    a real output or gradient: every padded product is an exact zero. The
-    outputs are cut back. Packed documents (`starts`, with `max_segments`)
-    are fla's varlen sequences over the shard's rows (`_cu_seqlens`)."""
+    widths every block of the kernels' configs divides, a decay per key
+    dimension with them. None of them changes a real output or gradient:
+    every padded product is an exact zero. The outputs are cut back. Packed
+    documents (`starts`, with `max_segments`) are fla's varlen sequences over
+    the shard's rows (`_cu_seqlens`). The decay's shape picks the port: per
+    head fla's gated delta rule, per key dimension its Kimi delta attention."""
     B, S, Hk, Dk = key.shape
     Hv, Dv = value.shape[2:]
     scale = Dk ** -0.5
@@ -704,11 +758,14 @@ def _blocked_rule(query, key, value, g, beta, state, starts, *, max_segments: in
     value, g, beta, state = grouped(value, 2), grouped(g, 2), grouped(beta, 2), grouped(state, 1)
     blocks = (max(64, 1 << (Dk - 1).bit_length()), max(64, 1 << (value.shape[3] - 1).bit_length()))
     query, key = (_padded(x, 3, blocks[0]) for x in (query, key))
+    per_key = g.ndim == 4
+    g = _padded(g, 3, blocks[0]) if per_key else g
     value = _padded(value, 3, blocks[1])
     state = _padded(_padded(state, 2, blocks[0]), 3, blocks[1])
     cu_seqlens = None if max_segments is None else _cu_seqlens(starts, max_segments)
-    out, final = fla_gdn.chunk_gated_delta_rule(query, key, value, g, beta, state, cu_seqlens, scale,
-                                                CHUNK_SIZE, not generation.triton_runs())
+    port = fla_kda.chunk_kda if per_key else fla_gdn.chunk_gated_delta_rule
+    out, final = port(query, key, value, g, beta, state, cu_seqlens, scale, CHUNK_SIZE,
+                      not generation.triton_runs())
     out = out[..., :width].reshape(B, S, Hk, group, width)[:, :, :, :served]
     out = out.reshape(B, S, Hv, split * width)[..., :Dv]
     final = final[:, :, :Dk, :width].reshape(B, Hk, group, Dk, width)[:, :, :served]

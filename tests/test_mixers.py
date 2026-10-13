@@ -138,16 +138,25 @@ def packed_and_alone(model, variables, tokens, cotangent):
                                 for begin, end in itertools.pairwise(starts)], axis=1)
 
     def run(forward):
-        logits, pull = jax.vjp(forward, variables)
-        return logits, pull(cotangent.astype(logits.dtype))[0]
+        @jax.jit
+        def pulled(variables, cotangent):
+            logits, pull = jax.vjp(forward, variables)
+            return logits, pull(cotangent.astype(logits.dtype))[0]
+
+        return pulled(variables, cotangent)
 
     assert tokens.shape == (1, total)
     return run(packed), run(alone)
 
 
 KIND_FIELDS = {"mlp": ({"intermediate_size": 64}, {}), "llama4": ({}, {"qk_norm": False}),
-               "deepseek_v4": ({"rope_head_dim": 8}, {"kinds": {"full_attention": LayerKind(window=8)}})}
-"""The fields a kind needs beyond its defaults to build in `tiny`: its own, then the model's."""
+               "deepseek_v4": ({"rope_head_dim": 8}, {"kinds": {"full_attention": LayerKind(window=8)}}),
+               "kimi_delta_attention": ({"linear_num_heads": 2, "linear_head_dim": 16}, {}),
+               "gated_delta_net": ({"linear_num_key_heads": 2, "linear_num_value_heads": 4,
+                                    "linear_key_head_dim": 16, "linear_value_head_dim": 16}, {})}
+"""The fields a kind needs beyond its defaults to build in `tiny`: its own, then the model's. The
+recurrent kinds default to their models' heads (Kimi Linear's 64 of 128, Qwen3.5's 32 of 128), whose
+per-key pairwise decays alone take 134 MB a chunk in KDA's portable math."""
 
 REFUSED = {"kpool_sparse_attention": "a packed row of documents"}
 """Kinds that refuse packed rows by name, and the name."""
@@ -211,7 +220,7 @@ def test_no_token_reaches_another_document(kind):
             logits = model.apply(variables, row, coordinates=tokens_at)
             return jnp.sum(logits * weight), logits[:, first:first + second]
 
-        (_, logits), grads = jax.value_and_grad(loss, has_aux=True)(variables)
+        (_, logits), grads = jax.jit(jax.value_and_grad(loss, has_aux=True))(variables)
         return logits, grads
 
     for (path, mine), theirs in zip(jax.tree_util.tree_leaves_with_path(second_document(changed)),

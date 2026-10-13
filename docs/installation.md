@@ -133,7 +133,7 @@ The `profile` extra installs XProf 2.23.1 or a later release, never 2.23.2. XPro
 
 FlashAttention comes as Dew's own wheel, `dew-flash-attn-cu12` or `dew-flash-attn-cu13` (kernels/flash_attn), for the CUDA major of your jax: FlashAttention-2 for sm8x and sm120, and FlashAttention-3 for Hopper (sm90). The `cuda12` and `cuda13` extras install it on Linux x86_64, the one platform it is built for. With it installed, `"auto"` runs it on the GPUs whose measured kernel it is, for the calls `dew.nn.attention.flash_refusal` admits; a call it turns down on such a GPU is logged once, with why.
 
-tokamax 0.0.15 or later comes with Dew: Dew's Pallas kernels measure their configs through it (`dew.nn.kernels.tuning`), and `"auto"` runs its Pallas-Triton attention on sm80 and later for heads up to 64 wide (`dew.nn.attention.triton_runs`). Earlier releases pin `typeguard==2.13.3`, which tyro excludes, so installing one by hand breaks every recipe's command line.
+tokamax 0.0.15 or later comes with Dew: Dew's Pallas kernels measure their configs through it (`dew.nn.kernels.tuning`). A compile takes the configs measured for its GPU model, else the nearest measured shape's or a heuristic, and measures nothing; `python tools/kernel_picks.py`, or `Trainer(tune_kernels=True)`, measures a model's on a GPU it has to itself. And `"auto"` runs its Pallas-Triton attention on sm80 and later for heads up to 64 wide (`dew.nn.attention.triton_runs`). Earlier releases pin `typeguard==2.13.3`, which tyro excludes, so installing one by hand breaks every recipe's command line.
 
 ## Development install
 
