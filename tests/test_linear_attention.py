@@ -26,6 +26,7 @@ instead of `q^T S` in the recurrent form; the numbers are in the tests that
 catch them.
 """
 
+import functools
 import json
 from pathlib import Path
 
@@ -33,8 +34,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from delta_rule_support import recurrence, through
 from flax import linen as nn
-from reference_error import assert_as_exact_as_the_reference
+from reference_error import assert_as_exact_as_the_reference, assert_leaves_as_exact, widened
 
 from dew.nn.inputs import AttentionMetadata, coordinates
 from dew.nn.linear import (
@@ -135,6 +137,49 @@ def test_the_chunked_and_recurrent_forms_agree(reference):
 
     assert largest(chunked, recurrent) < 1e-5
     assert largest(chunked_state, recurrent_state) < 1e-5
+
+
+@pytest.mark.parametrize("strong", [False, True], ids=["drawn decay", "strong decay"])
+@pytest.mark.parametrize("decay_width", [1, 8], ids=["per head", "per key dimension"])
+def test_the_chunked_rule_runs_packed_documents_as_each_runs_alone(decay_width, strong):
+    """Packed documents in the chunked rule, one starting on a chunk's first token, one four tokens
+    before a chunk's end and one spanning chunks: each document's output, the final memory and every
+    gradient as near the float64 recurrence run document by document as the chunked rule run on each
+    document alone (`assert_leaves_as_exact`), and within 1e-4 of it, the row's first document from
+    the row's memory and every other from zero, for a decay per head (the gated delta net) and per key
+    dimension (Kimi's delta attention). At a strong decay (-4 a token) the chunk's earlier document
+    sits 96 below its last one's, past exp's fp32 range."""
+    batch, length, heads, width, chunk = 1, 160, 2, 8, 32
+    begins = (0, 32, 60, 110)
+    starts = np.zeros((batch, length), bool)
+    starts[0, list(begins[1:])] = True
+    keys = jax.random.split(jax.random.key(23), 8)
+    q = l2norm(jax.random.normal(keys[0], (batch, length, heads, width)))
+    k = l2norm(jax.random.normal(keys[1], (batch, length, heads, width)))
+    v = jax.random.normal(keys[2], (batch, length, heads, width))
+    g = (jnp.full((batch, length, heads, decay_width), -4.0) if strong else
+         -jnp.exp(jax.random.normal(keys[3], (batch, length, heads, decay_width)) - 2.0))
+    beta = jax.nn.sigmoid(jax.random.normal(keys[4], (batch, length, heads)))
+    h0 = 0.1 * jax.random.normal(keys[5], (batch, heads, width, width))
+    do = jax.random.normal(keys[6], v.shape)
+    dht = 0.1 * jax.random.normal(keys[7], h0.shape)
+
+    def packed(*args):
+        return chunk_delta_rule(*args, chunk, starts=jnp.asarray(starts))
+
+    def chunked(*args):
+        return chunk_delta_rule(*args, chunk)
+
+    got = jax.jit(through(packed, do, dht))(q, k, v, g, beta, h0)
+    alone = jax.jit(through(functools.partial(recurrence, cuts=(begins,), rule=chunked), do, dht))
+    reference = alone(q, k, v, g, beta, h0)
+    with jax.enable_x64(new_val=True):
+        operands = widened((q, k, v, g, beta, h0, do, dht))
+        want = through(functools.partial(recurrence, cuts=(begins,)), *operands[6:])(*operands[:6])
+        want = widened(want)
+    assert_leaves_as_exact(got, reference, want, reductions=chunk)
+    for name, mine, theirs in zip(("out", "final", "q", "k", "v", "g", "beta", "h0"), got, want, strict=True):
+        assert largest(mine, theirs) < 1e-4 * max(1.0, float(np.max(np.abs(theirs)))), name
 
 
 def test_strong_decay_has_the_same_finite_gradient_in_both_forms():
