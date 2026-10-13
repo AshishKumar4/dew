@@ -91,12 +91,12 @@ def fixed_attention_buffer(name: str, tensor: np.ndarray, attention: str,
     return False
 
 
-def hf_ungated(mlp: object, family: str, tanh: str = 'gelu_new') -> str:
+def hf_ungated(mlp: GatedActivation | None, family: str, tanh: str = 'gelu_new') -> str:
     """The activation a classic `family`'s config names Dew's ungated `mlp`
     by, its tanh GELU spelled `tanh`; any other `mlp` is refused."""
-    if mlp not in ('gelu', 'gelu_exact', 'relu'):
-        refuse('mlp', f'{family} writes only an ungated GELU or ReLU')
-    return tanh if mlp == 'gelu' else _HF_ACTIVATIONS[mlp]
+    if isinstance(mlp, str) and mlp in ('gelu', 'gelu_exact', 'relu'):
+        return tanh if mlp == 'gelu' else _HF_ACTIVATIONS[mlp]
+    return refuse('mlp', f'{family} writes only an ungated GELU or ReLU')
 
 
 GEMMA3_MODEL_TYPE = 'gemma3_text'
