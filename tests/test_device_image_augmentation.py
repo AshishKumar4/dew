@@ -248,3 +248,28 @@ def test_a_run_checks_its_inputs_against_what_the_device_steps_make(host):
     layout = Layout(host=("variables",) if host else (), min_shard=1, tolerance=1.)
     state = Trainer(objective, optax.adam(1e-3), key=0, layout=layout).fit(data, steps=2, log_every=1)
     assert int(state.step) == 2
+
+
+def test_a_host_step_written_after_a_device_step_is_refused_in_every_spelling():
+    """A device step runs in the compiled step, after the batch's host steps: a host step written
+    after it, in the same map or a later one, would read the staged pixels, and is refused."""
+    from dew.data import images
+
+    def remember(batch):
+        return {**batch, "seen": np.asarray(batch["image"]).sum(axis=(1, 2, 3))}
+
+    rows = Memory([{"image": np.zeros((16, 16, 3), np.uint8)} for _ in range(8)])
+    keyed = rows.random_map(images.augmentation_key()).repeat().batch(4)
+    for chain in (keyed.map(images.device_augment(12), remember),
+                  keyed.map(images.device_augment(12)).map(remember)):
+        with pytest.raises(ValueError):
+            loader_of(chain)
+        with pytest.raises(ValueError):
+            next(chain.iterate())
+    assert loader_of(keyed.map(remember).map(images.device_augment(12))).device
+
+
+def loader_of(chain):
+    from dew.data.compile import compile
+
+    return compile(chain, read="memory", loading=READ)
