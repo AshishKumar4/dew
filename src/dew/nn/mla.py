@@ -508,11 +508,7 @@ class MultiHeadLatentAttention(nn.Module):
                 x, q_rot, rot, latent, q_resid, logical_positions, valid, kv_store)
             causal = False
         else:
-            if positions is None:
-                positions = (jnp.arange(length) if valid is None else
-                             jnp.maximum(jnp.cumsum(valid, axis=1) - 1, 0))
-            else:
-                positions = jnp.asarray(positions)
+            positions = jnp.arange(length) if positions is None else jnp.asarray(positions)
             q_rot, rot, freqs_cos, freqs_sin = self._rotated(q_rot, rot, positions)
             if segment_ids is not None:
                 inside = document_mask(segment_ids)[:, None]

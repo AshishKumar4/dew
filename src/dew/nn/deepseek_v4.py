@@ -688,9 +688,7 @@ class DeepseekV4Attention(nn.Module):
                                        (batch, self.max_seq_len, self.head_dim), x.dtype)
             if positions is None:
                 positions = slots
-        if positions is None:
-            positions = jnp.arange(length) if valid is None else jnp.maximum(jnp.cumsum(valid, axis=1) - 1, 0)
-        positions = jnp.asarray(positions)
+        positions = jnp.arange(length) if positions is None else jnp.asarray(positions)
         rows = jnp.arange(length)
         cos, sin = yarn_rope_freqs(positions, self.rope_dim, self.rope_theta, self.yarn,
                                    dtype=at_least_fp32(x.dtype))
