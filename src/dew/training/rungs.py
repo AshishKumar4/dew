@@ -1,6 +1,7 @@
-"""The rung of the fit ladder an earlier run of a step chose, recorded
-beside the persistent compilation cache so a later run starts there
-(`Trainer.compile`), as a resumed run starts at its checkpoint's rung.
+"""The plan an earlier run of a step chose, its rung of the fit ladder and
+the microbatches it read each batch in, recorded beside the persistent
+compilation cache so a later run's search starts there (`Trainer.compile`),
+as a resumed run starts at its checkpoint's.
 
 The fit check reads memory that identical runs can find apart: a process
 that compiles the step autotunes it, and a pool that grows keeps the
