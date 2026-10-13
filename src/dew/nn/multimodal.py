@@ -15,6 +15,7 @@ from flax.typing import Dtype, PrecisionLike
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_stack import DecoderBank
 from dew.nn.flops import MissingFlopsCount, counted_flops, parameter_flops
+from dew.nn.inputs import Coordinates
 from dew.nn.protocols import OutputTable, ProjectionGroup
 from dew.nn.sharding import explicit_spec
 from dew.nn.vision import Gemma3nVision, ProjectorBase, TowerBase
@@ -371,7 +372,8 @@ class MultimodalTransformer(nn.Module):
                       positions=None, segment_ids=None, image_indices=None,
                       conditioning: Mapping[str, jax.Array] | None = None,
                       attention_mask=None, image_groups=None, rotary_positions=None,
-                      audio_indices=None, routed_experts=None, routed=None, right_padded: bool = False):
+                      audio_indices=None, routed_experts=None, routed=None, right_padded: bool = False,
+                      coordinates: Coordinates | None = None):
         """Run the decoder over text with the media embeddings spliced in.
 
         `conditioning` holds the towers' payloads, and `image_indices` and
@@ -381,7 +383,8 @@ class MultimodalTransformer(nn.Module):
         `routed_experts` and `routed` replay a routing record and go to the
         language model unchanged. Engines record a row for every placeholder
         position too, so the `[B, S, layers, top_k]` layout matches the text.
-        `right_padded` is the language model's (`CausalTransformer.hidden_and_mtp_inputs`).
+        `right_padded` and `coordinates` are the language model's
+        (`CausalTransformer.hidden_and_mtp_inputs`).
         """
         if self.family == "gemma4":
             placeholder = tokens == self.image_token_id
@@ -410,25 +413,27 @@ class MultimodalTransformer(nn.Module):
             return self.language_model.hidden_states(
                 tokens, train=train, decode=decode, positions=positions, segment_ids=segment_ids,
                 attention_mask=attention_mask, image_groups=image_groups, rotary_positions=rotary_positions,
-                routed_experts=routed_experts, routed=routed, right_padded=right_padded)
+                routed_experts=routed_experts, routed=routed, right_padded=right_padded,
+                coordinates=coordinates)
         fused = self._conditioned_embeddings(tokens, image_indices, conditioning,
                                              train=train, audio_indices=audio_indices)
         return self.language_model.hidden_states(
             fused.tokens, train=train, decode=decode, positions=positions, segment_ids=segment_ids,
             input_embeddings=fused.embeddings, attention_mask=attention_mask,
             image_groups=image_groups, rotary_positions=rotary_positions, media_mask=fused.media,
-            routed_experts=routed_experts, routed=routed, right_padded=right_padded)
+            routed_experts=routed_experts, routed=routed, right_padded=right_padded,
+            coordinates=coordinates)
 
     def __call__(self, tokens, train: bool = False, decode: bool = False,
                  positions=None, segment_ids=None, image_indices=None,
                  conditioning: Mapping[str, jax.Array] | None = None,
                  attention_mask=None, image_groups=None, rotary_positions=None,
-                 audio_indices=None):
+                 audio_indices=None, coordinates: Coordinates | None = None):
         hidden = self.hidden_states(tokens, train=train, decode=decode, positions=positions,
                                     segment_ids=segment_ids, image_indices=image_indices,
                                     conditioning=conditioning, attention_mask=attention_mask,
                                     image_groups=image_groups, rotary_positions=rotary_positions,
-                                    audio_indices=audio_indices)
+                                    audio_indices=audio_indices, coordinates=coordinates)
         if self.is_initializing() and self.language_model.dspark is not None:
             self.language_model.reach_drafter(tokens, hidden.dtype)
         if self.is_initializing() and self.num_nextn_predict_layers:
