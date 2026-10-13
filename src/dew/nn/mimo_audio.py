@@ -26,9 +26,10 @@ from dew.registry import Record
 from .activations import gelu_exact
 from .attention import LayerNorm, RMSNorm
 from .audio import AudioEncoding
-from .backbones.decoder_block import BlockWiring, DecoderBlock, GatedMLP
+from .backbones.decoder_block import BlockWiring, DecoderBlock
 from .inputs import AttentionMetadata, coordinates
 from .mixers.attention import CausalSelfAttention
+from .mlp import GatedMLP
 from .quantizers import residual_quantize
 from .vision import TowerBase, TowerGeometry
 
