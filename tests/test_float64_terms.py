@@ -57,4 +57,4 @@ def test_a_sum_that_does_not_cancel_has_its_own_size_and_an_update_its_steps_ter
     np.testing.assert_allclose(trace_terms, (0.9 + 1) * sums, rtol=1e-12)
     np.testing.assert_allclose(moved_terms, 0.1 * (1 + 0.9 + 1) * sums, rtol=1e-12)
     # The weight started at one, which its terms leave out.
-    np.testing.assert_allclose(moved, 1 - moved_terms, rtol=1e-12)
+    np.testing.assert_allclose(moved, 1 - np.asarray(moved_terms), rtol=1e-12)
