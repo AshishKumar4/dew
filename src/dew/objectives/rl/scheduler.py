@@ -311,6 +311,9 @@ class RolloutScheduler:
         self._lock = threading.Lock()
         self._registered: deque[_Entry] = deque()
         self._serial = 0
+        # The rollout key of the call in progress and its submissions so far.
+        self._key: jax.Array = jax.random.key(0)
+        self._submissions = 0
         self._partition = DataPartition()
         self._rescore = jax.jit(objective.packed_log_probs)
 
@@ -350,9 +353,12 @@ class RolloutScheduler:
             self.source.cancel([sample.future for sample in samples])
 
     def _submit(self, group: _Group, samples: Sequence[tuple[int, int]]) -> None:
-        """Submit `(index, attempt)` samples of one group under the served version."""
+        """Submit `(index, attempt)` samples of one group under the served
+        version, each submission of a call drawing its own fold of the call's key."""
         version = self.weights.version
-        futures = self.source.submit(group.task, len(samples), version=version)
+        key = jax.random.fold_in(self._key, self._submissions)
+        self._submissions += 1
+        futures = self.source.submit(group.task, len(samples), version=version, key=key)
         group.live.extend(_Sample(index, attempt, version, future)
                           for (index, attempt), future in zip(samples, futures, strict=True))
 
@@ -502,7 +508,7 @@ class RolloutScheduler:
         return entry.complete[:target]
 
     def __call__(self, state: TrainState, batch: Batch, key: jax.Array) -> dict[str, np.ndarray]:
-        del key  # sources own their sampling seeds
+        self._key, self._submissions = key, 0
         updates = int(state.updates)
         self._publish(state, updates)
         rollouts, latencies, groups, tally, waited = agreed(
