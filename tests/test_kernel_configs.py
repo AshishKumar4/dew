@@ -63,8 +63,8 @@ def test_the_tuner_finds_each_of_the_rules_launches_in_its_lowering(module):
                                                       if isinstance(op, fla_gdn._Launch)}
 
 
-def test_a_launch_clips_its_blocks_to_the_operands_and_takes_the_labs_overrides():
-    """Blocks wider than a call's keys or values shrink to them; an override replaces its field."""
+def test_a_launch_clips_its_blocks_to_the_operands():
+    """Blocks wider than a call's keys or values shrink to them."""
     q = jax.ShapeDtypeStruct((1, 64, 1, 64), jnp.bfloat16)
     v = jax.ShapeDtypeStruct((1, 64, 1, 32), jnp.bfloat16)
     h = jax.ShapeDtypeStruct((1, 1, 1, 64, 32), jnp.bfloat16)

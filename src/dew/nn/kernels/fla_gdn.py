@@ -183,11 +183,11 @@ def _wide() -> bool:
 
 def _launch(op: _Launch, overrides: Mapping[str, int | None], *args, **kwargs):
     """`op` on `args`, its tiles the tuner's pick or heuristic, with any `overrides` (the lab's, a
-    test's) replacing their fields."""
+    test's) replacing their fields, fitted to the call as every config is (`_Launch._tiles`)."""
     given = {field: value for field, value in overrides.items() if value is not None}
     if given:
-        tiles = op._get_heuristics_config(op.bind(*args, **kwargs))
-        op = op.replace(config=dataclasses.replace(tiles, **given))
+        ba = op.bind(*args, **kwargs)
+        op = op.replace(config=op._tiles(ba, dataclasses.replace(op._get_heuristics_config(ba), **given)))
     return op(*args, **kwargs)
 
 

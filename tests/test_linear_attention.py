@@ -26,6 +26,7 @@ instead of `q^T S` in the recurrent form; the numbers are in the tests that
 catch them.
 """
 
+import functools
 import json
 from pathlib import Path
 
@@ -33,6 +34,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from delta_rule_support import recurrence, through, wide
 from flax import linen as nn
 from reference_error import assert_as_exact_as_the_reference
 
@@ -46,7 +48,6 @@ from dew.nn.linear import (
     chunk_gated_delta_rule,
     held_conv1d,
     l2norm,
-    recurrent_delta_rule,
     recurrent_gated_delta_rule,
     strictly_lower_inverse,
 )
@@ -165,27 +166,11 @@ def test_the_chunked_rule_runs_packed_documents_as_each_runs_alone(decay_width, 
     def packed(*args):
         return chunk_delta_rule(*args, chunk, starts=jnp.asarray(starts))
 
-    def alone(q, k, v, g, beta, h0):
-        outs, state = [], h0
-        for begin, end in zip(begins, (*begins[1:], length), strict=True):
-            state = state if begin == 0 else jnp.zeros_like(state)
-            out, state = recurrent_delta_rule(*(x[:, begin:end] for x in (q, k, v, g, beta)), state)
-            outs.append(out)
-        return jnp.concatenate(outs, axis=1), state
-
-    def through(rule, do, dht):
-        def loss(*args):
-            out, final = rule(*args)
-            return jnp.sum(out * do) + jnp.sum(final * dht), (out, final)
-
-        (_, results), grads = jax.value_and_grad(loss, argnums=range(6), has_aux=True)(q, k, v, g, beta, h0)
-        return (*results, *grads)
-
-    got = jax.jit(lambda: through(packed, do, dht))()
+    got = jax.jit(through(packed, do, dht))(q, k, v, g, beta, h0)
     with jax.enable_x64(new_val=True):
-        wide = [jnp.asarray(np.asarray(x, np.float64)) for x in (q, k, v, g, beta, h0, do, dht)]
-        q, k, v, g, beta, h0, do, dht = wide
-        want = through(alone, do, dht)
+        operands = wide(q, k, v, g, beta, h0, do, dht)
+        alone = functools.partial(recurrence, cuts=(begins,))
+        want = through(alone, *operands[6:])(*operands[:6])
     for name, mine, theirs in zip(("out", "final", "q", "k", "v", "g", "beta", "h0"), got, want, strict=True):
         assert largest(mine, theirs) < 1e-4 * max(1.0, float(np.max(np.abs(np.asarray(theirs))))), name
 
