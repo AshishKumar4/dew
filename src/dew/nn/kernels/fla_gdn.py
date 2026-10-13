@@ -313,7 +313,7 @@ class ChunkLocalCumsum(_Launch):
     KEYS, VALUES = None, None
 
     def _fwd(self, g: jax.Array, chunk_spans: jax.Array, sequence_spans: jax.Array, *, chunk: int,
-             scale: float, reverse: bool, interpret: bool, config: Tiles,
+             scale: float | None, reverse: bool, interpret: bool, config: Tiles,
              return_residuals: bool = False):
         from jax.experimental.pallas import triton as plgpu
 
