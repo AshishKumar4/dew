@@ -592,8 +592,7 @@ class Layout:
             else:
                 spec = logical_spec(axes, value.shape, rules=self.axis_rules, mesh=mesh)
             if self._kept_whole(path):
-                spec = P(*(tuple(axis for axis in mesh_axes(entry) if axis != FSDP_AXIS) or None
-                           for entry in spec))
+                spec = P(*map(_without_fsdp, spec))
             outside = sorted({axis for entry in spec for axis in mesh_axes(entry)}
                              - set(PARAMETER_AXES))
             if outside:
@@ -928,6 +927,12 @@ def first_reader_batch(mesh: Mesh, batch: Mapping[str, np.ndarray]) -> dict[str,
 
 # The batches a `DevicePrefetchIterator` queues ahead of the step by default.
 PREFETCH_DEPTH = 2
+
+
+def _without_fsdp(entry: MeshAxes) -> MeshAxes:
+    """A spec entry with the fsdp axis dropped from it."""
+    kept = tuple(axis for axis in mesh_axes(entry) if axis != FSDP_AXIS)
+    return kept if kept else None
 
 
 def placed_bytes(tree) -> int:

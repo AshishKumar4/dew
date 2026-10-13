@@ -276,13 +276,16 @@ def test_a_frozen_collection_kept_whole_is_never_gathered_over_fsdp(mesh, device
         trained, *_ = run(state, placed)
         return state, shardings, gathered, jax.device_get(trained.variables["params"])
 
-    split_state, split, split_gathered, split_trained = stepped(False)
-    whole_state, whole, whole_gathered, whole_trained = stepped(True)
+    split_state, split, split_gathered, split_trained = stepped(frozen_whole=False)
+    whole_state, whole, whole_gathered, whole_trained = stepped(frozen_whole=True)
     split_specs = [sharding.spec for sharding in jax.tree.leaves(split.variables[FROZEN])]
     whole_specs = [sharding.spec for sharding in jax.tree.leaves(whole.variables[FROZEN])]
     assert any("fsdp" in mesh_axes(entry) for spec in split_specs for entry in spec)
-    assert whole_specs == [P(*(tuple(axis for axis in mesh_axes(entry) if axis != "fsdp") or None
-                               for entry in spec)) for spec in split_specs]
+    def unsplit(entry):
+        kept = [axis for axis in mesh_axes(entry) if axis != "fsdp"]
+        return tuple(kept) if kept else None
+
+    assert whole_specs == [P(*map(unsplit, spec)) for spec in split_specs]
     assert mesh.tensor == 1 or any("tensor" in mesh_axes(entry) for spec in whole_specs for entry in spec)
     assert jax.tree.leaves(whole.variables["params"]) == jax.tree.leaves(split.variables["params"])
     assert placed_bytes(whole_state.opt_state) == placed_bytes(split_state.opt_state)
