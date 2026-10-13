@@ -37,10 +37,10 @@ from dew.interop import sources
 from dew.objectives.base import Metric, Objective
 from dew.telemetry.profile import Profiler, region
 from dew.training import Trainer
-from dew.training.distributed import DevicePrefetchIterator
+from dew.training.distributed import DevicePrefetchIterator, Signature, batch_signature
 from dew.training.runtime import prepare_process
 from dew.training.state import TrainState
-from dew.training.trainer import CompiledStep, Rollout, Shapes, batch_shapes
+from dew.training.trainer import CompiledStep, Rollout
 
 MODEL = "Qwen/Qwen3.5-0.8B"
 REVISION = "2fc06364715b967f1860aea9cf38778875588b17"
@@ -112,8 +112,8 @@ def model_flops(config: Mapping[str, object], real_tokens: float, squared_length
 class Measurement:
     def __init__(self, trainer: Trainer, counted: Counted, config: BenchmarkRun):
         self.trainer, self.counted, self.config = trainer, counted, config
-        self.compiled: dict[Shapes, CompiledStep] = {}
-        self.hardware: dict[Shapes, float | None] = {}
+        self.compiled: dict[Signature, CompiledStep] = {}
+        self.hardware: dict[Signature, float | None] = {}
         self.compiles: list[dict[str, object]] = []
         self.rows: list[dict[str, float]] = []
         self.started = time.perf_counter()
@@ -127,7 +127,7 @@ class Measurement:
             batch = next(reader)
         wait = time.perf_counter() - started
         counted = self.counted.counts.get_nowait()
-        shape = batch_shapes(batch)
+        shape = batch_signature(batch)
         compile_seconds = 0.0
         if shape not in self.compiled:
             began = time.perf_counter()
