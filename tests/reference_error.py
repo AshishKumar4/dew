@@ -241,7 +241,7 @@ def _evaluated(jaxpr, consts, args, given=None):
             outputs, made = _applied(equation, inputs, [energy(var) for var in equation.invars],
                                      any(var in wanted for var in equation.outvars))
         for var in equation.invars:
-            if last.get(var) == index:
+            if not isinstance(var, Literal) and last.get(var) == index:
                 values.pop(var, None)
                 energies.pop(var, None)
         for var, value, made_energy in zip(equation.outvars, outputs, made, strict=True):
