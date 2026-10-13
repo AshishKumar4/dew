@@ -37,11 +37,11 @@ def _muse_text_config(hf_config: Mapping[str, object], used: set[str]) -> Decode
     post_eps = records.number(hf_config.get('post_norm_eps', 1e-8), 'post_norm_eps')
     kinds = config['kinds']
     kinds.setdefault('sliding_attention', {})['mixer'] = {
-        'class': 'attention', 'fields': {'gate_projection': 'own'}}
+        'class': 'attention', 'fields': {'gate_projection': 'own', 'qk_norm_weight': False}}
     kinds.setdefault('full_attention', {})['mixer'] = {
-        'class': 'attention', 'fields': {'gate_projection': 'own', 'nope': True}}
+        'class': 'attention', 'fields': {'gate_projection': 'own', 'qk_norm_weight': False, 'nope': True}}
     config.update(
-        sandwich_norms=True, scale_offset=True, qk_norm_weight=False, output_gate=True,
+        sandwich_norms=True, scale_offset=True, output_gate=True,
         attention_scale=records.number(hf_config.get('qk_scale_factor', 3.87), 'qk_scale_factor')
         * head_dim ** -0.5,
         embedding_norm=True,
