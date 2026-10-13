@@ -25,7 +25,7 @@ concurrency:
 
 env:
   # The armada runner every armada job uses.
-  ARMADA: github:AshishKumar4/armada#3d0b707de58afc0c753244581ac49dfb4036d60d
+  ARMADA: github:AshishKumar4/armada#1879a6605c65f1e76539f8b60a29bdf35fa8fdc6
 
 jobs:
   # A commit this workflow passed on another push, as one proved on
@@ -200,7 +200,7 @@ jobs:
     runs-on: ubuntu-latest
     # The suite runs on armada (.armada.json, tools/armada/ci.py): both
     # Pythons as tasks of about five minutes each on Dew's own armada
-    # deployment, on at most 48 containers, which leaves the account's
+    # deployment, on at most 96 containers, which leaves the account's
     # container limit to its other projects: about 1,200 container-seconds
     # each, four times the heaviest task, so the heaviest-first queue ends
     # level with no task run twice (a simulation of the run 922 rows made:

@@ -33,7 +33,13 @@ from dew.pool import (
     runs_on_gpu,
     slurm_tasks_here,
 )
-from dew.telemetry.devices import apply_xla_flags, cuda_plugin, unpartition_gpu_pool, xla_flag
+from dew.telemetry.devices import (
+    apply_xla_flags,
+    cuda_plugin,
+    preallocate_gpu_pool,
+    unpartition_gpu_pool,
+    xla_flag,
+)
 
 _log = logging.getLogger(__name__)
 
@@ -108,6 +114,7 @@ def _set_environment(wandb: Wandb | None, xla_flags: str | None,
     os.environ['TOKENIZERS_PARALLELISM'] = "false"
     apply_xla_flags(xla_flags)
     unpartition_gpu_pool()
+    preallocate_gpu_pool()
     if compilation_cache_dir:
         enable_compilation_cache(compilation_cache_dir)
 

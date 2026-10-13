@@ -138,6 +138,13 @@ class DistillationObjective(Objective[Ratio, Effects], Generic[Loss, Effects]):
         self.student.substitute(modules[:count])
         self.teacher.substitute(modules[count:])
 
+    def tile_head(self, tile: tuple[int, int] | None = None) -> str | None:
+        """Tile the student's head, the vocabulary head this objective trains."""
+        return self.student.tile_head(tile)
+
+    def restore_head_tile(self, tile: tuple[int, int] | None) -> None:
+        self.student.restore_head_tile(tile)
+
     def held_variables(self) -> Variables | None:
         """Return the student's held tree, if any, with the teacher's under `teacher`."""
         held = dict(self.student.held_variables() or {})
