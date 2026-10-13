@@ -583,7 +583,7 @@ def test_text_preserves_exact_line_terminators_through_byte_tokenization(read):
 
 
 def test_exported_token_lengths_support_indexed_spans_without_record_scan():
-    from dew.data.sources.files import TokenFiles
+    from dew.data.sources.tokens import TokenFiles
 
     root = f"memory://token-export-{uuid4().hex}"
     export(
@@ -633,7 +633,8 @@ def test_cli_token_exports_are_readable_by_the_dispatched_token_source(tmp_path,
     assert stored.metadata()["eos_id"] == vocabulary.eos_id
     assert stored.metadata()["train_tokens"] == len(expected)
     records = stored.records("indexed")
-    assert np.concatenate([records[index]["text"] for index in range(len(records))]).tolist() == expected.tolist()
+    actual = np.concatenate([records[index]["text"] for index in range(len(records))])
+    assert actual.tolist() == expected.tolist()
 
 
 def test_cli_refuses_an_unsupported_token_export_format_before_writing(tmp_path):
@@ -1433,7 +1434,7 @@ def test_raw_token_arrayrecords_require_explicit_lengths_for_indexed_reads(tmp_p
 
     from dew.data.sources import source as resolve
     from dew.data.sources.codec import pack_dict_of_byte_arrays
-    from dew.data.sources.files import TokenFiles
+    from dew.data.sources.tokens import TokenFiles
 
     root = Store(str(tmp_path))
     root.child("meta.json").write(

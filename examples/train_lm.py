@@ -16,7 +16,7 @@ import tyro
 from dew.config import OptimConfig
 from dew.config.data import TextData, loader
 from dew.data import ByteTokenizer, Loading
-from dew.data.sources.files import TokenFiles
+from dew.data.sources.tokens import TokenFiles
 from dew.inference import RunProcessor
 from dew.nn.backbones import CausalTransformer
 from dew.objectives.lm import LMObjective, Samples
