@@ -35,6 +35,15 @@ Attention = Literal["full", "band", "window"]
 Order = Literal["patches", "columns", "windows"]
 
 
+def _documents(segment):
+    """The `Coordinates` of a layer's `segment` ids, each token keeping its index as its position (the
+    rotation is the metadata's own); None for a layer that attends unmasked."""
+    if segment is None:
+        return None
+    return coordinates(segments=segment, positions=jnp.broadcast_to(jnp.arange(segment.shape[1]),
+                                                                     segment.shape))
+
+
 @dataclasses.dataclass(frozen=True)
 class ViTLayout:
     """The geometry and wiring of one family's tower.
@@ -237,11 +246,8 @@ class VisionTransformer(nn.Module):
                 frames = _gather(jnp.where(valid, frame + 1, 0), order)
                 first = (frames != jnp.pad(frames, ((0, 0), (1, 0)))[:, :-1]) & (frames > 0)
                 bias = jnp.where(first[:, None, None, :], sinks[None, :, None, None], 0.0)
-            # Each token keeps its index as its position; the rotation is the metadata's own.
-            metadata = AttentionMetadata(
-                coordinates=coordinates(segments=segment, positions=jnp.broadcast_to(
-                    jnp.arange(segment.shape[1]), segment.shape)),
-                rotary_positions=_gather(rotary, order), position_bias=bias)
+            metadata = AttentionMetadata(coordinates=_documents(segment),
+                                         rotary_positions=_gather(rotary, order), position_bias=bias)
             hidden = vit_block(lay, index, dtype=self.dtype, precision=self.precision)(
                 hidden, attention_metadata=metadata)
             # A block without hyper-connections hands on the plain residual.

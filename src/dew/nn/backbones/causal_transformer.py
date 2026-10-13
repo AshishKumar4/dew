@@ -1477,12 +1477,12 @@ class CausalTransformer(nn.Module):
                     valid = valid & attention_mask[:, depth:]
                 if segment_ids is not None:
                     valid = valid & (segment_ids[:, :-depth] == segment_ids[:, depth:])
-            shifted = {name: None if field is None else field[:, depth:]
-                       for name, field in (("segments", segment_ids), ("positions", positions))}
-            given = valid is not None or any(field is not None for field in shifted.values())
+            segments, places = (None if field is None else field[:, depth:]
+                                for field in (segment_ids, positions))
+            given = valid is not None or segments is not None or places is not None
             metadata = AttentionMetadata(
                 coordinates=build_coordinates((hidden.shape[0], hidden.shape[1] - 1), valid=valid,
-                                              **shifted) if given else None,
+                                              segments=segments, positions=places) if given else None,
                 image_groups=None if image_groups is None else image_groups[:, depth:],
                 rotary_positions=None if rotary_positions is None else rotary_positions[:, depth:])
             hidden = block(hidden[:, :-1], embeds[:, depth:], train=train, attention_metadata=metadata)
