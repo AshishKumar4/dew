@@ -154,10 +154,11 @@ class TorchGraph:
         import torchax
 
         if train and self.training_only:
+            shown = ", ".join(self.training_only[:3]) + (", ..." if len(self.training_only) > 3 else "")
             raise ValueError(
                 f"fallback='torchax' runs transformers' eval forward, and this model computes "
-                f"{', '.join(self.training_only)} only in training; set them to 0 in its config, "
-                f"or train a family Dew loads natively")
+                f"{len(self.training_only)} things only in training ({shown}); set their rates to 0 "
+                f"in its config, or train a family Dew loads natively")
 
         env = torchax.default_env()
         arguments = env.j2t_iso((dict(params), dict(buffers), tokens))
