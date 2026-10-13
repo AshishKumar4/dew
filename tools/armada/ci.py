@@ -42,9 +42,9 @@ event saw that process's code. The records live in the dew-xla-cache Worker
 under `CACHE_PREFIX`; with DEW_TEST_CACHE=off, or without its URL and token, the
 plan runs every file.
 
-Beside each green row's record is where its tests read the backend and which
-are marked to run on a GPU (`READS`), from which `gpu-tier` names the files
-that take another path on a GPU, for the H100 tier to run.
+A row's record also says where its tests read the backend and which are
+marked to run on a GPU, from which `gpu-tier` names the files that take
+another path on a GPU, for the H100 tier to run.
 """
 
 import argparse
@@ -155,12 +155,10 @@ def worker() -> str:
     return os.environ["DEW_XLA_CACHE_URL"].rstrip("/")
 
 
-def cache_url(python: str, row_name: str, kind: str = "") -> str:
-    """Where the record of `row_name` lives, or its record of `kind` (`READS`): the Worker's key
-    alphabet has no colon or hash."""
+def cache_url(python: str, row_name: str) -> str:
+    """Where the record of `row_name` lives: the Worker's key alphabet has no colon or hash."""
     _, name, split = parsed_row(row_name)
-    return (f"{worker()}/{CACHE_PREFIX}/{kind}{python}/{name}/"
-            f"{'-of-'.join(split.split('/')) if split else 'whole'}")
+    return f"{worker()}/{CACHE_PREFIX}/{python}/{name}/{'-of-'.join(split.split('/')) if split else 'whole'}"
 
 
 def cache_request(url: str, token: str, data: bytes | None = None) -> bytes | None:
@@ -215,10 +213,15 @@ def cached(python: str, rows: list[str], common: str) -> bool:
         record = cache_request(cache_url(python, row_name), token)
         if record is None:
             return False
-        recorded = json.loads(record)
-        if recorded["key"] != cache_key(common, parsed_row(row_name)[1], recorded["depends"]):
+        if not fresh(json.loads(record), parsed_row(row_name)[1], common):
             return False
     return True
+
+
+def fresh(recorded: dict, name: str, common: str) -> bool:
+    """Whether test file `name`'s record was made on exactly these inputs. A file that started
+    another process has no key: no event saw that process's code."""
+    return recorded["key"] is not None and recorded["key"] == cache_key(common, name, recorded["depends"])
 
 
 def recorded_tests() -> dict[str, list[float]]:
@@ -487,27 +490,20 @@ def task(python: str, tests: list[str], split: str, out: Path, deadline: float, 
     return 0
 
 
-READS = "reads/"
-"""The kind of the records of where a row's tests read the backend (`gpu_tier`)."""
-
-
 def record(python: str, rows: list[dict], executed_report: Path, common: str) -> None:
-    """Keep each green row's key and the files its tests executed (`cached` reads them back), but a
-    file's that started another process, and where its tests read the backend (`gpu_tier`)."""
+    """Keep each green row's key, the files its tests executed and where they read the backend:
+    `cached` reads the key back, `gpu_tier` the reads."""
     token = os.environ.get("DEW_XLA_CACHE_TOKEN")
     if not token or "DEW_XLA_CACHE_URL" not in os.environ or not executed_report.is_file():
         return
     executed = json.loads(executed_report.read_text())
     for row_ in rows:
         name = parsed_row(row_["name"])[1]
-        if row_["exitCode"] != 0 or name not in executed:
-            continue
-        depends = executed[name]["depends"]
-        if depends is not None:
-            body = json.dumps({"key": cache_key(common, name, depends), "depends": depends}).encode()
+        if row_["exitCode"] == 0 and name in executed:
+            depends = executed[name]["depends"]
+            key = None if depends is None else cache_key(common, name, depends)
+            body = json.dumps({"key": key, "depends": depends, "reads": executed[name]["reads"]}).encode()
             cache_request(cache_url(python, row_["name"]), token, body)
-        reads = json.dumps(executed[name]["reads"]).encode()
-        cache_request(cache_url(python, row_["name"], READS), token, reads)
 
 
 def listed(prefix: str, token: str) -> list[str]:
@@ -528,22 +524,28 @@ def listed(prefix: str, token: str) -> list[str]:
 def gpu_tier(python: str) -> dict[str, list[str]]:
     """The test files that take another path on a GPU, each with its evidence: where its tests read
     the backend and its marks of tools/armada/executed.py's `MARKS`, over every record of its rows,
-    a split file's under each count of groups it was planned as. A file without a record, or with
-    one the Worker did not return, is in as "unrecorded": a new file, or one no green run of these
-    tools has recorded."""
+    a split file's under each count of groups it was planned as. A file is out only where every
+    record is of these inputs (`fresh`) and says neither, so a file whose inputs changed since it
+    ran is in as "changed", and one without a record, or with one the Worker did not return, as
+    "unrecorded": a new file, or one no green run of these tools has recorded."""
     token = reading_token()
     if token is None:
         raise SystemExit("the GPU tier is chosen from the test cache's records, which need its URL and token")
-    prefix = f"{CACHE_PREFIX}/{READS}{python}/"
+    common = shared(python)
+    prefix = f"{CACHE_PREFIX}/{python}/"
 
-    def reads(key: str) -> tuple[str, list[str] | None]:
+    def evidence_of(key: str) -> tuple[str, list[str]]:
+        name = key.rsplit("/", 1)[0]
         record = cache_request(f"{worker()}/{prefix}{key}", token)
-        return key.rsplit("/", 1)[0], None if record is None else json.loads(record)
+        if record is None:
+            return name, ["unrecorded"]
+        recorded = json.loads(record)
+        return name, recorded["reads"] or ([] if fresh(recorded, name, common) else ["changed"])
 
     evidence: dict[str, set[str]] = {}
     with concurrent.futures.ThreadPoolExecutor(32) as pool:
-        for name, found in pool.map(reads, listed(prefix, token)):
-            evidence.setdefault(name, set()).update(["unrecorded"] if found is None else found)
+        for name, found in pool.map(evidence_of, listed(prefix, token)):
+            evidence.setdefault(name, set()).update(found)
     every = sorted(str(path) for path in Path("tests").glob("test_*.py") if str(path) not in SKIPPED)
     unrecorded = {name: ["unrecorded"] for name in every if name not in evidence}
     return {name: sorted(evidence[name]) for name in every if evidence.get(name)} | unrecorded

@@ -117,12 +117,12 @@ def test_the_gpu_tier_is_every_file_whose_tests_read_the_backend_or_are_marked_f
         ci, tmp_path, monkeypatch, cache_worker):
     """A task keeps, beside each green file's key, where its run read the
     backend and its GPU marks (executed.py), and the GPU tier is each file
-    with either and each without a record the Worker returns. A read is the
-    file's whose test calls it, by any name, every file's that requests a
-    session fixture that made it, and a test module's whose body made it,
-    though another file imported it first. The `platform` module is no read.
-    A file that started a process is in the tier's records, and the plan
-    still never skips it."""
+    with either, each whose inputs changed since, and each without a record
+    the Worker returns. A read is the file's whose test calls it, by any
+    name, every file's that requests a session fixture that made it, and a
+    test module's whose body made it, though another file imported it
+    first. The `platform` module is no read. A file that started a process
+    has no key, so it is in, and the plan never skips it."""
     url, stored, _ = cache_worker
     monkeypatch.setenv("DEW_XLA_CACHE_URL", url)
     monkeypatch.setenv("DEW_XLA_CACHE_TOKEN", "token")
@@ -141,6 +141,8 @@ def test_the_gpu_tier_is_every_file_whose_tests_read_the_backend_or_are_marked_f
         "test_imported.py": device + "ON = Device().platform\ndef test_on(): assert ON == 'gpu'\n",
         "test_marked.py": "import pytest\n@pytest.mark.gpu\ndef test_on_a_gpu(): pass\n",
         "test_machine.py": "import platform\ndef test_machine(): assert platform.machine()\n",
+        "test_plain.py": "def test_plain(): pass\n",
+        "test_lost.py": "def test_lost(): pass\n",
         "test_spawns.py": "import subprocess, sys\n"
                           "def test_child(): subprocess.run([sys.executable, '-c', 'pass'], check=True)\n",
         "test_new.py": "def test_unrun(): pass\n",
@@ -156,17 +158,20 @@ def test_the_gpu_tier_is_every_file_whose_tests_read_the_backend_or_are_marked_f
     ci.task("3.12", ran, "", out, 600.0)
     assert {row["name"]: row["exitCode"] for row in json.loads(out.read_text())["rows"]} == {
         f"3.12:{name}": 0 for name in ran}
-    # A group of test_machine.py's the Worker lists and does not return.
-    stored[ci.cache_url("3.12", "3.12:tests/test_machine.py#2/2", ci.READS)[len(url):]] = None
+    (tmp_path / "tests/test_plain.py").write_text("def test_plain(): assert True\n")
+    # A group of test_lost.py's the Worker lists and does not return.
+    stored[ci.cache_url("3.12", "3.12:tests/test_lost.py#2/2")[len(url):]] = None
     assert ci.gpu_tier("3.12") == {
         "tests/test_imported.py": ["tests/test_imported.py:<module>"],
         "tests/test_importer.py": ["tests/test_imported.py:<module>"],
-        "tests/test_machine.py": ["unrecorded"],
+        "tests/test_lost.py": ["unrecorded"],
         "tests/test_marked.py": ["mark:gpu"],
         "tests/test_new.py": ["unrecorded"],
         "tests/test_one.py": ["tests/devices.py:placed"],
         "tests/test_passed.py": ["tests/test_passed.py:chosen"],
+        "tests/test_plain.py": ["changed"],
         "tests/test_routes.py": ["tests/test_routes.py:chosen"],
+        "tests/test_spawns.py": ["changed"],
         "tests/test_two.py": ["tests/devices.py:placed"]}
     common = ci.shared("3.12")
     assert [ci.cached("3.12", [ci.row("3.12", f"tests/{name}", "")], common)
