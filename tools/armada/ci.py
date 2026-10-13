@@ -39,8 +39,9 @@ recomputes each of its files' keys from the record made on its own CPU class
 instead of running a file whose key matches, which ran green on exactly these
 inputs there. A file that started another process is never reused, since no
 event saw that process's code. The records live in the dew-xla-cache Worker
-under `testcache/`; with DEW_TEST_CACHE=off, or without its URL and token, a
-task runs every file.
+under `testcache/`. With DEW_TEST_CACHE=off where the plan runs, which its
+entries carry to their tasks (`--cache`), or without the Worker's URL and
+token, a task runs every file.
 """
 
 import argparse
@@ -181,8 +182,8 @@ def cache_request(url: str, token: str, data: bytes | None = None) -> bytes | No
 def reused(python: str, name: str, split: str, common: str) -> dict | None:
     """The green row of test file `name` (in `split`'s group) recorded on this host's CPU class, if it
     ran green there on exactly these inputs; else None."""
-    token = os.environ.get("DEW_TEST_CACHE_TOKEN") or os.environ.get("DEW_XLA_CACHE_TOKEN")
-    if os.environ.get("DEW_TEST_CACHE") == "off" or not token or "DEW_XLA_CACHE_URL" not in os.environ:
+    token = os.environ.get("DEW_XLA_CACHE_TOKEN")
+    if not token or "DEW_XLA_CACHE_URL" not in os.environ:
         return None
     record = cache_request(cache_url(python, row(python, name, split), cpu_class()), token)
     if record is None:
@@ -279,7 +280,9 @@ MXFP4, armada dew-20261011231242-dd32ac90): its tasks hold only files so marked.
 def plan(target: float, timings: dict) -> list[dict]:
     """The matrix's entries: about `target` seconds of files each, for each Python. A file nothing has
     timed runs alone, so however long it takes it holds up no other file, and its time is known from
-    then on. Files marked `torchax` (`APART`) share tasks only with one another."""
+    then on. Files marked `torchax` (`APART`) share tasks only with one another. Each entry carries
+    the test cache's policy, DEW_TEST_CACHE here, to its task."""
+    cache = "off" if os.environ.get("DEW_TEST_CACHE") == "off" else "on"
     every = sorted(str(path) for path in Path("tests").glob("test_*.py") if str(path) not in SKIPPED)
     recorded = recorded_tests()
     entries = []
@@ -307,13 +310,14 @@ def plan(target: float, timings: dict) -> list[dict]:
         for index, (names, group, weight) in enumerate(tasks, start=1):
             entries.append({"name": f"{python}-{index}", "python": python, "tests": " ".join(names),
                             "split": group, "rows": [row(python, name, group) for name in names],
-                            "weight": weight})
+                            "weight": weight, "cache": cache})
     rest = [name for name in every if name not in NEWEST_FILES]
     for index in range(COLLECT_TASKS):
         names = rest[index::COLLECT_TASKS]
         entries.append({"name": f"{PYTHONS[1]}-{COLLECT}-{index + 1}", "python": PYTHONS[1],
                         "tests": " ".join(names), "split": COLLECT,
-                        "rows": [row(PYTHONS[1], name, COLLECT) for name in names], "weight": target})
+                        "rows": [row(PYTHONS[1], name, COLLECT) for name in names], "weight": target,
+                        "cache": cache})
     return entries
 
 
@@ -367,7 +371,8 @@ def collect(python: str, tests: list[str], out: Path, deadline: float) -> int:
     return 0
 
 
-def task(python: str, tests: list[str], split: str, out: Path, deadline: float, grace: float = 60.0) -> int:
+def task(python: str, tests: list[str], split: str, out: Path, deadline: float, cache: bool = True,
+         grace: float = 60.0) -> int:
     """Run `tests` and write one verdict row a file, interrupting them past `deadline` seconds and
     killing them `grace` seconds after that.
 
@@ -378,7 +383,7 @@ def task(python: str, tests: list[str], split: str, out: Path, deadline: float, 
     began = time.monotonic()
     # Before any test writes under tests/, the inputs as the plan saw them.
     common = shared(python)
-    rows = [found for name in tests if (found := reused(python, name, split, common))]
+    rows = [found for name in tests if cache and (found := reused(python, name, split, common))]
     tests = [name for name in tests if row(python, name, split) not in {found["name"] for found in rows}]
     if rows:
         print(f"{len(rows)} files ran green on these inputs on {cpu_class()}; their rows are reused")
@@ -508,6 +513,8 @@ def main() -> int:
     running.add_argument("--tests", required=True)
     running.add_argument("--split", default="")
     running.add_argument("--out", type=Path, required=True)
+    running.add_argument("--cache", choices=("on", "off"), required=True,
+                         help="whether a file that ran green on these inputs is reused (the plan's DEW_TEST_CACHE)")
     running.add_argument("--deadline", type=float, default=1680.0,
                          help="seconds before armada's own task timeout (.armada.json) to interrupt at")
     recording = operations.add_parser("durations")
@@ -525,7 +532,7 @@ def main() -> int:
         return 0
     if args.split == COLLECT:
         return collect(args.python, args.tests.split(), args.out, args.deadline)
-    return task(args.python, args.tests.split(), args.split, args.out, args.deadline)
+    return task(args.python, args.tests.split(), args.split, args.out, args.deadline, args.cache == "on")
 
 
 if __name__ == "__main__":
