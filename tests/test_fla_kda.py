@@ -1,9 +1,11 @@
 """fla's chunked Kimi delta attention on the port's kernels (dew.nn.kernels.fla_kda).
 
-Host tests interpret the kernels through the rule a GPU runs, `chunk_gated_delta_rule` with a decay per
-key dimension: its output, final memory and every gradient against the float64 rule, at shapes that pad
-to the kernels' blocks, with value heads sharing a key head, in a layer and on a mesh. The GPU tier runs
-them on the GPU, with the training shape's float64 distances against fla's own on the same operands.
+Host tests interpret the kernels through the port's entry, `fla_rule` with a decay per key dimension:
+its output, final memory and every gradient against the float64 token recurrence the GDN port's tests
+share, at shapes that pad to the kernels' blocks, with value heads sharing a key head, and on a mesh;
+its packed documents are test_fla_gdn's packed test. The GPU tier runs them on the GPU, the layer on
+the GPU's own target row, and the float64 distances against fla's own, run in its own interpreter, at
+the training shape, with grouped value heads, padded and packed.
 """
 
 import functools
@@ -19,12 +21,12 @@ import pytest
 from kernel_compile import compile_kernels
 from reference_error import assert_as_exact_as_the_reference, assert_leaves_as_exact, distance, widened
 from sharded import assert_runs_per_shard, boundary_copies
-from test_fla_gdn import port_named, recurrence, through, wide
+from test_fla_gdn import recurrence, through, wide
 
-from dew.nn import linear
+from dew.nn import kernels, linear
 from dew.nn.kda import KimiDeltaAttention
 from dew.nn.kernels import fla_gdn, fla_kda
-from dew.nn.linear import chunk_gated_delta_rule, fla_rule, l2norm, port_refusal
+from dew.nn.linear import fla_rule, l2norm
 
 pytestmark = pytest.mark.kernel
 
@@ -37,10 +39,9 @@ ON_A_GPU = pytest.mark.skipif(
     reason="on a GPU the port's fp32 products are fla's TF32 and its bar is fla's own distance "
            "(test_the_port_is_as_exact_as_fla_at_the_training_shape); interpreted, they are exact")
 
-APART = {jnp.dtype(jnp.float32): 1e-4, jnp.dtype(jnp.bfloat16): 5e-2}
-"""A layer's leaf's RMS distance from the portable math's, over its size: fp32 rounding of fla's chunked
-algebra, whose decay gradient sums cancelling terms the math does not, and bf16 storage, where fla
-keeps the chunk's operands in bf16. The port's bar is fla's own, held on the GPU."""
+APART = 5e-2
+"""A bf16 layer's leaf's RMS distance from the portable math's, over its size: bf16 storage, where fla
+keeps the chunk's operands in bf16. The port's bar is fla's own (`test_the_port_is_as_exact_as_fla`)."""
 
 
 def operands(batch, length, key_heads, value_heads, width, columns, dtype, *, seed: int = 0):
@@ -73,13 +74,11 @@ def math(q, k, v, g, beta, h0):
     (1, 1, 128, 128, 64),   # one chunk at the widest fp32 keys
 ])
 def test_the_rule_on_the_port_is_as_exact_as_the_math(key_heads, value_heads, width, columns, length):
-    """`chunk_gated_delta_rule` with a decay per key dimension where a GPU runs the port: padded to the
-    kernels' blocks, through every kernel and the custom VJP, its output, final memory and six gradients
-    as near the float64 recurrence as the portable math, up to fp32 rounding of a chunk's sums."""
+    """`fla_rule` with a decay per key dimension, the port as a GPU runs it: padded to the kernels'
+    blocks, through every kernel and the custom VJP, its output, final memory and six gradients as near
+    the float64 recurrence as the portable math, up to fp32 rounding of a chunk's sums."""
     *inputs, do, dht = operands(1, length, key_heads, value_heads, width, columns, jnp.float32, seed=11)
-    with port_named():
-        assert port_refusal(*inputs[:3]) is None
-        got = through(chunk_gated_delta_rule, do, dht)(*inputs)
+    got = through(fla_rule, do, dht)(*inputs)
     want = through(math, do, dht)(*inputs)
     with jax.enable_x64(new_val=True):
         operands64 = wide(*inputs, do, dht)
@@ -87,28 +86,26 @@ def test_the_rule_on_the_port_is_as_exact_as_the_math(key_heads, value_heads, wi
     assert_leaves_as_exact(got, want, widened(truth), reductions=CHUNKED)
 
 
-@pytest.mark.parametrize("dtype", [pytest.param(jnp.float32, marks=ON_A_GPU), jnp.bfloat16])
-def test_a_kimi_delta_attention_trains_on_the_port_as_on_the_math(dtype):
-    """The layer where a GPU runs the port, its conv rounding to the projections' dtype for it: its output
-    and every parameter gradient the math's, within fla's rounding (`APART`)."""
-    x = jax.random.normal(jax.random.key(23), (2, 72, 64)).astype(dtype)
-    layer = KimiDeltaAttention(emb_features=64, num_heads=2, head_dim=64, dtype=dtype)
+@pytest.mark.gpu(reason="the layer runs the port where the GPU's own target row names it")
+def test_a_bf16_kimi_delta_attention_trains_on_the_port_as_on_the_math():
+    """The layer on this GPU's row, which runs the port, its conv rounding to the projections' dtype
+    for it, and on a CPU's row, which runs the math (`kernels.assumed`): its output and every parameter
+    gradient the math's, within fla's bf16 storage (`APART`)."""
+    x = jax.random.normal(jax.random.key(23), (2, 72, 64)).astype(jnp.bfloat16)
+    layer = KimiDeltaAttention(emb_features=64, num_heads=2, head_dim=64, dtype=jnp.bfloat16)
     params = layer.init(jax.random.key(29), x)
 
-    def run(*, port):
-        def loss(params):
-            out = layer.apply(params, x)
-            return jnp.sum(out.astype(jnp.float32) ** 2), out
-        with port_named(port=port):
-            (_, out), grads = jax.value_and_grad(loss, has_aux=True)(params)
-        return out, grads
+    def loss(params):
+        out = layer.apply(params, x)
+        return jnp.sum(out.astype(jnp.float32) ** 2), out
 
-    want = run(port=False)
-    got = run(port=True)
-    assert got[0].dtype == want[0].dtype == dtype
+    with kernels.assumed("cpu"):
+        want = jax.value_and_grad(loss, has_aux=True)(params)
+    got = jax.value_and_grad(loss, has_aux=True)(params)
+    assert got[0][1].dtype == want[0][1].dtype == jnp.bfloat16
     for (path, mine), theirs in zip(jax.tree_util.tree_leaves_with_path(got), jax.tree.leaves(want),
                                     strict=True):
-        bound = APART[jnp.dtype(dtype)] * distance(theirs, 0)
+        bound = APART * distance(theirs, 0)
         assert distance(mine, theirs) <= bound, jax.tree_util.keystr(path)
 
 

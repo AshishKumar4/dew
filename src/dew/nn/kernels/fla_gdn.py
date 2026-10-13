@@ -49,12 +49,14 @@ the memory), at which its spaces are proven too; keys cannot split. fp32 keys ta
 @dataclasses.dataclass(frozen=True)
 class Tiles:
     """One launch's tiles: its key and value column blocks (fla's `BK`, `BV`; 0 where a kernel blocks
-    neither), its warps and its pipeline stages."""
+    neither), its warps, its pipeline stages, and the value heads a program takes (fla's `BH`, Kimi
+    delta attention's diagonal kernel's; 1 elsewhere)."""
 
     bk: int
     bv: int
     warps: int
     stages: int
+    bh: int = 1
 
 
 @dataclasses.dataclass(frozen=True)
@@ -72,7 +74,7 @@ class _Launch(tuning.KernelOp):
         """`tiles` with its blocks clipped to the call's key and value widths."""
         bk, bv = (block if name is None else min(block, ba.arguments[name].shape[-1])
                   for block, name in ((tiles.bk, self.KEYS), (tiles.bv, self.VALUES)))
-        return Tiles(bk, bv, tiles.warps, tiles.stages)
+        return dataclasses.replace(tiles, bk=bk, bv=bv)
 
     def heuristic(self, dtype: str, wide: bool) -> Tiles:
         """The kernel's tiles without a measurement (`HEURISTICS`)."""
