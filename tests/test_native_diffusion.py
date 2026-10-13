@@ -331,3 +331,19 @@ def test_conditioner_rebuild_uses_supplied_weights_without_reading_any_source_sh
         assert actual.dtype == original.dtype == jnp.bfloat16
         np.testing.assert_array_equal(actual, original)
 
+
+
+def test_a_resized_xl_conditioning_rebuilds_from_its_record_at_its_own_size(saved_pipelines):
+    """An XL pipeline loaded at 64x48 instead of its own 32x32 states that size in its time ids, and
+    the conditioner its run record rebuilds states the same, where it used to read the pipeline's
+    own size back."""
+    from dew.inputs import Condition
+    from dew.interop.pretrained import load_diffusion_source
+
+    source = load_diffusion_source(str(saved_pipelines / "xl"), dtype="float32", attention_impl="xla",
+                                   size=(64, 48))
+    condition = source.inputs.conditions["conditioning"]
+    assert condition.encoder.time_id_values == (64, 48, 0, 0, 64, 48)
+    assert source.inputs.sample.shape[:2] == (64, 48)
+    reloaded = Condition.from_json(condition.to_json(), params=condition.encoder.params)
+    assert reloaded.encoder.time_id_values == condition.encoder.time_id_values
