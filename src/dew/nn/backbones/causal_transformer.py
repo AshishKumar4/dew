@@ -16,9 +16,10 @@ dew.interop.hf_decoders does that rename. A model family is supported only after
 its translator and a same-weight parity test against the reference have landed.
 
 The block holds its token mixer in a slot. Any module with the
-(x, decode=..., positions=..., segment_ids=...) -> x signature of
-CausalSelfAttention can be self_attn without changes to the block, and that is
-where a linear-attention mixer goes.
+(x, decode=..., attention_metadata=...) -> x signature of CausalSelfAttention,
+reading its tokens' places and documents off the metadata's `Coordinates`, can
+be self_attn without changes to the block, and that is where a linear-attention
+mixer goes.
 """
 
 import dataclasses
