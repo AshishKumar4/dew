@@ -245,6 +245,10 @@ def _carried(equation) -> list[int]:
     floats = [index for index, var in enumerate(operands) if jnp.issubdtype(var.aval.dtype, jnp.inexact)]
     if name in CARRIES or _body(equation) is not None or name in ("scan", "while", "cond"):
         return floats
+    summed = [operands[0].aval.shape[axis] for axis in equation.params.get("axes", ())]
+    if name == "reduce_sum" and np.prod(summed) == 1:
+        # A sum over unit axes adds nothing: it moves its operand, as a broadcast's transpose does.
+        return floats
     if name in ("mul", "div") and len(floats) == 2:
         scalar = [index for index in floats if not operands[index].aval.shape]
         return [index for index in floats if index not in scalar] if len(scalar) == 1 else []
@@ -278,12 +282,12 @@ def _applied(equation, inputs, given, wanted: bool):
     outputs = list(outputs) if equation.primitive.multiple_results else [outputs]
     if not wanted:
         return outputs, [None] * len(outputs)
-    if name in SUMS:
+    carried = _carried(equation)
+    if name in SUMS and not carried:
         absolute = [jnp.abs(value) if jnp.issubdtype(var.aval.dtype, jnp.inexact) else value
                     for var, value in zip(equation.invars, inputs, strict=True)]
         made = equation.primitive.bind(*absolute, **equation.primitive.get_bind_params(params))
         return outputs, [made]
-    carried = _carried(equation)
     if not carried:
         return outputs, [jnp.abs(value) if jnp.issubdtype(jnp.result_type(value), jnp.inexact) else None
                          for value in outputs]
@@ -305,7 +309,8 @@ def _applied(equation, inputs, given, wanted: bool):
 
 def _scanned(params, inputs, given):
     """A scan's outputs and terms (`float64_terms`), its body evaluated a step at a time."""
-    body, constants, carries = params["jaxpr"], params["num_consts"], params["num_carry"]
+    body = params["jaxpr"]
+    constants, carries, _ = (len(group) for group in params["ft_in"].update(range(len(inputs))).unpack())
     consts, carry, xs = (inputs[:constants], inputs[constants:constants + carries],
                          inputs[constants + carries:])
     held, carry_terms, xs_terms = (given[:constants], given[constants:constants + carries],
