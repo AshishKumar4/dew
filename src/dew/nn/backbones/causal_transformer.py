@@ -70,6 +70,7 @@ from ..mixers import AttentionMixer, MixerBase, MixerContext
 from ..mixers.mamba2 import Mamba2Mixer
 from ..mixers.mlp import MLPMixer
 from ..mla import MLAMixer
+from ..mlp import GatedMLP
 from ..moe import GatedActivation, Situ
 from ..precision import at_least_fp32, biased_logits, capped_logits, head_dot_general, head_product, scaled
 from ..protocols import OutputTable, ProjectionGroup, QuantizesInputs, declared_groups
@@ -89,7 +90,6 @@ from .decoder_block import (
     RESIDUALS,
     BlockWiring,
     DecoderBlock,
-    GatedMLP,
     Mixture,
     MTPBlock,
     RematPolicy,
