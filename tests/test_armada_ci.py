@@ -19,6 +19,9 @@ def ci(tmp_path, monkeypatch):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     monkeypatch.chdir(tmp_path)
+    # CI's own environment names the shared test cache; these runs of the tools must not read or write it.
+    for name in ("DEW_XLA_CACHE_URL", "DEW_XLA_CACHE_TOKEN", "DEW_TEST_CACHE"):
+        monkeypatch.delenv(name, raising=False)
     (tmp_path / "tests").mkdir()
     return module
 
