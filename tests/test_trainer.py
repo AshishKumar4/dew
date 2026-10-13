@@ -1130,7 +1130,8 @@ def test_a_field_no_device_holds_stays_on_the_host_for_the_code_that_reads_it():
     data = dataset(lambda: captioned(Counting()), val=lambda: captioned(val_batches(1)()))
     state = Trainer(Features(), optax.sgd(.1), key=jax.random.key(0)).fit(
         data, steps=2, eval_every=2, metrics=(Captions([]),), checkpoint_final=False)
-    assert int(state.step) == 2 and captions == [f"row {index}" for index in range(BATCH)]
+    scored = next(val_batches(1)())["index"]
+    assert int(state.step) == 2 and captions == [f"row {index}" for index in scored]
 
 
 def test_a_failing_metric_fails_the_validation_pass():

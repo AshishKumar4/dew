@@ -782,7 +782,7 @@ def shard_batch(mesh: Mesh, batch: Batch) -> Batch:
     actually carry validity, the way `agreed_validity` does for a generation
     request, belongs where the caller's own collectives are issued.
     """
-    if isinstance(batch, Mapping) and (host := host_fields(batch)):
+    if host := host_fields(batch):
         # A field no device holds (`placeable`) stays on the host, where host code reads it.
         return with_host(shard_batch(mesh, device_fields(batch)), host)
     batch = filled_validity(batch) if jax.process_count() > 1 else batch
