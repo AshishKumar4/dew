@@ -27,7 +27,7 @@ import json
 import math
 import warnings
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -138,27 +138,31 @@ class TorchGraph:
     `head` names the output head's weight when the logits are exactly
     `hidden @ head.T`, checked at load; None when the model adds anything
     (a bias, a scale, a softcap). `persistent` names the buffers the source
-    checkpoint stores. The module runs in eval mode, so `training_only`
-    names what it computes only in a training forward (`_training_only`),
-    and a training forward of a model that has any is refused.
+    checkpoint stores. The module runs its eval forward. A training forward
+    runs it too where the model's training forward traces to the same
+    program, and is refused where it traces to another (dropout, layer
+    drop, router noise, any branch on `self.training`), as torchax cannot
+    run a training forward's randomness.
     """
 
     module: JittableModule
     head: str | None
     persistent: tuple[str, ...]
-    training_only: tuple[str, ...] = ()
+    # Whether the training forward differs, by the shapes it was traced at.
+    _differs: dict[str, bool] = field(default_factory=dict)
 
     def __call__(self, params: Mapping[str, jax.Array], buffers: Mapping[str, jax.Array],
                  tokens: jax.Array, *, train: bool) -> tuple[jax.Array, jax.Array]:
         """The logits and the output head's input states for `tokens`."""
-        import torchax
-
-        if train and self.training_only:
-            shown = ", ".join(self.training_only[:3]) + (", ..." if len(self.training_only) > 3 else "")
+        if train and self._trains_otherwise(params, buffers, tokens):
             raise ValueError(
-                f"fallback='torchax' runs transformers' eval forward, and this model computes "
-                f"{len(self.training_only)} things only in training ({shown}); set their rates to 0 "
-                f"in its config, or train a family Dew loads natively")
+                "fallback='torchax' runs transformers' eval forward, and this model's training forward "
+                "computes something else (dropout, layer drop, router noise or another branch on "
+                "self.training); set those rates to 0 in its config, or train a family Dew loads natively")
+        return self._forward(params, buffers, tokens)
+
+    def _forward(self, params, buffers, tokens) -> tuple[jax.Array, jax.Array]:
+        import torchax
 
         env = torchax.default_env()
         arguments = env.j2t_iso((dict(params), dict(buffers), tokens))
@@ -166,6 +170,22 @@ class TorchGraph:
             outputs = self.module.functional_call(_forward, *arguments)
         logits, hidden = env.t2j_iso(outputs)
         return logits, hidden
+
+    def _trains_otherwise(self, *arguments) -> bool:
+        """Whether the module's training forward traces to another program than its eval forward."""
+        shapes = jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(jnp.shape(leaf), jnp.result_type(leaf)),
+                              arguments)
+        key = str(jax.tree.map(lambda shape: (shape.shape, str(shape.dtype)), shapes))
+        if key not in self._differs:
+            programs = []
+            for training in (True, False):
+                self.module.train(training)
+                try:
+                    programs.append(str(jax.make_jaxpr(self._forward)(*shapes)))
+                finally:
+                    self.module.eval()
+            self._differs[key] = programs[0] != programs[1]
+        return self._differs[key]
 
     def export(self, model: nn.Module, variables: Mapping[str, object],
                config: Mapping[str, object]) -> dict[str, np.ndarray]:
@@ -205,8 +225,8 @@ class TorchCausalLM(nn.Module):
     `init` has no initializer to draw from, so the module starts from the
     loaded variables only. Floating parameters are cast to `dtype` for the
     forward, which keeps them in their stored dtype as masters; buffers keep
-    theirs. The torch module runs in eval mode, so a training forward is
-    refused where the model would compute anything else in one (`TorchGraph`).
+    theirs. The torch module runs its eval forward, and a training forward
+    is refused where the model would compute anything else in one (`TorchGraph`).
 
     `hidden_states` and `output_table` are the pair `LMObjective` scores
     through, so the vocabulary-sized logits are never built whole. Only a
@@ -345,7 +365,7 @@ def load(name_or_dir: str | Path, directory: Path, revision: str | None, *, dtyp
     vocab = int(head_weight.shape[0])
     # Torch's copies are no longer read: the forward runs on the arrays above.
     torch.nn.Module.to(model, "meta")
-    graph = TorchGraph(jittable, head_name, persistent, _training_only(model))
+    graph = TorchGraph(jittable, head_name, persistent)
     module = TorchCausalLM(graph, vocab, dtype=resolve_dtype(dtype))
     source = str(name_or_dir) if revision is None else f"{name_or_dir}@{revision}"
     processor = source_processor(directory, config, config, module, source=source)
@@ -361,26 +381,6 @@ def load(name_or_dir: str | Path, directory: Path, revision: str | None, *, dtyp
     built = {**config, "dtype": dtype, "fallback": "torchax", **versions}
     return PretrainedFallback(module, {"params": params, "buffers": buffers}, processor, config, directory,
                               built, generation_config, export_adapter=graph.export, revision=revision)
-
-
-def _training_only(model: torch.nn.Module) -> tuple[str, ...]:
-    """What `model` computes only in a training forward: an `nn.Dropout` of a
-    positive rate, a positive rate a module hands the functional dropout
-    (`attention_dropout`, Falcon's `hidden_dropout`, `*_pdrop`), and a
-    router's jitter (`jitter_noise`)."""
-    import torch
-
-    found = []
-    for name, module in model.named_modules():
-        if isinstance(module, torch.nn.Dropout):
-            if module.p > 0:
-                found.append(f"{name} (p={module.p})")
-            continue
-        for attribute, rate in vars(module).items():
-            if (attribute.endswith(("dropout", "pdrop")) or attribute == "jitter_noise") \
-                    and isinstance(rate, float) and rate > 0:
-                found.append(f"{name}.{attribute}={rate}")
-    return tuple(found)
 
 
 def _plain_head(model: PreTrainedModel, weight: torch.Tensor) -> bool:
