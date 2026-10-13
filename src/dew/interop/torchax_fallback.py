@@ -172,20 +172,35 @@ class TorchGraph:
         return logits, hidden
 
     def _trains_otherwise(self, *arguments) -> bool:
-        """Whether the module's training forward traces to another program than its eval forward."""
+        """Whether the module's training forward traces to another program than its eval forward.
+
+        Both are traced with torchax's random key as an input, so a random
+        draw is part of the program and a branch on one (layer drop) cannot
+        be decided at trace time: that trace fails, which counts as another
+        program."""
+        import torchax
+
+        env = torchax.default_env()
         shapes = jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(jnp.shape(leaf), jnp.result_type(leaf)),
                               arguments)
-        key = str(jax.tree.map(lambda shape: (shape.shape, str(shape.dtype)), shapes))
-        if key not in self._differs:
+        signature = str(jax.tree.map(lambda shape: (shape.shape, str(shape.dtype)), shapes))
+        if signature not in self._differs:
+
+            def forward(key, *arguments):
+                with env.override_property(prng=key):
+                    return self._forward(*arguments)
+
             programs = []
             for training in (True, False):
                 self.module.train(training)
                 try:
-                    programs.append(str(jax.make_jaxpr(self._forward)(*shapes)))
+                    programs.append(str(jax.make_jaxpr(forward)(jax.random.key(0), *shapes)))
+                except jax.errors.ConcretizationTypeError:
+                    programs.append(None)
                 finally:
                     self.module.eval()
-            self._differs[key] = programs[0] != programs[1]
-        return self._differs[key]
+            self._differs[signature] = programs[0] is None or programs[0] != programs[1]
+        return self._differs[signature]
 
     def export(self, model: nn.Module, variables: Mapping[str, object],
                config: Mapping[str, object]) -> dict[str, np.ndarray]:
