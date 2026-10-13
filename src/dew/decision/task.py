@@ -309,6 +309,10 @@ class Decide:
     def _encoded(self, state: JSON, questions: Mapping[str, Question],
                  media: Sequence[int] = ()) -> list[Encoded]:
         rows = self.layout.rows(self.tokenizer, self.specials, state, questions, media=media)
+        for row in rows:
+            if not self.layout.fits(row):
+                raise ValueError(f"the schema needs {len(row.tokens)} tokens besides the state, more than "
+                                 f"the maximum context length, max_len={self.layout.max_len}")
         for laid in (laid for row in rows for laid in row.questions):
             count = len(questions[laid.name].options)
             if len(laid.options) != count:
@@ -401,7 +405,7 @@ class Decide:
         If asked, it also fits a binning map and abstention thresholds that keep the
         error of the accepted answers at `target_error`, as `Calibration`'s parts fit
         them. `held_out` is labelled examples, or a dataset's validation reader
-        (`DecisionObjective.dataset(...).val`), whose rows are already laid out. The
+        (``load(recipe, objective=...).val``), whose rows are already laid out. The
         minimum counts are Laya's: a type's temperature needs `type_minimum` answers
         and a bucket's `bucket_minimum`.
         """
@@ -424,6 +428,8 @@ class Decide:
         and the log loss. The pass agrees its result across a process pool, so
         there every process calls it.
         """
+        from dew.data.compile import validation
+        from dew.decision.data import Decisions as DecisionRecipe
         from dew.decision.metrics import AURC, ECE, Accuracy
         from dew.decision.objective import DecisionObjective
         from dew.decision.scoring import LogLoss
@@ -435,7 +441,9 @@ class Decide:
         # A batch is one pass within the budget, as `batch` packs its rows, on
         # one device, as an answer is: a short last batch need not divide.
         rows = max(1, min(self.budget.rows, self.budget.tokens // self.layout.max_len))
-        evaluation = Evaluation.run(objective, self.variables, objective.held_out(examples, batch=rows),
+        held, _, _ = DecisionRecipe(source=tuple(examples)).pipelines()
+        reader = validation(held, batch=rows, objective=objective.data(), read="memory")
+        evaluation = Evaluation.run(objective, self.variables, reader,
                                     key=0, metrics=chosen, mesh=MeshSpec().build(jax.local_devices()[:1]))
         return {metric.name: evaluation.scores[f"val/{metric.name}"] for metric in chosen}
 

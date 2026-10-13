@@ -1,0 +1,50 @@
+{
+  "source": "r2://dew-data/decision/gold-v3",
+  "manifest_sha256": "4e9da7aacf6ac3bc05228e0535042fc39567fd8ba551ac6f467f2e55f72bfb52",
+  "train_rows": 2057992,
+  "nonempty_corpora": 35,
+  "environment": "Armada remote CPU, cloudflare/debian-trixie, Python 3.12; CPU model not captured",
+  "index_open": {
+    "command": "PYTHONPATH=src .venv-3.12/bin/python tools/benchmark_index_open.py --source r2://dew-data/decision/gold-v3 --cache <fresh-directory>",
+    "copy": {
+      "commit": "f95990a18",
+      "job": "20261011022117-f86e139b",
+      "seconds": 11.599302490998525,
+      "rss_delta_bytes": 71954432
+    },
+    "mmap": {
+      "commit": "ea7d50a6f",
+      "job": "20261011024008-abb64d62",
+      "seconds": 11.845814186999974,
+      "rss_delta_bytes": 901120
+    }
+  },
+  "pooled_http": {
+    "job": "20261011032115-29033888",
+    "container": "one container; alternating before/after three times, fresh local cache each run",
+    "before_adapter_commit": "921bd8b76",
+    "after_commit": "968cd0218",
+    "index_seconds_before": [12.150715114999969, 12.262110038999936, 11.868499622000058],
+    "index_seconds_after": [11.767897807999987, 11.256133779000038, 10.986215764999997],
+    "range_command": "PYTHONPATH=src .venv-3.12/bin/python tools/benchmark_range_reads.py --source r2://dew-data/decision/gold-v3 --reads 1000",
+    "range_reads": 1000,
+    "distinct_objects": 163,
+    "range_bytes": 64000,
+    "range_sha256": "80c5de10b1ae449a0d1803ca765642a3aae911177c2f313a6dbc4d2f33d37691",
+    "range_seconds_before": [156.00195605099998, 151.88854910700002, 152.02374131800002],
+    "range_seconds_after": [143.909003752, 148.46507713099993, 135.9523451969999]
+  },
+  "manifest_declared_index_open": {
+    "commit": "f1f0b8e0e",
+    "job": "20261011043831-a1777804",
+    "descriptor_sha256": "aa0e68216c5f003699efe87081edb525cb095b4ddaef64c9748ea579ee055627",
+    "seconds": 7.775772549997782,
+    "rss_delta_bytes": 516096,
+    "metadata_head_requests": 0
+  },
+  "limitations": [
+    "These measurements cover index opening and transport, not a full training pipeline.",
+    "All six range-read runs returned the same byte digest.",
+    "The source table's labels are not tokenized in the index-open measurement."
+  ]
+}

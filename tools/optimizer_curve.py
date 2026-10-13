@@ -31,7 +31,9 @@ import tyro
 
 import dew.nn.backbones  # noqa: F401  (registers the kind)
 from dew.config import OptimConfig
-from dew.data import DataPartition, Loading, TokenWindows
+from dew.config.data import TextData, loader
+from dew.data import Loading
+from dew.data.dataset import DataPartition
 from dew.objectives.lm import LMObjective
 from dew.registry import models
 from dew.training import MeshSpec, Trainer
@@ -98,11 +100,11 @@ def run(config: Comparison) -> Curve:
     vocab_size = int(meta["vocab_size"])
     # One worker and one read thread: the arms must see identical batches, and
     # a curve is not a throughput measurement.
-    data = TokenWindows(path=config.dataset, seq_len=config.sequence_length, seed=config.seed,
-                        loading=Loading(workers=0, threads=1, read_buffer=1,
-                                        worker_buffer=1)).load(batch=config.batch_size)
-    fields = dict(vocab_size=vocab_size, emb_features=config.emb_features, num_layers=config.num_layers,
-                  num_heads=config.num_heads, max_seq_len=config.sequence_length, dtype="bfloat16")
+    data = loader(TextData(source=config.dataset, seq_len=config.sequence_length), batch=config.batch_size,
+        read="memory", seed=config.seed, loading=Loading(workers=0, threads=1, read_buffer=1,
+                                        worker_buffer=1), validation_records=4 * (config.batch_size))
+    fields = {"vocab_size": vocab_size, "emb_features": config.emb_features, "num_layers": config.num_layers,
+              "num_heads": config.num_heads, "max_seq_len": config.sequence_length, "dtype": "bfloat16"}
     model = models.build("causal_transformer", **fields)
     objective = LMObjective(model, config.sequence_length, ema_decay=1.0)
 
@@ -116,7 +118,7 @@ def run(config: Comparison) -> Curve:
     with DevicePrefetchIterator(data.train(DataPartition.of(trainer.device_mesh)),
                                 trainer.device_mesh) as source:
         train_step = trainer.compile(state, next(source))
-        
+
         losses: list[float] = []
         start = time.perf_counter()
         for step in range(config.steps):
