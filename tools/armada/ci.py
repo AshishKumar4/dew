@@ -141,10 +141,10 @@ def cache_key(common: str, name: str, depends: list[str]) -> str:
 
 
 def cache_url(python: str, row_name: str) -> str:
-    """Where the record of `row_name` lives: the Worker's key alphabet has no colon."""
-    _, name, *group = row_name.split(":")
-    return f"{os.environ['DEW_XLA_CACHE_URL'].rstrip('/')}/{CACHE_PREFIX}/{python}/{name}/" + \
-        ("-of-".join(group[0].split("/")) if group and group[0] else "whole")
+    """Where the record of `row_name` lives: the Worker's key alphabet has no colon or hash."""
+    _, name, split = parsed_row(row_name)
+    return (f"{os.environ['DEW_XLA_CACHE_URL'].rstrip('/')}/{CACHE_PREFIX}/{python}/{name}/"
+            + ("-of-".join(split.split("/")) if split else "whole"))
 
 
 def cache_request(url: str, token: str, data: bytes | None = None) -> bytes | None:
@@ -192,7 +192,7 @@ def cached(python: str, rows: list[str], common: str) -> bool:
         if record is None:
             return False
         recorded = json.loads(record)
-        if recorded["key"] != cache_key(common, row_name.split(":")[1], recorded["depends"]):
+        if recorded["key"] != cache_key(common, parsed_row(row_name)[1], recorded["depends"]):
             return False
     return True
 
@@ -222,6 +222,13 @@ def weights(files: list[str], timings: dict, python: str = PYTHONS[0]) -> dict[s
 
 def row(python: str, name: str, split: str) -> str:
     return f"{python}:{name}" + (f"#{split}" if split else "")
+
+
+def parsed_row(row_name: str) -> tuple[str, str, str]:
+    """`row`'s (python, name, split) back from its name."""
+    python, rest = row_name.split(":", 1)
+    name, _, split = rest.partition("#")
+    return python, name, split
 
 
 def starts(weights: list[int], capacity: int) -> list[int]:
@@ -456,7 +463,7 @@ def record(python: str, rows: list[dict], executed_report: Path, common: str) ->
         return
     executed = json.loads(executed_report.read_text())
     for row_ in rows:
-        name = row_["name"].split(":")[1]
+        name = parsed_row(row_["name"])[1]
         depends = executed.get(name)
         if row_["exitCode"] == 0 and depends is not None:
             body = json.dumps({"key": cache_key(common, name, depends), "depends": depends}).encode()
