@@ -27,7 +27,7 @@ from dew.inputs import Field, InputSpec
 from dew.interop.hf_decoders import translate_config
 from dew.lora import LoRA
 from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.nn.backbones.decoder_block import GatedMLP, RematPolicy
+from dew.nn.backbones.decoder_block import RematPolicy
 from dew.nn.backbones.decoder_stack import Loop
 from dew.nn.backbones.dit import SimpleDiT
 from dew.nn.backbones.jepa import FactorizedTokenStack, JepaEncoder, JepaPredictor, TokenStack
@@ -50,6 +50,7 @@ from dew.nn.mixers.gated_delta_net import GatedDeltaNetMixer
 from dew.nn.mixers.mamba import Mamba, selective_scan
 from dew.nn.mixers.mamba2 import Mamba2, recurrent_ssd
 from dew.nn.mla import MultiHeadLatentAttention
+from dew.nn.mlp import GatedMLP
 from dew.nn.moe import SparseMLP
 from dew.nn.protocols import Counted, CountedDecisions, CountedLogits, CountedTraining
 from dew.nn.ssm import BidirectionalS5Layer, S5Layer, _scanned_directions

@@ -16,13 +16,14 @@ from test_architectures import CASES as ARCHITECTURE_CASES
 
 from dew.diffusion.process import DenoisingCondition
 from dew.interop.hf_decoders import translate_config
-from dew.nn.attention import local_attention, scaled_dot_product_attention
+from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.nn.dit import TextContext
 from dew.nn.dsa_kpool import KPoolSparseAttention
 from dew.nn.inputs import AttentionMetadata, coordinates
 from dew.nn.llama4 import Llama4Mixer
+from dew.nn.local_attention import local_attention
 from dew.nn.mixer_base import MixerContext
 from dew.nn.mla import MultiHeadLatentAttention
 from dew.nn.multimodal import MultimodalTransformer
