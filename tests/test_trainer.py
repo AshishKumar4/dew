@@ -1107,6 +1107,23 @@ def test_a_step_compiles_from_its_arrays_shapes_before_they_are_placed():
     assert int(advanced.step) == 1 and bool(finite)
 
 
+def test_a_batch_of_other_dtypes_at_the_same_shapes_runs_a_step_compiled_for_them():
+    """The compiled step is held under the batch's whole abstract signature, its fields and
+    each leaf's dtype as well as its shape: a stream whose inputs turn half precision at the
+    same shapes runs a step compiled for them, which an executable for float32 refuses."""
+
+    class Narrowing(Counting):
+        def __next__(self):
+            batch = super().__next__()
+            return batch if self.index % 2 else {**batch, "x": batch["x"].astype(np.float16)}
+
+    tracker = RecordingTracker()
+    Trainer(Regression(), optax.sgd(.1), key=jax.random.key(0), tracker=tracker).fit(
+        Data(Narrowing), steps=4, log_every=1, checkpoint_final=False)
+    compiles = [scalars["train/compiles"] for _, scalars in tracker.scalars if "train/compiles" in scalars]
+    assert compiles[-1] == 2
+
+
 def test_a_failing_metric_fails_the_validation_pass():
     class Broken:
         name = "broken"
