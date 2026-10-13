@@ -7,23 +7,25 @@
 """mamba_ssm's chunked SSD scan, ported kernel for kernel to Pallas reading Dew's [B, T, H, P].
 
 The port follows state-spaces/mamba's Triton SSD (`mamba_chunk_scan_combined`) without redesign: the same
-four forward kernels (each chunk's own state, the states passed across chunks, each chunk's `C B^T`,
-then the output), the same eight backward ones, the same blocks over each kernel's grid, and the numerics
-mamba_ssm runs: operands in their own dtype into fp32 accumulation, the states the chunks enter stored in
-the operands' dtype, the decay between two steps of a chunk `exp(min(acs_i - acs_j, 0))` of the log decay
-`acs` cumulated within the chunk, and each gradient of the decay summed from its products as mamba_ssm's
-stable kernels sum it. mamba_ssm's deterministic mode is the only one: a sum over a kernel's blocks lands
-in a workspace that XLA sums, where mamba_ssm's default adds atomically. Each kernel names its origin.
+five forward kernels (the decay cumulated within each chunk, each chunk's own state, the states passed
+across chunks, each chunk's `C B^T`, then the output), the same nine backward ones, the same blocks over
+each kernel's grid, and the numerics mamba_ssm runs: operands in their own dtype into fp32 accumulation,
+the states the chunks enter stored in the operands' dtype, the decay between two steps of a chunk
+`exp(min(acs_i - acs_j, 0))` of the log decay `acs` cumulated within the chunk, and each gradient of the
+decay summed from its products as mamba_ssm's stable kernels sum it. Products of fp32 operands take
+TF32x3 (`fla_gdn._dot`) where mamba_ssm's take one TF32. mamba_ssm's deterministic mode is the only one:
+a sum over a kernel's blocks lands in a workspace that XLA sums, where mamba_ssm's default adds
+atomically. Each kernel names its origin.
 
 What mamba_ssm folds in and Dew computes outside stays outside: the step's bias, softplus and limit
-(`dew.nn.mixers.mamba2._ssd`), the output gate `z` (Dew's gated norm), and the cumulative sum of `A dt`
-within each chunk, an XLA cumsum (`_per_chunk`). Packed documents are mamba_ssm's `seq_idx`, each token's
-document counted from its row's `starts`. Products of fp32 operands take TF32x3 (`fla_gdn._dot`), where
-mamba_ssm's take one TF32.
+(`dew.nn.mixers.mamba2._ssd`) and the output gate `z` (Dew's gated norm). Packed documents are
+mamba_ssm's `seq_idx`, each token's document counted from its row's `starts`.
 
-Operands stay in Dew's layout: `x` `[B, T, H, P]`, `B` and `C` `[B, T, G, N]`, the step and its
-cumulated decay `[B, T, H]` padded to whole chunks, the states the chunks enter `[B, T // chunk, H, P,
-N]`. A program reads its rows of its head where they sit, as mamba_ssm's pointer arithmetic does.
+Operands stay in Dew's layout, `x` `[B, T, H, P]`, `B` and `C` `[B, T, G, N]`, the step `[B, T, H]`, and
+a program reads its rows of its head where they sit, as mamba_ssm's pointer arithmetic does; the
+step and its decay cumulated within each chunk go heads-first `[B, H, Tp]` (padded to whole chunks)
+out of the cumsum kernel, as mamba_ssm lays them out, so that a program reads its head's steps whole,
+and the states the chunks enter are `[B, T // chunk, H, P, N]`.
 
 Each kernel is a launch the tuner times (`dew.nn.kernels.tuning.KernelOp`) over the configs mamba_ssm's
 own autotuner lists for it (`_space`), mamba_ssm's pick at Nemotron 3's shapes on an H100 its heuristic
@@ -60,7 +62,7 @@ class Tiles:
 
 @dataclasses.dataclass(frozen=True)
 class _Launch(tuning.KernelOp):
-    """One of the port's twelve launches, its `Tiles` measured per GPU model and shape over its
+    """One of the port's fourteen launches, its `Tiles` measured per GPU model and shape over its
     kernel's space (`_space`) by the tuner, mamba_ssm's own pick its heuristic (`HEURISTICS`). A
     subclass names its kernel and what each block spans (`SPANS`)."""
 
@@ -86,7 +88,8 @@ class _Launch(tuning.KernelOp):
         return dataclasses.replace(tiles, bm=blocks[0], bn=blocks[1], bk=blocks[2], heads=heads)
 
     def _get_heuristics_config(self, ba) -> Tiles:
-        dtype = "float32" if jnp.dtype(_operand(ba).dtype).itemsize == 4 else "bfloat16"
+        operand = _operand(ba)
+        dtype = "float32" if operand is None or jnp.dtype(operand.dtype).itemsize == 4 else "bfloat16"
         return self._fitted(ba, HEURISTICS[dtype][self.NAME])
 
     def _get_autotuning_configs(self, ba) -> set[Tiles]:
@@ -94,11 +97,11 @@ class _Launch(tuning.KernelOp):
 
 
 def _operand(ba):
-    """A call's first `[B, T, H, P]`-like operand: its dtype picks the heuristic (fp16 taking bf16's),
-    its third axis counts the heads."""
-    return next(value for value in ba.arguments.values()
-                if isinstance(value, jax.Array | jax.ShapeDtypeStruct)
-                and jnp.issubdtype(value.dtype, jnp.floating) and value.ndim == 4)
+    """A call's first `[B, T, H, P]`-like operand, None for the step's own kernels: its dtype picks the
+    heuristic (fp16 taking bf16's, the step's kernels fp32's), its third axis counts the heads."""
+    return next((value for value in ba.arguments.values()
+                 if isinstance(value, jax.Array | jax.ShapeDtypeStruct)
+                 and jnp.issubdtype(value.dtype, jnp.floating) and value.ndim == 4), None)
 
 
 def _tiles(blocks, warps: int, stages: int, heads=(0,)) -> frozenset[Tiles]:
@@ -124,6 +127,8 @@ def _space(kernel: str) -> frozenset[Tiles]:
     the kernels that sum a group's heads, every config Triton's default four warps and three stages
     where mamba_ssm's names none."""
     return {
+        "chunk_cumsum": _tiles([(heads, 0, 0) for heads in (1, 2, 4, 8, 16, 32, 64)], 4, 3),
+        "chunk_cumsum_bwd": _tiles([(heads, 0, 0) for heads in (1, 2, 4, 8, 16, 32, 64)], 4, 3),
         "chunk_state": _MATMUL,
         "state_passing": _tiles([(size, 0, 0) for size in (64, 128, 256, 512, 1024, 2048)], 4, 3),
         "bmm_chunk": _MATMUL,
@@ -144,6 +149,8 @@ def _space(kernel: str) -> frozenset[Tiles]:
 
 HEURISTICS = {
     "bfloat16": {
+        "chunk_cumsum": Tiles(16, 0, 0, 4, 3),
+        "chunk_cumsum_bwd": Tiles(16, 0, 0, 4, 3),
         "chunk_state": Tiles(64, 64, 32, 2, 4),
         "state_passing": Tiles(256, 0, 0, 4, 3),
         "bmm_chunk": Tiles(128, 64, 32, 4, 4),
@@ -198,15 +205,96 @@ def _compiled(warps: int, stages: int):
 
 
 def _token(batch: int, padded: int, *, heads: int | None = None):
-    """A per-token `[B, Tp, H]` array's block for a grid whose second axis counts `(chunk, row)`: its
-    row's `[Tp]` of the grid's head (third axis), or all `heads` `[Tp, H]`."""
+    """A heads-first per-step `[B, H, Tp]` array's block (the step and its cumulated decay, as
+    `_chunk_cumsum_kernel` lays them out) for a grid whose second axis counts `(chunk, row)`: its row's
+    `[Tp]` of the grid's head (third axis), or all `heads` `[H, Tp]`."""
     if heads is None:
-        return pl.BlockSpec((None, padded, None), lambda i, bc, h: (bc % batch, 0, h))
-    return pl.BlockSpec((None, padded, heads), lambda i, bc, s: (bc % batch, 0, 0))
+        return pl.BlockSpec((None, None, padded), lambda i, bc, h: (bc % batch, h, 0))
+    return pl.BlockSpec((None, heads, padded), lambda i, bc, s: (bc % batch, 0, 0))
 
 
 def _documents(batch: int, padded: int):
     return pl.BlockSpec((None, padded), lambda i, bc, h: (bc % batch, 0))
+
+
+def _chunk_cumsum_kernel(dt_ref, a_ref, step_ref, da_ref, *, length: int, chunk: int, bh: int):
+    """mamba_ssm's `_chunk_cumsum_fwd_kernel` (ssd_chunk_state.py:39-86) without the step's bias,
+    softplus and limit, for one chunk of `BH` heads: the step, zero past the row's end, and `A dt`
+    cumulated over the chunk, both fp32 in mamba_ssm's heads-first layout."""
+    c, h = pl.program_id(1), pl.program_id(2)
+    heads = pl.ds(h * bh, bh)
+    steps = pl.ds(c * chunk, chunk)
+    dt = _read(dt_ref.at[steps, heads], _limit(c, length, chunk)).astype(jnp.float32).T
+    step_ref[:, steps] = dt
+    da_ref[:, steps] = jnp.cumsum(dt * a_ref[heads].astype(jnp.float32)[:, None], axis=1)
+
+
+@dataclasses.dataclass(frozen=True)
+class ChunkCumsum(_Launch):
+    """`chunk_cumsum`'s launch (tuning.KernelOp)."""
+
+    NAME = "chunk_cumsum"
+    SPANS = (("dt", 2), None, None)
+
+    def _fwd(self, dt, A, *, chunk: int, interpret: bool, config: Tiles, return_residuals: bool = False):
+        batch, length, heads = dt.shape
+        padded = -(-length // chunk) * chunk
+        bh = config.bm
+        out = pl.BlockSpec((None, bh, padded), lambda b, c, h: (b, h, 0))
+        step, da = pl.pallas_call(
+            functools.partial(_chunk_cumsum_kernel, length=length, chunk=chunk, bh=bh),
+            grid=(batch, padded // chunk, heads // bh),
+            in_specs=[pl.BlockSpec((None, length, heads), lambda b, c, h: (b, 0, 0)),
+                      pl.BlockSpec((heads,), lambda b, c, h: (0,))],
+            out_specs=[out, out],
+            out_shape=[jax.ShapeDtypeStruct((batch, heads, padded), jnp.float32)] * 2,
+            compiler_params=_compiled(config.warps, config.stages), interpret=interpret,
+            name="mamba_chunk_cumsum_fwd",
+        )(dt, A)
+        return (step, da), None
+
+
+def _chunk_cumsum_bwd_kernel(dacs_ref, ddt_ref, dt_ref, a_ref, out_ref, da_ref, *, length: int,
+                             chunk: int, bh: int):
+    """mamba_ssm's `_chunk_cumsum_bwd_kernel` (ssd_chunk_state.py:101-174) without the step's bias,
+    softplus and limit, for one chunk of `BH` heads: the step's gradient `ddA A + ddt` back in Dew's
+    `[T, H]`, and `A`'s `sum ddA dt` over the chunk for XLA to sum."""
+    c, h = pl.program_id(1), pl.program_id(2)
+    heads = pl.ds(h * bh, bh)
+    steps = pl.ds(c * chunk, chunk)
+    limit = _limit(c, length, chunk)
+    dacs = dacs_ref[:, steps]
+    ddt = dacs * a_ref[heads].astype(jnp.float32)[:, None] + ddt_ref[:, steps]
+    _write(out_ref.at[steps, heads], limit, ddt.T)
+    dt = _read(dt_ref.at[steps, heads], limit).astype(jnp.float32).T
+    da_ref[...] = jnp.sum(dacs * dt, axis=1)
+
+
+@dataclasses.dataclass(frozen=True)
+class ChunkCumsumBwd(_Launch):
+    """`chunk_cumsum_bwd`'s launch (tuning.KernelOp)."""
+
+    NAME = "chunk_cumsum_bwd"
+    SPANS = (("dt", 2), None, None)
+
+    def _fwd(self, dacs, ddt, dt, A, *, chunk: int, interpret: bool, config: Tiles,
+             return_residuals: bool = False):
+        batch, length, heads = dt.shape
+        padded = dacs.shape[-1]
+        bh = config.bm
+        first = pl.BlockSpec((None, bh, padded), lambda b, c, h: (b, h, 0))
+        rows = pl.BlockSpec((None, length, heads), lambda b, c, h: (b, 0, 0))
+        out, da = pl.pallas_call(
+            functools.partial(_chunk_cumsum_bwd_kernel, length=length, chunk=chunk, bh=bh),
+            grid=(batch, padded // chunk, heads // bh),
+            in_specs=[first, first, rows, pl.BlockSpec((heads,), lambda b, c, h: (0,))],
+            out_specs=[rows, pl.BlockSpec((None, None, bh), lambda b, c, h: (b, c, h))],
+            out_shape=[jax.ShapeDtypeStruct(dt.shape, jnp.float32),
+                       jax.ShapeDtypeStruct((batch, padded // chunk, heads), jnp.float32)],
+            compiler_params=_compiled(config.warps, config.stages), interpret=interpret,
+            name="mamba_chunk_cumsum_bwd",
+        )(dacs, ddt, dt, A)
+        return (out, jnp.sum(da, axis=(0, 1))), None
 
 
 def _chunk_state_kernel(x_ref, b_ref, dt_ref, da_ref, *refs, batch: int, length: int, chunk: int,
@@ -245,7 +333,7 @@ class ChunkState(_Launch):
              return_residuals: bool = False):
         batch, length, heads, width = x.shape
         state = b.shape[-1]
-        padded = dt.shape[1]
+        padded = dt.shape[-1]
         ratio = heads // groups
         bm, bn = config.bm, config.bn
         columns = state // bn
@@ -302,14 +390,14 @@ class StatePassing(_Launch):
     def _fwd(self, states, da, h0, seq, *, chunk: int, dtype: str, interpret: bool, config: Tiles,
              return_residuals: bool = False):
         batch, chunks, heads, flat = states.shape
-        padded = da.shape[1]
+        padded = da.shape[-1]
         size = config.bm
         rows = pl.BlockSpec((None, chunks, None, size), lambda i, b, h: (b, 0, h, i))
         final = pl.BlockSpec((None, None, size), lambda i, b, h: (b, h, i))
         out, last = pl.pallas_call(
             functools.partial(_state_passing_kernel, chunk=chunk),
             grid=(flat // size, batch, heads),
-            in_specs=[rows, pl.BlockSpec((None, padded, None), lambda i, b, h: (b, 0, h)), final,
+            in_specs=[rows, pl.BlockSpec((None, None, padded), lambda i, b, h: (b, h, 0)), final,
                       *([] if seq is None else [pl.BlockSpec((None, padded), lambda i, b, h: (b, 0))])],
             out_specs=[rows, final],
             out_shape=[jax.ShapeDtypeStruct(states.shape, jnp.dtype(dtype)),
@@ -428,7 +516,7 @@ class ChunkScan(_Launch):
              return_residuals: bool = False):
         batch, length, heads, width = x.shape
         groups, state = c.shape[2:]
-        padded = dt.shape[1]
+        padded = dt.shape[-1]
         ratio = heads // groups
         bm, bn = config.bm, config.bn
         columns = width // bn
@@ -491,7 +579,7 @@ class ChunkScanBwdDstates(_Launch):
              return_residuals: bool = False):
         batch, length, heads, width = dout.shape
         groups, state = c.shape[2:]
-        padded = da.shape[1]
+        padded = da.shape[-1]
         ratio = heads // groups
         bm, bn = config.bm, config.bn
         columns = state // bn
@@ -553,14 +641,14 @@ class StatePassingBwd(_Launch):
     def _fwd(self, dout, states, da, dfinal, seq, *, chunk: int, dtype: str, interpret: bool, config: Tiles,
              return_residuals: bool = False):
         batch, chunks, heads, flat = states.shape
-        padded = da.shape[1]
+        padded = da.shape[-1]
         size = config.bm
         rows = pl.BlockSpec((None, chunks, None, size), lambda i, b, h: (b, 0, h, i))
         whole = pl.BlockSpec((None, None, size), lambda i, b, h: (b, h, i))
         dstates, dtotal, dinit, converted = pl.pallas_call(
             functools.partial(_state_passing_bwd_kernel, chunk=chunk),
             grid=(flat // size, batch, heads),
-            in_specs=[rows, rows, pl.BlockSpec((None, padded, None), lambda i, b, h: (b, 0, h)), whole,
+            in_specs=[rows, rows, pl.BlockSpec((None, None, padded), lambda i, b, h: (b, h, 0)), whole,
                       *([] if seq is None else [pl.BlockSpec((None, padded), lambda i, b, h: (b, 0))])],
             out_specs=[rows, pl.BlockSpec((None, None, chunks, None), lambda i, b, h: (b, h, 0, i)), whole,
                        rows],
@@ -631,7 +719,7 @@ class ChunkScanChunkStateBwdDx(_Launch):
              return_residuals: bool = False):
         batch, length, heads, width = x.shape
         groups, state = b.shape[2:]
-        padded = dt.shape[1]
+        padded = dt.shape[-1]
         chunks = padded // chunk
         ratio = heads // groups
         bm, bn = config.bm, config.bn
@@ -652,17 +740,17 @@ class ChunkScanChunkStateBwdDx(_Launch):
                                    lambda mn, bc, h: (bc % batch, bc // batch, h, mn % columns, 0)),
                       *([] if seq is None else [_documents(batch, padded)])],
             out_specs=[headed,
-                       pl.BlockSpec((None, padded, None, None),
-                                    lambda mn, bc, h: (bc % batch, 0, h, mn % columns)),
+                       pl.BlockSpec((None, None, None, padded),
+                                    lambda mn, bc, h: (mn % columns, bc % batch, h, 0)),
                        pl.BlockSpec((None, None, None, chunk // bm, columns),
                                     lambda mn, bc, h: (bc % batch, bc // batch, h, 0, 0))],
             out_shape=[jax.ShapeDtypeStruct(x.shape, x.dtype),
-                       jax.ShapeDtypeStruct((batch, padded, heads, columns), jnp.float32),
+                       jax.ShapeDtypeStruct((columns, batch, heads, padded), jnp.float32),
                        jax.ShapeDtypeStruct((batch, chunks, heads, chunk // bm, columns), jnp.float32)],
             compiler_params=_compiled(config.warps, config.stages), interpret=interpret,
             name="mamba_chunk_scan_chunk_state_bwd_dx",
         )(x, cb, dout, dt, da, d, b, dstates, *([] if seq is None else [seq]))
-        return (dx, jnp.sum(ddt, axis=-1), jnp.sum(dd, axis=(0, 1, 3, 4))), None
+        return (dx, jnp.sum(ddt, axis=0), jnp.sum(dd, axis=(0, 1, 3, 4))), None
 
 
 def _heads_of(s, g, *, ratio: int, heads: int):
@@ -696,11 +784,11 @@ def _db_kernel(x_ref, dstates_ref, b_ref, dt_ref, da_ref, *refs, batch: int, len
         h = first + i
         x = _read(x_ref.at[rows, h], taken)
         db = _dot(x, dstates_ref[h].astype(x.dtype), exact=exact)
-        scale = jnp.exp(jnp.minimum(da_ref[start + chunk - 1, h] - da_ref[rows, h], 0.0))
+        scale = jnp.exp(jnp.minimum(da_ref[h, start + chunk - 1] - da_ref[h, rows], 0.0))
         if seq:
             scale = jnp.where(same, scale, 0.0)
-        db = db * (scale * dt_ref[rows, h])[:, None]
-        dacs_ref[rows, h] = jnp.sum(db * bmat, axis=1)
+        db = db * (scale * dt_ref[h, rows])[:, None]
+        dacs_ref[h, rows] = jnp.sum(db * bmat, axis=1)
         return acc + db
 
     _write(db_ref.at[rows], taken, jax.lax.fori_loop(0, count, head, jnp.zeros((bm, bn), jnp.float32)))
@@ -717,7 +805,7 @@ class ChunkStateBwdDb(_Launch):
              return_residuals: bool = False):
         batch, length, heads, width = x.shape
         state = b.shape[-1]
-        padded = dt.shape[1]
+        padded = dt.shape[-1]
         ratio = heads // groups
         bm, bn = config.bm, config.bn
         columns = state // bn
@@ -736,14 +824,14 @@ class ChunkStateBwdDb(_Launch):
             out_specs=[pl.BlockSpec((None, length, None, None, bn),
                                     lambda mn, bc, sg: (bc % batch, 0, sg // groups, sg % groups,
                                                         mn % columns)),
-                       pl.BlockSpec((None, padded, heads, None),
-                                    lambda mn, bc, sg: (bc % batch, 0, 0, mn % columns))],
+                       pl.BlockSpec((None, None, heads, padded),
+                                    lambda mn, bc, sg: (mn % columns, bc % batch, 0, 0))],
             out_shape=[jax.ShapeDtypeStruct((batch, length, splits, groups, state), jnp.float32),
-                       jax.ShapeDtypeStruct((batch, padded, heads, columns), jnp.float32)],
+                       jax.ShapeDtypeStruct((columns, batch, heads, padded), jnp.float32)],
             compiler_params=_compiled(config.warps, config.stages), interpret=interpret,
             name="mamba_chunk_state_bwd_db",
         )(x, dstates, b, dt, da, *([] if seq is None else [seq]))
-        return (jnp.sum(db, axis=2), jnp.sum(dacs, axis=-1)), None
+        return (jnp.sum(db, axis=2), jnp.sum(dacs, axis=0)), None
 
 
 def _dc_kernel(dout_ref, states_ref, c_ref, da_ref, *refs, batch: int, length: int, chunk: int,
@@ -770,11 +858,11 @@ def _dc_kernel(dout_ref, states_ref, c_ref, da_ref, *refs, batch: int, length: i
         h = first + i
         dout = _read(dout_ref.at[rows, h], taken)
         dc = _dot(dout, states_ref[h].astype(dout.dtype), exact=exact)
-        scale = jnp.exp(da_ref[rows, h])
+        scale = jnp.exp(da_ref[h, rows])
         if seq:
             scale = jnp.where(same, scale, 0.0)
         dc = dc * scale[:, None]
-        dacs_ref[rows, h] = jnp.sum(dc * cmat, axis=1)
+        dacs_ref[h, rows] = jnp.sum(dc * cmat, axis=1)
         return acc + dc
 
     _write(dc_ref.at[rows], taken, jax.lax.fori_loop(0, count, head, jnp.zeros((bm, bn), jnp.float32)))
@@ -791,7 +879,7 @@ class ChunkScanBwdDc(_Launch):
              return_residuals: bool = False):
         batch, length, heads, width = dout.shape
         state = c.shape[-1]
-        padded = da.shape[1]
+        padded = da.shape[-1]
         ratio = heads // groups
         bm, bn = config.bm, config.bn
         columns = state // bn
@@ -810,14 +898,14 @@ class ChunkScanBwdDc(_Launch):
             out_specs=[pl.BlockSpec((None, length, None, None, bn),
                                     lambda mn, bc, sg: (bc % batch, 0, sg // groups, sg % groups,
                                                         mn % columns)),
-                       pl.BlockSpec((None, padded, heads, None),
-                                    lambda mn, bc, sg: (bc % batch, 0, 0, mn % columns))],
+                       pl.BlockSpec((None, None, heads, padded),
+                                    lambda mn, bc, sg: (mn % columns, bc % batch, 0, 0))],
             out_shape=[jax.ShapeDtypeStruct((batch, length, splits, groups, state), jnp.float32),
-                       jax.ShapeDtypeStruct((batch, padded, heads, columns), jnp.float32)],
+                       jax.ShapeDtypeStruct((columns, batch, heads, padded), jnp.float32)],
             compiler_params=_compiled(config.warps, config.stages), interpret=interpret,
             name="mamba_chunk_scan_bwd_dc",
         )(dout, states, c, da, *([] if seq is None else [seq]))
-        return (jnp.sum(dc, axis=2), jnp.sum(dacs, axis=-1)), None
+        return (jnp.sum(dc, axis=2), jnp.sum(dacs, axis=0)), None
 
 
 def _dcb_kernel(x_ref, dout_ref, dt_ref, da_ref, *refs, batch: int, length: int, chunk: int, groups: int,
@@ -847,8 +935,8 @@ def _dcb_kernel(x_ref, dout_ref, dt_ref, da_ref, *refs, batch: int, length: int,
             h = first + i
             dout = _read(dout_ref.at[rows_m, h], _from(limit, m * bm))
             x = _read(x_ref.at[rows_n, h], _from(limit, n * bn))
-            dcb = _dot(dout, x.T, exact=exact) * dt_ref[rows_n, h][None, :]
-            decay = jnp.exp(jnp.minimum(da_ref[rows_m, h][:, None] - da_ref[rows_n, h][None, :], 0.0))
+            dcb = _dot(dout, x.T, exact=exact) * dt_ref[h, rows_n][None, :]
+            decay = jnp.exp(jnp.minimum(da_ref[h, rows_m][:, None] - da_ref[h, rows_n][None, :], 0.0))
             return acc + dcb * decay
 
         acc = jax.lax.fori_loop(0, count, head, jnp.zeros((bm, bn), jnp.float32))
@@ -867,7 +955,7 @@ class ChunkScanBwdDcb(_Launch):
     def _fwd(self, x, dout, dt, da, seq, *, chunk: int, groups: int, interpret: bool, config: Tiles,
              return_residuals: bool = False):
         batch, length, heads, width = x.shape
-        padded = dt.shape[1]
+        padded = dt.shape[-1]
         chunks = padded // chunk
         ratio = heads // groups
         bm, bn = config.bm, config.bn
@@ -996,7 +1084,7 @@ class ChunkScanBwdDdacsStable(_Launch):
              return_residuals: bool = False):
         batch, length, heads, width = x.shape
         groups = cb.shape[2]
-        padded = dt.shape[1]
+        padded = dt.shape[-1]
         chunks = padded // chunk
         ratio = heads // groups
         bm = config.bm
@@ -1009,14 +1097,16 @@ class ChunkScanBwdDdacsStable(_Launch):
                       pl.BlockSpec((None, None, None, chunk, chunk),
                                    lambda m, bc, h: (bc % batch, bc // batch, h // ratio, 0, 0))],
             out_specs=pl.BlockSpec((None, None, None, None, chunk),
-                                   lambda m, bc, h: (bc % batch, bc // batch, h, m, 0)),
-            out_shape=jax.ShapeDtypeStruct((batch, chunks, heads, chunk // bm, chunk), jnp.float32),
+                                   lambda m, bc, h: (bc % batch, h, bc // batch, m, 0)),
+            out_shape=jax.ShapeDtypeStruct((batch, heads, chunks, chunk // bm, chunk), jnp.float32),
             compiler_params=_compiled(config.warps, config.stages), interpret=interpret,
             name="mamba_chunk_scan_bwd_ddacs_stable",
         )(x, dout, dt, da, cb)
-        return jnp.sum(dacs, axis=3), None
+        return dacs, None
 
 
+_CHUNK_CUMSUM = ChunkCumsum()
+_CHUNK_CUMSUM_BWD = ChunkCumsumBwd()
 _CHUNK_STATE = ChunkState()
 _STATE_PASSING = StatePassing()
 _BMM_CHUNK = BmmChunk()
@@ -1031,35 +1121,28 @@ _BMM_CHUNK_BWD = BmmChunkBwd()
 _DDACS = ChunkScanBwdDdacsStable()
 
 
-def _per_chunk(dt, A, seq, chunk: int):
-    """The step `[B, T, H]` in fp32 padded with zeros to whole chunks, its log decay `A dt` cumulated
-    within each chunk (mamba_ssm's `_chunk_cumsum_fwd`), and the documents padded with each row's
-    last: a padded token neither decays nor writes, and the chunk it ends reads its last real token's
-    total and document at its own last row."""
-    batch, length, heads = dt.shape
-    pad = -length % chunk
-    dt = dt.astype(jnp.float32)
-    if pad:
-        dt = jnp.pad(dt, ((0, 0), (0, pad), (0, 0)))
-        seq = None if seq is None else jnp.pad(seq, ((0, 0), (0, pad)), mode="edge")
-    da = jnp.cumsum((dt * A.astype(jnp.float32)).reshape(batch, -1, chunk, heads), axis=2).reshape(dt.shape)
-    return dt, da, seq
+def _documents_padded(seq, chunk: int):
+    """Each token's document `[B, T]` padded to whole chunks with its row's last: a chunk a row ends
+    inside reads its last real token's document at its own last row."""
+    if seq is None or not seq.shape[1] % chunk:
+        return seq
+    return jnp.pad(seq, ((0, 0), (0, -seq.shape[1] % chunk)), mode="edge")
 
 
 def _decay_gradient(dnext, dprev, dtotal, dintra, chunk: int):
-    """Each step's log decay gradient `[B, Tp, H]` from the kernels' parts (mamba_ssm's
+    """Each step's log decay gradient `[B, H, Tp]` from the kernels' parts (mamba_ssm's
     `_mamba_chunk_scan_combined_bwd`, ssd_combined.py:494-507): the chunk state's gradient of `acs_last
     - acs_m` cumulated over the steps before (`_chunk_state_bwd_db`'s cumsum of its shifted part); the
-    carried state's gradient of `acs_m`, the chunk total's added at the last step, cumulated from the
-    end; and the intra-chunk gradient, `dintra` `[B, NC, H, C]` shifted one step later."""
-    batch, padded, heads = dnext.shape
-    blocked = (batch, padded // chunk, chunk, heads)
-    shift = ((0, 0), (0, 0), (1, 0), (0, 0))
-    dnext = jnp.pad(jnp.cumsum(dnext.reshape(blocked), axis=2)[:, :, :-1], shift)
-    dprev = dprev.reshape(blocked).at[:, :, -1].add(jnp.swapaxes(dtotal, 1, 2))
-    dprev = jax.lax.cumsum(dprev, axis=2, reverse=True)
-    dintra = jnp.pad(jnp.swapaxes(dintra, 2, 3)[:, :, :-1], shift)
-    return (dintra + (dnext + dprev)).reshape(dnext.shape[0], padded, heads)
+    carried state's gradient of `acs_m`, the chunk total's `dtotal` `[B, H, NC]` added at the last step,
+    cumulated from the end; and the intra-chunk gradient, `dintra` `[B, H, NC, C]` shifted one step
+    later."""
+    batch, heads, padded = dnext.shape
+    blocked = (batch, heads, padded // chunk, chunk)
+    shift = ((0, 0), (0, 0), (0, 0), (1, 0))
+    dnext = jnp.pad(jnp.cumsum(dnext.reshape(blocked), axis=3)[..., :-1], shift)
+    dprev = jax.lax.cumsum(dprev.reshape(blocked).at[..., -1].add(dtotal), axis=3, reverse=True)
+    dintra = jnp.pad(dintra[..., :-1], shift)
+    return (dintra + (dnext + dprev)).reshape(batch, heads, padded)
 
 
 def _flat(states):
@@ -1076,12 +1159,13 @@ def _scan_fwd(x, dt, A, b, c, d, h0, seq, chunk: int, interpret: bool):
     the states across chunks (stored in `C`'s dtype), each chunk's `C B^T`, then the output. Saves the
     inputs alone, as mamba_ssm does."""
     groups = b.shape[2]
-    dtp, da, seqp = _per_chunk(dt, A, seq, chunk)
     launch = {"chunk": chunk, "interpret": interpret}
+    dtp, da = _CHUNK_CUMSUM(dt, A, **launch)
+    seqp = _documents_padded(seq, chunk)
     states = _CHUNK_STATE(x, b, dtp, da, seqp, groups=groups, **launch)
     states, final = _STATE_PASSING(_flat(states), da, _flat(h0).astype(jnp.float32), seqp,
                                    dtype=jnp.dtype(c.dtype).name, **launch)
-    cb = _BMM_CHUNK(c, b, seqp, padded=dtp.shape[1], **launch)
+    cb = _BMM_CHUNK(c, b, seqp, padded=dtp.shape[-1], **launch)
     y = _CHUNK_SCAN(cb, x, dtp, da, c, states.reshape(*states.shape[:3], *h0.shape[2:]),
                     d.astype(jnp.float32), seqp, **launch)
     return (y, final.reshape(h0.shape)), (x, dt, A, b, c, d, h0, seq)
@@ -1096,9 +1180,10 @@ def _scan_bwd(chunk: int, interpret: bool, residual, cotangent):
     dy, dfinal = cotangent
     groups = b.shape[2]
     shape = h0.shape
-    dtp, da, seqp = _per_chunk(dt, A, seq, chunk)
     launch = {"chunk": chunk, "interpret": interpret}
-    cb = _BMM_CHUNK(c, b, seqp, padded=dtp.shape[1], **launch)
+    dtp, da = _CHUNK_CUMSUM(dt, A, **launch)
+    seqp = _documents_padded(seq, chunk)
+    cb = _BMM_CHUNK(c, b, seqp, padded=dtp.shape[-1], **launch)
     states = _CHUNK_STATE(x, b, dtp, da, seqp, groups=groups, **launch)
     states, _ = _STATE_PASSING(_flat(states), da, _flat(h0).astype(jnp.float32), seqp, dtype="float32",
                                **launch)
@@ -1115,10 +1200,9 @@ def _scan_bwd(chunk: int, interpret: bool, residual, cotangent):
     dcb = _DCB(x, dy, dtp, da, seqp, groups=groups, **launch)
     db = _BMM_CHUNK_BWD(c, dcb, db, transposed=False, **launch)
     dc = _BMM_CHUNK_BWD(b, dcb, dc, transposed=True, **launch)
-    dacs = _decay_gradient(dnext, dprev, dtotal, _DDACS(x, dy, dtp, da, cb, **launch), chunk)
-    length = dt.shape[1]
-    ddt = (dacs * A.astype(jnp.float32) + ddt)[:, :length]
-    dA = jnp.sum(dacs * dtp, axis=(0, 1))
+    dintra = jnp.sum(_DDACS(x, dy, dtp, da, cb, **launch), axis=3)
+    dacs = _decay_gradient(dnext, dprev, dtotal, dintra, chunk)
+    ddt, dA = _CHUNK_CUMSUM_BWD(dacs, ddt, dt, A, **launch)
     return (dx, ddt.astype(dt.dtype), dA.astype(A.dtype), db, dc, dd.astype(d.dtype),
             dh0.reshape(shape).astype(h0.dtype), None)
 
