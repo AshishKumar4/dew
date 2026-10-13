@@ -127,7 +127,7 @@ FACTS = ('flops', 'launches')
 microbatch's FLOPs (`plan_flops`) and its kernel launches (`tune`)."""
 
 
-def recorded_fact(recorded: JSON, plan: Mapping[str, JSON], name: str) -> JSON:
+def recorded_fact(recorded: JSON, plan: Mapping[str, JSON], name: str) -> object:
     """The record's `name` (`FACTS`) of the program `plan` compiles, where
     `plan` is the `recorded` one, else None."""
     kept = dict(record(recorded, 'recorded plan')) if recorded is not None else {}
