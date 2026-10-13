@@ -10,10 +10,8 @@ import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
 
-from ..dit import ROPE_THETA, ModulatedBlock, _DiTStackOptions, remat_block, rope_for_scan
+from ..dit import ModulatedBlock, _DiTStackOptions, factorized_walk, remat_block, rope_for_scan
 from ..flops import MissingFlopsCount, matching_lengths, patch_lengths
-from ..precision import at_least_fp32
-from ..rope import rotary_freqs
 
 
 class VideoDiT(_DiTStackOptions):
@@ -77,17 +75,11 @@ class VideoDiT(_DiTStackOptions):
 
         dim_head = self.emb_features // self.num_heads
         freqs_spatial = rope_for_scan(tokens, dim_head, self.scan_order)
-        # Time is a genuine 1D axis, RoPE applies directly
-        freqs_temporal = rotary_freqs(jnp.arange(T), dim_head, ROPE_THETA,
-                                      dtype=at_least_fp32(tokens.dtype))
-
-        for spatial, temporal in zip(self.spatial_blocks, self.temporal_blocks, strict=True):
-            tokens = spatial(tokens, cond_spatial, freqs_spatial, train)
-            # [B*T, S, F] -> [B*S, T, F]
-            tokens = tokens.reshape(B, T, S, -1).transpose(0, 2, 1, 3).reshape(B * S, T, -1)
-            tokens = temporal(tokens, cond_temporal, freqs_temporal, train)
-            # back to [B*T, S, F]
-            tokens = tokens.reshape(B, S, T, -1).transpose(0, 2, 1, 3).reshape(B * T, S, -1)
+        # `train` positionally, which remat keeps static.
+        tokens = factorized_walk(tokens, T, dim_head, [
+            (lambda x, block=spatial: block(x, cond_spatial, freqs_spatial, train),
+             lambda x, rotation, block=temporal: block(x, cond_temporal, rotation, train))
+            for spatial, temporal in zip(self.spatial_blocks, self.temporal_blocks, strict=True)])
 
         out_frames = self.output(tokens, inv_idx, H, W)  # [B*T, H, W, C]
         return out_frames.reshape(B, T, H, W, self.output_channels)

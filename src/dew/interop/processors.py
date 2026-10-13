@@ -85,6 +85,38 @@ def _placeholder_runs(tokens: np.ndarray, image_id: int, video_id: int | None) -
     return runs
 
 
+def _in_text_order[T](streams: Mapping[int, Sequence[T]], tokens: np.ndarray,
+                      runs: list[list[np.ndarray]]) -> list[T]:
+    """Consume token-keyed payloads exactly once, in row and placeholder order."""
+    offsets = dict.fromkeys(streams, 0)
+    ordered = []
+    for row, spans in enumerate(runs):
+        for span in spans:
+            token = int(tokens[row, span[0]])
+            if token not in streams or offsets[token] == len(streams[token]):
+                raise ValueError("media placeholders exceed their payloads")
+            ordered.append(streams[token][offsets[token]])
+            offsets[token] += 1
+    if any(offsets[token] != len(stream) for token, stream in streams.items()):
+        raise ValueError("media payloads and placeholder counts disagree")
+    return ordered
+
+
+def _placed(runs: list[list[np.ndarray]], lengths: Sequence[int] | np.ndarray, capacity: int,
+            shape: tuple[int, ...], what: str) -> tuple[np.ndarray, list[tuple[int, int, np.ndarray]]]:
+    """Check each run's length against its item's and return the slot each
+    placeholder reads with every item's (row, index in its row, slots)."""
+    indices = np.full(shape, -1, np.int32)
+    places = []
+    for row, spans in enumerate(runs):
+        for medium, slots in enumerate(spans):
+            if len(slots) != int(lengths[len(places)]):
+                raise ValueError(f"media placeholder counts do not match the {what}")
+            indices[row, slots] = medium * capacity + np.arange(len(slots))
+            places.append((row, medium, slots))
+    return indices, places
+
+
 def _patch_streams(values: Mapping[str, object], image_id: int, video_id: int | None, *,
                    kernel: int, table_size: int, patch_size: int
                    ) -> dict[int, tuple[np.ndarray, np.ndarray, np.ndarray]]:
@@ -388,27 +420,20 @@ class Processor:
             padded_grid[..., 1:] = merge
         padded_positions = (None if patch_positions is None else np.full(
             (tokens.shape[0], width, shape[0], 2), -1, np.int32))
-        indices = np.full(tokens.shape, -1, np.int32)
+        indices, places = _placed(runs, lengths, capacity, tokens.shape, "projector's feature count")
         groups = None if gemma else np.full(tokens.shape, -1, np.int32)
         token_lengths = np.zeros((tokens.shape[0], width), np.int32)
-        offset = 0
-        for row, blocks in enumerate(runs):
-            for image, slots in enumerate(blocks):
-                length = int(lengths[offset])
-                if len(slots) != length:
-                    raise ValueError("image placeholder counts do not match the projector's feature count")
-                chunk = chunks[offset]
-                padded[row, image, :chunk.shape[0]] = chunk
-                if padded_grid is not None and grid is not None:
-                    padded_grid[row, image] = grid[offset]
-                if padded_positions is not None and patch_positions is not None:
-                    positions = patch_positions[offset]
-                    padded_positions[row, image, :positions.shape[0]] = positions
-                token_lengths[row, image] = length
-                indices[row, slots] = image * capacity + np.arange(length)
-                if groups is not None:
-                    groups[row, slots] = image
-                offset += 1
+        for offset, (row, image, slots) in enumerate(places):
+            chunk = chunks[offset]
+            padded[row, image, :chunk.shape[0]] = chunk
+            if padded_grid is not None and grid is not None:
+                padded_grid[row, image] = grid[offset]
+            if padded_positions is not None and patch_positions is not None:
+                positions = patch_positions[offset]
+                padded_positions[row, image, :positions.shape[0]] = positions
+            token_lengths[row, image] = len(slots)
+            if groups is not None:
+                groups[row, slots] = image
         conditioning = {"pixel_values": jnp.asarray(padded), "image_lengths": jnp.asarray(image_counts),
                         "image_token_lengths": jnp.asarray(token_lengths)}
         if padded_positions is not None:
@@ -442,24 +467,12 @@ class Processor:
             raise ValueError("position_embedding_size and patch_size must be positive integers")
         streams = _patch_streams(values, image_id, video_id, kernel=kernel,
                                  table_size=table_size, patch_size=patch_size)
-        offsets = dict.fromkeys(streams, 0)
-        chunks, patch_positions, lengths = [], [], []
-        for row, blocks in enumerate(runs):
-            for slots in blocks:
-                token_id = int(tokens[row, slots[0]])
-                stream = streams.get(token_id)
-                offset = offsets.get(token_id, 0)
-                if stream is None or offset >= len(stream[0]):
-                    raise ValueError("pixel_values and image/video placeholder counts disagree")
-                chunks.append(stream[0][offset])
-                patch_positions.append(stream[1][offset])
-                lengths.append(int(stream[2][offset]))
-                offsets[token_id] += 1
-        if any(offsets[token_id] != len(stream[0]) for token_id, stream in streams.items()):
-            raise ValueError("pixel_values and image/video placeholder counts disagree")
-        if not chunks:
+        patches = {token: list(zip(*stream, strict=True)) for token, stream in streams.items()}
+        ordered = _in_text_order(patches, tokens, runs)
+        if not ordered:
             raise ValueError("pixels require image or video placeholders")
-        return chunks, patch_positions, lengths, kernel
+        chunks, patch_positions, lengths = (list(part) for part in zip(*ordered, strict=True))
+        return chunks, patch_positions, [int(length) for length in lengths], kernel
 
     def _audio(self, values: Mapping[str, object], tokens: np.ndarray
                ) -> tuple[dict[str, jax.Array], dict[str, jax.Array]]:
@@ -500,16 +513,10 @@ class Processor:
         width = int(counts.max())
         padded = np.zeros((tokens.shape[0], width, *features.shape[1:]), features.dtype)
         padded_mask = np.zeros((tokens.shape[0], width, features.shape[1]), bool)
-        indices = np.full(tokens.shape, -1, np.int32)
-        offset = 0
-        for row, clips in enumerate(runs):
-            for clip, run in enumerate(clips):
-                if len(run) != int(expected[offset]):
-                    raise ValueError("audio placeholder counts do not match the encoded frame counts")
-                padded[row, clip] = features[offset]
-                padded_mask[row, clip] = mask[offset]
-                indices[row, run] = clip * capacity + np.arange(len(run))
-                offset += 1
+        indices, places = _placed(runs, expected, capacity, tokens.shape, "encoded frame counts")
+        for offset, (row, clip, _) in enumerate(places):
+            padded[row, clip] = features[offset]
+            padded_mask[row, clip] = mask[offset]
         conditioning = {
             "input_features": jnp.asarray(padded),
             "input_features_mask": jnp.asarray(padded_mask),
@@ -560,16 +567,8 @@ class Processor:
             if type(token_id) is not int:
                 raise ValueError(f"{token_name} must be an integer")
             streams[token_id] = pieces
-        offsets = dict.fromkeys(streams, 0)
-        ordered = []
-        for row, spans in enumerate(runs):
-            for span in spans:
-                token = int(tokens[row, span[0]])
-                if token not in streams or offsets[token] == len(streams[token]):
-                    raise ValueError("visual placeholders exceed their image/video frame payloads")
-                ordered.append(streams[token][offsets[token]])
-                offsets[token] += 1
-        if not ordered or any(offsets[token] != len(stream) for token, stream in streams.items()):
+        ordered = _in_text_order(streams, tokens, runs)
+        if not ordered:
             raise ValueError("visual payloads and placeholder frame counts disagree")
         chunks, grids = zip(*ordered, strict=True)
         widths = {chunk.shape[-1] for chunk in chunks}

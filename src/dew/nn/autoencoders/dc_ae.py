@@ -28,7 +28,9 @@ from dew import records
 from dew.interop.components import bind_component, component_source
 from dew.objectives.base import Variables
 
+from ..attention import rms_normalized
 from ..conv import Conv
+from ..precision import at_least_fp32
 from ..scan_orders import pixel_shuffle, pixel_unshuffle
 from .api import ModuleAutoEncoder
 
@@ -41,7 +43,8 @@ _ACTIVATIONS = {"relu": nn.relu, "relu6": nn.relu6, "silu": nn.silu}
 
 
 class _RMSNorm(nn.Module):
-    """diffusers' `RMSNorm` with a bias, over the channel axis."""
+    """diffusers' `RMSNorm` with a bias, over the channel axis: the bias joins
+    the scaled activation before its one cast."""
 
     features: int
     dtype: Dtype = jnp.float32
@@ -50,8 +53,10 @@ class _RMSNorm(nn.Module):
     def __call__(self, x):
         scale = self.param("scale", nn.initializers.ones, (self.features,))
         bias = self.param("bias", nn.initializers.zeros, (self.features,))
-        variance = jnp.mean(jnp.square(x.astype(jnp.float32)), axis=-1, keepdims=True)
-        return (x * jax.lax.rsqrt(variance + _EPS) * scale + bias).astype(self.dtype)
+        wide = at_least_fp32(x.dtype)
+        normed = rms_normalized(x, scale, _EPS, wide, scale_offset=False, scale_after_cast=False,
+                                fp32_statistics=True)
+        return (normed + bias.astype(wide)).astype(self.dtype)
 
 
 class _BatchNorm(nn.Module):
