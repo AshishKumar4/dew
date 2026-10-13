@@ -1611,8 +1611,10 @@ def resolve_implementation(implementation, query, key, *, dtype=None, precision=
     fused = sinks is None and cudnn_runs(query, softcap) and (causal or sliding_window is None)
     # tokamax's Triton kernel, where it takes the call, ran
     # SimpleDiT-B's 64-wide heads as fast as FlashAttention-2 on the A100 and
-    # faster on the L4.
-    if fused and triton_runs(query, sliding_window, mask, bias):
+    # faster on the L4; on an H100 FlashAttention-3 took half its time, so a
+    # target row names the kernel for heads it takes (`attention_narrow`).
+    if fused and measured_kernel('attention_narrow', 'triton') == 'triton' and triton_runs(
+            query, sliding_window, mask, bias):
         return 'triton'
     refusal = flash_refusal(query, key, causal, sliding_window, mask, bias, softcap, sinks)
     if refusal is None:
