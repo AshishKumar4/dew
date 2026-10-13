@@ -298,7 +298,9 @@ def _mimo_v2_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
         if records.boolean(hf.get(key, False), key) and kind in layers:
             kinds.setdefault(kind, native_fields(LayerKind)())['sinks'] = True
     if 'sliding_attention' in kinds:
-        kinds['sliding_attention']['num_kv_heads'] = swa_kv_heads
+        # A windowed kind rotates whole heads unless it states its own
+        # factor (`LayerKind`); MiMoV2Attention turns the same third of both.
+        kinds['sliding_attention'].update(num_kv_heads=swa_kv_heads, partial_rotary_factor=factor)
     scale = hf.get('attention_value_scale')
     config.update(
         kinds=kinds, value_head_dim=value_dim,
