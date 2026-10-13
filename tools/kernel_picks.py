@@ -72,7 +72,7 @@ def main() -> None:
             return lowered.lowered
         raise AssertionError("a trainer under lower_for raises its lowered step")
 
-    tuning.tune(step)
+    tuning.tune(step, measure=True)
     kind = jax.devices()[0].device_kind
     path = cache.kernel_picks_path(kind)
     with open(path) as file:
