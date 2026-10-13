@@ -1286,29 +1286,39 @@ def test_the_deepseek_v4_legacy_fields_fold_into_the_modern_spelling():
 
     ("partial_rotary_factor", 0.1875, "partial_rotary_factor 0.1875"),
     ("rope_scaling", {"type": "linear", "factor": 4.0}, "plain or YaRN"),
-    ("rope_scaling", {"type": "yarn", "factor": 16,
-                      "original_max_position_embeddings": 65536,
-                      "attention_factor": 1.3}, "attention_factor 1.3"),
 ])
 def test_a_deepseek_v4_field_with_no_counterpart_is_refused(field, value, message):
     with pytest.raises(ValueError, match=message):
         translate_config({**fixture_config("deepseek-v4-tiny"), field: value})
 
 
-def test_a_deepseek_v4_yarn_ramp_that_scales_its_table_is_refused():
-    """A nested compress entry naming no `attention_factor` derives one
-    that scales cos and sin (modeling_deepseek_v4.py:151-152), which this
-    rotary does not do, so it refuses naming the field."""
-    config = {key: value for key, value in fixture_config("deepseek-v4-tiny").items()
-              if key != "rope_scaling"}
+def test_a_deepseek_v4_yarn_ramp_scales_its_table_as_the_reference_does(tmp_path):
+    """A nested compress entry naming no `attention_factor` derives YaRN's
+    `0.1 ln(factor) + 1`, 1.28 at factor 16, and the reference multiplies
+    cos and sin by it (modeling_deepseek_v4.py:151-152): on the queries, the
+    keys, the compressor's entries and the de-rotated output alike."""
+    from shutil import copytree
+
+    from tools.decoder_export_reference import Case, reference_logits
+
+    copytree(DEEPSEEK_V4, tmp_path, dirs_exist_ok=True)
+    config = json.loads((tmp_path / "config.json").read_text())
+    del config["rope_scaling"]
     config["rope_parameters"] = {
         "main": {"rope_type": "default", "rope_theta": 10000,
                  "partial_rotary_factor": 0.25},
         "compress": {"rope_type": "yarn", "rope_theta": 160000, "factor": 16,
                      "original_max_position_embeddings": 65536,
                      "partial_rotary_factor": 0.25}}
-    with pytest.raises(ValueError, match="attention_factor None"):
-        translate_config(config)
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    ids = np.load(DEEPSEEK_V4 / "input_ids.npy")
+    source = Pretrained.load(str(tmp_path), dtype="float32", attention_impl="reference")
+    logits = np.asarray(source.model.apply(source.variables, jnp.asarray(ids, jnp.int32)))
+
+    case = Case("deepseek_v4", "deepseek-v4-tiny")
+    assert_as_exact_as_the_reference(logits, reference_logits(case, tmp_path, ids),
+                                     reference_logits(case, tmp_path, ids, wide=True),
+                                     "V4 logits under a scaling YaRN table")
 
 
 @pytest.mark.parametrize("released, saved", [
