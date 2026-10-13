@@ -68,10 +68,11 @@ def test_each_release_translates_to_the_dense_block_it_ships(size, groups, layer
     fields = translate_config(json.loads((ROOT / f'k2-horizon-{size}' / 'config.json').read_text()))
     assert (fields['norm_groups'], fields['num_layers'], fields['emb_features']) == (groups, layers, width)
     assert fields['scale_after_cast'] is False and fields['tie_embeddings'] is False
-    assert fields['mixture'] is None and fields['qk_norm'] is False
+    assert fields.get('mixture') is None and fields['qk_norm'] is False
     if size == '0.9b':
         yarn = fields['yarn']
-        assert (yarn['factor'], yarn['beta_fast'], yarn['beta_slow'], yarn['truncate']) == (16.0, 128.0, 4.0, True)
+        assert (yarn['factor'], yarn['beta_fast'], yarn['beta_slow']) == (16.0, 128.0, 4.0)
+        assert yarn['truncate']
         assert yarn['attention_factor'] == pytest.approx(1.2772588722239782)
     else:
         assert fields.get('yarn') is None and fields['rope_theta'] == 1e7

@@ -12,7 +12,7 @@ rotary and a window, which no dense release turns on: each is refused by name.
 from collections.abc import Mapping
 
 from dew import records
-from dew.interop.decoder_parts import DecoderFamily, DecoderFields, base_config, refuse
+from dew.interop.decoder_parts import DecoderFamily, DecoderFields, base_config, read_rope, refuse
 from dew.nn.backbones.causal_transformer import CausalTransformer
 
 _REMOTE = 'IFM/K2-Horizon-0.9B'
@@ -46,7 +46,10 @@ def _k2_horizon_config(hf: Mapping[str, object], used: set[str]) -> DecoderField
                  'use_sliding_window', 'original_max_position_embeddings', 'layernorm_num_groups', *_EXPERTS))
     # K2HorizonConfig drops the window unless use_sliding_window is set, and its attention builds
     # biases where attention_bias says (:212-223).
-    config = base_config({**hf, 'sliding_window': None}, used, scale_after_cast=False,
+    # The rotary builds transformers' YaRN where rope_parameters names it (:740-748).
+    rope = read_rope(hf, used, records.integer(hf.get('max_position_embeddings', 32768),
+                                               'max_position_embeddings'))
+    config = base_config({**hf, 'sliding_window': None}, used, rope=rope, scale_after_cast=False,
                          reads=frozenset({'attention_bias', 'sliding_window'}))
     config['norm_groups'] = records.integer(hf.get('layernorm_num_groups', 1), 'layernorm_num_groups')
     return config
