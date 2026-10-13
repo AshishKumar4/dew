@@ -657,7 +657,7 @@ def _fused_terms(hidden, table, labels, weights, z_loss: float, cap, bias, tile:
             d_raw = _logits_cotangent(d_raw, precision)
             values.append(jnp.einsum('tv,vd->td', d_raw, product_matrix, precision=precision,
                                      preferred_element_type=work))
-            operand = states.astype(d_raw.dtype)
+            operand = states.astype(operands)
 
             def rows(first, d_table, width):
                 block = jax.lax.dynamic_slice_in_dim(d_table, first, width, axis=0) + jnp.einsum(
