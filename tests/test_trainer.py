@@ -11,6 +11,7 @@ Local resume combines Dew's run and data-position policies; Orbax oracles the st
 
 import contextlib
 import dataclasses
+import itertools
 import json
 import os
 import signal
@@ -33,7 +34,7 @@ from dew.artifacts import Representations
 from dew.checkpoints import Ranking
 from dew.config import OptimConfig
 from dew.config.data import loader
-from dew.data.dataset import DataPartition
+from dew.data.dataset import DataPartition, Loader, replayed
 from dew.objectives.base import Aux, EMASpec, Objective, merge, under
 from dew.training import Checkpoints, Layout, MeshSpec, Trainer, TrainState, ema_update
 from dew.training.optim import Cosine, Power
@@ -253,13 +254,23 @@ def test_a_resumed_run_continues_the_key_stream(tmp_path):
         np.testing.assert_allclose(np.asarray(expected), np.asarray(actual), rtol=1e-6)
 
 
-def drawn(seed=0):
+def drawn(seed=0, opened=None, diverge=None):
     """A plain generator, without a position of its own: each batch drawn
-    from `seed`'s stream, or from fresh entropy with `seed=None`."""
+    from `seed`'s stream, or from fresh entropy with `seed=None`. With
+    `opened` (a list counting the generator's openings) and `diverge`, the
+    batches past index `diverge` differ on each opening."""
+    if opened is not None:
+        opened.append(None)
     rng = np.random.default_rng(seed)
-    while True:
+    for index in itertools.count():
+        if diverge is not None and index == diverge + 1:
+            rng = np.random.default_rng([seed, len(opened)])
         x = rng.normal(size=(BATCH, FEATURES)).astype(np.float32)
         yield {"x": x, "y": 2 * x[:, :2]}
+
+
+def stream(reader):
+    return Loader(reader, None, batch=BATCH, records=None)
 
 
 class Preempting(RecordingTracker):
@@ -276,30 +287,54 @@ class Preempting(RecordingTracker):
             os.kill(os.getpid(), signal.SIGTERM)
 
 
-def test_a_plain_generator_preempted_resumes_on_the_batches_the_whole_run_reads(tmp_path):
-    """A stream that keeps no position is positioned by the batches it read:
-    preempted at step 3 and resumed, it reads its first three batches again
-    and trains on the rest, landing on the uninterrupted run bit for bit."""
-    plain = dataset(train=drawn)
-    whole = make_trainer().fit(plain, steps=6, log_every=1)
+def preempted_and_resumed(tmp_path, data, at=3, steps=6):
+    """`data` trained to `steps` with a preemption at step `at` and a resume in a fresh trainer."""
     with pytest.raises(Preempted):
-        make_trainer(tmp_path, tracker=Preempting(3)).fit(plain, steps=6, log_every=1)
-    resumed = make_trainer(tmp_path).fit(plain, steps=6, log_every=1)
+        make_trainer(tmp_path, tracker=Preempting(at)).fit(data, steps=steps, log_every=1)
+    return make_trainer(tmp_path).fit(data, steps=steps, log_every=1)
+
+
+def same_variables(left, right) -> bool:
+    return all(np.array_equal(a, b) for a, b in zip(
+        jax.tree.leaves(jax.device_get(left.variables)), jax.tree.leaves(jax.device_get(right.variables)),
+        strict=True))
+
+
+def test_a_generator_declared_to_replay_resumes_on_the_batches_the_whole_run_reads(tmp_path):
+    """A generator declared to read the same batches each time it opens is
+    positioned by replay: preempted at step 3 and resumed, it reads its first
+    three batches again and trains on the rest, landing on the uninterrupted
+    run bit for bit."""
+    data = stream(replayed(lambda partition: drawn()))
+    resumed = preempted_and_resumed(tmp_path, data)
     assert int(resumed.step) == 6
-    for expected, actual in zip(jax.tree.leaves(jax.device_get(whole.variables)),
-                                jax.tree.leaves(jax.device_get(resumed.variables)), strict=True):
-        np.testing.assert_array_equal(expected, actual)
+    assert same_variables(resumed, make_trainer().fit(data, steps=6, log_every=1))
 
 
-def test_a_stream_that_does_not_replay_refuses_to_resume(tmp_path):
-    """A generator over fresh entropy reads other batches when reopened, so
-    the resume refuses by name rather than train on data the run never read
-    at those steps."""
-    fresh = dataset(train=lambda: drawn(None))
-    with pytest.raises(Preempted):
-        make_trainer(tmp_path, tracker=Preempting(2)).fit(fresh, steps=4, log_every=1)
+def test_an_undeclared_generator_trains_and_its_resume_is_refused(tmp_path):
+    """A plain generator trains and checkpoints, but its checkpoint holds no
+    position, so a resume, which would read its data again from the start,
+    is refused by name."""
+    with pytest.raises(ValueError, match="holds no data position"):
+        preempted_and_resumed(tmp_path, stream(lambda partition: drawn()))
+
+
+def test_a_declared_stream_whose_batch_at_the_position_differs_is_refused(tmp_path):
+    """The replay guard: a stream declared to replay that reads back another
+    batch at its position, one over fresh entropy, is refused."""
     with pytest.raises(ValueError, match="does not replay deterministically"):
-        make_trainer(tmp_path).fit(fresh, steps=4, log_every=1)
+        preempted_and_resumed(tmp_path, stream(replayed(lambda partition: drawn(None))))
+
+
+def test_the_replay_guard_reads_only_the_batch_at_the_position(tmp_path):
+    """The guard's limit: a declared stream that agrees up to its position
+    and differs after it resumes without complaint, on other data than the
+    uninterrupted run read, which is why replay is declared, not assumed."""
+    opened = []
+    data = stream(replayed(lambda partition: drawn(0, opened, diverge=2)))
+    resumed = preempted_and_resumed(tmp_path, data)
+    assert int(resumed.step) == 6
+    assert not same_variables(resumed, make_trainer().fit(data, steps=6, log_every=1))
 
 
 # --------------------------------------------------------------------------

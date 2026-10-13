@@ -292,7 +292,9 @@ The grace period has to cover one step and one checkpoint write. When `dew launc
 
 ## Data position
 
-A plain Python generator cannot report its position, so `fit` positions it by the batches it has read and a digest of the last one (`dew.data.dataset.Replayed`). A resume reopens the generator and reads that many batches again before training on the next, which continues exactly a generator that yields the same batches each time it opens. A generator that does not, one drawing from fresh entropy or a network, reads back another batch where the run stopped, and the resume refuses by name. Such a stream needs `get_state` and `set_state`, as the example's iterator has, or a built-in source. Reading a long stream again costs a resume one read of every batch before the position.
+A plain Python generator cannot report its position. It trains and checkpoints, but its checkpoint holds no data position, and `fit` refuses to resume one, since the generator would start its data again from the top. Give the iterator `get_state` and `set_state`, as the example's does, read it through a built-in source, or declare that it yields the same batches each time it opens: wrap the reader in `dew.data.dataset.replayed`, or pass `replay=True` to `from_iter`. A declared stream is positioned by the batches it has read, and a resume reopens it and reads that many again.
+
+At that position the resume compares the batch it reads with a digest of the one the run read, and refuses on a difference. That catches a stream that draws from fresh entropy or a network, but it is a guard and not a proof: a stream that reads the same batch there and differs later, one using a process-wide random generator or the clock, resumes without complaint on other data. Replay is exact only for a stream that is deterministic as declared. A resume reads every batch before the position again, and the digest costs the reader about a millisecond a megabyte of each batch.
 
 A persistent checkpoint can restore into a different, compatible placement through the trainer's restore template. Whether the process count can change depends on the saved position:
 

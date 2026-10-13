@@ -574,11 +574,12 @@ class Loader:
     `{"input_ids", "attention_mask"}` dict under "text", and a token window
     is int32 ids under "text".
 
-    Every training stream checkpoints its position. Grain-backed iterators
-    have `get_state` and `set_state`, and host transforms forward the pair; a
-    stream with neither is read through `Replayed`, which resumes it by
-    reading it again from its start and refuses one that does not read back
-    what it read. An indexed global-order position resumes on any
+    Whether a run resumes its data position depends on the iterator.
+    Grain-backed iterators have `get_state` and `set_state`, and host
+    transforms forward the pair. A stream with neither trains, and a resume
+    of its checkpoint is refused, unless its reader declares that it reads
+    the same batches each time it opens (`replayed`), which positions it by
+    replay. An indexed global-order position resumes on any
     partition, over one corpus or a weighted mixture. A stream that batches
     its own records reports its share's own position, and `dew.checkpoints`
     resumes it only on a reader of that share.
@@ -598,9 +599,6 @@ class Loader:
     device: tuple[DeviceStep, ...] = ()
     """The training batch's steps the compiled training step runs, on the
     accelerator, after the reader delivers it (`DeviceStep`)."""
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "train", replayable(self.train))
 
     @property
     def steps_per_epoch(self) -> int | None:
@@ -644,10 +642,10 @@ Dew's own envelope is bytes, and Grain reports a JSON object, which
 class Checkpointable(Protocol):
     """A data stream that can report where it stopped and resume from there.
 
-    Grain's iterators satisfy this, and so does `GlobalStream`; a `Loader`
-    reads a training stream without these methods through `Replayed`, which
-    resumes it by replay. The state itself is opaque here; `dew.position`
-    tells which of its two kinds a checkpoint holds.
+    Grain's iterators satisfy this, and so does `GlobalStream`, and so does
+    a stream a reader declares to replay (`replayed`). The state itself is
+    opaque here; `dew.position` tells which of its two kinds a checkpoint
+    holds.
     """
 
     def get_state(self) -> Position: ...
@@ -672,17 +670,14 @@ class Identified(Protocol):
     def identity(self) -> str: ...
 
 
-DIGESTED = 1 << 18
-"""The elements of an array `batch_digest` reads, evenly spaced, beyond which it reads no more."""
-
 type _Held = Mapping[str, _Held] | Sequence[_Held] | str | bytes | np.ndarray | np.generic | float | None
 """What a batch's fields hold, as `batch_digest` reads them."""
 
 
 def batch_digest(batch: Batch) -> str:
     """A digest of what `batch` holds: its fields by name, their values'
-    dtypes, shapes and elements (`DIGESTED` evenly spaced ones of a longer
-    array), its strings, bytes and scalars, and the type of any other object."""
+    dtypes, shapes and every element, its strings, bytes and scalars, and
+    the type of any other object."""
     digest = hashlib.blake2b(digest_size=16)
 
     def visit(value: _Held) -> None:
@@ -705,10 +700,7 @@ def batch_digest(batch: Batch) -> str:
             array = np.asarray(value)
             digest.update(f"{array.dtype}{array.shape}".encode())
             if array.dtype != object:
-                # Evenly spaced elements of a long array: a stream that does not replay differs
-                # throughout, and reading all of a large image batch would cost the reader a step.
-                flat = array.reshape(-1)
-                digest.update(np.ascontiguousarray(flat[::max(1, flat.size // DIGESTED)]).data)
+                digest.update(np.ascontiguousarray(array).data)
             elif array.ndim:
                 for element in array.flat:
                     visit(element)
@@ -721,15 +713,16 @@ def batch_digest(batch: Batch) -> str:
 
 
 class Replayed(Forwarding):
-    """The batches of a stream that keeps no position of its own, from
-    `reopen()`, positioned by how many it has read and a digest of the last.
+    """The batches of a stream declared to read the same batches each time
+    `reopen()` opens it, positioned by how many it has read and a digest of
+    the last.
 
-    A resume reopens the stream and reads that many again, which resumes
-    exactly a stream that reads the same batches every time it opens, and
-    refuses one whose batch at that position differs: a stream over random
-    draws or a network would resume on other data. Only the batch at the
-    position is compared, so one that differs earlier and agrees there
-    passes."""
+    A resume reopens the stream and reads that many again. The digest of the
+    batch at the position is a guard, not a proof: a stream whose batch there
+    differs is refused, and one that agrees there and differs elsewhere, one
+    drawing on a process-wide RNG or the clock after that batch, passes and
+    resumes on other data. Hashing every batch costs the reader about a
+    millisecond a megabyte."""
 
     def __init__(self, reopen: Callable[[], Iterator[Batch]], source: Iterator[Batch] | None = None):
         self._reopen = reopen
@@ -775,23 +768,15 @@ class Replayed(Forwarding):
                     f"(get_state and set_state) or read it through dew.data")
 
 
-@dataclasses.dataclass(frozen=True)
-class Replaying:
-    """`reader` whose streams each report a position: as they are where they
-    keep their own (`Checkpointable`), else `Replayed`."""
+def replayed(reader: Reader) -> Reader:
+    """`reader`, declared to read the same batches each time it opens, as a
+    script restarted from the top reads them: its streams are positioned by
+    replay (`Replayed`), so a run over it resumes where it stopped."""
 
-    reader: Reader
+    def opened(partition: DataPartition) -> Iterator[Batch]:
+        return Replayed(lambda: reader(partition))
 
-    def __call__(self, partition: DataPartition) -> Iterator[Batch]:
-        source = iter(self.reader(partition))
-        if isinstance(source, Checkpointable):
-            return source
-        return Replayed(lambda: self.reader(partition), source)
-
-
-def replayable(reader: Reader) -> Reader:
-    """`reader`, its streams positioned (`Replaying`), once."""
-    return reader if isinstance(reader, Replaying) else Replaying(reader)
+    return opened
 
 
 def stream_identity(stream: Iterator[Batch] | None) -> str:
