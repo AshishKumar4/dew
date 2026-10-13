@@ -36,7 +36,7 @@ from dew.nn.attention import (
 )
 from dew.nn.blocks import normal_kernel
 from dew.nn.flops import attention_flops, projection_flops
-from dew.nn.inputs import Admitted, AttentionMetadata
+from dew.nn.inputs import Admitted, AttentionMetadata, coordinates_of
 from dew.nn.kernels.generation import backend
 from dew.nn.kv_cache import TABLE, Append, KVCache, KVStore, filled_slots, rotated, write_cache
 from dew.nn.local_attention import local_attention
@@ -500,10 +500,13 @@ class CausalSelfAttention(nn.Module):
             or (self.bidirectional_images and metadata.image_groups is not None))
 
     @nn.compact
-    def __call__(self, x, decode: bool = False,
-                 positions=None, segment_ids=None, kv_store=None,
+    def __call__(self, x, decode: bool = False, kv_store=None,
                  attention_metadata: AttentionMetadata | None = None, train: bool = False):
         B, S, _ = x.shape
+        # The tokens' places and documents: the caller's or a packed batch's, else none given
+        # (`Coordinates`).
+        tokens = coordinates_of(attention_metadata, B, S)
+        positions, segment_ids = tokens.positions, tokens.segments
         logical_positions = positions
         # The projections and the kernel's output carry the names a remat
         # policy saves or offloads (decoder_block.RESIDUALS).
@@ -644,12 +647,10 @@ class CausalSelfAttention(nn.Module):
                 raise ValueError(
                     "a bidirectional canvas reads its encoder prefix as dense, full-precision "
                     "keys; it takes the default kv_cache layout")
-            elif self.kv_shared or segment_ids is not None:
+            elif self.kv_shared:
                 raise ValueError(
                     "a bidirectional canvas over a cache shares no keys across "
-                    "layers and packs no segments: a sharing layer owns no "
-                    "cache of its own, and packed positions do not continue "
-                    "past a prefix")
+                    "layers: a sharing layer owns no cache of its own")
             elif not self.has_variable("cache", "cached_key"):
                 raise ValueError(
                     "a bidirectional canvas has no KV cache of its own: prefill "
