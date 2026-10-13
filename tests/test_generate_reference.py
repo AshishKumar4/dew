@@ -102,7 +102,7 @@ def test_greedy_generation_emits_transformers_tokens(family):
 
     assert result.tokens.shape == (fixture["prompt"].shape[0], width + NEW_TOKENS)
     assert result.tokens.dtype == jnp.int32
-    np.testing.assert_array_equal(np.asarray(result.tokens)[:, :width], np.asarray(prompts(fixture)))
+    np.testing.assert_array_equal(np.asarray(result.tokens)[:, :width], fixture["prompt"])
     again = generate(pretrained.model, pretrained.variables, prompts(fixture), NEW_TOKENS,
                      key=jax.random.key(7), sampling=Sampling(temperature=0))
     np.testing.assert_array_equal(np.asarray(again.tokens), np.asarray(result.tokens))
