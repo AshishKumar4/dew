@@ -54,7 +54,8 @@ def test_explicit_overlapping_chunks_keep_all_document_targets(read):
 class InspectObjects:
     def __call__(self, batch):
         expected = batch["id"].tolist()
-        assert batch["caption"] == [f"image {index}" for index in expected]
+        assert batch["caption"].shape == (len(expected),)
+        assert batch["caption"].tolist() == [f"image {index}" for index in expected]
         assert batch["messages"] == [[{"role": "user", "content": str(index)}] * (index + 1)
                                      for index in expected]
         assert batch["tools"] == [{"names": [f"tool {index}"]} for index in expected]
