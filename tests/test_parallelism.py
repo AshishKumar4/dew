@@ -391,16 +391,21 @@ def test_a_checkpoint_restores_across_the_whole_fsdp_range(tmp_path, written, re
             assert leaf.addressable_shards[0].data.size == leaf.size // restored
 
 
-def test_a_checkpoint_without_a_position_resumes_from_the_top_of_the_stream(tmp_path):
-    """A stream without get_state writes no position; a resume from that
-    checkpoint restores the state and reads the stream from its start."""
-    make_trainer(tmp_path).fit(
-        Loader(lambda partition: batches(), None, batch=BATCH, records=None), steps=1, log_every=1)
+def test_a_stream_without_a_position_resumes_where_it_stopped_by_replay(tmp_path):
+    """A stream without get_state is positioned by the batches it read: its
+    checkpoint holds that count and the last one's digest, and a resume
+    reads its first batch again and trains on the second, as one run of two
+    steps does."""
+    stream = Loader(lambda partition: batches(), None, batch=BATCH, records=None)
+    make_trainer(tmp_path).fit(stream, steps=1, log_every=1)
     _, position = Checkpoints(str(tmp_path)).restore(share=DataPartition())
-    assert position is None
-    resumed = make_trainer(tmp_path).fit(
-        Loader(lambda partition: batches(), None, batch=BATCH, records=None), steps=2, log_every=1)
+    assert json.loads(position)["read"] == 1
+    resumed = make_trainer(tmp_path).fit(stream, steps=2, log_every=1)
+    whole = make_trainer().fit(stream, steps=2, log_every=1)
     assert int(resumed.step) == 2
+    for expected, actual in zip(jax.tree.leaves(jax.device_get(whole.variables)),
+                                jax.tree.leaves(jax.device_get(resumed.variables)), strict=True):
+        np.testing.assert_array_equal(expected, actual)
 
 
 # --------------------------------------------------------------------------
