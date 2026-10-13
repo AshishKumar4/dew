@@ -327,3 +327,32 @@ def test_a_run_trains_on_from_the_state_its_plan_timed(monkeypatch, tmp_path):
     state = trainer.fit(windows(token_files(tmp_path)), steps=3, checkpoint_every=None)
     assert [plan["seconds"] > 0 for plan in trainer.plan["timed"]] == [True, True]
     assert int(state.step) == 3
+
+
+KEY = """
+import json, sys
+sys.path.insert(0, "tests")
+from test_plan import BATCH, lm
+from dew.training.rungs import rung_key
+trainer = lm()
+state, _, _ = trainer.place()
+print(json.dumps(rung_key(trainer.objective.program_key(), (state, BATCH), [1, 2], trainer.device_mesh)))
+"""
+
+
+def test_two_processes_name_one_run_alike():
+    """A record is found by the next process of the same run, so nothing the key names may be one
+    process's alone, such as an address Python prints beside a function."""
+    import json
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    keys = []
+    for _ in range(2):
+        done = subprocess.run([sys.executable, "-c", KEY], cwd=root, capture_output=True, text=True,
+                              timeout=300)
+        assert done.returncode == 0, done.stderr[-3000:]
+        keys.append(json.loads(done.stdout.splitlines()[-1]))
+    assert keys[0] == keys[1]
