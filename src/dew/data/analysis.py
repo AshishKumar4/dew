@@ -84,12 +84,17 @@ def _provisioner(source: Source, read: Read) -> _Provisionable | None:
     return source if isinstance(source, _Provisionable) and source.can_provision(read) else None
 
 
+def _store(source: Source) -> Source:
+    """The store under any source slices or holdouts."""
+    while isinstance(source, _Wrapping):
+        source = source.source
+    return source
+
+
 def _in_memory(source: Source) -> bool:
     """Whether a source holds its records in memory (`Memory`), itself or
     through the sources that wrap it."""
-    while isinstance(source, _Wrapping):
-        source = source.source
-    return isinstance(source, Memory)
+    return isinstance(_store(source), Memory)
 
 
 def _promoted(pipeline: Pipeline) -> Pipeline:
@@ -136,7 +141,7 @@ def _preferred_read(compiled: Callable[[Read], Sequence[Pipeline]], *, provision
     would compile at each read, which differ where a recipe's default order
     does (`_order_at`), so each read is judged on the pipelines it would run.
 
-    Each source the run reads, after its published generations are promoted,
+    Each store the run reads, after its published generations are promoted,
     prefers memory for records held in memory (`Memory`, through any source
     that wraps one), indexed for a store that reads by index or can provision
     only that read, and streamed otherwise, and a mixture takes the least eager
@@ -160,6 +165,7 @@ def _preferred_read(compiled: Callable[[Read], Sequence[Pipeline]], *, provision
 
     chosen: list[Read] = []
     for source in (source for pipeline in promoted(READS[-1]) for _, source in _leaves(pipeline)):
+        source = _store(source)
         if _in_memory(source):
             chosen.append("memory")
         else:
