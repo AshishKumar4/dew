@@ -261,11 +261,15 @@ class SessionSource(Protocol):
     """Anything that turns tasks into sessions.
 
     `submit` starts `samples` sessions of one task under the served policy
-    `version` and returns one future per session. `cancel` stops the
-    sessions whose results are no longer wanted.
+    `version` and returns one future per session. A source that makes its
+    sessions' draws makes session k's under `fold_in(key, k)` and no other
+    seed, so the trainer's checkpointed key is the one authority over what
+    a run samples; an external harness's draws (Harbor) are its own.
+    `cancel` stops the sessions whose results are no longer wanted.
     """
 
-    def submit(self, task: Task, samples: int, *, version: int) -> Sequence[Future[Session]]: ...
+    def submit(self, task: Task, samples: int, *, version: int,
+               key: jax.Array) -> Sequence[Future[Session]]: ...
 
     def cancel(self, futures: Sequence[Future[Session]]) -> None: ...
 
