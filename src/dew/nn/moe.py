@@ -20,7 +20,6 @@ layout `jax.lax.ragged_dot` takes and the `expert` mesh axis shards.
 
 import dataclasses
 import functools
-import importlib
 import math
 from collections.abc import Callable, Mapping, Sequence
 
@@ -61,7 +60,7 @@ from .sharding import (
 SCORE_FUNCTIONS = ('softmax', 'sigmoid', 'sqrtsoftplus')
 
 # 'auto' resolves per hardware generation through `gpu_target().kernels['grouped_matmul']`.
-GROUPED_MATMULS = ('auto', 'xla', 'pallas', 'tokamax')
+GROUPED_MATMULS = ('auto', 'xla', 'pallas')
 EXPERT_DISPATCHES = ('global', 'exchange')
 
 # DeepSeek divides the selected weights by their sum plus this, so a token
@@ -324,7 +323,7 @@ class Router(nn.Module):
 
 def grouped_matmul_kernel(implementation: str, compute: Dtype, operands: tuple[Dtype, ...],
                           precision: PrecisionLike) -> str:
-    """The one choice of grouped matmul: 'xla', 'pallas' or 'tokamax'.
+    """The one choice of grouped matmul: 'xla' or 'pallas'.
 
     'auto' takes the generation's measured one (`gpu_target().kernels['grouped_matmul']`).
     'pallas' needs a GPU the kernels compile for and a product they compute
@@ -345,34 +344,6 @@ def grouped_matmul_kernel(implementation: str, compute: Dtype, operands: tuple[D
     return 'pallas' if refusal is None else ran_kernel('grouped_matmul', 'xla', refusal)
 
 
-def grouped_matmul(tokens: jax.Array, kernel: jax.Array, group_sizes: jax.Array, *,
-                   implementation: str, precision: PrecisionLike = None,
-                   preferred_element_type: Dtype | None = None) -> jax.Array:
-    """Each row of `tokens`, `[rows, in]`, through the matrix of its expert in
-    `kernel`, `[exp, in, out]`, for rows already sorted by expert; `group_sizes`
-    counts each expert's leading rows.
-
-    The raw call with JAX's own differentiation rules: 'tokamax' is
-    `tokamax.ragged_dot` with the kernel named per generation (`maxtext
-    layers/moe.py:1633`), everything else `jax.lax.ragged_dot`. The Pallas
-    kernels have no JAX rule, so they run behind `expert_projection`.
-    """
-    if implementation not in GROUPED_MATMULS:
-        raise ValueError(
-            f"implementation must be one of {list(GROUPED_MATMULS)}, got "
-            f"{implementation!r}")
-    if implementation == 'tokamax':
-        # tokamax is not a dependency (docs/concepts/moe.md), so it is
-        # imported at the call.
-        tokamax = importlib.import_module('tokamax')
-        return tokamax.ragged_dot(
-            tokens, kernel, group_sizes, precision=precision,
-            preferred_element_type=preferred_element_type,
-            implementation=measured_kernel('tokamax_grouped_matmul', 'xla'))
-    return xla_ragged_dot(tokens, kernel, group_sizes, precision=precision,
-                          preferred_element_type=preferred_element_type)
-
-
 def gather_expert_bias(bias: jax.Array, expert_ids: jax.Array, dtype: Dtype) -> jax.Array:
     """Expert-major biases in compute dtype, with master-precision cotangent sums.
 
@@ -388,7 +359,10 @@ def gather_expert_bias(bias: jax.Array, expert_ids: jax.Array, dtype: Dtype) -> 
 def expert_projection(x: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
                       dtype: Dtype | None, implementation: str,
                       precision: PrecisionLike) -> jax.Array:
-    """`grouped_matmul` under one precision contract for both dispatches.
+    """The grouped matmul of `x`'s expert-sorted rows, `[rows, in]`, through
+    each expert's matrix in `kernel`, `[experts, in, out]`, `group_sizes`
+    counting each expert's leading rows, under one precision contract for both
+    dispatches.
 
     Operands cast to `dtype` (flax's promotion when None), every contraction
     accumulates in at least fp32 and rounds once to the compute dtype, so a
@@ -397,7 +371,7 @@ def expert_projection(x: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
     dtype, an input gradient its input's, both accumulating over the widest of
     the compute, input and kernel dtypes, whatever the placement.
 
-    'xla' and 'tokamax' hold it in every differentiation mode (tangents on
+    'xla' holds it in every differentiation mode (tangents on
     `jax.lax.ragged_dot`); 'pallas' in first-order reverse mode
     (`dew.nn.kernels.grouped_matmul`), and a trace the kernels cannot take
     (`seen_whole`) runs 'xla'. tests/test_moe_precision.py measures it against
@@ -407,29 +381,26 @@ def expert_projection(x: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
     chosen = grouped_matmul_kernel(implementation, compute, (x.dtype, kernel.dtype), precision)
     if chosen == 'pallas' and seen_whole(x) and seen_whole(kernel):
         return grouped_projection(x, kernel, group_sizes, compute, implementation == 'pallas')
-    return _projection(x, kernel, group_sizes, dtype,
-                       'xla' if chosen == 'pallas' else chosen, precision)
+    return _projection(x, kernel, group_sizes, dtype, precision)
 
 
-@functools.partial(jax.custom_jvp, nondiff_argnums=(3, 4, 5))
+@functools.partial(jax.custom_jvp, nondiff_argnums=(3, 4))
 def _projection(x: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
-                dtype: Dtype | None, implementation: str,
-                precision: PrecisionLike) -> jax.Array:
-    """`expert_projection` in every differentiation mode."""
+                dtype: Dtype | None, precision: PrecisionLike) -> jax.Array:
+    """`expert_projection` in every differentiation mode, on `jax.lax.ragged_dot`."""
     x, kernel = promote_dtype(x, kernel, dtype=dtype)
-    accumulated = grouped_matmul(
-        x, kernel, group_sizes, implementation=implementation, precision=precision,
-        preferred_element_type=jnp.promote_types(x.dtype, jnp.float32))
+    accumulated = xla_ragged_dot(x, kernel, group_sizes, precision=precision,
+                                 preferred_element_type=jnp.promote_types(x.dtype, jnp.float32))
     return accumulated.astype(x.dtype)
 
 
-def _projection_jvp(dtype: Dtype | None, implementation: str, precision: PrecisionLike,
+def _projection_jvp(dtype: Dtype | None, precision: PrecisionLike,
                     primals: tuple[jax.Array, jax.Array, jax.Array],
                     tangents: tuple[jax.Array, jax.Array, jax.Array]
                     ) -> tuple[jax.Array, jax.Array | SymbolicZero]:
     x, kernel, group_sizes = primals
     dx, dkernel, _ = tangents
-    output = jnp.asarray(_projection(x, kernel, group_sizes, dtype, implementation, precision))
+    output = jnp.asarray(_projection(x, kernel, group_sizes, dtype, precision))
     work = jnp.result_type(output.dtype, x.dtype, kernel.dtype, jnp.float32)
     # A symbolic zero tangent contributes no term. Only the others pass the
     # barrier: jax 0.11.2 cannot transpose one that holds a constant zero.

@@ -13,7 +13,7 @@ from reference_error import assert_as_exact_as_the_reference
 
 from dew.interop import Pretrained, codecs
 from dew.interop.safetensors_io import read_weights
-from dew.training.quantization import NVFP4Input, nvfp4_input_qdq
+from dew.training.quantization import InputQuantizer, nvfp4_input_qdq
 
 ROOT = Path(__file__).parent / "fixtures" / "codecs" / "modelopt"
 
@@ -44,7 +44,8 @@ def test_modelopt_input_arithmetic_matches_its_own_fake_quantizer_in_every_bit(c
         if not key.endswith("/inputs"):
             continue
         stem = key.removesuffix("/inputs")
-        spec = NVFP4Input(float(reference[stem + "/global"].reshape(())), e4m3_scale=True, format="modelopt")
+        spec = InputQuantizer.nvfp4(float(reference[stem + "/global"].reshape(())), e4m3_scale=True,
+                                    format="modelopt")
         actual = jax.jit(lambda x, spec=spec: nvfp4_input_qdq(x, spec))(jnp.asarray(reference[key], dtype))
         suffix = "/qdq" if dtype == jnp.float32 else "/qdq_bf16"
         np.testing.assert_array_equal(np.asarray(actual, np.float32).view(np.uint32),
@@ -59,7 +60,8 @@ def test_direct_rn_scale_conversion_accounts_for_the_sm89_backend_difference(che
         if not key.endswith('/forward_inputs'):
             continue
         stem = key.removesuffix('/forward_inputs')
-        spec = NVFP4Input(float(reference[stem + '/global'].reshape(())), e4m3_scale=True, format='modelopt')
+        spec = InputQuantizer.nvfp4(float(reference[stem + '/global'].reshape(())), e4m3_scale=True,
+                                    format='modelopt')
         actual = jax.jit(lambda x, spec=spec: nvfp4_input_qdq(x, spec))(jnp.asarray(reference[key]))
         corrected = reference[stem + '/forward_qdq']
         original = reference[stem + '/forward_sm89_qdq']
@@ -98,7 +100,8 @@ def test_the_pinned_real_modelopt_layer_uses_its_stored_multipliers_bit_for_bit(
     with np.load(ROOT / "real" / "reference.npz") as reference:
         weight = codec.decode(stored, "m.weight")
         np.testing.assert_array_equal(weight.view(np.uint32), reference["weight"].view(np.uint32))
-        spec = NVFP4Input(float(reference["global_scale"].reshape(())), e4m3_scale=True, format="modelopt")
+        spec = InputQuantizer.nvfp4(float(reference["global_scale"].reshape(())), e4m3_scale=True,
+                                    format="modelopt")
         actual = jax.jit(lambda x: nvfp4_input_qdq(x, spec))(jnp.asarray(reference["inputs"], dtype))
         expected = reference["qdq_f32" if dtype == jnp.float32 else "qdq"]
         np.testing.assert_array_equal(np.asarray(actual, np.float32).view(np.uint32),
