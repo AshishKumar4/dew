@@ -727,7 +727,9 @@ class Replayed(Forwarding):
     A resume reopens the stream and reads that many again, which resumes
     exactly a stream that reads the same batches every time it opens, and
     refuses one whose batch at that position differs: a stream over random
-    draws or a network would resume on other data."""
+    draws or a network would resume on other data. Only the batch at the
+    position is compared, so one that differs earlier and agrees there
+    passes."""
 
     def __init__(self, reopen: Callable[[], Iterator[Batch]], source: Iterator[Batch] | None = None):
         self._reopen = reopen
@@ -755,11 +757,13 @@ class Replayed(Forwarding):
                              f"digest, not {dict(state)!r}")
         self.close()
         self._source, self._read, self._last = iter(self._reopen()), 0, None
-        for _ in range(read - 1):
+        if read:
+            _log.info("replaying %d batches of %s to resume", read, stream_identity(self._source))
+        for skipped in range(read - 1):
             try:
                 next(self._source)
             except StopIteration:
-                raise ValueError(f"the stream ran out after {_} batches, short of the {read} "
+                raise ValueError(f"the stream ran out after {skipped} batches, short of the {read} "
                                  f"a resume reads again") from None
             self._read += 1
         if read:
