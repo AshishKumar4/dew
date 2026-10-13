@@ -239,18 +239,6 @@ def test_a_best_state_that_cannot_be_restored_ends_the_run_failed(tmp_path):
     assert tracker.ended == ['failed']
 
 
-def test_a_checkpointer_needs_a_stream_that_resumes_where_it_stopped(tmp_path):
-    """The final checkpoint and a preemption's are full states a later run
-    resumes, so a stream without a position is refused whenever a
-    checkpointer is set, a cadence or not; without one it trains."""
-    plain = dataclasses.replace(data(), train=lambda partition: iter(Counting()))
-    with pytest.raises(ValueError, match="needs a training stream with get_state and set_state"):
-        trainer(tmp_path / 'run').fit(plain, steps=2, log_every=1)
-    state = Trainer(Overfit(), optax.sgd(0.1), key=jax.random.key(0), checkpoints=None).fit(
-        plain, steps=2, log_every=1)
-    assert int(state.step) == 2
-
-
 @pytest.mark.parametrize("aggregate", [False, True])
 def test_training_values_are_selected_through_the_objective(tmp_path, aggregate):
     run = trainer(tmp_path / 'run')

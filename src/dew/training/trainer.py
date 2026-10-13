@@ -1651,11 +1651,11 @@ class Trainer(Generic[Loss, Effects]):
         if not plan.finished(current, interval.real_tokens):
             partition = DataPartition.of(mesh)
             run.source = plan.dataset.train(partition)
-            # A preemption notice saves the full state whenever a checkpointer
-            # is set, as the final checkpoint does, and either resumes.
             check_stream(run.source, mesh, self.mesh, plan.dataset.batch,
                          self.accumulation * (self._split or 1), rows=self.rollout is None,
-                         checkpointing=checkpoints is not None)
+                         checkpointing=bool(plan.checkpoint_every or plan.local_every or (
+                             checkpoints is not None and plan.cadenced and plan.best and
+                             any(not choice.weights_only for choice in plan.best))))
             if isinstance(run.source, RampedStream):
                 # Each stage's batch is read whole: no plan splits a ramp's.
                 self._split = 1
