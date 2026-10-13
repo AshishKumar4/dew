@@ -27,16 +27,17 @@ from dew.interop.decoder_parts import (
     Renames,
     decoder_kinds,
     hf_activation,
+    hf_ungated,
     read_rope,
     refuse,
     renamed_name,
     renamed_path,
+    ungated_mlp,
 )
 from dew.nn.backbones.causal_transformer import CausalTransformer
 
 _ENCODER = 'ModernBertModel'
 _MASKED_LM = 'ModernBertForMaskedLM'
-_HEAD_ACTIVATIONS = {'gelu': 'gelu_exact', 'gelu_pytorch_tanh': 'gelu'}
 
 
 def _modernbert_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
@@ -106,9 +107,8 @@ def _modernbert_config(hf: Mapping[str, object], used: set[str]) -> DecoderField
 
     head = records.strings(hf.get('architectures', [_MASKED_LM]), 'architectures') != (_ENCODER,)
     head_activation = records.text(hf.get('classifier_activation', 'gelu'), 'classifier_activation')
-    if head and head_activation not in _HEAD_ACTIVATIONS:
-        refuse(f'classifier_activation={head_activation!r}',
-                f'the prediction head supports {sorted(_HEAD_ACTIVATIONS)}')
+    transform = (ungated_mlp(head_activation, ('gelu', 'gelu_pytorch_tanh'), 'classifier_activation',
+                             "ModernBERT's prediction head") if head else None)
     config: DecoderFields = native_fields(CausalTransformer)(
         vocab_size=records.integer(hf['vocab_size'], 'vocab_size'),
         emb_features=hidden, num_layers=layers, num_heads=heads, num_kv_heads=heads,
@@ -129,7 +129,7 @@ def _modernbert_config(hf: Mapping[str, object], used: set[str]) -> DecoderField
         kinds['sliding_attention']['bidirectional_window'] = True
     config['kinds'] = kinds
     if head:
-        config.update(head_transform=_HEAD_ACTIVATIONS[head_activation],
+        config.update(head_transform=transform,
                       head_bias=bool(hf.get('decoder_bias', True)))
     return config
 
@@ -197,8 +197,8 @@ def _modernbert_export(model: CausalTransformer) -> Mapping[str, object]:
     if sliding is not None and sliding.window is not None:
         fields['local_attention'] = 2 * (sliding.window - 1)
     if model.head_transform is not None:
-        fields['classifier_activation'] = {'gelu_exact': 'gelu', 'gelu': 'gelu_pytorch_tanh'}[
-            model.head_transform]
+        fields['classifier_activation'] = hf_ungated(model.head_transform, "ModernBERT's prediction head",
+                                                     tanh='gelu_pytorch_tanh')
     # ModernBERT's original keys, which transformers 5 no longer writes and older
     # readers still take: llama.cpp's converter reads its norm epsilon from these.
     fields['layer_norm_eps'] = model.norm_eps
