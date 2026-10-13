@@ -521,10 +521,11 @@ class Layout:
     parameter on the device, so the patterns are never silently ignored.
 
     `frozen_whole` keeps the frozen collection (`FROZEN`, a LoRA run's base)
-    whole on every device rather than split as the rules split it. A frozen
-    leaf has no gradient and no optimizer state, so a split saves only its
-    memory, and the step gathers it whole forward and again backward.
-    `check` counts no leaf it keeps whole.
+    whole over fsdp, split only over the other axes the rules give it (a
+    tensor split stays). A frozen leaf has no gradient and no optimizer
+    state, so an fsdp split saves only its memory, and the step gathers it
+    whole forward and again backward. `check` counts no leaf it keeps whole,
+    and a leaf `host_parameters` also names is kept so in pinned host memory.
     """
     rules: LogicalAxisRules | Mapping[str, MeshAxes] = DEFAULT_RULES
     min_shard: int = 2 ** 16
@@ -584,14 +585,15 @@ class Layout:
         def leaf_sharding(path, value):
             axes = declared_axes(path, value.ndim, declared)
             size = int(np.prod(value.shape, dtype=np.int64))
-            if self._kept_whole(path):
-                spec = P()
-            elif axes is None:
+            if axes is None:
                 spec = parameter_spec(value.shape, fsdp_size, self.min_shard)
             elif sharded_devices == 1 or size < self.min_shard:
                 spec = P()
             else:
                 spec = logical_spec(axes, value.shape, rules=self.axis_rules, mesh=mesh)
+            if self._kept_whole(path):
+                spec = P(*(tuple(axis for axis in mesh_axes(entry) if axis != FSDP_AXIS) or None
+                           for entry in spec))
             outside = sorted({axis for entry in spec for axis in mesh_axes(entry)}
                              - set(PARAMETER_AXES))
             if outside:

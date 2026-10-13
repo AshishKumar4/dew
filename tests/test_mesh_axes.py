@@ -245,13 +245,17 @@ def test_cross_attention_spends_communication_only_where_the_sequence_link_pays(
         assert split_bytes == kept_bytes
 
 
-@pytest.mark.mesh(devices=2)
-def test_a_frozen_collection_kept_whole_is_never_gathered():
-    """`Layout.frozen_whole` holds a LoRA base whole on each fsdp shard: a
-    device holds half the base more and the same optimizer state, the step
-    gathers none of the base, and one step trains what the split layout
-    trains."""
+@pytest.mark.parametrize(("mesh", "devices"), [
+    pytest.param(MeshSpec(fsdp=2), 2, marks=pytest.mark.mesh(devices=2), id="fsdp2"),
+    pytest.param(MeshSpec(fsdp=2, tensor=2), 4, marks=pytest.mark.mesh(devices=4), id="fsdp2_tensor2"),
+])
+def test_a_frozen_collection_kept_whole_is_never_gathered_over_fsdp(mesh, devices):
+    """`Layout.frozen_whole` holds a LoRA base whole over fsdp and split as
+    the rules split it over the rest (tensor): the step gathers none of what
+    fsdp split, the optimizer state and the trained parameters lie as the
+    split layout lays them, and one step trains what it trains."""
     from dew.lora import LoRA
+    from dew.nn.sharding import mesh_axes
     from dew.objectives.base import FROZEN
     from dew.training.distributed import placed_bytes
 
@@ -261,29 +265,29 @@ def test_a_frozen_collection_kept_whole_is_never_gathered():
     batch = next(token_batches())
 
     def stepped(frozen_whole: bool):
-        mesh = MeshSpec(fsdp=2)
         objective = LMObjective(adapter.model, SEQ_LEN, variables=jax.tree.map(np.asarray, adapter.variables))
         trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(0), mesh=mesh, checkpoints=None,
                           tracker=None, layout=Layout(min_shard=TINY_SHARD, frozen_whole=frozen_whole))
-        trainer.device_mesh = mesh.build(jax.devices()[:2])
+        trainer.device_mesh = mesh.build(jax.devices()[:devices])
         state, shardings, _ = trainer.place()
         placed = shard_batch(trainer.device_mesh, batch)
         run = trainer.compile(state, placed)
         gathered = sharded.collective_bytes(trainer.executable.as_text(), ("all-gather",))
-        held = {name: placed_bytes(getattr(state, name)) for name in ("variables", "opt_state")}
         trained, *_ = run(state, placed)
-        return shardings, held, gathered, jax.device_get(trained.variables["params"])
+        return state, shardings, gathered, jax.device_get(trained.variables["params"])
 
-    split, split_held, split_gathered, split_trained = stepped(False)
-    whole, whole_held, whole_gathered, whole_trained = stepped(True)
-    frozen = adapter.variables[FROZEN]
-    assert {sharding.spec for sharding in jax.tree.leaves(whole.variables[FROZEN])} == {P()}
-    assert P("fsdp") in {sharding.spec for sharding in jax.tree.leaves(split.variables[FROZEN])}
-    split_frozen = sum(leaf.nbytes for leaf, sharding in zip(
-        jax.tree.leaves(frozen), jax.tree.leaves(split.variables[FROZEN]), strict=True) if sharding.spec)
-    assert whole_held["variables"] - split_held["variables"] == split_frozen // 2
-    assert whole_held["opt_state"] == split_held["opt_state"]
-    assert split_gathered - whole_gathered >= split_frozen
+    split_state, split, split_gathered, split_trained = stepped(False)
+    whole_state, whole, whole_gathered, whole_trained = stepped(True)
+    split_specs = [sharding.spec for sharding in jax.tree.leaves(split.variables[FROZEN])]
+    whole_specs = [sharding.spec for sharding in jax.tree.leaves(whole.variables[FROZEN])]
+    assert any("fsdp" in mesh_axes(entry) for spec in split_specs for entry in spec)
+    assert whole_specs == [P(*(tuple(axis for axis in mesh_axes(entry) if axis != "fsdp") or None
+                               for entry in spec)) for spec in split_specs]
+    assert mesh.tensor == 1 or any("tensor" in mesh_axes(entry) for spec in whole_specs for entry in spec)
+    assert jax.tree.leaves(whole.variables["params"]) == jax.tree.leaves(split.variables["params"])
+    assert placed_bytes(whole_state.opt_state) == placed_bytes(split_state.opt_state)
+    kept = placed_bytes(whole_state.variables[FROZEN]) - placed_bytes(split_state.variables[FROZEN])
+    assert kept > 0 and split_gathered - whole_gathered >= kept
     for got, want in zip(jax.tree.leaves(whole_trained), jax.tree.leaves(split_trained), strict=True):
         np.testing.assert_allclose(got, want, rtol=1e-5, atol=1e-6)
 
