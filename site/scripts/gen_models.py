@@ -40,6 +40,7 @@ DECODERS = {
     "qwen3": ("Qwen 3", "Dense decoders"),
     "ouro": ("Ouro (looped)", "Dense decoders"),
     "qwen3_5_text": ("Qwen 3.5, text", "Dense decoders"),
+    "k2_horizon": ("K2 Horizon", "Dense decoders"),
     "bloom": ("BLOOM", "Dense decoders"),
     "gemma": ("Gemma", "Dense decoders"),
     "gemma2": ("Gemma 2", "Dense decoders"),
