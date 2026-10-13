@@ -34,7 +34,7 @@ temporaries, against 249 ms and 3.55 GiB for recomputing whole chunks.
 
 import math
 from collections.abc import Callable
-from typing import NamedTuple, cast
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -83,6 +83,10 @@ def vocabulary_chunks(vocab_size: int, chunks: int) -> tuple[tuple[int, int], ..
 
 
 BF16 = jax.lax.DotAlgorithmPreset.BF16_BF16_F32
+
+
+Terms = tuple[jax.Array, jax.Array | None, jax.Array]
+"""Each token's loss, top-1 column (None unless asked for) and log Z."""
 
 
 def _operand_dtype(precision: jax.lax.PrecisionLike, work: jnp.dtype):
@@ -522,7 +526,7 @@ def _token_spec(shape: tuple[int, ...]) -> P:
 def chunked_cross_entropy(hidden, head: OutputTable, targets, chunks: int, *,
                           tile: tuple[int, int] | None = (1024, 8192),
                           predict: bool = True, temperature: float = 1.0,
-                          excluded: int | None = None) -> tuple[jax.Array, jax.Array | None, jax.Array]:
+                          excluded: int | None = None) -> Terms:
     """Per-token cross entropy of `head.logits(hidden)`, its top-1 column
     and its log partition, the head contracted in tiles.
 
@@ -615,8 +619,8 @@ def chunked_cross_entropy(hidden, head: OutputTable, targets, chunks: int, *,
     mesh = jax.sharding.get_abstract_mesh()
     if mesh.empty:
         return scored(hidden, table, targets, left_out, cap, bias)
-    return cast(tuple[jax.Array, jax.Array | None, jax.Array], _sharded_head(
-        mesh, hidden, table, targets, left_out, cap, bias, scored, column_logits, predict=predict))
+    return _sharded_head(mesh, hidden, table, targets, left_out, cap, bias, scored, column_logits,
+                         predict=predict)
 
 
 def _fused_terms(hidden, table, labels, weights, z_loss: float, cap, bias, chunk: int,
@@ -731,7 +735,7 @@ def fused_tokens(tokens: int, vocab: int, tile: tuple[int, int] | None = None) -
 
 def fused_head_loss(hidden, head: OutputTable, targets, weights, *, z_loss: float = 0.0,
                     tile: tuple[int, int] | None = None, predict: bool = True, temperature: float = 1.0,
-                    excluded: int | None = None):
+                    excluded: int | None = None) -> tuple[jax.Array, Terms]:
     """The weighted sum of `head.logits(hidden)`'s cross entropies at
     `targets` and PaLM's z-loss, sum of w (ce + z_loss log Z^2), with each
     token's loss, top-1 column (None unless `predict`) and log Z beside it.
@@ -778,13 +782,14 @@ def fused_head_loss(hidden, head: OutputTable, targets, weights, *, z_loss: floa
     mesh = jax.sharding.get_abstract_mesh()
     if mesh.empty:
         return summed(states, table, (targets, weights), None, None, bias)
-    return _sharded_head(mesh, states, table, (targets, weights), None, None, bias, summed, None,
-                         predict=predict)
+    shares, terms = _sharded_head(mesh, states, table, (targets, weights), None, None, bias, summed, None,
+                                  predict=predict)
+    return jnp.sum(shares), terms
 
 
 def head_cross_entropy(model, variables, hidden, targets, chunks: int, *,
                        tile: tuple[int, int] | None = (1024, 8192), predict: bool = True,
-                       temperature: float = 1.0, excluded: int | None = None):
+                       temperature: float = 1.0, excluded: int | None = None) -> Terms:
     """`chunked_cross_entropy` of `hidden` against `model`'s head over `variables`.
 
     The head is the matrix `AffineHead.output_table` gives, its bias,
@@ -820,8 +825,8 @@ def _sharded_head(mesh, hidden, table, targets, excluded, cap, bias, head, colum
     against the head's own columns where they stay split (`_vocabulary_split`)
     or the head gathered whole (`chunked_cross_entropy`). A `head` with no
     `column_logits` returns a sum over its tokens before their outputs
-    (`fused_head_loss`), which the devices' sums add up to, and gathers the
-    head whole. `targets` may be a tuple of arrays alike, split alike."""
+    (`fused_head_loss`), each device's share of it out along the token axes,
+    and gathers the head whole. `targets` may be a tuple of arrays alike, split alike."""
     sums = column_logits is None
     spec = _token_spec(jax.tree.leaves(targets)[0].shape)
     axes = {axis for entry in spec for axis in mesh_axes(entry)}
@@ -876,14 +881,10 @@ def _sharded_head(mesh, hidden, table, targets, excluded, cap, bias, head, colum
     outputs = (spec, spec if predict else None, spec)
     inputs = (P(naming(spec[0]), *spec[1:], None), P(naming(held[0]), *held[1:]), spec, P(), P(),
               None if bias is None else P(naming(held[0])))
-    mapped = jax.shard_map(local, in_specs=inputs,
-                           out_specs=(P(tuple(sorted(axes)) + alone), outputs) if sums else outputs,
-                           axis_names=set(mesh.axis_names) - set(mesh.manual_axes), check_vma=False)(
+    return jax.shard_map(local, in_specs=inputs,
+                         out_specs=(P(tuple(sorted(axes)) + alone), outputs) if sums else outputs,
+                         axis_names=set(mesh.axis_names) - set(mesh.manual_axes), check_vma=False)(
         hidden, table, targets, excluded, cap, bias)
-    if sums:
-        shares, per_token = mapped
-        return jnp.sum(shares), per_token
-    return mapped
 
 
 def _vocabulary_split(hidden, table, targets, excluded, cap, bias, group: tuple[str, ...],
