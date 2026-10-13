@@ -48,12 +48,14 @@ from .precision import at_least_fp32
 from .sharding import logical_axes
 
 
-def chunk_kimi_delta_rule(query, key, value, g, beta, state=None, chunk_size: int = CHUNK_SIZE):
+def chunk_kimi_delta_rule(query, key, value, g, beta, state=None, chunk_size: int = CHUNK_SIZE, *,
+                          starts=None):
     """`chunk_kimi_delta_attention` (modeling_glm5_next.py:482-578): the
     chunked rule (`dew.nn.linear.chunk_delta_rule`) with `g` `[B, S, H, Dk]`,
     a log decay per key dimension, on the portable math: fla's port
-    (`dew.nn.kernels.fla_gdn`) decays per head."""
-    return chunk_delta_rule(query, key, value, g, beta, state, chunk_size)
+    (`dew.nn.kernels.fla_gdn`) decays per head. Packed documents' `starts`
+    reset the memory, as the chunked rule's do."""
+    return chunk_delta_rule(query, key, value, g, beta, state, chunk_size, starts=starts)
 
 
 # q/k/v_proj and o_proj carry the attention mixer's declarations under the
@@ -178,10 +180,10 @@ class KimiDeltaAttention(nn.Module):
         def scan(convolved, *, starts, valid, held):
             del valid
             query, key, value = (part.reshape(B, S, self.num_heads, self.head_dim) for part in convolved)
-            if S == 1 or starts is not None:
-                # Packed documents reset the memory at their starts, which the token-by-token rule takes.
+            if S == 1:
                 return recurrent_delta_rule(query, key, value, g, beta, held, starts=starts)
-            return chunk_kimi_delta_rule(query, key, value, g, beta, held, chunk_size=self.chunk_size)
+            return chunk_kimi_delta_rule(query, key, value, g, beta, held, chunk_size=self.chunk_size,
+                                         starts=starts)
 
         # The decode state is GatedDeltaNet's pair, here in fp32; the
         # allocation-only call returns before any state is written. The conv
