@@ -16,7 +16,7 @@ from process_support import REPO_ROOT
 from reference_error import equations
 
 from dew import cache
-from dew.nn.attention import stream_rms_normalized
+from dew.nn.attention import rms_normalized, stream_rms_normalized
 from dew.nn.kernels import norm_swiglu, tuning
 from dew.nn.moe import gated_product
 
@@ -29,6 +29,11 @@ def loss(x, branch, scale, gate, up):
                                            scale_after_cast=False, fp32_statistics=True,
                                            implementation="pallas")
     return jnp.sum(stream * normed) + jnp.sum(gated_product("swiglu", implementation="pallas")(gate, up))
+
+
+def plain(x, scale):
+    return rms_normalized(x, scale, 1e-6, x.dtype, scale_offset=True, scale_after_cast=False,
+                          fp32_statistics=True, implementation="pallas")
 
 
 def step():
@@ -131,8 +136,12 @@ def test_a_steps_launches_take_pins_stored_picks_and_heuristics(tmp_path):
               norm_swiglu.SwigluBackward: norm_swiglu.BlockConfig(256, 1)}
     timing = tokamax.BenchmarkData(compile_time_ms=1.0, lower_time_ms=1.0, evaluation_times_ms=(1.0,),
                                    metadata={})
-    picks = tokamax.AutotuningResult(jax.devices()[0].device_kind, tuple(
-        (ba, tuning.AutotuningData({picked[type(ba.op)]: timing})) for ba in found))
+    # A plain norm's pick beside them: a launch with no branch, which the seam's nearest search passes over.
+    with tuning.launches():
+        [alone] = tokamax.autotuning.get_bound_args(jax.jit(plain), operands(15)[0], operands(15)[2])
+    picks = tokamax.AutotuningResult(jax.devices()[0].device_kind, (
+        *((ba, tuning.AutotuningData({picked[type(ba.op)]: timing})) for ba in found),
+        (alone, tuning.AutotuningData({norm_swiglu.RowsConfig(2, 1): timing}))))
     flags = f"{os.environ.get('XLA_FLAGS', '')} {READ_ONLY}".strip()
     [path] = fresh(STORED, with_foreign(picks.dumps()), cache_dir=tmp_path / "cache", flags=flags)
     assert path.startswith(str(tmp_path / "cache" / "autotune" / "jaxlib-")) and path.endswith(".json")
