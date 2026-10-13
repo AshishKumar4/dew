@@ -8,6 +8,7 @@ the numpy position table.
 """
 
 import math
+from typing import Literal
 
 import einops
 import jax
@@ -15,6 +16,10 @@ import jax.numpy as jnp
 import numpy as np
 
 from .sharding import rows_spec
+
+ScanOrder = Literal['raster', 'hilbert', 'zigzag']
+"""The orders a patch grid runs in as a sequence: row by row, along a Hilbert
+curve, or in a zigzag."""
 
 
 def build_2d_sincos_pos_embed(emb_dim: int, H_P: int, W_P: int) -> np.ndarray:

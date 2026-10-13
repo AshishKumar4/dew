@@ -16,7 +16,7 @@ from dew import records
 from dew.interop.weights import translate_parameters
 from dew.nn.attention import RMSNorm
 from dew.nn.backbones.decoder_block import BlockWiring, DecoderBlock
-from dew.nn.inputs import AttentionMetadata
+from dew.nn.inputs import AttentionMetadata, coordinates
 from dew.nn.mixers.attention import CausalSelfAttention
 from dew.nn.mlp import GatedMLP
 from dew.objectives.base import Variables
@@ -153,7 +153,8 @@ class Gemma4VisionTransformer(nn.Module):
         table = jnp.asarray(self.position_table, hidden_states.dtype)
         positional = table[0, safe[..., 0]] + table[1, safe[..., 1]]
         hidden_states = hidden_states + jnp.where(valid[..., None], positional, 0)
-        metadata = AttentionMetadata(valid=valid, rotary_positions=pixel_position_ids)
+        metadata = AttentionMetadata(coordinates=coordinates(valid=valid),
+                                     rotary_positions=pixel_position_ids)
         for layer in self.layers:
             hidden_states = layer(hidden_states, attention_metadata=metadata)
         # A block without hyper-connections hands on the plain residual.
