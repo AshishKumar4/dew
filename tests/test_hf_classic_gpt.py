@@ -17,32 +17,33 @@ from dew.registry import models
 FIXTURES = Path(__file__).parent / 'fixtures' / 'hf'
 
 
-# Each family's config field, the spellings its reference reads, and the one
-# it writes the tanh GELU as.
+# Each family's config field and the spellings its reference reads.
 UNGATED = [
-    ("gpt2-tiny", "activation_function", ("gelu_new", "gelu_fast", "gelu_pytorch_tanh", "gelu", "relu"),
-     "gelu_new"),
-    ("opt-tiny", "activation_function", ("relu", "gelu", "gelu_new"), "gelu_new"),
-    ("gpt-neox-tiny", "hidden_act", ("gelu", "gelu_new", "gelu_pytorch_tanh", "relu"), "gelu_new"),
-    ("phi-tiny", "hidden_act", ("gelu_new", "gelu_pytorch_tanh", "gelu", "relu"), "gelu_new"),
-    ("falcon-tiny", "activation", ("gelu", "gelu_new", "relu"), "gelu_new"),
-    ("starcoder2-tiny", "hidden_act", ("gelu_pytorch_tanh", "gelu_new", "gelu", "relu"), "gelu_pytorch_tanh"),
+    ("gpt2-tiny", "activation_function", ("gelu_new", "gelu_fast", "gelu_pytorch_tanh", "gelu", "relu")),
+    ("opt-tiny", "activation_function", ("relu", "gelu", "gelu_new")),
+    ("gpt-neox-tiny", "hidden_act", ("gelu", "gelu_new", "gelu_pytorch_tanh", "relu")),
+    ("phi-tiny", "hidden_act", ("gelu_new", "gelu_pytorch_tanh", "gelu", "relu")),
+    ("falcon-tiny", "activation", ("gelu", "gelu_new", "relu")),
+    ("starcoder2-tiny", "hidden_act", ("gelu_pytorch_tanh", "gelu_new", "gelu", "relu")),
     ("gpt-bigcode-tiny", "activation_function",
-     ("gelu_new", "gelu_fast", "gelu_pytorch_tanh", "gelu", "relu"), "gelu_pytorch_tanh"),
+     ("gelu_new", "gelu_fast", "gelu_pytorch_tanh", "gelu", "relu")),
 ]
 
 
-@pytest.mark.parametrize("fixture, field, accepted, tanh", UNGATED, ids=[case[0] for case in UNGATED])
-def test_a_classic_family_reads_and_writes_its_own_activation_spellings(fixture, field, accepted, tanh):
+@pytest.mark.parametrize("fixture, field, accepted", UNGATED, ids=[case[0] for case in UNGATED])
+def test_a_classic_family_reads_and_writes_its_own_activation_spellings(fixture, field, accepted):
     """Every spelling a family's reference reads becomes the erf GELU, the
-    tanh GELU or ReLU, and exports as the family writes it; another
-    spelling is refused by name."""
+    tanh GELU or ReLU, and its export reads back as the same activation;
+    the release's own spelling exports as itself. Another spelling is
+    refused by name."""
     released = json.loads((FIXTURES / fixture / "config.json").read_text())
     exact = {"gelu": "gelu_exact", "relu": "relu"}
     for spelling in accepted:
         model = models.build("causal_transformer", **translate_config({**released, field: spelling}))
         assert model.mlp == exact.get(spelling, "gelu")
-        assert export_config(model)[field] == {"gelu_exact": "gelu", "relu": "relu"}.get(model.mlp, tanh)
+        assert translate_config(export_config(model))["mlp"] == model.mlp
+    own = export_config(models.build("causal_transformer", **translate_config(released)))
+    assert own[field] == released[field]
     refused = next(name for name in ("gelu_fast", "gelu_pytorch_tanh", "silu") if name not in accepted)
     with pytest.raises(ValueError, match=f"{field}='{refused}'"):
         translate_config({**released, field: refused})
