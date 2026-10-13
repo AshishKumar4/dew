@@ -120,6 +120,9 @@ class FileUri:
     def is_file(self):
         return self.local.is_file()
 
+    def is_dir(self):
+        return self.local.is_dir()
+
     def iterdir(self):
         return [FileUri(f"file://{entry}") for entry in self.local.iterdir()]
 

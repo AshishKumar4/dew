@@ -108,11 +108,12 @@ def test_a_trainer_run_trains_through_multi_turn_environments_on_the_native_serv
 
     episodes = EnvironmentSource(server, environment, verifier, max_prompt_tokens=32, max_new_tokens=16,
                                  max_turns=3, workers=16)
-    rollouts = []
+    rollouts, keys = [], []
     submit = episodes.submit
 
-    def watched(task, samples, *, version):
-        futures = submit(task, samples, version=version)
+    def watched(task, samples, *, version, key):
+        keys.append(tuple(int(word) for word in jax.random.key_data(key)))
+        futures = submit(task, samples, version=version, key=key)
         for future in futures:
             future.add_done_callback(
                 lambda done: rollouts.append(done.result()) if not done.cancelled() else None
@@ -148,6 +149,8 @@ def test_a_trainer_run_trains_through_multi_turn_environments_on_the_native_serv
         episodes.close()
         server.close()
     assert int(state.updates) == 4 and [record.updates for record in records] == [0, 1, 2, 3]
+    # Every submission draws its own fold of its step's rollout key.
+    assert len(set(keys)) == len(keys)
     assert all(0 <= record.lag <= 2 for record in records)
     assert any(record.lag > 0 for record in records), "no batch was ever drawn ahead of its update"
     # Each completed session's pair of calls merged into one chain.

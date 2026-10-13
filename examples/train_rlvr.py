@@ -380,7 +380,6 @@ def attempts_source(server, reward: CodeReward, decode: Callable[[Sequence[int]]
         max_new_tokens=config.new_tokens,
         max_turns=config.turns,
         workers=config.prompts * config.groups * (config.max_lag + 1),
-        seed=config.seed,
     )
 
 
@@ -567,8 +566,7 @@ def main(config: Config) -> dict:
     fleet = SandboxFleet(runner, limits=limits, workers=max(os.cpu_count() or 1, 4))
     reward = CodeReward(fleet)
     if config.turns == 1:
-        sessions = PromptSource(server, reward, decode=words.decode, max_new_tokens=config.new_tokens,
-                                seed=config.seed)
+        sessions = PromptSource(server, reward, decode=words.decode, max_new_tokens=config.new_tokens)
     else:
         sessions = attempts_source(
             server,
