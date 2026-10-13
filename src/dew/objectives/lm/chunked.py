@@ -344,17 +344,9 @@ def _bounded_head_bwd(chunks, tile, precision, predict, temperature, residuals, 
             logits, pullback = jax.vjp(
                 lambda raw, cap: capped_logits(raw, cap, temperature),
                 biased_logits(_tile_logits(states, matrix, precision), bias_tile), softcap)
-            # The maximum and the sum are the whole row's, so a tile's share of
-            # the softmax needs no renormalisation, and a target outside the
-            # tile one-hots to zero rather than to a wrapped column.
-            probabilities = (jnp.exp(_without(logits, first, excluded) - token_peak[:, None])
-                             / token_mass[:, None])
-            selected = jax.nn.one_hot(
-                jax.lax.dynamic_slice_in_dim(labels, start, size) - first, width,
-                dtype=work)
-            d_logits = ((token_loss + token_partition)[:, None] * probabilities
-                        - token_loss[:, None] * selected)
-            d_raw, cap_tile = pullback(d_logits)
+            d_raw, cap_tile = pullback(_softmax_cotangent(
+                logits, first, excluded, token_peak, token_mass,
+                jax.lax.dynamic_slice_in_dim(labels, start, size), token_loss, token_partition))
             # Bias is added after the bf16 product rounds. Its cotangent
             # stays fp32; only the product's two backward operands round.
             if d_offset is not None:
@@ -404,16 +396,30 @@ _bounded_head = jax.custom_vjp(_bounded_head_impl, nondiff_argnums=(4, 5, 7, 8, 
 _bounded_head.defvjp(_bounded_head_fwd, _bounded_head_bwd)
 
 
+def _softmax_cotangent(logits, first, excluded, peaks, masses, labels, d_loss, d_partition):
+    """The cotangent of a row tile of logits whose first column is `first`:
+    its share of the softmax times the loss's and the partition's
+    cotangents, less the loss's at the target. The share is taken against
+    the whole row's maximum and sum of exponentials scaled to it, so a tile
+    needs no renormalisation and every share rounds once, where dividing by
+    an exponentiated log Z would carry log Z's rounding into every share. A
+    target outside the tile one-hots to zero rather than to a wrapped
+    column."""
+    probabilities = jnp.exp(_without(logits, first, excluded) - peaks[:, None]) / masses[:, None]
+    selected = jax.nn.one_hot(labels - first, logits.shape[-1], dtype=logits.dtype)
+    return (d_loss + d_partition)[:, None] * probabilities - d_loss[:, None] * selected
+
+
 def _whole_head_terms(hidden, table, targets, excluded, softcap, precision, predict, temperature, bias):
-    """The whole `[tokens, vocab]` logits in at least fp32 and what
-    `_forward` returns of them: losses, the top-1 column (None unless
-    `predict`), log Z."""
+    """The whole `[tokens, vocab]` logits in at least fp32, each row's
+    maximum and sum of exponentials scaled to it, and what `_forward` returns
+    of them: losses, the top-1 column (None unless `predict`), log Z."""
     operands = _operand_dtype(precision, at_least_fp32(hidden.dtype))
     flat = hidden.reshape(-1, table.shape[1]).astype(operands)
     labels = targets.reshape(-1)
     raw = biased_logits(_tile_logits(flat, table.astype(operands), precision), bias)
     logits = _without(capped_logits(raw, softcap, temperature), 0, excluded)
-    log_z, top, _ = _row_terms(logits, predict)
+    log_z, top, normalizer = _row_terms(logits, predict)
     # A target outside the vocabulary picks no column, as in `_chunk_terms`:
     # the vocabulary-split head shifts each shard's targets by its first row
     # and sums the picked logit over shards, so only the owner may add one.
@@ -421,7 +427,7 @@ def _whole_head_terms(hidden, table, targets, excluded, softcap, precision, pred
     picked = jnp.where(inside, jnp.take_along_axis(
         logits, jnp.clip(labels, 0, table.shape[0] - 1)[:, None], axis=-1)[:, 0], 0.0)
     best = None if top is None else top[1].reshape(targets.shape)
-    return raw, ((log_z - picked).reshape(targets.shape), best, log_z.reshape(targets.shape))
+    return raw, normalizer, ((log_z - picked).reshape(targets.shape), best, log_z.reshape(targets.shape))
 
 
 def _whole_head_impl(hidden, table, targets, excluded, softcap, chunks, precision, predict,
@@ -434,11 +440,11 @@ def _whole_head_impl(hidden, table, targets, excluded, softcap, chunks, precisio
 
 def _whole_head_fwd(hidden, table, targets, excluded, softcap, chunks, precision, predict, temperature, bias):
     del chunks
-    raw, outputs = _whole_head_terms(hidden, table, targets, excluded, softcap, precision, predict,
-                                     temperature, bias)
+    raw, normalizer, outputs = _whole_head_terms(hidden, table, targets, excluded, softcap, precision,
+                                                 predict, temperature, bias)
     # The fp32 logits before the cap are kept, so the backward multiplies
     # nothing it did not have to: the state and head products alone.
-    return outputs, (hidden, table, targets, excluded, raw, outputs[2], softcap, bias)
+    return outputs, (hidden, table, targets, excluded, raw, normalizer, softcap, bias)
 
 
 def _whole_head_bwd(chunks, precision, predict, temperature, residuals, cotangents):
@@ -446,17 +452,15 @@ def _whole_head_bwd(chunks, precision, predict, temperature, residuals, cotangen
     logits: the logits' cotangent as `_logits_cotangent` gives it to both
     products, and the head's gradient accumulated in fp32 once."""
     del chunks, predict
-    hidden, table, targets, excluded, raw, log_z, softcap, bias = residuals
+    hidden, table, targets, excluded, raw, (peaks, masses), softcap, bias = residuals
     loss_cotangent, _, partition_cotangent = cotangents
     work = at_least_fp32(hidden.dtype)
     operands = _operand_dtype(precision, work)
     features = table.shape[1]
-    d_loss, d_partition = loss_cotangent.reshape(-1), partition_cotangent.reshape(-1)
     logits, pullback = jax.vjp(lambda raw, cap: capped_logits(raw, cap, temperature), raw, softcap)
-    probabilities = jnp.exp(_without(logits, 0, excluded) - log_z.reshape(-1)[:, None])
-    selected = jax.nn.one_hot(targets.reshape(-1), table.shape[0], dtype=work)
-    d_raw, d_cap = pullback((d_loss + d_partition)[:, None] * probabilities
-                            - d_loss[:, None] * selected)
+    d_raw, d_cap = pullback(_softmax_cotangent(
+        logits, 0, excluded, peaks, masses, targets.reshape(-1), loss_cotangent.reshape(-1),
+        partition_cotangent.reshape(-1)))
     d_bias = None if bias is None else jnp.sum(d_raw, axis=0).astype(bias.dtype)
     d_raw = _logits_cotangent(d_raw, precision)
     d_states = jnp.einsum('tv,vd->td', d_raw, table.astype(operands), precision=precision,
