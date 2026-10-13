@@ -10,6 +10,7 @@ from dew.interop.decoder_parts import (
     DecoderFamily,
     DecoderFields,
     Renames,
+    hf_ungated,
     refuse,
     renamed_name,
     renamed_path,
@@ -72,8 +73,7 @@ def _gpt_bigcode_export_weights(family: DecoderFamily, model: CausalTransformer,
 def _gpt_bigcode_export(model: CausalTransformer) -> Mapping[str, object]:
     fields = dict(gpt2_export(model))
     fields.update({'multi_query': model.kv_heads == 1,
-                   'activation_function': {'gelu': 'gelu_pytorch_tanh', 'gelu_exact': 'gelu',
-                                           'relu': 'relu'}[str(model.mlp)]})
+                   'activation_function': hf_ungated(model.mlp, 'GPTBigCode', tanh='gelu_pytorch_tanh')})
     return fields
 
 

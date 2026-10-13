@@ -1,6 +1,7 @@
 """Classic decoder ports against transformers 5.16.1, with nonzero biases."""
 
 import dataclasses
+import json
 from pathlib import Path
 
 import jax
@@ -9,11 +10,42 @@ import numpy as np
 import pytest
 
 from dew.interop import Pretrained
-from dew.interop.hf_decoders import translate_config
+from dew.interop.hf_decoders import export_config, translate_config
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.registry import models
 
 FIXTURES = Path(__file__).parent / 'fixtures' / 'hf'
+
+
+# Each family's config field, the spellings its reference reads, and the one
+# it writes the tanh GELU as.
+UNGATED = [
+    ("gpt2-tiny", "activation_function", ("gelu_new", "gelu_fast", "gelu_pytorch_tanh", "gelu", "relu"),
+     "gelu_new"),
+    ("opt-tiny", "activation_function", ("relu", "gelu", "gelu_new"), "gelu_new"),
+    ("gpt-neox-tiny", "hidden_act", ("gelu", "gelu_new", "gelu_pytorch_tanh", "relu"), "gelu_new"),
+    ("phi-tiny", "hidden_act", ("gelu_new", "gelu_pytorch_tanh", "gelu", "relu"), "gelu_new"),
+    ("falcon-tiny", "activation", ("gelu", "gelu_new", "relu"), "gelu_new"),
+    ("starcoder2-tiny", "hidden_act", ("gelu_pytorch_tanh", "gelu_new", "gelu", "relu"), "gelu_pytorch_tanh"),
+    ("gpt-bigcode-tiny", "activation_function",
+     ("gelu_new", "gelu_fast", "gelu_pytorch_tanh", "gelu", "relu"), "gelu_pytorch_tanh"),
+]
+
+
+@pytest.mark.parametrize("fixture, field, accepted, tanh", UNGATED, ids=[case[0] for case in UNGATED])
+def test_a_classic_family_reads_and_writes_its_own_activation_spellings(fixture, field, accepted, tanh):
+    """Every spelling a family's reference reads becomes the erf GELU, the
+    tanh GELU or ReLU, and exports as the family writes it; another
+    spelling is refused by name."""
+    released = json.loads((FIXTURES / fixture / "config.json").read_text())
+    exact = {"gelu": "gelu_exact", "relu": "relu"}
+    for spelling in accepted:
+        model = models.build("causal_transformer", **translate_config({**released, field: spelling}))
+        assert model.mlp == exact.get(spelling, "gelu")
+        assert export_config(model)[field] == {"gelu_exact": "gelu", "relu": "relu"}.get(model.mlp, tanh)
+    refused = next(name for name in ("gelu_fast", "gelu_pytorch_tanh", "silu") if name not in accepted)
+    with pytest.raises(ValueError, match=f"{field}='{refused}'"):
+        translate_config({**released, field: refused})
 
 
 def test_gpt2_config_builds_the_reference_block():
