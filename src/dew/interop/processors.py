@@ -87,9 +87,7 @@ def _placeholder_runs(tokens: np.ndarray, image_id: int, video_id: int | None) -
 
 def _in_text_order[T](streams: Mapping[int, Sequence[T]], tokens: np.ndarray,
                       runs: list[list[np.ndarray]]) -> list[T]:
-    """Each placeholder run's payload item, from the stream its placeholder
-    id names, in prompt-row and placeholder order: every stream is consumed
-    whole, and a run its stream has no item left for is refused."""
+    """Consume token-keyed payloads exactly once, in row and placeholder order."""
     offsets = dict.fromkeys(streams, 0)
     ordered = []
     for row, spans in enumerate(runs):
@@ -106,11 +104,8 @@ def _in_text_order[T](streams: Mapping[int, Sequence[T]], tokens: np.ndarray,
 
 def _placed(runs: list[list[np.ndarray]], lengths: Sequence[int] | np.ndarray, capacity: int,
             shape: tuple[int, ...], what: str) -> tuple[np.ndarray, list[tuple[int, int, np.ndarray]]]:
-    """Where each payload item goes: the slot each placeholder token reads,
-    `item * capacity + position` in its row's item order and -1 elsewhere,
-    and each item's (row, index in its row, placeholder slots), in
-    placeholder order. A run whose length is not its item's `lengths` entry
-    is refused, naming `what` the lengths count."""
+    """Check each run's length against its item's and return the slot each
+    placeholder reads with every item's (row, index in its row, slots)."""
     indices = np.full(shape, -1, np.int32)
     places = []
     for row, spans in enumerate(runs):
