@@ -51,6 +51,19 @@ def _chosen(take, taken, kept):
     return jax.tree.map(lambda new, old: jnp.where(take, new, old), taken, kept)
 
 
+def _only_when(due, taken, kept, operand):
+    """`taken(operand)` where `due` holds, else `kept(operand)`, running `taken` then alone.
+
+    XLA's conditional simplifier judges a branch by its ops' kinds, not their
+    size: one of elementwise ops and reductions, an optimizer update among
+    them, it runs on every call and selects (`TryRemoveConditional`). On Qwen3.5-0.8B
+    that ran the whole AdamW update on every microbatch, about 44 ms of a
+    731 ms step on an A100. The barrier, an op it counts as expensive, keeps
+    the branch a branch.
+    """
+    return jax.lax.cond(due, lambda current: jax.lax.optimization_barrier(taken(current)), kept, operand)
+
+
 def with_ema(params: Variables, ema: Variables | None) -> Variables | None:
     """The variables tree with the averaged leaves in place of the live ones."""
     return None if ema is None else merge(params, ema)
@@ -269,9 +282,13 @@ class Transaction:
                 mass = jax.lax.stop_gradient(mass)
                 total_mass = prior_mass + mass
                 denominator = jnp.where(total_mass > 0, total_mass, 1)
+                # A window's first microbatch starts its sum: the sum the last
+                # window committed stays in place, unread, rather than being
+                # cleared (`finish_attempt`).
                 gradient = jax.tree.map(
-                    lambda old, new: old * jnp.asarray(prior_mass / denominator, old.dtype)
-                    + new * jnp.asarray(mass / denominator, new.dtype), prior_gradient, gradient)
+                    lambda old, new: jnp.where(
+                        fill == 0, new, old * jnp.asarray(prior_mass / denominator, old.dtype)
+                        + new * jnp.asarray(mass / denominator, new.dtype)), prior_gradient, gradient)
                 numerator = previous.statistics[0] + total
                 pooled = Ratio(numerator, total_mass)
                 value, active = pooled.mean()
@@ -367,7 +384,7 @@ class Transaction:
             return apply(current), native_finite, norm
         if self.size == 1:
             return _chosen(native_finite, apply(current), current), native_finite, norm
-        return jax.lax.cond(native_finite, apply, lambda x: x, current), native_finite, norm
+        return _only_when(native_finite, apply, lambda x: x, current), native_finite, norm
 
     def finish_attempt(self, state, batch, aux, pending, gradient, attempt):
         """Commit the window when it is due, then advance the state's clocks.
@@ -389,7 +406,8 @@ class Transaction:
 
         A window that is not due retains this microbatch's batch, read
         snapshots and `attempt` in its slot, so a later replay can reproduce
-        it; a window that committed is zeroed for the next one.
+        it; a window that committed is zeroed for the next one, but for its
+        gradient sum, which the next window's first microbatch replaces.
         """
         scale, previous = state.scale, state.accumulation
         effects, qk, loss = pending.effects, pending.qk, pending.loss
@@ -409,8 +427,12 @@ class Transaction:
         else:
             dtype = jnp.result_type(*jax.tree.leaves(state.variables["params"]), jnp.float32)
             zero = jnp.real(jnp.zeros((), dtype))
-            numerical, native_finite, norm = jax.lax.cond(
-                due, commit, lambda x: (x, jnp.asarray(a=True), zero), numerical)
+            # The window goes round the commit, which never reads it: a
+            # conditional copies what it passes through.
+            numerical, native_finite, norm = _only_when(
+                due, commit, lambda x: (x, jnp.asarray(a=True), zero),
+                dataclasses.replace(numerical, accumulation=None))
+            numerical = dataclasses.replace(numerical, accumulation=previous)
         finite = finite & native_finite
         if scale is not None:
             accepted = finite & _all_finite((numerical.variables, numerical.opt_state, numerical.ema))
@@ -437,8 +459,14 @@ class Transaction:
                 return dataclasses.replace(jax.tree.map(jnp.zeros_like, acc), qk_stats=jax.tree.map(
                     lambda x: jnp.full_like(x, -jnp.inf) if jnp.issubdtype(x.dtype, jnp.inexact)
                     else jnp.zeros_like(x), acc.qk_stats))
+            # A pooled window's gradient sum (a replayed window keeps none)
+            # goes round the reset too, its next first microbatch restarting
+            # it (`prepare_attempt`): passed through on every microbatch the
+            # window does not commit, it was copied each time (Qwen3.5-0.8B's 1 GB
+            # embedding sum, twice a step on an A100).
+            window = jax.lax.cond(pending.due, clear, retain, dataclasses.replace(candidate, gradient=None))
             numerical = dataclasses.replace(
-                numerical, accumulation=jax.lax.cond(pending.due, clear, retain, candidate))
+                numerical, accumulation=dataclasses.replace(window, gradient=candidate.gradient))
         advanced = _chosen(accepted, numerical, state)
         if advanced.compute is not None:
             # The copies are the cast of whichever parameters were chosen, so

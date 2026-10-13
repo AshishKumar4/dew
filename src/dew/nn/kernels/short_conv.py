@@ -11,27 +11,26 @@ everything between in fp32 registers. Neither saves anything but the projection.
 own call, so a program knows statically whether it normalises and which cotangent it reads; the
 backward's calls write their columns of one gradient, each taking the last one's as its output.
 
-A kernel that reads a time block's inputs at the K shifts of the conv, as fla's causal_conv1d does
-(fla/modules/conv/triton/kernels.py, v0.5.2), would need the backward's pre-activation gradient at
-the K-1 rows past its block, and a Triton program cannot shift a register tile: fla writes the
-pre-activation to memory in a separate forward pass and reads it back at each shift, and fusing the
-norm on top would recompute the conv, silu and norm K times a row, about 80 fp32 operations an element
-against the 6 bytes it moves. Each program here instead walks time, as causal-conv1d's channel-last
-backward does (Dao-AILab/causal-conv1d, csrc/causal_conv1d_bwd.cu): a tile is `segments` rows, each
-the next token of its own run of `steps` tokens, and a loop steps all of them forward one token at a
-time, carrying the last K-1 inputs (and in the backward the last K-1 pre-activation gradients) from
-step to step, so each token's conv, silu, norm and their gradients are computed once. A run reads the
-K-1 tokens before it and the backward computes K-1 past its end, `(K - 1) / steps` extra.
+The forward needs nothing past a token's window, so each of its programs takes a tile of `ROWS`
+tokens and loads their windows at the conv's K shifts at once (the overlap stays in L1 and L2), as
+fla's causal_conv1d does (fla/modules/conv/triton/kernels.py, v0.5.2). The backward needs the
+pre-activation gradient at the K-1 rows past a tile, and a Triton program cannot shift a register
+tile: fla writes the pre-activation to memory in a separate pass and reads it back at each shift, and
+fusing the norm on top would recompute the conv, silu and norm K times a row. Each backward program
+instead walks time, as causal-conv1d's channel-last backward does (Dao-AILab/causal-conv1d,
+csrc/causal_conv1d_bwd.cu): a tile is `segments` rows, each the next token of its own run of `steps`
+tokens, and a loop steps all of them forward one token at a time, carrying the last K-1 inputs and
+pre-activation gradients, so each token's conv, silu, norm and their gradients are computed once. A
+run reads the K-1 tokens before it and computes K-1 past its end, `(K - 1) / steps` extra.
 
-The arithmetic is `causal_conv1d`'s in fp32, each output rounded once to its dtype, and nearer the exact
-values than XLA's: XLA sums the conv's products rounding each (4.1 fp32 ulps from float64 on average at
-the 0.8B's widths) and divides and takes roots approximately (Triton's and XLA's fp32 division is
-`div.full`, the root `sqrt.approx`), so where the bf16 outputs of the two straddle a rounding midpoint,
-which side XLA's lands on is noise. Here the conv keeps each product's rounding error and sums them
-compensated, the sigmoid's quotient and the norm's root and inverse round once (`div.rn`, `sqrt.rn`):
-0.25 ulps from float64 after the conv, 0.63 after the norm. Of the 0.8B's 50M bf16 queries on an H100,
-1,913 differ from XLA's, 1,654 of them nearer float64; values 1,605 to 152; the projection's gradient
-6,243 to 5,244 of 151M.
+The arithmetic is `causal_conv1d`'s in fp32, each output rounded once to its dtype: the conv's
+products summed tap by tap, as XLA sums them, and the sigmoid's quotient and the norm's root and
+inverse rounded once (`div.rn`, `sqrt.rn`, which cost nothing measurable), where Triton's and XLA's
+fp32 division is `div.full` and the root `sqrt.approx`. Every output and gradient is within the
+float64 gate of XLA's conv (tests/test_short_conv.py). Summing the products compensated and the tap
+gradients Kahan's way brought them nearer float64 than that (the 0.8B's fp32 queries 7.0e-8 from
+float64 against 8.3e-8 relative RMS) and cost 19% of an H100's forward and 26% of its backward, more
+than the gate asks for.
 """
 
 from __future__ import annotations
@@ -43,11 +42,13 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 
 from . import generation
-from .norm_swiglu import _neumaier_add, _product_parts
+
+ROWS = 16
+"""Tokens of a forward program's tile, each window loaded at once (`_forward_kernel`)."""
 
 SEGMENTS = 8
-"""Rows of a program's tile, each its own run of tokens: with a 128-channel block, 1024 elements, eight
-an fp32 register of each of four warps' threads."""
+"""Rows of a backward program's tile, each its own run of tokens: with a 128-channel block, 1024
+elements, eight an fp32 register of each of four warps' threads."""
 
 STEPS = 64
 """Tokens of a run: its K-1 extra tokens are 5% of 64 at the K of 4 every mixer uses."""
@@ -151,21 +152,12 @@ def _sqrt(x, *, interpret: bool):
     return jnp.sqrt(x) if interpret else _inline("sqrt.rn.f32 $0, $1;", x)
 
 
-def _preactivation(window, taps, bias, *, interpret: bool):
-    """The conv's sum rounded once: each product's rounding error kept exactly and the sum's in a
-    Neumaier correction, so the shared rounding of every later step starts from the exact sum."""
-    def tap_product(inputs, tap):
-        return _product_parts(inputs, jnp.broadcast_to(tap[None, :], inputs.shape), interpret=interpret)
-
-    total, correction = tap_product(window[0], taps[0])
+def _preactivation(window, taps, bias):
+    """The conv's sum in fp32, tap by tap from the oldest token, then the bias."""
+    total = window[0] * taps[0][None, :]
     for inputs, tap in zip(window[1:], taps[1:], strict=True):
-        product, error = tap_product(inputs, tap)
-        total, correction = _neumaier_add(total, correction, product, interpret=interpret)
-        correction = correction + error
-    if bias is not None:
-        total, correction = _neumaier_add(total, correction, jnp.broadcast_to(bias[None, :], total.shape),
-                                             interpret=interpret)
-    return total + correction
+        total = total + inputs * tap[None, :]
+    return total if bias is None else total + bias[None, :]
 
 
 def _sigmoid(pre, *, interpret: bool):
@@ -188,37 +180,26 @@ def _unpack(refs, has_bias: bool, has_valid: bool):
     return x_ref, w_ref, b_ref, valid_ref, refs
 
 
-def _forward_kernel(*refs, first: int, normalised: bool, block: int, segments: int, steps: int, count: int,
-                    length: int, has_bias: bool, has_valid: bool, activation: bool, eps: float,
-                    interpret: bool):
+def _forward_kernel(*refs, first: int, normalised: bool, block: int, rows: int, count: int, length: int,
+                    has_bias: bool, has_valid: bool, activation: bool, eps: float, interpret: bool):
+    """A tile of `rows` tokens, each computed from its K-window loaded at the conv's shifts, all at once:
+    the forward needs nothing from the tokens past the tile, so it walks nothing."""
     from jax.experimental.pallas import triton as plgpu
 
     x_ref, w_ref, b_ref, valid_ref, (out_ref,) = _unpack(refs, has_bias, has_valid)
-    columns, starts = _program(first, block, segments, steps)
+    columns = first + pl.program_id(0) * block + jnp.arange(block, dtype=jnp.int32)
+    tokens = pl.program_id(1) * rows + jnp.arange(rows, dtype=jnp.int32)
     local = columns - first
     taps, bias = _taps(w_ref, b_ref, columns, count)
-    history = tuple(_rows(x_ref, starts - count + 1 + tap, columns, length) for tap in range(count - 1))
-
-    def load(tokens):
-        return _rows(x_ref, tokens, columns, length), _kept(valid_ref, tokens, length)
-
-    def step(index, carry):
-        history, (current, kept) = carry
-        tokens = starts + index
-        # The next token's loads go out before this one's arithmetic, which hides their latency.
-        ahead = load(tokens + 1)
-        window = (*history, current)
-        y = _preactivation(window, taps, bias, interpret=interpret)
-        if activation:
-            y = _divide(y, 1.0 + jnp.exp(-y), interpret=interpret)
-        if normalised:
-            y = y * _inverse_norm(y, eps, interpret=interpret)
-        y = jnp.where(kept[:, None], y, 0.0)
-        plgpu.store(out_ref.at[tokens[:, None], local[None, :]], y.astype(out_ref.dtype),
-                    mask=(tokens < length)[:, None])
-        return window[1:], ahead
-
-    jax.lax.fori_loop(0, steps, step, (history, load(starts)))
+    window = tuple(_rows(x_ref, tokens - count + 1 + tap, columns, length) for tap in range(count))
+    y = _preactivation(window, taps, bias)
+    if activation:
+        y = _divide(y, 1.0 + jnp.exp(-y), interpret=interpret)
+    if normalised:
+        y = y * _inverse_norm(y, eps, interpret=interpret)
+    y = jnp.where(_kept(valid_ref, tokens, length)[:, None], y, 0.0)
+    plgpu.store(out_ref.at[tokens[:, None], local[None, :]], y.astype(out_ref.dtype),
+                mask=(tokens < length)[:, None])
 
 
 def _backward_kernel(*refs, first: int, normalised: bool, block: int, segments: int, steps: int,
@@ -242,12 +223,12 @@ def _backward_kernel(*refs, first: int, normalised: bool, block: int, segments: 
         return _rows(x_ref, tokens, columns, length), grad
 
     def step(index, carry):
-        history, later, sums, lost, (current, grad) = carry
+        history, later, sums, (current, grad) = carry
         tokens = starts + index
         # The next token's loads go out before this one's arithmetic, which hides their latency.
         ahead = load(tokens + 1)
         window = (*history, current)
-        pre = _preactivation(window, taps, bias, interpret=interpret)
+        pre = _preactivation(window, taps, bias)
         gate = _sigmoid(pre, interpret=interpret) if activation else None
         out = pre if gate is None else pre * gate
         if normalised:
@@ -259,13 +240,10 @@ def _backward_kernel(*refs, first: int, normalised: bool, block: int, segments: 
         if gate is not None:
             # silu's derivative as XLA's autodiff rounds it, the closer of the forms to float64.
             grad = grad * gate + (grad * pre) * (gate * (1.0 - gate))
-        # The token's own run sums its taps' and bias's gradients, compensated (Kahan) so a run's tokens
-        # round no worse than XLA's sum over the batch; the K-1 past the run are the next run's.
+        # The token's own run sums its taps' and bias's gradients; the K-1 past the run are the next run's.
         owned = jnp.where(((index < steps) & (tokens < length))[:, None], grad, 0.0)
         terms = (*(owned * inputs for inputs in window), owned)
-        corrected = tuple(term - error for term, error in zip(terms, lost, strict=True))
-        added = tuple(total + term for total, term in zip(sums, corrected, strict=True))
-        lost = tuple((new - total) - term for new, total, term in zip(added, sums, corrected, strict=True))
+        added = tuple(total + term for total, term in zip(sums, terms, strict=True))
         # Token `tokens - (K - 1)` reads this one through the last tap and the K-1 before through the others.
         gradients = (*later, grad)
         dx = gradients[0] * taps[count - 1][None, :]
@@ -274,12 +252,10 @@ def _backward_kernel(*refs, first: int, normalised: bool, block: int, segments: 
         emitted = tokens - (count - 1)
         plgpu.store(dx_ref.at[jnp.maximum(emitted, 0)[:, None], columns[None, :]], dx.astype(dx_ref.dtype),
                     mask=((index >= count - 1) & (emitted < length))[:, None])
-        return window[1:], gradients[1:], added, lost, ahead
+        return window[1:], gradients[1:], added, ahead
 
-    zeros = (zero,) * (count + 1)
-    carry = (history, (zero,) * (count - 1), zeros, zeros, load(starts))
-    _, _, totals, lost, _ = jax.lax.fori_loop(0, steps + count - 1, step, carry)
-    totals = tuple(total - error for total, error in zip(totals, lost, strict=True))
+    carry = (history, (zero,) * (count - 1), (zero,) * (count + 1), load(starts))
+    _, _, totals, _ = jax.lax.fori_loop(0, steps + count - 1, step, carry)
     for tap, total in enumerate(totals[:count]):
         dw_ref[local, tap] = jnp.sum(total, axis=0)
     if db_ref:
@@ -292,11 +268,10 @@ def _config(length: int, segments: int | None, steps: int | None) -> tuple[int, 
     return segments, steps
 
 
-def _specs(x, w, bias, valid, width: int, block: int, segments: int, steps: int):
-    """The grid over a piece's channel blocks, time tiles and rows, and the inputs' specs: each program
-    sees its row of `x` and `valid` whole and indexes its tokens."""
-    batch, length, channels = x.shape
-    grid = (width // block, pl.cdiv(length, segments * steps), batch)
+def _inputs(x, w, bias, valid):
+    """The inputs' specs over a grid of channel blocks, time tiles and rows: each program sees its row
+    of `x` and `valid` whole and indexes its tokens."""
+    _, length, channels = x.shape
     specs = [pl.BlockSpec((None, length, channels), lambda c, t, b: (b, 0, 0)),
              pl.BlockSpec(w.shape, lambda c, t, b: (0, 0))]
     operands = [x, w]
@@ -306,7 +281,7 @@ def _specs(x, w, bias, valid, width: int, block: int, segments: int, steps: int)
     if valid is not None:
         specs.append(pl.BlockSpec((None, length), lambda c, t, b: (b, 0)))
         operands.append(valid)
-    return grid, specs, operands
+    return specs, operands
 
 
 def _pieces(parts):
@@ -325,18 +300,18 @@ def _params(warps: int | None, stages: int | None):
 
 
 def _forward(x, taps, bias, valid, parts, activation: bool, eps: float, dtype, interpret: bool,
-             segments: int | None = None, steps: int | None = None, warps: int | None = None,
-             stages: int | None = None):
+             rows: int | None = None, warps: int | None = None, stages: int | None = None):
     batch, length, _ = x.shape
-    segments, steps = _config(length, segments, steps)
+    rows = ROWS if rows is None else rows
     out = []
     for first, width, head in _pieces(parts):
         block = block_width(width, head)
-        grid, specs, operands = _specs(x, taps, bias, valid, width, block, segments, steps)
+        grid = (width // block, pl.cdiv(length, rows), batch)
+        specs, operands = _inputs(x, taps, bias, valid)
         kernel = functools.partial(
-            _forward_kernel, first=first, normalised=head is not None, block=block, segments=segments,
-            steps=steps, count=taps.shape[1], length=length, has_bias=bias is not None,
-            has_valid=valid is not None, activation=activation, eps=eps, interpret=interpret)
+            _forward_kernel, first=first, normalised=head is not None, block=block, rows=rows,
+            count=taps.shape[1], length=length, has_bias=bias is not None, has_valid=valid is not None,
+            activation=activation, eps=eps, interpret=interpret)
         out.append(pl.pallas_call(
             kernel, grid=grid, in_specs=specs,
             out_specs=pl.BlockSpec((None, length, width), lambda c, t, b: (b, 0, 0)),
@@ -355,7 +330,8 @@ def _backward(x, taps, bias, valid, cotangents, parts, activation: bool, eps: fl
     dx, dw, db = None, [], []
     for (first, width, head), dy in zip(_pieces(parts), cotangents, strict=True):
         block = block_width(width, head)
-        grid, specs, operands = _specs(x, taps, bias, valid, width, block, segments, steps)
+        grid = (width // block, pl.cdiv(length, segments * steps), batch)
+        specs, operands = _inputs(x, taps, bias, valid)
         tiles = grid[1]
         kernel = functools.partial(
             _backward_kernel, first=first, normalised=head is not None, block=block, segments=segments,
