@@ -597,8 +597,12 @@ class Mamba2Mixer(MixerBase):
 
     residuals = ('context', 'conv')
 
-    # Its SSD scan's small batched dots gain from the fusions: 7.7% on an A100.
-    keeps_triton_gemm = True
+    @property
+    def keeps_triton_gemm(self) -> bool:
+        """Where the scan runs on XLA (the GPU's target row names no port), its
+        small batched dots gain from the fusions, 7.7% on an A100; on the
+        port a Mamba-2 130M step ran 3% faster without them."""
+        return measured_kernel('ssd', 'xla') != 'pallas'
 
     num_heads: int = 128
     head_dim: int = 64
