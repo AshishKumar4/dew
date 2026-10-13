@@ -1,8 +1,10 @@
 """Save and restore a run's training state and data position with Orbax.
 
-A checkpoint holds `step`, `variables`, `opt_state`, `ema`, `key` and, when the
-data iterator can report one, `position`. Metrics, the loss scale and epoch
-counters belong to the training loop, which rebuilds them on resume. A position
+A checkpoint holds every train-state field `TrainState` marks checkpointed
+(`dew.training.state.CHECKPOINTED`): the clocks, the variables, the optimizer
+state, the EMA, the key, the loss scaler and a partial accumulation window,
+and, when the data iterator can report one, `position`. The narrow compute
+copies derive from the variables and are rebuilt on resume. A position
 is either global, which any partition of the data can read, or one share's own
 offset, which only a reader of that same share can read; `dew.position` marks
 the difference and `read_position` acts on it. A state that is not a training
@@ -86,11 +88,6 @@ if TYPE_CHECKING:
 # gathered data position rides along under its own name as uint8 rows.
 type StateLeaf = (jax.Array | np.ndarray | Variables | optax.OptState
                   | DynamicScale | Accumulation | None)
-
-STATE_LEAVES = ("step", "microstep", "updates", "variables", "opt_state", "ema", "key",
-                "scale", "window_size", "accumulation")
-"""The train-state fields a checkpoint persists; anything outside this tuple
-is rebuilt on resume."""
 
 FROZEN_STORE = "frozen"
 """The directory beside the steps that holds every variables collection but
@@ -269,6 +266,16 @@ class Kept:
     """'state' for a train state, 'weights' for a weights-only snapshot, 'tree'
     for a mapping saved in place of a train state."""
     rankings: Mapping[str, dict] = dataclasses.field(default_factory=dict)
+
+
+def _kept(step: int, metrics: Mapping[str, float], custom: Mapping) -> Kept:
+    """The record of the step saved with `metrics` and `custom` metadata."""
+    rules = custom.get('rankings') or {}
+    return Kept(step=step, metrics=Metrics(metrics),
+                ranked_by=custom.get('primary') or next(iter(rules), None),
+                mode=next(iter(rules.values()), {}).get('mode'),
+                kind='weights' if custom.get('weights_only') else 'tree' if custom.get('tree') else 'state',
+                rankings=copy.deepcopy(rules))
 
 
 def frozen_entries(step_directory: str) -> list[str]:
@@ -639,6 +646,65 @@ def _item_metadata(metadata: ocp.metadata.StepMetadata) -> Variables:
     return dict(tree)
 
 
+def _read(want, dtype) -> ocp.ArrayRestoreArgs:
+    """How a stored leaf is read for its template leaf `want` (None where
+    there is none): in `dtype`, which Orbax casts it to on the host, where
+    `want` places it (a leaf `want` does not place, where it was saved), or
+    on the host where there is no template or JAX cannot hold that dtype now
+    (a float64 saved with x64 on, read with it off). A step's leaves read in
+    the template's dtype; a stored collection's in its own, which its digest
+    checks, and `_placed` casts and places them. A key reads as its data."""
+    if jnp.issubdtype(dtype, jax.dtypes.prng_key):
+        return ocp.ArrayRestoreArgs(sharding=getattr(want, 'sharding', None))
+    if want is None or jax.dtypes.canonicalize_dtype(dtype) != np.dtype(dtype):
+        return ocp.ArrayRestoreArgs(restore_type=np.ndarray)
+    return ocp.ArrayRestoreArgs(sharding=getattr(want, 'sharding', None), dtype=dtype)
+
+
+def _placed(tree, template):
+    """`tree`'s read leaves as `template` holds them, in its dtypes and
+    placements. A concrete template leaf the checkpoint lacks comes back
+    itself, and a key as its key data, which `request_key` types."""
+    def placed(leaf, want):
+        if leaf is want or jnp.issubdtype(want.dtype, jax.dtypes.prng_key) or (
+                isinstance(leaf, jax.Array) and leaf.dtype == want.dtype):
+            return leaf
+        value = jnp.asarray(leaf).astype(want.dtype)
+        sharding = getattr(want, 'sharding', None)
+        return value if sharding is None else jax.device_put(value, sharding)
+    return jax.tree.map(placed, tree, template)
+
+
+def _refuse_reshaped(template, stored, where: str) -> None:
+    """Refuse the leaves of `template` that `stored` (Orbax's metadata) holds
+    in another shape, by their names; a key is stored as its key data."""
+    held = ocp.tree.to_flat_dict(stored)
+    wrong = [f"{'/'.join(name)} {tuple(held[name].shape)} for {tuple(want.shape)}"
+             for name, want in ocp.tree.to_flat_dict(template).items()
+             if name in held and not jnp.issubdtype(want.dtype, jax.dtypes.prng_key)
+             and tuple(held[name].shape) != tuple(want.shape)]
+    if wrong:
+        raise ValueError(f"The checkpoint at {where} holds {', '.join(wrong[:6])}"
+                         f"{f' and {len(wrong) - 6} more' if len(wrong) > 6 else ''}: restore it into "
+                         f"the shapes it was written with.")
+
+
+def _paths(tree) -> set[str]:
+    return {jax.tree_util.keystr(path) for path, _ in jax.tree_util.tree_flatten_with_path(tree)[0]}
+
+
+def _refuse_lacking(lacking: set[str], where: str) -> None:
+    """Refuse a template whose leaves `lacking` the checkpoint at `where` does not hold."""
+    if lacking:
+        names = sorted(lacking)
+        raise ValueError(
+            f"The checkpoint at {where} holds no {', '.join(names[:6])}"
+            f"{f' or {len(names) - 6} more leaves' if len(names) > 6 else ''}, "
+            f"which this run's state has: the checkpoint was written by a model "
+            f"or objective without them. Restore it with the model it was "
+            f"written with.")
+
+
 def _plane_template(ema, deltas):
     """Return the EMA template with each leaf `deltas` names as the plane stack
     the checkpoint holds, and those leaves as the template had them, by path."""
@@ -667,7 +733,8 @@ def _check_template(template, metadata, stored, *, mapping: bool) -> None:
     if mapping:
         raise ValueError("the checkpoint holds a mapping saved in place of a train state; restore it "
                          "through a mapping template, or with none")
-    missing = set(STATE_LEAVES).difference(stored)
+    from dew.training.state import CHECKPOINTED
+    missing = set(CHECKPOINTED).difference(stored)
     if missing:
         raise ValueError(f"training checkpoint lacks required state fields {sorted(missing)}")
     if (metadata["scale"] is None) != (template.scale is None):
@@ -732,8 +799,11 @@ def _filled(template, restored: dict, step: int):
     if (not isinstance(template.window_size, jax.ShapeDtypeStruct)
             and int(restored["window_size"]) != int(template.window_size)):
         raise ValueError("checkpoint accumulation window_size differs from this run")
-    # A template's narrow copies are of its own parameters, not the restored ones.
-    return template.replace(**restored, compute=None)
+    from dew.training.state import CHECKPOINTED
+    # A field no checkpoint holds (the narrow copies) starts over: the
+    # template's are of its own parameters, not the restored ones.
+    return template.replace(**restored, **{field.name: field.default for field in dataclasses.fields(template)
+                                           if field.name not in CHECKPOINTED})
 
 
 class _RankedSteps(preservation.PreservationPolicy):
@@ -777,9 +847,8 @@ class _RankedSteps(preservation.PreservationPolicy):
                 previous = checkpoint.time
             if keep.where:
                 try:
-                    selected = keep.where(
-                        Kept(checkpoint.step, Metrics(checkpoint.metrics or {}), None, None)
-                    )
+                    selected = keep.where(_kept(checkpoint.step, checkpoint.metrics or {},
+                                                self.checkpoints._custom(checkpoint.step)))
                 except KeyError:
                     selected = False
                 if selected:
@@ -871,18 +940,15 @@ class Checkpoints:
 
     def _cache_step(self, step: int, metadata) -> Kept:
         custom = metadata.custom_metadata or {}
-        rules = custom.get('rankings') or {}
-        selection = next(iter(rules.values()), {})
-        checkpoint = Kept(
-            step=step,
-            metrics=Metrics(metadata.metrics or {}),
-            ranked_by=custom.get('primary') or next(iter(rules), None),
-            mode=selection.get('mode'),
-            kind='weights' if custom.get('weights_only') else 'tree' if custom.get('tree') else 'state',
-            rankings=copy.deepcopy(rules))
+        checkpoint = _kept(step, metadata.metrics or {}, custom)
         self._step_cache[step] = checkpoint
         self._custom_cache[step] = copy.deepcopy(custom)
         return checkpoint
+
+    def _custom(self, step: int) -> dict:
+        """The custom metadata `step` was saved with, as this process cached
+        it or from its committed metadata."""
+        return self._custom_cache.get(step) or self._open().metadata(step).custom_metadata or {}
 
     def kept(self) -> list[Kept]:
         """Return the committed retained steps, oldest first; their immutable metadata is cached."""
@@ -925,7 +991,7 @@ class Checkpoints:
             custom = self._open_local().metadata(step).custom_metadata or {}
         else:
             self.kept()
-            custom = self._custom_cache.get(step) or self._open().metadata(step).custom_metadata or {}
+            custom = self._custom(step)
         return copy.deepcopy(custom.get('control', {}))
 
     def _best_step(self, name: str | None) -> int | None:
@@ -1185,26 +1251,32 @@ class Checkpoints:
             if math.isfinite(rank.value):
                 scores[f'checkpoint/rank/{rank.metric}'] = rank.value if rank.mode == 'min' else -rank.value
                 rules[rank.metric] = dataclasses.asdict(rank)
-        with region("checkpoint.submit"):
-            persistent.save(
-                step,
-                args=ocp.args.PyTreeSave(state_tree),
-                metrics=scores,
-                force=True,
-                custom_metadata={
-                    "ema_deltas": deltas,
-                    "profiles": profile_metadata,
-                    "rankings": rules,
-                    "primary": primary or (rankings[0].metric if rankings else None),
-                    "control": copy.deepcopy(control or {}),
-                    "weights_only": weights_only,
-                    "rung": rung,
-                    "artifact": artifact,
-                    "boxed": _boxed_record(boxed),
-                    "frozen": frozen,
-                    "tree": mapping,
-                },
-            )
+        custom = {
+            "ema_deltas": deltas,
+            "profiles": profile_metadata,
+            "rankings": rules,
+            "primary": primary or (rankings[0].metric if rankings else None),
+            "control": copy.deepcopy(control or {}),
+            "weights_only": weights_only,
+            "rung": rung,
+            "artifact": artifact,
+            "boxed": _boxed_record(boxed),
+            "frozen": frozen,
+            "tree": mapping,
+        }
+        # The retention policy reads this step's record without waiting for its
+        # metadata to commit; a save Orbax refuses leaves the step's record as it was.
+        committed = self._custom_cache.pop(step, None)
+        self._custom_cache[step] = copy.deepcopy(custom)
+        try:
+            with region("checkpoint.submit"):
+                persistent.save(step, args=ocp.args.PyTreeSave(state_tree), metrics=scores, force=True,
+                                custom_metadata=custom)
+        except BaseException:
+            self._custom_cache.pop(step)
+            if committed is not None:
+                self._custom_cache[step] = committed
+            raise
         self._pending = (step, scores)
         self._frozen_pending = {digest for held in frozen.values() for digest in held.values()}
         # Pinned-host state is written before returning; the docstring says why.
@@ -1277,21 +1349,6 @@ class Checkpoints:
         template's placement and dtype or as host arrays, refusing one whose
         content no longer has the digest the step recorded."""
         values = {}
-        wide = jax.config.jax_enable_x64
-
-        def read(meta, want=None):
-            """A leaf in its stored dtype: on the host where no template places
-            it or JAX cannot hold that dtype now (a float64 saved with x64 on,
-            read with it off), else where the template places it."""
-            if want is None or (np.dtype(meta.dtype).itemsize == 8 and not wide):
-                return ocp.ArrayRestoreArgs(restore_type=np.ndarray)
-            return ocp.ArrayRestoreArgs(sharding=getattr(want, 'sharding', None), dtype=meta.dtype)
-
-        def placed(leaf, want):
-            value = jnp.asarray(leaf).astype(want.dtype)
-            sharding = getattr(want, 'sharding', None)
-            return value if sharding is None else jax.device_put(value, sharding)
-
         for name, digest in digests.items():
             path = epath.Path(self.directory) / FROZEN_STORE / digest
             if not path.exists():
@@ -1308,9 +1365,13 @@ class Checkpoints:
             whole = template is None or (jax.tree.structure(template) == jax.tree.structure(stored))
             if template is not None and not whole:
                 from dew.inference.banks import narrowed
-                stored, template = narrowed(stored, template), narrowed(template, stored)
-            restore_args = (jax.tree.map(read, stored) if template is None
-                            else jax.tree.map(read, stored, template))
+                kept = narrowed(template, stored)
+                _refuse_lacking(_paths(template) - _paths(kept), f"{path} ({name})")
+                stored, template = narrowed(stored, template), kept
+            if template is not None:
+                _refuse_reshaped(template, stored, f"{path} ({name})")
+            restore_args = (jax.tree.map(lambda meta: _read(None, meta.dtype), stored) if template is None
+                            else jax.tree.map(lambda meta, want: _read(want, meta.dtype), stored, template))
             tree = checkpointer.restore(path, args=ocp.args.PyTreeRestore(
                 item=stored, restore_args=restore_args, partial_restore=not whole))
             if whole:
@@ -1319,7 +1380,7 @@ class Checkpoints:
                     raise ValueError(f"{path} holds content with digest {found}, not the {digest} the "
                                      f"step recorded for its {name} collection")
             if template is not None:
-                tree = jax.tree.map(placed, tree, template)
+                tree = _placed(tree, template)
             values[name] = tree
         return values
 
@@ -1333,7 +1394,7 @@ class Checkpoints:
     def profile_metadata(self, step: int) -> tuple[int, tuple[float, ...]]:
         """Return a snapshot's recorded updates and relative standard deviations, without its averages."""
         self.kept()
-        custom = self._custom_cache.get(step) or self._open().metadata(step).custom_metadata or {}
+        custom = self._custom(step)
         profiles = custom.get('profiles')
         if profiles is None:
             raise ValueError(f"the checkpoint at step {step} holds no post-hoc EMA snapshot")
@@ -1446,7 +1507,8 @@ class Checkpoints:
     @staticmethod
     def _item(state: TrainState, saved: bytes | None,
               share: DataPartition | None) -> dict[str, StateLeaf]:
-        state_tree = {name: getattr(state, name) for name in STATE_LEAVES}
+        from dew.training.state import CHECKPOINTED
+        state_tree = {name: getattr(state, name) for name in CHECKPOINTED}
         if saved is not None:
             if share is None:
                 raise ValueError(
@@ -1570,9 +1632,9 @@ class Checkpoints:
 
     def accumulation_template(self, step: int):
         """Return the persisted pending-array shapes, without reading their values."""
-        from dew.training.state import Accumulation
+        from dew.training.state import CHECKPOINTED, Accumulation
         metadata = _item_metadata(self._step_metadata(step, local=step == self._local_latest()))
-        missing = set(STATE_LEAVES).difference(metadata.keys())
+        missing = set(CHECKPOINTED).difference(metadata.keys())
         if missing:
             raise ValueError(f"training checkpoint lacks required state fields {sorted(missing)}")
         pending = metadata["accumulation"]
@@ -1653,7 +1715,8 @@ class Checkpoints:
                     lambda path, leaf: _from_delta_planes(leaf, weights[path])
                     if path in deltas else leaf, restored['ema'])
         else:
-            state_tree = {name: getattr(template, name) for name in STATE_LEAVES} \
+            from dew.training.state import CHECKPOINTED
+            state_tree = {name: getattr(template, name) for name in CHECKPOINTED} \
                 if not isinstance(template, Mapping) else dict(template)
             held = _held_apart(state_tree, frozen)
             if from_local:
@@ -1662,10 +1725,8 @@ class Checkpoints:
             if state_tree.get('ema') is not None:
                 deltas = _ema_deltas(snapshot)
                 state_tree['ema'], targets = _plane_template(state_tree['ema'], deltas)
-            restore_args = jax.tree.map(
-                lambda leaf: ocp.ArrayRestoreArgs(
-                    sharding=leaf.sharding if isinstance(leaf, jax.ShapeDtypeStruct) else None),
-                state_tree)
+            _refuse_reshaped(state_tree, metadata, where)
+            restore_args = jax.tree.map(lambda want: _read(want, want.dtype), state_tree)
             if 'position' in stored and not isinstance(template, Mapping):
                 _position_leaves(state_tree, restore_args, metadata, from_local=from_local)
             try:
@@ -1688,16 +1749,11 @@ class Checkpoints:
                     f"and the gradient accumulation it was written with. Resume it "
                     f"with those, or start a fresh run in a directory of its own."
                 ) from mismatch
-            lacking = [jax.tree_util.keystr(path) for path, leaf
-                       in jax.tree_util.tree_flatten_with_path(dict(restored))[0]
-                       if isinstance(leaf, jax.ShapeDtypeStruct)]
-            if lacking:
-                raise ValueError(
-                    f"The checkpoint at {where} holds no {', '.join(lacking[:6])}"
-                    f"{f' or {len(lacking) - 6} more leaves' if len(lacking) > 6 else ''}, "
-                    f"which this run's state has: the checkpoint was written by a model "
-                    f"or objective without them. Restore it with the model it was "
-                    f"written with.")
+            _refuse_lacking({jax.tree_util.keystr(path) for path, leaf
+                             in jax.tree_util.tree_flatten_with_path(dict(restored))[0]
+                             if isinstance(leaf, jax.ShapeDtypeStruct)}, where)
+            restored = {name: value if name == 'position' else _placed(value, state_tree[name])
+                        for name, value in restored.items()}
             if targets:
                 restored = {**restored, 'ema': self._averages(checkpointer, step, metadata, restored,
                                                               targets, deltas)}

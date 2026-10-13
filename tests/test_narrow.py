@@ -136,14 +136,14 @@ def test_the_fit_check_counts_the_copies_the_first_step_builds(monkeypatch):
     the copies are not yet when the first step compiles, since `run` builds
     them before its first call, so their bytes count beside the step with the
     prefetched batches."""
-    from dew.training import trainer as module
+    from dew.training import planning as module
     from dew.training.distributed import placed_bytes
 
     asked = []
 
     def fits(executable, mesh, held=0):
         asked.append(held)
-        return True
+        return True, None
 
     monkeypatch.setattr(module, "step_fits", fits)
     narrow, _ = _trained(monkeypatch, {device_generation()}, optax.adam(1e-3), steps=1)
