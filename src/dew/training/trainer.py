@@ -1887,8 +1887,9 @@ class Trainer(Generic[Loss, Effects]):
                 return dataclasses.replace(choice, _source=owned(source) if source is not None else None)
             return choice
 
+        shown = _reported(None, metrics)
         selection = tuple(
-            (chosen if isinstance(chosen, Best) else Best(chosen)).resolved(metrics, splits)
+            (chosen if isinstance(chosen, Best) else Best(chosen)).resolved(metrics, shown, splits)
             for chosen in (owned(Best(choice) if isinstance(choice, str) else choice) for choice in raw)
         )
         labels = [(choice.split, choice.metric) for choice in selection
@@ -1901,7 +1902,7 @@ class Trainer(Generic[Loss, Effects]):
                 raise TypeError(
                     "Plateau selects a declared metric object, not a Best policy or score function"
                 )
-            stopping = Best(metric, mode=stop.mode, split=stop.split).resolved(metrics, splits)
+            stopping = Best(metric, mode=stop.mode, split=stop.split).resolved(metrics, shown, splits)
             stop = dataclasses.replace(stop, metric=metric, mode=stopping.mode, split=stopping.split)
         if restore_best and any(choice.weights_only for choice in selection):
             raise ValueError("restore_best requires full checkpoints, not weights_only snapshots")

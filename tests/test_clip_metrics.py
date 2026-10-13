@@ -62,7 +62,7 @@ def test_a_run_ranked_by_clip_distance_keeps_its_lowest():
 
     metric = CLIPDistance(modelname="never/downloaded")
     assert metric.shown.better == "lower"
-    assert Best(metric).resolved([metric]).mode == "min"
+    assert Best(metric).resolved([metric], {metric.name: metric.shown}).mode == "min"
 
 
 def test_clip_score_metric_clamps_the_reference_cosine():
