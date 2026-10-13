@@ -129,8 +129,9 @@ class MultiBlockMask:
                                for h, w in self.block_shapes])
 
         shape_key, pos_key, context_key = jax.random.split(rng, 3)
-        choice = jax.random.randint(shape_key, (batch_size, M), 0, len(self.block_shapes))
-        corner = jax.random.uniform(pos_key, (batch_size, M, 2))
+        # The draws' dtypes are fixed, so a float64 run samples the masks a float32 one does.
+        choice = jax.random.randint(shape_key, (batch_size, M), 0, len(self.block_shapes), dtype=jnp.int32)
+        corner = jax.random.uniform(pos_key, (batch_size, M, 2), dtype=jnp.float32)
         top = jnp.floor(corner[..., 0] * (H_P - heights[choice] + 1)).astype(jnp.int32)
         left = jnp.floor(corner[..., 1] * (W_P - widths[choice] + 1)).astype(jnp.int32)
         target_idx = (top * W_P + left)[..., None] + offsets[choice]
@@ -143,6 +144,6 @@ class MultiBlockMask:
             jnp.arange(batch_size)[:, None], target_idx.reshape(batch_size, -1)].set(True)
         # target tokens sort last, so the first num_context entries of a random
         # ordering are a uniform sample of the complement
-        order = jax.random.uniform(context_key, (batch_size, S)) + is_target
+        order = jax.random.uniform(context_key, (batch_size, S), dtype=jnp.float32) + is_target
         context_idx = jnp.sort(jnp.argsort(order, axis=1)[:, :self.num_context], axis=1)
         return context_idx, target_idx

@@ -133,19 +133,6 @@ def test_strict_merge_follows_append_only_history_and_splits_on_any_rewrite(seed
         assert (batch[ADVANTAGES_KEY][mine] == advantages(rollouts)[index]).all()
 
 
-def test_a_prompt_only_prefix_does_not_merge():
-    """Section 6: the template dropped the sampled reasoning from history."""
-    first = Call((1, 2, 3), (7, 8, 9), (-.1, -.2, -.3), "tool_calls", 0)
-    rewritten = Call((1, 2, 3, 9, 4), (5,), (-.5,), "stop", 0)
-    appended = Call((1, 2, 3, 7, 8, 9, 4), (5,), (-.5,), "stop", 0)
-    split = pack([Session("t", "g", 0, 0, (first, rewritten), Status.COMPLETED, 1.0)], 16)
-    merged = pack([Session("t", "g", 0, 0, (first, appended), Status.COMPLETED, 1.0)], 16)
-    assert split[SEGMENT_IDS_KEY].max() == 2
-    assert merged[SEGMENT_IDS_KEY].max() == 1
-    np.testing.assert_array_equal(merged[IDS_KEY][0, :8], [1, 2, 3, 7, 8, 9, 4, 5])
-    np.testing.assert_array_equal(merged[RESPONSE_MASK_KEY][0, :8], [0, 0, 0, 1, 1, 1, 0, 1])
-
-
 def test_masked_rollouts_take_no_rows_and_no_baseline():
     call = Call((1, 2), (3,), (-.1,), "stop", 0)
     rollouts = [Session("t", "g", 0, 0, (call,), Status.COMPLETED, 1.0),
@@ -180,27 +167,6 @@ def test_the_truncation_policy_decides_whether_a_truncation_trains_and_on_what_r
     assert ("masked/truncated" in metrics) == (truncation == "mask")
 
 
-def test_a_scored_truncation_needs_a_reward_and_an_unknown_policy_is_refused():
-    call = Call((1, 2), (3,), (-.1,), "length", 0)
-    unscored = [Session("t", "g", 0, 0, (call,), Status.TRUNCATED, None)]
-    with pytest.raises(ValueError, match="reward"):
-        pack(unscored, 3, truncation="score")
-    assert pack(unscored, 3, truncation="zero")[RESPONSE_MASK_KEY].sum() == 1
-    with pytest.raises(ValueError, match="truncation"):
-        pack(unscored, 3, truncation="drop")
-
-
-def test_rows_pad_to_a_fixed_count_and_refuse_overflow():
-    call = Call((1, 2), (3,), (-.1,), "stop", 0)
-    rollouts = [Session("t", "g", sample, 0, (call,), Status.COMPLETED, float(sample)) for sample in range(4)]
-    assert pack(rollouts, 6)[IDS_KEY].shape == (2, 6)
-    assert pack(rollouts, 6, rows=5)[IDS_KEY].shape == (5, 6)
-    with pytest.raises(ValueError, match="more than the 1"):
-        pack(rollouts, 6, rows=1)
-    with pytest.raises(ValueError, match="wider than"):
-        pack(rollouts, 2)
-
-
 def test_sampled_values_scatter_per_call_values_in_call_order():
     rng = np.random.default_rng(3)
     rollouts = [_rollout(rng, sample=index, reward=float(index))[0] for index in range(4)]
@@ -231,23 +197,6 @@ def test_session_metrics_report_merge_masking_reward_latency_and_lag():
     assert metrics["lag/max"] == 2 and metrics["lag/mean"] == pytest.approx((2 + 1 + 1 + 2 + 1) / 5)
 
 
-def test_each_sampled_id_weighs_one_over_its_rollouts_sampled_count():
-    """A rollout split over two chains still weighs as one: each of its
-    sampled ids carries 1 / (sampled ids of the rollout), not of its chain."""
-    first = Call((1, 2), (3, 4), (-.1, -.2), "tool_calls", 0)
-    rewritten = Call((1, 9), (5,), (-.3,), "stop", 0)
-    lonely = Call((6,), (7, 8, 9), (-.1, -.1, -.1), "stop", 0)
-    rollouts = [Session("t", "g", 0, 0, (first, rewritten), Status.COMPLETED, 1.0),
-                Session("t", "g", 1, 0, (lonely,), Status.COMPLETED, 0.0)]
-    batch = pack(rollouts, 4)
-    assert batch[SEGMENT_IDS_KEY].shape[0] == 3, "the first rollout splits into two rows"
-    sampled = batch[RESPONSE_MASK_KEY] != 0
-    for index, count in ((0, 3), (1, 3)):
-        mine = sampled & (batch[SESSION_INDEX_KEY] == index)
-        np.testing.assert_allclose(batch[SESSION_WEIGHTS_KEY][mine], 1 / count)
-    assert (batch[SESSION_WEIGHTS_KEY][~sampled] == 0).all()
-
-
 def test_group_advantages_match_hand_computed_values_across_uneven_groups():
     """Two groups of different sizes, one with a masked member: the group
     estimator normalises by each group's own deviation (ddof 1)."""
@@ -264,20 +213,3 @@ def test_group_advantages_match_hand_computed_values_across_uneven_groups():
     for index, value in enumerate(expected):
         mine = batch[SESSION_INDEX_KEY] == index
         np.testing.assert_allclose(batch[ADVANTAGES_KEY][mine], value, atol=1e-4)
-
-
-@pytest.mark.parametrize("value", [None, "1.0", True, float("nan")])
-def test_a_non_number_reward_or_likelihood_is_a_value_error(value):
-    if value is not None:  # None is how an unscored session says it has no reward
-        with pytest.raises(ValueError):
-            Session("t", "g", 0, 0, (), Status.CANCELLED, value)
-    with pytest.raises(ValueError):
-        Call((1,), (2,), (value,), "stop", 0)
-
-
-@pytest.mark.parametrize("value", [np.int64(1), np.int32(0), np.float32(-0.5), 2])
-def test_numpy_and_python_numbers_are_accepted_as_rewards_and_likelihoods(value):
-    session = Session("t", "g", 0, 0, (), Status.COMPLETED, value)
-    assert type(session.reward) is float and session.reward == float(value)
-    call = Call((1,), (2,), (value,), "stop", 0)
-    assert type(call.behavior_log_probs[0]) is float

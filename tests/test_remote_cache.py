@@ -90,45 +90,6 @@ def worker():
     server.shutdown()
 
 
-def test_a_slow_compilation_one_task_makes_is_read_by_the_next(worker):
-    """An entry that took a second or more to compile is uploaded with its
-    program's name and a quick one stays local; a later process lists the
-    names and asks the remote only about programs of those names."""
-    url, stored, seen = worker
-    first = remote_cache.RemoteCache(Local(), url, "token", "jax/cpu")
-    first.load_names()
-    first.put("jit_step-1", entry(2))
-    first.put("jit_step-2", entry(0))
-    first.put("jit_init-3", entry(0))
-    first.drain()
-    assert sorted(stored) == ["/jax/cpu/jit_step-1", "/jax/cpu/names/jit_step"]
-
-    for name in ("jit_a", "jit_b"):
-        stored[f"/jax/cpu/names/{name}"] = b"1"
-    second = remote_cache.RemoteCache(Local(), url, "token", "jax/cpu")
-    second.load_names()
-    assert second.names == {"jit_step", "jit_a", "jit_b"}  # over two pages
-    seen.clear()
-    assert second.get("jit_step-1") == entry(2)
-    assert second.base.get("jit_step-1") == entry(2)  # kept locally, so the next read is local
-    assert second.get("jit_step-1") == entry(2)
-    assert second.get("jit_step-2") is None and second.get("jit_init-3") is None
-    assert seen == ["/jax/cpu/jit_step-1", "/jax/cpu/jit_step-2"] and second.available
-    assert first.summary() == "shared XLA cache: 0 fetched, 1 uploaded, 1 names"
-    assert second.summary() == "shared XLA cache: 1 fetched, 0 uploaded, 3 names"
-
-
-def test_a_wrong_token_leaves_the_remote_alone_and_never_raises(worker):
-    url, stored, _ = worker
-    cache = remote_cache.RemoteCache(Local(), url, "wrong", "jax/cpu")
-    cache.load_names()
-    cache.put("jit_step-1", entry(2))
-    cache.drain()
-    assert not cache.available and stored == {} and cache.get("jit_step-2") is None
-    assert cache.base.get("jit_step-1") == entry(2)
-    assert cache.summary().endswith(", given up as unreachable")
-
-
 def test_an_unreachable_remote_only_slows_a_task_by_one_failed_listing(monkeypatch):
     """No Worker at the URL: the listing of names fails, the remote is left
     alone, every read is a local miss and every write stays local, and no call

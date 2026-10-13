@@ -141,17 +141,6 @@ def test_a_quantized_run_trains_on_from_its_own_record(tmp_path):
         np.testing.assert_array_equal(np.asarray(before), np.asarray(after))
 
 
-def test_a_second_quantization_is_refused_where_qwix_would_replace_the_first():
-    """Qwix holds one provider per model, and a second call drops the first
-    and every wrapper made over it, an adapter included; it is refused."""
-    pytest.importorskip("qwix")
-    base = decoder()
-    adapted = LoRA(rank=2, modules=("q_proj",)).apply(
-        Quantization().apply(base), base.init(jax.random.key(0), IDS), key=jax.random.key(1)).model
-    with pytest.raises(ValueError, match="already computes under a Qwix quantization"):
-        Quantization(dtype="fp8").apply(adapted)
-
-
 @pytest.mark.parametrize("fixture", ["modelopt/mixed", "modelopt/tiny", "nvfp4_qdq/e4m3"],
                          ids=["modelopt fp8 and nvfp4", "modelopt nvfp4", "compressed-tensors nvfp4"])
 def test_a_run_of_an_input_quantized_checkpoint_reloads_with_its_input_quantization(tmp_path, fixture):

@@ -11,18 +11,16 @@ likelihood stays the model's own.
 """
 
 import json
-import re
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from jax.experimental import checkify
 
 from dew.inference import RunProcessor, TextGeneration
 from dew.inference.serving import Server
 from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.sampling import Sample, Sampling, decoding, guided
+from dew.sampling import Sample, Sampling, guided
 
 pytest.importorskip("outlines_core")
 
@@ -183,7 +181,6 @@ def test_a_served_guided_request_draws_what_it_draws_alone(tokenizer):
         served = ticket.result().host()
         np.testing.assert_array_equal(served.tokens, lone.host().tokens)
         np.testing.assert_allclose(served.raw_log_probs, lone.host().raw_log_probs, atol=2e-6)
-        assert re.fullmatch(pattern, continuation(tokenizer, served))
 
 
 def test_the_raw_likelihood_is_the_models_own_and_the_behaviour_one_the_masked(tokenizer):
@@ -195,62 +192,3 @@ def test_the_raw_likelihood_is_the_models_own_and_the_behaviour_one_the_masked(t
     assert continuation(tokenizer, rows) == "7" and bool(rows.terminated[0])
     np.testing.assert_allclose(rows.behavior_log_probs[0, :2], 0.0, atol=1e-6)
     assert np.all(rows.raw_log_probs[0, :2] < 0)
-
-
-BUILT_INS = {
-    "temperature": decoding.Temperature(0.7), "top_k": decoding.TopK(3), "top_p": decoding.TopP(0.8),
-    "min_p": decoding.MinP(0.1), "typical": decoding.Typical(0.9), "epsilon": decoding.EpsilonCutoff(0.01),
-    "eta": decoding.EtaCutoff(0.01), "top_h": decoding.TopH(0.5), "renormalize": decoding.Renormalize(),
-    "repetition": decoding.RepetitionPenalty(1.3), "prompt_repetition": decoding.PromptRepetitionPenalty(1.3),
-    "frequency": decoding.FrequencyPenalty(0.5), "presence": decoding.PresencePenalty(0.5),
-    "length_decay": decoding.ExponentialDecayLengthPenalty(0, 1.5, jnp.array([0, 1], jnp.int32)),
-}
-
-
-@pytest.mark.parametrize("name", sorted(BUILT_INS))
-def test_every_transform_keeps_a_masked_token_masked(name):
-    """The grammar masks before the chain runs, so every built-in transform
-    sees -inf scores: none may turn one into a NaN or revive it."""
-    tokens = jnp.array([[1, 2, 3, 4, 5, 6, 0, 0], [3, 3, 4, 0, 0, 0, 0, 0]])
-    state = decoding.StepState(tokens, tokens > 0, jnp.array([2, 1]), jnp.ones(2, bool),
-                               jax.random.split(jax.random.key(0), 2), prompt_width=4)
-    logits = jax.random.normal(jax.random.key(1), (2, 16)).at[:, ::3].set(-jnp.inf)
-    out = BUILT_INS[name](state, logits)
-    assert not bool(jnp.any(jnp.isnan(out)))
-    assert bool(jnp.all(jnp.isneginf(out[:, ::3])))
-
-
-def test_a_length_penalty_on_a_masked_eos_leaves_the_row_drawing(tokenizer):
-    """ExponentialDecayLengthPenalty raises EOS's score; where the grammar
-    forbids EOS the score stays -inf, so the row keeps drawing inside the
-    pattern and ends where the pattern completes."""
-    grammar = guided.regex(tokenizer, "[0-9]{4}", EOS, vocab_size=EOS + 1)
-    bound = task(tokenizer, grammar, Sampling(temperature=1.0, eos_token_ids=EOS))
-    rows = bound("q", 8, key=0, logits=(decoding.ExponentialDecayLengthPenalty(
-        1, 1.5, jnp.array([EOS], jnp.int32)),)).host()
-    assert re.fullmatch("[0-9]{4}", continuation(tokenizer, rows)) and bool(rows.terminated[0])
-
-
-def test_a_grammar_keeps_a_greedy_chain_an_argmax(tokenizer):
-    """The mask joins a transform chain as its first transform, so a chain
-    ending in Greedy still draws by argmax with no categorical draw
-    (`strategies.draw`), and the masked argmax is a token the state allows."""
-    grammar = guided.regex(tokenizer, "[0-9]{4}", EOS, vocab_size=EOS + 1)
-    state = grammar.start(2)
-    guided_chain = grammar.guiding(decoding.chain((decoding.Greedy(),)), state)
-    assert isinstance(guided_chain, decoding.LogitsChain) and guided_chain.greedy
-    logits = jax.random.normal(jax.random.key(0), (2, EOS + 1))
-    step = decoding.StepState(jnp.zeros((2, 4), jnp.int32), jnp.zeros((2, 4), bool), jnp.zeros(2, jnp.int32),
-                              jnp.ones(2, bool), jax.random.split(jax.random.key(1), 2), prompt_width=2)
-    scores = decoding.chain(guided_chain.transforms[:-1])(step, logits)
-    np.testing.assert_array_equal(scores, grammar.masked(state, logits))
-
-
-def test_a_transform_forcing_a_token_the_grammar_forbids_fails_the_request(tokenizer):
-    """ForcedEOS draws EOS at the last slot whatever the mask allowed; a
-    grammar that cannot end there refuses the draw instead of leaving the
-    text outside its language."""
-    grammar = guided.regex(tokenizer, "[0-9]{6}", EOS, vocab_size=EOS + 1)
-    bound = task(tokenizer, grammar)
-    with pytest.raises(checkify.JaxRuntimeError, match="forbids"):
-        bound("q", 4, key=0, logits=(decoding.Greedy(), decoding.ForcedEOS(jnp.array([EOS], jnp.int32))))

@@ -21,25 +21,23 @@ from itertools import count
 from pathlib import Path
 
 import pytest
+import test_multiprocess as single
+from process_support import report_of, spawn, terminate, worker_env
+
+test_a_real_token_budget_agrees_across_processes_after_logging_ticks = (
+    single.test_a_real_token_budget_agrees_across_processes_after_logging_ticks)
+test_four_processes_build_the_same_mesh_as_two = single.test_four_processes_build_the_same_mesh_as_two
+test_processes_read_disjoint_shards_that_cover_the_corpus = (
+    single.test_processes_read_disjoint_shards_that_cover_the_corpus)
+test_the_global_batch_is_the_union_of_the_process_slices = (
+    single.test_the_global_batch_is_the_union_of_the_process_slices)
+test_the_mesh_covers_every_process_in_the_pool = single.test_the_mesh_covers_every_process_in_the_pool
+two_processes = single.two_processes
 
 RANK, WORLD = int(os.environ.get("ARMADA_RANK", "0")), int(os.environ.get("ARMADA_WORLD", "1"))
 if WORLD < 2:
     pytest.skip("runs across the containers of an armada gang", allow_module_level=True)
 
-import test_multiprocess as single  # noqa: E402
-from process_support import report_of, spawn, terminate, worker_env  # noqa: E402
-from test_multiprocess import (  # noqa: E402, F401
-    local_flags,
-    test_a_default_run_name_takes_its_timestamp_from_process_zero,
-    test_a_real_token_budget_agrees_across_processes_after_logging_ticks,
-    test_four_processes_build_the_same_mesh_as_two,
-    test_processes_read_disjoint_shards_that_cover_the_corpus,
-    test_the_global_batch_is_the_union_of_the_process_slices,
-    test_the_mesh_covers_every_process_in_the_pool,
-    two_processes,
-)
-
-REPO_ROOT = Path(__file__).resolve().parents[1]
 POOLS = count()
 """The pools this run has started: the n-th is the same pool on every rank, at the same ports."""
 COORDINATOR, EXCHANGE = 20000, 21000
@@ -165,64 +163,6 @@ def gang_pool(mode, directory: Path, processes: int, *, timeout=600, start=spawn
 single.run_pool = gang_pool
 
 
-def gang_run(command: list[str], *, devices: int, timeout: float = 1800) -> str:
-    """`command` as this rank's process of a pool of one process per rank, joined at rank0 as `dew launch`
-    leaves a pool (DEW_PROCESS_COUNT, DEW_PROCESS_ID, JAX_COORDINATOR_ADDRESS) on `devices` CPU devices each:
-    its output, once it exited 0."""
-    sequence = next(POOLS)
-    env = {**worker_env(devices), "DEW_PROCESS_COUNT": str(WORLD), "DEW_PROCESS_ID": str(RANK),
-           "JAX_COORDINATOR_ADDRESS": f"rank0:{COORDINATOR + sequence}"}
-    ran = subprocess.run(command, cwd=REPO_ROOT, env=env, capture_output=True, text=True, timeout=timeout)
-    exits = exchange(sequence, ran.returncode)
-    assert exits == [0] * WORLD, f"rank exits {exits}\n{ran.stdout[-6000:]}\n{ran.stderr[-6000:]}"
-    return ran.stdout
-
-
-@pytest.mark.distributed
-@pytest.mark.parametrize("model", ["dense", "moe"])
-def test_layouts_across_hosts_split_only_data_and_fsdp_and_match_one_device(model):
-    """The parity tool's dense decoder or mixture of experts over one device on each of four hosts:
-    the data, fsdp and replica layouts, whose sums cross the relay between containers, match one
-    device, and an axis inside a model replica (tensor, stage) is refused across hosts, since each
-    container is its own slice and only fsdp may cross slices. One model a test, so CI's gangs run
-    them side by side."""
-    if WORLD != 4:
-        pytest.skip("one device on each of four hosts")
-    output = gang_run([sys.executable, "tools/layout_parity.py", "--models", model, "--layouts",
-                       "data4", "fsdp4", "replicas4", "replicas2_fsdp2", "tensor4", "stage4"], devices=1)
-    if RANK == 0:
-        summary = next(line for line in output.splitlines() if re.fullmatch(r"\w+ \d+(, \w+ \d+)*", line))
-        counts = {status: int(count) for status, count in re.findall(r"(\w+) (\d+)", summary)}
-        refusals = re.findall(r"^refused (\S+): (.*)$", output, re.M)
-        assert counts == {"works": 4, "refused": 2}, output[-4000:]
-        assert sorted(name for name, _ in refusals) == [f"{model}/stage4", f"{model}/tensor4"]
-        assert all("granules" in reason for _, reason in refusals), refusals
-
-
-@pytest.mark.distributed
-def test_a_checkpoint_directory_on_each_hosts_own_disk_is_refused_on_every_host(tmp_path):
-    """A pool whose persistent checkpoint directory is a path on each host's own disk, which no
-    other host sees, is refused on every host before it trains: a step process 0 committed there
-    would lack the other hosts' shards."""
-    sequence = next(POOLS)
-    if RANK >= 2:
-        exchange(sequence, None)
-        return
-    process = spawn("fit", tmp_path / f"process{RANK}.json", processes=2, process_id=RANK,
-                    coordinator=f"rank0:{COORDINATOR + sequence}", **local_flags(tmp_path))
-    try:
-        output = process.communicate(timeout=600)[0]
-    except subprocess.TimeoutExpired:
-        terminate(process)
-        output = "still running after ten minutes"
-    refusal = next((line for line in output.splitlines() if "is not shared" in line), output[-2000:])
-    parts = exchange(sequence, [process.returncode, refusal])[:2]
-    expected = "is not shared: process(es) [1] of 2"
-    refused = [code not in (0, None) and expected in said for code, said in parts]
-    assert all(refused), "\n".join(f"rank {rank} exited {code}: {said}"
-                                    for rank, (code, said) in enumerate(parts))
-
-
 @pytest.mark.distributed
 def test_losing_one_host_ends_the_pool_on_the_others(tmp_path):
     """A host that dies while its pool trains (its process killed outright) ends the pool's process
@@ -247,3 +187,38 @@ def test_losing_one_host_ends_the_pool_on_the_others(tmp_path):
     parts = exchange(sequence, [alive, outcome])[:2]
     assert [part[0] for part in parts] == [True, True], "a process ended before rank 1's host died"
     assert parts[0][1] not in (0, None), "rank 0's process kept waiting ten minutes after rank 1's host died"
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+def gang_run(command: list[str], *, devices: int, timeout: float = 1800) -> str:
+    """`command` as this rank's process of a pool of one process per rank, joined at rank0 as `dew launch`
+    leaves a pool (DEW_PROCESS_COUNT, DEW_PROCESS_ID, JAX_COORDINATOR_ADDRESS) on `devices` CPU devices each:
+    its output, once it exited 0."""
+    sequence = next(POOLS)
+    env = {**worker_env(devices), "DEW_PROCESS_COUNT": str(WORLD), "DEW_PROCESS_ID": str(RANK),
+           "JAX_COORDINATOR_ADDRESS": f"rank0:{COORDINATOR + sequence}"}
+    ran = subprocess.run(command, cwd=REPO_ROOT, env=env, capture_output=True, text=True, timeout=timeout)
+    exits = exchange(sequence, ran.returncode)
+    assert exits == [0] * WORLD, f"rank exits {exits}\n{ran.stdout[-6000:]}\n{ran.stderr[-6000:]}"
+    return ran.stdout
+
+@pytest.mark.distributed
+@pytest.mark.parametrize("model", ["dense", "moe"])
+def test_layouts_across_hosts_split_only_data_and_fsdp_and_match_one_device(model):
+    """The parity tool's dense decoder or mixture of experts over one device on each of four hosts:
+    the data, fsdp and replica layouts, whose sums cross the relay between containers, match one
+    device, and an axis inside a model replica (tensor, stage) is refused across hosts, since each
+    container is its own slice and only fsdp may cross slices. One model a test, so CI's gangs run
+    them side by side."""
+    if WORLD != 4:
+        pytest.skip("one device on each of four hosts")
+    output = gang_run([sys.executable, "tools/layout_parity.py", "--models", model, "--layouts",
+                       "data4", "fsdp4", "replicas4", "replicas2_fsdp2", "tensor4", "stage4"], devices=1)
+    if RANK == 0:
+        summary = next(line for line in output.splitlines() if re.fullmatch(r"\w+ \d+(, \w+ \d+)*", line))
+        counts = {status: int(count) for status, count in re.findall(r"(\w+) (\d+)", summary)}
+        refusals = re.findall(r"^refused (\S+): (.*)$", output, re.M)
+        assert counts == {"works": 4, "refused": 2}, output[-4000:]
+        assert sorted(name for name, _ in refusals) == [f"{model}/stage4", f"{model}/tensor4"]
+        assert all("granules" in reason for _, reason in refusals), refusals

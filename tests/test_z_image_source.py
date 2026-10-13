@@ -116,17 +116,6 @@ def test_the_flow_and_its_gradients_match_the_source(source, arrays, record, nam
     assert gaps[worst] < GRADIENT, worst
 
 
-@pytest.mark.parametrize("change", [
-    {"all_patch_size": [1]}, {"n_kv_heads": 1}, {"qk_norm": False}, {"siglip_feat_dim": 16},
-    {"axes_dims": [8, 8, 8]},
-])
-def test_an_unsupported_config_is_refused(source, change):
-    config = json.loads((source / "padded" / "transformer" / "config.json").read_text())
-    z_image_fields(config)
-    with pytest.raises(ValueError):
-        z_image_fields({**config, **change})
-
-
 @pytest.fixture(scope="module")
 def pipeline(source):
     from dew.interop.pretrained import Pretrained

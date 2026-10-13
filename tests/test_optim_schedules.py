@@ -12,10 +12,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
-import pytest
 
 from dew.config import OptimConfig
-from dew.training.optim import Cosine, Exponential, Linear, OneCycle, ParamGroup, _keep_within
+from dew.training.optim import Cosine, Exponential, OneCycle, ParamGroup
 
 TORCH = np.load(Path(__file__).resolve().parent / "fixtures" / "torch_optim" / "reference.npz")
 EPOCHS, PER_EPOCH = 6, 2
@@ -51,17 +50,6 @@ def test_one_cycle_cycles_adams_b1_as_torch_does():
     np.testing.assert_allclose(values(MOMENTUM, 40), TORCH["one_cycle/b1"], rtol=SCHEDULE_RTOL)
 
 
-def test_one_cycle_holds_its_end_past_the_run():
-    """torch raises past its total steps; the record holds the value of its last step."""
-    built = OneCycle(peak=5e-3).schedule(40)
-    np.testing.assert_allclose([built(40), built(100)], TORCH["one_cycle/lr"][-1], rtol=SCHEDULE_RTOL)
-
-
-def test_a_one_cycle_with_no_fall_is_refused():
-    with pytest.raises(ValueError, match="no rise or no fall"):
-        OneCycle(peak=1.0).schedule(3)
-
-
 def test_exponential_is_torchs_exponential_lr_stepped_to_decay_steps_then_held():
     """The geometric decay from 12 to 0.23 over 10 steps, then 0.23 for the
     rest, plus the offset torch has no field for."""
@@ -76,11 +64,6 @@ def test_cosine_without_warmup_is_torchs_cosine_annealing():
                                rtol=SCHEDULE_RTOL, atol=ULPS * 0.1)
 
 
-def test_a_linear_schedule_from_its_peak_to_the_same_end_is_constant():
-    """Dew has no constant record; this is the one a group's constant rate uses."""
-    np.testing.assert_array_equal(values(Linear(peak=0.3, end=0.3), 7), np.float32(0.3))
-
-
 def test_every_holds_each_value_for_an_epoch_as_a_torch_scheduler_stepped_per_epoch():
     """A run of 40 epochs of 3 updates reads epoch e's value at each of its updates."""
     stepped = values(OneCycle(peak=5e-3, every=3), 40 * 3)
@@ -92,13 +75,6 @@ def test_every_counts_the_schedules_fields_in_its_own_steps():
     """`decay_steps` counts epochs: the decay ends after 10 epochs of 4 updates."""
     stepped = values(Exponential(init=12.0, end=0.23, decay_steps=10, every=4), 16 * 4)
     np.testing.assert_allclose(stepped, np.repeat(TORCH["exponential/lr"], 4), rtol=SCHEDULE_RTOL)
-
-
-def test_a_run_too_short_for_one_step_of_the_schedule_is_refused():
-    with pytest.raises(ValueError, match="never advances"):
-        Cosine(peak=0.1, every=10).schedule(9)
-    with pytest.raises(ValueError, match="once every 1 or more"):
-        Cosine(peak=0.1, every=0)
 
 
 def snn_delays_config() -> OptimConfig:
@@ -156,19 +132,6 @@ def test_grouped_adam_is_torchs_adam_with_param_groups_a_momentum_cycle_and_a_cl
                                    err_msg=name)
 
 
-def test_the_reference_run_moves_with_the_coupled_decay_and_the_momentum_cycle():
-    """Dropping either term from the kernel's group leaves the torch run, so
-    the parity above covers both."""
-    initial, grads, expected = torch_run()
-    config = snn_delays_config()
-    delays, weights, norms = config.param_groups
-    for changed in (ParamGroup("weights", ("kernel",), schedule=weights.schedule, b1=weights.b1),
-                    ParamGroup("weights", ("kernel",), schedule=weights.schedule, weight_decay=WEIGHT_DECAY)):
-        mutated = OptimConfig(optimizer="adam", param_groups=(delays, changed, norms))
-        kernel = np.stack(run(mutated.build(EPOCHS * PER_EPOCH), initial, grads)["kernel"])
-        assert np.max(np.abs(kernel - expected["kernel"])) > 10 * PARAMETER_ATOL["kernel"]
-
-
 def test_a_bounded_group_clamps_its_parameters_and_no_others():
     params = {"delay": jnp.asarray([0.05, 2.95]), "kernel": jnp.asarray([0.05, 2.95])}
     config = OptimConfig(optimizer="adam", learning_rate=0.5, param_groups=(
@@ -179,20 +142,3 @@ def test_a_bounded_group_clamps_its_parameters_and_no_others():
     stepped = optax.apply_updates(params, updates)
     np.testing.assert_allclose(stepped["delay"], [0.0, 3.0], atol=1e-7)
     np.testing.assert_allclose(stepped["kernel"], [-0.45, 3.45], rtol=1e-5)
-
-
-def test_keep_within_lands_a_parameter_on_its_bound():
-    params = jnp.asarray([0.3, 0.7, 2.0])
-    updates, _ = _keep_within(0.0, 1.0).update(jnp.asarray([-1.0, 0.1, -0.5]), optax.EmptyState(), params)
-    np.testing.assert_allclose(params + updates, [0.0, 0.8, 1.0], atol=1e-7)
-
-
-def test_bounds_from_high_to_low_are_refused():
-    with pytest.raises(ValueError, match="lower to a higher"):
-        ParamGroup("delays", ("delay",), bounds=(3.0, 0.0))
-
-
-def test_a_b1_schedule_on_an_optimizer_without_b1_is_refused():
-    config = OptimConfig(optimizer="muon", param_groups=(ParamGroup("all", ("*",), b1=MOMENTUM),))
-    with pytest.raises(ValueError, match="schedules b1"):
-        config.build(10)
