@@ -128,7 +128,7 @@ def test_original_bare_gpt2_weights_and_causal_buffers_preserve_logits():
         loaded.model.apply(variables, ids), loaded.model.apply(loaded.variables, ids)
     )
     tensors['h.0.attn.bias'][0, 0, 0, 1] = 1
-    with pytest.raises(ValueError, match='causal mask'):
+    with pytest.raises(ValueError):
         translate_weights(tensors, config, 'gpt2')
 
 

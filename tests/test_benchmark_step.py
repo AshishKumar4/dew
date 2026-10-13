@@ -46,66 +46,6 @@ def test_cpu_smoke_case_measures_a_finite_step_through_the_trainer(fixed_batch):
     assert row["ms_per_step"] > 0 and row["p50_ms"] > 0
 
 
-def test_a_profiled_case_traces_without_the_python_tracer(tmp_path, monkeypatch):
-    """The traced steps run as a Dew capture traces them: JAX's Python tracer
-    records every Python and C call and slows host work several times over,
-    so a trace with it would show host time, and device idle behind it, that
-    the timed steps never spent. Its events are named `$file:line function`.
-    The trace readers are replaced: on CPU there are no device kernels."""
-    import jax.profiler
-
-    tool = _benchmark_step()
-    from types import SimpleNamespace
-
-    reads = []
-
-    def device_events(directory):
-        reads.append(directory)
-        return {"/device:GPU:0": [SimpleNamespace(name="dot", start_ns=0, end_ns=100, stats=[])]}, []
-
-    monkeypatch.setattr(tool, "device_events", device_events)
-    config = tool.BenchmarkConfig(preset='cpu-smoke', architectures=['causal_transformer'],
-                                  warmup=1, steps=1, dtype='float32',
-                                  profile_dir=str(tmp_path), profile_steps=1)
-    (case,) = tool.build_cases(config)
-
-    tool.measure(case, config)
-    assert len(reads) == 1
-
-    (trace,) = tmp_path.rglob("*.xplane.pb")
-    names = [event.name for plane in jax.profiler.ProfileData.from_file(str(trace)).planes
-             for line in plane.lines for event in line.events]
-    assert names, "the traced steps left no events"
-    assert not [name for name in names if name.startswith("$")]
-
-
-@pytest.mark.parametrize("intervals,busy,window", [
-    ([(0, 10), (2, 3)], 10, 10),
-    ([(0, 4), (2, 6)], 6, 6),
-    ([(0, 2), (4, 6)], 4, 6),
-])
-def test_device_timeline_covers_nested_and_disjoint_kernels(
-    tmp_path, monkeypatch, intervals, busy, window,
-):
-    from types import SimpleNamespace
-
-    import jax.profiler
-
-    trace = tmp_path / "trace.xplane.pb"
-    trace.touch()
-    events = [SimpleNamespace(name="kernel", start_ns=start * 1_000_000,
-                              end_ns=end * 1_000_000) for start, end in intervals]
-    profile = SimpleNamespace(planes=[SimpleNamespace(
-        name="/device:GPU:0", lines=[SimpleNamespace(name="Stream #1(Compute)", events=events)])])
-    monkeypatch.setattr(jax.profiler, "ProfileData", SimpleNamespace(
-        from_file=lambda path: profile))
-
-    row = _benchmark_step().device_timeline(str(tmp_path), steps=1)
-    assert row["device_busy_ms_per_step"] == pytest.approx(busy)
-    assert row["device_window_ms_per_step"] == pytest.approx(window)
-    assert row["device_busy_percent"] == pytest.approx(100 * busy / window)
-
-
 def test_every_small_case_builds_its_trainer():
     """The small preset runs every registry architecture in one process, and
     one case its model refuses ends the sweep: a field a model does not

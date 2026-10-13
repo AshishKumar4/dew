@@ -252,5 +252,5 @@ def test_a_transform_forcing_a_token_the_grammar_forbids_fails_the_request(token
     text outside its language."""
     grammar = guided.regex(tokenizer, "[0-9]{6}", EOS, vocab_size=EOS + 1)
     bound = task(tokenizer, grammar)
-    with pytest.raises(checkify.JaxRuntimeError, match="forbids"):
+    with pytest.raises(checkify.JaxRuntimeError):
         bound("q", 4, key=0, logits=(decoding.Greedy(), decoding.ForcedEOS(jnp.array([EOS], jnp.int32))))

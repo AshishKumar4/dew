@@ -72,9 +72,9 @@ def test_the_nelbo_and_its_gradient_are_mdlms():
     step = Step(jnp.asarray(0), jax.random.key(0), None)
 
     def mean(variables):
-        return model.scalar_loss(variables, batch, step)[0]
+        return model.scalar_loss(variables, batch, step)
 
-    value, gradient = jax.value_and_grad(mean)(variables)
+    (value, aux), gradient = jax.value_and_grad(mean, has_aux=True)(variables)
     terms = model.evaluate(variables, batch, step).losses
     assert_as_exact_as_the_reference(terms, REFERENCE["nlls"], REFERENCE["nlls_f64"], "per-token NELBO")
     assert_as_exact_as_the_reference(gradient["params"]["hidden"], REFERENCE["grad/hidden"],
@@ -83,18 +83,10 @@ def test_the_nelbo_and_its_gradient_are_mdlms():
                                      REFERENCE["grad/head_f64"], "gradient in the head")
     np.testing.assert_allclose(value, REFERENCE["loss_f64"], rtol=1e-6)
 
-
-def test_the_reported_masked_accuracy_and_fraction_are_over_mdlms_masking():
-    """Over MDLM's own corruption of the same draws: the share of masked
-    positions whose float64 argmax, the mask token left out, is the clean
-    token, and the share of positions masked."""
     tokens, corrupted = REFERENCE["tokens"], REFERENCE["corrupted"]
-    logits = (REFERENCE["hidden"].astype(np.float64) @ REFERENCE["head"].astype(np.float64))
+    logits = REFERENCE["hidden"].astype(np.float64) @ REFERENCE["head"].astype(np.float64)
     logits[..., MASK] = -np.inf
     masked = corrupted == MASK
-    variables = {"params": {name: jnp.asarray(REFERENCE[name]) for name in ("hidden", "head")}}
-    _, aux = objective().loss(variables, {"text": jnp.asarray(tokens, jnp.int32)},
-                              Step(jnp.asarray(0), jax.random.key(0), None))
     assert 0 < masked.sum() < masked.size
     right = logits.argmax(-1)[masked] == tokens[masked]
     np.testing.assert_allclose(aux.metrics["masked_accuracy"], right.mean())

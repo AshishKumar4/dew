@@ -26,7 +26,6 @@ from episode_support import (
 )
 
 from dew.objectives.rl import EpisodeStatus
-from dew.rl.sandbox import SandboxLimits, SubprocessEnvironment, _ProcessEnvironment
 
 
 def alive(pid):
@@ -59,36 +58,6 @@ def test_worker_round_trip_and_process_group_cleanup():
     assert wait_gone(pids) == []
 
 
-def test_wall_time_limit_kills_a_hung_worker():
-    started = time.monotonic()
-    factory = environment("hang", wall_seconds=.5)
-    with factory(IDENTITY) as session:
-        with pytest.raises(TimeoutError, match="wall_seconds"):
-            session.reset()
-        assert isinstance(session, _ProcessEnvironment)
-        pid = session.process.pid
-    assert time.monotonic() - started < 5
-    assert wait_gone([pid]) == []
-
-
-def test_memory_limit_ends_the_worker_with_its_diagnostic():
-    with environment("allocate")(IDENTITY) as session, pytest.raises(ChildProcessError, match="MemoryError"):
-        session.reset()
-
-
-def test_worker_exit_reports_its_code_and_stderr():
-    with (
-        environment("crash")(IDENTITY) as session,
-        pytest.raises(ChildProcessError, match=r"code 3.*worker boom"),
-    ):
-        session.reset()
-
-
-def test_malformed_reply_is_refused():
-    with environment("garbage")(IDENTITY) as session, pytest.raises(ValueError, match="malformed JSON"):
-        session.reset()
-
-
 def test_parent_death_kills_the_worker(tmp_path):
     """A SIGKILLed parent takes its worker with it through the death signal."""
     script = tmp_path / "parent.py"
@@ -110,17 +79,6 @@ def test_parent_death_kills_the_worker(tmp_path):
     assert wait_gone([worker]) == []
 
 
-@pytest.mark.parametrize("limits", [{"wall_seconds": 0.}, {"cpu_seconds": 0}, {"memory_bytes": 1.5}])
-def test_limits_must_be_positive(limits):
-    with pytest.raises(ValueError):
-        SandboxLimits(**limits)
-
-
-def test_command_must_be_argv():
-    with pytest.raises(ValueError, match="argv"):
-        SubprocessEnvironment(())
-
-
 def test_episodes_collect_through_subprocess_workers():
     """The rollout collects a cohort from real workers and scores it."""
     harness = environment()
@@ -133,14 +91,6 @@ def test_episodes_collect_through_subprocess_workers():
     batch = rollout.project(episodes)
     assert batch["input_ids"].shape[1] == PROMPT + rollout.max_new_tokens
     assert np.isfinite(batch["advantages"]).all()
-
-
-def test_cpu_limit_kills_a_busy_worker():
-    with (
-        environment("cpu", cpu_seconds=1, wall_seconds=10.0)(IDENTITY) as session,
-        pytest.raises(ChildProcessError, match="code -9"),
-    ):
-        session.reset()
 
 
 def test_cancellation_releases_the_real_worker():

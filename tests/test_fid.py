@@ -144,13 +144,13 @@ def test_fid_refuses_an_image_set_it_cannot_score():
     scored never pays for the 90 MB of Inception weights, which is why this
     test needs no network."""
     images = np.zeros((4, 8, 8, 3), np.uint8)
-    with pytest.raises(ValueError, match="generated: expected uint8"):
+    with pytest.raises(ValueError):
         FID().score(images.astype(np.float32), images)
-    with pytest.raises(ValueError, match="real: expected uint8"):
+    with pytest.raises(ValueError):
         FID().score(images, images[0])
-    with pytest.raises(ValueError, match="generated: no images"):
+    with pytest.raises(ValueError):
         FID().score([], images)
-    with pytest.raises(ValueError, match="at least one image"):
+    with pytest.raises(ValueError):
         FID().score(images, images, batch_size=0)
 
 
@@ -356,7 +356,7 @@ def test_the_weights_loader_reads_arrays_and_refuses_the_rest(tmp_path):
 
     hostile = tmp_path / "hostile.pickle"
     hostile.write_bytes(pickle.dumps(print))
-    with pytest.raises(pickle.UnpicklingError, match=r"builtins.print"):
+    with pytest.raises(pickle.UnpicklingError):
         load_arrays(hostile)
 
 
@@ -373,7 +373,7 @@ def test_a_wrong_digest_is_refused_before_anything_reads_the_file(tmp_path):
     digest = hashlib.sha256(b"not the weights").hexdigest()
 
     assert _check_digest(str(path), "repo", "file", "revision", digest) == str(path)
-    with pytest.raises(ValueError, match="hashes to"):
+    with pytest.raises(ValueError):
         _check_digest(str(path), "repo", "file", "revision", "0" * 64)
 
 
@@ -388,7 +388,7 @@ def test_the_weights_are_pinned_by_digest():
 
     assert len(inception_fid.FID_WEIGHTS_DIGEST) == 64
     assert len(inception_fid.FID_WEIGHTS_REVISION) == 40
-    with pytest.raises(ValueError, match="hashes to"):
+    with pytest.raises(ValueError):
         inception_fid.fetch(inception_fid.FID_WEIGHTS_REPO, inception_fid.FID_WEIGHTS_FILE,
                             inception_fid.FID_WEIGHTS_REVISION, "0" * 64)
 

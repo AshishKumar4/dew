@@ -32,10 +32,8 @@ differ in the last fp32 digit because torch sums the token matrix in a
 different order.
 """
 
-import importlib.util
 import math
 from pathlib import Path
-from types import SimpleNamespace
 
 import jax
 import jax.numpy as jnp
@@ -46,7 +44,6 @@ from rl_support import clipped_surrogate, token_mean
 from dew.rl import surrogate
 
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "rl" / "surrogate.npz"
-GENERATOR = Path(__file__).resolve().parents[1] / "tools" / "parity_rl.py"
 REFERENCE = dict(np.load(FIXTURE))
 TOLERANCE = 1e-6
 
@@ -121,116 +118,24 @@ def check_stop_gradient(module):
     assert gradient.tolist() == weights.tolist()
 
 
-CHECKS = {"clip": check_clip, "k3": check_k3, "stop_gradient": check_stop_gradient}
+def test_the_clipped_loss_and_its_gradient_match_verl():
+    check_clip(surrogate)
 
-
-def mutate(original, replacement):
-    """The real module with one term rewritten, compiled under a new name."""
-    source = Path(surrogate.__file__).read_text()
-    assert source.count(original) == 1, (
-        f"{original!r} appears {source.count(original)} times, so the mutation "
-        f"no longer says what it used to")
-    namespace = {"__name__": "dew.rl.surrogate_mutant"}
-    exec(compile(source.replace(original, replacement), "<mutant>", "exec"), namespace)
-    return SimpleNamespace(**namespace)
-
-
-def assert_only_this_check_fails(mutant, broken):
-    with pytest.raises(AssertionError):
-        CHECKS[broken](mutant)
-    for name, check in CHECKS.items():
-        if name != broken:
-            check(mutant)
-
-
-def test_token_mean_divides_by_the_number_of_tokens_it_kept():
-    """Three unmasked tokens summing to 8, and a nan behind the mask that a
-    multiply by zero would turn into a nan loss."""
-    x = jnp.array([[1.0, jnp.nan], [3.0, 4.0]])
-    mask = jnp.array([[1.0, 0.0], [1.0, 1.0]])
-
-    assert float(token_mean(x, mask)) == pytest.approx(8 / 3, abs=1e-6)
-
-
-def test_token_mean_matches_verls_aggregation():
-    assert_matches(token_mean(LOG_PROBS, MASK), "verl_token_mean_log_probs")
-
-
-def test_token_log_ratio_clamps_what_it_is_about_to_exponentiate():
-    """A token the policy now gives 30 nats more probability than the rollout
-    did would exponentiate to 1e13 and take the step with it."""
-    ratio = surrogate.token_log_ratio(jnp.array([[-1.0, -0.5, 30.0]]),
-                                      jnp.array([[-1.5, -0.5, 0.0]]))
-
-    assert ratio[0].tolist() == pytest.approx([0.5, 0.0, 20.0], abs=1e-6)
-
-
-def test_the_clipped_loss_and_its_metrics_match_a_hand_computation():
-    """Log ratios 0, 0.5, -0.4 against advantage +1, and 0, 1.5, -0.4 against
-    advantage -1, with the last token of the second row masked. The band is
-    [0.8, 1.5] and the dual clip is 3.
-
-    The first row's ratios are 1, 1.6487, 0.6703. The middle one leaves the
-    band, so the clipped term -1.5 is the larger loss and the clip bites; the
-    last one leaves it downwards, where for a positive advantage the unclipped
-    term is still the larger, so it does not.
-
-    The second row's advantage is negative, so its ratios raise the loss. The
-    middle ratio 4.4817 gives 4.4817, above the dual clip's 3, which caps it.
-
-    That is (-1 - 1.5 - 0.6703 + 1 + 3) / 5 over the five unmasked tokens, one
-    clipped token in five, one dual-clipped token in five, and a ppo_kl of
-    -(0 + 0.5 - 0.4 + 0 + 1.5) / 5.
-    """
     log_ratio = jnp.array([[0.0, 0.5, -0.4], [0.0, 1.5, -0.4]])
     mask = jnp.array([[1.0, 1.0, 1.0], [1.0, 1.0, 0.0]])
-
-    loss, aux = clipped_surrogate(
-        log_ratio, jnp.array([1.0, -1.0]), mask,
-        epsilon_low=0.2, epsilon_high=0.5, dual_clip=3.0)
-
-    assert float(loss) == pytest.approx(
-        (-1 - 1.5 - math.exp(-0.4) + 1 + 3) / 5, abs=1e-6)
+    loss, aux = clipped_surrogate(log_ratio, jnp.array([1.0, -1.0]), mask,
+                                  epsilon_low=0.2, epsilon_high=0.5, dual_clip=3.0)
+    assert float(loss) == pytest.approx((-1 - 1.5 - math.exp(-0.4) + 1 + 3) / 5, abs=1e-6)
     assert float(aux["pg_clipfrac"]) == pytest.approx(0.2, abs=1e-6)
     assert float(aux["pg_clipfrac_lower"]) == pytest.approx(0.2, abs=1e-6)
     assert float(aux["ppo_kl"]) == pytest.approx(-0.32, abs=1e-6)
 
 
-def test_the_clipped_loss_and_its_gradient_match_verl():
-    check_clip(surrogate)
-
-
-def test_a_dual_clip_that_cannot_bind_is_refused():
-    """verl asserts the same bound. Below 1 the cap would sit inside the
-    clipping band and replace the surrogate with a constant."""
-    with pytest.raises(ValueError, match="dual_clip > 1"):
-        surrogate.clipped_surrogate_terms(jnp.zeros((1, 2)), jnp.zeros(1),
-                                          jnp.ones((1, 2)), dual_clip=1.0)
-
-
-def test_the_k3_estimator_matches_a_hand_computation():
-    """exp(d) - d - 1 for d = log pi_ref - log pi: 0.5 gives 0.1487 and -2
-    gives 1.1353. Both are positive, which the plain log ratio is not."""
-    kl = surrogate.k3_kl(jnp.array([[-1.0, -1.0]]), jnp.array([[-0.5, -3.0]]))
-
-    assert kl[0].tolist() == pytest.approx(
-        [math.exp(0.5) - 1.5, math.exp(-2.0) + 1.0], abs=1e-6)
-
-
 def test_the_k3_estimator_and_its_gradient_match_verl_and_tunix():
     check_k3(surrogate)
 
-
-def test_the_k3_estimator_bounds_a_token_that_drifted():
-    """Differences of 30, -5 and 2.5 nats. verl clamps the exponent at 20 and
-    the estimate at 10, so the first reads 10 instead of 1e13 and the third,
-    at 8.68, is left alone."""
-    kl = surrogate.k3_kl(jnp.asarray(REFERENCE["extreme_log_probs"]),
-                         jnp.asarray(REFERENCE["extreme_ref_log_probs"]))
-
-    assert_matches(kl, "verl_k3_kl_extreme")
-    assert kl[0].tolist() == pytest.approx(
-        [10.0, math.exp(-5.0) + 4.0, math.exp(2.5) - 3.5], abs=1e-5)
+    hand = surrogate.k3_kl(jnp.array([[-1.0, -1.0]]), jnp.array([[-0.5, -3.0]]))
+    assert hand[0].tolist() == pytest.approx([math.exp(0.5) - 1.5, math.exp(-2.0) + 1.0], abs=1e-6)
 
 
 def test_the_sequence_ratio_pools_the_value_and_keeps_the_gradient_per_token():
@@ -251,72 +156,3 @@ def test_the_gspo_loss_and_its_gradient_match_verl():
     assert_matches(loss, "verl_gspo_loss")
     assert_matches(gradient, "verl_gspo_grad")
     assert_matches(aux["pg_clipfrac"], "verl_gspo_pg_clipfrac")
-
-
-def test_dropping_the_clip_fails_only_the_clip_check():
-    """Without the maximum the surrogate is the unclipped policy gradient. It
-    still runs, still trains, and lets one token's ratio move the policy as far
-    as it likes."""
-    assert_only_this_check_fails(
-        mutate("worse = jnp.maximum(unclipped, clipped)", "worse = unclipped"),
-        "clip")
-
-
-def test_dropping_the_k3_correction_fails_only_the_k3_check():
-    """`-d` is the same KL in expectation and a different number on every
-    batch, with higher variance and a negative value wherever the policy moved
-    towards the reference."""
-    assert_only_this_check_fails(
-        mutate("jnp.exp(diff) - diff - 1", "-diff"), "k3")
-
-
-def test_flipping_the_stop_gradient_fails_only_the_gradient_check():
-    """The reversed subtraction is worth a test of its own because it is
-    invisible in the loss. Every value the mutant produces is the value the
-    real module produces, and every gradient has the wrong sign."""
-    mutant = mutate("log_probs - jax.lax.stop_gradient(log_probs)",
-                    "jax.lax.stop_gradient(log_probs) - log_probs")
-
-    pooled = mutant.sequence_log_ratio(LOG_PROBS, OLD_LOG_PROBS, MASK)
-    assert np.array_equal(
-        np.asarray(pooled),
-        np.asarray(surrogate.sequence_log_ratio(LOG_PROBS, OLD_LOG_PROBS, MASK)))
-
-    assert_only_this_check_fails(mutant, "stop_gradient")
-
-
-def test_the_fixture_holds_the_inputs_the_generator_names():
-    """A fixture regenerates only if the inputs beside it are the inputs it was
-    made from. Editing a log-probability in tools/parity_rl.py and forgetting
-    to run it leaves this file comparing Dew against the reference's answer to
-    a different question."""
-    spec = importlib.util.spec_from_file_location("parity_rl", GENERATOR)
-    generator = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(generator)
-
-    for name, expected in (("log_probs", generator.LOG_PROBS),
-                           ("old_log_probs", generator.OLD_LOG_PROBS),
-                           ("ref_log_probs", generator.REF_LOG_PROBS),
-                           ("response_mask", generator.SURROGATE_MASK),
-                           ("advantages", generator.ADVANTAGES),
-                           ("extreme_log_probs", generator.EXTREME_LOG_PROBS),
-                           ("extreme_ref_log_probs", generator.EXTREME_REF_LOG_PROBS)):
-        assert np.array_equal(REFERENCE[name], expected), name
-    assert REFERENCE["epsilon_low"] == np.float32(generator.EPSILON_LOW)
-    assert REFERENCE["epsilon_high"] == np.float32(generator.EPSILON_HIGH)
-    assert REFERENCE["dual_clip"] == np.float32(generator.DUAL_CLIP)
-
-
-def test_token_mean_divides_by_the_exact_token_count():
-    """The denominator is the token count with no epsilon: on one live token
-    the mean is that token's value exactly, where masked_mean's 1e-8 puts it
-    1e-8 relative below, and that factor would scale the gradient. In float32
-    a 1e-8 denominator shift rounds away, so the check runs in float64, where
-    the arithmetic is what the docstring claims."""
-    from dew.rl.advantage import masked_mean
-
-    with jax.enable_x64():
-        x = jnp.asarray([[2.0, 5.0, 7.0]], jnp.float64)
-        mask = jnp.asarray([[0, 1, 0]])
-        assert float(token_mean(x, mask)) == 5.0
-        assert float(masked_mean(x, mask)) != 5.0

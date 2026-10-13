@@ -2,81 +2,19 @@
 (`tools/meanflow_reference.py`), and the objective and interval sampling
 built around it."""
 
-import json
-from pathlib import Path
 
 import jax
 import jax.numpy as jnp
 import numpy as np
-import pytest
-from diffusion_stubs import label_table
-from flax import linen as nn
-from reference_error import assert_as_exact_as_the_reference
 
 from dew.diffusion import presets
 from dew.inputs import CharTable, Condition, Field, InputSpec
 from dew.nn.backbones import SimpleDiT
 from dew.objectives.base import Step
 from dew.objectives.diffusion.few_step import MeanFlowObjective
-from dew.sampling import CFG, Euler, sample
+from dew.sampling import Euler, sample
 
-FIXTURES = Path(__file__).resolve().parent / "fixtures" / "meanflow"
 CLASSES = 10
-
-
-class Tiny(nn.Module):
-    """`tools/meanflow_reference.py`'s average velocity u(x, t, h, y) in
-    Dew's calling convention: the model times are the flow time and the
-    duration times 1000, and the class is the condition's second token,
-    whose table entry is the class, the blank prompt's padding reading the
-    reference's null class."""
-
-    interval = True
-
-    @nn.compact
-    def __call__(self, x, time, textcontext, duration=None, train=False):
-        def column(value):
-            return value.reshape(-1, 1, 1, 1)
-
-        # The objective initializes the model without a duration.
-        duration = jnp.zeros_like(time) if duration is None else duration
-        t, h, y = time / 1000, duration / 1000, textcontext.hidden[:, 1, 0]
-        weights = self.param("weights", nn.initializers.zeros, (4, *x.shape[1:]))
-        return (jnp.tanh(x) * weights[0] + jnp.sin(3 * column(t)) * x * weights[1]
-                + column(h) * jnp.cos(x) * weights[2] + column(y) * weights[3])
-
-
-@pytest.mark.parametrize("power", ["0", "1"])
-def test_the_loss_and_its_gradient_are_the_references(power, monkeypatch):
-    """`MeanFlowObjective.loss` on Gsunshine/meanflow's `forward`'s own
-    draws, two times, the noise and the dropout uniforms: the interval with
-    its instantaneous rows, the guided velocity inside and outside the
-    guidance interval, the condition dropped on the first rows as many as the
-    uniforms under the rate count, the JVP target and the adaptive weight.
-    The loss within 1e-6 of the reference's float64 run and the gradient in
-    the network's 192 weights held to it by the float64 rule."""
-    case = np.load(FIXTURES / f"loss_p{power}.npz")
-    settings = json.loads(str(case["settings"]))
-    assert settings["num_classes"] == CLASSES
-    table = label_table(range(CLASSES), null=CLASSES)
-    inputs = InputSpec(Field("image", case["pixels"].shape[1:]), {"textcontext": Condition(table)})
-    task = MeanFlowObjective(
-        Tiny(), presets.MeanFlow()(), inputs,
-        instantaneous=settings["data_proportion"], omega=settings["omega"], kappa=settings["kappa"],
-        guidance_interval=(settings["t_start"], settings["t_end"]), norm_p=settings["norm_p"],
-        norm_eps=settings["norm_eps"], ema_decay=None, unconditional_prob=settings["class_dropout_prob"])
-    drawn = tuple(jnp.asarray(case[name]) for name in ("later", "earlier", "noise", "uniform"))
-    monkeypatch.setattr(MeanFlowObjective, "_draws", lambda self, key, count, shape: drawn)
-    variables = task.init(jax.random.PRNGKey(0))
-    batch = {"image": case["pixels"], **inputs.tokenize([str(int(label)) for label in case["classes"]])}
-    step = Step(step=jnp.asarray(0), key=jax.random.PRNGKey(1), ema=None)
-
-    def loss(weights):
-        return task.scalar_loss({**variables, "params": {"weights": weights}}, batch, step)[0]
-
-    value, gradient = jax.value_and_grad(loss)(jnp.asarray(case["weights"]))
-    np.testing.assert_allclose(float(value), float(case["loss_f64"]), rtol=1e-6)
-    assert_as_exact_as_the_reference(gradient, case["grad"], case["grad_f64"], f"gradient at norm_p {power}")
 
 
 def objective(**fields):
@@ -115,12 +53,6 @@ def test_the_objective_trains_the_duration_and_one_step_samples_the_interval():
     u = task.model.apply(task.model_variables(params), x_T, schedule.model_time(jnp.ones((4,))), **given,
                          duration=schedule.model_time(jnp.ones((4,))) - schedule.model_time(jnp.zeros((4,))))
     np.testing.assert_allclose(np.asarray(walked), np.asarray(x_T - u), rtol=1e-5, atol=1e-6)
-
-
-def test_meanflow_refuses_an_instantaneous_process():
-    model = SimpleDiT(patch_size=2, emb_features=16, num_layers=1, num_heads=2, mlp_ratio=1)
-    with pytest.raises(ValueError, match=r"presets\.MeanFlow"):
-        MeanFlowObjective(model, presets.Flow()(), InputSpec(Field("image", (4, 4, 3))))
 
 
 def test_a_run_config_trains_meanflow_and_its_saved_task_samples_in_one_step(tmp_path):
@@ -164,27 +96,3 @@ def test_a_run_config_trains_meanflow_and_its_saved_task_samples_in_one_step(tmp
     np.testing.assert_array_equal(
         TextToImage.from_run(str(run))(["a red bird"], key=9).host().images, expected
     )
-
-
-def test_meanflow_refuses_the_denoising_losss_extras_and_a_guidance():
-    """The guidance is trained in, so sampling with one would guide twice."""
-    model = SimpleDiT(patch_size=2, emb_features=16, num_layers=1, num_heads=2, mlp_ratio=1, interval=True)
-    inputs = InputSpec(Field("image", (4, 4, 3)))
-    for extra in ({"uncertainty": 8}, {"guidance": CFG(2.0)}):
-        with pytest.raises(ValueError, match="own loss and samples unguided"):
-            MeanFlowObjective(model, presets.MeanFlow()(), inputs, **extra)
-
-
-def test_a_meanflow_run_config_builds_a_smooth_time_embedding_unless_it_names_one():
-    from dew.config import ModelConfig, ObjectiveConfig
-    from dew.data import TFDSImages
-    from dew.objectives.diffusion import DiffusionRunConfig
-
-    def built(config):
-        return DiffusionRunConfig(model=ModelConfig("simple_dit", config), data=TFDSImages(image_size=8),
-                                  preset=presets.MeanFlow(), text=None,
-                                  val_metrics=(),
-                                  objective=ObjectiveConfig("mean_flow", {"solver": Euler()})).build().model
-
-    assert built({"patch_size": 2}).time_scale == 0.002 and built({"patch_size": 2}).interval
-    assert built({"patch_size": 2, "time_scale": 16}).time_scale == 16

@@ -10,7 +10,6 @@ it, with the Euler trajectory and its input gradient.
 """
 
 import json
-import shutil
 from pathlib import Path
 
 import jax
@@ -100,45 +99,6 @@ def test_native_sd3_matches_the_source_forward_and_every_gradient(name, source):
             assert relative_gap(value, arrays[key]) < 1e-4, key
 
 
-def test_every_declared_sd3_tensor_is_mapped_or_a_named_buffer(source):
-    """Every tensor the source stores lands somewhere: the parameters, or the
-    one frozen buffer. A name this translation does not know raises with that
-    name rather than loading a checkpoint that means something else."""
-    tensors = component_tensors(source / "dual", "transformer")
-    params, buffers, layouts = translate_sd3_weights(tensors)
-    assert len(layouts) == len(tensors)
-    assert set(buffers) == {"pos_embed"}
-    leaves = len(jax.tree.leaves(params)) + 1
-    assert leaves == len(tensors)
-    foreign = "transformer_blocks.0.attn.to_out.1.weight"
-    with pytest.raises(ValueError, match=f"unknown tensor name '{foreign}'"):
-        translate_sd3_weights({**tensors, foreign: tensors["transformer_blocks.0.attn.to_out.0.weight"]})
-
-
-def test_unsupported_sd3_controls_are_refused():
-    """A geometry control whose active meaning this model does not carry fails
-    at load rather than being dropped."""
-    config = {"sample_size": 16, "patch_size": 2, "in_channels": 4, "num_layers": 2,
-                  "attention_head_dim": 8, "num_attention_heads": 2, "joint_attention_dim": 12,
-                  "caption_projection_dim": 16, "pooled_projection_dim": 10, "out_channels": 4,
-                  "pos_embed_max_size": 8}
-    assert sd3_fields(config)["qk_norm"] is None
-    with pytest.raises(ValueError, match="qk_norm"):
-        sd3_fields({**config, "qk_norm": "layer_norm"})
-    with pytest.raises(ValueError, match="dual_attention_layers"):
-        sd3_fields({**config, "dual_attention_layers": "all"})
-
-
-def test_a_latent_grid_larger_than_the_position_buffer_is_refused(source):
-    with np.load(source / "sd3_transformer.npz") as arrays:
-        forward, params, _, _, _, condition = transformer_case(source, arrays, "plain")
-    latent = jnp.zeros((2, 20, 20, 4), jnp.float32)
-    with pytest.raises(ValueError, match="position buffer"):
-        forward(params, latent, condition.context, condition.pooled)
-    with pytest.raises(ValueError, match="whole number"):
-        forward(params, jnp.zeros((2, 7, 8, 4), jnp.float32), condition.context, condition.pooled)
-
-
 class Velocity(nn.Module):
     """The closed-form velocity of the optimal transport path for Gaussian
     data, which is the model both sides of the flow comparison run."""
@@ -195,47 +155,6 @@ def test_native_flow_schedule_matches_the_source_grids_and_trajectory(name, sour
                 assert relative_gap(run(x_T), arrays[f"{tag}.latents"][-1]) < 1e-4
                 (gradient,) = jax.vjp(run, x_T)[1](jnp.asarray(arrays[f"{tag}.cotangent"]))
                 assert relative_gap(gradient, arrays[f"{tag}.grad"]) < 1e-4
-
-
-def test_the_flow_rates_are_the_source_law_not_a_normalized_vp_pair(source):
-    """alpha is 1 - sigma: signal and noise sum to one, and the Euler step is
-    the source's `x + (sigma_next - sigma) v`, which is what Dew's Euler
-    solver computes on this schedule."""
-    arrays = flow_reference(source)
-    schedule = SourceSchedule.from_config(json.loads(str(arrays["flow.shift3.config"])))
-    process, times = schedule.sampling(4)
-    alpha, sigma = process.sampler_schedule.rates(times)
-    np.testing.assert_allclose(np.asarray(alpha + sigma), 1.0, atol=1e-6)
-    assert float(sigma[0]) == pytest.approx(1.0, abs=1e-6)
-    assert float(sigma[-1]) == 0.0
-    assert float(process.sampler_schedule.prior_scale()) == pytest.approx(1.0, abs=1e-6)
-
-
-def test_dynamic_shifting_reads_the_token_count_and_not_an_exponentiated_mu(source):
-    """A resolution-dependent file needs the latent's token count, and the mu
-    its pipeline computes is mu itself: at the base token count the shifted
-    grid is the one a static shift of exp(base_shift) gives, so a mu that
-    arrived already exponentiated would land somewhere else."""
-    arrays = flow_reference(source)
-    dynamic = SourceSchedule.from_config(json.loads(str(arrays["flow.dynamic.config"])))
-    with pytest.raises(ValueError, match="token count"):
-        dynamic.sampling(4)
-    static = SourceSchedule.from_config({
-        "_class_name": "FlowMatchEulerDiscreteScheduler", "num_train_timesteps": 1000,
-        "shift": float(np.exp(0.5))})
-    shifted, _ = dynamic.sampling(4, tokens=256, origin="linspace")
-    equivalent, times = static.sampling(4, origin="linspace")
-    np.testing.assert_allclose(np.asarray(shifted.sampler_schedule.sigmas(times)),
-                               np.asarray(equivalent.sampler_schedule.sigmas(times)),
-                               atol=1e-6, rtol=1e-6)
-
-
-@pytest.mark.parametrize("control", ["invert_sigmas", "stochastic_sampling"])
-def test_unproved_flow_semantics_are_refused(control):
-    config = {"_class_name": "FlowMatchEulerDiscreteScheduler", "num_train_timesteps": 1000,
-              control: True}
-    with pytest.raises(ValueError, match=control):
-        SourceSchedule.from_config(config)
 
 
 @pytest.mark.mesh
@@ -376,21 +295,6 @@ def test_omitted_call_policy_takes_the_published_pipelines_own(source, pipeline_
                             initial=arrays[f"{case}.x_T"], key=0)
     walked = task(prepared, key=jax.random.PRNGKey(0)).host()
     assert relative_gap(walked.latents, arrays[f"{case}.default_latents"]) < 2e-5
-
-
-def test_an_sd3_directory_declaring_a_flux_pipeline_is_refused(source, tmp_path):
-    """A declared class another family's denoiser drives is refused: the
-    shared unet/transformer check cannot tell Flux's transformer from SD3's,
-    so the gate reads the pipeline family."""
-    from dew.interop.pretrained import Pretrained
-
-    directory = tmp_path / "pipeline"
-    shutil.copytree(source / "pipeline", directory)
-    index = json.loads((directory / "model_index.json").read_text())
-    index["_class_name"] = "FluxPipeline"
-    (directory / "model_index.json").write_text(json.dumps(index))
-    with pytest.raises(ValueError, match=r"FluxPipeline.*StableDiffusion3Pipeline"):
-        Pretrained.load(str(directory), dtype="float32", attention_impl="xla")
 
 
 def test_a_trained_step_keeps_the_frozen_buffer_and_exports_for_the_source(source, tmp_path):

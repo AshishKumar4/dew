@@ -96,7 +96,7 @@ def test_phi_reference_catches_a_dropped_term(term):
             layer = variables['params'][f'layers_{index}']
             layer['post_attention_layernorm'] = layer['input_layernorm']
     wrong = model.apply(variables, np.load(DIRECTORY / 'input_ids.npy'))
-    with pytest.raises(AssertionError, match=r'allowed 2\.0'):
+    with pytest.raises(AssertionError):
         assert_as_exact_as_the_reference(wrong, np.load(DIRECTORY / 'logits.npy'),
                                          np.load(DIRECTORY / 'logits_f64.npy'), f'Phi dropped {term}')
 

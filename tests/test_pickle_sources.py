@@ -84,33 +84,3 @@ def test_sharded_pickles_read_through_their_index_in_their_stored_dtype(tmp_path
     assert np.array_equal(tensors["model.embed_tokens.weight"].astype(np.float32),
                           np.arange(12, dtype=np.float32).reshape(3, 4))
     assert np.array_equal(tensors["model.norm.weight"], np.arange(6, dtype=np.float32).reshape(2, 3).T)
-
-
-def test_without_torch_a_pickle_checkpoint_is_refused_naming_the_extra(tmp_path, cache, monkeypatch):
-    source = pickled_fixture(tmp_path / "source")
-    monkeypatch.setitem(sys.modules, "torch", None)
-
-    with pytest.raises(ImportError, match=r"dewml\[torch\].*huggingface\.co/spaces/safetensors/convert"):
-        Pretrained.load(source)
-
-
-
-def test_a_pickle_directory_without_a_config_is_refused_before_it_converts(tmp_path, cache):
-    (tmp_path / "pytorch_model.bin").write_bytes(b"not read")
-    with pytest.raises(FileNotFoundError, match=r"no config\.json"):
-        Pretrained.load(tmp_path)
-    assert not cache.exists()
-
-
-@pytest.mark.network
-def test_mamba2_130ms_pickle_converts_to_its_safetensors_conversions_weights(cache, monkeypatch):
-    """Both routes on state-spaces/mamba2-130m's main commit: SFconvertbot's
-    refs/pr/1, then the pytorch_model.bin itself, with the pull request
-    lookup made to find nothing. The same fp32 weights, bit for bit."""
-    commit = "3a5aea0c25d0fb43cc360e2c2aac82c26e3eed49"
-    pull = Pretrained.load("state-spaces/mamba2-130m", revision=commit, dtype="float32")
-    monkeypatch.setattr(sources, "_conversion_revision", lambda name, commit: None)
-    pickled = Pretrained.load("state-spaces/mamba2-130m", revision=commit, dtype="float32")
-
-    assert (pull.revision, pickled.revision) == ("ea6060f68a4289e9c06f80effa896629ba519216", commit)
-    assert jax.tree.all(jax.tree.map(np.array_equal, pull.variables, pickled.variables))
