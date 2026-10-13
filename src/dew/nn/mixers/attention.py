@@ -1043,6 +1043,9 @@ class AttentionMixer(MixerBase):
     (`exclusive_self_attention`)."""
     gate_projection: Literal['query', 'own'] = 'query'
     """Where the decoder's output gate comes from (`CausalSelfAttention.gate_projection`)."""
+    qk_norm_weight: bool = True
+    """Whether the decoder's qk norm has a weight (`CausalSelfAttention.qk_norm_weight`): Muse
+    Glimmer's has none (modeling_muse_glimmer.py:307)."""
 
     # `CausalSelfAttention` reads the mixed call's `Admitted` layout.
     mixed_step = True
