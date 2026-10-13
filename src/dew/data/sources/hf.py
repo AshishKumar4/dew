@@ -20,10 +20,18 @@ if TYPE_CHECKING:
     from datasets.iterable_dataset import _BaseExamplesIterable
 
 
+@dataclass(frozen=True)
+class _HFShard(Shard):
+    """One library shard, or a row-wise share when readers outnumber shards."""
+
+    count: int = 1
+    index: int = 0
+
+
 @dataclass(frozen=True, eq=False)
 class HF(Dataset):
     """A `datasets.Dataset`, read by index from its Arrow table, or an
-    `IterableDataset`, read as one stream whose position its own
+    `IterableDataset`, read over its shards whose positions its own
     `state_dict` checkpoints; the `.map()`s it holds are already applied. An
     image column reads as its encoded bytes, which `images.decode` decodes.
     `name` is its identity in a run's plan, a cache's key and its logs, its
@@ -33,7 +41,11 @@ class HF(Dataset):
     A stream resumes exactly from its `state_dict` only unshuffled, since
     Hugging Face's shuffle buffer is not part of that state: one that
     shuffles through it is refused; shuffle with the chain's
-    `shuffle(window=)` instead."""
+    `shuffle(window=)` instead.
+
+    A pool larger than the physical shards uses a row-wise node split.
+    These parts resume exactly at the same topology, but their cache fill
+    cannot publish: publication needs the store's own shards."""
 
     dataset: Any
     name: str | None = None
@@ -87,12 +99,19 @@ class HF(Dataset):
         if not self.streamed:
             rows = len(self.dataset)
             return ShardManifest((Shard(self.describe(), self.describe(), 0, rows, rows),), self._read_shard)
-        return ShardManifest((Shard(self.describe(), self.describe()),), self._read_shard)
+        return ShardManifest(self._shards(self.dataset.n_shards), self._read_shard, self._shards)
+
+    def _shards(self, count: int) -> tuple[Shard, ...]:
+        name = self.describe()
+        return tuple(_HFShard(f"{name}/shards-{count}/{index}", name, count=count, index=index)
+                     for index in range(count))
 
     def _read_shard(self, shard: Shard) -> grain.IterDataset:
         if not self.streamed:
             return grain.MapDataset.source(self._undecoded()).map(_record).to_iter_dataset()
-        return _Streamed(self._undecoded())
+        if not isinstance(shard, _HFShard):
+            raise ValueError("a Hugging Face stream needs its own shard descriptor")
+        return _Streamed(self._undecoded(), shard)
 
     def metadata(self) -> Mapping[str, object]:
         return {} if self.streamed else {"rows": len(self.dataset)}
@@ -103,16 +122,25 @@ class HF(Dataset):
 
 class _Streamed(grain.IterDataset):
     """An `IterableDataset` as a Grain stream, its position its `state_dict`.
-    Each opening reads its own dataset over the same examples (`shard(1, 0)`):
+    Each opening shards its own dataset, also before a row-wise node split:
     an IterableDataset keeps the position of the iterator it made last, and
     the position `load_state_dict` gave it for every later one."""
 
-    def __init__(self, dataset):
+    def __init__(self, dataset, shard: _HFShard):
         super().__init__()
         self._dataset = dataset
+        self._shard = shard
 
     def __iter__(self) -> grain.DatasetIterator:
-        return _StreamedIterator(self._dataset.shard(num_shards=1, index=0))
+        shard = self._shard
+        if shard.count <= self._dataset.n_shards:
+            dataset = self._dataset.shard(num_shards=shard.count, index=shard.index, contiguous=True)
+        else:
+            from datasets.distributed import split_dataset_by_node
+
+            dataset = self._dataset.shard(num_shards=1, index=0, contiguous=True)
+            dataset = split_dataset_by_node(dataset, rank=shard.index, world_size=shard.count)
+        return _StreamedIterator(dataset)
 
 
 class _StreamedIterator(grain.DatasetIterator):

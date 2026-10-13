@@ -1,5 +1,6 @@
 """The chain surface: stores carry the verbs, mix reads members of every kind, holdout splits by identity."""
 
+import dataclasses
 import itertools
 import json
 
@@ -231,6 +232,97 @@ def test_a_hugging_face_stream_resumes_exactly_and_its_own_shuffle_is_refused():
         from_hf(stream.shuffle(seed=0, buffer_size=8).map(lambda row: row), name="shuffled@1")
     with pytest.raises(ValueError):
         from_hf(stream)
+
+
+def hf_rows(shards: list[int]):
+    """The records of a Hugging Face stream, written across several shards."""
+    for shard in shards:
+        yield from ({"i": 12 * shard + index} for index in range(12))
+
+
+def hf_file_rows(shards: list[str]):
+    """A Hugging Face stream over JSONL files that can go offline."""
+    for shard in shards:
+        with open(shard) as source:
+            yield from map(json.loads, source)
+
+
+@pytest.mark.parametrize("shard_count", [1, 3, 4])
+@pytest.mark.parametrize("workers", [0, 2], ids=["workers0", "workers2"])
+def test_hugging_face_stream_shares_are_disjoint_and_resume_exactly(shard_count, workers):
+    """Physical shards and undersharded streams cover every record once across two shares,
+    with independent openings and exact per-share resumes, also through real workers."""
+    datasets = pytest.importorskip("datasets")
+    stream = datasets.IterableDataset.from_generator(hf_rows, gen_kwargs={"shards": list(range(shard_count))})
+    source = from_hf(stream, name=f"sharded-{shard_count}@1")
+    chain = (source.map(lambda row: {**row, "twice": 2 * row["i"]}, identity="twice@1")
+             .interleave(2).repeat(1).batch(2))
+    data = compile(chain, read="streamed", loading=dataclasses.replace(READ, workers=workers))
+    shares = []
+    for index in range(2):
+        partition = DataPartition(index, 2)
+        reader = data.train(partition)
+        try:
+            first = [next(reader) for _ in range(3)]
+            state = reader.get_state()
+            rest = list(reader)
+        finally:
+            reader.close()
+        batches = [*first, *rest]
+        assert all(np.array_equal(batch["twice"], 2 * batch["i"]) for batch in batches)
+        shares.append([int(value) for batch in batches for value in batch["i"]])
+        resumed = data.train(partition)
+        try:
+            resumed.set_state(state)
+            actual = list(resumed)
+            assert len(actual) == len(rest)
+            assert all(np.array_equal(left[field], right[field])
+                       for left, right in zip(actual, rest, strict=True) for field in ("i", "twice"))
+        finally:
+            resumed.close()
+        other = data.train(DataPartition(1 - index, 2))
+        try:
+            with pytest.raises(ValueError):
+                other.set_state(state)
+        finally:
+            other.close()
+    assert set(shares[0]).isdisjoint(shares[1])
+    assert sorted([*shares[0], *shares[1]]) == list(range(12 * shard_count))
+    whole = [row["i"] for row in iterate(source.chain(), read="streamed", loading=READ)]
+    assert whole == list(range(12 * shard_count))
+
+
+@pytest.mark.parametrize("shares", [1, 2])
+def test_a_hugging_face_stream_cache_publishes_only_its_store_shards(tmp_path, shares):
+    """A native-shard fill publishes; a row-wise node split refuses without reopening the store."""
+    from dew.data.cache import Cache
+    from dew.data.plan import Manifest
+    from dew.data.shards import streamed
+
+    datasets = pytest.importorskip("datasets")
+    path = tmp_path / "records.jsonl"
+    path.write_text("".join(json.dumps({"i": index}) + "\n" for index in range(12)))
+    stream = datasets.IterableDataset.from_generator(hf_file_rows, gen_kwargs={"shards": [str(path)]})
+    source = from_hf(stream, name="cached-counting@1")
+    cache, key = Cache((tmp_path / "cache").as_uri()), Manifest(source.fingerprint())
+    manifest = source.manifest()
+    cached = dataclasses.replace(manifest, reader=cache.streamed(manifest.reader, key, manifest))
+    actual = []
+    for index in range(shares):
+        reader = iter(streamed(cached, partition=DataPartition(index, shares), loading=READ))
+        try:
+            actual.extend(row["i"] for row in reader)
+        finally:
+            reader.close()
+    assert sorted(actual) == list(range(12))
+    if shares > 1:
+        path.rename(tmp_path / "offline.jsonl")
+        with pytest.raises(ValueError):
+            cache.publish(key, source)
+        assert cache.generation(key) is None
+    else:
+        generation = cache.publish(key, source)
+        assert [generation[index]["i"] for index in range(len(generation))] == list(range(12))
 
 
 def test_chunks_cut_long_documents_keeping_every_target():
