@@ -1,15 +1,21 @@
 """Each preset prepares its kind of record for a model, and a run trains and validates on it."""
 
+import dataclasses
 import json
 from pathlib import Path
 
 import numpy as np
 import optax
+import pytest
 from recording import RecordingTracker
 
 from dew import Field, InputSpec, Trainer
-from dew.data import Memory, mix, presets
+from dew.data import Loading, Memory, mix, presets
 from dew.data.chat import Role
+from dew.data.compile import compile
+from dew.data.dataset import DataPartition
+from dew.data.steps.generic import Fields
+from dew.data.steps.text import ValidTargets
 from dew.diffusion.presets import Flow
 from dew.nn.backbones import CausalTransformer, SimpleDiT
 from dew.objectives.diffusion import DiffusionObjective
@@ -97,6 +103,68 @@ def test_sft_renders_conversations_and_trains_on_the_assistant_turns():
                      held.pipe(presets.sft(str(CHAT), seq_len=48, batch=8)), metrics=(Perplexity(),))
     finite(logged, "train/loss")
     finite(logged, "val/perplexity")
+
+
+def sft_tokens(marker, targets, *, empty_rows=0):
+    """Equal-length tokenized conversations with `targets` assistant tokens per accepted row."""
+    roles = np.full(9, int(Role.USER), np.int8)
+    if targets:
+        roles[-targets:] = int(Role.ASSISTANT)
+    rows = [{"text": np.full(9, marker, np.int32),
+             "text_roles": np.full(9, int(Role.USER), np.int8) if index < empty_rows else roles}
+            for index in range(64)]
+    return Memory(rows).named(f"sft-{marker}").pack(9, fields=("text", "text_roles")).shuffle(marker).repeat()
+
+
+@pytest.mark.parametrize("weights", [(0.5, 0.5), (0.25, 0.75)])
+@pytest.mark.parametrize("empty_rows", [0, 32])
+@pytest.mark.parametrize("projected", [False, True])
+def test_sft_token_mixture_weighs_final_assistant_targets_and_resumes(weights, empty_rows, projected):
+    """One versus seven assistant targets per packed row get the requested scored-token shares."""
+    model = CausalTransformer(vocab_size=16, emb_features=8, num_layers=1, num_heads=2,
+                              mlp_features=16, max_seq_len=8)
+    policy = LMObjective(model, seq_len=8, loss_role=Role.ASSISTANT).data()
+    field = "tokens" if projected else "text"
+    if projected:
+        names = ("text", "text_roles", "text_segment_ids")
+        projection = Fields(names, rename=tuple((name, name.replace("text", field)) for name in names))
+        policy = dataclasses.replace(policy, train=(*policy.train, projection))
+    train = mix([sft_tokens(1, 1, empty_rows=empty_rows), sft_tokens(2, 7)], weights=weights, by="tokens")
+    data = compile(train.batch(8), objective=policy, read="memory", loading=Loading(workers=0))
+    reader = data.train(DataPartition())
+    targets = ValidTargets(field=field, role=int(Role.ASSISTANT), measured=False)
+    delivered = {1: 0, 2: 0}
+    try:
+        for _ in range(64):
+            batch = next(reader)
+            for index, marker in enumerate(batch[field][:, 0]):
+                row = {name: values[index] for name, values in batch.items()}
+                delivered[int(marker)] += targets(row)
+        saved = reader.get_state()
+        remaining = [next(reader)[field].tolist() for _ in range(3)]
+    finally:
+        reader.close()
+    assert [delivered[marker] / sum(delivered.values()) for marker in (1, 2)] == pytest.approx(weights,
+                                                                                          abs=0.01)
+    assert data.counts["sft-1"].accepted == 64 - empty_rows
+    assert data.counts["sft-1"].rejected["zero_targets"] == empty_rows
+    resumed = compile(train.batch(8), objective=policy, read="memory",
+                      loading=Loading(workers=0)).train(DataPartition())
+    try:
+        resumed.set_state(saved)
+        assert [next(resumed)[field].tolist() for _ in range(3)] == remaining
+    finally:
+        resumed.close()
+
+
+def test_sft_token_mixture_refuses_a_member_with_no_assistant_targets():
+    """A corpus with no objective targets cannot silently disappear from a token-weighted mix."""
+    model = CausalTransformer(vocab_size=16, emb_features=8, num_layers=1, num_heads=2,
+                              mlp_features=16, max_seq_len=8)
+    policy = LMObjective(model, seq_len=8, loss_role=Role.ASSISTANT).data()
+    train = mix([sft_tokens(1, 0), sft_tokens(2, 7)], by="tokens").batch(8)
+    with pytest.raises(ValueError):
+        compile(train, objective=policy, read="memory", loading=Loading(workers=0))
 
 
 def test_lm_over_a_mixture_of_raw_stores_tokenizes_and_packs_after_mixing():

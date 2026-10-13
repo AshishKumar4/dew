@@ -24,7 +24,7 @@ class Iterated(Dataset):
     `load_state(iterator, saved)` restores, as WebDataset, torchdata,
     Mosaic Streaming and Ray iterators each keep their own; without them, a
     resumed reader replays the stream from the start, skipping the records
-    already read. `name` is its identity in a run's plan and its logs."""
+    already read. `name` declares its content version in a run's plan and its logs."""
 
     factory: Callable[[], Iterator[Batch]]
     name: str
@@ -39,7 +39,7 @@ class Iterated(Dataset):
         return f"iter:{self.name}"
 
     def fingerprint(self) -> Mapping[str, object]:
-        return {"store": "iterator", "name": self.name}
+        return {"store": "iterator", "identity_required": True, "identity": self.name}
 
     def supports(self, read: Read) -> bool:
         return read == "streamed"
