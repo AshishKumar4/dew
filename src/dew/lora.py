@@ -36,6 +36,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import math
+import numbers
 import re
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
@@ -97,6 +98,29 @@ class Target:
     alpha: float
 
 
+def _rank(owner: str, rank: object) -> int:
+    """`rank`, refused unless a positive int. This and `_alpha` and `_dropout`
+    hold the numbers every description of an adapter states (a `LoRA`, an
+    `AdapterRecord`, a PEFT or Diffusers file's config) to one rule."""
+    if isinstance(rank, bool) or not isinstance(rank, int) or rank < 1:
+        raise ValueError(f"{owner}: rank must be a positive integer, not {rank!r}")
+    return rank
+
+
+def _alpha(owner: str, alpha: object) -> float:
+    """`alpha` as a float, refused unless a finite number."""
+    if isinstance(alpha, bool) or not isinstance(alpha, numbers.Real) or not math.isfinite(alpha):
+        raise ValueError(f"{owner}: alpha must be a finite number, not {alpha!r}")
+    return float(alpha)
+
+
+def _dropout(owner: str, dropout: object) -> float:
+    """`dropout` as a float, refused outside [0, 1)."""
+    if isinstance(dropout, bool) or not isinstance(dropout, numbers.Real) or not 0 <= float(dropout) < 1:
+        raise ValueError(f"{owner}: dropout must be in [0, 1), not {dropout!r}")
+    return float(dropout)
+
+
 @dataclass(frozen=True)
 class LoRA:
     """A low-rank adapter spec with PEFT's own fields.
@@ -123,14 +147,12 @@ class LoRA:
         if isinstance(self.modules, str):
             raise ValueError("modules is a sequence of module names, not one string")
         object.__setattr__(self, "modules", tuple(self.modules))
-        if type(self.rank) is not int or self.rank < 1:
-            raise ValueError(f"rank must be a positive integer, not {self.rank!r}")
+        _rank("LoRA", self.rank)
+        if self.alpha is not None:
+            _alpha("LoRA", self.alpha)
+        _dropout("LoRA", self.dropout)
         if not self.modules or any(not isinstance(module, str) or not module for module in self.modules):
             raise ValueError("modules names at least one projection")
-        if self.alpha is not None and (isinstance(self.alpha, bool) or not math.isfinite(self.alpha)):
-            raise ValueError(f"alpha must be a finite number, not {self.alpha!r}")
-        if not 0 <= self.dropout < 1:
-            raise ValueError(f"dropout must be in [0, 1), not {self.dropout!r}")
 
     def apply(self, model: nn.Module, variables: Variables, *, key: int | jax.Array,
               layouts: Mapping[str, WeightLayout] | None = None) -> Adapter:
@@ -608,10 +630,9 @@ class AdapterRecord:
     layouts: Mapping[str, AdapterBinding]
 
     def __post_init__(self) -> None:
-        if self.rank < 1 or not math.isfinite(self.alpha):
-            raise ValueError("adapter rank must be positive and alpha must be a finite number")
-        if not 0 <= self.dropout < 1:
-            raise ValueError("adapter dropout must be in [0, 1)")
+        _rank("the adapter record", self.rank)
+        _alpha("the adapter record", self.alpha)
+        _dropout("the adapter record", self.dropout)
         paths = [tuple(module.split('/')) for module in self.modules]
         if (not paths or len(set(paths)) != len(paths)
                 or any(not name or name in ('.', '..') for path in paths for name in path)):
@@ -822,14 +843,15 @@ class _Config:
         rank, alpha = config.get("r"), config.get("lora_alpha")
         rank_pattern, alpha_pattern = config.get("rank_pattern", {}), config.get("alpha_pattern", {})
         rslora, dropout = config.get("use_rslora", False), config.get("lora_dropout", 0.0)
-        if (type(rank) is not int or not isinstance(alpha, (int, float))
-                or not isinstance(rank_pattern, Mapping) or not isinstance(alpha_pattern, Mapping)
-                or not isinstance(rslora, bool) or not isinstance(dropout, (int, float))
-                or any(type(value) is not int for value in rank_pattern.values())
-                or any(not isinstance(value, (int, float)) for value in alpha_pattern.values())):
-            raise ValueError(f"{where} needs an integer r, numeric lora_alpha and per-module patterns")
-        return cls(rank, float(alpha), dict(rank_pattern),
-                   {key: float(value) for key, value in alpha_pattern.items()}, rslora, float(dropout))
+        if (not isinstance(rank_pattern, Mapping) or not isinstance(alpha_pattern, Mapping)
+                or not isinstance(rslora, bool)):
+            raise ValueError(f"{where} needs per-module patterns and a boolean use_rslora")
+        return cls(_rank(where, rank), _alpha(where, alpha),
+                   {module: _rank(f"{where} rank_pattern {module}", value)
+                    for module, value in rank_pattern.items()},
+                   {module: _alpha(f"{where} alpha_pattern {module}", value)
+                    for module, value in alpha_pattern.items()},
+                   rslora, _dropout(where, dropout))
 
     def rank_of(self, relative: str) -> int:
         return self.rank_pattern.get(_pattern(self.rank_pattern, relative), self.rank)
@@ -987,7 +1009,7 @@ def _diffusers_configs(tensors: Mapping[str, np.ndarray], metadata: str | None,
         component, _, rest = key.partition(".")
         module, _, factor = rest.rpartition(".lora_")
         if factor == "B.weight":
-            ranks.setdefault(component, {})[module] = tensor.shape[1]
+            ranks.setdefault(component, {})[module] = _rank(f"{where} {component}.{module}", tensor.shape[1])
     return {component: _Config(next(iter(found.values())), float(next(iter(found.values()))),
                                found, {}, rslora=False, dropout=0.0)
             for component, found in ranks.items()}
