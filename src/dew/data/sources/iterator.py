@@ -77,6 +77,7 @@ class _StreamIterator(grain.DatasetIterator):
         super().__init__()
         self._source = source
         self._rows = source.factory() if source.state is not None else Replayed(source.factory)
+        # The records read, which a position through `state` carries; Replayed counts its own.
         self._read = 0
 
     def __next__(self) -> Batch | bytes:
