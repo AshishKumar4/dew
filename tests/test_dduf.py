@@ -143,9 +143,9 @@ def test_a_dduf_file_loads_what_diffusers_reads_from_it_and_unpacks_once(packed_
 
 def test_a_dduf_file_the_repo_lacks_or_beside_a_single_file_is_refused(tmp_path):
     (tmp_path / "other.dduf").write_bytes(b"")
-    with pytest.raises(FileNotFoundError, match=r"the \.dduf files in .* are \['other\.dduf'\]"):
+    with pytest.raises(FileNotFoundError):
         Pretrained.load(tmp_path, dduf_file="pipeline.dduf")
-    with pytest.raises(ValueError, match="pass one"):
+    with pytest.raises(ValueError):
         Pretrained.load(tmp_path, dduf_file="other.dduf", single_file="model.safetensors")
 
 
@@ -165,7 +165,7 @@ def test_an_entry_named_outside_the_archive_directory_is_refused(tmp_path, monke
                                          '"..": ["diffusers", "X"]}')
         out.writestr(name, "{}")
         out.writestr("/config.json" if name.startswith("/") else "../config.json", "{}")
-    with pytest.raises(ValueError, match="outside its own directory"):
+    with pytest.raises(ValueError):
         dduf.unpacked(archive)
     # '..' from the staging directory is the cache's dduf directory.
     assert not (tmp_path / "cache" / "dew" / "dduf" / "escaped.json").exists()

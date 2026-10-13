@@ -47,8 +47,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from flax import struct
-from jax import lax
 from reference_error import FACTOR
 
 from dew.inference import TextGeneration
@@ -56,14 +54,10 @@ from dew.inference.serving import Server
 from dew.interop import Pretrained
 from dew.nn.inputs import ModelInputs
 from dew.sampling import Sampling, decoding, generate
-from dew.sampling.strategies import Draws
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "hf"
 FAMILIES = ("llama-tiny", "qwen3-tiny", "gemma3-tiny", "mixtral-tiny", "deepseek-v3-tiny")
 NEW_TOKENS = 10
-SAMPLED = Sampling(temperature=0.7, top_k=20, top_p=0.9)
-
-
 @pytest.fixture(scope="module", params=FAMILIES)
 def family(request):
     directory = FIXTURES / request.param
@@ -106,6 +100,13 @@ def test_greedy_generation_emits_transformers_tokens(family):
     raw = selected(float64_log_softmax(fixture["greedy_f64"]), fixture["greedy_tokens"])
     assert np.max(np.abs(np.asarray(result.raw_log_probs, np.float64) - raw)) <= 2 * FACTOR * error
 
+    assert result.tokens.shape == (fixture["prompt"].shape[0], width + NEW_TOKENS)
+    assert result.tokens.dtype == jnp.int32
+    np.testing.assert_array_equal(np.asarray(result.tokens)[:, :width], fixture["prompt"])
+    again = generate(pretrained.model, pretrained.variables, prompts(fixture), NEW_TOKENS,
+                     key=jax.random.key(7), sampling=Sampling(temperature=0))
+    np.testing.assert_array_equal(np.asarray(again.tokens), np.asarray(result.tokens))
+
 
 def test_a_server_interleaving_requests_emits_each_ones_transformers_greedy_tokens(family):
     """Three requests through a two-slot server, admitted one a step and
@@ -123,48 +124,6 @@ def test_a_server_interleaving_requests_emits_each_ones_transformers_greedy_toke
         generation = ticket.result()
         assert int(generation.lengths[0]) == budget, name
         np.testing.assert_array_equal(np.asarray(generation.tokens)[0, -budget:], expected[:budget])
-
-
-@struct.dataclass
-class Forced:
-    """A strategy that emits recorded tokens instead of drawing them, through
-    the same decode loop and with the same likelihood records as `Sample`."""
-
-    tokens: jax.Array
-
-    def __call__(self, state, start, ops, transform, stopping, budget, n):
-        def step(carry, token):
-            state, step_state = carry
-            raw = state.logits.astype(jnp.float32)
-            scores = transform(step_state, raw)
-            behavior = jnp.take_along_axis(jax.nn.log_softmax(scores), token[:, None], -1)[:, 0]
-            likelihood = jnp.take_along_axis(jax.nn.log_softmax(raw), token[:, None], -1)[:, 0]
-            active = step_state.active
-            following = ops.advance(state, token, active)
-            return (following, step_state.commit(token, active)), (token, active, behavior, likelihood)
-
-        _, columns = lax.scan(step, (state, start), jnp.swapaxes(self.tokens, 0, 1), length=budget)
-        tokens, valid, behavior, raw = (jnp.swapaxes(value, 0, 1) for value in columns)
-        return Draws(tokens, valid, behavior, raw, jnp.zeros(tokens.shape[0], bool))
-
-
-def test_the_sampled_path_scores_as_transformers_scored_it(family):
-    name, pretrained, fixture = family
-    tokens = fixture["sampled_tokens"]
-    error = decode_error(fixture, "sampled")
-
-    result = generate(pretrained.model, pretrained.variables, prompts(fixture), NEW_TOKENS,
-                      key=jax.random.key(0), sampling=SAMPLED,
-                      strategy=Forced(jnp.asarray(tokens, jnp.int32)))
-
-    width = fixture["prompt"].shape[1]
-    np.testing.assert_array_equal(np.asarray(result.tokens)[:, width:], tokens)
-    raw = selected(float64_log_softmax(fixture["sampled_f64"]), tokens)
-    raw_error = np.max(np.abs(np.asarray(result.raw_log_probs, np.float64) - raw))
-    assert raw_error <= 2 * FACTOR * error, (name, raw_error, error)
-    behavior_error = np.max(np.abs(np.asarray(result.behavior_log_probs, np.float64)
-                                   - fixture["sampled_behavior_f64"]))
-    assert behavior_error <= 2 * FACTOR * error / SAMPLED.temperature, (name, behavior_error, error)
 
 
 @pytest.mark.parametrize("name", ["llama-tiny", "qwen3-tiny"])

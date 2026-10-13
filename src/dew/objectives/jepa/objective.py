@@ -33,6 +33,7 @@ from flax import linen as nn
 
 from dew.artifacts import Representations
 from dew.inputs import Field, InputSpec, unit_range
+from dew.nn.precision import at_least_fp32
 from dew.nn.sharding import explicit_spec, whole_spec
 from dew.objectives.base import (
     Aux,
@@ -239,7 +240,8 @@ class JepaObjective(Objective[Ratio]):
         assert not isinstance(predictions, tuple)
         predictions = predictions.reshape(targets.shape)
 
-        squared = (predictions.astype(jnp.float32) - targets.astype(jnp.float32)) ** 2
+        wide = at_least_fp32(jnp.result_type(predictions, targets))
+        squared = (predictions.astype(wide) - targets.astype(wide)) ** 2
         loss = self.row_mean(squared, batch)
         pooled = jnp.mean(full, axis=tuple(range(1, full.ndim - 1)))
         return loss, Aux(representation_health(pooled))
