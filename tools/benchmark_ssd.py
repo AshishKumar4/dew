@@ -26,7 +26,7 @@ Usage:
 """
 
 import json
-import time
+import statistics
 from dataclasses import dataclass
 
 import jax
@@ -34,6 +34,7 @@ import jax.numpy as jnp
 import tyro
 
 from dew.nn.kernels.ssd import ssd_chunk_scan, ssd_kernel_runs
+from dew.nn.kernels.tuning import samples
 from dew.nn.mixers.mamba2 import xla_chunk_scan
 
 IMPLEMENTATIONS = ('xla', 'kernel')
@@ -145,12 +146,7 @@ def measure(case: dict, config: BenchmarkConfig) -> dict:
             row['backward_reason'] = failure(error)
 
     def time_call(callable_):
-        for _ in range(config.warmup):
-            jax.block_until_ready(callable_(*built))
-        start = time.perf_counter()
-        for _ in range(config.steps):
-            jax.block_until_ready(callable_(*built))
-        return (time.perf_counter() - start) / config.steps * 1e3
+        return statistics.mean(samples(callable_, *built, warmup=config.warmup, repeats=config.steps)) * 1e3
 
     if config.timing:
         row['forward_ms'] = time_call(forward)
