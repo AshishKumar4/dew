@@ -135,14 +135,20 @@ def cache_url(python: str, row_name: str) -> str:
 
 
 def cache_request(url: str, token: str, data: bytes | None = None) -> bytes | None:
-    """GET (or with `data`, PUT) `url`; None on a miss or any failure, which only costs a rerun."""
+    """GET (or with `data`, PUT) `url`: None on a miss, and on a failure, which it reports and which
+    costs only a rerun."""
     headers = {"Authorization": f"Bearer {token}", "User-Agent": "dew-ci-test-cache"}
     method = "PUT" if data is not None else "GET"
     request = urllib.request.Request(url, data=data, method=method, headers=headers)
     try:
         with urllib.request.urlopen(request, timeout=10) as response:
             return response.read()
-    except (urllib.error.URLError, TimeoutError, OSError):
+    except urllib.error.HTTPError as error:
+        if error.code != 404:
+            print(f"the test cache answered {error.code} to {method} {url}", file=sys.stderr)
+        return None
+    except (urllib.error.URLError, TimeoutError, OSError) as error:
+        print(f"the test cache is unreachable ({error}); {method} {url} skipped", file=sys.stderr)
         return None
 
 
