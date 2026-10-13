@@ -10,6 +10,7 @@ import threading
 import weakref
 from pathlib import Path
 
+import grain.python as grain
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -18,6 +19,8 @@ import pytest
 from affine_run import TimingRegression as Regression, batches
 
 from dew.artifacts import Representations
+from dew.data import Loading, Rejected, from_grain, mix
+from dew.data.compile import compile
 from dew.data.dataset import DataPartition, Loader, mapped
 from dew.data.readers import _Host
 from dew.training import Checkpoints, MeshSpec, Trainer
@@ -65,6 +68,205 @@ class Source:
         self.closed.set()
         if self.close_failure is not None:
             raise self.close_failure
+
+
+class ObservedRows(grain.IterDataset):
+    """Grain records with observable opening, checkpoint and read ownership."""
+
+    def __init__(self, end=32, *, block_open=False, block_read_at=None):
+        super().__init__()
+        self.end, self.block_open, self.block_read_at = end, block_open, block_read_at
+        self.entered, self.release = threading.Event(), threading.Event()
+        self.opened, self.reads, self.states, self.closed = [], [], [], []
+
+    def __iter__(self):
+        return ObservedRead(self)
+
+    def observe(self, parent):
+        return ObservedPipeline(parent, self)
+
+
+class ObservedRead(grain.DatasetIterator):
+    def __init__(self, source):
+        super().__init__()
+        self.source, self.position = source, 0
+
+    def __next__(self):
+        if self.position == self.source.block_read_at:
+            self.source.entered.set()
+            self.source.release.wait()
+        if self.position == self.source.end:
+            raise StopIteration
+        row = {"i": self.position}
+        self.position += 1
+        return row
+
+    def get_state(self):
+        return {"position": self.position}
+
+    def set_state(self, state):
+        self.position = state["position"]
+
+
+class ObservedPipeline(grain.IterDataset):
+    """Observe the Grain reader opened for a whole compiled chain."""
+
+    def __init__(self, parent, source):
+        super().__init__(parent)
+        self.source = source
+
+    def __iter__(self):
+        self.source.opened.append(threading.get_ident())
+        if self.source.block_open and len(self.source.opened) == 1:
+            self.source.entered.set()
+            self.source.release.wait()
+        return ObservedPipelineRead(iter(self._parent), self.source)
+
+
+class ObservedPipelineRead(grain.DatasetIterator):
+    def __init__(self, parent, source):
+        super().__init__(parent)
+        self.source = source
+
+    def __next__(self):
+        self.source.reads.append(threading.get_ident())
+        return next(self._parent)
+
+    def get_state(self):
+        self.source.states.append(threading.get_ident())
+        return self._parent.get_state()
+
+    def set_state(self, state):
+        self._parent.set_state(state)
+
+    def close(self):
+        if not self._closed:
+            self.source.closed.append(threading.get_ident())
+        super().close()
+
+
+READ = Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1)
+
+
+@pytest.mark.parametrize("host", [False, True])
+@pytest.mark.parametrize("operation", ["request_stop", "prefetch_close"])
+def test_unused_chain_cancellation_does_not_open_its_grain_reader(host, operation):
+    source = ObservedRows()
+    chain = (from_grain(source, "unused").repeat(1).batch(jax.device_count())
+             .grain(source.observe, identity="observed-reader"))
+    data = compile(chain.map(dict) if host else chain, read="streamed", loading=READ)
+    reader = data.train(DataPartition())
+    try:
+        assert source.opened == []
+        if operation == "request_stop":
+            reader.request_stop()
+        else:
+            with DevicePrefetchIterator(reader, MeshSpec().build()):
+                pass
+        assert source.opened == source.reads == source.states == source.closed == []
+    finally:
+        reader.close()
+
+
+def test_chain_cancellation_during_opening_keeps_one_reader_on_the_worker():
+    source = ObservedRows(block_open=True)
+    chain = (from_grain(source, "opening").repeat(1).batch(jax.device_count())
+             .grain(source.observe, identity="observed-reader"))
+    data = compile(chain, read="streamed", loading=READ)
+    stream = DevicePrefetchIterator(data.train(DataPartition()), MeshSpec().build())
+    consumer = threading.Thread(target=lambda: list(stream))
+    consumer.start()
+    try:
+        assert source.entered.wait(5)
+        with pytest.raises(TimeoutError):
+            stream.close(timeout=0.01)
+        assert len(source.opened) == 1
+        assert source.opened[0] != threading.get_ident()
+    finally:
+        source.release.set()
+        stream.close()
+        consumer.join(5)
+    assert not consumer.is_alive()
+    assert source.closed == source.opened
+
+
+def reject_thirds(row):
+    return Rejected("third") if row["i"] % 3 == 0 else row
+
+
+@pytest.mark.parametrize("host", [False, True])
+def test_chain_statistics_publish_without_reading_the_workers_live_iterator(host):
+    batch = jax.device_count()
+    kept = [index for index in range(2 * batch) if index % 3]
+    attempted = kept[batch - 1] + 1
+    source = ObservedRows(end=3 * batch + 1, block_read_at=attempted)
+    chain = (from_grain(source, "observed").repeat(1).filter_map(reject_thirds).batch(batch)
+             .grain(source.observe, identity="observed-reader"))
+    data = compile(chain.map(dict) if host else chain, read="streamed", loading=READ)
+    reader = data.train(DataPartition())
+    with DevicePrefetchIterator(reader, MeshSpec().build(), depth=1) as stream:
+        try:
+            np.testing.assert_array_equal(np.asarray(next(stream)["i"]), kept[:batch])
+            assert source.entered.wait(5)
+            states = tuple(source.states)
+            logged = {
+                "data/attempted/grain:observed": float(attempted),
+                "data/accepted/grain:observed": float(batch),
+                "data/rejected/grain:observed/third": float(attempted - batch),
+                "data/truncated/grain:observed": 0.0,
+                "data/chunks_per_record/grain:observed": 0.0,
+            }
+            for _ in range(3):
+                assert data.statistics() == logged
+            assert tuple(source.states) == states
+            published = data.statistics()
+        finally:
+            source.release.set()
+        remaining = [np.asarray(value["i"]).tolist() for value in stream]
+    assert published == logged
+    assert set(source.states) == set(source.reads) == set(source.opened)
+    assert source.opened[0] != threading.get_ident()
+    assert np.concatenate([kept[:batch], *remaining]).tolist() == [
+        index for index in range(source.end) if index % 3
+    ]
+    reference = weakref.ref(reader)
+    del reader
+    gc.collect()
+    assert reference() is None
+    final = data.statistics()
+    assert final["data/attempted/grain:observed"] == source.end
+    assert final["data/accepted/grain:observed"] == sum(index % 3 != 0 for index in range(source.end))
+    assert final["data/rejected/grain:observed/third"] == sum(index % 3 == 0 for index in range(source.end))
+
+
+def test_chain_statistics_follow_each_corpus_through_direct_reads_and_resume():
+    sources = [ObservedRows(end=64) for _ in range(2)]
+    chain = mix([from_grain(source, name).filter_map(reject_thirds)
+                 for source, name in zip(sources, ("a", "b"), strict=True)]).batch(4)
+    data = compile(chain, read="streamed", loading=READ)
+    first = data.train(DataPartition())
+    try:
+        next(first)
+        before = data.statistics()
+        saved = first.get_state()
+        expected = next(first)["i"]
+        after = data.statistics()
+        assert all(after[f"data/attempted/grain:{name}"] > before[f"data/attempted/grain:{name}"]
+                   for name in ("a", "b"))
+    finally:
+        first.close()
+    resumed = compile(chain, read="streamed", loading=READ)
+    reader = resumed.train(DataPartition())
+    try:
+        reader.set_state(saved)
+        np.testing.assert_array_equal(next(reader)["i"], expected)
+        assert resumed.statistics() == after
+        for name in ("a", "b"):
+            assert after[f"data/attempted/grain:{name}"] == (
+                after[f"data/accepted/grain:{name}"] + after[f"data/rejected/grain:{name}/third"]
+            )
+    finally:
+        reader.close()
 
 
 def test_full_queue_close_preserves_consumed_position_and_releases_source():
