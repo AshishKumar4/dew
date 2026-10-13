@@ -649,8 +649,9 @@ def _fused_terms(hidden, table, labels, weights, z_loss: float, cap, bias, chunk
             values.append(top[1])
         if gradients:
             weight = jax.lax.dynamic_slice_in_dim(weights, start, size).astype(work)
-            d_raw, = pullback(_softmax_cotangent(logits, 0, excluded, peaks, masses, targets, weight,
-                                                 2 * z_loss * log_z * weight))
+            cotangent = _softmax_cotangent(logits, 0, excluded, peaks, masses, targets, weight,
+                                           2 * z_loss * log_z * weight)
+            d_raw = jnp.asarray(pullback(cotangent)[0])
             d_bias = None if d_bias is None else d_bias + jnp.sum(d_raw, axis=0)
             d_raw = _logits_cotangent(d_raw, precision)
             values.append(jnp.einsum('tv,vd->td', d_raw, product_matrix, precision=precision,
