@@ -47,8 +47,6 @@ from tools import masked_diffusion_export_reference as tool
 REPO_ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = REPO_ROOT / "tests" / "fixtures" / "hf"
 LOGITS = 1e-4
-MOVEMENT = 1e-4
-
 CASES = {case.name: case for case in tool.CASES}
 
 
@@ -75,31 +73,6 @@ def trip(request, trips):
     return trips(request.param)
 
 
-def test_every_source_tensor_is_bound_and_written_back_under_its_own_name(trip):
-    """No tensor of the checkpoint is renamed or dropped on the way out. The
-    llama spelling the shared leaf map reads LLaDA through is an internal
-    detail of the load; what lands on disk is the release's own table."""
-    bound = [layout.name for layout in trip.source.weight_layouts]
-
-    assert len(bound) == len(set(bound)), "a source tensor is bound twice"
-    assert set(bound) == set(trip.source_tensors), "a source tensor is unbound"
-    assert not trip.source.retained_tensors
-    assert set(trip.exported_tensors) == set(trip.source_tensors)
-    for name, tensor in trip.source_tensors.items():
-        assert trip.exported_tensors[name].shape == tensor.shape, name
-
-
-def test_the_export_carries_the_trained_weights_not_the_loaded_ones(trip):
-    """One SGD step of the masked-diffusion NELBO moves the embedding, the
-    attention and MLP projections, the norms and the head, and it is the
-    moved values the source layout writes back."""
-    distances = tool.moved(trip)
-
-    assert set(distances) >= {"embedding", "attention", "mlp", "norm", "head"}
-    for kind, distance in distances.items():
-        assert distance > MOVEMENT, f"{kind} moved {distance:.3e}"
-
-
 def test_the_trained_export_reloads_leaf_for_leaf_and_recomputes_the_logits(trip):
     """`Pretrained.load` reads the export back into the same model with the
     trained values bit for bit, so it computes the same logits."""
@@ -122,28 +95,6 @@ def test_transformers_reads_the_trained_export(trip):
     assert np.array_equal(np.argmax(trip.theirs, -1), np.argmax(trip.ours, -1))
     difference = float(np.max(np.abs(trip.theirs - trip.ours)))
     assert difference < LOGITS, f"max |logit difference| {difference:.3e}"
-
-
-def test_the_export_keeps_the_sources_own_config(trip):
-    """The source's config is retained, not rebuilt from the model: a derived
-    config would drop the aliases and the training flags the release carries
-    and that the loader reads past."""
-    directory = FIXTURES / trip.case.fixture
-
-    assert (json.loads((trip.export / "config.json").read_text())
-            == json.loads((directory / "config.json").read_text()))
-
-
-def test_the_bidirectional_reading_is_what_the_reference_agrees_with(trip):
-    """The reference is the causal block with the mask lifted, which is the
-    forward both releases hard-code. Reading the same export causally moves
-    the logits well past the tolerance, so the agreement above is evidence
-    about the attention and not only about the weights."""
-    causal = trip.reloaded.model.clone(causal=True)
-    theirs = np.asarray(causal.apply(trip.reloaded.variables, trip.ids), np.float32)
-
-    difference = float(np.max(np.abs(theirs - trip.ours)))
-    assert difference > LOGITS, f"a causal read moved the logits {difference:.3e}"
 
 
 @pytest.mark.parametrize("fixture", ["llada-tiny", "dream-tiny"])

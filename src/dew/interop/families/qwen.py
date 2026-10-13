@@ -28,6 +28,7 @@ from dew.interop.decoder_parts import (
     kind_mixers,
     kinds_of,
     plain_partial_rope,
+    prediction_path,
     read_rope,
     record_int,
     refuse,
@@ -348,30 +349,24 @@ _QWEN_MTP_FIELDS = {
     "pre_fc_norm_hidden.weight": ("hnorm", "scale"),
     "norm.weight": ("final_norm", "scale"),
 }
-
-
 def _qwen_mtp_path(
     name: str,
     config: Mapping[str, object],
     block_path: Callable[[str, Mapping[str, object]], tuple[str, ...] | None],
-) -> tuple[str, ...]:
+) -> tuple[str, ...] | None:
     """Return the variables-tree path for one Qwen MTP tensor name.
 
     The names are vLLM qwen3_5_mtp.py's, for the shared-embedding single
-    prediction layer. `block_path` maps the layer's own block tensors.
+    prediction layer: its own leaves under `mtp.`, its block under
+    `mtp.layers.0.`, which `block_path` maps as the trunk's layer 0's.
     """
-    if config.get("num_nextn_predict_layers", 0) != 1:
-        raise ValueError("mtp tensors require one configured Qwen prediction layer")
-    tail = name.removeprefix("mtp.")
-    if tail in _QWEN_MTP_FIELDS:
-        return ("params", "mtp_0", *_QWEN_MTP_FIELDS[tail])
-    if tail.startswith("layers.0."):
-        path = block_path("model." + tail, config)
-        if path is not None:
-            return (path[0], "mtp_0", "block", *path[2:])
-    raise ValueError(f"unknown Qwen MTP tensor {name!r}")
+    def block(tail: str) -> tuple[str, ...] | None:
+        if not tail.startswith("layers.0."):
+            raise ValueError(f"unknown Qwen MTP tensor {name!r}")
+        return block_path("model." + tail, config)
 
-
+    return prediction_path(name, "mtp", 0, record_int(config, "num_nextn_predict_layers", 0),
+                           name.removeprefix("mtp."), _QWEN_MTP_FIELDS, block)
 def _qwen35_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
     if name.startswith("mtp."):
         return _qwen_mtp_path(name, config, dew_path)

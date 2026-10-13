@@ -77,6 +77,12 @@ _PROJECTOR_PATHS: dict[str, dict[str, tuple[str, ...]]] = {
         "linear_fc1.weight": ("fc1", "kernel"), "linear_fc1.bias": ("fc1", "bias"),
         "linear_fc2.weight": ("fc2", "kernel"), "linear_fc2.bias": ("fc2", "bias"),
     },
+    # MiMo's merger stores no biases (MiMoVisionPatchMerger's released tensors).
+    "mimo": {"ln_q.weight": ("norm", "scale"), "mlp.0.weight": ("fc1", "kernel"),
+             "mlp.2.weight": ("fc2", "kernel")},
+    # Muse Glimmer's adapter and projection, each name its prefix off (`PROJECTOR_PREFIX`).
+    "muse_glimmer": {"fc1.weight": ("adapter", "fc1", "kernel"), "fc2.weight": ("adapter", "fc2", "kernel"),
+                     "weight": ("projection", "kernel")},
     "gemma3n": {
         "embedding.weight": ("embedding", "embedding"),
         "hard_embedding_norm.weight": ("hard_embedding_norm", "scale"),
@@ -96,7 +102,7 @@ _PROJECTOR_PATHS: dict[str, dict[str, tuple[str, ...]]] = {
 
 def projector_weight_path(kind: str, name: str) -> tuple[str, ...]:
     """The projector's canonical tensor path, shared by load and source export."""
-    if kind == "qwen3_5":
+    if kind in ("qwen3_5", "mimo"):
         name = name.removeprefix("merger.")
     if kind not in _PROJECTOR_PATHS or name not in _PROJECTOR_PATHS[kind]:
         raise ValueError(f"unknown {kind} projector tensor {name!r}")

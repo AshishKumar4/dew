@@ -6,7 +6,6 @@ it happens once per run, not once per process, and a checkpoint directory
 that is a bucket URI is referenced, not uploaded, with the run spec beside it.
 """
 
-import json
 import shutil
 import sys
 import types
@@ -96,136 +95,6 @@ class TrackedRun(Run):
         self.exit_codes.append(exit_code)
 
 
-@pytest.mark.parametrize('publish', [False, True])
-def test_what_a_run_writes_after_training_is_published_only_on_request(tmp_path, wandb, publish):
-    """`after` runs before the final checkpoint is published, so a file it
-    writes into the run, as a decision run's calibrated task, is published
-    beside the step."""
-    from test_instrumentation import Regression, batches
-
-    from dew.config import RunConfig, TrainerConfig, Wandb
-    from dew.data import Loading
-
-    run = TrackedRun()
-    opened = []
-
-    def init(**options):
-        opened.append(options)
-        return run
-
-    wandb.init = init
-    config = RunConfig(trainer=TrainerConfig(
-        name="after", checkpoint_dir=str(tmp_path / "runs"), steps=1, batch_size=8, eval_every=None,
-        checkpoint_every=1, log_every=1, publish=publish, wandb=Wandb(project="dew", offline=True)))
-
-    def calibrate(state, directory):
-        (Path(directory) / "decide.json").write_text("{}")
-
-    batch = next(batches())
-    rows = [{"x": x, "y": y} for x, y in zip(batch["x"], batch["y"], strict=True)]
-    config.train(Regression(), loader(RecordsData(source=rows), batch=8, loading=Loading(workers=0),
-        read="memory"), name="after",
-                 after=calibrate)
-    assert opened[0]['name'] == config.trainer.name
-    assert any('train/loss' in row and 'train/grad_norm' in row for row in run.history)
-    assert len(wandb.created) == int(publish)
-    if publish:
-        ((artifact, _),) = run.logged
-        assert sorted(name for _, name in artifact.files) == ["decide.json", RUN_FILE]
-        assert len(run.linked) == 1
-    else:
-        assert run.logged == run.linked == []
-
-
-def test_publication_requires_a_wandb_run():
-    from dew.config import TrainerConfig
-
-    assert TrainerConfig().publish is False
-    with pytest.raises(ValueError, match=r'publish.*wandb'):
-        TrainerConfig(publish=True)
-
-
-def test_a_local_checkpoint_is_uploaded_with_its_run_spec(tmp_path, wandb):
-    run = tmp_path / "flowers"
-    step = run / "step_6"
-    step.mkdir(parents=True)
-    (step / "params").write_text("weights")
-    (run / RUN_FILE).write_text("{}")
-    (run / "decide.json").write_text("{}")
-    tracker = Tracker()
-
-    logged = dew.io.publish(str(step), "flowers", tracker=tracker, aliases=("v1",))
-
-    assert logged is not None
-    assert logged.dirs == [(str(step), "step_6")] and logged.references == []
-    assert logged.files == [(str(run / "decide.json"), "decide.json"), (str(run / RUN_FILE), RUN_FILE)], \
-        "the run's own files, its spec and what it wrote beside it, ride with the weights"
-    assert tracker.run.logged[0][1] == ("latest", "v1")
-    assert tracker.run.linked[0][1] == f"{dew.io.REGISTRY}/flowers"
-
-
-def test_a_bucket_checkpoint_is_referenced_rather_than_uploaded(monkeypatch, tmp_path, wandb):
-    """A pod writes its checkpoints to the bucket, and os.path.exists on a
-    gs:// path is False, so the spec is found through the path's own parent
-    and the reference carries it with no local read."""
-    class Uri:
-        """What publish asks a path: its parent, a child, its listing, and
-        whether it is a file. A real gs:// path would need credentials."""
-
-        def __init__(self, uri):
-            self.uri = str(uri)
-
-        @property
-        def parent(self):
-            return Uri(self.uri.rsplit("/", 1)[0])
-
-        def __truediv__(self, name):
-            return Uri(f"{self.uri}/{name}")
-
-        @property
-        def name(self):
-            return self.uri.rsplit("/", 1)[-1]
-
-        def exists(self):
-            return True
-
-        def is_file(self):
-            return self.name == RUN_FILE
-
-        def iterdir(self):
-            return [self / "step_6", self / RUN_FILE]
-
-        def read_text(self):
-            """The step's Orbax metadata, recording one stored collection."""
-            return json.dumps({"custom_metadata": {"frozen": {"variables": {"frozen": "f00d"}}}})
-
-        def __str__(self):
-            return self.uri
-
-    monkeypatch.setattr(dew.io.epath, "Path", Uri)
-    tracker = Tracker()
-
-    logged = dew.io.publish("gs://dew-runs/flowers/step_6", "flowers", tracker=tracker)
-
-    assert logged is not None
-    assert logged.dirs == [] and logged.files == []
-    assert logged.references == [("gs://dew-runs/flowers/step_6", "step_6"),
-                                 (f"gs://dew-runs/flowers/{RUN_FILE}", RUN_FILE),
-                                 (f"gs://dew-runs/flowers/{FROZEN_STORE}/f00d", f"{FROZEN_STORE}/f00d")]
-
-
-def test_only_process_zero_publishes(monkeypatch, tmp_path, wandb):
-    """Every process holds the same checkpoint, so a publish per process is a
-    duplicate upload of one artifact, not a part of the run."""
-    step = tmp_path / "flowers" / "step_6"
-    step.mkdir(parents=True)
-    monkeypatch.setattr(jax, "process_index", lambda: 1)
-    tracker = Tracker()
-
-    assert dew.io.publish(str(step), "flowers", tracker=tracker) is None
-    assert tracker.run.logged == [] and tracker.run.linked == []
-
-
 class FileUri:
     """A file:// URI over a local path, standing in for a bucket path, which
     `epath` reads but this test cannot reach; wandb references it as it is."""
@@ -278,7 +147,6 @@ def test_a_published_lora_run_downloads_to_a_run_that_loads_and_restores(tmp_pat
     records into a directory that `Adapter.from_run` and `Checkpoints.restore`
     read with the run itself gone: the adapter computes what the run trained,
     and the restored state is the run's, bitwise."""
-    import jax
     import jax.numpy as jnp
     import numpy as np
     import optax

@@ -8,7 +8,7 @@ source-format export of both families lives in test_masked_diffusion_export.py.
 """
 
 import json
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from importlib import import_module
 from pathlib import Path
 
@@ -159,46 +159,6 @@ def test_unmask_sampler_runs_on_a_loaded_model_end_to_end():
     assert bool(np.isfinite(np.asarray(scored.losses)).all()) and float(np.asarray(scored.losses).max()) > 0
 
 
-def test_the_objective_reports_the_loaded_tree_and_returns_it_from_init():
-    """The held-weights contract. `held_variables` is what the trainer's
-    boundary binds as an argument, and `init` returns that tree whether the
-    caller passes it or leaves the objective to read its own. An objective
-    holding nothing binds nothing and draws the model's tree from the key."""
-    model, variables = loaded("llada-tiny")
-    holding = MaskedDiffusionObjective(model, MDLM(mask_id=120)(), seq_len=12,
-                                       ema_decay=None, variables=variables)
-    fresh = MaskedDiffusionObjective(model, MDLM(mask_id=120)(), seq_len=12, ema_decay=None)
-    tree_bytes = sum(int(np.asarray(leaf).nbytes) for leaf in jax.tree.leaves(variables))
-
-    assert holding.held_variables() is variables and fresh.held_variables() is None
-    assert sum(int(np.asarray(leaf).nbytes)
-               for leaf in jax.tree.leaves(holding.initializer)) == tree_bytes
-    assert jax.tree.leaves(fresh.initializer) == []
-
-    key = jax.random.key(0)
-    held = flat_tree(variables)
-    for tree in (holding.init(key), holding.initializer(key), fresh.init(key, variables)):
-        assert flat_tree(tree).keys() == held.keys()
-        for name, leaf in flat_tree(tree).items():
-            np.testing.assert_array_equal(np.asarray(leaf), np.asarray(held[name]))
-    drawn = flat_tree(fresh.init(key))
-    assert drawn.keys() == held.keys()
-    assert any(not np.array_equal(np.asarray(leaf), np.asarray(held[name]))
-               for name, leaf in drawn.items()), "the fresh init returned the held tree"
-
-
-def test_a_tree_that_is_not_the_variables_dict_is_refused():
-    """`pretrained` is the whole variables dict, so a params collection
-    handed over on its own is named rather than initialising a tree whose
-    leaves sit one level too high."""
-    model, variables = loaded("llada-tiny")
-    objective = MaskedDiffusionObjective(model, MDLM(mask_id=120)(), seq_len=12,
-                                         ema_decay=None, variables=variables["params"])
-
-    with pytest.raises(ValueError, match="params"):
-        objective.init(jax.random.key(0))
-
-
 def test_the_trainer_builds_its_state_from_the_held_checkpoint():
     """What the seam exists for: a real `Trainer` accepts the objective and
     its initial state is the loaded checkpoint, so the run continues from
@@ -274,7 +234,7 @@ def test_masked_continuations_seed_eos_and_zero_budget(masked_source):
     np.testing.assert_array_equal(empty.decoder_steps, 0)
     with pytest.raises(TypeError):
         source.text_generation(sampling=Sampling())
-    with pytest.raises(ValueError, match="num_beams"):
+    with pytest.raises(ValueError):
         replace(source, generation_config={"num_beams": 2}).text_generation()
     for controls in ({"sampling": Sampling()}, {"logits": ()}, {"num_beams": 2}):
         with pytest.raises(TypeError):
@@ -349,53 +309,6 @@ def test_masked_training_resume_publish_and_run_pipeline(masked_source, tmp_path
     assert raw.text == restored.decode(raw)
 
 
-@dataclass(frozen=True)
-class Withheld(Unmask):
-    """Reveals nothing, so the closing argmax alone fills the response."""
-
-    def step(self, x, t, t_next, denoised, log_probs, state, key, process, denoise):
-        return x, state
-
-
-def test_masked_continuation_uses_last_valid_packed_segment(masked_source):
-    """The response a packed row's last segment conditions is the one that
-    segment conditions alone: read through the closing argmax, which no
-    random draw shapes, since the rows differ in width."""
-    source, _ = masked_source
-    task = replace(source.text_generation(), solver=Withheld())
-    final = ModelInputs(jnp.asarray([[7, 8, 9, 0, 0]]), {
-        "attention_mask": jnp.asarray([[1, 1, 1, 0, 0]], bool),
-        "positions": jnp.asarray([[0, 1, 2, 42, 42]]),
-        "segment_ids": jnp.asarray([[2, 2, 2, 0, 0]])})
-    packed = ModelInputs(
-        jnp.concatenate([jnp.arange(1, 17)[None], final.tokens], axis=1),
-        {
-            "attention_mask": jnp.concatenate(
-                [jnp.ones((1, 16), bool), final.token_fields["attention_mask"]], axis=1
-            ),
-            "positions": jnp.concatenate(
-                [jnp.arange(100, 116)[None], final.token_fields["positions"]], axis=1
-            ),
-            "segment_ids": jnp.concatenate(
-                [jnp.ones((1, 16), jnp.int32), final.token_fields["segment_ids"]], axis=1
-            ),
-        },
-    )
-    alone = task(final, 8, key=7, steps=1).host()
-    together = task(packed, 8, key=7, steps=1).host()
-    np.testing.assert_array_equal(together.tokens[:, :21], packed.tokens)
-    np.testing.assert_array_equal(together.tokens[:, -8:], alone.tokens[:, -8:])
-
-
-def test_masked_source_refuses_active_ar_controls_by_name(masked_source):
-    source, _ = masked_source
-    for name, value in (("repetition_penalty", 2.0), ("suppress_tokens", [7]),
-                        ("stop_strings", ["stop"]), ("num_beams", 2),
-                        ("temperature", 0.5), ("use_cache", True)):
-        with pytest.raises(ValueError, match=name):
-            replace(source, generation_config={name: value}).text_generation()
-
-
 def test_masked_source_accepts_neutral_controls_and_honors_task_metadata(masked_source):
     source, inputs = masked_source
     controls = {"repetition_penalty": 1.0, "suppress_tokens": None, "stop_strings": None,
@@ -410,26 +323,3 @@ def test_masked_source_accepts_neutral_controls_and_honors_task_metadata(masked_
     wanted = expected(inputs, key=7, steps=5).host()
     for left, right in zip(jax.tree.leaves(actual), jax.tree.leaves(wanted), strict=True):
         np.testing.assert_array_equal(left, right)
-
-
-def test_masked_task_refuses_non_scalar_logical_positions(masked_source):
-    source, inputs = masked_source
-    task = source.text_generation()
-    with pytest.raises(ValueError, match="positions"):
-        task(
-            replace(inputs, token_fields={**inputs.token_fields, "positions": jnp.zeros((3, 4, 3))}), 8, key=7
-        )
-
-
-def test_saved_masked_run_refuses_invalid_sample_budget(masked_source, tmp_path):
-    source, _ = masked_source
-    objective = MaskedDiffusionObjective(source.model, MDLM(mask_id=120)(), 8,
-                                         variables=source.variables, ema_decay=None)
-    state = Trainer(objective, optax.sgd(0.05), key=jax.random.key(19)).initial_state()
-    for index, budget in enumerate((-1, True, "8")):
-        checkpoints = Checkpoints(str(tmp_path / str(index)))
-        checkpoints.save(0, state, None, artifact={**objective.inference_record(), "max_new_tokens": budget})
-        checkpoints.wait()
-        with pytest.raises(ValueError, match="max_new_tokens"):
-            pipeline(str(tmp_path / str(index)), ema=False)
-

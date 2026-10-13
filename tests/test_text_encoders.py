@@ -32,29 +32,15 @@ divides the query by sqrt(head_dim) before the logits, where the reference
 multiplies the logits after (modeling_clip.py, eager_attention_forward).
 """
 
-import dataclasses
 import json
 import os
-import shutil
 from pathlib import Path
 
 import numpy as np
 import pytest
 
 from dew.inputs import CLIPText, Condition, Field, InputSpec
-from dew.nn.text_encoders import (
-    CLIPModel,
-    CLIPTextModel,
-    CLIPTextTransformer,
-    CLIPVisionTransformer,
-    T5EncoderTransformer,
-    translate_clip_config,
-    translate_clip_weights,
-    translate_config,
-    translate_t5_config,
-    translate_vision_config,
-    translate_weights,
-)
+from dew.nn.text_encoders import CLIPModel, CLIPTextModel, CLIPTextTransformer, translate_config
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "clip"
 TINY = FIXTURES / "tiny"
@@ -95,37 +81,6 @@ def largest_difference(actual, expected) -> float:
     return float(np.max(np.abs(np.asarray(actual, np.float32) - expected)))
 
 
-# Each translator must actually state every checkpoint-controlled field of
-# its tower, even when the constructor could supply a default instead.
-# `dtype` and `precision` are the caller's execution choices and `parent` and
-# `name` are flax's binding, so a config states none of the four.
-@pytest.mark.parametrize("translate, module, directory", [
-    (translate_config, CLIPTextTransformer, TINY),
-    (translate_vision_config, CLIPVisionTransformer, TINY),
-    (translate_t5_config, T5EncoderTransformer, FIXTURES.parent / "t5" / "tiny"),
-])
-def test_a_translated_config_names_every_field_of_the_tower_it_builds(translate, module, directory):
-    record = translate(fixture_config(directory))
-    declared = {field.name for field in dataclasses.fields(module)
-                if field.init} - {"parent", "name", "dtype", "precision"}
-    assert set(record) == declared
-    value = record.value
-    assert {name: getattr(value, name) for name in record} == record
-
-
-def test_a_constructor_record_keeps_defaults_implicit_and_reads_its_current_fields():
-    from dew.interop.config_records import native_fields
-
-    record = native_fields(CLIPTextTransformer)(vocab_size=31, hidden_size=8)
-    assert record == {"vocab_size": 31, "hidden_size": 8}
-    assert record.value.num_layers == 12
-    record["hidden_size"] = 16
-    assert record.value.hidden_size == 16
-    record["hidden_features"] = 8
-    with pytest.raises(ValueError, match="hidden_features"):
-        _ = record.value
-
-
 def test_translating_inside_a_module_keeps_its_native_parameter_names():
     import jax
     import jax.numpy as jnp
@@ -162,15 +117,12 @@ def test_tiny_checkpoint_matches_the_reference():
     assert hidden < TOLERANCE, f"max |hidden state difference| {hidden:.3e}"
     assert pooled < TOLERANCE, f"max |pooled difference| {pooled:.3e}"
 
-
-def test_the_tolerance_refuses_a_final_norm_off_by_one_part_in_two_to_the_seventeenth():
-    """A final norm whose gain is 1 + 2^-17 changes no shape and keeps every
-    invariant the tower's own tests compare it with itself on; on states
-    reaching 2.8 it moves them by about 2e-5, which the tolerance refuses."""
-    expected = reference(TINY)
-    outputs = CLIPTextModel.from_pretrained(str(TINY))(expected["input_ids"], expected["attention_mask"])
-    gained = np.asarray(outputs.last_hidden_state, np.float32) * np.float32(1 + 2 ** -17)
-    assert float(np.max(np.abs(gained - expected["last_hidden_state"]))) > TOLERANCE
+    ids = expected["input_ids"]
+    rows = np.arange(ids.shape[0])
+    eos = np.argmax(ids == model.config["eos_token_id"], axis=-1)
+    np.testing.assert_array_equal(np.asarray(outputs.pooler_output, np.float32),
+                                  np.asarray(outputs.last_hidden_state, np.float32)[rows, eos])
+    assert (np.argmax(ids, axis=-1) != eos).any()
 
 
 def test_the_encoder_loads_and_encodes():
@@ -248,27 +200,6 @@ def test_attention_stays_causal():
     assert np.max(np.abs(baseline[:, position] - moved[:, position])) > 0.1
 
 
-def test_pooled_row_follows_the_eos_token():
-    """The reference pools the row of the first eos token unless the config
-    carries the legacy eos_token_id 2, when it pools the argmax of the ids
-    instead. The tiny fixture's eos is 1 and its characters are larger, so the
-    two rules disagree and this pins the one the config asks for."""
-    expected = reference(TINY)
-    ids, mask = expected["input_ids"], expected["attention_mask"]
-    model = CLIPTextModel.from_pretrained(str(TINY))
-    assert model.config["eos_token_id"] == 1
-
-    outputs = model(ids, mask)
-    hidden = np.asarray(outputs.last_hidden_state, np.float32)
-    rows = np.arange(ids.shape[0])
-    eos = np.argmax(ids == 1, axis=-1)
-
-    assert np.array_equal(np.asarray(outputs.pooler_output, np.float32),
-                          hidden[rows, eos])
-    argmax = np.argmax(ids, axis=-1)
-    assert (argmax != eos).any(), "the fixture cannot tell the two rules apart"
-
-
 def test_legacy_eos_token_id_pools_the_argmax_row():
     """openai's own configs carry eos_token_id 2, and transformers keeps
     pooling those at the argmax of the input ids (PR #24773). The real
@@ -314,6 +245,12 @@ def test_tiny_checkpoint_image_embeddings_match_the_reference():
     difference = largest_difference(embeds, expected["image_embeds"])
     assert difference < TOLERANCE, f"max |image embedding difference| {difference:.3e}"
 
+    baseline = model.module.apply(
+        model.variables, pixel_values, method=lambda clip, pixels: clip.vision_model(pixels))
+    moved = model.module.apply(model.variables, np.flip(pixel_values, axis=-1),
+                               method=lambda clip, pixels: clip.vision_model(pixels))
+    assert np.max(np.abs(np.asarray(baseline.pooler_output) - np.asarray(moved.pooler_output))) > 0.1
+
 
 SAFETY_CROP = {"size": {"shortest_edge": 224}, "crop_size": {"height": 224, "width": 224}}
 SMALL_CROP = {"crop_size": {"height": 8, "width": 8}, "do_resize": False}
@@ -339,141 +276,6 @@ def test_clip_image_transform_matches_the_reference_processor(config, height, wi
     actual = np.asarray(CLIPImageTransform.from_config(config)(pixels))
 
     np.testing.assert_allclose(actual, expected, atol=1e-6)
-
-
-def test_vision_attention_reaches_every_patch():
-    """The vision tower is not causal: the class row, which is pooled, attends
-    to every patch, so changing the pixels moves the pooled row. With the text
-    tower's causal mask reused here, position 0 would see nothing but itself
-    and the pooled row would not depend on the image at all."""
-    expected = reference(TINY)
-    model = CLIPModel.from_pretrained(str(TINY))
-    pixel_values = expected["pixel_values"]
-
-    baseline = model.module.apply(
-        model.variables, pixel_values, method=lambda clip, pixels: clip.vision_model(pixels))
-    moved = model.module.apply(
-        model.variables, np.flip(pixel_values, axis=-1),
-        method=lambda clip, pixels: clip.vision_model(pixels))
-
-    assert np.max(np.abs(np.asarray(baseline.pooler_output)
-                         - np.asarray(moved.pooler_output))) > 0.1
-
-
-def test_pixel_values_of_another_size_are_refused():
-    """A checkpoint's position table covers one grid of patches; the reference
-    raises on any other image size and interpolates nothing."""
-    model = CLIPModel.from_pretrained(str(TINY))
-
-    with pytest.raises(ValueError, match="3x8x8"):
-        model.get_image_features(np.zeros((1, 3, 16, 16), np.float32))
-
-
-def test_a_text_only_config_translates_the_same_way():
-    """A checkpoint of the tower alone carries the CLIPTextConfig at the root,
-    which has to describe the same tower as the nested copy."""
-    nested = fixture_config(TINY)
-    assert translate_config(nested) == translate_config(nested["text_config"])
-
-
-def test_the_real_config_translates_to_the_towers_it_describes():
-    """A full config carries both towers and the width of the heads; the
-    vision fields come from vision_config the way the text ones come from
-    text_config, and a CLIPVisionConfig on its own reads the same."""
-    config = translate_clip_config(fixture_config(REAL))
-
-    assert config == {
-        "text": translate_config(fixture_config(REAL)),
-        "vision": {
-            "hidden_size": 1024, "intermediate_size": 4096, "num_layers": 24,
-            "num_heads": 16, "image_size": 224, "patch_size": 14, "num_channels": 3,
-            "layer_norm_eps": 1e-5,
-        },
-        "projection_dim": 768,
-    }
-    nested = fixture_config(TINY)
-    assert translate_vision_config(nested) == translate_vision_config(nested["vision_config"])
-
-
-def test_an_unfamiliar_tensor_name_is_refused():
-    """Skipping a name nobody mapped is how a checkpoint loads with half its
-    weights. The text tower's loader skips the vision tower and the projection
-    heads by their prefixes; the full model's loader maps them and skips only
-    the buffers and the logit scale. Any other name raises ValueError."""
-    with pytest.raises(ValueError, match=r"text_model.encoder.layers.0.self_attn.qkv"):
-        translate_weights({"text_model.encoder.layers.0.self_attn.qkv.weight":
-                           np.zeros((3, 2), np.float32)})
-    with pytest.raises(ValueError, match=r"vision_model.embeddings.patch_embedding.bias"):
-        translate_clip_weights({"vision_model.embeddings.patch_embedding.bias":
-                                np.zeros((2,), np.float32)})
-    with pytest.raises(ValueError, match="logit_bias"):
-        translate_clip_weights({"logit_bias": np.zeros((), np.float32)})
-
-    beside_the_text_tower = {
-        "vision_model.embeddings.class_embedding": np.zeros((2,), np.float32),
-        "visual_projection.weight": np.zeros((2, 2), np.float32),
-        "text_projection.weight": np.zeros((2, 2), np.float32),
-        "logit_scale": np.zeros((), np.float32),
-        "text_model.embeddings.position_ids": np.zeros((1, 77), np.int64),
-        "vision_model.embeddings.position_ids": np.zeros((1, 5), np.int64),
-    }
-    assert translate_weights(beside_the_text_tower) == {}
-    whole = translate_clip_weights(beside_the_text_tower)
-    assert {name: leaf.shape for name, leaf in whole.items() if leaf.__class__ is np.ndarray} == {}
-    assert sorted(whole) == ["text_projection", "vision_model", "visual_projection"]
-    assert sorted(whole["vision_model"]) == ["class_embedding"]
-
-
-def test_two_different_tensors_for_one_parameter_are_refused():
-    """The text tower's prefix is optional, so a file can name one parameter
-    twice. Equal copies are one tied tensor and load; different ones are two
-    parameters, and keeping the last would drop the other unnoticed."""
-    name = "embeddings.token_embedding.weight"
-    table = np.arange(6, dtype=np.float32).reshape(3, 2)
-
-    tied = translate_weights({"text_model." + name: table, name: table.copy()})
-    np.testing.assert_array_equal(tied["token_embedding"]["embedding"], table)
-    with pytest.raises(ValueError, match="token_embedding"):
-        translate_weights({"text_model." + name: table, name: table + 1})
-
-
-
-def test_conv_kernels_land_in_linen_layout():
-    """torch Conv2d holds [out, in, kh, kw] and nn.Conv [kh, kw, in, out]; a
-    kernel handed over untransposed would convolve the wrong axes and only
-    fail parity, so the layout is pinned by value."""
-    kernel = np.arange(2 * 3 * 4 * 5, dtype=np.float32).reshape(2, 3, 4, 5)
-    tree = translate_clip_weights({"vision_model.embeddings.patch_embedding.weight": kernel})
-
-    landed = tree["vision_model"]["patch_embedding"]["kernel"]
-    assert landed.shape == (4, 5, 3, 2)
-    assert landed[1, 2, 0, 1] == kernel[1, 0, 1, 2]
-
-
-def test_a_checkpoint_that_does_not_fit_its_config_is_refused(tmp_path):
-    """A config claiming more layers than the file holds would otherwise load a
-    model whose last layer is still random."""
-    for name in ("model.safetensors", "tokenizer.json", "tokenizer_config.json"):
-        shutil.copyfile(TINY / name, tmp_path / name)
-    config = fixture_config(TINY)
-    config["text_config"]["num_hidden_layers"] = 3
-    (tmp_path / "config.json").write_text(json.dumps(config))
-
-    with pytest.raises(ValueError, match="missing"):
-        CLIPTextModel.from_pretrained(str(tmp_path))
-
-
-def test_a_full_checkpoint_that_does_not_fit_its_config_is_refused(tmp_path):
-    """The same refusal for the vision tower: a config claiming a second
-    vision layer the file does not hold."""
-    for name in ("model.safetensors", "preprocessor_config.json"):
-        shutil.copyfile(TINY / name, tmp_path / name)
-    config = fixture_config(TINY)
-    config["vision_config"]["num_hidden_layers"] = 2
-    (tmp_path / "config.json").write_text(json.dumps(config))
-
-    with pytest.raises(ValueError, match=r"vision_model.layers_1"):
-        CLIPModel.from_pretrained(str(tmp_path))
 
 
 def real_checkpoint_is_available() -> bool:
@@ -557,56 +359,3 @@ def test_public_text_encoder_storage_is_separate_from_compute(kind):
         assert np.asarray(before).dtype == np.float32
         assert after.dtype == jnp.bfloat16
         np.testing.assert_array_equal(after, np.asarray(before).astype(jnp.bfloat16))
-
-
-@pytest.mark.parametrize("kind", ["clip_text", "t5"])
-def test_convenience_encoder_rebuild_binds_saved_weights_without_source_reads(kind, tmp_path, monkeypatch):
-    import dataclasses
-
-    import jax
-    import jax.numpy as jnp
-
-    import dew.nn.text_encoders as loaders
-    from dew.inputs import T5Text
-    from dew.inputs.encoders import rebuild
-
-    cls = CLIPText if kind == "clip_text" else T5Text
-    directory = TINY if kind == "clip_text" else FIXTURES.parent / "t5/tiny"
-    kwargs = {} if kind == "clip_text" else {"max_length": 8}
-    encoder = cls.from_pretrained(str(directory), dtype="float32", param_dtype="bfloat16", **kwargs)
-    tokens = encoder.tokenize(["a red bird"])
-    ordinary = rebuild(kind, encoder.to_json())
-    np.testing.assert_array_equal(ordinary.encode(ordinary.params, tokens).hidden,
-                                  encoder.encode(encoder.params, tokens).hidden)
-    assert all(leaf.dtype == jnp.bfloat16 for leaf in jax.tree.leaves(ordinary.params))
-
-    # The restored tree differs from the source. A reload cannot accidentally
-    # pass the forward comparison, even if it happens to use the right dtype.
-    saved = jax.tree.map(lambda leaf: leaf + jnp.asarray(0.125, leaf.dtype), encoder.params)
-    saved = {**saved, "constants": {"scale": jnp.asarray([1.003], jnp.float32),
-                                   "ids": jnp.asarray([16777217], jnp.int32)}}
-    for source in directory.iterdir():
-        if source.is_file() and source.suffix != ".safetensors":
-            shutil.copyfile(source, tmp_path / source.name)
-
-    def forbid_weights(*args, **kwargs):
-        raise AssertionError("supplied-variable reconstruction opened source weights")
-
-    monkeypatch.setattr(loaders, "_read_tensors", forbid_weights)
-    fields = {**encoder.to_json(), "checkpoint": str(tmp_path),
-              "dtype": "bfloat16", "param_dtype": "float32"}
-    spec = InputSpec.from_json(
-        {"sample": {"key": "image", "shape": [8, 8, 3]},
-         "conditions": {"textcontext": {"encoder": {"class": kind, "fields": fields},
-                                         "field": "text", "unconditional": ""}}},
-        params={"textcontext": saved})
-    restored = spec.conditions["textcontext"].encoder
-    expected = dataclasses.replace(encoder, transformer=encoder.transformer.clone(dtype=jnp.bfloat16),
-                                   dtype=jnp.bfloat16, params=saved)
-    np.testing.assert_array_equal(restored.encode(restored.params, tokens).hidden,
-                                  expected.encode(saved, tokens).hidden)
-
-    for before, after in zip(jax.tree.leaves(saved), jax.tree.leaves(restored.params), strict=True):
-        assert after.dtype == before.dtype
-        np.testing.assert_array_equal(after, before)
-

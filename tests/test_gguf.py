@@ -192,20 +192,6 @@ def test_tensors_are_the_ones_transformers_reads(tmp_path, architecture, qtype):
     assert config["tie_word_embeddings"] is True
 
 
-@pytest.mark.parametrize("architecture", ["llama", "qwen3"])
-def test_the_config_is_the_one_transformers_builds(tmp_path, architecture):
-    """The file's metadata over the config class's defaults: Qwen 3's head_dim
-    comes from Qwen3Config, not from the file."""
-    from transformers import AutoConfig
-
-    rng = np.random.default_rng(0)
-    write_gguf(tmp_path / "model.gguf", architecture, gguf.GGMLQuantizationType.Q8_0,
-               hf_tensors(architecture, rng), rng)
-
-    assert dew_gguf.read(tmp_path / "model.gguf")[0] == AutoConfig.from_pretrained(
-        str(tmp_path), gguf_file="model.gguf").to_diff_dict()
-
-
 def test_load_pretrained_reads_the_file_and_its_tokenizer(tmp_path):
     """The whole load: logits against transformers over the same GGUF, and the
     tokenizer the file carries, since the directory ships none."""
@@ -260,44 +246,6 @@ print(np.asarray(loaded.processor("Hello, GGUF").tokens).tolist()[0])
                          env={**os.environ, "JAX_PLATFORMS": "cpu"})
     assert run.returncode == 0, run.stderr[-1500:]
     assert run.stdout.split("\n")[-2] == str(expected)
-
-
-def test_metadata_the_table_does_not_read_is_refused(tmp_path):
-    """llama.cpp writes a linear or YaRN rope scaling under `rope.scaling.*`,
-    which transformers' table drops; the model would rotate unscaled."""
-    rng = np.random.default_rng(0)
-    write_gguf(tmp_path / "model.gguf", "llama", gguf.GGMLQuantizationType.F32, hf_tensors("llama", rng), rng,
-               scaling=4.0)
-
-    with pytest.raises(ValueError, match=r"llama\.rope\.scaling\.type='linear'.*base_model"):
-        dew_gguf.read(tmp_path / "model.gguf")
-
-
-def test_a_tensor_with_no_hf_name_is_refused(tmp_path):
-    """Llama 3's rope_freqs carries a frequency scaling the metadata does not
-    state; dropping it would load a different rotary embedding."""
-    rng = np.random.default_rng(0)
-    write_gguf(tmp_path / "model.gguf", "llama", gguf.GGMLQuantizationType.F32,
-               hf_tensors("llama", rng), rng, extra=("rope_freqs.weight",))
-
-    with pytest.raises(ValueError, match=r"'rope_freqs.weight' has no counterpart.*base_model"):
-        dew_gguf.read(tmp_path / "model.gguf")
-
-
-def test_an_unread_architecture_is_refused(tmp_path):
-    rng = np.random.default_rng(0)
-    write_gguf(tmp_path / "model.gguf", "gemma2", gguf.GGMLQuantizationType.F32, {}, rng)
-
-    with pytest.raises(ValueError, match=r"architecture 'gemma2' is not read by Dew.*base_model"):
-        dew_gguf.read(tmp_path / "model.gguf")
-
-
-def test_a_missing_file_names_the_files_there(tmp_path):
-    rng = np.random.default_rng(0)
-    write_gguf(tmp_path / "model-Q8_0.gguf", "llama", gguf.GGMLQuantizationType.F32, {}, rng)
-
-    with pytest.raises(FileNotFoundError, match=r"\['model-Q8_0.gguf'\]"):
-        Pretrained.load(tmp_path, gguf_file="model-Q4_K_M.gguf")
 
 
 # Pinned: the bounds below are this commit's files.

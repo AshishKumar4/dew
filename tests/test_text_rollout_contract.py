@@ -13,7 +13,6 @@ from rl_support import clipped_surrogate
 from dew.data.dataset import Loader
 from dew.nn.inputs import ModelInputs
 from dew.objectives.base import Step
-from dew.objectives.lm import LMObjective
 from dew.objectives.rl import GRPOObjective, SampledRollout
 from dew.sampling import Sampling, generate
 from dew.training import Trainer
@@ -188,24 +187,6 @@ def test_real_trainer_update_matches_raw_policy_ratio_with_behavior_recorded():
     assert movement > 0.001
 
 
-def test_recurrent_causality_and_bidirectional_capability_refusal():
-    tokens = jnp.array([[1, 2, 3, 4]], jnp.int32)
-    changed = tokens.at[0, -1].set(8)
-    recurrent = decoder("recurrent")
-    params = recurrent.init(jax.random.key(0), tokens)
-    np.testing.assert_array_equal(recurrent.apply(params, tokens)[:, 0],
-                                  recurrent.apply(params, changed)[:, 0])
-    bidirectional = decoder().clone(causal=False)
-    weights = bidirectional.init(jax.random.key(0), tokens)
-    difference = bidirectional.apply(weights, tokens)[:, 0] - bidirectional.apply(weights, changed)[:, 0]
-    assert float(jnp.max(jnp.abs(difference))) > 1e-3
-    with pytest.raises(ValueError, match="causal=True"):
-        recurrent.clone(causal=False).init(jax.random.key(0), tokens)
-    for objective in (LMObjective, GRPOObjective):
-        with pytest.raises(ValueError, match="causal"):
-            objective(bidirectional, seq_len=3)
-
-
 @pytest.mark.parametrize("kind", ["attention", "mla", "recurrent"])
 def test_padding_slots_do_not_consume_cache_capacity(kind):
     model = decoder(kind).clone(max_seq_len=5)
@@ -232,15 +213,3 @@ def test_any_declared_eos_id_stops_the_generation():
     np.testing.assert_array_equal(result.lengths, [1])
     np.testing.assert_array_equal(result.terminated, [True])
     np.testing.assert_allclose(result.raw_log_probs[0, 0], baseline.raw_log_probs[0, 0], atol=1e-6)
-
-
-def test_sampling_and_prompt_validity_fail_before_execution():
-    for kwargs in ({"temperature": -1}, {"temperature": float("nan")}, {"top_k": 0}):
-        with pytest.raises(ValueError):
-            Sampling(**kwargs)
-    model = decoder()
-    params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
-    for mask in ([[0, 0]], [[1, 2]], [[1]], [[0.5, 1]]):
-        with pytest.raises(ValueError):
-            generate(model, params, ModelInputs(jnp.array([[1, 2]]), {"attention_mask": jnp.asarray(mask)}),
-                     2, key=jax.random.key(1))

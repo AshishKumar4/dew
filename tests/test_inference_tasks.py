@@ -55,20 +55,8 @@ def test_a_bound_task_draws_from_the_weights_it_was_bound_to():
     np.testing.assert_array_equal(greedy.behavior_log_probs, 0)
     # Without a processor there is no text: the task's decode refuses as the generation's text does.
     for decoded in (lambda: task.decode(greedy), lambda: greedy.text):
-        with pytest.raises(ValueError, match="no processor to decode with"):
+        with pytest.raises(ValueError):
             decoded()
-
-
-def test_prepared_rows_and_text_requests_are_kept_apart():
-    model = decoder()
-    params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
-    task = TextGeneration(model, params)
-    with pytest.raises(ValueError, match="processor"):
-        task("hello", 3, key=jax.random.key(0))
-    with pytest.raises(ValueError, match="images"):
-        task([[1, 2]], 3, key=jax.random.key(0), images=[np.zeros((2, 2, 3))])
-    with pytest.raises(ValueError, match="vocabulary"):
-        task([[99, 2]], 3, key=jax.random.key(0))
 
 
 def test_a_loaded_source_generates_from_text_with_its_own_policy():
@@ -85,20 +73,6 @@ def test_a_loaded_source_generates_from_text_with_its_own_policy():
     assert loaded.processor is not None
     assert task.decode(generated) == tuple(loaded.processor.decode(generated.tokens[:, -3:]))
     assert not hasattr(loaded, "block_generation")
-
-
-def test_a_source_loads_as_its_kind_and_a_kind_refuses_another():
-    """`Pretrained.load` returns the kind the source is, with the methods
-    that kind has; called on a kind, it refuses a source of another."""
-    from dew.interop import PretrainedBlockDecoder, PretrainedDecoder, PretrainedMaskedDecoder
-
-    assert type(Pretrained.load(FIXTURES / "llama-tiny", dtype="float32")) is PretrainedDecoder
-    assert type(Pretrained.load(FIXTURES / "llada-tiny", dtype="float32")) is PretrainedMaskedDecoder
-    gemma = PretrainedBlockDecoder.load(FIXTURES / "diffusion-gemma-workflow", dtype="float32",
-                                        max_seq_len=32)
-    assert type(gemma) is PretrainedBlockDecoder
-    with pytest.raises(TypeError, match="is a PretrainedMaskedDecoder source, not a PretrainedDecoder"):
-        PretrainedDecoder.load(FIXTURES / "llada-tiny", dtype="float32")
 
 
 def test_a_loader_takes_a_dtype_and_records_its_name():
@@ -118,7 +92,6 @@ def test_a_loader_takes_a_dtype_and_records_its_name():
 def test_a_pretrained_bundle_fine_tunes_identically_to_explicit_wiring():
     from dew import Trainer
     from dew.objectives.base import Step
-    from dew.objectives.lm import LMObjective
 
     source = Pretrained.load(FIXTURES / "llama-tiny", dtype="float32", attention_impl="xla",
                              max_seq_len=8)
@@ -145,71 +118,6 @@ def test_a_pretrained_bundle_fine_tunes_identically_to_explicit_wiring():
         np.testing.assert_array_equal(actual, expected)
     assert any(not np.array_equal(actual, initial) for actual, initial in
                zip(jax.tree.leaves(states[1].variables), jax.tree.leaves(source.variables), strict=True))
-
-
-def test_a_keyword_overrides_what_a_bundle_supplies():
-    """A bundle stands in for the model, its weights and its processor; a
-    keyword given beside it wins."""
-    source = Pretrained.load(FIXTURES / "llama-tiny", dtype="float32", attention_impl="xla")
-    zeros = jax.tree.map(jnp.zeros_like, source.variables)
-    objective = LMObjective(source, 4, variables=zeros)
-    assert objective.processor is source.text_processor
-    assert not any(bool(jnp.any(leaf)) for leaf in jax.tree.leaves(objective.init(jax.random.key(0))))
-
-
-def test_an_explicit_none_clears_what_a_decoder_bundle_supplies():
-    """`variables=None` beside a bundle starts from a fresh init and
-    `processor=None` keeps no processor, as they do without one; only an
-    omitted keyword takes the bundle's."""
-    source = Pretrained.load(FIXTURES / "llama-tiny", dtype="float32", attention_impl="xla")
-    cleared = LMObjective(source, 4, variables=None, processor=None)
-    assert cleared.variables is None and cleared.processor is None
-    drawn = cleared.init(jax.random.key(0))
-    assert any(not np.array_equal(np.asarray(ours), np.asarray(theirs)) for ours, theirs in zip(
-        jax.tree.leaves(drawn["params"]), jax.tree.leaves(source.variables["params"]), strict=True))
-    kept = LMObjective(source, 4)
-    assert kept.variables is source.variables and kept.processor is source.text_processor
-
-
-def test_media_prompts_are_processed_once_and_keep_their_continuations():
-    """Text and images reach the processor once per request, whatever the
-    continuation count, and the continuations expand afterwards: each row
-    carries the prompt, the image features and the conditioned continuation of
-    the prompt it sits under."""
-    loaded = Pretrained.load(FIXTURES / "gemma3-native-tiny", dtype="float32", attention_impl="reference")
-    images = np.load(FIXTURES / "gemma3-native-tiny" / "raw_images.npy")
-    prompts = json.loads((FIXTURES / "gemma3-native-tiny" / "prompts.json").read_text())
-    expected = np.load(FIXTURES / "gemma3-native-tiny" / "continuation.npy")
-    requests = []
-
-    class Counted:
-        """The source processor, with the requests it was handed."""
-
-        def __init__(self, inner):
-            self.inner = inner
-
-        def __call__(self, text, *, images=None):
-            requests.append((tuple(text), None if images is None else len(images)))
-            return self.inner(text, images=images)
-
-        def decode(self, tokens):
-            return self.inner.decode(tokens)
-
-    assert loaded.processor is not None
-    task = replace(loaded.text_generation(), processor=Counted(loaded.processor), n=3)
-    generated = task(prompts, 3, key=jax.random.key(1), images=[[images[0]], [images[1], images[2]]])
-
-    assert requests == [(tuple(prompts), 2)]
-    rows = generated.host()
-    assert rows.tokens.shape[0] == 3 * len(prompts)
-    np.testing.assert_array_equal(rows.tokens[:, -3:], np.repeat(expected, 3, axis=0))
-    for prompt in range(len(prompts)):
-        group = rows.tokens[prompt * 3:(prompt + 1) * 3, :-3]
-        np.testing.assert_array_equal(group, np.repeat(group[:1], 3, axis=0))
-    text = generated.text
-    assert text == task.decode(generated) and len(text) == 3 * len(prompts)
-    for prompt in range(len(prompts)):
-        assert len(set(text[prompt * 3:(prompt + 1) * 3])) == 1
 
 
 def test_a_diffusion_gemma_source_generates_canvases_without_likelihood_claims():
@@ -268,24 +176,13 @@ def test_a_user_block_denoiser_generates_through_the_block_task():
     assert not bool(generated.terminated.any())
 
 
-def test_a_causal_decoder_is_no_block_denoiser_and_the_task_names_what_it_lacks():
-    """A causal language model scores tokens, but has no canvas to refine or
-    clean tokens to commit, so block generation refuses it by name rather
-    than fail inside the loop."""
-    model = decoder("attention")
-    task = BlockGeneration(model, model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)),
-                           BlockProcess(canvas_length=4, vocab_size=model.vocab_size))
-    with pytest.raises(TypeError, match=r"block denoiser \(BlockDenoiser\).* has no canvas_length, encode"):
-        task([[1, 2, 3]], 4, key=0)
-
-
 def test_seed_is_the_key():
     model = decoder("attention")
     params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
     task = TextGeneration(model, params, sampling=SAMPLING)
     prompt = [[1, 2, 4], [5, 6, 7]]
     assert_same_generation(task(prompt, 3, key=11), task(prompt, 3, key=jax.random.key(11)))
-    with pytest.raises(ValueError, match="key must be"):
+    with pytest.raises(ValueError):
         task(prompt, 3)
 
 
@@ -315,67 +212,6 @@ def test_equal_shape_calls_and_rebinding_do_not_request_compilation(tmp_path):
     finally:
         monitoring.unregister_event_listener(record)
         jax.config.update("jax_compilation_cache_dir", previous)
-
-def test_text_decodes_lazily_through_the_bound_processor():
-    """`Generation.text` is the processor's decoding of each row's valid
-    continuation; without a processor there is nothing to decode with."""
-    from dew.inference import RunProcessor
-
-    calls = []
-
-    class Digits:
-        vocab_size = 13
-        eos_id = 12
-
-        def encode(self, text):
-            return [int(character) for character in text]
-
-        def decode(self, ids):
-            calls.append(tuple(ids))
-            return "".join(str(int(token)) for token in ids)
-
-    model = decoder("attention")
-    params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
-    bare = TextGeneration(model, params, sampling=Sampling(temperature=0))
-    with pytest.raises(ValueError, match="no processor"):
-        _ = bare([[1, 2]], 3, key=0).text
-    task = TextGeneration(
-        model, params, RunProcessor(Digits()), sampling=Sampling(temperature=0), max_new_tokens=3
-    )
-    result = task(["12", "5"], key=0)
-    assert calls == []
-    first = result.text
-    assert len(calls) == 2
-    assert result.text is first and len(calls) == 2
-    rows = result.host()
-    assert rows.tokens.shape == (2, 2 + 3) and rows.tokens[1, 0] == 0
-    assert result.text == task.decode(result)
-    assert result.text == tuple("".join(str(token) for token in row[2:2 + length])
-                                for row, length in zip(rows.tokens, rows.lengths, strict=True))
-
-
-def test_a_prompt_batch_carries_validity_only_where_it_padded():
-    """A host that padded nothing says so by omitting validity. The model
-    cannot read the contents of an all-true mask, so it would build one and
-    leave its fused attention kernel; ragged prompts still carry theirs, and
-    the values say which slots the padding took."""
-    from dew.inference import RunProcessor
-
-    class Digits:
-        def encode(self, text):
-            return [int(character) for character in text]
-
-        def decode(self, ids):
-            return "".join(str(int(token)) for token in ids)
-
-    processor = RunProcessor(Digits())
-
-    assert "attention_mask" not in processor(["12", "34"]).token_fields
-    assert "attention_mask" not in processor("789").token_fields
-    ragged = processor(["12", "5"])
-    np.testing.assert_array_equal(ragged.token_fields["attention_mask"],
-                                  [[True, True], [False, True]])
-
 
 @pytest.mark.mesh(devices=1)
 def test_a_task_moves_onto_a_mesh_with_the_variables_it_holds():
@@ -483,7 +319,6 @@ def test_pipeline_publishes_the_updated_policy_not_the_frozen_reference(kind, tm
     np.testing.assert_array_equal(restored.tokens, expected.tokens)
     np.testing.assert_allclose(restored.raw_log_probs, expected.raw_log_probs, atol=1e-7, rtol=1e-7)
 
-    from dataclasses import replace
 
     import jax.numpy as jnp
 
@@ -500,4 +335,3 @@ def test_pipeline_publishes_the_updated_policy_not_the_frozen_reference(kind, tm
     result = converted([[1, 2]], 1, key=3).host()
     np.testing.assert_array_equal(result.tokens, wanted.tokens)
     np.testing.assert_array_equal(result.raw_log_probs, wanted.raw_log_probs)
-

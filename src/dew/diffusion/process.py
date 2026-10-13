@@ -130,15 +130,19 @@ class Process:
         return jax.random.normal(key, shape) * self.sampler_schedule.prior_scale()
 
     def denoiser(self, model, params, conditions: Mapping[str, Conditioning],
-                 unconditional: Mapping[str, Conditioning] | None = None) -> Denoiser:
+                 unconditional: Mapping[str, Conditioning] | None = None, *,
+                 schedule: NoiseScheduler | None = None) -> Denoiser:
         """Return the denoiser of `model` under `params` with the given conditions.
 
-        The denoiser maps `(x_t, t)` to `(x_0, epsilon)` on the sampling
-        schedule. `unconditional` has the same keys with the unconditional
-        values, and classifier-free guidance interpolates against it.
+        The denoiser maps `(x_t, t)` to `(x_0, epsilon)` with `t` on
+        `schedule`, the sampling schedule unless a training objective passes
+        its training schedule for the `t` it drew. `unconditional` has the
+        same keys with the unconditional values, and classifier-free guidance
+        interpolates against it.
         """
         return Denoiser(self, model, params, dict(conditions),
-                        None if unconditional is None else dict(unconditional))
+                        None if unconditional is None else dict(unconditional),
+                        self.sampler_schedule if schedule is None else schedule)
 
 
 @dataclass(frozen=True)
@@ -160,26 +164,27 @@ class Denoiser:
     model: nn.Module
     params: Variables
     conditions: dict[str, Conditioning]
-    unconditional: dict[str, Conditioning] | None = None
+    unconditional: dict[str, Conditioning] | None
+    schedule: NoiseScheduler
+    """The schedule `t` is on: the process's sampling schedule for a solver's
+    grid, its training schedule for a training objective's draw."""
 
     def _raw(self, x_t, t, conditions) -> jax.Array:
         """The model's own output at `(x_t, t)`, on the input scale and model
         time the process's parameterization asks for."""
-        process = self.process
-        rates = process.rates(t, like=x_t)
-        c_in = process.prediction.get_input_scale(rates)
-        output = self.model.apply(
-            self.params, x_t * c_in, process.sampler_schedule.model_time(t), **conditions)
+        rates = broadcast_rates(self.schedule, t, x_t)
+        c_in = self.process.prediction.get_input_scale(rates)
+        output = self.model.apply(self.params, x_t * c_in, self.schedule.model_time(t), **conditions)
         if not isinstance(output, jax.Array):
             raise TypeError("A diffusion model must return one prediction array")
         return output
 
     def convert(self, x_t, t, output) -> tuple[jax.Array, jax.Array]:
         """Return `(x_0, epsilon)` recovered from a raw model output at `(x_t, t)`."""
-        process = self.process
-        rates = process.rates(t, like=x_t)
-        preds = process.prediction.pred_transform(x_t, output, rates, t)
-        return process.prediction.backward_diffusion(x_t, preds, rates)
+        prediction = self.process.prediction
+        rates = broadcast_rates(self.schedule, t, x_t)
+        preds = prediction.pred_transform(x_t, output, rates, t)
+        return prediction.backward_diffusion(x_t, preds, rates)
 
     def __call__(self, x_t, t) -> tuple[jax.Array, jax.Array]:
         return self.convert(x_t, t, self.raw(x_t, t))
@@ -190,7 +195,7 @@ class Denoiser:
         Every call of the returned denoiser passes the interval's length in
         model time to the model as the `duration` condition.
         """
-        schedule = self.process.sampler_schedule
+        schedule = self.schedule
         duration = {"duration": schedule.model_time(t) - schedule.model_time(t_next)}
         return replace(
             self,
