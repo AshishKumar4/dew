@@ -64,10 +64,10 @@ def through(chunk: int, starts, dy, dfinal):
 
 
 # (batch, length, heads, head width, groups, state), chunk: a ragged tail with packed documents over
-# groups of two heads; whole chunks, one group; a state wider than one 128-wide product, as Falcon-H1's
-# 256, with documents.
+# groups of three heads, six in all, a count no power of two divides past 2 (Mamba-2 130M's 24 heads);
+# whole chunks, one group; a state wider than one 128-wide product, as Falcon-H1's 256, with documents.
 SHAPES = [
-    pytest.param((2, 100, 4, 16, 2, 16), 32, True, id="ragged-documents"),
+    pytest.param((2, 100, 6, 16, 2, 16), 32, True, id="ragged-documents"),
     pytest.param((1, 128, 4, 32, 1, 32), 64, False, id="whole-chunks"),
     pytest.param((1, 48, 2, 16, 2, 256), 16, True, id="wide-state-documents"),
 ]
