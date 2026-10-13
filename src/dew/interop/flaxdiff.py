@@ -45,6 +45,7 @@ _MOVED = {"time_embed": ("conditioning", "time_embed"),
           "text_proj": ("conditioning", "text_context_proj"),
           "final_norm": ("output", "final_norm"),
           "final_proj": ("output", "final_proj")}
+_MLP_LAYERS = {"layers_0": "up_proj", "layers_2": "down_proj"}
 _HYBRID_MOVED = {"time_embed": ("conditioning", "time_embed"),
                  "text_context_proj": ("conditioning", "text_context_proj"),
                  "hilbert_projection": ("embed", "hilbert_projection"),
@@ -179,6 +180,15 @@ def hybrid_dit_variables(weights: Mapping, model: Mapping[str, object], *,
     return _variables(weights, model, _HYBRID_MOVED, jax_version)
 
 
+def _gated(tree, mlp: bool = False):
+    """A FlaxDiff tree with each block's MLP, an `nn.Sequential`, under
+    `GatedMLP`'s names (`_MLP_LAYERS`)."""
+    if not isinstance(tree, Mapping):
+        return tree
+    return {(_MLP_LAYERS.get(name, name) if mlp else name): _gated(value, name == "mlp")
+            for name, value in tree.items()}
+
+
 def _variables(weights: Mapping, model: Mapping[str, object],
                moved: Mapping[str, tuple[str, ...]], jax_version: str) -> dict:
     params: dict = {}
@@ -187,7 +197,7 @@ def _variables(weights: Mapping, model: Mapping[str, object],
         branch = params
         for parent in parents:
             branch = branch.setdefault(parent, {})
-        branch[leaf] = value
+        branch[leaf] = _gated(value)
     table = fourier_table(records.integer(model["emb_features"], "emb_features"), jax_version)
     return {"params": params,
             "constants": {"conditioning": {"time_embed": {"layers_0": {"frequencies": table}}}}}
