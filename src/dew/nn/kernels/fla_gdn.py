@@ -1185,6 +1185,9 @@ def _wy_bwd_kernel(chunk_ref, k_ref, v_ref, beta_ref, g_ref, a_ref, dw_ref, du_r
             columns = pl.ds(block * bk, bk)
             key = read(k_ref, columns)
             scaled = key * beta[:, None]
+            # k k^T first, as fla takes it: taken after the dk store, sm90's pipelined loop returned
+            # a different dg on each call of one executable (FitBuzzard, dew-h100).
+            products = products + _dot(key, key.T, exact=exact)
             d_key = _dot(d_l, key, exact=exact)
             through_w = _dot(inverse_t, read(dw_ref, columns), exact=exact) * (decay * beta)[:, None]
             # d_l^T (k beta), fla's trans(trans(kb) dA), as one product into the accumulator's layout.
@@ -1193,7 +1196,7 @@ def _wy_bwd_kernel(chunk_ref, k_ref, v_ref, beta_ref, g_ref, a_ref, dw_ref, du_r
                 earlier = read(earlier_ref, columns).astype(jnp.float32)
                 full += jnp.where(first_of_group, earlier, 0.0)
             _write(_rows(dk_ref, start, chunk, columns), taken, full)
-            return products + _dot(key, key.T, exact=exact), d_beta + jnp.sum(d_key * key, axis=1)
+            return products, d_beta + jnp.sum(d_key * key, axis=1)
 
         products, d_beta = jax.lax.fori_loop(0, width // bk, keys_grad,
                                              (jnp.zeros((chunk, chunk), jnp.float32), d_beta))

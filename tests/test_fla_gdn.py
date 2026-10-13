@@ -318,6 +318,29 @@ def test_the_wy_backward_kernel_is_the_gradient_of_flas_wy_representation(dtype,
             assert relative(mine, theirs) < bound, name
 
 
+@pytest.mark.gpu(reason="the compiled kernel's own repeatability on this GPU")
+def test_the_wy_backward_gives_the_same_gradients_on_every_call_at_e1s_shape():
+    """One compiled WY backward, called again on the same operands at the Qwen3.5-0.8B step's shape (8 x
+    3072, 16 heads of 128, bf16), gives bitwise the same gradients: with its key loop's k k^T taken
+    after the dk store, sm90's pipelined loop gave a different dg on each call (20,000 elements, up
+    to 0.069)."""
+    batch, length, heads, width = 8, 3072, 16, 128
+    keys = jax.random.split(jax.random.key(83), 7)
+    k = l2norm(jax.random.normal(keys[0], (batch, length, heads, width))).astype(jnp.bfloat16)
+    v = jax.random.normal(keys[1], (batch, length, heads, width)).astype(jnp.bfloat16)
+    beta = jax.nn.sigmoid(jax.random.normal(keys[2], (batch, length, heads))).astype(jnp.bfloat16)
+    g = fla_gdn.chunk_local_cumsum(-jnp.exp(jax.random.normal(keys[3], (batch, length, heads)) - 3.0),
+                                   scale=fla_gdn.RCP_LN2)
+    a = fla_gdn.kkt_solve(k, g, beta)
+    dw, du, dk = (jax.random.normal(key, k.shape).astype(jnp.bfloat16) for key in keys[4:])
+    backward = jax.jit(fla_gdn.prepare_wy_repr_bwd)
+    first = [np.asarray(x) for x in backward(k, v, beta, g, a, dw, du, dk)]
+    for _ in range(4):
+        for name, again, was in zip(("dk", "dv", "db", "dg"), backward(k, v, beta, g, a, dw, du, dk), first,
+                                    strict=True):
+            np.testing.assert_array_equal(np.asarray(again), was, err_msg=name)
+
+
 @pytest.mark.parametrize("value_heads", [2, 4])
 def test_the_wy_backward_adds_the_keys_gradient_so_far_once_per_key_head(value_heads):
     """Given the query-side kernel's key gradient, the WY backward returns its own plus that one,
