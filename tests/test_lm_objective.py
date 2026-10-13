@@ -17,7 +17,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from affine_run import Data
+from affine_run import dataset
 from flax import linen as nn
 from recording import RecordingTracker
 
@@ -261,7 +261,7 @@ def test_the_objective_trains_through_the_trainer(tmp_path, fsdp):
     scored = jax.jit(lambda params: trainer.objective.scalar_loss(params, batch, step_at())[0])
     before = float(scored(trainer.initial_state().variables))
 
-    state = trainer.fit(Data(cycle_batches), steps=STEPS, log_every=50)
+    state = trainer.fit(dataset(cycle_batches), steps=STEPS, log_every=50)
     after = float(scored(state.variables))
 
     specs = [p.sharding.spec for p in jax.tree.leaves(state.variables)]
@@ -403,7 +403,7 @@ def test_the_validation_pass_scores_perplexity_per_token_and_logs_it():
     batches = [token_batch(BATCH, seed=1), padded]
     tracker = RecordingTracker()
     trainer = make_trainer(pad_id=0, tracker=tracker)
-    state = trainer.fit(Data(cycle_batches, val=lambda: iter(batches)), steps=1, log_every=1,
+    state = trainer.fit(dataset(cycle_batches, val=lambda: iter(batches)), steps=1, log_every=1,
                         eval_every=1, metrics=(Perplexity(),))
 
     total, count = 0.0, 0.0

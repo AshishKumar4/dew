@@ -159,17 +159,18 @@ class Interval:
 
     def take(self, step: int, loss: jax.Array, aux: Mapping[str, jax.Array], accepted: jax.Array,
              copies: tuple[jax.Array | None, jax.Array | None],
-             rollout: Mapping[str, Number | float]) -> Taken:
+             rollout: Mapping[str, Number | float], statistics: Mapping[str, float]) -> Taken:
         """Take the log of the interval ending at `step` without waiting on
         the devices, and start the next interval's counts; `copies` are the
         learning rate and loss scale, copied off the state the next step
-        donates (`held`)."""
+        donates (`held`), and `statistics` the data's, read on the host as
+        they stand at the step."""
         streak, book = self.streak(), self.book
         rate, scale = copies
         reading = Reading(loss, aux, accepted, streak, rate, scale, rollout,
                           None if book is None else (book.norms, book.commits),
                           book.training if self.model_counted and book is not None else None,
-                          book.tokens if self.tokens_counted and book is not None else None)
+                          book.tokens if self.tokens_counted and book is not None else None, statistics)
         taken = Taken(step, self, dataclasses.replace(self), reading,
                       time.time() if isinstance(loss, _Settled) and loss.is_ready() else None)
         if self.tokens_counted and book is not None:
@@ -222,8 +223,9 @@ Number = jax.Array | np.ndarray
 class Reading(NamedTuple):
     """What a log reads from the devices, as they stood at its step: the
     step's loss, aux and acceptance, the longest non-finite streak, the rate
-    and loss scale, the rollout's report, and the interval's committed
-    gradient norms and commits, analytical work and real tokens."""
+    and loss scale, the rollout's report, the interval's committed gradient
+    norms and commits, analytical work and real tokens, and the data's
+    statistics, already on the host."""
 
     loss: Number
     aux: Mapping[str, Number]
@@ -235,6 +237,7 @@ class Reading(NamedTuple):
     committed: tuple[Number, Number] | None
     training: Number | None
     tokens: Number | None
+    statistics: Mapping[str, float]
 
 
 class Taken(NamedTuple):

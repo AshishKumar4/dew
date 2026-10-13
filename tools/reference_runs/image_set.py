@@ -27,7 +27,7 @@ def main() -> None:
     parser.add_argument("--out", required=True)
     args = parser.parse_args()
 
-    from dew.data.images import unpack_dict_of_byte_arrays
+    from dew.data.sources.codec import unpack_dict_of_byte_arrays
 
     images = []
     for shard in args.shards:
