@@ -14,7 +14,7 @@ import math
 import os
 import re
 import secrets
-from collections.abc import Callable, Collection, Iterator, Mapping
+from collections.abc import Callable, Collection, Iterable, Iterator, Mapping
 from pathlib import Path
 
 import jax
@@ -263,14 +263,19 @@ def read_weights(folder) -> dict[str, np.ndarray]:
     owner: dict[str, str] = {}
     for shard in selected:
         values, _ = read_file(folder / shard)
-        for name, value in values.items():
-            if name in owner:
-                raise ValueError(
-                    f"tensor {name!r} is stored in both {owner[name]} and {shard} under {folder}"
-                )
-            owner[name] = shard
-            tensors[name] = value
+        own(owner, values, shard, folder)
+        tensors.update(values)
     return tensors
+
+
+def own(owner: dict[str, str], names: Iterable[str], shard: str, where: object) -> None:
+    """Record in `owner` that `shard` holds each of `names`, refusing a
+    tensor another of `where`'s shards already holds: a merge would keep
+    whichever came last."""
+    for name in names:
+        if name in owner:
+            raise ValueError(f"tensor {name!r} is stored in both {owner[name]} and {shard} under {where}")
+        owner[name] = shard
 
 
 def read_file(path, copy_on_write: bool = False) -> tuple[dict[str, np.ndarray], dict[str, str]]:
