@@ -517,6 +517,11 @@ class InputQuantization:
             def _dew_wrapper() -> InputQuantization:
                 return record
 
+            @nn.nowrap
+            def input_quantizer(self, module: nn.Module) -> InputQuantizer | None:
+                """The quantizer `module`'s input takes (`dew.nn.protocols.QuantizesInputs`)."""
+                return record.quantizer(module)
+
             def apply(self, variables, *args, **kwargs):
                 with nn.intercept_methods(quantize_inputs):
                     return super().apply(variables, *args, **kwargs)
