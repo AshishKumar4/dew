@@ -60,7 +60,7 @@ def shardings(mesh, rows: bool):
     return kernels, inputs, outputs
 
 
-@pytest.fixture(scope='module')
+@pytest.fixture
 def x64():
     # XLA's TPU rewrites float64 into pairs of float32 op by op, and has no
     # rewrite for a ragged dot ("While rewriting computation to not contain
