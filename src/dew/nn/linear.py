@@ -119,6 +119,8 @@ def causal_conv1d(x, kernel, activation: bool = True, bias=None, *, valid=None, 
     `head` channels (`l2norm`), the queries and keys of a delta rule: each
     piece is the array its scan reads, not a slice of one to copy out.
 
+    The pieces are named `conv` for a remat policy to keep.
+
     On a GPU that runs Dew's Triton kernels all of it is one kernel forward
     and one backward (`short_conv`), which save only `x`; elsewhere, and for
     a conv they turn down (`conv_refusal`), `xla_conv1d`. On a mesh whose
@@ -130,14 +132,18 @@ def causal_conv1d(x, kernel, activation: bool = True, bias=None, *, valid=None, 
     dtype = x.dtype if dtype is None else jnp.dtype(dtype)
     rows = _row_split(x)
     if rows is not None:
-        return _per_row_shard(x, kernel, activation, bias, valid, parts, dtype, rows)
-    pieces = ((x.shape[-1], None),) if parts is None else tuple(parts)
-    if conv_refusal(x, kernel, pieces, dtype) is None:
-        out = short_conv.conv(x, kernel, bias, None if valid is None else jnp.asarray(valid, jnp.int8),
-                              pieces, activation=activation, eps=L2NORM_EPS, dtype=dtype,
-                              interpret=not generation.triton_runs())
-        return out[0] if parts is None else out
-    return xla_conv1d(x, kernel, activation, bias, valid=valid, parts=parts, dtype=dtype)
+        out = _per_row_shard(x, kernel, activation, bias, valid, parts, dtype, rows)
+    else:
+        pieces = ((x.shape[-1], None),) if parts is None else tuple(parts)
+        if conv_refusal(x, kernel, pieces, dtype) is None:
+            out = short_conv.conv(x, kernel, bias, None if valid is None else jnp.asarray(valid, jnp.int8),
+                                  pieces, activation=activation, eps=L2NORM_EPS, dtype=dtype,
+                                  interpret=not generation.triton_runs())
+            out = out[0] if parts is None else out
+        else:
+            out = xla_conv1d(x, kernel, activation, bias, valid=valid, parts=parts, dtype=dtype)
+    # The conv's output, which a remat policy may keep (`dew.nn.backbones.decoder_block.RESIDUALS`).
+    return jax.tree.map(lambda piece: checkpoint_name(piece, 'conv'), out)
 
 
 def _row_split(x) -> MeshAxes | None:
@@ -362,6 +368,9 @@ def _masked_conv1d(x, kernel, valid, state=None, bias=None, segments=None, parts
     padded = jnp.pad(x, ((0, 0), (0, 1), (0, 0)))
     compact = jnp.take_along_axis(padded, source[:, :, None], axis=1, mode='promise_in_bounds')
     stream = jnp.concatenate([state, compact], axis=1)
+    # The K-1 stream rows from the row's token count on are the history it leaves.
+    rows = (rank[:, -1] + 1)[:, None] + jnp.arange(width)[None, :]
+    history = jnp.take_along_axis(stream, rows[:, :, None], axis=1)
     if segments is None:
         # The history in front carries the K-1 taps the first real token
         # reads, so row width + j of the convolution is the output of real
@@ -371,10 +380,12 @@ def _masked_conv1d(x, kernel, valid, state=None, bias=None, segments=None, parts
         ordered = jnp.take_along_axis(segments, source, axis=1, mode='fill', fill_value=-1)
         held = jnp.broadcast_to(ordered[:, :1], (batch, width))
         convolved = document_conv1d(state, compact, held, ordered, kernel, bias)
+        # The next call continues the last real token's document, so the history keeps only its
+        # tokens; an earlier document's, where the last is shorter than K-1, read as its start's zeros.
+        kept = jnp.take_along_axis(jnp.concatenate([held, ordered], axis=1), rows, axis=1)
+        last = jnp.take_along_axis(ordered, jnp.maximum(rank[:, -1:], 0), axis=1)
+        history = jnp.where(((kept == last) | (rank[:, -1:] < 0))[:, :, None], history, 0)
     output = jnp.take_along_axis(convolved, jnp.maximum(rank, 0)[:, :, None], axis=1)
-    # The K-1 stream rows from the row's token count on are the history it leaves.
-    history = jnp.take_along_axis(
-        stream, ((rank[:, -1] + 1)[:, None] + jnp.arange(width)[None, :])[:, :, None], axis=1)
     output = jnp.where(valid[:, :, None], output, 0)
     return conv_pieces(output, parts, x.dtype if dtype is None else dtype), history
 

@@ -96,12 +96,13 @@ def test_a_fused_kernel_takes_forward_mode_through_the_reference(implementation,
 
 
 @on_gpu
-@pytest.mark.parametrize("q_len, kv_len, causal", [
-    (1024, 77, False),   # every cross-attention over CLIP's 77 text tokens
-    (9, 7, False),       # short enough that one attended pad key would move an eighth of the mass
-    (333, 333, True),    # the concatenated text-plus-image sequence, causal
+@pytest.mark.parametrize("q_len, kv_len, causal, head_dim", [
+    (1024, 77, False, 64),   # every cross-attention over CLIP's 77 text tokens
+    (9, 7, False, 64),       # short enough that one attended pad key would move an eighth of the mass
+    (333, 333, True, 64),    # the concatenated text-plus-image sequence, causal
+    (3072, 3072, True, 256),  # Qwen3.5's 256-wide heads, which cudnn takes from Hopper on
 ])
-def test_cudnn_trains_odd_lengths_and_agrees_with_xla(q_len, kv_len, causal,
+def test_cudnn_trains_odd_lengths_and_agrees_with_xla(q_len, kv_len, causal, head_dim,
                                                       without_deterministic_ops):
     """cudnn's kernel has no backward pass for an odd length; the padded call
     trains, and what it computes for the real rows is what the xla kernel
@@ -109,8 +110,11 @@ def test_cudnn_trains_odd_lengths_and_agrees_with_xla(q_len, kv_len, causal,
     which is also how far the two kernels sit apart at an even length. A pad
     key left unmasked shifts every output by 1/(kv+1) of the value mass, 12%
     at 7 keys, and a pad query row left in the output changes its shape."""
-    query, _, _ = qkv((2, q_len, 4, 64))
-    _, key, value = qkv((2, kv_len, 4, 64), seed=1)
+    from dew.nn.attention import cudnn_max_head_dim
+    if head_dim > cudnn_max_head_dim():
+        pytest.skip(f"cudnn takes heads at most {cudnn_max_head_dim()} wide on {kernels.device_generation()}")
+    query, _, _ = qkv((2, q_len, 4, head_dim))
+    _, key, value = qkv((2, kv_len, 4, head_dim), seed=1)
 
     fused = value_and_grads('cudnn', query, key, value, causal=causal)
     reference = value_and_grads('xla', query, key, value, causal=causal)
@@ -298,14 +302,20 @@ def test_flash_keeps_the_kernel_contract_on_a_mesh(axis, split, without_determin
 
 
 @on_gpu
+@pytest.mark.parametrize("implementation", ["flash", "cudnn"])
 @pytest.mark.parametrize("head_dim", [128, 256])
-def test_flash_is_as_exact_as_the_xla_kernel_from_float64(head_dim, without_deterministic_ops):
-    """At Qwen3.5's grouped causal heads, 8 queries over 2 keys, FlashAttention's output and its
-    three input gradients lie within tests/reference_error.py's rule of the xla kernel's, both
-    measured from float64; on Hopper that holds FlashAttention-3 to it."""
-    flash_here()
-    if head_dim > 192 and kernels.device_generation() in ('sm86', 'sm87', 'sm89'):
-        pytest.skip("FlashAttention-2's backward takes heads over 192 wide only on sm80, sm90 and sm1xx")
+def test_fused_kernels_are_as_exact_as_the_xla_kernel_from_float64(implementation, head_dim,
+                                                                   without_deterministic_ops):
+    """At Qwen3.5's grouped causal heads, 8 queries over 2 keys, FlashAttention's and cuDNN's output
+    and three input gradients lie within tests/reference_error.py's rule of the xla kernel's, both
+    measured from float64; on Hopper that holds FlashAttention-3 and cuDNN's 256-wide heads to it."""
+    from dew.nn.attention import cudnn_max_head_dim
+    if implementation == 'flash':
+        flash_here()
+        if head_dim > 192 and kernels.device_generation() in ('sm86', 'sm87', 'sm89'):
+            pytest.skip("FlashAttention-2's backward takes heads over 192 wide only on sm80, sm90 and sm1xx")
+    elif head_dim > cudnn_max_head_dim():
+        pytest.skip(f"cudnn takes heads at most {cudnn_max_head_dim()} wide on {kernels.device_generation()}")
     query, _, _ = qkv((1, 1024, 8, head_dim))
     _, key, value = qkv((1, 1024, 2, head_dim), seed=1)
     cotangent = qkv((1, 1024, 8, head_dim), seed=2)[0]
@@ -314,7 +324,7 @@ def test_flash_is_as_exact_as_the_xla_kernel_from_float64(head_dim, without_dete
         return jax.jit(lambda q, k, v: scaled_dot_product_attention(
             q, k, v, implementation=implementation, causal=True))
 
-    fused = output_and_gradients(kernel('flash'), cotangent, query, key, value)
+    fused = output_and_gradients(kernel(implementation), cotangent, query, key, value)
     reference = output_and_gradients(kernel('xla'), cotangent, query, key, value)
     with jax.enable_x64(new_val=True):
         wide = [jnp.asarray(np.asarray(x[0], np.float64)) for x in (query, key, value, cotangent)]

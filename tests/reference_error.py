@@ -159,11 +159,14 @@ def assert_leaves_as_exact(dew, reference, truth, *, reductions: int = 1,
     are the loss's cotangents of the biased projection, before their sum
     over batch and positions: the bias broadcasts over those axes, so its
     gradient sums those cotangents. Their absolute sum measures the size
-    before cancellation. Only these leaves get sqrt(reductions) eps32 of
-    that size as a floor; their float64 RMS must be within sqrt(reductions)
-    eps64 of it, or the declaration fails. Every other leaf's floor uses
-    its own float64 RMS, however small a representable gradient is."""
-    unit, resolution = float(np.finfo(np.float32).eps), float(np.finfo(np.float64).eps)
+    before cancellation, and a test measures it in float64 from the same
+    computation, never from a constant. Only these leaves get
+    sqrt(reductions) eps32 of that size as a floor, the summation bound
+    |fl(sum x) - sum x| <= gamma_n sum |x|; a declared leaf's float64 RMS
+    must not exceed its terms', as no sum exceeds its absolute terms, or the
+    declaration fails. Every other leaf's floor uses its own float64 RMS, however small
+    a representable gradient is."""
+    unit = float(np.finfo(np.float32).eps)
     spread = np.sqrt(reductions)
     invariants = invariants or {}
     paths = jax.tree_util.tree_leaves_with_path(dew)
@@ -176,9 +179,8 @@ def assert_leaves_as_exact(dew, reference, truth, *, reductions: int = 1,
         size = distance(true, 0)
         scale = invariants.get(name, size)
         if name in invariants:
-            assert within(size, spread * resolution * scale), (
-                f"{name}: declared invariant has float64 RMS {size:.3e}, above cancellation resolution "
-                f"{spread * resolution * scale:.3e} (terms {scale:.3e})")
+            assert within(size, scale), (
+                f"{name}: declared invariant has float64 RMS {size:.3e}, above its terms' {scale:.3e}")
         own = spread * unit * scale
         bar = FACTOR * max(distance(theirs, true), own)
         if not within(distance(mine, true), bar):
