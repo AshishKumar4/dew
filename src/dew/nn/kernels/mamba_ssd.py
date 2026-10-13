@@ -13,9 +13,11 @@ each kernel's grid, and the numerics mamba_ssm runs: operands in their own dtype
 the states the chunks enter stored in the operands' dtype, the decay between two steps of a chunk
 `exp(min(acs_i - acs_j, 0))` of the log decay `acs` cumulated within the chunk, and each gradient of the
 decay summed from its products as mamba_ssm's stable kernels sum it. Products of fp32 operands take
-TF32x3 (`fla_gdn._dot`) where mamba_ssm's take one TF32. mamba_ssm's deterministic mode is the only one:
-a sum over a kernel's blocks lands in a workspace that XLA sums, where mamba_ssm's default adds
-atomically. Each kernel names its origin.
+TF32x3 (`fla_gdn._dot`) where mamba_ssm's take one TF32, and the output is stored in fp32 where
+mamba_ssm rounds it to the operands' dtype: a sequence-sharded scan adds the earlier shards' state to it
+before any rounding (`dew.nn.mixers.mamba2._ssd`), and the gated norm after it reads fp32 anyway.
+mamba_ssm's deterministic mode is the only one: a sum over a kernel's blocks lands in a workspace that
+XLA sums, where mamba_ssm's default adds atomically. Each kernel names its origin.
 
 What mamba_ssm folds in and Dew computes outside stays outside: the step's bias, softplus and limit
 (`dew.nn.mixers.mamba2._ssd`) and the output gate `z` (Dew's gated norm). Packed documents are
@@ -483,7 +485,7 @@ def _chunk_scan_kernel(cb_ref, x_ref, dt_ref, da_ref, c_ref, states_ref, d_ref, 
     head and a `[BM, BN]` block of its output: the state the chunk entered read through `C`, rounded
     to `C`'s dtype and decayed to each row by `exp(acs)` (zero for a row of a later document); then the
     causal `sum_k CB_mk exp(min(acs_m - acs_k, 0)) dt_k x_k` over the chunk's rows, each `CB` block
-    weighted in fp32 and rounded to `x`'s dtype before its product; then `D x`."""
+    weighted in fp32 and rounded to `x`'s dtype before its product; then `D x`; stored fp32."""
     *seq, out_ref = refs
     columns = width // bn
     m, h = pl.program_id(0) // columns, pl.program_id(2)
@@ -551,7 +553,7 @@ class ChunkScan(_Launch):
                       pl.BlockSpec((heads,), lambda mn, bc, h: (0,)),
                       *([] if seq is None else [_documents(batch, padded)])],
             out_specs=headed,
-            out_shape=jax.ShapeDtypeStruct(x.shape, x.dtype),
+            out_shape=jax.ShapeDtypeStruct(x.shape, jnp.float32),
             compiler_params=_compiled(config.warps, config.stages), interpret=interpret,
             name="mamba_chunk_scan_fwd",
         )(cb, x, dt, da, c, states, d, *([] if seq is None else [seq]))
@@ -1231,7 +1233,8 @@ ssd_scan = jax.custom_vjp(_scan, nondiff_argnums=(8, 9))
 `dt` `[B, T, H]` through its bias, softplus and limit, `A` `[H]`, `B` and `C` `[B, T, G, N]` in `x`'s
 dtype, `D` `[H]`, each row's initial state `h0` `[B, H, P, N]` and each token's document `seq` `[B, T]`
 int32 (mamba_ssm's `seq_idx`, counted from 0 at the initial state's) or None, over chunks of `chunk`
-tokens. `y` is in `x`'s dtype, the final state fp32. P, N and the chunk are powers of two of at least
-16. Its numbers are mamba_ssm's: operands in their own dtype into fp32 accumulation, the states the
-chunks enter in the operands' dtype, the decay and the states across chunks in fp32."""
+tokens. `y` and the final state are fp32. P, N and the chunk are powers of two of at least 16. Its
+numbers are mamba_ssm's: operands in their own dtype into fp32 accumulation, the states the chunks enter
+in the operands' dtype, the decay and the states across chunks in fp32; the output's cotangent is
+rounded to the operands' dtype for its products, as mamba_ssm's arrives."""
 ssd_scan.defvjp(_scan_fwd, _scan_bwd)
