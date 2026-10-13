@@ -180,7 +180,7 @@ def test_weight_decay_spares_the_biases_and_the_norms_unless_a_group_claims_them
 
     spared, grouped = decay_step(), decay_step(param_groups=(ParamGroup('all', ('*',)),))
     for path in [('output', 'final_norm', 'scale'), ('output', 'final_norm', 'bias'),
-                 ('dit_block_0', 'attention', 'to_q', 'bias'), ('dit_block_0', 'mlp', 'layers_0', 'bias')]:
+                 ('dit_block_0', 'attention', 'to_q', 'bias'), ('dit_block_0', 'mlp', 'up_proj', 'bias')]:
         assert not np.any(at(spared, path)) and np.all(at(grouped, path)), path
     for path in [('dit_block_0', 'attention', 'to_q', 'kernel'), ('embed', 'patch_embed', 'Conv_0', 'kernel'),
                  ('output', 'final_proj', 'kernel')]:
