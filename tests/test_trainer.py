@@ -531,6 +531,48 @@ def test_the_compiled_step_consumes_the_state_it_is_given():
     assert int(again.step) == 2
 
 
+def test_restore_preserves_the_optimizer_state_the_ema_and_the_key(tmp_path):
+    trainer = make_trainer(tmp_path, optimizer=optax.adam(1e-3))
+    trained = trainer.fit(Data(), steps=3, log_every=1)
+
+    resumed = make_trainer(tmp_path, optimizer=optax.adam(1e-3))
+    state, _, position = resumed.place()
+
+    assert int(state.step) == 3, "the step counter was reset"
+    for field in ("variables", "opt_state", "ema"):
+        for before, after in zip(jax.tree.leaves(getattr(trained, field)),
+                                 jax.tree.leaves(getattr(state, field)), strict=True):
+            np.testing.assert_array_equal(np.asarray(before), np.asarray(after), err_msg=field)
+    assert jnp.array_equal(jax.random.key_data(trained.key), jax.random.key_data(state.key))
+    assert json.loads(position)["index"] == 3
+
+
+def _rewrite_position(trainer, step, rows, shares):
+    """Save `step` again with `rows` as the checkpoint's position table, each
+    row read for the share `shares` names."""
+    restored, _ = trainer.checkpoints.restore()
+    written = [np.frombuffer(row, np.uint8) for row in rows]
+    table = {"rows": np.stack(written),
+             "lengths": np.array([len(row) for row in written], np.int64),
+             "shares": np.array(shares, np.int64)}
+    manager = trainer.checkpoints._open()
+    manager.save(step, args=ocp.args.PyTreeSave({**restored, "position": table}), force=True)
+    manager.wait_until_finished()
+
+
+def test_a_global_position_is_read_by_any_process_count(tmp_path):
+    """A global position is a record count over an order every process count
+    reads the same way, so the table two processes wrote is this one
+    process's position as well. Only a shard offset ties a resume to the
+    count that wrote it."""
+    trainer = make_trainer(tmp_path)
+    trainer.fit(Data(), steps=1, log_every=1)
+    global_position = position.encode(position.Global(records=16, order="Counting"))
+    _rewrite_position(trainer, 2, [global_position, global_position], shares=[[0, 2], [1, 2]])
+
+    assert Checkpoints(str(tmp_path / "run")).restore(step=2, share=DataPartition())[1] == global_position
+
+
 def held_state(params, ema):
     """A train state that holds `params` and `ema` and scalars beside them."""
     count = jnp.zeros((), jnp.int32)
