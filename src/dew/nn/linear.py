@@ -119,6 +119,8 @@ def causal_conv1d(x, kernel, activation: bool = True, bias=None, *, valid=None, 
     `head` channels (`l2norm`), the queries and keys of a delta rule: each
     piece is the array its scan reads, not a slice of one to copy out.
 
+    The pieces are named `conv` for a remat policy to keep.
+
     On a GPU that runs Dew's Triton kernels all of it is one kernel forward
     and one backward (`short_conv`), which save only `x`; elsewhere, and for
     a conv they turn down (`conv_refusal`), `xla_conv1d`. On a mesh whose
@@ -130,14 +132,18 @@ def causal_conv1d(x, kernel, activation: bool = True, bias=None, *, valid=None, 
     dtype = x.dtype if dtype is None else jnp.dtype(dtype)
     rows = _row_split(x)
     if rows is not None:
-        return _per_row_shard(x, kernel, activation, bias, valid, parts, dtype, rows)
-    pieces = ((x.shape[-1], None),) if parts is None else tuple(parts)
-    if conv_refusal(x, kernel, pieces, dtype) is None:
-        out = short_conv.conv(x, kernel, bias, None if valid is None else jnp.asarray(valid, jnp.int8),
-                              pieces, activation=activation, eps=L2NORM_EPS, dtype=dtype,
-                              interpret=not generation.triton_runs())
-        return out[0] if parts is None else out
-    return xla_conv1d(x, kernel, activation, bias, valid=valid, parts=parts, dtype=dtype)
+        out = _per_row_shard(x, kernel, activation, bias, valid, parts, dtype, rows)
+    else:
+        pieces = ((x.shape[-1], None),) if parts is None else tuple(parts)
+        if conv_refusal(x, kernel, pieces, dtype) is None:
+            out = short_conv.conv(x, kernel, bias, None if valid is None else jnp.asarray(valid, jnp.int8),
+                                  pieces, activation=activation, eps=L2NORM_EPS, dtype=dtype,
+                                  interpret=not generation.triton_runs())
+            out = out[0] if parts is None else out
+        else:
+            out = xla_conv1d(x, kernel, activation, bias, valid=valid, parts=parts, dtype=dtype)
+    # The conv's output, which a remat policy may keep (`dew.nn.backbones.decoder_block.RESIDUALS`).
+    return jax.tree.map(lambda piece: checkpoint_name(piece, 'conv'), out)
 
 
 def _row_split(x) -> MeshAxes | None:
