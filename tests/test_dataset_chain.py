@@ -393,6 +393,7 @@ def test_an_iterator_without_a_position_or_a_declared_replay_does_not_resume():
     try:
         with pytest.raises(ValueError, match=r"iter:undeclared keeps no position and declares no replay"):
             resumed.set_state(state)
+            next(resumed)
     finally:
         resumed.close()
     with pytest.raises(ValueError, match="not both"):
