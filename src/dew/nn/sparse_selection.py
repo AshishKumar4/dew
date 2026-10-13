@@ -30,8 +30,11 @@ def index_scores(query, keys, weights, precision=None):
     shared = 'bshd,btd->bsht' if keys.ndim == 3 else 'bshd,bstd->bsht'
     scores = jnp.maximum(jnp.einsum(shared, query.astype(wide),
                                     keys.astype(wide), precision=precision), 0) * width ** -0.5
-    return jnp.einsum('bsht,bsh->bst', scores, weights.astype(wide) * heads ** -0.5,
-                      precision=precision)
+    # The head sum as a [1, H] by [H, T] product per query: written as the
+    # einsum over the scores first, it ran a third slower forward and backward
+    # on an H100 at the V3.2 indexer's 64 heads over 4096 keys.
+    weighted = (weights.astype(wide) * heads ** -0.5)[..., None, :]
+    return jnp.matmul(weighted, scores, precision=precision).squeeze(-2)
 
 
 def top_k_selection(scores, keep, top_k: int):
