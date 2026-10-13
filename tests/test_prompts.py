@@ -14,8 +14,11 @@ import json
 import numpy as np
 import pytest
 
-from dew.data import DataPartition, Loading, Prompts
-from dew.data.prompts import LENGTH_KEY, PROMPT_KEY, PromptSource
+from dew.config.data import PromptData, loader
+from dew.data import Loading
+from dew.data.compile import iterate
+from dew.data.dataset import DataPartition
+from dew.data.prompts import LENGTH_KEY, PROMPT_KEY
 
 TOKENIZER = "tests/fixtures/tokenizers/tiny-chat"
 WINDOW = 8
@@ -29,7 +32,20 @@ def records(*rows):
 
 
 def source(*rows, width=WINDOW):
-    return PromptSource.from_records(records(*rows), TOKENIZER, width, 0)
+    return prompt_rows(records(*rows), TOKENIZER, width, 0)
+
+
+def prompt_rows(rows, tokenizer, width, pad_id, thinking=None):
+    recipe = PromptData(source=tuple(json.loads(row) for row in rows), tokenizer=tokenizer,
+                     max_prompt_len=width, pad_id=pad_id, thinking=thinking, long="truncate")
+    pipeline, _, _ = recipe.pipelines()
+    return list(iterate(pipeline, read="memory", loading=Loading(workers=0)))
+
+
+def prompt_file(path, tokenizer, width, pad_id):
+    pipeline, _, _ = PromptData(source=path, tokenizer=tokenizer, max_prompt_len=width,
+                            pad_id=pad_id, long="truncate").pipelines()
+    return list(iterate(pipeline, read="memory", loading=Loading(workers=0)))
 
 
 def test_a_string_prompt_encodes_on_its_own():
@@ -50,8 +66,9 @@ def test_a_string_prompt_encodes_on_its_own():
 def test_byte_string_prompts_load_as_the_native_tokenizers_ids(prompt):
     from dew.data.text import tokenizer_for
 
-    data = Prompts(tokenizer="byte", records=records({"prompt": prompt}) * 8,
-                   max_prompt_len=WINDOW, loading=Loading(workers=0)).load(batch=8)
+    data = loader(PromptData(source=tuple(json.loads(row) for row in records({"prompt": prompt}) * 8),
+        tokenizer="byte", max_prompt_len=WINDOW, long="truncate"), batch=8, read="memory",
+            loading=Loading(workers=0), validation_records=4 * (8))
     stream = data.train(DataPartition())
     try:
         batch = next(stream)
@@ -76,8 +93,9 @@ def test_string_prompts_keep_the_hf_sources_special_tokens_out(tmp_path):
     tokenizer.save_pretrained(tmp_path)
     ids = tokenizer.encode("dew", add_special_tokens=False)
     assert tokenizer.encode("dew") != ids
-    data = Prompts(tokenizer=str(tmp_path), records=records({"prompt": "dew"}),
-                   max_prompt_len=WINDOW, loading=Loading(workers=0)).load(batch=1)
+    data = loader(PromptData(source=tuple(json.loads(row) for row in records({"prompt": "dew"})),
+        tokenizer=str(tmp_path), max_prompt_len=WINDOW, long="truncate"), batch=1, read="memory",
+            loading=Loading(workers=0), validation_records=4 * (1))
     stream = data.train(DataPartition())
     try:
         batch = next(stream)
@@ -116,9 +134,9 @@ def test_template_variables_reach_the_chat_template():
     plain = list(render(conversation, tokenize=True, return_dict=False, add_generation_prompt=True,
                         enable_thinking=False))
     assert plain != thinking, "the variable matters for this template"
-    spec = Prompts(tokenizer=TOKENIZER, records=records({"prompt": conversation}), max_prompt_len=64,
-                   val_batches=None, loading=Loading(workers=0), thinking=False)
-    batch = next(spec.load(batch=1).train(DataPartition()))
+    spec = PromptData(source=tuple(json.loads(row) for row in records({"prompt": conversation})),
+        tokenizer=TOKENIZER, max_prompt_len=64, thinking=False, long="truncate")
+    batch = next(loader(spec, batch=1, read="memory", loading=Loading(workers=0)).train(DataPartition()))
     assert [int(token) for token in batch[PROMPT_KEY][0, 64 - int(batch[LENGTH_KEY][0]):]] == plain
 
 
@@ -129,8 +147,9 @@ def test_validation_is_one_pass_over_a_second_file(tmp_path):
     train, val = tmp_path / "train.parquet", tmp_path / "val.parquet"
     pq.write_table(pa.table({"prompt": [IDS, LONG]}), train)
     pq.write_table(pa.table({"prompt": [IDS]}), val)
-    data = Prompts(tokenizer=TOKENIZER, path=str(train), val_path=str(val),
-                   max_prompt_len=WINDOW, loading=Loading(workers=0)).load(batch=1)
+    data = loader(PromptData(source=str(train), tokenizer=TOKENIZER, max_prompt_len=WINDOW,
+        validation=str(val), long="truncate"), batch=1, read="memory", loading=Loading(workers=0),
+            validation_records=4 * (1))
 
     assert data.val is not None
     batches = list(data.val(DataPartition()))
@@ -143,8 +162,9 @@ def test_validation_is_one_pass_over_a_second_file(tmp_path):
 def test_the_train_stream_encodes_inside_workers():
     """The same rows through real worker processes: the source pickles, the
     workers load their own tokenizer copy, the batches match."""
-    data = Prompts(tokenizer=TOKENIZER, records=records({"prompt": IDS}),
-                   max_prompt_len=WINDOW, loading=Loading(workers=1)).load(batch=1)
+    data = loader(PromptData(source=tuple(json.loads(row) for row in records({"prompt": IDS})),
+        tokenizer=TOKENIZER, max_prompt_len=WINDOW, long="truncate"), batch=1, read="memory",
+            loading=Loading(workers=1), validation_records=4 * (1))
 
     batch = next(data.train(DataPartition()))
 

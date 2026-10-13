@@ -21,8 +21,9 @@ from jax.sharding import Mesh
 
 import dew.nn.backbones
 import dew.nn.backbones.jepa  # noqa: F401  (registers the kind)
-from dew.data import DataPartition, preferences
+from dew.data import preferences
 from dew.data.chat import ROLES_KEY, Role
+from dew.data.dataset import DataPartition
 from dew.diffusion import presets
 from dew.diffusion.discrete import MDLM
 from dew.diffusion.process import DenoisingCondition

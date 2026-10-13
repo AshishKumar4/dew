@@ -17,9 +17,13 @@ import jax
 import pytest
 
 from dew.config import ModelConfig, ObjectiveConfig
-from dew.data import DataPartition, PreferencePairs, TFDSImages, TokenCorpus, TokenWindows
+from dew.config.data import HoldOut, ImageData, PreferenceData, TextData, loader
+from dew.data import TFDS, Loading
+from dew.data.dataset import DataPartition
+from dew.data.steps.image import EncodeCaptions
 from dew.data.text import ByteTokenizer
 from dew.decision import Choice, DecisionObjective, Example, Specials, StateFirstLayout
+from dew.decision.data import Decisions
 from dew.diffusion.discrete import MDLM
 from dew.diffusion.presets import Flow, MeanFlow, Shortcut
 from dew.inputs import Field, InputSpec
@@ -50,7 +54,8 @@ SEQ_LEN = 15
 def first(spec, objective=None):
     """The first training batch `spec` loads, as its recipe loads it."""
     tokenize = None if objective is None else objective.inputs.tokenize
-    return next(spec.load(batch=2, tokenize=tokenize).train(DataPartition()))
+    return next(loader(spec, batch=2, read="memory", loading=Loading(workers=0),
+                     host=() if tokenize is None else (EncodeCaptions(tokenize),)).train(DataPartition()))
 
 
 def decoder(**fields):
@@ -58,10 +63,10 @@ def decoder(**fields):
                              mlp_features=32, max_seq_len=32, **fields)
 
 
-def corpus_windows(corpus: Path) -> TokenWindows:
-    """TokenWindows over a byte corpus written to `corpus`, what the LM recipe trains on."""
-    TokenCorpus.write(["the quick brown fox jumps over the lazy dog " * 8] * 4, corpus, val_fraction=0.25)
-    return TokenWindows(path=str(corpus), seq_len=SEQ_LEN, val_batches=None)
+def corpus_windows(corpus: Path) -> TextData:
+    """Text over a byte corpus written to `corpus`, what the LM recipe trains on."""
+    documents = tuple({"text": "the quick brown fox jumps over the lazy dog " * 8} for _ in range(4))
+    return TextData(source=documents, seq_len=SEQ_LEN, token_holdout=HoldOut(fraction=0.25))
 
 
 @pytest.fixture(scope="module")
@@ -74,7 +79,7 @@ def diffusion(preset=None, objective="diffusion", **fields) -> DiffusionRunConfi
     with `fields`, sampling in two Euler steps."""
     return DiffusionRunConfig(
         model=ModelConfig.from_model(SimpleDiT(patch_size=2, emb_features=16, num_layers=1, num_heads=2)),
-        data=TFDSImages(path=str(IMAGES), image_size=4, augmentation="none", val_batches=None),
+        data=ImageData(source=TFDS("dew_images", path=str(IMAGES), split="all"), image_size=4, augment=None),
         preset=Flow() if preset is None else preset, val_metrics=(),
         text=TextCondition(encoder="char_table", checkpoint="char_table"),
         objective=ObjectiveConfig(objective, {"solver": Euler(), "steps": 2, **fields}))
@@ -113,17 +118,17 @@ def packed(objective_for):
 
 
 def preference_pairs():
-    """The chain recipe's DPO stage: `PreferencePairs` at `seq_len`, DPO one below."""
+    """The chain recipe's DPO stage: `Preferences` at `seq_len`, DPO one below."""
     pair = {"chosen": [1, 2, 3, 4], "rejected": [1, 2, 5],
             "chosen_mask": [0, 0, 1, 1], "rejected_mask": [0, 0, 1]}
-    spec = PreferencePairs(records=(json.dumps(pair),) * 4, seq_len=6, val_batches=None)
+    spec = PreferenceData(source=tuple(json.loads(row) for row in (json.dumps(pair),) * 4), seq_len=6)
     return DPOObjective(decoder(), spec.seq_len - 1), first(spec)
 
 
 def jepa():
     """The JEPA recipe's sample field over its image dataset, the grid it patches."""
-    config = JepaRunConfig(data=TFDSImages(path=str(IMAGES), image_size=16, augmentation="none",
-                                           val_batches=None), probe_classes=2)
+    config = JepaRunConfig(data=ImageData(source=TFDS("dew_images", path=str(IMAGES), split="all"),
+                                     image_size=16, augment=None), probe_classes=2)
     sample = config.sample()
     encoder = JepaEncoder(patch_size=2, emb_features=16, num_layers=1, num_heads=2, mlp_ratio=2)
     grid = (sample.shape[-2] // encoder.patch_size,) * 2
@@ -143,7 +148,8 @@ def decision():
     objective = DecisionObjective(decoder(), tokenizer=ByteTokenizer(),
                                   specials=Specials(None, 10, 0, "\x00", 255),
                                   layout=StateFirstLayout(max_len=32, head_max_len=24, option_tokens=6))
-    return objective, next(objective.dataset(examples, batch=2).train(DataPartition()))
+    return objective, next(loader(Decisions(source=examples), batch=2, read="memory",
+        objective=objective.data()).train(DataPartition()))
 
 
 def cases(windows):
