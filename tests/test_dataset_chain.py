@@ -2,14 +2,18 @@
 
 import itertools
 import json
+from dataclasses import dataclass
 
 import grain.python as grain
 import numpy as np
 import pytest
 
 from dew.data import Dataset, Files, Loading, Memory, from_grain, from_hf, from_iter, mix, text
+from dew.data.cache import Cache
 from dew.data.compile import compile, iterate
 from dew.data.dataset import DataPartition
+from dew.data.pipeline import Configured, ObjectiveData, Rejected
+from dew.data.plan import Manifest, StepIdentity
 
 READ = Loading(workers=0, threads=1, read_buffer=2, worker_buffer=1)
 
@@ -59,6 +63,163 @@ def test_holdout_puts_each_record_in_one_part_by_its_identity_the_same_in_every_
     first, held = Memory(rows("c", 10)).holdout(records=3)
     assert [int(row["i"]) for row in iterate(held, read="memory")] == [0, 1, 2]
     assert [int(row["i"]) for row in iterate(first, read="memory")] == list(range(3, 10))
+
+
+def add_draw(row, rng):
+    draw = np.int64(rng.integers(1, 2**16))
+    return {**row, "value": row["value"] + draw, "draw": draw}
+
+
+def double(row):
+    return {**row, "value": 2 * row["value"]}
+
+
+@dataclass(frozen=True)
+class Draw(grain.RandomMapTransform):
+    def random_map(self, row, rng):
+        return add_draw(row, rng)
+
+
+def draw_step(metadata):
+    return Draw()
+
+
+@dataclass(frozen=True)
+class ObjectiveDraw(grain.RandomMapTransform):
+    def random_map(self, row, rng):
+        return {**row, "objective_input": row["value"], "objective_draw": rng.integers(1, 2**16)}
+
+
+def objective_draw(metadata):
+    return ObjectiveDraw()
+
+
+@pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
+@pytest.mark.parametrize("preparation", ["empty", "random", "configured", "configured_user"])
+def test_objective_preparation_keeps_the_written_order_of_random_mixture_steps(read, preparation):
+    """Objective work reads the rows each child's random map and later map made."""
+    sources = [Memory([{**row, "value": row["i"]} for row in rows(origin, 16)]) for origin in ("a", "b")]
+    members = [(source.map(Configured(draw_step, needs=(), scope="run", random=True))
+                if preparation == "configured_user" else source.random_map(add_draw)).map(double)
+               for source in sources]
+    chain = mix(members).batch(8)
+    steps = ()
+    if preparation == "random":
+        steps = (ObjectiveDraw(),)
+    elif preparation == "configured":
+        steps = (Configured(objective_draw, needs=(), scope="run", random=True),)
+    expected = compile(chain, read=read, loading=READ, seed=37).train(DataPartition())
+    trained = compile(chain, objective=ObjectiveData(train=steps), read=read,
+                      loading=READ, seed=37).train(DataPartition())
+    try:
+        batches = list(itertools.islice(trained, 4))
+        reference = list(itertools.islice(expected, 4))
+        assert len(batches) == len(reference) == 4
+        for batch, written in zip(batches, reference, strict=True):
+            for field in ("i", "value", "draw"):
+                np.testing.assert_array_equal(batch[field], written[field])
+            np.testing.assert_array_equal(batch["value"], 2 * (batch["i"] + batch["draw"]))
+            if steps:
+                np.testing.assert_array_equal(batch["objective_input"], batch["value"])
+    finally:
+        expected.close()
+        trained.close()
+
+
+@dataclass(frozen=True)
+class FetchLike:
+    """Unsealed payloads, dropping unavailable rows as a network fetch does."""
+
+    volatile = True
+    rejects = True
+    identity = "fetch-like@1"
+
+    def __call__(self, row):
+        return (Rejected("unavailable") if row["i"] % 3 == 0 else
+                {**row, "payload": np.full(4, row["i"], dtype=np.uint8)})
+
+
+@dataclass(frozen=True)
+class ConfigureFetch:
+    identity = "fetch-like-factory@1"
+
+    def __call__(self, metadata):
+        return FetchLike()
+
+
+def fetched_generation(source, directory):
+    cache = Cache((directory / "fetched").as_uri())
+    fetch = FetchLike()
+    manifest = Manifest(source.fingerprint(), (StepIdentity.of(fetch),))
+    stored = cache.mapped(grain.MapDataset.source(source.records("indexed")), manifest, source,
+                          transform=lambda index, row: (fetch(row),))
+    try:
+        for index in range(len(stored)):
+            stored[index]
+        stored.finish()
+    finally:
+        stored.close()
+    return cache.publish(manifest, source)
+
+
+@pytest.mark.parametrize("configured", [False, True])
+def test_eager_fetch_keeps_a_memory_plan_volatile_until_its_generation_is_sealed(tmp_path, configured):
+    """An eager fetch still needs one reader per share; a sealed generation does not."""
+    source = Memory(rows("fetched", 16))
+    chain = (source.map(Configured(ConfigureFetch(), needs=())) if configured
+             else source.filter_map(FetchLike()))
+    data = compile(chain.batch(2), read="memory", loading=READ)
+    assert data.plan.volatile
+    assert data.records == 10
+    reader = data.train(DataPartition())
+    try:
+        batch = next(reader)
+        np.testing.assert_array_equal(batch["i"], [1, 2])
+        np.testing.assert_array_equal(batch["payload"], np.repeat(batch["i"][:, None], 4, axis=1))
+    finally:
+        reader.close()
+    with pytest.raises(ValueError):
+        data.train(DataPartition(readers=2))
+    generation = fetched_generation(source, tmp_path)
+    sealed = compile(chain.cache(generation).batch(2), read="memory", loading=READ)
+    assert not sealed.plan.volatile
+    readers = [sealed.train(DataPartition(readers=2, reader=index)) for index in range(2)]
+    try:
+        first, second = (next(reader) for reader in readers)
+        for field in ("i", "payload"):
+            np.testing.assert_array_equal(first[field], second[field])
+    finally:
+        for reader in readers:
+            reader.close()
+
+
+@pytest.mark.parametrize(("selection", "read"), [("fraction", "memory"), ("fraction", "streamed"),
+                                               ("records", "memory"), ("records", "indexed")])
+def test_a_sealed_generation_keeps_its_holdout_selection_in_training_and_validation(tmp_path,
+                                                                                 selection, read):
+    """Generation promotion splits its accepted rows, not the original inputs or the full generation."""
+    source = Memory(rows("fetched", 64))
+    generation = fetched_generation(source, tmp_path)
+    cached = source.filter_map(FetchLike()).cache(generation)
+    train, held = (cached.holdout(0.25, key="i") if selection == "fraction"
+                   else cached.holdout(records=5))
+    accepted = {index for index in range(64) if index % 3}
+    parts = [{int(row["i"]) for row in iterate(part, read=read, loading=READ)} for part in (train, held)]
+    assert all(parts)
+    assert parts[0].isdisjoint(parts[1])
+    assert parts[0] | parts[1] == accepted
+    if selection == "records":
+        assert parts[1] == set(sorted(accepted)[:5])
+    data = compile(train.batch(2), validation=held.batch(2, drop_remainder=False),
+                   read=read, loading=READ)
+    training, validation = data.train(DataPartition()), data.val(DataPartition())
+    try:
+        trained = {int(index) for batch in itertools.islice(training, len(accepted)) for index in batch["i"]}
+        scored = {int(index) for batch in validation for index in batch["i"]}
+        assert [trained, scored] == parts
+    finally:
+        training.close()
+        validation.close()
 
 
 def drop_thirds(row: dict) -> dict:

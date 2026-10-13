@@ -48,7 +48,7 @@ from dew.data.dataset import (
     stream_endless,
     stream_identity,
 )
-from dew.data.pipeline import Dataset
+from dew.data.pipeline import Dataset, DeviceStep
 from dew.nn.flops import MissingFlopsCount
 from dew.nn.kernels.generation import assumed, gpu_mesh, gpu_target, measured_kernel
 from dew.nn.kernels.tuning import tune
@@ -522,6 +522,8 @@ class Trainer(Generic[Loss, Effects]):
         # cut every batch the run reads (`_rows`, read off `fit`'s data).
         self._split: int | None = 1 if whole is not None else split
         self._rows: tuple[int, ...] | None = None
+        # The training batch's device steps, which the compiled step runs (`Loader.device`).
+        self._device: tuple[DeviceStep, ...] = ()
 
     @property
     def optimizer(self) -> optax.GradientTransformation:
@@ -941,8 +943,15 @@ class Trainer(Generic[Loss, Effects]):
     # The step
     # ------------------------------------------------------------------
 
+    def _model_batch(self, batch: Batch) -> Batch:
+        """The objective's inputs: the batch after the dataset's device steps,
+        traced into the compiled step, without the trainer's accounting columns."""
+        for step in self._device:
+            batch = step(batch)
+        return model_batch(batch)
+
     def _loss_shape(self, state: TrainState, batch: Batch):
-        batch = model_batch(batch)
+        batch = jax.eval_shape(self._model_batch, batch)
         # Shapes and dtypes only: a resident frozen leaf sits in another
         # memory space than the moving ones, and the loss the realization
         # runs reads a snapshot in one space. The step's key is drawn inside
@@ -970,7 +979,7 @@ class Trainer(Generic[Loss, Effects]):
             return jax.ShapeDtypeStruct(leaf.shape, leaf.dtype)
 
         trainable = jax.tree.map(shape, state.variables["params"])
-        records = jax.tree.map(shape, model_batch(batch))
+        records = jax.tree.map(shape, jax.eval_shape(self._model_batch, batch))
         mutable = (None if shared or aux.variables is None else
                    jax.tree.map(shape, {name: state.variables[name] for name in aux.variables}))
 
@@ -1229,7 +1238,8 @@ class Trainer(Generic[Loss, Effects]):
             # The body sees every field on the device; the out shardings
             # return the host-resident ones to pinned host memory.
             micro = microbatch(batch, part, split)
-            advanced, loss, aux, committed = body(self._fetched(current, shardings), model_batch(micro), part)
+            advanced, loss, aux, committed = body(self._fetched(current, shardings), self._model_batch(micro),
+                                                  part)
             return (dataclasses.replace(advanced, step=current.step + (part == split - 1)), loss,
                     {**aux.metrics, **step_counts(batch)}, jnp.isfinite(loss),
                     advanced.microstep > current.microstep, committed)
@@ -1281,7 +1291,7 @@ class Trainer(Generic[Loss, Effects]):
             # the objective included: a parameter read there is used twice.
             variables = {**rest, "params": params}
             return self.objective._loss(
-                variables, model_batch(batch),
+                variables, self._model_batch(batch),
                 Step(microstep, jax.random.fold_in(key, step), with_ema(variables, ema)))
 
         rest = {name: tree for name, tree in variables.items() if name != "params"}
@@ -1311,13 +1321,15 @@ class Trainer(Generic[Loss, Effects]):
             placement = self.shardings(prepared)
             transaction = Transaction(self.objective, self.optimizer, self.accumulation, shapes)
             body = transaction.step(realize=execution.realize, host=True)
+            # The device steps compiled once, as the device step compiles them into its own program.
+            inputs = jax.jit(self._model_batch)
 
         def run(current, batch):
             batch = transfer(batch, batch_shardings(cpu, batch))
             with self._traced_on(cpu):
                 if current.accumulation is None and self.accumulation > 1:
                     current = self._initialize_accumulation(current, batch, shapes, window=self.accumulation)
-                advanced, loss, aux, committed = body(current, model_batch(batch), 0)
+                advanced, loss, aux, committed = body(current, inputs(batch), 0)
                 advanced = dataclasses.replace(advanced, step=current.step + 1)
                 # A leaf already where its placement says stays the array it
                 # is: the resident frozen collection crosses no boundary.
@@ -1390,6 +1402,7 @@ class Trainer(Generic[Loss, Effects]):
         if tokens is not None and not self.objective.counts_tokens:
             raise ValueError("tokens= needs an objective that counts real tokens")
         loader, validation = fitted(dataset, validation, objective=self.objective.data())
+        self._device = loader.device
         if epochs is not None:
             steps = loader.epoch_steps(epochs)
         count_compilation_cache()

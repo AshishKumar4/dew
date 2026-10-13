@@ -16,6 +16,8 @@ import numpy as np
 from dew.data.dataset import Batch, LengthGroups
 
 if TYPE_CHECKING:
+    import jax
+
     from dew.data.cache import Cache, Generation
     from dew.data.dataset import Loading
     from dew.data.sources.base import Read, Source
@@ -280,9 +282,21 @@ class Group:
     groups: LengthGroups
 
 
+class DeviceStep:
+    """A step over the training batch that runs inside the compiled training
+    step, on the accelerator, rather than in the reader: pure and traceable,
+    a batch of arrays in and out, its randomness only from per-record key
+    fields (`images.augmentation_key`), so its draws are the same at any
+    split, microbatch or pool size and on resume. The reader leaves the fields
+    it reads in the batch it delivers (`Loader.device`)."""
+
+    def __call__(self, batch: Mapping[str, jax.Array]) -> dict[str, jax.Array]:
+        raise NotImplementedError
+
+
 @dataclasses.dataclass(frozen=True)
 class MapBatch:
-    step: HostStep
+    step: HostStep | DeviceStep
     identity: str | None = None
 
 
@@ -422,6 +436,11 @@ class Dataset:
             hosts = [step for step in steps if _host(step)]
             if len(hosts) < len(steps):
                 raise TypeError("after batch, map takes functions of the training batch that keep every row")
+            ran = any(isinstance(stage, MapBatch) and isinstance(stage.step, DeviceStep)
+                      for stage in self.chain().stages)
+            if ran and not all(isinstance(step, DeviceStep) for step in hosts):
+                raise TypeError("a device step runs in the compiled training step, after every host step of "
+                                "the batch; map host steps before it")
             return self.then(*(MapBatch(step, identity) for step in hosts))
         if batched:
             return self.then(*(Batched(step, batch_size, identity) for step in _columns(steps)))
@@ -664,6 +683,12 @@ class Dataset:
 
         chain = self.chain()
         batched = any(isinstance(stage, (BatchStage, TokenBudget)) for stage in chain.stages)
+        # Device steps run here, on the batches read, as the compiled training step runs them.
+        device = [stage.step for stage in chain.stages
+                  if isinstance(stage, MapBatch) and isinstance(stage.step, DeviceStep)]
+        chain = dataclasses.replace(chain, stages=tuple(
+            stage for stage in chain.stages
+            if not (isinstance(stage, MapBatch) and isinstance(stage.step, DeviceStep))))
         read = chain if batched else chain.batch(1, drop_remainder=False)
         if any(isinstance(stage, Repeat) for stage in chain.stages):
             # An endless chain reads as training reads it, random steps drawing as they draw there.
@@ -675,6 +700,8 @@ class Dataset:
                                 loading=chain.loading or Loading())(DataPartition())
         try:
             for batch in reader:
+                for step in device:
+                    batch = step(batch)
                 yield batch if batched else {
                     name: value[0] for name, value in batch.items() if name != VALID_ROWS}
         finally:
