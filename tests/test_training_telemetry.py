@@ -12,7 +12,7 @@ from recording import RecordingTracker
 
 import dew.config
 from dew.config import OptimConfig, RunConfig, TrainerConfig, Wandb
-from dew.data import Dataset
+from dew.data.dataset import Loader
 from dew.objectives import Aux, Objective
 from dew.training import Trainer, WandbTracker
 from dew.training.optim import Cosine
@@ -41,7 +41,7 @@ class ComplexSquared(Objective):
 
 
 def targets(values):
-    return Dataset(lambda partition: iter({'target': np.full(8, value, np.float32)}
+    return Loader(lambda partition: iter({'target': np.full(8, value, np.float32)}
                                           for value in values), None, None, 8)
 
 
@@ -69,7 +69,7 @@ def test_rejected_attempts_do_not_contribute_to_grad_norm():
 @pytest.mark.parametrize('accumulation', [1, 2])
 def test_complex_gradients_have_a_real_committed_norm(accumulation):
     batch = {'target': np.broadcast_to(np.array([1 + 2j, 3 + 4j], np.complex64), (8, 2))}
-    data = Dataset(lambda partition: iter([batch] * accumulation), None, None, 8)
+    data = Loader(lambda partition: iter([batch] * accumulation), None, None, 8)
     sink = RecordingTracker()
     trainer = Trainer(ComplexSquared(), optax.sgd(.1), key=0, tracker=sink, accumulation=accumulation)
     trainer.fit(data, steps=accumulation, log_every=1)
@@ -108,7 +108,7 @@ def test_wandb_counts_each_new_step_shape_once(monkeypatch):
     monkeypatch.setattr(wandb, 'init', lambda **_: run)
     with WandbTracker('dew', 'shapes', offline=True) as sink:
         trainer = Trainer(Squared(), optax.sgd(.1), key=0, tracker=sink)
-        data = Dataset(lambda partition: iter(
+        data = Loader(lambda partition: iter(
             {'target': np.ones((8, columns), np.float32)} for columns in (1, 2, 1, 2)), None, None, 8)
         trainer.fit(data, steps=4, log_every=1)
     rows = [row for row in run.history if 'train/loss' in row]

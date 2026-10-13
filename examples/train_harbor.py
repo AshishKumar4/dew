@@ -46,7 +46,7 @@ import tyro
 
 from dew.config import OptimConfig
 from dew.data import HFTokenizer
-from dew.data.dataset import Dataset
+from dew.data.dataset import Loader
 from dew.inference import NativeRolloutServer, Publication, SafetensorsReload, Server, TextGeneration
 from dew.interop import PretrainedDecoder
 from dew.interop.harbor import HARBOR_KEY, Gateway, HarborSource
@@ -132,7 +132,7 @@ def main(config: Config) -> dict:
                                max_lag=config.max_lag, ahead=config.max_lag, truncation=config.truncation,
                                log=history.append)
     draw = np.random.default_rng(config.seed)
-    data = Dataset(train=lambda partition: iter(
+    data = Loader(train=lambda partition: iter(
                        lambda: {"task_id": draw.integers(0, len(tasks), config.prompts, np.int32)}, None),
                    val=None, records=len(tasks), batch=config.prompts)
     trainer = Trainer(objective, OptimConfig(learning_rate=config.learning_rate, b2=0.99, weight_decay=0.0),
