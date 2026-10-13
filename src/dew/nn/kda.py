@@ -34,7 +34,7 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from .flops import conv_flops, delta_flops, projection_flops
-from .inputs import AttentionMetadata
+from .inputs import AttentionMetadata, coordinates_of
 from .linear import (
     CHUNK_SIZE,
     DepthwiseConv1d,
@@ -159,9 +159,8 @@ class KimiDeltaAttention(nn.Module):
                  attention_metadata: AttentionMetadata | None = None):
         del positions, segment_ids, kv_store
         B, S, _ = x.shape
-        valid = None if attention_metadata is None else attention_metadata.valid
-        if valid is not None and valid.shape != (B, S):
-            raise ValueError(f"row validity must be {(B, S)}, got {valid.shape}")
+        tokens = coordinates_of(attention_metadata, B, S)
+        valid = tokens.valid
         if valid is not None:
             # The reference zeroes padded rows before projecting them
             # (apply_mask_to_padding_states, modeling_glm5_next.py:361-370).
@@ -177,21 +176,20 @@ class KimiDeltaAttention(nn.Module):
             beta = jnp.where(valid[:, :, None], beta, 0.0)
 
         def scan(convolved, *, starts, valid, held):
-            del starts, valid
+            del valid
             query, key, value = (part.reshape(B, S, self.num_heads, self.head_dim) for part in convolved)
-            rule = recurrent_delta_rule if S == 1 else functools.partial(
-                chunk_kimi_delta_rule, chunk_size=self.chunk_size)
-            return rule(query, key, value, g, beta, held)
+            if S == 1 or starts is not None:
+                # Packed documents reset the memory at their starts, which the token-by-token rule takes.
+                return recurrent_delta_rule(query, key, value, g, beta, held, starts=starts)
+            return chunk_kimi_delta_rule(query, key, value, g, beta, held, chunk_size=self.chunk_size)
 
         # The decode state is GatedDeltaNet's pair, here in fp32; the
         # allocation-only call returns before any state is written. The conv
         # normalises the queries and keys (`l2norm`).
         heads = ((self.qkv_features, self.head_dim),) * 2 + ((self.qkv_features, None),)
         out = held_scan(self, projected, taps, None, scan,
-                        (self.num_heads, self.head_dim, self.head_dim), decode=decode, valid=valid,
-                        state='recurrent_state', state_dtype=wide, conv_dtype=wide,
-                        right_padded=attention_metadata is not None and attention_metadata.right_padded,
-                        parts=heads, dtype=wide)
+                        (self.num_heads, self.head_dim, self.head_dim), decode=decode, coordinates=tokens,
+                        state='recurrent_state', state_dtype=wide, conv_dtype=wide, parts=heads, dtype=wide)
         if out is None:
             return self.o_proj(jnp.zeros((B, S, self.qkv_features), self.dtype))
         gate = self.g_proj(x) if self.full_rank_gate else self.g_b_proj(self.g_a_proj(x))
