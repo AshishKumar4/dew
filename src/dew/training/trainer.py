@@ -325,7 +325,7 @@ class _FitPlan:
     steps: int | None
     log_every: int
     eval_every: int | None
-    total_tokens: int | None
+    tokens: int | None
     checkpoint_every: int | datetime.timedelta | None
     checkpoint_final: bool
     local_every: int | None
@@ -340,10 +340,10 @@ class _FitPlan:
     def validation(self) -> bool:
         return bool(self.suites)
 
-    def finished(self, step: int, tokens: int) -> bool:
-        """Whether either run-length cap has been reached."""
+    def finished(self, step: int, real: int) -> bool:
+        """Whether either run-length cap has been reached, after `real` tokens."""
         return ((self.steps is not None and step >= self.steps)
-                or (self.total_tokens is not None and tokens >= self.total_tokens))
+                or (self.tokens is not None and real >= self.tokens))
 
     @property
     def scored(self) -> tuple[Metric, ...]:
@@ -1333,7 +1333,7 @@ class Trainer(Generic[Loss, Effects]):
         dataset: Dataset,
         *,
         steps: int | None = None,
-        total_tokens: int | None = None,
+        tokens: int | None = None,
         log_every: int = 100,
         eval_every: int | None = None,
         checkpoint_every: int | datetime.timedelta | None = None,
@@ -1355,7 +1355,7 @@ class Trainer(Generic[Loss, Effects]):
         Every `log_every` steps, the tracker receives the loss, the objective's
         metrics and the throughput.
 
-        `total_tokens` stops at the first microbatch that reaches this real-token
+        `tokens` stops at the first microbatch that reaches this real-token
         budget, from the same counter as `train/tokens`, persisted in checkpoints.
         Padding never counts. With both caps the first reached ends the run;
         with `steps=None`, a decaying schedule needs its own step horizon.
@@ -1382,11 +1382,11 @@ class Trainer(Generic[Loss, Effects]):
         Previews are generated only when `preview=True` and a tracker receives them;
         scalar reporting never triggers preview work.
         """
-        if steps is None and total_tokens is None:
-            raise ValueError("fit needs steps or total_tokens to name the run length")
+        if steps is None and tokens is None:
+            raise ValueError("fit needs steps or tokens to name the run length")
         count_compilation_cache()
-        if total_tokens is not None and not self.objective.counts_tokens:
-            raise ValueError("total_tokens needs an objective that counts real tokens")
+        if tokens is not None and not self.objective.counts_tokens:
+            raise ValueError("tokens needs an objective that counts real tokens")
         updates = None if steps is None else steps // self.accumulation
         if self._config is not None:
             built = self._config.build(updates)
@@ -1416,7 +1416,7 @@ class Trainer(Generic[Loss, Effects]):
                 steps=steps,
                 log_every=log_every,
                 eval_every=eval_every,
-                total_tokens=total_tokens,
+                tokens=tokens,
                 checkpoint_every=checkpoint_every,
                 checkpoint_final=checkpoint_final,
                 local_every=None if checkpoints is None else checkpoints.local_every,
@@ -1478,7 +1478,7 @@ class Trainer(Generic[Loss, Effects]):
         compiled: dict[Shapes, tuple[CompiledStep, StepFlops | None]] = {}
         seen = 0
         run.notice = PreemptionNotice()
-        while not plan.finished(run.current, interval.real_tokens if plan.total_tokens is not None else 0):
+        while not plan.finished(run.current, interval.real_tokens if plan.tokens is not None else 0):
             # The window's capture opens before this iteration's first
             # read, so the step row records the read it waits on rather
             # than a compile that ran before capture began.
@@ -1608,7 +1608,7 @@ class Trainer(Generic[Loss, Effects]):
             sum(leaf.size for leaf in jax.tree.leaves(state.variables["params"])), mesh.devices.size,
             jax.devices()[0].device_kind, jax.process_count(), dict(mesh.shape),
             split_share(state.variables),
-            seed=self.seed, total_tokens=plan.total_tokens)
+            seed=self.seed, tokens=plan.tokens)
         # On a device with a known peak, the run counts its batches' work
         # for train/mfu while they can be counted (`_counted_batch`).
         self._count_work = gpu_target(started.device_kind).bf16_peak is not None
@@ -1689,7 +1689,7 @@ class Trainer(Generic[Loss, Effects]):
         the checkpoints, and the preemption notice. Returns whether the
         notice stops the run at this step, whose checkpoint is then written."""
         current, checkpoints = run.current, self.checkpoints
-        ending = plan.finished(current, interval.real_tokens if plan.total_tokens is not None else 0)
+        ending = plan.finished(current, interval.real_tokens if plan.tokens is not None else 0)
         aux = {name: value for name, value in aux.items()
                if name not in (FORWARD_FLOPS, TRAINING_FLOPS, TOKENS)}
         run.training = {'train/loss': loss, **{f'train/{name}': value for name, value in aux.items()}}

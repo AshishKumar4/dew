@@ -244,7 +244,7 @@ class TrainingDisplay:
         console = Console()
         if not terminal(console):
             target = (f"to {started.target_steps}" if started.target_steps is not None
-                      else f"for {started.total_tokens} real tokens")
+                      else f"for {started.tokens} real tokens")
             self.note(f"Training {model} from step {started.start_step} {target}: "
                       + ", ".join(f"{label} {value}".strip() for label, value in self.header))
             return

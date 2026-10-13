@@ -536,7 +536,7 @@ def mode_token_budget(args) -> dict:
     trainer.tracker = tracker
     data = TokenWindows(path=args.tokens, seq_len=4, val_batches=0,
                         loading=Loading(workers=0, threads=1, read_buffer=1)).load(batch=BATCH)
-    state = trainer.fit(data, total_tokens=80, log_every=1)
+    state = trainer.fit(data, tokens=80, log_every=1)
     return {"step": int(state.step), "updates": int(state.updates), "logged": len(tracker.losses)}
 
 

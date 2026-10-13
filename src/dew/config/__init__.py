@@ -603,7 +603,7 @@ class TrainerConfig:
     steps: int | None = None
     epochs: int | None = None
     """The run length as passes over the data; `steps` sets it directly instead."""
-    total_tokens: int | None = None
+    tokens: int | None = None
     """Stop after this many real tokens across all microbatches, including before a resume.
 
     Uses the counter reported as `train/tokens`, without padding. The final
@@ -747,10 +747,10 @@ class TrainerConfig:
         if self.steps is not None:
             return self.steps
         if self.epochs is None:
-            if self.total_tokens is not None:
+            if self.tokens is not None:
                 return None
             raise ValueError("the run length is --trainer.steps or --trainer.epochs "
-                             "or --trainer.total-tokens")
+                             "or --trainer.tokens")
         if dataset.steps_per_epoch is None:
             raise ValueError(
                 "epochs need a dataset with a record count; this one streams without "
@@ -1221,7 +1221,7 @@ class RunConfig:
                 split=trainer.split, dynamic_scale=trainer.dynamic_scale, checkpoints=checkpoints,
                 tracker=tracker, rollout=rollout, profile=trainer.profile, lower_for=trainer.lower_for,
             ).fit(
-                dataset, steps=steps, total_tokens=trainer.total_tokens,
+                dataset, steps=steps, tokens=trainer.tokens,
                 log_every=trainer.log_every,
                 eval_every=trainer.eval_interval(dataset),
                 checkpoint_every=trainer.checkpoint_interval(dataset),
