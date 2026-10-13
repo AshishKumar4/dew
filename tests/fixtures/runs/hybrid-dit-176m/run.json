@@ -1,43 +1,8 @@
 {
   "class": "dew.objectives.diffusion.config:DiffusionRunConfig",
   "fields": {
-    "audio": null,
-    "autoencoder": {
-      "dtype": "bfloat16",
-      "latent_scale": null,
-      "latent_shift": null,
-      "modelname": "pcuenq/sd-vae-ft-mse-flax",
-      "revision": "main"
-    },
-    "data": {
-      "class": "dew.data.images:ArrayRecordImages",
-      "fields": {
-        "augmentation": "flip_jitter",
-        "augmentation_backend": "host",
-        "augmentation_size": null,
-        "count": null,
-        "crop_scale": [
-          1.0,
-          1.0
-        ],
-        "image_size": 256,
-        "loading": {
-          "read_buffer": 128,
-          "threads": 64,
-          "worker_buffer": 2,
-          "workers": 32
-        },
-        "path": null,
-        "seed": 0,
-        "shards": [
-          "arrayrecord2/laion12m_coco"
-        ],
-        "val_batches": 4,
-        "val_split": null
-      }
-    },
-    "lora": null,
     "model": {
+      "name": "dew.nn.backbones.ssm_dit:HybridSSMAttentionDiT",
       "fields": {
         "adaln_silu": false,
         "attention_impl": "auto",
@@ -54,93 +19,132 @@
         "text_pooling": "all",
         "use_2d_fusion": true
       },
-      "name": "dew.nn.backbones.ssm_dit:HybridSSMAttentionDiT",
+      "defaults": {
+        "precision": null,
+        "force_fp32_for_softmax": true,
+        "dropout_rate": 0.0,
+        "qk_norm": false,
+        "output_channels": 3,
+        "remat": false,
+        "routes": [],
+        "patch_bottleneck": null,
+        "interval": false,
+        "time_scale": 16,
+        "block_pattern": null,
+        "bidirectional_ssm": true
+      },
       "wrappers": []
     },
-    "objective": {
+    "data": {
+      "class": "dew.config.data:ImageData",
       "fields": {
-        "ema_decay": null,
-        "guidance": {
-          "class": "dew.sampling.guidance:CFG",
+        "source": {
+          "class": "dew.data.sources.files:Files",
           "fields": {
-            "interval": [
-              0.0,
-              1.0
+            "url": [
+              "arrayrecord2/laion12m_coco"
             ],
-            "rescale": 0.0,
-            "scale": 5.0
+            "format": "arrayrecord",
+            "index": null,
+            "columns": null,
+            "where": null,
+            "partitioning": "hive",
+            "shard_bytes": 67108864,
+            "storage_options": null,
+            "spark": false,
+            "file_info": null
           }
         },
-        "solver": {
-          "class": "dew.sampling.solvers.dpm:DPMSolverMultistep",
+        "image_size": 256,
+        "staging_size": null,
+        "field": "image",
+        "caption": null,
+        "caption_templates": [],
+        "caption_columns": [
+          "caption",
+          "text"
+        ],
+        "classes": [],
+        "labels": null,
+        "augment": {
+          "flip": true,
+          "jitter": true,
+          "crop_scale": [
+            1.0,
+            1.0
+          ],
+          "backend": "host"
+        },
+        "validation": {
+          "class": "dew.data.holdout:HoldOut",
           "fields": {
-            "algorithm": "dpmsolver++",
-            "euler_at_final": false,
-            "lower_order_final": true,
-            "order": 2,
-            "solver_type": "midpoint"
+            "records": 512,
+            "fraction": null,
+            "by": "index",
+            "most": null,
+            "seed": 0
           }
         },
-        "steps": 20,
-        "unconditional_prob": 0.12
-      },
-      "name": "dew.objectives.diffusion.objective:DiffusionObjective"
-    },
-    "optim": {
-      "b1": null,
-      "b2": null,
-      "clip_grads": 0.0,
-      "ema_profiles": [],
-      "forced_weight_normalization": false,
-      "learning_rate": 0.0001,
-      "optimizer": "adamw",
-      "optimizer_opts": {},
-      "param_groups": [],
-      "schedule": null,
-      "state_dtype": "float32",
-      "weight_decay": null
-    },
-    "preset": {
-      "class": "dew.diffusion.presets:EDM",
-      "fields": {
-        "P_mean": null,
-        "P_std": null,
-        "min_snr_gamma": null,
-        "regime": "latent",
-        "rho": 7.0,
-        "sigma_data": 0.5,
-        "sigma_max": 80.0,
-        "sigma_min": 0.002
+        "split": "train"
       }
     },
-    "pretrained": null,
-    "text": {
-      "checkpoint": "openai/clip-vit-large-patch14",
-      "dtype": "bfloat16",
-      "encoder": "clip_text",
-      "field": "text",
-      "max_length": null,
-      "param_dtype": "float32",
-      "revision": null,
-      "unconditional": ""
+    "data_read": null,
+    "provision": false,
+    "data_seed": 0,
+    "loading": {
+      "workers": 32,
+      "threads": 64,
+      "read_buffer": 128,
+      "worker_buffer": 2,
+      "ram_budget_mb": null,
+      "max_workers": null
+    },
+    "validation_records": null,
+    "optim": {
+      "optimizer": "adamw",
+      "optimizer_opts": {},
+      "learning_rate": 0.0001,
+      "schedule": null,
+      "weight_decay": null,
+      "b1": null,
+      "b2": null,
+      "param_groups": [],
+      "clip_grads": 0.0,
+      "state_dtype": "float32",
+      "forced_weight_normalization": false,
+      "ema_profiles": []
     },
     "trainer": {
-      "accumulation": 1,
-      "batch_ramp": null,
-      "batch_size": 128,
-      "best": null,
+      "name": "text-to-image-176m",
       "checkpoint_dir": "run",
-      "checkpoint_every": "epoch",
-      "compilation_cache_dir": null,
-      "dynamic_scale": false,
-      "epochs": null,
-      "eval_every": "epoch",
       "keep": 1,
+      "best": null,
+      "batch_size": 128,
+      "batch_tokens": null,
+      "update_tokens": null,
       "key": 0,
+      "steps": 1350000,
+      "epochs": null,
+      "total_tokens": null,
+      "log_every": 100,
+      "eval_every": "epoch",
+      "checkpoint_every": "epoch",
+      "checkpoint_final": true,
+      "accumulation": 1,
+      "split": null,
+      "batch_ramp": null,
+      "dynamic_scale": false,
+      "mesh": {
+        "fsdp": 1,
+        "expert": 1,
+        "tensor": 1,
+        "sequence": 1,
+        "stage": 1,
+        "microbatches": null,
+        "replicas": 1,
+        "explicit": []
+      },
       "layout": {
-        "host": [],
-        "host_parameters": [],
-        "min_shard": 65536,
         "rules": [
           [
             "vocab",
@@ -282,26 +286,90 @@
             "data"
           ]
         ],
-        "tolerance": 0.02
+        "min_shard": 65536,
+        "tolerance": 0.02,
+        "host": [],
+        "host_parameters": []
       },
-      "log_every": 100,
-      "mesh": {
-        "expert": 1,
-        "fsdp": 1,
-        "microbatches": null,
-        "replicas": 1,
-        "sequence": 1,
-        "stage": 1,
-        "tensor": 1
-      },
-      "multi_host": null,
-      "name": "text-to-image-176m",
       "profile": null,
-      "quantization": null,
-      "steps": 1350000,
+      "compilation_cache_dir": null,
       "wandb": null,
-      "xla_flags": null
+      "publish": false,
+      "multi_host": null,
+      "xla_flags": null,
+      "quantization": null,
+      "lower_for": null
     },
+    "objective": {
+      "name": "dew.objectives.diffusion.objective:DiffusionObjective",
+      "fields": {
+        "ema_decay": null,
+        "guidance": {
+          "class": "dew.sampling.guidance:CFG",
+          "fields": {
+            "scale": 5.0,
+            "interval": [
+              0.0,
+              1.0
+            ],
+            "rescale": 0.0
+          }
+        },
+        "solver": {
+          "class": "dew.sampling.solvers.dpm:DPMSolverMultistep",
+          "fields": {
+            "order": 2,
+            "algorithm": "dpmsolver++",
+            "solver_type": "midpoint",
+            "lower_order_final": true,
+            "euler_at_final": false
+          }
+        },
+        "steps": 20,
+        "unconditional_prob": 0.12
+      },
+      "defaults": {
+        "process": null,
+        "inputs": null,
+        "uncertainty": null,
+        "alignment": null,
+        "end_to_end": null
+      }
+    },
+    "lora": null,
+    "preset": {
+      "class": "dew.diffusion.presets:EDM",
+      "fields": {
+        "sigma_min": 0.002,
+        "sigma_max": 80.0,
+        "rho": 7.0,
+        "sigma_data": 0.5,
+        "regime": "latent",
+        "P_mean": null,
+        "P_std": null,
+        "min_snr_gamma": null
+      }
+    },
+    "text": {
+      "encoder": "clip_text",
+      "checkpoint": "openai/clip-vit-large-patch14",
+      "dtype": "bfloat16",
+      "param_dtype": "float32",
+      "field": "text",
+      "unconditional": "",
+      "max_length": null,
+      "revision": null
+    },
+    "audio": null,
+    "autoencoder": {
+      "modelname": "pcuenq/sd-vae-ft-mse-flax",
+      "revision": "main",
+      "dtype": "bfloat16",
+      "latent_shift": null,
+      "latent_scale": null
+    },
+    "pretrained": null,
+    "pretrained_param_dtype": "float32",
     "val_metrics": []
   }
 }

@@ -18,6 +18,7 @@ from flax import linen as nn
 from jax.extend import core as jaxpr_core
 from recording import RecordingTracker
 
+from dew.data.dataset import Loader
 from dew.data.text import ByteTokenizer
 from dew.decision.head import DecisionHead, JointSchemaHead
 from dew.decision.layout import DecisionInputs, Specials, StateFirstLayout
@@ -568,18 +569,15 @@ def test_accumulation_two_logs_the_real_tokens_of_both_microbatches():
 
     from dew.training import Trainer
 
-    class Batches:
-        batch, records, val, steps_per_epoch = 8, 16, None, 2
-
-        def train(self, partition):
-            for length in (3, 5):
-                row = np.arange(7) < length
-                yield {"text": np.broadcast_to(row.astype(np.int32), (self.batch, 7))}
+    def batches(partition):
+        for length in (3, 5):
+            row = np.arange(7) < length
+            yield {"text": np.broadcast_to(row.astype(np.int32), (8, 7))}
 
     tracker = RecordingTracker()
     objective = LMObjective(decoder().clone(num_layers=1), seq_len=6, pad_id=0)
     trainer = Trainer(objective, optax.sgd(0.01), key=0, accumulation=2, tracker=tracker)
-    trainer.fit(Batches(), steps=2, log_every=2)
+    trainer.fit(Loader(batches, None, batch=8, records=16), steps=2, log_every=2)
     ticks = [scalars for _, scalars in tracker.scalars if "train/tokens" in scalars]
     assert len(ticks) == 1
     assert ticks[0]["train/tokens"] * 2 == 8 * (3 + 5)
