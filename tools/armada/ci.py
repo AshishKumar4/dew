@@ -39,7 +39,7 @@ plan recomputes each file's key from its record at the commit it plans, and
 leaves out a file whose every row's key matches, which ran green on exactly
 these inputs. A file that started another process is never skipped, since no
 event saw that process's code. The records live in the dew-xla-cache Worker
-under `testcache/`; with DEW_TEST_CACHE=off, or without its URL and token, the
+under `CACHE_PREFIX`; with DEW_TEST_CACHE=off, or without its URL and token, the
 plan runs every file.
 """
 
@@ -110,7 +110,10 @@ def environment_files() -> list[str]:
                    for name in (environment.get("setup"), environment.get("install"),
                                 *environment.get("key", ()))
                    if name})
-CACHE_PREFIX = "testcache"
+CACHE_PREFIX = "testcache/" + hashlib.sha256(
+    Path(__file__).read_bytes() + Path(__file__).with_name("executed.py").read_bytes()).hexdigest()[:16]
+"""Where records live: one namespace per version of the tools that write and read them, so a branch
+grading with a changed record format never overwrites or breaks main's records."""
 
 
 def shared(python: str) -> str:
