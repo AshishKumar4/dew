@@ -192,16 +192,17 @@ def chunk_ssd(x, dt, A, B, C, D, state=None, chunk_size: int = CHUNK_SIZE, start
     """The chunked SSD scan, `mamba2_chunk_scan` (modeling_mamba2.py:254-357).
 
     `x` `[B, S, H, P]`, `dt` `[B, S, H]` through softplus and the limit, `A`
-    `[H]`, `B` and `C` `[B, S, G, N]`, `D` `[H]`; returns `(output [B, S, H, P]`
-    in `x`'s dtype, `state [B, H, P, N]` in `at_least_fp32` of the operands'
-    common dtype). `starts` `[B, S]` marks packed documents' first tokens,
+    `[H]`, `B` and `C` `[B, S, G, N]`, `D` `[H]`; returns `(output [B, S, H, P],
+    state [B, H, P, N])` in `at_least_fp32` of the operands' common dtype, the
+    output unrounded for what a caller adds to it (the earlier shards' state,
+    `_ssd`). `starts` `[B, S]` marks packed documents' first tokens,
     whose entering state drops. Where `ssd_port_refusal` takes the call the
     whole scan is mamba_ssm's kernels (`_ported`), on `x`, `B` and `C` in
     their common dtype; else the scan runs in `at_least_fp32` of it, the
     chunk scan on the TPU's Pallas kernel where `ssd_kernel_platform` takes
     the geometry, else `xla_chunk_scan` (tests/test_ssd_kernel.py).
     """
-    dtype, operand = x.dtype, jnp.result_type(x, B, C)
+    operand = jnp.result_type(x, B, C)
     work = at_least_fp32(operand)
     x, B, C = (jnp.asarray(t, operand) for t in (x, B, C))
     dt, A, D = (jnp.asarray(t, work) for t in (dt, A, D))
@@ -212,7 +213,7 @@ def chunk_ssd(x, dt, A, B, C, D, state=None, chunk_size: int = CHUNK_SIZE, start
     refusal = ssd_port_refusal(x, B, chunk_size)
     if refusal is None:
         out, final = _ported(x, dt, A, B, C, D, carried, chunk_size, starts)
-        return out.astype(dtype), final.astype(work)
+        return out.astype(work), final.astype(work)
     ran_kernel('ssd', 'xla', refusal)
     x, B, C = (jnp.asarray(t, work) for t in (x, B, C))
     B, C = _expand_groups(B, heads), _expand_groups(C, heads)
@@ -236,7 +237,7 @@ def chunk_ssd(x, dt, A, B, C, D, state=None, chunk_size: int = CHUNK_SIZE, start
     scanned, final = (xla_chunk_scan(x_c, B_c, C_c, a_c, carried) if platform is None else
                       ssd_chunk_scan(x_c, B_c, C_c, a_c, carried, platform))
     output = jnp.moveaxis(scanned, 0, 1).reshape(batch, total, heads, head_dim) + skip
-    return output[:, :length].astype(dtype), final
+    return output[:, :length], final
 
 
 def ssd_port_refusal(x, B, chunk_size: int) -> str | None:
@@ -292,7 +293,7 @@ def recurrent_ssd(x, dt, A, B, C, D, state=None, starts=None):
     (modeling_mamba2.py:192-251) as a scan over time, in fp32 (the input's
     own dtype where it is wider). Operands and results as `chunk_ssd`'s; a
     token `starts` marks sees a zero state."""
-    dtype, work = x.dtype, at_least_fp32(x.dtype)
+    work = at_least_fp32(jnp.result_type(x, B, C))
     x, dt, A, B, C, D = (jnp.asarray(t, work) for t in (x, dt, A, B, C, D))
     batch, length, heads, head_dim = x.shape
     B, C = _expand_groups(B, heads), _expand_groups(C, heads)
@@ -310,7 +311,7 @@ def recurrent_ssd(x, dt, A, B, C, D, state=None, starts=None):
     final, out = jax.lax.scan(
         one_token, jnp.asarray(state, work),
         tuple(jnp.moveaxis(t, 1, 0) for t in (x, dt, B, C, starts)))
-    return jnp.moveaxis(out, 0, 1).astype(dtype), final
+    return jnp.moveaxis(out, 0, 1), final
 
 
 class MambaRMSNormGated(nn.Module):
