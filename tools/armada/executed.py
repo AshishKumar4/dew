@@ -50,24 +50,35 @@ decided: dict[types.CodeType, bool] = {}
 
 def started(code, offset):
     name = code.co_filename
-    # The environment's packages, which CI installs in the checkout, are the locks' to key.
-    if name.startswith(root) and name.endswith(".py") and "site-packages" not in name:
-        current[-1].add(name[len(root):])
-        if reads_backend(code) and not conftest(name):
-            site = f"{name[len(root):]}:{code.co_qualname}"
-            if readers:
-                readers[-1].add(site)
-            # The callback runs in the reader's frame, under the bodies of the modules being imported.
-            frame = sys._getframe(1)
-            while frame is not None:
-                body = frame.f_code.co_filename
-                if frame.f_code.co_name == "<module>" and body.startswith(root) and not conftest(body):
-                    if Path(body).name.startswith("test_"):
-                        module_reads.setdefault(body[len(root):], set()).add(site)
-                    elif not readers:
-                        everywhere.add(site)
-                frame = frame.f_back
+    if not checkout(name):
+        return sys.monitoring.DISABLE
+    current[-1].add(name[len(root):])
+    if conftest(name):
+        return sys.monitoring.DISABLE
+    if code.co_name == "<module>":
+        # Each module body sees every reader it calls, however many bodies called it before.
+        sys.monitoring.restart_events()
+    if reads_backend(code):
+        site = f"{name[len(root):]}:{code.co_qualname}"
+        if readers:
+            readers[-1].add(site)
+        # The callback runs in the reader's frame, under the bodies of the modules being imported.
+        frame = sys._getframe(1)
+        while frame is not None:
+            body = frame.f_code.co_filename
+            if frame.f_code.co_name == "<module>" and checkout(body) and not conftest(body):
+                if Path(body).name.startswith("test_"):
+                    module_reads.setdefault(body[len(root):], set()).add(site)
+                elif not readers:
+                    everywhere.add(site)
+            frame = frame.f_back
     return sys.monitoring.DISABLE
+
+
+def checkout(name: str) -> bool:
+    """Whether `name` is a Python file of the checkout. The environment's packages, which CI installs
+    in the checkout, are the locks' to key."""
+    return name.startswith(root) and name.endswith(".py") and "site-packages" not in name
 
 
 def conftest(name: str) -> bool:
@@ -92,8 +103,7 @@ def audited(event, args):
 # Recording starts as `-p executed` imports this, before pytest loads the initial conftests, which
 # import Dew; repository modules imported even earlier join what every file shares.
 shared.update(name[len(root):] for module in list(sys.modules.values())
-              if (name := getattr(module, "__file__", None) or "").startswith(root) and name.endswith(".py")
-              and "site-packages" not in name)
+              if checkout(name := getattr(module, "__file__", None) or ""))
 sys.monitoring.use_tool_id(TOOL, "dew-test-cache")
 sys.monitoring.register_callback(TOOL, sys.monitoring.events.PY_START, started)
 sys.monitoring.set_events(TOOL, sys.monitoring.events.PY_START)

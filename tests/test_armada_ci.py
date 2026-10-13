@@ -121,7 +121,7 @@ def test_the_gpu_tier_is_every_file_whose_tests_read_the_backend_or_are_marked_f
     the Worker returns. A read is the file's whose test calls it, by any
     name, every file's of a task where a session fixture made it, and a
     test module's under whose body it ran, though another file imported it
-    first. The `platform` module is no read. A file that started a process
+    first, beside others. The `platform` module is no read. A file that started a process
     has no key, so it is in, and the plan never skips it."""
     url, stored, _ = cache_worker
     monkeypatch.setenv("DEW_XLA_CACHE_URL", url)
@@ -137,9 +137,12 @@ def test_the_gpu_tier_is_every_file_whose_tests_read_the_backend_or_are_marked_f
                           "def test_passed(): assert chosen(lambda: 'gpu') == 'gpu'\n",
         "test_one.py": "def test_one(where): assert where == 'gpu'\n",
         "test_two.py": "def test_two(request): assert request.getfixturevalue('where') == 'gpu'\n",
-        "test_importer.py": "import test_imported\ndef test_imports(): assert test_imported.ON == 'gpu'\n",
+        "test_importer.py": "import test_imported, test_imported_too\n"
+                            "def test_imports(): assert test_imported.ON == test_imported_too.ON == 'gpu'\n",
         "test_imported.py": "from devices import Device, placed\nON = placed(Device())\n"
                             "def test_on(): assert ON == 'gpu'\n",
+        "test_imported_too.py": "from devices import Device, placed\nON = placed(Device())\n"
+                                "def test_on(): assert ON == 'gpu'\n",
         "test_marked.py": "import pytest\n@pytest.mark.gpu\ndef test_on_a_gpu(): pass\n",
         "test_machine.py": "import platform\ndef test_machine(): assert platform.machine()\n",
         "plain.py": "def helper(): return 1\n",
@@ -168,6 +171,7 @@ def test_the_gpu_tier_is_every_file_whose_tests_read_the_backend_or_are_marked_f
     stored[ci.cache_url("3.12", "3.12:tests/test_lost.py#2/2")[len(url):]] = None
     assert ci.gpu_tier("3.12") == {
         "tests/test_imported.py": ["tests/devices.py:placed"],
+        "tests/test_imported_too.py": ["tests/devices.py:placed"],
         "tests/test_importer.py": ["tests/devices.py:placed"],
         "tests/test_lost.py": ["unrecorded"],
         "tests/test_marked.py": ["mark:gpu"],
