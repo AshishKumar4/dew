@@ -253,6 +253,7 @@ def test_local_partial_snapshot_survives_continued_training_and_weight_restore(t
         np.testing.assert_array_equal(raw_leaf(got), raw_leaf(want))
 
 
+@pytest.mark.gpu("XLA:GPU's simplifier speculates the branch; XLA:CPU's pipeline kept it a branch")
 def test_an_accumulating_step_updates_the_optimizer_in_its_commit_alone():
     """A window's microbatches before its last only accumulate: nothing in the
     step outside the commit's branch reads an Adam moment. XLA's conditional
