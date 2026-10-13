@@ -36,6 +36,7 @@ import jax.numpy as jnp
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 from jax.ad_checkpoint import checkpoint_name
+from jax.custom_derivatives import linear_call
 from jax.interpreters.ad import JVPTracer
 
 from dew.nn.kernels import delta_rule, fla_gdn, fla_kda, short_conv
@@ -390,6 +391,28 @@ def _masked_conv1d(x, kernel, valid, state=None, bias=None, segments=None, parts
     return conv_pieces(output, parts, x.dtype if dtype is None else dtype), history
 
 
+def _cumulated(g, documents=None):
+    """`g` `[..., C, F]` cumulated over its C positions as a compensated pair `(hi, lo)`
+    (`compensated_add`), restarting at each of packed `documents`' first positions."""
+    zeros = jnp.zeros_like(g)
+    if documents is None:
+        return jax.lax.associative_scan(compensated_add, (g, zeros), axis=g.ndim - 2)
+
+    def segmented(left, right):
+        (left_start, *left_sum), (right_start, *right_sum) = left, right
+        total = compensated_add(left_sum, right_sum)
+        restarted = (jnp.where(right_start, kept, summed)
+                     for kept, summed in zip(right_sum, total, strict=True))
+        return left_start | right_start, *restarted
+
+    changed = jnp.concatenate([jnp.ones_like(documents[..., :1, :], bool),
+                               documents[..., 1:, :] != documents[..., :-1, :]], axis=-2)
+    _, hi, lo = jax.lax.associative_scan(segmented, (jnp.broadcast_to(changed, g.shape), g, zeros),
+                                         axis=g.ndim - 2)
+    return hi, lo
+
+
+@jax.custom_jvp
 def chunk_decay(g, documents=None):
     """Cumulate per-chunk log decays and build the pairwise decay between positions.
 
@@ -414,27 +437,19 @@ def chunk_decay(g, documents=None):
     47.6 against 48.0 ms, Qwen3.5-0.8B's gated delta net over 4096 16.3
     against 16.5).
 
+    The gradient is the pairs' own (`_chunk_decay_tangent`): differentiating
+    the difference of two prefixes sums a pair's cotangent into its two ends
+    with opposite signs, and the decay gradient, a row sum less a column sum
+    of the chunk's pairs, cancelled to fp32 noise wherever the prefixes ran
+    long.
+
     With packed `documents` `[..., C, 1]` (each position's document within
     its chunk), the sum restarts at each document's first position and pairs
     of positions in different documents weigh zero, masked before exp: a
     document's decays are its own tokens' alone, the ones it computes run by
     itself.
     """
-    zeros = jnp.zeros_like(g)
-    if documents is None:
-        hi, lo = jax.lax.associative_scan(compensated_add, (g, zeros), axis=g.ndim - 2)
-    else:
-        def segmented(left, right):
-            (left_start, *left_sum), (right_start, *right_sum) = left, right
-            total = compensated_add(left_sum, right_sum)
-            restarted = (jnp.where(right_start, kept, summed)
-                         for kept, summed in zip(right_sum, total, strict=True))
-            return left_start | right_start, *restarted
-
-        changed = jnp.concatenate([jnp.ones_like(documents[..., :1, :], bool),
-                                   documents[..., 1:, :] != documents[..., :-1, :]], axis=-2)
-        _, hi, lo = jax.lax.associative_scan(segmented, (jnp.broadcast_to(changed, g.shape), g, zeros),
-                                             axis=g.ndim - 2)
+    hi, lo = _cumulated(g, documents)
     chunk_size = hi.shape[-2]
     inclusive = jnp.tril(jnp.ones((chunk_size, chunk_size), jnp.bool_))[..., None]
     if documents is not None:
@@ -445,6 +460,43 @@ def chunk_decay(g, documents=None):
     # the decay gradient.
     diff = jnp.where(inclusive, diff, 0.0)
     return hi, jnp.where(inclusive, jnp.exp(diff), 0.0)
+
+
+def _ranged(decay, dg):
+    """The decay's tangent: each pair's decay times its range's tangent, `dg` summed over `(t, s]`,
+    pair by pair; a pair across documents weighs zero."""
+    width = dg.shape[-2]
+    strict = jnp.tril(jnp.ones((width, width), bool), -1)[..., None]
+    return decay * jnp.cumsum(jnp.where(strict, dg[..., :, None, :], 0.0), axis=-3)
+
+
+def _ranged_transpose(decay, cotangent):
+    """`_ranged`'s transpose: position i's gradient is the weighted cotangent of every pair whose
+    range holds it, `sum_{s >= i} sum_{t < i} cotangent[s, t] decay[s, t]`, two cumulative sums
+    of the chunk's pairs, no pair entering any sum it does not span."""
+    width = decay.shape[-3]
+    strict = jnp.tril(jnp.ones((width, width), bool), -1)[..., None]
+    weighted = jnp.cumsum(jnp.where(strict, cotangent * decay, 0.0), axis=-2)
+    before = jnp.concatenate([jnp.zeros_like(weighted[..., :, :1, :]), weighted[..., :, :-1, :]], axis=-2)
+    after = jnp.flip(jnp.cumsum(jnp.flip(before, axis=-3), axis=-3), axis=-3)
+    return jnp.moveaxis(jnp.diagonal(after, axis1=-3, axis2=-2), -1, -2)
+
+
+@chunk_decay.defjvp
+def _chunk_decay_tangent(primals, tangents):
+    """The pairs' own tangent, in forward and reverse mode alike: the decay's is each pair's range
+    (`_ranged`), and its transpose sums only the pairs spanning a position (`_ranged_transpose`).
+    On Qwen3.5-tiny's packed decision rows (tests/test_decision_packing.py, clef) the prefix
+    difference's gradient put the gated delta net's A_log 3.58 and dt_bias 4.49 times as far from
+    float64 as the rows run alone, against 2 allowed; with this and the memory write's decay row
+    (`xla_chunk_states`) every backbone leaf sat at 0.77-0.93, on six CPUs of two models. It costs
+    the chunked rule's forward and backward 4% with a decay per head and 26% with one per key
+    dimension on CPU (2 x 4096 x 16 heads of 128: 1.508 against 1.564 s; 2 x 1024 x 8 heads,
+    1.936 against 2.440 s)."""
+    g, documents = primals
+    dg, _ = tangents
+    gc, decay = chunk_decay(g, documents)
+    return (gc, decay), (_cumulated(dg, documents)[0], linear_call(_ranged, _ranged_transpose, decay, dg))
 
 
 def strictly_lower_inverse(a):
@@ -493,7 +545,7 @@ def strictly_lower_inverse(a):
     return inverse.reshape(*lead, width, width)
 
 
-def xla_chunk_states(key, k_cumdecay, out_vals, gc, state, written=None, kept=None):
+def xla_chunk_states(key, k_cumdecay, out_vals, gc, last_decay, state, kept=None):
     """The memory crossing chunks, the one sequential part of the chunked
     rule, as a `lax.scan`: per chunk the reference's corrected values
     `v_new = value - k_cumdecay @ S` and its write `S * exp(gc[-1]) +
@@ -507,24 +559,24 @@ def xla_chunk_states(key, k_cumdecay, out_vals, gc, state, written=None, kept=No
     entered `[B, H, NC, Dk, Dv]`, each chunk's corrected values
     `[B, H, NC, C, Dv]` and the state leaving the last chunk.
 
-    With packed documents, `written` `[B, 1, NC, C, 1]` marks the tokens of
-    each chunk's last document, the only ones its write keeps, and `kept`
-    `[B, 1, NC, 1, 1]` the chunks no document starts in, the only ones the
-    memory they entered passes through.
+    The write weighs each token by `last_decay` `[B, H, NC, C, D]`, the last
+    row of the chunk's pairwise decay (`chunk_decay`'s `exp(gc[-1] - gc)`):
+    its exponent compensated as every pair's is, where the prefix's rounded
+    half alone put a long chunk's write off by its whole sum's rounding, and
+    zero for every token of a packed chunk's earlier documents, which the
+    write does not keep. With packed documents, `kept` `[B, 1, NC, 1, 1]`
+    marks the chunks no document starts in, the only ones the memory they
+    entered passes through.
     """
     def one_chunk(s, step):
-        k_i, kd_i, v_i, gc_i, own_i, kept_i = step
+        k_i, kd_i, v_i, gc_i, last_i, kept_i = step
         v_corrected = v_i - kd_i @ s
-        last = gc_i[..., -1:, :]
-        # Another document's decay is no difference of the last one's: masked before exp, which it
-        # would overflow (exp(140) * 0 is NaN), as chunk_decay masks its unused differences.
-        written_i = k_i * jnp.exp(jnp.where(own_i > 0, last - gc_i, 0.0)) * own_i
-        return (s * jnp.swapaxes(jnp.exp(last), -1, -2) * kept_i
-                + jnp.swapaxes(written_i, -1, -2) @ v_corrected, (s, v_corrected))
-    ones = jnp.ones((1, 1, gc.shape[2], 1, 1), gc.dtype)
-    masks = tuple(ones if x is None else x.astype(gc.dtype) for x in (written, kept))
+        return (s * jnp.swapaxes(jnp.exp(gc_i[..., -1:, :]), -1, -2) * kept_i
+                + jnp.swapaxes(k_i * last_i, -1, -2) @ v_corrected, (s, v_corrected))
+    kept = jnp.ones((1, 1, gc.shape[2], 1, 1), gc.dtype) if kept is None else kept.astype(gc.dtype)
     final, (entered, corrected) = jax.lax.scan(
-        one_chunk, state, tuple(jnp.moveaxis(x, 2, 0) for x in (key, k_cumdecay, out_vals, gc, *masks)))
+        one_chunk, state,
+        tuple(jnp.moveaxis(x, 2, 0) for x in (key, k_cumdecay, out_vals, gc, last_decay, kept)))
     return jnp.moveaxis(entered, 0, 2), jnp.moveaxis(corrected, 0, 2), final
 
 
@@ -557,8 +609,9 @@ def chunk_delta_rule(query, key, value, g, beta, state=None, chunk_size: int = C
     memory: within a chunk each document's decays are its own (`chunk_decay`),
     a token reads the memory the chunk entered only in the document that
     memory belongs to, and the chunk's write keeps only its last document's
-    tokens, the memory it entered passing through only where no document
-    starts in it. A document computes as it would alone.
+    tokens (the decay's last row is zero for the others), the memory it
+    entered passing through only where no document starts in it. A document
+    computes as it would alone.
     """
     dtype, work = query.dtype, at_least_fp32(query.dtype)
     query, key, value, g, beta = (x.astype(work) for x in (query, key, value, g, beta))
@@ -576,7 +629,7 @@ def chunk_delta_rule(query, key, value, g, beta, state=None, chunk_size: int = C
 
     q_c, k_c = chunks(query), chunks(key)
     kb_c, vb_c = chunks(key * beta[..., None]), chunks(value * beta[..., None])
-    document = first = written = kept = None
+    document = first = kept = None
     if starts is not None:
         # Each token's document within its row, per chunk, [B, 1, NC, C, 1], and the document the
         # memory each chunk enters belongs to: its first token's, unless that token starts one.
@@ -584,7 +637,6 @@ def chunk_delta_rule(query, key, value, g, beta, state=None, chunk_size: int = C
         document = jnp.cumsum(begins, axis=1).reshape(B, 1, T // chunk_size, chunk_size, 1)
         entered_document = document[..., :1, :] - begins.reshape(document.shape)[..., :1, :]
         first = document == entered_document
-        written = document == document[..., -1:, :]
         kept = document[..., -1:, :] == entered_document
     # The log decay cumulated within each chunk, the reference's
     # `g = g.cumsum(dim=-1)` (modeling_qwen3_next.py:417), and the decay
@@ -608,7 +660,8 @@ def chunk_delta_rule(query, key, value, g, beta, state=None, chunk_size: int = C
     # The barrier materializes the zero. Remove it when XLA:CPU no longer
     # returns an uninitialized scan carry here.
     state = jax.lax.optimization_barrier(state)
-    entered, v_corrected, state = xla_chunk_states(k_c, k_cumdecay, out_vals, gc, state, written, kept)
+    entered, v_corrected, state = xla_chunk_states(k_c, k_cumdecay, out_vals, gc, decay[..., -1, :, :], state,
+                                                   kept)
     # decay is zero above the diagonal, so this is the reference's inclusive
     # lower `masked_fill(triu(1), 0)`.
     core = (q_c * entering) @ entered + _paired(q_c, k_c, decay) @ v_corrected

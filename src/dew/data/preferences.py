@@ -1,6 +1,6 @@
 """Preference pairs for DPO: chosen and rejected rows with their masks.
 
-A `PreferencePairs` source reads a parquet file or in-memory JSON rows of
+A `PreferencePair` step reads records of
 `chosen` and `rejected` token-id lists, with `chosen_mask` and
 `rejected_mask` marking the completion tokens. Each batch stacks them in
 TRL's layout: chosen rows over rejected rows, padded to the longest row,
@@ -10,13 +10,10 @@ ids; anything else fails naming the row.
 
 from __future__ import annotations
 
-import dataclasses
-from collections.abc import Sequence
+from typing import TYPE_CHECKING
 
-import numpy as np
-
-from .dataset import Batch, Dataset, DatasetSpec, Tokenize
-from .rows import json_records, known_row, parquet_names, parquet_rows, row_dataset
+if TYPE_CHECKING:
+    from dew.data.steps.chat import PreferencePair
 
 IDS_KEY = "input_ids"
 """Batch key holding the `[B, 2, S]` pair ids, chosen at index 0."""
@@ -53,113 +50,9 @@ def _mask(values: object, name: str, length: int, where: str) -> list[int]:
     return mask
 
 
-class PreferenceSource:
-    """Reads validated pair rows by index, stacking each on read.
+def pair(seq_len: int = 256, *, pad_id: int = 0) -> PreferencePair:
+    """A record step that lays a chosen and a rejected completion's ids and
+    loss masks out as two `seq_len` rows."""
+    from dew.data.steps.chat import PreferencePair
 
-    Rows come back as `[2, seq_len]` pairs, chosen at index 0, padded with
-    `pad_id` and 0. A row longer than the window fails with its lengths,
-    because a pair cannot be chunked without cutting a completion and a
-    silent cut trains the wrong preference. The repr names the origin file,
-    or the record count for in-memory rows, which is what a saved position
-    compares against (`describe`).
-    """
-
-    def __init__(self, rows: Sequence[object], origin: str, pad_id: int,
-                 seq_len: int):
-        if seq_len < 1:
-            raise ValueError(f"seq_len is {seq_len}: pairs need at least one token")
-        normalized: list[tuple[list[int], list[int], list[int], list[int]]] = []
-        for index, held in enumerate(rows):
-            where = f"{origin} row {index}"
-            row = known_row(held, FIELDS, where)
-            if row.get("chosen") is None or row.get("rejected") is None:
-                raise ValueError(f"{where}: a pair needs both chosen and rejected ids")
-            chosen = _ids(row["chosen"], "chosen", where)
-            rejected = _ids(row["rejected"], "rejected", where)
-            longest = max(len(chosen), len(rejected))
-            if longest > seq_len:
-                raise ValueError(
-                    f"{where}: the pair runs {len(chosen)} and {len(rejected)} ids "
-                    f"for a {seq_len} window; shorten the row")
-            normalized.append((
-                chosen, rejected,
-                _mask(row.get("chosen_mask", [1] * len(chosen)), "chosen_mask",
-                      len(chosen), where),
-                _mask(row.get("rejected_mask", [1] * len(rejected)), "rejected_mask",
-                      len(rejected), where)))
-        if not normalized:
-            raise ValueError(f"{origin} holds no pairs")
-        self._rows = normalized
-        self._origin = origin
-        self._pad_id = pad_id
-        self._seq_len = seq_len
-
-    @classmethod
-    def from_parquet(cls, path: str, pad_id: int, seq_len: int) -> PreferenceSource:
-        """The parquet file's rows.
-
-        `chosen` and `rejected` are required; the masks default to
-        all-completion when absent. Rows longer than `seq_len` fail.
-        """
-        names = parquet_names(path, "preference")
-        for column in ("chosen", "rejected"):
-            if column not in names:
-                raise ValueError(
-                    f"{path}: the {column} column is required, the file has {names}")
-        return cls(parquet_rows(path, FIELDS, names), path, pad_id, seq_len)
-
-    @classmethod
-    def from_records(cls, records: tuple[str, ...], pad_id: int,
-                     seq_len: int) -> PreferenceSource:
-        """In-memory rows as JSON, for tests and small sweeps."""
-        rows = json_records(records)
-        return cls(rows, f"{len(rows)} in-memory records", pad_id, seq_len)
-
-    def __repr__(self) -> str:
-        return f"{self.__class__.__name__}(origin={self._origin!r})"
-
-    def __len__(self) -> int:
-        return len(self._rows)
-
-    def __getitem__(self, index: int) -> Batch:
-        chosen, rejected, chosen_mask, rejected_mask = self._rows[index]
-        ids = np.full((2, self._seq_len), self._pad_id, np.int32)
-        mask = np.zeros((2, self._seq_len), np.int32)
-        ids[0, :len(chosen)] = chosen
-        ids[1, :len(rejected)] = rejected
-        mask[0, :len(chosen_mask)] = chosen_mask
-        mask[1, :len(rejected_mask)] = rejected_mask
-        return {IDS_KEY: ids, MASK_KEY: mask}
-
-
-@dataclasses.dataclass(frozen=True)
-class PreferencePairs(DatasetSpec):
-    """Reads chosen and rejected completions as fixed-width pairs, for DPO.
-
-    `path` is a parquet file, and `records` is JSON rows for tests and small
-    sweeps; set exactly one of the two. A row holds `chosen` and `rejected`
-    token-id lists, and optionally `chosen_mask` and `rejected_mask`, which
-    mark the completion tokens with 1 and default to all ones. Each batch
-    holds `input_ids` and `completion_mask` as `[B, 2, seq_len]` pairs, with
-    the chosen row at index 0, padded with `pad_id` and 0. A row longer than
-    `seq_len` raises `ValueError`, because cutting it could cut a completion
-    and train the wrong preference. `val_path` is a second parquet file
-    scored as one pass; None trains without validation.
-    """
-
-    path: str | None = None
-    records: tuple[str, ...] = ()
-    val_path: str | None = None
-    seq_len: int = 256
-    pad_id: int = 0
-    val_batches: int | None = 4
-
-    def load(self, *, batch: int, tokenize: Tokenize | None = None) -> Dataset:
-        self.uncaptioned(tokenize)
-        return row_dataset(
-            self, batch=batch, path=self.path, records=self.records,
-            val_path=self.val_path, val_batches=self.val_batches,
-            from_parquet=lambda path: PreferenceSource.from_parquet(
-                path, self.pad_id, self.seq_len),
-            from_records=lambda records: PreferenceSource.from_records(
-                tuple(records), self.pad_id, self.seq_len))
+    return PreferencePair(seq_len, pad_id)
