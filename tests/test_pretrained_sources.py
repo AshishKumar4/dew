@@ -153,6 +153,21 @@ def test_a_tensor_in_two_shards_is_refused_by_name(tmp_path):
         sources.load_shards(tmp_path)
 
 
+def test_a_pickle_conversion_refuses_a_tensor_two_shards_hold(tmp_path, monkeypatch):
+    """The conversion owns each tensor by one shard as a read does: a later
+    shard's copy would otherwise replace the earlier in the index it writes."""
+    torch = pytest.importorskip("torch")
+    from dew.interop import pickles
+
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    names = ("pytorch_model-00001-of-00002.bin", "pytorch_model-00002-of-00002.bin")
+    for name, value in zip(names, (1.0, 0.0), strict=True):
+        torch.save({"model.norm.weight": torch.full((2,), value)}, tmp_path / name)
+    with pytest.raises(ValueError, match=r"'model\.norm\.weight' is stored in both "
+                                         r"pytorch_model-00001-of-00002\.bin and pytorch_model-00002"):
+        pickles.converted(tmp_path, names)
+
+
 def test_a_text_encoder_reads_its_weights_and_not_the_fp16_variant_beside_them(tmp_path):
     """A pipeline's text_encoder folder holds model.safetensors and
     model.fp16.safetensors, the same names at two precisions."""

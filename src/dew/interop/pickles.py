@@ -30,7 +30,7 @@ import numpy as np
 
 from dew.cache import dew_cache_dir
 from dew.files import stat_identity
-from dew.interop.safetensors_io import WEIGHTS_FILE, weight_files, write_file, write_index
+from dew.interop.safetensors_io import WEIGHTS_FILE, own, weight_files, write_file, write_index
 
 if TYPE_CHECKING:
     import torch
@@ -73,8 +73,10 @@ def converted(directory: Path, shards: Sequence[str]) -> Path:
         else [f"model-{number:05d}-of-{len(shards):05d}.safetensors" for number in range(1, len(shards) + 1)]
     )
     weight_map: dict[str, str] = {}
+    owner: dict[str, str] = {}
     for shard, output in zip(shards, outputs, strict=True):
         tensors = _state_dict(directory / shard)
+        own(owner, tensors, shard, directory)
         write_file(tensors, target / output, {"format": "pt"})
         weight_map.update(dict.fromkeys(tensors, output))
     if len(shards) > 1:
