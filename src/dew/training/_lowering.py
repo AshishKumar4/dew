@@ -14,11 +14,12 @@ GPU.
 
 A choice keyed on the platform reads `generation.backend()`, the assumed
 generation's platform, and takes the GPU's path here. Two read
-`generation.gpu_placed()`, this process's own GPU, so the dry run cannot see
-their GPU path: attention's cuDNN (`cudnn_runs`) and FlashAttention
-(`flash_refusal`) calls, CUDA kernels and not Pallas ones, whose trace asks
-the CUDA plugin for versions and libraries a CPU host lacks, so attention
-traces its XLA path.
+`generation.gpu_placed()`, this process's own GPU, which an assumed one never
+is, so the dry run cannot see their GPU path: attention's cuDNN (`cudnn_runs`)
+and FlashAttention (`flash_refusal`) calls, CUDA kernels and not Pallas ones,
+whose trace asks the CUDA plugin for versions and libraries a CPU host lacks
+and whose lowering asks for devices an abstract mesh lacks, even on a GPU
+host, so attention traces its XLA path.
 """
 
 from __future__ import annotations
