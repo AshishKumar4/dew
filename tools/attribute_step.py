@@ -44,7 +44,7 @@ import resource
 import shutil
 import tarfile
 import tempfile
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Iterable, Iterator
 from pathlib import Path
 
@@ -174,6 +174,18 @@ def step_program(rows: list) -> str:
     return max(programs, key=programs.__getitem__)
 
 
+def program_runs(rows: list, step: str, steps: int, ops: dict[str, HloInstruction] | None) -> float:
+    """How many times a step ran its program `step`: the count most of its ops show over the ops'
+    own calls a run (`HloInstruction.runs`). XProf counts an op's kernels, not its calls; a
+    cuBLAS GEMM that splits its reduction launches two, which read as twice its work."""
+    known = {row_name: found for row in rows if str(row.get("program_id")) == step
+             and (found := (ops or {}).get(row_name := str(row.get("hlo_op_name") or ""))) is not None
+             and found.runs}
+    counts = Counter(round(float(row.get("occurrences") or 0) / steps / known[name].runs, 3)
+                     for row in rows if (name := str(row.get("hlo_op_name") or "")) in known)
+    return counts.most_common(1)[0][0] if counts else 0.0
+
+
 def attribute_time(trace: Path, steps: int, model_flops: float | None,
                    ops: dict[str, HloInstruction] | None = None, device: str | None = None) -> dict:
     capture = capture_of(trace)
@@ -198,6 +210,7 @@ def attribute_time(trace: Path, steps: int, model_flops: float | None,
     for row in rows:
         programs[str(row.get("program_id"))] += float(row["total_self_time"])
     step = step_program(rows)
+    runs = program_runs(rows, step, steps, ops)
     by_part: dict = defaultdict(lambda: defaultdict(float))
     by_kind: dict = defaultdict(float)
     by_part_kind: dict = defaultdict(lambda: defaultdict(float))
@@ -224,7 +237,7 @@ def attribute_time(trace: Path, steps: int, model_flops: float | None,
         # step's FLOP count counts it. XProf's own rates are no measure of it: its model rate put a
         # cuBLAS weight-gradient GEMM of C6's Qwen3.5-0.8B at 550 TFLOP/s on an A100 (4x its work), and its
         # normalized rate guesses each op's precision (the later Qwen3.5-0.8B step's GEMMs at 1.127 of the peak).
-        calls = float(row.get("occurrences") or 0) / steps
+        calls = runs * known.runs if known is not None else 0.0
         gflops = known.flops * calls / (us * 1e-6) / 1e9 if known is not None and us else 0.0
         # XProf's HBM bandwidth is GiB/s over the op's own time, so the op moves that much a step.
         hbm_mib = float(row.get("hbm_bw") or 0) * us * 1e-6 * 1024
