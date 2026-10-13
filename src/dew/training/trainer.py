@@ -1493,7 +1493,8 @@ class Trainer(Generic[Loss, Effects]):
         interval = Interval(time.time(), last_saved=(
             int(state.step) if checkpoints is not None and checkpoints.latest is not None else None),
             tokens_before_log=int(run.stop_control.pop("tokens", 0)))
-        if self._opened(plan, run, interval, state, position):
+        if self._opened(plan, run, interval, state, position,
+                        resumed=initial is None and interval.last_saved is not None):
             return state
         compiled: dict[Shapes, tuple[CompiledStep, StepFlops | None]] = {}
         seen = 0
@@ -1617,10 +1618,12 @@ class Trainer(Generic[Loss, Effects]):
         run.other += time.perf_counter() - paused
         return self._reported_outcome(error, run)
 
-    def _opened(self, plan: _FitPlan, run: _FitRun, interval: Interval, state: TrainState, position) -> bool:
+    def _opened(self, plan: _FitPlan, run: _FitRun, interval: Interval, state: TrainState, position, *,
+                resumed: bool) -> bool:
         """Start `fit` from the placed state: report it, refuse a run already
-        past its steps or a checkpoint cadence with no checkpointer, and open
-        the training stream on its prefetch worker. Returns whether the run
+        past its steps, a checkpoint cadence with no checkpointer or a resume
+        its stream cannot continue, and open the training stream on its
+        prefetch worker. Returns whether the run
         is already complete, a checkpoint at its last step having been
         written, so there is nothing to do."""
         mesh, checkpoints, steps = self.device_mesh, self.checkpoints, plan.steps
@@ -1653,9 +1656,7 @@ class Trainer(Generic[Loss, Effects]):
             run.source = plan.dataset.train(partition)
             check_stream(run.source, mesh, self.mesh, plan.dataset.batch,
                          self.accumulation * (self._split or 1), rows=self.rollout is None,
-                         checkpointing=bool(plan.checkpoint_every or plan.local_every or (
-                             checkpoints is not None and plan.cadenced and plan.best and
-                             any(not choice.weights_only for choice in plan.best))))
+                         resumed=current if resumed and position is None else None)
             if isinstance(run.source, RampedStream):
                 # Each stage's batch is read whole: no plan splits a ramp's.
                 self._split = 1
