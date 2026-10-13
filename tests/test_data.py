@@ -1262,7 +1262,8 @@ def test_columns_rows_and_a_torch_dataset_are_the_same_records():
     first, *others = (next(data.train(DataPartition())) for data in (
         loader(RecordsData(source=columns), batch=4, seed=0, read="memory"), loader(RecordsData(source=rows),
             batch=4, seed=0, read="memory"),
-        loader(RecordsData(source=Torch(tensors, fields=("index", "x"))), batch=4, seed=0, read="memory",
+        loader(RecordsData(source=Torch(tensors, fields=("index", "x"), identity="columns@1")),
+            batch=4, seed=0, read="memory",
             loading=Loading(workers=0))))
 
     assert first["x"].shape == (4, 2) and first["x"].dtype == np.float32
@@ -1286,8 +1287,10 @@ def test_a_torchvision_style_dataset_reads_its_tuples_as_named_fields():
         def __getitem__(self, index):
             return Image.fromarray(np.full((5, 5, 3), index, np.uint8)), index
 
-    batch = next(loader(RecordsData(source=Torch(Pictures(), fields=("image", "label")),
-        validation=Torch(Pictures(), fields=("image", "label"))), batch=4, read="memory",
+    batch = next(loader(RecordsData(
+        source=Torch(Pictures(), fields=("image", "label"), identity="pictures@1"),
+        validation=Torch(Pictures(), fields=("image", "label"), identity="pictures@1")),
+            batch=4, read="memory",
             loading=Loading(workers=0)).val(DataPartition()))
 
     assert batch["image"].shape == (4, 5, 5, 3) and batch["image"].dtype == np.uint8
