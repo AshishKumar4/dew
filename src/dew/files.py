@@ -8,7 +8,8 @@ its bytes flushed to disk, so a crash at any point leaves either file whole.
 `write_atomically` is that for data in memory, and `staged` is it for a
 directory, which a cache publishes once. A location with a scheme (`gs://`,
 `s3://`) is written in place: its store makes an object visible whole or not
-at all, and has no rename to stage one with.
+at all, and has no rename to stage one with. `stat_identity` is what such a
+cache keys a source file by.
 """
 
 from __future__ import annotations
@@ -22,6 +23,21 @@ from collections.abc import Iterator
 from pathlib import Path
 
 from etils import epath
+
+
+def stat_identity(path: str | os.PathLike) -> tuple[str, int, int]:
+    """A file's resolved path, size and modification time in ns, which a
+    conversion cache keys it by in place of a hash of its bytes.
+
+    Hashing the contents would read the whole file on every cache hit, the
+    cost the cache exists to avoid. A Hub file resolves to its
+    content-addressed blob, so for a published file the key is a content
+    key. A local file relies on its mtime: rewriting it in place at the
+    same size within one mtime tick, or `cp -p` of another file of the
+    same size over it, reuses the stale conversion; deleting the cache's
+    directory under `dew.cache.dew_cache_dir()` clears it."""
+    status = os.stat(path)
+    return str(Path(path).resolve()), status.st_size, status.st_mtime_ns
 
 
 @contextlib.contextmanager

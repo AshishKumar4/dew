@@ -57,6 +57,48 @@ def hf_activation(activation: GatedActivation) -> str:
     return _HF_ACTIVATIONS[activation]
 
 
+UNGATED_ACTIVATIONS = {'gelu': 'gelu_exact', 'gelu_new': 'gelu', 'gelu_fast': 'gelu',
+                       'gelu_pytorch_tanh': 'gelu', 'relu': 'relu'}
+"""The ungated activations the classic families' configs name for an MLP or
+a head, as Dew's: transformers' erf GELU, its tanh approximations and ReLU."""
+
+
+def ungated_mlp(activation: str, accepted: Collection[str], field: str, family: str) -> str:
+    """Dew's name for the `activation` a `family` config's `field` names,
+    refused unless among the spellings `accepted`, those its reference reads."""
+    if activation not in accepted:
+        refuse(f'{field}={activation!r}', f'{family} reads only {sorted(accepted)}')
+    return UNGATED_ACTIVATIONS[activation]
+
+
+def fixed_attention_buffer(name: str, tensor: np.ndarray, attention: str,
+                           sentinels: Collection[float]) -> bool:
+    """Whether `name` is one of a classic family's fixed attention buffers,
+    under its `attention` module: `bias`, the triangular causal mask, or
+    `masked_bias`, a mask sentinel among `sentinels`, which each family's
+    releases spell their own. They describe the fixed mask, not learned
+    biases, so an altered one is refused."""
+    if name.endswith(f'.{attention}.bias'):
+        if (tensor.ndim != 4 or tensor.shape[:2] != (1, 1)
+                or tensor.shape[-2] != tensor.shape[-1]
+                or not np.array_equal(tensor, np.tril(np.ones_like(tensor)))):
+            raise ValueError(f'{name} must hold the fixed triangular causal mask')
+        return True
+    if name.endswith(f'.{attention}.masked_bias'):
+        if tensor.shape != () or float(tensor) not in sentinels:
+            raise ValueError(f'{name} must hold a historical mask sentinel, one of {sorted(sentinels)}')
+        return True
+    return False
+
+
+def hf_ungated(mlp: GatedActivation | None, family: str, tanh: str = 'gelu_new') -> str:
+    """The activation a classic `family`'s config names Dew's ungated `mlp`
+    by, its tanh GELU spelled `tanh`; any other `mlp` is refused."""
+    if isinstance(mlp, str) and mlp in ('gelu', 'gelu_exact', 'relu'):
+        return tanh if mlp == 'gelu' else _HF_ACTIVATIONS[mlp]
+    return refuse('mlp', f'{family} writes only an ungated GELU or ReLU')
+
+
 GEMMA3_MODEL_TYPE = 'gemma3_text'
 QWEN35 = 'qwen3_5_text'
 
