@@ -144,30 +144,27 @@ def test_a_split_files_groups_run_every_test_once(ci, tmp_path):
 def test_durations_are_each_tests_least_time_over_green_runs_floors(ci):
     """`durations` records each test of the newest verdict at its least time
     over green verdicts' floor rows, so a slow container or run moves nothing
-    and a test since removed is dropped, keeps the times of a file the newest
-    run skipped as unchanged, and refuses a red run or rows that carry no times."""
+    and a test since removed is dropped, and refuses a red run or rows that
+    carry no times."""
     def verdict(x, y):
         return {"rows": [
             {"name": "3.12:tests/test_a.py#1/2", "exitCode": 0, "tests": {"tests/test_a.py::test_x": x}},
             {"name": "3.12:tests/test_a.py#2/2", "exitCode": 0, "tests": {"tests/test_a.py::test_y": y}},
             {"name": "3.14:tests/test_a.py", "exitCode": 0, "tests": {"tests/test_a.py::test_x": 90.0}}]}
 
-    assert ci.durations([verdict(1.2346, 2.0)], {}) == {
+    assert ci.durations([verdict(1.2346, 2.0)]) == {
         "tests/test_a.py::test_x": 1.235, "tests/test_a.py::test_y": 2.0}
-    assert ci.durations([verdict(1.5, 2.0), verdict(30.0, 60.0), verdict(1.0, 2.5)], {}) == {
+    assert ci.durations([verdict(1.5, 2.0), verdict(30.0, 60.0), verdict(1.0, 2.5)]) == {
         "tests/test_a.py::test_x": 1.0, "tests/test_a.py::test_y": 2.0}
     removed = {"rows": [{"name": "3.12:tests/test_a.py", "exitCode": 0,
                          "tests": {"tests/test_a.py::test_x": 0.5, "tests/test_a.py::test_gone": 3.0}}]}
-    assert ci.durations([verdict(1.0, 2.0), removed], {}) == {
+    assert ci.durations([verdict(1.0, 2.0), removed]) == {
         "tests/test_a.py::test_x": 0.5, "tests/test_a.py::test_y": 2.0}
-    cold = ci.durations([{"rows": [*verdict(1.0, 2.0)["rows"], {
-        "name": "3.12:tests/test_b.py", "exitCode": 0, "tests": {"tests/test_b.py::test_z": 4.0}}]}], {})
-    assert ci.durations([verdict(1.0, 2.0)], cold) == cold
     red = {"name": "3.12:tests/test_b.py", "exitCode": 1, "tests": {}}
     with pytest.raises(SystemExit):
-        ci.durations([verdict(1.0, 2.0), {"rows": [*verdict(1.0, 2.0)["rows"], red]}], {})
+        ci.durations([verdict(1.0, 2.0), {"rows": [*verdict(1.0, 2.0)["rows"], red]}])
     with pytest.raises(SystemExit):
-        ci.durations([{"rows": [{"name": "3.12:tests/test_b.py", "exitCode": 0}]}], {})
+        ci.durations([{"rows": [{"name": "3.12:tests/test_b.py", "exitCode": 0}]}])
 
 
 def test_a_tasks_rows_share_its_wall_time_by_their_tests_times(ci, tmp_path):
@@ -189,6 +186,46 @@ def test_a_tasks_rows_share_its_wall_time_by_their_tests_times(ci, tmp_path):
     short, long = rows["3.12:tests/test_short.py"], rows["3.12:tests/test_long.py"]
     assert 1.2 < short + long <= wall
     assert long / short == pytest.approx(3.0, rel=0.25)
+
+
+def test_a_task_reuses_a_green_row_only_on_the_cpu_class_and_inputs_it_ran_on(ci, tmp_path, monkeypatch):
+    """A file that ran green is reused by a later task on the same CPU class while its inputs are
+    unchanged; a task on another class, or after its inputs change, runs it again."""
+    (tmp_path / "tests/test_counted.py").write_text(
+        "from pathlib import Path\n"
+        "def test_ok():\n"
+        "    with Path('runs').open('a') as runs: runs.write('x')\n")
+    venv = tmp_path / ".venv-3.12/bin"
+    venv.mkdir(parents=True)
+    (venv / "python").write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
+    (venv / "python").chmod(0o755)
+    worker: dict[str, bytes] = {}
+
+    def cache_request(url, token, data=None):
+        if data is not None:
+            worker[url] = data
+        return worker.get(url) if data is None else None
+
+    monkeypatch.setattr(ci, "cache_request", cache_request)
+    monkeypatch.setenv("DEW_XLA_CACHE_URL", "https://cache.invalid")
+    monkeypatch.setenv("DEW_XLA_CACHE_TOKEN", "token")
+    monkeypatch.delenv("DEW_TEST_CACHE", raising=False)
+    out = tmp_path / "verdict.json"
+
+    def run(cpu):
+        monkeypatch.setattr(ci, "cpu_class", lambda: cpu)
+        ci.task("3.12", ["tests/test_counted.py"], "", out, 60.0)
+        [only] = json.loads(out.read_text())["rows"]
+        assert only["exitCode"] == 0
+        return len((tmp_path / "runs").read_text())
+
+    assert run("GenuineIntel-6-143") == 1
+    assert run("GenuineIntel-6-143") == 1
+    assert run("AuthenticAMD-25-1") == 2
+    assert run("AuthenticAMD-25-1") == 2
+    (tmp_path / "tests/test_counted.py").write_text(
+        (tmp_path / "tests/test_counted.py").read_text() + "def test_more(): pass\n")
+    assert run("GenuineIntel-6-143") == 3
 
 
 def test_a_task_past_its_deadline_is_interrupted_and_every_row_it_holds_is_red(ci, tmp_path):
