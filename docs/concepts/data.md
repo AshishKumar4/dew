@@ -1,6 +1,17 @@
 # Training data
 
-A recipe describes records and transforms. `load` compiles it into the `Dataset` a trainer reads. A custom order uses `Pipeline` and `compile` directly. Both paths use Grain for ordering, batching, workers and iterator state.
+A `Dataset` is a store with the steps that read its records. `dew.data.load` reads a named Hub or TFDS dataset into a `Loader`; a custom chain uses `compile` directly. Run-layer data specs describe the same chains and compile themselves with `.load()`. All use Grain for ordering, batching, workers and iterator state.
+
+For a named text corpus, the short form downloads and prepares what its read needs:
+
+<!-- not run: downloads Tiny Shakespeare from the Hub -->
+```python
+import dew.data
+
+data = dew.data.load("hf/winglian/tiny-shakespeare", batch=8, tokenizer="byte", seq_len=64)
+```
+
+`tokenizer=` or `seq_len=` selects packed language-model rows, with the byte tokenizer and sequence length 256 where either is unstated. Text holds out 1% of document identities before tokenization; the remaining documents train, and every held-out document belongs only to validation. Without those options, `load` batches the source records and holds out the first 256. It also accepts a `dew.data.Dataset`. Names can pin a Hub revision (`hf/<repo>@<revision>`) or TFDS version (`tfds/<builder>:<version>`). Other sources are spelled with `Hub()`, `TFDS()` or `Files()`.
 
 ## A small in-memory dataset
 
@@ -28,24 +39,24 @@ finally:
 
 A source can hold column arrays or a sequence of record dictionaries. Training reshuffles from `seed` every epoch. Validation reads its own records once in order; a real validation split should be disjoint from training. Its final batch repeats rows to fill the shape and marks those repeats with `valid_rows=False`. Objectives and metrics leave them out.
 
-`Dataset.train(partition)` and `Dataset.val(partition)` each open a fresh iterator. Close the iterator after use, never the shared dataset. `Trainer.fit` closes the iterators it opens after success or failure.
+`Loader.train(partition)` and `Loader.val(partition)` each open a fresh iterator. Close the iterator after use, never the shared dataset. `Trainer.fit` closes the iterators it opens after success or failure.
 
 ## Recipes and fields
 
-`load(recipe_or_alias, batch=..., read=...)` accepts one of these recipe values or its registry alias. A bare URI names a source, so it belongs in `source=` rather than in place of the recipe.
+The specs in `dew.config.data` provide `.load(batch=..., read=...)`; `loader(spec_or_alias, ...)` also accepts their registry aliases. A bare URI names a source, so it belongs in `source=` rather than in place of the spec.
 
 | Recipe and alias | Fields after batching |
 |---|---|
-| `Records` / `records` | The source's fields, with numeric values in JAX's configured widths |
-| `Text` / `text` | `text`, int32 `[B, seq_len + 1]`; packing adds aligned segment and position arrays |
-| `Chat` / `chat` | Packed token fields and aligned `text_roles` |
-| `Prompts` / `prompts` | Left-padded prompt IDs, prompt lengths and fixed-width reward metadata |
-| `Preferences` / `preferences` | `input_ids` and `completion_mask`, `[B, 2, seq_len]` |
-| `Images` / `images` | RGB uint8 `image`, `[B, H, W, 3]`, and optional labels |
-| `Video` / `video` | Uint8 `video`, `[B, T, H, W, 3]`, and audio features |
+| `RecordsData` / `records` | The source's fields, with numeric values in JAX's configured widths |
+| `TextData` / `text` | `text`, int32 `[B, seq_len + 1]`; packing adds aligned segment and position arrays |
+| `ChatData` / `chat` | Packed token fields and aligned `text_roles` |
+| `PromptData` / `prompts` | Left-padded prompt IDs, prompt lengths and fixed-width reward metadata |
+| `PreferenceData` / `preferences` | `input_ids` and `completion_mask`, `[B, 2, seq_len]` |
+| `ImageData` / `images` | RGB uint8 `image`, `[B, H, W, 3]`, and optional labels |
+| `VideoData` / `video` | Uint8 `video`, `[B, T, H, W, 3]`, and audio features |
 | `Decisions` / `decisions` | The objective's encoded question rows |
 
-Recipes hold source and transform choices. `seed`, `loading`, `read` and `provision` belong to `load`. Overrides of an alias are checked against the recipe's fields.
+Specs hold source and transform choices. `seed`, `loading`, `read` and `provision` belong to `.load()`. Overrides of an alias are checked against the spec's fields.
 
 ## Sources and read modes
 
@@ -68,7 +79,7 @@ All stored locations are URLs. Plain paths and `file://` select local files; sch
 
 A run that states no read (`--data-read`, `load(read=None)`) lets its sources choose: memory for records held in memory, indexed for a store that reads by index, streamed otherwise, and a mixture the least eager of its corpora's choices.
 
-Provisioning is explicit. `provision=True` can prepare TFDS, prepare a Hub Arrow cache or create an offset index. A missing artifact otherwise raises an error naming it. Creating an artifact can download data and take a long time; it does not happen implicitly at step zero.
+`dew.data.load` provisions what its read needs, as Hugging Face `datasets` downloads on `load_dataset`: it prepares TFDS, a Hub Arrow cache or an offset index, logging the artifacts it prepares. Preparing can download data and take a long time. `provision=False` (the default of `compile`, spec `.load()` and run configurations) instead raises an error naming the missing artifact.
 
 For example, a prepared image source is:
 
@@ -106,15 +117,15 @@ held = Pipeline(Memory(records[:8])).batch(4)
 data = compile(train, validation=held, read="memory", loading=Loading(workers=0), seed=7)
 ```
 
-Validation is finite and never inherits a training repeat or augmentation stage. `validation_records=N` on `load` caps accepted evaluation records, before the share cut. A training rejection is dropped before mixtures are weighted; attempted, accepted, truncated and rejected records are counted per corpus.
+Validation is finite and never inherits a training repeat or augmentation stage. `validation_records=N` on spec `.load()` caps accepted evaluation records, before the share cut. A training rejection is dropped before mixtures are weighted; attempted, accepted, truncated and rejected records are counted per corpus.
 
 `map_batch(step)` runs in the training process after batching and workers. It forwards position and ownership. Steps on only one branch affect that branch; `compile(..., host=(step,))` applies a common host step to both branches.
 
-For conditional image training, pass `host=(EncodeCaptions(objective.inputs.tokenize),)` to `load`. Without a caption reader, the default host stage removes strings before device transfer.
+For conditional image training, pass `host=(EncodeCaptions(objective.inputs.tokenize),)` to spec `.load()`. Without a caption reader, the default host stage removes strings before device transfer.
 
 ## Text, chat and packing
 
-`Text` tokenizes raw text or opens a produced token store. Fixed windows contain `seq_len + 1` IDs with one overlap token. `pack="first-fit"` places documents in padded windows; `"concat"` concatenates and splits them. Aligned segment IDs stop attention and target scoring at document boundaries, and positions restart within each document.
+`TextData` tokenizes raw text or opens a produced token store. Fixed windows contain `seq_len + 1` IDs with one overlap token. `pack="first-fit"` places documents in padded windows; `"concat"` concatenates and splits them. Aligned segment IDs stop attention and target scoring at document boundaries, and positions restart within each document.
 
 `Chat` renders conversations with the tokenizer's chat template. Its default long-record policy truncates; `long="chunk"` keeps an over-length conversation as chunks, and `long="drop"` rejects it. The recipe emits role IDs for every token. The objective chooses the loss role, for example `LMObjective(..., loss_role=Role.ASSISTANT)`.
 
@@ -144,7 +155,7 @@ data = loader(TextData(source=token_store, seq_len=32, pack="first-fit"),
 
 Use a fresh output directory: exports commit immutable shards and a manifest, and refuse an existing publication. Export validation to a second URL and pass it as `validation=`. Existing binary token stores remain readable through `TokenFiles`; their tokenizer, dtype and document boundaries come from producer metadata.
 
-A raw-text memory run can reserve a token-axis fraction with `token_holdout=HoldOut(fraction=0.01)`. This splits after tokenization and before windows. Indexed and streamed runs need producer-published token splits.
+`TextData` ends each document with the tokenizer's EOS (`eos=True`) and, where no `validation` is named, holds out the head 1% of its tokens after tokenization and before windows; `token_holdout=None` holds out nothing. A token store keeps its producer's own validation split. Streamed runs need producer-published token splits. `ImageData` holds out its first 256 records where no `validation` is named; `validation=None` keeps every record for training.
 
 ## Mixtures, objectives and order
 
@@ -186,7 +197,7 @@ With it, `r2://bucket/path` reads and publishes through s3fs with those options.
 
 ## Loading and image augmentation
 
-`Loading` changes concurrency, never data order or per-record draws. Explicit `Loading(workers=0)` reads in the training process. The `load` default uses `workers="auto"` and Grain's memory-budgeted tuning. Threads and buffers can be set explicitly. A script that starts worker processes needs an `if __name__ == "__main__":` guard.
+`Loading` changes concurrency, never data order or per-record draws. `dew.data.load` defaults to `Loading(workers=0)`, which reads in the training process. Spec `.load()` defaults to `workers="auto"` and Grain's memory-budgeted tuning. Threads and buffers can be set explicitly. A script that starts worker processes needs an `if __name__ == "__main__":` guard.
 
 `Augment(backend="device")` runs the crop, flip and colour jitter on a batch with JAX. `backend="host"` uses the host implementation. `augment=None` selects deterministic resize. `staging_size` is the decoded square before cropping, and `crop_scale` is the area fraction kept.
 
