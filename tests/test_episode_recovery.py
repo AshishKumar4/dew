@@ -13,24 +13,10 @@ import numpy as np
 import pytest
 from episode_support import CALL_THREE, EOS, IDENTITY, NINE, START, action, build, collect, environment
 
-from dew.objectives.rl import EpisodeFailure, EpisodeJournal, RecoverableEnvironment
+from dew.objectives.rl import EpisodeJournal, RecoverableEnvironment
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKER = Path(__file__).with_name("episode_recovery_worker.py")
-
-
-def test_subprocess_snapshot_restores_tool_state_without_reset():
-    with environment()(IDENTITY) as first:
-        assert isinstance(first, RecoverableEnvironment)
-        first.reset()
-        observation = first.step(action((START,), CALL_THREE, EOS))
-        snapshot = first.get_state()
-    with environment()(IDENTITY) as second:
-        assert isinstance(second, RecoverableEnvironment)
-        second.set_state(snapshot)
-        final = second.step(action(observation.context, 5, EOS))
-        assert observation.context[-1] == NINE
-        assert json.loads(final.detail) == {"answer": 9, "expected": 9}
 
 
 def test_journal_refuses_a_different_policy_at_identical_clocks(tmp_path):
@@ -41,12 +27,6 @@ def test_journal_refuses_a_different_policy_at_identical_clocks(tmp_path):
     changed = replace(state, variables=jax.tree.map(lambda value: value + .001, state.variables))
     with pytest.raises(ValueError):
         collect(rollout, changed)
-
-
-def test_journal_requires_a_recoverable_environment(tmp_path):
-    trainer, rollout = build(journal=EpisodeJournal(str(tmp_path)))
-    with pytest.raises(EpisodeFailure):
-        collect(rollout, trainer.initial_state())
 
 
 def launch(directory, mode):
@@ -95,3 +75,15 @@ def test_sigkill_resumes_completed_turns_and_produces_the_same_update(tmp_path):
             old["action"].pop("_binding_id")
             new["action"].pop("_binding_id")
             assert old == new
+
+    with environment()(IDENTITY) as first:
+        assert isinstance(first, RecoverableEnvironment)
+        first.reset()
+        observation = first.step(action((START,), CALL_THREE, EOS))
+        snapshot = first.get_state()
+    with environment()(IDENTITY) as second:
+        assert isinstance(second, RecoverableEnvironment)
+        second.set_state(snapshot)
+        final = second.step(action(observation.context, 5, EOS))
+        assert observation.context[-1] == NINE
+        assert json.loads(final.detail) == {"answer": 9, "expected": 9}

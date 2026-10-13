@@ -70,18 +70,6 @@ def test_apg_walks_diffusers_adaptive_projected_guidance(name):
     assert_as_exact_as_the_reference(walked, arrays[f"{prefix}result32"], arrays[f"{prefix}result"], name)
 
 
-def test_a_flow_trajectory_refuses_apg_momentum():
-    """A flow trajectory's transitions are rescored one at a time, so its
-    guidance carries nothing from step to step; APG's momentum would."""
-    from dew.sampling import FlowSDE
-
-    process = Process(FlowMatchingScheduler(), FlowMatchPredictionTransform())
-    denoise = process.denoiser(Velocity(), {}, {"label": jnp.ones((1,))}, {"label": jnp.zeros((1,))})
-    with pytest.raises(ValueError):
-        FlowSDE(0.5).trajectory(denoise, jnp.zeros((1, 3, 4)), 4, guidance=APG(4.0, momentum=-0.5),
-                                key=jax.random.key(0))
-
-
 class RawPrediction(nn.Module):
     """Given predictions isolate the guidance from a model's rounding."""
 

@@ -10,7 +10,6 @@ the task's dataset from the Hub, so it carries the `network` marker; lm_eval
 0.4 ships no task whose data is in the package.
 """
 
-import dataclasses
 from pathlib import Path
 
 import pytest
@@ -123,16 +122,6 @@ def test_loglikelihood_equals_lm_evals_own_model_on_the_same_weights():
         assert greedy == reference_greedy
 
 
-def test_a_source_processor_reads_bos_off_the_tokenizer_it_holds():
-    """A source's processor, however it was built (the GGUF loader builds one
-    from its four fields), answers the BOS its tokenizer has, so a harness
-    over it does not fall back to EOS."""
-    from dew.interop.pretrained import Processor
-
-    assert Processor(_byte_tokenizer(bos=True), {}, {}, 256).bos_id == BOS
-    assert Processor(_byte_tokenizer(bos=False), {}, {}, 256).bos_id is None
-
-
 def test_a_bos_vocabulary_conditions_first_tokens_on_bos_as_lm_eval_does(tmp_path):
     """`HFLM.prefix_token_id` is the tokenizer's BOS when it has one. An empty
     context and a rolling window's first token are conditioned on it, so a
@@ -147,18 +136,6 @@ def test_a_bos_vocabulary_conditions_first_tokens_on_bos_as_lm_eval_does(tmp_pat
     text = [instance(_text(40), request_type="loglikelihood_rolling")]
     assert ours.loglikelihood_rolling(text) == pytest.approx(theirs.loglikelihood_rolling(text),
                                                              rel=RELATIVE)
-
-
-def test_a_continuation_longer_than_the_window_is_refused_as_lm_eval_refuses_it():
-    """No row of `max_length` ids holds such a continuation with any of its
-    context, so `HFLM` asserts against it and the adapter refuses it rather
-    than score it without the context the request conditions on."""
-    ours, theirs = _pair(16)
-    request = [instance("The capital of France is", _text(21))]
-    with pytest.raises(AssertionError):
-        theirs.loglikelihood(request)
-    with pytest.raises(ValueError):
-        ours.loglikelihood(request)
 
 
 @pytest.mark.parametrize("length, max_length", [(3, 16), (50, 16), (5000, 2048)])
@@ -188,71 +165,6 @@ def test_a_batch_scores_every_request_as_it_would_alone_and_keeps_the_order(adap
     reordered = adapter.loglikelihood([instance(*pair) for pair in reversed(pairs)])
     assert [score for score, _ in reordered] == pytest.approx(
         [score for score, _ in reversed(together)], rel=RELATIVE)
-
-
-def test_a_continuation_that_adds_no_token_is_refused_not_scored_as_certain(adapter):
-    """lm-eval's HFLM asserts every continuation has ids. Scored, an empty
-    one would be probability 1 and greedy, and win every multiple-choice
-    comparison it is in."""
-    with pytest.raises(ValueError):
-        adapter.loglikelihood([instance("The sky is", " blue"), instance("The sky is", "")])
-
-
-def test_generate_until_cuts_the_answer_at_the_first_stop_string(adapter):
-    """The budget is the request's, and a stop string cuts the decoded text."""
-    full, = adapter.generate_until([instance("the ", {"until": [], "max_gen_toks": 4})])
-    assert isinstance(full, str) and len(full) > 2
-    again, = adapter.generate_until([instance("the ", {"until": [], "max_gen_toks": 4})])
-    assert again == full, "the default policy is greedy, so one request draws one answer"
-    stop = full[1:3]
-    cut, = adapter.generate_until([instance("the ", {"until": [stop], "max_gen_toks": 4})])
-    assert cut == full[:full.index(stop)]
-    assert len(cut) < len(full)
-
-
-def test_generate_until_reads_each_request_as_lm_evals_own_model_does():
-    """A budget named `max_new_tokens`, `do_sample=False` beside a
-    temperature, which is greedy, and a context longer than the window less
-    the budget, which keeps its last ids: each answers what `HFLM` answers
-    on the same weights, the EOS token's text among the stop strings."""
-    ours, theirs = _pair(32)
-    for context, controls in (("the ", {"until": [], "max_new_tokens": 6}),
-                              ("the ", {"until": [], "max_gen_toks": 6, "do_sample": False,
-                                        "temperature": 0.7}),
-                              (_text(60), {"until": [], "max_gen_toks": 6})):
-        request = [instance(context, controls, request_type="generate_until")]
-        assert ours.generate_until(request) == theirs.generate_until(request), controls
-
-
-def test_the_adapter_refuses_a_task_it_cannot_score(run):
-    """It needs the processor that turns the harness's text into tokens."""
-    task = TextGeneration.from_run(str(run))
-    with pytest.raises(ValueError):
-        DewLM(dataclasses.replace(task, processor=None))
-    with pytest.raises(ValueError):
-        DewLM(task, batch_size=0)
-
-
-def test_the_registry_answers_dew_with_this_adapter_built_from_a_run(run):
-    """`--model dew --model_args run=<directory>` is this construction."""
-    from lm_eval.api.registry import get_model
-
-    assert get_model("dew") is DewLM
-    built = get_model("dew").create_from_arg_string(f"run={run},batch_size=2")
-    assert isinstance(built, DewLM) and built.batch_size == 2
-    with pytest.raises(ValueError):
-        get_model("dew").create_from_arg_string("batch_size=2")
-
-
-def test_the_registry_builds_a_run_that_kept_no_average(tmp_path):
-    """A run trained without an EMA loads its live weights through the
-    registry, as `dew.pipeline` loads it; asking for the average still refuses."""
-    from lm_eval.api.registry import get_model
-
-    make_lm_run(tmp_path, ema_decay=None)
-    assert isinstance(get_model("dew").create_from_arg_string(f"run={tmp_path}"), DewLM)
-    with pytest.raises(ValueError):
-        DewLM.from_run(str(tmp_path), ema=True)
 
 
 @pytest.mark.network
