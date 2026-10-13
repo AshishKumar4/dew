@@ -74,13 +74,21 @@ class _Launch(tuning.KernelOp):
                   for block, name in ((tiles.bk, self.KEYS), (tiles.bv, self.VALUES)))
         return Tiles(bk, bv, tiles.warps, tiles.stages)
 
+    def heuristic(self, dtype: str, wide: bool) -> Tiles:
+        """The kernel's tiles without a measurement (`HEURISTICS`)."""
+        return HEURISTICS[dtype, wide][self.NAME]
+
+    def space(self, wide: bool) -> frozenset[Tiles]:
+        """The kernel's 16-bit tiles to measure (`_space`)."""
+        return _space(self.NAME, wide)
+
     def _get_heuristics_config(self, ba) -> Tiles:
-        return self._tiles(ba, HEURISTICS[_dtype(ba.arguments[self.KEYS or "g"]), _wide()][self.NAME])
+        return self._tiles(ba, self.heuristic(_dtype(ba.arguments[self.KEYS or self.VALUES or "g"]), _wide()))
 
     def _get_autotuning_configs(self, ba) -> set[Tiles]:
-        if _dtype(ba.arguments[self.KEYS or "g"]) == "float32":
+        if _dtype(ba.arguments[self.KEYS or self.VALUES or "g"]) == "float32":
             return {self._get_heuristics_config(ba)}
-        return {self._tiles(ba, tiles) for tiles in _space(self.NAME, _wide())}
+        return {self._tiles(ba, tiles) for tiles in self.space(_wide())}
 
     def operands(self, specs: list[jax.ShapeDtypeStruct], seed: int) -> list[jax.Array]:
         """Normal floats, and chunk and sequence descriptors (`Sequences`) a timed launch can run: the
