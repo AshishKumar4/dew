@@ -3,7 +3,7 @@
 import numpy as np
 import pytest
 
-from dew.config.data import HoldOut, ImageData, loader
+from dew.config.data import Augment, HoldOut, ImageData, loader
 from dew.data import Files, Loading, Memory, images
 from dew.data.compile import compile
 from dew.data.dataset import DataPartition
@@ -118,3 +118,37 @@ def test_prepared_arrayrecords_and_public_image_steps_deliver_the_same_batches(t
     finally:
         left.close()
         right.close()
+
+
+def test_host_image_augmentation_matches_across_workers_and_resumes_exactly():
+    rows = [{**row, "label": np.int64(row["id"] % 3)} for row in pictures().values]
+    recipe = ImageData(source=Memory(rows), image_size=16, staging_size=24,
+                       caption_templates=("a {label}", "a photo of {}"),
+                       classes=("rose", "tulip", "lily"),
+                       augment=Augment(backend="host", crop_scale=(0.6, 0.9)))
+
+    def read(workers, count, state=None):
+        data = loader(recipe, batch=8, read="indexed", seed=7,
+                      loading=Loading(workers=workers, threads=1, read_buffer=2, worker_buffer=1),
+                      host=(EncodeCaptions(keep_captions),))
+        reader = data.train(DataPartition())
+        try:
+            if state is not None:
+                reader.set_state(state)
+            batches = [next(reader) for _ in range(count)]
+            return batches, reader.get_state()
+        finally:
+            reader.close()
+
+    serial, _ = read(0, 6)
+    workers, _ = read(2, 6)
+    for one, many in zip(serial, workers, strict=True):
+        assert one["image"].shape == (8, 16, 16, 3) and one["image"].dtype == np.uint8
+        assert one["label"].dtype == np.int32
+        for name in one:
+            np.testing.assert_array_equal(one[name], many[name])
+    _, saved = read(2, 3)
+    resumed, _ = read(2, 3, saved)
+    for expected, found in zip(serial[3:], resumed, strict=True):
+        for name in expected:
+            np.testing.assert_array_equal(expected[name], found[name])
