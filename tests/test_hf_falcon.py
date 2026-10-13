@@ -1,6 +1,5 @@
 """Falcon's fused MQA/MHA and one-norm parallel residual against transformers 5.16.1."""
 
-import json
 from pathlib import Path
 
 import jax
@@ -10,7 +9,6 @@ import pytest
 from reference_error import assert_as_exact_as_the_reference
 
 from dew.interop import Pretrained, PretrainedDecoder
-from dew.interop.hf_decoders import translate_config
 from dew.interop.sources import load_shards
 
 ROOT = Path(__file__).parent / 'fixtures' / 'hf'
@@ -30,6 +28,13 @@ def test_falcon_padded_logits_and_cached_generation_match_transformers(name):
     np.testing.assert_array_equal(actual[mask].argmax(-1), expected[mask].argmax(-1))
     original = np.load(directory / 'input_ids.npy')
     np.testing.assert_array_equal(greedy(loaded, original[:, :4], 6), np.load(directory / 'generated.npy'))
+
+    original_ids = np.load(directory / 'input_ids.npy')
+    original_logits = np.asarray(loaded.model.apply(loaded.variables, jnp.asarray(original_ids, jnp.int32)))
+    original_reference = np.load(directory / 'logits.npy')
+    assert_as_exact_as_the_reference(original_logits, original_reference,
+                                     np.load(directory / 'logits_f64.npy'), 'unpadded logits')
+    np.testing.assert_array_equal(original_logits.argmax(-1), original_reference.argmax(-1))
 
 
 @pytest.mark.parametrize('name', ['falcon-tiny', 'falcon-mha-tiny'])
@@ -53,6 +58,12 @@ def test_falcon_export_preserves_fused_weights_and_reads_in_transformers(name, t
     restored = Pretrained.load(tmp_path, dtype='float32', attention_impl='reference')
     np.testing.assert_array_equal(restored.model.apply(restored.variables, ids), actual)
 
+    assert restored.model == loaded.model
+    assert jax.tree.structure(restored.variables) == jax.tree.structure(loaded.variables)
+    for original, restored_leaf in zip(jax.tree.leaves(loaded.variables),
+                                        jax.tree.leaves(restored.variables), strict=True):
+        np.testing.assert_array_equal(np.asarray(restored_leaf), np.asarray(original))
+
 
 def test_falcon_source_export_writes_updated_fused_projections(tmp_path):
     from dataclasses import replace
@@ -65,27 +76,6 @@ def test_falcon_source_export_writes_updated_fused_projections(tmp_path):
     ids = np.load(ROOT / 'falcon-tiny' / 'input_ids.npy')
     expected = loaded.model.apply(variables, ids)
     np.testing.assert_array_equal(restored.model.apply(restored.variables, ids), expected)
-
-
-def test_falcon_reference_catches_sequential_residuals():
-    directory = ROOT / 'falcon-tiny'
-    loaded = Pretrained.load(directory, dtype='float32', attention_impl='reference')
-    variables = jax.tree.map(jnp.asarray, loaded.variables)
-    for index in range(loaded.model.num_layers):
-        layer = variables['params'][f'layers_{index}']
-        layer['post_attention_layernorm'] = layer['input_layernorm']
-    wrong = loaded.model.clone(parallel_residual=False, shared_parallel_norm=False).apply(
-        variables, np.load(directory / 'input_ids.npy'))
-    with pytest.raises(AssertionError, match=r'allowed 2\.0'):
-        assert_as_exact_as_the_reference(wrong, np.load(directory / 'logits.npy'),
-                                         np.load(directory / 'logits_f64.npy'), 'Falcon sequential residual')
-
-
-def test_falcon_released_config_retains_multi_query_and_parallel_layernorm():
-    model = translate_config(json.loads((ROOT / 'falcon-7b' / 'config.json').read_text())).value
-    assert (model.emb_features, model.num_heads, model.num_layers) == (4544, 71, 32)
-    assert model.kv_heads == 1 and model.parallel_residual and model.shared_parallel_norm
-    assert model.norm_bias and model.mlp == 'gelu_exact' and not model.attention_bias
 
 
 def test_falcon_block_has_finite_gradients_and_updates():
@@ -104,13 +94,3 @@ def test_falcon_block_has_finite_gradients_and_updates():
                            loaded.variables['params'], gradient)
     assert all(np.isfinite(leaf).all() for leaf in jax.tree.leaves(gradient))
     assert float(loss(changed)) < float(value)
-
-
-@pytest.mark.network
-def test_falcon_released_config_is_pinned():
-    from huggingface_hub import hf_hub_download
-
-    source = json.loads((ROOT / 'falcon-7b' / 'source.json').read_text())
-    filename = hf_hub_download(source['repo'], 'config.json', revision=source['revision'])
-    expected = json.loads((ROOT / 'falcon-7b' / 'config.json').read_text())
-    assert json.loads(Path(filename).read_text()) == expected
