@@ -8,7 +8,8 @@ except where it packs several records into one row.
 - `images(ds, size, batch=)` reads `image`, bytes or uint8 [H, W, 3], and
   writes `image`, uint8 [B, size, size, 3];
 - `lm(ds, tokenizer, seq_len=, batch=)` reads `text`, a string, and writes
-  `text`, `text_segment_ids` and `text_positions`, int32 [B, seq_len + 1];
+  `text`, int32 [B, seq_len + 1], and its windows' documents as
+  `text_coordinates` (`dew.nn.inputs.Coordinates`);
 - `sft(ds, tokenizer, seq_len=, batch=)` reads `messages`, chat turns, and
   writes the `lm` fields and `text_roles`.
 """
