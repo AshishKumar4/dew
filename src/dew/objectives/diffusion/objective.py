@@ -77,6 +77,7 @@ from dew.sampling.sample import sample
 from dew.sampling.solvers import DDIM, Consistency, Solver
 
 if TYPE_CHECKING:
+    from dew.data.pipeline import ObjectiveData
     from dew.inference.tasks import Processor
 
 # Samples a validation batch draws, conditioned or not.
@@ -239,6 +240,15 @@ class DiffusionObjective(Objective[Ratio]):
     resolved = ("solver", "guidance", "steps")
 
     counts_tokens = False
+
+    def data(self, tokenizer=None) -> ObjectiveData:
+        """Each batch's captions tokenized for the conditions, on the host, as
+        the step reads them; without text conditions, captions are dropped."""
+        from dew.data.pipeline import ObjectiveData
+        from dew.data.steps.image import EncodeCaptions
+
+        captions = (EncodeCaptions(self.inputs.tokenize if self.inputs.conditions else None),)
+        return ObjectiveData(train_batch=captions, evaluate_batch=captions)
 
     def real_lengths(self, batch: Batch) -> np.ndarray:
         """The denoiser's real patch-token lengths from the objective's latent shape."""

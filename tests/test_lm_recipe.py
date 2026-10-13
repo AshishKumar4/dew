@@ -11,6 +11,9 @@ import pytest
 from token_support import write_token_corpus
 
 import dew
+from dew.config.data import loader
+from dew.data import Loading
+from dew.data.dataset import Loader
 from dew.inference import TextGeneration
 from dew.objectives.lm import LMObjective, LMRunConfig
 from dew.sampling import Sampling
@@ -46,7 +49,7 @@ def model_flags(record):
 def run_config(tokens, *args, model='{"emb_features": 16, "num_layers": 1, "num_heads": 2}'):
     # A dataset subcommand has to come before its flags, so `args` leads.
     return LMRunConfig.cli([
-        *args, "--data.path", str(tokens), "--data.seq-len", str(SEQ), "--data.loading.workers", "0",
+        *args, "--data.source", str(tokens), "--data.seq-len", str(SEQ), "--loading.workers", "0",
         "--trainer.batch-size", "8", "--trainer.checkpoint-dir", str(tokens.parent / "runs"),
         "--trainer.compilation-cache-dir", "None", "--trainer.multi-host", "False",
         "--trainer.log-every", "1", "--model.dtype", "float32", *model_flags(model)])
@@ -61,13 +64,13 @@ def test_the_recipe_trains_on_tokenized_files(tmp_path, packed):
     args = ["--trainer.epochs", "1", "--prompt", "the ", "--max-new-tokens", "4",
             "--trainer.name", "run"]
     if packed:
-        args = ["--data.pack", "--data.packing-bins", "2", *args]
+        args = ["--data.pack", "first-fit", "--data.packing-bins", "2", "--data-read", "memory", *args]
     config = run_config(tokens, *args)
-    assert config.data.pack == packed
+    assert config.data.pack == ('first-fit' if packed else None)
 
     state = config.run()
 
-    data = config.data.load(batch=8)
+    data = loader(config.data, batch=8, read="memory", loading=Loading(workers=0))
     assert data.steps_per_epoch is not None and int(state.step) == data.steps_per_epoch > 0
     run = tmp_path / "runs" / "run"
     assert (run / str(int(state.step))).is_dir()
@@ -93,26 +96,27 @@ def test_the_recipe_trains_on_tokenized_files(tmp_path, packed):
 
 
 def test_the_recipe_trains_on_weighted_corpora(tmp_path):
-    """`--data.path a 0.7 b 0.3` parses to the weighted mapping and trains:
+    """`--data.source a 0.7 b 0.3` parses to the weighted mapping and trains:
     the vocabulary comes from the corpora's shared meta.json, and run.json
     records the mapping so the run reloads as configured."""
     first = write_token_files(tmp_path / "first", 40 * SEQ, 8 * SEQ, eos_id=0)
     second = write_token_files(tmp_path / "second", 24 * SEQ, 8 * SEQ, eos_id=0)
     config = LMRunConfig.cli([
-        "--data.pack", "--data.path", str(first), "0.7", str(second), "0.3",
-        "--data.seq-len", str(SEQ), "--data.packing-bins", "2", "--data.loading.workers", "0",
+        "--data.pack", "first-fit", "--data.source", json.dumps({str(first): 0.7, str(second): 0.3}),
+        "--data.seq-len", str(SEQ), "--data.packing-bins", "2", "--data-read", "memory",
+        "--loading.workers", "0",
         "--trainer.batch-size", "8", "--trainer.checkpoint-dir", str(tmp_path / "runs"),
         "--trainer.compilation-cache-dir", "None", "--trainer.multi-host", "False",
         "--trainer.steps", "2", "--trainer.name", "mixed", "--max-new-tokens", "0",
         "--model.dtype", "float32",
         "--model.emb_features", "16", "--model.num_layers", "1", "--model.num_heads", "2"])
-    assert config.data.path == {str(first): 0.7, str(second): 0.3}
+    assert config.data.source == {str(first): 0.7, str(second): 0.3}
 
     state = config.run()
 
     assert int(state.step) == 2
     recorded = LMRunConfig.load(str(tmp_path / "runs" / "mixed"))
-    assert recorded.data.path == config.data.path
+    assert recorded.data.source == config.data.source
     assert recorded.model.fields["vocab_size"] == 256
 
 
@@ -162,8 +166,8 @@ def export_tiny_decoder(directory, *, tokenizer="byte", vocab_size=256):
 
 
 def recipe_args(tokens, *args, model_config="{}"):
-    return [*args, "--data.path", str(tokens), "--data.seq-len", str(SEQ),
-            "--data.loading.workers", "0", "--trainer.batch-size", "8",
+    return [*args, "--data.source", str(tokens), "--data.seq-len", str(SEQ),
+            "--loading.workers", "0", "--trainer.batch-size", "8",
             "--trainer.checkpoint-dir", str(tokens.parent / "runs"),
             "--trainer.compilation-cache-dir", "None", "--trainer.multi-host", "False",
             "--trainer.log-every", "1", "--model.dtype", "float32",
@@ -383,11 +387,12 @@ def test_masked_diffusion_trains_on_packed_documents(tmp_path):
         ids[6::7] = 1  # every seventh id ends a document
         (directory / f"{split}.bin").write_bytes(ids.tobytes())
     (directory / "meta.json").write_text(json.dumps(
-        {"tokenizer": str(checkpoint), "vocab_size": 100, "dtype": "uint8", "eos_id": 1}))
+        {"tokenizer": str(checkpoint), "vocab_size": 100, "dtype": "uint8", "eos_id": 1,
+         "train_tokens": 400, "val_tokens": 96}))
     config = LMRunConfig.cli([
-        "--data.pack", "--pretrained", str(checkpoint), "--objective", "masked_diffusion",
-        "--tokenizer", str(checkpoint), "--data.path", str(directory),
-        "--data.seq-len", "11", "--data.loading.workers", "0",
+        "--data.pack", "first-fit", "--pretrained", str(checkpoint), "--objective", "masked_diffusion",
+        "--tokenizer", str(checkpoint), "--data.source", str(directory),
+        "--data.seq-len", "11", "--data-read", "memory", "--loading.workers", "0",
         "--model.dtype", "float32", "--model.attention-impl", "xla",
         "--trainer.batch-size", "8", "--trainer.steps", "2", "--trainer.log-every", "1",
         "--trainer.checkpoint-dir", str(tmp_path / "runs"), "--trainer.name", "packed",
@@ -399,7 +404,8 @@ def test_masked_diffusion_trains_on_packed_documents(tmp_path):
     assert int(state.updates) == 2
     original = Pretrained.load(str(checkpoint), dtype="float32", attention_impl="xla")
     objective = config.masked_objective(original.model, original.model_config, None)
-    batch = next(iter(config.data.load(batch=8).val(DataPartition())))
+    batch = next(iter(loader(config.data, batch=8, read="memory",
+        loading=Loading(workers=0)).val(DataPartition())))
     padding = np.asarray(batch["text_segment_ids"]) == 0
     assert padding.any() and not padding.all()
     scored = objective.evaluate(state.variables, batch, Step(jnp.asarray(0), jax.random.key(0), None))
@@ -424,11 +430,12 @@ def test_masked_diffusion_continues_a_pretrained_checkpoint(tmp_path):
         ids = np.random.RandomState(count).randint(4, 100, count).astype(np.uint8)
         (directory / f"{split}.bin").write_bytes(ids.tobytes())
     (directory / "meta.json").write_text(json.dumps(
-        {"tokenizer": str(checkpoint), "vocab_size": 100, "dtype": "uint8", "eos_id": 1}))
+        {"tokenizer": str(checkpoint), "vocab_size": 100, "dtype": "uint8", "eos_id": 1,
+         "train_tokens": 400, "val_tokens": 96}))
     config = LMRunConfig.cli([
         "--pretrained", str(checkpoint), "--objective", "masked_diffusion",
-        "--tokenizer", str(checkpoint), "--data.path", str(directory),
-        "--data.seq-len", "11", "--data.loading.workers", "0",
+        "--tokenizer", str(checkpoint), "--data.source", str(directory),
+        "--data.seq-len", "11", "--loading.workers", "0",
         "--model.dtype", "float32", "--model.attention-impl", "xla",
         "--trainer.batch-size", "8", "--trainer.steps", "1", "--trainer.log-every", "1",
         "--trainer.checkpoint-dir", str(tmp_path / "runs"), "--trainer.name", "masked",
@@ -464,8 +471,8 @@ def test_official_block_diffusion_is_a_complete_pretrained_recipe(tmp_path):
         {"tokenizer": str(checkpoint), "vocab_size": 32, "dtype": "uint8", "eos_id": 1}))
     config = LMRunConfig.cli([
         "--pretrained", str(checkpoint), "--objective", "block_diffusion",
-        "--tokenizer", str(checkpoint), "--data.path", str(directory), "--data.seq-len", "11",
-        "--objective.prompt-length", "4", "--data.loading.workers", "0",
+        "--tokenizer", str(checkpoint), "--data.source", str(directory), "--data.seq-len", "11",
+        "--objective.prompt-length", "4", "--loading.workers", "0",
         "--model.dtype", "float32", "--model.attention-impl", "xla",
         "--trainer.batch-size", "8", "--trainer.steps", "1", "--trainer.log-every", "1",
         "--trainer.checkpoint-dir", str(tmp_path / "runs"), "--trainer.name", "block",
@@ -502,7 +509,7 @@ def test_a_trained_block_diffusion_tree_saves_back_over_its_source(tmp_path):
     export is refused (tests/test_block_sft.py)."""
     import optax
 
-    from dew import Dataset, Trainer
+    from dew import Trainer
     from dew.interop import Pretrained
     from dew.objectives.base import Step, thaw
     from dew.objectives.diffusion.block import BlockDiffusionObjective
@@ -513,7 +520,7 @@ def test_a_trained_block_diffusion_tree_saves_back_over_its_source(tmp_path):
                                         variables=source.variables)
     rows = 2 * jax.device_count()
     batch = {"text": np.random.default_rng(0).integers(3, 60, (rows, 12)).astype(np.int32)}
-    data = Dataset(train=lambda partition: iter([batch, batch]), val=None, records=rows, batch=rows)
+    data = Loader(train=lambda partition: iter([batch, batch]), val=None, records=rows, batch=rows)
 
     state = Trainer(objective, optax.sgd(0.05), key=jax.random.key(0)).fit(data, steps=1, log_every=1)
     source.save(tmp_path / "trained", variables=thaw(state.variables))

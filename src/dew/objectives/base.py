@@ -48,6 +48,8 @@ if TYPE_CHECKING:
     from jax.sharding import Mesh
     from jax.typing import DTypeLike
 
+    from dew.data.pipeline import ObjectiveData
+    from dew.data.text import Tokenizer
     from dew.inference.tasks import BlockGeneration, MaskedGeneration, Processor, TextGeneration
     from dew.inputs import InputSpec
     from dew.nn.backbones.decoder_stack import DecoderBank
@@ -428,6 +430,12 @@ def _ruled_jvp(primals, tangents):
 
 class Objective(ABC, Generic[Loss, Effects]):
     """Defines what is learned: the parameters, the loss and what evaluation produces."""
+
+    def data(self, tokenizer: Tokenizer | None = None) -> ObjectiveData:
+        """Record and host-batch steps for the training and evaluation branches."""
+        from dew.data.pipeline import ObjectiveData
+
+        return ObjectiveData()
 
     _inputs: InputSpec | None = None
     variables: Variables | None = None

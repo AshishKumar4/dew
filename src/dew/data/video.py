@@ -12,28 +12,14 @@ reader and the audio processor are imported on use.
 
 from __future__ import annotations
 
-import dataclasses
 import os
-from collections.abc import Mapping
+from typing import TYPE_CHECKING
 
-import grain.python as pygrain
 import numpy as np
 
-from .dataset import (
-    CAPTION,
-    Batch,
-    Dataset,
-    DatasetSpec,
-    Tokenize,
-    checked_count,
-    hold_out,
-    tokenized,
-    train_stream,
-    validation_pass,
-)
-from .images import import_opencv
-from .processors import AutoAudioProcessor
-from .sources.av_utils import FPS
+if TYPE_CHECKING:
+    from dew.data.sources.urls import Fetch
+    from dew.data.steps.video import Audio, DecodeClip
 
 
 def video_paths(root: str, extensions: tuple[str, ...]) -> list[str]:
@@ -56,117 +42,27 @@ def fit_frames(frames: np.ndarray, size: int) -> np.ndarray:
                      for frame in frames])
 
 
-class AudioVideoTransform(pygrain.RandomMapTransform):
-    """Reads one clip per record: its frames, their audio, and its caption.
+def fetch(url: str = "url", to: str = "mp4", *, timeout: float = 30.0, max_bytes: int = 256 * 2**20) -> Fetch:
+    """A record step that fetches the clip at the record's `url` field into
+    `to` as bytes, as `images.fetch` does an image."""
+    from dew.data.sources.urls import Fetch
 
-    It is built where its loader opens and unpickled where a spawned worker
-    starts, both before any reader thread runs, and both import OpenCV
-    (`dew.data.images.import_opencv`).
-    """
-
-    def __init__(self, spec: VideoDataset):
-        import_opencv()
-        self.spec = spec
-        self.audio = AutoAudioProcessor(tensor_type="np", modelname=spec.audio_model)
-
-    def __setstate__(self, state: Mapping[str, object]) -> None:
-        import_opencv()
-        self.__dict__.update(state)
-
-    def random_map(self, element: Batch, rng: np.random.Generator) -> Batch:
-        # moviepy is imported on the first record, so importing this module needs no `av` extra.
-        from .sources.av_utils import read_av_random_clip
-        # The extractor is told the waveform is at its own rate, so it is read at that rate.
-        frames, audio = read_av_random_clip(
-            element["video_path"], num_frames=self.spec.frames,
-            audio_padding=self.spec.audio_padding, seed=int(rng.integers(0, 2**32 - 1)),
-            sample_rate=self.audio.sampling_rate)
-        frames = fit_frames(frames, self.spec.frame_size)
-        # The extractor takes one waveform and hands back a batch of one;
-        # given the rows it would read each frame's samples as a clip of
-        # its own. Key names differ per audio model, so its output passes
-        # through untouched.
-        features = self.audio(audio.reshape(-1))
-        return {
-            "video": frames,
-            CAPTION: element["caption"],
-            "audio": {**{key: value[0] for key, value in features.items()},
-                      "full_audio": audio},
-        }
+    return Fetch(url, to, timeout, max_bytes)
 
 
-@dataclasses.dataclass(frozen=True)
-class VideoDataset(DatasetSpec):
-    """Reads clips of `frames` frames at `frame_size`, with their audio.
+def decode_clip(frames: int = 16, *, size: int = 256, fps: float = 25.0, field: str = "mp4",
+                to: str = "video", audio_padding: int | None = None, sample_rate: int = 16_000) -> DecodeClip:
+    """A random record step that decodes `frames` frames at `fps` from a
+    random start of the clip in `field`, bytes or a path, each fitted into a
+    `size` square, under `to`; with `audio_padding`, the sound under them
+    too (`DecodeClip`). A clip that does not decode is counted and dropped."""
+    from dew.data.steps.video import DecodeClip
 
-    Each record comes out as
-    `{"video": uint8 [frames, frame_size, frame_size, 3], "caption": str, "audio": {...}}`.
-    A subclass defines `source`. `val_batches` batches of records are held
-    out of the head of the source, in canonical order, as the validation
-    split; None or 0 holds nothing out. `count` uses only that many records
-    from the head of the source.
-    """
-
-    frame_size: int = 256
-    frames: int = 16
-    audio_padding: int = 3
-    """Extra audio frames kept on either side of the sampled clip."""
-    audio_model: str = "facebook/wav2vec2-base-960h"
-    """The HF audio model whose feature extractor prepares the audio inputs."""
-    val_batches: int | None = 4
-    count: int | None = None
-
-    @property
-    def audio_seconds(self) -> float:
-        """The length in seconds of the waveform under a clip: its frames plus the
-        padding on each side, at the 25 fps that clips are sampled at."""
-        return (self.frames + 2 * self.audio_padding) / FPS
-
-    def source(self) -> list[dict[str, str]]:
-        """Return one `{"video_path", "caption"}` record per clip, in a fixed order."""
-        raise NotImplementedError
-
-    def load(self, *, batch: int, tokenize: Tokenize | None = None) -> Dataset:
-        source = self.source()
-        name = type(self).__name__
-        records = (len(source) if self.count is None
-                   else checked_count(self.count, len(source), name))
-        held_out = (self.val_batches or 0) * batch
-        train, validation = hold_out(source, records, held_out, name)
-        return Dataset(
-            train=tokenized(
-                train_stream(
-                    train, [AudioVideoTransform(self)], batch=batch, seed=self.seed, loading=self.loading
-                ),
-                tokenize,
-            ),
-            val=None
-            if validation is None
-            else tokenized(
-                validation_pass(
-                    validation, [AudioVideoTransform(self)], batch=batch, seed=self.seed, loading=self.loading
-                ),
-                tokenize,
-            ),
-            records=len(train),
-            batch=batch,
-            held_out=held_out,
-        )
+    return DecodeClip(frames, size, fps, field, to, audio_padding, sample_rate)
 
 
-@dataclasses.dataclass(frozen=True)
-class LocalVideos(VideoDataset):
-    """Reads every video file under `path`, captioned with `caption`.
+def audio(features: str = "facebook/wav2vec2-base-960h") -> Audio:
+    """A record step that featurizes a decoded clip's "audio" for the audio model `features`."""
+    from dew.data.steps.video import Audio
 
-    It reads the files whose suffix is in `extensions`, in sorted path order.
-    """
-
-    path: str | None = None
-    extensions: tuple[str, ...] = (".mp4", ".avi", ".mov", ".webm")
-    caption: str = ""
-
-    def source(self):
-        if not self.path:
-            raise ValueError("LocalVideos needs path= set to the directory of video files")
-        return [{"video_path": video_path, "caption": self.caption}
-                for video_path in video_paths(self.path, self.extensions)]
+    return Audio(features)

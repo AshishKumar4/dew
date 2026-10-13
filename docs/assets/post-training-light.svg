@@ -1,7 +1,7 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 372" width="760" height="372" role="img">
 <text x="20" y="65" font-family="'Geist Mono', 'JetBrains Mono', ui-monospace, Menlo, Consolas, monospace" font-size="14" font-weight="600" fill="#16282b" text-anchor="start">SFT</text>
 <rect x="70" y="20" width="200" height="84" rx="6" fill="#f2f6f5" stroke="#c9d9d5" stroke-width="1"/>
-<text x="82" y="43" font-family="'Geist Mono', 'JetBrains Mono', ui-monospace, Menlo, Consolas, monospace" font-size="14" font-weight="600" fill="#16282b" text-anchor="start">ChatMessages</text>
+<text x="82" y="43" font-family="'Geist Mono', 'JetBrains Mono', ui-monospace, Menlo, Consolas, monospace" font-size="14" font-weight="600" fill="#16282b" text-anchor="start">Chat</text>
 <text x="82" y="65" font-family="Geist, Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#4d6763" text-anchor="start">conversations, rendered by</text>
 <text x="82" y="84" font-family="Geist, Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#4d6763" text-anchor="start">the chat template</text>
 <rect x="290" y="20" width="210" height="84" rx="6" fill="#f2f6f5" stroke="#c9d9d5" stroke-width="1"/>
@@ -16,7 +16,7 @@
 <path d="M518.0,62.0 L511.0,65.5 L511.0,58.5 z" fill="#4d6763"/>
 <text x="20" y="169" font-family="'Geist Mono', 'JetBrains Mono', ui-monospace, Menlo, Consolas, monospace" font-size="14" font-weight="600" fill="#16282b" text-anchor="start">DPO</text>
 <rect x="70" y="124" width="200" height="84" rx="6" fill="#f2f6f5" stroke="#c9d9d5" stroke-width="1"/>
-<text x="82" y="147" font-family="'Geist Mono', 'JetBrains Mono', ui-monospace, Menlo, Consolas, monospace" font-size="14" font-weight="600" fill="#16282b" text-anchor="start">PreferencePairs</text>
+<text x="82" y="147" font-family="'Geist Mono', 'JetBrains Mono', ui-monospace, Menlo, Consolas, monospace" font-size="14" font-weight="600" fill="#16282b" text-anchor="start">Preferences</text>
 <text x="82" y="169" font-family="Geist, Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#4d6763" text-anchor="start">chosen, rejected and</text>
 <text x="82" y="188" font-family="Geist, Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#4d6763" text-anchor="start">their completion masks</text>
 <rect x="290" y="124" width="210" height="84" rx="6" fill="#f2f6f5" stroke="#c9d9d5" stroke-width="1"/>

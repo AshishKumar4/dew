@@ -200,7 +200,7 @@ trainer.fit(data, tokens=2e12)    # launched on every host with `dew launch`
 | Autotuner per GPU and shape | In review |
 | Native `jax.Mesh` with any axes, `data_axes=`, `microbatches=` on the Trainer | Planned |
 | Native variable trees normalized at the Trainer; `method=` | Planned |
-| `fit(epochs=, tokens=)` (today `total_tokens=`) | Planned |
+| `fit(epochs=, tokens=)` | Built, landing |
 | Compile before holding a GPU, period scan over layers | Planned |
 | `dew profile`; reloaded runs keeping their processor; chat without PyTorch; complete PEFT exports; `run.export` | Planned |
 | The five seams and their standing tests | In progress (seam 2 landing; seam 1 built) |

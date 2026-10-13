@@ -41,7 +41,9 @@ from jax.sharding import NamedSharding
 
 from dew import Layout, MeshSpec, Trainer
 from dew.config import OptimConfig
-from dew.data import ByteTokenizer, DataPartition, Loading, TokenWindows
+from dew.config.data import TextData, loader
+from dew.data import ByteTokenizer, Loading
+from dew.data.dataset import DataPartition
 from dew.inference import RunProcessor, TextGeneration
 from dew.inference.serving import Server
 from dew.nn.backbones import CausalTransformer, Mixture
@@ -96,7 +98,7 @@ def corpus(rng: np.random.Generator, lines: int) -> str:
 
 
 def write_tokens(directory: Path, seed: int) -> None:
-    """Byte token files in the layout `TokenWindows` reads."""
+    """Byte token files in the layout a Text recipe reads."""
     directory.mkdir(parents=True)
     rng = np.random.default_rng(seed)
     for split, lines in (("train", 20000), ("val", 400)):
@@ -216,8 +218,9 @@ def all_to_all_ops(hlo: str) -> tuple[int, str]:
 def main(config: Config) -> None:
     config.out.mkdir(parents=True)
     write_tokens(config.out / "tokens", config.seed)
-    data = TokenWindows(path=str(config.out / "tokens"), seq_len=config.sequence_length, val_batches=1,
-                        loading=Loading(workers=0, threads=1, read_buffer=2)).load(batch=config.batch_size)
+    data = loader(TextData(source=str(config.out / "tokens"), seq_len=config.sequence_length),
+                batch=config.batch_size, read="memory", validation_records=config.batch_size,
+                loading=Loading(workers=0, threads=1, read_buffer=2))
     model = CausalTransformer(
         vocab_size=256, emb_features=64, num_layers=2, num_heads=4,
         mlp_features=128, max_seq_len=64, dtype=jnp.float32, attention_impl="xla",

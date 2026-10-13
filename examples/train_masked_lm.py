@@ -33,7 +33,11 @@ import tyro
 
 import dew
 from dew.config import ModelConfig, ObjectiveConfig, OptimConfig, TrainerConfig
-from dew.data import ByteTokenizer, HFOptions, HFTokenizer, HubText, Loading, TokenCorpus, TokenWindows
+from dew.config.data import HoldOut, TextData, loader
+from dew.data import ByteTokenizer, Files, HFTokenizer, Hub, Loading
+from dew.data.compile import iterate
+from dew.data.pipeline import Pipeline
+from dew.data.steps.text import Tokenize
 from dew.objectives.diffusion.masked import MaskedDiffusionObjective
 from dew.objectives.lm import LMRunConfig, Perplexity
 from dew.training import Evaluation, MeshSpec
@@ -75,29 +79,28 @@ class Config:
     """Train a tiny model on a few local lines, byte-tokenized, on one CPU device."""
 
 
-def smoke_config(config: Config) -> tuple[Config, HFOptions]:
+def smoke_config(config: Config) -> tuple[Config, Files]:
     """The same run over a JSON file of text written here, read through the
     `json` builder `datasets` ships, so nothing is downloaded."""
     config.out.mkdir(parents=True, exist_ok=True)
     rows = config.out / "smoke.jsonl"
-    rows.write_text("".join(json.dumps({"text": line}) for line in SMOKE_TEXT * 160))
-    options = HFOptions(data_files=str(rows), cache_dir=str(config.out / "hf-cache"))
+    rows.write_text("".join(json.dumps({"text": line}) + "\n" for line in SMOKE_TEXT * 160))
+    source = Files(str(rows), format="jsonl")
     return replace(config, dataset="json", tokenizer="byte", sequence_length=32, batch_size=8,
                    steps=4, warmup_steps=1, model={"emb_features": 32, "num_layers": 1, "num_heads": 2},
                    eval_every=2, val_batches=1, sample_steps=4, max_new_tokens=8,
-                   prompts=("The cat", "A small boat")), options
+                   prompts=("The cat", "A small boat")), source
 
 
 def main(config: Config) -> Path:
-    options = HFOptions(config=config.config, revision=config.revision)
+    source = Hub(config.dataset, name=config.config, revision=config.revision)
     if config.smoke:
-        config, options = smoke_config(config)
+        config, source = smoke_config(config)
     tokenizer = ByteTokenizer() if config.tokenizer == "byte" else HFTokenizer(config.tokenizer)
-    # The window is one id shorter than a row: TokenWindows adds the id a
+    # The window is one id shorter than a row: Text adds the id a
     # next-token target shifts by, and MDLM denoises the whole row.
-    data = TokenWindows(hub=HubText(name=config.dataset, tokenizer=config.tokenizer, options=options),
-                        seq_len=config.sequence_length - 1, val_batches=config.val_batches,
-                        loading=Loading(workers=0, threads=4))
+    data = TextData(source=source, tokenizer=config.tokenizer, eos=True,
+                seq_len=config.sequence_length - 1, token_holdout=HoldOut(fraction=0.01))
     name = f"mdlm-{config.dataset.rsplit('/', 1)[-1].lower()}"
     trainer = TrainerConfig(name=name, checkpoint_dir=str(config.out / "checkpoints"), keep=1,
                             batch_size=config.batch_size, steps=config.steps,
@@ -108,7 +111,9 @@ def main(config: Config) -> Path:
         model=ModelConfig("causal_transformer", {
             **config.model, "causal": False, "mask_token_id": tokenizer.vocab_size,
             "dtype": "float32" if config.smoke else "bfloat16"}),
-        data=data, tokenizer=config.tokenizer,
+        data=data, data_read="memory", tokenizer=config.tokenizer, provision=not config.smoke,
+        validation_records=None if config.val_batches is None else config.val_batches * config.batch_size,
+        loading=Loading(workers=0, threads=4),
         objective=ObjectiveConfig("masked_diffusion", {
             "steps": config.sample_steps, "ema_decay": 0.9 if config.smoke else 0.999}),
         optim=OptimConfig(weight_decay=0.03, clip_grads=1.0, schedule=Cosine(
@@ -124,15 +129,22 @@ def main(config: Config) -> Path:
     run_dir = config.out / "checkpoints" / name
     task = dew.pipeline(str(run_dir))
     task = replace(task, eos_token_ids=() if tokenizer.eos_id is None else (tokenizer.eos_id,))
-    whole = replace(data, val_batches=None).load(batch=config.batch_size)
+    whole = loader(data, batch=config.batch_size, read="memory", loading=run.loading)
     scored = Evaluation.run(MaskedDiffusionObjective(task.model, task.process, config.sequence_length),
                             task.variables, whole.val, key=jax.random.key(0), metrics=[Perplexity()],
                             loss=True)
     generated = task(list(config.prompts), config.max_new_tokens, key=1)
     samples = [prompt + text for prompt, text in zip(config.prompts, task.decode(generated), strict=True)]
-    corpus = TokenCorpus.read(data.hub.tokenized())
+    token_rows = iterate(Pipeline(source).map(Tokenize(config.tokenizer, eos=True)), read="memory",
+                         loading=run.loading)
+    reader = iter(token_rows)
+    try:
+        total_tokens = sum(len(row["text"]) for row in reader)
+    finally:
+        reader.close()
+    held_tokens = int(total_tokens * 0.01)
     report = {"dataset": config.dataset, "config": config.config, "tokenizer": config.tokenizer,
-              "train_tokens": corpus.train_tokens, "held_out_tokens": corpus.val_tokens,
+              "train_tokens": total_tokens - held_tokens, "held_out_tokens": held_tokens,
               "device": jax.devices()[0].device_kind, "steps": config.steps,
               "batch_size": config.batch_size, "sequence_length": config.sequence_length,
               "train_seconds": round(trained - started, 1), "held_out": dict(scored.scores),

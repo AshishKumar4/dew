@@ -35,12 +35,15 @@ from dew.nn.sharding import (
     SEQUENCE_AXIS,
     STAGE_AXIS,
     LayoutRefused,
+    LogicalAxes,
     LogicalAxisRules,
     MeshAxes,
+    Suffix,
     batch_axes,
     boxed,
     boxed_axes,
     current_boxes,
+    declarations,
     declared_axes,
     logical_spec,
     mesh_axes,
@@ -573,9 +576,10 @@ class Layout:
         fsdp_size = mesh.shape.get(FSDP_AXIS, 1)
         sharded_devices = math.prod(mesh.shape[axis] for axis in parameter_axes(mesh.axis_names))
         explicit = set(explicit_axes(mesh))
+        declared = declarations(tree)
 
         def leaf_sharding(path, value):
-            axes = declared_axes(path, value.ndim)
+            axes = declared_axes(path, value.ndim, declared)
             size = int(np.prod(value.shape, dtype=np.int64))
             if axes is None:
                 spec = parameter_spec(value.shape, fsdp_size, self.min_shard)
@@ -602,11 +606,11 @@ class Layout:
         modules declared, as the rules place them."""
         return boxed(ruled_boxes({**current_boxes(), **boxed_axes(tree)}, self.axis_rules))
 
-    def _splitting(self, path, value) -> set[str]:
+    def _splitting(self, path, value, declared: Mapping[Suffix, LogicalAxes]) -> set[str]:
         """The parameter axes the rules could split the leaf at `path` over:
         those its declared names' rules name, or fsdp, which the shape
         heuristic splits an undeclared leaf over."""
-        axes = declared_axes(path, value.ndim)
+        axes = declared_axes(path, value.ndim, declared)
         if axes is None:
             return {FSDP_AXIS}
         return set(parameter_axes(axis for name, assignment in self.axis_rules if name in axes
@@ -681,8 +685,10 @@ class Layout:
 
         path_leaves, _ = jax.tree_util.tree_flatten_with_path(nn.unbox(params))
         splits = {axis for axis in parameter_axes(mesh.axis_names) if mesh.shape[axis] > 1}
+        declared = declarations(params)
         with self._declared(params):
-            splittable = [bool(self._splitting(path, param) & splits) for path, param in path_leaves]
+            splittable = [bool(self._splitting(path, param, declared) & splits)
+                          for path, param in path_leaves]
         shardable_elements = 0
         replicated = []
         for (path, param), sharding, ruled in zip(

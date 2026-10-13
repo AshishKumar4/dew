@@ -12,6 +12,7 @@ import pytest
 from flax import linen as nn
 from model_support import decoder
 
+from dew.data.dataset import Loader
 from dew.diffusion.block import BlockProcess
 from dew.inference import BlockGeneration, TextGeneration
 from dew.interop import Pretrained
@@ -89,7 +90,7 @@ def test_a_loader_takes_a_dtype_and_records_its_name():
 
 
 def test_a_pretrained_bundle_fine_tunes_identically_to_explicit_wiring():
-    from dew import Dataset, Trainer
+    from dew import Trainer
     from dew.objectives.base import Step
 
     source = Pretrained.load(FIXTURES / "llama-tiny", dtype="float32", attention_impl="xla",
@@ -107,7 +108,7 @@ def test_a_pretrained_bundle_fine_tunes_identically_to_explicit_wiring():
     def loss(objective):
         return jax.jit(objective.scalar_loss)(objective.init(key), batch, step)[0]
     np.testing.assert_array_equal(loss(bundled), loss(explicit))
-    data = Dataset(train=lambda partition: iter([batch]), val=None, records=count, batch=count)
+    data = Loader(train=lambda partition: iter([batch]), val=None, records=count, batch=count)
     states = [Trainer(objective, optax.adamw(1e-3), key=key).fit(
         data, steps=1, log_every=100, checkpoint_every=None) for objective in (explicit, bundled)]
     assert int(states[1].updates) == 1
@@ -263,7 +264,7 @@ def test_a_placed_diffusion_gemma_task_keeps_its_rows_sharded_and_draws_the_same
 @pytest.mark.parametrize("kind", ["dpo", "grpo", "ppo"])
 def test_pipeline_publishes_the_updated_policy_not_the_frozen_reference(kind, tmp_path):
     import dew
-    from dew.data import Dataset
+    from dew.data.dataset import Loader
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.objectives.lm import Samples
     from dew.objectives.rl import DPOObjective, GRPOObjective, PPOObjective, ValueHead
@@ -301,7 +302,7 @@ def test_pipeline_publishes_the_updated_policy_not_the_frozen_reference(kind, tm
         if kind == "ppo":
             values = np.asarray(objective.values(before.variables, batch))
             batch.update(old_values=values, returns=values + mask)
-    data = Dataset(train=lambda partition: iter([batch, batch]), val=None, records=2 * count, batch=count)
+    data = Loader(train=lambda partition: iter([batch, batch]), val=None, records=2 * count, batch=count)
     state = trainer.fit(data, steps=2, log_every=100, checkpoint_every=None)
     def draw(weights):
         task = objective.policy(weights) if kind == "ppo" else objective.policy(weights, sampling)
