@@ -89,7 +89,8 @@ hf download roneneldan/TinyStories TinyStoriesV2-GPT4-valid.txt \
 python - <<'PY'
 from pathlib import Path
 import numpy as np
-from dew.data import HFTokenizer, export
+from dew.data import HFTokenizer
+from dew.data.sinks import export
 
 tokenizer = HFTokenizer("gpt2")
 ids = np.asarray(tokenizer.encode(Path("data/TinyStoriesV2-GPT4-valid.txt").read_text()), np.int32)

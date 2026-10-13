@@ -33,7 +33,8 @@ Tokenize it with the byte tokenizer, which maps each UTF-8 byte to one of 256 ID
 python - <<'PY'
 from pathlib import Path
 import numpy as np
-from dew.data import ByteTokenizer, export
+from dew.data import ByteTokenizer
+from dew.data.sinks import export
 ids = np.asarray(ByteTokenizer().encode(Path("corpus.txt").read_text()), np.int32)
 held = int(len(ids) * 0.1)
 metadata = {"token_store": True, "tokenizer": "byte", "vocab_size": 256,
