@@ -125,7 +125,7 @@
       "key": 0,
       "steps": 1350000,
       "epochs": null,
-      "total_tokens": null,
+      "tokens": null,
       "log_every": 100,
       "eval_every": "epoch",
       "checkpoint_every": "epoch",
