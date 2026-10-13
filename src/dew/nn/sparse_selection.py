@@ -4,8 +4,9 @@ A selection is `[B, S, K]` key indices per query, -1 in a slot that names
 no key, which is how GLM's reference builds its top-k mask
 (`build_attention_mask_from_topk`, modeling_glm5_next.py:1218-1256). The
 V3.2 indexer (`dew.nn.mla`), GLM's k-pool indexer (`dew.nn.dsa_kpool`) and
-DeepSeek V4's compressed-entry indexer (`dew.nn.deepseek_v4`) all produce
-one, `selection_mask` turns it into the `[B, S, T]` mask the dense kernels
+DeepSeek V4's compressed-entry indexer (`dew.nn.deepseek_v4`) all score
+their keys through `index_scores` and select through `top_k_selection`,
+`selection_mask` turns it into the `[B, S, T]` mask the dense kernels
 read, and `sparse_latent_attention` attends it without that mask.
 """
 
@@ -14,6 +15,23 @@ import jax.numpy as jnp
 
 from dew.nn.precision import at_least_fp32
 from dew.nn.scatter import DROPPED
+
+
+def index_scores(query, keys, weights, precision=None):
+    """The lightning indexer's score of each query against each key,
+    `sum_h w_h relu(q_h . k) / sqrt(head_dim) / sqrt(n_heads)`, at least in
+    fp32 (`at_least_fp32`): queries `[B, S, H, D]` against keys `[B, T, D]`
+    every query shares or `[B, S, T, D]` per query, weighted by `weights`
+    `[B, S, H]`, as `[B, S, T]`. Both contractions take `precision`. The
+    V3.2 indexer scores its keys, GLM's k-pool its pooled keys and DeepSeek
+    V4 its compressed entries through it."""
+    heads, width = query.shape[-2:]
+    wide = at_least_fp32(query.dtype)
+    shared = 'bshd,btd->bsht' if keys.ndim == 3 else 'bshd,bstd->bsht'
+    scores = jnp.maximum(jnp.einsum(shared, query.astype(wide),
+                                    keys.astype(wide), precision=precision), 0) * width ** -0.5
+    return jnp.einsum('bsht,bsh->bst', scores, weights.astype(wide) * heads ** -0.5,
+                      precision=precision)
 
 
 def top_k_selection(scores, keep, top_k: int):
