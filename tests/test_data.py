@@ -661,7 +661,7 @@ class Augmenting:
     length: int = 16
     image_size: int = 128
     augment: images.Augment | None = FLIP_JITTER
-    augmentation_backend: str = "device"
+    augmentation_backend: str = "host"
     crop_scale: tuple[float, float] = (1.0, 1.0)
     augmentation_size: int | None = None
     val_batches: int | None = 4
@@ -775,7 +775,9 @@ class Lingering(Augmenting):
     seconds: float = 2.0
 
     def prepared(self, rows, *, training=True):
-        return super().prepared(rows, training=training).map(_LingeringRecord(self.seconds))
+        prepared = super().prepared(rows, training=training)
+        prefix = Pipeline(prepared.source).map(_LingeringRecord(self.seconds)).stages
+        return dataclasses.replace(prepared, stages=(*prefix, *prepared.stages))
 
 
 @dataclasses.dataclass(frozen=True)
