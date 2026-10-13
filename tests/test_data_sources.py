@@ -1388,6 +1388,26 @@ def test_artifact_codec_preserves_extended_numpy_dtypes():
     assert restored["scalar"] == values["scalar"]
 
 
+def test_content_fingerprint_preserves_array_identity_and_sequence_order():
+    from dew.data.sources.codec import content_fingerprint, decode, encode
+
+    ordered = {"a": [b"first", b"last"], "z": np.arange(6, dtype=np.int32).reshape(2, 3)}
+    reordered = {"z": ordered["z"], "a": ordered["a"]}
+    digest = content_fingerprint(ordered)
+    assert content_fingerprint(reordered) == digest == hashlib.sha256(encode(ordered)).digest()
+    assert encode(reordered) != encode(ordered)
+    assert list(decode(encode(reordered))) == ["z", "a"]
+    variants = [
+        {**ordered, "z": ordered["z"].astype(np.int64)},
+        {**ordered, "z": ordered["z"].reshape(3, 2)},
+        {**ordered, "z": ordered["z"] + 1},
+        {**ordered, "a": list(reversed(ordered["a"]))},
+        {**ordered, "a": tuple(ordered["a"])},
+    ]
+    assert all(content_fingerprint(row) != digest for row in variants)
+    assert content_fingerprint(np.int16(4)) != content_fingerprint(np.int32(4))
+
+
 def test_empty_shard_cycles_exhaust_a_named_search_budget():
     root = Store(f"memory://empty-shards-{uuid4().hex}/empty.jsonl")
     root.write(b" \n\n")
