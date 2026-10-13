@@ -84,6 +84,15 @@ def _in_memory(source: Source) -> bool:
     return isinstance(source, Memory)
 
 
+def _selection(source: Source, replacement: Source) -> Source:
+    """The holdout selections of `source` around its replacement."""
+    from dew.data.holdout import _HashSource, _SliceRecords
+
+    if isinstance(source, (_HashSource, _SliceRecords)):
+        return dataclasses.replace(source, source=_selection(source.source, replacement))
+    return replacement
+
+
 def _promoted(pipeline: Pipeline) -> Pipeline:
     """The pipeline as the run reads it. Each published generation it caches
     is read as a source, in place of the steps the generation already ran,
@@ -102,9 +111,11 @@ def _promoted(pipeline: Pipeline) -> Pipeline:
         source = dataclasses.replace(source, pipelines=tuple(_promoted(child) for child in source.pipelines))
     for index, stage in enumerate(stages):
         if isinstance(stage, Artifact) and isinstance(stage.cache, Generation):
-            source, stages = stage.cache.source(), stages[index + 1 :]
+            generation = stage.cache.source()
+            source, stages = _selection(source, generation), stages[index + 1 :]
             plans = record(stage.cache.manifest.get("plan", {}), "published plans")
-            if stages and isinstance(stages[0], Pack) and plan_name(stages[0], "accepted") in plans:
+            if (source is generation and stages and isinstance(stages[0], Pack)
+                    and plan_name(stages[0], "accepted") in plans):
                 source, stages = PackedSource.published(source, stage.cache, stages[0]), stages[1:]
             break
     pack = stages[0] if stages else None
