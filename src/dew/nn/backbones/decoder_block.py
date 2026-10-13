@@ -39,20 +39,50 @@ STREAMS = ("activation_batch", "activation_length", None, "activation_embed")
 """Manifold-constrained hyper-connections' `[B, S, hc_mult, D]` residual streams."""
 
 
+@dataclasses.dataclass(frozen=True)
+class NormSpec:
+    """How one of a decoder's norms differs from the model's others: its
+    epsilon, whether it has a weight, whether an RMS norm's weight is stored
+    as (1 + w), and the groups an RMS norm's statistics take
+    (`RMSNorm.groups`). None is the model's own (`norm_eps`, `scale_offset`)."""
+
+    eps: float | None = None
+    scale: bool = True
+    offset: bool | None = None
+    groups: int = 1
+
+
+NORM_SITES = ('input_layernorm', 'post_attention_layernorm', 'attention_output_norm', 'mlp_output_norm',
+              'post_per_layer_input_norm', 'embedding_layernorm', 'norm', 'head_norm')
+"""The decoder's norms a `NormSpec` may change, by the module name each is built under."""
+
+
 def decoder_norm(kind: Literal['rms', 'layer', 'fast_layer'], *, epsilon: float,
                  bias: bool, scale_offset: bool, scale_after_cast: bool,
-                 dtype: Dtype | None) -> Callable[..., nn.Module]:
-    """The decoder's norm factory. 'layer' keeps torch's exact variance, the
+                 dtype: Dtype | None,
+                 specs: Mapping[str, NormSpec] | None = None) -> Callable[..., nn.Module]:
+    """The decoder's norm factory, building each norm by its `name` as
+    `specs` changes it there. 'layer' keeps torch's exact variance, the
     reference decoders' formula; 'fast_layer' is flax's E[x^2] - E[x]^2
     (`dew.nn.attention.LayerNorm`), whose mean and square reduce in one pass,
     which the vision towers run."""
-    if kind == 'layer':
-        return functools.partial(nn.LayerNorm, epsilon=epsilon, use_bias=bias,
-                                 use_fast_variance=False, dtype=dtype)
-    if kind == 'fast_layer':
-        return functools.partial(LayerNorm, epsilon=epsilon, use_bias=bias, dtype=dtype)
-    return functools.partial(RMSNorm, epsilon=epsilon, scale_offset=scale_offset,
-                             scale_after_cast=scale_after_cast, dtype=dtype)
+
+    def build(*, name: str) -> nn.Module:
+        spec = (specs or {}).get(name, NormSpec())
+        eps = epsilon if spec.eps is None else spec.eps
+        if kind == 'rms':
+            return RMSNorm(epsilon=eps, scale_offset=scale_offset if spec.offset is None else spec.offset,
+                           scale_after_cast=scale_after_cast, with_scale=spec.scale, groups=spec.groups,
+                           dtype=dtype, name=name)
+        if spec.groups != 1 or spec.offset:
+            raise ValueError(f"{name}, a {kind} norm, takes its statistics over the whole axis under an "
+                             f"unshifted weight, not {spec}")
+        if kind == 'layer':
+            return nn.LayerNorm(epsilon=eps, use_bias=bias, use_scale=spec.scale, use_fast_variance=False,
+                                dtype=dtype, name=name)
+        return LayerNorm(epsilon=eps, use_bias=bias, use_scale=spec.scale, dtype=dtype, name=name)
+
+    return build
 
 
 @runtime_checkable
@@ -382,8 +412,9 @@ class DecoderBlock(nn.Module):
     """Pre-norm decoder block: a token mixer, then a feed-forward, each added to the residual.
 
     `mixer` and `feedforward` are factories that take only a name. The mixer
-    becomes self_attn and accepts (x, decode=..., positions=...,
-    segment_ids=...). The feed-forward becomes mlp and takes the normalized
+    becomes self_attn and accepts (x, decode=..., attention_metadata=...), its
+    tokens' places and documents the metadata's `Coordinates`. The
+    feed-forward becomes mlp and takes the normalized
     states, plus the token ids on a `hash_routed` block. A `feedforward` of
     None gives Mamba-2's block, which has the mixer alone. `wiring` places the
     norms (`BlockWiring`).
@@ -423,6 +454,7 @@ class DecoderBlock(nn.Module):
     norm_eps: float = 1e-5
     norm_type: Literal['rms', 'layer', 'fast_layer'] = 'rms'
     norm_bias: bool = False
+    norms: Mapping[str, NormSpec] | None = None
     scale_offset: bool = False
     scale_after_cast: bool = False
     per_layer_input_dim: int = 0
@@ -511,7 +543,7 @@ class DecoderBlock(nn.Module):
         norm = decoder_norm(
             self.norm_type, epsilon=self.norm_eps, bias=self.norm_bias,
             scale_offset=self.scale_offset, scale_after_cast=self.scale_after_cast,
-            dtype=self.dtype)
+            dtype=self.dtype, specs=self.norms)
         if self.wiring.parallel_residual and (
                 not self.wiring.pre_norms or self.wiring.output_norms
                 or self.feedforward is None or self.hyper_connections is not None
@@ -602,22 +634,20 @@ class DecoderBlock(nn.Module):
         """The packed groups its mixer and its feed-forward declare (`ProjectionSites`)."""
         return declared_groups(self.self_attn, *([self.mlp] if self.feedforward is not None else []))
 
-    def __call__(self, x, train: bool = False, decode: bool = False,
-                 positions=None, segment_ids=None, kv_store=None,
+    def __call__(self, x, train: bool = False, decode: bool = False, kv_store=None,
                  per_layer_input=None, attention_metadata=None,
                  prediction_phase: PredictionPhase = "ordinary"):
         if self.remat is None or self.is_initializing() or decode:
-            return self._forward(x, train, decode, positions, segment_ids,
-                                 kv_store, per_layer_input, attention_metadata, prediction_phase)
+            return self._forward(x, train, decode, kv_store, per_layer_input, attention_metadata,
+                                 prediction_phase)
 
-        def run(module, x, positions, segment_ids, kv_store, per_layer_input, attention_metadata):
+        def run(module, x, kv_store, per_layer_input, attention_metadata):
             # Providers write K/V into a dict; scanned consumers only read it.
             # Return writes explicitly, keeping consumer values out of the
             # scan result so its tracers cannot replace the outer store.
             store = None if kv_store is None else dict(kv_store)
             out = module._forward(
-                x, train, decode=False, positions=positions, segment_ids=segment_ids,
-                kv_store=store, per_layer_input=per_layer_input,
+                x, train, decode=False, kv_store=store, per_layer_input=per_layer_input,
                 attention_metadata=attention_metadata, prediction_phase=prediction_phase)
             changed = {} if kv_store is None or store is None else {
                 name: value for name, value in store.items()
@@ -628,7 +658,7 @@ class DecoderBlock(nn.Module):
         # back instead of recomputing; train stays a static closure value and
         # Linen lifts variables and RNGs with the call.
         out, store = nn.remat(run, policy=self.remat.checkpoint_policy())(
-            self, x, positions, segment_ids, kv_store, per_layer_input, attention_metadata)
+            self, x, kv_store, per_layer_input, attention_metadata)
         if kv_store is not None:
             kv_store.update(store)
         return out
@@ -638,8 +668,6 @@ class DecoderBlock(nn.Module):
         x,
         train: bool,
         decode: bool,
-        positions,
-        segment_ids,
         kv_store,
         per_layer_input,
         attention_metadata,
@@ -662,7 +690,7 @@ class DecoderBlock(nn.Module):
             normed = self.input_layernorm(read)
         routes = self._routes(per_layer_input)
         mixed = self._mix(
-            normed, decode, positions, segment_ids, kv_store, attention_metadata, prediction_phase, train,
+            normed, decode, kv_store, attention_metadata, prediction_phase, train,
             routes if self._mixer_routes else {})
         if self.wiring.output_norms:
             mixed = self.attention_output_norm(mixed)
@@ -846,8 +874,8 @@ class DecoderBlock(nn.Module):
             self.sow('prediction_inputs', 'draft_context', mean,
                      reduce_fn=lambda _, value: value, init_fn=lambda: mean)
 
-    def _mix(self, x, decode: bool, positions, segment_ids, kv_store, attention_metadata,
-             prediction_phase: PredictionPhase, train: bool, routes: dict):
+    def _mix(self, x, decode: bool, kv_store, attention_metadata, prediction_phase: PredictionPhase,
+             train: bool, routes: dict):
         """The token mixer over `x`. The store, the metadata, a prediction
         phase other than ordinary and the layer's replayed experts reach it
         only when the call carries them, since a mixer with no use for one
@@ -855,8 +883,6 @@ class DecoderBlock(nn.Module):
         return self.self_attn(
             x,
             decode=decode,
-            positions=positions,
-            segment_ids=segment_ids,
             **routes,
             **(
                 {"train": train}
@@ -1001,15 +1027,12 @@ class MTPBlock(nn.Module):
         """The packed groups its block declares (`ProjectionSites`)."""
         return self.block.projection_groups()
 
-    def __call__(self, hidden, embeds, train: bool = False, positions=None,
-                 segment_ids=None, attention_metadata=None, decode: bool = False,
+    def __call__(self, hidden, embeds, train: bool = False, attention_metadata=None, decode: bool = False,
                  prediction_phase: PredictionPhase = "ordinary"):
-        return self.states(hidden, embeds, train=train, positions=positions, segment_ids=segment_ids,
-                           attention_metadata=attention_metadata, decode=decode,
+        return self.states(hidden, embeds, train=train, attention_metadata=attention_metadata, decode=decode,
                            prediction_phase=prediction_phase)[0]
 
-    def states(self, hidden, embeds, train: bool = False, positions=None,
-               segment_ids=None, attention_metadata=None, decode: bool = False,
+    def states(self, hidden, embeds, train: bool = False, attention_metadata=None, decode: bool = False,
                prediction_phase: PredictionPhase = "ordinary"):
         """Return the normalized head input and the state that the next prediction step reads."""
         if self.hyper_connections is None:
@@ -1020,8 +1043,7 @@ class MTPBlock(nn.Module):
                 raise ValueError("mHC prediction needs the trunk's uncollapsed residual streams")
             fused = self.e_proj(self.enorm(embeds))[:, :, None, :] + self.h_proj(self.hnorm(hidden))
         predicted = self.block(
-            fused, train=train, positions=positions, segment_ids=segment_ids,
-            attention_metadata=attention_metadata, decode=decode,
+            fused, train=train, attention_metadata=attention_metadata, decode=decode,
             prediction_phase=prediction_phase)
         streams = predicted
         if self.hyper_connections is not None:
