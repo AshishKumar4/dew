@@ -1078,6 +1078,17 @@ Engine's `transformer_engine.jax.flax.DotProductAttention` (built from source fo
 FlashAttention-2 wheel rebuilt for sm90, and torch's `F.scaled_dot_product_attention` under the cuDNN
 backend and `kernels.get_kernel("kernels-community/flash-attn3").flash_attn_func`.
 
+### Heads of 64 on the H100, 2026-10-13
+
+'auto' sends a call of heads up to 64 wide that cuDNN would take to tokamax's Pallas-Triton kernel
+(`triton_runs`), measured faster than cuDNN on an RTX 4080 and as fast as FlashAttention-2 on an
+A100. On an H100 SXM at Llama-3.2-1B's attention (4 x 4096 tokens, 32 query heads over 8 of 64,
+causal, bf16, jax 0.11.2, tokamax 0.0.15) forward and backward took 4.44 ms on it, 2.78 on cuDNN and
+2.17 on FlashAttention-3, which a 1B FSDP step on two H100s spent 82 of 301 ms on. So sm90's row
+names flash for those heads (`attention_narrow`). The rows reproduce with `PYTHONPATH=src python
+tools/benchmark_attention.py --implementations triton flash cudnn --sequence-lengths 4096
+--head-dims 64 --batch-size 4 --heads 32 --kv-groups 4 --causal True`.
+
 ### FlashAttention-2 on the RTX PRO 6000, 2026-10-11
 
 At Qwen3.5's attention (B 2 and 4 x 3072 tokens, 16 query and 4 key heads of 256, causal bf16), where
