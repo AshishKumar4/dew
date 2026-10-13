@@ -116,7 +116,7 @@ TARGETS = {target.generation: target for target in (
                'NVIDIA GeForce RTX 4080': {'bf16': 97.5e12}}, ('gpu:l4', 'l4')),
     GpuTarget('sm90', 'NVIDIA H100 80GB HBM3', 227 * 1024,
               {'attention': 'flash', 'attention_window': 'flash', 'attention_sinks': 'flash',
-               'rms_norm': 'pallas', 'swiglu': 'pallas', 'gated_delta_rule': 'fla'}, {
+               'grouped_matmul': 'pallas', 'rms_norm': 'pallas', 'swiglu': 'pallas', 'gated_delta_rule': 'fla'}, {
         'NVIDIA H100': {'bf16': 989e12, 'fp8': 1979e12},
         'NVIDIA H100 PCIe': {'bf16': 756e12, 'fp8': 1513e12},
         'NVIDIA H100 NVL': {'bf16': 835e12, 'fp8': 1670.5e12},
@@ -130,11 +130,11 @@ TARGETS = {target.generation: target for target in (
     GpuTarget('v3', 'TPU v3', dense_peaks={'TPU v3': {'bf16': 61.5e12}}),
     GpuTarget('v4', 'TPU v4', dense_peaks={'TPU v4': {'bf16': 275e12}}),
     GpuTarget('v5e', 'TPU v5 lite',
-              kernels={'grouped_matmul': 'xla', 'tokamax_grouped_matmul': 'mosaic_tpu_v2'},
+              kernels={'grouped_matmul': 'xla'},
               dense_peaks={'TPU v5 lite': {'bf16': 197e12}}),
     GpuTarget('v5p', 'TPU v5', dense_peaks={'TPU v5': {'bf16': 459e12}, 'TPU v5p': {'bf16': 459e12}}),
     GpuTarget('v6e', 'TPU v6 lite',
-              kernels={'grouped_matmul': 'xla', 'tokamax_grouped_matmul': 'mosaic_tpu_v2'},
+              kernels={'grouped_matmul': 'xla'},
               dense_peaks={'TPU v6 lite': {'bf16': 918e12}}),
 )}
 

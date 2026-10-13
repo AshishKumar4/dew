@@ -20,7 +20,7 @@ from flax import linen as nn
 from jax.sharding import NamedSharding, PartitionSpec as P
 
 from ..mla import INDEXER_COLLECTION
-from ..sharding import STAGE_AXIS
+from ..sharding import STAGE_AXIS, microbatched
 from .decoder_block import DecoderBlock
 from .layer_plan import LayerSpec, group_layers, group_name
 
@@ -375,6 +375,18 @@ def _stack_leaves(*trees):
     return jax.tree.map(lambda *leaves: jnp.stack(leaves), *trees)
 
 
+def _refuse_unlike(collection: str, trees: Sequence, names: Sequence[str]) -> None:
+    """Refuse layers one scanned run or the stages' like positions read whose
+    `collection` differs in structure, as layers a checkpoint quantizes
+    differently do; the run reads one body for all of them."""
+    structures = [jax.tree.structure(tree) for tree in trees]
+    unlike = [name for name, structure in zip(names, structures, strict=True) if structure != structures[0]]
+    if unlike:
+        raise ValueError(f"collection {collection!r} differs between {names[0]} and {', '.join(unlike)}, "
+                         "which one scanned run or pipeline stage reads as like layers; run these layers "
+                         "unscanned on one stage")
+
+
 @dataclasses.dataclass(frozen=True)
 class StackView:
     """Converts the layer stack's variables between their stored layout and the one its loops read.
@@ -442,6 +454,8 @@ class StackView:
                         f"collection {collection!r} holds some of the layers "
                         f"{sorted(layer for stage in names for layer in stage)} and not "
                         "the others; a run reads every one of its layers or none")
+                _refuse_unlike(collection, [tree[layer] for stage in names for layer in stage],
+                               [layer for stage in names for layer in stage])
                 runs = [_stack_leaves(*[tree.pop(layer) for layer in stage]) if count > 1
                         else tree.pop(stage[0]) for stage in names]
                 if self.stages == 1:
@@ -528,21 +542,8 @@ def _stage_sharding(ndim: int) -> NamedSharding:
                          P(STAGE_AXIS, *([P.UNCONSTRAINED] * (ndim - 1))))
 
 
-def _microbatched(value, axis: int, count: int):
-    """`[.., rows, ..]` as `[count, .., rows / count, ..]`: microbatch m takes
-    rows m, m + count, m + 2 * count, ...
-
-    A batch splits over its devices in blocks of consecutive rows. Strided,
-    each microbatch keeps a share of every block where the block is, as long
-    as `count` divides a block; cut into consecutive runs, each microbatch
-    would sit in one block and move to the devices of every other."""
-    shape = value.shape
-    split = value.reshape((*shape[:axis], shape[axis] // count, count, *shape[axis + 1:]))
-    return jnp.moveaxis(split, axis + 1, 0)
-
-
 def _whole(value, axis: int):
-    """The batch `_microbatched` cut, back in one piece and in its order."""
+    """The batch `microbatched` cut, back in one piece and in its order."""
     moved = jnp.moveaxis(value, 0, axis + 1)
     shape = moved.shape
     return moved.reshape((*shape[:axis], shape[axis] * shape[axis + 1], *shape[axis + 2:]))
@@ -568,7 +569,7 @@ def run_pipeline(model: nn.Module, view: StackView, x, *, train: bool, positions
     stages, count = view.stages, view.microbatches
     per_stage = view.per_stage
     batch_axis = 1 if model.altup is not None else 0
-    micro = functools.partial(_microbatched, count=count)
+    micro = functools.partial(microbatched, count=count)
     x = micro(x, batch_axis)
     per_row = [None if value is None else micro(jnp.asarray(value), 0)
                for value in (positions, segment_ids)]

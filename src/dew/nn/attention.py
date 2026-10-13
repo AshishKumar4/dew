@@ -18,6 +18,7 @@ from typing import Literal
 import jax
 import jax.numpy as jnp
 import numpy as np
+import tokamax
 from flax import linen as nn
 from flax.linen.dtypes import canonicalize_dtype, promote_dtype
 from flax.typing import Dtype, PrecisionLike
@@ -72,8 +73,7 @@ field, a module's `attention_impl`, and `scaled_dot_product_attention`'s
 'reference' is the portable einsum and softmax, and the only path that reads
 dtype, precision and force_fp32_for_softmax. 'xla' and 'cudnn' are
 `jax.nn.dot_product_attention`'s own two. 'triton' is tokamax's Pallas-Triton
-flash kernel (`triton_attention`), which needs tokamax installed
-(docs/installation.md). 'flash' is FlashAttention (`flash_attention`),
+flash kernel (`triton_attention`). 'flash' is FlashAttention (`flash_attention`),
 FlashAttention-3 on Hopper and FlashAttention-2 elsewhere, from the
 dew_flash_attn wheel (docs/installation.md). 'tpu' is the
 pallas splash kernel, with the older pallas flash kernel behind it for the
@@ -935,8 +935,8 @@ def cudnn_runs(query, softcap=None) -> bool:
 
 def triton_runs(query, sliding_window=None, mask=None, bias=None) -> bool:
     """Report whether 'auto' sends a call cudnn would take to tokamax's
-    Pallas-Triton kernel instead: tokamax is installed, the heads are at most
-    64 wide, and the call has no window, mask (key lengths included) or bias.
+    Pallas-Triton kernel instead: the heads are at most 64 wide, and the call
+    has no window, mask (key lengths included) or bias.
 
     Those are the calls it measured faster on. On an RTX 4080, bf16, in the
     training step: SimpleDiT-B's attention (32 x 256 tokens, 12 heads of 64)
@@ -947,8 +947,7 @@ def triton_runs(query, sliding_window=None, mask=None, bias=None) -> bool:
     ms. A window gains nothing (0.58 against 0.59 ms at 256 of 1024), so it
     stays on cuDNN with the masks.
     """
-    return (query.shape[-1] <= 64 and sliding_window is None and mask is None and bias is None
-            and importlib.util.find_spec('tokamax') is not None)
+    return query.shape[-1] <= 64 and sliding_window is None and mask is None and bias is None
 
 
 FLASH_MAX_HEAD_DIM = 256
@@ -1074,15 +1073,8 @@ def triton_attention(query, key, value, causal: bool):
     tokamax's heuristic config, with jax.nn's default scale of 1/sqrt(D).
 
     It takes grouped key heads and any length itself. A Pallas call has no
-    partitioning rule, so on a mesh it runs per shard (`per_shard`). tokamax
-    is not a dependency of Dew (docs/installation.md says how to install it),
-    so it is imported here.
+    partitioning rule, so on a mesh it runs per shard (`per_shard`).
     """
-    try:
-        tokamax = importlib.import_module('tokamax')
-    except ImportError as e:
-        raise ValueError("attention implementation 'triton' needs tokamax: "
-                         "uv pip install 'tokamax>=0.0.15' (docs/installation.md)") from e
 
     def local(query, key, value):
         return tokamax.dot_product_attention(query, key, value, is_causal=causal,
@@ -1652,7 +1644,7 @@ def resolve_implementation(implementation, query, key, *, dtype=None, precision=
     # refuses a right window without the causal mask), so a bidirectional
     # window goes past it.
     fused = sinks is None and cudnn_runs(query, softcap) and (causal or sliding_window is None)
-    # tokamax's Triton kernel, where it is installed and takes the call, ran
+    # tokamax's Triton kernel, where it takes the call, ran
     # SimpleDiT-B's 64-wide heads as fast as FlashAttention-2 on the A100 and
     # faster on the L4.
     if fused and triton_runs(query, sliding_window, mask, bias):

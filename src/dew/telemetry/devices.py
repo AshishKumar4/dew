@@ -102,6 +102,26 @@ def unpartition_gpu_pool() -> None:
         apply_xla_flags("--xla_gpu_enable_allocator_spatial_partitioning=false")
 
 
+def preallocate_gpu_pool() -> None:
+    """Preallocate 95% of each GPU as XLA's pool for a training process,
+    unless the run named its pool (fraction, preallocation or allocator).
+
+    A pool that grows takes a step's temporaries only in a new region from
+    the part of its limit it has not taken (`dew.training.memory.placeable`),
+    so the regions it holds decide what fits: on an H100 SXM, Qwen3.5-0.8B at
+    8 x 3072 found 59.2 GiB left to grow, with 16 GiB held, against 63.4 GiB
+    of temporaries, and recomputed under 'minimal'; with 95% preallocated it
+    ran without, 351 ms a step against 403 (an A100-40 at 4 x 3072, 389
+    against 444 ms; gdn-one-path e3c90a968, runs/SwiftHeron/parity-*-gdn).
+    JAX's default 75% holds less than that step's 71.8 GiB peak."""
+    bridge = sys.modules.get("jax._src.xla_bridge")
+    if bridge is not None and bridge.backends_are_initialized():
+        return
+    named = ("XLA_PYTHON_CLIENT_MEM_FRACTION", "XLA_PYTHON_CLIENT_PREALLOCATE", "XLA_PYTHON_CLIENT_ALLOCATOR")
+    if cuda_plugin() and not any(name in os.environ for name in named):
+        os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.95"
+
+
 def cuda_builds() -> list[str]:
     """JAX's CUDA builds installed, `cuda12` and `cuda13` by their plugins;
     asked before the backend opens, which no other question can be."""
