@@ -172,7 +172,7 @@ def test_a_recorded_plan_settles_its_kernel_launches_without_lowering_the_step_f
     lowered = []
 
     def lowering(event, seconds, *, fun_name=None, **_):
-        if event == "/jax/core/compile/jaxpr_to_mlir_module_duration" and fun_name == "jit_step":
+        if event == "/jax/core/compile/jaxpr_to_mlir_module_duration" and fun_name == "jit(step)":
             lowered.append(seconds)
 
     counts = []
