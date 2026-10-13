@@ -43,7 +43,7 @@ from dew.artifacts import uint8_pixels
 from dew.config import ModelConfig, OptimConfig, TrainerConfig
 from dew.config.data import TextData, loader
 from dew.data import ByteTokenizer, Loading
-from dew.data.sources.files import TokenFiles
+from dew.data.sources.tokens import TokenFiles
 from dew.eval import FID, CLIPScore
 from dew.inference import RunProcessor, TextGeneration, TextToImage
 from dew.nn.backbones import CausalTransformer

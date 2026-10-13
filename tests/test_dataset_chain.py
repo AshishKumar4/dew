@@ -1,6 +1,7 @@
 """The chain surface: stores carry the verbs, mix reads members of every kind, holdout splits by identity."""
 
 import dataclasses
+import hashlib
 import itertools
 import json
 from dataclasses import dataclass
@@ -64,6 +65,52 @@ def test_holdout_puts_each_record_in_one_part_by_its_identity_the_same_in_every_
     first, held = Memory(rows("c", 10)).holdout(records=3)
     assert [int(row["i"]) for row in iterate(held, read="memory")] == [0, 1, 2]
     assert [int(row["i"]) for row in iterate(first, read="memory")] == list(range(3, 10))
+
+
+@pytest.mark.parametrize("read", ["memory", "streamed"])
+@pytest.mark.parametrize("key", [None, "identity"])
+@pytest.mark.parametrize("nested", ["mapping", "arrays", "object_array"])
+def test_holdout_ignores_mapping_order_at_every_depth(read, key, nested):
+    original = []
+    reordered = []
+    for index in range(64):
+        first = {"z": np.arange(3, dtype=np.int32), "a": index}
+        second = {"a": index, "z": np.arange(3, dtype=np.int32)}
+        if nested == "arrays":
+            first, second = [first, b"document"], [second, b"document"]
+        elif nested == "object_array":
+            first, second = np.asarray([first], dtype=object), np.asarray([second], dtype=object)
+        original.append({"identity": first, "id": index})
+        reordered.append({"id": index, "identity": second})
+
+    def parts(documents):
+        return [{int(row["id"]) for row in iterate(part, read=read, loading=READ)}
+                for part in Memory(documents).holdout(0.5, key=key)]
+
+    first, second = parts(original), parts(reordered)
+    assert first[0].isdisjoint(first[1])
+    assert first[0] | first[1] == set(range(64))
+    assert first == second
+
+
+def test_canonical_holdout_moves_unsorted_splits_but_keeps_sorted_and_scalar_hashes():
+    from dew.data.sources.codec import encode
+
+    original = [{"z": index, "a": {"z": "document", "a": index}} for index in range(200)]
+    ordered = [{"a": {"a": index, "z": "document"}, "z": index} for index in range(200)]
+
+    def legacy(documents, key=None):
+        return {row["z"] for row in documents
+                if int.from_bytes(hashlib.sha256(encode(row if key is None else row[key])).digest()[:8],
+                                  "big") < 2**63}
+
+    def held(documents, key=None):
+        _, validation = Memory(documents).holdout(0.5, key=key)
+        return {int(row["z"]) for row in iterate(validation, read="memory", loading=READ)}
+
+    assert held(original) == held(ordered) == legacy(ordered)
+    assert held(original) != legacy(original)
+    assert held(original, "z") == legacy(original, "z")
 
 
 def add_draw(row, rng):

@@ -16,7 +16,7 @@ import numpy as np
 from dew.data.dataset import Batch
 from dew.data.pipeline import Windows
 from dew.data.sources.base import Read, Shard, ShardManifest
-from dew.data.sources.files import TokenFiles
+from dew.data.sources.tokens import TokenFiles
 from dew.records import integers, record
 
 
