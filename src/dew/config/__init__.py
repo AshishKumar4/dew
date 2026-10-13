@@ -700,6 +700,13 @@ class TrainerConfig:
     compile of the whole step still needs one. The program exits with status
     0 once the step lowers, and opens no W&B run.
     """
+    tune_kernels: bool = False
+    """Measure each Pallas launch of the step that has no config measured on this GPU.
+
+    Only a process with the GPU to itself measures, and the picks persist beside
+    the compilation cache for every later run. Unset, such a launch runs the
+    nearest measured shape's config or its heuristic, and the run says how many.
+    """
 
     def __post_init__(self):
         if self.split is not None and self.split < 1:
@@ -1213,14 +1220,15 @@ class RunConfig:
                         processes=jax.process_count()), 0)
 
             agreed("run metadata", record_run)
-            # The trainer holds mesh, layout, accumulation, split, dynamic_scale
-            # and profile; prepare_process read the process fields, and the rest
-            # are fit's arguments or built the checkpoints and the tracker.
+            # The trainer holds mesh, layout, accumulation, split, dynamic_scale,
+            # profile and tune_kernels; prepare_process read the process fields,
+            # and the rest are fit's arguments or built the checkpoints and the tracker.
             state = Trainer(
                 objective, self.optim, key=trainer.key,
                 mesh=trainer.mesh, layout=trainer.layout, accumulation=trainer.accumulation,
                 split=trainer.split, dynamic_scale=trainer.dynamic_scale, checkpoints=checkpoints,
                 tracker=tracker, rollout=rollout, profile=trainer.profile, lower_for=trainer.lower_for,
+                tune_kernels=trainer.tune_kernels,
             ).fit(
                 dataset, steps=steps, tokens=trainer.tokens,
                 log_every=trainer.log_every,
