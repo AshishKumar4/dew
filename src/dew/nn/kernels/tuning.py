@@ -447,8 +447,9 @@ def _settle(found: list[tuple[KernelOp, tokamax.BoundArguments]], *, measure: bo
         return tokamax.AutotuningResult(kind, tuple(decisions)).dumps()
 
     text = coordination.broadcast_from_process_zero(coordination.agreed("settling kernel configs", decided))
-    settled = {(op, key): fastest
-               for op, key, fastest in _kernel_launches(_keyed(tokamax.AutotuningResult.loads(text).data))}
+    decided_launches = _keyed(tokamax.AutotuningResult.loads(text).data)
+    settled: dict[tuple[tokamax.Op, Hashable], AutotuningData] = {
+        (op, key): fastest for op, key, fastest in _kernel_launches(decided_launches)}
     changed = False
     for op, ba in found:
         picks, key = op.get_autotuning_cache(kind), ba.autotuning_cache_key
