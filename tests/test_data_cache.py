@@ -237,7 +237,7 @@ def test_moto_generation_publication_checks_shards_and_concurrent_finalizers():
     try:
         with ThreadPoolExecutor(2) as pool:
             attempts = list(pool.map(lambda _: publish(), range(2)))
-        from dew.data.cache import Generation
+        from dew.data.generation import Generation
 
         assert any(isinstance(attempt, Generation) for attempt in attempts)
         generation = cache.generation(key)

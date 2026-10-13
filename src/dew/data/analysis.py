@@ -94,7 +94,7 @@ def _promoted(pipeline: Pipeline) -> Pipeline:
     the windows are indexed and the order is global in every read. A source
     read only as a stream, such as one filtered by a predicate, is packed as
     its rows arrive."""
-    from dew.data.cache import Generation
+    from dew.data.generation import Generation
     from dew.data.holdout import rebased
     from dew.data.packing import PackedSource, plan_name
 
