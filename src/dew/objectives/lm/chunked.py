@@ -637,9 +637,10 @@ def head_cross_entropy(model, variables, hidden, targets, chunks: int, *,
 def logits_cross_entropy(logits, targets, *, predict: bool = True, temperature: float = 1.0,
                          excluded: int | None = None):
     """`chunked_cross_entropy`'s per-token losses, top-1 columns and log
-    partitions, of whole `[..., vocab]` logits, in fp32 and over `temperature`,
-    with column `excluded` given no mass."""
-    logits = _without(logits.astype(jnp.float32) / temperature, 0,
+    partitions, of whole `[..., vocab]` logits, in fp32 or wider (a float64
+    reference's), as the tiled head sums, and over `temperature`, with column
+    `excluded` given no mass."""
+    logits = _without(logits.astype(at_least_fp32(logits.dtype)) / temperature, 0,
                       None if excluded is None else jnp.asarray(excluded, jnp.int32))
     log_z = jax.nn.logsumexp(logits, axis=-1)
     picked = jnp.take_along_axis(logits, targets[..., None], axis=-1)[..., 0]
