@@ -31,6 +31,7 @@ import jax
 import jax.numpy as jnp
 from flax import linen as nn
 
+from .attention import unweighted_rmsnorm
 from .flops import projection_flops
 from .precision import at_least_fp32
 
@@ -94,7 +95,7 @@ class DepthAttention(nn.Module):
         kernel = self.param('kernel', nn.initializers.zeros, (self.emb_features, 1), jnp.float32)
         wide = at_least_fp32(values.dtype)
         work = values.astype(wide)
-        keys = work * jax.lax.rsqrt(jnp.mean(jnp.square(work), axis=-1, keepdims=True) + self.norm_eps)
+        keys = unweighted_rmsnorm(work, self.norm_eps, implementation='xla')
         query = scale.astype(wide) * kernel[:, 0].astype(wide)
         highest = jax.lax.Precision.HIGHEST
         weights = jax.nn.softmax(jnp.einsum('bsnd,d->bsn', keys, query, precision=highest), axis=-1)

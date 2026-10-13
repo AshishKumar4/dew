@@ -410,8 +410,12 @@ def l2_normalized(x, eps: float = 1e-12):
 
     The norm is the root of the squared norm held at `eps`², the same value,
     so a zero vector's gradient is zero: the root of a sum that is zero has
-    an infinite slope, which the floor's zero gradient would turn into NaN."""
-    return x / jnp.sqrt(jnp.maximum(jnp.sum(jnp.square(x), axis=-1, keepdims=True), eps * eps))
+    an infinite slope, which the floor's zero gradient would turn into NaN.
+    The norm is then held at `eps` again, a no-op that keeps the division off
+    a bare square root, which XLA rewrites to a product with rsqrt, so the
+    quotient rounds as torch's does."""
+    norm = jnp.sqrt(jnp.maximum(jnp.sum(jnp.square(x), axis=-1, keepdims=True), eps * eps))
+    return x / jnp.maximum(norm, eps)
 
 
 def unweighted_rmsnorm(x, eps: float, *, implementation: str = 'auto'):
