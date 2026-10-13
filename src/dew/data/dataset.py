@@ -672,12 +672,17 @@ class Identified(Protocol):
     def identity(self) -> str: ...
 
 
-def batch_digest(batch: object) -> str:
-    """A digest of everything `batch` holds: its fields by name, their
-    values' dtypes, shapes and bytes, and its strings and bytes."""
+type _Held = Mapping[str, _Held] | Sequence[_Held] | str | bytes | np.ndarray | np.generic | float | None
+"""What a batch's fields hold, as `batch_digest` reads them."""
+
+
+def batch_digest(batch: Batch) -> str:
+    """A digest of what `batch` holds: its fields by name, their values'
+    dtypes, shapes and bytes, its strings, bytes and scalars, and the type
+    of any other object."""
     digest = hashlib.blake2b(digest_size=16)
 
-    def visit(value: object) -> None:
+    def visit(value: _Held) -> None:
         if isinstance(value, Mapping):
             digest.update(b"{%d" % len(value))
             for key in sorted(value, key=repr):
@@ -685,20 +690,25 @@ def batch_digest(batch: object) -> str:
                 visit(value[key])
         elif isinstance(value, (list, tuple)):
             digest.update(b"[%d" % len(value))
-            for item in value:
-                visit(item)
+            for element in value:
+                visit(element)
         elif isinstance(value, str):
             digest.update(b"s" + value.encode())
         elif isinstance(value, bytes):
             digest.update(b"b" + value)
+        elif value is None or isinstance(value, (bool, int, float, complex)):
+            digest.update(b"v" + repr(value).encode())
         else:
             array = np.asarray(value)
             digest.update(f"{array.dtype}{array.shape}".encode())
-            if array.dtype == object:
-                for item in array.flat:
-                    visit(item)
-            else:
+            if array.dtype != object:
                 digest.update(np.ascontiguousarray(array).data)
+            elif array.ndim:
+                for element in array.flat:
+                    visit(element)
+            else:
+                # An object NumPy holds whole, whose text may name its address: its type alone.
+                digest.update(type(value).__qualname__.encode())
 
     visit(batch)
     return digest.hexdigest()
@@ -755,20 +765,23 @@ class Replayed(Forwarding):
                     f"(get_state and set_state) or read it through dew.data")
 
 
-def replayable(reader: Reader) -> Reader:
+@dataclasses.dataclass(frozen=True)
+class Replaying:
     """`reader` whose streams each report a position: as they are where they
     keep their own (`Checkpointable`), else `Replayed`."""
-    if getattr(reader, "replayable", False):
-        return reader
 
-    def opened(partition: DataPartition) -> Iterator[Batch]:
-        source = iter(reader(partition))
+    reader: Reader
+
+    def __call__(self, partition: DataPartition) -> Iterator[Batch]:
+        source = iter(self.reader(partition))
         if isinstance(source, Checkpointable):
             return source
-        return Replayed(lambda: reader(partition), source)
+        return Replayed(lambda: self.reader(partition), source)
 
-    opened.replayable = True  # type: ignore[attr-defined]
-    return opened
+
+def replayable(reader: Reader) -> Reader:
+    """`reader`, its streams positioned (`Replaying`), once."""
+    return reader if isinstance(reader, Replaying) else Replaying(reader)
 
 
 def stream_identity(stream: Iterator[Batch] | None) -> str:
