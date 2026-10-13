@@ -211,6 +211,9 @@ class CausalTransformer(nn.Module):
     norm_eps: float = 1e-5
     norm_type: Literal['rms', 'layer'] = 'rms'
     norm_bias: bool = False
+    norm_groups: int = 1
+    """The groups each RMS norm takes its statistics over (`RMSNorm.groups`), K2 Horizon's
+    `layernorm_num_groups`."""
     embedding_norm: bool = False
     """Normalize token embeddings before the first block, as BLOOM and ModernBERT do."""
     first_attention_norm: bool = True
@@ -1078,7 +1081,7 @@ class CausalTransformer(nn.Module):
             self.embedding_layernorm = decoder_norm(
                 self.norm_type, epsilon=self.norm_eps, bias=self.norm_bias,
                 scale_offset=self.scale_offset, scale_after_cast=self.scale_after_cast,
-                dtype=self.dtype)(name='embedding_layernorm')
+                dtype=self.dtype, groups=self.norm_groups)(name='embedding_layernorm')
         if self.position_embedding == 'learned':
             self.embed_positions = TokenEmbedding(
                 num_embeddings=self.position_embedding_size or self.max_seq_len,
@@ -1148,7 +1151,7 @@ class CausalTransformer(nn.Module):
         self.norm = decoder_norm(
             self.norm_type, epsilon=self.norm_eps, bias=self.norm_bias,
             scale_offset=self.scale_offset, scale_after_cast=self.scale_after_cast,
-            dtype=self.dtype)(name='norm')
+            dtype=self.dtype, groups=self.norm_groups)(name='norm')
         if self.loop is not None and self.loop.exit_gate:
             self.early_exit_gate = nn.Dense(
                 projections['early_exit_gate'][1], dtype=self.dtype, precision=self.precision,
@@ -1166,7 +1169,7 @@ class CausalTransformer(nn.Module):
             self.head_norm = decoder_norm(
                 self.norm_type, epsilon=self.norm_eps, bias=self.norm_bias,
                 scale_offset=self.scale_offset, scale_after_cast=self.scale_after_cast,
-                dtype=self.dtype)(name='head_norm')
+                dtype=self.dtype, groups=self.norm_groups)(name='head_norm')
         if self.head_bias:
             self.head_bias_value = self.param(
                 'head_bias', nn.initializers.zeros_init(), (self.vocab_size,), jnp.float32)
@@ -1245,6 +1248,7 @@ class CausalTransformer(nn.Module):
             norm_eps=self.norm_eps,
             norm_type=self.norm_type,
             norm_bias=self.norm_bias,
+            norm_groups=self.norm_groups,
             scale_offset=self.scale_offset,
             scale_after_cast=self.scale_after_cast,
             wiring=wiring,

@@ -272,6 +272,7 @@ def rms_kernel(implementation: str, x, scale, dtype, fp32_statistics: bool, *,
     return _selected('rms_norm', implementation, first_refusal(
         (not inverse_after_cast, "unweighted_rmsnorm rounds the inverse, not the normalized activation"),
         (not activated, "the norm is followed by an activation, which the kernel does not apply"),
+        (scale is None or scale.ndim == 1, "a grouped norm's weight spans its groups, one row per group"),
         (fp32_statistics, "input-dtype statistics round each reduction step; the kernel reduces in fp32"),
     ) or _norm_refusal(x, scale, dtype, axes, (branch,)))
 

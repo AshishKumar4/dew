@@ -44,18 +44,21 @@ STREAMS = ("activation_batch", "activation_length", None, "activation_embed")
 
 def decoder_norm(kind: Literal['rms', 'layer', 'fast_layer'], *, epsilon: float,
                  bias: bool, scale_offset: bool, scale_after_cast: bool,
-                 dtype: Dtype | None) -> Callable[..., nn.Module]:
+                 dtype: Dtype | None, groups: int) -> Callable[..., nn.Module]:
     """The decoder's norm factory. 'layer' keeps torch's exact variance, the
     reference decoders' formula; 'fast_layer' is flax's E[x^2] - E[x]^2
     (`dew.nn.attention.LayerNorm`), whose mean and square reduce in one pass,
-    which the vision towers run."""
+    which the vision towers run. `groups` splits an RMS norm's statistics
+    (`RMSNorm.groups`)."""
+    if groups != 1 and kind != 'rms':
+        raise ValueError(f"a {kind} norm takes its statistics over the whole axis, not {groups} groups")
     if kind == 'layer':
         return functools.partial(nn.LayerNorm, epsilon=epsilon, use_bias=bias,
                                  use_fast_variance=False, dtype=dtype)
     if kind == 'fast_layer':
         return functools.partial(LayerNorm, epsilon=epsilon, use_bias=bias, dtype=dtype)
     return functools.partial(RMSNorm, epsilon=epsilon, scale_offset=scale_offset,
-                             scale_after_cast=scale_after_cast, dtype=dtype)
+                             scale_after_cast=scale_after_cast, dtype=dtype, groups=groups)
 
 
 @runtime_checkable
@@ -548,6 +551,7 @@ class DecoderBlock(nn.Module):
     norm_eps: float = 1e-5
     norm_type: Literal['rms', 'layer', 'fast_layer'] = 'rms'
     norm_bias: bool = False
+    norm_groups: int = 1
     scale_offset: bool = False
     scale_after_cast: bool = False
     per_layer_input_dim: int = 0
@@ -636,7 +640,7 @@ class DecoderBlock(nn.Module):
         norm = decoder_norm(
             self.norm_type, epsilon=self.norm_eps, bias=self.norm_bias,
             scale_offset=self.scale_offset, scale_after_cast=self.scale_after_cast,
-            dtype=self.dtype)
+            dtype=self.dtype, groups=self.norm_groups)
         if self.wiring.parallel_residual and (
                 not self.wiring.pre_norms or self.wiring.output_norms
                 or self.feedforward is None or self.hyper_connections is not None
