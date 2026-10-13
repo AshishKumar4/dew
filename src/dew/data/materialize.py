@@ -176,7 +176,7 @@ def _memory_stages(
 ) -> Pipeline:
     derived: dict[str, str] = {}
     targets: Mapping[str, int] | None = None
-    counted = (
+    counted: dict[tuple[int, ...], int] | None = (
         dict(zip(source.identifiers, source.target_counts, strict=True))
         if isinstance(source, _Memory) and source.target_counts is not None
         else None

@@ -84,7 +84,7 @@ def _in_memory(source: Source) -> bool:
     return isinstance(source, Memory)
 
 
-def _selection(source: Source, replacement: Source) -> Source:
+def _selection(source: Source | Mixture | Phases, replacement: Source) -> Source:
     """The holdout selections of `source` around its replacement."""
     from dew.data.holdout import _HashSource, _SliceRecords
 
