@@ -40,6 +40,7 @@ from jax.tree_util import Partial
 from typing_extensions import TypeIs, TypeVar
 
 from dew.artifacts import Artifact, Artifacts, TokenScores
+from dew.nn.precision import compensated_sum
 from dew.records import JSON
 
 if TYPE_CHECKING:
@@ -422,35 +423,6 @@ def _ruled_jvp(primals, tangents):
     return value, moved_value + sum(jnp.vdot(leaf, change) for leaf, change in
                                     zip(jax.tree.leaves(rule), jax.tree.leaves(moved), strict=True))
 
-
-
-def compensated_sum(values: jax.Array, axes: tuple[int, ...]) -> jax.Array:
-    """The sum of `values` over `axes`, rounded once: neighbours added in pairs, then those sums in
-    pairs, each addition's rounding error kept exactly (Knuth's two-sum) and added back at the end.
-
-    One XLA reduction over a loss's every axis rounds as it goes; on 6144 JEPA squares it left the
-    sum one float32 step above the correctly rounded one, and the loss a float32 ulp from float64,
-    where numpy's float32 mean of the same squares was correctly rounded. A narrower float adds in
-    float32 and returns in its own dtype, as `jnp.sum` does; an integer sum is `jnp.sum`'s. Each
-    rounding error's derivative is zero, so the gradient is `jnp.sum`'s."""
-    if not jnp.issubdtype(values.dtype, jnp.floating):
-        return jnp.sum(values, axes)
-    kept = [axis for axis in range(values.ndim) if axis not in axes]
-    flat = jnp.transpose(values, (*kept, *axes)).reshape(*(values.shape[axis] for axis in kept), -1)
-    flat = flat.astype(jnp.promote_types(flat.dtype, jnp.float32))
-    if not flat.shape[-1]:
-        return jnp.zeros(flat.shape[:-1], values.dtype)
-    errors = jnp.zeros_like(flat)
-    while flat.shape[-1] > 1:
-        if flat.shape[-1] % 2:
-            flat, errors = (jnp.concatenate([part, jnp.zeros((*part.shape[:-1], 1), part.dtype)], axis=-1)
-                            for part in (flat, errors))
-        left, right = flat[..., 0::2], flat[..., 1::2]
-        flat = left + right
-        moved = flat - left
-        rounding = (left - (flat - moved)) + (right - moved)
-        errors = errors[..., 0::2] + errors[..., 1::2] + rounding
-    return (flat[..., 0] + errors[..., 0]).astype(values.dtype)
 
 
 class Objective(ABC, Generic[Loss, Effects]):
