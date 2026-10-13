@@ -260,16 +260,11 @@ def test_a_host_step_written_after_a_device_step_is_refused_in_every_spelling():
 
     rows = Memory([{"image": np.zeros((16, 16, 3), np.uint8)} for _ in range(8)])
     keyed = rows.random_map(images.augmentation_key()).repeat().batch(4)
-    for chain in (keyed.map(images.device_augment(12), remember),
-                  keyed.map(images.device_augment(12)).map(remember)):
-        with pytest.raises(ValueError):
-            loader_of(chain)
-        with pytest.raises(ValueError):
-            next(chain.iterate())
-    assert loader_of(keyed.map(remember).map(images.device_augment(12))).device
-
-
-def loader_of(chain):
+    with pytest.raises(ValueError):
+        keyed.map(images.device_augment(12), remember)
+    augmented = keyed.map(images.device_augment(12))
+    with pytest.raises(ValueError):
+        augmented.map(remember)
     from dew.data.compile import compile
 
-    return compile(chain, read="memory", loading=READ)
+    assert compile(keyed.map(remember).map(images.device_augment(12)), read="memory", loading=READ).device

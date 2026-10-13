@@ -436,6 +436,14 @@ class Dataset:
             hosts = [step for step in steps if _host(step)]
             if len(hosts) < len(steps):
                 raise TypeError("after batch, map takes functions of the training batch that keep every row")
+            # A device step runs in the compiled training step, after every host step the reader runs:
+            # a host step written after one would read what it had not yet made. The objective's own
+            # batch steps read the fields it leaves alone, and attach after it (`compile`).
+            written = [stage.step for stage in self.chain().stages if isinstance(stage, MapBatch)] + hosts
+            first = next((index for index, step in enumerate(written) if isinstance(step, DeviceStep)), None)
+            if first is not None and not all(isinstance(step, DeviceStep) for step in written[first:]):
+                raise ValueError(f"{type(written[first]).__name__} runs in the compiled training step, after "
+                                 "every host step of the batch; map the host steps before it")
             return self.then(*(MapBatch(step, identity) for step in hosts))
         if batched:
             return self.then(*(Batched(step, batch_size, identity) for step in _columns(steps)))

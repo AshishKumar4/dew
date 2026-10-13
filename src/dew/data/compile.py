@@ -543,10 +543,6 @@ def _batch_steps(pipeline: Pipeline) -> tuple[tuple[HostStep, ...], tuple[Device
     """The training batch's steps: those the reader runs on the host, then
     those the compiled step runs on the accelerator (`DeviceStep`)."""
     steps = [stage.step for stage in pipeline.stages if isinstance(stage, MapBatch)]
-    device = [index for index, step in enumerate(steps) if isinstance(step, DeviceStep)]
-    if device and any(not isinstance(step, DeviceStep) for step in steps[device[0]:]):
-        raise ValueError(f"{type(steps[device[0]]).__name__} runs in the compiled training step, after "
-                         "every host step of the batch; map the host steps before it")
     return (tuple(step for step in steps if not isinstance(step, DeviceStep)),
             tuple(step for step in steps if isinstance(step, DeviceStep)))
 
