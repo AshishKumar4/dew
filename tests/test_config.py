@@ -280,7 +280,7 @@ def _data(records=48, batch=8):
 
 
 def test_a_run_records_its_token_budget_and_final_checkpoint_policy(tmp_path):
-    config = TrainerConfig(total_tokens=30, checkpoint_final=False, batch_size=8,
+    config = TrainerConfig(tokens=30, checkpoint_final=False, batch_size=8,
                            checkpoint_dir=str(tmp_path), eval_every=None, checkpoint_every=None)
     run = RunConfig(trainer=config)
     assert RunConfig.from_dict(run.to_dict()).trainer == config
