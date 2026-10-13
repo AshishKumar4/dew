@@ -37,10 +37,10 @@ class _MLP(nn.Module):
         layer's replayed ones (`RoutesExperts`)."""
         return isinstance(self.feedforward, RoutesExperts) and self.feedforward.routes_experts
 
-    def __call__(self, x, decode: bool = False, positions=None, segment_ids=None, kv_store=None,
-                 attention_metadata=None, routes: Routes | None = None):
+    def __call__(self, x, decode: bool = False, kv_store=None, attention_metadata=None,
+                 routes: Routes | None = None):
         # Tokenwise: no position, document, cache or metadata changes what an MLP computes.
-        del decode, positions, segment_ids, kv_store, attention_metadata
+        del decode, kv_store, attention_metadata
         if isinstance(self.feedforward, RoutesExperts) and self.feedforward.routes_experts:
             return self.feedforward(x, routes=routes)
         return self.feedforward(x)

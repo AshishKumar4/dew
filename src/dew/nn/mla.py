@@ -36,7 +36,7 @@ from dew.nn.attention import (
     scaled_dot_product_attention,
 )
 from dew.nn.flops import MissingFlopsCount, attention_flops, projection_flops
-from dew.nn.inputs import AttentionMetadata
+from dew.nn.inputs import AttentionMetadata, coordinates_of
 from dew.nn.kv_cache import KVCache, write_cache
 
 # dsa_kpool reads INDEXER and the expanded cache below. Reading the registry
@@ -489,12 +489,13 @@ class MultiHeadLatentAttention(nn.Module):
         return jnp.concatenate([nope, rot], axis=-1), values
 
     @nn.compact
-    def __call__(self, x, decode: bool = False,
-                 positions=None, segment_ids=None, kv_store=None,
+    def __call__(self, x, decode: bool = False, kv_store=None,
                  attention_metadata: AttentionMetadata | None = None):
         causal, mask, objective = self.causal, None, None
         implementation = self.attention_impl
-        _, length, _ = x.shape
+        batch, length, _ = x.shape
+        tokens = coordinates_of(attention_metadata, batch, length)
+        positions, segment_ids = tokens.positions, tokens.segments
         valid = None if attention_metadata is None else attention_metadata.valid
         if attention_metadata is not None and attention_metadata.rotary_positions is not None:
             raise ValueError("MLA does not implement multi-axis rotary positions")

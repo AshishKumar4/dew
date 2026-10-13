@@ -91,7 +91,9 @@ def test_auto_under_a_window_or_packing_takes_the_reference_path(layer, argument
         x = jax.random.randint(jax.random.key(0), (2, 16), 0, 64)
     else:
         x = jax.random.normal(jax.random.key(0), (2, 16, 32))
-    call = {} if layer == "window" else {"segment_ids": PACKED}
+    call = {} if layer == "window" else {
+        "segment_ids": PACKED} if layer == "packed" else {
+        "attention_metadata": AttentionMetadata(coordinates=coordinates(segments=PACKED))}
     if layer == "kpool":
         call = {"attention_metadata": AttentionMetadata(coordinates=coordinates(valid=PACKED != 0))}
     variables = LAYERS[layer](**arguments).init(jax.random.key(1), x, **call)
