@@ -12,9 +12,11 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
+from model_support import TINY_DECODER
 from reference_error import assert_as_exact_as_the_reference
 
 from dew.nn.attention import cudnn_attention, scaled_dot_product_attention
+from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.kernels import bf16_dot_runs
 from dew.nn.kv_cache import (
     KVCache,
@@ -22,6 +24,7 @@ from dew.nn.kv_cache import (
     _gather_pages,
     _gpu_paged,
     hadamard,
+    overflowed,
     quantize,
     rotated,
     write_cache,
@@ -203,3 +206,26 @@ def test_a_pool_split_into_groups_reads_what_each_row_wrote():
     grouped = TextGeneration(model(KVCache(page_size=16, groups=2)), params, sampling=Sampling(temperature=0))
     dense = TextGeneration(model(KVCache()), params, sampling=Sampling(temperature=0))
     np.testing.assert_array_equal(grouped(prompts, 40, key=0).tokens, dense(prompts, 40, key=0).tokens)
+
+
+def test_a_cursor_past_capacity_marks_the_row_whose_appends_overflowed():
+    """Two rows decoded through a cache of 16: a prompt of 12 real tokens then 6 single steps
+    asks the first row's cache for 18 slots, the second's 5 real tokens and the same steps 11. The
+    first row's last two keys were dropped; `overflowed` names that row alone, and neither before
+    the steps that passed it."""
+    model = CausalTransformer(vocab_size=32, **TINY_DECODER)
+    tokens = jnp.arange(24).reshape(2, 12) % 32
+    valid = jnp.arange(12)[None] < jnp.asarray([[12], [5]])
+    params = model.init(jax.random.key(0), tokens)
+    cache = model.apply(params, 2, method=CausalTransformer.init_cache, mutable=["cache"])[1]["cache"]
+    _, updated = model.apply({**params, "cache": cache}, tokens, attention_mask=valid, decode=True,
+                             mutable=["cache"])
+    cache = updated["cache"]
+    seen = []
+    for step in range(6):
+        _, updated = model.apply({**params, "cache": cache}, tokens[:, step:step + 1], decode=True,
+                                 mutable=["cache"])
+        cache = updated["cache"]
+        seen.append(np.asarray(overflowed(cache, model.max_seq_len)).tolist())
+    assert seen[:4] == [[False, False]] * 4
+    assert seen[4:] == [[True, False]] * 2
