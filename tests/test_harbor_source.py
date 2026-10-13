@@ -340,8 +340,8 @@ def test_waiting_for_the_gateway_does_not_block_close_or_cancel(tmp_path, harbor
                           ready_timeout=3.0, ready_poll=0.01)
     waiting = threading.Thread(
         target=lambda: pytest.raises(
-            RuntimeError, source.submit, Task("hello", {HARBOR_KEY: str(tmp_path / "task")}), 1, version=0
-        )
+            RuntimeError, source.submit, Task("hello", {HARBOR_KEY: str(tmp_path / "task")}), 1, version=0,
+            key=KEY)
     )
     waiting.start()
     time.sleep(0.3)
