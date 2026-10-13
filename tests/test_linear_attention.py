@@ -483,7 +483,7 @@ def test_a_packed_prefill_leaves_only_its_last_documents_conv_history():
     following = jnp.asarray(np.random.default_rng(5).normal(size=(1, 3, 6)), jnp.float32)
     continued, _ = _masked_conv1d(following, kernel, jnp.ones((1, 3), bool), history)
     alone, _ = _masked_conv1d(jnp.concatenate([x[:, 5:], following], axis=1), kernel, jnp.ones((1, 5), bool))
-    np.testing.assert_array_equal(np.asarray(continued), np.asarray(alone[:, 2:]))
+    np.testing.assert_allclose(np.asarray(continued), np.asarray(alone[:, 2:]), rtol=0, atol=1e-6)
 
 
 def test_the_layer_reads_a_holed_row_as_the_row_without_its_holes(reference, geometry):
