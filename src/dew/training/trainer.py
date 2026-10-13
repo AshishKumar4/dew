@@ -106,9 +106,13 @@ from dew.training.distributed import (
     Layout,
     MeshSpec,
     Placement,
+    Signature,
+    batch_layout,
     batch_shardings,
+    batch_signature,
     check_batch,
     check_stream,
+    device_fields,
     link_bandwidth,
     microbatch,
     microbatch_shapes,
@@ -168,24 +172,6 @@ step's microbatches were accepted, and the transaction's commit telemetry (None 
 
 Loss = DefaultTypeVar("Loss", default=Ratio | jax.Array | float)
 Effects = DefaultTypeVar("Effects", default=None)
-
-Shapes = tuple[tuple[int, ...], ...]
-"""A batch's leaf shapes in tree order, the key a compiled step is held
-under. A fixed batch has one; a ramped batch has one per stage of its ramp,
-each compiled on the first step that reads it."""
-
-
-def batch_shapes(batch: Batch) -> Shapes:
-    """List a batch's leaf shapes in tree order."""
-    return tuple(np.shape(leaf) for leaf in jax.tree.leaves(batch))
-
-
-def batch_layout(batch: Batch) -> str:
-    """A batch's fields, each with its dtype and global shape; the batch may be
-    arrays or their abstract shapes (`jax.ShapeDtypeStruct`)."""
-    return ", ".join(f"{jax.tree_util.keystr(path)} {jnp.result_type(leaf)}{list(np.shape(leaf))}"
-                     for path, leaf in jax.tree_util.tree_leaves_with_path(batch))
-
 
 class Rollout(Protocol):
     """Produces a batch on the host, before the compiled step reads it.
@@ -1493,9 +1479,10 @@ class Trainer(Generic[Loss, Effects]):
         interval = Interval(time.time(), last_saved=(
             int(state.step) if checkpoints is not None and checkpoints.latest is not None else None),
             tokens_before_log=int(run.stop_control.pop("tokens", 0)))
-        if self._opened(plan, run, interval, state, position):
+        if self._opened(plan, run, interval, state, position,
+                        resumed=initial is None and interval.last_saved is not None):
             return state
-        compiled: dict[Shapes, tuple[CompiledStep, StepFlops | None]] = {}
+        compiled: dict[Signature, tuple[CompiledStep, StepFlops | None]] = {}
         seen = 0
         run.notice = PreemptionNotice()
         while not plan.finished(run.current, interval.real_tokens if plan.tokens is not None else 0):
@@ -1522,14 +1509,15 @@ class Trainer(Generic[Loss, Effects]):
                 if self.rollout is not None:
                     batch, sampled = self._rolled_out(state, batch)
                     interval.rollout_seconds += sampled
+                device = device_fields(batch)
                 inputs = self.objective.inputs
                 if not compiled and self.rollout is None and inputs is not None:
                     # A rollout writes the batch its loss reads, from prompts it reads itself.
                     # The objective reads the batch its device steps make (`_model_batch`).
-                    checked = self._model_shapes(batch) if self._device else batch
+                    checked = self._model_shapes(device) if self._device else device
                     agreed("training input declaration", functools.partial(inputs.check, checked))
                 known, began = len(compiled), time.perf_counter()
-                train_step, measured_flops, state = self._compiled_for(compiled, state, batch)
+                train_step, measured_flops, state = self._compiled_for(compiled, state, device)
                 interval.compiles = len(compiled)
                 if not known:
                     # Rebound once the step is compiled, so the first tick
@@ -1541,7 +1529,7 @@ class Trainer(Generic[Loss, Effects]):
                     # reports that time apart from its steps'.
                     interval.compiling += time.perf_counter() - began
                 with region("train.step"):
-                    state, loss, aux, finite, accepted, committed = train_step(state, batch)
+                    state, loss, aux, finite, accepted, committed = train_step(state, device)
                 if self._unproven:
                     # A step's failure on the devices surfaces at the next
                     # program that reads its outputs, the loss counters, so a
@@ -1617,10 +1605,12 @@ class Trainer(Generic[Loss, Effects]):
         run.other += time.perf_counter() - paused
         return self._reported_outcome(error, run)
 
-    def _opened(self, plan: _FitPlan, run: _FitRun, interval: Interval, state: TrainState, position) -> bool:
+    def _opened(self, plan: _FitPlan, run: _FitRun, interval: Interval, state: TrainState, position, *,
+                resumed: bool) -> bool:
         """Start `fit` from the placed state: report it, refuse a run already
-        past its steps or a checkpoint cadence with no checkpointer, and open
-        the training stream on its prefetch worker. Returns whether the run
+        past its steps, a checkpoint cadence with no checkpointer or a resume
+        its stream cannot continue, and open the training stream on its
+        prefetch worker. Returns whether the run
         is already complete, a checkpoint at its last step having been
         written, so there is nothing to do."""
         mesh, checkpoints, steps = self.device_mesh, self.checkpoints, plan.steps
@@ -1653,9 +1643,7 @@ class Trainer(Generic[Loss, Effects]):
             run.source = plan.dataset.train(partition)
             check_stream(run.source, mesh, self.mesh, plan.dataset.batch,
                          self.accumulation * (self._split or 1), rows=self.rollout is None,
-                         checkpointing=bool(plan.checkpoint_every or plan.local_every or (
-                             checkpoints is not None and plan.cadenced and plan.best and
-                             any(not choice.weights_only for choice in plan.best))))
+                         resumed=current if resumed and position is None else None)
             if isinstance(run.source, RampedStream):
                 # Each stage's batch is read whole: no plan splits a ramp's.
                 self._split = 1
@@ -2087,30 +2075,33 @@ class Trainer(Generic[Loss, Effects]):
         batch = shard_batch(self.device_mesh, self._counted_batch(self.rollout(state, batch, key)))
         return batch, time.perf_counter() - began
 
-    def _compiled_for(self, compiled: dict[Shapes, tuple[CompiledStep, StepFlops | None]], state: TrainState,
-                      batch: Batch) -> tuple[CompiledStep, StepFlops | None, TrainState]:
-        """Return the step compiled for this batch's shapes, compiling on first sight, and the state
-        to step, a fresh copy where the plan timed steps on it (`Timer`).
+    def _compiled_for(self, compiled: dict[Signature, tuple[CompiledStep, StepFlops | None]],
+                      state: TrainState, batch: Batch) -> tuple[CompiledStep, StepFlops | None, TrainState]:
+        """Return the step compiled for this batch's abstract signature (`batch_signature`),
+        compiling on first sight, and the state to step, a fresh copy where the plan timed steps
+        on it (`Timer`).
 
         A ramped run reads a new shape at every stage, so `compiled` keeps
-        one step per stage with the FLOPs measured for it.
+        one step per stage with the FLOPs measured for it. A batch whose
+        dtype, fields or a node's static field change at the same shapes is
+        another program, compiled as one: an executable refuses it.
         """
         timer = Timer(state, batch)
-        shapes = batch_shapes(batch)
-        if shapes not in compiled:
+        signature = batch_signature(batch)
+        if signature not in compiled:
             # A process whose reader changed a field or a shape would compile
             # a program whose collectives its peers' never meet.
             agreed_same("training batch layout", lambda: batch_layout(batch))
             began = time.perf_counter()
             with region("compile"):
-                compiled[shapes] = (self.compile(state, batch, timer), self.step_flops)
+                compiled[signature] = (self.compile(state, batch, timer), self.step_flops)
             seconds = time.perf_counter() - began
             links = {axis: AxisLink(link.bytes_per_second, link.spread)
                      for axis, link in self.links.items()}
             self._report(StepCompiled(seconds, recompute_record(self.objective), links, self.memory,
                                       self.plan), int(timer.state.step))
             self._unproven = True
-        return (*compiled[shapes], timer.state)
+        return (*compiled[signature], timer.state)
 
     def _saved_checkpoint(
         self,
@@ -2139,11 +2130,12 @@ class Trainer(Generic[Loss, Effects]):
             metadata.setdefault('train/loss', float(jax.device_get(interval.book.loss) / interval.steps))
             if not ranking and training_best:
                 ranking = (Ranking('train/loss', metadata['train/loss']),)
-        checkpoints.save(step, state, position, metadata, share=DataPartition.of(self.device_mesh),
-                         ranking=ranking, control={**(control or {}), "tokens": interval.real_tokens},
-                         weights_only=weights_only,
-                         rung=self._checkpoint_rung(), artifact=self._artifact(), boxed=self._boxed_axes())
-        self._report(CheckpointRequested(checkpoints.directory), step)
+        write = functools.partial(
+            checkpoints.save, step, state, position, metadata, share=DataPartition.of(self.device_mesh),
+            ranking=ranking, control={**(control or {}), "tokens": interval.real_tokens},
+            weights_only=weights_only, rung=self._checkpoint_rung(), artifact=self._artifact(),
+            boxed=self._boxed_axes())
+        self._report(CheckpointRequested(checkpoints.directory), step, write)
         interval.saved(step)
         self._display.status("")
         return time.perf_counter() - paused
@@ -2164,11 +2156,11 @@ class Trainer(Generic[Loss, Effects]):
         is the one a restarted node reads back, not the run's record."""
         paused = time.perf_counter()
         self._display.status("writing a local checkpoint")
-        checkpoints.save_local(step, state, position, share=DataPartition.of(self.device_mesh),
-                               control={**(control or {}), "tokens": interval.real_tokens},
-                               rung=self._checkpoint_rung(), artifact=self._artifact(),
-                               boxed=self._boxed_axes())
-        self._report(CheckpointRequested(str(checkpoints.local_directory), local=True), step)
+        write = functools.partial(
+            checkpoints.save_local, step, state, position, share=DataPartition.of(self.device_mesh),
+            control={**(control or {}), "tokens": interval.real_tokens}, rung=self._checkpoint_rung(),
+            artifact=self._artifact(), boxed=self._boxed_axes())
+        self._report(CheckpointRequested(str(checkpoints.local_directory), local=True), step, write)
         self._display.status("")
         return time.perf_counter() - paused
 
@@ -2297,13 +2289,18 @@ class Trainer(Generic[Loss, Effects]):
                 error.add_note(f'Reporting fit outcome failed: {failure!r}')
         return error
 
-    def _report(self, value: Record, step: int) -> None:
+    def _report(self, value: Record, step: int, after: Callable[[], None] | None = None) -> None:
         """Hand one record to the tracker on rank zero, then agree with the pool.
 
         The record's type names the phase, so a rank that failed to report is
         heard about at the report the pool was making, not at the next
-        collective."""
+        collective. `after` is the work the record reports, run first inside
+        the same agreement: a rank whose work fails after its own coordination
+        rounds (a checkpoint's position gather, then its write) meets its
+        peers at this report, rather than skip it while they wait there."""
         def send() -> None:
+            if after is not None:
+                after()
             if jax.process_index() == 0 and self.tracker is not None:
                 self.tracker.artifact(value, step)
 

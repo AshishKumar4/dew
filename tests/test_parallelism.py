@@ -21,7 +21,7 @@ from sharded import assert_sharded
 from dew.artifacts import Representations
 from dew.config.data import loader
 from dew.data import Loading
-from dew.data.dataset import DataPartition, Loader
+from dew.data.dataset import DataPartition, Loader, replayed
 from dew.inputs import unit_range
 from dew.nn.backbones.dit import SimpleDiT
 from dew.objectives.base import Aux, EMASpec, Objective
@@ -391,16 +391,15 @@ def test_a_checkpoint_restores_across_the_whole_fsdp_range(tmp_path, written, re
             assert leaf.addressable_shards[0].data.size == leaf.size // restored
 
 
-def test_a_checkpoint_without_a_position_resumes_from_the_top_of_the_stream(tmp_path):
-    """A stream without get_state writes no position; a resume from that
-    checkpoint restores the state and reads the stream from its start."""
-    make_trainer(tmp_path).fit(
-        Loader(lambda partition: batches(), None, batch=BATCH, records=None), steps=1, log_every=1)
+def test_a_checkpoint_without_a_position_does_not_resume_from_the_top_of_the_stream(tmp_path):
+    """A stream without get_state writes no position, and a resume from that
+    checkpoint, which would read the stream again from its start, is refused."""
+    stream = Loader(lambda partition: batches(), None, batch=BATCH, records=None)
+    make_trainer(tmp_path).fit(stream, steps=1, log_every=1)
     _, position = Checkpoints(str(tmp_path)).restore(share=DataPartition())
     assert position is None
-    resumed = make_trainer(tmp_path).fit(
-        Loader(lambda partition: batches(), None, batch=BATCH, records=None), steps=2, log_every=1)
-    assert int(resumed.step) == 2
+    with pytest.raises(ValueError, match="holds no data position"):
+        make_trainer(tmp_path).fit(stream, steps=2, log_every=1)
 
 
 # --------------------------------------------------------------------------
@@ -465,12 +464,12 @@ def test_a_resume_inside_an_accumulation_window_keeps_the_ema_clock(tmp_path):
     cut = accum * updates + 1
 
     whole = make_accumulating(tmp_path / "whole", accum).fit(
-        Loader(lambda partition: batches(), None, batch=BATCH, records=None), steps=total)
+        Loader(replayed(lambda partition: batches()), None, batch=BATCH, records=None), steps=total)
     interrupted = make_accumulating(tmp_path / "split", accum).fit(
-        Loader(lambda partition: batches(), None, batch=BATCH, records=None), steps=cut)
+        Loader(replayed(lambda partition: batches()), None, batch=BATCH, records=None), steps=cut)
     assert int(interrupted.microstep) % accum == 1, "the cut is not mid-window"
     resumed = make_accumulating(tmp_path / "split", accum).fit(
-        Loader(lambda partition: batches(), None, batch=BATCH, records=None), steps=total)
+        Loader(replayed(lambda partition: batches()), None, batch=BATCH, records=None), steps=total)
 
     assert int(resumed.step) == int(whole.step) == total
     assert moved(snapshot(whole.variables), snapshot(whole.ema))
