@@ -60,7 +60,6 @@ from .deepseek_v41 import (
     DeepseekV41Projector as DeepseekV41Projector,
     DeepseekV41ProjectorModule as DeepseekV41ProjectorModule,
     DeepseekV41Vision as DeepseekV41Vision,
-    DeepseekV41VisionTransformer as DeepseekV41VisionTransformer,
     deepseek_v41_vision_path,
 )
 from .gemma3n import (
