@@ -42,11 +42,15 @@ def audited(event, args):
         spawned.add(running[-1])
 
 
-def pytest_configure(config):
-    sys.monitoring.use_tool_id(TOOL, "dew-test-cache")
-    sys.monitoring.register_callback(TOOL, sys.monitoring.events.PY_START, started)
-    sys.monitoring.set_events(TOOL, sys.monitoring.events.PY_START)
-    sys.addaudithook(audited)
+# Recording starts as `-p executed` imports this, before pytest loads the initial conftests, which
+# import Dew; repository modules imported even earlier join what every file shares.
+shared.update(name[len(root):] for module in list(sys.modules.values())
+              if (name := getattr(module, "__file__", None) or "").startswith(root) and name.endswith(".py")
+              and "site-packages" not in name)
+sys.monitoring.use_tool_id(TOOL, "dew-test-cache")
+sys.monitoring.register_callback(TOOL, sys.monitoring.events.PY_START, started)
+sys.monitoring.set_events(TOOL, sys.monitoring.events.PY_START)
+sys.addaudithook(audited)
 
 
 @pytest.hookimpl(hookwrapper=True)
