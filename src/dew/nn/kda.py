@@ -205,6 +205,8 @@ class KimiDeltaAttentionMixer(MixerBase):
     window and the forget gate's lower bound (configuration_glm5_next.py:143-146),
     and Kimi K3's `use_full_rank_gate` output gate."""
 
+    residuals = ('context', 'conv', 'delta_decay', 'delta_inverse')
+
     linear_num_heads: int = 64
     linear_head_dim: int = 128
     linear_conv_kernel_dim: int = 4
