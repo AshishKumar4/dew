@@ -6,12 +6,16 @@ import importlib.util
 import json
 import math
 import sys
+from collections.abc import Mapping
 from pathlib import Path
 
 import pytest
 
+from dew.config.data import Split, loader
+from dew.data import Loading, Memory
+from dew.data.dataset import DataPartition
 from dew.data.text import HFTokenizer
-from dew.decision import Choice, Decide, DecisionTable, Example, Noul
+from dew.decision import Choice, Decide, DecisionObjective, Decisions, Example, JointLayout, Noul
 from dew.decision.config import DecisionRunConfig
 from dew.decision.scoring import ScoringRule
 from dew.registry import from_record
@@ -32,15 +36,16 @@ def test_a_csv_fine_tunes_a_laya_checkpoint_into_a_calibrated_run(tmp_path):
         writer.writerows(tickets)
     # The command line `laya-train --data tickets.csv` is, with this run's sizes.
     config = DecisionRunConfig.cli([
-        "--data.path", str(table), "--data.held-out", "0.5", "--data.question", "team",
-        "--data.loading.workers", "0", "--pretrained", str(TINY), "--objective.loss", json.dumps(
+        "--data.source", str(table), "--data.validation", json.dumps({"class": "dew.data.holdout:HoldOut",
+            "fields": {"fraction": 0.5, "by": "random", "most": 400}}), "--data.question", "team",
+        "--loading.workers", "0", "--pretrained", str(TINY), "--objective.loss", json.dumps(
             {"class": "dew.decision.scoring:Combined",
              "fields": {"terms": [[1.0, {"class": "log_loss"}], [0.5, {"class": "brier"}]]}}),
         "--trainer.name", "tickets", "--trainer.checkpoint-dir", str(tmp_path / "runs"),
         "--trainer.batch-size", "8", "--trainer.steps", "2", "--trainer.eval-every", "2",
         "--trainer.checkpoint-every", "2", "--trainer.log-every", "1", "--trainer.multi-host", "False",
         "--trainer.compilation-cache-dir", "None", "--model.dtype", "float32"])
-    assert isinstance(config.data, DecisionTable)
+    assert isinstance(config.data, Decisions)
     assert from_record(ScoringRule, config.objective.fields["loss"]).name == "log_loss+0.5*brier"
     config.run()
     run = tmp_path / "runs" / "tickets"
@@ -96,11 +101,44 @@ def _mixture(tmp_path: Path, rows: list[dict], evaluated: list[str], held: int) 
     return out
 
 
-def _flags(mixture: Path, runs: Path) -> list[str]:
-    return ["--mixture.root", str(mixture), "--trainer.name", "run", "--trainer.checkpoint-dir", str(runs),
-            "--trainer.batch-size", "8", "--trainer.steps", "2", "--trainer.eval-every", "2",
+@dataclasses.dataclass(frozen=True)
+class _NamedSplits(Memory):
+    """Memory rows with native named splits, as a Hub or TFDS source has them."""
+
+    splits: Mapping[str, tuple] = dataclasses.field(default_factory=dict)
+
+    def with_split(self, name: str) -> "_NamedSplits":
+        return dataclasses.replace(self, values=self.splits[name])
+
+
+def test_a_named_validation_split_reads_the_source_s_own_split():
+    """`Split("validation")` opens the training source's own named split through its
+    `with_split`, as every recipe opens one, and a source with no native splits refuses it."""
+    train = tuple({"text": f"train {index}", "label": "ab"[index % 2]} for index in range(4))
+    held = tuple({"text": f"held {index}", "label": "a"} for index in range(2))
+    named = _NamedSplits(train, splits={"train": train, "validation": held})
+    _, evaluated, _ = Decisions(source=named, validation=Split("validation"), question="team").pipelines()
+    assert list(evaluated.source.source.records("memory")) == list(held)
+    with pytest.raises(ValueError):
+        Decisions(source=Memory(train), validation=Split("validation"), question="team").pipelines()
+
+
+def test_a_decision_mixture_from_its_manifest_reads_by_index_by_default(tmp_path):
+    """The produced mixture states an offset index for each set, so a run that
+    states no read reads it by index rather than loading it whole."""
+    mixture = _mixture(tmp_path, _requests(24, joint=False), [], held=4)
+    loaded = loader(Decisions(str(mixture)), batch=4, read=DecisionRunConfig.data_read,
+                  loading=Loading(workers=0))
+    assert loaded.plan is not None and loaded.plan.order["read"] == "indexed"
+
+
+def _flags(mixture: Path, runs: Path, *, tokens: int | None = None) -> list[str]:
+    return ["--data.source", str(mixture), "--trainer.name", "run", "--trainer.checkpoint-dir", str(runs),
+            "--trainer.batch-size", "8" if tokens is None else "None",
+            "--trainer.batch-tokens", str(tokens), "--trainer.update-tokens", str(tokens),
+            "--trainer.steps", "2", "--trainer.eval-every", "2",
             "--trainer.checkpoint-every", "2", "--trainer.log-every", "1", "--trainer.multi-host", "False",
-            "--trainer.compilation-cache-dir", "None", "--data.loading.workers", "0",
+            "--trainer.compilation-cache-dir", "None", "--loading.workers", "0",
             "--model.dtype", "float32", "--optim.schedule.warmup-steps", "1", "--revision", "None"]
 
 
@@ -153,7 +191,8 @@ def test_the_encoder_recipe_trains_a_fresh_head_on_a_decontaminated_mixture(tmp_
     assert scored["sources"]["rows"]["rows"] == made["rows"]["rows"]["held"]
     assert scored["sources"]["hard"]["rows"] == 2
     for source, metrics in scored["sources"].items():
-        assert set(metrics) == {"rows", "questions", "log_loss", "infinite", "accuracy"}
+        assert set(metrics) == {"rows", "unfit", "questions", "log_loss", "infinite", "accuracy"}
+        assert metrics["unfit"] == 0
         expected = []
         for line in (mixture / f"{source}.held.jsonl").read_text().split("\n")[:-1]:
             example = Example.of(json.loads(line))
@@ -168,12 +207,39 @@ def test_the_encoder_recipe_trains_a_fresh_head_on_a_decontaminated_mixture(tmp_
             sum(value[metric] for value in scored["sources"].values()) / 2)
 
 
+def test_the_clef_recipe_defaults_build_token_budget_batches():
+    import itertools
+
+    run = _module("clef").run_config()
+    trainer = run.trainer.derived()
+    assert trainer.batch_size is None
+    assert trainer.batch_tokens == trainer.update_tokens == 16_384
+    assert trainer.accumulation == 1 and run.bucket_lengths == ()
+    choice = Choice("Which?", ["first", "second"])
+    examples = [Example("x" * size, {"team": choice}, {"team": 0})
+                for size in (160, 768, 1_536, 3_072)] * 64
+    objective = DecisionObjective(Decide.from_pretrained(TINY), layout=JointLayout(max_len=run.max_len),
+                                  shuffle_options=False)
+    data = loader(Decisions(source=examples), batch=trainer.batch_size, tokens=trainer.batch_tokens,
+                  lengths=run.bucket_lengths, objective=objective.data(), read="memory",
+                  loading=Loading(workers=0))
+    assert data.batch_tokens == 16_384
+    stream = data.train(DataPartition())
+    try:
+        batches = list(itertools.islice(stream, 8))
+    finally:
+        stream.close()
+    assert len({batch["tokens"].shape[1] for batch in batches}) <= 6
+    assert all(batch["tokens"].shape[0] * batch["tokens"].shape[1] == 16_384 for batch in batches)
+
+
 @pytest.mark.parametrize("param_dtype", ["float32", "bfloat16"])
 def test_the_clef_recipe_trains_a_joint_head_under_lora_on_a_frozen_decoder(tmp_path, param_dtype):
     """The Clef recipe end to end on the tiny Qwen 3.5: LoRA on its attention,
     Gated DeltaNet and MLP projections, a fresh joint head reading every
     question of a row; an example whose questions alone pass the row's 1,024
-    tokens is dropped and counted; the run reloads as a task."""
+    tokens is dropped and counted, by training and by the held-out scorer
+    alike; the run reloads as a task."""
     from flax.traverse_util import flatten_dict
 
     from dew.objectives.base import FROZEN
@@ -184,13 +250,23 @@ def test_the_clef_recipe_trains_a_joint_head_under_lora_on_a_frozen_decoder(tmp_
     mixture = _mixture(tmp_path, rows, ["nothing these rows share at all"], held=8)
     clef = _module("clef")
     storage = [] if param_dtype == "float32" else ["--param-dtype", param_dtype]
-    config = DecisionRunConfig.cli([*_flags(mixture, tmp_path / "runs"), "--pretrained", str(QWEN),
+    flags = _flags(mixture, tmp_path / "runs", tokens=8192)
+    flags[:0] = ["--data-read", "memory"]
+    config = DecisionRunConfig.cli([*flags, "--pretrained", str(QWEN),
                                     "--lora.rank", "4", "--head.width", "24", "--head.heads", "2",
                                     "--head.feedforward", "40", "--head.layers", "1",
                                     "--head.routing-layers", "1", "--max-len", "1024", *storage],
                                    default=clef.run_config())
     config.run()
-    assert sum(_summary(tmp_path / "runs" / "run")["unfit"].values()) == 1
+    unfit = _summary(tmp_path / "runs" / "run")["unfit"]
+    assert sum(unfit.values()) == 1
+    made = json.loads((mixture / "mixture.json").read_text())
+    (mixture / "long.held.jsonl").write_text("".join(json.dumps(row) + "\n" for row in (rows[1], rows[-1])))
+    made["rows"]["long"] = {"train": 0, "held": 2}
+    (mixture / "mixture.json").write_text(json.dumps(made))
+    scored = _module("benchmark").held(tmp_path / "runs" / "run", mixture)["sources"]
+    assert scored["rows"]["unfit"] == unfit["held out"]
+    assert (scored["long"]["rows"], scored["long"]["unfit"], scored["long"]["questions"]) == (2, 1, 2)
     decide = Decide.from_run(str(tmp_path / "runs" / "run"))
     frozen = flatten_dict(decide.variables[FROZEN])
     kernels = [value for path, value in frozen.items() if path[-1] == "kernel"]
@@ -223,8 +299,8 @@ def test_a_bucketed_decision_run_resumes_bitwise_and_after_a_change_that_keeps_i
     mixture = _mixture(tmp_path, _requests(24, joint=True), ["nothing these rows share at all"], held=8)
     clef = _module("clef")
 
-    def run(directory: Path, steps: int, *changed: str):
-        flags = _flags(mixture, directory)
+    def run(directory: Path, steps: int, *changed):
+        flags = _flags(mixture, directory, tokens=8192)
         flags[flags.index("--trainer.steps") + 1] = str(steps)
         flags += ["--pretrained", str(QWEN), "--lora.rank", "4", "--head.width", "24", "--head.heads", "2",
                   "--head.feedforward", "40", "--head.layers", "1", "--head.routing-layers", "1",
@@ -249,7 +325,7 @@ def test_a_bucketed_decision_run_resumes_bitwise_and_after_a_change_that_keeps_i
     for ours, theirs in zip(leaves(changed), leaves(unbroken), strict=True):
         np.testing.assert_allclose(ours, theirs, rtol=1e-4, atol=1e-6)
     with pytest.raises(ValueError):
-        run(tmp_path / "changed", 6, "--data.seed", "1")
+        run(tmp_path / "changed", 6, "--data-seed", "1")
 
 
 def test_a_checkpoint_loops_at_the_passes_and_over_the_block_asked():

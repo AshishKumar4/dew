@@ -479,7 +479,7 @@ def test_a_pool_resumes_every_process_at_its_own_position(tmp_path, pool_checkpo
 
 @pytest.fixture(scope="module")
 def elastic_checkpoint(tmp_path_factory):
-    """A three-step fit on two processes over `train_stream`, saved."""
+    """A three-step fit on two processes over a compiled global order, saved."""
     directory = tmp_path_factory.mktemp("elastic-checkpoint")
     reports = run_pool("fit", directory / "out", 2, name="elastic", elastic=True,
                        run_dir=directory / "run", fsdp_size=1, steps=POOL_STEPS,
@@ -540,7 +540,8 @@ def packed_checkpoint(tmp_path_factory):
     assert len(positions) == 1, "the processes saved different global positions"
     saved = json.loads(positions.pop())[ENVELOPE]
     assert saved["records"] == POOL_STEPS * worker.BATCH
-    assert "PackedWindows" in saved["order"], "the order has to name the packing"
+    assert any(stage.startswith("Pack(") for stage in json.loads(saved["order"])["stages"]), (
+        "the order has to name the packing")
     return {"run_dir": directory / "run", "corpus": corpus, "reports": reports}
 
 
@@ -1285,8 +1286,9 @@ def test_a_profile_window_that_fails_on_one_rank_fails_the_pool_together(tmp_pat
 def test_a_pool_refuses_what_its_processes_do_not_share_before_any_trains(tmp_path):
     """Each process opens its own stream over its own copy of the corpus, reads
     its batches on its own prefetch thread and lists the checkpoints itself.
-    Where one process's corpus holds other records under the same name and
-    length, or another count of them, where its first read fails, where its
+    Where one process's corpus holds other records of the same length, under
+    its own description or one name both copies share, or another count of
+    them, where its first read fails, where its
     stream (one Dew does not know endless) runs out a step before its peers',
     where its batch lacks a field, or where its listing has not yet seen the
     newest checkpoint a resume reads, every process refuses with the cause,
@@ -1297,7 +1299,9 @@ def test_a_pool_refuses_what_its_processes_do_not_share_before_any_trains(tmp_pa
     for rank, report in enumerate(reports):
         assert report["same"] is None and report["saved"] is None and report["latest"] == 2, report
         assert "training data differs between the processes" in report["content"], report
-        assert "64 records" in report["count"] and "96 records" in report["count"], report
+        assert "training data differs between the processes" in report["named"], report
+        # A pool compares what its processes hold, not where each mounted it: no description is named.
+        assert "training data differs between the processes" in report["count"], report
         assert "holds no rows" in report["first_read"], report
         assert "StopIteration" in report["eof"], report
         assert "training batch layout differs" in report["layout"], report
