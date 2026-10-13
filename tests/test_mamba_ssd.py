@@ -103,74 +103,62 @@ def summed_terms(operands, starts, dy, dfinal, chunk: int) -> dict[str, float]:
             "['D']": float(np.sqrt(np.mean(skip ** 2)))}
 
 
-# (batch, length, heads, head width, groups, state), chunk: a ragged tail with packed documents over
-# groups of three heads, six in all, a count no power of two divides past 2 (Mamba-2 130M's 24 heads);
-# whole chunks, one group; a state wider than one 128-wide product, as Falcon-H1's 256, with documents.
-SHAPES = [
-    pytest.param((2, 100, 6, 16, 2, 16), 32, True, id="ragged-documents"),
-    pytest.param((1, 128, 4, 32, 1, 32), 64, False, id="whole-chunks"),
-    pytest.param((1, 48, 2, 16, 2, 256), 16, True, id="wide-state-documents"),
+# tools/mamba_ssd_reference.py's cases: bf16 and fp32 operands over packed documents, a ragged last chunk
+# and groups of three heads; fp32 over whole chunks and one group; fp32 at a state wider than one
+# 128-wide product, as Falcon-H1's 256. The summing kernels also take two heads a program, a group's
+# three split two and one.
+CASES = [
+    pytest.param("bf16", None, id="bf16"),
+    pytest.param("bf16", 2, id="bf16-summing-two-of-three-heads"),
+    pytest.param("ragged-documents", None, id="ragged-documents"),
+    pytest.param("ragged-documents", 2, id="ragged-documents-summing-two-of-three-heads"),
+    pytest.param("whole-chunks", None, id="whole-chunks"),
+    pytest.param("wide-state-documents", None, id="wide-state-documents"),
 ]
 
 
-@pytest.mark.parametrize("shape, chunk, documents", SHAPES)
-def test_the_port_is_as_exact_as_the_xla_scan(monkeypatch, shape, chunk, documents):
-    """Forward, final state and every gradient on the port, each within the float64 gate of the XLA
-    scan's own distance from the same scan in float64; `D`, which sums its cotangents over every
-    token, with those terms' absolute sum its floor."""
-    operands, starts = scan_operands(*shape, documents=documents)
-    keys = jax.random.split(jax.random.key(1))
-    dy = jax.random.normal(keys[0], operands[0].shape)
-    dfinal = jax.random.normal(keys[1], operands[6].shape)
-    with jax.enable_x64(new_val=True):
-        truth = jax.tree.map(np.asarray, jax.jit(through(chunk, starts, dy, dfinal))(*widened(operands)))
-    # A fresh function per routing: jit's cache holds a function's trace whatever the row says since.
-    row_names_port(monkeypatch, port=False)
-    xla = jax.tree.map(np.asarray, jax.jit(through(chunk, starts, dy, dfinal))(*operands))
-    row_names_port(monkeypatch)
-    ported = jax.tree.map(np.asarray, jax.jit(through(chunk, starts, dy, dfinal))(*operands))
-    assert_leaves_as_exact(ported, xla, truth, reductions=chunk,
-                           invariants=summed_terms(operands, starts, dy, dfinal, chunk))
-
-
-@pytest.mark.parametrize("heads", [None, 2], ids=["heuristic", "summing-two-of-three-heads"])
-def test_the_port_in_bf16_is_as_exact_as_mamba_ssm(heads):
-    """bf16 operands, mamba_ssm's own numbers (tools/mamba_ssd_reference.py, its kernels on a GPU, two
-    rows of packed documents over a ragged last chunk, an initial state, three heads a group): the
-    port's output, final state and every gradient each within the float64 gate of mamba_ssm's
-    distance from the same scan in float64. With `heads` the kernels that sum a group's heads take
-    two a program, the group's three split two and one."""
-    fixture = ieee_fixture(FIXTURES / "ssd_mamba_ssm.npz")
-    chunk = int(fixture["chunk"])
-    seq = jnp.asarray(fixture["seq"])
+@pytest.mark.parametrize("case, heads", CASES)
+def test_the_port_is_as_exact_as_mamba_ssm(case, heads):
+    """mamba_ssm's own numbers at IEEE products (tools/mamba_ssd_reference.py, its kernels on a GPU):
+    the port's output, final state and every gradient each within the float64 gate of mamba_ssm's
+    distance from the same scan in float64, `A` and `D`, which sum their cotangents over every token,
+    with those terms' absolute sums their floors. With `heads` the kernels that sum a group's heads take
+    that many a program."""
+    stored = ieee_fixture(FIXTURES / "ssd_mamba_ssm.npz")
+    fixture = {name.removeprefix(f"{case}."): value
+               for name, value in stored.items() if name.startswith(f"{case}.")}
+    chunk, dtype = int(fixture["chunk"]), jnp.dtype(str(fixture["dtype"]))
+    seq = jnp.asarray(fixture["seq"]) if "seq" in fixture else None
     names = ("x", "dt", "A", "B", "C", "D", "h0")
-    narrow = [jnp.asarray(fixture[name], jnp.bfloat16 if name in "xBC" else jnp.float32) for name in names]
-    dy, dfinal = jnp.asarray(fixture["dy"], jnp.bfloat16), jnp.asarray(fixture["dfinal"])
-    starts = jnp.concatenate([seq[:, :1] > 0, seq[:, 1:] > seq[:, :-1]], axis=1)
+    inputs = [fixture[name] for name in names]
+    narrow = [jnp.asarray(value, dtype if name in "xBC" else jnp.float32)
+              for name, value in zip(names, inputs, strict=True)]
+    dy, dfinal = jnp.asarray(fixture["dy"], dtype), jnp.asarray(fixture["dfinal"])
+    starts = None if seq is None else jnp.concatenate([seq[:, :1] > 0, seq[:, 1:] > seq[:, :-1]], axis=1)
 
     def run(*args):
         def loss(*args):
             out, final = mamba_ssd.ssd_scan(*args, seq, chunk, INTERPRETED)
-            return jnp.sum(out.astype(jnp.float32) * dy) + jnp.sum(final * dfinal), (out, final)
+            return jnp.sum(out * dy) + jnp.sum(final * dfinal), (out, final)
 
         (_, (out, final)), grads = jax.value_and_grad(loss, argnums=range(7), has_aux=True)(*args)
         return {"y": out, "final": final, **dict(zip(names, grads, strict=True))}
 
-    summing = (mamba_ssd.ChunkStateBwdDb, mamba_ssd.ChunkScanBwdDc, mamba_ssd.ChunkScanBwdDcb)
     pins = {}
     if heads:
-        pins = {kernel: mamba_ssd.Tiles(64, 32, 0, 4, 3, heads) for kernel in summing}
+        rows, state = min(64, chunk), min(32, inputs[3].shape[-1])
+        pins = {mamba_ssd.ChunkStateBwdDb: mamba_ssd.Tiles(rows, state, 0, 4, 3, heads),
+                mamba_ssd.ChunkScanBwdDc: mamba_ssd.Tiles(rows, state, 0, 4, 3, heads),
+                mamba_ssd.ChunkScanBwdDcb: mamba_ssd.Tiles(rows, min(32, chunk), 0, 4, 3, heads)}
         assert all(pin in each_config(kernel, run, *narrow) for kernel, pin in pins.items())
     with tuning.pinned(pins):
         ported = jax.tree.map(np.asarray, jax.jit(run)(*narrow))
     with jax.enable_x64(new_val=True):
-        truth = jax.tree.map(np.asarray, jax.jit(through(chunk, starts, dy.astype(jnp.float64),
-                                                         jnp.asarray(fixture["dfinal"], jnp.float64)))(
-            *widened([fixture[name] for name in names])))
+        cotangents = widened((fixture["dy"], fixture["dfinal"]))
+        truth = jax.tree.map(np.asarray, jax.jit(through(chunk, starts, *cotangents))(*widened(inputs)))
     reference = {name: fixture[f"mamba.{name}"] for name in ported}
     assert_leaves_as_exact(ported, reference, truth, reductions=chunk,
-                           invariants=summed_terms([fixture[name] for name in names], starts, fixture["dy"],
-                                                   fixture["dfinal"], chunk))
+                           invariants=summed_terms(inputs, starts, fixture["dy"], fixture["dfinal"], chunk))
 
 
 @pytest.mark.parametrize("dtype, bound", [(jnp.float32, 1e-4), (jnp.bfloat16, 5e-2)])
