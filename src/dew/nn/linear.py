@@ -466,7 +466,9 @@ def xla_chunk_states(key, k_cumdecay, out_vals, gc, state, written=None, kept=No
         k_i, kd_i, v_i, gc_i, own_i, kept_i = step
         v_corrected = v_i - kd_i @ s
         last = gc_i[..., -1:, :]
-        written_i = k_i * jnp.exp(last - gc_i) * own_i
+        # Another document's decay is no difference of the last one's: masked before exp, which it
+        # would overflow (exp(140) * 0 is NaN), as chunk_decay masks its unused differences.
+        written_i = k_i * jnp.exp(jnp.where(own_i > 0, last - gc_i, 0.0)) * own_i
         return (s * jnp.swapaxes(jnp.exp(last), -1, -2) * kept_i
                 + jnp.swapaxes(written_i, -1, -2) @ v_corrected, (s, v_corrected))
     ones = jnp.ones((1, 1, gc.shape[2], 1, 1), gc.dtype)
