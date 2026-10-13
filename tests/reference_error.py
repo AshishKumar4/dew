@@ -184,8 +184,12 @@ added to a parameter) and moved. A product or quotient of a sum by a value
 that is none carries them too, scaled element by element (`_applied`), as
 `s_i sum_k x_ik` sums the terms `s_i x_ik`; a product of two sums ends them."""
 
-CALLS = ("jaxpr", "call_jaxpr", "fun_jaxpr")
-"""The parameters a call names its body in (pjit, a remat, a custom rule)."""
+CALLS = frozenset({"pjit", "jit", "closed_call", "core_call", "remat", "checkpoint", "custom_jvp_call",
+                   "custom_vjp_call", "custom_vjp_call_jaxpr"})
+"""The calls whose bodies are evaluated op by op, as the computation's own:
+a jit, a remat, a custom rule's primal. A body that runs elsewhere, a
+shard_map's per-device program or a Pallas kernel, is one operation, its
+outputs their own size."""
 
 
 def float64_terms(fn, *args):
@@ -269,9 +273,11 @@ def _carried(equation) -> list[int]:
 
 def _body(equation):
     """The jaxpr and constants a call runs (`CALLS`), or None."""
-    for name in CALLS:
+    if equation.primitive.name not in CALLS:
+        return None
+    for name in ("jaxpr", "call_jaxpr", "fun_jaxpr"):
         body = equation.params.get(name)
-        if body is not None and equation.primitive.name not in ("scan", "while", "cond"):
+        if body is not None:
             return (body.jaxpr, body.consts) if hasattr(body, "consts") else (body, [])
     return None
 
