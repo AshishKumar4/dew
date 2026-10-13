@@ -185,13 +185,14 @@ class TorchGraph:
                               arguments)
         signature = str(jax.tree.map(lambda shape: (shape.shape, str(shape.dtype)), shapes))
         if signature not in self._differs:
-
-            def forward(key, *arguments):
-                with env.override_property(prng=key):
-                    return self._forward(*arguments)
-
             programs = []
             for training in (True, False):
+
+                # One function a trace: JAX caches a trace by its function, and the mode is not an input.
+                def forward(key, *arguments):
+                    with env.override_property(prng=key):
+                        return self._forward(*arguments)
+
                 self.module.train(training)
                 try:
                     programs.append(str(jax.make_jaxpr(forward)(jax.random.key(0), *shapes)))
