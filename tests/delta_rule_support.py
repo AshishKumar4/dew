@@ -6,12 +6,6 @@ import itertools
 
 import jax
 import jax.numpy as jnp
-import numpy as np
-
-
-def wide(*arrays):
-    """`arrays` as float64 JAX arrays; call under `jax.enable_x64`."""
-    return tuple(jnp.asarray(np.asarray(x, np.float64)) for x in arrays)
 
 
 def rule_math(q, k, v, g, beta, h0):
@@ -31,20 +25,21 @@ def rule_math(q, k, v, g, beta, h0):
     return jnp.moveaxis(out, 0, 1), final
 
 
-def recurrence(q, k, v, g, beta, h0, cuts=None):
-    """`rule_math` with value heads reading their key head, each row through its documents (`cuts`,
-    each row's first tokens, the first 0; None, one a row): each from a zero memory but a row's first,
-    which takes the row's, the row's final memory its last document's."""
+def recurrence(q, k, v, g, beta, h0, cuts=None, rule=rule_math):
+    """`rule` (the token recurrence, `rule_math`, by default) with value heads reading their key head,
+    each row through its documents (`cuts`, each row's first tokens, the first 0; None, one a row):
+    each from a zero memory but a row's first, which takes the row's, the row's final memory its last
+    document's."""
     group = v.shape[2] // q.shape[2]
     q, k = jnp.repeat(q, group, axis=2), jnp.repeat(k, group, axis=2)
     if cuts is None:
-        return rule_math(q, k, v, g, beta, h0)
+        return rule(q, k, v, g, beta, h0)
     outs, finals = [], []
     for row, begins in enumerate(cuts):
         state, pieces = h0[row:row + 1], []
         for begin, end in itertools.pairwise((*begins, q.shape[1])):
             state = state if begin == 0 else jnp.zeros_like(state)
-            out, state = rule_math(*(x[row:row + 1, begin:end] for x in (q, k, v, g, beta)), state)
+            out, state = rule(*(x[row:row + 1, begin:end] for x in (q, k, v, g, beta)), state)
             pieces.append(out)
         outs.append(jnp.concatenate(pieces, axis=1))
         finals.append(state)
@@ -52,13 +47,13 @@ def recurrence(q, k, v, g, beta, h0, cuts=None):
 
 
 def through(rule, do, dht):
-    """`rule`'s output, final memory and its six operands' gradients under the cotangents `do`, `dht`."""
+    """`rule`'s output, final memory and its operands' gradients under the cotangents `do`, `dht`."""
     def loss(*args):
         out, final = rule(*args)
         return jnp.sum(out.astype(do.dtype) * do) + jnp.sum(final.astype(dht.dtype) * dht), (out, final)
 
     def run(*args):
-        (_, (out, final)), grads = jax.value_and_grad(loss, argnums=range(6), has_aux=True)(*args)
+        (_, (out, final)), grads = jax.value_and_grad(loss, argnums=range(len(args)), has_aux=True)(*args)
         return out, final, *grads
 
     return run

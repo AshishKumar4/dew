@@ -12,7 +12,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from delta_rule_support import recurrence, rule_math, through, wide
+from delta_rule_support import recurrence, rule_math, through
+from reference_error import widened
 from sharded import assert_runs_per_shard, boundary_copies
 from tuned import each_config
 
@@ -298,9 +299,9 @@ def test_the_wy_backward_kernel_is_the_gradient_of_flas_wy_representation(dtype,
         return jnp.moveaxis(x.reshape(batch, length // 64, 64, heads, *x.shape[3:]), 3, 2)
 
     with jax.enable_x64(new_val=True):
-        operands = wide(k, v, beta, g)
+        operands = widened((k, v, beta, g))
         inverse = np.asarray(wy_math(*operands)[2])
-        cot_w, cot_u = (chunks(x) for x in wide(dw, du))
+        cot_w, cot_u = (chunks(x) for x in widened((dw, du)))
 
         def scored(*args):
             w, u, _ = wy_math(*args)
@@ -357,21 +358,13 @@ def test_the_ported_rule_and_its_gradients_follow_the_recurrence(dtype, bound):
     scale = width ** -0.5
 
     def ported(*args):
-        out, final = fla_gdn.chunk_gated_delta_rule(*args, None, scale, 64, INTERPRETED)
-        return jnp.sum(out.astype(jnp.float32) * do.astype(jnp.float32)) + jnp.sum(final * dht), (out, final)
+        return fla_gdn.chunk_gated_delta_rule(*args, None, scale, 64, INTERPRETED)
 
-    (_, (out, final)), grads = jax.value_and_grad(ported, argnums=(0, 1, 2, 3, 4, 5), has_aux=True)(
-        q, k, v, g, beta, h0)
+    out, final, *grads = through(ported, do.astype(jnp.float32), dht)(q, k, v, g, beta, h0)
     with jax.enable_x64(new_val=True):
-        operands = wide(q, k, v, g, beta, h0)
-        wide_do, wide_dht = wide(do, dht)
-        want_out, want_final = (np.asarray(x) for x in rule_math(*operands))
-
-        def reference(*args):
-            o, f = rule_math(*args)
-            return jnp.sum(o * wide_do) + jnp.sum(f * wide_dht)
-
-        want_grads = [np.asarray(x) for x in jax.grad(reference, argnums=(0, 1, 2, 3, 4, 5))(*operands)]
+        operands = widened((q, k, v, g, beta, h0, do, dht))
+        want_out, want_final, *want_grads = (np.asarray(x) for x in
+                                             through(rule_math, *operands[6:])(*operands[:6]))
     assert relative(out, want_out) < bound
     assert relative(final, want_final) < bound
     for name, mine, theirs in zip(("q", "k", "v", "g", "beta", "h0"), grads, want_grads, strict=True):
@@ -405,7 +398,7 @@ def test_dews_fla_rule_follows_the_recurrence_for_any_heads_widths_and_length(
     port = through(fla_rule, do, dht)(q, k, v, g, beta, h0)
     assert port[0].shape == v.shape and port[1].shape == h0.shape and port[1].dtype == jnp.float32
     with jax.enable_x64(new_val=True):
-        operands = wide(q, k, v, g, beta, h0, do, dht)
+        operands = widened((q, k, v, g, beta, h0, do, dht))
         truth = jax.tree.map(np.asarray, through(recurrence, *operands[6:])(*operands[:6]))
     names = ("out", "final", "q", "k", "v", "g", "beta", "h0")
     for name, mine, theirs in zip(names, port, truth, strict=True):
@@ -440,7 +433,7 @@ def test_dews_fla_rule_runs_packed_documents_as_flas_varlen_sequences(per_key):
     packed = functools.partial(fla_rule, starts=jnp.asarray(starts), max_segments=3)
     port = through(packed, do, dht)(q, k, v, g, beta, h0)
     with jax.enable_x64(new_val=True):
-        operands = wide(q, k, v, g, beta, h0, do, dht)
+        operands = widened((q, k, v, g, beta, h0, do, dht))
         documents = functools.partial(recurrence, cuts=cuts)
         truth = jax.tree.map(np.asarray, through(documents, *operands[6:])(*operands[:6]))
     names = ("out", "final", "q", "k", "v", "g", "beta", "h0")
@@ -519,7 +512,7 @@ def test_dews_fla_rule_takes_wide_keys_up_to_fla_s_256_in_bf16(width):
     beta = jax.nn.sigmoid(jax.random.normal(keys[4], v.shape[:3])).astype(jnp.bfloat16)
     out, final = fla_rule(q, k, v, g, beta)
     with jax.enable_x64(new_val=True):
-        operands = wide(jnp.repeat(q, 2, axis=2), jnp.repeat(k, 2, axis=2), v, g, beta)
+        operands = widened((jnp.repeat(q, 2, axis=2), jnp.repeat(k, 2, axis=2), v, g, beta))
         want_out, want_final = (np.asarray(x) for x in rule_math(*operands, jnp.zeros((1, 2, width, 64))))
     assert relative(out, want_out) < 2e-2 and relative(final, want_final) < 2e-2
 
@@ -655,27 +648,17 @@ def test_the_port_keeps_the_kernel_contract_on_a_mesh(axis, split, per_key):
     g = -jnp.exp(jax.random.normal(keys[3], (*v.shape[:3], *(64,) * per_key)) - 3.0)
     beta = jax.nn.sigmoid(jax.random.normal(keys[4], v.shape[:3]))
     do = jax.random.normal(keys[5], v.shape)
-
-    def gradients(rule, cotangent):
-        def loss(*args):
-            out, final = rule(*args)
-            return jnp.sum(out * cotangent) + jnp.sum(final), (out, final)
-
-        def run(*args):
-            (_, (out, final)), grads = jax.value_and_grad(loss, argnums=(0, 1, 2, 3, 4), has_aux=True)(*args)
-            return out, final, *grads
-
-        return run
+    every = jnp.ones((v.shape[0], 4, 64, 64))
 
     def repeated(*args):
-        return recurrence(*args, jnp.zeros((v.shape[0], 4, 64, 64), args[0].dtype))
+        return recurrence(*args, jnp.zeros_like(every, args[0].dtype))
 
     with jax.enable_x64(new_val=True):
-        operands = wide(q, k, v, g, beta, do)
-        truth = jax.tree.map(np.asarray, gradients(repeated, operands[-1])(*operands[:-1]))
+        operands = widened((q, k, v, g, beta, do, every))
+        truth = jax.tree.map(np.asarray, through(repeated, *operands[-2:])(*operands[:-2]))
     spec = PartitionSpec(*(axis if dim in split else None for dim in range(3)))
     mesh = Mesh(np.asarray(jax.devices()[:2]), (axis,))
-    assert_runs_per_shard(gradients(fla_rule, do), (q, k, v, g, beta), [spec] * 5, mesh, truth)
+    assert_runs_per_shard(through(fla_rule, do, every), (q, k, v, g, beta), [spec] * 5, mesh, truth)
 
 
 @pytest.mark.gpu(reason="the port's kernels lower to Triton calls only on a GPU")

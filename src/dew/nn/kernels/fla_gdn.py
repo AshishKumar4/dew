@@ -283,6 +283,22 @@ _CHUNK = pl.BlockSpec((None, 2), lambda i_t, *_: (i_t, 0))
 """A per-chunk kernel's own chunk: its first token and count (`Sequences.chunks`)."""
 
 
+def _headed(tokens: int, size: int):
+    """A per-chunk kernel's value head's `[B * T, size]` rows, its grid's second axis the head."""
+    return pl.BlockSpec((tokens, None, size), lambda i_t, h: (0, h, 0))
+
+
+def _weighted_values(v_ref, u_ref, beta, inverse, start, taken, *, chunk: int, bv: int, exact: bool,
+                     ieee: bool):
+    """`u = A (v beta)` for a chunk, `BV` value columns at a time, `v beta` rounded to the values' dtype
+    before the product (fla's recompute_w_u kernels' `b_u`), at IEEE fp32 where `ieee`."""
+    for block in range(v_ref.shape[-1] // bv):
+        columns = pl.ds(block * bv, bv)
+        value = _read(_rows(v_ref, start, chunk, columns), taken)
+        scaled = (value * beta[:, None]).astype(value.dtype)
+        _write(_rows(u_ref, start, chunk, columns), taken, _dot(inverse, scaled, exact=exact, ieee=ieee))
+
+
 def _flat(*arrays):
     """`[B, T, ...]` arrays as `[B * T, ...]`, the token axis fla's varlen kernels address."""
     return tuple(x.reshape(x.shape[0] * x.shape[1], *x.shape[2:]) for x in arrays)
@@ -526,11 +542,8 @@ def _w_u_kernel(chunk_ref, k_ref, v_ref, beta_ref, a_ref, g_ref, w_ref, u_ref, *
 
         beta = read(beta_ref)
         inverse = read(a_ref)
-        for block in range(v_ref.shape[-1] // bv):
-            columns = pl.ds(block * bv, bv)
-            value = read(v_ref, columns)
-            scaled = (value * beta[:, None]).astype(value.dtype)
-            _write(_rows(u_ref, start, chunk, columns), taken, _dot(inverse, scaled, exact=exact, ieee=True))
+        _weighted_values(v_ref, u_ref, beta, inverse, start, taken, chunk=chunk, bv=bv, exact=exact,
+                         ieee=True)
         decay = jnp.exp2(_gates(g_ref, start, taken, chunk))
         for block in range(k_ref.shape[-1] // bk):
             columns = pl.ds(block * bk, bk)
@@ -560,8 +573,7 @@ class RecomputeWU(_Launch):
         tokens = batch * length
         aligned = _aligned(spans, batch, length, chunk)
 
-        def headed(size):
-            return pl.BlockSpec((tokens, None, size), lambda i_t, h: (0, h, 0))
+        headed = functools.partial(_headed, tokens)
 
         gate = pl.BlockSpec((tokens, None), lambda i_t, h: (0, h))
         w, u = pl.pallas_call(
@@ -1194,8 +1206,7 @@ class PrepareWyReprBwd(_Launch):
         tokens = batch * length
         aligned = _aligned(spans, batch, length, chunk)
 
-        def headed(size):
-            return pl.BlockSpec((tokens, None, size), lambda i_t, h: (0, h, 0))
+        headed = functools.partial(_headed, tokens)
 
         gate = pl.BlockSpec((tokens, None), lambda i_t, h: (0, h))
         keys = pl.BlockSpec((tokens, None, width), lambda i_t, h: (0, h // group, 0))
