@@ -93,7 +93,7 @@ class Mixture:
     goes through, 0 for none (`DeepseekV3MoE`'s `n_shared_experts` times its
     expert width). `shared_gate` adds a learned per-token sigmoid to that
     shared branch (Qwen3.5 MoE). `implementation` names the kernel of
-    `moe.grouped_matmul`. `dispatch` and `capacity_factor` are passed to
+    `moe.expert_projection`. `dispatch` and `capacity_factor` are passed to
     `moe.expert_dispatch`; `'exchange'` is expert parallelism over an expert
     mesh axis that divides the expert count. `hash_layers` route by DeepSeek
     V4's token table, `latent_features` gives Kimi K3's latent MoE, and

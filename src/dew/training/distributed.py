@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import fnmatch
+import functools
 import hashlib
 import json
 import logging
@@ -23,7 +24,7 @@ from jax.experimental import mesh_utils, multihost_utils
 from jax.sharding import AbstractMesh, AxisType, Mesh, NamedSharding, PartitionSpec as P
 
 from dew.coordination import agreed, broadcast_from_process_zero, from_every_process, stop_at_exit
-from dew.data.dataset import Budgeted, Checkpointable, Closeable, DataPartition, Stoppable
+from dew.data.dataset import Budgeted, Checkpointable, Closeable, DataPartition, RampedStream, Stoppable
 from dew.files import write_atomically
 from dew.nn.inputs import filled_validity
 from dew.nn.sharding import (
@@ -43,6 +44,7 @@ from dew.nn.sharding import (
     declared_axes,
     logical_spec,
     mesh_axes,
+    microbatched,
     ruled_boxes,
 )
 from dew.objectives.base import Batch, Variables
@@ -66,6 +68,14 @@ def device_mesh(mesh: MeshSpec | Mesh) -> Mesh:
     """The device mesh `mesh` names: a native `jax.sharding.Mesh` as it is,
     whatever its axes, or the one a `MeshSpec` builds."""
     return mesh if isinstance(mesh, Mesh) else mesh.build()
+
+
+def explicit_axes(mesh: MeshSpec | Mesh) -> tuple[str, ...]:
+    """The axes of `mesh` whose sharding the program's types carry (`AxisType.Explicit`)."""
+    if isinstance(mesh, MeshSpec):
+        return tuple(mesh.explicit)
+    return tuple(axis for axis, kind in zip(mesh.axis_names, mesh.axis_types, strict=True)
+                 if kind == AxisType.Explicit)
 
 type Placement[TreeT] = TreeT
 """`TreeT`'s own structure, with a `NamedSharding` at every leaf.
@@ -304,7 +314,7 @@ def hybrid_devices(spec: MeshSpec, shape: tuple[int, ...], devices: list) -> np.
         ici, dcn, devices, process_is_granule=by_process, allow_split_physical_axes=True)
 
 
-def batch_divisor(mesh: Mesh, microbatches: int) -> int:
+def batch_divisor(mesh: Mesh | AbstractMesh, microbatches: int) -> int:
     """Return the row count every global batch must be a multiple of.
 
     A batch's rows are sharded over the row axes (`batch_axes`) as whole
@@ -318,6 +328,100 @@ def batch_divisor(mesh: Mesh, microbatches: int) -> int:
     an hour in.
     """
     return math.prod(mesh.shape[axis] for axis in batch_axes(mesh)) * microbatches
+
+
+def check_batch(batch: int, mesh: Mesh, microbatches: int) -> None:
+    """Refuse, before anything is placed, a global batch `mesh` cannot split
+    (`batch_divisor`): its rows shard over the row axes as whole rows, and a
+    pipeline cuts each device's rows again into `microbatches`, where a
+    device that holds none of a microbatch's rows computes another's again.
+    The message names the row shards, and the batches and the microbatch
+    counts that fit."""
+    divisor = batch_divisor(mesh, microbatches)
+    if batch % divisor == 0:
+        return
+    count, stages = microbatches, mesh.shape.get(STAGE_AXIS, 1)
+    shards = divisor // count
+    suggestions = [f"a batch that is a multiple of {divisor} rows, {-(-batch // divisor) * divisor} "
+                   f"the nearest above {batch}"]
+    rows = batch_axes(mesh)
+    axes = " x ".join(f"{axis} {mesh.shape[axis]}" for axis in rows)
+    if count == 1:
+        raise LayoutRefused(
+            f"a global batch of {batch} rows over the {shards} row shards of {axes} leaves some "
+            f"device without whole rows; use {suggestions[0]}, or a mesh whose row axes "
+            f"({' x '.join(rows)}) divide {batch}")
+    if batch % shards == 0:
+        fitting = [m for m in range(stages, batch // shards + 1, stages)
+                   if (batch // shards) % m == 0]
+        if fitting:
+            suggestions.append(f"microbatches={fitting[-1]}, the most that divide the "
+                               f"{batch // shards} rows a device holds")
+    raise LayoutRefused(
+        f"a global batch of {batch} rows over {shards} row shards and {count} microbatches "
+        f"leaves some microbatch without rows on some device, which then computes another "
+        f"microbatch's again; use {' or '.join(suggestions)}")
+
+
+def check_stream(source, mesh: Mesh, microbatches: int, batch: int, window: int, *, rows: bool,
+                 checkpointing: bool) -> None:
+    """Refuse a training stream a run cannot checkpoint or cannot shard.
+
+    A checkpoint written without the data position would replay the data
+    on resume. A `batch` the mesh cannot divide fails where it is placed or
+    traced (`check_batch`), unless the stream's rows are not the step's
+    (`rows`; a rollout's are its own, checked where its step traces), and a
+    ramp stage's, for a later stage, an hour in. A ramp reads each stage's
+    batch whole, never in a `window` of more than one microbatch.
+    """
+    if checkpointing and not isinstance(source, Checkpointable):
+        raise ValueError(
+            f"checkpoint_every needs a training stream with get_state and "
+            f"set_state, and {type(source).__name__} lacks one; a checkpoint "
+            f"written without the data position would replay the data on "
+            f"resume. Train it with checkpoint_every=None "
+            f"(--trainer.checkpoint-every None)")
+    if not isinstance(source, RampedStream):
+        if rows:
+            check_batch(batch, mesh, microbatches)
+        return
+    if window > 1:
+        raise ValueError(
+            f"a batch ramp grows the records a step reads, and an "
+            f"accumulation window of {window} pools "
+            f"microbatches of one shape into one update; ramp the "
+            f"batch or accumulate, not both")
+    divisor = batch_divisor(mesh, microbatches)
+    refused = [stage.batch for stage in source.stages if stage.batch % divisor]
+    if refused:
+        raise ValueError(
+            f"the batch ramp reads {refused} records a step at some of "
+            f"its stages, and {dict(mesh.shape)} with "
+            f"{microbatches} microbatch(es) "
+            f"holds a batch that is a multiple of {divisor}")
+
+
+def microbatch(batch: Batch, part: jax.Array, split: int) -> Batch:
+    """The `part`th of the `split` microbatches a step reads `batch` in
+    (`Trainer.compile`): every `split`th row from row `part` (`microbatched`),
+    a share of each device's rows where `split` divides them, so no row
+    crosses devices. A field with no rows is the whole step's, and every
+    microbatch reads it whole; one microbatch is the batch as it came,
+    whatever its fields' rows (a rollout's groups)."""
+    if split == 1:
+        return batch
+    return jax.tree.map(lambda leaf: jax.lax.dynamic_index_in_dim(
+        microbatched(leaf, 0, split), part, 0, keepdims=False) if np.ndim(leaf) else leaf, batch)
+
+
+def microbatch_shapes(batch: Batch, split: int) -> Batch:
+    """The fields of `microbatch`'s microbatches, as a trace reads them: the
+    batch itself for one, whose placed fields' types carry their Explicit
+    axes, else their shapes."""
+    if split == 1:
+        return batch
+    part = jax.ShapeDtypeStruct((), np.dtype(np.int32))
+    return jax.eval_shape(functools.partial(microbatch, split=split), batch, part)
 
 
 def parameter_spec(shape: tuple, fsdp_size: int, min_shard_size: int) -> P:

@@ -80,3 +80,18 @@ def gemma_features(model_type, config, waveforms):
                          pad_to_multiple_of=128, return_tensors="np", return_attention_mask=True)
     return {"input_features": np.asarray(features["input_features"], np.float32),
             "input_features_mask": np.asarray(features["input_features_mask"], np.bool_)}
+
+
+NVFP4_QDQ = Path(__file__).parent / "fixtures" / "codecs" / "nvfp4_qdq"
+"""Two compressed-tensors NVFP4 checkpoints of one tiny Qwen3 with input QDQ, one per local-scale
+rounding, each with the author's reference forward (`reference.npz`)."""
+
+NVFP4_QDQ_CASES = ("unrounded", "e4m3")
+
+
+def nvfp4_qdq_case(kind: str) -> tuple[Path, dict[str, np.ndarray]]:
+    """One NVFP4 QDQ checkpoint's directory and its reference arrays."""
+    directory = NVFP4_QDQ / kind
+    with np.load(directory / "reference.npz") as reference:
+        return directory, dict(reference)
+

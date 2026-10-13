@@ -351,6 +351,29 @@ def test_a_gpu_process_keeps_its_temporaries_one_free_block(tmp_path, flags, kep
 
 
 @pytest.mark.mesh(devices=0)
+@pytest.mark.parametrize("named, fraction", [({}, "0.95"), ({"XLA_PYTHON_CLIENT_MEM_FRACTION": "0.6"}, "0.6"),
+                                             ({"XLA_PYTHON_CLIENT_PREALLOCATE": "false"}, None)])
+def test_a_training_process_preallocates_its_gpu_unless_it_named_the_pool(tmp_path, named, fraction):
+    """A pool that grows fits a step only in a region it has yet to take, so
+    a training process (`prepare_process`) preallocates 95% of its GPU where
+    JAX's CUDA plugin is installed (a stand-in here), unless the run named
+    its pool's fraction, preallocation or allocator."""
+    plugin = tmp_path / "jax_plugins" / "xla_cuda12"
+    plugin.mkdir(parents=True)
+    (plugin / "__init__.py").write_text("")
+    env = {name: value for name, value in os.environ.items() if not name.startswith("XLA_PYTHON_CLIENT_")}
+    env = {**env, **named, "PYTHONPATH": f"{REPO_ROOT / 'src'}{os.pathsep}{tmp_path}", "JAX_PLATFORMS": "cpu"}
+    program = ("import os\n"
+               "from dew.training.runtime import _set_environment\n"
+               "_set_environment(None, None, None)\n"
+               "print('fraction', os.environ.get('XLA_PYTHON_CLIENT_MEM_FRACTION'))\n")
+    done = subprocess.run([sys.executable, "-c", program], cwd=REPO_ROOT, env=env,
+                          capture_output=True, text=True, timeout=120)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert f"fraction {fraction}" in done.stdout, done.stdout
+
+
+@pytest.mark.mesh(devices=0)
 @pytest.mark.parametrize("raised", [True, False],
                          ids=["raised_to_a_lowered_hard_limit", "a_higher_soft_limit_kept"])
 def test_a_process_raises_its_descriptor_limit_within_the_hard_limit_it_was_given(raised):

@@ -136,6 +136,13 @@ class PPOObjective(Objective[Ratio, Variables]):
         *actor, self.critic = modules
         self.actor.substitute(actor)
 
+    def tile_head(self, tile: tuple[int, int] | None = None) -> str | None:
+        """Tile the actor's head, the vocabulary head this objective trains."""
+        return self.actor.tile_head(tile)
+
+    def restore_head_tile(self, tile: tuple[int, int] | None) -> None:
+        self.actor.restore_head_tile(tile)
+
     def held_variables(self) -> Variables | None:
         """Return the actor's held variables, such as a loaded policy checkpoint, or None.
 
