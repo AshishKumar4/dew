@@ -1655,14 +1655,8 @@ class Trainer(Generic[Loss, Effects]):
             partition = DataPartition.of(mesh)
             run.source = plan.dataset.train(partition)
             check_stream(run.source, mesh, self.mesh, plan.dataset.batch,
-                         self.accumulation * (self._split or 1), rows=self.rollout is None)
-            if resumed and position is None:
-                raise ValueError(
-                    f"step {current}'s checkpoint holds no data position, as "
-                    f"{stream_identity(run.source)} keeps none, so resuming would read its data again "
-                    f"from the start; give the stream get_state and set_state, read it through dew.data, "
-                    f"or declare that it reads the same batches each time it opens "
-                    f"(dew.data.dataset.replayed, from_iter(replay=True))")
+                         self.accumulation * (self._split or 1), rows=self.rollout is None,
+                         resumed=current if resumed and position is None else None)
             if isinstance(run.source, RampedStream):
                 # Each stage's batch is read whole: no plan splits a ramp's.
                 self._split = 1
