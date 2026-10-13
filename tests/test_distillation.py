@@ -22,9 +22,9 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from affine_run import Data
 from flax.traverse_util import unflatten_dict
 
+from dew.data.dataset import Loader, replayed
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.objectives import DistillationObjective
 from dew.objectives.base import Step
@@ -261,8 +261,10 @@ def test_a_student_with_the_router_balance_loss_is_refused():
 
 
 def fixed(batch):
-    """The one fixed batch, endlessly, as the trainer's dataset contract."""
-    return Data(lambda: itertools.repeat(batch), batch=batch[TEXT_KEY].shape[0])
+    """The one fixed batch, endlessly, as the trainer's dataset contract,
+    declared to replay so a resumed run continues it."""
+    return Loader(replayed(lambda partition: itertools.repeat(batch)), None, batch=batch[TEXT_KEY].shape[0],
+                  records=None)
 
 
 def make_trainer(arrays, tmp_path=None):

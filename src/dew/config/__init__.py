@@ -46,10 +46,12 @@ import dew.io
 from dew import registry
 from dew.cache import default_compilation_cache_dir, dew_cache_dir
 from dew.checkpoints import RUN_FILE, Checkpoints, Keep
+from dew.config.data import Augment, HoldOut, ImageData, RunData, loader
 from dew.config.sweep import RandomSearch, Search, Space, read_ledger, write_ledger
 from dew.coordination import agree_process_phase, agreed
-from dew.data import Dataset, DatasetSpec, Ramp
-from dew.data.dataset import Reader, ramped, record_argument
+from dew.data import Loading
+from dew.data.dataset import Loader, Ramp, Reader, ramped, record_argument
+from dew.data.sources.base import Read
 from dew.files import write_atomically
 from dew.lora import AdapterRecord, LoRA
 from dew.objectives.base import Effects, Loss, Metric, Objective
@@ -107,10 +109,10 @@ if TYPE_CHECKING:
     # tyro reads the runtime annotation, a Union of the aliased specs, and a
     # type checker cannot read a variable in a type expression. Both get what
     # they need: the base class statically, the union at runtime.
-    type DataSpec = DatasetSpec
+    type DataSpec = RunData
     type ScheduleSpec = ScheduleBase
 else:
-    DataSpec = datasets.union
+    DataSpec = datasets.subcommands
     ScheduleSpec = schedules.union
 
 
@@ -597,14 +599,18 @@ class TrainerConfig:
     """The number of latest checkpoints kept, besides the best one."""
     best: Annotated[str | Best | tuple[Best, ...] | None, _best_argument()] = None
     """The metric name and ranking policy; None selects validation loss or training loss."""
-    batch_size: int = 32
-    """The global batch size, over every process."""
+    batch_size: int | None = 32
+    """The global row batch; None selects token-budget batching."""
+    batch_tokens: int | None = None
+    """The micro-batch's token budget; set batch_size=None to select it."""
+    update_tokens: int | None = None
+    """The optimizer update's token budget, a whole number of micro-batches."""
     key: int = 0
     """The seed of the run key, which sets parameter init and every per-step draw."""
     steps: int | None = None
     epochs: int | None = None
     """The run length as passes over the data; `steps` sets it directly instead."""
-    total_tokens: int | None = None
+    tokens: int | None = None
     """Stop after this many real tokens across all microbatches, including before a resume.
 
     Uses the counter reported as `train/tokens`, without padding. The final
@@ -702,6 +708,20 @@ class TrainerConfig:
     """
 
     def __post_init__(self):
+        if (self.batch_tokens is None) != (self.update_tokens is None):
+            raise ValueError("--trainer.batch-tokens and --trainer.update-tokens must be set together")
+        if self.batch_tokens is not None:
+            if self.batch_size is not None:
+                raise ValueError("token budgets require --trainer.batch-size None together with "
+                                 "--trainer.batch-tokens and --trainer.update-tokens")
+            if self.batch_tokens < 1 or self.update_tokens is None or self.update_tokens < 1:
+                raise ValueError("trainer token budgets must be positive")
+            if self.update_tokens % self.batch_tokens:
+                raise ValueError("--trainer.update-tokens must be a multiple of --trainer.batch-tokens")
+            if self.batch_ramp is not None:
+                raise ValueError("--trainer.batch-ramp grows row batches and cannot use token budgets")
+        elif self.batch_size is None or self.batch_size < 1:
+            raise ValueError("--trainer.batch-size must be positive without token budgets")
         if self.split is not None and self.split < 1:
             raise ValueError("--trainer.split reads each step's batch in that many microbatches, at least 1")
         if self.publish and (self.wandb is None or not self.checkpoint_final):
@@ -729,6 +749,18 @@ class TrainerConfig:
                 self, "best", tuple(rebuilt) if isinstance(self.best, (tuple, list)) else rebuilt[0]
             )
 
+    def derived(self) -> Self:
+        """The trainer settings with token-budget accumulation recorded explicitly."""
+        if self.batch_tokens is None:
+            return self
+        if self.update_tokens is None:
+            raise ValueError("token-budget accumulation requires --trainer.update-tokens")
+        accumulation = self.update_tokens // self.batch_tokens
+        if self.accumulation not in (1, accumulation):
+            raise ValueError("token budgets determine --trainer.accumulation; omit it or match "
+                             f"the derived value {accumulation}")
+        return dataclasses.replace(self, accumulation=accumulation)
+
     def best_policies(self):
         if self.best is None:
             return None
@@ -743,26 +775,26 @@ class TrainerConfig:
             return False
         return Checkpoints(os.path.join(self.checkpoint_dir, self.name), keep=self.keep).latest is not None
 
-    def total_steps(self, dataset: Dataset) -> int | None:
+    def total_steps(self, dataset: Loader) -> int | None:
         """Return the step cap from `steps` or `epochs`, None for a token-only run."""
         if self.steps is not None:
             return self.steps
         if self.epochs is None:
-            if self.total_tokens is not None:
+            if self.tokens is not None:
                 return None
             raise ValueError("the run length is --trainer.steps or --trainer.epochs "
-                             "or --trainer.total-tokens")
-        if dataset.steps_per_epoch is None:
+                             "or --trainer.tokens")
+        if dataset.records is None:
             raise ValueError(
                 "epochs need a dataset with a record count; this one streams without "
                 "one, so give the run length as --trainer.steps")
-        return self.epochs * dataset.steps_per_epoch
+        return dataset.epoch_steps(self.epochs)
 
-    def eval_interval(self, dataset: Dataset) -> int | None:
+    def eval_interval(self, dataset: Loader) -> int | None:
         """Return the steps between validation passes over `data`, or None for never."""
         return self._interval(self.eval_every, dataset, "eval-every")
 
-    def checkpoint_interval(self, dataset: Dataset) -> int | datetime.timedelta | None:
+    def checkpoint_interval(self, dataset: Loader) -> int | datetime.timedelta | None:
         """Return the steps, or a recorded duration such as 30m, between checkpoints."""
         value = self.checkpoint_every
         if isinstance(value, datetime.timedelta):
@@ -772,7 +804,7 @@ class TrainerConfig:
         return self._interval(self.checkpoint_every, dataset, "checkpoint-every")
 
     @staticmethod
-    def _interval(value, dataset: Dataset, field_name: str) -> int | None:
+    def _interval(value, dataset: Loader, field_name: str) -> int | None:
         if value is None or isinstance(value, int):
             return value
         if dataset.steps_per_epoch is None:
@@ -903,7 +935,17 @@ class RunConfig:
     subcommand its flags imply."""
 
     model: ModelConfig = dataclasses.field(default_factory=ModelConfig)
-    data: DataSpec = dataclasses.field(default_factory=lambda: datasets["tfds_images"]())
+    data: DataSpec = dataclasses.field(default_factory=lambda: ImageData(
+        source="tfds://oxford_flowers102", split="all", augment=Augment(flip=True, jitter=True),
+        caption_templates=("a photo of a {}",), validation=HoldOut(records=128)))
+    data_read: Read | None = None
+    """How the data is read: 'memory', 'indexed' or 'streamed'. None leaves it
+    to the sources: memory for records held in memory, indexed for a store
+    that reads by index, streamed otherwise."""
+    provision: bool = False
+    data_seed: int = 0
+    loading: Loading = dataclasses.field(default_factory=Loading)
+    validation_records: int | None = None
     optim: OptimConfig = dataclasses.field(default_factory=OptimConfig)
     trainer: TrainerConfig = dataclasses.field(default_factory=TrainerConfig)
     objective: ObjectiveConfig | None = None
@@ -1093,11 +1135,15 @@ class RunConfig:
         """Build what this run trains: the objective its record names around
         its model, on its data. A kind of run with settings of its own builds
         from them in its own `prepare`."""
+        self = dataclasses.replace(self, trainer=self.trainer.derived())
         if self.objective is None or self.lora is not None:
             raise ValueError(f"{type(self).__name__} builds the objective it names around its whole model; "
                              "name an objective, and train an adapter as a kind of run that attaches one")
         objective = self.objective.build(model=self.model.build())
-        dataset = self.data.load(batch=self.trainer.batch_size)
+        dataset = loader(self.data, batch=self.trainer.batch_size, tokens=self.trainer.batch_tokens,
+                       read=self.data_read,
+                       provision=self.provision, seed=self.data_seed, loading=self.loading,
+                       validation_records=self.validation_records, objective=objective.data())
         return Prepared(self, lambda name: self.train(objective, dataset, name=name))
 
     def run(self) -> TrainState:
@@ -1142,7 +1188,7 @@ class RunConfig:
         return dataclasses.replace(self, objective=dataclasses.replace(
             stated, defaults={**stated.defaults, **resolved}))
 
-    def train(self, objective: Objective[Loss, Effects], dataset: Dataset, *, name: str,
+    def train(self, objective: Objective[Loss, Effects], dataset: Loader, *, name: str,
               metrics: Sequence[Metric] = (), rollout: Rollout | None = None,
               summary: Mapping[str, object] | None = None,
               validation: Mapping[str, Reader] | None = None,
@@ -1175,11 +1221,14 @@ class RunConfig:
         on and the run's directory before the checkpoint is published, as a
         decision run fits its calibration there, so what it writes is published.
         """
-        if dataset.batch != self.trainer.batch_size:
+        if self.trainer.batch_size is not None and dataset.batch != self.trainer.batch_size:
             raise ValueError(
                 f"--trainer.batch-size is {self.trainer.batch_size} and this dataset "
                 f"reads {dataset.batch} records a step; load it with "
                 f"load(batch={self.trainer.batch_size})")
+        if dataset.batch_tokens != self.trainer.batch_tokens:
+            raise ValueError(f"dataset.batch_tokens is {dataset.batch_tokens}, but trainer.batch_tokens is "
+                             f"{self.trainer.batch_tokens}; compile data with the trainer's token budget")
         if self.trainer.quantization is not None:
             quantize_trunk(objective, self.trainer.quantization)
         # The record names the run's directory, so its run.json trains the same run again.
@@ -1189,6 +1238,8 @@ class RunConfig:
         # Before the run length, since a ramp reads fewer records a step early
         # and a pass over the data is that many steps longer.
         dataset = dataset if trainer.batch_ramp is None else ramped(dataset, trainer.batch_ramp)
+        if dataset.plan is not None:
+            summary = {**(summary or {}), "data_plan": dataset.plan.record()}
         steps = trainer.total_steps(dataset)
         tracker = None
         try:
@@ -1222,7 +1273,7 @@ class RunConfig:
                 split=trainer.split, dynamic_scale=trainer.dynamic_scale, checkpoints=checkpoints,
                 tracker=tracker, rollout=rollout, profile=trainer.profile, lower_for=trainer.lower_for,
             ).fit(
-                dataset, steps=steps, total_tokens=trainer.total_tokens,
+                dataset, steps=steps, tokens=trainer.tokens,
                 log_every=trainer.log_every,
                 eval_every=trainer.eval_interval(dataset),
                 checkpoint_every=trainer.checkpoint_interval(dataset),

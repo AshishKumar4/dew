@@ -21,6 +21,7 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 from recording import RecordingTracker
 
 from dew.cache import enable_compilation_cache
+from dew.data.dataset import Loader
 from dew.objectives.lm import LMObjective
 from dew.registry import models
 from dew.telemetry.instrumentation import compiled_flops
@@ -29,16 +30,6 @@ from dew.training.distributed import shard_batch
 
 # Needs the eight simulated CPU devices conftest configures; the GPU lane skips it.
 pytestmark = pytest.mark.mesh
-
-
-class Data:
-    def __init__(self, train, batch=BATCH):
-        self._train, self.val, self.batch, self.records = train, None, batch, None
-
-    def train(self, partition):
-        return self._train()
-
-    steps_per_epoch = None
 
 
 def make_trainer(**kwargs):
@@ -247,7 +238,8 @@ def test_compiled_flops_counts_every_iteration_of_a_scanned_body():
 def test_fit_reports_throughput_to_the_tracker():
     """The logging tick carries the throughput numbers along with the loss."""
     tracker = RecordingTracker()
-    make_trainer(tracker=tracker).fit(Data(batches), steps=3, log_every=1)
+    make_trainer(tracker=tracker).fit(
+        Loader(lambda partition: batches(), None, batch=BATCH, records=None), steps=3, log_every=1)
 
     ticks = [p for _, p in tracker.scalars if "train/samples_per_sec" in p]
     assert len(ticks) == 3, "no throughput was logged"
@@ -293,7 +285,8 @@ def test_fit_reports_the_wait_on_input_and_a_later_compile():
             x = rng.normal(size=(rows, FEATURES)).astype(np.float32)
             yield {"x": x, "y": 2 * x[:, :2]}
 
-    make_trainer(tracker=tracker).fit(Data(slow), steps=steps, log_every=1)
+    make_trainer(tracker=tracker).fit(
+        Loader(lambda partition: slow(), None, batch=BATCH, records=None), steps=steps, log_every=1)
 
     ticks = [p for _, p in tracker.scalars if "train/step_time_ms" in p]
     assert len(ticks) == 10

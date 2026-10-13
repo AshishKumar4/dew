@@ -41,7 +41,8 @@ import numpy as np
 import optax
 
 from dew.config import ModelConfig, ObjectiveConfig, TrainerConfig
-from dew.data import Dataset, TFDSImages
+from dew.config.data import ImageData
+from dew.data.dataset import Loader
 from dew.diffusion.presets import Flow
 from dew.objectives.base import Step
 from dew.objectives.diffusion import DiffusionRunConfig, PretrainedAutoencoder, TextCondition
@@ -65,7 +66,7 @@ def run_config(directory):
         model=ModelConfig("simple_mmdit", {"patch_size": 2, "emb_features": 32, "num_layers": 1,
                                                "num_heads": 2, "mlp_ratio": 1,
                                                "dtype": "float32", "attention_impl": "reference"}),
-        data=TFDSImages(image_size=RES),
+        data=ImageData(source="tfds://oxford_flowers102", image_size=RES),
         trainer=TrainerConfig(checkpoint_dir=str(directory), batch_size=BATCH, steps=2),
         preset=Flow(), text=TextCondition(encoder="t5", checkpoint=str(T5_TINY), max_length=8),
         autoencoder=PretrainedAutoencoder(modelname=str(VAE_TINY), dtype="float32"),
@@ -97,7 +98,7 @@ def test_one_trainer_step_and_a_sample(tmp_path):
     loaded = objective.inputs.conditions["textcontext"].encoder.params["params"]
 
 
-    data = Dataset(train=lambda partition: batches(objective)(), val=None, records=None, batch=BATCH)
+    data = Loader(train=lambda partition: batches(objective)(), val=None, records=None, batch=BATCH)
     state = Trainer(objective, optax.adam(1e-3), key=jax.random.PRNGKey(0)).fit(
         data, steps=2, log_every=100)
     assert int(state.step) == 2

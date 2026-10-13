@@ -30,7 +30,8 @@ from reference_error import assert_leaves_as_exact
 
 from dew.artifacts import ImageGrid, Representations, TokenScores, VideoGrid
 from dew.config import ModelConfig, ObjectiveConfig
-from dew.data import TFDSImages
+from dew.config.data import ImageData
+from dew.data.dataset import Loader
 from dew.diffusion import presets
 from dew.inputs import Condition, ConditionEncoder, Field, InputSpec
 from dew.nn.attention import Stage
@@ -390,12 +391,10 @@ def run_case(case: Case, tmp_path, fsdp, devices=None, state=None):
     artifact, shape = expected_artifact(case)
     source = batches(case, encoder)
 
-    class Data:
-        train = staticmethod(lambda partition: source())
-        val = staticmethod(lambda partition: (batch for batch in [next(source())]))
-        batch = BATCH
-
-    state = trainer.fit(Data(), steps=2, log_every=1, eval_every=1,
+    data = Loader(train=lambda partition: source(),
+                   val=lambda partition: (batch for batch in [next(source())]),
+                   batch=BATCH, records=None)
+    state = trainer.fit(data, steps=2, log_every=1, eval_every=1,
                         metrics=(Spread(seen, artifact),), preview=True, state=state)
 
     assert dict(trainer.device_mesh.shape) == {"data": (devices or jax.device_count()) // fsdp, "expert": 1,
@@ -425,14 +424,12 @@ def truth(case: Case, tmp_path, initial):
     def wide(batch):
         return batch if case.is_lm else {**batch, case.sample_key: batch[case.sample_key].astype(np.float64)}
 
-    class Data:
-        train = staticmethod(lambda partition: map(wide, source()))
-        val = staticmethod(lambda partition: (wide(batch) for batch in [next(source())]))
-        batch = BATCH
-
+    data = Loader(train=lambda partition: map(wide, source()),
+                  val=lambda partition: (wide(batch) for batch in [next(source())]),
+                  batch=BATCH, records=None)
     wider = jax.tree.map(lambda leaf: leaf.astype(jnp.float64) if jnp.issubdtype(leaf.dtype, jnp.floating)
                          else jnp.copy(leaf), initial)
-    return trainer.fit(Data(), steps=2, state=wider)
+    return trainer.fit(data, steps=2, state=wider)
 
 
 KEY_PROJECTIONS = ("to_k", "k_proj")
@@ -682,7 +679,7 @@ JSON_UNET = {"emb_features": 32, "feature_depths": [8, 16], "norm_groups": 4,
 def unet_run(fields):
     return DiffusionRunConfig(
         model=ModelConfig("unet", {**fields, "dtype": "float32", "attention_impl": "reference"}),
-        data=TFDSImages(image_size=8), text=None,
+        data=ImageData(source="tfds://oxford_flowers102", image_size=8), text=None,
         objective=ObjectiveConfig("diffusion", {"guidance": None, "solver": Euler(), "steps": SAMPLER_STEPS}))
 
 
