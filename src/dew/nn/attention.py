@@ -50,6 +50,7 @@ from .rope import rotate
 from .sharding import (
     HEADS,
     KV_HEADS,
+    SCORES,
     SEQUENCE_AXIS,
     LayoutRefused,
     constrain,
@@ -58,7 +59,6 @@ from .sharding import (
     manual_map,
     mesh_axes,
     row_axes,
-    rows_spec,
     sequence_shards,
     split_positions,
 )
@@ -73,8 +73,9 @@ field, a module's `attention_impl`, and `scaled_dot_product_attention`'s
 'reference' is the portable einsum and softmax, and the only path that reads
 dtype, precision and force_fp32_for_softmax. 'xla' and 'cudnn' are
 `jax.nn.dot_product_attention`'s own two. 'triton' is tokamax's Pallas-Triton
-flash kernel (`triton_attention`). 'flash' is FlashAttention-2 (`flash_attention`), from
-the dew_flash_attn wheel (docs/installation.md). 'tpu' is the
+flash kernel (`triton_attention`). 'flash' is FlashAttention (`flash_attention`),
+FlashAttention-3 on Hopper and FlashAttention-2 elsewhere, from the
+dew_flash_attn wheel (docs/installation.md). 'tpu' is the
 pallas splash kernel, with the older pallas flash kernel behind it for the
 calls splash's mask descriptor cannot carry.
 'auto', every module's default, resolves per trace (`resolve_implementation`),
@@ -643,7 +644,8 @@ def cudnn_attention(query, key, value, bias, mask, causal, sliding_window,
     tokens, most text-plus-image sequences), so one zero row pads it even. The
     padded query row is sliced off and the padded key hidden by the kernel's
     key_value_seq_lengths, which never reach past the real keys.
-    tests/test_kernels.py pins the equality with the xla path.
+    tests/test_kernels.py pins the equality with the xla path. On a mesh it
+    runs per shard (`_per_shard`).
     """
     q_len, kv_len = query.shape[-3], key.shape[-3]
     # jax's cudnn call takes a mask or bias only at the full [.., Q, K]
@@ -666,13 +668,20 @@ def cudnn_attention(query, key, value, bias, mask, causal, sliding_window,
     kv_lengths = key_value_seq_lengths
     if kv_lengths is None and kv_pad:
         kv_lengths = jnp.full(key.shape[:1], kv_len, jnp.int32)
-    # A window of (l, r) keeps the l keys before the query and the r after it
-    # on both the xla and the cudnn path, the sides `window_sides` counts.
-    out = jax.nn.dot_product_attention(
-        query, key, value, bias=bias, mask=mask, is_causal=causal,
-        key_value_seq_lengths=kv_lengths,
-        local_window_size=None if sliding_window is None else window_sides(causal, sliding_window),
-        implementation='cudnn')
+
+    def local(query, key, value, bias=None, mask=None, key_value_seq_lengths=None):
+        # A window of (l, r) keeps the l keys before the query and the r after it
+        # on both the xla and the cudnn path, the sides `window_sides` counts.
+        return jax.nn.dot_product_attention(
+            query, key, value, bias=bias, mask=mask, is_causal=causal,
+            key_value_seq_lengths=key_value_seq_lengths,
+            local_window_size=None if sliding_window is None else window_sides(causal, sliding_window),
+            implementation='cudnn')
+
+    out = _per_shard(local, query, key, value,
+                    bias=(None if bias is None else _four_dimensional(bias), SCORES),
+                    mask=(None if mask is None else _four_dimensional(mask), SCORES),
+                    key_value_seq_lengths=(kv_lengths, ("activation_batch",)))
     return out[:, :q_len] if q_pad else out
 
 
@@ -724,7 +733,7 @@ def sequence_parallel_attention(kernel, query, key, value, shards: int, *, causa
     docs/guides/multi-node.md), and it never sends more bytes. A call with no
     mask takes the exchange that sends fewer (`all_to_all_moves_less`).
     """
-    tensor = _tensor_shards(query)
+    tensor = tensor_shards(query)
     heads, kv_heads = query.shape[-2], key.shape[-2]
     masked = causal or sliding_window is not None or mask is not None
     exchangeable = (heads % (tensor * shards) == 0
@@ -772,14 +781,14 @@ def _entry(spec: P, dimension: int):
     return spec[dimension] if dimension < len(spec) else None
 
 
-def _tensor_shards(query) -> int:
+def tensor_shards(query) -> int:
     """How many ways the mesh's tensor axes split the query heads."""
     mesh = jax.sharding.get_abstract_mesh()
     return math.prod(mesh.shape[axis]
                      for axis in mesh_axes(_entry(logical_spec(HEADS, query.shape), 2)))
 
 
-def _split_with_queries(key, value, split: int):
+def split_with_queries(key, value, split: int):
     """`key` and `value` with their heads repeated to the least common multiple
     of their count and `split`, the ways the mesh splits the query heads, so
     each shard holds the key heads its query heads read."""
@@ -787,15 +796,31 @@ def _split_with_queries(key, value, split: int):
     return repeat_kv_heads(key, heads), repeat_kv_heads(value, heads)
 
 
-def _per_shard(local, query, key, value):
-    """`local(query, key, value)`, a kernel with no partitioning rule, on each
-    shard's rows and heads (`manual_map`), the key heads repeated until the
-    tensor axes split them as they split the query's; whole off a mesh."""
-    if jax.sharding.get_abstract_mesh().empty:
-        return local(query, key, value)
-    key, value = _split_with_queries(key, value, _tensor_shards(query))
+def _per_shard(local, query, key, value, **extras):
+    """`local(query, key, value, **extras)` on each shard's rows and heads
+    (`manual_map`), the key heads repeated until the tensor axes split them as
+    they split the query's; whole off a mesh, or inside a map that already
+    holds every axis manual (the sequence exchanges). A Pallas kernel has no
+    partitioning rule, and jax's cuDNN attention partitions through
+    `custom_partitioning`, whose lowering on several devices names the
+    partitioner by a process address (`str(id(...))` in its backend config),
+    which the persistent cache key keeps, so every fresh process would compile
+    again; under a fully manual map jax lowers neither. `extras` maps each
+    further argument to its array, or None, and the logical axes it splits on.
+    """
+    given = {name: pair for name, pair in extras.items() if pair[0] is not None}
+    mesh = jax.sharding.get_abstract_mesh()
+    if mesh.empty or set(mesh.axis_names) <= set(mesh.manual_axes):
+        return local(query, key, value, **{name: x for name, (x, _) in given.items()})
+    key, value = split_with_queries(key, value, tensor_shards(query))
     queries, keys = logical_spec(HEADS, query.shape), logical_spec(KV_HEADS, key.shape)
-    return manual_map(local, (queries, keys, keys), queries)(query, key, value)
+    names = tuple(given)
+
+    def shard(query, key, value, *arrays):
+        return local(query, key, value, **dict(zip(names, arrays, strict=True)))
+
+    specs = (queries, keys, keys, *(logical_spec(axes, x.shape) for x, axes in given.values()))
+    return manual_map(shard, specs, queries)(query, key, value, *(x for x, _ in given.values()))
 
 
 def _four_dimensional(x):
@@ -836,7 +861,7 @@ def exchanged_heads_attention(kernel, query, key, value, shards: int, *, causal,
             f"({query.shape[1]}, {key.shape[1]}) {shards} ways, and one of them does "
             "not divide. `gathered_keys_attention` takes any head count and key "
             "length; `sequence_parallel_attention` picks it for such a call.")
-    key, value = _split_with_queries(key, value, split)
+    key, value = split_with_queries(key, value, split)
     keys = logical_spec(KV_HEADS, key.shape)
 
     # After the all-to-all a shard holds its tensor shard's heads split again
@@ -882,7 +907,7 @@ def gathered_keys_attention(kernel, query, key, value, shards: int, *, causal,
     and the caller's rotary angles stay exact.
     """
     q_len, kv_len = query.shape[1], key.shape[1]
-    key, value = _split_with_queries(key, value, _tensor_shards(query))
+    key, value = split_with_queries(key, value, tensor_shards(query))
 
     reordered = causal or sliding_window is not None or mask is not None
     if reordered:
@@ -912,8 +937,7 @@ def gathered_keys_attention(kernel, query, key, value, shards: int, *, causal,
     for name, x in (('mask', mask), ('bias', bias)):
         if x is not None:
             x = _four_dimensional(x)
-            extras[name] = (x, logical_spec(
-                ("activation_batch", "activation_heads", "activation_length", None), x.shape))
+            extras[name] = (x, logical_spec(SCORES, x.shape))
     if sinks is not None:
         extras['sinks'] = (sinks, logical_spec(("activation_heads",), sinks.shape))
     if key_value_seq_lengths is not None:
@@ -1013,13 +1037,14 @@ def flash_built_for(generation: str, architectures: tuple[str, ...]) -> bool:
 
 def flash_refusal(query, key, causal=False, sliding_window=None, mask=None, bias=None, softcap=None,
                   sinks=None) -> str | None:
-    """Why 'auto' does not send a call to FlashAttention-2 (`flash_attention`),
-    or None where it does: the GPU's target row names it, the query is bf16
-    or fp16 with heads a multiple of 8 up to 256 wide (192 on sm8x parts other
+    """Why 'auto' does not send a call to FlashAttention (`flash_attention`),
+    or None where it does: the GPU's target row names it, and names it for a
+    sliding window or sinks where the call has them, the query is bf16 or
+    fp16 with heads a multiple of 8 up to 256 wide (192 on sm8x parts other
     than sm80, whose backward takes no wider), a causal call is square, the
-    call has no window, mask, bias, softcap or sinks, no deterministic ops are
-    asked for, which its backward's atomic sum of the query gradient would
-    not keep, and the installed dew_flash_attn holds code for this GPU."""
+    call has no mask, bias or softcap, no deterministic ops are asked for,
+    which its backward's atomic sum of the query gradient would not keep, and
+    the installed dew_flash_attn holds code for this GPU."""
     head_dim = query.shape[-1]
     generation = device_generation()
     architectures = flash_architectures()
@@ -1028,14 +1053,16 @@ def flash_refusal(query, key, causal=False, sliding_window=None, mask=None, bias
     return first_refusal(
         (gpu_placed() and measured_kernel('attention', 'cudnn') == 'flash',
          "its target row names it for no other device"),
+        (sliding_window is None or measured_kernel('attention_window', 'cudnn') == 'flash',
+         f"the call has a sliding window, for which its target row names it on no {generation}"),
+        (sinks is None or measured_kernel('attention_sinks', 'xla') == 'flash',
+         f"the call has attention sinks, for which its target row names it on no {generation}"),
         (query.dtype in CUDNN_DTYPES, f"the query is {query.dtype}"),
         (head_dim % 8 == 0 and head_dim <= widest, f"the heads are {head_dim} wide"),
         (not causal or query.shape[-3] == key.shape[-3], "a causal call has more keys than queries"),
-        (sliding_window is None, "the call has a sliding window"),
         (mask is None, "the call has a mask"),
         (bias is None, "the call has a bias"),
         (softcap is None, "the call has a logit softcap"),
-        (sinks is None, "the call has attention sinks"),
         (not deterministic_ops_requested(), "--xla_gpu_deterministic_ops is set"),
         (architectures is not None, "dew_flash_attn is not installed"),
         (architectures is None or flash_built_for(generation, architectures),
@@ -1043,12 +1070,15 @@ def flash_refusal(query, key, causal=False, sliding_window=None, mask=None, bias
     )
 
 
-def flash_attention(query, key, value, causal: bool):
-    """FlashAttention-2 (dew_flash_attn, kernels/flash_attn) over `[B, S, H, D]`
-    arrays at jax.nn's default scale. Its causal mask is aligned to the last
-    key, where jax.nn's is aligned to the first, so a causal call is square.
-    On a mesh it runs per shard (`_per_shard`). It runs where the installed
-    wheel holds code for the device (`flash_built_for`)."""
+def flash_attention(query, key, value, causal: bool, sliding_window=None, sinks=None):
+    """FlashAttention (dew_flash_attn, kernels/flash_attn) over `[B, S, H, D]`
+    arrays at jax.nn's default scale: FlashAttention-3 on Hopper and
+    FlashAttention-2 elsewhere. A window keeps the keys `window_sides` counts,
+    and `sinks` `[H]` puts one value-free logit a head in each row's
+    denominator. Its causal mask is
+    aligned to the last key, where jax.nn's is aligned to the first, so a
+    causal call is square. On a mesh it runs per shard (`_per_shard`). It runs
+    where the installed wheel holds code for the device (`flash_built_for`)."""
     generation = device_generation()
     architectures = flash_architectures()
     if architectures is None:
@@ -1057,9 +1087,12 @@ def flash_attention(query, key, value, causal: bool):
         raise ValueError(f"the installed dew_flash_attn holds code for {', '.join(architectures)} and this "
                          f"device is {generation}; use attention_impl 'cudnn' or 'xla'")
     flash = importlib.import_module('dew_flash_attn')
+    window = (-1, -1) if sliding_window is None else window_sides(causal, sliding_window)
 
-    return _per_shard(lambda query, key, value: flash.flash_mha(query, key, value, is_causal=causal),
-                      query, key, value)
+    def local(query, key, value, sinks=None):
+        return flash.flash_mha(query, key, value, is_causal=causal, window_size=window, sinks=sinks)
+
+    return _per_shard(local, query, key, value, sinks=(sinks, ("activation_heads",)))
 
 
 def triton_attention(query, key, value, causal: bool):
@@ -1394,22 +1427,27 @@ def fused_attention(query, key, value, bias, mask, causal, sliding_window, imple
                 "bidirectional call windows both sides; use attention_impl 'xla'.")
         out = cudnn_attention(query, key, value, bias, mask, causal, sliding_window,
                               key_value_seq_lengths)
-    elif implementation in ('triton', 'flash'):
+    elif implementation == 'triton':
         if any(x is not None for x in (sinks, softcap, bias, mask, sliding_window, key_value_seq_lengths)):
             raise ValueError(
-                f"attention implementation '{implementation}' takes no sinks, softcap, bias, mask, "
-                "window or key lengths; use attention_impl 'cudnn' or 'xla' for this call.")
-        if implementation == 'flash' and query.dtype not in CUDNN_DTYPES:
+                "attention implementation 'triton' takes no sinks, softcap, bias, mask, window or key "
+                "lengths; use attention_impl 'cudnn' or 'xla' for this call.")
+        out = triton_attention(query, key, value, causal)
+    elif implementation == 'flash':
+        if any(x is not None for x in (softcap, bias, mask, key_value_seq_lengths)):
+            raise ValueError(
+                "attention implementation 'flash' takes no softcap, bias, mask or key lengths; use "
+                "attention_impl 'cudnn' or 'xla' for this call.")
+        if query.dtype not in CUDNN_DTYPES:
             raise ValueError(f"flash attention needs bf16 or fp16 inputs, the query is {query.dtype}")
-        if implementation == 'flash' and causal and query.shape[-3] != key.shape[-3]:
+        if causal and query.shape[-3] != key.shape[-3]:
             raise ValueError("flash attention aligns its causal mask to the last key, so a causal call "
                              f"needs as many queries as keys, not {query.shape[-3]} and {key.shape[-3]}")
-        if implementation == 'flash' and deterministic_ops_requested():
+        if deterministic_ops_requested():
             raise ValueError("attention implementation 'flash' cannot run under --xla_gpu_deterministic_ops: "
                              "its backward sums the query gradient with atomics. "
                              "Use attention_impl 'xla'.")
-        attend = triton_attention if implementation == 'triton' else flash_attention
-        out = attend(query, key, value, causal)
+        out = flash_attention(query, key, value, causal, sliding_window, sinks)
     elif (implementation == 'xla' and mask is None and folds(query, key, bias, mask, causal, sliding_window)
           and key_value_seq_lengths is not None and decode_attention.fits(query, key)):
         out = decode_attention.attend(query, key, value, key_value_seq_lengths)
@@ -1667,239 +1705,6 @@ def kernel_for_materialized_mask(implementation: str, query, *, dtype=None, prec
     if implementation in ('auto', 'cudnn', 'xla') and _xla_kernel_narrows(query):
         return 'reference'
     return 'xla' if implementation in ('auto', 'cudnn') else implementation
-
-
-def _blocks(x, block: int, blocks: int):
-    """`[B, S, ...]` padded at the end to `blocks * block` rows, as `[B, blocks, block, ...]`."""
-    x = jnp.pad(x, [(0, 0), (0, blocks * block - x.shape[1])] + [(0, 0)] * (x.ndim - 2))
-    return x.reshape(x.shape[0], blocks, block, *x.shape[2:])
-
-
-def _banded(x, before=None):
-    """Each block of `[B, n, W, ...]` behind the block before it: `[B, n, 2W, ...]`.
-
-    `before` `[B, 1, W, ...]` is the block before the first: under a sequence
-    axis, the previous shard's last `W` rows. None is zeros, whose rows are
-    negative and so outside every query's causal reach.
-    """
-    if before is None:
-        before = jnp.zeros_like(x[:, :1])
-    return jnp.concatenate([jnp.concatenate([before, x[:, :-1]], axis=1), x], axis=2)
-
-
-def local_attention(query, key, value, *, window: int | None = None, chunk: int | None = None,
-                    positions=None, segment_ids=None, valid=None, dtype=None, precision=None,
-                    force_fp32_for_softmax=True, implementation='auto', sinks=None,
-                    softcap=None):
-    """Causal self-attention in which each query reads only nearby keys, in
-    memory linear in the sequence.
-
-    `window=w` is sliding attention: a query reads itself and the w - 1 keys
-    before it (Mistral, Gemma, MaxText's `sliding_window_size`). `chunk=c` is
-    chunked local attention: a query reads the keys at or before it in its
-    chunk, `position // c` (Llama 4's `attention_chunk_size`). Exactly one is
-    set. `positions` `[S]` or `[B, S]` places the chunks (None is the row
-    index), `segment_ids` keeps packed documents apart (0 is padding) and
-    `valid` `[B, S]` drops the keys it marks False.
-
-    No `[S, S]` array is built above two spans. A window cudnn (no sinks or
-    packing) or splash takes as a flag runs there, skipping blocks outside it.
-    Chunks that start at row multiples fold into the batch. Everything else
-    runs banded: query blocks of the span against their own block and the one
-    before under a `[W, 2W]` mask, so the logits are `[S, 2W]` per head. Banding
-    pads to whole spans, so at most two spans take the dense call.
-    """
-    if (window is None) == (chunk is None):
-        raise ValueError("local attention takes exactly one of window and chunk")
-    span = window if window is not None else chunk
-    assert span is not None
-    if span < 1:
-        raise ValueError(f"a local span is a positive number of keys, got {span}")
-    length = query.shape[1]
-    if key.shape[1] != length:
-        raise ValueError(
-            f"local attention is self-attention: {length} queries against "
-            f"{key.shape[1]} keys")
-    whole = functools.partial(
-        scaled_dot_product_attention, query, key, value, dtype=dtype, precision=precision,
-        force_fp32_for_softmax=force_fp32_for_softmax, sinks=sinks, softcap=softcap)
-    resolved = resolve_implementation(
-        implementation, query, key, dtype=dtype, precision=precision,
-        force_fp32_for_softmax=force_fp32_for_softmax, softcap=softcap, sinks=sinks,
-        causal=True, sliding_window=window)
-    # A mask built here is at most `[S, 2W]` per head, so cudnn takes it as
-    # its additive bias where cudnn runs (docs/performance.md: 16384 packed
-    # tokens at window 4096 in 0.60 GiB of temporaries on an L4, where xla
-    # asked for 10.0 GiB at 8192).
-    masked = 'cudnn' if resolved == 'cudnn' else kernel_for_materialized_mask(
-        implementation, query, dtype=dtype, precision=precision,
-        force_fp32_for_softmax=force_fp32_for_softmax)
-    if window is not None and valid is None:
-        # An explicit 'tpu' at a length splash cannot tile would reach the
-        # flash kernel, whose default 128-row blocks must divide the length
-        # (flash_attention.py:113-128, 1707-1715), so it would raise there.
-        on_splash = resolved == 'tpu' and length % SPLASH_LANES == 0
-        if on_splash or (segment_ids is None and (
-                (resolved in ('cudnn', 'tpu') and sinks is None) or length <= 2 * span)):
-            return whole(implementation=implementation, causal=True, sliding_window=window,
-                         segment_ids=segment_ids)
-    shards = sequence_shards()
-    # Under a sequence axis each shard's first block reads the previous
-    # shard's last `span` rows, which only one neighbour holds when a shard's
-    # slice is at least that long. A wider span takes the dense call, whose
-    # mask the sequence exchange carries.
-    halo = length % shards == 0 and length // shards >= span
-    if length <= 2 * span or not halo:
-        places = jnp.arange(length) if positions is None else positions
-        mask = (None if chunk is None or (positions is None and length <= chunk)
-                else chunk_mask(places, places, chunk))
-        if segment_ids is not None:
-            mask = with_documents(mask, segment_ids)
-        if valid is not None:
-            live = jnp.asarray(valid, bool)[:, None, None, :]
-            mask = live if mask is None else mask & live
-        if mask is None:
-            return whole(implementation=implementation, causal=True, sliding_window=window)
-        return whole(implementation=masked, mask=combined_attention_mask(
-            length, length, causal=True, sliding_window=window, mask=mask))
-    kernel = functools.partial(
-        attention_kernel, dtype=dtype, precision=precision,
-        force_fp32_for_softmax=force_fp32_for_softmax, softcap=softcap)
-    if shards > 1:
-        out = _local_over_sequence(
-            kernel, query, key, value, shards, window=window, chunk=chunk, positions=positions,
-            segment_ids=segment_ids, valid=valid, sinks=sinks, implementation=implementation,
-            masked=masked)
-    else:
-        out = _local_blocks(functools.partial(kernel, sinks=sinks), query, key, value,
-                            window=window, chunk=chunk, positions=positions,
-                            segment_ids=segment_ids, valid=valid,
-                            implementation=implementation, masked=masked)
-    return checkpoint_name(out, 'attention_output')
-
-
-def _local_over_sequence(kernel, query, key, value, shards: int, *, window, chunk, positions,
-                         segment_ids, valid, sinks, implementation, masked):
-    """`_local_blocks` over a sequence the mesh's sequence axis splits, in a
-    `shard_map`: each shard computes its own rows, and one `ppermute` hands its
-    first block the previous shard's last `span` keys, values, positions,
-    segment ids and validity (zeros on the first shard). That halo is all that
-    crosses the interconnect; chunks starting at the shard boundaries need none.
-    Heads split over the tensor axis as the exchanges split them."""
-    batch, length = query.shape[:2]
-    span = window if window is not None else chunk
-    assert span is not None
-    queries = logical_spec(HEADS, query.shape)
-    key, value = _split_with_queries(key, value, _tensor_shards(query))
-    keys = logical_spec(KV_HEADS, key.shape)
-    fields = {}
-    if positions is not None:
-        fields['positions'] = jnp.broadcast_to(jnp.asarray(positions), (batch, length))
-    if segment_ids is not None:
-        fields['segment_ids'] = segment_ids
-    if valid is not None:
-        fields['valid'] = jnp.asarray(valid, bool)
-    rows = logical_spec(("activation_batch", "activation_length"), (batch, length))
-    specs = [rows] * len(fields)
-    if sinks is not None:
-        fields['sinks'] = sinks
-        specs.append(logical_spec(("activation_heads",), sinks.shape))
-    names = tuple(fields)
-    local_length = length // shards
-    # Chunks that start at every shard's first row stay inside their shard.
-    aligned = chunk is not None and positions is None and local_length % chunk == 0
-
-    def local(query, key, value, *arrays):
-        given = dict(zip(names, arrays, strict=True))
-        forward = [(shard, shard + 1) for shard in range(shards - 1)]
-
-        def last_rows(x):
-            if x is None:
-                return None
-            return jax.lax.ppermute(x[:, local_length - span:], SEQUENCE_AXIS, forward)
-
-        before = None if aligned else tuple(
-            last_rows(x) for x in (key, value, given.get('positions'),
-                                   given.get('segment_ids'), given.get('valid')))
-        return _local_blocks(
-            functools.partial(kernel, sinks=given.get('sinks')), query, key, value,
-            window=window, chunk=chunk, positions=given.get('positions'),
-            segment_ids=given.get('segment_ids'), valid=given.get('valid'),
-            implementation=implementation, masked=masked,
-            offset=jax.lax.axis_index(SEQUENCE_AXIS) * local_length, before=before)
-
-    attended = manual_map(local, (queries, keys, keys, *specs), queries)
-    return attended(query, key, value, *fields.values())
-
-
-def _local_blocks(kernel, query, key, value, *, window, chunk, positions, segment_ids, valid,
-                  implementation, masked, offset=0, before=None):
-    """`local_attention`'s blocked computation over the `[B, S, ...]` rows it
-    is handed, which start at row `offset` of the sequence.
-
-    `before` holds what the first rows read before them: the previous `span`
-    rows' keys, values, positions, segment ids and validity, each None where
-    the call has none. None is the start of the sequence, where nothing comes
-    before, and chunks start at row multiples from there."""
-    batch, length = query.shape[0], query.shape[1]
-    span = window if window is not None else chunk
-    assert span is not None
-    blocks = -(-length // span)
-    flags_only = segment_ids is None and valid is None
-
-    def folded(x, width: int):
-        return x.reshape(batch * blocks, width, *x.shape[3:])
-
-    def row_blocks(x):
-        return _blocks(jnp.broadcast_to(jnp.asarray(x), (batch, length)), span, blocks)
-
-    def preceding(index):
-        # The halo field at `index`, as the one block before the first.
-        return None if before is None else before[index][:, None]
-
-    if chunk is not None and positions is None and before is None:
-        mask = None
-        if not flags_only:
-            keep = jnp.ones((batch, blocks, span, span), bool)
-            if segment_ids is not None:
-                segments = row_blocks(segment_ids)
-                keep = keep & ((segments[..., :, None] == segments[..., None, :])
-                               & (segments[..., :, None] != 0))
-            if valid is not None:
-                keep = keep & row_blocks(jnp.asarray(valid, bool))[..., None, :]
-            mask = keep.reshape(batch * blocks, 1, span, span)
-            implementation = masked
-        out = kernel(*(folded(_blocks(x, span, blocks), span) for x in (query, key, value)),
-                     implementation=implementation, causal=True, mask=mask)
-    else:
-        rows = offset + jnp.arange(blocks * span).reshape(1, blocks, span)
-        key_rows = jnp.concatenate([rows - span, rows], axis=-1)
-        keep = ((key_rows[..., None, :] >= 0)
-                & (key_rows[..., None, :] <= rows[..., :, None]))
-        if window is not None:
-            keep = keep & (rows[..., :, None] - key_rows[..., None, :] < window)
-        keep = jnp.broadcast_to(keep, (batch, blocks, span, 2 * span))
-        if chunk is not None and positions is None:
-            keep = keep & (rows[..., :, None] // chunk == key_rows[..., None, :] // chunk)
-        elif chunk is not None:
-            places = row_blocks(positions) // chunk
-            earlier = preceding(2)
-            keep = keep & (places[..., :, None] == _banded(
-                places, None if earlier is None else earlier // chunk)[..., None, :])
-        if segment_ids is not None:
-            segments = row_blocks(segment_ids)
-            keep = keep & ((segments[..., :, None] == _banded(segments, preceding(3))[..., None, :])
-                           & (segments[..., :, None] != 0))
-        if valid is not None:
-            keep = keep & _banded(row_blocks(jnp.asarray(valid, bool)),
-                                  preceding(4))[..., None, :]
-        out = kernel(folded(_blocks(query, span, blocks), span),
-                     folded(_banded(_blocks(key, span, blocks), preceding(0)), 2 * span),
-                     folded(_banded(_blocks(value, span, blocks), preceding(1)), 2 * span),
-                     implementation=masked,
-                     mask=keep.reshape(batch * blocks, 1, span, 2 * span))
-    unfolded = (batch, blocks * span, *out.shape[2:])
-    return jax.lax.reshape(out, unfolded, out_sharding=rows_spec(out, len(unfolded)))[:, :length]
 
 
 # Splash's tile size. At 1024 the forward kernel holds 4 MiB of fp32 logits
@@ -2277,8 +2082,9 @@ class FlaxGEGLU(nn.Module):
     """Project to twice the hidden width, then gate one half by the other.
 
     The gate is GELU, the gated linear unit of Shazeer 2020
-    (https://arxiv.org/abs/2002.05202). The hidden width is four times
-    `dim`.
+    (https://arxiv.org/abs/2002.05202), whose product a gated MLP takes
+    (`dew.nn.moe.gated_product`); diffusers stores the up half first. The
+    hidden width is four times `dim`.
     """
 
     dim: int
@@ -2298,9 +2104,12 @@ class FlaxGEGLU(nn.Module):
         self.proj = nn.Dense(self.projections()["proj"][1], dtype=self.dtype, precision=self.precision)
 
     def __call__(self, hidden_states):
+        # Imported here: dew.nn.moe reaches this module through dew.nn.blocks.
+        from .moe import gated_product
+
         hidden_states = self.proj(hidden_states)
         hidden_linear, hidden_gelu = jnp.split(hidden_states, 2, axis=-1)
-        return hidden_linear * nn.gelu(hidden_gelu, approximate=self.approximate)
+        return gated_product('geglu' if self.approximate else 'geglu_exact')(hidden_gelu, hidden_linear)
 
 
 @logical_axes({("net_0", "proj"): ("embed", "mlp"), ("net_2",): ("mlp", "embed")})
