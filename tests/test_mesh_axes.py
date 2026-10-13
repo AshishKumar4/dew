@@ -279,9 +279,7 @@ def test_a_native_mesh_of_its_own_axes_trains_saves_and_resumes_as_one_device(tm
     over both fsdp levels and the rows over all three axes, and two steps,
     a checkpoint and a resumed third step train what one device trains in
     three, as a `MeshSpec` mesh does. A rule naming an axis the mesh lacks
-    is refused before anything is placed. `jax.make_mesh`'s axes are
-    Explicit: its rows split as their type places them, and a parameter
-    the rules put on one is refused by name."""
+    is refused before anything is placed."""
     layers = delta_layers(fused=False) if hybrid else {}
     native = Mesh(np.asarray(jax.devices()[:8]).reshape(2, 2, 2), ("replica", "zero", "zero2"))
     layout = Layout(rules=NATIVE_RULES, data_axes=("replica", "zero", "zero2"), min_shard=TINY_SHARD)
@@ -306,12 +304,24 @@ def test_a_native_mesh_of_its_own_axes_trains_saves_and_resumes_as_one_device(tm
     with pytest.raises(ValueError, match="zer0"):
         native_trainer(native, misspelt, None, **layers).fit(data, steps=1)
 
-    typed = native_trainer(jax.make_mesh((8,), ("data",), axis_types=(AxisType.Explicit,)), plain, None,
-                           **layers).fit(data, steps=3)
+
+@pytest.mark.mesh(devices=8)
+def test_a_meshs_explicit_axes_split_rows_and_hold_no_parameter(tmp_path):
+    """`jax.make_mesh`'s axes are Explicit unless named otherwise. The rows
+    split over one as their type places them and train what one device
+    trains; a parameter the rules put on one is refused by name, since the
+    partitioner places parameters."""
+    data = token_windows(tmp_path / "tokens")
+    plain = Layout(min_shard=TINY_SHARD)
+    whole = native_trainer(Mesh(np.asarray(jax.devices()[:1]), ("data",)), plain, None).fit(data, steps=3)
+    typed = native_trainer(jax.make_mesh((8,), ("data",), axis_types=(AxisType.Explicit,)), plain,
+                           None).fit(data, steps=3)
     assert_trains_alike(*jax.device_get((typed.variables["params"], whole.variables["params"])))
-    explicit = jax.make_mesh((2, 2, 2), native.axis_names, axis_types=(AxisType.Explicit,) * 3)
-    with pytest.raises(ValueError, match=r"Explicit axes \['zero', 'zero2'\]"):
-        native_trainer(explicit, layout, None, **layers).fit(data, steps=1)
+
+    explicit = jax.make_mesh((2, 2, 2), ("replica", "zero", "zero2"), axis_types=(AxisType.Explicit,) * 3)
+    layout = Layout(rules=NATIVE_RULES, data_axes=explicit.axis_names, min_shard=TINY_SHARD)
+    with pytest.raises(ValueError, match=r"variables/params/\S+ on the Explicit axes \['zero', 'zero2'\]"):
+        native_trainer(explicit, layout, None).fit(data, steps=1)
 
 
 @pytest.mark.parametrize(("bytes_per_second", "peak", "platform", "spreads"), [

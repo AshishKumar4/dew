@@ -452,7 +452,8 @@ def _variable_path(path) -> str:
     """Spell a leaf's logical path as `host_parameters` patterns are written:
     `params/layers_3/self_attn/q_proj/kernel`, the collection first."""
     return "/".join(
-        entry.key if isinstance(entry, jax.tree_util.DictKey) else str(entry.idx)
+        entry.key if isinstance(entry, jax.tree_util.DictKey)
+        else entry.name if isinstance(entry, jax.tree_util.GetAttrKey) else str(entry.idx)
         for entry in path)
 
 
