@@ -46,7 +46,7 @@ from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.precision import at_least_fp32
 from dew.nn.rope import YarnScaling, deinterleaved, rotate, yarn_query_scale, yarn_rope_freqs
 from dew.nn.sharding import RESIDUAL, LogicalAxes, constrain, down_projection, logical_axes
-from dew.nn.sparse_selection import selection_mask, sparse_latent_attention, top_k_selection
+from dew.nn.sparse_selection import index_scores, selection_mask, sparse_latent_attention, top_k_selection
 
 
 def open_mla_cache(module: nn.Module, names: tuple[str, str], first, second, index_keys,
@@ -213,14 +213,7 @@ class SparseIndexer(nn.Module):
         q_rot, q_pass = jnp.split(query, [self.rope_head_dim], axis=-1)
         query = jnp.concatenate(
             [_rotate(self.rope_interleave, q_rot, freqs_cos, freqs_sin), q_pass], axis=-1)
-        wide = at_least_fp32(query.dtype)
-        scores = jnp.matmul(
-            query.astype(wide),
-            jnp.expand_dims(keys.astype(wide).transpose(0, 2, 1), -3))
-        scores = jnp.maximum(scores * (self.head_dim ** -0.5), 0)
-        weights = self.weights_proj(hidden).astype(wide)
-        weights = weights * (self.n_heads ** -0.5)
-        return jnp.matmul(weights[..., None, :], scores).squeeze(-2)
+        return index_scores(query, keys, self.weights_proj(hidden), self.precision)
 
     def select(self, scores, keep):
         """The top-k keys of each query among those `keep` allows, as
