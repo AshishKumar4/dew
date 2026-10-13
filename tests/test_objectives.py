@@ -6,6 +6,10 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 
+from dew.data import Memory
+from dew.data.compile import validation
+from dew.data.pipeline import Pipeline
+from dew.data.steps.generic import Formatting
 from dew.objectives.base import Objective, Ratio, Step, everything, merge, select, under
 
 
@@ -143,7 +147,7 @@ def test_a_supplied_gradient_is_what_the_trainer_steps_with():
     """The statistics keep their value, the derivative of the reduced loss
     is the supplied rule over the mass, and two microbatches of a window
     pool their rules by mass, as the trainer pools `jax.grad`'s."""
-    from affine_run import Data
+    from affine_run import dataset
 
     from dew.training import Layout, Trainer
 
@@ -157,7 +161,7 @@ def test_a_supplied_gradient_is_what_the_trainer_steps_with():
 
     trainer = Trainer(objective, optax.sgd(0.5), key=jax.random.key(0), accumulation=2,
                       layout=Layout(min_shard=1, tolerance=1.0))
-    stepped = trainer.fit(Data(lambda: iter([{"x": x} for x in rows]), batch=8), steps=2).variables
+    stepped = trainer.fit(dataset(lambda: iter([{"x": x} for x in rows]), batch=8), steps=2).variables
     expected = -0.5 * (rows[0].sum(0) + rows[1].sum(0)) / 16
     np.testing.assert_allclose(stepped["params"]["w"], expected, rtol=1e-6)
 
@@ -187,10 +191,11 @@ def test_row_weights_count_the_real_rows_of_a_pass_and_every_row_of_training():
     """The last batch of a pass over five records at four a batch holds one
     real record and three repeats, weighted 1 and 0; a training batch carries
     no mark, and every row weighs 1. row_mean weighs rows the same way."""
-    from dew.data import DataPartition, Dataset
+    from dew.data.dataset import DataPartition
 
     records = {"x": np.arange(5, dtype=np.float32)}
-    last = list(Dataset.validation(records, batch=4)(DataPartition()))[-1]
+    last = list(validation(Pipeline(Memory(records)).map(Formatting()).batch(4), batch=4,
+        read="memory")(DataPartition()))[-1]
     np.testing.assert_array_equal(Objective.row_weights(last, 4), [1.0, 0.0, 0.0, 0.0])
     assert Objective.row_weights(last, 4).dtype == jnp.float32
     np.testing.assert_array_equal(Objective.row_weights({"x": last["x"]}, 4), np.ones(4, np.float32))

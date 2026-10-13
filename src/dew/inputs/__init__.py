@@ -46,9 +46,12 @@ class Field:
 
     key: str
     shape: tuple[int, ...]
+    variable_axes: tuple[int, ...] = ()
 
     def __post_init__(self):
         object.__setattr__(self, "shape", tuple(int(size) for size in self.shape))
+        if any(axis < 0 or axis >= len(self.shape) for axis in self.variable_axes):
+            raise ValueError("variable field axes must index its per-sample shape")
 
 
 @dataclass(frozen=True)
@@ -61,16 +64,20 @@ class Condition:
     unconditional: str | float | Mapping[str, object] = ""
 
     def to_json(self) -> dict:
-        return {"encoder": {"class": registry.import_path(type(self.encoder)),
-                            "fields": self.encoder.to_json()},
-                "field": self.field,
-                "unconditional": self.unconditional}
+        return {
+            "encoder": {"class": registry.import_path(type(self.encoder)), "fields": self.encoder.to_json()},
+            "field": self.field,
+            "unconditional": self.unconditional,
+        }
 
     @classmethod
     def from_json(cls, record: Mapping, *, params: Variables | None = None) -> Condition:
         encoder = record["encoder"]
-        return cls(encoder=rebuild(encoder["class"], encoder["fields"], params=params),
-                   field=record["field"], unconditional=record["unconditional"])
+        return cls(
+            encoder=rebuild(encoder["class"], encoder["fields"], params=params),
+            field=record["field"],
+            unconditional=record["unconditional"],
+        )
 
 
 @dataclass(frozen=True)
@@ -99,7 +106,8 @@ class InputSpec:
                 f"two conditions share the batch field {sorted(set(fields))}: "
                 "the objective reads batch[condition.field] under each keyword, "
                 "so the second tokenization would overwrite the first. "
-                "Name a field per condition")
+                "Name a field per condition"
+            )
 
     def tokenize(self, captions: Sequence[str]) -> dict[str, Mapping[str, np.ndarray]]:
         """Return the batch fields this run's caption conditions read, tokenized from `captions`.
@@ -107,8 +115,21 @@ class InputSpec:
         The result is empty for a run with no caption conditions, so the
         captions stop at the loader and no string array reaches a device.
         """
-        return {condition.field: condition.encoder.tokenize(captions)
-                for condition in self.conditions.values() if condition.encoder.reads_captions}
+        return {
+            condition.field: condition.encoder.tokenize(captions)
+            for condition in self.conditions.values()
+            if condition.encoder.reads_captions
+        }
+
+    def encode_fields(self, batch: Batch) -> dict[str, Mapping[str, np.ndarray]]:
+        """Return the batch fields this run's other conditions read, each encoded from the rows its
+        field holds: a clip's `audio` waveforms become the audio model's features, as `tokenize`
+        makes ids of captions, so the dataset carries the sound and the run's encoder featurizes it."""
+        return {
+            condition.field: condition.encoder.tokenize(list(batch[condition.field]))
+            for condition in self.conditions.values()
+            if not condition.encoder.reads_captions
+        }
 
     def check(self, batch: Batch) -> None:
         """Raise `ValueError` if `batch` is missing a field this spec names or has a wrong shape.
@@ -117,8 +138,9 @@ class InputSpec:
         A `ModelInputs` field's shape is taken from its token rows."""
         for condition in self.conditions.values():
             if condition.field not in batch:
-                raise ValueError(f"objective.inputs needs condition field {condition.field!r} "
-                                 "in the training batch")
+                raise ValueError(
+                    f"objective.inputs needs condition field {condition.field!r} in the training batch"
+                )
         for declared in (self.sample, self.mask):
             if declared is None:
                 continue
@@ -126,16 +148,36 @@ class InputSpec:
                 raise ValueError(f"objective.inputs needs field {declared.key!r} in the training batch")
             value = batch[declared.key]
             actual = np.shape(value.tokens if isinstance(value, ModelInputs) else value)[1:]
-            if tuple(actual) != declared.shape:
-                raise ValueError(f"objective.inputs field {declared.key!r} declares shape {declared.shape}, "
-                                 f"but the first training batch has shape {tuple(actual)}")
+            matches = len(actual) == len(declared.shape) and all(
+                0 < size <= bound if axis in declared.variable_axes else size == bound
+                for axis, (size, bound) in enumerate(zip(actual, declared.shape, strict=True))
+            )
+            if not matches:
+                raise ValueError(
+                    f"objective.inputs field {declared.key!r} declares shape {declared.shape}, "
+                    f"but the first training batch has shape {tuple(actual)}"
+                )
 
     def to_json(self) -> dict:
         return {
-            "sample": {"key": self.sample.key, "shape": list(self.sample.shape)},
+            "sample": {
+                "key": self.sample.key,
+                "shape": list(self.sample.shape),
+                **({"variable_axes": list(self.sample.variable_axes)} if self.sample.variable_axes else {}),
+            },
             "conditions": {keyword: condition.to_json() for keyword, condition in self.conditions.items()},
             **(
-                {"mask": {"key": self.mask.key, "shape": list(self.mask.shape)}}
+                {
+                    "mask": {
+                        "key": self.mask.key,
+                        "shape": list(self.mask.shape),
+                        **(
+                            {"variable_axes": list(self.mask.variable_axes)}
+                            if self.mask.variable_axes
+                            else {}
+                        ),
+                    }
+                }
                 if self.mask is not None
                 else {}
             ),
@@ -149,14 +191,30 @@ class InputSpec:
         When it is None, each encoder loads its own weights."""
         sample = record["sample"]
         return cls(
-            sample=Field(sample["key"], tuple(sample["shape"])),
+            sample=Field(sample["key"], tuple(sample["shape"]), tuple(sample.get("variable_axes", ()))),
             conditions={
                 keyword: Condition.from_json(condition, params=None if params is None else params[keyword])
                 for keyword, condition in record["conditions"].items()
             },
-            mask=Field(record["mask"]["key"], tuple(record["mask"]["shape"])) if "mask" in record else None,
+            mask=Field(
+                record["mask"]["key"],
+                tuple(record["mask"]["shape"]),
+                tuple(record["mask"].get("variable_axes", ())),
+            )
+            if "mask" in record
+            else None,
         )
 
 
-__all__ = ["CLIPText", "CharTable", "Condition", "ConditionEncoder", "DiffusionConditioner", "Field",
-           "HFAudio", "InputSpec", "T5Text", "unit_range"]
+__all__ = [
+    "CLIPText",
+    "CharTable",
+    "Condition",
+    "ConditionEncoder",
+    "DiffusionConditioner",
+    "Field",
+    "HFAudio",
+    "InputSpec",
+    "T5Text",
+    "unit_range",
+]
