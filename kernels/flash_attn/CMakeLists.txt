@@ -34,14 +34,15 @@ target_include_directories(dew_flash_attn PRIVATE
 target_compile_definitions(dew_flash_attn PRIVATE FLASHATTENTION_DISABLE_DROPOUT=1 FLASHATTENTION_DISABLE_ALIBI=1)
 
 # FlashAttention-3 for sm90a, the instantiations a training call reaches: bf16 and fp16, heads of
-# 64, 128 and 256 (flash.cpp rounds 96 up to 128 and 192 up to 256 with those two disabled), with
-# variable lengths but no split keys, paged or appended caches, softcap, sliding window, packed GQA
-# or fp8.
-set(FLASH3_DISABLED SPLIT PAGEDKV APPENDKV SOFTCAP LOCAL PACKGQA FP8 SM8x CLUSTER HDIM96 HDIM192
-    HDIMDIFF64 HDIMDIFF192)
+# 64, 128, 192 and 256 (flash.cpp rounds 96 up to 128 with it disabled) and sliding windows, with
+# variable lengths but no split keys, paged or appended caches, softcap, packed GQA or fp8. A value
+# narrower than the query comes padded (Dew's `widen_value_heads`): the port sets the value's and
+# the output's strides from the query's width (flash.cpp:46-84), so its 192-by-128 kernels would
+# read and write past them.
+set(FLASH3_DISABLED SPLIT PAGEDKV APPENDKV SOFTCAP PACKGQA FP8 SM8x CLUSTER HDIM96 HDIMDIFF64 HDIMDIFF192)
 file(GLOB KERNELS3 "${UPSTREAM3}/csrc/flash_attn/src/instantiations/flash_fwd_hdim*_sm90.cu"
                    "${UPSTREAM3}/csrc/flash_attn/src/instantiations/flash_bwd_hdim*_sm90.cu")
-list(FILTER KERNELS3 INCLUDE REGEX "/flash_(fwd|bwd)_hdim(64|128|256)_(bf16|fp16)_sm90\\.cu$")
+list(FILTER KERNELS3 INCLUDE REGEX "/flash_(fwd|bwd)_hdim(64|128|192|256)_(bf16|fp16)_sm90\\.cu$")
 add_library(dew_flash_attn3 SHARED ffi3.cpp
             "${UPSTREAM3}/csrc/flash_attn/flash.cpp"
             "${UPSTREAM3}/csrc/flash_attn/fill_kernel.cu"

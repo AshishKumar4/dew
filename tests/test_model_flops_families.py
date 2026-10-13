@@ -17,7 +17,7 @@ from dew.inputs.encoders import CharTable, ConditionWork, T5Text
 from dew.nn.attention import Stage
 from dew.nn.attention_residuals import AttentionResiduals
 from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.nn.backbones.decoder_block import BlockWiring, GatedMLP, MTPBlock
+from dew.nn.backbones.decoder_block import BlockWiring, MTPBlock
 from dew.nn.backbones.edm2 import EDM2UNet
 from dew.nn.backbones.flux import FluxSingleBlock, FluxTransformer
 from dew.nn.backbones.flux2 import Flux2SingleBlock, Flux2Transformer
@@ -37,6 +37,7 @@ from dew.nn.flops import MissingFlopsCount, patch_lengths
 from dew.nn.gemma3n import AltUp
 from dew.nn.hyper_connections import HyperConnections
 from dew.nn.mixers.attention import CausalSelfAttention
+from dew.nn.mlp import GatedMLP
 from dew.nn.text_encoders import CLIPTextTransformer, CLIPVisionTransformer, T5EncoderTransformer
 from dew.objectives.diffusion import DiffusionObjective
 from dew.objectives.lm import TEXT_KEY, LMObjective
