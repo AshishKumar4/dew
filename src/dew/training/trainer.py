@@ -1321,13 +1321,15 @@ class Trainer(Generic[Loss, Effects]):
             placement = self.shardings(prepared)
             transaction = Transaction(self.objective, self.optimizer, self.accumulation, shapes)
             body = transaction.step(realize=execution.realize, host=True)
+            # The device steps compiled once, as the device step compiles them into its own program.
+            inputs = jax.jit(self._model_batch)
 
         def run(current, batch):
             batch = transfer(batch, batch_shardings(cpu, batch))
             with self._traced_on(cpu):
                 if current.accumulation is None and self.accumulation > 1:
                     current = self._initialize_accumulation(current, batch, shapes, window=self.accumulation)
-                advanced, loss, aux, committed = body(current, self._model_batch(batch), 0)
+                advanced, loss, aux, committed = body(current, inputs(batch), 0)
                 advanced = dataclasses.replace(advanced, step=current.step + 1)
                 # A leaf already where its placement says stays the array it
                 # is: the resident frozen collection crosses no boundary.
