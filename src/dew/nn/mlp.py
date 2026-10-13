@@ -4,7 +4,6 @@ placement, remat names, activation rounding and work count."""
 
 import functools
 from collections.abc import Callable
-from typing import cast
 
 import jax.numpy as jnp
 from flax import linen as nn
@@ -72,7 +71,7 @@ class GatedMLP(nn.Module):
         builds, the count reads and the packed group (`_group`) concatenates."""
         sites = {'up_proj': (self.out_features, self.hidden_features),
                  'down_proj': (self.hidden_features, self.out_features)}
-        if self._ungated() is None:
+        if self._gated():
             sites['gate_proj'] = sites['up_proj']
         return sites
 
@@ -81,7 +80,7 @@ class GatedMLP(nn.Module):
         dense = functools.partial(
             self.linear, use_bias=self.use_bias, dtype=self.dtype, precision=self.precision,
             **normal_kernel(self.init_std))
-        if self._ungated() is None:
+        if self._gated():
             if self._packed():
                 group = self._group()
                 self.gate_up_proj = dense(sum(group.widths), name=group.packed)
@@ -104,9 +103,10 @@ class GatedMLP(nn.Module):
     def __call__(self, x, train: bool = False):
         # Column-parallel under a tensor axis: the hidden width splits and
         # down_proj's sum returns to the residual placement in the block.
-        if (activate := self._ungated()) is not None:
+        activation = self._activation()
+        if not isinstance(activation, (str, Situ)):
             up = checkpoint_name(constrain(self.up_proj(x), MLP_HIDDEN), 'up_proj')
-            hidden = self.dropout(activate(up), deterministic=not train)
+            hidden = self.dropout(activation(up), deterministic=not train)
             return checkpoint_name(self.down_proj(hidden), 'down_proj')
         if self._packed():
             gate, up = self._group().split(self.gate_up_proj(x))
@@ -120,17 +120,19 @@ class GatedMLP(nn.Module):
             up = jnp.clip(up, -self.swiglu_limit, self.swiglu_limit)
         if self.activation_sparsity:
             gate = gaussian_topk(gate, self.activation_sparsity)
-        # `_ungated` found no function, so the activation names a gated product.
-        product = gated_product(cast(GatedActivation, self.activation), axes=MLP_HIDDEN,
-                                packed=self._packed())
+        product = gated_product(activation, axes=MLP_HIDDEN, packed=self._packed())
         hidden = self.dropout(product(gate, up), deterministic=not train)
         return checkpoint_name(self.down_proj(hidden), 'down_proj')
 
-    def _ungated(self) -> Activation | None:
-        """The ungated MLP's activation, None for a gated product."""
+    def _activation(self) -> GatedActivation | Activation:
+        """The gated product's activation (a name `gated_product` reads, or Situ), else the
+        ungated MLP's function."""
         if isinstance(self.activation, str):
-            return UNGATED.get(self.activation)
-        return None if isinstance(self.activation, Situ) else self.activation
+            return UNGATED.get(self.activation, self.activation)
+        return self.activation
+
+    def _gated(self) -> bool:
+        return isinstance(self._activation(), (str, Situ))
 
     def _packed(self) -> bool:
         """Whether one `gate_up_proj` holds the gate and up projections: the
@@ -145,7 +147,7 @@ class GatedMLP(nn.Module):
     def projection_groups(self) -> tuple[ProjectionGroup, ...]:
         """Its group (`_group`) where it is gated and its variables hold it
         (`ProjectionSites`), which `setup` reads packed in the members' place."""
-        if self._ungated() is not None:
+        if not self._gated():
             return ()
         group = self._group()
         return (group,) if group.held(self.variables.get('params', {})) else ()
