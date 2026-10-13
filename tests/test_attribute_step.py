@@ -252,32 +252,57 @@ def test_the_peak_is_dews_dense_bf16_figure_for_a_named_device(tmp_path):
     assert time["device_ms_per_step"] == 1.0
 
 
+CONTRACT_1 = ('backend_config={"gemm_backend_config":{"dot_dimension_numbers":'
+              '{"lhs_contracting_dimensions":["1"],"rhs_contracting_dimensions":["0"]}}}')
+GEMMS = "\n".join([
+    "HloModule jit_step",
+    "",
+    "ENTRY %main.9 (a: f32[5000,5000], b: f32[5000,5000], c: f8e4m3fn[10000,8000], "
+    "d: f8e4m3fn[8000,5000]) -> bf16[10000,5000] {",
+    "  %a = f32[5000,5000]{1,0} parameter(0)",
+    "  %b = f32[5000,5000]{1,0} parameter(1)",
+    "  %c = f8e4m3fn[10000,8000]{1,0} parameter(2)",
+    "  %d = f8e4m3fn[8000,5000]{1,0} parameter(3)",
+    "  %custom-call.1 = f32[5000,5000]{1,0} custom-call(f32[5000,5000]{1,0} %a, f32[5000,5000]{1,0} %b), "
+    f'custom_call_target="__cublas$gemm", {CONTRACT_1}',
+    "  ROOT %custom-call.2 = bf16[10000,5000]{1,0} custom-call(f8e4m3fn[10000,8000]{1,0} %c, "
+    f'f8e4m3fn[8000,5000]{{1,0}} %d), custom_call_target="__cublas$lt$matmul$f8", {CONTRACT_1}',
+    "}",
+    ""])
+
+
 def test_a_gemm_is_judged_at_its_compiled_flops_against_its_own_precisions_peak(tmp_path):
-    """XProf's normalized rate scales a GEMM's FLOPs by bf16's peak over its precision's, so an fp32
-    dot it takes for non-tensor-core arithmetic reads above any peak (the later Qwen3.5-0.8B step's GEMMs at 1.127 of
-    the A100's). The compiler's FLOPs over the measured time are the work done, and each GEMM's
-    fraction is of its own precision's peak in Dew's table, as mfu_mixed counts it."""
+    """A GEMM's work is its compiled FLOPs, counted from the op as the step's count counts it, over
+    the measured time; XProf's rates are not read. Its model rate put a cuBLAS weight-gradient GEMM
+    of C6's Qwen3.5-0.8B at 4x its work, and its normalized rate scales by bf16's peak over its own guess of the
+    op's precision (the later Qwen3.5-0.8B step's GEMMs at 1.127 of the A100's). Each GEMM's fraction is of its own
+    precision's peak in Dew's table, as mfu_mixed counts it."""
     reports = tmp_path / "profile" / "capture-a" / "reports"
     reports.mkdir(parents=True)
     columns = ["program_id", "category", "hlo_op_name", "hlo_op_expression", "tf_op_name", "occurrences",
                "total_self_time", "source_info", "normalized_flop_rate", "model_flop_rate"]
     cells = [("15", "custom-call", "custom-call.1", '%custom-call.1 = f32[8,8]{1,0} custom-call('
               'f32[8,8]{1,0} %a, f32[8,8]{1,0} %b), custom_call_target="__cublas$gemm"',
-              "jit(step)/dot_general", "1", 1000.0, "", 8.0e6, 2.5e5),
+              "jit(step)/dot_general", "1", 1000.0, "", 8.0e6, 1.0e6),
              ("15", "custom-call", "custom-call.2", '%custom-call.2 = bf16[8,8]{1,0} custom-call('
               'f8e4m3fn[8,8]{1,0} %a, f8e4m3fn[8,8]{1,0} %b), custom_call_target="__cublas$lt$matmul$f8"',
-              "jit(step)/dot_general", "1", 1000.0, "", 4.0e5, 8.0e5)]
+              "jit(step)/dot_general", "1", 1000.0, "", 4.0e5, 3.2e6)]
     rows = [{"c": [{"v": v} for v in row]} for row in cells]
     (reports / "hlo_stats.json").write_text(json.dumps([{"cols": [{"id": name} for name in columns],
                                                          "rows": rows}]))
     (reports / "roofline_model.json").write_text(json.dumps({"p": {"peak_flop_rate": 3742430.0}}))
     entry = tmp_path / "entry.json"
     entry.write_text(json.dumps({"model_flops_per_step": 1.05e12, "device": "NVIDIA RTX PRO 6000 Blackwell"}))
+    dump = tmp_path / "hlo"
+    dump.mkdir()
+    (dump / "module_0015.jit_step.sm_12.0_gpu_after_optimizations.txt").write_text(GEMMS)
     out = tmp_path / "attribution.json"
-    command = ["--trace", str(tmp_path / "profile"), "--out", str(out), "--entry", str(entry)]
+    command = ["--trace", str(tmp_path / "profile"), "--hlo", str(dump), "--out", str(out),
+               "--entry", str(entry)]
     assert attribute.main(command) == 0
     time = json.loads(out.read_text())["time"]
-    # 2.5e5 of the 5e5 GFLOP/s bf16 peak and 8e5 of the 1e6 FP8 peak, a millisecond each.
+    # 2.5e11 and 8e11 FLOPs a millisecond: 2.5e5 of the 5e5 GFLOP/s bf16 peak and 8e5 of the 1e6
+    # FP8 peak, whatever XProf's rows say (4x those).
     assert {record["hlo"]: record["fraction_of_peak"] for record in time["gemms_by_lost_time"]} == {
         "custom-call.1": 0.5, "custom-call.2": 0.8}
     assert time["gemm_fraction_of_peak"] == 0.65 and time["gemm_lost_ms"] == 0.7
