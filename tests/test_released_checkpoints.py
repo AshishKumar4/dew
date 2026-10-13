@@ -192,7 +192,7 @@ def trained(scoring):
     """One real `Trainer` step of plain SGD over the released weights."""
     import grain
 
-    from dew.data.dataset import Dataset
+    from dew.data.dataset import Loader
     from dew.training import Trainer
 
     objective, _, rows = scoring
@@ -201,7 +201,7 @@ def trained(scoring):
     entries = [{"text": tokens[row]} for row in range(count)]
     stream = (grain.MapDataset.source(entries).repeat().to_iter_dataset()
               .batch(count, drop_remainder=True))
-    data = Dataset(train=lambda partition: iter(stream), val=None, records=count, batch=count)
+    data = Loader(train=lambda partition: iter(stream), val=None, records=count, batch=count)
     state = Trainer(objective, optax.sgd(RATE), key=jax.random.key(2)).fit(
         data, steps=1, log_every=1)
     return state, {"text": tokens}
