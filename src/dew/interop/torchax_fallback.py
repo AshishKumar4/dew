@@ -172,37 +172,51 @@ class TorchGraph:
         return logits, hidden
 
     def _trains_otherwise(self, *arguments) -> bool:
-        """Whether the module's training forward traces to another program than its eval forward.
+        """Whether the module's training forward does anything its eval forward does not.
 
-        Both are traced with torchax's random key as an input and torch's
-        default device on it, so every random draw, a bare `torch.rand` too,
-        is part of the program, and a branch on one (layer drop) cannot be
-        decided at trace time: that trace fails, which counts as another
-        program."""
+        Both are traced with torchax's random key as an input, so a draw on
+        the device is part of the program, and torch's random functions are
+        counted, so a draw on the host decided at trace time (OPT's layer
+        drop, `torch.rand([])`) is seen too. Another program or another
+        count is another forward."""
         import torch
         import torchax
+        from torch.overrides import TorchFunctionMode
+
+        drawing = (torch.rand, torch.rand_like, torch.randn, torch.randn_like, torch.randint,
+                   torch.randint_like, torch.randperm, torch.bernoulli, torch.multinomial, torch.normal,
+                   torch.Tensor.uniform_, torch.Tensor.normal_, torch.Tensor.bernoulli_,
+                   torch.Tensor.random_, torch.Tensor.exponential_, torch.nn.functional.dropout)
+
+        class Draws(TorchFunctionMode):
+            """Counts the calls of torch's random functions while it is entered."""
+            count = 0
+
+            def __torch_function__(self, func, types, args=(), kwargs=None):
+                self.count += func in drawing
+                return func(*args, **(kwargs or {}))
 
         env = torchax.default_env()
         shapes = jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(jnp.shape(leaf), jnp.result_type(leaf)),
                               arguments)
         signature = str(jax.tree.map(lambda shape: (shape.shape, str(shape.dtype)), shapes))
         if signature not in self._differs:
-            programs = []
+            traces = []
             for training in (True, False):
 
                 # One function a trace: JAX caches a trace by its function, and the mode is not an input.
                 def forward(key, *arguments):
-                    with env.override_property(prng=key), torch.device("jax"):
+                    with env.override_property(prng=key):
                         return self._forward(*arguments)
 
                 self.module.train(training)
                 try:
-                    programs.append(str(jax.make_jaxpr(forward)(jax.random.key(0), *shapes)))
-                except jax.errors.ConcretizationTypeError:
-                    programs.append(None)
+                    with Draws() as draws:
+                        program = str(jax.make_jaxpr(forward)(jax.random.key(0), *shapes))
+                    traces.append((program, draws.count))
                 finally:
                     self.module.eval()
-            self._differs[signature] = programs[0] is None or programs[0] != programs[1]
+            self._differs[signature] = traces[0] != traces[1]
         return self._differs[signature]
 
     def export(self, model: nn.Module, variables: Mapping[str, object],
