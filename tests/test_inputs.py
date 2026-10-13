@@ -6,6 +6,7 @@ copying resident inputs through the host.
 """
 
 import numpy as np
+import pytest
 from steady_state import guarded
 
 
