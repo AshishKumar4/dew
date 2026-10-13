@@ -377,11 +377,12 @@ def check_stream(source, mesh: Mesh, spec: MeshSpec, batch: int, window: int, *,
     """
     if checkpointing and not isinstance(source, Checkpointable):
         raise ValueError(
-            f"checkpoint_every needs a training stream with get_state and "
-            f"set_state, and {type(source).__name__} lacks one; a checkpoint "
-            f"written without the data position would replay the data on "
-            f"resume. Train it with checkpoint_every=None "
-            f"(--trainer.checkpoint-every None)")
+            f"a run with a checkpointer writes the full state (at its cadence, at "
+            f"its end and on preemption), which needs a training stream with "
+            f"get_state and set_state, and {type(source).__name__} lacks one; a "
+            f"checkpoint written without the data position would replay the data "
+            f"on resume. Read the data through dew.data (a from_iter source "
+            f"resumes by replaying its records), or train without checkpoints")
     if not isinstance(source, RampedStream):
         if rows:
             check_batch(batch, mesh, spec)

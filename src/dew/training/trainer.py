@@ -1435,25 +1435,25 @@ class Trainer(Generic[Loss, Effects]):
                 local_every=None if checkpoints is None else checkpoints.local_every,
                 metrics=metrics, preview=preview, best=selection, stop=stop, suites=suites,
             )
-            trained, complete = self._training_loop(plan, run, profiler, tracer, profile, checkpoints, state)
+            trained = self._training_loop(plan, run, profiler, tracer, profile, checkpoints, state)
             # The state a checkpoint would hold: the step rebuilds its narrow copies.
             trained = dataclasses.replace(trained, compute=None)
+            # Whether this fit trained or found the run complete, and inside
+            # the lifecycle, so a selection that fails is the run's outcome.
+            if restore_best and checkpoints is not None and run.preempted is None:
+                trained, _ = checkpoints.restore(
+                    jax.tree.map(
+                        lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=leaf.sharding),
+                        trained),
+                    step="best",
+                )
         finally:
             primary = sys.exception()
             error = self._closed(run, primary, profiler)
             if primary is None and error is not None:
                 raise error
-        if complete:
-            return trained
         if run.preempted is not None:
             raise Preempted(run.preempted)
-        if restore_best and checkpoints is not None:
-            trained, _ = checkpoints.restore(
-                jax.tree.map(
-                    lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=leaf.sharding), trained
-                ),
-                step="best",
-            )
         return trained
 
     def _schedule(self, updates: int | None) -> None:
@@ -1470,10 +1470,10 @@ class Trainer(Generic[Loss, Effects]):
     def _training_loop(self, plan: _FitPlan, run: _FitRun, profiler: Profiler | None,
                        tracer: Profiler | None, profile: ProfileWindow | None,
                        checkpoints: Checkpoints | None,
-                       initial: TrainState | None = None) -> tuple[TrainState, bool]:
+                       initial: TrainState | None = None) -> TrainState:
         """Place the state, dispatch the numerical steps and finish their loop
-        before resource cleanup. Returns the final state and whether the run
-        was already complete, its last checkpoint written, so nothing ran.
+        before resource cleanup. Returns the final state, the placed one for a
+        run already complete, its last checkpoint written, so nothing ran.
 
         The loop is the state's one holder: each step donates the state it is
         handed, and a reference kept past that, as fit's own once was, holds
@@ -1494,7 +1494,7 @@ class Trainer(Generic[Loss, Effects]):
             int(state.step) if checkpoints is not None and checkpoints.latest is not None else None),
             tokens_before_log=int(run.stop_control.pop("tokens", 0)))
         if self._opened(plan, run, interval, state, position):
-            return state, True
+            return state
         compiled: dict[Shapes, tuple[CompiledStep, StepFlops | None]] = {}
         seen = 0
         run.notice = PreemptionNotice()
@@ -1571,7 +1571,7 @@ class Trainer(Generic[Loss, Effects]):
                     assert profiler is not None
                     self._stop_trace(run, profile, profiler)
         self._wind_down(plan, run, interval, state, shardings, position, profiler)
-        return state, False
+        return state
 
     def _closed(self, run: _FitRun, primary: BaseException | None,
                 profiler: Profiler | None) -> BaseException | None:
@@ -1651,11 +1651,11 @@ class Trainer(Generic[Loss, Effects]):
         if not plan.finished(current, interval.real_tokens):
             partition = DataPartition.of(mesh)
             run.source = plan.dataset.train(partition)
+            # A preemption notice saves the full state whenever a checkpointer
+            # is set, as the final checkpoint does, and either resumes.
             check_stream(run.source, mesh, self.mesh, plan.dataset.batch,
                          self.accumulation * (self._split or 1), rows=self.rollout is None,
-                         checkpointing=bool(plan.checkpoint_every or plan.local_every or (
-                             checkpoints is not None and plan.cadenced and plan.best and
-                             any(not choice.weights_only for choice in plan.best))))
+                         checkpointing=checkpoints is not None)
             if isinstance(run.source, RampedStream):
                 # Each stage's batch is read whole: no plan splits a ramp's.
                 self._split = 1
