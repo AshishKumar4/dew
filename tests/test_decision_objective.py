@@ -13,7 +13,8 @@ import pytest
 
 from dew.artifacts import Decisions
 from dew.checkpoints import Checkpoints
-from dew.data import DataPartition
+from dew.config.data import loader
+from dew.data.dataset import DataPartition
 from dew.data.text import ByteTokenizer
 from dew.decision import (
     ECE,
@@ -22,6 +23,7 @@ from dew.decision import (
     Choice,
     Decide,
     DecisionObjective,
+    Encoding,
     Example,
     LogLoss,
     Noul,
@@ -31,6 +33,7 @@ from dew.decision import (
     StateFirstLayout,
     Weights,
 )
+from dew.decision.data import Decisions as DecisionRecipe
 from dew.lora import LoRA
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.objectives.base import FROZEN, VALID_ROWS
@@ -112,7 +115,8 @@ def test_the_loss_scores_a_soft_target_as_its_rule_does():
             for index in range(8)]
     objective = DecisionObjective(tiny_backbone(), tokenizer=TOKENIZER, specials=SPECIALS, layout=LAYOUT,
                                   shuffle_options=False)
-    data = objective.dataset(soft, batch=8, validation=soft)
+    data = loader(DecisionRecipe(source=soft, validation=soft), batch=8, read="memory",
+        objective=objective.data())
     (batch,) = list(data.val(DataPartition()))
     batch = {name: value for name, value in batch.items() if name != VALID_ROWS}
     variables = objective.init(jax.random.key(0))
@@ -133,7 +137,13 @@ def test_a_bucketed_stream_cuts_each_batch_just_past_its_longest_row():
     def read(**fields):
         objective = DecisionObjective(tiny_backbone(), tokenizer=TOKENIZER, specials=SPECIALS, layout=LAYOUT,
                                       shuffle_options=False, **fields)
-        return objective, list(itertools.islice(objective.dataset(rows, batch=2).train(DataPartition()), 64))
+        data = loader(DecisionRecipe(source=rows), batch=2, read="memory", objective=objective.data())
+        stream = data.train(DataPartition())
+        try:
+            return objective, [{name: np.array(value, copy=True) for name, value in batch.items()}
+                               for batch in itertools.islice(stream, 64)]
+        finally:
+            stream.close()
 
     def held(batches):
         return sorted(tuple(row[valid]) for batch in batches for row, valid
@@ -141,7 +151,9 @@ def test_a_bucketed_stream_cuts_each_batch_just_past_its_longest_row():
 
     plain, whole = read()
     bucketed, cut = read(bucket=8)
-    assert bucketed.inputs is None
+    assert bucketed.inputs.sample.key == "tokens"
+    assert bucketed.inputs.sample.shape == (LAYOUT.max_len,)
+    assert bucketed.inputs.sample.variable_axes == (0,)
     for batch in cut:
         size, longest = batch["tokens"].shape[1], int(np.sum(batch["valid"], axis=1).max())
         assert size % 8 == 0 and longest <= size < longest + 8
@@ -154,6 +166,67 @@ def test_a_bucketed_stream_cuts_each_batch_just_past_its_longest_row():
     step = Step(jnp.asarray(0), jax.random.key(0), None)
     np.testing.assert_allclose(plain.scalar_loss(variables, trimmed, step)[0],
                                plain.scalar_loss(variables, batch, step)[0], rtol=1e-6)
+
+
+HELD = [Example(f"{index}" if index % 3 == 0 else f"{index} " + "x" * (12 + index), {"team": INTENT},
+                {"team": ("billing", "technical", "sales")[index // 3 % 3]}) for index in range(18)]
+"""Under `LAYOUT`, six rows of 52 or 53 tokens and twelve of 66 to 83, no two alike."""
+
+
+@pytest.mark.parametrize(("bucket", "batching", "cut"), [
+    (8, {"batch": 4}, lambda longest: min(LAYOUT.max_len, -(-longest // 8) * 8)),
+    (None, {"batch": None, "tokens": 192, "lengths": (64, 96)}, lambda longest: 64 if longest <= 64 else 96),
+], ids=["rows", "tokens"])
+def test_a_held_pass_is_cut_as_training_is_and_scores_every_row_once(bucket, batching, cut):
+    """Eighteen held rows in batches of four cut at the next multiple of
+    eight past their longest row, or in a token budget's two lengths: each
+    batch is cut as a training batch is rather than padded to max_len, and
+    holds rows of like length. Every row is read once, the last batch's
+    repeats count nothing, and each row's probabilities and the pass's log
+    loss are those of every row in one uncut batch."""
+    from dew.objectives.base import Step
+    from dew.training.distributed import MeshSpec
+    from dew.training.evaluation import Evaluation
+
+    def built(**fields):
+        return DecisionObjective(tiny_backbone(), tokenizer=TOKENIZER, specials=SPECIALS, layout=LAYOUT,
+                                 shuffle_options=False, **fields)
+
+    plain, cutting = built(), built(bucket=bucket)
+    variables = plain.init(jax.random.key(0))
+    step = Step(jnp.asarray(0), jax.random.key(0), None)
+
+    def scored(objective, batch) -> list:
+        """Each real row's tokens and probabilities."""
+        found = np.asarray(objective.evaluate(variables, batch, step).probabilities)[:, 0]
+        real = np.asarray(batch.get(VALID_ROWS, np.ones(len(found), bool)))
+        return [(tuple(np.asarray(tokens)[np.asarray(valid)].tolist()), row) for tokens, valid, row, kept
+                in zip(batch["tokens"], batch["valid"], found, real, strict=True) if kept]
+
+    recipe = DecisionRecipe(source=HELD, validation=HELD)
+    oracle = loader(recipe, batch=len(HELD), read="memory", objective=plain.data())
+    data = loader(recipe, read="memory", objective=cutting.data(), **batching)
+    (whole,) = list(oracle.val(DataPartition()))
+    expected = dict(scored(plain, whole))
+    batches = list(data.val(DataPartition()))
+    spans, seen = [], []
+    for batch in batches:
+        lengths = np.sum(batch["valid"], axis=1)
+        assert batch["tokens"].shape[1] == cut(int(lengths.max()))
+        spans.append((int(lengths.min()), int(lengths.max())))
+        seen.extend(scored(cutting, batch))
+    assert min(batch["tokens"].shape[1] for batch in batches) < LAYOUT.max_len
+    spans.sort()
+    assert all(below[1] <= above[0] for below, above in itertools.pairwise(spans)), spans
+    assert sorted(key for key, _ in seen) == sorted(expected)
+    # Within float32 rounding: a cut row's attention sums over fewer padded keys.
+    for key, found in seen:
+        np.testing.assert_allclose(found, expected[key], rtol=1e-5)
+    mesh = MeshSpec().build(jax.local_devices()[:1])
+    passes = [Evaluation.run(objective, variables, reader, key=0, metrics=[LogLoss()], mesh=mesh)
+              for objective, reader in ((cutting, data.val), (plain, oracle.val))]
+    assert [result.records for result in passes] == [len(HELD), len(HELD)]
+    assert passes[0].scores["val/log_loss"] == pytest.approx(passes[1].scores["val/log_loss"], rel=1e-5)
 
 
 def tiny_backbone() -> CausalTransformer:
@@ -177,7 +250,8 @@ def test_lora_trains_its_factors_and_the_head_over_a_fixed_base_and_reloads_from
     adapter = LoRA(rank=4, modules=("q_proj", "v_proj")).apply(model, base, key=1)
     objective = DecisionObjective(adapter, tokenizer=TOKENIZER, specials=SPECIALS, layout=LAYOUT,
                                   loss=LogLoss() + 0.5 * Brier())
-    data = objective.dataset(EXAMPLES, batch=8, validation=EXAMPLES)
+    data = loader(DecisionRecipe(source=EXAMPLES, validation=EXAMPLES), batch=8, read="memory",
+        objective=objective.data())
     checkpoints = Checkpoints(str(tmp_path), keep=1)
     start = objective.init(jax.random.key(2))
     state = Trainer(objective, optax.adam(1e-2), key=0, checkpoints=checkpoints).fit(
@@ -211,10 +285,12 @@ def test_a_held_out_row_fewer_than_a_batch_counts_once_in_the_loss_and_the_metri
     from dew.training.evaluation import Evaluation
 
     objective = DecisionObjective(tiny_backbone(), tokenizer=TOKENIZER, specials=SPECIALS, layout=LAYOUT)
-    data = objective.dataset(EXAMPLES, batch=8, validation=EXAMPLES[:1])
+    data = loader(DecisionRecipe(source=EXAMPLES, validation=EXAMPLES[:1]), batch=8, read="memory",
+        objective=objective.data())
     variables = objective.init(jax.random.key(0))
     result = Evaluation.run(objective, variables, data.val, key=0, metrics=(Accuracy(),), loss=True)
-    alone = objective.dataset(EXAMPLES, batch=1, validation=EXAMPLES[:1])
+    alone = loader(DecisionRecipe(source=EXAMPLES, validation=EXAMPLES[:1]), batch=1, read="memory",
+        objective=objective.data())
     (row,) = list(alone.val(DataPartition()))
     row = {name: value for name, value in row.items() if name != VALID_ROWS}
     loss, _ = objective.scalar_loss(variables, row, Step(jnp.asarray(0), jax.random.key(0), None))
@@ -256,7 +332,7 @@ def test_a_saved_vision_run_answers_image_rows(tmp_path, separate_tokenizer):
     task = Decide(base.model, base.init(jax.random.key(0)), layout, tokenizer, base.specials,
                   processor=source.processor)
     objective = DecisionObjective(task)
-    data = objective.dataset(EXAMPLES, batch=8)
+    data = loader(DecisionRecipe(source=EXAMPLES), batch=8, read="memory", objective=objective.data())
     run = tmp_path / "run"
     checkpoints = Checkpoints(str(run), keep=1)
     state = Trainer(objective, optax.adam(1e-3), key=0, checkpoints=checkpoints).fit(
@@ -296,7 +372,7 @@ def test_a_saved_byte_decision_run_records_no_tokenizer_backed_processor(tmp_pat
     task = Decide(base.model, base.init(jax.random.key(0)), LAYOUT, TOKENIZER, SPECIALS,
                   processor=source.processor)
     objective = DecisionObjective(task)
-    data = objective.dataset(EXAMPLES, batch=8)
+    data = loader(DecisionRecipe(source=EXAMPLES), batch=8, read="memory", objective=objective.data())
     run = tmp_path / "run"
     checkpoints = Checkpoints(str(run), keep=1)
     state = Trainer(objective, optax.adam(1e-3), key=0, checkpoints=checkpoints).fit(
@@ -318,7 +394,8 @@ def test_a_calibration_comes_back_with_the_weights_it_was_fitted_on(tmp_path):
     on; trained further, the run's latest weights refuse it rather than
     reuse it stale."""
     objective = DecisionObjective(tiny_backbone(), tokenizer=TOKENIZER, specials=SPECIALS, layout=LAYOUT)
-    data = objective.dataset(EXAMPLES, batch=8, validation=EXAMPLES)
+    data = loader(DecisionRecipe(source=EXAMPLES, validation=EXAMPLES), batch=8, read="memory",
+        objective=objective.data())
     checkpoints = Checkpoints(str(tmp_path), keep=2)
     trainer = Trainer(objective, optax.adam(1e-3), key=0, checkpoints=checkpoints)
     state = trainer.fit(data, steps=1, log_every=100, checkpoint_every=1)
@@ -354,7 +431,8 @@ def test_diffusion_gemma_reads_each_row_once_whole_and_reloads_from_the_run(tmp_
     chosen = DecisionObjective(model, tokenizer=TOKENIZER, specials=SPECIALS).layout
     assert isinstance(chosen, StateFirstLayout)
     objective = DecisionObjective(model, tokenizer=TOKENIZER, specials=SPECIALS, layout=LAYOUT)
-    data = objective.dataset(EXAMPLES, batch=8, validation=EXAMPLES)
+    data = loader(DecisionRecipe(source=EXAMPLES, validation=EXAMPLES), batch=8, read="memory",
+        objective=objective.data())
     checkpoints = Checkpoints(str(tmp_path), keep=1)
     state = Trainer(objective, optax.adam(1e-2), key=0, checkpoints=checkpoints).fit(
         data, steps=2, log_every=100, checkpoint_every=2)
@@ -380,6 +458,38 @@ def test_a_joint_run_cuts_its_state_to_the_state_budget_and_a_layout_refuses_a_b
         _fresh_layout(causal=True, joint=True, budgets={"max_len": 3072, "head_max_len": 96})
     with pytest.raises(ValueError):
         _fresh_layout(causal=True, joint=False, budgets={"max_len": 1024, "max_state_tokens": 16})
+
+
+def test_a_hub_tokenizer_lays_rows_out_from_the_revision_its_identity_names(monkeypatch, tmp_path):
+    """A decision step holds an HFTokenizer, which resolves a hub name once:
+    the step's identity hashes the files of the resolved revision, and the
+    step lays its rows out from those same files, here and in a worker it is
+    pickled to, never from the name again."""
+    import pickle
+    import shutil
+
+    import huggingface_hub
+
+    from dew.data.plan import StepIdentity
+    from dew.data.text import HFTokenizer
+
+    # The Hub cache keeps a commit's files in a directory named for it.
+    files = tmp_path / "snapshots" / ("a" * 40)
+    shutil.copytree(Path(__file__).parent / "fixtures" / "tokenizers" / "gpt2", files)
+    resolved = []
+
+    def download(repo, revision, allow_patterns, local_files_only):
+        resolved.append((repo, revision))
+        return str(files)
+
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", download)
+    encoding = Encoding(LAYOUT, HFTokenizer("acme/tokenizer"), SPECIALS, width=4)
+    assert StepIdentity.of(encoding).dependencies["tokenizer"]["revision"] == "a" * 40
+    sent = pickle.loads(pickle.dumps(encoding))
+    local = Encoding(LAYOUT, HFTokenizer(str(files)), SPECIALS, width=4)
+    np.testing.assert_array_equal(sent(EXAMPLES[0], ("team",), None)["tokens"],
+                                  local(EXAMPLES[0], ("team",), None)["tokens"])
+    assert resolved == [("acme/tokenizer", None)]
 
 
 @pytest.mark.parametrize("joint", [False, True])

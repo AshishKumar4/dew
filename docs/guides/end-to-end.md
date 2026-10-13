@@ -42,7 +42,7 @@ python examples/sft_diffusion_gemma.py \
 JAX_PLATFORMS=cpu python examples/sft_diffusion_gemma.py --smoke --out /tmp/dg-smoke
 ```
 
-`--chat` is a Hub dataset id, a `.jsonl` file or a parquet file of conversations. [`ChatMessages`](../concepts/data.md) reads it and renders each conversation with the checkpoint's chat template. The conversations are in the `messages` column, or in the `prompt` column for rows in the verl layout. The smoke run writes three canned conversations as JSONL and renders them with the fixture tokenizer's own template.
+`--chat` is a Hub dataset id, a `.jsonl` file or a parquet file of conversations. [`Chat`](../concepts/data.md) reads it and renders each conversation with the checkpoint's chat template. The conversations are in the `messages` column, or in the `prompt` column for rows in the verl layout. The smoke run writes three canned conversations as JSONL and renders them with the fixture tokenizer's own template.
 
 ## Full-weight SFT of a Gemma 4 decoder
 
@@ -59,7 +59,7 @@ python -m dew.eval --model dew --model_args run=runs/gemma4-sft/checkpoints/gemm
 JAX_PLATFORMS=cpu python examples/sft_gemma4.py --smoke --out /tmp/gemma4-smoke
 ```
 
-The script passes `--dataset` to `ChatMessages` unchanged. `ChatMessages` resolves a Hub id through `HFOptions`, the same value the `hf` provider forwards, and renders each conversation with the checkpoint's chat template. `--rows N` takes the first N conversations, as the split slice `train[:N]` that `datasets` understands. The smoke run writes its canned conversations as JSONL and fine-tunes the committed tiny Gemma 4 for two steps.
+The script binds `--dataset` to a Hub Source and gives it to a Chat recipe. A local JSONL or Parquet file uses its path directly. The recipe renders each conversation with the checkpoint's chat template; the source selects `train[:N]` when `--rows N` is set. The smoke run writes canned JSONL conversations and fine-tunes the committed tiny Gemma 4 for two steps.
 
 ## GRPO with verifiable rewards
 
