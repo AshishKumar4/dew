@@ -309,6 +309,11 @@ def _round(word: str) -> list[str]:
     """
     client, number = _client(), next(_agreements)
     directory, patience = f"dew/agreement/{number}", int(AGREEMENT_PATIENCE_SECONDS * 1000)
+    import traceback as _traceback
+    frames = [f"{frame.filename.rsplit('/', 1)[-1]}:{frame.lineno}:{frame.name}"
+              for frame in _traceback.extract_stack()[:-1] if '/dew/' in frame.filename][-6:]
+    with open(f"/tmp/dew-rounds-{os.getpid()}.log", "a") as log:
+        log.write(f"ROUND rank={jax.process_index()} n={number} word={word[:70]!r} at {' < '.join(reversed(frames))}\n")
     client.key_value_set(f"{directory}/{jax.process_index()}", word)
     client.wait_at_barrier(directory, patience)
     said = dict(client.key_value_dir_get(directory))
