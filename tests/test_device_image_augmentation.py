@@ -226,9 +226,11 @@ def test_grain_workers_only_decode_and_keep_the_parent_device_draws():
         worker.close()
 
 
-def test_a_run_checks_its_inputs_against_what_the_device_steps_make():
+@pytest.mark.parametrize("host", [False, True], ids=["device", "host-master"])
+def test_a_run_checks_its_inputs_against_what_the_device_steps_make(host):
     """Pictures staged at 24 pixels reach the compiled step, which crops them to the model's 12: the
-    run checks its declared inputs against the device steps' output, not the staged batch."""
+    run checks its declared inputs against the device steps' output, not the staged batch, and a
+    run whose state the host holds augments in its accelerator forward too."""
     import optax
 
     from dew import Field, InputSpec, Trainer
@@ -236,11 +238,13 @@ def test_a_run_checks_its_inputs_against_what_the_device_steps_make():
     from dew.nn.backbones import SimpleDiT
     from dew.objectives.diffusion import DiffusionObjective
     from dew.sampling import Euler
+    from dew.training import Layout
 
     objective = DiffusionObjective(SimpleDiT(patch_size=4, emb_features=16, num_layers=1, num_heads=2,
                                              mlp_ratio=1),
                                    Flow(), InputSpec(Field("image", (12, 12, 3))), solver=Euler(), steps=2)
     data = loader(spec(staging_size=24), batch=8, read="memory", loading=READ, objective=objective.data())
     assert np.shape(next(iter(data.train(DataPartition())))["image"])[1:] == (24, 24, 3)
-    state = Trainer(objective, optax.adam(1e-3), key=0).fit(data, steps=2, log_every=1)
+    layout = Layout(host=("variables",) if host else (), min_shard=1, tolerance=1.)
+    state = Trainer(objective, optax.adam(1e-3), key=0, layout=layout).fit(data, steps=2, log_every=1)
     assert int(state.step) == 2
