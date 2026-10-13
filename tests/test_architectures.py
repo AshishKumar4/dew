@@ -496,7 +496,7 @@ def decay_terms(objective, variables, batch, index: int) -> dict[tuple[str, ...]
 
 
 def decay_invariants(case: Case, tmp_path, initial) -> dict[str, dict[tuple[str, ...], np.ndarray]]:
-    """`assert_leaves_as_exact`'s invariants for each gated delta net's decay
+    """The declared terms (`raised`) of each gated delta net's decay
     parameters over a language model's two SGD steps, by state tree. The
     momentum holds momentum g1 + g2, and a parameter that starts at zero
     moves to -lr ((1 + momentum) g1 + g2), so each is a sum of the two
