@@ -12,7 +12,7 @@ sandwich; the model files arrange blocks.
 import inspect
 import math
 from collections.abc import Sequence
-from typing import Literal, Self, TypedDict, Unpack, get_args
+from typing import TYPE_CHECKING, Literal, Self, TypedDict, Unpack, get_args
 
 import jax
 import jax.numpy as jnp
@@ -24,7 +24,7 @@ from dew.records import JSON
 
 from .activations import gelu_exact_torch, gelu_tanh
 from .attention import LayerNorm, NormalAttention
-from .blocks import FourierEmbedding, TimeProjection
+from .blocks import FourierEmbedding, TimeProjection, modulation
 from .conv import Conv
 from .flops import MissingFlopsCount, counted_flops, projection_flops, real_lengths
 from .precision import at_least_fp32, fp32_result_dot_general
@@ -165,13 +165,8 @@ class AdaLNParams(nn.Module):
     def __call__(self, conditioning):
         if conditioning.ndim == 2:
             conditioning = jnp.expand_dims(conditioning, axis=1)
-        return nn.Dense(
-            features=6 * self.features,
-            dtype=self.dtype,
-            precision=self.precision,
-            kernel_init=nn.initializers.zeros,
-            name="ada_proj"
-        )(nn.silu(conditioning) if self.silu else conditioning)
+        return modulation(conditioning, self.features, 6, name="ada_proj", silu=self.silu, zero_init=True,
+                          dtype=self.dtype, precision=self.precision)
 
 
 @logical_axes({("patch_embed", "Conv_0"): (None, None, None, "embed")})
@@ -330,13 +325,9 @@ class PatchSequenceOutput(nn.Module):
             assert conditioning is not None, "modulated output head needs the conditioning vector"
             if conditioning.ndim == 2:
                 conditioning = jnp.expand_dims(conditioning, axis=1)
-            shift, scale = jnp.split(nn.Dense(
-                features=2 * features,
-                dtype=self.dtype,
-                precision=self.precision,
-                kernel_init=nn.initializers.zeros,
-                name="final_ada_proj",
-            )(nn.silu(conditioning)), 2, axis=-1)
+            projected = modulation(conditioning, features, 2, name="final_ada_proj", zero_init=True,
+                                   dtype=self.dtype, precision=self.precision)
+            shift, scale = jnp.split(projected, 2, axis=-1)
             x_out = x_out * (1 + scale) + shift
 
         x_out = nn.Dense(
@@ -408,6 +399,29 @@ def restored_remat(remat: RematChoice, record: JSON) -> RematChoice | None:
     """`record`'s rung where it is above `remat`'s, or None to keep `remat`."""
     here, there = _remat_rung(remat), _remat_rung(record)
     return None if here is None or there is None or there <= here else DIFFUSION_REMAT[there]
+
+
+class RematLadder(nn.Module):
+    """A diffusion stack's own climb of the remat ladder (`Recomputing`): its `remat` field, one
+    `DIFFUSION_REMAT` rung at a time, and the rung a record restores. Whatever the stack's geometry,
+    the climb reads that one field, which each stack declares where its own fields sit."""
+
+    if TYPE_CHECKING:
+        remat: RematChoice
+
+    @nn.nowrap
+    def recompute_record(self) -> JSON:
+        return self.remat
+
+    @nn.nowrap
+    def recompute_more(self) -> Self | None:
+        stronger = stronger_remat(self.remat)
+        return None if stronger is None else self.clone(remat=stronger)
+
+    @nn.nowrap
+    def restore_recompute(self, record: JSON) -> Self:
+        restored = restored_remat(self.remat, record)
+        return self if restored is None else self.clone(remat=restored)
 
 
 def remat_block(block_cls, enabled: RematChoice, policy: str | None = 'dots'):
@@ -494,7 +508,7 @@ class _AttentionStackOptions(_TransformerOptions, kw_only=True):
         return {**super()._block_options(), 'dropout_rate': self.dropout_rate, 'qk_norm': self.qk_norm}
 
 
-class _DiTStackOptions(_AttentionStackOptions):
+class _DiTStackOptions(RematLadder, _AttentionStackOptions):
     output_channels: int = 3
     patch_size: int = 16
     emb_features: int = 768
@@ -502,20 +516,6 @@ class _DiTStackOptions(_AttentionStackOptions):
     num_heads: int = 12
     remat: RematChoice = False
     scan_order: ScanOrder = 'raster'
-
-    @nn.nowrap
-    def recompute_record(self) -> JSON:
-        return self.remat
-
-    @nn.nowrap
-    def recompute_more(self) -> Self | None:
-        stronger = stronger_remat(self.remat)
-        return None if stronger is None else self.clone(remat=stronger)
-
-    @nn.nowrap
-    def restore_recompute(self, record: JSON) -> Self:
-        restored = restored_remat(self.remat, record)
-        return self if restored is None else self.clone(remat=restored)
 
 
 class _TokenStackOptions(_AttentionBlockOptions):
@@ -717,6 +717,24 @@ class ModulatedBlock(nn.Module):
         mlp_output = self.dropout(mlp_output, deterministic=not train)
 
         return constrain(skip + gate_mlp * mlp_output, RESIDUAL)
+
+
+def factorized_walk(tokens: jax.Array, frames: int, head_dim: int, layers) -> jax.Array:
+    """A clip's `[B*T, S, F]` tokens through interleaved spatial and temporal layers, as the factorized
+    video stacks run them (VideoDiT, V-JEPA's `FactorizedTokenStack`): each `(spatial, temporal)`
+    pair's `spatial(tokens)` reads each frame's tokens, then `temporal(tokens, rotation)` each token's
+    frames under a rotary over frame index, and the tokens return to frame-major order."""
+    batch = tokens.shape[0] // frames
+    patches, features = tokens.shape[1:]
+    rotation = rotary_freqs(jnp.arange(frames), head_dim, ROPE_THETA, dtype=at_least_fp32(tokens.dtype))
+    for spatial, temporal in layers:
+        tokens = spatial(tokens)
+        tokens = tokens.reshape(batch, frames, patches, features).transpose(0, 2, 1, 3).reshape(
+            batch * patches, frames, features)
+        tokens = temporal(tokens, rotation)
+        tokens = tokens.reshape(batch, patches, frames, features).transpose(0, 2, 1, 3).reshape(
+            batch * frames, patches, features)
+    return tokens
 
 
 def rope_for_scan(tokens: jax.Array, head_dim: int, scan_order: str):

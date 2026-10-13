@@ -24,7 +24,7 @@ import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
-from dew.nn.blocks import sinusoidal_time
+from dew.nn.blocks import Modulation, sinusoidal_time
 from dew.nn.flops import MissingFlopsCount, matching_lengths, patch_lengths, projection_flops
 from dew.nn.precision import at_least_fp32
 from dew.nn.rope import axis_tables
@@ -35,7 +35,6 @@ from .joint import (
     TIME_FEATURES,
     DoubleStreamBlock,
     JointAttention,
-    Modulation,
     embedding,
     embedding_flops,
     guided_time,
