@@ -963,7 +963,7 @@ def test_nemotron_h_legacy_geometry_must_repeat_the_field_the_reference_reads(le
 @pytest.mark.parametrize("changes, message", [
     ({"num_nextn_predict_layers": 1, "mtp_layers_block_type": ["moe", "attention"]}, "mtp_layers_block_type"),
     ({"num_nextn_predict_layers": 1, "mtp_layers_block_type": None, "mtp_hybrid_override_pattern": "*X"},
-     "unknown block kinds"),
+     "mtp_hybrid_override_pattern"),
     ({"mlp_hidden_act": "silu"}, "mlp_hidden_act"),
     ({"mamba_hidden_act": "relu"}, "mamba_hidden_act"),
     ({"layers_block_type": ["unknown"]}, "layers_block_type"),
@@ -1128,6 +1128,44 @@ def test_a_nemotron_h_prediction_step_loads_computes_the_reference_and_trains(tm
     moved = jax.tree.map(lambda old, new: bool(np.any(old != np.asarray(new))), before,
                          jax.device_get(trained.variables["params"]["mtp_0"]))
     assert all(jax.tree.leaves(moved)), moved
+
+
+@pytest.mark.parametrize("step", [
+    {"mtp_layers_block_type": ["attention", "moe"]},
+    {"mtp_layers_block_type": None, "mtp_hybrid_override_pattern": "*E"},
+    {"mtp_layers_block_type": ["full_attention", "moe"], "mtp_hybrid_override_pattern": "*"},
+    {"mtp_layers_block_type": ["full_attention"], "mtp_hybrid_override_pattern": "*E"},
+])
+def test_nemotron_h_reads_the_prediction_step_transformers_reads(step):
+    """The step's blocks are the ones NemotronHConfig resolves from the list
+    and the legacy pattern, which overrides the list where the list is its
+    default."""
+    from transformers.models.nemotron_h.configuration_nemotron_h import NemotronHConfig
+
+    config = {**fixture_config("nemotron-h-moe-tiny"), "num_nextn_predict_layers": 1, **step}
+    model = translate_config(config).value
+    reference = NemotronHConfig.from_dict({**NemotronHConfig.from_pretrained(
+        str(FIXTURES / "nemotron-h-moe-tiny")).to_dict(), **step, "num_nextn_predict_layers": 1})
+    blocks = (model.mtp_layer_type, *((model.mtp_feedforward_type,) if model.mtp_feedforward_type else ()))
+    assert list(blocks) == list(reference.mtp_layers_block_type)
+
+
+@pytest.mark.parametrize("name", ["nemotron-h-tiny", "nemotron-h-moe-tiny"])
+def test_a_nemotron_h_trunk_whose_config_names_a_step_loads_as_the_trunk(name, tmp_path):
+    """transformers saves the trunk alone whatever depth the config names:
+    such a checkpoint, the dense one too, whose default step names a routed
+    kind its trunk lacks, loads the trunk it holds and computes its logits."""
+    from shutil import copytree
+
+    directory = tmp_path / name
+    copytree(FIXTURES / name, directory)
+    stated = {**fixture_config(name), "num_nextn_predict_layers": 1}
+    (directory / "config.json").write_text(json.dumps(stated))
+    model, variables = fp32_decoder(directory)
+    assert model.num_nextn_predict_layers == 0 and "mtp_0" not in variables["params"]
+    ids = jnp.asarray(np.load(FIXTURES / name / "input_ids.npy"), jnp.int32)
+    plain, held = fp32_decoder(FIXTURES / name)
+    np.testing.assert_array_equal(np.asarray(model.apply(variables, ids)), np.asarray(plain.apply(held, ids)))
 
 
 @pytest.mark.parametrize("name", HYBRID[1:])

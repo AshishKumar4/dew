@@ -549,7 +549,14 @@ def held_depths(fields: dict, params: Mapping[str, object]) -> None:
     the depths its config names is the trunk it holds; one holding some
     loads them, and refuses a missing one."""
     if fields.get("num_nextn_predict_layers") and not any(str(name).startswith("mtp_") for name in params):
-        fields["num_nextn_predict_layers"] = 0
+        # The trunk alone: no depth, nor the kinds and residual streams only depths build.
+        dspark = fields.get("dspark")
+        kept = {*fields.get("layer_types", ()),
+                *([dspark["layer_type"]] if isinstance(dspark, Mapping) else [])}
+        fields.update(num_nextn_predict_layers=0, mtp_layer_type=None, mtp_feedforward_type=None,
+                      mtp_hyper_connections=None)
+        if isinstance(fields.get("kinds"), Mapping):
+            fields["kinds"] = {name: kind for name, kind in fields["kinds"].items() if name in kept}
 
 
 def translate_weights(
