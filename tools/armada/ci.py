@@ -65,6 +65,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
+from collections.abc import Iterable
 from pathlib import Path
 
 PYTHONS = ("3.12", "3.14")
@@ -303,6 +304,11 @@ the whole process, so a torch.compile in a later file of its task fails (test_re
 MXFP4, armada dew-20261011231242-dd32ac90): its tasks hold only files so marked."""
 
 
+def torchax_files(names: Iterable[str]) -> set[str]:
+    """The files of `names` marked `torchax` (`APART`)."""
+    return {name for name in names if APART.search(Path(name).read_text())}
+
+
 def plan(target: float, timings: dict) -> list[dict]:
     """The matrix's entries: about `target` seconds of files each, for each Python. A file nothing has
     timed runs alone, so however long it takes it holds up no other file, and its time is known from
@@ -325,7 +331,7 @@ def plan(target: float, timings: dict) -> list[dict]:
                           for group, weight in enumerate(cut, start=1)]
         light = {name: seconds for name, seconds in timed.items()
                  if seconds is not None and seconds <= target}
-        apart = {name for name in light if APART.search(Path(name).read_text())}
+        apart = torchax_files(light)
         for family in (sorted(set(light) - apart), sorted(apart)):
             count = max(math.ceil(sum(light[name] for name in family) / target), 1)
             bins: list[tuple[float, int, list[str]]] = [(0.0, index, []) for index in range(count)]
@@ -522,8 +528,9 @@ def listed(prefix: str, token: str) -> list[str]:
 def gpu_tier(python: str) -> dict[str, list[str]]:
     """The test files that take another path on a GPU, each with its evidence: where its tests read
     the backend and its marks of tools/armada/executed.py's `MARKS`, over every record of its rows,
-    a split file's under each count of groups it was planned as. A file no record of which says
-    is in, as "unrecorded": a new file, or one no green run has recorded since records said."""
+    a split file's under each count of groups it was planned as. A file without a record, or with
+    one the Worker did not return, is in as "unrecorded": a new file, or one no green run of these
+    tools has recorded."""
     token = reading_token()
     if token is None:
         raise SystemExit("the GPU tier is chosen from the test cache's records, which need its URL and token")
@@ -536,8 +543,7 @@ def gpu_tier(python: str) -> dict[str, list[str]]:
     evidence: dict[str, set[str]] = {}
     with concurrent.futures.ThreadPoolExecutor(32) as pool:
         for name, found in pool.map(reads, listed(prefix, token)):
-            if found is not None:
-                evidence.setdefault(name, set()).update(found)
+            evidence.setdefault(name, set()).update(["unrecorded"] if found is None else found)
     every = sorted(str(path) for path in Path("tests").glob("test_*.py") if str(path) not in SKIPPED)
     unrecorded = {name: ["unrecorded"] for name in every if name not in evidence}
     return {name: sorted(evidence[name]) for name in every if evidence.get(name)} | unrecorded
@@ -595,8 +601,16 @@ def main() -> int:
         print(f"{len(recorded)} tests, {sum(recorded.values()):.0f} s, in {DURATIONS}")
         return 0
     if args.operation == "gpu-tier":
-        for name, evidence in gpu_tier(PYTHONS[0]).items():
-            print(name, *(evidence if args.evidence else ()), sep="\t")
+        tier = gpu_tier(PYTHONS[0])
+        if args.evidence:
+            for name, evidence in tier.items():
+                print(name, *evidence, sep="\t")
+            return 0
+        # A pytest session a line: files marked `torchax` run apart from the rest, as in the plan.
+        apart = torchax_files(tier)
+        for session in (sorted(set(tier) - apart), sorted(apart)):
+            if session:
+                print(*session)
         return 0
     if args.operation == "plan":
         timings = json.loads(args.timings.read_text()) if args.timings.is_file() else {}

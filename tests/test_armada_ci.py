@@ -115,18 +115,30 @@ def test_a_task_rows_each_file_red_where_ci_would_fail(ci, tmp_path):
 
 def test_the_gpu_tier_is_every_file_whose_tests_read_the_backend_or_are_marked_for_a_gpu(
         ci, tmp_path, monkeypatch, cache_worker):
-    """A task keeps, beside each green file's key, where its tests read the
-    backend and their GPU marks (executed.py), and the GPU tier is each file
-    with either and each no record covers. The `platform` module is no read
-    of the backend. A file that started a process is in the records for the
-    tier, and the plan still never skips it."""
-    url, _, _ = cache_worker
+    """A task keeps, beside each green file's key, where its run read the
+    backend and its GPU marks (executed.py), and the GPU tier is each file
+    with either and each without a record the Worker returns. A read is the
+    file's whose test calls it, by any name, every file's that requests a
+    session fixture that made it, and a test module's whose body made it,
+    though another file imported it first. The `platform` module is no read.
+    A file that started a process is in the tier's records, and the plan
+    still never skips it."""
+    url, stored, _ = cache_worker
     monkeypatch.setenv("DEW_XLA_CACHE_URL", url)
     monkeypatch.setenv("DEW_XLA_CACHE_TOKEN", "token")
+    device = "class Device:\n    platform = 'gpu'\n"
     files = {
-        "test_routes.py": "class Device:\n    platform = 'gpu'\n"
-                          "def chosen(device): return 'triton' if device.platform == 'gpu' else 'xla'\n"
-                          "def test_routes(): assert chosen(Device()) == 'triton'\n",
+        "devices.py": device + "def placed(device): return device.platform\n",
+        "conftest.py": "import pytest\nfrom devices import Device, placed\n"
+                       "@pytest.fixture(scope='session')\ndef where(): return placed(Device())\n",
+        "test_routes.py": device + "def chosen(device): return device.platform == 'gpu'\n"
+                                   "def test_routes(): assert chosen(Device())\n",
+        "test_passed.py": "def chosen(default_backend): return default_backend()\n"
+                          "def test_passed(): assert chosen(lambda: 'gpu') == 'gpu'\n",
+        "test_one.py": "def test_one(where): assert where == 'gpu'\n",
+        "test_two.py": "def test_two(where): assert where == 'gpu'\n",
+        "test_importer.py": "import test_imported\ndef test_imports(): assert test_imported.ON == 'gpu'\n",
+        "test_imported.py": device + "ON = Device().platform\ndef test_on(): assert ON == 'gpu'\n",
         "test_marked.py": "import pytest\n@pytest.mark.gpu\ndef test_on_a_gpu(): pass\n",
         "test_machine.py": "import platform\ndef test_machine(): assert platform.machine()\n",
         "test_spawns.py": "import subprocess, sys\n"
@@ -140,11 +152,22 @@ def test_the_gpu_tier_is_every_file_whose_tests_read_the_backend_or_are_marked_f
     (venv / "python").write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
     (venv / "python").chmod(0o755)
     out = tmp_path / "verdict.json"
-    ci.task("3.12", [f"tests/{name}" for name in files if name != "test_new.py"], "", out, 600.0)
+    ran = [f"tests/{name}" for name in files if name.startswith("test_") and name != "test_new.py"]
+    ci.task("3.12", ran, "", out, 600.0)
     assert {row["name"]: row["exitCode"] for row in json.loads(out.read_text())["rows"]} == {
-        f"3.12:tests/{name}": 0 for name in files if name != "test_new.py"}
-    assert ci.gpu_tier("3.12") == {"tests/test_marked.py": ["mark:gpu"], "tests/test_new.py": ["unrecorded"],
-                                   "tests/test_routes.py": ["tests/test_routes.py:chosen"]}
+        f"3.12:{name}": 0 for name in ran}
+    # A group of test_machine.py's the Worker lists and does not return.
+    stored[ci.cache_url("3.12", "3.12:tests/test_machine.py#2/2", ci.READS)[len(url):]] = None
+    assert ci.gpu_tier("3.12") == {
+        "tests/test_imported.py": ["tests/test_imported.py:<module>"],
+        "tests/test_importer.py": ["tests/test_imported.py:<module>"],
+        "tests/test_machine.py": ["unrecorded"],
+        "tests/test_marked.py": ["mark:gpu"],
+        "tests/test_new.py": ["unrecorded"],
+        "tests/test_one.py": ["tests/devices.py:placed"],
+        "tests/test_passed.py": ["tests/test_passed.py:chosen"],
+        "tests/test_routes.py": ["tests/test_routes.py:chosen"],
+        "tests/test_two.py": ["tests/devices.py:placed"]}
     common = ci.shared("3.12")
     assert [ci.cached("3.12", [ci.row("3.12", f"tests/{name}", "")], common)
             for name in ("test_machine.py", "test_spawns.py")] == [True, False]
