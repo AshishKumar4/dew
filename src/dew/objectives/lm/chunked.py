@@ -590,7 +590,7 @@ def chunked_cross_entropy(hidden, head: OutputTable, targets, chunks: int, *,
     table = head.matrix if vocab_major else head.matrix.T
     product = BF16 if rounds_to_bf16(compute, precision) else precision
 
-    def head(hidden, table, targets, excluded, cap, bias):
+    def scored(hidden, table, targets, excluded, cap, bias):
         if tile is None:
             return _whole_head(hidden, table, targets, excluded, cap, chunks, product, predict,
                                float(temperature), bias)
@@ -609,8 +609,8 @@ def chunked_cross_entropy(hidden, head: OutputTable, targets, chunks: int, *,
     left_out = None if excluded is None else jnp.asarray(excluded, jnp.int32)
     mesh = jax.sharding.get_abstract_mesh()
     if mesh.empty:
-        return head(hidden, table, targets, left_out, cap, bias)
-    return _sharded_head(mesh, hidden, table, targets, left_out, cap, bias, head, column_logits,
+        return scored(hidden, table, targets, left_out, cap, bias)
+    return _sharded_head(mesh, hidden, table, targets, left_out, cap, bias, scored, column_logits,
                          predict=predict)
 
 
