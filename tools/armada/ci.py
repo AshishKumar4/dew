@@ -440,8 +440,10 @@ def task(python: str, tests: list[str], split: str, out: Path, deadline: float, 
         red += [f"SKIPPED on a missing import {case.get('classname')}::{case.get('name')}: "
                 f"{node.get('message')}" for case in own for node in case.iter("skipped")
                 if "could not import" in f"{node.get('message')} {node.text}"]
-        if not own and done.returncode not in (0, 5):
-            red.append(f"pytest exited {done.returncode} with no report of {name}")
+        # pytest exits 1 for failed tests and 5 for none collected; any other exit (a crash, a signal,
+        # an internal error) leaves even a written report untrustworthy, so every row it holds is red.
+        if done.returncode not in (0, 1, 5) or (not own and done.returncode == 1):
+            red.append(f"pytest exited {done.returncode}" + ("" if own else f" with no report of {name}"))
         if expired:
             red.append(f"the task ran past its deadline of {deadline:.0f} s and was interrupted")
         seconds = own_seconds[name] * pace if pace else wall / len(tests)
