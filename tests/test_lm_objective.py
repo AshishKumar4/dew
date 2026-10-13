@@ -23,6 +23,7 @@ from recording import RecordingTracker
 
 from dew.artifacts import TokenScores
 from dew.data.chat import ROLES_KEY, Role
+from dew.nn.inputs import coordinates
 from dew.nn.protocols import OutputTable
 from dew.objectives.base import Step
 from dew.objectives.lm import TEXT_KEY, LMObjective, Perplexity, Samples
@@ -429,7 +430,9 @@ class PackedTinyLM(TinyCausalLM):
 
     @nn.compact
     def hidden_states(self, tokens, train: bool = False, positions=None,
-                      segment_ids=None):
+                      segment_ids=None, coordinates=None):
+        if coordinates is not None:
+            positions, segment_ids = coordinates.positions, coordinates.segments
         length = tokens.shape[1]
         table = self.param("positions", nn.initializers.normal(0.02),
                            (self.max_seq_len, self.emb_features))
@@ -556,8 +559,9 @@ def test_a_packed_batch_reaches_the_objective_through_the_batch_dict():
     objective = packed_objective()
     params = objective.init(jax.random.key(0))
     tokens, segment_ids, positions, _ = documents()
-    batch = {TEXT_KEY: tokens, "text_segment_ids": segment_ids,
-             "text_positions": positions}
+    batch = {TEXT_KEY: tokens, "text_coordinates": coordinates(
+        segments=segment_ids, positions=positions, max_segments=tokens.shape[1],
+        right_padded=True, xp=np)}
 
     packed, _ = objective.scalar_loss(params, batch, step_at())
     unpacked, _ = objective.scalar_loss(params, {TEXT_KEY: tokens}, step_at())
@@ -568,6 +572,21 @@ def test_a_packed_batch_reaches_the_objective_through_the_batch_dict():
     assert float(packed) == pytest.approx(weighted_mean(losses, weights))
     assert abs(float(packed) - float(unpacked)) > 1e-3, (
         "the packed keys made no difference to the loss")
+
+
+@pytest.mark.parametrize("stale", [("text_segment_ids",), ("text_positions",),
+                                  ("text_segment_ids", "text_positions")])
+def test_a_packed_batch_refuses_the_old_packing_columns(stale):
+    objective = packed_objective()
+    params = objective.init(jax.random.key(0))
+    tokens, segments, positions, _ = documents()
+    columns = {"text_segment_ids": segments, "text_positions": positions}
+    batch = {TEXT_KEY: tokens, **{name: columns[name] for name in stale}}
+
+    with pytest.raises(ValueError, match="text_coordinates"):
+        objective.scalar_loss(params, batch, step_at())
+    with pytest.raises(ValueError, match="text_coordinates"):
+        objective.evaluate(params, batch, step_at())
 
 
 # --- loss_role: SFT on the chat data path --------------------------------------

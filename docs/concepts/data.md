@@ -37,8 +37,8 @@ A source can hold column arrays or a sequence of record dictionaries. Training r
 | Recipe and alias | Fields after batching |
 |---|---|
 | `Records` / `records` | The source's fields, with numeric values in JAX's configured widths |
-| `Text` / `text` | `text`, int32 `[B, seq_len + 1]`; packing adds aligned segment and position arrays |
-| `Chat` / `chat` | Packed token fields and aligned `text_roles` |
+| `Text` / `text` | `text`, int32 `[B, seq_len + 1]`; packing adds `text_coordinates` |
+| `Chat` / `chat` | Packed `text`, `text_coordinates` and aligned `text_roles` |
 | `Prompts` / `prompts` | Left-padded prompt IDs, prompt lengths and fixed-width reward metadata |
 | `Preferences` / `preferences` | `input_ids` and `completion_mask`, `[B, 2, seq_len]` |
 | `Images` / `images` | RGB uint8 `image`, `[B, H, W, 3]`, and optional labels |
@@ -114,7 +114,7 @@ For conditional image training, pass `host=(EncodeCaptions(objective.inputs.toke
 
 ## Text, chat and packing
 
-`Text` tokenizes raw text or opens a produced token store. Fixed windows contain `seq_len + 1` IDs with one overlap token. `pack="first-fit"` places documents in padded windows; `"concat"` concatenates and splits them. Aligned segment IDs stop attention and target scoring at document boundaries, and positions restart within each document.
+`Text` tokenizes raw text or opens a produced token store. Fixed windows contain `seq_len + 1` IDs with one overlap token. `pack="first-fit"` places documents in padded windows; `"concat"` concatenates and splits them. A packed batch carries `text_coordinates`, a `dew.nn.inputs.Coordinates` pytree built on the host. Its `.segments` array stops attention and target scoring at document boundaries, and its `.positions` array restarts within each document. Record-level transforms before batching still read `text_segment_ids` and `text_positions`.
 
 `Chat` renders conversations with the tokenizer's chat template. Its default long-record policy truncates; `long="chunk"` keeps an over-length conversation as chunks, and `long="drop"` rejects it. The recipe emits role IDs for every token. The objective chooses the loss role, for example `LMObjective(..., loss_role=Role.ASSISTANT)`.
 
@@ -126,6 +126,7 @@ To produce token records, export a deterministic prefix. This example downloads 
 from dew.data import ByteTokenizer, Loading, Memory
 from dew.config.data import TextData, loader
 from dew.data.pipeline import Pipeline
+from dew.data.dataset import DataPartition
 from dew.data.sinks import export
 import tempfile
 from dew.data.steps.text import Tokenize
@@ -140,6 +141,13 @@ export(prefix, token_store, format="array_record", length_field="text",
                  "eos_id": tokenizer.eos_id})
 data = loader(TextData(source=token_store, seq_len=32, pack="first-fit"),
             batch=4, read="memory", loading=Loading(workers=0))
+stream = data.train(DataPartition())
+try:
+    packed = next(stream)
+    print(packed["text_coordinates"].segments[0])
+    print(packed["text_coordinates"].positions[0])
+finally:
+    stream.close()
 ```
 
 Use a fresh output directory: exports commit immutable shards and a manifest, and refuse an existing publication. Export validation to a second URL and pass it as `validation=`. Existing binary token stores remain readable through `TokenFiles`; their tokenizer, dtype and document boundaries come from producer metadata.
