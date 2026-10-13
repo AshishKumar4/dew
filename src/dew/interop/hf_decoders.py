@@ -849,13 +849,16 @@ def export_config(model) -> Mapping[str, object]:
 
 
 _RUNTIME_FIELDS = frozenset({
-    'parent', 'name', 'dtype', 'precision', 'attention_impl', 'kv_cache', 'remat', 'scan_layers',
-    'bank_layers', 'dropout_rate', 'embedding_dropout_rate', 'attention_dropout_rate',
-    'max_seq_len', 'mask_token_id', 'layer_scalar', 'scale_after_cast'})
+    'parent', 'name', 'dtype', 'precision', 'force_fp32_for_softmax', 'attention_impl', 'kv_cache', 'remat',
+    'scan_layers', 'bank_layers', 'dropout_rate', 'embedding_dropout_rate', 'attention_dropout_rate',
+    'initializer_range', 'depth_scaled_init', 'max_seq_len', 'mask_token_id', 'layer_scalar',
+    'scale_after_cast'})
 """CausalTransformer fields that say how a model runs or trains, not what it
-computes. `layer_scalar` is whether Gemma 4's scalars train; either way the
-forward multiplies by them. `scale_after_cast` orders a norm's scale and its
-cast to the compute dtype, which are the same product in fp32."""
+computes: precision and kernels, dropout, and the initialization a loaded
+model's weights replace. `layer_scalar` is whether Gemma 4's scalars train;
+either way the forward multiplies by them. `scale_after_cast` orders a
+norm's scale and its cast to the compute dtype, which are the same product
+in fp32."""
 
 _RESOLVED: Mapping[str, Callable[[CausalTransformer], object]] = {
     "num_kv_heads": lambda model: model.kv_heads,
