@@ -914,7 +914,14 @@ def gathered_keys_attention(kernel, query, key, value, shards: int, *, causal,
 
 
 CUDNN_DTYPES = (jnp.bfloat16, jnp.float16)
-CUDNN_MAX_HEAD_DIM = 128
+
+
+def cudnn_max_head_dim() -> int:
+    """The widest heads cuDNN's fused bf16/fp16 kernel takes on this GPU: 256 on Hopper and later, 128
+    before (jax's `check_is_flash_attention`, jax/_src/cudnn/fused_attention_stablehlo.py, which
+    raises past it)."""
+    generation = device_generation()
+    return 256 if generation.startswith('sm') and int(generation[2:]) >= 90 else 128
 
 
 def cudnn_runs(query, softcap=None) -> bool:
@@ -936,7 +943,7 @@ def cudnn_runs(query, softcap=None) -> bool:
     """
     head_dim = query.shape[-1]
     return (gpu_placed() and bf16_dot_runs() and query.dtype in CUDNN_DTYPES
-            and head_dim % 8 == 0 and head_dim <= CUDNN_MAX_HEAD_DIM
+            and head_dim % 8 == 0 and head_dim <= cudnn_max_head_dim()
             and softcap is None and not deterministic_ops_requested())
 
 
@@ -1356,11 +1363,11 @@ def fused_attention(query, key, value, bias, mask, causal, sliding_window, imple
                 f"{query.dtype}. Set dtype bfloat16, or attention_impl 'xla' to "
                 "keep this precision.")
         head_dim = query.shape[-1]
-        if head_dim % 8 or head_dim > CUDNN_MAX_HEAD_DIM:
+        if head_dim % 8 or head_dim > cudnn_max_head_dim():
             raise ValueError(
                 f"cudnn attention needs a head dimension that is a multiple of 8 "
-                f"and at most {CUDNN_MAX_HEAD_DIM}, got {head_dim}; use attention_impl "
-                "'xla' for this shape.")
+                f"and at most {cudnn_max_head_dim()} on {device_generation()}, got {head_dim}; use "
+                "attention_impl 'xla' for this shape.")
         if sliding_window is not None and not causal:
             raise ValueError(
                 "cudnn attention windows only the keys before a query, and this "
@@ -1604,8 +1611,10 @@ def resolve_implementation(implementation, query, key, *, dtype=None, precision=
     fused = sinks is None and cudnn_runs(query, softcap) and (causal or sliding_window is None)
     # tokamax's Triton kernel, where it takes the call, ran
     # SimpleDiT-B's 64-wide heads as fast as FlashAttention-2 on the A100 and
-    # faster on the L4.
-    if fused and triton_runs(query, sliding_window, mask, bias):
+    # faster on the L4; on an H100 FlashAttention-3 took half its time, so a
+    # target row names the kernel for heads it takes (`attention_narrow`).
+    if fused and measured_kernel('attention_narrow', 'triton') == 'triton' and triton_runs(
+            query, sliding_window, mask, bias):
         return 'triton'
     refusal = flash_refusal(query, key, causal, sliding_window, mask, bias, softcap, sinks)
     if refusal is None:
