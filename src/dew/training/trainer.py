@@ -1493,7 +1493,8 @@ class Trainer(Generic[Loss, Effects]):
         interval = Interval(time.time(), last_saved=(
             int(state.step) if checkpoints is not None and checkpoints.latest is not None else None),
             tokens_before_log=int(run.stop_control.pop("tokens", 0)))
-        if self._opened(plan, run, interval, state, position):
+        if self._opened(plan, run, interval, state, position,
+                        resumed=initial is None and interval.last_saved is not None):
             return state, True
         compiled: dict[Shapes, tuple[CompiledStep, StepFlops | None]] = {}
         seen = 0
@@ -1617,10 +1618,12 @@ class Trainer(Generic[Loss, Effects]):
         run.other += time.perf_counter() - paused
         return self._reported_outcome(error, run)
 
-    def _opened(self, plan: _FitPlan, run: _FitRun, interval: Interval, state: TrainState, position) -> bool:
+    def _opened(self, plan: _FitPlan, run: _FitRun, interval: Interval, state: TrainState, position, *,
+                resumed: bool) -> bool:
         """Start `fit` from the placed state: report it, refuse a run already
-        past its steps or a checkpoint cadence with no checkpointer, and open
-        the training stream on its prefetch worker. Returns whether the run
+        past its steps, a checkpoint cadence with no checkpointer or a resume
+        its stream cannot continue, and open the training stream on its
+        prefetch worker. Returns whether the run
         is already complete, a checkpoint at its last step having been
         written, so there is nothing to do."""
         mesh, checkpoints, steps = self.device_mesh, self.checkpoints, plan.steps
@@ -1653,6 +1656,13 @@ class Trainer(Generic[Loss, Effects]):
             run.source = plan.dataset.train(partition)
             check_stream(run.source, mesh, self.mesh, plan.dataset.batch,
                          self.accumulation * (self._split or 1), rows=self.rollout is None)
+            if resumed and position is None:
+                raise ValueError(
+                    f"step {current}'s checkpoint holds no data position, as "
+                    f"{stream_identity(run.source)} keeps none, so resuming would read its data again "
+                    f"from the start; give the stream get_state and set_state, read it through dew.data, "
+                    f"or declare that it reads the same batches each time it opens "
+                    f"(dew.data.dataset.replayed, from_iter(replay=True))")
             if isinstance(run.source, RampedStream):
                 # Each stage's batch is read whole: no plan splits a ramp's.
                 self._split = 1
