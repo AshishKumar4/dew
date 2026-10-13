@@ -29,7 +29,7 @@ TEXT = {
     "layer_rope_theta": [500000.0] * 3 + [0.0],
     "rope_parameters": {"rope_theta": 500000.0, "rope_type": "default"},
     "final_logit_softcapping": 20.0, "output_multiplier": 0.19611613513818404,
-    "tie_word_embeddings": False, "attention_bias": False,
+    "tie_word_embeddings": False, "attention_bias": False, "bos_token_id": 1, "eos_token_id": 2,
 }
 
 
