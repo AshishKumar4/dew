@@ -1,7 +1,7 @@
 """Full-weight SFT of a Gemma 4 text decoder on a Hub chat dataset.
 
     python examples/sft_gemma4.py --model google/gemma-4-E2B \\
-        --dataset allenai/tulu-3-sft-mixture --steps 4000 --out runs/gemma4-sft
+        --dataset hf://datasets/allenai/tulu-3-sft-mixture --steps 4000 --out runs/gemma4-sft
 
 The run packs whole conversations into windows, counts the loss on assistant
 targets alone, shards the weights over the visible devices and accumulates
@@ -12,9 +12,9 @@ them, and the run directory itself scores through the harness:
     python -m dew.eval --model dew --model_args run=runs/gemma4-sft/checkpoints/gemma4-sft \\
         --tasks hellaswag --limit 64
 
-`dew.data.ChatMessages` reads the Hub dataset itself, so the id on the
-command line is what the run trains on: it renders every conversation with
-the checkpoint's own chat template and packs them into windows.
+The `ChatData` recipe reads the Hub dataset through its `hf://` source, so the URL
+on the command line is what the run trains on: it renders every conversation
+with the checkpoint's own chat template and packs them into windows.
 
     JAX_PLATFORMS=cpu python examples/sft_gemma4.py --smoke --out /tmp/gemma4-smoke
 """
@@ -28,8 +28,10 @@ import jax.numpy as jnp
 import tyro
 
 from dew.config import ModelConfig, OptimConfig, TrainerConfig
-from dew.data import ChatMessages, HFTokenizer, Loading
+from dew.config.data import ChatData, loader
+from dew.data import HFTokenizer, Loading
 from dew.data.chat import Role
+from dew.data.sources import Read
 from dew.inference import RunProcessor
 from dew.interop import PretrainedDecoder
 from dew.objectives.lm import LMObjective, LMRunConfig, Perplexity, Samples
@@ -51,8 +53,10 @@ SMOKE_CONVERSATIONS = [
 @dataclass
 class Config:
     model: str = "google/gemma-4-E2B"
-    dataset: str = "allenai/tulu-3-sft-mixture"
-    """Hub chat dataset id, a parquet file or a .jsonl file of conversations."""
+    dataset: str = "hf://datasets/allenai/tulu-3-sft-mixture"
+    """A Hub source URL, Parquet file or JSONL conversations."""
+    data_read: Read = "memory"
+    """Materialize rendering and packing so four workers can share even one physical source shard."""
     split: str = "train"
     column: str = "messages"
     out: Path = Path("runs/gemma4-sft")
@@ -69,7 +73,7 @@ class Config:
 
 
 def write_conversations(conversations: list, out: Path) -> Path:
-    """The canned turns as the JSONL `ChatMessages` reads line by line."""
+    """The canned turns as the JSONL file the `Chat` recipe reads line by line."""
     out.mkdir(parents=True, exist_ok=True)
     jsonl = out / "chat.jsonl"
     jsonl.write_text("".join(json.dumps({"messages": turns}) + "\n" for turns in conversations))
@@ -83,10 +87,12 @@ def run_config(config: Config, tokenizer: str, chat: str) -> LMRunConfig:
     # A row budget is the split slice `datasets` already understands.
     split = config.split if config.rows is None else f"{config.split}[:{config.rows}]"
     return LMRunConfig(
-        data=ChatMessages(tokenizer=tokenizer, path=chat, val_path=chat, column=config.column,
-                          split=split, seq_len=config.sequence_length, val_batches=1,
-                          loading=Loading(workers=0, threads=1, read_buffer=2,
-                                          worker_buffer=1) if smoke else Loading(workers=4)),
+        data_read=config.data_read,
+        data=ChatData(tokenizer=tokenizer, source=chat, validation=chat, column=config.column,
+                  split=split, seq_len=config.sequence_length, long="chunk"),
+        validation_records=config.batch_size,
+        loading=Loading(workers=0, threads=1, read_buffer=2,
+                        worker_buffer=1) if smoke else Loading(workers=4),
         tokenizer=tokenizer,
         max_new_tokens=4 if smoke else 64,
         optim=OptimConfig(learning_rate=config.learning_rate, weight_decay=0.0,
@@ -135,7 +141,9 @@ def main(config: Config) -> Path:
     # rebuild the checkpoint's own architecture at the precision it trained in.
     run = replace(run, model=ModelConfig.from_model(source.model))
 
-    data = run.data.load(batch=run.trainer.batch_size)
+    data = loader(run.data, batch=run.trainer.batch_size, read=run.data_read,
+                provision=run.provision, loading=run.loading,
+                validation_records=run.validation_records)
     name = config.out.name
     state: TrainState = run.train(objective, data, name=name,
                                   metrics=(Perplexity(),),

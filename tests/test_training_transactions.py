@@ -13,7 +13,7 @@ from affine_run import raw_leaf
 from flax import struct
 
 from dew.checkpoints import Checkpoints
-from dew.data import DataPartition
+from dew.data.dataset import DataPartition
 from dew.objectives import Aux, EMASpec, Objective, Ratio
 from dew.objectives.base import under
 from dew.training import Trainer

@@ -24,8 +24,9 @@ import numpy as np
 import optax
 
 from dew.checkpoints import Checkpoints
-from dew.data import DataPartition, Loading, TokenWindows
-from dew.data.dataset import GlobalStream
+from dew.config.data import TextData, loader
+from dew.data import Loading
+from dew.data.dataset import DataPartition, GlobalStream
 from dew.interop import Pretrained
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
@@ -111,8 +112,8 @@ def run(directory: Path, mode: str) -> None:
     source = Pretrained.load(directory / "source", dtype="float32", attention_impl="xla")
     objective = LMObjective(source.model.clone(dropout_rate=0.1), SEQUENCE,
                             variables=source.variables, ema_decay=0.9)
-    data = TokenWindows(path=str(directory / "tokens"), seq_len=SEQUENCE, seed=17, val_batches=1,
-                        loading=Loading(workers=0, threads=1)).load(batch=BATCH)
+    data = loader(TextData(source=str(directory / "tokens"), seq_len=SEQUENCE), batch=BATCH, read="memory",
+                seed=17, validation_records=BATCH, loading=Loading(workers=0, threads=1))
     trainer = Trainer(objective, optax.chain(optax.clip_by_global_norm(0.5),
                                              optax.adamw(0.003, weight_decay=0.01)),
                       key=jax.random.key(11), accumulation=2, dynamic_scale=True,
