@@ -52,7 +52,7 @@ def _case_call(kernel, config, shape, dtype, *, reverse=False):
         "chunk_bwd_dv_local": (keyed, keyed, gated, valued),
         "chunk_bwd_dhu": (keyed, keyed, weighted, gated, state, valued, valued),
         "chunk_bwd_dqkwg": (keyed, keyed, valued, weighted, gated, entered, valued, valued, entered),
-        "prepare_wy_repr_bwd": (keyed, valued, beta, gated, inverse, weighted, valued),
+        "prepare_wy_repr_bwd": (keyed, valued, beta, gated, inverse, weighted, valued, keyed),
     }
     kwargs = {**config, "chunk": chunk, "interpret": False}
     if kernel == "chunk_local_cumsum":
