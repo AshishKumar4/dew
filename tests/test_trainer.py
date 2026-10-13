@@ -611,7 +611,7 @@ import sys
 
 import jax
 import numpy as np
-from affine_run import Data, Regression
+from affine_run import Regression, dataset
 from recording import RecordingTracker
 
 from dew.cache import enable_compilation_cache
@@ -632,7 +632,7 @@ def fit(peak, steps, path):
     trainer = Trainer(Regression(), config, key=jax.random.key(0), layout=Layout(min_shard=1, tolerance=1.0),
                       checkpoints=Checkpoints(path), tracker=sink)
     before = compilation_cache_counts()
-    state = trainer.fit(Data(), steps=steps, checkpoint_every=2, log_every=1)
+    state = trainer.fit(dataset(), steps=steps, checkpoint_every=2, log_every=1)
     after = compilation_cache_counts()
     return {"params": [np.asarray(leaf).tolist() for leaf in jax.tree.leaves(state.variables["params"])],
             "rates": {step: row["train/learning_rate"] for step, row in sink.scalars
