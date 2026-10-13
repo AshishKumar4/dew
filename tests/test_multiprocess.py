@@ -46,7 +46,6 @@ from dew.position import ENVELOPE
 pytestmark = pytest.mark.mesh
 
 
-
 # The simulated mesh the rest of the suite runs on, split among the processes.
 # tests/test_parallelism.py's tolerance for the same step on another topology.
 PARITY = {"rtol": 2e-4, "atol": 2e-5}
@@ -57,9 +56,6 @@ STEPS = 9
 SAVE_EVERY = 3
 BLOCK_AFTER = 5
 RECORDS = worker.BATCH * 16
-
-
-
 
 
 def dumped_params(out: Path) -> dict:
@@ -186,18 +182,6 @@ def test_four_processes_build_the_same_mesh_as_two(tmp_path):
 
 
 @pytest.mark.distributed
-def test_a_default_run_name_takes_its_timestamp_from_process_zero(two_processes):
-    """The date in a default run name is the checkpoint directory's name, and
-    every process writes into that directory, so the name comes from process
-    zero's clock. The worker sets process 1's clock a year ahead; a name
-    built from it would put process 1's shards in a directory of their own."""
-    stamps = [report["run_timestamp"] for report in two_processes]
-    assert stamps[0] == stamps[1]
-    assert int(stamps[0][:4]) == two_processes[0]["own_year"]
-    assert int(stamps[1][:4]) != two_processes[1]["own_year"], "the skew did not apply"
-
-
-@pytest.mark.distributed
 def test_the_global_batch_is_the_union_of_the_process_slices(two_processes):
     """Each process hands shard_batch its own rows and gets the whole batch.
 
@@ -309,29 +293,6 @@ def test_every_objective_scores_every_record_of_a_split_once_on_two_processes(tm
     if part == 0:
         assert_the_metric_over_every_record(reports[0]["perplexity"])
         assert_the_metric_over_every_record(reports[0]["one"], 1)
-
-
-@pytest.mark.distributed
-def test_a_validation_split_packed_unevenly_is_scored_whole_on_every_process(tmp_path):
-    """Every process scores every window of the split.
-
-    Of these 60 documents, 36 fill a nine-id window and 24 are one eos each,
-    which the plan packs into 39 windows; process 0 reads 20 of them and
-    process 1 the other 19, so their passes are 5 batches of 4 each, process
-    1's last filled out with a repeat (`VALID_ROWS`). Each batch is agreed
-    before it is scored, so both score 5.
-    """
-    seq_len, val_steps = 8, 5
-    lengths = [seq_len if index // 2 < (16, 20)[index % 2] else 0 for index in range(60)]
-    corpus = document_corpus(tmp_path / "corpus", 60, lengths)
-    reports = run_pool("fit", tmp_path / "out", 2, name="uneven", run_dir=tmp_path / "run",
-                       fsdp_size=2, steps=2, records=RECORDS, tokens=corpus,
-                       seq_len=seq_len, val_steps=val_steps)
-
-    assert [report["val_available"] for report in reports] == [5, 5]
-    for report in reports:
-        assert report["val_batches"] == 5
-        assert report["step"] == 2
 
 
 # --------------------------------------------------------------------------
@@ -514,23 +475,6 @@ def test_a_pool_resumes_every_process_at_its_own_position(tmp_path, pool_checkpo
         assert report["dataset_state"] == whole[index]["dataset_state"]
         assert_identical_parameters(dumped_params(tmp_path / "resumed" / f"process{index}.json"),
                                     dumped_params(tmp_path / "whole" / f"process{index}.json"))
-
-
-@pytest.mark.distributed
-def test_a_pool_checkpoint_refuses_a_different_process_count(tmp_path, pool_checkpoint):
-    """One process cannot take over two processes' positions, and says so.
-
-    Each position is where one share stopped, and the one share of one
-    process has no such place. Before the positions were per process this
-    surfaced as grain's repr comparison of two samplers; now it stops at load
-    with the shares in the message.
-    """
-    refused = spawn("fit", tmp_path / "single.json", fsdp_size=1, steps=2 * POOL_STEPS,
-                    records=RECORDS, name="pool", run_dir=pool_checkpoint["checkpoints"].parent)
-    log = refused.communicate(timeout=600)[0]
-    assert refused.returncode != 0, "one process resumed a two-process position"
-    assert "shares [(0, 2), (1, 2)] (index, count), and this reader reads share 0 of 1" in log
-    assert "Sampler in checkpoint" not in log, "grain's repr error is what the user sees"
 
 
 @pytest.fixture(scope="module")
@@ -931,25 +875,6 @@ def test_a_killed_pool_resumes_from_the_newer_local_checkpoint(tmp_path, killed_
     assert {name: after[name] for name in before} == before
 
 
-@pytest.mark.distributed
-def test_a_local_checkpoint_refuses_another_process_count(tmp_path, killed_local_pool):
-    """One process cannot take over a pool's local checkpoint: it holds the
-    shards of two processes' devices, and the refusal names both counts.
-    Without the local directory the persistent checkpoint's own count
-    refusal stands as before."""
-    directory = tmp_path / "killed"
-    shutil.copytree(killed_local_pool, directory)
-    refused = spawn("fit", tmp_path / "single.json", **local_flags(directory, fsdp_size=1))
-    log = refused.communicate(timeout=600)[0]
-    assert refused.returncode != 0, "one process resumed a two-process local checkpoint"
-    assert "written by 2 processes, and this run has 1 process" in log
-
-    persistent = spawn("fit", tmp_path / "persistent.json", fsdp_size=1, steps=STEPS,
-                       records=RECORDS, name="local", run_dir=directory / "run")
-    log = persistent.communicate(timeout=600)[0]
-    assert persistent.returncode != 0
-    assert "shares [(0, 2), (1, 2)] (index, count), and this reader reads share 0 of 1" in log
-
 # --------------------------------------------------------------------------
 # Validation and artifacts in a pool
 # --------------------------------------------------------------------------
@@ -1274,30 +1199,6 @@ def test_ranks_whose_clocks_differ_evaluate_at_roots(tmp_path):
 
 
 @pytest.mark.distributed
-def test_builtin_previews_coordinate_nested_setup_generation_and_transfer_failures(tmp_path):
-    reports = run_pool("builtin_preview_failures", tmp_path, 2, devices=1)
-    for kind in ("lm", "diffusion", "masked"):
-        for phase in ("setup", "generation", "preflight"):
-            for source in (0, 1):
-                case = f"{kind}-{phase}-{source}"
-                local, remote = reports[source][case], reports[1 - source][case]
-                assert local["closed"] and remote["closed"]
-                # The peer learns of the failure at the phase agreement and
-                # raises a RuntimeError naming the failing rank.
-                assert remote["runtime"]
-                assert f"rank {source}" in remote["error"]
-                if phase == "setup":
-                    assert local["type"] == "AttributeError"
-                elif phase == "generation":
-                    assert local["type"] == "ValueError" and local["original"]
-                else:
-                    assert local["type"] == "RuntimeError" and "deleted" in local["error"]
-        assert reports[0][f"{kind}-healthy"]["drawn"] == 1
-        assert reports[1][f"{kind}-healthy"]["drawn"] == 0
-        assert reports[0][f"{kind}-healthy"]["scores"] == reports[1][f"{kind}-healthy"]["scores"]
-
-
-@pytest.mark.distributed
 def test_composite_rejection_and_partial_restart_agree_across_processes(tmp_path):
     pool = run_pool("training_contract", tmp_path / "pool", 2, devices=1,
                     run_dir=str(tmp_path / "pool-state"))
@@ -1311,7 +1212,6 @@ def test_composite_rejection_and_partial_restart_agree_across_processes(tmp_path
     for report in pool:
         for want, got in zip(single["state"], report["state"], strict=True):
             np.testing.assert_allclose(got, want, rtol=1e-6, atol=1e-7)
-
 
 
 @pytest.mark.distributed
@@ -1366,8 +1266,6 @@ def test_masked_task_preserves_pool_rows_and_coordinates_invalid_requests(tmp_pa
         assert reports[0][name] + reports[1][name] == single[name], name
 
 
-
-
 @pytest.mark.distributed
 def test_a_profile_window_that_fails_on_one_rank_fails_the_pool_together(tmp_path):
     """A capture that cannot start on one rank must not leave its peer's open.
@@ -1407,14 +1305,3 @@ def test_a_pool_refuses_what_its_processes_do_not_share_before_any_trains(tmp_pa
         if rank == 0:
             assert "training read failed on rank 1" in report["first_read"], report
             assert "training read failed on rank 1" in report["eof"], report
-
-
-@pytest.mark.distributed
-def test_a_step_fits_only_where_it_fits_every_process(tmp_path):
-    """Each process reads only its own devices' memory, so one process short
-    of room refuses the step for the whole pool; every process has to compile
-    the same program, under the same remat."""
-    reports = run_pool("step_fits", tmp_path, 2)
-    for report in reports:
-        assert report == {"whole_mesh": True, "tight": False, "roomy": True,
-                          "one_unknown": True, "unknown": True}

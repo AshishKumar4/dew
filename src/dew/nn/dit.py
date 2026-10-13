@@ -83,13 +83,21 @@ def scan_ordered_pos_embed(emb_dim: int, H_P: int, W_P: int, scan_order: str):
     return pos_embed if order is None else pos_embed[order]
 
 
+BLOCK_MIXERS = ('ssm', 'attn')
+"""The mixers a hybrid layer can name: an S5 scan or attention."""
+
+
 def build_block_pattern(num_layers: int, ssm_attention_ratio: str = "3:1",
                         block_pattern: Sequence[str] | None = None):
-    """Per-layer mixer choice from a ratio string like '3:1', 'all-ssm', 'all-attn'."""
+    """Per-layer mixer choice (`BLOCK_MIXERS`) from a ratio string like '3:1', 'all-ssm', 'all-attn',
+    or a `block_pattern` naming every layer's, any other name refused."""
     if block_pattern is not None:
         if len(block_pattern) != num_layers:
             raise ValueError("block_pattern names every layer's mixer; got "
                              f"{len(block_pattern)} entries for {num_layers} layers")
+        unknown = sorted(set(block_pattern) - set(BLOCK_MIXERS))
+        if unknown:
+            raise ValueError(f"block_pattern names {unknown}; a hybrid layer is one of {list(BLOCK_MIXERS)}")
         return list(block_pattern)
     if ssm_attention_ratio == "all-ssm":
         return ['ssm'] * num_layers

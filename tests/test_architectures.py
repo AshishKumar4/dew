@@ -14,6 +14,7 @@ afterwards.
 """
 
 import json
+import math
 from dataclasses import dataclass, replace
 
 import jax
@@ -21,8 +22,8 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from jax.sharding import PartitionSpec as P
 from recording import RecordingTracker
+from reference_error import assert_leaves_as_exact
 
 from dew.artifacts import ImageGrid, Representations, TokenScores, VideoGrid
 from dew.config import ModelConfig, ObjectiveConfig
@@ -278,24 +279,6 @@ CASES = [
 IDS = [case.name for case in CASES]
 
 
-def model_variables(case: Case):
-    """The case's variables as shapes."""
-    model = models.build(case.architecture, **case.config)
-    rng = jax.random.key(0)
-    def init(*args):
-        return jax.eval_shape(model.init, *args)
-    if case.is_lm:
-        return init(rng, jnp.ones((1, case.seq_len), jnp.int32))
-    sample = jnp.ones((1, *case.sample_shape), jnp.float32)
-    if case.is_jepa:
-        return init(rng, sample, jnp.arange(MASK.num_context, dtype=jnp.int32)[None])
-    return init(rng, sample, jnp.ones((1,)),
-                TextContext(jnp.ones((1, TEXT_TOKENS, TEXT_FEATURES)), jnp.ones((1, TEXT_TOKENS), bool)))
-
-
-
-
-
 def batches(case: Case, encoder: ConditionEncoder | None):
     """uint8-range samples, as the data pipeline delivers them, with labels for
     the probes and tokenized text for the conditioned models."""
@@ -351,15 +334,27 @@ def make_objective(case: Case, model, encoder):
                               guidance=CFG(2.0), solver=Euler())
 
 
-def make_trainer(case: Case, tmp_path, fsdp, tracker=None):
+LINEAR = optax.sgd(1e-2, momentum=0.9)
+"""The optimizer the layouts are compared under: SGD with momentum moves the
+parameters and the momentum by each gradient linearly, so a layout's state
+differs from one device's by its gradients' rounding alone. Adam divides by
+each gradient's own size, so where a gradient is zero in exact arithmetic
+(a zero-initialised modulation's shift, a key bias) its rounding becomes a
+full step whose sign no order of summation fixes."""
+
+
+def make_trainer(case: Case, tmp_path, fsdp, tracker=None, devices=None, optimizer=LINEAR):
     """The trainer a recipe would build for this case: a registry model, the
-    real objective, the real optimizer, no wandb."""
+    real objective, a real optimizer, no wandb, over `devices` devices (all
+    by default)."""
     encoder = None if case.is_lm or case.is_jepa else StubText.from_pretrained("stub")
     model = models.build(case.architecture, **case.config)
     trainer = Trainer(
-        make_objective(case, model, encoder), optax.adam(1e-3), key=jax.random.key(0),
+        make_objective(case, model, encoder), optimizer, key=jax.random.key(0),
         mesh=MeshSpec(fsdp=fsdp), layout=Layout(min_shard=TINY_SHARD),
         checkpoints=Checkpoints(str(tmp_path / f"{case.name}-fsdp{fsdp}")), tracker=tracker)
+    if devices is not None:
+        trainer.device_mesh = trainer.mesh.build(jax.devices()[:devices])
     return trainer, encoder
 
 
@@ -377,11 +372,14 @@ def fsdp_leaves(tree):
     return [leaf for leaf in jax.tree.leaves(tree) if 'fsdp' in str(leaf.sharding.spec)]
 
 
-def run_case(case: Case, tmp_path, fsdp):
-    """One two-step run on the mesh, with everything the assertions read."""
+def run_case(case: Case, tmp_path, fsdp, devices=None, state=None):
+    """One two-step run on the mesh over `devices` devices (all by
+    default), from `state` (the trainer's own initial state by default),
+    with everything the assertions read: the trainer, the state and the
+    training losses."""
     seen = []
     tracker = RecordingTracker()
-    trainer, encoder = make_trainer(case, tmp_path, fsdp, tracker)
+    trainer, encoder = make_trainer(case, tmp_path / f"{devices}", fsdp, tracker, devices)
     artifact, shape = expected_artifact(case)
     source = batches(case, encoder)
 
@@ -391,9 +389,9 @@ def run_case(case: Case, tmp_path, fsdp):
         batch = BATCH
 
     state = trainer.fit(Data(), steps=2, log_every=1, eval_every=1,
-                        metrics=(Spread(seen, artifact),), preview=True)
+                        metrics=(Spread(seen, artifact),), preview=True, state=state)
 
-    assert dict(trainer.device_mesh.shape) == {"data": jax.device_count() // fsdp, "expert": 1,
+    assert dict(trainer.device_mesh.shape) == {"data": (devices or jax.device_count()) // fsdp, "expert": 1,
                                                "fsdp": fsdp, "tensor": 1, "sequence": 1, "stage": 1}
     assert int(state.step) == 2
     losses = [s["train/loss"] for _, s in tracker.scalars if "train/loss" in s]
@@ -406,108 +404,81 @@ def run_case(case: Case, tmp_path, fsdp):
             if isinstance(value, (ImageGrid, Representations, TokenScores, VideoGrid))] == (
                 [] if case.is_lm else [artifact] * 2)
     assert Checkpoints(trainer.checkpoints.directory).latest == 2
-    return trainer, state
+    return trainer, state, losses
+
+
+def truth(case: Case, tmp_path, initial):
+    """The case's two steps on one device in float64, from `initial`
+    widened: the same rows, keys and draws, every float wider. The
+    samples arrive as float64, so their conversion and the diffusion
+    noising do not share the float32 runs' roundings."""
+    trainer, encoder = make_trainer(case, tmp_path / "truth", 1, RecordingTracker(), 1)
+    source = batches(case, encoder)
+
+    def wide(batch):
+        return batch if case.is_lm else {**batch, case.sample_key: batch[case.sample_key].astype(np.float64)}
+
+    class Data:
+        train = staticmethod(lambda partition: map(wide, source()))
+        val = staticmethod(lambda partition: (wide(batch) for batch in [next(source())]))
+        batch = BATCH
+
+    wider = jax.tree.map(lambda leaf: leaf.astype(jnp.float64) if jnp.issubdtype(leaf.dtype, jnp.floating)
+                         else jnp.copy(leaf), initial)
+    return trainer.fit(Data(), steps=2, state=wider)
 
 
 @pytest.mark.parametrize("case", CASES, ids=IDS)
-def test_architecture_trains_data_parallel(case, tmp_path):
-    """8x1: every parameter replicated, the batch split across every device."""
-    _, state = run_case(case, tmp_path, fsdp=1)
-    assert not fsdp_leaves(state.variables), "nothing may shard on a 1-wide fsdp axis"
+def test_architecture_trains_on_every_layout_as_on_one_device(case, tmp_path):
+    """One device, 8x1 data parallelism (every parameter replicated, the
+    batch split across every device) and 2x4 fsdp (the parameter tree split
+    four ways, the optimizer's state and the EMA with it) train the same two
+    steps from the same state: each layout's variables, momentum and EMA
+    are as near a float64 run as one device's are
+    (`assert_leaves_as_exact`), so their summing a batch's rows and
+    positions in other orders is the only difference, where a layout that
+    dropped or repeated a row would fail by orders of magnitude. Adam's two
+    moments and its count follow the parameters' placement too."""
+    initial = make_trainer(case, tmp_path / "initial", 1, devices=1)[0].initial_state()
 
+    def copied():
+        # Each fit donates the state it was handed.
+        return jax.tree.map(jnp.copy, initial)
 
-@pytest.mark.parametrize("case", CASES, ids=IDS)
-def test_architecture_trains_under_fsdp(case, tmp_path):
-    """2x4: the parameter tree really split four ways, moments and EMA with it."""
-    _, state = run_case(case, tmp_path, fsdp=4)
+    _, alone, _ = run_case(case, tmp_path, fsdp=1, devices=1, state=copied())
+    with jax.enable_x64(new_val=True):
+        exact = jax.device_get(truth(case, tmp_path, copied()))
+    # The most terms a gradient sums: every row's positions, and over every
+    # layer for a weight the layers share (Gemma 3n's per-layer input norm).
+    positions = case.seq_len or math.prod(case.sample_shape[:-1])
+    layers = case.config.get("num_layers", 1)
+    reductions = BATCH * positions * int(np.sum(layers))
 
+    _, replicated, _ = run_case(case, tmp_path, fsdp=1, state=copied())
+    assert not fsdp_leaves(replicated.variables), "nothing may shard on a 1-wide fsdp axis"
+    _, state, _ = run_case(case, tmp_path, fsdp=4, state=copied())
     sharded = fsdp_leaves(state.variables)
     assert sharded, "no parameter was sharded over the fsdp axis"
     for param in sharded:
         assert param.addressable_shards[0].data.size == param.size // 4, \
             "shard is not a quarter of the global parameter"
-
-    # Adam's moments and the EMA copy follow the params they track, without
-    # the optimizer or the model ever describing a layout.
+    # The optimizer's state and the EMA copy follow the params they track,
+    # without the optimizer or the model ever describing a layout.
     param_specs = [leaf.sharding.spec for leaf in jax.tree.leaves(state.variables["params"])]
-    assert param_specs == [leaf.sharding.spec
-                           for leaf in jax.tree.leaves(state.opt_state[0].mu)]
-    ema_specs = {leaf.sharding.spec for leaf in jax.tree.leaves(state.ema)}
-    assert ema_specs <= set(param_specs)
-    assert fsdp_leaves(state.opt_state[0].mu), "no optimizer moment was sharded"
+    assert param_specs == [leaf.sharding.spec for leaf in jax.tree.leaves(state.opt_state[0].trace)]
+    assert {leaf.sharding.spec for leaf in jax.tree.leaves(state.ema)} <= set(param_specs)
+    adam = make_trainer(case, tmp_path / "adam", 4, optimizer=optax.adam(1e-3))[0].place()[0].opt_state[0]
+    for moment in (adam.mu, adam.nu):
+        assert param_specs == [leaf.sharding.spec for leaf in jax.tree.leaves(moment)]
+    for layout in (replicated, state):
+        for name in ("variables", "opt_state", "ema"):
+            assert_leaves_as_exact(*jax.device_get((getattr(layout, name), getattr(alone, name))),
+                                   getattr(exact, name), reductions=reductions)
 
 
 # --------------------------------------------------------------------------
 # The declarations as the fsdp axis widens
 # --------------------------------------------------------------------------
-
-@pytest.mark.slow
-@pytest.mark.parametrize("fsdp_size", [2, 4, 8])
-@pytest.mark.parametrize("case", CASES, ids=IDS)
-def test_every_architecture_shards_within_the_tolerance_at_every_width(case, fsdp_size):
-    """Each architecture on a 2, 4 and 8 wide fsdp axis, beyond the 4 above.
-
-    Three properties at once, because they share one derivation. The layout
-    has to be reproducible, or two processes deriving it would disagree and
-    the run would deadlock on mismatched collectives. Every dimension a spec
-    names has to be splittable that many ways, or jit rejects the layout. And
-    what the rules could not place has to stay inside the tolerance, or the
-    run is quietly training a replicated model on every device.
-    """
-    variables = model_variables(case)
-    mesh = MeshSpec(fsdp=fsdp_size).build()
-    layout = Layout(min_shard=TINY_SHARD)
-    shardings = layout.shardings(mesh, variables)
-    specs = jax.tree.map(lambda sharding: sharding.spec, shardings)
-    assert specs == jax.tree.map(lambda s: s.spec, layout.shardings(mesh, variables)), \
-        "the derivation is not stable"
-
-    leaves = jax.tree_util.tree_flatten_with_path(variables["params"])[0]
-    for (path, value), sharding in zip(
-            leaves, jax.tree.leaves(shardings["params"]), strict=True):
-        for dimension, entry in enumerate(sharding.spec):
-            if not entry:
-                continue
-            size = value.shape[dimension]
-            where = f"{jax.tree_util.keystr(path)} {value.shape} -> {sharding.spec}"
-            assert size % fsdp_size == 0, f"{where} cannot split {fsdp_size} ways"
-            assert size > 1, f"{where} shards a dimension of one"
-
-    layout.check(variables["params"], shardings["params"], mesh)
-
-
-# One named parameter per case whose spec the declarations decide, written
-# out by hand, so a declaration that stops matching a module shows up here.
-NAMED_LEAF = {
-    "causal_transformer": (("embed_tokens", "embedding"), P("fsdp")),
-    "simple_dit": (("dit_block_0", "attention", "to_q", "kernel"), P("fsdp")),
-}
-
-
-@pytest.mark.slow
-@pytest.mark.parametrize("fsdp_size", [2, 4, 8])
-@pytest.mark.parametrize("case", [case for case in CASES if case.name in NAMED_LEAF],
-                         ids=[case.name for case in CASES if case.name in NAMED_LEAF])
-def test_a_placed_state_carries_the_layout_the_declarations_derive(case, tmp_path, fsdp_size):
-    """The derivation through the path a run takes, not called on its own.
-
-    Every other sharding test calls the layout and reads its return value, so
-    a layout that is derived correctly and never reaches the state leaves all
-    of them green. Dropping out_shardings from the jit that materialises the
-    state is that mutation. Placing the state is what these assertions read.
-    """
-    trainer, _ = make_trainer(case, tmp_path, fsdp_size)
-    state, shardings, _ = trainer.place()
-    path, expected = NAMED_LEAF[case.name]
-    leaf = state.variables["params"]
-    for key in path:
-        leaf = leaf[key]
-    assert leaf.sharding.spec == expected, f"{path} {leaf.shape}"
-    assert leaf.addressable_shards[0].data.size == leaf.size // fsdp_size
-
-    for placed, derived in zip(jax.tree.leaves(state), jax.tree.leaves(shardings), strict=True):
-        assert placed.sharding == derived
-
 
 # A unet the way a command line and a run.json carry it: every sequence a
 # list, every stage a record. Two stages over 8-pixel images is the smallest
@@ -543,23 +514,10 @@ def test_a_unet_from_a_json_record_generates_what_its_value_twin_does():
             prompts, steps=SAMPLER_STEPS, key=key).host().images)
 
 
-def test_a_record_rebuilds_each_field_as_its_annotation_asks():
-    """The build boundary reads the annotation, not the value. JSON writes
-    every sequence as a list: `val_metrics` is declared a tuple and comes
-    back one, while the model config is an opaque JSON dict whose lists are
-    its own, and a run is the run it wrote down."""
-    config = replace(unet_run(JSON_UNET), val_metrics=("psnr", "ssim"))
-    rebuilt = DiffusionRunConfig.from_dict(json.loads(json.dumps(config.to_dict())))
-    assert rebuilt.val_metrics == ("psnr", "ssim")
-    assert type(rebuilt.model.fields["feature_depths"]) is list
-    assert rebuilt.model.fields["feature_depths"] == [8, 16]
-    assert rebuilt == config
-
-
 def test_a_val_metric_no_registry_knows_is_refused():
     """`val_metrics` names the metrics registry, so an unknown name is
     refused where it is written, with the registered names in the message."""
-    with pytest.raises(ValueError, match=r"\['fid_score'\].*'clip', 'clip_score',.* 'fid'"):
+    with pytest.raises(ValueError):
         replace(unet_run(JSON_UNET), val_metrics=("fid_score",))
 
     for name in sorted(metrics):

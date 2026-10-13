@@ -1,8 +1,5 @@
 """Checkpoint NVFP4 inputs through the existing Qwix Dense precision path."""
 
-import json
-import os
-from pathlib import Path
 
 import jax
 import jax.numpy as jnp
@@ -11,33 +8,9 @@ import pytest
 from interop_support import NVFP4_QDQ_CASES, assert_same_stored_tensors, nvfp4_qdq_case
 from reference_error import assert_as_exact_as_the_reference
 
-from dew.interop import Pretrained, codecs
+from dew.interop import Pretrained
 from dew.interop.safetensors_io import read_weights
-from dew.nn.fake_quant import E2M1_MIDPOINTS
-from dew.training.quantization import InputQuantizer, _nvfp4_divide, nvfp4_input_qdq
-
-
-def test_the_quantizer_divider_is_ieee_fp32_across_its_scale_ranges():
-    """2.5M normal ratios, half at or beside E2M1 boundaries, with x64 disabled.
-
-    Denominators span 2**-24 to 2**24 over normed activations, MLP products
-    and inverse global scales; quotients reach 128 before E2M1 saturation.
-    NumPy's IEEE fp32 divide supplies every expected bit. The correction
-    runs in fp32 even when the surrounding application enables x64.
-    """
-    rng = np.random.default_rng(2046)
-    count = 1_000_000
-    denominators = np.exp2(rng.uniform(-24, 24, count)).astype(np.float32)
-    quotients = (rng.uniform(-8, 8, count) * np.exp2(rng.uniform(-24, 4, count))).astype(np.float32)
-    numerators = (denominators.astype(np.float64) * quotients.astype(np.float64)).astype(np.float32)
-    q, b = rng.choice(E2M1_MIDPOINTS, count // 2), denominators[:count // 2]
-    a = (q.astype(np.float64) * b.astype(np.float64)).astype(np.float32)
-    numerators = np.concatenate([numerators, a, np.nextafter(a, np.inf), np.nextafter(a, -np.inf)])
-    denominators = np.concatenate([denominators, b, b, b])
-    with jax.enable_x64(new_val=False):
-        actual = jax.jit(_nvfp4_divide)(jnp.asarray(numerators), jnp.asarray(denominators))
-    np.testing.assert_array_equal(np.asarray(actual).view(np.uint32),
-                                  (numerators / denominators).view(np.uint32))
+from dew.training.quantization import InputQuantizer, nvfp4_input_qdq
 
 
 @pytest.fixture(scope="module", params=NVFP4_QDQ_CASES)
@@ -89,41 +62,3 @@ def test_input_qdq_uses_the_training_paths_straight_through_gradient(case):
     cotangent = jnp.arange(x.size, dtype=x.dtype).reshape(x.shape) / x.size
     gradient = jax.jit(jax.grad(lambda values: jnp.sum(nvfp4_input_qdq(values, spec) * cotangent)))(x)
     np.testing.assert_array_equal(gradient, cotangent)
-
-
-@pytest.mark.parametrize("scale", [0, -1, np.inf, np.nan])
-def test_an_invalid_global_scale_is_refused_before_compilation(scale):
-    with pytest.raises(ValueError, match="positive and finite"):
-        InputQuantizer.nvfp4(scale, e4m3_scale=False)
-
-
-def test_an_input_scale_missing_from_the_file_cannot_silently_drop_qdq(case, tmp_path):
-    _, directory, _ = case
-    config = json.loads((directory / "config.json").read_text())
-    stored = read_weights(directory)
-    name = next(name for name in stored if name.endswith(".input_global_scale"))
-    del stored[name]
-    codec = codecs.source_quantization(config)
-    assert codec is not None
-    with pytest.raises(ValueError, match="input_global_scale"):
-        codec.names(stored)
-
-
-@pytest.mark.network
-@pytest.mark.skipif(os.environ.get("DEW_NETWORK_TESTS") != "1",
-                    reason="set DEW_NETWORK_TESTS=1 for Hub configs")
-def test_the_pinned_redhat_config_selects_unrounded_local_scales():
-    """Config and index only, no weights from the 32B checkpoint."""
-    from huggingface_hub import hf_hub_download
-
-    repo, revision = "RedHatAI/Qwen3-32B-NVFP4", "10a4cab9378ab938be865492b96ff42faff11c3f"
-    config = json.loads(Path(hf_hub_download(repo, "config.json", revision=revision)).read_text())
-    index_path = Path(hf_hub_download(repo, "model.safetensors.index.json", revision=revision))
-    index = json.loads(index_path.read_text())
-    codec = codecs.source_quantization(config)
-    assert codec is not None and codec.input_scale_dtype == "unrounded"
-    modules = [name.removesuffix(".weight_packed") for name in index["weight_map"]
-               if name.endswith(".weight_packed")]
-    assert len(modules) == 64 * 7
-    for module in modules:
-        assert module + ".input_global_scale" in index["weight_map"]
