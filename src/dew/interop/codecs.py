@@ -43,8 +43,8 @@ float32 subnormals as zero, and these formats keep them: an MXFP4 group of
 2 ** -127 weights encodes to the 0.5 code at the 2 ** -126 scale and
 decodes back to 2 ** -127, which the same code under jax.numpy returns as
 zeros (measured, jax 0.11 CPU, scale bytes 0 and 1). The one cast a traced
-program also runs is the FP8 block cast (`quantize_fp8_blocks`), on a frozen
-FP8 product's activation rows, whose 1e-4 amax floor keeps every scale normal.
+program also runs is the FP8 block cast (`fp8_block_cast`), on a frozen FP8
+product's activation rows, whose 1e-4 amax floor keeps every scale normal.
 """
 
 from __future__ import annotations
@@ -57,6 +57,7 @@ from functools import partial
 from types import MappingProxyType
 from typing import Literal
 
+import jax
 import jax.numpy as jnp
 import ml_dtypes
 import numpy as np
@@ -538,7 +539,7 @@ def dequantize_fp8_blocks(weight: np.ndarray, scale_inv: np.ndarray,
     return out
 
 
-def _ceil_exponent(values: np.ndarray) -> np.ndarray:
+def _ceil_exponent(values: ArrayLike) -> np.ndarray:
     """The biased exponent of the smallest power of two at or above each
     positive float32 value, read off its bits: the exponent, plus one if any
     mantissa bit is set. DeepGEMM's `ceil_to_ue8m0` and the release kernels'
@@ -547,20 +548,10 @@ def _ceil_exponent(values: np.ndarray) -> np.ndarray:
     return (bits >> 23) + ((bits & 0x007fffff) != 0)
 
 
-def _fp8_scale_inv(amax, ue8m0: bool, xp=np):
-    """`per_block_cast_to_fp8`'s scale of a block from its float32 amax; ue8m0
-    rounds it up to a power of two on its bits, clamped to the normal
-    exponents as `ceil_to_ue8m0` clamps."""
-    scale_inv = _divide(xp)(xp.maximum(amax, xp.float32(AMAX_FLOOR)), xp.float32(E4M3_MAX))
-    if not ue8m0:
-        return scale_inv
+def _ue8m0(scale_inv: np.ndarray) -> np.ndarray:
+    """`ceil_to_ue8m0`: a block's scale rounded up to a power of two on its
+    bits, clamped to the normal exponents."""
     return (np.clip(_ceil_exponent(scale_inv), 1, 254).astype(np.uint32) << 23).view(np.float32)
-
-
-def _divide(xp):
-    """IEEE division under `xp`: NumPy's own, or the correctly rounded quotient
-    in a traced program, whose XLA divides through a reciprocal."""
-    return np.divide if xp is np else correctly_rounded_divide
 
 
 def _finite_matrix(weight: ArrayLike) -> np.ndarray:
@@ -580,7 +571,7 @@ def _finite_matrix(weight: ArrayLike) -> np.ndarray:
 
 
 def quantize_fp8_blocks(weight: ArrayLike, block: Block = BLOCK, *,
-                        ue8m0: bool = False, xp=np) -> tuple[np.ndarray, np.ndarray]:
+                        ue8m0: bool = False) -> tuple[np.ndarray, np.ndarray]:
     """Cast `weight` to float8_e4m3fn blocks and the float32 scales that invert them.
 
     The inverse of `dequantize_fp8_blocks`: a [rows, cols] weight in any float
@@ -611,19 +602,36 @@ def quantize_fp8_blocks(weight: ArrayLike, block: Block = BLOCK, *,
     refused by name rather than written as a block of NaN. The 1e-4 floor
     keeps every scale a float32 normal.
 
-    `xp=jax.numpy` runs the same cast in a traced program, to the same bytes,
-    on a matrix where it computes (a frozen FP8 product's activation rows,
-    `dew.training.quantization`); there no weight is refused and no scale is
-    rounded to ue8m0.
+    `fp8_block_cast` runs the same cast in a traced program, to the same bytes.
     """
     rows, cols = _sides(block)
-    values = _finite_matrix(weight) if xp is np else xp.asarray(weight, xp.float32)
+    return _cast_blocks(_finite_matrix(weight), rows, cols, xp=np, divide=np.divide,
+                        rounded=_ue8m0 if ue8m0 else np.asarray)
+
+
+def fp8_block_cast(x: jax.Array, block: Block) -> tuple[jax.Array, jax.Array]:
+    """`quantize_fp8_blocks`' cast in a traced program, on a matrix where it
+    computes, to the same bytes: a frozen FP8 product's activation rows
+    (`dew.training.quantization`). No value is refused and no scale is
+    rounded to ue8m0 here."""
+    rows, cols = _sides(block)
+    # XLA divides through a reciprocal; the cast's two divisions round as IEEE's do.
+    return _cast_blocks(x.astype(jnp.float32), rows, cols, xp=jnp, divide=correctly_rounded_divide,
+                        rounded=jnp.asarray)
+
+
+def _cast_blocks(values, rows: int, cols: int, *, xp, divide, rounded):
+    """The FP8 block cast of a float32 `values` matrix under `xp`, NumPy or
+    jax.numpy, dividing by `divide` and rounding each block's scale by
+    `rounded`: `quantize_fp8_blocks`' rule. The 1e-4 amax floor is
+    `per_block_cast_to_fp8`'s `clamp(1e-4)`."""
     height, width = values.shape
     padded = xp.pad(values, ((0, -height % rows), (0, -width % cols)))
     tiles = padded.reshape(padded.shape[0] // rows, rows, padded.shape[1] // cols, cols)
-    scale_inv = _fp8_scale_inv(xp.max(xp.abs(tiles), axis=(1, 3)), ue8m0, xp)
+    amax = xp.maximum(xp.max(xp.abs(tiles), axis=(1, 3)), xp.float32(AMAX_FLOOR))
+    scale_inv = rounded(divide(amax, xp.float32(E4M3_MAX)))
     # One reciprocal per block, as the reference takes it.
-    codes = (tiles * _divide(xp)(xp.float32(1.0), scale_inv)[:, None, :, None]).astype(E4M3)
+    codes = (tiles * divide(xp.float32(1.0), scale_inv)[:, None, :, None]).astype(E4M3)
     return codes.reshape(padded.shape)[:height, :width], scale_inv
 
 

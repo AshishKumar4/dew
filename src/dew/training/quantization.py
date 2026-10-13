@@ -259,9 +259,9 @@ def _fp8_rows(values: jax.Array, rows: jax.Array, row_scales: jax.Array) -> jax.
     rows cast by the FP8 block cast, the codes widened in the dot and both
     rows' scales applied after it, the form XLA's GPU compiler rewrites to an
     FP8 GEMM (cuBLASLt)."""
-    from dew.interop.codecs import quantize_fp8_blocks
+    from dew.interop.codecs import fp8_block_cast
 
-    codes, scales = quantize_fp8_blocks(values, (1, values.shape[1]), xp=jnp)
+    codes, scales = fp8_block_cast(values, (1, values.shape[1]))
     product = jax.lax.dot_general(codes.astype(jnp.float32), rows.astype(jnp.float32),
                                   (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32)
     return product * scales * row_scales.T
@@ -534,30 +534,23 @@ class InputQuantization:
         """`model` computing under this record's frozen FP8 sites, and under
         the input quantization it already computes under, if any: one
         wrapper, so one interceptor, serves both."""
-        base = type(model)
-        if "_dew_input_quantization" not in vars(base):
+        from dew.registry import wrapper_layers
+
+        _, layers = wrapper_layers(type(model))
+        held = layers[0]._dew_wrapper() if layers else None
+        if not isinstance(held, InputQuantization):
             return self.apply(model)
-        held = base._dew_wrapper()
-        unwrapped = base._dew_wrapped(**{field.name: getattr(model, field.name)
-                                         for field in dataclasses.fields(model)
-                                         if field.init and field.name not in ("parent", "name")})
+        unwrapped = layers[0]._dew_wrapped(**{field.name: getattr(model, field.name)
+                                              for field in dataclasses.fields(model)
+                                              if field.init and field.name not in ("parent", "name")})
         joined = dataclasses.replace(held, frozen_fp8=self.frozen_fp8, measured_on=self.measured_on)
         return joined.apply(unwrapped)
 
     def packed(self, frozen: Variables) -> Variables:
         """The `QUANTIZATION` leaves of `frozen_fp8`, packed from the kernels
         the `frozen` tree holds at their scopes (`frozen_fp8_leaves`)."""
-        def kernel(site: str):
-            node = frozen
-            for name in site.split("/"):
-                if not isinstance(node, Mapping) or name not in node:
-                    raise ValueError(f"frozen FP8 site {site} is not a frozen module of this model")
-                node = node[name]
-            if not isinstance(node, Mapping) or "kernel" not in node:
-                raise ValueError(f"frozen FP8 site {site} holds no kernel")
-            return node["kernel"]
         return unflatten_dict({(*site.split("/"), leaf): value for site in self.frozen_fp8
-                               for leaf, value in frozen_fp8_leaves(kernel(site)).items()})
+                               for leaf, value in frozen_fp8_leaves(_site_kernel(frozen, site)).items()})
 
     def refuse_other_fp8_generation(self, module: nn.Module) -> None:
         """Refuse a frozen FP8 product on a GPU other than the one its sites
@@ -632,6 +625,18 @@ class InputQuantization:
                                  if field.init and field.name not in ("parent", "name")})
 
 
+def _site_kernel(tree: Variables, site: str) -> jax.typing.ArrayLike:
+    """The kernel `tree` holds at the `/`-joined scope `site`, refused by name where it holds none."""
+    node: object = tree
+    for name in (*site.split("/"), "kernel"):
+        if not isinstance(node, Mapping) or name not in node:
+            raise ValueError(f"frozen FP8 site {site} is not a Dense of this model's frozen tree")
+        node = node[name]
+    if not isinstance(node, jax.Array | np.ndarray):
+        raise ValueError(f"frozen FP8 site {site} holds no kernel array")
+    return node
+
+
 def measured_fp8_sites(variables: Variables, sites: Sequence[str], tokens: int) -> InputQuantization:
     """The record of the frozen `sites` whose products run faster in FP8 on
     this process's GPU, measured at `tokens` rows a step.
@@ -654,8 +659,7 @@ def measured_fp8_sites(variables: Variables, sites: Sequence[str], tokens: int) 
     generation = device_generation()
     if gpu_target(generation).fp8_peak is None:
         raise ValueError(f"{generation} has no FP8 tensor cores to run a frozen base in FP8 on")
-    frozen = flatten_dict(variables["params"], sep="/")
-    shapes = {site: tuple(np.shape(frozen[f"{site}/kernel"])) for site in sites}
+    shapes = {site: tuple(np.shape(_site_kernel(variables["params"], site))) for site in sites}
     faster: dict[tuple[int, ...], bool] = {}
     for shape in sorted(set(shapes.values())):
         inputs, outputs = shape

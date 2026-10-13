@@ -125,7 +125,7 @@ def fake_quant_fp4(x, block: int, e4m3_scale: bool):
     return straight_through(x, (rounded * scale).reshape(x.shape))
 
 
-def correctly_rounded_divide(numerator: jax.Array, denominator: jax.Array) -> jax.Array:
+def correctly_rounded_divide(numerator: jax.typing.ArrayLike, denominator: jax.typing.ArrayLike) -> jax.Array:
     """The correctly rounded fp32 quotient, IEEE division's, on XLA's approximate
     dividers too: XLA:CPU and XLA:GPU divide through a reciprocal, and a
     quantizer's scales and quotients must round as the reference's host or
