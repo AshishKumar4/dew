@@ -20,7 +20,7 @@
 <text x="288" y="74" font-family="Geist, Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="14" font-weight="600" fill="#2fb8a8" text-anchor="start">compiled step (jax.jit), once per step</text>
 <rect x="288" y="90" width="432" height="66" rx="6" fill="#0b3531" stroke="#2fb8a8" stroke-width="1"/>
 <text x="300" y="113" font-family="'Geist Mono', 'JetBrains Mono', ui-monospace, Menlo, Consolas, monospace" font-size="14" font-weight="600" fill="#d8e5e2" text-anchor="start">objective.loss(variables, batch, step)</text>
-<text x="300" y="135" font-family="Geist, Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#93aba7" text-anchor="start">→ Mean(total, mass), Aux(metrics)</text>
+<text x="300" y="135" font-family="Geist, Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#93aba7" text-anchor="start">→ Ratio(total, mass), Aux(metrics)</text>
 <rect x="288" y="172" width="432" height="66" rx="6" fill="#0f191c" stroke="#243639" stroke-width="1"/>
 <text x="300" y="195" font-family="'Geist Mono', 'JetBrains Mono', ui-monospace, Menlo, Consolas, monospace" font-size="14" font-weight="600" fill="#d8e5e2" text-anchor="start">gradient</text>
 <text x="300" y="217" font-family="Geist, Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#93aba7" text-anchor="start">of the mean over the accumulation window</text>

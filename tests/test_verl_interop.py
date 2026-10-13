@@ -14,7 +14,10 @@ from pathlib import Path
 import numpy as np
 import pyarrow.parquet as pq
 
-from dew.data.prompts import INFO_KEY, SOURCE_KEY, TRUTH_KEY, PromptSource
+from dew.config.data import PromptData
+from dew.data import Loading
+from dew.data.compile import iterate
+from dew.data.prompts import INFO_KEY, SOURCE_KEY, TRUTH_KEY
 from dew.objectives.rl.sessions import (
     BEHAVIOR_LOG_PROBS_KEY,
     ROUTED_EXPERTS_KEY,
@@ -116,7 +119,9 @@ def test_rollouts_round_trip_through_verl_rows_losslessly():
 
 def test_the_verl_rl_parquet_reads_its_nested_ground_truth():
     table = pq.read_table(PARQUET).to_pylist()
-    rows = PromptSource.from_parquet(str(PARQUET), "tests/fixtures/tokenizers/tiny-tools", 512, 0)
+    pipeline, _, _ = PromptData(source=str(PARQUET), tokenizer="tests/fixtures/tokenizers/tiny-tools",
+                             max_prompt_len=512, long="truncate").pipelines()
+    rows = list(iterate(pipeline, read="memory", loading=Loading(workers=0)))
     for index, expected in enumerate(table):
         batch = rows[index]
         assert read(batch[SOURCE_KEY]) == expected["data_source"] == "openai/gsm8k"

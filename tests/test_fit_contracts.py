@@ -5,7 +5,9 @@ import numpy as np
 import optax
 import pytest
 
-from dew.data import Dataset
+from dew.data import Memory
+from dew.data.compile import compile
+from dew.data.pipeline import Pipeline
 from dew.inputs import Field, InputSpec
 from dew.objectives.base import Aux, Objective, Ratio, Step
 from dew.training import Trainer
@@ -39,8 +41,8 @@ class ScalarRegression(Objective):
 
 def data(width=2):
     import grain.python as grain
-    return Dataset.from_grain(grain.MapDataset.source(
-        [{'x': np.ones(width, np.float32)}] * 32), batch=8)
+    return compile(Pipeline(Memory(grain.MapDataset.source(
+        [{'x': np.ones(width, np.float32)}] * 32))).repeat().batch(8), read="indexed")
 
 
 def trainer(auxiliary=False, tracker=None, statistics='ratio'):
