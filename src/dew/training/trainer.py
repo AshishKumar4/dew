@@ -2180,11 +2180,12 @@ class Trainer(Generic[Loss, Effects]):
             metadata.setdefault('train/loss', float(jax.device_get(interval.book.loss) / interval.steps))
             if not ranking and training_best:
                 ranking = (Ranking('train/loss', metadata['train/loss']),)
-        checkpoints.save(step, state, position, metadata, share=DataPartition.of(self.device_mesh),
-                         ranking=ranking, control={**(control or {}), "tokens": interval.real_tokens},
-                         weights_only=weights_only,
-                         rung=self._checkpoint_rung(), artifact=self._artifact(), boxed=self._boxed_axes())
-        self._report(CheckpointRequested(checkpoints.directory), step)
+        write = functools.partial(
+            checkpoints.save, step, state, position, metadata, share=DataPartition.of(self.device_mesh),
+            ranking=ranking, control={**(control or {}), "tokens": interval.real_tokens},
+            weights_only=weights_only, rung=self._checkpoint_rung(), artifact=self._artifact(),
+            boxed=self._boxed_axes())
+        self._report(CheckpointRequested(checkpoints.directory), step, write)
         interval.saved(step)
         self._display.status("")
         return time.perf_counter() - paused
@@ -2205,11 +2206,11 @@ class Trainer(Generic[Loss, Effects]):
         is the one a restarted node reads back, not the run's record."""
         paused = time.perf_counter()
         self._display.status("writing a local checkpoint")
-        checkpoints.save_local(step, state, position, share=DataPartition.of(self.device_mesh),
-                               control={**(control or {}), "tokens": interval.real_tokens},
-                               rung=self._checkpoint_rung(), artifact=self._artifact(),
-                               boxed=self._boxed_axes())
-        self._report(CheckpointRequested(str(checkpoints.local_directory), local=True), step)
+        write = functools.partial(
+            checkpoints.save_local, step, state, position, share=DataPartition.of(self.device_mesh),
+            control={**(control or {}), "tokens": interval.real_tokens}, rung=self._checkpoint_rung(),
+            artifact=self._artifact(), boxed=self._boxed_axes())
+        self._report(CheckpointRequested(str(checkpoints.local_directory), local=True), step, write)
         self._display.status("")
         return time.perf_counter() - paused
 
@@ -2324,13 +2325,18 @@ class Trainer(Generic[Loss, Effects]):
                 error.add_note(f'Reporting fit outcome failed: {failure!r}')
         return error
 
-    def _report(self, value: Record, step: int) -> None:
+    def _report(self, value: Record, step: int, after: Callable[[], None] | None = None) -> None:
         """Hand one record to the tracker on rank zero, then agree with the pool.
 
         The record's type names the phase, so a rank that failed to report is
         heard about at the report the pool was making, not at the next
-        collective."""
+        collective. `after` is the work the record reports, run first inside
+        the same agreement: a rank whose work fails after its own coordination
+        rounds (a checkpoint's position gather, then its write) meets its
+        peers at this report, rather than skip it while they wait there."""
         def send() -> None:
+            if after is not None:
+                after()
             if jax.process_index() == 0 and self.tracker is not None:
                 self.tracker.artifact(value, step)
 
