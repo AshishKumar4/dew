@@ -26,11 +26,12 @@ from dew.decision.layout import DecisionInputs
 from dew.decision.questions import KINDS, Choice, Noul, Score
 from dew.nn.activations import gelu_exact_torch
 from dew.nn.attention import NormalAttention, l2_normalized
-from dew.nn.backbones.decoder_block import BlockWiring, DecoderBlock, GatedMLP, decoder_norm
+from dew.nn.backbones.decoder_block import BlockWiring, DecoderBlock, decoder_norm
 from dew.nn.flops import attention_flops, projection_flops, real_lengths
 from dew.nn.inputs import AttentionMetadata, coordinates
 from dew.nn.mixer_base import MixerContext
 from dew.nn.mixers import AttentionMixer
+from dew.nn.mlp import GatedMLP
 from dew.nn.precision import at_least_fp32
 from dew.nn.scatter import DROPPED
 from dew.records import JSON

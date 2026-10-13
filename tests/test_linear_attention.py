@@ -605,6 +605,34 @@ def test_a_decay_deep_in_a_chunk_keeps_its_own_precision():
     assert not np.asarray(decay)[:, above].any()
 
 
+def test_the_decay_gradient_sums_only_the_pairs_spanning_each_position():
+    """The decay's gradient, `sum_{s >= i > t} cotangent[s, t] decay[s, t]` at position i, as exact
+    as the sum of those pairs alone: within two sequential sums' rounding of their magnitudes
+    against float64, where the prefix difference's gradient summed every pair after i into it
+    with opposite signs and cancelled. Forward mode takes the same tangent: its pairing with a
+    cotangent is the gradient's."""
+    rng = np.random.default_rng(11)
+    g = rng.uniform(-3, -1, (2, 64, 4)).astype(np.float32)
+    cotangent = rng.standard_normal((2, 64, 64, 4)).astype(np.float32)
+
+    def gradient(g, cotangent):
+        _, pull = jax.vjp(lambda g: chunk_decay(g)[1], g)
+        return pull(cotangent)[0]
+
+    got = np.asarray(gradient(jnp.asarray(g), jnp.asarray(cotangent)), np.float64)
+    with jax.enable_x64(new_val=True):
+        wide = widened((g, cotangent))
+        want = np.asarray(gradient(*wide))
+        weighed = np.abs(np.asarray(wide[1] * chunk_decay(wide[0])[1]))
+    spans = np.array([weighed[:, i:, :i].sum((1, 2)) for i in range(64)]).transpose(1, 0, 2)
+    bound = 2 * 64 * (np.finfo(np.float32).eps / 2) * spans
+    assert np.all(np.abs(got - want) <= bound), float(np.max(np.abs(got - want) / np.maximum(bound, 1e-30)))
+    tangent = rng.standard_normal(g.shape).astype(np.float32)
+    _, forward = jax.jvp(lambda g: chunk_decay(g)[1], (jnp.asarray(g),), (jnp.asarray(tangent),))
+    paired = float(jnp.vdot(forward, cotangent))
+    np.testing.assert_allclose(paired, float(np.vdot(tangent, got)), rtol=1e-5)
+
+
 def test_the_chunked_rule_holds_with_aligned_keys():
     """Keys nearly aligned within a chunk, beta near one and slow decay, the
     case real checkpoints reach: the chunked math still gives the
