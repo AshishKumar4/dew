@@ -123,3 +123,49 @@ def fake_quant_fp4(x, block: int, e4m3_scale: bool):
             jnp.maximum(amax, _E2M1_MAX * 2 ** -126) * jnp.float32(1 / _E2M1_MAX))
         rounded = _e2m1(jnp.clip(blocks / scale, -_E2M1_MAX, _E2M1_MAX))
     return straight_through(x, (rounded * scale).reshape(x.shape))
+
+
+def correctly_rounded_divide(numerator: jax.Array, denominator: jax.Array) -> jax.Array:
+    """The correctly rounded fp32 quotient, IEEE division's, on XLA's approximate
+    dividers too: XLA:CPU and XLA:GPU divide through a reciprocal, and a
+    quantizer's scales and quotients must round as the reference's host or
+    CUDA division does (compressed-tensors' NVFP4, the FP8 block cast).
+
+    A Dekker TwoProduct gives the exact residual of the approximate
+    quotient, split into two fp32 values. One residual correction puts the
+    quotient within one ulp; comparing its exact residual with each
+    neighbour's half-spacing times the divisor chooses nearest-even.
+    That threshold product is exact because the half-spacing is a power
+    of two. The quantizer's observed scales and quotients keep these
+    intermediates normal; dense and midpoint checks hold the result to
+    NumPy's IEEE divide without enabling x64. Dense keeps its own precision.
+    """
+    def product_error(a, b, product):
+        ah = jax.lax.bitcast_convert_type(
+            jax.lax.bitcast_convert_type(a, jnp.uint32) & jnp.uint32(0xfffff000), jnp.float32)
+        bh = jax.lax.bitcast_convert_type(
+            jax.lax.bitcast_convert_type(b, jnp.uint32) & jnp.uint32(0xfffff000), jnp.float32)
+        al, bl = a - ah, b - bh
+        remainder = product - ah * bh
+        remainder = remainder - al * bh
+        remainder = remainder - ah * bl
+        return al * bl - remainder
+
+    quotient = numerator / denominator
+    product = quotient * denominator
+    error = product_error(quotient, denominator, product)
+    residual = (numerator - product) - error
+    quotient = quotient + residual / denominator
+    product = quotient * denominator
+    error = product_error(quotient, denominator, product)
+    difference = numerator - product
+    high = difference - error
+    recovered = high - difference
+    low = (difference - (high - recovered)) - (error + recovered)
+    above, below = jnp.nextafter(quotient, jnp.inf), jnp.nextafter(quotient, -jnp.inf)
+    upper = (above - quotient) * 0.5 * denominator
+    lower = (quotient - below) * 0.5 * denominator
+    odd = (jax.lax.bitcast_convert_type(quotient, jnp.uint32) & 1) != 0
+    up = (high > upper) | ((high == upper) & ((low > 0) | ((low == 0) & odd)))
+    down = (high < -lower) | ((high == -lower) & ((low < 0) | ((low == 0) & odd)))
+    return jnp.where(up, above, jnp.where(down, below, quotient))
