@@ -665,15 +665,16 @@ class Objective(ABC, Generic[Loss, Effects]):
         add: a loss head, a projector, a phase's split. The default adds nothing."""
         return tree
 
-    def _compiled_program(self, name: str, function: Callable, *, static_argnames: tuple[str, ...] = ()):
-        """Reuse a program only while this objective's modules and head tiles stay fixed, and under the
-        context it traced in (`trace_context`).
+    def program(self, name: str, function: Callable, *, static_argnames: tuple[str, ...] = ()):
+        """`function` jitted as this objective's program `name`, reused only while its modules and head
+        tiles stay fixed (`program_key`), and under the context it traced in (`trace_context`).
 
-        Fit's ladder replaces the immutable Flax model and may change a
-        tiled head. Argument shapes alone cannot identify those programs, nor
-        can they the pipeline's microbatch count, the layout's rules or the
-        links a model decides from. Keep only the current specialization, not
-        a history of old models.
+        Every program that runs this objective's modules is one of these, whoever calls it: an
+        evaluation, a rollout, a host step. Fit's ladder replaces the immutable Flax model and may
+        change a tiled head, and `substitute` may quantize it at the same shapes. Argument shapes
+        alone cannot identify those programs, nor can they the pipeline's microbatch count, the
+        layout's rules or the links a model decides from. `name` names everything else the program
+        fixes. Keep only the current specialization, not a history of old models.
         """
         programs = tuple((program.module, program.head_tile) for program in self.program_key())
         cached = vars(self).get('_program_cache')
@@ -696,13 +697,13 @@ class Objective(ABC, Generic[Loss, Effects]):
 
     @property
     def _validation_loss(self):
-        return self._compiled_program(
+        return self.program(
             'loss', lambda variables, batch, step: self._loss(variables, batch, step, validation=True)[0])
 
-    @functools.cached_property
+    @property
     def _validation_reduction(self):
-        """`reduce_loss` compiled once, for the statistics a validation pass sums."""
-        return jax.jit(self.reduce_loss)
+        """`reduce_loss` compiled, for the statistics a validation pass sums."""
+        return self.program('reduction', self.reduce_loss)
 
     @property
     def scalars(self) -> TrainingScalars[Loss, Effects]:
@@ -935,7 +936,7 @@ class Objective(ABC, Generic[Loss, Effects]):
         batch from the host, and jax's eager shard_map refuses the chunked
         head's map over the data axis alone."""
         assert self._evaluation_scores is not None
-        return self._compiled_program('scores', self._evaluation_scores)
+        return self.program('scores', self._evaluation_scores)
 
     def evaluation_variables(self, variables: Variables, step: Step) -> Variables:
         """Return the weights a validation pass and a preview score: the

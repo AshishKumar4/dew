@@ -312,10 +312,14 @@ class HostExecution:
         self.objective, self.layout = objective, layout
         self.accelerator, self.cpu = accelerator, cpu
         self.sites = bank_sites(objective) if objective.bank_sites else ()
-        # The objective owns the program, which its fit ladder replaces with its model.
-        self.forward = objective._compiled_program(
-            'host_forward', functools.partial(_forward, objective._loss), static_argnames=("layout",))
         self.unstack = jax.jit(functools.partial(_logical, sites=self.sites))
+
+    @property
+    def forward(self):
+        """The loss and its pullback, compiled for the objective's modules as they are now: the
+        objective owns the program, which its fit ladder replaces with its model."""
+        return self.objective.program('host_forward', functools.partial(_forward, self.objective._loss),
+                                      static_argnames=("layout",))
 
     def snapshot(self, variables):
         """The declared stacks as banks, everything else as it is stored.

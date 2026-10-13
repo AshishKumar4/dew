@@ -18,6 +18,7 @@ import numpy as np
 import pytest
 from reference_error import assert_as_exact_as_the_reference
 from rl_support import TinyHead
+from steady_state import steady_state
 
 from dew.data import DataPartition, Loading, PreferencePairs
 from dew.data.preferences import IDS_KEY, MASK_KEY, PreferenceSource
@@ -160,13 +161,15 @@ def test_swapped_halves_change_the_loss():
 
 def test_evaluation_scores_chosen_perplexity():
     """Validation reads the chosen responses' cross entropies under the
-    shifted completion mask."""
+    shifted completion mask, compiled once for the objective's modules."""
     objective = DPOObjective(TinyHead(vocab_size=VOCAB), WIDTH - 1, beta=0.5)
     params = objective.init(jax.random.key(0))
     batch = pair_batch()
     step = Step(step=jnp.asarray(0), key=jax.random.key(1), ema=params)
 
     scores = objective.evaluate(params, batch, step)
+    with steady_state(allow=("host_to_device",)):
+        objective.evaluate(params, batch, step)
 
     chosen_ids, _, chosen_mask, _ = flat(batch)
     expected = np.asarray(objective.per_token_log_probs(params, chosen_ids))
