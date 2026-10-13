@@ -587,13 +587,14 @@ def _counted_adapter(model: nn.Module, branch: _Branch,
                             CountedPredictions, CountedPredictionParameters, CountedPredictionTraining)
 
 
-def _fp8_packed(model: nn.Module, variables: Variables) -> Variables:
+def _fp8_packed(model: nn.Module, variables: Variables) -> dict:
     """`variables` with the frozen FP8 kernels of the record `model` computes
     under packed from its `FROZEN` base (`InputQuantization.packed`), the
     only kernels an adapter never trains."""
-    record = type(model)._dew_wrapper() if "_dew_input_quantization" in vars(type(model)) else None
+    records = [layer._dew_wrapper() for layer in wrapper_layers(type(model))[1]]
+    record = next((wrapper for wrapper in records if isinstance(wrapper, InputQuantization)), None)
     if record is None or not record.frozen_fp8:
-        return variables
+        return dict(variables)
     packed = record.packed(variables[FROZEN])
     return {**variables, QUANTIZATION: overlay(variables.get(QUANTIZATION, {}), packed)}
 
