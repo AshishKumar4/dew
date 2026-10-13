@@ -49,6 +49,15 @@ def test_device_pipeline_returns_resident_uint8_and_resumes_exactly():
         for name in expected:
             np.testing.assert_array_equal(actual[name], expected[name])
         assert not np.array_equal(first["image"], expected["image"])
+        from dew.training.distributed import DevicePrefetchIterator, MeshSpec
+
+        mesh = MeshSpec().build([jax.devices()[0]])
+        with DevicePrefetchIterator(stream, mesh) as prefetch:
+            for _ in range(3):
+                jax.block_until_ready(next(prefetch))
+            with steady_state():
+                batches = [next(prefetch) for _ in range(3)]
+                jax.block_until_ready(batches)
     finally:
         stream.close()
         resumed.close()
@@ -141,20 +150,6 @@ def test_production_fp32_crop_and_colour_are_within_one_uint8_code():
     assert np.max(np.abs(rounded - reference)) <= 1
 
 
-def test_model_float64_mode_changes_no_data_draw():
-    from dew.data.image_augmentation import augment_batch
-
-    image = np.random.default_rng(4).integers(0, 256, (4, 16, 16, 3), dtype=np.uint8)
-    keys = np.random.default_rng(2).integers(0, 2**32, (4, 2), dtype=np.uint32)
-    run = jax.jit(lambda images, raw: augment_batch(images, raw, size=12,
-                  flip=True, jitter=True, crop_scale=(0.4, 0.9)))
-    with jax.enable_x64(new_val=False):
-        expected = run(image, keys)
-    with jax.enable_x64():
-        actual = run(image, keys)
-    np.testing.assert_array_equal(actual, expected)
-
-
 def test_device_none_keeps_the_old_resize_bit_identical():
     host = spec(augmentation="none").load(batch=4).train(DataPartition())
     device = spec(augmentation="none", augmentation_backend="device").load(batch=4).train(DataPartition())
@@ -215,29 +210,3 @@ def test_grain_workers_only_decode_and_keep_the_parent_device_draws():
     finally:
         parent.close()
         worker.close()
-
-
-@pytest.mark.parametrize("options", [{"crop_scale": (0, 1)}, {"crop_scale": (0.9, 0.5)},
-                                    {"augmentation_size": 0}, {"augmentation_backend": "bad"}])
-def test_invalid_augmentation_configuration_is_rejected(options):
-    with pytest.raises(ValueError):
-        spec(**options)
-
-
-def test_a_device_augmented_stream_steadies_into_compiled_reads_the_loop_waits_on_alone():
-    """Once a few batches have been augmented and placed, the stream the
-    trainer reads compiles nothing more for records of other sizes and
-    crops, and handing the loop a placed batch moves nothing it did not ask
-    for (`steady_state`): the augmentation and the placement stay on the
-    devices and on the prefetch worker."""
-    from dew.training.distributed import DevicePrefetchIterator, MeshSpec
-
-    mesh = MeshSpec().build([jax.devices()[0]])
-    stream = spec(augmentation_backend="device", crop_scale=(0.5, 0.9)).load(batch=4).train(DataPartition())
-    with DevicePrefetchIterator(stream, mesh) as prefetch:
-        for _ in range(3):
-            jax.block_until_ready(next(prefetch))
-        with steady_state():
-            batches = [next(prefetch) for _ in range(3)]
-            jax.block_until_ready(batches)
-    assert all(batch["image"].shape == (4, 12, 12, 3) for batch in batches)

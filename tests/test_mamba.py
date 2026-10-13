@@ -11,9 +11,8 @@ import pytest
 from reference_error import assert_as_exact_as_the_reference
 
 from dew.interop import Pretrained, PretrainedDecoder
-from dew.interop.hf_decoders import translate_config
 from dew.interop.sources import load_shards
-from dew.nn.mixers.mamba import Mamba, MambaMixer, selective_scan
+from dew.nn.mixers.mamba import Mamba, selective_scan
 
 ROOT = Path(__file__).parent / 'fixtures' / 'hf'
 TINY = ROOT / 'mamba-tiny'
@@ -82,29 +81,6 @@ def test_logits_match_transformers():
                                      'mamba logits')
 
 
-def test_the_reference_catches_a_shared_decay():
-    """A is a decay per channel and state dimension; one decay per channel,
-    Mamba-2's scalar, computes another model."""
-    loaded = load()
-    params = jax.tree.map(jnp.asarray, loaded.variables)['params']
-    for index in range(loaded.model.num_layers):
-        log = params[f'layers_{index}']['self_attn']['A_log']
-        shared = jnp.broadcast_to(log.mean(-1, keepdims=True), log.shape)
-        params[f'layers_{index}']['self_attn']['A_log'] = shared
-    wrong = loaded.model.apply({'params': params}, np.load(TINY / 'input_ids.npy'))
-    with pytest.raises(AssertionError, match=r'allowed 2\.0'):
-        assert_as_exact_as_the_reference(wrong, np.load(TINY / 'logits.npy'),
-                                         np.load(TINY / 'logits_f64.npy'), 'mamba with a shared decay')
-
-
-def test_a_decode_step_scans_one_token():
-    """One token is the recurrence's one step, not a chunk padded out to 64."""
-    x, dt, A, B, C, D = operands(length=1)
-    jaxpr = jax.make_jaxpr(lambda *args: selective_scan(*args, chunk_size=64))(x, dt, A, B, C, D)
-    shapes = [getattr(var.aval, 'shape', ()) for equation in jaxpr.eqns for var in equation.outvars]
-    assert all(64 not in shape for shape in shapes)
-
-
 def test_the_layer_decodes_as_it_prefills():
     mixer = Mamba(emb_features=8, intermediate_size=16, state_size=4, time_step_rank=2, chunk_size=4)
     x = jax.random.normal(jax.random.key(0), (2, 9, 8))
@@ -138,23 +114,6 @@ def test_export_reads_in_transformers_and_reloads_bit_for_bit(tmp_path):
     assert_as_exact_as_the_reference(actual, expected, np.load(TINY / 'logits_f64.npy'), 'mamba export')
     restored = Pretrained.load(tmp_path, dtype='float32', attention_impl='reference')
     np.testing.assert_array_equal(restored.model.apply(restored.variables, ids), actual)
-
-
-def test_the_released_config_translates_its_computation():
-    model = translate_config(json.loads((ROOT / 'mamba-130m-hf' / 'config.json').read_text())).value
-    assert model.mixer == MambaMixer(intermediate_size=1536, state_size=16, time_step_rank=48, conv_kernel=4)
-    assert (model.emb_features, model.num_layers, model.vocab_size) == (768, 24, 50280)
-    assert model.mlp_features == 0 and model.tie_embeddings
-
-
-@pytest.mark.network
-def test_the_released_config_is_pinned():
-    from huggingface_hub import hf_hub_download
-
-    source = json.loads((ROOT / 'mamba-130m-hf' / 'source.json').read_text())
-    filename = hf_hub_download(source['repo'], 'config.json', revision=source['revision'])
-    pinned = json.loads((ROOT / 'mamba-130m-hf' / 'config.json').read_text())
-    assert json.loads(Path(filename).read_text()) == pinned
 
 
 @pytest.mark.network

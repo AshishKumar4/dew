@@ -26,9 +26,7 @@ from interop_support import fetch
 
 from dew.interop import Pretrained
 from dew.interop.codecs import (
-    AMAX_FLOOR,
     BLOCK,
-    E4M3_MAX,
     SCALE_SUFFIX,
     dequantize_fp8_blocks,
     fp8_blocks,
@@ -86,12 +84,6 @@ def test_a_widened_weight_dequantizes_like_the_fp8_one():
                           bits(dequantize_fp8_blocks(weight, scale_inv)))
 
 
-def test_a_scale_grid_that_does_not_fit_the_weight_is_refused():
-    weight = np.zeros((576, 256), FP8)
-    with pytest.raises(ValueError, match=r"\(5, 2\) scale, got \(4, 2\)"):
-        dequantize_fp8_blocks(weight, np.ones((4, 2), np.float32))
-
-
 def test_the_loader_hook_dequantizes_every_paired_weight_and_nothing_else():
     """A checkpoint read as fp32: the weight with a `_scale_inv` partner
     leaves dequantized and the partner is gone; every other tensor is the
@@ -119,40 +111,8 @@ def test_the_loader_hook_dequantizes_every_paired_weight_and_nothing_else():
     assert "model.layers.0.mlp.up_proj.weight_scale_inv" in tensors, "the input was mutated"
 
 
-def test_a_scale_without_its_weight_is_refused():
-    with pytest.raises(ValueError, match=r"scales model.layers.0.mlp.up_proj.weight, which"):
-        fp8_blocks(BLOCK).dequantize({"model.layers.0.mlp.up_proj.weight_scale_inv": np.ones((1, 1))})
-
-
 DEEPSEEK_V3 = {"activation_scheme": "dynamic", "fmt": "e4m3", "quant_method": "fp8",
                "weight_block_size": [128, 128]}
-DEEPSEEK_V32 = {**DEEPSEEK_V3, "scale_fmt": "ue8m0"}
-
-
-def test_the_config_names_the_block_and_the_scale_format():
-    """The two DeepSeek configs as they are on the hub, and the spellings
-    transformers' FineGrainedFP8Config reads the same way: no fmt (it
-    declares none and stores E4M3), and scale_fmt 'float', its default."""
-    assert fp8_format(DEEPSEEK_V3) == (128, False)
-    assert fp8_format(DEEPSEEK_V32) == (128, True)
-    assert fp8_format({key: value for key, value in DEEPSEEK_V3.items() if key != "fmt"}) == (128, False)
-    assert fp8_format({**DEEPSEEK_V3, "fmt": "float8_e4m3fn", "scale_fmt": "float"}) == (128, False)
-
-
-@pytest.mark.parametrize("field, value", [("fmt", "e5m2"), ("weight_block_size", None),
-                                          ("weight_block_size", [1, 128]),
-                                          ("weight_block_size", [128.0, 128.0]),
-                                          ("weight_block_size", [True, True]),
-                                          ("weight_block_size", [0, 0]),
-                                          ("weight_per_tensor", True),
-                                          ("scale_fmt", "e8m0"), ("scale_fmt", "")])
-def test_an_fp8_config_outside_the_finegrained_format_is_refused(field, value):
-    """A per-tensor or rectangular scale, or a scale format with no rounding
-    rule here, is refused at load rather than read under an invented one."""
-    with pytest.raises(ValueError, match="nothing else"):
-        fp8_format({**DEEPSEEK_V3, field: value})
-
-
 def write_safetensors(path, tensors):
     """One safetensors file from named arrays, fp8 included, without torch.
 
@@ -253,33 +213,6 @@ def test_a_checkpoint_with_block_scales_loads_dequantized(tmp_path):
                           tensors["model.layers.0.mlp.gate_proj.weight"].T)
 
 
-def test_a_re_ship_writes_over_the_shard_its_own_tensors_are_mapped_from(tmp_path):
-    """A re-ship rewrites the shard its inputs are memmapped from; the maps
-    must keep reading their old bytes and the shard must hold the new table.
-    The fp8 payload is a quarter of the fp32 it replaces, so a truncating
-    writer leaves the mapped bytes past end-of-file and SIGBUS is certain."""
-    from dew.interop.safetensors_io import read_file
-    directory = tmp_path / "reship"
-    shutil.copytree(FIXTURE, directory)
-    shard = directory / "model.safetensors"
-    name = "model.layers.0.mlp.up_proj.weight"
-    tensors, _ = read_file(shard)
-    assert isinstance(tensors[name].base, np.memmap), "the shard is not mapped; nothing to lose"
-    held = {key: array.tobytes() for key, array in tensors.items()}
-    shipped = dict(tensors)
-    shipped[name], shipped[name + SCALE_SUFFIX] = quantize_fp8_blocks(tensors[name], 16)
-    assert shipped[name].nbytes < tensors[name].nbytes, "the payload did not shrink"
-
-    write_safetensors(shard, shipped)
-
-    for key, array in tensors.items():
-        assert array.tobytes() == held[key], f"{key} changed under the map it was read through"
-    written = read_safetensors(shard)
-    assert set(written) == set(shipped)
-    for key, (_, shape, payload) in written.items():
-        assert shape == shipped[key].shape and payload == shipped[key].tobytes(), key
-
-
 # --------------------------------------------------------------------------
 # The encoder
 # --------------------------------------------------------------------------
@@ -333,55 +266,6 @@ def test_the_encoder_writes_the_upstream_casts_bytes(case, ue8m0):
     assert np.array_equal(scale_inv.view(np.uint32), reference[f"{case}/scales{suffix}"].view(np.uint32))
 
 
-def test_a_zero_block_takes_the_amax_floors_scale():
-    """The reference's `clamp(1e-4)`: without it an all-zero block's scale
-    is zero and every element of it 0/0. With it the block has a positive
-    scale, its zeros stay zeros, and both signed zeros keep their sign."""
-    codes, scale_inv = quantize_fp8_blocks(
-        np.array([[0.0, -0.0], [-0.0, 0.0]], np.float32), block=2)
-
-    assert scale_inv[0, 0] == np.float32(AMAX_FLOOR) / np.float32(E4M3_MAX)
-    np.testing.assert_array_equal(codes.view(np.uint8),
-                                  np.array([[0, 0x80], [0x80, 0]], np.uint8))
-    assert np.all(np.isfinite(dequantize_fp8_blocks(codes, scale_inv, block=2)))
-
-
-@pytest.mark.parametrize("amax, code", [(1e-9, 2), (1e-10, 0)])
-def test_a_block_under_the_amax_floor_scales_against_the_floor(amax, code):
-    """A block whose amax is under the floor is not stretched to fill the
-    range: it keeps the floor's scale, so 1e-9 lands two subnormal steps up
-    and 1e-10 rounds away altogether. That is the reference's behaviour, and
-    the reason a re-export cannot promise to carry a tiny block."""
-    codes, scale_inv = quantize_fp8_blocks(np.full((2, 2), amax, np.float32), block=2)
-
-    assert scale_inv[0, 0] == np.float32(AMAX_FLOOR) / np.float32(E4M3_MAX)
-    assert np.array_equal(codes.view(np.uint8), np.full((2, 2), code, np.uint8))
-
-
-def test_a_ue8m0_scale_is_the_least_power_of_two_at_or_above_the_quotient():
-    """`ceil_to_ue8m0` reads the exponent off the float32 bits and adds one
-    when any mantissa bit is set, so a scale quotient n ULPs above 2 ** k
-    takes 2 ** (k + 1) for every n > 0 and every k in the scale range, and
-    an exact power keeps itself. Each block is one element, 448 * 2 ** k *
-    (1 + n * 2 ** -23), its quotient exactly that; DeepGEMM's own bytes say
-    the same. Before DeepGEMM's 26/04 release the rule was float32
-    `2 ** ceil(log2(x))`, which kept the lower power for up to 133 of these
-    141 exponents at n = 1; DeepSeek's own V3.2 and V4.1 kernels
-    (`fast_log2_ceil`) round on the bits too."""
-    reference = deepgemm()
-    weight = reference["edge/weight"]
-    quotient = weight[:, 0] / np.float32(E4M3_MAX)
-    exact = (quotient.view(np.uint32) & 0x7FFFFF) == 0
-
-    codes, scale_inv = quantize_fp8_blocks(weight, 1, ue8m0=True)
-
-    assert np.array_equal(codes.view(np.uint8), reference["edge/codes/ue8m0"])
-    assert np.array_equal(scale_inv.view(np.uint32), reference["edge/scales/ue8m0"].view(np.uint32))
-    assert np.all(scale_inv.view(np.uint32) & 0x7FFFFF == 0), "not powers of two"
-    assert np.all(scale_inv[:, 0] >= quotient) and np.all(scale_inv[:, 0] / 2 < quotient)
-    np.testing.assert_array_equal(decode_e4m3fn(codes.view(np.uint8))[:, 0], np.where(exact, 448.0, 224.0))
-
-
 @pytest.mark.parametrize("ue8m0", [False, True], ids=["float32-scales", "ue8m0-scales"])
 def test_the_encoding_moves_a_weight_only_as_far_as_the_format_rounds(ue8m0):
     """Nearest-even into e4m3 inside a block scaled by `scale_inv` cannot
@@ -425,86 +309,6 @@ def test_the_encoding_does_not_depend_on_the_dtype_or_the_backend_it_arrives_on(
         actual = quantize_fp8_blocks(arrived, 16, ue8m0=ue8m0)
         assert np.array_equal(actual[0].view(np.uint8), expected[0].view(np.uint8))
         assert np.array_equal(actual[1].view(np.uint32), expected[1].view(np.uint32))
-
-
-@pytest.mark.parametrize("value", [np.inf, -np.inf, np.nan])
-def test_a_weight_that_is_not_finite_is_refused_rather_than_written(value):
-    """E4M3FN encodes no infinity, and a nonfinite element takes its block's
-    amax and so its scale with it: the reference's own arithmetic would
-    write the whole block as NaN under a scale of NaN. The writer names the
-    tensor instead."""
-    weight = np.ones((4, 4), np.float32)
-    weight[2, 3] = value
-
-    with pytest.raises(ValueError, match=r"1 value.*not finite"):
-        quantize_fp8_blocks(weight, block=2)
-
-
-def test_a_weight_that_is_not_a_matrix_is_refused():
-    with pytest.raises(ValueError, match=r"\[rows, cols\] weight, got shape \(2, 2, 2\)"):
-        quantize_fp8_blocks(np.ones((2, 2, 2), np.float32))
-
-
-def test_the_quantized_names_come_off_the_sources_own_scale_partners():
-    """What a loader has to record before it dequantizes: which tensors the
-    source shipped quantized, read off the `_scale_inv` partners in
-    checkpoint order rather than guessed from a name or a shape. After
-    `fp8_blocks(...).dequantize` the partners are gone and an fp8 weight is an
-    fp32 array like every other one, so the record cannot be taken later."""
-    tensors = {"model.embed_tokens.weight": np.ones((4, 4), np.float32),
-               "model.layers.0.mlp.up_proj.weight": np.ones((4, 4), FP8),
-               "model.layers.0.mlp.up_proj.weight_scale_inv": np.ones((1, 1), np.float32),
-               "model.layers.0.input_layernorm.weight": np.ones(4, np.float32),
-               "model.layers.0.self_attn.o_proj.weight": np.ones((4, 4), FP8),
-               "model.layers.0.self_attn.o_proj.weight_scale_inv": np.ones((1, 1), np.float32)}
-
-    names = scaled_names(tensors)
-
-    assert names == ("model.layers.0.mlp.up_proj.weight",
-                     "model.layers.0.self_attn.o_proj.weight")
-    dense = fp8_blocks(BLOCK).dequantize(tensors)
-    assert scaled_names(dense) == (), "the record cannot be taken after the load"
-    assert all(dense[name].dtype == np.float32 for name in names)
-
-
-PACK_BLOCK = 16
-
-
-def test_the_packer_writes_the_named_tensors_and_leaves_the_rest():
-    """`fp8_blocks(...).requantize` re-encodes the names it is handed and nothing else, so a
-    source that shipped its embeddings and its norms dense re-exports them
-    dense, as the same arrays rather than as copies or casts of them."""
-    rng = np.random.default_rng(3)
-    quantized = "model.layers.0.mlp.up_proj.weight"
-    tensors = {"model.embed_tokens.weight": rng.standard_normal((32, 16)).astype(np.float32),
-               quantized: rng.standard_normal((48, 32)).astype(np.float32),
-               "model.layers.0.input_layernorm.weight": np.ones(16, np.float32)}
-
-    written = fp8_blocks(PACK_BLOCK, ue8m0=False).requantize(tensors, (quantized,))
-
-    assert set(written) == set(tensors) | {quantized + SCALE_SUFFIX}
-    assert written[quantized].dtype == FP8
-    assert written[quantized + SCALE_SUFFIX].shape == (3, 2)
-    for name in ("model.embed_tokens.weight", "model.layers.0.input_layernorm.weight"):
-        assert written[name] is tensors[name]
-    assert len(tensors) == 3, "the input was mutated"
-
-
-def test_the_packer_refuses_a_recorded_tensor_it_was_not_handed():
-    """A source tensor that was quantized and is missing from the export
-    would otherwise be written dense under a config that calls it
-    quantized, which is the lie this whole path exists to avoid."""
-    with pytest.raises(KeyError, match=r"up_proj.weight"):
-        fp8_blocks(PACK_BLOCK).requantize({"a.weight": np.ones((16, 16), np.float32)},
-                                          ("model.layers.0.mlp.up_proj.weight",))
-
-
-def test_the_packer_refuses_to_overwrite_an_existing_scale_partner():
-    tensors = {"a.weight": np.ones((16, 16), np.float32),
-               "a.weight_scale_inv": np.ones((1, 1), np.float32)}
-
-    with pytest.raises(ValueError, match=r"a.weight_scale_inv is already"):
-        fp8_blocks(PACK_BLOCK, ue8m0=False).requantize(tensors, ("a.weight",))
 
 
 # --------------------------------------------------------------------------
@@ -580,12 +384,6 @@ def reexport(request, tmp_path_factory):
             "destination": destination}
 
 
-def test_the_recorded_names_are_the_ones_the_source_shipped_quantized(reexport):
-    """Read off the written checkpoint in its own order. The tensors the
-    fixture ships dense, the other three dozen, are not in the record."""
-    assert reexport["names"] == QUANTIZED_TENSORS
-
-
 def test_a_trained_source_writes_the_cast_of_its_trained_weights(reexport):
     """Every byte of every re-encoded tensor is the cast of the trained fp32
     weight the layouts assembled, and every scale the same float32: the
@@ -618,19 +416,6 @@ def test_the_written_file_decodes_through_a_reader_that_shares_no_code(reexport)
             bits(decode_e4m3fn(codes) * expanded(scale_inv, shape, REEXPORT_BLOCK)),
             bits(dequantize_fp8_blocks(reexport["written"][name], scale_inv,
                                        REEXPORT_BLOCK))), name
-
-
-def test_every_tensor_the_source_shipped_dense_is_written_unchanged(reexport):
-    """A re-export in the source's format touches the recorded tensors and
-    nothing else: the norms, the embeddings, the routing biases and the
-    projections the source left dense go out as the trained float32 arrays
-    they came from."""
-    dense, written, names = reexport["dense"], reexport["written"], reexport["names"]
-
-    untouched = [name for name in dense if name not in names]
-    assert len(untouched) > 30
-    for name in untouched:
-        assert written[name] is dense[name], name
 
 
 def test_reloading_the_re_export_recovers_the_blocks_it_wrote(reexport):

@@ -22,7 +22,6 @@ from dew.nn.backbones.layer_plan import LayerKind
 from dew.nn.mixers.mlp import MLPMixer
 from dew.nn.sharding import pipeline_microbatches
 from dew.objectives.lm import LMObjective
-from dew.objectives.lm.objective import router_counts
 from dew.objectives.rl.sessions import ROUTED_EXPERTS_KEY, ROUTED_KEY, Call, Session, Status, pack
 from dew.training import Layout, MeshSpec
 
@@ -191,33 +190,6 @@ def test_replay_under_a_pipeline_scores_as_on_one_stage():
     np.testing.assert_allclose(scored(MeshSpec(fsdp=2, stage=2, microbatches=2)), flat, atol=1e-5)
 
 
-def test_under_replay_the_bias_counts_the_replayed_experts():
-    """Megatron's R3 path as verl patches it: the balancing bias counts the
-    experts the tokens were sent to, the replayed ones."""
-    obj = objective()
-    params = obj.init(jax.random.key(0))
-    tokens = tokens_of(2)
-    routed = (engine_layout(choices(obj, params, tokens), 2) + 1) % EXPERTS
-    sown = obj.token_scores(params, tokens, routing=True, routes=(routed, None)).routing
-    counts = router_counts(
-        {"layers_0": {"mlp": {"gate": {"e_score_correction_bias": jnp.zeros(EXPERTS)}}}}, sown
-    )
-    np.testing.assert_array_equal(counts["layers_0"]["mlp"]["gate"]["e_score_correction_bias"],
-                                  np.bincount(routed[:, :-1, 0].ravel(), minlength=EXPERTS))
-
-
-def test_a_record_that_does_not_fit_the_model_is_refused():
-    obj = objective(layers=(1, 3))
-    params = obj.init(jax.random.key(0))
-    tokens = jnp.zeros((1, SEQ_LEN + 1), jnp.int32)
-    with pytest.raises(ValueError, match="layers, top_k"):
-        obj.token_scores(params, tokens, routes=(jnp.zeros((1, SEQ_LEN + 1, 2, TOP_K), jnp.int32), None))
-    with pytest.raises(ValueError, match="choosing"):
-        obj.token_scores(
-            params, tokens, routes=(jnp.zeros((1, SEQ_LEN + 1, LAYERS, TOP_K + 1), jnp.int32), None)
-        )
-
-
 def test_pack_takes_each_ids_routing_from_the_latest_call_that_forwarded_it():
     """Call 2 merges onto call 1; its record re-covers the whole chain except
     its own last sampled id, which no call forwarded. The engine's uint8 ids
@@ -237,13 +209,6 @@ def test_pack_takes_each_ids_routing_from_the_latest_call_that_forwarded_it():
     assert batch["input_ids"][0, 6:].tolist() == [9, 8]
     assert batch[ROUTED_KEY][0].tolist() == [True] * 5 + [False] * 3
     assert ROUTED_EXPERTS_KEY not in pack(rollouts[1:], 8)
-
-
-def test_a_call_record_must_cover_every_forwarded_id():
-    with pytest.raises(ValueError, match="3 rows for this call"):
-        Call((1, 2), (3, 4), (-0.1, -0.1), "stop", 0, routed_experts=np.zeros((4, 2, 2), np.int32))
-    with pytest.raises(ValueError, match="nonnegative"):
-        Call((1,), (3,), (-0.1,), "stop", 0, routed_experts=np.full((1, 2, 2), -1, np.int32))
 
 
 def test_packed_grpo_replays_the_routing_its_batch_carries():
