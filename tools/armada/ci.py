@@ -91,10 +91,21 @@ SKIPPED = {"tests/test_gen_api.py", "tests/test_multihost.py"}
 """CI runs the first in the lint job, under the griffe it pins, and the second in the multihost job,
 across the containers of an armada gang."""
 DURATIONS = Path("tests/test_durations.json")
-SHARED = ("locks/cpu.txt", "tools/install_environment.sh", "pyproject.toml", "constraints.txt",
-          ".armada.json", "tools/armada/ci.py", "tools/armada/split.py", "tools/armada/executed.py",
-          str(DURATIONS))
-"""The files every test file's key covers whole, beside tests/ and src/ (`shared`)."""
+SHARED = ("pyproject.toml", "constraints.txt", ".armada.json", "tools/armada/ci.py", "tools/armada/split.py",
+          "tools/armada/executed.py", str(DURATIONS))
+"""The files every test file's key covers whole, beside tests/ and src/ and the environment's own
+inputs, which .armada.json names (`environment_files`)."""
+
+
+def environment_files() -> list[str]:
+    """The files .armada.json builds the tasks' environments from: each environment's setup and
+    install scripts and its snapshot key's files. A shell script runs no Python a record could see."""
+    config = json.loads(Path(".armada.json").read_text())
+    environments = [config["environment"], *config.get("environments", {}).values()]
+    return sorted({name for environment in environments
+                   for name in (environment.get("setup"), environment.get("install"),
+                                *environment.get("key", ()))
+                   if name})
 CACHE_PREFIX = "testcache"
 
 
@@ -109,7 +120,7 @@ def shared(python: str) -> str:
             digest.update(str(path).encode())
             if path.suffix != ".py":
                 digest.update(hashlib.sha256(path.read_bytes()).digest())
-    for name in SHARED:
+    for name in (*SHARED, *environment_files()):
         digest.update(name.encode() + contents(name))
     return digest.hexdigest()
 
