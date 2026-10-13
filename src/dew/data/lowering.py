@@ -716,7 +716,7 @@ class _Build:
         if isinstance(rows, pygrain.MapDataset):
             if self.training and self.lowering.endless and not self.lowering.repeated:
                 rows = rows.repeat(None)
-            elif self.training and not self.lowering.endless:
+            elif self.training and not self.lowering.endless and drop:
                 rows = rows[: len(rows) // batch_stage.size * batch_stage.size]
             whole = rows
             rows = rows[offset + partition.index :: partition.count]
@@ -733,7 +733,7 @@ class _Build:
             stream = _as_iter(rows, self.loading).batch(
                 size, drop_remainder=drop, batch_fn=_Batched(batch_stage.batch_fn)
             )
-        if not self.training and fill:
+        if not drop and fill:
             stream = stream.map(
                 _FillShare(partition, batch_stage.size) if canonical else FilledBatch(size, real=not empty)
             )
