@@ -20,15 +20,20 @@ cumulative sum (73-90), the intra-chunk `Y_diag`, the per-chunk states, the
 inter-chunk recurrence (as a scan over the chunks where the reference
 materialises the `[NC+1, NC+1]` decay matrix; the two are the same
 products) and `Y_off`, the `D` skip added in fp32, and the whole scan in
-fp32 as the reference casts. The decode step is `mamba2_selective_state_update`
+fp32 as the reference casts its operands. The decode step is `mamba2_selective_state_update`
 (192-251). Both live here beside their gated-delta-rule counterparts'
 shapes so tests/test_mamba2.py can hold them to the reference's numbers.
 
 On a GPU whose target row names it the chunked scan is mamba_ssm's own
-kernels (`dew.nn.kernels.mamba_ssd`, `ssd_port_refusal` names where not);
-elsewhere the scan over the chunks is `xla_chunk_scan`, the oracle, or on a
-TPU whose tiling covers the geometry `dew.nn.kernels.ssd`'s Pallas kernel,
-chosen at trace time. Decoding stays on the recurrent form either way.
+kernels (`dew.nn.kernels.mamba_ssd`, `ssd_port_refusal` names where not),
+which multiply `x`, `B` and `C` in their own dtype into fp32 sums as
+mamba_ssm does; elsewhere the scan over the chunks is `xla_chunk_scan`, the
+oracle, or on a TPU whose tiling covers the geometry `dew.nn.kernels.ssd`'s
+Pallas kernel, chosen at trace time. Decoding stays on the recurrent form
+either way. The conv sums in at least fp32 and hands the scan its output in
+the model's compute dtype, as mamba_ssm's `causal_conv1d_fn` hands its scan
+(`mamba_split_conv1d_scan_combined`); the step, the decay and the states
+stay in at least fp32.
 
 Around the scan: `in_proj` yields `[z, x, B, C, dt]` in that order
 (`projected_states.split([intermediate, conv_dim, num_heads])`, 484-486,
@@ -189,25 +194,29 @@ def chunk_ssd(x, dt, A, B, C, D, state=None, chunk_size: int = CHUNK_SIZE, start
     """The chunked SSD scan, `mamba2_chunk_scan` (modeling_mamba2.py:254-357).
 
     `x` `[B, S, H, P]`, `dt` `[B, S, H]` through softplus and the limit, `A`
-    `[H]`, `B` and `C` `[B, S, G, N]`, `D` `[H]`; returns `(output [B, S, H, P],
-    state [B, H, P, N])` computed in `at_least_fp32` and cast back. `starts`
+    `[H]`, `B` and `C` `[B, S, G, N]`, `D` `[H]`; returns `(output [B, S, H, P]`
+    in `x`'s dtype, `state [B, H, P, N]` in `at_least_fp32` of it). `starts`
     `[B, S]` marks packed documents' first tokens, whose entering state drops.
     Where `ssd_port_refusal` takes the call the whole scan is mamba_ssm's
-    kernels (`_ported`); else the chunk scan runs on the TPU's Pallas kernel
-    where `ssd_kernel_platform` takes the geometry, else `xla_chunk_scan`
-    (tests/test_ssd_kernel.py).
+    kernels (`_ported`), on `x`, `B` and `C` in their common dtype; else the
+    scan runs in `at_least_fp32` of it, the chunk scan on the TPU's Pallas
+    kernel where `ssd_kernel_platform` takes the geometry, else
+    `xla_chunk_scan` (tests/test_ssd_kernel.py).
     """
-    dtype, work = x.dtype, at_least_fp32(x.dtype)
-    x, dt, A, B, C, D = (jnp.asarray(t, work) for t in (x, dt, A, B, C, D))
+    dtype = jnp.result_type(x, B, C)
+    work = at_least_fp32(dtype)
+    dt, A, D = (jnp.asarray(t, work) for t in (dt, A, D))
     batch, length, heads, head_dim = x.shape
     state_size = B.shape[-1]
     carried = (rows_like(jnp.zeros((batch, heads, head_dim, state_size), work), x) if state is None
                else jnp.asarray(state, work))
     refusal = ssd_port_refusal(x, B, chunk_size)
     if refusal is None:
+        x, B, C = (jnp.asarray(t, dtype) for t in (x, B, C))
         out, final = _ported(x, dt, A, B, C, D, carried, chunk_size, starts)
-        return out.astype(dtype), final.astype(dtype)
+        return out, final.astype(work)
     ran_kernel('ssd', 'xla', refusal)
+    x, B, C = (jnp.asarray(t, work) for t in (x, B, C))
     B, C = _expand_groups(B, heads), _expand_groups(C, heads)
     pad = (chunk_size - length % chunk_size) % chunk_size
     x, B, C = (jnp.pad(t, ((0, 0), (0, pad), (0, 0), (0, 0))) for t in (x, B, C))
@@ -229,7 +238,7 @@ def chunk_ssd(x, dt, A, B, C, D, state=None, chunk_size: int = CHUNK_SIZE, start
     scanned, final = (xla_chunk_scan(x_c, B_c, C_c, a_c, carried) if platform is None else
                       ssd_chunk_scan(x_c, B_c, C_c, a_c, carried, platform))
     output = jnp.moveaxis(scanned, 0, 1).reshape(batch, total, heads, head_dim) + skip
-    return output[:, :length].astype(dtype), final.astype(dtype)
+    return output[:, :length].astype(dtype), final
 
 
 def ssd_port_refusal(x, B, chunk_size: int) -> str | None:
@@ -286,7 +295,7 @@ def _ported(x, dt, A, B, C, D, state, chunk_size: int, starts):
 def recurrent_ssd(x, dt, A, B, C, D, state=None, starts=None):
     """One token at a time, `mamba2_selective_state_update`
     (modeling_mamba2.py:192-251) as a scan over time, in fp32 (the input's
-    own dtype where it is wider). Operands as `chunk_ssd` takes them; a
+    own dtype where it is wider). Operands and results as `chunk_ssd`'s; a
     token `starts` marks sees a zero state."""
     dtype, work = x.dtype, at_least_fp32(x.dtype)
     x, dt, A, B, C, D = (jnp.asarray(t, work) for t in (x, dt, A, B, C, D))
@@ -306,7 +315,7 @@ def recurrent_ssd(x, dt, A, B, C, D, state=None, starts=None):
     final, out = jax.lax.scan(
         one_token, jnp.asarray(state, work),
         tuple(jnp.moveaxis(t, 1, 0) for t in (x, dt, B, C, starts)))
-    return jnp.moveaxis(out, 0, 1).astype(dtype), final.astype(dtype)
+    return jnp.moveaxis(out, 0, 1).astype(dtype), final
 
 
 class MambaRMSNormGated(nn.Module):
@@ -434,10 +443,11 @@ class Mamba2(nn.Module):
         projected = self.in_proj(x)
         gate, mixed, dt = jnp.split(
             projected, [self.intermediate_size, self.intermediate_size + self.conv_features], axis=-1)
-        # The conv and the scan run in fp32, as the reference's torch path
-        # casts them (modeling_mamba2.py:271, 305), or in the model's own
-        # dtype where it is wider (`at_least_fp32`).
-        wide = at_least_fp32(mixed.dtype)
+        # The conv sums in at least fp32 and hands the scan the compute
+        # dtype, as mamba_ssm's conv hands its scan; the step, the decay and
+        # the states stay in at least fp32 (`at_least_fp32`).
+        compute = mixed.dtype
+        wide = at_least_fp32(compute)
         dt = dt.astype(wide)
         taps, bias = self.conv1d()
         heads = (jnp.asarray(self.dt_bias, wide), -jnp.exp(self.A_log.astype(wide)),
@@ -455,7 +465,8 @@ class Mamba2(nn.Module):
                     "state per row. Run them on a mesh with sequence=1.")
             out = held_scan(self, mixed, taps, bias, functools.partial(scan, dt=dt, heads=heads),
                             (self.num_heads, self.head_dim, self.state_size),
-                            decode=decode, coordinates=tokens, state_dtype=wide, conv_dtype=wide, dtype=wide)
+                            decode=decode, coordinates=tokens, state_dtype=wide, conv_dtype=wide,
+                            dtype=compute)
             if out is None:
                 # Allocation only, as the delta net: init_cache's dummy token
                 # must not consume a position or leave state behind.
@@ -464,11 +475,13 @@ class Mamba2(nn.Module):
                 out = jnp.where(valid[:, :, None], out, 0)
         elif shards > 1:
             # Wide across the shards, so a halo's gradient and its shard's own add before rounding.
-            out = _over_sequence(functools.partial(_sequence_mix, scan=scan, axis=SEQUENCE_AXIS),
+            out = _over_sequence(functools.partial(_sequence_mix, scan=scan, dtype=compute,
+                                                   axis=SEQUENCE_AXIS),
                                  shards, mixed.astype(wide), dt, tokens.segments, tokens.starts,
                                  (taps, bias, *heads))
         else:
-            out = _sequence_mix(mixed, dt, tokens.segments, tokens.starts, (taps, bias, *heads), scan=scan)
+            out = _sequence_mix(mixed, dt, tokens.segments, tokens.starts, (taps, bias, *heads), scan=scan,
+                                dtype=compute)
         return self.out_proj(self.norm(out, gate))
 
 
@@ -513,12 +526,13 @@ def _ssd(convolved, dt, heads, *, num_heads: int, head_dim: int, n_groups: int,
     return out.reshape(batch, length, intermediate), final
 
 
-def _sequence_mix(mixed, dt, segments, starts, weights, *, scan, axis: str | None = None):
+def _sequence_mix(mixed, dt, segments, starts, weights, *, scan, dtype, axis: str | None = None):
     """The conv and the scan over whole training sequences, or over this
     shard's slice of them inside a `shard_map` that holds `axis` manual.
 
-    `mixed` `[B, S, conv_dim]` the projection, convolved in at least fp32,
-    `dt` `[B, S, H]` in fp32, `segments` `[B, S]` and their documents' `starts` or None, `weights` the
+    `mixed` `[B, S, conv_dim]` the projection, convolved in at least fp32
+    and handed to the scan in `dtype`, the model's compute dtype, `dt`
+    `[B, S, H]` in fp32, `segments` `[B, S]` and their documents' `starts` or None, `weights` the
     conv's taps and bias and the heads' `dt_bias`, `A` and `D`. Under `axis`
     the conv reads the previous shard's last `K-1` tokens and segments by one
     `ppermute` (zeros on the first) and the scan is corrected for the earlier
@@ -536,18 +550,17 @@ def _sequence_mix(mixed, dt, segments, starts, weights, *, scan, axis: str | Non
         shards = jax.lax.axis_size(axis)
         forward = [(shard, shard + 1) for shard in range(shards - 1)]
         history = jax.lax.ppermute(mixed[:, length - width:], axis, forward)
-    wide = at_least_fp32(mixed.dtype)
     if segments is None and forward is None:
-        convolved = causal_conv1d(mixed, taps, bias=bias, dtype=wide)
+        convolved = causal_conv1d(mixed, taps, bias=bias, dtype=dtype)
     elif segments is None:
         stream = jnp.concatenate([history, mixed], axis=1)
-        convolved = causal_conv1d(stream, taps, bias=bias, dtype=wide)[:, width:]
+        convolved = causal_conv1d(stream, taps, bias=bias, dtype=dtype)[:, width:]
     else:
         if forward is None:
             before = jnp.broadcast_to(segments[:, :1], (batch, width))
         else:
             before = jax.lax.ppermute(segments[:, length - width:], axis, forward)
-        convolved = document_conv1d(history, mixed, before, segments, taps, bias)
+        convolved = document_conv1d(history, mixed, before, segments, taps, bias).astype(dtype)
     out, _ = scan(convolved, dt, (dt_bias, A, D), starts=starts, axis=axis)
     return out
 
