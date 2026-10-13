@@ -31,11 +31,11 @@ from dew.data.analysis import (
     _leaves,
     _manifest,
     _name,
-    _order_at,
     _preferred_read,
     _promoted,
     _steps,
     _until,
+    _written,
 )
 from dew.data.dataset import (
     Batch,
@@ -78,6 +78,7 @@ from dew.data.pipeline import (
     Pipeline,
     Prefetch,
     RandomMap,
+    RecordStep,
     Repeat,
     Shuffle,
     SingleReader,
@@ -366,8 +367,6 @@ def _prepared(
                 raise ValueError(f"no accepted rows of {_name(branches[0])}; raise the row budgets")
             metadata = _metadata(branches, read)
         branches = tuple(_configured(branch, metadata, read) for branch in branches)
-        if objective is not None and training:
-            branches = (_objective_order(branches[0], objective), *branches[1:])
     for branch, scored in zip(branches, held, strict=True):
         _analyzed(branch, read, validation=scored)
     return branches
@@ -487,7 +486,7 @@ def _compiled(
         cache=_cache_references(original, read),
         volatile=any(
             isinstance(stage.step, Volatile) and stage.step.volatile
-            for stage in _steps(train)
+            for stage in (*_steps(original), *(stage for source in sources for stage in _written(source, ())))
             if isinstance(stage, Map)
         ),
     )
@@ -745,8 +744,16 @@ def objective_steps(pipeline: Pipeline, objective: ObjectiveData, *, train: bool
     laid = max(layouts, default=0)
     at = laid + _until(pipeline.stages[laid:], boundary)
     suffix = pipeline.stages[at:]
-    pipeline = dataclasses.replace(pipeline, stages=pipeline.stages[:at])
-    for step in objective.train if train else objective.evaluate:
+    pipeline = _objective_records(dataclasses.replace(pipeline, stages=pipeline.stages[:at]),
+                                  objective.train if train else objective.evaluate)
+    return dataclasses.replace(pipeline, stages=(*pipeline.stages, *suffix))
+
+
+def _objective_records(
+    pipeline: Pipeline, steps: Sequence[RecordStep | pygrain.RandomMapTransform | Expansion | Configured]
+) -> Pipeline:
+    """Append objective record steps at the caller's preparation boundary."""
+    for step in steps:
         if isinstance(step, Expansion):
             pipeline = pipeline.flat_map(step)
         elif isinstance(step, Configured):
@@ -757,62 +764,25 @@ def objective_steps(pipeline: Pipeline, objective: ObjectiveData, *, train: bool
             pipeline = pipeline.random_map(step)
         else:
             pipeline = pipeline.map(step)
-    return dataclasses.replace(pipeline, stages=(*pipeline.stages, *suffix))
-
-
-def _objective_order(pipeline: Pipeline, objective: ObjectiveData) -> Pipeline:
-    def shared(stage: Stage) -> bool:
-        return isinstance(stage, RandomMap) and (
-            (stage.configured is not None and stage.configured.step.scope == "run")
-            or any(stage.step is step for step in objective.train)
-        )
-
-    selected: tuple[Stage, ...] = ()
-    source = pipeline.source
-    if isinstance(source, (Mixture, Phases)):
-        choices = [tuple(stage for stage in child.stages if shared(stage)) for child in source.pipelines]
-        if choices and all(stages == choices[0] for stages in choices):
-            selected = choices[0]
-            children = tuple(
-                dataclasses.replace(child, stages=tuple(stage for stage in child.stages if not shared(stage)))
-                for child in source.pipelines
-            )
-            source = dataclasses.replace(source, pipelines=children)
-    stages = tuple(stage for stage in pipeline.stages if not shared(stage))
-    selected = (*selected, *(stage for stage in pipeline.stages if shared(stage)))
-    at = _until(stages, (BatchStage, TokenBudget))
-    return dataclasses.replace(pipeline, source=source, stages=(*stages[:at], *selected, *stages[at:]))
+    return pipeline
 
 
 def _objective_branch(pipeline: Pipeline, objective: ObjectiveData, *, train: bool, read: Read) -> Pipeline:
-    branch = objective_steps(pipeline, objective, train=train, read=read)
-    if isinstance(branch.source, Mixture):
-        children = branch.source.pipelines
-        suffixes = [
-            tuple(stage for stage in child.stages if isinstance(stage, RandomMap)) for child in children
-        ]
-        if suffixes and all(suffix == suffixes[0] for suffix in suffixes):
-            children = tuple(
-                dataclasses.replace(
-                    child, stages=tuple(stage for stage in child.stages if not isinstance(stage, RandomMap))
-                )
-                for child in children
-            )
-            branch = dataclasses.replace(
-                branch,
-                source=dataclasses.replace(branch.source, pipelines=children),
-                stages=(*suffixes[0], *branch.stages),
-            )
-    ordering = tuple(stage for stage in branch.stages if isinstance(stage, (Shuffle, Repeat)))
-    without = tuple(stage for stage in branch.stages if not isinstance(stage, (Shuffle, Repeat)))
-    at, _ = _order_at(without, read)
-    if ordering and read == "memory" and at < len(without):
-        branch = dataclasses.replace(branch, stages=(*without[:at], *ordering, *without[at:]))
-    if objective.group is not None and not any(isinstance(stage, TokenBudget) for stage in branch.stages):
-        at = _until(branch.stages, (RandomMap, BatchStage, TokenBudget))
-        branch = dataclasses.replace(
-            branch, stages=(*branch.stages[:at], Group(objective.group), *branch.stages[at:])
-        )
+    """Prepare each corpus, then attach objective randomness after the user's record order."""
+    steps = objective.train if train else objective.evaluate
+    random = next((index for index, step in enumerate(steps)
+                   if isinstance(step, pygrain.RandomMapTransform)
+                   or (isinstance(step, Configured) and step.random)), len(steps))
+    prefix = dataclasses.replace(objective, train=objective.train[:random],
+                                 evaluate=objective.evaluate[:random])
+    branch = objective_steps(pipeline, prefix, train=train, read=read)
+    at = _until(branch.stages, (BatchStage, TokenBudget))
+    suffix = branch.stages[at:]
+    branch = dataclasses.replace(branch, stages=branch.stages[:at])
+    if objective.group is not None and not any(isinstance(stage, TokenBudget) for stage in suffix):
+        branch = branch.then(Group(objective.group))
+    branch = _objective_records(branch, steps[random:])
+    branch = dataclasses.replace(branch, stages=(*branch.stages, *suffix))
     steps = objective.train_batch if train else objective.evaluate_batch
     # The objective's batch goes to the accelerator: its string and object fields stay here.
     return branch.then(*(MapBatch(step) for step in steps), MapBatch(Placed()))
