@@ -146,3 +146,21 @@ def test_a_null_unet_flag_reads_as_false_as_diffusers_reads_it(edges, control, e
     fields = unet_fields({**config, control: None, "upcast_attention": None, "center_input_sample": None})
     assert {"flip_sin_to_cos": fields["cosine_first"],
             "use_linear_projection": fields["linear_projection"]}[control] is expected
+
+
+@pytest.mark.parametrize("control,value", [
+    ("act_fn", "gelu"), ("mid_block_add_attention", False), ("mid_block_add_attention", None),
+    ("out_channels", 4), ("down_block_types", ["DownEncoderBlock2D"] * 3 + ["DownBlock2D"]),
+    ("up_block_types", ["UpDecoderBlock2D"] * 3),
+])
+def test_an_autoencoder_config_the_stack_does_not_compute_is_refused_by_name(control, value):
+    """SDXL's published VAE config builds; the same config with one computation field the stack
+    does not compute is refused, naming the field, though its weights' shapes would bind."""
+    import jax.numpy as jnp
+
+    from dew.nn.autoencoders import AutoencoderKL
+
+    config = json.loads((SDXL / "vae/config.json").read_text())
+    assert AutoencoderKL.from_diffusers(config, jnp.float32).channels == (128, 256, 512, 512)
+    with pytest.raises(ValueError, match=control):
+        AutoencoderKL.from_diffusers({**config, control: value}, jnp.float32)
