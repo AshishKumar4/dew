@@ -26,7 +26,7 @@ pytestmark = pytest.mark.kernel
 
 def row_names_port(monkeypatch, *, port: bool = True):
     """The device's target row names the port for the scan where `port` (`measured_kernel`), as a
-    GPU's row does; off a GPU the port's kernels then interpret."""
+    GPU's row does, and names none where not, as a CPU's does; off a GPU the port's kernels interpret."""
     monkeypatch.setattr(mamba2, "measured_kernel",
                         lambda choice, default: "pallas" if port and choice == "ssd" else default)
 
@@ -85,6 +85,7 @@ def test_the_port_is_as_exact_as_the_xla_scan(monkeypatch, shape, chunk, documen
     run = through(chunk, starts, dy, dfinal)
     with jax.enable_x64(new_val=True):
         truth = jax.tree.map(np.asarray, jax.jit(run)(*widened(operands)))
+    row_names_port(monkeypatch, port=False)
     xla = jax.tree.map(np.asarray, jax.jit(run)(*operands))
     row_names_port(monkeypatch)
     ported = jax.tree.map(np.asarray, jax.jit(run)(*operands))
@@ -110,6 +111,7 @@ def test_a_mamba2_layer_on_the_port_matches_it_on_xla(monkeypatch, dtype, bound)
         out = jnp.asarray(layer.apply(params, x, attention_metadata=metadata))
         return jnp.sum(out.astype(jnp.float32) ** 2), out
 
+    row_names_port(monkeypatch, port=False)
     (_, want), want_grads = jax.jit(jax.value_and_grad(loss, has_aux=True))(params)
     row_names_port(monkeypatch)
     (_, got), got_grads = jax.jit(jax.value_and_grad(loss, has_aux=True))(params)
