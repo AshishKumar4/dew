@@ -161,8 +161,10 @@ HEURISTICS = {
     # One stage for fp32's dhu: three took 254,984 bytes of an A100's 166,912 (c58).
     ("float32", True): {**_A100, **_FP32_WY, "chunk_fwd_h": Tiles(0, 64, 4, 2),
                         "chunk_bwd_dhu": Tiles(0, 64, 4, 1)},
-    ("float32", False): {**_SMALL, **_FP32_WY, "chunk_fwd_h": Tiles(0, 64, 2, 1),
-                         "chunk_bwd_dhu": Tiles(0, 32, 4, 1)},
+    # One stage for fp32's WY backward on a 99 KB block: its looped blocks stage the next one, 102,400
+    # bytes at two stages (sm89).
+    ("float32", False): {**_SMALL, "prepare_wy_repr_bwd": Tiles(64, 64, 8, 1),
+                         "chunk_fwd_h": Tiles(0, 64, 2, 1), "chunk_bwd_dhu": Tiles(0, 32, 4, 1)},
 }
 """Each launch's tiles without a measurement, by activation dtype and whether the GPU's block holds an
 A100's shared memory: fla's own A100 choices, and its narrower picks for 99 KB devices. fp32 runs the
