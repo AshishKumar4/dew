@@ -175,9 +175,12 @@ def test_a_dataset_keeps_its_steps_while_its_record_default_is_held_out():
         np.testing.assert_array_equal(batch["twice"], 2 * batch["id"])
 
 
+def draw(row, rng):
+    return {**row, "draw": rng.integers(2**16)}
+
+
 def test_load_keeps_an_indexed_datasets_random_draws_and_resumed_position_at_the_requested_seed():
-    source = Memory([{"id": index} for index in range(320)]).random_map(
-        lambda row, rng: {**row, "draw": rng.integers(2**16)})
+    source = Memory([{"id": index} for index in range(320)]).random_map(draw)
     options = {"batch": 8, "read": "indexed", "seed": 37, "loading": READ}
     data = load(source, **options)
     train, held = source.holdout(records=256)
