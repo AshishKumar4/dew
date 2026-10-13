@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import dataclasses
-import functools
 import inspect
 import threading
 from collections.abc import Callable, Mapping, Sequence
@@ -16,9 +15,10 @@ from numpy.typing import ArrayLike
 from dew.data.dataset import Batch
 from dew.data.image_codec import decode_image
 from dew.data.images import as_rgb, import_opencv, resize_image
-from dew.data.pipeline import Rejected
+from dew.data.pipeline import DeviceStep, Rejected
 
 if TYPE_CHECKING:
+    import jax
     import torch
 
 
@@ -418,26 +418,20 @@ class EncodeCaptions:
 
 
 @dataclasses.dataclass(frozen=True)
-class DeviceAugment:
+class DeviceAugment(DeviceStep):
+    """Crop, flip and jitter each image of the training batch inside the
+    compiled step, from its record's own key (`augmentation_key`)."""
+
     size: int
     crop_scale: tuple[float, float] = (1.0, 1.0)
     flip: bool = True
     jitter: bool = False
 
-    def __call__(self, batch: Batch) -> Batch:
-        fields = dict(batch)
-        keys = fields.pop("image_augmentation_key")
-        fields["image"] = self._run(fields["image"], keys)
-        return fields
-
-    @functools.cached_property
-    def _run(self):
-        import jax
-
+    def __call__(self, batch: Mapping[str, jax.Array]) -> dict[str, jax.Array]:
         from dew.data.image_augmentation import augment_batch
 
-        return jax.jit(
-            functools.partial(
-                augment_batch, size=self.size, crop_scale=self.crop_scale, flip=self.flip, jitter=self.jitter
-            )
-        )
+        fields = dict(batch)
+        keys = fields.pop("image_augmentation_key")
+        fields["image"] = augment_batch(fields["image"], keys, size=self.size, crop_scale=self.crop_scale,
+                                        flip=self.flip, jitter=self.jitter)
+        return fields

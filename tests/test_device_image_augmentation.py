@@ -28,21 +28,34 @@ def spec(*, backend="device", augment=True, crop_scale=(1.0, 1.0), staging_size=
                       backend=backend) if augment else None)
 
 
-def test_device_pipeline_returns_resident_uint8_and_resumes_exactly():
+def augmented(data, batch):
+    """`batch` as the compiled training step reads it: after the loader's device steps."""
+    for step in data.device:
+        batch = step(batch)
+    return batch
+
+
+def test_device_pipeline_reads_host_batches_the_step_augments_and_resumes_exactly():
+    """The reader delivers host arrays with each record's key; the device steps, which the
+    compiled training step runs, make uint8 images of the output size from them, the same after
+    a resume."""
     data = loader(spec(backend="device", crop_scale=(0.5, 0.9)), batch=4, read="memory", seed=37,
                   loading=READ)
+    assert data.device, "the augmentation runs in the compiled step"
     stream = data.train(DataPartition())
     resumed = data.train(DataPartition())
     try:
-        first = next(stream)
+        read = next(stream)
+        assert not isinstance(read["image"], jax.Array) and "image_augmentation_key" in read
+        first = augmented(data, read)
         assert isinstance(first["image"], jax.Array)
         assert first["image"].dtype == jnp.uint8
         assert first["image"].shape == (4, 12, 12, 3)
         assert set(first) == {"image", "label"}
         saved = stream.get_state()
-        expected = next(stream)
+        expected = augmented(data, next(stream))
         resumed.set_state(saved)
-        actual = next(resumed)
+        actual = augmented(data, next(resumed))
         for name in expected:
             np.testing.assert_array_equal(actual[name], expected[name])
         assert not np.array_equal(first["image"], expected["image"])
@@ -199,11 +212,12 @@ def test_device_draws_follow_record_keys_across_threads_and_partitions():
 def test_grain_workers_only_decode_and_keep_the_parent_device_draws():
     original = spec(backend="device", crop_scale=(0.6, 0.9))
     worker_loading = Loading(workers=1, threads=1, read_buffer=2)
-    parent = loader(original, batch=4, read="memory", seed=37, loading=READ).train(DataPartition())
+    data = loader(original, batch=4, read="memory", seed=37, loading=READ)
+    parent = data.train(DataPartition())
     worker = loader(original, batch=4, read="memory", seed=37, loading=worker_loading).train(DataPartition())
     try:
         for _ in range(3):
-            expected, actual = next(parent), next(worker)
+            expected, actual = augmented(data, next(parent)), augmented(data, next(worker))
             assert isinstance(actual["image"], jax.Array)
             for name in expected:
                 np.testing.assert_array_equal(actual[name], expected[name])

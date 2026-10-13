@@ -18,14 +18,14 @@ from contextlib import ExitStack, closing
 from dataclasses import dataclass, field
 from functools import cached_property, lru_cache
 from pathlib import Path
-from typing import Literal, Protocol, TypedDict, overload, runtime_checkable
+from typing import Literal, Protocol, TypedDict, overload
 
 import grain.python as grain
 import numpy as np
 from array_record.python.array_record_module import ArrayRecordWriter
 
 from dew.data.dataset import _QUIET_STOP_SECONDS, Batch, Records
-from dew.data.pipeline import Record, Rejected
+from dew.data.pipeline import Record, Rejected, Volatile
 from dew.data.retention import LocalRetention
 from dew.data.sources.base import Read, Shard, ShardManifest, Source
 from dew.data.sources.codec import decode, encode
@@ -103,11 +103,6 @@ def _accepted(outputs: Sequence[Record]) -> Outputs:
     return tuple(value for value in outputs if value is not None and not isinstance(value, Rejected))
 
 
-@runtime_checkable
-class _Volatile(Protocol):
-    volatile: bool
-
-
 def _decode_outputs(encoded: bytes) -> Outputs:
     values = decode(encoded)
     if not isinstance(values, tuple):
@@ -135,6 +130,7 @@ class Cache:
 
     CURRENT is read only by an explicit generation open. Each process keeps
     its own writes; it never discovers another filling writer's rows.
+    Volatile prefixes run on every read and produce no completions.
     """
 
     url: str
@@ -524,10 +520,10 @@ class _Writer:
     def process(self, row_id: RowId, ordinal: int, value: Record, transform: Transform | None) -> CachedValue:
         row_key = _row_key(row_id)
         with self.lock:
-            existing = None if self.closing else self.pending.get(row_key)
+            existing = None if self.closing or self.volatile else self.pending.get(row_key)
             completed = (
                 None
-                if self.closing
+                if self.closing or self.volatile
                 else self.index.execute(
                     "SELECT shard, offset, digest FROM inputs WHERE id=?", (row_key,)
                 ).fetchone()
@@ -546,7 +542,7 @@ class _Writer:
         outputs = (value,) if transform is None else transform(ordinal, value)
         if not isinstance(outputs, tuple):
             raise TypeError("cache input transform must return a tuple of outputs")
-        if self.closing:
+        if self.closing or self.volatile:
             return outputs if transform is not None else outputs[0]
         payload = encode(outputs)
         transient = any(isinstance(output, Rejected) and not output.permanent for output in outputs)
@@ -556,11 +552,7 @@ class _Writer:
             existing = self.pending.get(row_key)
             if existing is not None:
                 if existing != payload:
-                    if not self.volatile:
-                        raise ValueError(f"conflicting cache duplicate for row {row_key}")
-                    _log.warning(
-                        "volatile cache conflict for pending row %s; keeping the first copy", row_key
-                    )
+                    raise ValueError(f"conflicting cache duplicate for row {row_key}")
                 cached = _decode_outputs(existing)
                 return cached if transform is not None else cached[0]
             completed = self.index.execute(
@@ -568,9 +560,7 @@ class _Writer:
             ).fetchone()
             if completed is not None:
                 if _hash(payload) != completed[2]:
-                    if not self.volatile:
-                        raise ValueError(f"conflicting cache duplicate for row {row_key}")
-                    _log.warning("volatile cache conflict for row %s; keeping the first copy", row_key)
+                    raise ValueError(f"conflicting cache duplicate for row {row_key}")
                 return outputs if transform is not None else outputs[0]
             if not transient and self.admitting:
                 self._admit(row_key, payload)
@@ -824,7 +814,7 @@ class _CachedMap(grain.MapDataset[CachedValue]):
                 writer = _Writer(
                     self.cache,
                     self.key,
-                    volatile=isinstance(self.transform, _Volatile) and self.transform.volatile,
+                    volatile=isinstance(self.transform, Volatile) and self.transform.volatile,
                     expected=len(self),
                 )
                 finalizer = weakref.finalize(self, writer.close)
@@ -950,7 +940,7 @@ class _CachedIterator(grain.DatasetIterator):
     ):
         super().__init__(parent)
         self.parent, self.shard, self.transform = parent, shard, transform
-        self.writer = _Writer(cache, key, volatile=isinstance(transform, _Volatile) and transform.volatile)
+        self.writer = _Writer(cache, key, volatile=isinstance(transform, Volatile) and transform.volatile)
         self.ordinal = 0
 
     def __next__(self):
