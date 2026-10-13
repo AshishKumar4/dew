@@ -325,6 +325,23 @@ def test_a_v4_checkpoint_refuses_what_its_format_cannot_hold(refused, message):
         refused()
 
 
+@pytest.mark.parametrize("codec, scale", [
+    (codecs.fp8_blocks(), "_scale_inv"),
+    (codecs.deepseek_v4(128, fp4_experts=False), ".scale"),
+], ids=["fp8-blocks", "v4"])
+def test_a_weight_whose_scale_is_lost_is_refused_rather_than_loaded_as_its_codes(codec, scale):
+    """Each format finds its weights by their scales; a weight stored as FP8
+    codes with no scale beside it is refused by name at the shared reader,
+    where it would otherwise load its codes as values."""
+    codes = np.zeros((128, 128), ml_dtypes.float8_e4m3fn)
+    stem = "kept.weight"
+    kept = {stem: codes, stem.removesuffix(".weight") + scale if scale == ".scale" else stem + scale:
+            np.ones((1, 1), np.float32)}
+    with pytest.raises(ValueError, match=r"lost\.weight arrive encoded and the checkpoint holds no scale"):
+        codec.dequantize({**kept, "lost.weight": codes})
+    assert set(codec.dequantize(kept)) == {stem}
+
+
 V4_TINY = Path(__file__).parent / "fixtures" / "hf" / "deepseek-v4-tiny"
 
 V4_QUANTIZED = re.compile(r"(attn\.(wq_a|wq_b|wkv|wo_a|wo_b)|attn\.indexer\.wq_b|ffn\.shared_experts\.w[123]"
