@@ -28,7 +28,6 @@ from dew.nn.attention import (
     combined_attention_mask,
     cudnn_runs,
     kernel_for_materialized_mask,
-    local_attention,
     max_attention_logits,
     open_kv_cache,
     reference_only,
@@ -40,6 +39,7 @@ from dew.nn.flops import attention_flops, projection_flops
 from dew.nn.inputs import Admitted, AttentionMetadata, coordinates_of
 from dew.nn.kernels.generation import backend
 from dew.nn.kv_cache import TABLE, Append, KVCache, KVStore, filled_slots, rotated, write_cache
+from dew.nn.local_attention import local_attention
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.precision import at_least_fp32, scaled
 from dew.nn.protocols import ProjectionGroup

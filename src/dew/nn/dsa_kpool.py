@@ -50,7 +50,7 @@ from .mixer_base import MixerBase, MixerContext
 from .mla import INDEXER, open_mla_cache
 from .precision import at_least_fp32
 from .sharding import RESIDUAL, constrain, down_projection
-from .sparse_selection import selection_mask
+from .sparse_selection import index_scores, selection_mask, top_k_selection
 
 
 def _real_slots(valid, count: int):
@@ -186,11 +186,7 @@ class KPoolIndexer(nn.Module):
         valid = packed[..., -1] > 0
         query = self.wq_b(q_resid).reshape(batch, length, self.n_heads, self.head_dim)
         pool_keys, pool_indices, pool_valid = self._pools(packed)
-        wide = at_least_fp32(query.dtype)
-        scores = jnp.einsum('bshd,bpd->bshp', query.astype(wide), pool_keys.astype(wide))
-        scores = jnp.maximum(scores * (self.head_dim ** -0.5), 0)
-        weights = self.weights_proj(x).astype(wide) * (self.n_heads ** -0.5)
-        index_scores = jnp.einsum('bsh,bshp->bsp', weights, scores)
+        scores = index_scores(query, pool_keys, self.weights_proj(x), self.precision)
         # A pool is a candidate iff the query sees its last token
         # (modeling_glm5_next.py:832-839); its indices are clamped only so
         # the gather is legal, the validity test excludes it on its own.
@@ -198,15 +194,12 @@ class KPoolIndexer(nn.Module):
         pool_visible = jnp.take_along_axis(
             visible, jnp.broadcast_to(pool_end[:, None, :], (batch, length, pool_end.shape[-1])), axis=-1)
         candidates = jnp.logical_and(pool_visible, pool_valid[:, None])
-        index_scores = jnp.where(candidates, index_scores, jnp.finfo(wide).min)
-        # The reference drops the pools no row fills (:969-972) before this
-        # minimum; a dropped pool is never a candidate, and a selected
+        # The reference drops the pools no row fills (:969-972) before its
+        # ranking; a dropped pool is never a candidate, and a selected
         # non-candidate contributes no indices, so the selection is the same.
-        select_k = min(self.top_k // self.kpool, index_scores.shape[-1])
-        chosen = jax.lax.top_k(index_scores, select_k, is_stable=True)[1]
-        chosen_valid = jnp.take_along_axis(candidates, chosen, axis=-1)
-        chosen_indices = pool_indices[jnp.arange(batch)[:, None, None], chosen]
-        tokens = jnp.where(chosen_valid[..., None], chosen_indices, -1).reshape(batch, length, -1)
+        chosen = top_k_selection(scores, candidates, self.top_k // self.kpool)
+        chosen_indices = pool_indices[jnp.arange(batch)[:, None, None], jnp.maximum(chosen, 0)]
+        tokens = jnp.where(chosen[..., None] >= 0, chosen_indices, -1).reshape(batch, length, -1)
         if self.always_select_tail and self.kpool > 1:
             tokens = jnp.concatenate([tokens, self._tail(visible, valid)], axis=-1)
         return tokens
