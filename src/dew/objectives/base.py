@@ -40,6 +40,7 @@ from jax.tree_util import Partial
 from typing_extensions import TypeIs, TypeVar
 
 from dew.artifacts import Artifact, Artifacts, TokenScores
+from dew.nn.precision import compensated_sum
 from dew.records import JSON
 
 if TYPE_CHECKING:
@@ -423,6 +424,7 @@ def _ruled_jvp(primals, tangents):
                                     zip(jax.tree.leaves(rule), jax.tree.leaves(moved), strict=True))
 
 
+
 class Objective(ABC, Generic[Loss, Effects]):
     """Defines what is learned: the parameters, the loss and what evaluation produces."""
 
@@ -745,18 +747,19 @@ class Objective(ABC, Generic[Loss, Effects]):
         number of entries summed. When the batch is an evaluation batch with
         `VALID_ROWS`, a repeat row has zero weight in both, so a loss and every
         batch-wide term computed through this count each real record once. Without
-        `VALID_ROWS`, as in training, this is `jnp.sum` and the size.
+        `VALID_ROWS`, as in training, this is the sum (`compensated_sum`) and the size.
         """
         dtype = jnp.promote_types(values.dtype, jnp.float32)
         axes = (tuple(range(values.ndim)) if axis is None
                 else (axis,) if isinstance(axis, int) else tuple(axis))
         if VALID_ROWS not in batch:
-            return Ratio(jnp.sum(values, axes), jnp.asarray(math.prod(values.shape[a] for a in axes), dtype))
+            count = math.prod(values.shape[a] for a in axes)
+            return Ratio(compensated_sum(values, axes), jnp.asarray(count, dtype))
         held = (rows,) if isinstance(rows, int) else rows
         shape = [values.shape[a] if a in held else 1 for a in range(values.ndim)]
         real = Objective.row_weights(batch, math.prod(values.shape[a] for a in held)).reshape(shape) > 0
         # Selected rather than multiplied, so a repeat holding a NaN still adds nothing.
-        return Ratio(jnp.sum(jnp.where(real, values, jnp.zeros((), values.dtype)), axes),
+        return Ratio(compensated_sum(jnp.where(real, values, jnp.zeros((), values.dtype)), axes),
                      jnp.sum(jnp.broadcast_to(real, values.shape).astype(dtype), axes))
 
     @staticmethod
