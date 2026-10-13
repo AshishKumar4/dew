@@ -512,7 +512,7 @@ class MultiHeadLatentAttention(nn.Module):
         latent, rot = self._latents(x, place)
         if decode:
             q_rot, key, value, mask = self._decode_step(
-                x, q_rot, rot, latent, q_resid, logical_positions, valid, segment_ids, kv_store)
+                x, q_rot, rot, latent, q_resid, logical_positions, valid, kv_store)
             causal = False
         else:
             if positions is None:
@@ -590,13 +590,11 @@ class MultiHeadLatentAttention(nn.Module):
             implementation=implementation, causal=causal, mask=mask)
         return self._output(attention, x)
 
-    def _decode_step(self, x, q_rot, rot, latent, q_resid, logical_positions, valid, segment_ids, kv_store):
+    def _decode_step(self, x, q_rot, rot, latent, q_resid, logical_positions, valid, kv_store):
         """One decode step's rotated query heads, its keys and values with the
         cache's joined, and the mask over them: the expanded keys and the
         indexer's selection under the sparse layout, or the latents expanded
         after the append under the dense one."""
-        if segment_ids is not None:
-            raise ValueError("decode accepts row validity, not packed segment_ids")
         # The cache hands out the slots first, because the rope heads
         # rotate at absolute positions: the queries at this step's slots
         # and the appended latents at theirs, while the cached ones keep

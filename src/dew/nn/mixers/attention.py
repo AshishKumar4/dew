@@ -631,12 +631,10 @@ class CausalSelfAttention(nn.Module):
                 raise ValueError(
                     "a bidirectional canvas reads its encoder prefix as dense, full-precision "
                     "keys; it takes the default kv_cache layout")
-            elif self.kv_shared or segment_ids is not None:
+            elif self.kv_shared:
                 raise ValueError(
                     "a bidirectional canvas over a cache shares no keys across "
-                    "layers and packs no segments: a sharing layer owns no "
-                    "cache of its own, and packed positions do not continue "
-                    "past a prefix")
+                    "layers: a sharing layer owns no cache of its own")
             elif not self.has_variable("cache", "cached_key"):
                 raise ValueError(
                     "a bidirectional canvas has no KV cache of its own: prefill "
