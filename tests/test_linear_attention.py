@@ -469,6 +469,23 @@ def test_the_masked_conv_splits_at_a_call_boundary():
     assert largest(final, carried) < 1e-5
 
 
+def test_a_packed_prefill_leaves_only_its_last_documents_conv_history():
+    """A row packing two documents, the last two tokens long, leaves the history its continuation
+    reads: the last document's two tokens and zeros where the first document's would be, so the
+    next call's tokens convolve as that document's would on its own."""
+    kernel = jnp.asarray(np.random.default_rng(3).normal(size=(6, 4)), jnp.float32)
+    x = jnp.asarray(np.random.default_rng(4).normal(size=(1, 7, 6)), jnp.float32)
+    segments = jnp.asarray([[1, 1, 1, 1, 1, 2, 2]])
+    valid = jnp.ones((1, 7), bool)
+    _, history = _masked_conv1d(x, kernel, valid, segments=segments)
+    np.testing.assert_array_equal(np.asarray(history[:, 0]), 0)
+    np.testing.assert_array_equal(np.asarray(history[:, 1:]), np.asarray(x[:, 5:]))
+    following = jnp.asarray(np.random.default_rng(5).normal(size=(1, 3, 6)), jnp.float32)
+    continued, _ = _masked_conv1d(following, kernel, jnp.ones((1, 3), bool), history)
+    alone, _ = _masked_conv1d(jnp.concatenate([x[:, 5:], following], axis=1), kernel, jnp.ones((1, 5), bool))
+    np.testing.assert_array_equal(np.asarray(continued), np.asarray(alone[:, 2:]))
+
+
 def test_the_layer_reads_a_holed_row_as_the_row_without_its_holes(reference, geometry):
     """The mixer's own contract, through its public call: the states of the
     real tokens of a row with padded slots between them are the states of
