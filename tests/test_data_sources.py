@@ -3,8 +3,10 @@
 import dataclasses
 import hashlib
 import io
+import itertools
 import json
 import pickle
+import shutil
 import tarfile
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -859,6 +861,77 @@ def test_jsonl_offset_index_is_mapped_and_reopened_instead_of_pickled_as_rows():
     resumed = pickle.loads(pickle.dumps(indexed))
     assert resumed[1] == {"id": 1}
     assert isinstance(resumed.tables[0], np.memmap)
+
+
+@pytest.mark.parametrize("format", ["jsonl", "text", "csv"])
+def test_copied_offset_indexes_define_one_order_at_different_mounts(tmp_path, format):
+    """Indexed copies agree on their compiled order and read the same records."""
+    from dew.data.compile import compile
+
+    first = tmp_path / "host0" / "corpus"
+    first.mkdir(parents=True)
+    suffix = "txt" if format == "text" else format
+    for shard in range(2):
+        rows = [f"row {index}" for index in range(2 * shard, 2 * shard + 2)]
+        payload = ("text\n" if format == "csv" else "") + "\n".join(
+            json.dumps({"text": row}) if format == "jsonl" else row for row in rows
+        ) + "\n"
+        (first / f"part-{shard}.{suffix}").write_text(payload)
+    Files(str(first), format=format).provision()
+    second = tmp_path / "elsewhere" / "mounted"
+    shutil.copytree(first, second)
+
+    def read(directory):
+        reader = compile(Files(str(directory), format=format).repeat().batch(2),
+                         read="indexed", loading=Loading(workers=0)).train(DataPartition())
+        try:
+            return reader.identity(), [text for batch in itertools.islice(reader, 2)
+                                       for text in batch["text"].tolist()]
+        finally:
+            reader.close()
+
+    first_identity, first_rows = read(first)
+    second_identity, second_rows = read(second)
+    assert first_rows == second_rows == [f"row {index}" + ("\n" if format == "text" else "")
+                                        for index in range(4)]
+    assert first_identity == second_identity
+
+
+def test_a_same_size_middle_write_changes_a_multifile_readers_identity(tmp_path):
+    """An exact multifile reader identifies bytes between every shard's endpoints."""
+    from dew.data.compile import compile
+
+    for shard in range(33):
+        (tmp_path / f"part-{shard:02d}.jsonl").write_text(
+            json.dumps({"id": shard, "text": "a" * (192 * 1024)}) + "\n")
+
+    def reader():
+        return compile(Files(str(tmp_path), format="jsonl").repeat().batch(1),
+                       read="streamed", loading=Loading(workers=0, threads=1, read_buffer=1)
+                       ).train(DataPartition())
+
+    before = reader()
+    try:
+        identity = before.identity()
+        batch = next(before)
+        assert 0 <= int(batch["id"][0]) < 33
+        assert batch["text"].tolist() == ["a" * (192 * 1024)]
+        position = before.get_state()
+    finally:
+        before.close()
+    path = tmp_path / "part-16.jsonl"
+    size = path.stat().st_size
+    with path.open("r+b") as file:
+        file.seek(size // 2)
+        file.write(b"b")
+    assert path.stat().st_size == size
+    after = reader()
+    try:
+        assert after.identity() != identity
+        with pytest.raises(ValueError):
+            after.set_state(position)
+    finally:
+        after.close()
 
 
 def test_published_file_facts_avoid_metadata_probes_and_verify_the_index(monkeypatch):

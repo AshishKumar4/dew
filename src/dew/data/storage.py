@@ -10,6 +10,7 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import tempfile
 import threading
 import time
@@ -307,22 +308,41 @@ class BoundedFileCache(WholeFileCacheFileSystem):
 _MEMORY_LOCK = threading.RLock()
 
 
-_BLOCK_BYTES = 64 * 1024
+def _local_file_key(path: str, size: int) -> tuple[str, int, int, int]:
+    """The local metadata that invalidates a persisted content checksum."""
+    realpath = os.path.realpath(path)
+    metadata = os.stat(realpath)
+    if metadata.st_size != size:
+        raise OSError(f"local file changed before its content was versioned: {path}")
+    return realpath, size, metadata.st_mtime_ns, metadata.st_ino
 
 
-def content_version(fs: AbstractFileSystem, path: str, size: int, blocks: int = 64) -> str:
-    """A file's version as every host holding a copy of it names it. An object
-    store's ETag or generation is the object's own, so callers keep it; a local
-    file's `ukey` names where it is mounted and when it was written, so a local
-    copy is named by its size and a digest of `blocks` 64 KiB blocks spread
-    evenly over it, its last included: a sample, not a checksum, since a corpus
-    may be terabytes (a store of many files samples each of them less)."""
-    digest = hashlib.sha256(str(size).encode())
-    with fs.open(path, "rb") as file:
-        for block in range(blocks if size else 0):
-            file.seek(max(0, (size - _BLOCK_BYTES) * block // max(blocks - 1, 1)))
-            digest.update(file.read(_BLOCK_BYTES))
-    return digest.hexdigest()
+def content_version(fs: AbstractFileSystem, path: str, size: int) -> str:
+    """A local file's full SHA256, persisted in Dew's cache until its metadata changes."""
+    directory = Path(dew_cache_dir()) / "content-versions"
+    directory.mkdir(parents=True, exist_ok=True)
+    lock = hashlib.sha256(os.path.realpath(path).encode()).hexdigest()
+    with FileLock(str(directory / (lock + ".lock"))), contextlib.closing(
+        sqlite3.connect(directory / "versions.sqlite")
+    ) as versions:
+        key = _local_file_key(path, size)
+        fingerprint = hashlib.sha256(json.dumps(key).encode()).hexdigest()
+        versions.execute(
+            "CREATE TABLE IF NOT EXISTS versions (file TEXT PRIMARY KEY, sha256 TEXT NOT NULL)"
+        )
+        cached = versions.execute("SELECT sha256 FROM versions WHERE file = ?", (fingerprint,)).fetchone()
+        if cached is not None:
+            return str(cached[0])
+        with fs.open(path, "rb") as file:
+            digest = hashlib.sha256()
+            while payload := file.read(2**20):
+                digest.update(payload)
+        checksum = digest.hexdigest()
+        if _local_file_key(path, size) != key:
+            raise OSError(f"local file changed while its content was versioned: {path}")
+        with versions:
+            versions.execute("INSERT INTO versions VALUES (?, ?)", (fingerprint, checksum))
+        return checksum
 
 
 def local(fs: AbstractFileSystem) -> bool:
