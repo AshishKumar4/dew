@@ -216,7 +216,7 @@ def train(source: Pretrained, ids: np.ndarray):
     """
     import grain.python as pygrain
 
-    from dew.data.dataset import Dataset
+    from dew.data.dataset import Loader
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.objectives.diffusion.masked import MaskedDiffusionObjective
     from dew.training import Trainer
@@ -235,7 +235,7 @@ def train(source: Pretrained, ids: np.ndarray):
     entries = [{"text": rows[row]} for row in range(count)]
     stream = (pygrain.MapDataset.source(entries).repeat().to_iter_dataset()
               .batch(count, drop_remainder=True))
-    data = Dataset(train=lambda partition: iter(stream), val=None, records=count, batch=count)
+    data = Loader(train=lambda partition: iter(stream), val=None, records=count, batch=count)
     return Trainer(objective, optax.sgd(RATE), key=jax.random.key(SEED)).fit(
         data, steps=1, log_every=1)
 
