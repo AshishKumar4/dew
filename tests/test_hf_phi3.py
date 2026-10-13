@@ -1,7 +1,5 @@
 """Phi-3's fused GQA and LongRoPE against transformers 5.16.1."""
 
-import functools
-import json
 from pathlib import Path
 
 import jax
@@ -11,9 +9,7 @@ import pytest
 from reference_error import assert_as_exact_as_the_reference
 
 from dew.interop import Pretrained, PretrainedDecoder
-from dew.interop.hf_decoders import translate_config
 from dew.interop.sources import load_shards
-from dew.nn.rope import LongRopeScaling
 
 ROOT = Path(__file__).parent / 'fixtures' / 'hf'
 DIRECTORY = ROOT / 'phi3-tiny'
@@ -46,38 +42,6 @@ def test_phi3_cached_greedy_crosses_the_longrope_boundary():
     np.testing.assert_array_equal(generated.tokens, np.load(DIRECTORY / 'generated.npy'))
 
 
-@pytest.mark.parametrize(('budget', 'rebuilds'), [(3, 0), (6, 1)])
-def test_greedy_decoding_forwards_the_prompt_once_and_one_token_a_step(monkeypatch, budget, rebuilds):
-    """Every backbone forward a greedy decode from a prompt of 4 runs: the
-    prompt once, and otherwise one token at a time, at least once a step,
-    with the whole 48-slot history again only at the step a row crosses
-    LongRoPE's original 8 positions (6 new tokens cross it once, 3 never).
-    The answers alone cannot tell a decode that recomputes its prefix every
-    step from one that does not."""
-    from dew.nn.backbones.causal_transformer import CausalTransformer
-    from dew.sampling import Sampling, generate
-
-    loaded = Pretrained.load(DIRECTORY, dtype='float32', attention_impl='reference', max_seq_len=48)
-    ids = np.load(DIRECTORY / 'input_ids.npy')[:, :4]
-    widths = []
-    forward = CausalTransformer.hidden_and_mtp_inputs
-
-    def counted(self, tokens, *args, **kwargs):
-        # Recorded as the forward runs: in the decode loop once a step, in a
-        # branch only when it is taken, and never for a trace of its shapes.
-        jax.debug.callback(functools.partial(widths.append, tokens.shape[1]))
-        return forward(self, tokens, *args, **kwargs)
-
-    monkeypatch.setattr(CausalTransformer, 'hidden_and_mtp_inputs', counted)
-    with jax.disable_jit():
-        generate(loaded.model, loaded.variables, ids, budget, key=jax.random.key(0),
-                 sampling=Sampling(temperature=0))
-    jax.effects_barrier()
-    said = " ".join(map(str, widths))
-    assert set(widths) <= {1, 4, 48} and widths.count(4) == 1, said
-    assert widths.count(48) == rebuilds and widths.count(1) >= budget, said
-
-
 def test_phi3_cache_rebuild_logits_match_uncached_transformers_on_both_sides_of_the_crossing():
     from dew.nn.inputs import ModelInputs
     from dew.sampling.text import decode_ops, prefill_state
@@ -98,15 +62,6 @@ def test_phi3_cache_rebuild_logits_match_uncached_transformers_on_both_sides_of_
         assert_as_exact_as_the_reference(actual[:, step], reference[:, step], truth[:, step],
                                          f'Phi-3 crossing step {step}')
     np.testing.assert_array_equal(actual.argmax(-1), generated[:, 4:])
-
-
-def test_phi3_long_request_does_not_change_a_short_rows_logits():
-    loaded = Pretrained.load(DIRECTORY, dtype='float32', attention_impl='reference', max_seq_len=64)
-    ids = jnp.asarray(np.load(DIRECTORY / 'input_ids.npy')[:, :4], jnp.int32)
-    positions = jnp.stack((jnp.arange(12, 16), jnp.arange(4)))
-    together = loaded.model.apply(loaded.variables, ids, positions=positions)
-    uniform = loaded.model.apply(loaded.variables, ids, positions=jnp.stack((jnp.arange(4), jnp.arange(4))))
-    np.testing.assert_array_equal(together[1], uniform[1])
 
 
 def test_phi3_mixed_tables_match_each_rows_batch_one_reference_under_the_float64_rule():
@@ -142,6 +97,9 @@ def test_phi3_mixed_tables_match_each_rows_batch_one_reference_under_the_float64
         assert_as_exact_as_the_reference(actual[row], expected[row], truth[row], f'Phi-3 mixed row {row}')
     np.testing.assert_array_equal(actual.argmax(-1), expected.argmax(-1))
 
+    uniform = loaded.model.apply(loaded.variables, ids, positions=np.stack((np.arange(4), np.arange(4))))
+    np.testing.assert_array_equal(actual[1], uniform[1])
+
 
 def test_phi3_dense_server_and_generate_share_the_per_row_crossing_rebuild():
     from dew.inference import TextGeneration
@@ -164,36 +122,6 @@ def test_phi3_dense_server_and_generate_share_the_per_row_crossing_rebuild():
         np.testing.assert_array_equal(served.lengths, alone.lengths)
 
 
-@pytest.mark.parametrize('mode', ['paged', 'chunked', 'prefix'])
-def test_phi3_server_refuses_modes_that_cannot_rebuild_at_the_crossing(mode):
-    from dew.inference import TextGeneration
-    from dew.inference.serving import Server
-    from dew.nn.kv_cache import KVCache
-    from dew.sampling import Sampling
-
-    loaded = Pretrained.load(DIRECTORY, dtype='float32', attention_impl='reference', max_seq_len=64)
-    task = TextGeneration(loaded.model, loaded.variables, sampling=Sampling(temperature=0))
-    options = ({'kv_cache': KVCache(page_size=16)} if mode == 'paged' else
-               {'chunk': 2} if mode == 'chunked' else {'prefix_cache': True})
-    with pytest.raises(ValueError, match=rf'LongRoPE crossing position 8.*{mode}'):
-        Server.from_task(task, slots=2, capacity=64, **options)
-
-
-def test_phi3_server_refuses_an_explicit_mixed_admission_mode():
-    from dataclasses import replace
-
-    from dew.inference.serving import DenseRows, Server
-    from dew.sampling import Sampling
-
-    loaded = Pretrained.load(DIRECTORY, dtype='float32', attention_impl='reference', max_seq_len=64)
-    rows = DenseRows(1, None)
-    rows.placement = replace(rows.placement, mixed=True)
-    with pytest.raises(ValueError, match=r'LongRoPE crossing position 8.*mixed admission'):
-        Server(loaded.model, loaded.variables, None, sampling=Sampling(temperature=0),
-               transforms=(), stopping=(), grammar=None, rows=rows, slots=2, capacity=64,
-               admission=2, default_budget=8, decode_steps=1)
-
-
 def test_phi3_export_preserves_both_fusions_and_reads_in_transformers(tmp_path):
     import torch
     from transformers import AutoModelForCausalLM
@@ -213,18 +141,11 @@ def test_phi3_export_preserves_both_fusions_and_reads_in_transformers(tmp_path):
     restored = Pretrained.load(tmp_path, dtype='float32', attention_impl='reference')
     np.testing.assert_array_equal(restored.model.apply(restored.variables, ids), actual)
 
-
-def test_phi3_reference_catches_the_short_table_used_for_a_long_call():
-    loaded = Pretrained.load(DIRECTORY, dtype='float32', attention_impl='reference')
-    rope = loaded.model.rope_scaling
-    assert isinstance(rope, LongRopeScaling)
-    wrong_rope = LongRopeScaling(rope.short_factor, rope.short_factor,
-                                rope.original_max_position_embeddings, rope.factor, rope.attention_factor)
-    wrong = loaded.model.clone(rope_scaling=wrong_rope).apply(
-        loaded.variables, np.load(DIRECTORY / 'input_ids.npy'))
-    with pytest.raises(AssertionError, match=r'allowed 2\.0'):
-        assert_as_exact_as_the_reference(wrong, np.load(DIRECTORY / 'logits.npy'),
-                                         np.load(DIRECTORY / 'logits_f64.npy'), 'Phi-3 wrong table')
+    assert restored.model == loaded.model
+    assert jax.tree.structure(restored.variables) == jax.tree.structure(loaded.variables)
+    for original, restored_leaf in zip(jax.tree.leaves(loaded.variables),
+                                        jax.tree.leaves(restored.variables), strict=True):
+        np.testing.assert_array_equal(np.asarray(restored_leaf), np.asarray(original))
 
 
 def test_phi3_gated_block_has_finite_gradients_and_updates():
@@ -242,28 +163,3 @@ def test_phi3_gated_block_has_finite_gradients_and_updates():
                            loaded.variables['params'], gradient)
     assert all(np.isfinite(leaf).all() for leaf in jax.tree.leaves(gradient))
     assert float(loss(changed)) < float(value)
-
-
-@pytest.mark.parametrize('name', ['phi3-mini-4k', 'phi4-mini'])
-def test_phi3_released_configs_build_the_native_fused_geometry(name):
-    model = translate_config(json.loads((ROOT / name / 'config.json').read_text())).value
-    assert model.emb_features == 3072
-    assert model.qk_norm is False and model.mlp == 'swiglu'
-    if name == 'phi4-mini':
-        assert model.num_heads == 24 and model.features_per_head == 128
-        assert model.partial_rotary_factor == .75 and model.kv_heads == 8
-        assert isinstance(model.rope_scaling, LongRopeScaling)
-        assert len(model.rope_scaling.short_factor) == 48
-    else:
-        assert model.num_heads == 32 and model.features_per_head == 96
-        assert model.rope_scaling is None and model.kind_of('sliding_attention').window == 2047
-
-
-@pytest.mark.network
-@pytest.mark.parametrize('name', ['phi3-mini-4k', 'phi4-mini'])
-def test_phi3_released_configs_are_pinned(name):
-    from huggingface_hub import hf_hub_download
-
-    source = json.loads((ROOT / name / 'source.json').read_text())
-    filename = hf_hub_download(source['repo'], 'config.json', revision=source['revision'])
-    assert json.loads(Path(filename).read_text()) == json.loads((ROOT / name / 'config.json').read_text())

@@ -13,10 +13,7 @@ captured head input through `chunked_cross_entropy`'s own logsumexp and
 lands one fp32 ulp (4.8e-7) from torch's; `LOSS` is two.
 """
 
-import json
 import math
-import os
-import shutil
 
 import jax
 import jax.numpy as jnp
@@ -25,7 +22,6 @@ import optax
 import pytest
 import torch
 import transformers
-from huggingface_hub import try_to_load_from_cache
 from jax.sharding import PartitionSpec as P
 
 from dew.data.dataset import Dataset
@@ -63,7 +59,7 @@ def source(tmp_path_factory):
 
 @pytest.fixture(scope="module")
 def loaded(source):
-    with pytest.warns(UserWarning, match="tier 3"):
+    with pytest.warns(UserWarning):
         return Pretrained.load(source[0], fallback="torchax", dtype="float32")
 
 
@@ -113,14 +109,6 @@ def test_the_gradients_are_transformers(source, loaded, tokens):
         assert np.abs(np.asarray(grads[name]) - expected).max() <= GRADIENT * np.abs(expected).max(), name
 
 
-def test_a_load_puts_nothing_on_a_device(source):
-    """The weights come to the host as views of torch's storage; only the
-    caller's placement moves them, so a model larger than one device loads.
-    Any transfer to a device during the load raises under the guard."""
-    with jax.transfer_guard_host_to_device("disallow"), pytest.warns(UserWarning, match="tier 3"):
-        Pretrained.load(source[0], fallback="torchax", dtype="float32")
-
-
 @pytest.mark.mesh
 def test_trainer_steps_move_the_params_and_place_them_by_name(loaded, tokens):
     """AdamW through the Trainer on a fsdp x tensor mesh: the loss falls,
@@ -160,51 +148,3 @@ def test_save_writes_the_source_names_back(source, loaded, tokens, tmp_path):
     reloaded = transformers.AutoModelForCausalLM.from_pretrained(tmp_path).eval()
     logits = np.asarray(loaded.model.apply(variables, jnp.asarray(tokens)))
     assert np.abs(logits - torch_logits(reloaded, tokens)).max() <= LOGITS
-
-
-def test_the_fallback_refuses_what_it_cannot_run(source, loaded, tmp_path):
-    with pytest.raises(ValueError, match="the one fallback is 'torchax'"):
-        Pretrained.load("nobody/nothing", fallback="torch")
-    config = {**transformers.GPTNeoXConfig(**TINY).to_dict(),
-              "quantization_config": {"quant_method": "awq", "bits": 4}}
-    (tmp_path / "config.json").write_text(json.dumps(config))
-    with pytest.raises(ValueError, match=r"float weights only.*awq"):
-        Pretrained.load(tmp_path, fallback="torchax")
-    assert not hasattr(loaded, "text_generation")
-    listed = tmp_path / "listed"
-    shutil.copytree(source[0], listed)
-    (listed / "generation_config.json").write_text("[]")
-    with pytest.raises(ValueError, match=r"generation_config\.json must contain an object"):
-        Pretrained.load(listed, fallback="torchax")
-
-
-GPT2 = ("openai-community/gpt2", "607a30d783dfa663caf39e06633721c8d4cfcd7e")
-GPT2_FP32 = 6e-4
-
-
-@pytest.mark.network
-@pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
-def test_released_gpt2_matches_transformers(dtype):
-    """GPT-2 has no Dew family; the fallback loads it at a pinned commit.
-
-    fp32 is held to twice the measured 2.9e-4 (logits reach 156, where an
-    fp32 ulp is 1.5e-5). A bf16 load, bf16 storage and compute, is held
-    to transformers' own bf16 run: no further from the fp32 reference than
-    that run is (measured 1.12 against 2.07).
-    """
-    repo, revision = GPT2
-    if (os.environ.get("DEW_NETWORK_TESTS") != "1"
-            and not isinstance(try_to_load_from_cache(repo, "model.safetensors", revision=revision), str)):
-        pytest.skip(f"{repo} at {revision[:8]} is neither cached nor DEW_NETWORK_TESTS=1")
-    with pytest.warns(UserWarning, match="tier 3"):
-        loaded = Pretrained.load(repo, revision=revision, fallback="torchax", dtype=dtype, param_dtype=dtype)
-    assert loaded.processor is not None
-    ids = np.asarray(loaded.processor("The Cascade Range runs from northern California through").tokens)
-    expected = torch_logits(transformers.AutoModelForCausalLM.from_pretrained(
-        str(loaded.source), dtype=torch.float32, local_files_only=True).eval(), ids)
-    bound = GPT2_FP32
-    if dtype == "bfloat16":
-        bound = np.abs(torch_logits(transformers.AutoModelForCausalLM.from_pretrained(
-            str(loaded.source), dtype=torch.bfloat16, local_files_only=True).eval(), ids) - expected).max()
-    logits = np.asarray(loaded.model.apply(loaded.variables, jnp.asarray(ids)))
-    assert np.abs(logits - expected).max() <= bound

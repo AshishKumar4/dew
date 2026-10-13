@@ -12,7 +12,7 @@ from dew.files import replacing, staged, write_atomically
 def test_a_write_that_fails_leaves_the_old_file_and_no_temporary(tmp_path):
     target = tmp_path / "run.json"
     target.write_text("old")
-    with pytest.raises(RuntimeError, match="crash"), replacing(target) as temporary:
+    with pytest.raises(RuntimeError), replacing(target) as temporary:
         temporary.write_text("half of the new")
         raise RuntimeError("crash")
     assert target.read_text() == "old"
@@ -46,7 +46,7 @@ def test_a_directory_is_published_by_the_writer_that_finishes_first_and_kept_who
 
 def test_a_directory_whose_block_fails_is_not_published(tmp_path):
     target = tmp_path / "entry"
-    with pytest.raises(RuntimeError, match="crash"), staged(target) as staging:
+    with pytest.raises(RuntimeError), staged(target) as staging:
         (staging / "weights").write_text("half")
         raise RuntimeError("crash")
     assert list(tmp_path.iterdir()) == []

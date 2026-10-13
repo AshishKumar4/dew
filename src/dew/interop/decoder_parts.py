@@ -1044,6 +1044,72 @@ def renamed_name(renames: Renames, dew_name: str, config: Mapping[str, object]) 
     return None if name is None else renamed(name, renames, export=True)
 
 
+type BlockPath = Callable[[str], tuple[str, ...] | None]
+"""A family's path for one block tensor, named as its trunk's layer 0's."""
+
+
+def _declared_depth(name: str, index: int | str | None, declared: int) -> int:
+    """`index`, a depth's number or its digits, refused unless it is one of the `declared` depths."""
+    depth = int(index) if isinstance(index, str) and index.isdigit() else index
+    if not isinstance(depth, int) or not 0 <= depth < declared:
+        raise ValueError(f"{name} names an undeclared prediction depth")
+    return depth
+
+
+def prediction_path(name: str, prefix: str, index: int | str | None, declared: int, tail: str,
+                    leaves: Mapping[str, tuple[str, ...]], block: BlockPath) -> tuple[str, ...] | None:
+    """The path of `name`, a tensor of prediction depth (or drafting stage)
+    `index` under the variables' `{prefix}_{index}`: its own leaf in
+    `leaves` by its `tail`, or its block's, which `block` places as the
+    trunk's layer 0's and this rebases. An index past the `declared` count
+    names no depth the model builds, and is refused by name; the families
+    keep their own spellings and architectures."""
+    depth = _declared_depth(name, index, declared)
+    if tail in leaves:
+        return ('params', f'{prefix}_{depth}', *leaves[tail])
+    path = block(tail)
+    return None if path is None else (path[0], f'{prefix}_{depth}', 'block', *path[2:])
+
+
+PREDICTION_INPUTS: Mapping[str, tuple[str, ...]] = {
+    'enorm.weight': ('enorm', 'scale'), 'hnorm.weight': ('hnorm', 'scale'),
+    'eh_proj.weight': ('eh_proj', 'kernel')}
+"""A prediction depth's normed inputs and their fused projection, by the
+tensor names DeepSeek-V3 and Nemotron-H's releases share."""
+PREDICTION_LEAVES: Mapping[str, tuple[str, ...]] = {
+    **PREDICTION_INPUTS, 'shared_head.norm.weight': ('final_norm', 'scale')}
+"""A DeepSeek-V3 prediction depth's own leaves, by its tensor names after
+`model.layers.{num_layers + d}.` (`layer_depth_path`)."""
+
+
+def layer_depth_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
+    """The path of `name` in DeepSeek-V3's layout, which GLM's MoE releases
+    share: prediction depth d at `model.layers.{num_layers + d}.*`, its own
+    leaves (`PREDICTION_LEAVES`), a block named as a trunk layer's, and
+    copies of the trunk's embedding and head, which map to the trunk's
+    leaves (`translate_weights` checks the copies). A tied trunk keeps the
+    head in the embedding, which stores the same [vocab, features] the copy
+    does; an untied one has the head's own kernel, which stores its
+    transpose. Any other name is the trunk's, `dew_path`'s."""
+    parts = name.split('.')
+    trunk = records.integer(config['num_layers'], 'num_layers')
+    if not (len(parts) >= 4 and parts[:2] == ['model', 'layers'] and parts[2].isdigit()
+            and int(parts[2]) >= trunk):
+        return dew_path(name, config)
+    tail = '.'.join(parts[3:])
+    depths = records.integer(config.get('num_nextn_predict_layers', 0), 'num_nextn_predict_layers')
+    depth = _declared_depth(name, int(parts[2]) - trunk, depths)
+    if tail == 'embed_tokens.weight':
+        return ('params', 'embed_tokens', 'embedding')
+    if tail == 'shared_head.head.weight':
+        return (('params', 'embed_tokens', 'embedding') if config['tie_embeddings']
+                else ('params', 'lm_head', 'kernel'))
+    return prediction_path(name, 'mtp', depth, depths, tail, PREDICTION_LEAVES,
+                           lambda block: dew_path('model.layers.0.' + block, config))
+
+
+
+
 def _param_path(parts: list[str], config: Mapping[str, object]) -> tuple[str, ...] | None:
     """Return the params-tree path of a split HF tensor name, or None for the tied head."""
     hf_name = '.'.join(parts)
