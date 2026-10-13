@@ -82,6 +82,13 @@ def _compiled(entry: dict) -> dict:
     return json.loads(output.strip().splitlines()[-1])
 
 
+def failures(found: list[dict]) -> list[str]:
+    """Each compiled record's failure, if any: its error, or its shared bytes past its block's limit."""
+    return [f"{record['name']}: {record['error']}" if "error" in record else
+            f"{record['name']}: {record['shared']} shared bytes, limit {record['limit']}"
+            for record in found if "error" in record or not record["shared"] <= record["limit"]]
+
+
 def compile_kernels(cases, generation: str) -> list[dict]:
     """Each case (`name`, `call()` giving the kernel and abstract operands) on the CUDA `generation`,
     lowered as on that GPU on this host (`assumed`, `gpu_mesh`) and compiled by pip's Triton for its
