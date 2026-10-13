@@ -4,6 +4,7 @@ placement, remat names, activation rounding and work count."""
 
 import functools
 from collections.abc import Callable
+from typing import cast
 
 import jax.numpy as jnp
 from flax import linen as nn
@@ -119,7 +120,9 @@ class GatedMLP(nn.Module):
             up = jnp.clip(up, -self.swiglu_limit, self.swiglu_limit)
         if self.activation_sparsity:
             gate = gaussian_topk(gate, self.activation_sparsity)
-        product = gated_product(self.activation, axes=MLP_HIDDEN, packed=self._packed())
+        # `_ungated` found no function, so the activation names a gated product.
+        product = gated_product(cast(GatedActivation, self.activation), axes=MLP_HIDDEN,
+                                packed=self._packed())
         hidden = self.dropout(product(gate, up), deterministic=not train)
         return checkpoint_name(self.down_proj(hidden), 'down_proj')
 
