@@ -57,7 +57,7 @@ from dew.nn.attention import (
     unweighted_rmsnorm,
 )
 from dew.nn.fake_quant import fake_quant_fp4, fake_quant_fp8
-from dew.nn.inputs import AttentionMetadata
+from dew.nn.inputs import AttentionMetadata, coordinates_of
 from dew.nn.kv_cache import KVCache, write_cache
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.precision import at_least_fp32
@@ -678,8 +678,10 @@ class DeepseekV4Attention(nn.Module):
         return entries, selected
 
     @nn.compact
-    def __call__(self, x, decode: bool = False, positions=None, segment_ids=None,
-                 kv_store=None, attention_metadata: AttentionMetadata | None = None):
+    def __call__(self, x, decode: bool = False, kv_store=None,
+                 attention_metadata: AttentionMetadata | None = None):
+        tokens = coordinates_of(attention_metadata, *x.shape[:2])
+        positions, segment_ids = tokens.positions, tokens.segments
         if segment_ids is not None and self.compressor is not None:
             raise ValueError("segment_ids are not supported by deepseek_v4 compressed windows")
         if attention_metadata is not None and attention_metadata.rotary_positions is not None:
@@ -799,8 +801,8 @@ class DSparkAttention(DeepseekV4Attention):
     """
 
     @nn.compact
-    def __call__(self, x, decode: bool = False, positions=None, segment_ids=None,
-                 kv_store=None, attention_metadata: AttentionMetadata | None = None):
+    def __call__(self, x, decode: bool = False, kv_store=None,
+                 attention_metadata: AttentionMetadata | None = None):
         store = {} if kv_store is None else kv_store
         main = store.get(DRAFT_CONTEXT)
         batch = x.shape[0]

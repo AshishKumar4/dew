@@ -37,7 +37,7 @@ from dew.nn.attention import (
 )
 from dew.nn.blocks import normal_kernel
 from dew.nn.flops import attention_flops, projection_flops
-from dew.nn.inputs import Admitted, AttentionMetadata
+from dew.nn.inputs import Admitted, AttentionMetadata, coordinates_of
 from dew.nn.kernels.generation import backend
 from dew.nn.kv_cache import TABLE, Append, KVCache, KVStore, filled_slots, rotated, write_cache
 from dew.nn.mixer_base import MixerBase, MixerContext
@@ -487,10 +487,13 @@ class CausalSelfAttention(nn.Module):
             or (self.bidirectional_images and metadata.image_groups is not None))
 
     @nn.compact
-    def __call__(self, x, decode: bool = False,
-                 positions=None, segment_ids=None, kv_store=None,
+    def __call__(self, x, decode: bool = False, kv_store=None,
                  attention_metadata: AttentionMetadata | None = None, train: bool = False):
         B, S, _ = x.shape
+        # The tokens' places and documents: the caller's or a packed batch's, else none given
+        # (`Coordinates`).
+        tokens = coordinates_of(attention_metadata, B, S)
+        positions, segment_ids = tokens.positions, tokens.segments
         logical_positions = positions
         # The projections and the kernel's output carry the names a remat
         # policy saves or offloads (decoder_block.RESIDUALS).

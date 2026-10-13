@@ -150,9 +150,9 @@ class KimiDeltaAttention(nn.Module):
         return -rate * jnp.where(gate > 20.0, gate, jnp.log1p(jnp.exp(jnp.minimum(gate, 20.0))))
 
     @nn.compact
-    def __call__(self, x, decode: bool = False, positions=None, segment_ids=None, kv_store=None,
+    def __call__(self, x, decode: bool = False, kv_store=None,
                  attention_metadata: AttentionMetadata | None = None):
-        del positions, segment_ids, kv_store
+        del kv_store
         B, S, _ = x.shape
         tokens = coordinates_of(attention_metadata, B, S)
         valid = tokens.valid

@@ -243,7 +243,9 @@ class Coordinates:
     """Where each token of a batch sits, built once (`coordinates`) and read by every token mixer.
 
     `positions` `[B, S]` is each real token's place in its document, counted
-    over real tokens. `segments` numbers each row's packed documents from 1,
+    over real tokens: a packed batch's or the caller's own, None where each
+    token's place is its index in its row, or in a cached call its cache
+    slot (`slots`). `segments` numbers each row's packed documents from 1,
     0 on the padding slots after them, which run as a document of their own,
     so no layer carries a real document's state or history into them or
     back; `valid` is the caller's mask of real tokens; `starts` marks each
@@ -257,7 +259,7 @@ class Coordinates:
     `right_padded` says every row's real tokens come first.
     """
 
-    positions: jax.Array
+    positions: jax.Array | None = None
     segments: jax.Array | None = None
     valid: jax.Array | None = None
     starts: jax.Array | None = None
@@ -270,8 +272,9 @@ def coordinates(shape: tuple[int, int] | None = None, *, segments=None, valid=No
                 max_segments: int | None = None, right_padded: bool = False) -> Coordinates:
     """The `Coordinates` of `[batch, length]` tokens from what the batch carries: packed `segments`
     (one document a row where None), a `valid` mask (every token real where None), explicit
-    `positions` (each document's real tokens counted from 0 where None) and the packer's
-    `max_segments` (the row length where None). `shape` is the first given field's where None."""
+    `positions` (with `segments`, each document's real tokens counted from 0 where None; without,
+    None, each token's place its row index or cache slot) and the packer's `max_segments` (the row
+    length where None). `shape` is the first given field's where None."""
     if shape is None:
         given = [x for x in (segments, valid, positions) if x is not None]
         if not given:
@@ -286,13 +289,14 @@ def coordinates(shape: tuple[int, int] | None = None, *, segments=None, valid=No
             raise ValueError(f"token coordinates are {shape}, got {name} {field.shape}")
     starts = None if segments is None else document_starts(
         segments, jnp.ones(shape, bool) if valid is None else valid)
-    if positions is None:
+    if positions is None and segments is not None:
         real = jnp.ones(shape, bool) if valid is None else valid
-        real = real if segments is None else real & (segments != 0)
+        real = real & (segments != 0)
         rank = jnp.cumsum(real, axis=1, dtype=jnp.int32) - 1
         first = 0 if starts is None else jax.lax.cummax(jnp.where(starts, rank, 0), axis=1)
         positions = jnp.where(real, rank - first, 0)
-    return Coordinates(jnp.asarray(positions, jnp.int32), segments, valid, starts,
+    positions = None if positions is None else jnp.asarray(positions, jnp.int32)
+    return Coordinates(positions, segments, valid, starts,
                        max_segments=(1 if segments is None else length) if max_segments is None
                        else max_segments,
                        right_padded=right_padded)
