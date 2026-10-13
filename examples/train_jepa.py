@@ -12,7 +12,8 @@ import jax.numpy as jnp
 import tyro
 
 from dew.config import OptimConfig
-from dew.data import TFDSImages
+from dew.config.data import Augment, HoldOut, ImageData, loader
+from dew.data import TFDS
 from dew.inputs import Field
 from dew.interop import save_params
 from dew.objectives.jepa import (
@@ -43,11 +44,13 @@ class Config:
 
 
 def main(config: Config, data=None):
-    data = data or TFDSImages(
-        path=None if config.data_path is None else str(config.data_path.expanduser()),
-        name="oxford_flowers102",
+    data = data or loader(ImageData(
+        source=TFDS("oxford_flowers102", split="all",
+                    path=None if config.data_path is None else str(config.data_path.expanduser())),
         image_size=config.image_size,
-    ).load(batch=config.batch_size)
+        caption_templates=("a photo of a {}",),
+        augment=Augment(flip=True, jitter=True), validation=HoldOut(records=4 * config.batch_size),
+    ), batch=config.batch_size, provision=config.data_path is None, read="memory")
     steps = config.steps or data.epoch_steps(config.epochs)
     side = config.image_size // config.patch_size
     grid = (side, side)

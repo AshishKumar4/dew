@@ -182,10 +182,14 @@ class ImageRows(TypedDict):
     fsdp_min_param_size: int
 
 
+GROUPED_NORMS = dict.fromkeys(("input_layernorm", "post_attention_layernorm", "norm"), {"groups": 4})
+"""K2 Horizon's norms, each over four groups of the width."""
+
+
 def zoo() -> dict[str, Any]:
     """Small models of every family a layout splits differently: a dense
-    decoder, MoE decoders with 8 and with Qwen3-30B-A3B's 128 experts, a
-    Mamba-2 hybrid, a DiT and DiffusionGemma, each at widths every layout
+    decoder (and under `GROUPED_NORMS`), MoE decoders with 8 and with
+    Qwen3-30B-A3B's 128 experts, a Mamba-2 hybrid, a DiT and DiffusionGemma, each at widths every layout
     above divides. The DiT's rows hold 256 patches, as a DiT's smallest
     release does (DiT-B/2 at 256 px): a sequence or tensor split repeats each
     row's conditioning on every shard by design, which the FLOPs bound would
@@ -262,6 +266,7 @@ def zoo() -> dict[str, Any]:
     images: ImageRows = {"batch_size": 8, "channels": 4, "fsdp_min_param_size": 256}
     return {
         "dense": Case("causal_transformer", dense, **lm),
+        "grouped": Case("causal_transformer", {**dense, "norms": GROUPED_NORMS}, **lm),
         "moe": Case("causal_transformer", moe, **lm),
         "moe128": Case("causal_transformer", moe128, **lm),
         "hybrid": Case("causal_transformer", hybrid, **lm),

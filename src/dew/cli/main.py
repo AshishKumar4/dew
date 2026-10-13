@@ -15,7 +15,7 @@ import json
 import sys
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal
 
 import tyro
 
@@ -52,36 +52,86 @@ class Export:
 
 
 @dataclasses.dataclass(frozen=True)
-class Tokenize:
-    """Tokenize a text corpus into the train.bin, val.bin and meta.json a token dataset reads."""
+class DataExport:
+    """Export a recipe's deterministic records to committed storage."""
 
-    input: str
-    """A text file, or a directory read as every *.txt inside it (recursive)."""
-    out: str
-    """The directory the token files are written into; created if it is not there."""
-    tokenizer: str = "byte"
-    """'byte' for utf-8 bytes, else a Hugging Face tokenizer name."""
-    val_fraction: float = 0.01
-    """The fraction of the token stream held out, from its head, as validation."""
-    pack: bool = False
-    """End every document (input file) with the tokenizer's eos id, so
-    TokenWindows(pack=True) can cut the stream back into documents."""
+    recipe: Positional[str]
+    destination: Positional[str]
+    fields: str = "{}"
+    format: Literal["parquet", "array_record"] = "parquet"
+    rows_per_shard: int = 100_000
+    branch: Literal["train", "validation"] = "train"
+    read: Literal["memory", "indexed", "streamed"] = "streamed"
+    provision: bool = False
+    tokenizer: str | None = None
+    eos: bool = False
 
     def run_command(self) -> int:
-        from dew.data import TokenCorpus
+        from dew.data.compile import iterate
+        from dew.data.sinks import export
+        from dew.records import record
+        from dew.registry import datasets
 
-        if self.tokenizer != "byte":
-            # Every chunk is longer than the model's context, which is the
-            # point of a corpus; without this the tokenizer warns about it.
-            from transformers.utils import logging as hf_logging
+        recipe = datasets.build(self.recipe, record(json.loads(self.fields), "recipe fields"))
+        train, held, _ = recipe.pipelines()
+        pipeline = train if self.branch == "train" else held
+        if pipeline is None:
+            raise ValueError(f"{self.recipe} has no validation source")
+        metadata = None
+        if self.tokenizer is not None:
+            from dew.data.steps.text import Tokenize
+            from dew.data.text import tokenizer_for
 
-            hf_logging.set_verbosity_error()
-        corpus = TokenCorpus.write(self.input, self.out, tokenizer=self.tokenizer,
-                                   val_fraction=self.val_fraction, pack=self.pack)
-        out = Path(self.out)
-        emit(f"wrote {corpus.train_tokens} tokens to {out / 'train.bin'} and "
-             f"{corpus.val_tokens} to {out / 'val.bin'}")
-        emit(f"{out / 'meta.json'}: {json.dumps(dataclasses.asdict(corpus))}")
+            vocabulary = tokenizer_for(self.tokenizer)
+            pipeline = pipeline.map(Tokenize(self.tokenizer, eos=self.eos))
+            metadata = {"token_store": True, "tokenizer": self.tokenizer,
+                        "vocab_size": vocabulary.vocab_size, "dtype": "int32",
+                        "eos_id": vocabulary.eos_id if self.eos else None}
+        manifest = export(iterate(pipeline, read=self.read, provision=self.provision),
+                          self.destination, format=self.format, rows_per_shard=self.rows_per_shard,
+                          metadata=metadata, length_field="text" if self.tokenizer is not None else None)
+        emit(json.dumps(manifest, sort_keys=True))
+        return 0
+
+
+@dataclasses.dataclass(frozen=True)
+class DataProvision:
+    """Prepare the named source for indexed reads."""
+
+    source: Positional[str]
+
+    def run_command(self) -> int:
+        from dew.data.sources import source
+
+        prepared = source(self.source, provision=True)
+        emit(f"prepared {prepared.describe()}")
+        return 0
+
+
+@dataclasses.dataclass(frozen=True)
+class DataPublish:
+    """Fill and publish a deterministic recipe prefix to the artifact cache."""
+
+    recipe: Positional[str]
+    destination: Positional[str]
+    fields: str = "{}"
+    branch: Literal["train", "validation"] = "train"
+    read: Literal["memory", "indexed", "streamed"] = "streamed"
+    provision: bool = False
+
+    def run_command(self) -> int:
+        from dew.data.cache import Cache
+        from dew.data.compile import publish
+        from dew.records import record
+        from dew.registry import datasets
+
+        recipe = datasets.build(self.recipe, record(json.loads(self.fields), "recipe fields"))
+        train, held, _ = recipe.pipelines()
+        pipeline = train if self.branch == "train" else held
+        if pipeline is None:
+            raise ValueError(f"{self.recipe} has no validation source")
+        generation = publish(pipeline, Cache(self.destination), read=self.read, provision=self.provision)
+        emit(f"published {generation.url}")
         return 0
 
 
@@ -120,13 +170,18 @@ class Train:
         return 0
 
 
-COMMANDS = {"export": Export, "launch": Launch, "tokenize": Tokenize, "train": Train}
+COMMANDS = {"export": Export, "launch": Launch, "train": Train}
+DATA_COMMANDS = {"export": DataExport, "provision": DataProvision, "publish": DataPublish}
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     if args[:1] == ["tpu"]:
         return tpu.main(args[1:])
+    if args[:1] == ["data"]:
+        command = tyro.extras.subcommand_cli_from_dict(
+            DATA_COMMANDS, args=args[1:], prog="dew data", config=CONFIG)
+        return command.run_command()
     command = tyro.extras.subcommand_cli_from_dict(
         COMMANDS, args=args, prog="dew", description=__doc__, config=CONFIG)
     return command.run_command()
