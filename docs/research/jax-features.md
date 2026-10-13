@@ -32,7 +32,7 @@ Dew changed after this survey. Line numbers elsewhere in this note refer to `65f
 - `pyproject.toml` requires `flax>=0.12.10,<0.13` (`flax.nnx` imports on jax 0.11.2 from 0.12.10 on, the first release with google/flax@01854da1) and `jax>=0.11.2,<0.11.3`, so the old `jax>=0.4.28` and `flax>=0.8.4` floors quoted under "Versions and evidence" are gone.
 - `pyproject.toml:10` requires Python 3.12 or newer, which settles open question 2: tokamax's Python floor no longer conflicts with core Dew.
 
-These still hold: the cuDNN head-dimension cap is 128 (`CUDNN_MAX_HEAD_DIM`, `src/dew/nn/attention.py:611`), and attention does not import tokamax.
+These still hold: the cuDNN head-dimension cap is 128 before Hopper and 256 from it (`cudnn_max_head_dim`, as jax's `check_is_flash_attention`), and attention does not import tokamax.
 
 ## Already present and easy to misclassify
 
