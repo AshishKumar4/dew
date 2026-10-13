@@ -47,7 +47,6 @@ import jax.numpy as jnp
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 from jax.ad_checkpoint import checkpoint_name
-from jax.typing import DTypeLike
 
 from dew.nn.attention import (
     RMSNorm,
@@ -62,7 +61,7 @@ from dew.nn.inputs import AttentionMetadata
 from dew.nn.kv_cache import KVCache, write_cache
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.precision import at_least_fp32
-from dew.nn.rope import YarnScaling, rotary_freqs, rotate, yarn_inv_freq
+from dew.nn.rope import YarnScaling, rotate, yarn_rope_freqs
 from dew.nn.sharding import RESIDUAL, LogicalAxes, constrain, down_projection, logical_axes
 from dew.nn.sparse_selection import candidate_pool, selection_mask, top_k_keys, top_k_selection
 
@@ -78,28 +77,13 @@ pool's entries. One name each, since every layer reads the latest (section
 2.3.1)."""
 
 
-def rope_freqs(positions, rope_dim: int, theta: float, yarn: YarnScaling | None, *,
-               dtype: DTypeLike):
-    """cos/sin per pair over the rope width, `[..., rope_dim // 2]`, in `dtype`
-    (`at_least_fp32` of the activations it rotates).
-
-    V4's rotary scales neither table: its YaRN entry forces
-    `attention_factor` to 1.0 (configuration_deepseek_v4.py:294-320) and
-    the plain entry never scales (modeling_deepseek_v4.py:136), so the
-    ramp changes the frequencies alone.
-    """
-    if yarn is None:
-        return rotary_freqs(positions, rope_dim, theta, dtype=dtype)
-    inv_freq = yarn_inv_freq(rope_dim, theta, yarn, dtype=dtype)
-    angles = jnp.asarray(positions, inv_freq.dtype)[..., None] * inv_freq
-    return jnp.cos(angles), jnp.sin(angles)
-
-
 _rotate_rope = functools.partial(rotate, pairs='adjacent', span='trailing')
 """V4's rotary: the trailing rope channels of a head or an entry turn in
 interleaved pairs that land back in place, the nope channels before them
-untouched (modeling_deepseek_v4.py:326-350), so a rotation by the negated
-sine undoes it, which the attention output relies on."""
+untouched (modeling_deepseek_v4.py:326-350). The attention output turns
+back by the negated sine, the conjugate rotation, which undoes it at a YaRN
+amplitude of 1 and scales the slice by its square otherwise, as the
+reference's does."""
 
 
 def pool_windows(kv, gate, position_bias, rate: int, overlap: bool):
@@ -285,8 +269,8 @@ class CompressedEntries(nn.Module):
 
     def rotate(self, latents, windows):
         """Rotate each entry at its window's first position, `window * rate`."""
-        cos, sin = rope_freqs(windows * self.rate, self.rope_dim, self.rope_theta, self.yarn,
-                              dtype=at_least_fp32(latents.dtype))
+        cos, sin = yarn_rope_freqs(windows * self.rate, self.rope_dim, self.rope_theta, self.yarn,
+                                   dtype=at_least_fp32(latents.dtype))
         return _rotate_rope(latents, cos, sin)
 
     def entries(self, x):
@@ -653,17 +637,17 @@ class DeepseekV4Attention(nn.Module):
         elif cache is None:
             entries, latents = self.compress.entries_and_latents(x)
             windows = jnp.arange(latents.shape[1])
-            keys = self.indexer.keys(latents, *rope_freqs(windows * rate, self.rope_dim,
-                                                          self.rope_theta, self.yarn,
-                                                          dtype=at_least_fp32(latents.dtype)))
+            keys = self.indexer.keys(latents, *yarn_rope_freqs(windows * rate, self.rope_dim,
+                                                               self.rope_theta, self.yarn,
+                                                               dtype=at_least_fp32(latents.dtype)))
         else:
             slots, capacity, allocated = cache
             entries, latents, windows = self.compress.cached_entries(x, slots, capacity, allocated)
             held = self.variable('cache', 'index_keys', jnp.zeros,
                                  (x.shape[0], capacity // rate, index_head_dim), latents.dtype)
-            fresh = self.indexer.keys(latents, *rope_freqs(windows * rate, self.rope_dim,
-                                                           self.rope_theta, self.yarn,
-                                                           dtype=at_least_fp32(latents.dtype)))
+            fresh = self.indexer.keys(latents, *yarn_rope_freqs(windows * rate, self.rope_dim,
+                                                                self.rope_theta, self.yarn,
+                                                                dtype=at_least_fp32(latents.dtype)))
             if allocated:
                 held.value = write_cache(held.value, fresh, windows)
             keys = held.value
@@ -720,8 +704,8 @@ class DeepseekV4Attention(nn.Module):
             positions = jnp.arange(length) if valid is None else jnp.maximum(jnp.cumsum(valid, axis=1) - 1, 0)
         positions = jnp.asarray(positions)
         rows = jnp.arange(length)
-        cos, sin = rope_freqs(positions, self.rope_dim, self.rope_theta, self.yarn,
-                              dtype=at_least_fp32(x.dtype))
+        cos, sin = yarn_rope_freqs(positions, self.rope_dim, self.rope_theta, self.yarn,
+                                   dtype=at_least_fp32(x.dtype))
 
         # The query latent and the shared key head project the residual down,
         # where `down_projection` places them: on each tensor shard's own
@@ -827,8 +811,8 @@ class DSparkAttention(DeepseekV4Attention):
                 slots, allocated = cache_positions(self, batch, main.shape[1], store.get(DRAFT_VALID))
                 if allocated:
                     cached_key.value = write_cache(cached_key.value, self._window_keys(
-                        main, *rope_freqs(slots, self.rope_dim, self.rope_theta, self.yarn,
-                                          dtype=at_least_fp32(main.dtype)),
+                        main, *yarn_rope_freqs(slots, self.rope_dim, self.rope_theta, self.yarn,
+                                               dtype=at_least_fp32(main.dtype)),
                         down_projection(main, self.head_dim)), slots)
             main_keys = cached_key.value
             last = jnp.asarray(self.get_variable('cache', 'cache_index')) - 1
@@ -836,17 +820,17 @@ class DSparkAttention(DeepseekV4Attention):
             raise ValueError(f"uncached, a DSpark stage's attention reads the whole context "
                              f"from kv_store[{DRAFT_CONTEXT!r}]")
         else:
-            main_keys = self._window_keys(main, *rope_freqs(jnp.arange(main.shape[1]), self.rope_dim,
-                                                            self.rope_theta, self.yarn,
-                                                            dtype=at_least_fp32(main.dtype)),
+            main_keys = self._window_keys(main, *yarn_rope_freqs(jnp.arange(main.shape[1]), self.rope_dim,
+                                                                 self.rope_theta, self.yarn,
+                                                                 dtype=at_least_fp32(main.dtype)),
                                           down_projection(main, self.head_dim))
             last = jnp.full((batch,), main.shape[1] - 1)
         length = x.shape[1]
         if length == 0:
             return x
         positions = last[:, None] + 1 + jnp.arange(length)
-        cos, sin = rope_freqs(positions, self.rope_dim, self.rope_theta, self.yarn,
-                              dtype=at_least_fp32(x.dtype))
+        cos, sin = yarn_rope_freqs(positions, self.rope_dim, self.rope_theta, self.yarn,
+                                   dtype=at_least_fp32(x.dtype))
         place = down_projection(x, self.q_lora_rank + self.head_dim)
         q_resid = constrain(self.q_a_norm(self.q_a_proj(constrain(x, place))), place)
         query = self.q_b_proj(constrain(q_resid, RESIDUAL)).reshape(
