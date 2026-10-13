@@ -23,6 +23,7 @@ from typing import BinaryIO, Protocol, TypedDict, runtime_checkable
 import fsspec
 from filelock import FileLock, Timeout
 from fsspec.implementations.cached import CachingFileSystem, WholeFileCacheFileSystem
+from fsspec.implementations.local import LocalFileSystem
 from fsspec.spec import AbstractFileSystem
 from gcsfs import GCSFileSystem
 from huggingface_hub import HfFileSystem
@@ -306,6 +307,29 @@ class BoundedFileCache(WholeFileCacheFileSystem):
 _MEMORY_LOCK = threading.RLock()
 
 
+_BLOCK_BYTES = 64 * 1024
+
+
+def content_version(fs: AbstractFileSystem, path: str, size: int, blocks: int = 64) -> str:
+    """A file's version as every host holding a copy of it names it. An object
+    store's ETag or generation is the object's own, so callers keep it; a local
+    file's `ukey` names where it is mounted and when it was written, so a local
+    copy is named by its size and a digest of `blocks` 64 KiB blocks spread
+    evenly over it, its last included: a sample, not a checksum, since a corpus
+    may be terabytes (a store of many files samples each of them less)."""
+    digest = hashlib.sha256(str(size).encode())
+    with fs.open(path, "rb") as file:
+        for block in range(blocks if size else 0):
+            file.seek(max(0, (size - _BLOCK_BYTES) * block // max(blocks - 1, 1)))
+            digest.update(file.read(_BLOCK_BYTES))
+    return digest.hexdigest()
+
+
+def local(fs: AbstractFileSystem) -> bool:
+    """Whether `fs` is this host's own disk, whose paths are where it mounted a file."""
+    return isinstance(fs, LocalFileSystem)
+
+
 @dataclass(frozen=True)
 class Versioned:
     data: bytes
@@ -368,7 +392,8 @@ class Store:
         fs, _ = self.resolve()
         while isinstance(fs, CachingFileSystem):
             fs = fs.fs
-        settings = {"url": self.url, "protocol": fs.protocol}
+        # A local path is where this host mounted the data, not how it is reached.
+        settings = {"protocol": fs.protocol} if local(fs) else {"url": self.url, "protocol": fs.protocol}
         if isinstance(fs, S3FileSystem):
             settings.update(
                 endpoint=fs.client_kwargs.get("endpoint_url") or fs.endpoint_url,

@@ -273,6 +273,16 @@ class Manifest:
         return all(step.exact for step in (*self.ran, *self.steps))
 
 
+def _unplaced(order: JSON) -> JSON:
+    """`order` without its sources' descriptions, which name where a host
+    mounted them, its corpora's and phases' included."""
+    if isinstance(order, dict):
+        return {name: _unplaced(value) for name, value in order.items() if name != "source"}
+    if isinstance(order, list):
+        return [_unplaced(value) for value in order]
+    return order
+
+
 @dataclasses.dataclass(frozen=True)
 class Plan:
     """Order-defining fields checked before a restored iterator opens readers."""
@@ -306,9 +316,12 @@ class Plan:
         """What every process of a pool reads, which the pool agrees before any
         reads: the order, as a reader can follow it, then a digest of the rest
         of the plan but its environment and the share this process reads,
-        which only the position it saves keeps."""
+        which only the position it saves keeps. The order's sources are named
+        by the manifest's content, not by their descriptions: hosts that mount
+        one dataset at different paths read the same records."""
         recorded = self.record()
         del recorded["environment"]
+        recorded["order"] = _unplaced(recorded["order"])
         recorded["topology"] = json_value(
             {name: value for name, value in self.topology.items() if name != "share"}, "topology"
         )
