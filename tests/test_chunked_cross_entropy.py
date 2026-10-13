@@ -175,6 +175,56 @@ def test_vocabulary_split_slices_the_bias_with_its_table_columns():
     np.testing.assert_array_equal(actual.correct, expected.correct)
 
 
+@pytest.mark.mesh(devices=2)
+def test_a_quantized_split_head_scores_as_one_device_and_moves_no_head_sized_array():
+    """A head whose input a checkpoint quantizes, split over the vocabulary on
+    a mesh, scores each token as one device does, and no collective of the
+    step carries an array the head's size: tokens and per-token terms cross
+    devices, the head stays in its shards."""
+    import re
+
+    from jax.sharding import NamedSharding, PartitionSpec as P
+
+    from dew.objectives.lm import LMObjective
+    from dew.training import Layout, MeshSpec
+    from dew.training.distributed import shard_batch
+    from dew.training.quantization import INPUT_SCALES, QUANTIZATION, InputQuantization
+
+    model = InputQuantization(format='modelopt', sites=(('lm_head', 'fp8'),)).apply(CausalTransformer(
+        vocab_size=512, emb_features=16, num_layers=1, num_heads=2, mlp_features=16, max_seq_len=4,
+        qk_norm=False, attention_impl='reference'))
+    tokens = jnp.arange(20, dtype=jnp.int32).reshape(4, 5)
+    variables = model.init(jax.random.key(0), tokens[:, :-1])
+    variables[QUANTIZATION]['lm_head'][INPUT_SCALES['fp8']] = jnp.asarray(0.02, jnp.float32)
+    objective = LMObjective(model, seq_len=4, variables=variables, head_chunks=4,
+                            head_tile=(2, 64), ema_decay=None)
+    expected = objective.token_scores(variables, tokens)
+    mesh = MeshSpec(fsdp=2).build(jax.devices()[:2])
+    shardings = Layout(min_shard=1).shardings(mesh, variables)
+    with jax.set_mesh(mesh):
+        placed = jax.device_put(variables, shardings)
+        batch = shard_batch(mesh, {'text': np.asarray(tokens)})['text']
+        actual = jax.jit(objective.token_scores)(placed, batch)
+        states = jax.device_put(model.apply(variables, tokens[:, :-1], method='hidden_states'),
+                                NamedSharding(mesh, P('fsdp')))
+        targets = jax.device_put(tokens[:, 1:], NamedSharding(mesh, P('fsdp')))
+
+        def loss(variables, states):
+            return chunked.head_cross_entropy(model, variables, states, targets, 4, tile=(2, 64))[0].sum()
+
+        # The head's forward and backward alone: the embedding's own gather is not the head's.
+        program = jax.jit(jax.grad(loss, argnums=(0, 1))).lower(placed, states).compile().as_text()
+    assert jnp.abs(actual.losses - expected.losses).max() <= 1e-5 * jnp.abs(expected.losses).max()
+    np.testing.assert_array_equal(actual.correct, expected.correct)
+    head = 512 * 16
+    collective = re.compile(r'=\s*(.*?)\s(?:all-gather|all-reduce|reduce-scatter|collective-permute|'
+                            r'all-to-all)(?:-start)?\(')
+    moved = [int(np.prod([int(size) for size in dims.split(',') if size], dtype=np.int64))
+             for line in program.splitlines() if (match := collective.search(line))
+             for dims in re.findall(r'\w+\[([0-9,]*)\]', match.group(1))]
+    assert moved and max(moved) < head // 2, moved
+
+
 def reference(hidden, head, targets, softcap=None):
     """The full-vocabulary path: one big logits tensor, optax's cross entropy.
     bf16 states are bf16 compute, which multiplies the head rounded to bf16
