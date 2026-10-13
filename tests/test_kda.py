@@ -24,8 +24,8 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from dew.nn.kda import KimiDeltaAttention, chunk_kimi_delta_rule
-from dew.nn.linear import l2norm as jax_l2norm, recurrent_delta_rule
+from dew.nn.kda import KimiDeltaAttention
+from dew.nn.linear import chunk_gated_delta_rule, l2norm as jax_l2norm, recurrent_delta_rule
 
 BOUND = 1e-4
 B, S, H, D, E, K = 2, 7, 2, 4, 8, 4  # batch, tokens, heads, head dim, model width, conv kernel
@@ -146,7 +146,7 @@ def test_the_rule_and_all_operand_gradients_match_the_executed_torch_reference(r
     def loss(q, k, v, g, beta, state):
         q, k = jax_l2norm(q), jax_l2norm(k)
         if rule == "chunk":
-            out, final = chunk_kimi_delta_rule(q, k, v, g, beta, state, chunk_size=4)
+            out, final = chunk_gated_delta_rule(q, k, v, g, beta, state, chunk_size=4)
         else:
             out, final = recurrent_delta_rule(q, k, v, g, beta, state)
         value = jnp.sum(out * jnp.asarray(fixture["output_cotangent"], jnp.float32))
@@ -170,7 +170,7 @@ def test_the_chunked_rule_matches_the_oracle_across_chunks_with_a_carried_state(
     ql, kl = jnp.asarray(q, jnp.float32), jnp.asarray(k, jnp.float32)
     from dew.nn.linear import l2norm
 
-    out, final = chunk_kimi_delta_rule(l2norm(ql), l2norm(kl), *as_f32(v, g, beta, state), chunk_size=4)
+    out, final = chunk_gated_delta_rule(l2norm(ql), l2norm(kl), *as_f32(v, g, beta, state), chunk_size=4)
 
     assert scaled(out, wanted) < BOUND
     assert scaled(final, wanted_state) < BOUND
@@ -183,7 +183,7 @@ def test_the_recurrent_rule_matches_the_oracle_and_the_chunked_rule(operands):
 
     ql, kl = l2norm(jnp.asarray(q, jnp.float32)), l2norm(jnp.asarray(k, jnp.float32))
     out, final = recurrent_delta_rule(ql, kl, *as_f32(v, g, beta, state))
-    chunked, chunked_state = chunk_kimi_delta_rule(ql, kl, *as_f32(v, g, beta, state), chunk_size=4)
+    chunked, chunked_state = chunk_gated_delta_rule(ql, kl, *as_f32(v, g, beta, state), chunk_size=4)
 
     assert scaled(out, wanted) < BOUND
     assert scaled(final, wanted_state) < BOUND

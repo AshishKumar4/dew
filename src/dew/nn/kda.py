@@ -18,10 +18,12 @@ modeling_glm5_next.py:584-733):
 - q and k are l2-normalised inside the rule as `x / sqrt(sum x^2 + eps)`
   (:416-424).
 
-`chunk_kimi_delta_rule` is `chunk_kimi_delta_attention` (:482-578) in fp32 on
-the gated delta rule's chunked form, `dew.nn.linear.chunk_delta_rule`, and
-the recurrent form `dew.nn.linear.recurrent_delta_rule` (:428-478).
-tests/test_kda.py holds both to a float64 oracle of the reference.
+`chunk_kimi_delta_attention` (:482-578) is the gated delta rule's chunked form
+with a decay per key dimension, `dew.nn.linear.chunk_gated_delta_rule`: on a
+GPU fla's chunked KDA ported to Pallas (`dew.nn.kernels.fla_kda`), elsewhere
+the portable math in fp32; the recurrent form is
+`dew.nn.linear.recurrent_delta_rule` (:428-478). tests/test_kda.py holds the
+math to a float64 oracle of the reference, and tests/test_fla_kda.py the port.
 """
 
 from __future__ import annotations
@@ -39,23 +41,14 @@ from .linear import (
     CHUNK_SIZE,
     DepthwiseConv1d,
     RMSNormGated,
-    chunk_delta_rule,
+    chunk_gated_delta_rule,
     held_scan,
+    port_refusal,
     recurrent_delta_rule,
 )
 from .mixer_base import MixerBase, MixerContext
 from .precision import at_least_fp32
 from .sharding import logical_axes
-
-
-def chunk_kimi_delta_rule(query, key, value, g, beta, state=None, chunk_size: int = CHUNK_SIZE, *,
-                          starts=None):
-    """`chunk_kimi_delta_attention` (modeling_glm5_next.py:482-578): the
-    chunked rule (`dew.nn.linear.chunk_delta_rule`) with `g` `[B, S, H, Dk]`,
-    a log decay per key dimension, on the portable math: fla's port
-    (`dew.nn.kernels.fla_gdn`) decays per head. Packed documents' `starts`
-    reset the memory, as the chunked rule's do."""
-    return chunk_delta_rule(query, key, value, g, beta, state, chunk_size, starts=starts)
 
 
 # q/k/v_proj and o_proj carry the attention mixer's declarations under the
@@ -177,21 +170,29 @@ class KimiDeltaAttention(nn.Module):
             g = jnp.where(valid[:, :, None, None], g, 0.0)
             beta = jnp.where(valid[:, :, None], beta, 0.0)
 
+        def split(part):
+            return part.reshape(B, S, self.num_heads, self.head_dim)
+
         def scan(convolved, *, starts, valid, held):
             del valid
-            query, key, value = (part.reshape(B, S, self.num_heads, self.head_dim) for part in convolved)
+            query, key, value = (split(part) for part in convolved)
             if S == 1:
                 return recurrent_delta_rule(query, key, value, g, beta, held, starts=starts)
-            return chunk_kimi_delta_rule(query, key, value, g, beta, held, chunk_size=self.chunk_size,
-                                         starts=starts)
+            return chunk_gated_delta_rule(query, key, value, g, beta, held, self.chunk_size,
+                                          projected=projected.dtype if ported else None, starts=starts,
+                                          max_segments=tokens.max_segments)
 
         # The decode state is GatedDeltaNet's pair, here in fp32; the
         # allocation-only call returns before any state is written. The conv
-        # normalises the queries and keys (`l2norm`).
+        # normalises the queries and keys (`l2norm`) and rounds once, to the
+        # dtype the rule takes: the projections' where the port runs it, as
+        # fla's layer hands them over, the wide one for the math.
+        ported = S > 1 and port_refusal(*(split(part) for part in jnp.split(projected, 3, axis=-1))) is None
         heads = ((self.qkv_features, self.head_dim),) * 2 + ((self.qkv_features, None),)
         out = held_scan(self, projected, taps, None, scan,
                         (self.num_heads, self.head_dim, self.head_dim), decode=decode, coordinates=tokens,
-                        state='recurrent_state', state_dtype=wide, conv_dtype=wide, parts=heads, dtype=wide)
+                        state='recurrent_state', state_dtype=wide, conv_dtype=wide, parts=heads,
+                        dtype=projected.dtype if ported else wide)
         if out is None:
             return self.o_proj(jnp.zeros((B, S, self.qkv_features), self.dtype))
         gate = self.g_proj(x) if self.full_rank_gate else self.g_b_proj(self.g_a_proj(x))
