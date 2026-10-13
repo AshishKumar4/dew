@@ -1637,7 +1637,7 @@ class CausalTransformer(nn.Module):
         - `routed_experts` `[B, S, layers, top_k]` replays a rollout engine's
           routing (vLLM's `routed_experts`, SGLang's
           `meta_info.routed_experts`), and `routed` `[B, S]` marks the tokens
-          it covers (`dew.nn.moe.Routes`).
+          it covers (`dew.nn.protocols.Routes`).
         - `media_mask` [B, S] marks the positions a media encoder fills.
           Engram keeps them out of its n-grams, and a media-biased router
           selects for them.
@@ -1861,7 +1861,7 @@ class CausalTransformer(nn.Module):
                     f"a batch of {rows} rows over {stages} stages needs a microbatch "
                     f"count that divides the rows and is a multiple of the stages, "
                     f"got {count_microbatches}")
-            # Microbatch m takes rows m, m + count, ... (`_microbatched`), a
+            # Microbatch m takes rows m, m + count, ... (`microbatched`), a
             # share of every device's rows only where the count divides a
             # block; otherwise devices holding none of a microbatch recompute
             # another's (1.43 times one device's FLOPs for 8 rows in 4

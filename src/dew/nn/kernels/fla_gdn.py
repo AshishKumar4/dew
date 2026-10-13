@@ -653,28 +653,25 @@ def _dhu_kernel(span_ref, q_ref, k_ref, w_ref, g_ref, dht_ref, do_ref, dv_ref, d
             dv = sum(_dot(read(k_ref, pl.ds(i * 64, 64)), grad[i].astype(k_ref.dtype), exact=exact)
                      for i in range(slices))
             final = begin + taken - 1
+            queries = [read(q_ref, pl.ds(i * 64, 64)) for i in range(slices)]
             if per_key:
                 dv = dv + read(dv_ref).astype(jnp.float32)
                 kept = [jnp.exp2(g_ref[final, pl.ds(i * 64, 64)].astype(jnp.float32))[:, None]
                         for i in range(slices)]
-
-                def queried(query):
-                    return _dot(query.T, out_grad.astype(query.dtype), exact=exact)
+                read_out = [_dot(query.T, out_grad.astype(query.dtype), exact=exact) for query in queries]
             else:
                 gate = _gates(g_ref, begin, taken, chunk)
                 last = g_ref[final].astype(jnp.float32)
                 dv = dv * jnp.exp2(last - gate)[:, None] + read(dv_ref).astype(jnp.float32)
                 decay = jnp.exp2(gate)[:, None]
                 kept = [jnp.exp2(last)] * slices
-
-                def queried(query):
-                    return _split_dot((query.astype(jnp.float32) * decay).T, out_grad, exact=exact)
+                read_out = [_split_dot((query.astype(jnp.float32) * decay).T, out_grad, exact=exact)
+                            for query in queries]
             _write(_rows(dv2_ref, begin, chunk), taken, dv)
 
             def moved(i):
                 written = read(w_ref, pl.ds(i * 64, 64))
-                return (queried(read(q_ref, pl.ds(i * 64, 64))) * scale
-                        - _dot(written.T, dv.astype(written.dtype), exact=exact))
+                return read_out[i] * scale - _dot(written.T, dv.astype(written.dtype), exact=exact)
 
             return [grad[i] * kept[i] + moved(i) for i in range(slices)]
 
@@ -903,17 +900,17 @@ def chunk_bwd_dqkwg(q, k, v, w, g, h, dv, do, dh, *, scale: float, chunk: int = 
     tokens = batch * length
     spans = sequences(batch, length, chunk=chunk) if spans is None else spans
     aligned = _aligned(spans, batch, length, chunk)
-    keys = pl.BlockSpec((tokens, None, bk), lambda i_k, i_t, i_h: (0, i_h, i_k))
-    values = pl.BlockSpec((tokens, group, columns), lambda i_k, i_t, i_h: (0, i_h, 0))
-    memory = pl.BlockSpec((None, group, bk, columns), lambda i_k, i_t, i_h: (i_t, i_h, i_k, 0))
+    keys = pl.BlockSpec((tokens, None, bk), lambda i_k, i_h, i_t: (0, i_h, i_k))
+    values = pl.BlockSpec((tokens, group, columns), lambda i_k, i_h, i_t: (0, i_h, 0))
+    memory = pl.BlockSpec((None, group, bk, columns), lambda i_k, i_h, i_t: (i_t, i_h, i_k, 0))
     dq, dk, dw, dg = pl.pallas_call(
         functools.partial(_dqkwg_kernel, chunk=chunk, aligned=aligned, scale=scale, bv=bv, exact=interpret),
-        grid=(width // bk, spans.chunks.shape[0], key_heads),
-        in_specs=[pl.BlockSpec((None, 2), lambda i_k, i_t, i_h: (i_t, 0)), keys, keys, values,
-                  pl.BlockSpec((tokens, group), lambda i_k, i_t, i_h: (0, i_h)), memory, values, memory,
+        grid=(width // bk, key_heads, spans.chunks.shape[0]),
+        in_specs=[pl.BlockSpec((None, 2), lambda i_k, i_h, i_t: (i_t, 0)), keys, keys, values,
+                  pl.BlockSpec((tokens, group), lambda i_k, i_h, i_t: (0, i_h)), memory, values, memory,
                   values],
-        out_specs=[keys, keys, pl.BlockSpec((tokens, group, bk), lambda i_k, i_t, i_h: (0, i_h, i_k)),
-                   pl.BlockSpec((None, tokens, group), lambda i_k, i_t, i_h: (i_k, 0, i_h))],
+        out_specs=[keys, keys, pl.BlockSpec((tokens, group, bk), lambda i_k, i_h, i_t: (0, i_h, i_k)),
+                   pl.BlockSpec((None, tokens, group), lambda i_k, i_h, i_t: (i_k, 0, i_h))],
         out_shape=[jax.ShapeDtypeStruct((tokens, key_heads, width), q.dtype),
                    jax.ShapeDtypeStruct((tokens, key_heads, width), k.dtype),
                    jax.ShapeDtypeStruct((tokens, value_heads, width), w.dtype),

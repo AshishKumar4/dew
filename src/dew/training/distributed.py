@@ -5,6 +5,8 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import fnmatch
+import functools
+import hashlib
 import json
 import logging
 import math
@@ -13,6 +15,7 @@ import statistics
 import threading
 import time
 from collections.abc import Callable, Iterator, Mapping
+from pathlib import Path
 
 import jax
 import numpy as np
@@ -21,7 +24,8 @@ from jax.experimental import mesh_utils, multihost_utils
 from jax.sharding import AbstractMesh, AxisType, Mesh, NamedSharding, PartitionSpec as P
 
 from dew.coordination import agreed, broadcast_from_process_zero, from_every_process, stop_at_exit
-from dew.data.dataset import Budgeted, Checkpointable, Closeable, DataPartition, Stoppable
+from dew.data.dataset import Budgeted, Checkpointable, Closeable, DataPartition, RampedStream, Stoppable
+from dew.files import write_atomically
 from dew.nn.inputs import filled_validity
 from dew.nn.sharding import (
     BATCH_AXES,
@@ -40,6 +44,7 @@ from dew.nn.sharding import (
     declared_axes,
     logical_spec,
     mesh_axes,
+    microbatched,
     ruled_boxes,
 )
 from dew.objectives.base import Batch, Variables
@@ -219,7 +224,16 @@ def link_bandwidth(mesh: Mesh, axis: str, size: int = 1 << 28) -> float:
     (DeepSeek-V3's residual gradient over 16384 tokens is 235 MB in bf16),
     past the sizes where a collective's latency counts: on 4x RTX 3090 an
     NVLink pair's all-gather moved 8.2 GB/s a device at 4 MiB and 31.0 at
-    128 MiB."""
+    128 MiB.
+
+    A pool keeps its figure beside the persistent compilation cache, by the
+    axis and the devices it spans, and a later pool on them takes it, a
+    resume among them: the decisions from it shape the step, and a figure
+    measured again moves by noise, across a threshold one time in some."""
+    record = _link_record(mesh, axis)
+    # Every process gathers, or none does: a pool measures unless each of its processes sees the figure.
+    if record is not None and all(from_every_process(record.exists())):
+        return min(from_every_process(float(json.loads(record.read_text())["bytes_per_second"])))
     ways = mesh.shape[axis]
     count = size // 4 // ways * ways
     sharding = NamedSharding(mesh, P(axis))
@@ -234,8 +248,23 @@ def link_bandwidth(mesh: Mesh, axis: str, size: int = 1 << 28) -> float:
         jax.block_until_ready(gather(source))
         if attempt >= 2:
             seconds.append(time.perf_counter() - began)
-    received = (ways - 1) / ways * count * 4 / statistics.median(seconds)
-    return min(from_every_process(received))
+    received = min(from_every_process((ways - 1) / ways * count * 4 / statistics.median(seconds)))
+    if record is not None and jax.process_index() == 0:
+        record.parent.mkdir(parents=True, exist_ok=True)
+        write_atomically(record, json.dumps({"bytes_per_second": received}))
+    return received
+
+
+def _link_record(mesh: Mesh, axis: str) -> Path | None:
+    """Where `link_bandwidth` keeps `mesh`'s `axis` figure: beside the persistent compilation cache,
+    named by the axis's width, the mesh's shape and its devices' kinds and processes, or nowhere when
+    the process keeps no cache."""
+    cache = jax.config.jax_compilation_cache_dir
+    if not cache:
+        return None
+    devices = sorted({(device.device_kind, device.process_index) for device in mesh.devices.flat})
+    name = json.dumps([axis, dict(mesh.shape), devices], sort_keys=True)
+    return Path(cache) / "dew-links" / f"{hashlib.sha256(name.encode()).hexdigest()}.json"
 
 
 def _slice(device) -> int:
@@ -286,7 +315,7 @@ def hybrid_devices(spec: MeshSpec, shape: tuple[int, ...], devices: list) -> np.
         ici, dcn, devices, process_is_granule=by_process, allow_split_physical_axes=True)
 
 
-def batch_divisor(mesh: Mesh, spec: MeshSpec) -> int:
+def batch_divisor(mesh: Mesh | AbstractMesh, spec: MeshSpec) -> int:
     """Return the row count every global batch must be a multiple of.
 
     A batch's rows are sharded over the batch axes as whole rows, and a
@@ -301,6 +330,99 @@ def batch_divisor(mesh: Mesh, spec: MeshSpec) -> int:
     """
     shards = math.prod(mesh.shape[axis] for axis in BATCH_AXES)
     return shards * (spec.microbatches or spec.stage)
+
+
+def check_batch(batch: int, mesh: Mesh, spec: MeshSpec) -> None:
+    """Refuse, before anything is placed, a global batch `mesh` cannot split
+    (`batch_divisor`): its rows shard over the batch axes as whole rows, and
+    a pipeline cuts each device's rows again into M microbatches, where a
+    device that holds none of a microbatch's rows computes another's again.
+    The message names the row shards, and the batches and the microbatch
+    counts that fit."""
+    divisor = batch_divisor(mesh, spec)
+    if batch % divisor == 0:
+        return
+    count = spec.microbatches or spec.stage
+    shards = divisor // count
+    suggestions = [f"a batch that is a multiple of {divisor} rows, {-(-batch // divisor) * divisor} "
+                   f"the nearest above {batch}"]
+    axes = " x ".join(f"{axis} {mesh.shape[axis]}" for axis in BATCH_AXES if mesh.shape[axis] > 1)
+    if count == 1:
+        raise LayoutRefused(
+            f"a global batch of {batch} rows over the {shards} row shards of {axes} leaves some "
+            f"device without whole rows; use {suggestions[0]}, or a mesh whose batch axes "
+            f"({' x '.join(BATCH_AXES)}) divide {batch}")
+    if batch % shards == 0:
+        fitting = [m for m in range(spec.stage, batch // shards + 1, spec.stage)
+                   if (batch // shards) % m == 0]
+        if fitting:
+            suggestions.append(f"microbatches={fitting[-1]}, the most that divide the "
+                               f"{batch // shards} rows a device holds")
+    raise LayoutRefused(
+        f"a global batch of {batch} rows over {shards} row shards and {count} microbatches "
+        f"leaves some microbatch without rows on some device, which then computes another "
+        f"microbatch's again; use {' or '.join(suggestions)}")
+
+
+def check_stream(source, mesh: Mesh, spec: MeshSpec, batch: int, window: int, *, rows: bool,
+                 checkpointing: bool) -> None:
+    """Refuse a training stream a run cannot checkpoint or cannot shard.
+
+    A checkpoint written without the data position would replay the data
+    on resume. A `batch` the mesh cannot divide fails where it is placed or
+    traced (`check_batch`), unless the stream's rows are not the step's
+    (`rows`; a rollout's are its own, checked where its step traces), and a
+    ramp stage's, for a later stage, an hour in. A ramp reads each stage's
+    batch whole, never in a `window` of more than one microbatch.
+    """
+    if checkpointing and not isinstance(source, Checkpointable):
+        raise ValueError(
+            f"checkpoint_every needs a training stream with get_state and "
+            f"set_state, and {type(source).__name__} lacks one; a checkpoint "
+            f"written without the data position would replay the data on "
+            f"resume. Train it with checkpoint_every=None "
+            f"(--trainer.checkpoint-every None)")
+    if not isinstance(source, RampedStream):
+        if rows:
+            check_batch(batch, mesh, spec)
+        return
+    if window > 1:
+        raise ValueError(
+            f"a batch ramp grows the records a step reads, and an "
+            f"accumulation window of {window} pools "
+            f"microbatches of one shape into one update; ramp the "
+            f"batch or accumulate, not both")
+    divisor = batch_divisor(mesh, spec)
+    refused = [stage.batch for stage in source.stages if stage.batch % divisor]
+    if refused:
+        raise ValueError(
+            f"the batch ramp reads {refused} records a step at some of "
+            f"its stages, and {dict(mesh.shape)} with "
+            f"{spec.microbatches or spec.stage} microbatch(es) "
+            f"holds a batch that is a multiple of {divisor}")
+
+
+def microbatch(batch: Batch, part: jax.Array, split: int) -> Batch:
+    """The `part`th of the `split` microbatches a step reads `batch` in
+    (`Trainer.compile`): every `split`th row from row `part` (`microbatched`),
+    a share of each device's rows where `split` divides them, so no row
+    crosses devices. A field with no rows is the whole step's, and every
+    microbatch reads it whole; one microbatch is the batch as it came,
+    whatever its fields' rows (a rollout's groups)."""
+    if split == 1:
+        return batch
+    return jax.tree.map(lambda leaf: jax.lax.dynamic_index_in_dim(
+        microbatched(leaf, 0, split), part, 0, keepdims=False) if np.ndim(leaf) else leaf, batch)
+
+
+def microbatch_shapes(batch: Batch, split: int) -> Batch:
+    """The fields of `microbatch`'s microbatches, as a trace reads them: the
+    batch itself for one, whose placed fields' types carry their Explicit
+    axes, else their shapes."""
+    if split == 1:
+        return batch
+    part = jax.ShapeDtypeStruct((), np.dtype(np.int32))
+    return jax.eval_shape(functools.partial(microbatch, split=split), batch, part)
 
 
 def parameter_spec(shape: tuple, fsdp_size: int, min_shard_size: int) -> P:
@@ -457,8 +579,23 @@ class Layout:
                     f"split the batch, and the stage axis holds the pipeline")
             return NamedSharding(mesh, spec)
 
-        with boxed(ruled_boxes({**current_boxes(), **boxed_axes(tree)}, self.axis_rules)):
+        with self._declared(tree):
             return jax.tree_util.tree_map_with_path(leaf_sharding, nn.unbox(tree))
+
+    def _declared(self, tree):
+        """The context in which `declared_axes` reads the axes `tree`'s
+        modules declared, as the rules place them."""
+        return boxed(ruled_boxes({**current_boxes(), **boxed_axes(tree)}, self.axis_rules))
+
+    def _splitting(self, path, value) -> set[str]:
+        """The parameter axes the rules could split the leaf at `path` over:
+        those its declared names' rules name, or fsdp, which the shape
+        heuristic splits an undeclared leaf over."""
+        axes = declared_axes(path, value.ndim)
+        if axes is None:
+            return {FSDP_AXIS}
+        return {axis for name, assignment in self.axis_rules if name in axes
+                for axis in mesh_axes(assignment) if axis in PARAMETER_AXES}
 
     def offloaded[TreeT](self, mesh: Mesh, tree: TreeT) -> Placement[TreeT]:
         """Return `shardings`, with the memory kind each leaf's path asks for.
@@ -501,9 +638,12 @@ class Layout:
 
         MaxText measures the excess per-chip memory over perfect sharding
         across every parameter. This check takes the same ratio over the
-        parameters of at least `min_shard` elements only. Smaller ones are
-        replicated on purpose, so counting them would fail models that are
-        merely small.
+        parameters of at least `min_shard` elements whose rules name a
+        parameter axis this mesh splits. Smaller ones are replicated on
+        purpose, so counting them would fail models that are merely small;
+        one no rule splits over this mesh's axes is replicated by the mesh's
+        choice, as a data axis replicates every parameter, so an expert-only
+        mesh keeps a mixture's dense weights whole as data parallelism does.
 
         Raises `LayoutRefused` when the replicated fraction is above
         `tolerance`, naming the five largest replicated parameters, and
@@ -524,13 +664,16 @@ class Layout:
         if all(mesh.shape[axis] == 1 for axis in PARAMETER_AXES):
             return
 
-        path_leaves, _ = jax.tree_util.tree_flatten_with_path(params)
+        path_leaves, _ = jax.tree_util.tree_flatten_with_path(nn.unbox(params))
+        splits = {axis for axis in PARAMETER_AXES if mesh.shape[axis] > 1}
+        with self._declared(params):
+            splittable = [bool(self._splitting(path, param) & splits) for path, param in path_leaves]
         shardable_elements = 0
         replicated = []
-        for (path, param), sharding in zip(
-                path_leaves, jax.tree.leaves(shardings), strict=True):
+        for (path, param), sharding, ruled in zip(
+                path_leaves, jax.tree.leaves(shardings), splittable, strict=True):
             elements = int(np.prod(param.shape, dtype=np.int64))
-            if elements < self.min_shard:
+            if elements < self.min_shard or not ruled:
                 continue
             shardable_elements += elements
             if any(axis in mesh_axes(assignment)

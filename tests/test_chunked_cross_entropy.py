@@ -1038,7 +1038,8 @@ def test_the_whole_logits_head_computes_what_the_tiled_one_does(dtype, softcap):
 
 def test_a_step_that_does_not_fit_tiles_the_head_before_it_recomputes_blocks():
     """The first rung of the fit ladder tiles a head that kept its whole
-    logits; only then does the model's remat climb."""
+    logits; only then does the model's remat climb, with the whole logits
+    again, and the head tiles once more at that rung."""
     from dew.objectives.lm import LMObjective
     from dew.training.memory import recompute_more
 
@@ -1047,6 +1048,8 @@ def test_a_step_that_does_not_fit_tiles_the_head_before_it_recomputes_blocks():
     assert recompute_more(objective) and objective.head_tile == chunked.chunked_tile()
     assert objective.model.remat is None
     assert recompute_more(objective) and objective.model.remat is not None
+    assert objective.head_tile is None
+    assert recompute_more(objective) and objective.head_tile == chunked.chunked_tile()
 
 
 def test_a_pass_with_no_backward_never_holds_the_logits_whole():

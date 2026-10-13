@@ -24,7 +24,9 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from jax.ad_checkpoint import print_saved_residuals
+from jax.sharding import Mesh
 from reference_error import assert_as_exact_as_the_reference, distance
+from tuned import each_config
 
 from dew.nn import attention, kernels
 from dew.nn.attention import (
@@ -35,6 +37,7 @@ from dew.nn.attention import (
     stream_rms_normalized,
     unweighted_rmsnorm,
 )
+from dew.nn.kernels import norm_swiglu, tuning
 from dew.nn.moe import ExpertMLP, gated_product
 
 pytestmark = pytest.mark.kernel
@@ -100,17 +103,29 @@ def assert_scale_accumulation(mine, reference, coefficient, seed):
 
 
 def compare(functions, operands, seed, labels, *, coefficient=None):
-    xla, pallas, exact = functions
+    pallas = functions[1]
     graph = str(jax.make_jaxpr(pallas)(*operands))
     assert "rms_norm_forward" in graph or "swiglu_forward" in graph
     differentiated = str(jax.make_jaxpr(functools.partial(evaluated, pallas))(operands, seed))
     assert "rms_norm_backward" in differentiated or "swiglu_backward" in differentiated
+    reference, truth = oracles(functions, operands, seed)
+    gated(labels, jax.jit(functools.partial(evaluated, pallas))(operands, seed), reference, truth, seed,
+          coefficient)
+
+
+def oracles(functions, operands, seed):
+    """XLA's outputs and gradients, and float64 truth."""
+    xla, _, exact = functions
     reference = jax.jit(functools.partial(evaluated, xla))(operands, seed)
-    actual = jax.jit(functools.partial(evaluated, pallas))(operands, seed)
     cpu = jax.devices("cpu")[0]
     with jax.enable_x64(new_val=True), jax.default_device(cpu):
         wide = jax.tree.map(lambda x: jnp.asarray(np.asarray(x, np.float64)), operands)
         truth = evaluated(exact, wide, jnp.asarray(np.asarray(seed, np.float64)))
+    return reference, truth
+
+
+def gated(labels, actual, reference, truth, seed, coefficient):
+    """Every output and gradient within the float64 gate."""
     try:
         for label, mine, theirs, want in zip(labels, actual, reference, truth, strict=True):
             if mine is None:
@@ -169,11 +184,66 @@ def test_rms_ragged_widths_and_many_rows(dtype, shape):
 def test_rms_weight_gradient_accumulates_a_full_step_of_rows(dtype):
     # Repeated tokens hold the row arithmetic fixed while the column sum
     # grows to Qwen3.5-0.8B's size, isolating partial-sum error from bf16 midpoint flips.
-    (row, scale), seed = norm_operands((1, 1000), dtype, jnp.float32)
-    x = jnp.broadcast_to(row, (24576, 1000))
-    seed = jnp.broadcast_to(seed, x.shape)
+    (x, scale), seed = full_step(dtype)
     compare(norm_functions(dtype, offset=True, after_cast=True), (x, scale), seed, ("y", "x", "scale"),
             coefficient=scale_coefficient(x, dtype, after_cast=True))
+
+
+def full_step(dtype):
+    """Qwen3.5-0.8B's 24,576 rows of one repeated 1000-wide token, so the weight
+    gradient's sums reach a step's length (`test_rms_weight_gradient...`)."""
+    (row, scale), seed = norm_operands((1, 1000), dtype, jnp.float32)
+    x = jnp.broadcast_to(row, (24576, 1000))
+    return (x, scale), jnp.broadcast_to(seed, x.shape)
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("kernel", [norm_swiglu.RmsForward, norm_swiglu.RmsBackward])
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
+@pytest.mark.parametrize("operands", ["full step", "wide rows", "narrow rows"])
+def test_every_config_of_the_norm_kernels_holds_the_float64_gate(kernel, dtype, operands):
+    """Each config the tuner may pick, at a step's rows, at rows wider than
+    a tile holds two of, and at rows narrow enough for its tallest tiles:
+    the space declares only configs proven here."""
+    (x, scale), seed = {"full step": lambda: full_step(dtype),
+                        "wide rows": lambda: norm_operands((7, 4096), dtype, jnp.float32),
+                        "narrow rows": lambda: norm_operands((4099, 256), dtype, jnp.float32)}[operands]()
+    functions = norm_functions(dtype, offset=True, after_cast=True)
+    reference, truth = oracles(functions, (x, scale), seed)
+    configs = each_config(kernel, functools.partial(evaluated, functions[1]), (x, scale), seed)
+    assert len(configs) > 1
+    for config in configs:
+        with tuning.pinned({kernel: config}):
+            actual = jax.jit(functools.partial(evaluated, functions[1]))((x, scale), seed)
+            # The factors this config's forward rounded, which its weight gradient sums.
+            coefficient = scale_coefficient(x, dtype, after_cast=True)
+        try:
+            gated(("y", "x", "scale"), actual, reference, truth, seed, coefficient)
+        except AssertionError as error:
+            error.add_note(f"{kernel.__name__} at {config}")
+            raise
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("kernel", [norm_swiglu.SwigluForward, norm_swiglu.SwigluBackward])
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
+def test_every_config_of_the_swiglu_kernels_holds_the_float64_gate(kernel, dtype):
+    """Each block and warp count, over a ragged tail of elements."""
+    shape = (3, 257, 17)
+    operands = tuple(jax.random.normal(jax.random.key(index), shape).astype(dtype) for index in (31, 32))
+    seed = jax.random.normal(jax.random.key(33), shape).astype(dtype)
+    xla, pallas = (gated_product("swiglu", implementation=name) for name in ("xla", "pallas"))
+    reference, truth = oracles((xla, pallas, xla), operands, seed)
+    configs = each_config(kernel, functools.partial(evaluated, pallas), operands, seed)
+    assert len(configs) > 1
+    for config in configs:
+        with tuning.pinned({kernel: config}):
+            actual = jax.jit(functools.partial(evaluated, pallas))(operands, seed)
+        try:
+            gated(("y", "gate", "up"), actual, reference, truth, seed, None)
+        except AssertionError as error:
+            error.add_note(f"{kernel.__name__} at {config}")
+            raise
 
 
 def test_random_bf16_gradients_keep_fp32_intermediates_near_float64():
@@ -442,6 +512,28 @@ def test_swiglu_refuses_broadcast_mixed_and_wide_dtypes():
                                           gated_product("swiglu", implementation="xla")(gate, up))
 
 
+@pytest.mark.gpu
+@pytest.mark.parametrize("implementation", ["auto", "pallas"])
+def test_a_gpu_hosts_cpu_runs_the_seams_its_placement_chooses(without_deterministic_ops, implementation):
+    """On a GPU host, the norm, the SiLU product and attention placed on the CPU, eagerly under the
+    default device and in a JIT on a CPU mesh, as a host-layout run places its state, run there:
+    'auto' takes no GPU kernel, and an explicit Pallas kernel interprets."""
+    cpu = jax.devices("cpu")[0]
+
+    def seams(x):
+        y = rms_normalized(x, None, 1e-5, x.dtype, scale_offset=False, scale_after_cast=False,
+                           fp32_statistics=True, implementation=implementation)
+        y = gated_product("swiglu", implementation=implementation)(y, y).reshape(1, 4, 2, 64)
+        return attention.attention_kernel(y, y, y).astype(jnp.float32).sum()
+
+    x = jax.device_put(jnp.linspace(-1, 1, 512, dtype=jnp.bfloat16).reshape(4, 128), cpu)
+    with jax.default_device(cpu):
+        eager = jax.value_and_grad(seams)(x)
+    with jax.set_mesh(Mesh(np.array([cpu]), ("data",))):
+        jitted = jax.jit(jax.value_and_grad(seams))(x)
+    assert {device for value in (*eager, *jitted) for device in value.devices()} == {cpu}
+
+
 def test_auto_takes_the_generation_row_and_forward_mode_is_portable():
     """Auto takes the device's measured kernel on a GPU Triton runs, XLA on a CPU."""
     from dew.nn.kernels import norm_swiglu
@@ -619,10 +711,15 @@ def test_expert_jvp_refuses_swiglu_once_and_matches_xla(monkeypatch, caplog):
         return expert.apply(params, x, weights, indices)
 
     reference = jax.jvp(function, (x,), (jnp.ones_like(x),))
+    # A GPU's own row may already have logged the reference's refusal.
+    caplog.clear()
     monkeypatch.setitem(kernels.gpu_target("sm80").kernels, "swiglu", "pallas")
     monkeypatch.setattr(kernels.generation, "device_generation", lambda: "sm80")
     monkeypatch.setattr(kernels.generation, "triton_runs", lambda: True)
     monkeypatch.setattr(kernels.generation, "_logged", set())
+    # A GPU whose row names the kernel logs the reference's own refusal;
+    # only the calls under this generation count.
+    caplog.clear()
     for _ in range(2):
         actual = jax.jvp(function, (x,), (jnp.ones_like(x),))
         for mine, theirs in zip(actual, reference, strict=True):

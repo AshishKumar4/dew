@@ -12,6 +12,11 @@ walk and returns a `Walk`. The `Walk` gives each step's guided prediction
 step to the next. Only `APG` with momentum keeps anything: the walk's state
 holds its running average of the guidance direction.
 
+Each guidance is a pytree: its scale (and APG's eta) a leaf, so a compiled
+walk takes another value as data; its interval and the switches that shape the
+program (CFG's rescale, APG's clipping and momentum, a guide's module) are
+static.
+
 Every guidance's `interval` is the part of the walk it guides, as fractions
 of the walk. The interval is closed at both ends, so step i of N is guided
 when start <= i / N <= stop, and the closing denoise counts as step N. Each
@@ -34,7 +39,7 @@ from typing import Any, Protocol, runtime_checkable
 
 import jax
 import jax.numpy as jnp
-from flax import linen as nn
+from flax import linen as nn, struct
 
 from dew.diffusion.process import Denoiser
 from dew.nn.precision import compensated_add
@@ -122,7 +127,7 @@ def _interval(interval) -> tuple[float, float]:
     return start, stop
 
 
-@dataclass(frozen=True)
+@struct.dataclass
 class CFG:
     """Interval-limited classifier-free guidance.
 
@@ -149,8 +154,8 @@ class CFG:
     """
 
     scale: float
-    interval: tuple[float, float] = (0.0, 1.0)
-    rescale: float = 0.0
+    interval: tuple[float, float] = struct.field(pytree_node=False, default=(0.0, 1.0))
+    rescale: float = struct.field(pytree_node=False, default=0.0)
 
     def __post_init__(self):
         object.__setattr__(self, "interval", _interval(self.interval))
@@ -175,7 +180,7 @@ class CFG:
         return Walk.stateless(lambda index: self._guided(denoise, scales(index)))
 
 
-@dataclass(frozen=True)
+@struct.dataclass
 class CFGPlusPlus:
     """Guides the clean prediction and renoises with the unconditional noise (CFG++).
 
@@ -191,10 +196,10 @@ class CFGPlusPlus:
     """
 
     scale: float
-    interval: tuple[float, float] = (0.0, 1.0)
+    interval: tuple[float, float] = struct.field(pytree_node=False, default=(0.0, 1.0))
 
     def __post_init__(self):
-        if not 0.0 <= self.scale <= 1.0:
+        if not isinstance(self.scale, jax.Array) and not 0.0 <= self.scale <= 1.0:
             raise ValueError(f"CFG++ interpolates with a scale in [0, 1], got {self.scale}")
         object.__setattr__(self, "interval", _interval(self.interval))
 
@@ -264,7 +269,7 @@ def _projected_components(direction, output):
     return orthogonal, parallel
 
 
-@dataclass(frozen=True)
+@struct.dataclass
 class APG:
     """Adaptive projected guidance, combining raw outputs as Diffusers' `AdaptiveProjectedGuidance` does.
 
@@ -288,9 +293,9 @@ class APG:
 
     scale: float
     eta: float = 1.0
-    norm_threshold: float = 15.0
-    momentum: float = 0.0
-    interval: tuple[float, float] = (0.0, 1.0)
+    norm_threshold: float = struct.field(pytree_node=False, default=15.0)
+    momentum: float = struct.field(pytree_node=False, default=0.0)
+    interval: tuple[float, float] = struct.field(pytree_node=False, default=(0.0, 1.0))
 
     def __post_init__(self):
         object.__setattr__(self, "interval", _interval(self.interval))
@@ -323,7 +328,7 @@ class APG:
             denoise, scales(index), x, t, average)[0])
 
 
-@dataclass(frozen=True)
+@struct.dataclass
 class Autoguidance:
     """Guides a model with a weaker version of itself (autoguidance).
 
@@ -342,8 +347,8 @@ class Autoguidance:
     """
 
     scale: float
-    model: nn.Module
-    interval: tuple[float, float] = (0.0, 1.0)
+    model: nn.Module = struct.field(pytree_node=False)
+    interval: tuple[float, float] = struct.field(pytree_node=False, default=(0.0, 1.0))
 
     def __post_init__(self):
         object.__setattr__(self, "interval", _interval(self.interval))

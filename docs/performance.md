@@ -904,10 +904,11 @@ the numerics of the fp32 head, and the precision rule refuses it anyway.)
 Correction, 2026-09-22, checked against current main. The jitted `bookkeep`
 from the first class-1 row is on main (`src/dew/training/trainer.py`, called
 from `Trainer.fit`). The class-5 row about `objective.py:141` no longer
-matches the code. The diffusion objective encodes the unconditional prompt
-once, when it is built, and each step only casts that stored encoding to the
-batch's dtypes (`DiffusionObjective.blank_conditions` in
-`src/dew/objectives/diffusion/objective.py`).
+matches the code. Correction, 2026-10-12: each step encodes the unconditional
+prompt's one row with the step's own towers (`DiffusionObjective.blank_conditions`
+in `src/dew/objectives/diffusion/objective.py`), so a restored tree conditions
+both branches; the cached encoding it replaced was baked into the step from the
+towers the objective was built with.
 
 ### Comparison with PyTorch
 
@@ -1673,6 +1674,109 @@ alone, and the differences are within the spread between two processes.
 Dew does not set the variable. To compare bytes across processes on such a
 machine, set it, or pin every process to one core type (`taskset -c 0-15`
 for the 12900K's P-cores).
+
+### Collectives over several GPUs, 2026-10-12
+
+A GPU step whose mesh spans more than one device compiles with NVIDIA
+JAX-Toolbox's collective options (`dew.training.memory.COLLECTIVES`): the
+latency-hiding scheduler, all-reduce and all-gather combined up to 1 GiB and
+reduce-scatter up to 128 MiB, and combine-by-dim off. A flag the run names
+stands. Llama-3.1-8B (random
+weights) over FSDP 2 on two H100 80GB HBM3 SXMs joined by NVLink, 2 x 4096
+tokens a step, JAX 0.11.2.post3, `XLA_FLAGS` empty, the trainer's own fit
+(a 1024 x 8192 head tile and minimal remat), 55 timed steps each, alternated:
+
+| ref | step ms | MFU |
+|---|---|---|
+| main 0290b93b2 | 557.3, 558.5 | 35.8% |
+| with the options, dfb40da61 | 537.9, 537.9 | 37.2% |
+
+That's 3.6% less time a step. The same options passed as `XLA_FLAGS`, with
+whole logits and minimal remat, took 539.3 to 519.5 ms (two runs each). With
+Toolbox's whole bundle, the step's all-gathers and reduce-scatters fell from
+376 and 162 to 48 and 66, on the same bytes. The bundle's other two options
+stay out: command buffers off cost 0.7% beside these, and XLA's
+rematerialization pass off changed nothing. Toolbox also names three
+pipelined-collective flags, which this XLA accepts in `XLA_FLAGS` and
+ignores; no compile accepts them as options. On one GPU there's nothing to
+combine: a dense 1.1B Llama on one H100 SXM ran within 0.4% with the whole
+bundle. Toolbox's while-loop double buffering stays out too: the 8B, whose
+layers Dew unrolls, stepped in 479.4 and 479.1 ms with it and 479.5 and
+479.2 without (84ec3a043's parent), and it failed XLA's schedule check
+(`hlo_schedule.cc:463`) in a two-process GPU pool's step.
+
+```
+cd <dew checkout> && JAX_PLATFORMS=cuda XLA_FLAGS= XLA_PYTHON_CLIENT_MEM_FRACTION=0.90 PYTHONPATH=src \
+  python tools/reference_runs/dew_lm.py --model <Llama-3.1-8B config checkpoint> --data <2 x 4096 windows.npz> \
+  --work work.json --out run.json --batch 2 --mesh fsdp --dtype bfloat16 --steps 80 --timing-warmup 20 \
+  --attention auto --lr-init 0 --warmup 16
+```
+
+The options cost Qwen3.5-9B with rank-256 factors over FSDP 2 (below) 3.6%
+at e3c90a968. There the delta net's activation exchanges, on the step's
+critical path, waited behind combined gathers of the frozen base. With the
+projections placed and every split on its leading dimension, the options
+are within the run-to-run spread there and win elsewhere. All-gathers
+combined to 128 MiB, MaxText's GPU value, lose on the 8B:
+
+| step, FSDP 2, leading-dimension splits | no options | options | all-gathers at 128 MiB |
+|---|---|---|---|
+| Llama-3.1-8B, ms (two runs) | 508.3, 507.8 | 488.6, 489.0 | 501.4, 500.5 |
+| 9B LoRA, ms (one run) | 434.7 | 437.4 | 431.9 |
+
+Three runs of the 9B's FSDP 2 arm at e3c90a968 spread 0.8%.
+
+### fsdp splits a parameter's leading dimension, 2026-10-12
+
+A parameter fsdp splits is gathered whole for every use, so which of its
+dimensions fsdp takes changes no product, only how the shards lie in
+memory. It now takes the leading dimension its rules name it alone for
+(`dew.nn.sharding.DEFAULT_RULES`). Before, rule order put fsdp on the gate
+and up projections' mlp width, their minor dimension, and each update read
+their reduce-scattered gradients transposed. The 8B's profile with the
+collective options spent 65 ms of each device's 524 ms step in transpose
+fusions, 43.5 of them in 64 optimizer updates of 0.68 ms. Same 8B, mesh,
+data and command as above, at ecaa727d9 (the collective options), 55 timed
+steps, alternated:
+
+| split | step ms | MFU | peak GB |
+|---|---|---|---|
+| rule order (gate, up on the mlp width) | 538.0, 537.5 | 37.1%, 37.2% | 71.5 |
+| leading dimension | 488.3, 487.6 | 40.9%, 41.0% | 65.3 |
+
+The losses agree to the run-to-run spread (1e-4 relative). On Qwen3.5-9B
+with rank-256 factors over FSDP 2 (below), the frozen base's gate, up and
+delta-net input projections split their leading dimension too: 446.8 to
+434.7 ms a step, its layout kernels 37.8 to 18.0 ms a device.
+
+### The delta net over fsdp, 2026-10-12
+
+Over an fsdp mesh GSPMD placed the gated delta net's projections head-split
+with the rows gathered: each device ran both rows' delta rule, and the step
+moved 8.4 GiB of all-to-alls and 2.8 GiB of activation gathers. Each
+projection now keeps the residual's placement
+(`GatedDeltaNet._project`). Qwen3.5-9B with its middle eight layers (12 to
+20) run twice, rank-256 factors over a frozen bf16 base, one 3072-token row
+a GPU, minimal remat, two H100 80GB HBM3 SXMs over NVLink, land/gdn-unit
+102918039, the median of steps 100 to 220:
+
+| run | step ms | peak GiB |
+|---|---|---|
+| FSDP 2, before | 481.3 | 25.0 |
+| FSDP 2, projections placed | 446.8 | 25.8 |
+| and leading-dimension splits | 434.7 | 25.1 |
+
+The profile's delta-net time fell from 175 to 95 ms over both devices, and
+every all-to-all and activation gather left the step.
+
+```
+cd <dew checkout> && PYTHONPATH=src python recipes/decision/clef.py --mixture.root <mix> --trainer.name run \
+  --pretrained Qwen/Qwen3.5-9B --revision c202236235762e1c871ad0ccb60c8ee5ba337b9a --max-len 3072 \
+  --max-state-tokens 1024 --trainer.batch-size 2 --trainer.steps 220 --trainer.eval-every 220 \
+  --trainer.checkpoint-every None --trainer.log-every 1 --no-calibrate --optim.schedule.warmup-steps 10 \
+  --lora.rank 256 --param-dtype bfloat16 --loop-steps 2 --loop-layers 12 20 --remat minimal \
+  --trainer.mesh.fsdp 2
+```
 
 ## UNet batch scaling
 
@@ -2783,9 +2887,24 @@ The kernel-matrix rows time forward plus backward at jax 0.11.2, checked against
 
 I rejected a pure-JAX loop of dense per-tile products. On the RTX 4080 it was 2.2x faster than XLA for the projection alone (6.67 ms), but it doubled the step's temporaries (4.22 GiB against 2.17 at batch 1), and on the v6e it was 2.2x slower than XLA (1.71 ms against 0.79).
 
-The Pallas kernels are JAX's own `gmm` and `tgmm` from the jax-v0.11.2 source tree, vendored because no wheel ships them and called through a custom VJP. jax 0.11.2 deprecates the Pallas Triton backend they run on and warns at every lowering. They stay the sm80 to sm89 path anyway, because JAX's Mosaic GPU grouped matmul (`pallas/ops/gpu/ragged_dot_mgpu.py`) uses wgmma and fails to compile on the RTX 4080, and tokamax's sm80 Mosaic config exceeds Ada's shared memory. Dew does not silence the warning, so filtering it is up to you. Moving this path to Mosaic GPU on sm90 and later is open, and waits for Hopper hardware to measure on. On a mesh the kernels run inside `shard_map` on each device's share of the sorted rows. That path is checked for parity on an 8-device CPU mesh and not measured on multiple GPUs.
+The Pallas kernels are JAX's own `gmm` and `tgmm` from the jax-v0.11.2 source tree, vendored because no wheel ships them and called through a custom VJP. jax 0.11.2 deprecates the Pallas Triton backend they run on and warns at every lowering. They are the sm80 to sm90 path anyway, because JAX's Mosaic GPU grouped matmul (`pallas/ops/gpu/ragged_dot_mgpu.py`) uses wgmma and fails to compile on the RTX 4080, tokamax's sm80 Mosaic config exceeds Ada's shared memory, and on an H100 tokamax's Mosaic GPU kernel only matched their forward (below). Dew does not silence the warning, so filtering it is up to you. On a mesh the kernels run inside `shard_map` on each device's share of the sorted rows. That path is checked for parity on an 8-device CPU mesh and not measured on multiple GPUs.
 
-On TPU, tokamax's `mosaic_tpu_v2` is within 1% of XLA on the step. tokamax's default dispatch picks its v1 kernel there, which is 13x slower, so Dew names the kernel.
+On TPU, tokamax's `mosaic_tpu_v2` was within 1% of XLA on the step; tokamax's default dispatch picked its v1 kernel there, which is 13x slower, so Dew named the kernel. With XLA as fast or faster on a v6e at the step and at 128 experts, TPUs run XLA, and Dew has no tokamax grouped matmul.
+
+At real MoE shapes on an H100 SXM and an A100 40 GB (2026-10-12, jax 0.11.2, torch 2.14.1), forward and forward plus backward, median of 30, in ms: `tools/benchmark_kernels.py projection --implementation xla|pallas --rows R --experts E --width W --features F`, whose tokamax column ran at 940572926 with `--implementation tokamax --tokamax-kernel mosaic`, and `tools/benchmark_grouped_mm_torch.py` with the same flags for torch's. Every Dew row lies at the same distance from the float64 oracle as XLA's or closer.
+
+| GPU | shape (rows, width to features, experts) | XLA | Pallas | tokamax Mosaic GPU | torch `_grouped_mm` |
+|---|---|---:|---:|---:|---:|
+| H100 SXM | 8192, 2048 to 768, 128 (Qwen3-30B-A3B) | 5.40 / 33.5 | 0.72 / 1.60 | 0.67 / 28.9 | 0.19 / 1.01 |
+| H100 SXM | 32768, 2048 to 768, 128 | 20.5 / 138 | 1.15 / 2.83 | 0.93 / 119 | 0.26 / 1.38 |
+| H100 SXM | 8192, 4096 to 14336, 8 (Mixtral) | 10.6 / 62.6 | 4.58 / 12.0 | 4.88 / 57.9 | 1.46 / 5.44 |
+| H100 SXM | 32768, 4096 to 14336, 8 | 39.9 / 245 | 15.0 / 42.1 | 16.2 / 264 | 5.42 / 18.0 |
+| A100 40 GB | 8192, 2048 to 768, 128 | 15.1 / 82.7 | 1.62 / 4.04 | | 1.87 / 5.80 |
+| A100 40 GB | 32768, 2048 to 768, 128 | | 2.62 / 7.37 | | 2.27 / 7.29 |
+| A100 40 GB | 8192, 4096 to 14336, 8 | 30.0 / 157 | 11.9 / 37.0 | | 5.21 / 14.5 |
+| A100 40 GB | 32768, 4096 to 14336, 8 | | 36.1 / 129 | | 15.1 / 47.4 |
+
+tokamax's kernel differentiates through XLA, so its backward is XLA's; on an A100 it registers only its XLA path, as its Triton kernel imports jax_triton. So `KERNELS['grouped_matmul']` names Pallas for sm90 as for sm80 to sm89. torch's CUTLASS grouped GEMM is 1.6 to 3.8 times faster than the Pallas kernels on the H100 and 2.5 times faster at Mixtral's width on the A100; matching it needs a grouped GEMM of Dew's own on those parts, which is open.
 
 ### bf16 Adam state: `OptimConfig.state_dtype`
 
@@ -3062,7 +3181,9 @@ I also timed one bf16 `ExpertMLP` layer forward plus backward under `MeshSpec(fs
 
 ### Rematerialization: the trainer's ladder
 
-A model's `remat` is where its step starts, and the trainer moves it up one rung whenever the compiled step does not fit its devices' memory. A decoder goes from none to `'minimal'` (MaxText's name: every projection output kept) to `'full'`, and a diffusion backbone from `False` to `'dots'` (matmul outputs and the attention forward kept) to `'full'`. Each rung is slower and smaller, so the first that fits is the fastest that runs.
+A model's `remat` is where its step starts, and the trainer moves it up one rung whenever the compiled step does not fit its devices' memory. A decoder goes from none to `'minimal'` (MaxText's name: every projection output kept) to `'full'`, and a diffusion backbone from `False` to `'dots'` (matmul outputs and the attention forward kept) to `'full'`. At each rung the head keeps its whole logits first and is tiled second. Each rung is slower and smaller, so the first that fits is the fastest that runs at that batch.
+
+The trainer also plans the batch (`dew.training.planning`). Unless the run fixes `--trainer.split`, a step that does not fit whole is read in microbatches, every split-th row so no row leaves its device, with a window that pools them into the same update. The search compiles the batch whole, then the largest split at each rung until one fits, then halves toward the fewest microbatches at that rung. When the plan splits, `fit` also compiles the batch whole one remat rung up with the head tiled, times both for 10 steps after 2 of warmup, and keeps the faster one. Fewer rows do not always win. On an A100-40, Qwen3.5-0.8B's full fine-tune at 8 x 3072 ran 1205.6 ms a step in four microbatches without remat and 1174.1 ms whole under `'minimal'`. The plan, every compile it made and both times are in `StepCompiled.plan`, and the choice is recorded beside the compilation cache.
 
 `dew.training.memory.step_fits` decides whether a step fits. XLA places a GPU step's temporaries in one allocation, so the temporaries, the outputs that do not reuse the donated state and the batches `fit` prefetches next to the step's own all have to fit in a single free block on each device, which can be smaller than the device's total free bytes. The block is the BFC pool's largest, or the part of its limit that a growing pool has not taken yet. An allocator that reports no pool (cuda_async, or a TPU's) is read by its free bytes. Each process reads its own devices, and the pool of processes takes the tightest. Where the allocator can leave the temporaries no block to return to once a batch is prefetched next to them, the check holds room for them twice (`strands_temporaries`). That happens with cuda_async and with XLA's spatially partitioned pool. `import dew` now turns the partitioning off wherever JAX's CUDA plugin is installed; before, only `prepare_process` did. So a Trainer built without `prepare_process`, such as `tools/reference_runs/dew_lm.py` or a notebook, held room for the 99M MoE's 8.34 GiB of temporaries twice in a preallocated pool on the RTX 4080, and tiled its head at 98.2 ms a step. With the partitioning off it keeps the whole logits at 78.3 ms, from a cold compile cache and from a warm one.
 

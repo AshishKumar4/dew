@@ -24,14 +24,13 @@ and on the same logits in float64.
 
 from __future__ import annotations
 
-import ast
 import sys
 import types
-import urllib.request
 from pathlib import Path
 
 import numpy as np
 import torch
+from reference_source import definitions
 
 VLLM = "https://raw.githubusercontent.com/vllm-project/vllm/ced6857afa0ea7b2e3f0846a62e1394e90f15607/"
 FIXTURE = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "decoding" / "penalties.npz"
@@ -42,30 +41,20 @@ PENALTIES = ((0.7, 0.0), (0.0, 0.7), (0.45, -0.3), (-1.2, 1.6))
 """(frequency, presence) pairs; OpenAI's range is -2 to 2."""
 
 
-def definitions(path: str, names: tuple[str, ...], scope: dict) -> dict:
-    text = urllib.request.urlopen(VLLM + path).read().decode()
-    found = [node for node in ast.parse(text).body
-             if isinstance(node, ast.FunctionDef) and node.name in names]
-    assert {node.name for node in found} == set(names), names
-    for node in found:
-        exec(ast.get_source_segment(text, node), scope)
-    return scope
-
-
 def padded(rows: tuple[list[int], ...]) -> torch.Tensor:
     width = max(1, max(len(row) for row in rows))
     return torch.tensor([row + [VOCAB] * (width - len(row)) for row in rows], dtype=torch.long)
 
 
 def main() -> None:
-    ops = definitions("vllm/_custom_ops.py",
+    ops = definitions(VLLM + "vllm/_custom_ops.py",
                       ("apply_repetition_penalties_torch", "apply_repetition_penalties"), {"torch": torch})
     # apply_repetition_penalties dispatches on logits.is_cuda; its CUDA
     # branch is never taken on these CPU tensors.
     ops["apply_repetition_penalties_cuda"] = None
     sys.modules["vllm"] = types.ModuleType("vllm")
     sys.modules["vllm._custom_ops"] = types.SimpleNamespace(**ops)
-    published = definitions("vllm/model_executor/layers/utils.py",
+    published = definitions(VLLM + "vllm/model_executor/layers/utils.py",
                             ("get_token_bin_counts_and_mask", "apply_penalties"), {"torch": torch})
     logits = np.random.default_rng(3).standard_normal((len(PROMPTS), VOCAB)).astype(np.float32)
     arrays = {"logits": logits, "penalties": np.asarray(PENALTIES),

@@ -839,6 +839,28 @@ class GlobalMean:
         return accumulated[0] / accumulated[1]
 
 
+def text_to_image(args):
+    """A tiny text-to-image diffusion objective over the committed CLIP
+    fixture, and this process's share of a batch of its images and prompts."""
+    from dew.diffusion import presets
+    from dew.inputs import Condition, Field, InputSpec
+    from dew.inputs.encoders import CLIPText
+    from dew.nn.backbones.dit import SimpleDiT
+    from dew.objectives.diffusion import DiffusionObjective
+
+    encoder = CLIPText.from_pretrained(str(FIXTURES / "clip" / "tiny"))
+    rows = BATCH // args.processes
+    mine = slice(args.process_id * rows, (args.process_id + 1) * rows)
+    batch = {"image": global_images()[mine],
+             "text": {name: value[mine] for name, value in encoder.tokenize(PROMPTS).items()}}
+    objective = DiffusionObjective(
+        SimpleDiT(patch_size=4, emb_features=32, num_layers=1, num_heads=2, mlp_ratio=1),
+        presets.Flow(),
+        InputSpec(Field("image", (RES, RES, 3)), {"textcontext": Condition(encoder)}),
+        guidance=None, steps=2)
+    return objective, batch
+
+
 def mode_validate(args) -> dict:
     """A real diffusion validation pass in the pool, scored by the clip metric.
 
@@ -851,25 +873,11 @@ def mode_validate(args) -> dict:
     import optax
 
     from dew.data import Dataset
-    from dew.diffusion import presets
     from dew.eval import CLIPDistance
-    from dew.inputs import Condition, Field, InputSpec
-    from dew.inputs.encoders import CLIPText
-    from dew.nn.backbones.dit import SimpleDiT
-    from dew.objectives.diffusion import DiffusionObjective
     from dew.training import Layout, MeshSpec, Trainer
 
     tiny = str(FIXTURES / "clip" / "tiny")
-    encoder = CLIPText.from_pretrained(tiny)
-    rows = BATCH // args.processes
-    mine = slice(args.process_id * rows, (args.process_id + 1) * rows)
-    batch = {"image": global_images()[mine],
-             "text": {name: value[mine] for name, value in encoder.tokenize(PROMPTS).items()}}
-    objective = DiffusionObjective(
-        SimpleDiT(patch_size=4, emb_features=32, num_layers=1, num_heads=2, mlp_ratio=1),
-        presets.Flow(),
-        InputSpec(Field("image", (RES, RES, 3)), {"textcontext": Condition(encoder)}),
-        guidance=None, steps=2)
+    objective, batch = text_to_image(args)
     scored = ScoreRecorder()
     trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(0),
                       mesh=MeshSpec(fsdp=args.fsdp_size), layout=Layout(min_shard=TINY),
@@ -1205,6 +1213,29 @@ def mode_evaluation_replicas(args) -> dict:
     unconsumed = Evaluation.run(trainer.objective, state.variables, data.val, key=state.key,
                           mesh=trainer.device_mesh).scalars
     return {"measured": measured, "no_consumer": unconsumed}
+
+
+def mode_evaluation_clocks(args) -> dict:
+    """Each rank evaluates the text-to-image diffusion objective's validation
+    loss from its own clocks, rank 1's ahead of rank 0's: the loss draws its
+    noise and times from the event's key. Every rank reports root's step
+    and identity, and root's scores."""
+    import jax
+    import optax
+
+    from dew.data import Dataset
+    from dew.training import Layout, MeshSpec, Trainer
+
+    objective, batch = text_to_image(args)
+    trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(0), mesh=MeshSpec(),
+                      layout=Layout(min_shard=TINY), checkpoints=None, tracker=None)
+    state, _, _ = trainer.place()
+    data = Dataset(train=lambda partition: iter([batch]), val=lambda partition: iter([batch]),
+                   records=BATCH, batch=BATCH)
+    ahead = 4 * jax.process_index()
+    result = Evaluation.run(trainer.objective, state.variables, data.val, key=state.key, loss=True,
+                            step=5 + ahead, schedule_step=np.int32(3 + ahead), mesh=trainer.device_mesh)
+    return {"step": result.step, "event": list(result.event_key), "scores": result.scalars}
 
 
 def _preview_objective(kind):
@@ -2218,7 +2249,7 @@ def mode_step_fits(args) -> dict:
     # own devices' memory, which a CPU device does not report.
     step = SimpleNamespace(memory_analysis=lambda: SimpleNamespace(
         output_size_in_bytes=100, alias_size_in_bytes=0, temp_size_in_bytes=100))
-    whole = step_fits(step, MeshSpec(fsdp=jax.device_count()).build())
+    whole, _ = step_fits(step, MeshSpec(fsdp=jax.device_count()).build())
     tight = [10, -1][args.process_id]
     return {"whole_mesh": whole, "tight": fits_everywhere(tight),
             "roomy": fits_everywhere(abs(tight)),
@@ -2258,6 +2289,7 @@ MODES = {"token_budget": mode_token_budget,
          "training_contract": mode_training_contract,
          "evaluation_contract": mode_evaluation_contract,
          "evaluation_replicas": mode_evaluation_replicas,
+         "evaluation_clocks": mode_evaluation_clocks,
          "builtin_preview_failures": mode_builtin_preview_failures,
          "profile_failure": mode_profile_failure, "pool_refusals": mode_pool_refusals}
 
