@@ -1155,7 +1155,6 @@ class Trainer(Generic[Loss, Effects]):
         if self._rung() != before:
             _log.warning("taking an earlier run's plan; delete %s to decide again", record_path)
         first = None if recorded is None else record(recorded, 'recorded plan').get('split', 1)
-        misses = compilation_cache_counts()['train/cache_misses']
         plans, probes = plan_step(
             lower, lambda candidate: step_compiler_options(
                 self.objective, device_tokens(self.objective, candidate.micro, shards),
@@ -1171,10 +1170,9 @@ class Trainer(Generic[Loss, Effects]):
         self.objective.restore_head_tile(planned.tile)
         self._xla_defaults = planned.xla_defaults
         chosen = {**self._rung(), 'split': planned.split}
-        compiled = compilation_cache_counts()['train/cache_misses'] > misses
-        flops = plan_flops(recorded, chosen, compiled, planned.executable)
+        flops, counted = plan_flops(recorded, planned.executable)
         if record_path is not None:
-            keep_rung(record_path, key, {**chosen, 'flops': flops and [flops.model, flops.hardware]})
+            keep_rung(record_path, key, {**chosen, 'flops': counted})
         self.plan = settled(planned, plans, seconds, probes)
         if planned.split != candidates[0] or seconds:
             _log.warning("the step fits the devices in the plan %s", self.plan)
