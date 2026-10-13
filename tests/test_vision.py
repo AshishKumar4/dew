@@ -1,4 +1,4 @@
-"""SigLIP, Llama 4, Gemma 4 and Qwen 3.5 vision towers against transformers.
+"""SigLIP, Llama 4, Gemma 4, Qwen 3.5, MiMo-V2.6 and Muse Glimmer vision towers against their references.
 
 The claim is parity: the same weights and the same pixels through the
 reference implementation and through dew produce the same features.
@@ -37,9 +37,20 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from reference_error import assert_as_exact_as_the_reference, ieee_fixture
 from safetensors.numpy import load_file
 
-from dew.nn.vision import gemma4, llama4, projector_variables, qwen35, siglip, tower_variables
+from dew.nn.vision import (
+    PROJECTOR_PREFIX,
+    gemma4,
+    llama4,
+    mimo,
+    muse_glimmer,
+    projector_variables,
+    qwen35,
+    siglip,
+    tower_variables,
+)
 from dew.registry import projectors, towers
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "hf"
@@ -245,7 +256,7 @@ def test_qwen35_tower_matches_the_reference_implementation():
     fixture = load_fixture("qwen35-vision-tiny")
     record = qwen35.translate_qwen35_vision_config(fixture["config"])
     tower = towers.from_record(record).build()
-    variables = {"params": qwen35.translate_qwen35_vision_weights(fixture["tensors"])}
+    variables = tower_variables("qwen3_5", fixture["tensors"], "float32")
     assert np.max(np.abs(
         np.asarray(tower.apply(variables, fixture["pixels"])) - fixture["tower_ref"])) < 1e-4
     unpositioned = jax.tree_util.tree_map_with_path(
@@ -330,6 +341,89 @@ def test_a_qwen35_merger_beside_the_decoder_width_is_refused():
     config = json.loads((FIXTURES / "qwen35-vision-tiny" / "config.json").read_text())
     with pytest.raises(ValueError, match="out_hidden_size"):
         qwen35.translate_qwen35_projector_config(config, 32)
+
+
+def shared_fixture(name):
+    """A tools/mimo_reference.py or tools/muse_glimmer_reference.py fixture: the reference config, the
+    tower's and projector's tensors,
+    and the IEEE references (`refs.npz`)."""
+    directory = FIXTURES / name
+    return (json.loads((directory / "config.json").read_text()),
+            load_file(str(directory / "model.safetensors")),
+            load_file(str(directory / "projector.safetensors")), ieee_fixture(directory / "refs.npz"))
+
+
+def real(values, grid, merge: int = 1):
+    """Each row's own entries of padded `[B, L, ...]` values, a row's patches `prod(grid) / merge**2`."""
+    counts = np.prod(grid, axis=1) // merge ** 2
+    return np.concatenate([np.asarray(values)[row, :count] for row, count in enumerate(counts)])
+
+
+def test_mimo_tower_is_as_exact_as_the_reference():
+    """MiMo ViT on two rows, a 4x6 image and a two-frame 4x4 clip: full layers, a band of three keys
+    either side in the processor's order and in merge-block column order, and the sinks, within
+    the float64 gate; with the sinks zeroed the trunk leaves the reference by far more."""
+    config, tensors, _, refs = shared_fixture("mimo-vision-tiny")
+    tower = towers.from_record(mimo.translate_mimo_vision_config(config)).build()
+    variables = tower_variables("mimo", tensors, "float32")
+    out = tower.apply(variables, refs["pixels"], refs["grid"])
+    grid = refs["grid"]
+    assert_as_exact_as_the_reference(real(out, grid), real(refs["tower"], grid),
+                                     real(refs["tower_f64"], grid), "mimo tower")
+    sinkless = jax.tree_util.tree_map_with_path(
+        lambda path, leaf: jnp.zeros_like(leaf) if path[-1].key.startswith("sinks_") else leaf, variables)
+    with pytest.raises(AssertionError):
+        assert_as_exact_as_the_reference(real(tower.apply(sinkless, refs["pixels"], refs["grid"]), grid),
+                                         real(refs["tower"], grid), real(refs["tower_f64"], grid), "sinkless")
+
+
+def test_mimo_merger_is_as_exact_as_the_reference():
+    config, _, projector_tensors, refs = shared_fixture("mimo-vision-tiny")
+    record = mimo.translate_mimo_projector_config(config, config["text_config"]["hidden_size"])
+    projector = projectors.from_record(record).build()
+    variables = {"params": projector_variables("mimo", projector_tensors, "float32")}
+    out = projector.apply(variables, refs["tower"])
+    grid = refs["grid"]
+    assert_as_exact_as_the_reference(real(out, grid, 2), real(refs["projector"], grid, 2),
+                                     real(refs["projector_f64"], grid, 2), "mimo merger")
+
+
+def test_muse_glimmer_tower_is_as_exact_as_the_reference():
+    """Muse Glimmer's trunk on a 6x10 grid of 4-patch windows, some partial, and an 8x4 one: the
+    resampled table, the windows and full layers, the column-first rotary, within the float64 gate,
+    and the first row again from its NCHW image packed in the processor's time-then-channel order."""
+    config, tensors, _, refs = shared_fixture("muse-glimmer-vision-tiny")
+    tower = towers.from_record(muse_glimmer.translate_muse_glimmer_vision_config(config)).build()
+    variables = tower_variables("muse_glimmer", tensors, "float32")
+    grid = refs["grid"]
+    out = tower.apply(variables, refs["pixels"], grid)
+    assert_as_exact_as_the_reference(real(out, grid), real(refs["tower"], grid),
+                                     real(refs["tower_f64"], grid), "muse glimmer tower")
+    image = tower.apply(variables, refs["image"])
+    count = int(np.prod(grid[0]))
+    assert_as_exact_as_the_reference(np.asarray(image)[0], refs["tower"][0, :count],
+                                     refs["tower_f64"][0, :count], "muse glimmer image")
+
+
+def test_muse_glimmer_projector_is_as_exact_as_the_reference():
+    """The pixel shuffle channel by channel, the adapter's two activated maps, the projection and the
+    scale-free norm, each tensor named as the checkpoint router leaves it (`PROJECTOR_PREFIX`)."""
+    config, _, projector_tensors, refs = shared_fixture("muse-glimmer-vision-tiny")
+    projector = projectors.from_record(muse_glimmer.translate_muse_glimmer_projector_config(config)).build()
+    routed = {name[len(prefix):]: tensor for name, tensor in projector_tensors.items()
+              for prefix in PROJECTOR_PREFIX["muse_glimmer"] if name.startswith(prefix)}
+    variables = {"params": projector_variables("muse_glimmer", routed, "float32")}
+    out = projector.apply(variables, refs["tower"])
+    grid = refs["grid"]
+    assert_as_exact_as_the_reference(real(out, grid, 2), real(refs["projector"], grid, 2),
+                                     real(refs["projector_f64"], grid, 2), "muse glimmer projector")
+
+
+def test_a_mimo_tower_ending_column_by_column_is_refused():
+    config = json.loads((FIXTURES / "mimo-vision-tiny" / "config.json").read_text())
+    config["vision_config"]["vit_window_attn_types"] = [-1, 0, 0, 1]
+    with pytest.raises(ValueError, match="column"):
+        towers.from_record(mimo.translate_mimo_vision_config(config))
 
 
 def test_gemma4_clipping_matches_reference_forward_and_backward():
