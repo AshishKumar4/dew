@@ -36,8 +36,13 @@ from dew.records import JSON, json_value, record
 from dew.telemetry.instrumentation import StepFlops, count_compilation_cache, step_flops
 
 if TYPE_CHECKING:
-    from dew.objectives.base import Batch
+    import optax
+
+    from dew.objectives.base import Batch, Objective
     from dew.training.state import TrainState
+    from dew.training.trainer import StepFn
+
+    type CustomStep = Callable[[Objective, optax.GradientTransformation], StepFn]
 
 
 def rung_records() -> Path | None:
@@ -52,7 +57,7 @@ RECORD_VERSION = 2
 
 
 def rung_key(modules: Sequence[object], arguments: tuple[TrainState, Batch], splits: Sequence[int],
-             mesh: Mesh, step: Callable[..., object] | None = None) -> dict[str, JSON]:
+             mesh: Mesh, step: CustomStep | None = None) -> dict[str, JSON]:
     """What a recorded rung was decided for, read before the step traces: the
     configuration of the `modules` its programs run at the rung it starts from
     (`Objective.program_key`) and a custom `step`'s name, the code that builds
@@ -98,7 +103,7 @@ def _code() -> str:
 
 
 def recorded_rung(modules: Sequence[object], arguments: tuple[TrainState, Batch], splits: Sequence[int],
-                  mesh: Mesh, step: Callable[..., object] | None = None,
+                  mesh: Mesh, step: CustomStep | None = None,
                   ) -> tuple[Path | None, dict[str, JSON], JSON]:
     """Where the rung of the step over `arguments` on `mesh` is recorded, its key
     (`rung_key`), and the rung the record holds (None if there is none). A
