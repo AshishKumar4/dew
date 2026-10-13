@@ -32,7 +32,8 @@ from dew.decision import (
     Brier,
     Decide,
     DecisionObjective,
-    DecisionTable,
+    Decisions,
+    Example,
     LogLoss,
     StateFirstLayout,
 )
@@ -63,12 +64,21 @@ def report(out: str, line: dict) -> None:
 
 
 def main(options: Options) -> None:
-    table = DecisionTable(path=BANKING77[0], revision=BANKING77[1], label="label_text", question="intent",
-                          instructions="Which banking request is this?")
-    train, held_out = table.examples()
+    from dew.config.data import HoldOut, loader
+    from dew.data import Hub
+    from dew.data.compile import iterate
+
+    table = Decisions(source=Hub(BANKING77[0], revision=BANKING77[1]), label="label_text", question="intent",
+                      instructions="Which banking request is this?",
+                      validation=HoldOut(fraction=0.1, by="random", most=400))
+    training, held, _ = table.pipelines()
+    train = [Example.of(row["example"]) for row in iterate(training, read="memory")]
+    held_out = [] if held is None else [Example.of(row["example"]) for row in iterate(held, read="memory")]
     # The test split asks the same 77 options, in the training split's order.
     intents = train[0].questions["intent"].options
-    test, _ = replace(table, split="test", held_out=0.0, options=intents).examples()
+    test_pipeline, _, _ = replace(table, source=Hub(BANKING77[0], revision=BANKING77[1], split="test"),
+                                  validation=None, options=tuple(intents)).pipelines()
+    test = [Example.of(row["example"]) for row in iterate(test_pipeline, read="memory")]
 
     if options.backbone == "laya":
         laya = Decide.from_pretrained(LAYA[0], revision=LAYA[1], dtype="bfloat16")
@@ -84,7 +94,8 @@ def main(options: Options) -> None:
         layout = StateFirstLayout(max_len=512, head_max_len=448, option_tokens=12)
         objective = DecisionObjective(qwen, loss=LogLoss() + 0.5 * Brier(), layout=layout)
 
-    data = objective.dataset(train, batch=options.batch, validation=held_out[:options.batch * 8])
+    data = loader(Decisions(source=train, validation=held_out[:options.batch * 8]), batch=options.batch,
+                read="memory", objective=objective.data())
     checkpoints = Checkpoints(options.run, keep=1)
     state = Trainer(objective, OptimConfig(learning_rate=options.learning_rate), key=0,
                     checkpoints=checkpoints).fit(
