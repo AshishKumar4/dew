@@ -722,7 +722,7 @@ def device_fields(batch: Batch) -> Batch:
             for name, value in batch.items() if isinstance(value, Mapping) or placeable(value)}
 
 
-def host_fields(batch: object) -> dict:
+def host_fields(batch: Batch | np.ndarray | jax.Array) -> dict:
     """The fields of `batch` no device can hold, in the mappings that hold them:
     none for a batch that is no mapping of fields."""
     if not isinstance(batch, Mapping):
