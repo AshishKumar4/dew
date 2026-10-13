@@ -20,7 +20,7 @@ from recording import RecordingTracker
 from sharded import assert_sharded
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.nn.backbones.decoder_block import GatedMLP
+from dew.nn.mlp import GatedMLP
 from dew.nn.moe import SparseMLP
 from dew.objectives.lm import LMObjective
 from dew.registry import models

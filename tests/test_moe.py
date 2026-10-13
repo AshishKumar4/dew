@@ -25,7 +25,7 @@ import numpy as np
 import pytest
 from moe_support import by_expert, router_variables
 
-from dew.nn.backbones.decoder_block import GatedMLP
+from dew.nn.mlp import GatedMLP
 from dew.nn.moe import ExpertMLP, Router, SparseMLP, load_balance_update
 
 pytestmark = pytest.mark.kernel
