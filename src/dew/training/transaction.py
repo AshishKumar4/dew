@@ -51,6 +51,19 @@ def _chosen(take, taken, kept):
     return jax.tree.map(lambda new, old: jnp.where(take, new, old), taken, kept)
 
 
+def _only_when(due, taken, kept, operand):
+    """`taken(operand)` where `due` holds, else `kept(operand)`, running `taken` then alone.
+
+    XLA's conditional simplifier judges a branch by its ops' kinds, not their
+    size: one of elementwise ops and reductions, an optimizer update among
+    them, it runs on every call and selects (`TryRemoveConditional`). On Qwen3.5-0.8B
+    that ran the whole AdamW update on every microbatch, about 44 ms of a
+    731 ms step on an A100. The barrier, an op it counts as expensive, keeps
+    the branch a branch.
+    """
+    return jax.lax.cond(due, lambda current: jax.lax.optimization_barrier(taken(current)), kept, operand)
+
+
 def with_ema(params: Variables, ema: Variables | None) -> Variables | None:
     """The variables tree with the averaged leaves in place of the live ones."""
     return None if ema is None else merge(params, ema)
@@ -367,7 +380,7 @@ class Transaction:
             return apply(current), native_finite, norm
         if self.size == 1:
             return _chosen(native_finite, apply(current), current), native_finite, norm
-        return jax.lax.cond(native_finite, apply, lambda x: x, current), native_finite, norm
+        return _only_when(native_finite, apply, lambda x: x, current), native_finite, norm
 
     def finish_attempt(self, state, batch, aux, pending, gradient, attempt):
         """Commit the window when it is due, then advance the state's clocks.
@@ -409,7 +422,7 @@ class Transaction:
         else:
             dtype = jnp.result_type(*jax.tree.leaves(state.variables["params"]), jnp.float32)
             zero = jnp.real(jnp.zeros((), dtype))
-            numerical, native_finite, norm = jax.lax.cond(
+            numerical, native_finite, norm = _only_when(
                 due, commit, lambda x: (x, jnp.asarray(a=True), zero), numerical)
         finite = finite & native_finite
         if scale is not None:
