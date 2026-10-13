@@ -488,6 +488,32 @@ def test_refusals_name_the_reason(decoder, tmp_path):
         load("kohya", {"lora_unet_down_blocks_0.alpha": np.full((), 4, np.float32)})
     with pytest.raises(ValueError, match="lora_A without its partner"):
         load("half", {prefix + ".lora_A.weight": a})
+    for name, config, message in (
+            ("nan-alpha", {"lora_alpha": float("nan")}, "alpha must be a finite number, not nan"),
+            ("bool-alpha", {"lora_alpha": True}, "alpha must be a finite number, not True"),
+            ("zero-rank", {"r": 0}, "rank must be a positive integer, not 0"),
+            ("whole-dropout", {"lora_dropout": 1.0}, r"dropout must be in \[0, 1\), not 1.0"),
+            ("pattern-rank", {"rank_pattern": {"q_proj": 0}}, "rank_pattern q_proj: rank must be"),
+            ("pattern-alpha", {"alpha_pattern": {"q_proj": float("inf")}},
+             "alpha_pattern q_proj: alpha must")):
+        with pytest.raises(ValueError, match=message):
+            load(name, {prefix + ".lora_A.weight": a, prefix + ".lora_B.weight": b}, config)
+
+
+def test_every_description_of_an_adapter_refuses_its_numbers_alike():
+    """A spec, a record and a file's config hold rank, alpha and dropout to
+    one rule: a negative alpha is a finite number, a float rank is not a rank."""
+    record = {"alpha": 2.0, "rslora": False, "dropout": 0.0, "modules": ("q_proj",), "layouts": {}}
+    assert LoRA(rank=2, modules=("q_proj",), alpha=-4.0).alpha == -4.0
+    assert lora.AdapterRecord(rank=2, **{**record, "alpha": -4.0}).alpha == -4.0
+    for build in (lambda **numbers: LoRA(modules=("q_proj",), **numbers),
+                  lambda **numbers: lora.AdapterRecord(**{**record, **numbers})):
+        with pytest.raises(ValueError, match=r"rank must be a positive integer, not 2\.0"):
+            build(rank=2.0)
+        with pytest.raises(ValueError, match="alpha must be a finite number, not inf"):
+            build(rank=2, alpha=float("inf"))
+        with pytest.raises(ValueError, match="dropout must be in"):
+            build(rank=2, dropout=-0.1)
 
 
 def test_a_per_expert_source_tensor_takes_no_adapter():
