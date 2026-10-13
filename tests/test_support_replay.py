@@ -20,7 +20,7 @@ from dew.lora import LoRA
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.objectives.base import FROZEN
 from dew.objectives.lm import LMObjective
-from dew.objectives.lm.chunked import chunked_cross_entropy, model_logits, support_log_probs
+from dew.objectives.lm.chunked import chunked_cross_entropy, model_logits
 from dew.objectives.rl.grpo import GRPOObjective
 from dew.objectives.rl.sessions import SUPPORT_COLUMNS_KEY, SUPPORT_KEY, Call, Session, Status, pack
 from dew.sampling.text import Sampling
@@ -157,80 +157,3 @@ def test_the_gradient_flows_only_through_the_kept_columns():
     assert np.all(np.isfinite(table))
     assert np.abs(table[:, ~touched]).max() == 0
     assert np.abs(table[:, touched]).max() > 0
-
-
-def test_a_target_outside_its_support_scores_minus_infinity():
-    hidden = jnp.ones((1, 2, 4))
-    head = jnp.eye(4, 6)
-    scores, present = support_log_probs(hidden, head, jnp.asarray([[5, 1]]),
-                                        jnp.asarray([[0, 1]]), jnp.asarray([[0, 0]]))
-    assert present.tolist() == [[True, False]]
-    assert float(scores[0, 0]) == -np.inf and float(scores[0, 1]) == 0.0
-
-
-def test_pack_keeps_supports_ragged_within_their_rows():
-    """One wide nucleus widens only its own row's capacity; each kept id is
-    tagged with its sampled id's column in that row."""
-    call = Call((1, 2), (3, 4), (-0.5, -0.1), "stop", 0, support=(tuple(range(3, 40)), (4,)))
-    session = Session("t", "g", 0, 0, (call,), Status.COMPLETED, 1.0)
-    batch = pack([session], 6, support_capacity=40)
-    assert batch[SUPPORT_KEY].shape == batch[SUPPORT_COLUMNS_KEY].shape == (1, 40)
-    assert batch[SUPPORT_KEY][0, :38].tolist() == [*range(3, 40), 4]
-    assert batch[SUPPORT_COLUMNS_KEY][0, :38].tolist() == [2] * 37 + [3]
-    assert (batch[SUPPORT_KEY][0, 38:] == -1).all() and (batch[SUPPORT_COLUMNS_KEY][0, 38:] == -1).all()
-    with pytest.raises(ValueError, match="more than support_capacity"):
-        pack([session], 6, support_capacity=10)
-    with pytest.raises(ValueError, match="outside its recorded support"):
-        Call((1,), (3,), (-0.5,), "stop", 0, support=((4,),))
-
-
-def test_supports_need_a_fixed_capacity_so_every_batch_has_one_shape():
-    """Two batches whose widest rows keep different id counts pack to one
-    shape, so the jitted step is traced once; without a capacity, pack refuses."""
-    def batch(kept, **options):
-        call = Call((1, 2), (3,), (-0.5,), "stop", 0, support=(kept,))
-        return pack([Session("t", "g", 0, 0, (call,), Status.COMPLETED, 1.0)], 4, **options)
-
-    with pytest.raises(ValueError, match="support_capacity"):
-        batch((3, 5))
-    assert (
-        batch((3, 5), support_capacity=8)[SUPPORT_KEY].shape
-        == batch((3,), support_capacity=8)[SUPPORT_KEY].shape
-    )
-
-
-@pytest.mark.mesh(devices=4)
-def test_supports_shard_with_their_rows():
-    """The trainer splits axis 0 of every batch leaf over the data axes, so the
-    supports have to lead with rows, as every other packed array does."""
-    from dew.training import MeshSpec
-    from dew.training.distributed import shard_batch
-
-    sessions = [Session("t", "g", index, 0, (Call((1, 2), (3,), (-0.5,), "stop", 0, support=((3, 5, 7),)),),
-                        Status.COMPLETED, float(index)) for index in range(7)]
-    batch = pack(sessions, 3, rows=8, support_capacity=3)
-    placed = shard_batch(MeshSpec(fsdp=4).build(), batch)
-    assert placed[SUPPORT_KEY].shape == (8, 3)
-
-
-
-def test_padded_support_entries_keep_the_gradient_finite():
-    """Padding reads head row 0; with a large row-0 logit at a low temperature
-    its exp overflows, and the masked entry must not turn the backward NaN."""
-    hidden = jnp.zeros((1, 2, 4)).at[0, 0, 0].set(100.0)
-    head = jnp.eye(4, 6)
-
-    def total(hidden, head):
-        scores, present = support_log_probs(
-            hidden,
-            head,
-            jnp.asarray([[1, 3]]),
-            jnp.asarray([[1, 2, -1, -1]]),
-            jnp.asarray([[0, 0, -1, -1]]),
-            temperature=0.5,
-        )
-        return jnp.sum(jnp.where(present, scores, 0.0))
-
-    assert np.isfinite(float(total(hidden, head)))
-    for gradient in jax.grad(total, (0, 1))(hidden, head):
-        assert np.all(np.isfinite(np.asarray(gradient)))

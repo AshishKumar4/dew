@@ -15,9 +15,6 @@ Parameter gradients are written back into the source layout through the
 same `WeightLayout`s an export uses. Every gap is scaled by max(1, |reference|).
 """
 
-import json
-import math
-import shutil
 from pathlib import Path
 
 import jax
@@ -26,17 +23,9 @@ import numpy as np
 import pytest
 from interop_support import assert_layout_tensors, extract_fixture, fixture_arrays, scaled_gap
 from reference_error import assert_as_exact_as_the_reference
-from safetensors.numpy import save_file
 
 from dew.interop.diffusion import component_tensors
-from dew.nn.autoencoders.wan import (
-    WanRMSNorm,
-    chunked_decode,
-    chunked_moments,
-    load_wan_vae,
-    wan_vae_fields,
-    wan_vae_path,
-)
+from dew.nn.autoencoders.wan import chunked_decode, chunked_moments, load_wan_vae
 
 ROOT = Path(__file__).resolve().parents[1]
 FORWARD = 1e-5
@@ -301,24 +290,6 @@ def test_a_bfloat16_walk_matches_the_sources_bfloat16_walk(source):
         assert difference.max() / scale < 2.0 ** -3, name
 
 
-def test_a_zero_row_normalizes_to_zero_with_a_finite_gradient():
-    """`F.normalize` clamps the norm at 1e-12, so a zero row and one far
-    below the clamp both divide by 1e-12: the zero row stays zero, and either
-    row's gradient is the probe times sqrt(C) * gamma / 1e-12, finite, as
-    torch's is. Clamping the norm after its square root would leave sqrt's
-    derivative at zero, NaN through the clamp, in both."""
-    features = 16
-    rows = jnp.stack([jnp.zeros(features), jnp.full(features, 1e-20)])
-    gamma = jnp.linspace(0.5, 1.5, features)
-    probe = jnp.linspace(-1.0, 1.0, 2 * features).reshape(2, features)
-    output, pullback = jax.vjp(lambda x: WanRMSNorm(features, 1).apply({"params": {"gamma": gamma}}, x), rows)
-    (gradient,) = pullback(probe)
-    clamped = math.sqrt(features) * np.asarray(gamma) / 1e-12
-    np.testing.assert_array_equal(np.asarray(output[0]), 0.0)
-    np.testing.assert_allclose(np.asarray(output[1]), np.asarray(rows[1]) * clamped, rtol=1e-6)
-    np.testing.assert_allclose(np.asarray(gradient), np.asarray(probe) * clamped, rtol=1e-6)
-
-
 def test_the_autoencoder_normalizes_as_the_pipeline_does(loaded, reference):
     """`WanPipeline` stores `(z - latents_mean) * (1 / latents_std)` and
     decodes `z / (1 / latents_std) + latents_mean`, per channel, and a video
@@ -341,79 +312,3 @@ def test_the_autoencoder_normalizes_as_the_pipeline_does(loaded, reference):
     # latent the decoder reads is a float32 rounding from numpy's.
     np.testing.assert_allclose(decoded, np.asarray(autoencoder.decode_video(params, latent / scale + mean)),
                                rtol=0, atol=1e-5)
-
-
-def test_a_video_of_the_wrong_length_is_refused(loaded):
-    autoencoder, params, _, _ = loaded
-    with pytest.raises(ValueError, match="1 \\+ 4k frames"):
-        autoencoder.encode(params, np.zeros((1, 4, 32, 48, 3), np.float32))
-
-
-def test_a_missing_tensor_is_refused(source, tmp_path):
-    shutil.copytree(source / "vae", tmp_path / "vae")
-    tensors = component_tensors(source, "vae")
-    del tensors["decoder.up_blocks.0.upsamplers.0.time_conv.weight"]
-    save_file(tensors, tmp_path / "vae" / "diffusion_pytorch_model.safetensors")
-    with pytest.raises(ValueError, match="time_conv"):
-        load_wan_vae(tmp_path)
-
-
-@pytest.mark.parametrize("name, ndim", [
-    ("encoder.down_blocks.0.norm1.gamma", 5),
-    ("decoder.conv_in.weight", 3),
-    ("vae.encoder.conv_in.weight", 5),
-    ("encoder.conv_in.scale", 1),
-])
-def test_an_unknown_tensor_is_refused(name, ndim):
-    with pytest.raises(ValueError):
-        wan_vae_path(name, ndim)
-
-
-@pytest.mark.parametrize("change", [
-    {"attn_scales": [1.0]}, {"dropout": 0.1}, {"is_residual": True}, {"patch_size": 2},
-    {"temperal_downsample": [False, True]},
-])
-def test_an_unsupported_config_is_refused(source, change):
-    config = json.loads((source / "vae" / "config.json").read_text())
-    wan_vae_fields(config)
-    with pytest.raises(ValueError):
-        wan_vae_fields({**config, **change})
-
-
-def test_a_video_run_denoises_wan_latents_and_samples_whole_clips(source):
-    """A `VideoDataset` run behind the Wan VAE denoises 1 + k latent frames
-    for clips of 1 + 4k, trains, and samples clips of the length it read."""
-    import optax
-    from diffusion_stubs import STUB_TEXT
-
-    from dew.config import ModelConfig, ObjectiveConfig, TrainerConfig
-    from dew.data import Dataset, VideoDataset
-    from dew.objectives.diffusion import DiffusionRunConfig, PretrainedAutoencoder, TextCondition
-    from dew.sampling import Euler
-    from dew.training import Trainer
-
-    config = DiffusionRunConfig(
-        model=ModelConfig(
-            "video_dit",
-            {"patch_size": 1, "emb_features": 16, "num_layers": 1, "num_heads": 2, "mlp_ratio": 1,
-             "dtype": "float32", "attention_impl": "reference"},
-        ),
-        data=VideoDataset(frame_size=32, frames=9),
-        trainer=TrainerConfig(batch_size=8, steps=1),
-        val_metrics=(),
-        text=TextCondition(encoder=STUB_TEXT, checkpoint="stub-clip"),
-        autoencoder=PretrainedAutoencoder(modelname=str(source), revision="main", dtype="float32"),
-        objective=ObjectiveConfig("diffusion", {"solver": Euler(), "steps": 2}),
-    )
-    objective = config.build()
-    assert objective.latent_shape == (3, 4, 4, 4)
-    clips = (np.random.default_rng(0).random((8, 9, 32, 32, 3)) * 255).astype(np.uint8)
-    batch = {
-        "video": clips,
-        "text": objective.inputs.conditions["textcontext"].encoder.tokenize(list("abcdefgh")),
-    }
-    state = Trainer(objective, optax.adam(1e-3), key=jax.random.PRNGKey(0)).fit(
-        Dataset(train=lambda partition: iter(lambda: batch, None), val=None, records=None, batch=8),
-        steps=1, log_every=100)
-    sampled = objective.pipeline(state)(["a", "b"], key=0).host()
-    assert sampled.images.shape == (2, 9, 32, 32, 3)

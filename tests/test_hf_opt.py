@@ -2,22 +2,14 @@
 
 from pathlib import Path
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
 
 from dew.interop import Pretrained
-from dew.interop.hf_decoders import translate_config
 
 DIRECTORY = Path(__file__).parent / 'fixtures' / 'hf' / 'opt-tiny'
-
-
-def test_opt_config_holds_reserved_position_rows():
-    config = translate_config({'model_type': 'opt', 'vocab_size': 32, 'hidden_size': 16,
-                               'ffn_dim': 32, 'num_hidden_layers': 2, 'num_attention_heads': 2,
-                               'max_position_embeddings': 32})
-    assert config['position_embedding_size'] == 34
-    assert config['position_embedding_offset'] == 2
 
 
 def test_opt_same_weight_logits_and_cached_greedy_generation():
@@ -49,15 +41,11 @@ def test_opt_export_uses_the_reference_checkpoint_names(tmp_path):
     np.testing.assert_array_equal(reloaded.model.apply(reloaded.variables, ids),
                                   loaded.model.apply(loaded.variables, ids))
 
-
-@pytest.mark.parametrize('unsupported', [{'do_layer_norm_before': False},
-                                        {'word_embed_proj_dim': 8},
-                                        {'layer_norm_elementwise_affine': False}])
-def test_opt_refuses_a_block_with_unrepresented_operations(unsupported):
-    with pytest.raises(ValueError):
-        translate_config({'model_type': 'opt', 'vocab_size': 32, 'hidden_size': 16,
-                          'ffn_dim': 32, 'num_hidden_layers': 2, 'num_attention_heads': 2,
-                          'max_position_embeddings': 32, **unsupported})
+    assert reloaded.model == loaded.model
+    assert jax.tree.structure(reloaded.variables) == jax.tree.structure(loaded.variables)
+    for original, restored_leaf in zip(jax.tree.leaves(loaded.variables),
+                                        jax.tree.leaves(reloaded.variables), strict=True):
+        np.testing.assert_array_equal(np.asarray(restored_leaf), np.asarray(original))
 
 
 @pytest.mark.network

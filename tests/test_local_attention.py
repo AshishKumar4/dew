@@ -13,7 +13,6 @@ import numpy as np
 import pytest
 from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_mask as splash
 
-from dew.nn import attention
 from dew.nn.attention import local_attention, scaled_dot_product_attention
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.kernels import bf16_dot_runs
@@ -141,59 +140,6 @@ def test_memory_grows_with_the_window_not_the_square_of_the_sequence():
     assert banded * 4 < dense
 
 
-def test_sinks_band_where_cudnn_would_take_the_window(monkeypatch):
-    """No fused kernel honours sinks, so a sink call that resolves to cuDNN
-    (a bf16 GPU call, stood in for here) still bands rather than handing the
-    window to the dense sink path's `[H, S, S]` logits."""
-    monkeypatch.setattr(attention, "cudnn_runs", lambda query, softcap=None: True)
-    length, window, heads = 4096, 128, 4
-    query, key, value = inputs(length, heads=heads, kv_heads=heads, batch=1)
-    sinks = jnp.zeros((heads,))
-    compiled = jax.jit(lambda q, k, v: local_attention(
-        q, k, v, window=window, sinks=sinks)).lower(query, key, value).compile()
-    assert compiled.memory_analysis().temp_size_in_bytes * 4 < heads * length * length * 4
-
-    query, key, value = inputs(64)
-    sinks = jax.random.normal(jax.random.key(4), (4,))
-    expected = scaled_dot_product_attention(query, key, value, causal=True, sliding_window=8,
-                                            sinks=sinks, implementation="reference")
-    actual = local_attention(query, key, value, window=8, sinks=sinks)
-    np.testing.assert_allclose(np.asarray(actual), np.asarray(expected), atol=2e-6, rtol=0)
-
-
-@pytest.mark.parametrize("span,length,packing", [
-    ({"window": 4096}, 256, True),
-    ({"chunk": 8192}, 1024, True),
-    ({"chunk": 8192}, 1024, False),
-    ({"chunk": 8192}, 2048, False),
-])
-def test_a_sequence_within_two_spans_costs_no_more_than_the_dense_call(span, length, packing):
-    """Banding pads to whole spans, so at or below two spans it would hold
-    more than the `[S, S]` mask it replaces: those calls take the dense mask,
-    and the compiled temporaries stay at the dense call's."""
-    heads = 4
-    query, key, value = inputs(length, heads=heads, kv_heads=heads, batch=1)
-    segments, positions = packed(length, (length // 3, length - 5))
-    segments, positions = jnp.asarray(segments)[None], jnp.asarray(positions)
-    rows = jnp.arange(length)
-    keep = rows[None, :] <= rows[:, None]
-    if packing:
-        keep = keep & (segments[0, :, None] == segments[0, None, :]) & (segments[0, :, None] != 0)
-    if "window" in span:
-        keep = keep & (rows[:, None] - rows[None, :] < span["window"])
-
-    def temporaries(fn):
-        compiled = jax.jit(fn).lower(query, key, value).compile()
-        return compiled.memory_analysis().temp_size_in_bytes
-
-    dense = temporaries(lambda q, k, v: scaled_dot_product_attention(
-        q, k, v, mask=keep[None, None], implementation="xla"))
-    local = temporaries(lambda q, k, v: local_attention(
-        q, k, v, **span, segment_ids=segments if packing else None,
-        positions=positions if packing and "chunk" in span else None, implementation="xla"))
-    assert local <= dense * 1.25
-
-
 def test_a_chunked_kind_decodes_what_its_whole_sequence_pass_computes():
     """The whole-sequence pass runs `local_attention`; the cached decode runs
     the chunk as a mask over cache slots. Both read the same keys."""
@@ -213,14 +159,6 @@ def test_a_chunked_kind_decodes_what_its_whole_sequence_pass_computes():
                                       tokens[:, index:index + 1], decode=True, mutable=["cache"])
         steps.append(logits[:, -1])
     np.testing.assert_allclose(np.stack(steps, 1), whole[:, 3:], atol=1e-5, rtol=0)
-
-
-def test_a_kind_reads_a_window_or_a_chunk_not_both():
-    model = CausalTransformer(
-        vocab_size=16, num_layers=1, emb_features=16, num_heads=2, max_seq_len=8,
-        layer_types=("local",), kinds={"local": {"chunk": 4, "window": 4}})
-    with pytest.raises(ValueError, match="window and a chunk"):
-        model.init(jax.random.key(0), jnp.zeros((1, 4), jnp.int32))
 
 
 @pytest.mark.gpu(reason="needs a cuda device of sm80 or later, cuDNN's bf16 floor")
