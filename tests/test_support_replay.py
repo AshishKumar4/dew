@@ -18,6 +18,7 @@ from affine_run import Data
 
 from dew.lora import LoRA
 from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.nn.protocols import OutputTable
 from dew.objectives.base import FROZEN
 from dew.objectives.lm import LMObjective
 from dew.objectives.lm.chunked import chunked_cross_entropy, model_logits, support_log_probs
@@ -131,8 +132,14 @@ def test_a_tempered_softcapped_cross_entropy_divides_after_the_cap():
         return -jnp.take_along_axis(jax.nn.log_softmax(logits), targets[:, None], 1)[:, 0]
 
     def chunked(hidden, head):
-        return chunked_cross_entropy(hidden, head, targets, 3, softcap=30.0, temperature=0.7,
-                                     tile=(2, 16))[0]
+        return chunked_cross_entropy(
+            hidden,
+            OutputTable(head, vocab_major=False, softcap=30.0),
+            targets,
+            3,
+            temperature=0.7,
+            tile=(2, 16),
+        )[0]
 
     np.testing.assert_allclose(chunked(hidden, head), dense(hidden, head), rtol=1e-5)
     for mine, theirs in zip(jax.grad(lambda *a: chunked(*a).sum(), (0, 1))(hidden, head),
@@ -162,8 +169,13 @@ def test_the_gradient_flows_only_through_the_kept_columns():
 def test_a_target_outside_its_support_scores_minus_infinity():
     hidden = jnp.ones((1, 2, 4))
     head = jnp.eye(4, 6)
-    scores, present = support_log_probs(hidden, head, jnp.asarray([[5, 1]]),
-                                        jnp.asarray([[0, 1]]), jnp.asarray([[0, 0]]))
+    scores, present = support_log_probs(
+        hidden,
+        OutputTable(head, vocab_major=False),
+        jnp.asarray([[5, 1]]),
+        jnp.asarray([[0, 1]]),
+        jnp.asarray([[0, 0]]),
+    )
     assert present.tolist() == [[True, False]]
     assert float(scores[0, 0]) == -np.inf and float(scores[0, 1]) == 0.0
 
@@ -223,7 +235,7 @@ def test_padded_support_entries_keep_the_gradient_finite():
     def total(hidden, head):
         scores, present = support_log_probs(
             hidden,
-            head,
+            OutputTable(head, vocab_major=False),
             jnp.asarray([[1, 3]]),
             jnp.asarray([[1, 2, -1, -1]]),
             jnp.asarray([[0, 0, -1, -1]]),

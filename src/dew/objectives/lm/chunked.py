@@ -39,7 +39,6 @@ from typing import NamedTuple
 import jax
 import jax.numpy as jnp
 from flax import linen as nn
-from flax.typing import PrecisionLike
 from jax.sharding import PartitionSpec as P
 
 from dew.nn.kernels.generation import device_generation
@@ -515,40 +514,36 @@ def _token_spec(shape: tuple[int, ...]) -> P:
     return P(*(entry[0] if len(entry) == 1 else tuple(entry) or None for entry in entries))
 
 
-def chunked_cross_entropy(hidden, head_weight, targets, chunks: int, *,
-                          softcap: float | None = None,
-                          precision: PrecisionLike = None,
+def chunked_cross_entropy(hidden, head: OutputTable, targets, chunks: int, *,
                           tile: tuple[int, int] | None = (1024, 8192),
-                          vocab_major: bool = False,
                           predict: bool = True, temperature: float = 1.0,
-                          excluded: int | None = None, bias=None):
-    """Per-token cross entropy of `hidden @ head_weight`, its top-1 column
-    and its log partition.
+                          excluded: int | None = None):
+    """Per-token cross entropy of `head.logits(hidden)`, its top-1 column
+    and its log partition, the head contracted in tiles.
 
-    `hidden` is `[..., features]` states in any compute dtype, `head_weight`
-    the `[features, vocab]` head in its stored dtype (each tile upcasts its
-    own slice; the products are accumulated in fp32), `targets` the `[...]`
-    int32 ids. Returns the per-token losses, the argmax prediction (None
+    `hidden` is `[..., features]` states in any dtype, `head` the table in
+    its stored dtype (each tile upcasts its own slice; the products are
+    accumulated in fp32), `targets` the `[...]` int32 ids. Returns the
+    per-token losses, the argmax prediction (None
     when `predict` is False, which skips the argmax: 0.77 ms of the head's
     8.0 on a TPU v6e) and the row's logsumexp (log Z, which PaLM's z-loss
     squares), all shaped like `targets`, each of the two float outputs carrying its own gradient. The
     caller owns the weighting and the mean, and with them the padding id.
 
-    The backward keeps the head it was given. With `vocab_major` the head
-    is `[vocab, features]`, the way a tied embedding table is stored, and
-    the value kept is the parameter itself; a `[features, vocab]` head is
+    The backward keeps the head it was given. A `vocab_major` head is
+    `[vocab, features]`, the way a tied embedding table is stored, and the
+    value kept is the parameter itself; a `[features, vocab]` head is
     transposed here first, and what the backward keeps is that transposed
-    array, a vocabulary-sized copy of a tied table (`head_table` on the
-    backbone hands out the stored orientation).
+    array (`head_table` on the backbone hands out the stored orientation).
 
-    The product follows the states' dtype, forward and backward: bf16
-    states at the default precision multiply the head as bf16 and accumulate
-    in fp32, and fp32 states multiply it as stored. The softmax, the
-    logsumexp and the loss are fp32 either way, or the states' dtype where
-    it is wider (a float64 reference's).
+    The states pass the head's input quantizer first, and the product follows
+    the head's compute dtype (the states' where it names none), forward and
+    backward: bf16 compute at the default precision multiplies the head as
+    bf16 and accumulates in fp32, and fp32 compute multiplies it as stored.
+    The softmax, the logsumexp and the loss are fp32 either way, or the
+    states' dtype where it is wider (a float64 reference's).
 
-    `softcap` is the backbone's `final_logit_softcap`. It is elementwise, so
-    capping a tile and capping the row agree. `tile` is a `(tokens, columns)`
+    The softcap is elementwise, so capping a tile and capping the row agree. `tile` is a `(tokens, columns)`
     block: both passes walk tokens in the first and columns in the second
     or a chunk, whichever is narrower, and the backward holds nothing
     wider, so it is the only knob on the backward's temporaries. The
@@ -574,11 +569,12 @@ def chunked_cross_entropy(hidden, head_weight, targets, chunks: int, *,
     the tokens' gradient cross devices. Otherwise the head is gathered whole
     on each device, and its gradient is the one sum that crosses devices.
     """
-    if bias is not None:
-        bias = jnp.asarray(bias, at_least_fp32(hidden.dtype))
-        if bias.shape != (head_weight.shape[0 if vocab_major else 1],):
-            raise ValueError('bias must have one entry per vocabulary column')
-    features = head_weight.shape[1 if vocab_major else 0]
+    hidden, vocab_major, precision = head.states(hidden), head.vocab_major, head.precision
+    compute = hidden.dtype if head.compute is None else head.compute
+    bias = None if head.bias is None else jnp.asarray(head.bias, at_least_fp32(hidden.dtype))
+    if bias is not None and bias.shape != (head.matrix.shape[0 if vocab_major else 1],):
+        raise ValueError('bias must have one entry per vocabulary column')
+    features = head.matrix.shape[1 if vocab_major else 0]
     if hidden.shape[-1] != features:
         raise ValueError(
             f"hidden states are {hidden.shape[-1]} wide and the head is {features}")
@@ -590,9 +586,9 @@ def chunked_cross_entropy(hidden, head_weight, targets, chunks: int, *,
 
     # A traced cap keeps `final_logit_softcap` differentiable; the head is
     # held vocabulary-major so a column tile is a row slice.
-    cap = None if softcap is None else jnp.asarray(softcap, at_least_fp32(hidden.dtype))
-    table = head_weight if vocab_major else head_weight.T
-    product = BF16 if rounds_to_bf16(hidden.dtype, precision) else precision
+    cap = None if head.softcap is None else jnp.asarray(head.softcap, at_least_fp32(hidden.dtype))
+    table = head.matrix if vocab_major else head.matrix.T
+    product = BF16 if rounds_to_bf16(compute, precision) else precision
 
     def head(hidden, table, targets, excluded, cap, bias):
         if tile is None:
@@ -604,7 +600,7 @@ def chunked_cross_entropy(hidden, head_weight, targets, chunks: int, *,
     def column_logits(states, rows, cap, bias):
         """The capped logit of each state against its own row of the head,
         as the head's tiles score it."""
-        effective = BF16 if rounds_to_bf16(states.dtype, precision) else precision
+        effective = BF16 if rounds_to_bf16(compute, precision) else precision
         operands = _operand_dtype(effective, at_least_fp32(states.dtype))
         logits = jax.vmap(lambda state, row: _tile_logits(
             state[None].astype(operands), row[None], effective)[0, 0])(states, rows)
@@ -632,10 +628,8 @@ def head_cross_entropy(model, variables, hidden, targets, chunks: int, *,
     """
     table = head_table(model, variables)
     if table is not None:
-        return chunked_cross_entropy(
-            hidden, table.matrix, targets, chunks, softcap=table.softcap, precision=table.precision,
-            tile=tile, vocab_major=table.vocab_major, predict=predict, temperature=temperature,
-            excluded=excluded, bias=table.bias)
+        return chunked_cross_entropy(hidden, table, targets, chunks, tile=tile, predict=predict,
+                                     temperature=temperature, excluded=excluded)
     return logits_cross_entropy(model.apply(variables, hidden, method="logits_from_hidden"), targets,
                                 predict=predict, temperature=temperature, excluded=excluded)
 
@@ -760,9 +754,8 @@ SUPPORT_BLOCK = 1 << 15
 """Kept ids one rematerialized step of `support_log_probs` scores, over all rows."""
 
 
-def support_log_probs(hidden, head_weight, targets, support_ids, support_columns, *,
-                      temperature: float = 1.0, softcap: float | None = None,
-                      precision: PrecisionLike = None, vocab_major: bool = False, bias=None):
+def support_log_probs(hidden, head: OutputTable, targets, support_ids, support_columns, *,
+                      temperature: float = 1.0):
     """Each target's log-probability renormalized over its recorded sampling support.
 
     Keep-sampling-mask (DeepSeek-V3.2 section 3.1; slime 5bae5bb `loss.py`
@@ -776,13 +769,13 @@ def support_log_probs(hidden, head_weight, targets, support_ids, support_columns
     row's kept ids back to back and `support_columns` `[B, C]` the column of
     the target each belongs to, both -1 on padding, so the arrays shard with
     their rows. Only those columns of the head are scored, `SUPPORT_BLOCK`
-    entries at a time and rematerialized in the backward pass. `head_weight`
-    is `[features, vocab]`, or `[vocab, features]` with `vocab_major`, as in
-    `chunked_cross_entropy`. Returns the log-probs, `-inf` for a target
+    entries at a time and rematerialized in the backward pass, as
+    `head.logits` scores them. Returns the log-probs, `-inf` for a target
     outside its support, and whether each target had one; a target with none
     scores 0.0 here.
     """
-    table = jnp.asarray(head_weight) if vocab_major else jnp.asarray(head_weight).T
+    hidden = head.states(hidden)
+    table = jnp.asarray(head.matrix) if head.vocab_major else jnp.asarray(head.matrix).T
     kept = support_ids.shape[1]
     block = max(1, min(kept, SUPPORT_BLOCK // targets.shape[0]))
     blocks = -(-kept // block)
@@ -795,9 +788,10 @@ def support_log_probs(hidden, head_weight, targets, support_ids, support_columns
         chosen, owner = args
         state = jnp.take_along_axis(hidden, jnp.maximum(owner, 0)[..., None], axis=1)
         # The full head's product (`head_product`), over the kept rows only.
-        logits = head_product('bcd,bcd->bc', state, table[jnp.maximum(chosen, 0)], precision)
-        return capped_logits(biased_logits(logits, None if bias is None else bias[jnp.maximum(chosen, 0)]),
-                       softcap, temperature)
+        logits = head_product('bcd,bcd->bc', state, table[jnp.maximum(chosen, 0)], head.precision,
+                              compute=head.compute)
+        bias = None if head.bias is None else head.bias[jnp.maximum(chosen, 0)]
+        return capped_logits(biased_logits(logits, bias), head.softcap, temperature)
 
     pieces = (
         ids.reshape(-1, blocks, block).swapaxes(0, 1),

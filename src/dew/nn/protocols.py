@@ -45,7 +45,6 @@ import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn, struct
 from flax.typing import PrecisionLike, VariableDict
-from jax.sharding import PartitionSpec
 from jax.typing import DTypeLike
 
 from dew.nn.inputs import ModelKwarg
@@ -94,6 +93,7 @@ __all__ = [
     "ModelKwarg",
     "OutputTable",
     "ProjectionGroup",
+    "QuantizesInputs",
     "Recomputing",
     "RematChoosing",
     "RequiresText",
@@ -111,10 +111,9 @@ class OutputTable:
     otherwise, an optional fp32 `[vocab]` `bias` added after the product,
     the `softcap` applied last, and the `precision` the product runs at.
     `compute`, the model's compute dtype, decides the product's operands
-    (`dew.nn.precision.head_product`; the states' dtype where None), an
+    (`dew.nn.precision.head_product`; the states' dtype where None), and an
     `input_quantizer` rounds the states first as a checkpoint's head input
-    quantization does, and `spec` is the matrix's partition spec in its
-    stored orientation.
+    quantization does.
 
     Contracting the model's final states with it (`logits`) reproduces the
     model's own logits, bias, softcap and any adapter on the head included.
@@ -129,7 +128,6 @@ class OutputTable:
     precision: PrecisionLike = struct.field(pytree_node=False, default=None)
     compute: DTypeLike | None = struct.field(pytree_node=False, default=None)
     input_quantizer: InputQuantizer | None = None
-    spec: PartitionSpec | None = struct.field(pytree_node=False, default=None)
 
     def states(self, hidden: jax.Array) -> jax.Array:
         """`hidden` as the product reads it: through the input quantizer's QDQ."""
@@ -372,6 +370,16 @@ class AffineHead(Protocol):
     """
 
     def output_table(self) -> OutputTable | None: ...
+
+
+@runtime_checkable
+class QuantizesInputs(Protocol):
+    """A model computing under a checkpoint's input quantization
+    (`dew.training.quantization.InputQuantization`): the quantizer a bound
+    module's input takes, which a head read as a table (`OutputTable`) applies
+    as the module's own call does."""
+
+    def input_quantizer(self, module: nn.Module) -> InputQuantizer | None: ...
 
 
 @runtime_checkable

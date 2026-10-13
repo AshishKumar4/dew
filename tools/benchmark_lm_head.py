@@ -31,8 +31,8 @@ import inspect
 import json
 import statistics
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, replace
-from typing import Callable
 
 import jax
 import jax.numpy as jnp
@@ -85,8 +85,12 @@ def baseline(states, table, targets, variant: Variant):
 
 def bounded(states, table, targets, variant: Variant):
     losses, predicted, log_z = chunked_cross_entropy(
-        states, table.T, targets, variant.chunks, softcap=variant.softcap,
-        tile=variant.tile, predict=variant.accuracy
+        states,
+        OutputTable(table.T, vocab_major=False, softcap=variant.softcap),
+        targets,
+        variant.chunks,
+        tile=variant.tile,
+        predict=variant.accuracy,
     )
     return finish(losses, predicted, log_z, targets, variant)
 

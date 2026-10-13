@@ -1048,10 +1048,8 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
             owners = jnp.where(columns > 0, columns - 1, -1)
             head = head_table(self.model, params)
             if head is not None:
-                filtered, present = support_log_probs(
-                    scores.hidden, head.matrix, targets, ids, owners, temperature=temperature,
-                    vocab_major=head.vocab_major, softcap=head.softcap, precision=head.precision,
-                    bias=head.bias)
+                filtered, present = support_log_probs(scores.hidden, head, targets, ids, owners,
+                                                      temperature=temperature)
             else:
                 logits = (model_logits(self.model, params, scores.hidden) if reads_states(self.model)
                           else scores.hidden)
