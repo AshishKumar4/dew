@@ -35,7 +35,6 @@ from safetensors.numpy import load_file
 from dew import lora
 from dew.data import Dataset
 from dew.diffusion.process import DenoisingCondition
-from dew.inputs.diffusion import _text_features
 from dew.interop.pretrained import Pretrained
 from dew.interop.safetensors_io import read_file
 from dew.lora import Adapter, LoRA, Target
@@ -458,10 +457,11 @@ def test_the_text_encoder_component_merges_into_the_conditioning_tower(pipeline,
     tower = pipeline.inputs.conditions["conditioning"].encoder.towers[0]
     ids = jnp.asarray(sd_reference["prompt_ids"])
     merged = adapter.merge(adapter.variables)
-    features = tower.apply({"params": _subtree(merged, TEXT_ROOT)}, ids, method=_text_features)
-    np.testing.assert_allclose(np.asarray(features.last), sd_reference["context"], atol=1e-4, rtol=0)
-    plain = tower.apply({"params": _subtree(pipeline.variables, TEXT_ROOT)}, ids, method=_text_features)
-    assert np.max(np.abs(np.asarray(plain.last) - sd_reference["context"])) > 1e-3
+    features = tower.apply({"params": _subtree(merged, TEXT_ROOT)}, ids)
+    np.testing.assert_allclose(np.asarray(features.last_hidden_state), sd_reference["context"], atol=1e-4,
+                               rtol=0)
+    plain = tower.apply({"params": _subtree(pipeline.variables, TEXT_ROOT)}, ids)
+    assert np.max(np.abs(np.asarray(plain.last_hidden_state) - sd_reference["context"])) > 1e-3
 
 
 def test_the_unet_component_matches_the_pipeline_adapted_and_fused(pipeline, sd_reference):

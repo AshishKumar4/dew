@@ -12,7 +12,6 @@ zero signal.
 from __future__ import annotations
 
 import functools
-import math
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Self
 
@@ -266,9 +265,7 @@ class DiffusionGemma(nn.Module):
         if self.conditioner is None or image_indices is None:
             raise ValueError("image conditioning requires a vision conditioner and image_indices")
         safe = jnp.where(image_indices >= 0, 0, tokens)
-        embedded = self.text.embed_tokens(safe)
-        embedded = (embedded * jnp.asarray(math.sqrt(self.text.emb_features),
-                     self.text.embed_tokens.embedding.dtype)).astype(embedded.dtype)
+        embedded = self.text.scaled_embeddings(self.text.embed_tokens(safe))
         fused = self.conditioner.fuse(safe, embedded, image_indices, conditioning, train=train)
         return fused.tokens, fused.embeddings
 
@@ -309,16 +306,12 @@ class DiffusionGemma(nn.Module):
         tokens = jnp.asarray(tokens, jnp.int32)
         if self.is_initializing() and self.conditioner is not None:
             self.conditioner.initialize_parameters()
-        embedded = self.decoder.embed_tokens(tokens)
-        table = self.decoder.embed_tokens.embedding
-        scaled = (embedded * jnp.asarray(math.sqrt(self.text.emb_features), table.dtype)).astype(
-            embedded.dtype
-        )
+        scaled = self.decoder.scaled_embeddings(self.decoder.embed_tokens(tokens))
         if self_conditioning_logits is None:
             signal = jnp.zeros_like(scaled)
         else:
-            signal = soft_embeddings(self_conditioning_logits, table,
-                                     math.sqrt(self.text.emb_features)).astype(scaled.dtype)
+            signal = soft_embeddings(self_conditioning_logits, self.decoder.embed_tokens.embedding,
+                                     self.decoder.embedding_factor).astype(scaled.dtype)
             if self_conditioning_mask is not None:
                 signal = jnp.where(jnp.asarray(self_conditioning_mask)[:, None, None], signal, 0)
         conditioned = self.self_conditioning(scaled, signal)
