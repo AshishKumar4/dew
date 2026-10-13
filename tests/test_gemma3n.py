@@ -16,8 +16,8 @@ import numpy as np
 import pytest
 from flax import linen as nn
 
-from dew.nn.backbones.decoder_block import GatedMLP
 from dew.nn.gemma3n import AltUp, AltUpLayer, LaurelBlock, gaussian_topk
+from dew.nn.mlp import GatedMLP
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "gemma3n"
 HIDDEN, COPIES = 32, 4

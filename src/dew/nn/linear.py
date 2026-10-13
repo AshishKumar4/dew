@@ -1013,10 +1013,9 @@ class GatedDeltaNet(nn.Module):
         return mixed, z.reshape(B, S, -1), b.reshape(B, S, -1), a.reshape(B, S, -1)
 
     @nn.compact
-    def __call__(self, x, decode: bool = False,
-                 positions=None, segment_ids=None, kv_store=None,
+    def __call__(self, x, decode: bool = False, kv_store=None,
                  attention_metadata: AttentionMetadata | None = None):
-        del positions, segment_ids, kv_store
+        del kv_store
         B, S, _ = x.shape
         tokens = coordinates_of(attention_metadata, B, S)
         valid = tokens.valid

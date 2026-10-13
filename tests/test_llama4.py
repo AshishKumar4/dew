@@ -14,9 +14,10 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from dew.nn.backbones.decoder_block import GatedMLP
+from dew.nn.inputs import AttentionMetadata, coordinates
 from dew.nn.llama4 import Llama4Mixer
 from dew.nn.mixer_base import MixerContext
+from dew.nn.mlp import GatedMLP
 from dew.nn.moe import SparseMLP
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "llama4"
@@ -81,6 +82,43 @@ def test_decode_matches_prefill_on_both_rules():
             steps.append(step)
         incremental = jnp.concatenate(steps, axis=1)
         assert float(jnp.max(jnp.abs(incremental - whole))) < 1e-5
+
+
+def test_a_left_padded_row_scores_its_tokens_as_the_row_alone_cached_or_not():
+    """Three padding slots before five real tokens: the chunk of 4 and the rotation read each real
+    token's logical place, its rank among the row's real tokens (`Coordinates.positions`), so the
+    padded row's real outputs are the row's alone, uncached and through a cache's prefill alike.
+    Tolerance 1e-5."""
+    tensors = fixture("attention")
+    real = jnp.asarray(tensors["hidden"])[:, :5]
+    padded = jnp.concatenate([jnp.zeros((real.shape[0], 3, HIDDEN), real.dtype), real], axis=1)
+    valid = jnp.broadcast_to(jnp.arange(8) >= 3, padded.shape[:2])
+    metadata = AttentionMetadata(coordinates=coordinates(valid=valid))
+    for settings in ({"use_rope": True, "attention_chunk_size": 4}, {"use_rope": False}):
+        module = attention(**settings)
+        variables = attention_variables(tensors)
+        alone = np.asarray(module.apply(variables, real))
+        uncached = module.apply(variables, padded, attention_metadata=metadata)
+        state = {**module.init(jax.random.key(0), padded[:, :1], decode=True), **variables}
+        cached, _ = module.apply(state, padded, decode=True, attention_metadata=metadata, mutable=["cache"])
+        for got in (uncached, cached):
+            assert float(np.max(np.abs(np.asarray(got)[:, 3:] - alone))) < 1e-5, settings
+
+
+def test_the_temperature_reads_logical_positions_through_a_cache():
+    """A global layer's queries scale by their logical places (`floor_scale` 4), which the caller
+    gives as 8 onwards: a cached call scales them as an uncached one does, not by the cache slots
+    0 onwards they are written at. Tolerance 1e-5."""
+    tensors = fixture("attention")
+    hidden = jnp.asarray(tensors["hidden"])[:, :6]
+    metadata = AttentionMetadata(coordinates=coordinates(
+        positions=jnp.broadcast_to(jnp.arange(6) + 8, hidden.shape[:2])))
+    module = attention(use_rope=False)
+    variables = attention_variables(tensors)
+    uncached = np.asarray(module.apply(variables, hidden, attention_metadata=metadata))
+    state = {**module.init(jax.random.key(0), hidden[:, :1], decode=True), **variables}
+    cached, _ = module.apply(state, hidden, decode=True, attention_metadata=metadata, mutable=["cache"])
+    assert float(np.max(np.abs(np.asarray(cached) - uncached))) < 1e-5
 
 
 def test_the_input_scaled_experts_match_the_reference_block():
