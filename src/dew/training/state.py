@@ -19,7 +19,9 @@ class Accumulation:
     """Holds the microbatches pooled so far, until the optimizer commits them.
 
     It keeps only sums, with no forward residuals and no Jacobians of the
-    statistics, so it can be saved in a checkpoint. `statistics` and
+    statistics, so it can be saved in a checkpoint. `gradient` is the
+    window's from its first microbatch (`microstep % accumulation == 0`),
+    which replaces what the last window left there. `statistics` and
     `effects` hold their array leaves in canonical tree order, and the
     objective's traced result supplies their tree structure.
 
