@@ -35,7 +35,8 @@ def finite(tracker: RecordingTracker, name: str) -> list[float]:
 
 def test_images_train_a_denoiser_with_device_augmentation_and_validate_unaugmented():
     """Pictures of several sizes, one encoded as PNG bytes, become 16-pixel squares: augmented on
-    the accelerator for training, as they are for validation, and a diffusion run learns on both."""
+    the accelerator for training, as they are for validation, and a diffusion run learns on both.
+    Each keeps its catalog URL, which stays on the host."""
     import io
 
     from PIL import Image
@@ -44,15 +45,16 @@ def test_images_train_a_denoiser_with_device_augmentation_and_validate_unaugment
     pictures = [rng.integers(0, 256, (20 + index % 3 * 7, 24, 3), np.uint8) for index in range(64)]
     encoded = io.BytesIO()
     Image.fromarray(pictures[0]).save(encoded, format="PNG")
-    rows = [{"image": encoded.getvalue(), "label": 0}, *({"image": picture,
-                                                          "label": 1} for picture in pictures)]
+    rows = [{"image": encoded.getvalue(), "label": 0, "url": "https://example/0"},
+            *({"image": picture, "label": 1, "url": f"https://example/{index + 1}"}
+              for index, picture in enumerate(pictures))]
     train, held = Memory(rows).holdout(records=8)
     objective = DiffusionObjective(SimpleDiT(patch_size=4, emb_features=16, num_layers=1, num_heads=2,
                                              mlp_ratio=1),
                                    Flow(), InputSpec(Field("image", (16, 16, 3))), solver=Euler(), steps=2)
     batch = next(train.shuffle(0).repeat().pipe(presets.images(16, batch=8, augment=True)).iterate())
     assert batch["image"].shape == (8, 16, 16, 3) and batch["image"].dtype == np.uint8
-    assert batch["label"].shape == (8,)
+    assert batch["label"].shape == (8,) and batch["url"].shape == (8,)
     logged = trained(objective, train.shuffle(0).repeat().pipe(presets.images(16, batch=8, augment=True)),
                      held.pipe(presets.images(16, batch=8)), preview=True)
     finite(logged, "train/loss")

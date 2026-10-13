@@ -248,7 +248,10 @@ def _identity(stage: Stage, *, cache: bool = False) -> StepIdentity:
     if isinstance(stage, Native):
         return StepIdentity.of(stage.function, stage.identity, cache=cache)
     if isinstance(stage, Batched):
-        return StepIdentity.of(stage.step, stage.identity, cache=cache)
+        step = StepIdentity.of(stage.step, stage.identity, cache=cache)
+        # The group size and whether the rows keep their count decide what a resume reads.
+        shape = f"[batched {stage.size}, {'same rows' if stage.same_rows else 'any rows'}]"
+        return dataclasses.replace(step, name=step.name + shape, config=step.config + shape)
     return StepIdentity.of(stage)
 
 

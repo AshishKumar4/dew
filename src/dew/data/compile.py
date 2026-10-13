@@ -92,6 +92,7 @@ from dew.data.pipeline import (
 from dew.data.plan import Plan, StepIdentity, fingerprint
 from dew.data.readers import _CanonicalPass, _Host, _PerShare, _Statistics
 from dew.data.sources.base import Read, ShardManifest, Source, _consumed
+from dew.data.steps.generic import Placed
 from dew.records import JSON, integer, json_value, record
 
 _DEFAULT_LOADING = Loading()
@@ -793,7 +794,8 @@ def _objective_branch(pipeline: Pipeline, objective: ObjectiveData, *, train: bo
             branch, stages=(*branch.stages[:at], Group(objective.group), *branch.stages[at:])
         )
     steps = objective.train_batch if train else objective.evaluate_batch
-    return branch.then(*(MapBatch(step) for step in steps))
+    # The objective's batch goes to the accelerator: its string and object fields stay here.
+    return branch.then(*(MapBatch(step) for step in steps), MapBatch(Placed()))
 
 
 def _metadata(pipelines: Sequence[Pipeline], read: Read) -> Mapping[str, object]:

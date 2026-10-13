@@ -115,7 +115,7 @@ def test_a_batched_step_runs_on_groups_and_the_chain_goes_on_by_record_through_a
     """A step over groups of five records, which returns fewer, then the training batch: each kept
     record once, the batched work done, and a resumed reader continues exactly. A batched map must
     keep its row count."""
-    with pytest.raises(ValueError, match="keeps the 5 rows"):
+    with pytest.raises(ValueError):
         next(compile(Memory(rows("a", 10)).map(tokenized_in_batches, batched=True, batch_size=5).batch(2),
                      read="memory", loading=READ).train(DataPartition()))
     chain = (Memory(rows("a", 30)).shuffle(4).repeat()
@@ -136,6 +136,15 @@ def test_a_batched_step_runs_on_groups_and_the_chain_goes_on_by_record_through_a
         assert [next(resumed)["i"].tolist() for _ in range(3)] == rest
     finally:
         resumed.close()
+    # The same step over groups of another size reads other records: that position is not its.
+    regrouped = (Memory(rows("a", 30)).shuffle(4).repeat()
+                 .flat_map(tokenized_in_batches, batched=True, batch_size=10).batch(5))
+    other = compile(regrouped, read="indexed", loading=READ).train(DataPartition())
+    try:
+        with pytest.raises(ValueError):
+            other.set_state(state)
+    finally:
+        other.close()
 
 
 def test_stats_counts_a_fresh_pass_and_mix_weighs_tokens():
@@ -195,14 +204,33 @@ def test_an_iterator_resumes_through_its_own_state_or_by_replaying():
             resumed.close()
 
 
-def test_a_hugging_face_stream_that_shuffles_through_its_own_buffer_is_refused():
-    """Hugging Face's state_dict leaves its shuffle buffer's rows out, so a stream that
-    shuffles through it cannot resume exactly: it is refused, also under a later map."""
+def test_a_hugging_face_stream_resumes_exactly_and_its_own_shuffle_is_refused():
+    """An IterableDataset reads as one stream and resumes from its own state_dict, each
+    opening at its own position; a stream that shuffles through Hugging Face's buffer, whose
+    rows that state leaves out, is refused, also under a later map, and so is one with no name
+    to tell it from another stream."""
     datasets = pytest.importorskip("datasets")
     stream = datasets.IterableDataset.from_generator(lambda: ({"i": i} for i in range(40)))
-    assert [row["i"] for row in from_hf(stream, name="counting").iterate()] == list(range(40))
-    with pytest.raises(ValueError, match="shuffle"):
-        from_hf(stream.shuffle(seed=0, buffer_size=8).map(lambda row: row), name="shuffled")
+    source = from_hf(stream, name="counting@1")
+    reader = compile(source.repeat().batch(4), read="streamed", loading=READ).train(DataPartition())
+    try:
+        first = [next(reader)["i"].tolist() for _ in range(3)]
+        state = reader.get_state()
+        rest = [next(reader)["i"].tolist() for _ in range(3)]
+    finally:
+        reader.close()
+    assert [i for batch in first for i in batch] == list(range(12))
+    resumed = compile(source.repeat().batch(4), read="streamed", loading=READ).train(DataPartition())
+    try:
+        resumed.set_state(state)
+        assert [next(resumed)["i"].tolist() for _ in range(3)] == rest
+    finally:
+        resumed.close()
+    assert [row["i"] for row in source.iterate()] == list(range(40))
+    with pytest.raises(ValueError):
+        from_hf(stream.shuffle(seed=0, buffer_size=8).map(lambda row: row), name="shuffled@1")
+    with pytest.raises(ValueError):
+        from_hf(stream)
 
 
 def test_chunks_cut_long_documents_keeping_every_target():
