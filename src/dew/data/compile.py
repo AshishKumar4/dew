@@ -27,8 +27,10 @@ from dew.data.analysis import (
     _at,
     _cache_manifest,
     _capabilities,
+    _cut,
     _identity,
     _leaves,
+    _Lowering,
     _manifest,
     _name,
     _preferred_read,
@@ -68,6 +70,7 @@ from dew.data.pipeline import (
     Group,
     HostStep,
     Interleave,
+    Limit,
     Map,
     MapBatch,
     Mixture,
@@ -805,6 +808,44 @@ def _metadata(pipelines: Sequence[Pipeline], read: Read) -> Mapping[str, object]
                 elif combined[key] != value:
                     combined.pop(key, None)
     return {**combined, "slots": slots} if slots else combined
+
+
+def _diagnostic(pipeline: Pipeline, *, records: int | None = None) -> _Host:
+    """Inspect through training's lowering, finite unless a repeat asks otherwise.
+
+    A bounded record pass runs lazily without loader read-ahead or
+    eager memory transforms, and leaves its counters in the Grain state.
+    """
+    read = pipeline.mode or _preferred_read(lambda _: (pipeline,), provision=True)
+    loading = pipeline.loading or _DEFAULT_LOADING
+    if records is not None:
+        pipeline = pipeline.then(Limit(records))
+        loading = dataclasses.replace(loading, workers=0, threads=0, read_buffer=0)
+    if not pipeline.batched:
+        pipeline = pipeline.batch(1, drop_remainder=False)
+    counts: dict[str, CorpusCounts] = {}
+    (pipeline,) = _prepared((pipeline,), read, provision=True, training=True,
+                            counts=(counts,) if records is None else None)
+    pipeline = _token_geometry(pipeline)
+    if read == "memory" and records is None:
+        pipeline = _materialize(pipeline, counts)
+    lowering = _analyzed(pipeline, read)
+    if records is not None:
+        lowering = _cut(lowering, per_share=True)
+    if not any(isinstance(stage, Repeat) for stage in _steps(pipeline)):
+        lowering = _finite(lowering)
+    batching = next(stage for stage in pipeline.stages if isinstance(stage, (BatchStage, TokenBudget)))
+    batch = batching.size if isinstance(batching, BatchStage) else _budget_rows(batching)
+    build = _Build(read, loading, 0, batch, _DEFAULT_BUDGET, lowering, training=True)
+    if loading.workers == "auto":
+        build = dataclasses.replace(build, loading=loading.resolved(build.batched(pipeline, DataPartition())))
+    return _Host(build.batches(pipeline, DataPartition()), _batch_steps(pipeline)[0])
+
+
+def _finite(lowering: _Lowering) -> _Lowering:
+    """A non-repeated diagnostic pass without training's implicit root repeats."""
+    return dataclasses.replace(lowering, endless=False, repeated=True, epochs=1,
+                               children=tuple(_finite(child) for child in lowering.children))
 
 
 def iterate(

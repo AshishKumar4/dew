@@ -932,6 +932,19 @@ _UNSTACKED = "Expected all input elements to have the same structure"
 not stack. A grain that words it otherwise raises its own error unchanged."""
 
 
+def unstacked(batch: Batch, index: int = 0) -> Batch:
+    """One row of a batch, with nested mappings and row-indexed object columns."""
+    row: Batch = {}
+    for name, value in batch.items():
+        if isinstance(value, Mapping):
+            row[name] = unstacked(value, index)
+        elif isinstance(value, (np.ndarray, jax.Array, Sequence)):
+            row[name] = value[index]
+        else:
+            raise TypeError(f"batch field {name!r} has no row dimension")
+    return row
+
+
 def stacked(rows: Sequence[Batch], stack: Callable[[Sequence[Batch]], Batch]) -> Batch:
     """`rows` stacked into one batch by `stack`, with grain's failure to
     stack them said in terms of what to change. Every batch Dew makes of

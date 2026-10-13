@@ -92,12 +92,11 @@ def test_token_budget_validation_keeps_partial_rows_with_a_mask():
 
 @pytest.mark.parametrize("drop_remainder", [False, True])
 @pytest.mark.parametrize("shares", [1, 2])
-def test_a_finite_token_budget_marks_its_remainder_or_drops_it(drop_remainder, shares):
+def test_a_finite_row_batch_marks_its_remainder_or_drops_it(drop_remainder, shares):
     """A finite pass scores each kept record once, with a fixed shape even in its last batch."""
     records = Memory(tuple({"id": np.int32(index), "text": np.arange(index * 8, (index + 1) * 8,
                        dtype=np.int32)} for index in range(6)))
-    pipeline = (Pipeline(records).map(FixedTokens(8)).repeat(1)
-                .batch(tokens=32, drop_remainder=drop_remainder))
+    pipeline = Pipeline(records).repeat(1).batch(4, drop_remainder=drop_remainder)
     data = compile(pipeline, read="memory", loading=READ)
     size = 4 // shares
     delivered = []

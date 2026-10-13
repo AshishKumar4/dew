@@ -45,6 +45,7 @@ from dew.data.pipeline import (
     Artifact,
     Batched,
     BatchStage,
+    Expansion,
     Filter,
     FlatMap,
     Group,
@@ -123,7 +124,9 @@ def _outputs(
     if isinstance(stage, Filter):
         return (value if stage.predicate(record(value, "filter input")) else Rejected(stage.reason),)
     if isinstance(stage, FlatMap):
-        return tuple(stage.step.flat_map(record(value, "flat_map input"))) or (Rejected("empty_expansion"),)
+        element = record(value, "flat_map input")
+        outputs = stage.step.flat_map(element) if isinstance(stage.step, Expansion) else stage.step(element)
+        return tuple(outputs) or (Rejected("empty_expansion"),)
     if isinstance(stage, RandomMap):
         if rng is None:
             raise ValueError(f"random step {_identity(stage).name} needs a record rng")
