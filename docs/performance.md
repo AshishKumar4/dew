@@ -3170,24 +3170,24 @@ On the RTX 4080 that one-program kernel ran 6x to 12x slower than XLA as Triton 
 
 ### The Mamba-2 SSD scan on GPU: mamba_ssm's kernels
 
-`dew.nn.kernels.mamba_ssd` ports mamba_ssm 2.3.2.post1's Triton SSD (`mamba_chunk_scan_combined`) kernel for kernel to Pallas: five forward and nine backward launches, each a tuner `KernelOp`. `chunk_ssd` runs it wherever the GPU's target row names `'ssd': 'pallas'` (sm80 and sm90, measured below), and the XLA scan stays the oracle and the CPU and unmeasured-GPU path. Mamba-2 hands the scan its compute dtype, as mamba_ssm's conv hands its scan, so a bf16 model's `x`, `B` and `C` reach it in bf16. `chunk_ssd` forward, and forward plus backward of a sum of its output, bf16 `x`, `B`, `C` and fp32 step, median of 20 after a warmup, 2026-10-13, jax 0.11.2.post3. XLA is main `c16587b3e`, whose scan casts every operand to fp32. mamba_ssm ran on torch 2.14 and Triton 3.8 on the same GPU in the same session. The port ran at its heuristic configs:
+`dew.nn.kernels.mamba_ssd` ports mamba_ssm 2.3.2.post1's Triton SSD (`mamba_chunk_scan_combined`) kernel for kernel to Pallas: five forward and nine backward launches, each a tuner `KernelOp`. `chunk_ssd` runs it wherever the GPU's target row names `'ssd': 'pallas'` (sm80 and sm90, measured below), and the XLA scan stays the oracle and the CPU and unmeasured-GPU path. Mamba-2 hands the scan its compute dtype, as mamba_ssm's conv hands its scan, so a bf16 model's `x`, `B` and `C` reach it in bf16. `chunk_ssd` forward, and forward plus backward of a sum of its output, bf16 `x`, `B`, `C` and fp32 step, median of 20 after a warmup, 2026-10-13, jax 0.11.2.post3. XLA is main `8ccb9cdfd`, whose scan casts every operand to fp32. mamba_ssm ran on torch 2.14 and Triton 3.8 on the same GPU in the same session. The port ran at its heuristic configs:
 
 | GPU | shape (batch x tokens; heads of 64 over groups, state 128, chunk) | XLA | port | mamba_ssm |
 |---|---|---|---|---|
-| H100 80GB HBM3 | Nemotron 3 Ultra, 1 x 4096; 256 over 8, chunk 128 | 4.74 / 12.59 ms | 0.68 / 2.06 ms | 0.76 / 3.53 ms |
-| H100 80GB HBM3 | the same, 1 x 8192 | 9.54 / 35.67 | 1.24 / 3.97 | 1.37 / 6.68 |
-| H100 80GB HBM3 | the same, 4 x 4096 | 19.12 / 58.22 | 2.47 / 7.90 | 2.68 / 13.16 |
-| H100 80GB HBM3 | Mamba-2 2.7B, 2 x 4096; 80 over 1, chunk 256 | 3.81 / 9.29 | 0.45 / 1.38 | 0.58 / 2.44 |
-| A100-SXM4-40GB | Nemotron 3 Ultra, 1 x 4096 | 8.99 / 35.32 | 1.88 / 5.38 | 1.50 / 6.79 |
-| A100-SXM4-40GB | the same, 1 x 8192 | 17.53 / 73.92 | 3.54 / 9.88 | 2.75 / 12.83 |
-| A100-SXM4-40GB | the same, 4 x 4096 | 35.91 / 119.99 | 6.91 / 17.35 | 5.30 / 25.38 |
-| A100-SXM4-40GB | Mamba-2 2.7B, 2 x 4096 | 6.74 / 70.92 | 1.19 / 3.41 | 1.08 / 4.54 |
+| H100 80GB HBM3 | Nemotron 3 Ultra, 1 x 4096; 256 over 8, chunk 128 | 4.74 / 12.83 ms | 0.71 / 2.06 ms | 0.76 / 3.53 ms |
+| H100 80GB HBM3 | the same, 1 x 8192 | 9.53 / 35.76 | 1.31 / 3.98 | 1.37 / 6.65 |
+| H100 80GB HBM3 | the same, 4 x 4096 | 19.22 / 58.31 | 2.64 / 7.89 | 2.68 / 13.16 |
+| H100 80GB HBM3 | Mamba-2 2.7B, 2 x 4096; 80 over 1, chunk 256 | 3.82 / 9.34 | 0.46 / 1.38 | 0.58 / 2.43 |
+| A100-SXM4-40GB | Nemotron 3 Ultra, 1 x 4096 | 9.41 / 35.27 | 1.93 / 5.40 | 1.50 / 6.78 |
+| A100-SXM4-40GB | the same, 1 x 8192 | 17.74 / 73.84 | 3.62 / 9.87 | 2.75 / 12.83 |
+| A100-SXM4-40GB | the same, 4 x 4096 | 35.89 / 119.92 | 7.09 / 17.34 | 5.30 / 25.39 |
+| A100-SXM4-40GB | Mamba-2 2.7B, 2 x 4096 | 6.75 / 70.40 | 1.02 / 2.89 | 1.08 / 4.51 |
 
-The heuristic configs are the tuner's picks on an H100 at Ultra's shape. There, every launch timed alone at each config of its space (the tuner's own measurement) took 2.03 ms summed at its best against mamba_ssm's autotuned picks on the port's kernels, whose chunk state ran 0.267 against 0.157 ms. On the A100 at the H100's picks the launches summed 5.18 ms against 4.73 at their own best, which is why the A100's forward trails mamba_ssm's until the tuner measures it. fp32 operands, which an fp32 model hands, take TF32x3 products where mamba_ssm takes one TF32 pass: 1.70 / 5.20 ms at Ultra 1 x 4096 on the H100 against XLA's 4.89 / 12.66, and 9.38 / 21.60 against 9.68 / 36.45 on the A100 at the H100's picks, whose fp32 launches the A100's own picks take from 26.9 to 17.0 ms summed.
+The heuristic configs are the tuner's picks on an H100 at Ultra's shape. There, every launch timed alone at each config of its space (the tuner's own measurement) took 2.03 ms summed at its best against mamba_ssm's autotuned picks on the port's kernels, whose chunk state ran 0.267 against 0.157 ms. On the A100 at the H100's picks the launches summed 5.18 ms against 4.73 at their own best; there the port's forward runs behind mamba_ssm's at Ultra's shapes and its forward plus backward ahead. fp32 operands, which an fp32 model hands, take TF32x3 products where mamba_ssm takes one TF32 pass: 1.70 / 5.26 ms at Ultra 1 x 4096 on the H100 against XLA's 4.89 / 12.59, and 9.33 / 19.52 against 9.67 / 36.42 on the A100 at the H100's picks, whose fp32 launches the A100's own picks take from 26.9 to 17.0 ms summed.
 
 Through the trainer (`tools/reference_runs/dew_lm.py`, bf16 compute, AdamW, 4 x 1024 tokens, 40 steps on synthetic token windows), Mamba-2 130M ran 71.2k tokens/s on main and 180.3k on the port on the H100 (MFU 6.0% to 15.1%, peak memory 18.6 to 5.0 GiB), and 33.9k and 83.8k on the A100 (86.5k without XLA's Triton GEMM fusions). Mamba-2 2.7B on the H100 ran 5.47k and 16.8k tokens/s (MFU 9.3% to 28.4%).
 
-Against float64 on the same inputs (ragged rows, packed documents, an initial state; forward, final state and every gradient), the port's bf16 RMS distance is mamba_ssm's on both GPUs: the ratio is 1.00 on the output, final state, `x`, `dt`, `A`, `B` and `C`, and 0.70 to 1.12 on `D` and the initial state. Its fp32 distance is about a thousandth of mamba_ssm's TF32 and of XLA's default-precision einsums. A bf16 model's scan now sits where mamba_ssm's does, about 8 times XLA's fp32 scan's distance on the output, where it used to take fp32 operands from a wide conv, as transformers' torch path does.
+Against float64 on the same inputs (ragged rows, packed documents, an initial state; forward, final state and every gradient), the port's bf16 RMS distance is mamba_ssm's on both GPUs, at four geometries (Mamba-2 130M's and 2.7B's heads, Ultra's state, ragged packed documents): the ratio is 1.00 on the final state and the gradients of `x`, `dt`, `B` and `C`, 1.00 to 1.06 on `A`'s, 0.70 to 0.72 on the initial state's, 0.67 to 1.73 on `D`'s (a sum over every token that cancels, whose mamba_ssm value moves between runs with its atomic adds), and 0.70 on the output, which the port stores in fp32 where mamba_ssm rounds it to bf16. Its fp32 distance is about a thousandth of mamba_ssm's TF32 and of XLA's default-precision einsums. A bf16 model's scan now sits where mamba_ssm's does, about 8 times XLA's fp32 scan's distance on the output, where it used to take fp32 operands from a wide conv, as transformers' torch path does.
 
 ### Packed sliding-window attention on GPU: `local_attention`
 
