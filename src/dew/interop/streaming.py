@@ -164,6 +164,11 @@ class WeightLayout:
     Kimi K3 ships each KDA layer's `A_log` for 96 heads padded to 128
     entries. The family's prepare step checks and trims the tail, and export
     writes the zeros back.
+
+
+    `chunks` interleaves the leaves concatenated on `concatenate` in that
+    many equal runs, each holding its share of every leaf in turn
+    (`decoder_parts.Packed.chunks`).
     """
 
     name: str
@@ -174,6 +179,7 @@ class WeightLayout:
     expert_index: int | None = None
     dtype: np.dtype | None = None
     padded: int | None = None
+    chunks: int | None = None
 
     def _leaf(self, variables: Mapping[str, object], path: tuple[str, ...],
               scalar_mode: str | None) -> np.ndarray | jax.Array:
@@ -222,7 +228,16 @@ class WeightLayout:
             value = np.asarray(jnp.transpose(jnp.asarray(leaves[0]), self.transpose))
         else:
             arrays = [np.asarray(leaf) for leaf in leaves]
-            value = arrays[0] if self.concatenate is None else np.concatenate(arrays, axis=self.concatenate)
+            if self.concatenate is None:
+                value = arrays[0]
+            elif self.chunks is None:
+                value = np.concatenate(arrays, axis=self.concatenate)
+            else:
+                axis = self.concatenate % arrays[0].ndim
+                runs = [array.reshape(*array.shape[:axis], self.chunks, -1, *array.shape[axis + 1:])
+                        for array in arrays]
+                value = np.concatenate(runs, axis=axis + 1)
+                value = value.reshape(*value.shape[:axis], -1, *value.shape[axis + 2:])
             if self.transpose is not None:
                 value = value.transpose(self.transpose)
         if self.padded is not None:
