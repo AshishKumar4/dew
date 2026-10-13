@@ -135,6 +135,32 @@ def compensated_add(left, right):
     return total, dropped + left_lo + right_lo
 
 
+def compensated_sum(values: jax.Array, axes: tuple[int, ...]) -> jax.Array:
+    """The sum of `values` over `axes`, rounded once: neighbours added in pairs, then those sums in
+    pairs, each pairing a `compensated_add`, and what the roundings dropped added back at the end.
+
+    One XLA reduction over a loss's every axis rounds as it goes; on 6144 JEPA squares it left the
+    sum one float32 step above the correctly rounded one, and the loss a float32 ulp from float64,
+    where numpy's float32 mean of the same squares was correctly rounded. A narrower float adds in
+    float32 and returns in its own dtype, as `jnp.sum` does; an integer sum is `jnp.sum`'s. Each
+    rounding error's derivative is zero, so the gradient is `jnp.sum`'s."""
+    if not jnp.issubdtype(values.dtype, jnp.floating):
+        return jnp.sum(values, axes)
+    kept = [axis for axis in range(values.ndim) if axis not in axes]
+    flat = jnp.transpose(values, (*kept, *axes)).reshape(*(values.shape[axis] for axis in kept), -1)
+    flat = flat.astype(jnp.promote_types(flat.dtype, jnp.float32))
+    if not flat.shape[-1]:
+        return jnp.zeros(flat.shape[:-1], values.dtype)
+    errors = jnp.zeros_like(flat)
+    while flat.shape[-1] > 1:
+        if flat.shape[-1] % 2:
+            flat, errors = (jnp.concatenate([part, jnp.zeros((*part.shape[:-1], 1), part.dtype)], axis=-1)
+                            for part in (flat, errors))
+        flat, errors = compensated_add((flat[..., 0::2], errors[..., 0::2]),
+                                       (flat[..., 1::2], errors[..., 1::2]))
+    return (flat[..., 0] + errors[..., 0]).astype(values.dtype)
+
+
 @functools.partial(jax.custom_jvp, nondiff_argnums=(1,))
 def rounded_operand(x: jax.Array, dtype: Dtype) -> jax.Array:
     """The value `x` takes in `dtype`, held in `x`'s own dtype, with a
