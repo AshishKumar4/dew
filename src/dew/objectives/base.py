@@ -424,24 +424,33 @@ def _ruled_jvp(primals, tangents):
 
 
 
-def pairwise_sum(values: jax.Array, axes: tuple[int, ...]) -> jax.Array:
-    """The sum of `values` over `axes` by pairwise summation: neighbours added in pairs, then those
-    sums in pairs, to one. Its rounding error grows with the log of the count, as numpy's sum's
-    does, where XLA's one reduction over a loss's every axis accumulates one term at a time on a
-    CPU: over the 6144 squares of a small JEPA loss that left the mean a float32 ulp from float64,
-    ten times numpy's float32 distance."""
+def compensated_sum(values: jax.Array, axes: tuple[int, ...]) -> jax.Array:
+    """The sum of `values` over `axes`, rounded once: neighbours added in pairs, then those sums in
+    pairs, each addition's rounding error kept exactly (Knuth's two-sum) and added back at the end.
+
+    One XLA reduction over a loss's every axis rounds as it goes; on 6144 JEPA squares it left the
+    sum one float32 step above the correctly rounded one, and the loss a float32 ulp from float64,
+    where numpy's float32 mean of the same squares was correctly rounded. A narrower float adds in
+    float32 and returns in its own dtype, as `jnp.sum` does; an integer sum is `jnp.sum`'s. Each
+    rounding error's derivative is zero, so the gradient is `jnp.sum`'s."""
     if not jnp.issubdtype(values.dtype, jnp.floating):
         return jnp.sum(values, axes)
     kept = [axis for axis in range(values.ndim) if axis not in axes]
     flat = jnp.transpose(values, (*kept, *axes)).reshape(*(values.shape[axis] for axis in kept), -1)
-    # A narrower float adds in float32 and returns in its own dtype, as `jnp.sum` does.
     flat = flat.astype(jnp.promote_types(flat.dtype, jnp.float32))
+    if not flat.shape[-1]:
+        return jnp.zeros(flat.shape[:-1], values.dtype)
+    errors = jnp.zeros_like(flat)
     while flat.shape[-1] > 1:
         if flat.shape[-1] % 2:
-            flat = jnp.concatenate([flat, jnp.zeros((*flat.shape[:-1], 1), flat.dtype)], axis=-1)
-        flat = flat[..., 0::2] + flat[..., 1::2]
-    total = flat[..., 0] if flat.shape[-1] else jnp.zeros(flat.shape[:-1], flat.dtype)
-    return total.astype(values.dtype)
+            flat, errors = (jnp.concatenate([part, jnp.zeros((*part.shape[:-1], 1), part.dtype)], axis=-1)
+                            for part in (flat, errors))
+        left, right = flat[..., 0::2], flat[..., 1::2]
+        flat = left + right
+        moved = flat - left
+        rounding = (left - (flat - moved)) + (right - moved)
+        errors = errors[..., 0::2] + errors[..., 1::2] + rounding
+    return (flat[..., 0] + errors[..., 0]).astype(values.dtype)
 
 
 class Objective(ABC, Generic[Loss, Effects]):
@@ -765,19 +774,19 @@ class Objective(ABC, Generic[Loss, Effects]):
         number of entries summed. When the batch is an evaluation batch with
         `VALID_ROWS`, a repeat row has zero weight in both, so a loss and every
         batch-wide term computed through this count each real record once. Without
-        `VALID_ROWS`, as in training, this is the sum (`pairwise_sum`) and the size.
+        `VALID_ROWS`, as in training, this is the sum (`compensated_sum`) and the size.
         """
         dtype = jnp.promote_types(values.dtype, jnp.float32)
         axes = (tuple(range(values.ndim)) if axis is None
                 else (axis,) if isinstance(axis, int) else tuple(axis))
         if VALID_ROWS not in batch:
             count = math.prod(values.shape[a] for a in axes)
-            return Ratio(pairwise_sum(values, axes), jnp.asarray(count, dtype))
+            return Ratio(compensated_sum(values, axes), jnp.asarray(count, dtype))
         held = (rows,) if isinstance(rows, int) else rows
         shape = [values.shape[a] if a in held else 1 for a in range(values.ndim)]
         real = Objective.row_weights(batch, math.prod(values.shape[a] for a in held)).reshape(shape) > 0
         # Selected rather than multiplied, so a repeat holding a NaN still adds nothing.
-        return Ratio(pairwise_sum(jnp.where(real, values, jnp.zeros((), values.dtype)), axes),
+        return Ratio(compensated_sum(jnp.where(real, values, jnp.zeros((), values.dtype)), axes),
                      jnp.sum(jnp.broadcast_to(real, values.shape).astype(dtype), axes))
 
     @staticmethod
