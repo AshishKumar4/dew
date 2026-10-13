@@ -129,7 +129,8 @@ def plan_flops(recorded: JSON, executable: jax.stages.Compiled) -> tuple[StepFlo
     reads the module's text. A key read before the step traces cannot tell
     apart two steps that differ in an objective's arguments alone; the
     executable can."""
-    fingerprint = executable.runtime_executable().fingerprint
+    runtime = executable.runtime_executable()
+    fingerprint = None if runtime is None else runtime.fingerprint
     named = fingerprint.hex() if isinstance(fingerprint, bytes) else None
     counted = record(recorded, 'recorded plan').get('flops') if recorded is not None else None
     if named is not None and isinstance(counted, list) and counted[:1] == [named]:
