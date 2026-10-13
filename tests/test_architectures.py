@@ -475,10 +475,15 @@ def key_bias_terms(case: Case, trainer, encoder, state, index: int) -> dict[tupl
 
     loss({}, values)
     cotangents = jax.grad(loss)({call: jnp.zeros_like(value) for call, value in values.items()})
+    # A module applied on its own (a JEPA encoder or predictor) names paths from its own root, so each
+    # call's bias is the one parameter whose path ends in the call's and whose shape is its features'.
+    params = traverse_util.flatten_dict(state.variables["params"])
     terms: dict[tuple[str, ...], np.ndarray] = {}
     for (path, _), cotangent in cotangents.items():
+        [bias] = [name for name, value in params.items()
+                  if name[-len(path) - 1:] == (*path, "bias") and value.shape == cotangent.shape[-1:]]
         summed = np.sum(np.abs(np.asarray(cotangent)), axis=tuple(range(cotangent.ndim - 1)))
-        terms[(*path, "bias")] = terms.get((*path, "bias"), 0) + summed
+        terms[bias] = terms.get(bias, 0) + summed
     return terms
 
 
