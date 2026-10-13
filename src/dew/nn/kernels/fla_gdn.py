@@ -21,7 +21,6 @@ explicit block/warp/stage overrides for the lab.
 
 import dataclasses
 import functools
-import operator
 from collections.abc import Mapping
 from typing import ClassVar, NamedTuple
 
@@ -606,8 +605,7 @@ def _h_kernel(span_ref, k_ref, u_ref, w_ref, g_ref, h0_ref, h_ref, corrected_ref
     64-key slices; each chunk stores the memory it enters in `h`'s dtype, then the corrected values
     `u - w h` (fla's `v_new`; `h` cast to `w`'s dtype for the product), gates them by
     `exp2(g_last - g)` and the memory by `exp2(g_last)`, casts the gated values to `k`'s dtype and
-    adds `k^T v` to the memory, the fp32 gated values as two parts of `k`'s dtype (`_split_dot`)
-    where fla rounds them once: h remains fp32, and h and the corrected values keep fla's storage.
+    adds `k^T v` to the memory: h remains fp32, and h and the corrected values keep fla's storage.
     `per_key` is fla's USE_GK branch: `g_ref` holds a decay per key dimension `[T, K]`, which gates
     the memory's rows by `exp2(g_last)` and not the values, whose keys carry their own decay. A row's
     first sequence starts from its initial memory and its last stores the final one."""
@@ -633,14 +631,16 @@ def _h_kernel(span_ref, k_ref, u_ref, w_ref, g_ref, h0_ref, h_ref, corrected_ref
             corrected = read(u_ref).astype(jnp.float32) - predicted
             _write(_rows(corrected_ref, begin, chunk), taken, corrected)
             final = begin + taken - 1
+
+            def written(i, values):
+                return _dot(read(k_ref, pl.ds(i * 64, 64)).T, values.astype(k_ref.dtype), exact=exact)
+
             if per_key:
                 return [state[i] * jnp.exp2(g_ref[final, pl.ds(i * 64, 64)].astype(jnp.float32))[:, None]
-                        + _split_dot(read(k_ref, pl.ds(i * 64, 64)).T, corrected, exact=exact)
-                        for i in range(slices)]
+                        + written(i, corrected) for i in range(slices)]
             last = g_ref[final].astype(jnp.float32)
             gated = corrected * jnp.exp2(last - _gates(g_ref, begin, taken, chunk))[:, None]
-            return [state[i] * jnp.exp2(last)
-                    + _split_dot(read(k_ref, pl.ds(i * 64, 64)).T, gated, exact=exact) for i in range(slices)]
+            return [state[i] * jnp.exp2(last) + written(i, gated) for i in range(slices)]
 
         state = jax.lax.fori_loop(0, -(-count // chunk), step, state)
 
@@ -729,11 +729,11 @@ def _dhu_kernel(span_ref, q_ref, k_ref, w_ref, g_ref, dht_ref, do_ref, dv_ref, d
     """fla's `chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64` (chunk_delta_h.py:359-669) for one
     sequence's head and `BV` value columns, chunks in reverse. Each stores the gradient of the memory
     it leaves into, `dh`, then `dv2 = dv + (k dh) exp2(g_last - g)` (dh cast to k's dtype), then
-    `dh = dh exp2(g_last) + scale (q exp2(g))^T do - w^T dv2`: the gated queries fp32 as two parts
-    of `do`'s dtype (`_split_dot`), where fla takes one TF32 product, and dv2 cast to w's dtype for
-    its product, as fla casts it. `per_key` is fla's USE_GK branch: `g_ref` `[T, K]` decays the
-    gradient's rows by `exp2(g_last)`, and neither `dv2` nor the queries, which carry their own decay,
-    are gated; the query product stays in q's dtype. A row's last sequence starts from the final
+    `dh = dh exp2(g_last) + scale (q exp2(g))^T do - w^T dv2`: the gated queries fp32 in one TF32
+    product with `do`, as fla's, and dv2 cast to w's dtype for its product, as fla casts it.
+    `per_key` is fla's USE_GK branch: `g_ref` `[T, K]` decays the gradient's rows by `exp2(g_last)`,
+    and neither `dv2` nor the queries, which carry their own decay, are gated; the query product
+    stays in q's dtype. A row's last sequence starts from the final
     memory's gradient and its first stores the initial memory's."""
     start, count, offset, row, first, last_in_row = _span(span_ref, length, chunk, aligned)
     slices = k_ref.shape[-1] // 64
@@ -770,7 +770,7 @@ def _dhu_kernel(span_ref, q_ref, k_ref, w_ref, g_ref, dht_ref, do_ref, dv_ref, d
                 dv = dv * jnp.exp2(last - gate)[:, None] + read(dv_ref).astype(jnp.float32)
                 decay = jnp.exp2(gate)[:, None]
                 kept = [jnp.exp2(last)] * slices
-                read_out = [_split_dot((query.astype(jnp.float32) * decay).T, out_grad, exact=exact)
+                read_out = [_tf32_dot((query.astype(jnp.float32) * decay).T, out_grad.astype(jnp.float32))
                             for query in queries]
             _write(_rows(dv2_ref, begin, chunk), taken, dv)
 
@@ -934,24 +934,6 @@ def chunk_bwd_dv_local(q, k, g, do, *, scale: float, chunk: int = 64, bk: int | 
                    q, k, g, do, *spans, scale=scale, chunk=chunk, interpret=interpret)
 
 
-def _split_dot(a, b, *, exact: bool):
-    """`a @ b` with an fp32 operand beside a 16-bit one: the fp32 one as two parts of the other's
-    dtype, its rounding and the rounding's remainder, each product exact and summed in fp32. fla
-    rounds that operand to the narrow dtype for one product, or takes one TF32 product of both in
-    fp32; the parts keep 16 bits of it at the cost of a second narrow product, which runs as fast as
-    one TF32 product. Operands of one dtype keep the one product."""
-    narrow = min(a.dtype, b.dtype, key=lambda dtype: jnp.dtype(dtype).itemsize)
-
-    def parts(x):
-        if x.dtype == narrow:
-            return [x]
-        high = x.astype(narrow)
-        return [high, (x - high.astype(jnp.float32)).astype(narrow)]
-
-    products = [_dot(left, right, exact=exact) for left in parts(a) for right in parts(b)]
-    return functools.reduce(operator.add, products)
-
-
 def _state_inner_product(memory, memory_grad):
     """fla chunk_o.py:251: multiply h/dh in their storage dtype, then tl.sum widens to fp32.
     In particular, bf16 products round before reduction; widening both inputs omits that round."""
@@ -1003,8 +985,9 @@ def _dqkwg_kernel(chunk_ref, q_ref, k_ref, v_ref, g_ref, h_ref, do_ref, dh_ref, 
             dk = dk * jnp.exp2(last - gate)[:, None]
             dg_last += jnp.sum(dk * keys.astype(jnp.float32))
             ds = jnp.where(causal, ds * jnp.exp2(gate[:, None] - gate[None, :]), 0.0) * scale
-            dq += _split_dot(ds, keys, exact=exact)
-            dk += _split_dot(ds.T, queries, exact=exact)
+            ds = ds.astype(keys.dtype)
+            dq += _dot(ds, keys, exact=exact)
+            dk += _dot(ds.T, queries, exact=exact)
             dg = (jnp.sum(dq * queries.astype(jnp.float32), axis=1)
                   - jnp.sum(dk * keys.astype(jnp.float32), axis=1))
             _write(_rows(dg_ref, start, chunk, head), taken, jnp.where(index < taken - 1, dg, dg + dg_last))
