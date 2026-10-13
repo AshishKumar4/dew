@@ -21,7 +21,6 @@ explicit block/warp/stage overrides for the lab.
 
 import dataclasses
 import functools
-import operator
 from collections.abc import Mapping
 from typing import ClassVar, NamedTuple
 
@@ -152,14 +151,20 @@ _FP32_WY = {"prepare_wy_repr_bwd": Tiles(64, 64, 8, 2)}
 # fla's stage and block lists for devices under an A100's shared memory (chunk_delta_h.py:43-44,
 # 352-353), with two warps for the forward h.
 _SMALL = {**_A100, "chunk_fwd_h": Tiles(0, 32, 2, 2), "chunk_bwd_dhu": Tiles(0, 64, 4, 1)}
+# Measured over each space at the Qwen3.5-0.8B step's shape (8 x 3072, 16 heads of 128, bf16), CUPTI, 2026-10-13:
+# dqkwg 128/128/8/1 1.33 ms on an A100 (64/64/4/1 2.65, best 128/64/8/1 1.19) and 0.65 on an H100
+# (64/64/4/1 0.52, 128/64/8/1 1.02); dhu 0/64/4/3 1.09 and 0.315, the fastest on both.
+_WIDE_16 = {**_A100, "chunk_bwd_dqkwg": Tiles(128, 128, 8, 1), "chunk_bwd_dhu": Tiles(0, 64, 4, 3)}
 HEURISTICS = {
-    ("bfloat16", True): _A100,
+    ("bfloat16", True): _WIDE_16,
     ("bfloat16", False): _SMALL,
     # One stage for fp32's dhu: three took 254,984 bytes of an A100's 166,912 (c58).
     ("float32", True): {**_A100, **_FP32_WY, "chunk_fwd_h": Tiles(0, 64, 4, 2),
                         "chunk_bwd_dhu": Tiles(0, 64, 4, 1)},
-    ("float32", False): {**_SMALL, **_FP32_WY, "chunk_fwd_h": Tiles(0, 64, 2, 1),
-                         "chunk_bwd_dhu": Tiles(0, 32, 4, 1)},
+    # One stage for fp32's WY backward on a 99 KB block: its looped blocks stage the next one, 102,400
+    # bytes at two stages (sm89).
+    ("float32", False): {**_SMALL, "prepare_wy_repr_bwd": Tiles(64, 64, 8, 1),
+                         "chunk_fwd_h": Tiles(0, 64, 2, 1), "chunk_bwd_dhu": Tiles(0, 32, 4, 1)},
 }
 """Each launch's tiles without a measurement, by activation dtype and whether the GPU's block holds an
 A100's shared memory: fla's own A100 choices, and its narrower picks for 99 KB devices. fp32 runs the
@@ -628,8 +633,7 @@ def _h_kernel(span_ref, k_ref, u_ref, w_ref, g_ref, h0_ref, h_ref, corrected_ref
     64-key slices; each chunk stores the memory it enters in `h`'s dtype, then the corrected values
     `u - w h` (fla's `v_new`; `h` cast to `w`'s dtype for the product), gates them by
     `exp2(g_last - g)` and the memory by `exp2(g_last)`, casts the gated values to `k`'s dtype and
-    adds `k^T v` to the memory, the fp32 gated values as two parts of `k`'s dtype (`_split_dot`)
-    where fla rounds them once: h remains fp32, and h and the corrected values keep fla's storage.
+    adds `k^T v` to the memory: h remains fp32, and h and the corrected values keep fla's storage.
     `per_key` is fla's USE_GK branch: `g_ref` holds a decay per key dimension `[T, K]`, which gates
     the memory's rows by `exp2(g_last)` and not the values, whose keys carry their own decay. A row's
     first sequence starts from its initial memory and its last stores the final one."""
@@ -655,14 +659,16 @@ def _h_kernel(span_ref, k_ref, u_ref, w_ref, g_ref, h0_ref, h_ref, corrected_ref
             corrected = read(u_ref).astype(jnp.float32) - predicted
             _write(_rows(corrected_ref, begin, chunk), taken, corrected)
             final = begin + taken - 1
+
+            def written(i, values):
+                return _dot(read(k_ref, pl.ds(i * 64, 64)).T, values.astype(k_ref.dtype), exact=exact)
+
             if per_key:
                 return [state[i] * jnp.exp2(g_ref[final, pl.ds(i * 64, 64)].astype(jnp.float32))[:, None]
-                        + _split_dot(read(k_ref, pl.ds(i * 64, 64)).T, corrected, exact=exact)
-                        for i in range(slices)]
+                        + written(i, corrected) for i in range(slices)]
             last = g_ref[final].astype(jnp.float32)
             gated = corrected * jnp.exp2(last - _gates(g_ref, begin, taken, chunk))[:, None]
-            return [state[i] * jnp.exp2(last)
-                    + _split_dot(read(k_ref, pl.ds(i * 64, 64)).T, gated, exact=exact) for i in range(slices)]
+            return [state[i] * jnp.exp2(last) + written(i, gated) for i in range(slices)]
 
         state = jax.lax.fori_loop(0, -(-count // chunk), step, state)
 
@@ -752,10 +758,11 @@ def _dhu_kernel(span_ref, q_ref, k_ref, w_ref, g_ref, dht_ref, do_ref, dv_ref, d
     sequence's head and `BV` value columns, chunks in reverse. Each stores the gradient of the memory
     it leaves into, `dh`, then `dv2 = dv + (k dh) exp2(g_last - g)` (dh cast to k's dtype), then
     `dh = dh exp2(g_last) + scale (q exp2(g))^T do - w^T dv2`: the gated queries fp32 as two parts
-    of `do`'s dtype (`_split_dot`), where fla takes one TF32 product, and dv2 cast to w's dtype for
-    its product, as fla casts it. `per_key` is fla's USE_GK branch: `g_ref` `[T, K]` decays the
-    gradient's rows by `exp2(g_last)`, and neither `dv2` nor the queries, which carry their own decay,
-    are gated; the query product stays in q's dtype. A row's last sequence starts from the final
+    of `do`'s dtype (`_split_dot`), where fla takes one TF32 product at the same cost, and dv2 cast
+    to w's dtype for its product, as fla casts it.
+    `per_key` is fla's USE_GK branch: `g_ref` `[T, K]` decays the gradient's rows by `exp2(g_last)`,
+    and neither `dv2` nor the queries, which carry their own decay, are gated; the query product
+    stays in q's dtype. A row's last sequence starts from the final
     memory's gradient and its first stores the initial memory's."""
     start, count, offset, row, first, last_in_row = _span(span_ref, length, chunk, aligned)
     slices = k_ref.shape[-1] // 64
@@ -958,10 +965,9 @@ def chunk_bwd_dv_local(q, k, g, do, *, scale: float, chunk: int = 64, bk: int | 
 
 def _split_dot(a, b, *, exact: bool):
     """`a @ b` with an fp32 operand beside a 16-bit one: the fp32 one as two parts of the other's
-    dtype, its rounding and the rounding's remainder, each product exact and summed in fp32. fla
-    rounds that operand to the narrow dtype for one product, or takes one TF32 product of both in
-    fp32; the parts keep 16 bits of it at the cost of a second narrow product, which runs as fast as
-    one TF32 product. Operands of one dtype keep the one product."""
+    dtype, its rounding and the rounding's remainder, each product exact and summed in fp32, where
+    fla takes one TF32 product of both in fp32: two narrow products run as fast as one TF32 product
+    and keep 16 bits of the fp32 operand to TF32's 10. Operands of one dtype keep the one product."""
     narrow = min(a.dtype, b.dtype, key=lambda dtype: jnp.dtype(dtype).itemsize)
 
     def parts(x):
@@ -970,8 +976,7 @@ def _split_dot(a, b, *, exact: bool):
         high = x.astype(narrow)
         return [high, (x - high.astype(jnp.float32)).astype(narrow)]
 
-    products = [_dot(left, right, exact=exact) for left in parts(a) for right in parts(b)]
-    return functools.reduce(operator.add, products)
+    return sum(_dot(left, right, exact=exact) for left in parts(a) for right in parts(b))
 
 
 def _state_inner_product(memory, memory_grad):
@@ -1025,8 +1030,9 @@ def _dqkwg_kernel(chunk_ref, q_ref, k_ref, v_ref, g_ref, h_ref, do_ref, dh_ref, 
             dk = dk * jnp.exp2(last - gate)[:, None]
             dg_last += jnp.sum(dk * keys.astype(jnp.float32))
             ds = jnp.where(causal, ds * jnp.exp2(gate[:, None] - gate[None, :]), 0.0) * scale
-            dq += _split_dot(ds, keys, exact=exact)
-            dk += _split_dot(ds.T, queries, exact=exact)
+            ds = ds.astype(keys.dtype)
+            dq += _dot(ds, keys, exact=exact)
+            dk += _dot(ds.T, queries, exact=exact)
             dg = (jnp.sum(dq * queries.astype(jnp.float32), axis=1)
                   - jnp.sum(dk * keys.astype(jnp.float32), axis=1))
             _write(_rows(dg_ref, start, chunk, head), taken, jnp.where(index < taken - 1, dg, dg + dg_last))
@@ -1139,27 +1145,34 @@ def _wy_bwd_kernel(chunk_ref, k_ref, v_ref, beta_ref, g_ref, a_ref, dw_ref, du_r
         gate = _gates(g_ref, start, taken, chunk)
         decay = jnp.exp2(gate)
         width = k_ref.shape[-1]
-        d_x = jnp.zeros((chunk, chunk), jnp.float32)
-        d_beta = jnp.zeros((chunk,), jnp.float32)
-        d_gate = jnp.zeros((chunk,), jnp.float32)
-        for block in range(width // bk):
+
+        # Each block loop is a loop, not unrolled, so Triton pipelines its loads and holds one block's
+        # values at a time: unrolled, the A100 kernel spilled 406 words and ran 1.93 ms against 1.03.
+        def through_keys(block, carry):
+            d_x, d_beta, d_gate = carry
             columns = pl.ds(block * bk, bk)
             key = read(k_ref, columns)
             scaled = key * (beta * decay)[:, None]
             w_grad = read(dw_ref, columns)
-            d_x += _dot(w_grad, scaled.T.astype(w_grad.dtype), exact=exact)
             d_scaled = _dot(inverse_t, w_grad, exact=exact)
-            d_beta += jnp.sum(d_scaled * key * decay[:, None], axis=1)
-            d_gate += jnp.sum(d_scaled * scaled, axis=1)
-        for block in range(v_ref.shape[-1] // bv):
+            return (d_x + _dot(w_grad, scaled.T.astype(w_grad.dtype), exact=exact),
+                    d_beta + jnp.sum(d_scaled * key * decay[:, None], axis=1),
+                    d_gate + jnp.sum(d_scaled * scaled, axis=1))
+
+        def through_values(block, carry):
+            d_x, d_beta = carry
             columns = pl.ds(block * bv, bv)
             value = read(v_ref, columns)
             scaled = (value * beta[:, None]).astype(value.dtype)
             u_grad = read(du_ref, columns)
-            d_x += _dot(u_grad, scaled.T, exact=exact)
             d_scaled = _dot(inverse_t, u_grad, exact=exact)
             _write(_rows(dv_ref, start, chunk, columns), taken, d_scaled * beta[:, None])
-            d_beta += jnp.sum(d_scaled * value, axis=1)
+            return (d_x + _dot(u_grad, scaled.T, exact=exact), d_beta + jnp.sum(d_scaled * value, axis=1))
+
+        empty = jnp.zeros((chunk,), jnp.float32)
+        d_x, d_beta, d_gate = jax.lax.fori_loop(0, width // bk, through_keys,
+                                                (jnp.zeros((chunk, chunk), jnp.float32), empty, empty))
+        d_x, d_beta = jax.lax.fori_loop(0, v_ref.shape[-1] // bv, through_values, (d_x, d_beta))
         index = jnp.arange(chunk)
         strict = index[:, None] > index[None, :]
         d_x = jnp.where(strict, d_x, 0.0)
@@ -1167,20 +1180,26 @@ def _wy_bwd_kernel(chunk_ref, k_ref, v_ref, beta_ref, g_ref, a_ref, dw_ref, du_r
         d_x = _dot(inverse_t, d_x.astype(inverse_t.dtype), exact=exact)
         d_x = d_x * jnp.exp2(gate[:, None] - gate[None, :])
         d_l = jnp.where(strict, -d_x, 0.0).astype(k_ref.dtype)
-        products = jnp.zeros((chunk, chunk), jnp.float32)
-        for block in range(width // bk):
+        def keys_grad(block, carry):
+            products, d_beta = carry
             columns = pl.ds(block * bk, bk)
             key = read(k_ref, columns)
             scaled = key * beta[:, None]
-            products += _dot(key, key.T, exact=exact)
+            # k k^T first, as fla takes it: taken after the dk store, sm90's pipelined loop returned
+            # a different dg on each call of one executable (FitBuzzard, dew-h100).
+            products = products + _dot(key, key.T, exact=exact)
             d_key = _dot(d_l, key, exact=exact)
-            d_beta += jnp.sum(d_key * key, axis=1)
             through_w = _dot(inverse_t, read(dw_ref, columns), exact=exact) * (decay * beta)[:, None]
-            full = through_w + (d_key * beta[:, None] + _dot(scaled.T.astype(d_l.dtype), d_l, exact=exact).T)
+            # d_l^T (k beta), fla's trans(trans(kb) dA), as one product into the accumulator's layout.
+            full = through_w + (d_key * beta[:, None] + _dot(d_l.T, scaled.astype(d_l.dtype), exact=exact))
             if earlier_ref is not None:
                 earlier = read(earlier_ref, columns).astype(jnp.float32)
                 full += jnp.where(first_of_group, earlier, 0.0)
             _write(_rows(dk_ref, start, chunk, columns), taken, full)
+            return products, d_beta + jnp.sum(d_key * key, axis=1)
+
+        products, d_beta = jax.lax.fori_loop(0, width // bk, keys_grad,
+                                             (jnp.zeros((chunk, chunk), jnp.float32), d_beta))
         _write(_rows(db_ref, start, chunk), taken, d_beta)
         weighted = d_l.astype(jnp.float32) * (products * beta[:, None])
         _write(_rows(dg_ref, start, chunk), taken, _wy_gate_sum(d_gate, weighted))
