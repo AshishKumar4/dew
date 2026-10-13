@@ -451,6 +451,7 @@ class DiffusionObjective(Objective[Ratio]):
             jax.eval_shape(autoencoder.moments, autoencoder.params, jnp.zeros((1, *inputs.sample.shape)))
         if inputs.mask is not None and autoencoder is None:
             raise ValueError("Masked-image conditioning requires an autoencoder")
+        check_solver(self.process, solver, steps)
         # Refusals come first: resolving the alignment's encoder may download its weights.
         self.alignment, self.representation = (None, None) if alignment is None else alignment.network(
             None if variables is None else variables.get(REPRESENTATION))
@@ -463,7 +464,6 @@ class DiffusionObjective(Objective[Ratio]):
             decay=ema_decay if callable(ema_decay) else optax.constant_schedule(ema_decay),
             select=under("params")))
         self.artifact = VideoGrid if len(inputs.sample.shape) == 4 else ImageGrid
-        check_solver(self.process, solver, steps)
 
     @property
     def _sample(self):
