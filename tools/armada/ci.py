@@ -39,7 +39,7 @@ recomputes each of its files' keys from the record made on its own CPU class
 instead of running a file whose key matches, which ran green on exactly these
 inputs there. A file that started another process is never reused, since no
 event saw that process's code. The records live in the dew-xla-cache Worker
-under `testcache/`. With DEW_TEST_CACHE=off where the plan runs, which its
+under `CACHE_PREFIX`. With DEW_TEST_CACHE=off where the plan runs, which its
 entries carry to their tasks (`--cache`), or without the Worker's URL and
 token, a task runs every file.
 """
@@ -109,7 +109,10 @@ def environment_files() -> list[str]:
                    for name in (environment.get("setup"), environment.get("install"),
                                 *environment.get("key", ()))
                    if name})
-CACHE_PREFIX = "testcache"
+CACHE_PREFIX = "testcache/" + hashlib.sha256(
+    Path(__file__).read_bytes() + Path(__file__).with_name("executed.py").read_bytes()).hexdigest()[:16]
+"""Where records live: one namespace per version of the tools that write and read them, so a branch
+grading with a changed record format never overwrites or breaks main's records."""
 
 
 def shared(python: str) -> str:
