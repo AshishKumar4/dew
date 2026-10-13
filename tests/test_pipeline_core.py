@@ -64,7 +64,7 @@ def take(reader, count):
 
 def test_memory_rejections_are_dense_before_global_order():
     stored = source()
-    data = compile(Pipeline(stored).map(Odd()).shuffle(3).repeat().batch(4),
+    data = compile(Pipeline(stored).filter_map(Odd()).shuffle(3).repeat().batch(4),
                    read="memory", loading=READ, seed=3)
     rows = tuple(value for value in stored.values if int(value["id"]) % 2)
     reader = data.train(DataPartition())
@@ -112,7 +112,7 @@ def test_host_steps_are_branch_scoped_and_common_steps_run_on_both():
 
 
 def test_rejection_iterator_resumes_exactly_and_refuses_topology_change():
-    data = compile(Pipeline(source()).shuffle(2).repeat().map(Odd()).batch(3), loading=READ, seed=2)
+    data = compile(Pipeline(source()).shuffle(2).repeat().filter_map(Odd()).batch(3), loading=READ, seed=2)
     reader = data.train(DataPartition())
     take(reader, 3)
     saved = reader.get_state()
@@ -467,7 +467,7 @@ def test_causal_windows_keep_each_boundary_target_and_restore_carry():
 
 
 def test_validation_takes_accepted_rows_before_the_share_cut():
-    prefix = Pipeline(source(11)).map(Odd()).take(3).batch(4)
+    prefix = Pipeline(source(11)).filter_map(Odd()).take(3).batch(4)
     data = compile(Pipeline(source()).batch(4), validation=prefix, loading=READ)
     for share in range(2):
         held = data.val(DataPartition(share, 2))
@@ -606,9 +606,10 @@ def test_a_stage_without_a_lowering_is_refused_at_compile_time():
 
 def test_shares_agree_on_one_identity_and_resume_only_their_own_rows():
     """A per-share order is agreed across the pool without the share index,
-    which only a share's saved position keeps."""
+    which only a share's saved position keeps. (Held in memory, the order is
+    global and its position fits every share.)"""
     thirds = Pipeline(source()).filter(lambda row: int(row["id"]) % 3 > 0, identity="thirds@1")
-    data = compile(thirds.batch(4), loading=READ)
+    data = compile(thirds.batch(4), loading=READ, read="indexed")
     first, second = data.train(DataPartition(0, 2)), data.train(DataPartition(1, 2))
     try:
         assert first.identity() == second.identity()

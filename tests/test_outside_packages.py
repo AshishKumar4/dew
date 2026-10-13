@@ -239,7 +239,7 @@ class ActivityRun(RunConfig):
 
     def prepare(self):
         rows = np.random.default_rng(0).normal(size=(64, 8)).astype(np.float32)
-        from dew.config.data import Records, loader
+        from dew.config.data import RecordsData, loader
 
         data = loader(RecordsData(source={"x": rows}, validation={"x": rows[:20]}),
                       batch=self.trainer.batch_size,
