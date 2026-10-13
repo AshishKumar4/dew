@@ -21,7 +21,7 @@ sub-chunk for the backward intra-chunk gradients.
 Operands keep their dtypes as fla's do: bf16 queries, keys and values store `A`, `w`, `u`, the
 gated keys and the memory each chunk enters in bf16 with fp32 accumulation; the decay is fp32 and
 cumulated in base 2 as compensated halves (`fla_gdn.chunk_local_cumsum`), every range's exponent
-taken from both (`fla_gdn._between`); gradients of q, k, the decay and beta accumulate in fp32.
+taken from both (`compensated_difference`); gradients of q, k, the decay and beta accumulate in fp32.
 """
 
 import dataclasses
@@ -39,7 +39,6 @@ from dew.nn.kernels.fla_gdn import (
     Sequences,
     Tiles,
     _aligned,
-    _between,
     _chunk_of,
     _chunk_states,
     _dot,
@@ -59,6 +58,7 @@ from dew.nn.kernels.fla_gdn import (
     _write,
     sequences,
 )
+from dew.nn.precision import compensated_difference
 
 SUB = 16
 """fla's BC: the sub-chunk the intra-chunk kernels build their 16 x 16 blocks over."""
@@ -115,8 +115,8 @@ def _intra_diagonal_kernel(chunk_ref, q_ref, k_ref, g_ref, lo_ref, beta_ref, aqk
     """fla's `chunk_kda_fwd_kernel_intra_token_parallel` (chunk_intra_token_parallel.py:33-118) for one
     token and `BH` value heads: its row of its 16-token sub-chunk's diagonal block, `Aqk_ij = scale
     sum_k q_ik k_jk exp2(g_ik - g_jk)` for `j <= i` and `Akk_ij = sum_k beta_i k_ik k_jk exp2(g_ik -
-    g_jk)` for `j < i`, in fp32, the exponents from the decay's two halves (`_between`); `Aqk` stored
-    in its dtype and `Akk` fp32. A program per place of a
+    g_jk)` for `j < i`, in fp32, the exponents from the decay's two halves
+    (`compensated_difference`); `Aqk` stored in its dtype and `Akk` fp32. A program per place of a
     chunk, where fla's searches the token's sequence; a place past the chunk's end does nothing."""
     start, taken = _chunk_of(chunk_ref, chunk, aligned)
     place = pl.program_id(0) % chunk
@@ -133,7 +133,7 @@ def _intra_diagonal_kernel(chunk_ref, q_ref, k_ref, g_ref, lo_ref, beta_ref, aqk
 
         def column(j, sums):
             earlier = first + j
-            decay = jnp.exp2(_between(gate, _row(g_ref, lo_ref, earlier)))
+            decay = jnp.exp2(compensated_difference(gate, _row(g_ref, lo_ref, earlier)))
             gated = k_ref[earlier].astype(jnp.float32) * decay
             here = (index == j)[None, :]
             return (jnp.where(here, (jnp.sum(query * gated, axis=1) * scale)[:, None], sums[0]),
@@ -207,8 +207,8 @@ def _intra_solve_kernel(chunk_ref, q_ref, k_ref, g_ref, lo_ref, beta_ref, aqkd_r
     chunk of one head, in 16-row blocks, the key dimensions in blocks of `bk`. The diagonal blocks are
     `intra_diagonal`'s. A block below the diagonal, rows `i` and columns `j` of sub-chunks `I > J`,
     factors the decay through `g_n`, the first row of `I`: `(x_I exp2(g_I - g_n)) (k_J exp2(g_n -
-    g_J))^T`, each exponent from the decay's two halves (`_between`), fp32 products at fla's TF32
-    (`_tf32_dot`), then scaled by `scale` or by beta. The
+    g_J))^T`, each exponent from the decay's two halves (`compensated_difference`), fp32 products at
+    fla's TF32 (`_tf32_dot`), then scaled by `scale` or by beta. The
     diagonal blocks of `I + Akk` invert by forward substitution and merge in fla's order, `X_IJ =
     -(X_II A_IJ) X_JJ` for neighbours and `-X_II (sum_M A_IM X_MJ)` beyond, at TF32. `Aqk` and the
     inverse are stored in the keys' dtype, zero above the diagonal; a chunk's rows past its end read
@@ -243,10 +243,10 @@ def _intra_solve_kernel(chunk_ref, q_ref, k_ref, g_ref, lo_ref, beta_ref, aqkd_r
                 key, gate = load(k_ref, i), gates(i)
                 at = jnp.minimum(start + i * SUB, start + taken - 1)
                 origin = tuple(x[None, :] for x in _row(g_ref, lo_ref, (at, columns)))
-                ahead = jnp.exp2(_between(gate, origin))
+                ahead = jnp.exp2(compensated_difference(gate, origin))
                 read, written = load(q_ref, i) * ahead, key * ahead
                 for j, (earlier, decay) in enumerate(held):
-                    behind = (earlier * jnp.exp2(_between(origin, decay))).T
+                    behind = (earlier * jnp.exp2(compensated_difference(origin, decay))).T
                     qk, kk = found[i, j]
                     found[i, j] = (qk + _tf32_dot(read, behind), kk + _tf32_dot(written, behind))
                 held.append((key, gate))
@@ -338,7 +338,7 @@ def _w_u_kernel(chunk_ref, k_ref, v_ref, beta_ref, a_ref, g_ref, lo_ref, *refs, 
     """fla's `recompute_w_u_fwd_kda_kernel` (fla/ops/kda/wy_fast.py:34-140) for one chunk of one head:
     `u = A (v beta)` and `w = A ((k beta) exp2(g))`, each operand rounded to its input dtype before the
     product; the gated keys `k exp2(g_last - g)`, the exponent from the decay's two halves
-    (`_between`); with `queries`, the gated queries `q exp2(g)`."""
+    (`compensated_difference`); with `queries`, the gated queries `q exp2(g)`."""
     if queries:
         q_ref, w_ref, u_ref, kg_ref, qg_ref = refs
     else:
@@ -365,7 +365,7 @@ def _w_u_kernel(chunk_ref, k_ref, v_ref, beta_ref, a_ref, g_ref, lo_ref, *refs, 
             if q_ref is not None and qg_ref is not None:
                 write(qg_ref, columns, read(q_ref, columns) * jnp.exp2(gate[0]))
             last = tuple(x[None, :] for x in _row(g_ref, lo_ref, (start + taken - 1, columns)))
-            write(kg_ref, columns, key * jnp.exp2(_between(last, gate)))
+            write(kg_ref, columns, key * jnp.exp2(compensated_difference(last, gate)))
             write(w_ref, columns, _dot(inverse, scaled.astype(key.dtype), exact=exact))
 
 
@@ -626,7 +626,7 @@ def _wy_dqkg_kernel(chunk_ref, q_ref, k_ref, v_ref, vn_ref, g_ref, lo_ref, beta_
             gate_exp = jnp.exp2(gate[0])
             decay_grad = decay_grad * jnp.exp2(final[0])
             dq = dq * gate_exp * scale
-            dk = dk * jnp.exp2(_between(tuple(x[None, :] for x in final), gate))
+            dk = dk * jnp.exp2(compensated_difference(tuple(x[None, :] for x in final), gate))
             gated_key = key * gate_exp
             dw = -dw.astype(transposed.dtype)
             scores = scores + _dot(dw, gated_key.T.astype(transposed.dtype), exact=exact)
@@ -718,7 +718,7 @@ def _bwd_intra_kernel(chunk_ref, q_ref, k_ref, g_ref, lo_ref, beta_ref, daqk_ref
     sub-chunk `i` of a chunk, one head and one block of key columns, as fla's grid runs it. The
     gradients of `Aqk` and `Akk` reach the sub-chunk's queries and keys from the sub-chunks before
     (`dq2`, `dk2`, the decay factored at its first row) and after (`dkt`, factored at its last row),
-    every exponent from the decay's two halves (`_between`),
+    every exponent from the decay's two halves (`compensated_difference`),
     fp32 products at fla's TF32 (`_tf32_dot`), and from its own tokens one by one in fp32; then beta's
     and the decay's gradients, added to the ones `bwd_wy_dqkg` gave. Beta's is this key block's share.
     A chunk's rows past its end read as zeros under its last row's decay, and its own tokens stop
@@ -760,17 +760,18 @@ def _bwd_intra_kernel(chunk_ref, q_ref, k_ref, g_ref, lo_ref, beta_ref, daqk_ref
         origin = decayed(first)
 
         def before(j, sums):
-            gated = tile(k_ref, j * SUB).astype(jnp.float32) * jnp.exp2(_between(origin, gates(j * SUB)))
+            decay = jnp.exp2(compensated_difference(origin, gates(j * SUB)))
+            gated = tile(k_ref, j * SUB).astype(jnp.float32) * decay
             return (sums[0] + _tf32_dot(scores(daqk_ref, first, j * SUB), gated),
                     sums[1] + _tf32_dot(scores(dakk_ref, first, j * SUB), gated))
 
         empty = jnp.zeros((SUB, width), jnp.float32)
         dq2, dk2 = jax.lax.fori_loop(0, i, before, (empty, empty))
-        ahead = jnp.exp2(_between(gate, origin))
+        ahead = jnp.exp2(compensated_difference(gate, origin))
         dq2, dk2 = dq2 * ahead, dk2 * ahead
         def diagonal(j, sums):
             token = first + j
-            decay = jnp.exp2(_between(gate, decayed(token)))
+            decay = jnp.exp2(compensated_difference(gate, decayed(token)))
             causal = (index >= j)[:, None]
             own = row(k_ref, token)[None, :] * decay
             column = pl.ds(token, 1)
@@ -786,20 +787,20 @@ def _bwd_intra_kernel(chunk_ref, q_ref, k_ref, g_ref, lo_ref, beta_ref, daqk_ref
         closing = decayed(first + own_tokens - 1)
 
         def after(j, dkt):
-            behind = jnp.exp2(_between(gates(j * SUB), closing))
+            behind = jnp.exp2(compensated_difference(gates(j * SUB), closing))
             # k beta in the operands' dtype, as fla's b_kb, then widened by the decay.
             weighted = (tile(k_ref, j * SUB) * tile(beta_ref, j * SUB)[:, None]).astype(jnp.float32)
             dkt = dkt + _tf32_dot(scores(daqk_ref, j * SUB, first).T,
                                   tile(q_ref, j * SUB).astype(jnp.float32) * behind)
             return dkt + _tf32_dot(scores(dakk_ref, j * SUB, first).T, weighted * behind)
 
-        dkt = jax.lax.fori_loop(i + 1, count, after, empty) * jnp.exp2(_between(closing, gate))
+        dkt = jax.lax.fori_loop(i + 1, count, after, empty) * jnp.exp2(compensated_difference(closing, gate))
 
         def own(j, dkt):
             token = first + j
             query = row(q_ref, token)
             weighted = row(k_ref, token) * row(beta_ref, token)
-            decay = jnp.exp2(_between(decayed(token), gate))
+            decay = jnp.exp2(compensated_difference(decayed(token), gate))
             causal = (index <= j)[:, None]
             qk = daqk_ref[start + token, pl.ds(first, SUB)]
             kk = dakk_ref[start + token, pl.ds(first, SUB)]

@@ -47,7 +47,7 @@ from .flops import conv_flops, delta_flops, projection_flops
 from .inputs import AttentionMetadata, Coordinates, coordinates_of, valid_order
 from .kernels import generation
 from .kernels.generation import first_refusal, measured_kernel, ran_kernel, triton_runs
-from .precision import asks_default_precision, at_least_fp32, compensated_add
+from .precision import asks_default_precision, at_least_fp32, compensated_add, compensated_difference
 from .sharding import (
     HEADS,
     MLP_HIDDEN,
@@ -454,7 +454,8 @@ def chunk_decay(g, documents=None):
     inclusive = jnp.tril(jnp.ones((chunk_size, chunk_size), jnp.bool_))[..., None]
     if documents is not None:
         inclusive = inclusive & (documents[..., :, None, :] == documents[..., None, :, :])
-    diff = ((hi[..., :, None, :] - hi[..., None, :, :]) + (lo[..., :, None, :] - lo[..., None, :, :]))
+    diff = compensated_difference((hi[..., :, None, :], lo[..., :, None, :]),
+                                  (hi[..., None, :, :], lo[..., None, :, :]))
     # Masked before exp, as the references do. The unused positive
     # differences can overflow, and an outer where alone leaves 0 * inf in
     # the decay gradient.

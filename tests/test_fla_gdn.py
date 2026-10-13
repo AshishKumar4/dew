@@ -12,8 +12,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from delta_rule_support import recurrence, rule_math, through
-from reference_error import widened
+from delta_rule_support import CHUNKED, recurrence, rule_math, through
+from reference_error import assert_leaves_as_exact, widened
 from sharded import assert_runs_per_shard, boundary_copies
 from tuned import each_config
 
@@ -88,8 +88,9 @@ def test_the_output_kernel_computes_flas_expression(dtype, shape, config):
 def test_the_cumsum_kernel_is_flas_chunk_local_cumsum(reverse, columns):
     """Within each chunk of each head, and each key dimension of a decay per key dimension (fla's
     vector kernel), the inclusive sum of the base-2 scaled tokens, from the end for the gradient, as
-    numpy sums them in float64. Forward gives compensated halves: every range within a chunk, the
-    halves' differences summed (`fla_gdn._between`), lies within two fp32 roundings of the range's
+    numpy sums them in float64. Forward gives compensated halves, the high the sum rounded once and
+    the low what that dropped (`compensated_add`): every range within a chunk, the
+    halves' differences summed (`compensated_difference`), lies within two fp32 roundings of the range's
     own magnitude, where fla's plain fp32 prefixes, differenced, carry the whole prefix's rounding and
     miss that bound."""
     g = -jnp.exp(jax.random.normal(jax.random.key(3), (2, 192, 3, *columns)) - 3.0)
@@ -112,6 +113,7 @@ def test_the_cumsum_kernel_is_flas_chunk_local_cumsum(reverse, columns):
     assert np.any(np.abs(ranges(plain.astype(np.float64)) - ranges(summed)) > bound)
     for high, low in tiled(fla_gdn.ChunkLocalCumsum, kernel, g):
         assert high.dtype == low.dtype == jnp.float32
+        assert np.all(np.abs(np.asarray(low)) <= np.spacing(np.abs(np.asarray(high))) / 2)
         halves = [np.asarray(x, np.float64).reshape(tokens.shape) for x in (high, low)]
         got = ranges(halves[0]) + ranges(halves[1])
         assert np.all(np.abs(got - ranges(summed)) <= bound)
@@ -405,6 +407,48 @@ def test_the_ported_rule_and_its_gradients_follow_the_recurrence(dtype, bound):
     assert relative(final, want_final) < bound
     for name, mine, theirs in zip(("q", "k", "v", "g", "beta", "h0"), grads, want_grads, strict=True):
         assert relative(mine, theirs) < bound, name
+
+
+@pytest.mark.skipif(not INTERPRETED, reason="interpreted, the kernels' products are exact, so the decay's "
+                    "rounding is the only one the case sees; a GPU's fp32 products are fla's TF32")
+@pytest.mark.parametrize("per_key", [False, True])
+def test_a_range_late_in_a_long_decayed_chunk_decays_by_its_own_tokens(per_key):
+    """A key at token 48 and a query at 63, after a first token that decays by e^-200: `fla_rule`'s
+    output, final memory and gradients, through every kernel and the custom VJP, as near the float64
+    recurrence as the portable math, both taking a range from compensated halves
+    (`compensated_difference`). A plain fp32 prefix there, near -289 in base 2, rounds each running
+    sum by up to 1.5e-5, which the 15-token range carries into the output and past the bar; that
+    is asserted too. A decay per key dimension (Kimi's delta attention) is the same in each, the
+    pair in one 16-token sub-chunk, its diagonal block."""
+    length, width, key_at, query_at = 64, 64, 48, 63
+    keys = jax.random.split(jax.random.key(29), 7)
+    decay = (-jnp.exp(jax.random.normal(keys[0], (1, length, 1)) - 3.0)).at[:, 0].set(-200.0)
+    g = jnp.repeat(decay[..., None], width, axis=-1) if per_key else decay
+
+    def alone(key, at):
+        row = l2norm(jax.random.normal(key, (width,)))
+        return jnp.zeros((1, length, 1, width)).at[0, at, 0].set(row)
+
+    v = jax.random.normal(keys[3], (1, length, 1, width))
+    beta = jax.nn.sigmoid(jax.random.normal(keys[4], (1, length, 1)))
+    inputs = (alone(keys[1], query_at), alone(keys[2], key_at), v, g, beta, jnp.zeros((1, 1, width, width)))
+    do = jax.random.normal(keys[5], (1, length, 1, width))
+    dht = 0.1 * jax.random.normal(keys[6], (1, 1, width, width))
+
+    def math(q, k, v, g, beta, h0):
+        return linear.chunk_delta_rule(q, k, v, g if per_key else g[..., None], beta, h0)
+
+    got = through(fla_rule, do, dht)(*inputs)
+    want = through(math, do, dht)(*inputs)
+    with jax.enable_x64(new_val=True):
+        operands = widened((*inputs, do, dht))
+        truth = widened(through(recurrence, *operands[6:])(*operands[:6]))
+    tokens = np.asarray(decay, np.float32)[0, :, 0] * np.float32(fla_gdn.RCP_LN2)
+    plain, exact = np.cumsum(tokens, dtype=np.float32), np.cumsum(tokens.astype(np.float64))
+    missed = (plain[query_at] - plain[key_at]) - (exact[query_at] - exact[key_at])
+    with pytest.raises(AssertionError):
+        assert_leaves_as_exact(truth[0] * np.exp2(missed), want[0], truth[0], reductions=CHUNKED)
+    assert_leaves_as_exact(got, want, truth, reductions=CHUNKED)
 
 
 @pytest.mark.parametrize("key_heads, value_heads, width, columns, length", [
