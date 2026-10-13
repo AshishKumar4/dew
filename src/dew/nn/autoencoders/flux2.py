@@ -84,8 +84,6 @@ def load_flux2_vae(name_or_dir: str | Path, compute=jnp.float32, *, revision: st
         )
     if tuple(config.get("patch_size", (2, 2))) != (2, 2):
         raise ValueError(f"FLUX.2's pipeline folds 2x2 latent blocks, not {config.get('patch_size')}")
-    if not config.get("mid_block_add_attention", True) or config.get("act_fn", "silu") != "silu":
-        raise ValueError("the port computes the published VAE: SiLU and mid-block attention")
     model = AutoencoderKL.from_diffusers(config, compute)
     tensors = read_weights(directory)
     frame = jax.ShapeDtypeStruct((1, model.downscale_factor, model.downscale_factor, model.image_channels),
