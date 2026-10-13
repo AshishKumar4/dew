@@ -46,14 +46,14 @@ def _case_call(kernel, config, shape, dtype, *, reverse=False):
     state = jax.ShapeDtypeStruct((batch, value_heads, width, columns), jnp.float32)
     operands = {
         "chunk_local_cumsum": (gated,),
-        "kkt_solve": (keyed, gated, beta),
+        "kkt_solve": (keyed, gated, gated, beta),
         "recompute_w_u": (keyed, valued, beta, inverse, gated),
-        "chunk_fwd_h": (keyed, weighted, valued, gated, state),
-        "chunk_fwd_o": (keyed, keyed, valued, entered, gated),
-        "chunk_bwd_dv_local": (keyed, keyed, gated, valued),
-        "chunk_bwd_dhu": (keyed, keyed, weighted, gated, state, valued, valued),
-        "chunk_bwd_dqkwg": (keyed, keyed, valued, weighted, gated, entered, valued, valued, entered),
-        "prepare_wy_repr_bwd": (keyed, valued, beta, gated, inverse, weighted, valued, keyed),
+        "chunk_fwd_h": (keyed, weighted, valued, gated, gated, state),
+        "chunk_fwd_o": (keyed, keyed, valued, entered, gated, gated),
+        "chunk_bwd_dv_local": (keyed, keyed, gated, gated, valued),
+        "chunk_bwd_dhu": (keyed, keyed, weighted, gated, gated, state, valued, valued),
+        "chunk_bwd_dqkwg": (keyed, keyed, valued, weighted, gated, gated, entered, valued, valued, entered),
+        "prepare_wy_repr_bwd": (keyed, valued, beta, gated, gated, inverse, weighted, valued, keyed),
     }
     kwargs = {**config, "chunk": chunk, "interpret": False}
     if kernel == "chunk_local_cumsum":
@@ -81,7 +81,18 @@ def kernel_cases(target: str) -> Iterator[KernelCase]:
                                                              reverse=reverse))
 
 
-def reference_o(q, k, v, h, g, *, scale: float, chunk: int = 64):
+def between(later, earlier):
+    """A range's exponent from two cumulated decays' `(hi, lo)` halves, as the kernels take it
+    (`fla_gdn._between`)."""
+    return (later[0] - earlier[0]) + (later[1] - earlier[1])
+
+
+def pairwise(g, lo):
+    """`g_s - g_t` for every pair of a chunk's last-axis positions, `[..., C, C]`, from the halves."""
+    return between((g[..., :, None], lo[..., :, None]), (g[..., None, :], lo[..., None, :]))
+
+
+def reference_o(q, k, v, h, g, g_lo, *, scale: float, chunk: int = 64):
     """`fla_gdn.chunk_fwd_o`'s math in XLA, per chunk, for the tests: the same dtypes and casts."""
     batch, length, key_heads, _ = q.shape
     value_heads = v.shape[2]
@@ -93,12 +104,12 @@ def reference_o(q, k, v, h, g, *, scale: float, chunk: int = 64):
 
     # Widened before the products: exact for bf16, and XLA:CPU has no bf16 x bf16 -> fp32 dot.
     qc, kc, vc = (chunks(x).astype(jnp.float32) for x in (q, k, v))
-    gc = chunks(g).astype(jnp.float32)
+    gc, lc = (jnp.moveaxis(chunks(x).astype(jnp.float32), 3, 2) for x in (g, g_lo))
     h = h.astype(jnp.float32)
     out = jnp.einsum('bnchk,bnhkv->bnchv', qc, h, preferred_element_type=jnp.float32)
-    out = out * jnp.exp2(gc)[..., None]
+    out = out * jnp.moveaxis(jnp.exp2(gc), 2, 3)[..., None]
     scores = jnp.einsum('bnshk,bnthk->bnhst', qc, kc, preferred_element_type=jnp.float32)
-    scores = scores * jnp.exp2(jnp.moveaxis(gc, 3, 2)[..., :, None] - jnp.moveaxis(gc, 3, 2)[..., None, :])
+    scores = scores * jnp.exp2(pairwise(gc, lc))
     index = jnp.arange(chunk)
     scores = jnp.where(index[:, None] >= index[None, :], scores, 0.0)
     out = out * scale + jnp.einsum('bnhst,bnthv->bnshv', scores.astype(v.dtype).astype(jnp.float32), vc,
@@ -123,7 +134,7 @@ def reference_w_u(k, v, beta, a, g, *, chunk: int = 64):
     return w.reshape(*k.shape[:3], k.shape[-1]).astype(k.dtype), u.reshape(v.shape).astype(v.dtype)
 
 
-def reference_kkt_solve(k, g, beta, *, chunk: int = 64):
+def reference_kkt_solve(k, g, g_lo, beta, *, chunk: int = 64):
     """`kkt_solve`'s math in XLA, for the tests: the inverse in float64 of the same matrix."""
     group = beta.shape[2] // k.shape[2]
     dtype = k.dtype
@@ -133,15 +144,17 @@ def reference_kkt_solve(k, g, beta, *, chunk: int = 64):
     def chunks(x):
         return jnp.moveaxis(x.reshape(batch, length // chunk, chunk, heads, *x.shape[3:]), 3, 2)
 
-    kc, gc, bc = chunks(k), chunks(g.astype(jnp.float32)), chunks(beta.astype(jnp.float32))
+    kc, bc = chunks(k), chunks(beta.astype(jnp.float32))
+    gc, lc = chunks(g.astype(jnp.float32)), chunks(g_lo.astype(jnp.float32))
     a = jnp.einsum('bnhsk,bnhtk->bnhst', kc, kc, precision=jax.lax.Precision.HIGHEST)
-    a = a * jnp.exp2(gc[..., :, None] - gc[..., None, :]) * bc[..., :, None]
+    a = a * jnp.exp2(pairwise(gc, lc))
+    a = a * bc[..., :, None]
     a = jnp.tril(a, -1)
     inverse = jnp.linalg.inv(jnp.eye(chunk) + a)
     return jnp.moveaxis(inverse, 2, 3).reshape(batch, length, heads, chunk).astype(dtype)
 
 
-def reference_h(k, w, u, g, h0, *, chunk: int = 64):
+def reference_h(k, w, u, g, g_lo, h0, *, chunk: int = 64):
     """`chunk_fwd_h`'s math in XLA, a scan over chunks with the same roundings, products widened. A
     `g` per key dimension `[B, T, HV, K]` decays the memory's rows and gates no value (fla's USE_GK)."""
     per_key = g.ndim == 4
@@ -155,13 +168,14 @@ def reference_h(k, w, u, g, h0, *, chunk: int = 64):
         return jnp.moveaxis(x.reshape(batch, length // chunk, chunk, *x.shape[2:]), 1, 0)
 
     def step(state, inputs):
-        keys, weights, values, gate = inputs
+        keys, weights, values, gate, low = inputs
         entered = state.astype(dtype)
         predicted = jnp.einsum('bchk,bhkv->bchv', weights.astype(jnp.float32),
                                state.astype(weights.dtype).astype(jnp.float32), precision=exact)
         corrected = values.astype(jnp.float32) - predicted
         last = gate[:, -1]
-        gated = corrected if per_key else corrected * jnp.exp2(last[:, None] - gate)[..., None]
+        gated = corrected if per_key else corrected * jnp.exp2(
+            between((last[:, None], low[:, -1][:, None]), (gate, low)))[..., None]
         high = gated.astype(dtype)
         update = jnp.einsum('bchk,bchv->bhkv', keys.astype(jnp.float32), high.astype(jnp.float32),
                             precision=exact)
@@ -174,11 +188,12 @@ def reference_h(k, w, u, g, h0, *, chunk: int = 64):
         return state, (entered, corrected.astype(u.dtype))
 
     final, (h, corrected) = jax.lax.scan(step, h0.astype(jnp.float32),
-                                     (chunks(k), chunks(w), chunks(u), chunks(g.astype(jnp.float32))))
+                                     (chunks(k), chunks(w), chunks(u), chunks(g.astype(jnp.float32)),
+                                      chunks(g_lo.astype(jnp.float32))))
     return jnp.moveaxis(h, 0, 1), jnp.moveaxis(corrected, 0, 1).reshape(u.shape), final
 
 
-def reference_dhu(q, k, w, g, dht, do, dv, *, scale: float, chunk: int = 64):
+def reference_dhu(q, k, w, g, g_lo, dht, do, dv, *, scale: float, chunk: int = 64):
     """`chunk_bwd_dhu`'s math in XLA, a reverse scan over chunks with the same roundings. A `g` per
     key dimension `[B, T, HV, K]` decays the gradient's rows and gates neither the values' gradient
     nor the queries (fla's USE_GK)."""
@@ -193,13 +208,13 @@ def reference_dhu(q, k, w, g, dht, do, dv, *, scale: float, chunk: int = 64):
         return jnp.moveaxis(x.reshape(batch, length // chunk, chunk, *x.shape[2:]), 1, 0)
 
     def step(grad, inputs):
-        queries, keys, weights, gate, out_grad, local = inputs
+        queries, keys, weights, gate, low, out_grad, local = inputs
         stored = grad.astype(q_dtype)
         last = gate[:, -1]
         full = jnp.einsum('bchk,bhkv->bchv', keys.astype(jnp.float32),
                           grad.astype(k_dtype).astype(jnp.float32), precision=exact)
         if not per_key:
-            full = full * jnp.exp2(last[:, None] - gate)[..., None]
+            full = full * jnp.exp2(between((last[:, None], low[:, -1][:, None]), (gate, low)))[..., None]
         full = full + local.astype(jnp.float32)
         read = queries.astype(jnp.float32) * (1.0 if per_key else jnp.exp2(gate)[..., None])
         grad = (grad * (jnp.exp2(last)[..., None] if per_key else jnp.exp2(last)[..., None, None])
@@ -210,12 +225,13 @@ def reference_dhu(q, k, w, g, dht, do, dv, *, scale: float, chunk: int = 64):
 
     initial, (dh, dv2) = jax.lax.scan(
         step, dht.astype(jnp.float32),
-        (chunks(q), chunks(k), chunks(w), chunks(g.astype(jnp.float32)), chunks(do), chunks(dv)),
+        (chunks(q), chunks(k), chunks(w), chunks(g.astype(jnp.float32)), chunks(g_lo.astype(jnp.float32)),
+         chunks(do), chunks(dv)),
         reverse=True)
     return jnp.moveaxis(dh, 0, 1), initial, jnp.moveaxis(dv2, 0, 1).reshape(dv.shape)
 
 
-def reference_dv_local(q, k, g, do, *, scale: float, chunk: int = 64):
+def reference_dv_local(q, k, g, g_lo, do, *, scale: float, chunk: int = 64):
     """`chunk_bwd_dv_local`'s math in XLA, per chunk, with the same casts."""
     group = do.shape[2] // q.shape[2]
     q, k = (jnp.repeat(x, group, axis=2).astype(jnp.float32) for x in (q, k))
@@ -224,17 +240,17 @@ def reference_dv_local(q, k, g, do, *, scale: float, chunk: int = 64):
     def chunks(x):
         return x.reshape(batch, length // chunk, chunk, *x.shape[2:])
 
-    gc = jnp.moveaxis(chunks(g.astype(jnp.float32)), 3, 2)
+    gc, lc = (jnp.moveaxis(chunks(x.astype(jnp.float32)), 3, 2) for x in (g, g_lo))
     exact = jax.lax.Precision.HIGHEST
     scores = jnp.einsum('bnshk,bnthk->bnhst', chunks(k), chunks(q), precision=exact) * scale
-    scores = scores * jnp.exp2(gc[..., None, :] - gc[..., :, None])
+    scores = scores * jnp.exp2(-pairwise(gc, lc))
     index = jnp.arange(chunk)
     scores = jnp.where(index[:, None] <= index[None, :], scores, 0.0).astype(do.dtype).astype(jnp.float32)
     dv = jnp.einsum('bnhst,bnthv->bnshv', scores, chunks(do).astype(jnp.float32), precision=exact)
     return dv.reshape(do.shape).astype(do.dtype)
 
 
-def reference_dqkwg(q, k, v, w, g, h, dv, do, dh, *, scale: float, chunk: int = 64):
+def reference_dqkwg(q, k, v, w, g, g_lo, h, dv, do, dh, *, scale: float, chunk: int = 64):
     """`chunk_bwd_dqkwg`'s math in XLA, per chunk, with the same casts, products widened, and a key
     head's value heads summed in fp32 before `dq` and `dk` round."""
     key_heads = q.shape[2]
@@ -249,7 +265,7 @@ def reference_dqkwg(q, k, v, w, g, h, dv, do, dh, *, scale: float, chunk: int = 
         return x.reshape(batch, length // chunk, chunk, *x.shape[2:])
 
     qc, kc, vc, doc, dvc = (chunks(x) for x in (q, k, v, do, dv))
-    gc = chunks(g.astype(f32))
+    gc, lc = chunks(g.astype(f32)), chunks(g_lo.astype(f32))
     last = gc[:, :, -1]
     dg_last = jnp.sum((h * dh).astype(f32), axis=(-2, -1)) * jnp.exp2(last)
     ds = jnp.einsum('bnshv,bnthv->bnhst', doc.astype(f32), vc.astype(f32), precision=exact)
@@ -258,12 +274,12 @@ def reference_dqkwg(q, k, v, w, g, h, dv, do, dh, *, scale: float, chunk: int = 
     dw = -jnp.einsum('bnshv,bnhkv->bnshk', dvc.astype(v.dtype).astype(f32), h.astype(v.dtype).astype(f32),
                      precision=exact)
     dq = dq * jnp.exp2(gc)[..., None] * scale
-    dk = dk * jnp.exp2(last[:, :, None] - gc)[..., None]
+    dk = dk * jnp.exp2(between((last[:, :, None], lc[:, :, -1][:, :, None]), (gc, lc)))[..., None]
     dg_last = dg_last + jnp.einsum('bnshk,bnshk->bnh', dk, kc.astype(f32))
-    gh = jnp.moveaxis(gc, 3, 2)
+    gh, lh = jnp.moveaxis(gc, 3, 2), jnp.moveaxis(lc, 3, 2)
     index = jnp.arange(chunk)
     causal = index[:, None] >= index[None, :]
-    ds = jnp.where(causal, ds * jnp.exp2(gh[..., :, None] - gh[..., None, :]), 0.0) * scale
+    ds = jnp.where(causal, ds * jnp.exp2(pairwise(gh, lh)), 0.0) * scale
     ds = ds.astype(k_dtype).astype(f32)
     dq = dq + jnp.einsum('bnhst,bnthk->bnshk', ds, kc.astype(f32), precision=exact)
     dk = dk + jnp.einsum('bnhst,bnshk->bnthk', ds, qc.astype(f32), precision=exact)
