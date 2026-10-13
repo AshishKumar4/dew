@@ -86,12 +86,14 @@ from ..sharding import (
 from .decoder_block import (
     DECODER_REMAT,
     MLP_RESIDUALS,
+    NORM_SITES,
     RESIDUALS,
     BlockWiring,
     DecoderBlock,
     GatedMLP,
     Mixture,
     MTPBlock,
+    NormSpec,
     RematPolicy,
     decoder_norm,
     remat_policy,
@@ -211,9 +213,10 @@ class CausalTransformer(nn.Module):
     norm_eps: float = 1e-5
     norm_type: Literal['rms', 'layer'] = 'rms'
     norm_bias: bool = False
-    norm_groups: int = 1
-    """The groups each RMS norm takes its statistics over (`RMSNorm.groups`), K2 Horizon's
-    `layernorm_num_groups`."""
+    norms: Mapping[str, NormSpec] | None = None
+    """The norms that differ from the model's others, by module name
+    (`decoder_block.NORM_SITES`): K2 Horizon's grouped statistics, an
+    epsilon or a weight of a norm's own."""
     embedding_norm: bool = False
     """Normalize token embeddings before the first block, as BLOOM and ModernBERT do."""
     first_attention_norm: bool = True
@@ -403,6 +406,14 @@ class CausalTransformer(nn.Module):
         if isinstance(self.mlp, Mapping):
             # A config states SiTU's betas as a record in the activation's place.
             object.__setattr__(self, "mlp", from_record(Situ, self.mlp))
+        if self.norms is not None:
+            unknown = sorted(set(self.norms) - set(NORM_SITES))
+            if unknown:
+                raise ValueError(f"norms names {unknown}, which are no norms the decoder builds; "
+                                 f"it builds {list(NORM_SITES)}")
+            object.__setattr__(self, "norms", flax.core.freeze({
+                name: spec if isinstance(spec, NormSpec) else NormSpec(**spec)
+                for name, spec in self.norms.items()}))
         if self.kinds is not None:
             # Frozen, because a module's fields are static to jit and a plain
             # dict cannot be hashed.
@@ -1081,7 +1092,7 @@ class CausalTransformer(nn.Module):
             self.embedding_layernorm = decoder_norm(
                 self.norm_type, epsilon=self.norm_eps, bias=self.norm_bias,
                 scale_offset=self.scale_offset, scale_after_cast=self.scale_after_cast,
-                dtype=self.dtype, groups=self.norm_groups)(name='embedding_layernorm')
+                dtype=self.dtype, specs=self.norms)(name='embedding_layernorm')
         if self.position_embedding == 'learned':
             self.embed_positions = TokenEmbedding(
                 num_embeddings=self.position_embedding_size or self.max_seq_len,
@@ -1151,7 +1162,7 @@ class CausalTransformer(nn.Module):
         self.norm = decoder_norm(
             self.norm_type, epsilon=self.norm_eps, bias=self.norm_bias,
             scale_offset=self.scale_offset, scale_after_cast=self.scale_after_cast,
-            dtype=self.dtype, groups=self.norm_groups)(name='norm')
+            dtype=self.dtype, specs=self.norms)(name='norm')
         if self.loop is not None and self.loop.exit_gate:
             self.early_exit_gate = nn.Dense(
                 projections['early_exit_gate'][1], dtype=self.dtype, precision=self.precision,
@@ -1169,7 +1180,7 @@ class CausalTransformer(nn.Module):
             self.head_norm = decoder_norm(
                 self.norm_type, epsilon=self.norm_eps, bias=self.norm_bias,
                 scale_offset=self.scale_offset, scale_after_cast=self.scale_after_cast,
-                dtype=self.dtype, groups=self.norm_groups)(name='head_norm')
+                dtype=self.dtype, specs=self.norms)(name='head_norm')
         if self.head_bias:
             self.head_bias_value = self.param(
                 'head_bias', nn.initializers.zeros_init(), (self.vocab_size,), jnp.float32)
@@ -1248,7 +1259,7 @@ class CausalTransformer(nn.Module):
             norm_eps=self.norm_eps,
             norm_type=self.norm_type,
             norm_bias=self.norm_bias,
-            norm_groups=self.norm_groups,
+            norms=self.norms,
             scale_offset=self.scale_offset,
             scale_after_cast=self.scale_after_cast,
             wiring=wiring,

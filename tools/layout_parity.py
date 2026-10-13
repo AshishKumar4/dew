@@ -263,7 +263,8 @@ def zoo() -> dict[str, Any]:
     images: ImageRows = {"batch_size": 8, "channels": 4, "fsdp_min_param_size": 256}
     return {
         "dense": Case("causal_transformer", dense, **lm),
-        "grouped": Case("causal_transformer", {**dense, "norm_groups": 4}, **lm),
+        "grouped": Case("causal_transformer", {**dense, "norms": {site: {"groups": 4} for site in (
+            "input_layernorm", "post_attention_layernorm", "norm")}}, **lm),
         "moe": Case("causal_transformer", moe, **lm),
         "moe128": Case("causal_transformer", moe128, **lm),
         "hybrid": Case("causal_transformer", hybrid, **lm),
