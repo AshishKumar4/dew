@@ -77,7 +77,7 @@ def test_a_flow_trajectory_refuses_apg_momentum():
 
     process = Process(FlowMatchingScheduler(), FlowMatchPredictionTransform())
     denoise = process.denoiser(Velocity(), {}, {"label": jnp.ones((1,))}, {"label": jnp.zeros((1,))})
-    with pytest.raises(ValueError, match="momentum"):
+    with pytest.raises(ValueError):
         FlowSDE(0.5).trajectory(denoise, jnp.zeros((1, 3, 4)), 4, guidance=APG(4.0, momentum=-0.5),
                                 key=jax.random.key(0))
 

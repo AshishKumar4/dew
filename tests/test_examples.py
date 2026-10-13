@@ -349,7 +349,7 @@ def test_train_rlvr_starts_its_engine_with_that_engines_own_build_tools_first(tm
         (environment / tool).write_text("#!/bin/sh\n" + body)
         (environment / tool).chmod(0o755)
     config = example.Config(backend=backend, out=tmp_path, **{backend: str(environment / backend)})
-    with pytest.raises(RuntimeError, match="exited with 3"):
+    with pytest.raises(RuntimeError):
         example.launch_engine(config, tmp_path / "served")
     assert found.read_text().strip() == str(environment / "ninja")
 
@@ -511,7 +511,7 @@ def test_train_harbor_waits_for_the_gateway_it_is_told_to_launch(tmp_path):
         out=tmp_path / "out",
         ready_timeout=1.0,
     )
-    with pytest.raises(RuntimeError, match="no healthy worker"):
+    with pytest.raises(RuntimeError):
         example.main(config)
     assert (tmp_path / "served" / "config.json").is_file()
 

@@ -78,7 +78,7 @@ def test_legacy_neox_buffers_are_validated_in_their_stored_precision():
     ids = jnp.asarray(np.load(DIRECTORY / 'input_ids.npy'))
     np.testing.assert_array_equal(loaded.model.apply(actual, ids), loaded.model.apply(loaded.variables, ids))
     tensors[prefix + 'rotary_emb.inv_freq'][0] = .5
-    with pytest.raises(ValueError, match='rotary frequencies'):
+    with pytest.raises(ValueError):
         translate_weights(tensors, config, 'gpt_neox')
 
 

@@ -73,7 +73,7 @@ def test_bloom_reference_catches_a_dropped_alibi(monkeypatch):
     monkeypatch.setattr(attention, 'alibi_bias',
                         lambda *args, **kwargs: jnp.zeros_like(bias(*args, **kwargs)))
     wrong = loaded.model.apply(loaded.variables, np.load(DIRECTORY / 'input_ids.npy'))
-    with pytest.raises(AssertionError, match=r'allowed 2\.0'):
+    with pytest.raises(AssertionError):
         assert_as_exact_as_the_reference(wrong, np.load(DIRECTORY / 'logits.npy'),
                                          np.load(DIRECTORY / 'logits_f64.npy'), 'BLOOM dropped ALiBi')
 

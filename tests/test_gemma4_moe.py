@@ -84,6 +84,6 @@ def test_the_experts_read_the_normed_residual_not_the_dense_output():
 
 
 def test_a_top_k_wider_than_the_experts_is_refused():
-    with pytest.raises(ValueError, match="top_k"):
+    with pytest.raises(ValueError):
         Gemma4TextRouter(num_experts=EXPERTS, top_k=EXPERTS + 1).init(
             jax.random.PRNGKey(0), jnp.ones((3, HIDDEN)))

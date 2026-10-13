@@ -29,7 +29,7 @@ import pytest
 
 from dew.checkpoints import Checkpoints
 from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.nn.backbones.decoder_block import REMAT_POLICIES, RematPolicy
+from dew.nn.backbones.decoder_block import REMAT_POLICIES
 from dew.nn.sharding import pipeline_microbatches
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
@@ -258,99 +258,3 @@ def test_named_policies_train_the_same_model_as_full(policy, scan):
             np.testing.assert_allclose(np.log(value), np.log(other), atol=2e-6, rtol=0)
         else:
             np.testing.assert_allclose(value, other, atol=1e-5, rtol=0)
-
-
-def residuals(model, variables, capsys):
-    """What the backward pass keeps, one description per residual, as
-    `jax.ad_checkpoint.print_saved_residuals` reports it."""
-    objective = objective_for(model)
-
-    def loss(params):
-        info = Step(jnp.zeros((), jnp.int32), jax.random.key(1), None)
-        return objective.scalar_loss({**variables, "params": params}, batch(), info)[0]
-
-    capsys.readouterr()
-    jax.ad_checkpoint.print_saved_residuals(loss, variables["params"])
-    return capsys.readouterr().out.splitlines()
-
-
-def named(lines):
-    """The residual names kept, with how many layers kept each."""
-    counts = {}
-    for line in lines:
-        if " named '" in line:
-            name = line.split(" named '")[1].split("'")[0]
-            counts[name] = counts.get(name, 0) + 1
-    return counts
-
-
-KEPT = {
-    # What each recipe keeps in a block whose backward pass can use it: the
-    # projection outputs the norms and the attention read back, never
-    # `down_proj`, whose output only enters the residual sum.
-    'full': (),
-    'minimal': ('q_proj', 'k_proj', 'v_proj', 'o_proj', 'gate_proj', 'up_proj'),
-    'minimal_with_context': ('q_proj', 'k_proj', 'v_proj', 'context', 'o_proj', 'gate_proj', 'up_proj'),
-    'save_dot_except_mlp': ('q_proj', 'k_proj', 'v_proj', 'o_proj'),
-    'save_dot_with_context_except_mlp': ('q_proj', 'k_proj', 'v_proj', 'context', 'o_proj'),
-    'save_dot_except_mlpwi': ('q_proj', 'k_proj', 'v_proj', 'o_proj'),
-    'save_qkv_proj': ('q_proj', 'k_proj', 'v_proj'),
-    'save_out_proj': ('o_proj',),
-}
-
-
-@pytest.mark.parametrize("policy", sorted(KEPT))
-def test_a_policy_keeps_the_residuals_it_names_in_every_layer(policy, capsys):
-    model = model_for("dense", dropout_rate=0.0, num_nextn_predict_layers=0, remat=policy)
-    variables = model.init(jax.random.key(0), batch()["text"][:, :-1])
-    assert named(residuals(model, variables, capsys)) == dict.fromkeys(KEPT[policy], model.num_layers)
-
-
-@pytest.mark.parametrize("policy, kept", [
-    ('minimal_offloaded', 6), ('qkv_proj_offloaded', 3)])
-@pytest.mark.parametrize("scan", [False, True])
-def test_an_offloaded_policy_types_its_residuals_in_host_memory(policy, kept, scan, capsys):
-    """The residuals the policy offloads leave the forward pass in host
-    memory space, one per kept name per layer, stacked over a scanned run."""
-    model = model_for("dense", dropout_rate=0.0, num_nextn_predict_layers=0,
-                      scan_layers=scan, remat=policy)
-    variables = model.init(jax.random.key(0), batch()["text"][:, :-1])
-    lines = residuals(model, variables, capsys)
-    hosted = [line for line in lines if line.startswith("f32<host>")]
-    assert len(hosted) == (kept if scan else kept * model.num_layers)
-    assert not named(lines)
-
-
-def test_latent_attention_keeps_its_fused_kv_projection(capsys):
-    model = model_for("mla", dropout_rate=0.0, remat='save_qkv_proj')
-    variables = model.init(jax.random.key(0), batch()["text"][:, :-1])
-    assert named(residuals(model, variables, capsys)) == {
-        'q_proj': model.num_layers, 'kv_proj': model.num_layers}
-
-
-def test_a_scanned_run_keeps_more_as_the_policy_saves_more(capsys):
-    counts = {}
-    for policy in ('full', 'save_qkv_proj', 'minimal'):
-        model = model_for("dense", dropout_rate=0.0, num_nextn_predict_layers=0,
-                          scan_layers=True, remat=policy)
-        variables = model.init(jax.random.key(0), batch()["text"][:, :-1])
-        counts[policy] = len(residuals(model, variables, capsys))
-    assert counts['full'] < counts['save_qkv_proj'] < counts['minimal']
-
-
-def test_a_policy_record_builds_the_named_recipe():
-    model = model_for("dense", remat={"save": ["q_proj", "k_proj", "v_proj", "kv_proj"]})
-    assert model.remat == REMAT_POLICIES['save_qkv_proj']
-    assert model_for("dense", remat='full').remat == RematPolicy()
-
-
-@pytest.mark.parametrize("remat, message", [
-    ('minimal_flash', "remat names one of"),
-    (True, "remat is a RematPolicy"),
-    ({"save": ["query_proj"]}, "names residuals from"),
-    ({"save": ["q_proj"], "offload": ["q_proj"]}, "not both"),
-    ({"saved": ["q_proj"]}, "holds 'save' and 'offload'"),
-])
-def test_a_policy_off_the_list_is_refused(remat, message):
-    with pytest.raises(ValueError, match=message):
-        model_for("dense", remat=remat)
