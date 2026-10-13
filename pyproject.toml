@@ -50,6 +50,12 @@ dependencies = [
     "jinja2",
     "filelock",
     "huggingface_hub",
+    "fsspec>=2026.6.0",
+    "gcsfs>=2026.6.0",
+    "s3fs>=2026.6.0",
+    "urllib3>=2.5",
+    "pyarrow>=25.0.1",
+    "array-record>=0.8.3; sys_platform != 'win32'",
     # dew.nn.kernels.tuning: every Pallas launch is a tokamax Op, whose config
     # is measured per GPU model and shape. 0.0.13 and 0.0.14 pin
     # typeguard==2.13.3, which tyro excludes.
@@ -104,6 +110,8 @@ profile = ["xprof>=2.23.1,!=2.23.2,<3"]
 quantization = ["qwix==0.1.8"]
 test = [
     "pytest",
+    "moto[server,s3]>=5.1.15",
+    "deltalake>=1.0",
     # tests/test_kernel_configs.py compiles every declared Pallas kernel config with Triton's own
     # compiler for each GPU generation on a CPU: the release torch 2.14 (the torchax extra) takes.
     "triton~=3.8.0; sys_platform == 'linux' and platform_machine == 'x86_64'",
@@ -177,6 +185,7 @@ tensorboard = ["tensorboard"]
 hpo = ["optuna"]
 # Online URL-streaming loader (HF datasets-backed)
 streaming = ["datasets"]
+delta = ["deltalake>=1.0"]
 # lm-evaluation-harness task suites through dew.eval.harness.DewLM, which
 # subclasses TemplateLM. Before 0.4.10, TemplateLM keeps the BOS that DewLM's
 # tokenizer puts at the start of an empty-context continuation, and scores it
@@ -206,6 +215,8 @@ serve = ["starlette>=0.40", "uvicorn>=0.30"]
 guided = ["outlines-core>=0.2.14"]
 # HF image processors use torchvision on the host; model computation stays JAX.
 vision = ["torchvision>=0.29"]
+# dew.data.images.albumentations: an albumentations pipeline as a seeded random step.
+augment = ["albumentations>=2"]
 # Pretrained.load(fallback="torchax"): transformers' PyTorch forward lowered to
 # JAX. torchax 0.0.13 fails to import on torch 2.14; this nightly is the build
 # the fallback's tests ran against.
@@ -213,7 +224,7 @@ torchax = ["torch>=2.14,<2.15", "torchax==0.0.14.dev20260922"]
 # The test suite's one environment: every package a test file imports, so no test skips for want
 # of one. CI's jobs, armada's (tools/armada/install.sh), the GPU nodes' and dew-ops' GPU jobs install
 # it under constraints.txt, locked in locks/ (tools/lock_environment.sh).
-ci = ["dewml[test,av,tfds,metrics,plots,inference-clients,serve,vision,quantization,profile,torchax,gguf]",
+ci = ["dewml[test,av,tfds,metrics,plots,inference-clients,serve,vision,augment,quantization,profile,torchax,gguf]",
       "flake8"]
 # The tutorial notebooks' environment (.github/workflows/tutorials.yml).
 tutorials = ["dewml[streaming,interop,plots]", "nbclient", "nbformat", "ipykernel"]
