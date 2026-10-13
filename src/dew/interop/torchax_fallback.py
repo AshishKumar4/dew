@@ -28,7 +28,7 @@ import json
 import math
 import warnings
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -140,80 +140,40 @@ class TorchGraph:
     `head` names the output head's weight when the logits are exactly
     `hidden @ head.T`, checked at load; None when the model adds anything
     (a bias, a scale, a softcap). `persistent` names the buffers the source
-    checkpoint stores. The module runs its eval forward. A training forward
-    runs it too where the model's training forward traces to the same
-    program, and is refused where it traces to another (dropout, layer
-    drop, router noise, any branch on `self.training`), as torchax cannot
-    run a training forward's randomness.
+    checkpoint stores. A training forward runs the module's own training
+    forward, its dropout and other draws taking `key` as torchax's random
+    key; one that draws on the host instead (OPT's layer drop,
+    `torch.rand([])`) is decided once at trace time, and is refused.
     """
 
     module: JittableModule
     head: str | None
     persistent: tuple[str, ...]
-    # Whether the training forward differs, by the shapes it was traced at.
-    _differs: dict[str, bool] = field(default_factory=dict)
 
     def __call__(self, params: Mapping[str, jax.Array], buffers: Mapping[str, jax.Array],
-                 tokens: jax.Array, *, train: bool) -> tuple[jax.Array, jax.Array]:
+                 tokens: jax.Array, *, train: bool, key: jax.Array | None = None
+                 ) -> tuple[jax.Array, jax.Array]:
         """The logits and the output head's input states for `tokens`."""
-        if train and self._trains_otherwise(params, buffers, tokens):
-            raise ValueError(
-                "fallback='torchax' runs transformers' eval forward, and this model's training forward "
-                "computes something else (dropout, layer drop, router noise or another branch on "
-                "self.training); set those rates to 0 in its config, or train a family Dew loads natively")
-        return self._forward(params, buffers, tokens)
-
-    def _forward(self, params, buffers, tokens, watch=None) -> tuple[jax.Array, jax.Array]:
         import torchax
 
         env = torchax.default_env()
+        draws = _Draws()
         arguments = env.j2t_iso((dict(params), dict(buffers), tokens))
-        with env, watch or contextlib.nullcontext():
-            outputs = self.module.functional_call(_forward, *arguments)
+        self.module.train(train)
+        try:
+            with env, env.override_property(prng=key) if key is not None else contextlib.nullcontext(), draws:
+                outputs = self.module.functional_call(_forward, *arguments)
+        finally:
+            self.module.eval()
+        if draws.host:
+            raise ValueError(
+                f"fallback='torchax' traces this model's training forward once, and it draws on the host "
+                f"({draws.host} draws, e.g. a layer drop), which tracing would fix for every step; set "
+                f"that rate to 0 in its config, or train a family Dew loads natively")
+        if draws.device and key is None:
+            raise ValueError("this model's training forward draws (dropout) and was given no 'dropout' rng")
         logits, hidden = env.t2j_iso(outputs)
         return logits, hidden
-
-    def _trains_otherwise(self, *arguments) -> bool:
-        """Whether the module's training forward does anything its eval forward does not.
-
-        Both are traced with torchax's random key as an input, so a draw on
-        the device is part of the program, under a mode above torchax's that
-        counts torch's random calls, since a draw on the host is decided at
-        trace time (OPT's layer drop, `torch.rand([])`) and leaves the
-        program alone. Another program, other constants or another count is
-        another forward; a training forward that cannot be traced is refused."""
-        import torchax
-
-        env = torchax.default_env()
-        shapes = jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(jnp.shape(leaf), jnp.result_type(leaf)),
-                              arguments)
-        signature = str(jax.tree.map(lambda shape: (shape.shape, str(shape.dtype)), shapes))
-        if signature not in self._differs:
-            traces = []
-            for training in (True, False):
-                draws = _Draws()
-
-                # One function a trace: JAX caches a trace by its function, and the mode is not an input.
-                def forward(key, *arguments, draws=draws):
-                    with env.override_property(prng=key):
-                        return self._forward(*arguments, watch=draws)
-
-                self.module.train(training)
-                try:
-                    traced = jax.make_jaxpr(forward)(jax.random.key(0), *shapes)
-                except Exception as error:
-                    mode = "training" if training else "eval"
-                    raise ValueError(f"fallback='torchax' could not trace this model's {mode} forward "
-                                     "to check one against the other") from error
-                finally:
-                    self.module.eval()
-                traces.append((str(traced.jaxpr), traced.consts, draws.count))
-            (program, consts, count), (eval_program, eval_consts, eval_count) = traces
-            self._differs[signature] = (program != eval_program or count != eval_count
-                                        or len(consts) != len(eval_consts)
-                                        or not all(np.array_equal(np.asarray(one), np.asarray(other))
-                                                   for one, other in zip(consts, eval_consts, strict=True)))
-        return self._differs[signature]
 
     def export(self, model: nn.Module, variables: Mapping[str, object],
                config: Mapping[str, object]) -> dict[str, np.ndarray]:
@@ -230,8 +190,10 @@ class TorchGraph:
 
 
 def _Draws():
-    """A torch function mode that counts the calls of torch's random functions."""
+    """A torch function mode counting the calls of torch's random functions,
+    on torchax's device (`device`) and on the host (`host`)."""
     import torch
+    import torchax
     from torch.overrides import TorchFunctionMode
 
     drawing = {torch.rand, torch.rand_like, torch.randn, torch.randn_like, torch.randint, torch.randint_like,
@@ -240,11 +202,16 @@ def _Draws():
                torch.Tensor.cauchy_, torch.Tensor.geometric_, torch.Tensor.log_normal_}
 
     class Draws(TorchFunctionMode):
-        count = 0
+        device = host = 0
 
         def __torch_function__(self, func, types, args=(), kwargs=None):
-            self.count += func in drawing
-            return func(*args, **(kwargs or {}))
+            result = func(*args, **(kwargs or {}))
+            if func in drawing:
+                if isinstance(result, torchax.tensor.Tensor):
+                    self.device += 1
+                else:
+                    self.host += 1
+            return result
 
     return Draws()
 
@@ -273,8 +240,8 @@ class TorchCausalLM(nn.Module):
     `init` has no initializer to draw from, so the module starts from the
     loaded variables only. Floating parameters are cast to `dtype` for the
     forward, which keeps them in their stored dtype as masters; buffers keep
-    theirs. The torch module runs its eval forward, and a training forward
-    is refused where the model would compute anything else in one (`TorchGraph`).
+    theirs. A training forward runs the module's own, its dropout drawing
+    from the 'dropout' rng (`TorchGraph`).
 
     `hidden_states` and `output_table` are the pair `LMObjective` scores
     through, so the vocabulary-sized logits are never built whole. Only a
@@ -336,7 +303,8 @@ class TorchCausalLM(nn.Module):
         held = self.variables
         params = {name: self._compute(leaf) for name, leaf in held["params"].items()}
         buffers = {name: jnp.asarray(leaf) for name, leaf in held.get("buffers", {}).items()}
-        return self.graph(params, buffers, jnp.asarray(tokens), train=train)
+        key = self.make_rng("dropout") if train and self.has_rng("dropout") else None
+        return self.graph(params, buffers, jnp.asarray(tokens), train=train, key=key)
 
     def _compute(self, leaf) -> jax.Array:
         value = jnp.asarray(leaf)
