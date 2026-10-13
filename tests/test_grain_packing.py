@@ -7,11 +7,11 @@ import numpy as np
 import pytest
 from grain.experimental import FirstFitPackIterDataset
 
-from dew.data import Loading, Memory, text
+from dew.data import Loading, Memory
 from dew.data.compile import validation
 from dew.data.dataset import DataPartition
 from dew.data.pipeline import Pipeline
-from dew.data.tokens import PackedWindows
+from dew.data.tokens import DocumentChunks, PackedWindows
 
 READ = Loading(workers=0, threads=1, read_buffer=0, worker_buffer=1)
 
@@ -20,7 +20,7 @@ READ = Loading(workers=0, threads=1, read_buffer=0, worker_buffer=1)
 def test_packed_windows_are_grains_first_fit_windows(window, bins):
     """Documents from one token to well past the window, a few exactly the
     window and one empty, with ids and roles: grain's packer, given the
-    chunks `text.chunk` cuts explicitly in file order and its bins emitted in
+    chunks `DocumentChunks` cuts in file order and its bins emitted in
     order, writes window for window what `PackedWindows` reads by index,
     the ids, the roles and the segment ids and positions. Grain writes a
     segment-id and position pair per feature; the roles' pair is the ids'
@@ -29,13 +29,11 @@ def test_packed_windows_are_grains_first_fit_windows(window, bins):
     lengths = np.concatenate([rng.integers(1, 3 * window, 60), [window, window, 0, 1]])
     documents = [{"text": (np.arange(length) + 1000 * index).astype(np.int32),
                   "text_roles": np.full(length, index % 4, np.int32)} for index, length in enumerate(lengths)]
-    chunking = text.chunk(window, fields=("text", "text_roles"))
-    chunks = [{name: part[name] for name in ("text", "text_roles")}
-              for document in documents for part in chunking.flat_map(document) if len(part["text"])]
-    source = grain.MapDataset.source(chunks)
-    packed = PackedWindows(source, [len(chunk["text"]) for chunk in chunks], window, bins, "corpus")
+    source = grain.MapDataset.source(documents)
+    packed = PackedWindows(source, lengths, window, bins, "corpus")
+    chunks = DocumentChunks(source, lengths, window)
     reference = list(FirstFitPackIterDataset(
-        source.to_iter_dataset(),
+        grain.MapDataset.source([chunks[index] for index in range(len(chunks))]).to_iter_dataset(),
         length_struct={"text": window, "text_roles": window}, num_packing_bins=bins, shuffle_bins=False))
     assert len(packed) == len(reference)
     for index, expected in enumerate(reference):

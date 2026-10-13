@@ -11,43 +11,13 @@ import grain.python as grain
 import numpy as np
 import pytest
 
-from dew.data import Loading, Memory, preferences, presets, prompts, text
+from dew.data import Loading, Memory, preferences, presets, prompts
 from dew.data.compile import compile, iterate
 from dew.data.dataset import DataPartition
 from dew.data.ordering import BlockShuffle
 from dew.objectives.base import VALID_ROWS
 
 READ = Loading(workers=0, threads=1, read_buffer=0, worker_buffer=1)
-
-
-@pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
-@pytest.mark.parametrize("policy", ["first-fit", "best-fit"])
-@pytest.mark.parametrize("planned", [False, True])
-def test_pack_refuses_implicit_document_chunks_in_every_read(read, policy, planned):
-    """Both eager records and certified lengths refuse an unsplit long document."""
-    documents = [np.arange(40, dtype=np.int32), np.arange(3, dtype=np.int32)]
-    stored = (Memory({"text": documents, "length": [len(row) for row in documents]}) if planned
-              else Memory([{"text": row} for row in documents]))
-    with pytest.raises(ValueError):
-        data = compile(stored.pack(16, policy=policy).batch(1), read=read, loading=READ)
-        reader = data.train(DataPartition())
-        try:
-            next(reader)
-        finally:
-            reader.close()
-
-
-@pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
-def test_explicit_overlapping_chunks_keep_all_document_targets(read):
-    """Explicit chunking keeps each next-token pair exactly once through packing."""
-    stored = Memory([{"text": np.arange(40, dtype=np.int32)}])
-    rows = iterate(stored.flat_map(text.chunk(16, overlap=1)).pack(16), read=read, loading=READ)
-    pairs = []
-    for row in rows:
-        ids, segments = row["text"], row["text_segment_ids"]
-        scored = (segments[:-1] > 0) & (segments[:-1] == segments[1:])
-        pairs.extend(zip(ids[:-1][scored].tolist(), ids[1:][scored].tolist(), strict=True))
-    assert sorted(pairs) == [(token, token + 1) for token in range(39)]
 
 
 @dataclasses.dataclass(frozen=True)

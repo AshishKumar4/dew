@@ -4,7 +4,6 @@ import itertools
 
 import numpy as np
 
-from dew.data import text
 from dew.data.cache import Cache
 from dew.data.compile import compile, publish
 from dew.data.dataset import DataPartition, Loading
@@ -17,7 +16,7 @@ READ = Loading(workers=0, threads=1, read_buffer=0, worker_buffer=1)
 
 def test_published_first_fit_matches_memory_windows_and_resumes_across_shares(tmp_path):
     source = Memory(tuple({"text": "x" * size} for size in (3, 7, 18, 2, 4, 12, 8, 1, 15, 6)))
-    prefix = Pipeline(source).map(Tokenize()).flat_map(text.chunk(9, overlap=1))
+    prefix = Pipeline(source).map(Tokenize())
     policy = prefix.pack(9, bins=3)
     generation = publish(policy, Cache(str(tmp_path / "cache"), spool_bytes=4 * 1024**2,
                                       shard_bytes=256 * 1024), read="indexed", loading=READ)

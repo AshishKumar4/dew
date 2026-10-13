@@ -622,8 +622,7 @@ class _Build:
                 raise ValueError(f"token split in {_name(pipeline)} needs a finite indexed order")
             rows, lengths = _TokenSplit(rows, stage), None
         elif isinstance(stage, Pack):
-            fields = Fields(stage.fields, max_length=None if stage.policy == "concat" else stage.seq_len)
-            rows = _packed(_as_iter(rows, self.loading).map(fields), stage)
+            rows = _packed(_as_iter(rows, self.loading).map(Fields(stage.fields)), stage)
             lengths = None
         elif isinstance(stage, Windows):
             from dew.data.steps.windows import CausalWindows
