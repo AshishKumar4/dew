@@ -751,8 +751,9 @@ def _dhu_kernel(span_ref, q_ref, k_ref, w_ref, g_ref, dht_ref, do_ref, dv_ref, d
     """fla's `chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64` (chunk_delta_h.py:359-669) for one
     sequence's head and `BV` value columns, chunks in reverse. Each stores the gradient of the memory
     it leaves into, `dh`, then `dv2 = dv + (k dh) exp2(g_last - g)` (dh cast to k's dtype), then
-    `dh = dh exp2(g_last) + scale (q exp2(g))^T do - w^T dv2`: the gated queries fp32 in one TF32
-    product with `do`, as fla's, and dv2 cast to w's dtype for its product, as fla casts it.
+    `dh = dh exp2(g_last) + scale (q exp2(g))^T do - w^T dv2`: the gated queries fp32 as two parts
+    of `do`'s dtype (`_split_dot`), where fla takes one TF32 product at the same cost, and dv2 cast
+    to w's dtype for its product, as fla casts it.
     `per_key` is fla's USE_GK branch: `g_ref` `[T, K]` decays the gradient's rows by `exp2(g_last)`,
     and neither `dv2` nor the queries, which carry their own decay, are gated; the query product
     stays in q's dtype. A row's last sequence starts from the final
@@ -792,7 +793,7 @@ def _dhu_kernel(span_ref, q_ref, k_ref, w_ref, g_ref, dht_ref, do_ref, dv_ref, d
                 dv = dv * jnp.exp2(last - gate)[:, None] + read(dv_ref).astype(jnp.float32)
                 decay = jnp.exp2(gate)[:, None]
                 kept = [jnp.exp2(last)] * slices
-                read_out = [_tf32_dot((query.astype(jnp.float32) * decay).T, out_grad.astype(jnp.float32))
+                read_out = [_split_dot((query.astype(jnp.float32) * decay).T, out_grad, exact=exact)
                             for query in queries]
             _write(_rows(dv2_ref, begin, chunk), taken, dv)
 
@@ -954,6 +955,22 @@ def chunk_bwd_dv_local(q, k, g, do, *, scale: float, chunk: int = 64, bk: int | 
     spans = sequences(batch, length, chunk=chunk) if spans is None else spans
     return _launch(_CHUNK_BWD_DV_LOCAL, {"bk": bk, "bv": bv, "warps": warps, "stages": stages},
                    q, k, g, do, *spans, scale=scale, chunk=chunk, interpret=interpret)
+
+
+def _split_dot(a, b, *, exact: bool):
+    """`a @ b` with an fp32 operand beside a 16-bit one: the fp32 one as two parts of the other's
+    dtype, its rounding and the rounding's remainder, each product exact and summed in fp32, where
+    fla takes one TF32 product of both in fp32: two narrow products run as fast as one TF32 product
+    and keep 16 bits of the fp32 operand to TF32's 10. Operands of one dtype keep the one product."""
+    narrow = min(a.dtype, b.dtype, key=lambda dtype: jnp.dtype(dtype).itemsize)
+
+    def parts(x):
+        if x.dtype == narrow:
+            return [x]
+        high = x.astype(narrow)
+        return [high, (x - high.astype(jnp.float32)).astype(narrow)]
+
+    return sum(_dot(left, right, exact=exact) for left in parts(a) for right in parts(b))
 
 
 def _state_inner_product(memory, memory_grad):
