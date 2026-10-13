@@ -28,7 +28,6 @@ from dew.nn.attention import (
     combined_attention_mask,
     cudnn_runs,
     kernel_for_materialized_mask,
-    local_attention,
     max_attention_logits,
     open_kv_cache,
     reference_only,
@@ -37,9 +36,10 @@ from dew.nn.attention import (
 )
 from dew.nn.blocks import normal_kernel
 from dew.nn.flops import attention_flops, projection_flops
-from dew.nn.inputs import Admitted, AttentionMetadata
+from dew.nn.inputs import Admitted, AttentionMetadata, coordinates_of
 from dew.nn.kernels.generation import backend
 from dew.nn.kv_cache import TABLE, Append, KVCache, KVStore, filled_slots, rotated, write_cache
+from dew.nn.local_attention import local_attention
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.precision import at_least_fp32, scaled
 from dew.nn.protocols import ProjectionGroup
@@ -487,10 +487,14 @@ class CausalSelfAttention(nn.Module):
             or (self.bidirectional_images and metadata.image_groups is not None))
 
     @nn.compact
-    def __call__(self, x, decode: bool = False,
-                 positions=None, segment_ids=None, kv_store=None,
+    def __call__(self, x, decode: bool = False, kv_store=None,
                  attention_metadata: AttentionMetadata | None = None, train: bool = False):
         B, S, _ = x.shape
+        # The tokens' places and documents: the caller's or a packed batch's, else none given
+        # (`Coordinates`).
+        tokens = coordinates_of(attention_metadata, B, S)
+        # Each token's logical place (`Coordinates.places`); a cached call's default is its slot.
+        positions, segment_ids = tokens.positions if decode else tokens.places(), tokens.segments
         logical_positions = positions
         # The projections and the kernel's output carry the names a remat
         # policy saves or offloads (decoder_block.RESIDUALS).
@@ -541,7 +545,9 @@ class CausalSelfAttention(nn.Module):
             if self.attention_scale is not None:
                 query = scaled(query, self.attention_scale * math.sqrt(self.head_dim))
             if self.temperature_tuning is not None:
-                scale = temperature_scale(positions, *self.temperature_tuning,
+                # The tokens' logical places, never their cache slots (`Coordinates.positions`).
+                scale = temperature_scale(positions if logical_positions is None else logical_positions,
+                                          *self.temperature_tuning,
                                           dtype=at_least_fp32(query.dtype))
                 query = query * (scale[..., None, None] if scale.ndim == 2
                                  else scale[None, :, None, None]).astype(query.dtype)
@@ -585,10 +591,8 @@ class CausalSelfAttention(nn.Module):
                 key_positions = jnp.arange(masking.key.shape[1])
             elif attention_metadata is not None and attention_metadata.key_positions is not None:
                 key_positions = attention_metadata.key_positions
-            elif attention_metadata is not None and attention_metadata.valid is not None:
-                valid = attention_metadata.valid
-                key_positions = (jnp.cumsum(valid, axis=-1) - 1) * valid
             else:
+                # Each key's logical place, its query's (`Coordinates.positions`).
                 key_positions = positions
             bias = alibi_bias(key_positions, self.num_heads, dtype=query.dtype)
         if attention_metadata is not None and attention_metadata.position_bias is not None:
@@ -628,12 +632,10 @@ class CausalSelfAttention(nn.Module):
                 raise ValueError(
                     "a bidirectional canvas reads its encoder prefix as dense, full-precision "
                     "keys; it takes the default kv_cache layout")
-            elif self.kv_shared or segment_ids is not None:
+            elif self.kv_shared:
                 raise ValueError(
                     "a bidirectional canvas over a cache shares no keys across "
-                    "layers and packs no segments: a sharing layer owns no "
-                    "cache of its own, and packed positions do not continue "
-                    "past a prefix")
+                    "layers: a sharing layer owns no cache of its own")
             elif not self.has_variable("cache", "cached_key"):
                 raise ValueError(
                     "a bidirectional canvas has no KV cache of its own: prefill "

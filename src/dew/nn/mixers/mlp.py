@@ -15,7 +15,8 @@ from dew.nn.moe import SparseMLP
 from dew.nn.protocols import ProjectionGroup, Routes, RoutesExperts, declared_groups
 
 if TYPE_CHECKING:
-    from dew.nn.backbones.decoder_block import GatedMLP, Mixture
+    from dew.nn.backbones.decoder_block import Mixture
+    from dew.nn.mlp import GatedMLP
 
 
 class _MLP(nn.Module):
@@ -37,10 +38,10 @@ class _MLP(nn.Module):
         layer's replayed ones (`RoutesExperts`)."""
         return isinstance(self.feedforward, RoutesExperts) and self.feedforward.routes_experts
 
-    def __call__(self, x, decode: bool = False, positions=None, segment_ids=None, kv_store=None,
-                 attention_metadata=None, routes: Routes | None = None):
+    def __call__(self, x, decode: bool = False, kv_store=None, attention_metadata=None,
+                 routes: Routes | None = None):
         # Tokenwise: no position, document, cache or metadata changes what an MLP computes.
-        del decode, positions, segment_ids, kv_store, attention_metadata
+        del decode, kv_store, attention_metadata
         if isinstance(self.feedforward, RoutesExperts) and self.feedforward.routes_experts:
             return self.feedforward(x, routes=routes)
         return self.feedforward(x)
@@ -93,7 +94,7 @@ class MLPMixer(MixerBase):
         depth's, `CausalTransformer.mtp_feedforward_type`)."""
         # decoder_block imports the mixer registry while its classes are being defined.
         from dew.nn.attention import RMSNorm
-        from dew.nn.backbones.decoder_block import GatedMLP
+        from dew.nn.mlp import GatedMLP
 
         dense = functools.partial(
             GatedMLP, out_features=ctx.emb_features,

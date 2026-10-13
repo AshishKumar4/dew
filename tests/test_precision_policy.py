@@ -16,13 +16,14 @@ from test_architectures import CASES as ARCHITECTURE_CASES
 
 from dew.diffusion.process import DenoisingCondition
 from dew.interop.hf_decoders import translate_config
-from dew.nn.attention import local_attention, scaled_dot_product_attention
+from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.nn.dit import TextContext
 from dew.nn.dsa_kpool import KPoolSparseAttention
 from dew.nn.inputs import AttentionMetadata, coordinates
 from dew.nn.llama4 import Llama4Mixer
+from dew.nn.local_attention import local_attention
 from dew.nn.mixer_base import MixerContext
 from dew.nn.mla import MultiHeadLatentAttention
 from dew.nn.multimodal import MultimodalTransformer
@@ -91,7 +92,9 @@ def test_auto_under_a_window_or_packing_takes_the_reference_path(layer, argument
         x = jax.random.randint(jax.random.key(0), (2, 16), 0, 64)
     else:
         x = jax.random.normal(jax.random.key(0), (2, 16, 32))
-    call = {} if layer == "window" else {"segment_ids": PACKED}
+    call = {} if layer == "window" else {
+        "segment_ids": PACKED} if layer == "packed" else {
+        "attention_metadata": AttentionMetadata(coordinates=coordinates(segments=PACKED))}
     if layer == "kpool":
         call = {"attention_metadata": AttentionMetadata(coordinates=coordinates(valid=PACKED != 0))}
     variables = LAYERS[layer](**arguments).init(jax.random.key(1), x, **call)
