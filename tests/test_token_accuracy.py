@@ -13,6 +13,7 @@ from dew import Mean
 from dew.artifacts import TokenScores
 from dew.data.chat import Role
 from dew.nn.backbones import CausalTransformer
+from dew.nn.protocols import OutputTable
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
 from dew.objectives.lm.chunked import chunked_cross_entropy
@@ -35,8 +36,12 @@ def test_a_tie_goes_to_the_lowest_column_as_trls_argmax_takes_it(chunks):
     labels = reference["labels"][:, 1:]
     kept = labels != -100
     states = jnp.asarray(reference["logits"][:, :-1])
-    _, predicted, _ = chunked_cross_entropy(states, jnp.eye(states.shape[-1], dtype=jnp.float32),
-                                            jnp.asarray(np.where(kept, labels, 0), jnp.int32), chunks)
+    _, predicted, _ = chunked_cross_entropy(
+        states,
+        OutputTable(jnp.eye(states.shape[-1], dtype=jnp.float32), vocab_major=False),
+        jnp.asarray(np.where(kept, labels, 0), jnp.int32),
+        chunks,
+    )
     assert int(np.sum((np.asarray(predicted) == labels) & kept)) == int(reference["correct"])
     assert int(kept.sum()) == int(reference["total"]) and 0 < int(reference["correct"]) < int(kept.sum())
 

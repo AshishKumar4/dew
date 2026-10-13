@@ -70,8 +70,8 @@ from ..mixers import AttentionMixer, MixerBase, MixerContext
 from ..mixers.mamba2 import Mamba2Mixer
 from ..mla import MLAMixer
 from ..moe import GatedActivation, Situ
-from ..precision import at_least_fp32, head_dot_general, head_product, scaled
-from ..protocols import OutputTable, ProjectionGroup, declared_groups
+from ..precision import at_least_fp32, biased_logits, capped_logits, head_dot_general, head_product, scaled
+from ..protocols import OutputTable, ProjectionGroup, QuantizesInputs, declared_groups
 from ..rope import LongRopeScaling, RopeScaling, YarnScaling, rope_scaling_from_record
 from ..sharding import (
     RESIDUAL,
@@ -1427,12 +1427,8 @@ class CausalTransformer(nn.Module):
         else:
             logits = self.lm_head(x)
         logits = logits.astype(at_least_fp32(logits.dtype))
-        if self.head_bias:
-            logits = logits + self.head_bias_value.astype(logits.dtype)
-        if self.final_logit_softcap is not None:
-            cap = jnp.asarray(self.final_logit_softcap, logits.dtype)
-            logits = cap * jnp.tanh(logits / cap)
-        return logits
+        return capped_logits(biased_logits(logits, self.head_bias_value if self.head_bias else None),
+                             self.final_logit_softcap)
 
     def mtp_hidden_states(self, hidden, tokens, train: bool = False,
                           positions=None, segment_ids=None, input_embeddings=None,
@@ -2100,15 +2096,19 @@ class CausalTransformer(nn.Module):
 
     def output_table(self) -> OutputTable | None:
         """Return the head as the matrix `logits_from_hidden` contracts, read from the bound variables:
-        the parameter itself, with `_logits`'s bias, softcap and precision.
+        the parameter itself, with `_logits`'s bias, softcap and precision, the compute dtype its
+        product follows and a checkpoint's quantizer of its input.
         None where no matrix alone is the head: past a `head_transform`, or when `lm_head`'s scope
         holds more than its kernel, as `dew.lora`'s factors, which its interceptor adds."""
         head = {} if self.tie_embeddings else self.lm_head.variables["params"]
         if self.head_transform is not None or set(head) - {"kernel"}:
             return None
         matrix = self.embed_tokens.embedding if self.tie_embeddings else head["kernel"]
+        quantizer = (self.input_quantizer(self.lm_head)
+                     if isinstance(self, QuantizesInputs) and not self.tie_embeddings else None)
         return OutputTable(matrix, self.tie_embeddings, self.head_bias_value if self.head_bias else None,
-                           self.final_logit_softcap, self.precision)
+                           self.final_logit_softcap, self.precision, compute=self.dtype,
+                           input_quantizer=quantizer)
 
     def init_cache(self, batch_size: int):
         """Allocate a zeroed decode cache for `batch_size` sequences.

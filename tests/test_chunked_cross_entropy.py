@@ -57,8 +57,9 @@ def test_vocabulary_bias_is_fp32_after_tied_or_untied_head_products(dtype, tied)
         actual = OutputTable(table.matrix, table.vocab_major, bias).logits(states)
         np.testing.assert_array_equal(actual, logits)
         for tile in (None, (2, 11)):
-            losses, predicted, _ = chunked_cross_entropy(states, table.matrix, ids, 4, tile=tile,
-                                                         vocab_major=table.vocab_major, bias=bias)
+            losses, predicted, _ = chunked_cross_entropy(
+                states, OutputTable(table.matrix, vocab_major=table.vocab_major, bias=bias), ids, 4, tile=tile
+            )
             expected = optax.softmax_cross_entropy_with_integer_labels(logits, ids)
             assert jnp.abs(losses - expected).max() <= 1e-5 * jnp.abs(expected).max()
             np.testing.assert_array_equal(predicted, logits.argmax(-1))
@@ -102,7 +103,9 @@ def test_vocabulary_bias_gradient_matches_full_logits_under_the_float64_rule(dty
             return optax.softmax_cross_entropy_with_integer_labels(logits, targets).mean()
 
         def bounded(offset):
-            return chunked_cross_entropy(states, matrix, targets, 4, tile=tile, bias=offset)[0].mean()
+            return chunked_cross_entropy(
+                states, OutputTable(matrix, vocab_major=False, bias=offset), targets, 4, tile=tile
+            )[0].mean()
 
         reference = jax.grad(full)(bias)
         actual = jax.grad(bounded)(bias)
@@ -187,7 +190,9 @@ def test_loss_and_prediction_match_the_full_vocabulary_pass(chunks, dtype):
         hidden, head = eighths(hidden, head)
     expected_losses, expected_top1 = reference(hidden, head, targets)
 
-    losses, predicted, _ = chunked_cross_entropy(hidden, head, targets, chunks)
+    losses, predicted, _ = chunked_cross_entropy(
+        hidden, OutputTable(head, vocab_major=False), targets, chunks
+    )
 
     assert losses.shape == targets.shape and losses.dtype == jnp.float32
     assert jnp.abs(losses - expected_losses).max() <= 1e-5 * jnp.abs(expected_losses).max()
@@ -200,8 +205,9 @@ def test_the_softcap_is_applied_inside_the_chunk(chunks):
     hidden, head, targets = inputs()
     expected_losses, expected_top1 = reference(hidden, head, targets, softcap=2.0)
 
-    losses, predicted, _ = chunked_cross_entropy(hidden, head, targets, chunks,
-                                              softcap=2.0)
+    losses, predicted, _ = chunked_cross_entropy(
+        hidden, OutputTable(head, vocab_major=False, softcap=2.0), targets, chunks
+    )
 
     assert jnp.abs(losses - expected_losses).max() <= 1e-5 * jnp.abs(expected_losses).max()
     assert jnp.array_equal(predicted, expected_top1)
@@ -215,7 +221,9 @@ def test_both_gradients_match_the_full_vocabulary_pass(chunks):
         return jnp.mean(reference(states, matrix, targets)[0])
 
     def chunked(states, matrix):
-        return jnp.mean(chunked_cross_entropy(states, matrix, targets, chunks)[0])
+        return jnp.mean(
+            chunked_cross_entropy(states, OutputTable(matrix, vocab_major=False), targets, chunks)[0]
+        )
 
     expected = jax.grad(full, argnums=(0, 1))(hidden, head)
     got = jax.grad(chunked, argnums=(0, 1))(hidden, head)
@@ -240,7 +248,7 @@ def test_a_tie_goes_to_the_lowest_column_across_chunk_boundaries():
     assert int(expected_top1[0, 0]) == 5, "the reference argmax did not tie-break low"
 
     for chunks in [*CHUNKS, 6]:
-        _, predicted, _ = chunked_cross_entropy(hidden, head, targets, chunks)
+        _, predicted, _ = chunked_cross_entropy(hidden, OutputTable(head, vocab_major=False), targets, chunks)
         assert jnp.array_equal(predicted, expected_top1), chunks
 
 
@@ -249,7 +257,7 @@ def test_a_flat_head_predicts_the_first_column():
     hidden, head, targets = inputs()
     flat = jnp.zeros_like(head)
 
-    _, predicted, _ = chunked_cross_entropy(hidden, flat, targets, 4)
+    _, predicted, _ = chunked_cross_entropy(hidden, OutputTable(flat, vocab_major=False), targets, 4)
 
     assert jnp.array_equal(predicted, jnp.zeros_like(targets))
     assert jnp.array_equal(predicted, reference(hidden, flat, targets)[1])
@@ -261,7 +269,9 @@ def test_the_prediction_is_the_int32_column_under_x64():
     as int32 columns."""
     with jax.enable_x64(new_val=True):
         hidden, head, targets = inputs()
-        _, predicted, _ = chunked_cross_entropy(hidden, head, targets.astype(jnp.int32), 4)
+        _, predicted, _ = chunked_cross_entropy(
+            hidden, OutputTable(head, vocab_major=False), targets.astype(jnp.int32), 4
+        )
         assert predicted.dtype == jnp.int32
         assert jnp.array_equal(predicted, reference(hidden, head, targets)[1])
 
@@ -288,8 +298,13 @@ def test_float64_states_and_head_compute_nothing_in_float32(tile):
             inputs())
 
         def loss(hidden, head):
-            losses, _, log_z = chunked_cross_entropy(hidden, head, targets.astype(jnp.int32), 4,
-                                                     softcap=30.0, tile=tile)
+            losses, _, log_z = chunked_cross_entropy(
+                hidden,
+                OutputTable(head, vocab_major=False, softcap=30.0),
+                targets.astype(jnp.int32),
+                4,
+                tile=tile,
+            )
             return jnp.sum(losses) + jnp.sum(log_z ** 2)
 
         jaxpr = jax.make_jaxpr(jax.value_and_grad(loss, argnums=(0, 1)))(hidden, head)
@@ -323,7 +338,7 @@ def test_dropping_the_target_term_fails_the_parity_check(monkeypatch):
         monkeypatch,
         lambda terms, start, stop: terms._replace(picked=jnp.zeros_like(terms.picked)))
 
-    losses, _, _ = chunked_cross_entropy(hidden, head, targets, 4)
+    losses, _, _ = chunked_cross_entropy(hidden, OutputTable(head, vocab_major=False), targets, 4)
 
     assert jnp.abs(losses - expected).max() > 1e-5 * jnp.abs(expected).max()
 
@@ -345,7 +360,7 @@ def test_dropping_one_chunk_fails_the_parity_check(monkeypatch, dropped):
 
     mutating_chunk_terms(monkeypatch, skip)
 
-    losses, _, _ = chunked_cross_entropy(hidden, head, targets, 4)
+    losses, _, _ = chunked_cross_entropy(hidden, OutputTable(head, vocab_major=False), targets, 4)
 
     assert jnp.abs(losses - expected).max() > 1e-5 * jnp.abs(expected).max()
 
@@ -380,7 +395,9 @@ def test_bf16_states_from_the_backbone_score_as_the_logits_did(chunks, tie_embed
     expected = optax.softmax_cross_entropy_with_integer_labels(logits, targets)
 
     hidden = model.apply(variables, ids, method=CausalTransformer.hidden_states)
-    losses, predicted, _ = chunked_cross_entropy(hidden, head_matrix(model, variables), targets, chunks)
+    losses, predicted, _ = chunked_cross_entropy(
+        hidden, OutputTable(head_matrix(model, variables), vocab_major=False), targets, chunks
+    )
 
     assert hidden.dtype == dtype
     assert jnp.abs(losses - expected).max() <= 1e-5 * jnp.abs(expected).max()
@@ -422,7 +439,11 @@ def test_the_gradient_reaches_the_backbone_through_the_states_and_the_head():
     def chunked(params):
         hidden = model.apply({'params': params}, ids,
                              method=CausalTransformer.hidden_states)
-        return jnp.mean(chunked_cross_entropy(hidden, head_matrix(model, {'params': params}), targets, 4)[0])
+        return jnp.mean(
+            chunked_cross_entropy(
+                hidden, OutputTable(head_matrix(model, {'params': params}), vocab_major=False), targets, 4
+            )[0]
+        )
 
     expected = jax.grad(full)(variables['params'])
     got = jax.grad(chunked)(variables['params'])
@@ -464,9 +485,9 @@ def test_impossible_chunk_counts_are_refused(vocab, chunks, message):
 def test_mismatched_shapes_are_refused():
     hidden, head, targets = inputs()
     with pytest.raises(ValueError, match="wide"):
-        chunked_cross_entropy(hidden[..., :-1], head, targets, 4)
+        chunked_cross_entropy(hidden[..., :-1], OutputTable(head, vocab_major=False), targets, 4)
     with pytest.raises(ValueError, match="targets"):
-        chunked_cross_entropy(hidden, head, targets[:, :-1], 4)
+        chunked_cross_entropy(hidden, OutputTable(head, vocab_major=False), targets[:, :-1], 4)
 
 
 # --- the bounded backward --------------------------------------------------
@@ -501,8 +522,12 @@ def test_the_bounded_backward_matches_the_full_vocabulary_pass(
 
     def tiled(states, matrix):
         losses, _, log_z = chunked_cross_entropy(
-            states, matrix, targets, 4, softcap=softcap, precision=precision,
-            tile=RAGGED)
+            states,
+            OutputTable(matrix, vocab_major=False, softcap=softcap, precision=precision),
+            targets,
+            4,
+            tile=RAGGED,
+        )
         return jnp.sum(loss_weight * losses + z_weight * jnp.square(log_z))
 
     want_loss, want = jax.value_and_grad(full, argnums=(0, 1))(hidden, head)
@@ -528,7 +553,8 @@ def test_the_softcap_gradient_survives_saturated_logits():
 
     def tiled(states, matrix, cap):
         losses, _, log_z = chunked_cross_entropy(
-            states, matrix, targets, 4, softcap=cap, tile=RAGGED)
+            states, OutputTable(matrix, vocab_major=False, softcap=cap), targets, 4, tile=RAGGED
+        )
         return jnp.mean(losses + 0.03 * jnp.square(log_z))
 
     expected = jax.grad(full, argnums=(0, 1, 2))(hidden, head, 30.)
@@ -544,7 +570,8 @@ def test_an_integer_softcap_gives_the_same_gradients_as_a_float_one():
 
     def loss(states, matrix, cap):
         losses, _, log_z = chunked_cross_entropy(
-            states, matrix, targets, 4, softcap=cap, tile=RAGGED)
+            states, OutputTable(matrix, vocab_major=False, softcap=cap), targets, 4, tile=RAGGED
+        )
         return jnp.mean(losses + 0.02 * jnp.square(log_z))
 
     gradient = jax.grad(loss, argnums=(0, 1))
@@ -575,7 +602,13 @@ def test_an_excluded_column_takes_no_mass_in_the_loss_the_prediction_or_the_grad
 
     def chunked_pass(states, matrix):
         losses, predicted, log_z = chunked_cross_entropy(
-            states, matrix, targets, 4, precision=precision, tile=tile, excluded=excluded)
+            states,
+            OutputTable(matrix, vocab_major=False, precision=precision),
+            targets,
+            4,
+            tile=tile,
+            excluded=excluded,
+        )
         return jnp.sum(losses + 0.7 * jnp.square(log_z)), (losses, log_z, predicted)
 
     (_, want), want_grads = jax.value_and_grad(full, argnums=(0, 1), has_aux=True)(hidden, head)
@@ -599,10 +632,18 @@ def test_a_target_outside_the_vocabulary_scores_the_partition_alone():
     outside = jnp.asarray([[1., 1., 0.]])
 
     def weighted(index):
-        return jax.grad(lambda states: jnp.sum(outside * chunked_cross_entropy(
-            states, head, targets, 4, tile=RAGGED)[index]))(hidden)
+        return jax.grad(
+            lambda states: jnp.sum(
+                outside
+                * chunked_cross_entropy(
+                    states, OutputTable(head, vocab_major=False), targets, 4, tile=RAGGED
+                )[index]
+            )
+        )(hidden)
 
-    losses, _, log_z = chunked_cross_entropy(hidden, head, targets, 4, tile=RAGGED)
+    losses, _, log_z = chunked_cross_entropy(
+        hidden, OutputTable(head, vocab_major=False), targets, 4, tile=RAGGED
+    )
 
     assert jnp.array_equal(losses[0, :2], log_z[0, :2])
     from_partition = weighted(2)
@@ -615,7 +656,11 @@ def test_a_zero_cotangent_leaves_both_gradients_at_zero():
     hidden, head, targets = inputs(vocab=97, tokens=(1, 3))
     _, pullback = jax.vjp(
         lambda states, matrix: chunked_cross_entropy(
-            states, matrix, targets, 4, tile=RAGGED)[0], hidden, head)
+            states, OutputTable(matrix, vocab_major=False), targets, 4, tile=RAGGED
+        )[0],
+        hidden,
+        head,
+    )
 
     gradients = pullback(jnp.zeros(targets.shape, jnp.float32))
 
@@ -642,8 +687,11 @@ def test_the_head_gradient_accumulates_every_token_tile_before_it_rounds(dtype):
         return jnp.mean(oracle(states, matrix, targets, precision=precision)[0])
 
     def tiled(states, matrix):
-        return jnp.mean(chunked_cross_entropy(
-            states, matrix, targets, 4, tile=RAGGED, precision=precision)[0])
+        return jnp.mean(
+            chunked_cross_entropy(
+                states, OutputTable(matrix, vocab_major=False, precision=precision), targets, 4, tile=RAGGED
+            )[0]
+        )
 
     expected = jax.grad(full, argnums=(0, 1))(hidden.astype(jnp.float32),
                                               head.astype(jnp.float32))
@@ -676,7 +724,11 @@ def test_the_backbone_receives_both_outputs_gradients(tie_embeddings):
         states = model.apply({"params": tree}, ids,
                              method=CausalTransformer.hidden_states)
         losses, _, log_z = chunked_cross_entropy(
-            states, head_matrix(model, {"params": tree}), targets, 4, softcap=30.)
+            states,
+            OutputTable(head_matrix(model, {"params": tree}), vocab_major=False, softcap=30.0),
+            targets,
+            4,
+        )
         return jnp.mean(losses + 0.02 * jnp.square(log_z))
 
     expected, got = jax.grad(full)(params), jax.grad(tiled)(params)
@@ -699,7 +751,8 @@ def test_the_backward_saves_the_inputs_and_a_few_numbers_per_token(tokens):
 
     def tiled(states, matrix):
         losses, _, log_z = chunked_cross_entropy(
-            states, matrix, targets, 4, softcap=30., tile=RAGGED)
+            states, OutputTable(matrix, vocab_major=False, softcap=30.0), targets, 4, tile=RAGGED
+        )
         return jnp.sum(losses + 0.03 * jnp.square(log_z))
 
     def full(states, matrix):
@@ -718,7 +771,8 @@ def test_no_matmul_is_wider_than_one_tile():
 
     def loss(states, matrix):
         losses, _, log_z = chunked_cross_entropy(
-            states, matrix, targets, 4, softcap=30., tile=RAGGED)
+            states, OutputTable(matrix, vocab_major=False, softcap=30.0), targets, 4, tile=RAGGED
+        )
         return jnp.sum(losses + 0.03 * jnp.square(log_z))
 
     graph = jax.make_jaxpr(jax.value_and_grad(loss, argnums=(0, 1)))(hidden, head)
@@ -774,7 +828,8 @@ def test_a_262144_vocabulary_matches_optax_in_float64_on_cpu(softcap):
 
         def tiled(states, matrix):
             losses, predictions, log_z = chunked_cross_entropy(
-                states, matrix, targets, 16, softcap=softcap, tile=(3, 8192))
+                states, OutputTable(matrix, vocab_major=False, softcap=softcap), targets, 16, tile=(3, 8192)
+            )
             return jnp.sum(weights * losses), (losses, log_z, predictions)
 
         expected = jax.jit(jax.value_and_grad(upstream, (0, 1), has_aux=True))(hidden, head)
@@ -870,7 +925,9 @@ def fp32_cross_entropy(hidden, head, targets, weights, softcap, chunks):
         if chunks is None:
             losses, log_z = oracle(states, matrix, targets, softcap)
         else:
-            losses, _, log_z = chunked_cross_entropy(states, matrix, targets, chunks, softcap=softcap)
+            losses, _, log_z = chunked_cross_entropy(
+                states, OutputTable(matrix, vocab_major=False, softcap=softcap), targets, chunks
+            )
         return jnp.sum(weights * losses), (losses, log_z)
 
     (_, (losses, log_z)), (d_hidden, d_head) = jax.jit(
@@ -916,8 +973,9 @@ def test_the_forward_rounds_the_table_once_not_once_per_token_tile():
     token tile: on an A100, Qwen3-0.6B's 4 x 1024 tokens in 1024-token tiles
     spent 2.65 ms of a 162 ms step converting it, where once costs 0.65."""
     hidden, head, targets = inputs(vocab=64, features=16, tokens=(4, 32), dtype=jnp.bfloat16)
-    program = jax.make_jaxpr(lambda h, w: chunked_cross_entropy(h, w, targets, 4, tile=(32, 16)))(
-        hidden, head)
+    program = jax.make_jaxpr(
+        lambda h, w: chunked_cross_entropy(h, OutputTable(w, vocab_major=False), targets, 4, tile=(32, 16))
+    )(hidden, head)
 
     def converts(jaxpr, looped):
         found = []
@@ -964,8 +1022,18 @@ def test_the_bf16_head_rounds_its_logits_and_their_cotangent_once(tile):
 
     rounded = strict_or_rounded(round_logits=True)
     want_states, want_table = jax.grad(rounded, argnums=(0, 1))(hidden, table)
-    have_states, have_table = jax.grad(lambda states, matrix: jnp.mean(chunked_cross_entropy(
-        states, matrix.T, targets, 4, tile=tile, precision=chunked.BF16)[0]), argnums=(0, 1))(hidden, table)
+    have_states, have_table = jax.grad(
+        lambda states, matrix: jnp.mean(
+            chunked_cross_entropy(
+                states,
+                OutputTable(matrix.T, vocab_major=False, precision=chunked.BF16),
+                targets,
+                4,
+                tile=tile,
+            )[0]
+        ),
+        argnums=(0, 1),
+    )(hidden, table)
     logits = jnp.einsum('td,vd->tv', hidden, table, precision=jax.lax.Precision.HIGHEST)
     cotangent = jnp.abs(jax.grad(lambda z: jnp.mean(
         optax.softmax_cross_entropy_with_integer_labels(z, targets)))(logits))
@@ -995,9 +1063,12 @@ def test_the_whole_logits_head_computes_what_the_tiled_one_does(dtype, softcap):
     def run(tile):
         def loss(states, matrix, cap):
             losses, _, log_z = chunked_cross_entropy(
-                states, matrix, targets, 4, tile=tile, softcap=cap)
+                states, OutputTable(matrix, vocab_major=False, softcap=cap), targets, 4, tile=tile
+            )
             return jnp.mean(losses) + 0.01 * jnp.mean(jnp.square(log_z))
-        outputs = chunked_cross_entropy(hidden, head, targets, 4, tile=tile, softcap=softcap)
+        outputs = chunked_cross_entropy(
+            hidden, OutputTable(head, vocab_major=False, softcap=softcap), targets, 4, tile=tile
+        )
         return outputs, jax.grad(loss, argnums=(0, 1, 2) if softcap else (0, 1))(
             hidden, head, softcap)
 
@@ -1058,7 +1129,9 @@ def test_a_pass_with_no_backward_never_holds_the_logits_whole():
     hidden, head, targets = inputs(vocab=32768, features=16, tokens=(4096,))
 
     def temporaries(tile):
-        forward = jax.jit(lambda h, w: chunked_cross_entropy(h, w, targets, 4, tile=tile)[0])
+        forward = jax.jit(
+            lambda h, w: chunked_cross_entropy(h, OutputTable(w, vocab_major=False), targets, 4, tile=tile)[0]
+        )
         return forward.lower(hidden, head).compile().memory_analysis().temp_size_in_bytes
 
     assert temporaries(None) <= temporaries((1024, 8192))
@@ -1073,8 +1146,20 @@ def test_both_gradient_products_read_one_bf16_cotangent(tile):
     operands; the tiled backward's logits products read fp32-stored bf16
     values under the algorithm, as its forward does."""
     hidden, head, targets = inputs(vocab=RAGGED_VOCAB, features=16, tokens=(RAGGED_TOKENS,))
-    program = jax.make_jaxpr(jax.grad(lambda states, matrix: jnp.mean(chunked_cross_entropy(
-        states, matrix, targets, 4, tile=tile, precision=chunked.BF16)[0]), argnums=(0, 1)))(hidden, head)
+    program = jax.make_jaxpr(
+        jax.grad(
+            lambda states, matrix: jnp.mean(
+                chunked_cross_entropy(
+                    states,
+                    OutputTable(matrix, vocab_major=False, precision=chunked.BF16),
+                    targets,
+                    4,
+                    tile=tile,
+                )[0]
+            ),
+            argnums=(0, 1),
+        )
+    )(hidden, head)
 
     def dots(jaxpr):
         for equation in jaxpr.eqns:
