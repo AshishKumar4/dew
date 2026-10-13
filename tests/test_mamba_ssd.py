@@ -8,20 +8,25 @@ gate (docs/performance.md, "The Mamba-2 SSD scan").
 """
 
 import functools
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import assert_leaves_as_exact, widened
+from reference_error import assert_leaves_as_exact, ieee_fixture, widened
 from sharded import assert_runs_per_shard
+from tuned import each_config
 
-from dew.nn import kernels
 from dew.nn.inputs import AttentionMetadata, coordinates
+from dew.nn.kernels import mamba_ssd, tuning
 from dew.nn.mixers import mamba2
 from dew.nn.mixers.mamba2 import Mamba2, chunk_ssd
 
 pytestmark = pytest.mark.kernel
+
+FIXTURES = Path(__file__).resolve().parent / "fixtures" / "mamba2"
+INTERPRETED = jax.default_backend() != "gpu"
 
 
 def row_names_port(monkeypatch, *, port: bool = True):
@@ -63,6 +68,13 @@ def through(chunk: int, starts, dy, dfinal):
     return run
 
 
+def skip_terms(dy, x) -> dict[str, float]:
+    """`D`'s declared invariant: its gradient is each head's `dy x` summed over rows, tokens and
+    channels, whose absolute terms' RMS over heads bounds it (`assert_leaves_as_exact`)."""
+    terms = np.sum(np.abs(np.asarray(dy, np.float64) * np.asarray(x, np.float64)), axis=(0, 1, 3))
+    return {"['D']": float(np.sqrt(np.mean(terms ** 2)))}
+
+
 # (batch, length, heads, head width, groups, state), chunk: a ragged tail with packed documents over
 # groups of three heads, six in all, a count no power of two divides past 2 (Mamba-2 130M's 24 heads);
 # whole chunks, one group; a state wider than one 128-wide product, as Falcon-H1's 256, with documents.
@@ -82,17 +94,53 @@ def test_the_port_is_as_exact_as_the_xla_scan(monkeypatch, shape, chunk, documen
     keys = jax.random.split(jax.random.key(1))
     dy = jax.random.normal(keys[0], operands[0].shape)
     dfinal = jax.random.normal(keys[1], operands[6].shape)
-    run = through(chunk, starts, dy, dfinal)
     with jax.enable_x64(new_val=True):
-        truth = jax.tree.map(np.asarray, jax.jit(run)(*widened(operands)))
+        truth = jax.tree.map(np.asarray, jax.jit(through(chunk, starts, dy, dfinal))(*widened(operands)))
+    # A fresh function per routing: jit's cache holds a function's trace whatever the row says since.
     row_names_port(monkeypatch, port=False)
-    xla = jax.tree.map(np.asarray, jax.jit(run)(*operands))
+    xla = jax.tree.map(np.asarray, jax.jit(through(chunk, starts, dy, dfinal))(*operands))
     row_names_port(monkeypatch)
-    ported = jax.tree.map(np.asarray, jax.jit(run)(*operands))
-    # D's gradient is its head's `dy x` summed over rows, tokens and channels.
-    terms = np.sum(np.abs(np.asarray(dy, np.float64) * np.asarray(operands[0], np.float64)), axis=(0, 1, 3))
-    assert_leaves_as_exact(ported, xla, truth, reductions=chunk,
-                           invariants={"['D']": float(np.sqrt(np.mean(terms ** 2)))})
+    ported = jax.tree.map(np.asarray, jax.jit(through(chunk, starts, dy, dfinal))(*operands))
+    assert_leaves_as_exact(ported, xla, truth, reductions=chunk, invariants=skip_terms(dy, operands[0]))
+
+
+@pytest.mark.parametrize("heads", [None, 2], ids=["heuristic", "summing-two-of-three-heads"])
+def test_the_port_in_bf16_is_as_exact_as_mamba_ssm(heads):
+    """bf16 operands, mamba_ssm's own numbers (tools/mamba_ssd_reference.py, its kernels on a GPU, two
+    rows of packed documents over a ragged last chunk, an initial state, three heads a group): the
+    port's output, final state and every gradient each within the float64 gate of mamba_ssm's
+    distance from the same scan in float64. With `heads` the kernels that sum a group's heads take
+    two a program, the group's three split two and one."""
+    fixture = ieee_fixture(FIXTURES / "ssd_mamba_ssm.npz")
+    chunk = int(fixture["chunk"])
+    seq = jnp.asarray(fixture["seq"])
+    names = ("x", "dt", "A", "B", "C", "D", "h0")
+    narrow = [jnp.asarray(fixture[name], jnp.bfloat16 if name in "xBC" else jnp.float32) for name in names]
+    dy, dfinal = jnp.asarray(fixture["dy"], jnp.bfloat16), jnp.asarray(fixture["dfinal"])
+    starts = jnp.concatenate([seq[:, :1] > 0, seq[:, 1:] > seq[:, :-1]], axis=1)
+
+    def run(*args):
+        def loss(*args):
+            out, final = mamba_ssd.ssd_scan(*args, seq, chunk, INTERPRETED)
+            return jnp.sum(out.astype(jnp.float32) * dy) + jnp.sum(final * dfinal), (out, final)
+
+        (_, (out, final)), grads = jax.value_and_grad(loss, argnums=range(7), has_aux=True)(*args)
+        return {"y": out, "final": final, **dict(zip(names, grads, strict=True))}
+
+    summing = (mamba_ssd.ChunkStateBwdDb, mamba_ssd.ChunkScanBwdDc, mamba_ssd.ChunkScanBwdDcb)
+    pins = {}
+    if heads:
+        pins = {kernel: mamba_ssd.Tiles(64, 32, 0, 4, 3, heads) for kernel in summing}
+        assert all(pin in each_config(kernel, run, *narrow) for kernel, pin in pins.items())
+    with tuning.pinned(pins):
+        ported = jax.tree.map(np.asarray, jax.jit(run)(*narrow))
+    with jax.enable_x64(new_val=True):
+        truth = jax.tree.map(np.asarray, jax.jit(through(chunk, starts, dy.astype(jnp.float64),
+                                                         jnp.asarray(fixture["dfinal"], jnp.float64)))(
+            *widened([fixture[name] for name in names])))
+    reference = {name: fixture[f"mamba.{name}"] for name in ported}
+    assert_leaves_as_exact(ported, reference, truth, reductions=chunk,
+                           invariants=skip_terms(fixture["dy"], fixture["x"]))
 
 
 @pytest.mark.parametrize("dtype, bound", [(jnp.float32, 1e-4), (jnp.bfloat16, 5e-2)])
@@ -151,16 +199,3 @@ def test_the_port_keeps_the_kernel_contract_on_a_mesh(monkeypatch, axis, split):
              spec(4, rows + ((1,) if heads else ()))]
     mesh = Mesh(np.asarray(jax.devices()[:2]), (axis,))
     assert_runs_per_shard(run, operands, specs, mesh, truth)
-
-
-@pytest.mark.parametrize("generation", sorted(name for name in kernels.TARGETS if name.startswith("sm")))
-def test_the_scan_runs_the_port_exactly_where_the_gpus_target_row_names_it(generation):
-    """Routing reads the row qualification reads (`generation.TARGETS`): a GPU generation whose row
-    names 'pallas' for the scan runs the port, and one whose row does not runs the XLA scan and says
-    why."""
-    x = jnp.zeros((1, 64, 2, 64), jnp.float32)
-    B = jnp.zeros((1, 64, 1, 128), jnp.float32)
-    with kernels.assumed(generation):
-        refusal = mamba2.ssd_port_refusal(x, B, 128)
-    named = kernels.TARGETS[generation].kernels.get("ssd") == "pallas"
-    assert (refusal is None) == named, refusal

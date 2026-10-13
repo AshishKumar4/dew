@@ -53,7 +53,6 @@ from __future__ import annotations
 
 import dataclasses
 import functools
-import math
 
 import jax
 import jax.numpy as jnp
@@ -73,13 +72,12 @@ from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.mixers.mamba import inverse_softplus_step
 from dew.nn.precision import at_least_fp32
 from dew.nn.sharding import (
-    HEADS,
     SEQUENCE_AXIS,
     LayoutRefused,
+    grouped_heads,
     logical_axes,
     logical_spec,
     manual_map,
-    mesh_axes,
     rows_like,
     sequence_shards,
 )
@@ -195,16 +193,17 @@ def chunk_ssd(x, dt, A, B, C, D, state=None, chunk_size: int = CHUNK_SIZE, start
 
     `x` `[B, S, H, P]`, `dt` `[B, S, H]` through softplus and the limit, `A`
     `[H]`, `B` and `C` `[B, S, G, N]`, `D` `[H]`; returns `(output [B, S, H, P]`
-    in `x`'s dtype, `state [B, H, P, N]` in `at_least_fp32` of it). `starts`
-    `[B, S]` marks packed documents' first tokens, whose entering state drops.
-    Where `ssd_port_refusal` takes the call the whole scan is mamba_ssm's
-    kernels (`_ported`), on `x`, `B` and `C` in their common dtype; else the
-    scan runs in `at_least_fp32` of it, the chunk scan on the TPU's Pallas
-    kernel where `ssd_kernel_platform` takes the geometry, else
-    `xla_chunk_scan` (tests/test_ssd_kernel.py).
+    in `x`'s dtype, `state [B, H, P, N]` in `at_least_fp32` of the operands'
+    common dtype). `starts` `[B, S]` marks packed documents' first tokens,
+    whose entering state drops. Where `ssd_port_refusal` takes the call the
+    whole scan is mamba_ssm's kernels (`_ported`), on `x`, `B` and `C` in
+    their common dtype; else the scan runs in `at_least_fp32` of it, the
+    chunk scan on the TPU's Pallas kernel where `ssd_kernel_platform` takes
+    the geometry, else `xla_chunk_scan` (tests/test_ssd_kernel.py).
     """
-    dtype = jnp.result_type(x, B, C)
-    work = at_least_fp32(dtype)
+    dtype, operand = x.dtype, jnp.result_type(x, B, C)
+    work = at_least_fp32(operand)
+    x, B, C = (jnp.asarray(t, operand) for t in (x, B, C))
     dt, A, D = (jnp.asarray(t, work) for t in (dt, A, D))
     batch, length, heads, head_dim = x.shape
     state_size = B.shape[-1]
@@ -212,9 +211,8 @@ def chunk_ssd(x, dt, A, B, C, D, state=None, chunk_size: int = CHUNK_SIZE, start
                else jnp.asarray(state, work))
     refusal = ssd_port_refusal(x, B, chunk_size)
     if refusal is None:
-        x, B, C = (jnp.asarray(t, dtype) for t in (x, B, C))
         out, final = _ported(x, dt, A, B, C, D, carried, chunk_size, starts)
-        return out, final.astype(work)
+        return out.astype(dtype), final.astype(work)
     ran_kernel('ssd', 'xla', refusal)
     x, B, C = (jnp.asarray(t, work) for t in (x, B, C))
     B, C = _expand_groups(B, heads), _expand_groups(C, heads)
@@ -283,10 +281,7 @@ def _ported(x, dt, A, B, C, D, state, chunk_size: int, starts):
     mesh = jax.sharding.get_abstract_mesh()
     if mesh.empty or set(mesh.axis_names) <= set(mesh.manual_axes):
         return scan(*operands)
-    spec = logical_spec(HEADS, x.shape)
-    rows, heads = (spec[i] if i < len(spec) else None for i in (0, 2))
-    if B.shape[2] % math.prod(mesh.shape[axis] for axis in mesh_axes(heads)):
-        heads = None
+    rows, heads = grouped_heads(x.shape, B.shape[2])
     four, held = P(rows, None, heads, None), P(rows, heads, None, None)
     specs = (four, P(rows, None, heads), P(heads), four, four, P(heads), held, P(rows, None))
     return manual_map(scan, specs[:len(operands)], (four, held))(*operands)

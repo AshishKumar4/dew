@@ -471,6 +471,19 @@ def axis_rules() -> LogicalAxisRules:
     return tuple(nn.get_logical_axis_rules()) or DEFAULT_RULES
 
 
+def grouped_heads(shape: tuple[int, ...], groups: int) -> tuple[MeshAxes, MeshAxes]:
+    """The mesh axes the rule table splits a `[B, T, H, ...]` activation's rows and heads over
+    (`HEADS`), its heads whole where their split does not divide the `groups` they read (a delta
+    rule's key heads, Mamba-2's B and C), so no group's gradient is summed across shards: a
+    per-shard kernel's placement (`manual_map`)."""
+    spec = logical_spec(HEADS, shape)
+    rows, heads = (spec[i] if i < len(spec) else None for i in (0, 2))
+    mesh = jax.sharding.get_abstract_mesh()
+    if groups % math.prod(mesh.shape[axis] for axis in mesh_axes(heads)):
+        heads = None
+    return rows, heads
+
+
 def logical_spec(axes: LogicalAxes, shape: tuple[int, ...], *,
                  rules: LogicalAxisRules | None = None,
                  mesh: jax.sharding.Mesh | jax.sharding.AbstractMesh | None = None
