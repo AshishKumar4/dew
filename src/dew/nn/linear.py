@@ -49,7 +49,9 @@ from .kernels.generation import first_refusal, measured_kernel, ran_kernel, trit
 from .precision import asks_default_precision, at_least_fp32, compensated_add
 from .sharding import (
     HEADS,
+    MLP_HIDDEN,
     RESIDUAL,
+    MeshAxes,
     constrain,
     logical_axes,
     logical_spec,
@@ -119,9 +121,16 @@ def causal_conv1d(x, kernel, activation: bool = True, bias=None, *, valid=None, 
 
     On a GPU that runs Dew's Triton kernels all of it is one kernel forward
     and one backward (`short_conv`), which save only `x`; elsewhere, and for
-    a conv they turn down (`conv_refusal`), `xla_conv1d`.
+    a conv they turn down (`conv_refusal`), `xla_conv1d`. On a mesh whose
+    axes split only the rows of the conv's operands, as data and fsdp axes
+    do, each shard convolves its own rows (`manual_map`), so the kernels
+    take an fsdp run's convs too; a mesh splitting the time or channel axis
+    leaves the conv to XLA's partitioner.
     """
     dtype = x.dtype if dtype is None else jnp.dtype(dtype)
+    rows = _row_split(x)
+    if rows is not None:
+        return _per_row_shard(x, kernel, activation, bias, valid, parts, dtype, rows)
     pieces = ((x.shape[-1], None),) if parts is None else tuple(parts)
     if conv_refusal(x, kernel, pieces, dtype) is None:
         out = short_conv.conv(x, kernel, bias, None if valid is None else jnp.asarray(valid, jnp.int8),
@@ -129,6 +138,36 @@ def causal_conv1d(x, kernel, activation: bool = True, bias=None, *, valid=None, 
                               interpret=not generation.triton_runs())
         return out[0] if parts is None else out
     return xla_conv1d(x, kernel, activation, bias, valid=valid, parts=parts, dtype=dtype)
+
+
+def _row_split(x) -> MeshAxes | None:
+    """The mesh axes that split the rows of a conv's `[B, S, D]` operand where they are every axis
+    left to the partitioner that is larger than one, and the context's rules split nothing else of
+    it, as a residual or a feed-forward activation; None otherwise. An axis that left the operand
+    whole on its devices would sum the taps' gradient over copies of the same rows."""
+    mesh = jax.sharding.get_abstract_mesh()
+    automatic = {axis for axis in mesh.axis_names if axis not in mesh.manual_axes and mesh.shape[axis] > 1}
+    if not automatic:
+        return None
+    residual, hidden = (tuple(logical_spec(axes, x.shape)) for axes in (RESIDUAL, MLP_HIDDEN))
+    if any(entry is not None for spec in (residual, hidden) for entry in spec[1:]):
+        return None
+    rows = residual[0] if residual else None
+    return rows if automatic <= set(mesh_axes(rows)) else None
+
+
+def _per_row_shard(x, kernel, activation, bias, valid, parts, dtype, rows: MeshAxes):
+    """`causal_conv1d` with each shard of `rows` convolving its own rows (`manual_map`); the taps and
+    bias are whole on every shard, and their gradients sum over the shards' rows."""
+    P = jax.sharding.PartitionSpec
+    row = P(rows, None, None)
+    pieces = 1 if parts is None else len(tuple(parts))
+
+    def local(x, kernel, bias, valid):
+        return causal_conv1d(x, kernel, activation, bias, valid=valid, parts=parts, dtype=dtype)
+
+    in_specs = (row, P(), None if bias is None else P(), None if valid is None else P(rows, None))
+    return manual_map(local, in_specs, row if parts is None else (row,) * pieces)(x, kernel, bias, valid)
 
 
 def xla_conv1d(x, kernel, activation: bool = True, bias=None, *, valid=None, parts: Pieces | None = None,
