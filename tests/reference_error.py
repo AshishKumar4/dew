@@ -151,10 +151,11 @@ def assert_leaves_as_exact(dew, reference, truth, *, reductions: int = 1, terms=
     rounding below it is luck, not a bar, and a leaf that lost a term still
     fails by orders of magnitude. What a leaf sums is its own float64 size,
     or, where `terms` gives the tree of each leaf's terms (`float64_terms`),
-    the larger of that and their absolute sum: the summation bound
-    |fl(sum x) - sum x| <= gamma_n sum |x|. A leaf whose sum cancels, as a
-    key bias's gradient does under the softmax's shift invariance, is held
-    to its terms' rounding, not to its own near-zero size."""
+    the larger of that and their root sum of squares, the size of the
+    partial sums a reordered sum rounds. A leaf whose sum cancels, as a key
+    bias's gradient does under the softmax's shift invariance, is held to
+    its terms' rounding, not to its own near-zero size; one whose terms'
+    signs are independent keeps about its own."""
     unit = float(np.finfo(np.float32).eps)
     spread = np.sqrt(reductions)
     sizes = jax.tree.leaves(truth) if terms is None else jax.tree.leaves(terms)
@@ -189,42 +190,47 @@ CALLS = ("jaxpr", "call_jaxpr", "fun_jaxpr")
 
 def float64_terms(fn, *args):
     """`fn(*args)` evaluated op by op, as float64 as `args` are, and the tree of
-    each output leaf's terms, alike: the absolute sum of the terms its final
-    sums add (`SUMS`), at their operands' values, carried into the leaf
-    (`CARRIES`); a leaf made by any other operation is its own size, and an
-    input carries no terms, so a parameter's terms after an update are the
-    update's. Nothing propagates through the layers behind a sum, which
-    would bound the whole computation and widen every leaf's floor."""
+    each output leaf's terms, alike: the root sum of squares of the terms its
+    final sums add (`SUMS`), at their operands' values, carried into the leaf
+    (`CARRIES`). That is the size of the sum's partial sums, which its
+    rounding scales with in any order: about the leaf's own size where the
+    terms' signs are independent, far above it where they cancel by design
+    (a softmax's shift invariance). A leaf made by any other operation is
+    its own size, and an input carries no terms, so a parameter's terms
+    after an update are the update's. Nothing propagates through the layers
+    behind a sum, which would bound the whole computation."""
     closed = jax.make_jaxpr(fn)(*args)
-    values, terms = _evaluated(closed.jaxpr, closed.consts, jax.tree.leaves(args))
+    values, energies = _evaluated(closed.jaxpr, closed.consts, jax.tree.leaves(args))
     tree = jax.tree.structure(jax.eval_shape(fn, *args))
-    return tree.unflatten(values), tree.unflatten(terms)
+    return tree.unflatten(values), tree.unflatten([np.sqrt(np.asarray(energy)) for energy in energies])
 
 
 def _evaluated(jaxpr, consts, args, given=None):
-    """`jaxpr`'s outputs and their terms (`float64_terms`), from `args` and the
-    terms `given` for them (none for a computation's own inputs)."""
+    """`jaxpr`'s outputs and their terms' energies, the sums of their squares
+    (`float64_terms`), from `args` and the energies `given` for them (none for
+    a computation's own inputs)."""
     from jax.extend.core import Literal
 
     wanted = _carrying(jaxpr)
-    values, terms = {}, {}
-    for var, value, term in zip(jaxpr.constvars + jaxpr.invars, [*consts, *args],
-                                [None] * len(consts) + list(given or [None] * len(args)), strict=True):
-        values[var], terms[var] = value, term
+    values, energies = {}, {}
+    for var, value, energy in zip(jaxpr.constvars + jaxpr.invars, [*consts, *args],
+                                  [None] * len(consts) + list(given or [None] * len(args)), strict=True):
+        values[var], energies[var] = value, energy
 
     def read(var):
         return var.val if isinstance(var, Literal) else values[var]
 
-    def term(var):
-        return None if isinstance(var, Literal) else terms.get(var)
+    def energy(var):
+        return None if isinstance(var, Literal) else energies.get(var)
 
     for equation in jaxpr.eqns:
         inputs = [read(var) for var in equation.invars]
-        outputs, made = _applied(equation, inputs, [term(var) for var in equation.invars],
-                                 any(var in wanted for var in equation.outvars))
-        for var, value, made_terms in zip(equation.outvars, outputs, made, strict=True):
-            values[var], terms[var] = value, made_terms
-    return [read(var) for var in jaxpr.outvars], [_or_size(term(var), read(var)) for var in jaxpr.outvars]
+        with equation.ctx.manager:
+            outputs, made = _applied(equation, inputs, [energy(var) for var in equation.invars],
+                                     any(var in wanted for var in equation.outvars))
+        for var, value, made_energy in zip(equation.outvars, outputs, made, strict=True):
+            values[var], energies[var] = value, made_energy
+    return [read(var) for var in jaxpr.outvars], [_or_size(energy(var), read(var)) for var in jaxpr.outvars]
 
 
 def _carrying(jaxpr) -> set:
@@ -239,10 +245,17 @@ def _carrying(jaxpr) -> set:
     return wanted
 
 
+def _real(var) -> bool:
+    return jnp.issubdtype(var.aval.dtype, jnp.floating)
+
+
 def _carried(equation) -> list[int]:
-    """The operands whose terms `equation` carries to its outputs."""
+    """The operands whose terms `equation` carries to its outputs: real floats
+    alone, as a complex value's terms have no order to sum in."""
     name, operands = equation.primitive.name, equation.invars
-    floats = [index for index, var in enumerate(operands) if jnp.issubdtype(var.aval.dtype, jnp.inexact)]
+    if not all(_real(var) or not jnp.issubdtype(var.aval.dtype, jnp.inexact) for var in equation.outvars):
+        return []
+    floats = [index for index, var in enumerate(operands) if _real(var)]
     if name in CARRIES or _body(equation) is not None or name in ("scan", "while", "cond"):
         return floats
     summed = [operands[0].aval.shape[axis] for axis in equation.params.get("axes", ())]
@@ -264,8 +277,12 @@ def _body(equation):
     return None
 
 
+def _squared(value):
+    return jnp.square(jnp.abs(value)) if jnp.issubdtype(jnp.result_type(value), jnp.inexact) else None
+
+
 def _applied(equation, inputs, given, wanted: bool):
-    """`equation`'s outputs from `inputs`, and their terms where `wanted`."""
+    """`equation`'s outputs from `inputs`, and their energies where `wanted`."""
     name, params = equation.primitive.name, equation.params
     body = _body(equation)
     if wanted and body is not None:
@@ -277,23 +294,20 @@ def _applied(equation, inputs, given, wanted: bool):
     if wanted and name == "cond":
         branch = params["branches"][int(inputs[0])]
         return _evaluated(branch.jaxpr, branch.consts, inputs[1:], given[1:])
-    with equation.ctx.manager:
-        outputs = equation.primitive.bind(*inputs, **equation.primitive.get_bind_params(params))
+    outputs = equation.primitive.bind(*inputs, **equation.primitive.get_bind_params(params))
     outputs = list(outputs) if equation.primitive.multiple_results else [outputs]
     if not wanted:
         return outputs, [None] * len(outputs)
     carried = _carried(equation)
-    if name in SUMS and not carried:
-        absolute = [jnp.abs(value) if jnp.issubdtype(var.aval.dtype, jnp.inexact) else value
-                    for var, value in zip(equation.invars, inputs, strict=True)]
-        made = equation.primitive.bind(*absolute, **equation.primitive.get_bind_params(params))
-        return outputs, [made]
+    if name in SUMS and not carried and all(_real(var) for var in equation.outvars):
+        squares = [_squared(value) if _real(var) or jnp.issubdtype(var.aval.dtype, jnp.complexfloating)
+                   else value for var, value in zip(equation.invars, inputs, strict=True)]
+        return outputs, [equation.primitive.bind(*squares, **equation.primitive.get_bind_params(params))]
     if not carried:
-        return outputs, [jnp.abs(value) if jnp.issubdtype(jnp.result_type(value), jnp.inexact) else None
-                         for value in outputs]
+        return outputs, [_squared(value) for value in outputs]
     if name in ("mul", "div"):
         (index,) = carried
-        scale = jnp.abs(inputs[1 - index])
+        scale = jnp.square(inputs[1 - index])
         moved = _or_zero(given[index], inputs[index])
         return outputs, [moved * scale if name == "mul" else moved / scale]
     operands = [_or_zero(given[index], value) if index in carried else value
@@ -303,12 +317,12 @@ def _applied(equation, inputs, given, wanted: bool):
             operands[0] if name == "neg" else
             primitive.bind(*operands, **primitive.get_bind_params(params)))
     made = list(made) if primitive.multiple_results else [made]
-    return outputs, [term if jnp.issubdtype(jnp.result_type(value), jnp.inexact) else None
-                     for term, value in zip(made, outputs, strict=True)]
+    return outputs, [energy if jnp.issubdtype(jnp.result_type(value), jnp.inexact) else None
+                     for energy, value in zip(made, outputs, strict=True)]
 
 
 def _scanned(params, inputs, given):
-    """A scan's outputs and terms (`float64_terms`), its body evaluated a step at a time."""
+    """A scan's outputs and energies (`float64_terms`), its body evaluated a step at a time."""
     body = params["jaxpr"]
     constants, carries, _ = (len(group) for group in params["ft_in"].update(range(len(inputs))).unpack())
     consts, carry, xs = (inputs[:constants], inputs[constants:constants + carries],
@@ -333,7 +347,7 @@ def _scanned(params, inputs, given):
 
 
 def _looped(params, inputs, given):
-    """A while loop's carries and terms (`float64_terms`), its body evaluated a step at a time."""
+    """A while loop's carries and energies (`float64_terms`), its body evaluated a step at a time."""
     condition, body = params["cond_jaxpr"], params["body_jaxpr"]
     tested, run = params["cond_nconsts"], params["body_nconsts"]
     condition_consts, body_consts, carry = inputs[:tested], inputs[tested:tested + run], inputs[tested + run:]
@@ -344,15 +358,15 @@ def _looped(params, inputs, given):
     return carry, carry_terms
 
 
-def _or_zero(term, value):
-    return jnp.zeros_like(value) if term is None else term
+def _or_zero(energy, value):
+    return jnp.zeros_like(value) if energy is None else energy
 
 
-def _or_size(term, value):
-    """An output's terms: its own carried ones, else its size."""
+def _or_size(energy, value):
+    """An output's energy: its own carried one, else its size's square."""
     if not jnp.issubdtype(jnp.result_type(value), jnp.inexact):
         return np.zeros(np.shape(value))
-    return jnp.abs(value) if term is None else term
+    return _squared(value) if energy is None else energy
 
 
 FALSE_FAILURE = 1e-6
