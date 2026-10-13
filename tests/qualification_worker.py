@@ -98,6 +98,7 @@ def export(run: Path, source, variables, probe) -> None:
 
 def run(directory: Path, mode: str) -> None:
     out = directory / ("baseline" if mode == "baseline" else "restarted")
+    out.mkdir(parents=True, exist_ok=True)
     checkpoints = Checkpoints(str(out / "checkpoints"), keep=2)
 
     class Interrupting(LocalTracker):
