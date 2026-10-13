@@ -9,7 +9,7 @@ from dataclasses import dataclass
 import grain.python as grain
 import numpy as np
 
-from dew.data.dataset import Batch, Records
+from dew.data.dataset import Batch, Closeable, Records, Stoppable
 from dew.data.pipeline import Dataset
 
 from .base import Read, Shard, ShardManifest
@@ -75,9 +75,11 @@ class _StreamIterator(grain.DatasetIterator):
 
     def __init__(self, source: Iterated):
         super().__init__()
+        self._closed = True
         self._source = source
         self._rows = source.factory()
         self._read = 0
+        self._closed = False
 
     def __next__(self) -> Batch | bytes:
         row = None
@@ -97,15 +99,34 @@ class _StreamIterator(grain.DatasetIterator):
         read, saved = state["read"], state.get("state")
         if not isinstance(read, int) or read < 0:
             raise ValueError(f"an iterator's position is the count of records it read, not {read!r}")
-        self._rows, self._read = self._source.factory(), 0
-        if self._source.load_state is not None:
+        load = self._source.load_state
+        position = None
+        if load is not None:
             if not isinstance(saved, str):
                 raise ValueError("this iterator resumes through load_state, and its position holds no state")
-            self._source.load_state(self._rows, decode(base64.b64decode(saved)))
+            position = decode(base64.b64decode(saved))
+        self.close()
+        self._rows, self._read = self._source.factory(), 0
+        self._closed = False
+        if load is not None:
+            load(self._rows, position)
             self._read = read
             return
         while self._read < read:
             next(self)
+
+    def request_stop(self) -> None:
+        if not self._closed and isinstance(self._rows, Stoppable):
+            self._rows.request_stop()
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        try:
+            if isinstance(self._rows, Closeable):
+                self._rows.close()
+        finally:
+            super().close()
 
 
 def from_iter(factory: Callable[[], Iterator[Batch]], *, name: str,

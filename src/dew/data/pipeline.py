@@ -18,8 +18,9 @@ from dew.data.dataset import Batch, LengthGroups
 if TYPE_CHECKING:
     import jax
 
-    from dew.data.cache import Cache, Generation
+    from dew.data.cache import Cache
     from dew.data.dataset import Loading
+    from dew.data.generation import Generation
     from dew.data.sources.base import Read, Source
 
 
