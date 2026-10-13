@@ -13,7 +13,6 @@ module's import or construction path reaches torchvision.
 
 import os
 import random
-import struct
 import subprocess
 import sys
 from pathlib import Path
@@ -31,7 +30,7 @@ if not flags.FLAGS.is_parsed():
 from dew.config.data import Augment, ImageData, loader
 from dew.data import Loading, Memory, images
 from dew.data.dataset import DataPartition
-from dew.data.sources.codec import unpack_dict_of_byte_arrays
+from dew.data.sources.codec import pack_dict_of_byte_arrays, unpack_dict_of_byte_arrays
 from dew.data.steps.image import EncodeCaptions
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -49,16 +48,6 @@ def _synthetic_image(seed=0):
     return np.random.RandomState(seed).randint(0, 256, (37, 53, 3), dtype=np.uint8)
 
 
-def _pack_records(records):
-    """Mirror of unpack_dict_of_byte_arrays' wire format."""
-    packed = bytearray()
-    for key, value in records.items():
-        key_bytes = key.encode("utf-8")
-        packed += struct.pack("I", len(key_bytes)) + key_bytes
-        packed += struct.pack("I", len(value)) + value
-    return bytes(packed)
-
-
 CAPTION_TEMPLATES = ("a photo of a {}", "a photo of a {} flower", "This is a photo of a {}")
 """More than one, so a test can see which the record's rng drew."""
 
@@ -70,7 +59,7 @@ def _element_for(kind, seed=0):
     if kind == "tfds":
         return {"image": image, "label": 2}
     encoded = cv2.imencode(".jpg", image)[1].tobytes()
-    return _pack_records({"jpg": encoded, "txt": b"a yellow tulip"})
+    return pack_dict_of_byte_arrays({"jpg": encoded, "txt": b"a yellow tulip"})
 
 
 def _spec(kind, augment=FLIP_JITTER):
