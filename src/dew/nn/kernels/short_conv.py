@@ -45,9 +45,12 @@ from jax.experimental import pallas as pl
 from . import generation
 from .norm_swiglu import _neumaier_add, _product_parts
 
+ROWS = 16
+"""Tokens of a forward program's tile, each window loaded at once (`_forward_kernel`)."""
+
 SEGMENTS = 8
-"""Rows of a program's tile, each its own run of tokens: with a 128-channel block, 1024 elements, eight
-an fp32 register of each of four warps' threads."""
+"""Rows of a backward program's tile, each its own run of tokens: with a 128-channel block, 1024
+elements, eight an fp32 register of each of four warps' threads."""
 
 STEPS = 64
 """Tokens of a run: its K-1 extra tokens are 5% of 64 at the K of 4 every mixer uses."""
@@ -188,37 +191,26 @@ def _unpack(refs, has_bias: bool, has_valid: bool):
     return x_ref, w_ref, b_ref, valid_ref, refs
 
 
-def _forward_kernel(*refs, first: int, normalised: bool, block: int, segments: int, steps: int, count: int,
-                    length: int, has_bias: bool, has_valid: bool, activation: bool, eps: float,
-                    interpret: bool):
+def _forward_kernel(*refs, first: int, normalised: bool, block: int, rows: int, count: int, length: int,
+                    has_bias: bool, has_valid: bool, activation: bool, eps: float, interpret: bool):
+    """A tile of `rows` tokens, each computed from its K-window loaded at the conv's shifts, all at once:
+    the forward needs nothing from the tokens past the tile, so it walks nothing."""
     from jax.experimental.pallas import triton as plgpu
 
     x_ref, w_ref, b_ref, valid_ref, (out_ref,) = _unpack(refs, has_bias, has_valid)
-    columns, starts = _program(first, block, segments, steps)
+    columns = first + pl.program_id(0) * block + jnp.arange(block, dtype=jnp.int32)
+    tokens = pl.program_id(1) * rows + jnp.arange(rows, dtype=jnp.int32)
     local = columns - first
     taps, bias = _taps(w_ref, b_ref, columns, count)
-    history = tuple(_rows(x_ref, starts - count + 1 + tap, columns, length) for tap in range(count - 1))
-
-    def load(tokens):
-        return _rows(x_ref, tokens, columns, length), _kept(valid_ref, tokens, length)
-
-    def step(index, carry):
-        history, (current, kept) = carry
-        tokens = starts + index
-        # The next token's loads go out before this one's arithmetic, which hides their latency.
-        ahead = load(tokens + 1)
-        window = (*history, current)
-        y = _preactivation(window, taps, bias, interpret=interpret)
-        if activation:
-            y = _divide(y, 1.0 + jnp.exp(-y), interpret=interpret)
-        if normalised:
-            y = y * _inverse_norm(y, eps, interpret=interpret)
-        y = jnp.where(kept[:, None], y, 0.0)
-        plgpu.store(out_ref.at[tokens[:, None], local[None, :]], y.astype(out_ref.dtype),
-                    mask=(tokens < length)[:, None])
-        return window[1:], ahead
-
-    jax.lax.fori_loop(0, steps, step, (history, load(starts)))
+    window = tuple(_rows(x_ref, tokens - count + 1 + tap, columns, length) for tap in range(count))
+    y = _preactivation(window, taps, bias, interpret=interpret)
+    if activation:
+        y = _divide(y, 1.0 + jnp.exp(-y), interpret=interpret)
+    if normalised:
+        y = y * _inverse_norm(y, eps, interpret=interpret)
+    y = jnp.where(_kept(valid_ref, tokens, length)[:, None], y, 0.0)
+    plgpu.store(out_ref.at[tokens[:, None], local[None, :]], y.astype(out_ref.dtype),
+                mask=(tokens < length)[:, None])
 
 
 def _backward_kernel(*refs, first: int, normalised: bool, block: int, segments: int, steps: int,
@@ -292,11 +284,10 @@ def _config(length: int, segments: int | None, steps: int | None) -> tuple[int, 
     return segments, steps
 
 
-def _specs(x, w, bias, valid, width: int, block: int, segments: int, steps: int):
-    """The grid over a piece's channel blocks, time tiles and rows, and the inputs' specs: each program
-    sees its row of `x` and `valid` whole and indexes its tokens."""
-    batch, length, channels = x.shape
-    grid = (width // block, pl.cdiv(length, segments * steps), batch)
+def _inputs(x, w, bias, valid):
+    """The inputs' specs over a grid of channel blocks, time tiles and rows: each program sees its row
+    of `x` and `valid` whole and indexes its tokens."""
+    _, length, channels = x.shape
     specs = [pl.BlockSpec((None, length, channels), lambda c, t, b: (b, 0, 0)),
              pl.BlockSpec(w.shape, lambda c, t, b: (0, 0))]
     operands = [x, w]
@@ -306,7 +297,7 @@ def _specs(x, w, bias, valid, width: int, block: int, segments: int, steps: int)
     if valid is not None:
         specs.append(pl.BlockSpec((None, length), lambda c, t, b: (b, 0)))
         operands.append(valid)
-    return grid, specs, operands
+    return specs, operands
 
 
 def _pieces(parts):
@@ -325,18 +316,18 @@ def _params(warps: int | None, stages: int | None):
 
 
 def _forward(x, taps, bias, valid, parts, activation: bool, eps: float, dtype, interpret: bool,
-             segments: int | None = None, steps: int | None = None, warps: int | None = None,
-             stages: int | None = None):
+             rows: int | None = None, warps: int | None = None, stages: int | None = None):
     batch, length, _ = x.shape
-    segments, steps = _config(length, segments, steps)
+    rows = ROWS if rows is None else rows
     out = []
     for first, width, head in _pieces(parts):
         block = block_width(width, head)
-        grid, specs, operands = _specs(x, taps, bias, valid, width, block, segments, steps)
+        grid = (width // block, pl.cdiv(length, rows), batch)
+        specs, operands = _inputs(x, taps, bias, valid)
         kernel = functools.partial(
-            _forward_kernel, first=first, normalised=head is not None, block=block, segments=segments,
-            steps=steps, count=taps.shape[1], length=length, has_bias=bias is not None,
-            has_valid=valid is not None, activation=activation, eps=eps, interpret=interpret)
+            _forward_kernel, first=first, normalised=head is not None, block=block, rows=rows,
+            count=taps.shape[1], length=length, has_bias=bias is not None, has_valid=valid is not None,
+            activation=activation, eps=eps, interpret=interpret)
         out.append(pl.pallas_call(
             kernel, grid=grid, in_specs=specs,
             out_specs=pl.BlockSpec((None, length, width), lambda c, t, b: (b, 0, 0)),
@@ -355,7 +346,8 @@ def _backward(x, taps, bias, valid, cotangents, parts, activation: bool, eps: fl
     dx, dw, db = None, [], []
     for (first, width, head), dy in zip(_pieces(parts), cotangents, strict=True):
         block = block_width(width, head)
-        grid, specs, operands = _specs(x, taps, bias, valid, width, block, segments, steps)
+        grid = (width // block, pl.cdiv(length, segments * steps), batch)
+        specs, operands = _inputs(x, taps, bias, valid)
         tiles = grid[1]
         kernel = functools.partial(
             _backward_kernel, first=first, normalised=head is not None, block=block, segments=segments,
