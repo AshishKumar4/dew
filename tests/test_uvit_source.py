@@ -61,7 +61,7 @@ def _block_path(rest: list[str]) -> tuple[str, ...]:
     if rest[0] in ("norm1", "norm2"):
         return (rest[0], "scale" if leaf == "weight" else "bias")
     if rest[0] == "mlp":
-        layer = {"fc1": "layers_0", "fc2": "layers_2"}[rest[1]]
+        layer = {"fc1": "up_proj", "fc2": "down_proj"}[rest[1]]
         return ("mlp", layer, "kernel" if leaf == "weight" else "bias")
     if rest[1] == "proj":
         return ("attention", "to_out_0", "kernel" if leaf == "weight" else "bias")
