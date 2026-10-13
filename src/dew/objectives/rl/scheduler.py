@@ -92,6 +92,7 @@ which independent draws would not give them.
 from __future__ import annotations
 
 import dataclasses
+import functools
 import threading
 import time
 from collections import Counter, deque
@@ -311,6 +312,9 @@ class RolloutScheduler:
         self._lock = threading.Lock()
         self._registered: deque[_Entry] = deque()
         self._serial = 0
+        # The rollout key of the call in progress and its submissions so far.
+        self._key: jax.Array = jax.random.key(0)
+        self._submissions = 0
         self._partition = DataPartition()
 
     def tasks(self, dataset: Dataset) -> Dataset:
@@ -349,9 +353,12 @@ class RolloutScheduler:
             self.source.cancel([sample.future for sample in samples])
 
     def _submit(self, group: _Group, samples: Sequence[tuple[int, int]]) -> None:
-        """Submit `(index, attempt)` samples of one group under the served version."""
+        """Submit `(index, attempt)` samples of one group under the served
+        version, each submission of a call drawing its own fold of the call's key."""
         version = self.weights.version
-        futures = self.source.submit(group.task, len(samples), version=version)
+        key = jax.random.fold_in(self._key, self._submissions)
+        self._submissions += 1
+        futures = self.source.submit(group.task, len(samples), version=version, key=key)
         group.live.extend(_Sample(index, attempt, version, future)
                           for (index, attempt), future in zip(samples, futures, strict=True))
 
@@ -501,7 +508,12 @@ class RolloutScheduler:
         return entry.complete[:target]
 
     def __call__(self, state: TrainState, batch: Batch, key: jax.Array) -> dict[str, np.ndarray]:
-        del key  # sources own their sampling seeds
+        # The engines draw with JAX's default PRNG on devices of their own, so every word of the
+        # trainer's key, of whatever implementation, folds into an uncommitted default key, and this
+        # data share's index after them, so two shares' readers draw apart.
+        words = [int(word) for word in np.asarray(jax.device_get(jax.random.key_data(key))).reshape(-1)]
+        self._key = functools.reduce(jax.random.fold_in, (*words, self._partition.index), jax.random.key(0))
+        self._submissions = 0
         updates = int(state.updates)
         self._publish(state, updates)
         rollouts, latencies, groups, tally, waited = agreed(
