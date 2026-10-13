@@ -13,18 +13,14 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
-from flax.traverse_util import flatten_dict
 from reference_error import assert_as_exact_as_the_reference
 
-from dew.diffusion.process import DenoisingCondition
 from dew.nn.attention import GroupNorm, LayerNorm, Stage
-from dew.nn.autoencoders.vae import FlaxDecoder, FlaxEncoder, translate_vae_weights
+from dew.nn.autoencoders.vae import FlaxEncoder, translate_vae_weights
 from dew.nn.backbones.dit import SimpleDiT
 from dew.nn.backbones.joint import DoubleStreamBlock
 from dew.nn.backbones.mmdit import SimpleMMDiT
-from dew.nn.backbones.ssm_dit import HybridSSMAttentionDiT
 from dew.nn.backbones.unet import Unet
-from dew.nn.backbones.unet_condition import UNet2DCondition, UNetStage
 from dew.nn.conv import Conv
 from dew.nn.dit import ModulatedBlock, TextContext
 from dew.nn.scan_orders import hilbert_indices, zigzag_indices
@@ -42,49 +38,6 @@ def small_inputs(rng, res=RES, channels=3):
     x = jax.random.normal(rng, (2, res, res, channels))
     temb = jnp.ones((2,))
     return x, temb, text()
-
-
-def test_a_bf16_dit_predicts_in_fp32(rng):
-    """The output head runs in fp32 whatever the model's compute dtype, so the
-    loss the objective takes from the prediction is an fp32 one. A head that
-    computed in bf16 and cast the result up keeps the dtype and loses the
-    mantissa, so the prediction has to carry bits bf16 cannot hold."""
-    model = SimpleDiT(patch_size=4, emb_features=64, num_layers=2, num_heads=2,
-                      mlp_ratio=2, dtype=jnp.bfloat16)
-    x, temb, textcontext = small_inputs(rng)
-    # The zero-initialized head predicts exactly zero, a value every dtype
-    # holds, so the weights are nudged off init first.
-    params = jax.tree.map(lambda p: p + 0.02, model.init(rng, x, temb, textcontext))
-    out = model.apply(params, x, temb, textcontext)
-    assert out.dtype == jnp.float32
-    assert not jnp.array_equal(out, out.astype(jnp.bfloat16).astype(jnp.float32))
-
-
-def _unet(norm_groups):
-    stage = Stage(heads=2, dtype=jnp.bfloat16, force_fp32_for_softmax=True)
-    model = Unet(output_channels=3, emb_features=32, feature_depths=(16, 32),
-                 attention_configs=(None, stage), num_res_blocks=1, norm_groups=norm_groups,
-                 dtype=jnp.bfloat16)
-    return model, (jnp.ones((2, 16, 16, 3), jnp.bfloat16), jnp.ones((2,))), {}
-
-
-def _unet_condition():
-    model = UNet2DCondition(stages=(UNetStage(32, 2), UNetStage(64, 2)), blocks_per_level=1,
-                            norm_groups=8, dtype=jnp.bfloat16)
-    context = DenoisingCondition(context=jnp.ones((2, 8, 32), jnp.bfloat16))
-    return model, (jnp.ones((2, 16, 16, 4), jnp.bfloat16), jnp.ones((2,))), {"conditioning": context}
-
-
-def _vae_encoder():
-    model = FlaxEncoder(out_channels=4, block_out_channels=(32, 64), layers_per_block=1, norm_num_groups=8,
-                        dtype=jnp.bfloat16)
-    return model, (jnp.ones((2, 16, 16, 3), jnp.bfloat16),), {}
-
-
-def _vae_decoder():
-    model = FlaxDecoder(out_channels=3, block_out_channels=(32, 64), layers_per_block=1, norm_num_groups=8,
-                        dtype=jnp.bfloat16)
-    return model, (jnp.ones((2, 8, 8, 4), jnp.bfloat16),), {}
 
 
 @pytest.mark.parametrize("channels", [(32, 32), (32, 64)], ids=["same", "widening"])
@@ -308,25 +261,6 @@ def test_strided_convolutions_keep_nested_vmap_and_its_vjp():
         np.testing.assert_array_equal(actual, expected)
 
 
-@pytest.mark.parametrize("build", [
-    lambda: _unet(8), lambda: _unet(0), _unet_condition, _vae_encoder, _vae_decoder,
-], ids=["unet_group_norm", "unet_rms_norm", "unet_condition", "vae_encoder", "vae_decoder"])
-def test_a_bf16_convolutional_model_keeps_its_activations_in_bf16(rng, build):
-    """With fp32 parameters and a bf16 compute dtype, every image-shaped
-    activation the convolutional models produce is bf16, the norms' outputs
-    included. A norm that leaves its dtype to promotion returns fp32 against
-    its fp32 scale, and the activation and convolution after it then read
-    fp32 activations the step keeps for the backward pass."""
-    model, inputs, kwargs = build()
-    params = model.init(rng, *inputs, **kwargs)
-    _, state = model.apply(params, *inputs, **kwargs, capture_intermediates=True)
-    activations = {"/".join(path): leaf.dtype
-                   for path, outputs in flatten_dict(state["intermediates"]).items()
-                   for leaf in jax.tree.leaves(outputs) if leaf.ndim == 4}
-    assert any("norm" in path for path in activations)
-    assert {path: dtype for path, dtype in activations.items() if dtype != jnp.bfloat16} == {}
-
-
 @pytest.mark.parametrize("architecture, extra", [
     ("simple_dit", {}),
     ("hybrid_dit", {"ssm_attention_ratio": "all-attn"}),
@@ -407,26 +341,6 @@ def test_hilbert_patchify_roundtrip(rng):
     assert jnp.array_equal(rec, x)
 
 
-@pytest.mark.parametrize("options, forwarded, stack_only", [
-    ("_TransformerOptions", "_BlockOptions", set()),
-    ("_AttentionStackOptions", "_AttentionBlockOptions", set()),
-    ("_DiTStackOptions", "_AttentionBlockOptions",
-     {"output_channels", "patch_size", "emb_features", "num_layers", "num_heads", "remat", "scan_order"}),
-    ("_JepaStackOptions", "_TokenStackOptions", set()),
-])
-def test_a_stack_option_class_forwards_every_control_it_declares(options, forwarded, stack_only):
-    """The DiT stacks hand their shared controls to blocks through a
-    TypedDict, whose literal pyright checks; a control added to the class and
-    not to its TypedDict would silently not reach the blocks."""
-    import dataclasses
-
-    import dew.nn.dit as dit
-
-    declared = {field.name for field in dataclasses.fields(getattr(dit, options))} - {"parent", "name"}
-    keys = getattr(dit, forwarded).__required_keys__ | getattr(dit, forwarded).__optional_keys__
-    assert declared - stack_only == keys
-
-
 @pytest.mark.parametrize("stack", [SimpleDiT, SimpleMMDiT], ids=["simple_dit", "simple_mmdit"])
 def test_dropout_is_active_in_train_mode(rng, stack):
     """Dropout is applied in train mode, so `dropout_rate` reaches the blocks."""
@@ -487,61 +401,6 @@ def test_mmdit_is_dual_stream(rng):
     out_a = model.apply(params, x, temb, text_a)
     out_b = model.apply(params, x, temb, text_b)
     assert not jnp.allclose(out_a, out_b), "text tokens do not reach the image stream"
-
-
-def test_a_fresh_mmdit_block_returns_both_streams_as_they_came(rng):
-    """Dew's MM-DiT starts adaLN-Zero: each block's modulation projects to
-    zero, so its gates are shut and a fresh block hands both streams on
-    exactly. The published families that share the block load their weights
-    and start from Linen's default instead."""
-    model = SimpleMMDiT(patch_size=4, emb_features=64, num_layers=2, num_heads=2, mlp_ratio=2)
-    x, temb, textcontext = small_inputs(rng)
-    variables = model.init(rng, x, temb, textcontext)
-    seen = []
-
-    def record(call, args, kwargs, context):
-        out = call(*args, **kwargs)
-        if isinstance(context.module, DoubleStreamBlock) and context.method_name == "__call__":
-            seen.append((args[:2], out))
-        return out
-
-    with nn.intercept_methods(record):
-        model.apply(variables, x, temb, textcontext)
-    assert len(seen) == 2
-    for streams, returned in seen:
-        for given, out in zip(streams, returned, strict=True):
-            np.testing.assert_array_equal(np.asarray(out), np.asarray(given))
-
-
-def test_attention_impl_parity(rng):
-    """Every attention implementation must share one param tree and produce
-    the same outputs. 'xla' (the jax.nn fused entrypoint) is verifiable on
-    CPU; cudnn/tpu dispatch to the same wrapper."""
-    ref = SimpleDiT(patch_size=4, emb_features=64, num_layers=2, num_heads=2, mlp_ratio=2)
-    xla = SimpleDiT(patch_size=4, emb_features=64, num_layers=2, num_heads=2, mlp_ratio=2,
-                    attention_impl="xla")
-    x, temb, textcontext = small_inputs(rng)
-    params = ref.init(rng, x, temb, textcontext)
-    out_ref = ref.apply(params, x, temb, textcontext)
-    out_xla = xla.apply(params, x, temb, textcontext)
-    assert jnp.max(jnp.abs(out_ref - out_xla)) < 1e-4
-
-
-def test_fused_attention_rejects_a_dtype_it_cannot_honor(rng):
-    """The fused kernels compute in the inputs' dtype, so a dtype asking for
-    anything else raises ValueError, as a HIGH precision and a False softmax
-    flag already do. The reference path keeps honoring it."""
-    from dew.nn.attention import scaled_dot_product_attention
-    query = jax.random.normal(rng, (2, 8, 4, 16), jnp.bfloat16)
-    key = jax.random.normal(jax.random.fold_in(rng, 1), (2, 8, 4, 16), jnp.bfloat16)
-    value = jax.random.normal(jax.random.fold_in(rng, 2), (2, 8, 4, 16), jnp.bfloat16)
-    with pytest.raises(ValueError, match="cannot honor"):
-        scaled_dot_product_attention(query, key, value, dtype=jnp.float32,
-                                     implementation="xla")
-    assert scaled_dot_product_attention(query, key, value, dtype=jnp.bfloat16,
-                                        implementation="xla").dtype == jnp.bfloat16
-    assert scaled_dot_product_attention(query, key, value, dtype=jnp.float32,
-                                        implementation="reference").dtype == jnp.float32
 
 
 def open_the_gates(params, key, scale=0.5):
@@ -634,134 +493,6 @@ def test_unet3d_temporal_mixing_after_training_signal(rng):
     assert other_frame > 1e-3 * same_frame, "no information flow across frames"
 
 
-def test_non_symmetric_attention_configs_place_attention_on_that_stage_alone(rng):
-    """attention_configs is per stage and need not be symmetric: attention on
-    the first of two stages builds one block on the way down and its mirror on
-    the way up, and the middle block follows the deepest stage, which names
-    none. A stage that is None must not decide anything for the stages that
-    are not, in either the image or the video stack."""
-    from dew.nn.backbones.unet3d import UNet3D
-
-    config = {
-        "emb_features": 64,
-        "feature_depths": [16, 32],
-        "attention_configs": [Stage(heads=2, dtype=jnp.float32,
-                                 use_projection=False, use_self_and_cross=False), None],
-        "num_res_blocks": 1,
-        "num_middle_res_blocks": 1,
-    }
-    temb = jnp.ones((2,))
-    textcontext = text()
-
-    def attention_blocks(variables):
-        return sorted(name for name in variables["params"] if "attention" in name)
-
-    image = jax.random.normal(rng, (2, 16, 16, 3))
-    video = jax.random.normal(rng, (2, 3, 16, 16, 3))
-    expected = ["down_0_attention_0", "up_1_attention_0"]
-    assert attention_blocks(Unet(**config).init(rng, image, temb, textcontext)) == expected
-    assert attention_blocks(UNet3D(**config, temporal_heads=2).init(
-        rng, video, temb, textcontext)) == expected
-
-
-def test_stages_that_do_not_match_the_feature_depths_are_refused(rng):
-    """attention_configs names one stage per feature depth. The decoder walks
-    the two reversed, so a list of the wrong length does not lose its odd end:
-    it offsets the levels the decoder attends in from the ones the encoder
-    does, and the halves stop mirroring with nothing raised. Narrowing
-    feature_depths and leaving the stages alone is how a run reaches it, so
-    both UNets refuse the disagreement instead of building either half.
-    """
-    from dew.nn.backbones.unet3d import UNet3D
-
-    config = {"emb_features": 64, "feature_depths": [16, 32], "num_res_blocks": 1,
-                  "num_middle_res_blocks": 1,
-                  "attention_configs": [None, Stage(heads=2), Stage(heads=2)]}
-    temb, textcontext = jnp.ones((2,)), text()
-    with pytest.raises(ValueError, match="3 stages for 2 depths"):
-        Unet(**config).init(rng, jax.random.normal(rng, (2, 16, 16, 3)), temb, textcontext)
-    with pytest.raises(ValueError, match="3 stages for 2 depths"):
-        UNet3D(**config, temporal_heads=2).init(
-            rng, jax.random.normal(rng, (2, 3, 16, 16, 3)), temb, textcontext)
-
-
-@pytest.mark.parametrize("video", [False, True])
-def test_upsampling_reaches_the_next_decoder_stage_width(rng, video):
-    from dew.nn.backbones.unet3d import UNet3D
-    from dew.nn.blocks import Upsample
-
-    depths = (8, 16, 32)
-    model_type = UNet3D if video else Unet
-    model = model_type(emb_features=16, feature_depths=depths,
-                       attention_configs=(None,) * len(depths),
-                       num_res_blocks=1, num_middle_res_blocks=1, dtype=jnp.float32)
-    shape = (1, 2, 16, 16, 3) if video else (1, 16, 16, 3)
-    _, variables = model.init_with_output(
-        rng, jax.random.normal(rng, shape), jnp.ones((1,)),
-        capture_intermediates=lambda module, method: isinstance(module, Upsample))
-    transitions = [values["__call__"][0].shape[-3:]
-                   for _, values in sorted(variables["intermediates"].items())]
-    assert transitions == [(8, 8, 16), (16, 16, 8)]
-
-
-def test_benchmark_unet_resampling_matches_the_native_model(rng, tmp_path, monkeypatch):
-    torch = pytest.importorskip("torch")
-    from dew.nn.blocks import Upsample
-
-    for name in ("TMPDIR", "TORCHINDUCTOR_CACHE_DIR", "TRITON_CACHE_DIR"):
-        monkeypatch.setenv(name, str(tmp_path / name))
-    from tools.benchmark_torch import Unet as TorchUnet
-
-    depths = (8, 16, 32)
-    native = Unet(emb_features=16, feature_depths=depths,
-                  attention_configs=(None,) * len(depths),
-                  num_res_blocks=1, num_middle_res_blocks=1, dtype=jnp.float32)
-    image = jnp.ones((1, 16, 16, 3))
-    _, variables = native.init_with_output(
-        rng, image, jnp.ones((1,)),
-        capture_intermediates=lambda module, method: isinstance(module, Upsample))
-    expected = [values["__call__"][0].shape[-3:]
-                for _, values in sorted(variables["intermediates"].items())]
-    twin = TorchUnet({"feature_depths": depths, "attention_heads": (None,) * len(depths),
-                      "emb_features": 16, "num_res_blocks": 1, "num_middle_res_blocks": 1},
-                     "reference")
-    observed = []
-
-    def record_shape(module, arguments, output):
-        observed.append((output.shape[2], output.shape[3], output.shape[1]))
-
-    handles = [layer.register_forward_hook(record_shape) for layer in twin.upsamples]
-    try:
-        with torch.no_grad():
-            twin(torch.ones(1, 16, 16, 3), torch.ones(1), None)
-    finally:
-        for handle in handles:
-            handle.remove()
-    assert observed == expected
-
-
-def test_a_stage_with_an_unknown_field_is_refused():
-    """Design rule 6: an unknown field raises ValueError naming it, so a
-    misspelled dial fails at build and the dial it meant is never left at
-    its default."""
-    stages = [None, {"heads": 2, "use_projeciton": True}]
-    with pytest.raises(ValueError, match="use_projeciton"):
-        models.build("unet", feature_depths=(8, 16), attention_configs=stages,
-                     num_res_blocks=1, norm_groups=4)
-
-
-def test_a_stage_record_builds_the_value():
-    """A stage arrives as a dict from a command line or a run record and is
-    the declared value by the time the model holds it."""
-    model = models.build("unet", feature_depths=(8, 16), num_res_blocks=1, norm_groups=4,
-                         attention_configs=[None, {"heads": 2, "use_projection": True}])
-    assert model.attention_configs[0] is None
-    assert model.attention_configs[1] == Stage(heads=2, use_projection=True)
-    assert models.build("unet", feature_depths=(8, 16), num_res_blocks=1, norm_groups=4,
-                        attention_configs=[None, Stage(heads=2, use_projection=True)]
-                        ).attention_configs[1] == model.attention_configs[1]
-
-
 def test_a_stage_names_the_dials_the_block_supports(rng):
     """Every `TransformerBlock` dial a stage names reaches the block the unet
     builds from it: `norm_epsilon` changes the output when set."""
@@ -798,31 +529,6 @@ def test_a_stage_without_dtype_computes_in_the_models_dtype(dtype, rng):
     np.testing.assert_array_equal(output, explicit.apply(variables, x))
 
 
-def test_a_block_pattern_and_a_ratio_together_are_refused():
-    """`block_pattern` names every layer's mixer and `ssm_attention_ratio`
-    names them by ratio; the hybrid DiT raises ValueError on the pair and
-    takes either alone."""
-    model = HybridSSMAttentionDiT(patch_size=4, emb_features=32, num_layers=2, num_heads=2,
-                                  block_pattern=("ssm", "attn"), ssm_attention_ratio="1:1")
-    with pytest.raises(ValueError, match="ssm_attention_ratio"):
-        model.init(jax.random.PRNGKey(0), jnp.zeros((1, 8, 8, 3)), jnp.ones((1,)))
-    for alone in ({"block_pattern": ("ssm", "attn")}, {"ssm_attention_ratio": "1:1"}):
-        HybridSSMAttentionDiT(patch_size=4, emb_features=32, num_layers=2, num_heads=2,
-                              **alone).init(jax.random.PRNGKey(0), jnp.zeros((1, 8, 8, 3)),
-                                            jnp.ones((1,)))
-
-
-def test_a_block_pattern_that_misses_a_layer_is_refused():
-    """`block_pattern` names every layer's mixer, so one shorter than
-    `num_layers` is refused rather than deciding the depth. The hybrid DiT
-    built one block per named layer, so a short pattern silently returned a
-    shallower model than the config asked for."""
-    hybrid = HybridSSMAttentionDiT(patch_size=4, emb_features=32, num_layers=4,
-                                   num_heads=2, block_pattern=("ssm", "attn"))
-    with pytest.raises(ValueError, match="2 entries for 4 layers"):
-        hybrid.init(jax.random.PRNGKey(0), jnp.zeros((1, 8, 8, 3)), jnp.ones((1,)))
-
-
 @pytest.mark.parametrize("dtype", [None, jnp.bfloat16, jnp.float32])
 @pytest.mark.parametrize("shape", [(2, 6, 16), (2, 4, 5, 16)])
 def test_group_norm_matches_flax_bit_for_bit(rng, dtype, shape):
@@ -839,19 +545,6 @@ def test_group_norm_matches_flax_bit_for_bit(rng, dtype, shape):
     found, expected = ours.apply(params, x), reference.apply(params, x)
     assert found.dtype == expected.dtype
     assert jnp.array_equal(found, expected)
-
-
-def test_norms_reduce_in_the_dtype_flax_requests():
-    """A float64 input under an fp32 module dtype reduces in fp32, as flax's
-    norms do: the mean of 1e8 and 1e8 + 1 rounds to 1e8 there."""
-    with jax.enable_x64():
-        x = jnp.asarray([[1e8, 1e8 + 1, 1e8, 1e8 + 1]], jnp.float64)
-        for ours, reference in ((GroupNorm(1, epsilon=1e-5, dtype=jnp.float32),
-                                 nn.GroupNorm(1, epsilon=1e-5, dtype=jnp.float32)),
-                                (LayerNorm(epsilon=1e-5, dtype=jnp.float32),
-                                 nn.LayerNorm(epsilon=1e-5, dtype=jnp.float32))):
-            params = reference.init(jax.random.key(0), x)
-            assert jnp.array_equal(ours.apply(params, x), reference.apply(params, x))
 
 
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])

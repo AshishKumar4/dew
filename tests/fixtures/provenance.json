@@ -2571,6 +2571,44 @@
     }
    ]
   },
+  "hf/mimo-audio-tiny": {
+   "tool": "tools/mimo_reference.py",
+   "sources": [
+    {
+     "repo": "XiaomiMiMo/MiMo-V2.6-Pro-MOPD",
+     "version": "6a7f202e8dbd0e57b3fe1da03917d08d75abc4b8",
+     "runs": "fetched"
+    },
+    {
+     "repo": "pytorch/audio",
+     "version": "2.11.0",
+     "runs": "torchaudio"
+    }
+   ],
+   "note": "AudioTokenizerEncoder's pooled features and codes (tokenize_audio_batch, in one batch and in batches bounded at 30 frames) and MiMoAudioEncoder's embeddings, fp32 and float64 (model.npz); torchaudio's MelSpectrogram at MiMo-Audio-Tokenizer's mel_spectrogram settings, fp32 and float64 (mel.npz)."
+  },
+  "hf/mimo-vision-tiny": {
+   "tool": "tools/mimo_reference.py",
+   "sources": [
+    {
+     "repo": "XiaomiMiMo/MiMo-V2.6-Pro-MOPD",
+     "version": "6a7f202e8dbd0e57b3fe1da03917d08d75abc4b8",
+     "runs": "fetched"
+    }
+   ],
+   "note": "MiMoVisionTransformer's trunk (the merger's input) and merger output, fp32 and float64; the merger's biases zero, as the release stores none."
+  },
+  "hf/muse-glimmer-vision-tiny": {
+   "tool": "tools/muse_glimmer_reference.py",
+   "sources": [
+    {
+     "repo": "huggingface/transformers",
+     "version": "5.16.1",
+     "runs": "transformers"
+    }
+   ],
+   "note": "MuseGlimmerVisionModel's trunk after ln_post in pixel-shuffle order, and its adapter, projection and scale-free norm, fp32 and float64."
+  },
   "hf/qwen35-vision-tiny/projector_ref.npy": {
    "tool": "tools/hf_reference.py",
    "sources": [
