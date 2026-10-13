@@ -102,7 +102,7 @@ def _rank(owner: str, rank: object) -> int:
     """`rank`, refused unless a positive int. This and `_alpha` and `_dropout`
     hold the numbers every description of an adapter states (a `LoRA`, an
     `AdapterRecord`, a PEFT or Diffusers file's config) to one rule."""
-    if type(rank) is not int or rank < 1:
+    if isinstance(rank, bool) or not isinstance(rank, int) or rank < 1:
         raise ValueError(f"{owner}: rank must be a positive integer, not {rank!r}")
     return rank
 
