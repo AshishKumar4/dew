@@ -57,6 +57,28 @@ def hf_activation(activation: GatedActivation) -> str:
     return _HF_ACTIVATIONS[activation]
 
 
+UNGATED_ACTIVATIONS = {'gelu': 'gelu_exact', 'gelu_new': 'gelu', 'gelu_fast': 'gelu',
+                       'gelu_pytorch_tanh': 'gelu', 'relu': 'relu'}
+"""The ungated feed-forward activations the classic families' configs name,
+as Dew's `mlp`: transformers' erf GELU, its tanh approximations and ReLU."""
+
+
+def ungated_mlp(activation: str, accepted: Collection[str], field: str, family: str) -> str:
+    """Dew's `mlp` for the `activation` a `family` config's `field` names,
+    refused unless among the spellings `accepted`, those its reference reads."""
+    if activation not in accepted:
+        refuse(f'{field}={activation!r}', f'the ungated {family} MLP reads {sorted(accepted)}')
+    return UNGATED_ACTIVATIONS[activation]
+
+
+def hf_ungated(mlp: object, family: str, tanh: str = 'gelu_new') -> str:
+    """The activation a classic `family`'s config names Dew's ungated `mlp`
+    by, its tanh GELU spelled `tanh`; any other `mlp` is refused."""
+    if mlp not in ('gelu', 'gelu_exact', 'relu'):
+        refuse('mlp', f'{family} requires an ungated GELU or ReLU MLP')
+    return tanh if mlp == 'gelu' else _HF_ACTIVATIONS[mlp]
+
+
 GEMMA3_MODEL_TYPE = 'gemma3_text'
 QWEN35 = 'qwen3_5_text'
 

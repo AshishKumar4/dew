@@ -11,9 +11,11 @@ from dew.interop.decoder_parts import (
     DecoderFields,
     Renames,
     base_config,
+    hf_ungated,
     refuse,
     renamed_name,
     renamed_path,
+    ungated_mlp,
 )
 from dew.interop.families.gpt_neox import gpt_neox_export_weights, gpt_neox_prepare
 from dew.interop.safetensors_io import LazyTensors
@@ -36,15 +38,13 @@ def _falcon_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
     hidden = records.integer(hf.get('hidden_size', 4544), 'hidden_size')
     heads = records.integer(hf.get('num_attention_heads', 71), 'num_attention_heads')
     activation = records.text(hf.get('activation', 'gelu') or 'gelu', 'activation')
-    activations = {'gelu': 'gelu_exact', 'gelu_new': 'gelu', 'relu': 'relu'}
-    if activation not in activations:
-        refuse('activation', 'the ungated Falcon MLP supports GELU and ReLU')
+    mlp = ungated_mlp(activation, ('gelu', 'gelu_new', 'relu'), 'activation', 'Falcon')
     config = base_config({**hf, 'hidden_size': hidden, 'num_attention_heads': heads,
                            'num_key_value_heads': 1 if hf.get('multi_query', True) else heads,
                            'intermediate_size': hf.get('ffn_hidden_size') or 4 * hidden,
                            'hidden_act': 'silu'}, used, reads=frozenset(), tie_embeddings=True)
     config.update({
-        'mlp': activations[activation], 'mlp_bias': bool(hf.get('bias', False)),
+        'mlp': mlp, 'mlp_bias': bool(hf.get('bias', False)),
         'attention_bias': bool(hf.get('bias', False)),
         'norm_type': 'layer', 'norm_bias': True, 'scale_after_cast': False,
         'norm_eps': records.number(hf.get('layer_norm_epsilon', 1e-5) or 1e-5, 'layer_norm_epsilon'),
@@ -86,7 +86,7 @@ def _falcon_export(model: CausalTransformer) -> Mapping[str, object]:
         'alibi': False, 'new_decoder_architecture': False, 'multi_query': model.kv_heads == 1,
         'parallel_attn': True, 'num_ln_in_parallel_attn': 1, 'bias': model.attention_bias,
         'ffn_hidden_size': model.hidden_features,
-        'activation': {'gelu_exact': 'gelu', 'gelu': 'gelu_new', 'relu': 'relu'}[str(model.mlp)],
+        'activation': hf_ungated(model.mlp, 'Falcon'),
         'layer_norm_epsilon': model.norm_eps, 'hidden_dropout': model.dropout_rate,
         'attention_dropout': model.attention_dropout_rate,
         'num_key_value_heads': None, 'head_dim': None, 'intermediate_size': None,

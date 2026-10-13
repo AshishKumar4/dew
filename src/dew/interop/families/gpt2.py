@@ -13,9 +13,11 @@ from dew.interop.decoder_parts import (
     Packed,
     Renames,
     decoder_tensors,
+    hf_ungated,
     refuse,
     renamed_name,
     renamed_path,
+    ungated_mlp,
 )
 from dew.interop.safetensors_io import LazyTensors
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -201,10 +203,8 @@ def gpt2_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
     if hf.get('reorder_and_upcast_attn'):
         refuse('reorder_and_upcast_attn', 'the reordered GPT-2 attention arithmetic is not represented')
     activation = records.text(hf.get('activation_function', 'gelu_new'), 'activation_function')
-    activations = {'gelu_new': 'gelu', 'gelu_fast': 'gelu', 'gelu_pytorch_tanh': 'gelu',
-                   'gelu': 'gelu_exact', 'relu': 'relu'}
-    if activation not in activations:
-        refuse(f'activation_function={activation!r}', 'the ungated MLP uses GELU or ReLU')
+    mlp = ungated_mlp(activation, ('gelu_new', 'gelu_fast', 'gelu_pytorch_tanh', 'gelu', 'relu'),
+                      'activation_function', 'GPT-2')
     if hidden % heads:
         refuse('n_embd/n_head', 'the hidden width must divide into whole attention heads')
     return native_fields(CausalTransformer)(
@@ -212,7 +212,7 @@ def gpt2_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
         emb_features=hidden, num_layers=layers, num_heads=heads,
         num_kv_heads=heads, head_dim=hidden // heads,
         mlp_features=records.integer(hf.get('n_inner') or 4 * hidden, 'n_inner'),
-        mlp=activations[activation], mlp_bias=True,
+        mlp=mlp, mlp_bias=True,
         norm_type='layer', norm_bias=True,
         norm_eps=records.number(hf.get('layer_norm_epsilon', 1e-5), 'layer_norm_epsilon'),
         qk_norm=False, attention_bias=True,
@@ -277,14 +277,12 @@ def _gpt2_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | Non
 
 
 def gpt2_export(model: CausalTransformer) -> Mapping[str, object]:
-    activation = model.mlp
-    if not isinstance(activation, str) or activation not in ('gelu', 'gelu_exact', 'relu'):
-        refuse('mlp', 'GPT-2 requires an ungated GELU or ReLU feed-forward')
+    activation = hf_ungated(model.mlp, 'GPT-2')
     config: dict[str, object] = {
         'n_embd': model.emb_features, 'n_layer': model.num_layers, 'n_head': model.num_heads,
         'n_inner': model.hidden_features, 'n_positions': model.position_embedding_size or model.max_seq_len,
         'layer_norm_epsilon': model.norm_eps,
-        'activation_function': {'gelu': 'gelu_new', 'gelu_exact': 'gelu', 'relu': 'relu'}[activation],
+        'activation_function': activation,
         'scale_attn_weights': model.attention_scale is None,
         'attn_pdrop': model.attention_dropout_rate,
         'embd_pdrop': model.embedding_dropout_rate, 'resid_pdrop': model.dropout_rate,
