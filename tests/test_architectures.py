@@ -13,6 +13,7 @@ evaluation running against the sharded EMA copy, and a checkpoint on disk
 afterwards.
 """
 
+import dataclasses
 import itertools
 import json
 import math
@@ -42,7 +43,7 @@ from dew.registry import metrics, models
 from dew.sampling import CFG, Euler
 from dew.training import Checkpoints, Layout, MeshSpec, Trainer
 from dew.training.model_flops import model_batch
-from dew.training.transaction import with_ema
+from dew.training.transaction import ema_update, with_ema
 
 # Needs the eight simulated CPU devices conftest configures; the GPU lane skips it.
 pytestmark = pytest.mark.mesh
@@ -413,12 +414,12 @@ def run_case(case: Case, tmp_path, fsdp, devices=None, state=None):
     return trainer, state, losses
 
 
-def truth(case: Case, tmp_path, initial, steps: int = 2):
-    """The case's `steps` steps on one device in float64, from `initial`
+def truth(case: Case, tmp_path, initial):
+    """The case's two steps on one device in float64, from `initial`
     widened: the same rows, keys and draws, every float wider. The
     samples arrive as float64, so their conversion and the diffusion
     noising do not share the float32 runs' roundings."""
-    trainer, encoder = make_trainer(case, tmp_path / f"truth-{steps}", 1, RecordingTracker(), 1)
+    trainer, encoder = make_trainer(case, tmp_path / "truth", 1, RecordingTracker(), 1)
     source = batches(case, encoder)
 
     def wide(batch):
@@ -431,31 +432,32 @@ def truth(case: Case, tmp_path, initial, steps: int = 2):
 
     wider = jax.tree.map(lambda leaf: leaf.astype(jnp.float64) if jnp.issubdtype(leaf.dtype, jnp.floating)
                          else jnp.copy(leaf), initial)
-    return trainer.fit(Data(), steps=steps, state=wider)
+    return trainer.fit(Data(), steps=2, state=wider)
 
 
 KEY_PROJECTIONS = ("to_k", "k_proj")
 """The names attention gives the projection of its keys."""
 
 
-def key_bias_terms(case: Case, trainer, encoder, state, index: int) -> dict[tuple[str, ...], np.ndarray]:
+def key_bias_terms(case: Case, trainer, encoder, state, index: int):
     """Each attention key projection's bias gradient at step `index`, as its
-    terms summed absolutely, in float64, keyed by the bias's path. A key
-    bias moves every key of its head by one vector, which the softmax over
-    those keys ignores, so its gradient, the key projection's cotangents
-    summed over rows and positions, is zero but for their rounding: the
-    cotangents are read by adding a zero to the projection's output, at the
-    step's own state, batch, key and averaged weights, as the Trainer
-    differentiates the loss."""
+    terms summed absolutely, in float64, keyed by the bias's path, with the
+    loss's gradient for the parameters beside them. A key bias moves every
+    key of its head by one vector, which the softmax over those keys
+    ignores, so its gradient, the key projection's cotangents summed over
+    rows and positions, is zero but for their rounding: the cotangents are
+    read by adding a zero to the projection's output, at the step's own
+    state, batch, key and averaged weights, as the Trainer differentiates
+    the loss."""
     batch = list(itertools.islice(batches(case, encoder)(), index + 1))[-1]
     if not case.is_lm:
         batch = {**batch, case.sample_key: batch[case.sample_key].astype(np.float64)}
     batch = model_batch(jax.tree.map(jnp.asarray, batch))
     step = Step(state.microstep, jax.random.fold_in(state.key, state.step),
                 with_ema(state.variables, state.ema))
-    values: dict[tuple, jax.Array] = {}
+    shapes: dict[tuple, jax.ShapeDtypeStruct] = {}
 
-    def loss(offsets, record=None):
+    def loss(params, offsets, record=None):
         calls: dict[tuple[str, ...], int] = {}
 
         def project(next_fun, args, kwargs, context):
@@ -467,15 +469,16 @@ def key_bias_terms(case: Case, trainer, encoder, state, index: int) -> dict[tupl
             call = (path, calls.setdefault(path, 0))
             calls[path] += 1
             if record is not None:
-                record[call] = value
+                record[call] = jax.ShapeDtypeStruct(value.shape, value.dtype)
             return value + offsets.get(call, 0)
 
         with nn.intercept_methods(project):
-            statistics, _ = trainer.objective._loss(state.variables, batch, step)
+            statistics, _ = trainer.objective._loss({**state.variables, "params": params}, batch, step)
         return trainer.objective.reduce_loss(statistics)[0]
 
-    loss({}, values)
-    cotangents = jax.grad(loss)({call: jnp.zeros_like(value) for call, value in values.items()})
+    jax.eval_shape(lambda params: loss(params, {}, shapes), state.variables["params"])
+    offsets = {call: jnp.zeros(shape.shape, shape.dtype) for call, shape in shapes.items()}
+    gradient, cotangents = jax.jit(jax.grad(loss, argnums=(0, 1)))(state.variables["params"], offsets)
     # A module applied on its own (a JEPA encoder or predictor) names paths from its own root, so each
     # call's bias is the one parameter whose path ends in the call's and whose shape is its features'.
     params = traverse_util.flatten_dict(state.variables["params"])
@@ -486,36 +489,42 @@ def key_bias_terms(case: Case, trainer, encoder, state, index: int) -> dict[tupl
         width = params[bias].ndim
         summed = np.sum(np.abs(np.asarray(cotangent)), axis=tuple(range(cotangent.ndim - width)))
         terms[bias] = terms.get(bias, 0) + summed
-    return terms
+    return terms, gradient
 
 
-def key_bias_invariants(case: Case, tmp_path, initial, exact) -> dict[str, dict[tuple[str, ...], np.ndarray]]:
+def key_bias_invariants(case: Case, tmp_path, initial) -> dict[str, dict[tuple[str, ...], np.ndarray]]:
     """Each attention key bias's terms over the two SGD steps, by state tree:
     the momentum holds momentum g1 + g2, the bias, which starts at zero,
     moves to -lr ((1 + momentum) g1 + g2), and the EMA averages those
     parameters with the objective's decays, so each is a sum of the two
     steps' gradients' terms (`key_bias_terms`), measured at the state each
-    step reads. SwiftHeron's general rule for small and cancelling leaves
-    (ledger 469) replaces this declaration."""
+    step reads: the first step's SGD update and average give the second's.
+    SwiftHeron's general rule for small and cancelling leaves (ledger 469)
+    replaces this declaration."""
     trainer, encoder = make_trainer(case, tmp_path / "key-terms", 1, devices=1)
     params = traverse_util.flatten_dict(initial.variables["params"])
     if not any(path[-2:] in [(name, "bias") for name in KEY_PROJECTIONS] for path in params):
         return {}
+    average = trainer.objective.ema
+    decays = [float(average.decay(jnp.asarray(index))) if average is not None
+              and bool(trainer.objective.averages(jnp.asarray(index))) else 1.0 for index in (0, 1)]
     with jax.enable_x64(new_val=True):
         wide = jax.tree.map(lambda leaf: leaf.astype(jnp.float64) if jnp.issubdtype(leaf.dtype, jnp.floating)
                             else jnp.copy(leaf), initial)
-        first = key_bias_terms(case, trainer, encoder, wide, 0)
-        once = truth(case, tmp_path, jax.tree.map(jnp.copy, initial), steps=1)
-        second = key_bias_terms(case, trainer, encoder, once, 1)
+        first, gradient = key_bias_terms(case, trainer, encoder, wide, 0)
+        variables = {**wide.variables, "params": jax.tree.map(lambda leaf, step: leaf - LEARNING_RATE * step,
+                                                              wide.variables["params"], gradient)}
+        ema = None if wide.ema is None else ema_update(wide.ema, variables, decays[0])
+        moved = dataclasses.replace(wide, variables=variables, ema=ema, step=wide.step + 1,
+                                    microstep=wide.microstep + 1)
+        second, _ = key_bias_terms(case, trainer, encoder, moved, 1)
     zero = [path for path in first if not np.any(np.asarray(params[path]))]
-    moved = {path: LEARNING_RATE * ((1 + MOMENTUM) * first[path] + second[path]) for path in zero}
-    scales = {"variables": moved,
+    biases = {path: LEARNING_RATE * ((1 + MOMENTUM) * first[path] + second[path]) for path in zero}
+    scales = {"variables": biases,
               "opt_state": {path: MOMENTUM * first[path] + second[path] for path in first}}
-    if exact.ema is not None:
-        first_decay, second_decay = (float(trainer.objective.ema.decay(jnp.asarray(index)))
-                                     for index in (0, 1))
-        scales["ema"] = {path: second_decay * (1 - first_decay) * LEARNING_RATE * first[path]
-                         + (1 - second_decay) * moved[path] for path in zero}
+    if wide.ema is not None:
+        scales["ema"] = {path: decays[1] * (1 - decays[0]) * LEARNING_RATE * first[path]
+                         + (1 - decays[1]) * biases[path] for path in zero}
     return scales
 
 
@@ -648,7 +657,7 @@ def test_architecture_trains_on_every_layout_as_on_one_device(case, tmp_path):
     for moment in (adam.mu, adam.nu):
         assert param_specs == [leaf.sharding.spec for leaf in jax.tree.leaves(moment)]
     scales = decay_invariants(case, tmp_path, initial)
-    for name, by_path in key_bias_invariants(case, tmp_path, initial, exact).items():
+    for name, by_path in key_bias_invariants(case, tmp_path, initial).items():
         scales.setdefault(name, {}).update(by_path)
     invariants = declared(scales, exact)
     for layout in (replicated, state):
