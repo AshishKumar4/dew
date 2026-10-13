@@ -310,6 +310,10 @@ class Files(Dataset):
     def _index_url(url: str) -> str:
         return url.rsplit(".", 1)[0] + ".index.npy"
 
+    def can_provision(self, read: Read) -> bool:
+        return (read == "indexed" and self.where is None
+                and self.kind in ("array_record", "jsonl", "text", "csv"))
+
     def provision(self) -> Files:
         if self.kind == "array_record":
             return self._provision_arrayrecord()
@@ -1110,6 +1114,9 @@ class TokenFiles(Dataset):
             return True
         tokens = self.tokens
         return not isinstance(tokens, TokenRecords) or tokens.lengths is not None
+
+    def can_provision(self, read: Read) -> bool:
+        return True
 
     def provision(self) -> TokenFiles:
         """Build the indexes the store's reads need: a record store's record

@@ -82,6 +82,9 @@ class WindowSource:
     def supports(self, read: Read) -> bool:
         return self.original.supports(read)
 
+    def can_provision(self, read: Read) -> bool:
+        return self.original.can_provision(read)
+
     def provision(self) -> WindowSource:
         """Provision the token store, whose length index these windows need
         to read it by span."""
