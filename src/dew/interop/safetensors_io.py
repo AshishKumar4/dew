@@ -268,7 +268,7 @@ def read_weights(folder) -> dict[str, np.ndarray]:
     return tensors
 
 
-def own(owner: dict[str, str], names: Iterable[str], shard: str, where: object) -> None:
+def own(owner: dict[str, str], names: Iterable[str], shard: str, where: Path) -> None:
     """Record in `owner` that `shard` holds each of `names`, refusing a
     tensor another of `where`'s shards already holds: a merge would keep
     whichever came last."""
