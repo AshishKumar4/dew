@@ -831,16 +831,21 @@ def _diagnostic(pipeline: Pipeline, *, records: int | None = None) -> _Host:
     counts: dict[str, CorpusCounts] = {}
     (pipeline,) = _prepared((pipeline,), read, provision=True, training=True,
                             counts=(counts,) if records is None else None)
+    finite = not any(isinstance(stage, Repeat) for stage in _steps(pipeline))
+    if finite:
+        pipeline = dataclasses.replace(pipeline, stages=tuple(
+            dataclasses.replace(stage, drop_remainder=False) if isinstance(stage, TokenBudget) else stage
+            for stage in pipeline.stages))
     pipeline = _token_geometry(pipeline)
     if read == "memory" and records is None:
         pipeline = _materialize(pipeline, counts)
     lowering = _analyzed(pipeline, read)
     if records is not None:
         lowering = _cut(lowering, per_share=True)
-    if not any(isinstance(stage, Repeat) for stage in _steps(pipeline)):
+    if finite:
         lowering = _finite(lowering)
     batching = next(stage for stage in pipeline.stages if isinstance(stage, (BatchStage, TokenBudget)))
-    batch = batching.size if isinstance(batching, BatchStage) else _budget_rows(batching)
+    batch = _batch_rows(batching)
     build = _Build(read, loading, 0, batch, _DEFAULT_BUDGET, lowering, training=True)
     if loading.workers == "auto":
         build = dataclasses.replace(build, loading=loading.resolved(build.batched(pipeline, DataPartition())))
