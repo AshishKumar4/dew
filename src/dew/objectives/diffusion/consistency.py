@@ -37,6 +37,7 @@ from dew.inputs import InputSpec
 from dew.nn.attention import forward_mode_attention
 from dew.nn.protocols import TimeScaled
 from dew.objectives.base import TEACHER, Aux, EMASpec, ProgramModule, Step, Variables
+from dew.sampling.guidance import guide
 
 from .few_step import SMOOTH_TIME_SCALE
 from .objective import FAKE_SCORE, FlowDistillationObjective
@@ -59,8 +60,8 @@ def trig_prediction(velocity: Velocity, x: jax.Array, t: jax.Array) -> tuple[jax
 
 
 def guided(unconditional: jax.Array, conditional: jax.Array, scale: float) -> jax.Array:
-    """Return the teacher's guided prediction. Guidance applies only at a scale above one."""
-    return conditional if scale <= 1.0 else unconditional + scale * (conditional - unconditional)
+    """Return the teacher's guided prediction (`guide`). Guidance applies only at a scale above one."""
+    return conditional if scale <= 1.0 else guide(conditional, unconditional, scale)
 
 
 def rows(value: jax.Array) -> jax.Array:

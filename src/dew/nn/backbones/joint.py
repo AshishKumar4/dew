@@ -20,45 +20,13 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.attention import LayerNorm, RMSNorm, scaled_dot_product_attention
+from dew.nn.blocks import Modulation
 from dew.nn.flops import MissingFlopsCount, attention_flops, matching_lengths, projection_flops
 from dew.nn.mlp import GatedMLP
 from dew.nn.rope import rotate
 from dew.nn.sharding import logical_axes
 
 TIME_FEATURES = 256
-
-
-class Modulation(nn.Module):
-    """Projects the conditioning as the source's `AdaLayerNormZero` family does: SiLU, then one linear layer.
-
-    The output is `pieces` chunks of the width, in the source's order.
-    """
-
-    features: int
-    pieces: int
-    bias: bool = True
-    zero_init: bool = False
-    """Whether the projection starts at zero, adaLN-Zero's identity block, which
-    Dew's own MM-DiT trains from; the published families load their weights."""
-    dtype: Dtype | None = None
-    precision: PrecisionLike = None
-
-    @property
-    def output_features(self) -> int:
-        return self.pieces * self.features
-
-    @nn.nowrap
-    def model_flops(self, lengths, input_features: int | None = None) -> float:
-        return projection_flops(lengths, self.features if input_features is None else input_features,
-                                self.output_features)
-
-    @nn.compact
-    def __call__(self, conditioning):
-        projected = nn.Dense(self.output_features, use_bias=self.bias, dtype=self.dtype,
-                             precision=self.precision, name="linear",
-                             kernel_init=(nn.initializers.zeros if self.zero_init
-                                          else nn.initializers.lecun_normal()))(nn.silu(conditioning))
-        return jnp.split(projected, self.pieces, axis=-1)
 
 
 def modulate(x, shift, scale):
@@ -365,5 +333,5 @@ class DoubleStreamBlock(nn.Module):
         return image, context
 
 
-__all__ = ["DoubleStreamBlock", "JointAttention", "Modulation", "embedding", "guided_time", "layer_norm",
+__all__ = ["DoubleStreamBlock", "JointAttention", "embedding", "guided_time", "layer_norm",
            "modulate"]
