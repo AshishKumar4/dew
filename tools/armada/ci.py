@@ -27,10 +27,25 @@ than leaving the task without a verdict. Each row also carries its tests' own
 times, from which `durations` rewrites tests/test_durations.json: given green
 runs' verdicts (`armada verdict <sha> --json`), the newest first, it records
 each test of the newest at its least time as the floor's Python ran it.
+
+The test cache skips a file whose inputs are unchanged since it ran green. A
+green row records the checkout's Python files its tests executed
+(tools/armada/executed.py) and its key, a hash of those files, the file
+itself and what every file shares (`shared`: the environment's locks, the
+CI tools, every non-Python file under tests/ and src/, and the names of every
+Python file there, so a file a scanner would find changes every key). The
+plan recomputes each file's key from its record at the commit it plans, and
+leaves out a file whose every row's key matches, which ran green on exactly
+these inputs. A file that started another process is never skipped, since no
+event saw that process's code. The records live in the dew-xla-cache Worker
+under `testcache/`; with DEW_TEST_CACHE=off, or without its URL and token, the
+plan runs every file.
 """
 
 import argparse
+import concurrent.futures
 import contextlib
+import hashlib
 import heapq
 import json
 import math
@@ -41,6 +56,8 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
@@ -74,6 +91,91 @@ SKIPPED = {"tests/test_gen_api.py", "tests/test_multihost.py"}
 """CI runs the first in the lint job, under the griffe it pins, and the second in the multihost job,
 across the containers of an armada gang."""
 DURATIONS = Path("tests/test_durations.json")
+SHARED = ("locks/cpu.txt", "tools/install_environment.sh", "pyproject.toml", "constraints.txt",
+          ".armada.json", "tools/armada/ci.py", "tools/armada/split.py", "tools/armada/executed.py",
+          str(DURATIONS))
+"""The files every test file's key covers whole, beside tests/ and src/ (`shared`)."""
+CACHE_PREFIX = "testcache"
+
+
+def shared(python: str) -> str:
+    """The hash of what every test file's run shares: `python`, the `SHARED` files, every non-Python
+    file under tests/ and src/, and the names of every Python file there."""
+    digest = hashlib.sha256(python.encode())
+    for top in ("tests", "src"):
+        for path in sorted(Path(top).rglob("*")):
+            if not path.is_file() or "__pycache__" in path.parts:
+                continue
+            digest.update(str(path).encode())
+            if path.suffix != ".py":
+                digest.update(hashlib.sha256(path.read_bytes()).digest())
+    for name in SHARED:
+        digest.update(name.encode() + contents(name))
+    return digest.hexdigest()
+
+
+def contents(name: str) -> bytes:
+    """The hash of file `name`'s bytes, or b"missing"."""
+    return hashlib.sha256(Path(name).read_bytes()).digest() if Path(name).is_file() else b"missing"
+
+
+def cache_key(common: str, name: str, depends: list[str]) -> str:
+    """The key of test file `name` whose run executed `depends`: those files' contents and `common`."""
+    digest = hashlib.sha256(common.encode())
+    for path in sorted({name, *depends}):
+        digest.update(path.encode() + contents(path))
+    return digest.hexdigest()
+
+
+def cache_url(python: str, row_name: str) -> str:
+    """Where the record of `row_name` lives: the Worker's key alphabet has no colon."""
+    _, name, *group = row_name.split(":")
+    return f"{os.environ['DEW_XLA_CACHE_URL'].rstrip('/')}/{CACHE_PREFIX}/{python}/{name}/" + \
+        ("-of-".join(group[0].split("/")) if group and group[0] else "whole")
+
+
+def cache_request(url: str, token: str, data: bytes | None = None) -> bytes | None:
+    """GET (or with `data`, PUT) `url`; None on a miss or any failure, which only costs a rerun."""
+    headers = {"Authorization": f"Bearer {token}", "User-Agent": "dew-ci-test-cache"}
+    method = "PUT" if data is not None else "GET"
+    request = urllib.request.Request(url, data=data, method=method, headers=headers)
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            return response.read()
+    except (urllib.error.URLError, TimeoutError, OSError):
+        return None
+
+
+def cached_files(python: str, timed: dict[str, float | None], recorded: dict[str, list[float]],
+                 target: float) -> set[str]:
+    """The files of `timed` whose every row, as the plan would split them, ran green on these inputs."""
+    common = shared(python)
+
+    def rows_of(name: str) -> list[str]:
+        seconds = timed[name]
+        if seconds is None or seconds <= target:
+            return [row(python, name, "")]
+        count = len(split(recorded.get(name, []), seconds, target))
+        return [row(python, name, f"{group}/{count}") for group in range(1, count + 1)]
+
+    with concurrent.futures.ThreadPoolExecutor(32) as pool:
+        hits = pool.map(lambda name: cached(python, rows_of(name), common), timed)
+        return {name for name, hit in zip(timed, hits, strict=True) if hit}
+
+
+def cached(python: str, rows: list[str], common: str) -> bool:
+    """Whether every one of a file's `rows` ran green on exactly these inputs."""
+    token = os.environ.get("DEW_TEST_CACHE_TOKEN") or os.environ.get("DEW_XLA_CACHE_TOKEN")
+    if os.environ.get("DEW_TEST_CACHE") == "off" or not token or "DEW_XLA_CACHE_URL" not in os.environ:
+        return False
+    for row_name in rows:
+        record = cache_request(cache_url(python, row_name), token)
+        if record is None:
+            return False
+        recorded = json.loads(record)
+        if recorded["key"] != cache_key(common, row_name.split(":")[1], recorded["depends"]):
+            return False
+    return True
 
 
 def recorded_tests() -> dict[str, list[float]]:
@@ -162,6 +264,9 @@ def plan(target: float, timings: dict) -> list[dict]:
     for python in PYTHONS:
         files = every if python == PYTHONS[0] else [name for name in every if name in NEWEST_FILES]
         timed = weights(files, timings, python)
+        unchanged = cached_files(python, timed, recorded, target)
+        print(f"{python}: {len(unchanged)} of {len(files)} files ran green on these inputs", file=sys.stderr)
+        timed = {name: seconds for name, seconds in timed.items() if name not in unchanged}
         tasks: list[tuple[list[str], str, float]] = [
             ([name], "", target) for name, seconds in timed.items() if seconds is None]
         for name, seconds in timed.items():
@@ -252,6 +357,9 @@ def task(python: str, tests: list[str], split: str, out: Path, deadline: float, 
     container's pace), which pytest's case times leave out. Weighed by case times, tasks planned
     at 300 seconds ran a median of 392."""
     began = time.monotonic()
+    # Before any test writes under tests/, the inputs as the plan saw them.
+    common = shared(python)
+    executed_report = out.with_name(f"{out.name}.executed.json")
     report = out.with_name(f"{out.name}.junit.xml")
     report.unlink(missing_ok=True)
     grouping = ["-p", "split", f"--ci-group={split}"] if split else []
@@ -259,7 +367,7 @@ def task(python: str, tests: list[str], split: str, out: Path, deadline: float, 
     # log holds every test that finished when a task is cut short.
     command = [f".venv-{python}/bin/python", "-u", "-m", "pytest", "-q", "-m", "not network", "-rfE",
                "--tb=short", "--continue-on-collection-errors", "-o", "faulthandler_timeout=600",
-               f"--junitxml={report}", *tests, *grouping]
+               "-p", "executed", f"--junitxml={report}", *tests, *grouping]
     # pytest leads a process group of its own, so what its tests start ends with it. Its output is
     # streamed as it comes by a reader of its own, which nothing waits on past pytest's end: a test's
     # child holding the pipe open (a pool worker, a server) cannot keep the verdict from being written.
@@ -267,7 +375,8 @@ def task(python: str, tests: list[str], split: str, out: Path, deadline: float, 
     # split.py, the plugin that keeps a split file's group, imports from beside this file.
     path = os.pathsep.join(filter(None, [str(Path(__file__).resolve().parent), os.environ.get("PYTHONPATH")]))
     done = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                            start_new_session=True, env={**os.environ, "PYTHONPATH": path})
+                            start_new_session=True,
+                            env={**os.environ, "PYTHONPATH": path, "DEW_EXECUTED": str(executed_report)})
 
     def read() -> None:
         for line in done.stdout or ():
@@ -317,7 +426,22 @@ def task(python: str, tests: list[str], split: str, out: Path, deadline: float, 
                      "tests": {node_of(case): float(case.get("time") or 0) for case in own},
                      "timings": {row(python, name, ""): seconds}})
     out.write_text(json.dumps({"rows": rows}))
+    record(python, rows, executed_report, common)
     return 0
+
+
+def record(python: str, rows: list[dict], executed_report: Path, common: str) -> None:
+    """Keep each green row's key and the files its tests executed (`cached` reads them back)."""
+    token = os.environ.get("DEW_XLA_CACHE_TOKEN")
+    if not token or "DEW_XLA_CACHE_URL" not in os.environ or not executed_report.is_file():
+        return
+    executed = json.loads(executed_report.read_text())
+    for row_ in rows:
+        name = row_["name"].split(":")[1]
+        depends = executed.get(name)
+        if row_["exitCode"] == 0 and depends is not None:
+            body = json.dumps({"key": cache_key(common, name, depends), "depends": depends}).encode()
+            cache_request(cache_url(python, row_["name"]), token, body)
 
 
 def durations(verdicts: list[dict]) -> dict[str, float]:
