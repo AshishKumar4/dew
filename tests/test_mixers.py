@@ -42,8 +42,8 @@ class ScaleMixerModule(nn.Module):
     scale: float = 2.0
 
     @nn.compact
-    def __call__(self, x, decode: bool = False, positions=None, segment_ids=None):
-        del decode, positions, segment_ids
+    def __call__(self, x, decode: bool = False):
+        del decode
         return x * self.scale
 
 
