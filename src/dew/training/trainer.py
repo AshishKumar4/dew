@@ -1441,6 +1441,7 @@ class Trainer(Generic[Loss, Effects]):
             # Whether this fit trained or found the run complete, and inside
             # the lifecycle, so a selection that fails is the run's outcome.
             if restore_best and checkpoints is not None and run.preempted is None:
+                checkpoints.wait()  # the best may be the last step's save, still in flight
                 trained, _ = checkpoints.restore(
                     jax.tree.map(
                         lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=leaf.sharding),
