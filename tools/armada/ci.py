@@ -4,6 +4,7 @@
     python3 tools/armada/ci.py plan --target=SECONDS --timings=FILE
     python3 tools/armada/ci.py task --python=3.12 --tests="tests/a.py tests/b.py" --split=[G/N] --out=FILE
     python3 tools/armada/ci.py durations VERDICT...
+    python3 tools/armada/ci.py gpu-tier
 
 The plan prints a task matrix for each Python CI proves. Whole test files are
 packed heaviest first into the lightest of the tasks, each near `target`
@@ -57,6 +58,7 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -140,11 +142,15 @@ def cache_key(common: str, name: str, depends: list[str]) -> str:
     return digest.hexdigest()
 
 
+def worker() -> str:
+    """The URL of the Worker that holds the records."""
+    return os.environ["DEW_XLA_CACHE_URL"].rstrip("/")
+
+
 def cache_url(python: str, row_name: str) -> str:
     """Where the record of `row_name` lives: the Worker's key alphabet has no colon or hash."""
     _, name, split = parsed_row(row_name)
-    return (f"{os.environ['DEW_XLA_CACHE_URL'].rstrip('/')}/{CACHE_PREFIX}/{python}/{name}/"
-            + ("-of-".join(split.split("/")) if split else "whole"))
+    return f"{worker()}/{CACHE_PREFIX}/{python}/{name}/{'-of-'.join(split.split('/')) if split else 'whole'}"
 
 
 def cache_request(url: str, token: str, data: bytes | None = None) -> bytes | None:
@@ -182,17 +188,26 @@ def cached_files(python: str, timed: dict[str, float | None], recorded: dict[str
         return {name for name, hit in zip(timed, hits, strict=True) if hit}
 
 
-def cached(python: str, rows: list[str], common: str) -> bool:
-    """Whether every one of a file's `rows` ran green on exactly these inputs."""
+def reading_token() -> str | None:
+    """The token the records are read with, or None where the cache is off or out of reach."""
     token = os.environ.get("DEW_TEST_CACHE_TOKEN") or os.environ.get("DEW_XLA_CACHE_TOKEN")
     if os.environ.get("DEW_TEST_CACHE") == "off" or not token or "DEW_XLA_CACHE_URL" not in os.environ:
+        return None
+    return token
+
+
+def cached(python: str, rows: list[str], common: str) -> bool:
+    """Whether every one of a file's `rows` ran green on exactly these inputs."""
+    token = reading_token()
+    if token is None:
         return False
     for row_name in rows:
         record = cache_request(cache_url(python, row_name), token)
         if record is None:
             return False
         recorded = json.loads(record)
-        if recorded["key"] != cache_key(common, parsed_row(row_name)[1], recorded["depends"]):
+        if recorded["depends"] is None or recorded["key"] != cache_key(
+                common, parsed_row(row_name)[1], recorded["depends"]):
             return False
     return True
 
@@ -459,17 +474,58 @@ def task(python: str, tests: list[str], split: str, out: Path, deadline: float, 
 
 
 def record(python: str, rows: list[dict], executed_report: Path, common: str) -> None:
-    """Keep each green row's key and the files its tests executed (`cached` reads them back)."""
+    """Keep each green row's key and the files its tests executed (`cached` reads them back), and
+    where they read the backend (`gpu_tier`). A file that started another process has no key."""
     token = os.environ.get("DEW_XLA_CACHE_TOKEN")
     if not token or "DEW_XLA_CACHE_URL" not in os.environ or not executed_report.is_file():
         return
     executed = json.loads(executed_report.read_text())
     for row_ in rows:
         name = parsed_row(row_["name"])[1]
-        depends = executed.get(name)
-        if row_["exitCode"] == 0 and depends is not None:
-            body = json.dumps({"key": cache_key(common, name, depends), "depends": depends}).encode()
+        if row_["exitCode"] == 0 and name in executed:
+            depends = executed[name]["depends"]
+            key = None if depends is None else cache_key(common, name, depends)
+            body = json.dumps({"key": key, "depends": depends, "reads": executed[name]["reads"]}).encode()
             cache_request(cache_url(python, row_["name"]), token, body)
+
+
+def listed(prefix: str, token: str) -> list[str]:
+    """The names of the Worker's records under `prefix`, without it, a page of a thousand at a time."""
+    names, cursor = [], None
+    while True:
+        fields = {"list": prefix} | ({"cursor": cursor} if cursor else {})
+        page = cache_request(f"{worker()}/?{urllib.parse.urlencode(fields)}", token)
+        if page is None:
+            raise SystemExit(f"the test cache did not list {prefix}")
+        listing = json.loads(page)
+        names += listing["keys"]
+        cursor = listing["cursor"]
+        if not cursor:
+            return names
+
+
+def gpu_tier(python: str) -> dict[str, list[str]]:
+    """The test files that take another path on a GPU, each with its evidence: where its tests read
+    the backend and its marks of tools/armada/executed.py's `MARKS`, over every record of its rows,
+    a split file's under each count of groups it was planned as. A file no record of which says
+    is in, as "unrecorded": a new file, or one no green run has recorded since records said."""
+    token = reading_token()
+    if token is None:
+        raise SystemExit("the GPU tier is chosen from the test cache's records, which need its URL and token")
+    prefix = f"{CACHE_PREFIX}/{python}/"
+
+    def reads(key: str) -> tuple[str, list[str] | None]:
+        record = cache_request(f"{worker()}/{prefix}{key}", token)
+        return key.rsplit("/", 1)[0], None if record is None else json.loads(record).get("reads")
+
+    evidence: dict[str, set[str]] = {}
+    with concurrent.futures.ThreadPoolExecutor(32) as pool:
+        for name, found in pool.map(reads, listed(prefix, token)):
+            if found is not None:
+                evidence.setdefault(name, set()).update(found)
+    every = sorted(str(path) for path in Path("tests").glob("test_*.py") if str(path) not in SKIPPED)
+    unrecorded = {name: ["unrecorded"] for name in every if name not in evidence}
+    return {name: sorted(evidence[name]) for name in every if evidence.get(name)} | unrecorded
 
 
 def durations(verdicts: list[dict], before: dict[str, float]) -> dict[str, float]:
@@ -511,6 +567,7 @@ def main() -> int:
     running.add_argument("--out", type=Path, required=True)
     running.add_argument("--deadline", type=float, default=1680.0,
                          help="seconds before armada's own task timeout (.armada.json) to interrupt at")
+    operations.add_parser("gpu-tier")
     recording = operations.add_parser("durations")
     recording.add_argument("verdicts", type=Path, nargs="+",
                            help="green runs' verdicts, the newest first: armada verdict <sha> --json")
@@ -520,6 +577,10 @@ def main() -> int:
         recorded = durations([json.loads(path.read_text()) for path in args.verdicts], before)
         DURATIONS.write_text(json.dumps(dict(sorted(recorded.items())), indent=0) + "\n")
         print(f"{len(recorded)} tests, {sum(recorded.values()):.0f} s, in {DURATIONS}")
+        return 0
+    if args.operation == "gpu-tier":
+        for name, evidence in gpu_tier(PYTHONS[0]).items():
+            print(name, *evidence, sep="\t")
         return 0
     if args.operation == "plan":
         timings = json.loads(args.timings.read_text()) if args.timings.is_file() else {}
