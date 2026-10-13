@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import importlib
+from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -18,6 +19,7 @@ if TYPE_CHECKING:
         Albumentations,
         Augmentation,
         AugmentationKey,
+        Bucket,
         Caption,
         CenterCrop,
         ColorJitter,
@@ -176,6 +178,16 @@ def center_crop(size: int, *, field: str = "image") -> CenterCrop:
     from dew.data.steps.image import CenterCrop
 
     return CenterCrop(size, field=field)
+
+
+def bucket(sizes: Sequence[tuple[int, int]], method: Interpolation = "area", *, field: str = "image",
+           to: str = "bucket") -> Bucket:
+    """A record step that resizes the pixels in `field` to cover the (height, width) of `sizes`
+    nearest their aspect ratio and cuts that size from the centre, writing its index under `to`; a
+    batch grouped by `to` stacks images of one shape."""
+    from dew.data.steps.image import Bucket
+
+    return Bucket(tuple((int(height), int(width)) for height, width in sizes), method, field, to)
 
 
 def random_crop(size: int, *, scale: tuple[float, float] = (0.8, 1.0), flip: bool = False,
