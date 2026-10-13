@@ -1,7 +1,7 @@
-"""Rotary position embeddings: the angles of one axis or several, the one
-rotation every model applies (half-split or adjacent pairs, leading or
-trailing), Llama 3.1's frequency ramp, and YaRN's frequency ramp and
-attention factor.
+"""Rotary position embeddings: the angles of one axis or several, Qwen's
+interleaved M-RoPE, the one rotation every model applies (half-split or
+adjacent pairs, leading or trailing), Llama 3.1's frequency ramp, and
+YaRN's frequency ramp and attention factor.
 
 YaRN's ramp is transformers 5.16.1's `_compute_yarn_parameters` and its
 scale `yarn_apply_mscale` (models/deepseek_v3), with `dim` at the rope
@@ -192,7 +192,8 @@ def rotary_freqs(positions, head_dim: int, theta: float, rot_dim: int | None = N
 
 
 def axis_tables[P: (np.ndarray, jax.Array)](positions: P, axes: Sequence[int], theta: float, *,
-                                            dtype: DTypeLike) -> tuple[P, P]:
+                                            dtype: DTypeLike, stored: DTypeLike | None = None
+                                            ) -> tuple[P, P]:
     """cos and sin of the rotary angles of ids on several axes: `[..., sum(axes) // 2]`.
 
     `positions` is `[..., len(axes)]`. Axis i turns its id at
@@ -201,14 +202,44 @@ def axis_tables[P: (np.ndarray, jax.Array)](positions: P, axes: Sequence[int], t
     the vision towers' patch grids. The angles are computed in `dtype`. NumPy
     ids compute on the host, where `dtype` may be float64, as
     `FluxPosEmbed` computes its static grid; JAX ids compute on the device.
+
+    `stored` is the dtype a source keeps its angles and tables in: the
+    angles round to it before their cosine and sine, and those round to it
+    after, as Z-Image's `precompute_freqs_cis` stores the float32 angles of
+    float64 products and takes their float32 cosine and sine.
     """
     angles = [positions[..., axis, None].astype(dtype) * inverse_frequencies(theta, dim, dtype=dtype)
               for axis, dim in enumerate(axes)]
+    if stored is not None:
+        angles = [angle.astype(stored).astype(dtype) for angle in angles]
+    table = dtype if stored is None else stored
     if isinstance(positions, np.ndarray):
         joined = np.concatenate(angles, axis=-1)
-        return np.cos(joined), np.sin(joined)
+        return np.cos(joined).astype(table), np.sin(joined).astype(table)
     joined = jnp.concatenate(angles, axis=-1)
-    return jnp.cos(joined), jnp.sin(joined)
+    return jnp.cos(joined).astype(table), jnp.sin(joined).astype(table)
+
+
+def mrope_tables(positions: jax.Array, section: Sequence[int], width: int, theta: float, *,
+                 dtype: DTypeLike) -> tuple[jax.Array, jax.Array]:
+    """cos and sin of Qwen's interleaved M-RoPE over a `width`-wide rope:
+    `[B, S, width // 2]` from temporal, height and width ids `[B, S, 3]`.
+
+    Pair i turns at `inverse_frequencies(theta, width)[i]` by the height id
+    when `i % 3 == 1` and `i < 3 * section[1]`, by the width id when
+    `i % 3 == 2` and `i < 3 * section[2]`, and by the temporal id otherwise
+    (Qwen3-VL's `apply_interleaved_mrope`). The angles are computed in
+    `dtype`.
+    """
+    if positions.shape[-1] != 3:
+        raise ValueError(f"M-RoPE reads three coordinates per position, got {positions.shape[-1]}")
+    indices = jnp.arange(width // 2)
+    axes = jnp.zeros((width // 2,), jnp.int32)
+    for axis in (1, 2):
+        axes = jnp.where((indices % 3 == axis) & (indices < section[axis] * 3), axis, axes)
+    selected = jnp.take_along_axis(positions, axes[None, None, :], axis=-1)
+    angles = selected.astype(dtype) * inverse_frequencies(theta, width, dtype=dtype)
+    return jnp.cos(angles), jnp.sin(angles)
 
 
 def rotate(x, cos, sin, *, pairs: Literal['half', 'adjacent'] = 'half',
