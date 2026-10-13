@@ -505,6 +505,7 @@ def test_every_description_of_an_adapter_refuses_its_numbers_alike():
     one rule: a negative alpha is a finite number, a float rank is not a rank."""
     record = {"alpha": 2.0, "rslora": False, "dropout": 0.0, "modules": ("q_proj",), "layouts": {}}
     assert LoRA(rank=2, modules=("q_proj",), alpha=-4.0).alpha == -4.0
+    assert LoRA(rank=2, modules=("q_proj",), alpha=np.float32(4), dropout=np.float32(0.1)).alpha == 4
     assert lora.AdapterRecord(rank=2, **{**record, "alpha": -4.0}).alpha == -4.0
     for build in (lambda **numbers: LoRA(modules=("q_proj",), **numbers),
                   lambda **numbers: lora.AdapterRecord(**{**record, **numbers})):
