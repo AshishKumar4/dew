@@ -38,7 +38,7 @@ from dew import records
 from dew.interop.components import bind_component, component_source
 from dew.objectives.base import Variables
 
-from ..attention import scaled_dot_product_attention
+from ..attention import l2_normalized, scaled_dot_product_attention
 from ..conv import Conv
 from .api import AutoEncoder
 from .kl import posterior_latent
@@ -60,14 +60,7 @@ class WanRMSNorm(nn.Module):
     def __call__(self, x):
         gamma = self.param("gamma", nn.initializers.ones, (self.features, *(1,) * (self.rank - 1)))
         wide = x.astype(jnp.promote_types(x.dtype, jnp.float32))
-        # F.normalize clamps the norm at 1e-12. Clamping its square first
-        # keeps a zero row's gradient finite (sqrt's derivative at zero would
-        # meet the clamp's zero); the second clamp, the same value, keeps the
-        # division off a bare square root, which XLA rewrites to rsqrt.
-        norm = jnp.sqrt(jnp.maximum(jnp.sum(jnp.square(wide), axis=-1, keepdims=True), 1e-24))
-        return (wide / jnp.maximum(norm, 1e-12) * math.sqrt(self.features) * gamma.reshape(-1)).astype(
-            self.dtype
-        )
+        return (l2_normalized(wide) * math.sqrt(self.features) * gamma.reshape(-1)).astype(self.dtype)
 
 
 def causal_conv(features: int, kernel: int, spatial: int, dtype: Dtype, name: str | None) -> nn.Module:
