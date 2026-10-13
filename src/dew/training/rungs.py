@@ -21,7 +21,7 @@ import os
 import re
 import sys
 import types
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -52,7 +52,7 @@ RECORD_VERSION = 2
 
 
 def rung_key(modules: Sequence[object], arguments: tuple[TrainState, Batch], splits: Sequence[int],
-             mesh: Mesh, step: object = None) -> dict[str, JSON]:
+             mesh: Mesh, step: Callable[..., object] | None = None) -> dict[str, JSON]:
     """What a recorded rung was decided for, read before the step traces: the
     configuration of the `modules` its programs run at the rung it starts from
     (`Objective.program_key`) and a custom `step`'s name, the code that builds
@@ -98,7 +98,8 @@ def _code() -> str:
 
 
 def recorded_rung(modules: Sequence[object], arguments: tuple[TrainState, Batch], splits: Sequence[int],
-                  mesh: Mesh, step: object = None) -> tuple[Path | None, dict[str, JSON], JSON]:
+                  mesh: Mesh, step: Callable[..., object] | None = None,
+                  ) -> tuple[Path | None, dict[str, JSON], JSON]:
     """Where the rung of the step over `arguments` on `mesh` is recorded, its key
     (`rung_key`), and the rung the record holds (None if there is none). A
     process of a pool keeps no record: its processes agree on the rung.
