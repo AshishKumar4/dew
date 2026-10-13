@@ -314,8 +314,9 @@ def wrapper_route(name: str, record: WrapperFields) -> tuple[str, str]:
         return "language_model", tail if tail.startswith(
             ("model.", "lm_head.weight", "mtp.")
         ) else f"model.{tail}"
-    if bare.startswith(projector_prefix):
-        return "projector", bare[len(projector_prefix):]
+    for prefix in (projector_prefix,) if isinstance(projector_prefix, str) else projector_prefix:
+        if bare.startswith(prefix):
+            return "projector", bare[len(prefix):]
     if bare.startswith(tower_prefix):
         return "tower", bare[len(tower_prefix):]
     if audio and bare.startswith("embed_audio."):
