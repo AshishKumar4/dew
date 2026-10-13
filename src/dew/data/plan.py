@@ -43,6 +43,21 @@ def fingerprint(value: JSON | Mapping[str, object] | np.ndarray) -> str:
     return hashlib.sha256(_canonical(value)).hexdigest()
 
 
+def _identified_sources(value: dict[str, JSON] | list[JSON] | str | int | float | bool | None) -> None:
+    """Require declared content identities throughout a source snapshot."""
+    if isinstance(value, dict):
+        identity = value.get("identity")
+        if value.get("identity_required") is True and (not isinstance(identity, str) or not identity):
+            raise ValueError(
+                f"source {value.get('store', 'adapter')} needs an explicit content identity"
+            )
+        for child in value.values():
+            _identified_sources(child)
+    elif isinstance(value, list):
+        for child in value:
+            _identified_sources(child)
+
+
 @dataclasses.dataclass(frozen=True)
 class StepIdentity:
     """What a step computes (`semantic`), and the bytes of each external
@@ -166,6 +181,9 @@ class Manifest:
     codec: int = 1
     schema: int = 1
     clean: bool = True
+
+    def __post_init__(self) -> None:
+        _identified_sources(json_value(self.source, "source"))
 
     @classmethod
     def of(

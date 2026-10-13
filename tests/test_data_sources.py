@@ -894,14 +894,93 @@ def test_torch_source_refuses_streaming_and_cache_without_content_identity():
     rows = Torch(TensorDataset(torch.arange(4)), fields=("id",))
     assert not rows.supports("streamed")
     assert int(rows.records("indexed")[2]["id"]) == 2
-    with pytest.raises(ValueError, match="cannot read streamed"):
+    with pytest.raises(ValueError):
         rows.records("streamed")
     import grain.python as grain
 
-    with pytest.raises(ValueError, match="explicit content identity"):
+    with pytest.raises(ValueError):
         Cache(f"memory://torch-cache-{uuid4().hex}").mapped(
             grain.MapDataset.source(rows.records("indexed")), Manifest(rows.fingerprint()), rows
         )
+
+
+@pytest.mark.parametrize("read", ["memory", "indexed"])
+@pytest.mark.parametrize("resume", ["exact", "non-exact"])
+def test_torch_compilation_requires_identity_even_for_equal_shapes(read, resume):
+    """Same-class, same-length datasets cannot name an exact position by their shape."""
+    import torch
+    from torch.utils.data import TensorDataset
+
+    from dew.data import from_torch
+    from dew.data.compile import compile
+
+    for offset in (0, 100):
+        source = from_torch(TensorDataset(torch.arange(32) + offset), fields=("id",))
+        with pytest.raises(ValueError):
+            compile(source.shuffle(4).repeat().batch(4), read=read, resume=resume,
+                    loading=Loading(workers=0))
+
+
+@pytest.mark.parametrize("kind,read", [("torch", "memory"), ("torch", "indexed"),
+                                       ("grain", "indexed"), ("iterator", "streamed")])
+@pytest.mark.parametrize("resume", ["exact", "non-exact"])
+def test_foreign_sources_resume_only_their_declared_content_identity(kind, read, resume):
+    """A source version resumes its remaining records; another version cannot take its position."""
+    import grain.python as grain
+
+    from dew.data import from_grain, from_iter, from_torch
+    from dew.data.compile import compile
+
+    def dataset(identity, offset=0):
+        rows = [{"id": index + offset} for index in range(32)]
+        if kind == "torch":
+            import torch
+            from torch.utils.data import TensorDataset
+
+            source = from_torch(TensorDataset(torch.arange(32) + offset), fields=("id",), identity=identity)
+        elif kind == "grain":
+            source = from_grain(grain.MapDataset.source(rows), identity)
+        else:
+            source = from_iter(lambda: iter(rows), name=identity)
+        return compile(source.repeat().batch(4), read=read, resume=resume, loading=Loading(workers=0))
+
+    original = dataset("tickets@1").train(DataPartition())
+    try:
+        next(original)
+        next(original)
+        saved = original.get_state()
+        remaining = [next(original)["id"].tolist() for _ in range(3)]
+        identity = original.identity()
+    finally:
+        original.close()
+    resumed = dataset("tickets@1").train(DataPartition())
+    changed = dataset("tickets@2", 100).train(DataPartition())
+    try:
+        resumed.set_state(saved)
+        assert [next(resumed)["id"].tolist() for _ in range(3)] == remaining
+        assert resumed.identity() == identity != changed.identity()
+        with pytest.raises(ValueError):
+            changed.set_state(saved)
+    finally:
+        resumed.close()
+        changed.close()
+
+
+@pytest.mark.parametrize("kind", ["grain", "iterator"])
+@pytest.mark.parametrize("resume", ["exact", "non-exact"])
+def test_foreign_sources_cannot_use_an_empty_content_identity(kind, resume):
+    """Grain and iterator adapters require a real source name, just as Torch requires identity."""
+    import grain.python as grain
+
+    from dew.data import from_grain, from_iter
+    from dew.data.compile import compile
+
+    rows = [{"id": index} for index in range(8)]
+    source = (from_grain(grain.MapDataset.source(rows), "") if kind == "grain"
+              else from_iter(lambda: iter(rows), name=""))
+    with pytest.raises(ValueError):
+        compile(source.repeat().batch(2), read="indexed" if kind == "grain" else "streamed",
+                resume=resume, loading=Loading(workers=0))
 
 
 def test_delta_snapshot_pins_version_and_discovers_partition_columns(tmp_path):

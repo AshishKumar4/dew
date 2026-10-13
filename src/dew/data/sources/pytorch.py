@@ -77,7 +77,7 @@ class TorchRecords:
 
 @dataclass(frozen=True)
 class Torch(Dataset):
-    """A map-style torch dataset, with explicit content identity for artifacts."""
+    """A map-style torch dataset, with explicit content identity for plans and artifacts."""
 
     dataset: TorchDataset
     fields: tuple[str, ...] | None = None
@@ -116,8 +116,9 @@ class Torch(Dataset):
         return None
 
 
-def from_torch(dataset: TorchDataset, fields: tuple[str, ...] | None = None,
-               name: str | None = None) -> Torch:
+def from_torch(dataset: TorchDataset, fields: tuple[str, ...] | None = None, *,
+               identity: str | None = None) -> Torch:
     """A map-style `torch.utils.data.Dataset` as a Dew dataset, its samples
-    named by `fields` where they are tuples, under `name` (`Torch`)."""
-    return Torch(dataset, fields, identity=name)
+    named by `fields` where they are tuples. Plans and artifacts require a
+    versioned content `identity`, including non-exact resumes (`Torch`)."""
+    return Torch(dataset, fields, identity=identity)
