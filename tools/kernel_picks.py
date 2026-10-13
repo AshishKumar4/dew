@@ -47,7 +47,7 @@ def model_of(arguments) -> CausalTransformer:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser = argparse.ArgumentParser(description="Measure this GPU's kernel picks for a decoder's training step.")
     parser.add_argument("--config", required=True,
                         help="a decoder checkpoint's directory or Hub repo; only its config.json is read")
     parser.add_argument("--revision", help="the Hub repo's commit")
@@ -81,7 +81,8 @@ def main() -> None:
         fastest = timings.prune()
         print(json.dumps({"kernel": type(ba.op).__name__, "key": str(dict(ba.autotuning_cache_key)),
                           "config": str(fastest.fastest_config),
-                          "ms": min(data.median_evaluation_time_ms for data in fastest.values())}))
+                          "ms": min(data.median_evaluation_time_ms for data in fastest.values()
+                                    if isinstance(data, tokamax.BenchmarkData))}))
     print(json.dumps({"store": path, "launches": len(stored.data)}))
 
 
