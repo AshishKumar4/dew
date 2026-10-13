@@ -1208,6 +1208,116 @@ def test_foreign_sources_resume_only_their_declared_content_identity(kind, read,
         changed.close()
 
 
+@pytest.mark.parametrize("native_state", [False, True])
+def test_from_iter_closes_the_native_file_before_restoring_and_on_close(tmp_path, native_state):
+    from dew.data import from_iter
+
+    path = tmp_path / "native.jsonl"
+    path.write_text("".join(json.dumps({"id": index}) + "\n" for index in range(8)))
+    events = []
+    opened = []
+
+    class Native:
+        def __init__(self):
+            self.file = path.open("rb")
+            self.index = len(opened)
+            opened.append(self)
+            events.append(("open", self.index))
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            line = self.file.readline()
+            if not line:
+                raise StopIteration
+            return json.loads(line)
+
+        def close(self):
+            assert not self.file.closed
+            self.file.close()
+            events.append(("close", self.index))
+
+    options = ({"state": lambda it: it.file.tell(), "load_state": lambda it, saved: it.file.seek(saved)}
+               if native_state else {})
+    source = from_iter(Native, name="native-file@1", **options)
+    manifest = source.manifest()
+    reader = iter(manifest.reader(manifest.shards[0]))
+    try:
+        assert next(reader) == {"id": 0}
+        saved = reader.get_state()
+        assert next(reader) == {"id": 1}
+        reader.set_state(saved)
+        assert events == [("open", 0), ("close", 0), ("open", 1)]
+        assert next(reader) == {"id": 1}
+    finally:
+        reader.close()
+        reader.close()
+    assert events == [("open", 0), ("close", 0), ("open", 1), ("close", 1)]
+    assert all(iterator.file.closed for iterator in opened)
+
+
+def test_closing_a_compiled_from_iter_reader_finalizes_its_native_generators():
+    from dew.data import from_iter
+    from dew.data.compile import compile
+
+    opened = []
+    closed = []
+    owned = []
+
+    def native():
+        identity = len(opened)
+        opened.append(identity)
+        try:
+            yield from ({"id": index} for index in range(64))
+        finally:
+            closed.append(identity)
+
+    def factory():
+        iterator = native()
+        owned.append(iterator)
+        return iterator
+
+    source = from_iter(factory, name="closing-generator@1").repeat().batch(2)
+    reader = compile(source, read="streamed", loading=Loading(workers=0, threads=1, read_buffer=1)
+                     ).train(DataPartition())
+    try:
+        assert next(reader)["id"].tolist() == [0, 1]
+        assert opened and not closed
+    finally:
+        reader.close()
+        reader.close()
+    assert sorted(closed) == opened
+
+
+def test_from_iter_forwards_a_native_stop_request():
+    from dew.data import from_iter
+    from dew.data.dataset import Stoppable
+
+    stopped = []
+
+    class Native:
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            return {"id": 0}
+
+        def request_stop(self):
+            stopped.append(True)
+
+    source = from_iter(Native, name="stoppable@1")
+    manifest = source.manifest()
+    reader = iter(manifest.reader(manifest.shards[0]))
+    try:
+        assert next(reader) == {"id": 0}
+        assert isinstance(reader, Stoppable)
+        reader.request_stop()
+        assert stopped == [True]
+    finally:
+        reader.close()
+
+
 @pytest.mark.parametrize("kind", ["grain", "iterator"])
 @pytest.mark.parametrize("resume", ["exact", "non-exact"])
 def test_foreign_sources_cannot_use_an_empty_content_identity(kind, resume):
