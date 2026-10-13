@@ -477,8 +477,8 @@ def read_position(table: dict, where: str, share: DataPartition) -> bytes:
             f"{share.index} of {share.count}. A position is where one share of "
             f"the data stopped and cannot be translated to another share, so "
             f"resume it on a mesh whose processes read those shares; a stream "
-            f"that reads its records globally, as every `train_stream` dataset "
-            f"does, saves a position that resumes on any partition.")
+            f"that reads its records globally, as every dataset compiled to a global "
+            f"order does, saves a position that resumes on any partition.")
     if any(row != mine[0] for row in mine[1:]):
         raise ValueError(
             f"The checkpoint at {where} holds positions for share {share.index} "

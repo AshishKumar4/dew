@@ -14,7 +14,7 @@ import pytest
 
 import dew
 from dew.config import ModelConfig, TrainerConfig
-from dew.data import Dataset
+from dew.data.dataset import Loader
 from dew.interop import Pretrained
 from dew.lora import AdapterRecord, LoRA
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -54,7 +54,7 @@ def trained_run(directory, objective, vocab, quantization=None):
     config = LMRunConfig(trainer=TrainerConfig(checkpoint_dir=str(directory), batch_size=BATCH, steps=1,
                                                eval_every=None, checkpoint_every=1,
                                                compilation_cache_dir=None, quantization=quantization))
-    state = config.train(objective, Dataset(lambda partition: Stream(vocab), None, None, BATCH), name="run")
+    state = config.train(objective, Loader(lambda partition: Stream(vocab), None, None, BATCH), name="run")
     Checkpoints(str(directory / "run")).wait()
     return state, dew.pipeline(str(directory / "run"))
 
@@ -125,7 +125,7 @@ def test_a_quantized_run_trains_on_from_its_own_record(tmp_path):
                                   eval_every=None, checkpoint_every=1, compilation_cache_dir=None,
                                   quantization=Quantization()))
         objective = LMObjective(config.model.build(), SEQ)
-        state = config.train(objective, Dataset(lambda partition: Stream(64), None, None, BATCH), name="run")
+        state = config.train(objective, Loader(lambda partition: Stream(64), None, None, BATCH), name="run")
         Checkpoints(str(directory / "run")).wait()
         return state
 
@@ -180,7 +180,7 @@ def test_an_input_quantized_run_resumes_from_its_record_where_two_steps_would_en
             checkpoint_every=1, compilation_cache_dir=None))
         objective = (LMObjective(record.model.build(), SEQ) if record
                      else LMObjective(source.model, SEQ, variables=source.variables))
-        state = config.train(objective, Dataset(lambda partition: Stream(96), None, None, BATCH), name="run")
+        state = config.train(objective, Loader(lambda partition: Stream(96), None, None, BATCH), name="run")
         Checkpoints(str(directory / "run")).wait()
         return state
 
