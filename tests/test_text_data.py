@@ -401,14 +401,18 @@ def test_a_store_without_a_document_index_packs_its_documents_by_one_planned_ord
     loading = Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1)
     recipe = TextData(source=str(directory), pack="first-fit", seq_len=4095, packing_bins=2)
     loaded = {read: loader(recipe, batch=2, read=read, loading=loading)
-              for read in ("indexed", "streamed", "memory")}
+              for read in ("indexed", "memory")}
     assert all(data.plan.lowering == "global" for data in loaded.values())
     assert len({data.records for data in loaded.values()}) == 1
     rows = {read: sorted(tuple(tuple(row[key].tolist()) for key in
                               ("text", "text_segment_ids", "text_positions"))
                          for row in _read(data.train(DataPartition()), data.steps_per_epoch))
             for read, data in loaded.items()}
-    assert rows["indexed"] == rows["streamed"] == rows["memory"]
+    assert rows["indexed"] == rows["memory"]
+    streamed = loader(recipe, batch=2, read="streamed", loading=loading)
+    assert rows["indexed"] == sorted(tuple(tuple(row[key].tolist()) for key in
+                                          ("text", "text_segment_ids", "text_positions"))
+                                    for row in _read(streamed.val(DataPartition())))
     assert not (directory / "train.documents.npy").exists()
 
 
@@ -423,7 +427,7 @@ def test_a_store_without_an_eos_id_is_one_document_windows_read_and_only_packing
     np.testing.assert_array_equal(records[0]["text"], stream)
     loading = Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1)
     data = loader(TextData(source=stored, seq_len=8), batch=1, read=read, loading=loading)
-    assert data.records == (len(stream) - 1) // 8
+    assert data.records == (None if read == "streamed" else (len(stream) - 1) // 8)
     assert [row["text"].tolist() for row in _read(data.val(DataPartition()), 2)] == [
         stream[start:start + 9].tolist() for start in (0, 8)]
     with pytest.raises(ValueError, match="producer document boundaries or EOS"):
