@@ -12,6 +12,7 @@ It also records the functions of the checkout that read the backend (`READS`) as
 collected or its tests run, and which of its tests are marked to run on a GPU: a file with either takes
 another path on a GPU, so the H100 tier runs it (`ci.py gpu-tier`)."""
 
+import dis
 import json
 import os
 import sys
@@ -46,9 +47,16 @@ def started(code, offset):
     # The environment's packages, which CI installs in the checkout, are the locks' to key.
     if name.startswith(root) and name.endswith(".py") and "site-packages" not in name:
         current[-1].add(name[len(root):])
-        if reader and not READS.isdisjoint(code.co_names) and not name.endswith(f"{os.sep}conftest.py"):
+        if reader and reads_backend(code) and not name.endswith(f"{os.sep}conftest.py"):
             reads.setdefault(reader[-1], set()).add(f"{name[len(root):]}:{code.co_qualname}")
     return sys.monitoring.DISABLE
+
+
+def reads_backend(code) -> bool:
+    """Whether `code` reads one of `READS`: `platform` as an attribute, since alone it is the module."""
+    return not READS.isdisjoint(code.co_names) and any(
+        step.argval == "default_backend" or (step.opname == "LOAD_ATTR" and step.argval == "platform")
+        for step in dis.get_instructions(code))
 
 
 def audited(event, args):
