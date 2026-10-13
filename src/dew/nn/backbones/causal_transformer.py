@@ -85,6 +85,8 @@ from ..sharding import (
 )
 from .decoder_block import (
     DECODER_REMAT,
+    MLP_RESIDUALS,
+    RESIDUALS,
     BlockWiring,
     DecoderBlock,
     GatedMLP,
@@ -2194,10 +2196,34 @@ class CausalTransformer(nn.Module):
 
     @nn.nowrap
     def recompute_more(self) -> Self | None:
-        """One rung up `DECODER_REMAT`; None at its top or off it."""
+        """One rung up `DECODER_REMAT`, past any rung that keeps nothing more of the names
+        these layers mark than the rung above it (`MixerBase.residuals`), whose step would
+        compile the same; None at the top or off the ladder."""
         if self.remat not in DECODER_REMAT[:-1]:
             return None
-        return self.clone(remat=DECODER_REMAT[DECODER_REMAT.index(self.remat) + 1])
+        marked = self.marked_residuals()
+
+        def kept(policy: RematPolicy | None) -> tuple[frozenset[str], frozenset[str]] | None:
+            return None if policy is None else (frozenset(policy.save) & marked,
+                                                frozenset(policy.offload) & marked)
+
+        index = DECODER_REMAT.index(self.remat) + 1
+        while (index < len(DECODER_REMAT) - 1
+               and kept(DECODER_REMAT[index]) == kept(DECODER_REMAT[index + 1])):
+            index += 1
+        return self.clone(remat=DECODER_REMAT[index])
+
+    @nn.nowrap
+    def marked_residuals(self) -> frozenset[str]:
+        """The `RESIDUALS` this decoder's layers can mark: each layer's mixer kind's
+        (`MixerBase.residuals`, every name where a kind does not say) and the MLP's."""
+        types = self.per_layer_types
+        mixers = [kind.mixer or self.mixer for kind in self.layer_kinds(types).values()]
+        if any(mixer is not None and mixer.residuals is None for mixer in mixers):
+            return frozenset(RESIDUALS)
+        default = AttentionMixer.residuals or ()
+        return frozenset(MLP_RESIDUALS).union(*(default if mixer is None else mixer.residuals or ()
+                                                for mixer in mixers))
 
     @nn.nowrap
     def restore_recompute(self, record: JSON) -> Self:

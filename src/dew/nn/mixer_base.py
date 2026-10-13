@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import dataclasses
 from collections.abc import Callable, Mapping
+from typing import ClassVar
 
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
@@ -137,6 +138,12 @@ class MixerBase:
     keeps_triton_gemm = False
     """Whether a step with this mixer keeps XLA's Triton GEMM fusions where
     `gpu_target().kernels['xla_triton_gemm']` turns them off."""
+
+    residuals: ClassVar[tuple[str, ...] | None] = None
+    """The names (`dew.nn.backbones.decoder_block.RESIDUALS`) the mixer this kind
+    builds marks for a remat policy to keep, or every name where None: a
+    decoder skips a remat rung that keeps nothing more of its layers' names
+    than the next (`CausalTransformer.recompute_more`)."""
 
     mixed_step = False
     """Whether the mixer this kind builds runs a server's mixed call

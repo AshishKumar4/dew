@@ -60,6 +60,8 @@ class MLPMixer(MixerBase):
     second feed-forward uses.
     """
 
+    residuals = ('gate_proj', 'up_proj', 'down_proj')
+
     # Tokenwise, with no cache for a mixed call to misread.
     mixed_step = True
 

@@ -19,15 +19,15 @@ identity's within float64 rounding.
 import jax
 import numpy as np
 
-from dew.nn.sharding import declared_axes, parameter_path
+from dew.nn.sharding import declarations, declared_axes, parameter_path
 
 # mHC's small mappings stay replicated; a production 'embed' declaration
 # would change their placement. Their columns concatenate residual streams.
 COMPOSITE_RESIDUAL_AXES = {("attn_hc", "fn"): 1, ("ffn_hc", "fn"): 1, ("hc_head", "hc_fn"): 1}
 
 
-def _residual_axis(path, leaf, width: int) -> int | None:
-    axes = declared_axes(path, leaf.ndim)
+def _residual_axis(path, leaf, width: int, declared) -> int | None:
+    axes = declared_axes(path, leaf.ndim, declared)
     if axes is None:
         suffix = parameter_path(path)[-2:]
         if suffix in COMPOSITE_RESIDUAL_AXES:
@@ -43,17 +43,19 @@ def residual_width(variables) -> int:
     """The residual stream's width: the 'embed' side of the token embedding
     table. A wrapper's vision tower declares its own, which is not this one
     unless the widths happen to agree; a text-only run never reads it."""
+    declared = declarations(variables["params"])
     (width,) = {leaf.shape[1] for path, leaf in jax.tree_util.tree_flatten_with_path(variables["params"])[0]
-                if declared_axes(path, leaf.ndim) == ("vocab", "embed")}
+                if declared_axes(path, leaf.ndim, declared) == ("vocab", "embed")}
     return width
 
 
 def permuted(variables, order: np.ndarray):
     """`variables` with the residual stream's units in `order`."""
     width = len(order)
+    declared = declarations(variables["params"])
 
     def reorder(path, leaf):
-        axis = _residual_axis(path, leaf, width)
+        axis = _residual_axis(path, leaf, width, declared)
         if axis is None:
             return leaf
         grouped = (np.arange(leaf.shape[axis] // width)[:, None] * width + order).reshape(-1)
