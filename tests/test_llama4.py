@@ -91,8 +91,9 @@ def test_a_left_padded_row_scores_its_tokens_as_the_row_alone_cached_or_not():
     Tolerance 1e-5."""
     tensors = fixture("attention")
     real = jnp.asarray(tensors["hidden"])[:, :5]
-    padded = jnp.concatenate([jnp.zeros((1, 3, HIDDEN), real.dtype), real], axis=1)
-    metadata = AttentionMetadata(coordinates=coordinates(valid=jnp.arange(8)[None] >= 3))
+    padded = jnp.concatenate([jnp.zeros((real.shape[0], 3, HIDDEN), real.dtype), real], axis=1)
+    valid = jnp.broadcast_to(jnp.arange(8) >= 3, padded.shape[:2])
+    metadata = AttentionMetadata(coordinates=coordinates(valid=valid))
     for settings in ({"use_rope": True, "attention_chunk_size": 4}, {"use_rope": False}):
         module = attention(**settings)
         variables = attention_variables(tensors)
@@ -110,7 +111,8 @@ def test_the_temperature_reads_logical_positions_through_a_cache():
     0 onwards they are written at. Tolerance 1e-5."""
     tensors = fixture("attention")
     hidden = jnp.asarray(tensors["hidden"])[:, :6]
-    metadata = AttentionMetadata(coordinates=coordinates(positions=jnp.arange(6)[None] + 8))
+    metadata = AttentionMetadata(coordinates=coordinates(
+        positions=jnp.broadcast_to(jnp.arange(6) + 8, hidden.shape[:2])))
     module = attention(use_rope=False)
     variables = attention_variables(tensors)
     uncached = np.asarray(module.apply(variables, hidden, attention_metadata=metadata))

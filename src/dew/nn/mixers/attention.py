@@ -493,7 +493,8 @@ class CausalSelfAttention(nn.Module):
         # The tokens' places and documents: the caller's or a packed batch's, else none given
         # (`Coordinates`).
         tokens = coordinates_of(attention_metadata, B, S)
-        positions, segment_ids = tokens.positions, tokens.segments
+        # Each token's logical place (`Coordinates.places`); a cached call's default is its slot.
+        positions, segment_ids = tokens.positions if decode else tokens.places(), tokens.segments
         logical_positions = positions
         # The projections and the kernel's output carry the names a remat
         # policy saves or offloads (decoder_block.RESIDUALS).
