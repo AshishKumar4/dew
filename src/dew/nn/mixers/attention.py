@@ -101,15 +101,6 @@ def held_reads(index: jax.Array, positions: jax.Array) -> jax.Array:
     return jnp.where(jnp.asarray(positions) >= 0, index, 1)
 
 
-@logical_axes({
-    ("q_proj",): ("embed", "heads"),
-    ("k_proj",): ("embed", "kv"),
-    ("v_proj",): ("embed", "kv"),
-    # The output gate's own projection (`gate_projection='own'`) is per head
-    # like the query's; the longer suffix outranks the MLP's `gate_proj`.
-    ("self_attn", "gate_proj"): ("embed", "heads"),
-    ("o_proj",): ("attention", "embed"),
-})
 class _Masking(NamedTuple):
     """`CausalSelfAttention._masking`'s result: the kernel's operands and
     the visibility they are read under."""
@@ -125,6 +116,15 @@ class _Masking(NamedTuple):
     cursor: jax.Array | None
 
 
+@logical_axes({
+    ("q_proj",): ("embed", "heads"),
+    ("k_proj",): ("embed", "kv"),
+    ("v_proj",): ("embed", "kv"),
+    # The output gate's own projection (`gate_projection='own'`) is per head
+    # like the query's; the longer suffix outranks the MLP's `gate_proj`.
+    ("self_attn", "gate_proj"): ("embed", "heads"),
+    ("o_proj",): ("attention", "embed"),
+})
 class CausalSelfAttention(nn.Module):
     """Causal self-attention with grouped-query heads, rotary positions, qk
     RMSNorm and a fixed-size KV cache.
