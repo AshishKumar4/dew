@@ -205,13 +205,13 @@ def _Draws():
         device = host = 0
 
         def __torch_function__(self, func, types, args=(), kwargs=None):
-            result = func(*args, **(kwargs or {}))
+            tensor = func(*args, **(kwargs or {}))
             if func in drawing:
-                if isinstance(result, torchax.tensor.Tensor):
+                if isinstance(tensor, torchax.tensor.Tensor):
                     self.device += 1
                 else:
                     self.host += 1
-            return result
+            return tensor
 
     return Draws()
 
