@@ -30,7 +30,7 @@ def loss(q, k, v):
 step = jax.jit(jax.value_and_grad(loss, argnums=(0, 1, 2)))
 whole = step(q, k, v)
 mesh = jax.make_mesh((2,), ('data',))
-with jax.sharding.use_mesh(mesh):
+with jax.set_mesh(mesh):
     rows = NamedSharding(mesh, P('data'))
     arrays = [jax.device_put(x, rows) for x in (q, k, v)]
     text = step.lower(*arrays).as_text()
