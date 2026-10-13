@@ -204,7 +204,7 @@ def _memory_stages(
             derived[f"accepted_before_pack_{consumed}"] = fingerprint(
                 [list(identifier) for identifier, _ in rows]
             )
-            kept = Fields(stage.fields)
+            kept = Fields(stage.fields, max_length=None if stage.policy == "concat" else stage.seq_len)
             documents = tuple(kept.map(record(value, "packing document")) for _, value in rows)
             sizes = np.asarray([len(value[stage.fields[0]]) for value in documents], np.int64)
             if stage.policy == "first-fit":

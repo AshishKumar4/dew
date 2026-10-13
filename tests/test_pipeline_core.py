@@ -984,11 +984,11 @@ def test_an_indexed_pack_over_a_token_store_reads_its_planned_global_windows(tmp
     store = TokenFiles(str(tmp_path)).provision()
 
     def windows(pipeline, read):
-        rows = iterate(pipeline.pack(8, bins=2), read=read, loading=READ)
+        rows = iterate(pipeline.pack(10, bins=2), read=read, loading=READ)
         return [{name: np.asarray(value).tolist() for name, value in row.items() if name[:5] != "_dew_"}
                 for row in rows]
 
-    lowering = compile(Pipeline(store).pack(8, bins=2).batch(2), read="indexed", loading=READ).plan.lowering
+    lowering = compile(Pipeline(store).pack(10, bins=2).batch(2), read="indexed", loading=READ).plan.lowering
     assert lowering == "global"
     memory = Pipeline(Memory([{"text": document} for document in documents]))
     assert windows(Pipeline(store), "indexed") == windows(memory, "memory")

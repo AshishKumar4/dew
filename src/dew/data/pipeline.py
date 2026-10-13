@@ -693,7 +693,7 @@ class Dataset:
         """This dataset's records, or its batches where it batches: one pass,
         or the passes its `repeat` asks for, with training's random draws."""
         from dew.data.compile import _batch_steps, _diagnostic
-        from dew.data.dataset import unstacked
+        from dew.data.dataset import take_batch
         from dew.objectives.base import VALID_ROWS
 
         chain = self.chain()
@@ -708,8 +708,8 @@ class Dataset:
             for batch in reader:
                 for step in device:
                     batch = step(batch)
-                yield batch if batched else unstacked({name: value for name, value in batch.items()
-                                                      if name != VALID_ROWS})
+                yield batch if batched else take_batch(
+                    {name: value for name, value in batch.items() if name != VALID_ROWS}, 0)
         finally:
             reader.close()
 

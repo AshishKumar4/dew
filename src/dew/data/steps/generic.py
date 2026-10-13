@@ -11,6 +11,7 @@ import numpy as np
 
 from dew.data.dataset import Batch
 from dew.data.pipeline import Rejected
+from dew.data.tokens import validate_pack_lengths
 from dew.records import record
 
 
@@ -19,13 +20,17 @@ class Fields(grain.MapTransform):
     names: tuple[str, ...] | None = None
     rename: tuple[tuple[str, str], ...] = ()
     remove: tuple[str, ...] = ()
+    max_length: int | None = None
 
     def map(self, element: Batch) -> Batch:
         renamed = dict(self.rename)
         names = tuple(element) if self.names is None else self.names
         kept = {name: element[name] for name in names if name not in self.remove}
-        return {**{name: value for name, value in kept.items() if name not in renamed},
-                **{new: kept[old] for old, new in self.rename}}
+        selected = {**{name: value for name, value in kept.items() if name not in renamed},
+                    **{new: kept[old] for old, new in self.rename}}
+        if self.max_length is not None:
+            validate_pack_lengths(np.asarray([len(value) for value in selected.values()]), self.max_length)
+        return selected
 
 
 @dataclasses.dataclass(frozen=True)
