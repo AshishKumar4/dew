@@ -41,11 +41,11 @@ def test_the_tuner_finds_each_of_the_rules_nine_launches_in_its_lowering():
     g = jax.ShapeDtypeStruct((1, 64, 2), jnp.float32)
     h0 = jax.ShapeDtypeStruct((1, 2, 64, 64), jnp.float32)
 
-    interpreted = True
+    def rule(*args):
+        return fla_gdn.chunk_gated_delta_rule(*args, None, 0.125, 64, interpret=True)
 
     def both(q, k, v, g, beta, h0, do):
-        (_, final), pull = jax.vjp(lambda *a: fla_gdn.chunk_gated_delta_rule(*a, None, 0.125, 64, interpreted),
-                                   q, k, v, g, beta, h0)
+        (_, final), pull = jax.vjp(rule, q, k, v, g, beta, h0)
         return pull((do, jnp.zeros_like(final)))
 
     with tuning.launches():
