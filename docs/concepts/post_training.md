@@ -4,8 +4,8 @@ Post-training changes how a trained model behaves. Each method in Dew is an obje
 
 | Method | Supervision | Data | Objective |
 |---|---|---|---|
-| Supervised fine-tuning (SFT) | Example answers | `ChatMessages`, or rows with `text_roles` | `LMObjective(loss_role=Role.ASSISTANT)` |
-| Direct preference optimization (DPO) | A preferred and a rejected answer to one prompt | `PreferencePairs` | `DPOObjective` |
+| Supervised fine-tuning (SFT) | Example answers | `Chat`, or rows with `text_roles` | `LMObjective(loss_role=Role.ASSISTANT)` |
+| Direct preference optimization (DPO) | A preferred and a rejected answer to one prompt | `Preferences` | `DPOObjective` |
 | Group-relative policy optimization (GRPO) | A reward on answers the model samples | `Prompts` and `SampledRollout`, or a rollout scheduler | `GRPOObjective` |
 | Proximal policy optimization (PPO) | A reward, plus a learned critic | `EpisodeRollout` and `PPORollout` | `PPOObjective` |
 | Flow-GRPO | A reward on samples from a rectified-flow model | `FlowRollout` | `FlowGRPOObjective` |
@@ -27,9 +27,11 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from dew import Dataset, Trainer
+from dew import Trainer
 from dew.config import OptimConfig
-from dew.data import ByteTokenizer, Loading, PreferencePairs
+from dew.data.dataset import Loader
+from dew.data import ByteTokenizer, Loading
+from dew.config.data import PreferenceData
 from dew.data.chat import Role
 from dew.nn.backbones import CausalTransformer
 from dew.objectives.lm import LMObjective
@@ -55,7 +57,7 @@ response = tokenizer.encode(" He kicked it.")
 row = np.array(prompt + response, dtype=np.int32)
 roles = np.array([Role.USER] * len(prompt) + [Role.ASSISTANT] * len(response), dtype=np.int8)
 sft_batch = {"text": np.tile(row, (8, 1)), "text_roles": np.tile(roles, (8, 1))}
-sft_data = Dataset(train=lambda partition: itertools.repeat(sft_batch), val=None,
+sft_data = Loader(train=lambda partition: itertools.repeat(sft_batch), val=None,
                    records=8, batch=8)
 sft_objective = LMObjective(model, seq_len=len(row) - 1, variables=base,
                             loss_role=Role.ASSISTANT)
@@ -76,13 +78,14 @@ Trained 20 steps in 0:00:01: first step after 1.08 s, then 84.1 step/s
 A pair is two sequences with the same prompt, one followed by the chosen response and the other by the rejected one. The masks mark response tokens with 1.
 
 ```python
+from dew.data import Loading
+from dew.config.data import PreferenceData, loader
 rejected = tokenizer.encode(" He kicked kicked.")
 pair = {"chosen": prompt + response, "rejected": prompt + rejected,
         "chosen_mask": [0] * len(prompt) + [1] * len(response),
         "rejected_mask": [0] * len(prompt) + [1] * len(rejected)}
 width = max(len(pair["chosen"]), len(pair["rejected"]))
-pairs = PreferencePairs(records=(json.dumps(pair),) * 8, seq_len=width,
-                        loading=Loading(workers=0, threads=1, read_buffer=2)).load(batch=8)
+pairs = loader(PreferenceData(source=tuple(json.loads(row) for row in (json.dumps(pair),) * 8), seq_len=width), batch=8, read="memory", loading=Loading(workers=0, threads=1, read_buffer=2), validation_records=(4) * (8))
 dpo = DPOObjective(model, seq_len=width - 1, beta=0.1, variables=sft_state.variables)
 dpo_state = Trainer(dpo, OptimConfig(optimizer="adam", learning_rate=1e-3), key=jax.random.key(2)).fit(
     pairs, steps=10, log_every=5)
@@ -96,7 +99,7 @@ Trained 10 steps in 0:00:03: first step after 2.58 s, then 29.9 step/s
 10.5% of the wall time in steps, final loss 0.008948
 ```
 
-`PreferencePairs.seq_len` is the full row width; shorter rows are padded to it, and the objective scores one position fewer because of the next-token shift.
+`Preferences.seq_len` is the full row width; shorter rows are padded to it, and the objective scores one position fewer because of the next-token shift.
 
 ### Reinforcement learning with a reward function
 
@@ -117,7 +120,7 @@ def reward(data_source, completion, ground_truth, extra_info):
     return sum(character.isalpha() for character in completion) / 8
 
 
-rl_data = Dataset(train=lambda partition: itertools.repeat(prompt_batch), val=None,
+rl_data = Loader(train=lambda partition: itertools.repeat(prompt_batch), val=None,
                   records=8, batch=8)
 rl_objective = GRPOObjective(model, seq_len=len(story) + 7, beta=0.01,
                              variables=dpo_state.variables)
@@ -144,7 +147,7 @@ Each prompt produces four completions, and `SampledRollout.decode` turns each on
 
 ## Supervised fine-tuning
 
-An SFT conversation is a list of messages, each with a role. `ChatMessages` reads conversations from a Parquet file, a `.jsonl` file or a Hub dataset ID. Each row holds one list of messages in the column named by `column` (default `messages`). If the data has no such column but has a `prompt` column, as verl's layout does, `ChatMessages` reads the messages from `prompt`. Tool schemas, where a row has any, go in a `tools` column. One row in the verl layout:
+An SFT conversation is a list of messages, each with a role. `Chat` reads conversations from a Parquet file, a `.jsonl` file or a Hub dataset ID. Each row holds one list of messages in the column named by `column` (default `messages`). If the data has no such column but has a `prompt` column, as verl's layout does, `Chat` reads the messages from `prompt`. Tool schemas, where a row has any, go in a `tools` column. One row in the verl layout:
 
 ```text
 prompt = [
@@ -156,19 +159,18 @@ prompt = [
 | Field | Default | Meaning |
 |---|---|---|
 | `tokenizer` | required | Hub name or local path of a tokenizer with a chat template. |
-| `path` | `None` | Conversations: Parquet, `.jsonl` or a Hub dataset ID. |
+| `source` | required | Parquet, JSONL, a Hub Source or record dictionaries. |
 | `column` | `messages` | Column holding each row's messages. |
 | `split` | `train` | Split of a Hub dataset. |
-| `val_path` | `None` | A separate source of held-out conversations, scored as one pass. |
-| `val_split` | `None` | Split `val_path` is read at; `None` reads `split`. |
+| `validation` | `None` | An explicit held-out Source, Pipeline, HoldOut or named Split. |
 | `seq_len` | `256` | Prediction length `L`. |
-| `options` | `HFOptions()` | What `datasets.load_dataset` takes beside the ID and the split. |
+| `long` | `truncate` | Truncate, drop or chunk an over-length conversation. |
 
-The chat template is the rule for turning message boundaries, role headers and content into tokens, and each model is trained on its own format. Joining message strings by hand can change both the input and which tokens count toward the loss. `ChatMessages` also preserves tool calls, tool responses and tool schemas.
+The chat template is the rule for turning message boundaries, role headers and content into tokens, and each model is trained on its own format. Joining message strings by hand can change both the input and which tokens count toward the loss. `Chat` also preserves tool calls, tool responses and tool schemas.
 
 Dew renders the conversation one prefix at a time to give each token a role. For an assistant turn, it leaves the generation header out of the assistant span. It checks that each tokenized prefix matches the start of the longer render, and raises if the template changes earlier tokens. This check does not guarantee correct assistant masks for every chat template or string delimiter, so look at the rendered tokens and roles for some typical conversations before a real run. Conversations must start with a system or user message; one that starts with an assistant message is rejected.
 
-`ChatMessages.load(batch=B)` packs conversations into these arrays:
+`load(Chat(source=..., tokenizer=...), batch=B, read=...)` packs conversations into these arrays:
 
 | Field | Shape | Meaning |
 | --- | --- | --- |
@@ -183,9 +185,9 @@ Train with `LMObjective(model, L, loss_role=Role.ASSISTANT)`. The objective shif
 
 DPO compares how much the policy prefers one answer over the other with how much a fixed reference policy does. The policy is the model being updated; the reference is a snapshot of its starting parameters. For each prompt, the chosen and rejected sequences hold the prompt followed by their own completion, and completion masks mark answer tokens with 1 and prompt tokens with 0.
 
-`PreferencePairs` takes either a Parquet `path` or a tuple of JSON strings in `records`, not both. Each row has `chosen`, `rejected`, `chosen_mask` and `rejected_mask`, and each mask is as long as its ID list. Without a mask, every token counts as a completion token. Dew does not guess from the text where the prompt ends, so give masks for prompt-and-answer data.
+`Preferences(source=...)` accepts a source URL, a typed Source or record dictionaries. Each row has `chosen`, `rejected`, `chosen_mask` and `rejected_mask`; each mask is as long as its ID list. Without a mask, every token counts as a completion token. Give explicit masks for prompt-and-answer data.
 
-A loaded batch holds `input_ids` and `completion_mask`, both `[B, 2, S]`. Index 0 of the middle axis is the chosen sequence and index 1 the rejected one. Shorter rows are right-padded to `S` (`pad_id`, default 0) with mask weight zero; rows that are too long raise. `PreferencePairs.seq_len` is the full row width `S`, so use `DPOObjective(model, seq_len=S - 1)`.
+A loaded batch holds `input_ids` and `completion_mask`, both `[B, 2, S]`. Index 0 of the middle axis is the chosen sequence and index 1 the rejected one. Shorter rows are right-padded to `S` (`pad_id`, default 0) with mask weight zero; rows that are too long raise. `Preferences.seq_len` is the full row width `S`, so use `DPOObjective(model, seq_len=S - 1)`.
 
 The objective sums the next-token log-probabilities over each completion and applies the log-sigmoid preference loss. `beta` (default 0.1) must be positive; it scales the comparison between policy and reference. Validation measures the perplexity of the chosen answers under the policy, which alone does not measure how often the preferred answer wins or how good the responses are.
 
@@ -201,7 +203,8 @@ import numpy as np
 
 from dew import Trainer
 from dew.config import OptimConfig
-from dew.data import Loading, PreferencePairs
+from dew.data import Loading
+from dew.config.data import PreferenceData, loader
 from dew.nn.backbones import CausalTransformer
 from dew.objectives.rl import DPOObjective
 
@@ -212,10 +215,8 @@ rows = [
      "chosen_mask": [0, 0, 1, 1], "rejected_mask": [0, 0, 1, 1]},
 ]
 row_width = 4
-spec = PreferencePairs(records=tuple(json.dumps(row) for row in rows * 4),
-                       seq_len=row_width, pad_id=0,
-                       loading=Loading(workers=0, threads=1, read_buffer=2))
-data = spec.load(batch=8)
+spec = PreferenceData(source=rows * 4, seq_len=row_width, pad_id=0)
+data = loader(spec, batch=8, read="memory", loading=Loading(workers=0))
 model = CausalTransformer(vocab_size=8, emb_features=16, num_layers=1,
                           num_heads=2, mlp_features=32, max_seq_len=row_width)
 objective = DPOObjective(model, seq_len=row_width - 1, beta=0.1)
@@ -254,10 +255,11 @@ Messages go through the Hugging Face tokenizer's chat template, and `thinking` s
 
 ```python
 import json
-from dew.data import Loading, Prompts
+from dew.data import Loading
+from dew.config.data import PromptData, loader
 
-data = Prompts(tokenizer="byte", records=(json.dumps({"prompt": "dew"}),) * 8,
-               max_prompt_len=8, loading=Loading(workers=0)).load(batch=8)
+data = loader(PromptData(source=({"prompt": "dew"},) * 8, tokenizer="byte", max_prompt_len=8),
+            batch=8, read="memory", loading=Loading(workers=0))
 ```
 
 The prompt loader produces left-padded `prompt` IDs of shape `[B, P]` and `prompt_length` of shape `[B]`, where `P` is `max_prompt_len` (default 128). A prompt that is too long is cut from the front, so its end is kept. The metadata columns are stored as fixed-width UTF-8 byte arrays, and `SampledRollout` turns them back into strings for the reward:
@@ -518,7 +520,7 @@ import jax
 import numpy as np
 import optax
 from dew import Trainer
-from dew.data import Dataset
+from dew.data.dataset import Loader
 from dew.objectives.rl import EpisodeRollout, PPOObjective, PPORollout, ValueHead
 
 sys.path.insert(0, str(Path(dew.__file__).parents[2] / "tests"))
@@ -533,7 +535,7 @@ episodes = EpisodeRollout(objective.policy(objective.init(key)), Harness(), veri
                           groups=4, sampling=SAMPLING)
 trainer = Trainer(objective, optax.sgd(.05), key=key,
                   rollout=PPORollout(objective, episodes, gamma=.97, lam=.9))
-data = Dataset(train=lambda partition: itertools.repeat({
+data = Loader(train=lambda partition: itertools.repeat({
     "task_id": np.arange(jax.device_count(), dtype=np.int32)}),
     val=None, records=None, batch=jax.device_count())
 state = trainer.fit(data, steps=2, log_every=1)
@@ -563,7 +565,7 @@ import jax
 import numpy as np
 from dew import Field, InputSpec, Trainer
 from dew.config import OptimConfig
-from dew.data import Dataset
+from dew.data.dataset import Loader
 from dew.diffusion.presets import Flow
 from dew.nn.backbones import SimpleDiT
 from dew.objectives.rl import FlowGRPOObjective, FlowRollout
@@ -579,7 +581,7 @@ def brightness(images, batch):
 
 rollout = FlowRollout(objective, brightness, groups=4, steps=5, train_steps=2)
 batch = {"image": np.zeros((2, 4, 4, 1), dtype=np.uint8)}
-data = Dataset(train=lambda partition: itertools.repeat(batch), val=None, records=2, batch=2)
+data = Loader(train=lambda partition: itertools.repeat(batch), val=None, records=2, batch=2)
 trainer = Trainer(objective, OptimConfig(optimizer="adam", learning_rate=1e-3), key=jax.random.key(0), rollout=rollout)
 state = trainer.fit(data, steps=2, log_every=1)
 print(int(state.updates))
@@ -597,7 +599,7 @@ On several hosts, every rank takes part in generation. Rewards run on rank zero.
 
 ## Stage chains
 
-`recipes.chain.Recipe(model, optimizer, key, stages, directory, batch=8, layout=Layout())` trains one decoder through a tuple of `Stage` values, in Python only. The type of a stage's dataset decides its objective: `ChatMessages` trains SFT, `PreferencePairs` trains DPO and `Prompts` trains GRPO. The stage name only labels its directory, so a name such as `"sft"` does not infer masks or convert data.
+`recipes.chain.Recipe(model, optimizer, key, stages, directory, batch=8, layout=Layout())` trains one decoder through a tuple of `Stage` values, in Python only. The type of a stage's dataset decides its objective: `Chat` trains SFT, `Preferences` trains DPO and `Prompts` trains GRPO. The stage name only labels its directory, so a name such as `"sft"` does not infer masks or convert data.
 
 In new stage directories, each stage starts a fresh optimizer and step counter from the previous stage's final policy variables. DPO and GRPO freeze that starting policy as their reference. If a stage directory already exists, the stage can restore its checkpoint instead, so a fresh chain needs distinct stage names and a new run directory. `Recipe.run` returns every stage's final state, oldest first, so a long chain can hold a lot of memory.
 
