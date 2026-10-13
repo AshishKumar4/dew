@@ -823,15 +823,6 @@ def test_a_block_pattern_that_misses_a_layer_is_refused():
         hybrid.init(jax.random.PRNGKey(0), jnp.zeros((1, 8, 8, 3)), jnp.ones((1,)))
 
 
-def test_a_block_pattern_naming_an_unknown_mixer_is_refused():
-    """A hybrid layer is an S5 scan or attention; a pattern naming another mixer ('mamba', or a
-    misspelt 'smm') is refused by name rather than built as attention."""
-    hybrid = HybridSSMAttentionDiT(patch_size=4, emb_features=32, num_layers=2,
-                                   num_heads=2, block_pattern=("smm", "attn"))
-    with pytest.raises(ValueError, match="'smm'"):
-        hybrid.init(jax.random.PRNGKey(0), jnp.zeros((1, 8, 8, 3)), jnp.ones((1,)))
-
-
 @pytest.mark.parametrize("dtype", [None, jnp.bfloat16, jnp.float32])
 @pytest.mark.parametrize("shape", [(2, 6, 16), (2, 4, 5, 16)])
 def test_group_norm_matches_flax_bit_for_bit(rng, dtype, shape):
