@@ -1,57 +1,47 @@
-"""Data for a run: dataset specs, the `Dataset` value they load, and tokenizers.
+"""Datasets for training and evaluation: a store, and the steps that read it.
 
-A dataset spec is a frozen dataclass, with an alias in `dew.registry.datasets`,
-and its `load(batch=)` returns a `Dataset` of batch iterators:
-
-    data = TFDSImages(path="data/oxford_flowers102/2.1.1", image_size=128).load(batch=32)
-    steps = epochs * data.steps_per_epoch
-
-Each spec here reads one kind of store: prepared TFDS, Hugging Face,
-ArrayRecord shards, url tables or video trees. Which corpus to read, with its
-name, bucket path and caption wording, is up to the recipe. For example,
-`recipes/diffusion/train.py` defines its own in `CORPORA`
-(`oxford-flowers102`, `cc12m`, the LAION sets and others).
-
-Importing this package defines every dataset without importing the heavy
-dependencies. A spec imports cv2, tensorflow_datasets, HF `datasets`, the AV
-readers or `transformers` only when it uses them, so a host that only needs
-the token loaders never loads the image stack, and the reverse.
+A store (`Files`, `Hub`, `TFDS`, `Memory`, or a Grain, Hugging Face or
+PyTorch dataset brought in) is a `Dataset`, and every verb returns a new
+one: `map`, `random_map`, `filter` and `flat_map` per record, `shuffle`,
+`repeat`, `pack` and `batch` across records, `mix` and `holdout` across
+datasets. The stage libraries (`images`, `video`, `audio`, `text`, `chat`,
+`prompts`, `preferences`) are factories of the functions those verbs take.
+`Trainer.fit` reads a dataset as the run's mesh shares it.
 """
 
-from .chat import ChatMessages, Role
-from .dataset import (
-                      Batch,
-                      Checkpointable,
-                      Corpus,
-                      DataPartition,
-                      DataPhase,
-                      Dataset,
-                      DatasetSpec,
-                      Loading,
-                      Ramp,
-                      Reader,
-                      Stage,
-)
-from .images import ArrayRecordImages, HFImages, ImageDataset, TFDSImages
-from .preferences import IDS_KEY, MASK_KEY, PreferencePairs
-from .processors import AutoAudioProcessor
-from .prompts import Prompts
-from .providers import HubDataset, PreparedTFDS, load
-from .sources.hf import HFOptions
-from .sources.text import HubText, TokenCorpus
-from .sources.tfds import TFDSOptions
-from .streaming import OnlineImages, OnlineVideos
+from . import audio, chat, images, preferences, presets, prompts, text, video
+from .chat import Role
+from .dataset import Batch, Loading
+from .pipeline import Dataset, Rejected, concat, mix
+from .sources import TFDS, Files, Hub, Memory, Source, Torch, from_grain, from_hf, from_iter, from_torch
 from .text import ByteTokenizer, HFTokenizer
-from .tokens import TokenWindows
-from .video import LocalVideos, VideoDataset
 
-__all__ = ["IDS_KEY", "MASK_KEY", "ArrayRecordImages",
-           "AutoAudioProcessor",
-           "Batch", "ByteTokenizer", "ChatMessages", "Checkpointable",
-           "Corpus", "DataPartition", "DataPhase", "Dataset",
-           "DatasetSpec",
-           "HFImages", "HFOptions", "HFTokenizer", "HubDataset", "HubText", "ImageDataset",
-           "Loading", "LocalVideos", "OnlineImages", "OnlineVideos",
-           "PreferencePairs", "PreparedTFDS", "Prompts", "Ramp", "Reader", "Role",
-           "Stage",
-           "TFDSImages", "TFDSOptions", "TokenCorpus", "TokenWindows", "VideoDataset", "load"]
+__all__ = [
+    "TFDS",
+    "Batch",
+    "ByteTokenizer",
+    "Dataset",
+    "Files",
+    "HFTokenizer",
+    "Hub",
+    "Loading",
+    "Memory",
+    "Rejected",
+    "Role",
+    "Source",
+    "Torch",
+    "audio",
+    "chat",
+    "concat",
+    "from_grain",
+    "from_hf",
+    "from_iter",
+    "from_torch",
+    "images",
+    "mix",
+    "preferences",
+    "presets",
+    "prompts",
+    "text",
+    "video",
+]
