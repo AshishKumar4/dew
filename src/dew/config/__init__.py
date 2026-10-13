@@ -637,7 +637,15 @@ class TrainerConfig:
     False disables this save; cadenced, ranked and preemption saves keep their own policy.
     """
     accumulation: int = 1
-    """The number of micro-batches per optimizer update."""
+    """The number of steps per optimizer update."""
+    split: int | None = None
+    """The microbatches each step's batch is read in, its rows split evenly.
+
+    None lets the trainer plan it from the compiled step's memory: the
+    fewest that fit the devices before it recomputes anything, at the least
+    recomputation that fits (`Trainer.compile`). A step's tokens and the
+    update's stay as configured either way; only the microbatch shrinks.
+    """
     batch_ramp: Ramp | None = None
     """A ramp that grows `batch_size` over the run's first records instead of starting there.
 
@@ -713,6 +721,8 @@ class TrainerConfig:
                 raise ValueError("--trainer.batch-ramp grows row batches and cannot use token budgets")
         elif self.batch_size is None or self.batch_size < 1:
             raise ValueError("--trainer.batch-size must be positive without token budgets")
+        if self.split is not None and self.split < 1:
+            raise ValueError("--trainer.split reads each step's batch in that many microbatches, at least 1")
         if self.publish and (self.wandb is None or not self.checkpoint_final):
             raise ValueError("trainer.publish requires trainer.wandb and trainer.checkpoint_final")
         if self.steps is not None and self.epochs is not None:
@@ -1253,14 +1263,14 @@ class RunConfig:
                         processes=jax.process_count()), 0)
 
             agreed("run metadata", record_run)
-            # The trainer holds mesh, layout, accumulation, dynamic_scale and
-            # profile; prepare_process read the process fields, and the rest
+            # The trainer holds mesh, layout, accumulation, split, dynamic_scale
+            # and profile; prepare_process read the process fields, and the rest
             # are fit's arguments or built the checkpoints and the tracker.
             state = Trainer(
                 objective, self.optim, key=trainer.key,
                 mesh=trainer.mesh, layout=trainer.layout, accumulation=trainer.accumulation,
-                dynamic_scale=trainer.dynamic_scale, checkpoints=checkpoints, tracker=tracker,
-                rollout=rollout, profile=trainer.profile, lower_for=trainer.lower_for,
+                split=trainer.split, dynamic_scale=trainer.dynamic_scale, checkpoints=checkpoints,
+                tracker=tracker, rollout=rollout, profile=trainer.profile, lower_for=trainer.lower_for,
             ).fit(
                 dataset, steps=steps, tokens=trainer.total_tokens,
                 log_every=trainer.log_every,

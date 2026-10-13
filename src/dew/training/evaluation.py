@@ -6,6 +6,7 @@ import contextlib
 import dataclasses
 import sys
 import time
+import types
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import Any
@@ -24,7 +25,17 @@ from dew.coordination import (
     from_every_process,
 )
 from dew.data.dataset import Closeable, DataPartition, Reader, rows_of
-from dew.objectives.base import VALID_ROWS, Batch, Effects, Loss, Metric, Objective, Step, Variables
+from dew.objectives.base import (
+    VALID_ROWS,
+    Batch,
+    Effects,
+    Loss,
+    Metric,
+    Objective,
+    Step,
+    TrainingScalar,
+    Variables,
+)
 
 from .distributed import MeshSpec, shard_batch
 
@@ -502,3 +513,58 @@ def _close_source(held) -> None:
             error = failure
     if primary is None:
         agree_process_phase(error, phase="iterator cleanup")
+
+
+class MetricScores[Statistics, Additions](Mapping):
+    """A fit's scores keyed by the metric objects, objective scalars and
+    `(split, metric)` pairs that `best=` and `stop=` name."""
+
+    def __init__(
+        self,
+        metrics: Sequence[Metric],
+        scores: Mapping[str, float],
+        objective: Objective[Statistics, Additions],
+    ):
+        self.objective = objective
+        self.metrics = tuple(metrics) + tuple(objective.scalars[name] for name in ('loss', *objective.shown)
+                                              if name == 'loss' or f'train/{name}' in scores)
+        self.scores = scores
+
+    def __getitem__(self, metric):
+        split = 'val'
+        if isinstance(metric, tuple):
+            split, metric = metric
+        if isinstance(metric, TrainingScalar):
+            if metric.owner is not self.objective:
+                raise KeyError("training score belongs to another objective")
+            return self.scores[f'train/{metric.name}']
+        if (
+            isinstance(metric, types.MethodType)
+            and metric.__name__ == "loss"
+            and metric.__self__ is self.objective
+        ):
+            return self.scores['train/loss']
+        if isinstance(metric, str):
+            if any(metric == f'{name}/{declared.name}' for name in {key.split('/')[0] for key in self.scores}
+                   for declared in self.metrics):
+                raise KeyError("index declared evaluation scores by metric object")
+            return self.scores[metric]
+        for declared in self.metrics:
+            if declared is metric:
+                return self.scores[f'{split}/{declared.name}']
+        raise KeyError("the score refers to a metric not passed to fit")
+
+    def __iter__(self):
+        for name in self.scores:
+            split, _, label = name.partition('/')
+            metric = next((metric for metric in self.metrics if metric.name == label), None)
+            yield (
+                name
+                if metric is None
+                else metric
+                if split == "val" or isinstance(metric, TrainingScalar)
+                else (split, metric)
+            )
+
+    def __len__(self):
+        return len(self.scores)
