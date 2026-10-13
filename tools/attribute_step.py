@@ -220,11 +220,12 @@ def attribute_time(trace: Path, steps: int, model_flops: float | None,
         by_part[part][direction] += us
         by_kind[kind] += us
         by_part_kind[part][kind] += us
-        # The compiler's FLOPs over the measured time: the work done. XProf's normalized rate
-        # scales them by bf16's peak over the op's precision's, its own guess of that precision
-        # (an fp32 dot as non-tensor-core arithmetic, though it runs as TF32), which put the later Qwen3.5-0.8B step's
-        # GEMMs at 1.127 of the A100's peak.
-        gflops = float(row.get("model_flop_rate") or 0)
+        # The compiled FLOPs over the measured time: the work done, counted from the op itself as the
+        # step's FLOP count counts it. XProf's own rates are no measure of it: its model rate put a
+        # cuBLAS weight-gradient GEMM of C6's Qwen3.5-0.8B at 550 TFLOP/s on an A100 (4x its work), and its
+        # normalized rate guesses each op's precision (the later Qwen3.5-0.8B step's GEMMs at 1.127 of the peak).
+        calls = float(row.get("occurrences") or 0) / steps
+        gflops = known.flops * calls / (us * 1e-6) / 1e9 if known is not None and us else 0.0
         # XProf's HBM bandwidth is GiB/s over the op's own time, so the op moves that much a step.
         hbm_mib = float(row.get("hbm_bw") or 0) * us * 1e-6 * 1024
         record = {"us": round(us, 1), "part": part, "direction": direction, "kind": kind,

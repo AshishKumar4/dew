@@ -359,6 +359,9 @@ class HloInstruction:
     """The traced names of the parameters it reads, through bitcasts, copies
     and tuple elements: a jitted step's own are its arguments' paths, such
     as `current.opt_state[0].mu['head']`."""
+    flops: float
+    """The matmul and convolution work of one call, a fusion's included, as
+    the step's count (`hlo_flops`) counts it."""
 
 
 def hlo_instructions(text: str | Iterable[str]) -> dict[str, HloInstruction]:
@@ -367,22 +370,25 @@ def hlo_instructions(text: str | Iterable[str]) -> dict[str, HloInstruction]:
     parser the FLOP count reads (`hlo_flops`). Each computation's body is
     gathered once, so the fusions that call one share its sets."""
     computations, _ = _parse(text)
-    bodies: dict[str, tuple[frozenset[str], frozenset[str]]] = {}
+    bodies: dict[str, tuple[frozenset[str], frozenset[str], float]] = {}
 
-    def fused(name: str, seen: frozenset[str] = frozenset()) -> tuple[frozenset[str], frozenset[str]]:
+    def fused(name: str, seen: frozenset[str] = frozenset()) -> tuple[frozenset[str], frozenset[str], float]:
         if name in bodies:
             return bodies[name]
         computation = computations.get(name)
         if computation is None or name in seen:
-            return frozenset(), frozenset()
+            return frozenset(), frozenset(), 0.0
         ops = {instruction.op for instruction in computation.instructions.values()}
         names = {each for instruction in computation.instructions.values() for each in instruction.traced}
+        flops = sum(_instruction_flops(instruction, computation.shapes)
+                    for instruction in computation.instructions.values())
         for instruction in computation.instructions.values():
             for called in _CALLS.findall(instruction.attributes):
-                inner_ops, inner_names = fused(called, seen | {name})
+                inner_ops, inner_names, inner_flops = fused(called, seen | {name})
                 ops |= inner_ops
                 names |= inner_names
-        bodies[name] = frozenset(ops), frozenset(names)
+                flops += inner_flops
+        bodies[name] = frozenset(ops), frozenset(names), flops
         return bodies[name]
 
     def parameters(computation: _Computation, operand: str) -> frozenset[str]:
@@ -401,12 +407,13 @@ def hlo_instructions(text: str | Iterable[str]) -> dict[str, HloInstruction]:
             target = _TARGET.search(instruction.attributes)
             calls = _CALLS.findall(instruction.attributes) if instruction.op == 'fusion' else []
             called = [fused(each) for each in calls]
-            ops = called[0][0] if len(called) == 1 else frozenset().union(*(each for each, _ in called))
-            names = frozenset(instruction.traced).union(*(each for _, each in called))
+            ops = called[0][0] if len(called) == 1 else frozenset().union(*(each for each, _, _ in called))
+            names = frozenset(instruction.traced).union(*(each for _, each, _ in called))
             reads = frozenset().union(*(parameters(computation, each) for each in instruction.operands))
+            flops = _instruction_flops(instruction, computation.shapes) + sum(each for _, _, each in called)
             found[name] = HloInstruction(instruction.op, target.group(1) if target else '',
                                          tuple(instruction.operands), ops, instruction.recomputed, names,
-                                         reads)
+                                         reads, flops)
     computations.clear()
     return found
 
