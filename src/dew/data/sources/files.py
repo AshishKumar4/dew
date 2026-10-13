@@ -103,8 +103,11 @@ def _fragment_rows(fragment) -> int:
 
 def _open_lines(fs: AbstractFileSystem, path: str):
     compression = infer_compression(path.lower())
-    file = fs.open(path, "rb", compression=compression)
-    return io.BufferedReader(file) if compression == "zstd" else file
+    if compression == "zstd":
+        from zstandard import ZstdDecompressor
+
+        return io.BufferedReader(ZstdDecompressor().stream_reader(fs.open(path, "rb")))
+    return fs.open(path, "rb", compression=compression)
 
 
 def _seek_lines(file: BinaryIO, offset: int) -> None:
@@ -784,5 +787,3 @@ class _LineIterator(grain.DatasetIterator):
 
     def close(self) -> None:
         self.file.close()
-
-

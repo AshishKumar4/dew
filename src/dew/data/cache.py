@@ -726,5 +726,3 @@ class _CachedIterator(grain.DatasetIterator):
 
     def metrics(self) -> CacheStats:
         return self.writer.metrics()
-
-
