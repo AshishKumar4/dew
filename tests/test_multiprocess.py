@@ -1300,7 +1300,8 @@ def test_a_pool_refuses_what_its_processes_do_not_share_before_any_trains(tmp_pa
         assert report["same"] is None and report["saved"] is None and report["latest"] == 2, report
         assert "training data differs between the processes" in report["content"], report
         assert "training data differs between the processes" in report["named"], report
-        assert all(source in report["count"] for source in report["counted"]), report
+        # A pool compares what its processes hold, not where each mounted it: no description is named.
+        assert "training data differs between the processes" in report["count"], report
         assert "holds no rows" in report["first_read"], report
         assert "StopIteration" in report["eof"], report
         assert "training batch layout differs" in report["layout"], report

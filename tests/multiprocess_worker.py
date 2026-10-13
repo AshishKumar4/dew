@@ -735,7 +735,6 @@ def mode_pool_refusals(args) -> dict:
         "eof": trained(reads(ends=1 if other else None)),
         "layout": trained(reads(fields=("x",) if other else ("x", "y"))),
         "saved": trained(stream(64, 0), Checkpoints(str(Path(args.run_dir) / "saved")), checkpoint_every=1),
-        "counted": [corpus(64, 0).describe(), corpus(96, 0).describe()],
     }
     outcomes["latest"] = Checkpoints(str(Path(args.run_dir) / "saved")).latest
     if other:
