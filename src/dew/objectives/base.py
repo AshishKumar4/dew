@@ -423,6 +423,27 @@ def _ruled_jvp(primals, tangents):
                                     zip(jax.tree.leaves(rule), jax.tree.leaves(moved), strict=True))
 
 
+
+def pairwise_sum(values: jax.Array, axes: tuple[int, ...]) -> jax.Array:
+    """The sum of `values` over `axes` by pairwise summation: neighbours added in pairs, then those
+    sums in pairs, to one. Its rounding error grows with the log of the count, as numpy's sum's
+    does, where XLA's one reduction over a loss's every axis accumulates one term at a time on a
+    CPU: over the 6144 squares of a small JEPA loss that left the mean a float32 ulp from float64,
+    ten times numpy's float32 distance."""
+    if not jnp.issubdtype(values.dtype, jnp.floating):
+        return jnp.sum(values, axes)
+    kept = [axis for axis in range(values.ndim) if axis not in axes]
+    flat = jnp.transpose(values, (*kept, *axes)).reshape(*(values.shape[axis] for axis in kept), -1)
+    # A narrower float adds in float32 and returns in its own dtype, as `jnp.sum` does.
+    flat = flat.astype(jnp.promote_types(flat.dtype, jnp.float32))
+    while flat.shape[-1] > 1:
+        if flat.shape[-1] % 2:
+            flat = jnp.concatenate([flat, jnp.zeros((*flat.shape[:-1], 1), flat.dtype)], axis=-1)
+        flat = flat[..., 0::2] + flat[..., 1::2]
+    total = flat[..., 0] if flat.shape[-1] else jnp.zeros(flat.shape[:-1], flat.dtype)
+    return total.astype(values.dtype)
+
+
 class Objective(ABC, Generic[Loss, Effects]):
     """Defines what is learned: the parameters, the loss and what evaluation produces."""
 
@@ -744,18 +765,19 @@ class Objective(ABC, Generic[Loss, Effects]):
         number of entries summed. When the batch is an evaluation batch with
         `VALID_ROWS`, a repeat row has zero weight in both, so a loss and every
         batch-wide term computed through this count each real record once. Without
-        `VALID_ROWS`, as in training, this is `jnp.sum` and the size.
+        `VALID_ROWS`, as in training, this is the sum (`pairwise_sum`) and the size.
         """
         dtype = jnp.promote_types(values.dtype, jnp.float32)
         axes = (tuple(range(values.ndim)) if axis is None
                 else (axis,) if isinstance(axis, int) else tuple(axis))
         if VALID_ROWS not in batch:
-            return Ratio(jnp.sum(values, axes), jnp.asarray(math.prod(values.shape[a] for a in axes), dtype))
+            count = math.prod(values.shape[a] for a in axes)
+            return Ratio(pairwise_sum(values, axes), jnp.asarray(count, dtype))
         held = (rows,) if isinstance(rows, int) else rows
         shape = [values.shape[a] if a in held else 1 for a in range(values.ndim)]
         real = Objective.row_weights(batch, math.prod(values.shape[a] for a in held)).reshape(shape) > 0
         # Selected rather than multiplied, so a repeat holding a NaN still adds nothing.
-        return Ratio(jnp.sum(jnp.where(real, values, jnp.zeros((), values.dtype)), axes),
+        return Ratio(pairwise_sum(jnp.where(real, values, jnp.zeros((), values.dtype)), axes),
                      jnp.sum(jnp.broadcast_to(real, values.shape).astype(dtype), axes))
 
     @staticmethod
