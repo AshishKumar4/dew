@@ -36,6 +36,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import math
+import numbers
 import re
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
@@ -108,14 +109,14 @@ def _rank(owner: str, rank: object) -> int:
 
 def _alpha(owner: str, alpha: object) -> float:
     """`alpha` as a float, refused unless a finite number."""
-    if isinstance(alpha, bool) or not isinstance(alpha, (int, float)) or not math.isfinite(alpha):
+    if isinstance(alpha, bool) or not isinstance(alpha, numbers.Real) or not math.isfinite(alpha):
         raise ValueError(f"{owner}: alpha must be a finite number, not {alpha!r}")
     return float(alpha)
 
 
 def _dropout(owner: str, dropout: object) -> float:
     """`dropout` as a float, refused outside [0, 1)."""
-    if isinstance(dropout, bool) or not isinstance(dropout, (int, float)) or not 0 <= dropout < 1:
+    if isinstance(dropout, bool) or not isinstance(dropout, numbers.Real) or not 0 <= float(dropout) < 1:
         raise ValueError(f"{owner}: dropout must be in [0, 1), not {dropout!r}")
     return float(dropout)
 
@@ -1008,7 +1009,7 @@ def _diffusers_configs(tensors: Mapping[str, np.ndarray], metadata: str | None,
         component, _, rest = key.partition(".")
         module, _, factor = rest.rpartition(".lora_")
         if factor == "B.weight":
-            ranks.setdefault(component, {})[module] = tensor.shape[1]
+            ranks.setdefault(component, {})[module] = _rank(f"{where} {component}.{module}", tensor.shape[1])
     return {component: _Config(next(iter(found.values())), float(next(iter(found.values()))),
                                found, {}, rslora=False, dropout=0.0)
             for component, found in ranks.items()}
