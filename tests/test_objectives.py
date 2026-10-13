@@ -162,6 +162,27 @@ def test_a_supplied_gradient_is_what_the_trainer_steps_with():
     np.testing.assert_allclose(stepped["params"]["w"], expected, rtol=1e-6)
 
 
+def test_a_loss_mean_is_as_exact_as_numpys_float32_mean():
+    """Each of 64 rows' mean over 6144 squares, a small JEPA loss's count, within the float64 gate:
+    one reduction over every element left such a sum a float32 step from the correctly rounded one,
+    and the JEPA loss a float32 ulp from float64 on some weights, several times numpy's distance."""
+    from reference_error import assert_as_exact_as_the_reference
+
+    squares = np.square(np.random.default_rng(0).normal(1.2, 1.0, size=(64, 6144))).astype(np.float32)
+    ratio = Objective.row_mean(jnp.asarray(squares), {}, axis=1)
+    rows = np.asarray(ratio.total / ratio.mass)
+    assert_as_exact_as_the_reference(rows, squares.mean(axis=1), squares.astype(np.float64).mean(axis=1),
+                                     "row means")
+    # Each row's sum is the correctly rounded one, compiled too, and its derivative is the plain
+    # sum's, ones.
+    correct = squares.astype(np.float64).sum(axis=1).astype(np.float32)
+    np.testing.assert_array_equal(np.asarray(ratio.total), correct)
+    compiled = jax.jit(lambda x: Objective.row_mean(x, {}, axis=1).total)(jnp.asarray(squares))
+    np.testing.assert_array_equal(np.asarray(compiled), correct)
+    gradient = jax.grad(lambda x: Objective.row_mean(x, {}).total)(jnp.asarray(squares))
+    np.testing.assert_array_equal(np.asarray(gradient), np.ones_like(squares))
+
+
 def test_row_weights_count_the_real_rows_of_a_pass_and_every_row_of_training():
     """The last batch of a pass over five records at four a batch holds one
     real record and three repeats, weighted 1 and 0; a training batch carries
