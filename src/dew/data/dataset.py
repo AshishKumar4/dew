@@ -17,6 +17,7 @@ import bisect
 import contextlib
 import dataclasses
 import functools
+import hashlib
 import itertools
 import json
 import logging
@@ -574,11 +575,12 @@ class Loader:
     `{"input_ids", "attention_mask"}` dict under "text", and a token window
     is int32 ids under "text".
 
-    Whether a run can checkpoint its position depends on the iterator.
-    Grain-backed iterators have `get_state` and `set_state`, a fetch-as-you-go
-    stream has neither, and host transforms forward the pair. A run over a stream
-    without them must train with `checkpoint_every=None` and is refused
-    otherwise. An indexed global-order position resumes on any
+    Whether a run resumes its data position depends on the iterator.
+    Grain-backed iterators have `get_state` and `set_state`, and host
+    transforms forward the pair. A stream with neither trains, and a resume
+    of its checkpoint is refused, unless its reader declares that it reads
+    the same batches each time it opens (`replayed`), which positions it by
+    replay. An indexed global-order position resumes on any
     partition, over one corpus or a weighted mixture. A stream that batches
     its own records reports its share's own position, and `dew.checkpoints`
     resumes it only on a reader of that share.
@@ -641,10 +643,10 @@ Dew's own envelope is bytes, and Grain reports a JSON object, which
 class Checkpointable(Protocol):
     """A data stream that can report where it stopped and resume from there.
 
-    Grain's iterators satisfy this, and so does `GlobalStream`. `Trainer.fit`
-    refuses a run that asks for checkpoints over a stream without these
-    methods. The state itself is opaque here; `dew.position` tells which of its
-    two kinds a checkpoint holds.
+    Grain's iterators satisfy this, and so does `GlobalStream`, and so does
+    a stream a reader declares to replay (`replayed`). The state itself is
+    opaque here; `dew.position` tells which of its two kinds a checkpoint
+    holds.
     """
 
     def get_state(self) -> Position: ...
@@ -667,6 +669,115 @@ class Identified(Protocol):
     endless: bool
 
     def identity(self) -> str: ...
+
+
+type _Held = Mapping[str, _Held] | Sequence[_Held] | str | bytes | np.ndarray | np.generic | float | None
+"""What a batch's fields hold, as `batch_digest` reads them."""
+
+
+def batch_digest(batch: Batch) -> str:
+    """A digest of what `batch` holds: its fields by name, their values'
+    dtypes, shapes and every element, its strings, bytes and scalars, and
+    the type of any other object."""
+    digest = hashlib.blake2b(digest_size=16)
+
+    def visit(value: _Held) -> None:
+        if isinstance(value, Mapping):
+            digest.update(b"{%d" % len(value))
+            for key in sorted(value, key=repr):
+                digest.update(repr(key).encode())
+                visit(value[key])
+        elif isinstance(value, (list, tuple)):
+            digest.update(b"[%d" % len(value))
+            for element in value:
+                visit(element)
+        elif isinstance(value, str):
+            digest.update(b"s" + value.encode())
+        elif isinstance(value, bytes):
+            digest.update(b"b" + value)
+        elif value is None or isinstance(value, (bool, int, float, complex)):
+            digest.update(b"v" + repr(value).encode())
+        else:
+            array = np.asarray(value)
+            digest.update(f"{array.dtype}{array.shape}".encode())
+            if array.dtype != object:
+                digest.update(np.ascontiguousarray(array).data)
+            elif array.ndim:
+                for element in array.flat:
+                    visit(element)
+            else:
+                # An object NumPy holds whole, whose text may name its address: its type alone.
+                digest.update(type(value).__qualname__.encode())
+
+    visit(batch)
+    return digest.hexdigest()
+
+
+class Replayed(Forwarding):
+    """The batches of a stream declared to read the same batches each time
+    `reopen()` opens it, positioned by how many it has read and a digest of
+    the last.
+
+    A resume reopens the stream and reads that many again. The digest of the
+    batch at the position is a guard, not a proof: a stream whose batch there
+    differs is refused, and one that agrees there and differs elsewhere, one
+    drawing on a process-wide RNG or the clock after that batch, passes and
+    resumes on other data. Hashing every batch costs the reader about a
+    millisecond a megabyte."""
+
+    def __init__(self, reopen: Callable[[], Iterator[Batch]], source: Iterator[Batch] | None = None):
+        self._reopen = reopen
+        self._source: Iterator[Batch] | None = iter(reopen()) if source is None else source
+        self._read, self._last = 0, None
+
+    def __iter__(self):
+        return self
+
+    def __next__(self) -> Batch:
+        if self._source is None:
+            raise StopIteration
+        batch = next(self._source)
+        self._read += 1
+        self._last = batch_digest(batch)
+        return batch
+
+    def get_state(self) -> dict[str, int | str | None]:
+        return {"read": self._read, "last": self._last}
+
+    def set_state(self, state: Mapping[str, object]) -> None:
+        read, last = state.get("read"), state.get("last")
+        if not isinstance(read, int) or read < 0 or (read and not isinstance(last, str)):
+            raise ValueError(f"a replayed stream's position is the count it read and the last one's "
+                             f"digest, not {dict(state)!r}")
+        self.close()
+        self._source, self._read, self._last = iter(self._reopen()), 0, None
+        if read:
+            _log.info("replaying %d batches of %s to resume", read, stream_identity(self._source))
+        for skipped in range(read - 1):
+            try:
+                next(self._source)
+            except StopIteration:
+                raise ValueError(f"the stream ran out after {skipped} batches, short of the {read} "
+                                 f"a resume reads again") from None
+            self._read += 1
+        if read:
+            next(self)
+            if self._last != last:
+                raise ValueError(
+                    f"this stream does not replay deterministically: its batch {read} reads back "
+                    f"other data than before the checkpoint. Make it Checkpointable "
+                    f"(get_state and set_state) or read it through dew.data")
+
+
+def replayed(reader: Reader) -> Reader:
+    """`reader`, declared to read the same batches each time it opens, as a
+    script restarted from the top reads them: its streams are positioned by
+    replay (`Replayed`), so a run over it resumes where it stopped."""
+
+    def opened(partition: DataPartition) -> Iterator[Batch]:
+        return Replayed(lambda: reader(partition))
+
+    return opened
 
 
 def stream_identity(stream: Iterator[Batch] | None) -> str:

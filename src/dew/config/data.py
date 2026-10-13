@@ -18,7 +18,7 @@ from dew.data.pipeline import Configured, HostStep, MapBatch, Mixture, Objective
 if TYPE_CHECKING:
     from dew.data.cache import Cache
     from dew.data.generation import Generation
-from dew.data import images, video
+from dew.data import audio, images, video
 from dew.data.sources.base import Read, ShardManifest, Source, _consumed
 from dew.data.steps.chat import ConfigurePrompt, PreferencePair, RenderChat
 from dew.data.steps.generic import Formatting
@@ -443,6 +443,8 @@ class VideoData:
     def pipelines(self) -> tuple[Pipeline, Pipeline | None, tuple[HostStep, ...]]:
         from pathlib import PurePosixPath
 
+        from dew.data.processors import AutoAudioProcessor
+        from dew.data.sources.av_utils import FPS
         from dew.data.sources.files import Files
 
         source = _source(self.source, split=self.split, format="files")
@@ -457,14 +459,20 @@ class VideoData:
             )
         prefix = Pipeline(source).map(_VideoRow(self.caption)).stages
         train, held = _branches(source, self.validation, split=self.split, prefix=prefix)
-        audio = video.audio(self.audio_model)
-        # A listed clip that does not decode is an error, as it always was here, so the run knows its count.
-        decoder = dataclasses.replace(video.decode_clip(
-            self.frames, size=self.frame_size, audio_padding=self.audio_padding,
-            sample_rate=audio.processor.sampling_rate), rejects=False)
-        train = train.random_map(decoder).map(audio)
-        held = None if held is None else held.random_map(decoder).map(audio)
-        return train, held, (EncodeCaptions(),)
+        # The sound at the rate the audio model reads, `audio_padding` frames either side of the frames.
+        rate = AutoAudioProcessor(tensor_type="np", modelname=self.audio_model).sampling_rate
+        padding = self.audio_padding / FPS
+
+        def clips(chain: Pipeline) -> Pipeline:
+            # A listed clip too short or that does not decode is an error, as it always was here, so the
+            # run knows its count.
+            pick = dataclasses.replace(video.pick_clip(self.frames / FPS, margin=padding), rejects=False)
+            frames = dataclasses.replace(video.decode(self.frames, fps=FPS, size=self.frame_size),
+                                         rejects=False)
+            sound = dataclasses.replace(audio.decode(rate, context=padding), rejects=False)
+            return chain.random_map(pick).map(frames, sound).remove_columns("mp4", "clip")
+
+        return clips(train), None if held is None else clips(held), (EncodeCaptions(),)
 
 
 @dataclasses.dataclass(frozen=True)
