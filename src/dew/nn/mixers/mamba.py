@@ -234,7 +234,7 @@ class _StepProjection(nn.Module):
         kernel = self.param(
             'kernel', lambda key, shape: jax.random.uniform(key, shape, jnp.float32, -bound, bound),
             (self.rank, self.features))
-        bias = self.param('bias', _inverse_softplus_step, (self.features,))
+        bias = self.param('bias', inverse_softplus_step, (self.features,))
         dtype = self.dtype if self.dtype is not None else raw.dtype
         widened = jnp.matmul(raw.astype(dtype), kernel.astype(dtype), precision=self.precision)
         wide = at_least_fp32(widened.dtype)
@@ -247,11 +247,13 @@ def _log_state_index(key, shape):
     return jnp.broadcast_to(jnp.log(jnp.arange(1, shape[1] + 1, dtype=jnp.float32)), shape)
 
 
-def _inverse_softplus_step(key, shape):
-    """`init_mamba_weights`' dt_proj bias (modeling_mamba.py:349-357) at the
-    reference config's defaults: a step log-uniform between time_step_min
-    0.001 and time_step_max 0.1, floored at time_step_floor 1e-4, then the
-    inverse of softplus so the forward's softplus recovers it."""
+def inverse_softplus_step(key, shape):
+    """Mamba's timestep bias, `init_mamba_weights`' dt_proj bias
+    (modeling_mamba.py:349-357) and `init_mamba2_weights`' dt_bias
+    (modeling_mamba2.py:434-442) at the reference configs' defaults: a step
+    log-uniform between time_step_min 0.001 and time_step_max 0.1, floored at
+    time_step_floor 1e-4, then the inverse of softplus so the forward's
+    softplus recovers it."""
     step = jnp.exp(jax.random.uniform(key, shape) * (math.log(0.1) - math.log(0.001)) + math.log(0.001))
     step = jnp.maximum(step, 1e-4)
     return step + jnp.log(-jnp.expm1(-step))

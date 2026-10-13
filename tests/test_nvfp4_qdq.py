@@ -8,15 +8,13 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from interop_support import assert_same_stored_tensors
+from interop_support import NVFP4_QDQ_CASES, assert_same_stored_tensors, nvfp4_qdq_case
 from reference_error import assert_as_exact_as_the_reference
 
 from dew.interop import Pretrained, codecs
 from dew.interop.safetensors_io import read_weights
 from dew.nn.fake_quant import E2M1_MIDPOINTS
-from dew.training.quantization import NVFP4Input, _nvfp4_divide, nvfp4_input_qdq
-
-FIXTURE = Path(__file__).parent / "fixtures" / "codecs" / "nvfp4_qdq"
+from dew.training.quantization import InputQuantizer, _nvfp4_divide, nvfp4_input_qdq
 
 
 def test_the_quantizer_divider_is_ieee_fp32_across_its_scale_ranges():
@@ -42,11 +40,9 @@ def test_the_quantizer_divider_is_ieee_fp32_across_its_scale_ranges():
                                   (numerators / denominators).view(np.uint32))
 
 
-@pytest.fixture(scope="module", params=["unrounded", "e4m3"])
+@pytest.fixture(scope="module", params=NVFP4_QDQ_CASES)
 def case(request):
-    directory = FIXTURE / request.param
-    with np.load(directory / "reference.npz") as reference:
-        return request.param, directory, dict(reference)
+    return request.param, *nvfp4_qdq_case(request.param)
 
 
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16], ids=["fp32", "bf16"])
@@ -57,7 +53,7 @@ def test_the_checkpoint_input_quantizer_matches_the_librarys_forward_bit_for_bit
         if not key.endswith("/inputs"):
             continue
         stem = key.removesuffix("/inputs")
-        spec = NVFP4Input(float(reference[stem + "/global"].reshape(())), kind == "e4m3")
+        spec = InputQuantizer.nvfp4(float(reference[stem + "/global"].reshape(())), kind == "e4m3")
         actual = jax.jit(lambda x, spec=spec: nvfp4_input_qdq(x, spec))(jnp.asarray(value, dtype))
         expected = reference[stem + ("/qdq" if dtype == jnp.float32 else "/qdq_bf16")]
         np.testing.assert_array_equal(np.asarray(actual, np.float32).view(np.uint32),
@@ -88,7 +84,7 @@ def test_input_qdq_uses_the_training_paths_straight_through_gradient(case):
     kind, _, reference = case
     key = next(key for key in reference if key.endswith("/inputs"))
     stem = key.removesuffix("/inputs")
-    spec = NVFP4Input(float(reference[stem + "/global"].reshape(())), kind == "e4m3")
+    spec = InputQuantizer.nvfp4(float(reference[stem + "/global"].reshape(())), kind == "e4m3")
     x = jnp.asarray(reference[key])
     cotangent = jnp.arange(x.size, dtype=x.dtype).reshape(x.shape) / x.size
     gradient = jax.jit(jax.grad(lambda values: jnp.sum(nvfp4_input_qdq(values, spec) * cotangent)))(x)
@@ -98,7 +94,7 @@ def test_input_qdq_uses_the_training_paths_straight_through_gradient(case):
 @pytest.mark.parametrize("scale", [0, -1, np.inf, np.nan])
 def test_an_invalid_global_scale_is_refused_before_compilation(scale):
     with pytest.raises(ValueError, match="positive and finite"):
-        NVFP4Input(scale, e4m3_scale=False)
+        InputQuantizer.nvfp4(scale, e4m3_scale=False)
 
 
 def test_an_input_scale_missing_from_the_file_cannot_silently_drop_qdq(case, tmp_path):
