@@ -308,10 +308,10 @@ Keyed = dict[tuple[tokamax.Op, Hashable], tuple[tokamax.BoundArguments, Autotuni
 """Launches by their op and cache key, each with its timings (`_keyed`)."""
 
 
-def _keyed(data) -> Keyed:
-    """Each of `data`'s `(launch, timings)` by its op and cache key, which binds the launch's
-    arguments to this checkout's signature of its kernel (ValueError where they do not)."""
-    return {(ba.op, ba.autotuning_cache_key): (ba, timings) for ba, timings in data}
+def _keyed(timed) -> Keyed:
+    """Each of the `(launch, timings)` pairs `timed` by its op and cache key, which binds the
+    launch's arguments to this checkout's signature of its kernel (ValueError where they do not)."""
+    return {(ba.op, ba.autotuning_cache_key): (ba, timings) for ba, timings in timed}
 
 
 def _kernel_launches(launches: Keyed):
