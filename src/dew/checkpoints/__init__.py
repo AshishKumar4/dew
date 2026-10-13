@@ -280,9 +280,17 @@ def _kept(step: int, metrics: Mapping[str, float], custom: Mapping) -> Kept:
 
 def frozen_entries(step_directory: str) -> list[str]:
     """The `FROZEN_STORE` entries the step at `step_directory` records,
-    relative to its run directory, which `dew.io.publish` carries beside it."""
-    metadata = epath.Path(step_directory) / "_CHECKPOINT_METADATA"
-    custom = (json.loads(metadata.read_text()).get("custom_metadata") or {}) if metadata.exists() else {}
+    relative to its run directory, which `dew.io.publish` carries beside it.
+
+    Orbax reads the step's metadata, opening no manager. A directory with
+    none, which is no Orbax step, records no entry; one whose metadata does
+    not read raises."""
+    if not (epath.Path(step_directory) / "_CHECKPOINT_METADATA").exists():
+        return []
+    try:
+        custom = ocp.metadata.get_step_metadata(step_directory).custom_metadata or {}
+    except ValueError as error:
+        raise ValueError(f"{step_directory}'s step metadata does not read") from error
     digests = {digest for names in (custom.get("frozen") or {}).values() for digest in names.values()}
     return [f"{FROZEN_STORE}/{digest}" for digest in sorted(digests)]
 
@@ -812,19 +820,19 @@ class _RankedSteps(preservation.PreservationPolicy):
 
     def should_preserve(self, checkpoints: Sequence[preservation.PolicyCheckpointInfo], *,
                         context: preservation.PreservationContext) -> Sequence[bool]:
-        held: set[int] = set()
-        full = [
-            checkpoint
-            for checkpoint in checkpoints
-            if not (checkpoint.metrics or {}).get("checkpoint/weights_only", 0)
-        ]
-        held.update(
-            checkpoint.step
-            for checkpoint in sorted(full, key=lambda checkpoint: checkpoint.step)[
-                -self.checkpoints.keep.latest :
-            ]
-            if self.checkpoints.keep.latest
-        )
+        keep = self.checkpoints.keep
+        ordered = sorted(checkpoints, key=lambda checkpoint: checkpoint.step)
+        # Orbax's selectors over the steps in order: the latest among those a
+        # resume reads (no weights-only step) and every `every`-th step.
+        full = [checkpoint for checkpoint in ordered
+                if not (checkpoint.metrics or {}).get("checkpoint/weights_only", 0)]
+        held = {checkpoint.step for checkpoint, kept in zip(
+            full, preservation.LatestN(n=keep.latest).should_preserve(full, context=context), strict=True)
+            if kept and keep.latest}
+        if keep.every:
+            held.update(checkpoint.step for checkpoint, kept in zip(
+                ordered, preservation.EveryNSteps(interval_steps=keep.every).should_preserve(
+                    ordered, context=context), strict=True) if kept)
         groups: dict[str, list[tuple[float, int]]] = {}
         limits = self.checkpoints._rank_limits
         for checkpoint in checkpoints:
@@ -836,12 +844,10 @@ class _RankedSteps(preservation.PreservationPolicy):
                     )
         for name, scores in groups.items():
             held.update(step for _, step in sorted(scores)[:limits.get(name, 1)])
-        keep = self.checkpoints.keep
         previous = None
         interval = duration(keep.interval) if isinstance(keep.interval, str) else keep.interval
-        for checkpoint in sorted(checkpoints, key=lambda checkpoint: checkpoint.step):
-            if keep.every and checkpoint.step % keep.every == 0:
-                held.add(checkpoint.step)
+        # Orbax's EveryNSeconds takes whole seconds; Keep.interval is a timedelta, kept exact here.
+        for checkpoint in ordered:
             if interval and (previous is None or checkpoint.time - previous >= interval):
                 held.add(checkpoint.step)
                 previous = checkpoint.time
