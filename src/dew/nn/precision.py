@@ -135,6 +135,34 @@ def compensated_add(left, right):
     return total, dropped + left_lo + right_lo
 
 
+def compensated_sum(values: jax.Array, axes: tuple[int, ...]) -> jax.Array:
+    """The sum of `values` over `axes`, rounded once: one XLA reduction whose accumulator is a
+    double-float `(hi, lo)` pair combined by `compensated_add`, so it partitions as any reduction
+    does, and what the roundings dropped is added back at the end.
+
+    One plain reduction over a loss's every axis rounds as it goes; on 6144 JEPA squares it left the
+    sum one float32 step above the correctly rounded one, and the loss a float32 ulp from float64,
+    where numpy's float32 mean of the same squares was correctly rounded. A narrower float adds in
+    float32 and returns in its own dtype, as `jnp.sum` does; an integer sum is `jnp.sum`'s. The
+    derivative is `jnp.sum`'s."""
+    if not jnp.issubdtype(values.dtype, jnp.floating):
+        return jnp.sum(values, axes)
+    return _compensated_sum(values, tuple(axes))
+
+
+@functools.partial(jax.custom_jvp, nondiff_argnums=(1,))
+def _compensated_sum(values: jax.Array, axes: tuple[int, ...]) -> jax.Array:
+    wide = values.astype(jnp.promote_types(values.dtype, jnp.float32))
+    zero = jnp.zeros((), wide.dtype)
+    hi, lo = jax.lax.reduce((wide, jnp.zeros_like(wide)), (zero, zero), compensated_add, axes)
+    return (hi + lo).astype(values.dtype)
+
+
+@_compensated_sum.defjvp
+def _compensated_sum_jvp(axes: tuple[int, ...], primals: tuple[jax.Array],
+                         tangents: tuple[jax.Array]) -> tuple[jax.Array, jax.Array]:
+    return _compensated_sum(primals[0], axes), jnp.sum(tangents[0], axes)
+
 @functools.partial(jax.custom_jvp, nondiff_argnums=(1,))
 def rounded_operand(x: jax.Array, dtype: Dtype) -> jax.Array:
     """The value `x` takes in `dtype`, held in `x`'s own dtype, with a
