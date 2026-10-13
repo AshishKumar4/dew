@@ -133,12 +133,15 @@ class StepCompiled:
     """A training step compiled for a new batch shape, the remat it compiled
     under, which is the model's own or a stronger rung the trainer moved to
     because the step did not fit, the links of the tensor and sequence axes
-    the mesh splits, by axis name, and the arithmetic of the check that it
-    fits this process's devices (`dew.training.memory.memory_record`)."""
+    the mesh splits, by axis name, the arithmetic of the check that it
+    fits this process's devices (`dew.training.memory.memory_record`), and
+    its plan: the microbatches it reads each batch in, their rows, and every
+    compile the search made (`dew.training.memory.Probe`)."""
     seconds: float
     remat: JSON
     links: Mapping[str, AxisLink]
     memory: JSON = None
+    plan: JSON = None
 
 
 @dataclasses.dataclass(frozen=True)
