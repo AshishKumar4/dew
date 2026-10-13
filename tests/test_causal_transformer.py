@@ -502,8 +502,9 @@ def test_a_post_norm_block_is_residual_plus_normed_sublayer_output(rng):
     sublayers, and against the pre-norm block on the same weights, which
     normalises the input instead and lands elsewhere."""
     from dew.nn.backbones.causal_transformer import RMSNorm
-    from dew.nn.backbones.decoder_block import BlockWiring, DecoderBlock, GatedMLP
+    from dew.nn.backbones.decoder_block import BlockWiring, DecoderBlock
     from dew.nn.mixers import AttentionMixer, MixerContext
+    from dew.nn.mlp import GatedMLP
 
     features, ids = 32, tokens(rng)
     x = jax.random.normal(rng, (*ids.shape, features)) * 3

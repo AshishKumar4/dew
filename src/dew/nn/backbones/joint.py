@@ -20,9 +20,9 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.attention import LayerNorm, RMSNorm, scaled_dot_product_attention
-from dew.nn.backbones.decoder_block import GatedMLP
 from dew.nn.blocks import Modulation
 from dew.nn.flops import MissingFlopsCount, attention_flops, matching_lengths, projection_flops
+from dew.nn.mlp import GatedMLP
 from dew.nn.rope import rotate
 from dew.nn.sharding import logical_axes
 
