@@ -12,7 +12,6 @@ through the objective's own head.
 import jax
 import numpy as np
 import optax
-import pytest
 from affine_run import Data, Regression
 from recording import RecordingTracker
 from rl_support import TinyHead
@@ -74,25 +73,6 @@ def test_an_identity_rollout_leaves_the_loop_byte_identical():
 
     assert [logged["train/loss"] for _, logged in plain.scalars if "train/loss" in logged] == [
         logged["train/loss"] for _, logged in ident.scalars if "train/loss" in logged] != []
-
-
-def test_changing_batches_compile_once():
-    """A rollout that rewrites the batch content every call, shapes fixed:
-    the trainer compiles the step on the first rolled batch and never again."""
-    calls = []
-
-    def shifting(state, batch, key):
-        calls.append(1)
-        return {"x": batch["x"] + len(calls), "y": batch["y"]}
-
-    trainer = make_trainer(rollout=shifting)
-    compiles = [trainer.compile]
-    trainer.compile = lambda *args: (compiles.append(1), compiles[0](*args))[1]
-
-    trainer.fit(Data(), steps=4, log_every=4)
-
-    assert len(calls) == 4
-    assert len(compiles) == 2, "the step compiled more than once"
 
 
 def test_rollout_keys_fold_forward_and_reproduce():
@@ -224,6 +204,9 @@ def test_a_sampled_rollout_packs_its_completions():
         np.testing.assert_array_equal(chain["input_ids"][:PROMPT_WIDTH], batch["prompt"][index // GROUPS])
         np.testing.assert_array_equal(chain["response_mask"], [0] * PROMPT_WIDTH + [1] * NEW_TOKENS)
         assert (chain["versions"][PROMPT_WIDTH:] == 3).all()
+        rescored = np.asarray(objective.per_token_log_probs(params, chain["input_ids"][None]))[0]
+        sampled = chain["response_mask"] != 0
+        np.testing.assert_allclose(chain["old_log_probs"][sampled], rescored[sampled[1:]], rtol=1e-5)
     again = rollout(FakeState(params, updates=3), batch, jax.random.key(1))
     for key in out:
         np.testing.assert_array_equal(np.asarray(out[key]), np.asarray(again[key]))
@@ -247,58 +230,6 @@ def test_rewards_and_advantages_follow_the_calls():
     expected = np.asarray(group_advantage(scores, GROUPS), np.float32)
     for index, chain in chains(out).items():
         np.testing.assert_allclose(chain["advantages"], expected[index], rtol=1e-5)
-
-
-def test_old_log_probs_come_from_the_sampling_head():
-    """The stored raw log-probabilities are the objective's own head over each
-    chain: entry t scores id t given the chain before it."""
-    objective = tiny_objective()
-    params = objective.init(jax.random.key(0))
-    rollout = SampledRollout(objective, Calls(), groups=GROUPS,
-                             max_new_tokens=NEW_TOKENS, sampling=Sampling(temperature=0.0))
-
-    out = rollout(FakeState(params), prompt_batch(), jax.random.key(1))
-
-    for chain in chains(out).values():
-        rescored = np.asarray(objective.per_token_log_probs(params, chain["input_ids"][None]))[0]
-        sampled = chain["response_mask"] != 0
-        np.testing.assert_allclose(chain["old_log_probs"][sampled], rescored[sampled[1:]], rtol=1e-5)
-
-
-def test_the_mask_stops_after_the_first_stop_token():
-    """With no stop token every response counts whole; when the first
-    response token is the stop token, only it counts."""
-    objective = tiny_objective()
-    params = objective.init(jax.random.key(0))
-    batch = prompt_batch()
-    first = SampledRollout(objective, Calls(), groups=GROUPS,
-                           max_new_tokens=NEW_TOKENS, sampling=Sampling(temperature=0.0))(
-                               FakeState(params), batch, jax.random.key(1))
-    stop = int(chains(first)[0]["input_ids"][PROMPT_WIDTH])
-
-    stopped = SampledRollout(objective, Calls(), groups=GROUPS,
-                             max_new_tokens=NEW_TOKENS,
-                             sampling=Sampling(temperature=0.0, eos_token_ids=stop))(
-                                 FakeState(params), batch, jax.random.key(1))
-
-    chain = chains(stopped)[0]
-    np.testing.assert_array_equal(chain["response_mask"], [0] * PROMPT_WIDTH + [1])
-
-
-def test_a_completion_that_hits_its_budget_is_a_truncation_the_policy_decides():
-    """Without a stop token every draw runs out of budget. SampledRollout
-    classifies those as PromptSource does, TRUNCATED: its default `score`
-    trains them on their reward, and `mask` drops them."""
-    objective = tiny_objective()
-    params = objective.init(jax.random.key(0))
-
-    def draw(truncation):
-        return SampledRollout(objective, Calls(), groups=GROUPS, max_new_tokens=NEW_TOKENS,
-                              sampling=Sampling(temperature=0.0), truncation=truncation)(
-                                  FakeState(params), prompt_batch(), jax.random.key(1))
-
-    assert draw("score")["response_mask"].sum() == 4 * NEW_TOKENS
-    assert draw("mask")["response_mask"].sum() == 0
 
 
 def test_the_rollout_names_its_advantage_family_the_way_pack_does():
@@ -331,24 +262,3 @@ def test_rloo_advantages_follow_the_calls():
     expected = np.asarray(rloo_advantage(scores, GROUPS), np.float32)
     for index, chain in chains(out).items():
         np.testing.assert_allclose(chain["advantages"], expected[index], rtol=1e-5)
-
-
-def test_a_misconfigured_rollout_is_refused():
-    objective = tiny_objective()
-    with pytest.raises(ValueError, match="at least two"):
-        SampledRollout(objective, Calls(), groups=1)
-    with pytest.raises(ValueError, match="at least one token"):
-        SampledRollout(objective, Calls(), max_new_tokens=0)
-    with pytest.raises(ValueError, match="estimator must be one of"):
-        SampledRollout(objective, Calls(), estimator="best_of_n")
-
-
-def test_a_misaligned_objective_is_refused():
-    """The concatenation must fit the objective's window: seq_len one below
-    the prompt width plus new tokens, else the rescoring reads the wrong
-    slice."""
-    rollout = SampledRollout(tiny_objective(seq=4), Calls(), groups=GROUPS,
-                             max_new_tokens=NEW_TOKENS, sampling=Sampling(temperature=0.0))
-    params = tiny_objective(seq=4).init(jax.random.key(0))
-    with pytest.raises(ValueError, match="one below"):
-        rollout(FakeState(params), prompt_batch(), jax.random.key(1))

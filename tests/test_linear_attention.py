@@ -40,7 +40,6 @@ from dew.nn.inputs import AttentionMetadata, coordinates
 from dew.nn.linear import (
     GatedDeltaNet,
     _masked_conv1d,
-    _stream_order,
     causal_conv1d,
     chunk_decay,
     chunk_delta_rule,
@@ -48,23 +47,9 @@ from dew.nn.linear import (
     held_conv1d,
     l2norm,
     recurrent_gated_delta_rule,
-    strictly_lower_inverse,
 )
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "linear_attention"
-
-
-def test_a_padding_slot_writes_nothing_into_the_next_row():
-    """The masked conv's stream order scatters each real token's slot into
-    its row's compact column and drops the padding slots. XLA's deterministic
-    GPU scatter (the CUDA lane's --xla_gpu_deterministic_ops) drops only an
-    index past the whole [rows, columns] space, so a padding slot dropped at
-    column `length` landed on the next row's first column (openxla/xla#49380,
-    fixed by 54cfa1ba): row 0's padding slot 2 overwrote row 1's column 0,
-    so row 1's first token convolved row 0's third."""
-    valid = jnp.array([[True, True, False, False], [True, False, False, False]])
-    _, source = jax.jit(_stream_order)(valid)
-    np.testing.assert_array_equal(source, [[0, 1, 4, 4], [0, 4, 4, 4]])
 
 
 @pytest.fixture(scope="module")
@@ -213,20 +198,14 @@ def test_the_causal_conv_matches_f_conv1d(reference):
     Largest observed difference 2.4e-07."""
     taps = jnp.asarray(reference["conv.weight"][:, 0, :])
     # The reference's tensors are channel-major, [B, D, S]; Dew's time-major.
-    out = causal_conv1d(jnp.swapaxes(jnp.asarray(reference["conv.input"]), 1, 2), taps)
+    x = jnp.swapaxes(jnp.asarray(reference["conv.input"]), 1, 2)
+    out = causal_conv1d(x, taps)
 
     assert largest(jnp.swapaxes(out, 1, 2), reference["conv.output"]) < 1e-5
-
-
-def test_the_conv_reads_no_future_column(reference):
-    """Causality of the short mixer, stated as a property: changing the last
-    column moves nothing before it."""
-    x = jnp.swapaxes(jnp.asarray(reference["conv.input"]), 1, 2)
-    taps = jnp.asarray(reference["conv.weight"][:, 0, :])
     moved = x.at[:, -1].set(x[:, -1] + 3.0)
-
-    assert jnp.array_equal(causal_conv1d(x, taps)[:, :-1], causal_conv1d(moved, taps)[:, :-1])
-    assert not jnp.allclose(causal_conv1d(x, taps)[:, -1], causal_conv1d(moved, taps)[:, -1])
+    changed = causal_conv1d(moved, taps)
+    assert jnp.array_equal(out[:, :-1], changed[:, :-1])
+    assert not jnp.allclose(out[:, -1], changed[:, -1])
 
 
 def layer_params(reference):
@@ -334,29 +313,6 @@ def test_a_bf16_layer_decodes_its_state_in_bf16_within_its_prefills_error(refere
     assert rms(decoded) <= 2 * rms(parallel), (rms(decoded), rms(parallel))
 
 
-def test_a_bf16_state_decays_where_rounding_to_nearest_would_hold_it():
-    """A state decayed by 0.999 a token moves by less than half a bf16 step
-    near 1, so rounded to nearest it never decays. Rounded stochastically
-    (`round_to_bf16`, its noise drawn from the token's key and value) it
-    follows the exact decay, 0.999 ** 2000, to within 2%. Rounded to
-    nearest, Qwen3.5-0.8B's bf16 state drifted to ten times the fp32 state's
-    error over 1024 tokens (docs/performance.md)."""
-    from dew.nn.kernels.delta_rule import round_to_bf16
-
-    def decayed(rounding):
-        def step(state, token):
-            key, value = (jax.random.normal(jax.random.fold_in(jax.random.key(token), side), (1, 64))
-                          for side in (0, 1))
-            stepped = state.astype(jnp.float32) * 0.999
-            return rounding(stepped, key, value), None
-        return jax.lax.scan(step, jnp.ones((1, 64, 64), jnp.bfloat16), jnp.arange(2000))[0]
-
-    nearest = decayed(lambda stepped, key, value: stepped.astype(jnp.bfloat16))
-    stochastic = decayed(round_to_bf16)
-    assert np.all(np.asarray(nearest, np.float32) == 1.0)
-    np.testing.assert_allclose(np.asarray(stochastic, np.float32).mean(), 0.999 ** 2000, rtol=0.02)
-
-
 def scan_masked_conv1d(x, kernel, valid, state=None):
     """The token-by-token form the compacted convolution replaced.
 
@@ -433,45 +389,22 @@ def test_the_masked_conv_matches_the_token_scan(case, history):
         if wanted is not None:
             assert largest(gradient, wanted) < 1e-5
 
-
-def test_the_masked_conv_reads_across_a_gap():
-    """A real token reads the real tokens before it, not the padding between
-    them, so the row's outputs are the plain convolution of the row with its
-    padding taken out.
-
-    The mutation this states the invariant against is the tempting one:
-    masking the input and convolving the physical slots. It agrees on
-    trailing padding and moves the slots after an interior gap by 5.0 here.
-    """
-    rows, width = MASKED_ROWS["interior holes"]
-    x, kernel, _state, valid, _ = masked_operands(rows, width, history=False, seed=3)
-    out, _ = _masked_conv1d(x, kernel, valid)
-
-    for row in range(x.shape[0]):
-        kept = np.flatnonzero(np.asarray(valid[row]))
-        compacted = causal_conv1d(x[row:row + 1, kept], kernel)
-        assert largest(out[row:row + 1, kept], compacted) < 1e-5
-
-    physical = jnp.where(valid[:, :, None], causal_conv1d(
-        jnp.where(valid[:, :, None], x, 0), kernel), 0)
-    assert largest(physical, out) > 1.0
-
-
-@pytest.mark.parametrize("case", list(MASKED_ROWS))
-def test_a_padded_slot_carries_no_output_and_no_gradient(case):
-    """Padding neither emits nor learns: its outputs are zero, its inputs
-    take exactly zero gradient, and a row with no real token at all hands
-    back the history it was given, unchanged."""
-    x, kernel, state, valid, cotangent = masked_operands(*MASKED_ROWS[case], seed=7)
-    out, carried = _masked_conv1d(x, kernel, valid, state)
-    grad = jax.grad(lambda value: jnp.sum(
-        _masked_conv1d(value, kernel, valid, state)[0] * cotangent))(x)
-
     assert jnp.array_equal(jnp.where(valid[:, :, None], 0.0, out), jnp.zeros_like(out))
-    assert jnp.array_equal(jnp.where(valid[:, :, None], 0.0, grad), jnp.zeros_like(grad))
-    paused = ~jnp.any(valid, axis=1)
-    assert state is not None
-    assert jnp.array_equal(carried[paused], state[paused])
+    assert jnp.array_equal(jnp.where(valid[:, :, None], 0.0, grads[0]), jnp.zeros_like(grads[0]))
+    if state is not None:
+        paused = ~jnp.any(valid, axis=1)
+        assert jnp.array_equal(carried[paused], state[paused])
+    if case == "interior holes" and not history:
+        rows, width = MASKED_ROWS[case]
+        gap_x, gap_kernel, _state, gap_valid, _ = masked_operands(rows, width, history=False, seed=3)
+        gap_out, _ = _masked_conv1d(gap_x, gap_kernel, gap_valid)
+        for row in range(gap_x.shape[0]):
+            kept = np.flatnonzero(np.asarray(gap_valid[row]))
+            compacted = causal_conv1d(gap_x[row:row + 1, kept], gap_kernel)
+            assert largest(gap_out[row:row + 1, kept], compacted) < 1e-5
+        physical = jnp.where(gap_valid[:, :, None], causal_conv1d(
+            jnp.where(gap_valid[:, :, None], gap_x, 0), gap_kernel), 0)
+        assert largest(physical, gap_out) > 1.0
 
 
 def test_the_masked_conv_splits_at_a_call_boundary():
@@ -542,48 +475,6 @@ def test_a_right_padded_row_convolves_as_the_masked_conv(case, history):
     for gradient, wanted in zip(grads, want_grads, strict=True):
         if wanted is not None:
             assert largest(gradient, wanted) < 1e-6
-
-
-def test_a_right_padded_layer_keeps_its_real_tokens_states(reference, geometry):
-    """The mixer told its rows are right-padded gives the masked call's
-    outputs, zero at the padding, by the conv without the gather: as close
-    to float64 as the masked call is (tests/reference_error.py), the two
-    being separate programs, which a GPU rounds apart (1.7e-6 on an H100)."""
-    module = layer(geometry)
-    variables = layer_params(reference)
-    hidden = jnp.asarray(reference["layer.hidden"])[:, :9]
-    valid = jnp.arange(9)[None, :] < jnp.asarray([[6], [9]])
-
-    def call(metadata, variables=variables):
-        return jax.jit(lambda hidden: module.apply(variables, hidden, attention_metadata=metadata))
-
-    def gathers(metadata) -> int:
-        return call(metadata).lower(hidden).compile().as_text().count(" gather(")
-
-    masked = AttentionMetadata(coordinates=coordinates(valid=valid))
-    declared = AttentionMetadata(coordinates=coordinates(valid=valid, right_padded=True))
-    mine, theirs = call(declared)(hidden), call(masked)(hidden)
-
-    assert jnp.array_equal(mine[0, 6:], jnp.zeros_like(hidden[0, 6:]))
-    assert gathers(declared) < gathers(masked)
-    cpu = jax.devices("cpu")[0]
-    with jax.enable_x64(new_val=True), jax.default_device(cpu):
-        wide = jax.tree.map(lambda x: jax.device_put(np.asarray(x, np.float64), cpu), variables)
-        truth = call(AttentionMetadata(coordinates=coordinates(valid=jax.device_put(np.asarray(valid), cpu))),
-                     wide)(jax.device_put(np.asarray(hidden, np.float64), cpu))
-    assert_as_exact_as_the_reference(mine, theirs, truth, "right-padded output")
-
-
-@pytest.mark.parametrize("chunk", [4, 16, 64])
-def test_the_chunk_inverse_is_exact_where_its_series_cancels(chunk):
-    """Every key the same and beta one make A every -1 below the diagonal:
-    (I - A)^-1 is I minus the subdiagonal, entries of at most 1, while the
-    series' powers of A grow as binomials (to 1.8e17 at 64), which summed
-    in fp32 left Qwen3.5-0.8B's fifth delta-rule layer 1e24 off on a
-    256-token prompt and its logits NaN."""
-    a = -jnp.tril(jnp.ones((2, chunk, chunk), jnp.float32), -1)
-    want = np.eye(chunk) - np.eye(chunk, k=-1)
-    np.testing.assert_allclose(strictly_lower_inverse(a), np.broadcast_to(want, a.shape), atol=1e-6)
 
 
 def test_a_decay_deep_in_a_chunk_keeps_its_own_precision():

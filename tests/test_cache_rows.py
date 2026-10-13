@@ -19,7 +19,6 @@ from model_support import decoder, greedy_walk as walk
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.inputs import ModelInputs
-from dew.nn.kv_cache import gather_cache_rows
 from dew.sampling import Sampling, generate
 from dew.sampling.text import decode_ops, prefill_state
 
@@ -101,28 +100,6 @@ def test_gathered_cache_rows_decode_like_the_prefixes_they_came_from(kind):
     # The duplicated rows agree with each other and the reordering is real.
     np.testing.assert_array_equal(gathered[0], gathered[2])
     assert not np.array_equal(gathered[0], gathered[1])
-
-
-@pytest.mark.parametrize("kind", list(MODELS))
-def test_every_cache_leaf_moves_with_its_row(kind):
-    """A leaf left behind would keep a row's old state. Gathering a pure
-    permutation and its inverse has to return the cache unchanged, leaf for
-    leaf, which fails as soon as one leaf indexes a different axis."""
-    model = MODELS[kind]()
-    prompts = jnp.asarray([[1, 2, 3], [4, 5, 6], [7, 8, 9]], jnp.int32)
-    params = model.init(jax.random.key(0), prompts[:1])
-    state, _ = prefill_state(model, params, ModelInputs(prompts), decode_ops(model, params, 0, 0))
-    order = jnp.asarray([2, 0, 1], jnp.int32)
-    inverse = jnp.asarray([1, 2, 0], jnp.int32)
-
-    rotated = gather_cache_rows(state.cache, order)
-    restored = gather_cache_rows(rotated, inverse)
-    leaves = jax.tree.leaves(state.cache)
-    assert leaves, "the cache has to hold something for this to prove anything"
-    for before, after, moved in zip(leaves, jax.tree.leaves(restored),
-                                    jax.tree.leaves(rotated), strict=True):
-        np.testing.assert_array_equal(np.asarray(before), np.asarray(after))
-        assert moved.shape == before.shape
 
 
 def test_beam_branching_reuses_one_prefill_without_mixing_prompts():

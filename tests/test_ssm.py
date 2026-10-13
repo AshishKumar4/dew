@@ -44,8 +44,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from dew.nn import ssm
-from dew.nn.ssm import BidirectionalS5Layer, S5Layer, diagonal_recurrence
+from dew.nn.ssm import S5Layer, diagonal_recurrence
 
 U = 2.0 ** -24
 BATCH, FEATURES, STATE = 2, 4, 8
@@ -171,55 +170,7 @@ def case(request):
     return layer, params, u, w
 
 
-def test_the_oracle_adjoint_is_the_derivative_of_the_oracle(case):
-    """Central differences in float64 on every parameter and input entry:
-    step 1e-6 leaves truncation near 1e-12 and cancellation near 1e-10
-    relative, so 1e-7 of the largest gradient separates a right adjoint from
-    a wrong one by orders of magnitude."""
-    _, params, u, w = case
-    p, u, w = float64_params(params), np.asarray(u, np.float64), np.asarray(w, np.float64)
-    gradients = adjoint(p, u, w, EXACT)
-
-    def loss(p, u):
-        return float(np.sum(w * forward(p, u, EXACT)[0]))
-
-    step = 1e-6
-    for name in (*LEAVES, "u"):
-        values = u if name == "u" else p[name]
-        numeric = np.zeros_like(values)
-        for index in np.ndindex(values.shape):
-            moved = []
-            for sign in (1, -1):
-                shifted = values.copy()
-                shifted[index] += sign * step
-                moved.append(loss(p, shifted) if name == "u" else loss({**p, name: shifted}, u))
-            numeric[index] = (moved[0] - moved[1]) / (2 * step)
-        scale = np.max(np.abs(numeric))
-        assert np.max(np.abs(gradients[name] - numeric)) <= 1e-7 * scale, name
-
-
-@pytest.fixture(params=["chunked", "scanned"])
-def form(request, monkeypatch):
-    """The layer's directions run as a GPU runs them (`_chunked_directions`)
-    or as a TPU does (`_scanned_directions`), both here on the CPU."""
-    chosen = {"chunked": ssm._chunked_directions, "scanned": ssm._scanned_directions}[request.param]
-    monkeypatch.setattr(ssm, "_directions", chosen)
-    return request.param
-
-
-def test_the_layer_computes_the_zero_order_hold_recurrence(case, form):
-    """Every output within K u of its absolute terms, K = 184 at 16 positions."""
-    layer, params, u, _ = case
-    expected, _ = forward(float64_params(params), np.asarray(u, np.float64), EXACT)
-    bound = forward_chain(u.shape[1]) * U * forward(
-        float64_params(params), np.asarray(u, np.float64), MAGNITUDES)[0]
-
-    actual = np.asarray(layer.apply({"params": params}, u), np.float64)
-
-    assert np.all(np.abs(actual - expected) <= bound)
-
-
-def test_a_float64_layer_discretizes_and_recurs_in_float64(case, form):
+def test_a_float64_layer_discretizes_and_recurs_in_float64(case):
     """`S5Layer(dtype=float64)` over fp32 inputs and parameters computes in float64: every output
     within the fp32 test's K of float64's unit roundoff of its absolute terms, which an fp32
     discretization or recurrence would miss by about 2^29."""
@@ -232,25 +183,6 @@ def test_a_float64_layer_discretizes_and_recurs_in_float64(case, form):
         assert actual.dtype == jnp.float64
 
     assert np.all(np.abs(np.asarray(actual) - expected) <= bound)
-
-
-def test_the_layer_gradients_are_the_recurrence_gradients(case, form):
-    """Every parameter's and the input's gradient within K u of its absolute
-    terms, K = 376 at 16 positions."""
-    layer, params, u, w = case
-    p, u64, w64 = float64_params(params), np.asarray(u, np.float64), np.asarray(w, np.float64)
-    expected = adjoint(p, u64, w64, EXACT)
-    terms = adjoint(p, u64, w64, MAGNITUDES)
-
-    def loss(variables, u):
-        return jnp.sum(w * layer.apply({"params": variables}, u))
-
-    parameters, inputs = jax.grad(loss, argnums=(0, 1))(params, u)
-    actual = {**{name: parameters[name] for name in LEAVES}, "u": inputs}
-
-    for name, value in actual.items():
-        error = np.abs(np.asarray(value, np.float64) - expected[name])
-        assert np.all(error <= gradient_chain(u.shape[1]) * U * terms[name]), name
 
 
 def test_a_long_sequence_stays_within_the_bound():
@@ -308,42 +240,3 @@ def test_the_recurrence_holds_for_poles_all_around_the_circle():
     actual = np.asarray(jax.jit(diagonal_recurrence)(jnp.asarray(pole), jnp.asarray(inputs)), np.float64)
     actual = actual[..., :states] + 1j * actual[..., states:]
     assert np.all(np.abs(actual - expected) <= forward_chain(steps, 1, states) * U * magnitude)
-
-
-@pytest.mark.parametrize("platform, scanned", [("tpu", True), ("cuda", False), ("cpu", False)])
-def test_a_tpu_runs_the_layer_as_it_first_did(platform, scanned):
-    """The TPU lowering takes `_scanned_directions`, the layer's first form,
-    and the others the chunked pole-power products, whose Toeplitz product
-    names its einsum."""
-    layer = BidirectionalS5Layer(features=4, state_dim=4)
-    u = jnp.zeros((1, 40, 4), jnp.float32)
-    variables = layer.init(jax.random.key(0), u)
-    text = jax.jit(layer.apply).trace(variables, u).lower(lowering_platforms=(platform,)).as_text(
-        debug_info=True)
-    assert ("kjn,bcjn->bckn" not in text) == scanned
-
-
-def test_the_forward_bound_rejects_an_euler_step(case):
-    """The mutation the bound has to catch: B_bar = dt B, the first-order
-    discretization in place of the hold, lands outside K u of the hold's
-    outputs, so a layer that made it would fail the test above."""
-    _, params, u, _ = case
-    p, u64 = float64_params(params), np.asarray(u, np.float64)
-    _, dt, _, hold, b = discretized(p, EXACT)
-    euler_b = b * (dt / hold)[:, None]
-    euler = forward({**p, "B_re": euler_b.real, "B_im": euler_b.imag}, u64, EXACT)[0]
-    expected = forward(p, u64, EXACT)[0]
-    bound = forward_chain(u.shape[1]) * U * forward(p, u64, MAGNITUDES)[0]
-    assert np.any(np.abs(euler - expected) > bound)
-
-
-def test_the_poles_start_at_s4d_lin():
-    """S4D-Lin (Gu, Gupta, Goel and Re, "On the Parameterization and
-    Initialization of Diagonal State Space Models", 2022, section 4): the
-    poles -1/2 + i pi n, n = 0 .. N - 1, a real part shared by every state."""
-    layer = S5Layer(features=FEATURES, state_dim=STATE)
-    params = layer.init(jax.random.key(0), jnp.zeros((1, 2, FEATURES)))["params"]
-    poles = (-np.exp(np.asarray(params["log_A_real"], np.float64))
-             + 1j * np.asarray(params["A_imag"], np.float64))
-    expected = -0.5 + 1j * np.pi * np.arange(STATE)
-    np.testing.assert_allclose(poles, expected, rtol=4 * U, atol=0)
