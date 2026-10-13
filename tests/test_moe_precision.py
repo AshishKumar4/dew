@@ -14,9 +14,12 @@ import numpy as np
 import optax
 import pytest
 from jax.sharding import NamedSharding, PartitionSpec as P
+from reference_error import assert_as_exact_as_the_reference
 from scipy.special import erfc
+from tuned import each_config
 
 from dew.nn.gpt_oss import GptOssExperts
+from dew.nn.kernels import grouped_matmul, tuning
 from dew.nn.kernels.generation import triton_runs
 from dew.nn.moe import ExpertMLP, exact_gelu, expert_dispatch, expert_projection
 from dew.training import MeshSpec
@@ -178,6 +181,48 @@ def test_the_pallas_kernels_hold_the_contract_on_one_device(sizes, input_dtype):
                                atol=TOLERANCE, rtol=TOLERANCE)
     np.testing.assert_allclose(np.asarray(dk, np.float64), kernel_oracle, atol=TOLERANCE,
                                rtol=TOLERANCE)
+
+
+@pytest.mark.gpu(reason="the tuner's space is a GPU's")
+@pytest.mark.skipif(not triton_runs(), reason="needs a GPU the Pallas kernels compile for")
+@pytest.mark.parametrize("kernel", [grouped_matmul.Gmm, grouped_matmul.GmmTransposed, grouped_matmul.Tgmm])
+def test_every_tile_of_the_grouped_kernels_holds_the_float64_gate(kernel):
+    """Each tile the tuner may pick for a launch, over groups ragged against
+    every tile size, one empty and one of a single row: the output and both
+    gradients of a bf16 projection lie within tests/reference_error.py's rule
+    of XLA's ragged dot, both measured from float64 sums of the same bf16
+    operands. The space declares only tiles proven here."""
+    rng = np.random.default_rng(91)
+    sizes = np.array([0, 70, 1, 129, 100, 0], np.int32)
+    rows, width, features = int(sizes.sum()), 192, 320
+    x = rounded(rng.normal(size=(rows, width)))
+    kernel_matrix = rounded(rng.normal(size=(len(sizes), width, features)) / np.sqrt(width))
+    dy = rounded(rng.normal(size=(rows, features)))
+    group = np.repeat(np.arange(len(sizes)), sizes)
+    truth = (np.einsum('ri,rio->ro', x, kernel_matrix[group]),
+             np.einsum('ro,rio->ri', dy, kernel_matrix[group]),
+             np.stack([x[group == expert].T @ dy[group == expert] for expert in range(len(sizes))]))
+
+    def projected(implementation):
+        def run(x, kernel_matrix):
+            y, pull = jax.vjp(lambda x, k: expert_projection(x, k, jnp.asarray(sizes), jnp.bfloat16,
+                                                             implementation, None), x, kernel_matrix)
+            return (y, *pull(jnp.asarray(dy, jnp.bfloat16)))
+        return run
+
+    operands = (jnp.asarray(x, jnp.bfloat16), jnp.asarray(kernel_matrix, jnp.bfloat16))
+    reference = [np.asarray(value, np.float64) for value in jax.jit(projected('xla'))(*operands)]
+    configs = each_config(kernel, projected('pallas'), *operands)
+    assert len(configs) > 1
+    for config in configs:
+        with tuning.pinned({kernel: config}):
+            actual = [np.asarray(value, np.float64) for value in jax.jit(projected('pallas'))(*operands)]
+        for name, got, theirs, exact in zip(("y", "dx", "dk"), actual, reference, truth, strict=True):
+            try:
+                assert_as_exact_as_the_reference(got, theirs, exact, name)
+            except AssertionError as error:
+                error.add_note(f"{kernel.__name__} at {config}")
+                raise
 
 
 @pytest.mark.gpu(reason="needs a GPU the Pallas kernels compile for")

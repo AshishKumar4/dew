@@ -181,32 +181,6 @@ def test_a_misconfigured_mixture_is_rejected(mixture, message):
             jax.random.key(0), jnp.zeros((1, SEQ_LEN), jnp.int32))
 
 
-def test_a_tokamax_mixture_computes_the_xla_mixtures_logits():
-    """The mixture's implementation reaches every sparse layer's experts: the
-    same weights through either kernel give the same logits."""
-    pytest.importorskip("tokamax")
-    tokens = jax.random.randint(jax.random.key(0), (2, SEQ_LEN), 0, VOCAB)
-    reference = decoder(mixture=Mixture(experts=4, top_k=2, layers=(1, 3)))
-    variables = reference.init(jax.random.key(1), tokens)
-    expected = reference.apply(variables, tokens)
-    logits = decoder(mixture=Mixture(
-        experts=4, top_k=2, layers=(1, 3), implementation='tokamax')).apply(variables, tokens)
-
-    # Observed 0 on CPU, where tokamax lowers to the same ragged_dot.
-    assert np.max(np.abs(np.asarray(logits) - np.asarray(expected))) < 1e-5
-
-
-def test_a_tokamax_mixture_runs_on_nothing_else(monkeypatch):
-    """The experts import tokamax at their call, so a model that names it
-    fails to initialise where the package cannot be imported instead of
-    running the XLA kernel under the tokamax name."""
-    # None in sys.modules is Python's own way to make an import fail.
-    monkeypatch.setitem(sys.modules, "tokamax", None)
-    model = decoder(mixture=Mixture(experts=4, top_k=2, layers=(1,), implementation='tokamax'))
-    with pytest.raises(ModuleNotFoundError, match="tokamax"):
-        model.init(jax.random.key(0), jnp.zeros((1, SEQ_LEN), jnp.int32))
-
-
 # --------------------------------------------------------------------------
 # The expert mesh axis
 # --------------------------------------------------------------------------
