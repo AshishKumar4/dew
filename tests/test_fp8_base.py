@@ -39,7 +39,7 @@ from dew.training.quantization import (
     measured_fp8_sites,
 )
 
-VOCAB, SEQ, BATCH = 64, 16, 4
+VOCAB, SEQ, BATCH = 64, 16, 8
 FEATURES, MLP = 64, 128
 FP8_SITES = ("q_proj", "gate_proj", "up_proj", "down_proj")
 
@@ -62,6 +62,11 @@ def record(variables, generation=None) -> InputQuantization:
         frozen_fp8=tuple(path.removesuffix("/kernel") for path in kernels
                          if path.endswith("/kernel") and path.split("/")[-2] in FP8_SITES),
         measured_on=generation or device_generation())
+
+
+def sites(adapter) -> tuple[str, ...]:
+    """The frozen FP8 sites of the record `adapter`'s model computes under."""
+    return adapter.model._dew_wrapped._dew_wrapper().frozen_fp8
 
 
 def adapters(model=None):
@@ -127,7 +132,7 @@ def test_every_named_site_computes_from_its_packed_kernel_inside_the_branch():
     included, and every other Dense computes as the bf16 base's does."""
     plain, fp8 = adapters()
     seen, base = calls(fp8.model, fp8.variables, ids()), calls(plain.model, plain.variables, ids())
-    named = set(record(plain.model.init(jax.random.key(0), ids())).frozen_fp8)
+    named = set(sites(fp8))
     assert named and named <= set(seen)
     packed = flatten_dict(fp8.variables[QUANTIZATION], sep="/")
     frozen = fp8.variables[FROZEN]
@@ -144,7 +149,7 @@ def test_every_named_site_computes_from_its_packed_kernel_inside_the_branch():
     assert set(base) == set(seen)
 
 
-def fit(adapter, steps, directory=None, mesh=None):
+def fit(adapter, steps, directory=None, mesh=None, devices=1):
     objective = LMObjective(adapter.model, SEQ, variables=adapter.variables)
     batches = np.random.default_rng(2).integers(0, VOCAB, (8, BATCH, SEQ + 1)).astype(np.int32)
 
@@ -165,9 +170,11 @@ def fit(adapter, steps, directory=None, mesh=None):
         def set_state(self, state):
             self.index = int(state)
 
-    trainer = Trainer(objective, optax.adam(1e-2), key=jax.random.key(0), mesh=mesh or MeshSpec(),
+    mesh = mesh or MeshSpec()
+    trainer = Trainer(objective, optax.adam(1e-2), key=jax.random.key(0), mesh=mesh,
                       layout=Layout(min_shard=1, tolerance=1.0),
                       checkpoints=None if directory is None else Checkpoints(str(directory)))
+    trainer.device_mesh = mesh.build(jax.devices()[:devices])
     return trainer.fit(Dataset(lambda partition: Stream(), None, None, BATCH), steps=steps,
                        checkpoint_every=None if directory is None else 2)
 
@@ -179,7 +186,7 @@ def test_lora_packs_the_frozen_base_once_and_training_moves_neither():
     _, fp8 = adapters()
     frozen = flatten_dict(fp8.variables[FROZEN], sep="/")
     packed = flatten_dict(fp8.variables[QUANTIZATION], sep="/")
-    for site in fp8.model._dew_wrapped._dew_wrapper().frozen_fp8:
+    for site in sites(fp8):
         for leaf, value in frozen_fp8_leaves(frozen[f"{site}/kernel"]).items():
             np.testing.assert_array_equal(np.asarray(packed[f"{site}/{leaf}"]).view(np.uint8),
                                           np.asarray(value).view(np.uint8))
@@ -210,7 +217,7 @@ def test_the_scanned_stack_reads_each_layers_own_packed_kernel():
 @pytest.mark.mesh(devices=2)
 def test_fsdp_trains_an_fp8_base_as_one_device_does():
     _, fp8 = adapters()
-    split = fit(fp8, 2, mesh=MeshSpec(fsdp=2))
+    split = fit(fp8, 2, mesh=MeshSpec(fsdp=2), devices=2)
     whole = fit(fp8, 2)
     split_params, whole_params = (jax.tree.leaves(state.variables["params"]) for state in (split, whole))
     for got, want in zip(split_params, whole_params, strict=True):
