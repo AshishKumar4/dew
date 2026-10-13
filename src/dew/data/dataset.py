@@ -946,15 +946,18 @@ _UNSTACKED = "Expected all input elements to have the same structure"
 not stack. A grain that words it otherwise raises its own error unchanged."""
 
 
-def _numeric(value) -> bool:
+def _stacked(value) -> bool:
+    """Whether Grain stacks `value` into one array: numbers, strings and bytes,
+    and mappings of them; not lists, object arrays or other records."""
     if isinstance(value, Mapping):
-        return bool(value) and all(_numeric(field) for field in value.values())
-    return (isinstance(value, (np.ndarray, np.generic, jax.Array, int, float, complex))
-            and np.asarray(value).dtype.kind in "biufc")
+        return bool(value) and all(_stacked(field) for field in value.values())
+    return (isinstance(value, (np.ndarray, np.generic, jax.Array, int, float, complex, str, bytes))
+            and np.asarray(value).dtype.kind in "biufcSU")
 
 
 def record_batch(rows: Sequence[Batch], *, shared: bool = False) -> Batch:
-    """Numeric columns stacked by Grain, with object columns kept as record lists."""
+    """Numeric and text columns stacked by Grain, with object columns (a
+    conversation's messages, a record's tools) kept as record lists."""
     if not rows:
         raise ValueError("a batch needs at least one record")
     if any(row.keys() != rows[0].keys() for row in rows[1:]):
@@ -963,7 +966,7 @@ def record_batch(rows: Sequence[Batch], *, shared: bool = False) -> Batch:
     for name in rows[0]:
         values = [row[name] for row in rows]
         batched[name] = (make_batch(values, output_to_shared_memory=shared)
-                         if all(_numeric(value) for value in values) else values)
+                         if all(_stacked(value) for value in values) else values)
     return batched
 
 
