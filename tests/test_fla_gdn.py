@@ -44,6 +44,17 @@ def tiled(kernel, call, *operands) -> list:
     return found
 
 
+def cumulated_decay(key, batch, length, value_heads, width=None):
+    """A base-2 decay cumulated within each 64-token chunk, per head `[B, T, HV]` or per key dimension
+    `[B, T, HV, K]` (fla's gk), as the kernels take it: its compensated halves `(hi, lo)` fp32
+    (`fla_gdn.chunk_local_cumsum`), from a float64 sum."""
+    shape = (batch, length, value_heads) + (() if width is None else (width,))
+    step = np.asarray(-jnp.exp(jax.random.normal(key, shape) - 3.0) * fla_gdn.RCP_LN2, np.float64)
+    summed = np.cumsum(step.reshape(batch, length // 64, 64, *shape[2:]), axis=2).reshape(shape)
+    high = summed.astype(np.float32)
+    return jnp.asarray(high), jnp.asarray((summed - high).astype(np.float32))
+
+
 def output_operands(batch, length, key_heads, value_heads, width, columns, dtype, chunk=64, seed=0):
     keys = jax.random.split(jax.random.key(seed), 5)
     q = l2norm(jax.random.normal(keys[0], (batch, length, key_heads, width))).astype(dtype)
@@ -51,9 +62,7 @@ def output_operands(batch, length, key_heads, value_heads, width, columns, dtype
     v = jax.random.normal(keys[2], (batch, length, value_heads, columns)).astype(dtype)
     memory = (batch, length // chunk, value_heads, width, columns)
     h = (0.1 * jax.random.normal(keys[3], memory)).astype(dtype)
-    step = -jnp.exp(jax.random.normal(keys[4], (batch, length, value_heads)) - 3.0) * fla_gdn.RCP_LN2
-    g = jnp.cumsum(step.reshape(batch, length // chunk, chunk, value_heads), axis=2).reshape(step.shape)
-    return q, k, v, h, g
+    return q, k, v, h, *cumulated_decay(keys[4], batch, length, value_heads)
 
 
 @pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float32])
@@ -78,17 +87,34 @@ def test_the_output_kernel_computes_flas_expression(dtype, shape, config):
 @pytest.mark.parametrize("reverse", [False, True])
 def test_the_cumsum_kernel_is_flas_chunk_local_cumsum(reverse, columns):
     """Within each chunk of each head, and each key dimension of a decay per key dimension (fla's
-    vector kernel), the inclusive sum (from the end for the gradient), fp32, then the base-2 scale: as
-    numpy computes it."""
+    vector kernel), the inclusive sum of the base-2 scaled tokens, from the end for the gradient, as
+    numpy sums them in float64. Forward gives compensated halves: every range within a chunk, the
+    halves' differences summed (`fla_gdn._between`), lies within two fp32 roundings of the range's
+    own magnitude, where fla's plain fp32 prefixes, differenced, carry the whole prefix's rounding and
+    miss that bound."""
     g = -jnp.exp(jax.random.normal(jax.random.key(3), (2, 192, 3, *columns)) - 3.0)
-    chunks = np.asarray(g, np.float64).reshape(2, 3, 64, 3, *columns)
-    summed = np.cumsum(chunks[:, :, ::-1], axis=2)[:, :, ::-1] if reverse else np.cumsum(chunks, axis=2)
-    want = (summed * fla_gdn.RCP_LN2).reshape(g.shape)
+    tokens = np.asarray(g, np.float64).reshape(2, 3, 64, 3, *columns) * fla_gdn.RCP_LN2
     kernel = functools.partial(fla_gdn.chunk_local_cumsum, scale=fla_gdn.RCP_LN2, reverse=reverse,
                                interpret=INTERPRETED)
-    for got in tiled(fla_gdn.ChunkLocalCumsum, kernel, g):
-        assert got.dtype == jnp.float32
-        assert relative(got, want) < 1e-6
+    if reverse:
+        want = np.cumsum(tokens[:, :, ::-1], axis=2)[:, :, ::-1].reshape(g.shape)
+        for got in tiled(fla_gdn.ChunkLocalCumsum, kernel, g):
+            assert got.dtype == jnp.float32
+            assert relative(got, want) < 1e-6
+        return
+    summed, magnitude = np.cumsum(tokens, axis=2), np.cumsum(np.abs(tokens), axis=2)
+
+    def ranges(x):
+        return x[:, :, :, None] - x[:, :, None, :]
+
+    bound = 2 * np.finfo(np.float32).eps * np.abs(ranges(magnitude)) + 1e-30
+    plain = np.cumsum((g * fla_gdn.RCP_LN2).reshape(tokens.shape), axis=2, dtype=np.float32)
+    assert np.any(np.abs(ranges(plain.astype(np.float64)) - ranges(summed)) > bound)
+    for high, low in tiled(fla_gdn.ChunkLocalCumsum, kernel, g):
+        assert high.dtype == low.dtype == jnp.float32
+        halves = [np.asarray(x, np.float64).reshape(tokens.shape) for x in (high, low)]
+        got = ranges(halves[0]) + ranges(halves[1])
+        assert np.all(np.abs(got - ranges(summed)) <= bound)
 
 
 @pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float32])
@@ -103,8 +129,7 @@ def test_the_w_u_kernel_is_flas_recompute(dtype, shape):
     beta = jax.nn.sigmoid(jax.random.normal(keys[2], (batch, length, value_heads))).astype(dtype)
     lower = jnp.tril(jax.random.normal(keys[3], (batch, length // 64, value_heads, 64, 64)) * 0.1)
     a = jnp.moveaxis(lower, 3, 2).reshape(batch, length, value_heads, 64).astype(dtype)
-    step = -jnp.exp(jax.random.normal(keys[4], (batch, length, value_heads)) - 3.0) * fla_gdn.RCP_LN2
-    g = jnp.cumsum(step.reshape(batch, length // 64, 64, value_heads), axis=2).reshape(step.shape)
+    g, _ = cumulated_decay(keys[4], batch, length, value_heads)
     want = support.reference_w_u(k, v, beta, a, g)
     kernel = functools.partial(fla_gdn.recompute_w_u, interpret=INTERPRETED)
     for got in tiled(fla_gdn.RecomputeWU, kernel, k, v, beta, a, g):
@@ -123,21 +148,12 @@ def test_the_kkt_solve_kernel_inverts_flas_matrix(dtype, shape):
     keys = jax.random.split(jax.random.key(6), 3)
     k = l2norm(jax.random.normal(keys[0], (batch, length, key_heads, width))).astype(dtype)
     beta = jax.nn.sigmoid(jax.random.normal(keys[1], (batch, length, value_heads))).astype(dtype)
-    step = -jnp.exp(jax.random.normal(keys[2], (batch, length, value_heads)) - 3.0) * fla_gdn.RCP_LN2
-    g = jnp.cumsum(step.reshape(batch, length // 64, 64, value_heads), axis=2).reshape(step.shape)
-    want = support.reference_kkt_solve(k, g, beta)
+    g = cumulated_decay(keys[2], batch, length, value_heads)
+    want = support.reference_kkt_solve(k, *g, beta)
     kernel = functools.partial(fla_gdn.kkt_solve, interpret=INTERPRETED)
-    for got in tiled(fla_gdn.KktSolve, kernel, k, g, beta):
+    for got in tiled(fla_gdn.KktSolve, kernel, k, *g, beta):
         assert got.shape == want.shape and got.dtype == want.dtype
         assert relative(got, want) < (2e-2 if dtype == jnp.bfloat16 else 2e-3)
-
-
-def cumulated_decay(key, batch, length, value_heads, width=None):
-    """A base-2 decay cumulated within each 64-token chunk, per head `[B, T, HV]` or per key dimension
-    `[B, T, HV, K]` (fla's gk)."""
-    shape = (batch, length, value_heads) + (() if width is None else (width,))
-    step = -jnp.exp(jax.random.normal(key, shape) - 3.0) * fla_gdn.RCP_LN2
-    return jnp.cumsum(step.reshape(batch, length // 64, 64, *shape[2:]), axis=2).reshape(shape)
 
 
 @pytest.mark.parametrize("per_key", [False, True])
@@ -153,9 +169,9 @@ def test_the_h_kernel_is_flas_recurrence(dtype, shape, per_key):
     u = jax.random.normal(keys[2], (batch, length, value_heads, columns)).astype(dtype)
     g = cumulated_decay(keys[3], batch, length, value_heads, width if per_key else None)
     h0 = 0.1 * jax.random.normal(keys[4], (batch, value_heads, width, columns))
-    want = support.reference_h(k, w, u, g, h0)
+    want = support.reference_h(k, w, u, *g, h0)
     kernel = functools.partial(fla_gdn.chunk_fwd_h, interpret=INTERPRETED)
-    for got in tiled(fla_gdn.ChunkFwdH, kernel, k, w, u, g, h0):
+    for got in tiled(fla_gdn.ChunkFwdH, kernel, k, w, u, *g, h0):
         for name, mine, theirs in zip(("h", "v_new", "final"), got, want, strict=True):
             assert mine.shape == theirs.shape and mine.dtype == theirs.dtype, name
             assert relative(mine, theirs) < (2e-2 if dtype == jnp.bfloat16 else 1e-5), name
@@ -178,9 +194,9 @@ def test_the_dhu_kernel_is_flas_reverse_recurrence(dtype, shape, per_key):
     do = jax.random.normal(keys[5], (batch, length, value_heads, columns)).astype(dtype)
     dv = jax.random.normal(keys[6], (batch, length, value_heads, columns)).astype(dtype)
     scale = width ** -0.5
-    want = support.reference_dhu(q, k, w, g, dht, do, dv, scale=scale)
+    want = support.reference_dhu(q, k, w, *g, dht, do, dv, scale=scale)
     kernel = functools.partial(fla_gdn.chunk_bwd_dhu, scale=scale, interpret=INTERPRETED)
-    for got in tiled(fla_gdn.ChunkBwdDhu, kernel, q, k, w, g, dht, do, dv):
+    for got in tiled(fla_gdn.ChunkBwdDhu, kernel, q, k, w, *g, dht, do, dv):
         for name, mine, theirs in zip(("dh", "dh0", "dv2"), got, want, strict=True):
             assert mine.shape == theirs.shape and mine.dtype == theirs.dtype, name
             assert relative(mine, theirs) < (2e-2 if dtype == jnp.bfloat16 else 1e-5), name
@@ -194,13 +210,12 @@ def test_the_dv_local_kernel_is_flas(dtype, shape):
     keys = jax.random.split(jax.random.key(10), 4)
     q = l2norm(jax.random.normal(keys[0], (batch, length, key_heads, width))).astype(dtype)
     k = l2norm(jax.random.normal(keys[1], (batch, length, key_heads, width))).astype(dtype)
-    step = -jnp.exp(jax.random.normal(keys[2], (batch, length, value_heads)) - 3.0) * fla_gdn.RCP_LN2
-    g = jnp.cumsum(step.reshape(batch, length // 64, 64, value_heads), axis=2).reshape(step.shape)
+    g = cumulated_decay(keys[2], batch, length, value_heads)
     do = jax.random.normal(keys[3], (batch, length, value_heads, columns)).astype(dtype)
     scale = width ** -0.5
-    want = support.reference_dv_local(q, k, g, do, scale=scale)
+    want = support.reference_dv_local(q, k, *g, do, scale=scale)
     kernel = functools.partial(fla_gdn.chunk_bwd_dv_local, scale=scale, interpret=INTERPRETED)
-    for got in tiled(fla_gdn.ChunkBwdDvLocal, kernel, q, k, g, do):
+    for got in tiled(fla_gdn.ChunkBwdDvLocal, kernel, q, k, *g, do):
         assert got.shape == want.shape and got.dtype == want.dtype
         assert relative(got, want) < (2e-2 if dtype == jnp.bfloat16 else 1e-5)
 
@@ -217,16 +232,15 @@ def test_the_dqkwg_kernel_is_flas(dtype, shape):
     k = l2norm(jax.random.normal(keys[1], (batch, length, key_heads, width))).astype(dtype)
     v = jax.random.normal(keys[2], (batch, length, value_heads, columns)).astype(dtype)
     w = (0.1 * jax.random.normal(keys[3], (batch, length, value_heads, width))).astype(dtype)
-    step = -jnp.exp(jax.random.normal(keys[4], (batch, length, value_heads)) - 3.0) * fla_gdn.RCP_LN2
-    g = jnp.cumsum(step.reshape(batch, chunks, 64, value_heads), axis=2).reshape(step.shape)
+    g = cumulated_decay(keys[4], batch, length, value_heads)
     h = (0.1 * jax.random.normal(keys[5], (batch, chunks, value_heads, width, columns))).astype(dtype)
     dh = (0.1 * jax.random.normal(keys[6], (batch, chunks, value_heads, width, columns))).astype(dtype)
     dv = jax.random.normal(keys[7], (batch, length, value_heads, columns)).astype(dtype)
     do = jax.random.normal(keys[0], (batch, length, value_heads, columns)).astype(dtype)
     scale = width ** -0.5
-    want = support.reference_dqkwg(q, k, v, w, g, h, dv, do, dh, scale=scale)
+    want = support.reference_dqkwg(q, k, v, w, *g, h, dv, do, dh, scale=scale)
     kernel = functools.partial(fla_gdn.chunk_bwd_dqkwg, scale=scale, interpret=INTERPRETED)
-    for got in tiled(fla_gdn.ChunkBwdDqkwg, kernel, q, k, v, w, g, h, dv, do, dh):
+    for got in tiled(fla_gdn.ChunkBwdDqkwg, kernel, q, k, v, w, *g, h, dv, do, dh):
         for name, mine, theirs in zip(("dq", "dk", "dw", "dg"), got, want, strict=True):
             assert mine.shape == theirs.shape and mine.dtype == theirs.dtype, name
             assert relative(mine, theirs) < (3e-2 if dtype == jnp.bfloat16 else 1e-5), name
@@ -292,15 +306,14 @@ def test_the_wy_backward_kernel_is_the_gradient_of_flas_wy_representation(dtype,
     k = l2norm(jax.random.normal(keys[0], (batch, length, heads, width))).astype(dtype)
     v = jax.random.normal(keys[1], (batch, length, heads, columns)).astype(dtype)
     beta = jax.nn.sigmoid(jax.random.normal(keys[2], (batch, length, heads))).astype(dtype)
-    step = -jnp.exp(jax.random.normal(keys[3], (batch, length, heads)) - 3.0) * fla_gdn.RCP_LN2
-    g = jnp.cumsum(step.reshape(batch, length // 64, 64, heads), axis=2).reshape(step.shape)
+    g = cumulated_decay(keys[3], batch, length, heads)
     dw = jax.random.normal(keys[4], (batch, length, heads, width)).astype(dtype)
     du = jax.random.normal(keys[5], (batch, length, heads, columns)).astype(dtype)
     def chunks(x):
         return jnp.moveaxis(x.reshape(batch, length // 64, 64, heads, *x.shape[3:]), 3, 2)
 
     with jax.enable_x64(new_val=True):
-        operands = widened((k, v, beta, g))
+        operands = widened((k, v, beta, np.asarray(g[0], np.float64) + np.asarray(g[1], np.float64)))
         inverse = np.asarray(wy_math(*operands)[2])
         cot_w, cot_u = (chunks(x) for x in widened((dw, du)))
 
@@ -312,7 +325,7 @@ def test_the_wy_backward_kernel_is_the_gradient_of_flas_wy_representation(dtype,
     want[3] = want[3] * fla_gdn.RCP_LN2
     a = jnp.asarray(np.moveaxis(inverse, 2, 3).reshape(batch, length, heads, 64), dtype)
     kernel = functools.partial(fla_gdn.prepare_wy_repr_bwd, interpret=INTERPRETED)
-    for got in tiled(fla_gdn.PrepareWyReprBwd, kernel, k, v, beta, g, a, dw, du):
+    for got in tiled(fla_gdn.PrepareWyReprBwd, kernel, k, v, beta, *g, a, dw, du):
         for name, mine, theirs in zip(("dk", "dv", "db", "dg"), got, want, strict=True):
             assert mine.shape == theirs.shape, name
             assert relative(mine, theirs) < bound, name
@@ -331,12 +344,12 @@ def test_the_wy_backward_gives_the_same_gradients_on_every_call_at_e1s_shape():
     beta = jax.nn.sigmoid(jax.random.normal(keys[2], (batch, length, heads))).astype(jnp.bfloat16)
     g = fla_gdn.chunk_local_cumsum(-jnp.exp(jax.random.normal(keys[3], (batch, length, heads)) - 3.0),
                                    scale=fla_gdn.RCP_LN2)
-    a = fla_gdn.kkt_solve(k, g, beta)
+    a = fla_gdn.kkt_solve(k, *g, beta)
     dw, du, dk = (jax.random.normal(key, k.shape).astype(jnp.bfloat16) for key in keys[4:])
     backward = jax.jit(fla_gdn.prepare_wy_repr_bwd)
-    first = [np.asarray(x) for x in backward(k, v, beta, g, a, dw, du, dk)]
+    first = [np.asarray(x) for x in backward(k, v, beta, *g, a, dw, du, dk)]
     for _ in range(4):
-        for name, again, was in zip(("dk", "dv", "db", "dg"), backward(k, v, beta, g, a, dw, du, dk), first,
+        for name, again, was in zip(("dk", "dv", "db", "dg"), backward(k, v, beta, *g, a, dw, du, dk), first,
                                     strict=True):
             np.testing.assert_array_equal(np.asarray(again), was, err_msg=name)
 
@@ -351,14 +364,13 @@ def test_the_wy_backward_adds_the_keys_gradient_so_far_once_per_key_head(value_h
     k = l2norm(jax.random.normal(keys[0], (batch, length, key_heads, width)))
     v = jax.random.normal(keys[1], (batch, length, value_heads, columns))
     beta = jax.nn.sigmoid(jax.random.normal(keys[2], (batch, length, value_heads)))
-    step = -jnp.exp(jax.random.normal(keys[3], (batch, length, value_heads)) - 3.0) * fla_gdn.RCP_LN2
-    g = jnp.cumsum(step.reshape(batch, length // 64, 64, value_heads), axis=2).reshape(step.shape)
+    g = cumulated_decay(keys[3], batch, length, value_heads)
     a = jnp.tril(jax.random.normal(keys[4], (batch, length, value_heads, 64)) * 0.1)
     dw = jax.random.normal(keys[5], (batch, length, value_heads, width))
     du = jax.random.normal(keys[6], (batch, length, value_heads, columns))
     earlier = jax.random.normal(keys[7], k.shape)
-    alone = fla_gdn.prepare_wy_repr_bwd(k, v, beta, g, a, dw, du, interpret=INTERPRETED)
-    joined = fla_gdn.prepare_wy_repr_bwd(k, v, beta, g, a, dw, du, earlier, interpret=INTERPRETED)
+    alone = fla_gdn.prepare_wy_repr_bwd(k, v, beta, *g, a, dw, du, interpret=INTERPRETED)
+    joined = fla_gdn.prepare_wy_repr_bwd(k, v, beta, *g, a, dw, du, earlier, interpret=INTERPRETED)
     assert relative(joined[0], alone[0] + earlier) < 1e-6
     for name, mine, theirs in zip(("dv", "db", "dg"), joined[1:], alone[1:], strict=True):
         np.testing.assert_array_equal(np.asarray(mine), np.asarray(theirs), err_msg=name)
