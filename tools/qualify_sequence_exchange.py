@@ -18,24 +18,18 @@ operands under JAX_DEFAULT_MATMUL_PRECISION=highest on jax 0.11.1.
 
 import functools
 import json
-import time
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 
 from dew.nn.attention import attention_kernel, exchanged_heads_attention
+from dew.nn.kernels.tuning import samples
 from dew.training import MeshSpec
 
 
 def timed(fn, *args, repeats: int = 10) -> float:
-    jax.block_until_ready(fn(*args))
-    times = []
-    for _ in range(repeats):
-        start = time.perf_counter()
-        jax.block_until_ready(fn(*args))
-        times.append(time.perf_counter() - start)
-    return float(np.median(times))
+    return float(np.median(samples(fn, *args, warmup=1, repeats=repeats)))
 
 
 def case(batch: int, seq: int, heads: int, kv_heads: int, head_dim: int, dtype) -> dict:
