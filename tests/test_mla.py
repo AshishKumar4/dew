@@ -24,6 +24,7 @@ import pytest
 from jax.sharding import PartitionSpec as P
 from recording import RecordingTracker
 
+from dew.data.dataset import Loader
 from dew.interop.decoder_parts import yarn_record
 from dew.interop.hf_decoders import translate_weights
 from dew.nn.attention import scaled_dot_product_attention
@@ -365,11 +366,6 @@ def token_batches():
         yield {"text": rng.integers(0, 64, size=(8, 17)).astype(np.int32)}
 
 
-class Data:
-    train = staticmethod(lambda partition: token_batches())
-    val, batch, records, steps_per_epoch = None, 8, None, None
-
-
 @pytest.mark.mesh
 @pytest.mark.parametrize("fsdp,expert", [(2, 1), (2, 2)])
 def test_the_deepseek_stack_fits_on_the_mesh(fsdp, expert):
@@ -388,7 +384,8 @@ def test_the_deepseek_stack_fits_on_the_mesh(fsdp, expert):
         key=jax.random.key(0), mesh=MeshSpec(fsdp=fsdp, expert=expert),
         layout=Layout(min_shard=TINY_SHARD), tracker=tracker)
 
-    state = trainer.fit(Data(), steps=2, log_every=1)
+    state = trainer.fit(Loader(lambda partition: token_batches(), None, batch=8, records=None),
+                        steps=2, log_every=1)
 
     assert dict(trainer.device_mesh.shape) == {
         "data": 8 // (fsdp * expert), "expert": expert, "fsdp": fsdp,

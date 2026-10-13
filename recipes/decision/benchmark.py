@@ -209,9 +209,11 @@ def held(run: Path, mixture: Path) -> dict:
     either a one-hot answer or its soft target. Accuracy uses the target's
     most likely option. Unlabelled questions are not scored. A question whose
     gold option the model gives no probability at all scores an infinite
-    loss, which stays in the mean, and `infinite` counts them. The macro means
-    give each source with scored questions equal weight, whatever its size;
-    a source without any reports null scores and is left out of that mean.
+    loss, which stays in the mean, and `infinite` counts them. A row the
+    layout cannot fit (`Layout.fits`) is left out and counted as `unfit`,
+    as training leaves it out and counts it. The macro means give each
+    source with scored questions equal weight, whatever its size; a source
+    without any reports null scores and is left out of that mean.
     """
     from dew.decision import Decide, Example
 
@@ -225,19 +227,21 @@ def held(run: Path, mixture: Path) -> dict:
                     if count["held"] else [])
         if len(examples) != count["held"]:
             raise ValueError(f"{path} has {len(examples)} rows, but mixture.json records {count['held']}")
+        fitting = [example for example in examples if all(map(decide.layout.fits, decide.layout.rows(
+            decide.tokenizer, decide.specials, example.state, example.questions)))]
         losses, correct = [], []
-        answered = [answers for first in range(0, len(examples), 64)
+        answered = [answers for first in range(0, len(fitting), 64)
                     for answers, _ in decide.batch([(example.state, example.questions)
-                                                    for example in examples[first:first + 64]])]
-        for example, answers in zip(examples, answered, strict=True):
+                                                    for example in fitting[first:first + 64]])]
+        for example, answers in zip(fitting, answered, strict=True):
             for name, label in example.labels().items():
                 truth = example.distribution(name)
                 found = answers[name].probabilities
                 positive = truth > 0
                 losses.append(float(-np.sum(truth[positive] * np.log(found[positive]))))
                 correct.append(int(np.argmax(found)) == label)
-        scores[source] = {"rows": len(examples), "questions": len(losses),
-                          "log_loss": float(np.mean(losses)) if losses else None,
+        scores[source] = {"rows": len(examples), "unfit": len(examples) - len(fitting),
+                          "questions": len(losses), "log_loss": float(np.mean(losses)) if losses else None,
                           "infinite": int(np.sum(np.isinf(losses))),
                           "accuracy": float(np.mean(correct)) if correct else None}
     scored = [value for value in scores.values() if value["questions"]]

@@ -15,7 +15,8 @@ from PIL import Image
 from dew import Checkpoints, Field, InputSpec, Trainer, sample
 from dew.artifacts import uint8_pixels
 from dew.config import OptimConfig
-from dew.data import Loading, TFDSImages
+from dew.config.data import Augment, ImageData, loader
+from dew.data import TFDS, Loading
 from dew.diffusion.presets import EDM
 from dew.nn.backbones import SimpleDiT
 from dew.objectives.diffusion import DiffusionObjective
@@ -31,13 +32,13 @@ class Config:
 
 
 def main(config: Config):
-    data = TFDSImages(
-        path=str(config.data.expanduser()),
-        split="train",
+    data = loader(ImageData(
+        source=TFDS("oxford_flowers102", split="train", path=str(config.data.expanduser())),
         image_size=64,
-        val_batches=0,
-        loading=Loading(workers=2, threads=2, read_buffer=16, worker_buffer=2),
-    ).load(batch=config.batch)
+        caption_templates=("a photo of a {}",),
+        augment=Augment(flip=True, jitter=True),
+    ), batch=config.batch, read="memory",
+        loading=Loading(workers=2, threads=2, read_buffer=16, worker_buffer=2))
     model = SimpleDiT(
         patch_size=4,
         emb_features=128,

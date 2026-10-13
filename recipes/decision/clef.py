@@ -1,8 +1,8 @@
 """A decision model on a frozen decoder under LoRA with Clef's joint head, as Clef is built.
 
     python recipes/decision/sources.py --out data/mixture --decontaminate eval-index.npz
-    python recipes/decision/clef.py --mixture.root data/mixture --trainer.checkpoint-dir runs
-    python recipes/decision/clef.py --mixture.root data/mixture --pretrained Qwen/Qwen3.5-9B \\
+    python recipes/decision/clef.py --data.source data/mixture --trainer.checkpoint-dir runs
+    python recipes/decision/clef.py --data.source data/mixture --pretrained Qwen/Qwen3.5-9B \\
         --revision c202236235762e1c871ad0ccb60c8ee5ba337b9a --lora.rank 256
 
 Qwen3.5-4B (Apache-2.0) stays frozen under rank-64 LoRA factors on every
@@ -18,15 +18,16 @@ third command is the size-matched comparison with Clef-flash, for an H100.
 It reads the same sets as the encoder recipe, with the same proper scoring
 rules. An example whose questions alone pass 4,096 tokens is dropped and
 counted (`DecisionRunConfig`'s summary, `unfit`). AdamW at 1e-4 warms up
-over 400 steps and decays on a cosine to step 12,000, with 4 rows a step;
-where a step does not fit the device, the trainer reads its batch in
-microbatches before it recomputes more of each block.
+over 400 steps and decays on a cosine to step 12,000, with 16,384-token
+micro-batch and update budgets; where a step does not fit the device, the
+trainer reads its batch in microbatches before it recomputes more of each
+block.
 """
 
 from encoder import RULES
 
 from dew.config import ModelConfig, ObjectiveConfig, OptimConfig, TrainerConfig
-from dew.decision import DecisionMixture
+from dew.decision import Decisions
 from dew.decision.config import DecisionRunConfig, JointShape
 from dew.lora import LoRA
 from dew.training.optim import Cosine
@@ -37,15 +38,16 @@ PROJECTIONS = ("q_proj", "k_proj", "v_proj", "o_proj", "in_proj_qkv", "in_proj_z
 
 
 def run_config() -> DecisionRunConfig:
-    """The Clef recipe's run, every value a flag."""
+    """Rows vary from 160 to 3,072+ tokens; a token budget fills each micro-batch with real tokens."""
     return DecisionRunConfig(
         pretrained="Qwen/Qwen3.5-4B", revision="851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a",
         model=ModelConfig("causal_transformer", {"dtype": "bfloat16"}),
         lora=LoRA(rank=64, modules=PROJECTIONS), head=JointShape(),
-        mixture=DecisionMixture("data/mixture"),
+        data=Decisions("data/mixture"),
         objective=ObjectiveConfig("decision", {"loss": RULES, "label_smoothing": 0.05}),
         optim=OptimConfig(learning_rate=1e-4, schedule=Cosine(peak=1e-4, warmup_steps=400)),
-        trainer=TrainerConfig(batch_size=4, steps=12_000, eval_every=1_000, checkpoint_every=1_000),
+        trainer=TrainerConfig(batch_size=None, batch_tokens=16_384, update_tokens=16_384,
+                              steps=12_000, eval_every=1_000, checkpoint_every=1_000),
         max_len=4096)
 
 

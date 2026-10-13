@@ -18,13 +18,13 @@ They run on the `Trainer` as it is (`dew.training.trainer`), with the same state
 
 ## 1. Data
 
-The three paths are `DatasetSpec`s in the `datasets` registry, beside `TokenWindows` and `PackedTokens`: `ChatMessages` (`dew/data/chat.py`), `PreferencePairs` (`dew/data/preferences.py`) and `Prompts` (`dew/data/prompts.py`). Each returns a `Dataset` from `load(batch=)`, so a recipe reaches them through the same `data:` subcommand every other run uses, and none of them changes the trainer.
+The paths are frozen Recipe values in the datasets registry: Chat, Preferences and Prompts alongside Text. Each constructs a Pipeline; load(recipe, batch=..., read=...) compiles it into the Dataset consumed by the trainer. Post-training therefore uses the same execution boundary as every other objective.
 
 ### 1.1 Chat and SFT: a role per token
 
 SFT needs one field beyond the pretraining contract: which role wrote each token. The loss must count assistant tokens only.
 
-`ChatMessages`, registered as `chat_messages`, is a Grain source over a parquet file whose `prompt` column holds verl-shaped conversations, plus a tokenizer whose chat template renders them. `ConversationSource` reads the conversations. `RenderConversation` renders each one and emits, per token, `text` and `text_roles` (int8: 0 pad, 1 system, 2 user, 3 assistant, 4 tool). The packer carries `text_roles` beside `text_segment_ids` and `text_positions`. A `_lengths` pass renders every row up front, so a bad row fails the run with its index before packing starts.
+`Chat`, registered as `chat`, is a Grain source over a parquet file whose `prompt` column holds verl-shaped conversations, plus a tokenizer whose chat template renders them. `Files`, `Hub` or `Memory` reads records. `RenderChat` renders each conversation and emits, per token, `text` and `text_roles` (int8: 0 pad, 1 system, 2 user, 3 assistant, 4 tool). The packer carries `text_roles` beside `text_segment_ids` and `text_positions`. Memory mode materializes deterministic rendering and packing explicitly. Indexed and streamed modes need producer metadata and do not add an implicit lengths scan.
 
 The assistant span comes from prefix rendering, not from template markers:
 
@@ -45,11 +45,11 @@ Packing reuses the existing machinery. `text_roles` joins as one more per-token 
 
 `loss_role` multiplies the objective's existing target weights by `(text_roles[:, 1:] == loss_role)`, together with the pad and segment-boundary weights it already computes. With no `loss_role`, every counted target counts, as in pretraining.
 
-Correction (2026-09-22): packing now goes through `PackedWindows`, one plan over the whole corpus (`src/dew/data/tokens.py:250`); `FirstFitPackIterDataset` is gone from `src/`. A window carries one `text_segment_ids`/`text_positions` pair that serves `text` and `text_roles` alike. `ChatMessages` reads a parquet file, a `.jsonl` file or a Hub dataset id; the conversation column defaults to `messages` and falls back to `prompt` (`src/dew/data/chat.py:672-704`). `Role` has a sixth value, `DEVELOPER = 5` (`src/dew/data/chat.py:65-80`).
+Correction (2026-09-22): packing now goes through Pipeline.pack, which fixes its recipe and scope in the compiled plan; `FirstFitPackIterDataset` is gone from `src/`. A window carries one `text_segment_ids`/`text_positions` pair that serves `text` and `text_roles` alike. `Chat` reads a parquet file, a `.jsonl` file or a Hub dataset id; the conversation column defaults to `messages` and falls back to `prompt` (`src/dew/data/chat.py:672-704`). `Role` has a sixth value, `DEVELOPER = 5` (`src/dew/data/chat.py:65-80`).
 
 ### 1.2 Preference pairs
 
-`PreferencePairs`, registered as `preference_pairs`, reads a parquet file or JSON rows of `chosen` and `rejected` token-id lists, with `chosen_mask` and `rejected_mask` marking the completion tokens. Absent masks default to all-completion. Every element is one `[2, seq_len]` pair, chosen at index 0, padded with `pad_id` and 0, so a grain batch is `[B, 2, seq_len]` and shuffling never separates a pair. A row longer than `seq_len` fails with its lengths. A pair cannot be chunked without cutting a completion, and a silent cut would train the wrong preference.
+`Preferences`, registered as `preferences`, reads a parquet file or JSON rows of `chosen` and `rejected` token-id lists, with `chosen_mask` and `rejected_mask` marking the completion tokens. Absent masks default to all-completion. Every element is one `[2, seq_len]` pair, chosen at index 0, padded with `pad_id` and 0, so a grain batch is `[B, 2, seq_len]` and shuffling never separates a pair. A row longer than `seq_len` fails with its lengths. A pair cannot be chunked without cutting a completion, and a silent cut would train the wrong preference.
 
 | key | shape | dtype | content |
 | --- | --- | --- | --- |
@@ -211,4 +211,4 @@ Research scale uses Dew's own `generate` and its samplers. Beyond that, the cros
 
 `recipes/lm/train.py` stays the pretraining recipe. Its `--objective` flag stays `lm | masked_diffusion`, because its data path (a token directory), its `--pretrained` (a Hugging Face decoder, not a dew run) and its sampling setup assume pretraining from the start. Post-training stages need pair and prompt data, dew-checkpoint init and reward callables, and that command line has none of them, so they live in the chain instead of behind its flag.
 
-Correction (2026-09-22): a `Stage` no longer names its loss. The type of its data decides it: `ChatMessages` trains SFT, `PreferencePairs` DPO and `Prompts` GRPO (`recipes/chain.py:37-68`). The LM recipe's `--objective` accepts `lm`, `masked_diffusion` and `block_diffusion` (`src/dew/objectives/lm/config.py:33-35`, `:77-79`).
+Correction (2026-09-22): a `Stage` no longer names its loss. The type of its data decides it: `Chat` trains SFT, `Preferences` DPO and `Prompts` GRPO (`recipes/chain.py:37-68`). The LM recipe's `--objective` accepts `lm`, `masked_diffusion` and `block_diffusion` (`src/dew/objectives/lm/config.py:33-35`, `:77-79`).
