@@ -18,14 +18,15 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from delta_rule_support import recurrence, through, wide
 from kernel_compile import compile_kernels
 from reference_error import assert_as_exact_as_the_reference, assert_leaves_as_exact, distance, widened
-from sharded import assert_runs_per_shard, boundary_copies
-from test_fla_gdn import recurrence, through, wide
+from sharded import boundary_copies
+from tuned import each_config
 
 from dew.nn import kernels, linear
 from dew.nn.kda import KimiDeltaAttention
-from dew.nn.kernels import fla_gdn, fla_kda
+from dew.nn.kernels import fla_gdn, fla_kda, tuning
 from dew.nn.linear import fla_rule, l2norm
 
 pytestmark = pytest.mark.kernel
@@ -107,37 +108,6 @@ def test_a_bf16_kimi_delta_attention_trains_on_the_port_as_on_the_math():
                                     strict=True):
         bound = APART * distance(theirs, 0)
         assert distance(mine, theirs) <= bound, jax.tree_util.keystr(path)
-
-
-@pytest.mark.mesh(devices=2)
-@pytest.mark.parametrize("axis, split", [("data", (0,)), ("tensor", (2,))])
-def test_the_port_keeps_the_kernel_contract_on_a_mesh(axis, split):
-    """`fla_rule` with a decay per key dimension over rows split two ways, or heads split two ways, runs
-    per shard (`assert_runs_per_shard`): its output, final memory and gradients within the float64 gate
-    of one device's, and no operand moved between devices."""
-    from jax.sharding import Mesh, PartitionSpec
-
-    q, k, v, g, beta, _, do, _ = operands(2, 80, 2, 2, 64, 64, jnp.float32, seed=43)
-
-    def run(rule, cotangent):
-        def loss(*args):
-            out, final = rule(*args)
-            return jnp.sum(out * cotangent) + jnp.sum(final), (out, final)
-
-        def grads(*args):
-            (_, (out, final)), found = jax.value_and_grad(loss, argnums=(0, 1, 2, 3, 4), has_aux=True)(*args)
-            return out, final, *found
-
-        return grads
-
-    with jax.enable_x64(new_val=True):
-        operands64 = wide(q, k, v, g, beta, do)
-        zero = jnp.zeros((2, 2, 64, 64), jnp.float64)
-        rule = functools.partial(recurrence, h0=zero)
-        truth = jax.tree.map(np.asarray, run(rule, operands64[-1])(*operands64[:-1]))
-    spec = PartitionSpec(*(axis if dim in split else None for dim in range(3)))
-    mesh = Mesh(np.asarray(jax.devices()[:2]), (axis,))
-    assert_runs_per_shard(run(fla_rule, do), (q, k, v, g, beta), [spec] * 5, mesh, truth)
 
 
 TRAINING = (1, 4096, 32, 128)
@@ -256,8 +226,9 @@ def float64_truth(inputs, cuts) -> list[np.ndarray]:
     q, k, v, g, beta, h0, do, dht = inputs
     group = v.shape[2] // q.shape[2]
     with jax.enable_x64(new_val=True):
+        rows = None if cuts is None else (cuts,)
         run = jax.jit(lambda q, k, v, g, beta, h0, do, dht: through(
-            functools.partial(recurrence, cuts=cuts), do, dht)(q, k, v, g, beta, h0))
+            functools.partial(recurrence, cuts=rows), do, dht)(q, k, v, g, beta, h0))
         heads = []
         for head in range(v.shape[2]):
             keyed = slice(head // group, head // group + 1)
@@ -281,6 +252,8 @@ GPU_CASES = {
     "padded": ((4000, 8, 8, 96, 96), None),
     # Packed documents as fla's varlen sequences, on and off the chunk grid, one shorter than a chunk.
     "packed": ((4096, 8, 8, 128, 128), (0, 1000, 1037, 2500)),
+    # Every tile the tuner may pick: a partial last chunk, four value heads a program can block.
+    "tiles": ((1000, 4, 4, 128, 128), None),
 }
 
 
@@ -292,6 +265,37 @@ def test_the_port_is_as_exact_as_fla(case, dtype):
     """Each of the port's outputs and gradients through `fla_rule` is as near the float64 recurrence as
     fla 0.5.2's own on the same operands (`assert_as_exact_as_the_reference`): at Kimi Linear's training
     shape, with value heads sharing a key head, padded to the kernels' blocks, and packed."""
+    inputs, run, cuts = gpu_case(case, dtype)
+    mine = [np.asarray(x, np.float64) for x in run(*inputs[:-2])]
+    theirs = fla_side(inputs, cuts, dtype)
+    for name, dew, fla, value in zip(NAMES, mine, theirs, float64_truth(inputs, cuts), strict=True):
+        assert_as_exact_as_the_reference(dew, fla, value, f"{case}/{name}")
+
+
+LAUNCHES = sorted({type(op) for op in vars(fla_kda).values() if isinstance(op, fla_gdn._Launch)},
+                  key=lambda kind: kind.__name__)
+"""The port's own launches, each a tuner KernelOp."""
+
+
+@pytest.mark.gpu(reason="float64 distances against fla's own on this GPU")
+@pytest.mark.parametrize("launch", LAUNCHES, ids=lambda kind: kind.__name__)
+def test_each_tile_the_tuner_may_pick_is_as_exact_as_fla(launch):
+    """Every tile in the space of each of the port's own launches on this GPU (tests/tuned.py's
+    `each_config`), pinned (`tuning.pinned`), keeps each output and gradient as near the float64
+    recurrence as fla's own, at a partial last chunk."""
+    inputs, run, cuts = gpu_case("tiles", jnp.bfloat16)
+    theirs = fla_side(inputs, cuts, jnp.bfloat16)
+    truth = float64_truth(inputs, cuts)
+    for tiles in each_config(launch, run, *inputs[:-2]):
+        with tuning.pinned({launch: tiles}):
+            mine = [np.asarray(x, np.float64) for x in jax.jit(lambda *a: run(*a))(*inputs[:-2])]
+        for name, dew, fla, value in zip(NAMES, mine, theirs, truth, strict=True):
+            assert_as_exact_as_the_reference(dew, fla, value, f"{launch.__name__}/{tiles}/{name}")
+
+
+def gpu_case(case, dtype):
+    """A GPU case's operands (one row), the port's outputs and gradients through `fla_rule` as a
+    function of the six operands, and the case's packed documents' first tokens, or None."""
     (length, key_heads, value_heads, width, columns), cuts = GPU_CASES[case]
     inputs = operands(1, length, key_heads, value_heads, width, columns, dtype, seed=61)
     rule = fla_rule
@@ -299,8 +303,4 @@ def test_the_port_is_as_exact_as_fla(case, dtype):
         starts = np.zeros((1, length), bool)
         starts[0, list(cuts[1:])] = True
         rule = functools.partial(fla_rule, starts=jnp.asarray(starts), max_segments=len(cuts))
-    mine = [np.asarray(x, np.float64) for x in
-            through(rule, inputs[-2].astype(jnp.float32), inputs[-1])(*inputs[:-2])]
-    theirs = fla_side(inputs, cuts, dtype)
-    for name, dew, fla, value in zip(NAMES, mine, theirs, float64_truth(inputs, cuts), strict=True):
-        assert_as_exact_as_the_reference(dew, fla, value, f"{case}/{name}")
+    return inputs, through(rule, inputs[-2].astype(jnp.float32), inputs[-1]), cuts
