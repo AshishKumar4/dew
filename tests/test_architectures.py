@@ -432,11 +432,12 @@ def truth(case: Case, tmp_path, initial):
 
 
 def decay_terms(objective, variables, batch, index: int) -> dict[tuple[str, ...], np.ndarray]:
-    """Each gated delta net layer's `A_log` gradient as its terms summed
-    absolutely, by head, in float64: the decay g = -exp(A_log) softplus(z),
-    z = a + dt_bias, enters the rule at every row and position, so the
-    gradient sums dL/dg g there, which is dL/da softplus(z) / sigmoid(z)
-    read through the `a` projection. Keyed by the layer's module path."""
+    """Each gated delta net layer's decay parameters' gradients as their
+    terms summed absolutely, by head, in float64, keyed by the parameter's
+    path. The decay g = -exp(A_log) softplus(z), z = a + dt_bias, enters the
+    rule at every row and position, so `dt_bias`'s gradient sums dL/dz and
+    `A_log`'s sums dL/dg g = dL/dz softplus(z) / sigmoid(z) there, both read
+    through the `a` projection, whose cotangent is dL/dz."""
     step = Step(step=jnp.asarray(index), key=jax.random.key(0), ema=None)
     values: dict[tuple[str, ...], jax.Array] = {}
 
@@ -461,17 +462,20 @@ def decay_terms(objective, variables, batch, index: int) -> dict[tuple[str, ...]
         for part in path:
             layer = layer[part]
         z = values[path] + layer["dt_bias"]
-        term = cotangent * jax.nn.softplus(z) / jax.nn.sigmoid(z)
-        terms[path] = np.sum(np.abs(np.asarray(term)), axis=(0, 1))
+        decay = cotangent * jax.nn.softplus(z) / jax.nn.sigmoid(z)
+        for name, term in (("dt_bias", cotangent), ("A_log", decay)):
+            terms[(*path, name)] = np.sum(np.abs(np.asarray(term)), axis=(0, 1))
     return terms
 
 
 def decay_invariants(case: Case, tmp_path, initial, exact) -> dict[str, dict[str, float]]:
-    """`assert_leaves_as_exact`'s invariants for each gated delta net
-    `A_log` of a language model's two SGD steps, by state tree: the leaf moves
-    by -lr ((1 + momentum) g1 + g2) and the momentum holds momentum g1 + g2,
-    so their terms are those of the two steps' gradients (`decay_terms`),
-    measured in float64 at the parameters each step reads."""
+    """`assert_leaves_as_exact`'s invariants for each gated delta net's decay
+    parameters over a language model's two SGD steps, by state tree. The
+    momentum holds momentum g1 + g2, and a parameter that starts at zero
+    moves to -lr ((1 + momentum) g1 + g2), so each is a sum of the two
+    steps' gradients' terms (`decay_terms`), measured in float64 at the
+    parameters each step reads. A parameter that starts elsewhere is no such
+    sum, and its own size floors it."""
     if not case.is_lm:
         return {}
     trainer, _ = make_trainer(case, tmp_path / "terms", 1, devices=1)
@@ -488,15 +492,22 @@ def decay_invariants(case: Case, tmp_path, initial, exact) -> dict[str, dict[str
         moved = {**wide, "params": jax.tree.map(lambda leaf, step: leaf - LEARNING_RATE * step,
                                                 wide["params"], gradient)}
         second = decay_terms(trainer.objective, moved, batch, 1)
+
+    def starts_at_zero(path):
+        leaf = initial.variables["params"]
+        for part in path:
+            leaf = leaf[part]
+        return not np.any(np.asarray(leaf))
+
     scales = {"variables": {path: LEARNING_RATE * ((1 + MOMENTUM) * first[path] + second[path])
-                            for path in first},
+                            for path in first if starts_at_zero(path)},
               "opt_state": {path: MOMENTUM * first[path] + second[path] for path in first}}
     declared = {}
     for name, by_path in scales.items():
         for key, _ in jax.tree_util.tree_leaves_with_path(getattr(exact, name)):
             text = jax.tree_util.keystr(key)
             for path, scale in by_path.items():
-                if text.endswith("".join(f"['{part}']" for part in (*path, "A_log"))):
+                if text.endswith("".join(f"['{part}']" for part in path)):
                     declared.setdefault(name, {})[text] = float(np.sqrt(np.mean(scale ** 2)))
     return declared
 
