@@ -341,10 +341,11 @@ def token_batch(rows: int = BATCH):
 PIPELINED_ROWS = 16
 
 
-def loss_and_grads(objective, spec, variables, batch, devices=None):
+def loss_and_grads(objective, spec, variables, batch, devices=None, microbatches=None):
     """The objective's loss, metrics and gradients on `spec`'s mesh over
-    `devices` (every device by default), with the pipeline's schedule in
-    context the way the trainer's compiled step puts it there."""
+    `devices` (every device by default), with the pipeline's schedule of
+    `microbatches` in context the way the trainer's compiled step puts it
+    there."""
     mesh = spec.build(devices)
     layout = Layout(min_shard=TINY_SHARD)
     placed = jax.device_put(variables, layout.shardings(mesh, variables))
@@ -355,7 +356,7 @@ def loss_and_grads(objective, spec, variables, batch, devices=None):
     def loss(params):
         return objective.scalar_loss({**variables, "params": params}, batch, step)
 
-    with jax.set_mesh(mesh), pipeline_microbatches(spec.microbatches):
+    with jax.set_mesh(mesh), pipeline_microbatches(microbatches):
         (value, aux), grads = jax.jit(jax.value_and_grad(loss, has_aux=True))(placed["params"])
     return (float(value), {name: float(number) for name, number in aux.metrics.items()},
             jax.tree.map(np.asarray, grads))
@@ -382,7 +383,7 @@ def test_a_pipeline_over_two_stages_has_the_loss_and_gradient_of_one(build, bala
 
     loss, metrics, grads = loss_and_grads(objective, MeshSpec(fsdp=4), variables, batch)
     piped, piped_metrics, piped_grads = loss_and_grads(
-        objective, MeshSpec(fsdp=2, stage=2, microbatches=4), variables, batch)
+        objective, MeshSpec(fsdp=2, stage=2), variables, batch, microbatches=4)
 
     assert abs(loss - piped) < 1e-5, (loss, piped)
     assert same_metrics(metrics, piped_metrics), (metrics, piped_metrics)
@@ -403,7 +404,7 @@ def test_a_pipeline_trains_an_exchange_dispatch():
 
     loss, _, grads = loss_and_grads(objective, MeshSpec(expert=2, fsdp=2), variables, batch)
     piped, _, piped_grads = loss_and_grads(
-        objective, MeshSpec(expert=2, stage=2, microbatches=4), variables, batch)
+        objective, MeshSpec(expert=2, stage=2), variables, batch, microbatches=4)
 
     assert abs(loss - piped) < 1e-5, (loss, piped)
     difference = largest_difference(grads, piped_grads)
@@ -421,7 +422,7 @@ def test_a_scanned_pipeline_has_the_loss_and_gradient_of_the_plain_loop():
     loss, _, grads = loss_and_grads(LMObjective(tiny(), SEQ_LEN), MeshSpec(fsdp=4), variables, batch)
     piped, _, piped_grads = loss_and_grads(
         LMObjective(tiny(scan_layers=True), SEQ_LEN),
-        MeshSpec(fsdp=2, stage=2, microbatches=2), variables, batch)
+        MeshSpec(fsdp=2, stage=2), variables, batch, microbatches=2)
 
     assert abs(loss - piped) < 1e-5, (loss, piped)
     difference = largest_difference(grads, piped_grads)
@@ -440,7 +441,7 @@ def test_a_pipeline_under_a_bf16_policy_trains_the_loss_of_the_plain_loop():
 
     loss, _, _ = loss_and_grads(LMObjective(model, SEQ_LEN), MeshSpec(fsdp=4), variables, batch)
     piped, _, piped_grads = loss_and_grads(
-        LMObjective(model, SEQ_LEN), MeshSpec(fsdp=2, stage=2, microbatches=4), variables, batch)
+        LMObjective(model, SEQ_LEN), MeshSpec(fsdp=2, stage=2), variables, batch, microbatches=4)
 
     assert abs(loss - piped) < 1e-2 * max(1.0, abs(loss)), (loss, piped)
     assert all(np.isfinite(leaf).all() for leaf in jax.tree.leaves(piped_grads))
@@ -449,8 +450,7 @@ def test_a_pipeline_under_a_bf16_policy_trains_the_loss_of_the_plain_loop():
 
 
 @pytest.mark.mesh(devices=4)
-@pytest.mark.parametrize("spec", [MeshSpec(stage=4, microbatches=4),
-                                  MeshSpec(stage=2, sequence=2, microbatches=4)],
+@pytest.mark.parametrize("spec", [MeshSpec(stage=4), MeshSpec(stage=2, sequence=2)],
                          ids=["stage4", "stage2_sequence2"])
 def test_a_pipeline_whose_rows_no_axis_splits_computes_the_whole_stacks_step(spec):
     """On four devices, four stages, or two beside a sequence axis of two,
@@ -469,7 +469,7 @@ def test_a_pipeline_whose_rows_no_axis_splits_computes_the_whole_stacks_step(spe
     objective, four = LMObjective(model, 16), jax.devices()[:4]
 
     loss, _, grads = loss_and_grads(objective, MeshSpec(), variables, batch, four)
-    piped, _, piped_grads = loss_and_grads(objective, spec, variables, batch, four)
+    piped, _, piped_grads = loss_and_grads(objective, spec, variables, batch, four, microbatches=4)
 
     assert abs(loss - piped) < 1e-5, (loss, piped)
     difference = largest_difference(grads, piped_grads)
