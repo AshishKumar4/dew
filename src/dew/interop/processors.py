@@ -109,11 +109,11 @@ def _placed(runs: list[list[np.ndarray]], lengths: Sequence[int] | np.ndarray, c
     indices = np.full(shape, -1, np.int32)
     places = []
     for row, spans in enumerate(runs):
-        for item, slots in enumerate(spans):
+        for medium, slots in enumerate(spans):
             if len(slots) != int(lengths[len(places)]):
                 raise ValueError(f"media placeholder counts do not match the {what}")
-            indices[row, slots] = item * capacity + np.arange(len(slots))
-            places.append((row, item, slots))
+            indices[row, slots] = medium * capacity + np.arange(len(slots))
+            places.append((row, medium, slots))
     return indices, places
 
 
@@ -467,8 +467,8 @@ class Processor:
             raise ValueError("position_embedding_size and patch_size must be positive integers")
         streams = _patch_streams(values, image_id, video_id, kernel=kernel,
                                  table_size=table_size, patch_size=patch_size)
-        items = {token: list(zip(*stream, strict=True)) for token, stream in streams.items()}
-        ordered = _in_text_order(items, tokens, runs)
+        patches = {token: list(zip(*stream, strict=True)) for token, stream in streams.items()}
+        ordered = _in_text_order(patches, tokens, runs)
         if not ordered:
             raise ValueError("pixels require image or video placeholders")
         chunks, patch_positions, lengths = (list(part) for part in zip(*ordered, strict=True))
