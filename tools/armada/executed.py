@@ -8,14 +8,17 @@ session-scoped fixtures execute serves every test file after them, so it joins e
 A test file that starts another process runs code no event sees, so its record says so, and the
 cache never skips it.
 
-It also records the functions of the checkout that read the backend (`READS`) as each test file is
-collected or its tests run, and which of its tests are marked to run on a GPU: a file with either takes
-another path on a GPU, so the H100 tier runs it (`ci.py gpu-tier`)."""
+It also records where each test file's run read the backend (`reads_backend`) and which of its tests
+are marked to run on a GPU (`MARKS`): a file with either takes another path on a GPU, so the H100 tier
+runs it (`ci.py gpu-tier`). A read is that of the test file being collected or run, or of the
+session-scoped fixture being set up, which every file that requests it shares. A module's body reads
+once, as it is imported: for its own test file too, and for every file where nothing is collected yet."""
 
 import dis
 import json
 import os
 import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -24,8 +27,6 @@ TOOL = 3
 """sys.monitoring's tool ids 0-2 and 5 are the debugger's, coverage's, the profiler's and the optimizer's."""
 SPAWNS = {"subprocess.Popen", "os.fork", "os.forkpty", "os.posix_spawn", "os.spawn", "os.exec"}
 """Audit events of a process start."""
-READS = frozenset({"default_backend", "platform"})
-"""The names code reads the backend by: `jax.default_backend()` and a device's `platform`."""
 MARKS = ("gpu", "kernel")
 """The marks of tests a GPU runs otherwise: those only a GPU runs, and a kernel's, which a CPU interprets."""
 
@@ -37,9 +38,16 @@ spawned: set[str] = set()
 current: list[set[str]] = [shared]
 running: list[str] = []
 reads: dict[str, set[str]] = {}
-"""Each test file's functions that read the backend, and its marks of `MARKS`."""
-reader: list[str] = []
-"""The test file being collected or run: conftest.py reads the backend for every test, so it is left out."""
+"""Each test file's reads of the backend, as `file:function`, and its marks of `MARKS`."""
+module_reads: dict[str, set[str]] = {}
+imported: set[str] = set()
+"""What module bodies read before collection began."""
+fixture_reads: dict[str, set[str]] = {}
+requested: dict[str, set[str]] = {}
+"""The fixtures each test file's tests requested."""
+readers: list[set[str]] = []
+"""Where a function's read is kept. conftest.py's reads are every test's, so they are left out."""
+decided: dict[types.CodeType, bool] = {}
 
 
 def started(code, offset):
@@ -47,16 +55,25 @@ def started(code, offset):
     # The environment's packages, which CI installs in the checkout, are the locks' to key.
     if name.startswith(root) and name.endswith(".py") and "site-packages" not in name:
         current[-1].add(name[len(root):])
-        if reader and reads_backend(code) and not name.endswith(f"{os.sep}conftest.py"):
-            reads.setdefault(reader[-1], set()).add(f"{name[len(root):]}:{code.co_qualname}")
+        if reads_backend(code) and not name.endswith(f"{os.sep}conftest.py"):
+            site = f"{name[len(root):]}:{code.co_qualname}"
+            if code.co_name == "<module>":
+                module_reads.setdefault(name[len(root):], set()).add(site)
+            if readers:
+                readers[-1].add(site)
+            elif code.co_name == "<module>":
+                imported.add(site)
     return sys.monitoring.DISABLE
 
 
-def reads_backend(code) -> bool:
-    """Whether `code` reads one of `READS`: `platform` as an attribute, since alone it is the module."""
-    return not READS.isdisjoint(code.co_names) and any(
-        step.argval == "default_backend" or (step.opname == "LOAD_ATTR" and step.argval == "platform")
-        for step in dis.get_instructions(code))
+def reads_backend(code: types.CodeType) -> bool:
+    """Whether `code` calls `default_backend` (jax's), by any name table, or reads a `platform`
+    attribute (a device's), as `platform` alone is the module."""
+    if code not in decided:
+        decided[code] = any(step.argval == "default_backend"
+                            or (step.opname == "LOAD_ATTR" and step.argval == "platform")
+                            for step in dis.get_instructions(code))
+    return decided[code]
 
 
 def audited(event, args):
@@ -83,11 +100,12 @@ def pytest_runtest_protocol(item, nextitem):
         current[:] = [own.setdefault(name, set())]
         sys.monitoring.restart_events()
     reads.setdefault(name, set()).update(f"mark:{mark}" for mark in MARKS if item.get_closest_marker(mark))
-    reader.append(name)
+    requested.setdefault(name, set()).update(item.fixturenames)
+    readers.append(reads[name])
     try:
         yield
     finally:
-        reader.pop()
+        readers.pop()
 
 
 @pytest.hookimpl(hookwrapper=True)
@@ -96,12 +114,12 @@ def pytest_make_collect_report(collector):
     if not isinstance(collector, pytest.Module):
         yield
         return
-    reader.append(collector.nodeid)
+    readers.append(reads.setdefault(collector.nodeid, set()))
     sys.monitoring.restart_events()
     try:
         yield
     finally:
-        reader.pop()
+        readers.pop()
 
 
 @pytest.hookimpl(hookwrapper=True)
@@ -110,11 +128,13 @@ def pytest_fixture_setup(fixturedef, request):
         yield
         return
     current.append(shared)
+    readers.append(fixture_reads.setdefault(fixturedef.argname, set()))
     sys.monitoring.restart_events()
     try:
         yield
     finally:
         current.pop()
+        readers.pop()
         sys.monitoring.restart_events()
 
 
@@ -123,5 +143,8 @@ def pytest_sessionfinish(session):
     out = os.environ.get("DEW_EXECUTED")
     if out:
         recorded = {name: {"depends": None if name in spawned else sorted(files | shared),
-                           "reads": sorted(reads.get(name, ()))} for name, files in own.items()}
+                           "reads": sorted(reads.get(name, set()) | module_reads.get(name, set()) | imported
+                                           | set().union(*(fixture_reads.get(fixture, set())
+                                                           for fixture in requested.get(name, ()))))}
+                    for name, files in own.items()}
         Path(out).write_text(json.dumps(recorded))
