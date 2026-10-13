@@ -12,7 +12,7 @@ sandwich; the model files arrange blocks.
 import inspect
 import math
 from collections.abc import Sequence
-from typing import Literal, Self, TypedDict, Unpack
+from typing import Literal, Self, TypedDict, Unpack, get_args
 
 import jax
 import jax.numpy as jnp
@@ -30,6 +30,7 @@ from .flops import MissingFlopsCount, counted_flops, projection_flops, real_leng
 from .precision import at_least_fp32, fp32_result_dot_general
 from .rope import rotary_freqs
 from .scan_orders import (
+    ScanOrder,
     build_2d_sincos_pos_embed,
     hilbert_indices,
     hilbert_patchify,
@@ -41,8 +42,6 @@ from .scan_orders import (
 )
 from .sharding import MLP_HIDDEN, RESIDUAL, constrain, logical_axes
 from .ssm import BidirectionalS5Layer, S5Layer, SpatialFusionConv
-
-SCAN_ORDERS = ('raster', 'hilbert', 'zigzag')
 
 # The rotary base every model here rotates with, RoFormer's.
 ROPE_THETA = 10000.0
@@ -83,13 +82,21 @@ def scan_ordered_pos_embed(emb_dim: int, H_P: int, W_P: int, scan_order: str):
     return pos_embed if order is None else pos_embed[order]
 
 
+BLOCK_MIXERS = ('ssm', 'attn')
+"""The mixers a hybrid layer can name: an S5 scan or attention."""
+
+
 def build_block_pattern(num_layers: int, ssm_attention_ratio: str = "3:1",
                         block_pattern: Sequence[str] | None = None):
-    """Per-layer mixer choice from a ratio string like '3:1', 'all-ssm', 'all-attn'."""
+    """Per-layer mixer choice (`BLOCK_MIXERS`) from a ratio string like '3:1', 'all-ssm', 'all-attn',
+    or a `block_pattern` naming every layer's, any other name refused."""
     if block_pattern is not None:
         if len(block_pattern) != num_layers:
             raise ValueError("block_pattern names every layer's mixer; got "
                              f"{len(block_pattern)} entries for {num_layers} layers")
+        unknown = sorted(set(block_pattern) - set(BLOCK_MIXERS))
+        if unknown:
+            raise ValueError(f"block_pattern names {unknown}; a hybrid layer is one of {list(BLOCK_MIXERS)}")
         return list(block_pattern)
     if ssm_attention_ratio == "all-ssm":
         return ['ssm'] * num_layers
@@ -188,7 +195,7 @@ class PatchSequenceEmbed(nn.Module):
                                parent=None).model_flops(lengths, input_channels)
 
     def setup(self):
-        assert self.scan_order in SCAN_ORDERS, f"Unknown scan order {self.scan_order}"
+        assert self.scan_order in get_args(ScanOrder), f"Unknown scan order {self.scan_order}"
         if self.scan_order == 'raster':
             self.patch_embed = PatchEmbedding(
                 patch_size=self.patch_size,
@@ -494,7 +501,7 @@ class _DiTStackOptions(_AttentionStackOptions):
     num_layers: int = 12
     num_heads: int = 12
     remat: RematChoice = False
-    scan_order: Literal['raster', 'hilbert', 'zigzag'] = 'raster'
+    scan_order: ScanOrder = 'raster'
 
     @nn.nowrap
     def recompute_record(self) -> JSON:
@@ -638,7 +645,7 @@ class ModulatedBlock(nn.Module):
                 features=self.features, state_dim=self.ssm_state_dim, dtype=self.dtype, name="ssm"
             )
             if self.use_2d_fusion:
-                assert self.scan_order in SCAN_ORDERS, f"Unknown scan_order {self.scan_order}"
+                assert self.scan_order in get_args(ScanOrder), f"Unknown scan_order {self.scan_order}"
                 self.spatial_fusion = SpatialFusionConv(
                     features=self.features,
                     dilations=(1, 2, 3),

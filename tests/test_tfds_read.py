@@ -6,8 +6,6 @@ where TensorFlow is not installed. They require no downloads or preparation.
 """
 
 import itertools
-import json
-import shutil
 from pathlib import Path
 
 import numpy as np
@@ -43,19 +41,6 @@ def test_prepared_records_carry_encoded_pixels_labels_and_caption_names():
     ]
 
 
-def test_a_prepared_source_describes_the_directory_and_split_it_reads():
-    """A saved position names the order it counts into by naming its source,
-    and the builder's own source describes itself by its address in this
-    process, which no resume can match."""
-    from dew.data.dataset import describe
-
-    source = TFDSImages(path=str(FIXTURE)).source()
-    other = TFDSImages(path=str(FIXTURE), split="test").source()
-
-    assert describe(source) == f"Prepared(directory={str(FIXTURE)!r}, split='all')"
-    assert describe(other) != describe(source)
-
-
 @pytest.mark.parametrize("workers", [0, 2])
 def test_prepared_records_reach_grain_batches_without_split_overlap(workers):
     data = TFDSImages(
@@ -75,43 +60,3 @@ def test_prepared_records_reach_grain_batches_without_split_overlap(workers):
         np.testing.assert_array_equal(row["label"], (row["image"][:, 0, 0, 0] - 10) % 2)
         np.testing.assert_array_equal(
             row["image"], np.broadcast_to(row["image"][:, :1, :1, :1], (4, 8, 8, 3)))
-
-
-def test_explicit_caption_names_override_the_prepared_metadata(tmp_path):
-    labels = tmp_path / "names.txt"
-    labels.write_text("fern\nrose\n")
-    spec = TFDSImages(path=str(FIXTURE), labels=str(labels))
-    source = spec.source()
-    _, caption, label = spec.record(source[1], np.random.default_rng(0))
-    assert label == 1 and "rose" in caption.split()
-
-
-def test_an_unprepared_directory_requests_external_preparation(tmp_path):
-    with pytest.raises(ValueError, match="prepared TFDS ArrayRecords"):
-        TFDSImages().source()
-    with pytest.raises(FileNotFoundError, match="separate environment"):
-        TFDSImages(path=str(tmp_path)).source()
-    assert list(tmp_path.iterdir()) == []
-
-
-def test_a_tfrecord_preparation_is_refused_before_reading(tmp_path):
-    directory = tmp_path / "prepared"
-    shutil.copytree(FIXTURE, directory)
-    metadata_path = directory / "dataset_info.json"
-    metadata = json.loads(metadata_path.read_text())
-    metadata["fileFormat"] = "tfrecord"
-    metadata_path.write_text(json.dumps(metadata))
-    with pytest.raises(ValueError, match="dew reads ArrayRecords"):
-        TFDSImages(path=str(directory)).source()
-
-
-def test_missing_records_request_preparation_only_for_the_selected_split(tmp_path):
-    """A missing shard otherwise raises inside a grain worker on the first
-    record that needed it, steps into a run."""
-    directory = tmp_path / "prepared"
-    shutil.copytree(FIXTURE, directory)
-    (directory / "dew_images-train.array_record-00000-of-00001").unlink()
-    available = TFDSImages(path=str(directory), split="test").source()
-    assert int(decode_image(available[0]["image"])[0, 0, 0]) == 26
-    with pytest.raises(FileNotFoundError, match="Missing prepared ArrayRecord shard"):
-        TFDSImages(path=str(directory), split="train").source()

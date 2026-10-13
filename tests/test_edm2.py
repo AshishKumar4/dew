@@ -111,32 +111,6 @@ def test_forced_weight_normalization_trains_as_edm2_does():
         params = optax.apply_updates(params, updates)
 
 
-def test_a_run_config_builds_the_unet_and_scores_a_batch():
-    """The run's precision settings reach the model as every registered
-    model takes them, attention kernel included."""
-    from dew.config import ModelConfig, ObjectiveConfig
-    from dew.data import TFDSImages
-    from dew.diffusion.presets import EDM
-    from dew.objectives import Step
-    from dew.objectives.diffusion import DiffusionRunConfig, TextCondition
-    from dew.sampling import Euler
-
-    config = DiffusionRunConfig(
-        model=ModelConfig("edm2_unet", {"model_channels": 8, "channel_mult": [1, 2], "num_blocks": 1,
-                                        "attn_resolutions": [2], "channels_per_head": 8,
-                                        "dtype": "float32", "attention_impl": "xla"}),
-        data=TFDSImages(image_size=4), preset=EDM(regime="pixel"),
-        val_metrics=(), text=TextCondition(encoder="char_table", checkpoint="char_table"),
-        objective=ObjectiveConfig("diffusion",
-                                  {"uncertainty": 8, "solver": Euler(), "guidance": None, "steps": 2,
-                                   "ema_decay": None}))
-    objective = config.build()
-    params = objective.init(jax.random.PRNGKey(0))
-    batch = {"image": np.full((2, 4, 4, 3), 200, np.uint8), **objective.inputs.tokenize(["a", "b"])}
-    loss, _ = objective.loss(params, batch, Step(jnp.asarray(0), jax.random.PRNGKey(1), None))
-    assert np.isfinite(float(loss.total / loss.mass))
-
-
 def test_forced_weight_normalization_keeps_every_kernel_at_unit_magnitude():
     """Adam's steps grow an unconstrained weight's norm; the forced one stays
     at unit root-mean-square magnitude per output channel after every

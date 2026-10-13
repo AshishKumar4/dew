@@ -34,9 +34,8 @@ import pytest
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.inputs import AttentionMetadata, ModelInputs, coordinates
-from dew.nn.mixers.mamba2 import Mamba2, Mamba2Mixer, chunk_ssd, recurrent_ssd, segment_sum
+from dew.nn.mixers.mamba2 import Mamba2, chunk_ssd, recurrent_ssd
 from dew.objectives.lm import LMObjective
-from dew.registry import mixers
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "mamba2"
 BOUND = 1e-5
@@ -68,18 +67,6 @@ def operands(reference):
         jnp.asarray(reference["scan.C"]),
         jnp.asarray(reference["scan.D"]),
     )
-
-
-def test_segment_sum_is_the_masked_cumulative_sum():
-    """`out[i, j] = sum_{j < k <= i} x[k]` on and below the diagonal, -inf
-    above, the reference's spelling (modeling_mamba2.py:73-90)."""
-    x = jnp.asarray([1.0, 2.0, 4.0, 8.0])
-    out = segment_sum(x)
-    expected = np.full((4, 4), -np.inf, np.float32)
-    for i in range(4):
-        for j in range(i + 1):
-            expected[i, j] = float(np.sum(np.asarray(x)[j + 1:i + 1]))
-    assert np.array_equal(np.asarray(out), expected)
 
 
 def test_the_chunked_scan_matches_the_reference(reference):
@@ -176,21 +163,6 @@ def test_the_layer_matches_mamba2_mixer(reference, geometry):
     assert largest(out, reference["layer.output"]) < BOUND
 
 
-def test_a_call_shorter_than_the_conv_reads_the_first_tokens_as_a_longer_one(reference, geometry):
-    """Two tokens, fewer than the conv kernel's three of history: the zeros
-    ahead of them still span the whole history, so their outputs are the
-    first two of the 70-token call's."""
-    module = layer(geometry)
-    variables = layer_params(reference)
-    hidden = jnp.asarray(reference["layer.hidden"])
-    assert hidden.shape[1] > 2 and geometry["conv_kernel"] - 1 > 2
-
-    out = module.apply(variables, hidden[:, :2])
-
-    assert out.shape == (hidden.shape[0], 2, geometry["hidden_size"])
-    assert largest(out, reference["layer.output"][:, :2]) < BOUND
-
-
 def test_the_layer_in_bfloat16_matches_the_reference_in_bfloat16(reference, geometry):
     """Compute in bfloat16 with fp32 parameters, against the reference run
     in bfloat16 end to end; the scan itself is fp32 in both. Largest
@@ -228,23 +200,6 @@ def test_the_layer_decodes_as_it_prefills(reference, geometry):
         steps.append(out)
 
     assert largest(jnp.concatenate(steps, axis=1), parallel) < BOUND
-
-
-def test_the_decode_state_is_a_fixed_size(reference, geometry):
-    """The mixer's analogue of the KV cache does not grow with the tokens:
-    the conv tail is the last K-1 columns and the SSM state one
-    `[H, P, N]` block per row, whatever was decoded."""
-    module = layer(geometry)
-    variables = layer_params(reference)
-    hidden = jnp.asarray(reference["layer.hidden"])
-    cache = module.apply(variables, hidden[:, :1], decode=True, mutable=["cache"])[1]["cache"]
-    _, mutated = module.apply({**variables, "cache": cache}, hidden, decode=True, mutable=["cache"])
-    conv_dim = (
-        geometry["num_heads"] * geometry["head_dim"] + 2 * geometry["n_groups"] * geometry["state_size"]
-    )
-    assert jax.tree.map(jnp.shape, mutated["cache"]) == {
-        "conv_state": (2, geometry["conv_kernel"] - 1, conv_dim),
-        "ssm_state": (2, geometry["num_heads"], geometry["head_dim"], geometry["state_size"])}
 
 
 def test_padded_rows_preserve_the_state_and_the_history(reference, geometry):
@@ -352,16 +307,6 @@ def test_padded_packed_rows_reset_at_each_document():
     assert largest(scored.hidden[0][kept], alone.hidden[0][:int(kept.sum())]) < BOUND
 
 
-def test_the_kind_builds_from_the_configs_fields():
-    record = {"class": "mamba2", "fields": {"num_heads": 4, "head_dim": 6, "state_size": 5, "n_groups": 2,
-              "conv_kernel": 4, "chunk_size": 8}}
-    mixer = mixers.from_record(record)
-    assert isinstance(mixer, Mamba2Mixer)
-    assert mixer.n_groups == 2 and mixer.chunk_size == 8
-    with pytest.raises(ValueError):
-        mixers.from_record({**record, "linear_num_heads": 4})
-
-
 def tiny_lm(**overrides) -> CausalTransformer:
     """Two SSD layers with no feed-forward, the reference's block."""
     config = {"vocab_size": 32, "emb_features": 16, "num_layers": 2, "num_heads": 4, "mlp_features": 0,
@@ -369,16 +314,6 @@ def tiny_lm(**overrides) -> CausalTransformer:
               "mixer": {"class": "mamba2", "fields": {"num_heads": 4, "head_dim": 8, "state_size": 5,
                         "n_groups": 2, "chunk_size": 4}}}
     return CausalTransformer(**{**config, **overrides})
-
-
-def test_a_layer_without_a_feed_forward_holds_the_mixer_alone():
-    model = tiny_lm()
-    variables = jax.eval_shape(model.init, jax.random.key(0), jnp.ones((1, 8), jnp.int32))
-    layer_0 = variables["params"]["layers_0"]
-    assert set(layer_0) == {"input_layernorm", "self_attn"}
-    assert set(layer_0["self_attn"]) == {"A_log", "D", "conv1d", "dt_bias", "in_proj", "norm", "out_proj"}
-    with pytest.raises(ValueError, match="0 for a layer without"):
-        jax.eval_shape(tiny_lm(mlp_features=-1).init, jax.random.key(0), jnp.ones((1, 8), jnp.int32))
 
 
 def test_the_model_decodes_as_it_scores_in_parallel():

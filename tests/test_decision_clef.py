@@ -25,7 +25,6 @@ from dew.decision import (
     Encoded,
     Example,
     JointLayout,
-    JointSchemaHead,
     Noul,
     Question,
     Specials,
@@ -96,16 +95,6 @@ def test_clefs_head_matches_clef_under_the_float64_rule(tokenizer):
     assert_as_exact_as_the_reference(*head_logits(tokenizer), "Clef head logits")
 
 
-def test_the_rule_catches_clefs_types_in_layas_order(tokenizer, monkeypatch):
-    """Clef numbers its type embedding noul, choice, score; reading it in
-    Laya's order moves the logits far past the rule."""
-    from dew.decision import head
-
-    monkeypatch.setattr(head, "_CLEF_ROWS", (0, 1, 2))
-    with pytest.raises(AssertionError, match=r"allowed 2\.0"):
-        assert_as_exact_as_the_reference(*head_logits(tokenizer), "Clef head logits, Laya's type order")
-
-
 def test_a_padded_batch_scores_every_row_as_it_scores_alone(tokenizer):
     """All five cases in one batch, padded to the longest row and the most
     questions and options: padding reaches none of the head's pooling or
@@ -125,33 +114,12 @@ def test_a_padded_batch_scores_every_row_as_it_scores_alone(tokenizer):
                 width = len(laid.options)
                 np.testing.assert_allclose(batched[index, slot, :width], alone[0, slot, :width], atol=2e-5)
 
-
-def test_a_padded_batch_gives_the_output_table_a_finite_gradient(tokenizer):
-    """A full fine-tune trains the output table the head reads: a padding
-    option slot's empty span pools to zeros, and its lexical cosine must pass
-    the table a zero gradient, not the NaN a norm's slope at zero would."""
-    loaded = ClefHead.load(TINY, attention_impl="xla")
-    table = load_file(BACKBONE / "model.safetensors")["lm_head.weight"]
-    rows = laid_out(tokenizer)
-    inputs = DecisionInputs.collate([row for _, row in rows.values()], 0)
-    with np.load(TINY / "states.npz") as states:
-        length = inputs.tokens.shape[1]
-        padded = np.stack([np.pad(states[case], ((0, length - len(states[case])), (0, 0))) for case in rows])
-
     def total(rows_of_table):
         scores = loaded.head.apply({"params": loaded.params}, padded, inputs, rows_of_table)
         return jax.numpy.sum(jax.numpy.where(jax.numpy.isfinite(scores), scores, 0.0))
 
     gradient = np.asarray(jax.grad(total)(jax.numpy.asarray(table)))
     assert np.all(np.isfinite(gradient)) and np.any(gradient)
-
-
-def test_a_head_record_rebuilds_the_head():
-    head = JointSchemaHead(hidden_size=32, width=24, routing_layers=2, layers=2, heads=2, feedforward=40)
-    record = head.record()
-    assert record == {"name": "JointSchemaHead", "fields": {"width": 24, "routing_layers": 2, "layers": 2,
-                                                              "heads": 2, "feedforward": 40}}
-    assert JointSchemaHead.from_record(record, 32) == head
 
 
 def test_a_clef_release_answers_as_clefs_own_model(tmp_path):

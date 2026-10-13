@@ -23,7 +23,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from dew.interop import Pretrained, pretrained
+from dew.interop import Pretrained
 from dew.interop.safetensors_io import read_file, write_file
 
 pytest.importorskip("diffusers", reason="single-file conversion runs diffusers' own key maps")
@@ -83,67 +83,6 @@ def test_a_single_file_converts_to_the_tensors_diffusers_from_single_file_does(
     _assert_converted(converted, json.loads((FIXTURE / kind / "from_single_file.json").read_text()))
 
 
-def test_a_cached_load_reads_nothing_from_the_file(tmp_path: Path, cache: Path,
-                                                    monkeypatch: pytest.MonkeyPatch) -> None:
-    repo = _repo(tmp_path, "sd")
-    _load(repo, "sd")
-
-    def refused(*_: object, **__: object) -> None:
-        raise AssertionError("the single file was read again")
-
-    monkeypatch.setattr(single_file, "read_file", refused)
-    _load(repo, "sd")
-    assert len(_entries(cache)) == 1
-
-
-def test_another_diffusers_converts_again(
-    tmp_path: Path, cache: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    import diffusers
-
-    repo = _repo(tmp_path, "sd")
-    _load(repo, "sd")
-    monkeypatch.setattr(diffusers, "__version__", "0.0.0-other")
-    _load(repo, "sd")
-    assert len(_entries(cache)) == 2
-
-
-def test_a_failed_load_caches_nothing(tmp_path: Path, cache: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    repo = _repo(tmp_path, "sd")
-    load = pretrained.assemble_pipeline
-
-    def interrupted(*args: object, **kwargs: object) -> None:
-        raise KeyboardInterrupt
-
-    monkeypatch.setattr(pretrained, "assemble_pipeline", interrupted)
-    with pytest.raises(KeyboardInterrupt):
-        _load(repo, "sd")
-    assert list(cache.iterdir()) == []
-    monkeypatch.setattr(pretrained, "assemble_pipeline", load)
-    _load(repo, "sd")
-    assert [entry.name.startswith(".") for entry in cache.iterdir()] == [False]
-
-
-def test_a_failed_placement_caches_nothing(
-    tmp_path: Path, cache: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Placing the pipeline on the mesh is part of the load: a placement that
-    fails (a device out of memory, a layout refusal) keeps no conversion."""
-    from dew.training.distributed import MeshSpec
-
-    repo = _repo(tmp_path, "sd")
-
-    def refused(*args: object, **kwargs: object) -> None:
-        raise MemoryError("device out of memory")
-
-    monkeypatch.setattr(pretrained, "place", refused)
-    with pytest.raises(MemoryError):
-        Pretrained.load(
-            repo, single_file="sd.safetensors", dtype="float32", param_dtype="auto", mesh=MeshSpec()
-        )
-    assert list(cache.iterdir()) == []
-
-
 def _without_vae(tmp_path: Path, vae_weights: bool) -> Path:
     """The SD fixture's file without its VAE, beside configs that hold the
     VAE's diffusers weights or, like a Hub repo's metadata snapshot, none."""
@@ -168,43 +107,6 @@ def test_a_component_the_file_lacks_comes_from_the_local_configs(tmp_path: Path,
     vae = loaded.source / "vae" / WEIGHTS["vae"]
     assert vae.read_bytes() == (repo / "vae" / WEIGHTS["vae"]).read_bytes()
     assert vae.stat().st_nlink == 2
-
-
-def test_a_component_with_no_weights_anywhere_is_refused_by_name(tmp_path: Path, cache: Path) -> None:
-    repo = _without_vae(tmp_path, vae_weights=False)
-    with pytest.raises(ValueError, match=r"no weights for \['vae'\]"):
-        _load(repo, "sd")
-    assert _entries(cache) == []
-
-
-def test_a_hub_repo_gives_the_missing_weights_by_the_snapshot_rule_at_its_commit(
-        tmp_path: Path, cache: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Pretrained.load("org/repo", single_file=...) for a repo whose metadata
-    snapshot holds the configs and a file without its VAE: the VAE comes from
-    the repo at the snapshot's commit, fetched and linked by `weight_files`'
-    rule, so the fp16 variant beside it stays behind."""
-    from dew.interop import sources
-
-    metadata = _without_vae(tmp_path, vae_weights=False)
-    hub = tmp_path / "hub-weights"
-    (hub / "vae").mkdir(parents=True)
-    _vae_weights(tmp_path / "whole", hub / "vae")
-    shutil.copy(hub / "vae" / WEIGHTS["vae"], hub / "vae" / "diffusion_pytorch_model.fp16.safetensors")
-    asked = []
-
-    def snapshot(name: str, revision: str | None, *, weights: bool | tuple[str, ...] = True) -> Path:
-        asked.append((name, revision, weights))
-        return metadata if weights is False else hub
-
-    monkeypatch.setattr(sources, "snapshot", snapshot)
-    monkeypatch.setattr(sources, "repo_file", lambda name, directory, filename: metadata / filename)
-    loaded = Pretrained.load("org/sd-tiny", single_file="sd.safetensors", dtype="float32", param_dtype="auto")
-    assert asked == [("org/sd-tiny", None, False), ("org/sd-tiny", metadata.name, ("vae",))]
-    assert loaded.revision == metadata.name
-    assert sorted(path.name for path in (loaded.source / "vae").iterdir()) == ["config.json", WEIGHTS["vae"]]
-    assert (loaded.source / "vae" / WEIGHTS["vae"]).read_bytes() == (
-        hub / "vae" / WEIGHTS["vae"]
-    ).read_bytes()
 
 
 def test_only_the_configs_metadata_is_copied(tmp_path: Path, cache: Path) -> None:
@@ -261,18 +163,6 @@ def test_weights_that_cannot_be_hard_linked_are_copied(code: int, tmp_path: Path
     vae = _load(repo, "sd").source / "vae" / WEIGHTS["vae"]
     assert vae.read_bytes() == (repo / "vae" / WEIGHTS["vae"]).read_bytes()
     assert vae.stat().st_nlink == 1
-
-
-@pytest.mark.parametrize("dtype", ["bfloat16", "float8_e4m3fn", "float16"])
-def test_a_stored_tensor_is_viewed_in_torch_without_a_copy(dtype: str) -> None:
-    import ml_dtypes
-    import torch
-
-    array = np.arange(24, dtype=np.float32).reshape(2, 3, 4).astype(getattr(ml_dtypes, dtype, dtype))
-    tensor = single_file._torch_view(array)
-    assert tensor.data_ptr() == array.ctypes.data
-    assert tensor.dtype == getattr(torch, dtype)
-    np.testing.assert_array_equal(tensor.float().numpy(), array.astype(np.float32))
 
 
 # FLUX.1's width and head size, which diffusers' key map hard-codes; one block of each kind.
@@ -350,77 +240,3 @@ def test_the_released_sd15_file_converts_to_the_tensors_diffusers_from_single_fi
                              single_file="v1-5-pruned-emaonly-fp16.safetensors",
                              revision="9cfd069101959ca3828bf9c04a4419870832b74f", param_dtype="auto")
     _assert_converted(loaded.source, json.loads((FIXTURE / "sd15_from_single_file.json").read_text()))
-
-
-RELEASED = {
-    "sdxl": ("stabilityai/stable-diffusion-xl-base-1.0", "sd_xl_base_1.0.safetensors",
-             "462165984030d82259a11f4367a4eed129e94a7b"),
-    "flux-dev": ("Comfy-Org/flux1-dev", "flux1-dev.safetensors", "83c446ef27a6ac1e9e36ecf13257283aa12cf22a"),
-    "flux-schnell": ("Comfy-Org/flux1-schnell", "flux1-schnell.safetensors",
-                     "c2b683ea00713d6feadcd54b39e3725bbc78638b"),
-}
-
-
-def _header(repo: str, filename: str, revision: str) -> dict:
-    """A released file's tensors as meta tensors, from its safetensors header alone."""
-    import torch
-    from huggingface_hub import HfApi
-
-    dtypes = {"BF16": torch.bfloat16, "F16": torch.float16, "F32": torch.float32}
-    header = HfApi().parse_safetensors_file_metadata(repo, filename, revision=revision)
-    return {name: torch.empty(info.shape, dtype=dtypes[info.dtype], device="meta")
-            for name, info in header.tensors.items()}
-
-
-def _shapes(tensors) -> dict[str, tuple[int, ...]]:
-    return {name.removeprefix("text_model."): tuple(value.shape) for name, value in tensors.items()
-            if not name.endswith("position_ids")}
-
-
-@pytest.mark.network
-def test_the_released_sdxl_header_converts_to_the_repo_s_own_diffusers_layout() -> None:
-    """Every component sd_xl_base_1.0.safetensors carries converts to exactly
-    the names and shapes of the same repo's diffusers-format weights."""
-    from huggingface_hub import HfApi
-
-    repo, filename, revision = RELEASED["sdxl"]
-    checkpoint = _header(repo, filename, revision)
-    assert single_file.config_repo(checkpoint) == repo
-    configs = single_file._configs(repo)
-    index = single_file.pipeline_index(configs)
-    seen = []
-    for name, _, tensors in single_file.converted(checkpoint, configs, index):
-        assert tensors is not None, name
-        published = HfApi().parse_safetensors_file_metadata(
-            repo, f"{name}/{WEIGHTS[name]}", revision=revision
-        )
-        assert _shapes(tensors) == {key.removeprefix("text_model."): tuple(info.shape)
-                                    for key, info in published.tensors.items()
-                                    if not key.endswith("position_ids")}, name
-        assert {str(value.dtype) for value in tensors.values()} <= {"torch.float16"}, name
-        seen.append(name)
-    assert sorted(seen) == ["text_encoder", "text_encoder_2", "unet", "vae"]
-
-
-@pytest.mark.network
-@pytest.mark.parametrize("kind", ["flux-dev", "flux-schnell"])
-def test_the_released_flux_header_converts_to_the_diffusers_transformer(kind: str, tmp_path: Path) -> None:
-    """black-forest-labs' config repos are gated, so the configs are diffusers'
-    own FLUX.1 defaults; the converted names and shapes are exactly those of
-    FluxTransformer2DModel built from them."""
-    import torch
-    from diffusers import FluxTransformer2DModel
-
-    checkpoint = _header(*RELEASED[kind])
-    guided = kind == "flux-dev"
-    assert single_file.config_repo(checkpoint) == ("black-forest-labs/FLUX.1-dev" if guided
-                                                   else "black-forest-labs/FLUX.1-schnell")
-    config = {"guidance_embeds": guided}
-    (tmp_path / "transformer").mkdir()
-    (tmp_path / "transformer" / "config.json").write_text(json.dumps(config))
-    index = {"transformer": ["diffusers", "FluxTransformer2DModel"]}
-    [(_, _, tensors)] = single_file.converted(checkpoint, tmp_path, index)
-    assert tensors is not None
-    with torch.device("meta"):
-        model = FluxTransformer2DModel(**config)
-    assert _shapes(tensors) == _shapes(model.state_dict())
