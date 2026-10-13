@@ -61,7 +61,7 @@ def test_the_platform_is_the_placements():
     """A host-layout run builds its CPU-owned state under `jax.default_device` and steps it under
     `jax.set_mesh` on a GPU host's CPU, where the Triton kernels interpret and no CUDA library is
     asked; a step traced on a GPU's abstract mesh chooses for that GPU, and is this process's GPU
-    only on a GPU host."""
+    only on a GPU host, and never for an assumed GPU, whose step lowers without devices."""
     cpu = jax.devices('cpu')[0]
     mesh = Mesh(np.array([cpu]), ('data',))
     with jax.default_device(cpu):
@@ -71,6 +71,8 @@ def test_the_platform_is_the_placements():
     with jax.sharding.use_abstract_mesh(gpu_mesh(mesh, 'sm90')):
         assert (placed_platform(), backend()) == ('gpu', 'gpu')
         assert gpu_placed() == (jax.default_backend() == 'gpu')
+        with assumed('sm90'):
+            assert (backend(), gpu_placed()) == ('gpu', False)
 
 
 def test_a_platform_keyed_choice_takes_the_assumed_gpus_path():
