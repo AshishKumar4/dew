@@ -41,8 +41,8 @@ def test_a_kernel_traced_for_an_assumed_gpu_lowers_to_a_named_triton_call():
 
 
 # The Triton kernels each Pallas choice a KERNELS row can name lowers to, by their `pallas_call` names,
-# and the probe that runs them: the Clef recipe's step (tools/clef_step.py), an expert layer's forward
-# and backward (`_experts_lowered`), or a Mamba-2 layer's (`_mamba2_lowered`).
+# and the probe that runs them: the decision-model recipe's step (tools/clef_step.py), an expert layer's
+# forward and backward (`_experts_lowered`), or a Mamba-2 layer's (`_mamba2_lowered`).
 FAMILIES = {
     ('grouped_matmul', 'pallas'): ("experts", {"pallas_triton_ragged_dot", "tgmm_ragged_dot"}),
     ('rms_norm', 'pallas'): ("step", {"rms_norm_forward", "rms_norm_backward"}),
