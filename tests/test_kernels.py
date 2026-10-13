@@ -272,14 +272,20 @@ def test_flash_keeps_the_kernel_contract_on_a_mesh(axis, split, without_determin
 
 
 @on_gpu
+@pytest.mark.parametrize("implementation", ["flash", "cudnn"])
 @pytest.mark.parametrize("head_dim", [128, 256])
-def test_flash_is_as_exact_as_the_xla_kernel_from_float64(head_dim, without_deterministic_ops):
-    """At Qwen3.5's grouped causal heads, 8 queries over 2 keys, FlashAttention's output and its
-    three input gradients lie within tests/reference_error.py's rule of the xla kernel's, both
-    measured from float64; on Hopper that holds FlashAttention-3 to it."""
-    flash_here()
-    if head_dim > 192 and kernels.device_generation() in ('sm86', 'sm87', 'sm89'):
-        pytest.skip("FlashAttention-2's backward takes heads over 192 wide only on sm80, sm90 and sm1xx")
+def test_fused_kernels_are_as_exact_as_the_xla_kernel_from_float64(implementation, head_dim,
+                                                                   without_deterministic_ops):
+    """At Qwen3.5's grouped causal heads, 8 queries over 2 keys, FlashAttention's and cuDNN's output
+    and three input gradients lie within tests/reference_error.py's rule of the xla kernel's, both
+    measured from float64; on Hopper that holds FlashAttention-3 and cuDNN's 256-wide heads to it."""
+    from dew.nn.attention import cudnn_max_head_dim
+    if implementation == 'flash':
+        flash_here()
+        if head_dim > 192 and kernels.device_generation() in ('sm86', 'sm87', 'sm89'):
+            pytest.skip("FlashAttention-2's backward takes heads over 192 wide only on sm80, sm90 and sm1xx")
+    elif head_dim > cudnn_max_head_dim():
+        pytest.skip(f"cudnn takes heads at most {cudnn_max_head_dim()} wide on {kernels.device_generation()}")
     query, _, _ = qkv((1, 1024, 8, head_dim))
     _, key, value = qkv((1, 1024, 2, head_dim), seed=1)
     cotangent = qkv((1, 1024, 8, head_dim), seed=2)[0]
@@ -288,7 +294,7 @@ def test_flash_is_as_exact_as_the_xla_kernel_from_float64(head_dim, without_dete
         return jax.jit(lambda q, k, v: scaled_dot_product_attention(
             q, k, v, implementation=implementation, causal=True))
 
-    fused = output_and_gradients(kernel('flash'), cotangent, query, key, value)
+    fused = output_and_gradients(kernel(implementation), cotangent, query, key, value)
     reference = output_and_gradients(kernel('xla'), cotangent, query, key, value)
     with jax.enable_x64(new_val=True):
         wide = [jnp.asarray(np.asarray(x[0], np.float64)) for x in (query, key, value, cotangent)]
