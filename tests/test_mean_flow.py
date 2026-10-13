@@ -61,7 +61,7 @@ def test_a_run_config_trains_meanflow_and_its_saved_task_samples_in_one_step(tmp
 
     from dew.checkpoints import Checkpoints
     from dew.config import ModelConfig, ObjectiveConfig, TrainerConfig
-    from dew.data import TFDSImages
+    from dew.config.data import ImageData
     from dew.objectives.diffusion import DiffusionRunConfig, TextCondition
     from dew.sampling import TextToImage
     from dew.training import Trainer
@@ -72,7 +72,7 @@ def test_a_run_config_trains_meanflow_and_its_saved_task_samples_in_one_step(tmp
             {"patch_size": 2, "emb_features": 16, "num_layers": 1, "num_heads": 2,
              "dtype": "float32", "attention_impl": "xla"},
         ),
-        data=TFDSImages(image_size=4),
+        data=ImageData(source="tfds://oxford_flowers102", image_size=4),
         preset=presets.MeanFlow(),
         val_metrics=(),
         trainer=TrainerConfig(checkpoint_dir=str(tmp_path)),

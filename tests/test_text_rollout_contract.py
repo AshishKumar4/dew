@@ -10,7 +10,7 @@ import pytest
 from model_support import decoder
 from rl_support import clipped_surrogate
 
-from dew.data import Dataset
+from dew.data.dataset import Loader
 from dew.nn.inputs import ModelInputs
 from dew.objectives.base import Step
 from dew.objectives.rl import GRPOObjective, SampledRollout
@@ -175,7 +175,7 @@ def test_real_trainer_update_matches_raw_policy_ratio_with_behavior_recorded():
     assert np.isfinite(loss)
     expected = jax.tree.map(lambda p, g: p - 0.01 * g, params, grads)
     rows = len(batch["prompt"])
-    data = Dataset(train=lambda partition: iter([batch]), val=None, records=rows, batch=rows)
+    data = Loader(train=lambda partition: iter([batch]), val=None, records=rows, batch=rows)
     state = Trainer(objective, optax.sgd(0.01), key=key, rollout=rollout).fit(
         data, steps=1, log_every=1, checkpoint_every=None)
     assert int(state.step) == 1
