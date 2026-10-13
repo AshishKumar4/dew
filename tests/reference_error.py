@@ -82,22 +82,6 @@ def widened(tree):
         leaf, np.float64 if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf.dtype), tree)
 
 
-def equations(graph):
-    """Every equation of a jaxpr, its sub-jaxprs' (scan, cond, custom rules) in turn."""
-    if hasattr(graph, "eqns"):
-        for equation in graph.eqns:
-            yield equation
-            yield from equations(equation.params)
-    elif hasattr(graph, "jaxpr"):
-        yield from equations(graph.jaxpr)
-    elif isinstance(graph, dict):
-        for value in graph.values():
-            yield from equations(value)
-    elif isinstance(graph, (tuple, list)):
-        for value in graph:
-            yield from equations(value)
-
-
 def within(error, bound) -> bool:
     """Whether every `error` is at most its `bound`, both finite. Written as the
     passing condition, so a NaN or infinite error never passes, nor does an

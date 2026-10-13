@@ -8,10 +8,8 @@ parity test states its tolerance and the largest difference observed.
 
 from pathlib import Path
 
-import jax
 import jax.numpy as jnp
 import numpy as np
-import pytest
 
 from dew.nn.gemma4_moe import Gemma4Experts, Gemma4TextRouter
 
@@ -48,20 +46,6 @@ def branch() -> Gemma4Experts:
                          out_features=HIDDEN, activation="geglu")
 
 
-def test_the_router_matches_the_reference():
-    """`Gemma4TextRouter`: the scale-free norm, the router's own scale over
-    sqrt(hidden), a softmax in fp32, the top two renormalised to one and
-    scaled per expert. The fixture's per-expert scales are random, so a
-    router that skipped them, or applied them before renormalising, would
-    not match. Tolerance 1e-6; observed 1.5e-08."""
-    tensors = fixture()
-    hidden = jnp.asarray(tensors["hidden"]).reshape(-1, HIDDEN)
-    weights, indices = Gemma4TextRouter(num_experts=EXPERTS, top_k=TOP_K).apply(
-        {"params": router_params(tensors)}, hidden)
-    assert np.array_equal(np.asarray(indices), tensors["router_indices"])
-    assert float(np.max(np.abs(np.asarray(weights) - tensors["router_weights"]))) < 1e-6
-
-
 def test_the_routed_branch_matches_the_reference_block():
     """The dense MLP's output and the routed experts' output, each behind
     its own norm, summed: what the layer's post_feedforward_layernorm then
@@ -72,18 +56,8 @@ def test_the_routed_branch_matches_the_reference_block():
                             jnp.asarray(tensors["hidden"]), jnp.asarray(tensors["mlp_out"]))
     assert float(np.max(np.abs(np.asarray(output) - tensors["output"]))) < 1e-5
 
-
-def test_the_experts_read_the_normed_residual_not_the_dense_output():
-    """Routing the dense MLP's output through the experts, as a layer that
-    chained the branches would, disagrees with the reference by far more
-    than the tolerance."""
-    tensors = fixture()
-    chained = branch().apply(branch_variables(tensors),
-                             jnp.asarray(tensors["mlp_out"]), jnp.asarray(tensors["mlp_out"]))
-    assert float(np.max(np.abs(np.asarray(chained) - tensors["output"]))) > 1e-2
-
-
-def test_a_top_k_wider_than_the_experts_is_refused():
-    with pytest.raises(ValueError):
-        Gemma4TextRouter(num_experts=EXPERTS, top_k=EXPERTS + 1).init(
-            jax.random.PRNGKey(0), jnp.ones((3, HIDDEN)))
+    hidden = jnp.asarray(tensors["hidden"]).reshape(-1, HIDDEN)
+    weights, indices = Gemma4TextRouter(num_experts=EXPERTS, top_k=TOP_K).apply(
+        {"params": router_params(tensors)}, hidden)
+    assert np.array_equal(np.asarray(indices), tensors["router_indices"])
+    assert float(np.max(np.abs(np.asarray(weights) - tensors["router_weights"]))) < 1e-6

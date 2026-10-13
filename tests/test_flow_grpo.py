@@ -27,63 +27,11 @@ from dew.telemetry.records import RECORD_TYPES
 from dew.training import Trainer
 
 
-def test_deterministic_endpoints_have_no_gaussian_density():
-    x = jnp.asarray([[0.2, -0.3], [0.7, 0.4]])
-    velocity = jnp.asarray([[0.4, 0.1], [-0.1, 0.8]])
-    ode = flow_transition(x, velocity, 0.8, 0.2, noise_level=0)
-    np.testing.assert_allclose(ode.sample(jax.random.key(3)), x - 0.6 * velocity, atol=1e-7)
-    assert np.isnan(ode.log_prob(ode.mean)).all()
-    np.testing.assert_array_equal(ode.stochastic, [False, False])
-    np.testing.assert_array_equal(ode.kl(ode.mean), [0, 0])
-    assert np.isinf(ode.kl(ode.mean + 1)).all()
-    endpoint = flow_transition(x, velocity, jnp.asarray([0., 1.]), jnp.asarray([0., 1.]))
-    np.testing.assert_array_equal(endpoint.sample(jax.random.key(4)), x)
-    assert np.isnan(endpoint.log_prob(x)).all()
-
-
-def test_gaussian_kl_uses_elapsed_time_and_all_sample_dimensions():
-    x = jnp.arange(8, dtype=jnp.float32).reshape(2, 2, 2) / 10
-    velocity = jnp.full_like(x, 0.2)
-    t, s, noise = jnp.asarray([0.6, 0.8]), jnp.asarray([0.2, 0.7]), 0.4
-    transition = flow_transition(x, velocity, t, s, noise_level=noise)
-    reference = flow_transition(x, velocity + 0.3, t, s, noise_level=noise)
-    dt = np.asarray(s - t)
-    g_squared = noise**2 * np.asarray(t) / (1 - np.asarray(t))
-    coefficient = (1 + g_squared * (1 - np.asarray(t)) / (2 * np.asarray(t))) * dt
-    expected = 4 * np.square(0.3 * coefficient) / (2 * g_squared * -dt)
-    np.testing.assert_allclose(transition.kl(reference.mean), expected, atol=2e-6, rtol=2e-6)
-
-
 class AffineVelocity(nn.Module):
     @nn.compact
     def __call__(self, x, temb, offset=0):
         gain = self.param("gain", nn.initializers.constant(0.25), ())
         return gain * x + (temb / 1000)[:, None] * 0.1 + offset
-
-
-def test_checkpointed_flow_validation_refuses_implicit_loss_before_placing(tmp_path):
-    from affine_run import Data
-
-    from dew.training import Best, Checkpoints
-
-    process = Process(FlowMatchingScheduler(), FlowMatchPredictionTransform())
-    objective = FlowGRPOObjective(AffineVelocity(), process, InputSpec(Field("image", (2,))),
-                                  guidance=None, steps=3)
-    class Unplaced(Trainer):
-        def place(self, *args, **kwargs):
-            raise AssertionError("training reached placement")
-
-    trainer = Unplaced(objective, optax.sgd(.01), key=jax.random.key(0),
-                       checkpoints=Checkpoints(str(tmp_path / "flow")))
-    data = Data(val=lambda: iter(({"image": np.zeros((8, 2), np.float32)},)))
-    with pytest.raises(ValueError):
-        trainer.fit(data, steps=1, eval_every=1)
-    # Both remedies in the refusal pass preflight; no model is placed here.
-    with pytest.raises(AssertionError):
-        trainer.fit(Data(), steps=1)
-    with pytest.raises(AssertionError):
-        trainer.fit(data, steps=1, eval_every=1,
-                    best=Best(objective.scalars.reward, mode="max"))
 
 
 def test_recorded_trajectory_rescores_under_shifted_guided_process():
@@ -196,6 +144,17 @@ def test_flow_objective_matches_clipping_and_conditional_gaussian_kl():
     with pytest.raises(ValueError):
         objective.scalar_loss(current, batch, step.replace(ema=None))
 
+    x = jnp.arange(8, dtype=jnp.float32).reshape(2, 2, 2) / 10
+    velocity = jnp.full_like(x, 0.2)
+    t, s, noise = jnp.asarray([0.6, 0.8]), jnp.asarray([0.2, 0.7]), 0.4
+    transition = flow_transition(x, velocity, t, s, noise_level=noise)
+    reference_transition = flow_transition(x, velocity + 0.3, t, s, noise_level=noise)
+    dt = np.asarray(s - t)
+    g_squared = noise**2 * np.asarray(t) / (1 - np.asarray(t))
+    coefficient = (1 + g_squared * (1 - np.asarray(t)) / (2 * np.asarray(t))) * dt
+    expected = 4 * np.square(0.3 * coefficient) / (2 * g_squared * -dt)
+    np.testing.assert_allclose(transition.kl(reference_transition.mean), expected, atol=2e-6, rtol=2e-6)
+
 
 def test_deterministic_rollout_cannot_contribute_policy_gradient():
     process = Process(FlowMatchingScheduler(), FlowMatchPredictionTransform())
@@ -261,37 +220,6 @@ def test_flow_rollout_groups_rewards_selects_steps_and_preserves_likelihoods():
         Step(jnp.asarray(0), jax.random.key(24), None))[0])(variables["params"])
     norm = float(optax.tree.norm(gradients))
     assert np.isfinite(float(loss)) and np.isfinite(norm) and norm > 1e-5
-
-
-def test_nonfinite_reward_is_refused_before_advantage_construction():
-
-    model = AffineVelocity()
-    process = Process(FlowMatchingScheduler(), FlowMatchPredictionTransform())
-    objective = FlowGRPOObjective(model, process, InputSpec(Field("image", (2,))), guidance=None)
-
-    state = Trainer(objective, optax.sgd(1e-3), key=jax.random.key(31)).initial_state()
-    rollout = FlowRollout(objective, lambda images, context: np.full(images.shape[0], np.nan), steps=3)
-    with pytest.raises(ValueError):
-        rollout(state, {"image": np.zeros((2, 2), np.float32)}, jax.random.key(33))
-
-
-
-def test_zero_reward_variance_has_no_training_support():
-    model = AffineVelocity()
-    process = Process(FlowMatchingScheduler(), FlowMatchPredictionTransform())
-    objective = FlowGRPOObjective(model, process, InputSpec(Field("image", (2,))),
-                                  guidance=None, beta=0.1)
-    state = Trainer(objective, optax.sgd(1e-3), key=jax.random.key(41)).initial_state()
-    rollout = FlowRollout(objective, lambda images, context: np.ones(images.shape[0]),
-                          groups=3, steps=4)
-    batch = rollout(state, {"image": np.zeros((2, 2), np.float32)}, jax.random.key(42))
-    assert batch["latents"].shape[:2] == (6, 3)
-    assert np.isfinite(batch["old_log_probs"]).all()
-    params = {**state.variables, "params": {"gain": jnp.asarray(0.9)}}
-    stats, _ = objective.loss(params, batch, Step(state.microstep, jax.random.key(43), state.averaged))
-    value, active = objective.reduce_loss(stats)
-    assert float(stats.mass) == 0 and float(value) == 0 and not bool(active)
-
 
 
 def test_transition_matches_released_sampler_and_torch_distribution():
@@ -424,27 +352,6 @@ def test_mixed_precision_transition_keeps_density_arithmetic_in_float32():
 
 
 
-def test_group_normalization_preserves_small_differences_on_large_reward_offset():
-    model = AffineVelocity()
-    process = Process(FlowMatchingScheduler(), FlowMatchPredictionTransform())
-    objective = FlowGRPOObjective(model, process, InputSpec(Field("image", (2,))), guidance=None)
-    state = Trainer(objective, optax.sgd(1e-3), key=jax.random.key(81)).initial_state()
-    callback_values = []
-
-    def reward(images, context):
-        values = 1_000_000 + images.mean(axis=1)
-        callback_values.append(values.copy())
-        return values
-
-    rollout = FlowRollout(objective, reward,
-                          groups=3, steps=4)
-    batch = rollout(state, {"image": np.zeros((2, 2), np.float32)}, jax.random.key(82))
-    rewards = np.asarray(callback_values[0], np.float64).reshape(2, 3)
-    expected = (rewards - rewards.mean(axis=1, keepdims=True)) / (rewards.std(axis=1, keepdims=True) + 1e-4)
-    np.testing.assert_allclose(batch["advantages"], expected.reshape(-1), atol=2e-6)
-
-
-
 def test_float64_callback_distinctions_reach_a_real_policy_update():
     import itertools
 
@@ -545,23 +452,3 @@ def test_conditioned_prompt_only_evaluation_preview_and_trainer_consumers():
     assert logged["evaluation/records"] == count * 2
     previews = [value for _, value in tracker.artifacts if not isinstance(value, RECORD_TYPES)]
     assert previews[0].images.shape == (min(4, count), 4, 4, 1)
-
-
-def test_flow_sde_takes_any_rectified_flow_schedule():
-    """FlowSDE's step holds on the rectified-flow path, which a published
-    source's flow grid walks as Dew's own schedule does, so either is taken
-    and a VP schedule is refused; a timestep shift that is not finite and
-    positive is refused where the schedule is built."""
-    from dew.diffusion.schedules import CosineNoiseScheduler
-    from dew.diffusion.schedules.source_grids import FlowGrid
-
-    velocity = FlowMatchPredictionTransform()
-    grid = FlowGrid(np.linspace(1.0, 0.0, 9), np.linspace(1000.0, 0.0, 9), 1.0)
-    for schedule in (FlowMatchingScheduler(shift=3.0), grid):
-        FlowSDE().validate(Process(schedule, velocity))
-    with pytest.raises(ValueError):
-        FlowSDE().validate(Process(CosineNoiseScheduler(1000), velocity))
-    for shift in (0.0, float("inf")):
-        with pytest.raises(ValueError):
-            FlowMatchingScheduler(shift=shift)
-

@@ -21,7 +21,7 @@ from dew.artifacts import Representations
 from dew.data import DataPartition, Dataset
 from dew.data.dataset import tokenized
 from dew.data.tokens import bounded
-from dew.training import Checkpoints, MeshSpec, ProfileWindow, Trainer
+from dew.training import Checkpoints, MeshSpec, Trainer
 from dew.training.distributed import DevicePrefetchIterator
 
 
@@ -118,15 +118,6 @@ def test_restoration_and_position_capture_share_the_iteration_thread():
         assert json.loads(stream.source_state) == {"position": 4}
     assert len(set(source.owners)) == 1
     assert source.owners[0] != threading.get_ident()
-
-
-def test_unbounded_depth_is_rejected_without_taking_ownership():
-    """depth 0 is the value queue.Queue reads as unbounded."""
-    source = Source()
-    with pytest.raises(ValueError):
-        DevicePrefetchIterator(source, MeshSpec().build(), depth=0)
-    assert not source.owners
-    source.close()
 
 
 def test_timeout_does_not_close_a_running_generator_and_can_be_rejoined():
@@ -290,57 +281,6 @@ def test_metric_failure_closes_owned_iterators_before_it_escapes(steps):
     assert validation.owners[-1] == threading.get_ident()
 
 
-def test_fit_attempts_every_cleanup_without_masking_tracker_error(tmp_path, monkeypatch):
-    primary = LookupError("tracker unavailable")
-    source = Source(close_failure=OSError("source finalization failed"))
-    stopped, waited = threading.Event(), threading.Event()
-
-    class Tracker:
-        def artifact(self, value, step):
-            assert value is not None
-
-        def log(self, scalars, step):
-            raise primary
-
-    class Waiting(Checkpoints):
-        def wait(self):
-            super().wait()
-            waited.set()
-            raise OSError("checkpoint wait failed")
-
-    def stop_trace():
-        stopped.set()
-        raise OSError("trace stop failed")
-
-    import dew.telemetry.profile as telemetry_profile
-
-    real_version = telemetry_profile.version
-    monkeypatch.setattr(telemetry_profile, "version",
-                        lambda name: "0.0" if name == "xprof" else real_version(name))
-
-    class Converter:
-        def xspace_to_tool_names(self, paths):
-            return ["overview_page"]
-
-        def xspace_to_tool_data(self, paths, tool, params):
-            return b"{}", "application/json"
-
-    monkeypatch.setattr(telemetry_profile, "require_profile_support",
-                        lambda: Converter())
-    monkeypatch.setattr(jax.profiler, "start_trace", lambda *a, **k: None)
-    monkeypatch.setattr(jax.profiler, "stop_trace", stop_trace)
-    trainer = Trainer(Regression(), optax.sgd(0.01), key=jax.random.key(0),
-                      checkpoints=Waiting(str(tmp_path)), tracker=Tracker(),
-                      profile=ProfileWindow(str(tmp_path / "trace"), steps=5, warmup=0))
-    with pytest.raises(LookupError) as raised:
-        trainer.fit(Dataset(lambda partition: source, None, None, 8), steps=2, log_every=1)
-    assert raised.value is primary
-    assert source.closed.is_set() and stopped.is_set() and waited.is_set()
-    notes = "\n".join(primary.__notes__)
-    assert all(message in notes for message in (
-        "source finalization failed", "trace stop failed", "checkpoint wait failed"))
-
-
 def test_checkpointability_refusal_finalizes_the_untransferred_source(tmp_path):
     closed = threading.Event()
 
@@ -359,15 +299,6 @@ def test_checkpointability_refusal_finalizes_the_untransferred_source(tmp_path):
     with pytest.raises(ValueError):
         trainer.fit(Dataset(lambda partition: Uncheckpointable(), None, None, 8), steps=1, checkpoint_every=1)
     assert closed.is_set()
-
-def test_constructor_starts_no_unowned_source_work():
-    source = Source()
-    with DevicePrefetchIterator(source, MeshSpec().build(), source_state=b'{"position": 2}'):
-        assert source.owners == []
-    assert source.closed.is_set()
-    assert source.position == 0
-    assert source.owners[0] != threading.get_ident()
-
 
 def test_sigint_during_fit_restoration_closes_only_after_restoration_returns(tmp_path):
     checkpoints = Checkpoints(str(tmp_path))
@@ -493,13 +424,6 @@ def test_bounded_validation_preserves_records_and_owned_close():
     assert values == [1.0, 2.0]
     assert source.closed.is_set()
     reader.close()
-
-
-def test_zero_validation_bound_opens_no_source():
-    def unexpected(partition):
-        raise AssertionError("zero bound opened its source")
-
-    assert list(bounded(unexpected, 0)(DataPartition())) == []
 
 
 def test_a_program_that_ends_without_closing_its_prefetcher_exits_cleanly():

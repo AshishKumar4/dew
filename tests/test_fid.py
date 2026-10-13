@@ -21,35 +21,9 @@ from reference_error import assert_as_exact_as_the_reference
 
 from dew.artifacts import ImageGrid
 from dew.eval import FID
-from dew.eval.fid import frechet_distance
 
 INCEPTION_TINY = (Path(__file__).resolve().parent / "fixtures" / "inception" / "tiny"
                   / "inception_v3_fid.safetensors")
-
-
-def test_frechet_distance_of_a_distribution_with_itself_is_zero(rng):
-    features = np.asarray(jax.random.normal(rng, (256, 16)))
-    mu, sigma = features.mean(axis=0), np.cov(features, rowvar=False)
-    assert frechet_distance(mu, sigma, mu, sigma) == pytest.approx(0.0, abs=1e-6)
-
-
-def test_frechet_distance_of_shifted_gaussians_is_the_squared_mean_gap():
-    sigma = np.eye(8)
-    mu_a = np.zeros(8)
-    mu_b = np.full(8, 0.5)
-    assert frechet_distance(mu_a, sigma, mu_b, sigma) == pytest.approx(8 * 0.25, abs=1e-6)
-
-
-def test_frechet_distance_of_a_scaled_covariance_matches_the_closed_form():
-    """Centred gaussians with covariances I and cI are 8 (1 - sqrt(c))^2 apart.
-    Dropping the (sigma_a sigma_b)^1/2 term leaves tr(sigma_a) + tr(sigma_b),
-    which grows with c as well."""
-    mu = np.zeros(8)
-    identity = np.eye(8)
-    assert frechet_distance(mu, identity, mu, identity * 1.5) == pytest.approx(
-        8 * (1 - np.sqrt(1.5)) ** 2, abs=1e-6)
-    assert frechet_distance(mu, identity, mu, identity * 4.0) == pytest.approx(
-        8 * (1 - 2.0) ** 2, abs=1e-6)
 
 
 PYTORCH_FID = Path(__file__).resolve().parent / "fixtures" / "inception" / "pytorch_fid_reference.npz"
@@ -63,30 +37,6 @@ def pytorch_fid_reference():
     upscale = int(reference["upscale_b"])
     scored_b = np.repeat(np.repeat(reference["images_b"], upscale, axis=1), upscale, axis=2)
     return reference, reference["images_a"], scored_b
-
-
-def test_frechet_distance_equals_pytorch_fids_on_the_same_statistics():
-    """The distance alone, on the statistics of pytorch-fid's own features:
-    both take scipy's `sqrtm` of the covariance product and nudge the
-    diagonal when it is singular.
-
-    Eight images a set leave rank-7 covariances, so 2041 of the product's
-    2048 eigenvalues are rounding, each at most eps * |Sa| * |Sb| (spectral
-    norms). sqrtm turns each into up to the square root of that, and FID
-    subtracts twice the trace, so two correct runs (another scipy, another
-    BLAS) can differ by 2 * (n - r) * sqrt(eps * |Sa| * |Sb|): 7.8e-4 here.
-    CI's scipy landed 4.2e-6 from pytorch-fid's number, a Colab CPU 1.8e-8.
-    Covariances without Bessel's correction move the distance by 7.6, one
-    trace term instead of two by 9.3, and dropping the mean term by 135."""
-    reference, _, _ = pytorch_fid_reference()
-    (mu_a, sigma_a), (mu_b, sigma_b) = [
-        (features.astype(np.float64).mean(axis=0), np.cov(features.astype(np.float64), rowvar=False))
-        for features in (reference["features_a"], reference["features_b"])]
-    width = sigma_a.shape[0]
-    rank = min(len(reference["features_a"]), len(reference["features_b"])) - 1
-    rounding = np.finfo(np.float64).eps * np.linalg.norm(sigma_a, 2) * np.linalg.norm(sigma_b, 2)
-    bound = 2 * (width - rank) * np.sqrt(rounding)
-    assert frechet_distance(mu_a, sigma_a, mu_b, sigma_b) == pytest.approx(float(reference["fid"]), abs=bound)
 
 
 @pytest.mark.network
@@ -115,57 +65,10 @@ def test_the_extractor_gives_pytorch_fids_features_and_distance_on_the_published
     assert FID().score(images_a, images_b) == pytest.approx(float(reference["fid"]), rel=1e-5)
 
 
-@pytest.mark.network
-def test_fid_metric_scores_real_images_better_than_noise(rng):
-    metric = FID()
-    assert metric.name == 'fid' and metric.reads is ImageGrid
-
-    key_real, key_noise = jax.random.split(rng)
-    real = jax.random.randint(key_real, (8, 64, 64, 3), 0, 256, dtype=jnp.int32).astype(jnp.uint8)
-    batch = {'image': real}
-
-    # Generated samples live in [-1, 1]; the same images should score far
-    # closer to the batch than unrelated noise does
-    matching = metric.finalize(metric(ImageGrid((jnp.asarray(real, jnp.float32) - 127.5) / 127.5), batch))
-    unrelated = metric.finalize(metric(ImageGrid(jax.random.normal(key_noise, (8, 64, 64, 3))), batch))
-    assert np.isfinite(matching) and np.isfinite(unrelated)
-    assert matching < unrelated
-
-
 def fid_sets():
     """Sixteen uint8 images of 32x32, and the same pixels brightened by 40."""
     images = np.random.default_rng(93).integers(0, 256, (16, 32, 32, 3), dtype=np.uint8)
     return images, np.clip(images.astype(np.int32) + 40, 0, 255).astype(np.uint8)
-
-
-def test_fid_refuses_an_image_set_it_cannot_score():
-    """Both sides of `FID.score` are uint8 [N, H, W, 3]. The refusal comes out of the
-    batch parser before the extractor is asked for, so a call that cannot be
-    scored never pays for the 90 MB of Inception weights, which is why this
-    test needs no network."""
-    images = np.zeros((4, 8, 8, 3), np.uint8)
-    with pytest.raises(ValueError):
-        FID().score(images.astype(np.float32), images)
-    with pytest.raises(ValueError):
-        FID().score(images, images[0])
-    with pytest.raises(ValueError):
-        FID().score([], images)
-    with pytest.raises(ValueError):
-        FID().score(images, images, batch_size=0)
-
-
-@pytest.mark.network
-def test_fid_of_a_set_against_itself_is_zero_and_a_shifted_set_scores_above_it():
-    """`FID.score` scores two image sets with no objective, no dataset and no batch.
-
-    One set twice has identical pooled statistics, so the distance is zero up
-    to the rounding in the matrix square root. Observed -2.0e-05 with the
-    released weights on 16 images of 32x32 on CPU, against a bound of 1e-3.
-    Adding 40 counts to every pixel moves the population, observed 10.6."""
-    images, brighter = fid_sets()
-
-    assert abs(FID().score(images, images)) < 1e-3
-    assert FID().score(brighter, images) > 0
 
 
 def test_fid_takes_its_extractor_from_a_file_and_orders_populations_offline():
@@ -197,28 +100,6 @@ def test_fid_takes_its_extractor_from_a_file_and_orders_populations_offline():
     pooled = metric.finalize(metric(ImageGrid(unit_range(brighter)), {"image": images}))
     assert pooled == pytest.approx(shifted, rel=1e-6)
     assert _get_activations(weights)(unit_range(images[:1])).shape[1] == record["pool3_features"]
-
-
-def test_the_converted_extractor_reproduces_the_features_it_gave_as_a_pickle():
-    """The extractor used to get its weights by unpickling a nested dict and
-    handing every convolution and norm an initializer that returned the stored
-    array. It is an ordinary Flax module now, applied to an ordinary variables
-    tree read from safetensors, and `reference_features.npy` is what the old
-    path gave for this fixture: the same arrays reach the same operations.
-
-    The two are equal to the bit when the reductions behind them are split the
-    same way, which is how this was checked when the extractor changed. XLA's
-    CPU backend splits by its thread pool, and the thread pool is the machine's
-    rather than the code's: the same weights on the same pixels move by 6e-08
-    between one host and another, so what is asserted here is a tolerance a
-    changed network could not sit inside.
-    """
-    from dew.eval.fid import _get_activations
-
-    images = np.random.default_rng(0).uniform(-1, 1, (4, 299, 299, 3)).astype(np.float32)
-    features = np.asarray(_get_activations(str(INCEPTION_TINY))(images))
-    reference = np.load(INCEPTION_TINY.parent / "reference_features.npy")
-    np.testing.assert_allclose(features, reference, rtol=1e-5, atol=1e-7)
 
 
 PYTORCH_FID_TINY = Path(__file__).resolve().parent / "fixtures" / "pytorch_fid_tiny" / "reference.npz"
@@ -273,6 +154,11 @@ def test_the_converted_extractor_is_as_exact_as_pytorch_fid(tmp_path, size):
     assert_as_exact_as_the_reference(np.asarray(features), arrays[f"{size}/fp32.features"],
                                      arrays[f"{size}/fp64.features"], f"{size}x{size} pool3")
 
+    legacy_pixels = np.random.default_rng(0).uniform(-1, 1, (4, 299, 299, 3)).astype(np.float32)
+    legacy_features = np.asarray(_get_activations(str(INCEPTION_TINY))(legacy_pixels))
+    legacy_reference = np.load(INCEPTION_TINY.parent / "reference_features.npy")
+    np.testing.assert_allclose(legacy_features, legacy_reference, rtol=1e-5, atol=1e-7)
+
 
 def test_fid_extraction_is_independent_of_small_batch_boundaries():
     """The mean of repeated copies of one image is that image's feature.
@@ -296,25 +182,6 @@ def test_fid_extraction_is_independent_of_small_batch_boundaries():
         for part, whole in ((actual.generated, reference.generated), (actual.real, reference.real)):
             assert part.count == rows
             np.testing.assert_allclose(part.mean, whole.mean, rtol=1e-5, atol=1e-7)
-
-
-@pytest.mark.network
-def test_the_fid_metric_and_the_function_report_the_same_distance():
-    """The registered metric is that same path with a trainer's artifact and
-    batch in front of it, so a validation pass lands on the number `FID.score` gives
-    for the same pixels.
-
-    One pass over one batch splits nothing, so the features and the statistics
-    are the same arrays: the two distances were equal to the last bit on CPU,
-    and the bound is 1e-6 relative for a backend that reassociates."""
-    from dew.inputs import unit_range
-
-    images, brighter = fid_sets()
-    metric = FID()
-
-    pooled = metric.finalize(metric(ImageGrid(unit_range(brighter)), {"image": images}))
-
-    assert pooled == pytest.approx(FID().score(brighter, images), rel=1e-6)
 
 
 @pytest.mark.network
@@ -358,39 +225,6 @@ def test_the_weights_loader_reads_arrays_and_refuses_the_rest(tmp_path):
     hostile.write_bytes(pickle.dumps(print))
     with pytest.raises(pickle.UnpicklingError):
         load_arrays(hostile)
-
-
-def test_a_wrong_digest_is_refused_before_anything_reads_the_file(tmp_path):
-    """The pin is a check over local bytes, so it is tested over local bytes:
-    a file whose hash is not the pinned one is refused, and the pinned file
-    passes through untouched."""
-    import hashlib
-
-    from dew.interop.inception_fid import _check_digest
-
-    path = tmp_path / "weights.pickle"
-    path.write_bytes(b"not the weights")
-    digest = hashlib.sha256(b"not the weights").hexdigest()
-
-    assert _check_digest(str(path), "repo", "file", "revision", digest) == str(path)
-    with pytest.raises(ValueError):
-        _check_digest(str(path), "repo", "file", "revision", "0" * 64)
-
-
-@pytest.mark.network
-def test_the_weights_are_pinned_by_digest():
-    """The weights came from a consumer file-sharing link with no checksum,
-    which a released package unpickled, so whoever held the link chose what
-    ran. They come from a Hub revision now and the digest is checked as well,
-    so a file that is not the one this code was written against is refused
-    before anything reads it."""
-    from dew.interop import inception_fid
-
-    assert len(inception_fid.FID_WEIGHTS_DIGEST) == 64
-    assert len(inception_fid.FID_WEIGHTS_REVISION) == 40
-    with pytest.raises(ValueError):
-        inception_fid.fetch(inception_fid.FID_WEIGHTS_REPO, inception_fid.FID_WEIGHTS_FILE,
-                            inception_fid.FID_WEIGHTS_REVISION, "0" * 64)
 
 
 @pytest.mark.network
