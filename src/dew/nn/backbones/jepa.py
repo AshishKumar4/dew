@@ -31,10 +31,14 @@ import numpy as np
 from flax import linen as nn
 
 from ..attention import LayerNorm
-from ..dit import ROPE_THETA, ModulatedBlock, _JepaStackOptions, build_block_pattern, scan_ordered_pos_embed
+from ..dit import (
+    ModulatedBlock,
+    _JepaStackOptions,
+    build_block_pattern,
+    factorized_walk,
+    scan_ordered_pos_embed,
+)
 from ..flops import MissingFlopsCount, counted_flops, projection_flops, real_lengths
-from ..precision import at_least_fp32
-from ..rope import rotary_freqs
 from ..scan_orders import ScanOrder
 from ..sharding import constrain, down_projection, rows_like
 from .dit import gather_tokens
@@ -119,15 +123,10 @@ class FactorizedTokenStack(_JepaStackOptions):
 
     def __call__(self, tokens, train: bool = False):
         B, T, N, F = tokens.shape
-        freqs_temporal = rotary_freqs(jnp.arange(T), self.features // self.num_heads, ROPE_THETA,
-                                      dtype=at_least_fp32(tokens.dtype))
-
-        tokens = tokens.reshape(B * T, N, F)
-        for spatial, temporal in zip(self.spatial, self.temporal, strict=True):
-            tokens = spatial(tokens, train=train)
-            tokens = tokens.reshape(B, T, N, F).transpose(0, 2, 1, 3).reshape(B * N, T, F)
-            tokens = temporal(tokens, freqs_cis=freqs_temporal, train=train)
-            tokens = tokens.reshape(B, N, T, F).transpose(0, 2, 1, 3).reshape(B * T, N, F)
+        tokens = factorized_walk(tokens.reshape(B * T, N, F), T, self.features // self.num_heads, [
+            (lambda x, stack=spatial: stack(x, train=train),
+             lambda x, rotation, stack=temporal: stack(x, freqs_cis=rotation, train=train))
+            for spatial, temporal in zip(self.spatial, self.temporal, strict=True)])
         return tokens.reshape(B, T, N, F)
 
 
