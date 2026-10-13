@@ -22,6 +22,7 @@ This module imports neither torch nor torchax until a load asks for them.
 from __future__ import annotations
 
 import fnmatch
+import functools
 import importlib.metadata
 import json
 import math
@@ -176,25 +177,11 @@ class TorchGraph:
 
         Both are traced with torchax's random key as an input, so a draw on
         the device is part of the program, and torch's random functions are
-        counted, so a draw on the host decided at trace time (OPT's layer
-        drop, `torch.rand([])`) is seen too. Another program or another
-        count is another forward."""
+        counted, since a draw on the host is decided at trace time (OPT's
+        layer drop, `torch.rand([])`) and leaves the program alone. Another
+        program or another count is another forward."""
         import torch
         import torchax
-        from torch.overrides import TorchFunctionMode
-
-        drawing = (torch.rand, torch.rand_like, torch.randn, torch.randn_like, torch.randint,
-                   torch.randint_like, torch.randperm, torch.bernoulli, torch.multinomial, torch.normal,
-                   torch.Tensor.uniform_, torch.Tensor.normal_, torch.Tensor.bernoulli_,
-                   torch.Tensor.random_, torch.Tensor.exponential_, torch.nn.functional.dropout)
-
-        class Draws(TorchFunctionMode):
-            """Counts the calls of torch's random functions while it is entered."""
-            count = 0
-
-            def __torch_function__(self, func, types, args=(), kwargs=None):
-                self.count += func in drawing
-                return func(*args, **(kwargs or {}))
 
         env = torchax.default_env()
         shapes = jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(jnp.shape(leaf), jnp.result_type(leaf)),
@@ -210,11 +197,16 @@ class TorchGraph:
                         return self._forward(*arguments)
 
                 self.module.train(training)
+                draws = []
+                drawing = {name: getattr(torch, name) for name in _DRAWS}
+                for name, draw in drawing.items():
+                    setattr(torch, name, functools.partial(_counted, draw, draws))
                 try:
-                    with Draws() as draws:
-                        program = str(jax.make_jaxpr(forward)(jax.random.key(0), *shapes))
-                    traces.append((program, draws.count))
+                    program = str(jax.make_jaxpr(forward)(jax.random.key(0), *shapes))
+                    traces.append((program, len(draws)))
                 finally:
+                    for name, draw in drawing.items():
+                        setattr(torch, name, draw)
                     self.module.eval()
             self._differs[signature] = traces[0] != traces[1]
         return self._differs[signature]
@@ -231,6 +223,16 @@ class TorchGraph:
         tensors = {name: np.asarray(leaf) for name, leaf in params.items()}
         tensors.update({name: np.asarray(buffers[name]) for name in self.persistent})
         return tensors
+
+
+_DRAWS = ("rand", "rand_like", "randn", "randn_like", "randint", "randint_like", "randperm", "bernoulli",
+          "multinomial", "normal")
+"""torch's random functions, which a module calls as `torch.<name>`."""
+
+
+def _counted(draw, draws: list, *args, **kwargs):
+    draws.append(draw)
+    return draw(*args, **kwargs)
 
 
 def _forward(model: PreTrainedModel, tokens: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
