@@ -374,6 +374,9 @@ class _FitRun:
     preempted: int | None = None
     notice: PreemptionNotice | None = None
     endless: bool = False
+    reads: dict[Signature, tuple[bool, ...]] = dataclasses.field(default_factory=dict)
+    """Which leaves of a batch of each signature its compiled step reads
+    (`step_reads`), which the prefetcher alone places."""
 
     def read(self) -> Batch:
         """The training stream's next batch, read through this run each time:
@@ -510,9 +513,6 @@ class Trainer(Generic[Loss, Effects]):
         self._rows: tuple[int, ...] | None = None
         # The training batch's device steps, which the compiled step runs (`Loader.device`).
         self._device: tuple[DeviceStep, ...] = ()
-        # Which leaves of a batch of each signature its compiled step reads (`step_reads`),
-        # which the prefetcher alone places.
-        self._batch_reads: dict[Signature, tuple[bool, ...]] = {}
 
     @property
     def optimizer(self) -> optax.GradientTransformation:
@@ -1519,6 +1519,8 @@ class Trainer(Generic[Loss, Effects]):
                     agreed("training input declaration", functools.partial(inputs.check, checked))
                 known, began = len(compiled), time.perf_counter()
                 train_step, measured_flops, state = self._compiled_for(compiled, state, batch)
+                if len(compiled) > known and self.executable is not None and not self.host_master:
+                    run.reads[batch_signature(batch)] = step_reads(self.executable)
                 interval.compiles = len(compiled)
                 if not known:
                     # Rebound once the step is compiled, so the first tick
@@ -1657,7 +1659,7 @@ class Trainer(Generic[Loss, Effects]):
             run.endless = stream_endless(run.source)
             run.train = DevicePrefetchIterator(run.source, mesh, source_state=position,
                                                 prepare=self._counted_batch if self.rollout is None else None,
-                                                reads=self._batch_reads)
+                                                reads=run.reads)
             run.source = None  # Lifetime transferred to the prefetch worker.
 
         trained = [entry.module for entry in self.objective.program_key() if entry.trained]
@@ -2137,8 +2139,6 @@ class Trainer(Generic[Loss, Effects]):
             began = time.perf_counter()
             with region("compile"):
                 compiled[signature] = (self.compile(state, batch, timer), self.step_flops)
-            if self.executable is not None and not self.host_master:
-                self._batch_reads[signature] = step_reads(self.executable)
             seconds = time.perf_counter() - began
             links = {axis: AxisLink(link.bytes_per_second, link.spread)
                      for axis, link in self.links.items()}
