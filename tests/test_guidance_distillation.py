@@ -17,7 +17,8 @@ from dew.checkpoints import Checkpoints
 from dew.config import ModelConfig, ObjectiveConfig, TrainerConfig
 from dew.data import TFDSImages
 from dew.diffusion import broadcast_rates
-from dew.diffusion.presets import Flow
+from dew.diffusion.presets import EDM, Flow
+from dew.diffusion.process import aligned_conditions
 from dew.inputs import unit_range
 from dew.objectives.base import TEACHER, Step
 from dew.objectives.diffusion import DiffusionRunConfig, GuidanceDistillationObjective, TextCondition
@@ -40,16 +41,18 @@ FLUX = {
 }
 
 
-@pytest.fixture(scope="module")
-def runs(tmp_path_factory):
+@pytest.fixture(scope="module", params=[Flow(), EDM(regime="pixel")], ids=["flow", "edm"])
+def runs(tmp_path_factory, request):
     """A tiny guidance-embedded Flux teacher, trained a step and saved, and
-    the config of a student that distills it."""
+    the config of a student that distills it: under flow matching, whose
+    training and sampling schedules are one, and under EDM, whose training
+    times are standard-normal draws its Karras sampling grid reads otherwise."""
     root = tmp_path_factory.mktemp("guidance")
     with tarfile.open(FIXTURES / "flux_source.tar.xz") as archive:
         archive.extractall(root / "flux", filter="data")
     teacher = DiffusionRunConfig(
         model=ModelConfig("flux_transformer", {**FLUX, "dtype": "float32", "attention_impl": "xla"}),
-        data=TFDSImages(image_size=8), preset=Flow(), val_metrics=(),
+        data=TFDSImages(image_size=8), preset=request.param, val_metrics=(),
         trainer=TrainerConfig(checkpoint_dir=str(root)),
         text=TextCondition(encoder="diffusion_text", checkpoint=str(root / "flux" / "pipeline")),
         objective=ObjectiveConfig("diffusion",
@@ -72,7 +75,9 @@ def runs(tmp_path_factory):
 def test_the_loss_is_the_papers_equation(runs):
     """Per row a scale w ~ U(1, 6); the student reads it as its guidance and
     matches u + w (c - u) of the teacher's two branches on the same noised
-    sample, in raw velocity, under Dew's halved L2."""
+    sample, in raw output, under Dew's halved L2 weighted as the process
+    weighs the time. Teacher and student read the sample at the time drawn
+    on the training schedule, input-scaled for it."""
     _, config, batch = runs
     task = config.build()
     assert isinstance(task, GuidanceDistillationObjective)
@@ -89,17 +94,20 @@ def test_the_loss_is_the_papers_equation(runs):
     t = schedule.sample_t(time_key, count)
     noise = jax.random.normal(noise_key, samples.shape)
     alpha, sigma = broadcast_rates(schedule, t, samples)
-    x = alpha * samples + sigma * noise
+    x = (alpha * samples + sigma * noise) * task.process.prediction.get_input_scale((alpha, sigma))
+    time = schedule.model_time(t)
     teacher = task.teacher
     given, blank = teacher._conditions(params[TEACHER], batch, drop_key, dropout=False)
     variables = teacher.model_variables(params[TEACHER])
-    conditional = teacher.model.apply(variables, x, schedule.model_time(t), **given)
-    unconditional = teacher.process.denoiser(teacher.model, variables, given, blank).raw_both(x, t)[1]
+    null = jax.tree.map(lambda value, empty: jnp.broadcast_to(empty, value.shape), given,
+                        aligned_conditions(given, blank))
+    conditional = teacher.model.apply(variables, x, time, **given)
+    unconditional = teacher.model.apply(variables, x, time, **null)
     target = unconditional + scale.reshape(-1, 1, 1, 1) * (conditional - unconditional)
     student_given, _ = task._conditions(params, batch, drop_key, dropout=False)
-    output = task.model.apply(task.model_variables(params), x, schedule.model_time(t),
-                              **with_guidance(student_given, scale))
-    expected = jnp.mean(0.5 * jnp.square(output - target))
+    output = task.model.apply(task.model_variables(params), x, time, **with_guidance(student_given, scale))
+    # Weighted per row as the process weighs its times: one for flow matching, EDM's lambda(sigma).
+    expected = jnp.mean(0.5 * jnp.square(output - target) * task.process.weight(t).reshape(-1, 1, 1, 1))
     assert float(loss.total / loss.mass) == pytest.approx(float(expected), rel=1e-5)
     modules = [program.module.clone() for program in task.program_key()]
     task.substitute(modules)

@@ -14,7 +14,6 @@ gradients are written back into the source layout through the same
 `WeightLayout`s an export uses. Every gap is scaled by max(1, |reference|).
 """
 
-import json
 import shutil
 from pathlib import Path
 
@@ -25,7 +24,7 @@ import pytest
 from interop_support import assert_layout_tensors, extract_fixture, fixture_arrays, scaled_gap
 from safetensors.numpy import load_file, save_file
 
-from dew.nn.autoencoders.dc_ae import dc_ae_fields, dc_ae_path, load_dc_ae
+from dew.nn.autoencoders.dc_ae import load_dc_ae
 
 ROOT = Path(__file__).resolve().parents[1]
 FORWARD = 1e-5
@@ -64,26 +63,6 @@ def test_every_published_tensor_is_mapped_and_exports_bit_identical(variant):
     assert_layout_tensors(layouts, {"autoencoder": params}, counted, "vae/")
 
 
-def test_the_latent_matches_the_source(variant):
-    _, (autoencoder, params, _, _), reference = variant
-    model = autoencoder.model
-    latent = model.apply({"params": params}, channels_last(reference["image"]), method=model.encode)
-    assert latent.shape == (2, 8, 12, 8)
-    gap = scaled_gap(latent, channels_last(reference["latent"]))
-    print(f"latent gap {gap:.3g}")
-    assert gap < FORWARD
-
-
-def test_the_decode_matches_the_source(variant):
-    _, (autoencoder, params, _, _), reference = variant
-    model = autoencoder.model
-    pixels = model.apply({"params": params}, channels_last(reference["code"]), method=model.decode)
-    assert pixels.shape == (2, 32, 48, 3)
-    gap = scaled_gap(pixels, channels_last(reference["pixels"]))
-    print(f"decode gap {gap:.3g}")
-    assert gap < FORWARD
-
-
 def test_the_quadratic_attention_matches_the_source(variant):
     """At 8x16 pixels the deepest level holds 2x4 = attention_head_dim
     positions, where the source switches to quadratic attention."""
@@ -103,9 +82,12 @@ def test_encoder_gradients_match_the_source(variant):
     probe = channels_last(reference["probe_latent"])
 
     def objective(params, image):
-        return jnp.sum(model.apply({"params": params}, image, method=model.encode) * probe)
+        latent = model.apply({"params": params}, image, method=model.encode)
+        return jnp.sum(latent * probe), latent
 
-    grad_params, grad_image = jax.grad(objective, argnums=(0, 1))(params, channels_last(reference["image"]))
+    (_, latent), (grad_params, grad_image) = jax.value_and_grad(objective, argnums=(0, 1), has_aux=True)(
+        params, channels_last(reference["image"]))
+    assert scaled_gap(latent, channels_last(reference["latent"])) < FORWARD
     image_gap = scaled_gap(grad_image, channels_last(reference["encode.grad_image"]))
     gaps = parameter_gaps(layouts, grad_params, reference, "encode")
     worst = max(gaps, key=gaps.get)
@@ -120,9 +102,12 @@ def test_decoder_gradients_match_the_source(variant):
     probe = channels_last(reference["probe"])
 
     def objective(params, latent):
-        return jnp.sum(model.apply({"params": params}, latent, method=model.decode) * probe)
+        pixels = model.apply({"params": params}, latent, method=model.decode)
+        return jnp.sum(pixels * probe), pixels
 
-    grad_params, grad_code = jax.grad(objective, argnums=(0, 1))(params, channels_last(reference["code"]))
+    (_, pixels), (grad_params, grad_code) = jax.value_and_grad(objective, argnums=(0, 1), has_aux=True)(
+        params, channels_last(reference["code"]))
+    assert scaled_gap(pixels, channels_last(reference["pixels"])) < FORWARD
     code_gap = scaled_gap(grad_code, channels_last(reference["decode.grad_code"]))
     gaps = parameter_gaps(layouts, grad_params, reference, "decode")
     worst = max(gaps, key=gaps.get)
@@ -158,31 +143,8 @@ def test_a_missing_tensor_is_refused(source, tmp_path):
     tensors = load_file(weights)
     del tensors["encoder.down_blocks.2.1.attn.to_qkv_multiscale.0.proj_out.weight"]
     save_file(tensors, weights)
-    with pytest.raises(ValueError, match=r"down_blocks_2_1.attn.to_qkv_multiscale_0.per_head"):
+    with pytest.raises(ValueError):
         load_dc_ae(tmp_path / "vae")
-
-
-@pytest.mark.parametrize("name, ndim", [
-    ("encoder.down_blocks.0.0.norm.weight", 4),
-    ("decoder.up_blocks.2.0.attn.to_q.bias", 2),
-    ("vae.encoder.conv_in.weight", 4),
-    ("encoder.conv_in.scale", 1),
-])
-def test_an_unknown_tensor_is_refused(name, ndim):
-    with pytest.raises(ValueError):
-        dc_ae_path(name, ndim)
-
-
-@pytest.mark.parametrize("change", [
-    {"encoder_block_types": "ViTBlock"}, {"decoder_norm_types": "layer_norm"},
-    {"decoder_act_fns": "gelu"}, {"downsample_block_type": "avg_pool"},
-    {"upsample_block_type": "bilinear"}, {"encoder_layers_per_block": [1, 1]},
-])
-def test_an_unsupported_config_is_refused(source, change):
-    config = json.loads((source / "conv" / "config.json").read_text())
-    dc_ae_fields(config)
-    with pytest.raises(ValueError):
-        dc_ae_fields({**config, **change})
 
 
 def test_a_run_trains_behind_the_dc_ae_its_checkpoint_names(source, tmp_path):

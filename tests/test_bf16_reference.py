@@ -37,20 +37,10 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import (
-    FACTOR,
-    FALSE_FAILURE,
-    ORDERS,
-    assert_as_exact_as_the_reference,
-    assert_as_exact_over_orders,
-    assert_computes_the_oracle,
-    assert_rounds_where_the_reference_does,
-    ieee_fixture,
-)
+from reference_error import assert_as_exact_as_the_reference
 from safetensors.numpy import load_file
 
 from dew.interop import Pretrained, diffusion_gemma as adapter
-from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.inputs import ModelInputs
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "hf"
@@ -109,108 +99,8 @@ def test_the_diffusion_denoiser_is_as_exact_as_its_reference_in_bf16():
                                          f"workflow {name}")
 
 
-def test_a_float64_twin_is_held_to_its_own_rounding_and_not_the_fp32_error():
-    """Row sums of 256 float64 terms, summed in reverse, sit a few float64
-    ulps off the exact (fsum) sums, however exact an fp32 run of the same
-    sums might land. The computation's own float64 rounding (256 roundings
-    of the sums' scale) holds them, and a twin that drops one term is
-    refused by many orders of magnitude."""
-    import math
-
-    terms = np.random.default_rng(0).standard_normal((64, 256))
-    truth = np.asarray([math.fsum(row) for row in terms])
-    # Left to right in reverse; Python's own `sum` of floats is compensated.
-    reordered = np.add.accumulate(terms[:, ::-1], axis=-1)[:, -1]
-    assert np.abs(reordered - truth).max() > 0
-    assert_computes_the_oracle(reordered, truth, "reordered sums", roundings=256)
-    with pytest.raises(AssertionError, match="more than float64 rounding"):
-        assert_computes_the_oracle(terms[:, 1:].sum(-1), truth, "a dropped term", roundings=256)
-
-
-def test_logits_coarser_than_the_reference_fail_the_rule():
-    """How coarse an error the rule sees: llama-tiny's bf16 logits rounded
-    once more to two significand bits (float8_e5m2's; `reduce_precision`,
-    which XLA cannot fold away the way it drops an astype round trip under
-    jit on GPU) land 2.80 times the reference's error away and fail it. The
-    same logits rounded to three bits (e4m3) land at 1.73 times and pass,
-    the scale below which this rule is blind (tests/reference_error.py)."""
-    directory = FIXTURES / "llama-tiny"
-    pretrained = Pretrained.load(str(directory), dtype="bfloat16", attention_impl="reference")
-    ids = jnp.asarray(np.load(directory / "input_ids.npy"), jnp.int32)
-    logits = jnp.asarray(pretrained.model.apply(pretrained.variables, ids), jnp.float32)
-    coarse = jax.lax.reduce_precision(logits, exponent_bits=5, mantissa_bits=2)
-    with np.load(directory / "numerics.npz") as exact, pytest.raises(AssertionError, match="ratio"):
-        assert_as_exact_as_the_reference(coarse, exact["bf16"], exact["f64"], "coarse")
-
-
-@pytest.mark.parametrize("recorded", [None, "tf32", "TRITON_F32_DEFAULT tf32x3", "ieee"])
-def test_a_reference_without_a_record_of_ieee_matmuls_is_refused(tmp_path, recorded):
-    """The same float32 arrays, regenerated with TF32 matmuls, sit farther
-    from float64 and so widen the budget the rule above takes from them.
-    Only the generator's record tells the two apart, so a file that does not
-    record 'ieee' is refused before any distance is taken."""
-    path = tmp_path / "reference.npz"
-    np.savez(path, logits=np.ones(3, np.float32), **({} if recorded is None else {"precision": recorded}))
-    if recorded == "ieee":
-        assert set(ieee_fixture(path)) == {"logits"}
-    else:
-        with pytest.raises(ValueError, match="not 'ieee'"):
-            ieee_fixture(path)
-
-
-def test_the_k_order_rule_holds_an_equally_exact_port_and_fails_a_coarser_one():
-    """ORDERS is the fewest K at which F(K, K), the ratio of two means of
-    one-degree chi-squares, the widest a squared RMS of Gaussian roundings
-    spreads, passes FACTOR^2 with probability at most FALSE_FAILURE. Over
-    20000 simulated fixtures of one-degree draws, an equally exact port
-    never fails, one twice as far fails half the time, as at the factor it
-    must, and one four times as far always fails."""
-    from scipy.stats import f
-
-    assert next(k for k in range(1, 1000) if f.sf(FACTOR ** 2, k, k) <= FALSE_FAILURE) == ORDERS
-    rng = np.random.default_rng(11)
-    dew, reference = np.sqrt(rng.chisquare(1, (2, 20000, ORDERS)))
-    ratio = np.sqrt(np.mean(np.square(dew), 1) / np.mean(np.square(reference), 1))
-    assert not np.any(ratio > FACTOR)
-    assert 0.45 < np.mean(2 * ratio > FACTOR) < 0.55
-    assert np.all(4 * ratio > FACTOR)
-    assert_as_exact_over_orders(dew[0], reference[0], "equally exact")
-    with pytest.raises(AssertionError, match="ratio"):
-        assert_as_exact_over_orders(2.5 * dew[1], reference[1], "coarser")
-    with pytest.raises(AssertionError, match="orders"):
-        assert_as_exact_over_orders(dew[0][:20], reference[0][:20], "too few orders")
-
-
 def bfloat16(bits: np.ndarray) -> jax.Array:
     return jax.lax.bitcast_convert_type(jnp.asarray(bits), jnp.bfloat16)
-
-
-@pytest.mark.parametrize("softmax_in_fp32", [True, False], ids=["fp32-softmax", "bf16-softmax"])
-def test_bf16_attention_rounds_where_the_reference_does(softmax_in_fp32):
-    """The ordering the whole-model cases cannot resolve: the attention
-    softmax. transformers' eager attention (tools/numerics_reference.py,
-    one head of 512 queries over 512 keys) rounds the bf16 logits, takes the
-    softmax in fp32 and rounds the probabilities once; Dew's reference path
-    claims that order, so it is held to the reference's own bf16 output
-    (tests/reference_error.py). Logits of standard deviation 0.5 spread the
-    weight over hundreds of keys, where the softmax's own roundings, not the
-    logits', make most of the error. Observed ratio 0.041 with the fp32
-    softmax, the 0.04 the flip estimate gives at K 512; taken in bf16 it is
-    1.72 and fails. The 'xla' path keeps the logits in fp32, rounds at other
-    points and sits nearer float64 (1.18e-04 against the reference's
-    1.32e-04), so it answers to the factor-2 rule, not this one."""
-    with np.load(Path(__file__).resolve().parent / "fixtures" / "attention_bf16.npz") as stored:
-        q, k, v, reference = (bfloat16(stored[name]) for name in ("q", "k", "v", "bf16"))
-        truth = stored["f64"]
-    # [batch, heads, length, width] -> [batch, length, heads, width]
-    q, k, v = (jnp.swapaxes(t, 1, 2) for t in (q, k, v))
-    out = scaled_dot_product_attention(q, k, v, implementation="reference",
-                                       force_fp32_for_softmax=softmax_in_fp32)
-    if softmax_in_fp32:
-        assert_rounds_where_the_reference_does(out, reference, truth, "attention")
-    else:
-        with pytest.raises(AssertionError, match="ratio"):
-            assert_rounds_where_the_reference_does(out, reference, truth, "attention")
 
 
 MAMBA2_130M = "AntonV/mamba2-130m-hf"

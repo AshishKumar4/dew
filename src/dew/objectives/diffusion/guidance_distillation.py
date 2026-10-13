@@ -114,7 +114,9 @@ class GuidanceDistillationObjective(DiffusionObjective):
         teacher = self.teacher
         frozen = jax.lax.stop_gradient(variables[TEACHER])
         given, blank = teacher._conditions(frozen, batch, drop_key, dropout=False)
-        denoise = teacher.process.denoiser(teacher.model, teacher.model_variables(frozen), given, blank)
+        # The teacher reads the student's noised sample at the time drawn on the training schedule.
+        denoise = teacher.process.denoiser(teacher.model, teacher.model_variables(frozen), given, blank,
+                                           schedule=schedule)
         conditional, unconditional = denoise.raw_both(noisy, t)
         target = jax.lax.stop_gradient(guided_target(conditional, unconditional, scale))
 

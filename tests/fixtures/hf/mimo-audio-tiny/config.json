@@ -1,0 +1,59 @@
+{
+ "audio_config": {
+  "audio_channels": 4,
+  "group_size": 4,
+  "input_local_dim": 32,
+  "input_local_layers": 2,
+  "input_local_attn_heads": 4,
+  "input_local_intermediate_size": 48,
+  "input_full_attention": true,
+  "rope_theta": 640000,
+  "partial_rotary_factor": 1.0,
+  "add_post_norm": true,
+  "projection_layers": 2,
+  "out_hidden_size": 24,
+  "speech_vocab_size": "20",
+  "speech_zeroemb_idx": "16",
+  "audio_segment_size": 20,
+  "input_local_hidden_dropout": 0.0
+ },
+ "tokenizer": {
+  "n_mels": 16,
+  "sampling_rate": 24000,
+  "nfft": 960,
+  "hop_length": 240,
+  "window_size": 960,
+  "fmin": 0,
+  "fmax": null,
+  "d_model": 32,
+  "kernel_size": 3,
+  "stride_size": 2,
+  "avg_pooler": 2,
+  "encoder_layers": 4,
+  "encoder_attention_heads": 4,
+  "encoder_ffn_dim": 48,
+  "encoder_causal": true,
+  "encoder_attn_window_size": [
+   3,
+   0
+  ],
+  "encoder_skip_layer_id": 2,
+  "hybrid_attention": true,
+  "swa_per_block": 2,
+  "rope_theta": 10000,
+  "rope_type": "default",
+  "ln_type": "LayerNorm",
+  "activation_function": "gelu",
+  "num_quantizers": 4,
+  "codebook_size": [
+   16,
+   16,
+   8,
+   8
+  ],
+  "max_audio_seconds": 30,
+  "scale_embedding": false,
+  "threshold_ema_dead_code": 2,
+  "position_embedding_type": "rope"
+ }
+}
