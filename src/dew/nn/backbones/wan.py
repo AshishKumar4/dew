@@ -30,7 +30,7 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.attention import LayerNorm, NormalAttention, RMSNorm, scaled_dot_product_attention
-from dew.nn.blocks import sinusoidal_time
+from dew.nn.blocks import Modulation, sinusoidal_time
 from dew.nn.conv import Conv
 from dew.nn.flops import MissingFlopsCount, matching_lengths, patch_lengths, projection_flops
 from dew.nn.precision import at_least_fp32
@@ -38,7 +38,7 @@ from dew.nn.rope import axis_tables, rotate
 from dew.nn.sharding import logical_axes
 
 from ..mlp import GatedMLP
-from .joint import Modulation, embedding, embedding_flops, layer_norm, modulate
+from .joint import embedding, embedding_flops, layer_norm, modulate
 
 if TYPE_CHECKING:
     from dew.diffusion.process import DenoisingCondition
