@@ -182,6 +182,10 @@ class ImageRows(TypedDict):
     fsdp_min_param_size: int
 
 
+GROUPED_NORMS = dict.fromkeys(("input_layernorm", "post_attention_layernorm", "norm"), {"groups": 4})
+"""K2 Horizon's norms, each over four groups of the width."""
+
+
 def zoo() -> dict[str, Any]:
     """Small models of every family a layout splits differently: a dense
     decoder, the dense one under norms over four groups of its width (K2
@@ -263,8 +267,7 @@ def zoo() -> dict[str, Any]:
     images: ImageRows = {"batch_size": 8, "channels": 4, "fsdp_min_param_size": 256}
     return {
         "dense": Case("causal_transformer", dense, **lm),
-        "grouped": Case("causal_transformer", {**dense, "norms": {site: {"groups": 4} for site in (
-            "input_layernorm", "post_attention_layernorm", "norm")}}, **lm),
+        "grouped": Case("causal_transformer", {**dense, "norms": GROUPED_NORMS}, **lm),
         "moe": Case("causal_transformer", moe, **lm),
         "moe128": Case("causal_transformer", moe128, **lm),
         "hybrid": Case("causal_transformer", hybrid, **lm),
