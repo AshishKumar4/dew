@@ -39,20 +39,50 @@ STREAMS = ("activation_batch", "activation_length", None, "activation_embed")
 """Manifold-constrained hyper-connections' `[B, S, hc_mult, D]` residual streams."""
 
 
+@dataclasses.dataclass(frozen=True)
+class NormSpec:
+    """How one of a decoder's norms differs from the model's others: its
+    epsilon, whether it has a weight, whether an RMS norm's weight is stored
+    as (1 + w), and the groups an RMS norm's statistics take
+    (`RMSNorm.groups`). None is the model's own (`norm_eps`, `scale_offset`)."""
+
+    eps: float | None = None
+    scale: bool = True
+    offset: bool | None = None
+    groups: int = 1
+
+
+NORM_SITES = ('input_layernorm', 'post_attention_layernorm', 'attention_output_norm', 'mlp_output_norm',
+              'post_per_layer_input_norm', 'embedding_layernorm', 'norm', 'head_norm')
+"""The decoder's norms a `NormSpec` may change, by the module name each is built under."""
+
+
 def decoder_norm(kind: Literal['rms', 'layer', 'fast_layer'], *, epsilon: float,
                  bias: bool, scale_offset: bool, scale_after_cast: bool,
-                 dtype: Dtype | None) -> Callable[..., nn.Module]:
-    """The decoder's norm factory. 'layer' keeps torch's exact variance, the
+                 dtype: Dtype | None,
+                 specs: Mapping[str, NormSpec] | None = None) -> Callable[..., nn.Module]:
+    """The decoder's norm factory, building each norm by its `name` as
+    `specs` changes it there. 'layer' keeps torch's exact variance, the
     reference decoders' formula; 'fast_layer' is flax's E[x^2] - E[x]^2
     (`dew.nn.attention.LayerNorm`), whose mean and square reduce in one pass,
     which the vision towers run."""
-    if kind == 'layer':
-        return functools.partial(nn.LayerNorm, epsilon=epsilon, use_bias=bias,
-                                 use_fast_variance=False, dtype=dtype)
-    if kind == 'fast_layer':
-        return functools.partial(LayerNorm, epsilon=epsilon, use_bias=bias, dtype=dtype)
-    return functools.partial(RMSNorm, epsilon=epsilon, scale_offset=scale_offset,
-                             scale_after_cast=scale_after_cast, dtype=dtype)
+
+    def build(*, name: str) -> nn.Module:
+        spec = (specs or {}).get(name, NormSpec())
+        eps = epsilon if spec.eps is None else spec.eps
+        if kind == 'rms':
+            return RMSNorm(epsilon=eps, scale_offset=scale_offset if spec.offset is None else spec.offset,
+                           scale_after_cast=scale_after_cast, with_scale=spec.scale, groups=spec.groups,
+                           dtype=dtype, name=name)
+        if spec.groups != 1 or spec.offset:
+            raise ValueError(f"{name}, a {kind} norm, takes its statistics over the whole axis under an "
+                             f"unshifted weight, not {spec}")
+        if kind == 'layer':
+            return nn.LayerNorm(epsilon=eps, use_bias=bias, use_scale=spec.scale, use_fast_variance=False,
+                                dtype=dtype, name=name)
+        return LayerNorm(epsilon=eps, use_bias=bias, use_scale=spec.scale, dtype=dtype, name=name)
+
+    return build
 
 
 @runtime_checkable
@@ -423,6 +453,7 @@ class DecoderBlock(nn.Module):
     norm_eps: float = 1e-5
     norm_type: Literal['rms', 'layer', 'fast_layer'] = 'rms'
     norm_bias: bool = False
+    norms: Mapping[str, NormSpec] | None = None
     scale_offset: bool = False
     scale_after_cast: bool = False
     per_layer_input_dim: int = 0
@@ -511,7 +542,7 @@ class DecoderBlock(nn.Module):
         norm = decoder_norm(
             self.norm_type, epsilon=self.norm_eps, bias=self.norm_bias,
             scale_offset=self.scale_offset, scale_after_cast=self.scale_after_cast,
-            dtype=self.dtype)
+            dtype=self.dtype, specs=self.norms)
         if self.wiring.parallel_residual and (
                 not self.wiring.pre_norms or self.wiring.output_norms
                 or self.feedforward is None or self.hyper_connections is not None
