@@ -134,8 +134,8 @@ def train_and_export(root: Path) -> Path:
         else:
             model_args.extend((f"--model.{key}", str(value)))
     config = LMRunConfig.cli([
-        "--data.path", str(tokens), "--data.seq-len", str(SEQ),
-        "--data.loading.workers", "0", "--tokenizer", str(TOKENIZER),
+        "--data.source", str(tokens), "--data.seq-len", str(SEQ),
+        "--loading.workers", "0", "--tokenizer", str(TOKENIZER),
         "--trainer.batch-size", "16", "--trainer.steps", str(STEPS),
         "--trainer.log-every", str(STEPS), "--trainer.eval-every", "None",
         "--trainer.checkpoint-every", "None", "--trainer.name", "ollama-interop",

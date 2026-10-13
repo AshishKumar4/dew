@@ -37,7 +37,7 @@ from dew.objectives.base import (
     Variables,
 )
 
-from .distributed import MeshSpec, shard_batch
+from .distributed import MeshSpec, device_fields, host_fields, shard_batch, with_host
 
 
 @dataclass(frozen=True)
@@ -98,7 +98,7 @@ class Evaluation:
         Every process calls this with the same objective, metrics and numerical
         settings. `batches` is called with this process's share of the split
         (`DataPartition.of(mesh)`) and returns a fresh iterator, which this call
-        opens and closes; you can pass `Dataset.val` directly. Every batch holds
+        opens and closes; you can pass `Loader.val` directly. Every batch holds
         `VALID_ROWS` (all True when the reader marked none), and the objective's loss
         and the metrics count only the real rows. A process whose share runs out
         before the others' scores a copy of its last batch in which every row is a
@@ -420,8 +420,10 @@ def _dispatched(objective: Objective[Loss, Effects], variables: Variables, loss_
     """One batch's device work, dispatched under one key: the validation-loss
     statistics where `loss`, and what the objective produces where `evaluate`."""
     keyed = replace(context, key=_folded(score_key, index))
-    statistics = objective._validation_loss(loss_variables, batch, keyed) if loss else None
-    return statistics, objective.evaluate(variables, batch, keyed) if evaluate else None
+    # The objective's programs take what a device holds; the metrics read the rest (`_merged`).
+    device = device_fields(batch)
+    statistics = objective._validation_loss(loss_variables, device, keyed) if loss else None
+    return statistics, objective.evaluate(variables, device, keyed) if evaluate else None
 
 
 def _as_placed(leaf) -> np.ndarray:
@@ -444,9 +446,9 @@ def _merged(produced, batch: Batch, held: Batch, index: int, *, metrics: Sequenc
     """
     if all(leaf.is_fully_addressable for leaf in jax.tree.leaves(batch) if isinstance(leaf, jax.Array)):
         produced = collective_host(produced, phase=f"scoring batch {index}")
-        home = jax.tree.map(_as_placed, held)
+        home = with_host(jax.tree.map(_as_placed, device_fields(held)), host_fields(held))
     else:
-        produced, home = collective_host((produced, batch), phase=f"scoring batch {index}")
+        produced, home = collective_host((produced, device_fields(batch)), phase=f"scoring batch {index}")
 
     def merge() -> None:
         if not root:

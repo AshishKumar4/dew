@@ -24,7 +24,7 @@ from test_inference import make_run
 
 from dew import Checkpoints
 from dew.artifacts import uint8_pixels
-from dew.data import Dataset
+from dew.data.dataset import Loader
 from dew.diffusion.presets import Flow
 from dew.inputs import Condition, Field, InputSpec
 from dew.interop import load_params
@@ -167,7 +167,7 @@ def _batches(batch, classes=None, size=RES):
 
 
 def fake_dataset(batch, classes=None, size=RES):
-    return Dataset(train=lambda partition: _batches(batch, classes, size)(),
+    return Loader(train=lambda partition: _batches(batch, classes, size)(),
                    val=lambda partition: itertools.islice(_batches(batch, classes, size)(), 1),
                    records=4 * batch, batch=batch)
 
