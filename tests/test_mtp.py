@@ -21,7 +21,7 @@ import pytest
 from model_support import TINY_DECODER
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.nn.inputs import ModelInputs
+from dew.nn.inputs import ModelInputs, coordinates
 from dew.objectives.base import Step
 from dew.objectives.lm import TEXT_KEY, LMObjective
 
@@ -192,13 +192,15 @@ def packed_row():
 
 
 def test_packing_carried_by_the_model_inputs_scores_the_depths_the_same():
-    """Segment ids and positions may ride the `ModelInputs` instead of the
-    batch's packing columns, and the losses are the same number either way."""
+    """Coordinates may ride the `ModelInputs` instead of beside the batch's
+    token ids, and the losses are the same number either way."""
     objective = LMObjective(tiny(num_nextn_predict_layers=1), SEQ, mtp_weight=0.3)
     params = objective.init(jax.random.key(0))
     ids, segments, positions = packed_row()
-    columns = {TEXT_KEY: ids, "text_segment_ids": segments, "text_positions": positions}
-    carried = {TEXT_KEY: ModelInputs(ids, {"segment_ids": segments, "positions": positions})}
+    laid = coordinates(segments=segments, positions=positions, max_segments=ids.shape[1],
+                       right_padded=True, xp=np)
+    columns = {TEXT_KEY: ids, "text_coordinates": laid}
+    carried = {TEXT_KEY: ModelInputs(ids, {"coordinates": laid})}
 
     _, by_columns = objective.scalar_loss(params, columns, step_at())
     _, by_inputs = objective.scalar_loss(params, carried, step_at())
