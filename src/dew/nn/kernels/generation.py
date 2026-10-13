@@ -113,8 +113,8 @@ TARGETS = {target.generation: target for target in (
               {'NVIDIA L4': {'bf16': 121e12, 'fp8': 242.5e12},
                'NVIDIA GeForce RTX 4080': {'bf16': 97.5e12}}, ('gpu:l4', 'l4')),
     GpuTarget('sm90', 'NVIDIA H100 80GB HBM3', 227 * 1024,
-              {'attention': 'flash', 'grouped_matmul': 'pallas', 'rms_norm': 'pallas', 'swiglu': 'pallas',
-               'gated_delta_rule': 'fla'}, {
+              {'attention': 'flash', 'attention_narrow': 'flash', 'grouped_matmul': 'pallas',
+               'rms_norm': 'pallas', 'swiglu': 'pallas', 'gated_delta_rule': 'fla'}, {
         'NVIDIA H100': {'bf16': 989e12, 'fp8': 1979e12},
         'NVIDIA H100 PCIe': {'bf16': 756e12, 'fp8': 1513e12},
         'NVIDIA H100 NVL': {'bf16': 835e12, 'fp8': 1670.5e12},
