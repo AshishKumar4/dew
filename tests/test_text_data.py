@@ -854,3 +854,35 @@ def test_hosts_that_mount_one_corpus_at_different_paths_read_one_order(tmp_path)
             reader.close()
 
     assert identity(first) == identity(second) != identity(other)
+
+
+def test_a_same_size_write_between_token_samples_changes_the_readers_identity(tmp_path):
+    """An exact reader identifies every token, including the middle of a large file."""
+    stream = np.full(8 * 2**20, 7, dtype=np.uint16)
+    directory = write_token_corpus(tmp_path / "tokens", stream)
+
+    def reader():
+        data = loader(TextData(source=str(directory), seq_len=1024), batch=1, read="indexed",
+                      loading=Loading(workers=0))
+        return data.train(DataPartition())
+
+    before = reader()
+    try:
+        identity = before.identity()
+        np.testing.assert_array_equal(next(before)["text"], np.full((1, 1025), 7, dtype=np.int32))
+        position = before.get_state()
+    finally:
+        before.close()
+    path = directory / "train.bin"
+    size = path.stat().st_size
+    with path.open("r+b") as file:
+        file.seek(size // 2)
+        file.write(np.asarray([9], dtype=np.uint16).tobytes())
+    assert path.stat().st_size == size
+    after = reader()
+    try:
+        assert after.identity() != identity
+        with pytest.raises(ValueError):
+            after.set_state(position)
+    finally:
+        after.close()
