@@ -509,14 +509,16 @@ _DEFAULT_SAMPLING = Sampling()
 
 
 
-def scored_targets(xp, tokens, pad_id: int | None, attention_mask, segment_ids, depth: int = 0):
+def scored_targets(xp, tokens, pad_id: int | None, attention_mask, segment_ids, depth: int = 0,
+                   roles=None, role: int | None = None):
     """Whether each target the loss scores at prediction `depth` counts, as
     `[B, S - 1 - depth]` booleans, in `xp` (numpy for the host's FLOP
-    geometry, jax.numpy for the loss): the state at p scores the token
-    `depth + 1` later, which counts when it is not padding, when the
-    attention mask keeps every position from the state to it, and, in a
-    packed batch, when the state and it share a document (segment 0 is
-    padding)."""
+    geometry and the data's target counts, jax.numpy for the loss): the
+    state at p scores the token `depth + 1` later, which counts when it is
+    not padding, when the attention mask keeps every position from the state
+    to it, in a packed batch when the state and it share a document (segment
+    0 is padding), and with a `role` (`loss_role`) when `roles`, one per
+    token, give the target that role."""
     span = depth + 1
     width = tokens.shape[1] - span
     counted = xp.ones((tokens.shape[0], width), bool) if pad_id is None else tokens[:, span:] != pad_id
@@ -525,6 +527,8 @@ def scored_targets(xp, tokens, pad_id: int | None, attention_mask, segment_ids, 
             counted = counted & attention_mask[:, offset:offset + width].astype(bool)
     if segment_ids is not None:
         counted = counted & (segment_ids[:, span:] == segment_ids[:, :-span]) & (segment_ids[:, span:] != 0)
+    if role is not None and roles is not None:
+        counted = counted & (roles[:, span:] == role)
     return counted
 
 class LMObjective(Objective[Ratio | LMStatistics, Variables]):
@@ -976,31 +980,38 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
                 depth_scores.append((depth_losses, depth_weights, depth_total))
         return Scores(losses, weights, log_z, correct, hidden, kept, sown, depth_scores, qk, kls, total)
 
+    def data(self, tokenizer=None):
+        from dew.data.pipeline import ObjectiveData
+        from dew.data.steps.text import CountTargets, FixedTokens
+
+        geometry = FixedTokens(self.seq_len, extra=1, pad_id=0 if self.pad_id is None else self.pad_id)
+        if self.loss_role is None and self.pad_id is None:
+            return ObjectiveData(train=(geometry,), evaluate=(geometry,))
+        counted = CountTargets(
+            role=None if self.loss_role is None else int(self.loss_role), pad_id=self.pad_id
+        )
+        return ObjectiveData(train=(counted, geometry), evaluate=(counted, geometry))
+
     def _row_weights(self, prepared, roles, dtype):
         """Weight the targets the row itself scores (`scored_targets`), and
         with `loss_role` one role's targets alone."""
         fields = prepared.token_fields
-        weights = scored_targets(jnp, prepared.tokens, self.pad_id, fields.get("attention_mask"),
-                                 fields.get("segment_ids")).astype(dtype)
-        if roles is not None:
-            if roles.shape != prepared.tokens.shape:
-                raise ValueError(
-                    f"text_roles has shape {tuple(roles.shape)} for "
-                    f"{tuple(prepared.tokens.shape)} ids; the roles align with the input "
-                    "tokens, one per token")
-            if self.loss_role is not None:
-                weights = weights * (roles[:, 1:] == int(self.loss_role))
-        return weights
+        if roles is not None and roles.shape != prepared.tokens.shape:
+            raise ValueError(
+                f"text_roles has shape {tuple(roles.shape)} for "
+                f"{tuple(prepared.tokens.shape)} ids; the roles align with the input "
+                "tokens, one per token")
+        return scored_targets(jnp, prepared.tokens, self.pad_id, fields.get("attention_mask"),
+                              fields.get("segment_ids"), roles=roles,
+                              role=None if self.loss_role is None else int(self.loss_role)).astype(dtype)
 
     def _depth_weights(self, prepared, roles, dtype, depth: int):
         """Weight the targets one prediction depth scores: depth d's state at
         p scores the target d further out (`scored_targets`)."""
         fields = prepared.token_fields
-        weights = scored_targets(jnp, prepared.tokens, self.pad_id, fields.get("attention_mask"),
-                                 fields.get("segment_ids"), depth).astype(dtype)
-        if roles is not None and self.loss_role is not None:
-            weights = weights * (roles[:, depth + 1:] == int(self.loss_role))
-        return weights
+        return scored_targets(jnp, prepared.tokens, self.pad_id, fields.get("attention_mask"),
+                              fields.get("segment_ids"), depth, roles=roles,
+                              role=None if self.loss_role is None else int(self.loss_role)).astype(dtype)
 
     def tile_head(self, tile: tuple[int, int] | None = None) -> str | None:
         """Move a head that keeps its whole logits to `tile`, and report what it moved to.

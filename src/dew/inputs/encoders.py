@@ -387,7 +387,7 @@ class HFAudio(ConditionEncoder[AudioRow, TextContext]):
     Every waveform is cut or zero-padded to `seconds`, so every clip has the
     same length, including the constant the unconditional branch is encoded
     from. A dataset that writes the extractor's arrays itself
-    (`VideoDataset`'s `audio` field) passes them to `encode` unchanged, which
+    (the Video recipe's `audio` field) passes them to `encode` unchanged, which
     is why this encoder reads no captions.
     """
 
