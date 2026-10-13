@@ -183,6 +183,11 @@ def assert_leaves_as_exact(dew, reference, truth, *, reductions: int = 1,
                 f"{name}: declared invariant has float64 RMS {size:.3e}, above its terms' {scale:.3e}")
         own = spread * unit * scale
         bar = FACTOR * max(distance(theirs, true), own)
+        if "to_k" in name or "k_proj" in name:
+            import sys as _sys
+            print(f"KEYBIAS {name} declared={name in invariants} size={size:.3e} scale={scale:.3e} "
+                  f"own={own:.3e} ref={distance(theirs, true):.3e} mine={distance(mine, true):.3e} "
+                  f"bar={bar:.3e} reductions={reductions}", file=_sys.stderr, flush=True)
         if not within(distance(mine, true), bar):
             over.append(f"{name}: {distance(mine, true):.3e} from float64 (rms), "
                         f"the reference {distance(theirs, true):.3e}, allowed {bar:.3e}")
