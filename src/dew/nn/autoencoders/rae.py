@@ -36,6 +36,7 @@ from dew.nn.activations import activation
 from dew.nn.attention import LayerNorm, scaled_dot_product_attention
 from dew.nn.backbones.sd3 import sincos_position
 from dew.nn.blocks import torch_bicubic_resize
+from dew.nn.mlp import GatedMLP
 from dew.nn.text_encoders import check_tree
 from dew.objectives.base import Variables
 
@@ -117,10 +118,10 @@ class _Block(nn.Module):
         x = x + scaled(
             _Attention(self.width, self.heads, self.dtype, name="attention")(norm(x)), "layer_scale1"
         )
-        hidden = nn.Dense(self.intermediate, dtype=self.dtype, name="fc1")(
-            LayerNorm(epsilon=self.epsilon, dtype=self.dtype, name="norm2")(x))
-        hidden = activation(self.activation)(hidden)
-        return x + scaled(nn.Dense(self.width, dtype=self.dtype, name="fc2")(hidden), "layer_scale2")
+        mlp = GatedMLP(self.intermediate, self.width, activation=activation(self.activation), use_bias=True,
+                       dtype=self.dtype, name="mlp")
+        normed = LayerNorm(epsilon=self.epsilon, dtype=self.dtype, name="norm2")(x)
+        return x + scaled(mlp(normed), "layer_scale2")
 
 
 class RepresentationEncoder(nn.Module):
@@ -340,10 +341,10 @@ _LAYER = {
     "attention.to_k": "attention.key",
     "attention.to_v": "attention.value",
     "attention.to_out.0": "attention.out",
-    "mlp.fc1": "fc1",
-    "intermediate.dense": "fc1",
-    "mlp.fc2": "fc2",
-    "output.dense": "fc2",
+    "mlp.fc1": "mlp.up_proj",
+    "intermediate.dense": "mlp.up_proj",
+    "mlp.fc2": "mlp.down_proj",
+    "output.dense": "mlp.down_proj",
     "layer_scale1": "layer_scale1",
     "layer_scale2": "layer_scale2",
 }
