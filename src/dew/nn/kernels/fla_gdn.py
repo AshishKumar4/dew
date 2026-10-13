@@ -151,8 +151,12 @@ _FP32_WY = {"prepare_wy_repr_bwd": Tiles(64, 64, 8, 2)}
 # fla's stage and block lists for devices under an A100's shared memory (chunk_delta_h.py:43-44,
 # 352-353), with two warps for the forward h.
 _SMALL = {**_A100, "chunk_fwd_h": Tiles(0, 32, 2, 2), "chunk_bwd_dhu": Tiles(0, 64, 4, 1)}
+# Measured over each space at the Qwen3.5-0.8B step's shape (8 x 3072, 16 heads of 128, bf16), CUPTI, 2026-10-13:
+# dqkwg 128/128/8/1 1.33 ms on an A100 (64/64/4/1 2.65, best 128/64/8/1 1.19) and 0.65 on an H100
+# (64/64/4/1 0.52, 128/64/8/1 1.02); dhu 0/64/4/3 1.09 and 0.315, the fastest on both.
+_WIDE_16 = {**_A100, "chunk_bwd_dqkwg": Tiles(128, 128, 8, 1), "chunk_bwd_dhu": Tiles(0, 64, 4, 3)}
 HEURISTICS = {
-    ("bfloat16", True): _A100,
+    ("bfloat16", True): _WIDE_16,
     ("bfloat16", False): _SMALL,
     # One stage for fp32's dhu: three took 254,984 bytes of an A100's 166,912 (c58).
     ("float32", True): {**_A100, **_FP32_WY, "chunk_fwd_h": Tiles(0, 64, 4, 2),
