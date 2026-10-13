@@ -89,6 +89,8 @@ def arguments() -> argparse.Namespace:
     parser.add_argument("--b1", type=float, default=0.9)
     parser.add_argument("--b2", type=float, default=0.95)
     parser.add_argument("--eps", type=float, default=1e-8)
+    parser.add_argument("--state-dtype", choices=("float32", "bfloat16"), default="float32",
+                        help="Adam's moments in memory (OptimConfig.state_dtype)")
     parser.add_argument("--weight-decay", type=float, default=0.1)
     parser.add_argument("--clip", type=float, default=1.0)
     parser.add_argument("--aux-loss-alpha", type=float, default=None,
@@ -161,7 +163,7 @@ def build(args: argparse.Namespace) -> Run:
     # One group over every parameter, as torch_lm.py's AdamW decays the norms
     # and biases too.
     solver = OptimConfig(
-        optimizer="adamw", b1=args.b1, b2=args.b2, optimizer_opts={"eps": args.eps},
+        optimizer="adamw", b1=args.b1, b2=args.b2, optimizer_opts={"eps": args.eps}, state_dtype=args.state_dtype,
         schedule=schedule, weight_decay=args.weight_decay, clip_grads=args.clip,
         param_groups=(ParamGroup("all", ("*",)),)).build(schedule_steps)
     devices = jax.device_count()
