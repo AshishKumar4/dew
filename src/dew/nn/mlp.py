@@ -42,13 +42,10 @@ class GatedMLP(nn.Module):
     `gate_up_proj` from init on, as DeepSeek-V4.1's vision tower stores them,
     and `linear` is the projections' module (Gemma 4's vision tower clips
     theirs). `dropout_rate` drops the activated hidden units before the down
-    projection while training, as T5's `T5DenseActDense` does. `in_features`
-    is the input width where it is not `out_features` (a projector's), which
-    the work count and the packed group read.
+    projection while training, as T5's `T5DenseActDense` does.
     """
     hidden_features: int
     out_features: int
-    in_features: int | None = None
     activation: GatedActivation | Activation = 'swiglu'
     use_bias: bool = False
     activation_sparsity: float = 0.0
@@ -72,8 +69,7 @@ class GatedMLP(nn.Module):
     def projections(self) -> dict[str, tuple[int, int]]:
         """The feed-forward's maps as `{name: (inputs, outputs)}`: what setup
         builds, the count reads and the packed group (`_group`) concatenates."""
-        width = self.out_features if self.in_features is None else self.in_features
-        sites = {'up_proj': (width, self.hidden_features),
+        sites = {'up_proj': (self.out_features, self.hidden_features),
                  'down_proj': (self.hidden_features, self.out_features)}
         if self._ungated() is None:
             sites['gate_proj'] = sites['up_proj']

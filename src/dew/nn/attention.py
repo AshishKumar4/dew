@@ -2243,8 +2243,9 @@ class FlaxGEGLU(nn.Module):
     """Project to twice the hidden width, then gate one half by the other.
 
     The gate is GELU, the gated linear unit of Shazeer 2020
-    (https://arxiv.org/abs/2002.05202). The hidden width is four times
-    `dim`.
+    (https://arxiv.org/abs/2002.05202), whose product a gated MLP takes
+    (`dew.nn.moe.gated_product`); diffusers stores the up half first. The
+    hidden width is four times `dim`.
     """
 
     dim: int
@@ -2264,9 +2265,12 @@ class FlaxGEGLU(nn.Module):
         self.proj = nn.Dense(self.projections()["proj"][1], dtype=self.dtype, precision=self.precision)
 
     def __call__(self, hidden_states):
+        # Imported here: dew.nn.moe reaches this module through dew.nn.blocks.
+        from .moe import gated_product
+
         hidden_states = self.proj(hidden_states)
         hidden_linear, hidden_gelu = jnp.split(hidden_states, 2, axis=-1)
-        return hidden_linear * nn.gelu(hidden_gelu, approximate=self.approximate)
+        return gated_product('geglu' if self.approximate else 'geglu_exact')(hidden_gelu, hidden_linear)
 
 
 @logical_axes({("net_0", "proj"): ("embed", "mlp"), ("net_2",): ("mlp", "embed")})
