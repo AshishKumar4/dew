@@ -940,6 +940,21 @@ MOE_SHARED = ('gate_proj', 'up_proj', 'down_proj')
 # does; its Linear leaves transpose like any other, and the rest keep the
 # checkpoint's names and shapes (GatedDeltaNet in dew.nn.linear). Qwen3-Next
 # stores the same projections fused as in_proj_qkvz and in_proj_ba.
+type Leaves = Mapping[str, tuple[str, ...]]
+"""A family's own tensors, by their dotted names, onto their paths."""
+
+
+KDA_LEAVES: Leaves = {
+    'self_attn.A_log': ('self_attn', 'A_log'), 'self_attn.dt_bias': ('self_attn', 'dt_bias'),
+    'self_attn.o_norm.weight': ('self_attn', 'o_norm', 'weight'),
+    **{f'self_attn.{conv}.weight': ('self_attn', conv, 'weight')
+       for conv in ('q_conv1d', 'k_conv1d', 'v_conv1d')},
+    **{f'self_attn.{projection}.weight': ('self_attn', projection, 'kernel')
+       for projection in ('f_a_proj', 'f_b_proj', 'b_proj', 'g_a_proj', 'g_b_proj')},
+}
+"""Kimi Delta Attention's tensors below its layer, beside the shared q, k and v
+projections: the decay, its bias, the output norm, the short convolutions and
+the gate projections, which Kimi Linear, Kimi K3 and GLM-5 Next hold alike."""
 _LINEAR_PROJECTIONS = ('in_proj_qkv', 'in_proj_z', 'in_proj_b', 'in_proj_a',
                        'in_proj_qkvz', 'in_proj_ba', 'out_proj')
 _LINEAR_LEAVES: frozenset[tuple[str, ...]] = frozenset(
@@ -1033,9 +1048,21 @@ def renamed(name: str, renames: Renames, *, export: bool = False) -> str:
     return '.'.join(spelled)
 
 
-def renamed_path(renames: Renames, name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
-    """`dew_path` of a family whose names differ from the shared ones by `renames`."""
-    return dew_path(renamed(name, renames), config)
+def renamed_path(renames: Renames, name: str, config: Mapping[str, object], *, leaves: Leaves | None = None,
+                 layer_leaves: Leaves | None = None) -> tuple[str, ...] | None:
+    """`dew_path` of a family whose names differ from the shared ones by
+    `renames`, and that holds tensors the shared map has no place for:
+    `leaves` by their whole name, `layer_leaves` by their name below
+    `model.layers.N.`, each spelled after the renames and placed under
+    `params`, a layer's in its own."""
+    spelled = renamed(name, renames)
+    if leaves is not None and spelled in leaves:
+        return ('params', *leaves[spelled])
+    parts = spelled.split('.', 3)
+    if (layer_leaves is not None and len(parts) == 4 and parts[:2] == ['model', 'layers']
+            and parts[2].isdigit() and parts[3] in layer_leaves):
+        return ('params', f'layers_{parts[2]}', *layer_leaves[parts[3]])
+    return dew_path(spelled, config)
 
 
 def renamed_name(renames: Renames, dew_name: str, config: Mapping[str, object]) -> str | None:
@@ -1187,13 +1214,9 @@ def _hyper_connection_param_path(parts: list[str]) -> tuple[str, ...] | None:
             return (f'{site}_hc', suffix)
     if module == 'self_attn':
         tail = tuple(parts[4:])
-        if tail in (('A_log',), ('dt_bias',), ('o_norm', 'weight')):
-            return (module, *tail)
-        if len(tail) == 2 and tail[1] == 'weight':
-            if tail[0] in ('q_conv1d', 'k_conv1d', 'v_conv1d'):
-                return (module, *tail)
-            if tail[0] in ('f_a_proj', 'f_b_proj', 'b_proj', 'g_a_proj', 'g_b_proj'):
-                return (module, tail[0], 'kernel')
+        kda = KDA_LEAVES.get('.'.join(parts[3:]))
+        if kda is not None:
+            return kda
         if len(tail) == 2 and tail[0] == 'indexer' and tail[1] in (
                 'index_kpool_compress_ape', 'index_kpool_compress_gate'):
             return (module, *tail)
