@@ -26,7 +26,6 @@ from typing import TYPE_CHECKING, Protocol, runtime_checkable
 import grain.experimental as gx
 import grain.python as pygrain
 import numpy as np
-from grain._src.python.dataset.transformations.batch import make_batch
 
 from dew.data.analysis import (
     _LOCAL,
@@ -39,7 +38,16 @@ from dew.data.analysis import (
     _name,
     _until,
 )
-from dew.data.dataset import Batch, DataPartition, FilledBatch, Loading, Records, _Grouped, stacked
+from dew.data.dataset import (
+    Batch,
+    DataPartition,
+    FilledBatch,
+    Loading,
+    Records,
+    _Grouped,
+    record_batch,
+    stacked,
+)
 from dew.data.mixing import Accepted, PrimedMix, SearchBudget, TokenDeficit, primed_maps, token_weights
 from dew.data.pipeline import (
     Artifact,
@@ -614,7 +622,8 @@ class _Build:
                 raise ValueError(f"token split in {_name(pipeline)} needs a finite indexed order")
             rows, lengths = _TokenSplit(rows, stage), None
         elif isinstance(stage, Pack):
-            rows = _packed(_as_iter(rows, self.loading).map(Fields(stage.fields)), stage)
+            fields = Fields(stage.fields, max_length=None if stage.policy == "concat" else stage.seq_len)
+            rows = _packed(_as_iter(rows, self.loading).map(fields), stage)
             lengths = None
         elif isinstance(stage, Windows):
             from dew.data.steps.windows import CausalWindows
@@ -883,8 +892,8 @@ class _SharedOutput(Protocol):
 @dataclasses.dataclass
 class _Batched:
     """The batch step: each row's private fields dropped (`_Payload`), then
-    the rows stacked (`stacked`) by the pipeline's `batch_fn`, or by Grain's
-    own batch, into shared memory once Grain asks for it. The strip runs
+    the rows stacked (`stacked`) by the pipeline's `batch_fn`, or by
+    `record_batch`, into shared memory once Grain asks for it. The strip runs
     inside the batch, so it adds no Grain stage of its own; rows carry their
     private fields up to it, for the grouping and counting that read them."""
 
@@ -906,7 +915,7 @@ class _Batched:
         payload = [_Payload()(row) for row in rows]
         if self.batch_fn is not None:
             return stacked(payload, self.batch_fn)
-        return stacked(payload, functools.partial(make_batch, output_to_shared_memory=self.shared))
+        return stacked(payload, functools.partial(record_batch, shared=self.shared))
 
 
 @dataclasses.dataclass(frozen=True)

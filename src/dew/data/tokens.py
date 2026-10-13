@@ -1,4 +1,4 @@
-"""Indexed document chunks and first-fit plans."""
+"""Indexed documents and first-fit plans."""
 
 from __future__ import annotations
 
@@ -11,34 +11,15 @@ import numpy as np
 from .dataset import Batch
 
 
-def chunk_counts(lengths, chunk_len: int):
-    """How many chunks of at most `chunk_len` tokens each entry of `lengths` is cut into."""
-    return -(-np.asarray(lengths, np.int64) // chunk_len)
-
-
-def chunk_lengths(lengths, chunk_len: int) -> np.ndarray:
-    """The token count of every chunk `DocumentChunks` cuts `lengths` into.
-
-    A document of `chunk_len` tokens or fewer is one chunk of its own length;
-    a longer one is whole chunks and a remainder. A document of no tokens is
-    no chunks, as `chunk_counts` says.
-    """
-    lengths = np.asarray(lengths, np.int64)
-    counts = chunk_counts(lengths, chunk_len)
-    sizes = np.full(int(counts.sum()), chunk_len, np.int64)
-    kept = counts > 0
-    last = np.cumsum(counts)[kept] - 1
-    sizes[last] = lengths[kept] - (counts[kept] - 1) * chunk_len
-    return sizes
-
-
-def chunk_table(lengths, chunk_len: int) -> tuple[np.ndarray, np.ndarray]:
-    """The document each chunk `chunk_lengths` sizes is cut from, and where
-    in that document the chunk starts, both int64 and one entry per chunk."""
-    counts = chunk_counts(lengths, chunk_len)
-    documents = np.repeat(np.arange(len(counts), dtype=np.int64), counts)
-    first = np.repeat(np.cumsum(counts) - counts, counts)
-    return documents, (np.arange(len(documents), dtype=np.int64) - first) * chunk_len
+def validate_pack_lengths(lengths: np.ndarray, window: int) -> None:
+    """Document lengths that fit a packing window without implicit cuts."""
+    if np.any(lengths < 0):
+        raise ValueError("packing document lengths must be nonnegative")
+    if np.any(lengths > window):
+        raise ValueError(
+            f"pack needs documents no longer than {window} tokens; "
+            f"apply text.chunk({window}, overlap=1) before packing"
+        )
 
 
 def packed_window(chunks: Sequence[Batch], window: int) -> Batch:
@@ -80,6 +61,9 @@ def first_fit(sizes: np.ndarray, window: int, bins: int) -> tuple[np.ndarray, np
     """
     if bins < 1:
         raise ValueError(f"a packer fills at least one window at a time, got {bins}")
+    validate_pack_lengths(sizes, window)
+    documents = np.flatnonzero(sizes > 0)
+    sizes = sizes[documents]
     room = [window] * bins
     plan = np.empty(len(sizes), np.int64)
     closed = 0
@@ -100,7 +84,7 @@ def first_fit(sizes: np.ndarray, window: int, bins: int) -> tuple[np.ndarray, np
     windows = closed + bins - room.count(window)
     starts = np.concatenate([np.zeros(1, np.int64),
                              np.cumsum(np.bincount(plan, minlength=windows))])
-    return np.argsort(plan, kind="stable"), starts
+    return documents[np.argsort(plan, kind="stable")], starts
 
 
 class _WrappingDataset(pygrain.MapDataset[Batch]):
@@ -125,36 +109,6 @@ class _WrappingDataset(pygrain.MapDataset[Batch]):
         if isinstance(index, slice):
             return self.slice(index)
         return self.record(index % len(self))
-
-
-class DocumentChunks(_WrappingDataset):
-    """Cuts documents into consecutive chunks of at most `chunk_len` tokens.
-
-    A window holds nothing longer than itself, so a document that outgrows
-    the window is cut first. Each chunk becomes its own segment in the packed
-    window, which keeps attention inside the chunk and RoPE running from the
-    chunk's own 0.
-
-    The chunk table is built once from the document lengths. A record then
-    costs one read of its document and a slice.
-    """
-
-    def __init__(self, parent: pygrain.MapDataset, lengths, chunk_len: int):
-        super().__init__(parent)
-        self._chunk_len = chunk_len
-        self._document, self._offset = chunk_table(lengths, chunk_len)
-
-    def __len__(self) -> int:
-        return len(self._document)
-
-    def record(self, index: int) -> Batch:
-        document = self._parent[int(self._document[index])]
-        if document is None:
-            raise ValueError(f"document {index} of the packed corpus is missing")
-        start = int(self._offset[index])
-        # Every per-token field is cut the same way, so ids and roles stay
-        # aligned inside the chunk.
-        return {key: value[start:start + self._chunk_len] for key, value in document.items()}
 
 
 class PackedWindows(_WrappingDataset):
@@ -185,10 +139,10 @@ class PackedWindows(_WrappingDataset):
 
     def __init__(self, documents: pygrain.MapDataset[Batch], lengths, window: int,
                  bins: int, described: str):
-        super().__init__(DocumentChunks(documents, lengths, window))
+        super().__init__(documents)
         self._window, self._bins = window, bins
         self._described = described
-        self.order, self.starts = first_fit(chunk_lengths(lengths, window), window, bins)
+        self.order, self.starts = first_fit(np.asarray(lengths, np.int64), window, bins)
 
     def __repr__(self) -> str:
         # A saved position names the order it counts into (`dew.position`),
