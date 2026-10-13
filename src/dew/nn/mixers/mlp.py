@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING
 
 from flax import linen as nn
@@ -83,6 +83,12 @@ class MLPMixer(MixerBase):
                              'media_bias need a decoder feed-forward slot')
 
     def build(self, ctx: MixerContext):
+        return functools.partial(_MLP, feedforward=self.feedforward(ctx)(parent=None))
+
+    def feedforward(self, ctx: MixerContext) -> Callable[..., GatedMLP | SparseMLP]:
+        """The factory of the MLP this slot holds, dense or routed, which a
+        decoder block's feed-forward slot takes as it is (a prediction
+        depth's, `CausalTransformer.mtp_feedforward_type`)."""
         # decoder_block imports the mixer registry while its classes are being defined.
         from dew.nn.attention import RMSNorm
         from dew.nn.backbones.decoder_block import GatedMLP
@@ -90,14 +96,13 @@ class MLPMixer(MixerBase):
         dense = functools.partial(
             GatedMLP, out_features=ctx.emb_features,
             activation=self.activation, use_bias=self.use_bias, init_std=ctx.init_std,
-            output_init_std=ctx.output_init_std, dtype=ctx.dtype, precision=ctx.precision, parent=None)
-        feedforward = (dense(hidden_features=self.intermediate_size) if self.mixture is None else
-                       self.mixture.build(out_features=ctx.emb_features,
-                                          hidden_features=self.intermediate_size,
-                                          activation=self.activation, dense=dense,
-                                          norm=functools.partial(
-                                              RMSNorm, epsilon=ctx.norm_eps, scale_offset=ctx.scale_offset,
-                                              scale_after_cast=ctx.scale_after_cast, dtype=ctx.dtype),
-                                          init_std=ctx.init_std, output_init_std=ctx.output_init_std,
-                                          dtype=ctx.dtype, precision=ctx.precision)(parent=None))
-        return functools.partial(_MLP, feedforward=feedforward)
+            output_init_std=ctx.output_init_std, dtype=ctx.dtype, precision=ctx.precision)
+        if self.mixture is None:
+            return functools.partial(dense, hidden_features=self.intermediate_size)
+        return self.mixture.build(out_features=ctx.emb_features, hidden_features=self.intermediate_size,
+                                  activation=self.activation, dense=functools.partial(dense, parent=None),
+                                  norm=functools.partial(
+                                      RMSNorm, epsilon=ctx.norm_eps, scale_offset=ctx.scale_offset,
+                                      scale_after_cast=ctx.scale_after_cast, dtype=ctx.dtype),
+                                  init_std=ctx.init_std, output_init_std=ctx.output_init_std,
+                                  dtype=ctx.dtype, precision=ctx.precision)
