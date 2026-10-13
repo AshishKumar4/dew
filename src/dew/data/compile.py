@@ -60,6 +60,7 @@ from dew.data.pipeline import (
     Bound,
     Configured,
     Dataset,
+    DeviceStep,
     Expansion,
     Filter,
     FlatMap,
@@ -494,7 +495,8 @@ def _compiled(
         tuning = dataclasses.replace(build, loading=dataclasses.replace(loading, workers=0))
         loading = loading.resolved(tuning.batched(train, DataPartition()))
         build = dataclasses.replace(build, loading=loading)
-    train_host = tuple(stage.step for stage in train.stages if isinstance(stage, MapBatch)) + host
+    train_host, device = _batch_steps(train)
+    train_host = train_host + host
     statistics = _Statistics(counts)
     training = functools.partial(
         _training_reader,
@@ -514,7 +516,7 @@ def _compiled(
             build=dataclasses.replace(
                 build, lowering=_analyzed(validation, read, validation=True), training=False
             ),
-            host=tuple(stage.step for stage in validation.stages if isinstance(stage, MapBatch)) + host,
+            host=_held_steps(validation) + host,
         )
     )
     records = _epoch_records(train, build)
@@ -534,7 +536,25 @@ def _compiled(
         plan=plan,
         statistics=statistics,
         batch_tokens=batch_tokens,
+        device=device,
     )
+
+
+def _batch_steps(pipeline: Pipeline) -> tuple[tuple[HostStep, ...], tuple[DeviceStep, ...]]:
+    """The training batch's steps: those the reader runs on the host, then
+    those the compiled step runs on the accelerator (`DeviceStep`)."""
+    steps = [stage.step for stage in pipeline.stages if isinstance(stage, MapBatch)]
+    return (tuple(step for step in steps if not isinstance(step, DeviceStep)),
+            tuple(step for step in steps if isinstance(step, DeviceStep)))
+
+
+def _held_steps(pipeline: Pipeline) -> tuple[HostStep, ...]:
+    """A validation batch's host steps; a device step is a training transform."""
+    host, device = _batch_steps(pipeline)
+    if device:
+        raise ValueError(f"{type(device[0]).__name__} runs in the training step; a validation dataset "
+                         "takes its batches as they are read")
+    return host
 
 
 def _compile_phases(
@@ -920,8 +940,8 @@ def validation(
         tuning = dataclasses.replace(build, loading=dataclasses.replace(loading, workers=0))
         loading = loading.resolved(tuning.batched(pipeline, DataPartition()))
         build = dataclasses.replace(build, loading=loading)
-    stages = tuple(stage.step for stage in pipeline.stages if isinstance(stage, MapBatch)) + host
-    return functools.partial(_validation_reader, pipeline=pipeline, build=build, host=stages)
+    return functools.partial(_validation_reader, pipeline=pipeline, build=build,
+                             host=_held_steps(pipeline) + host)
 
 
 def publish(

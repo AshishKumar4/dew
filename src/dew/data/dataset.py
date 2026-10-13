@@ -51,6 +51,7 @@ if not flags.FLAGS.is_parsed():
 
 if TYPE_CHECKING:
     from dew.data.mixing import CorpusCounts
+    from dew.data.pipeline import DeviceStep
     from dew.data.plan import Plan
 
 
@@ -593,6 +594,9 @@ class Loader:
     plan: Plan | None = None
     statistics: Callable[[], Mapping[str, float]] = dataclasses.field(default=_data_statistics, repr=False)
     batch_tokens: int | None = None
+    device: tuple[DeviceStep, ...] = ()
+    """The training batch's steps the compiled training step runs, on the
+    accelerator, after the reader delivers it (`DeviceStep`)."""
 
     @property
     def steps_per_epoch(self) -> int | None:
