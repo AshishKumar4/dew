@@ -11,7 +11,6 @@ script_sha256 is the hash of the program the page shows.
 
 import hashlib
 import json
-import re
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -36,9 +35,9 @@ def digest(code: str) -> str:
 
 def training_example(source: str) -> str:
     """site/src/data/hero.py as the page shows it, without its command line."""
-    source = source.replace("import argparse\n\n", "", 1)
-    return re.sub(r"parser = argparse.ArgumentParser\(\)[\s\S]*?steps = parser.parse_args\(\).steps",
-                  "steps = 1000", source, count=1)
+    before, command = source.split("# Begin command line\n", 1)
+    _, after = command.split("# End command line\n", 1)
+    return before + after
 
 
 def programs() -> dict[str, str]:

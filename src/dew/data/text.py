@@ -8,17 +8,72 @@ tokenizer on first use, so a host without the hub cache still imports
 
 from __future__ import annotations
 
+import contextlib
+import dataclasses
+import functools
+import hashlib
 import threading
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
+from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
     from jax.typing import ArrayLike
     from transformers import PreTrainedTokenizerBase
 
+    from dew.data.steps.text import Chunks, Dropped, MinChars, Tokenize
+
 
 _load_lock = threading.Lock()
 _loaded: dict[tuple[str, str | None, bool], PreTrainedTokenizerBase] = {}
+
+
+_TOKENIZER_FILES = ["*.json", "*.jinja", "*.model", "*.txt", "*.tiktoken"]
+"""The files a tokenizer's loader can read: its vocabulary, merges and templates."""
+
+
+@dataclasses.dataclass(frozen=True)
+class PinnedTokenizer:
+    """A Hugging Face tokenizer resolved once to immutable files
+    (`pin_tokenizer`): the snapshot its identity hashes and the directory it
+    reads its vocabulary and templates from, which are one revision by
+    construction."""
+
+    snapshot: Mapping[str, object]
+    directory: str
+
+    def transformers(self) -> PreTrainedTokenizerBase:
+        """The transformers tokenizer of these files, whose chat template
+        renders conversations. A directory is read where it is, so the load
+        reaches no hub, and it is the one load every reader of the directory
+        shares (`load_tokenizer`)."""
+        return load_tokenizer(self.directory)
+
+
+def pin_tokenizer(name: str, *, local_files_only: bool = False) -> PinnedTokenizer:
+    """Resolve `name` once: a local directory, or a hub repo (optionally
+    `repo@revision`) downloaded at the commit its revision names, with every
+    file its loader can read hashed. The Hub cache keeps a commit's files in
+    a directory named for the commit, which is the revision recorded; offline
+    (`HF_HUB_OFFLINE`), or with `local_files_only`, the name resolves to the
+    commit the local cache holds."""
+    if name == "byte":
+        raise ValueError("'byte' names Dew's byte vocabulary (ByteTokenizer), which has no tokenizer files")
+    directory = Path(name)
+    repo = resolved = None
+    if not directory.is_dir():
+        from huggingface_hub import snapshot_download
+
+        repo, separator, revision = name.rpartition("@")
+        repo, revision = (repo, revision) if separator else (name, None)
+        directory = Path(snapshot_download(repo, revision=revision, allow_patterns=_TOKENIZER_FILES,
+                                           local_files_only=local_files_only))
+        resolved = directory.name
+    files = {str(path.relative_to(directory)): hashlib.sha256(path.read_bytes()).hexdigest()
+             for pattern in _TOKENIZER_FILES
+             for path in directory.rglob(pattern) if path.is_file()}
+    snapshot = {"name": repo, "revision": resolved, "files": files}
+    return PinnedTokenizer(snapshot, str(directory))
 
 
 def load_tokenizer(name: str, *, revision: str | None = None,
@@ -28,6 +83,11 @@ def load_tokenizer(name: str, *, revision: str | None = None,
     Every Dew path that needs an HF tokenizer loads it here, so one name at
     one revision is one object however many readers share it.
     """
+    repo, separator, pinned = name.rpartition("@")
+    if separator and not Path(name).exists():
+        if revision is not None and revision != pinned:
+            raise ValueError(f"tokenizer {name} and revision={revision!r} disagree")
+        name, revision = repo, pinned
     key = (name, revision, local_files_only)
     held = _loaded.get(key)
     if held is not None:
@@ -103,6 +163,9 @@ class ByteTokenizer:
         self.eos_id = 255
         self.bos_id = None
 
+    def dependencies(self) -> Mapping[str, object]:
+        return {"name": "byte", "encoding": "utf-8", "eos": 255}
+
     def encode(self, text: str, *, add_special_tokens: bool = True) -> list[int]:
         """Return the text's utf-8 bytes as ids.
 
@@ -119,21 +182,33 @@ class ByteTokenizer:
 
 
 class HFTokenizer:
-    """A Hugging Face tokenizer, loaded from its hub name or local directory
+    """A Hugging Face tokenizer, resolved from its hub name or local directory
     on first use.
 
-    Because it loads lazily, `import dew.data.text` (and `import dew.data`)
-    does not import `transformers` or look anything up on the hub until a
-    caller uses the tokenizer.
+    It resolves its name once (`pinned`), and its identity (`dependencies`)
+    and every encoding read that one resolution, here and in any process it
+    is pickled to, so a hub name that moves, or another revision of it a
+    process already loaded, never encodes rows under the identity of this
+    one. Because it resolves lazily, `import dew.data.text` (and
+    `import dew.data`) does not import `transformers` or look anything up on
+    the hub until a caller uses the tokenizer.
     """
 
     def __init__(self, name: str, *, local_files_only: bool = False):
         self.name = name
         self.local_files_only = local_files_only
 
+    @functools.cached_property
+    def pinned(self) -> PinnedTokenizer:
+        """The name resolved once to immutable files (`pin_tokenizer`)."""
+        return pin_tokenizer(self.name, local_files_only=self.local_files_only)
+
+    def dependencies(self) -> Mapping[str, object]:
+        return self.pinned.snapshot
+
     @property
     def tokenizer(self) -> PreTrainedTokenizerBase:
-        return load_tokenizer(self.name, local_files_only=self.local_files_only)
+        return self.pinned.transformers()
 
     @property
     def vocab_size(self) -> int:
@@ -185,7 +260,73 @@ class HFTokenizer:
         return f"{self.__class__.__name__}(name={self.name!r})"
 
 
-def tokenizer_for(name: str, *, local_files_only: bool = False):
+def tokenizer_name(tokenizer: str | PreTrainedTokenizerBase) -> str:
+    """A tokenizer as the name Dew's steps carry: a name as it is, and a
+    transformers tokenizer object saved once to a directory named for its
+    files' hash, which every worker reads and every run hashes alike."""
+    if isinstance(tokenizer, str):
+        return tokenizer
+    import shutil
+    import tempfile
+
+    from dew.cache import dew_cache_dir
+
+    root = Path(dew_cache_dir(), "tokenizers")
+    root.mkdir(parents=True, exist_ok=True)
+    staging = Path(tempfile.mkdtemp(dir=root))
+    try:
+        tokenizer.save_pretrained(str(staging))
+        digest = hashlib.sha256()
+        for path in sorted(path for path in staging.rglob("*") if path.is_file()):
+            digest.update(str(path.relative_to(staging)).encode() + b"\0" + path.read_bytes())
+        directory = root / digest.hexdigest()
+        if not directory.is_dir():
+            # Another process saving the same tokenizer writes the same files first.
+            with contextlib.suppress(OSError):
+                staging.rename(directory)
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+    return str(directory)
+
+
+def tokenize(tokenizer: str | PreTrainedTokenizerBase = "byte", *, field: str = "text",
+             eos: bool | None = None) -> Tokenize:
+    """A record step that encodes the text in `field` to token ids under
+    "text", each document ended by the tokenizer's EOS with `eos`, or where
+    the tokenizer has one with None.
+    `tokenizer` is "byte" (Dew's utf-8 vocabulary), a Hub repo or directory,
+    or a transformers tokenizer object."""
+    from dew.data.steps.text import Tokenize
+
+    return Tokenize(tokenizer_name(tokenizer), field, eos)
+
+
+def chunk(length: int, *, overlap: int = 0, fields: tuple[str, ...] = ("text",)) -> Chunks:
+    """An expansion (`flat_map`) that cuts a document's token `fields` into
+    pieces of at most `length`, overlapping by `overlap`, before `pack`, which
+    refuses a document longer than its window. For next-token training,
+    `overlap=1` keeps every target: pack to `length` with `seq_len=length`."""
+    from dew.data.steps.text import Chunks
+
+    return Chunks(length, fields, overlap)
+
+
+def drop(field: str = "caption", p: float = 0.1) -> Dropped:
+    """A random step that empties the text in `field` with probability `p`,
+    as classifier-free guidance trains its unconditioned branch."""
+    from dew.data.steps.text import Dropped
+
+    return Dropped(field, p)
+
+
+def min_chars(count: int, field: str = "text") -> MinChars:
+    """A filter keeping texts of at least `count` characters."""
+    from dew.data.steps.text import MinChars
+
+    return MinChars(count, field)
+
+
+def tokenizer_for(name: str, *, local_files_only: bool = False) -> ByteTokenizer | HFTokenizer:
     """Builds the tokenizer `name` asks for.
 
     `byte` is dew's own utf-8 vocabulary; any other name is the HF tokenizer

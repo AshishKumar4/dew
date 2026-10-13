@@ -11,7 +11,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from affine_run import Counting, Data, val_batches
+from affine_run import Counting, dataset, val_batches
 
 from dew.artifacts import TokenScores
 from dew.checkpoints import Checkpoints, Keep, Ranking
@@ -62,7 +62,7 @@ def data():
     def validation():
         for batch in val_batches(1)():
             yield {**batch, 'validation': np.ones(len(batch['x']), bool)}
-    return Data(train=train, val=validation)
+    return dataset(train=train, val=validation)
 
 
 def trainer(path, keep=1):
@@ -117,7 +117,7 @@ def test_missing_and_undeclared_metrics_are_refused_before_training(tmp_path):
 
 def test_ranked_loss_and_periodic_retention(tmp_path):
     run = trainer(tmp_path / 'run', keep=Keep(latest=1, every=2))
-    state = run.fit(Data(train=data()._train), steps=1, log_every=1)
+    state = run.fit(dataclasses.replace(data(), val=None), steps=1, log_every=1)
     checkpoints = run.checkpoints
     for step, loss in [(2, .1), (3, .9), (4, .7), (5, .8)]:
         checkpoints.save(step, state.replace(step=jnp.int32(step)), None, ranking=Ranking('train/loss', loss))
@@ -200,7 +200,7 @@ def test_restore_best_returns_the_whole_earlier_state(tmp_path):
 @pytest.mark.parametrize("aggregate", [False, True])
 def test_training_values_are_selected_through_the_objective(tmp_path, aggregate):
     run = trainer(tmp_path / 'run')
-    stream = Data(train=data()._train) if aggregate else data()
+    stream = dataclasses.replace(data(), val=None) if aggregate else data()
     best = Best(lambda metrics: metrics[run.objective.loss]) if aggregate else run.objective.loss
     run.fit(stream, steps=4, log_every=1, checkpoint_every=4 if aggregate else 1, best=best)
     assert run.checkpoints.best == 4
@@ -210,14 +210,14 @@ def test_training_values_are_selected_through_the_objective(tmp_path, aggregate)
 
 def test_time_cadence_and_recorded_duration(tmp_path):
     from dew.config import TrainerConfig
-    from dew.data import Dataset
+    from dew.data.dataset import Loader
 
     assert TrainerConfig(checkpoint_every="30m").checkpoint_interval(
-        Dataset(lambda p: iter(()), None, records=4, batch=2)
+        Loader(lambda p: iter(()), None, records=4, batch=2)
     ) == datetime.timedelta(minutes=30)
     with pytest.raises(ValueError):
         TrainerConfig(checkpoint_every="0m").checkpoint_interval(
-            Dataset(lambda p: iter(()), None, records=4, batch=2)
+            Loader(lambda p: iter(()), None, records=4, batch=2)
         )
     with pytest.raises(TypeError):
         TrainerConfig(best=Best(lambda m: 0))
