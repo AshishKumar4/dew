@@ -162,7 +162,7 @@ Dew stores compiled executables in `~/.cache/dew/xla/python3.X`, or `$XDG_CACHE_
 
 Training reads prepared TFDS ArrayRecords and does not import TensorFlow. Preparing a dataset does need TensorFlow and sometimes dataset-specific packages (Oxford Flowers reads its label files with SciPy). TFDS 4.9.10 also imports `importlib_resources` while it prepares a dataset but only declares it for Python before 3.9, so the command installs it too.
 
-Where the training environment has them (Python 3.13 or earlier, with `tensorflow` and `importlib_resources` installed), `dew.data.load("tfds/mnist", batch=64)` and `TFDSImages(name="mnist")` prepare the builder themselves, in a separate Python process, into `~/.cache/dew/tfds` (`$XDG_CACHE_HOME/dew/tfds` when that is set), and every later call reads it from there, offline. TensorFlow 2.21.0 has no Python 3.14 wheels, so on 3.14 prepare in a separate Python 3.13 environment:
+Preparation is explicit: call TFDS.provision(), pass provision=True to load, or run dew data provision tfds://mnist. Those choices can download data. Indexed reads otherwise require prepared ArrayRecords and name the missing artifact. TensorFlow 2.21.0 has no Python 3.14 wheels, so prepare in a separate Python 3.13 environment when needed:
 
 ```bash
 uv venv --python 3.13 .venv-tfds-prepare
@@ -182,21 +182,21 @@ print("export DEW_FLOWERS_PATH=" + shlex.quote(str(builder.data_dir)))
 PY
 ```
 
-The script downloads the data if needed and prints an `export` line with the prepared version directory. To have `load("tfds/<builder>")` and `TFDSImages(name=)` find it without a path, prepare it with `data_dir` set to the training environment's `~/.cache/dew/tfds` instead. Otherwise run the printed line in the shell you train from:
+The script prints the prepared version directory. Run that export line in the training shell and bind it as the TFDS Source's path:
 
 <!-- not run: needs the prepared TFDS directory the script above writes -->
 ```python
 import os
-from dew.data import Loading, TFDSImages
+from dew.data import Loading, TFDS
+from dew.config.data import Augment, HoldOut, ImageData, loader
 
-data = TFDSImages(
-    path=os.environ["DEW_FLOWERS_PATH"],
-    image_size=64,
-    loading=Loading(workers=0),
-).load(batch=4)
+recipe = ImageData(source=TFDS("oxford_flowers102", split="all", path=os.environ["DEW_FLOWERS_PATH"]),
+                image_size=64, caption_templates=("a photo of a {}",),
+                augment=Augment(flip=True, jitter=True), validation=HoldOut(records=16))
+data = loader(recipe, batch=4, read="memory", loading=Loading(workers=0))
 ```
 
-Recipes take the same path as `--data.path "$DEW_FLOWERS_PATH"`; the diffusion recipe's `data:oxford-flowers102` reads it with flower captions. With `labels=None`, `TFDSImages` reads the class names from the `label.labels.txt` file TFDS writes there; `--data.labels` names another file. If the metadata or shards under a `path` are missing, the reader raises an error that asks you to prepare the data; Dew prepares only into its own directory, never into a `path` you name.
+For a run's CLI, --data.source accepts the JSON record of that TFDS value (class dew.data.sources.tfds:TFDS, fields name/path/split). Images uses TFDS's class-label metadata for its caption templates; labels names an explicit alternative label file. Missing shards are named errors. Non-local, non-GCS TFDS stores currently require an explicit local provision mirror; they are not silently materialized.
 
 ## Building the documentation
 

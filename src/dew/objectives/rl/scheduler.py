@@ -105,7 +105,7 @@ import jax
 import numpy as np
 
 from dew.coordination import agreed
-from dew.data.dataset import Batch, DataPartition, Dataset, tapped
+from dew.data.dataset import Batch, DataPartition, Loader, tapped
 from dew.nn.inputs import local_rows, mesh_of
 from dew.objectives.base import Shown, Variables
 from dew.training.distributed import first_reader_batch, shard_batch
@@ -317,7 +317,7 @@ class RolloutScheduler:
         self._submissions = 0
         self._partition = DataPartition()
 
-    def tasks(self, dataset: Dataset) -> Dataset:
+    def tasks(self, dataset: Loader) -> Loader:
         """Return `dataset` with a training stream that registers each task batch ahead of the step.
 
         Opening the stream again, as a resume does, cancels every rollout
