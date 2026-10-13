@@ -11,6 +11,10 @@ on:
   pull_request:
     branches: [ "main" ]
   workflow_dispatch:
+  # Daily, main's every test file runs, the test cache aside (tools/armada/ci.py), so nothing it
+  # skipped can hide.
+  schedule:
+    - cron: "17 9 * * *"
   # The release workflow runs all of this on the release's own commit and
   # publishes only if every job passes.
   workflow_call:
@@ -190,10 +194,15 @@ jobs:
       env:
         ARMADA_URL: ${{ secrets.ARMADA_URL }}
         ARMADA_TOKEN: ${{ secrets.ARMADA_TOKEN }}
+        # The plan reads the test cache with a token that cannot write it.
+        DEW_TEST_CACHE_TOKEN: ${{ secrets.DEW_TEST_CACHE_READ_TOKEN }}
+        DEW_TEST_CACHE: ${{ github.event_name == 'schedule' && 'off' || 'on' }}
       run: |
         armada="bunx --bun $ARMADA"
-        # Its own deadline sits below this job's 40 minutes, so a hang is armada's named error.
-        $armada verdict ${{ github.sha }} || $armada run ${{ github.sha }} --deadline=1800 \
+        # Its own deadline sits below this job's 40 minutes, so a hang is armada's named error. The
+        # daily run proves the commit again, with every file.
+        if [ "$DEW_TEST_CACHE" = on ]; then $armada verdict ${{ github.sha }} && exit 0; fi
+        $armada run ${{ github.sha }} --deadline=1800 \
           --label="${{ github.ref_name }}"
 
   multihost:
