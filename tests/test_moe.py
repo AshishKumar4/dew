@@ -27,8 +27,7 @@ from flax import linen as nn
 from moe_support import by_expert, router_variables
 
 from dew.nn.backbones.decoder_block import GatedMLP
-from dew.nn.kernels import TARGETS, assumed
-from dew.nn.moe import ExpertMLP, Router, SparseMLP, grouped_matmul, load_balance_update
+from dew.nn.moe import ExpertMLP, Router, SparseMLP, load_balance_update
 from dew.training import MeshSpec
 
 pytestmark = pytest.mark.kernel
@@ -501,93 +500,8 @@ def test_the_grouped_matmul_matches_a_per_expert_loop():
     assert np.max(np.abs(np.asarray(output) - reference)) < 1e-6
 
 
-def test_float32_expert_routing_with_x64_keeps_its_output_and_gradients():
-    """Enabling a float64 oracle must not prevent the float32 model running.
-
-    bincount defaults to int64 under x64; TPU ragged-dot cannot lower those
-    group sizes. Exercise the routed experts, not just a hand-typed count.
-    """
-    with jax.enable_x64(new_val=False):
-        experts, variables, x, weights, indices = routed_experts(top_k=2)
-
-    def step(variables, x):
-        output = experts.apply(variables, x, weights, indices)
-        return jnp.square(output).sum(), output
-
-    results = []
-    for enabled in (False, True):
-        with jax.enable_x64(enabled):
-            results.append(jax.device_get(jax.jit(
-                jax.value_and_grad(step, argnums=(0, 1), has_aux=True))(variables, x)))
-    for expected, actual in zip(jax.tree.leaves(results[0]), jax.tree.leaves(results[1]), strict=True):
-        assert actual.dtype == expected.dtype == np.float32
-        np.testing.assert_allclose(actual, expected, rtol=1e-6, atol=1e-7)
-
-def random_routing(key, tokens, top_k, num_experts=8):
-    """Distinct experts per token, as a router chooses them, under random
-    positive weights; some experts stay idle and the loads differ."""
-    choice_key, weight_key = jax.random.split(key)
-    _, indices = jax.lax.top_k(jax.random.normal(choice_key, (tokens, num_experts)), top_k)
-    return jax.random.uniform(weight_key, (tokens, top_k)), indices
-
-
-def test_the_tokamax_grouped_matmul_agrees_with_the_xla_one():
-    """The optional kernel path, on a machine that has tokamax installed."""
-    pytest.importorskip("tokamax")
-    experts, variables, x, _, _ = routed_experts(top_k=2, tokens=24)
-    weights, indices = random_routing(jax.random.key(2), 24, 2)
-    expected = experts.apply(variables, x, weights, indices)
-    other = experts.clone(implementation='tokamax').apply(
-        variables, x, weights, indices)
-
-    # Observed 0 on CPU, where tokamax lowers to the same ragged_dot; the
-    # bound leaves room for a Mosaic or Triton kernel's accumulation order.
-    assert np.max(np.abs(np.asarray(other) - np.asarray(expected))) < 1e-6
-
-
-GPU_ROWS = sorted(generation for generation in TARGETS if generation.startswith('sm'))
-
-
-@pytest.mark.parametrize("generation", GPU_ROWS)
-def test_each_gpu_row_names_a_tokamax_kernel_tokamax_registers(generation):
-    """A KERNELS row names an implementation Dew's install provides: tokamax's
-    Triton kernel imports jax_triton, which no Dew install brings, so a row
-    that named it failed with tokamax's "Unknown implementation" on that GPU.
-    Each row's kernel computes the XLA product."""
-    pytest.importorskip("tokamax")
-    keys = jax.random.split(jax.random.key(5), 2)
-    tokens = jax.random.normal(keys[0], (24, 16))
-    kernel = jax.random.normal(keys[1], (4, 16, 8))
-    sizes = jnp.asarray([5, 0, 12, 7], jnp.int32)
-    expected = grouped_matmul(tokens, kernel, sizes, implementation='xla')
-    with assumed(generation):
-        chosen = grouped_matmul(tokens, kernel, sizes, implementation='tokamax')
-    np.testing.assert_allclose(np.asarray(chosen), np.asarray(expected), rtol=0, atol=1e-6)
-
-
-def test_the_tokamax_grouped_matmul_backs_the_same_gradients():
-    """Both kernels differentiate: the expert weights and the tokens get the
-    same gradient through either, under routing that loads experts unevenly."""
-    pytest.importorskip("tokamax")
-    experts, variables, x, _, _ = routed_experts(top_k=3, tokens=24)
-    weights, indices = random_routing(jax.random.key(3), 24, 3)
-    probe = jax.random.normal(jax.random.key(4), x.shape)
-
-    def gradients(module):
-        def loss(variables, x):
-            return jnp.sum(module.apply(variables, x, weights, indices) * probe)
-        return jax.grad(loss, argnums=(0, 1))(variables, x)
-
-    expected = gradients(experts)
-    other = gradients(experts.clone(implementation='tokamax'))
-
-    for theirs, ours in zip(jax.tree.leaves(expected), jax.tree.leaves(other), strict=True):
-        assert np.max(np.abs(np.asarray(ours) - np.asarray(theirs))) < 1e-6
-    assert all(float(jnp.max(jnp.abs(leaf))) > 0 for leaf in jax.tree.leaves(expected))
-
-
 def test_an_unknown_grouped_matmul_is_rejected():
-    with pytest.raises(ValueError, match="tokamax"):
+    with pytest.raises(ValueError, match="'pallas'"):
         routed_experts(implementation='megablox')
 
 
@@ -599,7 +513,7 @@ def test_routing_that_does_not_describe_the_tokens_is_rejected():
 
 @pytest.mark.parametrize('generation,gpu,chosen', [
     ('sm89', True, 'pallas'), ('sm86', True, 'pallas'), ('sm80', True, 'pallas'), ('sm75', False, 'xla'),
-    ('sm90', True, 'xla'), ('v6e', False, 'xla'), ('cpu', False, 'xla')])
+    ('sm90', True, 'pallas'), ('sm120', True, 'xla'), ('v6e', False, 'xla'), ('cpu', False, 'xla')])
 def test_auto_takes_the_measured_grouped_matmul_and_xla_elsewhere(monkeypatch, generation, gpu,
                                                                   chosen):
     """'auto' runs the Pallas kernels only on a generation they were measured

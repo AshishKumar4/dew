@@ -20,7 +20,7 @@ from dew.lora import AdapterRecord, LoRA
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.objectives.lm import LMObjective, LMRunConfig
 from dew.training import Checkpoints, Trainer
-from dew.training.quantization import InputQuantization, Quantization, quantize_trunk
+from dew.training.quantization import QUANTIZATION, InputQuantization, Quantization, quantize_trunk
 
 pytestmark = pytest.mark.mesh
 
@@ -157,8 +157,9 @@ def test_a_second_quantization_is_refused_where_qwix_would_replace_the_first():
 def test_a_run_of_an_input_quantized_checkpoint_reloads_with_its_input_quantization(tmp_path, fixture):
     """A ModelOpt or compressed-tensors FP8 or NVFP4 checkpoint computes with
     its input quantization (`InputQuantization`); a run of it records the
-    per-Linear scales and reloads computing the run's logits bit for bit,
-    which the same weights without them do not."""
+    scheme, keeps the per-Linear scales in its variables (`QUANTIZATION`) and
+    reloads computing the run's logits bit for bit, which the same weights
+    without the scheme do not."""
     pytest.importorskip("qwix")
     source = Pretrained.load(FIXTURES / "codecs" / fixture, dtype="float32", attention_impl="reference")
     objective = LMObjective(source.model, SEQ, variables=source.variables)
@@ -166,10 +167,45 @@ def test_a_run_of_an_input_quantized_checkpoint_reloads_with_its_input_quantizat
 
     recorded = ModelConfig.from_model(task.model).wrappers
     assert recorded == ModelConfig.from_model(source.model).wrappers
-    assert len(recorded) == 1 and isinstance(recorded[0], InputQuantization) and recorded[0].inputs
+    assert len(recorded) == 1 and isinstance(recorded[0], InputQuantization)
+    assert jax.tree.leaves(task.variables[QUANTIZATION])
     np.testing.assert_array_equal(logits(task.model, task.variables), logits(source.model, state.variables))
     plain = rebuilt_with(task.model)
     assert float(np.max(np.abs(logits(plain, task.variables) - logits(task.model, task.variables)))) > 0
+
+
+def test_an_input_quantized_run_resumes_from_its_record_where_two_steps_would_end(tmp_path):
+    """A run of an input-quantized checkpoint resumed from its own record
+    rebuilds the model with no source at hand: its `init` declares the scales
+    the record names (`InputQuantization.sites`), which the checkpoint then
+    restores, so one step and a resumed second end where two uninterrupted
+    steps end, scales and weights bit for bit."""
+    from dew.config import RunConfig
+
+    source = Pretrained.load(FIXTURES / "codecs" / "nvfp4_qdq" / "e4m3", dtype="float32",
+                             attention_impl="reference")
+
+    def run(directory, steps, record=None):
+        config = record or LMRunConfig(model=ModelConfig.from_model(source.model), trainer=TrainerConfig(
+            checkpoint_dir=str(directory), batch_size=BATCH, steps=steps, eval_every=None,
+            checkpoint_every=1, compilation_cache_dir=None))
+        objective = (LMObjective(record.model.build(), SEQ) if record
+                     else LMObjective(source.model, SEQ, variables=source.variables))
+        state = config.train(objective, Dataset(lambda partition: Stream(96), None, None, BATCH), name="run")
+        Checkpoints(str(directory / "run")).wait()
+        return state
+
+    whole = run(tmp_path / "whole", 2)
+    run(tmp_path / "stopped", 1)
+    record = RunConfig.load(str(tmp_path / "stopped" / "run"))
+    assert isinstance(record, LMRunConfig) and isinstance(record.model.wrappers[0], InputQuantization)
+    resumed = run(tmp_path / "stopped", 2, dataclasses.replace(
+        record, trainer=dataclasses.replace(record.trainer, steps=2)))
+    assert int(resumed.step) == int(whole.step) == 2
+    assert jax.tree.leaves(resumed.variables[QUANTIZATION])
+    for before, after in zip(jax.tree.leaves(whole.variables), jax.tree.leaves(resumed.variables),
+                             strict=True):
+        np.testing.assert_array_equal(np.asarray(before), np.asarray(after))
 
 
 def test_a_block_run_the_trainer_quantizes_reloads_quantized(tmp_path):
