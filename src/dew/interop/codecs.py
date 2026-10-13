@@ -1357,8 +1357,6 @@ def _modelopt_names(tensors: Mapping[str, np.ndarray], *, method: str = 'NVFP4',
         missing = [part for part in parts if part not in tensors]
         if missing:
             raise ValueError(f"{stem}.weight is ModelOpt NVFP4 and the checkpoint holds no {missing}")
-        if stem == 'lm_head' and algo != 'W4A16_NVFP4':
-            raise ValueError("ModelOpt lm_head input quantization is not computed by the chunked loss head")
         if any(stem + part in tensors for part in ('.pre_quant_scale', '.input_pre_quant_scale')):
             raise ValueError(f"{stem} has ModelOpt pre_quant_scale, "
                              "which this input provider does not compute")
