@@ -27,9 +27,9 @@ from flax.typing import Dtype, PrecisionLike
 from dew.interop.weights import ParamTree, checkpoint_array, translate_parameters
 from dew.nn.activations import activation as named_activation
 from dew.nn.attention import LayerNorm, RMSNorm
-from dew.nn.backbones.decoder_block import BlockWiring, DecoderBlock, GatedMLP
+from dew.nn.backbones.decoder_block import DecoderBlock
 from dew.nn.inputs import AttentionMetadata
-from dew.nn.mixers.attention import CausalSelfAttention
+from dew.nn.text_encoders import clip_layer
 
 Attention = Literal["full", "band", "window"]
 Order = Literal["patches", "columns", "windows"]
@@ -128,24 +128,16 @@ def resampled_positions(table, rows, columns, heights, widths, *, align_corners:
 
 def vit_block(layout: ViTLayout, index: int, *, dtype: Dtype | None,
               precision: PrecisionLike) -> DecoderBlock:
-    """Layer `index`'s block: a pre-norm attention over the 2D rotary and a pre-norm feed-forward,
-    both residual."""
+    """Layer `index`'s block (`clip_layer`): a pre-norm attention over the 2D rotary, over a band of
+    keys where the layout says, and a pre-norm feed-forward, both residual."""
     band = layout.attention[index] == "band"
-    attention = functools.partial(
-        CausalSelfAttention, emb_features=layout.hidden_size, num_heads=layout.num_heads,
-        num_kv_heads=layout.num_kv_heads, head_dim=layout.head_dim, max_seq_len=1, causal=False,
-        qk_norm=False, attention_bias=True, rotary_axes=(layout.head_dim // 2,) * 2,
-        rope_theta=layout.rope_theta, packed=layout.packed,
-        # A band keeps the keys within `band` places: |q - k| < band + 1 (`window_sides`).
-        sliding_window=layout.band + 1 if band else None, bidirectional_window=band,
-        dtype=dtype, precision=precision)
-    mlp = functools.partial(GatedMLP, hidden_features=layout.intermediate_size,
-                            out_features=layout.hidden_size, activation=layout.activation,
-                            use_bias=layout.mlp_bias, packed=layout.mlp_packed, dtype=dtype,
-                            precision=precision)
-    return DecoderBlock(attention, mlp, layout.hidden_size, BlockWiring(), norm_eps=layout.norm_eps,
-                        norm_type=layout.norm_type, norm_bias=layout.norm_bias, dtype=dtype,
-                        precision=precision, name=f"blocks_{index}")
+    return clip_layer(layout.hidden_size, layout.num_heads, layout.intermediate_size, 1,
+                      kv_heads=layout.num_kv_heads, head_dim=layout.head_dim, activation=layout.activation,
+                      eps=layout.norm_eps, norm_type=layout.norm_type, norm_bias=layout.norm_bias,
+                      mlp_bias=layout.mlp_bias, mlp_packed=layout.mlp_packed,
+                      rotary_axes=(layout.head_dim // 2,) * 2, rope_theta=layout.rope_theta,
+                      packed=layout.packed, window=layout.band if band else None, dtype=dtype,
+                      precision=precision, name=f"blocks_{index}")
 
 
 def _gather(x, index):
