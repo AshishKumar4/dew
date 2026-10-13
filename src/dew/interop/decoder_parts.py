@@ -71,6 +71,26 @@ def ungated_mlp(activation: str, accepted: Collection[str], field: str, family: 
     return UNGATED_ACTIVATIONS[activation]
 
 
+def fixed_attention_buffer(name: str, tensor: np.ndarray, attention: str,
+                           sentinels: Collection[float]) -> bool:
+    """Whether `name` is one of a classic family's fixed attention buffers,
+    under its `attention` module: `bias`, the triangular causal mask, or
+    `masked_bias`, a mask sentinel among `sentinels`, which each family's
+    releases spell their own. They describe the fixed mask, not learned
+    biases, so an altered one is refused."""
+    if name.endswith(f'.{attention}.bias'):
+        if (tensor.ndim != 4 or tensor.shape[:2] != (1, 1)
+                or tensor.shape[-2] != tensor.shape[-1]
+                or not np.array_equal(tensor, np.tril(np.ones_like(tensor)))):
+            raise ValueError(f'{name} must hold the fixed triangular causal mask')
+        return True
+    if name.endswith(f'.{attention}.masked_bias'):
+        if tensor.shape != () or float(tensor) not in sentinels:
+            raise ValueError(f'{name} must hold a historical mask sentinel, one of {sorted(sentinels)}')
+        return True
+    return False
+
+
 def hf_ungated(mlp: object, family: str, tanh: str = 'gelu_new') -> str:
     """The activation a classic `family`'s config names Dew's ungated `mlp`
     by, its tanh GELU spelled `tanh`; any other `mlp` is refused."""

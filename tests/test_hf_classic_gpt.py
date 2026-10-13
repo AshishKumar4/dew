@@ -162,6 +162,10 @@ def test_original_bare_gpt2_weights_and_causal_buffers_preserve_logits():
     tensors['h.0.attn.bias'][0, 0, 0, 1] = 1
     with pytest.raises(ValueError, match='causal mask'):
         translate_weights(tensors, config, 'gpt2')
+    tensors['h.0.attn.bias'][0, 0, 0, 1] = 0
+    tensors['h.0.attn.masked_bias'] = np.asarray(-1e9, np.float32)
+    with pytest.raises(ValueError, match=r'h\.0\.attn\.masked_bias must hold a historical mask sentinel'):
+        translate_weights(tensors, config, 'gpt2')
 
 
 @pytest.mark.network

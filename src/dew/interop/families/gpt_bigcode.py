@@ -9,13 +9,12 @@ import numpy as np
 from dew.interop.decoder_parts import (
     DecoderFamily,
     DecoderFields,
-    Renames,
     hf_ungated,
     refuse,
     renamed_name,
     renamed_path,
 )
-from dew.interop.families.gpt2 import gpt2_config, gpt2_export
+from dew.interop.families.gpt2 import GPT2_NAMES, gpt2_config, gpt2_export
 from dew.interop.families.gpt_neox import gpt_neox_export_weights, gpt_neox_prepare
 from dew.interop.safetensors_io import LazyTensors
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -41,16 +40,9 @@ def _gpt_bigcode_config(hf: Mapping[str, object], used: set[str]) -> DecoderFiel
     return config
 
 
-_GPT_BIGCODE_NAMES: Renames = (
-    ('transformer.wte', 'model.embed_tokens'), ('transformer.wpe', 'model.embed_positions'),
-    ('transformer.ln_f', 'model.norm'), ('transformer.h', 'model.layers'),
-    ('ln_1', 'input_layernorm'), ('ln_2', 'post_attention_layernorm'),
-    ('attn.c_proj', 'self_attn.o_proj'), ('mlp.c_fc', 'mlp.up_proj'), ('mlp.c_proj', 'mlp.down_proj'))
-
-
 def _gpt_bigcode_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
     # The fused qkv has three leaves, split by `_gpt_bigcode_prepare`.
-    return None if '.attn.c_attn.' in name else renamed_path(_GPT_BIGCODE_NAMES, name, config)
+    return None if '.attn.c_attn.' in name else renamed_path(GPT2_NAMES, name, config)
 
 
 def _gpt_bigcode_prepare(tensors: Mapping[str, np.ndarray],
@@ -82,7 +74,7 @@ GPT_BIGCODE = DecoderFamily(
     ('gpt_bigcode',), _gpt_bigcode_config,
     lambda fields: fields.position_embedding == 'learned' and fields.kv_heads == 1 < fields.num_heads,
     'gpt_bigcode', 'GPTBigCodeForCausalLM', _gpt_bigcode_export,
-    weight_path=_gpt_bigcode_path, export_path=partial(renamed_name, _GPT_BIGCODE_NAMES),
+    weight_path=_gpt_bigcode_path, export_path=partial(renamed_name, GPT2_NAMES),
     prepare=_gpt_bigcode_prepare, export_weights=_gpt_bigcode_export_weights, preserve_source_layout=False,
     tied_head_names=('lm_head.weight', 'transformer.wte.weight'),
 )
