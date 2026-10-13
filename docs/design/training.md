@@ -1,0 +1,206 @@
+# Training in Dew: an objective, an optimizer, a mesh, and `fit`
+
+Design record, 2026-10-12. This is the binding design for Dew's training and model API. Code blocks show the target API; the [status table](#11-status) says what is built and what is planned. Its data counterpart is [the data design](data.md).
+
+## 0. The idea in one paragraph
+
+A `Trainer` runs an `Objective` (the loss and metrics for one kind of training: language modelling, diffusion, decision, preference, RL) with an Optax optimizer on a device mesh. `fit` takes a data chain and a budget. Everything between (sharding, micro-batches, rematerialization, kernels, compilation, checkpoints, resume) is chosen by Dew from the model, the mesh and the hardware, and every one of those choices can be overridden. The model is a plain Flax module, the optimizer is plain Optax, checkpoints are plain Orbax, and the mesh can be a plain `jax.Mesh`.
+
+```python
+model = CausalTransformer(vocab=50_257, width=768, depth=12, heads=12)
+trainer = Trainer(LMObjective(model, seq_len=1024), optax.adamw(3e-4), key=0)
+state = trainer.fit(train, validation=val, tokens=10e9)
+```
+
+```mermaid
+flowchart LR
+  M["Flax module"] --> O["Objective<br/>loss · metrics · data contract"]
+  O --> T["Trainer"]
+  X["Optax optimizer"] --> T
+  Me["Mesh<br/>MeshSpec or jax.Mesh"] --> T
+  C["Checkpoints<br/>Orbax"] -.-> T
+  K["Tracker<br/>W&B · MLflow"] -.-> T
+  D["Dataset chain"] --> F["fit(budget)"]
+  T --> F --> S["TrainState"]
+```
+
+## 1. Models
+
+Any Flax module trains. The objective calls the module's forward, which is `__call__` unless you say otherwise:
+
+```python
+class MyLM(nn.Module):
+    def __call__(self, tokens, *, positions=None, segment_ids=None): ...
+    def logits(self, tokens, **inputs): ...
+
+LMObjective(MyLM(...), seq_len=2048)                     # calls __call__
+LMObjective(MyLM(...), seq_len=2048, method="logits")    # Flax's own apply(method=)
+```
+
+- Flax NNX modules go through Flax's own NNX-to-Linen bridge; Dew has no second module system.
+- Variables are whatever Flax returns (plain dicts, or `FrozenDict` from older code). The Trainer normalizes the tree once at its boundary, so training, saving and restoring see one form.
+- Pretrained weights come from `Pretrained.load("Qwen/Qwen3.5-0.8B")`, which returns the module, its variables and its processor.
+
+## 2. The mesh
+
+Two ways to describe the devices, one path underneath.
+
+```python
+# Convenient: counts per role; the data axis takes the devices left over.
+Trainer(objective, opt, key=0, mesh=MeshSpec(fsdp=8, tensor=2))
+
+# Native: your own jax.Mesh, any axis names, and how the model maps onto them.
+mesh = jax.make_mesh((4, 8, 2), ("replica", "fsdp", "context"))
+Trainer(objective, opt, key=0, mesh=mesh,
+        rules={"embed": "fsdp", "mlp": "fsdp", "length": "context"},
+        data_axes=("replica", "fsdp"))
+```
+
+`MeshSpec` builds Dew's six named axes (`data`, `fsdp`, `expert`, `tensor`, `sequence`, `stage`). It is serializable, so a run's `run.json` and the command line (`--mesh.fsdp 8`) can store it and a resumed run rebuilds the mesh on whatever hardware it lands on. Its `replicas=` orders devices for hybrid sharded data parallelism, so FSDP's gathers stay inside a host's NVLink domain and only the gradient all-reduce crosses the slower network.
+
+A native `jax.Mesh` needs two facts from you: `rules`, which map the model's logical axes (`embed`, `mlp`, `heads`, `vocab`, `experts`, `length`, `layers`) onto mesh axes, and `data_axes`, which say which axes split the batch. `data_axes=` is shorthand that writes the one batch rule everything else reads: each host's data share, gradient reduction, and token accounting. Model-parallel algorithms keep their role names: expert exchange runs on an axis called `expert`, sequence attention on `sequence`, pipeline stages on `stage`. Any other axis, a second FSDP level or a context axis, is free for parameters and data through the rules. Dew refuses by name only what cannot work: a rule naming an axis the mesh lacks, or a parameter placed on a data axis.
+
+```mermaid
+flowchart LR
+  subgraph Model["Logical axes (from the module)"]
+    E["embed"]; Mm["mlp"]; H["heads"]; V["vocab"]; X["experts"]; L["length"]; B["batch"]
+  end
+  subgraph Mesh["Mesh axes"]
+    F["fsdp"]; T["tensor"]; Ex["expert"]; S["sequence"]; D["data"]
+  end
+  E --> F; Mm --> F; Mm --> T; H --> T; V --> T; X --> Ex; L --> S; B --> D; B --> F
+```
+
+`microbatches=` for pipeline stages is a Trainer argument (default: one per stage), the same for both mesh forms.
+
+## 3. Memory and speed are chosen for you
+
+The memory planner picks, per model, mesh and GPU, the cheapest combination that fits: micro-batch size, rematerialization policy, LM-head tiling and host offload. The same `batch(1024)` works on one GPU or 256. You override any one of them:
+
+```python
+Trainer(objective, opt, key=0, accumulation=4)                    # fix the micro-batch split
+Trainer(objective, opt, key=0, layout=Layout(host=("optimizer",)))  # keep optimizer state in host memory
+```
+
+Kernels are chosen per GPU generation from one table (`dew.nn.kernels`): FlashAttention 3 on Hopper, FlashAttention 2 on Ampere and Blackwell workstations, fla's gated delta rule, fused norms and SwiGLU. A kernel replaces the XLA path only when it is measured faster and passes the float64 accuracy gate on that GPU. Tile sizes come from one autotuner per GPU and shape, cached with XLA's own autotune results.
+
+## 4. `fit`
+
+```python
+state = trainer.fit(
+    train,                                    # a Dataset chain, a Grain dataset, or arrays
+    validation={"web": val_web, "code": val_code},
+    tokens=50e9,                              # or steps= or epochs=
+    eval_every=1000,
+    checkpoint_every=datetime.timedelta(minutes=30),
+    best="validation/web/loss", restore_best=True,
+    stop=Plateau(patience=5),
+)
+```
+
+- One budget: `steps=`, `epochs=` or `tokens=` (committed valid target tokens, the same clock the data `schedule` reads).
+- `validation` is one chain or a dict of named chains, each reported separately.
+- `fit` returns the final `TrainState`; `fit(..., state=state)` continues from one in memory.
+
+### The batch contract
+
+A data mismatch fails within seconds of launch, on every host at once, never hours into a run.
+
+1. The data chain declares what it yields: each stream's fields, per-row shapes and dtypes, with the batch sharding from the mesh. This is MaxText's `get_shaped_batch`, the producer's shape. It is known before any read where the chain fixes it (presets, `pack`, buckets, `batch`); a chain with your own `map`s takes it from its first batch.
+2. The step compiles from those shapes, `jit(step).lower(abstract_state, abstract_batch).compile()`, while the readers open. A `schedule` gives one shape per stage. The readers' shapes are compared with what the run already declares it reads, with no new declaration: `InputSpec`'s sample and mask, each condition encoder's token length, a supervised model's input shape, the model's vocabulary for id fields, and the host-only fields a metric names (such as the captions a CLIP score compares). Lowering then catches any other missing field. A wrong image size is caught here, because a convolution would trace at the wrong size without complaint.
+3. Each host reads only its share and checks it as numpy, before `jax.make_array_from_process_local_data` turns it into a global array: field names, per-row shapes, dtypes, the share's row count, and the bounds an id field declares (a gather past the vocabulary would clamp silently on the device). At start, `fit` reads the first batch of the training stream and of every validation stream while it initializes, restores and compiles. These checks run inside `agreed()`, so all hosts report every mismatch in every stream in one error before step 1. The batches it read are used, not read again. `objective.check(batch)` runs the same path on a laptop before a costly launch.
+4. Later batches take the same local comparison before transfer, with no collective. Shapes are fixed by construction (presets, `pack`, `batch` without a partial last batch), so a mismatch means a step broke one: the host raises naming the step and records, and JAX's coordination service stops the others. A `schedule` stage's new shape is expected and compiled once.
+
+## 5. Checkpoints and resume
+
+```python
+Trainer(objective, opt, key=0,
+        checkpoints=Checkpoints("gs://runs/lm-1b", keep=Keep(latest=2, every=10_000)))
+```
+
+- A run with a checkpoint directory resumes automatically from its latest checkpoint: parameters, optimizer state, step, RNG and each data share's position. Resume is exact on the same mesh.
+- A checkpoint directory belongs to one run. A fresh run takes a new directory; a directory holding another run's checkpoints refuses to resume, naming what differs.
+- A resumed run skips loading pretrained weights it is about to overwrite, and its first step hits the compile cache.
+- `Keep` decides retention; `where=` sees each checkpoint's real record (kind, step, metrics).
+- The directory is a plain Orbax `CheckpointManager` directory, readable without Dew.
+
+## 6. Compilation
+
+Compiled programs depend only on the model, shapes, dtypes, shardings and configuration, never on where a run happens to be. The persistent compile cache is shared across runs, processes and checkouts. A resumed or repeated run reuses its programs. Compilation can run before a GPU is held, from stored autotune results, so GPUs spend their time training.
+
+## 7. Seeing what happens
+
+Every run logs canonical MFU (analytic model FLOPs on real tokens over wall time) and where step time goes. `dew profile runs/lm-1b` prints the step breakdown, MFU, the kernel chosen for each operation, and the top three losses. Trackers (W&B, MLflow) take the same metrics; the local metric journal is JSONL.
+
+## 8. After training
+
+```python
+pipe = dew.pipeline("runs/lm-1b")                 # the trained model with its processor
+pipe("The capital of France is", max_new_tokens=32)
+pipe([{"role": "user", "content": "Hi"}])        # chat, no PyTorch needed
+
+run.export("out/", format="hf")                   # loads in transformers and vLLM
+adapter.save("out/lora")                          # a complete PEFT adapter
+```
+
+A reloaded run behaves like the live one: the same processor, chat template and generation defaults.
+
+## 9. The shared seams, as a user sees them
+
+| Seam | What it guarantees |
+|---|---|
+| Token coordinates | Packed, padded and cached rows give the same result as separate ones, in every mixer (attention, GDN, KDA, Mamba). |
+| Layer identity | Quantization survives fused projections, scanned layers and pipeline stages. |
+| One LM head | Full logits, the chunked loss and scoring compute the head the same way, quantized or not, sharded or not. |
+| Loading readers | Every model family loads and exports through one reversible weight-layout plan. |
+| Checkpoint state | Saving and restoring derive from the training state's own schema; restore casts and places once. |
+
+Each seam has one standing end-to-end test that runs every implementation registered for it.
+
+## 10. Examples
+
+### LoRA fine-tuning a chat model, exported for vLLM
+
+```python
+bundle = Pretrained.load("Qwen/Qwen3.5-0.8B")
+adapted, adapter = bundle.adapt(LoRA(rank=16), key=0)
+chats = Hub("HuggingFaceH4/ultrachat_200k", split="train_sft").map(chat.template(bundle.processor)).pack(seq_len=4096)
+trainer = Trainer(LMObjective(adapted, seq_len=4096, loss_role=Role.ASSISTANT), optax.adamw(1e-4), key=0)
+trainer.fit(chats.shuffle(seed=0).batch(64), epochs=2)
+adapter.save("out/lora")
+```
+
+### A diffusion model, then samples
+
+```python
+model = DiT.preset("dit-b/2")
+data = Files("gs://data/laion/*.array_record").filter_map(images.decode()).map(images.resize(256)).batch(256)
+trainer = Trainer(DiffusionObjective(model, process=FlowMatching(), vae="stabilityai/sd-vae-ft-ema"), optax.adamw(1e-4), key=0)
+state = trainer.fit(data, steps=400_000)
+images = dew.pipeline(trainer)("a red fox in snow", steps=50, guidance=4.0)
+```
+
+### The same LM script on 64 GPUs
+
+```python
+trainer = Trainer(LMObjective(model, seq_len=8192), optax.adamw(3e-4), key=0,
+                  mesh=MeshSpec(fsdp=8, replicas=8),
+                  checkpoints=Checkpoints("gs://runs/lm-8b"))
+trainer.fit(data, tokens=2e12)    # launched on every host with `dew launch`
+```
+
+## 11. Status
+
+| Area | Status |
+|---|---|
+| Trainer, objectives, Optax optimizers, `MeshSpec`, `Layout(rules=)`, checkpoints with automatic resume, `Keep`, trackers, canonical MFU | Built |
+| Memory planner choosing micro-batch, remat and head tiling | Built, landing |
+| Resume skipping pretrained weights; cache keys stable across checkouts | Built, landing |
+| FlashAttention 3, fla GDN, fused norms and SwiGLU, the kernel table | Built |
+| Autotuner per GPU and shape | In review |
+| Native `jax.Mesh` with any axes, `data_axes=`, `microbatches=` on the Trainer | Planned |
+| Native variable trees normalized at the Trainer; `method=` | Planned |
+| `fit(epochs=, tokens=)` | Built, landing |
+| Compile before holding a GPU, period scan over layers | Planned |
+| `dew profile`; reloaded runs keeping their processor; chat without PyTorch; complete PEFT exports; `run.export` | Planned |
+| The five seams and their standing tests | In progress (seam 2 landing; seam 1 built) |

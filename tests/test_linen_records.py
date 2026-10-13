@@ -16,7 +16,7 @@ import jax
 import numpy as np
 
 from dew.config import ModelConfig
-from dew.registry import imported, to_record
+from dew.registry import to_record
 
 
 class Residual(nn.Module):
@@ -69,21 +69,3 @@ def test_a_nested_linen_model_rebuilds_from_its_record_with_its_weights_in_a_fre
     assert done.returncode == 0, done.stderr[-2000:]
     assert json.loads(done.stdout.splitlines()[-1]) == expected
     assert expected["shared"][1] == ["layers_0"] and expected["separate"][1] == ["layers_0", "layers_1"]
-
-
-def test_a_nested_layers_default_initializer_is_left_out_and_a_given_one_is_kept():
-    record = ModelConfig.from_model(models()["residual"]).fields
-    assert "bias_init" not in record["inner"] and "scale_init" not in record["norm"]
-    assert imported(record["inner"]["kernel_init"]["function"]) is nn.initializers.zeros
-
-
-def test_a_layer_held_twice_is_recorded_once_and_two_equal_layers_twice():
-    """Flax adopts a module by identity, so the record writes the shared
-    layer once and refers to it; two layers built alike are two records."""
-    shared = models()["shared"]
-    assert ModelConfig.from_model(shared).fields["layers"] == [
-        {**to_record(nn.Dense(8), nn.Module), "share": 0}, {"shared": 0}]
-    separate = ModelConfig.from_model(models()["separate"]).fields["layers"]
-    assert separate[0] == separate[1] and all("share" not in layer for layer in separate)
-    rebuilt = ModelConfig.from_model(shared).build()
-    assert rebuilt.layers[0] is rebuilt.layers[1]

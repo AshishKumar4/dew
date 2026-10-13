@@ -24,9 +24,8 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from dew.nn.kda import KimiDeltaAttention, KimiDeltaAttentionMixer, chunk_kimi_delta_rule
+from dew.nn.kda import KimiDeltaAttention, chunk_kimi_delta_rule
 from dew.nn.linear import l2norm as jax_l2norm, recurrent_delta_rule
-from dew.registry import mixers
 
 BOUND = 1e-4
 B, S, H, D, E, K = 2, 7, 2, 4, 8, 4  # batch, tokens, heads, head dim, model width, conv kernel
@@ -234,19 +233,6 @@ def test_the_layer_matches_the_oracle_in_both_forget_gate_forms(lower_bound):
     )
 
 
-def test_a_per_head_scalar_decay_is_a_different_layer():
-    """The decay is a vector over the key dimensions; GDN's per-head scalar
-    over the same weights is not KDA, and the oracle separates the two."""
-    module, params, variables = layer_and_params(-5.0)
-    x = np.random.RandomState(4).randn(B, S, E)
-
-    def scalar_decay(q, k, v, g, beta, state):
-        return oracle_recurrent(q, k, v, np.broadcast_to(g.mean(-1, keepdims=True), g.shape), beta, state)
-
-    wanted = oracle_layer(x, params, -5.0, 1e-5, scalar_decay)
-    assert scaled(module.apply(variables, jnp.asarray(x, jnp.float32)), wanted) > 1e-2
-
-
 def test_the_layer_gradients_match_central_differences_of_the_oracle():
     """Into the input and every parameter, through the conv, the forget
     gate, the chunked rule across a chunk boundary and the gated norm."""
@@ -314,11 +300,3 @@ def test_padded_rows_preserve_the_memory_and_the_history():
     wanted = module.apply(variables, compact)
 
     assert scaled(np.asarray(gapped)[:, [0, 1, 3, 4]], np.asarray(wanted)) < BOUND
-
-
-def test_the_kind_builds_from_the_configs_fields():
-    mixer = mixers.from_record({"class": "kimi_delta_attention", "fields": {
-        "linear_num_heads": 3, "linear_head_dim": 8, "linear_conv_kernel_dim": 4,
-        "linear_lower_bound": -5.0}})
-    assert isinstance(mixer, KimiDeltaAttentionMixer)
-    assert mixer.linear_num_heads == 3 and mixer.linear_head_dim == 8

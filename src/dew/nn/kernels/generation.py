@@ -272,9 +272,11 @@ def placed_platform() -> str:
 
 def gpu_placed() -> bool:
     """Whether a call runs on this process's own GPU: what a CUDA library call needs, which its trace
-    asks the installed plugin about, where `backend()` also takes an assumed GPU."""
+    asks the installed plugin about and its lowering the devices, where `backend()` also takes an
+    assumed GPU. A step traced for an assumed GPU (`lower_for`) lowers without devices, even on a
+    GPU host, so it makes none."""
     import jax
-    return jax.default_backend() == 'gpu' and placed_platform() == 'gpu'
+    return ASSUMED.get() is None and jax.default_backend() == 'gpu' and placed_platform() == 'gpu'
 
 
 def backend() -> str:

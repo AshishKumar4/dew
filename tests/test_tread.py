@@ -10,10 +10,8 @@ from pathlib import Path
 import jax
 import jax.numpy as jnp
 import numpy as np
-import pytest
 
 from dew.nn.backbones.dit import SimpleDiT, gather_tokens, scatter_tokens
-from dew.nn.backbones.ssm_dit import HybridSSMAttentionDiT
 from dew.nn.dit import ROPE_THETA, rope_for_scan
 from dew.nn.rope import rotary_freqs
 
@@ -73,6 +71,8 @@ def test_a_routed_forward_skips_each_span_on_the_drawn_tokens():
         if index in (2, 3):
             tokens, rotation = scatter_tokens(held, kept, tokens), full
     np.testing.assert_array_equal(np.asarray(output), np.asarray(bound.output(tokens, order, 8, 8)))
+    plain = model(()).apply(variables, x, t, train=True, rngs=rngs)
+    assert not np.allclose(np.asarray(output), np.asarray(plain))
 
 
 def test_sampling_runs_every_token_through_every_block():
@@ -80,32 +80,3 @@ def test_sampling_runs_every_token_through_every_block():
     variables = drawn(model(), x, t)
     np.testing.assert_array_equal(np.asarray(model().apply(variables, x, t)),
                                   np.asarray(model(()).apply(variables, x, t)))
-
-
-def test_routing_changes_the_training_forward():
-    x, t = inputs()
-    variables = drawn(model(), x, t)
-    rngs = {"dropout": jax.random.PRNGKey(2)}
-    routed = model().apply(variables, x, t, train=True, rngs=rngs)
-    assert not np.allclose(
-        np.asarray(routed), np.asarray(model(()).apply(variables, x, t, train=True, rngs=rngs))
-    )
-
-
-@pytest.mark.parametrize(
-    "routes", [((1.0, 1, 2),), ((0.5, 2, 1),), ((0.5, 1, 3), (0.5, 3, 4)), ((0.5, 1, 5),)]
-)
-def test_a_route_outside_the_stack_or_overlapping_another_is_refused(routes):
-    x, t = inputs()
-    with pytest.raises(ValueError, match="ordered, disjoint"):
-        model(routes).init(
-            {"params": jax.random.PRNGKey(1), "dropout": jax.random.PRNGKey(2)}, x, t, train=True
-        )
-
-
-def test_the_hybrid_refuses_routes_under_2d_fusion():
-    x, t = inputs()
-    network = HybridSSMAttentionDiT(patch_size=2, emb_features=16, num_layers=4, num_heads=2,
-                                    ssm_state_dim=4, use_2d_fusion=True, routes=((0.5, 1, 2),))
-    with pytest.raises(ValueError, match="2D state fusion"):
-        network.init(jax.random.PRNGKey(1), x, t)

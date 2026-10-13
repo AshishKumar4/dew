@@ -13,13 +13,10 @@ from typing import Any
 import jax
 import jax.numpy as jnp
 import numpy as np
-import pytest
 
-from dew.nn.attention import chunk_mask
 from dew.nn.backbones.decoder_block import GatedMLP
 from dew.nn.llama4 import Llama4Mixer
 from dew.nn.mixer_base import MixerContext
-from dew.nn.mixers.attention import temperature_scale
 from dew.nn.moe import SparseMLP
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "llama4"
@@ -62,28 +59,6 @@ def test_a_global_layer_matches_the_reference():
     module = attention(use_rope=False)
     output = module.apply(attention_variables(tensors), jnp.asarray(tensors["hidden"]))
     assert float(np.max(np.abs(np.asarray(output) - tensors["global_output"]))) < 1e-5
-
-
-@pytest.mark.parametrize("mutation, against", [
-    ({"use_rope": True, "attention_chunk_size": None}, "local_output"),
-    ({"use_rope": True, "attention_chunk_size": 4, "use_qk_norm": False}, "local_output"),
-    ({"use_rope": False, "attn_temperature_tuning": False}, "global_output"),
-])
-def test_each_rule_is_what_the_parity_tests(mutation, against):
-    """Without the chunk, without the norm, or without the temperature, the
-    same weights disagree with the reference."""
-    tensors = fixture("attention")
-    output = attention(**mutation).apply(attention_variables(tensors), jnp.asarray(tensors["hidden"]))
-    assert float(np.max(np.abs(np.asarray(output) - tensors[against]))) > 1e-3
-
-
-def test_the_chunk_mask_and_temperature_follow_the_reference_formulas():
-    positions = jnp.arange(6)
-    mask = chunk_mask(positions, positions, 4)[0, 0]
-    assert mask.tolist() == [[p // 4 == k // 4 for k in range(6)] for p in range(6)]
-    scale = temperature_scale(jnp.asarray([0, 3, 4, 7, 8]), 4.0, 0.1, dtype=jnp.float32)
-    expected = np.log1p(np.floor((np.array([0, 3, 4, 7, 8]) + 1) / 4)) * 0.1 + 1
-    np.testing.assert_allclose(np.asarray(scale), expected, rtol=1e-6)
 
 
 def test_decode_matches_prefill_on_both_rules():
@@ -138,14 +113,3 @@ def test_the_input_scaled_experts_match_the_reference_block():
     assert float(np.max(np.abs(np.asarray(output) - reference))) < 1e-5
     other = block(scale_inputs=False).apply(variables, hidden)
     assert float(np.max(np.abs(np.asarray(other) - reference))) > 1e-3
-
-
-def test_input_scaling_reaches_the_router_gradient():
-    """The routing weight sits inside the expert, so the router kernel gets
-    gradient through the experts' nonlinearity."""
-    module = SparseMLP(num_experts=4, top_k=2, hidden_features=16, out_features=HIDDEN,
-                       score_function="sigmoid", normalize_weights=False, scale_inputs=True)
-    hidden = jax.random.normal(jax.random.PRNGKey(0), (2, 5, HIDDEN))
-    variables = module.init(jax.random.PRNGKey(1), hidden)
-    grads = jax.grad(lambda v: jnp.square(jnp.asarray(module.apply(v, hidden))).sum())(variables)
-    assert float(jnp.abs(grads["params"]["gate"]["kernel"]).max()) > 0

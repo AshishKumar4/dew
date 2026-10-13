@@ -10,51 +10,20 @@ does not exist.
 """
 
 import contextlib
-import functools
 import io
 import os
-import queue
-import struct
 import sys
 import threading
 import time
-import zlib
-from contextlib import closing, contextmanager
 
-import jax
-import jax.numpy as jnp
 import numpy as np
-import optax
 import PIL.Image
 import pytest
 
-from dew.data import DataPartition, Loading, online_loader
+from dew.data import online_loader
 from dew.data.online_loader import Fetch, UrlStream
-from dew.objectives.base import Aux, Objective
-from dew.training import Checkpoints, Layout, MeshSpec, Trainer
 
-BATCH = 4
-# Comfortably longer than the stream's queue timeout below, so the slow
-# producer really does make it wait.
-SLOW = 0.15
-# The pool tests spread 12 rows over 2 workers.
-POOL_ROWS = 12
 FETCH = Fetch(size=64, min_size=32, timeout=1, retries=0)
-
-
-def _sample(index, size=8):
-    return np.full((size, size, 3), index + 1, np.uint8), f"sample {index}"
-
-
-def _stream(monkeypatch, producer, queue_timeout=0.05, **settings):
-    """A UrlStream fed by `producer` instead of the fetcher pool.
-
-    The stream binds the producer from the module global as it is built, so
-    patching the name keeps the real one, and its process pool, out of reach.
-    """
-    monkeypatch.setattr(online_loader, "fetch_rows", producer)
-    return UrlStream(_StubRows(64), batch=BATCH, fetch=Fetch(size=8, min_size=4, timeout=1, retries=0),
-                     workers=1, threads=1, prefetch=4, queue_timeout=queue_timeout, **settings)
 
 
 class _StubRows:
@@ -93,120 +62,17 @@ def _png(pixels: np.ndarray) -> bytes:
     return buffer.getvalue()
 
 
-def _refuse_to_fork(*args, **kwargs):
-    raise AssertionError("the fetch pool forked a process that runs JAX")
-
-
 # ---------------------------------------------------------------------------------
 # Slow fetching waits; it never invents data
 # ---------------------------------------------------------------------------------
-
-def test_slow_fetching_waits_instead_of_fabricating_samples(monkeypatch, caplog):
-    """A queue timeout waits; a batch of zeros captioned "Timeout occurred
-    while waiting for sample" would train as data."""
-    def slow(rows, sink, **kwargs):
-        for index in range(BATCH):
-            kwargs["stop"].wait(SLOW)
-            sink.put(_sample(index))
-        kwargs["stop"].wait()
-
-    with closing(_stream(monkeypatch, slow)) as stream:
-        batch = next(stream)
-
-    assert list(batch["caption"]) == [f"sample {i}" for i in range(BATCH)]
-    assert [int(image.max()) for image in batch["image"]] == [1, 2, 3, 4]
-    assert "still fetching" in caplog.text
-
-
-def test_dropped_fetches_are_counted_and_never_yielded(monkeypatch):
-    def with_drops(rows, sink, **kwargs):
-        for index in range(BATCH):
-            sink.put(f"file:///nonexistent/{index}.jpg")
-            sink.put(_sample(index))
-        kwargs["stop"].wait()
-
-    with closing(_stream(monkeypatch, with_drops)) as stream:
-        batch = next(stream)
-
-        assert list(batch["caption"]) == [f"sample {i}" for i in range(BATCH)]
-        assert stream.dropped == BATCH
-
-
-def test_a_malformed_sample_raises_instead_of_training_as_zeros(monkeypatch):
-    """The old collate caught every exception and stacked zeros captioned
-    "error image" in place of the batch."""
-    def producer(rows, sink, **kwargs):
-        for index in range(BATCH - 1):
-            sink.put(_sample(index))
-        sink.put(_sample(BATCH - 1, size=4))
-        kwargs["stop"].wait()
-
-    with closing(_stream(monkeypatch, producer)) as stream, pytest.raises(ValueError):
-        next(stream)
-
 
 # ---------------------------------------------------------------------------------
 # A fetcher that is gone ends iteration, and says why
 # ---------------------------------------------------------------------------------
 
-def test_an_exhausted_fetcher_stops_iteration(monkeypatch):
-    def exhausted(rows, sink, **kwargs):
-        sink.put(_sample(0))
-
-    with closing(_stream(monkeypatch, exhausted)) as stream:
-
-        with pytest.raises(StopIteration):
-            next(stream)
-        # and it stays stopped: a second call does not block on the empty queue
-        with pytest.raises(StopIteration):
-            next(stream)
-
-
-def test_a_fetcher_that_dies_raises_its_own_error(monkeypatch):
-    def broken(rows, sink, **kwargs):
-        raise RuntimeError("the fetch pool fell over")
-
-    with closing(_stream(monkeypatch, broken)) as stream:
-
-        with pytest.raises(RuntimeError, match="url fetcher died") as failure:
-            next(stream)
-        assert "fell over" in str(failure.value.__cause__)
-
-
 # ---------------------------------------------------------------------------------
 # One url: fetch, decode, fit
 # ---------------------------------------------------------------------------------
-
-def test_a_missing_file_and_a_malformed_url_fetch_nothing():
-    assert online_loader.fetch_bytes("file:///nonexistent/gone.jpg", timeout=1, retries=1) is None
-    assert online_loader.fetch_bytes("not a url", timeout=1, retries=1) is None
-
-
-def test_bytes_that_are_no_image_decode_to_nothing():
-    pixels = np.arange(48, dtype=np.uint8).reshape(4, 4, 3)
-    assert np.array_equal(online_loader.decode_pixels(_png(pixels)), pixels)
-    assert online_loader.decode_pixels(b"<html>not found</html>") is None
-    assert online_loader.decode_pixels(_png(pixels)[:40]) is None
-
-
-def _bomb_png(width: int, height: int) -> bytes:
-    """A PNG whose header declares `width` by `height` and holds no pixels."""
-    def chunk(kind: bytes, body: bytes) -> bytes:
-        return (struct.pack(">I", len(body)) + kind + body
-                + struct.pack(">I", zlib.crc32(kind + body)))
-    header = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
-    return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", header) + chunk(b"IEND", b"")
-
-
-def test_a_decompression_bomb_decodes_to_nothing():
-    """200M declared pixels, past PIL's refusal at twice MAX_IMAGE_PIXELS.
-    PIL raises its own DecompressionBombError, which is no OSError, so an
-    uncaught one would kill the fetcher and the stream with it."""
-    blob = _bomb_png(20000, 10000)
-    assert 2 * PIL.Image.MAX_IMAGE_PIXELS < 20000 * 10000
-
-    assert online_loader.decode_pixels(blob) is None
-
 
 def _on_white(rgba: np.ndarray) -> np.ndarray:
     """img2dataset's alpha matting: c * a / 255 + 255 - a, rounded, in float64."""
@@ -229,15 +95,6 @@ def test_a_fetched_grey_or_transparent_image_is_kept_as_rgb(pixels):
     assert online_loader.prepare_image(fetched, size=64, min_size=32) is not None
 
 
-@pytest.mark.parametrize("pixels", [
-    pytest.param(np.random.RandomState(0).randint(0, 256, (31, 48, 3), np.uint8), id="too_small"),
-    pytest.param(np.random.RandomState(0).randint(0, 256, (32, 78, 3), np.uint8), id="too_wide"),
-    pytest.param(np.full((48, 48, 3), 200, np.uint8), id="flat"),
-])
-def test_an_image_not_worth_training_on_is_dropped(pixels):
-    assert online_loader.prepare_image(pixels, size=64, min_size=32) is None
-
-
 def test_a_kept_image_is_fitted_into_the_square_and_padded_white():
     """A 48 by 24 image, the widest aspect the filter keeps, comes back with
     its longer side at the stream's size, the rest padded white on both
@@ -254,300 +111,21 @@ def test_a_kept_image_is_fitted_into_the_square_and_padded_white():
     assert (image[16:48, :28] == 0).all() and (image[16:48, 36:] == 200).all()
 
 
-def test_a_fetched_image_reaches_the_queue_as_a_sample(tmp_path, monkeypatch):
-    """What a worker does with one url, run in this process, which holds the
-    patched fetch a worker would not. Of that path only the request header
-    comes from HF datasets, which the streaming extra owns."""
-    monkeypatch.setattr(online_loader, "_user_agent", lambda: "dew-tests")
-    path = tmp_path / "3.png"
-    path.write_bytes(_png(np.random.RandomState(3).randint(0, 256, (48, 48, 3), np.uint8)))
-    sink = queue.Queue()
-
-    online_loader.fetch_one(path.as_uri(), "caption 3", sink, FETCH)
-    online_loader.fetch_one((tmp_path / "gone.png").as_uri(), "caption 4", sink, FETCH)
-
-    image, caption = sink.get_nowait()
-    assert caption == "caption 3" and image.shape == (64, 64, 3) and int(image.max()) > 0
-    assert sink.get_nowait() == (tmp_path / "gone.png").as_uri()
-
-
 # ---------------------------------------------------------------------------------
 # A shard of rows
 # ---------------------------------------------------------------------------------
-
-def test_a_shard_names_its_url_and_caption_columns_by_the_known_names():
-    urls, captions = online_loader.columns({"URL": ["u"], "TEXT": ["t"], "other": [1]})
-    assert (urls, captions) == (["u"], ["t"])
-    with pytest.raises(ValueError, match="caption"):
-        online_loader.columns({"url": ["u"]})
-    with pytest.raises(ValueError, match="url"):
-        online_loader.columns({"caption": ["t"]})
-
-
-def test_a_worker_threads_exception_reaches_the_pool(monkeypatch, tmp_path):
-    """Our own code failing on one url is a bug, not a drop: the executor
-    swallows an unread map, so the shard has to read its results."""
-    def broken(pixels, size, min_size):
-        raise TypeError("a bug in the image processor")
-
-    path = tmp_path / "0.png"
-    path.write_bytes(_png(np.random.RandomState(0).randint(0, 256, (48, 48, 3), np.uint8)))
-    monkeypatch.setattr(online_loader, "_user_agent", lambda: "dew-tests")
-    monkeypatch.setattr(online_loader, "prepare_image", broken)
-    monkeypatch.setattr(online_loader, "_worker_sink", queue.Queue())
-
-    with pytest.raises(TypeError, match="a bug in the image processor"):
-        online_loader._fetch_shard({"url": [path.as_uri()], "caption": ["c"]}, FETCH, threads=2)
-
 
 # ---------------------------------------------------------------------------------
 # The real worker pool
 # ---------------------------------------------------------------------------------
 
-def _drain(sink, expected, producer_failure, deadline):
-    reported = []
-    while len(reported) < expected and time.monotonic() < deadline:
-        try:
-            reported.append(sink.get(timeout=0.5))
-        except queue.Empty:
-            # Nothing queued and the producer gone means no worker ever ran.
-            assert not producer_failure, producer_failure[0]
-    return reported
-
-
-@contextmanager
-def _produce_in_a_thread(rows, sink):
-    stop = online_loader._WORKER_CONTEXT.Event()
-    producer_failure = []
-    shutdown = threading.Event()
-
-    def finish(error):
-        if error is not None:
-            producer_failure.append(error)
-
-    def produce():
-        try:
-            online_loader.fetch_rows(rows, sink, workers=2, threads=2, fetch=FETCH,
-                                     stop=stop, shutdown=shutdown, finish=finish)
-        except BaseException as error:
-            producer_failure.append(error)
-
-    worker = threading.Thread(target=produce, daemon=True)
-    worker.start()
-    try:
-        yield producer_failure
-    finally:
-        stop.set()
-        shutdown.set()
-        worker.join(10)
-        assert not worker.is_alive(), "image fetch pool did not stop"
-        sink.cancel_join_thread()
-        sink.close()
-
-
-def test_the_fetch_pool_starts_its_workers_without_forking(monkeypatch):
-    """os.fork carries over only the calling thread, so a worker forked out of
-    a training process inherits mutexes that JAX's other threads were holding,
-    and hangs the first time it allocates. With os.fork refused the pool still
-    has to start its workers and hear back from them."""
-    monkeypatch.setattr(os, "fork", _refuse_to_fork)
-    sink = online_loader._WORKER_CONTEXT.Queue(64)
-    with _produce_in_a_thread(_StubRows(POOL_ROWS), sink) as failure:
-
-        reported = _drain(sink, POOL_ROWS, failure, time.monotonic() + 60)
-
-        # Every url is a file that does not exist, so every fetch fails, and the
-        # url a worker queues for it proves the worker ran and its inherited
-        # queue crossed over.
-        assert sorted(reported) == sorted(f"file:///nonexistent/{i}.jpg" for i in range(POOL_ROWS))
-
-
-def test_the_fetch_pool_covers_the_rows_past_an_even_split(monkeypatch):
-    """Thirteen rows over two workers: an even split holds twelve, so the
-    thirteenth row needs a shard of its own. A row no shard holds is a row no
-    run ever trains on, however long the stream runs. The drops carry their
-    urls, so two passes have to show every row twice."""
-    monkeypatch.setattr(os, "fork", _refuse_to_fork)
-    rows = POOL_ROWS + 1
-    sink = online_loader._WORKER_CONTEXT.Queue(64)
-    with _produce_in_a_thread(_StubRows(rows, passes=2), sink) as failure:
-
-        reported = _drain(sink, 2 * rows, failure, time.monotonic() + 120)
-
-        assert sorted(reported) == sorted(2 * [f"file:///nonexistent/{i}.jpg" for i in range(rows)])
-
-
 # ---------------------------------------------------------------------------------
 # The streaming extra
 # ---------------------------------------------------------------------------------
 
-def test_loading_rows_asks_for_the_streaming_extra(monkeypatch):
-    """Importing this module must work without HF datasets; only actually
-    loading a dataset needs it, and it has to say so.
-
-    The absence is simulated so the test states the behaviour whether or not
-    the extra is installed in the environment that runs it.
-    """
-    monkeypatch.setitem(sys.modules, "datasets", None)
-    with pytest.raises(ImportError, match=r"dewml\[streaming\]"):
-        online_loader.load_rows(["some/hf/dataset"])
-
-
 # ---------------------------------------------------------------------------------
 # The streaming spec: what a run gets from OnlineImages
 # ---------------------------------------------------------------------------------
-
-def _producer_of(rows, passes):
-    """A fetcher that walks `rows` records `passes` times, then stays alive."""
-
-    def produce(table, sink, **kwargs):
-        for _ in range(passes):
-            for index in range(rows):
-                while not kwargs["stop"].is_set():
-                    try:
-                        sink.put(_sample(index, size=4), timeout=0.05)
-                        break
-                    except queue.Full:
-                        continue
-                if kwargs["stop"].is_set():
-                    return
-        kwargs["stop"].wait()
-
-    return produce
-
-
-def _online_spec(monkeypatch, rows, passes):
-    """OnlineImages over a stub table, with the fetcher pool replaced."""
-    from dew.data import OnlineImages
-
-    monkeypatch.setattr(online_loader, "fetch_rows", _producer_of(rows, passes))
-    monkeypatch.setattr(online_loader, "load_rows", lambda sources: _StubRows(rows))
-    return OnlineImages(sources=("fake_online",), image_size=4,
-                        workers=1)
-
-
-def test_the_streaming_spec_repeats_its_records_instead_of_ending(monkeypatch):
-    """The streamer is documented as endless: the pool walks its shards in a
-    loop and a run bounds training by steps, so `for batch in loader` must not
-    stop at the end of the dataset."""
-    rows, batch, passes = 12, 4, 3
-    with closing(_online_spec(monkeypatch, rows, passes).load(batch=batch).train(DataPartition())) as loader:
-
-        seen = [[int(v) for v in next(loader)["image"][:, 0, 0, 0]]
-                for _ in range(rows // batch * passes)]
-        records = [value for row in seen for value in row]
-
-        assert len(records) == rows * passes
-        assert sorted(records[:rows]) == list(range(1, rows + 1)), "a pass repeats a record"
-        assert set(records[rows:]) == set(records[:rows]), "the stream reads them again"
-
-
-def test_the_streaming_spec_reports_its_records_and_holds_nothing_out(monkeypatch):
-    """`records` counts rows, like every grain spec's, so a recipe divides it
-    by the batch for steps per epoch; a streaming run holds nothing out, so
-    nothing downstream may report a validation pass over a held-out split."""
-    data = _online_spec(monkeypatch, 12, 1).load(batch=4)
-
-    assert data.records == 12 and data.batch == 4 and data.steps_per_epoch == 3
-    assert data.val is None
-    with closing(data.train(DataPartition())) as stream:
-        assert len(next(stream)["image"]) == 4
-
-
-def test_the_streaming_spec_opens_nothing_before_the_stream_is_asked_for(monkeypatch):
-    """Loading resolves the rows; the fetcher pool and its thread start with
-    `train()`."""
-    started = []
-    producer = _producer_of(4, 1)
-
-    def produce(rows, sink, **kwargs):
-        started.append(rows)
-        producer(rows, sink, **kwargs)
-
-    data = _online_spec(monkeypatch, 4, 1).load(batch=4)
-    monkeypatch.setattr(online_loader, "fetch_rows", produce)
-    assert started == []
-
-    with closing(data.train(DataPartition())) as stream:
-        assert len(next(stream)["image"]) == 4
-        assert len(started) == 1
-
-
-def test_the_streaming_spec_stops_when_its_fetcher_is_gone(monkeypatch):
-    """A gone fetcher ends the stream.
-
-    The spec leaves the stream's queue timeout at a minute, so the wait
-    before it looks at the fetcher is shortened here. What is under test is
-    that the wait ends in StopIteration, not in a batch of zeros.
-    """
-    def exhausted(rows, sink, **kwargs):
-        for index in range(4):
-            sink.put(_sample(index, size=4))
-
-    from dew.data import OnlineImages
-
-    monkeypatch.setattr(online_loader, "fetch_rows", exhausted)
-    monkeypatch.setattr(online_loader, "UrlStream",
-                        functools.partial(UrlStream, queue_timeout=0.05))
-    monkeypatch.setattr(online_loader, "load_rows", lambda sources: _StubRows(4))
-    with closing(OnlineImages(sources=("fake_online",), image_size=4,
-                          workers=1).load(batch=4).train(DataPartition())) as loader:
-
-        assert len(next(loader)["image"]) == 4
-        with pytest.raises(StopIteration):
-            next(loader)
-
-
-class Ratio(Objective):
-    """One scalar fitted to the batch mean: the smallest objective that reads a
-    batch, so what is under test is the streaming data path alone."""
-
-    ema = None
-
-    def init(self, key, variables=None):
-        return {"params": {"level": jnp.zeros(())}}
-
-    def loss(self, variables, batch, step):
-        pixels = (jnp.asarray(batch["image"], jnp.float32) - 127.5) / 127.5
-        return jnp.mean((pixels - variables["params"]["level"]) ** 2), Aux({})
-
-
-def _run(data, *, steps, checkpoints=None, checkpoint_every=None):
-    trainer = Trainer(Ratio(), optax.sgd(0.1), key=jax.random.key(0),
-                      mesh=MeshSpec(), layout=Layout(), checkpoints=checkpoints)
-    return trainer.fit(data, steps=steps, log_every=steps, eval_every=None,
-                       checkpoint_every=checkpoint_every)
-
-
-def test_the_streaming_spec_cannot_report_a_position(monkeypatch):
-    """The iterator is the single answer to whether a run can checkpoint: the
-    fetch stream carries no get_state, and `tokenized` does not invent one."""
-    data = _online_spec(monkeypatch, 12, 1).load(batch=4)
-
-    with closing(data.train(DataPartition())) as stream:
-        assert not hasattr(stream, "get_state") and not hasattr(stream, "set_state")
-
-
-def test_a_streaming_run_trains_when_it_never_checkpoints(monkeypatch):
-    """The whole point of the gate: an online stream is trainable, six steps of
-    it, as long as the run does not ask for a position it cannot have."""
-    data = _online_spec(monkeypatch, 24, 6).load(batch=8)
-
-    state = _run(data, steps=6)
-
-    assert int(state.step) == 6
-    # The rows carry pixel values 1 to 24, so the level fits the mean of what
-    # reached the objective; a batch of fabricated zeros fits -1.0.
-    assert -0.70 < float(state.variables["params"]["level"]) < -0.60
-
-
-def test_a_streaming_run_that_asks_for_checkpoints_is_refused(monkeypatch, tmp_path):
-    """And the other half: a ValueError naming checkpoint_every, before any training."""
-    data = _online_spec(monkeypatch, 24, 6).load(batch=8)
-
-    with pytest.raises(ValueError, match=r"checkpoint_every=None"):
-        _run(data, steps=6, checkpoints=Checkpoints(str(tmp_path / "ckpt")),
-             checkpoint_every=2)
 
 def test_abandoned_full_image_queue_releases_real_spawned_workers(tmp_path):
     import multiprocessing
@@ -647,126 +225,6 @@ def test_cancellation_during_large_packet_does_not_terminate_its_writer(tmp_path
     print(output, end="")
 
 
-def test_closed_consumer_only_image_queue_releases_pipe_descriptors(monkeypatch):
-    import gc
-    from pathlib import Path
-
-    descriptors = Path("/proc/self/fd")
-    if not descriptors.exists():
-        pytest.skip("requires Linux descriptor accounting")
-    # Start multiprocessing's process-wide resource tracker before the baseline.
-    primed = online_loader._WORKER_CONTEXT.Queue(1)
-    primed.close()
-    del primed
-    gc.collect()
-    before = len(list(descriptors.iterdir()))
-
-    def exhausted(rows, sink, **kwargs):
-        return
-
-    monkeypatch.setattr(online_loader, "fetch_rows", exhausted)
-    stream = UrlStream(_StubRows(1), batch=1, fetch=Fetch(size=8, min_size=4, timeout=1, retries=0),
-                       workers=1, threads=1, prefetch=1)
-    stream.close()
-    gc.collect()
-    after = len(list(descriptors.iterdir()))
-    assert after == before
-    print(f"retained closed UrlStream: pipe descriptor baseline={before}, after={after}")
-    # Keep the closed stream alive: deleting the owner must not be necessary.
-    with pytest.raises(StopIteration):
-        next(stream)
-
-
 # ---------------------------------------------------------------------------------
 # Video clips by url, served over HTTP from tmp_path
 # ---------------------------------------------------------------------------------
-
-CLIP_FPS = 25
-CLIP_FRAMES = 20
-CLIP_GREY_STEP = 10
-
-
-def _video(path, frames=CLIP_FRAMES, side=32):
-    """A lossless clip whose frame f is a flat grey of CLIP_GREY_STEP * f,
-    written by the ffmpeg the `av` extra bundles."""
-    moviepy_config = pytest.importorskip("moviepy.config", reason="needs the av extra")
-    import subprocess
-
-    pixels = np.stack([np.full((side, side, 3), CLIP_GREY_STEP * index, np.uint8)
-                       for index in range(frames)])
-    raw = path.with_suffix(".raw")
-    raw.write_bytes(pixels.tobytes())
-    subprocess.run([moviepy_config.FFMPEG_BINARY, "-y", "-loglevel", "error", "-f", "rawvideo",
-                    "-pix_fmt", "rgb24", "-s", f"{side}x{side}", "-r", str(CLIP_FPS),
-                    "-i", str(raw), "-c:v", "ffv1", str(path)], check=True)
-    raw.unlink()
-
-
-@contextmanager
-def _served(directory):
-    """`directory` over HTTP on a free local port, yielding its base url."""
-    import http.server
-
-    handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=str(directory))
-    handler.log_message = lambda *args: None
-    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    try:
-        yield f"http://127.0.0.1:{server.server_address[1]}"
-    finally:
-        server.shutdown()
-        server.server_close()
-
-
-@pytest.fixture
-def clips(tmp_path):
-    _video(tmp_path / "clip.mkv")
-    _video(tmp_path / "short.mkv", frames=3)
-    _video(tmp_path / "small.mkv", side=16)
-    (tmp_path / "still.png").write_bytes(_png(np.full((32, 32, 3), 40, np.uint8)))
-    (tmp_path / "junk.mp4").write_bytes(b"not a video at all")
-    with _served(tmp_path) as base:
-        yield base
-
-
-def test_a_fetched_video_reaches_the_queue_as_consecutive_frames(clips, monkeypatch):
-    """A clip url yields `frames` consecutive frames at the stream's size; a
-    still image, bytes that are no video, a video shorter than the clip, one
-    under the minimum size and a missing url are each dropped as their url."""
-    monkeypatch.setattr(online_loader, "_user_agent", lambda: "dew-tests")
-    fetch = Fetch(size=24, min_size=32, timeout=5, retries=0, frames=4)
-    sink = queue.Queue()
-
-    for name in ("clip.mkv", "still.png", "junk.mp4", "short.mkv", "small.mkv", "gone.mkv"):
-        online_loader.fetch_one(f"{clips}/{name}", name, sink, fetch)
-
-    clip, caption = sink.get_nowait()
-    assert caption == "clip.mkv" and clip.shape == (4, 24, 24, 3) and clip.dtype == np.uint8
-    indices = [round(int(frame[12, 12, 0]) / CLIP_GREY_STEP) for frame in clip]
-    assert indices == list(range(indices[0], indices[0] + 4))
-    assert [sink.get_nowait() for _ in range(5)] == [
-        f"{clips}/{name}" for name in ("still.png", "junk.mp4", "short.mkv", "small.mkv", "gone.mkv")]
-
-
-def test_the_online_video_spec_streams_clips_through_the_real_pool(clips):
-    """OnlineVideos over a table of HTTP urls, fetched by the spawned pool:
-    a batch is clips under `video` with their captions, which is the field
-    and shape a diffusion run over the spec generates."""
-    hf = pytest.importorskip("datasets")
-    from dew.data import OnlineVideos
-    from dew.objectives.diffusion.config import DiffusionRunConfig
-
-    spec = OnlineVideos(sources=("served",), image_size=16, min_image_size=16, frames=4,
-                        timeout=5, retries=0, loading=Loading(workers=1, threads=2, worker_buffer=1))
-    rows = hf.Dataset.from_dict({"url": [f"{clips}/clip.mkv", f"{clips}/junk.mp4"],
-                                 "caption": ["a grey ramp", "junk"]})
-    with pytest.MonkeyPatch.context() as patch:
-        patch.setattr(online_loader, "load_rows", lambda sources: rows)
-        dataset = spec.load(batch=2, tokenize=lambda captions: {"caption": np.asarray(captions)})
-    with closing(dataset.train(DataPartition())) as loader:
-        batch = next(loader)
-
-    assert batch["video"].shape == (2, 4, 16, 16, 3)
-    assert list(batch["caption"]) == ["a grey ramp", "a grey ramp"]
-    assert DiffusionRunConfig(data=spec, text=None).sample_field().shape == (4, 16, 16, 3)

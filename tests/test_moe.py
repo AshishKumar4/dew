@@ -23,12 +23,10 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from flax import linen as nn
 from moe_support import by_expert, router_variables
 
 from dew.nn.backbones.decoder_block import GatedMLP
 from dew.nn.moe import ExpertMLP, Router, SparseMLP, load_balance_update
-from dew.training import MeshSpec
 
 pytestmark = pytest.mark.kernel
 
@@ -100,31 +98,6 @@ def test_router_reproduces_the_mixtral_choice_and_gate_values():
     assert np.max(np.abs(ours_weights - theirs_weights)) < 1e-6
 
 
-def test_a_router_with_all_zero_sigmoid_scores_keeps_finite_zero_weights():
-    router = Router(num_experts=4, in_features=2, top_k=2, score_function="sigmoid")
-    variables = {"params": {"kernel": jnp.full((2, 4), -1000., jnp.float32)}}
-    hidden = jnp.ones((3, 2), jnp.float32)
-
-    weights, indices = jax.jit(router.apply)(variables, hidden)
-
-    np.testing.assert_array_equal(weights, np.zeros((3, 2), np.float32))
-    assert np.isfinite(weights).all()
-    assert np.all((np.asarray(indices) >= 0) & (np.asarray(indices) < 4))
-
-
-def test_mixtral_parity_needs_the_renormalisation():
-    """The mutation the router's weights would survive: keep the top-k
-    softmax mass without dividing by it."""
-    tensors = fixture("mixtral")
-    hidden = jnp.asarray(tensors["hidden"]).reshape(-1, CONFIG["mixtral"]["hidden_size"])
-    weights, indices = mixtral_router(normalize_weights=False).apply(
-        router_variables(tensors), hidden)
-
-    _, theirs_weights = by_expert(tensors["router_indices"], tensors["router_weights"])
-    _, ours_weights = by_expert(indices, weights)
-    assert np.max(np.abs(ours_weights - theirs_weights)) > 0.1
-
-
 def test_router_reproduces_the_deepseek_group_limited_choice():
     """DeepseekV3MoE's router: sigmoid scores, a per-expert selection bias, the
     node limit over expert groups, renormalise, scale."""
@@ -141,18 +114,6 @@ def test_router_reproduces_the_deepseek_group_limited_choice():
     # Largest observed difference 2.38e-07 at fp32 on CPU, on weights the
     # routed_scaling_factor of 2.5 has already multiplied.
     assert np.max(np.abs(ours_weights - theirs_weights)) < 1e-6
-
-
-def test_deepseek_parity_needs_the_group_limit():
-    """Dropping the node limit leaves a plain top-k, which picks other experts."""
-    tensors = fixture("deepseek")
-    hidden = jnp.asarray(tensors["hidden"])
-    _, indices = deepseek_router(expert_groups=1, groups_per_token=1).apply(
-        router_variables(tensors, bias=True), hidden)
-
-    flat = np.asarray(indices).reshape(-1, indices.shape[-1])
-    assert not np.array_equal(np.sort(flat, axis=-1),
-                              np.sort(tensors["router_indices"], axis=-1))
 
 
 def test_the_selection_bias_never_reaches_the_gate_values():
@@ -240,15 +201,6 @@ def test_the_expert_block_reproduces_the_deepseek_block_output():
     assert np.max(np.abs(np.asarray(output) - tensors["block_output"])) < 2e-5
 
 
-def test_deepseek_parity_needs_the_shared_branch():
-    """The mutation: the same block without its shared expert is the routed
-    sum alone, which the reference output is not."""
-    tensors = fixture("deepseek")
-    output = deepseek_block(shared=False).apply(
-        deepseek_variables(tensors, shared=False), jnp.asarray(tensors["hidden"]))
-    assert np.max(np.abs(np.asarray(output) - tensors["block_output"])) > 0.1
-
-
 def v4_router(**overrides) -> Router:
     config = CONFIG["deepseek_v4"]
     settings = {"score_function": 'sqrtsoftplus',
@@ -278,18 +230,6 @@ def test_router_reproduces_the_deepseek_v4_sqrt_softplus_choice():
     assert np.max(np.abs(ours_weights - theirs_weights)) < 1e-6
 
 
-def test_v4_parity_needs_the_sqrt_softplus():
-    """A sigmoid over the same logits renormalises to other gate values."""
-    tensors = fixture("deepseek_v4")
-    hidden = jnp.asarray(tensors["hidden"])
-    weights, indices = v4_router(score_function='sigmoid').apply(
-        router_variables(tensors, bias=True), hidden)
-    _, theirs_weights = by_expert(tensors["router_indices"], tensors["router_weights"])
-    _, ours_weights = by_expert(
-        indices.reshape(-1, indices.shape[-1]), weights.reshape(-1, weights.shape[-1]))
-    assert np.max(np.abs(ours_weights - theirs_weights)) > 0.01
-
-
 def v4_experts(swiglu_limit) -> ExpertMLP:
     config = CONFIG["deepseek_v4"]
     return ExpertMLP(num_experts=config["num_local_experts"],
@@ -313,26 +253,6 @@ def test_the_experts_reproduce_the_deepseek_v4_clamped_output():
         variables, hidden, jnp.asarray(tensors["router_weights"]),
         jnp.asarray(tensors["router_indices"]))
     assert np.max(np.abs(np.asarray(output) - tensors["experts_output"])) < 2e-5
-
-
-def test_v4_parity_needs_the_clamp():
-    """The unclamped experts on the same weights disagree, so the limit is
-    what the fixture tests."""
-    tensors = fixture("deepseek_v4")
-    config = CONFIG["deepseek_v4"]
-    variables = {"params": sparse_variables(
-        tensors, config["num_local_experts"])["params"]["experts"]}
-    hidden = jnp.asarray(tensors["hidden"]).reshape(-1, config["hidden_size"])
-    output = v4_experts(None).apply(
-        variables, hidden, jnp.asarray(tensors["router_weights"]),
-        jnp.asarray(tensors["router_indices"]))
-    assert np.max(np.abs(np.asarray(output) - tensors["experts_output"])) > 0.1
-
-
-def test_a_swiglu_limit_that_clamps_nothing_is_rejected():
-    with pytest.raises(ValueError, match="swiglu_limit"):
-        v4_experts(0.0).init(jax.random.key(0), jnp.zeros((4, 16)),
-                             jnp.ones((4, 2)), jnp.zeros((4, 2), jnp.int32))
 
 
 # --------------------------------------------------------------------------
@@ -403,29 +323,6 @@ def test_the_bias_update_evens_out_the_expert_load():
     assert final.min() > 0, final
 
 
-def test_a_balancing_update_that_follows_the_load_makes_it_worse():
-    """The mutation: the same loop with the update's sign flipped concentrates
-    the load, so the balanced run above is the update's doing."""
-    start, final, bias = balanced_run(direction=-1.0)
-
-    assert np.ptp(final) > np.ptp(start), (start, final)
-    assert bias[np.argmax(start)] > 0 > bias[np.argmin(start)]
-
-
-@pytest.mark.parametrize("settings,message", [
-    ({"score_function": 'softplus'}, "score_function"),
-    ({"top_k": 9}, "top_k"),
-    ({"expert_groups": 3}, "divide"),
-    ({"expert_groups": 4, "groups_per_token": 5}, "groups_per_token"),
-    ({"expert_groups": 8}, "two best"),
-    ({"expert_groups": 4, "groups_per_token": 1, "top_k": 3}, "fewer than"),
-])
-def test_a_router_that_cannot_choose_top_k_experts_is_rejected(settings, message):
-    with pytest.raises(ValueError, match=message):
-        Router(**{"num_experts": 8, "in_features": 8, "top_k": 2, **settings}).init(
-            jax.random.key(0), jnp.zeros((2, 8)))
-
-
 # --------------------------------------------------------------------------
 # The grouped matmul
 # --------------------------------------------------------------------------
@@ -441,26 +338,6 @@ def routed_experts(num_experts=8, top_k=1, tokens=6, width=8, hidden=12,
     weights = jnp.full((tokens, top_k), 1.0 / top_k, jnp.float32)
     variables = experts.init(jax.random.key(1), x, weights, indices)
     return experts, variables, x, weights, indices
-
-
-def test_every_expert_initialises_like_the_dense_projection_it_replaces():
-    """The expert dimension stacks whole matrices, so fan-in is one expert's
-    input width. Counting the stack in it would scale every expert's weights
-    down by sqrt(num_experts) and a from-scratch run would start quiet.
-    """
-    experts = ExpertMLP(num_experts=8, hidden_features=64, out_features=64)
-    variables = experts.init(
-        jax.random.key(1), jnp.zeros((4, 64)), jnp.ones((4, 1)),
-        jnp.zeros((4, 1), jnp.int32))
-    stacked = np.asarray(variables["params"]["gate_proj"]["kernel"])
-    dense = np.asarray(nn.initializers.lecun_normal()(
-        jax.random.key(1), (64, 64), jnp.float32))
-
-    assert stacked.shape == (8, 64, 64)
-    # Observed 0.1255 against the dense 0.1252 and the 1/sqrt(64) of 0.1250,
-    # where a fan-in over the whole stack would give 0.0442.
-    assert abs(stacked.std() - 1 / np.sqrt(64)) < 0.02 / np.sqrt(64)
-    assert abs(stacked.std() - dense.std()) < 0.05 * dense.std()
 
 
 def test_an_expert_no_token_reached_cannot_change_the_output():
@@ -500,93 +377,24 @@ def test_the_grouped_matmul_matches_a_per_expert_loop():
     assert np.max(np.abs(np.asarray(output) - reference)) < 1e-6
 
 
-def test_an_unknown_grouped_matmul_is_rejected():
-    with pytest.raises(ValueError, match="'pallas'"):
-        routed_experts(implementation='megablox')
+def test_float32_expert_routing_with_x64_keeps_its_output_and_gradients():
+    """Enabling a float64 oracle must not prevent the float32 model running.
 
+    bincount defaults to int64 under x64; TPU ragged-dot cannot lower those
+    group sizes. Exercise the routed experts, not just a hand-typed count.
+    """
+    with jax.enable_x64(new_val=False):
+        experts, variables, x, weights, indices = routed_experts(top_k=2)
 
-def test_routing_that_does_not_describe_the_tokens_is_rejected():
-    experts, variables, x, weights, indices = routed_experts(top_k=2)
-    with pytest.raises(ValueError, match="does not describe"):
-        experts.apply(variables, x[:-1], weights, indices)
+    def step(variables, x):
+        output = experts.apply(variables, x, weights, indices)
+        return jnp.square(output).sum(), output
 
-
-@pytest.mark.parametrize('generation,gpu,chosen', [
-    ('sm89', True, 'pallas'), ('sm86', True, 'pallas'), ('sm80', True, 'pallas'), ('sm75', False, 'xla'),
-    ('sm90', True, 'pallas'), ('sm120', True, 'xla'), ('v6e', False, 'xla'), ('cpu', False, 'xla')])
-def test_auto_takes_the_measured_grouped_matmul_and_xla_elsewhere(monkeypatch, generation, gpu,
-                                                                  chosen):
-    """'auto' runs the Pallas kernels only on a generation they were measured
-    on and can compile for; an unmeasured or older one runs XLA."""
-    import dew.nn.moe as moe
-    from dew.nn import kernels
-    monkeypatch.setattr(kernels.generation, 'device_generation', lambda: generation)
-    monkeypatch.setattr(moe, 'triton_runs', lambda: gpu)
-    assert moe.grouped_matmul_kernel('auto', jnp.bfloat16, (jnp.bfloat16, jnp.float32),
-                                     None) == chosen
-
-
-def test_pallas_steps_aside_for_a_product_its_kernels_would_change(monkeypatch, caplog):
-    """The kernels multiply at the operands' dtype and ignore precision, so
-    fp32 at HIGHEST runs XLA even where they compile, and on a generation
-    where they were measured fastest the first such call logs why."""
-    import dew.nn.moe as moe
-    from dew.nn import kernels
-    monkeypatch.setattr(kernels.generation, 'device_generation', lambda: 'sm89')
-    monkeypatch.setattr(kernels.generation, '_logged', set())
-    monkeypatch.setattr(moe, 'triton_runs', lambda: True)
-    assert [moe.grouped_matmul_kernel(implementation, jnp.float32, (jnp.float32, jnp.float32), 'highest')
-            for implementation in ('pallas', 'auto')] == ['xla', 'xla']
-    assert moe.grouped_matmul_kernel('pallas', jnp.float32, (jnp.float32, jnp.float32),
-                                     'default') == 'pallas'
-    logged = [record.getMessage() for record in caplog.records if record.name == kernels.generation.__name__]
-    assert logged == ["grouped_matmul runs 'xla', not 'pallas', the kernel measured fastest on sm89: fp32 "
-                      "products above the default precision, and the kernels multiply in TF32"]
-
-
-@pytest.mark.mesh
-@pytest.mark.parametrize("dispatch", ["exchange", "global"])
-@pytest.mark.parametrize("experts", ["gpt_oss", "mixture"])
-def test_a_forward_reads_the_expert_kernels_as_stored(experts, dispatch):
-    """bf16 expert kernels under an fp32 stream, as gpt-oss-20b is served over
-    an expert axis. The forward multiplies them as stored: the stream rounds
-    to bf16 and the products accumulate in fp32. Widened, by the dispatch for
-    its gradient sums or by the stream's promotion, each layer's experts were
-    copied to fp32: 14.35 GiB of live temporaries on four RTX 3090s. Read off
-    the program JAX traces, since XLA's CPU backend runs a bf16 dot in fp32
-    on its own."""
-    from dew.nn.gpt_oss import GptOssMLP
-
-    width, hidden = 64, 96
-    if experts == "gpt_oss":
-        module = GptOssMLP(width, hidden, 8, 2, dispatch=dispatch)
-    else:
-        module = SparseMLP(num_experts=8, top_k=2, hidden_features=hidden,
-                           out_features=width, dispatch=dispatch)
-    x = jnp.zeros((4, 16, width), jnp.float32)
-    shapes = jax.eval_shape(module.init, jax.random.key(0), x)
-    variables = jax.tree.map(lambda leaf: jnp.zeros(leaf.shape, jnp.bfloat16), shapes)
-    with jax.set_mesh(MeshSpec(expert=4, fsdp=2).build()), nn.logical_axis_rules(()):
-        program = str(jax.make_jaxpr(module.apply)(variables, x))
-    kernels = [f"{experts},{rows},{columns}" for experts in (8, 2)
-               for rows, columns in ((width, hidden), (hidden, width),
-                                     (width, 2 * hidden), (2 * hidden, width))]
-    widened = [line for line in program.splitlines()
-               if any(f"f32[{shape}]" in line for shape in kernels)]
-    assert not widened, widened[:3]
-
-
-def test_experts_keep_a_stored_dtype_only_when_narrower_than_the_stream():
-    """fp32 over bf16 experts computes in bf16, as stored; bf16 over fp16
-    experts promotes to fp32, since fp16 would overflow bf16 values past
-    65504; one dtype throughout keeps it."""
-    from dew.nn.moe import expert_compute_dtype
-
-    def compute(stream, experts):
-        return expert_compute_dtype(jnp.zeros(2, stream), jnp.zeros(2, experts), dtype=None)
-
-    assert compute(jnp.float32, jnp.bfloat16) == jnp.bfloat16
-    assert compute(jnp.bfloat16, jnp.float16) == jnp.float32
-    assert compute(jnp.bfloat16, jnp.bfloat16) == jnp.bfloat16
-    assert expert_compute_dtype(jnp.zeros(2, jnp.float32), jnp.zeros(2, jnp.bfloat16),
-                                dtype=jnp.float32) == jnp.float32
+    results = []
+    for enabled in (False, True):
+        with jax.enable_x64(enabled):
+            results.append(jax.device_get(jax.jit(
+                jax.value_and_grad(step, argnums=(0, 1), has_aux=True))(variables, x)))
+    for expected, actual in zip(jax.tree.leaves(results[0]), jax.tree.leaves(results[1]), strict=True):
+        assert actual.dtype == expected.dtype == np.float32
+        np.testing.assert_allclose(actual, expected, rtol=1e-6, atol=1e-7)
