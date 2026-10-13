@@ -501,6 +501,25 @@ def _phase_filter(model: nn.Module, indexer: IndexerTraining | None,
 _DEFAULT_SAMPLING = Sampling()
 
 
+
+def scored_targets(xp, tokens, pad_id: int | None, attention_mask, segment_ids, depth: int = 0):
+    """Whether each target the loss scores at prediction `depth` counts, as
+    `[B, S - 1 - depth]` booleans, in `xp` (numpy for the host's FLOP
+    geometry, jax.numpy for the loss): the state at p scores the token
+    `depth + 1` later, which counts when it is not padding, when the
+    attention mask keeps every position from the state to it, and, in a
+    packed batch, when the state and it share a document (segment 0 is
+    padding)."""
+    span = depth + 1
+    width = tokens.shape[1] - span
+    counted = xp.ones((tokens.shape[0], width), bool) if pad_id is None else tokens[:, span:] != pad_id
+    if attention_mask is not None:
+        for offset in range(span + 1):
+            counted = counted & attention_mask[:, offset:offset + width].astype(bool)
+    if segment_ids is not None:
+        counted = counted & (segment_ids[:, span:] == segment_ids[:, :-span]) & (segment_ids[:, span:] != 0)
+    return counted
+
 class LMObjective(Objective[Ratio | LMStatistics, Variables]):
     """Trains a next-token model with shifted cross entropy, teacher-forced scoring and optional previews.
 
@@ -620,18 +639,23 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
             return f"{type(model).__name__} does not declare prediction_flops for its MTP depths"
         return None
 
-    def _counted_tokens(self, batch: Batch):
-        """Host token geometry, with the same padding/packing fields as the loss."""
+    def _token_geometry(self, batch: Batch) -> tuple[np.ndarray, np.ndarray | None, np.ndarray | None]:
+        """The host's tokens, attention mask and documents: the fields the loss reads."""
         raw = batch[TEXT_KEY]
         prepared = raw if isinstance(raw, ModelInputs) else ModelInputs(raw)
-        tokens = np.asarray(prepared.tokens)
         fields = prepared.token_fields
         documents = batch.get("text_segment_ids", fields.get("segment_ids"))
+        mask = fields.get("attention_mask")
+        return (np.asarray(prepared.tokens), None if mask is None else np.asarray(mask, bool),
+                None if documents is None else np.asarray(documents))
+
+    def _counted_tokens(self, batch: Batch):
+        """Host input geometry: each real token, and the documents."""
+        tokens, mask, documents = self._token_geometry(batch)
         valid = np.ones(tokens.shape, bool) if self.pad_id is None else tokens != self.pad_id
-        if "attention_mask" in fields:
-            valid &= np.asarray(fields["attention_mask"], bool)
+        if mask is not None:
+            valid &= mask
         if documents is not None:
-            documents = np.asarray(documents)
             valid &= documents != 0
         return valid, documents
 
@@ -691,10 +715,12 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
                           batch: Batch) -> list[tuple[np.ndarray, np.ndarray]]:
         """A depth's real fusion inputs and scored targets differ at document boundaries.
 
-        Every intervening token must be real, as `_depth_weights` requires;
-        counting totals and subtracting a depth would join across pad holes.
+        Every intervening input must be real; the targets are the ones the
+        loss scores (`scored_targets`). Counting totals and subtracting a depth
+        would join across pad holes.
         """
         valid, documents = self._counted_tokens(batch)
+        tokens, mask, _ = self._token_geometry(batch)
         depth_rows = []
         for depth in range(1, model.num_nextn_predict_layers + 1):
             span = valid.shape[1] - 1 - depth
@@ -704,11 +730,8 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
             segments = None if documents is None else documents[:, :span]
             if documents is not None:
                 admitted &= segments == documents[:, depth:depth + span]
-            inputs = self._row_lengths(admitted, segments)
-            admitted &= valid[:, depth + 1:depth + 1 + span]
-            if documents is not None:
-                admitted &= segments == documents[:, depth + 1:depth + 1 + span]
-            depth_rows.append((inputs, self._row_lengths(admitted, segments)))
+            scored = scored_targets(np, tokens, self.pad_id, mask, documents, depth)
+            depth_rows.append((self._row_lengths(admitted, segments), self._row_lengths(scored, segments)))
         return depth_rows
 
     def _check_flop_geometry(self, batch: Batch) -> None:
@@ -717,12 +740,11 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         if isinstance(raw, ModelInputs) and raw.conditioning:
             raise MissingFlopsCount("LMObjective needs its conditioning tower's multi-sequence geometry")
 
-    def _prediction_lengths(self, batch: Batch) -> np.ndarray:
-        valid, documents = self._counted_tokens(batch)
-        predicted = valid[:, :-1] & valid[:, 1:]
-        if documents is not None:
-            predicted &= documents[:, :-1] == documents[:, 1:]
-        return np.sum(predicted, axis=-1, dtype=np.int64)
+    def _prediction_lengths(self, batch: Batch, depth: int = 0) -> np.ndarray:
+        """Each row's targets the loss scores at `depth` (`scored_targets`)."""
+        tokens, mask, documents = self._token_geometry(batch)
+        return np.sum(scored_targets(np, tokens, self.pad_id, mask, documents, depth), axis=-1,
+                      dtype=np.int64)
 
     def __init__(
         self,
@@ -899,7 +921,7 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
             head_cross_entropy(self.model, params, hidden, targets, self.head_chunks, tile=self.head_tile,
                                predict=predict) if reads_states(self.model)
             else logits_cross_entropy(hidden, targets, predict=predict))
-        weights = self._row_weights(prepared, targets, roles, losses.dtype)
+        weights = self._row_weights(prepared, roles, losses.dtype)
         correct = None if predicted is None else (predicted == targets).astype(losses.dtype)
         depth_scores = []
         if depths:
@@ -923,20 +945,15 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
                 depth_losses, _, _ = head_cross_entropy(
                     self.model, params, state, targets[:, depth:], self.head_chunks,
                     tile=self.head_tile, predict=False)
-                depth_scores.append((depth_losses, self._depth_weights(
-                    prepared, targets, roles, losses.dtype, depth)))
+                depth_scores.append((depth_losses, self._depth_weights(prepared, roles, losses.dtype, depth)))
         return Scores(losses, weights, log_z, correct, hidden, kept, sown, depth_scores, qk, kls)
 
-    def _row_weights(self, prepared, targets, roles, dtype):
-        """Weight the targets the row itself scores.
-
-        A supplied validity mask drops the transitions across padding, and
-        `loss_role` keeps one role's targets alone.
-        """
-        weights = self._target_weights(prepared, targets, dtype)
-        valid = prepared.token_fields.get("attention_mask")
-        if valid is not None:
-            weights = weights * (valid[:, :-1] & valid[:, 1:]).astype(weights.dtype)
+    def _row_weights(self, prepared, roles, dtype):
+        """Weight the targets the row itself scores (`scored_targets`), and
+        with `loss_role` one role's targets alone."""
+        fields = prepared.token_fields
+        weights = scored_targets(jnp, prepared.tokens, self.pad_id, fields.get("attention_mask"),
+                                 fields.get("segment_ids")).astype(dtype)
         if roles is not None:
             if roles.shape != prepared.tokens.shape:
                 raise ValueError(
@@ -947,22 +964,12 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
                 weights = weights * (roles[:, 1:] == int(self.loss_role))
         return weights
 
-    def _depth_weights(self, prepared, targets, roles, dtype, depth: int):
-        """Weight the targets one prediction depth scores.
-
-        Depth d's state at p scores the target d further out, so the same
-        document rule applies between the state's document and the
-        target's. A padded row admits the target only when every position
-        from the state to it is real.
-        """
-        weights = self._target_weights(prepared, targets[:, depth:], dtype, depth)
-        valid = prepared.token_fields.get("attention_mask")
-        if valid is not None:
-            span = targets.shape[1] - depth
-            admitted = jnp.ones((targets.shape[0], span), dtype=bool)
-            for offset in range(depth + 2):
-                admitted = admitted & valid[:, offset:offset + span]
-            weights = weights * admitted.astype(weights.dtype)
+    def _depth_weights(self, prepared, roles, dtype, depth: int):
+        """Weight the targets one prediction depth scores: depth d's state at
+        p scores the target d further out (`scored_targets`)."""
+        fields = prepared.token_fields
+        weights = scored_targets(jnp, prepared.tokens, self.pad_id, fields.get("attention_mask"),
+                                 fields.get("segment_ids"), depth).astype(dtype)
         if roles is not None and self.loss_role is not None:
             weights = weights * (roles[:, depth + 1:] == int(self.loss_role))
         return weights
@@ -1057,27 +1064,6 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
                                                              temperature=temperature)
             log_probs = jnp.where(present, filtered, log_probs)
         return log_probs
-
-    def _target_weights(self, prepared, targets, dtype, depth: int = 0):
-        """Mark with 1 every target that counts.
-
-        A target counts when it is not padding and, in a packed batch,
-        when it sits inside the document of the state that predicts it,
-        which is `depth + 1` positions before it.
-        """
-        weights = (jnp.ones_like(targets, dtype) if self.pad_id is None
-                   else (targets != self.pad_id).astype(dtype))
-        segment_ids = prepared.token_fields.get("segment_ids")
-        if segment_ids is not None:
-            # A target counts only inside a document. The first token of the
-            # next packed document, the padding after the last one (segment 0,
-            # which the seg==seg comparison alone would keep), and every
-            # cross-boundary transition drop out of loss and accuracy alike.
-            span = depth + 1
-            weights = weights * (
-                (segment_ids[:, span:] == segment_ids[:, :-span])
-                & (segment_ids[:, span:] != 0)).astype(dtype)
-        return weights
 
     def _batch_roles(self, batch):
         """Read the batch's `text_roles` column, or None on a run that counts
