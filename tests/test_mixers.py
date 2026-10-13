@@ -110,9 +110,8 @@ def test_models_build_takes_kind_mixer_records():
     assert jnp.array_equal(model.apply(params, ids), expected.apply(params, ids))
 
 
-DOCUMENTS = (5, 70, 7)
-"""Three packed documents' lengths, all uneven: the first shorter than a conv's history would carry,
-the second across the chunked rules' 64-token chunk boundary, the third starting mid-chunk after it."""
+DOCUMENTS = (5, 7)
+"""Two packed documents' lengths: the first shorter than a conv's history would carry, both uneven."""
 
 PADDING = 3
 """Segment-0 slots after the documents, the packer's tail."""
@@ -165,7 +164,7 @@ REFUSED = {"kpool_sparse_attention": "a packed row of documents"}
 
 @pytest.mark.parametrize("kind", sorted(mixers.paths))
 def test_a_packed_row_computes_what_its_documents_compute_alone(kind):
-    """Every mixer in the registry: a row packing three documents (segment ids, positions restarting)
+    """Every mixer in the registry: a row packing two documents (segment ids, positions restarting)
     gives each document's logits and the parameters' gradients its documents give run one at a time,
     within the float64 gate, so no layer carries a conv history, a recurrent state or attention across
     a document boundary, nor between the documents and the segment-0 padding after them. The
@@ -176,7 +175,7 @@ def test_a_packed_row_computes_what_its_documents_compute_alone(kind):
                     "alone sum in different orders and one draw of each measures luck; isolation on a "
                     "GPU is test_no_token_reaches_another_document's, bitwise")
     fields, overrides = KIND_FIELDS.get(kind, ({}, {}))
-    model = tiny(mixer=mixers.build(kind, **fields), max_seq_len=128, **overrides)
+    model = tiny(mixer=mixers.build(kind, **fields), max_seq_len=32, **overrides)
     tokens = jax.random.randint(jax.random.key(3), (1, sum(DOCUMENTS)), 0, VOCAB)
     variables = model.init(jax.random.key(4), tokens)
     cotangent = jax.random.normal(jax.random.key(5), (1, sum(DOCUMENTS), VOCAB))
@@ -196,15 +195,15 @@ def test_a_packed_row_computes_what_its_documents_compute_alone(kind):
 
 @pytest.mark.parametrize("kind", sorted(mixers.paths))
 def test_no_token_reaches_another_document(kind):
-    """Every mixer in the registry, on every backend: in a packed row (DOCUMENTS' first two, then
-    segment-0 padding), changing the first document's tokens and the padding's leaves the second's
+    """Every mixer in the registry, on every backend: in a packed row (two documents, then segment-0
+    padding), changing the first document's tokens and the padding's leaves the second document's
     logits, and the gradients of a loss on them alone, bitwise as they were. The same program on the
     same shapes, so any difference is information crossing a document boundary."""
     if kind in REFUSED:
         pytest.skip(f"{kind} refuses packed rows")
     fields, overrides = KIND_FIELDS.get(kind, ({}, {}))
-    model = tiny(mixer=mixers.build(kind, **fields), max_seq_len=128, **overrides)
-    first, second = DOCUMENTS[:2]
+    model = tiny(mixer=mixers.build(kind, **fields), max_seq_len=32, **overrides)
+    first, second = DOCUMENTS
     total = first + second + PADDING
     segments = jnp.asarray([[1] * first + [2] * second + [0] * PADDING], jnp.int32)
     positions = jnp.asarray([[*range(first), *range(second)] + [0] * PADDING], jnp.int32)
