@@ -46,6 +46,7 @@ from dew.nn.precision import (
     at_least_fp32,
     biased_logits,
     capped_logits,
+    compensated_sum,
     head_product,
     rounded_operand,
     rounded_to,
@@ -616,6 +617,135 @@ def chunked_cross_entropy(hidden, head: OutputTable, targets, chunks: int, *,
         return scored(hidden, table, targets, left_out, cap, bias)
     return _sharded_head(mesh, hidden, table, targets, left_out, cap, bias, scored, column_logits,
                          predict=predict)
+
+
+def _fused_terms(hidden, table, labels, weights, z_loss: float, cap, bias, chunk: int,
+                 precision: jax.lax.PrecisionLike, predict: bool, temperature: float, excluded,
+                 gradients: bool):
+    """`fused_head_loss`'s per-token terms, a `chunk` of tokens at a time
+    against the whole vocabulary, and with `gradients` the loss's gradients
+    taken in the same chunk: the states', the head's (fp32 until every chunk
+    is in) and the bias's."""
+    count, features = hidden.shape
+    work = at_least_fp32(hidden.dtype)
+    operands = _operand_dtype(precision, work)
+    # Once, not per chunk: every chunk multiplies the same rounded table.
+    matrix = rounded_operand(table.astype(work), operands)
+    product_matrix = table.astype(jnp.bfloat16) if precision is BF16 else matrix
+
+    def tokens(start, carry, size):
+        outputs, d_table, d_bias = carry
+        states = rounded_operand(jax.lax.dynamic_slice_in_dim(hidden, start, size).astype(work), operands)
+        targets = jax.lax.dynamic_slice_in_dim(labels, start, size)
+        logits, pullback = jax.vjp(lambda raw: capped_logits(raw, cap, temperature),
+                                   biased_logits(_tile_logits(states, matrix, precision), bias))
+        log_z, top, (peaks, masses) = _row_terms(_without(logits, 0, excluded), predict)
+        inside = (targets >= 0) & (targets < table.shape[0])
+        picked = jnp.where(inside, jnp.take_along_axis(
+            logits, jnp.clip(targets, 0, table.shape[0] - 1)[:, None], axis=-1)[:, 0], 0.0)
+        values = [log_z - picked, log_z]
+        if predict:
+            assert top is not None
+            values.append(top[1])
+        if gradients:
+            weight = jax.lax.dynamic_slice_in_dim(weights, start, size).astype(work)
+            d_raw, = pullback(_softmax_cotangent(logits, 0, excluded, peaks, masses, targets, weight,
+                                                 2 * z_loss * log_z * weight))
+            d_bias = None if d_bias is None else d_bias + jnp.sum(d_raw, axis=0)
+            d_raw = _logits_cotangent(d_raw, precision)
+            values.append(jnp.einsum('tv,vd->td', d_raw, product_matrix, precision=precision,
+                                     preferred_element_type=work))
+            d_table = d_table + jnp.einsum('tv,td->vd', d_raw, states.astype(d_raw.dtype),
+                                           precision=precision, preferred_element_type=work)
+        outputs = tuple(jax.lax.dynamic_update_slice_in_dim(out, value, start, axis=0)
+                        for out, value in zip(outputs, values, strict=True))
+        return outputs, d_table, d_bias
+
+    outputs = (jnp.zeros((count,), work),) * 2
+    if predict:
+        outputs += (jnp.zeros((count,), jnp.int32),)
+    if gradients:
+        outputs += (jnp.zeros((count, features), work),)
+    d_table = jnp.zeros(table.shape, work) if gradients else None
+    d_bias = jnp.zeros(bias.shape, work) if gradients and bias is not None else None
+    return _over_tiles((outputs, d_table, d_bias), count, chunk, tokens)
+
+
+def _fused_total(losses, log_z, weights, z_loss: float):
+    """The weighted sum of the losses and the z-loss, summed as `Objective.row_mean` sums."""
+    terms = weights.astype(losses.dtype) * (losses + z_loss * jnp.square(log_z) if z_loss else losses)
+    return compensated_sum(terms, (0,))
+
+
+def _fused_impl(hidden, table, labels, weights, bias, z_loss, cap, chunk, precision, predict, temperature,
+                excluded):
+    (losses, log_z, *predicted), _, _ = _fused_terms(
+        hidden, table, labels, weights, z_loss, cap, bias, chunk, precision, predict, temperature, excluded,
+        gradients=False)
+    return _fused_total(losses, log_z, weights, z_loss), (losses, predicted[0] if predict else None, log_z)
+
+
+def _fused_fwd(hidden, table, labels, weights, bias, z_loss, cap, chunk, precision, predict, temperature,
+               excluded):
+    (losses, log_z, *rest), d_table, d_bias = _fused_terms(
+        hidden, table, labels, weights, z_loss, cap, bias, chunk, precision, predict, temperature, excluded,
+        gradients=True)
+    predicted, d_states = (rest[0], rest[1]) if predict else (None, rest[0])
+    total = _fused_total(losses, log_z, weights, z_loss)
+    # Empty arrays carry the inputs' dtypes, which the gradients return in.
+    dtypes = (jnp.zeros((0,), hidden.dtype), jnp.zeros((0,), table.dtype))
+    return (total, (losses, predicted, log_z)), (d_states, d_table, d_bias, dtypes)
+
+
+def _fused_bwd(z_loss, cap, chunk, precision, predict, temperature, excluded, residuals, cotangents):
+    """The gradients the forward took, times the total's cotangent; the
+    per-token outputs carry none."""
+    d_states, d_table, d_bias, (states_dtype, table_dtype) = residuals
+    scale = cotangents[0]
+    return ((scale * d_states).astype(states_dtype.dtype), (scale * d_table).astype(table_dtype.dtype), None,
+            None, None if d_bias is None else scale * d_bias)
+
+
+_fused = jax.custom_vjp(_fused_impl, nondiff_argnums=(5, 6, 7, 8, 9, 10, 11))
+_fused.defvjp(_fused_fwd, _fused_bwd)
+
+
+def fused_head_loss(hidden, head: OutputTable, targets, weights, *, z_loss: float = 0.0, chunk: int = 256,
+                    predict: bool = True, temperature: float = 1.0, excluded: int | None = None):
+    """The weighted sum of `head.logits(hidden)`'s cross entropies at
+    `targets` and PaLM's z-loss, sum of w (ce + z_loss log Z^2), with each
+    token's loss, top-1 column (None unless `predict`) and log Z beside it.
+
+    Only the sum carries a gradient, and its gradient is taken in the forward
+    pass, Liger's fused linear cross entropy: each `chunk` of tokens scores
+    the whole vocabulary, then pulls its softmax back through the head at
+    once, three products a chunk and no logits recomputed or held beyond the
+    chunk. The backward scales those gradients by the sum's cotangent. The
+    sum is a loss's numerator (`Ratio.total`), with no 1/sum(w) in it, so
+    microbatches pool by mass; `weights` (`[...]` like `targets`) are known
+    in the forward and carry no gradient. The products, the softmax and the
+    rounding are `chunked_cross_entropy`'s whole head's, the states through
+    the head's input quantizer. Under `jax.checkpoint` the forward and its
+    gradients run again with the rest of the scope, so a step keeps the head
+    outside the rematerialized blocks. `excluded` is a column the softmax
+    gives no mass, as in `chunked_cross_entropy`. Off a mesh only for now.
+    """
+    if not jax.sharding.get_abstract_mesh().empty:
+        raise NotImplementedError("fused_head_loss runs off a mesh; on one, take chunked_cross_entropy")
+    if hidden.shape[:-1] != targets.shape or weights.shape != targets.shape:
+        raise ValueError(f"{hidden.shape[:-1]} states, {targets.shape} targets and {weights.shape} weights")
+    states = head.states(hidden)
+    compute = states.dtype if head.compute is None else head.compute
+    precision = BF16 if rounds_to_bf16(compute, head.precision) else head.precision
+    table = head.matrix if head.vocab_major else head.matrix.T
+    bias = None if head.bias is None else jnp.asarray(head.bias, at_least_fp32(states.dtype))
+    flat = states.reshape(-1, states.shape[-1])
+    total, (losses, predicted, log_z) = _fused(
+        flat, table, targets.reshape(-1), jax.lax.stop_gradient(weights.reshape(-1)), bias, float(z_loss),
+        head.softcap, chunk, precision, predict, float(temperature),
+        None if excluded is None else int(excluded))
+    shaped = None if predicted is None else predicted.reshape(targets.shape)
+    return total, (losses.reshape(targets.shape), shaped, log_z.reshape(targets.shape))
 
 
 def head_cross_entropy(model, variables, hidden, targets, chunks: int, *,

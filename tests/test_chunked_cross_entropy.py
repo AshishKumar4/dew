@@ -31,7 +31,7 @@ from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.precision import rounded_operand, rounded_to
 from dew.nn.protocols import OutputTable
 from dew.objectives.lm import chunked
-from dew.objectives.lm.chunked import chunked_cross_entropy, vocabulary_chunks
+from dew.objectives.lm.chunked import chunked_cross_entropy, fused_head_loss, vocabulary_chunks
 
 EXERCISED = {jnp.float32: 'highest', jnp.bfloat16: 'default'}
 """The matmul precision each compute dtype's head is compared under: bf16's
@@ -67,6 +67,51 @@ def test_vocabulary_bias_is_fp32_after_tied_or_untied_head_products(dtype, tied)
             np.testing.assert_array_equal(predicted, logits.argmax(-1))
     assert variables['params']['head_bias'].dtype == jnp.float32
     assert not np.array_equal(np.asarray(bias), np.asarray(bias.astype(jnp.bfloat16), np.float32))
+
+
+@pytest.mark.parametrize('dtype', [jnp.float32, jnp.bfloat16])
+@pytest.mark.parametrize('softcap', [None, 3.0], ids=['uncapped', 'capped'])
+def test_the_fused_head_takes_the_whole_heads_loss_and_gradients_under_the_float64_rule(dtype, softcap):
+    """The gradient-in-forward head's weighted sum of losses and z-loss, and
+    its gradients for the states, the head and the bias, as close to float64
+    as the whole-logits head's, over chunks whose last is short, padded
+    weights and a cap; its per-token losses, log Z and top-1 columns are the
+    whole head's."""
+    from reference_error import assert_as_exact_as_the_reference
+
+    states, matrix, targets = inputs(vocab=37, features=16, tokens=(2, 5), dtype=dtype)
+    # Sums exact in any order, so the chunks' products are the whole head's.
+    states, matrix = eighths(states, matrix)
+    bias = jax.random.normal(jax.random.key(3), (37,), jnp.float32) / 17
+    weights = jnp.asarray([[1, 1, 0, 1, 2], [1, 0, 1, 1, 1]], jnp.float32)
+    z_loss = 1e-2
+
+    def whole(states, matrix, bias):
+        logits = OutputTable(matrix, vocab_major=False, bias=bias, softcap=softcap).logits(states)
+        log_z = jax.nn.logsumexp(logits, axis=-1)
+        losses = log_z - jnp.take_along_axis(logits, targets[..., None], axis=-1)[..., 0]
+        return jnp.sum(weights * (losses + z_loss * jnp.square(log_z))), (losses, log_z, logits)
+
+    def fused(states, matrix, bias):
+        return fused_head_loss(states, OutputTable(matrix, vocab_major=False, bias=bias, softcap=softcap),
+                               targets, weights, z_loss=z_loss, chunk=3)
+
+    with jax.default_matmul_precision(EXERCISED[dtype]):
+        (total, (losses, predicted, log_z)), gradients = jax.value_and_grad(
+            fused, argnums=(0, 1, 2), has_aux=True)(states, matrix, bias)
+        (reference, (expected, expected_z, logits)), expected_gradients = jax.value_and_grad(
+            whole, argnums=(0, 1, 2), has_aux=True)(states, matrix, bias)
+    np.testing.assert_array_equal(predicted, logits.argmax(-1))
+    np.testing.assert_allclose(losses, expected, rtol=1e-6, atol=1e-6)
+    np.testing.assert_allclose(log_z, expected_z, rtol=1e-6, atol=1e-6)
+    with jax.enable_x64(new_val=True):
+        wide = [jnp.asarray(value, jnp.float64) for value in (states, matrix, bias)]
+        exact, exact_gradients = jax.value_and_grad(
+            lambda *values: whole(*values)[0], argnums=(0, 1, 2))(*wide)
+    for label, mine, theirs, true in zip(('loss', 'states', 'head', 'bias'), (total, *gradients),
+                                         (reference, *expected_gradients), (exact, *exact_gradients),
+                                         strict=True):
+        assert_as_exact_as_the_reference(mine, theirs, true, f'{dtype} {softcap} fused {label}')
 
 
 @pytest.mark.parametrize('kind', ['nvfp4', 'fp8'])
