@@ -362,6 +362,9 @@ class HloInstruction:
     flops: float
     """The matmul and convolution work of one call, a fusion's included, as
     the step's count (`hlo_flops`) counts it."""
+    runs: float
+    """Its calls per call of the module, as `hlo_flops` weighs them: a loop
+    body's trip count, every branch of a conditional once."""
 
 
 def hlo_instructions(text: str | Iterable[str]) -> dict[str, HloInstruction]:
@@ -369,7 +372,8 @@ def hlo_instructions(text: str | Iterable[str]) -> dict[str, HloInstruction]:
     dump's after-optimizations HLO, whole or as its lines) by name, read by the
     parser the FLOP count reads (`hlo_flops`). Each computation's body is
     gathered once, so the fusions that call one share its sets."""
-    computations, _ = _parse(text)
+    computations, entry = _parse(text)
+    weights = {} if entry is None else _weights(computations, entry)
     bodies: dict[str, tuple[frozenset[str], frozenset[str], float]] = {}
 
     def fused(name: str, seen: frozenset[str] = frozenset()) -> tuple[frozenset[str], frozenset[str], float]:
@@ -402,7 +406,7 @@ def hlo_instructions(text: str | Iterable[str]) -> dict[str, HloInstruction]:
         return frozenset()
 
     found = {}
-    for computation in computations.values():
+    for called_as, computation in computations.items():
         for name, instruction in computation.instructions.items():
             target = _TARGET.search(instruction.attributes)
             calls = _CALLS.findall(instruction.attributes) if instruction.op == 'fusion' else []
@@ -413,7 +417,7 @@ def hlo_instructions(text: str | Iterable[str]) -> dict[str, HloInstruction]:
             flops = _instruction_flops(instruction, computation.shapes) + sum(each for _, _, each in called)
             found[name] = HloInstruction(instruction.op, target.group(1) if target else '',
                                          tuple(instruction.operands), ops, instruction.recomputed, names,
-                                         reads, flops)
+                                         reads, flops, weights.get(called_as, 0.0))
     computations.clear()
     return found
 
