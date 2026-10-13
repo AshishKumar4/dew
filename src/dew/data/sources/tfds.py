@@ -7,6 +7,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import posixpath
 import shutil
 import subprocess
 import sys
@@ -237,11 +238,13 @@ class TFDS(Dataset):
         return f"tfds:{self.name}/{self.config}:{self.version}:{self.split}:{self.path}"
 
     def fingerprint(self) -> Mapping[str, object]:
-        from dew.data.storage import Store
+        from dew.data.storage import Store, content_version, local
 
         directory = str(self.builder.data_path)
         metadata = Store(directory.rstrip("/") + "/dataset_info.json").read()
         fs, prefix = Store(directory).resolve()
+        # A local copy is named by its content, so hosts that mounted it at different paths agree.
+        mounted = local(fs)
         definitions = {}
         for path in fs.find(prefix):
             if path.endswith((".json", ".labels.txt")):
@@ -266,7 +269,10 @@ class TFDS(Dataset):
                         f"Missing prepared ArrayRecord shard {instruction.filename!r}; "
                         "copy the complete split or provision it again"
                     ) from error
-                files.append({"uri": store.url, "bytes": header["size"], "version": fs.ukey(path)})
+                files.append(
+                    {"uri": posixpath.relpath(path, prefix), "bytes": header["size"],
+                     "version": content_version(fs, path, header["size"], blocks=2)}
+                    if mounted else {"uri": store.url, "bytes": header["size"], "version": fs.ukey(path)})
         if self.remote:
             mirrored = json.loads(Path(self.directory, "READY").read_text())
             files = mirrored["files"]
@@ -275,12 +281,12 @@ class TFDS(Dataset):
             "name": self.name,
             "split": self.split,
             "shard_rows": self.shard_rows,
-            "directory": self.path if self.remote else directory,
+            **({} if mounted else {"directory": self.path if self.remote else directory}),
             "metadata_sha256": hashlib.sha256(metadata).hexdigest(),
             "definitions": definitions,
             "files": files,
             "decoders": _decoder_record(self.decoders),
-            "original": self.path,
+            **({} if mounted else {"original": self.path}),
         }
 
     def supports(self, read: Read) -> bool:

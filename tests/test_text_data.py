@@ -834,3 +834,23 @@ def test_a_hub_tokenizer_runs_the_revision_its_identity_names(monkeypatch, tmp_p
     encoded = [int(token) for token in sent.map({"text": "hello there"})["text"]]
     assert encoded == load_tokenizer(str(files), local_files_only=True).encode("hello there")
     assert resolved == [("acme/tokenizer", None)]
+
+
+def test_hosts_that_mount_one_corpus_at_different_paths_read_one_order(tmp_path):
+    """Each host of a pool reads its own copy of a token corpus, mounted where it was put: the
+    copies' readers agree on what they read, and a copy that holds other tokens does not."""
+    stream = (np.arange(97, dtype=np.uint16) * 7) % 32
+    first = write_token_corpus(tmp_path / "host0" / "tokens", stream, stream)
+    second = tmp_path / "elsewhere" / "copy"
+    shutil.copytree(first, second)
+    other = write_token_corpus(tmp_path / "host2" / "tokens", stream[::-1].copy(), stream)
+
+    def identity(directory):
+        data = loader(TextData(source=str(directory), seq_len=4), batch=4, loading=Loading(workers=0))
+        reader = data.train(DataPartition())
+        try:
+            return reader.identity()
+        finally:
+            reader.close()
+
+    assert identity(first) == identity(second) != identity(other)
