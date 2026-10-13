@@ -570,8 +570,9 @@ def test_a_run_resumed_at_another_rate_steps_at_it_on_the_compiled_step(tmp_path
     process, with a cache of its own."""
     root = Path(__file__).resolve().parents[1]
     environment = {**os.environ, "PYTHONPATH": os.pathsep.join([str(root / "src"), str(root / "tests")])}
-    done = subprocess.run([sys.executable, "-c", RATE_RESUMES, str(tmp_path), "grouped" if grouped else "one"],
-                          env=environment, capture_output=True, text=True, timeout=600)
+    done = subprocess.run(
+        [sys.executable, "-c", RATE_RESUMES, str(tmp_path), "grouped" if grouped else "one"],
+        env=environment, capture_output=True, text=True, timeout=600)
     assert done.returncode == 0, done.stderr[-3000:]
     runs = json.loads(done.stdout.splitlines()[-1])
     assert runs["fast"]["misses"] == 0 and runs["fast"]["hits"] >= 1
