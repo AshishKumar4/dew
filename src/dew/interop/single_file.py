@@ -46,7 +46,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 from dew.cache import dew_cache_dir
-from dew.files import staged
+from dew.files import staged, stat_identity
 from dew.interop import sources
 from dew.interop.pickles import host_view
 from dew.interop.safetensors_io import WEIGHT_STEMS, folder_weights, read_file, write_file
@@ -204,8 +204,7 @@ def _key(path: Path, configs: str) -> str:
     diffusers whose key maps convert it."""
     import diffusers
 
-    status = path.stat()
-    identity = f"{path.resolve()}\0{status.st_size}\0{status.st_mtime_ns}\0{configs}\0{diffusers.__version__}"
+    identity = "\0".join(map(str, (*stat_identity(path), configs, diffusers.__version__)))
     return hashlib.sha256(identity.encode()).hexdigest()[:24]
 
 
@@ -261,8 +260,8 @@ def unpacked(path: str | os.PathLike[str], configs: Path | None = None,
         for file in metadata:
             digest.update(f"{file.relative_to(configs).as_posix()}\0".encode() + file.read_bytes())
         for file in sorted(configs.glob("*/*.safetensors*")):
-            status = file.stat()
-            digest.update(f"{file.relative_to(configs).as_posix()}\0{status.st_size}\0{status.st_mtime_ns}\0".encode())
+            _, size, modified = stat_identity(file)
+            digest.update(f"{file.relative_to(configs).as_posix()}\0{size}\0{modified}\0".encode())
         origin = f"{configs.resolve()}#{digest.hexdigest()}"
     target = Path(dew_cache_dir()) / "single_file" / _key(source, origin)
     if (target / "model_index.json").is_file():

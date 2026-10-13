@@ -12,7 +12,7 @@ sandwich; the model files arrange blocks.
 import inspect
 import math
 from collections.abc import Sequence
-from typing import Literal, Self, TypedDict, Unpack, get_args
+from typing import TYPE_CHECKING, Literal, Self, TypedDict, Unpack, get_args
 
 import jax
 import jax.numpy as jnp
@@ -411,6 +411,29 @@ def restored_remat(remat: RematChoice, record: JSON) -> RematChoice | None:
     return None if here is None or there is None or there <= here else DIFFUSION_REMAT[there]
 
 
+class RematLadder(nn.Module):
+    """A diffusion stack's own climb of the remat ladder (`Recomputing`): its `remat` field, one
+    `DIFFUSION_REMAT` rung at a time, and the rung a record restores. Whatever the stack's geometry,
+    the climb reads that one field, which each stack declares where its own fields sit."""
+
+    if TYPE_CHECKING:
+        remat: RematChoice
+
+    @nn.nowrap
+    def recompute_record(self) -> JSON:
+        return self.remat
+
+    @nn.nowrap
+    def recompute_more(self) -> Self | None:
+        stronger = stronger_remat(self.remat)
+        return None if stronger is None else self.clone(remat=stronger)
+
+    @nn.nowrap
+    def restore_recompute(self, record: JSON) -> Self:
+        restored = restored_remat(self.remat, record)
+        return self if restored is None else self.clone(remat=restored)
+
+
 def remat_block(block_cls, enabled: RematChoice, policy: str | None = 'dots'):
     """Optionally rematerialize a block class under `saved_through_remat`.
 
@@ -495,7 +518,7 @@ class _AttentionStackOptions(_TransformerOptions, kw_only=True):
         return {**super()._block_options(), 'dropout_rate': self.dropout_rate, 'qk_norm': self.qk_norm}
 
 
-class _DiTStackOptions(_AttentionStackOptions):
+class _DiTStackOptions(RematLadder, _AttentionStackOptions):
     output_channels: int = 3
     patch_size: int = 16
     emb_features: int = 768
@@ -503,20 +526,6 @@ class _DiTStackOptions(_AttentionStackOptions):
     num_heads: int = 12
     remat: RematChoice = False
     scan_order: ScanOrder = 'raster'
-
-    @nn.nowrap
-    def recompute_record(self) -> JSON:
-        return self.remat
-
-    @nn.nowrap
-    def recompute_more(self) -> Self | None:
-        stronger = stronger_remat(self.remat)
-        return None if stronger is None else self.clone(remat=stronger)
-
-    @nn.nowrap
-    def restore_recompute(self, record: JSON) -> Self:
-        restored = restored_remat(self.remat, record)
-        return self if restored is None else self.clone(remat=restored)
 
 
 class _TokenStackOptions(_AttentionBlockOptions):

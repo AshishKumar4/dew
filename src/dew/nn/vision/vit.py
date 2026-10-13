@@ -103,7 +103,8 @@ def _interp_taps(index, size, side: int, align_corners: bool):
         source = (index + 0.5) * side / size - 0.5
     floor = jnp.floor(source)
     raw = floor.astype(jnp.int32)[..., None] + jnp.arange(2)
-    weights = jnp.clip(1 - jnp.abs(source[..., None] - floor[..., None] - jnp.arange(2)), min=0)
+    distance = (source - floor)[..., None]
+    weights = jnp.concatenate([1 - distance, distance], axis=-1).clip(min=0)
     if not align_corners:
         weights = weights * ((raw >= 0) & (raw <= side - 1))
     return jnp.clip(raw, 0, side - 1), weights
