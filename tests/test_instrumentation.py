@@ -196,6 +196,30 @@ def test_compiled_flops_matches_the_transformer_flop_formula():
     assert trainer.flops_per_step * jax.device_count() == pytest.approx(analytic, rel=0.05)
 
 
+@pytest.mark.gpu("cuDNN's fused attention runs on a CUDA GPU alone")
+@pytest.mark.mesh(devices=1)
+@pytest.mark.parametrize("window", [None, 64])
+def test_a_fused_attention_counts_the_pairs_its_mask_computes(window):
+    """A causal kernel computes about half the scores, a sliding window fewer: the forward's two
+    products and the backward's four count one multiply-add per pair it reaches, head and width.
+    On an H100 FlashAttention-3 counted the whole square of a causal call, twice its work."""
+    batch, length, heads, width = 1, 256, 2, 128
+    shape = jax.ShapeDtypeStruct((batch, length, heads, width), jnp.bfloat16)
+    spans = {} if window is None else {"local_window_size": (window, 0)}
+
+    def attend(q, k, v):
+        return jax.nn.dot_product_attention(q, k, v, implementation="cudnn", is_causal=True, **spans)
+
+    def loss(q, k, v):
+        return attend(q, k, v).astype(jnp.float32).sum()
+
+    pairs = sum(min(row, length if window is None else window) + 1 for row in range(length))
+    forward = compiled_flops(jax.jit(attend).lower(shape, shape, shape).compile())
+    both = compiled_flops(jax.jit(jax.grad(loss, argnums=(0, 1, 2))).lower(shape, shape, shape).compile())
+    assert forward == 2 * 2 * batch * heads * pairs * width
+    assert both == (2 + 4) * 2 * batch * heads * pairs * width
+
+
 def test_compiled_flops_counts_every_iteration_of_a_scanned_body():
     """A scanned stack runs its body once per iteration. The count has to be
     the run's, not the body's: cost analysis reports the body's."""
