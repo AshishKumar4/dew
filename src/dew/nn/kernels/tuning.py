@@ -174,8 +174,9 @@ class KernelOp(tokamax.Op):
                 return None
             if any(stored[name] != key[name] for name in key if name not in rows):
                 return None
-            if any((stored[name].shape[1:], stored[name].dtype) != (key[name].shape[1:], key[name].dtype)
-                   for name in rows):
+            # A launch without one of the token-counted operands (a norm with no branch) is another launch.
+            if any(stored[name] is None or (stored[name].shape[1:], stored[name].dtype)
+                   != (key[name].shape[1:], key[name].dtype) for name in rows):
                 return None
             return sum(abs(stored[name].shape[0].bit_length() - key[name].shape[0].bit_length())
                        for name in rows)
