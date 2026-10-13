@@ -21,7 +21,6 @@ from dew.config import OptimConfig
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.dit import SimpleDiT
 from dew.training import MeshSpec
-from dew.training.trainer import learning_rate
 from dew.training.optim import (
     OPTIMIZER_MAP,
     Cosine,
@@ -37,6 +36,7 @@ from dew.training.optim import (
     scaled,
     weight_decay_mask,
 )
+from dew.training.trainer import learning_rate
 from tools.muonclip_reference import clip_qk_kernel, clip_scale
 
 LR = 1e-3
@@ -693,7 +693,8 @@ def test_every_optimizer_the_config_names_is_built():
     ("muon", Power(peak=2e-2, warmup_steps=2, a=4e-2, tail=PowerTail(start=4, end=1e-3))),
     ("muonclip", OneCycle(peak=1e-2)),
     ("adamw", None),
-], ids=["lamb-cosine", "adam-linear", "adamw-exponential", "muon-power", "muonclip-one_cycle", "adamw-constant"])
+], ids=["lamb-cosine", "adam-linear", "adamw-exponential", "muon-power", "muonclip-one_cycle",
+        "adamw-constant"])
 def test_a_configured_optimizer_is_optaxs_own_at_the_rate_its_state_holds(optimizer, schedule):
     """`OptimConfig` runs the optax optimizer it names (`OPTIMIZER_MAP`)
     behind the global-norm clip, its betas and `optimizer_opts` reaching
@@ -722,8 +723,9 @@ def test_a_configured_optimizer_is_optaxs_own_at_the_rate_its_state_holds(optimi
         expected, expected_state = reference.update(grads, expected_state, params)
         for have, want in zip(jax.tree.leaves(updates), jax.tree.leaves(expected), strict=True):
             np.testing.assert_array_equal(np.asarray(have), np.asarray(want))
-        with jax.enable_x64(True):
+        with jax.enable_x64(new_val=True):
             # optax counts in int32, which divides to float32: a float64 count keeps the schedule float64.
-            exact = scale if schedule is None else float(schedule.schedule(10)(jnp.asarray(step, jnp.float64)))
+            exact = scale if schedule is None else float(
+                schedule.schedule(10)(jnp.asarray(step, jnp.float64)))
         assert abs(float(learning_rate(state)) - exact) <= 2.4e-7 * (abs(exact) + scale)
         params = optax.apply_updates(params, updates)
