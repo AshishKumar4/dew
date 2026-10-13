@@ -4,10 +4,10 @@ from __future__ import annotations
 import dataclasses
 import math
 import types
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from typing import Literal
 
-from dew.objectives.base import Metric, TrainingScalar
+from dew.objectives.base import Metric, Shown, TrainingScalar
 
 
 @dataclasses.dataclass(frozen=True, init=False)
@@ -48,3 +48,43 @@ class Best:
         for field, value in (('metric', name), ('top', top), ('mode', mode), ('threshold', threshold),
                              ('weights_only', weights_only), ('split', split), ('_source', source)):
             object.__setattr__(self, field, value)
+
+    def resolved(self, metrics: Sequence[Metric], shown: Mapping[str, Shown],
+                 splits: Sequence[str] = ("val",)) -> Best:
+        """This selection bound to the metric it names among `metrics`, with its direction from how
+        that metric is `shown` where it names none, and the split it ranks: `train` for a training
+        scalar, else the one of `splits` it names or the only one."""
+        selection = self
+        metric = selection._source
+        if metric is None:
+            name = selection.metric.removeprefix((selection.split or 'val') + '/')
+            metric = next((declared for declared in metrics if declared.name == name), None)
+            if metric is None:
+                raise ValueError(f"best metric {selection.metric!r} is not among fit's metrics")
+            selection = dataclasses.replace(selection, _source=metric)
+        if isinstance(metric, TrainingScalar):
+            if selection.mode is None:
+                if metric.shown.better is None:
+                    raise ValueError("training scalar has no declared direction; use Best(scalar, mode=...)")
+                selection = dataclasses.replace(
+                    selection, mode="max" if metric.shown.better == "higher" else "min"
+                )
+            return dataclasses.replace(selection, split='train')
+        if isinstance(metric, Metric):
+            if not any(metric is declared for declared in metrics):
+                raise ValueError("best must be a metric object passed in metrics")
+            declared = shown.get(metric.name)
+            better = None if declared is None else declared.better
+            if selection.mode is None:
+                if better not in ('higher', 'lower'):
+                    raise ValueError(
+                        "best metric has no declared direction; use Best(metric, mode='min' or 'max')"
+                    )
+                selection = dataclasses.replace(selection, mode='max' if better == 'higher' else 'min')
+        if selection.split is None:
+            if len(splits) != 1 and isinstance(metric, Metric):
+                raise ValueError("Best(metric, split=...) is required with several validation splits")
+            selection = dataclasses.replace(selection, split=splits[0] if len(splits) == 1 else None)
+        elif selection.split not in splits:
+            raise ValueError(f"unknown validation split {selection.split!r}")
+        return selection

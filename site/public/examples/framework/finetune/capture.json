@@ -1,19 +1,19 @@
 {
 	"about": "The screen finetune.py left on a terminal, written by site/scripts/capture_snippets.py.",
 	"arguments": [],
-	"script_sha256": "e6b615e4e1c91d55eddee8b252cf55cffb10d6c6849e3d21f3fe9e7608309819",
+	"script_sha256": "60be3c41c5916e3dc9d529a7c0e43123507eb0eafe8c12f026a63f7a4d164099",
 	"meta": {
 		"where": "a 4-vCPU Cloudflare container",
 		"python": "3.12.15",
 		"jax": "0.11.2.post3",
 		"flax": "0.12.10",
 		"optax": "0.2.8",
-		"dew": "898a4ec7f2af4f4ee3b51c1842d43070e4a957e4",
-		"date": "2026-10-08"
+		"dew": "e3ef9db5370cf236b0175e092b94d2a4caccfc29",
+		"date": "2026-10-12"
 	},
 	"hero": {
 		"returncode": 0,
-		"seconds": 91.4,
+		"seconds": 211.6,
 		"columns": 96,
 		"screen": [
 			[
@@ -128,14 +128,14 @@
 					"dim": true
 				},
 				{
-					"text": "  100%  1.4"
+					"text": "  100%  1.5"
 				},
 				{
-					"text": " step/s",
+					"text": " s/step",
 					"dim": true
 				},
 				{
-					"text": "  0:00:28 "
+					"text": "  0:01:12 "
 				},
 				{
 					"text": "\u2502",
@@ -185,21 +185,21 @@
 					"text": " "
 				},
 				{
-					"text": "  loss           ",
+					"text": "  loss                  ",
 					"dim": true
 				},
 				{
 					"text": "  "
 				},
 				{
-					"text": "     4.947",
+					"text": "     4.752",
 					"bold": true
 				},
 				{
 					"text": "  "
 				},
 				{
-					"text": "\u2587",
+					"text": "\u2588",
 					"fg": "00afd7"
 				},
 				{
@@ -214,11 +214,11 @@
 					"text": "  "
 				},
 				{
-					"text": "   \u2191 7.2%",
+					"text": "   \u2191 1.2%",
 					"fg": "d75f5f"
 				},
 				{
-					"text": "                                               "
+					"text": "                                        "
 				},
 				{
 					"text": "\u2502",
@@ -234,21 +234,21 @@
 					"text": " "
 				},
 				{
-					"text": "  ce             ",
+					"text": "  ce                    ",
 					"dim": true
 				},
 				{
 					"text": "  "
 				},
 				{
-					"text": "     4.947",
+					"text": "     4.752",
 					"bold": true
 				},
 				{
 					"text": "  "
 				},
 				{
-					"text": "\u2587",
+					"text": "\u2588",
 					"fg": "00afd7"
 				},
 				{
@@ -263,11 +263,11 @@
 					"text": "  "
 				},
 				{
-					"text": "   \u2191 7.2%",
+					"text": "   \u2191 1.2%",
 					"fg": "d75f5f"
 				},
 				{
-					"text": "                                               "
+					"text": "                                        "
 				},
 				{
 					"text": "\u2502",
@@ -283,25 +283,25 @@
 					"text": " "
 				},
 				{
-					"text": "  perplexity     ",
+					"text": "  perplexity            ",
 					"dim": true
 				},
 				{
 					"text": "  "
 				},
 				{
-					"text": "     140.7",
+					"text": "     115.8",
 					"bold": true
 				},
 				{
 					"text": "  "
 				},
 				{
-					"text": "\u2587",
+					"text": "\u2588",
 					"fg": "00afd7"
 				},
 				{
-					"text": "\u2586\u2581",
+					"text": "\u2587\u2581",
 					"fg": "5f87d7"
 				},
 				{
@@ -312,11 +312,11 @@
 					"text": "  "
 				},
 				{
-					"text": "    \u2191 39%",
+					"text": "   \u2191 6.0%",
 					"fg": "d75f5f"
 				},
 				{
-					"text": "                                               "
+					"text": "                                        "
 				},
 				{
 					"text": "\u2502",
@@ -332,21 +332,21 @@
 					"text": " "
 				},
 				{
-					"text": "  token_accuracy ",
+					"text": "  token_accuracy        ",
 					"dim": true
 				},
 				{
 					"text": "  "
 				},
 				{
-					"text": "     25.0%",
+					"text": "     26.6%",
 					"bold": true
 				},
 				{
 					"text": "  "
 				},
 				{
-					"text": "\u2582",
+					"text": "\u2584",
 					"fg": "00afd7"
 				},
 				{
@@ -354,18 +354,162 @@
 					"fg": "5f87d7"
 				},
 				{
-					"text": "\u2582",
+					"text": "\u2584",
 					"fg": "875fd7"
 				},
 				{
 					"text": "  "
 				},
 				{
-					"text": " \u2191 1.6 pt",
-					"fg": "5faf5f"
+					"text": "        \u2192",
+					"dim": true
 				},
 				{
-					"text": "                                               "
+					"text": "                                        "
+				},
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "  data_wait_ms          ",
+					"dim": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "     1.094",
+					"bold": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "\u2582",
+					"fg": "00afd7"
+				},
+				{
+					"text": "\u2588\u2581",
+					"fg": "5f87d7"
+				},
+				{
+					"text": "\u2588",
+					"fg": "875fd7"
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "   \u2191 762%",
+					"dim": true
+				},
+				{
+					"text": "                                        "
+				},
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "  grad_norm             ",
+					"dim": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "     9.449",
+					"bold": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "\u2588",
+					"fg": "00afd7"
+				},
+				{
+					"text": "\u2581\u2581",
+					"fg": "5f87d7"
+				},
+				{
+					"text": "\u2581",
+					"fg": "875fd7"
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "    \u2193 52%",
+					"dim": true
+				},
+				{
+					"text": "                                        "
+				},
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				},
+				{
+					"text": "   "
+				},
+				{
+					"text": "compiles ",
+					"dim": true
+				},
+				{
+					"text": "1.000",
+					"bold": true
+				},
+				{
+					"text": "   "
+				},
+				{
+					"text": "cache_hits ",
+					"dim": true
+				},
+				{
+					"text": "0",
+					"bold": true
+				},
+				{
+					"text": "   "
+				},
+				{
+					"text": "cache_misses ",
+					"dim": true
+				},
+				{
+					"text": "0",
+					"bold": true
+				},
+				{
+					"text": "                                             "
 				},
 				{
 					"text": "\u2502",
@@ -402,14 +546,14 @@
 					"text": " "
 				},
 				{
-					"text": "  step_time_ms   ",
+					"text": "  step_time_ms          ",
 					"dim": true
 				},
 				{
 					"text": "  "
 				},
 				{
-					"text": "     661.0",
+					"text": "     1,588",
 					"bold": true
 				},
 				{
@@ -420,7 +564,7 @@
 					"fg": "00afd7"
 				},
 				{
-					"text": "\u2582\u2581",
+					"text": "\u2581\u2581",
 					"fg": "5f87d7"
 				},
 				{
@@ -431,11 +575,11 @@
 					"text": "  "
 				},
 				{
-					"text": "    \u2193 24%",
+					"text": "    \u2193 21%",
 					"fg": "5faf5f"
 				},
 				{
-					"text": "                                               "
+					"text": "                                        "
 				},
 				{
 					"text": "\u2502",
@@ -451,14 +595,14 @@
 					"text": " "
 				},
 				{
-					"text": "  samples_per_sec",
+					"text": "  samples_per_sec       ",
 					"dim": true
 				},
 				{
 					"text": "  "
 				},
 				{
-					"text": "     1.513",
+					"text": "    0.6298",
 					"bold": true
 				},
 				{
@@ -469,7 +613,7 @@
 					"fg": "00afd7"
 				},
 				{
-					"text": "\u2587\u2588",
+					"text": "\u2588\u2588",
 					"fg": "5f87d7"
 				},
 				{
@@ -480,11 +624,84 @@
 					"text": "  "
 				},
 				{
-					"text": "    \u2191 31%",
+					"text": "    \u2191 26%",
 					"fg": "5faf5f"
 				},
 				{
-					"text": "                                               "
+					"text": "                                        "
+				},
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "  tokens_per_s          ",
+					"dim": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "     40.31",
+					"bold": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "\u2581",
+					"fg": "00afd7"
+				},
+				{
+					"text": "\u2588\u2588",
+					"fg": "5f87d7"
+				},
+				{
+					"text": "\u2587",
+					"fg": "875fd7"
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "    \u2191 26%",
+					"fg": "5faf5f"
+				},
+				{
+					"text": "                                        "
+				},
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				},
+				{
+					"text": "   "
+				},
+				{
+					"text": "tokens ",
+					"dim": true
+				},
+				{
+					"text": "64.00",
+					"bold": true
+				},
+				{
+					"text": "                                                                               "
 				},
 				{
 					"text": "\u2502",
@@ -529,7 +746,187 @@
 					"bold": true
 				},
 				{
-					"text": "                                                                            "
+					"text": "   "
+				},
+				{
+					"text": "learning_rate ",
+					"dim": true
+				},
+				{
+					"text": "1.000e-04",
+					"bold": true
+				},
+				{
+					"text": "                                                  "
+				},
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "data                                                                                        ",
+					"fg": "875fd7",
+					"bold": true
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				},
+				{
+					"text": "   "
+				},
+				{
+					"text": "attempted/hf:winglian/tiny-shakespeare@619106eee01474d8eaa5dd400b4b405eb3734ebe:None:train",
+					"dim": true
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "472.0",
+					"bold": true
+				},
+				{
+					"text": "                                                                                        "
+				},
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "accepted/hf:winglian/tiny-shakespeare@619106eee01474d8eaa5dd400b4b405eb3734ebe:None:train ",
+					"dim": true
+				},
+				{
+					"text": "   "
+				},
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "5,768",
+					"bold": true
+				},
+				{
+					"text": "                                                                                        "
+				},
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "truncated/hf:winglian/tiny-shakespeare@619106eee01474d8eaa5dd400b4b405eb3734ebe:None:train ",
+					"dim": true
+				},
+				{
+					"text": "0",
+					"bold": true
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "chunks_per_record/hf:winglian/tiny-shakespeare@619106eee01474d8eaa5dd400b4b405eb3734ebe:None",
+					"dim": true
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": ":train ",
+					"dim": true
+				},
+				{
+					"text": "0",
+					"bold": true
+				},
+				{
+					"text": "                                                                                     "
 				},
 				{
 					"text": "\u2502",
@@ -587,7 +984,7 @@
 					"dim": true
 				},
 				{
-					"text": "20 steps in 0:00:30             "
+					"text": "20 steps in 0:01:15             "
 				},
 				{
 					"text": "\u2502",
@@ -607,7 +1004,7 @@
 					"dim": true
 				},
 				{
-					"text": "after 17.09 s                   "
+					"text": "after 45.08 s                   "
 				},
 				{
 					"text": "\u2502",
@@ -627,7 +1024,7 @@
 					"dim": true
 				},
 				{
-					"text": "1.5 step/s                      "
+					"text": "0.6 step/s                      "
 				},
 				{
 					"text": "\u2502",
@@ -647,7 +1044,7 @@
 					"dim": true
 				},
 				{
-					"text": "42.1% of the wall time in steps "
+					"text": "39.8% of the wall time in steps "
 				},
 				{
 					"text": "\u2502",
@@ -667,7 +1064,7 @@
 					"dim": true
 				},
 				{
-					"text": "4.947                          ",
+					"text": "4.752                          ",
 					"bold": true
 				},
 				{
@@ -714,13 +1111,13 @@
 			[],
 			[
 				{
-					"text": "MESSELYNE:"
+					"text": "MESSEL:"
 				}
 			],
 			[],
 			[
 				{
-					"text": "What is it,"
+					"text": "What is it, my lord"
 				}
 			]
 		]
