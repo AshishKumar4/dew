@@ -164,6 +164,28 @@ def test_a_later_run_starts_its_search_at_the_plan_an_earlier_one_recorded(monke
     assert counted == [] and again.step_flops == first.step_flops
 
 
+@pytest.mark.gpu("a step's Pallas launches are read from a lowering of their own on a CUDA GPU alone")
+def test_a_recorded_plan_settles_its_kernel_launches_without_lowering_the_step_for_them():
+    """A step's kernel launches are read from a lowering of its own (`tune`) and recorded with
+    its plan, so a later run settles their configs from the record and lowers the step once."""
+    lowered = []
+
+    def lowering(event, seconds, *, fun_name=None, **_):
+        if event == "/jax/core/compile/jaxpr_to_mlir_module_duration" and fun_name == "jit_step":
+            lowered.append(seconds)
+
+    counts = []
+    jax.monitoring.register_event_duration_secs_listener(lowering)
+    try:
+        for _ in range(2):
+            trained(lm(), steps=0)
+            counts.append(len(lowered))
+            lowered.clear()
+    finally:
+        jax.monitoring.unregister_event_duration_listener(lowering)
+    assert counts == [2, 1]
+
+
 def test_a_pinned_split_is_read_as_given_and_its_state_holds_it():
     """`split` fixes the microbatches; the window pools `split` x
     `accumulation` of them, one update every `accumulation` steps, and the

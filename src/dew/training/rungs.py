@@ -122,15 +122,27 @@ def recorded_rung(modules: Sequence[object], arguments: tuple[TrainState, Batch]
     return path, key, json_value(stored.get('rung'), f"rung record {path}")
 
 
+FACTS = ('flops', 'launches')
+"""What a record holds of its plan's program besides the plan: a
+microbatch's FLOPs (`plan_flops`) and its kernel launches (`tune`)."""
+
+
+def recorded_fact(recorded: JSON, plan: Mapping[str, JSON], name: str) -> JSON:
+    """The record's `name` (`FACTS`) of the program `plan` compiles, where
+    `plan` is the `recorded` one, else None."""
+    kept = dict(record(recorded, 'recorded plan')) if recorded is not None else {}
+    facts = {fact: kept.pop(fact, None) for fact in FACTS}
+    return facts[name] if kept == plan else None
+
+
 def plan_flops(recorded: JSON, chosen: Mapping[str, JSON], compiled: bool,
                executable: jax.stages.Compiled) -> StepFlops | None:
     """A microbatch's FLOPs in the `chosen` plan: those its record holds, where
     the plan is the `recorded` one and the search `compiled` nothing (every
     program came from the persistent cache), else counted from its
     `executable` (`step_flops`), which reads the module's text."""
-    kept = dict(record(recorded, 'recorded plan')) if recorded is not None else {}
-    counted = kept.pop('flops', None)
-    if not compiled and kept == chosen and isinstance(counted, list):
+    counted = recorded_fact(recorded, chosen, 'flops')
+    if not compiled and isinstance(counted, list):
         return StepFlops(*counted)
     return step_flops(executable)
 
