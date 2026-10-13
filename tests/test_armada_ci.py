@@ -2,6 +2,7 @@
 
 import importlib.util
 import json
+import re
 import sys
 import time
 import xml.etree.ElementTree as ET
@@ -190,7 +191,9 @@ def test_a_tasks_rows_share_its_wall_time_by_their_tests_times(ci, tmp_path):
 
 def test_a_task_reuses_a_green_row_only_on_the_cpu_class_and_inputs_it_ran_on(ci, tmp_path, monkeypatch):
     """A file that ran green is reused by a later task on the same CPU class while its inputs are
-    unchanged; a task on another class, or after its inputs change, runs it again."""
+    unchanged; a task on another class, after its inputs change, or planned with DEW_TEST_CACHE=off
+    (the daily full run) runs it again. Each task runs as armada starts it: .armada.json's command
+    filled from its plan entry."""
     (tmp_path / "tests/test_counted.py").write_text(
         "from pathlib import Path\n"
         "def test_ok():\n"
@@ -209,12 +212,19 @@ def test_a_task_reuses_a_green_row_only_on_the_cpu_class_and_inputs_it_ran_on(ci
     monkeypatch.setattr(ci, "cache_request", cache_request)
     monkeypatch.setenv("DEW_XLA_CACHE_URL", "https://cache.invalid")
     monkeypatch.setenv("DEW_XLA_CACHE_TOKEN", "token")
-    monkeypatch.delenv("DEW_TEST_CACHE", raising=False)
     out = tmp_path / "verdict.json"
+    command = json.loads((ROOT / ".armada.json").read_text())["task"]["command"]
 
-    def run(cpu):
+    def run(cpu, policy="on"):
         monkeypatch.setattr(ci, "cpu_class", lambda: cpu)
-        ci.task("3.12", ["tests/test_counted.py"], "", out, 60.0)
+        monkeypatch.setenv("DEW_TEST_CACHE", policy)
+        [entry] = [entry for entry in ci.plan(300.0, {}) if entry["python"] == "3.12"]
+        values = {**entry, "out": out}
+        filled = [re.sub(r"\{(\w+)\}", lambda field: str(values[field[1]]), word) for word in command]
+        monkeypatch.setattr(sys, "argv", ["ci.py", *filled[2:]])
+        # A task's environment is .armada.json's, which the plan's DEW_TEST_CACHE is not part of.
+        monkeypatch.delenv("DEW_TEST_CACHE")
+        assert ci.main() == 0
         [only] = json.loads(out.read_text())["rows"]
         assert only["exitCode"] == 0
         return len((tmp_path / "runs").read_text())
@@ -223,9 +233,10 @@ def test_a_task_reuses_a_green_row_only_on_the_cpu_class_and_inputs_it_ran_on(ci
     assert run("GenuineIntel-6-143") == 1
     assert run("AuthenticAMD-25-1") == 2
     assert run("AuthenticAMD-25-1") == 2
+    assert run("AuthenticAMD-25-1", policy="off") == 3
     (tmp_path / "tests/test_counted.py").write_text(
         (tmp_path / "tests/test_counted.py").read_text() + "def test_more(): pass\n")
-    assert run("GenuineIntel-6-143") == 3
+    assert run("GenuineIntel-6-143") == 4
 
 
 def test_a_task_past_its_deadline_is_interrupted_and_every_row_it_holds_is_red(ci, tmp_path):
