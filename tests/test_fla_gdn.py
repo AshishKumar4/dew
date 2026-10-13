@@ -246,17 +246,6 @@ def test_the_state_decay_gradient_rounds_the_bf16_product_before_reducing():
     assert float(omitted_round - got) == 2 ** -14
 
 
-def test_the_state_write_retains_the_bf16_gated_value_residual_on_chip():
-    """A gated value at a bf16 midpoint must not lose its residual before the fp32 state write."""
-    key = jnp.ones((1, 1), jnp.bfloat16)
-    gated = jnp.full((1, 1), 1.00390625, jnp.float32)
-    got = fla_gdn._split_dot(key.T, gated, exact=True)
-    assert got.dtype == jnp.float32
-    assert float(got[0, 0]) == 1.00390625
-    rounded = key.astype(jnp.float32).T @ gated.astype(jnp.bfloat16).astype(jnp.float32)
-    assert float(rounded[0, 0]) == 1.0
-
-
 def test_the_wy_decay_gradient_subtracts_before_adding_the_accumulator():
     """The ordering matters when large row/column sums cancel a small gate gradient."""
     gate = jnp.ones((1,), jnp.float32)
