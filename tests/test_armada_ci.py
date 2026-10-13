@@ -105,6 +105,12 @@ def test_a_task_rows_each_file_red_where_ci_would_fail(ci, tmp_path):
                                                                "tests/test_pass.py::test_skip"}
     assert ci.node_of(ET.Element("testcase", classname="tests.test_split.TestB", name="test_b")) == \
         "tests/test_split.py::TestB::test_b"
+    # A process that dies after its report is written leaves every row it ran red, green cases included.
+    (tmp_path / "tests/test_dies.py").write_text("import atexit, os\natexit.register(lambda: os._exit(3))\n"
+                                                 "def test_ok(): pass\n")
+    ci.task("3.12", ["tests/test_pass.py", "tests/test_dies.py"], "", out, 600.0)
+    assert {row["name"]: row["exitCode"] for row in json.loads(out.read_text())["rows"]} == {
+        "3.12:tests/test_pass.py": 1, "3.12:tests/test_dies.py": 1}
 
 
 def test_a_split_files_groups_run_every_test_once(ci, tmp_path):
