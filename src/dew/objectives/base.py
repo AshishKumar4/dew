@@ -111,10 +111,11 @@ Effects = TypeVar("Effects", default=None)
 class Step:
     """What the trainer tells an objective about the current step.
 
-    `step` is the count of accepted microbatches, which is what an
-    objective's own schedules index by. `key` is new for every attempt at a
-    microbatch, and a replayed microbatch gets the key of the attempt that
-    first read it, so it draws the same randomness.
+    `step` is the count of accepted microbatches over the microbatches each
+    step's batch is read in (`Trainer.compile`), which is what an objective's
+    own schedules index by, however the trainer splits its batches. `key` is
+    new for every attempt at a microbatch, and a replayed microbatch gets the
+    key of the attempt that first read it, so it draws the same randomness.
     """
     step: jax.Array
     key: jax.Array
