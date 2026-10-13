@@ -100,6 +100,8 @@ inputs, which .armada.json names (`environment_files`)."""
 def environment_files() -> list[str]:
     """The files .armada.json builds the tasks' environments from: each environment's setup and
     install scripts and its snapshot key's files. A shell script runs no Python a record could see."""
+    if not Path(".armada.json").is_file():  # a project armada does not run, as the CI tool's tests make
+        return []
     config = json.loads(Path(".armada.json").read_text())
     environments = [config["environment"], *config.get("environments", {}).values()]
     return sorted({name for environment in environments
