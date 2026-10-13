@@ -250,7 +250,8 @@ class ChunkCumsum(_Launch):
     NAME = "chunk_cumsum"
     SPANS = (("dt", 2), None, None)
 
-    def _fwd(self, dt, A, *, chunk: int, interpret: bool, config: Tiles, return_residuals: bool = False):
+    def _fwd(self, dt: jax.Array, A: jax.Array, *, chunk: int, interpret: bool, config: Tiles,
+             return_residuals: bool = False):
         batch, length, heads = dt.shape
         padded = -(-length // chunk) * chunk
         bh = config.bm
@@ -291,8 +292,8 @@ class ChunkCumsumBwd(_Launch):
     NAME = "chunk_cumsum_bwd"
     SPANS = (("dt", 2), None, None)
 
-    def _fwd(self, dacs, ddt, dt, A, *, chunk: int, interpret: bool, config: Tiles,
-             return_residuals: bool = False):
+    def _fwd(self, dacs: jax.Array, ddt: jax.Array, dt: jax.Array, A: jax.Array, *, chunk: int,
+             interpret: bool, config: Tiles, return_residuals: bool = False):
         batch, length, heads = dt.shape
         padded = dacs.shape[-1]
         bh = config.bm
@@ -343,8 +344,8 @@ class ChunkState(_Launch):
     NAME = "chunk_state"
     SPANS = (("x", 3), ("b", 3), "chunk")
 
-    def _fwd(self, x, b, dt, da, seq, *, chunk: int, groups: int, interpret: bool, config: Tiles,
-             return_residuals: bool = False):
+    def _fwd(self, x: jax.Array, b: jax.Array, dt: jax.Array, da: jax.Array, seq: jax.Array | None, *,
+             chunk: int, groups: int, interpret: bool, config: Tiles, return_residuals: bool = False):
         batch, length, heads, width = x.shape
         state = b.shape[-1]
         padded = dt.shape[-1]
@@ -401,8 +402,8 @@ class StatePassing(_Launch):
     NAME = "state_passing"
     SPANS = ("state", None, None)
 
-    def _fwd(self, states, da, h0, seq, *, chunk: int, dtype: str, interpret: bool, config: Tiles,
-             return_residuals: bool = False):
+    def _fwd(self, states: jax.Array, da: jax.Array, h0: jax.Array, seq: jax.Array | None, *, chunk: int,
+             dtype: str, interpret: bool, config: Tiles, return_residuals: bool = False):
         batch, chunks, heads, flat = states.shape
         padded = da.shape[-1]
         size = config.bm
@@ -453,8 +454,8 @@ class BmmChunk(_Launch):
     NAME = "bmm_chunk"
     SPANS = ("chunk", "chunk", ("a", 3))
 
-    def _fwd(self, a, b, seq, *, chunk: int, padded: int, interpret: bool, config: Tiles,
-             return_residuals: bool = False):
+    def _fwd(self, a: jax.Array, b: jax.Array, seq: jax.Array | None, *, chunk: int, padded: int,
+             interpret: bool, config: Tiles, return_residuals: bool = False):
         batch, length, groups, state = a.shape
         chunks = padded // chunk
         bm, bn = config.bm, config.bn
@@ -526,7 +527,8 @@ class ChunkScan(_Launch):
     NAME = "chunk_scan"
     SPANS = ("chunk", ("x", 3), "chunk")
 
-    def _fwd(self, cb, x, dt, da, c, states, d, seq, *, chunk: int, interpret: bool, config: Tiles,
+    def _fwd(self, cb: jax.Array, x: jax.Array, dt: jax.Array, da: jax.Array, c: jax.Array, states: jax.Array,
+             d: jax.Array, seq: jax.Array | None, *, chunk: int, interpret: bool, config: Tiles,
              return_residuals: bool = False):
         batch, length, heads, width = x.shape
         groups, state = c.shape[2:]
@@ -589,8 +591,8 @@ class ChunkScanBwdDstates(_Launch):
     NAME = "chunk_scan_bwd_dstates"
     SPANS = (("dout", 3), ("c", 3), "chunk")
 
-    def _fwd(self, dout, c, da, seq, *, chunk: int, interpret: bool, config: Tiles,
-             return_residuals: bool = False):
+    def _fwd(self, dout: jax.Array, c: jax.Array, da: jax.Array, seq: jax.Array | None, *, chunk: int,
+             interpret: bool, config: Tiles, return_residuals: bool = False):
         batch, length, heads, width = dout.shape
         groups, state = c.shape[2:]
         padded = da.shape[-1]
@@ -652,7 +654,8 @@ class StatePassingBwd(_Launch):
     NAME = "state_passing_bwd"
     SPANS = ("state", None, None)
 
-    def _fwd(self, dout, states, da, dfinal, seq, *, chunk: int, dtype: str, interpret: bool, config: Tiles,
+    def _fwd(self, dout: jax.Array, states: jax.Array, da: jax.Array, dfinal: jax.Array,
+             seq: jax.Array | None, *, chunk: int, dtype: str, interpret: bool, config: Tiles,
              return_residuals: bool = False):
         batch, chunks, heads, flat = states.shape
         padded = da.shape[-1]
@@ -729,8 +732,9 @@ class ChunkScanChunkStateBwdDx(_Launch):
     NAME = "chunk_scan_chunk_state_bwd_dx"
     SPANS = ("chunk", ("x", 3), "chunk")
 
-    def _fwd(self, x, cb, dout, dt, da, d, b, dstates, seq, *, chunk: int, interpret: bool, config: Tiles,
-             return_residuals: bool = False):
+    def _fwd(self, x: jax.Array, cb: jax.Array, dout: jax.Array, dt: jax.Array, da: jax.Array, d: jax.Array,
+             b: jax.Array, dstates: jax.Array, seq: jax.Array | None, *, chunk: int, interpret: bool,
+             config: Tiles, return_residuals: bool = False):
         batch, length, heads, width = x.shape
         groups, state = b.shape[2:]
         padded = dt.shape[-1]
@@ -815,7 +819,8 @@ class ChunkStateBwdDb(_Launch):
     NAME = "chunk_state_bwd_db"
     SPANS = ("chunk", ("b", 3), None)
 
-    def _fwd(self, x, dstates, b, dt, da, seq, *, chunk: int, groups: int, interpret: bool, config: Tiles,
+    def _fwd(self, x: jax.Array, dstates: jax.Array, b: jax.Array, dt: jax.Array, da: jax.Array,
+             seq: jax.Array | None, *, chunk: int, groups: int, interpret: bool, config: Tiles,
              return_residuals: bool = False):
         batch, length, heads, width = x.shape
         state = b.shape[-1]
@@ -889,8 +894,8 @@ class ChunkScanBwdDc(_Launch):
     HEADS = "dout"
     SPANS = ("chunk", ("c", 3), None)
 
-    def _fwd(self, dout, states, c, da, seq, *, chunk: int, groups: int, interpret: bool, config: Tiles,
-             return_residuals: bool = False):
+    def _fwd(self, dout: jax.Array, states: jax.Array, c: jax.Array, da: jax.Array, seq: jax.Array | None, *,
+             chunk: int, groups: int, interpret: bool, config: Tiles, return_residuals: bool = False):
         batch, length, heads, width = dout.shape
         state = c.shape[-1]
         padded = da.shape[-1]
@@ -966,8 +971,8 @@ class ChunkScanBwdDcb(_Launch):
     NAME = "chunk_scan_bwd_dcb"
     SPANS = ("chunk", "chunk", None)
 
-    def _fwd(self, x, dout, dt, da, seq, *, chunk: int, groups: int, interpret: bool, config: Tiles,
-             return_residuals: bool = False):
+    def _fwd(self, x: jax.Array, dout: jax.Array, dt: jax.Array, da: jax.Array, seq: jax.Array | None, *,
+             chunk: int, groups: int, interpret: bool, config: Tiles, return_residuals: bool = False):
         batch, length, heads, width = x.shape
         padded = dt.shape[-1]
         chunks = padded // chunk
@@ -1026,8 +1031,8 @@ class BmmChunkBwd(_Launch):
     NAME = "bmm_chunk_bwd"
     SPANS = ("chunk", ("a", 3), "chunk")
 
-    def _fwd(self, a, dout, residual, *, chunk: int, transposed: bool, interpret: bool, config: Tiles,
-             return_residuals: bool = False):
+    def _fwd(self, a: jax.Array, dout: jax.Array, residual: jax.Array, *, chunk: int, transposed: bool,
+             interpret: bool, config: Tiles, return_residuals: bool = False):
         batch, length, groups, state = a.shape
         chunks = dout.shape[1]
         bm, bn = config.bm, config.bn
@@ -1094,8 +1099,8 @@ class ChunkScanBwdDdacsStable(_Launch):
     NAME = "chunk_scan_bwd_ddacs_stable"
     SPANS = ("chunk", "chunk", None)
 
-    def _fwd(self, x, dout, dt, da, cb, *, chunk: int, interpret: bool, config: Tiles,
-             return_residuals: bool = False):
+    def _fwd(self, x: jax.Array, dout: jax.Array, dt: jax.Array, da: jax.Array, cb: jax.Array, *, chunk: int,
+             interpret: bool, config: Tiles, return_residuals: bool = False):
         batch, length, heads, width = x.shape
         groups = cb.shape[2]
         padded = dt.shape[-1]
