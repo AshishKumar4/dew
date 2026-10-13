@@ -6,13 +6,11 @@ block's output into its mirror in the second half.
 """
 
 from functools import partial
-from typing import Literal, Self
+from typing import Literal
 
 import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
-
-from dew.records import JSON
 
 from ..attention import LayerNorm
 from ..blocks import sinusoidal_time
@@ -22,10 +20,9 @@ from ..dit import (
     ModulatedBlock,
     PatchEmbedding,
     RematChoice,
+    RematLadder,
     _TransformerOptions,
     remat_block,
-    restored_remat,
-    stronger_remat,
 )
 from ..flops import MissingFlopsCount, matching_lengths, patch_lengths, projection_flops
 from ..precision import at_least_fp32
@@ -202,7 +199,7 @@ class UViT(_TransformerOptions):
         return self.final_layer(image) if self.conv else image
 
 
-class SimpleUDiT(_TransformerOptions):
+class SimpleUDiT(RematLadder, _TransformerOptions):
     """A U-shaped DiT: `SimpleDiT`'s adaLN-Zero blocks with the first half's
     outputs skipping into the second half through a dense layer over the
     concatenation. Position comes from RoPE over the sequence index, so a
@@ -252,20 +249,6 @@ class SimpleUDiT(_TransformerOptions):
                 + (self.num_layers + 1) * self._block(parent=None).model_flops(lengths)
                 + (self.num_layers // 2) * projection_flops(lengths, *self.projections()['up_dense'])
                 + self._output(self.patch_size, self.output_channels).model_flops(lengths, self.emb_features))
-
-    @nn.nowrap
-    def recompute_record(self) -> JSON:
-        return self.remat
-
-    @nn.nowrap
-    def recompute_more(self) -> Self | None:
-        stronger = stronger_remat(self.remat)
-        return None if stronger is None else self.clone(remat=stronger)
-
-    @nn.nowrap
-    def restore_recompute(self, record: JSON) -> Self:
-        restored = restored_remat(self.remat, record)
-        return self if restored is None else self.clone(remat=restored)
 
     def setup(self):
         assert self.num_layers % 2 == 0, "num_layers must be even for U-Net structure"
