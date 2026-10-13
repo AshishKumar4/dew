@@ -61,7 +61,7 @@ def test_decision_branches_keep_labels_aligned_with_option_order_and_cut_both_al
 def test_text_windows_keep_document_continuations_and_global_resume():
     documents = ({"text": "abcdefgh"}, {"text": "ijklmnopqrstuvwx"})
     loaded = loader(TextData(documents, seq_len=3), batch=2, read="memory", loading=READ)
-    assert loaded.records == 7
+    assert loaded.records == 8
     reader = loaded.train(DataPartition())
     first = next(reader)["text"]
     assert first.shape == (2, 4)

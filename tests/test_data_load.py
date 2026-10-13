@@ -122,6 +122,17 @@ def test_text_forms_pack_each_document_on_only_one_side_of_the_default_holdout(h
     assert all(batch["text"].shape[1] == options.get("seq_len", 256) + 1 for batch in batches(data))
 
 
+def test_a_refused_read_and_disabled_provisioning_leave_the_hub_cache_unprepared(hub):
+    builders, _ = hub
+    for options in ({"read": "streamed"}, {"read": "memory", "provision": False}):
+        with pytest.raises(ValueError):
+            load("hf/acme/simple", batch=8, loading=READ, **options)
+        assert not Path(builders["frozen-default"].cache_dir, "dataset_info.json").exists()
+    data = load("hf/acme/simple", batch=8, read="memory", loading=READ)
+    assert data.plan.order["read"] == "memory"
+    assert sorted(int(value) for batch in batches(data) for value in batch["id"]) == list(range(256, 512))
+
+
 @pytest.mark.parametrize("name", ["records", "acme/simple", "hf/", "hf/@release", "hf/acme/simple@",
                                   "hf://datasets/acme/simple", "tfds/", "tfds/dew_images:",
                                   "tfds://dew_images", "data/train.jsonl"])
@@ -162,6 +173,35 @@ def test_a_dataset_keeps_its_steps_while_its_record_default_is_held_out():
     assert trained.isdisjoint(scored)
     for batch in train + held:
         np.testing.assert_array_equal(batch["twice"], 2 * batch["id"])
+
+
+def test_load_keeps_an_indexed_datasets_random_draws_and_resumed_position_at_the_requested_seed():
+    source = Memory([{"id": index} for index in range(320)]).random_map(
+        lambda row, rng: {**row, "draw": rng.integers(2**16)})
+    options = {"batch": 8, "read": "indexed", "seed": 37, "loading": READ}
+    data = load(source, **options)
+    train, held = source.holdout(records=256)
+    reference = compile(train.batch(8), validation=held.batch(8), read="indexed", seed=37, loading=READ)
+    actual, expected = data.train(DataPartition()), reference.train(DataPartition())
+    changed = load(source, **{**options, "seed": 38}).train(DataPartition())
+    try:
+        first = next(actual)
+        np.testing.assert_array_equal(first["draw"], next(expected)["draw"])
+        assert not np.array_equal(first["draw"], next(changed)["draw"])
+        saved = actual.get_state()
+        following = next(actual)
+        resumed = load(source, **options).train(DataPartition())
+        try:
+            resumed.set_state(saved)
+            restored = next(resumed)
+            for field in following:
+                np.testing.assert_array_equal(restored[field], following[field])
+        finally:
+            resumed.close()
+    finally:
+        actual.close()
+        expected.close()
+        changed.close()
 
 
 def test_text_data_defaults_end_documents_and_hold_out_tokens_without_replacing_named_validation():

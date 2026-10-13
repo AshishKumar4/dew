@@ -854,7 +854,8 @@ def test_a_recipe_reads_a_published_packing_before_its_default_order(tmp_path):
     stored = Memory(tuple({"text": "x" * size} for size in (3, 7, 18, 2, 4, 12, 8, 1, 15, 6)))
     published = publish(Pipeline(stored).map(Tokenize()).flat_map(Chunks(9)).pack(9, bins=3),
                         Cache(str(tmp_path / "cache")), read="indexed", loading=READ)
-    data = loader(TextData(source=stored, seq_len=8, pack="first-fit", packing_bins=3), batch=2,
+    data = loader(TextData(source=stored, seq_len=8, pack="first-fit", packing_bins=3,
+                           eos=False, token_holdout=None), batch=2,
                   cache=published,
                 read="indexed", loading=READ)
     assert data.plan is not None
