@@ -45,6 +45,61 @@ def targets(values):
                                           for value in values), None, None, 8)
 
 
+@pytest.mark.parametrize('cadence,step,streak', [(1, 7, 5), (2, 8, 6)])
+def test_a_non_finite_run_stops_at_the_step_whose_losses_it_read(cadence, step, streak):
+    """The losses go non-finite from step 3 on. A log is read once the next
+    step is dispatched, and the stop names the step the log was taken at,
+    with the streak its losses held, and every earlier log is reported."""
+    sink = RecordingTracker()
+    trainer = Trainer(Squared(), optax.sgd(.1), key=0, tracker=sink)
+    with pytest.raises(RuntimeError, match=f"{streak} consecutive steps ending near step {step},"):
+        trainer.fit(targets([1., 1.] + [float('nan')] * 8), steps=10, log_every=cadence)
+    logged = [row for row, scalars in sink.scalars if 'train/loss' in scalars]
+    assert logged == list(range(cadence, step, cadence))
+
+
+def test_each_checkpoint_follows_the_log_of_its_step(tmp_path):
+    """A log is read a step late, but never past a checkpoint: each save,
+    persistent or local, comes after its step's row, and the rows are the
+    ones a run logging every step reports at those steps."""
+    from dew.telemetry.records import CheckpointRequested
+    from dew.training import Checkpoints
+
+    class Ordered(RecordingTracker):
+        def __init__(self):
+            super().__init__()
+            self.events = []
+
+        def log(self, scalars, step):
+            super().log(scalars, step)
+            if 'train/loss' in scalars:
+                self.events.append(('log', step))
+
+        def artifact(self, value, step):
+            super().artifact(value, step)
+            if isinstance(value, CheckpointRequested):
+                self.events.append(('local' if value.local else 'checkpoint', step))
+
+    def rows(log_every, directory=None):
+        sink = Ordered()
+        checkpoints = None if directory is None else Checkpoints(
+            str(directory / 'run'), local_directory=str(directory / 'local'), local_every=3)
+        Trainer(Squared(), optax.sgd(.1), key=0, tracker=sink, checkpoints=checkpoints).fit(
+            targets([1., 3., 2., 6., 1., 3., 2., 5.]), steps=8, log_every=log_every,
+            checkpoint_every=None if directory is None else 2)
+        return sink
+
+    ordered, every = rows(2, tmp_path), rows(1)
+    saves = [event for event in ordered.events if event[0] != 'log']
+    assert {kind for kind, _ in saves} == {'checkpoint', 'local'}
+    for save in saves:
+        logged = [step for kind, step in ordered.events[:ordered.events.index(save)] if kind == 'log']
+        assert logged and logged[-1] == save[1] // 2 * 2
+    losses = {step: scalars['train/loss'] for step, scalars in every.scalars if 'train/loss' in scalars}
+    assert {step: scalars['train/loss'] for step, scalars in ordered.scalars if 'train/loss' in scalars} == {
+        step: losses[step] for step in (2, 4, 6, 8)}
+
+
 @pytest.mark.parametrize('cadence,expected', [
     (1, {2: 4., 4: 7.2, 6: 1.76}), (3, {3: 4., 6: 4.48}), (6, {6: 4.32}),
 ])

@@ -350,19 +350,29 @@ def test_prefetch_counts_on_worker_then_step_reduces_global_rows():
 
 
 def test_interval_accumulates_work_with_its_loss_and_resets_only_at_logs():
-    interval = Interval(last_log_time=0, last_saved=None)
+    """A log takes the interval's work and tokens and starts the next
+    interval's at zero, and the run's lifetime tokens keep both logs'."""
+    interval = Interval(last_log_time=0, last_saved=None, tokens_before_log=5)
     loss = jnp.asarray(1.0)
-    for forward, tokens in ((100, 4), (200, 3)):
-        interval.count({"rows": np.ones((2, 1))}, StepFlops(10, 20), loss,
-                        jnp.asarray(a=True), None, {FORWARD_FLOPS: jnp.asarray(forward),
-                                                   TRAINING_FLOPS: jnp.asarray(3 * forward),
-                                                   TOKENS: jnp.asarray(_TokenCount.words(tokens))})
+
+    def counted(steps):
+        for forward, tokens in steps:
+            interval.count({"rows": np.ones((2, 1))}, StepFlops(10, 20), loss,
+                           jnp.asarray(a=True), None, {FORWARD_FLOPS: jnp.asarray(forward),
+                                                      TRAINING_FLOPS: jnp.asarray(3 * forward),
+                                                      TOKENS: jnp.asarray(_TokenCount.words(tokens))})
+
+    counted(((100, 4), (200, 3)))
     assert float(interval.book.training) == 900 and _TokenCount.host(interval.book.tokens) == 7
     interval.saved(2)
     assert float(interval.book.training) == 900 and _TokenCount.host(interval.book.tokens) == 7
-    interval.logged(3.0)
+    taken = interval.take(3, loss, {}, jnp.asarray(a=True), (None, None), {})
+    assert float(taken.reading.training) == 900 and _TokenCount.host(taken.reading.tokens) == 7
     assert float(interval.book.training) == 0 and _TokenCount.host(interval.book.tokens) == 0
     assert not interval.model_counted and not interval.tokens_counted
+    assert interval.real_tokens == 12
+    counted(((50, 2),))
+    assert interval.real_tokens == 14
 
 
 def forward_products(function, *operands, state_mac: bool = False):

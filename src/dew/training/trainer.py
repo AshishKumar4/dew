@@ -116,7 +116,7 @@ from dew.training.distributed import (
     shard_batch,
 )
 from dew.training.evaluation import EvalSuite, Evaluation, MetricScores
-from dew.training.interval import Interval
+from dew.training.interval import Interval, Taken, held
 from dew.training.memory import (
     climb_to,
     device_tokens,
@@ -386,6 +386,8 @@ class _FitRun:
     preempted: int | None = None
     notice: PreemptionNotice | None = None
     endless: bool = False
+    taken: Taken | None = None
+    """The log taken at the latest logging step and not yet read."""
 
     def read(self) -> Batch:
         """The training stream's next batch, read through this run each time:
@@ -1506,6 +1508,9 @@ class Trainer(Generic[Loss, Effects]):
                 if not compiled and self.rollout is None and inputs is not None:
                     # A rollout writes the batch its loss reads, from prompts it reads itself.
                     agreed("training input declaration", functools.partial(inputs.check, batch))
+                if batch_shapes(batch) not in compiled:
+                    # A compile holds the devices idle anyway, and its seconds are the next interval's.
+                    self._read_taken(run)
                 known, began = len(compiled), time.perf_counter()
                 train_step, measured_flops, state = self._compiled_for(compiled, state, batch)
                 interval.compiles = len(compiled)
@@ -1520,6 +1525,8 @@ class Trainer(Generic[Loss, Effects]):
                     interval.compiling += time.perf_counter() - began
                 with region("train.step"):
                     state, loss, aux, finite, accepted, committed = train_step(state, batch)
+                # Read with this step queued behind the one it describes, so the devices go on meanwhile.
+                self._read_taken(run)
                 if self._unproven:
                     # A step's failure on the devices surfaces at the next
                     # program that reads its outputs, the loss counters, so a
@@ -1573,7 +1580,11 @@ class Trainer(Generic[Loss, Effects]):
             assert profiler is not None
             stop_trace = functools.partial(self._stop_trace, run, profile, profiler)
         error = primary
+        # A failed run's peers may be gone: its last log is read only where no read waits on them.
+        unread = (None if run.taken is None or not run.taken.ready()
+                  else functools.partial(self._read_taken, run, agree=False))
         for label, cleanup in (
+            ("Training log", unread),
             ("Training iterator", close),
             ("Profiler", stop_trace),
             ("Checkpoint wait", None if checkpoints is None else checkpoints.wait),
@@ -1590,8 +1601,8 @@ class Trainer(Generic[Loss, Effects]):
                     error.add_note(f"{label} cleanup failed: {failure!r}")
         # The traceback of a failed run holds fit's frame and this one, and
         # with them whatever these names still point at.
-        run.source = run.train = None
-        close = stop_trace = cleanup = None
+        run.source, run.train, run.taken = None, None, None
+        close = stop_trace = cleanup = unread = None
         run.other += time.perf_counter() - paused
         return self._reported_outcome(error, run)
 
@@ -1694,8 +1705,15 @@ class Trainer(Generic[Loss, Effects]):
                if name not in (FORWARD_FLOPS, TRAINING_FLOPS, TOKENS)}
         run.training = {'train/loss': loss, **{f'train/{name}': value for name, value in aux.items()}}
         if current % plan.log_every == 0:
-            interval.check_finite(current, self._display)
-            self._log_interval(current, loss, aux, accepted, state, interval)
+            rate = learning_rate(state.opt_state)
+            if (rate is None and self._config is not None and self._config.schedule is None
+                    and not self._config.param_groups):
+                rate = self._config.learning_rate
+            if rate is None and self._scheduled_rate is not None:
+                rate = self._scheduled_rate(state.updates)
+            run.taken = interval.take(current, loss, aux, accepted,
+                                      held(rate, None if state.scale is None else state.scale.scale),
+                                      {} if self.rollout is None else dict(_rollout_metrics(self.rollout)))
 
         if isinstance(plan.checkpoint_every, datetime.timedelta):
             # The clock is read at the log interval, where the step is already
@@ -1712,6 +1730,7 @@ class Trainer(Generic[Loss, Effects]):
         evaluation_due = bool(due) or bool(plan.eval_every and current % plan.eval_every == 0)
         ranked = bool((plan.validation or plan.best or plan.stop) and run.checkpoint_due)
         if not ending and (evaluation_due or ranked):
+            self._read_taken(run)
             with region("evaluate"):
                 # A checkpoint that ranks the steps reads every suite's score.
                 names = None if ranked else due
@@ -1729,6 +1748,7 @@ class Trainer(Generic[Loss, Effects]):
         assert run.notice is not None
         if not ending and run.notice.reached(current):
             if checkpoints is not None and interval.last_saved != current:
+                self._read_taken(run)
                 run.other += self._saved_checkpoint(
                     checkpoints,
                     current,
@@ -1757,6 +1777,7 @@ class Trainer(Generic[Loss, Effects]):
             candidate = checkpoints is not None
         if (checkpoints is not None and interval.last_saved != current
                 and (run.checkpoint_due or candidate or (final and plan.checkpoint_final))):
+            self._read_taken(run)
             run.other += self._saved_checkpoint(
                 checkpoints, current, state, position, interval, scores=scores, ranking=ranking,
                 training_best=not plan.validation and not plan.best, control=run.stop_control,
@@ -1766,6 +1787,7 @@ class Trainer(Generic[Loss, Effects]):
             run.last_checkpoint = time.perf_counter()
         if (plan.local_every and checkpoints is not None and current % plan.local_every == 0
                 and run.last_local_saved != current):
+            self._read_taken(run)
             run.other += self._saved_local_checkpoint(
                 checkpoints, current, state, position, interval, control=run.stop_control)
             run.last_local_saved = current
@@ -1776,6 +1798,7 @@ class Trainer(Generic[Loss, Effects]):
         announced, the trace window stopped, the final validation (skipped on
         a preemption) and the checkpoint of the state the run ends on."""
         profile, checkpoints, current, loss = self.profile, self.checkpoints, run.current, run.loss
+        self._read_taken(run)
         if run.notice is not None:
             run.notice.close()
         paused = time.perf_counter()
@@ -2191,15 +2214,16 @@ class Trainer(Generic[Loss, Effects]):
         self._display.status("")
         return time.perf_counter() - paused
 
-    def _log_interval(self, step: int, loss: jax.Array, aux: dict[str, jax.Array],
-                      accepted: jax.Array, state: TrainState, interval: Interval) -> None:
-        """Report one logging interval and start the next.
+    def _read_taken(self, run: _FitRun, *, agree: bool = True) -> None:
+        """Read the log the loop took (`Taken`), check its losses and report
+        one logging interval, its clock ending when its step was done.
 
         Rank zero builds the row; every other rank has nothing to report.
         The report is agreed, so a tracker that failed on rank zero stops its
-        peers here rather than at their next collective.
+        peers here rather than at their next collective; a failed run's
+        cleanup reads without agreeing, since its peers may never agree.
 
-        Loss and objective aux metrics are the latest attempt's values.
+        Loss and objective aux metrics are the logged step's values.
         train/grad_norm is instead the mean over admitted optimizer commits
         since the last log: bookkeep sums each window's native gradient norm
         and its commit count on device, independently of the checkpoint loss
@@ -2213,68 +2237,55 @@ class Trainer(Generic[Loss, Effects]):
         runs only at the logging cadence, and its value joins the same host
         read; no optimizer or checkpoint state is added for reporting.
         """
-        now = time.time()
+        taken, run.taken = run.taken, None
+        if taken is None:
+            return
+        counts = taken.counts
+
         def report() -> None:
             if jax.process_index() != 0:
                 return
-            # The interval's numbers need the loss on the host, so this is
-            # where the loop waits on the device.
-            loss.block_until_ready()
-            rate = learning_rate(state.opt_state)
-            if (rate is None and self._config is not None and self._config.schedule is None
-                    and not self._config.param_groups):
-                rate = self._config.learning_rate
-            if rate is None and self._scheduled_rate is not None:
-                rate = self._scheduled_rate(state.updates)
-            # One read for every number, since each float() of a device
-            # array is a copy of its own.
-            read = jax.device_get({
-                "loss": loss, "aux": aux, "accepted": accepted, "rate": rate,
-                "committed": None if interval.book is None else (interval.book.norms, interval.book.commits),
-                "scale": None if state.scale is None else state.scale.scale,
-                "training_flops": (interval.book.training
-                                   if interval.model_counted and interval.book is not None else None),
-                "tokens": (interval.book.tokens if interval.tokens_counted and interval.book is not None
-                           else None),
-                "rollout": {} if self.rollout is None else dict(_rollout_metrics(self.rollout))})
-            work = read["training_flops"]
+            work = None if read.training is None else float(read.training)
             if work is not None and not math.isfinite(work) and not self._unavailable_noted:
                 # A process refused a count (`_counted_batch`) and the global
                 # sum carried it here: this thread alone says so, once.
                 self._unavailable_noted = True
                 reason = self._refusal or "another process's batch could not be counted"
                 self._display.note(f"train/mfu is unavailable for {type(self.objective).__name__}: {reason}")
-            scalars = {"train/loss": float(read["loss"]),
-                       **{f"train/{k}": float(v) for k, v in read["aux"].items()},
-                       **self._throughput(now - interval.last_log_time, interval.since_log,
-                                          interval.samples, interval.flops, waited=interval.waited,
-                                          compiling=interval.compiling, training_flops=read["training_flops"],
-                                          tokens=None if read["tokens"] is None
-                                          else _TokenCount.host(read["tokens"]))}
-            scalars["train/accepted"] = float(read["accepted"])
-            if read['committed'] is not None:
-                norms, commits = read['committed']
+            scalars = {"train/loss": float(read.loss),
+                       **{f"train/{k}": float(v) for k, v in read.aux.items()},
+                       **self._throughput(elapsed, counts.since_log, counts.samples, counts.flops,
+                                          waited=counts.waited, compiling=counts.compiling,
+                                          training_flops=work, tokens=None if read.tokens is None
+                                          else _TokenCount.host(read.tokens))}
+            scalars["train/accepted"] = float(read.accepted)
+            if read.committed is not None:
+                norms, commits = read.committed
                 if commits:
                     scalars['train/grad_norm'] = float(norms / commits)
-            scalars['train/compiles'] = float(interval.compiles)
+            scalars['train/compiles'] = float(counts.compiles)
             scalars.update(compilation_cache_counts())
             peak = peak_memory_gib()
             if peak is not None:
                 scalars['train/peak_memory_gib'] = peak
-            if read["rate"] is not None:
-                scalars["train/learning_rate"] = float(read["rate"])
-            if read["scale"] is not None:
-                scalars["train/loss_scale"] = float(read["scale"])
+            if read.rate is not None:
+                scalars["train/learning_rate"] = float(read.rate)
+            if read.scale is not None:
+                scalars["train/loss_scale"] = float(read.scale)
             if self.rollout is not None:
-                scalars["train/rollout_seconds"] = interval.rollout_seconds
-                scalars.update({f"rollout/{name}": float(value) for name, value in read["rollout"].items()})
-            self._display.interval(step, scalars)
+                scalars["train/rollout_seconds"] = counts.rollout_seconds
+                scalars.update({f"rollout/{name}": float(value) for name, value in read.rollout.items()})
+            self._display.interval(taken.step, scalars)
             if self.tracker is not None:
-                self.tracker.log(scalars, step)
+                self.tracker.log(scalars, taken.step)
 
         with region("log"):
-            agreed("training reporting", report)
-        interval.logged(now)
+            # One read for every number, since each float() of a device array is a copy of its own.
+            read, elapsed = taken.read(self._display)
+            if agree:
+                agreed("training reporting", report)
+            else:
+                report()
 
     def _reported_outcome(self, error: BaseException | None, run: _FitRun) -> BaseException | None:
         """Agree the run's cleanup, report its goodput and its outcome.
