@@ -113,6 +113,43 @@ def test_a_task_rows_each_file_red_where_ci_would_fail(ci, tmp_path):
         "3.12:tests/test_pass.py": 1, "3.12:tests/test_dies.py": 1}
 
 
+def test_the_gpu_tier_is_every_file_whose_tests_read_the_backend_or_are_marked_for_a_gpu(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """A task keeps, beside each green file's key, where its tests read the
+    backend and their GPU marks (executed.py), and the GPU tier is each file
+    with either and each no record covers. The `platform` module is no read
+    of the backend. A file that started a process is in the records for the
+    tier, and the plan still never skips it."""
+    url, _, _ = cache_worker
+    monkeypatch.setenv("DEW_XLA_CACHE_URL", url)
+    monkeypatch.setenv("DEW_XLA_CACHE_TOKEN", "token")
+    files = {
+        "test_routes.py": "class Device:\n    platform = 'gpu'\n"
+                          "def chosen(device): return 'triton' if device.platform == 'gpu' else 'xla'\n"
+                          "def test_routes(): assert chosen(Device()) == 'triton'\n",
+        "test_marked.py": "import pytest\n@pytest.mark.gpu\ndef test_on_a_gpu(): pass\n",
+        "test_machine.py": "import platform\ndef test_machine(): assert platform.machine()\n",
+        "test_spawns.py": "import subprocess, sys\n"
+                          "def test_child(): subprocess.run([sys.executable, '-c', 'pass'], check=True)\n",
+        "test_new.py": "def test_unrun(): pass\n",
+    }
+    for name, source in files.items():
+        (tmp_path / "tests" / name).write_text(source)
+    venv = tmp_path / ".venv-3.12/bin"
+    venv.mkdir(parents=True)
+    (venv / "python").write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
+    (venv / "python").chmod(0o755)
+    out = tmp_path / "verdict.json"
+    ci.task("3.12", [f"tests/{name}" for name in files if name != "test_new.py"], "", out, 600.0)
+    assert {row["name"]: row["exitCode"] for row in json.loads(out.read_text())["rows"]} == {
+        f"3.12:tests/{name}": 0 for name in files if name != "test_new.py"}
+    assert ci.gpu_tier("3.12") == {"tests/test_marked.py": ["mark:gpu"], "tests/test_new.py": ["unrecorded"],
+                                   "tests/test_routes.py": ["tests/test_routes.py:chosen"]}
+    common = ci.shared("3.12")
+    assert [ci.cached("3.12", [ci.row("3.12", f"tests/{name}", "")], common)
+            for name in ("test_machine.py", "test_spawns.py")] == [True, False]
+
+
 def test_a_split_files_groups_run_every_test_once(ci, tmp_path):
     """Each task of a split file runs its own group (split.py) of the same
     cut, so the groups together run every test, none twice, a test the

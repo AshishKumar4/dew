@@ -1,6 +1,10 @@
 import gc
+import http.server
+import json
 import logging
 import os
+import threading
+import urllib.parse
 
 import lane_environment  # configures the backend before JAX reads the environment
 import jax
@@ -111,3 +115,58 @@ def caplog(caplog):
 def rng():
     return jax.random.PRNGKey(0)
 
+
+@pytest.fixture
+def cache_worker():
+    """The dew-xla-cache Worker's protocol over a dict: GET, PUT, a listing two keys a page, a 404 on
+    a miss, a 401 without the token, and Cloudflare's 403 for urllib's own User-Agent, which never
+    reaches the Worker. Each request's path is kept."""
+    stored, seen = {}, []
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def _authorized(self):
+            seen.append(self.path)
+            if self.headers.get("User-Agent", "").startswith("Python-urllib"):
+                self.send_response(403)
+                self.end_headers()
+                return False
+            if self.headers.get("Authorization") == "Bearer token":
+                return True
+            self.send_response(401)
+            self.end_headers()
+            return False
+
+        def do_GET(self):
+            if not self._authorized():
+                return
+            url = urllib.parse.urlparse(self.path)
+            if url.path == "/":
+                query = urllib.parse.parse_qs(url.query)
+                prefix, start = "/" + query["list"][0], int(query.get("cursor", ["0"])[0])
+                keys = sorted(key[len(prefix):] for key in stored if key.startswith(prefix))
+                body = json.dumps({"keys": keys[start:start + 2],
+                                   "cursor": str(start + 2) if start + 2 < len(keys) else None}).encode()
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            value = stored.get(self.path)
+            self.send_response(404 if value is None else 200)
+            self.end_headers()
+            if value is not None:
+                self.wfile.write(value)
+
+        def do_PUT(self):
+            if not self._authorized():
+                return
+            stored[self.path] = self.rfile.read(int(self.headers["Content-Length"]))
+            self.send_response(204)
+            self.end_headers()
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    yield f"http://127.0.0.1:{server.server_address[1]}", stored, seen
+    server.shutdown()
