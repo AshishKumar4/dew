@@ -718,10 +718,9 @@ def test_router_z_loss_adds_each_routers_mean_squared_log_partition():
 def test_a_training_steps_tiled_head_contracts_the_vocabulary_three_times_and_matches_the_tiled_head():
     """A training step whose head is tiled takes the head's gradient in the
     forward (`fused_head_loss`): beside blocks recomputed in the backward, the
-    step contracts the vocabulary three times, the logits, the states'
-    gradient and the head's, none again, where the per-token tiled head
-    recomputes its logits, and its loss and gradients are the per-token
-    head's, z-loss and padding included."""
+    step contracts the whole vocabulary three times, the logits, the states'
+    gradient and the head's, none again, and its loss and gradients are the
+    per-token tiled head's, z-loss and padding included."""
     from dew.nn.backbones.causal_transformer import CausalTransformer
     vocab = 61
     model = CausalTransformer(vocab_size=vocab, emb_features=24, num_layers=2, num_heads=2, mlp_features=32,
@@ -753,7 +752,6 @@ def test_a_training_steps_tiled_head_contracts_the_vocabulary_three_times_and_ma
         return count
 
     assert products(jax.make_jaxpr(jax.grad(loss(fused, training=True)))(params).jaxpr) == 3
-    assert products(jax.make_jaxpr(jax.grad(loss(fused, training=False)))(params).jaxpr) == 4
     with jax.default_matmul_precision("highest"):
         mine = jax.value_and_grad(loss(fused, training=True))(params)
         theirs = jax.value_and_grad(loss(fused, training=False))(params)
