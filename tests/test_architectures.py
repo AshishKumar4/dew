@@ -461,7 +461,8 @@ def key_bias_terms(case: Case, trainer, encoder, state, index: int) -> dict[tupl
         def project(next_fun, args, kwargs, context):
             value = next_fun(*args, **kwargs)
             path = context.module.scope.path
-            if context.method_name != "__call__" or path[-1:] not in [(name,) for name in KEY_PROJECTIONS]:
+            if (context.method_name != "__call__" or path[-1:] not in [(name,) for name in KEY_PROJECTIONS]
+                    or "bias" not in context.module.variables.get("params", {})):
                 return value
             call = (path, calls.setdefault(path, 0))
             calls[path] += 1
@@ -480,9 +481,10 @@ def key_bias_terms(case: Case, trainer, encoder, state, index: int) -> dict[tupl
     params = traverse_util.flatten_dict(state.variables["params"])
     terms: dict[tuple[str, ...], np.ndarray] = {}
     for (path, _), cotangent in cotangents.items():
-        [bias] = [name for name, value in params.items()
-                  if name[-len(path) - 1:] == (*path, "bias") and value.shape == cotangent.shape[-1:]]
-        summed = np.sum(np.abs(np.asarray(cotangent)), axis=tuple(range(cotangent.ndim - 1)))
+        [bias] = [name for name, value in params.items() if name[-len(path) - 1:] == (*path, "bias")
+                  and value.shape == cotangent.shape[cotangent.ndim - value.ndim:]]
+        width = params[bias].ndim
+        summed = np.sum(np.abs(np.asarray(cotangent)), axis=tuple(range(cotangent.ndim - width)))
         terms[bias] = terms.get(bias, 0) + summed
     return terms
 
