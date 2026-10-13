@@ -30,15 +30,17 @@ Usage:
 """
 
 import contextlib
-import importlib
 import json
-import time
+import statistics
 from dataclasses import dataclass
 from typing import Optional
 
 import jax
 import jax.numpy as jnp
+import tokamax
 import tyro
+
+from dew.nn.kernels.tuning import samples
 
 IMPLEMENTATIONS = ('reference', 'xla', 'cudnn', 'flash', 'triton', 'jax_cudnn')
 # B chosen so batch * sequence * heads is constant across the sequence sweep:
@@ -95,9 +97,6 @@ def attention_fn(implementation: str, config: BenchmarkConfig, causal: bool, sin
         # jax.nn's own cuDNN call, which takes heads wider than Dew's cudnn path does.
         return lambda q, k, v: jax.nn.dot_product_attention(q, k, v, is_causal=causal, implementation='cudnn')
     if implementation == 'triton':
-        # tokamax is not a dependency (docs/concepts/moe.md), so it is
-        # imported at the call.
-        tokamax = importlib.import_module('tokamax')
         local = None if window is None else (window - 1, 0)
         return lambda q, k, v: tokamax.dot_product_attention(
             q, k, v, is_causal=causal, local_window_size=local,
@@ -134,9 +133,8 @@ def measure(case: dict, config: BenchmarkConfig) -> dict:
     reason; the row is part of the answer, not an error. jax raises
     NotImplementedError for a shape its cudnn checks refuse, a
     JaxRuntimeError when the materialized logits do not fit in memory or a
-    Pallas kernel exceeds the card's shared memory, and ImportError when
-    tokamax is not installed. A forward that runs but a backward that does
-    not is a served row with `backward_reason`.
+    Pallas kernel exceeds the card's shared memory. A forward that runs but a
+    backward that does not is a served row with `backward_reason`.
     """
     seq, head_dim = case['sequence_length'], case['head_dim']
     heads = config.heads or max(1, TOKEN_HEAD_BUDGET // (seq * case['batch_size']))
@@ -164,12 +162,8 @@ def measure(case: dict, config: BenchmarkConfig) -> dict:
             return {**row, 'served': False, 'reason': failure(e)}
 
         def time_call(callable_, *args):
-            for _ in range(config.warmup):
-                jax.block_until_ready(callable_(*args))
-            start = time.perf_counter()
-            for _ in range(config.steps):
-                jax.block_until_ready(callable_(*args))
-            return (time.perf_counter() - start) / config.steps * 1e3
+            measured = samples(callable_, *args, warmup=config.warmup, repeats=config.steps)
+            return statistics.mean(measured) * 1e3
 
         row.update(served=True, forward_ms=time_call(fn, q, k, v))
 
