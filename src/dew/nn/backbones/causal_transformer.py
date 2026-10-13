@@ -1856,7 +1856,7 @@ class CausalTransformer(nn.Module):
                     f"a batch of {rows} rows over {stages} stages needs a microbatch "
                     f"count that divides the rows and is a multiple of the stages, "
                     f"got {count_microbatches}")
-            # Microbatch m takes rows m, m + count, ... (`_microbatched`), a
+            # Microbatch m takes rows m, m + count, ... (`microbatched`), a
             # share of every device's rows only where the count divides a
             # block; otherwise devices holding none of a microbatch recompute
             # another's (1.43 times one device's FLOPs for 8 rows in 4

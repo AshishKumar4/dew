@@ -11,6 +11,8 @@ import sys
 
 import jax
 
+from dew.telemetry.devices import xla_flag
+
 
 def dew_cache_dir() -> str:
     """Dew's cache directory: `$XDG_CACHE_HOME/dew`, else ~/.cache/dew."""
@@ -63,9 +65,51 @@ def enable_compilation_cache(path: str):
     jax.config.update('jax_persistent_cache_min_compile_time_secs', 0.0)
     flags = os.environ.get('XLA_FLAGS', '')
     if '--xla_gpu_per_fusion_autotune_cache_dir' not in flags:
-        picks = os.path.join(path, 'autotune', f"jaxlib-{importlib.metadata.version('jaxlib')}")
+        picks = autotune_dir(path)
         os.makedirs(picks, exist_ok=True)
         os.environ['XLA_FLAGS'] = f"{flags} --xla_gpu_per_fusion_autotune_cache_dir={picks}".strip()
+
+
+def autotune_dir(path: str) -> str:
+    """Where the GPU picks of the executables cached under `path` go, for this
+    jaxlib alone: XLA's per fusion, and Dew's kernels' beside them
+    (`kernel_picks_path`). jaxlib pins XLA, Triton and Mosaic, which each
+    pick's speed depends on."""
+    return os.path.join(path, 'autotune', f"jaxlib-{importlib.metadata.version('jaxlib')}")
+
+
+def kernel_picks_path(device_kind: str) -> str:
+    """The file of Dew's kernel configs measured on GPUs of `device_kind`
+    (`dew.nn.kernels.tuning`), beside XLA's picks in the cache this process
+    compiles to."""
+    name = device_kind.lower().replace(' ', '_').replace('/', '_')
+    return os.path.join(autotune_dir(default_compilation_cache_dir()), 'kernels', f"{name}.json")
+
+
+KERNEL_TUNES = jax.make_user_context(0)
+"""How many times this process's kernel picks changed (`dew.nn.kernels.tuning.tune`):
+a context JAX keys its trace and compile caches on, so a program lowered
+after picks change traces again. Made at `import dew`, as JAX makes a user
+context only beside no other JAX call."""
+
+KERNEL_LAUNCHES = jax.make_user_context(default_value=False)
+"""Whether a traced kernel launch carries tokamax's description of itself
+(`dew.nn.kernels.tuning.launches`), keyed on as `KERNEL_TUNES` is. Only the
+lowering `tune` reads its launches from carries it: jaxlib 0.11.2 writes a
+compiled program holding it to the persistent cache and cannot read it back
+("Invalid metadata payload id")."""
+
+KERNEL_PINS = jax.make_user_context(())
+"""The `(kernel, config)` pairs `dew.nn.kernels.tuning.pinned` holds in this
+thread, keyed on as `KERNEL_TUNES` is."""
+
+
+def measures_picks() -> bool:
+    """Whether this process may measure GPU picks and store them, XLA's and
+    the kernels' alike: not beside other work on its GPU, where `gpu-run -n
+    0.5` asks XLA to read its picks and write none
+    (AUTOTUNE_CACHE_MODE_READ), since a measurement there is unfair."""
+    return xla_flag('xla_gpu_experimental_autotune_cache_mode') != 'AUTOTUNE_CACHE_MODE_READ'
 
 
 def persist_compilations() -> None:

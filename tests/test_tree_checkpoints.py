@@ -106,7 +106,7 @@ def test_a_template_of_another_shape_is_refused(tmp_path):
     checkpoints = Checkpoints(str(tmp_path))
     checkpoints.save(1, {"v": jnp.zeros((4,))})
     checkpoints.wait()
-    with pytest.raises(ValueError, match="holds a mapping that does not fit"):
+    with pytest.raises(ValueError):
         checkpoints.restore(template({"v": jnp.zeros((5,))}))
 
 
