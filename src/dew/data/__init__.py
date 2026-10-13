@@ -4,12 +4,12 @@ A store (`Files`, `Hub`, `TFDS`, `Memory`, or a Grain, Hugging Face or
 PyTorch dataset brought in) is a `Dataset`, and every verb returns a new
 one: `map`, `random_map`, `filter` and `flat_map` per record, `shuffle`,
 `repeat`, `pack` and `batch` across records, `mix` and `holdout` across
-datasets. The stage libraries (`images`, `video`, `text`, `chat`, `prompts`,
-`preferences`) are factories of the functions those verbs take.
+datasets. The stage libraries (`images`, `video`, `audio`, `text`, `chat`,
+`prompts`, `preferences`) are factories of the functions those verbs take.
 `Trainer.fit` reads a dataset as the run's mesh shares it.
 """
 
-from . import chat, images, preferences, presets, prompts, text, video
+from . import audio, chat, images, preferences, presets, prompts, text, video
 from .chat import Role
 from .dataset import Batch, Loading
 from .pipeline import Dataset, Rejected, concat, mix
@@ -30,6 +30,7 @@ __all__ = [
     "Role",
     "Source",
     "Torch",
+    "audio",
     "chat",
     "concat",
     "from_grain",
