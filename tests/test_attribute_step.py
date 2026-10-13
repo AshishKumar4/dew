@@ -9,6 +9,7 @@ move, and a weight-gradient GEMM traced at `up_proj/transpose` is a GEMM.
 
 import json
 
+import pytest
 from tool_support import load
 
 attribute = load("attribute_step")
@@ -285,9 +286,11 @@ def test_a_gemm_is_judged_at_its_compiled_flops_against_its_own_precisions_peak(
     assert time["mfu_mixed_of_device_time"] == 0.65
 
 
-def test_the_dump_reads_only_its_newest_module_from_an_archive(tmp_path):
-    """A dump holds every compile of the step; only the newest one's four files are extracted,
-    and the memory breakdown reads them a line at a time."""
+def test_the_dump_reads_the_compile_the_capture_ran_from_an_archive(tmp_path):
+    """A dump holds every compile of the step, a plan's candidates among them; only the four
+    files of the one the capture ran are extracted (the newest, without a capture), and the
+    memory breakdown reads them a line at a time. A capture of a compile the dump lacks is
+    refused."""
     import tarfile
 
     dump = tmp_path / "hlo"
@@ -306,7 +309,10 @@ def test_the_dump_reads_only_its_newest_module_from_an_archive(tmp_path):
     with tarfile.open(archive, "w:gz") as writer:
         writer.add(dump, arcname="hlo")
     for source in (archive, dump):
-        with attribute.dump_files(source, "jit_step") as files:
-            memory = attribute.attribute_memory(files)
-        assert (memory["peak_gib"], memory["total_bytes_gib"], memory["allocations_gib"]) == (
-            2.0, 2.0, {"parameter": 2.0})
+        for program, gib in ((None, 2.0), ("3", 1.0)):
+            with attribute.dump_files(source, "jit_step", program) as files:
+                memory = attribute.attribute_memory(files)
+            assert (memory["peak_gib"], memory["total_bytes_gib"], memory["allocations_gib"]) == (
+                gib, gib, {"parameter": gib})
+        with pytest.raises(SystemExit, match="ran program 9"), attribute.dump_files(source, "jit_step", "9"):
+            pass
