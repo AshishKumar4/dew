@@ -209,7 +209,8 @@ def cached(python: str, rows: list[str], common: str) -> bool:
         if record is None:
             return False
         recorded = json.loads(record)
-        if recorded["depends"] is None or recorded["key"] != cache_key(
+        # A file that started another process has no key (`record`).
+        if recorded["key"] is None or recorded["key"] != cache_key(
                 common, parsed_row(row_name)[1], recorded["depends"]):
             return False
     return True
