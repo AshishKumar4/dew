@@ -10,6 +10,7 @@ import jax
 import jax.numpy as jnp
 
 from dew.nn.kernels import fla_gdn, generation
+from dew.nn.precision import compensated_difference
 
 COMPILED_SHAPES = {
     "0.8b": {"batch": 8, "length": 3072, "key_heads": 16, "value_heads": 16,
@@ -81,15 +82,9 @@ def kernel_cases(target: str) -> Iterator[KernelCase]:
                                                              reverse=reverse))
 
 
-def between(later, earlier):
-    """A range's exponent from two cumulated decays' `(hi, lo)` halves, as the kernels take it
-    (`fla_gdn._between`)."""
-    return (later[0] - earlier[0]) + (later[1] - earlier[1])
-
-
 def pairwise(g, lo):
     """`g_s - g_t` for every pair of a chunk's last-axis positions, `[..., C, C]`, from the halves."""
-    return between((g[..., :, None], lo[..., :, None]), (g[..., None, :], lo[..., None, :]))
+    return compensated_difference((g[..., :, None], lo[..., :, None]), (g[..., None, :], lo[..., None, :]))
 
 
 def reference_o(q, k, v, h, g, g_lo, *, scale: float, chunk: int = 64):
@@ -175,7 +170,7 @@ def reference_h(k, w, u, g, g_lo, h0, *, chunk: int = 64):
         corrected = values.astype(jnp.float32) - predicted
         last = gate[:, -1]
         gated = corrected if per_key else corrected * jnp.exp2(
-            between((last[:, None], low[:, -1][:, None]), (gate, low)))[..., None]
+            compensated_difference((last[:, None], low[:, -1][:, None]), (gate, low)))[..., None]
         high = gated.astype(dtype)
         update = jnp.einsum('bchk,bchv->bhkv', keys.astype(jnp.float32), high.astype(jnp.float32),
                             precision=exact)
@@ -214,7 +209,8 @@ def reference_dhu(q, k, w, g, g_lo, dht, do, dv, *, scale: float, chunk: int = 6
         full = jnp.einsum('bchk,bhkv->bchv', keys.astype(jnp.float32),
                           grad.astype(k_dtype).astype(jnp.float32), precision=exact)
         if not per_key:
-            full = full * jnp.exp2(between((last[:, None], low[:, -1][:, None]), (gate, low)))[..., None]
+            full = full * jnp.exp2(
+                compensated_difference((last[:, None], low[:, -1][:, None]), (gate, low)))[..., None]
         full = full + local.astype(jnp.float32)
         read = queries.astype(jnp.float32) * (1.0 if per_key else jnp.exp2(gate)[..., None])
         grad = (grad * (jnp.exp2(last)[..., None] if per_key else jnp.exp2(last)[..., None, None])
@@ -274,7 +270,8 @@ def reference_dqkwg(q, k, v, w, g, g_lo, h, dv, do, dh, *, scale: float, chunk: 
     dw = -jnp.einsum('bnshv,bnhkv->bnshk', dvc.astype(v.dtype).astype(f32), h.astype(v.dtype).astype(f32),
                      precision=exact)
     dq = dq * jnp.exp2(gc)[..., None] * scale
-    dk = dk * jnp.exp2(between((last[:, :, None], lc[:, :, -1][:, :, None]), (gc, lc)))[..., None]
+    dk = dk * jnp.exp2(
+        compensated_difference((last[:, :, None], lc[:, :, -1][:, :, None]), (gc, lc)))[..., None]
     dg_last = dg_last + jnp.einsum('bnshk,bnshk->bnh', dk, kc.astype(f32))
     gh, lh = jnp.moveaxis(gc, 3, 2), jnp.moveaxis(lc, 3, 2)
     index = jnp.arange(chunk)

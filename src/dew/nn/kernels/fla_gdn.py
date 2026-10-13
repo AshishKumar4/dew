@@ -31,7 +31,7 @@ from jax.ad_checkpoint import checkpoint_name
 from jax.experimental import pallas as pl
 
 from dew.nn.kernels import generation, tuning
-from dew.nn.precision import compensated_add
+from dew.nn.precision import compensated_add, compensated_difference
 
 RCP_LN2 = 1.4426950216
 """fla's 1 / ln 2: its kernels take the cumulated decay in base 2 and exponentiate with exp2."""
@@ -287,17 +287,10 @@ def _row(g_ref, lo_ref, index):
     return g_ref[index].astype(jnp.float32), lo_ref[index].astype(jnp.float32)
 
 
-def _between(later, earlier):
-    """The decay's exponent from `earlier` to `later`, cumulated decays as `(hi, lo)` halves
-    (`chunk_local_cumsum`): the halves' differences summed, so a range carries its own rounding,
-    where the rounded prefixes' difference alone carries the whole prefix's, a one-token range in
-    a prefix near -78 off by 4e-6 of its decay. Broadcasts as the halves do."""
-    return (later[0] - earlier[0]) + (later[1] - earlier[1])
-
-
 def _pairs(rows, columns):
-    """`_between` each row position and each column position, `[R, C]`: `g_r - g_c`."""
-    return _between(tuple(x[:, None] for x in rows), tuple(x[None, :] for x in columns))
+    """The decay's exponent from each column position to each row position, `[R, C]`: `g_r - g_c`
+    from the cumulated decay's halves (`compensated_difference`)."""
+    return compensated_difference(tuple(x[:, None] for x in rows), tuple(x[None, :] for x in columns))
 
 
 def _write(view, count, value):
@@ -341,30 +334,27 @@ def _cumsum_kernel(chunk_ref, s_ref, o_ref, *refs, chunk: int, aligned: bool, sc
     head, of each column of a gate per key dimension (fla's vector kernel, :90-133) too: the
     inclusive cumulative sum over its tokens, each token times `scale` first, compensated, each
     running sum a `(hi, lo)` pair (`compensated_add`) taken token by token. Forward stores both
-    halves (`o_ref`, `refs[0]`), so a range's sum keeps its own precision (`_between`); fla's plain
-    fp32 prefix carries every earlier token's rounding into it. `reverse`, the decay's gradient,
+    halves (`o_ref`, `refs[0]`), so a range's sum keeps its own precision
+    (`compensated_difference`); fla's plain fp32 prefix carries every earlier token's rounding into
+    it. `reverse`, the decay's gradient,
     sums from the end and stores each sum rounded once."""
     start, count = _chunk_of(chunk_ref, chunk, aligned)
 
-    @pl.when(count > 0)
-    def _():
-        def step(i, total):
-            live = i < count
-            row = start + (jnp.maximum(count - 1 - i, 0) if reverse else i)
-            taken = live.astype(jnp.int32)
-            token = _read(_rows(s_ref, row, 1), taken).astype(jnp.float32)
-            if scale is not None:
-                token = token * scale
-            total = compensated_add(total, (token, jnp.zeros_like(token)))
-            if reverse:
-                _write(_rows(o_ref, row, 1), taken, total[0] + total[1])
-            else:
-                _write(_rows(o_ref, row, 1), taken, total[0])
-                _write(_rows(refs[0], row, 1), taken, total[1])
-            return total
+    def step(i, total):
+        row = start + (count - 1 - i if reverse else i)
+        token = _rows(s_ref, row, 1)[...].astype(jnp.float32)
+        if scale is not None:
+            token = token * scale
+        total = compensated_add(total, (token, jnp.zeros_like(token)))
+        if reverse:
+            _rows(o_ref, row, 1)[...] = total[0] + total[1]
+        else:
+            _rows(o_ref, row, 1)[...] = total[0]
+            _rows(refs[0], row, 1)[...] = total[1]
+        return total
 
-        zero = jnp.zeros((1, *s_ref.shape[1:]), jnp.float32)
-        jax.lax.fori_loop(0, chunk, step, (zero, zero))
+    zero = jnp.zeros((1, *s_ref.shape[1:]), jnp.float32)
+    jax.lax.fori_loop(0, count, step, (zero, zero))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -410,7 +400,7 @@ def chunk_local_cumsum(g, *, chunk: int = 64, scale: float | None = None, revers
     tokens of each sequence (`spans`, the rows where None), fp32: fla's `chunk_local_cumsum`
     (cumsum.py:262-341), `scale` RCP_LN2 for the forward's base-2 decay, `reverse` for its gradient.
     Forward returns the sums' compensated halves `(hi, lo)`, whose difference between two positions
-    every kernel takes as a range's exponent (`_between`); `reverse` the sums from the end, each
+    every kernel takes as a range's exponent (`compensated_difference`); `reverse` the sums from the end, each
     rounded once. fla autotunes only `num_warps` over 1, 2, 4 and 8 here."""
     batch, length = g.shape[:2]
     spans = sequences(batch, length, chunk=chunk) if spans is None else spans
@@ -675,9 +665,9 @@ def _h_kernel(span_ref, k_ref, u_ref, w_ref, g_ref, lo_ref, h0_ref, h_ref, corre
     343) for one sequence's head and `BV` value columns, its chunks in order. The memory is fp32 in
     64-key slices; each chunk stores the memory it enters in `h`'s dtype, then the corrected values
     `u - w h` (fla's `v_new`; `h` cast to `w`'s dtype for the product), gates them by
-    `exp2(g_last - g)` (both halves, `_between`) and the memory by `exp2(g_last)`, casts the gated
-    values to `k`'s dtype and adds `k^T v` to the memory: h remains fp32, and h and the corrected
-    values keep fla's storage.
+    `exp2(g_last - g)` (both halves, `compensated_difference`) and the memory by `exp2(g_last)`,
+    casts the gated values to `k`'s dtype and adds `k^T v` to the memory: h remains fp32, and h and
+    the corrected values keep fla's storage.
     `per_key` is fla's USE_GK branch: `g_ref` holds a decay per key dimension `[T, K]`, which gates
     the memory's rows by `exp2(g_last)` and not the values, whose keys carry their own decay. A row's
     first sequence starts from its initial memory and its last stores the final one."""
@@ -711,7 +701,8 @@ def _h_kernel(span_ref, k_ref, u_ref, w_ref, g_ref, lo_ref, h0_ref, h_ref, corre
                 return [state[i] * jnp.exp2(g_ref[final, pl.ds(i * 64, 64)].astype(jnp.float32))[:, None]
                         + written(i, corrected) for i in range(slices)]
             last = _row(g_ref, lo_ref, final)
-            gated = corrected * jnp.exp2(_between(last, _halves(g_ref, lo_ref, begin, taken, chunk)))[:, None]
+            gate = _halves(g_ref, lo_ref, begin, taken, chunk)
+            gated = corrected * jnp.exp2(compensated_difference(last, gate))[:, None]
             return [state[i] * jnp.exp2(last[0]) + written(i, gated) for i in range(slices)]
 
         state = jax.lax.fori_loop(0, -(-count // chunk), step, state)
@@ -804,7 +795,7 @@ def _dhu_kernel(span_ref, q_ref, k_ref, w_ref, g_ref, lo_ref, dht_ref, do_ref, d
     """fla's `chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64` (chunk_delta_h.py:359-669) for one
     sequence's head and `BV` value columns, chunks in reverse. Each stores the gradient of the memory
     it leaves into, `dh`, then `dv2 = dv + (k dh) exp2(g_last - g)` (dh cast to k's dtype, the
-    exponent from both halves, `_between`), then
+    exponent from both halves, `compensated_difference`), then
     `dh = dh exp2(g_last) + scale (q exp2(g))^T do - w^T dv2`: the gated queries fp32 as two parts
     of `do`'s dtype (`_split_dot`), where fla takes one TF32 product at the same cost, and dv2 cast
     to w's dtype for its product, as fla casts it.
@@ -844,7 +835,8 @@ def _dhu_kernel(span_ref, q_ref, k_ref, w_ref, g_ref, lo_ref, dht_ref, do_ref, d
             else:
                 gate = _halves(g_ref, lo_ref, begin, taken, chunk)
                 last = _row(g_ref, lo_ref, final)
-                dv = dv * jnp.exp2(_between(last, gate))[:, None] + read(dv_ref).astype(jnp.float32)
+                dv = (dv * jnp.exp2(compensated_difference(last, gate))[:, None]
+                      + read(dv_ref).astype(jnp.float32))
                 decay = jnp.exp2(gate[0])[:, None]
                 kept = [jnp.exp2(last[0])] * slices
                 read_out = [_split_dot((query.astype(jnp.float32) * decay).T, out_grad, exact=exact)
@@ -1077,7 +1069,7 @@ def _dqkwg_kernel(chunk_ref, q_ref, k_ref, v_ref, g_ref, lo_ref, h_ref, do_ref, 
             last = _row(g_ref, lo_ref, (start + taken - 1, head))
             dg_last = dg_last * jnp.exp2(last[0])
             dq = dq * jnp.exp2(gate[0])[:, None] * scale
-            dk = dk * jnp.exp2(_between(last, gate))[:, None]
+            dk = dk * jnp.exp2(compensated_difference(last, gate))[:, None]
             dg_last += jnp.sum(dk * keys.astype(jnp.float32))
             ds = jnp.where(causal, ds * jnp.exp2(_pairs(gate, gate)), 0.0) * scale
             ds = ds.astype(keys.dtype)
