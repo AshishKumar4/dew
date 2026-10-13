@@ -366,12 +366,7 @@ def tune(lower: Callable[[], jax.stages.Lowered], *, measure: bool = False) -> s
     with launches():
         lowered = lower()
     found = [(op, op.keyed(ba)) for ba in _bound_args(lowered) if isinstance(op := ba.op, KernelOp)]
-    unmeasured = _settle(found, measure=measure)
-    if unmeasured and found and (kind := _kind(found[0][1])) not in _told:
-        _told.add(kind)
-        _log.warning("%d kernel launches have no config measured on %s, so they run the nearest measured "
-                     "shape's or their heuristic: measure them on a GPU to yourself with "
-                     "Trainer(tune_kernels=True) or `python tools/kernel_picks.py`", unmeasured, kind)
+    _settle(found, measure=measure)
     return dump_bound_args_to_json([ba for _, ba in found])
 
 
@@ -396,7 +391,8 @@ def missing(lowered: jax.stages.Lowered) -> int:
 def _settle(found: list[tuple[KernelOp, tokamax.BoundArguments]], *, measure: bool) -> int:
     """Take process 0's picks for the keyed launches `found` on every process,
     process 0 measuring a launch without one where `measure` and it has its
-    GPU to itself; how many still have none."""
+    GPU to itself; how many still have none, which the process says once,
+    with how to measure them."""
     if not found:
         return 0
     kind = _kind(found[0][1])
@@ -435,7 +431,13 @@ def _settle(found: list[tuple[KernelOp, tokamax.BoundArguments]], *, measure: bo
     if any(coordination.from_every_process(changed)):
         # A program lowered again traces again, with the picks it now reads.
         cache.KERNEL_TUNES.set_global(cache.KERNEL_TUNES.get_global() + 1)
-    return sum(_pick(ba) is None for _, ba in found)
+    unmeasured = sum(_pick(ba) is None for _, ba in found)
+    if unmeasured and kind not in _told:
+        _told.add(kind)
+        _log.warning("%d kernel launches have no config measured on %s, so they run the nearest measured "
+                     "shape's or their heuristic: measure them on a GPU to yourself with "
+                     "Trainer(tune_kernels=True) or `python tools/kernel_picks.py`", unmeasured, kind)
+    return unmeasured
 
 
 @contextlib.contextmanager
