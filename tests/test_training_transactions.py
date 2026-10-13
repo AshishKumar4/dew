@@ -253,22 +253,21 @@ def test_local_partial_snapshot_survives_continued_training_and_weight_restore(t
         np.testing.assert_array_equal(raw_leaf(got), raw_leaf(want))
 
 
-@pytest.mark.parametrize("dynamic_scale", [False, True])
-def test_an_accumulating_step_updates_the_optimizer_in_its_commit_alone(dynamic_scale):
+def test_an_accumulating_step_updates_the_optimizer_in_its_commit_alone():
     """A window's microbatches before its last only accumulate: nothing in the
-    step outside the commit's branch reads an AdamW moment. XLA's conditional
-    simplifier runs a branch of elementwise ops and reductions on every call
-    and selects its result; on Qwen3.5-0.8B that was the whole update every microbatch.
-    The dynamic scaler's own branch, which skips a non-finite update, is held
-    to the same."""
+    step outside the commit's branch reads an Adam moment. XLA's conditional
+    simplifier runs a branch of elementwise ops and reductions, as a clipped
+    AdamW's update is (`OptimConfig`'s), on every call and selects its
+    result; on Qwen3.5-0.8B that was the whole update every microbatch."""
+    from dew.config import OptimConfig
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.objectives.lm import LMObjective
     from dew.telemetry.instrumentation import hlo_instructions
 
     model = CausalTransformer(vocab_size=64, emb_features=16, num_layers=1, num_heads=2, mlp_features=32,
                               max_seq_len=8)
-    train = Trainer(LMObjective(model, 8), optax.adamw(1e-3), key=jax.random.PRNGKey(0), accumulation=2,
-                    dynamic_scale=dynamic_scale)
+    train = Trainer(LMObjective(model, 8), OptimConfig(learning_rate=1e-3).build(10),
+                    key=jax.random.PRNGKey(0), accumulation=2)
     state = train.initial_state()
     rows = jax.device_count()
     train.compile(state, {"text": np.arange(rows * 9, dtype=np.int32).reshape(rows, 9) % 64})
