@@ -102,11 +102,11 @@ This preset runs tiny models on a simulated 8-device CPU mesh. It checks the too
 
 ```
 python tools/benchmark_data.py data:oxford-flowers --batch 8 \
-    --data.image-size 64 --steps 100 --warmup 5 --data.loading.workers {0,8} \
-    --data.path <prepared version directory>
+    --data.image-size 64 --steps 100 --warmup 5 --loading.workers {0,8} \
+    --data.source <prepared version directory>
 ```
 
-The dataset was Oxford Flowers 102 from local TFDS ArrayRecord files: 8189 records, resized to 64px, with flip and jitter augmentation and CLIP tokenization per record. `TFDSImages` reads only prepared ArrayRecords and raises a `ValueError` without `--data.path`, so the command passes it.
+The dataset was Oxford Flowers 102 from local TFDS ArrayRecord files: 8189 records, resized to 64px, with flip and jitter augmentation and CLIP tokenization per record. The measurement predates the recipe API. The current equivalent is Images over a prepared TFDS Source, with explicit augmentation and caption encoding; preparation remains separate.
 
 | grain workers | samples/s | p50 step | p95 step |
 |---------------|-----------|----------|----------|
@@ -115,4 +115,4 @@ The dataset was Oxford Flowers 102 from local TFDS ArrayRecord files: 8189 recor
 
 With workers, the p50 is a queue read, so the loader only shows up in the p95. At 8 workers the pipeline delivers 505 images/s. The image rows of the first step table consume 489-2036 samples/s, and all but `hierarchical_mmdit` (489) are above 505. So at 64px this loader keeps up with `hierarchical_mmdit` and starves the other image models; if an image run shows a low `train/mfu`, check the loader first. The video rows count 8-frame clips, and this image loader does not measure video throughput.
 
-These two points are not the loader's ceiling. The measured run read with 16 threads, and `tools/benchmark_data.py` now has no read-thread setting of its own. It reads with the dataset spec's `Loading`, whose defaults are no worker processes and 64 threads, set with `--data.loading.workers` and `--data.loading.threads`. Oxford Flowers is also only 8189 small records, far from a sharded 12M-record set.
+These two points are not the loader's ceiling. The measured run read with 16 threads, and `tools/benchmark_data.py` now has no read-thread setting of its own. It reads with the dataset spec's `Loading`, whose defaults are no worker processes and 16 threads, set with `--loading.workers` and `--loading.threads`. Oxford Flowers is also only 8189 small records, far from a sharded 12M-record set.
