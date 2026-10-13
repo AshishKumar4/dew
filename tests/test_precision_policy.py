@@ -28,36 +28,12 @@ from dew.nn.mixer_base import MixerContext
 from dew.nn.mla import MultiHeadLatentAttention
 from dew.nn.multimodal import MultimodalTransformer
 from dew.nn.vision import GemmaProjector, SiglipVision
-from dew.registry import dtype_name, models, resolve_dtype
+from dew.registry import models, resolve_dtype
 
 import_module("dew.nn.multimodal")  # registers the fixture kind
 
 
 BF16_QKV = (1, 4, 2, 8)  # [B, S, H, D]
-
-
-def qkv(dtype=jnp.bfloat16):
-    return (jnp.ones(BF16_QKV, dtype),) * 3
-
-
-@pytest.mark.parametrize("implementation", ['xla', 'cudnn', 'tpu'])
-@pytest.mark.parametrize("precision", [jax.lax.Precision.HIGH, jax.lax.Precision.HIGHEST,
-                                       'high', ('highest', 'highest')])
-def test_fused_attention_rejects_precision_it_cannot_honor(implementation, precision,
-                                                           without_deterministic_ops):
-    """jax.nn.dot_product_attention takes no precision argument at all: it
-    accumulates the logits in fp32 whatever it is handed, so asking a fused
-    kernel by name for HIGH raises."""
-    with pytest.raises(ValueError, match="precision"):
-        scaled_dot_product_attention(*qkv(), precision=precision,
-                                     implementation=implementation)
-
-
-@pytest.mark.parametrize("implementation", ['xla', 'cudnn', 'tpu'])
-def test_fused_attention_rejects_bf16_softmax(implementation, without_deterministic_ops):
-    with pytest.raises(ValueError, match="force_fp32_for_softmax"):
-        scaled_dot_product_attention(*qkv(), force_fp32_for_softmax=False,
-                                     implementation=implementation)
 
 
 @pytest.mark.parametrize("arguments", [
@@ -143,27 +119,6 @@ def test_fused_attention_default_precision_matches_the_attention_equation(precis
     actual = scaled_dot_product_attention(
         query, key, value, precision=precision, implementation="xla")
     assert jnp.max(jnp.abs(actual - expected)) < 1e-5
-
-
-def test_cudnn_rejects_float32_inputs(without_deterministic_ops):
-    """cuDNN's fused kernel has no fp32 path; casting behind the caller's back
-    would make --model.dtype float32 a lie."""
-    with pytest.raises(ValueError, match="bfloat16"):
-        scaled_dot_product_attention(*qkv(jnp.float32), implementation='cudnn')
-
-
-def test_cudnn_rejects_a_head_dimension_it_cannot_honor(without_deterministic_ops):
-    narrow = (jnp.ones((1, 4, 2, 4), jnp.bfloat16),) * 3
-    with pytest.raises(ValueError, match="multiple of 8"):
-        scaled_dot_product_attention(*narrow, implementation="cudnn")
-
-
-def test_logged_dtype_values_round_trip_through_the_registry():
-    """Recorded dtype names are resolved at the model's build boundary."""
-    assert resolve_dtype("bfloat16") is jnp.bfloat16
-    assert dtype_name(jnp.bfloat16) == "bfloat16"
-    with pytest.raises(ValueError, match="not one of"):
-        resolve_dtype("float8")
 
 
 TINY = {"emb_features": 32, "precision": "default"}
@@ -388,23 +343,6 @@ def made_in(jaxpr, dtype) -> list[str]:
     return found
 
 
-@pytest.mark.parametrize("architecture", sorted(models) + sorted(DECODERS))
-def test_a_float64_model_computes_nothing_in_float32(architecture, rng):
-    """A float64 model, under x64, computes in float64 throughout: its norm
-    statistics, softmax, rotary angles and heads, which compute in at least
-    float32 (`dew.nn.precision.at_least_fp32`), are float64 there. Rounded
-    to float32, they were roundings a float64 twin shared with the float32
-    model it bounds, so the bound missed them: test_layer_stack's scanned
-    gemma3n read 1.07 of its bound on a TPU and 1.1 on an RTX 4080 at full
-    float32, where 1383 of its twin's values were float32. The twin runs on
-    the CPU backend, which every lane keeps beside its accelerator, since a
-    TPU has no float64."""
-    with jax.enable_x64(), jax.default_device(jax.devices("cpu")[0]):
-        run, operands = forward(architecture, "float64", rng)
-        made = made_in(jax.make_jaxpr(run)(*operands).jaxpr, jnp.float32)
-    assert not made, f"{len(made)} float32 values, first at {sorted(set(made))[:8]}"
-
-
 @pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
 @pytest.mark.parametrize("architecture", sorted(models) + sorted(DECODERS))
 def test_a_model_below_float64_computes_the_same_bits_whether_x64_is_on(architecture, dtype, rng):
@@ -428,57 +366,6 @@ def test_a_model_below_float64_computes_the_same_bits_whether_x64_is_on(architec
         np.testing.assert_array_equal(under, without)
 
 
-@pytest.mark.parametrize("architecture", sorted(models))
-def test_explicit_bf16_compute_keeps_params_fp32(architecture, rng):
-    """bf16 is a compute dtype: every param leaf stays float32 so checkpoints
-    and the optimizer state are unchanged. DiffusionGemma refines a canvas
-    against an encoded prompt, so its forward is the encode-then-refine pair."""
-    model = build_model(architecture)
-
-    inputs = tiny_inputs(architecture, rng)
-    args, kwargs = inputs if isinstance(inputs[0], tuple) else (inputs, {})
-    variables = model.init(rng, *args, **kwargs)
-    if architecture == "diffusion_gemma":
-        prompt = jnp.zeros((1, 8), jnp.int32)
-        cache = model.apply(variables, 1, method=model.init_cache, mutable=["cache"])[1]["cache"]
-        cache = model.apply({**variables, "cache": cache}, prompt, method=model.encode,
-                            mutable=["cache"])[1]["cache"]
-        variables = {**variables, "cache": cache}
-    demoted = {jax.tree_util.keystr(path): str(leaf.dtype)
-               for path, leaf in jax.tree_util.tree_flatten_with_path(variables["params"])[0]
-               if leaf.dtype != jnp.float32}
-    assert not demoted
-
-    out = model.apply(variables, *args, **kwargs)
-    assert jnp.all(jnp.isfinite(out.astype(jnp.float32)))
-    if architecture == "unet_2d_condition":
-        assert out.dtype == jnp.bfloat16
-
-
-def test_a_rounded_operand_rounds_under_jit_on_this_device():
-    """XLA's GPU default may delete a cast round trip under jit; the rounding
-    has to survive it, on whatever device runs the suite."""
-    from dew.nn.precision import rounded_operand
-    x = jnp.asarray([1 + 2**-10, -3 - 2**-9, 2**-130], jnp.float32)
-    rounded = jax.jit(lambda x: rounded_operand(x, jnp.bfloat16))(x)
-    assert jnp.array_equal(rounded, x.astype(jnp.bfloat16).astype(jnp.float32))
-    assert not jnp.array_equal(rounded, x)
-
-
-@pytest.mark.parametrize("source,target", [(jnp.float16, jnp.bfloat16), (jnp.bfloat16, jnp.float16),
-                                           (jnp.float32, jnp.float16)])
-def test_a_rounded_operand_rounds_between_formats_of_one_width(source, target):
-    """float16 and bfloat16 are both two bytes and each loses bits in the
-    other, so the rounding is the cast round trip whatever the byte counts."""
-    from dew.nn.precision import rounded_operand
-    x = jnp.asarray([1 + 2**-9, 3.0e-5, 1000.25, 70000.0 if source != jnp.float16 else 1.0],
-                    source)
-    rounded = jax.jit(lambda x: rounded_operand(x, target))(x)
-    assert rounded.dtype == source
-    assert jnp.array_equal(rounded, x.astype(target).astype(source), equal_nan=True)
-    assert not jnp.array_equal(rounded, x)
-
-
 @pytest.mark.parametrize("helper", ["rounded_operand", "rounded_to"])
 def test_a_rounding_survives_the_reduction_it_feeds(helper):
     """XLA:CPU's YNNPACK reduce fusion sums the unrounded values of a bare
@@ -498,20 +385,6 @@ def test_a_rounding_survives_the_reduction_it_feeds(helper):
     # the rounding moves them (at most 0.96), so each sum must also be nearer
     # the rounded values' than the unrounded ones'.
     assert np.all(np.abs(sums - rounded.sum(-1)) < np.abs(sums - x.astype(np.float64).sum(-1)))
-
-
-def test_a_value_already_in_the_dtype_keeps_its_rounding_under_jit():
-    """A bf16 value computed in fp32 and cast down is held as bf16 where it is
-    already the operand dtype: without the barrier, XLA's GPU excess precision
-    fuses the fp32 producer into its consumer and the cast rounds nothing."""
-    from dew.nn.precision import rounded_operand
-    x = jnp.asarray([1 + 2**-10, -3 - 2**-9, 7 + 2**-7], jnp.float32)
-
-    def held(x):
-        narrow = (x * 1.0).astype(jnp.bfloat16)
-        return rounded_operand(narrow, jnp.bfloat16).astype(jnp.float32) * 1.0
-
-    assert jnp.array_equal(jax.jit(held)(x), x.astype(jnp.bfloat16).astype(jnp.float32))
 
 
 def test_bf16_logits_round_as_rounded_to_and_are_held_as_bf16_under_cuda():

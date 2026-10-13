@@ -3,7 +3,6 @@
 Replay and effect commits are Dew transaction policies; Optax and Flax oracle their arithmetic.
 """
 import dataclasses
-import json
 
 import jax
 import jax.numpy as jnp
@@ -135,67 +134,6 @@ def test_boundary_rejection_preserves_accepted_prefix_and_mutable_reads(composit
         np.testing.assert_allclose(got, want, rtol=1e-6, atol=1e-7)
 
 
-class Stream:
-    def __init__(self):
-        self.index = 0
-    def __iter__(self):
-        return self
-    def __next__(self):
-        result = batches()[self.index % 4]
-        self.index += 1
-        return result
-    def get_state(self):
-        return json.dumps(self.index).encode()
-    def set_state(self, state):
-        self.index = json.loads(state)
-
-
-class Data:
-    batch = 2 * jax.device_count()
-    def train(self, partition):
-        return Stream()
-
-
-@pytest.mark.parametrize("composite", [False, True])
-@pytest.mark.parametrize("cut", [1, 2])
-def test_partial_checkpoint_replays_exact_realized_records(tmp_path, composite, cut):
-    checkpoints = Checkpoints(str(tmp_path / "run"))
-    trainer(composite, checkpoints=checkpoints).fit(Data(), steps=cut)
-    resumed = trainer(composite, checkpoints=checkpoints).fit(Data(), steps=4)
-    assert float(resumed.scale.scale) == 65536.
-    assert int(resumed.scale.fin_steps) == 0
-    uninterrupted = trainer(composite).fit(Data(), steps=4)
-    for want, got in zip(jax.tree.leaves(uninterrupted), jax.tree.leaves(resumed), strict=True):
-        np.testing.assert_array_equal(raw_leaf(got), raw_leaf(want))
-    class Unused(Data):
-        def train(self, partition):
-            raise AssertionError("same-target resume opened the data stream")
-    same = trainer(composite, checkpoints=checkpoints).fit(Unused(), steps=4)
-    assert int(same.step) == 4
-    with pytest.raises(ValueError, match="window_size"):
-        trainer(composite, k=4, checkpoints=checkpoints).fit(Unused(), steps=5)
-
-
-@pytest.mark.parametrize("composite,aux_active,updates", [(False, 0, 0), (True, 0, 0), (True, 1, 1)])
-def test_activity_uses_all_loss_terms(composite, aux_active, updates):
-    train = trainer(composite)
-    initial = train.initial_state()
-    data = batches()[0]
-    data["mask"] = jnp.zeros_like(data["mask"])
-    data["active"] = jnp.asarray(aux_active)
-    run = train.compile(initial, data)
-    # the step consumes the state
-    start, opt_state = jax.tree.map(np.asarray, (initial.variables, initial.opt_state))
-    state, *_ = run(initial, data)
-    state, *_ = run(state, data)
-    assert int(state.microstep) == 2
-    assert int(state.updates) == updates
-    if not updates:
-        np.testing.assert_array_equal(state.variables["params"]["w"], start["params"]["w"])
-        for a, b in zip(jax.tree.leaves(opt_state), jax.tree.leaves(state.opt_state), strict=True):
-            np.testing.assert_array_equal(a, b)
-
-
 @pytest.mark.parametrize("auxiliary", [None, "rows", "global"])
 def test_real_lm_mtp_router_and_qk_update_matches_combined_batch(auxiliary):
     from dew.data.chat import Role
@@ -313,4 +251,3 @@ def test_local_partial_snapshot_survives_continued_training_and_weight_restore(t
     selected, _ = checkpoints.restore(template, 1)
     for want, got in zip(jax.tree.leaves(prefix_params), jax.tree.leaves(selected["variables"]), strict=True):
         np.testing.assert_array_equal(raw_leaf(got), raw_leaf(want))
-

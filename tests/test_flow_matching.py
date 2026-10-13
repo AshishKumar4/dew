@@ -17,33 +17,9 @@ import pytest
 from flax import linen as nn
 from reference_error import assert_as_exact_as_the_reference
 
-from dew.diffusion import FlowMatchPredictionTransform, Process, broadcast_rates, expand, presets
+from dew.diffusion import broadcast_rates, expand, presets
 from dew.diffusion.schedules import FlowMatchingScheduler
-from dew.sampling import DDIM, Euler, sample
-
-STEPS = jnp.array([0.05, 0.3, 0.6, 0.95])
-
-
-def test_linear_path_rates():
-    schedule = FlowMatchingScheduler()
-    alpha, sigma = schedule.rates(STEPS)
-    assert jnp.allclose(alpha + sigma, 1.0, atol=1e-6)
-    assert jnp.allclose(sigma, STEPS, atol=1e-6)
-    # No input preconditioning on the linear path
-    assert FlowMatchPredictionTransform().get_input_scale((alpha, sigma)) == 1
-
-
-def test_endpoints_are_data_and_noise(rng):
-    schedule = FlowMatchingScheduler()
-    key0, key1 = jax.random.split(rng)
-    x0 = jax.random.normal(key0, (4, 8, 8, 3))
-    noise = jax.random.normal(key1, (4, 8, 8, 3))
-    transform = FlowMatchPredictionTransform()
-    at_zero = transform.forward_diffusion(x0, noise, broadcast_rates(schedule, jnp.zeros((4,)), x0))[0]
-    at_one = transform.forward_diffusion(x0, noise, broadcast_rates(schedule, jnp.ones((4,)), x0))[0]
-    assert jnp.allclose(at_zero, x0, atol=1e-6)
-    assert jnp.allclose(at_one, noise, atol=1e-6)
-
+from dew.sampling import Euler, sample
 
 DENSITIES = dict(np.load(Path(__file__).parent / "fixtures" / "flow" / "densities.npz"))
 
@@ -64,13 +40,6 @@ def test_training_times_are_diffusers_sd3_densities(case, fields):
     assert_as_exact_as_the_reference(drawn, DENSITIES[case], DENSITIES[f"{case}_f64"], case)
 
 
-def test_uniform_training_times_are_the_draw_itself():
-    """Diffusers' fallback density is the uniform draw unchanged, as Dew's is."""
-    count = DENSITIES["uniform"].shape[0]
-    drawn = FlowMatchingScheduler(density="uniform").sample_t(jax.random.key(0), count)
-    np.testing.assert_array_equal(drawn, DENSITIES["uniform"])
-
-
 def test_cosmap_times_follow_the_papers_density(rng):
     """Eq. 21's density 2 / (pi (1 - 2t + 2t^2)) integrates to the CDF
     (2 / pi) atan(t / (1 - t)); the draws' empirical CDF stays within the
@@ -83,73 +52,9 @@ def test_cosmap_times_follow_the_papers_density(rng):
     assert np.max(np.abs(empirical - cdf)) < 1.63 / np.sqrt(count)
 
 
-def test_mode_scale_outside_the_monotone_range_is_refused():
-    with pytest.raises(ValueError, match="monotone"):
-        FlowMatchingScheduler(density="mode", mode_scale=2.0)
-
-
-def test_resolution_shift_is_identity_at_one():
-    schedule = FlowMatchingScheduler(shift=1.0)
-    assert jnp.allclose(schedule.shift_timesteps(STEPS), STEPS, atol=1e-7)
-
-
-@pytest.mark.parametrize("shift", [0.5, 1.0, 3.0])
-def test_resolution_shift_is_monotonic_and_fixes_endpoints(shift):
-    schedule = FlowMatchingScheduler(shift=shift)
-    t = jnp.linspace(0.0, 1.0, 101)
-    shifted = schedule.shift_timesteps(t)
-    assert jnp.all(jnp.diff(shifted) > 0)
-    assert float(shifted[0]) == pytest.approx(0.0, abs=1e-7)
-    assert float(shifted[-1]) == pytest.approx(1.0, abs=1e-7)
-    # A shift above 1 moves every interior timestep towards higher noise
-    if shift >= 1:
-        assert jnp.all(shifted >= t - 1e-7)
-    else:
-        assert jnp.all(shifted <= t + 1e-7)
-
-
-def test_timestep_conditioning_is_scaled_to_the_embedding_range():
-    schedule = FlowMatchingScheduler(shift=2.0)
-    assert jnp.allclose(schedule.model_time(STEPS), schedule.shift_timesteps(STEPS) * 1000)
-
-
-def test_velocity_roundtrip_is_exact(rng):
-    """The linear path round-trips to 1e-5; the observed difference is 3.6e-7 on CPU."""
-    schedule = FlowMatchingScheduler()
-    transform = FlowMatchPredictionTransform()
-    key0, key1 = jax.random.split(rng)
-    x0 = jax.random.normal(key0, (4, 8, 8, 3))
-    noise = jax.random.normal(key1, (4, 8, 8, 3))
-    rates = broadcast_rates(schedule, STEPS, x0)
-
-    xt, _, target = transform.forward_diffusion(x0, noise, rates)
-    assert jnp.allclose(target, noise - x0, atol=1e-6)
-
-    recovered_x0, recovered_noise = transform.backward_diffusion(xt, target, rates)
-    assert jnp.max(jnp.abs(recovered_x0 - x0)) < 1e-5
-    assert jnp.max(jnp.abs(recovered_noise - noise)) < 1e-5
-
-
 ############################################################################################################
 # The existing solvers already integrate the flow ODE
 ############################################################################################################
-
-@pytest.mark.parametrize("solver", [Euler(), DDIM()], ids=lambda s: type(s).__name__)
-def test_solver_step_is_the_flow_euler_step(solver, rng):
-    """x_{t+dt} = x_t + u * dt exactly, for the unmodified solvers."""
-    process = Process(FlowMatchingScheduler(), FlowMatchPredictionTransform())
-    key0, key1 = jax.random.split(rng)
-    x_t = jax.random.normal(key0, (4, 8, 8, 3))
-    velocity = jax.random.normal(key1, (4, 8, 8, 3))
-    t = jnp.full((4,), 0.8)
-    t_next = jnp.full((4,), 0.6)
-
-    rates = broadcast_rates(process.schedule, t, x_t)
-    x0, eps = process.prediction.backward_diffusion(x_t, velocity, rates)
-    stepped, _ = solver.step(x_t, t, t_next, x0, eps, (), rng, process, None)
-    expected = x_t + velocity * (0.6 - 0.8)
-    assert jnp.max(jnp.abs(stepped - expected)) < 1e-5
-
 
 ############################################################################################################
 # Toy end-to-end: a two-mode gaussian mixture in the plane

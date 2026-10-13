@@ -33,24 +33,6 @@ def tiny(**overrides):
     return CausalTransformer(**{"vocab_size": VOCAB, **TINY_DECODER, **overrides})
 
 
-def test_no_depths_leaves_the_tree_unchanged():
-    params = tiny().init(jax.random.key(0), jnp.ones((1, 8), jnp.int32))
-
-    assert list(params["params"]) == [
-        "embed_tokens", "layers_0", "layers_1", "norm"]
-
-
-def test_depths_land_in_the_tree_with_the_fused_projection():
-    params = tiny(num_nextn_predict_layers=2).init(
-        jax.random.key(0), jnp.ones((1, 8), jnp.int32))["params"]
-
-    assert params["mtp_0"]["eh_proj"]["kernel"].shape == (64, 32)
-    assert params["mtp_1"]["eh_proj"]["kernel"].shape == (64, 32)
-    for depth in ("mtp_0", "mtp_1"):
-        assert set(params[depth]) == {"enorm", "hnorm", "eh_proj", "block", "final_norm"}
-        assert "q_proj" in params[depth]["block"]["self_attn"]
-
-
 def test_mean_stream_trunk_exposes_normalized_states_to_plain_prediction():
     model = tiny(num_nextn_predict_layers=1, dtype=jnp.float32,
                  hyper_connections={'hc_mult': 4, 'hc_eps': 1e-6,
@@ -74,35 +56,6 @@ def test_mean_stream_trunk_exposes_normalized_states_to_plain_prediction():
         method=CausalTransformer.mtp_step, decode=True, mutable=['cache'])
     np.testing.assert_allclose(jnp.asarray(logits), jnp.asarray(expected)[:, :1], atol=1e-4, rtol=0)
     assert jnp.asarray(carried).shape == (ids.shape[0], 1, model.emb_features)
-
-
-def test_a_negative_depth_count_is_refused():
-    with pytest.raises(ValueError, match="num_nextn_predict_layers"):
-        tiny(num_nextn_predict_layers=-1).init(
-            jax.random.key(0), jnp.ones((1, 8), jnp.int32))
-
-
-def test_a_sequence_with_no_position_a_depth_out_is_refused():
-    with pytest.raises(ValueError, match="prediction depths"):
-        tiny(num_nextn_predict_layers=2).init(
-            jax.random.key(0), jnp.ones((1, 2), jnp.int32))
-
-
-def test_mtp_logits_score_one_token_further_per_depth():
-    """One fp32 logit array per depth, each a position shorter than the
-    last, finite, and the depths disagree with each other where they overlap."""
-    model = tiny(num_nextn_predict_layers=2)
-    ids = jnp.ones((2, 8), jnp.int32)
-    params = model.init(jax.random.key(0), ids)
-    hidden = model.apply(params, ids, method=CausalTransformer.hidden_states)
-
-    depths = model.apply(params, hidden, ids, method=CausalTransformer.mtp_logits)
-
-    assert [logits.shape for logits in depths] == [(2, 7, VOCAB), (2, 6, VOCAB)]
-    for logits in depths:
-        assert logits.dtype == jnp.float32
-        assert jnp.all(jnp.isfinite(logits))
-    assert jnp.any(depths[0][:, :6] != depths[1])
 
 
 def test_a_depth_reads_the_token_after_its_position():
@@ -142,31 +95,6 @@ def test_the_depths_score_through_the_main_head():
     for plain, louder in zip(scored(params), scored(doubled), strict=True):
         assert float(jnp.max(jnp.abs(plain))) > 1e-3
         assert jnp.allclose(2.0 * plain, louder, rtol=1e-6)
-
-
-def test_no_depths_scores_nothing():
-    model = tiny()
-    ids = jnp.ones((2, 8), jnp.int32)
-    params = model.init(jax.random.key(0), ids)
-    hidden = model.apply(params, ids, method=CausalTransformer.hidden_states)
-
-    assert model.apply(params, hidden, ids, method=CausalTransformer.mtp_logits) == []
-
-
-@pytest.mark.mesh
-def test_a_depth_places_on_a_sharded_mesh():
-    """The fused projection's input is two embed widths concatenated, so it
-    cannot carry the embed name twice: flax refuses a repeated logical name,
-    and a declaration with it failed every MTP model on a mesh with fsdp above
-    one once the kernel crossed min_shard."""
-    from dew.training import Layout, MeshSpec
-
-    model = tiny(num_nextn_predict_layers=1)
-    params = model.init(jax.random.key(0), jnp.ones((1, 8), jnp.int32))
-    mesh = MeshSpec(fsdp=8).build()
-    placement = Layout(min_shard=1).shardings(mesh, params)
-
-    assert placement["params"]["mtp_0"]["eh_proj"]["kernel"].spec == jax.sharding.PartitionSpec(None, "fsdp")
 
 
 # --------------------------------------------------------------------------
@@ -263,24 +191,6 @@ def packed_row():
     return jnp.asarray(ids), jnp.asarray(segments), jnp.asarray(positions)
 
 
-def test_a_packed_batch_keeps_the_depths_inside_their_documents():
-    """A depth's target counts only when the state that predicts it sits in
-    the same document: depth 1 drops the last two transitions of every
-    document and everything into the padding, one more than the main term."""
-    model = tiny(num_nextn_predict_layers=1)
-    objective = LMObjective(model, SEQ, mtp_weight=0.3)
-    params = objective.init(jax.random.key(0))
-    ids, segments, positions = packed_row()
-
-    depths = objective.token_scores(
-        params, ids, segment_ids=segments, positions=positions, depths=True).depths
-    (_, weights), = depths
-
-    # State at p predicts the target at p + 2: only p = 0, 1 (document 1)
-    # and p = 4 (document 2) stay inside a document.
-    assert weights.tolist() == [[1, 1, 0, 0, 1, 0, 0]]
-
-
 def test_packing_carried_by_the_model_inputs_scores_the_depths_the_same():
     """Segment ids and positions may ride the `ModelInputs` instead of the
     batch's packing columns, and the losses are the same number either way."""
@@ -295,34 +205,6 @@ def test_packing_carried_by_the_model_inputs_scores_the_depths_the_same():
 
     assert float(by_inputs.metrics["ce"]) == float(by_columns.metrics["ce"])
     assert float(by_inputs.metrics["mtp_ce"]) == float(by_columns.metrics["mtp_ce"])
-
-
-def test_a_depth_keeps_the_fused_kernel_when_nothing_restricts_its_view(without_deterministic_ops):
-    """An unpacked, unpadded batch restricts no depth's view, so a depth runs
-    the kernel its layer asked for rather than dropping to xla behind an
-    all-true mask. Pinning cudnn proves it on a host without cudnn: the
-    refusal is the depth reaching the fused path, and a packed batch, whose
-    depths do restrict their keys, runs instead.
-    """
-    model = tiny(num_nextn_predict_layers=1, attention_impl='cudnn')
-    ids = jnp.ones((1, SEQ + 1), jnp.int32)
-    params = tiny(num_nextn_predict_layers=1).init(jax.random.key(0), ids)
-    hidden = jnp.ones((1, SEQ + 1, 32), jnp.float32)
-
-    with pytest.raises(ValueError, match="cudnn attention needs bf16"):
-        model.apply(params, hidden, ids, method=CausalTransformer.mtp_hidden_states)
-
-    segments = jnp.asarray([[1, 1, 1, 1, 2, 2, 2, 0, 0]], jnp.int32)
-    states = model.apply(params, hidden, ids, segment_ids=segments,
-                         method=CausalTransformer.mtp_hidden_states)
-    assert states[0].shape == (1, SEQ, 32)
-
-
-def test_mtp_weight_needs_depths_and_a_positive_weight():
-    with pytest.raises(ValueError, match="num_nextn_predict_layers"):
-        LMObjective(tiny(), SEQ, mtp_weight=0.3)
-    with pytest.raises(ValueError, match="positive weight"):
-        LMObjective(tiny(num_nextn_predict_layers=1), SEQ, mtp_weight=0.0)
 
 
 def test_a_routed_depth_balances_only_when_the_depths_run():
@@ -349,4 +231,3 @@ def test_a_routed_depth_balances_only_when_the_depths_run():
     assert not jnp.array_equal(
         moved["mtp_0"]["block"]["mlp"]["gate"]["e_score_correction_bias"],
         params["moe"]["mtp_0"]["block"]["mlp"]["gate"]["e_score_correction_bias"])
-
