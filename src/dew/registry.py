@@ -28,7 +28,7 @@ import operator
 import sys
 import types
 import typing
-from collections.abc import Callable, Iterator, Mapping, MutableMapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, MutableMapping, MutableSequence, Sequence
 from enum import Enum
 from typing import (
     TYPE_CHECKING,
@@ -536,6 +536,11 @@ def _rebuilt(annotation: Annotation, value: object, *, dtypes: bool, name: str =
             if not classes:
                 raise ValueError(f"{annotation} declares no class, so nothing builds the record {value!r}")
             return _built(_member(named[0], classes), named[1], dtypes=dtypes)
+        sequences = [member for member in inner if member in (tuple, Sequence, list)
+                     or typing.get_origin(member) in (tuple, Sequence, list, MutableSequence)]
+        if isinstance(value, list) and len(sequences) == 1:
+            # A record's list is the union's one sequence member (`Files.url: str | tuple[str, ...]`).
+            return _rebuilt(sequences[0], value, dtypes=dtypes)
         return configured(value)
     if isinstance(value, Mapping):
         if typing.get_origin(annotation) is Callable or annotation is Callable:

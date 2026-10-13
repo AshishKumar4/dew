@@ -7,7 +7,7 @@ import functools
 import inspect
 import threading
 from collections.abc import Callable, Mapping, Sequence
-from typing import TYPE_CHECKING, Literal, Protocol
+from typing import TYPE_CHECKING, ClassVar, Literal, Protocol
 
 import grain.python as grain
 import numpy as np
@@ -273,11 +273,13 @@ class Albumentations(grain.RandomMapTransform):
 
     transform: Augmentation
     field: str = "image"
+    # Each instance's own, set by __post_init__ and __setstate__; no field of its configuration.
+    _turn: ClassVar[threading.Lock]
 
-    @functools.cached_property
-    def _turn(self) -> threading.Lock:
-        """This stage's one lock in its process: the seed and the call it seeds go together."""
-        return threading.Lock()
+    def __post_init__(self) -> None:
+        # This stage's one lock in its process, made before any reader thread runs: the seed and
+        # the call it seeds go together.
+        object.__setattr__(self, "_turn", threading.Lock())
 
     def random_map(self, element: Batch, rng: np.random.Generator) -> Batch:
         with self._turn:
@@ -286,8 +288,12 @@ class Albumentations(grain.RandomMapTransform):
         return {**element, self.field: augmented}
 
     def __getstate__(self) -> dict:
-        # A worker builds its own lock.
         return {key: value for key, value in self.__dict__.items() if key != "_turn"}
+
+    def __setstate__(self, state: dict) -> None:
+        # A worker makes its own lock.
+        self.__dict__.update(state)
+        object.__setattr__(self, "_turn", threading.Lock())
 
 
 @dataclasses.dataclass(frozen=True, eq=False)
@@ -306,7 +312,8 @@ class Torchvision(grain.RandomMapTransform):
         seed = int(rng.integers(0, 2**63 - 1))
         pixels = torch.from_numpy(np.ascontiguousarray(element[self.field])).permute(2, 0, 1)
         with _torch_rng, torch.random.fork_rng(devices=[]):
-            torch.manual_seed(seed)
+            # The CPU generator alone, the one fork_rng restores; an accelerator's stays as it was.
+            torch.default_generator.manual_seed(seed)
             transformed = self.transform(pixels)
         return {**element, self.field: np.ascontiguousarray(np.asarray(transformed).transpose(1, 2, 0))}
 

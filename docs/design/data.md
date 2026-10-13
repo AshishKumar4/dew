@@ -70,7 +70,7 @@ Library stages are factories that return one of these shapes. `images.resize(256
 | `Hub(repo, name=, split=, columns=, revision=)` | Hugging Face Hub datasets, streamed or prepared. `split=` is HF's own named split. | HF datasets, Hub Parquet shards |
 | `TFDS(name, split=)` | TensorFlow Datasets | TFDS ArrayRecord |
 | `Memory(records or columns)` | Arrays, lists of dicts, DataFrames | numpy, pyarrow |
-| `from_hf(dataset)` | An existing `datasets.Dataset`, its `.map()`s already applied. A shuffled `IterableDataset` is refused, because HF drops its shuffle buffer on resume. | HF datasets |
+| `from_hf(dataset, name=)` | An existing `datasets.Dataset`, its `.map()`s already applied. An `IterableDataset` is named, with its version, since it has no content fingerprint; a shuffled one is refused, because HF drops its shuffle buffer on resume. | HF datasets |
 | `from_torch(dataset)` | A map-style `torch.utils.data.Dataset` | PyTorch |
 | `from_grain(dataset)` | A Grain `MapDataset` or `IterDataset` | Grain |
 | `from_iter(factory, state=, load_state=)` | Any resumable iterator: WebDataset, torchdata, Mosaic Streaming, Ray | the library's own state |

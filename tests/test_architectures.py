@@ -417,14 +417,12 @@ def truth(case: Case, tmp_path, initial):
     def wide(batch):
         return batch if case.is_lm else {**batch, case.sample_key: batch[case.sample_key].astype(np.float64)}
 
-    class Data:
-        train = staticmethod(lambda partition: map(wide, source()))
-        val = staticmethod(lambda partition: (wide(batch) for batch in [next(source())]))
-        batch = BATCH
-
+    data = Loader(train=lambda partition: map(wide, source()),
+                  val=lambda partition: (wide(batch) for batch in [next(source())]),
+                  batch=BATCH, records=None)
     wider = jax.tree.map(lambda leaf: leaf.astype(jnp.float64) if jnp.issubdtype(leaf.dtype, jnp.floating)
                          else jnp.copy(leaf), initial)
-    return trainer.fit(Data(), steps=2, state=wider)
+    return trainer.fit(data, steps=2, state=wider)
 
 
 @pytest.mark.parametrize("case", CASES, ids=IDS)

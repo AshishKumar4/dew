@@ -27,10 +27,26 @@ class HF(Dataset):
     `state_dict` checkpoints; the `.map()`s it holds are already applied. An
     image column reads as its encoded bytes, which `images.decode` decodes.
     `name` is its identity in a run's plan, a cache's key and its logs, its
-    fingerprint by default."""
+    fingerprint by default; a stream has no fingerprint of its content, so
+    it is named, with its version, or refused.
+
+    A stream resumes exactly from its `state_dict` only unshuffled, since
+    Hugging Face's shuffle buffer is not part of that state: one that
+    shuffles through it is refused; shuffle with the chain's
+    `shuffle(window=)` instead."""
 
     dataset: Any
     name: str | None = None
+
+    def __post_init__(self) -> None:
+        if not self.streamed:
+            return
+        if self.name is None:
+            raise ValueError("an IterableDataset has no fingerprint of its content; name it, with its "
+                             "version, so a resume can tell it from another stream: from_hf(dataset, name=)")
+        if _buffer_shuffled(self.dataset._ex_iterable):
+            raise ValueError("an IterableDataset's own shuffle loses its buffer on resume; pass it "
+                             "unshuffled and shuffle with the chain's shuffle(window=)")
 
     @property
     def streamed(self) -> bool:
@@ -86,14 +102,17 @@ class HF(Dataset):
 
 
 class _Streamed(grain.IterDataset):
-    """An `IterableDataset` as a Grain stream, its position its `state_dict`."""
+    """An `IterableDataset` as a Grain stream, its position its `state_dict`.
+    Each opening reads its own dataset over the same examples (`shard(1, 0)`):
+    an IterableDataset keeps the position of the iterator it made last, and
+    the position `load_state_dict` gave it for every later one."""
 
     def __init__(self, dataset):
         super().__init__()
         self._dataset = dataset
 
     def __iter__(self) -> grain.DatasetIterator:
-        return _StreamedIterator(self._dataset)
+        return _StreamedIterator(self._dataset.shard(num_shards=1, index=0))
 
 
 class _StreamedIterator(grain.DatasetIterator):
@@ -118,14 +137,7 @@ class _StreamedIterator(grain.DatasetIterator):
 
 def from_hf(dataset: datasets.Dataset | datasets.IterableDataset, name: str | None = None) -> HF:
     """A Hugging Face `datasets.Dataset` or `IterableDataset` as a Dew
-    dataset (`HF`). An `IterableDataset` resumes exactly from its own
-    `state_dict` only unshuffled, since its shuffle buffer is not part of that
-    state; shuffle it with the chain's `shuffle(window=)` instead."""
-    from datasets import IterableDataset
-
-    if isinstance(dataset, IterableDataset) and _buffer_shuffled(dataset._ex_iterable):
-        raise ValueError("an IterableDataset's own shuffle loses its buffer on resume; pass it unshuffled "
-                         "and shuffle with the chain's shuffle(window=)")
+    dataset (`HF`): an `IterableDataset` named, unshuffled."""
     return HF(dataset, name)
 
 
