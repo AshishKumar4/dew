@@ -9,6 +9,7 @@ move, and a weight-gradient GEMM traced at `up_proj/transpose` is a GEMM.
 
 import json
 
+import pytest
 from tool_support import load
 
 attribute = load("attribute_step")
@@ -143,6 +144,55 @@ def test_a_nameless_fusion_is_attributed_by_the_ops_it_fuses(tmp_path):
     assert time["by_part_ms"] == {"norm": {"backward": 2.0}}
 
 
+UPDATE = "\n".join([
+    "HloModule jit_step",
+    "",
+    "%fused_update.7 (param_0: f32[1024], param_1: f32[1024], param_2: f32[1024]) -> bf16[1024] {",
+    "  %param_0 = f32[1024]{0} parameter(0)",
+    "  %param_1 = f32[1024]{0} parameter(1)",
+    "  %param_2 = f32[1024]{0} parameter(2)",
+    "  %divide.3 = f32[1024]{0} divide(%param_1, %param_2)",
+    "  %subtract.4 = f32[1024]{0} subtract(%param_0, %divide.3)",
+    "  ROOT %convert.5 = bf16[1024]{0} convert(%subtract.4), "
+    "metadata={op_name=\"jit(step)/convert_element_type\" "
+    "source_file=\"/root/dew/src/dew/training/narrow.py\" source_line=94}",
+    "}",
+    "",
+    "ENTRY %main.3 (w: f32[1024], mu: f32[1024], nu: f32[1024]) -> bf16[1024] {",
+    "  %w = f32[1024]{0} parameter(0), metadata={op_name=\"current.variables['params']['w']\"}",
+    "  %mu = f32[1024]{0} parameter(1), metadata={op_name=\"current.opt_state[0].mu['w']\"}",
+    "  %nu = f32[1024]{0} parameter(2), metadata={op_name=\"current.opt_state[0].nu['w']\"}",
+    "  %bitcast.6 = f32[1024]{0} bitcast(%nu)",
+    "  ROOT %loop_convert_fusion.7 = bf16[1024]{0} fusion(%w, %mu, %bitcast.6), kind=kLoop, "
+    "calls=%fused_update.7, metadata={op_name=\"jit(step)/convert_element_type\" "
+    "source_file=\"/root/dew/src/dew/training/narrow.py\" source_line=94}",
+    "}",
+    "",
+])
+
+
+def test_a_fusion_that_reads_optimizer_state_is_the_optimizers(tmp_path):
+    """AdamW's update of a leaf is one fusion, named by its root, the parameter narrowed for
+    the next step's compute (Qwen3.5-0.8B's 12 ms of "other" on an A100): the moments it reads say it is
+    the optimizer's."""
+    reports = tmp_path / "profile" / "capture-a" / "reports"
+    reports.mkdir(parents=True)
+    columns = ["program_id", "category", "hlo_op_name", "hlo_op_expression", "tf_op_name", "occurrences",
+               "total_self_time", "source_info"]
+    cells = ("3", "loop fusion", "loop_convert_fusion.7", "%loop_convert_fusion.7 = bf16[1024]{0} fusion("
+             "f32[1024]{0} %w, f32[1024]{0} %mu, f32[1024]{0} %bitcast.6)", "jit(step)/convert_element_type",
+             "1", 3000.0, "src/dew/training/narrow.py:94")
+    (reports / "hlo_stats.json").write_text(json.dumps([{"cols": [{"id": name} for name in columns],
+                                                         "rows": [{"c": [{"v": v} for v in cells]}]}]))
+    (reports / "roofline_model.json").write_text(json.dumps({"p": {"peak_flop_rate": 311869.0}}))
+    dump = tmp_path / "hlo"
+    dump.mkdir()
+    (dump / "module_0003.jit_step.sm_8.0_gpu_after_optimizations.txt").write_text(UPDATE)
+    out = tmp_path / "attribution.json"
+    assert attribute.main(["--trace", str(tmp_path / "profile"), "--hlo", str(dump), "--out", str(out)]) == 0
+    assert json.loads(out.read_text())["time"]["by_part_kind_ms"] == {"optimizer": {"elementwise": 3.0}}
+
+
 def test_a_capture_attributes_its_time_by_part_and_kind(tmp_path):
     """Through the command: the step's time by kind and by part and kind, each op once."""
     reports = tmp_path / "profile" / "capture-a" / "reports"
@@ -202,32 +252,57 @@ def test_the_peak_is_dews_dense_bf16_figure_for_a_named_device(tmp_path):
     assert time["device_ms_per_step"] == 1.0
 
 
+CONTRACT_1 = ('backend_config={"gemm_backend_config":{"dot_dimension_numbers":'
+              '{"lhs_contracting_dimensions":["1"],"rhs_contracting_dimensions":["0"]}}}')
+GEMMS = "\n".join([
+    "HloModule jit_step",
+    "",
+    "ENTRY %main.9 (a: f32[5000,5000], b: f32[5000,5000], c: f8e4m3fn[10000,8000], "
+    "d: f8e4m3fn[8000,5000]) -> bf16[10000,5000] {",
+    "  %a = f32[5000,5000]{1,0} parameter(0)",
+    "  %b = f32[5000,5000]{1,0} parameter(1)",
+    "  %c = f8e4m3fn[10000,8000]{1,0} parameter(2)",
+    "  %d = f8e4m3fn[8000,5000]{1,0} parameter(3)",
+    "  %custom-call.1 = f32[5000,5000]{1,0} custom-call(f32[5000,5000]{1,0} %a, f32[5000,5000]{1,0} %b), "
+    f'custom_call_target="__cublas$gemm", {CONTRACT_1}',
+    "  ROOT %custom-call.2 = bf16[10000,5000]{1,0} custom-call(f8e4m3fn[10000,8000]{1,0} %c, "
+    f'f8e4m3fn[8000,5000]{{1,0}} %d), custom_call_target="__cublas$lt$matmul$f8", {CONTRACT_1}',
+    "}",
+    ""])
+
+
 def test_a_gemm_is_judged_at_its_compiled_flops_against_its_own_precisions_peak(tmp_path):
-    """XProf's normalized rate scales a GEMM's FLOPs by bf16's peak over its precision's, so an fp32
-    dot it takes for non-tensor-core arithmetic reads above any peak (the later Qwen3.5-0.8B step's GEMMs at 1.127 of
-    the A100's). The compiler's FLOPs over the measured time are the work done, and each GEMM's
-    fraction is of its own precision's peak in Dew's table, as mfu_mixed counts it."""
+    """A GEMM's work is its compiled FLOPs, counted from the op as the step's count counts it, over
+    the measured time; XProf's rates are not read. Its model rate put a cuBLAS weight-gradient GEMM
+    of C6's Qwen3.5-0.8B at 4x its work, and its normalized rate scales by bf16's peak over its own guess of the
+    op's precision (the later Qwen3.5-0.8B step's GEMMs at 1.127 of the A100's). Each GEMM's fraction is of its own
+    precision's peak in Dew's table, as mfu_mixed counts it."""
     reports = tmp_path / "profile" / "capture-a" / "reports"
     reports.mkdir(parents=True)
     columns = ["program_id", "category", "hlo_op_name", "hlo_op_expression", "tf_op_name", "occurrences",
                "total_self_time", "source_info", "normalized_flop_rate", "model_flop_rate"]
     cells = [("15", "custom-call", "custom-call.1", '%custom-call.1 = f32[8,8]{1,0} custom-call('
               'f32[8,8]{1,0} %a, f32[8,8]{1,0} %b), custom_call_target="__cublas$gemm"',
-              "jit(step)/dot_general", "1", 1000.0, "", 8.0e6, 2.5e5),
+              "jit(step)/dot_general", "1", 1000.0, "", 8.0e6, 1.0e6),
              ("15", "custom-call", "custom-call.2", '%custom-call.2 = bf16[8,8]{1,0} custom-call('
               'f8e4m3fn[8,8]{1,0} %a, f8e4m3fn[8,8]{1,0} %b), custom_call_target="__cublas$lt$matmul$f8"',
-              "jit(step)/dot_general", "1", 1000.0, "", 4.0e5, 8.0e5)]
+              "jit(step)/dot_general", "1", 1000.0, "", 4.0e5, 3.2e6)]
     rows = [{"c": [{"v": v} for v in row]} for row in cells]
     (reports / "hlo_stats.json").write_text(json.dumps([{"cols": [{"id": name} for name in columns],
                                                          "rows": rows}]))
     (reports / "roofline_model.json").write_text(json.dumps({"p": {"peak_flop_rate": 3742430.0}}))
     entry = tmp_path / "entry.json"
     entry.write_text(json.dumps({"model_flops_per_step": 1.05e12, "device": "NVIDIA RTX PRO 6000 Blackwell"}))
+    dump = tmp_path / "hlo"
+    dump.mkdir()
+    (dump / "module_0015.jit_step.sm_12.0_gpu_after_optimizations.txt").write_text(GEMMS)
     out = tmp_path / "attribution.json"
-    command = ["--trace", str(tmp_path / "profile"), "--out", str(out), "--entry", str(entry)]
+    command = ["--trace", str(tmp_path / "profile"), "--hlo", str(dump), "--out", str(out),
+               "--entry", str(entry)]
     assert attribute.main(command) == 0
     time = json.loads(out.read_text())["time"]
-    # 2.5e5 of the 5e5 GFLOP/s bf16 peak and 8e5 of the 1e6 FP8 peak, a millisecond each.
+    # 2.5e11 and 8e11 FLOPs a millisecond: 2.5e5 of the 5e5 GFLOP/s bf16 peak and 8e5 of the 1e6
+    # FP8 peak, whatever XProf's rows say (4x those).
     assert {record["hlo"]: record["fraction_of_peak"] for record in time["gemms_by_lost_time"]} == {
         "custom-call.1": 0.5, "custom-call.2": 0.8}
     assert time["gemm_fraction_of_peak"] == 0.65 and time["gemm_lost_ms"] == 0.7
@@ -236,9 +311,11 @@ def test_a_gemm_is_judged_at_its_compiled_flops_against_its_own_precisions_peak(
     assert time["mfu_mixed_of_device_time"] == 0.65
 
 
-def test_the_dump_reads_only_its_newest_module_from_an_archive(tmp_path):
-    """A dump holds every compile of the step; only the newest one's four files are extracted,
-    and the memory breakdown reads them a line at a time."""
+def test_the_dump_reads_the_compile_the_capture_ran_from_an_archive(tmp_path):
+    """A dump holds every compile of the step, a plan's candidates among them; only the four
+    files of the one the capture ran are extracted (the newest, without a capture), and the
+    memory breakdown reads them a line at a time. A capture of a compile the dump lacks is
+    refused."""
     import tarfile
 
     dump = tmp_path / "hlo"
@@ -257,7 +334,10 @@ def test_the_dump_reads_only_its_newest_module_from_an_archive(tmp_path):
     with tarfile.open(archive, "w:gz") as writer:
         writer.add(dump, arcname="hlo")
     for source in (archive, dump):
-        with attribute.dump_files(source, "jit_step") as files:
-            memory = attribute.attribute_memory(files)
-        assert (memory["peak_gib"], memory["total_bytes_gib"], memory["allocations_gib"]) == (
-            2.0, 2.0, {"parameter": 2.0})
+        for program, gib in ((None, 2.0), ("3", 1.0)):
+            with attribute.dump_files(source, "jit_step", program) as files:
+                memory = attribute.attribute_memory(files)
+            assert (memory["peak_gib"], memory["total_bytes_gib"], memory["allocations_gib"]) == (
+                gib, gib, {"parameter": gib})
+        with pytest.raises(SystemExit, match="ran program 9"), attribute.dump_files(source, "jit_step", "9"):
+            pass

@@ -582,6 +582,8 @@ class Mamba2Mixer(MixerBase):
     `head_dim` are the checkpoint's own.
     """
 
+    residuals = ('context', 'conv')
+
     # Its SSD scan's small batched dots gain from the fusions: 7.7% on an A100.
     keeps_triton_gemm = True
 
