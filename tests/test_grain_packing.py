@@ -1,12 +1,19 @@
-"""Packed windows against grain's own first-fit packer
-(`grain.experimental.FirstFitPackIterDataset`), which `first_fit` plans as."""
+"""Packed windows against grain's own packers: `first_fit` plans as
+`grain.experimental.FirstFitPackIterDataset` packs, and a memory read packs by
+the stage's policy as an indexed read does."""
 
 import grain
 import numpy as np
 import pytest
 from grain.experimental import FirstFitPackIterDataset
 
+from dew.data import Loading, Memory
+from dew.data.compile import validation
+from dew.data.dataset import DataPartition
+from dew.data.pipeline import Pipeline
 from dew.data.tokens import DocumentChunks, PackedWindows
+
+READ = Loading(workers=0, threads=1, read_buffer=0, worker_buffer=1)
 
 
 @pytest.mark.parametrize("window, bins", [(8, 1), (8, 3), (16, 4), (5, 2)])
@@ -35,3 +42,25 @@ def test_packed_windows_are_grains_first_fit_windows(window, bins):
             np.testing.assert_array_equal(got[key], expected[key], err_msg=f"window {index} {key}")
         for key in ("segment_ids", "positions"):
             np.testing.assert_array_equal(expected[f"text_roles_{key}"], expected[f"text_{key}"])
+
+
+@pytest.mark.parametrize("policy", ["first-fit", "best-fit", "concat"])
+def test_a_memory_read_packs_by_the_policy_an_indexed_read_packs_by(policy):
+    """read='memory' packs the whole corpus before the order and an indexed
+    read packs it as it streams. Both follow the stage's policy, so a pass
+    over either is the same windows, segment ids and positions in the same
+    order; first-fit, which has its own plan, is the control."""
+    lengths = (3, 7, 2, 5, 8, 4, 6, 2, 8, 3)
+    documents = [{"text": (np.arange(length) + 100 * index).astype(np.int32)}
+                 for index, length in enumerate(lengths)]
+    pipeline = Pipeline(Memory(documents)).pack(8, bins=3, policy=policy)
+
+    def windows(read):
+        reader = validation(pipeline, batch=2, read=read, loading=READ)(DataPartition())
+        try:
+            return [{key: np.asarray(value).tolist() for key, value in batch.items()} for batch in reader]
+        finally:
+            reader.close()
+
+    memory = windows("memory")
+    assert memory and memory == windows("indexed")
