@@ -34,7 +34,7 @@ temporaries, against 249 ms and 3.55 GiB for recomputing whole chunks.
 
 import math
 from collections.abc import Callable
-from typing import NamedTuple
+from typing import NamedTuple, cast
 
 import jax
 import jax.numpy as jnp
@@ -522,7 +522,7 @@ def _token_spec(shape: tuple[int, ...]) -> P:
 def chunked_cross_entropy(hidden, head: OutputTable, targets, chunks: int, *,
                           tile: tuple[int, int] | None = (1024, 8192),
                           predict: bool = True, temperature: float = 1.0,
-                          excluded: int | None = None):
+                          excluded: int | None = None) -> tuple[jax.Array, jax.Array | None, jax.Array]:
     """Per-token cross entropy of `head.logits(hidden)`, its top-1 column
     and its log partition, the head contracted in tiles.
 
@@ -615,8 +615,8 @@ def chunked_cross_entropy(hidden, head: OutputTable, targets, chunks: int, *,
     mesh = jax.sharding.get_abstract_mesh()
     if mesh.empty:
         return scored(hidden, table, targets, left_out, cap, bias)
-    return _sharded_head(mesh, hidden, table, targets, left_out, cap, bias, scored, column_logits,
-                         predict=predict)
+    return cast(tuple[jax.Array, jax.Array | None, jax.Array], _sharded_head(
+        mesh, hidden, table, targets, left_out, cap, bias, scored, column_logits, predict=predict))
 
 
 def _fused_terms(hidden, table, labels, weights, z_loss: float, cap, bias, chunk: int,
