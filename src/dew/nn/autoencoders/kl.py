@@ -12,14 +12,20 @@ from ..conv import Conv
 from .vae import FlaxDecoder, FlaxEncoder
 
 
-def posterior_latent(moments: jnp.ndarray, key: jax.Array | None) -> jnp.ndarray:
-    """The posterior mean when `key` is None, else one draw from it. The
-    moments split on the channel axis, and the log-variance is clamped to
-    [-30, 20] as diffusers' `DiagonalGaussianDistribution` clamps it."""
+def posterior_moments(moments: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """The posterior's mean and log-variance: the moments split on the channel
+    axis, the log-variance clamped to [-30, 20] as diffusers'
+    `DiagonalGaussianDistribution` clamps it."""
     mean, log_variance = jnp.split(moments, 2, axis=-1)
+    return mean, jnp.clip(log_variance, -30.0, 20.0)
+
+
+def posterior_latent(moments: jnp.ndarray, key: jax.Array | None) -> jnp.ndarray:
+    """The posterior mean when `key` is None, else one draw from it (`posterior_moments`)."""
+    mean, log_variance = posterior_moments(moments)
     if key is None:
         return mean
-    deviation = jnp.exp(0.5 * jnp.clip(log_variance, -30.0, 20.0))
+    deviation = jnp.exp(0.5 * log_variance)
     # Drawn in float32, as the rest of a step's draws are, whatever the
     # moments' precision, so a float64 run draws the same numbers.
     return mean + deviation * jax.random.normal(key, mean.shape, dtype=jnp.float32).astype(mean.dtype)
