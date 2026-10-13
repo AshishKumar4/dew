@@ -180,9 +180,9 @@ CARRIES = frozenset({"add", "add_any", "sub", "neg", "convert_element_type", "re
                      "slice", "dynamic_slice", "concatenate", "pad", "select_n", "optimization_barrier"})
 """The operations that carry the terms of sums into a leaf without making
 new ones: sums combined (tied weights, accumulated microbatches, an update
-added to a parameter) and moved. A product by a scalar carries them too,
-scaled (`_carried`); a product by a tensor is a Jacobian, through which the
-terms would be a bound over the whole graph, so it ends a leaf's terms."""
+added to a parameter) and moved. A product or quotient of a sum by a value
+that is none carries them too, scaled element by element (`_applied`), as
+`s_i sum_k x_ik` sums the terms `s_i x_ik`; a product of two sums ends them."""
 
 CALLS = ("jaxpr", "call_jaxpr", "fun_jaxpr")
 """The parameters a call names its body in (pjit, a remat, a custom rule)."""
@@ -202,13 +202,14 @@ def float64_terms(fn, *args):
     closed = jax.make_jaxpr(fn)(*args)
     values, energies = _evaluated(closed.jaxpr, closed.consts, jax.tree.leaves(args))
     tree = jax.tree.structure(jax.eval_shape(fn, *args))
-    return tree.unflatten(values), tree.unflatten([np.sqrt(np.asarray(energy)) for energy in energies])
+    return tree.unflatten(values), tree.unflatten([np.sqrt(np.asarray(_or_size(energy, value)))
+                                                   for energy, value in zip(energies, values, strict=True)])
 
 
 def _evaluated(jaxpr, consts, args, given=None):
     """`jaxpr`'s outputs and their terms' energies, the sums of their squares
     (`float64_terms`), from `args` and the energies `given` for them (none for
-    a computation's own inputs)."""
+    a computation's own inputs). A value no sum made has none."""
     from jax.extend.core import Literal
 
     wanted = _carrying(jaxpr)
@@ -230,7 +231,7 @@ def _evaluated(jaxpr, consts, args, given=None):
                                      any(var in wanted for var in equation.outvars))
         for var, value, made_energy in zip(equation.outvars, outputs, made, strict=True):
             values[var], energies[var] = value, made_energy
-    return [read(var) for var in jaxpr.outvars], [_or_size(energy(var), read(var)) for var in jaxpr.outvars]
+    return [read(var) for var in jaxpr.outvars], [energy(var) for var in jaxpr.outvars]
 
 
 def _carrying(jaxpr) -> set:
@@ -262,9 +263,8 @@ def _carried(equation) -> list[int]:
     if name == "reduce_sum" and np.prod(summed) == 1:
         # A sum over unit axes adds nothing: it moves its operand, as a broadcast's transpose does.
         return floats
-    if name in ("mul", "div") and len(floats) == 2:
-        scalar = [index for index in floats if not operands[index].aval.shape]
-        return [index for index in floats if index not in scalar] if len(scalar) == 1 else []
+    if name in ("mul", "div"):
+        return floats
     return []
 
 
@@ -304,12 +304,16 @@ def _applied(equation, inputs, given, wanted: bool):
                    else value for var, value in zip(equation.invars, inputs, strict=True)]
         return outputs, [equation.primitive.bind(*squares, **equation.primitive.get_bind_params(params))]
     if not carried:
-        return outputs, [_squared(value) for value in outputs]
+        return outputs, [None] * len(outputs)
     if name in ("mul", "div"):
-        (index,) = carried
-        scale = jnp.square(inputs[1 - index])
-        moved = _or_zero(given[index], inputs[index])
-        return outputs, [moved * scale if name == "mul" else moved / scale]
+        summed = [index for index in carried if given[index] is not None]
+        if len(summed) != 1 or (name == "div" and summed != [0]):
+            return outputs, [None] * len(outputs)
+        (index,) = summed
+        scale = jnp.square(jnp.abs(inputs[1 - index]))
+        return outputs, [given[index] * scale if name == "mul" else given[index] / scale]
+    if all(given[index] is None for index in carried):
+        return outputs, [None] * len(outputs)
     operands = [_or_zero(given[index], value) if index in carried else value
                 for index, value in enumerate(inputs)]
     primitive = jax.lax.add_p if name == "sub" else equation.primitive
@@ -363,7 +367,7 @@ def _or_zero(energy, value):
 
 
 def _or_size(energy, value):
-    """An output's energy: its own carried one, else its size's square."""
+    """An output's energy: the one its sums carried, else its own size's square."""
     if not jnp.issubdtype(jnp.result_type(value), jnp.inexact):
         return np.zeros(np.shape(value))
     return _squared(value) if energy is None else energy
