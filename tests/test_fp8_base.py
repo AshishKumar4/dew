@@ -5,10 +5,13 @@ kernels packed once, from the base the adapter freezes, as E4M3 rows for the
 forward product and for the input gradient (`frozen_fp8_leaves`); each such
 Dense computes its output from them inside the adapter's branch, its input's
 rows cast by the same FP8 block cast (`dew.interop.codecs`). The product is
-held to the float64 product of those exact operands, every site of a model
-is checked to take it, and a run with an FP8 base resumes, scans and shards
-as one with a bf16 base does. Where FP8 pays is a GPU's measurement
-(`measured_fp8_sites`), recorded with the generation it was taken on.
+held to the float64 product of those exact operands, on one device and split
+over fsdp, every site of a model is checked to take it, and a run with an FP8
+base resumes and scans as one with a bf16 base does. A whole run split over
+fsdp is not held to one device's: a last-bit difference upstream moves an
+activation across an E4M3 rounding boundary. Where FP8 pays is a GPU's
+measurement (`measured_fp8_sites`), recorded with the generation it was
+taken on.
 """
 
 import jax
@@ -18,6 +21,7 @@ import optax
 import pytest
 from flax import linen as nn
 from flax.traverse_util import flatten_dict
+from jax.sharding import NamedSharding, PartitionSpec
 from model_support import TINY_DECODER
 from reference_error import assert_leaves_as_exact
 
@@ -101,29 +105,50 @@ def operands(x, rows, scales):
     return cast.astype(np.float64), packed.astype(np.float64)
 
 
-def test_the_frozen_product_multiplies_the_cast_rows_exactly_and_trains_no_kernel():
-    """Forward and input gradient are the float64 products of the FP8 block
-    cast's rows to float32's order of summation; neither the packed kernel
-    nor its scales take a gradient."""
+def product_case():
+    """An input whose rows span twelve binades, a kernel packed, and an output cotangent."""
     rng = np.random.default_rng(1)
     x = jnp.asarray(rng.standard_normal((48, 96)) * np.exp2(rng.integers(-6, 6, (48, 1))), jnp.bfloat16)
     kernel = rng.standard_normal((96, 80)).astype(np.float32) * 0.05
     leaves = [jnp.asarray(value) for value in frozen_fp8_leaves(kernel).values()]
-    cotangent = jnp.asarray(rng.standard_normal((48, 80)), jnp.float32)
-    output, pullback = jax.vjp(frozen_fp8_product, x, *leaves)
-    gradients = pullback(cotangent)
+    return x, leaves, jnp.asarray(rng.standard_normal((48, 80)), jnp.float32)
+
+
+def assert_products_exact(x, leaves, cotangent, output, gradient):
+    """The forward and the input gradient are the float64 products of the FP8
+    block cast's rows to float32's order of summation; the input gradient
+    rounds once more, to the input's dtype."""
     forward, forward_scale, dgrad, dgrad_scale = leaves
     rows, packed = operands(x, forward, forward_scale)
     cotangent_rows, packed_dgrad = operands(cotangent, dgrad, dgrad_scale)
-    truth = {"output": rows @ packed.T, "input": cotangent_rows @ packed_dgrad.T}
-    dew = {"output": np.asarray(output), "input": np.asarray(gradients[0], np.float32)}
-    assert_leaves_as_exact(dew["output"], truth["output"], truth["output"], reductions=96)
-    # The input gradient rounds once more, to the input's bf16.
-    assert_leaves_as_exact(
-        {"input": dew["input"]}, {"input": np.asarray(jnp.asarray(truth["input"], jnp.bfloat16), np.float64)},
-        {"input": truth["input"]}, reductions=80)
+    truth, gradient_truth = rows @ packed.T, cotangent_rows @ packed_dgrad.T
+    assert_leaves_as_exact(np.asarray(output), truth, truth, reductions=x.shape[1])
+    rounded = np.asarray(jnp.asarray(gradient_truth, gradient.dtype), np.float64)
+    assert_leaves_as_exact(np.asarray(gradient, np.float32), rounded, gradient_truth,
+                           reductions=forward.shape[0])
+
+
+def test_the_frozen_product_multiplies_the_cast_rows_exactly_and_trains_no_kernel():
+    """Neither the packed kernel nor its scales take a gradient."""
+    x, leaves, cotangent = product_case()
+    output, pullback = jax.vjp(frozen_fp8_product, x, *leaves)
+    gradients = pullback(cotangent)
+    assert_products_exact(x, leaves, cotangent, output, gradients[0])
     assert gradients[0].dtype == x.dtype and all(gradient is None or not np.any(gradient)
                                                  for gradient in gradients[1:])
+
+
+@pytest.mark.mesh(devices=2)
+def test_split_over_fsdp_the_frozen_product_is_one_devices():
+    """The input's rows and the packed kernel's split over fsdp, as a run
+    places them, the product and the input gradient are the same exact
+    products: a row's cast reads the row alone, wherever it lies."""
+    x, leaves, cotangent = product_case()
+    mesh = jax.make_mesh((2,), ("fsdp",), devices=jax.devices()[:2])
+    split = NamedSharding(mesh, PartitionSpec("fsdp", None))
+    x, cotangent, *leaves = jax.device_put((x, cotangent, *leaves), split)
+    output, pullback = jax.jit(lambda *args: jax.vjp(frozen_fp8_product, *args))(x, *leaves)
+    assert_products_exact(x, leaves, cotangent, output, pullback(cotangent)[0])
 
 
 def test_every_named_site_computes_from_its_packed_kernel_inside_the_branch():
@@ -149,7 +174,7 @@ def test_every_named_site_computes_from_its_packed_kernel_inside_the_branch():
     assert set(base) == set(seen)
 
 
-def fit(adapter, steps, directory=None, mesh=None, devices=1):
+def fit(adapter, steps, directory=None):
     objective = LMObjective(adapter.model, SEQ, variables=adapter.variables)
     batches = np.random.default_rng(2).integers(0, VOCAB, (8, BATCH, SEQ + 1)).astype(np.int32)
 
@@ -170,11 +195,11 @@ def fit(adapter, steps, directory=None, mesh=None, devices=1):
         def set_state(self, state):
             self.index = int(state)
 
-    mesh = mesh or MeshSpec()
+    mesh = MeshSpec()
     trainer = Trainer(objective, optax.adam(1e-2), key=jax.random.key(0), mesh=mesh,
                       layout=Layout(min_shard=1, tolerance=1.0),
                       checkpoints=None if directory is None else Checkpoints(str(directory)))
-    trainer.device_mesh = mesh.build(jax.devices()[:devices])
+    trainer.device_mesh = mesh.build(jax.devices()[:1])
     return trainer.fit(Loader(lambda partition: Stream(), None, None, BATCH), steps=steps,
                        checkpoint_every=None if directory is None else 2)
 
@@ -212,17 +237,6 @@ def test_the_scanned_stack_reads_each_layers_own_packed_kernel():
     looped = np.asarray(fp8.model.apply(fp8.variables, ids()), np.float32)
     np.testing.assert_allclose(np.asarray(scanned.model.apply(fp8.variables, ids()), np.float32), looped,
                                rtol=1e-6, atol=1e-6)
-
-
-@pytest.mark.mesh(devices=2)
-def test_fsdp_trains_an_fp8_base_as_one_device_does():
-    _, fp8 = adapters()
-    split = fit(fp8, 2, mesh=MeshSpec(fsdp=2), devices=2)
-    whole = fit(fp8, 2)
-    split_params, whole_params = (jax.tree.leaves(state.variables["params"]) for state in (split, whole))
-    for got, want in zip(split_params, whole_params, strict=True):
-        np.testing.assert_allclose(np.asarray(got, np.float32), np.asarray(want, np.float32),
-                                   rtol=1e-5, atol=1e-6)
 
 
 def test_a_checkpoints_input_quantization_and_an_fp8_base_share_one_wrapper():
