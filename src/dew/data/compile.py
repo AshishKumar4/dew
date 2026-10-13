@@ -279,11 +279,14 @@ def _token_geometry(pipeline: Pipeline, fallback: Geometry | None = None) -> Pip
     )
 
 
-def _budget_rows(budget: TokenBudget) -> int:
+def _batch_rows(batching: BatchStage | TokenBudget) -> int:
+    """The declared row batch, or the largest row count of a fixed token budget."""
+    if isinstance(batching, BatchStage):
+        return batching.size
     from dew.data.batching import bucket_lengths
 
-    lengths = bucket_lengths(budget)
-    return budget.tokens // min(lengths)
+    lengths = bucket_lengths(batching)
+    return batching.tokens // min(lengths)
 
 
 def _derived(pipeline: Pipeline, build: _Build) -> Mapping[str, str]:
@@ -426,7 +429,7 @@ def compile(
     batching = next((stage for stage in train.stages if isinstance(stage, (BatchStage, TokenBudget))), None)
     if batching is None:
         raise ValueError("compile needs one batch(global_size) stage on the training pipeline")
-    batch = batching.size if isinstance(batching, BatchStage) else _budget_rows(batching)
+    batch = _batch_rows(batching)
     batch_tokens = None if isinstance(batching, BatchStage) else batching.tokens
     original = train
     if read == "memory":
@@ -704,7 +707,9 @@ def _validation_reader(
     opened: Iterator[Batch]
     if not build.global_order:
         build = dataclasses.replace(build, loading=dataclasses.replace(build.loading, workers=0))
-    if build.read == "streamed":
+    # A token budget has no fixed row shape; its lowering enforces one share.
+    budgeted = any(isinstance(stage, TokenBudget) for stage in pipeline.stages)
+    if build.read == "streamed" and not budgeted:
         opened = _CanonicalPass(
             functools.partial(build.batches, pipeline, fill=False), partition, build.batch
         )
@@ -844,9 +849,6 @@ def fitted[Entry](
     an evaluation suite) is passed on as it is."""
     if isinstance(dataset, Dataset):
         train = _endless(dataset.chain())
-        if isinstance(validation, Dataset):
-            return compile(train, validation=_batched(validation.chain(), train), objective=objective,
-                           provision=True), None
         loader = compile(train, objective=objective, provision=True)
     else:
         loader = dataset
@@ -865,16 +867,6 @@ def _endless(chain: Pipeline) -> Pipeline:
                 if isinstance(stage, (BatchStage, TokenBudget))]
     at = batching[0] if batching else len(chain.stages)
     return dataclasses.replace(chain, stages=(*chain.stages[:at], Repeat(None), *chain.stages[at:]))
-
-
-def _batched(held: Pipeline, train: Pipeline) -> Pipeline:
-    """`held` batched as `train` is, every record scored, where it states no batch of its own."""
-    if any(isinstance(stage, (BatchStage, TokenBudget)) for stage in held.stages):
-        return held
-    size = next((stage.size for stage in train.stages if isinstance(stage, BatchStage)), None)
-    if size is None:
-        raise ValueError("a validation dataset without a batch takes the training batch, which states none")
-    return held.batch(size, drop_remainder=False)
 
 
 def _held(chain: Pipeline, batch: int, objective: ObjectiveData) -> Reader:
@@ -899,9 +891,12 @@ def validation(
     """Compile one finite evaluation branch without constructing a training
     stream. With no `read`, the sources choose it (`_preferred_read`)."""
     read = read or _preferred_read(lambda _: (pipeline,), provision=provision)
-    if not any(isinstance(stage, BatchStage) for stage in pipeline.stages):
+    if not any(isinstance(stage, (BatchStage, TokenBudget)) for stage in pipeline.stages):
         pipeline = pipeline.batch(batch, drop_remainder=False)
     (pipeline,) = _prepared((pipeline,), read, provision=provision, objective=objective, counts=({},))
+    pipeline = _token_geometry(pipeline)
+    batching = next(stage for stage in pipeline.stages if isinstance(stage, (BatchStage, TokenBudget)))
+    batch = _batch_rows(batching)
     if read == "memory":
         pipeline = _materialize(pipeline, {}, training=False)
     lowering = _analyzed(pipeline, read, validation=True)

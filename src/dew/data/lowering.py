@@ -768,6 +768,7 @@ class _Build:
                 "token-budget batching requires one share until a synchronized shape schedule is supplied"
             )
         rows, _ = self.records(pipeline, partition)
+        budget = budget if self.training else dataclasses.replace(budget, drop_remainder=False)
         return TokenBatches(_as_iter(rows, self.loading), budget, partition, self.seed)
 
 
