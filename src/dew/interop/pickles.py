@@ -20,7 +20,6 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
-import os
 import zipfile
 from collections.abc import Sequence
 from pathlib import Path
@@ -30,7 +29,8 @@ import ml_dtypes
 import numpy as np
 
 from dew.cache import dew_cache_dir
-from dew.interop.safetensors_io import WEIGHTS_FILE, weight_files, write_file, write_index
+from dew.files import stat_identity
+from dew.interop.safetensors_io import WEIGHTS_FILE, own, weight_files, write_file, write_index
 
 if TYPE_CHECKING:
     import torch
@@ -54,10 +54,7 @@ def converted(directory: Path, shards: Sequence[str]) -> Path:
     atomically, so a failed conversion leaves nothing a later load would
     read.
     """
-    identity = []
-    for name in shards:
-        status = (directory / name).stat()
-        identity.append([name, os.path.realpath(directory / name), status.st_size, status.st_mtime_ns])
+    identity = [[name, *stat_identity(directory / name)] for name in shards]
     target = (
         Path(dew_cache_dir()) / "converted" / hashlib.sha256(json.dumps(identity).encode()).hexdigest()[:32]
     )
@@ -76,8 +73,10 @@ def converted(directory: Path, shards: Sequence[str]) -> Path:
         else [f"model-{number:05d}-of-{len(shards):05d}.safetensors" for number in range(1, len(shards) + 1)]
     )
     weight_map: dict[str, str] = {}
+    owner: dict[str, str] = {}
     for shard, output in zip(shards, outputs, strict=True):
         tensors = _state_dict(directory / shard)
+        own(owner, tensors, shard, directory)
         write_file(tensors, target / output, {"format": "pt"})
         weight_map.update(dict.fromkeys(tensors, output))
     if len(shards) > 1:

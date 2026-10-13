@@ -9,7 +9,6 @@ shared loader calls it.
 
 from __future__ import annotations
 
-import dataclasses
 from collections.abc import Mapping
 
 import numpy as np
@@ -18,7 +17,12 @@ from flax.traverse_util import flatten_dict
 from dew import records
 from dew.diffusion.block import BlockProcess
 from dew.interop.config_records import NativeFields
-from dew.interop.hf_decoders import export_config, translate_config, translate_denoiser_weights
+from dew.interop.hf_decoders import (
+    export_config,
+    refuse_lossy_export,
+    translate_config,
+    translate_denoiser_weights,
+)
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.nn.multimodal import VisionConditioner
@@ -179,16 +183,6 @@ def scalar_placement(text: CausalTransformer, variables: Variables) -> CausalTra
 _GEMMA4_ONLY = ("architectures", "use_cache", "attention_k_eq_v", "enable_moe_block",
                 "final_logit_softcapping", "hidden_size_per_layer_input", "vocab_size_per_layer_input",
                 "num_kv_shared_layers", "use_double_wide_mlp")
-# The run's own settings, which no config carries: precision and kernels,
-# training-time dropout and initialization, layout, and where the layer
-# scalar is stored (`scalar_placement`). `causal` is no setting but is fixed
-# by the classes on both sides: Dew's text stack is the causal encoder view
-# DiffusionGemma requires, and transformers' encoder attends causally unless
-# use_bidirectional_attention is "all", which this config never writes,
-# while its decoder never does (modeling_diffusion_gemma.py:281, :383, 5.16.1).
-_RUN_SETTINGS = ("dtype", "precision", "force_fp32_for_softmax", "attention_impl", "kv_cache", "causal",
-                 "scan_layers", "bank_layers", "remat", "dropout_rate", "embedding_dropout_rate",
-                 "attention_dropout_rate", "initializer_range", "depth_scaled_init", "layer_scalar")
 
 
 def published_config(model: DiffusionGemma) -> Mapping[str, object]:
@@ -198,18 +192,18 @@ def published_config(model: DiffusionGemma) -> Mapping[str, object]:
 
     Dew places images by position and keeps no image token ids, so the config
     names none and transformers' defaults stand. A model the written fields
-    would rebuild differently is refused, naming the fields that differ.
+    would rebuild differently is refused, naming the fields that differ
+    (`refuse_lossy_export`). The text record is the decoder view, as
+    `causal` is fixed by the classes on both sides: Dew's text stack is the
+    causal encoder view DiffusionGemma requires, and transformers' encoder
+    attends causally unless use_bidirectional_attention is "all", which this
+    config never writes, while its decoder never does
+    (modeling_diffusion_gemma.py:281, :383, 5.16.1).
     """
     text = {name: value for name, value in export_config(model.text).items() if name not in _GEMMA4_ONLY}
     text.update(model_type="diffusion_gemma_text",
                 use_bidirectional_attention=None if model.conditioner is None else "vision")
-    rebuilt = from_record(CausalTransformer, {
-        **translate_config(text), **{name: getattr(model.text, name) for name in _RUN_SETTINGS}})
-    lost = [field.name for field in dataclasses.fields(CausalTransformer)
-            if field.name not in ("parent", "name")
-            and getattr(rebuilt, field.name) != getattr(model.text, field.name)]
-    if lost:
-        raise ValueError(f"DiffusionGemma's text config cannot carry this model's {', '.join(lost)}")
+    refuse_lossy_export(model.text.clone(causal=False), text)
     config: dict[str, object] = {"model_type": "diffusion_gemma",
                                  "architectures": ["DiffusionGemmaForBlockDiffusion"],
                                  "text_config": text, "canvas_length": model.canvas_length,
