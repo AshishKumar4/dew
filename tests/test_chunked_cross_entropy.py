@@ -94,7 +94,7 @@ def test_the_fused_head_takes_the_whole_heads_loss_and_gradients_under_the_float
 
     def fused(states, matrix, bias):
         return fused_head_loss(states, OutputTable(matrix, vocab_major=False, bias=bias, softcap=softcap),
-                               targets, weights, z_loss=z_loss, tile=(3, 11))
+                               targets, weights, z_loss=z_loss, chunk=3)
 
     with jax.default_matmul_precision(EXERCISED[dtype]):
         (total, (losses, predicted, log_z)), gradients = jax.value_and_grad(
