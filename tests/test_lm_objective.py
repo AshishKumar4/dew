@@ -12,8 +12,6 @@ sampler runs in test_lm_recipe.
 """
 
 
-import re
-
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -740,13 +738,20 @@ def test_a_training_steps_head_contracts_the_vocabulary_three_times_and_matches_
             return objective.reduce_loss(stats)[0]
         return scalar
 
-    program = jax.jit(jax.grad(loss(fused, training=True))).lower(params).compile().as_text()
-    # A product that writes or reads a vocabulary-sized array: [.., vocab, ..] beside dot( or convolution(.
-    sized = rf"\[[^\]]*\b{vocab}\b[^\]]*\]"
-    contractions = [line for line in program.splitlines()
-                    if re.search(rf"= \w+{sized}\S* (dot|convolution)\(", line)
-                    or re.search(rf" (dot|convolution)\(.*\w+{sized}", line)]
-    assert len(contractions) == 3, contractions
+    def products(jaxpr) -> int:
+        """The products in `jaxpr` and every program inside it that read or write a vocabulary-sized array."""
+        count = 0
+        for eqn in jaxpr.eqns:
+            shapes = [getattr(var.aval, "shape", ()) for var in (*eqn.invars, *eqn.outvars)]
+            count += eqn.primitive.name == "dot_general" and any(vocab in shape for shape in shapes)
+            for value in jax.tree.leaves(eqn.params, is_leaf=lambda leaf: hasattr(leaf, "eqns")
+                                         or hasattr(getattr(leaf, "jaxpr", None), "eqns")):
+                inner = value if hasattr(value, "eqns") else getattr(value, "jaxpr", None)
+                if hasattr(inner, "eqns"):
+                    count += products(inner)
+        return count
+
+    assert products(jax.make_jaxpr(jax.grad(loss(fused, training=True)))(params).jaxpr) == 3
     with jax.default_matmul_precision("highest"):
         mine = jax.value_and_grad(loss(fused, training=True))(params)
         theirs = jax.value_and_grad(loss(fused, training=False))(params)
