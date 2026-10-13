@@ -11,20 +11,18 @@ from dew.interop.decoder_parts import (
     DecoderFields,
     Renames,
     base_config,
-    refuse,
+    hf_ungated,
     renamed_name,
     renamed_path,
+    ungated_mlp,
 )
 from dew.nn.backbones.causal_transformer import CausalTransformer
-
-_ACTIVATIONS = {'gelu_pytorch_tanh': 'gelu', 'gelu_new': 'gelu', 'gelu': 'gelu_exact', 'relu': 'relu'}
-"""`hidden_act` as the ungated feed-forward names it."""
 
 
 def _starcoder2_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
     activation = records.text(hf.get('hidden_act', 'gelu_pytorch_tanh'), 'hidden_act')
-    if activation not in _ACTIVATIONS:
-        refuse(f'hidden_act {activation!r}', f'the ungated Starcoder2 MLP supports {sorted(_ACTIVATIONS)}')
+    mlp = ungated_mlp(activation, ('gelu_pytorch_tanh', 'gelu_new', 'gelu', 'relu'), 'hidden_act',
+                      'Starcoder2')
     layers = records.integer(hf['num_hidden_layers'], 'num_hidden_layers')
     # Starcoder2Model masks every layer by the window when one is set.
     window = hf.get('sliding_window')
@@ -38,7 +36,7 @@ def _starcoder2_config(hf: Mapping[str, object], used: set[str]) -> DecoderField
     used.update(('use_bias', 'norm_epsilon', 'residual_dropout', 'embedding_dropout', 'attention_dropout',
                  'mlp_type', 'norm_type'))
     config.update({
-        'mlp': _ACTIVATIONS[activation], 'mlp_bias': biased, 'attention_bias': biased,
+        'mlp': mlp, 'mlp_bias': biased, 'attention_bias': biased,
         'norm_type': 'layer', 'norm_bias': True,
         'norm_eps': records.number(hf.get('norm_epsilon', 1e-5), 'norm_epsilon'),
         'dropout_rate': records.number(hf.get('residual_dropout', 0.), 'residual_dropout'),
@@ -54,7 +52,7 @@ _STARCODER2_NAMES: Renames = (('mlp.c_fc', 'mlp.up_proj'), ('mlp.c_proj', 'mlp.d
 def _starcoder2_export(model: CausalTransformer) -> Mapping[str, object]:
     windowed = 'sliding_attention' in model.per_layer_types
     return {
-        'hidden_act': {'gelu': 'gelu_pytorch_tanh', 'gelu_exact': 'gelu', 'relu': 'relu'}[str(model.mlp)],
+        'hidden_act': hf_ungated(model.mlp, 'Starcoder2', tanh='gelu_pytorch_tanh'),
         'use_bias': model.attention_bias, 'norm_epsilon': model.norm_eps,
         'sliding_window': model.kind_of('sliding_attention').window if windowed else None,
         'residual_dropout': model.dropout_rate, 'embedding_dropout': model.embedding_dropout_rate,

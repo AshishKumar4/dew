@@ -13,9 +13,11 @@ from dew.interop.decoder_parts import (
     Renames,
     base_config,
     decoder_tensors,
-    refuse,
+    fixed_attention_buffer,
+    hf_ungated,
     renamed_name,
     renamed_path,
+    ungated_mlp,
 )
 from dew.interop.safetensors_io import LazyTensors
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -27,16 +29,14 @@ def _gpt_neox_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
     partial = records.number(parameters.get('partial_rotary_factor', hf.get('rotary_pct', .25)), 'rotary_pct')
     theta = records.number(parameters.get('rope_theta', hf.get('rotary_emb_base', 10000.)), 'rotary_emb_base')
     activation = records.text(hf.get('hidden_act', 'gelu'), 'hidden_act')
-    activations = {'gelu': 'gelu_exact', 'gelu_new': 'gelu', 'gelu_pytorch_tanh': 'gelu', 'relu': 'relu'}
-    if activation not in activations:
-        refuse(f'hidden_act={activation!r}', 'GPT-NeoX requires an ungated GELU or ReLU MLP')
+    mlp = ungated_mlp(activation, ('gelu', 'gelu_new', 'gelu_pytorch_tanh', 'relu'), 'hidden_act', 'GPT-NeoX')
     rope = {key: value for key, value in parameters.items() if key != 'partial_rotary_factor'}
     config = base_config({**hf, 'hidden_act': 'gelu', 'rope_theta': theta,
                            'rope_parameters': rope or None}, used, reads=frozenset({'attention_bias'}))
     used.update(('rotary_pct', 'rotary_emb_base', 'use_parallel_residual', 'layer_norm_eps',
                  'hidden_dropout', 'classifier_dropout', 'is_decoder'))
     config.update({
-        'mlp': activations[activation], 'mlp_bias': True,
+        'mlp': mlp, 'mlp_bias': True,
         'norm_type': 'layer', 'norm_bias': True,
         'norm_eps': records.number(hf.get('layer_norm_eps', 1e-5), 'layer_norm_eps'),
         'scale_after_cast': False, 'attention_bias': bool(hf.get('attention_bias', True)),
@@ -59,16 +59,8 @@ def gpt_neox_prepare(tensors: Mapping[str, np.ndarray],
     dimension = records.integer(config['head_dim'], 'head_dim')
     prepared = {}
     for name, tensor in tensors.items():
-        if name.endswith('.attention.bias'):
-            if (tensor.ndim != 4 or tensor.shape[:2] != (1, 1)
-                    or tensor.shape[-2] != tensor.shape[-1]
-                    or not np.array_equal(tensor, np.tril(np.ones_like(tensor)))):
-                raise ValueError(f'{name} must hold the fixed triangular causal mask')
-            continue
-        if name.endswith('.attention.masked_bias'):
-            # FP16 releases cast the historical -1e9 sentinel to -inf.
-            if tensor.shape != () or float(tensor) not in (-1e9, -np.inf):
-                raise ValueError(f'{name} must hold the historical negative mask sentinel')
+        # FP16 releases cast the historical -1e9 sentinel to -inf.
+        if fixed_attention_buffer(name, tensor, 'attention', (-1e9, -np.inf)):
             continue
         if name.endswith('.attention.rotary_emb.inv_freq'):
             rotated = int(
@@ -112,12 +104,9 @@ def _gpt_neox_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] |
 
 
 def _gpt_neox_export(model: CausalTransformer) -> Mapping[str, object]:
-    activation = model.mlp
-    if not isinstance(activation, str) or activation not in ('gelu', 'gelu_exact', 'relu'):
-        refuse('mlp', 'GPT-NeoX requires an ungated MLP')
     fields: dict[str, object] = {
         'layer_norm_eps': model.norm_eps, 'use_parallel_residual': model.parallel_residual,
-        'hidden_act': {'gelu': 'gelu_new', 'gelu_exact': 'gelu', 'relu': 'relu'}[activation],
+        'hidden_act': hf_ungated(model.mlp, 'GPT-NeoX'),
         'hidden_dropout': model.dropout_rate, 'attention_dropout': model.attention_dropout_rate,
         'rope_parameters': {'rope_type': 'default', 'rope_theta': model.rope_theta,
                             'partial_rotary_factor': model.partial_rotary_factor or 1.},
