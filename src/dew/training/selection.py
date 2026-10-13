@@ -49,10 +49,11 @@ class Best:
                              ('weights_only', weights_only), ('split', split), ('_source', source)):
             object.__setattr__(self, field, value)
 
-    def resolved(self, metrics: Sequence[Metric], splits: Sequence[str] = ("val",)) -> Best:
-        """This selection bound to the metric it names among `metrics`, with its direction from that
-        metric's `Shown` where it names none, and the split it ranks: `train` for a training scalar,
-        else the one of `splits` it names or the only one."""
+    def resolved(self, metrics: Sequence[Metric], shown: Mapping[str, Shown],
+                 splits: Sequence[str] = ("val",)) -> Best:
+        """This selection bound to the metric it names among `metrics`, with its direction from how
+        that metric is `shown` where it names none, and the split it ranks: `train` for a training
+        scalar, else the one of `splits` it names or the only one."""
         selection = self
         metric = selection._source
         if metric is None:
@@ -72,8 +73,8 @@ class Best:
         if isinstance(metric, Metric):
             if not any(metric is declared for declared in metrics):
                 raise ValueError("best must be a metric object passed in metrics")
-            shown = getattr(metric, "shown", None)
-            better = shown.better if isinstance(shown, Shown) else None
+            declared = shown.get(metric.name)
+            better = None if declared is None else declared.better
             if selection.mode is None:
                 if better not in ('higher', 'lower'):
                     raise ValueError(
