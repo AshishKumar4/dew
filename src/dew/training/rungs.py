@@ -33,7 +33,7 @@ from dew.files import write_atomically
 from dew.nn.kernels.generation import gpu_target
 from dew.nn.sharding import trace_context
 from dew.records import JSON, json_value, record
-from dew.telemetry.instrumentation import StepFlops, count_compilation_cache, step_flops
+from dew.telemetry.instrumentation import StepFlops, step_flops
 
 if TYPE_CHECKING:
     from dew.objectives.base import Batch
@@ -110,7 +110,6 @@ def recorded_rung(modules: Sequence[object], arguments: tuple[TrainState, Batch]
     directory = rung_records()
     if directory is None or jax.process_count() > 1:
         return None, {}, None
-    count_compilation_cache()  # whether a search compiled anything (`plan_flops`)
     key = rung_key(modules, arguments, splits, mesh, step)
     path = directory / f"{hashlib.sha256(json.dumps(key, sort_keys=True).encode()).hexdigest()}.json"
     if not path.exists():
@@ -122,29 +121,32 @@ def recorded_rung(modules: Sequence[object], arguments: tuple[TrainState, Batch]
     return path, key, json_value(stored.get('rung'), f"rung record {path}")
 
 
-FACTS = ('flops', 'launches')
-"""What a record holds of its plan's program besides the plan: a
-microbatch's FLOPs (`plan_flops`) and its kernel launches (`tune`)."""
-
-
-def recorded_fact(recorded: JSON, plan: Mapping[str, JSON], name: str) -> object:
-    """The record's `name` (`FACTS`) of the program `plan` compiles, where
-    `plan` is the `recorded` one, else None."""
+def recorded_launches(recorded: JSON, plan: Mapping[str, JSON]) -> str | None:
+    """The kernel launches (`dew.nn.kernels.tuning.tune`) the record holds of
+    the program `plan` compiles, where `plan` is the `recorded` one: the
+    record beside its FLOPs (`plan_flops`)."""
     kept = dict(record(recorded, 'recorded plan')) if recorded is not None else {}
-    facts = {fact: kept.pop(fact, None) for fact in FACTS}
-    return facts[name] if kept == plan else None
+    kept.pop('flops', None)
+    launches = kept.pop('launches', None)
+    return launches if kept == plan and isinstance(launches, str) else None
 
 
-def plan_flops(recorded: JSON, chosen: Mapping[str, JSON], compiled: bool,
-               executable: jax.stages.Compiled) -> StepFlops | None:
-    """A microbatch's FLOPs in the `chosen` plan: those its record holds, where
-    the plan is the `recorded` one and the search `compiled` nothing (every
-    program came from the persistent cache), else counted from its
-    `executable` (`step_flops`), which reads the module's text."""
-    counted = recorded_fact(recorded, chosen, 'flops')
-    if not compiled and isinstance(counted, list):
-        return StepFlops(*counted)
-    return step_flops(executable)
+def plan_flops(recorded: JSON, executable: jax.stages.Compiled) -> tuple[StepFlops | None, JSON]:
+    """A microbatch's FLOPs in the plan `executable` runs, and what a record
+    keeps of them: those the `recorded` plan's record holds where they were
+    counted for this very executable (its fingerprint, which a
+    persistent-cache hit keeps), else counted from it (`step_flops`), which
+    reads the module's text. A key read before the step traces cannot tell
+    apart two steps that differ in an objective's arguments alone; the
+    executable can."""
+    fingerprint = executable.runtime_executable().fingerprint
+    named = fingerprint.hex() if isinstance(fingerprint, bytes) else None
+    counted = record(recorded, 'recorded plan').get('flops') if recorded is not None else None
+    if named is not None and isinstance(counted, list) and counted[:1] == [named]:
+        flops = StepFlops(*counted[1:])
+    else:
+        flops = step_flops(executable)
+    return flops, None if flops is None else [named, flops.model, flops.hardware]
 
 
 def keep_rung(path: Path, key: Mapping[str, JSON], rung: JSON) -> None:

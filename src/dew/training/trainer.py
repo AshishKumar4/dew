@@ -140,7 +140,7 @@ from dew.training.model_flops import (
 )
 from dew.training.narrow import narrowed, narrowed_paths
 from dew.training.planning import Candidate, Planned, Timer, plan_step, settled, splits, whole_step
-from dew.training.rungs import keep_rung, plan_flops, recorded_fact, recorded_rung
+from dew.training.rungs import keep_rung, plan_flops, recorded_launches, recorded_rung
 from dew.training.runtime import Preempted, PreemptionNotice
 from dew.training.selection import Best
 from dew.training.state import Accumulation, TrainState
@@ -1157,9 +1157,8 @@ class Trainer(Generic[Loss, Effects]):
         shards = math.prod(mesh.shape[axis] for axis in BATCH_AXES)
 
         def lower(split: int) -> Candidate:
-            launches = recorded_fact(recorded, {**self._rung(), 'split': split}, 'launches')
             return self._candidate(state, batch, schedule, placement, replicated, split,
-                                   launches if isinstance(launches, str) else None)
+                                   recorded_launches(recorded, {**self._rung(), 'split': split}))
 
         # Read before anything traces, so a recorded rung is the first one lowered.
         record_path, key, recorded = recorded_rung(self.objective.program_key(), (state, batch), candidates,
@@ -1170,7 +1169,6 @@ class Trainer(Generic[Loss, Effects]):
         if self._rung() != before:
             _log.warning("taking an earlier run's plan; delete %s to decide again", record_path)
         first = None if recorded is None else record(recorded, 'recorded plan').get('split', 1)
-        misses = compilation_cache_counts()['train/cache_misses']
         plans, probes = plan_step(
             lower, lambda candidate: step_compiler_options(
                 self.objective, device_tokens(self.objective, candidate.micro, shards),
@@ -1186,11 +1184,9 @@ class Trainer(Generic[Loss, Effects]):
         self.objective.restore_head_tile(planned.tile)
         self._xla_defaults = planned.xla_defaults
         chosen = {**self._rung(), 'split': planned.split}
-        compiled = compilation_cache_counts()['train/cache_misses'] > misses
-        flops = plan_flops(recorded, chosen, compiled, planned.executable)
+        flops, counted = plan_flops(recorded, planned.executable)
         if record_path is not None:
-            keep_rung(record_path, key, {**chosen, 'flops': flops and [flops.model, flops.hardware],
-                                         'launches': planned.candidate.launches})
+            keep_rung(record_path, key, {**chosen, 'flops': counted, 'launches': planned.candidate.launches})
         self.plan = settled(planned, plans, seconds, probes)
         if planned.split != candidates[0] or seconds:
             _log.warning("the step fits the devices in the plan %s", self.plan)
@@ -1201,7 +1197,8 @@ class Trainer(Generic[Loss, Effects]):
         """The step reading `batch` in `split` microbatches, lowered at the
         objective's current rung, with what the fit check holds beside it.
         `launches` are its kernel launches where a record holds them, which
-        settle their configs without the lowering `tune` reads them from."""
+        settle their configs without the lowering `tune` reads them from, unless
+        the run measures configs (`tune_kernels`)."""
         micro = microbatch_shapes(batch, split)
         shapes, copies, prepared = self._prepared(state, micro, schedule, split * self.accumulation)
         shardings = self.shardings(prepared)
@@ -1218,8 +1215,10 @@ class Trainer(Generic[Loss, Effects]):
         part = jax.ShapeDtypeStruct((), jnp.int32, sharding=replicated)
         lower = functools.partial(jitted.lower, prepared, batch, part)
         # The lowering after either reads the launch configs they settled.
-        if launches is None or (not tuning.settled(launches) and self.tune_kernels):
+        if launches is None or self.tune_kernels:
             launches = tuning.tune(lower, measure=self.tune_kernels)
+        else:
+            tuning.settled(launches)
         return Candidate(micro, shapes, copies, shardings, prepared, held, lower(), launches)
 
     def _prepared(self, state: TrainState, batch: Batch, schedule: Schedule, window: int):
