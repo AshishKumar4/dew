@@ -848,6 +848,8 @@ class DeepseekV4Mixer(MixerBase):
     `candidates` the pool's role.
     """
 
+    residuals = ('q_proj', 'k_proj', 'v_proj', 'kv_proj', 'o_proj', 'context')
+
     q_lora_rank: int = 1024
     o_groups: int = 8
     o_lora_rank: int = 1024
