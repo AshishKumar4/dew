@@ -715,11 +715,12 @@ def test_router_z_loss_adds_each_routers_mean_squared_log_partition():
     np.testing.assert_allclose(float(aux.metrics["router_z_loss"]), expected, rtol=1e-5)
 
 
-def test_a_training_steps_head_contracts_the_vocabulary_three_times_and_matches_the_tiled_head():
-    """A training step's loss takes its head's gradient in the forward
-    (`fused_head_loss`): beside blocks recomputed in the backward, the step
-    contracts the vocabulary three times, the logits, the states' gradient and
-    the head's, none again, and its loss and gradients are the per-token
+def test_a_training_steps_tiled_head_contracts_the_vocabulary_three_times_and_matches_the_tiled_head():
+    """A training step whose head is tiled takes the head's gradient in the
+    forward (`fused_head_loss`): beside blocks recomputed in the backward, the
+    step contracts the vocabulary three times, the logits, the states'
+    gradient and the head's, none again, where the per-token tiled head
+    recomputes its logits, and its loss and gradients are the per-token
     head's, z-loss and padding included."""
     from dew.nn.backbones.causal_transformer import CausalTransformer
     vocab = 61
@@ -727,7 +728,7 @@ def test_a_training_steps_head_contracts_the_vocabulary_three_times_and_matches_
                               max_seq_len=8, tie_embeddings=False, remat="full", qk_norm=False,
                               attention_impl="reference")
     tokens = jax.random.randint(jax.random.key(1), (2, 9), 0, vocab).at[1, 6:].set(0)
-    fused = LMObjective(model, 8, ema_decay=None, z_loss=1e-3, pad_id=0)
+    fused = LMObjective(model, 8, ema_decay=None, z_loss=1e-3, pad_id=0, head_tile=(4, 16))
     params = fused.init(jax.random.key(0))
 
     def loss(objective, *, training):
@@ -752,6 +753,7 @@ def test_a_training_steps_head_contracts_the_vocabulary_three_times_and_matches_
         return count
 
     assert products(jax.make_jaxpr(jax.grad(loss(fused, training=True)))(params).jaxpr) == 3
+    assert products(jax.make_jaxpr(jax.grad(loss(fused, training=False)))(params).jaxpr) == 4
     with jax.default_matmul_precision("highest"):
         mine = jax.value_and_grad(loss(fused, training=True))(params)
         theirs = jax.value_and_grad(loss(fused, training=False))(params)
