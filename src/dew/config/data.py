@@ -13,6 +13,7 @@ from dew.data.analysis import _cache_at, _order_at, _preferred_read, _promoted, 
 from dew.data.compile import compile
 from dew.data.dataset import Batch, DataPhase, Loader, Loading, record_argument
 from dew.data.holdout import HoldOut, SourceValue, Split, Validation, _branches, _source, source_argument
+from dew.data.load import RECORD_HOLDOUT, TEXT_HOLDOUT
 from dew.data.pipeline import Configured, HostStep, MapBatch, Mixture, ObjectiveData, Phases, Pipeline, mix
 
 if TYPE_CHECKING:
@@ -31,6 +32,12 @@ _DEFAULT_LOADING = Loading(workers="auto")
 @runtime_checkable
 class RunData(Protocol):
     def pipelines(self) -> tuple[Pipeline, Pipeline | None, tuple[HostStep, ...]]: ...
+
+
+class _Loadable(RunData):
+    def load(self, **options) -> Loader:
+        """Compile this run's data with `loader(self, **options)`."""
+        return loader(self, **options)
 
 
 @runtime_checkable
@@ -53,7 +60,7 @@ def _host_stages(defaults: tuple[HostStep, ...], explicit: tuple[HostStep, ...])
 
 
 @dataclasses.dataclass(frozen=True)
-class RecordsData:
+class RecordsData(_Loadable):
     source: Annotated[SourceValue, source_argument(SourceValue)]
     validation: Annotated[Validation, source_argument(Validation)] = None
     split: str = "train"
@@ -65,19 +72,19 @@ class RecordsData:
 
 
 @dataclasses.dataclass(frozen=True)
-class TextData:
+class TextData(_Loadable):
     source: Annotated[SourceValue | Mapping[str, float], source_argument(SourceValue)] = ""
     tokenizer: str = "byte"
     seq_len: int = 256
     stride: int | None = None
     field: str = "text"
-    eos: bool = False
+    eos: bool = True
     pack: Literal["first-fit", "best-fit", "concat"] | None = None
     packing_bins: int = 8
     validation: Annotated[Validation, source_argument(Validation)] = None
     split: str = "train"
     phases: Annotated[tuple[DataPhase, ...], record_argument(tuple[DataPhase, ...])] = ()
-    token_holdout: HoldOut | None = None
+    token_holdout: HoldOut | None = TEXT_HOLDOUT
 
     def __post_init__(self) -> None:
         if self.seq_len < 1 or (self.stride is not None and self.stride < 1):
@@ -137,9 +144,9 @@ class TextData:
             return self._token_pipelines(stored)
         prefix = Pipeline(stored).map(Tokenize(self.tokenizer, self.field, self.eos)).stages
         train, held = _branches(self.source, self.validation, split=self.split, prefix=prefix)
-        if self.token_holdout is not None:
-            if self.validation is not None or self.token_holdout.fraction is None:
-                raise ValueError("token_holdout needs fraction= and no separate validation source")
+        if self.token_holdout is not None and self.validation is None:
+            if self.token_holdout.fraction is None:
+                raise ValueError("token_holdout needs fraction=")
             held = train.token_split(self.token_holdout.fraction, held=True)
             train = train.token_split(self.token_holdout.fraction, held=False)
         if self.pack is None:
@@ -206,7 +213,7 @@ class TextData:
 
 
 @dataclasses.dataclass(frozen=True)
-class ChatData:
+class ChatData(_Loadable):
     source: Annotated[SourceValue, source_argument(SourceValue)]
     tokenizer: str
     seq_len: int = 256
@@ -237,7 +244,7 @@ class ChatData:
 
 
 @dataclasses.dataclass(frozen=True)
-class PromptData:
+class PromptData(_Loadable):
     source: Annotated[SourceValue, source_argument(SourceValue)]
     tokenizer: str
     max_prompt_len: int = 256
@@ -324,7 +331,7 @@ class _PromptFacts:
 
 
 @dataclasses.dataclass(frozen=True)
-class PreferenceData:
+class PreferenceData(_Loadable):
     source: Annotated[SourceValue, source_argument(SourceValue)]
     seq_len: int = 256
     pad_id: int = 0
@@ -362,7 +369,7 @@ class Augment:
 
 
 @dataclasses.dataclass(frozen=True)
-class ImageData:
+class ImageData(_Loadable):
     source: Annotated[SourceValue, source_argument(SourceValue)]
     image_size: int = 128
     staging_size: int | None = None
@@ -373,7 +380,7 @@ class ImageData:
     classes: tuple[str, ...] = ()
     labels: str | None = None
     augment: Augment | None = dataclasses.field(default_factory=Augment)
-    validation: Annotated[Validation, source_argument(Validation)] = None
+    validation: Annotated[Validation, source_argument(Validation)] = RECORD_HOLDOUT
     split: str = "train"
 
     def __post_init__(self) -> None:
@@ -423,7 +430,7 @@ class ImageData:
 
 
 @dataclasses.dataclass(frozen=True)
-class VideoData:
+class VideoData(_Loadable):
     source: Annotated[SourceValue, source_argument(SourceValue)]
     frames: int = 16
     frame_size: int = 256
