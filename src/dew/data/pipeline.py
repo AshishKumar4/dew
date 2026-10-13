@@ -436,11 +436,6 @@ class Dataset:
             hosts = [step for step in steps if _host(step)]
             if len(hosts) < len(steps):
                 raise TypeError("after batch, map takes functions of the training batch that keep every row")
-            ran = any(isinstance(stage, MapBatch) and isinstance(stage.step, DeviceStep)
-                      for stage in self.chain().stages)
-            if ran and not all(isinstance(step, DeviceStep) for step in hosts):
-                raise TypeError("a device step runs in the compiled training step, after every host step of "
-                                "the batch; map host steps before it")
             return self.then(*(MapBatch(step, identity) for step in hosts))
         if batched:
             return self.then(*(Batched(step, batch_size, identity) for step in _columns(steps)))
@@ -677,15 +672,14 @@ class Dataset:
         as a validation pass reads it, or endlessly after a `repeat`, as
         training reads it, where random steps after a shuffle or a drop may
         draw."""
-        from dew.data.compile import compile, validation
+        from dew.data.compile import _batch_steps, compile, validation
         from dew.data.dataset import Closeable, DataPartition, Loading
         from dew.objectives.base import VALID_ROWS
 
         chain = self.chain()
         batched = any(isinstance(stage, (BatchStage, TokenBudget)) for stage in chain.stages)
         # Device steps run here, on the batches read, as the compiled training step runs them.
-        device = [stage.step for stage in chain.stages
-                  if isinstance(stage, MapBatch) and isinstance(stage.step, DeviceStep)]
+        _, device = _batch_steps(chain)
         chain = dataclasses.replace(chain, stages=tuple(
             stage for stage in chain.stages
             if not (isinstance(stage, MapBatch) and isinstance(stage.step, DeviceStep))))
