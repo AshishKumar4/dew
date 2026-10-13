@@ -800,3 +800,168 @@ def test_scalar_mode_survives_scanning_and_rematerialized_backward(mode):
     np.testing.assert_allclose(value, expected, atol=1e-5, rtol=0)
     for actual, wanted in zip(jax.tree.leaves(gradient), jax.tree.leaves(expected_grad), strict=True):
         np.testing.assert_allclose(actual, wanted, atol=1e-4, rtol=1e-5)
+
+
+def nemotron_step_source(directory, *, seed: int = 7):
+    """The latent-MoE fixture with Nemotron 3 Ultra's prediction step, one
+    depth of an attention block and a routed latent block
+    (mtp_layers_block_type [attention, moe]), its tensors drawn under the
+    released names `mtp.layers.{0,1}.*` (vLLM nemotron_h_mtp.py), written to
+    `directory`; and the reference: transformers' own blocks composed as
+    vLLM composes the step, at `dtype`."""
+    import torch
+    from safetensors.numpy import load_file, save_file
+    from transformers.models.nemotron_h import modeling_nemotron_h as reference
+    from transformers.models.nemotron_h.configuration_nemotron_h import NemotronHConfig
+
+    source = FIXTURES / "nemotron-h-moe-latent-tiny"
+    hf = {**fixture_config("nemotron-h-moe-latent-tiny"), "num_nextn_predict_layers": 1,
+          "mtp_layers_block_type": ["attention", "moe"]}
+    trunk = hf["layers_block_type"]
+    # The step's blocks are built as layers past the trunk, as vLLM builds them.
+    extended = NemotronHConfig.from_dict({**NemotronHConfig.from_pretrained(str(source)).to_dict(),
+                                          "layers_block_type": [*trunk, "full_attention", "moe"]})
+    extended._attn_implementation, extended._experts_implementation = "eager", "eager"
+    torch.manual_seed(seed)
+    step = torch.nn.ModuleDict({
+        "enorm": reference.NemotronHRMSNorm(hf["hidden_size"], eps=hf["layer_norm_epsilon"]),
+        "hnorm": reference.NemotronHRMSNorm(hf["hidden_size"], eps=hf["layer_norm_epsilon"]),
+        "eh_proj": torch.nn.Linear(2 * hf["hidden_size"], hf["hidden_size"], bias=False),
+        "attention": reference.NemotronHBlock(extended, layer_idx=len(trunk)),
+        "moe": reference.NemotronHBlock(extended, layer_idx=len(trunk) + 1),
+        "final_layernorm": reference.NemotronHRMSNorm(hf["hidden_size"], eps=hf["layer_norm_epsilon"]),
+    })
+    with torch.no_grad():
+        for parameter in step.parameters():
+            parameter.normal_(0.0, 0.3)
+        bias = step["moe"].mixer.gate.e_score_correction_bias
+        bias.copy_(torch.linspace(-0.4, 0.4, hf["n_routed_experts"]))
+    names = {"enorm.weight": "mtp.layers.0.enorm.weight", "hnorm.weight": "mtp.layers.0.hnorm.weight",
+             "eh_proj.weight": "mtp.layers.0.eh_proj.weight",
+             "final_layernorm.weight": "mtp.layers.1.final_layernorm.weight"}
+    tensors = load_file(str(source / "model.safetensors"))
+    for name, tensor in step.state_dict().items():
+        block, _, rest = name.partition(".")
+        stored = tensor.to(torch.float32).numpy()
+        if name in names:
+            tensors[names[name]] = stored
+        elif rest.startswith("mixer.experts."):
+            # The release stores one tensor per expert.
+            projection = rest.removeprefix("mixer.experts.")
+            for expert, matrix in enumerate(stored):
+                tensors[f"mtp.layers.1.mixer.experts.{expert}.{projection}.weight"] = matrix
+        else:
+            tensors[f"mtp.layers.{0 if block == 'attention' else 1}.{rest}"] = stored
+    directory.mkdir()
+    save_file(tensors, str(directory / "model.safetensors"))
+    (directory / "config.json").write_text(json.dumps(hf))
+
+    def logits(ids, dtype):
+        model = reference.NemotronHForCausalLM.from_pretrained(str(source), dtype=dtype).eval()
+        # The eager experts run in float64, where torch's grouped matmul does not.
+        model.config._experts_implementation = "eager"
+        depth = step.to(dtype)
+        with torch.no_grad():
+            hidden = model.model(input_ids=ids, use_cache=False).last_hidden_state[:, :-1]
+            fused = depth["eh_proj"](torch.cat([depth["enorm"](model.model.embeddings(ids[:, 1:])),
+                                                depth["hnorm"](hidden)], dim=-1))
+            positions = torch.arange(fused.shape[1])[None]
+            mask = reference.create_causal_mask(config=extended, inputs_embeds=fused, attention_mask=None,
+                                                past_key_values=None, position_ids=positions)
+            out = depth["moe"](depth["attention"](fused, attention_mask=mask, position_ids=positions))
+            return model.lm_head(depth["final_layernorm"](out)).double().numpy()
+    return logits
+
+
+def test_a_nemotron_h_prediction_step_loads_computes_the_reference_and_trains(tmp_path):
+    """Nemotron 3 Ultra's prediction step over the latent-MoE fixture loads as
+    `mtp_0`: the attention block's mixer and pre-norm, the routed block in
+    its feed-forward slot, the step's input maps and final norm. Its logits
+    are what transformers' own blocks give composed as vLLM composes the
+    step, within the reference's own distance from float64; and the LM
+    objective's `mtp_weight` trains the step's weights."""
+    from unittest.mock import patch
+
+    import torch
+
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from tools.diffusers_wan_reference import float64
+
+    reference = nemotron_step_source(tmp_path / "ultra-step")
+    model, variables = fp32_decoder(tmp_path / "ultra-step")
+    depth = variables["params"]["mtp_0"]
+    assert set(depth) == {"enorm", "hnorm", "eh_proj", "block", "final_norm"}
+    assert {"input_layernorm", "self_attn", "post_attention_layernorm", "mlp"} <= set(depth["block"])
+    assert depth["block"]["mlp"]["experts"]["up_proj"]["kernel"].shape[0] == 8
+    assert "mtp_0" in variables["moe"]
+
+    ids = np.load(FIXTURES / "nemotron-h-moe-latent-tiny" / "input_ids.npy")
+    hidden = model.apply(variables, jnp.asarray(ids, jnp.int32), method=CausalTransformer.hidden_states)
+    logits = np.asarray(model.apply(variables, hidden, jnp.asarray(ids, jnp.int32),
+                                    method=CausalTransformer.mtp_logits)[0])
+    tokens = torch.from_numpy(ids.astype(np.int64))
+    fp32 = reference(tokens, torch.float32)
+    widen = torch.Tensor.type
+
+    def wide_type(tensor, dtype=None, **kwargs):
+        # Nemotron's router pins .type(torch.float32), beyond the shared cast widener.
+        return widen(tensor, torch.float64 if dtype == torch.float32 else dtype, **kwargs)
+
+    with float64(), patch.object(torch.Tensor, "type", wide_type):
+        truth = reference(tokens, torch.float64)
+    assert_as_exact_as_the_reference(logits, fp32, truth, "nemotron-h prediction step logits")
+    assert np.array_equal(np.argmax(logits, -1), np.argmax(fp32, -1))
+
+    import optax
+
+    from dew.objectives.lm import LMObjective
+    from dew.training import Layout, Trainer
+
+    objective = LMObjective(model, ids.shape[1] - 1, mtp_weight=0.5, variables=variables)
+    trainer = Trainer(objective, optax.sgd(0.1), key=jax.random.key(0),
+                      layout=Layout(min_shard=1, tolerance=1.0), checkpoints=None, tracker=None)
+    state, _, _ = trainer.place()
+    before = jax.device_get(state.variables["params"]["mtp_0"])
+    batch = {"text": jnp.asarray(np.tile(ids, (max(1, jax.device_count() // len(ids)), 1)), jnp.int32)}
+    trained, *_ = trainer.compile(state, batch)(state, batch)
+    moved = jax.tree.map(lambda old, new: bool(np.any(old != np.asarray(new))), before,
+                         jax.device_get(trained.variables["params"]["mtp_0"]))
+    assert all(jax.tree.leaves(moved)), moved
+
+
+@pytest.mark.parametrize("step", [
+    {"mtp_layers_block_type": ["attention", "moe"]},
+    {"mtp_layers_block_type": None, "mtp_hybrid_override_pattern": "*E"},
+    {"mtp_layers_block_type": ["full_attention", "moe"], "mtp_hybrid_override_pattern": "*"},
+    {"mtp_layers_block_type": ["full_attention"], "mtp_hybrid_override_pattern": "*E"},
+])
+def test_nemotron_h_reads_the_prediction_step_transformers_reads(step):
+    """The step's blocks are the ones NemotronHConfig resolves from the list
+    and the legacy pattern, which overrides the list where the list is its
+    default."""
+    from transformers.models.nemotron_h.configuration_nemotron_h import NemotronHConfig
+
+    config = {**fixture_config("nemotron-h-moe-tiny"), "num_nextn_predict_layers": 1, **step}
+    model = translate_config(config).value
+    reference = NemotronHConfig.from_dict({**NemotronHConfig.from_pretrained(
+        str(FIXTURES / "nemotron-h-moe-tiny")).to_dict(), **step, "num_nextn_predict_layers": 1})
+    blocks = (model.mtp_layer_type, *((model.mtp_feedforward_type,) if model.mtp_feedforward_type else ()))
+    assert list(blocks) == list(reference.mtp_layers_block_type)
+
+
+@pytest.mark.parametrize("name", ["nemotron-h-tiny", "nemotron-h-moe-tiny"])
+def test_a_nemotron_h_trunk_whose_config_names_a_step_loads_as_the_trunk(name, tmp_path):
+    """transformers saves the trunk alone whatever depth the config names:
+    such a checkpoint, the dense one too, whose default step names a routed
+    kind its trunk lacks, loads the trunk it holds and computes its logits."""
+    from shutil import copytree
+
+    directory = tmp_path / name
+    copytree(FIXTURES / name, directory)
+    stated = {**fixture_config(name), "num_nextn_predict_layers": 1}
+    (directory / "config.json").write_text(json.dumps(stated))
+    model, variables = fp32_decoder(directory)
+    assert model.num_nextn_predict_layers == 0 and "mtp_0" not in variables["params"]
+    ids = jnp.asarray(np.load(FIXTURES / name / "input_ids.npy"), jnp.int32)
+    plain, held = fp32_decoder(FIXTURES / name)
+    np.testing.assert_array_equal(np.asarray(model.apply(variables, ids)), np.asarray(plain.apply(held, ids)))
