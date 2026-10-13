@@ -63,11 +63,9 @@ def fresh(script: str, *arguments: str, cache_dir, flags: str) -> list:
 
 STORED = """
 import json, os, sys
-import tokamax
 from dew import cache
 from dew.files import write_atomically
-picks = tokamax.AutotuningResult.loads(sys.argv[1])
-path = cache.kernel_picks_path(picks.device_kind)
+path = cache.kernel_picks_path(json.loads(sys.argv[1])["device_kind"])
 os.makedirs(os.path.dirname(path), exist_ok=True)
 write_atomically(path, sys.argv[1])
 print(json.dumps([path]))
