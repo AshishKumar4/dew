@@ -506,7 +506,7 @@ def test_a_scanned_glm5_next_computes_its_unrolled_forward():
     forward is the unrolled one's, call after call. On XLA:CPU it was off by
     8.7, 10.1 or NaN depending on the process, exact without jit and on a
     GPU: the compiled program is identical across processes, so the bad
-    values came from its run (`chunk_kimi_delta_rule`'s workaround)."""
+    values came from its run (the chunked rule's workaround)."""
     loaded = Pretrained.load(FIXTURES / "glm5-next-tiny", dtype="float32", param_dtype="float32")
     tokens = (jnp.arange(24, dtype=jnp.int32).reshape(2, 12) * 7) % 31 + 1
     unrolled = np.asarray(jax.jit(loaded.model.apply)(loaded.variables, tokens), np.float64)
