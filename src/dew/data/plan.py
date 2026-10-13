@@ -273,7 +273,7 @@ class Manifest:
         return all(step.exact for step in (*self.ran, *self.steps))
 
 
-def _unplaced(order: JSON) -> JSON:
+def _unplaced(order: dict[str, JSON] | list[JSON] | str | int | float | bool | None) -> JSON:
     """`order` without its sources' descriptions, which name where a host
     mounted them, its corpora's and phases' included."""
     if isinstance(order, dict):
