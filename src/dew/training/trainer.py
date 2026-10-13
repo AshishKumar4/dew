@@ -1147,7 +1147,7 @@ class Trainer(Generic[Loss, Effects]):
 
         # Read before anything traces, so a recorded rung is the first one lowered.
         record_path, key, recorded = recorded_rung(self.objective.program_key(), (state, batch), candidates,
-                                                   mesh)
+                                                   mesh, self.step)
         before = self._rung()
         self._climb_to(recorded)
         self._resumed_rung = None
