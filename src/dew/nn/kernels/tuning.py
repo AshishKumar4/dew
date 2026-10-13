@@ -316,8 +316,10 @@ def _read(path: str) -> tuple[tokamax.AutotuningResult | None, list]:
     the stored entries they do not, as JSON: another checkout's launches (a
     kernel another branch adds, or another branch's config fields), which a
     write keeps as they are. Each launch is read alone, so one launch this
-    checkout cannot read leaves the others readable. A file that is not JSON
-    holds nothing."""
+    checkout cannot read leaves the others readable: one that does not parse,
+    or whose stored arguments do not bind to this checkout's signature of its
+    kernel (a launch that gained an operand). A file that is not JSON holds
+    nothing."""
     if not os.path.exists(path):
         return None, []
     try:
@@ -330,8 +332,10 @@ def _read(path: str) -> tuple[tokamax.AutotuningResult | None, list]:
     read, foreign = [], []
     for entry in entries:
         try:
-            read.extend(tokamax.AutotuningResult.loads(json.dumps(
-                {**stored, "data": [entry]})).data)
+            found = tokamax.AutotuningResult.loads(json.dumps({**stored, "data": [entry]})).data
+            for ba, _ in found:
+                ba.autotuning_cache_key  # noqa: B018  (binds the stored arguments to this signature)
+            read.extend(found)
         except ValueError:
             foreign.append(entry)
     return tokamax.AutotuningResult(kind, tuple(read)), foreign
