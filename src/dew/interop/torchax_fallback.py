@@ -367,6 +367,8 @@ def _training_only(model: torch.nn.Module) -> tuple[str, ...]:
     positive rate, a positive rate a module hands the functional dropout
     (`attention_dropout`, Falcon's `hidden_dropout`, `*_pdrop`), and a
     router's jitter (`jitter_noise`)."""
+    import torch
+
     found = []
     for name, module in model.named_modules():
         if isinstance(module, torch.nn.Dropout):
