@@ -4,6 +4,7 @@ blocks in a configurable ratio. The S5 layers live in ssm.py; the block and
 the patchify/conditioning/output machinery live in dit.py.
 """
 
+import functools
 from collections.abc import Sequence
 
 from ..dit import ModulatedBlock, build_block_pattern, remat_block
@@ -35,8 +36,8 @@ class HybridSSMAttentionDiT(SimpleDiT):
         policy, and the name a checkpoint stores them under.
         """
         def build(block_cls, policy: str | None, **fields) -> ModulatedBlock:
-            return (block_cls if counted else remat_block(block_cls, self.remat, policy=policy))(
-                **({'parent': None} if counted else {}),
+            make = functools.partial(
+                block_cls if counted else remat_block(block_cls, self.remat, policy=policy),
                 features=self.emb_features,
                 num_heads=self.num_heads,
                 mlp_ratio=self.mlp_ratio,
@@ -47,6 +48,7 @@ class HybridSSMAttentionDiT(SimpleDiT):
                 adaln_silu=self.adaln_silu,
                 **fields,
             )
+            return make(parent=None) if counted else make()
 
         if block_type == 'ssm':
             return build(
