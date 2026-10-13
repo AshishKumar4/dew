@@ -27,6 +27,7 @@ from .attention import LayerNorm, NormalAttention
 from .blocks import FourierEmbedding, TimeProjection
 from .conv import Conv
 from .flops import MissingFlopsCount, counted_flops, projection_flops, real_lengths
+from .mlp import GatedMLP
 from .precision import at_least_fp32, fp32_result_dot_general
 from .rope import rotary_freqs
 from .scan_orders import (
@@ -39,7 +40,7 @@ from .scan_orders import (
     zigzag_indices,
     zigzag_patchify,
 )
-from .sharding import MLP_HIDDEN, RESIDUAL, constrain, logical_axes
+from .sharding import RESIDUAL, constrain, logical_axes
 from .ssm import BidirectionalS5Layer, S5Layer, SpatialFusionConv
 
 SCAN_ORDERS = ('raster', 'hilbert', 'zigzag')
@@ -556,7 +557,6 @@ def _exact_gelu(hidden: jax.Array) -> jax.Array:
     return gelu_exact_torch(hidden)
 
 
-@logical_axes({("mlp", "layers_0"): ("embed", "mlp"), ("mlp", "layers_2"): ("mlp", "embed")})
 class ModulatedBlock(nn.Module):
     """adaLN-Zero modulated residual block with a pluggable token mixer.
 
@@ -656,15 +656,10 @@ class ModulatedBlock(nn.Module):
                     name="spatial_fusion",
                 )
 
-        activate = gelu_tanh if self.gelu_approximate else _exact_gelu
-        self.mlp = nn.Sequential([
-            nn.Dense(features=hidden_features, dtype=self.dtype, precision=self.precision),
-            # Column-parallel under a tensor axis; the activation holds the
-            # place so the layers keep their names. GELU runs in fp32 and
-            # rounds once, as torch's bf16 GELU does (docs/performance.md).
-            lambda hidden: activate(constrain(hidden, MLP_HIDDEN)),
-            nn.Dense(features=self.features, dtype=self.dtype, precision=self.precision),
-        ])
+        # GELU runs in fp32 and rounds once, as torch's bf16 GELU does (docs/performance.md).
+        self.mlp = GatedMLP(hidden_features, self.features,
+                            activation=gelu_tanh if self.gelu_approximate else _exact_gelu, use_bias=True,
+                            dtype=self.dtype, precision=self.precision)
         self.dropout = nn.Dropout(rate=self.dropout_rate)
 
     def _apply_2d_fusion(self, ssm_output):
