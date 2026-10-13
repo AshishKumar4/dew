@@ -243,20 +243,18 @@ class Coordinates:
     """Where each token of a batch sits, built once (`coordinates`) and read by every token mixer.
 
     `positions` `[B, S]` is each real token's logical place in its document,
-    counted over real tokens: the caller's own, else its rank among its
-    document's real tokens (a padded row's from its first real token, a
-    cached call's after the tokens its cache holds), None only for an
-    uncached row of real tokens alone, where each token's place is its index.
-    Rotation, NoPE's temperature, chunked attention and learned embeddings
-    read it; a cache addresses its keys by slot (`cache_positions`), which a
-    layer derives from its own cursor. `segments` numbers each row's packed documents from 1,
-    0 on the padding slots after them, which run as a document of their own,
-    so no layer carries a real document's state or history into them or
-    back; `valid` is the caller's mask of real tokens; `starts` marks each
-    document's first real token but a
-    row's first, which continues whatever state the row holds. Each is None
-    where it holds nothing (one document a row, every token real, no start),
-    which a layer's fast path reads as a static fact. `max_segments` bounds the
+    counted over real tokens: a packed batch's or the caller's own, None
+    where none is given, each token's place then its rank among its row's
+    real tokens (`places`) or, in a cached call, the slot its cache writes it
+    at. Rotation, NoPE's temperature, chunked attention and ALiBi read the
+    logical places; a cache addresses keys by slot. `segments` numbers each
+    row's packed documents from 1, 0 on the padding slots after them, which
+    run as a document of their own, so no layer carries a real document's
+    state or history into them or back; `valid` is the caller's mask of real
+    tokens; `starts` marks each document's first real token but a row's
+    first, which continues whatever state the row holds. Each is None where
+    it holds nothing (one document a row, every token real, no start), which
+    a layer's fast path reads as a static fact. `max_segments` bounds the
     documents a row holds (the packer's static plan, else the row length) and
     `right_padded` says every row's real tokens come first.
     """
@@ -268,13 +266,22 @@ class Coordinates:
     max_segments: int = struct.field(pytree_node=False, default=1)
     right_padded: bool = struct.field(pytree_node=False, default=False)
 
+    def places(self) -> jax.Array | None:
+        """Each token's logical place in an uncached call: the given `positions`, else its rank among
+        its row's real tokens `[B, S]` (a padding slot's the rank before it, 0 before any); None
+        where every token is real and none is given, each token's place its index. A cached call's
+        places are the slots its cache writes them at where none are given."""
+        if self.positions is not None or self.valid is None:
+            return self.positions
+        return jnp.maximum(jnp.cumsum(self.valid, axis=1, dtype=jnp.int32) - 1, 0)
+
 
 def coordinates(shape: tuple[int, int] | None = None, *, segments=None, valid=None, positions=None,
                 max_segments: int | None = None, right_padded: bool = False, xp=jnp) -> Coordinates:
     """The `Coordinates` of `[batch, length]` tokens from what the batch carries: packed `segments`
     (one document a row where None), a `valid` mask (every token real where None), explicit
-    `positions` (each document's real tokens counted from 0 where None and `segments` or `valid` is
-    given; else None, each token's place its row index) and the packer's `max_segments` (the row
+    `positions` (with `segments`, each document's real tokens counted from 0 where None; without,
+    None, each token's place its row index or cache slot) and the packer's `max_segments` (the row
     length where None). `shape` is the first given field's where None. `xp` is the array module the
     fields are built with: jax.numpy in a traced call, numpy where a data reader builds a batch's on
     the host."""
@@ -292,14 +299,12 @@ def coordinates(shape: tuple[int, int] | None = None, *, segments=None, valid=No
             raise ValueError(f"token coordinates are {shape}, got {name} {field.shape}")
     starts = None if segments is None else document_starts(
         segments, xp.ones(shape, bool) if valid is None else valid, xp=xp)
-    if positions is None and (segments is not None or valid is not None):
+    if positions is None and segments is not None:
         real = xp.ones(shape, bool) if valid is None else valid
-        real = real if segments is None else real & (segments != 0)
+        real = real & (segments != 0)
         rank = xp.cumsum(real, axis=1, dtype=np.int32) - 1
-        first = 0
-        if starts is not None:
-            begun = xp.where(starts, rank, 0)
-            first = np.maximum.accumulate(begun, axis=1) if xp is np else jax.lax.cummax(begun, axis=1)
+        begun = xp.where(starts, rank, 0)
+        first = np.maximum.accumulate(begun, axis=1) if xp is np else jax.lax.cummax(begun, axis=1)
         positions = xp.where(real, rank - first, 0)
     positions = None if positions is None else xp.asarray(positions, np.int32)
     return Coordinates(positions, segments, valid, starts,
