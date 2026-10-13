@@ -59,7 +59,7 @@ from dew.nn.sharding import (
     microbatched,
     ruled_boxes,
 )
-from dew.objectives.base import Batch, Variables
+from dew.objectives.base import FROZEN, Batch, Variables
 from dew.telemetry.profile import region
 
 # The axes a parameter can be split over. A dimension named 'exp' takes the
@@ -519,12 +519,19 @@ class Layout:
     fetches each layer's parameters as it reaches that layer. When
     `host_parameters` is set, `check` refuses a placement that keeps every
     parameter on the device, so the patterns are never silently ignored.
+
+    `frozen_whole` keeps the frozen collection (`FROZEN`, a LoRA run's base)
+    whole on every device rather than split as the rules split it. A frozen
+    leaf has no gradient and no optimizer state, so a split saves only its
+    memory, and the step gathers it whole forward and again backward.
+    `check` counts no leaf it keeps whole.
     """
     rules: LogicalAxisRules | Mapping[str, MeshAxes] = DEFAULT_RULES
     min_shard: int = 2 ** 16
     tolerance: float = 0.02
     host: tuple[str, ...] = ()
     host_parameters: tuple[str, ...] = ()
+    frozen_whole: bool = False
 
     def __post_init__(self):
         if not 0.0 <= self.tolerance <= 1.0:
@@ -577,7 +584,9 @@ class Layout:
         def leaf_sharding(path, value):
             axes = declared_axes(path, value.ndim, declared)
             size = int(np.prod(value.shape, dtype=np.int64))
-            if axes is None:
+            if self._kept_whole(path):
+                spec = P()
+            elif axes is None:
                 spec = parameter_spec(value.shape, fsdp_size, self.min_shard)
             elif sharded_devices == 1 or size < self.min_shard:
                 spec = P()
@@ -609,6 +618,13 @@ class Layout:
             return {FSDP_AXIS}
         return {axis for name, assignment in self.axis_rules if name in axes
                 for axis in mesh_axes(assignment) if axis in PARAMETER_AXES}
+
+    def _kept_whole(self, path) -> bool:
+        """Whether a leaf sits in the frozen collection `frozen_whole` keeps
+        whole: the first key on its path, in a variables tree or a train
+        state's, is `FROZEN`."""
+        collection = next((entry.key for entry in path if isinstance(entry, jax.tree_util.DictKey)), None)
+        return self.frozen_whole and collection == FROZEN
 
     def offloaded[TreeT](self, mesh: Mesh, tree: TreeT) -> Placement[TreeT]:
         """Return `shardings`, with the memory kind each leaf's path asks for.
@@ -688,7 +704,7 @@ class Layout:
         for (path, param), sharding, ruled in zip(
                 path_leaves, jax.tree.leaves(shardings), splittable, strict=True):
             elements = int(np.prod(param.shape, dtype=np.int64))
-            if elements < self.min_shard or not ruled:
+            if elements < self.min_shard or not ruled or self._kept_whole(path):
                 continue
             shardable_elements += elements
             if any(axis in mesh_axes(assignment)
