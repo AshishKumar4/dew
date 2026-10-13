@@ -26,7 +26,7 @@ from dew.data.dataset import (
     rows_of,
 )
 from dew.data.mixing import CorpusCounts, state_counts
-from dew.data.pipeline import HostStep
+from dew.data.pipeline import HostStep, Map
 from dew.data.plan import Plan
 from dew.records import integer, record
 
@@ -102,11 +102,13 @@ class _Host(Forwarding):
         return self
 
     def __next__(self) -> Batch:
+        from dew.data.lowering import _outputs
+
         if self._source is None:
             raise StopIteration
         value = next(self._source)
         for step in self._steps:
-            value = step.map(value) if isinstance(step, pygrain.MapTransform) else step(value)
+            value = record(_outputs(Map(step), None, value)[0], "host map result")
         return value
 
     def close(self) -> None:
