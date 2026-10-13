@@ -212,3 +212,26 @@ def test_the_kernels_compile_on_tritons_compiler_within_each_gpus_block(target):
                 f"{record['name']}: {record['shared']} shared bytes, limit {record['limit']}"
                 for record in found if "error" in record or not record["shared"] <= record["limit"]]
     assert not failures, "\n".join(failures)
+
+
+@pytest.mark.mesh(devices=2)
+@pytest.mark.parametrize("axis", ["data", "fsdp"])
+def test_the_conv_keeps_the_kernel_contract_on_a_mesh_that_splits_rows(axis):
+    """`causal_conv1d` over rows split two ways, as data or fsdp parallelism splits them, runs per shard
+    (`sharded.assert_runs_per_shard`): its pieces, the l2-normalised queries and keys of a delta rule
+    over padded rows, and the gradients of the input, the taps and the bias within the float64 gate
+    of one device's, and no operand moved between devices. On a GPU each shard is the fused kernel."""
+    from jax.sharding import Mesh, PartitionSpec
+    from sharded import assert_runs_per_shard
+
+    x, weights, shift, valid = operands(4, 48, DELTA, dtype=jnp.float32, bias=True, valid=True)
+    grads = cotangents(x, DELTA, jnp.float32)
+
+    def gradients(x, weights, shift, valid, *grads):
+        return run(causal_conv1d, x, weights, shift, valid, DELTA, jnp.float32, grads)
+
+    expected = jax.tree.map(np.asarray, truth(x, weights, shift, valid, DELTA, grads))
+    mesh = Mesh(np.asarray(jax.devices()[:2]), (axis,))
+    rows, whole = PartitionSpec(axis), PartitionSpec()
+    assert_runs_per_shard(gradients, (x, weights, shift, valid, *grads),
+                          [rows, whole, whole, rows, rows, rows, rows], mesh, expected)

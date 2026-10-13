@@ -25,6 +25,7 @@ from dew.diffusion.transforms import broadcast_rates
 from dew.inputs import InputSpec
 from dew.lora import unadapted
 from dew.objectives.base import TEACHER, Aux, ProgramModule, Step, Variables, model_rngs
+from dew.sampling.guidance import guide
 
 from .objective import DiffusionObjective, _own_loss, teacher_weights
 
@@ -33,14 +34,6 @@ def with_guidance(conditions: dict, scale: jax.Array) -> dict:
     """Return `conditions` with every conditioning record's guidance set to `scale`, one value per row."""
     return {keyword: replace(value, guidance=scale) if isinstance(value, DenoisingCondition) else value
             for keyword, value in conditions.items()}
-
-
-def guided_target(conditional: jax.Array, unconditional: jax.Array, scale: jax.Array) -> jax.Array:
-    """Return the teacher's guided raw output at a per-row scale w.
-
-    The output is unconditional + w (conditional - unconditional).
-    """
-    return unconditional + expand(scale, conditional) * (conditional - unconditional)
 
 
 class GuidanceDistillationObjective(DiffusionObjective):
@@ -118,7 +111,7 @@ class GuidanceDistillationObjective(DiffusionObjective):
         denoise = teacher.process.denoiser(teacher.model, teacher.model_variables(frozen), given, blank,
                                            schedule=schedule)
         conditional, unconditional = denoise.raw_both(noisy, t)
-        target = jax.lax.stop_gradient(guided_target(conditional, unconditional, scale))
+        target = jax.lax.stop_gradient(guide(conditional, unconditional, scale))
 
         conditions, _ = self._conditions(variables, batch, drop_key, dropout=False)
         if not any(isinstance(value, DenoisingCondition) and value.guidance is not None
@@ -133,4 +126,4 @@ class GuidanceDistillationObjective(DiffusionObjective):
         return self.row_mean(weighted, batch), Aux(metrics={})
 
 
-__all__ = ["GuidanceDistillationObjective", "guided_target", "with_guidance"]
+__all__ = ["GuidanceDistillationObjective", "with_guidance"]

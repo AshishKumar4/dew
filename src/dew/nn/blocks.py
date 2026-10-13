@@ -82,6 +82,50 @@ def _whole(x: jax.Array) -> jax.Array:
 table_rows.defvjp(_table_rows_forward, _table_rows_backward)
 
 
+def modulation(conditioning, features: int, pieces: int, *, name: str, silu: bool = True,
+               bias: bool = True, zero_init: bool = False, dtype: Dtype | None = None,
+               precision: PrecisionLike = None) -> jax.Array:
+    """The adaLN projection of `conditioning`, `[..., pieces * features]`: SiLU, then one linear map,
+    named `name` in the calling module so each family keeps its checkpoint's path. `silu` False
+    projects the conditioning as it is (FlaxDiff 0.2's DiT); `zero_init` starts it at zero,
+    adaLN-Zero's identity block at the start of training."""
+    return nn.Dense(pieces * features, use_bias=bias, dtype=dtype, precision=precision, name=name,
+                    kernel_init=nn.initializers.zeros if zero_init else nn.initializers.lecun_normal())(
+        nn.silu(conditioning) if silu else conditioning)
+
+
+class Modulation(nn.Module):
+    """Projects the conditioning as the source's `AdaLayerNormZero` family does: SiLU, then one linear
+    layer (`modulation`, named `linear`).
+
+    The output is `pieces` chunks of the width, in the source's order.
+    """
+
+    features: int
+    pieces: int
+    bias: bool = True
+    zero_init: bool = False
+    """Whether the projection starts at zero, adaLN-Zero's identity block, which
+    Dew's own MM-DiT trains from; the published families load their weights."""
+    dtype: Dtype | None = None
+    precision: PrecisionLike = None
+
+    @property
+    def output_features(self) -> int:
+        return self.pieces * self.features
+
+    @nn.nowrap
+    def model_flops(self, lengths, input_features: int | None = None) -> float:
+        return projection_flops(lengths, self.features if input_features is None else input_features,
+                                self.output_features)
+
+    @nn.compact
+    def __call__(self, conditioning):
+        projected = modulation(conditioning, self.features, self.pieces, name="linear", bias=self.bias,
+                               zero_init=self.zero_init, dtype=self.dtype, precision=self.precision)
+        return jnp.split(projected, self.pieces, axis=-1)
+
+
 class TokenEmbedding(nn.Embed):
     """Token lookup with cotangent accumulation in the parameter dtype."""
 
