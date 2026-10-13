@@ -34,7 +34,7 @@ temporaries, against 249 ms and 3.55 GiB for recomputing whole chunks.
 
 import math
 from collections.abc import Callable
-from typing import NamedTuple
+from typing import NamedTuple, overload
 
 import jax
 import jax.numpy as jnp
@@ -818,6 +818,16 @@ def logits_cross_entropy(logits, targets, *, predict: bool = True, temperature: 
     log_z = jax.nn.logsumexp(logits, axis=-1)
     picked = jnp.take_along_axis(logits, targets[..., None], axis=-1)[..., 0]
     return log_z - picked, jnp.argmax(logits, axis=-1) if predict else None, log_z
+
+
+@overload
+def _sharded_head(mesh, hidden, table, targets, excluded, cap, bias, head, column_logits: Callable, *,
+                  predict: bool) -> Terms: ...
+
+
+@overload
+def _sharded_head(mesh, hidden, table, targets, excluded, cap, bias, head, column_logits: None, *,
+                  predict: bool) -> tuple[jax.Array, Terms]: ...
 
 
 def _sharded_head(mesh, hidden, table, targets, excluded, cap, bias, head, column_logits, *, predict: bool):
