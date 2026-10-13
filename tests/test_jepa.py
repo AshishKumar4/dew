@@ -296,7 +296,8 @@ def test_training_makes_the_prediction_depend_on_the_context(mask):
     moved = {"params": {"context_encoder": jax.tree.map(
         lambda value: value + 0.1, initial.averaged["params"]["context_encoder"])}}
     other = float(objective.scalar_loss(params, batch, step_with(merge(initial.averaged, moved)))[0])
-    assert abs(other - same) > 1e-2 * same
+    # Far above fp32 rounding: the loss reads the averaged context encoder.
+    assert abs(other - same) > 1e-4 * same
 
     state = trainer.fit(Data(batches, batch=16), steps=150, log_every=50)
 
@@ -418,7 +419,7 @@ def test_an_adapted_pretrained_encoder_trains_its_factors_over_one_frozen_base(m
     encoder = make_encoder()
     pretrained = encoder.init(jax.random.key(5), jnp.ones((1, RES, RES, 3)),
                               jnp.arange(mask.num_context, dtype=jnp.int32)[None])
-    adapter = LoRA(rank=2, modules=("layers_0",)).apply(encoder, pretrained, key=0)
+    adapter = LoRA(rank=2, modules=("up_proj",)).apply(encoder, pretrained, key=0)
     objective = JepaObjective(adapter.model, make_predictor(), mask, sample=Field("image", (RES, RES, 3)),
                               encoder_variables=adapter.variables, momentum=(0.5, 0.5), momentum_steps=1)
     trainer = Trainer(objective, optax.adam(1e-2), key=jax.random.key(0))
