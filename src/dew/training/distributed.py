@@ -714,13 +714,19 @@ def placeable(field) -> bool:
 def device_fields(batch: Batch) -> Batch:
     """`batch` without the fields no device can hold (`placeable`), which host
     code reads and a compiled step cannot take: the batch a step and an
-    objective's programs are called on."""
+    objective's programs are called on. A batch with no such field, a bare
+    array among them, is itself."""
+    if not host_fields(batch):
+        return batch
     return {name: device_fields(value) if isinstance(value, Mapping) else value
             for name, value in batch.items() if isinstance(value, Mapping) or placeable(value)}
 
 
-def host_fields(batch: Batch) -> Batch:
-    """The fields of `batch` no device can hold, in the mappings that hold them."""
+def host_fields(batch: object) -> dict:
+    """The fields of `batch` no device can hold, in the mappings that hold them:
+    none for a batch that is no mapping of fields."""
+    if not isinstance(batch, Mapping):
+        return {}
     nested = {name: host_fields(value) for name, value in batch.items() if isinstance(value, Mapping)}
     return {**{name: value for name, value in batch.items()
                if not isinstance(value, Mapping) and not placeable(value)},
