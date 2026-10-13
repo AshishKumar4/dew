@@ -1209,15 +1209,14 @@ def mode_evaluation_clocks(args) -> dict:
     import jax
     import optax
 
-    from dew.data import Dataset
     from dew.training import Layout, MeshSpec, Trainer
 
     objective, batch = text_to_image(args)
     trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(0), mesh=MeshSpec(),
                       layout=Layout(min_shard=TINY), checkpoints=None, tracker=None)
     state, _, _ = trainer.place()
-    data = Dataset(train=lambda partition: iter([batch]), val=lambda partition: iter([batch]),
-                   records=BATCH, batch=BATCH)
+    data = Loader(train=lambda partition: iter([batch]), val=lambda partition: iter([batch]),
+                  records=BATCH, batch=BATCH)
     ahead = 4 * jax.process_index()
     result = Evaluation.run(trainer.objective, state.variables, data.val, key=state.key, loss=True,
                             step=5 + ahead, schedule_step=np.int32(3 + ahead), mesh=trainer.device_mesh)
