@@ -45,8 +45,10 @@ import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn, struct
 from flax.typing import PrecisionLike, VariableDict
+from jax.typing import DTypeLike
 
 from dew.nn.inputs import ModelKwarg
+from dew.nn.precision import biased_logits, capped_logits, head_product
 
 if TYPE_CHECKING:
     from dew.diffusion.process import DenoisingCondition
@@ -56,6 +58,7 @@ if TYPE_CHECKING:
     from dew.nn.hyper_connections import HyperConnections
     from dew.nn.mla import MLAMixer
     from dew.records import JSON
+    from dew.training.quantization import InputQuantizer
 
 __all__ = [
     "AffineHead",
@@ -90,6 +93,7 @@ __all__ = [
     "ModelKwarg",
     "OutputTable",
     "ProjectionGroup",
+    "QuantizesInputs",
     "Recomputing",
     "RematChoosing",
     "RequiresText",
@@ -106,11 +110,15 @@ class OutputTable:
     stores it, `[vocab, features]` when `vocab_major` and `[features, vocab]`
     otherwise, an optional fp32 `[vocab]` `bias` added after the product,
     the `softcap` applied last, and the `precision` the product runs at.
+    `compute`, the model's compute dtype, decides the product's operands
+    (`dew.nn.precision.head_product`; the states' dtype where None), and an
+    `input_quantizer` rounds the states first as a checkpoint's head input
+    quantization does.
 
-    Contracting the model's final states with it reproduces the model's own
-    logits, bias, softcap and any adapter on the head included. Where no
-    matrix does, `output_table` returns None, and the logits come from
-    `logits_from_hidden` or `logits` instead.
+    Contracting the model's final states with it (`logits`) reproduces the
+    model's own logits, bias, softcap and any adapter on the head included.
+    Where no matrix does, `output_table` returns None, and the logits come
+    from `logits_from_hidden` or `logits` instead.
     """
 
     matrix: jax.Array
@@ -118,6 +126,21 @@ class OutputTable:
     bias: jax.Array | None = None
     softcap: float | None = struct.field(pytree_node=False, default=None)
     precision: PrecisionLike = struct.field(pytree_node=False, default=None)
+    compute: DTypeLike | None = struct.field(pytree_node=False, default=None)
+    input_quantizer: InputQuantizer | None = None
+
+    def states(self, hidden: jax.Array) -> jax.Array:
+        """`hidden` as the product reads it: through the input quantizer's QDQ."""
+        return hidden if self.input_quantizer is None else self.input_quantizer.qdq(hidden)
+
+    def logits(self, hidden: jax.Array, *, temperature: float = 1.0) -> jax.Array:
+        """`hidden`'s `[..., vocab]` logits, at least fp32: the states through
+        the input quantizer, the product (`head_product`), the bias, the
+        softcap, then `temperature`, which a sampler applies to the head's
+        logits."""
+        logits = head_product('...d,vd->...v' if self.vocab_major else '...d,dv->...v',
+                              self.states(hidden), self.matrix, self.precision, compute=self.compute)
+        return capped_logits(biased_logits(logits, self.bias), self.softcap, temperature)
 
 
 @runtime_checkable
@@ -347,6 +370,16 @@ class AffineHead(Protocol):
     """
 
     def output_table(self) -> OutputTable | None: ...
+
+
+@runtime_checkable
+class QuantizesInputs(Protocol):
+    """A model computing under a checkpoint's input quantization
+    (`dew.training.quantization.InputQuantization`): the quantizer a bound
+    module's input takes, which a head read as a table (`OutputTable`) applies
+    as the module's own call does."""
+
+    def input_quantizer(self, module: nn.Module) -> InputQuantizer | None: ...
 
 
 @runtime_checkable
