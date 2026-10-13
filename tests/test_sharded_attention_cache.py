@@ -4,6 +4,7 @@
 the kernel per shard (`dew.nn.attention.per_shard`), where jax lowers no partitioner."""
 
 import json
+import os
 import subprocess
 import sys
 
@@ -43,16 +44,17 @@ print(json.dumps({**compilation_cache_counts(), "partitioner": "CustomSPMDPartit
 
 @pytest.mark.mesh(devices=2)
 @pytest.mark.gpu(reason="jax's cuDNN attention runs on a CUDA GPU alone")
-def test_a_sharded_cudnn_attention_compiles_once_across_processes(tmp_path):
+def test_a_sharded_cudnn_attention_compiles_once_across_processes(tmp_path, without_deterministic_ops):
     """Two fresh processes train one causal cuDNN attention with its rows over two GPUs against one
     persistent cache: the program holds no partitioner, the second process compiles nothing, both
     take the same gradients, and those match the attention run whole, bit for bit, since every row
     attends alone."""
     reports, gradients = [], []
     for run in range(2):
+        # The test's own process holds its share of each GPU; the child takes memory as it needs it.
         done = subprocess.run([sys.executable, "-c", PROGRAM, str(tmp_path / "cache"),
-                               str(tmp_path / f"gradients-{run}.npy")],
-                              capture_output=True, text=True, timeout=600)
+                               str(tmp_path / f"gradients-{run}.npy")], capture_output=True, text=True,
+                              timeout=600, env={**os.environ, "XLA_PYTHON_CLIENT_PREALLOCATE": "false"})
         assert done.returncode == 0, done.stderr[-3000:]
         reports.append(json.loads(done.stdout.splitlines()[-1]))
         gradients.append(np.load(tmp_path / f"gradients-{run}.npy"))
