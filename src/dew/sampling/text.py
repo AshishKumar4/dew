@@ -893,7 +893,7 @@ def decoding_storage(model: nn.Module, variables: Variables) -> Variables:
     if compute is None:
         return variables
 
-    def stored(path: jax.tree_util.KeyPath, leaf: jax.Array) -> jax.Array:
+    def stored(path: tuple[jax.tree_util.KeyEntry, ...], leaf: jax.Array) -> jax.Array:
         names = tuple(jax.tree_util.keystr((key,), simple=True) for key in path)
         dtype = jnp.result_type(leaf)
         if (names[0] != "params" or not jnp.issubdtype(dtype, jnp.floating)
