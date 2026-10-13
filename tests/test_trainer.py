@@ -1111,6 +1111,28 @@ def test_a_step_compiles_from_its_arrays_shapes_before_they_are_placed():
     assert int(advanced.step) == 1 and bool(finite)
 
 
+def test_a_field_no_device_holds_stays_on_the_host_for_the_code_that_reads_it():
+    """A batch may carry a field no device holds, a caption: the step and the
+    objective's evaluation take the rest, and a metric reads the caption on
+    the host, for the rows it scores."""
+
+    def captioned(source):
+        for batch in source:
+            yield {**batch, "caption": np.array([f"row {index}" for index in batch["index"]])}
+
+    captions = []
+
+    class Captions(Spread):
+        def __call__(self, artifact, batch):
+            captions.extend(batch["caption"].tolist())
+            return super().__call__(artifact, batch)
+
+    data = dataset(lambda: captioned(Counting()), val=lambda: captioned(val_batches(1)()))
+    state = Trainer(Features(), optax.sgd(.1), key=jax.random.key(0)).fit(
+        data, steps=2, eval_every=2, metrics=(Captions([]),), checkpoint_final=False)
+    assert int(state.step) == 2 and captions == [f"row {index}" for index in range(BATCH)]
+
+
 def test_a_failing_metric_fails_the_validation_pass():
     class Broken:
         name = "broken"

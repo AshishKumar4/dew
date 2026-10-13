@@ -696,6 +696,37 @@ class Layout:
             f"Largest replicated parameters:\n{details}")
 
 
+def placeable(field) -> bool:
+    """Whether a device can hold every leaf of `field`: arrays of numbers,
+    not strings, bytes or Python objects, such as a caption or an image's
+    catalog URL."""
+    return all(isinstance(leaf, jax.Array) or (
+        not isinstance(leaf, (str, bytes)) and np.asarray(leaf).dtype.kind not in "OSUV")
+        for leaf in jax.tree.leaves(field))
+
+
+def device_fields(batch: Batch) -> Batch:
+    """`batch` without the fields no device can hold (`placeable`), which host
+    code reads and a compiled step cannot take: the batch a step and an
+    objective's programs are called on."""
+    return {name: device_fields(value) if isinstance(value, Mapping) else value
+            for name, value in batch.items() if isinstance(value, Mapping) or placeable(value)}
+
+
+def host_fields(batch: Batch) -> Batch:
+    """The fields of `batch` no device can hold, in the mappings that hold them."""
+    nested = {name: host_fields(value) for name, value in batch.items() if isinstance(value, Mapping)}
+    return {**{name: value for name, value in batch.items()
+               if not isinstance(value, Mapping) and not placeable(value)},
+            **{name: value for name, value in nested.items() if value}}
+
+
+def with_host(placed: Batch, host: Batch) -> Batch:
+    """`placed` with the host fields put back where they were."""
+    return {**placed, **{name: with_host(placed[name], value) if isinstance(value, Mapping) else value
+                         for name, value in host.items()}}
+
+
 def batch_shardings(mesh: Mesh | AbstractMesh, batch: Batch) -> Placement[Batch]:
     """Return a sharding for each leaf of `batch`, chosen from the leaf's shape.
 
@@ -751,6 +782,9 @@ def shard_batch(mesh: Mesh, batch: Batch) -> Batch:
     actually carry validity, the way `agreed_validity` does for a generation
     request, belongs where the caller's own collectives are issued.
     """
+    if isinstance(batch, Mapping) and (host := host_fields(batch)):
+        # A field no device holds (`placeable`) stays on the host, where host code reads it.
+        return with_host(shard_batch(mesh, device_fields(batch)), host)
     batch = filled_validity(batch) if jax.process_count() > 1 else batch
     cpu = all(device.platform == "cpu" for device in mesh.devices.flat)
     batch = jax.tree.map(
