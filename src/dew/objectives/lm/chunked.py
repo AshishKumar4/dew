@@ -619,14 +619,13 @@ def chunked_cross_entropy(hidden, head: OutputTable, targets, chunks: int, *,
                          predict=predict)
 
 
-def _fused_terms(hidden, table, labels, weights, z_loss: float, cap, bias, tile: tuple[int, int],
+def _fused_terms(hidden, table, labels, weights, z_loss: float, cap, bias, chunk: int,
                  precision: jax.lax.PrecisionLike, predict: bool, temperature: float, excluded,
                  gradients: bool):
-    """`fused_head_loss`'s per-token terms, `tile[0]` tokens at a time
+    """`fused_head_loss`'s per-token terms, a `chunk` of tokens at a time
     against the whole vocabulary, and with `gradients` the loss's gradients
     taken in the same chunk: the states', the head's (fp32 until every chunk
-    is in, added `tile[1]` rows at a time, so the sum is updated in place and
-    no second copy of it is held) and the bias's."""
+    is in) and the bias's."""
     count, features = hidden.shape
     work = at_least_fp32(hidden.dtype)
     operands = _operand_dtype(precision, work)
@@ -657,15 +656,9 @@ def _fused_terms(hidden, table, labels, weights, z_loss: float, cap, bias, tile:
             d_raw = _logits_cotangent(d_raw, precision)
             values.append(jnp.einsum('tv,vd->td', d_raw, product_matrix, precision=precision,
                                      preferred_element_type=work))
-            operand = states.astype(operands)
-
-            def rows(first, d_table, width):
-                block = jax.lax.dynamic_slice_in_dim(d_table, first, width, axis=0) + jnp.einsum(
-                    'tv,td->vd', jax.lax.dynamic_slice_in_dim(d_raw, first, width, axis=1), operand,
-                    precision=precision, preferred_element_type=work)
-                return jax.lax.dynamic_update_slice_in_dim(d_table, block, first, axis=0)
-
-            d_table = _over_tiles(d_table, table.shape[0], tile[1], rows)
+            operand = jax.lax.dynamic_slice_in_dim(hidden, start, size).astype(operands)
+            d_table = d_table + jnp.einsum('tv,td->vd', d_raw, operand, precision=precision,
+                                           preferred_element_type=work)
         outputs = tuple(jax.lax.dynamic_update_slice_in_dim(out, value, start, axis=0)
                         for out, value in zip(outputs, values, strict=True))
         return outputs, d_table, d_bias
@@ -677,7 +670,7 @@ def _fused_terms(hidden, table, labels, weights, z_loss: float, cap, bias, tile:
         outputs += (jnp.zeros((count, features), work),)
     d_table = jnp.zeros(table.shape, work) if gradients else None
     d_bias = jnp.zeros(bias.shape, work) if gradients and bias is not None else None
-    return _over_tiles((outputs, d_table, d_bias), count, tile[0], tokens)
+    return _over_tiles((outputs, d_table, d_bias), count, chunk, tokens)
 
 
 def _fused_total(losses, log_z, weights, z_loss: float):
@@ -686,18 +679,18 @@ def _fused_total(losses, log_z, weights, z_loss: float):
     return compensated_sum(terms, (0,))
 
 
-def _fused_impl(hidden, table, labels, weights, bias, z_loss, cap, tile, precision, predict, temperature,
+def _fused_impl(hidden, table, labels, weights, bias, z_loss, cap, chunk, precision, predict, temperature,
                 excluded):
     (losses, log_z, *predicted), _, _ = _fused_terms(
-        hidden, table, labels, weights, z_loss, cap, bias, tile, precision, predict, temperature, excluded,
+        hidden, table, labels, weights, z_loss, cap, bias, chunk, precision, predict, temperature, excluded,
         gradients=False)
     return _fused_total(losses, log_z, weights, z_loss), (losses, predicted[0] if predict else None, log_z)
 
 
-def _fused_fwd(hidden, table, labels, weights, bias, z_loss, cap, tile, precision, predict, temperature,
+def _fused_fwd(hidden, table, labels, weights, bias, z_loss, cap, chunk, precision, predict, temperature,
                excluded):
     (losses, log_z, *rest), d_table, d_bias = _fused_terms(
-        hidden, table, labels, weights, z_loss, cap, bias, tile, precision, predict, temperature, excluded,
+        hidden, table, labels, weights, z_loss, cap, bias, chunk, precision, predict, temperature, excluded,
         gradients=True)
     predicted, d_states = (rest[0], rest[1]) if predict else (None, rest[0])
     total = _fused_total(losses, log_z, weights, z_loss)
@@ -706,7 +699,7 @@ def _fused_fwd(hidden, table, labels, weights, bias, z_loss, cap, tile, precisio
     return (total, (losses, predicted, log_z)), (d_states, d_table, d_bias, dtypes)
 
 
-def _fused_bwd(z_loss, cap, tile, precision, predict, temperature, excluded, residuals, cotangents):
+def _fused_bwd(z_loss, cap, chunk, precision, predict, temperature, excluded, residuals, cotangents):
     """The gradients the forward took, times the total's cotangent; the
     per-token outputs carry none."""
     d_states, d_table, d_bias, (states_dtype, table_dtype) = residuals
@@ -719,20 +712,18 @@ _fused = jax.custom_vjp(_fused_impl, nondiff_argnums=(5, 6, 7, 8, 9, 10, 11))
 _fused.defvjp(_fused_fwd, _fused_bwd)
 
 
-def fused_head_loss(hidden, head: OutputTable, targets, weights, *, z_loss: float = 0.0,
-                    tile: tuple[int, int] = (2048, 8192), predict: bool = True, temperature: float = 1.0,
-                    excluded: int | None = None):
+def fused_head_loss(hidden, head: OutputTable, targets, weights, *, z_loss: float = 0.0, chunk: int = 256,
+                    predict: bool = True, temperature: float = 1.0, excluded: int | None = None):
     """The weighted sum of `head.logits(hidden)`'s cross entropies at
     `targets` and PaLM's z-loss, sum of w (ce + z_loss log Z^2), with each
     token's loss, top-1 column (None unless `predict`) and log Z beside it.
 
     Only the sum carries a gradient, and its gradient is taken in the forward
-    pass, Liger's fused linear cross entropy: each `tile[0]` tokens score
-    the whole vocabulary, then pull their softmax back through the head at
+    pass, Liger's fused linear cross entropy: each `chunk` of tokens scores
+    the whole vocabulary, then pulls its softmax back through the head at
     once, three products a chunk and no logits recomputed or held beyond the
-    chunk; the head's gradient sums `tile[1]` of its rows at a time. The
-    backward scales those gradients by the sum's cotangent. The sum is a
-    loss's numerator (`Ratio.total`), with no 1/sum(w) in it, so
+    chunk. The backward scales those gradients by the sum's cotangent. The
+    sum is a loss's numerator (`Ratio.total`), with no 1/sum(w) in it, so
     microbatches pool by mass; `weights` (`[...]` like `targets`) are known
     in the forward and carry no gradient. The products, the softmax and the
     rounding are `chunked_cross_entropy`'s whole head's, the states through
@@ -753,7 +744,7 @@ def fused_head_loss(hidden, head: OutputTable, targets, weights, *, z_loss: floa
     flat = states.reshape(-1, states.shape[-1])
     total, (losses, predicted, log_z) = _fused(
         flat, table, targets.reshape(-1), jax.lax.stop_gradient(weights.reshape(-1)), bias, float(z_loss),
-        head.softcap, tuple(tile), precision, predict, float(temperature),
+        head.softcap, chunk, precision, predict, float(temperature),
         None if excluded is None else int(excluded))
     shaped = None if predicted is None else predicted.reshape(targets.shape)
     return total, (losses.reshape(targets.shape), shaped, log_z.reshape(targets.shape))

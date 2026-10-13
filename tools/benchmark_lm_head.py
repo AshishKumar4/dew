@@ -7,8 +7,7 @@ The variants are baseline (one full-vocabulary logits tensor), stored (the
 Python vocabulary loop holding its tiles), remat (that loop under
 `jax.checkpoint`), bounded (the shipped recomputing custom VJP) and fused
 (`fused_head_loss`, its gradient taken in the forward, `--token-tile` tokens a
-chunk against the whole vocabulary, the head's gradient summed `--vocab-tile`
-rows at a time), each with
+chunk against the whole vocabulary), each with
 an optional chunk count after the name (`bounded8`; 4 when absent) and the
 suffixes -noacc, which drops the top-1 prediction to price the metric, and
 -fp32, which keeps the states in fp32 (and so the head's product fp32; bf16
@@ -99,10 +98,10 @@ def bounded(states, table, targets, variant: Variant):
 
 
 def fused(states, table, targets, variant: Variant):
-    """The gradient-in-forward head (`fused_head_loss`) at `--token-tile` and `--vocab-tile`."""
+    """The gradient-in-forward head (`fused_head_loss`), `--token-tile` tokens a chunk."""
     total, (_, predicted, _) = fused_head_loss(
         states, OutputTable(table.T, vocab_major=False, softcap=variant.softcap), targets,
-        jnp.ones(targets.shape, jnp.float32), z_loss=variant.z_loss, tile=variant.tile,
+        jnp.ones(targets.shape, jnp.float32), z_loss=variant.z_loss, chunk=variant.tile[0],
         predict=variant.accuracy)
     accuracy = (jnp.mean((predicted == targets).astype(jnp.float32)) if predicted is not None
                 else jnp.zeros((), jnp.float32))
