@@ -88,7 +88,9 @@ print(dict(MeshSpec(fsdp=4, sequence=2).build().shape))
 ```python
 from dew.training import Layout
 
-mesh = jax.make_mesh((2, 2, 2), ("replica", "zero", "zero2"))
+from jax.sharding import AxisType
+
+mesh = jax.make_mesh((2, 2, 2), ("replica", "zero", "zero2"), axis_types=(AxisType.Auto,) * 3)
 layout = Layout(rules={"embed": ("zero", "zero2"), "mlp": "zero", "vocab": "zero"},
                 data_axes=("replica", "zero", "zero2"))
 trainer = Trainer(LMObjective(model, seq_len=64), OptimConfig(learning_rate=1e-3), key=0,
@@ -96,7 +98,7 @@ trainer = Trainer(LMObjective(model, seq_len=64), OptimConfig(learning_rate=1e-3
 trainer.fit(data, steps=2, log_every=2)
 ```
 
-A batch placed outside the trainer, by `dew.training.distributed.shard_batch` say, reads the rules in context: put it under `flax.linen.logical_axis_rules(layout.axis_rules)`.
+`jax.make_mesh` makes Explicit axes unless `axis_types` says otherwise. The partitioner places Dew's parameters, so their axes are Auto, and a rule that puts a parameter on an Explicit axis is refused by name; an Explicit axis can split the batch's rows, which then sit where their type places them. A batch placed outside the trainer, by `dew.training.distributed.shard_batch` say, reads the rules in context: put it under `flax.linen.logical_axis_rules(layout.axis_rules)`.
 
 ## Parameter placement
 
