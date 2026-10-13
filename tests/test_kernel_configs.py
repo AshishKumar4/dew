@@ -6,9 +6,10 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+import tokamax
 from kernel_compile import compile_kernels
 
-from dew.nn.kernels import fla_gdn, generation
+from dew.nn.kernels import fla_gdn, generation, tuning
 
 pytestmark = pytest.mark.kernel
 
@@ -30,6 +31,28 @@ def test_each_gpu_takes_the_picks_its_block_holds_and_measures_a_space_holding_t
     for kernel, tiles in fla_gdn.HEURISTICS["bfloat16", wide].items():
         assert tiles in fla_gdn._space(kernel, wide), kernel
     assert set(fla_gdn.HEURISTICS["bfloat16", wide]) == set(fla_gdn.HEURISTICS["float32", wide])
+
+
+def test_the_tuner_finds_each_of_the_rules_nine_launches_in_its_lowering():
+    """The rule's forward and backward, traced as the tuner reads a program (`tuning.launches`): each
+    of the nine kernels is a launch tokamax describes, its arguments serializable into its key."""
+    q = jax.ShapeDtypeStruct((1, 64, 1, 64), jnp.bfloat16)
+    v = jax.ShapeDtypeStruct((1, 64, 2, 64), jnp.bfloat16)
+    g = jax.ShapeDtypeStruct((1, 64, 2), jnp.float32)
+    h0 = jax.ShapeDtypeStruct((1, 2, 64, 64), jnp.float32)
+
+    interpreted = True
+
+    def both(q, k, v, g, beta, h0, do):
+        (_, final), pull = jax.vjp(lambda *a: fla_gdn.chunk_gated_delta_rule(*a, None, 0.125, 64, interpreted),
+                                   q, k, v, g, beta, h0)
+        return pull((do, jnp.zeros_like(final)))
+
+    with tuning.launches():
+        beta = g.update(dtype=jnp.bfloat16)
+        found = tokamax.autotuning.get_bound_args(jax.jit(both), q, q, v, g, beta, h0, v)
+    assert {type(ba.op) for ba in found} == {type(op) for op in vars(fla_gdn).values()
+                                             if isinstance(op, fla_gdn._Launch)}
 
 
 def test_a_launch_clips_its_blocks_to_the_operands_and_takes_the_labs_overrides():
