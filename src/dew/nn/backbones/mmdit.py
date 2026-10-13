@@ -6,7 +6,6 @@ through a single joint attention over the concatenated sequence.
 """
 
 from collections.abc import Sequence
-from typing import Self
 
 import einops
 import jax.numpy as jnp
@@ -14,18 +13,15 @@ import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
-from dew.records import JSON
-
 from ..attention import LayerNorm
 from ..dit import (
     ROPE_THETA,
     RematChoice,
+    RematLadder,
     _AttentionStackOptions,
     _DiTStackOptions,
     remat_block,
-    restored_remat,
     rope_for_scan,
-    stronger_remat,
 )
 from ..flops import MissingFlopsCount, matching_lengths, patch_lengths, projection_flops
 from ..precision import at_least_fp32
@@ -188,7 +184,7 @@ class PatchExpanding(nn.Module):
         return expanded, new_H, new_W
 
 
-class HierarchicalMMDiT(_AttentionStackOptions):
+class HierarchicalMMDiT(RematLadder, _AttentionStackOptions):
     """U-shaped MM-DiT: dual-stream blocks per stage with patch merging on the
     way down and expansion + skip fusion on the way up.
 
@@ -244,20 +240,6 @@ class HierarchicalMMDiT(_AttentionStackOptions):
                 count += projection_flops(level, *maps[f'fusion_{stage}'])
         return count + self._output(self.base_patch_size, self.output_channels, modulated=True).model_flops(
             lengths, base)
-
-    @nn.nowrap
-    def recompute_record(self) -> JSON:
-        return self.remat
-
-    @nn.nowrap
-    def recompute_more(self) -> Self | None:
-        stronger = stronger_remat(self.remat)
-        return None if stronger is None else self.clone(remat=stronger)
-
-    @nn.nowrap
-    def restore_recompute(self, record: JSON) -> Self:
-        restored = restored_remat(self.remat, record)
-        return self if restored is None else self.clone(remat=restored)
 
     def stage_blocks(self, stage: int, prefix: str) -> list:
         """Build one stage's dual-stream blocks, at that stage's width and heads."""
