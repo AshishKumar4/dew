@@ -173,9 +173,12 @@ def test_a_loss_mean_is_as_exact_as_numpys_float32_mean():
     rows = np.asarray(ratio.total / ratio.mass)
     assert_as_exact_as_the_reference(rows, squares.mean(axis=1), squares.astype(np.float64).mean(axis=1),
                                      "row means")
-    # Each row's sum is the correctly rounded one, and its derivative is the plain sum's, ones.
+    # Each row's sum is the correctly rounded one, compiled too, and its derivative is the plain
+    # sum's, ones.
     correct = squares.astype(np.float64).sum(axis=1).astype(np.float32)
     np.testing.assert_array_equal(np.asarray(ratio.total), correct)
+    compiled = jax.jit(lambda x: Objective.row_mean(x, {}, axis=1).total)(jnp.asarray(squares))
+    np.testing.assert_array_equal(np.asarray(compiled), correct)
     gradient = jax.grad(lambda x: Objective.row_mean(x, {}).total)(jnp.asarray(squares))
     np.testing.assert_array_equal(np.asarray(gradient), np.ones_like(squares))
 
