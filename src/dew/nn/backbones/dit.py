@@ -1,3 +1,4 @@
+import functools
 from collections.abc import Sequence
 from typing import Literal
 
@@ -51,9 +52,9 @@ class SimpleDiT(_DiTStackOptions):
 
     @nn.nowrap
     def counted_blocks(self) -> list[ModulatedBlock]:
-        """The plain blocks without lifted remat, for host-side work accounting."""
-        return [ModulatedBlock(features=self.emb_features, num_heads=self.num_heads,
-                               **self._block_options(), parent=None) for _ in range(self.num_layers)]
+        """The layers `stack` builds, unbound and without lifted remat, for host-side work
+        accounting; a configuration `stack` refuses is refused here too."""
+        return self.stack(counted=True)
 
     @nn.nowrap
     def model_flops(self, lengths) -> float:
@@ -92,18 +93,14 @@ class SimpleDiT(_DiTStackOptions):
         self.blocks = self.stack()
         self.output = self._output(self.patch_size, self.output_channels)
 
-    def stack(self) -> list[ModulatedBlock]:
-        """The layers between the patch embedding and the output, all attention."""
-        return [
-            remat_block(ModulatedBlock, self.remat)(
-                features=self.emb_features,
-                num_heads=self.num_heads,
-                mixer='attention',
-                adaln_silu=self.adaln_silu,
-                **self._block_options(),
-                name=f"dit_block_{i}"
-            ) for i in range(self.num_layers)
-        ]
+    def stack(self, *, counted: bool = False) -> list[ModulatedBlock]:
+        """The layers between the patch embedding and the output, all attention; `counted`,
+        unbound and without remat (`counted_blocks`)."""
+        block = functools.partial(ModulatedBlock if counted else remat_block(ModulatedBlock, self.remat),
+                                  features=self.emb_features, num_heads=self.num_heads, mixer='attention',
+                                  adaln_silu=self.adaln_silu, **self._block_options())
+        return [block(name=f"dit_block_{i}", parent=None) if counted else block(name=f"dit_block_{i}")
+                for i in range(self.num_layers)]
 
     def __call__(self, x, temb, textcontext=None, train: bool = False, duration=None):
         _, H, W, _ = x.shape
