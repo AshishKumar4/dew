@@ -16,6 +16,8 @@ A Dew training run is built from four objects, each responsible for one part of 
 This trains a small decoder on one repeated sentence and generates from it. It downloads nothing and runs on a CPU.
 
 ```python
+from dew.data import Loading
+from dew.config.data import RecordsData, loader
 import jax
 import numpy as np
 
@@ -29,7 +31,7 @@ from dew.sampling import Sampling, generate
 tokenizer = ByteTokenizer()
 text = tokenizer.encode("dew trains jax models. " * 3)
 rows = np.tile(np.asarray(text[:65], np.int32), (8, 1))
-data = Dataset.from_records({"text": rows}, batch=8)
+data = loader(RecordsData(source={"text": rows}), batch=8, read="memory", loading=Loading(workers=0))
 
 model = CausalTransformer(
     vocab_size=tokenizer.vocab_size,
@@ -128,9 +130,9 @@ Dew ships objectives for autoregressive language modeling (`LMObjective`), image
 
 ## Dataset
 
-`Dataset(train, val, records, batch)` holds two functions. `train(partition)` opens an endless stream of training batches; `val(partition)` opens one pass over the validation records. `partition` is a `DataPartition` that says which share of each global batch this process reads, which matters when several processes train together. `Dataset.from_records` builds one from records held in memory, as the example does: it reshuffles them every epoch, gives each process its share, and saves its position in checkpoints.
+`Dataset(train, val, records, batch)` holds two functions. `train(partition)` opens training batches; `val(partition)` opens one finite validation pass. `DataPartition` names the process's share of the global batch. The example compiles a `Records` recipe over column arrays with `load(..., read="memory")`; it reshuffles each epoch and saves the consumed position in checkpoints.
 
-The built-in readers, such as `TokenWindows` for tokenized text and `HFImages` for image datasets on the Hugging Face Hub, are specifications whose `.load(batch=...)` returns a `Dataset`. Images arrive as `uint8` arrays in `[0, 255]` and token windows as `int32` ids under the key `"text"`. Readers built on Grain record their position, so a checkpoint resumes the data stream where it stopped. [Training data](concepts/data.md) covers the details.
+`Text`, `Images` and the other recipes construct Pipelines; `load(recipe, batch=..., read=...)` compiles them into a Dataset. Images arrive as uint8 arrays in `[0, 255]` and token windows as int32 IDs under `"text"`. A custom order uses Pipeline and compile directly. [Training data](concepts/data.md) covers read modes, storage, mixtures and exact resume.
 
 ![Dataset to global batch: train(partition) opens an iterator of host batches, and shard_batch assembles each into one jax.Array split over the mesh's batch axes.](assets/data-pipeline-light.svg)
 ![Dataset to global batch: train(partition) opens an iterator of host batches, and shard_batch assembles each into one jax.Array split over the mesh's batch axes.](assets/data-pipeline-dark.svg)

@@ -14,12 +14,12 @@ import numpy as np
 
 from dew import Field, Trainer
 from dew.config import OptimConfig
-from dew.data import Dataset
+from dew.data.dataset import Loader
 from dew.objectives.jepa import JepaEncoder, JepaObjective, JepaPredictor, MultiBlockMask
 
 rng = np.random.default_rng(0)
 images = rng.integers(0, 256, size=(8, 16, 16, 3), dtype=np.uint8)
-data = Dataset(train=lambda partition: itertools.repeat({"image": images}),
+data = Loader(train=lambda partition: itertools.repeat({"image": images}),
                val=None, records=8, batch=8)
 encoder = JepaEncoder(patch_size=4, emb_features=32, num_layers=2, num_heads=2)
 predictor = JepaPredictor(grid=(4, 4), emb_features=32,
