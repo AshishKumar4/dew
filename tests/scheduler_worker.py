@@ -52,7 +52,7 @@ def main() -> None:
     params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
 
     class Scripted:
-        def submit(self, task, samples, *, version):
+        def submit(self, task, samples, *, version, key):
             futures = []
             for sample in range(samples):
                 draw = int(task.id) * 10 + sample + (process if args.vary else 0)
