@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import dataclasses
+
 import jax
 import optax
 from flax import struct
@@ -9,7 +11,7 @@ from flax.training.dynamic_scale import DynamicScale
 
 from dew.objectives.base import Aux, Batch, Step, Variables, merge
 
-__all__ = ["Accumulation", "Aux", "Step", "TrainState", "Variables"]
+__all__ = ["CHECKPOINTED", "Accumulation", "Aux", "Step", "TrainState", "Variables"]
 
 
 @struct.dataclass
@@ -41,11 +43,13 @@ class Accumulation:
 class TrainState:
     """Holds everything a run must checkpoint to resume where it stopped.
 
-    It keeps three separate counters. `step` counts attempts, and together
-    with the root `key`, which never changes, it determines the next
-    training draw. `microstep` counts accepted microbatches, and the
-    objective's schedules read it. `updates` counts committed updates, and
-    the optimizer's and the EMA's schedules read it.
+    It keeps three separate counters. `step` counts attempted steps, and
+    together with the root `key`, which never changes, and a microbatch's
+    place in its step, it determines each training draw. `microstep` counts
+    accepted microbatches, which a step's batch is read in one or more of
+    (`Trainer.compile`), and the objective's schedules read it per step.
+    `updates` counts committed updates, and the optimizer's and the EMA's
+    schedules read it.
 
     The loss scaler (`scale`) and the partial accumulation window
     (`accumulation`) are numerical state too, so they are saved in the same
@@ -61,7 +65,7 @@ class TrainState:
     scale: DynamicScale | None
     window_size: jax.Array
     accumulation: Accumulation | None = None
-    compute: Variables | None = None
+    compute: Variables | None = struct.field(default=None, metadata={'checkpointed': False})
     """The lower-precision copies of the parameters that the forward pass reads, such as bf16 copies
     of fp32 weights, written by the update (`dew.training.narrow`).
 
@@ -80,3 +84,9 @@ class TrainState:
                 "the objective keeps no EMA, so there are no averaged weights; "
                 "read state.variables")
         return merge(self.variables, self.ema)
+
+
+CHECKPOINTED = tuple(field.name for field in dataclasses.fields(TrainState)
+                     if field.metadata.get('checkpointed', True))
+"""The train-state fields a checkpoint holds, by their names; a field its
+declaration marks `checkpointed=False` is rebuilt on resume."""

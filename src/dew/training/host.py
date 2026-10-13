@@ -7,6 +7,7 @@ cross-host device_put between different device sets (dispatch.py:488-516).
 """
 from __future__ import annotations
 
+import dataclasses
 import mmap
 from collections import defaultdict
 from collections.abc import Mapping
@@ -140,6 +141,28 @@ class HostSource(Protocol):
     def read(self, index: tuple[slice, ...] | None) -> np.ndarray: ...
 
     def release(self) -> None: ...
+
+
+@dataclasses.dataclass(frozen=True)
+class Held:
+    """An array's addressable shards copied to host memory: a `HostSource`
+    that `place_leaf` puts back where they were, as often as it is asked."""
+    shape: tuple[int, ...]
+    shards: Mapping[tuple[slice, ...], np.ndarray]
+
+    @classmethod
+    def of(cls, array: jax.Array) -> Held:
+        return cls(array.shape, {shard.index: np.asarray(shard.data) for shard in array.addressable_shards})
+
+    @property
+    def ndim(self) -> int:
+        return len(self.shape)
+
+    def read(self, index: tuple[slice, ...] | None) -> np.ndarray:
+        return self.shards[index or ()]
+
+    def release(self) -> None:
+        """Keep the copy for the next placement."""
 
 
 def place_leaf(value, target: NamedSharding) -> jax.Array:

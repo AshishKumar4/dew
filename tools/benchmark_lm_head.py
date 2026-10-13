@@ -29,6 +29,7 @@ figure. The full head gradient is an output of every variant, not a saving.
 import argparse
 import inspect
 import json
+import statistics
 import time
 from dataclasses import dataclass, replace
 from typing import Callable
@@ -36,6 +37,7 @@ from typing import Callable
 import jax
 import jax.numpy as jnp
 
+from dew.nn.kernels.tuning import samples
 from dew.objectives.lm.chunked import (
     chunked_cross_entropy,
     head_logits,
@@ -165,14 +167,7 @@ def parse_variant(text: str) -> Variant:
 
 def timed(callable_, args, repeats: int) -> float:
     """Steady wall latency with no overlapping result buffers between calls."""
-    for _ in range(3):
-        out = jax.block_until_ready(callable_(*args))
-        del out
-    start = time.perf_counter()
-    for _ in range(repeats):
-        out = jax.block_until_ready(callable_(*args))
-        del out
-    return (time.perf_counter() - start) / repeats * 1e3
+    return statistics.mean(samples(callable_, *args, warmup=3, repeats=repeats)) * 1e3
 
 
 def executable_bytes(executable) -> dict[str, int] | None:
