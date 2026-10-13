@@ -38,6 +38,9 @@ def _k2_horizon_config(hf: Mapping[str, object], used: set[str]) -> DecoderField
         refuse(f"rope_head_dim {hf['rope_head_dim']!r}", f'every dense release rotates all {head_dim} dims')
     if hf.get('use_sliding_window'):
         refuse('use_sliding_window', 'no dense release windows its attention')
+    if hf.get('tie_word_embeddings'):
+        # K2HorizonForCausalLM declares no tied weights, so a tied checkpoint reloads an untrained head.
+        refuse('tie_word_embeddings', 'the remote K2HorizonForCausalLM ties no head to its embedding')
     stated = hf.get('original_max_position_embeddings')
     entry = records.record(hf.get('rope_parameters') or {}, 'rope_parameters')
     if stated is not None and stated != entry.get('original_max_position_embeddings'):
@@ -66,7 +69,8 @@ def _k2_horizon_export(model: CausalTransformer) -> Mapping[str, object]:
 
 
 # A model whose norms group their statistics; the 0.9B's single group exports as Llama, whose norm
-# orders its cast and weight otherwise, the same product in fp32 (`hf_decoders._RUNTIME_FIELDS`).
+# orders its cast and weight otherwise, the same product in fp32 (`hf_decoders._RUNTIME_FIELDS`),
+# and whose rotary builds its YaRN.
 K2_HORIZON = DecoderFamily(
     ('k2_horizon',), _k2_horizon_config, lambda fields: fields.norm_groups != 1,
     'k2_horizon', 'K2HorizonForCausalLM', _k2_horizon_export, preserve_source_layout=False,
