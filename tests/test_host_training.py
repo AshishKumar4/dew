@@ -16,7 +16,9 @@ from steady_state import steady_state
 from test_training_transactions import ShortScaleTrainer, Terms, Tiny, batches
 
 from dew.checkpoints import Checkpoints
-from dew.data import DataPartition, Dataset, Loading
+from dew.config.data import RecordsData, loader
+from dew.data import Loading
+from dew.data.dataset import DataPartition
 from dew.inference.banks import spread
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
@@ -507,7 +509,8 @@ def test_a_cpu_owned_lora_run_loads_through_the_pipeline_in_a_fresh_process(tmp_
     checkpoints = Checkpoints(str(tmp_path / "run"))
     rows = [{"text": np.arange(1, 10, dtype=np.int32)} for _ in range(8)]
     trainer = Trainer(objective, optax.adam(.01), key=jax.random.key(5), layout=HOST, checkpoints=checkpoints)
-    data = Dataset.from_records(rows, batch=jax.device_count(), loading=Loading(workers=0))
+    data = loader(RecordsData(source=rows), batch=jax.device_count(), loading=Loading(workers=0),
+                  read="memory")
     state = trainer.fit(data, steps=1, checkpoint_every=1, log_every=100)
     checkpoints.wait()
     assert any(group_layers(name) and len(group_layers(name)) > 1 for name in state.variables[FROZEN])

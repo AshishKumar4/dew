@@ -20,7 +20,7 @@ from model_support import TINY_DECODER
 from recording import RecordingTracker
 from sharded import assert_sharded
 
-from dew.data import Dataset
+from dew.data.dataset import Loader
 from dew.nn.backbones.dit import SimpleDiT
 from dew.nn.blocks import Upsample
 from dew.nn.conv import Conv
@@ -256,7 +256,7 @@ def run_losses(mesh, layout, steps):
     trainer = Trainer(
         LMObjective(tiny(), SEQ_LEN), optax.adam(1e-3), key=jax.random.key(0),
         mesh=mesh, layout=layout, tracker=tracker)
-    state = trainer.fit(Dataset(train=lambda partition: token_batches(), val=None, records=None, batch=BATCH),
+    state = trainer.fit(Loader(train=lambda partition: token_batches(), val=None, records=None, batch=BATCH),
                         steps=steps, log_every=1)
     assert_sharded(state.variables["params"], trainer.device_mesh)
     return [entry["train/loss"] for _, entry in tracker.scalars if "train/loss" in entry]

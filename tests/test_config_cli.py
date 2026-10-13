@@ -10,8 +10,9 @@ from typing import Annotated
 import pytest
 
 from dew.config import RunConfig, ScheduleSpec
-from dew.data import Dataset, OnlineImages, TFDSImages, TokenWindows
-from dew.data.dataset import record_argument
+from dew.config.data import Augment, ImageData, TextData
+from dew.data import Files
+from dew.data.dataset import Loader, record_argument
 from dew.diffusion.presets import Flow
 from dew.objectives.diffusion import DiffusionRunConfig
 from dew.objectives.jepa import JepaRunConfig
@@ -31,13 +32,14 @@ def parse(cls, args):
 
 def test_the_flags_pick_a_dataset_a_preset_and_a_solver_from_the_registries():
     config = parse(DiffusionRunConfig, [
-        "--data.image-size", "64", "--data.augmentation", "flip_only",
+        "--data.image-size", "64", "--data.augment.crop-scale", "0.8", "1.0",
         "preset:flow", "--preset.shift", "3.0", "--objective.solver", '{"class": "heun"}',
         "--objective.guidance", '{"class": "dew.sampling.guidance:CFG", "fields": {"scale": 2.5}}',
         "--trainer.batch-size", "8", "--trainer.steps", "10", "--trainer.mesh.fsdp", "2",
         "--model", "simple_dit", "--model.scan_order", "hilbert"])
 
-    assert config.data == TFDSImages(image_size=64, augmentation="flip_only")
+    assert config.data == dataclasses.replace(DiffusionRunConfig().data, image_size=64,
+                                               augment=Augment(jitter=True, crop_scale=(0.8, 1.0)))
     assert config.preset == Flow(shift=3.0)
     assert config.objective.fields["solver"]["class"] == import_path(Heun)
     assert config.objective.fields["guidance"]["fields"]["scale"] == 2.5
@@ -46,11 +48,11 @@ def test_the_flags_pick_a_dataset_a_preset_and_a_solver_from_the_registries():
 
 
 def test_another_dataset_is_its_subcommand():
-    config = parse(LMRunConfig, ["data:token-windows", "--data.path", "d", "--data.pack",
+    config = parse(LMRunConfig, ["data:text", "--data.source", "d", "--data.pack", "first-fit",
                                  "--data.seq-len", "64", "--data.packing-bins", "2"])
-    assert config.data == TokenWindows(path="d", seq_len=64, packing_bins=2, pack=True)
+    assert config.data == TextData(source="d", seq_len=64, packing_bins=2, pack="first-fit")
     with pytest.raises(ValueError):
-        LMRunConfig(data=TFDSImages()).prepare()
+        LMRunConfig(data=ImageData(source="tfds://oxford_flowers102")).prepare()
 
 
 def test_a_spec_field_the_dataset_lacks_is_a_command_line_error():
@@ -63,7 +65,7 @@ def test_a_run_config_round_trips_through_its_json_record(name):
     cls = {"diffusion": DiffusionRunConfig, "lm": LMRunConfig, "jepa": JepaRunConfig}[name]
     args = {"diffusion": ["preset:karras", "--preset.sigma-data", "0.6",
                           "--objective.unconditional-prob", "0.2"],
-            "lm": ["--data.path", "d", "--max-new-tokens", "4", "--objective.ema-decay", "0.9"],
+            "lm": ["--data.source", "d", "--max-new-tokens", "4", "--objective.ema-decay", "0.9"],
             "jepa": ["--probe-classes", "7", "--objective.momentum", "0.9", "0.99"]}[name]
     config = parse(cls, [*args, "--trainer.steps", "5"])
 
@@ -76,24 +78,33 @@ def test_a_run_config_round_trips_through_its_json_record(name):
 def test_a_run_over_url_datasets_round_trips_through_its_json_record():
     """A diffusion run may train on any hub table of urls; its record has to
     name the sources, so the run and its solvers rebuild from run.json."""
-    config = DiffusionRunConfig(data=OnlineImages(sources=("user/urls",), image_size=64))
+    config = DiffusionRunConfig(data=ImageData(source=Files("hf://datasets/user/images/train.parquet",
+        format="parquet"), image_size=64))
 
     record = json.loads(json.dumps(config.to_dict()))
 
     assert DiffusionRunConfig.from_dict(record) == config
-    assert record["data"]["class"] == datasets.paths["online_images"]
+    assert record["data"]["class"] == datasets.paths["images"]
 
 
 def test_steps_and_epochs_are_one_choice():
     with pytest.raises(SystemExit):
         parse(RunConfig, ["--trainer.steps", "5", "--trainer.epochs", "1"])
     config = parse(RunConfig, ["--trainer.epochs", "2"])
-    data = Dataset(train=lambda partition: iter(()), val=None, records=100, batch=10)
+    data = Loader(train=lambda partition: iter(()), val=None, records=100, batch=10)
     assert config.trainer.total_steps(data) == 20
     with pytest.raises(ValueError):
         config.trainer.total_steps(
-            Dataset(train=lambda partition: iter(()), val=None, records=None, batch=10)
+            Loader(train=lambda partition: iter(()), val=None, records=None, batch=10)
         )
+
+
+def test_the_cli_selects_a_token_budget_without_selecting_a_row_batch():
+    config = parse(RunConfig, ["--trainer.batch-size", "None", "--trainer.batch-tokens", "24576",
+                              "--trainer.update-tokens", "98304", "--trainer.steps", "1"])
+    assert config.trainer.batch_size is None
+    assert config.trainer.derived().accumulation == 4
+    assert RunConfig.from_dict(json.loads(json.dumps(config.to_dict()))) == config
 
 
 def test_a_jepa_run_without_probes_schedules_no_validation_pass():
