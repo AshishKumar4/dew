@@ -10,7 +10,7 @@ import jax
 import numpy as np
 from episode_support import build
 
-from dew.data import Dataset
+from dew.data.dataset import Loader
 from dew.objectives.rl import EpisodeJournal
 from dew.rl.sandbox import SandboxLimits, SubprocessEnvironment
 
@@ -27,7 +27,7 @@ def main() -> None:
         environment, journal=EpisodeJournal(str(directory / "journal")), record=records.append
     )
     trainer.rollout = rollout
-    data = Dataset(
+    data = Loader(
         train=lambda partition: itertools.repeat({"task_id": np.arange(jax.device_count(), dtype=np.int32)}),
         val=None,
         records=None,

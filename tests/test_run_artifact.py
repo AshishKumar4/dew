@@ -11,7 +11,10 @@ import pytest
 
 from dew.checkpoints import Checkpoints
 from dew.config import ModelConfig
-from dew.data import Dataset, Loading
+from dew.data import Loading, Memory
+from dew.data.compile import compile
+from dew.data.dataset import Loader
+from dew.data.pipeline import Pipeline
 from dew.diffusion import schedules, transforms
 from dew.diffusion.process import Process
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -62,7 +65,8 @@ def test_the_documented_model_records_itself_and_its_run_loads_back(tmp_path, mo
     objective = DiffusionObjective(model, Flow(), InputSpec(Field("image", (4, 4, 3))),
                                    guidance=None, steps=2)
     rows = [{"image": np.full((4, 4, 3), 128, np.uint8)} for _ in range(8)]
-    data = Dataset.from_grain(grain.MapDataset.source(rows), batch=8, loading=Loading(workers=0))
+    data = compile(Pipeline(Memory(grain.MapDataset.source(rows))).repeat().batch(8), read="indexed",
+        loading=Loading(workers=0))
     checkpoints = Checkpoints(str(tmp_path / "run"))
     state = Trainer(objective, optax.sgd(.01), key=0, checkpoints=checkpoints).fit(
         data, steps=1, checkpoint_every=1)
@@ -89,7 +93,8 @@ def test_an_adapted_run_records_its_base_and_adapter_and_loads_what_it_trained(t
         base, base.init(jax.random.key(0), jnp.zeros((1, 8), jnp.int32)), key=1)
     objective = LMObjective(adapter.model, seq_len=8, ema_decay=None, variables=adapter.variables)
     rows = [{'text': np.arange(9, dtype=np.int32)} for _ in range(8)]
-    data = Dataset.from_grain(grain.MapDataset.source(rows), batch=8, loading=Loading(workers=0))
+    data = compile(Pipeline(Memory(grain.MapDataset.source(rows))).repeat().batch(8), read="indexed",
+        loading=Loading(workers=0))
     checkpoints = Checkpoints(str(tmp_path / 'run'))
     state = Trainer(objective, optax.sgd(1.0), key=0, checkpoints=checkpoints).fit(
         data, steps=2, checkpoint_every=1)
@@ -149,7 +154,7 @@ def test_an_adapted_policy_run_loads_and_saves_the_policy_it_trained(kind, tmp_p
         batch["behavior_log_probs"] = batch["old_log_probs"]
         values = np.asarray(objective.values(before.variables, batch))
         batch.update(old_values=values, returns=values + mask)
-    data = Dataset(train=lambda partition: iter([batch, batch]), val=None, records=2 * count, batch=count)
+    data = Loader(train=lambda partition: iter([batch, batch]), val=None, records=2 * count, batch=count)
     state = trainer.fit(data, steps=2, log_every=100, checkpoint_every=None)
     checkpoints = Checkpoints(str(tmp_path / "run"))
     checkpoints.save(int(state.step), state, None, artifact=objective.inference_record())
@@ -203,7 +208,8 @@ def test_an_adapted_denoiser_run_loads_what_it_trained(tmp_path):
                                    guidance=None, steps=2, ema_decay=None,
                                    variables={**adapter.variables, "encoders": {}})
     rows = [{"image": np.full((4, 4, 3), 200, np.uint8)} for _ in range(8)]
-    data = Dataset.from_grain(grain.MapDataset.source(rows), batch=8, loading=Loading(workers=0))
+    data = compile(Pipeline(Memory(grain.MapDataset.source(rows))).repeat().batch(8), read="indexed",
+        loading=Loading(workers=0))
     checkpoints = Checkpoints(str(tmp_path / 'run'))
     state = Trainer(objective, optax.sgd(1.0), key=0, checkpoints=checkpoints).fit(
         data, steps=2, checkpoint_every=1)

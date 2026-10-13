@@ -353,9 +353,9 @@ def post_training_figure():
     for variant, t in THEMES.items():
         svg = Svg(760, 372, t)
         lanes = [
-            ("SFT", "ChatMessages", ["conversations, rendered by", "the chat template"],
+            ("SFT", "Chat", ["conversations, rendered by", "the chat template"],
              "text, text_roles", ["[B, L + 1]"], "LMObjective", ["loss_role=Role.ASSISTANT"]),
-            ("DPO", "PreferencePairs", ["chosen, rejected and", "their completion masks"],
+            ("DPO", "Preferences", ["chosen, rejected and", "their completion masks"],
              "input_ids", ["completion_mask", "both [B, 2, S]"], "DPOObjective",
              ["policy against the frozen", "reference in TrainState.ema"]),
             ("GRPO", "Prompts", ["left-padded prompt,", "prompt_length, reward fields"],

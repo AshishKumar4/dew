@@ -28,7 +28,7 @@ import operator
 import sys
 import types
 import typing
-from collections.abc import Callable, Iterator, Mapping, MutableMapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, MutableMapping, MutableSequence, Sequence
 from enum import Enum
 from typing import (
     TYPE_CHECKING,
@@ -36,6 +36,7 @@ from typing import (
     ClassVar,
     Literal,
     Protocol,
+    TypeAliasType,
     TypedDict,
     Union,
     overload,
@@ -54,7 +55,7 @@ if TYPE_CHECKING:
     from _typeshed import DataclassInstance
     from flax import linen as nn
 
-    from dew.data.dataset import DatasetSpec
+    from dew.config.data import RunData as Recipe
     from dew.diffusion.presets import Preset
     from dew.inputs.encoders import ConditionEncoder
     from dew.nn.mixers import MixerBase
@@ -269,6 +270,18 @@ class Aliases[T: Callable[..., Any], Built](Mapping[str, T]):
         """The union of the members' types, for a tyro subcommand over the kind."""
         return functools.reduce(operator.or_, self.values())
 
+    @property
+    def subcommands(self) -> Annotation:
+        """The members' union with each subcommand named as the kind names it
+        ("data:text"), rather than by its class."""
+        import tyro
+
+        # The special form subscripted at runtime, where each member is a value rather than a
+        # type expression, which a type checker reads `typing.Annotated[...]` as.
+        annotated = vars(typing)["Annotated"]
+        members = (annotated[self[name], tyro.conf.subcommand(name)] for name in self)
+        return functools.reduce(operator.or_, members)
+
 
 def declared_type(member: type, field: str) -> Annotation:
     """Resolve one field's annotation, without evaluating unrelated ones."""
@@ -294,6 +307,15 @@ def resolve_alias(annotation: Annotation) -> Annotation:
     while isinstance(annotation, typing.TypeAliasType):
         annotation = annotation.__value__
     return annotation
+
+
+def _union_members(annotation: Annotation) -> tuple[Annotation, ...]:
+    annotation = resolve_alias(annotation)
+    if typing.get_origin(annotation) in (Union, types.UnionType):
+        return tuple(inner for member in typing.get_args(annotation) for inner in _union_members(member))
+    if typing.get_origin(annotation) is typing.Annotated:
+        return _union_members(typing.get_args(annotation)[0])
+    return (annotation,)
 
 
 def _unwrapped(annotation: Annotation) -> Annotation:
@@ -330,7 +352,17 @@ def wants_tuple(annotation: Annotation) -> bool:
             or typing.get_origin(annotation) in (tuple, Sequence))
 
 
-def from_record[ValueT](annotation: type[ValueT], value: Configured, *, dtypes: bool = True) -> ValueT:
+@overload
+def from_record[ValueT](annotation: type[ValueT], value: Configured, *, dtypes: bool = True) -> ValueT: ...
+
+
+@overload
+def from_record(annotation: types.UnionType | TypeAliasType, value: Configured, *,
+                dtypes: bool = True) -> Configured: ...
+
+
+def from_record[ValueT](annotation: type[ValueT] | types.UnionType | TypeAliasType, value: Configured, *,
+                        dtypes: bool = True) -> ValueT | Configured:
     """Return `value` as the class `annotation` names, from a record or already one.
 
     The class is the witness: what comes back is an instance of it or a
@@ -344,7 +376,9 @@ def from_record[ValueT](annotation: type[ValueT], value: Configured, *, dtypes: 
     """
     with _reading(value):
         built = _rebuilt(annotation, value, dtypes=dtypes)
-    witness: type[ValueT] = typing.get_origin(annotation) or annotation
+    if isinstance(annotation, (types.UnionType, TypeAliasType)):
+        return built
+    witness = typing.get_origin(annotation) or annotation
     if not isinstance(built, witness):
         raise ValueError(f"{value!r} builds {type(built).__name__}, "
                          f"not the {witness.__name__} the field declares")
@@ -493,7 +527,7 @@ def _rebuilt(annotation: Annotation, value: object, *, dtypes: bool, name: str =
     if typing.get_origin(annotation) in (Union, types.UnionType):
         if value is None:
             return value
-        inner = [member for member in typing.get_args(annotation) if member is not type(None)]
+        inner = [member for member in _union_members(annotation) if member is not type(None)]
         if len(inner) == 1:
             return _rebuilt(inner[0], value, dtypes=dtypes)
         classes = tuple(member for member in inner if isinstance(member, type))
@@ -502,6 +536,11 @@ def _rebuilt(annotation: Annotation, value: object, *, dtypes: bool, name: str =
             if not classes:
                 raise ValueError(f"{annotation} declares no class, so nothing builds the record {value!r}")
             return _built(_member(named[0], classes), named[1], dtypes=dtypes)
+        sequences = [member for member in inner if member in (tuple, Sequence, list)
+                     or typing.get_origin(member) in (tuple, Sequence, list, MutableSequence)]
+        if isinstance(value, list) and len(sequences) == 1:
+            # A record's list is the union's one sequence member (`Files.url: str | tuple[str, ...]`).
+            return _rebuilt(sequences[0], value, dtypes=dtypes)
         return configured(value)
     if isinstance(value, Mapping):
         if typing.get_origin(annotation) is Callable or annotation is Callable:
@@ -1118,21 +1157,17 @@ solvers: Aliases[type[Solver[Any]], Solver[Any]] = Aliases("solver", {
     "unipc": "dew.sampling.solvers.unipc:UniPC",
     "unmask": "dew.diffusion.discrete:Unmask",
 })
-datasets: Aliases[type[DatasetSpec], DatasetSpec] = Aliases("dataset", {
-    "array_record_images": "dew.data.images:ArrayRecordImages",
-    "chat_messages": "dew.data.chat:ChatMessages",
-    "decision_table": "dew.decision.data:DecisionTable",
-    "hf": "dew.data.providers:HubDataset",
-    "hf_images": "dew.data.images:HFImages",
-    "local_videos": "dew.data.video:LocalVideos",
-    "online_images": "dew.data.streaming:OnlineImages",
-    "online_videos": "dew.data.streaming:OnlineVideos",
-    "preference_pairs": "dew.data.preferences:PreferencePairs",
-    "prompts": "dew.data.prompts:Prompts",
-    "tfds": "dew.data.providers:PreparedTFDS",
-    "tfds_images": "dew.data.images:TFDSImages",
-    "token_windows": "dew.data.tokens:TokenWindows",
-}, base="dew.data.dataset:DatasetSpec")
+datasets: Aliases[type[Recipe], Recipe] = Aliases("dataset", {
+    "chat": "dew.config.data:ChatData",
+    "decisions": "dew.decision.data:Decisions",
+    "images": "dew.config.data:ImageData",
+    "preferences": "dew.config.data:PreferenceData",
+    "prompts": "dew.config.data:PromptData",
+    "records": "dew.config.data:RecordsData",
+    "text": "dew.config.data:TextData",
+    "tiny_shakespeare": "dew.config.data:TinyShakespeareData",
+    "video": "dew.config.data:VideoData",
+}, base="dew.config.data:RunData")
 encoders: Aliases[type[ConditionEncoder[Any]], ConditionEncoder[Any]] = Aliases("encoder", {
     "char_table": "dew.inputs.encoders:CharTable",
     "clip_text": "dew.inputs.encoders:CLIPText",
