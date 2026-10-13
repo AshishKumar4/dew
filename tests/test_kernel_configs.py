@@ -7,7 +7,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 import tokamax
-from kernel_compile import compile_kernels
+from kernel_compile import compile_kernels, failures
 
 from dew.nn.kernels import fla_gdn, fla_kda, generation, tuning
 
@@ -114,7 +114,4 @@ def test_every_declared_kernel_config_compiles_on_tritons_compiler_within_its_bl
     pytest.importorskip("triton")
     found = compile_kernels(support.kernel_cases(target), target)
     assert found, "the compile gate must not be vacuous"
-    failures = [f"{record['name']}: {record['error']}" if "error" in record else
-                f"{record['name']}: {record['shared']} shared bytes, limit {record['limit']}"
-                for record in found if "error" in record or not record["shared"] <= record["limit"]]
-    assert not failures, "\n".join(failures)
+    assert not failures(found), "\n".join(failures(found))

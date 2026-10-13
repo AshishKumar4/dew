@@ -18,8 +18,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from delta_rule_support import recurrence, through, wide
-from kernel_compile import compile_kernels
+from delta_rule_support import recurrence, through
+from kernel_compile import compile_kernels, failures
 from reference_error import assert_as_exact_as_the_reference, assert_leaves_as_exact, distance, widened
 from sharded import boundary_copies
 from tuned import each_config
@@ -38,7 +38,7 @@ math's distance (`assert_leaves_as_exact`'s `reductions`)."""
 ON_A_GPU = pytest.mark.skipif(
     jax.default_backend() == "gpu",
     reason="on a GPU the port's fp32 products are fla's TF32 and its bar is fla's own distance "
-           "(test_the_port_is_as_exact_as_fla_at_the_training_shape); interpreted, they are exact")
+           "(test_the_port_is_as_exact_as_fla); interpreted, they are exact")
 
 APART = 5e-2
 """A bf16 layer's leaf's RMS distance from the portable math's, over its size: bf16 storage, where fla
@@ -82,7 +82,7 @@ def test_the_rule_on_the_port_is_as_exact_as_the_math(key_heads, value_heads, wi
     got = through(fla_rule, do, dht)(*inputs)
     want = through(math, do, dht)(*inputs)
     with jax.enable_x64(new_val=True):
-        operands64 = wide(*inputs, do, dht)
+        operands64 = widened((*inputs, do, dht))
         truth = through(recurrence, *operands64[6:])(*operands64[:6])
     assert_leaves_as_exact(got, want, widened(truth), reductions=CHUNKED)
 
@@ -151,10 +151,7 @@ def test_the_kernels_compile_on_tritons_compiler_within_each_gpus_block(target):
     pytest.importorskip("triton")
     found = compile_kernels(training_cases(), target)
     assert len(found) == 2
-    failures = [f"{record['name']}: {record['error']}" if "error" in record else
-                f"{record['name']}: {record['shared']} shared bytes, limit {record['limit']}"
-                for record in found if "error" in record or not record["shared"] <= record["limit"]]
-    assert not failures, "\n".join(failures)
+    assert not failures(found), "\n".join(failures(found))
 
 
 @pytest.mark.gpu(reason="the port's kernels lower to Triton calls only on a GPU")
@@ -186,14 +183,14 @@ o, final = chunk_kda(*leaves[:5], scale=q.shape[-1] ** -0.5, initial_state=leave
                      cu_seqlens=cu_seqlens)
 torch.autograd.backward((o, final), (do, dht))
 np.savez(sys.argv[2], **{name: x.detach().float().cpu().numpy() for name, x in
-                         zip(("o", "final", "dq", "dk", "dv", "dg", "dbeta", "dh0"),
-                             (o, final, *(leaf.grad for leaf in leaves)))})
+                         zip(sys.argv[4:], (o, final, *(leaf.grad for leaf in leaves)), strict=True)})
 '''
 """fla's side of the comparison, in the interpreter `DEW_FLA_PYTHON` names: fla 0.5.2's `chunk_kda` on the
-operands of an npz, its outputs and gradients into another; packed documents as its varlen sequences,
-each with a memory of its own."""
+operands of an npz, its outputs and gradients into another under the names it is given (`NAMES`);
+packed documents as its varlen sequences, each with a memory of its own."""
 
 NAMES = ("o", "final", "dq", "dk", "dv", "dg", "dbeta", "dh0")
+"""The outputs and gradients each side gives, in `through`'s order."""
 
 
 def fla_side(inputs, cuts, dtype) -> list[np.ndarray]:
@@ -213,7 +210,7 @@ def fla_side(inputs, cuts, dtype) -> list[np.ndarray]:
     with tempfile.TemporaryDirectory() as root:
         np.savez(Path(root) / "in.npz", **given)
         subprocess.run([python, "-c", FLA_SIDE, Path(root) / "in.npz", Path(root) / "out.npz",
-                        jnp.dtype(dtype).name], check=True)
+                        jnp.dtype(dtype).name, *NAMES], check=True)
         found = np.load(Path(root) / "out.npz")
         theirs = {name: found[name].astype(np.float64) for name in NAMES}
     theirs["final"], theirs["dh0"] = theirs["final"][-1:], theirs["dh0"][:1]
@@ -235,7 +232,7 @@ def float64_truth(inputs, cuts) -> list[np.ndarray]:
             valued = slice(head, head + 1)
             sliced = (q[:, :, keyed], k[:, :, keyed], v[:, :, valued], g[:, :, valued], beta[:, :, valued],
                       h0[:, valued], do[:, :, valued], dht[:, valued])
-            heads.append([np.asarray(x) for x in run(*wide(*sliced))])
+            heads.append([np.asarray(x) for x in run(*widened(sliced))])
     found = [np.concatenate([leaves[i] for leaves in heads], axis=axis)
              for i, axis in enumerate((2, 1, 2, 2, 2, 2, 2, 1))]
     for i in (2, 3):
@@ -250,21 +247,23 @@ GPU_CASES = {
     "gva": ((4096, 16, 32, 128, 128), None),
     # A length off the chunk grid and widths off the blocks', which `fla_rule` pads.
     "padded": ((4000, 8, 8, 96, 96), None),
-    # Packed documents as fla's varlen sequences, on and off the chunk grid, one shorter than a chunk.
-    "packed": ((4096, 8, 8, 128, 128), (0, 1000, 1037, 2500)),
-    # Every tile the tuner may pick: a partial last chunk, four value heads a program can block.
-    "tiles": ((1000, 4, 4, 128, 128), None),
+    # Packed documents as fla's varlen sequences, on and off the chunk grid, one shorter than a chunk,
+    # two value heads a key head.
+    "packed": ((4096, 4, 8, 128, 128), (0, 1000, 1037, 2500)),
+    # Every tile the tuner may pick: a partial last chunk, eight value heads a program can block.
+    "tiles": ((1000, 8, 8, 128, 128), None),
 }
 
 
 @pytest.mark.gpu(reason="float64 distances against fla's own on this GPU")
 @pytest.mark.parametrize("case, dtype", [("training", jnp.bfloat16), ("training", jnp.float32),
                                          ("gva", jnp.bfloat16), ("padded", jnp.bfloat16),
-                                         ("packed", jnp.bfloat16)])
+                                         ("packed", jnp.bfloat16), ("packed", jnp.float32)])
 def test_the_port_is_as_exact_as_fla(case, dtype):
     """Each of the port's outputs and gradients through `fla_rule` is as near the float64 recurrence as
     fla 0.5.2's own on the same operands (`assert_as_exact_as_the_reference`): at Kimi Linear's training
-    shape, with value heads sharing a key head, padded to the kernels' blocks, and packed."""
+    shape, with value heads sharing a key head, padded to the kernels' blocks, and packed with value heads
+    sharing a key head, in fp32 too (whose products are fla's TF32 here)."""
     inputs, run, cuts = gpu_case(case, dtype)
     mine = [np.asarray(x, np.float64) for x in run(*inputs[:-2])]
     theirs = fla_side(inputs, cuts, dtype)

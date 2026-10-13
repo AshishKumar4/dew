@@ -43,6 +43,7 @@ from dew.nn.kernels.fla_gdn import (
     _dot,
     _flat,
     _gates,
+    _headed,
     _Launch,
     _launch,
     _read,
@@ -50,6 +51,7 @@ from dew.nn.kernels.fla_gdn import (
     _tf32_dot,
     _tiles,
     _tril_inverse,
+    _weighted_values,
     _write,
     sequences,
 )
@@ -287,8 +289,7 @@ class IntraSolve(_KdaLaunch):
         group, tokens = value_heads // key_heads, batch * length
         keys = pl.BlockSpec((tokens, None, width), lambda i_t, h: (0, h // group, 0))
 
-        def headed(size):
-            return pl.BlockSpec((tokens, None, size), lambda i_t, h: (0, h, 0))
+        headed = functools.partial(_headed, tokens)
 
         shape = jax.ShapeDtypeStruct((tokens, value_heads, chunk), k.dtype)
         found = pl.pallas_call(
@@ -343,11 +344,8 @@ def _w_u_kernel(chunk_ref, k_ref, v_ref, beta_ref, a_ref, g_ref, *refs, chunk: i
 
         beta = read(beta_ref)
         inverse = read(a_ref)
-        for block in range(v_ref.shape[-1] // bv):
-            columns = pl.ds(block * bv, bv)
-            value = read(v_ref, columns)
-            scaled = (value * beta[:, None]).astype(value.dtype)
-            write(u_ref, columns, _dot(inverse, scaled, exact=exact))
+        _weighted_values(v_ref, u_ref, beta, inverse, start, taken, chunk=chunk, bv=bv, exact=exact,
+                         ieee=False)
         for block in range(k_ref.shape[-1] // bk):
             columns = pl.ds(block * bk, bk)
             key = read(k_ref, columns)
@@ -378,8 +376,7 @@ class RecomputeWU(_KdaLaunch):
         group, tokens = value_heads // key_heads, batch * length
         keys = pl.BlockSpec((tokens, None, width), lambda i_t, h: (0, h // group, 0))
 
-        def headed(size):
-            return pl.BlockSpec((tokens, None, size), lambda i_t, h: (0, h, 0))
+        headed = functools.partial(_headed, tokens)
 
         keyed = jax.ShapeDtypeStruct((tokens, value_heads, width), k.dtype)
         queries = q is not None
@@ -530,8 +527,7 @@ class BwdDav(_KdaLaunch):
         batch, length, value_heads, columns = v.shape
         tokens = batch * length
 
-        def headed(size):
-            return pl.BlockSpec((tokens, None, size), lambda i_t, h: (0, h, 0))
+        headed = functools.partial(_headed, tokens)
 
         da, dv = pl.pallas_call(
             functools.partial(_dav_kernel, chunk=chunk, aligned=_aligned(spans, batch, length, chunk),
@@ -663,8 +659,7 @@ class BwdWyDqkg(_KdaLaunch):
         group, tokens = value_heads // key_heads, batch * length
         keys = pl.BlockSpec((tokens, None, width), lambda i_t, h: (0, h // group, 0))
 
-        def headed(size):
-            return pl.BlockSpec((tokens, None, size), lambda i_t, h: (0, h, 0))
+        headed = functools.partial(_headed, tokens)
 
         gate = pl.BlockSpec((tokens, None), lambda i_t, h: (0, h))
         states = pl.BlockSpec((None, None, width, columns), lambda i_t, h: (i_t, h, 0, 0))
