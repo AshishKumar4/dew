@@ -44,7 +44,7 @@ from .attention import (
     max_attention_logits,
     scaled_dot_product_attention,
 )
-from .inputs import AttentionMetadata, PredictionPhase, valid_order
+from .inputs import AttentionMetadata, PredictionPhase, coordinates_of, valid_order
 from .kv_cache import KVCache
 from .mixer_base import MixerBase, MixerContext
 from .mla import INDEXER, open_mla_cache
@@ -280,16 +280,16 @@ class KPoolSparseAttention(nn.Module):
             dtype=self.dtype, precision=self.precision, name=INDEXER)
 
     @nn.compact
-    def __call__(self, x, decode: bool = False, positions=None, segment_ids=None, kv_store=None,
+    def __call__(self, x, decode: bool = False, kv_store=None,
                  attention_metadata: AttentionMetadata | None = None,
                  prediction_phase: PredictionPhase = "ordinary"):
         # No rope: the slot positions order the keys and nothing rotates.
-        del positions, kv_store
-        if segment_ids is not None:
+        del kv_store
+        batch, length, _ = x.shape
+        if coordinates_of(attention_metadata, batch, length).segments is not None:
             raise ValueError(
                 "kpool_sparse_attention pools one row's consecutive keys, which a packed "
                 "row of documents has no reference form for; pass one document per row")
-        batch, length, _ = x.shape
         valid = None if attention_metadata is None else attention_metadata.valid
         if valid is not None:
             valid = jnp.asarray(valid, bool)
