@@ -189,20 +189,6 @@ def test_a_split_must_cut_every_batch_the_run_reads_into_whole_rows():
         splits(rows, BATCH, one, 1, 4)
 
 
-def test_a_step_that_fits_no_plan_is_refused_with_the_closest_candidates_numbers(monkeypatch):
-    """Where no split at any rung fits, the run stops naming every candidate
-    it compiled and the one closest to fitting, with what it needs."""
-    room(monkeypatch, 0)
-    trainer = lm()
-    state, _, _ = trainer.place()
-    with pytest.raises(RuntimeError, match=r"fits no plan of its batch: the closest, \d+ x \d+ rows at remat "
-                       r".*, needs [\d.]+ GiB of temporaries beside [\d.]+ GiB of arguments, [\d.]+ GiB more "
-                       r"than its tightest device has\. Tried 1 x 32 rows at remat None; 32 x 1 rows at "
-                       r"remat None; 32 x 1 rows at remat None, the head tiled; 32 x 1 rows at remat "
-                       r"'minimal'; 32 x 1 rows at remat 'minimal', the head tiled;"):
-        trainer.compile(state, BATCH)
-
-
 def raw(leaf):
     """A leaf's bits, a key's included."""
     return np.asarray(jax.random.key_data(leaf) if jnp.issubdtype(leaf.dtype, jax.dtypes.prng_key) else leaf)

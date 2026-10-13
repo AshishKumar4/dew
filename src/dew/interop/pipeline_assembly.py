@@ -220,7 +220,7 @@ class _QwenImageText:
               attention_impl: str = "auto", params: Variables | None = None, lazy: bool = False
               ) -> tuple[QwenImageConditioner, tuple[WeightLayout, ...], dict[str, Mapping[str, object]]]:
         """Construct `QwenImageConditioner` at the pipeline's prompt budget."""
-        return _qwen_image_conditioning(directory, index, compute, size, tokens=policy.sequence,
+        return _qwen_image_conditioning(directory, index, compute, tokens=policy.sequence,
                                         param_dtype=param_dtype, attention_impl=attention_impl,
                                         params=params, lazy=lazy)
 
@@ -247,7 +247,7 @@ class _HiddenStatesText:
               ) -> tuple[HiddenStatesConditioner, tuple[WeightLayout, ...], dict[str, Mapping[str, object]]]:
         """Construct `HiddenStatesConditioner` at the pipeline's prompt budget."""
         return _hidden_states_conditioning(
-            directory, index, compute, size, pipeline=self.pipeline, tokens=policy.sequence,
+            directory, index, compute, pipeline=self.pipeline, tokens=policy.sequence,
             guidance=policy.guidance if self.embeds_guidance else None, param_dtype=param_dtype,
             attention_impl=attention_impl, params=params, lazy=lazy)
 
@@ -389,11 +389,12 @@ def assemble_pipeline(directory: Path, index: Mapping[str, object], *, dtype: st
 def load_diffusion_conditioner[C: ConditionEncoder](
         checkpoint: str, kind: type[C], *, dtype: str | None = "bfloat16", param_dtype: str = "float32",
         revision: str | None = None, attention_impl: str = "auto", tokens: int | None = None,
-        params: Variables | None = None, mesh: MeshSpec | Mesh | None = None,
-        layout: Layout | None = None) -> C:
+        params: Variables | None = None, mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None,
+        size: tuple[int, int] | None = None) -> C:
     """Load the text conditioning a pipeline's denoiser reads, which must be a
     `kind`, or bind supplied parameters using metadata only. `tokens` replaces
-    the pipeline's own prompt budget. `mesh` and `layout` place the weights it
+    the pipeline's own prompt budget, and `size` the (height, width) it
+    renders. `mesh` and `layout` place the weights it
     reads as `Pretrained.load`'s do, streamed one leaf at a time, so a
     pipeline's prompts can be encoded with its text encoder alone."""
     from dew.nn.autoencoders import AutoencoderKL
@@ -404,6 +405,8 @@ def load_diffusion_conditioner[C: ConditionEncoder](
     directory = sources.snapshot(checkpoint, revision, weights=False)
     with open(directory / "model_index.json") as handle:
         index = json.load(handle)
+    if size is not None:
+        index = {**index, "dew_height": size[0], "dew_width": size[1]}
     denoiser = pipeline_denoiser(directory, dtype=dtype, attention_impl=attention_impl)
     text = denoiser.text
     if text.conditioner is not kind:
@@ -810,7 +813,7 @@ def _qwen_text_path(record: decoder_parts.DecoderFields):
     return path
 
 
-def _qwen_image_conditioning(directory: Path, index: Mapping[str, object], compute, size: tuple[int, int], *,
+def _qwen_image_conditioning(directory: Path, index: Mapping[str, object], compute, *,
                              tokens: int, param_dtype: str, attention_impl: str,
                              params: Variables | None = None, lazy: bool = False
                              ) -> tuple[QwenImageConditioner, tuple[WeightLayout, ...],
@@ -833,10 +836,9 @@ def _qwen_image_conditioning(directory: Path, index: Mapping[str, object], compu
             _qwen_text_path(record), ("encoders", "conditioning", "text_encoder"),
             param_dtype=param_dtype, lazy=lazy)
         params = {"text_encoder": tower}
-    height, width = _geometry(index, size)
     encoder = QwenImageConditioner(
         decoder, load_tokenizer(str(directory / "processor")), params, str(directory),
-        height, width, tokens=tokens, param_dtype=param_dtype)
+        tokens=tokens, param_dtype=param_dtype)
     return encoder, layouts, {"text_encoder": config}
 
 
@@ -870,8 +872,7 @@ def _hidden_states_path(record: decoder_parts.DecoderFields, family: str, multim
     return path
 
 
-def _hidden_states_conditioning(directory: Path, index: Mapping[str, object], compute,
-                                size: tuple[int, int], *,
+def _hidden_states_conditioning(directory: Path, index: Mapping[str, object], compute, *,
                                 pipeline: Literal["flux2", "z_image"], tokens: int, guidance: float | None,
                                 param_dtype: str, attention_impl: str, params: Variables | None = None,
                                 lazy: bool = False
@@ -914,9 +915,8 @@ def _hidden_states_conditioning(directory: Path, index: Mapping[str, object], co
             _hidden_states_path(record, records.text(text["model_type"], "model_type"), multimodal),
             ("encoders", "conditioning", "text_encoder"), param_dtype=param_dtype, lazy=lazy)
         params = {"text_encoder": tower}
-    height, width = _geometry(index, size)
     encoder = HiddenStatesConditioner(
-        decoder, load_tokenizer(str(directory / "tokenizer")), params, str(directory), height, width,
+        decoder, load_tokenizer(str(directory / "tokenizer")), params, str(directory),
         template=template, layers=layers, thinking=pipeline == "z_image", tokens=tokens, guidance=guidance,
         param_dtype=param_dtype)
     return encoder, layouts, {"text_encoder": config}

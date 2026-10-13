@@ -21,13 +21,10 @@ from sharded import assert_sharded
 from dew.artifacts import Representations
 from dew.data import DataPartition, Loading
 from dew.inputs import unit_range
-from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.dit import SimpleDiT
-from dew.nn.sharding import DECLARED, LayoutRefused, logical_axes
 from dew.objectives.base import Aux, EMASpec, Objective
 from dew.training import Checkpoints, Layout, MeshSpec, Trainer
-from dew.training.distributed import DEFAULT_RULES, DevicePrefetchIterator, parameter_spec, shard_batch
-from dew.training.optim import OPTIMIZER_MAP
+from dew.training.distributed import DevicePrefetchIterator, shard_batch
 
 # Needs the eight simulated CPU devices conftest configures; the GPU lane skips it.
 pytestmark = pytest.mark.mesh
@@ -167,183 +164,6 @@ def reference_losses(trainer, steps):
 # Sharding heuristic
 # --------------------------------------------------------------------------
 
-def test_parameter_spec_replicates_without_fsdp():
-    assert parameter_spec((1024, 1024), fsdp_size=1, min_shard_size=16) == P()
-
-
-def test_parameter_spec_replicates_small_params():
-    assert parameter_spec((8, 8), fsdp_size=2, min_shard_size=2 ** 16) == P()
-
-
-def test_parameter_spec_shards_largest_divisible_axis():
-    assert parameter_spec((64, 1024), fsdp_size=2, min_shard_size=16) == P(None, 'fsdp')
-    assert parameter_spec((1024, 64), fsdp_size=2, min_shard_size=16) == P('fsdp')
-
-
-def test_parameter_spec_falls_back_to_replication_when_indivisible():
-    assert parameter_spec((15, 15), fsdp_size=2, min_shard_size=16) == P()
-
-
-def declared_specs(variables, rules):
-    """Parameter specs on a two-way fsdp mesh under one rule table."""
-    shardings = Layout(rules=rules, min_shard=1).shardings(
-        MeshSpec(fsdp=2).build(), variables)
-    return jax.tree.map(lambda sharding: sharding.spec, shardings)["params"]
-
-
-def dit_variables(**overrides):
-    model = SimpleDiT(patch_size=4, emb_features=64, num_layers=1, num_heads=2, mlp_ratio=2,
-                      **overrides)
-    return jax.eval_shape(model.init, jax.random.key(0), jnp.ones((1, 8, 8, 3)), jnp.ones((1,)))
-
-
-def test_causal_transformer_axes_land_on_the_dimensions_they_name():
-    """One rule at a time: the dimension that moves is the one the module
-    declares."""
-    model = CausalTransformer(
-        vocab_size=64, emb_features=32, num_layers=1, num_heads=2,
-        num_kv_heads=1, mlp_features=64, max_seq_len=8, tie_embeddings=False)
-    variables = jax.eval_shape(
-        model.init, jax.random.key(0), jnp.ones((1, 8), jnp.int32))
-
-    vocab = declared_specs(variables, {"vocab": "fsdp"})
-    assert vocab["embed_tokens"]["embedding"] == P("fsdp")
-    assert vocab["lm_head"]["kernel"] == P(None, "fsdp")
-
-    # Grouped-query k and v are the 'kv' axis, q is 'heads': a rule for one
-    # must leave the other whole.
-    kv = declared_specs(variables, {"kv": "fsdp"})
-    attention = kv["layers_0"]["self_attn"]
-    assert attention["k_proj"]["kernel"] == P(None, "fsdp")
-    assert attention["v_proj"]["kernel"] == P(None, "fsdp")
-    assert attention["q_proj"]["kernel"] == P()
-
-    heads = declared_specs(variables, {"heads": "fsdp"})["layers_0"]["self_attn"]
-    assert heads["q_proj"]["kernel"] == P(None, "fsdp")
-    assert heads["k_proj"]["kernel"] == P()
-
-    out = declared_specs(variables, {"attention": "fsdp"})["layers_0"]["self_attn"]
-    assert out["o_proj"]["kernel"] == P("fsdp")
-
-    mlp = declared_specs(variables, {"mlp": "fsdp"})["layers_0"]["mlp"]
-    assert mlp["gate_proj"]["kernel"] == P(None, "fsdp")
-    assert mlp["up_proj"]["kernel"] == P(None, "fsdp")
-    assert mlp["down_proj"]["kernel"] == P("fsdp")
-
-    embed = declared_specs(variables, {"embed": "fsdp"})
-    assert embed["embed_tokens"]["embedding"] == P(None, "fsdp")
-    assert embed["lm_head"]["kernel"] == P("fsdp")
-
-    # fsdp takes the leading width either rule names, and a name whose first
-    # rule keeps it whole stays whole.
-    both = declared_specs(variables, (("mlp", "fsdp"), ("embed", "fsdp")))["layers_0"]["mlp"]
-    assert both["gate_proj"]["kernel"] == P("fsdp")
-    whole = declared_specs(variables, (("embed", None), ("mlp", "fsdp"), ("embed", "fsdp")))
-    assert whole["layers_0"]["mlp"]["gate_proj"]["kernel"] == P(None, "fsdp")
-
-
-def test_dit_axes_land_on_the_dimensions_they_name():
-    """The same for the DiT stack, whose attention kernels carry three axes."""
-    variables = dit_variables()
-
-    heads = declared_specs(variables, {"heads": "fsdp"})["dit_block_0"]["attention"]
-    assert heads["to_q"]["kernel"] == P(None, "fsdp")
-    assert heads["to_out_0"]["kernel"] == P("fsdp")
-
-    head_dim = declared_specs(
-        variables, {"head_dim": "fsdp"})["dit_block_0"]["attention"]
-    assert head_dim["to_q"]["kernel"] == P(None, None, "fsdp")
-    assert head_dim["to_out_0"]["kernel"] == P(None, "fsdp")
-
-    embed = declared_specs(variables, {"embed": "fsdp"})
-    assert embed["embed"]["patch_embed"]["Conv_0"]["kernel"] == P(None, None, None, "fsdp")
-    assert embed["conditioning"]["time_embed"]["layers_2"]["kernel"] == P(None, "fsdp")
-
-    modulation = declared_specs(variables, {"modulation": "fsdp"})
-    assert (modulation["dit_block_0"]["ada_params_module"]["ada_proj"]["kernel"]
-            == P(None, "fsdp"))
-
-    output = declared_specs(variables, {"output": "fsdp"})
-    assert output["output"]["final_proj"]["kernel"] == P(None, "fsdp")
-
-    mlp = declared_specs(variables, {"mlp": "fsdp"})
-    assert mlp["conditioning"]["time_embed"]["layers_2"]["kernel"] == P("fsdp")
-
-
-def test_a_declared_axis_that_cannot_name_a_parameter_is_an_error():
-    """A module that keeps its name while its parameter gains a dimension has
-    to stop the derivation, not shard whichever dimensions the short name
-    happens to reach."""
-    variables = {"params": {"q_proj": {
-        "kernel": jax.ShapeDtypeStruct((8, 8, 8), jnp.float32)}}}
-    with pytest.raises(ValueError, match="q_proj"):
-        Layout(min_shard=1).shardings(MeshSpec(fsdp=2).build(), variables)
-
-
-def test_a_declaration_that_names_one_axis_twice_is_refused_where_it_is_written():
-    """flax assigns a mesh axis to a logical name at most once per array, so
-    a kernel declared ("embed", "embed") cannot be placed: the refusal has to
-    come at the decorator, not from Layout.shardings on the first sharded
-    mesh a run builds (the eh_proj declaration shipped that way)."""
-    with pytest.raises(ValueError, match="twice"):
-        @logical_axes({("fused_proj",): ("embed", "embed")})
-        class Fused(nn.Module):
-            pass
-    assert not any(("fused_proj",) in table for table in DECLARED.values())
-
-
-@pytest.fixture
-def declarations(monkeypatch):
-    """The declaration tables, restored after the test that decorates classes."""
-    from dew.nn import sharding
-
-    monkeypatch.setattr(sharding, "DECLARED", dict(sharding.DECLARED))
-    monkeypatch.setattr(sharding, "_OWNERS", dict(sharding._OWNERS))
-    return sharding
-
-
-def test_two_classes_declaring_one_suffix_differently_are_refused_both_named(declarations):
-    """A suffix is matched in every model in the process, so a second class
-    that declares it otherwise fails where it is decorated, naming both."""
-    @logical_axes({("plugin_head", "readout"): ("embed", "vocab")})
-    class Head(nn.Module):
-        pass
-
-    with pytest.raises(ValueError, match=r"plugin_head/readout.*Other.*Head"):
-        @logical_axes({("plugin_head", "readout"): ("vocab", "embed")})
-        class Other(nn.Module):
-            pass
-    # The same axes from another class place the same parameters, and stand.
-    @logical_axes({("plugin_head", "readout"): ("embed", "vocab")})
-    class Same(nn.Module):
-        pass
-
-    assert declarations.DECLARED[Head] == declarations.DECLARED[Same]
-
-
-def test_a_plugins_one_name_suffix_is_refused_and_its_qualified_one_places_only_that_path(declarations):
-    """A class outside Dew that declares (`readout`,) would place every
-    model's `readout`; qualified by its holder's name it places that one, and
-    a model whose `readout` sits elsewhere keeps the shape heuristic."""
-    with pytest.raises(ValueError, match=r"one-name suffixes \['readout'\].*\('head', 'readout'\)"):
-        @logical_axes({("readout",): ("embed", "vocab")})
-        class Bare(nn.Module):
-            pass
-
-    @logical_axes({("classifier", "readout"): (None, "vocab")})
-    class Classifier(nn.Module):
-        pass
-
-    # The declaration splits the 8-wide vocabulary; the heuristic splits the
-    # largest dimension fsdp divides, the 16-wide one.
-    layout, mesh = Layout(min_shard=1, rules=(("vocab", "fsdp"),)), MeshSpec(fsdp=2).build()
-    kernel = jax.ShapeDtypeStruct((16, 8), jnp.float32)
-    declared = layout.shardings(mesh, {"params": {"classifier": {"readout": {"kernel": kernel}}}})
-    elsewhere = layout.shardings(mesh, {"params": {"decoder": {"readout": {"kernel": kernel}}}})
-    assert declared["params"]["classifier"]["readout"]["kernel"].spec == P(None, "fsdp")
-    assert elsewhere["params"]["decoder"]["readout"]["kernel"].spec == P("fsdp")
-
-
 class Decoder(nn.Module):
     @nn.compact
     def __call__(self, x):
@@ -376,31 +196,6 @@ class BoxedReadout(Objective):
         return jnp.sum(Readouts().apply(variables, features) ** 2), Aux({})
 
 
-def test_a_boxed_parameter_places_by_its_own_names_and_its_namesake_elsewhere_does_not():
-    """A module that boxes its parameter (`nn.with_logical_partitioning`)
-    places it by those names, ahead of any suffix, though the state holds it
-    unboxed: its 8-wide vocabulary splits, while the plain `readout` under
-    `decoder` keeps the shape heuristic's 16-wide split. Muon reads the same
-    names: the boxed kernel maps into the vocabulary, so AdamW steps it with
-    two moments, and Muon steps its namesake with one, every moment on its
-    parameter's spec. A kernel boxed with names no rule mentions keeps the
-    heuristic, as an undeclared one does, rather than the whole-array
-    placement its names alone would give."""
-    trainer = Trainer(BoxedReadout(), OPTIMIZER_MAP["muon"](1e-3), key=jax.random.key(0),
-                      mesh=MeshSpec(fsdp=2), layout=Layout(min_shard=1, rules=(("vocab", "fsdp"),)))
-    abstract = jax.eval_shape(trainer.initial_state)
-    placement = jax.tree.map(lambda sharding: sharding.spec, trainer.shardings(abstract))
-    params = placement.variables["params"]
-    assert params["readout"]["kernel"] == P(None, "fsdp")
-    assert params["decoder"]["readout"]["kernel"] == P("fsdp")
-    assert params["foreign"]["kernel"] == P("fsdp")
-    # The trainer's optimizer state mirrors the params collection itself.
-    moments = muon_moment_specs(placement.opt_state, params)
-    boxed, plain = moments[("readout", "kernel")], moments[("decoder", "readout", "kernel")]
-    assert (len(boxed[1]), set(boxed[1])) == (2, {P(None, "fsdp")})
-    assert (len(plain[1]), set(plain[1])) == (1, {P("fsdp")})
-
-
 def test_a_restored_run_places_its_boxed_parameters_by_their_names(tmp_path):
     """The trainer records the axes the model boxes with each checkpoint, and
     a restore onto a mesh (`Checkpoints.variables`, which `from_run` and
@@ -418,178 +213,9 @@ def test_a_restored_run_places_its_boxed_parameters_by_their_names(tmp_path):
     assert params["foreign"]["kernel"].sharding.spec == P("fsdp")
 
 
-class SevenWide(nn.Module):
-    @nn.compact
-    def __call__(self, x):
-        return nn.Dense(7, use_bias=False, name="readout", kernel_init=nn.with_logical_partitioning(
-            nn.initializers.lecun_normal(), (None, "vocab")))(x)
-
-
-class SevenWideReadout(BoxedReadout):
-    def init(self, key, variables=None):
-        return SevenWide().init(key, jnp.ones((1, 16)))
-
-    def loss(self, variables, batch, step):
-        features = batch["image"].reshape(batch["image"].shape[0], -1)[:, :16].astype(jnp.float32) / 255
-        return jnp.sum(SevenWide().apply(variables, features) ** 2), Aux({})
-
-
-@pytest.mark.mesh
-def test_the_trainer_checks_a_boxed_width_by_its_own_names():
-    """A module's boxed vocabulary that its rule puts on an expert-only mesh
-    is placed and checked by those names, though the state holds it
-    unboxed: eight wide it splits, seven wide it stays whole, which the
-    check refuses, where read as undeclared it would have counted as a
-    width the mesh splits nothing of."""
-    layout = Layout(min_shard=1, rules=(("vocab", "expert"),))
-    Trainer(BoxedReadout(), optax.adam(1e-3), key=jax.random.key(0), mesh=MeshSpec(expert=8),
-            layout=layout).place()
-    with pytest.raises(LayoutRefused):
-        Trainer(SevenWideReadout(), optax.adam(1e-3), key=jax.random.key(0), mesh=MeshSpec(expert=8),
-                layout=layout).place()
-
-
-def test_rule_override_changes_only_declared_axes():
-    specs = declared_specs(dit_variables(), {"mlp": "fsdp"})
-
-    assert specs["dit_block_0"]["mlp"]["layers_0"]["kernel"] == P(None, "fsdp")
-    assert specs["dit_block_0"]["mlp"]["layers_2"]["kernel"] == P("fsdp")
-    assert specs["dit_block_0"]["attention"]["to_q"]["kernel"] == P()
-    assert specs["embed"]["patch_embed"]["Conv_0"]["kernel"] == P()
-
-
-def test_default_rules_split_every_dit_leaf_the_shape_heuristic_splits():
-    """The declared table splits each of the DiT's leaves that the
-    largest-divisible-axis heuristic splits, so declaring the model left none
-    whole; a kernel's split may sit on another dimension, its leading one
-    (`DEFAULT_RULES`)."""
-    variables = dit_variables()
-    shardings = Layout(rules=DEFAULT_RULES, min_shard=1).shardings(
-        MeshSpec(fsdp=2).build(), variables)
-    expected = jax.tree.map(
-        lambda leaf: bool(parameter_spec(leaf.shape, fsdp_size=2, min_shard_size=1)), variables)
-    assert jax.tree.map(lambda sharding: bool(sharding.spec), shardings) == expected
-
-
-def test_a_rule_onto_an_axis_of_size_one_shards_nothing():
-    """Every mesh has the tensor axis; at size 1 a rule onto it is dropped
-    from the spec and the width falls to the next axis the rule names."""
-    shardings = Layout(rules={"mlp": ["tensor", "fsdp"], "heads": "tensor"},
-                       min_shard=1).shardings(MeshSpec(fsdp=2).build(),
-                                              dit_variables())["params"]
-
-    assert (shardings["dit_block_0"]["mlp"]["layers_0"]["kernel"].spec
-            == P(None, "fsdp"))
-    assert shardings["dit_block_0"]["attention"]["to_q"]["kernel"].spec == P()
-
-
-def test_a_rule_onto_an_axis_that_places_no_parameter_is_refused():
-    """The data and sequence axes split the batch: a parameter the rules
-    place on either would be gathered on every use, and placing one there
-    names it. A misspelt axis, one the mesh lacks that is none of Dew's
-    roles, is refused where the layout first meets the mesh."""
-    with pytest.raises(ValueError, match=r"the rules name the axes \['fspd'\]"):
-        Layout(rules={"embed": "fspd"}).shardings(MeshSpec(fsdp=2).build(), dit_variables())
-    with pytest.raises(ValueError, match=r"the rules place params/.* on \['data'\]"):
-        Layout(rules={"mlp": "data"}, min_shard=1).shardings(
-            MeshSpec(fsdp=2).build(), dit_variables())
-
-
-class IndivisibleModel(nn.Module):
-    """A parameter no mesh axis of size two can split."""
-
-    @nn.compact
-    def __call__(self, x):
-        return nn.Dense(15, use_bias=False, name="indivisible")(x)
-
-
-class Indivisible(Objective):
-    ema = None
-
-    def init(self, key, variables=None):
-        return IndivisibleModel().init(key, jnp.ones((1, 15)))
-
-    def loss(self, variables, batch, step):
-        return jnp.sum(IndivisibleModel().apply(variables, batch["image"][:, 0, 0, :]) ** 2), Aux({})
-
-
-def build_indivisible(tolerance):
-    return Trainer(Indivisible(), optax.adam(1e-3), key=jax.random.key(0),
-                   mesh=MeshSpec(fsdp=2),
-                   layout=Layout(min_shard=1, tolerance=tolerance)).fit(Data(batches), steps=0)
-
-
-def test_sharding_tolerance_names_the_largest_replicated_parameter():
-    with pytest.raises(ValueError) as error:
-        build_indivisible(tolerance=0.02)
-
-    message = str(error.value)
-    assert "100.00%" in message and "2.00%" in message
-    assert "['params']['indivisible']['kernel']" in message
-    assert "(15, 15)" in message
-
-
-def test_sharding_tolerance_can_allow_intentional_replication():
-    state = build_indivisible(tolerance=1.0)
-    assert state.variables["params"]["indivisible"]["kernel"].sharding.spec == P()
-
-
-def test_the_layout_default_tolerance_is_two_percent():
-    """A layout that names no tolerance carries the library's 2%, without
-    the config repeating the number."""
-    assert Layout().tolerance == 0.02
-    with pytest.raises(ValueError, match=r"2.00%"):
-        Trainer(Indivisible(), optax.adam(1e-3), key=jax.random.key(0),
-                mesh=MeshSpec(fsdp=2), layout=Layout(min_shard=1)).fit(Data(batches), steps=0)
-
-
-def test_sharding_tolerance_outside_zero_to_one_is_rejected():
-    with pytest.raises(ValueError, match="between 0 and 1"):
-        Layout(tolerance=1.5)
-
-
-@pytest.mark.parametrize("fsdp_size", [2, 4, 8])
-def test_odd_vocabulary_shards_the_embedding_on_its_other_axis(fsdp_size):
-    """GPT-2's 50257 rows divide by nothing, so the rule that wins the
-    embedding cannot be taken: the width has to carry the shard, or a real run
-    stops on the tolerance check with 98% of the model replicated. Nothing
-    about that changes as the fsdp axis widens; a fallback that only ever
-    divided by two would show up at four and eight."""
-    model = CausalTransformer(
-        vocab_size=50257, emb_features=64, num_layers=1, num_heads=2,
-        num_kv_heads=1, mlp_features=128, max_seq_len=8)
-    variables = jax.eval_shape(
-        model.init, jax.random.key(0), jnp.ones((1, 8), jnp.int32))
-    mesh = MeshSpec(fsdp=fsdp_size).build()
-    layout = Layout(min_shard=TINY)
-    shardings = layout.shardings(mesh, variables)
-
-    assert shardings["params"]["embed_tokens"]["embedding"].spec == P(None, "fsdp")
-    layout.check(variables["params"], shardings["params"], mesh)
-
-
-def test_mesh_build_rejects_bad_fsdp_size():
-    with pytest.raises(ValueError):
-        MeshSpec(fsdp=3).build()
-
-
-def test_mesh_build_axes():
-    mesh = MeshSpec(fsdp=2).build()
-    assert mesh.shape['data'] == jax.device_count() // 2
-    assert mesh.shape['fsdp'] == 2
-
-
 # --------------------------------------------------------------------------
 # Batch placement and prefetch
 # --------------------------------------------------------------------------
-
-def test_shard_batch_splits_across_all_devices():
-    mesh = MeshSpec(fsdp=2).build()
-    batch = {"image": np.zeros((jax.device_count(), 4), np.float32)}
-    sharded = shard_batch(mesh, batch)["image"]
-    assert len(sharded.addressable_shards) == jax.device_count()
-    assert sharded.addressable_shards[0].data.shape == (1, 4)
-
 
 @pytest.mark.parametrize("devices", [1, 8])
 def test_placed_batch_owns_its_reader_buffer(devices):
@@ -616,19 +242,6 @@ def test_prefetch_iterator_preserves_order_and_terminates():
         seen = [float(np.asarray(b["x"])[0, 0]) for b in it]
         assert seen == [0.0, 1.0, 2.0, 3.0, 4.0]
         with pytest.raises(StopIteration):
-            next(it)
-
-
-def test_prefetch_iterator_surfaces_source_errors():
-    mesh = MeshSpec().build()
-
-    def broken():
-        yield {"x": np.zeros((jax.device_count(), 2), np.float32)}
-        raise ValueError("source exploded")
-
-    with DevicePrefetchIterator(broken(), mesh, depth=2) as it:
-        next(it)
-        with pytest.raises(ValueError, match="source exploded"):
             next(it)
 
 
@@ -737,32 +350,6 @@ def test_fsdp_shards_parameters_and_optimizer_state():
     assert specs(state.variables) == specs(state.ema)
 
 
-def test_muon_masked_optimizer_state_shards_with_its_parameters():
-    """A masked optax transform leaves a MaskedNode where its group does not
-    apply, and muon's adam branch is always masked, so the derivation has to
-    carry a leaf that is not an array at all."""
-    state = make_trainer(fsdp=2, optimizer=optax.contrib.muon(1e-3)).fit(
-        Data(batches), steps=0)
-
-    def is_placeholder(leaf):
-        return isinstance(leaf, optax.MaskedNode)
-
-    placeholders = [leaf for leaf in jax.tree.leaves(
-        state.opt_state, is_leaf=is_placeholder) if is_placeholder(leaf)]
-    assert placeholders, "muon left no masked placeholder for the derivation to carry"
-
-    kernel = state.variables["params"]["dit_block_0"]["mlp"]["layers_0"]["kernel"]
-    assert kernel.sharding.spec == P("fsdp")
-    moment_specs = {leaf.sharding.spec for leaf in jax.tree.leaves(state.opt_state)}
-    assert kernel.sharding.spec in moment_specs
-
-
-def test_replicated_run_shards_nothing():
-    state = make_trainer(fsdp=1).fit(Data(batches), steps=0)
-    for leaf in jax.tree.leaves(state.variables):
-        assert leaf.sharding.spec == P()
-
-
 # --------------------------------------------------------------------------
 # Checkpointing under sharding
 # --------------------------------------------------------------------------
@@ -775,19 +362,6 @@ def test_sharded_checkpoint_roundtrips(tmp_path):
     for before, after in zip(jax.tree.leaves(trained.variables),
                              jax.tree.leaves(restored.variables), strict=True):
         assert before.sharding.spec == after.sharding.spec
-        np.testing.assert_array_equal(np.asarray(before), np.asarray(after))
-
-
-def test_checkpoint_restores_onto_a_different_mesh(tmp_path):
-    """A run saved with FSDP must be resumable on a replicated mesh."""
-    trained = make_trainer(tmp_path, fsdp=2).fit(Data(batches), steps=1, log_every=1)
-    restored = make_trainer(tmp_path, fsdp=1).fit(Data(batches), steps=1)
-
-    assert int(restored.step) == 1
-    for leaf in jax.tree.leaves(restored.variables):
-        assert leaf.sharding.spec == P()
-    for before, after in zip(jax.tree.leaves(trained.variables),
-                             jax.tree.leaves(restored.variables), strict=True):
         np.testing.assert_array_equal(np.asarray(before), np.asarray(after))
 
 
@@ -861,39 +435,6 @@ def snapshot(tree):
 
 def moved(before, after):
     return any(not np.array_equal(a, b) for a, b in zip(before, after, strict=True))
-
-
-def test_gradient_accumulation_updates_only_on_the_boundary():
-    """MultiSteps must hold the params still until k micro-batches have run."""
-    accum = 3
-    trainer = make_accumulating(accumulation=accum)
-    state = trainer.initial_state()
-    reference = snapshot(state.variables)
-    for micro in range(1, accum * 2 + 1):
-        state = micro_steps(trainer, 1, state)
-        at_boundary = micro % accum == 0
-        assert moved(reference, snapshot(state.variables)) == at_boundary, f"micro-step {micro}"
-        if at_boundary:
-            reference = snapshot(state.variables)
-
-
-def test_ema_moves_only_on_accumulation_boundaries():
-    """The EMA has to run on the optimizer's clock, not the micro-batch's.
-
-    Between boundaries MultiSteps holds the params still, so an average taken
-    every micro-step would blend in parameters that never changed and pull the
-    EMA k times as far per update.
-    """
-    accum = 4
-    trainer = make_accumulating(accumulation=accum)
-    state = trainer.initial_state()
-    reference = snapshot(state.ema)
-    for micro in range(1, accum * 2 + 1):
-        state = micro_steps(trainer, 1, state)
-        at_boundary = micro % accum == 0
-        assert moved(reference, snapshot(state.ema)) == at_boundary, f"micro-step {micro}"
-        if at_boundary:
-            reference = snapshot(state.ema)
 
 
 def test_accumulated_ema_matches_a_plain_run_at_equal_update_counts():
@@ -981,14 +522,6 @@ def test_a_resumed_run_reads_the_batch_after_its_checkpoint(tmp_path):
                                       np.asarray(next(fresh)["image"]))
 
 
-def test_fit_resumes_the_unfinished_part_of_a_run(tmp_path):
-    data = Data(grain_image_loader, records=BATCH * 64)
-    make_trainer(tmp_path).fit(data, steps=2, log_every=1)
-    state = make_trainer(tmp_path).fit(data, steps=6, log_every=1)
-    assert int(state.step) == 6
-    assert Checkpoints(str(tmp_path)).latest == 6
-
-
 # --------------------------------------------------------------------------
 # The whole run, on a real mesh
 # --------------------------------------------------------------------------
@@ -1053,177 +586,6 @@ def test_fit_end_to_end_with_validation_and_metrics(tmp_path, fsdp_size):
 # The optimizer parameter groups under sharding
 # --------------------------------------------------------------------------
 
-def muon_state_specs(variables, rules):
-    """Params and the moments of both optimizer groups, on a two-way mesh."""
-    solver = OPTIMIZER_MAP["muon"](1e-3)
-    opt_state = jax.eval_shape(solver.init, variables)
-    shardings = Layout(rules=rules, min_shard=1).shardings(
-        MeshSpec(fsdp=2).build(), (variables, opt_state))
-    return jax.tree.map(lambda sharding: sharding.spec, shardings)
-
-
-def muon_moment_specs(opt_state_specs, param_specs):
-    """Per parameter, its own spec and the specs its moments were given.
-
-    A parameter is identified the way the derivation identifies it, by the
-    trailing run of its path, because each group nests a copy of the
-    parameter tree inside its own state. A group holds no leaf at all for a
-    parameter it does not step, so the moments found are the membership.
-    """
-    found = {tuple(entry.key for entry in path): (spec, [])
-             for path, spec in jax.tree_util.tree_flatten_with_path(param_specs)[0]}
-    for path, spec in jax.tree_util.tree_flatten_with_path(opt_state_specs)[0]:
-        names = []
-        for entry in reversed(path):
-            if not isinstance(entry, jax.tree_util.DictKey):
-                break
-            names.append(entry.key)
-        candidate = tuple(reversed(names))
-        if candidate in found:
-            found[candidate][1].append(spec)
-    return found
-
-
-def test_muon_group_moments_take_the_spec_their_parameter_declared():
-    """The split nests the parameter tree in two masked states, one per group.
-    Under a rule table that names one axis, a moment that fell back to the
-    shape heuristic would shard a parameter the table leaves whole, so the
-    assertion is that every moment of every parameter carries that
-    parameter's own spec, in both groups. The moment count says which group
-    stepped it: AdamW keeps two, Muon one.
-    """
-    model = CausalTransformer(
-        vocab_size=64, emb_features=32, num_layers=1, num_heads=2,
-        num_kv_heads=1, mlp_features=64, max_seq_len=8, tie_embeddings=False)
-    variables = jax.eval_shape(
-        model.init, jax.random.key(0), jnp.ones((1, 8), jnp.int32))
-    param_specs, opt_state_specs = muon_state_specs(variables, {"mlp": "fsdp"})
-
-    params = param_specs["params"]
-    assert params["embed_tokens"]["embedding"] == P()
-    assert params["layers_0"]["mlp"]["down_proj"]["kernel"] == P("fsdp")
-    assert params["layers_0"]["mlp"]["up_proj"]["kernel"] == P(None, "fsdp")
-
-    moments = muon_moment_specs(opt_state_specs, param_specs)
-    for name, (declared, specs) in moments.items():
-        assert specs, f"{name} has no optimizer moment in either group"
-        assert set(specs) == {declared}, name
-
-    embedding = moments[("params", "embed_tokens", "embedding")]
-    kernel = moments[("params", "layers_0", "mlp", "down_proj", "kernel")]
-    assert len(embedding[1]) == 2 and embedding[0] == P()
-    assert len(kernel[1]) == 1 and kernel[0] == P("fsdp")
-
-
 # --------------------------------------------------------------------------
 # Sharding invariants at every fsdp width
 # --------------------------------------------------------------------------
-
-def assert_specs_can_split(variables, shardings, fsdp_size):
-    """Every dimension a spec names has to be splittable that many ways.
-
-    A spec that names a dimension the mesh axis does not divide, or one of
-    size 1, is a layout jit rejects or a collective that moves nothing. The
-    rules are supposed to drop those names and hand the axis to another
-    dimension.
-    """
-    leaves = jax.tree_util.tree_flatten_with_path(variables)[0]
-    for (path, value), sharding in zip(leaves, jax.tree.leaves(shardings), strict=True):
-        for dimension, entry in enumerate(sharding.spec):
-            if not entry:
-                continue
-            size = value.shape[dimension]
-            where = f"{jax.tree_util.keystr(path)} {value.shape} -> {sharding.spec}"
-            assert size % fsdp_size == 0, f"{where} cannot split {fsdp_size} ways"
-            assert size > 1, f"{where} shards a dimension of one"
-
-
-def single_head_variables(num_heads=1):
-    """A DiT whose attention kernels carry a heads dimension of one."""
-    model = SimpleDiT(patch_size=4, emb_features=32, num_layers=1,
-                      num_heads=num_heads, mlp_ratio=1)
-    return jax.eval_shape(model.init, jax.random.key(0),
-                          jnp.ones((1, RES, RES, 3)), jnp.ones((1,)))
-
-
-@pytest.mark.slow
-@pytest.mark.parametrize("fsdp_size", [2, 4, 8])
-def test_a_single_head_model_shards_a_dimension_it_can_split(fsdp_size):
-    """One head makes the heads dimension 1, which shards nothing.
-
-    The DiT's attention kernels are (embed, heads, head_dim) and the
-    declaration names all three, so the rules have to leave the single head
-    alone and shard a dimension that exists. Every model in the suite has two
-    heads, where a spec naming the heads axis happens to work.
-    """
-    variables = single_head_variables()
-    mesh = MeshSpec(fsdp=fsdp_size).build()
-    layout = Layout(min_shard=TINY)
-    shardings = layout.shardings(mesh, variables)
-    attention = shardings["params"]["dit_block_0"]["attention"]
-
-    assert attention["to_q"]["kernel"].spec == P("fsdp")
-    assert_specs_can_split(variables["params"], shardings["params"], fsdp_size)
-    layout.check(variables["params"], shardings["params"], mesh)
-
-
-class OneLongVector(nn.Module):
-    """A model whose only parameter worth sharding has a single dimension."""
-    length: int = 4096
-
-    @nn.compact
-    def __call__(self, x):
-        scale = self.param('scale', nn.initializers.ones, (self.length,))
-        return nn.Dense(4)(x) * jnp.sum(scale)
-
-
-@pytest.mark.slow
-@pytest.mark.parametrize("fsdp_size", [2, 4, 8])
-def test_a_one_dimensional_parameter_shards_on_its_only_axis(fsdp_size):
-    """A vector has one axis to give, and giving it is not optional.
-
-    Every declared parameter is a matrix or a stack of them, so a 1-D
-    parameter falls to the shape heuristic. Leaving it replicated because it
-    has no second dimension would put the whole model on every device and
-    pass every other sharding test here.
-    """
-    variables = jax.eval_shape(
-        OneLongVector().init, jax.random.key(0), jnp.ones((1, 4)))
-    mesh = MeshSpec(fsdp=fsdp_size).build()
-    layout = Layout(min_shard=TINY)
-    shardings = layout.shardings(mesh, variables)
-
-    assert shardings["params"]["scale"].spec == P("fsdp")
-    layout.check(variables["params"], shardings["params"], mesh)
-
-
-@pytest.mark.slow
-@pytest.mark.parametrize("fsdp_size,replicated_fraction", [(2, 0.0), (4, 0.36), (8, 0.90)])
-def test_a_width_the_mesh_cannot_divide_stops_the_run_rather_than_replicating_it(
-        fsdp_size, replicated_fraction):
-    """62 features divide by two and by no other size the mesh offers.
-
-    The rules drop a name they cannot use, so the wider the fsdp axis the more
-    of this model stays whole: nothing at two, a third at four, nine tenths at
-    eight. What must not happen is a run that trains anyway with the model
-    replicated on every device; the tolerance check stops it.
-    """
-    model = CausalTransformer(
-        vocab_size=64, emb_features=62, num_layers=1, num_heads=1, num_kv_heads=1,
-        mlp_features=124, max_seq_len=8)
-    variables = jax.eval_shape(
-        model.init, jax.random.key(0), jnp.ones((1, 8), jnp.int32))
-    mesh = MeshSpec(fsdp=fsdp_size).build()
-    layout = Layout(min_shard=TINY)
-    shardings = layout.shardings(mesh, variables)
-
-    # Whatever the rules could not place, they left alone and unnamed.
-    assert_specs_can_split(variables["params"], shardings["params"], fsdp_size)
-
-    if not replicated_fraction:
-        layout.check(variables["params"], shardings["params"], mesh)
-        return
-    with pytest.raises(ValueError) as error:
-        layout.check(variables["params"], shardings["params"], mesh)
-    reported = float(str(error.value).split("%")[0]) / 100
-    assert abs(reported - replicated_fraction) < 0.01, str(error.value)

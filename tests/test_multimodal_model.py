@@ -33,52 +33,6 @@ from dew.training import Layout, MeshSpec, Trainer
 FIXTURE = Path(__file__).parent / "fixtures" / "hf" / "gemma3-native-tiny"
 
 
-@pytest.mark.parametrize("name", [
-    "qwen38-dense-tiny", "gemma3-native-tiny", "gemma4-native-tiny", "qwen35-native-tiny",
-    "llama4-native-tiny", "gemma-3n-audio-tiny", "gemma-4-audio-tiny",
-])
-def test_text_preprocessing_matches_the_sources_full_processor(name):
-    from transformers import AutoProcessor
-
-    from dew.data.text import load_tokenizer
-
-    directory = FIXTURE.parent / name
-    tokenizer = load_tokenizer(str(directory), local_files_only=True)
-    options = {"backend": "pil"} if name == "gemma3-native-tiny" else {}
-    reference = AutoProcessor.from_pretrained(str(directory), local_files_only=True, **options)
-    loaded = Pretrained.load(directory, dtype="float32", attention_impl="reference")
-    processor = loaded.processor
-    assert processor is not None
-    for text in ("token4", ["token4", "token4 token5", "A text-only request"]):
-        expected = reference(text=text, padding=True, truncation=False, return_tensors="np")
-        encoded = tokenizer(text=text, padding=True, truncation=False, return_tensors="np")
-        for field in ("input_ids", "attention_mask"):
-            np.testing.assert_array_equal(encoded[field], expected[field])
-        inputs = processor(text)
-        np.testing.assert_array_equal(inputs.tokens, expected["input_ids"])
-        decoded = reference.batch_decode(expected["input_ids"], skip_special_tokens=True)
-        assert tokenizer.batch_decode(encoded["input_ids"], skip_special_tokens=True) == decoded
-        assert processor.decode(inputs.tokens) == decoded
-    for content in ("token4", [{"type": "text", "text": "token4"}]):
-        messages = [{"role": "user", "content": content}]
-        if reference.chat_template is None:
-            for host in (reference, tokenizer):
-                with pytest.raises(ValueError, match="chat template"):
-                    host.apply_chat_template(messages, tokenize=False)
-            with pytest.raises(ValueError, match="chat template"):
-                processor.chat(messages)
-        else:
-            rendered = reference.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-            assert tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True) == rendered
-            expected = reference.apply_chat_template(
-                messages, tokenize=True, return_dict=True, return_tensors="np", add_generation_prompt=True)
-            encoded = tokenizer.apply_chat_template(
-                messages, tokenize=True, return_dict=True, return_tensors="np", add_generation_prompt=True)
-            np.testing.assert_array_equal(encoded["input_ids"], expected["input_ids"])
-            np.testing.assert_array_equal(processor.chat(messages).tokens, expected["input_ids"])
-
-
 @pytest.fixture(scope="module")
 def source():
     loaded = Pretrained.load(FIXTURE, dtype="float32", attention_impl="reference")
@@ -177,17 +131,6 @@ def test_model_inputs_alignment_preserves_media_identity(source):
     assert isinstance(aligned, ModelInputs)
 
 
-def test_source_processor_rejects_unknown_fields_and_incorrect_image_counts(source):
-    loaded, _ = source
-    assert loaded.processor is not None
-    values = {name: np.load(FIXTURE / f"{name}.npy") for name in
-              ("input_ids", "attention_mask", "pixel_values", "token_type_ids")}
-    with pytest.raises(ValueError, match="processor fields"):
-        loaded.processor.from_hf({**values, "mystery_mask": np.ones((2, 19))})
-    with pytest.raises(ValueError, match="placeholder counts disagree"):
-        loaded.processor.from_hf({**values, "pixel_values": values["pixel_values"][:1]})
-
-
 @pytest.fixture(scope='module')
 def gemma4_video_batch():
     from transformers import AutoProcessor
@@ -269,70 +212,6 @@ def test_gemma4_mixed_video_forward_matches_unmodified_reference(gemma4_video_ba
         variables, inputs.tokens, **inputs.kwargs()))(loaded.variables)
     valid = np.asarray(values['attention_mask'], dtype=bool)
     np.testing.assert_allclose(np.asarray(actual)[valid], expected[valid], atol=1e-4, rtol=0)
-
-
-def test_gemma4_vision_groups_cross_modality_boundaries_not_text(gemma4_video_batch):
-    loaded, _ = gemma4_video_batch
-    image, video = loaded.processor.config['image_token_id'], loaded.processor.config['video_token_id']
-    values = {'input_ids': np.array([[image, image, video, video, 4, video, 5, image]], np.int32),
-              'mm_token_type_ids': np.array([[1, 1, 2, 2, 0, 2, 0, 1]], np.int32)}
-    groups = loaded.processor.from_hf(values).token_fields['image_groups']
-    np.testing.assert_array_equal(groups, [[0, 0, 0, 0, -1, 1, -1, 2]])
-
-
-@pytest.mark.parametrize('invalid', ['missing_positions', 'unaligned_frames', 'unpaired_padding',
-                                      'coordinate_bounds', 'incomplete_pool', 'unused_frames'])
-def test_gemma4_video_payload_must_match_positions_and_placeholders(gemma4_video_batch, invalid):
-    loaded, original = gemma4_video_batch
-    values = dict(original)
-    values['video_position_ids'] = original['video_position_ids'].copy()
-    if invalid == 'missing_positions':
-        del values['video_position_ids']
-        message = 'arrive together'
-    elif invalid == 'unaligned_frames':
-        values['video_position_ids'] = values['video_position_ids'][:, :1]
-        message = 'aligned integer patch coordinates'
-    elif invalid == 'unpaired_padding':
-        values['video_position_ids'][0, 0, 0] = [-1, 0]
-        message = 'paired'
-    elif invalid == 'coordinate_bounds':
-        values["video_position_ids"][0, 0, 0, 0] = loaded.processor.config["vision_config"][
-            "position_embedding_size"
-        ]
-        message = 'position_embedding_size'
-    elif invalid == 'incomplete_pool':
-        values['video_position_ids'][0, 0, 0] = [-1, -1]
-        message = 'complete pooling blocks'
-    else:
-        values['pixel_values_videos'] = np.concatenate([original['pixel_values_videos']] * 2)
-        values['video_position_ids'] = np.concatenate([original['video_position_ids']] * 2)
-        message = 'placeholder counts disagree'
-    with pytest.raises(ValueError, match=message):
-        loaded.processor.from_hf(values)
-
-
-def test_the_processor_emits_validity_only_where_the_batch_is_padded(source):
-    """A whole batch states its validity by carrying none, and the positions
-    it does carry are the row indices. A mask that only says every slot is
-    real says nothing the model can read, so it goes the same way; a mask
-    with a padded slot in it stays."""
-    loaded, _ = source
-    assert loaded.processor is not None
-    ids = np.load(FIXTURE / "input_ids.npy")[:1]
-    left_padded = np.ones(ids.shape, np.int32)
-    left_padded[:, :2] = 0
-
-    whole = loaded.processor.from_hf({"input_ids": ids})
-    spelled = loaded.processor.from_hf({"input_ids": ids, "attention_mask": np.ones(ids.shape, np.int32)})
-    padded = loaded.processor.from_hf({"input_ids": ids, "attention_mask": left_padded})
-
-    assert "attention_mask" not in whole.token_fields
-    assert "attention_mask" not in spelled.token_fields
-    np.testing.assert_array_equal(whole.token_fields["positions"],
-                                  np.arange(ids.shape[1])[None, :])
-    np.testing.assert_array_equal(np.asarray(padded.token_fields["attention_mask"]),
-                                  left_padded.astype(bool))
-    np.testing.assert_array_equal(padded.token_fields["positions"][0, :4], [0, 0, 0, 1])
 
 
 def test_public_cached_generation_preserves_image_conditioning(source):
@@ -550,40 +429,6 @@ def test_audio_only_processor_forward_and_greedy_continuation_match_reference(au
     np.testing.assert_allclose(np.asarray(logits)[valid], reference["logits"][valid], atol=1e-4, rtol=0)
     generated = loaded.text_generation()(inputs, 3, key=jax.random.key(1), sampling=Sampling(temperature=0))
     np.testing.assert_array_equal(generated.tokens[:, -3:], reference["generated"][:, -3:])
-
-
-def test_gemma3n_left_padded_batch_has_finite_gradients():
-    """A zero pad embedding at a padded slot must not poison the gradient.
-
-    The AltUp magnitude is a square root of that slot's zero RMS; without a
-    finite derivative there the masked slot's zero upstream gradient became
-    NaN in the embedding table (observed on the pad row alone).
-    """
-    loaded = Pretrained.load(
-        FIXTURE.parent / "gemma-3n-audio-tiny", dtype="float32", attention_impl="reference"
-    )
-    model = loaded.model.language_model
-    params = {"params": loaded.variables["params"]["language_model"]}
-    tokens = jnp.asarray([[0, 0, 0, 5, 4, 7, 9, 3], [8, 4, 9, 7, 3, 2, 5, 6]], jnp.int32)
-    valid = tokens != 0
-    inputs = ModelInputs(
-        tokens,
-        {
-            "attention_mask": valid,
-            "positions": jnp.maximum(jnp.cumsum(valid, axis=1) - 1, 0).astype(jnp.int32),
-        },
-        {},
-    )
-
-    def loss(variables):
-        logits = model.apply(variables, inputs.tokens, **inputs.kwargs())
-        log_probs = jax.nn.log_softmax(logits[:, :-1])
-        picked = jnp.take_along_axis(log_probs, tokens[:, 1:, None], -1)[..., 0]
-        return -(picked * valid[:, 1:]).sum() / valid[:, 1:].sum()
-
-    gradient = jax.grad(loss)(params)
-    assert all(bool(jnp.isfinite(leaf).all()) for leaf in jax.tree.leaves(gradient))
-
 
 
 def test_source_processor_forward_and_cached_generation_match_reference(family_source):

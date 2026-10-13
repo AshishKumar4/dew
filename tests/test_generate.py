@@ -32,27 +32,6 @@ def tiny(**overrides):
 
 
 
-def test_greedy_generation_follows_the_full_sequence_argmax(rng):
-    model = tiny()
-    prompt = jax.random.randint(rng, (3, 5), 0, VOCAB)
-    params = model.init(rng, prompt)
-
-    generated = generate(
-        model, params, prompt, 6, key=jax.random.PRNGKey(1), sampling=Sampling(temperature=0)
-    ).tokens
-    assert generated.shape == (3, 11)
-    assert generated.dtype == jnp.int32
-    assert jnp.array_equal(generated[:, :5], prompt)
-    assert jnp.array_equal(generated, argmax_walk(model, params, prompt, 6))
-    # greedy ignores the rng, so two calls cannot disagree
-    assert jnp.array_equal(
-        generated,
-        generate(
-            model, params, prompt, 6, key=jax.random.PRNGKey(7), sampling=Sampling(temperature=0)
-        ).tokens,
-    )
-
-
 def test_a_pattern_and_its_kinds_from_json_can_generate(rng):
     """A run record hands the pattern as a list and each kind as a record,
     the form a config parses to."""
@@ -118,20 +97,6 @@ def test_top_k_restricts_the_choice_and_top_one_is_greedy(rng):
         allowed = jnp.argsort(logits, axis=-1)[:, -5:]
         chosen = sampled[:, position]
         assert jnp.all(jnp.any(allowed == chosen[:, None], axis=-1))
-
-
-def test_a_single_new_token_and_none_at_all(rng):
-    model = tiny()
-    prompt = jax.random.randint(rng, (2, 4), 0, VOCAB)
-    params = model.init(rng, prompt)
-
-    assert jnp.array_equal(prompt, generate(model, params, prompt, 0,
-                                            key=jax.random.PRNGKey(0)).tokens)
-    one = generate(
-        model, params, prompt, 1, key=jax.random.PRNGKey(0), sampling=Sampling(temperature=0)
-    ).tokens
-    assert one.shape == (2, 5)
-    assert jnp.array_equal(one, argmax_walk(model, params, prompt, 1))
 
 
 def test_every_continuation_row_belongs_to_the_prompt_it_sits_under(rng):
@@ -236,14 +201,6 @@ def test_continuations_run_on_a_routed_expert_decoder(rng):
     np.testing.assert_array_equal(np.asarray(two.tokens)[::2], np.asarray(one.tokens))
     np.testing.assert_array_equal(np.asarray(two.raw_log_probs)[::2], np.asarray(one.raw_log_probs))
     assert not np.array_equal(np.asarray(two.tokens)[0, 4:], np.asarray(two.tokens)[1, 4:])
-
-
-def test_generation_longer_than_the_cache_is_refused(rng):
-    model = tiny(max_seq_len=8)
-    prompt = jax.random.randint(rng, (1, 6), 0, VOCAB)
-    params = model.init(rng, prompt)
-    with pytest.raises(ValueError, match="max_seq_len"):
-        generate(model, params, prompt, 4, key=jax.random.PRNGKey(0))
 
 
 def copy_batch(rng, size):

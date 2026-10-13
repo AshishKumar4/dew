@@ -1115,6 +1115,9 @@ class Trainer(Generic[Loss, Effects]):
         splits, left open and unrecorded, is timed by `timed` (`fit`) against
         the batch whole a rung up, and the faster kept.
         """
+        if self.lower_for is not None:
+            # Shapes are all a lowering reads, so the state may be abstract (`jax.eval_shape`).
+            raise Lowered(self.lower_for, self._lowered_for(state, batch, self.lower_for))
         split, unaligned = divmod(int(state.window_size), self.accumulation)
         if unaligned or (state.accumulation is not None and self._split not in (None, split)):
             raise ValueError(f"the state pools windows of {int(state.window_size)} microbatches, and this "
@@ -1123,8 +1126,6 @@ class Trainer(Generic[Loss, Effects]):
             self._split = split
         if (state.scale is not None) != self.dynamic_scale:
             raise ValueError("checkpoint dynamic-scaler configuration differs from this trainer")
-        if self.lower_for is not None:
-            raise Lowered(self.lower_for, self._lowered_for(state, batch, self.lower_for))
         if self.host_master:
             return self._compile_host(state, batch)
         mesh = self.device_mesh
