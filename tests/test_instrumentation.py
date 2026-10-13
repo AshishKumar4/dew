@@ -206,6 +206,7 @@ def test_compiled_flops_matches_the_transformer_flop_formula():
 
 
 @pytest.mark.gpu("cuDNN's fused attention runs on a CUDA GPU alone")
+@pytest.mark.mesh(devices=1)
 @pytest.mark.parametrize("window", [None, 64])
 def test_a_fused_attention_counts_the_pairs_its_mask_computes(window):
     """A causal kernel computes about half the scores, a sliding window fewer: the forward's two
