@@ -23,7 +23,7 @@ of warmup, equal peak memory; Colab job dew-gpu-c20-gelu-a100-job-1).
 
 # tests/test_jepa_source.py checks these modules against V-JEPA's own code.
 
-from typing import ClassVar, Literal
+from typing import ClassVar
 
 import jax
 import jax.numpy as jnp
@@ -39,6 +39,7 @@ from ..dit import (
     scan_ordered_pos_embed,
 )
 from ..flops import MissingFlopsCount, counted_flops, projection_flops, real_lengths
+from ..scan_orders import ScanOrder
 from ..sharding import constrain, down_projection, rows_like
 from .dit import gather_tokens
 
@@ -135,7 +136,7 @@ class JepaEncoder(_JepaStackOptions):
     emb_features: int = 384
     num_layers: int = 12
     num_heads: int = 6
-    scan_order: Literal["raster", "hilbert", "zigzag"] = "raster"
+    scan_order: ScanOrder = "raster"
 
     stack_type: ClassVar[type[TokenStack | FactorizedTokenStack]] = TokenStack
     """The layers between the patches and the norm.

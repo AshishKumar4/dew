@@ -12,7 +12,7 @@ sandwich; the model files arrange blocks.
 import inspect
 import math
 from collections.abc import Sequence
-from typing import Literal, Self, TypedDict, Unpack
+from typing import Literal, Self, TypedDict, Unpack, get_args
 
 import jax
 import jax.numpy as jnp
@@ -30,6 +30,7 @@ from .flops import MissingFlopsCount, counted_flops, projection_flops, real_leng
 from .precision import at_least_fp32, fp32_result_dot_general
 from .rope import rotary_freqs
 from .scan_orders import (
+    ScanOrder,
     build_2d_sincos_pos_embed,
     hilbert_indices,
     hilbert_patchify,
@@ -41,8 +42,6 @@ from .scan_orders import (
 )
 from .sharding import MLP_HIDDEN, RESIDUAL, constrain, logical_axes
 from .ssm import BidirectionalS5Layer, S5Layer, SpatialFusionConv
-
-SCAN_ORDERS = ('raster', 'hilbert', 'zigzag')
 
 # The rotary base every model here rotates with, RoFormer's.
 ROPE_THETA = 10000.0
@@ -196,7 +195,7 @@ class PatchSequenceEmbed(nn.Module):
                                parent=None).model_flops(lengths, input_channels)
 
     def setup(self):
-        assert self.scan_order in SCAN_ORDERS, f"Unknown scan order {self.scan_order}"
+        assert self.scan_order in get_args(ScanOrder), f"Unknown scan order {self.scan_order}"
         if self.scan_order == 'raster':
             self.patch_embed = PatchEmbedding(
                 patch_size=self.patch_size,
@@ -502,7 +501,7 @@ class _DiTStackOptions(_AttentionStackOptions):
     num_layers: int = 12
     num_heads: int = 12
     remat: RematChoice = False
-    scan_order: Literal['raster', 'hilbert', 'zigzag'] = 'raster'
+    scan_order: ScanOrder = 'raster'
 
     @nn.nowrap
     def recompute_record(self) -> JSON:
@@ -646,7 +645,7 @@ class ModulatedBlock(nn.Module):
                 features=self.features, state_dim=self.ssm_state_dim, dtype=self.dtype, name="ssm"
             )
             if self.use_2d_fusion:
-                assert self.scan_order in SCAN_ORDERS, f"Unknown scan_order {self.scan_order}"
+                assert self.scan_order in get_args(ScanOrder), f"Unknown scan_order {self.scan_order}"
                 self.spatial_fusion = SpatialFusionConv(
                     features=self.features,
                     dilations=(1, 2, 3),
