@@ -879,12 +879,12 @@ def _rule_fwd(q, k, v, g, beta, h0, cu_seqlens, scale: float, chunk: int, interp
     (`fla_gdn.chunk_fwd_h`'s USE_GK branch), then the output. Saves what fla saves."""
     spans = sequences(q.shape[0], q.shape[1], cu_seqlens, chunk=chunk)
     kernels = {"chunk": chunk, "spans": spans, "interpret": interpret}
-    gc = fla_gdn.chunk_local_cumsum(g, scale=RCP_LN2, **kernels)
-    aqk, akk = intra_solve(q, k, *gc, beta, scale=scale, **kernels)
-    w, u, kg, _ = recompute_w_u(k, v, beta, akk, *gc, **kernels)
-    h, corrected, final = fla_gdn.chunk_fwd_h(kg, w, u, *gc, h0, **kernels)
-    o = chunk_fwd_o(q, corrected, gc[0], aqk, h, scale=scale, **kernels)
-    return (o, final), (q, k, v, gc, beta, aqk, akk, h0, spans)
+    g_hi, g_lo = fla_gdn.chunk_local_cumsum(g, scale=RCP_LN2, **kernels)
+    aqk, akk = intra_solve(q, k, g_hi, g_lo, beta, scale=scale, **kernels)
+    w, u, kg, _ = recompute_w_u(k, v, beta, akk, g_hi, g_lo, **kernels)
+    h, corrected, final = fla_gdn.chunk_fwd_h(kg, w, u, g_hi, g_lo, h0, **kernels)
+    o = chunk_fwd_o(q, corrected, g_hi, aqk, h, scale=scale, **kernels)
+    return (o, final), (q, k, v, g_hi, g_lo, beta, aqk, akk, h0, spans)
 
 
 def _rule_bwd(scale: float, chunk: int, interpret: bool, residual, cotangent):
@@ -893,17 +893,17 @@ def _rule_bwd(scale: float, chunk: int, interpret: bool, residual, cotangent):
     (`fla_gdn.chunk_bwd_dhu`'s USE_GK branch), the fused WY and memory gradients, the intra-chunk
     terms, a key head's value heads summed (fla's GVA), and the decay's gradient summed back over
     each chunk."""
-    q, k, v, gc, beta, aqk, akk, h0, spans = residual
+    q, k, v, g_hi, g_lo, beta, aqk, akk, h0, spans = residual
     do, dht = cotangent
     kernels = {"chunk": chunk, "spans": spans, "interpret": interpret}
-    w, u, kg, qg = recompute_w_u(k, v, beta, akk, *gc, q, **kernels)
-    h, corrected, _ = fla_gdn.chunk_fwd_h(kg, w, u, *gc, h0, **kernels)
+    w, u, kg, qg = recompute_w_u(k, v, beta, akk, g_hi, g_lo, q, **kernels)
+    h, corrected, _ = fla_gdn.chunk_fwd_h(kg, w, u, g_hi, g_lo, h0, **kernels)
     daqk, dv = bwd_dav(corrected, do, aqk, scale=scale, **kernels)
-    dh, dh0, dv = fla_gdn.chunk_bwd_dhu(qg, kg, w, *gc, dht.astype(jnp.float32), do, dv, scale=scale,
+    dh, dh0, dv = fla_gdn.chunk_bwd_dhu(qg, kg, w, g_hi, g_lo, dht.astype(jnp.float32), do, dv, scale=scale,
                                         **kernels)
-    dq, dk, dv, db, dg, dakk = bwd_wy_dqkg(q, k, v, corrected, *gc, beta, akk, h, do, dh, dv, scale=scale,
-                                           **kernels)
-    dq, dk, db, dg = bwd_intra(q, k, *gc, beta, daqk, dakk, dq, dk, db, dg, **kernels)
+    dq, dk, dv, db, dg, dakk = bwd_wy_dqkg(q, k, v, corrected, g_hi, g_lo, beta, akk, h, do, dh, dv,
+                                           scale=scale, **kernels)
+    dq, dk, db, dg = bwd_intra(q, k, g_hi, g_lo, beta, daqk, dakk, dq, dk, db, dg, **kernels)
     group = v.shape[2] // k.shape[2]
     if group > 1:
         dq, dk = (x.reshape(*x.shape[:2], k.shape[2], group, x.shape[-1]).sum(axis=3) for x in (dq, dk))
