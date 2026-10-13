@@ -14,9 +14,13 @@ from collections.abc import Mapping
 from dew import records
 from dew.interop.decoder_parts import DecoderFamily, DecoderFields, base_config, read_rope, refuse
 from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.nn.backbones.decoder_block import NormSpec
 
 _REMOTE = 'IFM/K2-Horizon-0.9B'
 """The repository whose remote code an exported config names, as the released ones do."""
+
+_GROUPED = ('input_layernorm', 'post_attention_layernorm', 'norm')
+"""The norms K2HorizonRMSNorm builds, each over `layernorm_num_groups` (:660-667, :836-839)."""
 
 _EXPERTS = ('decoder_sparse_step', 'moe_intermediate_size', 'num_experts_per_tok', 'norm_topk_prob',
             'output_router_logits', 'router_aux_loss_coef', 'moe_gate_bias', 'num_shared_experts',
@@ -54,13 +58,20 @@ def _k2_horizon_config(hf: Mapping[str, object], used: set[str]) -> DecoderField
                                                'max_position_embeddings'))
     config = base_config({**hf, 'sliding_window': None}, used, rope=rope, scale_after_cast=False,
                          reads=frozenset({'attention_bias', 'sliding_window'}))
-    config['norm_groups'] = records.integer(hf.get('layernorm_num_groups', 1), 'layernorm_num_groups')
+    groups = records.integer(hf.get('layernorm_num_groups', 1), 'layernorm_num_groups')
+    if groups != 1:
+        config['norms'] = {site: {'groups': groups} for site in _GROUPED}
     return config
+
+
+def _groups(model: CausalTransformer) -> int:
+    """The groups of the block's input norm, which K2 Horizon's every norm shares."""
+    return (model.norms or {}).get('input_layernorm', NormSpec()).groups
 
 
 def _k2_horizon_export(model: CausalTransformer) -> Mapping[str, object]:
     return {
-        'layernorm_num_groups': model.norm_groups, 'num_experts': 0, 'query_key_norm': False,
+        'layernorm_num_groups': _groups(model), 'num_experts': 0, 'query_key_norm': False,
         'attention_gate_func': None, 'rope_head_dim': model.head_dim, 'use_sliding_window': False,
         'auto_map': {'AutoConfig': f'{_REMOTE}--configuration_k2_horizon.K2HorizonConfig',
                      'AutoModel': f'{_REMOTE}--modeling_k2_horizon.K2HorizonModel',
@@ -72,6 +83,6 @@ def _k2_horizon_export(model: CausalTransformer) -> Mapping[str, object]:
 # orders its cast and weight otherwise, the same product in fp32 (`hf_decoders._RUNTIME_FIELDS`),
 # and whose rotary builds its YaRN.
 K2_HORIZON = DecoderFamily(
-    ('k2_horizon',), _k2_horizon_config, lambda fields: fields.norm_groups != 1,
+    ('k2_horizon',), _k2_horizon_config, lambda fields: _groups(fields) != 1,
     'k2_horizon', 'K2HorizonForCausalLM', _k2_horizon_export, preserve_source_layout=False,
 )

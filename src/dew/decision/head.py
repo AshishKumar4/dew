@@ -39,7 +39,7 @@ from dew.records import JSON
 def _layer_norm(dtype: Dtype | None, name: str) -> nn.Module:
     """torch's `nn.LayerNorm`: a scale and a bias at 1e-5."""
     return decoder_norm("layer", epsilon=1e-5, bias=True, scale_offset=False, scale_after_cast=False,
-                        dtype=dtype, groups=1)(name=name)
+                        dtype=dtype)(name=name)
 
 
 class Head(nn.Module):

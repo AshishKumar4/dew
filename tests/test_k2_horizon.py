@@ -31,7 +31,8 @@ def test_grouped_norms_and_yarn_compute_the_remote_codes_logits():
     from tools.classic_gpt_reference import greedy
 
     loaded = load()
-    assert loaded.model.norm_groups == 2
+    assert {name: spec.groups for name, spec in loaded.model.norms.items()} == dict.fromkeys(
+        ('input_layernorm', 'post_attention_layernorm', 'norm'), 2)
     logits = np.asarray(loaded.model.apply(loaded.variables, fixture('input_ids')))
     assert_as_exact_as_the_reference(logits, fixture('logits'), fixture('logits_f64'), 'K2 Horizon logits')
     mask = fixture('attention_mask')
@@ -67,7 +68,7 @@ def test_a_single_group_exports_as_llama_with_its_yarn(tmp_path):
     from tools.decoder_export_reference import Case, reference_logits
 
     loaded = load()
-    single = loaded.model.clone(norm_groups=1)
+    single = loaded.model.clone(norms=None)
     PretrainedDecoder.from_model(single, loaded.variables).save(tmp_path)
     config = json.loads((tmp_path / 'config.json').read_text())
     assert config['model_type'] == 'llama'
@@ -84,7 +85,8 @@ def test_each_release_translates_to_the_dense_block_it_ships(size, groups, layer
     """Every released config reads whole: grouped norms that scale before
     their cast, untied heads, and the 0.9B's YaRN with its own betas."""
     fields = translate_config(json.loads((ROOT / f'k2-horizon-{size}' / 'config.json').read_text()))
-    assert (fields['norm_groups'], fields['num_layers'], fields['emb_features']) == (groups, layers, width)
+    stated = {spec['groups'] for spec in (fields.get('norms') or {'': {'groups': 1}}).values()}
+    assert (stated, fields['num_layers'], fields['emb_features']) == ({groups}, layers, width)
     assert fields['scale_after_cast'] is False and fields['tie_embeddings'] is False
     assert fields.get('mixture') is None and fields['qk_norm'] is False
     if size == '0.9b':
