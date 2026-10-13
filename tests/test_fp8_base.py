@@ -21,7 +21,7 @@ from flax.traverse_util import flatten_dict
 from model_support import TINY_DECODER
 from reference_error import assert_leaves_as_exact
 
-from dew.data import Dataset
+from dew.data.dataset import Loader
 from dew.interop.codecs import dequantize_fp8_blocks, quantize_fp8_blocks
 from dew.lora import LoRA
 from dew.nn.kernels.generation import assumed, device_generation, gpu_target
@@ -175,7 +175,7 @@ def fit(adapter, steps, directory=None, mesh=None, devices=1):
                       layout=Layout(min_shard=1, tolerance=1.0),
                       checkpoints=None if directory is None else Checkpoints(str(directory)))
     trainer.device_mesh = mesh.build(jax.devices()[:devices])
-    return trainer.fit(Dataset(lambda partition: Stream(), None, None, BATCH), steps=steps,
+    return trainer.fit(Loader(lambda partition: Stream(), None, None, BATCH), steps=steps,
                        checkpoint_every=None if directory is None else 2)
 
 
