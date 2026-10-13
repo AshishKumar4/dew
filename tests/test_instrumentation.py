@@ -21,6 +21,7 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 from recording import RecordingTracker
 
 from dew.cache import enable_compilation_cache
+from dew.data.dataset import Loader
 from dew.objectives.lm import LMObjective
 from dew.registry import models
 from dew.telemetry.instrumentation import compiled_flops
@@ -29,16 +30,6 @@ from dew.training.distributed import shard_batch
 
 # Needs the eight simulated CPU devices conftest configures; the GPU lane skips it.
 pytestmark = pytest.mark.mesh
-
-
-class Data:
-    def __init__(self, train, batch=BATCH):
-        self._train, self.val, self.batch, self.records = train, None, batch, None
-
-    def train(self, partition):
-        return self._train()
-
-    steps_per_epoch = None
 
 
 def make_trainer(**kwargs):
@@ -205,6 +196,30 @@ def test_compiled_flops_matches_the_transformer_flop_formula():
     assert trainer.flops_per_step * jax.device_count() == pytest.approx(analytic, rel=0.05)
 
 
+@pytest.mark.gpu("cuDNN's fused attention runs on a CUDA GPU alone")
+@pytest.mark.mesh(devices=1)
+@pytest.mark.parametrize("window", [None, 64])
+def test_a_fused_attention_counts_the_pairs_its_mask_computes(window):
+    """A causal kernel computes about half the scores, a sliding window fewer: the forward's two
+    products and the backward's four count one multiply-add per pair it reaches, head and width.
+    On an H100 FlashAttention-3 counted the whole square of a causal call, twice its work."""
+    batch, length, heads, width = 1, 256, 2, 128
+    shape = jax.ShapeDtypeStruct((batch, length, heads, width), jnp.bfloat16)
+    spans = {} if window is None else {"local_window_size": (window, 0)}
+
+    def attend(q, k, v):
+        return jax.nn.dot_product_attention(q, k, v, implementation="cudnn", is_causal=True, **spans)
+
+    def loss(q, k, v):
+        return attend(q, k, v).astype(jnp.float32).sum()
+
+    pairs = sum(min(row, length if window is None else window) + 1 for row in range(length))
+    forward = compiled_flops(jax.jit(attend).lower(shape, shape, shape).compile())
+    both = compiled_flops(jax.jit(jax.grad(loss, argnums=(0, 1, 2))).lower(shape, shape, shape).compile())
+    assert forward == 2 * 2 * batch * heads * pairs * width
+    assert both == (2 + 4) * 2 * batch * heads * pairs * width
+
+
 def test_compiled_flops_counts_every_iteration_of_a_scanned_body():
     """A scanned stack runs its body once per iteration. The count has to be
     the run's, not the body's: cost analysis reports the body's."""
@@ -223,7 +238,8 @@ def test_compiled_flops_counts_every_iteration_of_a_scanned_body():
 def test_fit_reports_throughput_to_the_tracker():
     """The logging tick carries the throughput numbers along with the loss."""
     tracker = RecordingTracker()
-    make_trainer(tracker=tracker).fit(Data(batches), steps=3, log_every=1)
+    make_trainer(tracker=tracker).fit(
+        Loader(lambda partition: batches(), None, batch=BATCH, records=None), steps=3, log_every=1)
 
     ticks = [p for _, p in tracker.scalars if "train/samples_per_sec" in p]
     assert len(ticks) == 3, "no throughput was logged"
@@ -267,7 +283,8 @@ def test_fit_reports_the_wait_on_input_and_a_later_compile():
             x = rng.normal(size=(rows, FEATURES)).astype(np.float32)
             yield {"x": x, "y": 2 * x[:, :2]}
 
-    make_trainer(tracker=tracker).fit(Data(slow), steps=steps, log_every=1)
+    make_trainer(tracker=tracker).fit(
+        Loader(lambda partition: slow(), None, batch=BATCH, records=None), steps=steps, log_every=1)
 
     ticks = [p for _, p in tracker.scalars if "train/step_time_ms" in p]
     assert len(ticks) == 10

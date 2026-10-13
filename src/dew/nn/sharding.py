@@ -192,11 +192,9 @@ LOGITS: LogicalAxes = ("activation_batch", "activation_length", "activation_voca
 """`[batch, length, vocab]` scores."""
 
 
-DECLARED: dict[type, dict[Suffix, LogicalAxes]] = {}
-"""Each decorated module class's own declarations."""
 _OWNERS: dict[Suffix, tuple[LogicalAxes, type]] = {}
 """Every declaration by its suffix, with the class that made it: the table
-`declared_axes` matches, one set of axes per suffix across all classes."""
+`declarations` matches, one set of axes per suffix across all classes."""
 
 @dataclasses.dataclass
 class Schedule:
@@ -655,7 +653,6 @@ def logical_axes(declared: Mapping[Suffix, LogicalAxes]):
                     f"{held[0]} by {_qualified(held[1])}; a suffix has one set of axes")
         for suffix, axes in declared.items():
             _OWNERS.setdefault(suffix, (axes, cls))
-        DECLARED.setdefault(cls, {}).update(declared)
         return cls
 
     return decorate
@@ -727,32 +724,36 @@ def boxed(table: Mapping[Suffix, LogicalAxes]) -> Iterator[None]:
         _BOXED.reset(token)
 
 
-def declared_axes(path, ndim: int) -> LogicalAxes | None:
-    """The declared axes of the parameter at `path`, or None for an unnamed one.
+def declarations(tree) -> dict[Suffix, LogicalAxes]:
+    """The axes `logical_axes` declares for each leaf of `tree`, by the
+    leaf's parameter path, the one place the declarations are read: a
+    declaration names a module, whose parameters share its axes, or one
+    parameter under its module, for a module whose leaves have different
+    axes (GPT OSS's fused experts). The parameter's own path is tried first.
+    """
+    table: dict[Suffix, LogicalAxes] = {}
+    for path, _ in jax.tree_util.tree_leaves_with_path(nn.unbox(tree)):
+        names = parameter_path(path)
+        suffix = _matching(_OWNERS, names) or _matching(_OWNERS, names[:-1])
+        if suffix is not None:
+            table[names] = _OWNERS[suffix][0]
+    return table
 
-    A parameter its module boxed with its axes (`boxed`) takes exactly
-    those, matched by its whole path: a variables leaf by its own, a leaf of
-    a tree that mirrors the params collection (an optimizer moment, a
-    gradient) under `params`. Otherwise a declaration names a module, whose
-    parameters share its axes, or one parameter under its module, for a
-    module whose leaves have different axes (GPT OSS's fused experts). The
-    parameter's own path is tried first.
+
+def declared_axes(path, ndim: int, declared: Mapping[Suffix, LogicalAxes]) -> LogicalAxes | None:
+    """The axes of the parameter at `path`, or None for an unnamed one: the
+    axes its module boxed on it (`boxed`), matched by its whole path, a
+    variables leaf by its own and a leaf of a tree that mirrors the params
+    collection (an optimizer moment, a gradient) under `params`; else those
+    `declared`, the `declarations` of the tree it is a leaf of, give it.
     """
     names = parameter_path(path)
     held = _BOXED.get()
-    own = held.get(names) or held.get(("params", *names))
-    if own is not None:
-        if ndim > len(own):
-            raise ValueError(f"{'/'.join(names)} is boxed {own}, which cannot name its {ndim} dimensions")
-        return own[len(own) - ndim:]
-    suffix = _matching(_OWNERS, names) or _matching(_OWNERS, names[:-1])
-    if suffix is None:
+    axes = held.get(names) or held.get(("params", *names)) or declared.get(names)
+    if axes is None:
         return None
-    axes, owner = _OWNERS[suffix]
     if ndim > len(axes):
-        raise ValueError(
-            f"{'/'.join(suffix)} is declared {axes} by {_qualified(owner)}, which cannot "
-            f"name the {ndim} dimensions of {'/'.join(names)}")
+        raise ValueError(f"{'/'.join(names)} has the axes {axes}, which cannot name its {ndim} dimensions")
     return axes[len(axes) - ndim:]
 
 

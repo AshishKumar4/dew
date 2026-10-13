@@ -20,7 +20,8 @@ import itertools
 import jax
 import numpy as np
 
-from dew import Dataset, Trainer
+from dew import Trainer
+from dew.data.dataset import Loader
 from dew.config import OptimConfig
 from dew.nn.backbones import CausalTransformer
 from dew.objectives.lm import LMObjective
@@ -29,7 +30,7 @@ from dew.training import MeshSpec
 model = CausalTransformer(vocab_size=512, emb_features=256, num_layers=2,
                           num_heads=4, mlp_features=1024, max_seq_len=64)
 rows = np.random.default_rng(0).integers(0, 512, (16, 65), dtype=np.int32)
-data = Dataset(train=lambda partition: itertools.repeat({"text": rows}), val=None,
+data = Loader(train=lambda partition: itertools.repeat({"text": rows}), val=None,
                records=16, batch=16)
 trainer = Trainer(LMObjective(model, seq_len=64), OptimConfig(learning_rate=1e-3), key=jax.random.key(0),
                   mesh=MeshSpec(fsdp=2, tensor=2))
@@ -169,7 +170,7 @@ An earlier synthetic BF16 bank load of 18.00 GiB (144 layers, width 2048, `bank_
 
 ## Rematerialization
 
-`CausalTransformer(remat=...)` sets which activations of each decoder block the backward pass recomputes and which it keeps. The value is a policy. The default, `None`, recomputes nothing, and `"full"` keeps only the block inputs. The other names in `dew.nn.backbones.decoder_block.REMAT_POLICIES` are `minimal`, `minimal_with_context`, `save_dot_except_mlp`, `save_dot_with_context_except_mlp`, `save_dot_except_mlpwi`, `save_qkv_proj`, `save_out_proj`, `minimal_offloaded` and `qkv_proj_offloaded`. Each keeps some of the named projection outputs (`q_proj`, `k_proj`, `v_proj`, `kv_proj`, `context`, `o_proj`, `gate_proj`, `up_proj`, `down_proj`) or offloads them to host memory. They trade recompute time for memory the same way MaxText's recipes of the same names do. You can also pass a record with your own lists, such as `{"save": ["q_proj", "k_proj", "v_proj"], "offload": ["gate_proj", "up_proj"]}`. Every policy trains the same model. `tools/benchmark_decoder_remat.py --remat <name>` reports the residual and compiler memory of one configuration.
+`CausalTransformer(remat=...)` sets which activations of each decoder block the backward pass recomputes and which it keeps. The value is a policy. The default, `None`, recomputes nothing, and `"full"` keeps only the block inputs. The other names in `dew.nn.backbones.decoder_block.REMAT_POLICIES` are `minimal`, `minimal_with_conv`, `minimal_with_context`, `save_dot_except_mlp`, `save_dot_with_context_except_mlp`, `save_dot_except_mlpwi`, `save_qkv_proj`, `save_out_proj`, `minimal_offloaded` and `qkv_proj_offloaded`. Each keeps some of the named projection outputs (`q_proj`, `k_proj`, `v_proj`, `kv_proj`, `context`, `conv`, `o_proj`, `gate_proj`, `up_proj`, `down_proj`) or offloads them to host memory. They trade recompute time for memory the same way MaxText's recipes of the same names do. You can also pass a record with your own lists, such as `{"save": ["q_proj", "k_proj", "v_proj"], "offload": ["gate_proj", "up_proj"]}`. Every policy trains the same model. `tools/benchmark_decoder_remat.py --remat <name>` reports the residual and compiler memory of one configuration.
 
 ## Batches
 

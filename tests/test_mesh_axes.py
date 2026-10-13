@@ -21,11 +21,11 @@ from recording import RecordingTracker
 from sharded import assert_sharded
 
 from dew.checkpoints import Checkpoints
-from dew.data import Dataset
+from dew.data.dataset import Loader
 from dew.nn.backbones.dit import SimpleDiT
 from dew.nn.blocks import Upsample
 from dew.nn.conv import Conv
-from dew.nn.sharding import declared_axes
+from dew.nn.sharding import declarations, declared_axes
 from dew.nn.ssm import SpatialFusionConv
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
@@ -169,9 +169,10 @@ def test_an_fsdp_step_splits_leading_dimensions_and_moves_no_activation(fused):
                       for shape in shapes if op != "all-gather" or LENGTH in shape)
 
     shardings, text, trained = stepped(MeshSpec(fsdp=2), 2, **delta_layers(fused=fused))
+    declared = declarations(shardings)
     specs = {jax.tree_util.keystr(path): sharding.spec
              for path, sharding in jax.tree_util.tree_leaves_with_path(shardings)
-             if sharding.spec and "kernel" in jax.tree_util.keystr(path) and declared_axes(path, 2)}
+             if sharding.spec and "kernel" in jax.tree_util.keystr(path) and declared_axes(path, 2, declared)}
     assert specs.pop("['lm_head']['kernel']") == P(None, "fsdp")
     assert set(specs.values()) == {P("fsdp")}, specs
     assert moved(text) == moved(stepped(MeshSpec(fsdp=2), 2)[1])
@@ -337,7 +338,7 @@ def run_losses(mesh, layout, steps, microbatches=None):
     trainer = Trainer(
         LMObjective(tiny(), SEQ_LEN), optax.adam(1e-3), key=jax.random.key(0),
         mesh=mesh, layout=layout, microbatches=microbatches, tracker=tracker)
-    state = trainer.fit(Dataset(train=lambda partition: token_batches(), val=None, records=None, batch=BATCH),
+    state = trainer.fit(Loader(train=lambda partition: token_batches(), val=None, records=None, batch=BATCH),
                         steps=steps, log_every=1)
     assert_sharded(state.variables["params"], trainer.device_mesh)
     return [entry["train/loss"] for _, entry in tracker.scalars if "train/loss" in entry]

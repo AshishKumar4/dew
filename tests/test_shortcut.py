@@ -15,7 +15,7 @@ def test_a_run_config_trains_a_shortcut_model_on_its_own_targets():
     from diffusion_stubs import batch_for
 
     from dew.config import ModelConfig, ObjectiveConfig
-    from dew.data import TFDSImages
+    from dew.config.data import ImageData
     from dew.objectives.diffusion import DiffusionRunConfig, TextCondition
     from dew.sampling import Euler
     from dew.training import Trainer
@@ -26,7 +26,7 @@ def test_a_run_config_trains_a_shortcut_model_on_its_own_targets():
             {"patch_size": 2, "emb_features": 16, "num_layers": 1, "num_heads": 2,
              "dtype": "float32", "attention_impl": "xla"},
         ),
-        data=TFDSImages(image_size=4),
+        data=ImageData(source="tfds://oxford_flowers102", image_size=4),
         preset=presets.Shortcut(),
         val_metrics=(),
         text=TextCondition(encoder="char_table", checkpoint="char_table"),

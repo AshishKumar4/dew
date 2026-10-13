@@ -130,45 +130,51 @@ Import `TrainState` from `dew.training`.
 
 `state.averaged` overlays EMA leaves onto `state.variables` and raises when no EMA is configured. For fixed window length K, the accepted fill is `microstep % K`. A partial window is checkpointed without flushing.
 
-## Dataset and Loading
+## Dataset, Pipeline and Loading
 
-Import `Dataset`, `DataPartition` and `Loading` from `dew.data`.
+Import the data values and recipes from `dew.data`.
 
 ```text
+load(recipe_or_alias, *, batch, read="indexed", provision=False, cache=None,
+     objective=None, validation_records=None, seed=0, loading=Loading(workers="auto"), host=())
+compile(train, *, validation=None, host=(), objective=None, read="indexed",
+        provision=False, loading=Loading(), seed=0)
 Dataset(train, val, records, batch, ramp=None)
-Dataset.from_records(records, *, batch, seed=0, validation=None, loading=Loading())
-Dataset.from_grain(train, *, batch, validation=None, records=None, loading=Loading())
-Dataset.from_torch(dataset, *, batch, fields=None, seed=0, validation=None, loading=Loading())
 DataPartition(index=0, count=1, readers=1, reader=0)
-Loading(workers=0, threads=64, read_buffer=128, worker_buffer=2)
+Loading(workers=0, threads=16, read_buffer=16, worker_buffer=2)
 ```
 
-`from_records` reads records held in memory: a mapping of equal-length columns, a sequence of per-record mappings, or a source with `__len__` and `__getitem__`. Its training stream reshuffles from `seed` every epoch and saves a global record position. `validation` is one ordered pass over every record, with its last batch padded by repeated rows that `VALID_ROWS` marks. `from_grain` reads a Grain pipeline the caller built, in the caller's order. `from_torch` reads a map-style `torch.utils.data.Dataset` as `from_records` reads a source, naming a tuple sample's entries with `fields`; it refuses a `DataLoader` and an `IterableDataset`.
+A recipe is a frozen value implementing `Recipe.pipelines()`: it returns the training Pipeline, an optional finite validation Pipeline and common host steps. The aliases are `records`, `text`, `chat`, `prompts`, `preferences`, `images`, `video` and `decisions`. Source URLs belong in `source`; `load` refuses a bare URI.
 
-`train(partition)` opens a training iterator, and `val(partition)` opens one finite validation pass; `val` is `None` when there is no validation data. Each iterator reads the share of every global batch that its `DataPartition` names. The partition splits each batch into `count` disjoint shares; `index` is the share to read; `readers` is the number of processes that read that share alike; and `reader` is which of those processes this one is. `DataPartition.of(mesh)` is the share a process reads on a mesh, and `DataPartition()` is every row.
+`load(..., batch=None, tokens=N, lengths=(...))` selects token-budget batching. It requires record steps declaring `TokenGeometry`; `TokenField.extra` describes an aligned field's additional IDs. The compiled Dataset exposes `batch_tokens`. Row and token budgets are mutually exclusive. Run configurations set TrainerConfig.batch_size=None, batch_tokens and update_tokens, and record the derived update/micro accumulation.
 
-`records` is the known training-record count or `None`, and `batch` is the global batch size. `steps_per_epoch` is records divided by batch with integer division, or `None`. `epoch_steps(epochs=1)` requires a finite record count. `ramp` is set when the run grows its batch over its first records, and `batch` is then the batch size the ramp ends at.
+`Pipeline(source)` is immutable. Its methods add ordered stages: `map`, `random_map`, `map_with_index`, `filter`, `flat_map`, `shuffle`, `repeat`, `slice`, `mix`, `interleave`, `windows`, `pack`, `group`, `batch`, `workers`, `prefetch`, `take`, `cache` and `map_batch`. `batch` takes the global row batch. Host batch steps run after workers in the training process. `compile(..., host=(step,))` applies common steps to both branches.
 
-Each factory call must return a fresh, exclusively owned iterator. Ordinary `close()` is finalization and must not race `next()` or checkpoint operations. A source that needs to interrupt blocking reads may additionally implement `request_stop()`: a thread-safe, nonblocking, idempotent signal, safe alongside both `next()` and `close()`. Tokenized wrappers forward these operations.
+Sources implement `Source`: `Memory` holds records or columns, `Files` opens a format over URLs, `Hub` opens prepared Arrow or physical Hub Parquet shards, `TFDS` opens prepared ArrayRecords, and `Torch` adapts map-style PyTorch samples with explicit tuple field names. A `DataLoader` keeps its own sampler and collator and is refused.
 
-`DevicePrefetchIterator(iterator, mesh, depth=2, source_state=None)` in `dew.training.distributed` takes ownership of `iterator` once construction succeeds, and starts its worker on the first `next()`. Restoring a saved position also happens there, so a restoration failure unwinds through the iterator it already owns. Closing an unused iterator only finalizes it, without a read or a restoration. Use it in a `with` block, or call `close(timeout=5.0)`, even when a loop consumes only a fixed number of batches.
+`read="memory"` materializes deterministic transforms and packing. `read="indexed"` requires a producer index or explicit provisioning. `read="streamed"` reads physical shards. The mode applies to every leaf, including validation. Missing artifacts are named errors unless `provision=True` permits their creation.
 
-Depth must be positive. At most `depth` device batches are queued, plus at most one in flight, not counting the consumer and upstream buffers. `source_state` describes the last delivered batch, never speculative read-ahead. An EOF or a source failure is reported after the batches queued before it. An early close discards unread data and speculative failures, but reports finalization failures.
+`Objective.data()` returns `ObjectiveData`, holding train and evaluation record steps, grouping, and host batch steps for each branch. It does not change `Objective.inputs`. Metadata-dependent steps use `Configured`; the compiler binds their declared facts from the source.
 
-The prefetch worker runs the iteration, the checkpoint operations and the final close of the source. Closing requests cancellation, discards queued batches and joins the worker. A `TimeoutError` means the source read, placement or finalization did not stop when asked. The thread is not killed, and its in-flight references may remain. Cancellation stays requested, and you can retry the close. After close, further iteration stops.
+`HoldOut(records=N)` reserves the source's head, `HoldOut(fraction=f, by="hash")` splits immutable record identities, and `Split(name)` opens a named split. An explicit source or Pipeline is also valid. `validation_records` caps accepted records before the share cut.
 
-Grain limits how cleanly Dew can shut a loader down. The installed `DataLoaderIterator` has no public close, so Dew releases the references it owns without reaching into private iterators or changing the sampling pipeline. In local-record probes the source and child processes are released, but Grain does not promise a deterministic shutdown. Grain also keeps a process-wide thread pool that deletes shared memory. Dew calls `DatasetIterator.close()` on the iteration thread, but shutting down the read executor does not wait for record reads already running. So a blocked upstream read is outside Dew's shutdown guarantee.
+`train(partition)` opens a new training iterator. `val(partition)` opens one finite pass, or is `None` without validation. Its final partial batch is filled with repeats marked by `valid_rows=False`. `DataPartition.of(mesh)` selects the process's share; `DataPartition()` reads all rows.
 
-`Loading` sets Grain's concurrency and buffers for the built-in specifications. The default, which is also Grain's, starts no worker processes and reads with threads of the training process. Raise `workers` once you have measured that the input pipeline is the bottleneck. See [data preparation](../concepts/data.md) for field layouts and process partitioning.
+`records` is the known accepted training-record count or `None`. `batch` is global. `steps_per_epoch` and `epoch_steps` require an authoritative finite count. The compiled `plan` records source snapshots, transforms, ordering, derived layouts, cache generations and topology constraints.
 
-Every dataset specification has `seed` and `loading` as keyword-only fields from `DatasetSpec`, and every one loads with `spec.load(batch=, tokenize=None)`. A specification that writes no captions raises `TypeError` when given a `tokenize` reader, because it cannot use one.
+A global count-preserving or memory-materialized plan resumes across process counts dividing its batch. A streamed, rejecting, expanding or online-packed plan saves exact Grain iterator state per share and refuses topology changes. Volatile fetches cannot claim exact resume before their bytes are persisted.
 
-An image specification takes its validation data from `val_split`, one of the dataset's own splits, limited to `val_batches` batches. With `val_split` unset, it holds out the first `val_batches * batch` records of the training source instead.
+`Loading` changes concurrency without changing record order or draws. Explicit `Loading(workers=0)` reads in the training process. `load` defaults to Grain's memory-budgeted auto tuning. A multiprocessing program needs a main guard.
 
-`Dataset.from_grain(train, *, batch, validation=None, records=None, loading=Loading())` builds a run over Grain pipelines the caller assembled. A `MapDataset` is repeated and cut into the reader's share, and its position is saved as one global record count. A pipeline that is read as it comes is passed as a function of the `DataPartition` that builds the `IterDataset` of that share. That pipeline is batched where it is and reports Grain's own iterator state.
+Each factory returns an exclusively owned iterator. Final `close()` must not race iteration or checkpoint operations. `request_stop()`, where supplied, is a nonblocking signal safe alongside both. The compiler's host stages forward ownership and position.
 
-A token corpus is a directory of `train` and `val` files, either `.bin` files or ArrayRecord shards of token arrays, beside the `meta.json` that `TokenCorpus` reads and writes. `TokenWindows` reads `path` as such a directory and takes whichever store the suffix names, so the same corpus gives the same windows and the same packing plan (`pack=True`) in both. `TokenWindows(hub=HubText(name, split=, column=, tokenizer=, options=))` reads a Hugging Face text split instead, tokenized once into `dew_cache_dir()/tokens`, which is what `dew.data.load("hf/<name>", tokenizer=, seq_len=)` builds.
+`DevicePrefetchIterator(iterator, mesh, depth=2, source_state=None)` in `dew.training.distributed` takes ownership after successful construction. It starts reading and restoring on the first `next()`; closing an unused iterator only finalizes it. Use it in a context manager or call `close(timeout=5.0)`.
 
+Depth is positive. The queue contains at most that many device batches plus one in flight. Saved source state names the last delivered batch, not speculative read-ahead. EOF or failure follows already queued batches; early close discards unread work and reports finalization errors.
+
+The prefetch worker owns iteration, restore and finalization. A timeout leaves cancellation requested and permits retrying close; it does not kill a running source. Grain's read executor does not promise to stop a blocked upstream read, so that remains outside Dew's shutdown guarantee.
+
+`export` writes committed Parquet or ArrayRecord shards and indexes. `publish` fills a deterministic cache prefix and certifies one generation. A filling run never adopts a newly published generation implicitly; a later run names `Generation` explicitly. See [training data](../concepts/data.md) for layouts, sources and publication.
 
 ## Checkpoints
 

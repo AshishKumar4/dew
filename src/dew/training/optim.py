@@ -30,7 +30,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 
-from dew.nn.sharding import LogicalAxes, declared_axes
+from dew.nn.sharding import LogicalAxes, declarations, declared_axes
 
 # Attention stores its projections either as one matrix over the flattened
 # head space or as a dimension per head. The head dimensions count as one
@@ -108,10 +108,12 @@ def muon_weight_dimension_numbers(params):
     Optax reads one spec tree shaped like the parameters and treats a None
     leaf as an AdamW parameter (optax/contrib/_muon.py:660-675).
     """
+    declared = declarations(params)
+
     def leaf(path: jax.tree_util.KeyPath, param: jax.Array, decays: bool):
         if not decays:
             return None
-        axes = declared_axes(path, param.ndim)
+        axes = declared_axes(path, param.ndim, declared)
         if axes is None:
             if param.ndim > 2:
                 raise ValueError(

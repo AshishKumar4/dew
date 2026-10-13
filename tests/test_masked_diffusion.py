@@ -22,7 +22,8 @@ from flax import linen as nn
 from model_support import flat_tree
 
 from dew.checkpoints import Checkpoints
-from dew.data import ByteTokenizer, Dataset
+from dew.data import ByteTokenizer
+from dew.data.dataset import Loader
 from dew.diffusion.discrete import MDLM, Unmask
 from dew.inference import RunProcessor, pipeline
 from dew.interop import Pretrained
@@ -265,7 +266,7 @@ def test_masked_training_resume_publish_and_run_pipeline(masked_source, tmp_path
     rows = jax.device_count()
     batch = {"text": np.full((rows, 8), 7, np.int32)}
     stream = grain.MapDataset.source([batch]).repeat().to_iter_dataset()
-    data = Dataset(train=lambda partition: iter(stream), val=None, records=rows, batch=rows)
+    data = Loader(train=lambda partition: iter(stream), val=None, records=rows, batch=rows)
     checkpoints = Checkpoints(str(tmp_path / "run"))
     key = jax.random.key(19)
     Trainer(objective, optax.sgd(0.05), key=key, checkpoints=checkpoints).fit(
