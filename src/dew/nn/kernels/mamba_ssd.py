@@ -68,6 +68,8 @@ class _Launch(tuning.KernelOp):
 
     config_cls: ClassVar[type[Tiles]] = Tiles
     NAME: ClassVar[str]
+    HEADS: ClassVar[str] = "x"
+    """The argument whose third axis counts the heads a summing kernel's `heads` splits."""
     SPANS: ClassVar[tuple[tuple[str, int] | str | None, ...]] = (None, None, None)
     """What each of `bm`, `bn` and `bk` spans, clipping it: an argument's axis, 'chunk' the chunk
     length, 'state' the flattened state `P * N` of an argument `[..., P, N]` named 'states'."""
@@ -84,7 +86,7 @@ class _Launch(tuning.KernelOp):
         """`tiles` with each block clipped to what it spans and `heads` to a group's."""
         blocks = [block if span is None else min(block, self._size(ba, span))
                   for block, span in zip((tiles.bm, tiles.bn, tiles.bk), self.SPANS, strict=True)]
-        heads = tiles.heads and min(tiles.heads, _operand(ba).shape[2] // ba.arguments["groups"])
+        heads = tiles.heads and min(tiles.heads, ba.arguments[self.HEADS].shape[2] // ba.arguments["groups"])
         return dataclasses.replace(tiles, bm=blocks[0], bn=blocks[1], bk=blocks[2], heads=heads)
 
     def _get_heuristics_config(self, ba) -> Tiles:
@@ -105,7 +107,7 @@ def _operand(ba):
 
 
 def _tiles(blocks, warps: int, stages: int, heads=(0,)) -> frozenset[Tiles]:
-    return frozenset(Tiles(*block, warps, stages, h) for block in blocks for h in heads)
+    return frozenset(Tiles(m, n, k, warps, stages, h) for m, n, k in blocks for h in heads)
 
 
 _MATMUL = frozenset({Tiles(128, 256, 64, 8, 3), Tiles(64, 256, 32, 4, 4), Tiles(128, 128, 32, 4, 4),
@@ -151,25 +153,37 @@ HEURISTICS = {
     "bfloat16": {
         "chunk_cumsum": Tiles(16, 0, 0, 4, 3),
         "chunk_cumsum_bwd": Tiles(16, 0, 0, 4, 3),
-        "chunk_state": Tiles(64, 64, 32, 2, 4),
-        "state_passing": Tiles(256, 0, 0, 4, 3),
-        "bmm_chunk": Tiles(128, 64, 32, 4, 4),
-        "chunk_scan": Tiles(32, 64, 32, 2, 5),
+        "chunk_state": Tiles(64, 128, 64, 8, 3),
+        "state_passing": Tiles(512, 0, 0, 4, 3),
+        "bmm_chunk": Tiles(128, 128, 64, 8, 3),
+        "chunk_scan": Tiles(64, 64, 32, 2, 4),
         "chunk_scan_bwd_dstates": Tiles(64, 128, 32, 4, 4),
         "state_passing_bwd": Tiles(512, 0, 0, 4, 3),
         "chunk_scan_chunk_state_bwd_dx": Tiles(32, 64, 32, 4, 5),
         "chunk_state_bwd_db": Tiles(64, 128, 0, 4, 3, 64),
         "chunk_scan_bwd_dc": Tiles(64, 128, 0, 4, 3, 64),
         "chunk_scan_bwd_dcb": Tiles(64, 64, 0, 4, 3, 64),
-        "bmm_chunk_bwd": Tiles(32, 64, 32, 2, 5),
+        "bmm_chunk_bwd": Tiles(64, 128, 32, 4, 4),
         "chunk_scan_bwd_ddacs_stable": Tiles(64, 32, 0, 4, 3),
     },
 }
-HEURISTICS["float32"] = HEURISTICS["bfloat16"]
-"""Each launch's config without a measurement, by operand dtype: mamba_ssm's own autotuner's pick on
-an H100 at Nemotron 3 Ultra's shapes (one row of 4096 tokens, 256 heads of 64 over 8 groups, a state of
-128, chunks of 128), each summing kernel taking a group's every head as mamba_ssm's SM-count rule
-gives there."""
+HEURISTICS["float32"] = {
+    **HEURISTICS["bfloat16"],
+    "chunk_state": Tiles(64, 64, 32, 2, 4),
+    "bmm_chunk": Tiles(64, 128, 32, 4, 4),
+    "chunk_scan": Tiles(64, 64, 32, 4, 4),
+    "chunk_scan_bwd_dstates": Tiles(64, 64, 32, 2, 4),
+    "chunk_scan_chunk_state_bwd_dx": Tiles(64, 64, 32, 4, 4),
+    "chunk_state_bwd_db": Tiles(64, 64, 0, 4, 3, 64),
+    "chunk_scan_bwd_dc": Tiles(64, 64, 0, 4, 3, 64),
+    "bmm_chunk_bwd": Tiles(128, 64, 32, 4, 4),
+}
+"""Each launch's config without a measurement, by operand dtype: the tuner's pick on an H100 at Nemotron
+3 Ultra's shapes (one row of 4096 tokens, 256 heads of 64 over 8 groups, a state of 128, chunks of 128),
+each summing kernel taking a group's every head. fp32's TF32x3 products want smaller blocks: at bf16's
+picks its launches summed 10.6 ms against 5.9. mamba_ssm's own autotuner picks the same for seven of
+the twelve it tunes; its picks for the chunk state, the state passing, both `C B^T` products and the
+chunk scan ran 4% to 70% slower on the port there (2026-10-13)."""
 
 
 def _limit(c, length: int, chunk: int):
@@ -778,15 +792,15 @@ def _db_kernel(x_ref, dstates_ref, b_ref, dt_ref, da_ref, *refs, batch: int, len
     rows = pl.ds(start + m * bm, bm)
     taken = _from(limit, m * bm)
     bmat = _read(b_ref.at[rows], taken).astype(jnp.float32)
-    same = seq[0][rows] == seq[0][start + chunk - 1] if seq else None
+    # The tokens of the chunk's last document (mamba_ssm's `seq_idx_m == seq_idx_last`).
+    same = seq[0][rows] == seq[0][start + chunk - 1] if seq else True
 
     def head(i, acc):
         h = first + i
         x = _read(x_ref.at[rows, h], taken)
         db = _dot(x, dstates_ref[h].astype(x.dtype), exact=exact)
-        scale = jnp.exp(jnp.minimum(da_ref[h, start + chunk - 1] - da_ref[h, rows], 0.0))
-        if seq:
-            scale = jnp.where(same, scale, 0.0)
+        to_end = jnp.minimum(da_ref[h, start + chunk - 1] - da_ref[h, rows], 0.0)
+        scale = jnp.where(same, jnp.exp(to_end), 0.0)
         db = db * (scale * dt_ref[h, rows])[:, None]
         dacs_ref[h, rows] = jnp.sum(db * bmat, axis=1)
         return acc + db
@@ -852,15 +866,14 @@ def _dc_kernel(dout_ref, states_ref, c_ref, da_ref, *refs, batch: int, length: i
     rows = pl.ds(start + m * bm, bm)
     taken = _from(limit, m * bm)
     cmat = _read(c_ref.at[rows], taken).astype(jnp.float32)
-    same = seq[0][rows] == _earlier(seq[0], start, c) if seq else None
+    # The tokens of the entered state's document (mamba_ssm's `seq_idx_m == seq_idx_prev`).
+    same = seq[0][rows] == _earlier(seq[0], start, c) if seq else True
 
     def head(i, acc):
         h = first + i
         dout = _read(dout_ref.at[rows, h], taken)
         dc = _dot(dout, states_ref[h].astype(dout.dtype), exact=exact)
-        scale = jnp.exp(da_ref[h, rows])
-        if seq:
-            scale = jnp.where(same, scale, 0.0)
+        scale = jnp.where(same, jnp.exp(da_ref[h, rows]), 0.0)
         dc = dc * scale[:, None]
         dacs_ref[h, rows] = jnp.sum(dc * cmat, axis=1)
         return acc + dc
@@ -873,6 +886,7 @@ class ChunkScanBwdDc(_Launch):
     """`chunk_scan_bwd_dc`'s launch (tuning.KernelOp)."""
 
     NAME = "chunk_scan_bwd_dc"
+    HEADS = "dout"
     SPANS = ("chunk", ("c", 3), None)
 
     def _fwd(self, dout, states, c, da, seq, *, chunk: int, groups: int, interpret: bool, config: Tiles,

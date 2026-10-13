@@ -94,28 +94,32 @@ def test_the_port_is_as_exact_as_the_xla_scan(monkeypatch, shape, chunk, documen
                            invariants={"['D']": float(np.sqrt(np.mean(terms ** 2)))})
 
 
-def test_a_mamba2_layer_on_the_port_matches_it_on_xla(monkeypatch):
-    """The layer on the port, packed documents and all: its output and every parameter's gradient
-    the XLA scan's, within fp32 rounding of the chunked algebra."""
-    layer = Mamba2(emb_features=64, num_heads=4, head_dim=16, state_size=16, n_groups=2, chunk_size=32)
-    x = jax.random.normal(jax.random.key(3), (2, 72, 64))
+@pytest.mark.parametrize("dtype, bound", [(jnp.float32, 1e-4), (jnp.bfloat16, 5e-2)])
+def test_a_mamba2_layer_on_the_port_matches_it_on_xla(monkeypatch, dtype, bound):
+    """The layer on the port, packed documents and all, hands the scan its compute dtype: its output
+    and every parameter's gradient the XLA scan's, within fp32 rounding of the chunked algebra in
+    float32 and within bf16 operands' rounding in bfloat16, mamba_ssm's numbers."""
+    layer = Mamba2(emb_features=64, num_heads=4, head_dim=16, state_size=16, n_groups=2, chunk_size=32,
+                   dtype=dtype)
+    x = jax.random.normal(jax.random.key(3), (2, 72, 64)).astype(dtype)
     params = layer.init(jax.random.key(5), x)
     segments = jnp.asarray(np.repeat([[1, 2, 3]], [30, 2, 40], axis=1).repeat(2, axis=0), jnp.int32)
     metadata = AttentionMetadata(coordinates=coordinates(segments=segments))
 
     def loss(params):
-        out = layer.apply(params, x, attention_metadata=metadata)
-        return jnp.sum(out ** 2), out
+        out = jnp.asarray(layer.apply(params, x, attention_metadata=metadata))
+        return jnp.sum(out.astype(jnp.float32) ** 2), out
 
     (_, want), want_grads = jax.jit(jax.value_and_grad(loss, has_aux=True))(params)
     row_names_port(monkeypatch)
     (_, got), got_grads = jax.jit(jax.value_and_grad(loss, has_aux=True))(params)
-    scale = float(jnp.max(jnp.abs(want)))
-    assert float(jnp.max(jnp.abs(got - want))) < 1e-4 * scale
+    assert got.dtype == want.dtype == dtype
+    scale = float(jnp.max(jnp.abs(want.astype(jnp.float32))))
+    assert float(jnp.max(jnp.abs(got.astype(jnp.float32) - want))) < bound * scale
     for path, mine in jax.tree_util.tree_leaves_with_path(got_grads):
         theirs = functools.reduce(lambda node, key: node[key.key], path, want_grads)
         size = float(jnp.max(jnp.abs(theirs)))
-        assert float(jnp.max(jnp.abs(mine - theirs))) < 1e-4 * size, jax.tree_util.keystr(path)
+        assert float(jnp.max(jnp.abs(mine - theirs))) < bound * size, jax.tree_util.keystr(path)
 
 
 @pytest.mark.mesh(devices=2)
