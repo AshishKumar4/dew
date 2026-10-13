@@ -364,24 +364,15 @@ def check_batch(batch: int, mesh: Mesh, spec: MeshSpec) -> None:
         f"microbatch's again; use {' or '.join(suggestions)}")
 
 
-def check_stream(source, mesh: Mesh, spec: MeshSpec, batch: int, window: int, *, rows: bool,
-                 checkpointing: bool) -> None:
-    """Refuse a training stream a run cannot checkpoint or cannot shard.
+def check_stream(source, mesh: Mesh, spec: MeshSpec, batch: int, window: int, *, rows: bool) -> None:
+    """Refuse a training stream a run cannot shard.
 
-    A checkpoint written without the data position would replay the data
-    on resume. A `batch` the mesh cannot divide fails where it is placed or
+    A `batch` the mesh cannot divide fails where it is placed or
     traced (`check_batch`), unless the stream's rows are not the step's
     (`rows`; a rollout's are its own, checked where its step traces), and a
     ramp stage's, for a later stage, an hour in. A ramp reads each stage's
     batch whole, never in a `window` of more than one microbatch.
     """
-    if checkpointing and not isinstance(source, Checkpointable):
-        raise ValueError(
-            f"checkpoint_every needs a training stream with get_state and "
-            f"set_state, and {type(source).__name__} lacks one; a checkpoint "
-            f"written without the data position would replay the data on "
-            f"resume. Train it with checkpoint_every=None "
-            f"(--trainer.checkpoint-every None)")
     if not isinstance(source, RampedStream):
         if rows:
             check_batch(batch, mesh, spec)

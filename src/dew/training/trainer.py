@@ -1652,10 +1652,7 @@ class Trainer(Generic[Loss, Effects]):
             partition = DataPartition.of(mesh)
             run.source = plan.dataset.train(partition)
             check_stream(run.source, mesh, self.mesh, plan.dataset.batch,
-                         self.accumulation * (self._split or 1), rows=self.rollout is None,
-                         checkpointing=bool(plan.checkpoint_every or plan.local_every or (
-                             checkpoints is not None and plan.cadenced and plan.best and
-                             any(not choice.weights_only for choice in plan.best))))
+                         self.accumulation * (self._split or 1), rows=self.rollout is None)
             if isinstance(run.source, RampedStream):
                 # Each stage's batch is read whole: no plan splits a ramp's.
                 self._split = 1
