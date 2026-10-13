@@ -470,11 +470,12 @@ def record(python: str, rows: list[dict], executed_report: Path, common: str) ->
             cache_request(cache_url(python, row_["name"]), token, body)
 
 
-def durations(verdicts: list[dict]) -> dict[str, float]:
+def durations(verdicts: list[dict], before: dict[str, float]) -> dict[str, float]:
     """Each test of the first of green runs' `verdicts`, the newest, at its least time over them all,
     as their floor's Python ran it: what it takes where nothing slows it. A container can run three
     times as slowly as the rest of its run, and a run's compilations can miss the shared cache, and
-    neither moves a test's time. A test the newest run did not have is gone."""
+    neither moves a test's time. A test of a file the newest run ran, which that run did not have, is
+    gone; a file the newest run skipped as unchanged (the test cache) keeps its times from `before`."""
     times: dict[str, list[float]] = {}
     for verdict in verdicts:
         rows = verdict["rows"]
@@ -487,9 +488,12 @@ def durations(verdicts: list[dict]) -> dict[str, float]:
         for row in floor:
             for node, seconds in row["tests"].items():
                 times.setdefault(node, []).append(seconds)
-    newest = {node for row in verdicts[0]["rows"] if row["name"].startswith(f"{PYTHONS[0]}:")
-              for node in row["tests"]}
-    return {node: round(min(seconds), 3) for node, seconds in sorted(times.items()) if node in newest}
+    newest_rows = [row for row in verdicts[0]["rows"] if row["name"].startswith(f"{PYTHONS[0]}:")]
+    newest = {node for row in newest_rows for node in row["tests"]}
+    ran = {parsed_row(row["name"])[1] for row in newest_rows}
+    kept = {node: seconds for node, seconds in before.items() if node.split("::")[0] not in ran}
+    return dict(sorted({**kept, **{node: round(min(seconds), 3) for node, seconds in times.items()
+                                   if node in newest}}.items()))
 
 
 def main() -> int:
@@ -510,7 +514,8 @@ def main() -> int:
                            help="green runs' verdicts, the newest first: armada verdict <sha> --json")
     args = parser.parse_args()
     if args.operation == "durations":
-        recorded = durations([json.loads(path.read_text()) for path in args.verdicts])
+        before = json.loads(DURATIONS.read_text()) if DURATIONS.is_file() else {}
+        recorded = durations([json.loads(path.read_text()) for path in args.verdicts], before)
         DURATIONS.write_text(json.dumps(dict(sorted(recorded.items())), indent=0) + "\n")
         print(f"{len(recorded)} tests, {sum(recorded.values()):.0f} s, in {DURATIONS}")
         return 0
