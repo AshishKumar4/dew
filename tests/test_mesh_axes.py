@@ -16,7 +16,7 @@ import numpy as np
 import optax
 import pytest
 import sharded
-from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+from jax.sharding import AxisType, Mesh, NamedSharding, PartitionSpec as P
 from model_support import TINY_DECODER
 from recording import RecordingTracker
 from sharded import assert_sharded
@@ -279,7 +279,9 @@ def test_a_native_mesh_of_its_own_axes_trains_saves_and_resumes_as_one_device(tm
     over both fsdp levels and the rows over all three axes, and two steps,
     a checkpoint and a resumed third step train what one device trains in
     three, as a `MeshSpec` mesh does. A rule naming an axis the mesh lacks
-    is refused before anything is placed."""
+    is refused before anything is placed. `jax.make_mesh`'s axes are
+    Explicit: its rows split as their type places them, and a parameter
+    the rules put on one is refused by name."""
     layers = delta_layers(fused=False) if hybrid else {}
     native = Mesh(np.asarray(jax.devices()[:8]).reshape(2, 2, 2), ("replica", "zero", "zero2"))
     layout = Layout(rules=NATIVE_RULES, data_axes=("replica", "zero", "zero2"), min_shard=TINY_SHARD)
@@ -303,6 +305,13 @@ def test_a_native_mesh_of_its_own_axes_trains_saves_and_resumes_as_one_device(tm
     misspelt = Layout(rules={**NATIVE_RULES, "embed": "zer0"}, data_axes=layout.data_axes)
     with pytest.raises(ValueError, match="zer0"):
         native_trainer(native, misspelt, None, **layers).fit(data, steps=1)
+
+    typed = native_trainer(jax.make_mesh((8,), ("data",), axis_types=(AxisType.Explicit,)), plain, None,
+                           **layers).fit(data, steps=3)
+    assert_trains_alike(*jax.device_get((typed.variables["params"], whole.variables["params"])))
+    explicit = jax.make_mesh((2, 2, 2), native.axis_names, axis_types=(AxisType.Explicit,) * 3)
+    with pytest.raises(ValueError, match=r"Explicit axes \['zero', 'zero2'\]"):
+        native_trainer(explicit, layout, None, **layers).fit(data, steps=1)
 
 
 @pytest.mark.parametrize(("bytes_per_second", "peak", "platform", "spreads"), [

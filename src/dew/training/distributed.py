@@ -565,11 +565,13 @@ class Layout:
         Flax metadata that a caller's own module attached is removed, because
         the state the trainer creates from these shardings holds plain arrays.
         Raises ValueError when the rules place a leaf on the data, sequence or
-        stage axis (`UNSPLIT_AXES`), or name an axis the mesh lacks.
+        stage axis (`UNSPLIT_AXES`) or on an Explicit axis, or name an axis
+        the mesh lacks.
         """
         self._refuse_unknown(mesh)
         fsdp_size = mesh.shape.get(FSDP_AXIS, 1)
         sharded_devices = math.prod(mesh.shape[axis] for axis in parameter_axes(mesh.axis_names))
+        explicit = set(explicit_axes(mesh))
 
         def leaf_sharding(path, value):
             axes = declared_axes(path, value.ndim)
@@ -580,11 +582,15 @@ class Layout:
                 spec = P()
             else:
                 spec = logical_spec(axes, value.shape, rules=self.axis_rules, mesh=mesh)
-            outside = sorted({axis for entry in spec for axis in mesh_axes(entry)} & set(UNSPLIT_AXES))
-            if outside:
+            placed = {axis for entry in spec for axis in mesh_axes(entry)}
+            if outside := sorted(placed & set(UNSPLIT_AXES)):
                 raise ValueError(
                     f"the rules place {_variable_path(path)} on {outside}; the data and "
                     f"sequence axes split the batch, and the stage axis holds the pipeline")
+            if typed := sorted(placed & explicit):
+                raise ValueError(
+                    f"the rules place {_variable_path(path)} on the Explicit axes {typed}; the "
+                    f"partitioner places parameters, over Auto axes (jax.make_mesh's axis_types)")
             return NamedSharding(mesh, spec)
 
         with self._declared(tree):

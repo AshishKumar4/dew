@@ -539,9 +539,10 @@ def constrain(x: jax.Array, axes: LogicalAxes) -> jax.Array:
     weight. With it fsdp gathers weights and splits rows, as fully sharded
     data parallelism is defined. No mesh in context leaves `x` as it is, and
     under a pipeline's vmap the stage axis takes the vmapped dimension. An
-    Explicit axis stays where `x`'s type places it (`auto_part`)."""
+    Explicit axis stays where `x`'s type places it (`auto_part`), so a mesh
+    of Explicit axes alone leaves `x` as it is too."""
     mesh = jax.sharding.get_abstract_mesh()
-    if mesh.empty:
+    if mesh.empty or mesh.are_all_axes_explicit:
         return x
     return jax.lax.with_sharding_constraint(x, auto_part(logical_spec(axes, x.shape), mesh))
 
