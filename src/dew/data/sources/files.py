@@ -94,7 +94,7 @@ def _mount_root(paths: Sequence[str]) -> str:
 
 def _version(fs: AbstractFileSystem, path: str) -> str:
     """A file's version as every host holding a copy names it (`content_version`)."""
-    return content_version(fs, path, fs.size(path)) if local(fs) else str(fs.ukey(path))
+    return content_version(fs, path, int(fs.info(path)["size"])) if local(fs) else str(fs.ukey(path))
 
 
 def _fragment_rows(fragment) -> int:
@@ -248,7 +248,8 @@ class Files(Dataset):
             )
             if version is None and local(fs):
                 # About 4 MiB read over the whole store, each file's first and last blocks at least.
-                version = content_version(fs, path, metadata["size"], blocks=max(2, 64 // len(resolved)))
+                version = content_version(fs, path, integer(metadata["size"], "size"),
+                                          blocks=max(2, 64 // len(resolved)))
             elif version is None:
                 version = fs.ukey(path)
             files.append(
