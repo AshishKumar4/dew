@@ -1078,6 +1078,17 @@ Engine's `transformer_engine.jax.flax.DotProductAttention` (built from source fo
 FlashAttention-2 wheel rebuilt for sm90, and torch's `F.scaled_dot_product_attention` under the cuDNN
 backend and `kernels.get_kernel("kernels-community/flash-attn3").flash_attn_func`.
 
+### Heads of 64 on the H100, 2026-10-13
+
+'auto' sends a call of heads up to 64 wide that cuDNN would take to tokamax's Pallas-Triton kernel
+(`triton_runs`), measured faster than cuDNN on an RTX 4080 and as fast as FlashAttention-2 on an
+A100. On an H100 SXM at Llama-3.2-1B's attention (4 x 4096 tokens, 32 query heads over 8 of 64,
+causal, bf16, jax 0.11.2, tokamax 0.0.15) forward and backward took 4.44 ms on it, 2.78 on cuDNN and
+2.17 on FlashAttention-3, which a 1B FSDP step on two H100s spent 82 of 301 ms on. So sm90's row
+names flash for those heads (`attention_narrow`). The rows reproduce with `PYTHONPATH=src python
+tools/benchmark_attention.py --implementations triton flash cudnn --sequence-lengths 4096
+--head-dims 64 --batch-size 4 --heads 32 --kv-groups 4 --causal True`.
+
 ### FlashAttention-2 on the RTX PRO 6000, 2026-10-11
 
 At Qwen3.5's attention (B 2 and 4 x 3072 tokens, 16 query and 4 key heads of 256, causal bf16), where
@@ -3181,7 +3192,7 @@ I also timed one bf16 `ExpertMLP` layer forward plus backward under `MeshSpec(fs
 
 ### Rematerialization: the trainer's ladder
 
-A model's `remat` is where its step starts, and the trainer moves it up one rung whenever the compiled step does not fit its devices' memory. A decoder goes from none to `'minimal'` (MaxText's name: every projection output kept) to `'full'`, and a diffusion backbone from `False` to `'dots'` (matmul outputs and the attention forward kept) to `'full'`. At each rung the head keeps its whole logits first and is tiled second. Each rung is slower and smaller, so the first that fits is the fastest that runs at that batch.
+A model's `remat` is where its step starts, and the trainer moves it up one rung whenever the compiled step does not fit its devices' memory. A decoder goes from none to `'minimal_with_conv'` (MaxText's `'minimal'` and a linear-attention or SSM layer's short conv output kept; a decoder without such layers skips it, as it would compile the same step) to `'minimal'` (every projection output kept) to `'full'`, and a diffusion backbone from `False` to `'dots'` (matmul outputs and the attention forward kept) to `'full'`. At each rung the head keeps its whole logits first and is tiled second. Each rung is slower and smaller, so the first that fits is the fastest that runs at that batch.
 
 The trainer also plans the batch (`dew.training.planning`). Unless the run fixes `--trainer.split`, a step that does not fit whole is read in microbatches, every split-th row so no row leaves its device, with a window that pools them into the same update. The search compiles the batch whole, then the largest split at each rung until one fits, then halves toward the fewest microbatches at that rung. When the plan splits, `fit` also compiles the batch whole one remat rung up with the head tiled, times both for 10 steps after 2 of warmup, and keeps the faster one. Fewer rows do not always win. On an A100-40, Qwen3.5-0.8B's full fine-tune at 8 x 3072 ran 1205.6 ms a step in four microbatches without remat and 1174.1 ms whole under `'minimal'`. The plan, every compile it made and both times are in `StepCompiled.plan`, and the choice is recorded beside the compilation cache.
 
