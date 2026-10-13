@@ -135,7 +135,7 @@ decorator==5.3.1
     #   moviepy
 defusedxml==0.7.1
     # via nltk
-dew-flash-attn-cu12==0.1.0
+dew-flash-attn-cu12==0.3.0
     # via dewml (pyproject.toml)
 diffusers==0.34.0
     # via dewml (pyproject.toml)
