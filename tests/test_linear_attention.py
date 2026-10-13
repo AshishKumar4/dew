@@ -138,22 +138,25 @@ def test_the_chunked_and_recurrent_forms_agree(reference):
     assert largest(chunked_state, recurrent_state) < 1e-5
 
 
+@pytest.mark.parametrize("strong", [False, True], ids=["drawn decay", "strong decay"])
 @pytest.mark.parametrize("decay_width", [1, 8], ids=["per head", "per key dimension"])
-def test_the_chunked_rule_runs_packed_documents_as_each_runs_alone(decay_width):
-    """Packed documents in the chunked rule, one starting on a chunk's first token, one mid-chunk and
-    one spanning chunks: each document's output, the final memory and every gradient within fp32
-    rounding of the documents run one by one in float64, the row's first document from the row's
-    memory and every other from zero, for a decay per head (the gated delta net) and per key
-    dimension (Kimi's delta attention)."""
+def test_the_chunked_rule_runs_packed_documents_as_each_runs_alone(decay_width, strong):
+    """Packed documents in the chunked rule, one starting on a chunk's first token, one four tokens
+    before a chunk's end and one spanning chunks: each document's output, the final memory and every
+    gradient within fp32 rounding of the documents run one by one in float64, the row's first
+    document from the row's memory and every other from zero, for a decay per head (the gated delta
+    net) and per key dimension (Kimi's delta attention). At a strong decay (-4 a token) the chunk's
+    earlier document sits 96 below its last one's, past exp's fp32 range."""
     batch, length, heads, width, chunk = 1, 160, 2, 8, 32
-    begins = (0, 32, 45, 110)
+    begins = (0, 32, 60, 110)
     starts = np.zeros((batch, length), bool)
     starts[0, list(begins[1:])] = True
     keys = jax.random.split(jax.random.key(23), 8)
     q = l2norm(jax.random.normal(keys[0], (batch, length, heads, width)))
     k = l2norm(jax.random.normal(keys[1], (batch, length, heads, width)))
     v = jax.random.normal(keys[2], (batch, length, heads, width))
-    g = -jnp.exp(jax.random.normal(keys[3], (batch, length, heads, decay_width)) - 2.0)
+    g = (jnp.full((batch, length, heads, decay_width), -4.0) if strong else
+         -jnp.exp(jax.random.normal(keys[3], (batch, length, heads, decay_width)) - 2.0))
     beta = jax.nn.sigmoid(jax.random.normal(keys[4], (batch, length, heads)))
     h0 = 0.1 * jax.random.normal(keys[5], (batch, heads, width, width))
     do = jax.random.normal(keys[6], v.shape)
