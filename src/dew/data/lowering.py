@@ -45,6 +45,7 @@ from dew.data.pipeline import (
     Artifact,
     Batched,
     BatchStage,
+    Expansion,
     Filter,
     FlatMap,
     Group,
@@ -123,7 +124,9 @@ def _outputs(
     if isinstance(stage, Filter):
         return (value if stage.predicate(record(value, "filter input")) else Rejected(stage.reason),)
     if isinstance(stage, FlatMap):
-        return tuple(stage.step.flat_map(record(value, "flat_map input"))) or (Rejected("empty_expansion"),)
+        element = record(value, "flat_map input")
+        outputs = stage.step.flat_map(element) if isinstance(stage.step, Expansion) else stage.step(element)
+        return tuple(outputs) or (Rejected("empty_expansion"),)
     if isinstance(stage, RandomMap):
         if rng is None:
             raise ValueError(f"random step {_identity(stage).name} needs a record rng")
@@ -716,7 +719,7 @@ class _Build:
         if isinstance(rows, pygrain.MapDataset):
             if self.training and self.lowering.endless and not self.lowering.repeated:
                 rows = rows.repeat(None)
-            elif self.training and not self.lowering.endless:
+            elif self.training and not self.lowering.endless and drop:
                 rows = rows[: len(rows) // batch_stage.size * batch_stage.size]
             whole = rows
             rows = rows[offset + partition.index :: partition.count]
@@ -733,7 +736,7 @@ class _Build:
             stream = _as_iter(rows, self.loading).batch(
                 size, drop_remainder=drop, batch_fn=_Batched(batch_stage.batch_fn)
             )
-        if not self.training and fill:
+        if not drop and fill:
             stream = stream.map(
                 _FillShare(partition, batch_stage.size) if canonical else FilledBatch(size, real=not empty)
             )
