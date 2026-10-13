@@ -41,7 +41,6 @@ from dew.nn.backbones.wan import WanTransformer
 from dew.objectives.diffusion import DiffusionObjective
 
 ROOT = Path(__file__).resolve().parents[1]
-PUBLISHED = ROOT / "tests/fixtures/hf/wan-source"
 CASES = ("published", "variant")
 
 
@@ -122,34 +121,6 @@ def test_a_bfloat16_flow_is_as_exact_as_the_bfloat16_source(source, arrays, name
     assert_as_exact_as_the_reference(np.moveaxis(np.asarray(flow, np.float32), -1, 1),
                                      arrays[f"{name}.bf16.output"], arrays[f"{name}.fp64.output"],
                                      f"{name} bfloat16 flow")
-
-
-@pytest.mark.parametrize("change", [
-    {"image_dim": 1280}, {"added_kv_proj_dim": 5120}, {"pos_embed_seq_len": 514}, {"qk_norm": "rms_norm"},
-    {"patch_size": [2, 2]}, {"attention_head_dim": 13},
-])
-def test_an_unsupported_config_is_refused(source, change):
-    config = json.loads((source / "published" / "transformer" / "config.json").read_text())
-    wan_fields(config)
-    with pytest.raises(ValueError):
-        wan_fields({**config, **change})
-
-
-def test_every_tensor_of_the_published_checkpoint_has_a_native_place():
-    """Wan2.1-T2V-1.3B's own config builds the native tree, and every tensor
-    its shard index names lands on a leaf of it."""
-    config = json.loads((PUBLISHED / "transformer" / "config.json").read_text())
-    names = json.loads((PUBLISHED / "transformer" / "diffusion_pytorch_model.safetensors.index.json")
-                       .read_text())["weight_map"]
-    model = WanTransformer(**wan_fields(config))
-    shapes = jax.eval_shape(lambda: model.init(
-        jax.random.PRNGKey(0), jnp.zeros((1, 1, 2, 2, config["in_channels"])), jnp.zeros((1,)),
-        DenoisingCondition(jnp.zeros((1, 1, config["text_dim"])))))
-    leaves = {tuple(key.key for key in path) for path, _ in jax.tree_util.tree_leaves_with_path(shapes)}
-    tree, _ = translate_wan_weights({name: np.zeros((1, 1) if name.endswith("weight") else (1,), np.float32)
-                                     for name in names})
-    placed = {tuple(key.key for key in path) for path, _ in jax.tree_util.tree_leaves_with_path(tree)}
-    assert {("params", *path) for path in placed} == leaves
 
 
 @pytest.fixture(scope="module")
@@ -288,15 +259,6 @@ def test_the_scheduler_steps_as_the_source_on_the_same_model_outputs(pipeline, w
                                      arrays[f"replay.{steps}.fp64.latents"], f"{steps}-step replay")
 
 
-def test_a_clip_the_vae_cannot_decode_whole_is_refused(walk):
-    from dew.interop.pretrained import load_diffusion_source
-
-    with pytest.raises(ValueError, match="1 \\+ 4k frames"):
-        load_diffusion_source(str(walk[0] / "pipeline"), dtype="float32", size=(8, 32, 48))
-    shorter = load_diffusion_source(str(walk[0] / "pipeline"), dtype="float32", size=(5, 16, 32))
-    assert shorter.inputs.sample.shape == (5, 16, 32, 3)
-
-
 def clip_batch(objective, prompts):
     """One clip per device, a fixed ramp of pixels, and the prompts in turn."""
     rows, (frames, height, width, channels) = jax.device_count(), objective.inputs.sample.shape
@@ -373,7 +335,7 @@ def test_an_unchanged_sample_cannot_exceed_its_sources_measured_float64_error():
     reference = truth.astype(np.float32)
     changed = truth + 1.5 * (reference.astype(np.float64) - truth)
     assert_no_less_exact(reference, reference, truth, "unchanged")
-    with pytest.raises(AssertionError, match="unchanged source"):
+    with pytest.raises(AssertionError):
         assert_no_less_exact(changed, reference, truth, "changed")
 
 

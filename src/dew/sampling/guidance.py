@@ -33,7 +33,7 @@ steps [int(start N), int(stop N)), which converts to
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from fractions import Fraction
 from typing import Any, Protocol, runtime_checkable
 
@@ -357,10 +357,9 @@ class Autoguidance:
         if "guide" not in denoise.params:
             raise ValueError("autoguidance reads its guide's variables under `guide` in the "
                              "denoiser's variables")
-        main = Denoiser(denoise.process, denoise.model,
-                        {name: tree for name, tree in denoise.params.items() if name != "guide"},
-                        denoise.conditions)
-        guide = Denoiser(denoise.process, self.model, denoise.params["guide"], denoise.conditions)
+        main = replace(denoise, unconditional=None,
+                       params={name: tree for name, tree in denoise.params.items() if name != "guide"})
+        guide = replace(denoise, model=self.model, params=denoise.params["guide"], unconditional=None)
         scales = _scales(self.scale, self.interval, steps)
 
         def guided(scale):

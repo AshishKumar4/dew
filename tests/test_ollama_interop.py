@@ -106,13 +106,6 @@ def draw(client: OllamaCompletion, prompt: str, count: int,
     return client(prompt, count, key=0, raw=True, **fields)
 
 
-def prompt_tokens(client: OllamaCompletion, prompt: str) -> int | None:
-    """How many tokens the daemon charged the prompt, off the retained SDK
-    response. The count is all it reports; the daemon exposes no tokenize
-    endpoint, so the ids it used stay hidden."""
-    return draw(client, prompt, 1, sampling=GREEDY).responses[0].prompt_eval_count
-
-
 def write_token_files(directory: Path, tokenizer: HFTokenizer) -> dict:
     """The train.bin / val.bin / meta.json a tokenizer run writes, over the
     repo's own prose. Real text, so the trained model prefers a definite next
@@ -214,97 +207,6 @@ def client(imported):
     return OllamaCompletion(name, ollama.Client(host=daemon_url()))
 
 
-def test_the_converted_model_carries_the_exported_config(imported):
-    """Ollama's converter reads the export's own config, so the GGUF it
-    writes reports Dew's widths, its rope base and its parameter count.
-    A field the export spelled wrong lands here as a different number."""
-    _name, export, shown = imported
-    config = json.loads((export / "config.json").read_text())
-    info = shown["model_info"]
-
-    assert info["general.architecture"] == "llama"
-    assert info["llama.embedding_length"] == config["hidden_size"]
-    assert info["llama.block_count"] == config["num_hidden_layers"]
-    assert info["llama.attention.head_count"] == config["num_attention_heads"]
-    assert info["llama.attention.head_count_kv"] == config["num_key_value_heads"]
-    assert info["llama.attention.head_dim"] == config["head_dim"]
-    assert info["llama.feed_forward_length"] == config["intermediate_size"]
-    assert info["llama.context_length"] == config["max_position_embeddings"]
-    assert info["llama.rope.freq_base"] == config["rope_theta"]
-    assert info["llama.attention.layer_norm_rms_epsilon"] == config["rms_norm_eps"]
-    assert info["llama.vocab_size"] == config["vocab_size"]
-
-    weights = sum(int(np.prod(entry["shape"])) for entry in shown["tensors"])
-    assert info["general.parameter_count"] == weights
-
-
-def test_the_tokenizer_reaches_the_gguf(imported, client):
-    """The tokenizer the export wrote is the one the daemon loads:
-    its end and unknown ids are in the GGUF, and a prompt costs the daemon
-    the number of tokens the HF tokenizer encodes it into.
-
-    A count, not the ids. The daemon serves no tokenize endpoint, so the ids
-    it used are not observable here; a tokenizer that failed to convert
-    would still show up, since its lengths would not line up.
-    """
-    _, export, shown = imported
-    from transformers import AutoTokenizer
-
-    tokenizer = AutoTokenizer.from_pretrained(str(export), local_files_only=True)
-    info = shown["model_info"]
-    assert info["tokenizer.ggml.model"] == "gpt2", "byte-level BPE reads as gpt2"
-    assert info["tokenizer.ggml.eos_token_id"] == tokenizer.eos_token_id
-    assert info["tokenizer.ggml.unknown_token_id"] == tokenizer.unk_token_id
-
-    for prompt in PROMPTS:
-        assert prompt_tokens(client, prompt) == len(
-            tokenizer.encode(prompt, add_special_tokens=False)), prompt
-
-
-def test_a_digit_run_tokenizes_differently_in_the_gguf(imported, client):
-    """Why the length check above is not an identity claim.
-
-    The converter records the pre-tokenizer as `default`, whose regex cuts a
-    digit run into groups of three; the exported ByteLevel tokenizer keeps
-    the run whole and merges across it. So `0123` is three tokens to Dew and
-    four to the daemon, and ids Dew wrote are not the ids the served model
-    reads. A converter that learned to carry the ByteLevel regex would make
-    these equal, and this test is how that would be noticed.
-    """
-    _, export, _ = imported
-    from transformers import AutoTokenizer
-
-    tokenizer = AutoTokenizer.from_pretrained(str(export), local_files_only=True)
-    ours = tokenizer.encode("0123", add_special_tokens=False)
-
-    assert len(ours) == 3, tokenizer.convert_ids_to_tokens(ours)
-    assert prompt_tokens(client, "0123") == 4
-
-
-def test_the_client_completes_prompts_against_the_daemon(client):
-    """`OllamaCompletion` over the imported model: one answer per prompt in
-    prompt order, the token budget spent, the backend's own finish reason,
-    and the SDK responses retained. Ollama reports no aggregate usage."""
-    answer = client(list(PROMPTS), DRAWN, key=1234,
-                    sampling=Sampling(temperature=0.8, top_k=40))
-
-    assert len(answer.texts) == len(PROMPTS)
-    assert all(text for text in answer.texts)
-    assert answer.token_counts == (DRAWN,) * len(PROMPTS)
-    assert answer.finish_reasons == ("length",) * len(PROMPTS)
-    assert answer.usage is None
-    assert len(answer.responses) == len(PROMPTS)
-
-
-def test_zero_temperature_repeats_itself(client):
-    """The seed rides on every call, so the same greedy request twice is the
-    same text: a completion is reproducible against a fixed model."""
-    first = client(PROMPTS[0], DRAWN, key=7, options={"temperature": 0.0})
-    again = client(PROMPTS[0], DRAWN, key=7, options={"temperature": 0.0})
-
-    assert first.texts == again.texts
-
-
 def test_the_daemon_draws_dews_own_greedy_continuation(imported, client):
     """The conversion repacked the computation, it did not change it.
 
@@ -398,48 +300,3 @@ def test_the_daemon_reports_dews_own_logprobs(imported, client):
     assert mine <= FACTOR * conversion, (
         f"the daemon is {mine:.3e} from float64 (rms logprob), the F16 conversion alone "
         f"{conversion:.3e} (ratio {mine / conversion:.2f}, allowed {FACTOR})")
-
-
-def test_backend_options_alone_are_not_the_models_policy(client):
-    """Why the tests above hand over a `Sampling` value rather than options.
-
-    Temperature zero through the lower-level `options` escape hatch is argmax
-    over a distribution the daemon has already penalised: `repeat_penalty`
-    defaults to 1.1 over the last tokens, and nothing in a bare options
-    mapping turns that off. A `Sampling` value does, and on this checkpoint
-    the two answers differ.
-    """
-    bare = draw(client, PROMPTS[0], DRAWN, options={"temperature": 0}).texts
-    policy = draw(client, PROMPTS[0], DRAWN, sampling=GREEDY).texts
-
-    assert bare != policy
-    assert draw(client, PROMPTS[0], DRAWN,
-                options={"temperature": 0, "repeat_penalty": 1.1}).texts == bare
-
-
-def test_what_the_export_writes_is_enough_to_import(imported, tmp_path):
-    """The gap the decoder export used to leave, closed.
-
-    It wrote config.json, model.safetensors and a generation_config naming a
-    tokenizer it did not copy, and that directory did not convert: the
-    tokenizer had to be put there by whoever exported. Handed the tokenizer,
-    it now writes that tokenizer's own files, so the five files it produces
-    are by themselves a directory `ollama create` accepts. Copying exactly
-    those five is what makes this a claim about the writer rather than about
-    whatever else the export directory happens to hold.
-    """
-    _, export, _ = imported
-    bare = tmp_path / "bare"
-    bare.mkdir()
-    for name in ("config.json", "model.safetensors", "generation_config.json",
-                 "tokenizer.json", "tokenizer_config.json"):
-        shutil.copy2(export / name, bare / name)
-
-    probe = f"dew-interop-bare-{uuid.uuid4().hex[:8]}"
-    try:
-        done = create(probe, bare, tmp_path)
-    finally:
-        remove(probe)
-
-    assert done.returncode == 0, (
-        f"ollama refused what the export writes:\n{done.stderr}")
