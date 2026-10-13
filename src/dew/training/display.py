@@ -200,8 +200,9 @@ class TrainingDisplay:
     pace: collections.deque = dataclasses.field(default_factory=lambda: collections.deque(maxlen=24))
     # Metrics by group, then by logged name, in the order first logged.
     groups: dict[str, dict[str, Row]] = dataclasses.field(default_factory=dict)
-    # Each split's evaluations, in the order they completed.
-    evaluations: dict[str, list[Evaluation]] = dataclasses.field(default_factory=dict)
+    # Each split's last `TREND` evaluations, in the order they completed,
+    # scores only: the trackers keep the previews.
+    evaluations: dict[str, collections.deque[Evaluation]] = dataclasses.field(default_factory=dict)
     # Whether evaluation scores the objective's EMA, which each split's label says.
     averaged: bool = False
     phase: str = ""
@@ -293,7 +294,8 @@ class TrainingDisplay:
 
     def evaluation(self, evaluation: Evaluation) -> None:
         self.phase = ""
-        self.evaluations.setdefault(evaluation.split, []).append(evaluation)
+        self.evaluations.setdefault(evaluation.split, collections.deque(maxlen=TREND)).append(
+            dataclasses.replace(evaluation, previews=()))
         if self.live is not None:
             return
         counts = f"{evaluation.records} records in {evaluation.elapsed_seconds:.2f} s"
