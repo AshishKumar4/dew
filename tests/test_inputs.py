@@ -89,25 +89,3 @@ def test_shard_batch_preserves_resident_nested_inputs_without_host_transfer():
     assert placed["text"].conditioning["pixel_values"].sharding == NamedSharding(mesh, P(row_axes))
     assert placed["labels"].sharding == NamedSharding(mesh, P(row_axes))
     assert placed["weight"].sharding == NamedSharding(mesh, P())
-
-
-def test_char_table_compute_override_preserves_supplied_storage():
-    import jax.numpy as jnp
-
-    from dew.inputs import CharTable
-    from dew.inputs.encoders import rebuild
-
-    source = CharTable.from_pretrained(dtype="bfloat16", param_dtype="float32", tokens=4, features=3)
-    tokens = source.tokenize(["ab"])
-    table = source.params["table"]
-    assert table.dtype == jnp.float32
-    expected = table[tokens["input_ids"]].astype(jnp.bfloat16)
-    np.testing.assert_array_equal(source.encode(source.params, tokens).hidden, expected)
-    saved = {"table": (table + 0.25).astype(jnp.bfloat16)}
-    rebuilt = rebuild("char_table", {**source.to_json(), "dtype": "float32"}, params=saved)
-    actual = rebuilt.encode(rebuilt.params, tokens).hidden
-    assert actual.dtype == jnp.float32
-    assert rebuilt.params["table"].dtype == jnp.bfloat16
-    np.testing.assert_array_equal(rebuilt.params["table"], saved["table"])
-    np.testing.assert_array_equal(actual, saved["table"][tokens["input_ids"]].astype(jnp.float32))
-

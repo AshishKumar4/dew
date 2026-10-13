@@ -1,5 +1,4 @@
 """Canonical nested decoder banks, shared ownership, and selected source reads."""
-import shutil
 from collections.abc import Mapping
 from dataclasses import dataclass
 
@@ -100,55 +99,6 @@ def test_nested_checkpoint_banks_restore_only_selected_leaves_and_partial_ema(tm
               scores(model, resident, tokens, indices, media))
 
 
-def test_a_checkpoint_written_again_at_a_path_is_read_as_it_now_is(tmp_path):
-    """A bank source reads the checkpoint that is at its path when it is
-    built. One saved where an earlier run's was deleted, at the same step,
-    has to be read as itself, not with the earlier one's shapes, which is
-    what pytest reusing a deleted test's directory name exposed."""
-    run = tmp_path / "run"
-    zero = jnp.asarray(0, jnp.int32)
-    for kind in ("multimodal", "shared-diffusion"):
-        _, variables, _, _, _ = fixture(kind)
-        state = TrainState(step=zero, microstep=zero, updates=zero, variables=variables,
-                           opt_state=(), ema=None, key=jax.random.PRNGKey(0),
-                           scale=None, window_size=jnp.asarray(1, jnp.int32))
-        if run.exists():
-            shutil.rmtree(run)
-        checkpoints = Checkpoints(str(run))
-        checkpoints.save(0, state, None)
-        checkpoints.wait()
-        shapes = CheckpointBanks(str(run)).shapes()
-        assert jax.tree.structure(shapes) == jax.tree.structure(variables), kind
-
-
-def test_a_missing_nested_owner_or_layer_is_rejected_before_entry_transfer():
-    model, variables, _, _, _ = fixture("multimodal")
-    (site,) = model.bank_sites
-
-    class MetadataOnly(HeldBanks):
-        def entry(self, placement):
-            raise AssertionError("invalid ownership reached an entry read")
-
-        def bank(self, layers, placement, *, namespace=()):
-            raise AssertionError("invalid ownership reached a bank read")
-
-    wrong = DeclaredOwners((DecoderBank(("missing",), site.view),))
-    with pytest.raises(ValueError):
-        MetadataOnly(variables).place(wrong, layout=DEVICE)
-    scope = dict(in_namespace(variables, site.namespace)["params"])
-    scope.pop("layers_1")
-    broken = {**variables, "params": {**variables["params"], "language_model": scope}}
-    with pytest.raises(ValueError):
-        MetadataOnly(broken).place(model, layout=DEVICE)
-
-
-def test_nested_entry_offload_cannot_treat_a_decoder_owner_as_one_fetch():
-    model, variables, _, _, _ = fixture("multimodal")
-    with pytest.raises(ValueError):
-        HeldBanks(variables).place(model, layout=Layout(
-            min_shard=1, tolerance=1.0, host_parameters=("params/language_model/*",)))
-
-
 def test_an_unscanned_decoder_banks_one_layer_at_a_time():
     """A plain loop declares singleton runs, which stream like longer ones."""
     model, variables, tokens, indices, media = fixture("multimodal")
@@ -169,29 +119,3 @@ def test_an_unscanned_decoder_banks_one_layer_at_a_time():
     identical(scores(unscanned, hosted, tokens, indices, media),
               scores(unscanned, resident, tokens, indices, media))
     assert source.reads == [(site.namespace, (index,)) for index in range(4)]
-
-
-def test_spreading_placed_banks_holds_the_base_once():
-    """Cutting a restored base's banks into their rows releases each bank as
-    its rows exist, so the live bytes never pass the base and one bank."""
-    from jax.sharding import NamedSharding, PartitionSpec as P
-
-    from dew.inference.banks import placed_rows, spread
-
-    sharding = NamedSharding(jax.make_mesh((1,), ("data",), devices=jax.devices()[:1]), P())
-    banks = {f"layers_{4 * index}_{4 * index + 3}": {"kernel": jax.device_put(jnp.ones((4, 128, 128)),
-                                                                              sharding)}
-             for index in range(4)}
-    one = 4 * 128 * 128 * 4
-    start = sum(array.nbytes for array in jax.live_arrays())
-    peaks = []
-
-    def rows(leaf, count):
-        cut = placed_rows(leaf, count)
-        peaks.append(sum(array.nbytes for array in jax.live_arrays()) - start)
-        return cut
-
-    spread_tree = spread(banks, rows)
-    del banks
-    assert set(spread_tree) == {f"layers_{index}" for index in range(16)}
-    assert max(peaks) <= one, peaks

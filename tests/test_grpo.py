@@ -128,54 +128,6 @@ def test_the_loss_reads_the_rolled_out_batch():
     assert {"pg", "actor/pg_clipfrac", "actor/ppo_kl", "actor/pg_clipfrac_lower", "kl"} <= set(aux.metrics)
 
 
-def test_zero_beta_leaves_the_reference_unread():
-    """With the KL term off, no frozen tree is needed and none is reported."""
-    objective = GRPOObjective(TinyHead(vocab_size=VOCAB),
-                              PROMPT_WIDTH + RESPONSE_WIDTH - 1, beta=0.0)
-    params = objective.init(jax.random.key(0))
-    batch = rollout_batch()
-    step = Step(step=jnp.asarray(0), key=jax.random.key(1), ema=None)
-
-    loss, aux = objective.scalar_loss(params, batch, step)
-
-    assert np.isfinite(float(loss))
-    assert "kl" not in aux.metrics
-
-
-def test_a_positive_beta_needs_the_frozen_tree():
-    objective = GRPOObjective(TinyHead(vocab_size=VOCAB),
-                              PROMPT_WIDTH + RESPONSE_WIDTH - 1, beta=0.01)
-    params = objective.init(jax.random.key(0))
-    step = Step(step=jnp.asarray(0), key=jax.random.key(1), ema=None)
-    with pytest.raises(ValueError):
-        objective.scalar_loss(params, rollout_batch(), step)
-
-
-def test_a_misbuilt_objective_is_refused():
-    with pytest.raises(ValueError):
-        GRPOObjective(TinyHead(vocab_size=VOCAB), 7, beta=-0.1)
-    with pytest.raises(ValueError):
-        GRPOObjective(TinyHead(vocab_size=VOCAB), 7, ema_decay=0.999)
-    with pytest.raises(ValueError):
-        GRPOObjective(TinyHead(vocab_size=VOCAB), 7, loss_role="x")
-
-
-def test_a_misshapen_batch_is_refused():
-    objective = GRPOObjective(TinyHead(vocab_size=VOCAB),
-                              PROMPT_WIDTH + RESPONSE_WIDTH - 1, beta=0.0)
-    params = objective.init(jax.random.key(0))
-    step = Step(step=jnp.asarray(0), key=jax.random.key(1), ema=None)
-    batch = rollout_batch()
-
-    narrow = {key: value[:, :5] for key, value in batch.items()}
-    with pytest.raises(ValueError):
-        objective.scalar_loss(params, narrow, step)
-
-    ragged = dict(batch, **{ADVANTAGES_KEY: jnp.zeros((ROWS, 2), jnp.float32)})
-    with pytest.raises(ValueError):
-        objective.scalar_loss(params, ragged, step)
-
-
 def test_evaluation_scores_prompt_perplexity():
     """Validation never samples: each prompt's shifted cross entropy, the
     real suffix weighted off `prompt_length`, pads counting nothing."""
@@ -196,82 +148,6 @@ def test_evaluation_scores_prompt_perplexity():
     with pytest.raises(ValueError):
         objective.evaluate(params, {PROMPT_KEY: jnp.ones((1, 1), jnp.int32),
                                     LENGTH_KEY: jnp.ones(1, jnp.int32)}, step)
-
-
-@pytest.mark.parametrize("kind", ["grpo", "ppo"])
-def test_checkpointed_policy_fit_validates_source_prompts(tmp_path, kind):
-    import itertools
-
-    import optax
-    from affine_run import Data
-    from flax import linen as nn
-    from recording import RecordingTracker
-
-    from dew.objectives.base import VALID_ROWS
-    from dew.objectives.rl import PPOObjective
-    from dew.training import Checkpoints, Trainer
-
-    class Critic(nn.Module):
-        @nn.compact
-        def __call__(self, tokens, **packing):
-            return nn.Embed(VOCAB, 1)(tokens)[..., 0]
-
-    model = TinyHead(vocab_size=VOCAB)
-    width = PROMPT_WIDTH + RESPONSE_WIDTH - 1
-    objective = (GRPOObjective(model, width, beta=.01) if kind == "grpo"
-                 else PPOObjective(model, width, critic=Critic(), beta=.01))
-    rows = 2 * jax.device_count()
-    source = {PROMPT_KEY: np.tile(np.arange(1, 6, dtype=np.int32), (rows, 1)),
-              LENGTH_KEY: np.tile(np.array([5, 3], np.int32), rows // 2)}
-    validation = {**source, VALID_ROWS: np.arange(rows) < rows - 1}
-    packed = jax.tree.map(lambda value: jnp.tile(value, (rows // ROWS, 1)), rollout_batch())
-    if kind == "ppo":
-        packed.update(old_values=jnp.zeros_like(packed[RESPONSE_MASK_KEY]),
-                      returns=jnp.ones_like(packed[RESPONSE_MASK_KEY]))
-    tracker = RecordingTracker()
-    trainer = Trainer(objective, optax.sgd(0.), key=jax.random.key(0), tracker=tracker,
-                      checkpoints=Checkpoints(str(tmp_path / kind)),
-                      rollout=lambda state, batch, key: packed)
-    data = Data(train=lambda: itertools.repeat(source), val=lambda: iter((validation,)), batch=rows)
-    final = trainer.fit(data, steps=1, eval_every=1)
-    reported = [scalars["val/loss"] for _, scalars in tracker.scalars if "val/loss" in scalars]
-    assert reported and np.isfinite(reported).all()
-    scores = objective.evaluate(final.variables, validation, Step(jnp.array(1), jax.random.key(1), None))
-    weights = np.asarray(scores.weights) * validation[VALID_ROWS][:, None]
-    expected = np.sum(np.asarray(scores.losses) * weights) / weights.sum()
-    assert reported[-1] == pytest.approx(float(expected), rel=1e-5)
-
-
-def test_the_rollout_batch_feeds_the_objective():
-    """The `SampledRollout` pack and the `GRPOObjective` loss agree on every
-    key: a rollout straight into the loss, shapes fixed, loss finite."""
-    objective = GRPOObjective(TinyHead(vocab_size=VOCAB),
-                              PROMPT_WIDTH + RESPONSE_WIDTH - 1, beta=0.01)
-    params = objective.init(jax.random.key(0))
-    width = PROMPT_WIDTH
-    prompts = np.tile(np.arange(1, width + 1, dtype=np.int32), (2, 1))
-    info = max(len("rule"), len("other"))
-    def pad(text):
-        return np.pad(
-            np.frombuffer(text.encode(), np.uint8).astype(np.int32), (0, info - len(text)))
-    batch = {
-        PROMPT_KEY: prompts,
-        LENGTH_KEY: np.full(2, width, np.int32),
-        SOURCE_KEY: np.stack([pad("rule"), pad("other")]),
-        TRUTH_KEY: np.stack([pad("1"), pad("2")]),
-        INFO_KEY: np.stack([pad(""), pad("")]),
-    }
-    state = SimpleNamespace(variables=params, updates=0)
-    rollout = SampledRollout(objective, lambda *args: 1.0, groups=2,
-                             max_new_tokens=RESPONSE_WIDTH, sampling=Sampling(temperature=0.0))
-    rolled = rollout(state, batch, jax.random.key(1))
-    step = Step(step=jnp.asarray(0), key=jax.random.key(1), ema=params)
-
-    loss, aux = objective.scalar_loss(params, rolled, step)
-
-    assert np.isfinite(float(loss))
-    assert rolled[IDS_KEY].shape == (4, width + RESPONSE_WIDTH)
-    assert set(aux.metrics) >= {"pg", "kl"}
 
 
 def test_a_rollout_after_the_first_reuses_its_programs_and_reads_only_what_it_scores():

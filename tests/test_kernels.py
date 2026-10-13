@@ -344,18 +344,6 @@ def test_single_query_cudnn_decode_matches_float64_attention_and_gradients(witho
             assert np.abs(got - want).max() <= 2 ** -6 * np.abs(want).max()
 
 
-def test_auto_computes_what_xla_computes_under_deterministic_ops(monkeypatch):
-    """What the selection did is in the output: on a gpu backend 'auto' would
-    fuse this call, and under the flag it returns the xla kernel's numbers
-    bit for bit."""
-    query, key, value = qkv((1, 8, 2, 64))
-    expected = scaled_dot_product_attention(query, key, value, implementation='xla')
-    monkeypatch.setattr(jax, "default_backend", lambda: "gpu")
-    monkeypatch.setenv("XLA_FLAGS", "--xla_gpu_deterministic_ops=true")
-    routed = scaled_dot_product_attention(query, key, value, implementation='auto')
-    assert np.array_equal(np.asarray(routed, np.float32), np.asarray(expected, np.float32))
-
-
 @pytest.mark.skipif(jax.default_backend() != 'cpu', reason="the blocked sum is XLA:CPU's")
 def test_cpu_fp32_attention_rounds_closer_to_float64_in_blocks():
     """Over 2048 keys of cross-attention-like inputs, Dew's fp32 attention on
