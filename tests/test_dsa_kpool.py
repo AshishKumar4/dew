@@ -267,6 +267,21 @@ def test_a_padded_prefill_decodes_like_the_padded_parallel_block():
     assert scaled(ours[valid], wanted[valid]) < BOUND
 
 
+def test_a_row_with_a_hole_pools_as_its_cache_does():
+    """A validity hole inside a row: the parallel block pools and tails the row's real keys in the
+    order its cache compacts them (`valid_order`), so its real queries equal the prefill-then-steps
+    ones, as a left-padded row's do."""
+    block = reference_block()
+    hidden, valid = inputs()
+    valid[0, 3] = False
+    variables = translated(block)
+    metadata = AttentionMetadata(coordinates=coordinates(valid=jnp.asarray(valid)))
+    parallel = np.asarray(module().apply(variables, jnp.asarray(hidden), attention_metadata=metadata))
+
+    stepped = decode_steps(module(), variables, hidden, valid, prefill=5)
+    assert scaled(stepped[valid], parallel[valid]) < BOUND
+
+
 def test_the_kind_builds_from_the_configs_fields_and_is_nope():
     record = {"class": "kpool_sparse_attention", "fields": {**SETTINGS}}
     mixer = mixers.from_record(record)

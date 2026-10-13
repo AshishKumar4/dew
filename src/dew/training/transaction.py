@@ -191,19 +191,22 @@ class Transaction:
     once here. `step` composes them for a resident run or for a host-master
     run; only where each phase executes differs.
     """
-    def __init__(self, objective, optimizer, accumulation: int, shapes, copies=None):
+    def __init__(self, objective, optimizer, accumulation: int, shapes, copies=None, split: int = 1):
         """Hold the objective, the optimizer and the shapes a step traces for.
 
-        `shapes` is the traced result of the objective's loss, statistics and
-        `Aux`. Statistics that are a `Ratio` or a bare scalar pool into one
-        shared mean, which the window can sum and never has to replay.
-        `copies` names the parameters the forward reads through the state's
-        narrow copies, which the commit rewrites (`dew.training.narrow`).
+        `accumulation` is the microbatches a window pools, and `split` the
+        microbatches each step's batch is read in (`Trainer.compile`), one
+        attempt each. `shapes` is the traced result of the objective's loss,
+        statistics and `Aux`. Statistics that are a `Ratio` or a bare scalar
+        pool into one shared mean, which the window can sum and never has to
+        replay. `copies` names the parameters the forward reads through the
+        state's narrow copies, which the commit rewrites (`dew.training.narrow`).
         """
         self.objective = objective
         self.optimizer = optimizer
         self.copies = copies or {}
         self.size = accumulation
+        self.split = split
         stats_shape, self.aux_shape = shapes
         self.shared = isinstance(stats_shape, (Ratio, jax.ShapeDtypeStruct))
         self.stats_tree = jax.tree.structure(stats_shape)
@@ -298,8 +301,7 @@ class Transaction:
             if jnp.issubdtype(leaf.dtype, jnp.inexact) else cot,
             back(jnp.asarray(factor, value.dtype))[0], current_stats)
 
-    @staticmethod
-    def replay_input(state, fill, index):
+    def replay_input(self, state, fill, index):
         """Rebuild the inputs of the window's `index`-th microbatch.
 
         The batch and the mutable collections come from the retained buffers.
@@ -311,7 +313,7 @@ class Transaction:
         batch = jax.tree.map(lambda x: x[index], previous.batches)
         variables = state.variables if previous.variables is None else {
             **state.variables, **jax.tree.map(lambda x: x[index], previous.variables)}
-        step_info = Step(state.microstep - fill + index,
+        step_info = Step((state.microstep - fill + index) // self.split,
                     jax.random.fold_in(state.key, previous.attempts[index]),
                     with_ema(variables, state.ema))
         return variables, batch, step_info
@@ -367,7 +369,7 @@ class Transaction:
             return _chosen(native_finite, apply(current), current), native_finite, norm
         return jax.lax.cond(native_finite, apply, lambda x: x, current), native_finite, norm
 
-    def finish_attempt(self, state, batch, aux, pending, gradient):
+    def finish_attempt(self, state, batch, aux, pending, gradient, attempt):
         """Commit the window when it is due, then advance the state's clocks.
 
         A rejected attempt costs the same trace as an accepted one. With a
@@ -385,9 +387,9 @@ class Transaction:
         has reached this one's commit, and the device idles through every
         step's host work (15.9 ms a 32.5 ms DiT step on four RTX 3090s).
 
-        A window that is not due retains this microbatch's batch and read
-        snapshots in its slot, so a later replay can reproduce it; a window
-        that committed is zeroed for the next one.
+        A window that is not due retains this microbatch's batch, read
+        snapshots and `attempt` in its slot, so a later replay can reproduce
+        it; a window that committed is zeroed for the next one.
         """
         scale, previous = state.scale, state.accumulation
         effects, qk, loss = pending.effects, pending.qk, pending.loss
@@ -423,7 +425,7 @@ class Transaction:
                         batches=jax.tree.map(
                             lambda held, x: held.at[pending.fill].set(x), acc.batches, batch
                         ),
-                        attempts=acc.attempts.at[pending.fill].set(state.step),
+                        attempts=acc.attempts.at[pending.fill].set(attempt),
                     )
                     if acc.variables is not None:
                         reads = {name: state.variables[name] for name in acc.variables}
@@ -466,9 +468,13 @@ class Transaction:
         unscale = compile_phase(self.unscaled)
         add = compile_phase(self.add_contribution)
 
-        def run(state, batch):
-            step_info = Step(state.microstep, jax.random.fold_in(state.key, state.step),
-                        with_ema(state.variables, state.ema))
+        def run(state, batch, part):
+            # The `part`th microbatch of the step's batch is attempt step *
+            # split + part, with a draw of its own; the objective's schedules
+            # count steps, however many microbatches each is read in.
+            attempt = state.step * self.split + part
+            step_info = Step(state.microstep // self.split, jax.random.fold_in(state.key, attempt),
+                             with_ema(state.variables, state.ema))
             factor = jnp.asarray(1., jnp.float32) if state.scale is None else state.scale.scale
             realized = realize(forward_variables(state.variables, state.compute), batch, step_info)
             loss, cotangent = reduce(realized.stats, factor)
@@ -509,13 +515,13 @@ class Transaction:
                 # its own gradient is ready.
                 aux, pending, gradient = jax.tree.map(
                     jax.lax.optimization_barrier, (realized.aux, pending, gradient))
-                return finish(state, batch, aux, pending, gradient)
+                return finish(state, batch, aux, pending, gradient, attempt)
             if FROZEN not in state.variables:
-                return finish(state, batch, realized.aux, pending, gradient)
+                return finish(state, batch, realized.aux, pending, gradient, attempt)
             held = state.variables[FROZEN]
             moving = {name: tree for name, tree in state.variables.items() if name != FROZEN}
             advanced, loss, aux, committed = finish(dataclasses.replace(state, variables=moving), batch,
-                                                    realized.aux, pending, gradient)
+                                                    realized.aux, pending, gradient, attempt)
             return (dataclasses.replace(advanced, variables={**advanced.variables, FROZEN: held}),
                     loss, aux, committed)
         return run

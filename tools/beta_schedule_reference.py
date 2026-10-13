@@ -15,12 +15,11 @@ imports) is not needed. Each key is `<repo>_<name>_<steps>`, float64 betas.
 """
 
 import argparse
-import ast
 import math
-import urllib.request
 from pathlib import Path
 
 import numpy as np
+from reference_source import definitions
 
 FIXTURES = Path(__file__).resolve().parents[1] / "tests" / "fixtures"
 SOURCES = {
@@ -39,15 +38,8 @@ TABLES = {
 def named_schedules(repo: str, commit: str, path: str):
     """The repo's `get_named_beta_schedule`, defined from its own source."""
     url = f"https://raw.githubusercontent.com/{repo}/{commit}/{path}"
-    with urllib.request.urlopen(url, timeout=60) as response:
-        source = response.read().decode()
-    wanted = {"get_named_beta_schedule", "betas_for_alpha_bar"}
-    module = ast.Module(body=[node for node in ast.parse(source).body
-                              if isinstance(node, ast.FunctionDef) and node.name in wanted],
-                        type_ignores=[])
-    scope = {"math": math, "np": np}
-    exec(compile(module, url, "exec"), scope)
-    return scope["get_named_beta_schedule"]
+    return definitions(url, {"get_named_beta_schedule", "betas_for_alpha_bar"},
+                       {"math": math, "np": np})["get_named_beta_schedule"]
 
 
 def main() -> None:

@@ -50,6 +50,10 @@ dependencies = [
     "jinja2",
     "filelock",
     "huggingface_hub",
+    # dew.nn.kernels.tuning: every Pallas launch is a tokamax Op, whose config
+    # is measured per GPU model and shape. 0.0.13 and 0.0.14 pin
+    # typeguard==2.13.3, which tyro excludes.
+    "tokamax>=0.0.15",
 ]
 license = "MIT"
 # Third-party code Dew carries keeps its notice: each file translated or
@@ -206,6 +210,13 @@ vision = ["torchvision>=0.29"]
 # JAX. torchax 0.0.13 fails to import on torch 2.14; this nightly is the build
 # the fallback's tests ran against.
 torchax = ["torch>=2.14,<2.15", "torchax==0.0.14.dev20260922"]
+# The test suite's one environment: every package a test file imports, so no test skips for want
+# of one. CI's jobs, armada's (tools/armada/install.sh), the GPU nodes' and dew-ops' GPU jobs install
+# it under constraints.txt, locked in locks/ (tools/lock_environment.sh).
+ci = ["dewml[test,av,tfds,metrics,plots,inference-clients,serve,vision,quantization,profile,torchax,gguf]",
+      "flake8"]
+# The tutorial notebooks' environment (.github/workflows/tutorials.yml).
+tutorials = ["dewml[streaming,interop,plots]", "nbclient", "nbformat", "ipykernel"]
 
 [tool.ruff]
 target-version = "py312"

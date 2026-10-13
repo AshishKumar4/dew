@@ -352,6 +352,29 @@ def test_a_gpu_process_keeps_its_temporaries_one_free_block(tmp_path, flags, kep
 
 
 @pytest.mark.mesh(devices=0)
+@pytest.mark.parametrize("named, fraction", [({}, "0.95"), ({"XLA_PYTHON_CLIENT_MEM_FRACTION": "0.6"}, "0.6"),
+                                             ({"XLA_PYTHON_CLIENT_PREALLOCATE": "false"}, None)])
+def test_a_training_process_preallocates_its_gpu_unless_it_named_the_pool(tmp_path, named, fraction):
+    """A pool that grows fits a step only in a region it has yet to take, so
+    a training process (`prepare_process`) preallocates 95% of its GPU where
+    JAX's CUDA plugin is installed (a stand-in here), unless the run named
+    its pool's fraction, preallocation or allocator."""
+    plugin = tmp_path / "jax_plugins" / "xla_cuda12"
+    plugin.mkdir(parents=True)
+    (plugin / "__init__.py").write_text("")
+    env = {name: value for name, value in os.environ.items() if not name.startswith("XLA_PYTHON_CLIENT_")}
+    env = {**env, **named, "PYTHONPATH": f"{REPO_ROOT / 'src'}{os.pathsep}{tmp_path}", "JAX_PLATFORMS": "cpu"}
+    program = ("import os\n"
+               "from dew.training.runtime import _set_environment\n"
+               "_set_environment(None, None, None)\n"
+               "print('fraction', os.environ.get('XLA_PYTHON_CLIENT_MEM_FRACTION'))\n")
+    done = subprocess.run([sys.executable, "-c", program], cwd=REPO_ROOT, env=env,
+                          capture_output=True, text=True, timeout=120)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert f"fraction {fraction}" in done.stdout, done.stdout
+
+
+@pytest.mark.mesh(devices=0)
 @pytest.mark.parametrize("raised", [True, False],
                          ids=["raised_to_a_lowered_hard_limit", "a_higher_soft_limit_kept"])
 def test_a_process_raises_its_descriptor_limit_within_the_hard_limit_it_was_given(raised):
@@ -934,24 +957,31 @@ def test_a_pool_gathers_a_tree_in_groups_to_every_host_or_to_process_zero():
 
 
 @pytest.mark.mesh(devices=4)
-def test_every_process_of_a_pool_takes_the_same_link_bandwidth():
+def test_every_process_of_a_pool_takes_the_same_link_bandwidth(tmp_path):
     """A tensor axis over two processes' devices. Each process times its own
     part of the gathers, and processes that placed the step from different
     figures could compile different programs and hang in their collectives,
-    so every process takes the pool's one figure."""
+    so every process takes the pool's one figure. A later pool on the same
+    devices, as a resume is, takes that figure from beside the compilation
+    cache rather than a new measurement that noise moves."""
     program = ("import dew.training.runtime as runtime\n"
-               "runtime.prepare_process()\n"
+               f"runtime.prepare_process(compilation_cache_dir={str(tmp_path / 'cache')!r})\n"
                "import jax\n"
                "from dew.training import MeshSpec\n"
                "from dew.training.distributed import link_bandwidth\n"
                "mesh = MeshSpec(tensor=jax.device_count()).build()\n"
                "print('measured', jax.process_index(), repr(link_bandwidth(mesh, 'tensor')), flush=True)\n")
-    done = launch("--processes-per-host", "2", "--", sys.executable, "-c", program, devices=2, timeout=300)
-    assert done.returncode == 0, done.stdout + done.stderr
-    figures = dict(line.split("] measured ", 1)[1].split(" ", 1)
-                   for line in done.stdout.splitlines() if "] measured " in line)
-    assert sorted(figures) == ["0", "1"], done.stdout
-    assert figures["0"] == figures["1"] and float(figures["0"]) > 0, figures
+    pools = []
+    for _ in range(2):
+        done = launch("--processes-per-host", "2", "--", sys.executable, "-c", program, devices=2,
+                      timeout=300)
+        assert done.returncode == 0, done.stdout + done.stderr
+        figures = dict(line.split("] measured ", 1)[1].split(" ", 1)
+                       for line in done.stdout.splitlines() if "] measured " in line)
+        assert sorted(figures) == ["0", "1"], done.stdout
+        assert figures["0"] == figures["1"] and float(figures["0"]) > 0, figures
+        pools.append(figures["0"])
+    assert pools[0] == pools[1] and len(list((tmp_path / "cache" / "dew-links").iterdir())) == 1
 
 
 @pytest.mark.mesh(devices=2)

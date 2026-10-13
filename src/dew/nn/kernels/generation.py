@@ -113,7 +113,8 @@ TARGETS = {target.generation: target for target in (
               {'NVIDIA L4': {'bf16': 121e12, 'fp8': 242.5e12},
                'NVIDIA GeForce RTX 4080': {'bf16': 97.5e12}}, ('gpu:l4', 'l4')),
     GpuTarget('sm90', 'NVIDIA H100 80GB HBM3', 227 * 1024,
-              {'attention': 'flash', 'rms_norm': 'pallas', 'swiglu': 'pallas', 'gated_delta_rule': 'fla'}, {
+              {'attention': 'flash', 'grouped_matmul': 'pallas', 'rms_norm': 'pallas', 'swiglu': 'pallas',
+               'gated_delta_rule': 'fla'}, {
         'NVIDIA H100': {'bf16': 989e12, 'fp8': 1979e12},
         'NVIDIA H100 PCIe': {'bf16': 756e12, 'fp8': 1513e12},
         'NVIDIA H100 NVL': {'bf16': 835e12, 'fp8': 1670.5e12},
@@ -127,11 +128,11 @@ TARGETS = {target.generation: target for target in (
     GpuTarget('v3', 'TPU v3', dense_peaks={'TPU v3': {'bf16': 61.5e12}}),
     GpuTarget('v4', 'TPU v4', dense_peaks={'TPU v4': {'bf16': 275e12}}),
     GpuTarget('v5e', 'TPU v5 lite',
-              kernels={'grouped_matmul': 'xla', 'tokamax_grouped_matmul': 'mosaic_tpu_v2'},
+              kernels={'grouped_matmul': 'xla'},
               dense_peaks={'TPU v5 lite': {'bf16': 197e12}}),
     GpuTarget('v5p', 'TPU v5', dense_peaks={'TPU v5': {'bf16': 459e12}, 'TPU v5p': {'bf16': 459e12}}),
     GpuTarget('v6e', 'TPU v6 lite',
-              kernels={'grouped_matmul': 'xla', 'tokamax_grouped_matmul': 'mosaic_tpu_v2'},
+              kernels={'grouped_matmul': 'xla'},
               dense_peaks={'TPU v6 lite': {'bf16': 918e12}}),
 )}
 
@@ -256,14 +257,33 @@ def bf16_dot_runs() -> bool:
     return not generation.startswith('sm') or int(generation[2:]) >= BF16_GPU
 
 
+def placed_platform() -> str:
+    """The platform of the devices the context places a call on: the set mesh's, else the default
+    device's (`jax.default_device`), else `jax.default_backend()`, 'gpu' for CUDA's and ROCm's. A
+    host-layout run builds and steps its CPU-owned state on a GPU host's CPU, and every choice keyed
+    on the platform follows it there."""
+    import jax
+    device = jax.sharding.get_abstract_mesh().abstract_device or jax.config.jax_default_device
+    if device is None:
+        return jax.default_backend()
+    platform = device if isinstance(device, str) else device.platform
+    return 'gpu' if platform in ('cuda', 'rocm') else platform
+
+
+def gpu_placed() -> bool:
+    """Whether a call runs on this process's own GPU: what a CUDA library call needs, which its trace
+    asks the installed plugin about, where `backend()` also takes an assumed GPU."""
+    import jax
+    return jax.default_backend() == 'gpu' and placed_platform() == 'gpu'
+
+
 def backend() -> str:
-    """The platform a call's code is chosen for: `jax.default_backend()`, or within `assumed` the
+    """The platform a call's code is chosen for: `placed_platform()`, or within `assumed` the
     assumed generation's, 'gpu' for an `smXY` and 'tpu' for a TPU's, so a choice keyed on the
     platform acts as on that device while a step traces for it on another."""
-    import jax
     generation = ASSUMED.get()
     if generation is None:
-        return jax.default_backend()
+        return placed_platform()
     if generation.startswith('sm'):
         return 'gpu'
     if generation in TARGETS and TARGETS[generation].device_kind.startswith('TPU '):

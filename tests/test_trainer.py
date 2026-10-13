@@ -38,7 +38,7 @@ from steady_state import steady_state
 
 from dew import position
 from dew.artifacts import Representations
-from dew.checkpoints import STATE_LEAVES, Ranking
+from dew.checkpoints import Ranking
 from dew.config import OptimConfig
 from dew.data import DataPartition
 from dew.objectives.base import Aux, EMASpec, Objective, freeze, merge, select, under
@@ -55,6 +55,7 @@ from dew.training import (
 )
 from dew.training.interval import Book, Interval
 from dew.training.optim import Cosine, Power
+from dew.training.state import CHECKPOINTED
 from dew.training.transaction import write_back
 
 
@@ -520,16 +521,90 @@ def test_a_run_past_its_target_is_refused(tmp_path):
         make_trainer(tmp_path).fit(Data(), steps=2)
 
 
-def held_lm_trainer(**settings):
+def held_lm_trainer(container=dict, **settings):
+    """A one-layer LM trainer over held weights, which the objective holds
+    in `container` (Flax's FrozenDict, say)."""
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.objectives.lm import LMObjective
 
     model = CausalTransformer(vocab_size=32, emb_features=8, num_layers=1, num_heads=1,
                               mlp_features=16, max_seq_len=8)
     weights = jax.jit(LMObjective(model, seq_len=4).init)(jax.random.key(0))
-    objective = LMObjective(model, seq_len=4, variables=weights, ema_decay=0.999)
+    objective = LMObjective(model, seq_len=4, variables=container(weights), ema_decay=0.999)
     return Trainer(objective, optax.adam(1e-3), key=jax.random.key(0),
                    layout=Layout(min_shard=1, tolerance=1.0), **settings), objective, weights
+
+
+def test_native_frozen_variables_train_save_and_resume_as_plain_ones(tmp_path):
+    """A FrozenDict of variables, Flax's own container, trains, saves and
+    resumes as the same tree of dicts does, to the same numbers, and a
+    supplied state holding one fits: the trainer holds every tree as dicts."""
+    from flax.core import FrozenDict
+
+    batch = {"text": jnp.tile(jnp.arange(1, 6, dtype=jnp.int32)[None], (jax.device_count(), 1))}
+
+    def trained(container, directory, steps):
+        trainer, _, _ = held_lm_trainer(container, checkpoints=Checkpoints(str(directory)))
+        state, _, _ = trainer.place()
+        step = trainer.compile(state, batch)
+        for _ in range(steps):
+            state, *_ = step(state, batch)
+        trainer.checkpoints.save(int(state.step), state)
+        trainer.checkpoints.wait()
+        return trainer, state
+
+    _, frozen = trained(FrozenDict, tmp_path / "frozen", 2)
+    assert type(frozen.variables) is dict and type(frozen.variables["params"]) is dict
+    _, resumed = trained(FrozenDict, tmp_path / "frozen", 2)
+    _, plain = trained(dict, tmp_path / "plain", 4)
+    assert int(resumed.step) == 4
+    for got, want in zip(jax.tree.leaves((resumed.variables, resumed.opt_state)),
+                         jax.tree.leaves((plain.variables, plain.opt_state)), strict=True):
+        np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+    regression = make_trainer(objective=Regression())
+    supplied = regression.initial_state()
+    assert int(regression.fit(Data(), steps=1, state=supplied.replace(
+        variables=FrozenDict(supplied.variables))).step) == 1
+
+
+def test_a_runs_checkpoint_opens_with_orbax_alone(tmp_path):
+    """A step is one Orbax PyTree item: Orbax's own manager reads the state's
+    fields by name, the PRNG key as a key, and an EMA leaf the metadata
+    lists as byte planes decodes to the run's average bit for bit, as the
+    checkpoint guide says."""
+    import orbax.checkpoint as ocp
+
+    trainer, _, _ = held_lm_trainer(checkpoints=Checkpoints(str(tmp_path)))
+    state, _, _ = trainer.place()
+    batch = {"text": jnp.tile(jnp.arange(1, 6, dtype=jnp.int32)[None], (jax.device_count(), 1))}
+    step = trainer.compile(state, batch)
+    for _ in range(2):
+        state, *_ = step(state, batch)
+    trainer.checkpoints.save(int(state.step), state)
+    trainer.checkpoints.wait()
+
+    manager = ocp.CheckpointManager(str(tmp_path), item_handlers=ocp.PyTreeCheckpointHandler())
+    tree = manager.restore(manager.latest_step(), args=ocp.args.PyTreeRestore())
+    deltas = manager.metadata(manager.latest_step()).custom_metadata["ema_deltas"]
+    assert int(tree["step"]) == int(state.step) == 2
+    assert jnp.issubdtype(tree["key"].dtype, jax.dtypes.prng_key)
+    np.testing.assert_array_equal(jax.random.key_data(tree["key"]), jax.random.key_data(state.key))
+    for got, want in zip(jax.tree.leaves(tree["variables"]), jax.tree.leaves(state.variables), strict=True):
+        np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+    weights = {jax.tree_util.keystr(path): np.asarray(leaf)
+               for path, leaf in jax.tree_util.tree_flatten_with_path(tree["variables"])[0]}
+    averages = dict(jax.tree_util.tree_flatten_with_path(state.ema)[0])
+    decoded = 0
+    for path, stored in jax.tree_util.tree_flatten_with_path(tree["ema"])[0]:
+        name, want = jax.tree_util.keystr(path), np.asarray(averages[path])
+        if name in deltas:
+            live = weights[name]
+            unsigned = np.dtype(f"uint{8 * live.dtype.itemsize}")
+            planes = np.asarray(stored)
+            bits = sum(planes[k].astype(unsigned) << unsigned.type(8 * k) for k in range(len(planes)))
+            stored, decoded = (live.view(unsigned) ^ bits).view(live.dtype), decoded + 1
+        np.testing.assert_array_equal(np.asarray(stored), want)
+    assert decoded == len(deltas) > 0
 
 
 def test_overlapping_token_windows_resume_in_a_fresh_trainer_bit_exactly(tmp_path):
@@ -1007,7 +1082,7 @@ def test_a_checkpoint_that_stores_the_ema_as_itself_still_restores(tmp_path):
     the weights hold it as plain arrays, and read back as they were written."""
     state = awkward_state()
     written = ocp.CheckpointManager(str(tmp_path / "run"), item_handlers=ocp.PyTreeCheckpointHandler())
-    written.save(0, args=ocp.args.PyTreeSave({name: getattr(state, name) for name in STATE_LEAVES}))
+    written.save(0, args=ocp.args.PyTreeSave({name: getattr(state, name) for name in CHECKPOINTED}))
     written.wait_until_finished()
 
     checkpoints = Checkpoints(str(tmp_path / "run"))
@@ -2287,6 +2362,10 @@ APART = {"xla_gpu_dot_merger_threshold_mb": 0}
 
 @pytest.mark.parametrize("generation, flags, tokens, frozen, expected", [
     ("sm89", "", 4, False, {**APART, "xla_gpu_enable_triton_gemm": False}),
+    ("sm90", "", 1024, False, {**APART, **memory.COLLECTIVES}),
+    ("sm90", "--xla_gpu_enable_latency_hiding_scheduler=false", 1024, False,
+     {**APART, **{name: value for name, value in memory.COLLECTIVES.items()
+                  if name != "xla_gpu_enable_latency_hiding_scheduler"}}),
     ("sm86", "", 4, False, APART),
     ("sm86", "", 128, True, None),
     ("sm89", "", 128, True, {"xla_gpu_enable_triton_gemm": False}),
@@ -2303,9 +2382,10 @@ def test_a_gpu_training_step_compiles_its_dots_apart(monkeypatch, generation, fl
     merger would concatenate their weights every step, except a step beside
     frozen weights on 128 tokens or fewer a device (32 rows of 4 at most), which
     keeps the merger as decoding does; the Triton GEMM fusions go off on the
-    generations measured faster without them; a flag the run named stands.
-    The options are the step's own, so a process that also serves keeps the
-    merger there."""
+    generations measured faster without them; a step over several GPUs (here
+    the sm90 cases, over two) takes the combined, pipelined collectives; a
+    flag the run named stands. The options are the step's own, so a process
+    that also serves keeps the merger there."""
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.objectives.lm import LMObjective
     monkeypatch.setattr(memory, 'device_generation', lambda: generation)
@@ -2313,7 +2393,14 @@ def test_a_gpu_training_step_compiles_its_dots_apart(monkeypatch, generation, fl
     model = CausalTransformer(vocab_size=32, emb_features=8, num_layers=1, num_heads=1,
                               mlp_features=16, max_seq_len=8)
     objective = LMObjective(model, seq_len=4)
-    assert memory.step_compiler_options(objective, tokens, frozen) == expected
+    devices = 2 if generation == "sm90" else 1
+    assert memory.step_compiler_options(objective, tokens, frozen, devices) == expected
+
+
+def test_the_collective_options_are_options_xla_takes():
+    """Every collective option names a field of XLA's debug options, which a
+    compile refuses when it doesn't know one (on any backend)."""
+    jax.jit(lambda x: x + 1).lower(jnp.ones(3)).compile(dict(memory.COLLECTIVES))
 
 
 def test_a_frozen_step_tells_the_options_its_tokens_and_split(monkeypatch):
@@ -2325,7 +2412,7 @@ def test_a_frozen_step_tells_the_options_its_tokens_and_split(monkeypatch):
 
     seen = []
     monkeypatch.setattr(trainer_module, 'step_compiler_options',
-                        lambda objective, tokens, frozen: seen.append((tokens, frozen)))
+                        lambda objective, tokens, frozen, devices: seen.append((tokens, frozen, devices)))
     model = CausalTransformer(vocab_size=32, emb_features=8, num_layers=1, num_heads=1,
                               mlp_features=16, max_seq_len=8)
     fresh = LMObjective(model, seq_len=4).init(jax.random.key(0))
@@ -2335,7 +2422,7 @@ def test_a_frozen_step_tells_the_options_its_tokens_and_split(monkeypatch):
                           key=jax.random.key(0), checkpoints=None, tracker=None)
         state, _, _ = trainer.place()
         trainer.compile(state, {"text": jax.ShapeDtypeStruct((8, 5), jnp.int32)})
-        assert seen[-1] == (8 // len(jax.devices()) * 4, frozen)
+        assert seen[-1] == (8 // len(jax.devices()) * 4, frozen, len(jax.devices()))
 
 
 def test_a_step_without_tokens_compiles_whatever_its_batch_holds():
@@ -2353,7 +2440,7 @@ def test_the_step_runs_the_program_it_compiled(monkeypatch, tmp_path):
     from dew.training import trainer as trainer_module
 
     monkeypatch.setattr(trainer_module, 'step_compiler_options',
-                        lambda objective, tokens, frozen: {'xla_embed_ir_in_executable': False})
+                        lambda objective, tokens, frozen, devices: {'xla_embed_ir_in_executable': False})
     trainer, _, _ = held_lm_trainer()
     state, _, _ = trainer.place()
     batch = {"text": jnp.zeros((8, 5), jnp.int32)}
@@ -2373,7 +2460,7 @@ def test_the_step_runs_the_program_it_compiled(monkeypatch, tmp_path):
         assert events, "the public compile must reach the compilation event listener"
         # Input placement is separate from executing the compiled transaction.
         assert trainer.executable is not None
-        state, batch = jax.device_put((state, batch), trainer.executable.input_shardings[0])
+        state, batch = jax.device_put((state, batch), trainer.executable.input_shardings[0][:2])
         jax.block_until_ready((state, batch))
         events.clear()
         jax.block_until_ready(step(state, batch))
