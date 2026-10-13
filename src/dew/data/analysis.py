@@ -68,12 +68,20 @@ _STAGES = get_args(Stage.__value__)
 
 @runtime_checkable
 class _Provisionable(Protocol):
+    def can_provision(self, read: Read) -> bool: ...
     def provision(self) -> Source: ...
 
 
 @runtime_checkable
 class _Wrapping(Protocol):
     source: Source
+
+
+def _provisioner(source: Source, read: Read) -> _Provisionable | None:
+    """The source that can prepare `read`, through any split or slice wrapping it."""
+    while isinstance(source, _Wrapping) and not isinstance(source, _Provisionable):
+        source = source.source
+    return source if isinstance(source, _Provisionable) and source.can_provision(read) else None
 
 
 def _in_memory(source: Source) -> bool:
@@ -130,9 +138,9 @@ def _preferred_read(compiled: Callable[[Read], Sequence[Pipeline]], *, provision
 
     Each source the run reads, after its published generations are promoted,
     prefers memory for records held in memory (`Memory`, through any source
-    that wraps one), indexed for a store that reads by index, and streamed
-    otherwise, and a mixture takes the least eager of its corpora's
-    preferences. The run reads by the first read, from that preference toward
+    that wraps one), indexed for a store that reads by index or can provision
+    only that read, and streamed otherwise, and a mixture takes the least eager
+    of its corpora's preferences. The run reads by the first read, from that preference toward
     the more eager ones, that it can take (`_takes`).
 
     A source that cannot take the preferred read until it is provisioned
@@ -155,12 +163,15 @@ def _preferred_read(compiled: Callable[[Read], Sequence[Pipeline]], *, provision
         if _in_memory(source):
             chosen.append("memory")
         else:
-            chosen.append("indexed" if source.supports("indexed") else "streamed")
+            indexed = source.supports("indexed") or (
+                not source.supports("streamed") and _provisioner(source, "indexed") is not None
+            )
+            chosen.append("indexed" if indexed else "streamed")
     preferred = READS.index(max(chosen, key=READS.index))
     for read in READS[preferred::-1]:
         pipelines = promoted(read)
         missing = _unsupported(pipelines, read)
-        provisionable = all(isinstance(source, _Provisionable) for source in missing)
+        provisionable = all(_provisioner(source, read) is not None for source in missing)
         if read == READS[preferred] and missing and provisionable and not provision:
             return read
         if (not missing or (provision and provisionable)) and _lowers(pipelines, read):
@@ -600,11 +611,9 @@ def _capabilities(pipelines: Sequence[Pipeline], read: Read, provision: bool) ->
     missing = _unsupported(pipelines, read)
     if provision:
         for source in missing:
-            # A split or a slice reads its source's records, so that source is what provisions.
-            while isinstance(source, _Wrapping) and not isinstance(source, _Provisionable):
-                source = source.source
-            if isinstance(source, _Provisionable):
-                source.provision()
+            preparer = _provisioner(source, read)
+            if preparer is not None:
+                preparer.provision()
     refused = [source.describe() for source in missing if not source.supports(read)]
     if refused:
         raise ValueError(
