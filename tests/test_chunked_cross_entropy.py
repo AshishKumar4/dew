@@ -209,11 +209,12 @@ def test_a_quantized_split_head_scores_as_one_device_and_moves_no_head_sized_arr
                                 NamedSharding(mesh, P('fsdp')))
         targets = jax.device_put(tokens[:, 1:], NamedSharding(mesh, P('fsdp')))
 
-        def loss(variables, states):
-            return chunked.head_cross_entropy(model, variables, states, targets, 4, tile=(2, 64))[0].sum()
+        def loss(params, states):
+            return chunked.head_cross_entropy(model, {**placed, 'params': params}, states, targets, 4,
+                                              tile=(2, 64))[0].sum()
 
         # The head's forward and backward alone: the embedding's own gather is not the head's.
-        program = jax.jit(jax.grad(loss, argnums=(0, 1))).lower(placed, states).compile().as_text()
+        program = jax.jit(jax.grad(loss, argnums=(0, 1))).lower(placed['params'], states).compile().as_text()
     assert jnp.abs(actual.losses - expected.losses).max() <= 1e-5 * jnp.abs(expected.losses).max()
     np.testing.assert_array_equal(actual.correct, expected.correct)
     head = 512 * 16
