@@ -215,6 +215,8 @@ serve = ["starlette>=0.40", "uvicorn>=0.30"]
 guided = ["outlines-core>=0.2.14"]
 # HF image processors use torchvision on the host; model computation stays JAX.
 vision = ["torchvision>=0.29"]
+# dew.data.images.albumentations: an albumentations pipeline as a seeded random step.
+augment = ["albumentations>=2"]
 # Pretrained.load(fallback="torchax"): transformers' PyTorch forward lowered to
 # JAX. torchax 0.0.13 fails to import on torch 2.14; this nightly is the build
 # the fallback's tests ran against.
@@ -222,7 +224,7 @@ torchax = ["torch>=2.14,<2.15", "torchax==0.0.14.dev20260922"]
 # The test suite's one environment: every package a test file imports, so no test skips for want
 # of one. CI's jobs, armada's (tools/armada/install.sh), the GPU nodes' and dew-ops' GPU jobs install
 # it under constraints.txt, locked in locks/ (tools/lock_environment.sh).
-ci = ["dewml[test,av,tfds,metrics,plots,inference-clients,serve,vision,quantization,profile,torchax,gguf]",
+ci = ["dewml[test,av,tfds,metrics,plots,inference-clients,serve,vision,augment,quantization,profile,torchax,gguf]",
       "flake8"]
 # The tutorial notebooks' environment (.github/workflows/tutorials.yml).
 tutorials = ["dewml[streaming,interop,plots]", "nbclient", "nbformat", "ipykernel"]

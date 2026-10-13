@@ -839,6 +839,9 @@ class ExplodingManager:
     def latest_step(self):
         return None
 
+    def all_steps(self):
+        return []
+
     def save(self, *args, **kwargs):
         raise OSError("No space left on device")
 

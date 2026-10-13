@@ -24,7 +24,7 @@ from dew.data.dataset import Loader
 from dew.nn.backbones.dit import SimpleDiT
 from dew.nn.blocks import Upsample
 from dew.nn.conv import Conv
-from dew.nn.sharding import declared_axes
+from dew.nn.sharding import declarations, declared_axes
 from dew.nn.ssm import SpatialFusionConv
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
@@ -168,9 +168,10 @@ def test_an_fsdp_step_splits_leading_dimensions_and_moves_no_activation(fused):
                       for shape in shapes if op != "all-gather" or LENGTH in shape)
 
     shardings, text, trained = stepped(MeshSpec(fsdp=2), 2, **delta_layers(fused=fused))
+    declared = declarations(shardings)
     specs = {jax.tree_util.keystr(path): sharding.spec
              for path, sharding in jax.tree_util.tree_leaves_with_path(shardings)
-             if sharding.spec and "kernel" in jax.tree_util.keystr(path) and declared_axes(path, 2)}
+             if sharding.spec and "kernel" in jax.tree_util.keystr(path) and declared_axes(path, 2, declared)}
     assert specs.pop("['lm_head']['kernel']") == P(None, "fsdp")
     assert set(specs.values()) == {P("fsdp")}, specs
     assert moved(text) == moved(stepped(MeshSpec(fsdp=2), 2)[1])
