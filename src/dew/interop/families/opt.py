@@ -10,9 +10,11 @@ from dew.interop.decoder_parts import (
     DecoderFamily,
     DecoderFields,
     Renames,
+    hf_ungated,
     refuse,
     renamed_name,
     renamed_path,
+    ungated_mlp,
 )
 from dew.nn.backbones.causal_transformer import CausalTransformer
 
@@ -40,16 +42,14 @@ def _opt_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
     if hf.get('layerdrop', 0):
         refuse('layerdrop', 'stochastic decoder-layer dropping is not represented')
     activation = records.text(hf.get('activation_function', 'relu'), 'activation_function')
-    activations = {'relu': 'relu', 'gelu': 'gelu_exact', 'gelu_new': 'gelu'}
-    if activation not in activations:
-        refuse(f'activation_function={activation!r}', 'the ungated MLP supports ReLU and GELU')
+    mlp = ungated_mlp(activation, ('relu', 'gelu', 'gelu_new'), 'activation_function', 'OPT')
     return native_fields(CausalTransformer)(
         vocab_size=records.integer(hf.get('vocab_size', 50272), 'vocab_size'),
         emb_features=hidden,
         num_layers=records.integer(hf.get('num_hidden_layers', 12), 'num_hidden_layers'),
         num_heads=heads, num_kv_heads=heads, head_dim=hidden // heads,
         mlp_features=records.integer(hf.get('ffn_dim', 3072), 'ffn_dim'),
-        mlp=activations[activation], mlp_bias=bool(hf.get('enable_bias', True)),
+        mlp=mlp, mlp_bias=bool(hf.get('enable_bias', True)),
         norm_type='layer', norm_bias=True, norm_eps=1e-5,
         qk_norm=False, attention_bias=bool(hf.get('enable_bias', True)),
         position_embedding='learned', position_embedding_size=positions + 2,
@@ -68,16 +68,14 @@ _OPT_NAMES: Renames = (
 
 
 def _opt_export(model: CausalTransformer) -> Mapping[str, object]:
-    activation = model.mlp
-    if not isinstance(activation, str) or activation not in ('relu', 'gelu', 'gelu_exact'):
-        refuse('mlp', 'OPT requires an ungated ReLU or GELU MLP')
+    activation = hf_ungated(model.mlp, 'OPT')
     fields: dict[str, object] = {
         'ffn_dim': model.hidden_features, 'word_embed_proj_dim': model.emb_features,
         'enable_bias': model.attention_bias, 'layer_norm_elementwise_affine': True,
         'do_layer_norm_before': True, 'dropout': model.dropout_rate,
         'attention_dropout': model.attention_dropout_rate,
         'max_position_embeddings': (model.position_embedding_size or model.max_seq_len + 2) - 2,
-        'activation_function': {'relu': 'relu', 'gelu': 'gelu_new', 'gelu_exact': 'gelu'}[activation],
+        'activation_function': activation,
     }
     fields.update(dict.fromkeys(('intermediate_size', 'rms_norm_eps', 'hidden_act', 'head_dim',
                                  'num_key_value_heads', 'attention_bias', 'rope_theta')))
