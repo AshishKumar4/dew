@@ -251,11 +251,12 @@ def build_objective(case: Case, attention_impl: str = 'auto', *, widened: bool =
 def build_trainer(case: Case, attention_impl: str = 'auto',
                   optimizer: optax.GradientTransformation | None = None) -> Trainer:
     """The trainer a recipe would build for this case, minus the tracker and the
-    checkpoints, on the case's device order."""
+    checkpoints, on the case's device order. A case measures its own batch,
+    so the step reads it whole and climbs the remat ladder where it must."""
     trainer = Trainer(
         build_objective(case, attention_impl), optimizer or optax.adam(1e-4), key=jax.random.key(0),
         mesh=mesh_spec(case.mesh), layout=Layout(min_shard=case.fsdp_min_param_size),
-        accumulation=case.accumulation, checkpoints=None, tracker=None)
+        accumulation=case.accumulation, split=1, checkpoints=None, tracker=None)
     if case.device_order is not None:
         by_id = {device.id: device for device in jax.devices()}
         trainer.device_mesh = trainer.mesh.build([by_id[index] for index in case.device_order])
