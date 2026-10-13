@@ -18,9 +18,8 @@ _log = logging.getLogger(__name__)
 class Fetch:
     """Fetch the bytes at a record's url into `output`, in one attempt: a url
     that fails now is dropped as transient, for a later epoch or a cache
-    refill to fetch again, so a reader waits at most `timeout` on it. Only
-    permanent failures (404, 410, a malformed url, an oversized object) may
-    become cache tombstones."""
+    refill to fetch again, so a reader waits at most `timeout` on it. A cache
+    never freezes a fetch's outcome; only `snapshot(url)` seals outcomes."""
 
     field: str = "url"
     output: str = "bytes"
