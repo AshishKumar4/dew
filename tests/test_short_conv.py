@@ -160,15 +160,17 @@ TRAINING_SHAPES = {
 
 
 @pytest.mark.gpu(reason="the training shapes' float64 distances are a GPU's")
+@pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float32])
 @pytest.mark.parametrize("model", sorted(TRAINING_SHAPES))
-def test_the_kernels_are_as_exact_as_xla_at_the_training_shapes(model):
+def test_the_kernels_are_as_exact_as_xla_at_the_training_shapes(model, dtype):
     """A delta net's conv at its training shape, bf16 projections into the bf16 operands fla's rule
-    takes: each piece and gradient as exact as XLA's own conv (`assert_as_exact_as_the_reference`)."""
+    takes, and fp32 into fp32: each piece and gradient as exact as XLA's own conv
+    (`assert_as_exact_as_the_reference`)."""
     shape, parts = TRAINING_SHAPES[model]
-    x, weights, _, _ = operands(*shape, parts)
-    grads = cotangents(x, parts, jnp.bfloat16)
-    got, got_grads = run(kernel_conv, x, weights, None, None, parts, jnp.bfloat16, grads)
-    want, want_grads = run(xla_conv1d, x, weights, None, None, parts, jnp.bfloat16, grads)
+    x, weights, _, _ = operands(*shape, parts, dtype=dtype)
+    grads = cotangents(x, parts, dtype)
+    got, got_grads = run(kernel_conv, x, weights, None, None, parts, dtype, grads)
+    want, want_grads = run(xla_conv1d, x, weights, None, None, parts, dtype, grads)
     exact, exact_grads = truth(x, weights, None, None, parts, grads)
     labels = ("q", "k", "v", "dx", "dtaps")
     # The gradients of the projection and the taps; there is no bias.
