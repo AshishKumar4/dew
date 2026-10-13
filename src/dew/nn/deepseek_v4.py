@@ -64,7 +64,7 @@ from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.precision import at_least_fp32
 from dew.nn.rope import YarnScaling, rotate, yarn_rope_freqs
 from dew.nn.sharding import RESIDUAL, LogicalAxes, constrain, down_projection, logical_axes
-from dew.nn.sparse_selection import candidate_pool, selection_mask, top_k_keys, top_k_selection
+from dew.nn.sparse_selection import candidate_pool, index_scores, selection_mask, top_k_keys, top_k_selection
 
 COMPRESSORS = ('csa', 'hca', 'csa2')
 CANDIDATES = ('source', 'restrict')
@@ -340,20 +340,7 @@ class IndexScorer(nn.Module):
     def __call__(self, query, keys, x):
         weights = nn.Dense(self.n_heads, use_bias=False, dtype=self.dtype,
                            precision=self.precision, name='weights_proj')(x)
-        return _index_scores(query, keys, weights, self.precision)
-
-
-def _index_scores(query, keys, weights, precision=None):
-    """`sum_h w_h relu(q_h . k) / sqrt(head_dim) / sqrt(n_heads)` in fp32
-    (`at_least_fp32`), over keys `[B, T, D]` every query shares or
-    `[B, S, T, D]` per query."""
-    heads, width = query.shape[-2:]
-    wide = at_least_fp32(query.dtype)
-    shared = 'bshd,btd->bsht' if keys.ndim == 3 else 'bshd,bstd->bsht'
-    scores = jnp.maximum(jnp.einsum(shared, query.astype(wide),
-                                    keys.astype(wide), precision=precision), 0) * width ** -0.5
-    return jnp.einsum('bsht,bsh->bst', scores, weights.astype(wide) * heads ** -0.5,
-                      precision=precision)
+        return index_scores(query, keys, weights, self.precision)
 
 
 class LightningIndexer(CompressedEntries):
@@ -466,7 +453,7 @@ class Csa2Indexer(nn.Module):
         batch, length, _ = x.shape
         query = _rotate_rope(
             self.wq_b(q_resid).reshape(batch, length, self.n_heads, self.head_dim), cos, sin)
-        return _index_scores(self._fp4(query), jax.lax.stop_gradient(keys), self.weights_proj(x),
+        return index_scores(self._fp4(query), jax.lax.stop_gradient(keys), self.weights_proj(x),
                             self.precision)
 
 
