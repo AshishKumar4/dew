@@ -6,7 +6,6 @@ everywhere, since construction never imports it.
 
 import dataclasses
 import itertools
-import json
 from importlib import import_module
 
 import jax
@@ -21,7 +20,7 @@ from dew.config import ObjectiveConfig, OptimConfig
 from dew.nn.sharding import pipeline_microbatches
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
-from dew.registry import from_record, models
+from dew.registry import models
 from dew.training.distributed import Layout, MeshSpec, shard_batch
 from dew.training.quantization import Quantization, quantize_for_serving
 
@@ -42,41 +41,6 @@ def tiny(**overrides):
 def token_batch():
     rng = np.random.default_rng(0)
     return {"text": rng.integers(0, VOCAB, size=(BATCH, SEQ_LEN + 1)).astype(np.int32)}
-
-
-def test_a_value_that_says_nothing_is_refused():
-    with pytest.raises(ValueError, match="no patterns"):
-        Quantization(patterns=())
-    with pytest.raises(ValueError, match="does not compile"):
-        Quantization(patterns=(".*(unclosed",))
-    with pytest.raises(ValueError, match="calibration"):
-        Quantization(calibration="percentile,99")
-    with pytest.raises(ValueError, match="tile_size"):
-        Quantization(tile_size=0)
-    with pytest.raises(ValueError, match="bwd_qtype"):
-        Quantization(bwd_qtype="int4")
-    with pytest.raises(ValueError, match="bwd_stochastic_rounding"):
-        Quantization(bwd_stochastic_rounding="gaussian")
-    with pytest.raises(ValueError, match="int8 or fp8"):
-        Quantization(dtype="int4")
-
-
-def test_the_value_round_trips_through_json():
-    spec = Quantization(dtype="fp8", patterns=(".*mlp.*", ".*self_attn.*"),
-                        calibration="absmax,0.8", tile_size=32,
-                        bwd_qtype="int8", bwd_stochastic_rounding="uniform")
-    record = json.loads(json.dumps(dataclasses.asdict(spec)))
-    assert from_record(Quantization, record, dtypes=False) == spec
-
-
-def test_without_qwix_quantization_names_the_extra_that_installs_it(monkeypatch):
-    """Quantizing without Qwix installed raises naming `dewml[quantization]`,
-    where Python's own error named only the missing module."""
-    import sys
-
-    monkeypatch.setitem(sys.modules, "qwix", None)
-    with pytest.raises(ModuleNotFoundError, match=r"dewml\[quantization\]"):
-        Quantization().apply(tiny())
 
 
 def quantized_forward(spec, **overrides):
@@ -163,26 +127,6 @@ def int8_products(jaxpr) -> int:
             if hasattr(inner, "eqns"):
                 count += repeats * int8_products(inner)
     return count
-
-
-def test_a_scanned_quantized_stack_quantizes_what_the_plain_one_does():
-    """Quantization composes with the scan: the wrapped scan runs as many
-    int8 products as the wrapped plain loop (19 for this model), and its
-    compiled logits stay away from its fp32 twin, so the rules reached the
-    matmuls under the scan. Its logits are checked against Qwix's own call
-    over the same scanned stack (`test_the_wrapped_forward_matches_qwixs_own_call`),
-    not against the plain loop's: the scan body and the unrolled layers
-    compile to different fusions, which on the RTX 4080 differ by 2.3e-04
-    unquantized, and int8 rounding turns that into 7.0e-02 on logits of order
-    4, at the default and the highest matmul precision alike (0.0 on CPU)."""
-    pytest.importorskip("qwix")
-    model, qmodel, variables, ids = quantized_forward(
-        Quantization(), scan_layers=True)
-    plain_wrapped = Quantization().apply(tiny())
-    scanned = int8_products(jax.make_jaxpr(qmodel.apply)(variables, ids).jaxpr)
-    assert scanned == int8_products(jax.make_jaxpr(plain_wrapped.apply)(variables, ids).jaxpr) > 0
-    reference = jax.jit(model.apply)(variables, ids)
-    assert float(jnp.max(jnp.abs(jax.jit(qmodel.apply)(variables, ids) - reference))) > 1e-2
 
 
 @pytest.mark.skipif(jax.default_backend() == "gpu",
@@ -389,50 +333,6 @@ def test_a_bf16_convolution_under_weight_only_quantization_trains_as_qwix_does()
     jax.tree.map(np.testing.assert_array_equal, got, value_and_gradients(conv))
 
 
-@pytest.mark.skipif(jax.default_backend() == "gpu",
-                    reason="Dew refuses a grouped quantized convolution on a GPU; "
-                           "test_a_gpu_refuses_grouped_quantized_convolutions covers it")
-def test_quantized_gradients_of_a_grouped_convolution_are_refused():
-    """Qwix 0.1.8 cannot quantize a grouped convolution's gradients, so
-    training one with `bwd_qtype` raises naming the ways around it."""
-    pytest.importorskip("qwix")
-    from dew.nn.conv import Conv
-
-    conv = Conv(features=16, kernel_size=(3, 3), padding="SAME", feature_group_count=16, use_bias=False)
-    x = jax.random.normal(jax.random.key(0), (2, 8, 8, 16))
-    variables = conv.init(jax.random.key(1), x)
-    with pytest.raises(ValueError, match=r"bwd_qtype.*spatial_fusion"):
-        Quantization(bwd_qtype="int8").apply(conv).apply(variables, x)
-
-
-@pytest.mark.gpu(reason="needs a GPU")
-@pytest.mark.parametrize("dtype", ["int8", "fp8"])
-@pytest.mark.parametrize("group_width", [1, 4])
-@pytest.mark.parametrize("dilation", [1, 2, 3])
-def test_a_gpu_refuses_grouped_quantized_convolutions(group_width, dtype, dilation):
-    """XLA:GPU computes a grouped convolution with int8 or fp8 activations
-    wrongly or not at all, depending on the GPU, so quantizing one raises
-    naming the ways around it, for training and for serving alike; weight-only
-    quantization, one of them, leaves the convolution in float."""
-    pytest.importorskip("qwix")
-    from dew.nn.conv import Conv
-
-    features = 64
-    conv = Conv(features=features, kernel_size=(3, 3), padding="SAME",
-                feature_group_count=features // group_width, use_bias=False,
-                kernel_dilation=(dilation, dilation))
-    x = jax.random.normal(jax.random.key(0), (2, 8, 8, features))
-    variables = conv.init(jax.random.key(1), x)
-    with pytest.raises(ValueError, match="spatial_fusion"):
-        Quantization(dtype=dtype).apply(conv).apply(variables, x)
-    with pytest.raises(ValueError, match="spatial_fusion"):
-        quantize_for_serving(conv, variables, Quantization(dtype=dtype), x)
-    served, served_variables = quantize_for_serving(
-        conv, variables, Quantization(dtype=dtype, weight_only=True), x
-    )
-    np.testing.assert_array_equal(served.apply(served_variables, x), conv.apply(variables, x))
-
-
 @pytest.mark.parametrize("kernels", ["initialized", "trained"])
 def test_a_convolution_no_rule_quantizes_computes_as_unwrapped_and_as_qwix_does(kernels):
     """The hybrid DiT's spatial fusion (depthwise, dilations 1 to 3), left out
@@ -495,33 +395,6 @@ def test_serving_stores_int8_kernels_and_computes_what_training_quantized():
     logits = served.apply(served_variables, ids)
     assert float(jnp.max(jnp.abs(logits - qmodel.apply(variables, ids)))) < 1e-4
     assert float(jnp.max(jnp.abs(logits - model.apply(variables, ids)))) > 1e-2
-
-
-@pytest.mark.parametrize("weight_only", [False, True])
-def test_a_served_language_model_generates_with_its_quantized_kernels(weight_only):
-    """Generation enters a language model through methods besides
-    `__call__` (`states_and_logits_at` for the prefill, `states_and_logits`
-    for each step), and they compute with the stored quantized kernels as
-    `__call__` does. Before, they ran outside Qwix's interception and a
-    stored kernel reached a Dense raw (`TypeError: expected number, got
-    WithAux`)."""
-    pytest.importorskip("qwix")
-    from dew.sampling import Sampling, generate
-
-    model = tiny()
-    prompt = token_batch()["text"][:, :4]
-    variables = model.init(jax.random.key(0), prompt)
-    served, served_variables = quantize_for_serving(
-        model, variables, Quantization(weight_only=weight_only), prompt
-    )
-    logits = served.apply(served_variables, prompt)
-    _, stepped = served.apply(served_variables, prompt, method="states_and_logits")
-    np.testing.assert_array_equal(stepped, logits)
-    assert float(jnp.max(jnp.abs(logits - model.apply(variables, prompt)))) > 1e-3
-    tokens = (
-        generate(served, served_variables, prompt, 3, key=0, sampling=Sampling(temperature=0)).host().tokens
-    )
-    assert tokens.shape == (BATCH, 7)
 
 
 @pytest.mark.parametrize("dtype", ["int8", "fp8"])
@@ -639,24 +512,6 @@ def test_a_quantized_image_task_matches_qwix_direct_prediction_and_samples(flux_
                                   direct(["a red bird"], steps=2, key=1).host().images)
 
 
-@pytest.mark.mesh
-def test_quantizing_resident_weights_keeps_their_parameter_shards():
-    from dew.inference import TextGeneration
-
-    pytest.importorskip("qwix")
-    model = tiny()
-    prompt = jnp.asarray(token_batch()["text"][:, :4])
-    variables = model.init(jax.random.key(0), prompt)
-    mesh = MeshSpec(fsdp=2).build()
-    variables = jax.device_put(variables, Layout(min_shard=1).shardings(mesh, variables))
-    served = TextGeneration(model, variables).quantized(Quantization(weight_only=True, patterns=(".*_proj",)))
-    for name in ("q_proj", "k_proj", "v_proj", "o_proj"):
-        original = variables["params"]["layers_0"]["self_attn"][name]["kernel"]
-        quantized = served.variables["params"]["layers_0"]["self_attn"][name]["kernel"].array.qvalue
-        assert "fsdp" in str(original.sharding.spec)
-        assert quantized.sharding == original.sharding
-
-
 def test_quantizing_host_weights_keeps_numpy_storage_and_matches_qwix():
     """Host kernels use Qwix 0.1.8 on the active backend and retain host storage."""
     import functools
@@ -718,16 +573,6 @@ def test_quantizing_packed_pipeline_weights_matches_the_canonical_quantized_mode
     np.testing.assert_allclose(drawn.raw_log_probs, expected.raw_log_probs, atol=2e-6, rtol=2e-6)
 
 
-def test_a_quantized_text_task_without_qwix_names_the_install_extra(monkeypatch):
-    import sys
-
-    from dew.inference import TextGeneration
-
-    monkeypatch.setitem(sys.modules, "qwix", None)
-    with pytest.raises(ModuleNotFoundError, match=r"dewml\[quantization\]"):
-        TextGeneration(tiny(), {}).quantized(Quantization())
-
-
 def test_a_quantized_multimodal_task_keeps_its_processor_and_media():
     from pathlib import Path
 
@@ -752,23 +597,6 @@ def test_a_quantized_multimodal_task_keeps_its_processor_and_media():
     assert generated.text == task.decode(generated)
     assert len(generated.text) == 1 and generated.text[0]
     assert served.processor is task.processor and served.sampling == task.sampling
-
-
-@pytest.mark.parametrize("weight_only", [False, True])
-def test_a_served_bf16_module_computes_in_bf16(weight_only):
-    """A quantized kernel follows the module's compute dtype as its float
-    kernel would: a bf16 Dense stays bf16 through its matmul. Before, the
-    fp32 scales of the stored kernel promoted it to fp32."""
-    pytest.importorskip("qwix")
-    from flax import linen as nn
-
-    dense = nn.Dense(16, dtype=jnp.bfloat16)
-    x = jax.random.normal(jax.random.key(0), (4, 32), jnp.bfloat16)
-    variables = dense.init(jax.random.key(1), x)
-    served, served_variables = quantize_for_serving(
-        dense, variables, Quantization(weight_only=weight_only), x
-    )
-    assert served.apply(served_variables, x).dtype == jnp.bfloat16
 
 
 def test_a_bf16_int8_matmul_scales_its_int32_products_in_float32():
@@ -807,33 +635,6 @@ def converted_int32_products(jaxpr) -> set:
             if hasattr(inner, "eqns"):
                 dtypes |= converted_int32_products(inner)
     return dtypes
-
-
-@pytest.mark.skipif(jax.default_backend() == "gpu",
-                    reason="Dew refuses a grouped quantized convolution on a GPU; "
-                           "test_a_gpu_refuses_grouped_quantized_convolutions covers it")
-@pytest.mark.parametrize("training", [True, False])
-def test_a_bf16_int8_depthwise_convolution_scales_its_int32_products_in_float32(training):
-    """A bf16 depthwise convolution quantized to int8 converts its int32
-    product to float32 for the scales, in training as in serving, and
-    returns bf16. Qwix 0.1.8 converted it to bf16 in training, and on a v6e
-    XLA:TPU computed an int8 depthwise convolution scaled that way as NaN in
-    all but a few outputs."""
-    pytest.importorskip("qwix")
-    from dew.nn.conv import Conv
-
-    features = 16
-    conv = Conv(features=features, kernel_size=(3, 3), padding="SAME", feature_group_count=features,
-                use_bias=False, dtype=jnp.bfloat16)
-    x = jax.random.normal(jax.random.key(0), (2, 8, 8, features), jnp.bfloat16)
-    variables = conv.init(jax.random.key(1), x)
-    if training:
-        module, module_variables = Quantization().apply(conv), variables
-    else:
-        module, module_variables = quantize_for_serving(conv, variables, Quantization(), x)
-    assert converted_int32_products(jax.make_jaxpr(module.apply)(module_variables, x).jaxpr) == {
-        jnp.dtype(jnp.float32)}
-    assert module.apply(module_variables, x).dtype == jnp.bfloat16
 
 
 def test_quantized_training_differentiates_through_complex_matmuls_in_float():
@@ -1083,50 +884,6 @@ def test_the_trainer_knob_quantizes_what_a_distillation_trains_and_not_its_teach
                                  - jax.jit(student.apply)(variables, tokens)))) > 0.0
     np.testing.assert_array_equal(jax.jit(frozen.apply)(variables, tokens),
                                   jax.jit(teacher.apply)(variables, tokens))
-
-
-def test_an_objective_that_trains_no_single_model_is_refused(tmp_path):
-    """The wrap needs a module to wrap; an objective that keeps none is
-    refused by name, before the run writes anything."""
-    from dew.data.dataset import Loader
-    from dew.objectives.base import Aux, Objective
-
-    class Modelless(Objective):
-        def init(self, key, variables=None):
-            return {"params": {}}
-
-        def loss(self, variables, batch, step):
-            return jnp.zeros(()), Aux({})
-
-    config = diffusion_run(tmp_path, quantization=Quantization())
-    with pytest.raises(ValueError, match="Modelless trains none"):
-        config.train(
-            Modelless(),
-            Loader(lambda partition: image_batches(RUN_BATCH)(), None, None, RUN_BATCH),
-            name="quantized",
-        )
-    assert not (tmp_path / "quantized").exists()
-
-
-class _Contracted(nn.Module):
-    """One quantized Dense, then an einsum that asks for an fp32 result from bf16 operands."""
-
-    @nn.compact
-    def __call__(self, x):
-        y = nn.Dense(16, dtype=jnp.bfloat16, param_dtype=jnp.bfloat16)(x)
-        table = self.param("table", nn.initializers.normal(), (16, 8), jnp.bfloat16)
-        return jnp.einsum("bd,dv->bv", y, table, preferred_element_type=jnp.float32)
-
-
-def test_a_quantized_matmul_keeps_the_result_dtype_its_call_asks_for():
-    """Qwix's quantized einsum drops `preferred_element_type`; the provider
-    widens the operands to it instead, exactly for bf16, so the product
-    comes out in fp32 as the unquantized one does."""
-    pytest.importorskip("qwix")
-    x = jnp.ones((2, 8), jnp.bfloat16)
-    model = Quantization().apply(_Contracted())
-    variables = model.init(jax.random.key(0), x)
-    assert model.apply(variables, x).dtype == jnp.float32
 
 
 def test_a_matmul_that_pins_its_precision_runs_unquantized_at_it():

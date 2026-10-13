@@ -137,19 +137,16 @@ class ValidTargets:
     measured: bool = True
 
     def __call__(self, element: Batch) -> int:
+        """The record's targets the loss scores, by the LM objective's own rule (`scored_targets`)."""
         if self.measured and "_dew_valid_targets" in element:
             return int(element["_dew_valid_targets"])
+        from dew.objectives.lm.objective import scored_targets
+
         segments = element.get(f"{self.field}_segment_ids")
-        if segments is None:
-            valid = np.ones(max(0, len(element[self.field]) - 1), bool)
-        else:
-            segments = np.asarray(segments)
-            valid = (segments[1:] > 0) & (segments[1:] == segments[:-1])
-        if self.role is not None:
-            valid &= np.asarray(element[f"{self.field}_roles"])[1:] == self.role
-        if self.pad_id is not None:
-            valid &= np.asarray(element[self.field])[1:] != self.pad_id
-        return int(valid.sum())
+        roles = None if self.role is None else np.asarray(element[f"{self.field}_roles"])[None]
+        return int(scored_targets(np, np.asarray(element[self.field])[None], self.pad_id, None,
+                                  None if segments is None else np.asarray(segments)[None],
+                                  roles=roles, role=self.role).sum())
 
 
 @dataclasses.dataclass(frozen=True)

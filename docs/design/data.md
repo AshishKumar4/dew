@@ -70,7 +70,7 @@ Library stages are factories that return one of these shapes. `images.resize(256
 | `Hub(repo, name=, split=, columns=, revision=)` | Hugging Face Hub datasets, streamed or prepared. `split=` is HF's own named split. | HF datasets, Hub Parquet shards |
 | `TFDS(name, split=)` | TensorFlow Datasets | TFDS ArrayRecord |
 | `Memory(records or columns)` | Arrays, lists of dicts, DataFrames | numpy, pyarrow |
-| `from_hf(dataset)` | An existing `datasets.Dataset`, its `.map()`s already applied. A shuffled `IterableDataset` is refused, because HF drops its shuffle buffer on resume. | HF datasets |
+| `from_hf(dataset, name=)` | An existing `datasets.Dataset`, its `.map()`s already applied. An `IterableDataset` is named, with its version, since it has no content fingerprint; a shuffled one is refused, because HF drops its shuffle buffer on resume. | HF datasets |
 | `from_torch(dataset)` | A map-style `torch.utils.data.Dataset` | PyTorch |
 | `from_grain(dataset)` | A Grain `MapDataset` or `IterDataset` | Grain |
 | `from_iter(factory, state=, load_state=)` | Any resumable iterator: WebDataset, torchdata, Mosaic Streaming, Ray | the library's own state |
@@ -276,6 +276,10 @@ trainer.fit(train.pipe(presets.images, 64, batch=16, augment=True),
 ```
 
 Training and validation use the same preset, so both are prepared the same way. Augmentation is off unless you ask for it, so a validation split never gets it by accident. There are no train or eval variants. Presets live in `dew.data.presets`; `images`, `text`, `chat`, `video` and `audio` hold only steps.
+
+The public image decoder also reads prepared ArrayRecord byte maps: `shape` holds two int32 dimensions, `image` holds RGB uint8 pixels, and `label` and UTF-8 `caption` are optional. It reads encoded `jpg`/`txt` byte maps through the same step. By default, `filter_map(images.decode())` counts and drops bad images; `.map(images.decode(rejects=False))` fails on bad bytes and keeps every source position, as the run-layer `ImageData` recipe does.
+
+`images.caption(template, classes=names)` formats a class label; `images.caption(columns=("description", "text"))` picks the first present column. To draw one of several templates per record, use `.random_map(images.caption(templates=("a {label}", "a photo of {}"), classes=names))`. `ImageData` composes these same decoding, resizing, caption and augmentation steps; its recorded run settings are unchanged.
 
 | Preset | Reads per record | Writes per batch |
 |---|---|---|

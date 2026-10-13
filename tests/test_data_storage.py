@@ -3,13 +3,18 @@
 import hashlib
 import json
 import os
+import subprocess
+import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from uuid import uuid4
 
 import fsspec
 import pytest
+from fsspec.implementations.local import LocalFileSystem
 
+from dew.data.sources import Files
 from dew.data.storage import BoundedFileCache, PreconditionFailed, Store, Versioned, _profile
 
 
@@ -114,6 +119,61 @@ def test_named_profile_resolves_secrets_lazily(monkeypatch):
     fs, path = Store("credentialtest://bucket/key").resolve()
     fs.pipe_file(path, b"present")
     assert fs.cat_file(path) == b"present"
+
+
+def test_local_content_versions_are_shared_and_refreshed_after_writes(tmp_path, monkeypatch):
+    """Independent readers share one complete checksum per local file version."""
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    path = tmp_path / "corpus.txt"
+    payload = b"a" * (192 * 1024)
+    path.write_bytes(payload)
+    opened = []
+    open_file = LocalFileSystem.open
+
+    def count(self, filename, *args, **kwargs):
+        if Path(filename).resolve() == path:
+            opened.append(filename)
+        return open_file(self, filename, *args, **kwargs)
+
+    monkeypatch.setattr(LocalFileSystem, "open", count)
+
+    def version(filename):
+        return Files(str(filename), format="text").fingerprint()["files"][0]["version"]
+
+    with ThreadPoolExecutor(4) as readers:
+        versions = list(readers.map(version, [path] * 4))
+    assert versions == [hashlib.sha256(payload).hexdigest()] * 4
+    alias = tmp_path / "alias.txt"
+    alias.symlink_to(path)
+    assert version(alias) == versions[0]
+    assert len(opened) == 1
+    reopened = subprocess.run([sys.executable, "-c", """
+import os
+import sys
+from fsspec.implementations.local import LocalFileSystem
+from dew.data.storage import content_version
+
+class CachedOnly(LocalFileSystem):
+    def _open(self, *args, **kwargs):
+        raise RuntimeError("a persisted content version reread its source")
+
+filename = sys.argv[1]
+print(content_version(CachedOnly(), filename, os.stat(filename).st_size))
+""", str(path)], capture_output=True, text=True, check=True)
+    assert reopened.stdout.strip() == versions[0]
+    with path.open("r+b") as file:
+        file.seek(len(payload) // 2)
+        file.write(b"b")
+    changed = version(path)
+    assert changed != versions[0]
+    assert len(opened) == 2
+    metadata = path.stat()
+    replacement = tmp_path / "replacement.txt"
+    replacement.write_bytes(b"c" * len(payload))
+    os.utime(replacement, ns=(metadata.st_atime_ns, metadata.st_mtime_ns))
+    replacement.replace(path)
+    assert version(path) != changed
+    assert len(opened) == 3
 
 
 def test_cache_keeps_active_file_pinned_and_evicts_lru(tmp_path):

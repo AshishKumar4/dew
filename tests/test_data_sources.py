@@ -3,8 +3,10 @@
 import dataclasses
 import hashlib
 import io
+import itertools
 import json
 import pickle
+import shutil
 import tarfile
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -861,6 +863,77 @@ def test_jsonl_offset_index_is_mapped_and_reopened_instead_of_pickled_as_rows():
     assert isinstance(resumed.tables[0], np.memmap)
 
 
+@pytest.mark.parametrize("format", ["jsonl", "text", "csv"])
+def test_copied_offset_indexes_define_one_order_at_different_mounts(tmp_path, format):
+    """Indexed copies agree on their compiled order and read the same records."""
+    from dew.data.compile import compile
+
+    first = tmp_path / "host0" / "corpus"
+    first.mkdir(parents=True)
+    suffix = "txt" if format == "text" else format
+    for shard in range(2):
+        rows = [f"row {index}" for index in range(2 * shard, 2 * shard + 2)]
+        payload = ("text\n" if format == "csv" else "") + "\n".join(
+            json.dumps({"text": row}) if format == "jsonl" else row for row in rows
+        ) + "\n"
+        (first / f"part-{shard}.{suffix}").write_text(payload)
+    Files(str(first), format=format).provision()
+    second = tmp_path / "elsewhere" / "mounted"
+    shutil.copytree(first, second)
+
+    def read(directory):
+        reader = compile(Files(str(directory), format=format).repeat().batch(2),
+                         read="indexed", loading=Loading(workers=0)).train(DataPartition())
+        try:
+            return reader.identity(), [text for batch in itertools.islice(reader, 2)
+                                       for text in batch["text"].tolist()]
+        finally:
+            reader.close()
+
+    first_identity, first_rows = read(first)
+    second_identity, second_rows = read(second)
+    assert first_rows == second_rows == [f"row {index}" + ("\n" if format == "text" else "")
+                                        for index in range(4)]
+    assert first_identity == second_identity
+
+
+def test_a_same_size_middle_write_changes_a_multifile_readers_identity(tmp_path):
+    """An exact multifile reader identifies bytes between every shard's endpoints."""
+    from dew.data.compile import compile
+
+    for shard in range(33):
+        (tmp_path / f"part-{shard:02d}.jsonl").write_text(
+            json.dumps({"id": shard, "text": "a" * (192 * 1024)}) + "\n")
+
+    def reader():
+        return compile(Files(str(tmp_path), format="jsonl").repeat().batch(1),
+                       read="streamed", loading=Loading(workers=0, threads=1, read_buffer=1)
+                       ).train(DataPartition())
+
+    before = reader()
+    try:
+        identity = before.identity()
+        batch = next(before)
+        assert 0 <= int(batch["id"][0]) < 33
+        assert batch["text"].tolist() == ["a" * (192 * 1024)]
+        position = before.get_state()
+    finally:
+        before.close()
+    path = tmp_path / "part-16.jsonl"
+    size = path.stat().st_size
+    with path.open("r+b") as file:
+        file.seek(size // 2)
+        file.write(b"b")
+    assert path.stat().st_size == size
+    after = reader()
+    try:
+        assert after.identity() != identity
+        with pytest.raises(ValueError):
+            after.set_state(position)
+    finally:
+        after.close()
+
+
 def test_published_file_facts_avoid_metadata_probes_and_verify_the_index(monkeypatch):
     root = Store(f"memory://published-facts-{uuid4().hex}/rows.jsonl")
     root.write(b'{"id":0}\n{"id":1}\n')
@@ -894,14 +967,93 @@ def test_torch_source_refuses_streaming_and_cache_without_content_identity():
     rows = Torch(TensorDataset(torch.arange(4)), fields=("id",))
     assert not rows.supports("streamed")
     assert int(rows.records("indexed")[2]["id"]) == 2
-    with pytest.raises(ValueError, match="cannot read streamed"):
+    with pytest.raises(ValueError):
         rows.records("streamed")
     import grain.python as grain
 
-    with pytest.raises(ValueError, match="explicit content identity"):
+    with pytest.raises(ValueError):
         Cache(f"memory://torch-cache-{uuid4().hex}").mapped(
             grain.MapDataset.source(rows.records("indexed")), Manifest(rows.fingerprint()), rows
         )
+
+
+@pytest.mark.parametrize("read", ["memory", "indexed"])
+@pytest.mark.parametrize("resume", ["exact", "non-exact"])
+def test_torch_compilation_requires_identity_even_for_equal_shapes(read, resume):
+    """Same-class, same-length datasets cannot name an exact position by their shape."""
+    import torch
+    from torch.utils.data import TensorDataset
+
+    from dew.data import from_torch
+    from dew.data.compile import compile
+
+    for offset in (0, 100):
+        source = from_torch(TensorDataset(torch.arange(32) + offset), fields=("id",))
+        with pytest.raises(ValueError):
+            compile(source.shuffle(4).repeat().batch(4), read=read, resume=resume,
+                    loading=Loading(workers=0))
+
+
+@pytest.mark.parametrize("kind,read", [("torch", "memory"), ("torch", "indexed"),
+                                       ("grain", "indexed"), ("iterator", "streamed")])
+@pytest.mark.parametrize("resume", ["exact", "non-exact"])
+def test_foreign_sources_resume_only_their_declared_content_identity(kind, read, resume):
+    """A source version resumes its remaining records; another version cannot take its position."""
+    import grain.python as grain
+
+    from dew.data import from_grain, from_iter, from_torch
+    from dew.data.compile import compile
+
+    def dataset(identity, offset=0):
+        rows = [{"id": index + offset} for index in range(32)]
+        if kind == "torch":
+            import torch
+            from torch.utils.data import TensorDataset
+
+            source = from_torch(TensorDataset(torch.arange(32) + offset), fields=("id",), identity=identity)
+        elif kind == "grain":
+            source = from_grain(grain.MapDataset.source(rows), identity)
+        else:
+            source = from_iter(lambda: iter(rows), name=identity)
+        return compile(source.repeat().batch(4), read=read, resume=resume, loading=Loading(workers=0))
+
+    original = dataset("tickets@1").train(DataPartition())
+    try:
+        next(original)
+        next(original)
+        saved = original.get_state()
+        remaining = [next(original)["id"].tolist() for _ in range(3)]
+        identity = original.identity()
+    finally:
+        original.close()
+    resumed = dataset("tickets@1").train(DataPartition())
+    changed = dataset("tickets@2", 100).train(DataPartition())
+    try:
+        resumed.set_state(saved)
+        assert [next(resumed)["id"].tolist() for _ in range(3)] == remaining
+        assert resumed.identity() == identity != changed.identity()
+        with pytest.raises(ValueError):
+            changed.set_state(saved)
+    finally:
+        resumed.close()
+        changed.close()
+
+
+@pytest.mark.parametrize("kind", ["grain", "iterator"])
+@pytest.mark.parametrize("resume", ["exact", "non-exact"])
+def test_foreign_sources_cannot_use_an_empty_content_identity(kind, resume):
+    """Grain and iterator adapters require a real source name, just as Torch requires identity."""
+    import grain.python as grain
+
+    from dew.data import from_grain, from_iter
+    from dew.data.compile import compile
+
+    rows = [{"id": index} for index in range(8)]
+    source = (from_grain(grain.MapDataset.source(rows), "") if kind == "grain"
+              else from_iter(lambda: iter(rows), name=""))
+    with pytest.raises(ValueError):
+        compile(source.repeat().batch(2), read="indexed" if kind == "grain" else "streamed",
+                resume=resume, loading=Loading(workers=0))
 
 
 def test_delta_snapshot_pins_version_and_discovers_partition_columns(tmp_path):

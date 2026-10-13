@@ -32,6 +32,8 @@ if TYPE_CHECKING:
         MinSide,
         NotFlat,
         Processor,
+        RandomCaption,
+        RandomCrop,
         RandomResizedCrop,
         Resize,
         Torchvision,
@@ -92,11 +94,6 @@ class Augment:
     jitter: bool
 
 
-# ColorJitter(brightness=0.2, contrast=0.05, saturation=0.2, hue=0): the three
-# factors' uniform ranges, applied in a random order per record.
-_JITTER_RANGES = ((0.8, 1.2), (0.95, 1.05), (0.8, 1.2))
-
-
 def augment_image(augment: Augment | None, image: np.ndarray,
                   rng: np.random.Generator) -> np.ndarray:
     """Flips and colour-jitters `image`, seeded by the record's own rng.
@@ -114,9 +111,9 @@ def augment_image(augment: Augment | None, image: np.ndarray,
     if not augment.jitter:
         return np.ascontiguousarray(image)
 
-    from .image_augmentation import jitter_host
+    from .image_augmentation import jitter_host, jitter_ranges
 
-    factors = np.asarray([rng.uniform(low, high) for low, high in _JITTER_RANGES])
+    factors = np.asarray([rng.uniform(low, high) for low, high in jitter_ranges()])
     pixels = jitter_host(image.astype(np.float32), factors, rng.permutation(3))
     return np.rint(pixels).astype(np.uint8)
 
@@ -133,12 +130,15 @@ def fetch(url: str = "url", to: str = "jpg", *, timeout: float = 10.0, max_bytes
     return Fetch(url, to, timeout, max_bytes)
 
 
-def decode(field: str = "jpg", to: str = "image") -> DecodeImage:
+def decode(field: str = "jpg", to: str = "image", *, at_least: int | None = None,
+           rejects: bool = True) -> DecodeImage:
     """A record step that decodes the image in `field` to RGB uint8 pixels
-    under `to`; bytes that are no image are counted and dropped."""
+    under `to`, including prepared ArrayRecord pixels, labels and captions;
+    bytes that are no image are counted and dropped. With `rejects=False`,
+    use `map` and fail on bad bytes. `at_least` bounds a reduced JPEG decode."""
     from dew.data.steps.image import DecodeImage
 
-    return DecodeImage(field, to=to)
+    return DecodeImage(field, at_least=at_least, to=to, rejects=rejects)
 
 
 def min_side(size: int, field: str = "image") -> MinSide:
@@ -190,6 +190,14 @@ def bucket(sizes: Sequence[tuple[int, int]], method: Interpolation = "area", *, 
     return Bucket(tuple((int(height), int(width)) for height, width in sizes), method, field, to)
 
 
+def random_crop(size: int, *, scale: tuple[float, float] = (0.8, 1.0), flip: bool = False,
+                jitter: bool = False) -> RandomCrop:
+    """A random step that crops to `scale` of the area and resizes to `size`."""
+    from dew.data.steps.image import RandomCrop
+
+    return RandomCrop(size, scale, flip, jitter)
+
+
 def random_resized_crop(size: int, *, scale: tuple[float, float] = (0.08, 1.0),
                         ratio: tuple[float, float] = (3 / 4, 4 / 3),
                         field: str = "image") -> RandomResizedCrop:
@@ -215,13 +223,18 @@ def color_jitter(brightness: float = 0.2, contrast: float = 0.05, saturation: fl
     return ColorJitter(brightness, contrast, saturation, field)
 
 
-def caption(template: str | None = None, *, classes: tuple[str, ...] = ()) -> Caption:
+def caption(template: str | None = None, *, templates: tuple[str, ...] = (),
+            classes: tuple[str, ...] = (),
+            columns: tuple[str, ...] = ("caption", "text")) -> Caption | RandomCaption:
     """A record step that writes "caption": `template` formatted with the
     record's fields ("{label}" is the class name `classes` gives its label),
-    or with none, the record's own caption or text."""
-    from dew.data.steps.image import Caption
+    or with none, the first of `columns`. With `templates`, a random step
+    instead draws one template per record; `{}` and `{label}` both name its class."""
+    from dew.data.steps.image import Caption, RandomCaption
 
-    return Caption(template, classes)
+    if templates:
+        return RandomCaption(template, classes, columns, templates)
+    return Caption(template, classes, columns)
 
 
 def processor(image_processor: ImageProcessor, *, field: str = "image",

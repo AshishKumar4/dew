@@ -735,7 +735,6 @@ def mode_pool_refusals(args) -> dict:
         "eof": trained(reads(ends=1 if other else None)),
         "layout": trained(reads(fields=("x",) if other else ("x", "y"))),
         "saved": trained(stream(64, 0), Checkpoints(str(Path(args.run_dir) / "saved")), checkpoint_every=1),
-        "counted": [corpus(64, 0).describe(), corpus(96, 0).describe()],
     }
     outcomes["latest"] = Checkpoints(str(Path(args.run_dir) / "saved")).latest
     if other:
@@ -1209,15 +1208,14 @@ def mode_evaluation_clocks(args) -> dict:
     import jax
     import optax
 
-    from dew.data import Dataset
     from dew.training import Layout, MeshSpec, Trainer
 
     objective, batch = text_to_image(args)
     trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(0), mesh=MeshSpec(),
                       layout=Layout(min_shard=TINY), checkpoints=None, tracker=None)
     state, _, _ = trainer.place()
-    data = Dataset(train=lambda partition: iter([batch]), val=lambda partition: iter([batch]),
-                   records=BATCH, batch=BATCH)
+    data = Loader(train=lambda partition: iter([batch]), val=lambda partition: iter([batch]),
+                  records=BATCH, batch=BATCH)
     ahead = 4 * jax.process_index()
     result = Evaluation.run(trainer.objective, state.variables, data.val, key=state.key, loss=True,
                             step=5 + ahead, schedule_step=np.int32(3 + ahead), mesh=trainer.device_mesh)

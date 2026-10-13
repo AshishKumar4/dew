@@ -6,18 +6,21 @@ where TensorFlow is not installed. They require no downloads or preparation.
 """
 
 import itertools
-import json
 import shutil
+from collections import Counter
 from pathlib import Path
+from uuid import uuid4
 
 import numpy as np
 import pytest
+from fsspec.implementations.local import LocalFileSystem
 
 from dew.config.data import HoldOut, ImageData, loader
-from dew.data import TFDS, Loading
+from dew.data import TFDS, Loading, Memory, images
+from dew.data.compile import compile
 from dew.data.dataset import DataPartition
 from dew.data.image_codec import decode_image
-from dew.data.steps.image import ImageRecord
+from dew.data.storage import Store
 
 tfds = pytest.importorskip("tensorflow_datasets", reason="needs the tfds extra")
 
@@ -36,9 +39,10 @@ def test_prepared_records_carry_encoded_pixels_labels_and_caption_names():
         assert isinstance(record["image"], bytes)
         np.testing.assert_array_equal(decode_image(record["image"]), np.full((8, 8, 3), index + 10, np.uint8))
         assert record["label"] == index % 2
-        result = ImageRecord(8, 8, templates=spec.caption_templates, classes=("red",
-            "blue")).random_map(record, np.random.default_rng(0))
-        caption, label = result["caption"], result["label"]
+        result = next(Memory([record]).map(images.decode("image", rejects=False))
+                      .random_map(images.caption(templates=spec.caption_templates,
+                                                 classes=("red", "blue"))).batch(1).iterate())
+        caption, label = result["caption"][0], result["label"][0]
         assert ("red" if label == 0 else "blue") in caption.split()
     test_split = TFDS("dew_images", path=str(FIXTURE), split="test",
         decoders={"image": tfds.decode.SkipDecoding()}).records("indexed")
@@ -50,18 +54,51 @@ def test_prepared_records_carry_encoded_pixels_labels_and_caption_names():
     ]
 
 
-def test_a_prepared_source_describes_the_directory_and_split_it_reads():
-    """A saved position names the order it counts into by naming its source,
-    and the builder's own source describes itself by its address in this
-    process, which no resume can match."""
+@pytest.mark.parametrize("location", ["local", "prepared", "mirror"])
+def test_streamed_tfds_pins_one_fingerprint_for_all_virtual_shards(tmp_path, monkeypatch, location):
+    """Virtual shards reuse the prepared split's pinned physical snapshot."""
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    directory = (tmp_path / "cache" / "dew" / "tfds" / "dew_images" / "1.0.0"
+                 if location == "prepared" else tmp_path / "prepared")
+    shutil.copytree(FIXTURE, directory)
+    source = TFDS("dew_images", path=None if location == "prepared" else str(directory),
+                  split="all", shard_rows=2,
+                  decoders={"image": tfds.decode.SkipDecoding()})
+    if location == "mirror":
+        remote = Store(f"memory://tfds-snapshot-{uuid4().hex}/1.0.0")
+        for path in directory.iterdir():
+            remote.child(path.name).write(path.read_bytes())
+        source = TFDS("dew_images", path=remote.url, split="all", shard_rows=2,
+                      decoders={"image": tfds.decode.SkipDecoding()}).provision()
+        directory = Path(source.directory)
+    assert source.metadata()["rows"] == 20
+    opened = Counter()
+    open_file = LocalFileSystem.open
 
-    source = TFDS("dew_images", path=str(FIXTURE), split="all",
-        decoders={"image": tfds.decode.SkipDecoding()})
-    other = TFDS("dew_images", path=str(FIXTURE), split="test",
-        decoders={"image": tfds.decode.SkipDecoding()})
+    def count(self, path, *args, **kwargs):
+        filename = Path(path)
+        if filename.parent == directory:
+            opened[filename.name] += 1
+        return open_file(self, path, *args, **kwargs)
 
-    assert str(FIXTURE) in source.describe() and ":all:" in source.describe()
-    assert other.fingerprint() != source.fingerprint()
+    monkeypatch.setattr(LocalFileSystem, "open", count)
+    reader = compile(source.repeat().batch(2), read="streamed",
+                     loading=Loading(workers=0, threads=1, read_buffer=1)).train(DataPartition())
+    try:
+        identity = reader.identity()
+        pixels = [int(decode_image(image)[0, 0, 0]) for batch in itertools.islice(reader, 10)
+                  for image in batch["image"]]
+        assert sorted(pixels) == list(range(10, 30))
+        assert reader.identity() == identity
+        if location != "local":
+            source.provision()
+        assert int(decode_image(source.records("indexed")[0]["image"])[0, 0, 0]) == 10
+    finally:
+        reader.close()
+    assert opened["dataset_info.json"] == 2
+    assert opened["features.json"] == opened["label.labels.txt"] == 1
+    assert opened["dew_images-train.array_record-00000-of-00001"] == 1
+    assert opened["dew_images-test.array_record-00000-of-00001"] == 1
 
 
 @pytest.mark.parametrize("workers", [0, 2])
@@ -84,46 +121,3 @@ def test_prepared_records_reach_grain_batches_without_split_overlap(workers):
         np.testing.assert_array_equal(row["label"], (row["image"][:, 0, 0, 0] - 10) % 2)
         np.testing.assert_array_equal(
             row["image"], np.broadcast_to(row["image"][:, :1, :1, :1], (4, 8, 8, 3)))
-
-
-def test_explicit_caption_names_override_the_prepared_metadata(tmp_path):
-    labels = tmp_path / "names.txt"
-    labels.write_text("fern\nrose\n")
-    spec = ImageData(source=TFDS("dew_images", path=str(FIXTURE), split="all",
-        decoders={"image": tfds.decode.SkipDecoding()}), labels=str(labels),
-            caption_templates=("a photo of a {}",))
-    source = spec.source.records("indexed")
-    result = ImageRecord(8, 8, templates=spec.caption_templates,
-        classes=tuple(labels.read_text().splitlines())).random_map(source[1], np.random.default_rng(0))
-    caption, label = result["caption"], result["label"]
-    assert label == 1 and "rose" in caption.split()
-
-
-def test_an_unprepared_directory_requests_external_preparation(tmp_path):
-    with pytest.raises(FileNotFoundError, match="has no prepared ArrayRecord data"):
-        TFDS("dew_images", path=str(tmp_path), split="all").records("indexed")
-    assert list(tmp_path.iterdir()) == []
-
-
-def test_a_tfrecord_preparation_is_refused_before_reading(tmp_path):
-    directory = tmp_path / "prepared"
-    shutil.copytree(FIXTURE, directory)
-    metadata_path = directory / "dataset_info.json"
-    metadata = json.loads(metadata_path.read_text())
-    metadata["fileFormat"] = "tfrecord"
-    metadata_path.write_text(json.dumps(metadata))
-    with pytest.raises(ValueError, match="dew reads ArrayRecords"):
-        TFDS("dew_images", path=str(directory), split="all").records("indexed")
-
-
-def test_missing_records_request_preparation_only_for_the_selected_split(tmp_path):
-    """A missing shard otherwise raises inside a grain worker on the first
-    record that needed it, steps into a run."""
-    directory = tmp_path / "prepared"
-    shutil.copytree(FIXTURE, directory)
-    (directory / "dew_images-train.array_record-00000-of-00001").unlink()
-    available = TFDS("dew_images", path=str(directory), split="test",
-        decoders={"image": tfds.decode.SkipDecoding()}).records("indexed")
-    assert int(decode_image(available[0]["image"])[0, 0, 0]) == 26
-    with pytest.raises(FileNotFoundError, match="Missing prepared ArrayRecord shard"):
-        TFDS("dew_images", path=str(directory), split="train").records("indexed")

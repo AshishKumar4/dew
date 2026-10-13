@@ -24,11 +24,12 @@ import numpy as np
 
 from dew.data.analysis import _analyzed, _identity, _name
 from dew.data.dataset import Batch, LengthGroups, Records
-from dew.data.lowering import _CachedOutputs, _fill, _Locality, _outputs, _packed, _Payload, _TokenSplit
+from dew.data.lowering import _CachedOutputs, _fill, _Locality, _outputs, _packed, _TokenSplit
 from dew.data.mixing import CorpusCounts
 from dew.data.pipeline import (
     FlatMap,
     Group,
+    Map,
     Mixture,
     Pack,
     Phases,
@@ -41,6 +42,8 @@ from dew.data.pipeline import (
 )
 from dew.data.plan import fingerprint
 from dew.data.sources.base import Read, ShardManifest, Source
+from dew.data.steps.generic import Fields
+from dew.data.steps.text import CountTargets, ValidTargets
 from dew.records import JSON, integer, json_value, record
 
 _log = logging.getLogger(__name__)
@@ -48,6 +51,8 @@ _log = logging.getLogger(__name__)
 
 @dataclasses.dataclass(frozen=True)
 class _Memory:
+    """Accepted rows and their facts, keeping measured targets through field projections."""
+
     original: Source
     held: tuple[Batch | bytes, ...]
     measured: np.ndarray | None
@@ -56,6 +61,7 @@ class _Memory:
     identifiers: tuple[tuple[int, ...], ...] = ()
     inputs: int = 0
     ran: tuple[Stage, ...] = ()
+    target_counts: tuple[int, ...] | None = None
 
     def describe(self) -> str:
         return self.original.describe()
@@ -170,9 +176,17 @@ def _memory_stages(
 ) -> Pipeline:
     derived: dict[str, str] = {}
     targets: Mapping[str, int] | None = None
+    counted: dict[tuple[int, ...], int] | None = (
+        dict(zip(source.identifiers, source.target_counts, strict=True))
+        if isinstance(source, _Memory) and source.target_counts is not None
+        else None
+    )
     for stage in pipeline.stages[consumed:eager]:
         if isinstance(stage, TokenSplit):
             split = _TokenSplit(pygrain.MapDataset.source([value for _, value in rows]), stage)
+            if counted is not None:
+                counted = {(*rows[row][0], first, last): counted[rows[row][0]]
+                           for row, first, last in split.spans}
             spans = enumerate(split.spans)
             rows = [((*rows[row][0], first, last), split[index]) for index, (row, first, last) in spans]
         elif isinstance(stage, Windows):
@@ -190,7 +204,8 @@ def _memory_stages(
             derived[f"accepted_before_pack_{consumed}"] = fingerprint(
                 [list(identifier) for identifier, _ in rows]
             )
-            documents = tuple(_Payload()(record(value, "packing document")) for _, value in rows)
+            kept = Fields(stage.fields)
+            documents = tuple(kept.map(record(value, "packing document")) for _, value in rows)
             sizes = np.asarray([len(value[stage.fields[0]]) for value in documents], np.int64)
             if stage.policy == "first-fit":
                 packed = PackedWindows(
@@ -205,29 +220,36 @@ def _memory_stages(
             rows, targets = _targeted([((index,), packed[index]) for index in range(len(packed))], counter)
         else:
             expanded: list[tuple[tuple[int, ...], Record]] = []
+            expanded_counts: dict[tuple[int, ...], int] = {}
+            counts_targets = isinstance(stage, Map) and isinstance(stage.step, CountTargets)
             for identifier, value in rows:
                 for child, output in enumerate(_outputs(stage, identifier[0], value)):
                     if isinstance(output, Rejected):
                         counter.rejected[output.reason] += 1
                     else:
-                        expanded.append(
-                            ((*identifier, child) if isinstance(stage, FlatMap) else identifier, output)
-                        )
+                        output_id = (*identifier, child) if isinstance(stage, FlatMap) else identifier
+                        expanded.append((output_id, output))
+                        if counts_targets:
+                            expanded_counts[output_id] = ValidTargets()(record(output, "counted row"))
+                        elif counted is not None:
+                            expanded_counts[output_id] = counted[identifier]
             rows = expanded
+            if counts_targets or counted is not None:
+                counted = expanded_counts
         consumed += 1
+    if counted is not None:
+        targets = {"windows": len(rows), "valid_targets": sum(counted.values())}
     if targets is not None and targets["valid_targets"] == 0 and training:
         raise ValueError(f"corpus {_name(pipeline)} has zero valid target tokens")
     inputs = source.inputs if isinstance(source, _Memory) else len(stored)
-    return _memory_order(pipeline, rows, consumed, source, inputs, counter, derived, groups, targets)
+    return _memory_order(pipeline, rows, consumed, source, inputs, counter, derived, groups, targets, counted)
 
 
 def _targeted(
     rows: list[tuple[tuple[int, ...], Record]], counter: CorpusCounts
 ) -> tuple[list[tuple[tuple[int, ...], Record]], Mapping[str, int]]:
     """The windows a pack or windows stage made that hold a valid target, and
-    their count and targets, taken where the windows are made so later steps
-    cannot change them."""
-    from dew.data.steps.text import ValidTargets
+    their counts before record steps rename or remove their token fields."""
 
     kept, total = [], 0
     for identifier, value in rows:
@@ -282,6 +304,7 @@ def _memory_order(
     derived: dict[str, str],
     groups: LengthGroups | None,
     packed: Mapping[str, int] | None,
+    counted: Mapping[tuple[int, ...], int] | None,
 ) -> Pipeline:
     rows = [
         (identifier, value if isinstance(value, bytes) else record(value, "materialized record"))
@@ -324,6 +347,7 @@ def _memory_order(
             tuple(identifier for identifier, _ in rows),
             inputs,
             pipeline.stages[:consumed],
+            None if counted is None else tuple(counted[identifier] for identifier, _ in rows),
         ),
         stages=remaining,
     )

@@ -77,6 +77,7 @@ from dew.data.pipeline import (
 from dew.data.plan import Manifest
 from dew.data.readers import _FillShare, _GroupedRows
 from dew.data.sources.base import Read, Shard, ShardManifest, Source
+from dew.data.steps.generic import Fields
 from dew.data.tokens import _WrappingDataset
 from dew.records import integer, record
 
@@ -610,7 +611,7 @@ class _Build:
                 raise ValueError(f"token split in {_name(pipeline)} needs a finite indexed order")
             rows, lengths = _TokenSplit(rows, stage), None
         elif isinstance(stage, Pack):
-            rows = _packed(_as_iter(rows, self.loading).map(_Payload()), stage)
+            rows = _packed(_as_iter(rows, self.loading).map(Fields(stage.fields)), stage)
             lengths = None
         elif isinstance(stage, Windows):
             from dew.data.steps.windows import CausalWindows

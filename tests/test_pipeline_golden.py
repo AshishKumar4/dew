@@ -1,4 +1,7 @@
-"""Every migrated loader against bytes frozen at 66beb5305, with real workers."""
+"""Loader batches and RNG against frozen references, with real workers.
+
+Images pin the public-stage recipe; the other loaders pin 66beb5305.
+"""
 
 import gzip
 import hashlib

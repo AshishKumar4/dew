@@ -1,0 +1,357 @@
+"""The vision transformer Qwen 3.5's, MiMo's and Muse Glimmer's towers share, and the merge projector.
+
+A family's config states its `ViTLayout`: the patch map and the learned position table it resamples,
+the block (its norm, heads and feed-forward), the 2D rotary's axis order, and per layer the attention
+(full over a frame, a band of keys either side of each query, or a square window of patches), the
+token order the layer runs in and whether it adds attention sinks. Packed pixels arrive as the
+family's processor writes them, `[B, patches, pixels]` with each row's `[time, height, width]` grid;
+NCHW images are packed here. The tower returns the trunk sequence in merge-block order, each merge
+block's patches consecutive, which `MergeProjector` groups and maps to the decoder width.
+
+Each family's reference, transformers 5.16.1's `models/qwen3_5/modeling_qwen3_5.py` and
+`models/muse_glimmer/modeling_muse_glimmer.py` and MiMo-V2.6's `modeling_mimo_v2.py`, names its parts;
+`qwen35`, `mimo` and `muse_glimmer` hold the configs and checkpoint maps.
+"""
+
+import dataclasses
+import functools
+from collections.abc import Callable, Mapping
+from typing import Literal
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+from flax import linen as nn
+from flax.typing import Dtype, PrecisionLike
+
+from dew.interop.weights import ParamTree, checkpoint_array, translate_parameters
+from dew.nn.activations import activation as named_activation
+from dew.nn.attention import LayerNorm, RMSNorm
+from dew.nn.backbones.decoder_block import DecoderBlock
+from dew.nn.inputs import AttentionMetadata
+from dew.nn.text_encoders import clip_layer
+
+Attention = Literal["full", "band", "window"]
+Order = Literal["patches", "columns", "windows"]
+
+
+@dataclasses.dataclass(frozen=True)
+class ViTLayout:
+    """The geometry and wiring of one family's tower.
+
+    `attention`, `order` and `sinks` name each layer's: its keys (a frame's every patch, `band` keys
+    either side in the layer's order, or the patches of its `window`-patch square), the order its
+    tokens run in (the processor's, merge blocks column by column, or window by window), and whether
+    a learned logit per head joins the first key of each frame (MiMo's sinks). `rotary_columns_first`
+    turns the first rotary half by the column and the second by the row, both counted from
+    `rotary_origin`; the position table, `position_table` entries square, resamples with or without
+    aligned corners (`F.interpolate`'s flag; without, out-of-range taps weigh zero as
+    `F.grid_sample`'s zero padding). `merge_blocks` is the processor's patch order: merge block by
+    merge block, else raster; `channels_first` its pixel order in a patch, channels then time, else
+    time then channels. `mlp_packed` keeps a gated feed-forward's gate and up maps in one (as
+    `packed` the attention's queries, keys and values). `post_norm` names the norm after the
+    blocks, a layer or an RMS norm, or none; `grid_output` returns NCHW images' trunk as their
+    `[B, rows, columns, F]` patch grid, for a projector that pools it.
+    """
+
+    depth: int
+    hidden_size: int
+    num_heads: int
+    num_kv_heads: int
+    head_dim: int
+    intermediate_size: int
+    activation: str
+    in_channels: int
+    patch_size: int
+    temporal_patch_size: int
+    spatial_merge_size: int
+    norm_type: Literal["rms", "layer", "fast_layer"]
+    norm_eps: float
+    norm_bias: bool
+    mlp_bias: bool
+    packed: bool
+    patch_bias: bool
+    attention: tuple[Attention, ...]
+    order: tuple[Order, ...]
+    sinks: tuple[bool, ...]
+    position_table: int = 0
+    align_corners: bool = True
+    pre_norm: bool = False
+    post_norm: Literal["layer", "rms"] | None = None
+    outer_norm_eps: float = 1e-5
+    mlp_packed: bool = False
+    grid_output: bool = False
+    rope_theta: float = 10000.0
+    rotary_columns_first: bool = False
+    rotary_origin: int = 0
+    band: int = 0
+    window: int = 0
+    merge_blocks: bool = True
+    channels_first: bool = True
+
+    def __post_init__(self):
+        if not len(self.attention) == len(self.order) == len(self.sinks) == self.depth:
+            raise ValueError(f"{self.depth} layers need an attention, an order and a sinks flag each")
+        if self.head_dim % 4:
+            raise ValueError(f"head_dim {self.head_dim} splits into no height and width rotary pairs")
+
+
+def _interp_taps(index, size, side: int, align_corners: bool):
+    """Bilinear taps into a `side`-long table for positions along one axis, and their weights:
+    transformers' `_interpolation_axis_taps_weights` (vision_utils.py) with aligned corners, or with
+    half-pixel centres and out-of-range taps weighing zero."""
+    index = index.astype(jnp.float32)
+    if align_corners:
+        source = index * (side - 1) / jnp.maximum(size - 1, 1)
+    else:
+        source = (index + 0.5) * side / size - 0.5
+    floor = jnp.floor(source)
+    raw = floor.astype(jnp.int32)[..., None] + jnp.arange(2)
+    distance = (source - floor)[..., None]
+    weights = jnp.concatenate([1 - distance, distance], axis=-1).clip(min=0)
+    if not align_corners:
+        weights = weights * ((raw >= 0) & (raw <= side - 1))
+    return jnp.clip(raw, 0, side - 1), weights
+
+
+def resampled_positions(table, rows, columns, heights, widths, *, align_corners: bool):
+    """The learned square table resampled to each patch's grid place: bilinear over its rows and
+    columns separately, the outer product of the taps (vision_utils.py,
+    get_vision_interpolation_indices_and_weights)."""
+    side = round(len(table) ** 0.5)
+    row_taps, row_weights = _interp_taps(rows, heights, side, align_corners)
+    column_taps, column_weights = _interp_taps(columns, widths, side, align_corners)
+    indices = (row_taps[..., :, None] * side + column_taps[..., None, :]).reshape(*rows.shape, 4)
+    weights = (row_weights[..., :, None] * column_weights[..., None, :]).reshape(*rows.shape, 4)
+    return (table[indices] * weights[..., None]).sum(axis=-2)
+
+
+def vit_block(layout: ViTLayout, index: int, *, dtype: Dtype | None,
+              precision: PrecisionLike) -> DecoderBlock:
+    """Layer `index`'s block (`clip_layer`): a pre-norm attention over the 2D rotary, over a band of
+    keys where the layout says, and a pre-norm feed-forward, both residual."""
+    band = layout.attention[index] == "band"
+    return clip_layer(layout.hidden_size, layout.num_heads, layout.intermediate_size, 1,
+                      kv_heads=layout.num_kv_heads, head_dim=layout.head_dim, activation=layout.activation,
+                      eps=layout.norm_eps, norm_type=layout.norm_type, norm_bias=layout.norm_bias,
+                      mlp_bias=layout.mlp_bias, mlp_packed=layout.mlp_packed,
+                      rotary_axes=(layout.head_dim // 2,) * 2, rope_theta=layout.rope_theta,
+                      packed=layout.packed, window=layout.band if band else None, dtype=dtype,
+                      precision=precision, name=f"blocks_{index}")
+
+
+def _gather(x, index):
+    """`x`'s rows `[B, L, ...]` taken in `index` `[B, L]` order; None takes them as they are."""
+    if x is None or index is None:
+        return x
+    return jnp.take_along_axis(x, index.reshape(*index.shape, *(1,) * (x.ndim - 2)), axis=1)
+
+
+class VisionTransformer(nn.Module):
+    """A family's trunk (`ViTLayout`): patches mapped and placed, the blocks, and the trunk sequence
+    in merge-block order.
+
+    Packed pixels `[B, patches, pixels]` come with each row's `[time, height, width]` patch grid, a
+    row's padding past its patches; attention stays inside a frame, or a window of it, and padding
+    (segment 0) sees nothing. NCHW images are one frame each, repeated along time, packed in the
+    processor's order. Each layer runs in its own token order, the tokens, their rotary places and
+    their frames gathered into it from the previous layer's; the sequence returns to the processor's
+    order after the last.
+    """
+
+    layout: ViTLayout
+    dtype: Dtype | None = None
+    precision: PrecisionLike = None
+
+    @nn.compact
+    def __call__(self, pixel_values, grid_thw=None) -> jax.Array:
+        lay = self.layout
+        pixels, grid, images = self._packed(jnp.asarray(pixel_values), grid_thw)
+        length = pixels.shape[1]
+        merge = lay.spatial_merge_size
+        heights, widths = grid[:, 1:2], grid[:, 2:3]
+        area = heights * widths
+        place = jnp.arange(length)[None, :]
+        within = place % area
+        if lay.merge_blocks:
+            blocks_wide = widths // merge
+            rows = (within // (merge * merge * blocks_wide)) * merge + (within // merge) % merge
+            columns = ((within // (merge * merge)) % blocks_wide) * merge + within % merge
+        else:
+            rows, columns = within // widths, within % widths
+        valid = place < jnp.prod(grid, axis=1, keepdims=True)
+        frame = place // area
+
+        hidden = nn.Dense(lay.hidden_size, use_bias=lay.patch_bias, dtype=self.dtype,
+                          precision=self.precision, name="patch_embed")(pixels)
+        if lay.position_table:
+            table = nn.Embed(lay.position_table, lay.hidden_size, dtype=self.dtype, name="position_table")
+            hidden = hidden + resampled_positions(jnp.asarray(table.embedding, hidden.dtype), rows, columns,
+                                                  heights, widths, align_corners=lay.align_corners)
+        outer = functools.partial(LayerNorm, epsilon=lay.outer_norm_eps, dtype=self.dtype)
+        if lay.pre_norm:
+            hidden = outer(name="pre_norm")(hidden)
+
+        axes = (columns, rows) if lay.rotary_columns_first else (rows, columns)
+        rotary = jnp.stack(axes, axis=-1) + lay.rotary_origin
+        last = jnp.iinfo(jnp.int32).max
+        # Each order's key: a token's place in it, padding last.
+        keys = {"patches": place, "columns": None, "windows": None}
+        if "columns" in lay.order:
+            # Merge blocks column by column, each block's patches as they came (MiMo's window index).
+            unit, blocks_wide = within // (merge * merge), widths // merge
+            keys["columns"] = (frame * area + (unit % blocks_wide) * (heights // merge) * merge * merge
+                               + (unit // blocks_wide) * merge * merge + within % (merge * merge))
+        windows = None
+        if "window" in lay.attention or "windows" in lay.order:
+            side = lay.window
+            across = -(-widths // side)
+            square = (rows // side) * across + columns // side
+            windows = frame * (-(-heights // side)) * across + square
+            keys["windows"] = windows * side * side + (rows % side) * side + columns % side
+        orders = {name: None if name == "patches"
+                  else jnp.argsort(jnp.where(valid, key, last), axis=1, stable=True)
+                  for name, key in keys.items() if key is not None}
+
+        segments = {
+            # An NCHW image is one frame with no padding: its full layers attend unmasked.
+            "full": None if images else jnp.where(valid, frame + 1, 0),
+            "band": jnp.where(valid, frame + 1, 0),
+            "window": None if windows is None else jnp.where(valid, windows + 1, 0),
+        }
+        current = "patches"
+        for index in range(lay.depth):
+            wanted = lay.order[index]
+            if wanted != current:
+                leaving, entering = orders[current], orders[wanted]
+                if leaving is not None:
+                    back = jnp.argsort(leaving, axis=1)
+                    entering = back if entering is None else jnp.take_along_axis(back, entering, axis=1)
+                hidden = _gather(hidden, entering)
+                current = wanted
+            order = orders[current]
+            segment = _gather(segments[lay.attention[index]], order)
+            bias = None
+            if lay.sinks[index]:
+                sinks = self.param(f"sinks_{index}", nn.initializers.zeros, (lay.num_heads,))
+                frames = _gather(jnp.where(valid, frame + 1, 0), order)
+                first = (frames != jnp.pad(frames, ((0, 0), (1, 0)))[:, :-1]) & (frames > 0)
+                bias = jnp.where(first[:, None, None, :], sinks[None, :, None, None], 0.0)
+            metadata = AttentionMetadata(rotary_positions=_gather(rotary, order), position_bias=bias)
+            hidden = vit_block(lay, index, dtype=self.dtype, precision=self.precision)(
+                hidden, segment_ids=segment, attention_metadata=metadata)
+            # A block without hyper-connections hands on the plain residual.
+            assert isinstance(hidden, jax.Array)
+        leaving = orders[current]
+        if leaving is not None:
+            hidden = _gather(hidden, jnp.argsort(leaving, axis=1))
+        if lay.post_norm == "layer":
+            hidden = outer(name="post_norm")(hidden)
+        elif lay.post_norm == "rms":
+            hidden = RMSNorm(epsilon=lay.outer_norm_eps, dtype=self.dtype, name="post_norm")(hidden)
+        if not lay.merge_blocks and merge > 1:
+            # Raster patches into merge blocks, each block's patches consecutive (pixel_shuffle's gather).
+            block = frame * area + (rows // merge) * merge * widths + (columns // merge) * merge * merge
+            key = block + (rows % merge) * merge + columns % merge
+            hidden = _gather(hidden, jnp.argsort(jnp.where(valid, key, last), axis=1, stable=True))
+        if lay.grid_output:
+            if not images:
+                raise ValueError("a tower returning its patch grid takes NCHW images")
+            height, width = jnp.shape(pixel_values)[2:]
+            hidden = hidden.reshape(hidden.shape[0], height // lay.patch_size, width // lay.patch_size, -1)
+        return hidden
+
+    def _packed(self, pixels, grid_thw):
+        """Packed pixels and their grids `[B, 3]`, and whether they came as NCHW images."""
+        lay = self.layout
+        merge, patch = lay.spatial_merge_size, lay.patch_size
+        if pixels.ndim == 4:
+            if grid_thw is not None:
+                raise ValueError("grid_thw accompanies packed pixels, not NCHW images")
+            batch, channels, height, width = pixels.shape
+            stride = patch * merge
+            if channels != lay.in_channels or height % stride or width % stride:
+                raise ValueError(f"pixel_values must be {lay.in_channels}-channel images tiled by "
+                                 f"{stride}px blocks")
+            rows, columns = height // patch, width // patch
+            if lay.merge_blocks:
+                blocks = pixels.reshape(batch, channels, rows // merge, merge, patch, columns // merge, merge,
+                                        patch).transpose(0, 2, 5, 3, 6, 1, 4, 7)
+            else:
+                blocks = pixels.reshape(batch, channels, rows, patch, columns, patch).transpose(
+                    0, 2, 4, 1, 3, 5)
+            flat = blocks.reshape(batch, rows * columns, 1, channels, patch, patch)
+            frames = jnp.broadcast_to(
+                flat, (batch, rows * columns, lay.temporal_patch_size, channels, patch, patch))
+            if lay.channels_first:
+                frames = frames.transpose(0, 1, 3, 2, 4, 5)
+            pixels = frames.reshape(batch, rows * columns, -1)
+            grid = jnp.broadcast_to(jnp.array([1, rows, columns], jnp.int32), (batch, 3))
+            return pixels, grid, True
+        if pixels.ndim != 3 or pixels.shape[-1] != lay.in_channels * lay.temporal_patch_size * patch ** 2:
+            raise ValueError("packed pixels must be [B, patches, C * temporal_patch_size * patch_size**2]")
+        if grid_thw is None or jnp.shape(grid_thw) != (pixels.shape[0], 3):
+            raise ValueError("packed pixels require aligned [B, 3] grid_thw")
+        return pixels, jnp.asarray(grid_thw), False
+
+
+class MergeProjector(nn.Module):
+    """Each merge block's features as one vector, mapped to the decoder width.
+
+    The trunk sequence comes in merge-block order (`VisionTransformer`). With `norm`, a layer norm
+    first (Qwen 3.5's and MiMo's merger); `bias` gives it and both maps their biases. Each block's
+    `merge**2` features join unit by unit, or channel by channel where `channel_major` (Muse
+    Glimmer's `pixel_shuffle`), and pass two maps with the checkpoint's `activation` (its
+    `hidden_act` name) between them, and after the second too where `activation_after` (Muse
+    Glimmer's adapter).
+    """
+
+    hidden_size: int
+    spatial_merge_size: int
+    width: int
+    out_width: int
+    norm: bool = True
+    channel_major: bool = False
+    bias: bool = True
+    activation: str = "gelu"
+    activation_after: bool = False
+    dtype: Dtype | None = None
+    precision: PrecisionLike = None
+
+    @nn.compact
+    def __call__(self, image_features) -> jax.Array:
+        batch, count, _ = image_features.shape
+        block = self.spatial_merge_size ** 2
+        if count % block:
+            raise ValueError(f"{count} patch features do not group into "
+                             f"{self.spatial_merge_size}x{self.spatial_merge_size} merge blocks")
+        if self.norm:
+            image_features = LayerNorm(epsilon=1e-6, use_bias=self.bias, dtype=self.dtype,
+                                       name="norm")(image_features)
+        grouped = image_features.reshape(batch, count // block, block, self.hidden_size)
+        if self.channel_major:
+            grouped = grouped.swapaxes(-1, -2)
+        grouped = grouped.reshape(batch, count // block, block * self.hidden_size)
+        act = named_activation(self.activation)
+        dense = functools.partial(nn.Dense, use_bias=self.bias, dtype=self.dtype, precision=self.precision)
+        out = dense(self.out_width, name="fc2")(act(dense(self.width, name="fc1")(grouped)))
+        return act(out) if self.activation_after else out
+
+
+PATCH_CONVOLUTION = "patch_embed.proj.weight"
+"""Where the Qwen-style towers keep their patch map: a `[out, in, time, h, w]` convolution."""
+
+
+def translate_vit_weights(hf_tensors: Mapping[str, np.ndarray],
+                          path_of: Callable[[str], tuple[str, ...] | None],
+                          param_dtype: str = "float32") -> ParamTree:
+    """A trunk's parameters from its tensors through its family's `path_of`, the patch convolution
+    `PATCH_CONVOLUTION`, where the checkpoint has one, landing as one Dense map over the processor's
+    channel, time and pixel order."""
+    params = translate_parameters({name: tensor for name, tensor in hf_tensors.items()
+                                   if name != PATCH_CONVOLUTION}, path_of, param_dtype)
+    if PATCH_CONVOLUTION in hf_tensors:
+        conv = checkpoint_array(hf_tensors[PATCH_CONVOLUTION], param_dtype)
+        params.setdefault("patch_embed", {})["kernel"] = np.ascontiguousarray(
+            conv.transpose(1, 2, 3, 4, 0).reshape(-1, conv.shape[0]))
+    return params

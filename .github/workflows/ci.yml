@@ -11,6 +11,10 @@ on:
   pull_request:
     branches: [ "main" ]
   workflow_dispatch:
+  # Daily, main's every test file runs, the test cache aside (tools/armada/ci.py), so nothing it
+  # skipped can hide.
+  schedule:
+    - cron: "17 9 * * *"
   # The release workflow runs all of this on the release's own commit and
   # publishes only if every job passes.
   workflow_call:
@@ -29,7 +33,7 @@ env:
 
 jobs:
   # A commit this workflow passed on another push, as one proved on
-  # ci/integration before main takes it, is not proved again: lint, types and
+  # ci/integration before main takes it, is not proved again: lint and
   # package skip, and the test job finds armada's verdict. A pull request, a
   # dispatch and the release's call run everything.
   proven:
@@ -68,18 +72,8 @@ jobs:
     - name: Install dependencies
       run: |
         sh tools/install_environment.sh cpu --system
-    - name: The locks match pyproject.toml and constraints.txt
-      run: sh tools/lock_environment.sh && git diff --exit-code locks/
-    - name: Lint with flake8
-      run: |
-        # stop the build if there are Python syntax errors or undefined names; the
-        # landing page's sampling and text cells run after their setup cell, which defines their names
-        flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics --extend-exclude=site/src/data/sampler.py,site/src/data/text.py
-    - name: Lint
-      run: |
-        uvx ruff@0.14.3 check src/dew tests tools/lint_slop.py tools/complexity.py tools/mutation.py examples recipes
-        JAX_PLATFORMS=cpu python tools/lint_slop.py
-        python tools/complexity.py src/dew tools/lint_slop.py examples recipes > complexity.json
+    - name: Every cheap gate (tools/check.sh), all failures reported
+      run: sh tools/check.sh
     - name: Upload the complexity distribution
       uses: actions/upload-artifact@v4
       with:
@@ -99,32 +93,8 @@ jobs:
       run: |
         node site/scripts/sync-docs.mjs --check
         node site/scripts/render-notebooks.mjs --check
-        uv run --no-project --with griffe==2.3.0 python site/scripts/gen_api.py --check
-        uv run --no-project --with griffe==2.3.0 --with pytest python -m pytest -q --noconftest tests/test_gen_api.py
         JAX_PLATFORMS=cpu python site/scripts/gen_models.py --check
         python site/scripts/gen_examples.py --check
-
-  types:
-    needs: proven
-    if: needs.proven.outputs.run == ''
-    runs-on: ubuntu-latest
-    steps:
-    - uses: actions/checkout@v4
-    - uses: actions/setup-python@v5
-      with:
-        # The compatibility floor, which pyright checks syntax against.
-        python-version: "3.12"
-    - uses: astral-sh/setup-uv@v6
-      with:
-        enable-cache: true
-        cache-dependency-glob: locks/cpu.txt
-    - name: Install dependencies
-      run: |
-        # pyright resolves every import in src/dew, the optional readers' included: the
-        # test suite's environment (pyproject.toml's `ci` extra) holds every one.
-        sh tools/install_environment.sh cpu --system
-    - name: Type check
-      run: uvx pyright@1.1.406 --pythonpath "$(which python)" src/dew
 
   # What PyPI receives, installed the way a user installs it: the sdist and
   # wheel build, pass twine, and name no requirement by URL, which PyPI
@@ -224,10 +194,15 @@ jobs:
       env:
         ARMADA_URL: ${{ secrets.ARMADA_URL }}
         ARMADA_TOKEN: ${{ secrets.ARMADA_TOKEN }}
+        # The plan reads the test cache with a token that cannot write it.
+        DEW_TEST_CACHE_TOKEN: ${{ secrets.DEW_TEST_CACHE_READ_TOKEN }}
+        DEW_TEST_CACHE: ${{ github.event_name == 'schedule' && 'off' || 'on' }}
       run: |
         armada="bunx --bun $ARMADA"
-        # Its own deadline sits below this job's 40 minutes, so a hang is armada's named error.
-        $armada verdict ${{ github.sha }} || $armada run ${{ github.sha }} --deadline=1800 \
+        # Its own deadline sits below this job's 40 minutes, so a hang is armada's named error. The
+        # daily run proves the commit again, with every file.
+        if [ "$DEW_TEST_CACHE" = on ]; then $armada verdict ${{ github.sha }} && exit 0; fi
+        $armada run ${{ github.sha }} --deadline=1800 \
           --label="${{ github.ref_name }}"
 
   multihost:

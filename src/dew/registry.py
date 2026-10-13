@@ -28,7 +28,7 @@ import operator
 import sys
 import types
 import typing
-from collections.abc import Callable, Iterator, Mapping, MutableMapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, MutableMapping, MutableSequence, Sequence
 from enum import Enum
 from typing import (
     TYPE_CHECKING,
@@ -536,6 +536,11 @@ def _rebuilt(annotation: Annotation, value: object, *, dtypes: bool, name: str =
             if not classes:
                 raise ValueError(f"{annotation} declares no class, so nothing builds the record {value!r}")
             return _built(_member(named[0], classes), named[1], dtypes=dtypes)
+        sequences = [member for member in inner if member in (tuple, Sequence, list)
+                     or typing.get_origin(member) in (tuple, Sequence, list, MutableSequence)]
+        if isinstance(value, list) and len(sequences) == 1:
+            # A record's list is the union's one sequence member (`Files.url: str | tuple[str, ...]`).
+            return _rebuilt(sequences[0], value, dtypes=dtypes)
         return configured(value)
     if isinstance(value, Mapping):
         if typing.get_origin(annotation) is Callable or annotation is Callable:
@@ -1229,6 +1234,9 @@ towers: Aliases[type[TowerBase], TowerBase] = Aliases("tower", {
     "gemma4": "dew.nn.vision.gemma4:Gemma4Vision",
     "gemma4_audio": "dew.nn.audio:Gemma4Audio",
     "llama4": "dew.nn.vision.llama4:Llama4Vision",
+    "mimo": "dew.nn.vision.mimo:MiMoVision",
+    "mimo_audio": "dew.nn.mimo_audio:MiMoAudio",
+    "muse_glimmer": "dew.nn.vision.muse_glimmer:MuseGlimmerVision",
     "qwen3_5": "dew.nn.vision.qwen35:Qwen35Vision",
     "siglip": "dew.nn.vision.siglip:SiglipVision",
 }, base="dew.nn.vision.common:TowerBase")
@@ -1238,6 +1246,8 @@ projectors: Aliases[type[ProjectorBase], ProjectorBase] = Aliases("projector", {
     "gemma3n": "dew.nn.vision.gemma3n:Gemma3nProjector",
     "gemma4": "dew.nn.vision.gemma4:Gemma4Projector",
     "llama4": "dew.nn.vision.llama4:Llama4Projector",
+    "mimo": "dew.nn.vision.mimo:MiMoProjector",
+    "muse_glimmer": "dew.nn.vision.muse_glimmer:MuseGlimmerProjector",
     "qwen3_5": "dew.nn.vision.qwen35:Qwen35Projector",
 }, base="dew.nn.vision.common:ProjectorBase")
 schedules: Aliases[type[ScheduleBase], ScheduleBase] = Aliases("schedule", {

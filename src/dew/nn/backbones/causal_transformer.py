@@ -58,14 +58,21 @@ from ..hyper_connections import (
     expand_streams,
     first_stream,
 )
-from ..inputs import AttentionMetadata, LayerInputs, PredictionPhase
+from ..inputs import (
+    AttentionMetadata,
+    Coordinates,
+    LayerInputs,
+    PredictionPhase,
+    coordinates as build_coordinates,
+)
 from ..kv_cache import KVCache
 from ..mixers import AttentionMixer, MixerBase, MixerContext
 from ..mixers.mamba2 import Mamba2Mixer
+from ..mixers.mlp import MLPMixer
 from ..mla import MLAMixer
 from ..moe import GatedActivation, Situ
-from ..precision import at_least_fp32, head_dot_general, head_product, scaled
-from ..protocols import OutputTable, ProjectionGroup, declared_groups
+from ..precision import at_least_fp32, biased_logits, capped_logits, head_dot_general, head_product, scaled
+from ..protocols import OutputTable, ProjectionGroup, QuantizesInputs, declared_groups
 from ..rope import LongRopeScaling, RopeScaling, YarnScaling, rope_scaling_from_record
 from ..sharding import (
     RESIDUAL,
@@ -305,6 +312,11 @@ class CausalTransformer(nn.Module):
     """The layer kind the prediction depths build their mixer from. It need not
     occur in the trunk. None uses the full-attention kind when the pattern has
     one, and the first layer's kind otherwise."""
+    mtp_feedforward_type: str | None = None
+    """The layer kind whose MLP mixer (`MLPMixer`) builds the prediction
+    depths' feed-forward, as Nemotron-H's step pairs an attention block with
+    a routed MLP block. None routes like the last layer, and is dense
+    otherwise."""
     mtp_hyper_connections: HyperConnections | None = None
     """The residual streams of the prediction depths. None gives the depths
     plain residuals and normalized trunk inputs. Setting it opts the depth into
@@ -585,7 +597,10 @@ class CausalTransformer(nn.Module):
         )
         if self.dspark is not None:
             prediction_kinds.add(self.dspark.layer_type)
-        unnamed = sorted(set(self.kinds or {}) - set(types) - prediction_kinds)
+        # The depths' feed-forward kind fills no mixer slot, so only its name is checked here.
+        feeding = ({self.mtp_feedforward_type} if self.num_nextn_predict_layers and self.mtp_feedforward_type
+                   else set())
+        unnamed = sorted(set(self.kinds or {}) - set(types) - prediction_kinds - feeding)
         if unnamed:
             raise ValueError(
                 f"kinds {unnamed} name no layer of this model, whose pattern is "
@@ -1263,7 +1278,14 @@ class CausalTransformer(nn.Module):
         mtp_mixer = prediction_mixer.build(self.mixer_context(
             kinds[mtp_type], mtp_type, kv_shared=False))
         widths = self.mlp_widths
+        feeding = self.mtp_feedforward_type
+        feeder = None if feeding is None else self.kind_of(feeding).mixer
+        if feeding is not None and not isinstance(feeder, MLPMixer):
+            raise ValueError(f"mtp_feedforward_type {feeding!r} builds its feed-forward from an MLPMixer, "
+                             f"and the kind's mixer is {type(feeder).__name__}")
         mtp_feedforward = (
+            feeder.feedforward(self.mixer_context(self.kind_of(feeding), feeding, kv_shared=False))
+            if isinstance(feeder, MLPMixer) and feeding is not None else
             routed if routed is not None and self.num_layers - 1 in self.sparse_layers else
             None if widths[-1] == 0 else
             # The last layer's width: the one width of every model with
@@ -1364,12 +1386,14 @@ class CausalTransformer(nn.Module):
                  positions=None, segment_ids=None,
                  input_embeddings=None,
                  attention_mask=None, image_groups=None, rotary_positions=None,
-                 attention_pairwise_mask=None, attention_key_positions=None, right_padded: bool = False):
+                 attention_pairwise_mask=None, attention_key_positions=None, right_padded: bool = False,
+                 coordinates: Coordinates | None = None):
         x, prediction = self.hidden_and_mtp_inputs(
             tokens, train=train, decode=decode, positions=positions, segment_ids=segment_ids,
             input_embeddings=input_embeddings, attention_mask=attention_mask, image_groups=image_groups,
             rotary_positions=rotary_positions, attention_pairwise_mask=attention_pairwise_mask,
-            attention_key_positions=attention_key_positions, right_padded=right_padded)
+            attention_key_positions=attention_key_positions, right_padded=right_padded,
+            coordinates=coordinates)
         if self.is_initializing() and self.dspark is not None:
             self.reach_drafter(tokens, x.dtype)
         if self.is_initializing() and self.mtp:
@@ -1419,12 +1443,8 @@ class CausalTransformer(nn.Module):
         else:
             logits = self.lm_head(x)
         logits = logits.astype(at_least_fp32(logits.dtype))
-        if self.head_bias:
-            logits = logits + self.head_bias_value.astype(logits.dtype)
-        if self.final_logit_softcap is not None:
-            cap = jnp.asarray(self.final_logit_softcap, logits.dtype)
-            logits = cap * jnp.tanh(logits / cap)
-        return logits
+        return capped_logits(biased_logits(logits, self.head_bias_value if self.head_bias else None),
+                             self.final_logit_softcap)
 
     def mtp_hidden_states(self, hidden, tokens, train: bool = False,
                           positions=None, segment_ids=None, input_embeddings=None,
@@ -1458,7 +1478,7 @@ class CausalTransformer(nn.Module):
                 if segment_ids is not None:
                     valid = valid & (segment_ids[:, :-depth] == segment_ids[:, depth:])
             metadata = AttentionMetadata(
-                valid=valid,
+                coordinates=None if valid is None else build_coordinates(valid=valid),
                 image_groups=None if image_groups is None else image_groups[:, depth:],
                 rotary_positions=None if rotary_positions is None else rotary_positions[:, depth:])
             hidden = block(hidden[:, :-1], embeds[:, depth:], train=train,
@@ -1499,8 +1519,9 @@ class CausalTransformer(nn.Module):
         state, prediction = self.mtp[depth].states(
             hidden, embeds, positions=positions, decode=decode,
             prediction_phase=prediction_phase if self.index_share_for_mtp_iteration else "ordinary",
-            attention_metadata=AttentionMetadata(valid=attention_mask,
-                                                 rotary_positions=rotary_positions))
+            attention_metadata=AttentionMetadata(
+                coordinates=None if attention_mask is None else build_coordinates(valid=attention_mask),
+                rotary_positions=rotary_positions))
         return self._logits(state), prediction
 
     def token_embeddings(self, tokens):
@@ -1534,6 +1555,13 @@ class CausalTransformer(nn.Module):
             x = (x * jnp.asarray(math.sqrt(self.emb_features),
                                  self.embed_tokens.embedding.dtype)).astype(x.dtype)
         return scaled(x, self.embedding_multiplier)
+
+    @property
+    def embedding_factor(self) -> float:
+        """The factor `scaled_embeddings` scales an embedding by, unrounded,
+        for a mixture of the table's rows to take in its own arithmetic
+        (`dew.nn.diffusion_gemma.soft_embeddings`)."""
+        return (math.sqrt(self.emb_features) if self.embedding_scale else 1.0) * self.embedding_multiplier
 
     def draft(self, context, tokens, *, decode: bool = True, valid=None, choose=None):
         """Draft a DSpark block after each row's last context position.
@@ -1611,7 +1639,7 @@ class CausalTransformer(nn.Module):
                               attention_mask=None, image_groups=None, rotary_positions=None,
                               attention_pairwise_mask=None, attention_key_positions=None,
                               routed_experts=None, routed=None, media_mask=None, admitted=None,
-                              right_padded: bool = False):
+                              right_padded: bool = False, coordinates: Coordinates | None = None):
         """Return the final normalized states and the prediction depths' input.
 
         V4's depth reads the raw residual streams from before the collapse head
@@ -1639,10 +1667,18 @@ class CausalTransformer(nn.Module):
           (`dew.nn.inputs.AttentionMetadata.right_padded`). The real tokens'
           states are the masked call's, the padding's are unspecified, and a
           causal layer runs as an unpadded call does.
+        - `coordinates` are the tokens' documents, validity and positions as
+          the batch's builder made them (`dew.nn.inputs.coordinates`, with the
+          packer's `max_segments`); where None they are built here from
+          `segment_ids`, `attention_mask`, `positions` and `right_padded`.
         """
+        if coordinates is not None and coordinates.segments is not None:
+            # Attention still reads the documents and their positions as fields of its own.
+            segment_ids, positions = coordinates.segments, coordinates.positions
         attention_metadata = self._attention_metadata(
-            tokens, decode, positions, attention_mask, image_groups, rotary_positions,
-            attention_pairwise_mask, attention_key_positions, media_mask, admitted, right_padded)
+            tokens, decode, positions, segment_ids, attention_mask, image_groups, rotary_positions,
+            attention_pairwise_mask, attention_key_positions, media_mask, admitted, right_padded,
+            coordinates)
         # The stack's entry and exit sit where the batch does, so neither the
         # lookup nor the head is computed whole on the shards of an axis that
         # splits the rows or the positions.
@@ -1695,10 +1731,11 @@ class CausalTransformer(nn.Module):
                      reduce_fn=lambda _, value: value, init_fn=lambda: None)
         return hidden, prediction
 
-    def _attention_metadata(self, tokens, decode: bool, positions, attention_mask, image_groups,
+    def _attention_metadata(self, tokens, decode: bool, positions, segment_ids, attention_mask, image_groups,
                             rotary_positions, pairwise_mask, key_positions,
                             media_mask, admitted=None,
-                            right_padded: bool = False) -> AttentionMetadata | None:
+                            right_padded: bool = False,
+                            coordinates: Coordinates | None = None) -> AttentionMetadata | None:
         """What the layers read beside the residual, None for a call that
         carries none of it: the masks and positions `hidden_and_mtp_inputs`
         takes, the token ids a hash router selects by, the engram layers'
@@ -1714,15 +1751,18 @@ class CausalTransformer(nn.Module):
             media_mask = None
         engram_ids = (None if self.engram is None
                       else self.engram_hashes(tokens, attention_mask, positions, decode, media_mask))
-        if (attention_mask is None and image_groups is None and rotary_positions is None
+        if coordinates is None and (segment_ids is not None or attention_mask is not None or right_padded):
+            coordinates = build_coordinates(tokens.shape[:2], segments=segment_ids, valid=attention_mask,
+                                            positions=positions, right_padded=right_padded)
+        if (coordinates is None and image_groups is None and rotary_positions is None
                 and pairwise_mask is None and key_positions is None and not self.hash_layers
                 and engram_ids is None and media_mask is None and admitted is None):
             return None
         return AttentionMetadata(
-            valid=attention_mask, image_groups=image_groups, rotary_positions=rotary_positions,
+            coordinates=coordinates, image_groups=image_groups, rotary_positions=rotary_positions,
             pairwise_mask=pairwise_mask, key_positions=key_positions,
             token_ids=tokens if self.hash_layers else None, engram_ids=engram_ids, media=media_mask,
-            admitted=admitted, right_padded=right_padded)
+            admitted=admitted)
 
     def looped(self, x, **stack):
         """Run the layer stack over `x` once, or as `loop` says: the layers before
@@ -2079,15 +2119,19 @@ class CausalTransformer(nn.Module):
 
     def output_table(self) -> OutputTable | None:
         """Return the head as the matrix `logits_from_hidden` contracts, read from the bound variables:
-        the parameter itself, with `_logits`'s bias, softcap and precision.
+        the parameter itself, with `_logits`'s bias, softcap and precision, the compute dtype its
+        product follows and a checkpoint's quantizer of its input.
         None where no matrix alone is the head: past a `head_transform`, or when `lm_head`'s scope
         holds more than its kernel, as `dew.lora`'s factors, which its interceptor adds."""
         head = {} if self.tie_embeddings else self.lm_head.variables["params"]
         if self.head_transform is not None or set(head) - {"kernel"}:
             return None
         matrix = self.embed_tokens.embedding if self.tie_embeddings else head["kernel"]
+        quantizer = (self.input_quantizer(self.lm_head)
+                     if isinstance(self, QuantizesInputs) and not self.tie_embeddings else None)
         return OutputTable(matrix, self.tie_embeddings, self.head_bias_value if self.head_bias else None,
-                           self.final_logit_softcap, self.precision)
+                           self.final_logit_softcap, self.precision, compute=self.dtype,
+                           input_quantizer=quantizer)
 
     def init_cache(self, batch_size: int):
         """Allocate a zeroed decode cache for `batch_size` sequences.

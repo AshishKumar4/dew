@@ -28,24 +28,46 @@ def spec(*, backend="device", augment=True, crop_scale=(1.0, 1.0), staging_size=
                       backend=backend) if augment else None)
 
 
-def test_device_pipeline_returns_resident_uint8_and_resumes_exactly():
+def augmented(data, batch):
+    """`batch` as the compiled training step reads it: after the loader's device steps."""
+    for step in data.device:
+        batch = step(batch)
+    return batch
+
+
+def test_device_pipeline_reads_host_batches_the_step_augments_and_resumes_exactly():
+    """The reader delivers host arrays with each record's key; the device steps, which the
+    compiled training step runs, make uint8 images of the output size from them, the same after
+    a resume."""
     data = loader(spec(backend="device", crop_scale=(0.5, 0.9)), batch=4, read="memory", seed=37,
                   loading=READ)
+    assert data.device, "the augmentation runs in the compiled step"
     stream = data.train(DataPartition())
     resumed = data.train(DataPartition())
     try:
-        first = next(stream)
+        read = next(stream)
+        assert not isinstance(read["image"], jax.Array) and "image_augmentation_key" in read
+        first = augmented(data, read)
         assert isinstance(first["image"], jax.Array)
         assert first["image"].dtype == jnp.uint8
         assert first["image"].shape == (4, 12, 12, 3)
         assert set(first) == {"image", "label"}
         saved = stream.get_state()
-        expected = next(stream)
+        expected = augmented(data, next(stream))
         resumed.set_state(saved)
-        actual = next(resumed)
+        actual = augmented(data, next(resumed))
         for name in expected:
             np.testing.assert_array_equal(actual[name], expected[name])
         assert not np.array_equal(first["image"], expected["image"])
+        from dew.training.distributed import DevicePrefetchIterator, MeshSpec
+
+        mesh = MeshSpec().build([jax.devices()[0]])
+        with DevicePrefetchIterator(stream, mesh) as prefetch:
+            for _ in range(3):
+                jax.block_until_ready(next(prefetch))
+            with steady_state():
+                batches = [next(prefetch) for _ in range(3)]
+                jax.block_until_ready(batches)
     finally:
         stream.close()
         resumed.close()
@@ -138,20 +160,6 @@ def test_production_fp32_crop_and_colour_are_within_one_uint8_code():
     assert np.max(np.abs(rounded - reference)) <= 1
 
 
-def test_model_float64_mode_changes_no_data_draw():
-    from dew.data.image_augmentation import augment_batch
-
-    image = np.random.default_rng(4).integers(0, 256, (4, 16, 16, 3), dtype=np.uint8)
-    keys = np.random.default_rng(2).integers(0, 2**32, (4, 2), dtype=np.uint32)
-    run = jax.jit(lambda images, raw: augment_batch(images, raw, size=12,
-                  flip=True, jitter=True, crop_scale=(0.4, 0.9)))
-    with jax.enable_x64(new_val=False):
-        expected = run(image, keys)
-    with jax.enable_x64():
-        actual = run(image, keys)
-    np.testing.assert_array_equal(actual, expected)
-
-
 def test_device_none_keeps_the_old_resize_bit_identical():
     host = loader(spec(augment=False), batch=4, read="memory", seed=37, loading=READ).train(DataPartition())
     device = loader(spec(augment=False, backend="device"), batch=4, read="memory", seed=37,
@@ -204,11 +212,12 @@ def test_device_draws_follow_record_keys_across_threads_and_partitions():
 def test_grain_workers_only_decode_and_keep_the_parent_device_draws():
     original = spec(backend="device", crop_scale=(0.6, 0.9))
     worker_loading = Loading(workers=1, threads=1, read_buffer=2)
-    parent = loader(original, batch=4, read="memory", seed=37, loading=READ).train(DataPartition())
+    data = loader(original, batch=4, read="memory", seed=37, loading=READ)
+    parent = data.train(DataPartition())
     worker = loader(original, batch=4, read="memory", seed=37, loading=worker_loading).train(DataPartition())
     try:
         for _ in range(3):
-            expected, actual = next(parent), next(worker)
+            expected, actual = augmented(data, next(parent)), augmented(data, next(worker))
             assert isinstance(actual["image"], jax.Array)
             for name in expected:
                 np.testing.assert_array_equal(actual[name], expected[name])
@@ -217,28 +226,45 @@ def test_grain_workers_only_decode_and_keep_the_parent_device_draws():
         worker.close()
 
 
-@pytest.mark.parametrize("options", [{"crop_scale": (0, 1)}, {"crop_scale": (0.9, 0.5)},
-                                    {"staging_size": 0}, {"backend": "bad"}])
-def test_invalid_augmentation_configuration_is_rejected(options):
+@pytest.mark.parametrize("host", [False, True], ids=["device", "host-master"])
+def test_a_run_checks_its_inputs_against_what_the_device_steps_make(host):
+    """Pictures staged at 24 pixels reach the compiled step, which crops them to the model's 12: the
+    run checks its declared inputs against the device steps' output, not the staged batch, and a
+    run whose state the host holds augments in its accelerator forward too."""
+    import optax
+
+    from dew import Field, InputSpec, Trainer
+    from dew.diffusion.presets import Flow
+    from dew.nn.backbones import SimpleDiT
+    from dew.objectives.diffusion import DiffusionObjective
+    from dew.sampling import Euler
+    from dew.training import Layout
+
+    objective = DiffusionObjective(SimpleDiT(patch_size=4, emb_features=16, num_layers=1, num_heads=2,
+                                             mlp_ratio=1),
+                                   Flow(), InputSpec(Field("image", (12, 12, 3))), solver=Euler(), steps=2)
+    data = loader(spec(staging_size=24), batch=8, read="memory", loading=READ, objective=objective.data())
+    assert np.shape(next(iter(data.train(DataPartition())))["image"])[1:] == (24, 24, 3)
+    layout = Layout(host=("variables",) if host else (), min_shard=1, tolerance=1.)
+    state = Trainer(objective, optax.adam(1e-3), key=0, layout=layout).fit(data, steps=2, log_every=1)
+    assert int(state.step) == 2
+
+
+def test_a_host_step_written_after_a_device_step_is_refused_in_every_spelling():
+    """A device step runs in the compiled step, after the batch's host steps: a host step written
+    after it, in the same map or a later one, would read the staged pixels, and is refused."""
+    from dew.data import images
+
+    def remember(batch):
+        return {**batch, "seen": np.asarray(batch["image"]).sum(axis=(1, 2, 3))}
+
+    rows = Memory([{"image": np.zeros((16, 16, 3), np.uint8)} for _ in range(8)])
+    keyed = rows.random_map(images.augmentation_key()).repeat().batch(4)
     with pytest.raises(ValueError):
-        spec(**options).pipelines()
+        keyed.map(images.device_augment(12), remember)
+    augmented = keyed.map(images.device_augment(12))
+    with pytest.raises(ValueError):
+        augmented.map(remember)
+    from dew.data.compile import compile
 
-
-def test_a_device_augmented_stream_steadies_into_compiled_reads_the_loop_waits_on_alone():
-    """Once a few batches have been augmented and placed, the stream the
-    trainer reads compiles nothing more for records of other sizes and
-    crops, and handing the loop a placed batch moves nothing it did not ask
-    for (`steady_state`): the augmentation and the placement stay on the
-    devices and on the prefetch worker."""
-    from dew.training.distributed import DevicePrefetchIterator, MeshSpec
-
-    mesh = MeshSpec().build([jax.devices()[0]])
-    stream = loader(spec(backend="device", crop_scale=(0.5, 0.9)), batch=4, read="memory", seed=37,
-        loading=READ).train(DataPartition())
-    with DevicePrefetchIterator(stream, mesh) as prefetch:
-        for _ in range(3):
-            jax.block_until_ready(next(prefetch))
-        with steady_state():
-            batches = [next(prefetch) for _ in range(3)]
-            jax.block_until_ready(batches)
-    assert all(batch["image"].shape == (4, 12, 12, 3) for batch in batches)
+    assert compile(keyed.map(remember).map(images.device_augment(12)), read="memory", loading=READ).device

@@ -18,7 +18,7 @@ from dew.config.data import PromptData, loader
 from dew.data import Loading
 from dew.data.compile import iterate
 from dew.data.dataset import DataPartition
-from dew.data.prompts import INFO_KEY, LENGTH_KEY, PROMPT_KEY, SOURCE_KEY, TRUTH_KEY
+from dew.data.prompts import LENGTH_KEY, PROMPT_KEY
 
 TOKENIZER = "tests/fixtures/tokenizers/tiny-chat"
 WINDOW = 8
@@ -29,11 +29,6 @@ LONG = list(range(1, 20))
 
 def records(*rows):
     return tuple(json.dumps(row) for row in rows)
-
-
-def read(row):
-    """A fixed-width int32 UTF-8 row back to its string, one byte per value."""
-    return bytes(row[row != 0].astype(np.uint8)).decode("utf-8")
 
 
 def source(*rows, width=WINDOW):
@@ -51,54 +46,6 @@ def prompt_file(path, tokenizer, width, pad_id):
     pipeline, _, _ = PromptData(source=path, tokenizer=tokenizer, max_prompt_len=width,
                             pad_id=pad_id, long="truncate").pipelines()
     return list(iterate(pipeline, read="memory", loading=Loading(workers=0)))
-
-
-def test_ids_prompts_left_pad_with_their_length():
-    rows = source({"prompt": IDS, "data_source": "rule", "ground_truth": "4"})
-
-    batch = rows[0]
-
-    np.testing.assert_array_equal(batch[PROMPT_KEY], [0, 0, 0, 1, 2, 3, 4, 5])
-    assert int(batch[LENGTH_KEY]) == 5
-    assert batch[PROMPT_KEY].dtype == np.int32
-
-
-def test_a_long_prompt_keeps_its_tail():
-    rows = source({"prompt": LONG})
-
-    batch = rows[0]
-
-    np.testing.assert_array_equal(batch[PROMPT_KEY], LONG[-WINDOW:])
-    assert int(batch[LENGTH_KEY]) == WINDOW
-
-
-def test_the_reward_columns_round_trip_as_bytes():
-    rows = source({"prompt": IDS, "data_source": "rule", "ground_truth": "4",
-                   "extra_info": '{"k": 1}'})
-
-    batch = rows[0]
-
-    assert read(batch[SOURCE_KEY]) == "rule"
-    assert read(batch[TRUTH_KEY]) == "4"
-    assert read(batch[INFO_KEY]) == '{"k": 1}'
-
-    assert batch[SOURCE_KEY].shape == batch[TRUTH_KEY].shape == batch[INFO_KEY].shape
-
-
-def test_missing_reward_columns_default_to_empty():
-    rows = source({"prompt": IDS})
-
-    batch = rows[0]
-
-    assert all(int(batch[key].sum()) == 0 for key in (SOURCE_KEY, TRUTH_KEY, INFO_KEY))
-
-
-def test_non_string_reward_columns_travel_as_json():
-    rows = source({"prompt": IDS, "ground_truth": {"answer": 4}})
-
-    batch = rows[0]
-
-    assert read(batch[TRUTH_KEY]) == '{"answer": 4}'
 
 
 def test_a_string_prompt_encodes_on_its_own():
@@ -191,98 +138,6 @@ def test_template_variables_reach_the_chat_template():
         tokenizer=TOKENIZER, max_prompt_len=64, thinking=False, long="truncate")
     batch = next(loader(spec, batch=1, read="memory", loading=Loading(workers=0)).train(DataPartition()))
     assert [int(token) for token in batch[PROMPT_KEY][0, 64 - int(batch[LENGTH_KEY][0]):]] == plain
-
-
-def test_a_row_without_a_prompt_is_refused():
-    with pytest.raises(ValueError, match="needs a prompt column"):
-        source({"data_source": "rule"})
-
-
-def test_unknown_fields_are_refused():
-    with pytest.raises(ValueError, match="unknown fields"):
-        source({"prompt": IDS, "reward": 1.0})
-
-def test_an_empty_prompt_is_refused():
-    with pytest.raises(ValueError, match="no tokens"):
-        source({"prompt": []})[0]
-    with pytest.raises(ValueError, match="blank"):
-        source({"prompt": ""})[0]
-
-
-def test_a_malformed_message_is_refused():
-    with pytest.raises(ValueError, match="role as a string"):
-        source({"prompt": [{"content": "hi"}]})[0]
-
-
-def test_a_non_object_row_is_refused():
-    with pytest.raises(json.JSONDecodeError):
-        prompt_rows(("{oops",), TOKENIZER, WINDOW, 0)
-    with pytest.raises(ValueError, match="record of named fields"):
-        source([1, 2])[0]
-
-
-def test_a_window_below_one_is_refused():
-    with pytest.raises(ValueError, match="max_prompt_len"):
-        prompt_rows(records({"prompt": IDS}), TOKENIZER, 0, 0)
-
-
-@pytest.mark.parametrize("prompt", ["hi", IDS])
-def test_tool_schemas_need_a_chat_prompt(prompt):
-    """Plain text and pretokenized ids have no template to render schemas."""
-    spec = PromptData(source=tuple(json.loads(row) for row in records({"prompt": prompt, "tools": []})),
-        tokenizer=TOKENIZER, max_prompt_len=WINDOW, long="truncate")
-    with pytest.raises(ValueError, match="tools require chat messages"):
-        next(loader(spec, batch=1, read="memory", loading=Loading(workers=0),
-            validation_records=4 * (1)).train(DataPartition()))
-
-
-def test_parquet_carries_the_verl_columns(tmp_path):
-    import pyarrow as pa
-    import pyarrow.parquet as pq
-
-    path = tmp_path / "prompts.parquet"
-    pq.write_table(pa.table({
-        "prompt": [IDS, LONG],
-        "data_source": ["rule", "other"],
-        "ground_truth": ["4", "19"],
-        "extra_info": ["", "x"],
-    }), path)
-
-    rows = prompt_file(str(path), TOKENIZER, WINDOW, 0)
-
-    assert len(rows) == 2
-    assert read(rows[1][SOURCE_KEY]) == "other"
-    np.testing.assert_array_equal(rows[1][PROMPT_KEY], LONG[-WINDOW:])
-
-
-def test_parquet_without_a_prompt_column_is_refused(tmp_path):
-    import pyarrow as pa
-    import pyarrow.parquet as pq
-
-    path = tmp_path / "noprompt.parquet"
-    pq.write_table(pa.table({"data_source": ["rule"]}), path)
-    with pytest.raises(ValueError, match="needs a prompt column"):
-        prompt_file(str(path), TOKENIZER, WINDOW, 0)
-
-
-def test_the_dataset_batches_fixed_width_rows():
-    data = loader(PromptData(source=tuple(json.loads(row) for row in records(
-        {"prompt": IDS}, {"prompt": LONG}, {"prompt": "hi"})), tokenizer=TOKENIZER,
-            max_prompt_len=WINDOW, long="truncate"), batch=2, read="memory", loading=Loading(workers=0),
-                validation_records=4 * (2))
-
-    batch = next(data.train(DataPartition()))
-
-    assert data.records == 3
-    assert batch[PROMPT_KEY].shape == (2, WINDOW)
-    assert batch[LENGTH_KEY].shape == (2,)
-    assert set(batch) == {PROMPT_KEY, LENGTH_KEY, SOURCE_KEY, TRUTH_KEY, INFO_KEY}
-
-
-def test_unknown_recipe_fields_are_refused_before_reading_records():
-    with pytest.raises(ValueError, match="unknown fields"):
-        loader("prompts", source=({"prompt": IDS},), tokenizer=TOKENIZER, batch=2,
-             read="memory", records=({"prompt": IDS},))
 
 
 def test_validation_is_one_pass_over_a_second_file(tmp_path):

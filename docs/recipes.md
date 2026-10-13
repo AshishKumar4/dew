@@ -33,7 +33,8 @@ Tokenize it with the byte tokenizer, which maps each UTF-8 byte to one of 256 ID
 python - <<'PY'
 from pathlib import Path
 import numpy as np
-from dew.data import ByteTokenizer, export
+from dew.data import ByteTokenizer
+from dew.data.sinks import export
 ids = np.asarray(ByteTokenizer().encode(Path("corpus.txt").read_text()), np.int32)
 held = int(len(ids) * 0.1)
 metadata = {"token_store": True, "tokenizer": "byte", "vocab_size": 256,
@@ -104,7 +105,7 @@ A dotted flag sets a field inside a configuration object. A subcommand such as `
 | Setting | Default | Notes |
 |---|---|---|
 | `--model.dtype` | `bfloat16` | The model's compute dtype, which each recipe's default model states. Parameters are stored in float32. A run-wide matmul precision is `jax.default_matmul_precision`; a model's own is `--model.precision`. |
-| `--model.attention-impl` | `auto` | `auto`, `reference`, `xla`, `cudnn` or `tpu`. The example uses `reference` so no device-specific kernel runs. |
+| `--model.attention-impl` | `auto` | A name `AttentionImpl` declares ([dew/nn/attention.py](../src/dew/nn/attention.py)). The example uses `reference` so no device-specific kernel runs. |
 | `--optim.optimizer` | `adamw` | `adam`, `adamw`, `lamb`, `muon` or `muonclip`. |
 | `--optim.learning-rate` | `2.7e-4` | The constant rate when no schedule is named. |
 | `--optim.state-dtype` | `float32` | `bfloat16` stores Adam's moments stochastically rounded, for `adam` and `adamw` only. |

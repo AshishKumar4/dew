@@ -10,6 +10,7 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import tempfile
 import threading
 import time
@@ -23,6 +24,7 @@ from typing import BinaryIO, Protocol, TypedDict, runtime_checkable
 import fsspec
 from filelock import FileLock, Timeout
 from fsspec.implementations.cached import CachingFileSystem, WholeFileCacheFileSystem
+from fsspec.implementations.local import LocalFileSystem
 from fsspec.spec import AbstractFileSystem
 from gcsfs import GCSFileSystem
 from huggingface_hub import HfFileSystem
@@ -306,6 +308,48 @@ class BoundedFileCache(WholeFileCacheFileSystem):
 _MEMORY_LOCK = threading.RLock()
 
 
+def _local_file_key(path: str, size: int) -> tuple[str, int, int, int]:
+    """The local metadata that invalidates a persisted content checksum."""
+    realpath = os.path.realpath(path)
+    metadata = os.stat(realpath)
+    if metadata.st_size != size:
+        raise OSError(f"local file changed before its content was versioned: {path}")
+    return realpath, size, metadata.st_mtime_ns, metadata.st_ino
+
+
+def content_version(fs: AbstractFileSystem, path: str, size: int) -> str:
+    """A local file's full SHA256, persisted in Dew's cache until its metadata changes."""
+    directory = Path(dew_cache_dir()) / "content-versions"
+    directory.mkdir(parents=True, exist_ok=True)
+    lock = hashlib.sha256(os.path.realpath(path).encode()).hexdigest()
+    with FileLock(str(directory / (lock + ".lock"))), contextlib.closing(
+        sqlite3.connect(directory / "versions.sqlite")
+    ) as versions:
+        key = _local_file_key(path, size)
+        fingerprint = hashlib.sha256(json.dumps(key).encode()).hexdigest()
+        versions.execute(
+            "CREATE TABLE IF NOT EXISTS versions (file TEXT PRIMARY KEY, sha256 TEXT NOT NULL)"
+        )
+        cached = versions.execute("SELECT sha256 FROM versions WHERE file = ?", (fingerprint,)).fetchone()
+        if cached is not None:
+            return str(cached[0])
+        with fs.open(path, "rb") as file:
+            digest = hashlib.sha256()
+            while payload := file.read(2**20):
+                digest.update(payload)
+        checksum = digest.hexdigest()
+        if _local_file_key(path, size) != key:
+            raise OSError(f"local file changed while its content was versioned: {path}")
+        with versions:
+            versions.execute("INSERT INTO versions VALUES (?, ?)", (fingerprint, checksum))
+        return checksum
+
+
+def local(fs: AbstractFileSystem) -> bool:
+    """Whether `fs` is this host's own disk, whose paths are where it mounted a file."""
+    return isinstance(fs, LocalFileSystem)
+
+
 @dataclass(frozen=True)
 class Versioned:
     data: bytes
@@ -368,7 +412,8 @@ class Store:
         fs, _ = self.resolve()
         while isinstance(fs, CachingFileSystem):
             fs = fs.fs
-        settings = {"url": self.url, "protocol": fs.protocol}
+        # A local path is where this host mounted the data, not how it is reached.
+        settings = {"protocol": fs.protocol} if local(fs) else {"url": self.url, "protocol": fs.protocol}
         if isinstance(fs, S3FileSystem):
             settings.update(
                 endpoint=fs.client_kwargs.get("endpoint_url") or fs.endpoint_url,

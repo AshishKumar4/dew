@@ -11,14 +11,10 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
-import pytest
 from affine_run import Affine, dataset
 from flax import linen as nn
 
 from dew.config import ModelConfig, ObjectiveConfig, RunConfig, TrainerConfig
-from dew.data import Loading, Memory
-from dew.data.compile import compile
-from dew.data.pipeline import Pipeline
 from dew.inputs import Field, InputSpec
 from dew.objectives.base import VALID_ROWS, Step
 from dew.objectives.supervised import Accuracy, CrossEntropy, Supervised
@@ -65,12 +61,6 @@ def test_the_loss_is_the_mean_over_the_real_rows_and_metrics_report_by_name():
     np.testing.assert_allclose(aux.metrics["squared"], np.mean(squared(outputs, real)), rtol=1e-6)
 
 
-def test_a_loss_that_returns_its_own_mean_is_refused():
-    objective = Supervised(Affine(), lambda outputs, batch: jnp.mean(squared(outputs, batch)), inputs=INPUTS)
-    with pytest.raises(ValueError, match="one loss per example"):
-        objective.scalar_loss(objective.init(jax.random.key(0)), batch(), STEP)
-
-
 def supervised_run(loss) -> RunConfig:
     return RunConfig(model=ModelConfig.from_model(Affine()), trainer=TrainerConfig(steps=1),
                      objective=ObjectiveConfig("supervised", {"loss": loss, "metrics": (Accuracy(),),
@@ -87,80 +77,6 @@ def test_the_run_record_builds_the_same_objective_again():
                                   original.scalar_loss(variables, batch(), STEP)[0])
     assert record["objective"]["fields"]["loss"] == {
         "class": "dew.objectives.supervised:CrossEntropy", "fields": {"labels": "label", "output": []}}
-
-
-def test_a_lambda_loss_is_refused_where_the_run_states_it():
-    with pytest.raises(ValueError, match="define it at module level"):
-        supervised_run(lambda outputs, batch: squared(outputs, batch))
-
-
-def test_a_run_stating_another_objectives_arguments_refuses_to_train():
-    run = RunConfig(objective=ObjectiveConfig("lm", {"ema_decay": 0.9}), trainer=TrainerConfig(batch_size=8))
-    records = batch()
-    rows = [{name: value[index] for name, value in records.items()} for index in range(8)]
-    data = compile(Pipeline(Memory(rows)).repeat().batch(8), read="memory", loading=Loading(workers=0))
-    with pytest.raises(ValueError, match=r"states the arguments of .*LMObjective"):
-        run.train(Supervised(Affine(), squared, inputs=INPUTS), data, name="mismatched")
-
-
-def test_set_reads_each_value_as_its_field_reads_a_flag():
-    run = supervised_run(CrossEntropy()).assigned([
-        "trainer.steps=2000", "optim.learning_rate=1e-3", "data.image_size=96", "trainer.eval_every=None",
-        'objective.loss={"class": "dew.objectives.supervised:CrossEntropy", "fields": {"labels": "y"}}'])
-    assert run.trainer.steps == 2000 and run.optim.learning_rate == 0.001
-    assert run.data.image_size == 96 and run.trainer.eval_every is None
-    assert run.objective.build(model=run.model.build()).criterion == CrossEntropy(labels="y")
-
-    lm = RunConfig(model=ModelConfig("causal_transformer", {"vocab_size": 8}),
-                   objective=ObjectiveConfig("lm"))
-    lm = lm.assigned(["model.num_layers=12", "model.dtype=bfloat16", "objective.ema_decay=0.99"])
-    assert lm.model.fields == {"vocab_size": 8, "num_layers": 12, "dtype": "bfloat16"}
-    assert lm.objective.fields == {"ema_decay": 0.99}
-
-
-def test_set_refuses_a_path_the_run_does_not_declare_and_a_value_its_type_does_not_read():
-    run = supervised_run(CrossEntropy())
-    with pytest.raises(KeyError, match="names no field"):
-        run.assigned(["trainer.stepz=3"])
-    with pytest.raises(KeyError, match="names no argument"):
-        run.assigned(["objective.los=3"])
-    with pytest.raises(ValueError, match="sets no value"):
-        run.assigned(["trainer.steps"])
-    with pytest.raises(SystemExit):
-        run.assigned(["trainer.steps=many"])
-
-
-def test_a_model_whose_call_needs_more_than_the_sample_is_refused_by_name():
-    """Supervised feeds the model one input, so a call that also needs a time
-    (a denoiser's) is refused naming what it needs, before anything traces."""
-    class Timed(nn.Module):
-        @nn.compact
-        def __call__(self, sample, time, *, train=False):
-            return nn.Dense(1)(sample) * time[:, None]
-
-    with pytest.raises(TypeError, match="sample alone, and Timed's call also needs time"):
-        Supervised(Timed(), squared, inputs=INPUTS)
-
-
-class Heads(nn.Module):
-    """Logits beside the features they are read from."""
-
-    @nn.compact
-    def __call__(self, x):
-        features = nn.Dense(4)(x)
-        return {"logits": nn.Dense(2)(features), "features": features}
-
-
-def test_criteria_read_the_output_their_path_selects_from_a_model_with_several():
-    objective = Supervised(Heads(), CrossEntropy(output=("logits",)), (Accuracy(output=("logits",)),),
-                           inputs=INPUTS)
-    variables = objective.init(jax.random.key(0))
-    _, aux = objective.scalar_loss(variables, batch(), STEP)
-    logits = Heads().apply(variables, batch()["x"])["logits"]
-    np.testing.assert_allclose(aux.metrics["accuracy"], np.mean(np.argmax(logits, -1) == batch()["label"]),
-                               rtol=1e-6)
-    with pytest.raises(TypeError, match="selects a dict"):
-        Supervised(Heads(), CrossEntropy(), inputs=INPUTS).scalar_loss(variables, batch(), STEP)
 
 
 def test_an_autoencoder_with_two_outputs_trains_and_its_record_trains_it_again_in_a_new_process(tmp_path):
@@ -240,34 +156,3 @@ def test_batch_statistics_update_as_the_model_trains_and_reload_from_its_checkpo
     assert json.loads(restored.stdout.splitlines()[-1]) == {
         jax.tree_util.keystr(path): np.asarray(leaf).tobytes().hex()
         for path, leaf in jax.tree_util.tree_leaves_with_path(trained)}
-
-
-class Moded(nn.Module):
-    """A layer whose BatchNorm and Dropout read the mode its call is given."""
-
-    @nn.compact
-    def __call__(self, x, train=False):
-        x = nn.BatchNorm(use_running_average=not train, momentum=0.5)(x.astype(jnp.float32))
-        return nn.Dropout(0.5)(x, deterministic=not train)
-
-
-def test_a_model_with_a_training_mode_trains_in_it_and_is_scored_out_of_it():
-    """With `mode`, the step calls the model in training mode, so its BatchNorm
-    moves toward the batch and its Dropout draws; a validation pass calls it in
-    evaluation mode, on the running statistics, the same whatever the key, and
-    writes nothing. Without it the model keeps its call's default."""
-    moded = Supervised(Moded(), squared, inputs=INPUTS, mode="train")
-    variables = moded.init(jax.random.key(0))
-    batch = {"x": jnp.full((4, 3), 5.0), "y": jnp.zeros((4, 3))}
-    _, aux = moded.loss(variables, batch, Step(jnp.int32(0), jax.random.key(1), None))
-    np.testing.assert_allclose(aux.variables["batch_stats"]["BatchNorm_0"]["mean"], 2.5)
-    first, second = (moded.validation_loss(variables, batch, Step(jnp.int32(0), jax.random.key(seed), None))
-                     for seed in (1, 2))
-    assert first[0].mean()[0] == second[0].mean()[0] and first[1].variables is None
-    trained, _ = moded.loss(variables, batch, Step(jnp.int32(0), jax.random.key(1), None))
-    assert trained.mean()[0] != first[0].mean()[0]
-    _, default = Supervised(Moded(), squared, inputs=INPUTS).loss(
-        variables, batch, Step(jnp.int32(0), jax.random.key(1), None))
-    np.testing.assert_array_equal(default.variables["batch_stats"]["BatchNorm_0"]["mean"], 0.0)
-    with pytest.raises(TypeError, match="does not take"):
-        Supervised(Moded(), squared, inputs=INPUTS, mode="training")

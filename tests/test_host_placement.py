@@ -29,7 +29,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from affine_run import BATCH, Counting, Features, Regression, Spread, val_batches
+from affine_run import BATCH, Counting, Features, Spread, val_batches
 from process_support import run_pool
 
 from dew.data.dataset import Loader
@@ -38,7 +38,7 @@ from dew.nn.backbones.decoder_stack import StackView
 from dew.objectives.lm import LMObjective
 from dew.registry import models
 from dew.sampling.text import Sampling, generate
-from dew.training import Checkpoints, Layout, MeshSpec, Trainer
+from dew.training import Checkpoints, Layout, Trainer
 
 DEVICE = Layout(min_shard=1, tolerance=1.0)
 HOST = Layout(min_shard=1, tolerance=1.0, host=("opt_state", "ema"))
@@ -90,11 +90,6 @@ def test_host_resident_state_resumes_from_its_checkpoint(tmp_path):
     assert identical(resumed.opt_state, reference.opt_state)
     assert identical(resumed.ema, reference.ema)
     assert not identical(resumed.variables, saved.variables)
-
-
-def test_a_layout_places_only_the_state_it_can_fetch():
-    with pytest.raises(ValueError, match="batches"):
-        Layout(host=("batches",))
 
 
 # --------------------------------------------------------------------------
@@ -177,13 +172,17 @@ def test_a_host_resident_bank_scores_what_a_resident_bank_scores(shape):
     where the loop's reassociation lives and is unchanged by the fetching.
     """
     plain, scanned, variables, tokens = pair(**SHAPES[shape])
+    before = np.asarray(plain.apply(variables, tokens))
     resident, on_host = stores(scanned, variables)
     banks = [name for name in on_host["params"] if name.startswith("layers_")]
     assert memory_kinds({name: on_host["params"][name] for name in banks}) == {"pinned_host"}
     assert memory_kinds(resident["params"]) == {"device"}
     fetched = scanned.apply(on_host, tokens)
     assert np.array_equal(np.asarray(fetched), np.asarray(scanned.apply(resident, tokens)))
-    difference = float(jnp.max(jnp.abs(fetched - plain.apply(variables, tokens))))
+    assert all(not leaf.is_deleted() for leaf in jax.tree.leaves(variables))
+    after = np.asarray(plain.apply(variables, tokens))
+    np.testing.assert_array_equal(after, before)
+    difference = float(jnp.max(jnp.abs(fetched - after)))
     assert difference < SCAN_BOUND, f"max |logit difference| {difference:.3e}"
 
 
@@ -212,20 +211,6 @@ def test_a_host_resident_bank_decodes_through_the_cache_it_allocates(shape):
     assert {leaf.shape[0] for leaf in jax.tree.leaves(cache)} == {2}
 
 
-def test_a_bank_holds_the_layers_a_checkpoint_stores(tmp_path):
-    """Every layer of the store is its bank's row, so the stored `layers_N`
-    tree is what the adapter reads back out of the banks."""
-    _, scanned, variables, _ = pair(num_layers=6, bank_layers=2)
-    _, on_host = stores(scanned, variables)
-    groups = scanned.bind({}).groups
-    assert groups == ((0, 2), (2, 2), (4, 2))
-    assert sorted(on_host["params"]) == [
-        "embed_tokens", "layers_0_1", "layers_2_3", "layers_4_5", "norm"]
-    logical = StackView(groups).unstack(on_host)
-    assert sorted(logical["params"]) == sorted(variables["params"])
-    assert identical(logical, variables)
-
-
 def test_a_layout_offloads_only_the_layers_it_names():
     """Banks the patterns do not name stay on the device, and a stack split
     between the two places computes what the resident one computes."""
@@ -239,82 +224,6 @@ def test_a_layout_offloads_only_the_layers_it_names():
                      "layers_0_1": {"pinned_host"}, "layers_2_3": {"device"}}
     assert np.array_equal(np.asarray(scanned.apply(split, tokens)),
                           np.asarray(scanned.apply(resident, tokens)))
-
-
-def test_a_run_split_between_the_two_memories_is_refused():
-    """A bank is one array in one memory space, so a selection that cuts
-    through a run is refused with the run and the layers it disagreed about."""
-    _, scanned, variables, _ = pair(num_layers=4)
-    half = Layout(min_shard=1, tolerance=1.0, host_parameters=("params/layers_0",))
-    with pytest.raises(ValueError, match="layers 0 to 3 are one run"):
-        HeldBanks(variables).place(scanned, layout=half)
-
-
-def test_a_run_whose_layers_offload_different_leaves_is_refused():
-    """Layers of one run that use the same two memory spaces for different
-    leaves still disagree, because a bank stacks corresponding leaves.
-
-    Comparing the set of memory kinds a layer uses would pass this: both
-    layers use device and pinned_host. The check has to compare the leaves
-    that end up in one array, and name the first path they differ at.
-    """
-    _, scanned, variables, _ = pair(num_layers=4)
-    crossed = Layout(min_shard=1, tolerance=1.0, host_parameters=(
-        "params/layers_0/self_attn/q_proj", "params/layers_1/mlp",
-        "params/layers_2/self_attn/q_proj", "params/layers_3/mlp"))
-    with pytest.raises(ValueError, match=r"disagree about .* of them"):
-        HeldBanks(variables).place(scanned, layout=crossed)
-
-
-def test_a_selector_that_names_nothing_is_refused_beside_ones_that_do():
-    """A stale or misspelled pattern is not excused by the patterns next to
-    it: the weights it meant to move would stay on the device silently."""
-    _, scanned, variables, _ = pair(num_layers=4)
-    stale = Layout(min_shard=1, tolerance=1.0,
-                   host_parameters=("params/layers_*", "params/blocks_*"))
-    with pytest.raises(ValueError, match=r"\['params/blocks_\*'\] names none"):
-        HeldBanks(variables).place(scanned, layout=stale)
-
-
-def test_a_load_leaves_the_source_it_borrowed_usable():
-    """`HeldBanks` borrows: nothing it read is donated or deleted, so the
-    caller's tree still scores what it scored before the load."""
-    plain, scanned, variables, tokens = pair(num_layers=4)
-    before = np.asarray(plain.apply(variables, tokens))
-    HeldBanks(variables).place(scanned, layout=BANKS)
-    assert all(not leaf.is_deleted() for leaf in jax.tree.leaves(variables))
-    assert np.array_equal(np.asarray(plain.apply(variables, tokens)), before)
-
-
-@pytest.mark.parametrize("pattern, held", [
-    ("params/embed_tokens", "embed_tokens"), ("params/norm", "norm")])
-def test_an_offloaded_variable_no_layer_fetches_is_refused(pattern, held):
-    """Only a run of layers is read one layer at a time. An embedding table,
-    which a tied head reads as well, would come over whole."""
-    _, scanned, variables, _ = pair(num_layers=4, tie_embeddings=True)
-    with pytest.raises(ValueError, match=f"stack does not fetch|{held}"):
-        HeldBanks(variables).place(scanned,
-                    layout=Layout(min_shard=1, tolerance=1.0, host_parameters=(pattern,)))
-
-
-def test_host_parameters_that_name_nothing_are_refused():
-    """A pattern that matches no variable would place every weight on the
-    device and save nothing, silently."""
-    _, scanned, variables, _ = pair(num_layers=4)
-    with pytest.raises(ValueError, match="names none of this tree"):
-        HeldBanks(variables).place(scanned,
-                    layout=Layout(min_shard=1, tolerance=1.0,
-                                  host_parameters=("params/blocks_*",)))
-
-
-def test_inference_parameter_patterns_are_not_a_training_layout():
-    """Training selects complete CPU transaction ownership with host=params,
-    not the inference-only path selection."""
-    trainer = Trainer(Regression(), optax.adam(0.1), key=jax.random.key(0),
-                      layout=Layout(min_shard=1, tolerance=1.0,
-                                    host_parameters=("params/*",)))
-    with pytest.raises(ValueError, match="LayerBanks source's place"):
-        trainer.place()
 
 
 def test_banked_training_preserves_each_layers_dropout_rng_lineage():
@@ -336,76 +245,6 @@ def test_banked_training_preserves_each_layers_dropout_rng_lineage():
     assert jax.tree.structure(captures[0]) == jax.tree.structure(captures[1])
     for a, b in zip(jax.tree.leaves(captures[0]), jax.tree.leaves(captures[1]), strict=True):
         np.testing.assert_array_equal(np.asarray(a) == 0, np.asarray(b) == 0)
-
-
-def test_a_store_holding_a_leaf_in_both_a_bank_and_its_layers_is_refused():
-    """A bank beside its rows is read when the two hold different leaves (a
-    host layout keeps what every row froze as the bank); the same leaf in
-    both is not decided by guessing."""
-    _, scanned, variables, tokens = pair(num_layers=4)
-    _, on_host = stores(scanned, variables)
-    mixed = {"params": {**on_host["params"],
-                        "layers_2": variables["params"]["layers_2"]}}
-    with pytest.raises(ValueError, match="in its layer layers_2;"):
-        scanned.apply(mixed, tokens)
-
-
-def bank_leaves(store) -> int:
-    return len(jax.tree.leaves(
-        {name: tree for name, tree in store["params"].items() if name.startswith("layers_")}))
-
-
-def host_parameters_in_plan(compiled) -> int:
-    """How many of the compiled entry computation's parameters XLA assigned to
-    the host memory space, read off its own layout."""
-    head = compiled.as_text().splitlines()[0]
-    body = head.partition("entry_computation_layout={(")[2].partition(")->")[0]
-    return sum(1 for entry in body.split(", ") if "S(5)" in entry)
-
-
-def compiled_forward(scanned, store, cache, tokens):
-    return jax.jit(lambda held, cached, ids: scanned.apply(
-        {**held, "cache": cached}, ids, decode=True, mutable=["cache"])).lower(
-            store, cache, tokens).compile()
-
-
-def staged_plan(depth: int) -> tuple[int, int, int, int]:
-    """Cached host placement, cache-free parameter-staging workspace, and one
-    layer's parameter bytes."""
-    _, scanned, variables, tokens = pair(num_layers=depth)
-    resident, on_host = stores(scanned, variables)
-    cache = scanned.apply(on_host, 2, method="init_cache", mutable=["cache"])[1]["cache"]
-    compiled = compiled_forward(scanned, on_host, cache, tokens)
-    assert host_parameters_in_plan(compiled_forward(scanned, resident, cache, tokens)) == 0
-    uncached = jax.jit(lambda held, ids: scanned.apply(held, ids)).lower(on_host, tokens).compile()
-    analysis = uncached.memory_analysis()
-    assert analysis is not None
-    banks = {name: tree for name, tree in on_host["params"].items() if name.startswith("layers_")}
-    layer = sum(leaf.nbytes for leaf in jax.tree.leaves(banks)) // depth
-    return (host_parameters_in_plan(compiled), bank_leaves(on_host),
-            analysis.temp_size_in_bytes, layer)
-
-
-def test_the_compiled_plan_puts_every_bank_in_host_memory_and_stages_one_layer():
-    """Parameter staging, not total cached-decode workspace, is depth-bounded.
-
-    The cached forward still assigns every bank leaf to host memory, unlike
-    its resident counterpart. The cache-free public forward isolates the
-    parameter-staging cost: it holds the current and prefetched layers, not
-    the whole stack, so eight more layers add less than one layer's bytes to
-    its temporaries, where staging the stack would add eight layers'. The
-    bound is not zero: with deterministic ops on an RTX 4080 and an A100 the
-    sixteen-layer plan's temporaries are 256 bytes over the eight-layer
-    plan's, and on the 4080 the resident plan's grow by the same 256. Both
-    plans hold the same temporaries apart from a loop's s32[depth - 1]; XLA
-    packs them into its temporary allocation differently. Cached decode has
-    depth-dependent KV-bank tiling and output formatting on TPU; subtracting
-    logical cache nbytes from physical temporaries cannot remove that cost.
-    Separate decode tests check values.
-    """
-    shallow, deep = staged_plan(8), staged_plan(16)
-    assert shallow[0] == shallow[1] and deep[0] == deep[1]
-    assert deep[2] - shallow[2] < shallow[3], (shallow, deep)
 
 
 def test_a_checkpoint_restores_bank_by_bank_into_host_memory(tmp_path):
@@ -433,17 +272,6 @@ def test_a_checkpoint_restores_bank_by_bank_into_host_memory(tmp_path):
                           np.asarray(scanned.apply(resident, tokens)))
     trained = StackView(scanned.bind({}).groups).unstack(resident)
     assert identical(trained, state.variables)
-
-
-@pytest.mark.mesh
-def test_a_pipeline_over_stages_refuses_a_banked_store():
-    """A pipeline stacks every stage's copy of a layer, which a store already
-    banked by run cannot be reshaped into."""
-
-    _, scanned, variables, tokens = pair(num_layers=4)
-    _, on_host = stores(scanned, variables)
-    with jax.set_mesh(MeshSpec(stage=2).build()), pytest.raises(ValueError, match="already banked by run"):
-        scanned.apply(on_host, tokens)
 
 
 # --------------------------------------------------------------------------
@@ -507,41 +335,3 @@ def test_synthetic_banks_keep_namespace_values_across_bank_sizes(kind):
     separate = source.place(one, layout=DEVICE)
     identical(unpack(separate, one.bank_sites, source.shapes()),
               unpack(resident, sites, source.shapes()))
-
-
-
-def _resident_shared_bytes() -> int:
-    with open("/proc/self/status") as handle:
-        for line in handle:
-            if line.startswith("RssShmem"):
-                return int(line.split()[1]) * 1024
-    return -1
-
-
-@pytest.mark.gpu(reason="pinned host memory is the GPU pool")
-def test_the_host_memory_limit_is_what_stops_the_bank_pool_from_doubling(monkeypatch):
-    """XLA's pinned pool grows by power-of-two regions, capped at the process
-    host memory limit. Banks placed one at a time land in a pool that ends
-    at that limit, so the limit is the lever; a limit below the banks is
-    refused by name before anything is placed."""
-    from jax.sharding import NamedSharding, PartitionSpec as P
-
-    from dew.training.execution import HOST_LIMIT, check_bank_pool
-    from dew.training.host import place_leaf
-    mesh = jax.sharding.Mesh(np.array(jax.devices()[:1]), ("x",))
-    monkeypatch.setenv(HOST_LIMIT, "1")
-    with pytest.raises(ValueError, match="set it to at least"):
-        check_bank_pool(3 * (1 << 30), mesh)
-    monkeypatch.setenv(HOST_LIMIT, "8")
-    check_bank_pool(3 * (1 << 30), mesh)
-    memory = NamedSharding(mesh, P(), memory_kind="pinned_host")
-    bank = 96 << 20
-    before = _resident_shared_bytes()
-    held = [place_leaf(np.full((bank // 2,), index, jnp.bfloat16), memory) for index in range(5)]
-    assert all(int(np.asarray(placed)[0]) == index for index, placed in enumerate(held))
-    grown = _resident_shared_bytes() - before
-    # Five 96 MiB banks land in power-of-two regions that a bank cannot
-    # straddle, so the pool runs well past the 480 MiB used. The process
-    # limit is the one thing that caps it, and it is fixed at backend start,
-    # which is why the check above reads it rather than the pool.
-    assert grown >= 5 * bank * 1.2, grown

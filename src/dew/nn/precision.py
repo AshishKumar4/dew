@@ -135,6 +135,34 @@ def compensated_add(left, right):
     return total, dropped + left_lo + right_lo
 
 
+def compensated_sum(values: jax.Array, axes: tuple[int, ...]) -> jax.Array:
+    """The sum of `values` over `axes`, rounded once: one XLA reduction whose accumulator is a
+    double-float `(hi, lo)` pair combined by `compensated_add`, so it partitions as any reduction
+    does, and what the roundings dropped is added back at the end.
+
+    One plain reduction over a loss's every axis rounds as it goes; on 6144 JEPA squares it left the
+    sum one float32 step above the correctly rounded one, and the loss a float32 ulp from float64,
+    where numpy's float32 mean of the same squares was correctly rounded. A narrower float adds in
+    float32 and returns in its own dtype, as `jnp.sum` does; an integer sum is `jnp.sum`'s. The
+    derivative is `jnp.sum`'s."""
+    if not jnp.issubdtype(values.dtype, jnp.floating):
+        return jnp.sum(values, axes)
+    return _compensated_sum(values, tuple(axes))
+
+
+@functools.partial(jax.custom_jvp, nondiff_argnums=(1,))
+def _compensated_sum(values: jax.Array, axes: tuple[int, ...]) -> jax.Array:
+    wide = values.astype(jnp.promote_types(values.dtype, jnp.float32))
+    zero = jnp.zeros((), wide.dtype)
+    hi, lo = jax.lax.reduce((wide, jnp.zeros_like(wide)), (zero, zero), compensated_add, axes)
+    return (hi + lo).astype(values.dtype)
+
+
+@_compensated_sum.defjvp
+def _compensated_sum_jvp(axes: tuple[int, ...], primals: tuple[jax.Array],
+                         tangents: tuple[jax.Array]) -> tuple[jax.Array, jax.Array]:
+    return _compensated_sum(primals[0], axes), jnp.sum(tangents[0], axes)
+
 @functools.partial(jax.custom_jvp, nondiff_argnums=(1,))
 def rounded_operand(x: jax.Array, dtype: Dtype) -> jax.Array:
     """The value `x` takes in `dtype`, held in `x`'s own dtype, with a
@@ -213,8 +241,22 @@ def head_dot_general(dtype: Dtype | None, precision: PrecisionLike = None):
     return dot_general
 
 
+def biased_logits(logits: jax.Array, bias: jax.Array | None) -> jax.Array:
+    """The vocabulary bias after the product's rounding, in fp32 or wider."""
+    return logits if bias is None else logits + jnp.asarray(bias, logits.dtype)
+
+
+def capped_logits(logits: jax.Array, softcap, temperature: float = 1.0) -> jax.Array:
+    """Softcapped logits over a sampling temperature, which an engine applies
+    to what the model's head returns."""
+    if softcap is not None:
+        cap = jnp.asarray(softcap, logits.dtype)
+        logits = cap * jnp.tanh(logits / cap)
+    return logits / temperature
+
+
 def head_product(subscripts: str, hidden: jax.Array, head: jax.Array,
-                 precision: PrecisionLike = None) -> jax.Array:
+                 precision: PrecisionLike = None, *, compute: DTypeLike | None = None) -> jax.Array:
     """`jnp.einsum(subscripts, hidden, head)` as a vocabulary head computes
     it, with accumulation and a result at least fp32.
 
@@ -227,9 +269,11 @@ def head_product(subscripts: str, hidden: jax.Array, head: jax.Array,
     below seed noise) and saves 13% of a 3-layer decoder's step. It does move
     layout parity (a 4 x RTX 3090 bf16 MoE read 5758 of its bound against 0.41
     in fp32), so a run comparing layouts or resuming onto another mesh sets
-    `matmul_precision` "highest", whose head is fp32."""
-    if rounds_to_bf16(hidden.dtype, precision):
-        logits = jnp.einsum(subscripts, hidden.astype(jnp.float32), _algorithm_operand(head),
+    `matmul_precision` "highest", whose head is fp32. `compute`, the model's
+    compute dtype where the states arrive in another, decides in their place."""
+    if rounds_to_bf16(hidden.dtype if compute is None else compute, precision):
+        states = _algorithm_operand(hidden.astype(jnp.float32))
+        logits = jnp.einsum(subscripts, states, _algorithm_operand(head),
                             precision=jax.lax.DotAlgorithmPreset.BF16_BF16_F32,
                             preferred_element_type=jnp.float32)
         return bf16_logits(logits)

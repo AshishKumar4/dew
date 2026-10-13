@@ -95,6 +95,7 @@ def _promoted(pipeline: Pipeline) -> Pipeline:
     read only as a stream, such as one filtered by a predicate, is packed as
     its rows arrive."""
     from dew.data.cache import Generation
+    from dew.data.holdout import rebased
     from dew.data.packing import PackedSource, plan_name
 
     source, stages = pipeline.source, pipeline.stages
@@ -102,9 +103,11 @@ def _promoted(pipeline: Pipeline) -> Pipeline:
         source = dataclasses.replace(source, pipelines=tuple(_promoted(child) for child in source.pipelines))
     for index, stage in enumerate(stages):
         if isinstance(stage, Artifact) and isinstance(stage.cache, Generation):
-            source, stages = stage.cache.source(), stages[index + 1 :]
+            generation = stage.cache.source()
+            source, stages = rebased(source, generation), stages[index + 1 :]
             plans = record(stage.cache.manifest.get("plan", {}), "published plans")
-            if stages and isinstance(stages[0], Pack) and plan_name(stages[0], "accepted") in plans:
+            if (source is generation and stages and isinstance(stages[0], Pack)
+                    and plan_name(stages[0], "accepted") in plans):
                 source, stages = PackedSource.published(source, stage.cache, stages[0]), stages[1:]
             break
     pack = stages[0] if stages else None
@@ -248,7 +251,10 @@ def _identity(stage: Stage, *, cache: bool = False) -> StepIdentity:
     if isinstance(stage, Native):
         return StepIdentity.of(stage.function, stage.identity, cache=cache)
     if isinstance(stage, Batched):
-        return StepIdentity.of(stage.step, stage.identity, cache=cache)
+        step = StepIdentity.of(stage.step, stage.identity, cache=cache)
+        # The group size and whether the rows keep their count decide what a resume reads.
+        shape = f"[batched {stage.size}, {'same rows' if stage.same_rows else 'any rows'}]"
+        return dataclasses.replace(step, name=step.name + shape, config=step.config + shape)
     return StepIdentity.of(stage)
 
 

@@ -309,10 +309,11 @@ class CharTable(ConditionEncoder[str, TextContext]):
                         params: Variables | None = None):
         """Return an encoder with the table `seed` draws, or with the table `params` already holds.
 
-        There is nothing to load, so `checkpoint` is ignored. It is in the
-        signature because `rebuild` passes every encoder the checkpoint name
-        its `to_json` wrote, and this encoder always writes `"char_table"`.
-        """
+        The table has no checkpoint: `checkpoint` names it as `char_table`, and any other name is
+        refused rather than read as a random table."""
+        if checkpoint != "char_table":
+            raise ValueError(f"the character table draws its table from `seed` and reads no checkpoint; "
+                             f"name it 'char_table', not {checkpoint!r}")
         compute = resolve_dtype(dtype)
         storage = resolve_dtype(param_dtype)
         if params is None:

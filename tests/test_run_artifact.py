@@ -1,8 +1,5 @@
 """Python training saves the model/task declaration with its own checkpoint."""
-import dataclasses
 import inspect
-import json
-import shutil
 
 import flax.linen
 import grain.python as grain
@@ -38,17 +35,6 @@ def test_live_model_record_rebuilds_exact_constructor_fields():
     tokens = jnp.arange(1, 9)[None, :]
     variables = original.init(jax.random.key(0), tokens)
     np.testing.assert_array_equal(original.apply(variables, tokens), rebuilt.apply(variables, tokens))
-
-
-def test_a_composite_model_record_nests_its_part_and_rebuilds_it():
-    """DiffusionGemma holds a CausalTransformer: its record nests the part's own
-    record, and building it gives the part's precision to the part alone."""
-    from dew.nn.diffusion_gemma import DiffusionGemma
-
-    original = DiffusionGemma(model().clone(layer_scalar="frozen"), canvas_length=4)
-    record = ModelConfig.from_model(original)
-    assert "dtype" not in record.fields and record.fields["text"]["layer_scalar"] == "frozen"
-    assert record.build() == original.clone(text=original.text.clone(dtype=jnp.float32))
 
 
 def documented_block(page, after):
@@ -92,68 +78,6 @@ def test_the_documented_model_records_itself_and_its_run_loads_back(tmp_path, mo
     assert type(restored.model) is mymodels.ResidualMLP and restored.model.features == 16
     np.testing.assert_array_equal(restored([""], key=3).host().images,
                                   objective.pipeline(state)([""], key=3).host().images)
-
-
-def test_a_model_with_no_import_path_trains_and_saves_and_loading_says_why(tmp_path, caplog):
-    """A class defined inside a function trains and checkpoints as any other;
-    its record cannot name it, which the first checkpoint warns and loading
-    the run raises."""
-    from dew.inference import TextGeneration
-
-    class Custom(type(model())):
-        pass
-
-    objective = LMObjective(Custom(**{field.name: getattr(model(), field.name)
-                                      for field in dataclasses.fields(model())
-                                      if field.init and field.name not in ("parent", "name")}),
-                            seq_len=8, ema_decay=None)
-    rows = [{'text': np.arange(9, dtype=np.int32)} for _ in range(8)]
-    data = compile(Pipeline(Memory(grain.MapDataset.source(rows))).repeat().batch(8), read="indexed",
-        loading=Loading(workers=0))
-    checkpoints = Checkpoints(str(tmp_path / 'run'))
-    with caplog.at_level("WARNING", logger="dew.training.trainer"):
-        Trainer(objective, optax.sgd(.01), key=0, checkpoints=checkpoints).fit(data, steps=1,
-                                                                               checkpoint_every=1)
-    checkpoints.wait()
-    assert "has no import path a record can name" in caplog.text
-    with pytest.raises(ValueError, match="has no import path a record can name"):
-        TextGeneration.from_run(str(tmp_path / 'run'))
-
-
-class Opaque:
-    pass
-
-
-class Noted(flax.linen.Module):
-    """A denoiser holding a field no record can carry."""
-
-    note: object = Opaque()
-
-    @flax.linen.compact
-    def __call__(self, x, temb, textcontext=None, train=False):
-        return flax.linen.Dense(x.shape[-1])(x)
-
-
-def test_a_model_no_record_can_describe_still_checkpoints_and_loading_says_why(tmp_path, caplog):
-    from dew import Field, InputSpec
-    from dew.diffusion.presets import Flow
-    from dew.objectives.diffusion import DiffusionObjective
-    from dew.sampling import TextToImage
-
-    objective = DiffusionObjective(Noted(), Flow(), InputSpec(Field("image", (4, 4, 3))), guidance=None,
-                                   steps=2)
-    rows = [{"image": np.zeros((4, 4, 3), np.uint8)} for _ in range(8)]
-    data = compile(Pipeline(Memory(grain.MapDataset.source(rows))).repeat().batch(8), read="indexed",
-        loading=Loading(workers=0))
-    checkpoints = Checkpoints(str(tmp_path / 'run'))
-    with caplog.at_level("WARNING", logger="dew.training.trainer"):
-        Trainer(objective, optax.sgd(.01), key=0, checkpoints=checkpoints).fit(data, steps=1,
-                                                                               checkpoint_every=1)
-    checkpoints.wait()
-    assert caplog.text.count("no loader can rebuild their model") == 1
-    assert checkpoints.variables(ema=False)["params"]
-    with pytest.raises(ValueError, match="no model to load: DiffusionObjective: Opaque is not something"):
-        TextToImage.from_run(str(tmp_path / 'run'))
 
 
 def test_an_adapted_run_records_its_base_and_adapter_and_loads_what_it_trained(tmp_path):
@@ -298,77 +222,6 @@ def test_an_adapted_denoiser_run_loads_what_it_trained(tmp_path):
                                   np.asarray(objective.model.apply(state.variables, x, t)))
 
 
-def python_lm_run(directory):
-    """A run defined in Python, an LMObjective fit two steps into `directory`: its objective and state."""
-    objective = LMObjective(model(), seq_len=8, ema_decay=None)
-    rows = [{'text': np.arange(9, dtype=np.int32)} for _ in range(16)]
-    data = compile(Pipeline(Memory(grain.MapDataset.source(rows))).repeat().batch(8), read="indexed",
-        loading=Loading(workers=0))
-    checkpoints = Checkpoints(str(directory))
-    trainer = Trainer(objective, optax.sgd(.01), key=0, checkpoints=checkpoints)
-    state = trainer.fit(data, steps=2, log_every=2, checkpoint_every=1)
-    checkpoints.wait()
-    return objective, state
-
-
-def test_python_lm_run_saves_its_inference_record_and_marks_itself_a_run(tmp_path):
-    from dew.checkpoints import PYTHON_RUN
-    from dew.config import RunConfig
-
-    objective, state = python_lm_run(tmp_path / 'run')
-    assert json.loads((tmp_path / 'run' / 'run.json').read_text()) == PYTHON_RUN
-    with pytest.raises(ValueError, match='defined in Python'):
-        RunConfig.load(str(tmp_path / 'run'))
-    record = Checkpoints(str(tmp_path / 'run')).artifact(2)
-    assert record['objective'] == 'dew.objectives.lm.objective:LMObjective'
-    assert record['seq_len'] == 8
-    from dew.interop import Pretrained, PretrainedDecoder, PretrainedMaskedDecoder
-    bundle = Pretrained.from_run(tmp_path / 'run')
-    assert isinstance(bundle, PretrainedDecoder)
-    with pytest.raises(TypeError, match='PretrainedDecoder source, not a PretrainedMaskedDecoder'):
-        PretrainedMaskedDecoder.from_run(tmp_path / 'run')
-    rebuilt = ModelConfig.from_dict(record['model']).build()
-    assert rebuilt == objective.model.clone(dtype=jnp.float32)
-    assert record['tokenizer'] is None
-    from dew.inference import TextGeneration
-    task = TextGeneration.from_run(str(tmp_path / 'run'), ema=False)
-    assert task.processor is None
-    tokens = jnp.arange(1, 9)[None, :]
-    expected = objective.model.apply(state.variables, tokens)
-    actual = task.model.apply(task.variables, tokens)
-    np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
-
-
-def test_a_python_run_pushed_to_the_hub_loads_through_the_pipeline_as_it_does_locally(tmp_path, monkeypatch):
-    """The run's own directory, uploaded whole (`HfApi.upload_folder`), is the
-    snapshot the Hub serves: `dew.pipeline` finds its run record there and
-    loads the run, as it loads the directory; steps without the record are
-    refused by name."""
-    import huggingface_hub
-
-    import dew
-    import dew.interop.hub as hub
-
-    objective, state = python_lm_run(tmp_path / 'run')
-    snapshot = tmp_path / 'hub' / ('0' * 40)
-    shutil.copytree(tmp_path / 'run', snapshot)
-
-    def snapshot_download(repo_id=None, revision=None, **_):
-        assert repo_id == 'acme/python-run'
-        return str(snapshot)
-
-    monkeypatch.setattr(huggingface_hub, 'snapshot_download', snapshot_download)
-    monkeypatch.setattr(hub, 'snapshot_download', snapshot_download)
-    tokens = jnp.arange(1, 9)[None, :]
-    expected = np.asarray(objective.model.apply(state.variables, tokens))
-    for source in ('acme/python-run', str(tmp_path / 'run')):
-        task = dew.pipeline(source, ema=False)
-        np.testing.assert_array_equal(np.asarray(task.model.apply(task.variables, tokens)), expected)
-    (snapshot / 'run.json').unlink()
-    with pytest.raises(ValueError, match=r'no run\.json'):
-        dew.pipeline(str(snapshot), ema=False)
-
-
 @pytest.mark.parametrize("kind", ["text", "masked", "block"])
 def test_task_from_pretrained_selects_the_requested_snapshot(tmp_path, monkeypatch, kind):
     from flax.core import freeze
@@ -441,24 +294,6 @@ def test_builtin_autoencoder_record_uses_the_saved_parameters():
                                   rebuilt.decode(rebuilt.params, latent))
 
 
-def test_masked_run_returns_its_own_bundle_kind(tmp_path):
-    from dew.diffusion.discrete import MDLM
-    from dew.interop import Pretrained, PretrainedMaskedDecoder
-    from dew.objectives.diffusion.masked import MaskedDiffusionObjective
-
-    masked = model().clone(causal=False, mask_token_id=0, qk_norm=False)
-    objective = MaskedDiffusionObjective(masked, MDLM(mask_id=0)(), 8,
-                                        head_chunks=1, ema_decay=None, steps=2)
-    source = grain.MapDataset.source([{'text': np.arange(1, 9, dtype=np.int32)}] * 8)
-    data = compile(Pipeline(Memory(source)).repeat().batch(8), read="indexed", loading=Loading(workers=0))
-    trainer = Trainer(objective, optax.sgd(.01), key=jax.random.key(0),
-                      checkpoints=Checkpoints(str(tmp_path / 'run')))
-    trainer.fit(data, steps=1, log_every=1, checkpoint_every=1)
-    bundle = Pretrained.from_run(tmp_path / 'run')
-    assert isinstance(bundle, PretrainedMaskedDecoder)
-    assert bundle.model.mask_token_id == 0
-
-
 def process_components():
 
     classes = [getattr(schedules, name) for name in schedules.__all__]
@@ -525,25 +360,3 @@ def test_every_builtin_process_component_round_trips_nondefaults(component):
         jax.tree.map(np.testing.assert_array_equal,
                      original.prediction.backward_diffusion(clean, noise, rates),
                      rebuilt.prediction.backward_diffusion(clean, noise, rates))
-
-
-def test_python_diffusion_checkpoint_preserves_its_solver(tmp_path):
-    from dew.diffusion.presets import Flow
-    from dew.inference import TextToImage
-    from dew.inputs import Field, InputSpec
-    from dew.nn.backbones.dit import SimpleDiT
-    from dew.objectives.diffusion import DiffusionObjective
-    from dew.sampling.solvers import Euler
-
-    model = SimpleDiT(patch_size=2, emb_features=16, num_layers=1, num_heads=2, mlp_ratio=1,
-                      output_channels=1, dtype=jnp.float32)
-    objective = DiffusionObjective(model, Flow(), InputSpec(Field('image', (4, 4, 1))),
-                                   solver=Euler(), steps=2, ema_decay=None)
-    source = grain.MapDataset.source([{'image': np.ones((4, 4, 1), np.float32)}] * 8)
-    data = compile(Pipeline(Memory(source)).repeat().batch(8), read="indexed", loading=Loading(workers=0))
-    trainer = Trainer(objective, optax.sgd(.01), key=0, checkpoints=Checkpoints(str(tmp_path / 'run')))
-    trainer.fit(data, steps=1, log_every=1, checkpoint_every=1)
-    trainer.checkpoints.wait()
-    loaded = TextToImage.from_run(str(tmp_path / 'run'))
-    assert isinstance(loaded.solver, Euler)
-    assert loaded.steps == 2

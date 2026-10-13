@@ -24,13 +24,12 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Literal
 
 import jax
 import jax.numpy as jnp
 
 from dew.nn.dit import scan_indices
-from dew.nn.scan_orders import inverse_permutation
+from dew.nn.scan_orders import ScanOrder, inverse_permutation
 
 
 def _factorizations(area: int, grid: tuple[int, int], aspect: tuple[float, float]):
@@ -58,13 +57,13 @@ class MultiBlockMask:
     num_targets: int
     block_shapes: tuple[tuple[int, int], ...]
     num_context: int
-    scan_order: Literal["raster", "hilbert", "zigzag"] = "raster"
+    scan_order: ScanOrder = "raster"
 
     @classmethod
     def for_grid(cls, grid: tuple[int, int], num_targets: int = 4,
                  scale: tuple[float, float] = (0.15, 0.2),
                  aspect: tuple[float, float] = (0.75, 1.5),
-                 scan_order: Literal["raster", "hilbert", "zigzag"] = "raster") -> MultiBlockMask:
+                 scan_order: ScanOrder = "raster") -> MultiBlockMask:
         """Resolve the I-JEPA mask geometry for a patch grid whose tokens the encoder orders by `scan_order`.
 
         The block area is the one in the `scale` range, a fraction of the
@@ -129,8 +128,9 @@ class MultiBlockMask:
                                for h, w in self.block_shapes])
 
         shape_key, pos_key, context_key = jax.random.split(rng, 3)
-        choice = jax.random.randint(shape_key, (batch_size, M), 0, len(self.block_shapes))
-        corner = jax.random.uniform(pos_key, (batch_size, M, 2))
+        # The draws' dtypes are fixed, so a float64 run samples the masks a float32 one does.
+        choice = jax.random.randint(shape_key, (batch_size, M), 0, len(self.block_shapes), dtype=jnp.int32)
+        corner = jax.random.uniform(pos_key, (batch_size, M, 2), dtype=jnp.float32)
         top = jnp.floor(corner[..., 0] * (H_P - heights[choice] + 1)).astype(jnp.int32)
         left = jnp.floor(corner[..., 1] * (W_P - widths[choice] + 1)).astype(jnp.int32)
         target_idx = (top * W_P + left)[..., None] + offsets[choice]
@@ -143,6 +143,6 @@ class MultiBlockMask:
             jnp.arange(batch_size)[:, None], target_idx.reshape(batch_size, -1)].set(True)
         # target tokens sort last, so the first num_context entries of a random
         # ordering are a uniform sample of the complement
-        order = jax.random.uniform(context_key, (batch_size, S)) + is_target
+        order = jax.random.uniform(context_key, (batch_size, S), dtype=jnp.float32) + is_target
         context_idx = jnp.sort(jnp.argsort(order, axis=1)[:, :self.num_context], axis=1)
         return context_idx, target_idx

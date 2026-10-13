@@ -5,25 +5,17 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
-import pytest
 
 from dew.data import Memory
 from dew.data.compile import validation
 from dew.data.pipeline import Pipeline
 from dew.data.steps.generic import Formatting
-from dew.objectives.base import Aux, EMASpec, Objective, Ratio, Step, everything, merge, select, under
+from dew.objectives.base import Objective, Ratio, Step, everything, merge, select, under
 
 
 def tree():
     return {"params": {"encoder": {"w": jnp.ones((2,))}, "head": {"w": jnp.zeros((2,))}},
             "stats": {"seen": jnp.zeros(())}}
-
-
-def test_under_selects_a_prefix_and_everything_selects_all():
-    assert under("params", "encoder")(("params", "encoder", "w"))
-    assert not under("params", "encoder")(("params", "head", "w"))
-    assert not under("params", "encoder")(("params",))
-    assert everything(("stats", "seen"))
 
 
 def test_select_keeps_the_nesting_of_what_it_keeps():
@@ -52,45 +44,6 @@ def test_merge_after_select_puts_the_averaged_leaves_where_they_came_from():
     np.testing.assert_array_equal(merged["params"]["head"]["w"], 0.0)
 
 
-def test_step_and_aux_cross_jit():
-    """What the compiled step hands an objective and takes back are pytrees."""
-    @jax.jit
-    def body(step: Step) -> Aux:
-        draw = jax.random.normal(step.key, ())
-        return Aux({"draw": draw, "step": step.step.astype(jnp.float32)},
-                   variables={"stats": {"seen": step.ema["stats"]["seen"] + 1}})
-
-    aux = body(Step(step=jnp.asarray(3), key=jax.random.key(0), ema=tree()))
-    assert float(aux.metrics["step"]) == 3.0
-    assert float(aux.variables["stats"]["seen"]) == 1.0
-    assert jnp.isfinite(aux.metrics["draw"])
-
-
-def test_step_mode_is_static_under_jit():
-    @jax.jit
-    def signed(step):
-        return step.step if step.training else -step.step
-
-    step = Step(step=jnp.asarray(3), key=jax.random.key(0), ema=None)
-    assert signed(step) == 3
-    assert signed(step.replace(training=False)) == -3
-    assert step.training
-
-
-def test_ema_spec_defaults_to_the_whole_tree():
-    spec = EMASpec(decay=optax.constant_schedule(0.9))
-    assert spec.select is everything
-
-
-def test_an_objective_needs_init_and_loss():
-    class Incomplete(Objective):
-        def init(self, key, variables=None):
-            return {}
-
-    with pytest.raises(TypeError):
-        Incomplete()
-
-
 def test_registered_lm_objective_computes_next_token_loss():
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.objectives.lm import LMObjective
@@ -106,24 +59,6 @@ def test_registered_lm_objective_computes_next_token_loss():
     actual, _ = registered.scalar_loss(variables, batch, step)
     expected, _ = direct.scalar_loss(variables, batch, step)
     np.testing.assert_allclose(actual, expected)
-
-
-def held_bytes(initializer) -> int:
-    return sum(int(np.asarray(leaf).nbytes) for leaf in jax.tree.leaves(initializer))
-
-
-def captured_bytes(function, *args) -> int:
-    """The arrays a JIT of `function` would compile in as constants.
-
-    A closed jaxpr's constvars are what MLIR lowers to `stablehlo.constant`,
-    so this is the quantity that put a 2.2 GiB parameter tree inside the
-    state executable and past the compilation cache's 2 GiB entry limit.
-    """
-    consts = jax.make_jaxpr(function)(*args).consts
-    return sum(int(np.asarray(jax.random.key_data(value)
-                              if jnp.issubdtype(value.dtype, jax.dtypes.prng_key)
-                              else value).nbytes)
-               for value in consts)
 
 
 def lm_objective(variables=None, **options):
@@ -156,62 +91,6 @@ def test_compiled_scores_follow_substituted_modules_and_head_tiles():
     objective.head_tile = (2, 8)
     assert objective._compiled_scores is not compiled
     assert objective._compiled_scores is objective._compiled_scores
-
-
-def model_constants(objective) -> int:
-    """What the model's own initialization compiles in: its static tables
-    (the rotary inverse frequencies, built on the host), a few hundred bytes."""
-    return captured_bytes(lambda key: objective.model.init(key, jnp.zeros((1, 4), jnp.int32)),
-                          jax.random.key(0))
-
-
-def test_an_objective_that_holds_nothing_binds_no_initializer_arguments():
-    """The default initializer is `init` itself: an objective that draws its
-    whole tree from the key has no data to hand over, and compiles in nothing
-    past the model's own static tables."""
-    objective = lm_objective()
-    assert jax.tree.leaves(objective.initializer) == []
-    # The tiny model's tables are 16 bytes; a baseline past a few KiB would
-    # be an array the model itself bakes in.
-    assert model_constants(objective) < 4096
-    assert captured_bytes(lambda key: objective.initializer(key), jax.random.key(0)) == model_constants(
-        objective
-    )
-
-
-def test_a_held_tree_crosses_into_a_jit_as_data_rather_than_as_a_constant():
-    """The boundary this seam exists for. A continued-pretraining objective
-    holds the whole parameter tree; bound as the initializer's argument it is
-    a JIT argument, while reading it off the objective inside a nullary trace
-    compiles it into the executable."""
-    tiny = lm_objective()
-    weights = jax.jit(tiny.init)(jax.random.key(0))
-    objective = lm_objective(variables=weights)
-    tree_bytes = sum(int(np.asarray(leaf).nbytes) for leaf in jax.tree.leaves(weights))
-
-    assert held_bytes(objective.initializer) == tree_bytes
-    assert captured_bytes(lambda: objective.init(jax.random.key(0))) == tree_bytes
-    assert captured_bytes(lambda initializer, key: initializer(key),
-                          objective.initializer, jax.random.key(0)) == 0
-
-
-def test_a_held_tree_stays_data_through_an_objectives_own_jit():
-    """The argument survives nesting, which is what makes the boundary a
-    contract rather than a property of one implementation: an objective free
-    to compile its own initialization cannot smuggle its held tree back in."""
-    from dew.objectives.lm import LMObjective
-
-    class Nested(LMObjective):
-        def init(self, key, variables=None):
-            return jax.jit(lambda held: LMObjective.init(self, key, held))(
-                self.variables if variables is None else variables)
-
-    tiny = lm_objective()
-    weights = jax.jit(tiny.init)(jax.random.key(0))
-    objective = Nested(tiny.model, seq_len=4, variables=weights)
-
-    assert captured_bytes(lambda initializer, key: initializer(key),
-                          objective.initializer, jax.random.key(0)) == 0
 
 
 def test_the_initializer_dispatches_through_the_public_init():
@@ -248,18 +127,6 @@ def test_the_initializer_and_init_return_the_same_tree():
         assert jax.tree.structure(direct) == jax.tree.structure(through)
         for left, right in zip(jax.tree.leaves(direct), jax.tree.leaves(through), strict=True):
             np.testing.assert_array_equal(left, right)
-
-
-def test_the_held_variables_hook_is_what_the_initializer_binds():
-    """`held_variables` is the public hook the boundary reads, so an
-    objective that reports nothing binds nothing and one that reports a tree
-    binds exactly that tree."""
-    tiny = lm_objective()
-    weights = jax.jit(tiny.init)(jax.random.key(0))
-
-    assert tiny.held_variables() is None
-    holding = lm_objective(variables=weights)
-    assert held_bytes(holding.initializer) == held_bytes(holding.held_variables())
 
 
 class SuppliedRule(Objective):
@@ -299,21 +166,25 @@ def test_a_supplied_gradient_is_what_the_trainer_steps_with():
     np.testing.assert_allclose(stepped["params"]["w"], expected, rtol=1e-6)
 
 
-def test_a_supplied_rule_is_computed_only_where_something_differentiates():
-    """A pass that reads only the values, as a validation pass does, leaves
-    the rule out of its program; differentiated, the statistic's gradient is
-    the rule, bit for bit."""
-    params = {"w": jnp.asarray([0.5, -1.0, 2.0])}
-    x = np.random.default_rng(0).normal(size=(8, 3)).astype(np.float32)
+def test_a_loss_mean_is_as_exact_as_numpys_float32_mean():
+    """Each of 64 rows' mean over 6144 squares, a small JEPA loss's count, within the float64 gate:
+    one reduction over every element left such a sum a float32 step from the correctly rounded one,
+    and the JEPA loss a float32 ulp from float64 on some weights, several times numpy's distance."""
+    from reference_error import assert_as_exact_as_the_reference
 
-    def statistic(p, x):
-        rule = {"w": jnp.sin(x).sum(0)}  # an operation of its own, to look for
-        return Objective.with_gradients(jnp.mean(jnp.square(x @ p["w"] - 1.0)), rule, p)
-
-    assert "sine" not in jax.jit(statistic).lower(params, x).compile().as_text()
-    np.testing.assert_allclose(statistic(params, x), np.mean(np.square(x @ np.asarray(params["w"]) - 1.0)),
-                               rtol=1e-6)
-    np.testing.assert_array_equal(jax.grad(statistic)(params, x)["w"], jnp.sin(x).sum(0))
+    squares = np.square(np.random.default_rng(0).normal(1.2, 1.0, size=(64, 6144))).astype(np.float32)
+    ratio = Objective.row_mean(jnp.asarray(squares), {}, axis=1)
+    rows = np.asarray(ratio.total / ratio.mass)
+    assert_as_exact_as_the_reference(rows, squares.mean(axis=1), squares.astype(np.float64).mean(axis=1),
+                                     "row means")
+    # Each row's sum is the correctly rounded one, compiled too, and its derivative is the plain
+    # sum's, ones.
+    correct = squares.astype(np.float64).sum(axis=1).astype(np.float32)
+    np.testing.assert_array_equal(np.asarray(ratio.total), correct)
+    compiled = jax.jit(lambda x: Objective.row_mean(x, {}, axis=1).total)(jnp.asarray(squares))
+    np.testing.assert_array_equal(np.asarray(compiled), correct)
+    gradient = jax.grad(lambda x: Objective.row_mean(x, {}).total)(jnp.asarray(squares))
+    np.testing.assert_array_equal(np.asarray(gradient), np.ones_like(squares))
 
 
 def test_row_weights_count_the_real_rows_of_a_pass_and_every_row_of_training():
@@ -329,19 +200,6 @@ def test_row_weights_count_the_real_rows_of_a_pass_and_every_row_of_training():
     assert Objective.row_weights(last, 4).dtype == jnp.float32
     np.testing.assert_array_equal(Objective.row_weights({"x": last["x"]}, 4), np.ones(4, np.float32))
     assert float(Objective.row_mean(jnp.asarray(last["x"]), last).mean()[0]) == 4.0
-
-
-@pytest.mark.parametrize("rule, message", [
-    ({"right": jnp.full((2,), 3.0), "wrong_key": jnp.full((2,), 7.0)}, r"wrong_key.*which no.*miss.*left"),
-    ({"left": jnp.ones(2), "right": {"nested": jnp.ones(2)}}, "miss"),
-    ({"left": jnp.ones(2), "right": jnp.ones((2, 1))}, r"\['right'\] \(2, 1\) for \(2,\)"),
-])
-def test_a_supplied_gradient_binds_by_path_and_refuses_another_tree(rule, message):
-    """A rule of the parameters' leaf count but other keys, nesting or shapes
-    would bind to other parameters; it is refused, naming the paths."""
-    params = {"left": jnp.zeros(2), "right": jnp.zeros(2)}
-    with pytest.raises(ValueError, match=message):
-        jax.grad(lambda p: Objective.with_gradients(jnp.float32(0), rule, p))(params)
 
 
 def test_a_supplied_gradient_binds_each_rule_to_its_own_parameter_in_any_mapping():

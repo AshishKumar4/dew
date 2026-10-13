@@ -33,6 +33,7 @@ from contextlib import AbstractContextManager, suppress
 from dataclasses import dataclass, field, replace
 from uuid import uuid4
 
+import jax
 import numpy as np
 
 from dew.inference.rollouts import Draw, RolloutServer
@@ -61,15 +62,11 @@ def _scored(value: float) -> float:
     return reward
 
 
-def _seed(*parts: int) -> int:
-    return int(np.random.default_rng(list(parts)).integers(0, 2 ** 31 - 1))
-
-
 def _failure(error: BaseException) -> str:
     return f"{type(error).__name__}: {error}"
 
 
-class _Refused(Exception):
+class _Refused(ValueError):
     """A configuration error found inside a session; it fails the rollout's future."""
 
 
@@ -98,7 +95,7 @@ class EnvironmentSource:
     def __init__(self, server: RolloutServer,
                  environment: Callable[[Task, EpisodeId], AbstractContextManager[Environment]],
                  verifier: Callable[[Task, Episode], float], *, max_prompt_tokens: int, max_new_tokens: int,
-                 max_turns: int, workers: int = 64, seed: int = 0):
+                 max_turns: int, workers: int = 64):
         for name, value in (("max_prompt_tokens", max_prompt_tokens), ("max_new_tokens", max_new_tokens),
                             ("max_turns", max_turns), ("workers", workers)):
             if type(value) is not int or value < 1:
@@ -111,21 +108,21 @@ class EnvironmentSource:
             max_new_tokens,
             max_turns,
         )
-        self.seed = seed
         self._pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="dew-episode")
         self._lock = threading.Lock()
         self._handles: dict[Future[Session], _Handle] = {}
         self._serial = 0
 
-    def submit(self, task: Task, samples: int, *, version: int) -> list[Future[Session]]:
+    def submit(self, task: Task, samples: int, *, version: int, key: jax.Array) -> list[Future[Session]]:
         with self._lock:
             serial = self._serial
             self._serial += 1
         futures = []
         for sample in range(samples):
             handle = _Handle()
-            identity = EpisodeId(serial, 0, sample, (self.seed, serial, sample))
-            future = self._pool.submit(self._run, task, identity, version, handle)
+            drawn = jax.random.fold_in(key, sample)
+            identity = EpisodeId(serial, 0, sample, tuple(int(word) for word in jax.random.key_data(drawn)))
+            future = self._pool.submit(self._run, task, identity, version, drawn, handle)
             with self._lock:
                 self._handles[future] = handle
             future.add_done_callback(self._forget)
@@ -154,12 +151,12 @@ class EnvironmentSource:
         with self._lock:
             self._handles.pop(future, None)
 
-    def _draw(self, context: tuple[int, ...], seed: int, handle: _Handle) -> Draw | None:
+    def _draw(self, context: tuple[int, ...], key: jax.Array, handle: _Handle) -> Draw | None:
         """One call on the server, or None when the session is cancelled while it runs."""
         handle.wake.clear()
         if handle.cancelled:
             return None
-        pending = self.server.submit(context, self.max_new_tokens, key=seed)
+        pending = self.server.submit(context, self.max_new_tokens, key=key)
         pending.add_done_callback(lambda _: handle.wake.set())
         handle.wake.wait()
         if handle.cancelled and not pending.done():
@@ -179,7 +176,7 @@ class EnvironmentSource:
             context, draw.tokens, raw, draw.behavior_log_probs, draw.terminated, draw.version, sampling
         )
 
-    def _run(self, task: Task, identity: EpisodeId, version: int, handle: _Handle) -> Session:
+    def _run(self, task: Task, identity: EpisodeId, version: int, key: jax.Array, handle: _Handle) -> Session:
         initial: Observation | None = None
         transitions: list[Transition] = []
         draws: list[Draw] = []
@@ -200,9 +197,7 @@ class EnvironmentSource:
                     if limit is not None:
                         status, detail = limit.status, limit.detail
                         break
-                    draw = self._draw(
-                        observation.context, _seed(self.seed, identity.task, identity.sample, turn), handle
-                    )
+                    draw = self._draw(observation.context, jax.random.fold_in(key, turn), handle)
                     if draw is None:
                         status, detail = EpisodeStatus.CANCELLED, "cancelled by the scheduler"
                         break
@@ -291,24 +286,16 @@ class PromptSource:
         decode: Callable[[Sequence[int]], str],
         max_new_tokens: int,
         scorers: int = 16,
-        seed: int = 0,
     ):
         if type(max_new_tokens) is not int or max_new_tokens < 1:
             raise ValueError("a rollout generates at least one token")
         self.server, self.reward, self.decode, self.max_new_tokens = server, reward, decode, max_new_tokens
-        self.seed = seed
         self._scorers = ThreadPoolExecutor(max_workers=scorers, thread_name_prefix="dew-reward")
-        self._serial = 0
-        self._lock = threading.Lock()
 
-    def submit(self, task: Task, samples: int, *, version: int) -> list[Future[Session]]:
-        del version  # each draw reports the version it was submitted under
-        with self._lock:
-            serial = self._serial
-            self._serial += 1
+    def submit(self, task: Task, samples: int, *, version: int, key: jax.Array) -> list[Future[Session]]:
         prompt = _Prompt.of(task)
-        return [self._scored(task, prompt, self.server.submit(prompt.ids, self.max_new_tokens,
-                                                              key=_seed(self.seed, serial, k)))
+        return [self._scored(task, prompt, version, self.server.submit(prompt.ids, self.max_new_tokens,
+                                                                       key=jax.random.fold_in(key, k)))
                 for k in range(samples)]
 
     def cancel(self, futures: Sequence[Future[Session]]) -> None:
@@ -320,11 +307,14 @@ class PromptSource:
         """Stop the reward threads. The caller closes the server; this method does not."""
         self._scorers.shutdown(wait=True, cancel_futures=True)
 
-    def _rollout(self, task: Task, prompt: _Prompt, drawn: Future[Draw]) -> Session:
+    def _rollout(self, task: Task, prompt: _Prompt, version: int, drawn: Future[Draw]) -> Session:
         try:
             draw = drawn.result()
         except Exception as error:
             return Session(task.id, "", 0, 0, (), Status.INFRA_ERROR, None, {}, f"draw: {_failure(error)}")
+        if draw.version != version:
+            return Session(task.id, "", 0, 0, (), Status.INFRA_ERROR, None, {},
+                           f"draw: served by version {draw.version}, submitted under {version}")
         call = Call(
             draw.prompt,
             draw.tokens,
@@ -344,7 +334,7 @@ class PromptSource:
             )
         return Session(task.id, "", 0, 0, (call,), status, score)
 
-    def _scored(self, task: Task, prompt: _Prompt, drawn: Future[Draw]) -> Future[Session]:
+    def _scored(self, task: Task, prompt: _Prompt, version: int, drawn: Future[Draw]) -> Future[Session]:
         """The draw's future, chained into its reward on a scorer thread."""
         scored: Future[Session] = Future()
 
@@ -352,7 +342,7 @@ class PromptSource:
             if scored.cancelled():
                 return
             try:
-                rollout = self._rollout(task, prompt, drawn)
+                rollout = self._rollout(task, prompt, version, drawn)
             except BaseException as failure:
                 # Not a failure of the draw or the reward: a broken source, which the scheduler raises.
                 with suppress(InvalidStateError):  # cancelled while scoring
