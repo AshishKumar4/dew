@@ -15,13 +15,14 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from reference_error import assert_leaves_as_exact, ieee_fixture, widened
-from sharded import assert_runs_per_shard
+from sharded import assert_runs_per_shard, boundary_copies
 from tuned import each_config
 
 from dew.nn.inputs import AttentionMetadata, coordinates
 from dew.nn.kernels import mamba_ssd, tuning
 from dew.nn.mixers import mamba2
 from dew.nn.mixers.mamba2 import Mamba2, chunk_ssd
+from dew.training._lowering import triton_kernels
 
 pytestmark = pytest.mark.kernel
 
@@ -199,6 +200,28 @@ def test_a_mamba2_layer_on_the_port_matches_it_on_xla(monkeypatch, dtype, bound)
         theirs = functools.reduce(lambda node, key: node[key.key], path, want_grads)
         size = float(jnp.max(jnp.abs(theirs)))
         assert float(jnp.max(jnp.abs(mine - theirs))) < bound * size, jax.tree_util.keystr(path)
+
+
+@pytest.mark.gpu(reason="the port's kernels lower to Triton calls only on a GPU")
+def test_a_bf16_mamba2_layer_trains_with_no_copy_at_the_ports_edges():
+    """A bf16 Mamba-2 layer at Nemotron-H's head and state widths, packed documents and all, forward
+    and backward compiled for this GPU: the conv hands the scan `x`, `B` and `C` as its own arrays
+    (`Mamba2.conv_parts`), and no copy or transpose feeds one of the port's Triton calls or reads one
+    of its results (`sharded.boundary_copies`)."""
+    layer = Mamba2(emb_features=512, num_heads=16, head_dim=64, state_size=128, n_groups=2, chunk_size=128,
+                   dtype=jnp.bfloat16)
+    x = jax.random.normal(jax.random.key(47), (2, 512, 512), jnp.bfloat16)
+    params = layer.init(jax.random.key(53), x)
+    segments = jnp.asarray(np.repeat([[1, 2]], [300, 212], axis=1).repeat(2, axis=0), jnp.int32)
+    metadata = AttentionMetadata(coordinates=coordinates(segments=segments))
+
+    def loss(params, x):
+        out = jnp.asarray(layer.apply(params, x, attention_metadata=metadata))
+        return jnp.sum(out.astype(jnp.float32) ** 2)
+
+    lowered = jax.jit(jax.grad(loss, argnums=(0, 1))).lower(params, x)
+    assert "mamba_chunk_scan_fwd" in triton_kernels(lowered)
+    assert boundary_copies(lowered.compile().as_text() or "") == []
 
 
 @pytest.mark.mesh(devices=2)
