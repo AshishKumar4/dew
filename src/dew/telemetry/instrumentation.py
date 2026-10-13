@@ -19,6 +19,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 
 import jax
+import numpy as np
 
 from dew.nn.kernels.generation import gpu_target
 
@@ -275,21 +276,48 @@ the query sits among each one's operands (the backward's first is the
 output's gradient), and whether it is the backward."""
 
 
+_CAUSAL = re.compile(r'is_causal = true|"mask_type":"(?:PADDING_)?CAUSAL"')
+_SIDES = re.compile(r'window_size_(left|right) = (-?\d+)')
+_SLIDING = re.compile(r'"sliding_window_length":(\d+)')
+
+
+def _reached(queries: int, keys: int, attributes: str) -> int:
+    """How many (query, key) pairs a fused attention computes: each query row
+    reaches the keys its call's mask leaves it, under a causal mask the keys up
+    to its own position (aligned to the last key, as FlashAttention aligns
+    them) and within a sliding window the ones it spans, left of the query
+    and right of it. dew_flash_attn states `is_causal` and
+    `window_size_left`/`_right` (-1 unbounded); cuDNN its `mask_type` and a
+    `sliding_window_length` of the window's left side and the query's own
+    key (0 none)."""
+    causal = bool(_CAUSAL.search(attributes))
+    sides = {side: int(size) for side, size in _SIDES.findall(attributes)}
+    sliding = _SLIDING.search(attributes)
+    left = sides.get('left', int(sliding.group(1)) - 1 if sliding and int(sliding.group(1)) else -1)
+    right = 0 if causal else sides.get('right', -1)
+    diagonal = np.arange(queries) + (keys - queries)
+    low = np.maximum(diagonal - left, 0) if left >= 0 else np.zeros(queries, np.int64)
+    high = np.minimum(diagonal + right, keys - 1) if right >= 0 else np.full(queries, keys - 1)
+    return int(np.clip(high - low + 1, 0, None).sum())
+
+
 def _fused_attention_flops(instruction: _Instruction, shapes: dict[str, tuple[int, ...]], *,
                            query: int, backward: bool) -> float:
-    """A fused-attention call (cuDNN's or FlashAttention-2's), from the query
-    and key it is given, the operands at `query` and the one after it.
+    """A fused-attention call (cuDNN's or dew_flash_attn's), from the query and
+    key it is given, the operands at `query` and the one after it, and the
+    pairs of them its mask computes (`_reached`).
 
     The kernel keeps the scores off memory, so nothing in the module states
     its arithmetic; the operands do. They are `[batch, sequence, heads, width]`
     (checked against the calls XLA emits for `jax.nn.dot_product_attention`,
     including grouped-query and cross attention, where the key carries its own
     head count and sequence, and against dew_flash_attn's). Both products of
-    the forward pass, `Q K^T` and `P V`, cost one multiply-add per query, key,
-    head and width; the backward pass runs four such products, for dV, dP, dQ
-    and dK. That is the whole square: under a causal mask the kernels skip
-    about half of it, so the count keeps MFU's convention and train/hfu reads
-    up to twice their hardware's work there.
+    the forward pass, `Q K^T` and `P V`, cost one multiply-add per pair, head
+    and width; the backward pass runs four such products, for dV, dP, dQ and
+    dK. A causal mask leaves the kernels about half the square, which is what
+    they compute: on an H100, FlashAttention-3's causal call at 2 x 16 heads
+    x 4096 x 128 counted the whole square, twice its work, before this read
+    the mask.
     """
     if len(instruction.operands) < query + 2:
         return 0.0
@@ -299,7 +327,7 @@ def _fused_attention_flops(instruction: _Instruction, shapes: dict[str, tuple[in
         return 0.0
     batch, length, heads, width = queries
     products = 4 if backward else 2
-    return products * _MAC * batch * heads * length * key[1] * width
+    return products * _MAC * batch * heads * _reached(length, key[1], instruction.attributes) * width
 
 
 def custom_call_kind(target: str) -> str | None:
