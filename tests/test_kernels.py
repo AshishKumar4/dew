@@ -234,6 +234,7 @@ def test_packed_sequences_attend_within_themselves_as_far_from_float64_as_one_at
                 assert_as_exact_as_the_reference(got, theirs, want, f"{name} of the document at {begin}")
 
 
+@on_gpu
 @pytest.mark.mesh(devices=2)
 @pytest.mark.parametrize("axis, split", [("data", (0,)), ("tensor", (2,))])
 def test_flash_keeps_the_kernel_contract_on_a_mesh(axis, split, without_deterministic_ops):
