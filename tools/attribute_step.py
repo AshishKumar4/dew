@@ -9,9 +9,10 @@ inside CUDA command buffers XProf attributes every kernel to its module and hlo_
 `--steps` is how many steps the capture traced; totals are divided by it.
 
 `--hlo` is an XLA dump (`--xla_dump_to=... --xla_dump_hlo_as_text`), a directory or a .tgz of
-one. The newest `<module>` compiled is read: its optimized HLO (each op's opcode, a custom call's
-target, the ops a fusion runs), its live-range dump's peak (the values live at the peak and XLA's
-breakdown of them by op_name) and its buffer assignment (parameters, outputs, temporaries).
+one. The `<module>` compile the capture ran is read, the newest without `--trace`: its
+optimized HLO (each op's opcode, a custom call's target, the ops a fusion runs), its
+live-range dump's peak (the values live at the peak and XLA's breakdown of them by op_name)
+and its buffer assignment (parameters, outputs, temporaries).
 
 Time, from the XProf reports: device time a step by model part (GDN, attention, LoRA, MLP, head
 and loss, embedding, norm, optimizer, other) and direction (forward, backward, neither); by kind,
@@ -164,6 +165,15 @@ def heaviest(groups: dict) -> list:
     return sorted(groups.items(), key=lambda item: -sum(item[1].values()))
 
 
+def step_program(rows: list) -> str:
+    """The program the capture's device time went to most, its step: XProf's program id,
+    which is the number XLA's dump names the module by."""
+    programs = defaultdict(float)
+    for row in rows:
+        programs[str(row.get("program_id"))] += float(row["total_self_time"])
+    return max(programs, key=programs.__getitem__)
+
+
 def attribute_time(trace: Path, steps: int, model_flops: float | None,
                    ops: dict[str, HloInstruction] | None = None, device: str | None = None) -> dict:
     capture = capture_of(trace)
@@ -187,7 +197,7 @@ def attribute_time(trace: Path, steps: int, model_flops: float | None,
     programs = defaultdict(float)
     for row in rows:
         programs[str(row.get("program_id"))] += float(row["total_self_time"])
-    step = max(programs, key=programs.__getitem__)
+    step = step_program(rows)
     by_part: dict = defaultdict(lambda: defaultdict(float))
     by_kind: dict = defaultdict(float)
     by_part_kind: dict = defaultdict(lambda: defaultdict(float))
@@ -203,6 +213,10 @@ def attribute_time(trace: Path, steps: int, model_flops: float | None,
             # A multi-output fusion carries no name of its own; its ops say what it computes.
             part = by_majority([part_of(each) for each in known.traced], "other")
             direction = by_majority([direction_of(each) for each in known.traced], "neither")
+        if known is not None and any(re.search(dict(PARTS)["optimizer"], each) for each in known.reads):
+            # An update is named by its root, the parameter it writes narrowed for the next step's
+            # compute (training/narrow.py); the optimizer state it reads says what it is.
+            part = "optimizer"
         by_part[part][direction] += us
         by_kind[kind] += us
         by_part_kind[part][kind] += us
@@ -287,11 +301,13 @@ def gemm_precision(row: dict, known: HloInstruction | None) -> str:
 
 
 @contextlib.contextmanager
-def dump_files(hlo: Path, module: str) -> Iterator[dict]:
-    """The newest `module`'s after-optimizations HLO, live-range, buffer-assignment and
-    memory-usage-report files, by suffix (the HLO's is `.txt`), as paths read a line at a
-    time (`lines`): from a .tgz only those four are extracted, to a directory that lasts
-    the context. A dump holds every compile of the step, each tens of megabytes."""
+def dump_files(hlo: Path, module: str, program: str | None = None) -> Iterator[dict]:
+    """The after-optimizations HLO, live-range, buffer-assignment and memory-usage-report
+    files of `module`'s compile numbered `program`, the one a capture ran (`step_program`),
+    or of its newest without a capture, by suffix (the HLO's is `.txt`), as paths read a
+    line at a time (`lines`): from a .tgz only those four are extracted, to a directory that
+    lasts the context. A dump holds every compile of the step, each tens of megabytes: a
+    plan compiles several candidates, and the newest need not be the one that ran."""
     suffixes = (".txt", "-live-range.txt", "-buffer-assignment.txt", "-memory-usage-report.txt")
     pattern = re.compile(rf"module_(\d+)\.{re.escape(module)}\..*after_optimizations((?:-[a-z-]+)?\.txt)$")
 
@@ -309,11 +325,15 @@ def dump_files(hlo: Path, module: str) -> Iterator[dict]:
                      if (key := wanted(str(path)))]
         if not found:
             raise SystemExit(f"no {module} after-optimizations dumps under {hlo}")
-        newest = max(number for (number, _), _ in found)
+        numbers = sorted({number for (number, _), _ in found})
+        if program is not None and int(program) not in numbers:
+            raise SystemExit(f"the capture ran program {program}, and {hlo} holds {module} "
+                             f"compiles {numbers} only")
+        chosen = numbers[-1] if program is None else int(program)
         directory = Path(stack.enter_context(tempfile.TemporaryDirectory()))
-        files: dict = {"module_number": str(newest)}
+        files: dict = {"module_number": str(chosen)}
         for (number, suffix), source in found:
-            if number != newest:
+            if number != chosen:
                 continue
             if isinstance(source, Path):
                 files[suffix] = source
@@ -434,7 +454,9 @@ def main(argv: list[str] | None = None) -> int:
         entry = json.loads(args.entry.read_text())
         flops, device = entry.get("model_flops_per_step"), device or entry.get("device")
     result = {}
-    with dump_files(args.hlo, args.module) if args.hlo else contextlib.nullcontext({}) as files:
+    rows = report_table(capture_of(args.trace) / "reports" / "hlo_stats.json")[1] if args.trace else []
+    program = step_program(rows) if rows else None
+    with dump_files(args.hlo, args.module, program) if args.hlo else contextlib.nullcontext({}) as files:
         if args.trace:
             ops = hlo_instructions(lines(files[".txt"])) if ".txt" in files else None
             result["time"] = attribute_time(args.trace, args.steps, flops, ops, device)
