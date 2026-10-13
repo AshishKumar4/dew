@@ -77,7 +77,7 @@ def _space(kernel: str, wide: bool) -> frozenset[Tiles]:
 
 
 _A100 = {
-    "intra_diagonal": Tiles(0, 0, 4, 1, bh=4),
+    "intra_diagonal": Tiles(0, 0, 4, 1, 4),
     # Measured on an A100-40GB at Kimi Linear's 1 x 4096 x 32 x 128 bf16: the solve 0.98 -> 0.80 ms,
     # the backward intra kernel 2.49 -> 1.98 ms, the output 0.25 -> 0.23 ms.
     "intra_solve": Tiles(32, 0, 1, 1),
@@ -724,16 +724,20 @@ def _bwd_intra_kernel(chunk_ref, q_ref, k_ref, g_ref, beta_ref, daqk_ref, dakk_r
     def _():
         index = jnp.arange(SUB)
         width = k_ref.shape[-1]
-        own_tokens = jnp.minimum(SUB, taken - first)
+        own_tokens = SUB if aligned else jnp.minimum(SUB, taken - first)
+
+        def left(at):
+            """The chunk's rows from `at`: a whole sub-chunk's where every chunk is whole."""
+            return SUB if aligned else taken - at
 
         def tile(ref, at):
-            return _read(_rows(ref, start + at, SUB), taken - at)
+            return _read(_rows(ref, start + at, SUB), left(at))
 
         def gates(at):
-            return _gates(g_ref, start, taken, SUB, at)
+            return _gates(g_ref, start + at, left(at), SUB)
 
         def scores(ref, row, column):
-            return _read(_rows(ref, start + row, SUB, pl.ds(column, SUB)), taken - row)
+            return _read(_rows(ref, start + row, SUB, pl.ds(column, SUB)), left(row))
 
         def row(ref, at):
             return ref[start + at].astype(jnp.float32)
@@ -758,16 +762,16 @@ def _bwd_intra_kernel(chunk_ref, q_ref, k_ref, g_ref, beta_ref, daqk_ref, dakk_r
             causal = (index >= j)[:, None]
             own = row(k_ref, token)[None, :] * decay
             column = pl.ds(token, 1)
-            qk = _read(_rows(daqk_ref, start + first, SUB, column), taken - first)
-            kk = _read(_rows(dakk_ref, start + first, SUB, column), taken - first)
+            qk = _read(_rows(daqk_ref, start + first, SUB, column), left(first))
+            kk = _read(_rows(dakk_ref, start + first, SUB, column), left(first))
             return (sums[0] + jnp.where(causal, qk * own, 0.0), sums[1] + jnp.where(causal, kk * own, 0.0))
 
         dq2, dk2 = jax.lax.fori_loop(0, own_tokens, diagonal, (dq2, dk2))
         beta_grad = jnp.sum(dk2 * key, axis=1)
         dk2 = dk2 * beta[:, None]
         dg2 = tile(q_ref, first).astype(jnp.float32) * dq2
-        _write(_rows(dq2_ref, start + first, SUB), taken - first, dq2 + tile(dq_ref, first))
-        closing = row(g_ref, jnp.minimum(first + SUB, taken) - 1)[None, :]
+        _write(_rows(dq2_ref, start + first, SUB), left(first), dq2 + tile(dq_ref, first))
+        closing = row(g_ref, first + own_tokens - 1)[None, :]
 
         def after(j, dkt):
             behind = jnp.exp2(gates(j * SUB) - closing)
@@ -792,9 +796,9 @@ def _bwd_intra_kernel(chunk_ref, q_ref, k_ref, g_ref, beta_ref, daqk_ref, dakk_r
 
         dkt = jax.lax.fori_loop(0, own_tokens, own, dkt)
         dg2 = dg2 + (dk2 - dkt) * key + tile(dg_ref, first)
-        _write(_rows(dk2_ref, start + first, SUB), taken - first, dk2 + tile(dk_ref, first) + dkt)
-        _write(_rows(dg2_ref, start + first, SUB), taken - first, dg2)
-        _write(_rows(db2_ref, start + first, SUB), taken - first, beta_grad)
+        _write(_rows(dk2_ref, start + first, SUB), left(first), dk2 + tile(dk_ref, first) + dkt)
+        _write(_rows(dg2_ref, start + first, SUB), left(first), dg2)
+        _write(_rows(db2_ref, start + first, SUB), left(first), beta_grad)
 
 
 @dataclasses.dataclass(frozen=True)
