@@ -1997,6 +1997,7 @@
 "tests/test_jepa.py::test_probe_metrics_score_representations_and_average_over_the_pass": 2.188,
 "tests/test_jepa.py::test_representation_health_is_the_float64_statistics": 0.641,
 "tests/test_jepa.py::test_target_encoder_tracks_the_context_encoder": 4.163,
+"tests/test_jepa.py::test_the_loss_is_the_mean_squared_error_to_normalized_targets_of_the_same_blocks": 0.491,
 "tests/test_jepa.py::test_the_predictor_predicts_each_target_by_its_position[image]": 6.691,
 "tests/test_jepa.py::test_the_predictor_predicts_each_target_by_its_position[video]": 5.758,
 "tests/test_jepa.py::test_the_token_index_selects_tokens_with_their_positions": 3.873,
