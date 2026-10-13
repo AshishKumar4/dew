@@ -1096,6 +1096,42 @@ cuDNN refuses heads over 128, the wheel's sm120 build ran forward and backward i
 against XLA's 9.84 and 19.34 on a G4, its float64 distances those of FlashAttention-2 in torch, so
 sm120's row names 'flash'.
 
+### Sliding windows and attention sinks on FlashAttention, 2026-10-12
+
+A call with a window or attention sinks did not reach FlashAttention: sinks ran XLA's composed
+attention, dense for a full layer, and a window ran cuDNN's where it took the call or XLA's band
+of blocks. dew_flash_attn 0.3.0 passes FlashAttention's window to both kernels, builds
+FlashAttention-3 with sliding windows and 192-wide heads (a narrower value is padded to the
+query's width, `widen_value_heads`: the FA3 port sets the value's strides from the query's
+width, so its 192-by-128 kernels ran out of bounds and returned NaN on an H100), and composes
+sinks over the kernel's log-sum-exp. A sink adds `e^s` to each row's denominator, so the output
+is the kernel's times the share the keys keep, `sigmoid(lse - s)`; the kernel's own backward
+takes the gradient times that share, and the sink's logit takes minus the rest of the share
+times each row's gradient along the output.
+
+Forward and backward in ms, bf16, Dew's path for the call against flash, the A100 and the H100
+SXM at batch 2 (Mistral 1), the RTX 4080 at batch 1, jax 0.11.2, median of 20:
+
+| call | Dew's path | A100 | A100 flash | H100 | H100 flash | RTX 4080 | 4080 flash |
+|---|---|---:|---:|---:|---:|---:|---:|
+| gpt-oss-20b full layer: 4096 tokens, 64 query heads over 8 of 64, causal, sinks | xla | 80.98 | 8.38 | 51.99 | 2.24 | out of memory | 7.33 |
+| gpt-oss-20b sliding layer: the same with a 128-key window | xla | 11.06 | 2.45 | 4.27 | 0.90 | 8.01 | 2.16 |
+| MiMo-V2-Flash sliding layer: 128 query heads over 8 of 192, values 128, 128 keys, sinks | xla | 19.03 | 10.54 | 8.13 | 4.10 | 18.35 | 11.61 |
+| Mistral-7B v0.1: 8192 tokens, 32 over 8 of 128, 4096 keys | cudnn | 13.56 | 10.22 | 3.08 | 2.59 | 21.29 | 18.44 |
+| Gemma 3: 4096 tokens, 8 over 4 of 256, 1024 keys | xla | 9.17 | 2.63 | 4.16 | 0.84 | | |
+| ModernBERT local layer: 8192 tokens, 12 heads of 64, 64 keys either side | xla | 46.96 | 1.12 | 26.61 | 0.40 | 47.23 | 0.59 |
+
+The 4080's backward takes no head over 192, so Gemma 3 stays off flash there. Flash's output and
+its query, key, value and sink gradients lie within tests/reference_error.py's rule of the xla
+kernel's from float64, batched and packed (tests/test_kernels.py), on all three GPUs. So the
+target rows of sm80, sm89 and sm90 name flash for `attention_window` and `attention_sinks`; sm120
+keeps its windows on cuDNN and its sinks on XLA until a G4 measures them. A packed or key-masked
+windowed call keeps its band on cuDNN, which takes the band's mask as a bias. Each row reproduces
+with `tools/benchmark_attention.py`, for example the MiMo row with `PYTHONPATH=src python
+tools/benchmark_attention.py --implementations xla flash --sequence-lengths 4096 --head-dims 192
+--value-dim 128 --batch-size 2 --heads 128 --kv-groups 16 --causal True --sliding-window 128
+--sinks`.
+
 ### Splash's tiles on the TPU, 2026-10-02
 
 Splash attention took 34 ms of Dew's 156 ms Qwen3-0.6B step at 8 x 1024
