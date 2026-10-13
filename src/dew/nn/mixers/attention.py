@@ -112,6 +112,8 @@ class _Masking(NamedTuple):
     window: int | None
     mask: jax.Array | None
     documents: jax.Array | None
+    max_segments: int | None
+    """The most documents a row of `documents` holds (`Coordinates.max_segments`)."""
     implementation: str
     cursor: jax.Array | None
 
@@ -593,6 +595,8 @@ class CausalSelfAttention(nn.Module):
                 query, key, value, window=self.sliding_window, chunk=self.attention_chunk,
                 positions=None if logical_positions is None else positions,
                 segment_ids=segment_ids,
+                max_segments=(None if attention_metadata is None or attention_metadata.coordinates is None
+                              else attention_metadata.coordinates.max_segments),
                 valid=None if attention_metadata is None else attention_metadata.valid,
                 dtype=self.dtype, precision=self.precision,
                 force_fp32_for_softmax=self.force_fp32_for_softmax,
@@ -800,14 +804,17 @@ class CausalSelfAttention(nn.Module):
             mask = chunked if base is None else base & chunked
             causal, window = False, None
             implementation = masked
-        return _Masking(query, key, value, causal, window, mask, documents, implementation, cursor)
+        coordinates = None if attention_metadata is None else attention_metadata.coordinates
+        max_segments = None if documents is None or coordinates is None else coordinates.max_segments
+        return _Masking(query, key, value, causal, window, mask, documents, max_segments, implementation,
+                        cursor)
 
     def _attended(self, masking: _Masking, positions, append, sinks, train: bool, *, bias=None):
         """The attention output through the kernel the masking chose: the
         paged kernel or a per-row key count for a plain decode step, the
         general kernel otherwise, with the per-head logit maxima sown for
         QK-Clip when a caller opened that collection."""
-        query, key, value, causal, window, mask, documents, implementation, cursor = masking
+        query, key, value, causal, window, mask, documents, max_segments, implementation, cursor = masking
         B, S = query.shape[:2]
         # The per-head maxima the QK-Clip reads. Computed only when a caller
         # opened the collection; the plain forward leaves it closed and its
@@ -841,7 +848,8 @@ class CausalSelfAttention(nn.Module):
                 force_fp32_for_softmax=self.force_fp32_for_softmax,
                 implementation=implementation, causal=causal,
                 sliding_window=window, mask=mask, bias=bias, sinks=sinks,
-                softcap=self.attn_logit_softcap, segment_ids=documents), 'context')
+                softcap=self.attn_logit_softcap, segment_ids=documents, max_segments=max_segments),
+                'context')
         return attention
 
     def mixed_refusal(self) -> str | None:
