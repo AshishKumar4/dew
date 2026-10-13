@@ -14,9 +14,10 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from sharded import assert_runs_per_shard, boundary_copies
+from tuned import each_config
 
 from dew.nn import kernels, linear
-from dew.nn.kernels import fla_gdn
+from dew.nn.kernels import fla_gdn, tuning
 from dew.nn.linear import GatedDeltaNet, fla_rule, l2norm
 
 pytestmark = pytest.mark.kernel
@@ -27,6 +28,19 @@ INTERPRETED = jax.default_backend() != "gpu"
 def relative(got, want) -> float:
     want = np.asarray(want, np.float64)
     return float(np.max(np.abs(np.asarray(got, np.float64) - want)) / max(np.max(np.abs(want)), 1e-6))
+
+
+def tiled(kernel, call, *operands) -> list:
+    """`call(*operands)` at each of `kernel`'s tiles the tuner may pick on this GPU (tests/tuned.py's
+    `each_config`), or at its unmeasured tiles where the kernels interpret: a kernel's gate holds at
+    every config of its space."""
+    if INTERPRETED:
+        return [call(*operands)]
+    found = []
+    for tiles in each_config(kernel, call, *operands):
+        with tuning.pinned({kernel: tiles}):
+            found.append(call(*operands))
+    return found
 
 
 def output_operands(batch, length, key_heads, value_heads, width, columns, dtype, chunk=64, seed=0):
@@ -66,12 +80,14 @@ def test_the_cumsum_kernel_is_flas_chunk_local_cumsum(reverse, columns):
     vector kernel), the inclusive sum (from the end for the gradient), fp32, then the base-2 scale: as
     numpy computes it."""
     g = -jnp.exp(jax.random.normal(jax.random.key(3), (2, 192, 3, *columns)) - 3.0)
-    got = fla_gdn.chunk_local_cumsum(g, scale=fla_gdn.RCP_LN2, reverse=reverse, interpret=INTERPRETED)
     chunks = np.asarray(g, np.float64).reshape(2, 3, 64, 3, *columns)
     summed = np.cumsum(chunks[:, :, ::-1], axis=2)[:, :, ::-1] if reverse else np.cumsum(chunks, axis=2)
     want = (summed * fla_gdn.RCP_LN2).reshape(g.shape)
-    assert got.dtype == jnp.float32
-    assert relative(got, want) < 1e-6
+    kernel = functools.partial(fla_gdn.chunk_local_cumsum, scale=fla_gdn.RCP_LN2, reverse=reverse,
+                               interpret=INTERPRETED)
+    for got in tiled(fla_gdn.ChunkLocalCumsum, kernel, g):
+        assert got.dtype == jnp.float32
+        assert relative(got, want) < 1e-6
 
 
 @pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float32])
@@ -88,11 +104,12 @@ def test_the_w_u_kernel_is_flas_recompute(dtype, shape):
     a = jnp.moveaxis(lower, 3, 2).reshape(batch, length, value_heads, 64).astype(dtype)
     step = -jnp.exp(jax.random.normal(keys[4], (batch, length, value_heads)) - 3.0) * fla_gdn.RCP_LN2
     g = jnp.cumsum(step.reshape(batch, length // 64, 64, value_heads), axis=2).reshape(step.shape)
-    got = fla_gdn.recompute_w_u(k, v, beta, a, g, interpret=INTERPRETED)
     want = support.reference_w_u(k, v, beta, a, g)
-    for name, mine, theirs in zip(("w", "u"), got, want, strict=True):
-        assert mine.shape == theirs.shape and mine.dtype == theirs.dtype, name
-        assert relative(mine, theirs) < (2e-2 if dtype == jnp.bfloat16 else 1e-5), name
+    kernel = functools.partial(fla_gdn.recompute_w_u, interpret=INTERPRETED)
+    for got in tiled(fla_gdn.RecomputeWU, kernel, k, v, beta, a, g):
+        for name, mine, theirs in zip(("w", "u"), got, want, strict=True):
+            assert mine.shape == theirs.shape and mine.dtype == theirs.dtype, name
+            assert relative(mine, theirs) < (2e-2 if dtype == jnp.bfloat16 else 1e-5), name
 
 
 @pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float32])
@@ -107,10 +124,11 @@ def test_the_kkt_solve_kernel_inverts_flas_matrix(dtype, shape):
     beta = jax.nn.sigmoid(jax.random.normal(keys[1], (batch, length, value_heads))).astype(dtype)
     step = -jnp.exp(jax.random.normal(keys[2], (batch, length, value_heads)) - 3.0) * fla_gdn.RCP_LN2
     g = jnp.cumsum(step.reshape(batch, length // 64, 64, value_heads), axis=2).reshape(step.shape)
-    got = fla_gdn.kkt_solve(k, g, beta, interpret=INTERPRETED)
     want = support.reference_kkt_solve(k, g, beta)
-    assert got.shape == want.shape and got.dtype == want.dtype
-    assert relative(got, want) < (2e-2 if dtype == jnp.bfloat16 else 2e-3)
+    kernel = functools.partial(fla_gdn.kkt_solve, interpret=INTERPRETED)
+    for got in tiled(fla_gdn.KktSolve, kernel, k, g, beta):
+        assert got.shape == want.shape and got.dtype == want.dtype
+        assert relative(got, want) < (2e-2 if dtype == jnp.bfloat16 else 2e-3)
 
 
 def cumulated_decay(key, batch, length, value_heads, width=None):
@@ -134,11 +152,12 @@ def test_the_h_kernel_is_flas_recurrence(dtype, shape, per_key):
     u = jax.random.normal(keys[2], (batch, length, value_heads, columns)).astype(dtype)
     g = cumulated_decay(keys[3], batch, length, value_heads, width if per_key else None)
     h0 = 0.1 * jax.random.normal(keys[4], (batch, value_heads, width, columns))
-    got = fla_gdn.chunk_fwd_h(k, w, u, g, h0, interpret=INTERPRETED)
     want = support.reference_h(k, w, u, g, h0)
-    for name, mine, theirs in zip(("h", "v_new", "final"), got, want, strict=True):
-        assert mine.shape == theirs.shape and mine.dtype == theirs.dtype, name
-        assert relative(mine, theirs) < (2e-2 if dtype == jnp.bfloat16 else 1e-5), name
+    kernel = functools.partial(fla_gdn.chunk_fwd_h, interpret=INTERPRETED)
+    for got in tiled(fla_gdn.ChunkFwdH, kernel, k, w, u, g, h0):
+        for name, mine, theirs in zip(("h", "v_new", "final"), got, want, strict=True):
+            assert mine.shape == theirs.shape and mine.dtype == theirs.dtype, name
+            assert relative(mine, theirs) < (2e-2 if dtype == jnp.bfloat16 else 1e-5), name
 
 
 @pytest.mark.parametrize("per_key", [False, True])
@@ -158,11 +177,12 @@ def test_the_dhu_kernel_is_flas_reverse_recurrence(dtype, shape, per_key):
     do = jax.random.normal(keys[5], (batch, length, value_heads, columns)).astype(dtype)
     dv = jax.random.normal(keys[6], (batch, length, value_heads, columns)).astype(dtype)
     scale = width ** -0.5
-    got = fla_gdn.chunk_bwd_dhu(q, k, w, g, dht, do, dv, scale=scale, interpret=INTERPRETED)
     want = support.reference_dhu(q, k, w, g, dht, do, dv, scale=scale)
-    for name, mine, theirs in zip(("dh", "dh0", "dv2"), got, want, strict=True):
-        assert mine.shape == theirs.shape and mine.dtype == theirs.dtype, name
-        assert relative(mine, theirs) < (2e-2 if dtype == jnp.bfloat16 else 1e-5), name
+    kernel = functools.partial(fla_gdn.chunk_bwd_dhu, scale=scale, interpret=INTERPRETED)
+    for got in tiled(fla_gdn.ChunkBwdDhu, kernel, q, k, w, g, dht, do, dv):
+        for name, mine, theirs in zip(("dh", "dh0", "dv2"), got, want, strict=True):
+            assert mine.shape == theirs.shape and mine.dtype == theirs.dtype, name
+            assert relative(mine, theirs) < (2e-2 if dtype == jnp.bfloat16 else 1e-5), name
 
 
 @pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float32])
@@ -177,10 +197,11 @@ def test_the_dv_local_kernel_is_flas(dtype, shape):
     g = jnp.cumsum(step.reshape(batch, length // 64, 64, value_heads), axis=2).reshape(step.shape)
     do = jax.random.normal(keys[3], (batch, length, value_heads, columns)).astype(dtype)
     scale = width ** -0.5
-    got = fla_gdn.chunk_bwd_dv_local(q, k, g, do, scale=scale, interpret=INTERPRETED)
     want = support.reference_dv_local(q, k, g, do, scale=scale)
-    assert got.shape == want.shape and got.dtype == want.dtype
-    assert relative(got, want) < (2e-2 if dtype == jnp.bfloat16 else 1e-5)
+    kernel = functools.partial(fla_gdn.chunk_bwd_dv_local, scale=scale, interpret=INTERPRETED)
+    for got in tiled(fla_gdn.ChunkBwdDvLocal, kernel, q, k, g, do):
+        assert got.shape == want.shape and got.dtype == want.dtype
+        assert relative(got, want) < (2e-2 if dtype == jnp.bfloat16 else 1e-5)
 
 
 @pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float32])
@@ -202,11 +223,12 @@ def test_the_dqkwg_kernel_is_flas(dtype, shape):
     dv = jax.random.normal(keys[7], (batch, length, value_heads, columns)).astype(dtype)
     do = jax.random.normal(keys[0], (batch, length, value_heads, columns)).astype(dtype)
     scale = width ** -0.5
-    got = fla_gdn.chunk_bwd_dqkwg(q, k, v, w, g, h, dv, do, dh, scale=scale, interpret=INTERPRETED)
     want = support.reference_dqkwg(q, k, v, w, g, h, dv, do, dh, scale=scale)
-    for name, mine, theirs in zip(("dq", "dk", "dw", "dg"), got, want, strict=True):
-        assert mine.shape == theirs.shape and mine.dtype == theirs.dtype, name
-        assert relative(mine, theirs) < (3e-2 if dtype == jnp.bfloat16 else 1e-5), name
+    kernel = functools.partial(fla_gdn.chunk_bwd_dqkwg, scale=scale, interpret=INTERPRETED)
+    for got in tiled(fla_gdn.ChunkBwdDqkwg, kernel, q, k, v, w, g, h, dv, do, dh):
+        for name, mine, theirs in zip(("dq", "dk", "dw", "dg"), got, want, strict=True):
+            assert mine.shape == theirs.shape and mine.dtype == theirs.dtype, name
+            assert relative(mine, theirs) < (3e-2 if dtype == jnp.bfloat16 else 1e-5), name
 
 
 def wide(*arrays):
@@ -260,21 +282,23 @@ def wy_math(k, v, beta, g, chunk=64):
     return inverse @ (kc * (bc * jnp.exp2(gc))[..., None]), inverse @ (vc * bc[..., None]), inverse
 
 
-def test_the_wy_backward_kernel_is_the_gradient_of_flas_wy_representation():
+@pytest.mark.parametrize("dtype, bound", [(jnp.float32, 1e-4), (jnp.bfloat16, 2e-2)])
+def test_the_wy_backward_kernel_is_the_gradient_of_flas_wy_representation(dtype, bound):
     """fla's prepare_wy_repr_bwd gives the gradients of `w` and `u`'s cotangents with respect to the
     keys, values, beta and the cumulated decay through the inverse: as float64 autodiff of the same
-    representation, fp32 operands. The kernels read the decay in base 2 and give its gradient in the
-    natural-log units the caller's gate is in, so the reference's gradient with respect to the
-    base-2 decay is scaled by 1 / ln 2 (fla's RCP_LN2) to compare."""
+    representation, within fp32 rounding of fp32 operands and bf16 storage's of bf16. The kernels
+    read the decay in base 2 and give its gradient in the natural-log units the caller's gate is in,
+    so the reference's gradient with respect to the base-2 decay is scaled by 1 / ln 2 (fla's
+    RCP_LN2) to compare."""
     batch, length, heads, width, columns = 1, 128, 2, 64, 64
     keys = jax.random.split(jax.random.key(12), 6)
-    k = l2norm(jax.random.normal(keys[0], (batch, length, heads, width)))
-    v = jax.random.normal(keys[1], (batch, length, heads, columns))
-    beta = jax.nn.sigmoid(jax.random.normal(keys[2], (batch, length, heads)))
+    k = l2norm(jax.random.normal(keys[0], (batch, length, heads, width))).astype(dtype)
+    v = jax.random.normal(keys[1], (batch, length, heads, columns)).astype(dtype)
+    beta = jax.nn.sigmoid(jax.random.normal(keys[2], (batch, length, heads))).astype(dtype)
     step = -jnp.exp(jax.random.normal(keys[3], (batch, length, heads)) - 3.0) * fla_gdn.RCP_LN2
     g = jnp.cumsum(step.reshape(batch, length // 64, 64, heads), axis=2).reshape(step.shape)
-    dw = jax.random.normal(keys[4], (batch, length, heads, width))
-    du = jax.random.normal(keys[5], (batch, length, heads, columns))
+    dw = jax.random.normal(keys[4], (batch, length, heads, width)).astype(dtype)
+    du = jax.random.normal(keys[5], (batch, length, heads, columns)).astype(dtype)
     def chunks(x):
         return jnp.moveaxis(x.reshape(batch, length // 64, 64, heads, *x.shape[3:]), 3, 2)
 
@@ -289,11 +313,12 @@ def test_the_wy_backward_kernel_is_the_gradient_of_flas_wy_representation():
 
         want = [np.asarray(x) for x in jax.grad(scored, argnums=(0, 1, 2, 3))(*operands)]
     want[3] = want[3] * fla_gdn.RCP_LN2
-    a = jnp.asarray(np.moveaxis(inverse, 2, 3).reshape(batch, length, heads, 64), jnp.float32)
-    got = fla_gdn.prepare_wy_repr_bwd(k, v, beta, g, a, dw, du, interpret=INTERPRETED)
-    for name, mine, theirs in zip(("dk", "dv", "db", "dg"), got, want, strict=True):
-        assert mine.shape == theirs.shape, name
-        assert relative(mine, theirs) < 1e-4, name
+    a = jnp.asarray(np.moveaxis(inverse, 2, 3).reshape(batch, length, heads, 64), dtype)
+    kernel = functools.partial(fla_gdn.prepare_wy_repr_bwd, interpret=INTERPRETED)
+    for got in tiled(fla_gdn.PrepareWyReprBwd, kernel, k, v, beta, g, a, dw, du):
+        for name, mine, theirs in zip(("dk", "dv", "db", "dg"), got, want, strict=True):
+            assert mine.shape == theirs.shape, name
+            assert relative(mine, theirs) < bound, name
 
 
 @pytest.mark.parametrize("value_heads", [2, 4])
@@ -650,12 +675,6 @@ def test_a_remat_policy_saves_the_ports_named_residuals_and_changes_no_gradient(
                                     strict=True):
         np.testing.assert_array_equal(np.asarray(mine), np.asarray(theirs),
                                       err_msg=jax.tree_util.keystr(path))
-
-
-def test_a_gpu_the_targets_do_not_list_runs_the_99_kb_tables():
-    assert fla_gdn._config_key(jnp.bfloat16, target="sm100") == ("sm89", "bfloat16")
-    assert fla_gdn._config_key(jnp.float16, target="sm120") == ("sm120", "bfloat16")
-    assert fla_gdn._config_key(jnp.float32, target="cpu") == ("sm80", "float32")
 
 
 @pytest.mark.parametrize("chunk_size", [32, 64])

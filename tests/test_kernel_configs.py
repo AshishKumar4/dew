@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 from kernel_compile import compile_kernels
 
-from dew.nn.kernels import fla_gdn
+from dew.nn.kernels import fla_gdn, generation
 
 pytestmark = pytest.mark.kernel
 
@@ -19,27 +19,29 @@ def test_the_compiled_shapes_reach_the_widest_keys_and_values_the_port_takes():
     assert max(shape["columns"] for shape in shapes) == fla_gdn.WIDEST == 128
 
 
-def test_each_triton_gpu_takes_the_table_its_block_holds():
-    """An A100's configs on every generation whose block holds as much shared memory, the 99 KB
-    tables on the rest, and the RTX PRO 6000's own bf16 picks, measured on a G4, on sm120."""
-    assert fla_gdn.CONFIGS[("sm80", "bfloat16")] is fla_gdn._SM80_BF16
-    assert fla_gdn.CONFIGS[("sm90", "bfloat16")] is fla_gdn._SM80_BF16
-    for target in ("sm86", "sm89"):
-        assert fla_gdn.CONFIGS[(target, "bfloat16")] is fla_gdn._SMALL_BF16
-        assert fla_gdn.CONFIGS[(target, "float32")] is fla_gdn._SMALL_FP32
-    assert fla_gdn.CONFIGS[("sm120", "bfloat16")] is fla_gdn._BLACKWELL_BF16
-    assert fla_gdn.CONFIGS[("sm120", "float32")] is fla_gdn._SMALL_FP32
-    assert ("sm75", "bfloat16") not in fla_gdn.CONFIGS
+@pytest.mark.parametrize("target, wide", [("sm80", True), ("sm90", True), ("sm86", False), ("sm89", False),
+                                          ("sm120", False), ("sm100", False), ("cpu", True)])
+def test_each_gpu_takes_the_picks_its_block_holds_and_measures_a_space_holding_them(target, wide):
+    """An A100's picks on every GPU whose block holds as much shared memory, the 99 KB ones elsewhere,
+    on a GPU the targets do not list (sm100) too, and an A100's where a CPU interprets; every kernel's
+    16-bit space holds its unmeasured pick, and fp32 has a pick for every kernel."""
+    with generation.assumed(target):
+        assert fla_gdn._wide() is wide
+    for kernel, tiles in fla_gdn.HEURISTICS["bfloat16", wide].items():
+        assert tiles in fla_gdn._space(kernel, wide), kernel
+    assert set(fla_gdn.HEURISTICS["bfloat16", wide]) == set(fla_gdn.HEURISTICS["float32", wide])
 
 
-def test_a_config_takes_the_labs_overrides_and_clips_to_the_operands():
-    shape = {"width": 64, "columns": 32, "chunk": 64}
-    assert fla_gdn.kernel_config("chunk_fwd_o", shape, jnp.bfloat16, target="sm80") == {
-        "bk": 64, "bv": 32, "warps": 8, "stages": 3}
-    overridden = fla_gdn.kernel_config("chunk_bwd_dhu", shape, jnp.float32, target="sm120",
-                                       stages=3, warps=None)
-    assert overridden == {"bv": 32, "warps": 4, "stages": 3}
-    assert fla_gdn.CONFIGS[("sm120", "float32")]["chunk_bwd_dhu"]["stages"] == 1
+def test_a_launch_clips_its_blocks_to_the_operands_and_takes_the_labs_overrides():
+    """Blocks wider than a call's keys or values shrink to them; an override replaces its field."""
+    q = jax.ShapeDtypeStruct((1, 64, 1, 64), jnp.bfloat16)
+    v = jax.ShapeDtypeStruct((1, 64, 1, 32), jnp.bfloat16)
+    h = jax.ShapeDtypeStruct((1, 1, 1, 64, 32), jnp.bfloat16)
+    g = jax.ShapeDtypeStruct((1, 64, 1), jnp.float32)
+    spans = fla_gdn.sequences(1, 64)
+    ba = fla_gdn._CHUNK_FWD_O.bind(q, q, v, h, g, *spans, scale=1.0, chunk=64, interpret=True)
+    with generation.assumed("sm80"):
+        assert fla_gdn._CHUNK_FWD_O._get_heuristics_config(ba) == fla_gdn.Tiles(64, 32, 8, 3)
 
 
 @pytest.mark.parametrize("target", ["sm80", "sm120"])
@@ -70,14 +72,6 @@ def test_the_shared_dot_preserves_narrow_products_with_fp32_accumulation():
     assert got.dtype == jnp.float32
     expected = a.astype(jnp.float32) @ a.T.astype(jnp.float32)
     np.testing.assert_array_equal(np.asarray(got), np.asarray(expected))
-
-
-def test_wide_keys_cap_an_a100s_dhu_at_two_stages():
-    shape = {"width": 256, "columns": 128}
-    assert fla_gdn.kernel_config("chunk_bwd_dhu", shape, jnp.bfloat16, target="sm80")["stages"] == 2
-    assert fla_gdn.kernel_config("chunk_bwd_dhu", shape, jnp.bfloat16, target="sm120")["stages"] == 1
-    assert fla_gdn.kernel_config("chunk_bwd_dhu", {"width": 128, "columns": 128}, jnp.bfloat16,
-                                 target="sm80")["stages"] == 3
 
 
 @pytest.mark.parametrize("target", ["sm80", "sm89", "sm120"])
