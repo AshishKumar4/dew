@@ -2315,7 +2315,7 @@ class Trainer(Generic[Loss, Effects]):
                 error.add_note(f'Reporting fit outcome failed: {failure!r}')
         return error
 
-    def _report(self, value: Record, step: int, after: Callable[[], object] | None = None) -> None:
+    def _report(self, value: Record, step: int, after: Callable[[], None] | None = None) -> None:
         """Hand one record to the tracker on rank zero, then agree with the pool.
 
         The record's type names the phase, so a rank that failed to report is
