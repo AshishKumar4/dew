@@ -21,8 +21,8 @@ This module imports neither torch nor torchax until a load asks for them.
 
 from __future__ import annotations
 
+import contextlib
 import fnmatch
-import functools
 import importlib.metadata
 import json
 import math
@@ -163,12 +163,12 @@ class TorchGraph:
                 "self.training); set those rates to 0 in its config, or train a family Dew loads natively")
         return self._forward(params, buffers, tokens)
 
-    def _forward(self, params, buffers, tokens) -> tuple[jax.Array, jax.Array]:
+    def _forward(self, params, buffers, tokens, watch=None) -> tuple[jax.Array, jax.Array]:
         import torchax
 
         env = torchax.default_env()
         arguments = env.j2t_iso((dict(params), dict(buffers), tokens))
-        with env:
+        with env, watch or contextlib.nullcontext():
             outputs = self.module.functional_call(_forward, *arguments)
         logits, hidden = env.t2j_iso(outputs)
         return logits, hidden
@@ -177,11 +177,11 @@ class TorchGraph:
         """Whether the module's training forward does anything its eval forward does not.
 
         Both are traced with torchax's random key as an input, so a draw on
-        the device is part of the program, and torch's random functions are
-        counted, since a draw on the host is decided at trace time (OPT's
-        layer drop, `torch.rand([])`) and leaves the program alone. Another
-        program or another count is another forward."""
-        import torch
+        the device is part of the program, under a mode above torchax's that
+        counts torch's random calls, since a draw on the host is decided at
+        trace time (OPT's layer drop, `torch.rand([])`) and leaves the
+        program alone. Another program, other constants or another count is
+        another forward; a training forward that cannot be traced is refused."""
         import torchax
 
         env = torchax.default_env()
@@ -191,25 +191,28 @@ class TorchGraph:
         if signature not in self._differs:
             traces = []
             for training in (True, False):
+                draws = _Draws()
 
                 # One function a trace: JAX caches a trace by its function, and the mode is not an input.
-                def forward(key, *arguments):
+                def forward(key, *arguments, draws=draws):
                     with env.override_property(prng=key):
-                        return self._forward(*arguments)
+                        return self._forward(*arguments, watch=draws)
 
                 self.module.train(training)
-                draws = []
-                drawing = {name: getattr(torch, name) for name in _DRAWS}
-                for name, draw in drawing.items():
-                    setattr(torch, name, functools.partial(_counted, draw, draws))
                 try:
-                    program = str(jax.make_jaxpr(forward)(jax.random.key(0), *shapes))
-                    traces.append((program, len(draws)))
+                    traced = jax.make_jaxpr(forward)(jax.random.key(0), *shapes)
+                except Exception as error:
+                    mode = "training" if training else "eval"
+                    raise ValueError(f"fallback='torchax' could not trace this model's {mode} forward "
+                                     "to check one against the other") from error
                 finally:
-                    for name, draw in drawing.items():
-                        setattr(torch, name, draw)
                     self.module.eval()
-            self._differs[signature] = traces[0] != traces[1]
+                traces.append((str(traced.jaxpr), traced.consts, draws.count))
+            (program, consts, count), (eval_program, eval_consts, eval_count) = traces
+            self._differs[signature] = (program != eval_program or count != eval_count
+                                        or len(consts) != len(eval_consts)
+                                        or not all(np.array_equal(np.asarray(one), np.asarray(other))
+                                                   for one, other in zip(consts, eval_consts, strict=True)))
         return self._differs[signature]
 
     def export(self, model: nn.Module, variables: Mapping[str, object],
@@ -226,14 +229,24 @@ class TorchGraph:
         return tensors
 
 
-_DRAWS = ("rand", "rand_like", "randn", "randn_like", "randint", "randint_like", "randperm", "bernoulli",
-          "multinomial", "normal")
-"""torch's random functions, which a module calls as `torch.<name>`."""
+def _Draws():
+    """A torch function mode that counts the calls of torch's random functions."""
+    import torch
+    from torch.overrides import TorchFunctionMode
 
+    drawing = {torch.rand, torch.rand_like, torch.randn, torch.randn_like, torch.randint, torch.randint_like,
+               torch.randperm, torch.bernoulli, torch.multinomial, torch.normal, torch.Tensor.uniform_,
+               torch.Tensor.normal_, torch.Tensor.bernoulli_, torch.Tensor.random_, torch.Tensor.exponential_,
+               torch.Tensor.cauchy_, torch.Tensor.geometric_, torch.Tensor.log_normal_}
 
-def _counted(draw, draws: list, *args, **kwargs):
-    draws.append(draw)
-    return draw(*args, **kwargs)
+    class Draws(TorchFunctionMode):
+        count = 0
+
+        def __torch_function__(self, func, types, args=(), kwargs=None):
+            self.count += func in drawing
+            return func(*args, **(kwargs or {}))
+
+    return Draws()
 
 
 def _forward(model: PreTrainedModel, tokens: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
