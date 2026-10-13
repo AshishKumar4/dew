@@ -66,7 +66,7 @@ from ..inputs import (
     PredictionPhase,
     coordinates as build_coordinates,
 )
-from ..kv_cache import KVCache
+from ..kv_cache import CURSOR, KVCache, leaf_name
 from ..mixers import AttentionMixer, MixerBase, MixerContext
 from ..mixers.mamba2 import Mamba2Mixer
 from ..mixers.mlp import MLPMixer
@@ -1691,14 +1691,7 @@ class CausalTransformer(nn.Module):
         x = constrain(self._prepared(self.scaled_embeddings(self.token_embeddings(tokens)),
                                      input_embeddings), RESIDUAL)
         if self.position_embedding == 'learned':
-            places = positions
-            if places is None:
-                start = (self.layers[0].self_attn.get_variable('cache', 'cache_index')
-                         if decode else None)
-                valid = (jnp.ones(tokens.shape, bool) if attention_mask is None else attention_mask)
-                places = jnp.cumsum(valid, axis=-1, dtype=jnp.int32) - 1
-                if start is not None:
-                    places = places + start[:, None]
+            places = jnp.arange(tokens.shape[1])[None] if positions is None else positions
             x = x + self.embed_positions(jnp.maximum(places + self.position_embedding_offset, 0))
         if self.embedding_norm:
             x = self.embedding_layernorm(x)
@@ -1753,6 +1746,9 @@ class CausalTransformer(nn.Module):
                 raise ValueError("explicit pairwise masks require ordinary attention mixers")
         if self.engram is None and (self.mixture is None or not self.mixture.media_bias):
             media_mask = None
+        if decode and coordinates is None and positions is None and admitted is None:
+            # A mixed serving step's rows each carry their own (`Admitted`).
+            positions = self._continued(tokens.shape[:2], attention_mask)
         if coordinates is None and (segment_ids is not None or attention_mask is not None or right_padded
                                     or positions is not None):
             coordinates = build_coordinates(tokens.shape[:2], segments=segment_ids, valid=attention_mask,
@@ -1773,6 +1769,16 @@ class CausalTransformer(nn.Module):
             pairwise_mask=pairwise_mask, key_positions=key_positions,
             token_ids=tokens if self.hash_layers else None, engram_ids=engram_ids, media=media_mask,
             admitted=admitted)
+
+    def _continued(self, shape: tuple[int, int], valid):
+        """A cached call's logical positions: each real token's rank after what the cache holds,
+        the cursor every layer's cache advances alike (`cache_positions`), read off the first
+        cache that keeps one; from 0 where none does yet (the call that allocates them)."""
+        cursors = [leaf for path, leaf in jax.tree_util.tree_leaves_with_path(self.variables.get('cache', {}))
+                   if leaf_name(path) == CURSOR]
+        start = cursors[0].reshape(-1, shape[0])[0] if cursors else jnp.zeros(shape[:1], jnp.int32)
+        valid = jnp.ones(shape, bool) if valid is None else jnp.asarray(valid, bool)
+        return start[:, None] + jnp.cumsum(valid, axis=1, dtype=jnp.int32) - 1
 
     def looped(self, x, **stack):
         """Run the layer stack over `x` once, or as `loop` says: the layers before
