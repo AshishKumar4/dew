@@ -394,6 +394,29 @@ class _FitRun:
         return next(self.train)
 
 
+def _read_whole(accumulation: int, split: int | None, step: Callable[..., StepFn] | None, layout: Layout,
+                rollout: Rollout | None, mesh: MeshSpec) -> str | None:
+    """Why every step reads its batch whole, or None where a plan may split it,
+    refusing the arguments no Trainer takes together."""
+    if accumulation < 1:
+        raise ValueError(f"accumulation must be at least 1, got {accumulation}")
+    # Split under an Explicit axis, a step met a cotangent the split typed
+    # float32[16@data,16,16] against its forward's float32[16,16,16].
+    whole = ("a custom step owns its execution" if step is not None else
+             "the layout keeps the variables on the host" if "variables" in layout.host else
+             "a rollout writes a batch of its own" if rollout is not None else
+             "an Explicit mesh axis types the step's rows" if mesh.explicit else None)
+    if split is not None and (split < 1 or (whole is not None and split > 1)):
+        raise ValueError(f"split reads each step's batch in that many microbatches, at least 1, and "
+                         f"only 1 where {whole}; got {split}")
+    if step is not None and "variables" in layout.host:
+        raise ValueError(
+            "Parameter-streamed training requires the trainer objective transaction; "
+            "custom steps own their execution"
+        )
+    return whole
+
+
 _DEFAULT_MESH = MeshSpec()
 _DEFAULT_LAYOUT = Layout()
 
@@ -439,22 +462,7 @@ class Trainer(Generic[Loss, Effects]):
         where the process has the GPU to itself (`dew.nn.kernels.tuning.tune`); without it such a
         launch runs the nearest measured shape's config or its heuristic.
         """
-        if accumulation < 1:
-            raise ValueError(f"accumulation must be at least 1, got {accumulation}")
-        # Split under an Explicit axis, a step met a cotangent the split typed
-        # float32[16@data,16,16] against its forward's float32[16,16,16].
-        whole = ("a custom step owns its execution" if step is not None else
-                 "the layout keeps the variables on the host" if "variables" in layout.host else
-                 "a rollout writes a batch of its own" if rollout is not None else
-                 "an Explicit mesh axis types the step's rows" if mesh.explicit else None)
-        if split is not None and (split < 1 or (whole is not None and split > 1)):
-            raise ValueError(f"split reads each step's batch in that many microbatches, at least 1, and "
-                             f"only 1 where {whole}; got {split}")
-        if step is not None and "variables" in layout.host:
-            raise ValueError(
-                "Parameter-streamed training requires the trainer objective transaction; "
-                "custom steps own their execution"
-            )
+        whole = _read_whole(accumulation, split, step, layout, rollout, mesh)
         self.objective = objective
         built = isinstance(optimizer, optax.GradientTransformation)
         self._config = None if built else optimizer
