@@ -28,7 +28,6 @@ from jax.typing import DTypeLike
 
 from dew import records
 from dew._model_types import QWEN35_TYPES
-from dew.coordination import agreed
 from dew.diffusion.process import Process
 from dew.diffusion.schedules.source import SourceSchedule
 from dew.inference import BlockGeneration, MaskedGeneration, TextGeneration
@@ -44,6 +43,7 @@ from dew.interop.generation_config import (
     generation_config_of,
     generation_limit,
     pad_id,
+    read_generation_config,
     return_sequences,
     source_decoding,
 )
@@ -1166,24 +1166,6 @@ def _decoder_layouts(tensors: Mapping[str, np.ndarray], record: decoder_parts.De
     return tuple(bindings), retained
 
 
-def _generation_config(directory: Path) -> Mapping[str, object]:
-    """The source's generation_config.json, or {} when it has none."""
-    generation_path = directory / "generation_config.json"
-    generation_config = json.loads(generation_path.read_text()) if generation_path.exists() else {}
-
-    def policy_read() -> None:
-        """Refuse a generation_config.json that is not an object.
-
-        Loading for training or export does not opt into the source sampler;
-        active policy support is checked when the caller creates its task.
-        """
-        if not isinstance(generation_config, dict):
-            raise ValueError("generation_config.json must contain an object")
-
-    agreed("pretrained generation policy", policy_read)
-    return generation_config
-
-
 class _Built(NamedTuple):
     """A decoder source built and bound: the model, its variables, the
     record it was translated to, what it was built from, and the source
@@ -1327,7 +1309,7 @@ def _load_native_source(name_or_dir: str | Path, directory: Path, commit: str | 
     model, variables = _input_quantization(model, variables, layouts, config, grid)
     source = str(name_or_dir) if commit is None else f"{name_or_dir}@{directory.name}"
     processor = source_processor(directory, config, record, model, gguf_path, source=source)
-    generation_config = _generation_config(directory)
+    generation_config = read_generation_config(directory)
 
     # Dew's byte vocabulary has no files: an export names it in
     # generation_config.json, and the name is the whole record of it.

@@ -10,9 +10,11 @@ from dew.interop.decoder_parts import (
     Renames,
     base_config,
     decoder_tensors,
+    hf_ungated,
     refuse,
     renamed_name,
     renamed_path,
+    ungated_mlp,
 )
 from dew.nn.backbones.causal_transformer import CausalTransformer
 
@@ -24,9 +26,7 @@ def _phi_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
     theta = records.number(parameters.get('rope_theta', hf.get('rope_theta', 10000.)), 'rope_theta')
     rope = {key: value for key, value in parameters.items() if key != 'partial_rotary_factor'}
     activation = records.text(hf.get('hidden_act', 'gelu_new'), 'hidden_act')
-    activations = {'gelu_new': 'gelu', 'gelu_pytorch_tanh': 'gelu', 'gelu': 'gelu_exact', 'relu': 'relu'}
-    if activation not in activations:
-        refuse('hidden_act', 'Phi uses an ungated GELU or ReLU feed-forward')
+    mlp = ungated_mlp(activation, ('gelu_new', 'gelu_pytorch_tanh', 'gelu', 'relu'), 'hidden_act', 'Phi')
     if hf.get('qk_layernorm', False):
         refuse('qk_layernorm', 'Phi q/k LayerNorm has no RMSNorm counterpart')
     config = base_config({**hf, 'hidden_act': 'silu', 'rope_theta': theta,
@@ -34,7 +34,7 @@ def _phi_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
     used.update(('partial_rotary_factor', 'qk_layernorm', 'layer_norm_eps', 'resid_pdrop',
                  'embd_pdrop', 'attention_dropout'))
     config.update({
-        'mlp': activations[activation], 'mlp_bias': True,
+        'mlp': mlp, 'mlp_bias': True,
         'norm_type': 'layer', 'norm_bias': True, 'scale_after_cast': False,
         'norm_eps': records.number(hf.get('layer_norm_eps', 1e-5), 'layer_norm_eps'),
         'parallel_residual': True, 'shared_parallel_norm': True, 'head_bias': True,
@@ -53,7 +53,7 @@ _PHI_NAMES: Renames = (
 
 def _phi_export(model: CausalTransformer) -> Mapping[str, object]:
     return {
-        'hidden_act': {'gelu': 'gelu_new', 'gelu_exact': 'gelu', 'relu': 'relu'}[str(model.mlp)],
+        'hidden_act': hf_ungated(model.mlp, 'Phi'),
         'layer_norm_eps': model.norm_eps, 'qk_layernorm': False,
         'resid_pdrop': model.dropout_rate, 'embd_pdrop': model.embedding_dropout_rate,
         'attention_dropout': model.attention_dropout_rate,
