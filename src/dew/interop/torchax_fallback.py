@@ -174,10 +174,12 @@ class TorchGraph:
     def _trains_otherwise(self, *arguments) -> bool:
         """Whether the module's training forward traces to another program than its eval forward.
 
-        Both are traced with torchax's random key as an input, so a random
-        draw is part of the program and a branch on one (layer drop) cannot
-        be decided at trace time: that trace fails, which counts as another
+        Both are traced with torchax's random key as an input and torch's
+        default device on it, so every random draw, a bare `torch.rand` too,
+        is part of the program, and a branch on one (layer drop) cannot be
+        decided at trace time: that trace fails, which counts as another
         program."""
+        import torch
         import torchax
 
         env = torchax.default_env()
@@ -190,7 +192,7 @@ class TorchGraph:
 
                 # One function a trace: JAX caches a trace by its function, and the mode is not an input.
                 def forward(key, *arguments):
-                    with env.override_property(prng=key):
+                    with env.override_property(prng=key), torch.device("jax"):
                         return self._forward(*arguments)
 
                 self.module.train(training)
