@@ -195,15 +195,27 @@ def test_eager_fetch_keeps_a_memory_plan_volatile_until_its_generation_is_sealed
 
 
 @pytest.mark.parametrize(("selection", "read"), [("fraction", "memory"), ("fraction", "streamed"),
-                                               ("records", "memory"), ("records", "indexed")])
+                                               ("records", "memory"), ("records", "indexed"),
+                                               ("random", "memory"), ("random", "indexed")])
 def test_a_sealed_generation_keeps_its_holdout_selection_in_training_and_validation(tmp_path,
                                                                                  selection, read):
     """Generation promotion splits its accepted rows, not the original inputs or the full generation."""
+    from dew.config.data import RecordsData, loader
+    from dew.data.holdout import HoldOut
+
     source = Memory(rows("fetched", 64))
     generation = fetched_generation(source, tmp_path)
-    cached = source.filter_map(FetchLike()).cache(generation)
-    train, held = (cached.holdout(0.25, key="i") if selection == "fraction"
-                   else cached.holdout(records=5))
+    if selection == "random":
+        holdout = HoldOut(records=5, by="random", seed=37)
+        train, held, _ = RecordsData(generation.source(), validation=holdout).pipelines()
+        data = loader(RecordsData(source, validation=holdout), cache=generation,
+                      batch=2, read=read, loading=READ)
+    else:
+        cached = source.filter_map(FetchLike()).cache(generation)
+        train, held = (cached.holdout(0.25, key="i") if selection == "fraction"
+                       else cached.holdout(records=5))
+        data = compile(train.batch(2), validation=held.batch(2, drop_remainder=False),
+                       read=read, loading=READ)
     accepted = {index for index in range(64) if index % 3}
     parts = [{int(row["i"]) for row in iterate(part, read=read, loading=READ)} for part in (train, held)]
     assert all(parts)
@@ -211,8 +223,8 @@ def test_a_sealed_generation_keeps_its_holdout_selection_in_training_and_validat
     assert parts[0] | parts[1] == accepted
     if selection == "records":
         assert parts[1] == set(sorted(accepted)[:5])
-    data = compile(train.batch(2), validation=held.batch(2, drop_remainder=False),
-                   read=read, loading=READ)
+    if selection == "random":
+        assert len(parts[1]) == 5
     training, validation = data.train(DataPartition()), data.val(DataPartition())
     try:
         trained = {int(index) for batch in itertools.islice(training, len(accepted)) for index in batch["i"]}
