@@ -292,7 +292,9 @@ The grace period has to cover one step and one checkpoint write. When `dew launc
 
 ## Data position
 
-A plain Python generator usually cannot report its position. To continue the data sequence after a resume, use a built-in source that supports checkpointing, or give the iterator both `get_state` and `set_state` as the example does. An iterator rebuilt from the start may replay records even though the model weights restore correctly. A stream that cannot save its position cannot produce a resumable checkpoint, so `fit` refuses a `checkpoint_every` for it and you have to pass `checkpoint_every=None`. The final state is still written.
+A plain Python generator cannot report its position. It trains and checkpoints, but its checkpoint holds no data position, and `fit` refuses to resume one, since the generator would start its data again from the top. Give the iterator `get_state` and `set_state`, as the example's does, read it through a built-in source, or declare that it yields the same batches each time it opens: wrap the reader in `dew.data.dataset.replayed`, or pass `replay=True` to `from_iter`. A declared stream is positioned by the batches it has read, and a resume reopens it and reads that many again.
+
+At that position the resume compares the batch it reads with a digest of the one the run read, and refuses on a difference. That catches a stream that draws from fresh entropy or a network, but it is a guard and not a proof: a stream that reads the same batch there and differs later, one using a process-wide random generator or the clock, resumes without complaint on other data. Replay is exact only for a stream that is deterministic as declared. A resume reads every batch before the position again, and the digest costs the reader about a millisecond a megabyte of each batch.
 
 A persistent checkpoint can restore into a different, compatible placement through the trainer's restore template. Whether the process count can change depends on the saved position:
 

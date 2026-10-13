@@ -12,6 +12,7 @@ import atexit
 import dataclasses
 import itertools
 import json
+import subprocess
 import time
 
 import cv2
@@ -28,10 +29,9 @@ from dew.data.dataset import Checkpointable, DataPartition, Records as IndexedRo
 from dew.data.image_codec import decode_image
 from dew.data.pipeline import Pipeline
 from dew.data.sinks import export
-from dew.data.sources import Torch, av_utils, source as stored_source
+from dew.data.sources import Torch, source as stored_source
 from dew.data.steps.generic import Formatting
 from dew.data.steps.image import EncodeCaptions
-from dew.data.steps.video import Audio, DecodeClip
 from dew.objectives.base import VALID_ROWS
 from dew.position import ENVELOPE
 from dew.registry import datasets
@@ -549,34 +549,39 @@ def test_an_indexed_filter_resumes_the_exact_accepted_record_order():
 
 
 # ---------------------------------------------------------------------------------
-# Clip sampling uses a local RNG
-# ---------------------------------------------------------------------------------
-
-# ---------------------------------------------------------------------------------
 # Video datasets
 # ---------------------------------------------------------------------------------
 
 def _voxceleb_tree(root, split="train", identities=("id00012", "id00015")):
-    """Build <root>/<split>/<identity>/<clip>/<utterance>.mp4, plus some noise."""
+    """Build <root>/<split>/<identity>/<clip>/<utterance>.avi, 2 seconds of 16 kHz sound under 25 fps
+    frames, plus a file that is no clip. AVI with PCM, where the sound's seek is sample-exact."""
+    from moviepy.config import FFMPEG_BINARY
+
+    (root / "frames.rgb").write_bytes(np.full((50, 32, 48, 3), 90, np.uint8).tobytes())
+    (root / "sound.pcm").write_bytes(np.full(32000, 3000, np.int16).tobytes())
     clips = []
     for identity in identities:
         for clip in ("_raOc3-IRsw", "21Uxsk56VDQ"):
-            path = root / split / identity / clip / "00001.mp4"
+            path = root / split / identity / clip / "00001.avi"
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_bytes(b"not really an mp4")
+            subprocess.run([FFMPEG_BINARY, "-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "rgb24",
+                            "-s", "48x32", "-r", "25", "-i", str(root / "frames.rgb"), "-f", "s16le",
+                            "-ar", "16000", "-ac", "1", "-i", str(root / "sound.pcm"), "-c:v", "ffv1",
+                            "-c:a", "pcm_s16le", str(path)], check=True)
             clips.append(path)
     (root / split / "filelist.txt").write_text("ignored\n")
     return clips
 
 
 def test_local_videos_lists_every_file_under_the_directory(tmp_path):
+    pytest.importorskip("moviepy.config", reason="needs the av extra")
     clips = _voxceleb_tree(tmp_path)
     (tmp_path / "extra.webm").write_bytes(b"")
 
     from dew.config.data import _VideoRow
     from dew.data import Files
 
-    patterns = (str(tmp_path / "**" / "*.mp4"), str(tmp_path / "**" / "*.webm"))
+    patterns = (str(tmp_path / "**" / "*.avi"), str(tmp_path / "**" / "*.webm"))
     rows = Files(patterns, format="files").records("memory")
     records = [_VideoRow(caption="a clip")(row) for row in rows]
 
@@ -588,51 +593,74 @@ def test_local_videos_lists_every_file_under_the_directory(tmp_path):
         stored_source(str(tmp_path / "missing"), format="files").records("memory")
 
 
-def test_video_records_flow_through_the_audio_video_transform(tmp_path, monkeypatch):
-    """End to end with the reader stubbed and the audio model's extractor
-    built here, so its weights are the only thing not real. The extractor
-    takes the padded waveform whole and normalises it as one clip, which is
-    what the audio condition receives; handed the rows instead, wav2vec2's
-    extractor read each frame's 640 samples as a clip of its own and the
-    record kept the first, a frame of padding."""
+@pytest.mark.parametrize("rate", [16000, 48000])
+def test_a_video_recipe_reads_frames_and_the_sound_around_them_at_its_audio_model_s_rate(
+        tmp_path, monkeypatch, rate):
+    """Every clip under the directory, and nothing else, gives one record of `frames` frames fitted
+    into `frame_size` squares and the sound under them with `audio_padding` frames' worth either
+    side, at the rate the audio model's extractor reads: a 48 kHz model's record holds 1920 samples
+    a frame where a 16 kHz one holds 640. The audio model featurizes the sound when a run encodes
+    it, so the record holds the waveform."""
+    pytest.importorskip("moviepy.config", reason="needs the av extra")
     from transformers import AutoFeatureExtractor, Wav2Vec2FeatureExtractor
 
-    _voxceleb_tree(tmp_path)
-    spec = VideoData(source=str(tmp_path), caption="a video of a speaker", frame_size=32, frames=4,
-        audio_padding=1)
-    frame_samples = 640
-    seen = {}
+    clips = _voxceleb_tree(tmp_path)
+    monkeypatch.setattr(AutoFeatureExtractor, "from_pretrained",
+                        lambda name: Wav2Vec2FeatureExtractor(sampling_rate=rate))
+    spec = VideoData(source=str(tmp_path / "train"), caption="a video of a speaker", frame_size=16, frames=4,
+                 audio_padding=1)
 
-    def fake_read_av_random_clip(video_path, *, num_frames, audio_padding, seed, sample_rate=16000,
-                                 fps=25.0):
-        seen.update(video_path=video_path, num_frames=num_frames,
-                    audio_padding=audio_padding, seed=seed)
-        padded = num_frames + 2 * audio_padding
-        audio = np.linspace(-0.5, 0.5, padded * int(sample_rate / fps), dtype=np.float32)
-        # Native resolution differs from frame_size, so the resize must happen
-        return np.zeros((num_frames, 96, 48, 3), np.uint8), audio.reshape(padded, -1)
+    train, _, _ = spec.pipelines()
+    records = list(train.repeat(1).iterate())
 
-    monkeypatch.setattr(av_utils, "read_av_random_clip", fake_read_av_random_clip)
+    assert len(records) == len(clips)
+    for record in records:
+        assert set(record) == {"video", "audio", "audio_valid", "caption"}
+        assert record["video"].shape == (4, 16, 16, 3) and record["video"].dtype == np.uint8
+        assert (record["video"] == 90).all()
+        assert record["audio"].shape == (6 * rate // 25,) and record["audio"].dtype == np.float32
+        # Two seconds of sound under every clip: each window's 0.24 seconds are all the track's.
+        assert record["audio_valid"].dtype == bool and int(record["audio_valid"].sum()) == 6 * rate // 25
+        assert np.allclose(record["audio"], 3000 / 32768, atol=1e-3)
+        assert record["caption"] == "a video of a speaker"
+
+
+def test_a_video_recipe_reads_the_same_batches_at_any_worker_count_and_after_a_resume(tmp_path, monkeypatch):
+    """Clips whose frames and sound count up, so every drawn window shows: two workers give the
+    batches the main process gives, and a reader resumed from a saved position continues with the
+    batches an uninterrupted one reads, windows included."""
+    pytest.importorskip("moviepy.config", reason="needs the av extra")
+    from test_data_av import _mux
+    from transformers import AutoFeatureExtractor, Wav2Vec2FeatureExtractor
+
+    (tmp_path / "train").mkdir()
+    for index in range(6):
+        _mux(tmp_path / "train" / f"{index}.avi")
     monkeypatch.setattr(AutoFeatureExtractor, "from_pretrained",
                         lambda name: Wav2Vec2FeatureExtractor(sampling_rate=16000))
+    spec = VideoData(source=str(tmp_path / "train"), frames=4, frame_size=16, audio_padding=1)
 
-    records = [{"mp4": str(path), "caption": spec.caption} for path in sorted(tmp_path.rglob("*.mp4"))]
-    audio = Audio(spec.audio_model)
-    decoded = DecodeClip(spec.frames, spec.frame_size, audio_padding=spec.audio_padding,
-                         sample_rate=audio.processor.sampling_rate)
-    decoded = decoded.random_map(records[0], np.random.default_rng(0))
-    batch = audio.map(decoded)
+    def read(workers, count, state=None):
+        data = loader(spec, batch=2, read="memory", seed=7,
+                      loading=Loading(workers=workers, threads=1, read_buffer=2, worker_buffer=1))
+        reader = data.train(DataPartition())
+        try:
+            if state is not None:
+                reader.set_state(state)
+            return [next(reader) for _ in range(count)], reader.get_state()
+        finally:
+            reader.close()
 
-    assert seen["video_path"] == records[0]["mp4"]
-    assert seen["num_frames"] == 4 and seen["audio_padding"] == 1
-    assert seen["seed"] == int(np.random.default_rng(0).integers(0, 2**32 - 1))
-    assert batch["video"].shape == (4, 32, 32, 3)
-    assert batch["caption"] == "a video of a speaker"
-    waveform = batch["audio"]["full_audio"]
-    assert waveform.shape == (6, frame_samples) and waveform[0, 0] == -0.5
-    flat = waveform.reshape(-1)
-    normalised = (flat - flat.mean()) / np.sqrt(flat.var() + 1e-7)
-    assert np.allclose(batch["audio"]["input_values"], normalised, atol=1e-5)
+    single, _ = read(0, 4)
+    workers, _ = read(2, 4)
+    for one, many in zip(single, workers, strict=True):
+        for field in ("video", "audio", "audio_valid"):
+            np.testing.assert_array_equal(one[field], many[field])
+    assert any(not np.array_equal(batch["video"][0], batch["video"][1]) for batch in single)
+    _, saved = read(0, 2)
+    resumed, _ = read(0, 2, saved)
+    for expected, found in zip(single[2:], resumed, strict=True):
+        np.testing.assert_array_equal(expected["audio"], found["audio"])
 
 
 def keep_captions(captions):

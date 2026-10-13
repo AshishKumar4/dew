@@ -61,6 +61,48 @@ def test_an_augmentation_draws_the_same_at_any_thread_count_and_after_a_resume(k
         np.testing.assert_array_equal(expected["image"], found["image"])
 
 
+def _read(chain, threads, count):
+    data = compile(chain, read="indexed",
+                   loading=Loading(workers=0, threads=threads, read_buffer=2 * threads, worker_buffer=1))
+    reader = data.train(DataPartition())
+    try:
+        return [next(reader) for _ in range(count)]
+    finally:
+        reader.close()
+
+
+def test_stages_holding_one_albumentations_pipeline_each_draw_their_own_record_s_seed():
+    """Two stages around one Compose, read by eight threads: no thread's seed lands between another's
+    seed and call, so every record's draws are the ones one thread makes."""
+    A = pytest.importorskip("albumentations")
+
+    compose = A.Compose([A.HorizontalFlip(p=0.5), A.RandomBrightnessContrast(p=1.0), A.RandomCrop(20, 20)])
+    chain = (pictures().shuffle(0).repeat().random_map(images.albumentations(compose))
+             .random_map(images.albumentations(compose)).batch(8))
+
+    for one, many in zip(_read(chain, 1, 8), _read(chain, 8, 8), strict=True):
+        np.testing.assert_array_equal(one["image"], many["image"])
+
+
+def test_a_bucket_is_the_size_nearest_an_image_s_aspect_covered_and_cut_at_the_centre():
+    """A wide, a tall and a square image each take the size nearest their aspect, cover it and keep
+    its centre: a horizontal ramp's middle column stays in the middle."""
+    sizes = ((16, 16), (12, 20), (20, 12))
+    ramp = np.broadcast_to(np.arange(60, dtype=np.uint8)[None, :, None] * 4, (20, 60, 3))
+    rows = [{"image": np.ascontiguousarray(ramp)}, {"image": np.zeros((40, 24, 3), np.uint8)},
+            {"image": np.zeros((30, 31, 3), np.uint8)}]
+
+    bucketed = [images.bucket(sizes).map(row) for row in rows]
+
+    assert [int(row["bucket"]) for row in bucketed] == [1, 2, 0]
+    assert [row["image"].shape for row in bucketed] == [(12, 20, 3), (20, 12, 3), (16, 16, 3)]
+    # The ramp, 60 columns wide, covers 20 at 36 wide; the cut keeps columns 8 to 28 of 36, whose
+    # middle is the ramp's middle, 118.
+    assert abs(float(bucketed[0]["image"][:, 9:11].mean()) - 118) < 8
+    with pytest.raises(ValueError):
+        images.bucket(((16, 0),))
+
+
 def keep_captions(captions):
     return {"caption": np.asarray(captions)}
 

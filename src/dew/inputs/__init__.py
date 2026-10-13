@@ -121,6 +121,16 @@ class InputSpec:
             if condition.encoder.reads_captions
         }
 
+    def encode_fields(self, batch: Batch) -> dict[str, Mapping[str, np.ndarray]]:
+        """Return the batch fields this run's other conditions read, each encoded from the rows its
+        field holds: a clip's `audio` waveforms become the audio model's features, as `tokenize`
+        makes ids of captions, so the dataset carries the sound and the run's encoder featurizes it."""
+        return {
+            condition.field: condition.encoder.tokenize(list(batch[condition.field]))
+            for condition in self.conditions.values()
+            if not condition.encoder.reads_captions
+        }
+
     def check(self, batch: Batch) -> None:
         """Raise `ValueError` if `batch` is missing a field this spec names or has a wrong shape.
 

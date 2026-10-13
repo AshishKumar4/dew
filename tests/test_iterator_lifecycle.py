@@ -482,7 +482,9 @@ def test_metric_failure_closes_owned_iterators_before_it_escapes(steps):
     assert validation.owners[-1] == threading.get_ident()
 
 
-def test_checkpointability_refusal_finalizes_the_untransferred_source(tmp_path):
+def test_a_refusal_before_the_transfer_finalizes_the_untransferred_source(tmp_path):
+    """A stream fit refuses before its prefetch worker owns it, here for a
+    batch the mesh's eight devices cannot divide, is closed by fit."""
     closed = threading.Event()
 
     class Uncheckpointable:
@@ -497,8 +499,8 @@ def test_checkpointability_refusal_finalizes_the_untransferred_source(tmp_path):
 
     trainer = Trainer(Regression(), optax.sgd(0.01), key=jax.random.key(0),
                       checkpoints=Checkpoints(str(tmp_path)))
-    with pytest.raises(ValueError):
-        trainer.fit(Loader(lambda partition: Uncheckpointable(), None, None, 8), steps=1, checkpoint_every=1)
+    with pytest.raises(ValueError, match="7"):
+        trainer.fit(Loader(lambda partition: Uncheckpointable(), None, None, 7), steps=1, checkpoint_every=1)
     assert closed.is_set()
 
 def test_sigint_during_fit_restoration_closes_only_after_restoration_returns(tmp_path):
