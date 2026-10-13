@@ -68,11 +68,38 @@ def through(chunk: int, starts, dy, dfinal):
     return run
 
 
-def skip_terms(dy, x) -> dict[str, float]:
-    """`D`'s declared invariant: its gradient is each head's `dy x` summed over rows, tokens and
-    channels, whose absolute terms' RMS over heads bounds it (`assert_leaves_as_exact`)."""
-    terms = np.sum(np.abs(np.asarray(dy, np.float64) * np.asarray(x, np.float64)), axis=(0, 1, 3))
-    return {"['D']": float(np.sqrt(np.mean(terms ** 2)))}
+def summed_terms(operands, starts, dy, dfinal, chunk: int) -> dict[str, float]:
+    """The declared invariants of the two leaves that sum their cotangents over every token
+    (`assert_leaves_as_exact`), each the RMS over heads of its terms' absolute sum, in float64: `D`'s
+    terms are `dy x`; `A`'s are each step's log-decay gradient times its step, a document's first token
+    (whose decay is the reset) taking none, the gradient read from the XLA scan, which takes the decay
+    `A dt` per step (`xla_chunk_scan`)."""
+    x, dt, A, B, C, _, h0 = widened(operands)
+    batch, length, heads, width = x.shape
+    with jax.enable_x64(new_val=True):
+        pad = -length % chunk
+        padded = [np.pad(t, [(0, 0), (0, pad)] + [(0, 0)] * (t.ndim - 2))
+                  for t in (x * dt[..., None], np.repeat(B, heads // B.shape[2], axis=2),
+                            np.repeat(C, heads // C.shape[2], axis=2), dt)]
+
+        def chunked(t):
+            return jnp.moveaxis(t.reshape(batch, -1, chunk, *t.shape[2:]), 1, 0)
+
+        def loss(a):
+            a = jnp.pad(a, ((0, 0), (0, pad), (0, 0)))
+            if starts is not None:
+                a = jnp.where(jnp.pad(starts, ((0, 0), (0, pad)))[..., None], mamba2.RESET_DECAY, a)
+            x_c, b_c, c_c = (chunked(t) for t in padded[:3])
+            y, final = mamba2.xla_chunk_scan(x_c, b_c, c_c, jnp.moveaxis(chunked(a), 3, 2), h0)
+            y = jnp.moveaxis(y, 0, 1).reshape(batch, -1, heads, width)[:, :length]
+            return jnp.sum(y * np.asarray(dy, np.float64)) + jnp.sum(final * np.asarray(dfinal, np.float64))
+
+        decay = np.asarray(jax.grad(loss)(A * dt)) * dt
+    if starts is not None:
+        decay = np.where(np.asarray(starts)[..., None], 0.0, decay)
+    skip = np.abs(np.asarray(dy, np.float64) * x).sum(axis=(0, 1, 3))
+    return {"['A']": float(np.sqrt(np.mean(np.abs(decay).sum(axis=(0, 1)) ** 2))),
+            "['D']": float(np.sqrt(np.mean(skip ** 2)))}
 
 
 # (batch, length, heads, head width, groups, state), chunk: a ragged tail with packed documents over
@@ -101,7 +128,8 @@ def test_the_port_is_as_exact_as_the_xla_scan(monkeypatch, shape, chunk, documen
     xla = jax.tree.map(np.asarray, jax.jit(through(chunk, starts, dy, dfinal))(*operands))
     row_names_port(monkeypatch)
     ported = jax.tree.map(np.asarray, jax.jit(through(chunk, starts, dy, dfinal))(*operands))
-    assert_leaves_as_exact(ported, xla, truth, reductions=chunk, invariants=skip_terms(dy, operands[0]))
+    assert_leaves_as_exact(ported, xla, truth, reductions=chunk,
+                           invariants=summed_terms(operands, starts, dy, dfinal, chunk))
 
 
 @pytest.mark.parametrize("heads", [None, 2], ids=["heuristic", "summing-two-of-three-heads"])
@@ -140,7 +168,8 @@ def test_the_port_in_bf16_is_as_exact_as_mamba_ssm(heads):
             *widened([fixture[name] for name in names])))
     reference = {name: fixture[f"mamba.{name}"] for name in ported}
     assert_leaves_as_exact(ported, reference, truth, reductions=chunk,
-                           invariants=skip_terms(fixture["dy"], fixture["x"]))
+                           invariants=summed_terms([fixture[name] for name in names], starts, fixture["dy"],
+                                                   fixture["dfinal"], chunk))
 
 
 @pytest.mark.parametrize("dtype, bound", [(jnp.float32, 1e-4), (jnp.bfloat16, 5e-2)])
