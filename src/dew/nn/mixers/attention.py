@@ -49,7 +49,7 @@ from dew.nn.rope import (
     YarnScaling,
     axis_halves,
     axis_tables,
-    inverse_frequencies,
+    mrope_tables,
     rotary_freqs,
     rotate,
     yarn_rope_freqs,
@@ -355,24 +355,6 @@ class CausalSelfAttention(nn.Module):
                 f"head dims, got {factor} of head_dim {self.head_dim}")
         return rot_dim
 
-    def _multimodal_rotary(self, positions: jax.Array, dtype: jnp.dtype):
-        """Qwen's interleaved temporal/height/width rotary frequency selection,
-        its angles in `dtype`."""
-        rotated = self._rot_dim() or self.head_dim
-        if self.mrope_section is None:
-            raise ValueError("multimodal rotary requires mrope_section")
-        if positions.shape[-1] != 3 or self.partial_rotary_type != "default":
-            raise ValueError("M-RoPE requires three coordinates and default partial rotary")
-        indices = jnp.arange(rotated // 2)
-        axes = jnp.zeros((rotated // 2,), jnp.int32)
-        for axis in (1, 2):
-            axes = jnp.where((indices % 3 == axis) & (indices < self.mrope_section[axis] * 3), axis, axes)
-        selected = jnp.take_along_axis(positions, axes[None, None, :], axis=-1)
-        # transformers' 1 / theta ** (2i / dim) (Qwen2VLRotaryEmbedding), on the host.
-        inv = inverse_frequencies(self.rope_theta, rotated, dtype=dtype)
-        angles = selected.astype(dtype) * inv
-        return jnp.cos(angles), jnp.sin(angles)
-
     def _shared_kv(self, kv_store):
         """Read the keys, values and positions the provider layer stashed.
 
@@ -431,7 +413,10 @@ class CausalSelfAttention(nn.Module):
                                  "[B, S, axes] from attention_metadata.rotary_positions")
             return axis_tables(rotary_positions, self.rotary_axes, self.rope_theta, dtype=dtype)
         if self.mrope_section is not None and rotary_positions is not None and rotary_positions.ndim == 3:
-            return self._multimodal_rotary(rotary_positions, dtype)
+            if self.partial_rotary_type != "default":
+                raise ValueError("M-RoPE requires default partial rotary")
+            return mrope_tables(rotary_positions, self.mrope_section, self._rot_dim() or self.head_dim,
+                                self.rope_theta, dtype=dtype)
         if self.yarn is None:
             return rotary_freqs(
                 rotary_positions, self.head_dim, self.rope_theta, rot_dim=self._rot_dim(),

@@ -24,13 +24,12 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Literal
 
 import jax
 import jax.numpy as jnp
 
 from dew.nn.dit import scan_indices
-from dew.nn.scan_orders import inverse_permutation
+from dew.nn.scan_orders import ScanOrder, inverse_permutation
 
 
 def _factorizations(area: int, grid: tuple[int, int], aspect: tuple[float, float]):
@@ -58,13 +57,13 @@ class MultiBlockMask:
     num_targets: int
     block_shapes: tuple[tuple[int, int], ...]
     num_context: int
-    scan_order: Literal["raster", "hilbert", "zigzag"] = "raster"
+    scan_order: ScanOrder = "raster"
 
     @classmethod
     def for_grid(cls, grid: tuple[int, int], num_targets: int = 4,
                  scale: tuple[float, float] = (0.15, 0.2),
                  aspect: tuple[float, float] = (0.75, 1.5),
-                 scan_order: Literal["raster", "hilbert", "zigzag"] = "raster") -> MultiBlockMask:
+                 scan_order: ScanOrder = "raster") -> MultiBlockMask:
         """Resolve the I-JEPA mask geometry for a patch grid whose tokens the encoder orders by `scan_order`.
 
         The block area is the one in the `scale` range, a fraction of the

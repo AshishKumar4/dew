@@ -1,7 +1,7 @@
 """Rectified flow schedules: the linear path and its resolution shift."""
 
 import math
-from typing import Literal
+from typing import Literal, get_args
 
 import jax
 import jax.numpy as jnp
@@ -55,8 +55,8 @@ class FlowMatchingScheduler(ContinuousNoiseScheduler, RectifiedFlow):
 
     def __init__(self, shift: float = 1.0, logit_mean: float = 0.0, logit_std: float = 1.0,
                  density: Density = "logit_normal", mode_scale: float = 1.29):
-        if density not in ("logit_normal", "mode", "cosmap", "uniform"):
-            raise ValueError(f"density is logit_normal, mode, cosmap or uniform, not {density!r}")
+        if density not in get_args(Density):
+            raise ValueError(f"density is one of {get_args(Density)}, not {density!r}")
         if density == "mode" and not -1.0 <= mode_scale <= 2.0 / (math.pi - 2.0):
             raise ValueError(f"mode_scale is in [-1, 2 / (pi - 2)], where the map is monotone; "
                              f"got {mode_scale}")
