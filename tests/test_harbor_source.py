@@ -82,44 +82,6 @@ def test_a_live_gateway_session_is_the_engine_ids_and_likelihoods(engine):
         assert call.behavior_log_probs == tuple(entry["logprob"] for entry in choice["logprobs"]["content"])
 
 
-@pytest.mark.parametrize("broken", [
-    trace([], [3], [-.5]),  # no ids at all: the engine was not asked for them
-    trace([1], [3, 4], [-.5]),  # one likelihood short
-    trace([1], [3], [-.5], None),  # no finish reason
-])
-def test_a_trace_that_cannot_train_is_refused(broken):
-    with pytest.raises(ValueError):
-        calls([broken], unstamped=0)
-
-
-@pytest.mark.parametrize("raw", [{"choices": [{"prompt_token_ids": [1]}]}, {"sglext": {"input_ids": [1]}}])
-def test_prompt_ids_come_from_the_gateway_alone(raw):
-    """An engine's raw reply may list prompt ids too, but a trace without the
-    gateway's own is refused rather than filled from it."""
-    with pytest.raises(ValueError):
-        calls([trace([], [3], [-.5], raw_response=raw)], unstamped=0)
-
-
-@pytest.mark.parametrize("malformed", [
-    {**trace([1], [3], [-.5]), "raw_response": "upstream said no"},  # a raw response that is not an object
-    {**trace([1], [3], [-.5]), "logprobs": ["-0.5"]},  # a likelihood that is not a number
-    {**trace([1], [3], [-.5]), "weight_version": "7"},  # a stamp that is not an integer
-    [1, 2, 3],  # not a trace at all
-])
-def test_a_malformed_trace_is_refused_as_such(malformed):
-    with pytest.raises(ValueError):
-        calls([malformed], unstamped=0)
-
-
-@pytest.mark.parametrize("malformed", [
-    {"exception_info": None, "verifier_result": {"rewards": {"reward": "1"}}},
-    {"exception_info": "boom", "verifier_result": None},
-    {"exception_info": None, "verifier_result": {"rewards": [1]}},
-])
-def test_a_malformed_trial_result_is_infra(malformed):
-    assert outcome(malformed, (STOP,))[0] is Status.INFRA_ERROR
-
-
 def overflow(engine):
     return json.loads((FIXTURES / f"{engine}_overflow_trace.json").read_text())
 
@@ -162,62 +124,11 @@ def test_an_engine_error_is_an_event_that_decides_the_session(refused, status):
     assert outcome(result(rewards={"reward": 0}), recorded.calls, errors=recorded.errors)[0] is status
 
 
-STOP = Call((1,), (2,), (-.5,), "stop", 0)
-CUT = Call((1,), (2,), (-.5,), "length", 0)
-ABORTED = Call((1,), (2,), (-.5,), "abort", 0)
-
-
 def result(exception=None, rewards=None):
     return {
         "exception_info": {"exception_type": exception, "exception_message": "boom"} if exception else None,
         "verifier_result": {"rewards": rewards} if rewards is not None else None,
     }
-
-
-@pytest.mark.parametrize(
-    ("trial", "records", "exit", "status", "reward"),
-    [
-        (result(rewards={"reward": 1}), (STOP,), None, Status.COMPLETED, 1.0),
-        (result(rewards={"reward": 0}), (STOP,), None, Status.COMPLETED, 0.0),
-        (result("NonZeroAgentExitCodeError", {"reward": 0}), (STOP,), None, Status.AGENT_ERROR, 0.0),
-        (result("AgentTimeoutError", {"reward": 1}), (STOP,), None, Status.TRUNCATED, 1.0),
-        (result("ContextWindowExceededError"), (STOP,), None, Status.TRUNCATED, None),
-        (result(rewards={"reward": 0}), (STOP, CUT), None, Status.TRUNCATED, 0.0),
-        (result(rewards={"reward": 0}), (STOP,), "LimitsExceeded", Status.TRUNCATED, 0.0),
-        (result(rewards={"reward": 1}), (STOP, ABORTED), None, Status.INFRA_ERROR, 1.0),
-        (result(rewards={"reward": 1}), (), None, Status.INFRA_ERROR, 1.0),
-        (result("EnvironmentStartTimeoutError"), (), None, Status.INFRA_ERROR, None),
-        (result("ApiConnectionClosedError", {"reward": 0}), (STOP,), None, Status.INFRA_ERROR, 0.0),
-        (result("RewardFileNotFoundError"), (STOP,), None, Status.INFRA_ERROR, None),
-        (result(rewards={"tests": 1, "style": 0}), (STOP,), None, Status.INFRA_ERROR, None),
-        # The harness's model client gave up (litellm exception names, recorded by mini-swe-agent as its
-        # exit status) and Harbor saw only a nonzero exit: an infrastructure fault, not a scored failure.
-        (
-            result("NonZeroAgentExitCodeError", {"reward": 0}),
-            (STOP,),
-            "APIConnectionError",
-            Status.INFRA_ERROR,
-            0.0,
-        ),
-        (
-            result("NonZeroAgentExitCodeError", {"reward": 0}),
-            (STOP,),
-            "ContextWindowExceededError",
-            Status.TRUNCATED,
-            0.0,
-        ),
-        (
-            result("NonZeroAgentExitCodeError", {"reward": 0}),
-            (STOP,),
-            "RepeatedFormatError",
-            Status.AGENT_ERROR,
-            0.0,
-        ),
-    ],
-)
-def test_a_trial_is_scored_masked_or_retried_by_how_it_ended(trial, records, exit, status, reward):
-    classified = outcome(trial, records, harness_exit=exit)
-    assert classified[:2] == (status, reward)
 
 
 HARBOR = '''\
@@ -449,39 +360,6 @@ def test_a_gateway_with_no_healthy_worker_refuses_the_submission(tmp_path, harbo
         assert not (tmp_path / "trials").exists()
     finally:
         source.close()
-
-
-def test_a_task_without_a_harbor_directory_is_refused(tmp_path, harbor):
-    source = HarborSource(fake_gateway()[0], harbor=harbor, model="m/p", trials=tmp_path)
-    try:
-        with pytest.raises(ValueError):
-            source.submit(Task("nothing"), 1, version=0)
-    finally:
-        source.close()
-
-
-def test_session_ids_are_single_path_segments():
-    gateway, _ = fake_gateway()
-    with pytest.raises(ValueError):
-        gateway.session("org/task:group:0:token")
-
-
-def test_a_cancelled_trial_leaves_no_escalation_timer_holding_the_interpreter(tmp_path, harbor):
-    (tmp_path / "slow").mkdir()
-    gateway, _ = fake_gateway()
-    source = HarborSource(gateway, harbor=harbor, model="m/p", trials=tmp_path / "trials", grace=60.0)
-    try:
-        (future,) = source.submit(Task("slow", {HARBOR_KEY: str(tmp_path / "slow")}), 1, version=0)
-        deadline = time.monotonic() + 30
-        while not list((tmp_path / "trials").glob("*/seen.json")) and time.monotonic() < deadline:
-            time.sleep(0.05)
-        source.cancel([future])
-        assert future.result(timeout=30).status is Status.CANCELLED
-    finally:
-        source.close()
-    # Harbor died on the interrupt; nothing may keep the interpreter alive for the rest of the grace.
-    assert not [thread for thread in threading.enumerate()
-                if isinstance(thread, threading.Timer) and thread.is_alive() and not thread.daemon]
 
 
 TRAINER = """

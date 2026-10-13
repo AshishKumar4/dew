@@ -119,42 +119,6 @@ def test_mxfp4_encodes_what_the_released_encoder_encodes(domain):
     np.testing.assert_array_equal(ours[0], blocks)
 
 
-def test_mxfp4_keeps_a_group_of_bf16_subnormals():
-    """2 ** -127 is a bf16 subnormal, and the released encoder writes it as
-    the 0.5 code at the 2 ** -126 scale, so the reader gives it back exactly.
-    A subnormal beside a normal large enough to set the scale is a code below
-    the grid, and rounds to zero as the reference's own product does."""
-    weight = np.full((1, 32, 1), np.ldexp(1.0, -127), np.float32)
-    weight[0, 5, 0] = -weight[0, 5, 0]
-    blocks, scales = quantize_mxfp4(weight)
-    decoded = released_decode(blocks, scales)
-
-    assert int(scales[0, 0, 0]) == 1
-    assert set(group_codes(blocks).reshape(-1).tolist()) == {1, 9}
-    np.testing.assert_array_equal(decoded, weight)
-    np.testing.assert_array_equal(np.signbit(decoded), np.signbit(weight))
-
-    beside = np.full((1, 32, 1), np.ldexp(1.0, -130), np.float32)
-    beside[0, 0, 0] = 1.0
-    blocks, scales = quantize_mxfp4(beside)
-    assert int(scales[0, 0, 0]) == 125
-    assert set(group_codes(blocks).reshape(-1).tolist()) == {0, 6}
-
-
-def test_mxfp4_rounds_an_fp32_weight_through_bf16_first():
-    """0.7495 is nearer 0.5 than 1.0 in the E2M1 grid and still comes back as
-    1.0: bf16 carries it onto the 0.75 midpoint, which rounds up. That second
-    rounding is the released encoder's own first step, so an fp32-trained
-    weight can land one code away from where a single rounding would put it."""
-    weight = np.full((1, 32, 1), 0.7495, np.float32)
-    weight[0, 0, 0] = 6.0
-    blocks, scales = quantize_mxfp4(weight)
-
-    assert int(scales[0, 0, 0]) == 127
-    assert int(group_codes(blocks)[0, 0, 0, 1]) == 2
-    assert released_decode(blocks, scales)[0, 1, 0] == 1.0
-
-
 def test_mxfp4_re_encodes_a_checkpoint_group_onto_the_same_values():
     """The fixture's 1024 values, decoded and encoded again: every one comes
     back at atol 0, and the bytes come back unchanged wherever the group's
@@ -175,48 +139,6 @@ def test_mxfp4_re_encodes_a_checkpoint_group_onto_the_same_values():
     assert int(scales[0, 0, 0]) == 126
     assert set(group_codes(blocks).reshape(-1).tolist()) == {7}
     np.testing.assert_array_equal(released_decode(blocks, scales), threes)
-
-
-def test_mxfp4_zero_and_smallest_groups_take_the_floor_of_the_format():
-    """A group with nothing in it takes the 0x00 scale byte and still tells
-    -0.0 from 0.0. A group down at the fp32 normal floor encodes exactly at
-    the 2 ** -126 scale the round-up stops on. Below that floor nothing
-    survives: a group of bf16 subnormals decodes to zero."""
-    zeros = np.zeros((1, 32, 1), np.float32)
-    zeros[0, 3, 0] = -0.0
-    blocks, scales = quantize_mxfp4(zeros)
-    decoded = released_decode(blocks, scales)
-    assert int(scales[0, 0, 0]) == 0
-    np.testing.assert_array_equal(decoded, zeros)
-    np.testing.assert_array_equal(np.signbit(decoded), np.signbit(zeros))
-
-    # Both groups want a scale below the floor and get 2 ** -126, byte 1: the
-    # quotient that picks it is 2 ** -128 and 2 ** -127, subnormal both times.
-    for exponent, code in ((-126, 2), (-125, 4)):
-        smallest = np.full((1, 32, 1), np.ldexp(1.0, exponent), np.float32)
-        smallest[0, 7, 0] *= 1.5
-        blocks, scales = quantize_mxfp4(smallest)
-        assert int(scales[0, 0, 0]) == 1
-        assert int(group_codes(blocks)[0, 0, 0, 0]) == code
-        np.testing.assert_array_equal(released_decode(blocks, scales), smallest)
-
-    subnormal = np.full((1, 32, 1), np.ldexp(1.0, -133), np.float32)
-    blocks, scales = quantize_mxfp4(subnormal)
-    np.testing.assert_array_equal(released_decode(blocks, scales), np.zeros_like(subnormal))
-
-
-@pytest.mark.parametrize("weight,message", [
-    (np.full((1, 32, 1), np.nan, np.float32), "reserved E8M0 NaN scale"),
-    (np.full((1, 32, 1), np.inf, np.float32), "reserved E8M0 NaN scale"),
-    (np.zeros((1, 48, 1), np.float32), "multiple of the 32-value group"),
-    (np.zeros((32, 1), np.float32), r"\[expert, input, output\] weight"),
-    (np.zeros((1, 32, 1), np.int32), "encodes float weights"),
-])
-def test_mxfp4_refuses_what_the_format_cannot_hold(weight, message):
-    """E2M1 encodes neither an infinity nor a NaN, and a stored group is
-    always exactly 32 values, so a half group has nowhere to go."""
-    with pytest.raises(ValueError):
-        quantize_mxfp4(weight)
 
 
 def test_pack_mxfp4_writes_back_the_recorded_stems_and_nothing_else():

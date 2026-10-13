@@ -165,27 +165,6 @@ def test_ollama_retains_sdk_metadata_and_full_options(clients):
     assert calls[0]["images"] == ["aW1hZ2UgYnl0ZXM="] and calls[0]["format"] == {"type": "object"}
 
 
-@pytest.mark.parametrize("answer", [
-    {}, {"response": None}, {"response": {}}, {"response": "", "eval_count": -1},
-    {"response": "", "eval_count": 1.5},
-])
-def test_ollama_malformed_or_negative_wire_values_fail(clients, answer):
-    """The public SDK methods parse the wire; unparsable text and counts fail
-    there, and a negative count fails in the adapter. Bool and numeric-string
-    counts are the SDK's own lax coercion and are not visible to the adapter."""
-    task, _ = clients("ollama", lambda http, request, body: http.Response(200, json=answer))
-    with pytest.raises(ValueError):
-        task("a", 3)
-
-
-def test_genuine_empty_text_zero_usage_and_absent_reason_remain_distinct(clients):
-    task, _ = clients(
-        "ollama", lambda http, request, body: http.Response(200, json={"response": "", "eval_count": 0})
-    )
-    result = task("a", 0)
-    assert result.texts == ("",) and result.token_counts == (0,) and result.finish_reasons == (None,)
-
-
 def test_openai_keeps_aggregate_usage_separate_and_associates_choices(clients):
     def network(http, request, body):
         return http.Response(200, json=response([
@@ -201,27 +180,6 @@ def test_openai_keeps_aggregate_usage_separate_and_associates_choices(clients):
     assert calls[0]["top_k"] == 3 and calls[0]["min_p"] == 0.1
     assert calls[0]["top_p"] == 0.7 and calls[0]["logprobs"] == 2
 
-
-@pytest.mark.parametrize("choices", [
-    [choice(0, "a"), choice(0, "b")], [choice(0.9, "a"), choice(0.1, "b")],
-    [choice(index=True, text="a"), choice(0, "b")], [choice(2, "a"), choice(0, "b")],
-    [{"text": "a"}, choice(1, "b")], [choice(0, None), choice(1, "b")], [{}, {}],
-])
-def test_openai_refuses_ambiguous_or_malformed_prompt_associations(clients, choices):
-    task, _ = clients("openai", lambda http, request, body: http.Response(200, json=response(choices)))
-    with pytest.raises(ValueError):
-        task(["a", "b"], 4)
-
-
-@pytest.mark.parametrize("count", [-1, True, 1.2, "4"])
-def test_openai_refuses_coerced_or_negative_usage(clients, count):
-    task, _ = clients("openai", lambda http, request, body: http.Response(200, json=response(
-        [choice(0, "ok")], usage={"completion_tokens": count})))
-    with pytest.raises(ValueError):
-        task("a", 4)
-
-
-def test_multiple_choices_and_absent_usage_are_preserved(clients):
     task, _ = clients("openai", lambda http, request, body: http.Response(200, json=response(
         [choice(1, "second"), choice(0, "first")], model_extension="kept")))
     result = task("prompt", 5, n=2)

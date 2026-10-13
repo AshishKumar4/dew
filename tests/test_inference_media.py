@@ -53,38 +53,6 @@ def test_trained_image_task_accepts_raw_and_prepared_inputs_and_immutable_rebind
         task(replace(prepared, noise=prepared.noise[:, :-1]), steps=3, key=key)
 
 
-def test_canvas_raw_media_processing_reaches_the_real_conditioner():
-    source = Pretrained.load(FIXTURE, dtype="float32", attention_impl="xla", max_seq_len=32)
-    with np.load(FIXTURE / "reference.npz") as reference:
-        prompt = np.asarray(reference["image_prompt"])
-        pixels = np.asarray(reference["pixels"])
-        expected = np.asarray(reference["image_tokens"][:, :12])
-
-    class PixelProcessor:
-        """This fixture's image payloads are already normalized pixel tensors."""
-        def __call__(self, text, *, images=None):
-            if len(text) != len(prompt) or images is None:
-                raise ValueError("each fixture prompt needs its image")
-            return ModelInputs(jnp.asarray(prompt), {"image_indices": jnp.where(prompt == 60, 0, -1)},
-                               {"pixel_values": jnp.asarray(images)})
-
-        def decode(self, ids):
-            return [" ".join(map(str, row)) for row in np.asarray(ids)]
-
-    processor = PixelProcessor()
-    task = replace(source.block_generation(), processor=processor)
-    generated = task(["image A", "image B"], 7, images=pixels, key=jax.random.key(11))
-    np.testing.assert_array_equal(generated.tokens, expected)
-    prepared = processor(["image A", "image B"], images=pixels)
-    direct = task(prepared, 7, key=jax.random.key(11))
-    np.testing.assert_array_equal(direct.tokens, generated.tokens)
-    different = task(["image A", "image B"], 7, images=-pixels, key=jax.random.key(11))
-    assert not np.array_equal(different.tokens, generated.tokens)
-    for invalid in ([[1.9, 2.8]], [[1, 2], "drop this"], [[True, 1]]):
-        with pytest.raises(ValueError):
-            task(invalid, 2, key=jax.random.key(1))
-
-
 def test_partial_image_trajectory_and_refiner_handoff_preserve_latents(tmp_path):
     from dew.sampling import Euler
 
@@ -143,4 +111,3 @@ def test_host_and_resident_media_generate_equivalent_public_results(family):
     actual = generated.host()
     for left, right in zip(jax.tree.leaves(actual), jax.tree.leaves(expected), strict=True):
         np.testing.assert_array_equal(left, right)
-

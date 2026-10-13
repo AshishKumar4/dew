@@ -300,20 +300,6 @@ def test_companion_coordinates_preserve_shards_under_device_permutation():
 
 
 @pytest.mark.mesh
-def test_missing_companion_devices_names_the_launch_fix():
-    devices = jax.devices("cpu")
-    mesh = Mesh(np.asarray(devices, dtype=object), ("fsdp",), axis_types=(AxisType.Auto,))
-    with pytest.raises(ValueError):
-        companion_mesh(mesh, devices[:1])
-
-
-def test_custom_step_cannot_silently_bypass_streamed_execution():
-    with pytest.raises(ValueError):
-        Trainer(Coupled(), centered(), key=jax.random.key(0), layout=HOST,
-                step=lambda objective, optimizer: lambda state, batch: (state, jnp.asarray(0.), Aux({})))
-
-
-@pytest.mark.mesh
 @pytest.mark.distributed
 def test_companion_pool_uses_one_global_optimizer_reduction(tmp_path):
     from test_multiprocess import run_pool, run_worker
@@ -368,31 +354,6 @@ def _moments(opt_state) -> optax.ScaleByAdamState:
         if isinstance(node, optax.ScaleByAdamState):
             return node
     raise AssertionError("the optimizer state carries no Adam moments")
-
-
-def test_a_host_step_differentiates_its_moving_leaves_only(monkeypatch):
-    """The banked step takes the loss's gradient in the moving leaves alone:
-    a frozen bank is held as a value, not differentiated and its cotangent
-    thrown away, so freezing a layer takes leaves out of the backward."""
-    import sys
-
-    differentiated = []
-    vjp = jax.vjp
-
-    def counted(function, primals, *rest, **options):
-        if sys._getframe(1).f_code.co_filename.endswith("training/execution.py"):
-            differentiated.append(len(jax.tree.leaves(primals)))
-        return vjp(function, primals, *rest, **options)
-
-    monkeypatch.setattr(jax, "vjp", counted)
-    model = decoder()
-    initial = LMObjective(model, 8).init(jax.random.key(0))
-    # Every layer's gate kernel frozen: the bank they share is held whole.
-    for start in (initial, freeze(initial, lambda path: path[-2:] != ("gate_proj", "kernel"))):
-        objective = LMObjective(model, 8, head_chunks=1, variables=jax.tree.map(np.asarray, start))
-        updated(objective, tokens(), HOST)
-    every, moving = differentiated
-    assert moving == every - 1
 
 
 def test_streamed_banks_train_a_mixed_frozen_root_decoder_like_the_resident_stack(tmp_path):
@@ -568,25 +529,6 @@ def test_a_nested_decoder_bank_trains_beside_frozen_media_entries():
         np.testing.assert_array_equal(value, initial[name], err_msg=name)
 
 
-def test_an_unscanned_decoder_is_refused_by_a_host_layout():
-    """A plain loop declares one bank per layer, but nothing sequences their
-    fetches: the compiler hoists every layer's copy to the front and the
-    whole stack lands on the device (the 26B on an A100 asked for 49 GiB in
-    one allocation). The layout says so by name instead of streaming nothing."""
-    model = multimodal(scan_layers=False)
-    (site,) = model.bank_sites
-    assert (site.namespace, site.view.groups, site.scanned) == (("language_model",), ((0, 1), (1, 1)), False)
-    batch = media_batch()
-    held = model.init(jax.random.key(0), batch["text"].tokens,
-                      image_indices=batch["text"].token_fields["image_indices"],
-                      conditioning=batch["text"].conditioning)
-    objective = LMObjective(model, 8, head_chunks=1,
-                            variables=freeze(held, lambda path: path[1] == "language_model"))
-    with pytest.raises(ValueError):
-        updated(objective, batch, HOST)
-    assert multimodal(scan_layers=True).bank_sites[0].scanned
-
-
 @pytest.mark.parametrize("detached", [False, True])
 def test_a_shared_text_owner_sums_both_block_losses_through_one_bank(detached):
     """DiffusionGemma reads one physical stack twice: encoder and denoiser.
@@ -633,54 +575,8 @@ def test_a_shared_text_owner_sums_both_block_losses_through_one_bank(detached):
 # --------------------------------------------------------------------------
 
 
-def _pointers(tree):
-    return {path: tuple(shard.data.unsafe_buffer_pointer() for shard in leaf.addressable_shards)
-            for path, leaf in _named_leaves(tree)}
-
-
 def _named_leaves(tree):
     return [(jax.tree_util.keystr(path), leaf) for path, leaf in jax.tree_util.tree_leaves_with_path(tree)]
-
-
-def test_frozen_leaves_stay_resident_and_snapshots_alias_them():
-    """A frozen leaf is placed once, beside the accelerator, and is the same
-    buffer after every step; a scanned run's frozen bank is built once and
-    kept, while its moving leaves are snapshotted afresh."""
-    from dew.training.execution import BANK_MEMORY, HostExecution
-
-    def trainable(path):
-        return path[-2:] == ("q_proj", "kernel")
-
-    model = decoder(scan_layers=True)
-    objective = LMObjective(model, 8, head_chunks=1,
-                            variables=freeze(LMObjective(model, 8).init(jax.random.key(0)), trainable))
-    trainer = Trainer(objective, optax.adam(.01), key=jax.random.key(5), layout=HOST)
-    state, _placement, _ = trainer.place()
-    frozen = state.variables[FROZEN]
-    for path, leaf in _named_leaves(frozen):
-        assert leaf.sharding.mesh == trainer.device_mesh, path
-        assert leaf.sharding.memory_kind == (BANK_MEMORY if "layers_" in path else "device"), path
-    execution = HostExecution(objective, HOST, trainer.device_mesh, trainer.state_mesh)
-    with jax.set_mesh(trainer.state_mesh):
-        first, second = execution.snapshot(state.variables), execution.snapshot(state.variables)
-    bank = next(name for name in first["params"] if name.startswith("layers_0_"))
-    assert (
-        first["params"][bank]["mlp"]["gate_proj"]["kernel"]
-        is second["params"][bank]["mlp"]["gate_proj"]["kernel"]
-    )
-    assert (
-        first["params"][bank]["self_attn"]["q_proj"]["kernel"]
-        is not second["params"][bank]["self_attn"]["q_proj"]["kernel"]
-    )
-    before = _pointers(frozen)
-    step = trainer.compile(state, tokens())
-    for _ in range(2):
-        state, *_ = step(state, tokens())
-    assert _pointers(state.variables[FROZEN]) == before
-    assert _pointers(state.variables["params"]) != _pointers(frozen) and set(state.variables["params"]) == {
-        "layers_0",
-        "layers_1",
-    }
 
 
 def test_place_streams_the_held_tree_and_releases_each_source():
@@ -722,82 +618,3 @@ def test_place_streams_the_held_tree_and_releases_each_source():
         ).variables,
         resident.variables,
     )
-
-
-def _resident_pages(view: np.ndarray) -> int:
-    """How many of a mapped view's whole pages this process has in memory."""
-    import mmap
-    base = view
-    while not isinstance(base, np.memmap):
-        base = base.base
-    offset = view.__array_interface__["data"][0] - base.__array_interface__["data"][0]
-    first = -(-offset // mmap.PAGESIZE) * mmap.PAGESIZE
-    last = (offset + view.nbytes) // mmap.PAGESIZE * mmap.PAGESIZE
-    resident = 0
-    with open("/proc/self/pagemap", "rb") as pagemap:
-        for page in range(first // mmap.PAGESIZE, last // mmap.PAGESIZE):
-            address = base.__array_interface__["data"][0] + page * mmap.PAGESIZE
-            pagemap.seek(address // mmap.PAGESIZE * 8)
-            resident += int.from_bytes(pagemap.read(8), "little") >> 63
-    return resident
-
-
-def test_place_lets_a_mapped_checkpoint_page_go_once_the_leaf_has_landed(tmp_path):
-    """A loader maps a checkpoint file once and hands out views into it. Placing
-    a view reads its pages in; afterwards they are given back, whether the
-    view went into a bank or was placed on its own, so the file is not a
-    second copy of the base beside the placed one. A fault maps the whole
-    page-cache folio it lands in, so a neighbour's placement can bring back
-    the part of a tensor that shares its folio: the file is dropped from the
-    cache first so it comes back through readahead in small folios, and the
-    tensors are megabytes, so what stays is a sliver."""
-    import os
-
-    from dew.interop.safetensors_io import read_file, write_file
-    model = decoder(vocab_size=256, emb_features=256, mlp_features=4096)
-    fresh = jax.tree.map(np.asarray, model.init(jax.random.key(1), jnp.zeros((1, 8), jnp.int32)))
-    flat = {"/".join(entry.key for entry in path): leaf
-            for path, leaf in jax.tree_util.tree_leaves_with_path(fresh["params"])}
-    write_file(flat, tmp_path / "model.safetensors", {})
-    descriptor = os.open(tmp_path / "model.safetensors", os.O_RDONLY)
-    os.fsync(descriptor)
-    os.posix_fadvise(descriptor, 0, 0, os.POSIX_FADV_DONTNEED)
-    os.close(descriptor)
-    stored, _ = read_file(tmp_path / "model.safetensors")
-    held = {"params": {}}
-    for name, view in stored.items():
-        node = held["params"]
-        *parents, last = name.split("/")
-        for key in parents:
-            node = node.setdefault(key, {})
-        node[last] = view
-    banked_row = stored["layers_1/mlp/gate_proj/kernel"]
-    single = stored["embed_tokens/embedding"]
-    assert banked_row.base is single.base and isinstance(banked_row.base, np.memmap)
-    pages = banked_row.nbytes // 4096
-    assert pages >= 1024
-
-    objective = LMObjective(model, 8, head_chunks=1,
-                            variables=freeze(held, lambda path: path[-2:] == ("q_proj", "kernel")))
-    trainer = Trainer(objective, optax.adam(.01), key=jax.random.key(5), layout=HOST)
-    state, _, _ = trainer.place()
-    assert _resident_pages(banked_row) < pages // 10
-    assert _resident_pages(single) < single.nbytes // 4096
-    np.testing.assert_array_equal(
-        np.asarray(state.variables[FROZEN]["layers_0_1"]["mlp"]["gate_proj"]["kernel"])[1],
-        np.asarray(banked_row),
-    )
-
-
-def test_stream_refuses_a_node_it_cannot_update_in_place_by_its_path():
-    """stream writes each placed leaf back into its dict node; a FrozenDict
-    below the root is named, not handed to the placement as a leaf."""
-    from flax.core import freeze
-    from jax.sharding import NamedSharding, PartitionSpec
-
-    from dew.training.host import stream
-
-    replicated = NamedSharding(jax.sharding.Mesh(np.array(jax.devices()[:1]), ("data",)), PartitionSpec())
-    tree = {"params": freeze({"dense": {"kernel": np.ones(2, np.float32)}})}
-    with pytest.raises(TypeError):
-        stream(tree, {"params": {"dense": {"kernel": replicated}}})

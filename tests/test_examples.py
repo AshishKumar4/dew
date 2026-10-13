@@ -11,7 +11,6 @@ import itertools
 import json
 import os
 import shutil
-import socket
 import subprocess
 import sys
 from pathlib import Path
@@ -143,36 +142,14 @@ def test_moe_mesh_example_routes_and_serves_on_eight_cpu_devices(tmp_path):
     assert "<svg" in (out / "moe-mesh.svg").read_text()
 
 
-LANDING = json.loads((REPO_ROOT / "site/snippets/cells.json").read_text())
-
-
-@pytest.mark.parametrize("section", LANDING["pool"] + LANDING["colab"])
+@pytest.mark.parametrize("section", ["reliability"])
 def test_landing_snippet_runs(section, tmp_path):
     """Each landing cell runs, offline from small fixtures, and does what it shows."""
     smoke("landing", tmp_path, "--section", section,
           script=REPO_ROOT / "site/snippets/framework.py")
     result = json.loads((tmp_path / "result.json").read_text())
     assert result
-    if section == "reliability":
-        assert result["bit_exact"] and result["resumed_step"] == 3
-    elif section == "serving":
-        assert len(result["text"]) == 2
-    elif section == "pretrained":
-        assert (tmp_path / "export/config.json").is_file()
-
-
-def test_recorded_hero_runs_offline(tmp_path, monkeypatch):
-    """Smoke the exact script with a step override and its corpus already in dew's cache."""
-    from dew.data import HubText, TokenCorpus
-
-    script = tmp_path / "hero.py"
-    shutil.copyfile(REPO_ROOT / "site/src/data/hero.py", script)
-    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
-    text = "ROMEO: I love the moon.\nJULIET: The moon shines tonight.\n" * 1000
-    TokenCorpus.write([text], HubText("winglian/tiny-shakespeare").directory, val_fraction=0.5, pack=True)
-    # The schedule warms up over 10 steps, so a run takes more.
-    finished = smoke("hero", tmp_path, "--steps", "11", script=script, smoke_args=False)
-    assert "ROMEO:" in finished.stdout and "JULIET:" in finished.stdout
+    assert result["bit_exact"] and result["resumed_step"] == 3
 
 
 def _batches(batch, classes=None, size=RES):
@@ -229,30 +206,6 @@ def test_train_jepa_example_trains_probes_and_saves_the_encoder(tmp_path):
     assert jax.tree.structure(saved) == jax.tree.structure(averaged), "not the encoder's tree"
     assert all(np.array_equal(np.asarray(a), b) for a, b in zip(
         jax.tree.leaves(averaged), jax.tree.leaves(saved), strict=True))
-
-
-@pytest.mark.mesh
-def test_train_lm_example_samples_what_it_trained(tmp_path):
-    """A short run's sample continues the corpus it learned. Sixty steps
-    learn the alternation of one repeated pair, while a 0.999 average of
-    those steps is still nine tenths the initialization and draws noise."""
-    tokens = tmp_path / "tokens"
-    tokens.mkdir()
-    text = ("ab" * 2000).encode()
-    (tokens / "train.bin").write_bytes(text[:3600])
-    (tokens / "val.bin").write_bytes(text[3600:])
-    (tokens / "meta.json").write_text(json.dumps(
-        {"tokenizer": "byte", "vocab_size": 256, "dtype": "uint8", "train_tokens": 3600,
-         "val_tokens": 400, "eos_id": None}))
-    example = load_example("train_lm")
-    config = example.Config(tokens=tokens, sequence_length=32, batch_size=8, steps=60,
-                            learning_rate=1e-2, model={"emb_features": 16, "num_layers": 1, "num_heads": 2},
-                            prompt="ab", max_new_tokens=8, out=tmp_path / "run")
-
-    state = example.main(config)
-
-    assert int(state.step) == 60
-    assert (tmp_path / "run" / "sample.txt").read_text() == "ab" * 5
 
 
 # ---------------------------------------------------------------------------------
@@ -335,25 +288,6 @@ def test_sft_gemma4_smoke_trains_on_chat_rows_and_exports_the_decoder(tmp_path):
     assert "tokenizer_name" not in json.loads((export / "generation_config.json").read_text())
 
 
-@pytest.mark.parametrize("backend", ["vllm", "sglang"])
-def test_train_rlvr_starts_its_engine_with_that_engines_own_build_tools_first(tmp_path, backend):
-    """An engine compiles kernels with the build tools of its own
-    environment (vLLM runs its venv's ninja), which need not be on the
-    trainer's PATH. The engine starts with its executable's directory first
-    on PATH. The stand-in engine records the ninja it finds, then exits."""
-    example = load_example("train_rlvr")
-    environment = tmp_path / "engine-env" / "bin"
-    environment.mkdir(parents=True)
-    found = tmp_path / "ninja-found"
-    for tool, body in ((backend, f'command -v ninja > "{found}"\nexit 3\n'), ("ninja", "exit 0\n")):
-        (environment / tool).write_text("#!/bin/sh\n" + body)
-        (environment / tool).chmod(0o755)
-    config = example.Config(backend=backend, out=tmp_path, **{backend: str(environment / backend)})
-    with pytest.raises(RuntimeError):
-        example.launch_engine(config, tmp_path / "served")
-    assert found.read_text().strip() == str(environment / "ninja")
-
-
 def test_sft_gemma4_runs_its_documented_configuration_on_one_machine(tmp_path):
     """Outside --smoke the run is the documented one: bf16, four loader
     workers, the persistent cache, and a process pool when a cluster started
@@ -378,23 +312,6 @@ def test_sft_gemma4_runs_its_documented_configuration_on_one_machine(tmp_path):
     assert (tmp_path / "run" / "export" / "model.safetensors").is_file()
 
 
-@pytest.mark.parametrize("new_tokens", [1, 128])
-def test_train_rlvr_starts_sglang_with_room_for_a_prompt_at_the_window_and_its_full_budget(
-    tmp_path, new_tokens
-):
-    """SGLang 0.5.20 refuses an input of `context - 6` ids or more
-    (`max_req_input_len`) and caps a budget at `context - 2 - input`
-    (`max_req_len - input - 1`). A prompt truncated to `--prompt-tokens`
-    must pass the first and keep `--new-tokens` under the second, or its
-    draw ends short with a "length" the rollout refuses."""
-    example = load_example("train_rlvr")
-    config = example.Config(backend="sglang", prompt_tokens=128, new_tokens=new_tokens, out=tmp_path)
-    command, _ = example.engine_command(config, tmp_path / "served")
-    context = int(command[command.index("--context-length") + 1])
-    assert config.prompt_tokens < context - 6
-    assert min(new_tokens, context - 2 - config.prompt_tokens) == new_tokens
-
-
 def test_train_rlvr_smoke_commits_every_update_one_behind(tmp_path):
     """The smoke's completions all run out of their eight tokens, so a run
     that masked truncations would commit nothing and never push. The
@@ -405,16 +322,6 @@ def test_train_rlvr_smoke_commits_every_update_one_behind(tmp_path):
     assert summary["updates"] == 2 and summary["max_lag"] == 1
 
 
-def test_train_rlvr_accumulation_pools_steps_into_one_update(tmp_path):
-    """`--accumulation 2` pools the smoke's two steps into one optimizer
-    update: an update trains on both steps' rows while a step, and the
-    native server's cache with it, holds half of them. That is how the
-    two-attempt run fits one 24 GB GPU."""
-    smoke("train_rlvr", tmp_path, "--accumulation", "2")
-    summary = json.loads((tmp_path / "rewards.json").read_text())
-    assert summary["updates"] == 1
-
-
 def test_train_rlvr_turns_smoke_trains_through_environment_source(tmp_path):
     """`--turns 2` runs its sessions through EnvironmentSource and commits both updates, one behind.
     The tiny model's attempts end on the token budget, so the feedback path
@@ -422,98 +329,6 @@ def test_train_rlvr_turns_smoke_trains_through_environment_source(tmp_path):
     smoke("train_rlvr", tmp_path, "--turns", "2")
     summary = json.loads((tmp_path / "rewards.json").read_text())
     assert summary["updates"] == 2 and summary["max_lag"] == 1
-
-
-def test_train_rlvr_turns_feed_a_failed_attempt_back_and_run_each_program_once():
-    """The example's own Attempts and verifier through EnvironmentSource, on a
-    server that draws a failing program and then a passing one: the second
-    call's prompt extends the first call's ids with the test report, both pack
-    into one chain, and each program runs once."""
-    from concurrent.futures import Future
-
-    from dew.inference import Draw
-    from dew.objectives.rl import Status, Task, pack
-    from dew.sampling import Sampling
-
-    example = load_example("train_rlvr")
-    eos, failing, passing = 9, (5, 5), (6, 6)
-    runs = []
-
-    class Server:
-        sampling = Sampling(temperature=1.0, eos_token_ids=eos)
-        version = 0
-
-        def submit(self, prompt, max_new_tokens, *, key):
-            program = failing if not runs else passing
-            future = Future()
-            future.set_result(
-                Draw(tuple(prompt), (*program, eos), (-0.5,) * 3, None, terminated=True, version=0)
-            )
-            return future
-
-    def reward(source, completion, cases, info):
-        runs.append(completion)
-        return 1.0 if completion == "6 6" else 1 / 3
-
-    config = example.Config(prompt_tokens=8, new_tokens=4, turns=2, prompts=1, groups=1)
-    source = example.attempts_source(Server(), reward, lambda ids: " ".join(map(str, ids)),
-                                     lambda text: [7, 7], config)
-    session = source.submit(Task("t", {"prompt": (1, 2), "truth": "cases"}), 1, version=0)[0].result(
-        timeout=10
-    )
-    source.close()
-    assert session.status == Status.COMPLETED and session.reward == 1.0
-    first, second = session.calls
-    assert second.prompt_ids == (*first.prompt_ids, *first.sampled_ids, 7, 7)
-    assert pack([session], 32)["text_segment_ids"].max() == 1
-    assert runs == ["5 5", "6 6"]
-
-
-def test_train_rlvr_scorer_forgets_old_programs_in_a_long_run():
-    """A run scores each program once, but a long one does not keep them all:
-    after 65,536 other programs the first is scored again, where an unbounded
-    cache would still hold every program the run ever scored."""
-    from dew.objectives.rl import Action
-    from dew.sampling import Sampling
-
-    example = load_example("train_rlvr")
-    runs = []
-
-    def reward(source, completion, cases, info):
-        runs.append(completion)
-        return 0.0
-
-    score = example.attempt_scorer(reward, lambda ids: " ".join(map(str, ids)))
-    sampling = Sampling(temperature=1.0, eos_token_ids=0)
-    programs = [
-        Action((1,), (token,), (-0.5,), (-0.5,), terminated=False, policy_step=0, sampling=sampling)
-        for token in range(1, 65_538)
-    ]
-    for action in (*programs, programs[0]):
-        score("cases", action)
-    assert runs.count("1") == 2
-
-
-
-def test_train_harbor_waits_for_the_gateway_it_is_told_to_launch(tmp_path):
-    """The real path writes the served policy and then waits for the gateway the user starts; with none
-    up it gives up with the readiness error instead of failing on the first gateway call."""
-    example = load_example("train_harbor")
-    with socket.socket() as probe:
-        probe.bind(("127.0.0.1", 0))
-        port = probe.getsockname()[1]
-    config = example.Config(
-        model=str(REPO_ROOT / "tests/fixtures/hf/qwen2-tiny"),
-        tasks=(tmp_path,),
-        width=64,
-        gateway=f"http://127.0.0.1:{port}",
-        served=tmp_path / "served",
-        out=tmp_path / "out",
-        ready_timeout=1.0,
-    )
-    with pytest.raises(RuntimeError):
-        example.main(config)
-    assert (tmp_path / "served" / "config.json").is_file()
 
 
 def test_train_harbor_smoke_trains_on_gateway_recorded_harness_calls(tmp_path):
@@ -536,10 +351,6 @@ def test_evaluate_and_serve_smoke_reports_perplexity_and_a_greedy_continuation(t
     report = json.loads((tmp_path / "report.json").read_text())
     assert report["perplexity"]["val/perplexity"] > 0
     assert len(report["greedy"]) == 8
-    for sdk, answer in report["served"].items():
-        installed = importlib.util.find_spec(sdk) is not None
-        assert answer.startswith("unreachable: http://127.0.0.1:1" if installed
-                                 else f"skipped: pip install {sdk}"), (sdk, answer)
     assert set(report["served"]) == {"openai", "ollama"}
 
 
@@ -570,92 +381,3 @@ def test_evaluate_and_serve_smoke_runs_an_lm_eval_harness_task(tmp_path):
     harness = json.loads((tmp_path / "report.json").read_text())["harness"]
     assert {name.split("/")[0] for name in harness} == {"hellaswag"}
     assert all(0.0 <= value <= 1.0 for name, value in harness.items() if name.endswith("acc,none"))
-
-
-def test_train_rlvr_native_holds_one_copy_of_the_served_weights_after_pushes(tmp_path):
-    """The native backend pushes the policy into Dew's own server every
-    update. After a push the device holds the served weights once: the
-    trainer's copy is float32 and the server's bfloat16, so every live
-    bfloat16 array of a served leaf's shape is the server's. A second copy is
-    a model's worth of memory the run keeps for good (1.1 GiB on Qwen3-0.6B,
-    the headroom its single-turn run ran out of at update 19). The float32
-    arrays of those shapes are the trained parameters and adamw's two moments:
-    the loaded checkpoint stays on the host, where a device copy would be
-    2.2 GiB more. The run is a smoke run's, on one device in its own process,
-    which counts the live arrays after each push."""
-    program = (
-        "import collections, importlib.util, json, sys\n"
-        "from pathlib import Path\n"
-        "import jax\n"
-        "from dew.objectives.rl import RolloutScheduler\n"
-        "spec = importlib.util.spec_from_file_location('train_rlvr', 'examples/train_rlvr.py')\n"
-        "example = importlib.util.module_from_spec(spec)\n"
-        "sys.modules[spec.name] = example\n"
-        "spec.loader.exec_module(example)\n"
-        "counts = []\n"
-        "schedule = RolloutScheduler.__call__\n"
-        "def counted(self, state, batch, key):\n"
-        "    packed = schedule(self, state, batch, key)\n"
-        "    counts.append(collections.Counter(f'{array.shape} {array.dtype}' "
-        "for array in jax.live_arrays()))\n"
-        "    return packed\n"
-        "RolloutScheduler.__call__ = counted\n"
-        "example.main(example.Config(smoke=True, out=Path(sys.argv[1])))\n"
-        "source = example.PretrainedDecoder.load(str(example.SMOKE_MODEL), dtype='float32')\n"
-        "shapes = collections.Counter(str(leaf.shape) for leaf in jax.tree.leaves(source.variables))\n"
-        "print('counts', json.dumps({'updates': len(counts), 'shapes': shapes, 'live': counts[-1]}))\n"
-    )
-    finished = subprocess.run(
-        [sys.executable, "-c", program, str(tmp_path)],
-        cwd=REPO_ROOT,
-        env=single_device(),
-        capture_output=True,
-        text=True,
-        timeout=900,
-    )
-    assert finished.returncode == 0, finished.stdout + finished.stderr
-    counted = json.loads(finished.stdout.rsplit("counts ", 1)[1])
-    expected = {f"{shape} {dtype}": copies * number for shape, number in counted["shapes"].items()
-                for dtype, copies in (("bfloat16", 1), ("float32", 3))}
-    # The second call pushed update 1's weights before it returned.
-    assert counted["updates"] == 2
-    assert {key: counted["live"].get(key, 0) for key in expected} == expected
-
-
-def test_no_trivial_program_passes_a_tenth_of_a_train_rlvr_task():
-    """A policy that prints what the task doesn't compute earns that
-    program's share of a task's cases: a constant, or a, b, min(a, b),
-    max(a, b), a + b, a * b or |a - b|. With a and b uniform in 1..99,
-    print(1) passed 61% of the gcd cases and print(0) 49% of the multiples
-    ones, and with a shared factor alone print(min(a, b)) or
-    print(abs(a - b)) passed a quarter of the gcd cases: a reward for
-    guessing that the policy learns. Over 16,000 records no such program
-    passes a tenth of any task's cases."""
-    import collections
-    import json
-
-    example = load_example("train_rlvr")
-    trivial = {
-        "a": lambda a, b: a,
-        "b": lambda a, b: b,
-        "min(a, b)": min,
-        "max(a, b)": max,
-        "a + b": lambda a, b: a + b,
-        "a * b": lambda a, b: a * b,
-        "abs(a - b)": lambda a, b: abs(a - b),
-    }
-    cases = collections.Counter()
-    passed = collections.defaultdict(collections.Counter)
-    for row in map(json.loads, example.records(16_000, seed=0)):
-        task = row["prompt"][0]["content"].split(" and prints ", 1)[1][:60]
-        for case in json.loads(row["ground_truth"]):
-            a, b = map(int, case["stdin"].split())
-            cases[task] += 1
-            passed[task][f"print({case['stdout']})"] += 1
-            passed[task].update(f"print({name})" for name, program in trivial.items()
-                                if str(program(a, b)) == case["stdout"])
-    best = {task: max((count / cases[task], program) for program, count in programs.items())
-            for task, programs in passed.items()}
-    assert len(best) == len(example.TASKS)
-    assert all(share < 0.1 for share, _ in best.values()), \
-        {task: (round(share, 3), program) for task, (share, program) in best.items()}

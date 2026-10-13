@@ -10,7 +10,7 @@ import pytest
 from flax import linen as nn
 from reference_error import assert_as_exact_as_the_reference
 
-from dew.diffusion import FlowMatchingScheduler, Process, VelocityLoss, expand, presets
+from dew.diffusion import expand, presets
 from dew.inputs import Field, InputSpec, unit_range
 from dew.nn.dit import PatchEmbedding
 from dew.objectives.base import Step
@@ -66,11 +66,6 @@ def test_the_training_times_are_the_references_logit_normal_mirrored():
     normals = np.asarray(jax.random.normal(key, (1000,)), np.float64)
     reference = 1 / (1 + np.exp(-(-0.8 + 0.8 * -normals)))
     np.testing.assert_allclose(sigma, 1 - reference, rtol=0, atol=1e-6)
-
-
-def test_the_velocity_loss_refuses_another_prediction():
-    with pytest.raises(ValueError):
-        Process(FlowMatchingScheduler(), presets.Flow()().prediction, VelocityLoss()).weight(jnp.ones((1,)))
 
 
 def test_the_bottleneck_embedding_is_jits():

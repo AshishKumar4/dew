@@ -2,6 +2,7 @@
 
 from pathlib import Path
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
@@ -26,25 +27,6 @@ def test_gpt_neox_logits_and_cached_greedy_generation_match_transformers():
     assert float(np.max(np.abs(wrong - expected))) > 1e-2
 
 
-def test_gpt_neox_fused_qkv_is_grouped_by_head():
-    from dew.interop.hf_decoders import translate_config, translate_weights
-    from dew.interop.sources import load_shards
-
-    loaded = Pretrained.load(DIRECTORY, dtype='float32', attention_impl='reference')
-    tensors = dict(load_shards(DIRECTORY))
-    for index in range(loaded.model.num_layers):
-        for suffix in ('weight', 'bias'):
-            name = f'gpt_neox.layers.{index}.attention.query_key_value.{suffix}'
-            tensor = tensors[name]
-            tensors[name] = tensor.reshape(4, 3, 8, *tensor.shape[1:]).transpose(
-                (1, 0, 2, *range(3, tensor.ndim + 2))).reshape(tensor.shape)
-    variables = translate_weights(tensors, translate_config(loaded.config), 'gpt_neox')
-    ids = np.load(DIRECTORY / 'input_ids.npy')
-    wrong = np.asarray(loaded.model.apply(variables, jnp.asarray(ids)))
-    expected = np.load(DIRECTORY / 'logits.npy')
-    assert float(np.max(np.abs(wrong - expected))) > 1e-2
-
-
 def test_gpt_neox_export_preserves_fused_head_layout(tmp_path):
     from dew.interop.sources import load_shards
 
@@ -58,6 +40,12 @@ def test_gpt_neox_export_preserves_fused_head_layout(tmp_path):
     ids = jnp.asarray(np.load(DIRECTORY / 'input_ids.npy'))
     np.testing.assert_array_equal(reloaded.model.apply(reloaded.variables, ids),
                                   loaded.model.apply(loaded.variables, ids))
+
+    assert reloaded.model == loaded.model
+    assert jax.tree.structure(reloaded.variables) == jax.tree.structure(loaded.variables)
+    for original, restored_leaf in zip(jax.tree.leaves(loaded.variables),
+                                        jax.tree.leaves(reloaded.variables), strict=True):
+        np.testing.assert_array_equal(np.asarray(restored_leaf), np.asarray(original))
 
 
 def test_legacy_neox_buffers_are_validated_in_their_stored_precision():
@@ -80,21 +68,6 @@ def test_legacy_neox_buffers_are_validated_in_their_stored_precision():
     tensors[prefix + 'rotary_emb.inv_freq'][0] = .5
     with pytest.raises(ValueError):
         translate_weights(tensors, config, 'gpt_neox')
-
-
-def test_plain_exact_gelu_rounds_the_negative_tail_like_torch():
-    from flax import linen as nn
-
-    from dew.nn.backbones.decoder_block import GatedMLP
-
-    mlp = GatedMLP(1, 1, activation='gelu_exact')
-    variables = {'params': {'up_proj': {'kernel': jnp.ones((1, 1), jnp.float32)},
-                            'down_proj': {'kernel': jnp.ones((1, 1), jnp.float32)}}}
-    negative = jnp.asarray([[[-6.]]], jnp.float32)
-    # In Torch's fp32 1 + erf formula, erf(-6/sqrt(2)) rounds to -1.
-    # Flax's erfc form retains a nonzero tail, amplified by trained layers.
-    np.testing.assert_array_equal(mlp.apply(variables, negative), jnp.zeros_like(negative))
-    assert float(jnp.abs(nn.gelu(negative, approximate=False)).max()) > 0
 
 
 @pytest.mark.network

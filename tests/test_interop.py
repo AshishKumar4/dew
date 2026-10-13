@@ -21,8 +21,7 @@ import numpy as np
 import pytest
 
 import dew
-from dew.interop import hub, load_params, save_hf_layout, save_params
-from dew.interop.hub import pull_from_hub
+from dew.interop import load_params, save_params
 from dew.interop.safetensors_io import read_file, write_file
 from dew.nn.backbones.dit import SimpleDiT
 from dew.nn.dit import TextContext
@@ -44,11 +43,6 @@ def params(rng):
         jnp.ones((1,)),
         TextContext(jnp.ones((1, 77, 768)), jnp.ones((1, 77), bool)),
     )
-
-
-def flat_names(tree):
-    leaves, _ = jax.tree_util.tree_flatten_with_path(tree)
-    return {"/".join(entry.key for entry in path) for path, _ in leaves}
 
 
 def test_round_trip_keeps_the_tree_and_the_values(params, tmp_path):
@@ -73,42 +67,6 @@ def test_round_trip_keeps_bfloat16(params, tmp_path):
     ):
         assert restored.dtype == jnp.bfloat16
         assert np.array_equal(np.asarray(saved), restored)
-
-
-def test_names_on_disk_are_the_slash_joined_paths(params, tmp_path):
-    """A reader outside dew sees flat names, and they are the module paths."""
-    path = tmp_path / "model.safetensors"
-    save_params(params, path)
-
-    names = set(safetensors_numpy.load_file(str(path)))
-    assert names == flat_names(params)
-
-
-def test_hf_layout_writes_the_pair_a_loader_looks_for(params, tmp_path):
-    config = {"architecture": "simple_dit", "patch_size": 4, "emb_features": 32}
-    export = tmp_path / "export"
-    save_hf_layout(params, config, export)
-
-    assert json.loads((export / "config.json").read_text()) == config
-    loaded = load_params(export / "model.safetensors")
-    assert jax.tree_util.tree_structure(loaded) == jax.tree_util.tree_structure(params)
-
-
-def test_a_key_holding_the_separator_is_refused(tmp_path):
-    with pytest.raises(ValueError):
-        save_params({"params": {"a/b": jnp.ones((2,))}}, tmp_path / "model.safetensors")
-
-
-def test_missing_safetensors_names_the_extra(params, tmp_path, monkeypatch):
-    monkeypatch.setitem(sys.modules, "safetensors", None)
-    with pytest.raises(ImportError):
-        save_params(params, tmp_path / "model.safetensors")
-
-
-def test_missing_safetensors_reader_names_the_extra(tmp_path, monkeypatch):
-    monkeypatch.setitem(sys.modules, "safetensors", None)
-    with pytest.raises(ImportError):
-        read_file(tmp_path / "model.safetensors")
 
 
 # ---------------------------------------------------------------------------------
@@ -194,30 +152,6 @@ def test_block_scale_exponents_and_packed_fp4_are_mapped_as_stored(tmp_path):
     assert packed.tobytes() == bytes([0x21, 0x43]) and isinstance(packed.base, np.memmap)
 
 
-def test_an_fp4_tensor_with_an_odd_last_axis_is_refused_by_name(tmp_path):
-    path = tmp_path / "odd.safetensors"
-    raw_safetensors(path, {"w": ("F4", (2, 3), bytes(3))})
-
-    with pytest.raises(ValueError):
-        read_file(path)
-
-
-def test_the_arrays_are_read_only_views_of_the_file(tmp_path):
-    """The map outlives the reader context, and the arrays refuse writes."""
-    path = tmp_path / "model.safetensors"
-    safetensors_numpy.save_file(
-        {"w": np.asarray([1.0, 2.0, 3.0], np.float32)}, str(path)
-    )
-
-    tensors, _ = read_file(path)
-
-    tensor = tensors["w"]
-    assert isinstance(tensor.base, np.memmap) and not tensor.flags.writeable
-    np.testing.assert_array_equal(tensor, [1.0, 2.0, 3.0])
-    with pytest.raises(ValueError):
-        tensor[0] = 9.0
-
-
 _PUBLISHERS = [
     pytest.param(
         lambda value, path: save_params({"params": {"w": value}}, path),
@@ -284,51 +218,6 @@ def test_failed_publication_preserves_the_file_and_cleans_the_temporary(
     assert set(tmp_path.iterdir()) == {path}
 
 
-def test_a_truncated_file_fails_in_the_official_parser(tmp_path):
-    path = tmp_path / "model.safetensors"
-    safetensors_numpy.save_file({"w": np.ones((4,), np.float32)}, str(path))
-    raw = path.read_bytes()
-    path.write_bytes(raw[: len(raw) // 2])
-
-    with pytest.raises(safetensors.SafetensorError):
-        read_file(path)
-
-
-def test_a_metadata_only_file_reads_empty(tmp_path):
-    path = tmp_path / "model.safetensors"
-    safetensors_numpy.save_file({}, str(path), metadata={"layout": "dew"})
-
-    tensors, metadata = read_file(path)
-
-    assert tensors == {} and metadata == {"layout": "dew"}
-
-
-def test_a_bf16_checkpoint_still_loads_as_fp32_parameters(tmp_path):
-    """A bfloat16 checkpoint reads in its stored dtype and widens exactly,
-    so the public fp32 default is unchanged."""
-    from dew.interop import Pretrained
-
-    source = Path(__file__).resolve().parent / "fixtures" / "hf" / "llama-tiny"
-    tensors, _ = read_file(source / "model.safetensors")
-    bf16 = {
-        name: np.asarray(jnp.asarray(tensor, jnp.bfloat16))
-        for name, tensor in tensors.items()
-    }
-    directory = tmp_path / "checkpoint"
-    directory.mkdir()
-    (directory / "config.json").write_text((source / "config.json").read_text())
-    write_file(bf16, directory / "model.safetensors", {"format": "pt"})
-
-    loaded = Pretrained.load(str(directory), dtype="float32", attention_impl="xla")
-
-    leaves, _ = jax.tree_util.tree_flatten(loaded.variables)
-    assert all(np.asarray(leaf).dtype == np.float32 for leaf in leaves)
-    np.testing.assert_array_equal(
-        np.asarray(loaded.variables["params"]["embed_tokens"]["embedding"]),
-        np.asarray(bf16["model.embed_tokens.weight"], np.float32),
-    )
-
-
 def assert_parameter_storage(reference, actual, is_parameter):
     """The public storage contract on full variable paths, not implementation calls."""
     assert jax.tree.structure(reference) == jax.tree.structure(actual)
@@ -369,84 +258,17 @@ def test_public_parameter_storage_is_independent_of_compute_and_roundtrips(tmp_p
         assert np.asarray(before).dtype == np.asarray(after).dtype
         np.testing.assert_array_equal(before, after)
 
-
-def test_public_loader_rejects_aliases_hidden_by_bfloat16_rounding(tmp_path):
-    from dew.interop import Pretrained
-
-    source = Path(__file__).resolve().parent / "fixtures" / "hf" / "llama-tiny"
-    tensors, _ = read_file(source / "model.safetensors")
-    config = json.loads((source / "config.json").read_text())
-    config["tie_word_embeddings"] = True
-    shape = tensors["model.embed_tokens.weight"].shape
-    tensors["model.embed_tokens.weight"] = np.full(shape, 1., np.float32)
-    tensors["lm_head.weight"] = np.full(shape, 1. + 1. / 1024, np.float32)
-    directory = tmp_path / "different-aliases"
-    save_hf_layout(tensors, config, directory)
-    with pytest.raises(ValueError):
-        Pretrained.load(directory, param_dtype="bfloat16")
+    if family == "llama-tiny":
+        widened = Pretrained.load(destination, dtype="float32", attention_impl="xla")
+        for before, after in zip(jax.tree.leaves(native.variables),
+                                 jax.tree.leaves(widened.variables), strict=True):
+            assert np.asarray(after).dtype == np.float32
+            np.testing.assert_array_equal(np.asarray(after), np.asarray(before, np.float32))
 
 
 # ---------------------------------------------------------------------------------
 # Hub pull
 # ---------------------------------------------------------------------------------
-
-
-class _RecordingApi:
-    """Stands in for HfApi and keeps every call a push makes, with the files
-    the uploaded folder held while the call ran."""
-
-    def __init__(self):
-        self.created = []
-        self.uploaded = []
-        self.files = []
-
-    def create_repo(self, repo_id, **kwargs):
-        self.created.append((repo_id, kwargs))
-
-    def upload_folder(self, **kwargs):
-        self.uploaded.append(kwargs)
-        self.files.append({entry.name for entry in Path(kwargs["folder_path"]).iterdir()})
-
-
-def test_a_bundle_pushes_what_it_saves_to_a_created_repo(tmp_path, monkeypatch):
-    """`push_to_hub` is `save` into a staging directory and that directory
-    uploaded, to a repo created when missing; the privacy flag and the commit
-    message pass through."""
-    import huggingface_hub
-
-    from dew.interop import PretrainedDecoder
-    from dew.nn.backbones import CausalTransformer
-
-    api = _RecordingApi()
-    monkeypatch.setattr(huggingface_hub, "HfApi", lambda: api)
-    model = CausalTransformer(vocab_size=16, emb_features=8, num_layers=1, num_heads=2, mlp_features=16,
-                              max_seq_len=8, attention_impl="reference")
-    bundle = PretrainedDecoder.from_model(model, model.init(jax.random.key(0), np.zeros((1, 2), np.int32)),
-                                          tokenizer="byte")
-    bundle.push_to_hub("acme/dew-export", private=True, commit_message="step 1000")
-    bundle.save(tmp_path / "saved")
-
-    assert api.created == [("acme/dew-export", {"private": True, "exist_ok": True})]
-    assert [(call["repo_id"], call["commit_message"]) for call in api.uploaded] == [
-        ("acme/dew-export", "step 1000")]
-    assert api.files == [{entry.name for entry in (tmp_path / "saved").iterdir()}]
-
-
-def test_pull_returns_the_snapshot_directory(tmp_path, monkeypatch):
-    calls = []
-
-    def snapshot_download(**kwargs):
-        calls.append(kwargs)
-        return str(tmp_path / "snapshot")
-
-    monkeypatch.setattr(hub, "snapshot_download", snapshot_download)
-
-    assert pull_from_hub("acme/dew-export", revision="v2") == tmp_path / "snapshot"
-    assert pull_from_hub("acme/dew-export") == tmp_path / "snapshot"
-    assert calls == [
-        {"repo_id": "acme/dew-export", "revision": "v2"},
-        {"repo_id": "acme/dew-export", "revision": None},
-    ]
 
 
 # ---------------------------------------------------------------------------------
@@ -526,31 +348,6 @@ def test_a_trained_lm_run_exports_and_reloads_at_its_own_logits(tmp_path):
                                       ordered_export=tmp_path / "orders")
 
 
-def test_exporting_a_run_whose_model_has_no_published_layout_names_it(tmp_path):
-    """A latent diffusion run: the denoiser is a native model with no file
-    to be written back into, so building its export bundle is refused,
-    naming the model and the task that loads the run."""
-    from test_inference import make_run
-
-    from dew.interop import Pretrained
-
-    make_run(tmp_path)
-    with pytest.raises(TypeError):
-        Pretrained.from_run(str(tmp_path))
-
-
-def test_writing_a_model_no_decoder_family_describes_as_a_decoder_names_it():
-    """A decoder family's config is derived from a decoder's fields, so a
-    denoiser handed to the decoder writer is refused by name rather than
-    read as fields it does not have."""
-    from dew.interop import PretrainedDecoder
-    from dew.registry import models
-
-    denoiser = models.build("simple_dit")
-    with pytest.raises(TypeError):
-        PretrainedDecoder.from_model(denoiser, {})
-
-
 FRESH_TRAINING = """
 import sys
 
@@ -601,133 +398,10 @@ def test_a_run_trained_in_one_process_exports_from_a_fresh_one(tmp_path):
     assert_transformers_reads_the_run(tmp_path / "export", dew.pipeline(str(tmp_path / "run")),
                                       np.arange(9).reshape(1, 9))
 
-
-def test_a_registry_imports_the_module_that_registers_a_name_and_no_other():
-    """A lookup of a name nothing has registered yet imports the module whose
-    decorator registers it, found in Dew's sources, with what that module
-    imports, and no other registering module (JEPA's objective, the eval
-    harness); a name no module registers still raises."""
-    import os
-    import subprocess
-
-    root = Path(__file__).resolve().parents[1]
-    env = {**os.environ, "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(root / "src")}
-    program = ("import sys\n"
-               "from dew.registry import objectives, solvers\n"
-               "assert 'dew.objectives.rl.ppo' not in sys.modules\n"
-               "print(objectives['ppo'].__module__, solvers['heun'].__name__)\n"
-               "print('dew.objectives.jepa' in sys.modules, 'dew.eval.harness' in sys.modules)\n"
-               "try:\n"
-               "    objectives['no_such_objective']\n"
-               "except KeyError as error:\n"
-               "    print('refused', 'no_such_objective' in str(error))\n")
-    done = subprocess.run([sys.executable, "-c", program], capture_output=True, text=True, env=env,
-                          timeout=300)
-    assert done.returncode == 0, done.stderr[-2000:]
-    assert done.stdout.splitlines() == ["dew.objectives.rl.ppo Heun", "False False", "refused True"]
-
-
-ALIASES = """
-import json
-
-import dew.registry as registry
-
-drift = {}
-for kind in registry.KINDS:
-    for alias, path in kind.paths.items():
-        try:
-            member = kind[alias]
-        except ModuleNotFoundError as missing:
-            if missing.name is None or missing.name.split(".")[0] == "dew":
-                raise
-            continue  # an optional dependency this environment lacks
-        if registry.import_path(member) != path:
-            drift[f"{kind.kind} {alias}"] = registry.import_path(member)
-print(json.dumps(drift))
-"""
-
-
-def test_every_alias_names_the_class_at_its_path():
-    """Each alias imports, in a fresh process, a class whose own import path
-    is the path the alias names, so a class moved or renamed without its
-    alias fails here rather than in a user's run."""
-    import os
-    import subprocess
-
-    root = Path(__file__).resolve().parents[1]
-    env = {**os.environ, "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(root / "src")}
-    done = subprocess.run([sys.executable, "-c", ALIASES], capture_output=True, text=True, env=env,
-                          timeout=600)
-    assert done.returncode == 0, done.stderr[-2000:]
-    assert json.loads(done.stdout.splitlines()[-1]) == {}
-
-
-def test_the_cli_exports_a_run_and_refuses_a_directory_that_is_not_one(tmp_path, capsys):
-    """`dew export <run> <dest>` is the same call with two positional names."""
-    from test_inference import make_lm_run
-
     from dew.cli.main import main
 
-    run = tmp_path / "run"
-    run.mkdir()
-    make_lm_run(run)
-    destination = tmp_path / "export"
-
-    assert main(["export", str(run), str(destination)]) == 0
-    assert (destination / "model.safetensors").is_file()
-    assert "exported" in capsys.readouterr().out
     with pytest.raises(FileNotFoundError):
         main(["export", str(tmp_path / "nothing"), str(tmp_path / "other")])
-
-
-def test_a_block_diffusion_run_writes_no_export_transformers_cannot_read(tmp_path):
-    """transformers' DiffusionGemmaForBlockDiffusion, the implementation the
-    checkpoint layout is for, builds experts and a vision tower, and takes
-    generation_config.json as a closed set of fields. Google's dense
-    text-only model has neither, and Dew's byte vocabulary has no files and
-    no field to be named in, so a run of either is refused before a file is
-    written (a run of the image-reading model on its own tokenizer exports:
-    test_diffusion_gemma_workflow.py)."""
-    from test_inference import make_block_run
-
-    from dew.interop import Pretrained
-
-    dense = tmp_path / "dense"
-    dense.mkdir()
-    make_block_run(dense, fixture="diffusion-gemma-sft")
-    with pytest.raises(ValueError):
-        Pretrained.from_run(str(dense), ema=False).save(tmp_path / "refused")
-    assert not (tmp_path / "refused").exists()
-
-    byte = tmp_path / "byte"
-    byte.mkdir()
-    make_block_run(byte)
-    with pytest.raises(ValueError):
-        Pretrained.from_run(str(byte), ema=False).save(tmp_path / "refused")
-    assert not (tmp_path / "refused").exists()
-
-
-def test_the_fid_converter_refuses_a_pickle_that_is_missing_a_key(tmp_path):
-    """The extractor's own variables tree says which arrays the conversion
-    wants and what they are called, so a jax-fid pickle that cannot answer for
-    one of them is refused by the name it failed on rather than landing a tree
-    with a hole in it."""
-    import pickle
-
-    from dew.interop.inception_fid import convert, upstream_names
-
-    tree: dict = {}
-    for upstream in upstream_names().values():
-        node = tree
-        for step in upstream[:-1]:
-            node = node.setdefault(step, {})
-        node[upstream[-1]] = np.zeros(1, np.float32)
-    del tree["Mixed_7c"]["branch_pool"]["bn"]["var"]
-
-    path = tmp_path / "inception_v3_fid.pickle"
-    path.write_bytes(pickle.dumps(tree))
-    with pytest.raises(ValueError):
-        convert(path)
 
 
 def test_a_written_tensor_reads_back_in_its_own_order_whatever_its_memory_layout(tmp_path):

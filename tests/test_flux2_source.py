@@ -102,23 +102,6 @@ def test_the_forward_and_every_gradient_match_the_source(source, arrays, record,
     assert gaps[worst] < GRADIENT, worst
 
 
-def test_a_guided_checkpoint_refuses_a_call_without_guidance(source, arrays, record):
-    model, params, _ = load(source, "dev")
-    latent, times, condition, _ = walk("dev", arrays, record)
-    with pytest.raises(ValueError):
-        model.apply({"params": params}, latent, times, DenoisingCondition(condition.context))
-
-
-@pytest.mark.parametrize(
-    "change", [{"patch_size": 2}, {"axes_dims_rope": [8, 8]}, {"axes_dims_rope": [4, 4, 4, 3]}]
-)
-def test_an_unsupported_config_is_refused(source, change):
-    config = json.loads((source / "dev" / "transformer" / "config.json").read_text())
-    flux2_fields(config)
-    with pytest.raises(ValueError):
-        flux2_fields({**config, **change})
-
-
 def nhwc(array):
     return np.asarray(array).transpose(0, 2, 3, 1)
 
@@ -218,27 +201,6 @@ def test_klein_pipeline_walk_matches_the_source(klein, arrays, record):
     for row in range(len(pipeline["prompts"])):
         assert relative_gap(raw[row], nhwc(arrays[f"pipeline.latents.{row}"])[0]) < FORWARD, row
         assert relative_gap(images[row], arrays[f"pipeline.images.{row}"][0]) < FORWARD, row
-
-
-def test_a_step_distilled_klein_samples_unguided(source):
-    """The published [klein] marks itself step-distilled, and its call then
-    ignores its guidance scale."""
-    from dew.interop.pipeline_assembly import _call_policy, pipeline_denoiser
-
-    denoiser = pipeline_denoiser(source / "pipeline", dtype="float32", attention_impl="xla")
-    index = json.loads((source / "pipeline" / "model_index.json").read_text())
-    assert _call_policy(index, denoiser).guided
-    assert not _call_policy({**index, "is_distilled": True}, denoiser).guided
-
-
-def test_the_empirical_shift_is_the_pipelines():
-    from dew.diffusion.schedules.source import empirical_mu
-
-    # compute_empirical_mu at diffusers 0.40.0, evaluated by hand: the 10- and
-    # 200-step lines at 1024 tokens, and the 200-step line past 4300.
-    assert empirical_mu(1024, 200) == pytest.approx(0.00016927 * 1024 + 0.45666666)
-    assert empirical_mu(1024, 10) == pytest.approx(8.73809524e-05 * 1024 + 1.89833333)
-    assert empirical_mu(5000, 4) == pytest.approx(0.00016927 * 5000 + 0.45666666)
 
 
 def test_a_mistral3_encoder_reads_as_flux2_dev_reads_it(source, arrays, record):

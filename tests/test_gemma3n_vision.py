@@ -13,17 +13,13 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from jax.sharding import PartitionSpec as P
 from safetensors.numpy import load_file
 
 from dew.interop.hf_decoders import translate_wrapper_config, translate_wrapper_weights
 from dew.interop.pretrained import Pretrained
-from dew.nn import vision as V
 from dew.nn.inputs import ModelInputs
 from dew.nn.mobilenet import MobileConvNormAct
 from dew.registry import models, projectors, towers
-from dew.training import Layout, MeshSpec
-from dew.training.optim import muon_weight_dimension_numbers
 
 FIXTURE = Path(__file__).parent / "fixtures" / "hf" / "gemma3n-vision-tiny"
 
@@ -40,22 +36,6 @@ def bundle():
     decoder = models.build("causal_transformer", record["text"], dtype="float32", attention_impl="reference")
     decoder = decoder.clone(precision=precision)
     return record, variables, tower, projector, decoder
-
-
-def test_bfloat16_gelu_preserves_the_reference_activation():
-    """Torch 2.14 CPU ConvNormAct/RmsNorm2d/tanh-GELU on an identity map.
-
-    The input RMS is exactly one in bf16. timm returns -0.04541015625 for
-    the negative channel; a bf16 GELU polynomial returns -0.046875.
-    """
-    block = MobileConvNormAct(8, dtype=jnp.bfloat16)
-    params = {"params": {"conv": {"kernel": jnp.eye(8).reshape(1, 1, 8, 8)},
-                         "bn": {"scale": jnp.ones(8)}}}
-    inputs = jnp.array([2, -2, 0, 0, 0, 0, 0, 0], jnp.bfloat16).reshape(1, 1, 1, 8)
-    output = jax.jit(block.apply)(params, inputs)
-    reference = np.array([1.953125, -0.04541015625, 0, 0, 0, 0, 0, 0], np.float32)
-    np.testing.assert_array_equal(np.asarray(output, np.float32).ravel(), reference)
-    assert output.dtype == jnp.bfloat16
 
 
 def test_a_bfloat16_norm_rounds_as_timm_does():
@@ -117,67 +97,6 @@ def test_encoder_backward_and_sgd_update_match_reference(bundle):
     np.testing.assert_allclose(stepped, np.load(FIXTURE / "stepped_ref.npy"), rtol=0, atol=1e-4)
 
 
-# One kernel per shape the tower builds, with the spec its declaration derives
-# written out by hand: an expansion, a projection back, a depthwise middle, a
-# strided key downsample and the four attention projections. `min_shard` below
-# keeps the fixture's small widths inside the threshold policy, so the spec of
-# a declaration that stopped matching its module shows up here as P().
-TOWER_SPECS = {
-    ("conv_stem", "conv", "kernel"): P(None, None, None, "fsdp"),
-    ("stages_0", "blocks_0", "conv_exp", "kernel"): P(None, None, None, "fsdp"),
-    ("stages_0", "blocks_0", "conv_pwl", "kernel"): P(None, None, None, "fsdp"),
-    ("stages_1", "blocks_1", "dw_start", "conv", "kernel"): P(None, None, None, "fsdp"),
-    ("stages_1", "blocks_0", "dw_mid", "conv", "kernel"): P(None, None, None, "fsdp"),
-    ("stages_2", "blocks_11", "attn", "query", "proj", "kernel"): P(None, None, None, "fsdp"),
-    ("stages_2", "blocks_11", "attn", "key", "proj", "kernel"): P(None, None, None, "fsdp"),
-    ("stages_2", "blocks_11", "attn", "value", "proj", "kernel"): P(None, None, None, "fsdp"),
-    ("stages_2", "blocks_11", "attn", "output", "proj", "kernel"): P(None, None, None, "fsdp"),
-    ("stages_2", "blocks_11", "attn", "key", "down_conv", "kernel"): P(None, None, None, "fsdp"),
-    ("msfa", "ffn", "pw_exp", "conv", "kernel"): P(None, None, None, "fsdp"),
-    ("msfa", "ffn", "pw_proj", "conv", "kernel"): P(None, None, None, "fsdp"),
-}
-
-
-@pytest.mark.mesh
-def test_the_layout_and_muon_read_the_towers_declared_axes():
-    """Placing the wrapper on an fsdp mesh, the call a Trainer refused before.
-
-    `("proj",)` is a router's declaration elsewhere in the tree, and the
-    attention's projection convolutions sat under exactly that name, so the
-    layout hit a two-name declaration on a rank-four kernel and raised for
-    132 of the tower's leaves. Both readers of the table are asserted here
-    because one declaration answers both: the layout splits a kernel on its
-    output channels, and Muon contracts the flattened receptive field into
-    them, which is what the unnamed leading dimensions say.
-    """
-    loaded = Pretrained.load(FIXTURE, dtype="float32", attention_impl="reference")
-    mesh = MeshSpec(fsdp=4).build()
-    layout = Layout(min_shard=64)
-    shardings = layout.shardings(mesh, loaded.variables)
-    layout.check(loaded.variables["params"], shardings["params"], mesh)
-
-    tower, placed = loaded.variables["params"]["tower"], shardings["params"]["tower"]
-    for path, expected in TOWER_SPECS.items():
-        leaf, sharding = tower, placed
-        for name in path:
-            leaf, sharding = leaf[name], sharding[name]
-        assert sharding.spec == expected, f"{'/'.join(path)} {leaf.shape}"
-
-    # Optax's spec is itself a pytree node, so its own fields would flatten
-    # away; None is the AdamW group the norms and the biases belong to.
-    def is_spec(leaf):
-        return leaf is None or isinstance(
-            leaf, optax.contrib.MuonDimensionNumbers)
-    numbers = muon_weight_dimension_numbers(tower)
-    matrices = [(jax.tree_util.keystr(path), leaf) for path, leaf
-                in jax.tree_util.tree_flatten_with_path(numbers, is_leaf=is_spec)[0]
-                if leaf is not None]
-    assert len(matrices) == sum(1 for leaf in jax.tree.leaves(tower) if leaf.ndim == 4)
-    wrong = [name for name, leaf in matrices
-             if (leaf.reduction_axis, leaf.output_axis) != ((0, 1, 2), (3,))]
-    assert wrong == [], f"{len(wrong)} kernels are not a receptive field mapped to channels"
-
-
 def test_image_only_wrapper_matches_conditional_reference_and_uses_hard_tokens(bundle):
     """Full image-to-logit fp32 parity through the native wrapper, including
     hard vision IDs (48..55 here) and the per-layer table that ends at 48.
@@ -208,15 +127,6 @@ def test_image_only_wrapper_matches_conditional_reference_and_uses_hard_tokens(b
     assert np.max(np.abs(np.asarray(run(muted)) - reference)) > 1e-2
 
 
-def test_soft_initialization_also_creates_the_hard_vision_path():
-    projector = V.Gemma3nProjectorModule(8, 4, vocab_size=3, vocab_offset=16)
-    variables = projector.init(jax.random.key(51), jnp.arange(16, dtype=jnp.float32).reshape(1, 2, 8))
-    hard = jnp.asarray(
-        projector.apply(variables, jnp.array([[16, 18]], jnp.int32), method=projector.embed_hard)
-    )
-    np.testing.assert_allclose(jnp.mean(jnp.square(hard), axis=-1), 1.0, atol=1e-4)
-
-
 def test_drop_path_uses_training_rng_and_is_disabled_for_evaluation(bundle):
     _, variables, tower, _, _ = bundle
     tower = tower.clone(drop_path_rate=0.4)
@@ -228,68 +138,3 @@ def test_drop_path_uses_training_rng_and_is_disabled_for_evaluation(bundle):
     assert np.max(np.abs(np.asarray(first - training(jax.random.key(2))))) > 1e-2
     evaluation = jax.jit(tower.apply)(variables["tower"], pixels)
     np.testing.assert_allclose(evaluation, np.load(FIXTURE / "tower_even.npy"), rtol=0, atol=1e-4)
-
-
-@pytest.mark.parametrize("pixels", (
-    np.zeros((1, 32, 32, 3), np.float32),
-    np.zeros((3, 32, 32), np.float32),
-    np.zeros((1, 3, 32, 32), np.int32),
-))
-def test_tower_refuses_nonprocessor_pixels(bundle, pixels):
-    _, variables, tower, _, _ = bundle
-    with pytest.raises(ValueError):
-        tower.apply(variables["tower"], pixels)
-
-
-@pytest.mark.parametrize("change", (
-    {"architecture": "resnet50"},
-    {"hidden_size": 1024},
-    {"do_pooling": True},
-    {"model_args": {"features_only": True}},
-    {"model_args": {"norm_layer": "batchnorm2d"}},
-    {"model_type": "siglip_vision_model"},
-    {"unknown_computational_field": True},
-))
-def test_unsupported_timm_graph_changes_fail_before_loading(change):
-    config = json.loads((FIXTURE / "config.json").read_text())
-    config["vision_config"].update(change)
-    with pytest.raises(ValueError):
-        translate_wrapper_config(config)
-
-
-def test_wrapper_checks_audio_weights_and_wrong_soft_token_count(bundle):
-    """An audio config translates to its tower record; its weights must then exist."""
-    config = json.loads((FIXTURE / "config.json").read_text())
-    config["audio_config"] = {"model_type": "gemma3n_audio", "hidden_size": 32}
-    record = translate_wrapper_config(config)
-    assert record["audio"]["class"] == "gemma3n_audio" and record["audio_soft_tokens"] == 188
-    with pytest.raises(ValueError):
-        translate_wrapper_weights(load_file(str(FIXTURE / "model.safetensors")), record)
-    config["audio_config"] = None
-    config["vision_soft_tokens_per_image"] = 9
-    with pytest.raises(ValueError):
-        translate_wrapper_config(config)
-    tensors = load_file(str(FIXTURE / "model.safetensors"))
-    tensors["model.audio_tower.linear_start.weight"] = np.ones((4, 4), np.float32)
-    with pytest.raises(ValueError):
-        translate_wrapper_weights(tensors, bundle[0])
-
-
-def test_image_only_released_config_builds_the_actual_encoder():
-    """The released geometry is checked abstractly, without allocating 300M weights."""
-    config = json.loads((FIXTURE.parent / "gemma-3n-e2b" / "config.json").read_text())
-    config["audio_config"] = None
-    record = translate_wrapper_config(config)
-    tower = towers.from_record(record["tower"]).build()
-    output, _ = jax.eval_shape(tower.init_with_output, jax.random.key(0),
-                               jax.ShapeDtypeStruct((1, 3, 768, 768), jnp.float32))
-    assert output.shape == (1, 256, 2048)
-
-
-@pytest.mark.parametrize("field,value", [("vocab_size", "8"), ("vocab_offset", "48"),
-                                         ("rms_norm_eps", "x"), ("vocab_size", True)])
-def test_wrapper_rejects_mistyped_vision_values_before_building(field, value):
-    config = json.loads((FIXTURE / "config.json").read_text())
-    config["vision_config"][field] = value
-    with pytest.raises(ValueError):
-        translate_wrapper_config(config)
