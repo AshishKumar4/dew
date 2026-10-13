@@ -119,8 +119,8 @@ def test_the_gpu_tier_is_every_file_whose_tests_read_the_backend_or_are_marked_f
     backend and its GPU marks (executed.py), and the GPU tier is each file
     with either, each whose inputs changed since, and each without a record
     the Worker returns. A read is the file's whose test calls it, by any
-    name, every file's that requests a session fixture that made it, and a
-    test module's whose body made it, though another file imported it
+    name, every file's of a task where a session fixture made it, and a
+    test module's under whose body it ran, though another file imported it
     first. The `platform` module is no read. A file that started a process
     has no key, so it is in, and the plan never skips it."""
     url, stored, _ = cache_worker
@@ -136,9 +136,10 @@ def test_the_gpu_tier_is_every_file_whose_tests_read_the_backend_or_are_marked_f
         "test_passed.py": "def chosen(default_backend): return default_backend()\n"
                           "def test_passed(): assert chosen(lambda: 'gpu') == 'gpu'\n",
         "test_one.py": "def test_one(where): assert where == 'gpu'\n",
-        "test_two.py": "def test_two(where): assert where == 'gpu'\n",
+        "test_two.py": "def test_two(request): assert request.getfixturevalue('where') == 'gpu'\n",
         "test_importer.py": "import test_imported\ndef test_imports(): assert test_imported.ON == 'gpu'\n",
-        "test_imported.py": device + "ON = Device().platform\ndef test_on(): assert ON == 'gpu'\n",
+        "test_imported.py": "from devices import Device, placed\nON = placed(Device())\n"
+                            "def test_on(): assert ON == 'gpu'\n",
         "test_marked.py": "import pytest\n@pytest.mark.gpu\ndef test_on_a_gpu(): pass\n",
         "test_machine.py": "import platform\ndef test_machine(): assert platform.machine()\n",
         "plain.py": "def helper(): return 1\n",
@@ -155,16 +156,19 @@ def test_the_gpu_tier_is_every_file_whose_tests_read_the_backend_or_are_marked_f
     (venv / "python").write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
     (venv / "python").chmod(0o755)
     out = tmp_path / "verdict.json"
+    # The session fixture's files in a task of their own, where it reads for every file.
+    fixtures = ["tests/test_one.py", "tests/test_two.py"]
     ran = [f"tests/{name}" for name in files if name.startswith("test_") and name != "test_new.py"]
-    ci.task("3.12", ran, "", out, 600.0)
-    assert {row["name"]: row["exitCode"] for row in json.loads(out.read_text())["rows"]} == {
-        f"3.12:{name}": 0 for name in ran}
+    for tests in ([name for name in ran if name not in fixtures], fixtures):
+        ci.task("3.12", tests, "", out, 600.0)
+        assert {row["name"]: row["exitCode"] for row in json.loads(out.read_text())["rows"]} == {
+            f"3.12:{name}": 0 for name in tests}
     (tmp_path / "tests/plain.py").write_text("def helper(): return 2 - 1\n")
     # A group of test_lost.py's the Worker lists and does not return.
     stored[ci.cache_url("3.12", "3.12:tests/test_lost.py#2/2")[len(url):]] = None
     assert ci.gpu_tier("3.12") == {
-        "tests/test_imported.py": ["tests/test_imported.py:<module>"],
-        "tests/test_importer.py": ["tests/test_imported.py:<module>"],
+        "tests/test_imported.py": ["tests/devices.py:placed"],
+        "tests/test_importer.py": ["tests/devices.py:placed"],
         "tests/test_lost.py": ["unrecorded"],
         "tests/test_marked.py": ["mark:gpu"],
         "tests/test_new.py": ["unrecorded"],

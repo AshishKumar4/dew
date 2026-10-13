@@ -10,9 +10,9 @@ cache never skips it.
 
 It also records where each test file's run read the backend (`reads_backend`) and which of its tests
 are marked to run on a GPU (`MARKS`): a file with either takes another path on a GPU, so the H100 tier
-runs it (`ci.py gpu-tier`). A read is that of the test file being collected or run, or of the
-session-scoped fixture being set up, which every file that requests it shares. A module's body reads
-once, as it is imported: for its own test file too, and for every file where nothing is collected yet."""
+runs it (`ci.py gpu-tier`). A read is the test file's being collected or run. As with the files they
+execute, what session-scoped fixtures read is every file's, and what runs under a module's body,
+which runs once, as it is imported, is its own test file's too, and every file's before collection."""
 
 import dis
 import json
@@ -40,13 +40,11 @@ running: list[str] = []
 reads: dict[str, set[str]] = {}
 """Each test file's reads of the backend, as `file:function`, and its marks of `MARKS`."""
 module_reads: dict[str, set[str]] = {}
-imported: set[str] = set()
-"""What module bodies read before collection began."""
-fixture_reads: dict[str, set[str]] = {}
-requested: dict[str, set[str]] = {}
-"""The fixtures each test file's tests requested."""
+"""What ran under each test module's body."""
+everywhere: set[str] = set()
+"""What session-scoped fixtures read, and module bodies before collection."""
 readers: list[set[str]] = []
-"""Where a function's read is kept. conftest.py's reads are every test's, so they are left out."""
+"""Where a read is kept. conftest.py's reads are every test's, so they are left out."""
 decided: dict[types.CodeType, bool] = {}
 
 
@@ -55,15 +53,25 @@ def started(code, offset):
     # The environment's packages, which CI installs in the checkout, are the locks' to key.
     if name.startswith(root) and name.endswith(".py") and "site-packages" not in name:
         current[-1].add(name[len(root):])
-        if reads_backend(code) and not name.endswith(f"{os.sep}conftest.py"):
+        if reads_backend(code) and not conftest(name):
             site = f"{name[len(root):]}:{code.co_qualname}"
-            if code.co_name == "<module>":
-                module_reads.setdefault(name[len(root):], set()).add(site)
             if readers:
                 readers[-1].add(site)
-            elif code.co_name == "<module>":
-                imported.add(site)
+            # The callback runs in the reader's frame, under the bodies of the modules being imported.
+            frame = sys._getframe(1)
+            while frame is not None:
+                body = frame.f_code.co_filename
+                if frame.f_code.co_name == "<module>" and body.startswith(root) and not conftest(body):
+                    if Path(body).name.startswith("test_"):
+                        module_reads.setdefault(body[len(root):], set()).add(site)
+                    elif not readers:
+                        everywhere.add(site)
+                frame = frame.f_back
     return sys.monitoring.DISABLE
+
+
+def conftest(name: str) -> bool:
+    return Path(name).name == "conftest.py"
 
 
 def reads_backend(code: types.CodeType) -> bool:
@@ -100,7 +108,6 @@ def pytest_runtest_protocol(item, nextitem):
         current[:] = [own.setdefault(name, set())]
         sys.monitoring.restart_events()
     reads.setdefault(name, set()).update(f"mark:{mark}" for mark in MARKS if item.get_closest_marker(mark))
-    requested.setdefault(name, set()).update(item.fixturenames)
     readers.append(reads[name])
     try:
         yield
@@ -128,7 +135,7 @@ def pytest_fixture_setup(fixturedef, request):
         yield
         return
     current.append(shared)
-    readers.append(fixture_reads.setdefault(fixturedef.argname, set()))
+    readers.append(everywhere)
     sys.monitoring.restart_events()
     try:
         yield
@@ -143,8 +150,6 @@ def pytest_sessionfinish(session):
     out = os.environ.get("DEW_EXECUTED")
     if out:
         recorded = {name: {"depends": None if name in spawned else sorted(files | shared),
-                           "reads": sorted(reads.get(name, set()) | module_reads.get(name, set()) | imported
-                                           | set().union(*(fixture_reads.get(fixture, set())
-                                                           for fixture in requested.get(name, ()))))}
+                           "reads": sorted(reads[name] | module_reads.get(name, set()) | everywhere)}
                     for name, files in own.items()}
         Path(out).write_text(json.dumps(recorded))
