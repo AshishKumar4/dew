@@ -228,11 +228,21 @@ def _evaluated(jaxpr, consts, args, given=None):
     def energy(var):
         return None if isinstance(var, Literal) else energies.get(var)
 
-    for equation in jaxpr.eqns:
+    # Each value and energy goes once its last reader has run, as an execution
+    # frees it: a chunked scan's float64 intermediates would otherwise all stay.
+    last = {var: index for index, equation in enumerate(jaxpr.eqns)
+            for var in equation.invars if not isinstance(var, Literal)}
+    for var in jaxpr.outvars:
+        last.pop(var, None)
+    for index, equation in enumerate(jaxpr.eqns):
         inputs = [read(var) for var in equation.invars]
         with equation.ctx.manager:
             outputs, made = _applied(equation, inputs, [energy(var) for var in equation.invars],
                                      any(var in wanted for var in equation.outvars))
+        for var in equation.invars:
+            if last.get(var) == index:
+                values.pop(var, None)
+                energies.pop(var, None)
         for var, value, made_energy in zip(equation.outvars, outputs, made, strict=True):
             values[var], energies[var] = value, made_energy
     return [read(var) for var in jaxpr.outvars], [energy(var) for var in jaxpr.outvars]
