@@ -16,10 +16,13 @@ import time
 from pathlib import Path
 
 import httpx
+import jax
 import pytest
 
 from dew.interop.harbor import HARBOR_KEY, Gateway, HarborSource, calls, outcome
 from dew.objectives.rl.sessions import Call, Status, Task
+
+KEY = jax.random.key(0)
 
 
 def trace(prompt, sampled, logprobs, reason="stop", *, started=0.0, version=None, **extra):
@@ -37,7 +40,7 @@ def trace(prompt, sampled, logprobs, reason="stop", *, started=0.0, version=None
 
 def test_calls_follow_submission_order_and_carry_the_gateway_stamp():
     # The first call finished last: stored order is completion order, not submission order.
-    late = trace([1, 2, 3, 4, 5], [6, 7], [-.5, -.25], "stop", started=1.0, version=3)
+    late = trace([1, 2, 3, 4, 5], [6, 7], [-.5, -.25], "stop", started=1.0, version=3, key=KEY)
     early = trace([1, 2], [3, 4], [-1., -2.], "tool_calls", started=0.0, version=None)
     early["latency_ms"] = 5000.0
     early["timestamp"] = 5.0
@@ -215,7 +218,7 @@ def test_each_sample_is_its_own_trial_and_gateway_session(tmp_path, harbor):
     source = HarborSource(gateway, harbor=harbor, model="hosted_vllm/policy", trials=tmp_path / "trials",
                           environment={"MSWEA_API_KEY": "none"}, arguments=("-e", "docker"))
     try:
-        futures = source.submit(Task("hello", {HARBOR_KEY: str(tmp_path / "task")}), 2, version=5)
+        futures = source.submit(Task("hello", {HARBOR_KEY: str(tmp_path / "task")}), 2, version=5, key=KEY)
         rollouts = [future.result(timeout=60) for future in futures]
     finally:
         source.close()
@@ -249,7 +252,7 @@ def test_a_cancelled_trial_is_interrupted_and_resolves_cancelled(tmp_path, harbo
     gateway, asked = fake_gateway()
     source = HarborSource(gateway, harbor=harbor, model="hosted_vllm/policy", trials=tmp_path / "trials")
     try:
-        (future,) = source.submit(Task("slow", {HARBOR_KEY: str(tmp_path / "slow")}), 1, version=0)
+        (future,) = source.submit(Task("slow", {HARBOR_KEY: str(tmp_path / "slow")}), 1, version=0, key=KEY)
         deadline = time.monotonic() + 30
         while not list((tmp_path / "trials").glob("*/seen.json")) and time.monotonic() < deadline:
             time.sleep(0.05)
@@ -271,7 +274,8 @@ def test_a_harbor_that_ignores_the_interrupt_is_terminated_after_the_grace(tmp_p
         gateway, harbor=harbor, model="hosted_vllm/policy", trials=tmp_path / "trials", grace=1.0
     )
     try:
-        (future,) = source.submit(Task("stubborn", {HARBOR_KEY: str(tmp_path / "stubborn")}), 1, version=0)
+        (future,) = source.submit(Task("stubborn", {HARBOR_KEY: str(tmp_path / "stubborn")}), 1,
+                                  version=0, key=KEY)
         deadline = time.monotonic() + 30
         while not list((tmp_path / "trials").glob("*/seen.json")) and time.monotonic() < deadline:
             time.sleep(0.05)
@@ -289,7 +293,7 @@ def test_close_resolves_queued_trials_without_launching_them(tmp_path, harbor):
     source = HarborSource(
         gateway, harbor=harbor, model="hosted_vllm/policy", trials=tmp_path / "trials", workers=1
     )
-    futures = source.submit(Task("slow", {HARBOR_KEY: str(tmp_path / "slow")}), 2, version=0)
+    futures = source.submit(Task("slow", {HARBOR_KEY: str(tmp_path / "slow")}), 2, version=0, key=KEY)
     deadline = time.monotonic() + 30
     while not list((tmp_path / "trials").glob("*/seen.json")) and time.monotonic() < deadline:
         time.sleep(0.05)
@@ -308,7 +312,7 @@ def test_the_first_submission_waits_for_a_healthy_gateway_worker(tmp_path, harbo
     gateway, asked = fake_gateway(unhealthy_checks=3)
     source = HarborSource(gateway, harbor=harbor, model="m/p", trials=tmp_path / "trials", ready_poll=0.01)
     try:
-        (future,) = source.submit(Task("hello", {HARBOR_KEY: str(tmp_path / "task")}), 1, version=0)
+        (future,) = source.submit(Task("hello", {HARBOR_KEY: str(tmp_path / "task")}), 1, version=0, key=KEY)
         assert future.result(timeout=60).status is Status.COMPLETED
     finally:
         source.close()
@@ -322,7 +326,7 @@ def test_a_gateway_that_reports_healthy_before_its_engine_listens_is_waited_for(
     gateway, _ = fake_gateway(unreachable_models=3)
     source = HarborSource(gateway, harbor=harbor, model="m/p", trials=tmp_path / "trials", ready_poll=0.01)
     try:
-        (future,) = source.submit(Task("hello", {HARBOR_KEY: str(tmp_path / "task")}), 1, version=0)
+        (future,) = source.submit(Task("hello", {HARBOR_KEY: str(tmp_path / "task")}), 1, version=0, key=KEY)
         assert future.result(timeout=60).status is Status.COMPLETED
     finally:
         source.close()
@@ -336,8 +340,8 @@ def test_waiting_for_the_gateway_does_not_block_close_or_cancel(tmp_path, harbor
                           ready_timeout=3.0, ready_poll=0.01)
     waiting = threading.Thread(
         target=lambda: pytest.raises(
-            RuntimeError, source.submit, Task("hello", {HARBOR_KEY: str(tmp_path / "task")}), 1, version=0
-        )
+            RuntimeError, source.submit, Task("hello", {HARBOR_KEY: str(tmp_path / "task")}), 1, version=0,
+            key=KEY)
     )
     waiting.start()
     time.sleep(0.3)
@@ -356,7 +360,7 @@ def test_a_gateway_with_no_healthy_worker_refuses_the_submission(tmp_path, harbo
                           ready_timeout=0.2, ready_poll=0.01)
     try:
         with pytest.raises(RuntimeError):
-            source.submit(Task("hello", {HARBOR_KEY: str(tmp_path / "task")}), 1, version=0)
+            source.submit(Task("hello", {HARBOR_KEY: str(tmp_path / "task")}), 1, version=0, key=KEY)
         assert not (tmp_path / "trials").exists()
     finally:
         source.close()
@@ -366,14 +370,14 @@ TRAINER = """
 import sys, time
 from pathlib import Path
 sys.path.insert(0, {src!r}); sys.path.insert(0, {tests!r})
-from test_harbor_source import fake_gateway
+from test_harbor_source import KEY, fake_gateway
 from dew.interop.harbor import HARBOR_KEY, HarborSource
 from dew.objectives.rl.sessions import Task
 root = Path({root!r})
 source = HarborSource(fake_gateway()[0], harbor=root / "harbor", model="m/p",
                       trials=root / "trials", workers=1,
                       grace=2.0)
-source.submit(Task("slow", {{HARBOR_KEY: str(root / "slow")}}), 2, version=0)
+source.submit(Task("slow", {{HARBOR_KEY: str(root / "slow")}}), 2, version=0, key=KEY)
 while not list((root / "trials").glob("*/seen.json")):
     time.sleep(0.05)
 raise KeyboardInterrupt  # the trainer is interrupted mid-trial and never calls close()
