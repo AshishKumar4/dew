@@ -103,6 +103,25 @@ def _accepted(outputs: Sequence[Record]) -> Outputs:
     return tuple(value for value in outputs if value is not None and not isinstance(value, Rejected))
 
 
+def _transformed(ordinal: int, value: Record, transform: Transform | None) -> Outputs:
+    outputs = (value,) if transform is None else transform(ordinal, value)
+    if not isinstance(outputs, tuple):
+        raise TypeError("cache input transform must return a tuple of outputs")
+    return outputs
+
+
+def _volatile(transform: Transform) -> bool:
+    return isinstance(transform, Volatile) and transform.volatile
+
+
+@dataclass(frozen=True)
+class _Passthrough:
+    transform: Transform
+
+    def __call__(self, index: int, value: Record) -> Outputs:
+        return _transformed(index, value, self.transform)
+
+
 def _decode_outputs(encoded: bytes) -> Outputs:
     values = decode(encoded)
     if not isinstance(values, tuple):
@@ -198,8 +217,10 @@ class Cache:
         source: Source,
         *,
         transform: Transform | None = None,
-    ) -> _CachedMap:
+    ) -> _Mapped:
         self._root(key)
+        if transform is not None and _volatile(transform):
+            return _Mapped(parent.map_with_index(_Passthrough(transform)))
         return _CachedMap(parent, self, key, source, transform)
 
     def streamed(
@@ -211,6 +232,8 @@ class Cache:
         transform: Transform | None = None,
     ) -> Callable[[Shard], grain.IterDataset]:
         self._root(key)
+        if transform is not None and _volatile(transform):
+            return _PassthroughReader(reader, _Passthrough(transform))
         return _CachedReader(reader, self, key, transform)
 
     def generation(self, key: DependencyManifest) -> Generation | None:
@@ -482,9 +505,7 @@ def _source_ids(source: Source, *, streamed: bool = False,
 
 
 class _Writer:
-    def __init__(
-        self, cache: Cache, key: DependencyManifest, *, volatile: bool = False, expected: int | None = None
-    ):
+    def __init__(self, cache: Cache, key: DependencyManifest, *, expected: int | None = None):
         self.cache, self.root = cache, cache._root(key)
         self.writer = uuid.uuid4().hex
         _, root_path, scheme = self.root._backend()
@@ -507,7 +528,6 @@ class _Writer:
         self.uploaded_bytes = 0
         self.upload_seconds = 0.0
         self.abandoned = 0
-        self.volatile = volatile
         self.expected = expected
         self.seal_future: Future | None = None
 
@@ -525,10 +545,10 @@ class _Writer:
     def process(self, row_id: RowId, ordinal: int, value: Record, transform: Transform | None) -> CachedValue:
         row_key = _row_key(row_id)
         with self.lock:
-            existing = None if self.closing or self.volatile else self.pending.get(row_key)
+            existing = None if self.closing else self.pending.get(row_key)
             completed = (
                 None
-                if self.closing or self.volatile
+                if self.closing
                 else self.index.execute(
                     "SELECT shard, offset, digest FROM inputs WHERE id=?", (row_key,)
                 ).fetchone()
@@ -544,10 +564,8 @@ class _Writer:
                     raise ValueError(f"cache writer record is corrupt for row {row_key}")
                 values = _decode_outputs(payload)
                 return values if transform is not None else values[0]
-        outputs = (value,) if transform is None else transform(ordinal, value)
-        if not isinstance(outputs, tuple):
-            raise TypeError("cache input transform must return a tuple of outputs")
-        if self.closing or self.volatile:
+        outputs = _transformed(ordinal, value, transform)
+        if self.closing:
             return outputs if transform is not None else outputs[0]
         payload = encode(outputs)
         transient = any(isinstance(output, Rejected) and not output.permanent for output in outputs)
@@ -682,7 +700,7 @@ class _Writer:
                         "schema": 1,
                         "shard": {"path": shard, "bytes": len(payload), "sha256": _hash(payload)},
                         "completions": entries,
-                        "volatile": self.volatile,
+                        "volatile": False,
                     }
                 )
                 if self.closed:
@@ -798,34 +816,12 @@ class _Writer:
                 self.pin.close()
 
 
-class _CachedMap(grain.MapDataset[CachedValue]):
-    def __init__(
-        self,
-        parent: grain.MapDataset,
-        cache: Cache,
-        key: DependencyManifest,
-        source: Source,
-        transform: Transform | None,
-    ):
-        super().__init__(parent)
-        self.cache, self.key, self.input_source, self.transform = cache, key, source, transform
-        self.input_parent = parent
-        self.writer_lock = threading.RLock()
+class _Mapped(grain.MapDataset[CachedValue]):
+    """An indexed cache read, with no fill for a volatile prefix."""
 
-    @property
-    def writer(self) -> _Writer:
-        with self.writer_lock:
-            if "_writer" not in self.__dict__:
-                writer = _Writer(
-                    self.cache,
-                    self.key,
-                    volatile=isinstance(self.transform, Volatile) and self.transform.volatile,
-                    expected=len(self),
-                )
-                finalizer = weakref.finalize(self, writer.close)
-                finalizer.atexit = False
-                self.__dict__["_writer"] = writer
-            return self.__dict__["_writer"]
+    def __init__(self, parent: grain.MapDataset):
+        super().__init__(parent)
+        self.input_parent = parent
 
     def __len__(self) -> int:
         return len(self.input_parent)
@@ -837,8 +833,56 @@ class _CachedMap(grain.MapDataset[CachedValue]):
     def __getitem__(self, index: int) -> CachedValue: ...
 
     def __getitem__(self, index):
-        if isinstance(index, slice):
-            return self.slice(index)
+        return self.slice(index) if isinstance(index, slice) else self.record(index)
+
+    def record(self, index: int) -> CachedValue:
+        return self.input_parent[index]
+
+    def close(self) -> None:
+        pass
+
+    def finish(self) -> None:
+        pass
+
+    def metrics(self) -> CacheStats:
+        return {"admitting": False, "spool_bytes": 0, "uploaded_bytes": 0,
+                "upload_seconds": 0.0, "abandoned": 0}
+
+    def iterated(
+        self, view: grain.MapDataset[CachedValue], read_options: grain.ReadOptions | None = None
+    ) -> grain.IterDataset[CachedValue]:
+        """An indexed view read without a cache writer."""
+        return view.to_iter_dataset(read_options)
+
+
+class _CachedMap(_Mapped):
+    def __init__(
+        self,
+        parent: grain.MapDataset,
+        cache: Cache,
+        key: DependencyManifest,
+        source: Source,
+        transform: Transform | None,
+    ):
+        super().__init__(parent)
+        self.cache, self.key, self.input_source, self.transform = cache, key, source, transform
+        self.writer_lock = threading.RLock()
+
+    @property
+    def writer(self) -> _Writer:
+        with self.writer_lock:
+            if "_writer" not in self.__dict__:
+                writer = _Writer(
+                    self.cache,
+                    self.key,
+                    expected=len(self),
+                )
+                finalizer = weakref.finalize(self, writer.close)
+                finalizer.atexit = False
+                self.__dict__["_writer"] = writer
+            return self.__dict__["_writer"]
+
+    def record(self, index: int) -> CachedValue:
         return self.writer.process(
             index % len(self), index % len(self), self.input_parent[index], self.transform
         )
@@ -907,6 +951,15 @@ class _ClosingCacheIterator(grain.DatasetIterator[CachedValue]):
 
 
 @dataclass(frozen=True)
+class _PassthroughReader:
+    reader: Callable[[Shard], grain.IterDataset]
+    transform: _Passthrough
+
+    def __call__(self, shard: Shard) -> grain.IterDataset:
+        return self.reader(shard).map_with_index(self.transform)
+
+
+@dataclass(frozen=True)
 class _CachedReader:
     reader: Callable[[Shard], grain.IterDataset]
     cache: Cache
@@ -945,7 +998,7 @@ class _CachedIterator(grain.DatasetIterator):
     ):
         super().__init__(parent)
         self.parent, self.shard, self.transform = parent, shard, transform
-        self.writer = _Writer(cache, key, volatile=isinstance(transform, Volatile) and transform.volatile)
+        self.writer = _Writer(cache, key)
         self.ordinal = 0
 
     def __next__(self):

@@ -307,6 +307,13 @@ class _RandomSource:
         raise ValueError("random-index HoldOut needs indexed records; use by='hash' for streams")
 
 
+def rebased(source: Source | Mixture | Phases, replacement: Source) -> Source:
+    """The holdout selections of `source` around its replacement."""
+    if isinstance(source, (_HashSource, _SliceRecords, _RandomSource)):
+        return dataclasses.replace(source, source=rebased(source.source, replacement))
+    return replacement
+
+
 def _source(
     value: SourceValue | Mapping[str, float], *, split: str = "train", format: Format | None = None
 ) -> Source:
