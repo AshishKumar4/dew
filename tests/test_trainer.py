@@ -13,6 +13,7 @@ import contextlib
 import dataclasses
 import json
 import os
+import signal
 import subprocess
 import sys
 from pathlib import Path
@@ -36,6 +37,7 @@ from dew.data.dataset import DataPartition
 from dew.objectives.base import Aux, EMASpec, Objective, merge, under
 from dew.training import Checkpoints, Layout, MeshSpec, Trainer, TrainState, ema_update
 from dew.training.optim import Cosine, Power
+from dew.training.runtime import Preempted
 from dew.training.state import CHECKPOINTED
 
 
@@ -249,6 +251,54 @@ def test_a_resumed_run_continues_the_key_stream(tmp_path):
     for expected, actual in zip(jax.tree.leaves(whole.variables),
                                 jax.tree.leaves(resumed.variables), strict=True):
         np.testing.assert_allclose(np.asarray(expected), np.asarray(actual), rtol=1e-6)
+
+
+def drawn(seed=0):
+    """A plain generator, without a position of its own: each batch drawn
+    from `seed`'s stream, or from fresh entropy with `seed=None`."""
+    rng = np.random.default_rng(seed)
+    while True:
+        x = rng.normal(size=(BATCH, FEATURES)).astype(np.float32)
+        yield {"x": x, "y": 2 * x[:, :2]}
+
+
+class Preempting(RecordingTracker):
+    """Sends this process the scheduler's SIGTERM once step `at` is logged."""
+
+    def __init__(self, at):
+        super().__init__()
+        self.at = at
+
+    def log(self, scalars, step):
+        super().log(scalars, step)
+        if step == self.at:
+            os.kill(os.getpid(), signal.SIGTERM)
+
+
+def test_a_plain_generator_preempted_resumes_on_the_batches_the_whole_run_reads(tmp_path):
+    """A stream that keeps no position is positioned by the batches it read:
+    preempted at step 3 and resumed, it reads its first three batches again
+    and trains on the rest, landing on the uninterrupted run bit for bit."""
+    plain = dataset(train=drawn)
+    whole = make_trainer().fit(plain, steps=6, log_every=1)
+    with pytest.raises(Preempted):
+        make_trainer(tmp_path, tracker=Preempting(3)).fit(plain, steps=6, log_every=1)
+    resumed = make_trainer(tmp_path).fit(plain, steps=6, log_every=1)
+    assert int(resumed.step) == 6
+    for expected, actual in zip(jax.tree.leaves(jax.device_get(whole.variables)),
+                                jax.tree.leaves(jax.device_get(resumed.variables)), strict=True):
+        np.testing.assert_array_equal(expected, actual)
+
+
+def test_a_stream_that_does_not_replay_refuses_to_resume(tmp_path):
+    """A generator over fresh entropy reads other batches when reopened, so
+    the resume refuses by name rather than train on data the run never read
+    at those steps."""
+    fresh = dataset(train=lambda: drawn(None))
+    with pytest.raises(Preempted):
+        make_trainer(tmp_path, tracker=Preempting(2)).fit(fresh, steps=4, log_every=1)
+    with pytest.raises(ValueError, match="does not replay deterministically"):
+        make_trainer(tmp_path).fit(fresh, steps=4, log_every=1)
 
 
 # --------------------------------------------------------------------------
