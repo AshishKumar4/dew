@@ -39,6 +39,7 @@ from flax.typing import Dtype, PrecisionLike
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from dew.interop import sources
+from dew.interop.generation_config import read_generation_config
 from dew.interop.pickles import host_view
 from dew.interop.pretrained import PretrainedFallback, source_processor
 from dew.interop.weights import AUTO
@@ -313,6 +314,8 @@ def load(name_or_dir: str | Path, directory: Path, revision: str | None, *, dtyp
     except ImportError as error:
         raise ImportError(f"fallback='torchax' needs torch, torchax and transformers: {INSTALL}") from error
     directory = sources.snapshot(str(name_or_dir), revision)
+    # Before transformers, whose reader fails on a malformed file without naming it.
+    generation_config = read_generation_config(directory)
     storage = "auto" if param_dtype == AUTO else getattr(torch, param_dtype)
     model = AutoModelForCausalLM.from_pretrained(str(directory), dtype=storage, local_files_only=True)
     model.eval()
@@ -339,8 +342,6 @@ def load(name_or_dir: str | Path, directory: Path, revision: str | None, *, dtyp
     module = TorchCausalLM(graph, vocab, dtype=resolve_dtype(dtype))
     source = str(name_or_dir) if revision is None else f"{name_or_dir}@{revision}"
     processor = source_processor(directory, config, config, module, source=source)
-    generation_path = directory / "generation_config.json"
-    generation_config = json.loads(generation_path.read_text()) if generation_path.exists() else {}
     versions = {name: importlib.metadata.version(name) for name in ("transformers", "torchax", "torch")}
     warnings.warn(
         f"{name_or_dir} loads as tier 3 (fallback='torchax'): transformers {versions['transformers']}'s "
