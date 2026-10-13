@@ -141,7 +141,8 @@ def test_the_gpu_tier_is_every_file_whose_tests_read_the_backend_or_are_marked_f
         "test_imported.py": device + "ON = Device().platform\ndef test_on(): assert ON == 'gpu'\n",
         "test_marked.py": "import pytest\n@pytest.mark.gpu\ndef test_on_a_gpu(): pass\n",
         "test_machine.py": "import platform\ndef test_machine(): assert platform.machine()\n",
-        "test_plain.py": "def test_plain(): pass\n",
+        "plain.py": "def helper(): return 1\n",
+        "test_plain.py": "def test_plain():\n    from plain import helper\n    assert helper() == 1\n",
         "test_lost.py": "def test_lost(): pass\n",
         "test_spawns.py": "import subprocess, sys\n"
                           "def test_child(): subprocess.run([sys.executable, '-c', 'pass'], check=True)\n",
@@ -158,7 +159,7 @@ def test_the_gpu_tier_is_every_file_whose_tests_read_the_backend_or_are_marked_f
     ci.task("3.12", ran, "", out, 600.0)
     assert {row["name"]: row["exitCode"] for row in json.loads(out.read_text())["rows"]} == {
         f"3.12:{name}": 0 for name in ran}
-    (tmp_path / "tests/test_plain.py").write_text("def test_plain(): assert True\n")
+    (tmp_path / "tests/plain.py").write_text("def helper(): return 2 - 1\n")
     # A group of test_lost.py's the Worker lists and does not return.
     stored[ci.cache_url("3.12", "3.12:tests/test_lost.py#2/2")[len(url):]] = None
     assert ci.gpu_tier("3.12") == {
