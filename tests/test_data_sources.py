@@ -611,6 +611,58 @@ def test_exported_token_lengths_support_indexed_spans_without_record_scan():
         source.with_split("val")
 
 
+@pytest.mark.parametrize("format_args", [[], ["--format", "array_record"]])
+def test_cli_token_exports_are_readable_by_the_dispatched_token_source(tmp_path, format_args):
+    from dew.cli.main import main
+    from dew.data.sources import TokenFiles, source
+    from dew.data.text import ByteTokenizer
+
+    documents = ["first café", "next document", "last"]
+    input = tmp_path / "documents.jsonl"
+    input.write_text("".join(json.dumps({"text": text}) + "\n" for text in documents))
+    destination = tmp_path / "tokens"
+    assert main(["data", "export", "records", str(destination),
+                 "--fields", json.dumps({"source": str(input)}), "--tokenizer", "byte", "--eos",
+                 "--rows-per-shard", "2", *format_args]) == 0
+    stored = source(str(destination))
+    assert isinstance(stored, TokenFiles)
+    vocabulary = ByteTokenizer()
+    expected = np.concatenate([np.append(vocabulary.encode(text), vocabulary.eos_id) for text in documents])
+    assert stored.tokens[:].tolist() == expected.tolist()
+    assert stored.supports("indexed")
+    assert stored.metadata()["eos_id"] == vocabulary.eos_id
+    assert stored.metadata()["train_tokens"] == len(expected)
+    records = stored.records("indexed")
+    assert np.concatenate([records[index]["text"] for index in range(len(records))]).tolist() == expected.tolist()
+
+
+def test_cli_refuses_an_unsupported_token_export_format_before_writing(tmp_path):
+    from dew.cli.main import main
+
+    input = tmp_path / "documents.jsonl"
+    input.write_text('{"text":"a document"}\n')
+    destination = tmp_path / "tokens"
+    with pytest.raises(ValueError):
+        main(["data", "export", "records", str(destination),
+              "--fields", json.dumps({"source": str(input)}), "--tokenizer", "byte", "--format", "parquet"])
+    assert not destination.exists()
+
+
+def test_cli_record_exports_still_default_to_parquet(tmp_path):
+    from dew.cli.main import main
+    from dew.data.sources import source
+
+    input = tmp_path / "documents.jsonl"
+    input.write_text('{"text":"a document"}\n')
+    destination = tmp_path / "records"
+    assert main(["data", "export", "records", str(destination),
+                 "--fields", json.dumps({"source": str(input)})]) == 0
+    stored = source(str(destination))
+    assert isinstance(stored, Files)
+    assert stored.kind == "parquet"
+    assert stored.records("indexed")[0] == {"text": "a document"}
+
+
 def test_remote_indexed_arrayrecords_read_only_the_selected_physical_shard(monkeypatch):
     root = Store(f"memory://lazy-records-{uuid4().hex}")
     manifest = export(
