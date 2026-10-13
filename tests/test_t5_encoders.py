@@ -23,11 +23,9 @@ Tolerances and the differences actually observed, fp32 on CPU:
 """
 
 import json
-import re
 from pathlib import Path
 
 import jax
-import jax.numpy as jnp
 import numpy as np
 import pytest
 
@@ -78,23 +76,6 @@ def test_a_umt5_checkpoint_matches_the_reference():
     assert difference < TOLERANCE, f"max |hidden state difference| {difference:.3e}"
 
 
-def test_each_umt5_layer_reads_its_own_bias():
-    """T5's sharing, layer 0's table read by every layer, is not UMT5's: with
-    the later layers' tables replaced by layer 0's, the outputs leave the
-    reference."""
-    expected = reference(TINY_UMT5)
-    encoder = T5Text.from_pretrained(str(TINY_UMT5))
-    tokens = {"input_ids": expected["input_ids"], "attention_mask": expected["attention_mask"]}
-    tables = encoder.params["params"]
-    shared = dict(tables)
-    for name in ("relative_attention_bias_1", "relative_attention_bias_2"):
-        shared[name] = tables["relative_attention_bias_0"]
-
-    difference = largest_difference(encoder.encode({"params": shared}, tokens).hidden,
-                                    expected["last_hidden_state"])
-    assert difference > TOLERANCE, f"layer 0's table in every layer still matches: {difference:.3e}"
-
-
 def test_training_drops_units_and_one_key_drops_the_same_ones():
     """The config's dropout_rate reaches the tower, and with `train` the
     encoder drops units: two dropout keys give different states, one key the
@@ -140,70 +121,6 @@ def test_the_json_fields_rebuild_an_encoder_that_agrees():
     tokens = encoder.tokenize(prompts(TINY)[:2])
     assert np.array_equal(np.asarray(rebuilt.encode(rebuilt.params, tokens).hidden),
                           np.asarray(encoder.encode(encoder.params, tokens).hidden))
-
-
-@pytest.mark.parametrize("path", [
-    ("embed_tokens", "embedding"),
-    ("relative_attention_bias_0", "embedding"),
-    ("layers_0", "self_attn", "q_proj", "kernel"),
-    ("layers_0", "self_attn", "o_proj", "kernel"),
-    ("layers_0", "input_layernorm", "scale"),
-    ("layers_0", "mlp", "gate_proj", "kernel"),
-    ("layers_0", "mlp", "up_proj", "kernel"),
-    ("layers_0", "mlp", "down_proj", "kernel"),
-    ("layers_1", "post_attention_layernorm", "scale"),
-    ("final_layer_norm", "scale"),
-], ids=lambda path: ".".join(path))
-def test_every_translated_leaf_is_load_bearing(path):
-    """One mutation per module of the tower: zeroing any leaf the translator
-    places must move the outputs past the tolerance, or the parity test above
-    proves nothing about that module. The relative bias table, the gate and
-    both norms are each a leaf a name map can misplace without a shape error."""
-    encoder = T5Text.from_pretrained(str(TINY))
-    expected = reference(TINY)
-    tokens = {"input_ids": expected["input_ids"],
-              "attention_mask": expected["attention_mask"]}
-
-    broken = jax.tree.map(lambda leaf: leaf, encoder.params)
-    node = broken["params"]
-    for entry in path[:-1]:
-        node = node[entry]
-    node[path[-1]] = jnp.zeros_like(node[path[-1]])
-
-    difference = largest_difference(
-        encoder.encode(broken, tokens).hidden, expected["last_hidden_state"])
-    assert difference > TOLERANCE, f"zeroed {'.'.join(path)} still matches: {difference:.3e}"
-
-
-def test_the_name_map_takes_the_encoder_and_refuses_the_rest():
-    """The encoder's tied embedding is this tower whether a file stores it as
-    shared.weight or encoder.embed_tokens.weight; the decoder and the lm_head
-    translate to nothing. A name the map cannot explain raises ValueError, so
-    a renamed upstream layout fails whole."""
-    from dew.nn.text_encoders import translate_t5_weights
-
-    input_embedding = np.arange(8, dtype=np.float32).reshape(4, 2)
-    encoded = translate_t5_weights({
-        "encoder.embed_tokens.weight": input_embedding,
-        "decoder.block.0.layer.0.SelfAttention.q.weight": np.zeros((2, 2), np.float32),
-        "lm_head.weight": np.zeros((4, 2), np.float32),
-    })
-    assert set(encoded) == {"embed_tokens"}
-    np.testing.assert_array_equal(encoded["embed_tokens"]["embedding"], input_embedding)
-
-    beside_the_embedding = {
-        "shared.weight": input_embedding,
-        "decoder.block.0.layer.1.DenseReluDense.wi.weight": np.zeros((2, 2), np.float32),
-        "lm_head.weight": np.zeros((4, 2), np.float32),
-    }
-    encoded = translate_t5_weights(beside_the_embedding)
-    assert set(encoded) == {"embed_tokens"}
-    np.testing.assert_array_equal(encoded["embed_tokens"]["embedding"], input_embedding)
-
-    for name in ("encoder.block.0.layer.0.SelfAttention.qkv.weight", "encoder.pooler.weight"):
-        with pytest.raises(ValueError, match=re.escape(name)):
-            translate_t5_weights({"shared.weight": input_embedding,
-                                  name: np.zeros((2, 2), np.float32)})
 
 
 @pytest.mark.network

@@ -69,7 +69,7 @@ def _failure(error: BaseException) -> str:
     return f"{type(error).__name__}: {error}"
 
 
-class _Refused(Exception):
+class _Refused(ValueError):
     """A configuration error found inside a session; it fails the rollout's future."""
 
 

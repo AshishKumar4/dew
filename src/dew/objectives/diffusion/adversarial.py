@@ -278,7 +278,8 @@ class AdversarialDistillationObjective(FlowDistillationObjective):
         noise = jax.random.normal(noise_key, samples.shape)
         noisy, _, _ = self.process.prediction.forward_diffusion(samples, noise,
                                                                  broadcast_rates(schedule, t, samples))
-        student = self.process.denoiser(self.model, self.model_variables(variables), conditions)
+        student = self.process.denoiser(self.model, self.model_variables(variables), conditions,
+                                        schedule=schedule)
         clean, _ = student(noisy, t)
 
         level_key, renoise_noise = jax.random.split(renoise_key)
@@ -316,7 +317,7 @@ class AdversarialDistillationObjective(FlowDistillationObjective):
             metrics["r1"] = jnp.mean(r1)
             total = total + self.r1_weight * r1
         if self.distillation_weight > 0:
-            target, _ = self.process.denoiser(self.teacher, teacher, conditions)(
+            target, _ = self.process.denoiser(self.teacher, teacher, conditions, schedule=schedule)(
                 renoised(jax.lax.stop_gradient(clean)), level)
             distance = jnp.sum(jnp.square(clean - jax.lax.stop_gradient(target)),
                                axis=tuple(range(1, clean.ndim)))

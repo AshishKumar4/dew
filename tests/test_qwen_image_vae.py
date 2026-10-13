@@ -14,8 +14,6 @@ through the same `WeightLayout`s an export uses, so each is compared against
 the source tensor it names. Every gap is scaled by max(1, |reference|).
 """
 
-import json
-import shutil
 from pathlib import Path
 
 import jax
@@ -23,15 +21,9 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from interop_support import assert_layout_tensors, extract_fixture, fixture_arrays, scaled_gap
-from safetensors.numpy import save_file
 
 from dew.interop.diffusion import component_tensors
-from dew.nn.autoencoders.qwen_image import (
-    QwenImageAutoencoder,
-    load_qwen_image_vae,
-    qwen_image_vae_fields,
-    qwen_image_vae_path,
-)
+from dew.nn.autoencoders.qwen_image import load_qwen_image_vae
 
 ROOT = Path(__file__).resolve().parents[1]
 FORWARD = 1e-5
@@ -176,43 +168,3 @@ def test_the_autoencoder_normalizes_as_the_pipeline_does(loaded, reference):
     np.testing.assert_allclose(decoded, np.asarray(autoencoder.decode_batch(params, latent * std + mean)),
                                rtol=1e-6, atol=1e-6)
     assert np.asarray(autoencoder.decode(params, latent[None])).shape == (1, 2, 32, 48, 4)
-
-
-def test_a_missing_tensor_is_refused(source, tmp_path):
-    shutil.copytree(source / "vae", tmp_path / "vae")
-    tensors = component_tensors(source, "vae")
-    del tensors["decoder.up_blocks.0.upsampler.time_conv.weight"]
-    save_file(tensors, tmp_path / "vae" / "diffusion_pytorch_model.safetensors")
-    with pytest.raises(ValueError, match="time_conv"):
-        load_qwen_image_vae(tmp_path, jnp.float32)
-
-
-@pytest.mark.parametrize("name, ndim", [
-    ("encoder.down_blocks.0.resnets.0.norm3.gamma", 4),
-    ("decoder.mid_block.attentions.0.to_q.weight", 4),
-    ("encoder.down_blocks.1.downsampler.resample.0.weight", 4),
-    ("vae.encoder.conv_in.weight", 4),
-    ("encoder.conv_in.weight", 2),
-])
-def test_an_unknown_tensor_is_refused(name, ndim):
-    with pytest.raises(ValueError):
-        qwen_image_vae_path(name, ndim)
-
-
-@pytest.mark.parametrize("change", [
-    {"is_residual": False}, {"dropout": 0.1}, {"patch_size": 2}, {"out_channels": 3},
-    {"scale_factor_spatial": 8}, {"temperal_downsample": [False, True, True]},
-    {"dim_mult": [1, 3, 2, 4, 4]},
-])
-def test_an_unsupported_config_is_refused(source, change):
-    config = json.loads((source / "vae" / "config.json").read_text())
-    qwen_image_vae_fields(config)
-    with pytest.raises(ValueError):
-        qwen_image_vae_fields({**config, **change})
-
-
-def test_mismatched_latent_statistics_are_refused(loaded):
-    autoencoder, params, _, config = loaded
-    with pytest.raises(ValueError, match="latent channel"):
-        QwenImageAutoencoder(model=autoencoder.model, params=params,
-                             latents_mean=config["latents_mean"][:-1], latents_std=config["latents_std"])

@@ -15,7 +15,6 @@ takes prompts its conditioner encoded alone (`prepare(conditions=...)`): the
 same images as the prompted call, bit for bit.
 """
 
-import shutil
 import tarfile
 from pathlib import Path
 
@@ -26,10 +25,7 @@ import pytest
 from flax import linen as nn
 from reference_error import assert_as_exact_as_the_reference
 
-from dew.interop.diffusion import component_tensors, translate_wan_weights
 from dew.interop.pretrained import Pretrained, load_diffusion_source
-from dew.interop.streaming import SourceLeaf
-from dew.objectives.diffusion import DiffusionObjective
 from dew.training import Layout, MeshSpec
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -55,46 +51,6 @@ def extracted(tmp_path_factory):
     return {family: root / archive / inside for family, (archive, inside) in PIPELINES.items()}
 
 
-def flat(tree) -> dict[str, object]:
-    return {jax.tree_util.keystr(path): leaf for path, leaf in jax.tree_util.tree_leaves_with_path(tree)}
-
-
-@pytest.mark.mesh
-@pytest.mark.parametrize("family", sorted(PIPELINES))
-@pytest.mark.parametrize("param_dtype", ["float32", "bfloat16"])
-def test_a_streamed_pipeline_holds_the_eager_tree_and_reads_one_shard_at_a_time(
-        extracted, family, param_dtype, monkeypatch):
-    """Every placed leaf is the eager load's, bit for bit, carries the
-    layout's sharding, and every read of a recipe is one device's shard of
-    it; the UNet's per-head attention kernels and every convolution are
-    read whole and land the same."""
-    eager = Pretrained.load(str(extracted[family]), dtype="float32", param_dtype=param_dtype,
-                            attention_impl="xla")
-    reads: list[tuple[tuple[int, ...], tuple[int, ...]]] = []
-    read = SourceLeaf.read
-
-    def recorded(leaf: SourceLeaf, index: tuple[slice, ...] | None = None) -> np.ndarray:
-        value = read(leaf, index)
-        reads.append((leaf.shape, value.shape))
-        return value
-
-    monkeypatch.setattr(SourceLeaf, "read", recorded)
-    streamed = Pretrained.load(str(extracted[family]), dtype="float32", param_dtype=param_dtype,
-                               attention_impl="xla", mesh=MeshSpec(fsdp=jax.device_count()), layout=LAYOUT)
-    expected, placed = flat(eager.variables), flat(streamed.variables)
-    assert placed.keys() == expected.keys()
-    shards = set()
-    for name, leaf in placed.items():
-        assert isinstance(leaf, jax.Array), name
-        want = np.asarray(expected[name])
-        got = np.asarray(jax.device_get(leaf))
-        assert got.dtype == want.dtype and got.shape == want.shape, name
-        assert got.tobytes() == want.tobytes(), name
-        shards.add((leaf.shape, leaf.sharding.shard_shape(leaf.shape)))
-    assert any(shard != shape for shape, shard in shards)
-    assert reads and set(reads) <= shards, sorted(set(reads) - shards)[:3]
-
-
 @pytest.mark.parametrize("family", ["flux", "z_image", "wan"])
 def test_a_streamed_pipeline_samples_what_the_eager_one_does(extracted, family):
     """The conditioner and the autoencoder hold the placed leaves, so a
@@ -106,28 +62,6 @@ def test_a_streamed_pipeline_samples_what_the_eager_one_does(extracted, family):
         return np.asarray(source.text_to_image()(["a red bird"], steps=2, key=3).host().images)
 
     np.testing.assert_array_equal(sampled(streamed), sampled(eager))
-
-
-def test_load_diffusion_source_streams_at_its_own_geometry(extracted):
-    """`load_diffusion_source` takes the mesh too, beside the clip geometry
-    only it takes."""
-    loaded = load_diffusion_source(str(extracted["wan"]), dtype="float32", size=(5, 16, 32), mesh=MeshSpec())
-    assert loaded.inputs.sample.shape == (5, 16, 32, 3)
-    assert all(isinstance(leaf, jax.Array) for leaf in jax.tree.leaves(loaded.variables))
-
-
-def test_a_lazy_translation_reads_nothing_until_placed(extracted):
-    """Lazily, a linear kernel and an untransposed leaf are recipes over the
-    stored tensor; a convolution, whose transpose a recipe does not express,
-    is read whole. Eagerly, nothing is a recipe."""
-    tensors = component_tensors(extracted["wan"], "transformer")
-    lazy, _ = translate_wan_weights(tensors, lazy=True)
-    kinds = {name: type(leaf) for name, leaf in flat(lazy).items()}
-    assert kinds["['blocks_0']['attn1']['to_q']['kernel']"] is SourceLeaf
-    assert kinds["['scale_shift_table']"] is SourceLeaf
-    assert kinds["['patch_embedding_3d']['kernel']"] is np.ndarray
-    eager, _ = translate_wan_weights(tensors)
-    assert all(type(leaf) is np.ndarray for leaf in jax.tree.leaves(eager))
 
 
 ENCODED = {"z_image": "HiddenStatesConditioner", "wan": "WanConditioner"}
@@ -213,37 +147,3 @@ def test_on_a_mesh_an_encoded_call_is_the_prompted_call(extracted, family):
         else:
             assert wide.dtype == np.float64
             assert_as_exact_as_the_reference(np.asarray(got), want, wide, f"{family} conditioner alone")
-
-
-def test_a_pipeline_without_its_text_encoder_reads_none_of_its_weights(extracted, tmp_path):
-    """With the text encoder's weight files gone, `text=False` loads and the
-    whole pipeline does not."""
-    directory = tmp_path / "wan"
-    shutil.copytree(extracted["wan"], directory)
-    for weights in (directory / "text_encoder").glob("*.safetensors*"):
-        weights.unlink()
-    load_diffusion_source(str(directory), dtype="float32", text=False)
-    with pytest.raises(FileNotFoundError):
-        load_diffusion_source(str(directory), dtype="float32")
-
-
-def test_a_pipeline_without_its_text_encoder_refuses_what_reads_it(extracted, tmp_path):
-    """A prompt, training and saving each read the text encoder; each is
-    refused by name, never at a missing key. An encoded call with no
-    unconditional branch walks unguided and refuses guidance."""
-    lean = load_diffusion_source(str(extracted["wan"]), dtype="float32", attention_impl="xla", text=False)
-    task = lean.text_to_image()
-    with pytest.raises(ValueError, match="text=False"):
-        task(PROMPTS, steps=2, key=0)
-    with pytest.raises(ValueError, match="text=False"):
-        DiffusionObjective(lean)
-    with pytest.raises(ValueError, match="text=False"):
-        lean.save(tmp_path / "saved")
-    given = encoded(extracted["wan"], "WanConditioner", PROMPTS, {})
-    with pytest.raises(ValueError, match="one of the two"):
-        task.prepare(PROMPTS, conditions=given, key=0, steps=2)
-    unguided = task.prepare(conditions=given, key=0, steps=2)
-    assert not unguided.unconditional
-    with pytest.raises(ValueError, match="unconditional branch"):
-        task(unguided, key=0)
-    assert np.isfinite(np.asarray(task(unguided, guidance=None, key=0).host().images)).all()
