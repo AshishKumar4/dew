@@ -28,11 +28,20 @@ from dew.interop.weights import ParamTree, checkpoint_array, translate_parameter
 from dew.nn.activations import activation as named_activation
 from dew.nn.attention import LayerNorm, RMSNorm
 from dew.nn.backbones.decoder_block import DecoderBlock
-from dew.nn.inputs import AttentionMetadata
+from dew.nn.inputs import AttentionMetadata, coordinates
 from dew.nn.text_encoders import clip_layer
 
 Attention = Literal["full", "band", "window"]
 Order = Literal["patches", "columns", "windows"]
+
+
+def _documents(segment):
+    """The `Coordinates` of a layer's `segment` ids, each token keeping its index as its position (the
+    rotation is the metadata's own); None for a layer that attends unmasked."""
+    if segment is None:
+        return None
+    return coordinates(segments=segment, positions=jnp.broadcast_to(jnp.arange(segment.shape[1]),
+                                                                     segment.shape))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -237,9 +246,10 @@ class VisionTransformer(nn.Module):
                 frames = _gather(jnp.where(valid, frame + 1, 0), order)
                 first = (frames != jnp.pad(frames, ((0, 0), (1, 0)))[:, :-1]) & (frames > 0)
                 bias = jnp.where(first[:, None, None, :], sinks[None, :, None, None], 0.0)
-            metadata = AttentionMetadata(rotary_positions=_gather(rotary, order), position_bias=bias)
+            metadata = AttentionMetadata(coordinates=_documents(segment),
+                                         rotary_positions=_gather(rotary, order), position_bias=bias)
             hidden = vit_block(lay, index, dtype=self.dtype, precision=self.precision)(
-                hidden, segment_ids=segment, attention_metadata=metadata)
+                hidden, attention_metadata=metadata)
             # A block without hyper-connections hands on the plain residual.
             assert isinstance(hidden, jax.Array)
         leaving = orders[current]
