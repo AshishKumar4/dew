@@ -50,13 +50,13 @@ the memory), at which its spaces are proven too; keys cannot split. fp32 keys ta
 class Tiles:
     """One launch's tiles: its key and value column blocks (fla's `BK`, `BV`; 0 where a kernel blocks
     neither), its warps, its pipeline stages, and the value heads a program takes (fla's `BH`, Kimi
-    delta attention's diagonal kernel's; 1 elsewhere)."""
+    delta attention's diagonal kernel's; 0 where a program takes one)."""
 
     bk: int
     bv: int
     warps: int
     stages: int
-    bh: int = 1
+    bh: int = 0
 
 
 @dataclasses.dataclass(frozen=True)
