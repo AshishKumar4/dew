@@ -263,7 +263,7 @@ def drawn(seed=0):
 
 
 class Preempting(RecordingTracker):
-    """Sends this process the scheduler's SIGTERM once step `at` is logged."""
+    """Sends this process the scheduler's SIGTERM, once, when step `at` is logged."""
 
     def __init__(self, at):
         super().__init__()
@@ -272,6 +272,7 @@ class Preempting(RecordingTracker):
     def log(self, scalars, step):
         super().log(scalars, step)
         if step == self.at:
+            self.at = None
             os.kill(os.getpid(), signal.SIGTERM)
 
 
