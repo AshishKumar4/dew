@@ -140,3 +140,19 @@ def test_public_diffusion_export_preserves_mapped_snapshot_when_republished(save
             original[layout.name] + np.float32(1.0) if layout.name == changed.name else original[layout.name]
         )
         np.testing.assert_array_equal(layout.export(latest.variables), expected)
+
+
+def test_a_resized_xl_conditioning_rebuilds_from_its_record_at_its_own_size(saved_pipelines):
+    """An XL pipeline loaded at 64x48 instead of its own 32x32 states that size in its time ids, and
+    the conditioner its run record rebuilds states the same, where it used to read the pipeline's
+    own size back."""
+    from dew.inputs import Condition
+    from dew.interop.pretrained import load_diffusion_source
+
+    source = load_diffusion_source(str(saved_pipelines / "xl"), dtype="float32", attention_impl="xla",
+                                   size=(64, 48))
+    condition = source.inputs.conditions["conditioning"]
+    assert condition.encoder.time_id_values == (64, 48, 0, 0, 64, 48)
+    assert source.inputs.sample.shape[:2] == (64, 48)
+    reloaded = Condition.from_json(condition.to_json(), params=condition.encoder.params)
+    assert reloaded.encoder.time_id_values == condition.encoder.time_id_values
