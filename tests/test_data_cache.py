@@ -52,15 +52,18 @@ class CountedStep:
         return {**row, "value": attempt if self.volatile else row_id + 10}
 
 
-def _cached_passes(step, directory, records=8):
+def _cached_passes(step, directory, records=8, read="indexed"):
     from dew.data.compile import compile
     from dew.data.dataset import DataPartition, Loading
 
     source = Memory([{"id": index} for index in range(records)])
     prefix = (source.filter_map(step, identity="counted@1") if step.reject_first
               else source.map(step, identity="counted@1"))
-    chain = prefix.cache(str(directory)).take(2).repeat(2).batch(1)
-    loader = compile(chain, read="indexed", loading=Loading(workers=0, threads=1, read_buffer=1))
+    chain = prefix.cache(str(directory))
+    if records > 2:
+        chain = chain.take(2)
+    chain = chain.repeat(2).batch(1)
+    loader = compile(chain, read=read, loading=Loading(workers=0, threads=1, read_buffer=1))
     reader = loader.train(DataPartition())
     try:
         return [(int(batch["id"][0]), int(batch["value"][0])) for batch in reader]
@@ -69,19 +72,21 @@ def _cached_passes(step, directory, records=8):
 
 
 @pytest.mark.parametrize("records", [2, 8])
-def test_volatile_cache_reruns_prefix_on_later_passes(tmp_path, records):
+@pytest.mark.parametrize("read", ["indexed", "streamed"])
+def test_volatile_cache_reruns_prefix_on_later_passes(tmp_path, records, read):
     step = CountedStep(volatile=True)
-    assert _cached_passes(step, tmp_path, records) == [(0, 1), (1, 1), (0, 2), (1, 2)]
+    assert _cached_passes(step, tmp_path, records, read) == [(0, 1), (1, 1), (0, 2), (1, 2)]
     assert step.calls[0] == step.calls[1] == 2
-    assert not list(tmp_path.rglob("*.array_record"))
+    assert not list(tmp_path.iterdir())
 
 
 @pytest.mark.parametrize("permanent", [True, False])
-def test_volatile_cache_retries_rejected_rows_on_later_passes(tmp_path, permanent):
+@pytest.mark.parametrize("read", ["indexed", "streamed"])
+def test_volatile_cache_retries_rejected_rows_on_later_passes(tmp_path, permanent, read):
     step = CountedStep(volatile=True, reject_first=True, permanent=permanent)
-    assert _cached_passes(step, tmp_path) == [(1, 1), (2, 1), (0, 2), (1, 2)]
+    assert _cached_passes(step, tmp_path, read=read) == [(1, 1), (2, 1), (0, 2), (1, 2)]
     assert step.calls[0] == step.calls[1] == 2
-    assert not list(tmp_path.rglob("*.array_record"))
+    assert not list(tmp_path.iterdir())
 
 
 def test_deterministic_cache_serves_prefix_on_later_passes(tmp_path):
