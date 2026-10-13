@@ -91,6 +91,8 @@ def arguments() -> argparse.Namespace:
     parser.add_argument("--eps", type=float, default=1e-8)
     parser.add_argument("--state-dtype", choices=("float32", "bfloat16"), default="float32",
                         help="Adam's moments in memory (OptimConfig.state_dtype)")
+    parser.add_argument("--remat", default=None,
+                        help="the decoder's starting remat policy, a name in REMAT_POLICIES")
     parser.add_argument("--weight-decay", type=float, default=0.1)
     parser.add_argument("--clip", type=float, default=1.0)
     parser.add_argument("--aux-loss-alpha", type=float, default=None,
@@ -135,6 +137,7 @@ def build(args: argparse.Namespace) -> Run:
     from dew.config import OptimConfig
     from dew.interop import Pretrained
     from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.nn.multimodal import MultimodalTransformer
     from dew.objectives.lm import TEXT_KEY, LMObjective
     from dew.training import MeshSpec, Trainer
     from dew.training.distributed import batch_shardings
@@ -150,6 +153,10 @@ def build(args: argparse.Namespace) -> Run:
     pretrained = Pretrained.load(args.model, dtype=args.dtype, param_dtype="float32",
                                  attention_impl=args.attention)
     model = pretrained.model
+    if args.remat is not None:
+        text = model.language_model if isinstance(model, MultimodalTransformer) else model
+        text = text.clone(remat=args.remat)
+        model = model.clone(language_model=text) if isinstance(model, MultimodalTransformer) else text
     if args.dispatch is not None:
         if not isinstance(model, CausalTransformer) or model.mixture is None:
             raise SystemExit(f"--dispatch sets a mixture's dispatch, and {args.model} builds no mixture")
