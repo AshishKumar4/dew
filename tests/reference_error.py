@@ -233,7 +233,8 @@ def _evaluated(jaxpr, consts, args, given=None):
     last = {var: index for index, equation in enumerate(jaxpr.eqns)
             for var in equation.invars if not isinstance(var, Literal)}
     for var in jaxpr.outvars:
-        last.pop(var, None)
+        if not isinstance(var, Literal):
+            last.pop(var, None)
     for index, equation in enumerate(jaxpr.eqns):
         inputs = [read(var) for var in equation.invars]
         with equation.ctx.manager:
