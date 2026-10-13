@@ -75,9 +75,9 @@ def runs(tmp_path_factory, request):
 def test_the_loss_is_the_papers_equation(runs):
     """Per row a scale w ~ U(1, 6); the student reads it as its guidance and
     matches u + w (c - u) of the teacher's two branches on the same noised
-    sample, in raw output, under Dew's halved L2. Teacher and student read
-    the sample at the time drawn on the training schedule, input-scaled for
-    it."""
+    sample, in raw output, under Dew's halved L2 weighted as the process
+    weighs the time. Teacher and student read the sample at the time drawn
+    on the training schedule, input-scaled for it."""
     _, config, batch = runs
     task = config.build()
     assert isinstance(task, GuidanceDistillationObjective)
@@ -106,7 +106,8 @@ def test_the_loss_is_the_papers_equation(runs):
     target = unconditional + scale.reshape(-1, 1, 1, 1) * (conditional - unconditional)
     student_given, _ = task._conditions(params, batch, drop_key, dropout=False)
     output = task.model.apply(task.model_variables(params), x, time, **with_guidance(student_given, scale))
-    expected = jnp.mean(0.5 * jnp.square(output - target))
+    # Weighted per row as the process weighs its times: one for flow matching, EDM's lambda(sigma).
+    expected = jnp.mean(0.5 * jnp.square(output - target) * task.process.weight(t).reshape(-1, 1, 1, 1))
     assert float(loss.total / loss.mass) == pytest.approx(float(expected), rel=1e-5)
     modules = [program.module.clone() for program in task.program_key()]
     task.substitute(modules)
