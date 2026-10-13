@@ -12,7 +12,7 @@ from reference_error import assert_as_exact_as_the_reference
 
 from dew.interop import Pretrained, codecs
 from dew.interop.safetensors_io import read_weights
-from dew.training.quantization import FP8Input, fp8_input_qdq
+from dew.training.quantization import InputQuantizer, fp8_input_qdq
 
 FIXTURE = Path(__file__).parent / 'fixtures' / 'codecs' / 'modelopt' / 'mixed'
 
@@ -41,7 +41,7 @@ def test_static_fp8_inputs_match_modelopts_own_fake_quantizer(mixed, dtype):
         if not key.endswith('/inputs'):
             continue
         stem = key.removesuffix('/inputs')
-        spec = FP8Input(float(reference[stem + '/global'].reshape(())))
+        spec = InputQuantizer.fp8(float(reference[stem + '/global'].reshape(())))
         quantize = jax.jit(lambda value, spec=spec: fp8_input_qdq(value, spec))
         actual = quantize(jnp.asarray(reference[key], dtype))
         expected = reference[stem + ('/qdq' if dtype == jnp.float32 else '/qdq_bf16')]
