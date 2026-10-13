@@ -304,8 +304,9 @@ class ChunkLocalCumsum(_Launch):
     NAME = "chunk_local_cumsum"
     KEYS, VALUES = None, None
 
-    def _fwd(self, g, chunk_spans, sequence_spans, *,
-             chunk, scale, reverse, interpret: bool, config: Tiles, return_residuals: bool = False):
+    def _fwd(self, g: jax.Array, chunk_spans: jax.Array, sequence_spans: jax.Array, *, chunk: int,
+             scale: float, reverse: bool, interpret: bool, config: Tiles,
+             return_residuals: bool = False):
         from jax.experimental.pallas import triton as plgpu
 
         spans = Sequences(chunk_spans, sequence_spans)
@@ -459,8 +460,9 @@ class KktSolve(_Launch):
     NAME = "kkt_solve"
     KEYS, VALUES = 'k', None
 
-    def _fwd(self, k, g, beta, chunk_spans, sequence_spans, *,
-             chunk, sub, interpret: bool, config: Tiles, return_residuals: bool = False):
+    def _fwd(self, k: jax.Array, g: jax.Array, beta: jax.Array, chunk_spans: jax.Array,
+             sequence_spans: jax.Array, *, chunk: int, sub: int, interpret: bool, config: Tiles,
+             return_residuals: bool = False):
         from jax.experimental.pallas import triton as plgpu
 
         spans = Sequences(chunk_spans, sequence_spans)
@@ -537,8 +539,9 @@ class RecomputeWU(_Launch):
     NAME = "recompute_w_u"
     KEYS, VALUES = 'k', 'v'
 
-    def _fwd(self, k, v, beta, a, g, chunk_spans, sequence_spans, *,
-             chunk, interpret: bool, config: Tiles, return_residuals: bool = False):
+    def _fwd(self, k: jax.Array, v: jax.Array, beta: jax.Array, a: jax.Array, g: jax.Array,
+             chunk_spans: jax.Array, sequence_spans: jax.Array, *, chunk: int, interpret: bool,
+             config: Tiles, return_residuals: bool = False):
         from jax.experimental.pallas import triton as plgpu
 
         spans = Sequences(chunk_spans, sequence_spans)
@@ -656,8 +659,9 @@ class ChunkFwdH(_Launch):
     NAME = "chunk_fwd_h"
     KEYS, VALUES = 'k', 'u'
 
-    def _fwd(self, k, w, u, g, h0, chunk_spans, sequence_spans, *,
-             chunk, interpret: bool, config: Tiles, return_residuals: bool = False):
+    def _fwd(self, k: jax.Array, w: jax.Array, u: jax.Array, g: jax.Array, h0: jax.Array,
+             chunk_spans: jax.Array, sequence_spans: jax.Array, *, chunk: int, interpret: bool,
+             config: Tiles, return_residuals: bool = False):
         from jax.experimental.pallas import triton as plgpu
 
         spans = Sequences(chunk_spans, sequence_spans)
@@ -793,8 +797,9 @@ class ChunkBwdDhu(_Launch):
     NAME = "chunk_bwd_dhu"
     KEYS, VALUES = 'k', 'do'
 
-    def _fwd(self, q, k, w, g, dht, do, dv, chunk_spans, sequence_spans, *,
-             scale, chunk, interpret: bool, config: Tiles, return_residuals: bool = False):
+    def _fwd(self, q: jax.Array, k: jax.Array, w: jax.Array, g: jax.Array, dht: jax.Array, do: jax.Array,
+             dv: jax.Array, chunk_spans: jax.Array, sequence_spans: jax.Array, *, scale: float,
+             chunk: int, interpret: bool, config: Tiles, return_residuals: bool = False):
         from jax.experimental.pallas import triton as plgpu
 
         spans = Sequences(chunk_spans, sequence_spans)
@@ -888,8 +893,9 @@ class ChunkBwdDvLocal(_Launch):
     NAME = "chunk_bwd_dv_local"
     KEYS, VALUES = 'k', 'do'
 
-    def _fwd(self, q, k, g, do, chunk_spans, sequence_spans, *,
-             scale, chunk, interpret: bool, config: Tiles, return_residuals: bool = False):
+    def _fwd(self, q: jax.Array, k: jax.Array, g: jax.Array, do: jax.Array, chunk_spans: jax.Array,
+             sequence_spans: jax.Array, *, scale: float, chunk: int, interpret: bool, config: Tiles,
+             return_residuals: bool = False):
         from jax.experimental.pallas import triton as plgpu
 
         spans = Sequences(chunk_spans, sequence_spans)
@@ -1019,8 +1025,10 @@ class ChunkBwdDqkwg(_Launch):
     NAME = "chunk_bwd_dqkwg"
     KEYS, VALUES = 'k', 'v'
 
-    def _fwd(self, q, k, v, w, g, h, dv, do, dh, chunk_spans, sequence_spans, *,
-             scale, chunk, interpret: bool, config: Tiles, return_residuals: bool = False):
+    def _fwd(self, q: jax.Array, k: jax.Array, v: jax.Array, w: jax.Array, g: jax.Array, h: jax.Array,
+             dv: jax.Array, do: jax.Array, dh: jax.Array, chunk_spans: jax.Array,
+             sequence_spans: jax.Array, *, scale: float, chunk: int, interpret: bool, config: Tiles,
+             return_residuals: bool = False):
         from jax.experimental.pallas import triton as plgpu
 
         spans = Sequences(chunk_spans, sequence_spans)
@@ -1165,8 +1173,9 @@ class PrepareWyReprBwd(_Launch):
     NAME = "prepare_wy_repr_bwd"
     KEYS, VALUES = 'k', 'v'
 
-    def _fwd(self, k, v, beta, g, a, dw, du, dk, chunk_spans, sequence_spans, *,
-             chunk, interpret: bool, config: Tiles, return_residuals: bool = False):
+    def _fwd(self, k: jax.Array, v: jax.Array, beta: jax.Array, g: jax.Array, a: jax.Array, dw: jax.Array,
+             du: jax.Array, dk: jax.Array | None, chunk_spans: jax.Array, sequence_spans: jax.Array, *,
+             chunk: int, interpret: bool, config: Tiles, return_residuals: bool = False):
         from jax.experimental.pallas import triton as plgpu
 
         spans = Sequences(chunk_spans, sequence_spans)
@@ -1261,8 +1270,9 @@ class ChunkFwdO(_Launch):
     NAME = "chunk_fwd_o"
     KEYS, VALUES = 'k', 'v'
 
-    def _fwd(self, q, k, v, h, g, chunk_spans, sequence_spans, *,
-             scale, chunk, interpret: bool, config: Tiles, return_residuals: bool = False):
+    def _fwd(self, q: jax.Array, k: jax.Array, v: jax.Array, h: jax.Array, g: jax.Array,
+             chunk_spans: jax.Array, sequence_spans: jax.Array, *, scale: float, chunk: int,
+             interpret: bool, config: Tiles, return_residuals: bool = False):
         from jax.experimental.pallas import triton as plgpu
 
         spans = Sequences(chunk_spans, sequence_spans)
