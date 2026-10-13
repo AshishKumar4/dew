@@ -26,9 +26,10 @@ from dew.registry import Record
 from .activations import gelu_exact
 from .attention import LayerNorm, RMSNorm
 from .audio import AudioEncoding
-from .backbones.decoder_block import BlockWiring, DecoderBlock, GatedMLP
-from .inputs import AttentionMetadata
+from .backbones.decoder_block import BlockWiring, DecoderBlock
+from .inputs import AttentionMetadata, coordinates
 from .mixers.attention import CausalSelfAttention
+from .mlp import GatedMLP
 from .quantizers import residual_quantize
 from .vision import TowerBase, TowerGeometry
 
@@ -156,7 +157,10 @@ class AudioTokenizerEncoder(nn.Module):
             block = DecoderBlock(attention, mlp, cfg.d_model, BlockWiring(), norm_eps=1e-5, norm_type="layer",
                                  norm_bias=True, dtype=self.dtype, precision=self.precision,
                                  name=f"layers_{index}")
-            x = block(x, segment_ids=valid.astype(jnp.int32), attention_metadata=AttentionMetadata())
+            # The padding runs as a document of its own; each frame keeps its index as its position.
+            places = jnp.broadcast_to(jnp.arange(valid.shape[1]), valid.shape)
+            x = block(x, attention_metadata=AttentionMetadata(
+                coordinates=coordinates(segments=valid.astype(jnp.int32), positions=places)))
             assert isinstance(x, jax.Array)
             if cfg.encoder_skip_layer_id is not None and index == cfg.encoder_skip_layer_id - 1:
                 skip = x
