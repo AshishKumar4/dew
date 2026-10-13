@@ -114,7 +114,7 @@ from dew.objectives.base import Variables
 from dew.sampling.decoding import LogitsTransform, Stopping
 from dew.sampling.guided import Grammar
 from dew.sampling.strategies import Sample
-from dew.sampling.text import Generation, Sampling, check_inputs, rebuild_position, resolve
+from dew.sampling.text import Generation, Sampling, check_inputs, decoding_storage, rebuild_position, resolve
 
 Prompt = str | Sequence[int] | ArrayLike | ModelInputs
 """One request: text for the processor, one row of token ids, or one prepared row."""
@@ -391,7 +391,9 @@ class Server:
     prefills. A request whose prompt and budget do not fit the capacity is
     refused at `submit`, with the error `TextGeneration` raises for a request
     over the model's context. Over a mesh, the slots and the admission split
-    evenly over the groups of rows, and so do the pages of a paged pool.
+    evenly over the groups of rows, and so do the pages of a paged pool. The
+    server holds the weights at their decoding storage (`decoding_storage`),
+    to which `reload` casts the weights it is handed.
     """
 
     def __init__(self, model: nn.Module, variables: Variables, processor: Processor | None, *,
@@ -406,6 +408,7 @@ class Server:
                                chunked=rows.chunk is not None, mixed=rows.placement.mixed)
         if type(decode_steps) is not int or decode_steps < 1:
             raise ValueError("decode_steps must be a positive number of iterations per device call")
+        variables = decoding_storage(model, variables)
         self.mesh = mesh_of(variables)
         self.groups = _row_groups(self.mesh)
         if slots % self.groups or admission % self.groups:
