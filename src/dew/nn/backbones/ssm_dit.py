@@ -4,9 +4,8 @@ blocks in a configurable ratio. The S5 layers live in ssm.py; the block and
 the patchify/conditioning/output machinery live in dit.py.
 """
 
+import functools
 from collections.abc import Sequence
-
-from flax import linen as nn
 
 from ..dit import ModulatedBlock, build_block_pattern, remat_block
 from .dit import SimpleDiT
@@ -28,25 +27,17 @@ class HybridSSMAttentionDiT(SimpleDiT):
     bidirectional_ssm: bool = True
     use_2d_fusion: bool = False  # 2D state fusion in SSM blocks (see SpatialFusionConv)
 
-    @nn.nowrap
-    def counted_blocks(self) -> list[ModulatedBlock]:
-        """The configured hybrid pattern, without lifting its counting methods."""
-        pattern = build_block_pattern(self.num_layers, self.ssm_attention_ratio, self.block_pattern)
-        return [ModulatedBlock(features=self.emb_features, num_heads=self.num_heads,
-                               mixer='ssm' if kind == 'ssm' else 'attention',
-                               ssm_state_dim=self.ssm_state_dim, bidirectional_ssm=self.bidirectional_ssm,
-                               use_2d_fusion=self.use_2d_fusion, **self._block_options(), parent=None)
-                for kind in pattern]
-
-    def block(self, index: int, block_type: str) -> ModulatedBlock:
-        """Build layer `index`'s block, with an SSM mixer or an attention mixer.
+    def block(self, index: int, block_type: str, *, counted: bool = False) -> ModulatedBlock:
+        """Build layer `index`'s block, with an SSM mixer or an attention mixer; `counted`,
+        unbound and without remat, for work accounting.
 
         The two share the width, the MLP ratio and the norms. They differ
         in the mixer they name, the fields only that mixer reads, the remat
         policy, and the name a checkpoint stores them under.
         """
         def build(block_cls, policy: str | None, **fields) -> ModulatedBlock:
-            return remat_block(block_cls, self.remat, policy=policy)(
+            make = functools.partial(
+                block_cls if counted else remat_block(block_cls, self.remat, policy=policy),
                 features=self.emb_features,
                 num_heads=self.num_heads,
                 mlp_ratio=self.mlp_ratio,
@@ -57,6 +48,7 @@ class HybridSSMAttentionDiT(SimpleDiT):
                 adaln_silu=self.adaln_silu,
                 **fields,
             )
+            return make(parent=None) if counted else make()
 
         if block_type == 'ssm':
             return build(
@@ -77,8 +69,9 @@ class HybridSSMAttentionDiT(SimpleDiT):
             name=f"dit_block_{index}",
         )
 
-    def stack(self) -> list[ModulatedBlock]:
-        """Return the layers' blocks, each the block that `ssm_attention_ratio` or `block_pattern` names.
+    def stack(self, *, counted: bool = False) -> list[ModulatedBlock]:
+        """Return the layers' blocks, each the block that `ssm_attention_ratio` or `block_pattern` names;
+        `counted`, unbound and without remat (`counted_blocks`).
 
         Raises `ValueError` when both are set, or when TREAD's routes are
         combined with `use_2d_fusion`.
@@ -92,4 +85,4 @@ class HybridSSMAttentionDiT(SimpleDiT):
                              "lay out on the image grid; set use_2d_fusion=False to route")
         pattern = build_block_pattern(
             self.num_layers, self.ssm_attention_ratio, self.block_pattern)
-        return [self.block(index, block_type) for index, block_type in enumerate(pattern)]
+        return [self.block(index, block_type, counted=counted) for index, block_type in enumerate(pattern)]
