@@ -281,7 +281,7 @@ def test_native_export_failure_keeps_body_exception_and_trace(tmp_path, native_r
 def test_construction_is_configuration_only_in_a_fresh_process(tmp_path):
     script = """import sys
 import dew
-assert 'jax' not in sys.modules and 'xprof' not in sys.modules
+assert 'xprof' not in sys.modules
 p = dew.Profiler(sys.argv[1])
 assert not p.running and 'xprof' not in sys.modules
 assert not p.directory.exists()

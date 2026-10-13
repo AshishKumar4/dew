@@ -22,18 +22,36 @@ from flax.core import unfreeze
 from dew.interop.streaming import SourceLeaf
 from dew.nn.protocols import ProjectionGroup, Serving
 from dew.objectives.base import Variables
+from dew.training.quantization import QUANTIZATION
+
+
+def _node(variables: Variables, collection: str, path: Sequence[str]) -> dict:
+    node = variables.get(collection, {})
+    for part in path:
+        node = node.get(part, {})
+    return node
+
+
+def _same_quantization(variables: Variables, group: ProjectionGroup) -> bool:
+    """Whether the members' input quantization, which each holds at its own
+    scope (`QUANTIZATION`), is one: they read one input, so the packed product
+    quantizes it once, exactly as each member would."""
+    node = _node(variables, QUANTIZATION, group.path)
+    held = [node.get(name, {}) for name in group.members]
+    return all(set(leaves) == set(held[0]) and all(
+        np.array_equal(np.asarray(leaves[leaf]), np.asarray(held[0][leaf])) for leaf in leaves)
+        for leaves in held)
 
 
 def _concatenates(variables: Variables, group: ProjectionGroup) -> bool:
     """Whether `variables` hold `group` packed, or hold members that concatenate:
     each a kernel and maybe a bias, of one dtype and one input shape, stored
-    as arrays or source leaves."""
-    node = variables.get("params", {})
-    for part in group.path:
-        node = node.get(part, {})
+    as arrays or source leaves, under one input quantization."""
+    node = _node(variables, "params", group.path)
     held = [node.get(name, {}) for name in group.members]
     fields = set(held[0])
-    return group.packed in node or ("kernel" in fields and fields <= {"kernel", "bias"} and all(
+    return group.packed in node or (_same_quantization(variables, group) and "kernel" in fields
+                                    and fields <= {"kernel", "bias"} and all(
         set(projection) == fields for projection in held) and all(
         isinstance(projection[field], (jax.Array, np.ndarray, SourceLeaf))
         and projection[field].dtype == held[0][field].dtype
@@ -73,6 +91,11 @@ def pack_projections(variables: Variables, groups: Sequence[ProjectionGroup]) ->
         node[group.packed] = {field: joined(field) for field in node[group.members[0]]}
         for projection in group.members:
             del node[projection]
+        quantized = _node(packed, QUANTIZATION, group.path)
+        if group.members[0] in quantized:
+            quantized[group.packed] = quantized[group.members[0]]
+            for projection in group.members:
+                del quantized[projection]
     return packed
 
 

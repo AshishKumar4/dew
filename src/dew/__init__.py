@@ -19,12 +19,17 @@ On a machine with an NVIDIA GPU, `import dew` stops with the install that
 fixes it where JAX would run on the CPU: no CUDA build of JAX installed, or
 none this driver runs (docs/installation.md, "Which CUDA build").
 `JAX_PLATFORMS=cpu` asks for the CPU and is not stopped.
+
+`import dew` also makes the two JAX user contexts the kernel autotuner keys
+traces on (`dew.cache.KERNEL_TUNES`, `KERNEL_PINS`): JAX makes one only
+beside no other JAX call, so before any thread starts.
 """
 
 from collections.abc import Callable
 from importlib import import_module
 from typing import TYPE_CHECKING
 
+from dew import cache as cache
 from dew.logging import configure as _configure_logging
 from dew.telemetry.devices import (
     keep_roundings as _keep_roundings,
