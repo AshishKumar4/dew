@@ -623,10 +623,9 @@ def _v4_rope(entry: Mapping[str, object], field: str, head_dim: int, width: int,
     The entry's own `partial_rotary_factor` sizes its table, and so the
     slice the layers on it rotate (modeling_deepseek_v4.py:131-134); one
     naming another width than the model's has no counterpart in a mixer
-    that rotates one. A YaRN entry changes the frequencies alone here, so
-    an `attention_factor` other than the 1.0 V4's own configs force
-    refuses: the reference multiplies its cos and sin by it (:151-152),
-    and an entry that names none derives a factor that does.
+    that rotates one. A YaRN entry's `attention_factor` scales cos and sin
+    (:151-152): the flat spelling's 1.0 leaves them alone, and a nested
+    entry that names none derives YaRN's own.
     """
     fraction = record_float(entry, 'partial_rotary_factor', 1.0)
     if int(head_dim * fraction) != width:
@@ -643,10 +642,6 @@ def _v4_rope(entry: Mapping[str, object], field: str, head_dim: int, width: int,
     if rope_type != 'yarn':
         refuse(f"{field} rope_type {rope_type!r}",
                 "the mixer applies plain or YaRN rotary positions")
-    if entry.get('attention_factor') != 1.0:
-        refuse(f"{field} attention_factor {entry.get('attention_factor')!r}",
-                "V4's rotary scales its cos and sin by this factor, and its "
-                "own configs set the 1.0 that leaves them alone")
     ramp = {key: value for key, value in entry.items()
             if key != 'partial_rotary_factor'}
     ramp.setdefault('original_max_position_embeddings', max_pos)
