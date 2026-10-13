@@ -67,7 +67,7 @@ class CLIPTowerOutput(NamedTuple):
     pooler_output: jax.Array
 
 
-_ACTIVATIONS = {"quick_gelu": "quick_gelu", "gelu_pytorch_tanh": "gelu", "gelu": "gelu_exact"}
+TOWER_ACTIVATIONS = {"quick_gelu": "quick_gelu", "gelu_pytorch_tanh": "gelu", "gelu": "gelu_exact"}
 """A tower's `hidden_act` as the ungated feed-forward names it
 (`dew.nn.activations.UNGATED`): torch's erf GELU for 'gelu'."""
 
@@ -90,16 +90,16 @@ def clip_layer(width: int, heads: int, hidden: int, positions: int, *, causal: b
     map (`packed`). The MLP is two biased maps around the checkpoint's
     `hidden_act`, `activation`.
     """
-    if activation not in _ACTIVATIONS:
+    if activation not in TOWER_ACTIVATIONS:
         raise ValueError(f"activation {activation!r} is not expressible: this layer runs "
-                         f"{', '.join(_ACTIVATIONS)}")
+                         f"{', '.join(TOWER_ACTIVATIONS)}")
     attention = functools.partial(
         CausalSelfAttention, emb_features=width, num_heads=heads, num_kv_heads=heads, head_dim=width // heads,
         max_seq_len=positions, causal=causal, nope=rotary_axes is None, qk_norm=False, attention_bias=True,
         rotary_axes=rotary_axes, rotary_pairs=rotary_pairs, rope_theta=rope_theta, packed=packed,
         dtype=dtype, precision=precision)
     mlp = functools.partial(GatedMLP, hidden_features=hidden, out_features=width,
-                            activation=_ACTIVATIONS[activation], use_bias=True, dtype=dtype,
+                            activation=TOWER_ACTIVATIONS[activation], use_bias=True, dtype=dtype,
                             precision=precision)
     return DecoderBlock(attention, mlp, width, BlockWiring(), norm_eps=eps, norm_type="fast_layer",
                         norm_bias=True, dtype=dtype, precision=precision, name=name)

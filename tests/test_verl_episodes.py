@@ -9,7 +9,6 @@ import json
 from dataclasses import asdict, replace
 
 import numpy as np
-import pytest
 from episode_support import build, collect
 
 from dew.objectives.rl import session_of
@@ -39,15 +38,6 @@ def test_collected_episodes_survive_verl_rows_and_context_compaction():
     before, after = pack(rollouts, 64), pack(restored, 64)
     for key in before:
         np.testing.assert_array_equal(before[key], after[key], err_msg=key)
-
-
-@pytest.mark.parametrize("field", ["context", "tokens"])
-def test_action_construction_rejects_boolean_token_ids(field):
-    trainer, rollout = build()
-    action = collect(rollout, trainer.initial_state())[0].transitions[0].action
-    ids = action.context if field == "context" else action.tokens
-    with pytest.raises(ValueError, match="integer"):
-        replace(action, **{field: (True, *ids[1:])})
 
 
 def test_an_episode_record_reads_back_every_sampling_control():

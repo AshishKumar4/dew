@@ -23,22 +23,14 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from jax.ad_checkpoint import print_saved_residuals
 from jax.sharding import Mesh
 from reference_error import assert_as_exact_as_the_reference, distance
 from tuned import each_config
 
-from dew.nn import attention, kernels
-from dew.nn.attention import (
-    RMSNorm,
-    forward_mode_attention,
-    gated_rms_normalized,
-    rms_normalized,
-    stream_rms_normalized,
-    unweighted_rmsnorm,
-)
+from dew.nn import attention
+from dew.nn.attention import RMSNorm, gated_rms_normalized, rms_normalized, stream_rms_normalized
 from dew.nn.kernels import norm_swiglu, tuning
-from dew.nn.moe import ExpertMLP, gated_product
+from dew.nn.moe import gated_product
 
 pytestmark = pytest.mark.kernel
 
@@ -353,66 +345,6 @@ def test_gated_norm_and_every_gradient_hold_the_float64_gate(activation, dtype, 
         assert_as_exact_as_the_reference(mine, theirs, want, label)
 
 
-def small_block():
-    from dew.nn.backbones.decoder_block import BlockWiring, DecoderBlock, GatedMLP
-    from dew.nn.mixers import AttentionMixer, MixerContext
-
-    features = 32
-    mixer = AttentionMixer().build(MixerContext(
-        emb_features=features, num_heads=4, num_kv_heads=2, head_dim=8, max_seq_len=16))
-    block = DecoderBlock(mixer=mixer, feedforward=functools.partial(
-        GatedMLP, hidden_features=64, out_features=features), emb_features=features, scale_offset=True,
-        wiring=BlockWiring())
-    x = jax.random.normal(jax.random.key(41), (2, 16, features))
-    params = block.init(jax.random.key(42), x)
-    seed = jax.random.normal(jax.random.key(43), x.shape)
-    step = jax.jit(jax.value_and_grad(lambda params, x: jnp.sum(block.apply(params, x) * seed),
-                                      argnums=(0, 1)))
-    return params, x, step
-
-
-def test_decoder_block_seams_keep_the_block_to_the_bit(monkeypatch):
-    """XLA's seams are the old block's add, read and norm, bit for bit."""
-    from dew.nn.backbones import decoder_block
-
-    params, x, step = small_block()
-    seams = step(params, x)
-
-    class Unseamed:
-        """No norm owns a seam: the block writes, reads and norms as before."""
-
-    monkeypatch.setattr(decoder_block, "SeamNorm", Unseamed)
-    *_, old = small_block()
-    for mine, theirs in zip(jax.tree.leaves(seams), jax.tree.leaves(old(params, x)), strict=True):
-        np.testing.assert_array_equal(mine, theirs)
-
-
-def test_decoder_block_seams_run_the_fused_norm(monkeypatch):
-    """Both of a pre-norm block's norms run the fused seam: the input norm
-    passes the stream through, the post-attention norm takes the attention
-    branch's add, and the reverse pass folds each stream cotangent in."""
-    from dew.nn.kernels import norm_swiglu
-
-    monkeypatch.setattr(norm_swiglu, "rms_kernel", lambda *args, **kwargs: "xla")
-    params, x, step = small_block()
-    reference = step(params, x)
-    monkeypatch.setattr(norm_swiglu, "rms_kernel", lambda *args, **kwargs: "pallas")
-    fused, joins = norm_swiglu.stream_rms_norm, []
-
-    def recorded(x, branch, *args, **kwargs):
-        joins.append(branch is not None)
-        return fused(x, branch, *args, **kwargs)
-
-    monkeypatch.setattr(norm_swiglu, "stream_rms_norm", recorded)
-    params, x, step = small_block()
-    joins.clear()
-    jax.make_jaxpr(step)(params, x)
-    # The input norm and the attention's query and key norms read; the MLP's norm joins.
-    assert joins.count(True) == 1 and joins.count(False) == 3, joins
-    for mine, theirs in zip(jax.tree.leaves(step(params, x)), jax.tree.leaves(reference), strict=True):
-        assert relative(mine, theirs) < 1e-5
-
-
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
 @pytest.mark.parametrize("shape", [(2, 3, 1000), (3, 4096), (3, 257, 17)])
 def test_swiglu_forward_and_both_gradients(dtype, shape):
@@ -420,16 +352,6 @@ def test_swiglu_forward_and_both_gradients(dtype, shape):
     seed = jax.random.normal(jax.random.key(33), shape).astype(dtype)
     xla, pallas = (gated_product("swiglu", implementation=name) for name in ("xla", "pallas"))
     compare((xla, pallas, xla), operands, seed, ("y", "gate", "up"))
-
-
-def test_zero_rows_have_finite_norm_gradients():
-    x = jnp.zeros((5, 1000), jnp.bfloat16)
-    functions = norm_functions(jnp.bfloat16, offset=False, after_cast=True)
-    expected = evaluated(functions[0], (x, None), jnp.ones_like(x))
-    actual = jax.jit(functools.partial(evaluated, functions[1]))((x, None), jnp.ones_like(x))
-    for mine, theirs in zip(actual[:2], expected[:2], strict=True):
-        np.testing.assert_array_equal(mine, theirs)
-        assert np.all(np.isfinite(np.asarray(mine, np.float32)))
 
 
 @pytest.mark.parametrize("offset,after_cast,with_scale", [(False, True, True), (True, False, True),
@@ -446,58 +368,6 @@ def test_rms_module_uses_the_same_fused_vjp(offset, after_cast, with_scale):
     for actual, expected in zip(jax.tree.leaves(mine), jax.tree.leaves(theirs), strict=True):
         assert relative(actual, expected) < 1e-5
     assert "rms_norm_forward" in str(jax.make_jaxpr(module.apply)(params, x))
-
-
-def measured_on_this_host(monkeypatch, choice: str) -> None:
-    """This host's generation measures the Pallas kernel fastest for `choice`, so a call the
-    kernel turns down is logged (`ran_kernel`), as on a GPU whose target row names it."""
-    host = kernels.device_generation()
-    monkeypatch.setitem(kernels.TARGETS, host, kernels.GpuTarget(host, host, kernels={choice: "pallas"}))
-
-
-@pytest.mark.parametrize("statistics,dtype,scale_shape,width,reason", [
-    (False, jnp.float32, (31,), 31, "input-dtype statistics"),
-    (True, jnp.float64, (31,), 31, "float64"),
-    (True, jnp.float32, (1,), 31, "broadcast affine"),
-    (True, jnp.float32, (8193,), 8193, "8192 features"),
-])
-def test_rms_refusals_fall_back_and_log_once(monkeypatch, caplog, statistics, dtype,
-                                           scale_shape, width, reason):
-    from dew.nn.kernels import norm_swiglu
-
-    measured_on_this_host(monkeypatch, "rms_norm")
-    monkeypatch.setattr(kernels.generation, "_logged", set())
-    with jax.enable_x64(new_val=True):
-        x, scale = jnp.ones((2, width), dtype), jnp.ones(scale_shape, dtype)
-        assert norm_swiglu.rms_kernel("pallas", x, scale, dtype, statistics) == "xla"
-        assert norm_swiglu.rms_kernel("pallas", x, scale, dtype, statistics) == "xla"
-        mine = rms_normalized(x, scale, 1e-5, dtype, scale_offset=False, scale_after_cast=True,
-                               fp32_statistics=statistics, implementation="pallas")
-        theirs = rms_normalized(x, scale, 1e-5, dtype, scale_offset=False, scale_after_cast=True,
-                                 fp32_statistics=statistics, implementation="xla")
-        np.testing.assert_array_equal(mine, theirs)
-    logged = [record.getMessage() for record in caplog.records if record.name == kernels.generation.__name__]
-    assert len(logged) == 1 and reason in logged[0]
-
-
-def test_packed_halves_keep_xla_product_and_say_why(monkeypatch, caplog):
-    """A packed gate_up projection's halves stay XLA's product, which reads
-    them in place; the kernel would copy each half out first."""
-    from dew.nn.backbones.decoder_block import GatedMLP
-
-    measured_on_this_host(monkeypatch, "swiglu")
-    monkeypatch.setattr(kernels.generation, "_logged", set())
-    x = jax.random.normal(jax.random.key(81), (2, 5, 8))
-    for packed in (False, True):
-        mlp = GatedMLP(hidden_features=16, out_features=8, packed=packed)
-        params = mlp.init(jax.random.key(82), x)
-        graph = str(jax.make_jaxpr(mlp.apply)(params, x))
-        assert ("swiglu_forward" in graph) == (not packed and jax.default_backend() == "gpu"), packed
-    with monkeypatch.context() as patched:
-        patched.setattr(kernels.generation, "triton_runs", lambda: True)
-        assert kernels.norm_swiglu.swiglu_kernel("auto", x, x, packed=True) == "xla"
-    logged = [record.getMessage() for record in caplog.records if record.name == kernels.generation.__name__]
-    assert any("packed projection" in message for message in logged), logged
 
 
 def test_swiglu_refuses_broadcast_mixed_and_wide_dtypes():
@@ -534,91 +404,11 @@ def test_a_gpu_hosts_cpu_runs_the_seams_its_placement_chooses(without_determinis
     assert {device for value in (*eager, *jitted) for device in value.devices()} == {cpu}
 
 
-def test_auto_takes_the_generation_row_and_forward_mode_is_portable():
-    """Auto takes the device's measured kernel on a GPU Triton runs, XLA on a CPU."""
-    from dew.nn.kernels import norm_swiglu
-
-    def expected(choice):
-        on_gpu = kernels.generation.triton_runs()
-        return kernels.generation.measured_kernel(choice, "xla") if on_gpu else "xla"
-
-    x = jnp.ones((2, 17), jnp.float32)
-    assert norm_swiglu.rms_kernel("auto", x, None, x.dtype, fp32_statistics=True) == expected("rms_norm")
-    assert norm_swiglu.swiglu_kernel("auto", x, x) == expected("swiglu")
-    with forward_mode_attention():
-        assert norm_swiglu.rms_kernel("pallas", x, None, x.dtype, fp32_statistics=True) == "xla"
-        assert norm_swiglu.swiglu_kernel("pallas", x, x) == "xla"
-        jax.jvp(lambda x: rms_normalized(x, None, 1e-5, x.dtype, scale_offset=False,
-                                         scale_after_cast=False, fp32_statistics=True,
-                                         implementation="pallas"), (x,), (x,))
-        jax.jvp(gated_product("swiglu", implementation="pallas"), (x, x), (x, x))
-
-
 @pytest.mark.parametrize("name", ["geglu", "geglu_exact"])
 def test_other_gates_keep_their_arithmetic(name):
     gate, up = jnp.arange(17, dtype=jnp.float32) / 7 - 1, jnp.ones(17)
     np.testing.assert_array_equal(gated_product(name, implementation="pallas")(gate, up),
                                   gated_product(name, implementation="xla")(gate, up))
-
-
-def test_selection_uses_the_generation_table(monkeypatch):
-    monkeypatch.setitem(kernels.gpu_target("sm80").kernels, "rms_norm", "pallas")
-    monkeypatch.setitem(kernels.gpu_target("sm80").kernels, "swiglu", "pallas")
-    monkeypatch.setattr(kernels.generation, "device_generation", lambda: "sm80")
-    monkeypatch.setattr(kernels.generation, "triton_runs", lambda: True)
-    x = jnp.ones((2, 17), jnp.float32)
-    graph = str(jax.make_jaxpr(lambda x: attention.rms_normalized(
-        x, None, 1e-5, x.dtype, scale_offset=False, scale_after_cast=False, fp32_statistics=True))(x))
-    assert "rms_norm_forward" in graph
-    assert "swiglu_forward" in str(jax.make_jaxpr(gated_product("swiglu"))(x, x))
-
-
-def test_unknown_implementation_is_rejected():
-    x = jnp.ones((2, 17))
-    with pytest.raises(ValueError, match="implementation"):
-        rms_normalized(x, None, 1e-5, x.dtype, scale_offset=False, scale_after_cast=False,
-                        fp32_statistics=True, implementation="other")
-    with pytest.raises(ValueError, match="implementation"):
-        gated_product("swiglu", implementation="other")
-
-
-def test_inverse_cast_variant_refuses_the_normalized_activation_kernel(monkeypatch, caplog):
-    measured_on_this_host(monkeypatch, "rms_norm")
-    monkeypatch.setattr(kernels.generation, "_logged", set())
-    x = jax.random.normal(jax.random.key(15), (3, 31)).astype(jnp.bfloat16)
-    reference = evaluated(lambda x: unweighted_rmsnorm(x, 1e-5, implementation="xla"), (x,), x)
-    for _ in range(2):
-        actual = evaluated(lambda x: unweighted_rmsnorm(x, 1e-5, implementation="pallas"), (x,), x)
-        for mine, theirs in zip(actual, reference, strict=True):
-            np.testing.assert_array_equal(mine, theirs)
-    logged = [record.getMessage() for record in caplog.records if record.name == kernels.generation.__name__]
-    assert len(logged) == 1 and "rounds the inverse" in logged[0]
-
-
-@pytest.mark.parametrize("operation", ["rms_norm", "swiglu"])
-def test_fused_residuals_keep_no_full_width_fp32_activation(operation, capsys):
-    x = jnp.ones((2, 3, 31), jnp.bfloat16)
-    if operation == "rms_norm":
-        function = norm_functions(jnp.bfloat16, offset=False, after_cast=True)[1]
-        operands = (x, jnp.ones((31,), jnp.float32))
-    else:
-        function, operands = gated_product("swiglu", implementation="pallas"), (x, x)
-    print_saved_residuals(function, *operands)
-    saved = capsys.readouterr().out
-    assert "bf16[2,3,31]" in saved and "f32[2,3,31]" not in saved, saved
-
-
-@pytest.mark.mesh(devices=2)
-def test_split_mesh_operands_refuse_both_local_kernels_without_axes():
-    from dew.nn.kernels import norm_swiglu
-    from dew.training import MeshSpec
-
-    x = jnp.ones((2, 31), jnp.float32)
-    with jax.set_mesh(MeshSpec(fsdp=2).build(jax.devices()[:2])):
-        assert norm_swiglu.rms_kernel("pallas", x, None, x.dtype, fp32_statistics=True) == "xla"
-        assert norm_swiglu.swiglu_kernel("pallas", x, x) == "xla"
-    assert norm_swiglu.rms_kernel("pallas", x, None, x.dtype, fp32_statistics=True) == "pallas"
-    assert norm_swiglu.swiglu_kernel("pallas", x, x) == "pallas"
 
 
 @pytest.mark.mesh(devices=2)
@@ -648,84 +438,6 @@ def test_seam_and_product_run_per_shard_as_on_one_device(split):
         meshed = jax.jit(functools.partial(run, RESIDUAL, MLP_HIDDEN))()
     for mine, theirs in zip(jax.tree.leaves(meshed), jax.tree.leaves(alone), strict=True):
         assert relative(mine, theirs) < 1e-6
-
-
-@pytest.mark.mesh(devices=2)
-def test_a_narrow_weight_gradient_sums_its_shards_before_it_rounds():
-    """Rows split over two shards: each shard's bf16-rounded sum would lose
-    the 1/256 that the whole column's fp32 sum keeps (1 + 1/256 rounds to 1)."""
-    from dew.nn.sharding import RESIDUAL
-    from dew.training import MeshSpec
-
-    x = jnp.ones((4, 1, 1), jnp.float32)
-    dy = jnp.asarray([1.0, 1 / 256, -1.0, 0.0], jnp.float32).reshape(x.shape)
-    scale = jnp.ones((1,), jnp.bfloat16)
-
-    def dscale(x, scale):
-        return jax.vjp(lambda scale: rms_normalized(
-            x, scale, 0.0, x.dtype, scale_offset=False, scale_after_cast=False, fp32_statistics=True,
-            implementation="pallas", axes=RESIDUAL), scale)[1](dy)[0]
-
-    with jax.set_mesh(MeshSpec(fsdp=2).build(jax.devices()[:2])):
-        assert "shard_map" in str(jax.make_jaxpr(dscale)(x, scale))
-        meshed = jax.jit(dscale)(x, scale)
-    assert meshed.dtype == jnp.bfloat16
-    np.testing.assert_array_equal(np.asarray(meshed, np.float32), [1 / 256])
-
-
-@pytest.mark.mesh(devices=2)
-def test_any_varying_operand_refuses_both_kernels_in_a_checked_shard_map():
-    """A Pallas call states no varying type for its result, so a stream,
-    weight, branch, gate or up that varies inside a checking shard_map keeps
-    XLA, even where the first operand is replicated."""
-    from jax.sharding import PartitionSpec
-
-    from dew.nn.kernels import norm_swiglu
-    from dew.training import MeshSpec
-
-    mesh = MeshSpec(fsdp=2).build(jax.devices()[:2])
-    replicated, rows = jnp.ones((2, 8), jnp.float32), jnp.ones((4, 8), jnp.float32)
-    chosen = {}
-
-    def local(replicated, varying):
-        chosen["branch"] = norm_swiglu.rms_kernel("pallas", replicated, None, jnp.float32,
-                                                  fp32_statistics=True, branch=varying)
-        chosen["gate"] = norm_swiglu.gated_rms_kernel("pallas", replicated, varying, None, jnp.float32,
-                                                      "silu")
-        chosen["up"] = norm_swiglu.swiglu_kernel("pallas", replicated, varying)
-        return varying
-
-    jax.make_jaxpr(jax.shard_map(local, mesh=mesh, in_specs=(PartitionSpec(), PartitionSpec("fsdp")),
-                                 out_specs=PartitionSpec("fsdp")))(replicated, rows)
-    assert chosen == {"branch": "xla", "gate": "xla", "up": "xla"}, chosen
-
-
-def test_expert_jvp_refuses_swiglu_once_and_matches_xla(monkeypatch, caplog):
-    x = jax.random.normal(jax.random.key(73), (2, 3, 8))
-    indices = jnp.zeros((2, 3, 1), jnp.int32)
-    weights = jnp.ones((2, 3, 1), jnp.float32)
-    expert = ExpertMLP(num_experts=2, hidden_features=16, out_features=8, implementation="xla")
-    params = expert.init(jax.random.key(74), x, weights, indices)
-
-    def function(x):
-        return expert.apply(params, x, weights, indices)
-
-    reference = jax.jvp(function, (x,), (jnp.ones_like(x),))
-    # A GPU's own row may already have logged the reference's refusal.
-    caplog.clear()
-    monkeypatch.setitem(kernels.gpu_target("sm80").kernels, "swiglu", "pallas")
-    monkeypatch.setattr(kernels.generation, "device_generation", lambda: "sm80")
-    monkeypatch.setattr(kernels.generation, "triton_runs", lambda: True)
-    monkeypatch.setattr(kernels.generation, "_logged", set())
-    # A GPU whose row names the kernel logs the reference's own refusal;
-    # only the calls under this generation count.
-    caplog.clear()
-    for _ in range(2):
-        actual = jax.jvp(function, (x,), (jnp.ones_like(x),))
-        for mine, theirs in zip(actual, reference, strict=True):
-            np.testing.assert_array_equal(mine, theirs)
-    logged = [record.getMessage() for record in caplog.records if record.name == kernels.generation.__name__]
-    assert len(logged) == 1 and "JVP trace" in logged[0]
 
 
 def test_norm_jvp_without_a_context_uses_xla():

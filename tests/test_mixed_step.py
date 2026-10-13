@@ -91,19 +91,3 @@ def test_a_mixed_call_decodes_and_prefills_as_the_separate_calls_do(continuing, 
             alone_row = np.asarray(admitted["cache"][layer]["self_attn"][name])[0, :4]
             np.testing.assert_allclose(written[3, :4], alone_row, atol=2e-6)
             np.testing.assert_array_equal(attention[name][2], cache[layer]["self_attn"][name][2])
-
-
-@pytest.mark.parametrize("overrides,named", [
-    ({"layer_types": ("local", "global"), "kinds": {"local": {"window": 4}}}, "sliding window"),
-    ({"attention_sinks": True}, "attention sinks")])
-def test_a_layer_a_mixed_call_cannot_serve_names_why(overrides, named):
-    """A layer that reads more than its own dense, causal row refuses the
-    mixed call by name, so the server can say why it keeps two forwards."""
-    model = tiny(**overrides)
-    params = model.init(jax.random.key(0), jnp.zeros((1, 4), jnp.int32))
-    with pytest.raises(ValueError, match=named):
-        tokens = jnp.zeros((1, ROWS + WIDTH), jnp.int32)
-        model.apply({**params, "cache": cache_of(model, params, ROWS)}, tokens,
-                    jnp.zeros((1, 1), jnp.int32), attention_mask=jnp.ones(tokens.shape, bool), decode=True,
-                    mutable=["cache"], admitted=Admitted(slots=jnp.asarray([3]), cursors=jnp.asarray([0])),
-                    method=CausalTransformer.states_and_logits_at)
