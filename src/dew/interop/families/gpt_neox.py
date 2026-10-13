@@ -13,6 +13,7 @@ from dew.interop.decoder_parts import (
     Renames,
     base_config,
     decoder_tensors,
+    fixed_attention_buffer,
     hf_ungated,
     renamed_name,
     renamed_path,
@@ -58,16 +59,8 @@ def gpt_neox_prepare(tensors: Mapping[str, np.ndarray],
     dimension = records.integer(config['head_dim'], 'head_dim')
     prepared = {}
     for name, tensor in tensors.items():
-        if name.endswith('.attention.bias'):
-            if (tensor.ndim != 4 or tensor.shape[:2] != (1, 1)
-                    or tensor.shape[-2] != tensor.shape[-1]
-                    or not np.array_equal(tensor, np.tril(np.ones_like(tensor)))):
-                raise ValueError(f'{name} must hold the fixed triangular causal mask')
-            continue
-        if name.endswith('.attention.masked_bias'):
-            # FP16 releases cast the historical -1e9 sentinel to -inf.
-            if tensor.shape != () or float(tensor) not in (-1e9, -np.inf):
-                raise ValueError(f'{name} must hold the historical negative mask sentinel')
+        # FP16 releases cast the historical -1e9 sentinel to -inf.
+        if fixed_attention_buffer(name, tensor, 'attention', (-1e9, -np.inf)):
             continue
         if name.endswith('.attention.rotary_emb.inv_freq'):
             rotated = int(
