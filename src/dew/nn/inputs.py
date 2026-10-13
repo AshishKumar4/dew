@@ -239,6 +239,84 @@ class ModelInputs:
 
 
 @struct.dataclass
+class Coordinates:
+    """Where each token of a batch sits, built once (`coordinates`) and read by every token mixer.
+
+    `positions` `[B, S]` is each real token's place in its document, counted
+    over real tokens. `segments` numbers each row's packed documents from 1,
+    0 on the padding slots after them, which run as a document of their own,
+    so no layer carries a real document's state or history into them or
+    back; `valid` is the caller's mask of real tokens; `starts` marks each
+    document's first real token but a
+    row's first, which continues whatever state the row holds. Each is None
+    where it holds nothing (one document a row, every token real, no start),
+    which a layer's fast path reads as a static fact. `slots` is where a cache
+    writes each real token, -1 for padding, which the model fills from its
+    cache's cursor; None for an uncached call. `max_segments` bounds the
+    documents a row holds (the packer's static plan, else the row length) and
+    `right_padded` says every row's real tokens come first.
+    """
+
+    positions: jax.Array
+    segments: jax.Array | None = None
+    valid: jax.Array | None = None
+    starts: jax.Array | None = None
+    slots: jax.Array | None = None
+    max_segments: int = struct.field(pytree_node=False, default=1)
+    right_padded: bool = struct.field(pytree_node=False, default=False)
+
+
+def coordinates(shape: tuple[int, int] | None = None, *, segments=None, valid=None, positions=None,
+                max_segments: int | None = None, right_padded: bool = False) -> Coordinates:
+    """The `Coordinates` of `[batch, length]` tokens from what the batch carries: packed `segments`
+    (one document a row where None), a `valid` mask (every token real where None), explicit
+    `positions` (each document's real tokens counted from 0 where None) and the packer's
+    `max_segments` (the row length where None). `shape` is the first given field's where None."""
+    if shape is None:
+        given = [x for x in (segments, valid, positions) if x is not None]
+        if not given:
+            raise ValueError("token coordinates take their shape from a field, or `shape`")
+        batch, length = jnp.shape(given[0])[:2]
+        shape = (batch, length)
+    length = shape[1]
+    segments = None if segments is None else jnp.asarray(segments, jnp.int32)
+    valid = None if valid is None else jnp.asarray(valid, bool)
+    for name, field in (("segments", segments), ("valid", valid)):
+        if field is not None and field.shape != shape:
+            raise ValueError(f"token coordinates are {shape}, got {name} {field.shape}")
+    starts = None if segments is None else document_starts(
+        segments, jnp.ones(shape, bool) if valid is None else valid)
+    if positions is None:
+        real = jnp.ones(shape, bool) if valid is None else valid
+        real = real if segments is None else real & (segments != 0)
+        rank = jnp.cumsum(real, axis=1, dtype=jnp.int32) - 1
+        first = 0 if starts is None else jax.lax.cummax(jnp.where(starts, rank, 0), axis=1)
+        positions = jnp.where(real, rank - first, 0)
+    return Coordinates(jnp.asarray(positions, jnp.int32), segments, valid, starts,
+                       max_segments=(1 if segments is None else length) if max_segments is None
+                       else max_segments,
+                       right_padded=right_padded)
+
+
+def coordinates_of(metadata: AttentionMetadata | None, batch: int, length: int) -> Coordinates:
+    """The call's `Coordinates`: its metadata's, else those of whole rows of real tokens."""
+    if metadata is not None and metadata.coordinates is not None:
+        return metadata.coordinates
+    return coordinates((batch, length))
+
+
+def document_starts(segments, valid):
+    """`[B, S]`: each real token whose segment differs from the previous real token's in its row, a
+    row's first real token continuing what precedes the row and a padding slot starting nothing."""
+    order, _ = valid_order(valid)
+    rank = jnp.cumsum(valid, axis=1, dtype=jnp.int32) - 1
+    compact = jnp.take_along_axis(segments, order, axis=1)
+    changed = jnp.concatenate([jnp.zeros_like(compact[:, :1], bool), compact[:, 1:] != compact[:, :-1]],
+                              axis=1)
+    return valid & jnp.take_along_axis(changed, jnp.maximum(rank, 0), axis=1)
+
+
+@struct.dataclass
 class AttentionMetadata:
     """Per-token data the layers read alongside their inputs, independent of physical cache-slot addresses.
 
@@ -254,16 +332,17 @@ class AttentionMetadata:
     `[B or 1, heads, S, keys]`: T5's relative position table, which its
     encoder computes once for its layers.
 
-    `right_padded` says each row's `valid` slots are its first, its padding
-    after them, as a training batch pads its rows. A real token then reads no
-    padding through a causal layer, so those layers skip what would keep it
-    out: causal attention takes no key mask and stays on its fused kernel, and
-    a conv reads the row as it stands (`dew.nn.linear.held_conv1d`). A padding
-    slot's output is then unspecified. A mask with padding before or between
-    real slots must not set it.
+    `coordinates` are the tokens' documents, validity, positions and cache
+    slots (`Coordinates`). Their `right_padded` says each row's real tokens
+    come first, its padding after them, as a training batch pads its rows. A
+    real token then reads no padding through a causal layer, so those layers
+    skip what would keep it out: causal attention takes no key mask and stays
+    on its fused kernel, and a conv reads the row as it stands
+    (`dew.nn.linear.held_conv1d`). A padding slot's output is then
+    unspecified.
     """
 
-    valid: jax.Array | None = None
+    coordinates: Coordinates | None = None
     image_groups: jax.Array | None = None
     rotary_positions: jax.Array | None = None
     pairwise_mask: jax.Array | None = None
@@ -273,7 +352,15 @@ class AttentionMetadata:
     media: jax.Array | None = None
     admitted: Admitted | None = None
     position_bias: jax.Array | None = None
-    right_padded: bool = struct.field(pytree_node=False, default=False)
+
+    @property
+    def valid(self) -> jax.Array | None:
+        """The real tokens (`Coordinates.valid`), None where every token is."""
+        return None if self.coordinates is None else self.coordinates.valid
+
+    @property
+    def right_padded(self) -> bool:
+        return self.coordinates is not None and self.coordinates.right_padded
 
 
 @struct.dataclass

@@ -21,7 +21,7 @@ from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.nn.dit import TextContext
 from dew.nn.dsa_kpool import KPoolSparseAttention
-from dew.nn.inputs import AttentionMetadata
+from dew.nn.inputs import AttentionMetadata, coordinates
 from dew.nn.llama4 import Llama4Mixer
 from dew.nn.local_attention import local_attention
 from dew.nn.mixer_base import MixerContext
@@ -94,7 +94,7 @@ def test_auto_under_a_window_or_packing_takes_the_reference_path(layer, argument
         x = jax.random.normal(jax.random.key(0), (2, 16, 32))
     call = {} if layer == "window" else {"segment_ids": PACKED}
     if layer == "kpool":
-        call = {"attention_metadata": AttentionMetadata(valid=PACKED != 0)}
+        call = {"attention_metadata": AttentionMetadata(coordinates=coordinates(valid=PACKED != 0))}
     variables = LAYERS[layer](**arguments).init(jax.random.key(1), x, **call)
     auto = LAYERS[layer](attention_impl="auto", **arguments).apply(variables, x, **call)
     reference = LAYERS[layer](attention_impl="reference", **arguments).apply(variables, x, **call)

@@ -3,7 +3,6 @@ and chunked local attention, run as one flagged kernel call where a kernel
 takes the window, else as banded blocks of the span."""
 
 import functools
-import math
 
 import jax
 import jax.numpy as jnp
@@ -16,9 +15,9 @@ from .attention import (
     combined_attention_mask,
     cudnn_runs,
     kernel_for_materialized_mask,
-    repeat_kv_heads,
     resolve_implementation,
     scaled_dot_product_attention,
+    split_with_queries,
     tensor_shards,
     with_documents,
 )
@@ -150,8 +149,7 @@ def _local_over_sequence(kernel, query, key, value, shards: int, *, window, chun
     span = window if window is not None else chunk
     assert span is not None
     queries = logical_spec(HEADS, query.shape)
-    kv_heads = math.lcm(key.shape[2], tensor_shards(query))
-    key, value = repeat_kv_heads(key, kv_heads), repeat_kv_heads(value, kv_heads)
+    key, value = split_with_queries(key, value, tensor_shards(query))
     keys = logical_spec(KV_HEADS, key.shape)
     fields = {}
     if positions is not None:

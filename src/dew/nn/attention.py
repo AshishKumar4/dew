@@ -13,7 +13,7 @@ import importlib
 import importlib.util
 import math
 from collections.abc import Callable
-from typing import Literal
+from typing import Literal, get_args
 
 import jax
 import jax.numpy as jnp
@@ -78,12 +78,15 @@ FlashAttention-3 on Hopper and FlashAttention-2 elsewhere, from the
 dew_flash_attn wheel (docs/installation.md). 'tpu' is the
 pallas splash kernel, with the older pallas flash kernel behind it for the
 calls splash's mask descriptor cannot carry.
-'auto', every module's default, resolves per trace (`resolve_implementation`):
-triton where cudnn's kernel runs and `triton_runs`; flash where
-`flash_refusal` finds none; cudnn where its kernel runs; tpu where splash's does;
-the reference path where the call asks for arithmetic only it honours; and
-xla anywhere else. A call off the kernel the device's target row (`gpu_target().kernels`)
-measured fastest is logged once a process with the reason (`ran_kernel`).
+'auto', every module's default, resolves per trace (`resolve_implementation`),
+so a configuration logged as 'auto' runs on the next machine too: the
+reference path where the call asks for arithmetic only it honours
+(`reference_only`), or where jax.nn's xla kernel would narrow or chain it;
+else triton where cudnn's kernel runs and `triton_runs`; flash where
+`flash_refusal` finds none; cudnn where its kernel runs (`cudnn_runs`); tpu
+where splash's does (`tpu_runs`); and xla anywhere else. A call off the kernel
+the device's target row (`gpu_target().kernels`) measured fastest is logged
+once a process with the reason (`ran_kernel`).
 """
 
 
@@ -618,7 +621,7 @@ def cudnn_attention(query, key, value, bias, mask, causal, sliding_window,
     padded query row is sliced off and the padded key hidden by the kernel's
     key_value_seq_lengths, which never reach past the real keys.
     tests/test_kernels.py pins the equality with the xla path. On a mesh it
-    runs per shard (`per_shard`).
+    runs per shard (`_per_shard`).
     """
     q_len, kv_len = query.shape[-3], key.shape[-3]
     # jax's cudnn call takes a mask or bias only at the full [.., Q, K]
@@ -651,7 +654,7 @@ def cudnn_attention(query, key, value, bias, mask, causal, sliding_window,
             local_window_size=None if sliding_window is None else window_sides(causal, sliding_window),
             implementation='cudnn')
 
-    out = per_shard(local, query, key, value,
+    out = _per_shard(local, query, key, value,
                     bias=(None if bias is None else _four_dimensional(bias), SCORES),
                     mask=(None if mask is None else _four_dimensional(mask), SCORES),
                     key_value_seq_lengths=(kv_lengths, ("activation_batch",)))
@@ -761,6 +764,41 @@ def tensor_shards(query) -> int:
                      for axis in mesh_axes(_entry(logical_spec(HEADS, query.shape), 2)))
 
 
+def split_with_queries(key, value, split: int):
+    """`key` and `value` with their heads repeated to the least common multiple
+    of their count and `split`, the ways the mesh splits the query heads, so
+    each shard holds the key heads its query heads read."""
+    heads = math.lcm(key.shape[-2], split)
+    return repeat_kv_heads(key, heads), repeat_kv_heads(value, heads)
+
+
+def _per_shard(local, query, key, value, **extras):
+    """`local(query, key, value, **extras)` on each shard's rows and heads
+    (`manual_map`), the key heads repeated until the tensor axes split them as
+    they split the query's; whole off a mesh, or inside a map that already
+    holds every axis manual (the sequence exchanges). A Pallas kernel has no
+    partitioning rule, and jax's cuDNN attention partitions through
+    `custom_partitioning`, whose lowering on several devices names the
+    partitioner by a process address (`str(id(...))` in its backend config),
+    which the persistent cache key keeps, so every fresh process would compile
+    again; under a fully manual map jax lowers neither. `extras` maps each
+    further argument to its array, or None, and the logical axes it splits on.
+    """
+    given = {name: pair for name, pair in extras.items() if pair[0] is not None}
+    mesh = jax.sharding.get_abstract_mesh()
+    if mesh.empty or set(mesh.axis_names) <= set(mesh.manual_axes):
+        return local(query, key, value, **{name: x for name, (x, _) in given.items()})
+    key, value = split_with_queries(key, value, tensor_shards(query))
+    queries, keys = logical_spec(HEADS, query.shape), logical_spec(KV_HEADS, key.shape)
+    names = tuple(given)
+
+    def shard(query, key, value, *arrays):
+        return local(query, key, value, **dict(zip(names, arrays, strict=True)))
+
+    specs = (queries, keys, keys, *(logical_spec(axes, x.shape) for x, axes in given.values()))
+    return manual_map(shard, specs, queries)(query, key, value, *(x for x, _ in given.values()))
+
+
 def _four_dimensional(x):
     """A mask or a bias `[.., Q, K]` broadcastable to `[B, H, Q, K]`, as four
     dimensions; a broadcast dimension of 1 divides by no mesh axis, so the
@@ -799,8 +837,7 @@ def exchanged_heads_attention(kernel, query, key, value, shards: int, *, causal,
             f"({query.shape[1]}, {key.shape[1]}) {shards} ways, and one of them does "
             "not divide. `gathered_keys_attention` takes any head count and key "
             "length; `sequence_parallel_attention` picks it for such a call.")
-    kv_heads = math.lcm(key.shape[-2], split)
-    key, value = repeat_kv_heads(key, kv_heads), repeat_kv_heads(value, kv_heads)
+    key, value = split_with_queries(key, value, split)
     keys = logical_spec(KV_HEADS, key.shape)
 
     # After the all-to-all a shard holds its tensor shard's heads split again
@@ -846,9 +883,7 @@ def gathered_keys_attention(kernel, query, key, value, shards: int, *, causal,
     and the caller's rotary angles stay exact.
     """
     q_len, kv_len = query.shape[1], key.shape[1]
-    # Each tensor shard's query heads beside the key heads they read.
-    kv_heads = math.lcm(key.shape[-2], tensor_shards(query))
-    key, value = repeat_kv_heads(key, kv_heads), repeat_kv_heads(value, kv_heads)
+    key, value = split_with_queries(key, value, tensor_shards(query))
 
     reordered = causal or sliding_window is not None or mask is not None
     if reordered:
@@ -1004,37 +1039,6 @@ def flash_refusal(query, key, causal=False, sliding_window=None, mask=None, bias
     )
 
 
-def per_shard(local, query, key, value, **extras):
-    """`local(query, key, value, **extras)` on a mesh's shards, or whole without one.
-
-    On a mesh it runs in `manual_map` on each shard's rows and heads, the key
-    heads repeated until the tensor axes split them as they split the query's.
-    A Pallas kernel has no partitioning rule, and jax's cuDNN attention
-    partitions through `custom_partitioning`, whose lowering on several devices
-    keys the persistent compilation cache by a process address
-    (`str(id(...))` in its backend config), so every fresh process would
-    compile again; under a fully manual map jax lowers neither. `extras` maps
-    each further argument to the array, or None, and the logical axes it
-    splits on.
-    """
-    given = {name: pair for name, pair in extras.items() if pair[0] is not None}
-    mesh = jax.sharding.get_abstract_mesh()
-    # Inside a map that holds every axis manual (the sequence exchanges) the
-    # arrays are a shard's already.
-    if mesh.empty or set(mesh.axis_names) <= set(mesh.manual_axes):
-        return local(query, key, value, **{name: x for name, (x, _) in given.items()})
-    kv_heads = math.lcm(key.shape[-2], tensor_shards(query))
-    key, value = repeat_kv_heads(key, kv_heads), repeat_kv_heads(value, kv_heads)
-    queries, keys = logical_spec(HEADS, query.shape), logical_spec(KV_HEADS, key.shape)
-    names = tuple(given)
-
-    def shard(query, key, value, *arrays):
-        return local(query, key, value, **dict(zip(names, arrays, strict=True)))
-
-    specs = (queries, keys, keys, *(logical_spec(axes, x.shape) for x, axes in given.values()))
-    return manual_map(shard, specs, queries)(query, key, value, *(x for x, _ in given.values()))
-
-
 def flash_attention(query, key, value, causal: bool, sliding_window=None, sinks=None):
     """FlashAttention (dew_flash_attn, kernels/flash_attn) over `[B, S, H, D]`
     arrays at jax.nn's default scale: FlashAttention-3 on Hopper and
@@ -1042,7 +1046,7 @@ def flash_attention(query, key, value, causal: bool, sliding_window=None, sinks=
     and `sinks` `[H]` puts one value-free logit a head in each row's
     denominator. Its causal mask is
     aligned to the last key, where jax.nn's is aligned to the first, so a
-    causal call is square. On a mesh it runs per shard (`per_shard`). It runs
+    causal call is square. On a mesh it runs per shard (`_per_shard`). It runs
     where the installed wheel holds code for the device (`flash_built_for`)."""
     generation = device_generation()
     architectures = flash_architectures()
@@ -1057,7 +1061,7 @@ def flash_attention(query, key, value, causal: bool, sliding_window=None, sinks=
     def local(query, key, value, sinks=None):
         return flash.flash_mha(query, key, value, is_causal=causal, window_size=window, sinks=sinks)
 
-    return per_shard(local, query, key, value, sinks=(sinks, ("activation_heads",)))
+    return _per_shard(local, query, key, value, sinks=(sinks, ("activation_heads",)))
 
 
 def triton_attention(query, key, value, causal: bool):
@@ -1065,14 +1069,11 @@ def triton_attention(query, key, value, causal: bool):
     tokamax's heuristic config, with jax.nn's default scale of 1/sqrt(D).
 
     It takes grouped key heads and any length itself. A Pallas call has no
-    partitioning rule, so on a mesh it runs per shard (`per_shard`).
+    partitioning rule, so on a mesh it runs per shard (`_per_shard`).
     """
 
-    def local(query, key, value):
-        return tokamax.dot_product_attention(query, key, value, is_causal=causal,
-                                             implementation='triton')
-
-    return per_shard(local, query, key, value)
+    return _per_shard(lambda query, key, value: tokamax.dot_product_attention(
+        query, key, value, is_causal=causal, implementation='triton'), query, key, value)
 
 
 VALUE_BLOCK = 256
@@ -1623,7 +1624,7 @@ def resolve_implementation(implementation, query, key, *, dtype=None, precision=
     where it was measured fastest is logged (`ran_kernel`). Any other name is returned as it is,
     so an explicit kernel still refuses what it cannot honour by name.
     """
-    if implementation not in ('auto', 'reference', 'xla', 'cudnn', 'triton', 'flash', 'tpu'):
+    if implementation not in get_args(AttentionImpl):
         raise ValueError(f"Unknown attention implementation: {implementation}")
     if implementation in ('auto', 'xla') and (_xla_kernel_narrows(query) or _xla_kernel_chains(query, key)):
         return 'reference'
