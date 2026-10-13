@@ -222,22 +222,23 @@ class Files(Dataset):
     def fingerprint(self) -> Mapping[str, object]:
         return self._snapshot
 
+    @property
+    def _indexes(self) -> tuple[str, ...]:
+        if self.kind not in ("jsonl", "text", "csv"):
+            return ()
+        return (self.index,) if self.index else tuple(self._index_url(url) for url in self.paths)
+
     @cached_property
-    def _snapshot(self) -> Mapping[str, object]:
+    def _file_facts(self) -> tuple[tuple[str, Mapping[str, object]], ...]:
         files = []
-        indexes = (
-            ()
-            if self.kind not in ("jsonl", "text", "csv")
-            else (self.index,)
-            if self.index
-            else tuple(self._index_url(url) for url in self.paths)
-        )
+        indexes = self._indexes
+        indexed = set(indexes)
         resolved = [(url, *Store(url, self.storage_options).resolve()) for url in (*self.paths, *indexes)]
         # Local copies are named by their place under the files' common directory and their
         # content, so hosts that mounted one dataset at different paths name it alike.
         root = _mount_root([path for _, fs, path in resolved if local(fs)])
         for url, fs, path in resolved:
-            if url in indexes and url not in self.declared and not fs.exists(path):
+            if url in indexed and url not in self.declared and not fs.exists(path):
                 continue
             metadata = self._header(url)
             version = (
@@ -246,22 +247,24 @@ class Files(Dataset):
                 or metadata.get("etag")
                 or metadata.get("generation")
             )
-            if version is None and local(fs):
-                # About 4 MiB read over the whole store, each file's first and last blocks at least.
-                version = content_version(fs, path, integer(metadata["size"], "size"),
-                                          blocks=max(2, 64 // len(resolved)))
+            if local(fs):
+                version = content_version(fs, path, integer(metadata["size"], "size"))
             elif version is None:
                 version = fs.ukey(path)
             files.append(
-                {
+                (url, {
                     "uri": posixpath.relpath(path, root) if local(fs) else url,
                     "bytes": metadata["size"],
                     "version": version,
-                }
+                })
             )
+        return tuple(files)
+
+    @cached_property
+    def _snapshot(self) -> Mapping[str, object]:
         return {
             "store": self.kind,
-            "files": files,
+            "files": [metadata for _, metadata in self._file_facts],
             "columns": self.columns,
             "where": str(self.where),
             "partitioning": self.partitioning,
@@ -292,11 +295,10 @@ class Files(Dataset):
             return True
         if self.kind == "webdataset":
             return False
-        indexes = (self.index,) if self.index else tuple(self._index_url(path) for path in self.paths)
         if "index_headers" in self.__dict__:
             return True
         headers = {}
-        for url in indexes:
+        for url in self._indexes:
             try:
                 headers[url] = self._header(url)
             except FileNotFoundError:
@@ -348,6 +350,7 @@ class Files(Dataset):
             )
             Store(self._index_url(url), self.storage_options).write(encoded.getvalue())
         self.__dict__.pop("paths", None)
+        self.__dict__.pop("_file_facts", None)
         self.__dict__.pop("_snapshot", None)
         self.__dict__.pop("_metadata", None)
         self.__dict__.pop("index_headers", None)
@@ -395,6 +398,7 @@ class Files(Dataset):
         root.child("_dew_manifest.json").put_if_absent(json.dumps(manifest, sort_keys=True).encode())
         self.__dict__.pop("committed", None)
         self.__dict__.pop("declared", None)
+        self.__dict__.pop("_file_facts", None)
         self.__dict__.pop("_snapshot", None)
         self.__dict__.pop("_metadata", None)
         return self
@@ -522,14 +526,8 @@ class Files(Dataset):
             return {}
         if "index_headers" not in self.__dict__ and not self.supports("indexed"):
             return {}
-        indexes = (self.index,) if self.index else tuple(self._index_url(path) for path in self.paths)
-        known = self.__dict__["index_headers"]
-        headers = []
-        for url in indexes:
-            fs, path = Store(url, self.storage_options).resolve()
-            metadata = known[url]
-            version = metadata.get("sha256") or metadata.get("etag") or metadata.get("ETag")
-            headers.append({"url": url, "version": fs.ukey(path) if version is None else version})
+        indexes = set(self._indexes)
+        headers = [metadata for url, metadata in self._file_facts if url in indexes]
         return {"row_index": hashlib.sha256(json.dumps(headers, sort_keys=True).encode()).hexdigest()}
 
     def metadata(self) -> Mapping[str, object]:
