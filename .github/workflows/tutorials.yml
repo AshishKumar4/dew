@@ -76,7 +76,11 @@ jobs:
       uses: actions/cache@v4
       with:
         path: ~/.cache/huggingface
-        key: tutorials-hf-v1
+        # One cache per job, since each job downloads only its own notebooks' files; a shared key
+        # kept whichever job saved first, and the others fetched from the Hub on every run. A
+        # notebook edit saves a new cache on top of the last one.
+        key: tutorials-hf-${{ matrix.notebooks }}-${{ hashFiles('tutorials/*.ipynb') }}
+        restore-keys: tutorials-hf-${{ matrix.notebooks }}-
     - name: Run the tutorials
       run: python tools/run_tutorials.py ${{ matrix.notebooks }} --workdir "$RUNNER_TEMP/tutorials" --imports "$RUNNER_TEMP/imports.json"
     - name: Report outputs older than the code they ran
