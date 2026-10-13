@@ -1006,7 +1006,7 @@ type BlockPath = Callable[[str], tuple[str, ...] | None]
 """A family's path for one block tensor, named as its trunk's layer 0's."""
 
 
-def _declared_depth(name: str, index: object, declared: int) -> int:
+def _declared_depth(name: str, index: int | str | None, declared: int) -> int:
     """`index`, a depth's number or its digits, refused unless it is one of the `declared` depths."""
     depth = int(index) if isinstance(index, str) and index.isdigit() else index
     if not isinstance(depth, int) or not 0 <= depth < declared:
@@ -1014,7 +1014,7 @@ def _declared_depth(name: str, index: object, declared: int) -> int:
     return depth
 
 
-def prediction_path(name: str, prefix: str, index: object, declared: int, tail: str,
+def prediction_path(name: str, prefix: str, index: int | str | None, declared: int, tail: str,
                     leaves: Mapping[str, tuple[str, ...]], block: BlockPath) -> tuple[str, ...] | None:
     """The path of `name`, a tensor of prediction depth (or drafting stage)
     `index` under the variables' `{prefix}_{index}`: its own leaf in
