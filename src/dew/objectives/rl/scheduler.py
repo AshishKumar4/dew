@@ -508,7 +508,10 @@ class RolloutScheduler:
         return entry.complete[:target]
 
     def __call__(self, state: TrainState, batch: Batch, key: jax.Array) -> dict[str, np.ndarray]:
-        self._key, self._submissions = key, 0
+        # On the host, uncommitted: the engines draw on devices of their own, not the trainer's mesh.
+        self._key = jax.random.wrap_key_data(jax.device_get(jax.random.key_data(key)),
+                                             impl=jax.random.key_impl(key))
+        self._submissions = 0
         updates = int(state.updates)
         self._publish(state, updates)
         rollouts, latencies, groups, tally, waited = agreed(
