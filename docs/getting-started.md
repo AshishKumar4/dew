@@ -7,6 +7,8 @@ The blocks below form one script, `train.py`.
 ## Data
 
 ```python
+from dew.data import Loading
+from dew.config.data import RecordsData, loader
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -19,10 +21,10 @@ from dew.objectives.base import Aux, Objective
 
 x = np.linspace(-1, 1, 32, dtype=np.float32).reshape(32, 1)
 y = 2 * x + 1
-data = Dataset.from_records({"x": x, "y": y}, batch=32)
+data = loader(RecordsData(source={"x": x, "y": y}), batch=32, read="memory", loading=Loading(workers=0))
 ```
 
-`Dataset.from_records` takes the records as columns: here, float32 arrays `x` and `y` of shape `(32, 1)`, one record per row. A batch is a dictionary with the same fields and the batch as its first dimension. `batch=32` reads all 32 points every step.
+`Records` accepts columns: here, float32 arrays `x` and `y` of shape `(32, 1)`, one record per row. `load(..., read="memory")` compiles that recipe. A batch has the same fields with the batch as its first dimension, so `batch=32` reads all 32 points every step.
 
 The training stream reshuffles the records every epoch using `seed` (0 unless you pass one). A checkpoint saves the stream's position, so a resumed run continues where it stopped. With several processes, each one reads its own share of every batch. `validation=` takes held-out records in the same form; this example has none. [Training data](concepts/data.md) covers the readers for files, Hugging Face and TFDS datasets, and the `Dataset` value they all return.
 
@@ -104,6 +106,6 @@ This is what `fit` prints when stdout is not a terminal, as in a pipe, a log fil
 
 - For more input features, give the batch shape `(batch_size, features)` and the `init` sample shape `(1, features)`.
 - For a nonlinear model, replace `nn.Dense` with your own Linen module. The batch fields and the objective must still agree on names, shapes and dtypes.
-- To change the data, pass more records, a smaller `batch`, or held-out records as `validation=` to `from_records`. For data that does not fit in memory, use a dataset specification or `dew.data.load`; see [Training data](concepts/data.md) and [Checkpoints](guides/checkpoints.md).
+- To change the data, change a Records recipe's source or validation and compile it with load. For data larger than memory, choose an indexed or streamed source explicitly; see [Training data](concepts/data.md) and [Checkpoints](guides/checkpoints.md).
 
 [Custom objectives](concepts/objectives.md) adds evaluation and state to an objective. [Language models](concepts/language_models.md) uses a built-in objective on tokenized text.

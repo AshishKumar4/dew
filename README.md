@@ -72,6 +72,9 @@ PY
 Here is an abridged [`examples/train_flowers.py`](https://github.com/AshishKumar4/dew/blob/main/examples/train_flowers.py). The full file adds command-line options and the sampling step:
 
 ```python
+from dew.data import Loading, TFDS
+from dew.config.data import Augment, loader
+from dew.data.steps.image import EncodeCaptions
 from pathlib import Path
 
 import jax
@@ -79,7 +82,8 @@ import jax.numpy as jnp
 import optax
 
 from dew import Checkpoints, Field, InputSpec, Trainer
-from dew.data import Loading, TFDSImages
+from dew.data import Loading
+from dew.config.data import ImageData
 from dew.diffusion.presets import EDM
 from dew.objectives.diffusion import DiffusionObjective
 from dew.nn.backbones import SimpleDiT
@@ -87,13 +91,7 @@ from dew.nn.backbones import SimpleDiT
 
 def train():
     data_path = Path.home() / ".cache/dew/datasets/oxford_flowers102/2.1.1"
-    data = TFDSImages(
-        path=str(data_path),
-        split="train",
-        image_size=64,
-        val_batches=0,
-        loading=Loading(workers=2, threads=2, read_buffer=16, worker_buffer=2),
-    ).load(batch=16)
+    data = loader(ImageData(source=TFDS(name="oxford_flowers102", split="train", path=str(data_path)), image_size=64, caption_templates=("a photo of a {}",), augment=Augment(flip=True, jitter=True, backend="device")), batch=16, read="memory", loading=Loading(workers=2, threads=2, read_buffer=16, worker_buffer=2))
 
     model = SimpleDiT(
         patch_size=4,
@@ -400,31 +398,46 @@ A training run combines a model, an objective, a dataset, and an optimizer:
 
 ### Language modeling
 
-This decoder trains on TinyStories, a corpus of short stories in simple English, with the GPT-2 tokenizer. Download the 22 MB validation file of TinyStories V2 and tokenize it into the `train.bin`, `val.bin` and `meta.json` files that `TokenWindows` reads. `dew tokenize` holds out the first 1% of the tokens for validation.
+This decoder trains on TinyStories, a corpus of short stories in simple English, with the GPT-2 tokenizer. Download the 22 MB validation file of TinyStories V2 and export token records with a producer manifest and length index. The script below reserves the first 1% of tokens for validation.
 
 ```bash
 hf download roneneldan/TinyStories TinyStoriesV2-GPT4-valid.txt \
     --repo-type dataset --local-dir data
-dew tokenize --input data/TinyStoriesV2-GPT4-valid.txt \
-    --out data/tinystories --tokenizer gpt2
+python - <<'PY'
+from pathlib import Path
+import numpy as np
+from dew.data import HFTokenizer
+from dew.data.sinks import export
+
+tokenizer = HFTokenizer("gpt2")
+ids = np.asarray(tokenizer.encode(Path("data/TinyStoriesV2-GPT4-valid.txt").read_text()), np.int32)
+held = int(len(ids) * 0.01)
+metadata = {"token_store": True, "tokenizer": "gpt2", "vocab_size": tokenizer.vocab_size,
+            "dtype": "int32", "eos_id": None}
+export([{"text": ids[held:]}], "data/tinystories/train", format="array_record",
+       metadata=metadata, length_field="text")
+export([{"text": ids[:held]}], "data/tinystories/val", format="array_record",
+       metadata=metadata, length_field="text")
+PY
 ```
 
 Each row holds 257 token IDs: the model receives the first 256 and predicts the following 256.
 
 ```python
+from dew.config.data import loader
 import jax
 import jax.numpy as jnp
 import optax
 
 from dew import Trainer
-from dew.data import HFTokenizer, Loading, TokenWindows
+from dew.data import HFTokenizer, Loading
+from dew.config.data import TextData
 from dew.nn.backbones import CausalTransformer
 from dew.objectives.lm import LMObjective, Perplexity
 from dew.sampling import Sampling, generate
 
 tokenizer = HFTokenizer("gpt2")
-data = TokenWindows(path="data/tinystories", seq_len=256,
-                    loading=Loading(workers=0)).load(batch=32)
+data = loader(TextData(source="data/tinystories/train", validation="data/tinystories/val", seq_len=256), batch=32, read="memory", loading=Loading(workers=0), validation_records=(4) * (32))
 model = CausalTransformer(vocab_size=tokenizer.vocab_size, emb_features=256, num_layers=4,
                           num_heads=4, max_seq_len=256, dtype=jnp.bfloat16)
 objective = LMObjective(model, seq_len=256)
@@ -442,18 +455,18 @@ On one Colab L4 GPU the run takes about three minutes. The training loss falls f
 
 `temperature=0` selects the highest-probability token. GPU reductions are not bitwise repeatable by default, so a second run can continue differently after the first sentence. Validation uses EMA weights, which lag the live parameters during a short run: at step 1,000 their perplexity is 29.3.
 
-To pack whole documents into the windows instead, set `TokenWindows(pack=True)`. It adds segment IDs and positions, and splits the stream at the EOS ID that `dew tokenize --pack` records. `ChatMessages` reads conversations from a parquet file, a JSONL file or a Hub dataset ID, renders them with the tokenizer's chat template, and records each token's role. Set `LMObjective(loss_role=Role.ASSISTANT)` to train only on assistant targets. See [language models](https://github.com/AshishKumar4/dew/blob/main/docs/concepts/language_models.md) for checkpoint loading and text tokenization.
+To pack whole documents into the windows instead, set `Text(pack="first-fit")`. It adds segment IDs and positions, and splits the stream at the producer-recorded EOS boundaries. `Chat` reads conversations from a parquet file, a JSONL file or a Hub dataset ID, renders them with the tokenizer's chat template, and records each token's role. Set `LMObjective(loss_role=Role.ASSISTANT)` to train only on assistant targets. See [language models](https://github.com/AshishKumar4/dew/blob/main/docs/concepts/language_models.md) for checkpoint loading and text tokenization.
 
 ### Supervised fine-tuning
 
-Next, fine-tune the decoder above on one response to a prompt. Each token has a role: the prompt's tokens are `Role.USER` and the response's are `Role.ASSISTANT`. When you read conversation data, `ChatMessages` builds this role column from the chat template.
+Next, fine-tune the decoder above on one response to a prompt. Each token has a role: the prompt's tokens are `Role.USER` and the response's are `Role.ASSISTANT`. When you read conversation data, `Chat` builds this role column from the chat template.
 
 ```python
 import itertools
 
 import numpy as np
 
-from dew import Dataset
+from dew.data.dataset import Loader
 from dew.data.chat import Role
 
 prompt = tokenizer.encode("Tom had a red ball.")
@@ -461,7 +474,7 @@ response = tokenizer.encode(" He kicked it to his dog.")
 row = np.array(prompt + response, dtype=np.int32)
 roles = np.array([Role.USER] * len(prompt) + [Role.ASSISTANT] * len(response), dtype=np.int8)
 sft_batch = {"text": np.tile(row, (8, 1)), "text_roles": np.tile(roles, (8, 1))}
-sft_data = Dataset(
+sft_data = Loader(
     train=lambda partition: itertools.repeat(sft_batch),
     val=None,
     records=8,
@@ -480,30 +493,31 @@ sft_state = Trainer(
 ).fit(sft_data, steps=20, log_every=10)
 ```
 
-The loss counts only the assistant targets, after the next-token shift; the prompt tokens are still there as context. For conversation files, `ChatMessages` also keeps tool calls, tool responses and tool schemas.
+The loss counts only the assistant targets, after the next-token shift; the prompt tokens are still there as context. For conversation files, `Chat` also keeps tool calls, tool responses and tool schemas.
 
 ### Preference optimization
 
 This continues from `model` and `lm_state` above, with a chosen and a rejected response to the same prompt. The masks limit the loss to the response tokens.
 
 ```python
+from dew.data import Loading
+from dew.config.data import loader
 import json
 
-from dew.data import PreferencePairs
+from dew.config.data import PreferenceData
 from dew.objectives.rl import DPOObjective
 
 rejected = tokenizer.encode(" He kicked kicked kicked it.")
 pair = {"chosen": prompt + response, "rejected": prompt + rejected,
         "chosen_mask": [0] * len(prompt) + [1] * len(response),
         "rejected_mask": [0] * len(prompt) + [1] * len(rejected)}
-pairs = PreferencePairs(records=(json.dumps(pair),) * 8, seq_len=16,
-                        loading=Loading(workers=0, threads=1, read_buffer=2)).load(batch=8)
+pairs = loader(PreferenceData(source=tuple(json.loads(row) for row in (json.dumps(pair),) * 8), seq_len=16), batch=8, read="memory", loading=Loading(workers=0, threads=1, read_buffer=2), validation_records=(4) * (8))
 dpo = DPOObjective(model, seq_len=15, beta=0.1, variables=lm_state.variables)
 dpo_state = Trainer(dpo, optax.adam(0.001), key=jax.random.key(2)).fit(
     pairs, steps=10, log_every=5)
 ```
 
-`DPOObjective` keeps the starting policy as a frozen reference and raises the likelihood of the chosen response relative to the rejected one. `PreferencePairs.seq_len` is the width of the whole ID row, and shorter pairs are padded to it. The objective scores one position fewer because of the next-token shift.
+`DPOObjective` keeps the starting policy as a frozen reference and raises the likelihood of the chosen response relative to the rejected one. `Preferences.seq_len` is the width of the whole ID row, and shorter pairs are padded to it. The objective scores one position fewer because of the next-token shift.
 
 `FlowGRPOObjective` applies group-relative rewards to stochastic flow trajectories. `FlowRollout` samples groups of images, computes their rewards, and records the transition densities that the clipped policy objective uses. [FlowGRPO](https://github.com/AshishKumar4/dew/blob/main/docs/concepts/post_training.md) has a complete example with an image reward.
 
@@ -515,6 +529,7 @@ This example keeps training the same decoder and rewards stories that mention a 
 
 ```python
 from dew.objectives.rl import GRPOObjective, SampledRollout
+from dew.data.dataset import Loader
 
 prompt = tokenizer.encode("Once upon a time, there was a little")
 prompt_batch = {
@@ -536,7 +551,7 @@ def reward(data_source, completion, ground_truth, extra_info):
     return float(ground_truth in completion)
 
 
-rl_data = Dataset(
+rl_data = Loader(
     train=lambda partition: itertools.repeat(prompt_batch),
     val=None,
     records=8,
@@ -573,11 +588,12 @@ In the Colab run, 3 of 128 responses sampled from the policy before these 20 ste
 Masked diffusion trains a bidirectional decoder to recover masked tokens. There is no next-token shift, so each input row holds exactly `seq_len` tokens. Windows of `seq_len=127` hold 128 IDs each, which is what the 128-token objective needs. The mask token takes the first ID after GPT-2's vocabulary.
 
 ```python
+from dew.data import Loading
+from dew.config.data import TextData, loader
 from dew.diffusion.discrete import MDLM
 from dew.objectives.diffusion import MaskedDiffusionObjective
 
-masked_data = TokenWindows(path="data/tinystories", seq_len=127,
-                           loading=Loading(workers=0)).load(batch=64)
+masked_data = loader(TextData(source="data/tinystories", seq_len=127), batch=64, read="memory", loading=Loading(workers=0), validation_records=(4) * (64))
 mask_id = tokenizer.vocab_size
 process = MDLM(mask_id=mask_id)()
 masked_model = CausalTransformer(
@@ -612,24 +628,21 @@ LLaDA and Dream train the same way. Diffusion Gemma uses a different process, wi
 A JEPA encoder learns by predicting the representations of masked image patches. This example uses the Flowers data prepared in [Getting started](#getting-started), with 8×8 patches and a smaller predictor.
 
 ```python
+from dew.data import TFDS
+from dew.config.data import Augment, HoldOut, loader
 from pathlib import Path
 
 import jax
 import optax
 
 from dew import Field, Trainer
-from dew.data import Loading, TFDSImages
+from dew.data import Loading
+from dew.config.data import ImageData
 from dew.objectives.jepa import JepaEncoder, JepaObjective, JepaPredictor, KnnProbe, MultiBlockMask
 
 
 def train_jepa():
-    data = TFDSImages(
-        path=str(Path.home() / ".cache/dew/datasets/oxford_flowers102/2.1.1"),
-        split="train",
-        image_size=64,
-        val_batches=2,
-        loading=Loading(workers=0, threads=1, read_buffer=2),
-    ).load(batch=16)
+    data = loader(ImageData(source=TFDS(name="oxford_flowers102", split="train", path=str(Path.home() / ".cache/dew/datasets/oxford_flowers102/2.1.1")), image_size=64, caption_templates=("a photo of a {}",), augment=Augment(flip=True, jitter=True, backend="device"), validation=HoldOut(records=(2) * (16))), batch=16, read="memory", loading=Loading(workers=0, threads=1, read_buffer=2))
     encoder = JepaEncoder(
         patch_size=8,
         emb_features=64,
@@ -719,7 +732,8 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 
-from dew import Checkpoints, Dataset, Trainer
+from dew import Checkpoints, Trainer
+from dew.data.dataset import Loader
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.layer_plan import LayerKind
 from dew.objectives.lm import LMObjective
@@ -735,7 +749,7 @@ model = CausalTransformer(
 row = np.resize(np.array([1, 2, 3, 4], np.int32), 17)
 batch = {"text": np.tile(row, (4, 1))}
 stream = grain.MapDataset.source([batch]).repeat().to_iter_dataset()
-data = Dataset(train=lambda partition: iter(stream), val=None, records=4, batch=4)
+data = Loader(train=lambda partition: iter(stream), val=None, records=4, batch=4)
 objective = LMObjective(model, seq_len=16)
 checkpoints = Checkpoints("runs/custom-decoder")
 state = Trainer(objective, optax.adamw(0.003), key=jax.random.key(0),
@@ -760,6 +774,8 @@ use one with `checkpoint_every`. `objective.pipeline` returns a
 An objective can train any Linen module. This example fits `y = 2x + 1` with a single dense layer.
 
 ```python
+from dew.data import Loading
+from dew.config.data import RecordsData, loader
 import flax.linen as nn
 import jax
 import jax.numpy as jnp
@@ -781,7 +797,7 @@ class Regression(Objective):
         return loss, Aux(metrics={"mse": loss})
 
 x = np.linspace(-1, 1, 32, dtype=np.float32).reshape(32, 1)
-data = Dataset.from_records({"x": x, "y": 2 * x + 1}, batch=32)
+data = loader(RecordsData(source={"x": x, "y": 2 * x + 1}), batch=32, read="memory", loading=Loading(workers=0))
 objective = Regression()
 state = Trainer(objective, optax.sgd(0.1), key=jax.random.key(0)).fit(
     data, steps=100, log_every=25)
@@ -835,14 +851,15 @@ import jax
 import numpy as np
 import optax
 
-from dew import Dataset, Evaluation, LocalTracker, Trainer
+from dew import Evaluation, LocalTracker, Trainer
+from dew.data.dataset import Loader
 from dew.nn.backbones import CausalTransformer
 from dew.objectives.lm import LMObjective, Perplexity, Samples
 from dew.sampling import Sampling
 
 row = np.resize(np.array([1, 2, 3, 4], dtype=np.int32), 17)
 batch = {"text": np.tile(row, (8, 1))}
-data = Dataset(
+data = Loader(
     train=lambda partition: itertools.repeat(batch),
     val=lambda partition: iter([batch]),
     records=8,
@@ -932,13 +949,13 @@ To trace a window of training, pass `Trainer` a `ProfileWindow` with the trace `
 from dew import Evaluation, LocalTracker
 from dew.config import ModelConfig, OptimConfig, RunConfig, TrainerConfig
 from dew.config.sweep import GridSearch
-from dew.data import TokenWindows
+from dew.config.data import TextData
 
 config = RunConfig(
     # The run records the model it trains, and the batches above stand in
     # for the dataset this names.
     model=ModelConfig.from_model(objective.model),
-    data=TokenWindows(seq_len=16),
+    data=TextData(source="", seq_len=16),
     optim=OptimConfig(optimizer="adam"),
     trainer=TrainerConfig(name="lm-rate", checkpoint_dir="runs/sweep", steps=40, batch_size=8,
                           eval_every=None, checkpoint_every=None),
@@ -1039,6 +1056,10 @@ EMA copy merged over the live parameters, so you don't repeat the model
 configuration at generation time.
 
 ```python
+from dew.data.steps.image import EncodeCaptions
+from dew.config.data import loader
+from dew.data import TFDS
+from dew.config.data import Augment
 from pathlib import Path
 
 import jax
@@ -1047,7 +1068,8 @@ import optax
 
 from dew import Checkpoints, Trainer
 from dew.config import ModelConfig, TrainerConfig
-from dew.data import Loading, TFDSImages
+from dew.data import Loading
+from dew.config.data import ImageData
 from dew.diffusion import presets
 from dew.inference import TextToImage
 from dew.nn.backbones import SimpleDiT
@@ -1058,12 +1080,7 @@ run = Path("runs/flowers-run")
 config = DiffusionRunConfig(
     model=ModelConfig.from_model(SimpleDiT(patch_size=4, emb_features=128, num_layers=4,
                                            num_heads=4, dtype=jnp.bfloat16)),
-    data=TFDSImages(
-        path=str(Path.home() / ".cache/dew/datasets/oxford_flowers102/2.1.1"),
-        image_size=64,
-        val_batches=0,
-        loading=Loading(workers=0, threads=1, read_buffer=2),
-    ),
+    data=ImageData(source=TFDS(name="oxford_flowers102", split="all", path=str(Path.home() / ".cache/dew/datasets/oxford_flowers102/2.1.1")), image_size=64, caption_templates=("a photo of a {}",), augment=Augment(flip=True, jitter=True, backend="device")),
     trainer=TrainerConfig(checkpoint_dir=str(run), batch_size=16, steps=20, keep=1),
     preset=presets.EDM(regime="pixel"),
     text=None,
@@ -1075,7 +1092,8 @@ def main():
     checkpoints = Checkpoints(str(run), keep=1)
     state = Trainer(objective, optax.adamw(2e-4), key=jax.random.key(0),
                     checkpoints=checkpoints).fit(
-        config.data.load(batch=16, tokenize=objective.inputs.tokenize),
+        loader(config.data, batch=16, read="memory", loading=Loading(workers=0),
+             host=(EncodeCaptions(objective.inputs.tokenize),)),
         steps=20, log_every=20, checkpoint_every=20)
     checkpoints.wait()
     config.save(str(run))
@@ -1095,9 +1113,9 @@ The run directory then holds `['20', 'run.json']` and the task draws
 `(2, 64, 64, 3)` images clipped to `[-1, 1]`. `text=None` trains an
 unconditional model, so the prompt list only sets how many images to draw; a
 run with a `TextCondition` encodes the prompts with the encoder it names.
-`config.data.load` takes `tokenize=objective.inputs.tokenize` because the
-objective's conditions read the dataset's captions. `Loading(workers=0)` keeps
-that caption reader in the training process, so it shuts down with the run.
+`load` applies `EncodeCaptions(objective.inputs.tokenize)` as a common host
+stage because the objective's conditions read captions. It runs in the
+training process after batching and closes with the iterator.
 
 ### Exporting a decoder and serving it
 
@@ -1112,13 +1130,27 @@ tokenizer committed for the tests, and the corpus is the TinyStories file from
 [Language modeling](#language-modeling):
 
 ```bash
-dew tokenize \
-    --input data/TinyStoriesV2-GPT4-valid.txt \
-    --out runs/tokens \
-    --tokenizer tests/fixtures/tokenizers/tiny-tools
+python - <<'PY'
+from pathlib import Path
+import numpy as np
+from dew.data import HFTokenizer
+from dew.data.sinks import export
+
+name = "tests/fixtures/tokenizers/tiny-tools"
+tokenizer = HFTokenizer(name)
+ids = np.asarray(tokenizer.encode(Path("data/TinyStoriesV2-GPT4-valid.txt").read_text()), np.int32)
+held = int(len(ids) * 0.01)
+metadata = {"token_store": True, "tokenizer": name, "vocab_size": tokenizer.vocab_size,
+            "dtype": "int32", "eos_id": None}
+export([{"text": ids[held:]}], "runs/tokens/train", format="array_record",
+       metadata=metadata, length_field="text")
+export([{"text": ids[:held]}], "runs/tokens/val", format="array_record",
+       metadata=metadata, length_field="text")
+PY
 ```
 
 ```python
+from dew.config.data import loader
 from pathlib import Path
 
 import jax
@@ -1127,7 +1159,8 @@ import numpy as np
 import optax
 
 from dew import Trainer
-from dew.data import HFTokenizer, Loading, TokenCorpus, TokenWindows
+from dew.data import HFTokenizer, Loading
+from dew.config.data import TextData
 from dew.interop import PretrainedDecoder
 from dew.nn.backbones import CausalTransformer
 from dew.objectives.lm import LMObjective
@@ -1135,13 +1168,10 @@ from dew.sampling import Sampling
 
 tokens = Path("runs/tokens")
 export = Path("runs/dew-decoder")
-corpus = TokenCorpus.read(tokens)
-tokenizer = HFTokenizer(corpus.tokenizer)
+tokenizer = HFTokenizer("tests/fixtures/tokenizers/tiny-tools")
 
-data = TokenWindows(path=str(tokens), seq_len=128,
-                    loading=Loading(workers=0, threads=1, read_buffer=2)
-                    ).load(batch=16)
-model = CausalTransformer(vocab_size=corpus.vocab_size,
+data = loader(TextData(source=str(tokens / "train"), validation=str(tokens / "val"), seq_len=128), batch=16, read="memory", loading=Loading(workers=0, threads=1, read_buffer=2), validation_records=(4) * (16))
+model = CausalTransformer(vocab_size=tokenizer.vocab_size,
                           emb_features=128, num_layers=4, num_heads=4, num_kv_heads=2,
                           mlp_features=256, max_seq_len=128, dtype=jnp.float32,
                           qk_norm=False, tie_embeddings=False)
@@ -1257,16 +1287,15 @@ Every host runs the same script. The example below uses two hosts with two GPUs 
 Prepare byte-token data from your corpus and place it on shared storage:
 
 ```bash
-dew tokenize \
-    --input corpus.txt \
-    --out /shared/tokens \
-    --tokenizer byte \
-    --val-fraction 0.01
+dew data export records /shared/tokens \
+    --fields '{"source": "corpus.txt"}' \
+    --format array_record --tokenizer byte --read memory
 ```
 
 Save this as `train_multihost.py`. `prepare_process` joins the process pool, so call it before you create any device array.
 
 ```python
+from dew.config.data import loader
 import os
 
 import jax
@@ -1281,15 +1310,12 @@ def main():
         import jax.numpy as jnp
 
         from dew import Checkpoints, MeshSpec, Trainer
-        from dew.data import Loading, TokenWindows
+        from dew.data import Loading
+        from dew.config.data import TextData
         from dew.nn.backbones import CausalTransformer
         from dew.objectives.lm import LMObjective
 
-        data = TokenWindows(
-            path=os.environ["DEW_TOKEN_DIR"],
-            seq_len=128,
-            loading=Loading(workers=0, threads=1, read_buffer=2),
-        ).load(batch=16)
+        data = loader(TextData(source=os.environ["DEW_TOKEN_DIR"], seq_len=128), batch=16, read="memory", loading=Loading(workers=0, threads=1, read_buffer=2), validation_records=(4) * (16))
         model = CausalTransformer(
             vocab_size=256,
             emb_features=128,
