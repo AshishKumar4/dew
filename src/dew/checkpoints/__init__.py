@@ -280,9 +280,17 @@ def _kept(step: int, metrics: Mapping[str, float], custom: Mapping) -> Kept:
 
 def frozen_entries(step_directory: str) -> list[str]:
     """The `FROZEN_STORE` entries the step at `step_directory` records,
-    relative to its run directory, which `dew.io.publish` carries beside it."""
-    metadata = epath.Path(step_directory) / "_CHECKPOINT_METADATA"
-    custom = (json.loads(metadata.read_text()).get("custom_metadata") or {}) if metadata.exists() else {}
+    relative to its run directory, which `dew.io.publish` carries beside it.
+
+    Orbax reads the step's metadata, opening no manager. A directory with
+    none, which is no Orbax step, records no entry; one whose metadata does
+    not read raises."""
+    if not (epath.Path(step_directory) / "_CHECKPOINT_METADATA").exists():
+        return []
+    try:
+        custom = ocp.metadata.get_step_metadata(step_directory).custom_metadata or {}
+    except ValueError as error:
+        raise ValueError(f"{step_directory}'s step metadata does not read") from error
     digests = {digest for names in (custom.get("frozen") or {}).values() for digest in names.values()}
     return [f"{FROZEN_STORE}/{digest}" for digest in sorted(digests)]
 
@@ -812,19 +820,19 @@ class _RankedSteps(preservation.PreservationPolicy):
 
     def should_preserve(self, checkpoints: Sequence[preservation.PolicyCheckpointInfo], *,
                         context: preservation.PreservationContext) -> Sequence[bool]:
-        held: set[int] = set()
-        full = [
-            checkpoint
-            for checkpoint in checkpoints
-            if not (checkpoint.metrics or {}).get("checkpoint/weights_only", 0)
-        ]
-        held.update(
-            checkpoint.step
-            for checkpoint in sorted(full, key=lambda checkpoint: checkpoint.step)[
-                -self.checkpoints.keep.latest :
-            ]
-            if self.checkpoints.keep.latest
-        )
+        keep = self.checkpoints.keep
+        ordered = sorted(checkpoints, key=lambda checkpoint: checkpoint.step)
+        # Orbax's selectors over the steps in order: the latest among those a
+        # resume reads (no weights-only step) and every `every`-th step.
+        full = [checkpoint for checkpoint in ordered
+                if not (checkpoint.metrics or {}).get("checkpoint/weights_only", 0)]
+        held = {checkpoint.step for checkpoint, kept in zip(
+            full, preservation.LatestN(n=keep.latest).should_preserve(full, context=context), strict=True)
+            if kept and keep.latest}
+        if keep.every:
+            held.update(checkpoint.step for checkpoint, kept in zip(
+                ordered, preservation.EveryNSteps(interval_steps=keep.every).should_preserve(
+                    ordered, context=context), strict=True) if kept)
         groups: dict[str, list[tuple[float, int]]] = {}
         limits = self.checkpoints._rank_limits
         for checkpoint in checkpoints:
@@ -836,12 +844,10 @@ class _RankedSteps(preservation.PreservationPolicy):
                     )
         for name, scores in groups.items():
             held.update(step for _, step in sorted(scores)[:limits.get(name, 1)])
-        keep = self.checkpoints.keep
         previous = None
         interval = duration(keep.interval) if isinstance(keep.interval, str) else keep.interval
-        for checkpoint in sorted(checkpoints, key=lambda checkpoint: checkpoint.step):
-            if keep.every and checkpoint.step % keep.every == 0:
-                held.add(checkpoint.step)
+        # Orbax's EveryNSeconds takes whole seconds; Keep.interval is a timedelta, kept exact here.
+        for checkpoint in ordered:
             if interval and (previous is None or checkpoint.time - previous >= interval):
                 held.add(checkpoint.step)
                 previous = checkpoint.time
@@ -947,8 +953,10 @@ class Checkpoints:
 
     def _custom(self, step: int) -> dict:
         """The custom metadata `step` was saved with, as this process cached
-        it or from its committed metadata."""
-        return self._custom_cache.get(step) or self._open().metadata(step).custom_metadata or {}
+        it or from its committed metadata, which Orbax reads opening no manager."""
+        if step in self._custom_cache:
+            return self._custom_cache[step]
+        return ocp.metadata.get_step_metadata(self.path(step)).custom_metadata or {}
 
     def kept(self) -> list[Kept]:
         """Return the committed retained steps, oldest first; their immutable metadata is cached."""
@@ -1134,19 +1142,16 @@ class Checkpoints:
 
     @property
     def latest(self) -> int | None:
-        """Return the newest committed step a resume can read, local or persistent."""
-        persistent = self._open().latest_step()
-        if persistent is not None and (not self._complete(persistent) or
-                (self._step_metadata(persistent).custom_metadata or {}).get('weights_only', False)):
-            persistent = max(
-                (
-                    step
-                    for step in self._open().all_steps()
-                    if self._complete(step)
-                    and not (self._step_metadata(step).custom_metadata or {}).get("weights_only", False)
-                ),
-                default=None,
-            )
+        """Return the newest committed step a resume can read, local or persistent.
+
+        Asking opens and writes nothing: until this process writes, Orbax's
+        step format lists the committed steps read-only, and once it has, its
+        manager's view, which holds this process's own saves, does."""
+        steps = (self._manager.all_steps() if self._manager is not None
+                 else [found.step for found in ocp.step.standard_name_format().find_all(self.directory)])
+        resumable = (step for step in sorted(steps, reverse=True)
+                     if self._complete(step) and not self._custom(step).get("weights_only", False))
+        persistent = next(resumable, None)
         local = self._local_latest()
         if persistent is None or local is None:
             return local if persistent is None else persistent

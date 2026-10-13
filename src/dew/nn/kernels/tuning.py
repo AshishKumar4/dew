@@ -43,6 +43,7 @@ from __future__ import annotations
 import concurrent.futures
 import contextlib
 import dataclasses
+import json
 import logging
 import os
 import threading
@@ -173,8 +174,9 @@ class KernelOp(tokamax.Op):
                 return None
             if any(stored[name] != key[name] for name in key if name not in rows):
                 return None
-            if any((stored[name].shape[1:], stored[name].dtype) != (key[name].shape[1:], key[name].dtype)
-                   for name in rows):
+            # A launch without one of the token-counted operands (a norm with no branch) is another launch.
+            if any(stored[name] is None or (stored[name].shape[1:], stored[name].dtype)
+                   != (key[name].shape[1:], key[name].dtype) for name in rows):
                 return None
             return sum(abs(stored[name].shape[0].bit_length() - key[name].shape[0].bit_length())
                        for name in rows)
@@ -309,17 +311,36 @@ def _kernel_launches(picks: tokamax.AutotuningResult):
             yield ba, timings.prune()
 
 
-def _stored_picks(kind: str) -> dict[tuple[tokamax.Op, str], _Picks]:
-    """The picks stored for GPUs of `kind`, by op. A store that no longer
-    parses (a kernel left Dew) is measured anew."""
-    path = cache.kernel_picks_path(kind)
+def _read(path: str) -> tuple[tokamax.AutotuningResult | None, list]:
+    """The launches stored at `path` that this checkout's kernels read, and
+    the stored entries they do not, as JSON: another checkout's launches (a
+    kernel another branch adds, or another branch's config fields), which a
+    write keeps as they are. Each launch is read alone, so one launch this
+    checkout cannot read leaves the others readable. A file that is not JSON
+    holds nothing."""
     if not os.path.exists(path):
-        return {}
+        return None, []
     try:
         with open(path) as file:
-            stored = tokamax.AutotuningResult.load(file)
-    except ValueError as error:
-        _log.warning("the kernel picks at %s no longer parse, so they are measured anew: %s", path, error)
+            stored = json.load(file)
+        entries, kind = list(stored["data"]), stored["device_kind"]
+    except (ValueError, KeyError, TypeError) as error:
+        _log.warning("the kernel picks at %s are not a store, so they are measured anew: %s", path, error)
+        return None, []
+    read, foreign = [], []
+    for entry in entries:
+        try:
+            read.extend(tokamax.AutotuningResult.loads(json.dumps(
+                {**stored, "data": [entry]})).data)
+        except ValueError:
+            foreign.append(entry)
+    return tokamax.AutotuningResult(kind, tuple(read)), foreign
+
+
+def _stored_picks(kind: str) -> dict[tuple[tokamax.Op, str], _Picks]:
+    """The picks stored for GPUs of `kind` that this checkout reads (`_read`), by op."""
+    stored, _ = _read(cache.kernel_picks_path(kind))
+    if stored is None:
         return {}
     picks: dict[tuple[tokamax.Op, str], _Picks] = {}
     for ba, fastest in _kernel_launches(stored):
@@ -330,17 +351,19 @@ def _stored_picks(kind: str) -> dict[tuple[tokamax.Op, str], _Picks]:
 
 def _store(picks: tokamax.AutotuningResult) -> None:
     """Merge `picks` into the stored picks for their GPU model, one writer at a
-    time, a launch's newer timings replacing its older (`write_atomically`)."""
+    time, a launch's newer timings replacing its older, the entries this
+    checkout does not read kept as they are (`_read`). The file is replaced
+    whole (`write_atomically`), so no reader on the shared filesystem sees a
+    part of it."""
     path = cache.kernel_picks_path(picks.device_kind)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with filelock.FileLock(path + '.lock'):
-        launches = []
-        if os.path.exists(path):
-            with open(path) as file, contextlib.suppress(ValueError):
-                launches = list(tokamax.AutotuningResult.load(file).data)
+        stored, foreign = _read(path)
+        launches = () if stored is None else stored.data
         merged = {(ba.op, ba.autotuning_cache_key): (ba, timings) for ba, timings in (*launches, *picks.data)}
-        write_atomically(path, tokamax.AutotuningResult(picks.device_kind, tuple(merged.values()))
-                         .dumps(prune_errors=True))
+        written = json.loads(tokamax.AutotuningResult(picks.device_kind, tuple(merged.values()))
+                             .dumps(prune_errors=True))
+        write_atomically(path, json.dumps({**written, "data": [*written["data"], *foreign]}))
 
 
 @contextlib.contextmanager
