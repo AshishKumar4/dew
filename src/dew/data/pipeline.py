@@ -469,7 +469,7 @@ class Dataset:
         replacement or `Rejected(reason)`, which drops it, counted by reason
         in the reader's checkpointed counts, as `images.fetch` and
         `images.decode` do. A `grain.RandomMapTransform` draws from the
-        record's generator."""
+        record's generator, as `video.pick_clip` draws a window."""
         return self.then(*(RandomMap(step, identity, rejects=True) if isinstance(step,
                                                                                  pygrain.RandomMapTransform)
                            else Map(step, identity, rejects=True) for step in steps))

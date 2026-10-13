@@ -24,7 +24,15 @@ from jax.experimental import mesh_utils, multihost_utils
 from jax.sharding import AbstractMesh, AxisType, Mesh, NamedSharding, PartitionSpec as P
 
 from dew.coordination import agreed, broadcast_from_process_zero, from_every_process, stop_at_exit
-from dew.data.dataset import Budgeted, Checkpointable, Closeable, DataPartition, RampedStream, Stoppable
+from dew.data.dataset import (
+    Budgeted,
+    Checkpointable,
+    Closeable,
+    DataPartition,
+    RampedStream,
+    Stoppable,
+    stream_identity,
+)
 from dew.files import write_atomically
 from dew.nn.inputs import filled_validity
 from dew.nn.sharding import (
@@ -368,23 +376,23 @@ def check_batch(batch: int, mesh: Mesh, spec: MeshSpec) -> None:
 
 
 def check_stream(source, mesh: Mesh, spec: MeshSpec, batch: int, window: int, *, rows: bool,
-                 checkpointing: bool) -> None:
-    """Refuse a training stream a run cannot checkpoint or cannot shard.
+                 resumed: int | None) -> None:
+    """Refuse a training stream a run cannot resume or cannot shard.
 
-    A checkpoint written without the data position would replay the data
-    on resume. A `batch` the mesh cannot divide fails where it is placed or
+    `resumed` is the step a resume restored from a checkpoint without a data
+    position, which a stream that keeps none cannot continue: it would read
+    its data again from the start. A `batch` the mesh cannot divide fails where it is placed or
     traced (`check_batch`), unless the stream's rows are not the step's
     (`rows`; a rollout's are its own, checked where its step traces), and a
     ramp stage's, for a later stage, an hour in. A ramp reads each stage's
     batch whole, never in a `window` of more than one microbatch.
     """
-    if checkpointing and not isinstance(source, Checkpointable):
+    if resumed is not None and not isinstance(source, Checkpointable):
         raise ValueError(
-            f"checkpoint_every needs a training stream with get_state and "
-            f"set_state, and {type(source).__name__} lacks one; a checkpoint "
-            f"written without the data position would replay the data on "
-            f"resume. Train it with checkpoint_every=None "
-            f"(--trainer.checkpoint-every None)")
+            f"step {resumed}'s checkpoint holds no data position, as {stream_identity(source)} keeps "
+            f"none, so resuming would read its data again from the start; give the stream get_state "
+            f"and set_state, read it through dew.data, or declare that it reads the same batches each "
+            f"time it opens (dew.data.dataset.replayed, from_iter(replay=True))")
     if not isinstance(source, RampedStream):
         if rows:
             check_batch(batch, mesh, spec)
