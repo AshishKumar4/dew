@@ -672,14 +672,17 @@ class Identified(Protocol):
     def identity(self) -> str: ...
 
 
+DIGESTED = 1 << 18
+"""The elements of an array `batch_digest` reads, evenly spaced, beyond which it reads no more."""
+
 type _Held = Mapping[str, _Held] | Sequence[_Held] | str | bytes | np.ndarray | np.generic | float | None
 """What a batch's fields hold, as `batch_digest` reads them."""
 
 
 def batch_digest(batch: Batch) -> str:
     """A digest of what `batch` holds: its fields by name, their values'
-    dtypes, shapes and bytes, its strings, bytes and scalars, and the type
-    of any other object."""
+    dtypes, shapes and elements (`DIGESTED` evenly spaced ones of a longer
+    array), its strings, bytes and scalars, and the type of any other object."""
     digest = hashlib.blake2b(digest_size=16)
 
     def visit(value: _Held) -> None:
@@ -702,7 +705,10 @@ def batch_digest(batch: Batch) -> str:
             array = np.asarray(value)
             digest.update(f"{array.dtype}{array.shape}".encode())
             if array.dtype != object:
-                digest.update(np.ascontiguousarray(array).data)
+                # Evenly spaced elements of a long array: a stream that does not replay differs
+                # throughout, and reading all of a large image batch would cost the reader a step.
+                flat = array.reshape(-1)
+                digest.update(np.ascontiguousarray(flat[::max(1, flat.size // DIGESTED)]).data)
             elif array.ndim:
                 for element in array.flat:
                     visit(element)
