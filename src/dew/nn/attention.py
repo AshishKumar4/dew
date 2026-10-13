@@ -488,11 +488,12 @@ class RMSNorm(nn.Module):
         def grouped(value):
             return None if value is None else value.reshape(*value.shape[:-1], self.groups, -1)
 
-        # The groups' own last axis: the one norm body reduces over it, under the weight laid out alike.
+        # The groups' own last axis: the one norm body reduces over it, under the weight laid out
+        # alike, and the width's logical axis names the groups, each group's own span none.
         stream, normed = stream_rms_normalized(
             grouped(x), grouped(branch), grouped(scale), self.epsilon, dtype, self.scale_offset,
             self.scale_after_cast, self.fp32_statistics, implementation=self.implementation,
-            activation=self.activation)
+            axes=None if axes is None else (*axes, None), activation=self.activation)
         return stream.reshape(x.shape), normed.reshape(x.shape)
 
 

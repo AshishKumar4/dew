@@ -184,7 +184,8 @@ class ImageRows(TypedDict):
 
 def zoo() -> dict[str, Any]:
     """Small models of every family a layout splits differently: a dense
-    decoder, MoE decoders with 8 and with Qwen3-30B-A3B's 128 experts, a
+    decoder, the dense one under norms over four groups of its width (K2
+    Horizon's), MoE decoders with 8 and with Qwen3-30B-A3B's 128 experts, a
     Mamba-2 hybrid, a DiT and DiffusionGemma, each at widths every layout
     above divides. The DiT's rows hold 256 patches, as a DiT's smallest
     release does (DiT-B/2 at 256 px): a sequence or tensor split repeats each
@@ -262,6 +263,7 @@ def zoo() -> dict[str, Any]:
     images: ImageRows = {"batch_size": 8, "channels": 4, "fsdp_min_param_size": 256}
     return {
         "dense": Case("causal_transformer", dense, **lm),
+        "grouped": Case("causal_transformer", {**dense, "norm_groups": 4}, **lm),
         "moe": Case("causal_transformer", moe, **lm),
         "moe128": Case("causal_transformer", moe128, **lm),
         "hybrid": Case("causal_transformer", hybrid, **lm),
