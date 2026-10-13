@@ -13,7 +13,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
-from model_support import Digits, decoder, serving_task as task
+from model_support import Digits, decoder, flat_tree, serving_task as task
 from sharded import assert_sharded
 from steady_state import guarded, steady_state
 
@@ -26,6 +26,7 @@ from dew.nn.kv_cache import KVCache
 from dew.nn.mixers.attention import CausalSelfAttention
 from dew.nn.sharding import BATCH_AXES
 from dew.sampling import Sampling
+from dew.sampling.text import decoding_storage
 from dew.training import Layout, MeshSpec
 
 VOCAB = 13
@@ -75,6 +76,29 @@ def test_prepacked_queries_keys_and_values_preserve_attention_and_cache():
         np.testing.assert_array_equal(actual, expected)
         for before, after in zip(jax.tree.leaves(cache), jax.tree.leaves(packed_cache), strict=True):
             np.testing.assert_array_equal(after, before)
+
+
+def test_a_server_holds_its_weights_at_decoding_storage_and_reloads_into_it():
+    """A server over a bf16 decoder's fp32 weights holds them at decoding
+    storage, and a reload of the trained fp32 tree casts it there: the
+    server then draws what one built over the trained weights draws."""
+    model = decoder().clone(max_seq_len=128, dtype=jnp.bfloat16, head_bias=True)
+    params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
+    bound = TextGeneration(model, params, RunProcessor(Digits()),
+                           sampling=Sampling(temperature=0, eos_token_ids=12))
+    server = Server.from_task(bound, slots=2, capacity=128)
+
+    def held(variables):
+        return {name: leaf.dtype for name, leaf in flat_tree(variables).items()}
+
+    stored = held(decoding_storage(model, params))
+    assert held(server.variables) == stored and jnp.dtype(jnp.bfloat16) in stored.values()
+    trained = jax.tree.map(lambda leaf: leaf * 1.5, params)
+    server.reload(trained)
+    assert held(server.variables) == stored
+    fresh = Server.from_task(bound.bind(trained), slots=2, capacity=128)
+    for actual, expected in zip(server(["12", "34"], 5, key=3), fresh(["12", "34"], 5, key=3), strict=True):
+        assert_same_generation(actual, expected)
 
 
 def test_prepacked_serving_keeps_the_source_and_reloads_its_original_tree():

@@ -10,7 +10,7 @@ import numpy as np
 import optax
 import pytest
 from flax import linen as nn
-from model_support import decoder
+from model_support import decoder, flat_tree
 
 from dew.diffusion.block import BlockProcess
 from dew.inference import BlockGeneration, TextGeneration
@@ -18,6 +18,7 @@ from dew.interop import Pretrained
 from dew.nn.inputs import ModelInputs
 from dew.objectives.lm import LMObjective
 from dew.sampling import Sampling, generate
+from dew.sampling.text import decoding_storage
 
 FIXTURES = Path(__file__).parent / "fixtures" / "hf"
 SAMPLING = Sampling(temperature=0.8, top_k=5, eos_token_ids=(3, 9))
@@ -29,6 +30,25 @@ def assert_same_generation(actual, expected):
     np.testing.assert_array_equal(actual.terminated, expected.terminated)
     np.testing.assert_allclose(actual.behavior_log_probs, expected.behavior_log_probs, atol=2e-6, rtol=2e-6)
     np.testing.assert_allclose(actual.raw_log_probs, expected.raw_log_probs, atol=2e-6, rtol=2e-6)
+
+
+def test_generate_decodes_wider_weights_at_the_models_compute_dtype():
+    """A bf16 decoder over fp32 weights decodes at bf16 storage: `generate`
+    casts each floating parameter once, the head bias kept fp32 as a
+    checkpoint loaded at bf16 holds it, and draws what the weights stored at
+    bf16 draw."""
+    model = decoder().clone(dtype=jnp.bfloat16, head_bias=True)
+    params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
+    stored = decoding_storage(model, params)
+    held = {name: leaf.dtype for name, leaf in flat_tree(stored).items()}
+    assert held.pop("params.head_bias") == jnp.float32
+    assert set(held.values()) == {jnp.dtype(jnp.bfloat16)}, held
+    assert all(leaf.dtype == jnp.float32 for leaf in jax.tree.leaves(params))
+    prompts = jnp.asarray([[1, 2, 3], [4, 5, 6]], jnp.int32)
+    wide = generate(model, params, prompts, 5, key=3, sampling=SAMPLING)
+    narrow = generate(model, stored, prompts, 5, key=3, sampling=SAMPLING)
+    for field in ("tokens", "lengths", "terminated", "behavior_log_probs", "raw_log_probs"):
+        np.testing.assert_array_equal(getattr(wide, field), getattr(narrow, field))
 
 
 def test_a_bound_task_draws_from_the_weights_it_was_bound_to():

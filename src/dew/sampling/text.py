@@ -33,12 +33,14 @@ from jax.experimental import checkify
 from jax.typing import ArrayLike
 from typing_extensions import TypeVar
 
+from dew.interop.weights import checkpoint_dtype
 from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.dspark import DSpark
 from dew.nn.inputs import ModelInputs, PredictionPhase, Request, local_rows, mesh_of, valid_order
 from dew.nn.kv_cache import Layered, gather_cache_rows, refuse_unassigned, write_cache
 from dew.nn.protocols import BlockDenoiser, Serving
 from dew.objectives.base import Variables
+from dew.registry import dtype_name
 from dew.sampling import decoding, strategies
 from dew.sampling.decoding import (
     EndOfSequence,
@@ -880,6 +882,28 @@ def _check(model: nn.Module, params: Variables, inputs: ModelInputs, max_new_tok
     return prepared, controls, components
 
 
+def decoding_storage(model: nn.Module, variables: Variables) -> Variables:
+    """`variables` stored as decoding reads them: each floating parameter
+    wider than the model's compute dtype cast to it, but for those the
+    storage rule keeps in fp32 (`dew.interop.weights.checkpoint_dtype`), as
+    a checkpoint loaded at that storage holds them, and as HF's `torch_dtype`
+    and vLLM's `dtype` store a model. Other collections and a model that
+    declares no compute dtype keep theirs."""
+    compute = getattr(model, "dtype", None)
+    if compute is None:
+        return variables
+
+    def stored(path: tuple[jax.tree_util.DictKey, ...], leaf: jax.Array) -> jax.Array:
+        names = tuple(str(key.key) for key in path)
+        dtype = jnp.result_type(leaf)
+        if (names[0] != "params" or not jnp.issubdtype(dtype, jnp.floating)
+                or dtype.itemsize <= jnp.dtype(compute).itemsize):
+            return leaf
+        return leaf.astype(checkpoint_dtype(dtype, dtype_name(compute), path=names))
+
+    return jax.tree_util.tree_map_with_path(stored, variables)
+
+
 def _checked(model: nn.Module, params: Variables, inputs: ModelInputs, keys: jax.Array,
              budget: jax.Array, trips: int, pad_id: int, n: int,
              transforms: tuple[LogitsTransform, ...], stopping: tuple[Stopping, ...],
@@ -889,7 +913,8 @@ def _checked(model: nn.Module, params: Variables, inputs: ModelInputs, keys: jax
     An undefined draw has to reach the caller as an exception rather than a
     fabricated token, and a device loop cannot raise. `checkify` carries the
     failure out of the computation; with no check emitted the error is empty
-    and throwing it costs nothing.
+    and throwing it costs nothing. The weights are cast to their decoding
+    storage once, before the loop (`decoding_storage`).
     """
 
     def run(params, inputs, keys, budget, transforms, stopping, strategy):
@@ -897,7 +922,7 @@ def _checked(model: nn.Module, params: Variables, inputs: ModelInputs, keys: jax
                          transforms, stopping, strategy)
 
     return checkify.checkify(run, errors=checkify.user_checks)(
-        params, inputs, keys, budget, transforms, stopping, strategy)
+        decoding_storage(model, params), inputs, keys, budget, transforms, stopping, strategy)
 
 
 @functools.cache
@@ -925,7 +950,9 @@ def generate(model: nn.Module, params: Variables,
     the cache and logical-position state the model keeps. Each cache
     compacts the real input tokens and leaves paused rows unchanged.
 
-    Parameters keep their placement. On a mesh, the rows are split over its
+    Parameters keep their placement, and decode at the model's compute
+    dtype: a call casts a parameter stored wider to it once, before its loop
+    (`decoding_storage`). On a mesh, the rows are split over its
     batch axes and the result keeps that sharding; ``Generation.host()``
     reads a process's own rows back. All cooperating processes must use the
     same input shapes, effective decoding components, padding id and
