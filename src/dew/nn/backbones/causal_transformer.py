@@ -1556,6 +1556,13 @@ class CausalTransformer(nn.Module):
                                  self.embed_tokens.embedding.dtype)).astype(x.dtype)
         return scaled(x, self.embedding_multiplier)
 
+    @property
+    def embedding_factor(self) -> float:
+        """The factor `scaled_embeddings` scales an embedding by, unrounded,
+        for a mixture of the table's rows to take in its own arithmetic
+        (`dew.nn.diffusion_gemma.soft_embeddings`)."""
+        return (math.sqrt(self.emb_features) if self.embedding_scale else 1.0) * self.embedding_multiplier
+
     def draft(self, context, tokens, *, decode: bool = True, valid=None, choose=None):
         """Draft a DSpark block after each row's last context position.
 
