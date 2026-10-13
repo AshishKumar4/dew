@@ -18,7 +18,7 @@ from .base import Read, Shard, ShardManifest
 class Grain(Dataset):
     """A Grain `MapDataset`, read by index, or `IterDataset`, read as one
     stream whose position Grain checkpoints. Grain states no store of its own,
-    so `name` is its identity in a run's plan, a cache's key and its logs."""
+    so `name` declares its content version in a run's plan, a cache's key and its logs."""
 
     dataset: grain.MapDataset | grain.IterDataset
     name: str
@@ -27,7 +27,7 @@ class Grain(Dataset):
         return f"grain:{self.name}"
 
     def fingerprint(self) -> Mapping[str, object]:
-        return {"store": "grain", "name": self.name, **self.metadata()}
+        return {"store": "grain", "identity_required": True, "identity": self.name, **self.metadata()}
 
     def supports(self, read: Read) -> bool:
         return (read == "streamed") == isinstance(self.dataset, grain.IterDataset)

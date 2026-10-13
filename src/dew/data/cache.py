@@ -200,9 +200,6 @@ class Cache:
         transform: Transform | None = None,
     ) -> _CachedMap:
         self._root(key)
-        snapshot = source.fingerprint()
-        if snapshot.get("identity_required") is True and snapshot.get("identity") is None:
-            raise ValueError(f"cache source {source.describe()} needs an explicit content identity")
         return _CachedMap(parent, self, key, source, transform)
 
     def streamed(
