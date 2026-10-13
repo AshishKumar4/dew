@@ -1143,27 +1143,34 @@ def _wy_bwd_kernel(chunk_ref, k_ref, v_ref, beta_ref, g_ref, a_ref, dw_ref, du_r
         gate = _gates(g_ref, start, taken, chunk)
         decay = jnp.exp2(gate)
         width = k_ref.shape[-1]
-        d_x = jnp.zeros((chunk, chunk), jnp.float32)
-        d_beta = jnp.zeros((chunk,), jnp.float32)
-        d_gate = jnp.zeros((chunk,), jnp.float32)
-        for block in range(width // bk):
+
+        # Each block loop is a loop, not unrolled, so Triton pipelines its loads and holds one block's
+        # values at a time: unrolled, the A100 kernel spilled 406 words and ran 1.93 ms against 1.03.
+        def through_keys(block, carry):
+            d_x, d_beta, d_gate = carry
             columns = pl.ds(block * bk, bk)
             key = read(k_ref, columns)
             scaled = key * (beta * decay)[:, None]
             w_grad = read(dw_ref, columns)
-            d_x += _dot(w_grad, scaled.T.astype(w_grad.dtype), exact=exact)
             d_scaled = _dot(inverse_t, w_grad, exact=exact)
-            d_beta += jnp.sum(d_scaled * key * decay[:, None], axis=1)
-            d_gate += jnp.sum(d_scaled * scaled, axis=1)
-        for block in range(v_ref.shape[-1] // bv):
+            return (d_x + _dot(w_grad, scaled.T.astype(w_grad.dtype), exact=exact),
+                    d_beta + jnp.sum(d_scaled * key * decay[:, None], axis=1),
+                    d_gate + jnp.sum(d_scaled * scaled, axis=1))
+
+        def through_values(block, carry):
+            d_x, d_beta = carry
             columns = pl.ds(block * bv, bv)
             value = read(v_ref, columns)
             scaled = (value * beta[:, None]).astype(value.dtype)
             u_grad = read(du_ref, columns)
-            d_x += _dot(u_grad, scaled.T, exact=exact)
             d_scaled = _dot(inverse_t, u_grad, exact=exact)
             _write(_rows(dv_ref, start, chunk, columns), taken, d_scaled * beta[:, None])
-            d_beta += jnp.sum(d_scaled * value, axis=1)
+            return (d_x + _dot(u_grad, scaled.T, exact=exact), d_beta + jnp.sum(d_scaled * value, axis=1))
+
+        empty = jnp.zeros((chunk,), jnp.float32)
+        d_x, d_beta, d_gate = jax.lax.fori_loop(0, width // bk, through_keys,
+                                                (jnp.zeros((chunk, chunk), jnp.float32), empty, empty))
+        d_x, d_beta = jax.lax.fori_loop(0, v_ref.shape[-1] // bv, through_values, (d_x, d_beta))
         index = jnp.arange(chunk)
         strict = index[:, None] > index[None, :]
         d_x = jnp.where(strict, d_x, 0.0)
@@ -1171,20 +1178,23 @@ def _wy_bwd_kernel(chunk_ref, k_ref, v_ref, beta_ref, g_ref, a_ref, dw_ref, du_r
         d_x = _dot(inverse_t, d_x.astype(inverse_t.dtype), exact=exact)
         d_x = d_x * jnp.exp2(gate[:, None] - gate[None, :])
         d_l = jnp.where(strict, -d_x, 0.0).astype(k_ref.dtype)
-        products = jnp.zeros((chunk, chunk), jnp.float32)
-        for block in range(width // bk):
+        def keys_grad(block, carry):
+            products, d_beta = carry
             columns = pl.ds(block * bk, bk)
             key = read(k_ref, columns)
             scaled = key * beta[:, None]
-            products += _dot(key, key.T, exact=exact)
             d_key = _dot(d_l, key, exact=exact)
-            d_beta += jnp.sum(d_key * key, axis=1)
             through_w = _dot(inverse_t, read(dw_ref, columns), exact=exact) * (decay * beta)[:, None]
-            full = through_w + (d_key * beta[:, None] + _dot(scaled.T.astype(d_l.dtype), d_l, exact=exact).T)
+            # d_l^T (k beta), fla's trans(trans(kb) dA), as one product into the accumulator's layout.
+            full = through_w + (d_key * beta[:, None] + _dot(d_l.T, scaled.astype(d_l.dtype), exact=exact))
             if earlier_ref is not None:
                 earlier = read(earlier_ref, columns).astype(jnp.float32)
                 full += jnp.where(first_of_group, earlier, 0.0)
             _write(_rows(dk_ref, start, chunk, columns), taken, full)
+            return products + _dot(key, key.T, exact=exact), d_beta + jnp.sum(d_key * key, axis=1)
+
+        products, d_beta = jax.lax.fori_loop(0, width // bk, keys_grad,
+                                             (jnp.zeros((chunk, chunk), jnp.float32), d_beta))
         _write(_rows(db_ref, start, chunk), taken, d_beta)
         weighted = d_l.astype(jnp.float32) * (products * beta[:, None])
         _write(_rows(dg_ref, start, chunk), taken, _wy_gate_sum(d_gate, weighted))
