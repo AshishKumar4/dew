@@ -1,5 +1,6 @@
 """Training telemetry describes the admitted optimizer work and its checkout."""
 
+import json
 import subprocess
 from pathlib import Path
 
@@ -45,6 +46,26 @@ def targets(values):
                                           for value in values), None, None, 8)
 
 
+class Targets:
+    """`targets`' stream with its position, which a checkpoint saves."""
+
+    def __init__(self, values):
+        self.values, self.index = values, 0
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        self.index += 1
+        return {'target': np.full(8, self.values[self.index - 1], np.float32)}
+
+    def get_state(self):
+        return json.dumps(self.index).encode()
+
+    def set_state(self, state):
+        self.index = json.loads(state)
+
+
 @pytest.mark.parametrize('cadence,step,streak', [(1, 7, 5), (2, 8, 6)])
 def test_a_non_finite_run_stops_at_the_step_whose_losses_it_read(cadence, step, streak):
     """The losses go non-finite from step 3 on. A log is read once the next
@@ -84,8 +105,9 @@ def test_each_checkpoint_follows_the_log_of_its_step(tmp_path):
         sink = Ordered()
         checkpoints = None if directory is None else Checkpoints(
             str(directory / 'run'), local_directory=str(directory / 'local'), local_every=3)
+        data = Dataset(lambda partition: Targets([1., 3., 2., 6., 1., 3., 2., 5.]), None, None, 8)
         Trainer(Squared(), optax.sgd(.1), key=0, tracker=sink, checkpoints=checkpoints).fit(
-            targets([1., 3., 2., 6., 1., 3., 2., 5.]), steps=8, log_every=log_every,
+            data, steps=8, log_every=log_every,
             checkpoint_every=None if directory is None else 2)
         return sink
 
