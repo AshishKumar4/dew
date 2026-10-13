@@ -502,8 +502,9 @@ def test_a_post_norm_block_is_residual_plus_normed_sublayer_output(rng):
     sublayers, and against the pre-norm block on the same weights, which
     normalises the input instead and lands elsewhere."""
     from dew.nn.backbones.causal_transformer import RMSNorm
-    from dew.nn.backbones.decoder_block import BlockWiring, DecoderBlock, GatedMLP
+    from dew.nn.backbones.decoder_block import BlockWiring, DecoderBlock
     from dew.nn.mixers import AttentionMixer, MixerContext
+    from dew.nn.mlp import GatedMLP
 
     features, ids = 32, tokens(rng)
     x = jax.random.normal(rng, (*ids.shape, features)) * 3
@@ -679,6 +680,17 @@ def test_a_packed_document_reads_like_the_document_alone(rng):
 
     alone = model.apply(params, ids[:, 6:])
     assert jnp.max(jnp.abs(packed[:, 6:] - alone)) < 1e-5
+
+
+def test_a_packed_row_refuses_a_decode_cache_by_name(rng):
+    """A cache stores no document ids, so a packed row appended to one would attend across its
+    documents: the model refuses it at its entry, naming why, before any layer runs."""
+    model = tiny()
+    ids, segment_ids, positions = packed_pair(rng)
+    params = model.init(rng, ids)
+    with pytest.raises(ValueError, match="packed rows cannot append to a decode cache"):
+        model.apply(params, ids, decode=True, positions=positions, segment_ids=segment_ids,
+                    mutable=["cache"])
 
 
 def test_padding_in_a_packed_row_reaches_no_query(rng):

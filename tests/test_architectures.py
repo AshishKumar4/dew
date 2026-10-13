@@ -22,6 +22,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from flax import linen as nn
 from recording import RecordingTracker
 from reference_error import assert_leaves_as_exact, float64_terms
 
@@ -32,6 +33,7 @@ from dew.diffusion import presets
 from dew.inputs import Condition, ConditionEncoder, Field, InputSpec
 from dew.nn.attention import Stage
 from dew.nn.dit import TextContext
+from dew.objectives.base import Step
 from dew.objectives.diffusion import DiffusionObjective, DiffusionRunConfig
 from dew.objectives.jepa import JepaObjective, MultiBlockMask
 from dew.objectives.lm import LMObjective
@@ -456,6 +458,93 @@ def update_terms(case: Case, tmp_path, initial):
         return float64_terms(two_steps, state)[1]
 
 
+def decay_terms(objective, variables, batch, index: int) -> dict[tuple[str, ...], np.ndarray]:
+    """Each gated delta net layer's decay parameters' gradients as their
+    terms summed absolutely, by head, in float64, keyed by the parameter's
+    path. The decay g = -exp(A_log) softplus(z), z = a + dt_bias, enters the
+    rule at every row and position, so `dt_bias`'s gradient sums dL/dz and
+    `A_log`'s sums dL/dg g = dL/dz softplus(z) / sigmoid(z) there, both read
+    through the `a` projection, whose cotangent is dL/dz."""
+    step = Step(step=jnp.asarray(index), key=jax.random.key(0), ema=None)
+    values: dict[tuple[str, ...], jax.Array] = {}
+
+    def loss(offsets, record=None):
+        def project(next_fun, args, kwargs, context):
+            value = next_fun(*args, **kwargs)
+            path = context.module.scope.path
+            if context.method_name == "__call__" and path[-1:] == ("in_proj_a",):
+                if record is not None:
+                    record[path[:-1]] = value
+                return value + offsets.get(path[:-1], 0)
+            return value
+
+        with nn.intercept_methods(project):
+            return objective.scalar_loss(variables, batch, step)[0]
+
+    loss({}, values)
+    cotangents = jax.grad(loss)({path: jnp.zeros_like(value) for path, value in values.items()})
+    terms = {}
+    for path, cotangent in cotangents.items():
+        layer = variables["params"]
+        for part in path:
+            layer = layer[part]
+        z = values[path] + layer["dt_bias"]
+        decay = cotangent * jax.nn.softplus(z) / jax.nn.sigmoid(z)
+        for name, term in (("dt_bias", cotangent), ("A_log", decay)):
+            terms[(*path, name)] = np.sum(np.abs(np.asarray(term)), axis=(0, 1))
+    return terms
+
+
+def decay_invariants(case: Case, tmp_path, initial) -> dict[str, dict[tuple[str, ...], np.ndarray]]:
+    """`assert_leaves_as_exact`'s invariants for each gated delta net's decay
+    parameters over a language model's two SGD steps, by state tree. The
+    momentum holds momentum g1 + g2, and a parameter that starts at zero
+    moves to -lr ((1 + momentum) g1 + g2), so each is a sum of the two
+    steps' gradients' terms (`decay_terms`), measured in float64 at the
+    parameters each step reads. A parameter that starts elsewhere is no such
+    sum, and its own size floors it."""
+    if not case.is_lm:
+        return {}
+    trainer, _ = make_trainer(case, tmp_path / "terms", 1, devices=1)
+    batch = {"text": jnp.asarray(next(batches(case, None)())["text"])}
+    with jax.enable_x64(new_val=True):
+        wide = jax.tree.map(lambda leaf: leaf.astype(jnp.float64) if jnp.issubdtype(leaf.dtype, jnp.floating)
+                            else leaf, initial.variables)
+        first = decay_terms(trainer.objective, wide, batch, 0)
+        if not first:
+            return {}
+        step = Step(step=jnp.asarray(0), key=jax.random.key(0), ema=None)
+        gradient = jax.grad(lambda params: trainer.objective.scalar_loss(
+            {**wide, "params": params}, batch, step)[0])(wide["params"])
+        moved = {**wide, "params": jax.tree.map(lambda leaf, step: leaf - LEARNING_RATE * step,
+                                                wide["params"], gradient)}
+        second = decay_terms(trainer.objective, moved, batch, 1)
+
+    def starts_at_zero(path):
+        leaf = initial.variables["params"]
+        for part in path:
+            leaf = leaf[part]
+        return not np.any(np.asarray(leaf))
+
+    return {"variables": {path: LEARNING_RATE * ((1 + MOMENTUM) * first[path] + second[path])
+                          for path in first if starts_at_zero(path)},
+            "opt_state": {path: MOMENTUM * first[path] + second[path] for path in first}}
+
+
+def raised(terms, scales: dict[str, dict[tuple[str, ...], np.ndarray]]):
+    """`terms` with each leaf whose path ends in a declared parameter's at least
+    its declared terms (`decay_invariants`), leaf by leaf."""
+    def raise_tree(name, tree):
+        def leaf(key, value):
+            text = jax.tree_util.keystr(key)
+            for path, scale in scales.get(name, {}).items():
+                if text.endswith("".join(f"['{part}']" for part in path)):
+                    value = np.maximum(value, scale)
+            return value
+        return jax.tree_util.tree_map_with_path(leaf, tree)
+    return replace(terms, **{name: raise_tree(name, getattr(terms, name)) for name in scales})
+
+
 @pytest.mark.parametrize("case", CASES, ids=IDS)
 def test_architecture_trains_on_every_layout_as_on_one_device(case, tmp_path):
     """One device, 8x1 data parallelism (every parameter replicated, the
@@ -500,6 +589,9 @@ def test_architecture_trains_on_every_layout_as_on_one_device(case, tmp_path):
         assert param_specs == [leaf.sharding.spec for leaf in jax.tree.leaves(moment)]
     with jax.enable_x64(new_val=True):
         terms = jax.device_get(update_terms(case, tmp_path, copied()))
+    # A delta net's decay terms stay declared: its float32 rounding runs through the chunked
+    # rule's cumulative sums of the decay, which the step's own terms do not see.
+    terms = raised(terms, decay_invariants(case, tmp_path, initial))
     for layout in (replicated, state):
         for name in ("variables", "opt_state", "ema"):
             assert_leaves_as_exact(*jax.device_get((getattr(layout, name), getattr(alone, name))),
