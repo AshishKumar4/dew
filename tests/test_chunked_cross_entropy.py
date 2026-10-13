@@ -63,6 +63,36 @@ def test_vocabulary_bias_is_fp32_after_tied_or_untied_head_products(dtype, tied)
     assert not np.array_equal(np.asarray(bias), np.asarray(bias.astype(jnp.bfloat16), np.float32))
 
 
+@pytest.mark.parametrize('kind', ['nvfp4', 'fp8'])
+@pytest.mark.parametrize('dtype', [jnp.float32, jnp.bfloat16])
+def test_a_checkpoints_head_input_quantization_reaches_every_head_that_scores_it(kind, dtype):
+    """A model computing under a checkpoint's input quantization of its
+    lm_head (ModelOpt's, as `Pretrained` reads it) has its head's input
+    rounded by the quantizer in its forward; the table a loss, a scorer and
+    a sampler read carries the same quantizer, so the table's logits are the
+    forward's and the tiled loss is the forward's logits' cross entropy."""
+    from dew.training.quantization import INPUT_SCALES, QUANTIZATION, InputQuantization
+
+    model = InputQuantization(format='modelopt', sites=(('lm_head', kind),)).apply(CausalTransformer(
+        vocab_size=97, emb_features=32, num_layers=1, num_heads=2, mlp_features=32, max_seq_len=8,
+        head_bias=True, dtype=dtype, qk_norm=False, attention_impl='reference'))
+    ids = jnp.asarray([[2, 7, 3, 5], [11, 4, 9, 1]], jnp.int32)
+    variables = model.init(jax.random.key(0), ids)
+    variables[QUANTIZATION]['lm_head'][INPUT_SCALES[kind]] = jnp.asarray(0.37, jnp.float32)
+    with jax.default_matmul_precision('default'):
+        logits = model.apply(variables, ids)
+        states = model.apply(variables, ids, method='hidden_states')
+        table = chunked.head_table(model, variables)
+        assert table is not None and table.input_quantizer is not None
+        np.testing.assert_array_equal(chunked.model_logits(model, variables, states), logits)
+        unquantized = OutputTable(table.matrix, table.vocab_major, table.bias, compute=table.compute)
+        assert not np.array_equal(unquantized.logits(states), logits)
+        losses, predicted, _ = chunked.head_cross_entropy(model, variables, states, ids, 4, tile=(3, 11))
+    expected = optax.softmax_cross_entropy_with_integer_labels(logits, ids)
+    assert jnp.abs(losses - expected).max() <= 1e-5 * jnp.abs(expected).max()
+    np.testing.assert_array_equal(predicted, logits.argmax(-1))
+
+
 @pytest.mark.parametrize('tied', [False, True])
 def test_a_bf16_models_table_scores_states_handed_over_in_fp32_as_its_head_does(tied):
     """A table carries its model's compute dtype, so states that reach a
