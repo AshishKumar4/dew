@@ -26,11 +26,10 @@ from flax.typing import Dtype, PrecisionLike
 
 from dew.interop.weights import ParamTree, checkpoint_array, translate_parameters
 from dew.nn.activations import activation as named_activation
-from dew.nn.attention import LayerNorm
-from dew.nn.backbones.decoder_block import BlockWiring, DecoderBlock
+from dew.nn.attention import LayerNorm, RMSNorm
+from dew.nn.backbones.decoder_block import DecoderBlock
 from dew.nn.inputs import AttentionMetadata
-from dew.nn.mixers.attention import CausalSelfAttention
-from dew.nn.mlp import GatedMLP
+from dew.nn.text_encoders import clip_layer
 
 Attention = Literal["full", "band", "window"]
 Order = Literal["patches", "columns", "windows"]
@@ -49,7 +48,10 @@ class ViTLayout:
     aligned corners (`F.interpolate`'s flag; without, out-of-range taps weigh zero as
     `F.grid_sample`'s zero padding). `merge_blocks` is the processor's patch order: merge block by
     merge block, else raster; `channels_first` its pixel order in a patch, channels then time, else
-    time then channels.
+    time then channels. `mlp_packed` keeps a gated feed-forward's gate and up maps in one (as
+    `packed` the attention's queries, keys and values). `post_norm` names the norm after the
+    blocks, a layer or an RMS norm, or none; `grid_output` returns NCHW images' trunk as their
+    `[B, rows, columns, F]` patch grid, for a projector that pools it.
     """
 
     depth: int
@@ -75,8 +77,10 @@ class ViTLayout:
     position_table: int = 0
     align_corners: bool = True
     pre_norm: bool = False
-    post_norm: bool = False
+    post_norm: Literal["layer", "rms"] | None = None
     outer_norm_eps: float = 1e-5
+    mlp_packed: bool = False
+    grid_output: bool = False
     rope_theta: float = 10000.0
     rotary_columns_first: bool = False
     rotary_origin: int = 0
@@ -124,23 +128,16 @@ def resampled_positions(table, rows, columns, heights, widths, *, align_corners:
 
 def vit_block(layout: ViTLayout, index: int, *, dtype: Dtype | None,
               precision: PrecisionLike) -> DecoderBlock:
-    """Layer `index`'s block: a pre-norm attention over the 2D rotary and a pre-norm feed-forward,
-    both residual."""
+    """Layer `index`'s block (`clip_layer`): a pre-norm attention over the 2D rotary, over a band of
+    keys where the layout says, and a pre-norm feed-forward, both residual."""
     band = layout.attention[index] == "band"
-    attention = functools.partial(
-        CausalSelfAttention, emb_features=layout.hidden_size, num_heads=layout.num_heads,
-        num_kv_heads=layout.num_kv_heads, head_dim=layout.head_dim, max_seq_len=1, causal=False,
-        qk_norm=False, attention_bias=True, rotary_axes=(layout.head_dim // 2,) * 2,
-        rope_theta=layout.rope_theta, packed=layout.packed,
-        # A band keeps the keys within `band` places: |q - k| < band + 1 (`window_sides`).
-        sliding_window=layout.band + 1 if band else None, bidirectional_window=band,
-        dtype=dtype, precision=precision)
-    mlp = functools.partial(GatedMLP, hidden_features=layout.intermediate_size,
-                            out_features=layout.hidden_size, activation=layout.activation,
-                            use_bias=layout.mlp_bias, dtype=dtype, precision=precision)
-    return DecoderBlock(attention, mlp, layout.hidden_size, BlockWiring(), norm_eps=layout.norm_eps,
-                        norm_type=layout.norm_type, norm_bias=layout.norm_bias, dtype=dtype,
-                        precision=precision, name=f"blocks_{index}")
+    return clip_layer(layout.hidden_size, layout.num_heads, layout.intermediate_size, 1,
+                      kv_heads=layout.num_kv_heads, head_dim=layout.head_dim, activation=layout.activation,
+                      eps=layout.norm_eps, norm_type=layout.norm_type, norm_bias=layout.norm_bias,
+                      mlp_bias=layout.mlp_bias, mlp_packed=layout.mlp_packed,
+                      rotary_axes=(layout.head_dim // 2,) * 2, rope_theta=layout.rope_theta,
+                      packed=layout.packed, window=layout.band if band else None, dtype=dtype,
+                      precision=precision, name=f"blocks_{index}")
 
 
 def _gather(x, index):
@@ -248,13 +245,20 @@ class VisionTransformer(nn.Module):
         leaving = orders[current]
         if leaving is not None:
             hidden = _gather(hidden, jnp.argsort(leaving, axis=1))
-        if lay.post_norm:
+        if lay.post_norm == "layer":
             hidden = outer(name="post_norm")(hidden)
+        elif lay.post_norm == "rms":
+            hidden = RMSNorm(epsilon=lay.outer_norm_eps, dtype=self.dtype, name="post_norm")(hidden)
         if not lay.merge_blocks and merge > 1:
             # Raster patches into merge blocks, each block's patches consecutive (pixel_shuffle's gather).
             block = frame * area + (rows // merge) * merge * widths + (columns // merge) * merge * merge
             key = block + (rows % merge) * merge + columns % merge
             hidden = _gather(hidden, jnp.argsort(jnp.where(valid, key, last), axis=1, stable=True))
+        if lay.grid_output:
+            if not images:
+                raise ValueError("a tower returning its patch grid takes NCHW images")
+            height, width = jnp.shape(pixel_values)[2:]
+            hidden = hidden.reshape(hidden.shape[0], height // lay.patch_size, width // lay.patch_size, -1)
         return hidden
 
     def _packed(self, pixels, grid_thw):

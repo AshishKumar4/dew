@@ -13,67 +13,23 @@ from flax.typing import Dtype, PrecisionLike
 
 from dew import records
 from dew.nn.activations import gelu_exact
-from dew.nn.attention import RMSNorm
-from dew.nn.backbones.decoder_block import BlockWiring, DecoderBlock
-from dew.nn.inputs import AttentionMetadata
-from dew.nn.mixers.attention import CausalSelfAttention
-from dew.nn.mlp import GatedMLP
 from dew.registry import Record
 
 from .common import ProjectorBase, TowerBase, TowerGeometry, _vision_section
-
-
-class DeepseekV41VisionTransformer(nn.Module):
-    """DeepSeek-V4.1's ViT over NCHW images (vision.py:87-103).
-
-    Each `patch_size` square's pixels, channel-major, map through one biased
-    projection; the blocks attend over the whole grid with its 2D rotary, and
-    a final RMS norm closes. The return value keeps the grid,
-    `[images, rows, columns, hidden_size]`, which the aligner groups.
-
-    Each block is the decoder block (vision.py:46-84): pre-norm full attention
-    whose queries, keys and values come from one biased map, rotated by the
-    grid in fp32, as Qwen 3.5's vision rope turns them (vision.py:8-21), then a
-    pre-norm SwiGLU whose gate and up maps are one, both residual.
-    """
-
-    config: "DeepseekV41Vision"
-    dtype: Dtype | None = None
-    precision: PrecisionLike = None
-
-    @nn.compact
-    def __call__(self, pixel_values) -> jax.Array:
-        cfg = self.config
-        pixels = jnp.asarray(pixel_values)
-        patch = cfg.patch_size
-        images, channels, height, width = pixels.shape
-        if height % patch or width % patch:
-            raise ValueError(f"pixel_values must tile into {patch}px patches, got {height}x{width}")
-        rows, columns = height // patch, width // patch
-        patches = pixels.reshape(images, channels, rows, patch, columns, patch).transpose(0, 2, 4, 1, 3, 5)
-        hidden_states = nn.Dense(cfg.hidden_size, dtype=self.dtype, precision=self.precision,
-                                 name="patch_embed")(patches.reshape(images, rows * columns, -1))
-        grid = jnp.stack(jnp.meshgrid(jnp.arange(rows), jnp.arange(columns), indexing="ij"), axis=-1)
-        metadata = AttentionMetadata(rotary_positions=grid.reshape(1, rows * columns, 2))
-        head_dim = cfg.hidden_size // cfg.num_attention_heads
-        attention = functools.partial(
-            CausalSelfAttention, emb_features=cfg.hidden_size, num_heads=cfg.num_attention_heads,
-            num_kv_heads=cfg.num_attention_heads, head_dim=head_dim, max_seq_len=rows * columns, causal=False,
-            qk_norm=False, attention_bias=True, rotary_axes=(head_dim // 2, head_dim // 2),
-            rope_theta=cfg.rope_theta, packed=True, dtype=self.dtype, precision=self.precision)
-        mlp = functools.partial(GatedMLP, hidden_features=cfg.intermediate_size, out_features=cfg.hidden_size,
-                                packed=True, dtype=self.dtype, precision=self.precision)
-        for index in range(cfg.num_hidden_layers):
-            hidden_states = DecoderBlock(
-                attention, mlp, cfg.hidden_size, BlockWiring(), norm_eps=1e-6, dtype=self.dtype,
-                precision=self.precision, name=f"blocks_{index}")(hidden_states, attention_metadata=metadata)
-        hidden_states = RMSNorm(epsilon=1e-6, dtype=self.dtype, name="norm")(hidden_states)
-        return hidden_states.reshape(images, rows, columns, cfg.hidden_size)
+from .vit import VisionTransformer, ViTLayout
 
 
 @dataclasses.dataclass(frozen=True)
 class DeepseekV41Vision(TowerBase):
-    """DeepSeek-V4.1's ViT geometry, under its vision_config's names."""
+    """DeepSeek-V4.1's ViT geometry, under its vision_config's names (vision.py:87-103).
+
+    Its layout (`ViTLayout`): each `patch_size` square's pixels, channel-major, through one biased
+    map; blocks of full attention whose queries, keys and values come from one biased map, rotated by
+    the grid's rows then columns in fp32 as Qwen 3.5's vision rope turns them (vision.py:8-21), then
+    a SwiGLU whose gate and up maps are one, each after an RMS norm (vision.py:46-84); a final RMS
+    norm, and the trunk returned as its `[images, rows, columns, hidden_size]` grid, which the
+    aligner groups.
+    """
 
     num_hidden_layers: int = 32
     hidden_size: int = 1024
@@ -82,8 +38,18 @@ class DeepseekV41Vision(TowerBase):
     patch_size: int = 14
     rope_theta: float = 10000.0
 
+    def layout(self) -> ViTLayout:
+        depth, heads = self.num_hidden_layers, self.num_attention_heads
+        return ViTLayout(
+            depth=depth, hidden_size=self.hidden_size, num_heads=heads, num_kv_heads=heads,
+            head_dim=self.hidden_size // heads, intermediate_size=self.intermediate_size, activation="swiglu",
+            in_channels=3, patch_size=self.patch_size, temporal_patch_size=1, spatial_merge_size=1,
+            norm_type="rms", norm_eps=1e-6, norm_bias=False, mlp_bias=False, packed=True, mlp_packed=True,
+            patch_bias=True, attention=("full",) * depth, order=("patches",) * depth, sinks=(False,) * depth,
+            post_norm="rms", outer_norm_eps=1e-6, rope_theta=self.rope_theta, grid_output=True)
+
     def build(self) -> nn.Module:
-        return DeepseekV41VisionTransformer(self)
+        return VisionTransformer(self.layout())
 
     def geometry(self) -> TowerGeometry:
         return TowerGeometry(patch_size=self.patch_size, channels=3)
@@ -154,7 +120,7 @@ _BLOCK_MAPS = {("attn", "wqkv"): ("self_attn", "qkv_proj"), ("attn", "wo"): ("se
 _DEEPSEEK_V41_VISION_TENSORS = {
     "patch_embed.proj.weight": ("patch_embed", "kernel"),
     "patch_embed.proj.bias": ("patch_embed", "bias"),
-    "norm.weight": ("norm", "scale"),
+    "norm.weight": ("post_norm", "scale"),
 }
 
 
