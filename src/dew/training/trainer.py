@@ -950,8 +950,15 @@ class Trainer(Generic[Loss, Effects]):
             batch = step(batch)
         return model_batch(batch)
 
+    def _model_shapes(self, batch: Batch) -> Batch:
+        """`_model_batch`'s output, traced only where device steps change it: a
+        traced copy of the batch would lose the shardings its leaves carry."""
+        if not self._device:
+            return model_batch(batch)
+        return jax.eval_shape(self._model_batch, batch)
+
     def _loss_shape(self, state: TrainState, batch: Batch):
-        batch = jax.eval_shape(self._model_batch, batch)
+        batch = self._model_shapes(batch)
         # Shapes and dtypes only: a resident frozen leaf sits in another
         # memory space than the moving ones, and the loss the realization
         # runs reads a snapshot in one space. The step's key is drawn inside
@@ -979,7 +986,7 @@ class Trainer(Generic[Loss, Effects]):
             return jax.ShapeDtypeStruct(leaf.shape, leaf.dtype)
 
         trainable = jax.tree.map(shape, state.variables["params"])
-        records = jax.tree.map(shape, jax.eval_shape(self._model_batch, batch))
+        records = jax.tree.map(shape, self._model_shapes(batch))
         mutable = (None if shared or aux.variables is None else
                    jax.tree.map(shape, {name: state.variables[name] for name in aux.variables}))
 
@@ -1519,7 +1526,7 @@ class Trainer(Generic[Loss, Effects]):
                 if not compiled and self.rollout is None and inputs is not None:
                     # A rollout writes the batch its loss reads, from prompts it reads itself.
                     # The objective reads the batch its device steps make (`_model_batch`).
-                    checked = jax.eval_shape(self._model_batch, batch) if self._device else batch
+                    checked = self._model_shapes(batch) if self._device else batch
                     agreed("training input declaration", functools.partial(inputs.check, checked))
                 known, began = len(compiled), time.perf_counter()
                 train_step, measured_flops, state = self._compiled_for(compiled, state, batch)
