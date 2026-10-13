@@ -1266,18 +1266,24 @@ def test_closing_a_compiled_from_iter_reader_finalizes_its_native_generators():
     opened = []
     closed = []
     owned = []
+    finalizers = []
+    both_started = threading.Event()
 
-    def native():
-        identity = len(opened)
+    def native(identity, finalized):
         opened.append(identity)
+        if len(opened) == 2:
+            both_started.set()
         try:
             yield from ({"id": index} for index in range(64))
         finally:
             closed.append(identity)
+            finalized.set()
 
     def factory():
-        iterator = native()
+        finalized = threading.Event()
+        iterator = native(len(owned), finalized)
         owned.append(iterator)
+        finalizers.append(finalized)
         return iterator
 
     source = from_iter(factory, name="closing-generator@1").repeat().batch(2)
@@ -1285,11 +1291,14 @@ def test_closing_a_compiled_from_iter_reader_finalizes_its_native_generators():
                      ).train(DataPartition())
     try:
         assert next(reader)["id"].tolist() == [0, 1]
-        assert opened and not closed
+        assert both_started.wait(timeout=5)
+        assert sorted(opened) == [0, 1] and not closed
     finally:
         reader.close()
         reader.close()
-    assert sorted(closed) == opened
+    # Grain finalizes the unconsumed lookahead on its iterator-making executor.
+    assert all(finalized.wait(timeout=5) for finalized in finalizers)
+    assert sorted(closed) == sorted(opened) == [0, 1]
 
 
 def test_from_iter_forwards_a_native_stop_request():
