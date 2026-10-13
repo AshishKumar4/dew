@@ -1,4 +1,4 @@
-"""One random clip of frames and aligned audio out of a video file.
+"""Frames and sound of a media file over a time window, which `video.pick_clip` draws once for both.
 
 moviepy is the reader because it is what the `av` extra installs and it
 reads from wheels alone; it drives ffmpeg, so nothing here holds a decoder
@@ -7,112 +7,87 @@ open across records.
 
 from __future__ import annotations
 
+import re
 import subprocess
 
 import numpy as np
 
 FPS = 25.0
-"""The rate clips are sampled at, which cuts the audio into rows per frame."""
+"""The rate `VideoData` samples clips at."""
 
 
-def choose_clip_start(total_frames: int, num_frames: int, padding: int,
-                      rng: np.random.Generator) -> int:
-    """A start for a clip of `num_frames` that leaves `padding` frames free
-    on either side, drawn from `rng`, or the only start that fits.
+def media_info(path: str) -> tuple[float, bool, bool]:
+    """`path`'s duration in seconds and whether it holds a video and an audio stream, from ffmpeg's
+    reading of the container, so a sound file answers too."""
+    from moviepy.video.io.ffmpeg_reader import ffmpeg_parse_infos
 
-    The generator is an argument because np.random.seed() inside a
-    data-loading worker reseeds the process-global RNG and perturbs every
-    other consumer of np.random.
-    """
-    latest = total_frames - num_frames - padding
-    if latest <= padding:
-        return padding
-    return int(rng.integers(padding, latest))
+    try:
+        probed = ffmpeg_parse_infos(path, check_duration=True)
+    except (OSError, IndexError) as error:
+        raise ValueError(f"ffmpeg could not read {path}: {error}") from error
+    duration = probed.get("duration")
+    if not duration:
+        raise ValueError(f"{path} reports no duration, so no clip can be cut from it")
+    return float(duration), bool(probed.get("video_found")), bool(probed.get("audio_found"))
 
 
-def audio_window(path: str, start: float, duration: float, sample_rate: int) -> np.ndarray:
-    """The sound of `path` from `start` for `duration` seconds, mono at
-    `sample_rate`, float32 in [-1, 1].
+def audio_window(path: str, start: float, duration: float, sample_rate: int) -> tuple[np.ndarray, np.ndarray]:
+    """The sound of `path` from `start` for `duration` seconds, mono at `sample_rate`, float32 in
+    [-1, 1], and whether the track holds each sample: silence and False before the track begins,
+    whether `start` is before the file's or the track starts late, and after it ends.
 
     ffmpeg does the seek, the resampling and the downmix, through the binary
     moviepy drives. moviepy's own audio reader asks for stereo at 44.1 kHz
     whatever the track is, and ffmpeg's mono-to-stereo upmix takes 3 dB off
     a mono track; sampling that stream at another rate then picks the
     nearest 44.1 kHz sample, which aliases and is never sample-exact.
+
+    The samples are placed by the timestamp of the first one decoded, read a
+    second before `start`: cut by ffmpeg's own seek instead, an AVI's track
+    started 73 or 261 samples late in 2 of 80 windows and a Matroska one up
+    to 464 samples off, and a track that starts after the video came back
+    shifted to the window's start. Placed, all 80 were sample-exact.
     """
     from moviepy.config import FFMPEG_BINARY
 
     done = subprocess.run(
-        [FFMPEG_BINARY, "-loglevel", "error", "-nostdin", "-ss", f"{start:.6f}",
-         "-t", f"{duration:.6f}", "-i", path, "-vn", "-f", "s16le", "-ac", "1",
-         "-ar", str(sample_rate), "-"],
+        [FFMPEG_BINARY, "-loglevel", "info", "-nostdin", "-copyts", "-start_at_zero",
+         "-ss", f"{max(start - 1.0, 0.0):.6f}", "-to", f"{start + duration + 0.01:.6f}", "-i", path,
+         "-map", "0:a:0", "-af", "ashowinfo", "-f", "s16le", "-ac", "1", "-ar", str(sample_rate), "-"],
         capture_output=True)
     if done.returncode:
         raise ValueError(f"ffmpeg could not read the audio of {path}: "
-                         f"{done.stderr.decode(errors='replace').strip()}")
-    return np.frombuffer(done.stdout, np.int16).astype(np.float32) / 32768.0
+                         f"{done.stderr.decode(errors='replace').strip()[-2000:]}")
+    count = round(duration * sample_rate)
+    wave, held = np.zeros(count, np.float32), np.zeros(count, bool)
+    first = re.search(rb"pts_time:(\S+)", done.stderr)
+    if first is None:
+        return wave, held
+    decoded = np.frombuffer(done.stdout, np.int16).astype(np.float32) / 32768.0
+    # The first decoded sample's place in the window; before it where the read began early.
+    at = round((float(first.group(1)) - start) * sample_rate)
+    lead = min(max(at, 0), count)
+    kept = decoded[max(-at, 0):][:count - lead]
+    wave[lead:lead + len(kept)] = kept
+    held[lead:lead + len(kept)] = True
+    return wave, held
 
 
-def read_random_frames(path: str, *, num_frames: int, padding: int, seed: int,
-                       fps: float = FPS) -> tuple[np.ndarray, int]:
-    """`num_frames` consecutive frames of `path` sampled at `fps`, as uint8
-    `[num_frames, H, W, 3]` RGB, and the index of the first.
+def read_frames(path: str, start: float, count: int, fps: float) -> np.ndarray:
+    """`count` frames of `path` at `start + i / fps` seconds, as uint8 `[count, H, W, 3]` RGB.
 
-    The start is the one `seed` picks leaving `padding` frames free on
-    either side, so a caller can read the sound around the clip.
+    Each frame is asked for by its own time: the reader seeks to the first
+    and steps to the rest, where a subclip's iterator enumerates times from a
+    float duration and can come up one short.
     """
     from moviepy import VideoFileClip
 
-    padded_frames = num_frames + 2 * padding
     with VideoFileClip(path, audio=False) as video:
-        if video.duration is None:
-            raise ValueError(f"{path} reports no duration, so no clip can be cut from it")
-        total_frames = int(video.duration * fps)
-        if total_frames < padded_frames:
-            raise ValueError(
-                f"{path} has {total_frames} frames at {fps} fps and a clip of "
-                f"{num_frames} with {padding} of padding needs {padded_frames}")
-        start = choose_clip_start(total_frames, num_frames, padding, np.random.default_rng(seed))
-        # One frame per index, asked for by its own time. The reader seeks
-        # to the first and steps to the rest, where a subclip's iterator
-        # enumerates times from a float duration and can come up one short.
         decoded: list[np.ndarray] = []
-        for index in range(num_frames):
-            timestamp = (start + index) / fps
+        for index in range(count):
+            timestamp = start + index / fps
             frame = video.get_frame(timestamp)
             if frame is None:
                 raise ValueError(f"{path} returned no video frame at {timestamp} seconds")
             decoded.append(frame)
-    return np.stack(decoded), start
-
-
-def read_av_random_clip(path: str, *, num_frames: int, audio_padding: int, seed: int,
-                        sample_rate: int = 16000, fps: float = FPS
-                        ) -> tuple[np.ndarray, np.ndarray]:
-    """`num_frames` consecutive frames of `path` from a start `seed` picks,
-    and the audio under them with `audio_padding` frames more on each side.
-
-    Frames are sampled at `fps` and come back as uint8 `[num_frames, H, W, 3]`
-    RGB. The audio is decoded mono at `sample_rate` and cut into one row per
-    video frame, float32 in [-1, 1] of shape `[num_frames + 2 * audio_padding,
-    sample_rate / fps]`, so row `audio_padding + i` is the sound under frame
-    `i`; the rate therefore has to be a whole number of samples per frame.
-    """
-    samples_per_frame = sample_rate / fps
-    if not samples_per_frame.is_integer():
-        raise ValueError(
-            f"{sample_rate} Hz at {fps} fps is {samples_per_frame} audio samples a "
-            "frame, and a row of audio per frame needs a whole number")
-    samples_per_frame = int(samples_per_frame)
-    padded_frames = num_frames + 2 * audio_padding
-
-    # The audio is not opened with the frames. A file without a track fails
-    # in audio_window with ffmpeg's own words for it.
-    frames, start = read_random_frames(path, num_frames=num_frames, padding=audio_padding,
-                                       seed=seed, fps=fps)
-    samples = audio_window(path, (start - audio_padding) / fps, padded_frames / fps, sample_rate)
-    needed = padded_frames * samples_per_frame
-    if len(samples) < needed:
-        raise ValueError(
-            f"{path} gave {len(samples)} audio samples where the clip needs {needed}")
-    return frames, samples[:needed].reshape(padded_frames, samples_per_frame)
+    return np.stack(decoded)

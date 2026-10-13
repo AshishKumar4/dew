@@ -1014,7 +1014,7 @@ def test_foreign_sources_resume_only_their_declared_content_identity(kind, read,
         elif kind == "grain":
             source = from_grain(grain.MapDataset.source(rows), identity)
         else:
-            source = from_iter(lambda: iter(rows), name=identity)
+            source = from_iter(lambda: iter(rows), name=identity, replay=True)
         return compile(source.repeat().batch(4), read=read, resume=resume, loading=Loading(workers=0))
 
     original = dataset("tickets@1").train(DataPartition())

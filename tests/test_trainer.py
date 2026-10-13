@@ -11,8 +11,10 @@ Local resume combines Dew's run and data-position policies; Orbax oracles the st
 
 import contextlib
 import dataclasses
+import itertools
 import json
 import os
+import signal
 import subprocess
 import sys
 from pathlib import Path
@@ -32,10 +34,11 @@ from dew.artifacts import Representations
 from dew.checkpoints import Ranking
 from dew.config import OptimConfig
 from dew.config.data import loader
-from dew.data.dataset import DataPartition
+from dew.data.dataset import DataPartition, Loader, replayed
 from dew.objectives.base import Aux, EMASpec, Objective, merge, under
 from dew.training import Checkpoints, Layout, MeshSpec, Trainer, TrainState, ema_update
 from dew.training.optim import Cosine, Power
+from dew.training.runtime import Preempted
 from dew.training.state import CHECKPOINTED
 
 
@@ -249,6 +252,89 @@ def test_a_resumed_run_continues_the_key_stream(tmp_path):
     for expected, actual in zip(jax.tree.leaves(whole.variables),
                                 jax.tree.leaves(resumed.variables), strict=True):
         np.testing.assert_allclose(np.asarray(expected), np.asarray(actual), rtol=1e-6)
+
+
+def drawn(seed=0, opened=None, diverge=None):
+    """A plain generator, without a position of its own: each batch drawn
+    from `seed`'s stream, or from fresh entropy with `seed=None`. With
+    `opened` (a list counting the generator's openings) and `diverge`, the
+    batches past index `diverge` differ on each opening."""
+    if opened is not None:
+        opened.append(None)
+    rng = np.random.default_rng(seed)
+    for index in itertools.count():
+        if diverge is not None and index == diverge + 1:
+            rng = np.random.default_rng([seed, len(opened)])
+        x = rng.normal(size=(BATCH, FEATURES)).astype(np.float32)
+        yield {"x": x, "y": 2 * x[:, :2]}
+
+
+def stream(reader):
+    return Loader(reader, None, batch=BATCH, records=None)
+
+
+class Preempting(RecordingTracker):
+    """Sends this process the scheduler's SIGTERM, once, when step `at` is logged."""
+
+    def __init__(self, at):
+        super().__init__()
+        self.at = at
+
+    def log(self, scalars, step):
+        super().log(scalars, step)
+        if step == self.at:
+            self.at = None
+            os.kill(os.getpid(), signal.SIGTERM)
+
+
+def preempted_and_resumed(tmp_path, data, at=3, steps=6):
+    """`data` trained to `steps` with a preemption at step `at` and a resume in a fresh trainer."""
+    with pytest.raises(Preempted):
+        make_trainer(tmp_path, tracker=Preempting(at)).fit(data, steps=steps, log_every=1)
+    return make_trainer(tmp_path).fit(data, steps=steps, log_every=1)
+
+
+def same_variables(left, right) -> bool:
+    return all(np.array_equal(a, b) for a, b in zip(
+        jax.tree.leaves(jax.device_get(left.variables)), jax.tree.leaves(jax.device_get(right.variables)),
+        strict=True))
+
+
+def test_a_generator_declared_to_replay_resumes_on_the_batches_the_whole_run_reads(tmp_path):
+    """A generator declared to read the same batches each time it opens is
+    positioned by replay: preempted at step 3 and resumed, it reads its first
+    three batches again and trains on the rest, landing on the uninterrupted
+    run bit for bit."""
+    data = stream(replayed(lambda partition: drawn()))
+    resumed = preempted_and_resumed(tmp_path, data)
+    assert int(resumed.step) == 6
+    assert same_variables(resumed, make_trainer().fit(data, steps=6, log_every=1))
+
+
+def test_an_undeclared_generator_trains_and_its_resume_is_refused(tmp_path):
+    """A plain generator trains and checkpoints, but its checkpoint holds no
+    position, so a resume, which would read its data again from the start,
+    is refused by name."""
+    with pytest.raises(ValueError, match="holds no data position"):
+        preempted_and_resumed(tmp_path, stream(lambda partition: drawn()))
+
+
+def test_a_declared_stream_whose_batch_at_the_position_differs_is_refused(tmp_path):
+    """The replay guard: a stream declared to replay that reads back another
+    batch at its position, one over fresh entropy, is refused."""
+    with pytest.raises(ValueError, match="does not replay deterministically"):
+        preempted_and_resumed(tmp_path, stream(replayed(lambda partition: drawn(None))))
+
+
+def test_the_replay_guard_reads_only_the_batch_at_the_position(tmp_path):
+    """The guard's limit: a declared stream that agrees up to its position
+    and differs after it resumes without complaint, on other data than the
+    uninterrupted run read, which is why replay is declared, not assumed."""
+    opened = []
+    data = stream(replayed(lambda partition: drawn(0, opened, diverge=2)))
+    resumed = preempted_and_resumed(tmp_path, data)
+    assert int(resumed.step) == 6
+    assert not same_variables(resumed, make_trainer().fit(data, steps=6, log_every=1))
 
 
 # --------------------------------------------------------------------------
@@ -1112,6 +1198,46 @@ def test_a_step_compiles_from_its_arrays_shapes_before_they_are_placed():
     advanced, loss, _, finite, _, _ = jax.block_until_ready(compiled(state, batch))
     assert loss == pytest.approx(float(expected), rel=1e-6)
     assert int(advanced.step) == 1 and bool(finite)
+
+
+def test_a_field_no_device_holds_stays_on_the_host_for_the_code_that_reads_it():
+    """A batch may carry a field no device holds, a caption: the step and the
+    objective's evaluation take the rest, and a metric reads the caption on
+    the host, for the rows it scores."""
+
+    def captioned(source):
+        for batch in source:
+            yield {**batch, "caption": np.array([f"row {index}" for index in batch["index"]])}
+
+    captions = []
+
+    class Captions(Spread):
+        def __call__(self, artifact, batch):
+            captions.extend(batch["caption"].tolist())
+            return super().__call__(artifact, batch)
+
+    data = dataset(lambda: captioned(Counting()), val=lambda: captioned(val_batches(1)()))
+    state = Trainer(Features(), optax.sgd(.1), key=jax.random.key(0)).fit(
+        data, steps=2, eval_every=2, metrics=(Captions([]),), checkpoint_final=False)
+    scored = next(val_batches(1)())["index"]
+    assert int(state.step) == 2 and captions == [f"row {index}" for index in scored]
+
+
+def test_a_batch_of_other_dtypes_at_the_same_shapes_runs_a_step_compiled_for_them():
+    """The compiled step is held under the batch's whole abstract signature, its fields and
+    each leaf's dtype as well as its shape: a stream whose inputs turn half precision at the
+    same shapes runs a step compiled for them, which an executable for float32 refuses."""
+
+    class Narrowing(Counting):
+        def __next__(self):
+            batch = super().__next__()
+            return batch if self.index % 2 else {**batch, "x": batch["x"].astype(np.float16)}
+
+    tracker = RecordingTracker()
+    Trainer(Regression(), optax.sgd(.1), key=jax.random.key(0), tracker=tracker).fit(
+        dataset(Narrowing), steps=4, log_every=1, checkpoint_final=False)
+    compiles = [scalars["train/compiles"] for _, scalars in tracker.scalars if "train/compiles" in scalars]
+    assert compiles[-1] == 2
 
 
 def test_a_failing_metric_fails_the_validation_pass():
