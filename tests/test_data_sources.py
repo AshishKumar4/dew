@@ -1628,3 +1628,19 @@ def test_a_token_store_without_its_length_index_is_refused_naming_provisioning(t
     loaded = loader(TextData(source=str(tmp_path), seq_len=4), batch=1, read=None, provision=True,
                   loading=Loading(workers=0))
     assert loaded.plan is not None and loaded.plan.order["read"] == "streamed"
+
+
+def test_a_local_store_whose_producer_declared_other_bytes_is_refused(tmp_path):
+    """A producer's manifest states each file's bytes and checksum; a copy on this host's disk
+    that holds other bytes (a cut of the files under the whole set's manifest) is refused, naming
+    both, and one that holds what it declares is read."""
+    import hashlib
+
+    path = tmp_path / "rows.jsonl"
+    path.write_text("".join(json.dumps({"id": index}) + "\n" for index in range(8)))
+    url = str(path)
+    held = {"bytes": path.stat().st_size, "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+    assert [row["id"] for row in Files(url, file_info={url: held}).iterate()] == list(range(8))
+    for stale in ({**held, "bytes": 2 * held["bytes"]}, {**held, "sha256": "0" * 64}):
+        with pytest.raises(ValueError):
+            Files(url, file_info={url: stale}).fingerprint()
