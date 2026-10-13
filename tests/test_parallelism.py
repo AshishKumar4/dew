@@ -21,7 +21,7 @@ from sharded import assert_sharded
 from dew.artifacts import Representations
 from dew.config.data import loader
 from dew.data import Loading
-from dew.data.dataset import DataPartition, Loader
+from dew.data.dataset import DataPartition, Loader, replayed
 from dew.inputs import unit_range
 from dew.nn.backbones.dit import SimpleDiT
 from dew.objectives.base import Aux, EMASpec, Objective
@@ -464,12 +464,12 @@ def test_a_resume_inside_an_accumulation_window_keeps_the_ema_clock(tmp_path):
     cut = accum * updates + 1
 
     whole = make_accumulating(tmp_path / "whole", accum).fit(
-        Loader(lambda partition: batches(), None, batch=BATCH, records=None), steps=total)
+        Loader(replayed(lambda partition: batches()), None, batch=BATCH, records=None), steps=total)
     interrupted = make_accumulating(tmp_path / "split", accum).fit(
-        Loader(lambda partition: batches(), None, batch=BATCH, records=None), steps=cut)
+        Loader(replayed(lambda partition: batches()), None, batch=BATCH, records=None), steps=cut)
     assert int(interrupted.microstep) % accum == 1, "the cut is not mid-window"
     resumed = make_accumulating(tmp_path / "split", accum).fit(
-        Loader(lambda partition: batches(), None, batch=BATCH, records=None), steps=total)
+        Loader(replayed(lambda partition: batches()), None, batch=BATCH, records=None), steps=total)
 
     assert int(resumed.step) == int(whole.step) == total
     assert moved(snapshot(whole.variables), snapshot(whole.ema))
