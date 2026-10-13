@@ -15,7 +15,7 @@ from dew import records
 from dew.interop.weights import checkpoint_array
 from dew.nn.attention import LayerNorm, RMSNorm
 from dew.nn.conv import Conv
-from dew.nn.text_encoders import _encoder_layer_path, clip_layer
+from dew.nn.text_encoders import _encoder_layer_path, checked_image, clip_layer, tower_activation
 from dew.objectives.base import Variables
 from dew.registry import Record
 
@@ -53,7 +53,7 @@ class SiglipVisionTransformer(nn.Module):
                                            dtype=self.dtype, name="position_embedding")
         self.layers = [
             clip_layer(cfg.hidden_size, cfg.num_heads, cfg.intermediate_size, patches,
-                       activation=cfg.hidden_act, eps=cfg.layer_norm_eps, dtype=self.dtype,
+                       activation=tower_activation(cfg.hidden_act), eps=cfg.layer_norm_eps, dtype=self.dtype,
                        precision=self.precision, name=f"layers_{index}")
             for index in range(cfg.num_layers)]
         self.post_layernorm = LayerNorm(
@@ -61,13 +61,8 @@ class SiglipVisionTransformer(nn.Module):
 
     def __call__(self, pixel_values) -> jax.Array:
         cfg = self.config
-        pixel_values = jnp.asarray(pixel_values)
-        batch, channels, height, width = pixel_values.shape
-        expected = (cfg.num_channels, cfg.image_size, cfg.image_size)
-        if (channels, height, width) != expected:
-            raise ValueError(
-                f"pixel_values of {channels}x{height}x{width} are not the "
-                f"{'x'.join(map(str, expected))} this checkpoint was trained with")
+        pixel_values = checked_image(pixel_values, cfg.num_channels, cfg.image_size)
+        batch = pixel_values.shape[0]
         patches = self.patch_embedding(jnp.transpose(pixel_values, (0, 2, 3, 1)))
         hidden_states = patches.reshape(batch, -1, cfg.hidden_size)
         hidden_states = hidden_states + self.position_embedding(

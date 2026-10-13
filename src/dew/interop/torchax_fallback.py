@@ -21,6 +21,7 @@ This module imports neither torch nor torchax until a load asks for them.
 
 from __future__ import annotations
 
+import contextlib
 import fnmatch
 import importlib.metadata
 import json
@@ -139,7 +140,10 @@ class TorchGraph:
     `head` names the output head's weight when the logits are exactly
     `hidden @ head.T`, checked at load; None when the model adds anything
     (a bias, a scale, a softcap). `persistent` names the buffers the source
-    checkpoint stores.
+    checkpoint stores. A training forward runs the module's own training
+    forward, its dropout and other draws taking `key` as torchax's random
+    key; one that draws on the host instead (OPT's layer drop,
+    `torch.rand([])`) is decided once at trace time, and is refused.
     """
 
     module: JittableModule
@@ -147,14 +151,27 @@ class TorchGraph:
     persistent: tuple[str, ...]
 
     def __call__(self, params: Mapping[str, jax.Array], buffers: Mapping[str, jax.Array],
-                 tokens: jax.Array) -> tuple[jax.Array, jax.Array]:
+                 tokens: jax.Array, *, train: bool, key: jax.Array | None = None
+                 ) -> tuple[jax.Array, jax.Array]:
         """The logits and the output head's input states for `tokens`."""
         import torchax
 
         env = torchax.default_env()
+        draws = _Draws()
         arguments = env.j2t_iso((dict(params), dict(buffers), tokens))
-        with env:
-            outputs = self.module.functional_call(_forward, *arguments)
+        self.module.train(train)
+        try:
+            with env, env.override_property(prng=key) if key is not None else contextlib.nullcontext(), draws:
+                outputs = self.module.functional_call(_forward, *arguments)
+        finally:
+            self.module.eval()
+        if draws.host:
+            raise ValueError(
+                f"fallback='torchax' traces this model's training forward once, and it draws on the host "
+                f"({draws.host} draws, e.g. a layer drop), which tracing would fix for every step; set "
+                f"that rate to 0 in its config, or train a family Dew loads natively")
+        if draws.device and key is None:
+            raise ValueError("this model's training forward draws (dropout) and was given no 'dropout' rng")
         logits, hidden = env.t2j_iso(outputs)
         return logits, hidden
 
@@ -170,6 +187,33 @@ class TorchGraph:
         tensors = {name: np.asarray(leaf) for name, leaf in params.items()}
         tensors.update({name: np.asarray(buffers[name]) for name in self.persistent})
         return tensors
+
+
+def _Draws():
+    """A torch function mode counting the calls of torch's random functions,
+    on torchax's device (`device`) and on the host (`host`)."""
+    import torch
+    import torchax
+    from torch.overrides import TorchFunctionMode
+
+    drawing = {torch.rand, torch.rand_like, torch.randn, torch.randn_like, torch.randint, torch.randint_like,
+               torch.randperm, torch.bernoulli, torch.multinomial, torch.normal, torch.Tensor.uniform_,
+               torch.Tensor.normal_, torch.Tensor.bernoulli_, torch.Tensor.random_, torch.Tensor.exponential_,
+               torch.Tensor.cauchy_, torch.Tensor.geometric_, torch.Tensor.log_normal_}
+
+    class Draws(TorchFunctionMode):
+        device = host = 0
+
+        def __torch_function__(self, func, types, args=(), kwargs=None):
+            tensor = func(*args, **(kwargs or {}))
+            if func in drawing:
+                if isinstance(tensor, torchax.tensor.Tensor):
+                    self.device += 1
+                else:
+                    self.host += 1
+            return tensor
+
+    return Draws()
 
 
 def _forward(model: PreTrainedModel, tokens: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -196,8 +240,8 @@ class TorchCausalLM(nn.Module):
     `init` has no initializer to draw from, so the module starts from the
     loaded variables only. Floating parameters are cast to `dtype` for the
     forward, which keeps them in their stored dtype as masters; buffers keep
-    theirs. The torch module runs in eval mode, so dropout is off whatever
-    `train` says.
+    theirs. A training forward runs the module's own, its dropout drawing
+    from the 'dropout' rng (`TorchGraph`).
 
     `hidden_states` and `output_table` are the pair `LMObjective` scores
     through, so the vocabulary-sized logits are never built whole. Only a
@@ -229,13 +273,13 @@ class TorchCausalLM(nn.Module):
         return None
 
     def __call__(self, tokens, train: bool = False) -> jax.Array:
-        logits, _ = self._run(tokens)
+        logits, _ = self._run(tokens, train)
         return logits.astype(jnp.float32)
 
     def hidden_states(self, tokens, train: bool = False, **packing) -> jax.Array:
         """The states the output head reads, `[B, S, features]`."""
         _refuse_packing(packing)
-        _, hidden = self._run(tokens)
+        _, hidden = self._run(tokens, train)
         return hidden
 
     def logits(self, tokens, *, train: bool = False, **packing) -> jax.Array:
@@ -251,7 +295,7 @@ class TorchCausalLM(nn.Module):
         return OutputTable(self.variables["params"][self.graph.head], vocab_major=True,
                            precision=self.precision)
 
-    def _run(self, tokens) -> tuple[jax.Array, jax.Array]:
+    def _run(self, tokens, train: bool) -> tuple[jax.Array, jax.Array]:
         if self.is_initializing():
             raise ValueError(
                 "a torchax model has no initializer; apply it to the variables "
@@ -259,7 +303,8 @@ class TorchCausalLM(nn.Module):
         held = self.variables
         params = {name: self._compute(leaf) for name, leaf in held["params"].items()}
         buffers = {name: jnp.asarray(leaf) for name, leaf in held.get("buffers", {}).items()}
-        return self.graph(params, buffers, jnp.asarray(tokens))
+        key = self.make_rng("dropout") if train and self.has_rng("dropout") else None
+        return self.graph(params, buffers, jnp.asarray(tokens), train=train, key=key)
 
     def _compute(self, leaf) -> jax.Array:
         value = jnp.asarray(leaf)
