@@ -702,14 +702,18 @@ def test_a_pool_refuses_a_checkpoint_directory_its_processes_do_not_share(tmp_pa
     with nothing shared do. Orbax writes one checkpoint across the pool and
     reads any process's shards back, so process 0 would commit steps missing
     the others' shards while they saw none, and a resume would train
-    different states. Every process refuses, naming the one that cannot see
-    the directory."""
+    different states. Asking for the latest step reads only; at the first
+    write every process refuses, naming the one that cannot see the
+    directory."""
     program = ("import os, sys\n"
                "from dew.training.runtime import prepare_process\n"
                "prepare_process()\n"
+               "import jax.numpy as jnp\n"
                "from dew.checkpoints import Checkpoints\n"
                "host = os.path.join(sys.argv[1], 'host' + os.environ['DEW_PROCESS_ID'])\n"
-               "print('latest', Checkpoints(os.path.join(host, 'run')).latest)\n")
+               "checkpoints = Checkpoints(os.path.join(host, 'run'))\n"
+               "print('latest', checkpoints.latest)\n"
+               "checkpoints.save(1, {'params': {'w': jnp.zeros(1)}})\n")
     done = launch("--processes-per-host", "2", "--", sys.executable, "-c", program,
                   str(tmp_path), devices=1, timeout=300)
     assert done.returncode != 0, done.stdout + done.stderr
