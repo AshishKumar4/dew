@@ -712,28 +712,48 @@ _fused = jax.custom_vjp(_fused_impl, nondiff_argnums=(5, 6, 7, 8, 9, 10, 11))
 _fused.defvjp(_fused_fwd, _fused_bwd)
 
 
-def fused_head_loss(hidden, head: OutputTable, targets, weights, *, z_loss: float = 0.0, chunk: int = 256,
-                    predict: bool = True, temperature: float = 1.0, excluded: int | None = None):
+FUSED_LOGIT_BYTES = 2 << 30
+"""The fp32 logits one chunk of `fused_head_loss` holds, when no tile asks
+for fewer tokens: the most tokens, a power of two, whose logits fit. On an
+A100 and an H100, at Qwen3.5-0.8B's head (1024 wide, vocabulary 248320, 12288 tokens,
+bf16) 2048 tokens a chunk took 123.9 and 49.6 ms against 1024's 129.3 and
+56.3 and 4096's 126.3, and at the 8B's (4096 wide, 128256, 4096 tokens)
+the one chunk this allows took 58.1 ms on the A100 against 2048's 70.8
+(tools/benchmark_lm_head.py fused)."""
+
+
+def fused_tokens(tokens: int, vocab: int, tile: tuple[int, int] | None = None) -> int:
+    """`fused_head_loss`'s chunk: `FUSED_LOGIT_BYTES` of fp32 logits, at most
+    `tile`'s tokens and every token."""
+    fitting = 1 << max(FUSED_LOGIT_BYTES // (4 * vocab), 1).bit_length() - 1
+    return min(tokens, fitting, tokens if tile is None else tile[0])
+
+
+def fused_head_loss(hidden, head: OutputTable, targets, weights, *, z_loss: float = 0.0,
+                    tile: tuple[int, int] | None = None, predict: bool = True, temperature: float = 1.0,
+                    excluded: int | None = None):
     """The weighted sum of `head.logits(hidden)`'s cross entropies at
     `targets` and PaLM's z-loss, sum of w (ce + z_loss log Z^2), with each
     token's loss, top-1 column (None unless `predict`) and log Z beside it.
 
     Only the sum carries a gradient, and its gradient is taken in the forward
-    pass, Liger's fused linear cross entropy: each `chunk` of tokens scores
-    the whole vocabulary, then pulls its softmax back through the head at
-    once, three products a chunk and no logits recomputed or held beyond the
-    chunk. The backward scales those gradients by the sum's cotangent. The
-    sum is a loss's numerator (`Ratio.total`), with no 1/sum(w) in it, so
-    microbatches pool by mass; `weights` (`[...]` like `targets`) are known
-    in the forward and carry no gradient. The products, the softmax and the
-    rounding are `chunked_cross_entropy`'s whole head's, the states through
-    the head's input quantizer. Under `jax.checkpoint` the forward and its
-    gradients run again with the rest of the scope, so a step keeps the head
-    outside the rematerialized blocks. `excluded` is a column the softmax
-    gives no mass, as in `chunked_cross_entropy`. Off a mesh only for now.
+    pass, Liger's fused linear cross entropy: a chunk of tokens
+    (`fused_tokens`, `tile`'s tokens at most) scores the whole vocabulary,
+    then pulls its softmax back through the head at once, three products a
+    chunk and no logits recomputed or held beyond the chunk. The backward
+    scales those gradients by the sum's cotangent. The sum is a loss's
+    numerator (`Ratio.total`), with no 1/sum(w) in it, so microbatches pool
+    by mass; `weights` (`[...]` like `targets`) are known in the forward and
+    carry no gradient. The products, the softmax and the rounding are
+    `chunked_cross_entropy`'s whole head's, the states through the head's
+    input quantizer; the softcap is the head's own, a constant. Under
+    `jax.checkpoint` the forward and its gradients run again with the rest
+    of the scope, so a step keeps the head outside its rematerialized
+    blocks, as `LMObjective`'s does. On a mesh every device sums its own
+    tokens against the head gathered whole, the sums added after, and the
+    head's gradient leaves reduce-scattered (`_sharded_head`). `excluded` is
+    a column the softmax gives no mass, as in `chunked_cross_entropy`.
     """
-    if not jax.sharding.get_abstract_mesh().empty:
-        raise NotImplementedError("fused_head_loss runs off a mesh; on one, take chunked_cross_entropy")
     if hidden.shape[:-1] != targets.shape or weights.shape != targets.shape:
         raise ValueError(f"{hidden.shape[:-1]} states, {targets.shape} targets and {weights.shape} weights")
     states = head.states(hidden)
@@ -741,13 +761,25 @@ def fused_head_loss(hidden, head: OutputTable, targets, weights, *, z_loss: floa
     precision = BF16 if rounds_to_bf16(compute, head.precision) else head.precision
     table = head.matrix if head.vocab_major else head.matrix.T
     bias = None if head.bias is None else jnp.asarray(head.bias, at_least_fp32(states.dtype))
-    flat = states.reshape(-1, states.shape[-1])
-    total, (losses, predicted, log_z) = _fused(
-        flat, table, targets.reshape(-1), jax.lax.stop_gradient(weights.reshape(-1)), bias, float(z_loss),
-        head.softcap, chunk, precision, predict, float(temperature),
-        None if excluded is None else int(excluded))
-    shaped = None if predicted is None else predicted.reshape(targets.shape)
-    return total, (losses.reshape(targets.shape), shaped, log_z.reshape(targets.shape))
+    statics = (float(z_loss), head.softcap)
+
+    def summed(hidden, table, targets, excluded, cap, bias):
+        del excluded, cap  # Static here, closed over below.
+        labels, weights = targets
+        chunk = fused_tokens(labels.size, table.shape[0], tile)
+        total, (losses, predicted, log_z) = _fused(
+            hidden.reshape(-1, hidden.shape[-1]), table, labels.reshape(-1),
+            jax.lax.stop_gradient(weights.reshape(-1)), bias, *statics, chunk, precision, predict,
+            float(temperature), None if excluded_column is None else int(excluded_column))
+        shaped = None if predicted is None else predicted.reshape(labels.shape)
+        return total, (losses.reshape(labels.shape), shaped, log_z.reshape(labels.shape))
+
+    excluded_column = excluded
+    mesh = jax.sharding.get_abstract_mesh()
+    if mesh.empty:
+        return summed(states, table, (targets, weights), None, None, bias)
+    return _sharded_head(mesh, states, table, (targets, weights), None, None, bias, summed, None,
+                         predict=predict)
 
 
 def head_cross_entropy(model, variables, hidden, targets, chunks: int, *,
@@ -786,8 +818,12 @@ def logits_cross_entropy(logits, targets, *, predict: bool = True, temperature: 
 def _sharded_head(mesh, hidden, table, targets, excluded, cap, bias, head, column_logits, *, predict: bool):
     """`head` on a mesh: each device scores its own tokens in a `shard_map`,
     against the head's own columns where they stay split (`_vocabulary_split`)
-    or the head gathered whole (`chunked_cross_entropy`)."""
-    spec = _token_spec(targets.shape)
+    or the head gathered whole (`chunked_cross_entropy`). A `head` with no
+    `column_logits` returns a sum over its tokens before their outputs
+    (`fused_head_loss`), which the devices' sums add up to, and gathers the
+    head whole. `targets` may be a tuple of arrays alike, split alike."""
+    sums = column_logits is None
+    spec = _token_spec(jax.tree.leaves(targets)[0].shape)
     axes = {axis for entry in spec for axis in mesh_axes(entry)}
     if not axes:
         return head(hidden, table, targets, excluded, cap, bias)
@@ -804,7 +840,7 @@ def _sharded_head(mesh, hidden, table, targets, excluded, cap, bias, head, colum
     held = P(*(entry if entry else None for entry in kept))
     group, widths = kept
     size = math.prod(mesh.shape[axis] for axis in group)
-    split = bool(group) and (hidden.size // math.prod(
+    split = not sums and bool(group) and (hidden.size // math.prod(
         mesh.shape[axis] for axis in axes) * size * hidden.dtype.itemsize
         < table.size * table.dtype.itemsize)
 
@@ -817,6 +853,9 @@ def _sharded_head(mesh, hidden, table, targets, excluded, cap, bias, head, colum
             table = jax.lax.all_gather(table, group, axis=0, tiled=True)
             if bias is not None:
                 bias = jax.lax.all_gather(bias, group, axis=0, tiled=True)
+        if sums:
+            total, outputs = head(hidden, table, targets, excluded, cap, bias)
+            return total.reshape(1), outputs
         return head(hidden, table, targets, excluded, cap, bias)
 
     # The map holds every axis manual, those that split no token too: in a map
@@ -834,11 +873,17 @@ def _sharded_head(mesh, hidden, table, targets, excluded, cap, bias, head, colum
     def naming(entry):
         return (*mesh_axes(entry), *alone) or None
 
-    return jax.shard_map(local, in_specs=(P(naming(spec[0]), *spec[1:], None), P(naming(held[0]), *held[1:]),
-                                          spec, P(), P(), None if bias is None else P(naming(held[0]))),
-                         out_specs=(spec, spec if predict else None, spec),
-                         axis_names=set(mesh.axis_names) - set(mesh.manual_axes), check_vma=False)(
+    outputs = (spec, spec if predict else None, spec)
+    inputs = (P(naming(spec[0]), *spec[1:], None), P(naming(held[0]), *held[1:]), spec, P(), P(),
+              None if bias is None else P(naming(held[0])))
+    mapped = jax.shard_map(local, in_specs=inputs,
+                           out_specs=(P(tuple(sorted(axes)) + alone), outputs) if sums else outputs,
+                           axis_names=set(mesh.axis_names) - set(mesh.manual_axes), check_vma=False)(
         hidden, table, targets, excluded, cap, bias)
+    if sums:
+        shares, per_token = mapped
+        return jnp.sum(shares), per_token
+    return mapped
 
 
 def _vocabulary_split(hidden, table, targets, excluded, cap, bias, group: tuple[str, ...],
