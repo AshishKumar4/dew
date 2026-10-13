@@ -43,7 +43,7 @@ from dew.nn.precision import at_least_fp32
 from dew.nn.rope import axis_tables
 from dew.nn.sharding import logical_axes
 
-from .decoder_block import GatedMLP
+from ..mlp import GatedMLP
 from .joint import TIME_FEATURES, JointAttention, embedding, embedding_flops, layer_norm
 
 if TYPE_CHECKING:

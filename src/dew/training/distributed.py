@@ -18,6 +18,7 @@ from collections.abc import Callable, Iterator, Mapping
 from pathlib import Path
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
 from jax.experimental import mesh_utils, multihost_utils
@@ -710,6 +711,63 @@ class Layout:
             f"Largest replicated parameters:\n{details}")
 
 
+def placeable(field) -> bool:
+    """Whether a device can hold every leaf of `field`: arrays of numbers,
+    not strings, bytes or Python objects, such as a caption or an image's
+    catalog URL."""
+    return all(isinstance(leaf, jax.Array) or (
+        not isinstance(leaf, (str, bytes)) and np.asarray(leaf).dtype.kind not in "OSUV")
+        for leaf in jax.tree.leaves(field))
+
+
+def device_fields(batch: Batch) -> Batch:
+    """`batch` without the fields no device can hold (`placeable`), which host
+    code reads and a compiled step cannot take: the batch a step and an
+    objective's programs are called on. A batch with no such field, a bare
+    array among them, is itself."""
+    if not host_fields(batch):
+        return batch
+    return {name: device_fields(value) if isinstance(value, Mapping) else value
+            for name, value in batch.items() if isinstance(value, Mapping) or placeable(value)}
+
+
+def host_fields(batch: Batch | np.ndarray | jax.Array) -> dict:
+    """The fields of `batch` no device can hold, in the mappings that hold them:
+    none for a batch that is no mapping of fields."""
+    if not isinstance(batch, Mapping):
+        return {}
+    nested = {name: host_fields(value) for name, value in batch.items() if isinstance(value, Mapping)}
+    return {**{name: value for name, value in batch.items()
+               if not isinstance(value, Mapping) and not placeable(value)},
+            **{name: value for name, value in nested.items() if value}}
+
+
+def with_host(placed: Batch, host: Batch) -> Batch:
+    """`placed` with the host fields put back where they were."""
+    return {**placed, **{name: with_host(placed[name], value) if isinstance(value, Mapping) else value
+                         for name, value in host.items()}}
+
+
+Signature = tuple[jax.tree_util.PyTreeDef, tuple[jax.ShapeDtypeStruct, ...]]
+"""A batch's abstract signature, the key a compiled step is held under: its
+tree, which holds each node's static fields, and each leaf's shape and
+dtype. A fixed batch has one; a ramped batch has one per stage of its ramp,
+each compiled on the first step that reads it."""
+
+
+def batch_signature(batch: Batch) -> Signature:
+    """The abstract signature of a batch of arrays or their shapes (`jax.ShapeDtypeStruct`)."""
+    leaves, tree = jax.tree.flatten(batch)
+    return tree, tuple(jax.ShapeDtypeStruct(np.shape(leaf), jnp.result_type(leaf)) for leaf in leaves)
+
+
+def batch_layout(batch: Batch) -> str:
+    """A batch's fields, each with its dtype and global shape; the batch may be
+    arrays or their abstract shapes (`jax.ShapeDtypeStruct`)."""
+    return ", ".join(f"{jax.tree_util.keystr(path)} {jnp.result_type(leaf)}{list(np.shape(leaf))}"
+                     for path, leaf in jax.tree_util.tree_leaves_with_path(batch))
+
+
 def batch_shardings(mesh: Mesh | AbstractMesh, batch: Batch) -> Placement[Batch]:
     """Return a sharding for each leaf of `batch`, chosen from the leaf's shape.
 
@@ -765,6 +823,9 @@ def shard_batch(mesh: Mesh, batch: Batch) -> Batch:
     actually carry validity, the way `agreed_validity` does for a generation
     request, belongs where the caller's own collectives are issued.
     """
+    if host := host_fields(batch):
+        # A field no device holds (`placeable`) stays on the host, where host code reads it.
+        return with_host(shard_batch(mesh, device_fields(batch)), host)
     batch = filled_validity(batch) if jax.process_count() > 1 else batch
     cpu = all(device.platform == "cpu" for device in mesh.devices.flat)
     batch = jax.tree.map(

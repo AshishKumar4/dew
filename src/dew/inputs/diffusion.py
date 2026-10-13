@@ -358,7 +358,7 @@ def _residual_states(decoder, ids):
     `scaled_embeddings`; the decoders this reads run one residual stream.
     """
     return decoder.stack(decoder.scaled_embeddings(decoder.token_embeddings(ids)), train=False,
-                         decode=False, positions=None, segment_ids=None, per_layer_input=None)
+                         decode=False, per_layer_input=None)
 
 
 @dataclass(eq=False)

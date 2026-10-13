@@ -20,6 +20,7 @@ from dew.interop.families.gpt2 import GPT2, GPT_NEO, GPTJ
 from dew.interop.families.gpt_bigcode import GPT_BIGCODE
 from dew.interop.families.gpt_neox import GPT_NEOX
 from dew.interop.families.gpt_oss import GPT_OSS
+from dew.interop.families.k2_horizon import K2_HORIZON
 from dew.interop.families.kimi import KIMI_K3, KIMI_LINEAR
 from dew.interop.families.llama import GRANITEMOE, MISTRAL, MIXTRAL, llama_config, ministral_config
 from dew.interop.families.llama4 import LLAMA4_TEXT
@@ -108,6 +109,7 @@ ENTRIES = (
         preserve_source_layout=True,
         tied_head_names=("lm_head.weight", "backbone.embeddings.weight"),
     ),
+    K2_HORIZON,
     DecoderFamily(
         ("ministral",),
         ministral_config,
