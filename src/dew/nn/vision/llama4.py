@@ -15,7 +15,7 @@ from dew import records
 from dew.nn.activations import gelu_exact
 from dew.nn.attention import LayerNorm
 from dew.nn.inputs import AttentionMetadata
-from dew.nn.text_encoders import _encoder_layer_path, clip_layer
+from dew.nn.text_encoders import _encoder_layer_path, checked_image, clip_layer
 from dew.registry import Record
 
 from .common import ProjectorBase, TowerBase, TowerGeometry, _image_size, _vision_section
@@ -121,7 +121,7 @@ class Llama4VisionTransformer(nn.Module):
         side = cfg.hidden_size // cfg.num_heads // 2
         self.layers = [
             clip_layer(cfg.hidden_size, cfg.num_heads, cfg.intermediate_size, grid * grid + 1,
-                       activation="gelu", eps=cfg.layer_norm_eps, rotary_axes=(side, side),
+                       activation="gelu_exact", eps=cfg.layer_norm_eps, rotary_axes=(side, side),
                        rotary_pairs="adjacent", rope_theta=cfg.rope_theta, dtype=self.dtype,
                        precision=self.precision, name=f"layers_{index}")
             for index in range(cfg.num_layers)]
@@ -132,13 +132,8 @@ class Llama4VisionTransformer(nn.Module):
 
     def __call__(self, pixel_values) -> jax.Array:
         cfg = self.config
-        pixel_values = jnp.asarray(pixel_values)
-        batch, channels, height, width = pixel_values.shape
-        expected = (cfg.num_channels, cfg.image_size, cfg.image_size)
-        if (channels, height, width) != expected:
-            raise ValueError(
-                f"pixel_values of {channels}x{height}x{width} are not the "
-                f"{'x'.join(map(str, expected))} this checkpoint was trained with")
+        pixel_values = checked_image(pixel_values, cfg.num_channels, cfg.image_size)
+        batch, channels = pixel_values.shape[:2]
         grid = cfg.image_size // cfg.patch_size
         patches = pixel_values.reshape(
             batch, channels, grid, cfg.patch_size, grid, cfg.patch_size)
