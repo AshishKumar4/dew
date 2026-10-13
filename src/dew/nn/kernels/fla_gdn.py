@@ -1421,27 +1421,27 @@ def _rule_fwd(q, k, v, g, beta, h0, cu_seqlens, scale: float, chunk: int, interp
     'delta_decay' and 'delta_inverse' for a remat policy, and the initial memory."""
     spans = sequences(q.shape[0], q.shape[1], cu_seqlens, chunk=chunk)
     kernels = {"chunk": chunk, "spans": spans, "interpret": interpret}
-    gc = checkpoint_name(chunk_local_cumsum(g, scale=RCP_LN2, **kernels), 'delta_decay')
-    a = checkpoint_name(kkt_solve(k, *gc, beta, **kernels), 'delta_inverse')
-    w, u = recompute_w_u(k, v, beta, a, gc[0], **kernels)
-    h, corrected, final = chunk_fwd_h(k, w, u, *gc, h0, **kernels)
-    o = chunk_fwd_o(q, k, corrected, h, *gc, scale=scale, **kernels)
-    return (o, final), (q, k, v, gc, beta, a, h0, spans)
+    g_hi, g_lo = checkpoint_name(chunk_local_cumsum(g, scale=RCP_LN2, **kernels), 'delta_decay')
+    a = checkpoint_name(kkt_solve(k, g_hi, g_lo, beta, **kernels), 'delta_inverse')
+    w, u = recompute_w_u(k, v, beta, a, g_hi, **kernels)
+    h, corrected, final = chunk_fwd_h(k, w, u, g_hi, g_lo, h0, **kernels)
+    o = chunk_fwd_o(q, k, corrected, h, g_hi, g_lo, scale=scale, **kernels)
+    return (o, final), (q, k, v, g_hi, g_lo, beta, a, h0, spans)
 
 
 def _rule_bwd(scale: float, chunk: int, interpret: bool, residual, cotangent):
     """fla's `chunk_gated_delta_rule_bwd` (chunk.py:126-250): `w`, `u` and the memory recomputed, then
     the output's local value gradient, the reverse recurrence, the query, key, `w` and decay
     gradients, the WY backward, and the decay's gradient summed back over each chunk."""
-    q, k, v, gc, beta, a, h0, spans = residual
+    q, k, v, g_hi, g_lo, beta, a, h0, spans = residual
     do, dht = cotangent
     kernels = {"chunk": chunk, "spans": spans, "interpret": interpret}
-    w, u = recompute_w_u(k, v, beta, a, gc[0], **kernels)
-    h, corrected, _ = chunk_fwd_h(k, w, u, *gc, h0, **kernels)
-    dv = chunk_bwd_dv_local(q, k, *gc, do, scale=scale, **kernels)
-    dh, dh0, dv = chunk_bwd_dhu(q, k, w, *gc, dht.astype(jnp.float32), do, dv, scale=scale, **kernels)
-    dq, dk, dw, dg = chunk_bwd_dqkwg(q, k, corrected, w, *gc, h, dv, do, dh, scale=scale, **kernels)
-    dk, dv, db, dg2 = prepare_wy_repr_bwd(k, v, beta, *gc, a, dw, dv, dk, **kernels)
+    w, u = recompute_w_u(k, v, beta, a, g_hi, **kernels)
+    h, corrected, _ = chunk_fwd_h(k, w, u, g_hi, g_lo, h0, **kernels)
+    dv = chunk_bwd_dv_local(q, k, g_hi, g_lo, do, scale=scale, **kernels)
+    dh, dh0, dv = chunk_bwd_dhu(q, k, w, g_hi, g_lo, dht.astype(jnp.float32), do, dv, scale=scale, **kernels)
+    dq, dk, dw, dg = chunk_bwd_dqkwg(q, k, corrected, w, g_hi, g_lo, h, dv, do, dh, scale=scale, **kernels)
+    dk, dv, db, dg2 = prepare_wy_repr_bwd(k, v, beta, g_hi, g_lo, a, dw, dv, dk, **kernels)
     dg = chunk_local_cumsum(dg + dg2, reverse=True, **kernels)
     return dq, dk, dv, dg.astype(jnp.float32), db, dh0, None
 
