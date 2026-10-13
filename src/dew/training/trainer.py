@@ -106,9 +106,13 @@ from dew.training.distributed import (
     Layout,
     MeshSpec,
     Placement,
+    Signature,
+    batch_layout,
     batch_shardings,
+    batch_signature,
     check_batch,
     check_stream,
+    device_fields,
     link_bandwidth,
     microbatch,
     microbatch_shapes,
@@ -168,24 +172,6 @@ step's microbatches were accepted, and the transaction's commit telemetry (None 
 
 Loss = DefaultTypeVar("Loss", default=Ratio | jax.Array | float)
 Effects = DefaultTypeVar("Effects", default=None)
-
-Shapes = tuple[tuple[int, ...], ...]
-"""A batch's leaf shapes in tree order, the key a compiled step is held
-under. A fixed batch has one; a ramped batch has one per stage of its ramp,
-each compiled on the first step that reads it."""
-
-
-def batch_shapes(batch: Batch) -> Shapes:
-    """List a batch's leaf shapes in tree order."""
-    return tuple(np.shape(leaf) for leaf in jax.tree.leaves(batch))
-
-
-def batch_layout(batch: Batch) -> str:
-    """A batch's fields, each with its dtype and global shape; the batch may be
-    arrays or their abstract shapes (`jax.ShapeDtypeStruct`)."""
-    return ", ".join(f"{jax.tree_util.keystr(path)} {jnp.result_type(leaf)}{list(np.shape(leaf))}"
-                     for path, leaf in jax.tree_util.tree_leaves_with_path(batch))
-
 
 class Rollout(Protocol):
     """Produces a batch on the host, before the compiled step reads it.
@@ -1496,7 +1482,7 @@ class Trainer(Generic[Loss, Effects]):
         if self._opened(plan, run, interval, state, position,
                         resumed=initial is None and interval.last_saved is not None):
             return state
-        compiled: dict[Shapes, tuple[CompiledStep, StepFlops | None]] = {}
+        compiled: dict[Signature, tuple[CompiledStep, StepFlops | None]] = {}
         seen = 0
         run.notice = PreemptionNotice()
         while not plan.finished(run.current, interval.real_tokens if plan.tokens is not None else 0):
@@ -1523,14 +1509,15 @@ class Trainer(Generic[Loss, Effects]):
                 if self.rollout is not None:
                     batch, sampled = self._rolled_out(state, batch)
                     interval.rollout_seconds += sampled
+                device = device_fields(batch)
                 inputs = self.objective.inputs
                 if not compiled and self.rollout is None and inputs is not None:
                     # A rollout writes the batch its loss reads, from prompts it reads itself.
                     # The objective reads the batch its device steps make (`_model_batch`).
-                    checked = self._model_shapes(batch) if self._device else batch
+                    checked = self._model_shapes(device) if self._device else device
                     agreed("training input declaration", functools.partial(inputs.check, checked))
                 known, began = len(compiled), time.perf_counter()
-                train_step, measured_flops, state = self._compiled_for(compiled, state, batch)
+                train_step, measured_flops, state = self._compiled_for(compiled, state, device)
                 interval.compiles = len(compiled)
                 if not known:
                     # Rebound once the step is compiled, so the first tick
@@ -1542,7 +1529,7 @@ class Trainer(Generic[Loss, Effects]):
                     # reports that time apart from its steps'.
                     interval.compiling += time.perf_counter() - began
                 with region("train.step"):
-                    state, loss, aux, finite, accepted, committed = train_step(state, batch)
+                    state, loss, aux, finite, accepted, committed = train_step(state, device)
                 if self._unproven:
                     # A step's failure on the devices surfaces at the next
                     # program that reads its outputs, the loss counters, so a
@@ -2088,30 +2075,33 @@ class Trainer(Generic[Loss, Effects]):
         batch = shard_batch(self.device_mesh, self._counted_batch(self.rollout(state, batch, key)))
         return batch, time.perf_counter() - began
 
-    def _compiled_for(self, compiled: dict[Shapes, tuple[CompiledStep, StepFlops | None]], state: TrainState,
-                      batch: Batch) -> tuple[CompiledStep, StepFlops | None, TrainState]:
-        """Return the step compiled for this batch's shapes, compiling on first sight, and the state
-        to step, a fresh copy where the plan timed steps on it (`Timer`).
+    def _compiled_for(self, compiled: dict[Signature, tuple[CompiledStep, StepFlops | None]],
+                      state: TrainState, batch: Batch) -> tuple[CompiledStep, StepFlops | None, TrainState]:
+        """Return the step compiled for this batch's abstract signature (`batch_signature`),
+        compiling on first sight, and the state to step, a fresh copy where the plan timed steps
+        on it (`Timer`).
 
         A ramped run reads a new shape at every stage, so `compiled` keeps
-        one step per stage with the FLOPs measured for it.
+        one step per stage with the FLOPs measured for it. A batch whose
+        dtype, fields or a node's static field change at the same shapes is
+        another program, compiled as one: an executable refuses it.
         """
         timer = Timer(state, batch)
-        shapes = batch_shapes(batch)
-        if shapes not in compiled:
+        signature = batch_signature(batch)
+        if signature not in compiled:
             # A process whose reader changed a field or a shape would compile
             # a program whose collectives its peers' never meet.
             agreed_same("training batch layout", lambda: batch_layout(batch))
             began = time.perf_counter()
             with region("compile"):
-                compiled[shapes] = (self.compile(state, batch, timer), self.step_flops)
+                compiled[signature] = (self.compile(state, batch, timer), self.step_flops)
             seconds = time.perf_counter() - began
             links = {axis: AxisLink(link.bytes_per_second, link.spread)
                      for axis, link in self.links.items()}
             self._report(StepCompiled(seconds, recompute_record(self.objective), links, self.memory,
                                       self.plan), int(timer.state.step))
             self._unproven = True
-        return (*compiled[shapes], timer.state)
+        return (*compiled[signature], timer.state)
 
     def _saved_checkpoint(
         self,

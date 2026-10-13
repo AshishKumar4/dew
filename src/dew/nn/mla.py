@@ -36,7 +36,7 @@ from dew.nn.attention import (
     scaled_dot_product_attention,
 )
 from dew.nn.flops import MissingFlopsCount, attention_flops, projection_flops
-from dew.nn.inputs import AttentionMetadata
+from dew.nn.inputs import AttentionMetadata, coordinates_of
 from dew.nn.kv_cache import KVCache, write_cache
 
 # dsa_kpool reads INDEXER and the expanded cache below. Reading the registry
@@ -46,7 +46,7 @@ from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.precision import at_least_fp32
 from dew.nn.rope import YarnScaling, deinterleaved, rotate, yarn_query_scale, yarn_rope_freqs
 from dew.nn.sharding import RESIDUAL, LogicalAxes, constrain, down_projection, logical_axes
-from dew.nn.sparse_selection import selection_mask, sparse_latent_attention, top_k_selection
+from dew.nn.sparse_selection import index_scores, selection_mask, sparse_latent_attention, top_k_selection
 
 
 def open_mla_cache(module: nn.Module, names: tuple[str, str], first, second, index_keys,
@@ -213,14 +213,7 @@ class SparseIndexer(nn.Module):
         q_rot, q_pass = jnp.split(query, [self.rope_head_dim], axis=-1)
         query = jnp.concatenate(
             [_rotate(self.rope_interleave, q_rot, freqs_cos, freqs_sin), q_pass], axis=-1)
-        wide = at_least_fp32(query.dtype)
-        scores = jnp.matmul(
-            query.astype(wide),
-            jnp.expand_dims(keys.astype(wide).transpose(0, 2, 1), -3))
-        scores = jnp.maximum(scores * (self.head_dim ** -0.5), 0)
-        weights = self.weights_proj(hidden).astype(wide)
-        weights = weights * (self.n_heads ** -0.5)
-        return jnp.matmul(weights[..., None, :], scores).squeeze(-2)
+        return index_scores(query, keys, self.weights_proj(hidden), self.precision)
 
     def select(self, scores, keep):
         """The top-k keys of each query among those `keep` allows, as
@@ -489,12 +482,13 @@ class MultiHeadLatentAttention(nn.Module):
         return jnp.concatenate([nope, rot], axis=-1), values
 
     @nn.compact
-    def __call__(self, x, decode: bool = False,
-                 positions=None, segment_ids=None, kv_store=None,
+    def __call__(self, x, decode: bool = False, kv_store=None,
                  attention_metadata: AttentionMetadata | None = None):
         causal, mask, objective = self.causal, None, None
         implementation = self.attention_impl
-        _, length, _ = x.shape
+        batch, length, _ = x.shape
+        tokens = coordinates_of(attention_metadata, batch, length)
+        positions, segment_ids = tokens.positions, tokens.segments
         valid = None if attention_metadata is None else attention_metadata.valid
         if attention_metadata is not None and attention_metadata.rotary_positions is not None:
             raise ValueError("MLA does not implement multi-axis rotary positions")
@@ -511,7 +505,7 @@ class MultiHeadLatentAttention(nn.Module):
         latent, rot = self._latents(x, place)
         if decode:
             q_rot, key, value, mask = self._decode_step(
-                x, q_rot, rot, latent, q_resid, logical_positions, valid, segment_ids, kv_store)
+                x, q_rot, rot, latent, q_resid, logical_positions, valid, kv_store)
             causal = False
         else:
             if positions is None:
@@ -589,13 +583,11 @@ class MultiHeadLatentAttention(nn.Module):
             implementation=implementation, causal=causal, mask=mask)
         return self._output(attention, x)
 
-    def _decode_step(self, x, q_rot, rot, latent, q_resid, logical_positions, valid, segment_ids, kv_store):
+    def _decode_step(self, x, q_rot, rot, latent, q_resid, logical_positions, valid, kv_store):
         """One decode step's rotated query heads, its keys and values with the
         cache's joined, and the mask over them: the expanded keys and the
         indexer's selection under the sparse layout, or the latents expanded
         after the append under the dense one."""
-        if segment_ids is not None:
-            raise ValueError("decode accepts row validity, not packed segment_ids")
         # The cache hands out the slots first, because the rope heads
         # rotate at absolute positions: the queries at this step's slots
         # and the appended latents at theirs, while the cached ones keep

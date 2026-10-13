@@ -16,9 +16,10 @@ dew.interop.hf_decoders does that rename. A model family is supported only after
 its translator and a same-weight parity test against the reference have landed.
 
 The block holds its token mixer in a slot. Any module with the
-(x, decode=..., positions=..., segment_ids=...) -> x signature of
-CausalSelfAttention can be self_attn without changes to the block, and that is
-where a linear-attention mixer goes.
+(x, decode=..., attention_metadata=...) -> x signature of CausalSelfAttention,
+reading its tokens' places and documents off the metadata's `Coordinates`, can
+be self_attn without changes to the block, and that is where a linear-attention
+mixer goes.
 """
 
 import dataclasses
@@ -70,6 +71,7 @@ from ..mixers import AttentionMixer, MixerBase, MixerContext
 from ..mixers.mamba2 import Mamba2Mixer
 from ..mixers.mlp import MLPMixer
 from ..mla import MLAMixer
+from ..mlp import GatedMLP
 from ..moe import GatedActivation, Situ
 from ..precision import at_least_fp32, biased_logits, capped_logits, head_dot_general, head_product, scaled
 from ..protocols import OutputTable, ProjectionGroup, QuantizesInputs, declared_groups
@@ -89,7 +91,6 @@ from .decoder_block import (
     RESIDUALS,
     BlockWiring,
     DecoderBlock,
-    GatedMLP,
     Mixture,
     MTPBlock,
     RematPolicy,
@@ -1479,14 +1480,15 @@ class CausalTransformer(nn.Module):
                     valid = valid & attention_mask[:, depth:]
                 if segment_ids is not None:
                     valid = valid & (segment_ids[:, :-depth] == segment_ids[:, depth:])
+            segments, places = (None if field is None else field[:, depth:]
+                                for field in (segment_ids, positions))
+            given = valid is not None or segments is not None or places is not None
             metadata = AttentionMetadata(
-                coordinates=None if valid is None else build_coordinates(valid=valid),
+                coordinates=build_coordinates((hidden.shape[0], hidden.shape[1] - 1), valid=valid,
+                                              segments=segments, positions=places) if given else None,
                 image_groups=None if image_groups is None else image_groups[:, depth:],
                 rotary_positions=None if rotary_positions is None else rotary_positions[:, depth:])
-            hidden = block(hidden[:, :-1], embeds[:, depth:], train=train,
-                           positions=None if positions is None else positions[:, depth:],
-                           segment_ids=None if segment_ids is None else segment_ids[:, depth:],
-                           attention_metadata=metadata)
+            hidden = block(hidden[:, :-1], embeds[:, depth:], train=train, attention_metadata=metadata)
             states.append(hidden)
         return states
 
@@ -1518,11 +1520,13 @@ class CausalTransformer(nn.Module):
         if depth < 0 or depth >= len(self.mtp):
             raise ValueError("prediction depth is outside the model's configured depths")
         embeds = self.token_embeddings(tokens) if input_embeddings is None else input_embeddings
+        given = attention_mask is not None or positions is not None
         state, prediction = self.mtp[depth].states(
-            hidden, embeds, positions=positions, decode=decode,
+            hidden, embeds, decode=decode,
             prediction_phase=prediction_phase if self.index_share_for_mtp_iteration else "ordinary",
             attention_metadata=AttentionMetadata(
-                coordinates=None if attention_mask is None else build_coordinates(valid=attention_mask),
+                coordinates=build_coordinates(hidden.shape[:2], valid=attention_mask, positions=positions)
+                if given else None,
                 rotary_positions=rotary_positions))
         return self._logits(state), prediction
 
@@ -1646,7 +1650,8 @@ class CausalTransformer(nn.Module):
 
         V4's depth reads the raw residual streams from before the collapse head
         and the final norm; other depths read the final normalized states.
-        Packed `positions` and `segment_ids` are passed on to the layers.
+        Packed `positions` and `segment_ids` reach the layers as the call's
+        `Coordinates`, the one description of its tokens every layer reads.
 
         - `input_embeddings` `[B, S, D]` replace the scaled token embeddings,
           for a caller that fuses in another encoder's output. The token ids
@@ -1674,13 +1679,12 @@ class CausalTransformer(nn.Module):
           packer's `max_segments`); where None they are built here from
           `segment_ids`, `attention_mask`, `positions` and `right_padded`.
         """
-        if coordinates is not None and coordinates.segments is not None:
-            # Attention still reads the documents and their positions as fields of its own.
-            segment_ids, positions = coordinates.segments, coordinates.positions
         attention_metadata = self._attention_metadata(
             tokens, decode, positions, segment_ids, attention_mask, image_groups, rotary_positions,
             attention_pairwise_mask, attention_key_positions, media_mask, admitted, right_padded,
             coordinates)
+        if attention_metadata is not None and attention_metadata.coordinates is not None:
+            positions = attention_metadata.coordinates.positions
         # The stack's entry and exit sit where the batch does, so neither the
         # lookup nor the head is computed whole on the shards of an axis that
         # splits the rows or the positions.
@@ -1712,8 +1716,6 @@ class CausalTransformer(nn.Module):
             self._expand(x),
             train=train,
             decode=decode,
-            positions=positions,
-            segment_ids=segment_ids,
             per_layer_input=ple,
             attention_metadata=attention_metadata,
         )
@@ -1751,11 +1753,17 @@ class CausalTransformer(nn.Module):
                 raise ValueError("explicit pairwise masks require ordinary attention mixers")
         if self.engram is None and (self.mixture is None or not self.mixture.media_bias):
             media_mask = None
-        engram_ids = (None if self.engram is None
-                      else self.engram_hashes(tokens, attention_mask, positions, decode, media_mask))
-        if coordinates is None and (segment_ids is not None or attention_mask is not None or right_padded):
+        if coordinates is None and (segment_ids is not None or attention_mask is not None or right_padded
+                                    or positions is not None):
             coordinates = build_coordinates(tokens.shape[:2], segments=segment_ids, valid=attention_mask,
                                             positions=positions, right_padded=right_padded)
+        if decode and coordinates is not None and coordinates.max_segments > 1:
+            raise ValueError(
+                "packed rows cannot append to a decode cache: it stores no document ids, so a cached "
+                "call would attend across documents; prefill each document into a row of its own")
+        engram_ids = (None if self.engram is None else self.engram_hashes(
+            tokens, attention_mask, None if coordinates is None else coordinates.positions, decode,
+            media_mask))
         if (coordinates is None and image_groups is None and rotary_positions is None
                 and pairwise_mask is None and key_positions is None and not self.hash_layers
                 and engram_ids is None and media_mask is None and admitted is None):
@@ -1811,8 +1819,8 @@ class CausalTransformer(nn.Module):
         if not self.is_initializing():
             self.sow('exits', 'logits', logit)
 
-    def stack(self, x, *, train: bool, decode: bool, positions, segment_ids,
-              per_layer_input, attention_metadata=None, span: tuple[int, int] | None = None):
+    def stack(self, x, *, train: bool, decode: bool, per_layer_input, attention_metadata=None,
+              span: tuple[int, int] | None = None):
         """Run the layer stack over `x` as the plain loop, as scanned runs, or as a pipeline over the stages.
 
         `span` runs layers [first, end) alone, as a `Loop` over a block runs its
@@ -1841,14 +1849,12 @@ class CausalTransformer(nn.Module):
                 view = StackView(groups)
                 run = nn.map_variables(type(self)._stacked, mapped_collections=True, trans_in_fn=view.stack,
                                        trans_out_fn=view.unstack, init=True, mutable=True)
-                return run(self, view, x, train, decode, positions, segment_ids,
-                           per_layer_input, attention_metadata)
+                return run(self, view, x, train, decode, per_layer_input, attention_metadata)
         if self.is_initializing() or (stages == 1 and not self.scan_layers):
             return run_stack(
                 self.layers, self.block, self.specs,
                 tuple((index, 1) for index in range(first, end)), x,
-                train=train, decode=decode, positions=positions, segment_ids=segment_ids,
-                kv_store={} if self.sharing_layers else None,
+                train=train, decode=decode, kv_store={} if self.sharing_layers else None,
                 per_layer_input=per_layer_input, attention_metadata=attention_metadata)
         banked = self.banked_collections()
         if stages == 1:
@@ -1905,13 +1911,13 @@ class CausalTransformer(nn.Module):
                 # loop creates (the routers' sowing) comes out per iteration.
                 broadcast=tuple(name for name, tree in self.variables.items() if tree))
         dtype = self.residual_dtype(
-            x, train=train, decode=decode, positions=positions, segment_ids=segment_ids,
-            per_layer_input=per_layer_input, attention_metadata=attention_metadata)
+            x, train=train, decode=decode, per_layer_input=per_layer_input,
+            attention_metadata=attention_metadata)
         # A carried collapse stays fp32, as the reference keeps it.
         x = x._replace(streams=x.streams.astype(dtype)) if isinstance(x, Carried) else x.astype(dtype)
         run = nn.map_variables(type(self)._stacked, mapped_collections=True, trans_in_fn=view.stack,
                                trans_out_fn=view.unstack, init=False, mutable=True)
-        return run(self, view, x, train, decode, positions, segment_ids, per_layer_input, attention_metadata)
+        return run(self, view, x, train, decode, per_layer_input, attention_metadata)
 
     def banked_collections(self) -> tuple[str, ...]:
         """Return the collections whose layer subtrees the store holds as banks.
@@ -1959,8 +1965,8 @@ class CausalTransformer(nn.Module):
             banked.append(collection)
         return tuple(banked)
 
-    def residual_dtype(self, x, *, train: bool, decode: bool, positions, segment_ids,
-                       per_layer_input, attention_metadata=None) -> jnp.dtype:
+    def residual_dtype(self, x, *, train: bool, decode: bool, per_layer_input,
+                       attention_metadata=None) -> jnp.dtype:
         """Return the dtype the residual stream settles in: `x`'s promoted with the first layer's output.
 
         A scan carries one dtype through, and each pipeline stage takes the
@@ -1976,8 +1982,7 @@ class CausalTransformer(nn.Module):
         streams = x.streams if isinstance(x, Carried) else x
         output = jax.eval_shape(lambda held: layer.apply(
             held, x, mutable=True, rngs=rngs,
-            train=train, decode=decode, positions=positions, segment_ids=segment_ids,
-            kv_store={} if self.sharing_layers else None,
+            train=train, decode=decode, kv_store={} if self.sharing_layers else None,
             per_layer_input=None if per_layer_input is None else per_layer_input.layer(0),
             attention_metadata=attention_metadata)[0], self.first_layer_shapes())
         output = output.streams if isinstance(output, Carried) else output
@@ -2043,14 +2048,13 @@ class CausalTransformer(nn.Module):
         return count
 
     @nn.compact
-    def _stacked(self, view: StackView, x, train: bool, decode: bool, positions,
-                 segment_ids, per_layer_input, attention_metadata=None):
+    def _stacked(self, view: StackView, x, train: bool, decode: bool, per_layer_input,
+                 attention_metadata=None):
         """The stack inside `view`: scanned runs, or the pipeline over stages."""
         if view.stages == 1:
             return run_stack(
                 self.layers, self.block, self.specs, view.groups, x,
-                train=train, decode=decode, positions=positions, segment_ids=segment_ids,
-                kv_store={} if self.sharing_layers else None,
+                train=train, decode=decode, kv_store={} if self.sharing_layers else None,
                 per_layer_input=per_layer_input, attention_metadata=attention_metadata,
                 banked='params' in view.banked)
         return run_pipeline(
@@ -2058,8 +2062,6 @@ class CausalTransformer(nn.Module):
             view,
             x,
             train=train,
-            positions=positions,
-            segment_ids=segment_ids,
             per_layer_input=per_layer_input,
             attention_metadata=attention_metadata,
         )
