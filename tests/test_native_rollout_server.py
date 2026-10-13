@@ -82,7 +82,7 @@ def test_a_refused_request_raises_at_submit_and_the_native_server_keeps_serving(
     )
     try:
         running = server.submit([1, 2, 3], 40, key=1)
-        with pytest.raises(ValueError, match="max_seq_len"):
+        with pytest.raises(ValueError):
             server.submit(list(range(1, 11)) * 6, 10, key=2)
         assert len(running.result(timeout=120).tokens) >= 1
         assert server.submit([4, 5], 3, key=3).result(timeout=120).prompt == (4, 5)

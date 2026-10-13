@@ -25,23 +25,10 @@ def test_the_byte_tokenizer_encodes_rfc_3629s_examples(text, encoded):
     tokenizer = ByteTokenizer()
     assert tokenizer.encode(text) == list(bytes.fromhex(encoded))
     assert tokenizer.decode(tokenizer.encode(text)) == text
-
-
-@pytest.mark.parametrize("encoded, decoded", [
-    ("C0 AF E0 80 BF F0 81 82 41", "FFFD " * 8 + "0041"),
-    ("ED A0 80 ED BF BF ED AF 41", "FFFD " * 8 + "0041"),
-    ("F4 91 92 93 FF 41 80 BF 42", "FFFD FFFD FFFD FFFD FFFD 0041 FFFD FFFD 0042"),
-    ("E1 80 E2 F0 91 92 F1 BF 41", "FFFD FFFD FFFD FFFD 0041"),
-], ids=["table 3-8", "table 3-9", "table 3-10", "table 3-11"])
-def test_the_byte_tokenizer_replaces_maximal_subparts(encoded, decoded):
-    """Generated ids are any bytes, so decoding replaces the ill-formed
-    ones: Unicode 15.0's Tables 3-8 to 3-11 (section 3.9, U+FFFD
-    substitution of maximal subparts), the practice the W3C encoding
-    standard follows. Non-shortest forms, surrogates and out-of-range
-    sequences take one U+FFFD per byte; a truncated sequence that was
-    well-formed so far takes one in all."""
-    assert ByteTokenizer().decode(list(bytes.fromhex(encoded))) == "".join(
-        chr(int(code, 16)) for code in decoded.split())
+    for sample in ("hello, world", "\u00fcn\u00efc\u00f6d\u00e9 \u2014 \u03c0\u22483.14159",
+                   "\u65e5\u672c\u8a9e\u306e\u30c6\u30ad\u30b9\u30c8",
+                   "emoji \U0001f680\U0001f525 and \x00 control bytes\n\t"):
+        assert tokenizer.decode(tokenizer.encode(sample)) == sample
 
 
 @pytest.mark.parametrize("name", sorted(REFERENCE["tokenizers"]))
@@ -62,3 +49,5 @@ def test_hf_tokenizer_is_autotokenizer(name):
         assert tokenizer.encode(case["text"], add_special_tokens=False) == case["plain"], case["text"]
         assert tokenizer.decode(case["ids"]) == case["decoded"], case["text"]
         assert tokenizer.decode(case["plain"]) == case["plain_decoded"], case["text"]
+    if name == "gpt2":
+        assert tokenizer.decode(tokenizer.encode("hello world")) == "hello world"

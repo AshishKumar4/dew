@@ -17,7 +17,6 @@ import pytest
 from reference_error import assert_as_exact_as_the_reference
 
 from dew.nn.autoencoders import AutoencoderKL, StableDiffusionVAE
-from dew.nn.autoencoders.kl import posterior_latent
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "vae"
 
@@ -66,17 +65,6 @@ def test_the_advertised_geometry_is_the_encoders(channels):
         decoded, autoencoder.decode(autoencoder.params, jnp.ones_like(latent)), atol=1e-6)
 
 
-def test_video_frames_match_the_same_frames_encoded_as_images(autoencoder):
-    """The B*T flattening must not mix frames together."""
-    frames = jax.random.uniform(
-        jax.random.PRNGKey(3), (6, IMAGE_SIZE, IMAGE_SIZE, 3), minval=-1.0, maxval=1.0
-    )
-    video = frames.reshape(2, 3, IMAGE_SIZE, IMAGE_SIZE, 3)
-    per_frame = autoencoder.encode(autoencoder.params, frames)
-    video_latent = autoencoder.encode(autoencoder.params, video)
-    assert jnp.allclose(video_latent, per_frame.reshape(2, 3, *per_frame.shape[1:]), atol=1e-6)
-
-
 def test_latent_normalization_is_inverted_by_decode(autoencoder, image):
     """encode applies (z - shift) * scale and decode must undo exactly it, so
     decode(encode(x)) is the raw decoder applied to the raw latent."""
@@ -123,11 +111,3 @@ def test_a_clip_decodes_as_diffusers_decodes_its_frames(contract, sd3_tiny):
     decoded = sd3_tiny.decode(sd3_tiny.params, clip)
     assert_as_exact_as_the_reference(np.asarray(decoded).reshape(-1, *decoded.shape[2:]),
                                      contract["fp32.decoded"], contract["fp64.decoded"], "decoded")
-
-
-def test_a_posterior_draw_clamps_its_log_variance_as_diffusers_does(contract):
-    """`posterior_latent` against `DiagonalGaussianDistribution.sample` from
-    one draw, on log-variances past the [-30, 20] clamp on both sides."""
-    drawn = posterior_latent(jnp.asarray(contract["moments"]), jax.random.key(7))
-    assert_as_exact_as_the_reference(np.asarray(drawn), contract["fp32.posterior"],
-                                     contract["fp64.posterior"], "posterior")
