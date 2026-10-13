@@ -6,6 +6,7 @@ Each group's update is asserted against the transform it is supposed to be,
 because a parameter in the wrong group still trains, only worse.
 """
 import json
+import typing
 from pathlib import Path
 
 import jax
@@ -20,7 +21,14 @@ from dew.config import OptimConfig
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.dit import SimpleDiT
 from dew.training import MeshSpec
-from dew.training.optim import Cosine, ParamGroup, muon_weight_dimension_numbers, scale_by_qk_clip
+from dew.training.optim import (
+    OPTIMIZER_MAP,
+    Cosine,
+    Optimizer,
+    ParamGroup,
+    muon_weight_dimension_numbers,
+    scale_by_qk_clip,
+)
 from tools.muonclip_reference import clip_qk_kernel, clip_scale
 
 LR = 1e-3
@@ -662,6 +670,10 @@ def test_bf16_state_keeps_the_second_moments_small_increments():
     have = float(jnp.mean(state[0].nu['w'].astype(jnp.float32)))
     assert want < 0.4
     assert have == pytest.approx(want, rel=1e-2)
+
+
+def test_every_optimizer_the_config_names_is_built():
+    assert set(OPTIMIZER_MAP) == set(typing.get_args(Optimizer))
 
 
 def test_lamb_is_optax_lamb_on_the_configs_schedule_options_and_clip():
