@@ -180,6 +180,9 @@ KV_HEADS: LogicalAxes = ("activation_batch", "activation_length", "activation_kv
 """A `[batch, length, kv_heads, head_dim]` key or value. Grouped heads the
 tensor axis does not divide are computed whole on every tensor shard, the
 way Megatron repeats them."""
+SCORES: LogicalAxes = ("activation_batch", "activation_heads", "activation_length", None)
+"""A `[batch, heads, queries, keys]` attention mask or bias, any of whose
+leading three may broadcast."""
 SPREAD: LogicalAxes = ("activation_batch", "activation_spread", None)
 """A `[batch, length, width]` activation whose per-token work splits no
 tensor width, multi-head latent attention's down-projections and their

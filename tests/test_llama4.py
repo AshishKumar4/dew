@@ -14,9 +14,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from dew.nn.backbones.decoder_block import GatedMLP
 from dew.nn.llama4 import Llama4Mixer
 from dew.nn.mixer_base import MixerContext
+from dew.nn.mlp import GatedMLP
 from dew.nn.moe import SparseMLP
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "llama4"
