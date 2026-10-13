@@ -277,6 +277,10 @@ trainer.fit(train.pipe(presets.images, 64, batch=16, augment=True),
 
 Training and validation use the same preset, so both are prepared the same way. Augmentation is off unless you ask for it, so a validation split never gets it by accident. There are no train or eval variants. Presets live in `dew.data.presets`; `images`, `text`, `chat`, `video` and `audio` hold only steps.
 
+The public image decoder also reads prepared ArrayRecord byte maps: `shape` holds two int32 dimensions, `image` holds RGB uint8 pixels, and `label` and UTF-8 `caption` are optional. It reads encoded `jpg`/`txt` byte maps through the same step. By default, `filter_map(images.decode())` counts and drops bad images; `.map(images.decode(rejects=False))` fails on bad bytes and keeps every source position, as the run-layer `ImageData` recipe does.
+
+`images.caption(template, classes=names)` formats a class label; `images.caption(columns=("description", "text"))` picks the first present column. To draw one of several templates per record, use `.random_map(images.caption(templates=("a {label}", "a photo of {}"), classes=names))`. `ImageData` composes these same decoding, resizing, caption and augmentation steps; its recorded run settings are unchanged.
+
 | Preset | Reads per record | Writes per batch |
 |---|---|---|
 | `images(ds, size, *, batch, augment=False, crop_scale=(1, 1), cache=None)` | `image`: encoded bytes or uint8 `[H, W, 3]` | `image` uint8 `[B, size, size, 3]` |

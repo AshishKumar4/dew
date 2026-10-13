@@ -21,16 +21,16 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from dew.config.data import HoldOut, ImageData, RecordsData, VideoData, loader
+from dew.config.data import Augment, HoldOut, ImageData, RecordsData, VideoData, loader
 from dew.data import Loading, Memory, images
 from dew.data.compile import compile, validation
 from dew.data.dataset import Checkpointable, DataPartition, Records as IndexedRows, SourceSlice, describe
 from dew.data.image_codec import decode_image
-from dew.data.pipeline import MapBatch, Pipeline
+from dew.data.pipeline import Pipeline
 from dew.data.sinks import export
 from dew.data.sources import Torch, av_utils, source as stored_source
 from dew.data.steps.generic import Formatting
-from dew.data.steps.image import DeviceAugment, EncodeCaptions, ImageRecord
+from dew.data.steps.image import EncodeCaptions
 from dew.data.steps.video import Audio, DecodeClip
 from dew.objectives.base import VALID_ROWS
 from dew.position import ENVELOPE
@@ -206,8 +206,8 @@ def test_without_a_named_split_the_head_hold_out_is_unchanged():
     held = next(data.val(DataPartition()))
     assert _labels(iter([held])) == [0, 1, 2, 3]
     assert set(_labels(data.train(DataPartition()), batches=3)).isdisjoint(range(4))
-    expected = spec.transform(training=False).random_map(_Images(16)[0], np.random.default_rng(0))
-    assert held["image"][0].tobytes() == expected["image"].tobytes()
+    expected = cv2.resize(_Images(16)[0]["image"], (8, 8), interpolation=cv2.INTER_AREA)
+    np.testing.assert_array_equal(held["image"][0], expected)
 
 
 def test_a_dataset_of_one_pile_refuses_a_split_it_cannot_name(tmp_path):
@@ -677,21 +677,15 @@ class Augmenting:
         return _Images(self.length if split is None else self.splits[split],
                        first=0 if split is None else 1000)
 
-    def record(self, element, rng):
-        template = CAPTION_TEMPLATES[int(rng.integers(len(CAPTION_TEMPLATES)))]
-        name = ["rose", "tulip", "lotus", "orchid", "marigold"][element["index"] % 5]
-        return element["image"], template.format(name), element["index"]
-
-    def transform(self, *, training=True):
+    def prepared(self, rows, *, training=True):
         mode = self.augment if training else None
-        size = self.augmentation_size or self.image_size if mode else self.image_size
-        return ImageRecord(self.image_size, size, templates=CAPTION_TEMPLATES,
-                           classes=tuple(["rose", "tulip", "lotus", "orchid", "marigold"] *
-                                         ((1000 + max((self.length, *self.splits.values()))) // 5 + 1)),
-                           flip=False if mode is None else mode.flip,
-                           jitter=False if mode is None else mode.jitter,
-                           crop_scale=self.crop_scale if mode else (1.0, 1.0),
-                           backend=self.augmentation_backend if training else "host")
+        classes = tuple(["rose", "tulip", "lotus", "orchid", "marigold"] *
+                        ((1000 + max((self.length, *self.splits.values()))) // 5 + 1))
+        augment = None if mode is None else Augment(mode.flip, mode.jitter, self.crop_scale,
+                                                  self.augmentation_backend)
+        return ImageData(source=Memory(rows), image_size=self.image_size,
+                         staging_size=self.augmentation_size, caption_templates=CAPTION_TEMPLATES,
+                         classes=classes, augment=augment).pipelines()[0]
 
     def pipelines(self):
         source = self.source()
@@ -707,14 +701,8 @@ class Augmenting:
                 held = held[:self.val_batches * self.batch] if isinstance(held,
                     list) else [held[index] for index in
                         range(min(len(held), self.val_batches * self.batch))]
-        training = Pipeline(Memory(train)).random_map(self.transform())
-        if self.augmentation_backend == "device":
-            mode = self.augment
-            training = training.then(MapBatch(DeviceAugment(self.image_size,
-                self.crop_scale if mode else (1.0, 1.0),
-                False if mode is None else mode.flip, False if mode is None else mode.jitter)))
-        validation = (None if held is None else
-                      Pipeline(Memory(held)).random_map(self.transform(training=False)))
+        training = self.prepared(train)
+        validation = None if held is None else self.prepared(held, training=False)
         return training, validation, (EncodeCaptions(),)
 
 
@@ -786,18 +774,17 @@ class Lingering(Augmenting):
 
     seconds: float = 2.0
 
-    def transform(self, *, training=True):
-        return _LingeringRecord(super().transform(training=training), self.seconds)
+    def prepared(self, rows, *, training=True):
+        return super().prepared(rows, training=training).map(_LingeringRecord(self.seconds))
 
 
 @dataclasses.dataclass(frozen=True)
-class _LingeringRecord(pygrain.RandomMapTransform):
-    transform: ImageRecord
+class _LingeringRecord(pygrain.MapTransform):
     seconds: float
 
-    def random_map(self, element, rng):
+    def map(self, element):
         _linger(self.seconds)
-        return self.transform.random_map(element, rng)
+        return element
 
 
 @pytest.mark.slow
@@ -912,8 +899,9 @@ def test_a_prepared_set_is_the_deterministic_half_of_the_transform(tmp_path):
     """Exported pixels, labels and captions equal the configured record stage."""
     spec = Augmenting(length=16, image_size=8, augment=None, val_batches=None, **WORKERS)
     live = _Images(16)
-    rows = [spec.transform(training=False).random_map(live[index], np.random.default_rng(index))
-            for index in range(16)]
+    rows = [{name: column[index] for name, column in batch.items()}
+            for batch in spec.prepared(live, training=False).batch(4).iterate()
+            for index in range(4)]
     manifest = export(rows, str(tmp_path), format="array_record", rows_per_shard=8,
                       metadata={"image_size": 8})
     assert manifest["rows"] == 16 and manifest["metadata"]["image_size"] == 8
@@ -1085,12 +1073,12 @@ def test_the_image_transform_resizes_augments_and_captions_one_record():
     spec = Augmenting(image_size=8, augment=None)
     element = _Images(16)[5]
 
-    out = spec.transform().random_map(element, np.random.default_rng(0))
+    out = next(spec.prepared([element]).batch(1).iterate())
 
     np.testing.assert_array_equal(
-        out["image"], cv2.resize(element["image"], (8, 8), interpolation=cv2.INTER_AREA))
-    assert out["caption"] in {template.format("rose") for template in CAPTION_TEMPLATES}
-    assert out["label"] == 5 and out["label"].dtype == np.int32
+        out["image"][0], cv2.resize(element["image"], (8, 8), interpolation=cv2.INTER_AREA))
+    assert out["caption"][0] in {template.format("rose") for template in CAPTION_TEMPLATES}
+    np.testing.assert_array_equal(out["label"], [5])
 
 
 def test_resizing_interpolates_up_and_averages_down():

@@ -17,11 +17,11 @@ from dew.data.pipeline import Configured, HostStep, MapBatch, Mixture, Objective
 
 if TYPE_CHECKING:
     from dew.data.cache import Cache, Generation
-from dew.data import video
+from dew.data import images, video
 from dew.data.sources.base import Read, ShardManifest, Source, _consumed
 from dew.data.steps.chat import ConfigurePrompt, PreferencePair, RenderChat
 from dew.data.steps.generic import Formatting
-from dew.data.steps.image import ConfigureImage, DeviceAugment, EncodeCaptions, ImageRecord
+from dew.data.steps.image import ConfigureCaption, EncodeCaptions
 from dew.data.steps.text import Chunks, LengthPolicy, Tokenize
 
 _DEFAULT_LOADING = Loading(workers="auto")
@@ -396,34 +396,28 @@ class ImageData:
             from dew.data.storage import Store
 
             classes = tuple(Store(self.labels).read().decode().splitlines())
-        transform = ImageRecord(
-            self.image_size,
-            size,
-            self.field,
-            self.caption,
-            self.caption_templates,
-            self.caption_columns,
-            classes,
-            flip=augment is not None and augment.flip,
-            jitter=augment is not None and augment.jitter,
-            crop_scale=(1.0, 1.0) if augment is None else augment.crop_scale,
-            backend="host" if augment is None else augment.backend,
-        )
-        train = train.map(Configured(ConfigureImage(transform), needs=(), random=True))
-        if augment is not None and augment.backend == "device":
-            train = train.then(MapBatch(
-                DeviceAugment(self.image_size, augment.crop_scale, augment.flip, augment.jitter)
-            ))
-        if held is not None:
-            evaluated = dataclasses.replace(
-                transform,
-                staging_size=self.image_size,
-                backend="host",
-                flip=False,
-                jitter=False,
-                crop_scale=(1.0, 1.0),
-            )
-            held = held.map(Configured(ConfigureImage(evaluated), needs=(), random=True))
+        caption = images.caption(self.caption, templates=self.caption_templates,
+                                 classes=classes, columns=self.caption_columns)
+        configured = Configured(ConfigureCaption(caption), needs=(), random=bool(self.caption_templates))
+
+        def prepared(chain: Pipeline, staging: int) -> Pipeline:
+            return (chain.map(images.decode(self.field, at_least=staging, rejects=False))
+                    .map(images.resize(staging)).map(configured))
+
+        train = prepared(train, size)
+        if augment is not None and augment.backend == "host":
+            if augment.crop_scale != (1.0, 1.0) or size != self.image_size:
+                train = train.random_map(images.random_crop(self.image_size, scale=augment.crop_scale,
+                                                            flip=augment.flip, jitter=augment.jitter))
+            else:
+                if augment.flip:
+                    train = train.random_map(images.flip())
+                if augment.jitter:
+                    train = train.random_map(images.color_jitter())
+        elif augment is not None:
+            train = train.random_map(images.augmentation_key()).then(MapBatch(images.device_augment(
+                self.image_size, crop_scale=augment.crop_scale, flip=augment.flip, jitter=augment.jitter)))
+        held = None if held is None else prepared(held, self.image_size)
         return train, held, (EncodeCaptions(),)
 
 
