@@ -9,7 +9,7 @@ import pytest
 import tokamax
 from kernel_compile import compile_kernels
 
-from dew.nn.kernels import fla_gdn, generation, tuning
+from dew.nn.kernels import fla_gdn, fla_kda, generation, tuning
 
 pytestmark = pytest.mark.kernel
 
@@ -25,34 +25,42 @@ def test_the_compiled_shapes_reach_the_widest_keys_and_values_the_port_takes():
 def test_each_gpu_takes_the_picks_its_block_holds_and_measures_a_space_holding_them(target, wide):
     """An A100's picks on every GPU whose block holds as much shared memory, the 99 KB ones elsewhere,
     on a GPU the targets do not list (sm100) too, and an A100's where a CPU interprets; every kernel's
-    16-bit space holds its unmeasured pick, and fp32 has a pick for every kernel."""
+    16-bit space holds its unmeasured pick, Kimi delta attention's own kernels' too, and fp32 has a pick
+    for every kernel."""
     with generation.assumed(target):
         assert fla_gdn._wide() is wide
-    for kernel, tiles in fla_gdn.HEURISTICS["bfloat16", wide].items():
-        assert tiles in fla_gdn._space(kernel, wide), kernel
+    for picks, space in ((fla_gdn.HEURISTICS["bfloat16", wide], fla_gdn._space),
+                         (fla_kda.HEURISTICS[wide], fla_kda._space)):
+        for kernel, tiles in picks.items():
+            assert tiles in space(kernel, wide), kernel
     assert set(fla_gdn.HEURISTICS["bfloat16", wide]) == set(fla_gdn.HEURISTICS["float32", wide])
 
 
-def test_the_tuner_finds_each_of_the_rules_nine_launches_in_its_lowering():
+@pytest.mark.parametrize("module", [fla_gdn, fla_kda])
+def test_the_tuner_finds_each_of_the_rules_launches_in_its_lowering(module):
     """The rule's forward and backward, traced as the tuner reads a program (`tuning.launches`): each
-    of the nine kernels is a launch tokamax describes, its arguments serializable into its key."""
+    of its kernels is a launch tokamax describes, its arguments serializable into its key; the gated
+    delta rule's nine, and Kimi delta attention's seven with the cumsum and memory kernels it shares."""
+    per_key = module is fla_kda
     q = jax.ShapeDtypeStruct((1, 64, 1, 64), jnp.bfloat16)
     v = jax.ShapeDtypeStruct((1, 64, 2, 64), jnp.bfloat16)
-    g = jax.ShapeDtypeStruct((1, 64, 2), jnp.float32)
+    g = jax.ShapeDtypeStruct((1, 64, 2, *(64,) * per_key), jnp.float32)
     h0 = jax.ShapeDtypeStruct((1, 2, 64, 64), jnp.float32)
+    port = fla_kda.chunk_kda if per_key else fla_gdn.chunk_gated_delta_rule
+    shared = {fla_gdn.ChunkLocalCumsum, fla_gdn.ChunkFwdH, fla_gdn.ChunkBwdDhu} if per_key else set()
 
     def rule(*args):
-        return fla_gdn.chunk_gated_delta_rule(*args, None, 0.125, 64, interpret=True)
+        return port(*args, None, 0.125, 64, interpret=True)
 
     def both(q, k, v, g, beta, h0, do):
         (_, final), pull = jax.vjp(rule, q, k, v, g, beta, h0)
         return pull((do, jnp.zeros_like(final)))
 
     with tuning.launches():
-        beta = g.update(dtype=jnp.bfloat16)
+        beta = g.update(shape=g.shape[:3], dtype=jnp.bfloat16)
         found = tokamax.autotuning.get_bound_args(jax.jit(both), q, q, v, g, beta, h0, v)
-    assert {type(ba.op) for ba in found} == {type(op) for op in vars(fla_gdn).values()
-                                             if isinstance(op, fla_gdn._Launch)}
+    assert {type(ba.op) for ba in found} == shared | {type(op) for op in vars(module).values()
+                                                      if isinstance(op, fla_gdn._Launch)}
 
 
 def test_a_launch_clips_its_blocks_to_the_operands_and_takes_the_labs_overrides():

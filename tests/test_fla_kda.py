@@ -6,10 +6,9 @@ to the kernels' blocks, with value heads sharing a key head, in a layer and on a
 them on the GPU, with the training shape's float64 distances against fla's own on the same operands.
 """
 
-import importlib.util
+import functools
 import os
 import subprocess
-import sys
 import tempfile
 from pathlib import Path
 
@@ -20,7 +19,7 @@ import pytest
 from kernel_compile import compile_kernels
 from reference_error import assert_as_exact_as_the_reference, assert_leaves_as_exact, distance, widened
 from sharded import assert_runs_per_shard, boundary_copies
-from test_fla_gdn import row_names_port
+from test_fla_gdn import port_named, recurrence, through, wide
 
 from dew.nn import linear
 from dew.nn.kda import KimiDeltaAttention
@@ -66,20 +65,6 @@ def math(q, k, v, g, beta, h0):
     return linear.chunk_delta_rule(q, k, v, g, beta, h0)
 
 
-def gradients(rule, do, dht):
-    """`rule`'s output, final memory and the six gradients under the cotangents `do` and `dht`."""
-    def loss(*args):
-        out, final = rule(*args)
-        return (jnp.sum(out.astype(do.dtype) * do) + jnp.sum(final.astype(dht.dtype) * dht)), (out, final)
-
-    def run(*args):
-        argnums = tuple(range(len(args)))
-        (_, (out, final)), grads = jax.value_and_grad(loss, argnums=argnums, has_aux=True)(*args)
-        return out, final, *grads
-
-    return run
-
-
 @ON_A_GPU
 @pytest.mark.parametrize("key_heads, value_heads, width, columns, length", [
     (1, 2, 64, 64, 128),    # value heads sharing a key head, two whole chunks
@@ -87,45 +72,39 @@ def gradients(rule, do, dht):
     (1, 1, 32, 96, 70),     # keys narrower than a block, values no whole number of them
     (1, 1, 128, 128, 64),   # one chunk at the widest fp32 keys
 ])
-def test_the_rule_on_the_port_is_as_exact_as_the_math(monkeypatch, key_heads, value_heads, width, columns,
-                                                       length):
+def test_the_rule_on_the_port_is_as_exact_as_the_math(key_heads, value_heads, width, columns, length):
     """`chunk_gated_delta_rule` with a decay per key dimension where a GPU runs the port: padded to the
     kernels' blocks, through every kernel and the custom VJP, its output, final memory and six gradients
-    as near the float64 rule as the portable math, up to fp32 rounding of a chunk's sums."""
+    as near the float64 recurrence as the portable math, up to fp32 rounding of a chunk's sums."""
     *inputs, do, dht = operands(1, length, key_heads, value_heads, width, columns, jnp.float32, seed=11)
-    row_names_port(monkeypatch)
-    assert port_refusal(*inputs[:3]) is None
-    got = gradients(chunk_gated_delta_rule, do, dht)(*inputs)
-    want = gradients(math, do, dht)(*inputs)
+    with port_named():
+        assert port_refusal(*inputs[:3]) is None
+        got = through(chunk_gated_delta_rule, do, dht)(*inputs)
+    want = through(math, do, dht)(*inputs)
     with jax.enable_x64(new_val=True):
-        wide = [jnp.asarray(x) for x in widened((*inputs, do, dht))]
-        truth = gradients(math, wide[-2], wide[-1])(*wide[:-2])
+        operands64 = wide(*inputs, do, dht)
+        truth = through(recurrence, *operands64[6:])(*operands64[:6])
     assert_leaves_as_exact(got, want, widened(truth), reductions=CHUNKED)
 
 
-def layer_on(monkeypatch, *, port: bool, **fields):
-    """A KimiDeltaAttention that runs the port where `port` (as a GPU's target row decides,
-    `row_names_port`; off a GPU its kernels interpret) and the portable math where not."""
-    row_names_port(monkeypatch, port=port)
-    return KimiDeltaAttention(emb_features=64, num_heads=2, head_dim=64, **fields)
-
-
 @pytest.mark.parametrize("dtype", [pytest.param(jnp.float32, marks=ON_A_GPU), jnp.bfloat16])
-def test_a_kimi_delta_attention_trains_on_the_port_as_on_the_math(monkeypatch, dtype):
+def test_a_kimi_delta_attention_trains_on_the_port_as_on_the_math(dtype):
     """The layer where a GPU runs the port, its conv rounding to the projections' dtype for it: its output
     and every parameter gradient the math's, within fla's rounding (`APART`)."""
     x = jax.random.normal(jax.random.key(23), (2, 72, 64)).astype(dtype)
-    params = layer_on(monkeypatch, port=False, dtype=dtype).init(jax.random.key(29), x)
+    layer = KimiDeltaAttention(emb_features=64, num_heads=2, head_dim=64, dtype=dtype)
+    params = layer.init(jax.random.key(29), x)
 
-    def run(params, x, *, port):
+    def run(*, port):
         def loss(params):
-            out = layer_on(monkeypatch, port=port, dtype=x.dtype).apply(params, x)
+            out = layer.apply(params, x)
             return jnp.sum(out.astype(jnp.float32) ** 2), out
-        (_, out), grads = jax.value_and_grad(loss, has_aux=True)(params)
+        with port_named(port=port):
+            (_, out), grads = jax.value_and_grad(loss, has_aux=True)(params)
         return out, grads
 
-    want = run(params, x, port=False)
-    got = run(params, x, port=True)
+    want = run(port=False)
+    got = run(port=True)
     assert got[0].dtype == want[0].dtype == dtype
     for (path, mine), theirs in zip(jax.tree_util.tree_leaves_with_path(got), jax.tree.leaves(want),
                                     strict=True):
@@ -155,9 +134,10 @@ def test_the_port_keeps_the_kernel_contract_on_a_mesh(axis, split):
         return grads
 
     with jax.enable_x64(new_val=True):
-        wide = [jnp.asarray(x) for x in widened((q, k, v, g, beta, do))]
+        operands64 = wide(q, k, v, g, beta, do)
         zero = jnp.zeros((2, 2, 64, 64), jnp.float64)
-        truth = jax.tree.map(np.asarray, run(lambda *a: math(*a, zero), wide[-1])(*wide[:-1]))
+        rule = functools.partial(recurrence, h0=zero)
+        truth = jax.tree.map(np.asarray, run(rule, operands64[-1])(*operands64[:-1]))
     spec = PartitionSpec(*(axis if dim in split else None for dim in range(3)))
     mesh = Mesh(np.asarray(jax.devices()[:2]), (axis,))
     assert_runs_per_shard(run(fla_rule, do), (q, k, v, g, beta), [spec] * 5, mesh, truth)
@@ -184,7 +164,7 @@ def training_cases():
 
             def grads(q, k, v, g, beta, h0):
                 def loss(*args):
-                    out, final = fla_kda.chunk_kda(*args, width ** -0.5, 64, interpret=False)
+                    out, final = fla_kda.chunk_kda(*args, None, width ** -0.5, 64, interpret=False)
                     return jnp.sum(out.astype(jnp.float32)) + jnp.sum(final)
                 return jax.grad(loss, argnums=(0, 1, 2, 3, 4, 5))(q, k, v, g, beta, h0)
 
@@ -229,52 +209,101 @@ def test_a_bf16_kimi_delta_attention_trains_with_no_copy_at_the_ports_edges():
 FLA_SIDE = '''
 import sys, numpy as np, torch
 from fla.ops.kda import chunk_kda
-root = sys.argv[1]
-load = lambda name, dtype: torch.from_numpy(np.load(f"{root}/{name}.npy")).to("cuda", dtype)
-dtype = getattr(torch, sys.argv[2])
+given, dtype = np.load(sys.argv[1]), getattr(torch, sys.argv[3])
+load = lambda name, as_dtype: torch.from_numpy(given[name]).to("cuda", as_dtype)
 q, k, v, do, beta = (load(n, dtype) for n in ("q", "k", "v", "do", "beta"))
 g, h0, dht = (load(n, torch.float32) for n in ("g", "h0", "dht"))
+cu_seqlens = load("cu_seqlens", torch.long) if "cu_seqlens" in given else None
 leaves = [x.requires_grad_() for x in (q, k, v, g, beta, h0)]
-o, final = chunk_kda(*leaves[:5], scale=q.shape[-1] ** -0.5, initial_state=leaves[5], output_final_state=True)
+o, final = chunk_kda(*leaves[:5], scale=q.shape[-1] ** -0.5, initial_state=leaves[5], output_final_state=True,
+                     cu_seqlens=cu_seqlens)
 torch.autograd.backward((o, final), (do, dht))
-for name, x in zip(("o", "final", *("d" + n for n in ("q", "k", "v", "g", "beta", "h0"))),
-                   (o, final, *(leaf.grad for leaf in leaves))):
-    np.save(f"{root}/fla_{name}.npy", x.detach().float().cpu().numpy())
+np.savez(sys.argv[2], **{name: x.detach().float().cpu().numpy() for name, x in
+                         zip(("o", "final", "dq", "dk", "dv", "dg", "dbeta", "dh0"),
+                             (o, final, *(leaf.grad for leaf in leaves)))})
 '''
+"""fla's side of the comparison, in the interpreter `DEW_FLA_PYTHON` names: fla 0.5.2's `chunk_kda` on the
+operands of an npz, its outputs and gradients into another; packed documents as its varlen sequences,
+each with a memory of its own."""
+
+NAMES = ("o", "final", "dq", "dk", "dv", "dg", "dbeta", "dh0")
 
 
-@pytest.mark.gpu(reason="the training shape's float64 distances, against fla's on this GPU")
-@pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float32])
-def test_the_port_is_as_exact_as_fla_at_the_training_shape(dtype):
-    """At Kimi Linear's training shape, each of the port's outputs and gradients is as near the float64
-    rule as fla 0.5.2's own on the same operands (`assert_as_exact_as_the_reference`), fla run in a
-    process of its own."""
-    if importlib.util.find_spec("fla") is None or importlib.util.find_spec("torch") is None:
-        pytest.skip("fla and torch are the GPU tier's reference, not installed here")
-    batch, length, heads, width = TRAINING
-    inputs = operands(batch, length, heads, heads, width, width, dtype, seed=61)
-    got = gradients(lambda *a: fla_kda.chunk_kda(*a, width ** -0.5, 64, interpret=False),
-                    inputs[-2].astype(jnp.float32), inputs[-1])(*inputs[:-2])
-    got = [np.asarray(x, np.float64) for x in got]
-    names = ("o", "final", "dq", "dk", "dv", "dg", "dbeta", "dh0")
+def fla_side(inputs, cuts, dtype) -> list[np.ndarray]:
+    """fla's outputs and gradients on `inputs` (one row), run in a process of its own. Packed into
+    documents at `cuts`, the row's memory is its first document's and its final memory and cotangent
+    its last's: the others start from zero and give theirs no cotangent."""
+    python = os.environ.get("DEW_FLA_PYTHON")
+    if not python:
+        pytest.skip("DEW_FLA_PYTHON names no interpreter with fla 0.5.2 and torch, the GPU tier's reference")
+    given = dict(zip(("q", "k", "v", "g", "beta", "h0", "do", "dht"),
+                     (np.asarray(x, np.float32) for x in inputs), strict=True))
+    if cuts is not None:
+        others = np.zeros((len(cuts) - 1, *given["h0"].shape[1:]), np.float32)
+        given["h0"] = np.concatenate([given["h0"], others])
+        given["dht"] = np.concatenate([others, given["dht"]])
+        given["cu_seqlens"] = np.asarray([*cuts, given["q"].shape[1]], np.int64)
     with tempfile.TemporaryDirectory() as root:
-        for name, x in zip(("q", "k", "v", "g", "beta", "h0", "do", "dht"), inputs, strict=True):
-            np.save(Path(root) / f"{name}.npy", np.asarray(x, np.float32))
-        subprocess.run([sys.executable, "-c", FLA_SIDE, root, jnp.dtype(dtype).name], check=True,
-                       env=dict(os.environ))
-        theirs = [np.load(Path(root) / f"fla_{name}.npy").astype(np.float64) for name in names]
-    # The float64 rule head by head, the heads independent, so a head's chunk products fit.
+        np.savez(Path(root) / "in.npz", **given)
+        subprocess.run([python, "-c", FLA_SIDE, Path(root) / "in.npz", Path(root) / "out.npz",
+                        jnp.dtype(dtype).name], check=True)
+        found = np.load(Path(root) / "out.npz")
+        theirs = {name: found[name].astype(np.float64) for name in NAMES}
+    theirs["final"], theirs["dh0"] = theirs["final"][-1:], theirs["dh0"][:1]
+    return [theirs[name] for name in NAMES]
+
+
+def float64_truth(inputs, cuts) -> list[np.ndarray]:
+    """The token recurrence's outputs and gradients in float64 (`recurrence`), a value head at a time
+    so a head's backward fits, each key head's gradients summed over the value heads it serves."""
+    q, k, v, g, beta, h0, do, dht = inputs
+    group = v.shape[2] // q.shape[2]
     with jax.enable_x64(new_val=True):
-        wide = [jnp.asarray(x) for x in widened(inputs)]
-        axes = (2, 2, 2, 2, 2, 1, 2, 1)
+        run = jax.jit(lambda q, k, v, g, beta, h0, do, dht: through(
+            functools.partial(recurrence, cuts=cuts), do, dht)(q, k, v, g, beta, h0))
+        heads = []
+        for head in range(v.shape[2]):
+            keyed = slice(head // group, head // group + 1)
+            valued = slice(head, head + 1)
+            sliced = (q[:, :, keyed], k[:, :, keyed], v[:, :, valued], g[:, :, valued], beta[:, :, valued],
+                      h0[:, valued], do[:, :, valued], dht[:, valued])
+            heads.append([np.asarray(x) for x in run(*wide(*sliced))])
+    found = [np.concatenate([leaves[i] for leaves in heads], axis=axis)
+             for i, axis in enumerate((2, 1, 2, 2, 2, 2, 2, 1))]
+    for i in (2, 3):
+        found[i] = found[i].reshape(*found[i].shape[:2], q.shape[2], group, -1).sum(axis=3)
+    return found
 
-        @jax.jit
-        def one(q, k, v, g, beta, h0, do, dht):
-            return gradients(math, do, dht)(q, k, v, g, beta, h0)
 
-        per_head = [one(*(jax.lax.slice_in_dim(x, h, h + 1, axis=axis)
-                          for x, axis in zip(wide, axes, strict=True))) for h in range(heads)]
-        exact = [np.concatenate([np.asarray(found[i]) for found in per_head], axis=axis)
-                 for i, axis in enumerate((2, 1, 2, 2, 2, 2, 2, 1))]
-    for name, mine, fla, value in zip(names, got, theirs, exact, strict=True):
-        assert_as_exact_as_the_reference(mine, fla, value, name)
+GPU_CASES = {
+    # Kimi Linear's KDA layer: 32 heads of 128 at a 4096-token row.
+    "training": ((4096, 32, 32, 128, 128), None),
+    # Two value heads a key head (fla's GVA).
+    "gva": ((4096, 16, 32, 128, 128), None),
+    # A length off the chunk grid and widths off the blocks', which `fla_rule` pads.
+    "padded": ((4000, 8, 8, 96, 96), None),
+    # Packed documents as fla's varlen sequences, on and off the chunk grid, one shorter than a chunk.
+    "packed": ((4096, 8, 8, 128, 128), (0, 1000, 1037, 2500)),
+}
+
+
+@pytest.mark.gpu(reason="float64 distances against fla's own on this GPU")
+@pytest.mark.parametrize("case, dtype", [("training", jnp.bfloat16), ("training", jnp.float32),
+                                         ("gva", jnp.bfloat16), ("padded", jnp.bfloat16),
+                                         ("packed", jnp.bfloat16)])
+def test_the_port_is_as_exact_as_fla(case, dtype):
+    """Each of the port's outputs and gradients through `fla_rule` is as near the float64 recurrence as
+    fla 0.5.2's own on the same operands (`assert_as_exact_as_the_reference`): at Kimi Linear's training
+    shape, with value heads sharing a key head, padded to the kernels' blocks, and packed."""
+    (length, key_heads, value_heads, width, columns), cuts = GPU_CASES[case]
+    inputs = operands(1, length, key_heads, value_heads, width, columns, dtype, seed=61)
+    rule = fla_rule
+    if cuts is not None:
+        starts = np.zeros((1, length), bool)
+        starts[0, list(cuts[1:])] = True
+        rule = functools.partial(fla_rule, starts=jnp.asarray(starts), max_segments=len(cuts))
+    mine = [np.asarray(x, np.float64) for x in
+            through(rule, inputs[-2].astype(jnp.float32), inputs[-1])(*inputs[:-2])]
+    theirs = fla_side(inputs, cuts, dtype)
+    for name, dew, fla, value in zip(NAMES, mine, theirs, float64_truth(inputs, cuts), strict=True):
+        assert_as_exact_as_the_reference(dew, fla, value, f"{case}/{name}")
