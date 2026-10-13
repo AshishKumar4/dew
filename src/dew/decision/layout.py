@@ -137,7 +137,7 @@ def _slots(count: int, order: Sequence[int] | None) -> list[int]:
 
 @dataclass(frozen=True)
 class Layout:
-    """How a state and its questions become rows of at most `max_len` tokens."""
+    """How a state and its questions become rows of tokens that fit `max_len` (`fits`)."""
 
     max_len: int = 512
     joint: ClassVar[bool] = False
@@ -157,6 +157,13 @@ class Layout:
         `image` text places in the row.
         """
         raise NotImplementedError
+
+    def fits(self, row: Encoded) -> bool:
+        """Whether `row` is within `max_len`. A layout cuts the state to fit
+        and keeps a schema whole, so a row whose schema alone passes
+        `max_len` does not fit: training leaves its example out (`Fit`),
+        counted as unfit, and a task refuses it."""
+        return len(row.tokens) <= self.max_len
 
 
 @dataclass(frozen=True)
@@ -328,7 +335,8 @@ class JointLayout(Layout):
     A choice's options come in the order of their keys, and a noul's as true,
     then false, with Clef's descriptions where the question gives none. The
     state is cut to `max_state_tokens`, and to what the schema leaves of
-    `max_len`; the schema itself is never cut.
+    `max_len`; the schema itself is never cut, so a schema longer than
+    `max_len` leaves no state and a row that does not fit (`fits`).
     """
 
     max_len: int = 16384
@@ -374,11 +382,7 @@ class JointLayout(Layout):
         whole = len(state_ids)
         if self.max_state_tokens is not None:
             state_ids = state_ids[:self.max_state_tokens]
-        fixed = len(prefix) + len(schema) + len(suffix)
-        if fixed > self.max_len:
-            raise ValueError(f"the schema needs {fixed} tokens before the state, more than the "
-                             f"maximum context length, max_len={self.max_len}")
-        state_ids = state_ids[:self.max_len - fixed]
+        state_ids = state_ids[:max(0, self.max_len - len(prefix) - len(schema) - len(suffix))]
         offset = len(prefix) + len(state_ids)
 
         def moved(span: tuple[int, int]) -> tuple[int, int]:
