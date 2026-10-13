@@ -67,7 +67,7 @@ from dew.nn.inputs import AttentionMetadata, coordinates_of
 from dew.nn.kernels import mamba_ssd
 from dew.nn.kernels.generation import first_refusal, measured_kernel, ran_kernel, triton_runs
 from dew.nn.kernels.ssd import ssd_chunk_scan, ssd_kernel_platform
-from dew.nn.linear import DepthwiseConv1d, causal_conv1d, conv_pieces, document_conv1d, held_scan
+from dew.nn.linear import DepthwiseConv1d, causal_conv1d, document_conv1d, held_scan
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.mixers.mamba import inverse_softplus_step
 from dew.nn.precision import at_least_fp32
@@ -397,12 +397,6 @@ class Mamba2(nn.Module):
     def conv_features(self) -> int:
         return self.intermediate_size + 2 * self.n_groups * self.state_size
 
-    @property
-    def conv_parts(self) -> tuple[tuple[int, None], ...]:
-        """The conv's output as the scan's three operands, `x`, `B` and `C`, each its own dense array
-        out of the conv (`causal_conv1d`'s `parts`) where slices of one would be copied into a kernel."""
-        return ((self.intermediate_size, None), *((self.n_groups * self.state_size, None),) * 2)
-
     def setup(self):
         if self.num_heads % self.n_groups:
             raise ValueError(
@@ -468,7 +462,7 @@ class Mamba2(nn.Module):
             out = held_scan(self, mixed, taps, bias, functools.partial(scan, dt=dt, heads=heads),
                             (self.num_heads, self.head_dim, self.state_size),
                             decode=decode, coordinates=tokens, state_dtype=wide, conv_dtype=wide,
-                            parts=self.conv_parts, dtype=compute)
+                            dtype=compute)
             if out is None:
                 # Allocation only, as the delta net: init_cache's dummy token
                 # must not consume a position or leave state behind.
@@ -477,24 +471,23 @@ class Mamba2(nn.Module):
                 out = jnp.where(valid[:, :, None], out, 0)
         elif shards > 1:
             # Wide across the shards, so a halo's gradient and its shard's own add before rounding.
-            out = _over_sequence(functools.partial(_sequence_mix, scan=scan, parts=self.conv_parts,
-                                                   dtype=compute, axis=SEQUENCE_AXIS),
+            out = _over_sequence(functools.partial(_sequence_mix, scan=scan, dtype=compute,
+                                                   axis=SEQUENCE_AXIS),
                                  shards, mixed.astype(wide), dt, tokens.segments, tokens.starts,
                                  (taps, bias, *heads))
         else:
             out = _sequence_mix(mixed, dt, tokens.segments, tokens.starts, (taps, bias, *heads), scan=scan,
-                                parts=self.conv_parts, dtype=compute)
+                                dtype=compute)
         return self.out_proj(self.norm(out, gate))
 
 
 
-def _ssd(pieces, dt, heads, *, num_heads: int, head_dim: int, n_groups: int,
+def _ssd(convolved, dt, heads, *, num_heads: int, head_dim: int, n_groups: int,
          state_size: int, chunk_size: int, time_step_limit, starts=None, valid=None, held=None,
          axis: str | None = None):
-    """The scan after the conv: its `pieces`, `x` `[B, S, H * P]`, `B` and
-    `C` `[B, S, G * N]` (`Mamba2.conv_parts`), the step through softplus with
-    its bias and the limit, then the recurrent step for one token and the
-    chunked scan otherwise.
+    """The scan after the conv: `convolved` `[B, S, conv_dim]` split into
+    `x`, `B` and `C`, the step through softplus with its bias and the limit,
+    then the recurrent step for one token and the chunked scan otherwise.
     Returns the output `[B, S, H * P]` and the zero-start state leaving it.
 
     Under `axis` the scan runs from zero and the output gains `C_t . exp(acs_t)
@@ -502,8 +495,9 @@ def _ssd(pieces, dt, heads, *, num_heads: int, head_dim: int, n_groups: int,
     this shard's `A dt` (a `RESET_DECAY` in it zeroes the term). The zero-start
     final state is the shard's write `B_r` (`_entering_state`)."""
     dt_bias, A, D = heads
-    xs, B, C = pieces
-    batch, length, intermediate = xs.shape
+    batch, length, _ = convolved.shape
+    intermediate = num_heads * head_dim
+    xs, B, C = jnp.split(convolved, [intermediate, intermediate + n_groups * state_size], axis=-1)
     xs = xs.reshape(batch, length, num_heads, head_dim)
     B = B.reshape(batch, length, n_groups, state_size)
     C = C.reshape(batch, length, n_groups, state_size)
@@ -528,12 +522,12 @@ def _ssd(pieces, dt, heads, *, num_heads: int, head_dim: int, n_groups: int,
     return out.reshape(batch, length, intermediate), final
 
 
-def _sequence_mix(mixed, dt, segments, starts, weights, *, scan, parts, dtype, axis: str | None = None):
+def _sequence_mix(mixed, dt, segments, starts, weights, *, scan, dtype, axis: str | None = None):
     """The conv and the scan over whole training sequences, or over this
     shard's slice of them inside a `shard_map` that holds `axis` manual.
 
     `mixed` `[B, S, conv_dim]` the projection, convolved in at least fp32
-    and handed to the scan as its `parts` in `dtype`, the model's compute dtype, `dt`
+    and handed to the scan in `dtype`, the model's compute dtype, `dt`
     `[B, S, H]` in fp32, `segments` `[B, S]` and their documents' `starts` or None, `weights` the
     conv's taps and bias and the heads' `dt_bias`, `A` and `D`. Under `axis`
     the conv reads the previous shard's last `K-1` tokens and segments by one
@@ -553,18 +547,17 @@ def _sequence_mix(mixed, dt, segments, starts, weights, *, scan, parts, dtype, a
         forward = [(shard, shard + 1) for shard in range(shards - 1)]
         history = jax.lax.ppermute(mixed[:, length - width:], axis, forward)
     if segments is None and forward is None:
-        pieces = causal_conv1d(mixed, taps, bias=bias, parts=parts, dtype=dtype)
+        convolved = causal_conv1d(mixed, taps, bias=bias, dtype=dtype)
     elif segments is None:
         stream = jnp.concatenate([history, mixed], axis=1)
-        pieces = tuple(piece[:, width:] for piece in
-                       causal_conv1d(stream, taps, bias=bias, parts=parts, dtype=dtype))
+        convolved = causal_conv1d(stream, taps, bias=bias, dtype=dtype)[:, width:]
     else:
         if forward is None:
             before = jnp.broadcast_to(segments[:, :1], (batch, width))
         else:
             before = jax.lax.ppermute(segments[:, length - width:], axis, forward)
-        pieces = conv_pieces(document_conv1d(history, mixed, before, segments, taps, bias), parts, dtype)
-    out, _ = scan(pieces, dt, (dt_bias, A, D), starts=starts, axis=axis)
+        convolved = document_conv1d(history, mixed, before, segments, taps, bias).astype(dtype)
+    out, _ = scan(convolved, dt, (dt_bias, A, D), starts=starts, axis=axis)
     return out
 
 
