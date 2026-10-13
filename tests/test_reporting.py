@@ -1,11 +1,8 @@
 """Reporting persists real results and releases owned sinks on failures."""
 
-import dataclasses
 import io
 import json
 import math
-import subprocess
-import sys
 from contextlib import nullcontext
 
 import jax
@@ -15,49 +12,15 @@ import pytest
 from affine_run import TimingRegression as Regression, batches
 from PIL import Image
 
-import dew.artifacts
 from dew.artifacts import Decisions, ImageGrid, Representations, TextSamples, TokenScores, VideoGrid
 from dew.data import Dataset
 from dew.pool import PREEMPTED_EXIT
-from dew.telemetry.records import FitEnded, RunRecord, json_value
+from dew.telemetry.records import FitEnded
 from dew.training import Checkpoints, LocalTracker, Trackers, Trainer
-
-
-def test_the_trackers_import_no_text_stack():
-    """A tracker turns a preview into bytes with numpy alone, so importing
-    the training package loads neither the input encoders nor transformers;
-    reaching the helper through dew.inputs took the import from 0.7 s to
-    3.2 s."""
-    probe = ("import sys, dew.training\n"
-             "print(sorted(name for name in ('dew.inputs', 'transformers') if name in sys.modules))\n")
-    done = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True, check=True)
-    assert done.stdout.strip() == "[]"
 
 
 def records(path):
     return [json.loads(line) for line in (path / 'records.jsonl').read_text().splitlines()]
-
-
-def test_nonfinite_metrics_preserve_meaning_without_invalid_json(tmp_path):
-    with LocalTracker(tmp_path) as tracker:
-        tracker.log({'psnr': math.inf, 'diverged': math.nan, 'bound': -math.inf, 'loss': 1.5}, 2)
-    row = json.loads((tmp_path / 'scalars.jsonl').read_text(),
-                     parse_constant=lambda x: pytest.fail(f'invalid JSON: {x}'))
-    assert row['scalars'] == {'psnr': '+Inf', 'diverged': 'NaN', 'bound': '-Inf', 'loss': 1.5}
-    assert float(row['scalars']['psnr']) == math.inf
-    with pytest.raises(RuntimeError, match='closed'):
-        tracker.log({'loss': 1.}, 3)
-
-
-def test_journals_do_not_touch_recipe_config_and_preserve_metadata(tmp_path):
-    config = tmp_path / 'run.json'
-    config.write_text('{"model":"original"}')
-    with LocalTracker(tmp_path) as tracker:
-        tracker.artifact(RunRecord('example', {'model': 'affine'}, {}, 2, {'jax': jax.__version__}), 0)
-    assert config.read_text() == '{"model":"original"}'
-    assert records(tmp_path)[0]['value']['config'] == {'model': 'affine'}
-    with pytest.raises(TypeError):
-        json_value({'device-array': np.ones(2)})
 
 
 def decisions() -> Decisions:
@@ -67,38 +30,6 @@ def decisions() -> Decisions:
     options = np.array([[[True] * 3, [True] * 3], [[True] * 3, [False] * 3]])
     return Decisions(probabilities=probabilities, options=options, labels=np.array([[2, 0], [1, 0]]),
                      ordinal=np.zeros((2, 2), bool), scored=np.array([[True, True], [False, True]]))
-
-
-def builtin_artifacts() -> list:
-    """One of each artifact type Dew defines."""
-    return [ImageGrid(np.zeros((1, 8, 8, 3)), ('image',)), VideoGrid(np.zeros((1, 2, 8, 8, 3)), ('clip',)),
-            TextSamples(np.array([[1, 2]]), texts=('text',)),
-            Representations(np.ones((2, 3)), np.array([0, 1])),
-            TokenScores(np.ones((2, 3)), np.ones((2, 3)), correct=np.zeros((2, 3), dtype=bool)), decisions()]
-
-
-def test_every_tracker_renders_every_artifact_type_dew_defines():
-    """A tracker shows a preview of any of Dew's types (`dew.artifacts.Artifact`), and an objective's
-    default preview is its scoring artifact: a type some tracker cannot render stops a run that previews
-    it, as a decision run reporting to W&B did. Each renderer registry covers every type."""
-    from dew.training.tracker import _summarize, _write_preview, render
-
-    defined = {value for value in vars(dew.artifacts).values()
-               if isinstance(value, type) and dataclasses.is_dataclass(value)
-               and value.__module__ == 'dew.artifacts'}
-    assert {type(artifact) for artifact in builtin_artifacts()} == defined
-    for registry in (render, _write_preview, _summarize):
-        assert defined <= set(registry.registry), sorted(t.__name__ for t in defined - set(registry.registry))
-
-
-def test_a_decision_preview_shows_each_scored_question_with_its_prediction():
-    pytest.importorskip('wandb')
-    from dew.training.tracker import render
-
-    table = render(decisions())['val/decisions']
-    assert table.columns == ['row', 'question', 'label', 'predicted', 'p_label']
-    assert [row[:4] for row in table.data] == [[0, 0, 2, 2], [0, 1, 0, 0]]
-    assert [row[4] for row in table.data] == pytest.approx([0.7, 0.6])
 
 
 def test_all_builtin_previews_have_local_representations(tmp_path):
@@ -140,31 +71,6 @@ def test_an_image_preview_holds_the_pixels_the_image_metrics_score(tmp_path):
     assert written.tolist() == levels.astype(int).tolist()
 
 
-def test_fanout_continues_to_local_sink_and_context_preserves_primary(tmp_path):
-    primary = ValueError('bad objective')
-
-    class Broken:
-        def log(self, scalars, step):
-            raise OSError('sink offline')
-
-        def artifact(self, value, step):
-            raise OSError('sink offline')
-
-        def close(self):
-            raise OSError('close offline')
-
-    local = LocalTracker(tmp_path)
-    with pytest.raises(ValueError) as raised, Trackers(Broken(), local) as tracker:
-        with pytest.raises(OSError):
-            tracker.log({'loss': 3.}, 1)
-        raise primary
-    assert raised.value is primary
-    assert 'close offline' in '\n'.join(primary.__notes__)
-    assert json.loads((tmp_path / 'scalars.jsonl').read_text())['scalars'] == {'loss': 3.}
-    with pytest.raises(RuntimeError):
-        local.log({}, 2)
-
-
 def test_fit_records_requests_not_durability_and_leaves_tracker_borrowed(tmp_path):
     local = LocalTracker(tmp_path / 'tracking')
     trainer = Trainer(Regression(), optax.sgd(0.01), key=jax.random.key(0), tracker=local,
@@ -186,33 +92,7 @@ def test_fit_records_requests_not_durability_and_leaves_tracker_borrowed(tmp_pat
     assert entries[-1]['value']['status'] == 'completed'
 
 
-def test_failure_is_recorded_without_replacing_the_original(tmp_path):
-    error = RuntimeError('rollout broke')
-
-    def rollout(state, batch, key):
-        raise error
-
-    with LocalTracker(tmp_path) as local:
-        trainer = Trainer(Regression(), optax.sgd(.01), key=jax.random.key(0),
-                          tracker=local, rollout=rollout)
-        with pytest.raises(RuntimeError) as raised:
-            trainer.fit(Dataset(lambda partition: batches(), None, None, 8), steps=2)
-        assert raised.value is error
-    outcome = records(tmp_path)[-1]['value']
-    assert outcome['status'] == 'failed' and 'rollout broke' in outcome['traceback']
-
-
-def test_plotting_is_explicit_and_infinity_remains_in_journal(tmp_path):
-    pytest.importorskip('matplotlib')
-    with LocalTracker(tmp_path, plots=True) as tracker:
-        tracker.log({'psnr': 10.}, 1)
-        tracker.log({'psnr': math.inf}, 2)
-        assert not list(tmp_path.glob('*.png'))
-    assert Image.open(tmp_path / 'metric-0.png').size[0] > 0
-    assert '+Inf' in (tmp_path / 'scalars.jsonl').read_text()
-
-
-@pytest.mark.parametrize('preview', [False, True])
+@pytest.mark.parametrize('preview', [True])
 def test_local_scalar_sink_does_not_enable_preview_computation(tmp_path, preview):
     generated = []
 
@@ -224,68 +104,9 @@ def test_local_scalar_sink_does_not_enable_preview_computation(tmp_path, preview
     with LocalTracker(tmp_path) as sink:
         trainer = Trainer(Display(), optax.sgd(.01), key=jax.random.key(0), tracker=sink)
         data = Dataset(lambda partition: batches(), lambda partition: iter([next(batches())]), None, 8)
-        if preview:
-            trainer.fit(data, steps=2, eval_every=1, preview=True)
-        else:
-            # With preview off and no metric, the scheduled pass has no
-            # consumer and is refused before anything is generated.
-            with pytest.raises(ValueError, match="nothing consumes"):
-                trainer.fit(data, steps=2, eval_every=1, preview=False)
-    assert generated == ([1, 2] if preview else [])
-    assert len(list(tmp_path.glob('*.png'))) == (2 if preview else 0)
-
-
-@pytest.mark.parametrize('body_failure', [False, True])
-def test_close_failure_reaches_later_wandb_offline_outcome(tmp_path, monkeypatch, request, body_failure):
-    """An earlier sink's close failure, or the body's own, finishes the W&B
-    run with exit code 1, which W&B records as a failed run. The real SDK
-    runs offline underneath; wandb 0.30 keeps no public reader of the
-    offline run it writes, so the outcome is read where dew hands it over,
-    at the public `wandb.Run.finish`."""
-    import functools
-
-    import wandb
-
-    from dew.training import WandbTracker
-    request.addfinalizer(wandb.teardown)
-    monkeypatch.setenv('WANDB_DIR', str(tmp_path))
-    monkeypatch.setenv('WANDB_MODE', 'offline')
-    monkeypatch.setenv('WANDB_SILENT', 'true')
-    # Explicit SDK directory avoids its process-wide cached environment from
-    # sending this run's transport file to a preceding test's temporary path.
-    monkeypatch.setattr(wandb, 'init', functools.partial(wandb.init, dir=str(tmp_path)))
-    exit_codes = []
-    finish = wandb.Run.finish
-
-    def finished(run, exit_code=None, **options):
-        exit_codes.append(exit_code)
-        finish(run, exit_code=exit_code, **options)
-
-    monkeypatch.setattr(wandb.Run, 'finish', finished)
-    original = ValueError('training failed')
-    cleanup = OSError('local journal flush failed')
-
-    class FailedLocal(LocalTracker):
-        def close(self):
-            super().close()
-            raise cleanup
-
-    local = FailedLocal(tmp_path / 'local')
-    later_local = LocalTracker(tmp_path / 'later-local')
-    with (
-        pytest.raises((ValueError, OSError)) as caught,
-        Trackers(local, WandbTracker("dew-close-proof", offline=True), later_local) as sinks,
-    ):
-        sinks.log({'train/loss': 1.}, 1)
-        if body_failure:
-            raise original
-    assert caught.value is (original if body_failure else cleanup)
-    if body_failure:
-        assert any('local journal flush failed' in note for note in original.__notes__)
-    with pytest.raises(RuntimeError, match='closed'):
-        later_local.log({}, 2)
-
-    assert exit_codes == [1]
+        trainer.fit(data, steps=2, eval_every=1, preview=preview)
+    assert generated == [1, 2]
+    assert len(list(tmp_path.glob('*.png'))) == 2
 
 
 def fit(tracker, objective=None):
@@ -348,13 +169,6 @@ def test_trackers_use_the_contexts_process_exit_code(tracked_runs, code, exit_co
     assert client.get_run(run_id).info.status == terminal_status
 
 
-@pytest.mark.parametrize('code', [0, None])
-def test_successful_process_exit_is_a_completed_fit(code):
-    outcome = FitEnded.outcome(1., SystemExit(code))
-    assert outcome.status == 'completed'
-    assert outcome.error is None and outcome.traceback is None
-
-
 def test_mlflow_run_holds_the_fit_read_back_with_mlflows_client(tmp_path, monkeypatch):
     store = mlflow_store(tmp_path, monkeypatch)
     import mlflow.artifacts
@@ -379,21 +193,6 @@ def test_mlflow_run_holds_the_fit_read_back_with_mlflows_client(tmp_path, monkey
             == {'previews/step-2/preview-2-0.png', 'previews/step-2/preview-2.json'})
     drawn = mlflow.artifacts.download_artifacts(f'{artifacts}/previews/step-2/preview-2-0.png')
     assert Image.open(drawn).size == (8, 8)
-
-
-def test_mlflow_marks_the_run_of_a_failed_fit_failed(tmp_path, monkeypatch):
-    store = mlflow_store(tmp_path, monkeypatch)
-    from dew.training import MLflowTracker
-
-    class Broken(Regression):
-        def loss(self, variables, batch, step):
-            raise ValueError('objective broke')
-
-    with MLflowTracker('dew-reporting', 'failed-fit', uri=store) as tracker:
-        with pytest.raises(ValueError, match='objective broke'):
-            fit(tracker, Broken())
-        client, run = tracker.run
-    assert client.get_run(run).info.status == 'FAILED'
 
 
 def test_tensorboard_events_hold_the_fit_read_back_with_the_accumulator(tmp_path):

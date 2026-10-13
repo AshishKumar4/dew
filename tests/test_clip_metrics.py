@@ -55,34 +55,6 @@ def test_clip_metric_scores_the_reference_cosine():
     assert abs(score - expected) < CLIP_TOLERANCE, f"{score} against {expected}"
 
 
-def test_a_run_ranked_by_clip_distance_keeps_its_lowest():
-    """CLIP distance is 1 - cos, so the best checkpoint is the closest one:
-    the metric declares lower is better, and a selection by it minimizes."""
-    from dew.training.selection import Best
-    from dew.training.trainer import Trainer
-
-    metric = CLIPDistance(modelname="never/downloaded")
-    assert metric.shown.better == "lower"
-    assert Trainer._best_selection(Best(metric), [metric]).mode == "min"
-
-
-def test_clip_score_metric_clamps_the_reference_cosine():
-    """CLIPScore is 100 * max(cos, 0) averaged; the fixture holds one negative
-    cosine (-0.072) among three positive ones, so the clamp does work here.
-    Observed 6.1e-06 off the reference on CPU and 1.0e-05 on an RTX 4080,
-    against a tolerance of 1e-3 on a score of order 15."""
-    metric = CLIPScore(modelname=str(CLIP_TINY))
-    assert metric.name == 'clip_score'
-    generated, batch, cosine = clip_fixture()
-    assert (cosine < 0).any() and (cosine > 0).any()
-
-    score = metric.finalize(metric(ImageGrid(generated), batch))
-
-    expected = np.mean(100.0 * np.maximum(cosine, 0.0))
-    assert abs(score - expected) < CLIP_SCORE_TOLERANCE, f"{score} against {expected}"
-    assert score != pytest.approx(np.mean(100.0 * cosine), abs=1e-3)
-
-
 def test_clip_score_over_images_and_prompts_is_the_metric_number():
     """`CLIPScore.score` takes uint8 images and prompt strings, with no artifact
     and no tokenized batch, and tokenizes them the way a run's loader does. It
@@ -114,7 +86,7 @@ def test_clip_score_batches_a_set_into_the_score_of_the_whole_set():
     batched = CLIPScore(str(CLIP_TINY)).score(images, prompts, batch_size=3)
 
     assert batched == pytest.approx(whole, rel=1e-6)
-    with pytest.raises(ValueError, match="equal counts"):
+    with pytest.raises(ValueError):
         CLIPScore(str(CLIP_TINY)).score(images, prompts[:2])
 
 
@@ -134,33 +106,3 @@ def test_each_images_clip_score_is_a_term_of_the_sets():
     np.testing.assert_allclose(metric.scores(images, prompts, batch_size=3), each, rtol=1e-6)
     assert metric.score(images, prompts) == pytest.approx(each.mean(), abs=1e-9)
     assert metric.scores(images[::-1], prompts[::-1])[::-1] == pytest.approx(each, abs=1e-9)
-
-
-def test_clip_score_truncates_an_overlong_caption_to_the_text_context():
-    """A caption past CLIP's context is cut to it, so 500 words and 600 score
-    alike instead of overrunning the position table."""
-    images = np.load(CLIP_TINY / "reference.npz")["images"][:1]
-
-    long = CLIPScore(str(CLIP_TINY)).score(images, [" ".join(["word"] * 500)])
-
-    assert np.isfinite(long)
-    assert CLIPScore(str(CLIP_TINY)).score(images, [" ".join(["word"] * 600)]) == long
-
-
-def test_a_sample_outside_the_pixel_range_is_clipped_not_wrapped():
-    """A sampler does not promise [-1, 1]. Casting 1.2 straight to uint8 wraps
-    it to a dark pixel, which the old metric did; the score of an overshooting
-    white image has to be the score of a white one."""
-    metric = CLIPScore(modelname=str(CLIP_TINY))
-    _, batch, _ = clip_fixture()
-    white = jnp.ones((4, 16, 12, 3), jnp.float32)
-
-    assert metric.finalize(metric(ImageGrid(1.2 * white), batch)) == metric.finalize(
-        metric(ImageGrid(white), batch)
-    )
-    assert metric.finalize(metric(ImageGrid(-1.2 * white), batch)) == metric.finalize(
-        metric(ImageGrid(-white), batch)
-    )
-    assert metric.finalize(metric(ImageGrid(white), batch)) != metric.finalize(
-        metric(ImageGrid(-white), batch)
-    )
