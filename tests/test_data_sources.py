@@ -1239,8 +1239,9 @@ def test_from_iter_closes_the_native_file_before_restoring_and_on_close(tmp_path
             self.file.close()
             events.append(("close", self.index))
 
+    # Without a native position, the stream resumes by replay, which it declares.
     options = ({"state": lambda it: it.file.tell(), "load_state": lambda it, saved: it.file.seek(saved)}
-               if native_state else {})
+               if native_state else {"replay": True})
     source = from_iter(Native, name="native-file@1", **options)
     manifest = source.manifest()
     reader = iter(manifest.reader(manifest.shards[0]))
