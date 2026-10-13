@@ -36,7 +36,7 @@
       "wrappers": []
     },
     "data": {
-      "class": "dew.data.recipes:Images",
+      "class": "dew.config.data:ImageData",
       "fields": {
         "source": {
           "class": "dew.data.sources.files:Files",
@@ -47,7 +47,7 @@
             "format": "arrayrecord",
             "index": null,
             "columns": null,
-            "filter": null,
+            "where": null,
             "partitioning": "hive",
             "shard_bytes": 67108864,
             "storage_options": null,
@@ -76,7 +76,7 @@
           "backend": "host"
         },
         "validation": {
-          "class": "dew.data.recipes:HoldOut",
+          "class": "dew.data.holdout:HoldOut",
           "fields": {
             "records": 512,
             "fraction": null,
@@ -125,10 +125,13 @@
       "key": 0,
       "steps": 1350000,
       "epochs": null,
+      "total_tokens": null,
       "log_every": 100,
       "eval_every": "epoch",
       "checkpoint_every": "epoch",
+      "checkpoint_final": true,
       "accumulation": 1,
+      "split": null,
       "batch_ramp": null,
       "dynamic_scale": false,
       "mesh": {
