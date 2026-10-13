@@ -24,9 +24,11 @@ fp32 as the reference casts. The decode step is `mamba2_selective_state_update`
 (192-251). Both live here beside their gated-delta-rule counterparts'
 shapes so tests/test_mamba2.py can hold them to the reference's numbers.
 
-The scan over the chunks is `xla_chunk_scan`, the oracle, and on a TPU whose
-tiling covers the geometry `dew.nn.kernels.ssd`'s Pallas kernel, chosen at
-trace time. Decoding stays on the recurrent form either way.
+On a GPU whose target row names it the chunked scan is mamba_ssm's own
+kernels (`dew.nn.kernels.mamba_ssd`, `ssd_port_refusal` names where not);
+elsewhere the scan over the chunks is `xla_chunk_scan`, the oracle, or on a
+TPU whose tiling covers the geometry `dew.nn.kernels.ssd`'s Pallas kernel,
+chosen at trace time. Decoding stays on the recurrent form either way.
 
 Around the scan: `in_proj` yields `[z, x, B, C, dt]` in that order
 (`projected_states.split([intermediate, conv_dim, num_heads])`, 484-486,
@@ -46,6 +48,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import math
 
 import jax
 import jax.numpy as jnp
@@ -53,21 +56,25 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 from jax.sharding import PartitionSpec as P
 
-from dew.nn.attention import unweighted_rmsnorm
+from dew.nn.attention import FORWARD_MODE, unweighted_rmsnorm
 from dew.nn.blocks import normal_kernel
 from dew.nn.flops import conv_flops, projection_flops, ssd_flops
 from dew.nn.inputs import AttentionMetadata, coordinates_of
+from dew.nn.kernels import mamba_ssd
+from dew.nn.kernels.generation import first_refusal, measured_kernel, ran_kernel, triton_runs
 from dew.nn.kernels.ssd import ssd_chunk_scan, ssd_kernel_platform
 from dew.nn.linear import DepthwiseConv1d, causal_conv1d, document_conv1d, held_scan
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.mixers.mamba import inverse_softplus_step
 from dew.nn.precision import at_least_fp32
 from dew.nn.sharding import (
+    HEADS,
     SEQUENCE_AXIS,
     LayoutRefused,
     logical_axes,
     logical_spec,
     manual_map,
+    mesh_axes,
     rows_like,
     sequence_shards,
 )
@@ -185,13 +192,22 @@ def chunk_ssd(x, dt, A, B, C, D, state=None, chunk_size: int = CHUNK_SIZE, start
     `[H]`, `B` and `C` `[B, S, G, N]`, `D` `[H]`; returns `(output [B, S, H, P],
     state [B, H, P, N])` computed in `at_least_fp32` and cast back. `starts`
     `[B, S]` marks packed documents' first tokens, whose entering state drops.
-    The chunk scan runs on the Pallas kernel where `ssd_kernel_platform` takes
-    the geometry, else `xla_chunk_scan` (tests/test_ssd_kernel.py).
+    Where `ssd_port_refusal` takes the call the whole scan is mamba_ssm's
+    kernels (`_ported`); else the chunk scan runs on the TPU's Pallas kernel
+    where `ssd_kernel_platform` takes the geometry, else `xla_chunk_scan`
+    (tests/test_ssd_kernel.py).
     """
     dtype, work = x.dtype, at_least_fp32(x.dtype)
     x, dt, A, B, C, D = (jnp.asarray(t, work) for t in (x, dt, A, B, C, D))
     batch, length, heads, head_dim = x.shape
     state_size = B.shape[-1]
+    carried = (rows_like(jnp.zeros((batch, heads, head_dim, state_size), work), x) if state is None
+               else jnp.asarray(state, work))
+    refusal = ssd_port_refusal(x, B, chunk_size)
+    if refusal is None:
+        out, final = _ported(x, dt, A, B, C, D, carried, chunk_size, starts)
+        return out.astype(dtype), final.astype(dtype)
+    ran_kernel('ssd', 'xla', refusal)
     B, C = _expand_groups(B, heads), _expand_groups(C, heads)
     pad = (chunk_size - length % chunk_size) % chunk_size
     x, B, C = (jnp.pad(t, ((0, 0), (0, pad), (0, 0), (0, 0))) for t in (x, B, C))
@@ -209,13 +225,62 @@ def chunk_ssd(x, dt, A, B, C, D, state=None, chunk_size: int = CHUNK_SIZE, start
 
     x_c, B_c, C_c = chunks(x), chunks(B), chunks(C)         # [NC, B, C, H, ...]
     a_c = jnp.moveaxis(chunks(a), 3, 2)                     # [NC, B, H, C]
-    carried = (rows_like(jnp.zeros((batch, heads, head_dim, state_size), work), x) if state is None
-               else jnp.asarray(state, work))
     platform = ssd_kernel_platform(chunk_size, head_dim, state_size, dtype=work)
     scanned, final = (xla_chunk_scan(x_c, B_c, C_c, a_c, carried) if platform is None else
                       ssd_chunk_scan(x_c, B_c, C_c, a_c, carried, platform))
     output = jnp.moveaxis(scanned, 0, 1).reshape(batch, total, heads, head_dim) + skip
     return output[:, :length].astype(dtype), final.astype(dtype)
+
+
+def ssd_port_refusal(x, B, chunk_size: int) -> str | None:
+    """Why a chunked scan over these operands runs the XLA scan rather than
+    mamba_ssm's kernels (`mamba_ssd.ssd_scan`), or None where the port takes
+    it: on every GPU whose target row names it (`measured_kernel`), except
+    inside `jax.jvp`'s traces (`FORWARD_MODE`), which the port's custom VJP
+    gives no tangent; inside a caller's `shard_map` that checks varying axes
+    over operands that vary, where a Pallas call, which states no varying
+    type for its results, cannot run; float64 operands, whose scan is the
+    reference math itself; and head widths, state widths or chunks that are
+    not powers of two of at least 16, the smallest block Triton's dot takes."""
+    widths = (x.shape[-1], B.shape[-1], chunk_size)
+    return first_refusal(
+        (measured_kernel('ssd', 'xla') == 'pallas',
+         "the device's target row (generation.TARGETS) does not name the port"),
+        (not FORWARD_MODE.get(), "forward_mode_attention traces for jax.jvp, which the port's custom VJP "
+                                 "gives no tangent"),
+        (not jax.typeof(x).mat.varying,
+         "a shard_map that checks varying axes holds the operands, and a Pallas call states no "
+         "varying type for its results"),
+        (jnp.dtype(x.dtype) != jnp.float64, "float64 operands, whose scan is the reference math itself"),
+        (all(width >= 16 and width & (width - 1) == 0 for width in widths),
+         f"head width {widths[0]}, state {widths[1]} and chunk {widths[2]}; the port takes powers of "
+         "two of at least 16"),
+    )
+
+
+def _ported(x, dt, A, B, C, D, state, chunk_size: int, starts):
+    """The scan on mamba_ssm's kernels, each token's document counted from
+    `starts` (mamba_ssm's `seq_idx`). On a mesh it runs per shard
+    (`manual_map`): rows where the rules split them, and heads with their
+    groups where the head split divides the groups, the time axis whole;
+    off a GPU its kernels interpret, as the CPU suite runs them."""
+    interpret = not triton_runs()
+    seq = None if starts is None else jnp.cumsum(starts, axis=1, dtype=jnp.int32)
+
+    def scan(x, dt, A, B, C, D, state, *seq):
+        return mamba_ssd.ssd_scan(x, dt, A, B, C, D, state, *(seq or (None,)), chunk_size, interpret)
+
+    operands = (x, dt, A, B, C, D, state, *([] if seq is None else [seq]))
+    mesh = jax.sharding.get_abstract_mesh()
+    if mesh.empty or set(mesh.axis_names) <= set(mesh.manual_axes):
+        return scan(*operands)
+    spec = logical_spec(HEADS, x.shape)
+    rows, heads = (spec[i] if i < len(spec) else None for i in (0, 2))
+    if B.shape[2] % math.prod(mesh.shape[axis] for axis in mesh_axes(heads)):
+        heads = None
+    four, held = P(rows, None, heads, None), P(rows, heads, None, None)
+    specs = (four, P(rows, None, heads), P(heads), four, four, P(heads), held, P(rows, None))
+    return manual_map(scan, specs[:len(operands)], (four, held))(*operands)
 
 
 def recurrent_ssd(x, dt, A, B, C, D, state=None, starts=None):
