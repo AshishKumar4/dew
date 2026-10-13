@@ -105,6 +105,9 @@ def held_reads(index: jax.Array, positions: jax.Array) -> jax.Array:
     ("q_proj",): ("embed", "heads"),
     ("k_proj",): ("embed", "kv"),
     ("v_proj",): ("embed", "kv"),
+    # The output gate's own projection (`gate_projection='own'`) is per head
+    # like the query's; the longer suffix outranks the MLP's `gate_proj`.
+    ("self_attn", "gate_proj"): ("embed", "heads"),
     ("o_proj",): ("attention", "embed"),
 })
 class _Masking(NamedTuple):
