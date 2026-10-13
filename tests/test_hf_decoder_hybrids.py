@@ -11,6 +11,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from model_support import flat_tree
+from reference_error import assert_leaves_as_exact
 from test_hf_decoders import fixture_config, fp32_decoder, scaled_difference
 
 from dew.interop.hf_decoders import translate_config, translate_weights
@@ -144,9 +145,13 @@ def test_qwen35_logits_match_the_reference_implementation():
 
 
 def test_a_qwen35_checkpoint_decodes_as_it_scores_in_parallel():
-    """The loaded weights through the cache: a prefill and single-token
-    steps against the parallel forward, every argmax equal. Largest
-    observed logit difference 1.3e-05."""
+    """The loaded weights through the cache: a prefill and single-token steps
+    against the parallel forward, every argmax equal, and the steps' logits as
+    near a float64 forward as the parallel forward's (`assert_leaves_as_exact`).
+    On a CPU both run the portable math (RMS 4.5e-06 and 4.9e-06 from float64);
+    on a GPU the parallel forward runs the gated delta net's port, whose fp32
+    products are TF32 as fla's are (1.0e-05 on an H100, 1.2e-04 at most), and
+    the steps' fp32 recurrence 2.0e-06."""
     directory = FIXTURES / "qwen35-tiny"
     model, variables = fp32_decoder(directory, max_seq_len=16)
     ids = jnp.asarray(np.load(directory / "input_ids.npy"), jnp.int32)
@@ -163,8 +168,13 @@ def test_a_qwen35_checkpoint_decodes_as_it_scores_in_parallel():
         steps.append(logits[:, -1])
     incremental = jnp.stack(steps, axis=1)
 
-    difference = float(jnp.abs(full[:, 3:] - incremental).max())
-    assert difference < 1e-4, f"max |logit difference| {difference:.3e}"
+    with jax.enable_x64(new_val=True):
+        wide = jax.tree.map(lambda x: jnp.asarray(np.asarray(x, np.float64))
+                            if jnp.issubdtype(x.dtype, jnp.floating) else x, variables)
+        truth = np.asarray(model.clone(dtype=jnp.float64).apply(wide, ids), np.float64)[:, 3:]
+    # The head sums the model's width into each logit.
+    assert_leaves_as_exact(np.asarray(incremental), np.asarray(full[:, 3:]), truth,
+                           reductions=model.emb_features)
     assert jnp.array_equal(full[:, 3:].argmax(-1), incremental.argmax(-1))
 
 
