@@ -60,6 +60,24 @@ def test_a_grouped_model_saves_in_the_remote_codes_layout(tmp_path):
                                   loaded.model.apply(loaded.variables, ids))
 
 
+def test_a_single_group_exports_as_llama_with_its_yarn(tmp_path):
+    """The 0.9B's shape, one group under YaRN, exports as Llama, whose norm
+    is the same product in fp32 and whose rotary builds the same YaRN:
+    transformers' LlamaForCausalLM reads it back within the float64 gate."""
+    from tools.decoder_export_reference import Case, reference_logits
+
+    loaded = load()
+    single = loaded.model.clone(norm_groups=1)
+    PretrainedDecoder.from_model(single, loaded.variables).save(tmp_path)
+    config = json.loads((tmp_path / 'config.json').read_text())
+    assert config['model_type'] == 'llama'
+    ids = fixture('input_ids')
+    case = Case('llama', 'k2-horizon-tiny')
+    actual = np.asarray(single.apply(loaded.variables, ids))
+    assert_as_exact_as_the_reference(actual, reference_logits(case, tmp_path, ids),
+                                     reference_logits(case, tmp_path, ids, wide=True), 'Llama YaRN export')
+
+
 @pytest.mark.parametrize('size, groups, layers, width', [('0.9b', 1, 28, 1536), ('3.7b', 2, 36, 2560),
                                                          ('7b', 4, 36, 4096)])
 def test_each_release_translates_to_the_dense_block_it_ships(size, groups, layers, width):
