@@ -380,3 +380,21 @@ def test_a_joint_run_cuts_its_state_to_the_state_budget_and_a_layout_refuses_a_b
         _fresh_layout(causal=True, joint=True, budgets={"max_len": 3072, "head_max_len": 96})
     with pytest.raises(ValueError):
         _fresh_layout(causal=True, joint=False, budgets={"max_len": 1024, "max_state_tokens": 16})
+
+
+@pytest.mark.parametrize("joint", [False, True])
+def test_the_abstract_state_draws_a_missing_head_at_the_shapes_init_draws(joint):
+    """A missing head drawn in a trace of the state (the abstract state a restore builds) has the
+    shapes a concrete init gives it. Clef's head reads the backbone's output table as well."""
+    from dew.decision import JointLayout, JointSchemaHead
+
+    layout = JointLayout(max_len=96) if joint else LAYOUT
+    head = JointSchemaHead(hidden_size=32, width=32, routing_layers=1, layers=1, heads=2,
+                           feedforward=64) if joint else None
+    objective = DecisionObjective(tiny_backbone(), tokenizer=TOKENIZER, specials=SPECIALS, layout=layout,
+                                  head=head)
+    backbone = {"params": {"backbone": objective.model.backbone.init(
+        jax.random.key(1), np.zeros((1, layout.max_len), np.int32))["params"]}}
+    drawn = objective.complete_variables(jax.random.key(0), backbone)
+    again = jax.eval_shape(objective.complete_variables, jax.random.key(0), backbone)
+    assert jax.tree.map(np.shape, again) == jax.tree.map(np.shape, drawn)
