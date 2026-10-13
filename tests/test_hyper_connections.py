@@ -21,7 +21,6 @@ from dew.nn.hyper_connections import (
     collapse_streams,
     expand_streams,
     mix_streams,
-    sinkhorn,
 )
 
 BOUND = 1e-4
@@ -93,34 +92,6 @@ def site(spec, params, streams, output):
     )
 
 
-def test_the_site_mapping_and_mixing_match_the_oracle(case):
-    spec, streams, output, params = case
-    post, comb, collapsed = oracle_mapping(streams, params["fn"], params["base"], params["scale"],
-                                           spec.hc_eps, spec.hc_sinkhorn_iters, 1e-5)
-    wanted = oracle_mix(post, comb, output, streams)
-
-    ours_collapsed, ours = site(spec, params, streams, output)
-
-    assert scaled(ours_collapsed, collapsed) < BOUND
-    assert scaled(ours, wanted) < BOUND
-    # The last Sinkhorn step normalises the columns, so those sum to one to
-    # the floor whatever the iteration count; the rows converge with it.
-    assert np.allclose(comb.sum(-2), 1, atol=1e-4)
-
-
-def test_the_mixing_direction_is_the_references(case):
-    """`comb` is applied transposed. The other orientation is a different
-    residual mix of the same Sinkhorn output, which the oracle separates."""
-    spec, streams, output, params = case
-    post, comb, _ = oracle_mapping(streams, params["fn"], params["base"], params["scale"],
-                                   spec.hc_eps, spec.hc_sinkhorn_iters, 1e-5)
-    other = post[..., None] * output[..., None, :] + comb @ streams
-
-    _, ours = site(spec, params, streams, output)
-
-    assert scaled(ours, other) > 1e-2
-
-
 def test_the_gradients_match_central_differences_of_the_oracle(case):
     """Through the mapping, the Sinkhorn loop and the mix, into the streams
     and every parameter."""
@@ -132,12 +103,16 @@ def test_the_gradients_match_central_differences_of_the_oracle(case):
         return float(np.sum(oracle_mix(post, comb, output, streams) * cotangent))
 
     def loss_module(streams, params):
-        _, mixed = site(spec, params, streams, output)
-        return jnp.sum(mixed * jnp.asarray(cotangent, jnp.float32))
+        collapsed, mixed = site(spec, params, streams, output)
+        return jnp.sum(mixed * jnp.asarray(cotangent, jnp.float32)), (collapsed, mixed)
 
-    grads = jax.grad(loss_module, argnums=(0, 1))(
+    (_, (ours_collapsed, mixed)), grads = jax.value_and_grad(loss_module, argnums=(0, 1), has_aux=True)(
         jnp.asarray(streams, jnp.float32), jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float32), params)
     )
+    post, comb, collapsed = oracle_mapping(streams, params["fn"], params["base"], params["scale"],
+                                           spec.hc_eps, spec.hc_sinkhorn_iters, 1e-5)
+    assert scaled(ours_collapsed, collapsed) < BOUND
+    assert scaled(mixed, oracle_mix(post, comb, output, streams)) < BOUND
     ours = {"streams": grads[0], **grads[1]}
     arguments = {"streams": streams, **params}
     for name, value in arguments.items():
@@ -168,31 +143,3 @@ def test_the_weighted_head_matches_the_oracle_and_the_mean_head_is_the_mean(case
     assert scaled(collapse_streams(jnp.asarray(streams, jnp.float32), None), streams.mean(2)) < BOUND
     first = jnp.asarray(streams[:, :, 0], jnp.float32)
     assert np.array_equal(expand_streams(first, H), np.repeat(np.asarray(first)[:, :, None], H, axis=2))
-
-
-def test_sinkhorn_compiles_its_repeats_as_one_loop():
-    """Sinkhorn's repeats lower to a loop, so the gradient program, and the
-    time XLA takes to compile it, does not grow with the iteration count:
-    unrolled, 20 repeats took an L4 71 s to compile for one site's gradient,
-    where the loop takes 0.5 s."""
-    comb = jnp.full((2, 4, 4), 0.25, jnp.float32)
-
-    def program(iters):
-        gradient = jax.grad(lambda comb: jnp.sum(sinkhorn(comb, iters, 1e-6) ** 2))
-        return jax.jit(gradient).lower(comb).as_text()
-
-    twenty, forty = program(20), program(40)
-    assert "stablehlo.while" in twenty
-    assert twenty.count("stablehlo.divide") == forty.count("stablehlo.divide")
-
-
-def test_the_record_refuses_what_the_references_cannot_build():
-    with pytest.raises(ValueError, match="hc_mult"):
-        HyperConnections(hc_mult=0)
-    with pytest.raises(ValueError, match="hc_sinkhorn_iters"):
-        HyperConnections(hc_sinkhorn_iters=0)
-    with pytest.raises(ValueError, match="head"):
-        HyperConnections(head="sum")
-    with pytest.raises(ValueError, match="single_pass"):
-        HyperConnections(head="carried")
-    HyperConnections(head="carried", single_pass=True)

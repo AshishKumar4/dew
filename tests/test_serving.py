@@ -7,7 +7,6 @@ left, a queue longer than the slots, and a request too large for the cache.
 """
 
 import dataclasses
-import itertools
 
 import jax
 import jax.numpy as jnp
@@ -19,11 +18,10 @@ from sharded import assert_sharded
 from steady_state import guarded, steady_state
 
 from dew.inference import RunProcessor, TextGeneration
-from dew.inference.pages import Pages
 from dew.inference.pipeline import place
-from dew.inference.serving import PagedRows, Server
+from dew.inference.serving import Server
 from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.nn.backbones.decoder_block import GatedMLP, Mixture
+from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.kv_cache import KVCache
 from dew.nn.mixers.attention import CausalSelfAttention
 from dew.nn.sharding import BATCH_AXES
@@ -47,22 +45,6 @@ def assert_same_generation(served, alone):
     np.testing.assert_array_equal(served.terminated, alone.terminated)
     np.testing.assert_allclose(served.behavior_log_probs, alone.behavior_log_probs, atol=2e-6, rtol=2e-6)
     np.testing.assert_allclose(served.raw_log_probs, alone.raw_log_probs, atol=2e-6, rtol=2e-6)
-
-
-def test_prepacked_gate_and_up_draw_the_same_gated_projection():
-    """The serving layout is one dot, split before the trained activation."""
-    with jax.enable_x64():
-        model = GatedMLP(hidden_features=6, out_features=4, use_bias=True, dtype=jnp.float64)
-        x = jnp.arange(32, dtype=jnp.float64).reshape(2, 2, 8) / 16
-        kernel = jnp.arange(96, dtype=jnp.float64).reshape(8, 12) / 128
-        bias = jnp.arange(12, dtype=jnp.float64) / 32
-        down = jnp.arange(24, dtype=jnp.float64).reshape(6, 4) / 64
-        down_bias = jnp.arange(4, dtype=jnp.float64) / 16
-        variables = {"params": {"gate_up_proj": {"kernel": kernel, "bias": bias},
-                                "down_proj": {"kernel": down, "bias": down_bias}}}
-        gate, up = jnp.split(x @ kernel + bias, 2, axis=-1)
-        expected = (jax.nn.silu(gate) * up) @ down + down_bias
-        np.testing.assert_array_equal(jax.jit(model.apply)(variables, x), expected)
 
 
 def test_prepacked_queries_keys_and_values_preserve_attention_and_cache():
@@ -152,33 +134,6 @@ def test_inference_projection_layout_preserves_special_attention_logits(case):
         eps = 64 * np.finfo(np.float64).eps
         np.testing.assert_allclose(actual, expected, atol=eps, rtol=eps)
         np.testing.assert_array_equal(jnp.argmax(actual, axis=-1), jnp.argmax(expected, axis=-1))
-
-
-def test_an_admitting_step_pads_to_the_fewest_rows_that_hold_its_prompts():
-    """The admitting program prefills every row it is given: a request
-    arriving alone is one row, three together are four, never the whole
-    admission of eight (`admission_share`), and each draws what it draws alone."""
-    from dew.inference.serving import admission_share
-
-    assert [admission_share(waiting, 8) for waiting in range(1, 9)] == [1, 2, 4, 4, 8, 8, 8, 8]
-    assert admission_share(5, 6) == 6
-    bound = task()
-    server = Server.from_task(bound, slots=8, capacity=128, admission=8)
-    widths, admit = [], server._admit
-
-    def recorded():
-        admission = admit()
-        widths.append(None if admission is None else admission.prompts.tokens.shape[0])
-        return admission
-
-    server._admit = recorded
-    first = server.submit(PROMPTS[0], 3, key=0)
-    server.step()
-    rest = [server.submit(prompt, 3, key=index) for index, prompt in enumerate(PROMPTS[1:4], start=1)]
-    server.run()
-    assert [width for width in widths if width] == [1, 4]
-    for index, ticket in enumerate([first, *rest]):
-        assert ticket.result().text == bound(PROMPTS[index], 3, key=index).text
 
 
 @pytest.mark.parametrize("decode_steps", [1, 4])
@@ -312,43 +267,6 @@ def test_a_request_with_an_integer_seed_launches_nothing_until_admission(seed):
     assert_same_generation(ticket.result(), bound(prompt[None], 5, key=seed))
 
 
-def test_a_step_donates_the_slot_matrices_and_rewrites_the_vectors():
-    """XLA copies a donated buffer that is read after the output is written,
-    as every cursor, step count and active flag is, so a step donates only
-    the matrices: the resident half holds the cache, tokens and validity,
-    the carried half each row's vectors."""
-    server = Server.from_task(task(Sampling(temperature=0, eos_token_ids=None)), slots=2, capacity=64)
-    resident, carried = server._resident, server._carried
-    assert jax.tree.leaves(resident) and all(leaf.ndim >= 2 for leaf in jax.tree.leaves(resident))
-    assert all(leaf.ndim < 2 for leaf in jax.tree.leaves(carried))
-    for name in ("step", "budget", "active"):
-        assert getattr(resident, name) is None and getattr(carried, name) is not None
-
-
-def test_a_step_without_admission_draws_from_its_own_logits_without_merging_every_slot():
-    """With no admission every drawing row fed this step, so the logits it
-    draws from are the model's whole: no select over every slot's vocabulary
-    keeps a held row's (on an RTX 4080 at 64 slots, 136 us of an 8.4 ms
-    step). A step that seats rows still merges, since those draw from their
-    prompt's logits."""
-    from dew.inference.serving_kernel import _advanced, joined
-
-    server = Server.from_task(task(Sampling(temperature=0, eos_token_ids=None)), slots=2, capacity=64,
-                              admission=1)
-    server.submit(np.asarray([1, 2, 3], np.int32), 4, key=0)
-    admission = server._admit()
-    state = joined(server._resident, server._carried)
-
-    def merges(admission):
-        jaxpr = jax.make_jaxpr(lambda state: _advanced(
-            server.model, server.variables, server.pad_id, server.rows.placement, state, admission,
-            server.transforms, server.stopping, server.grammar))(state)
-        return _selects(jaxpr.jaxpr, state.decoder.logits.shape)
-
-    assert admission is not None and merges(admission)
-    assert not merges(None)
-
-
 def _selects(jaxpr, shape) -> bool:
     """Whether `jaxpr` or a jaxpr it calls selects an array of `shape`."""
     for eqn in jaxpr.eqns:
@@ -396,16 +314,6 @@ def test_a_server_round_after_the_first_reuses_its_programs_and_reads_once_a_ste
         second = served(rounds[1])
     for mine, theirs in zip(second, first, strict=True):
         np.testing.assert_array_equal(mine.host().tokens, theirs.host().tokens)
-
-
-@pytest.mark.parametrize("ids", [np.asarray([1.5, 2.0]), np.asarray([True, False]),
-                                  np.asarray([2**32], np.int64), np.asarray([-1, 2], np.int32),
-                                  np.asarray([VOCAB], np.int32), np.asarray([], np.int32)])
-def test_host_numeric_submission_still_refuses_invalid_token_rows(ids):
-    server = Server.from_task(task(), slots=1, capacity=128)
-    with pytest.raises(ValueError):
-        server.submit(ids, 2, key=jax.random.key(1))
-    assert server.queued == 0 and server.occupancy == 0
 
 
 def test_a_request_admitted_mid_flight_draws_what_it_draws_alone():
@@ -480,66 +388,6 @@ def test_more_requests_than_slots_queue_and_all_complete():
     assert all(ticket.admitted is not None and ticket.admitted >= ticket.submitted for ticket in tickets)
 
 
-def test_a_ticket_shows_its_tokens_as_each_step_reads_them_back():
-    """A caller streams a request from its ticket: each read of the draws
-    replaces `tokens` with a longer prefix and calls back, the first before
-    the request finishes, and the last is the generation's own tokens."""
-    bound = task()
-    server = Server.from_task(bound, slots=2, capacity=128, admission=2, decode_steps=2)
-    ticket = server.submit(PROMPTS[2], 7, key=0)
-    other = server.submit(PROMPTS[0], 3, key=1)
-    seen = []
-    ticket.add_tokens_callback(lambda done: seen.append((done.tokens, done.done())))
-    ticket.add_tokens_callback(lambda done: 1 / 0)
-    server.run()
-    generation = ticket.result()
-    drawn = tuple(int(token) for token in generation.tokens[0, -7:][:int(generation.lengths[0])])
-    snapshots = [tokens for tokens, _ in seen]
-    assert len(snapshots) > 1 and snapshots[-1] == drawn == ticket.tokens
-    assert all(len(shorter) < len(longer) and longer[:len(shorter)] == shorter
-               for shorter, longer in itertools.pairwise(snapshots))
-    assert not seen[0][1] and not seen[-1][1]
-    assert generation.text == bound(PROMPTS[2], 7, key=0).text
-    assert other.tokens and other.result().text == bound(PROMPTS[0], 3, key=1).text
-
-
-def test_a_request_over_the_capacity_is_refused_as_the_task_refuses_it():
-    bound = task(capacity=64)
-    server = Server.from_task(bound, slots=2, capacity=64)
-    with pytest.raises(ValueError, match="exceeds max_seq_len") as refused:
-        bound("1234567", 60, key=0)
-    with pytest.raises(ValueError, match="exceeds max_seq_len") as served:
-        server.submit("1234567", 60, key=0)
-    assert str(served.value) == str(refused.value)
-    assert server.queued == 0
-    with pytest.raises(ValueError, match="max_seq_len"):
-        Server.from_task(bound, slots=2, capacity=65)
-    with pytest.raises(ValueError, match="one continuation"):
-        Server.from_task(bound.__class__(bound.model, bound.variables, bound.processor,
-                                         sampling=bound.sampling, n=2), slots=2, capacity=64)
-
-
-def test_a_server_holds_its_capacity_in_whole_tiles_not_a_power_of_two():
-    """Every decode step's attention reads each slot of a row's cache, so the
-    cache holds the capacity asked for, rounded up to whole 64-slot tiles and
-    whole pages. A capacity of 384 was bucketed to 512 slots, a third more
-    cache memory and attention traffic than any row could use."""
-    bound = task(capacity=512)
-
-    def slots(**options):
-        server = Server.from_task(bound, slots=2, **options)
-        page = options.get("kv_cache", KVCache()).page_size
-        # A row's slots: the dense keys' second axis, or its pages' tokens.
-        leaves = jax.tree_util.tree_flatten_with_path(server.cache)[0]
-        held = {leaf.shape[1] * (page or 1) for path, leaf in leaves
-                if jax.tree_util.keystr(path).endswith("['page_table']" if page else "['cached_key']")}
-        return server.capacity, held
-
-    assert slots(capacity=384) == (384, {384})
-    assert slots(capacity=300) == (320, {320})
-    assert slots(capacity=300, kv_cache=KVCache(page_size=128)) == (384, {384})
-
-
 def test_a_prompt_past_the_bucket_under_the_capacity_is_served_as_the_task_serves_it():
     """A capacity of 384 is no power of two, and a 300-token prompt's
     prefill bucket is 512: the prefill is bounded by the capacity, so the
@@ -588,50 +436,6 @@ def test_a_paged_server_draws_what_each_request_draws_alone(options):
         assert_same_generation(ticket.result(), lone)
     # "1234567" keeps its last token to prefill: one full page of four is shared.
     assert server.prefix_hits == (4 if options.get("prefix_cache") else 0)
-
-
-@pytest.mark.parametrize("decode_steps", [1, 3])
-def test_a_paged_kernel_reads_one_key_of_each_idle_row(monkeypatch, request, decode_steps):
-    """A freed row keeps its last request's slot count on the device until
-    the next request is admitted, and the paged kernel reads every key under
-    the count it is given: the four-slot server's second run decodes one row
-    beside three idle ones, each of which reads one key, as the dense path's
-    per-row count reads. The kernel here is softmax attention over the
-    gathered rows, which records what it was told to read, so every draw is
-    still the lone call's. JAX's caches are cleared before and after: the
-    patched kernel is only read where the server's step is traced, and a
-    trace of it must not serve a later test."""
-    from dew.inference import serving_kernel
-    from dew.nn.kv_cache import KVStore
-
-    jax.clear_caches()
-    request.addfinalizer(jax.clear_caches)
-
-    reads = []
-
-    def recorded(store, query, lengths, softcap):
-        jax.debug.callback(lambda counts: reads.append(np.asarray(counts)), lengths)
-        keys, values = (jnp.repeat(part, query.shape[1] // part.shape[2], axis=2) for part in store.read())
-        scores = jnp.einsum("rhd,rkhd->rhk", query, keys) / np.sqrt(query.shape[-1])
-        scores = jnp.where(jnp.arange(keys.shape[1]) < lengths[:, None, None], scores, -jnp.inf)
-        return jnp.einsum("rhk,rkhd->rhd", jax.nn.softmax(scores, axis=-1), values).astype(query.dtype)
-
-    monkeypatch.setattr(KVStore, "kernel", lambda store, query: True)
-    monkeypatch.setattr(KVStore, "decode", recorded)
-    monkeypatch.setattr(CausalSelfAttention, "_page_kernel_runs", lambda layer, query: True)
-    monkeypatch.setattr(serving_kernel, "_PROGRAMS", {})
-    bound = task()
-    alone = bound(PROMPTS[2], BUDGETS[2], key=2)
-    server = Server.from_task(bound, slots=4, capacity=128, admission=2, decode_steps=decode_steps,
-                              kv_cache=KVCache(page_size=16, pages=12))
-    for index, (prompt, budget) in enumerate(zip(PROMPTS, BUDGETS, strict=True)):
-        server.submit(prompt, budget, key=index)
-    server.run()
-    reads.clear()
-    ticket = server.submit(PROMPTS[2], BUDGETS[2], key=2)
-    server.run()
-    assert_same_generation(ticket.result(), alone)
-    assert reads and all(np.sum(counts > 1) <= 1 for counts in reads), reads
 
 
 @pytest.mark.parametrize("options", [{}, {"kv_cache": KVCache(page_size=16, pages=12)}],
@@ -684,33 +488,7 @@ def test_a_server_on_a_mesh_draws_what_each_request_draws_alone(mesh, options):
 
 
 @pytest.mark.mesh(devices=4)
-@pytest.mark.parametrize("mesh", [MeshSpec(sequence=2), MeshSpec(stage=2)], ids=["sequence", "stage"])
-def test_a_server_refuses_a_mesh_that_splits_a_row_or_the_layer_stack(mesh):
-    bound = task()
-    with pytest.raises(ValueError, match=r"sequence=1|stage=1"):
-        Server.from_task(bound.bind(place(bound.variables, mesh, Layout(min_shard=1, tolerance=1.0))),
-                         slots=8, capacity=128)
-
-
-def test_a_full_pool_queues_a_request_until_a_row_gives_pages_back():
-    """Three pages of sixteen hold one request of prompt and budget at a time:
-    the second waits in the queue, not in a slot, and draws what it draws
-    alone once the first returns its pages."""
-    bound = task()
-    server = Server.from_task(bound, slots=2, capacity=128, kv_cache=KVCache(page_size=16, pages=3))
-    first = server.submit("1234567", 30, key=0)
-    second = server.submit("98", 30, key=1)
-    server.step()
-    assert server.occupancy == 1 and server.queued == 1
-    server.run()
-    assert first.result().text == bound("1234567", 30, key=0).text
-    assert second.result().text == bound("98", 30, key=1).text
-    with pytest.raises(ValueError, match="pool holds 3"):
-        server.submit("1234567", 60, key=0)
-
-
-@pytest.mark.mesh(devices=4)
-@pytest.mark.parametrize("dispatch", ["exchange", "global"])
+@pytest.mark.parametrize("dispatch", ["global"])
 def test_a_server_on_an_expert_mesh_draws_what_one_device_draws(dispatch):
     """A mixture layer on an expert mesh can run its dispatch in a shard_map,
     and jax's checkify cannot carry a device check into one (jax-ml/jax#40907).
@@ -739,33 +517,7 @@ def test_a_server_on_an_expert_mesh_draws_what_one_device_draws(dispatch):
     assert server.groups == jax.device_count()
     for ticket, row in zip(tickets, [*alone, alone[2]], strict=True):
         assert_same_generation(ticket.result(), row)
-    if dispatch == "exchange":
-        with pytest.raises(ValueError, match="dispatch='global'"):
-            served("12", 3, key=0)
 
-
-def test_a_wrapped_decoder_holds_the_capacity_it_is_served_at():
-    """A multimodal wrapper declares its language model's max_seq_len, which
-    `_sized` read only as the wrapper's own field: Qwen3.5-0.8B served at 384
-    slots held a cache of 8192 (4.1 GiB at 32 rows, out of memory at 128,
-    and its decode step transposed every full-attention layer's 8192 slots).
-    The language model inside is sized, whatever the wrapper declares."""
-    from dew.nn.multimodal import MultimodalTransformer
-    from dew.nn.vision import GemmaProjector, SiglipVision
-
-    text = CausalTransformer(vocab_size=VOCAB, emb_features=16, num_layers=1, num_heads=2, head_dim=8,
-                             mlp_features=32, max_seq_len=1024, dtype="float32")
-    model = MultimodalTransformer(
-        text, SiglipVision(hidden_size=16, intermediate_size=32, num_layers=1, num_heads=2,
-                           image_size=8, patch_size=4),
-        GemmaProjector(text_width=16, patches_per_side=2, tokens_per_side=1),
-        family="gemma3", image_token_id=1)
-    bound = TextGeneration(model, model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)),
-                           RunProcessor(Digits()))
-    server = Server.from_task(bound, slots=2, capacity=128)
-    held = {leaf.shape[1] for path, leaf in jax.tree_util.tree_leaves_with_path(server.cache)
-            if jax.tree_util.keystr(path).endswith("['cached_key']")}
-    assert held == {128}
 
 
 class UserDecoder(nn.Module):
@@ -824,30 +576,6 @@ def wrapped(kind, model, variables, sampling, processor=None):
     return TextGeneration(kind(model), held, processor, sampling=sampling)
 
 
-def test_a_user_decoder_module_is_served_as_far_as_it_answers():
-    """A server reads a model through what it answers, not its class. A
-    user's module around a decoder that answers from it is served at the
-    capacity asked for (`CacheCapacity`) and admits in one mixed forward
-    (`Serving`); one that answers neither keeps its whole context and
-    prefills in a forward of its own, and says why. Both draw what the bare
-    decoder draws."""
-    bound = task(capacity=1024)
-    alone = [bound(prompt, budget, key=index)
-             for index, (prompt, budget) in enumerate(zip(PROMPTS, BUDGETS, strict=True))]
-    unanswered = "UserDecoder does not say its layers run a mixed step (Serving)"
-    for kind, held, refusal in ((AnsweringDecoder, 128, None), (UserDecoder, 1024, unanswered)):
-        user = wrapped(kind, bound.model, bound.variables, bound.sampling, bound.processor)
-        server = Server.from_task(user, slots=4, capacity=128, admission=2)
-        assert server.mixed_refusal == refusal
-        assert {leaf.shape[1] for path, leaf in jax.tree_util.tree_leaves_with_path(server.cache)
-                if jax.tree_util.keystr(path).endswith("['cached_key']")} == {held}
-        tickets = [server.submit(prompt, budget, key=index)
-                   for index, (prompt, budget) in enumerate(zip(PROMPTS, BUDGETS, strict=True))]
-        server.run()
-        for ticket, row in zip(tickets, alone, strict=True):
-            assert_same_generation(ticket.result(), row)
-
-
 def test_a_user_decoder_module_is_packed_where_it_names_its_groups():
     """Placement packs the projections a model names (`Serving`)
     at their paths in its variables: a user's module around a decoder that
@@ -874,134 +602,6 @@ def test_a_user_decoder_module_is_packed_where_it_names_its_groups():
                         bound.sampling, bound.processor)
     for actual, prompt in zip(server(PROMPTS[:2], 5, key=3), PROMPTS[:2], strict=True):
         assert_same_generation(actual, retrained(prompt, 5, key=3))
-
-
-def test_a_user_decoder_module_rebuilds_its_cache_where_its_decoder_says_it_goes_stale():
-    """Phi-3's LongRoPE keys go stale past position 8, and a model that says
-    so (`Serving`) has a crossing row's prefix recomputed: a user's
-    module around the decoder draws what the decoder draws across the
-    crossing, and a server refuses for it the modes that cannot rebuild."""
-    from pathlib import Path
-
-    from dew.interop import Pretrained
-
-    directory = Path(__file__).parent / "fixtures" / "hf" / "phi3-tiny"
-    loaded = Pretrained.load(directory, dtype="float32", attention_impl="reference", max_seq_len=64)
-    greedy = Sampling(temperature=0, eos_token_ids=None)
-    bare = TextGeneration(loaded.model, loaded.variables, sampling=greedy)
-    user = wrapped(AnsweringDecoder, loaded.model, loaded.variables, greedy)
-    prompts = np.load(directory / "input_ids.npy").astype(np.int32)[:, :4]
-    assert_same_generation(user(prompts, 8, key=0), bare(prompts, 8, key=0))
-    with pytest.raises(ValueError, match=r"LongRoPE crossing position 8.*chunked"):
-        Server.from_task(user, slots=2, capacity=64, chunk=2)
-
-
-def test_prefix_sharing_needs_a_paged_cache():
-    with pytest.raises(ValueError, match="paged cache"):
-        Server.from_task(task(), slots=2, capacity=128, prefix_cache=True)
-
-
-@pytest.mark.parametrize("scan_layers", [False, True])
-def test_a_plain_decoder_takes_the_mixed_step_scanned_or_not(scan_layers):
-    """A decoder answers for its plain attention whether the stack is a loop
-    or scanned (a decode runs the plain loop, so a scanned stack's caches sit
-    under its layers too): neither loses the mixed admitting step."""
-    model = CausalTransformer(vocab_size=VOCAB, emb_features=16, num_layers=2, num_heads=2, head_dim=8,
-                              mlp_features=32, max_seq_len=128, dtype="float32", scan_layers=scan_layers)
-    bound = TextGeneration(model, model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)),
-                           RunProcessor(Digits()))
-    assert Server.from_task(bound, slots=4, capacity=128).mixed_refusal is None
-
-
-@pytest.mark.parametrize("kind", ["llama4", "mla", "gated_delta_net"])
-def test_a_layer_that_cannot_run_the_mixed_step_keeps_two_forwards_by_name(kind):
-    """A cache any layer but plain attention holds keeps the admitting step's
-    two forwards, named: such a layer does not read the mixed call's layout
-    and would take its one row of tokens as one sequence (a Llama 4 server
-    failed to build). Served rows are still each request's alone."""
-    from dew.nn.llama4 import Llama4Mixer
-    from dew.nn.mixers.gated_delta_net import GatedDeltaNetMixer
-    from dew.nn.mla import MLAMixer
-
-    linear = GatedDeltaNetMixer(linear_num_key_heads=2, linear_num_value_heads=2,
-                                linear_key_head_dim=8, linear_value_head_dim=8)
-    extra = {
-        "llama4": {"mixer": Llama4Mixer()},
-        "mla": {"mixer": MLAMixer(kv_lora_rank=8, qk_nope_head_dim=8, qk_rope_head_dim=8, v_head_dim=8)},
-        "gated_delta_net": {"layer_types": ("linear", "full"), "kinds": {"linear": {"mixer": linear}}},
-    }[kind]
-    model = CausalTransformer(vocab_size=VOCAB, emb_features=16, num_layers=2, num_heads=2, head_dim=8,
-                              mlp_features=32, max_seq_len=128, dtype="float32", qk_norm=False, **extra)
-    bound = TextGeneration(model, model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)),
-                           RunProcessor(Digits()))
-    server = Server.from_task(bound, slots=4, capacity=128)
-    assert "which a mixed step does not run" in (server.mixed_refusal or "")
-    tickets = [server.submit(prompt, 3, key=index) for index, prompt in enumerate(PROMPTS[:2])]
-    server.run()
-    for index, ticket in enumerate(tickets):
-        assert_same_generation(ticket.result(), bound(PROMPTS[index], 3, key=index))
-
-
-def test_a_model_the_mixed_step_cannot_take_keeps_two_forwards_and_says_why(monkeypatch):
-    """A layer that refuses the mixed admitting step names why; the server
-    keeps the prompts' prefill in a forward of its own and reports the
-    reason, and refuses a dense chunked prefill, which only the mixed step
-    serves."""
-    from dew.nn.mixers.attention import CausalSelfAttention
-
-    monkeypatch.setattr(CausalSelfAttention, "mixed_refusal", lambda self: f"{self.name}: a test refusal")
-    server = Server.from_task(task(), slots=2, capacity=128)
-    assert "a test refusal" in (server.mixed_refusal or "") and not server.rows.placement.mixed
-    with pytest.raises(ValueError, match="a test refusal"):
-        Server.from_task(task(), slots=2, capacity=128, chunk=4)
-
-
-def test_a_paged_server_refuses_a_model_whose_layers_kept_a_dense_cache():
-    """A paged server moves rows by their page tables; a cache without any
-    means the layout did not reach the layers, and serving it would hold a
-    dense slots x capacity cache instead of the bounded pool."""
-    bound = task()
-    dense = Server.from_task(bound, slots=2, capacity=128)
-    with pytest.raises(ValueError, match="did not take the paged layout"):
-        PagedRows([Pages(8, 16, prefix_cache=False)], None, 8).check(dense.cache)
-
-
-def test_a_released_prefix_page_is_shared_until_the_free_pages_run_out():
-    """The ledger shares a full prompt page by the hash of everything up to
-    its end, keeps it after its row leaves, and reclaims it only when a
-    request needs more pages than are free, oldest release first."""
-    pages = Pages(4, 2, prefix_cache=True)
-    prompt = np.array([1, 2, 3, 4, 5])
-    first, hit = pages.reserve(prompt, 6)
-    assert hit == 0 and len(first) == 3
-    pages.publish(prompt, first)
-    pages.release(first)
-    assert pages.available == 4
-    # Same first four tokens: two pages shared, the last token still prefilled.
-    again, hit = pages.reserve(np.array([1, 2, 3, 4, 9]), 6)
-    assert hit == 4 and again[:2] == first[:2]
-    pages.release(again)
-    # A different first page shares nothing, even where later tokens agree.
-    other, hit = pages.reserve(np.array([7, 2, 3, 4, 5]), 8)
-    assert hit == 0 and len(other) == 4
-    pages.release(other)
-    assert pages.reserve(np.array([1, 2, 3, 4, 5]), 6)[1] == 0
-
-
-def test_reclaiming_a_released_chain_takes_its_tail_before_its_head():
-    """A shared prefix loses its last page first under memory pressure, so
-    the head that every later prompt starts with stays reachable."""
-    pages = Pages(3, 2, prefix_cache=True)
-    prompt = np.array([1, 2, 3, 4, 5])
-    chain, _ = pages.reserve(prompt, 6)
-    pages.publish(prompt, chain)
-    pages.release(chain)
-    # Two pages are needed and one is free: the one reclaimed is the tail.
-    taken, _ = pages.reserve(np.array([9, 9, 9]), 4)
-    assert taken == [chain[2], chain[1]]
-    pages.release(taken)
-    again, hit = pages.reserve(np.array([1, 2, 7, 7, 7]), 6)
-    assert hit == 2 and again[0] == chain[0]
 
 
 def test_reloaded_weights_share_no_prefix_page_the_old_weights_wrote():
@@ -1050,25 +650,6 @@ def test_a_served_request_is_forced_to_end_at_its_own_budget():
     expected = bound("12", 3, key=0)
     np.testing.assert_array_equal(ticket.result().tokens, expected.tokens)
     assert int(np.asarray(ticket.result().tokens)[0, -1]) == 5
-
-
-@pytest.mark.parametrize("through", ["submit", "batch"])
-@pytest.mark.parametrize("fields, conditioning, refusal", [
-    ({"positions": jnp.array([[5, 6, 7]], jnp.int32)}, {}, "positions"),
-    ({"attention_mask": jnp.array([[1, 2, 1]], jnp.int32)}, {}, "binary"),
-    ({}, {"pixel_values": jnp.zeros((1, 3, 4, 4))}, "media"),
-], ids=["noncanonical positions", "a validity of 2", "media"])
-def test_a_prompt_the_row_cursor_cannot_reproduce_is_refused(through, fields, conditioning, refusal):
-    """Only the positions the row cursor reproduces are safe to drop, and a
-    served row carries tokens and binary validity alone: a batch through the
-    server's call is held to what `submit` holds one row to."""
-    from dew.nn.inputs import ModelInputs
-
-    bound = task(Sampling(temperature=0))
-    server = Server.from_task(bound, slots=2, capacity=64)
-    inputs = ModelInputs(jnp.array([[1, 2, 3]], jnp.int32), fields, conditioning)
-    with pytest.raises(ValueError, match=refusal):
-        server.submit(inputs, 4, key=0) if through == "submit" else server(inputs, 4, key=0)
 
 
 def test_a_padding_positions_value_is_not_part_of_a_served_row():

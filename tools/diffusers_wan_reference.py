@@ -122,7 +122,8 @@ def float64_scheduler(module: ModuleType):
 @contextlib.contextmanager
 def widened():
     """The reference in float64: every float32 pin of the Wan modules
-    widened, which are their `.float()` and `.to(torch.float32)` casts, the
+    widened, which are their `.float()`, `.to(torch.float32)` and
+    `.type(torch.float32)` casts (Nemotron-H's router pins the last), the
     sinusoids' float32 `arange` and the UniPC scheduler's float32 sigma
     table, and float64 the default dtype."""
     from unittest.mock import patch
@@ -136,7 +137,7 @@ def widened():
     # meta-device init (transformers' from_pretrained) would make arange's
     # tensors on the CPU beside the meta ones; so it is built first.
     _device_constructors()
-    float_, to, arange = torch.Tensor.float, torch.Tensor.to, torch.arange
+    float_, to, type_, arange = torch.Tensor.float, torch.Tensor.to, torch.Tensor.type, torch.arange
 
     def wide(dtype):
         return torch.float64 if dtype == torch.float32 else dtype
@@ -148,6 +149,8 @@ def widened():
 
     torch.Tensor.float = lambda self, *args, **kwargs: self.double()
     torch.Tensor.to = widened_to
+    torch.Tensor.type = lambda self, dtype=None, *args, **kwargs: type_(
+        self, *(() if dtype is None else (wide(dtype),)), *args, **kwargs)
     torch.arange = lambda *args, dtype=None, **kwargs: arange(*args, dtype=wide(dtype), **kwargs)
     default = torch.get_default_dtype()
     torch.set_default_dtype(torch.float64)
@@ -155,7 +158,7 @@ def widened():
         with patch.object(scheduling_unipc_multistep, "np", Float64Library(np)):
             yield
     finally:
-        torch.Tensor.float, torch.Tensor.to, torch.arange = float_, to, arange
+        torch.Tensor.float, torch.Tensor.to, torch.Tensor.type, torch.arange = float_, to, type_, arange
         torch.set_default_dtype(default)
 
 

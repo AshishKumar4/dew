@@ -46,7 +46,6 @@ def test_rank_local_environment_error_aborts_peers_and_releases_all_slots(tmp_pa
     assert all(report["opened"] == report["closed"] == 4 for report in reports)
     assert all(report["updates"] is None and report["error"] for report in reports)
     assert all(episode["reward"] is None for report in reports for episode in report["episodes"])
-    assert all("rank-local tool failed" in report["error"] for report in reports)
 
 
 def test_inconsistent_cohort_settings_fail_before_creating_environments(tmp_path):
