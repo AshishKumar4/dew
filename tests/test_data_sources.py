@@ -663,6 +663,82 @@ def test_cli_record_exports_still_default_to_parquet(tmp_path):
     assert stored.records("indexed")[0] == {"text": "a document"}
 
 
+@pytest.mark.parametrize("read", [None, "memory", "indexed"])
+def test_snapshot_uses_requested_or_preferred_read_and_loading(tmp_path, read):
+    import time
+
+    from torch.utils.data import Dataset
+
+    from dew.data import from_torch
+
+    lock = threading.Lock()
+    active = maximum = 0
+
+    class Counted(Dataset):
+        def __len__(self):
+            return 32
+
+        def __getitem__(self, index):
+            nonlocal active, maximum
+            with lock:
+                active += 1
+                maximum = max(maximum, active)
+            try:
+                time.sleep(0.01)
+                return {"id": index}
+            finally:
+                with lock:
+                    active -= 1
+
+    chain = from_torch(Counted(), identity="snapshot@1").map(lambda row: {"id": row["id"] * 2}).threads(2)
+    if read is not None:
+        chain = chain.read(read)
+    destination = tmp_path / "snapshot"
+    manifest = chain.snapshot(str(destination), rows_per_shard=7)
+    stored = Files(str(destination)).records("indexed")
+    assert [int(stored[index]["id"]) for index in range(len(stored))] == list(range(0, 64, 2))
+    assert manifest["rows"] == 32
+    assert maximum <= 2
+
+
+def test_snapshot_provisions_the_requested_indexed_read(tmp_path):
+    input = tmp_path / "rows.jsonl"
+    input.write_text('{"id":0}\n{"id":1}\n')
+    files = Files(str(input))
+    assert not files.supports("indexed")
+    destination = tmp_path / "snapshot"
+    files.read("indexed").threads(1).snapshot(str(destination))
+    assert Files(str(input)).supports("indexed")
+    stored = Files(str(destination)).records("indexed")
+    assert [stored[index] for index in range(len(stored))] == [{"id": 0}, {"id": 1}]
+
+
+@pytest.mark.parametrize("read", [None, "indexed"])
+def test_snapshot_reads_a_prepared_hub_without_physical_shards(tmp_path, monkeypatch, read):
+    from types import SimpleNamespace
+
+    import datasets
+    from huggingface_hub import HfApi
+
+    from dew.data import Hub
+
+    (tmp_path / "dataset_info.json").write_text("{}")
+    prepared = datasets.Dataset.from_dict({"id": [4, 5, 6]})
+    builder = SimpleNamespace(cache_dir=str(tmp_path), config=SimpleNamespace(data_files=None),
+                              info=SimpleNamespace(features=None, splits=None),
+                              as_dataset=lambda **kwargs: prepared)
+    monkeypatch.setattr(datasets, "load_dataset_builder", lambda *args, **kwargs: builder)
+    monkeypatch.setattr(HfApi, "dataset_info", lambda *args, **kwargs: SimpleNamespace(sha="pinned"))
+    monkeypatch.setattr(HfApi, "list_repo_files", lambda *args, **kwargs: ["train.tar"])
+    chain = Hub("owner/data", revision="pinned").threads(1)
+    if read is not None:
+        chain = chain.read(read)
+    destination = tmp_path / "snapshot"
+    chain.snapshot(str(destination))
+    stored = Files(str(destination)).records("indexed")
+    assert [stored[index]["id"] for index in range(len(stored))] == [4, 5, 6]
+
+
 def test_remote_indexed_arrayrecords_read_only_the_selected_physical_shard(monkeypatch):
     root = Store(f"memory://lazy-records-{uuid4().hex}")
     manifest = export(
