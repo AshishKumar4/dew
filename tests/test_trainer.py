@@ -1123,7 +1123,7 @@ def test_a_batch_of_other_dtypes_at_the_same_shapes_runs_a_step_compiled_for_the
 
     tracker = RecordingTracker()
     Trainer(Regression(), optax.sgd(.1), key=jax.random.key(0), tracker=tracker).fit(
-        Data(Narrowing), steps=4, log_every=1, checkpoint_final=False)
+        dataset(Narrowing), steps=4, log_every=1, checkpoint_final=False)
     compiles = [scalars["train/compiles"] for _, scalars in tracker.scalars if "train/compiles" in scalars]
     assert compiles[-1] == 2
 

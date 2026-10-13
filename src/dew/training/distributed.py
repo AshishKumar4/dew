@@ -798,7 +798,8 @@ def shard_batch(mesh: Mesh, batch: Batch, reads: Sequence[bool] | None = None) -
     moving = [leaf if isinstance(leaf, jax.Array) else np.array(leaf, copy=True) if cpu else np.asarray(leaf)
               for index, leaf in enumerate(leaves) if index not in held]
     count = DataPartition.of(mesh).count
-    shardings = batch_shardings(mesh, moving)
+    every: list[NamedSharding] = jax.tree.leaves(batch_shardings(mesh, batch))
+    shardings = [sharding for index, sharding in enumerate(every) if index not in held]
     if jax.process_count() == 1:
         # The whole batch is this process's share, placed by one device_put
         # for the tree: 74 us of host time a batch on an RTX 4080, and 174 on
