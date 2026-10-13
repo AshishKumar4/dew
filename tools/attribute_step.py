@@ -203,6 +203,10 @@ def attribute_time(trace: Path, steps: int, model_flops: float | None,
             # A multi-output fusion carries no name of its own; its ops say what it computes.
             part = by_majority([part_of(each) for each in known.traced], "other")
             direction = by_majority([direction_of(each) for each in known.traced], "neither")
+        if known is not None and any(re.search(dict(PARTS)["optimizer"], each) for each in known.reads):
+            # An update is named by its root, the parameter it writes narrowed for the next step's
+            # compute (training/narrow.py); the optimizer state it reads says what it is.
+            part = "optimizer"
         by_part[part][direction] += us
         by_kind[kind] += us
         by_part_kind[part][kind] += us
