@@ -63,7 +63,10 @@ def test_stats_only_loss_matches_auxiliary_loss_and_direct_differentiation(stati
     np.testing.assert_array_equal(gradient['params']['weight'], jnp.full(2, -2.))
 
 
-def test_supplied_state_continues_instead_of_initializing_again():
+def test_a_supplied_state_is_the_runs_initial_state():
+    """A run handed another run's state starts from it rather than a fresh
+    initialization: on a stream that reads the same batch throughout, two steps
+    from a two-step state equal four from scratch."""
     direct = trainer(auxiliary=True).fit(data(), steps=4, log_every=4)
     running = trainer(auxiliary=True)
     middle = running.fit(data(), steps=2, log_every=2)
