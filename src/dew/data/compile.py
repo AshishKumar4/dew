@@ -969,13 +969,16 @@ def publish(
     planned = _at(pipeline.stages, Pack)
     builder = None
     if planned is not None:
-        from dew.data.packing import PackingPlan
+        from dew.data.packing import PackingPlan, chunks_for
 
         packing = pipeline.stages[planned]
         if not isinstance(packing, Pack) or planned != len(pipeline.stages) - 1:
             raise ValueError("publication accepts one terminal packing stage after the cached prefix")
-        builder = PackingPlan(packing)
-        pipeline = dataclasses.replace(pipeline, stages=pipeline.stages[:planned])
+        # A chunk step just before the pack is the plan's own cut (`chunks_for`), not the prefix's.
+        before = pipeline.stages[planned - 1] if planned else None
+        chunked = isinstance(before, FlatMap) and chunks_for(before.step, packing)
+        builder = PackingPlan(packing, chunked=chunked)
+        pipeline = dataclasses.replace(pipeline, stages=pipeline.stages[: planned - chunked])
     (pipeline,) = _prepared((pipeline,), read, provision=provision)
     source = pipeline.source
     if isinstance(source, (Mixture, Phases)):
