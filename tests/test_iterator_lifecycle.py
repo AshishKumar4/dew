@@ -306,9 +306,9 @@ def test_full_queue_close_preserves_consumed_position_and_releases_source():
     assert ref() is None
 
 
-def test_a_stop_request_racing_the_workers_close_reaches_the_source_before_it_or_not_at_all():
-    """close asks a stoppable source to stop while the worker, the source just drained, takes it to
-    close: the request reaches the source before its close begins, never after the worker let it go.
+def test_a_stop_request_racing_the_workers_close_reaches_the_source_it_read():
+    """close asks a stoppable source to stop while the worker, the source just drained, closes it
+    and lets it go: the request reaches the source close read, and close returns without error.
     The source holds the race open: when close checks it for request_stop, the source lets its
     worker drain and finish, and waits a moment for it."""
     events, drain = [], threading.Event()
@@ -344,7 +344,7 @@ def test_a_stop_request_racing_the_workers_close_reaches_the_source_before_it_or
     consumer.start()
     stream.close()
     consumer.join(10)
-    assert events == ["stop", "close"]
+    assert sorted(events) == ["close", "stop"]
 
 
 @pytest.mark.parametrize("failure", [None, ValueError("source failed")])

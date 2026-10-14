@@ -975,8 +975,9 @@ class DevicePrefetchIterator:
         self._stop = threading.Event()
         self._done = threading.Event()
         self._start_lock = threading.Lock()
-        # Held while a stop request reaches the source and while the worker takes the source to
-        # close it: a request either reaches the source before its close begins, or not at all.
+        # Held while a stop request reaches the source and while the worker lets the source go:
+        # a request reaches the source it read (during its close too, which may wait on it), and
+        # the worker releases the source only after that request returns.
         self._handover = threading.Lock()
         self._error: BaseException | None = None
         self._cleanup_error: BaseException | None = None
@@ -1018,7 +1019,7 @@ class DevicePrefetchIterator:
             self._stop_source()
 
     def _stop_source(self) -> None:
-        """Ask the source to stop its own work, unless the worker has taken it to close."""
+        """Ask the source to stop its own work, unless the worker has already let it go."""
         with self._handover:
             source = self._iterator
             if isinstance(source, Stoppable):
@@ -1078,9 +1079,6 @@ class DevicePrefetchIterator:
             self._error = error
         finally:
             batch = placed = state = None
-            with self._handover:
-                # The source is this thread's to close from here: no stop request reaches it.
-                self._iterator = None
             try:
                 close = iterator.close if isinstance(iterator, Closeable) else None
                 if close is not None:
@@ -1088,6 +1086,8 @@ class DevicePrefetchIterator:
             except BaseException as error:
                 self._cleanup_error = error
             finally:
+                with self._handover:
+                    self._iterator = None
                 self._mesh = self._prepare = None
                 # No bound close method or checkpointable alias may retain a
                 # Grain pipeline after the worker exits.
