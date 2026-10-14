@@ -24,6 +24,7 @@ def spec(*, backend="device", augment=True, crop_scale=(1.0, 1.0), staging_size=
     rows = [{"image": np.random.default_rng(index).integers(
         0, 256, (19, 23, 3), dtype=np.uint8), "label": index} for index in range(24)]
     return ImageData(source=Memory(rows), image_size=12, caption="a flower", staging_size=staging_size,
+                  validation=None,
                   augment=Augment(flip=True, jitter=True, crop_scale=crop_scale,
                       backend=backend) if augment else None)
 

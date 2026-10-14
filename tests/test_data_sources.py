@@ -118,6 +118,56 @@ def moving_hub_conversion(monkeypatch, tmp_path, request):
     return converted
 
 
+def test_a_split_saved_as_arrow_streams_its_parquet_conversion(monkeypatch):
+    """A dataset repo's `.arrow` files are what `save_to_disk` and `push_to_hub` write, Arrow's
+    stream format, which no file reader opens; a split that holds only those streams its Parquet
+    conversion, and a pinned revision without one is prepared rather than streamed."""
+    from types import SimpleNamespace
+
+    import pyarrow.parquet as pq
+    from huggingface_hub import HfApi, HfFileSystem
+    from huggingface_hub.hf_api import GitRefInfo, GitRefs
+
+    from dew.data.compile import compile
+    from dew.data.dataset import DataPartition
+    from dew.data.pipeline import Pipeline
+    from dew.data.sources import Hub
+
+    rows = pa.table({"id": list(range(12))})
+    stream = pa.BufferOutputStream()
+    with pa.ipc.new_stream(stream, rows.schema) as writer:
+        writer.write_table(rows)
+    converted = pa.BufferOutputStream()
+    pq.write_table(rows, converted)
+    payloads = {
+        "datasets/owner/data@original/train/data-00000-of-00001.arrow": stream.getvalue().to_pybytes(),
+        "datasets/owner/data@converted/default/train/0000.parquet": converted.getvalue().to_pybytes(),
+    }
+
+    def header(self, path, **kwargs):
+        return {"name": path, "type": "file", "size": len(payloads[path]),
+                "sha256": hashlib.sha256(payloads[path]).hexdigest()}
+
+    def listing(self, repo, *, repo_type, revision):
+        return (["default/train/0000.parquet"] if revision == "converted"
+                else ["train/data-00000-of-00001.arrow", "train/state.json"])
+
+    conversion = GitRefInfo(name="parquet", ref="refs/convert/parquet", target_commit="converted")
+    monkeypatch.setattr(HfApi, "dataset_info", lambda self, repo, **kwargs: SimpleNamespace(sha="original"))
+    monkeypatch.setattr(HfApi, "list_repo_files", listing)
+    monkeypatch.setattr(HfApi, "list_repo_refs",
+                        lambda self, repo, **kwargs: GitRefs(branches=[], converts=[conversion], tags=[]))
+    monkeypatch.setattr(HfFileSystem, "info", header)
+    monkeypatch.setattr(HfFileSystem, "_open", lambda self, path, **kwargs: io.BytesIO(payloads[path]))
+    reader = compile(Pipeline(Hub("owner/data")).batch(4), read="streamed",
+                     loading=Loading(workers=0)).train(DataPartition())
+    try:
+        assert [int(value) for _ in range(3) for value in next(reader)["id"]] == list(range(12))
+    finally:
+        reader.close()
+    assert Hub("owner/data", revision="original").streamed is None
+
+
 def test_a_conversion_that_moves_under_one_default_commit_is_another_snapshot(moving_hub_conversion):
     """One source pins its conversion once; a new source refuses the old plan
     after that conversion moves under the same default commit."""
@@ -230,7 +280,7 @@ def test_metadata_wrapped_hub_resume_keeps_facts_and_checks_consumed_files(
         moved.close()
 
 
-@pytest.mark.parametrize("format", ["jsonl", "arrow", "parquet"])
+@pytest.mark.parametrize("format", ["jsonl", "parquet"])
 def test_hub_native_shards_keep_the_requested_revision(monkeypatch, format):
     from types import SimpleNamespace
 
