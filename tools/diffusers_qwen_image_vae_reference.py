@@ -35,6 +35,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from reference_vjp import recorded_vjp
 
 DIFFUSERS_COMMIT = "6256aa7666cedd47443adc8f82da9a10e110b09c"
 CONFIG = {"base_dim": 4, "decoder_base_dim": 6, "z_dim": 8, "dim_mult": [1, 2, 2, 4, 4], "num_res_blocks": 1,
@@ -63,35 +64,21 @@ def build(root: Path) -> dict[str, np.ndarray]:
     model.save_pretrained(root / "vae", safe_serialization=True)
     named = list(model.named_parameters())
 
-    def gradients(loss, inputs):
-        every = inputs + [value for _, value in named]
-        found = torch.autograd.grad(loss, every, allow_unused=True)
-        return [torch.zeros_like(value) if gradient is None else gradient
-                for gradient, value in zip(found, every, strict=True)]
-
     image = (torch.rand((BATCH, CONFIG["in_channels"], HEIGHT, WIDTH), generator=generator) * 2 - 1
              ).requires_grad_()
     posterior = model.encode(image[:, :, None]).latent_dist
     mean, std = posterior.mean[:, :, 0], posterior.std[:, :, 0]
-    probe_mean = torch.randn(mean.shape, generator=generator)
-    probe_std = torch.randn(std.shape, generator=generator)
-    encoded = gradients((mean * probe_mean).sum() + (std * probe_std).sum(), [image])
+    encoded = recorded_vjp("encode", {"probe_mean": mean, "probe_std": std}, {"image": image}, named,
+                           generator)
 
     latent = torch.randn(mean.shape, generator=generator).requires_grad_()
     pixels = model.decode(latent[:, :, None], return_dict=False)[0][:, :, 0]
-    probe = torch.randn(pixels.shape, generator=generator)
-    decoded = gradients((pixels * probe).sum(), [latent])
+    decoded = recorded_vjp("decode", {"probe": pixels}, {"latent": latent}, named, generator)
 
     arrays = {
         "image": image.detach().numpy(), "mean": mean.detach().numpy(), "std": std.detach().numpy(),
-        "probe_mean": probe_mean.numpy(), "probe_std": probe_std.numpy(),
-        "encode.grad_image": encoded[0].numpy(),
-        "latent": latent.detach().numpy(), "pixels": pixels.detach().numpy(), "probe": probe.numpy(),
-        "decode.grad_latent": decoded[0].numpy(),
+        "latent": latent.detach().numpy(), "pixels": pixels.detach().numpy(), **encoded, **decoded,
     }
-    for (name, _), from_encode, from_decode in zip(named, encoded[1:], decoded[1:], strict=True):
-        arrays[f"encode.grad.{name}"] = from_encode.numpy()
-        arrays[f"decode.grad.{name}"] = from_decode.numpy()
     clamped = float((pixels.detach().abs() >= 1).float().mean())
     print(f"parameters {len(named)} ({sum(value.numel() for _, value in named)} values); "
           f"latent {tuple(mean.shape)}; |mean| <= {np.abs(arrays['mean']).max():.3g}; "

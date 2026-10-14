@@ -11,7 +11,6 @@ interface __BaseEnv_Env {
 	WALL_SECONDS: "1200";
 	WARM_SECONDS: "600";
 	IDLE_SECONDS: "300";
-	CPU_SECONDS: "900";
 	IP_WINDOW_SECONDS: "600";
 	IP_STARTS: "10" | "3";
 	COORDINATOR: DurableObjectNamespace<import("./src/index").Coordinator>;
@@ -36,7 +35,6 @@ declare namespace Cloudflare {
 		WALL_SECONDS: "1200";
 		WARM_SECONDS: "600";
 		IDLE_SECONDS: "300";
-		CPU_SECONDS: "900";
 		IP_WINDOW_SECONDS: "600";
 		IP_STARTS: "10";
 		COORDINATOR: DurableObjectNamespace<import("./src/index").Coordinator>;
@@ -52,5 +50,5 @@ type StringifyValues<EnvType extends Record<string, unknown>> = {
 	[Binding in keyof EnvType]: EnvType[Binding] extends string ? EnvType[Binding] : string;
 };
 declare namespace NodeJS {
-	interface ProcessEnv extends StringifyValues<Pick<Cloudflare.Env, "SNAPSHOT_COMMIT" | "ALLOWED_ORIGINS" | "TURNSTILE_HOSTNAMES" | "TURNSTILE_TEST_KEYS" | "BUDGET_SECONDS" | "MAX_SESSIONS" | "WALL_SECONDS" | "WARM_SECONDS" | "IDLE_SECONDS" | "CPU_SECONDS" | "IP_WINDOW_SECONDS" | "IP_STARTS">> {}
+	interface ProcessEnv extends StringifyValues<Pick<Cloudflare.Env, "SNAPSHOT_COMMIT" | "ALLOWED_ORIGINS" | "TURNSTILE_HOSTNAMES" | "TURNSTILE_TEST_KEYS" | "BUDGET_SECONDS" | "MAX_SESSIONS" | "WALL_SECONDS" | "WARM_SECONDS" | "IDLE_SECONDS" | "IP_WINDOW_SECONDS" | "IP_STARTS">> {}
 }

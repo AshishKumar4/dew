@@ -68,11 +68,11 @@ export default {
 			return Response.json({ reply, status: await registry.status(), calls: await preparer.calls(), now: Date.now() });
 		}
 		if (scenario === 'hash-alarm') {
-			await registry.ensure('c'.repeat(64));
+			await registry.ensure('c'.repeat(40));
 			await registry.runAlarm();
 			const leased = (await registry.status()).rebuild;
 			await preparer.finish();
-			return Response.json({ leased, generation: await registry.current('c'.repeat(64)), calls: await preparer.calls() });
+			return Response.json({ leased, generation: await registry.current('c'.repeat(40)), calls: await preparer.calls() });
 		}
 		if (scenario === 'alarm-failure') {
 			await registry.refresh(A);

@@ -47,12 +47,10 @@ beginning and end ids), read back with the pinned gguf-py.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import subprocess
 import sys
 import tarfile
-import urllib.request
 from pathlib import Path
 
 import numpy as np
@@ -62,7 +60,6 @@ FIXTURE = ROOT / "tests" / "fixtures" / "llama_cpp"
 TOKENIZER = FIXTURE / "tokenizer"
 COMMIT = "7fe450e19305b828c199d602c23a8337aaa1f03b"
 ARCHIVE_SHA256 = "a6861d549427f814dc591c439e08206f67ffaba0248344d421589abf18199e67"
-SOURCE = Path.home() / ".cache" / "dew" / "upstream" / "ggml-org" / "llama.cpp" / COMMIT
 FIELDS = {"vocab_size": 384, "emb_features": 64, "num_layers": 2, "num_heads": 4, "num_kv_heads": 2,
           "mlp_features": 128, "max_seq_len": 64, "qk_norm": False, "tie_embeddings": False}
 SEED = 61
@@ -207,23 +204,20 @@ def digests(directory: Path) -> dict[str, str]:
 
 
 def fetch() -> Path:
-    """The pinned source, fetched once and checked against its SHA-256."""
-    if (SOURCE / "convert_hf_to_gguf.py").is_file():
-        return SOURCE
-    SOURCE.mkdir(parents=True, exist_ok=True)
-    archive = SOURCE / "source.tar.gz"
-    url = f"https://github.com/ggml-org/llama.cpp/archive/{COMMIT}.tar.gz"
-    with urllib.request.urlopen(url, timeout=300) as response:
-        archive.write_bytes(response.read())
-    found = hashlib.sha256(archive.read_bytes()).hexdigest()
-    if found != ARCHIVE_SHA256:
-        raise RuntimeError(f"{url} has SHA-256 {found}, not the pinned {ARCHIVE_SHA256}")
+    """The pinned source, its archive fetched once, checked against its
+    SHA-256 and unpacked."""
+    from tools.reference_source import CACHE, verified
+
+    unpacked = CACHE / "ggml-org" / "llama.cpp" / COMMIT
+    if (unpacked / "convert_hf_to_gguf.py").is_file():
+        return unpacked
+    archive = verified(f"https://github.com/ggml-org/llama.cpp/archive/{COMMIT}.tar.gz",
+                       unpacked.parent / f"{COMMIT}.tar.gz", ARCHIVE_SHA256)
     with tarfile.open(archive) as source:
         for member in source.getmembers():
             member.name = member.name.split("/", 1)[1] if "/" in member.name else ""
-        source.extractall(SOURCE, members=[m for m in source.getmembers() if m.name], filter="data")
-    archive.unlink()
-    return SOURCE
+        source.extractall(unpacked, members=[m for m in source.getmembers() if m.name], filter="data")
+    return unpacked
 
 
 def build(source: Path) -> Path:

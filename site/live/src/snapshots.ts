@@ -68,7 +68,7 @@ export class SnapshotRegistry extends DurableObject<SnapshotEnv> {
 	}> {
 		const generation = await this.current(commit);
 		if (generation) return { generation, rebuilding: false };
-		if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(commit)) throw new Error('snapshot generation must be pinned');
+		if (!/^[0-9a-f]{40}$/.test(commit)) throw new Error('snapshot generation must be pinned');
 		await this.ctx.storage.transaction(async (storage) => {
 			if ((await storage.get<string>('requested')) !== commit) await storage.delete('retries');
 			await storage.put('requested', commit);
@@ -131,7 +131,7 @@ export class SnapshotRegistry extends DurableObject<SnapshotEnv> {
 	 * to `prepared`; the alarm fails a lease that hears nothing. Whether it started one.
 	 */
 	async refresh(commit: string, now = Date.now()): Promise<boolean> {
-		if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(commit)) throw new Error('snapshot generation must be pinned');
+		if (!/^[0-9a-f]{40}$/.test(commit)) throw new Error('snapshot generation must be pinned');
 		const token = crypto.randomUUID();
 		const acquired = await this.ctx.storage.transaction(async (storage) => {
 			const lease = await storage.get<{ until: number }>('rebuild');

@@ -7,6 +7,8 @@ left, a queue longer than the slots, and a request too large for the cache.
 """
 
 import dataclasses
+import itertools
+import threading
 
 import jax
 import jax.numpy as jnp
@@ -406,6 +408,34 @@ def test_more_requests_than_slots_queue_and_all_complete():
     for index, (prompt, budget) in enumerate(zip(prompts, budgets, strict=True)):
         assert tickets[index].result().text == bound(prompt, budget, key=index).text
     assert all(ticket.admitted is not None and ticket.admitted >= ticket.submitted for ticket in tickets)
+
+
+@pytest.mark.parametrize("options", [{}, {"kv_cache": KVCache(page_size=16, pages=12)}],
+                         ids=["dense", "paged"])
+def test_requests_submitted_while_another_thread_steps_are_served_in_order(options):
+    """A thread submits while another steps the server: each request is
+    served as the task serves it alone, admitted no earlier than it was
+    submitted and no earlier than any request submitted before it."""
+    bound = task()
+    server = Server.from_task(bound, slots=2, capacity=128, admission=2, **options)
+    prompts, budgets = PROMPTS * 3, BUDGETS * 3
+    tickets, submitted = [], threading.Event()
+
+    def submit():
+        for index, (prompt, budget) in enumerate(zip(prompts, budgets, strict=True)):
+            tickets.append(server.submit(prompt, budget, key=index))
+        submitted.set()
+
+    submitter = threading.Thread(target=submit)
+    submitter.start()
+    while not submitted.is_set() or server.queued or server.occupancy:
+        server.step()
+    submitter.join()
+    server.run()
+    for index, (prompt, budget) in enumerate(zip(prompts, budgets, strict=True)):
+        assert tickets[index].result().text == bound(prompt, budget, key=index).text
+    assert all(ticket.admitted >= ticket.submitted for ticket in tickets)
+    assert all(before.admitted <= after.admitted for before, after in itertools.pairwise(tickets))
 
 
 def test_a_prompt_past_the_bucket_under_the_capacity_is_served_as_the_task_serves_it():

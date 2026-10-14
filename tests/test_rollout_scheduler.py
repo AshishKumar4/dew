@@ -1,17 +1,5 @@
-"""The rollout scheduler: complete groups within the staleness bound, failures masked and retried.
-
-A scripted source decides each sample's outcome from its task, submission
-and sample index, and can leave a sample running for the test to finish or
-never finish. The checks: groups enter the batch complete and relabelled so a
-retried sample rejoins its own group; infrastructure failures and
-cancellations are resubmitted and never trained; a sample that keeps failing
-abandons its group; truncations stay masked; stragglers are cut by
-over-sampling and the admit count; stale rollouts are discarded before anyone
-waits on them; a rollout spanning a weight push keeps its oldest version; a
-reopened stream cancels what the old one left in flight; a source that
-raises stops the batch; and a real `Trainer` trains a tiny model through
-two-turn in-process environments on Dew's own server.
-"""
+"""The rollout scheduler driving a real `Trainer`: a tiny model trains
+through two-turn in-process environments on Dew's own server."""
 
 import math
 from contextlib import contextmanager
@@ -30,42 +18,6 @@ from dew.objectives.rl.scheduler import RolloutScheduler
 from dew.objectives.rl.sessions import Status, pack
 from dew.sampling import Sampling
 from dew.training import Layout, Trainer
-
-WIDTH = 8
-ROWS = 8
-
-
-class Objective:
-    """The scheduler reads the correction setting and rescores packed rows."""
-
-    behavior_importance = 2.0
-
-    def packed_log_probs(self, params, batch):
-        return jnp.full(batch["input_ids"].shape, -0.75, jnp.float32) + 0 * params
-
-
-class Publisher:
-    def __init__(self, version=0, stall=0):
-        self.version, self.loads, self.stall = version, [], stall
-
-    def load(self, variables, version):
-        self.loads.append(version)
-        if len(self.loads) > self.stall:
-            self.version = version
-
-
-def batches(*rows):
-    for tasks in rows:
-        yield {"task_id": np.asarray(tasks, np.int32)}
-
-
-def scheduler(source, publisher=None, stream=((1, 2), (3, 4), (5, 6)), **options):
-    records = []
-    options = {"groups": 2, "max_lag": 1, "ahead": 1, "width": WIDTH, "rows": ROWS, **options}
-    rollout = RolloutScheduler(Objective(), source, publisher or Publisher(), log=records.append, **options)
-    data = rollout.tasks(Loader(train=lambda partition: batches(*stream), val=None, records=None, batch=2))
-    return rollout, data, records
-
 
 VOCAB = 13
 STOP = 12
