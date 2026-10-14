@@ -127,9 +127,10 @@ def programs(event: str, args: tuple) -> list:
 
 
 def native(names: list) -> bool:
-    """Whether every one of `names`, and at least one, is a program of `TOOLS`."""
-    return bool(names) and all(name is not None and os.path.basename(os.fsdecode(name)) in TOOLS
-                               for name in names)
+    """Whether every one of `names`, and at least one, is a program of `TOOLS`. A start that names
+    its program by a file descriptor (`os.execve`'s), or by nothing, is no tool's."""
+    return bool(names) and all(isinstance(name, (str, bytes, os.PathLike))
+                               and os.path.basename(os.fsdecode(name)) in TOOLS for name in names)
 
 
 def start_child(self: BaseProcess) -> None:
