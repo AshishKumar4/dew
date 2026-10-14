@@ -36,7 +36,6 @@ from flax import linen as nn
 from dew.diffusion import DirectPredictionTransform, FlowMatchingScheduler, Process
 from dew.inputs import Field, InputSpec
 from dew.interop import load_params, save_params
-from dew.interop.hub import pull_from_hub
 from dew.sampling import Euler, TextToImage
 
 class Zero(nn.Module):

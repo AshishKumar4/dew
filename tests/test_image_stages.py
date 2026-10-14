@@ -165,6 +165,7 @@ def test_prepared_arrayrecords_and_public_image_steps_deliver_the_same_batches(t
 def test_host_image_augmentation_matches_across_workers_and_resumes_exactly():
     rows = [{**row, "label": np.int64(row["id"] % 3)} for row in pictures().values]
     recipe = ImageData(source=Memory(rows), image_size=16, staging_size=24,
+                       validation=None,
                        caption_templates=("a {label}", "a photo of {}"),
                        classes=("rose", "tulip", "lily"),
                        augment=Augment(backend="host", crop_scale=(0.6, 0.9)))

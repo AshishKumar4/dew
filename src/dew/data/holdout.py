@@ -9,7 +9,7 @@ import json
 import random
 from collections.abc import Callable, Mapping, Sequence
 from types import UnionType
-from typing import TYPE_CHECKING, Literal, Protocol, TypeAliasType, runtime_checkable
+from typing import TYPE_CHECKING, ClassVar, Literal, Protocol, TypeAliasType, runtime_checkable
 
 import numpy as np
 import tyro
@@ -22,6 +22,8 @@ from dew.records import integer
 
 if TYPE_CHECKING:
     from dew.data.sources.files import Format
+
+_INDEXED_READS: tuple[Read, ...] = ("memory", "indexed")
 
 
 @runtime_checkable
@@ -39,6 +41,7 @@ def _named_split(source: Source, name: str) -> Source:
 
 @dataclasses.dataclass(frozen=True)
 class _SliceRecords:
+    reads: ClassVar[tuple[Read, ...]] = _INDEXED_READS
     source: Source
     start: int
     stop: int | None = None
@@ -53,7 +56,7 @@ class _SliceRecords:
         return {**self.source.fingerprint(), "slice": [self.start, self.stop]}
 
     def supports(self, read: Read) -> bool:
-        return read != "streamed" and self.source.supports(read)
+        return read in self.reads and self.source.supports(read)
 
     def records(self, read: Read):
         from dew.data.dataset import SourceSlice
@@ -115,6 +118,7 @@ class _HashSource:
     that do not: a row is in exactly one part, the same in every run, read,
     machine and resume."""
 
+    reads: ClassVar[tuple[Read, ...]] = ("memory", "streamed")
     source: Source
     low: float
     high: float
@@ -133,7 +137,7 @@ class _HashSource:
                 "key": self.key, "content_hash": "sha256:sorted-mappings-v1"}
 
     def supports(self, read: Read) -> bool:
-        return read != "indexed" and self.source.supports(read)
+        return read in self.reads and self.source.supports(read)
 
     def records(self, read: Read):
         import grain.python as grain
@@ -261,6 +265,7 @@ class Split:
 
 @dataclasses.dataclass(frozen=True)
 class _RandomSource:
+    reads: ClassVar[tuple[Read, ...]] = _INDEXED_READS
     source: Source
     split: HoldOut
     held: bool
@@ -275,7 +280,7 @@ class _RandomSource:
         return {**self.source.fingerprint(), "holdout": dataclasses.asdict(self.split), "held": self.held}
 
     def supports(self, read: Read) -> bool:
-        return read != "streamed" and self.source.supports(read)
+        return read in self.reads and self.source.supports(read)
 
     def _indices(self, count: int) -> tuple[int, ...]:
         size = (

@@ -45,7 +45,9 @@ The arithmetic is NumPy's on a host copy. XLA on CPU reads and writes
 float32 subnormals as zero, and these formats keep them: an MXFP4 group of
 2 ** -127 weights encodes to the 0.5 code at the 2 ** -126 scale and
 decodes back to 2 ** -127, which the same code under jax.numpy returns as
-zeros (measured, jax 0.11 CPU, scale bytes 0 and 1).
+zeros (measured, jax 0.11 CPU, scale bytes 0 and 1). The one cast a traced
+program also runs is the FP8 block cast (`fp8_block_cast`), on a frozen FP8
+product's activation rows, whose 1e-4 amax floor keeps every scale normal.
 """
 
 from __future__ import annotations
@@ -58,6 +60,7 @@ from functools import partial
 from types import MappingProxyType
 from typing import Literal
 
+import jax
 import jax.numpy as jnp
 import ml_dtypes
 import numpy as np
@@ -65,7 +68,7 @@ from numpy.typing import ArrayLike, DTypeLike
 
 from dew import records
 from dew.interop.weights import checkpoint_array
-from dew.nn.fake_quant import E2M1, E2M1_MIDPOINTS
+from dew.nn.fake_quant import E2M1, E2M1_MIDPOINTS, correctly_rounded_divide
 
 # --------------------------------------------------------------------------
 # E2M1 codes under E8M0 exponents, shared by every FP4 format
@@ -498,9 +501,24 @@ def fp8_format(quantization: Mapping[str, object]) -> tuple[int, bool]:
     return block[0], scale_fmt == 'ue8m0'
 
 
+Block = int | tuple[int, int]
+"""The rows and columns one FP8 scale covers: DeepSeek's square `block`, or
+`(rows, cols)`, such as `(1, cols)` for one scale a row of a `cols`-wide
+matrix (a frozen FP8 matrix's rows, `dew.training.quantization`)."""
+
+
+def _sides(block: Block) -> tuple[int, int]:
+    """`block` as its rows and columns, refused unless both are positive ints."""
+    rows, cols = (block, block) if isinstance(block, int) else block
+    if type(rows) is not int or type(cols) is not int or rows < 1 or cols < 1:
+        raise ValueError(f"a block covers a positive number of rows and columns, got {block!r}")
+    return rows, cols
+
+
 def dequantize_fp8_blocks(weight: np.ndarray, scale_inv: np.ndarray,
-                          block: int = BLOCK, *, runs: int = 1) -> np.ndarray:
-    """Return float32(weight[i, j]) * float32(scale_inv[i // block, j // block]).
+                          block: Block = BLOCK, *, runs: int = 1) -> np.ndarray:
+    """Return float32(weight[i, j]) * float32(scale_inv[i // rows, j // cols])
+    for `block` = (rows, cols), or `block` x `block`.
 
     `weight` may be in any float dtype, `scale_inv` float32 or E8M0. With
     `runs` the rows are that many equal runs, each tiled in blocks of its own
@@ -515,22 +533,22 @@ def dequantize_fp8_blocks(weight: np.ndarray, scale_inv: np.ndarray,
             f"block-scaled dequantization takes a [rows, cols] weight and its "
             f"[row blocks, col blocks] scales, got shapes {weight.shape} and "
             f"{scale_inv.shape}")
-    rows, cols = weight.shape
-    blocks = (math.ceil(rows / block), math.ceil(cols / block))
+    rows, cols = _sides(block)
+    blocks = (math.ceil(weight.shape[0] / rows), math.ceil(weight.shape[1] / cols))
     if scale_inv.shape != blocks:
         raise ValueError(
-            f"a {weight.shape} weight in {block} x {block} blocks takes a "
+            f"a {weight.shape} weight in {rows} x {cols} blocks takes a "
             f"{blocks} scale, got {scale_inv.shape}")
     # Scaled one block row at a time, so no scale array of the weight's size
     # is ever built.
     out = weight.astype(np.float32)
     scales = scale_inv.astype(np.float32)
     for index in range(blocks[0]):
-        out[index * block:(index + 1) * block] *= np.repeat(scales[index], block)[:cols]
+        out[index * rows:(index + 1) * rows] *= np.repeat(scales[index], cols)[:weight.shape[1]]
     return out
 
 
-def _ceil_exponent(values: np.ndarray) -> np.ndarray:
+def _ceil_exponent(values: ArrayLike) -> np.ndarray:
     """The biased exponent of the smallest power of two at or above each
     positive float32 value, read off its bits: the exponent, plus one if any
     mantissa bit is set. DeepGEMM's `ceil_to_ue8m0` and the release kernels'
@@ -539,33 +557,25 @@ def _ceil_exponent(values: np.ndarray) -> np.ndarray:
     return (bits >> 23) + ((bits & 0x007fffff) != 0)
 
 
-def _fp8_scale_inv(amax: np.ndarray, ue8m0: bool) -> np.ndarray:
-    """`per_block_cast_to_fp8`'s scale of a block from its float32 amax; ue8m0
-    rounds it up to a power of two on its bits, clamped to the normal
-    exponents as `ceil_to_ue8m0` clamps."""
-    scale_inv = np.maximum(amax, np.float32(AMAX_FLOOR)) / np.float32(E4M3_MAX)
-    if not ue8m0:
-        return scale_inv
+def _ue8m0(scale_inv: np.ndarray) -> np.ndarray:
+    """`ceil_to_ue8m0`: a block's scale rounded up to a power of two on its
+    bits, clamped to the normal exponents."""
     return (np.clip(_ceil_exponent(scale_inv), 1, 254).astype(np.uint32) << 23).view(np.float32)
 
 
-def _finite_matrix(weight: ArrayLike, rows: int, cols: int) -> np.ndarray:
-    """A weight's host float32 copy, refused unless it is a finite matrix;
-    its blocks are `rows` x `cols`."""
+def _finite_matrix(weight: ArrayLike) -> np.ndarray:
+    """A weight's host float32 copy, refused unless it is a finite matrix."""
     values = np.asarray(weight, np.float32)
     if values.ndim != 2:
         raise ValueError(
             f"block-scaled quantization takes a [rows, cols] weight, got shape "
             f"{values.shape}")
-    if type(cols) is not int or cols < 1:
-        raise ValueError(
-            f"a block covers a positive number of rows and columns, got {cols!r}")
     if not np.isfinite(values).all():
         raise ValueError(
             f"a {values.shape} weight holds "
             f"{int(np.count_nonzero(~np.isfinite(values)))} value(s) that are not "
             f"finite; E4M3FN encodes no infinity, and one of them carries its "
-            f"whole {rows} x {cols} block's scale away with it")
+            f"whole block's scale away with it")
     return values
 
 
@@ -577,15 +587,15 @@ def _runs(weight: np.ndarray, scale: np.ndarray | None, runs: int) -> tuple[list
     return np.split(weight, runs), [None] * runs if scale is None else np.split(scale, runs)
 
 
-def quantize_fp8_blocks(weight: ArrayLike, block: int = BLOCK, *,
+def quantize_fp8_blocks(weight: ArrayLike, block: Block = BLOCK, *,
                         ue8m0: bool = False, runs: int = 1) -> tuple[np.ndarray, np.ndarray]:
     """Cast `weight` to float8_e4m3fn blocks and the float32 scales that invert them.
 
     The inverse of `dequantize_fp8_blocks`: a [rows, cols] weight in any float
     dtype, on any device (widened to a host float32 copy exactly first),
-    gives a float8_e4m3fn array of its shape and a [ceil(rows / block),
-    ceil(cols / block)] `scale_inv`. `ue8m0` rounds the scales up to powers
-    of two, as V3.2's config declares.
+    gives a float8_e4m3fn array of its shape and a [ceil(rows / r),
+    ceil(cols / c)] `scale_inv` for `block` = (r, c), or `block` x `block`.
+    `ue8m0` rounds the scales up to powers of two, as V3.2's config declares.
 
     This is DeepGEMM's `per_block_cast_to_fp8` (deep_gemm/utils/math.py at
     057ca596), the cast that produces weights in this format, ported
@@ -598,8 +608,8 @@ def quantize_fp8_blocks(weight: ArrayLike, block: int = BLOCK, *,
 
     Not `act_quant` in DeepSeek's inference code, the activation rule: it
     reduces over 1 x 128 tiles and divides where the weight cast multiplies
-    by a reciprocal. The partial blocks the reference zero-pads are reduced
-    in place here, which zeros and the 1e-4 floor make the same reduction.
+    by a reciprocal. The partial blocks the reference zero-pads are padded
+    with zeros here too, which the 1e-4 floor makes the same reduction.
 
     The cast needs no clamp. A float32 scale is amax / 448 to within a few
     roundings and a ue8m0 scale is never under it, so a scaled element stays
@@ -609,26 +619,45 @@ def quantize_fp8_blocks(weight: ArrayLike, block: int = BLOCK, *,
     refused by name rather than written as a block of NaN. The 1e-4 floor
     keeps every scale a float32 normal. `runs` tiles each of that many equal
     runs of rows on its own, as `dequantize_fp8_blocks` reads them.
+
+    `fp8_block_cast` runs the same cast in a traced program, to the same bytes.
     """
     if runs > 1:
         parts = [quantize_fp8_blocks(part, block, ue8m0=ue8m0)
                  for part in _runs(np.asarray(weight), None, runs)[0]]
         return np.concatenate([codes for codes, _ in parts]), np.concatenate([scale for _, scale in parts])
-    values = _finite_matrix(weight, block, block)
-    rows, cols = values.shape
-    row_starts, col_starts = np.arange(0, rows, block), np.arange(0, cols, block)
-    # reduceat's last segment in each dimension is the partial block, over
-    # just its own elements.
-    amax = np.maximum.reduceat(
-        np.maximum.reduceat(np.abs(values), row_starts, axis=0), col_starts, axis=1)
-    scale_inv = _fp8_scale_inv(amax, ue8m0)
-    out = np.empty(values.shape, E4M3)
-    for index, start in enumerate(row_starts):
-        # One reciprocal per block, as the reference takes it, repeated across
-        # the block row.
-        scales = np.repeat(np.float32(1.0) / scale_inv[index], block)[:cols]
-        out[start:start + block] = (values[start:start + block] * scales).astype(E4M3)
-    return out, scale_inv
+    rows, cols = _sides(block)
+    codes, scale_inv = _cast_blocks(_finite_matrix(weight), rows, cols, xp=np, divide=np.divide,
+                                    rounded=_ue8m0 if ue8m0 else np.asarray)
+    # A contiguous copy: sliced off the padding, the codes are a view whose
+    # buffer a writer taking it would read as the padded rows.
+    return np.ascontiguousarray(codes), scale_inv
+
+
+def fp8_block_cast(x: jax.Array, block: Block) -> tuple[jax.Array, jax.Array]:
+    """`quantize_fp8_blocks`' cast in a traced program, on a matrix where it
+    computes, to the same bytes: a frozen FP8 product's activation rows
+    (`dew.training.quantization`). No value is refused and no scale is
+    rounded to ue8m0 here."""
+    rows, cols = _sides(block)
+    # XLA divides through a reciprocal; the cast's two divisions round as IEEE's do.
+    return _cast_blocks(x.astype(jnp.float32), rows, cols, xp=jnp, divide=correctly_rounded_divide,
+                        rounded=jnp.asarray)
+
+
+def _cast_blocks(values, rows: int, cols: int, *, xp, divide, rounded):
+    """The FP8 block cast of a float32 `values` matrix under `xp`, NumPy or
+    jax.numpy, dividing by `divide` and rounding each block's scale by
+    `rounded`: `quantize_fp8_blocks`' rule. The 1e-4 amax floor is
+    `per_block_cast_to_fp8`'s `clamp(1e-4)`."""
+    height, width = values.shape
+    padded = xp.pad(values, ((0, -height % rows), (0, -width % cols)))
+    tiles = padded.reshape(padded.shape[0] // rows, rows, padded.shape[1] // cols, cols)
+    amax = xp.maximum(xp.max(xp.abs(tiles), axis=(1, 3)), xp.float32(AMAX_FLOOR))
+    scale_inv = rounded(divide(amax, xp.float32(E4M3_MAX)))
+    # One reciprocal per block, as the reference takes it.
+    codes = (tiles * divide(xp.float32(1.0), scale_inv)[:, None, :, None]).astype(E4M3)
+    return codes.reshape(padded.shape)[:height, :width], scale_inv
 
 
 def scaled_names(tensors: Mapping[str, np.ndarray]) -> tuple[str, ...]:
@@ -831,9 +860,7 @@ def _decode_v4(tensors: Mapping[str, np.ndarray], name: str, *, block: int,
     if value.shape[1] % block or scale.shape != (value.shape[0], value.shape[1] // block):
         raise ValueError(f"{name} is an engram table, [rows, dim] beside a [rows, dim / {block}] "
                          f"{partner}, got {value.shape} and {scale.shape}")
-    rows = value.astype(np.float32).reshape(value.shape[0], value.shape[1] // block, block)
-    rows *= scale.astype(np.float32)[..., None]
-    return rows.reshape(value.shape)
+    return dequantize_fp8_blocks(value, scale, (1, block))
 
 
 def quantize_deepseek_v4_fp4(weight: ArrayLike) -> tuple[np.ndarray, np.ndarray]:
@@ -856,33 +883,18 @@ def quantize_deepseek_v4_fp4(weight: ArrayLike) -> tuple[np.ndarray, np.ndarray]
             exponents.view(ml_dtypes.float8_e8m0fnu))
 
 
-def quantize_fp8_rows(weight: ArrayLike, group: int) -> tuple[np.ndarray, np.ndarray]:
-    """Cast a [rows, cols] weight to float8_e4m3fn with one ue8m0 scale per
-    `group` consecutive values of a row, [rows, cols / group] float32.
-
-    `quantize_fp8_blocks`' rule with ue8m0 over 1 x `group` blocks, the
-    layout V4.1's engram tables ship in.
-    """
-    values = _finite_matrix(weight, 1, group)
-    groups = values.reshape(values.shape[0], values.shape[1] // group, group)
-    scale_inv = _fp8_scale_inv(np.abs(groups).max(-1), ue8m0=True)
-    codes = (groups * (np.float32(1.0) / scale_inv)[..., None]).astype(E4M3)
-    return codes.reshape(values.shape), scale_inv
-
-
 def _encode_v4(name: str, weight: np.ndarray, *, block: int, fp4_experts: bool,
                scale_dtype: str | None) -> dict[str, np.ndarray]:
     """`name` written back as a DeepSeek-V4 weight and `.scale`, in the
     layout `deepseek_v4_layout` gives it. An FP8 weight takes
-    `quantize_fp8_blocks` or `quantize_fp8_rows` under ue8m0, its scale
-    stored in `scale_dtype`, the dtype the source stored its scales in (E8M0
-    when None). An FP4 expert takes `quantize_deepseek_v4_fp4`, whose scales
-    are E8M0."""
+    `quantize_fp8_blocks` under ue8m0, in `block` x `block` blocks or, for an
+    engram table, 1 x `block` ones, its scale stored in `scale_dtype`, the
+    dtype the source stored its scales in (E8M0 when None). An FP4 expert
+    takes `quantize_deepseek_v4_fp4`, whose scales are E8M0."""
     partner, layout = _v4_partners(name)[0], deepseek_v4_layout(name, fp4_experts)
     if layout == 'fp4':
         return dict(zip((name, partner), quantize_deepseek_v4_fp4(weight), strict=True))
-    codes, scale_inv = (quantize_fp8_rows(weight, block) if layout == 'rows'
-                        else quantize_fp8_blocks(weight, block, ue8m0=True))
+    codes, scale_inv = quantize_fp8_blocks(weight, (1, block) if layout == 'rows' else block, ue8m0=True)
     return {name: codes, partner: scale_inv.astype(np.dtype(scale_dtype or V4_SCALE_DTYPES[0]))}
 
 
