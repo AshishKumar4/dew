@@ -10,14 +10,24 @@ except where it packs several records into one row.
 - `lm(ds, tokenizer, seq_len=, batch=)` reads `text`, a string, and writes
   `text`, `text_segment_ids` and `text_positions`, int32 [B, seq_len + 1];
 - `sft(ds, tokenizer, seq_len=, batch=)` reads `messages`, chat turns, and
-  writes the `lm` fields and `text_roles`.
+  writes the `lm` fields and `text_roles`;
+- `clips(ds, seconds, frames=, fps=, size=, batch=)` reads `mp4`, media
+  bytes or a path, and writes `video`, uint8 [B, frames, size, size, 3], and
+  with `sample_rate=`, `audio`, float32 [B, samples], and `audio_valid`, bool
+  [B, samples].
 """
 
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from dew.data import chat, images as image_steps, text as text_steps
+from dew.data import (
+    audio as audio_steps,
+    chat,
+    images as image_steps,
+    text as text_steps,
+    video as video_steps,
+)
 
 if TYPE_CHECKING:
     from transformers import PreTrainedTokenizerBase
@@ -63,3 +73,20 @@ def sft(dataset: Dataset, tokenizer: str | PreTrainedTokenizerBase, *, seq_len: 
 
     return (dataset.map(chat.template(tokenizer)).map(chat.fit_length(seq_len + 1))
             .pack(seq_len + 1, fields=("text", "text_roles")).batch(batch))
+
+
+def clips(dataset: Dataset, seconds: float, *, frames: int, fps: float, size: int, batch: int,
+          sample_rate: int | None = None) -> Pipeline:
+    """Windows of `seconds` drawn from the media in `mp4`, each record's own
+    on every read and resume (`video.pick_clip`), as `frames` frames at `fps`
+    fitted into `size` squares, in batches of `batch`. With `sample_rate`,
+    the window's sound beside them, mono at that rate, filled with silence
+    marked invalid where the media has none (`audio.decode`). Media shorter
+    than the window, or that does not decode, is counted and dropped; the
+    media and its window are read here and leave the record."""
+
+    picked = (dataset.random_filter_map(video_steps.pick_clip(seconds))
+              .filter_map(video_steps.decode(frames, fps=fps, size=size)))
+    if sample_rate is not None:
+        picked = picked.filter_map(audio_steps.decode(sample_rate, missing="silence"))
+    return picked.remove_columns("mp4", "clip").batch(batch)
