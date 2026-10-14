@@ -197,3 +197,31 @@ def test_a_window_is_the_record_s_own_draw(media):
     starts = np.asarray([clip[0] for clip in first])
     assert starts.min() >= 0.1 and starts.max() <= 2.0 - 0.4 - 0.1 and len(set(starts.tolist())) == 16
     assert np.array_equal(state, np.random.get_state()[1])
+
+
+def test_the_clips_preset_batches_a_clip_and_its_sound_by_the_schema_and_passes_other_fields(media):
+    """presets.clips is the public steps written out: each record's window, its frames and its
+    sound, the media read and gone, other fields stacked beside them; a silent clip keeps its
+    frames with its sound marked invalid, and media that does not read is dropped."""
+    from dew.data import presets
+
+    rows = [{"mp4": media["clip"], "id": 0}, {"mp4": media["silent"], "id": 1},
+            {"mp4": b"not media", "id": 2}, {"mp4": media["clip"], "id": 3}]
+    written = (Memory(rows).random_filter_map(video.pick_clip(8 / FPS))
+               .filter_map(video.decode(8, fps=FPS, size=32))
+               .filter_map(audio.decode(SAMPLE_RATE, missing="silence"))
+               .remove_columns("mp4", "clip").batch(2))
+    batched = Memory(rows).pipe(presets.clips, 8 / FPS, frames=8, fps=FPS, size=32, batch=2,
+                                sample_rate=SAMPLE_RATE)
+    batches, expected = _records(batched), _records(written)
+    assert len(batches) == len(expected) == 1
+    (batch,), (reference,) = batches, expected
+    assert set(batch) == {"video", "audio", "audio_valid", "id"}
+    for name in batch:
+        np.testing.assert_array_equal(batch[name], reference[name])
+    assert batch["video"].shape == (2, 8, 32, 32, 3) and batch["video"].dtype == np.uint8
+    assert batch["audio"].shape == (2, 8 * SAMPLES_PER_FRAME) and batch["audio"].dtype == np.float32
+    assert batch["id"].tolist() == [0, 1]
+    assert batch["audio_valid"][0].all() and not batch["audio_valid"][1].any()
+    silent = _records(Memory(rows[:2]).pipe(presets.clips, 8 / FPS, frames=8, fps=FPS, size=32, batch=2))
+    assert set(silent[0]) == {"video", "id"}

@@ -290,7 +290,7 @@ The public image decoder also reads prepared ArrayRecord byte maps: `shape` hold
 | `images(ds, size, *, batch, augment=False, crop_scale=(1, 1), cache=None)` | `image`: encoded bytes or uint8 `[H, W, 3]` | `image` uint8 `[B, size, size, 3]` |
 | `lm(ds, tokenizer, *, seq_len, batch, field="text", cache=None)` | `text`: a string | `text`, `text_segment_ids`, `text_positions`: int32 `[B, seq_len + 1]` |
 | `sft(ds, tokenizer, *, seq_len, batch, cache=None)` | `messages`: chat turns | the `lm` fields and `text_roles` int32 `[B, seq_len + 1]` |
-| `clips(ds, seconds, *, frames, fps, size, batch, sample_rate=None)` | `mp4`: bytes | `video` uint8 `[B, frames, size, size, 3]`; with `sample_rate`, `audio` float32 `[B, samples]` and `audio_valid` bool `[B]` |
+| `clips(ds, seconds, *, frames, fps, size, batch, sample_rate=None)` | `mp4`: bytes | `video` uint8 `[B, frames, size, size, 3]`; with `sample_rate`, `audio` float32 `[B, samples]` and `audio_valid` bool `[B, samples]` |
 
 - A `lm` or `sft` row holds `seq_len` inputs and their next-token targets.
 - `images` and `clips` pass every other field through, stacked per batch: `label` becomes `[B]`, `caption` a list of `B` strings.
