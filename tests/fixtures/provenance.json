@@ -3079,6 +3079,16 @@
     }
    ]
   },
+  "native_unet_float64.npz": {
+   "tool": "tools/native_unet_reference.py --float64",
+   "sources": [
+    {
+     "repo": "huggingface/diffusers",
+     "version": "0.34.0",
+     "runs": "diffusers"
+    }
+   ]
+  },
   "pytorch_fid_tiny": {
    "tool": "tools/pytorch_fid_tiny_reference.py",
    "sources": [
