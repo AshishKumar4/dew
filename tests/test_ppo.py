@@ -40,13 +40,13 @@ class TokenFeatures(nn.Module):
         return jax.nn.one_hot(tokens, VOCAB) * scale
 
 
-def build_ppo():
+def build_ppo(verifier=verify, gamma=.97):
     objective = PPOObjective(ToolPolicy(), PROMPT + RESPONSE - 1,
                              critic=ValueHead(TokenFeatures()), beta=.03)
     trainer = Trainer(objective, optax.sgd(.05), key=jax.random.key(19))
-    source = EpisodeRollout(objective.policy(objective.init(jax.random.key(19))), Harness(), verify,
+    source = EpisodeRollout(objective.policy(objective.init(jax.random.key(19))), Harness(), verifier,
                             PROMPT, RESPONSE, TURNS, sampling=SAMPLING, groups=GROUPS)
-    rollout = PPORollout(objective, source, gamma=.97, lam=.9)
+    rollout = PPORollout(objective, source, gamma=gamma, lam=.9)
     trainer.rollout = rollout
     return trainer, rollout
 
@@ -111,18 +111,14 @@ def test_episode_advantages_hold_at_values_far_above_them():
     difference is the same, and so is each whitened advantage, bit for bit,
     where returns less values would round every advantage below 4 away."""
     def advantages(shift):
-        objective = PPOObjective(ToolPolicy(), PROMPT + RESPONSE - 1, critic=ValueHead(TokenFeatures()),
-                                 beta=.03)
-        state = Trainer(objective, optax.sgd(.05), key=jax.random.key(19)).initial_state()
-        source = EpisodeRollout(objective.policy(objective.init(jax.random.key(19))), Harness(),
-                                lambda episode: shift + 8 * verify(episode), PROMPT, RESPONSE, TURNS,
-                                sampling=SAMPLING, groups=GROUPS)
+        trainer, rollout = build_ppo(lambda episode: shift + 8 * verify(episode), gamma=1.)
+        state = trainer.initial_state()
         params = state.variables["params"]
         value = params["critic"]["value"]
         level = {"kernel": jnp.zeros_like(value["kernel"]), "bias": jnp.full_like(value["bias"], shift)}
         variables = {**state.variables, "params": {**params, "critic": {**params["critic"], "value": level}}}
-        batch = PPORollout(objective, source, gamma=1., lam=.9)(
-            state.replace(variables=variables), {"task_id": np.array([31], np.int32)}, jax.random.key(23))
+        batch = rollout(state.replace(variables=variables), {"task_id": np.array([31], np.int32)},
+                        jax.random.key(23))
         actions = batch["response_mask"] != 0
         assert np.all(batch[OLD_VALUES_KEY][actions] == np.float32(shift))
         return batch["advantages"][actions]
