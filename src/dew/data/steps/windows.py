@@ -123,19 +123,6 @@ class WindowSource:
         return grain.MapDataset.source(self.records("indexed"))[shard.start : shard.stop].to_iter_dataset()
 
 
-@dataclasses.dataclass(frozen=True)
-class Documents:
-    eos_id: int
-
-    def flat_map(self, row: Batch) -> Sequence[Batch]:
-        tokens = np.asarray(row["text"], np.int32)
-        ends = np.flatnonzero(tokens == self.eos_id) + 1
-        if not len(ends) or ends[-1] != len(tokens):
-            ends = np.append(ends, len(tokens))
-        starts = np.concatenate([[0], ends[:-1]])
-        return tuple({"text": tokens[start:end]} for start, end in zip(starts, ends, strict=True))
-
-
 class _WindowIterator(grain.DatasetIterator[Batch]):
     def __init__(self, parent: grain.DatasetIterator[Batch], windows: Windows):
         super().__init__(parent)

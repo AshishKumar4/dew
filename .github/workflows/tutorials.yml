@@ -55,8 +55,9 @@ jobs:
       matrix:
         # Three runners of about two and a half minutes of notebooks each (01
         # 83 s, 03 40; 02 55, 04 47, 05 20, 07 18; 06 35, 08 107 in run
-        # 37786757641). 04 reads the checkpoint 02 writes, so they share one.
-        notebooks: ["01 03", "02 04 05 07", "06 08"]
+        # 37786757641; 11 about 40 s on armada). 04 reads the checkpoint 02
+        # writes, so they share one.
+        notebooks: ["01 03 11", "02 04 05 07", "06 08", "10"]
     name: smoke (${{ matrix.notebooks }})
     steps:
     - uses: actions/checkout@v4

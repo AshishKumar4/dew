@@ -1306,11 +1306,11 @@ def decoder_tensors(family: "DecoderFamily", model: CausalTransformer, variables
         kernel = name.endswith('.kernel') and value.ndim == 2
         layouts[target] = WeightLayout(target, (('params', *name.split('.')),), value.shape[::-1]
                                        if kernel else value.shape, (1, 0) if kernel else None)
-    return layout_tensors(_packed_layouts(layouts, family.packed), tree, model.layer_scalar)
+    return layout_tensors(_packed_layouts(layouts, family.packed, config), tree, model.layer_scalar)
 
 
-def _packed_layouts(layouts: Mapping[str, WeightLayout],
-                    packed: Sequence["Packed"]) -> dict[str, WeightLayout]:
+def _packed_layouts(layouts: Mapping[str, WeightLayout], packed: Sequence["Packed"],
+                    config: Mapping[str, object]) -> dict[str, WeightLayout]:
     """`layouts` with each `packed` source tensor built from its parts' layouts,
     in the place of its first part."""
     source: dict[str, WeightLayout] = {}
@@ -1327,7 +1327,7 @@ def _packed_layouts(layouts: Mapping[str, WeightLayout],
             raise ValueError(f'{stem}{packing.name} packs {name} with {missing}, which nothing writes')
         if part == packing.parts[0]:
             source[stem + packing.name] = packing.layout(
-                stem + packing.name, [layouts[stem + other] for other in packing.parts])
+                stem + packing.name, [layouts[stem + other] for other in packing.parts], config)
     return source
 
 
@@ -1385,7 +1385,10 @@ class Packed:
     Each name is a suffix after the stem a tensor and its parts share. A load
     splits the tensor into views of its parts (`DecoderFamily.prepare_weights`)
     and an export packs their leaves back (`layout`), so the one entry is
-    both directions.
+    both directions. With `chunks` the tensor is that many equal runs on
+    `axis`, each holding its share of every part in turn, as a checkpoint
+    pre-sharded for as many tensor-parallel ranks stores them; each part is
+    its shares in run order.
     """
 
     name: str
@@ -1393,25 +1396,38 @@ class Packed:
     axis: int = -1
     transpose: tuple[int, ...] | None = None
     widths: Callable[[Mapping[str, object]], tuple[int, ...]] | None = None
-    """Config-derived unequal part widths, as in Phi-3's grouped-query qkv."""
+    """Config-derived unequal part widths, as in Phi-3's grouped-query qkv;
+    with `chunks`, one run's."""
+    chunks: Callable[[Mapping[str, object]], int] | None = None
+    """Config-derived count of the runs the parts are interleaved in, as in
+    MiMo-V2.6's fused qkv, pre-sharded over its key heads."""
 
     def split(self, name: str, tensor: np.ndarray,
               config: Mapping[str, object] | None = None) -> dict[str, np.ndarray]:
-        """The parts of the source tensor `name`, as views of it."""
+        """The parts of the source tensor `name`, as views of it, or copies
+        where they are interleaved in runs."""
         stem = name.removesuffix(self.name)
         stored = tensor if self.transpose is None else tensor.transpose(self.transpose)
+        if (self.widths is not None or self.chunks is not None) and config is None:
+            raise ValueError(f'{name} needs translated geometry to split its projections')
+        axis = self.axis % stored.ndim
+        runs = 1 if self.chunks is None or config is None else self.chunks(config)
+        if runs < 1 or stored.shape[axis] % runs:
+            raise ValueError(f'{name} has shape {stored.shape}, which {runs} equal runs do not divide')
+        run = stored.reshape(*stored.shape[:axis], runs, stored.shape[axis] // runs, *stored.shape[axis + 1:])
         sections: int | np.ndarray = len(self.parts)
-        if self.widths is not None:
-            if config is None:
-                raise ValueError(f'{name} needs translated geometry to split its projections')
+        if self.widths is not None and config is not None:
             widths = self.widths(config)
-            if len(widths) != len(self.parts) or min(widths) < 1 or sum(widths) != stored.shape[self.axis]:
-                raise ValueError(f'{name} has shape {stored.shape}, incompatible with part widths {widths}')
+            if len(widths) != len(self.parts) or min(widths) < 1 or sum(widths) != run.shape[axis + 1]:
+                raise ValueError(f'{name} has shape {stored.shape}, incompatible with part widths {widths} '
+                                 f'in {runs} runs')
             sections = np.cumsum(widths[:-1])
-        return {stem + part: piece for part, piece in
-                zip(self.parts, np.split(stored, sections, axis=self.axis), strict=True)}
+        pieces = np.split(run, sections, axis=axis + 1)
+        return {stem + part: piece.reshape(*stored.shape[:axis], -1, *stored.shape[axis + 1:])
+                for part, piece in zip(self.parts, pieces, strict=True)}
 
-    def layout(self, name: str, parts: Sequence[WeightLayout]) -> WeightLayout:
+    def layout(self, name: str, parts: Sequence[WeightLayout],
+               config: Mapping[str, object] | None = None) -> WeightLayout:
         """The layout of the source tensor `name`, from each part's one-leaf layout."""
         ndim = len(parts[0].shape)
         # A part's axis k is its leaf's axis order[k].
@@ -1422,10 +1438,12 @@ class Packed:
         back = tuple(range(ndim)) if self.transpose is None else tuple(
             int(k) for k in np.argsort(self.transpose))
         transpose = tuple(order[k] for k in back)
+        runs = None if self.chunks is None or config is None else self.chunks(config)
         return WeightLayout(name, tuple(path for part in parts for path in part.paths),
                             tuple(shape[k] for k in back),
                             None if transpose == tuple(range(ndim)) else transpose,
-                            None if len(parts) == 1 else order[axis] - ndim)
+                            None if len(parts) == 1 else order[axis] - ndim,
+                            chunks=None if runs == 1 else runs)
 
 
 # Gemma 4, Qwen3-Next and Qwen 3.5 MoE hold their routed experts as torch

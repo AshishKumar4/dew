@@ -1,6 +1,7 @@
 """`DecisionObjective`: training a decision model on labelled questions."""
 
 import dataclasses
+import functools
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -12,13 +13,22 @@ import numpy as np
 from flax import linen as nn
 
 from dew.artifacts import Decisions
-from dew.data.dataset import LengthGroups
-from dew.data.pipeline import Configured, ObjectiveData, Rejected, TokenField
+from dew.data.pipeline import Configured, ObjectiveData, Pack, Rejected
 from dew.data.text import HFTokenizer, Tokenizer
 from dew.decision.calibration import Temperatures
 from dew.decision.data import Example
 from dew.decision.head import DecisionHead, Head
-from dew.decision.layout import DecisionInputs, Layout, MarkerLayout, Specials, StateFirstLayout, compacted
+from dew.decision.layout import (
+    OPTION_TILE,
+    Bounds,
+    DecisionInputs,
+    Layout,
+    MarkerLayout,
+    QuestionLayout,
+    Specials,
+    StateFirstLayout,
+    compacted,
+)
 from dew.decision.model import DecisionModel
 from dew.decision.questions import KINDS, Choice, Question, Score
 from dew.decision.scoring import LogLoss, ScoringRule
@@ -59,33 +69,30 @@ _SCORE = KINDS.index(Score)
 
 @dataclass(frozen=True)
 class Encoding:
-    """How a labelled example becomes the fixed-size row a step trains on.
+    """How a labelled example becomes the row a step packs and trains on.
 
-    Every row is `max_len` tokens, `questions` question slots and `width` option
-    slots. A layout of one row per question lays out one answered question; a
-    joint layout lays out every question of the example, scoring the answered
-    ones. With `shuffle`, a choice's options are laid out in a fresh random order
-    every time the row is read (Laya's `--shuffle-options`), while a score's
-    levels and a noul's two answers keep their order, and a joint row asks its
-    questions in a fresh order too, as Clef's training permutes field orders.
-    With `none_of_the_above` p, a choice with a single right answer gains a
-    "none of the above" option with probability p, and half of those also lose
-    their right option, which makes "none of the above" the right answer. That
-    teaches the model to say that no option fits instead of picking the nearest
-    wrong one. Each scored slot's target is its gold distribution (`Example.distribution`)
-    in the order the row shows the options. With `option_slots`, a row also
-    carries its real options compacted to that many slots (`compacted`), which
-    a joint head computes alone.
+    A row is its own tokens, at most `max_len`, one slot per question it lays
+    out and `width` option slots each. A layout of one row per question lays
+    out one answered question; a joint layout lays out every question of the
+    example, scoring the answered ones. With `shuffle`, a choice's options are
+    laid out in a fresh random order every time the row is read (Laya's
+    `--shuffle-options`), while a score's levels and a noul's two answers keep
+    their order, and a joint row asks its questions in a fresh order too, as
+    Clef's training permutes field orders. With `none_of_the_above` p, a
+    choice with a single right answer gains a "none of the above" option with
+    probability p, and half of those also lose their right option, which
+    makes "none of the above" the right answer. That teaches the model to say
+    that no option fits instead of picking the nearest wrong one. Each scored
+    slot's target is its gold distribution (`Example.distribution`) in the
+    order the row shows the options.
     """
 
     layout: Layout
     tokenizer: Tokenizer
     specials: Specials
     width: int
-    questions: int = 1
     shuffle: bool = True
     none_of_the_above: float = 0.0
-    option_slots: int | None = None
 
     def __call__(self, example: Example, names: Sequence[str], rng: np.random.Generator | None) -> Batch:
         labels = example.labels()
@@ -117,26 +124,23 @@ class Encoding:
             else None
         )
         rows = self.layout.rows(self.tokenizer, self.specials, example.state, asked, orders=orders)
-        if len(rows) != 1 or len(rows[0].questions) > self.questions:
-            raise ValueError(
-                f"an encoding lays out one row of at most {self.questions} questions, "
-                f"and the layout gave {len(rows)} rows"
-            )
+        if len(rows) != 1:
+            raise ValueError(f"an encoding lays out one row, and the layout gave {len(rows)}")
         encoded = rows[0]
         length = self.layout.max_len
         if not self.layout.fits(encoded):
             raise ValueError(f"the row needs {len(encoded.tokens)} tokens, more than max_len={length}")
+        count = len(encoded.questions)
         row: Batch = {
-            "tokens": _padded(encoded.tokens, length, self.specials.pad),
-            "valid": _padded((True,) * len(encoded.tokens), length, fill=False),
-            "kinds": np.zeros(self.questions, np.int32),
-            "questions": np.zeros(self.questions, bool),
-            "spans": np.zeros((self.questions, 2), np.int32),
-            "option_spans": np.zeros((self.questions, self.width, 2), np.int32),
-            "options": np.zeros((self.questions, self.width), bool),
-            "labels": np.zeros(self.questions, np.int32),
-            "scored": np.zeros(self.questions, bool),
-            "targets": np.zeros((self.questions, self.width), np.float32),
+            "tokens": np.asarray(encoded.tokens, np.int32),
+            "kinds": np.zeros(count, np.int32),
+            "questions": np.ones(count, bool),
+            "spans": np.zeros((count, 2), np.int32),
+            "option_spans": np.zeros((count, self.width, 2), np.int32),
+            "options": np.zeros((count, self.width), bool),
+            "labels": np.zeros(count, np.int32),
+            "scored": np.zeros(count, bool),
+            "targets": np.zeros((count, self.width), np.float32),
         }
         for slot, laid in enumerate(encoded.questions):
             count = len(asked[laid.name].options)
@@ -147,7 +151,7 @@ class Encoding:
                 )
             if count > self.width:
                 raise ValueError(f"a question of {count} options outgrows the encoding's {self.width} slots")
-            row["kinds"][slot], row["questions"][slot], row["spans"][slot] = laid.kind, True, laid.span
+            row["kinds"][slot], row["spans"][slot] = laid.kind, laid.span
             row["option_spans"][slot, :count] = laid.options
             row["options"][slot, :count] = True
             if laid.name in golds:
@@ -156,10 +160,8 @@ class Encoding:
                 row["labels"][slot] = int(np.argmax(shown))
                 row["scored"][slot] = True
         if encoded.positions is not None and encoded.slots is not None:
-            row["positions"] = _padded(encoded.positions, length, 0)
-            row["slots"] = _padded(encoded.slots, length, 0)
-        if self.option_slots is not None:
-            row["option_slots"], row["slotted"] = compacted(row["options"], self.option_slots)
+            row["positions"] = np.asarray(encoded.positions, np.int32)
+            row["slots"] = np.asarray(encoded.slots, np.int32)
         return row
 
 
@@ -173,32 +175,6 @@ def _none_of_the_above(question: Choice, label: int, *, drop: bool) -> tuple[Cho
     described[NONE_OF_THE_ABOVE] = "none of the other options fits"
     options = list(described)
     return Choice(question.instructions, described), options.index(NONE_OF_THE_ABOVE if drop else right)
-
-
-_ALONG_THE_ROW = ("tokens", "valid", "positions", "slots")
-"""The fields of an encoded row that run along its tokens."""
-
-
-@dataclass(frozen=True)
-class _Cut:
-    """A batch's fields along its rows cut after its longest row, rounded up to
-    a multiple of `bucket` and at most `length`: the padding no row reaches."""
-
-    bucket: int
-    length: int
-    single_reader = True
-
-    def __call__(self, batch: Batch) -> Batch:
-        longest = int(np.max(np.sum(batch["valid"], axis=1)))
-        size = min(self.length, -(-longest // self.bucket) * self.bucket)
-        return {name: value[:, :size] if name in _ALONG_THE_ROW else value for name, value in batch.items()}
-
-
-def _padded(values: Sequence[int | bool], length: int, fill: int | bool = 0) -> np.ndarray:
-    dtype = np.bool_ if isinstance(fill, bool) else np.int32
-    row = np.full((length,), fill, dtype)
-    row[: len(values)] = values
-    return row
 
 
 def _tokenizer_of(processor: TaskProcessor | None) -> Tokenizer | None:
@@ -234,6 +210,7 @@ class Fit(pygrain.MapTransform):
     layout: Layout
     tokenizer: Tokenizer
     specials: Specials
+    head: Head
     rejects = True
 
     def map(self, element: Batch) -> Batch | Rejected:
@@ -245,6 +222,7 @@ class Fit(pygrain.MapTransform):
         laid = self.layout.rows(self.tokenizer, self.specials, example.state, asked)
         if not all(map(self.layout.fits, laid)):
             return Rejected("unfit")
+        self.head.validate_rows(laid)
         fitted = tuple(
             FittedRow(
                 example,
@@ -263,8 +241,6 @@ class Fit(pygrain.MapTransform):
                     "slots": {
                         "questions": len(asked),
                         "options": max(len(question.options) for question in asked.values()),
-                        "total_options": sum(len(question.options) for question in asked.values()),
-                        "choice_questions": sum(isinstance(question, Choice) for question in asked.values()),
                     }
                 },
             }
@@ -283,10 +259,6 @@ class QuestionRows:
                     "slots": {
                         "questions": 1,
                         "options": max(len(row.example.questions[name].options) for name in row.names),
-                        "total_options": sum(len(row.example.questions[name].options) for name in row.names),
-                        "choice_questions": sum(
-                            isinstance(row.example.questions[name], Choice) for name in row.names
-                        ),
                     }
                 }
             }
@@ -307,23 +279,7 @@ class LayoutRows(pygrain.RandomMapTransform):
 
     def random_map(self, element: Batch, rng: np.random.Generator) -> Batch:
         fitted = _fitted(element)
-        encoded = self.encoding(fitted.example, fitted.names, rng)
-        return {**encoded, self.length_field: np.int32(np.sum(encoded["valid"]))}
-
-    @property
-    def max_length(self) -> int:
-        return self.encoding.layout.max_len
-
-    @property
-    def token_fields(self) -> tuple[TokenField, ...]:
-        return tuple(
-            TokenField(name, pad=self.encoding.specials.pad if name == "tokens" else 0)
-            for name in _ALONG_THE_ROW
-        )
-
-    @property
-    def length_field(self) -> str:
-        return "_dew_length"
+        return self.encoding(fitted.example, fitted.names, rng)
 
 
 @dataclass(frozen=True)
@@ -332,14 +288,7 @@ class EvaluateRows(pygrain.MapTransform):
 
     def map(self, element: Batch) -> Batch:
         fitted = _fitted(element)
-        encoded = self.encoding(fitted.example, fitted.names, None)
-        return {**encoded, "_dew_length": np.int32(np.sum(encoded["valid"]))}
-
-
-@dataclass(frozen=True)
-class StoredLength:
-    def __call__(self, element: Batch) -> int:
-        return _fitted(element).length if "decision" in element else int(np.sum(element["valid"]))
+        return self.encoding(fitted.example, fitted.names, None)
 
 
 @dataclass(frozen=True)
@@ -354,21 +303,70 @@ class ConfigureLayout:
     def __call__(self, metadata: Mapping[str, object]) -> LayoutRows | EvaluateRows:
         slots = record(metadata["slots"], "decision slots")
         width = integer(slots.get("options"), "slots.options") + int(self.none_of_the_above > 0)
-        questions = integer(slots.get("questions"), "slots.questions") if self.layout.joint else 1
-        if min(width, questions) < 1:
+        if width < 1:
             raise ValueError("decision source slot maxima must be positive")
-        encoding = Encoding(
-            self.layout, self.tokenizer, self.specials, width, questions, self.shuffle, self.none_of_the_above
-        )
-        total = slots.get("total_options")
-        if total is not None:
-            count = integer(total, "slots.total_options")
-            if self.none_of_the_above > 0:
-                count += integer(slots.get("choice_questions"), "slots.choice_questions")
-            capacity = -(-count // 128) * 128
-            if capacity < questions * width:
-                encoding = dataclasses.replace(encoding, option_slots=capacity)
+        encoding = Encoding(self.layout, self.tokenizer, self.specials, width, self.shuffle,
+                            self.none_of_the_above)
         return LayoutRows(encoding) if self.train else EvaluateRows(encoding)
+
+
+_ALONG_THE_QUESTIONS = ("kinds", "questions", "spans", "option_spans", "options", "labels", "scored",
+                        "targets")
+"""The fields of an encoded row that run along its questions."""
+
+
+def packing(layout: Layout, bounds: Bounds) -> Pack:
+    """Rows of `layout` packed first-fit into windows of its `max_len`, each
+    window's rows, questions and options within `bounds` (`Layout.bounds`)."""
+    parallel = isinstance(layout, QuestionLayout) and layout.parallel
+    along = tuple((name, bounds.questions) for name in _ALONG_THE_QUESTIONS)
+    return Pack(layout.max_len, ("tokens", "positions", "slots") if parallel else ("tokens",),
+                segments=bounds.segments, along=along)
+
+
+def _rows(batch: Batch) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Each packed row's tokens, questions and options, window by window."""
+    segments = np.asarray(batch["segments"])
+    owners = np.where(batch["questions"],
+                      np.take_along_axis(segments, np.asarray(batch["spans"])[..., 0], axis=1), 0)
+    options = np.sum(np.asarray(batch["options"], bool), axis=-1)
+    counted = []
+    for window, owner, option in zip(segments, owners, options, strict=True):
+        rows = int(window.max()) + 1
+        counted.append(np.stack([np.bincount(window, minlength=rows), np.bincount(owner, minlength=rows),
+                                 np.bincount(owner, weights=option, minlength=rows).astype(np.int64)])[:, 1:])
+    lengths, questions, real = np.concatenate(counted, axis=1)
+    return lengths, questions, real
+
+
+@dataclass(frozen=True)
+class PackedRows(pygrain.MapTransform):
+    """A window of packed rows (`packing`) as `DecisionInputs` reads it: each
+    row's spans moved to where it starts in the window, and with
+    `option_slots` the window's real options compacted to that many slots
+    (`compacted`). Every window is `max_length` tokens, which a token budget
+    divides into rows."""
+
+    max_length: int
+    option_slots: int | None = None
+
+    def map(self, element: Batch) -> Batch:
+        segments = np.asarray(element["tokens_segment_ids"])
+        owners = np.asarray(element["kinds_segment_ids"])
+        starts = np.concatenate([[0], np.cumsum(np.bincount(segments)[1:])]).astype(np.int32)
+        moved = np.where(owners > 0, starts[np.maximum(owners - 1, 0)], 0)
+        options = np.asarray(element["options"])
+        laid = {name: element[name] for name in ("tokens", *_ALONG_THE_QUESTIONS)} | {
+            "segments": segments,
+            "positions": element["positions"] if "slots" in element else element["tokens_positions"],
+            "spans": element["spans"] + moved[:, None],
+            "option_spans": element["option_spans"] + (moved[:, None] * options)[..., None],
+        }
+        if "slots" in element:
+            laid["slots"] = element["slots"]
+        if self.option_slots is not None:
+            laid["option_slots"], laid["slotted"] = compacted(options, self.option_slots)
+        return laid
 
 
 class DecisionObjective(Objective[Ratio]):
@@ -387,12 +385,12 @@ class DecisionObjective(Objective[Ratio]):
     The loss is `loss`, a proper scoring rule or a sum of them, computed against
     each row's right option, with `label_smoothing` spread evenly over its
     options. `shuffle_options` and `none_of_the_above` augment the rows as
-    `Encoding` describes, and `data` supplies their pipeline steps. With `bucket`, the
-    training stream and the validation pass batch rows of like length
-    (`LengthGroups`) and cut each batch after its longest row, rounded up to a
-    multiple of `bucket`, so a step pays for little more than its tokens
-    instead of `max_len` per row; each length compiles its own step, and both
-    are read on one process.
+    `Encoding` describes, and `data` supplies their pipeline steps. The
+    training stream and the validation pass pack rows first-fit into windows
+    of the layout's `max_len` tokens (`packing`), as many rows, questions and
+    options as its `bounds` let a window hold, so a step pays for its tokens
+    rather than `max_len` per row, and every batch has one shape. The loss
+    is the mean over the batch's scored questions.
 
     Evaluation returns the model's `Decisions` on the validation rows, which
     `Accuracy`, `ECE`, `AURC` and the scoring rules read, its probabilities
@@ -408,8 +406,8 @@ class DecisionObjective(Objective[Ratio]):
     counts_tokens = True
 
     def real_lengths(self, batch: Batch) -> np.ndarray:
-        """The layout's unpadded row lengths, not its bucket or maximum length."""
-        return np.sum(np.asarray(batch["valid"], bool), axis=-1, dtype=np.int64)
+        """Each packed row's own length, not its window's."""
+        return _rows(batch)[0]
 
     def model_flops(self, model, batch: Batch) -> float:
         """One backbone pass plus the head's real question/option geometry."""
@@ -423,10 +421,7 @@ class DecisionObjective(Objective[Ratio]):
             raise MissingFlopsCount("DecisionObjective needs its image tower's multi-sequence geometry")
         if not isinstance(model.head, CountedDecisions):
             raise MissingFlopsCount(f"{type(model.head).__name__} has no declared decision_flops")
-        lengths = self.real_lengths(batch)
-        questions = np.sum(np.asarray(batch["questions"], bool), axis=-1, dtype=np.int64)
-        options = np.sum(np.asarray(batch["options"], bool), axis=(-2, -1), dtype=np.int64)
-        return model.head.decision_flops(lengths, questions, options)
+        return model.head.decision_flops(*_rows(batch))
 
     def training_flops(self, model, batch: Batch) -> float:
         """The adapted frozen/trainable backbone plus the trained decision head."""
@@ -441,8 +436,7 @@ class DecisionObjective(Objective[Ratio]):
                  specials: Specials | None = None, layout: Layout | None = None,
                  head: Head | None = None, variables: Variables | None | Omitted = OMITTED,
                  label_smoothing: float = 0.0, shuffle_options: bool = True,
-                 none_of_the_above: float = 0.0, temperatures: Temperatures | None = None,
-                 bucket: int | None = None):
+                 none_of_the_above: float = 0.0, temperatures: Temperatures | None = None):
         held: Variables | None = None
         self.image_processor = None
         match backbone:
@@ -468,10 +462,6 @@ class DecisionObjective(Objective[Ratio]):
             raise ValueError("label_smoothing is a share of the target, in [0, 1)")
         if not 0.0 <= none_of_the_above <= 1.0:
             raise ValueError("none_of_the_above is a probability")
-        if bucket is not None and bucket < 1:
-            raise ValueError(
-                f"bucket is the multiple a batch's length rounds up to, at least 1, not {bucket}"
-            )
         if head is None:
             width, dtype = DecisionModel.head_size(module)
             head = DecisionHead(width, dtype=dtype)
@@ -492,8 +482,7 @@ class DecisionObjective(Objective[Ratio]):
         self.shuffle_options = shuffle_options
         self.none_of_the_above = none_of_the_above
         self.temperatures = temperatures
-        self.bucket = bucket
-        self.inputs = InputSpec(sample=Field("tokens", (self.layout.max_len,), variable_axes=(0,)))
+        self.inputs = InputSpec(sample=Field("tokens", (self.layout.max_len,)))
 
     def program_key(self) -> tuple[ProgramModule, ...]:
         """The backbone, then the head, both trained."""
@@ -529,7 +518,7 @@ class DecisionObjective(Objective[Ratio]):
             one = jnp.ones((1, 1), bool)
             inputs = DecisionInputs(
                 tokens=tokens,
-                valid=jnp.ones_like(tokens, bool),
+                segments=jnp.ones_like(tokens),
                 kinds=jnp.zeros((1, 1), jnp.int32),
                 questions=one,
                 spans=jnp.asarray([[[0, 1]]]),
@@ -544,8 +533,13 @@ class DecisionObjective(Objective[Ratio]):
             parts["head"] = self.model.head.init(head_key, states, inputs, table)
         return joined(parts)
 
+    @functools.cached_property
+    def bounds(self) -> Bounds:
+        """The most rows, questions and options a window packs (`Layout.bounds`)."""
+        return self.layout.bounds(self.tokenizer, self.specials)
+
     def loss(self, variables: Variables, batch: Batch, step: Step):
-        inputs = laid_out(batch)
+        inputs = laid_out(batch, self.bounds.segments)
         logits = self.model.logits(
             variables, inputs, train=step.training, rngs=model_rngs(step.key, training=step.training)
         )
@@ -560,18 +554,11 @@ class DecisionObjective(Objective[Ratio]):
         charge = self.loss_rule.charge(logits, target, options, inputs.kinds == _SCORE)
         correct = (jnp.argmax(logits, axis=-1) == batch["labels"]).astype(jnp.float32)
         accuracy, _ = self.accuracy(correct, batch, scored).mean()
-        from dew.data.batching import TOKEN_COUNTS
-
-        weight = (
-            self.row_mean(batch[TOKEN_COUNTS], batch).total
-            if TOKEN_COUNTS in batch
-            else self.row_mean(scored, batch).total
-        )
-        loss = Ratio(self.row_mean(charge * scored, batch).total, weight)
+        loss = Ratio(self.row_mean(charge * scored, batch).total, self.row_mean(scored, batch).total)
         return loss, Aux(metrics={"accuracy": accuracy})
 
     def evaluate(self, params: Variables, batch: Batch, step: Step) -> Decisions:
-        inputs = laid_out(batch)
+        inputs = laid_out(batch, self.bounds.segments)
         weights = self.evaluation_variables(params, step)
         logits = self._logits(weights, inputs)
         if self.temperatures is not None:
@@ -604,22 +591,24 @@ class DecisionObjective(Objective[Ratio]):
         return self.program('logits', lambda variables, inputs: self.model.logits(variables, inputs))
 
     def data(self, tokenizer: Tokenizer | None = None) -> ObjectiveData:
-        """Fit rows before mixing, augment training layouts, and group and cut
-        training and evaluation batches alike."""
-        vocabulary = self.tokenizer if tokenizer is None else tokenizer
-        training = ConfigureLayout(
-            self.layout, vocabulary, self.specials, self.shuffle_options, self.none_of_the_above, train=True
-        )
+        """Fit rows before mixing, augment training layouts, and pack training
+        and evaluation rows alike, by the objective's own tokenizer, which its
+        `bounds` count in."""
+        if tokenizer not in (None, self.tokenizer):
+            raise ValueError("a decision objective lays its rows out with its own tokenizer; "
+                             "pass tokenizer= when building it")
+        training = ConfigureLayout(self.layout, self.tokenizer, self.specials, self.shuffle_options,
+                                   self.none_of_the_above, train=True)
         evaluating = dataclasses.replace(training, train=False)
-        fit = Fit(self.layout, vocabulary, self.specials)
+        fit = Fit(self.layout, self.tokenizer, self.specials, self.model.head)
         expand = () if self.layout.joint else (QuestionRows(),)
-        cut = () if self.bucket is None else (_Cut(self.bucket, self.layout.max_len),)
+        options = self.bounds.options if self.layout.joint else None
+        compact = None if options is None else -(-options // OPTION_TILE) * OPTION_TILE
         return ObjectiveData(
             train=(fit, *expand, Configured(training, needs=("slots",), scope="run", random=True)),
             evaluate=(fit, *expand, Configured(evaluating, needs=("slots",), scope="run")),
-            group=None if self.bucket is None else LengthGroups(StoredLength()),
-            train_batch=cut,
-            evaluate_batch=cut,
+            pack=packing(self.layout, self.bounds),
+            packed=(PackedRows(self.layout.max_len, compact),),
         )
 
     def inference_record(self):

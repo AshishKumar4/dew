@@ -983,7 +983,7 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         from dew.data.pipeline import ObjectiveData
         from dew.data.steps.text import CountTargets, FixedTokens
 
-        geometry = FixedTokens(self.seq_len, extra=1, pad_id=0 if self.pad_id is None else self.pad_id)
+        geometry = FixedTokens(self.seq_len, extra=1)
         if self.loss_role is None and self.pad_id is None:
             return ObjectiveData(train=(geometry,), evaluate=(geometry,))
         counted = CountTargets(
