@@ -37,7 +37,7 @@ Anything that implements a published architecture, schedule, sampler or loss is 
 
 A test is worth keeping only if it would fail on a plausible bug in the thing it names. Before committing one, ask what change to the code would make it go red; if the answer is "none" or "only deleting the function", it is not a test.
 
-- Test observable behavior through public interfaces: numerical results, state transitions, error handling, shapes, dtypes, and sharding where they are part of the contract. A shape-only assertion does not prove numerical correctness; a mock call or self-equal constant does not prove behavior.
+- Test observable behavior through public interfaces: numerical results, state transitions, error handling, shapes, dtypes, and sharding where they are part of the contract. A shape-only assertion does not prove numerical correctness; a mock call or self-equal constant does not prove behavior. A refusal is proved by a valid setup that changes one thing and raises, not by the error's wording, and no test reads the source (`tools/lint_slop.py`, SLOP011).
 - Test at the seam where the behaviour lives, through the public interface, with real inputs. Mock only at real external boundaries (network, disk, a service). A stub that returns the value the test then checks proves nothing.
 - Prove the test can fail. A bug fix ships with the test that failed before the fix and passes after, both runs shown in the commit or review. A new invariant ships with a mutation that breaks it (drop a term, flip a comparison, skip a chunk) and the assertion that the mutated code fails.
 - One behaviour per test, named for the behaviour. A test that would need its name changed when the implementation changes is testing the implementation.

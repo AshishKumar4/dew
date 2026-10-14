@@ -540,6 +540,131 @@ def test_a_plugin_package_checks_its_own_source_with_dews_rules(tmp_path):
     assert lint.main(["--root", str(tmp_path), "--package", "sparx"]) == 1
 
 
+def _linted(tmp_path, files: dict[str, str]) -> list[tuple[str, int, str]]:
+    """Write `files` into a sparx checkout and return each finding as (path, line, code)."""
+    lint = load("lint_slop")
+    for relative, text in files.items():
+        (tmp_path / relative).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / relative).write_text(text)
+    modules = list(lint.collect(["src/sparx", "tests", "tools"], tmp_path, "sparx"))
+    return sorted((finding.path, finding.line, finding.code)
+                  for module in modules for finding in lint.check(module))
+
+
+def test_a_test_that_checks_wording_or_source_text_is_reported_and_one_that_checks_behaviour_is_not(tmp_path):
+    """SLOP011: `match=` on pytest's raise, a read of a function's source and a
+    test that names a source file each prove text, not behaviour, however the
+    test imports them. A raise without `match`, another object's `raises`, a
+    local `getsource`, and a library that names its own file, are not reported."""
+    found = _linted(tmp_path, {
+        "src/sparx/graph.py": 'HOME = "src/sparx/graph.py"\n',
+        "tests/test_graph.py": (
+            "import inspect\n"
+            "import pytest\n"
+            "from inspect import getsource as source\n"
+            "from pytest import raises as refused\n"
+            "from sparx import graph\n"
+            "def test_wording():\n"
+            "    with pytest.raises(ValueError, match='empty'):\n"
+            "        graph.edges({})\n"
+            "    with refused(ValueError, match='empty'):\n"
+            "        graph.edges({})\n"
+            "def test_source():\n"
+            "    assert 'return' in inspect.getsource(graph) + source(graph)\n"
+            "def test_file():\n"
+            "    assert open('src/sparx/graph.py').read()\n"
+            "def test_refusal(table):\n"
+            "    def source():\n"
+            "        return ''\n"
+            "    with pytest.raises(ValueError), table.raises(ValueError, match='empty'):\n"
+            "        graph.edges({source(): 1, table().inspect.getsource(graph): 2})\n"
+            "def test_imported_here():\n"
+            "    from pytest import raises as source\n"
+            "    with source(ValueError, match='empty'):\n"
+            "        graph.edges({})\n"
+            "class TestReading:\n"
+            "    from inspect import getsource as read\n"
+            "    def test_default(self, text=read(graph)):\n"
+            "        assert text\n"
+            "def test_comprehension(readers):\n"
+            "    import inspect\n"
+            "    assert [inspect.getsource() for inspect in readers]\n"
+            "def test_lambda_default(text=(lambda inspect: inspect.getsource())(graph)):\n"
+            "    assert text\n"
+            "class TestClassComprehension:\n"
+            "    from inspect import getsource as read\n"
+            "    texts = [read(graph) for _ in range(1)]\n"),
+    })
+    assert found == [("tests/test_graph.py", line, "SLOP011") for line in (7, 9, 12, 12, 14, 22, 26)]
+
+
+def test_a_module_rebound_for_every_caller_is_reported_outside_the_suite(tmp_path):
+    """SLOP012: a script that replaces or deletes the package's own functions,
+    by any assignment or `setattr`, and a library that does so to anything it
+    imported, a sibling module by a relative import included, change them for
+    every caller. A script's rebinding of another library, an interpreter
+    hook however it is spelled, and an attribute of an object a scope holds
+    as its own name or reaches from a call are not reported; each scope
+    reads its own imports, and a comprehension's names stay in it."""
+    found = _linted(tmp_path, {
+        "src/sparx/conv.py": "",
+        "src/sparx/graph.py": (
+            "import sys\n"
+            "import sys as system\n"
+            "import json\n"
+            "from . import conv\n"
+            "class Edges:\n"
+            "    pass\n"
+            "def install():\n"
+            "    json.dumps = repr\n"
+            "    conv.convolve = print\n"
+            "    sys.excepthook = print\n"
+            "    system.displayhook = print\n"
+            "    setattr(sys, 'breakpointhook', print)\n"
+            "def fill(json):\n"
+            "    conv = Edges()\n"
+            "    conv.count = 0\n"
+            "    json.dumps = repr\n"
+            "    Edges().json.dumps = repr\n"
+            "def after_comprehension():\n"
+            "    [conv for conv in (Edges(),)]\n"
+            "    conv.convolve = repr\n"
+            "def rebuilt():\n"
+            "    import json\n"
+            "    json = Edges()\n"
+            "    json.count = 0\n"
+            "def install_again(json):\n"
+            "    import json\n"
+            "    json.dumps = repr\n"),
+        "tools/bench.py": (
+            "import json\n"
+            "from sparx import graph\n"
+            "import sparx.graph\n"
+            "import sparx.graph as sys\n"
+            "graph.install = print\n"
+            "setattr(sparx.graph, 'install', print)\n"
+            "graph.install: object = print\n"
+            "graph.install, graph.edges = print, repr\n"
+            "del graph.edges\n"
+            "sys.excepthook = print\n"
+            "json.dumps = repr\n"
+            "def fill(graph):\n"
+            "    graph.count = 0\n"
+            "def first_party():\n"
+            "    from sparx import graph as engine\n"
+            "    engine.run = repr\n"
+            "def third_party():\n"
+            "    import json as engine\n"
+            "    engine.run = repr\n"
+            "def defined():\n"
+            "    class graph:\n"
+            "        pass\n"
+            "    graph.run = repr\n"),
+    })
+    assert found == [*[("src/sparx/graph.py", line, "SLOP012") for line in (8, 9, 20, 27)],
+                     *[("tools/bench.py", line, "SLOP012") for line in (5, 6, 7, 8, 8, 9, 10, 16)]]
+
+
 # ---------------------------------------------------------------------------
 # tools/hf_coverage.py
 # ---------------------------------------------------------------------------

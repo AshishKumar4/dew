@@ -33,7 +33,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from dew.coordination import agreed, collective_host, stop_at_exit
-from dew.nn.inputs import key_seed, request_key
+from dew.nn.inputs import key_seed, request_key, token_id
 from dew.objectives.base import Variables, thaw
 from dew.records import JSON
 from dew.sampling.text import Generation, Sampling
@@ -120,9 +120,9 @@ class RolloutServer(Protocol):
 
 
 def _prompt(prompt: Sequence[int]) -> tuple[int, ...]:
-    ids = tuple(prompt)
-    if not ids or any(type(token) is not int or token < 0 for token in ids):
-        raise ValueError("a rollout prompt is a nonempty row of nonnegative integer token ids")
+    ids = tuple(token_id(token, where="a rollout prompt") for token in prompt)
+    if not ids:
+        raise ValueError("a rollout prompt is a nonempty row of token ids")
     return ids
 
 
