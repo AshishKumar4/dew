@@ -53,11 +53,3 @@ class StableDiffusionVAE(ModuleAutoEncoder[AutoencoderKL]):
     def decode_raw(self, params, latents):
         """Decode a posterior draw as `decode_batch` does, traced in the caller's step, not jitted apart."""
         return jnp.asarray(self.model.apply({"params": params}, latents, method=self.model.decode))
-
-    @property
-    def downscale_factor(self) -> int:
-        return self.model.downscale_factor
-
-    @property
-    def latent_channels(self) -> int:
-        return self.model.latent_channels
