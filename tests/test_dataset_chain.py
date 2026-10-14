@@ -1,6 +1,7 @@
 """The chain surface: stores carry the verbs, mix reads members of every kind, holdout splits by identity."""
 
 import dataclasses
+import hashlib
 import itertools
 import json
 from dataclasses import dataclass
@@ -64,6 +65,52 @@ def test_holdout_puts_each_record_in_one_part_by_its_identity_the_same_in_every_
     first, held = Memory(rows("c", 10)).holdout(records=3)
     assert [int(row["i"]) for row in iterate(held, read="memory")] == [0, 1, 2]
     assert [int(row["i"]) for row in iterate(first, read="memory")] == list(range(3, 10))
+
+
+@pytest.mark.parametrize("read", ["memory", "streamed"])
+@pytest.mark.parametrize("key", [None, "identity"])
+@pytest.mark.parametrize("nested", ["mapping", "arrays", "object_array"])
+def test_holdout_ignores_mapping_order_at_every_depth(read, key, nested):
+    original = []
+    reordered = []
+    for index in range(64):
+        first = {"z": np.arange(3, dtype=np.int32), "a": index}
+        second = {"a": index, "z": np.arange(3, dtype=np.int32)}
+        if nested == "arrays":
+            first, second = [first, b"document"], [second, b"document"]
+        elif nested == "object_array":
+            first, second = np.asarray([first], dtype=object), np.asarray([second], dtype=object)
+        original.append({"identity": first, "id": index})
+        reordered.append({"id": index, "identity": second})
+
+    def parts(documents):
+        return [{int(row["id"]) for row in iterate(part, read=read, loading=READ)}
+                for part in Memory(documents).holdout(0.5, key=key)]
+
+    first, second = parts(original), parts(reordered)
+    assert first[0].isdisjoint(first[1])
+    assert first[0] | first[1] == set(range(64))
+    assert first == second
+
+
+def test_canonical_holdout_moves_unsorted_splits_but_keeps_sorted_and_scalar_hashes():
+    from dew.data.sources.codec import encode
+
+    original = [{"z": index, "a": {"z": "document", "a": index}} for index in range(200)]
+    ordered = [{"a": {"a": index, "z": "document"}, "z": index} for index in range(200)]
+
+    def legacy(documents, key=None):
+        return {row["z"] for row in documents
+                if int.from_bytes(hashlib.sha256(encode(row if key is None else row[key])).digest()[:8],
+                                  "big") < 2**63}
+
+    def held(documents, key=None):
+        _, validation = Memory(documents).holdout(0.5, key=key)
+        return {int(row["z"]) for row in iterate(validation, read="memory", loading=READ)}
+
+    assert held(original) == held(ordered) == legacy(ordered)
+    assert held(original) != legacy(original)
+    assert held(original, "z") == legacy(original, "z")
 
 
 def add_draw(row, rng):
@@ -252,7 +299,7 @@ def test_dropped_records_are_the_same_whole_sharded_and_resumed():
     kept = {(origin, i) for origin in ("a", "b") for i in range(30) if i % 3}
 
     def keys(batch):
-        return set(zip(batch["origin"].tolist(), batch["i"].tolist(), strict=True))
+        return set(zip(batch["origin"], batch["i"].tolist(), strict=True))
 
     whole = data.train(DataPartition())
     halves = [data.train(DataPartition(index, 2)) for index in range(2)]
@@ -523,3 +570,177 @@ def test_a_hugging_face_stream_cache_publishes_only_its_store_shards(tmp_path, s
 def test_chunks_cut_long_documents_keeping_every_target():
     pieces = list(Memory([{"text": np.arange(10)}]).flat_map(text.chunk(4, overlap=1)).iterate())
     assert [piece["text"].tolist() for piece in pieces] == [[0, 1, 2, 3], [3, 4, 5, 6], [6, 7, 8, 9]]
+
+
+@pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
+def test_diagnostic_records_unstack_nested_numeric_and_object_fields(read):
+    records = [{"id": index, "nested": {"x": np.arange(3) + index,
+                                        "deep": {"even": index % 2 == 0}},
+                "objects": np.array(["label", {"turns": ["question", "answer"]}], dtype=object),
+                "caption": f"record {index}"} for index in range(3)]
+    chain = dataclasses.replace(Memory(records).read(read), loading=READ)
+    actual = list(chain.iterate())
+    assert len(actual) == len(records)
+    for row, original in zip(actual, records, strict=True):
+        assert row["id"] == original["id"]
+        assert row["caption"] == original["caption"]
+        np.testing.assert_array_equal(row["nested"]["x"], original["nested"]["x"])
+        assert row["nested"]["deep"] == original["nested"]["deep"]
+        np.testing.assert_array_equal(row["objects"], original["objects"])
+
+
+@pytest.mark.parametrize("read", [None, "memory", "indexed", "streamed"])
+def test_stats_bounds_preprocessing_and_counts_only_the_inspected_records(read):
+    processed = []
+
+    def prepare(row):
+        processed.append(row["i"])
+        return {**row, "twice": 2 * row["i"]}
+
+    chain = dataclasses.replace(Memory(rows("a", 40)).named("sample"), mode=read, loading=READ)
+    counts = chain.map(prepare, identity="stats-prepare@1").filter_map(drop_thirds).stats(10)
+    assert counts["data/accepted/sample"] == 10
+    assert counts["data/attempted/sample"] == 15
+    assert counts["data/rejected/sample/third"] == 5
+    assert processed == list(range(15))
+
+
+@pytest.mark.parametrize("records", [0, 100])
+def test_stats_stops_at_a_finite_sources_end(records):
+    processed = []
+
+    def prepare(row):
+        processed.append(row["i"])
+        return row
+
+    chain = dataclasses.replace(Memory(rows("a", 7)).named("sample"), loading=READ)
+    counts = chain.map(prepare, identity="stats-finite@1").filter_map(drop_thirds).stats(records)
+    expected = 0 if records == 0 else 7
+    assert processed == list(range(expected))
+    assert counts.get("data/attempted/sample", 0) == expected
+    assert counts.get("data/accepted/sample", 0) == (0 if records == 0 else 4)
+
+
+@pytest.mark.parametrize("read", [None, "memory", "indexed", "streamed"])
+def test_stats_counts_one_to_one_chains_lazily(read):
+    processed = []
+
+    def prepare(row):
+        processed.append(row["i"])
+        return {**row, "twice": 2 * row["i"]}
+
+    chain = dataclasses.replace(Memory(rows("a", 7)).named("sample"), mode=read, loading=READ)
+    counts = chain.map(prepare, identity="stats-one-to-one@1").stats(3)
+    assert counts["data/attempted/sample"] == counts["data/accepted/sample"] == 3
+    assert processed == [0, 1, 2]
+
+
+def expand_record(row):
+    if row["i"] % 3:
+        yield {**row, "piece": 0}
+        yield {**row, "piece": 1}
+
+
+@pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
+def test_flat_map_reads_plain_record_functions_through_iteration_and_resume(read):
+    chain = Memory(rows("a", 7)).flat_map(expand_record, identity="expand-record@1")
+    chain = dataclasses.replace(chain, mode=read, loading=READ)
+    expected = [(index, piece) for index in range(7) if index % 3 for piece in range(2)]
+    assert [(int(row["i"]), int(row["piece"])) for row in chain.iterate()] == expected
+    data = compile(chain.repeat(1).batch(2), loading=READ)
+    reader = data.train(DataPartition())
+    try:
+        first = next(reader)
+        saved = reader.get_state()
+        rest = list(reader)
+    finally:
+        reader.close()
+    assert list(zip(first["i"].tolist(), first["piece"].tolist(), strict=True)) == expected[:2]
+    resumed = data.train(DataPartition())
+    try:
+        resumed.set_state(saved)
+        actual = list(resumed)
+    finally:
+        resumed.close()
+    assert len(actual) == len(rest)
+    for left, right in zip(actual, rest, strict=True):
+        for name in ("i", "piece"):
+            np.testing.assert_array_equal(left[name], right[name])
+
+
+@pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
+def test_finite_diagnostics_draw_after_rejection_and_shuffle_as_training_does(read):
+    chain = Memory([{**row, "value": row["i"]} for row in rows("a", 7)])
+    chain = chain.shuffle(13, **({"window": 3} if read == "streamed" else {}))
+    chain = chain.filter_map(drop_thirds).random_map(add_draw)
+    chain = dataclasses.replace(chain, mode=read, loading=READ)
+    actual = list(chain.iterate())
+    reader = compile(chain.repeat(1).batch(1, drop_remainder=False), loading=READ).train(DataPartition())
+    try:
+        reference = list(reader)
+    finally:
+        reader.close()
+    assert len(actual) == len(reference) == 4
+    for row, batch in zip(actual, reference, strict=True):
+        for name in ("i", "draw", "value"):
+            np.testing.assert_array_equal(row[name], batch[name][0])
+        assert row["value"] == row["i"] + row["draw"]
+
+
+@pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
+def test_an_augmented_image_preset_can_be_inspected_without_repeating(read):
+    from dew.data import presets
+    from dew.data.compile import fitted
+
+    records = [{"image": np.arange(6 * 8 * 3, dtype=np.uint8).reshape(6, 8, 3) + index,
+                "id": index} for index in range(4)]
+    chain = Memory(records).read(read).pipe(presets.images, 4, batch=2, augment=True)
+    chain = dataclasses.replace(chain, loading=READ)
+    inspected = list(chain.iterate())
+    data, _ = fitted(chain, None, objective=ObjectiveData())
+    reader = data.train(DataPartition())
+    try:
+        training = [next(reader) for _ in range(2)]
+    finally:
+        reader.close()
+    assert len(inspected) == 2
+    for actual, batch in zip(inspected, training, strict=True):
+        expected = batch
+        for step in data.device:
+            expected = step(expected)
+        np.testing.assert_array_equal(actual["id"], expected["id"])
+        np.testing.assert_array_equal(actual["image"], expected["image"])
+
+
+@pytest.mark.parametrize("consumer", ["iterate", "training"])
+def test_host_maps_refuse_undeclared_rejections_before_the_next_stage(consumer):
+    seen = []
+
+    def reject(batch):
+        return Rejected("bad_batch")
+
+    def following(batch):
+        seen.append(batch)
+        return batch
+
+    chain = Memory(rows("a", 4)).read("indexed").repeat(1).batch(2).map(reject, following)
+    chain = dataclasses.replace(chain, loading=READ)
+    reader = (chain.iterate() if consumer == "iterate"
+              else compile(chain, loading=READ).train(DataPartition()))
+    try:
+        with pytest.raises(ValueError):
+            next(reader)
+    finally:
+        reader.close()
+    assert seen == []
+
+
+@pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
+def test_column_verbs_preserve_simultaneous_renames_and_selection(read):
+    records = [{"a": index, "b": 10 + index, "unused": -index} for index in range(3)]
+    chain = (Memory(records).read(read).rename_columns({"a": "b", "b": "a"})
+             .remove_columns("unused", "absent").select_columns("b", "a"))
+    chain = dataclasses.replace(chain, loading=READ)
+    actual = list(chain.iterate())
+    assert [{name: int(value) for name, value in row.items()} for row in actual] == [
+        {"b": index, "a": 10 + index} for index in range(3)]
