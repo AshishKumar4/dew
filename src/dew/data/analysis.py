@@ -68,6 +68,7 @@ _STAGES = get_args(Stage.__value__)
 
 @runtime_checkable
 class _Provisionable(Protocol):
+    def can_provision(self, read: Read) -> bool: ...
     def provision(self) -> Source: ...
 
 
@@ -76,12 +77,24 @@ class _Wrapping(Protocol):
     source: Source
 
 
+def _provisioner(source: Source, read: Read) -> _Provisionable | None:
+    """The source that can prepare `read`, through any split or slice wrapping it."""
+    while isinstance(source, _Wrapping) and not isinstance(source, _Provisionable):
+        source = source.source
+    return source if isinstance(source, _Provisionable) and source.can_provision(read) else None
+
+
+def _store(source: Source) -> Source:
+    """The store under any source slices or holdouts."""
+    while isinstance(source, _Wrapping):
+        source = source.source
+    return source
+
+
 def _in_memory(source: Source) -> bool:
     """Whether a source holds its records in memory (`Memory`), itself or
     through the sources that wrap it."""
-    while isinstance(source, _Wrapping):
-        source = source.source
-    return isinstance(source, Memory)
+    return isinstance(_store(source), Memory)
 
 
 def _promoted(pipeline: Pipeline) -> Pipeline:
@@ -94,7 +107,7 @@ def _promoted(pipeline: Pipeline) -> Pipeline:
     the windows are indexed and the order is global in every read. A source
     read only as a stream, such as one filtered by a predicate, is packed as
     its rows arrive."""
-    from dew.data.cache import Generation
+    from dew.data.generation import Generation
     from dew.data.holdout import rebased
     from dew.data.packing import PackedSource, plan_name
 
@@ -128,11 +141,11 @@ def _preferred_read(compiled: Callable[[Read], Sequence[Pipeline]], *, provision
     would compile at each read, which differ where a recipe's default order
     does (`_order_at`), so each read is judged on the pipelines it would run.
 
-    Each source the run reads, after its published generations are promoted,
+    Each store the run reads, after its published generations are promoted,
     prefers memory for records held in memory (`Memory`, through any source
-    that wraps one), indexed for a store that reads by index, and streamed
-    otherwise, and a mixture takes the least eager of its corpora's
-    preferences. The run reads by the first read, from that preference toward
+    that wraps one), indexed for a store that reads by index or can provision
+    only that read, and streamed otherwise, and a mixture takes the least eager
+    of its corpora's preferences. The run reads by the first read, from that preference toward
     the more eager ones, that it can take (`_takes`).
 
     A source that cannot take the preferred read until it is provisioned
@@ -152,15 +165,20 @@ def _preferred_read(compiled: Callable[[Read], Sequence[Pipeline]], *, provision
 
     chosen: list[Read] = []
     for source in (source for pipeline in promoted(READS[-1]) for _, source in _leaves(pipeline)):
+        source = _store(source)
         if _in_memory(source):
             chosen.append("memory")
         else:
-            chosen.append("indexed" if source.supports("indexed") else "streamed")
+            indexed = source.supports("indexed") or (
+                not source.supports("streamed") and _provisioner(source, "streamed") is None
+                and _provisioner(source, "indexed") is not None
+            )
+            chosen.append("indexed" if indexed else "streamed")
     preferred = READS.index(max(chosen, key=READS.index))
     for read in READS[preferred::-1]:
         pipelines = promoted(read)
         missing = _unsupported(pipelines, read)
-        provisionable = all(isinstance(source, _Provisionable) for source in missing)
+        provisionable = all(_provisioner(source, read) is not None for source in missing)
         if read == READS[preferred] and missing and provisionable and not provision:
             return read
         if (not missing or (provision and provisionable)) and _lowers(pipelines, read):
@@ -583,14 +601,12 @@ def _checked(
         if isinstance(stage, Workers):
             if workers:
                 raise ValueError(f"pipeline {name} contains workers more than once")
-            if host:
-                raise ValueError(f"workers in {name} must precede map_batch")
             workers = True
         if isinstance(stage, MapBatch):
             if not batched:
                 raise ValueError(f"map_batch in {name} must follow batch")
             host = True
-        elif host:
+        elif host and not isinstance(stage, (Workers, Prefetch)):
             raise ValueError(f"{type(stage).__name__} in {name} follows the host map_batch stage")
         prefix.append(stage)
     return per_share
@@ -600,11 +616,9 @@ def _capabilities(pipelines: Sequence[Pipeline], read: Read, provision: bool) ->
     missing = _unsupported(pipelines, read)
     if provision:
         for source in missing:
-            # A split or a slice reads its source's records, so that source is what provisions.
-            while isinstance(source, _Wrapping) and not isinstance(source, _Provisionable):
-                source = source.source
-            if isinstance(source, _Provisionable):
-                source.provision()
+            preparer = _provisioner(source, read)
+            if preparer is not None:
+                preparer.provision()
     refused = [source.describe() for source in missing if not source.supports(read)]
     if refused:
         raise ValueError(
