@@ -132,6 +132,9 @@ test = [
     "diffusers==0.34.0",
     # tests/test_wan_source.py cleans prompts as Wan's pipelines do (the wan extra).
     "ftfy",
+    # tests/test_live_bridge.py runs the live bridge (site/live/container) over real sockets, on the
+    # release its container installs (setup-managed.sh).
+    "websockets==17.1",
     # Every decoder and MoE parity number is calibrated against this exact
     # release: the fixtures record it (tests/fixtures/hf/*/meta.json), the
     # tests cite its line numbers, and a resolve that moved it would compare
