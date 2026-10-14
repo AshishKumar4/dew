@@ -47,7 +47,7 @@ from typing import ClassVar, Protocol, TypedDict, runtime_checkable
 import jax
 import jax.numpy as jnp
 import numpy as np
-from flax import linen as nn
+from flax import linen as nn, traverse_util
 from flax.linen.dtypes import promote_dtype
 from flax.linen.module import Interceptor
 from flax.nnx import bridge
@@ -73,8 +73,15 @@ from dew.nn.protocols import (
     CountedTraining,
     CountedVideo,
 )
-from dew.objectives.base import Path, Variables, freeze, merge as overlay, select, thaw
+from dew.objectives.base import FROZEN, Path, Variables, freeze, merge as overlay, select, thaw
 from dew.registry import wrapper_layers
+from dew.training.quantization import (
+    FROZEN_FP8,
+    QUANTIZATION,
+    InputQuantization,
+    frozen_fp8_kernel,
+    measured_fp8_sites,
+)
 
 PEFT_CONFIG = "adapter_config.json"
 PEFT_WEIGHTS = "adapter_model.safetensors"
@@ -155,7 +162,8 @@ class LoRA:
             raise ValueError("modules names at least one projection")
 
     def apply(self, model: nn.Module, variables: Variables, *, key: int | jax.Array,
-              layouts: Mapping[str, WeightLayout] | None = None) -> Adapter:
+              layouts: Mapping[str, WeightLayout] | None = None,
+              fp8_base: InputQuantization | None = None) -> Adapter:
         """Attach this adapter to `model` over `variables` and draw its factors.
 
         `layouts` maps module names to tree paths: `Pretrained.layouts` for a loaded
@@ -163,10 +171,17 @@ class LoRA:
         its names. An entry of `modules` that matches no projection is refused. A is
         drawn per module from `key` in sorted name order, the way PEFT draws it, and B
         is zero, so the adapted model computes exactly what the source does.
+
+        `fp8_base` (`fp8_base`'s measurement) runs its frozen sites' products in
+        FP8: their kernels are packed from the base this adapter freezes, and the
+        model computes them under the record, inside the adapter's branch. FP8
+        changes the function, by about E4M3's rounding of each operand.
         """
         from dew.nn.inputs import request_key
 
         _refuse_unadaptable(model)
+        if fp8_base is not None:
+            model = fp8_base.joined(model)
         variables = thaw(variables)
         bound = _named(bound_layouts(model, variables, layouts or {}), self.modules)
         scaling = 2.0 * self.rank if self.alpha is None else float(self.alpha)
@@ -180,6 +195,23 @@ class LoRA:
             _insert_factors(leaves, factors.module, INIT_A(factor_key, shape_a, jnp.float32),
                             INIT_B(factor_key, shape_b, jnp.float32))
         return Adapter.bound(model, overlay(variables, leaves), targets, self.rslora, self.dropout, bound)
+
+    def fp8_base(self, model: nn.Module, variables: Variables, *, tokens: int,
+                 modules: Sequence[str] | None = None,
+                 layouts: Mapping[str, WeightLayout] | None = None) -> InputQuantization:
+        """Measure which projections of the base this adapter freezes run
+        faster in FP8 on this GPU at `tokens` rows a step, and return the
+        record `apply` takes as its `fp8_base` (`measured_fp8_sites`).
+
+        `modules` names the projections as `modules` does (this adapter's own
+        when None) and `layouts` resolves them as `apply` does. The
+        measurement holds the GPU; a run records its result, so a rerun
+        reproduces the choice without measuring.
+        """
+        bound = _named(bound_layouts(model, thaw(variables), layouts or {}),
+                       self.modules if modules is None else tuple(modules))
+        sites = tuple("/".join(layout.paths[0][1:-1]) for layout in bound.values())
+        return measured_fp8_sites(thaw(variables), sites, tokens)
 
     @staticmethod
     def load(model: nn.Module, variables: Variables, path: str | FilePath, *,
@@ -242,8 +274,8 @@ class Adapter:
         """
         adapted = _adapted(model, _Branch(targets, rslora, dropout), layouts)
         factors = {(*path, factor) for path in targets for factor in FACTORS}
-        return cls(adapted, freeze(thaw(variables), lambda path: path in factors), targets, rslora, dropout,
-                   layouts)
+        return cls(adapted, _fp8_packed(model, freeze(thaw(variables), lambda path: path in factors)),
+                   targets, rslora, dropout, layouts)
 
     @classmethod
     def from_run(cls, directory: str | FilePath, *, step: int | str | None = None,
@@ -301,13 +333,19 @@ class Adapter:
 
         `variables` is the adapted tree, whole or split as a trainer keeps it. The sum
         runs in at least fp32 at full precision and is stored in the kernel's dtype,
-        as PEFT's `merge_and_unload` does. The result is one `params` collection.
+        as PEFT's `merge_and_unload` does. A frozen FP8 site's kernel is the one its
+        codes decode to (`frozen_fp8_kernel`), targeted or not. The result is one
+        `params` collection.
         """
         variables = thaw(variables)
+        coded = {path[:-1] for path in traverse_util.flatten_dict(variables.get(QUANTIZATION, {}))
+                 if path[-1] == FROZEN_FP8[0]}
         merged: dict = {}
+        for site in coded:
+            _insert(merged, ("params", *site, "kernel"), _base_kernel(variables, ("params", *site)))
         for path, target in self.targets.items():
             node = _node(variables, path)
-            kernel, a, b = node["kernel"], node["lora_A"], node["lora_B"]
+            kernel, a, b = _base_kernel(variables, path), node["lora_A"], node["lora_B"]
             dtype = jnp.promote_types(kernel.dtype, jnp.float32)
             delta = jnp.tensordot(a.astype(dtype), b.astype(dtype), axes=1,
                                   precision=jax.lax.Precision.HIGHEST)
@@ -432,9 +470,13 @@ class _Branch:
         else:
             axes = (-1,)
         axes = tuple(sorted(axis % x.ndim for axis in axes))
-        kernel = module.get_variable("params", "kernel")
-        a = module.param("lora_A", INIT_A, (*kernel.shape[:len(axes)], target.rank), module.param_dtype)
-        b = module.param("lora_B", INIT_B, (target.rank, *kernel.shape[len(axes):]), module.param_dtype)
+        if module.has_variable("params", "lora_A"):
+            # A frozen FP8 site holds no kernel past init (`_fp8_packed`); its factors hold their shapes.
+            a, b = module.get_variable("params", "lora_A"), module.get_variable("params", "lora_B")
+        else:
+            kernel = module.get_variable("params", "kernel")
+            a = module.param("lora_A", INIT_A, (*kernel.shape[:len(axes)], target.rank), module.param_dtype)
+            b = module.param("lora_B", INIT_B, (target.rank, *kernel.shape[len(axes):]), module.param_dtype)
         # The branch drops out its input when the forward carries the
         # dropout stream, which is how a training forward is marked; an
         # evaluation forward carries none.
@@ -561,6 +603,22 @@ def _counted_adapter(model: nn.Module, branch: _Branch,
                             CountedPredictions, CountedPredictionParameters, CountedPredictionTraining)
 
 
+def _fp8_packed(model: nn.Module, variables: Variables) -> dict:
+    """`variables` with the frozen FP8 kernels of the record `model` computes
+    under packed from its `FROZEN` base (`InputQuantization.packed`), the
+    only kernels an adapter never trains, in place of those kernels: the
+    product never reads them (`frozen_fp8_dense`), and a merge decodes them
+    (`frozen_fp8_kernel`)."""
+    records = [layer._dew_wrapper() for layer in wrapper_layers(type(model))[1]]
+    record = next((wrapper for wrapper in records if isinstance(wrapper, InputQuantization)), None)
+    if record is None or not record.frozen_fp8:
+        return dict(variables)
+    packed = record.packed(variables[FROZEN])
+    sites = {tuple(site.split("/")) for site in record.frozen_fp8}
+    frozen = select(variables[FROZEN], lambda path: not (path[-1] == "kernel" and path[:-1] in sites))
+    return {**variables, FROZEN: frozen, QUANTIZATION: overlay(variables.get(QUANTIZATION, {}), packed)}
+
+
 def _adapted(model: nn.Module, branch: _Branch, layouts: Mapping[str, WeightLayout]) -> nn.Module:
     """Return `model` computing `branch` in every target module.
 
@@ -597,7 +655,7 @@ def _adapted(model: nn.Module, branch: _Branch, layouts: Mapping[str, WeightLayo
         def init_with_output(self, *args, **kwargs):
             with nn.intercept_methods(branch):
                 output, variables = super().init_with_output(*args, **kwargs)
-            return output, dict(freeze(variables, lambda path: path in factors))
+            return output, _fp8_packed(model, dict(freeze(variables, lambda path: path in factors)))
 
     Adapted.__name__ = Adapted.__qualname__ = base.__name__
     return Adapted(**{field.name: getattr(model, field.name)
@@ -670,6 +728,28 @@ def _record(targets: Mapping[Path, Target], rslora: bool, dropout: float,
                           for path in sorted(targets) if path in bindings})
 
 
+def _site_codes(variables: Variables, path: Path) -> Mapping | None:
+    """A frozen FP8 site's packed leaves for the module at `path` (under
+    `params`), or None where the module holds its own kernel."""
+    leaves = variables.get(QUANTIZATION, {})
+    for name in path[1:]:
+        leaves = leaves.get(name, {})
+    return leaves if FROZEN_FP8[0] in leaves else None
+
+
+def _base_kernel(variables: Variables, path: Path) -> jax.Array:
+    """The kernel of the module at `path`: its own, or a frozen FP8 site's
+    decoded from its packed codes (`frozen_fp8_kernel`)."""
+    codes = _site_codes(variables, path)
+    return _node(variables, path)["kernel"] if codes is None else jnp.asarray(frozen_fp8_kernel(codes))
+
+
+def _kernel_shape(variables: Variables, path: Path) -> tuple[int, ...]:
+    """The shape of `_base_kernel`, read without decoding a frozen FP8 site."""
+    codes = _site_codes(variables, path)
+    return tuple(np.shape(_node(variables, path)["kernel"] if codes is None else codes[FROZEN_FP8[0]].T))
+
+
 def _node(tree: Mapping, path: Path) -> Mapping:
     node = tree
     for name in path:
@@ -726,7 +806,7 @@ def _factors(name: str, layout: WeightLayout, variables: Variables, rank: int) -
             "delta on the assembled tensor does not split into one per leaf")
     if len(layout.shape) != 2:
         raise ValueError(f"{name} stores {layout.shape}, not a [out, in] matrix")
-    kernel_shape = _node(variables, layout.paths[0][:-1])["kernel"].shape
+    kernel_shape = _kernel_shape(variables, layout.paths[0][:-1])
     out, inner = layout.shape
     transpose = layout.transpose or tuple(range(len(kernel_shape)))
     stored = tuple(kernel_shape[axis] for axis in transpose)

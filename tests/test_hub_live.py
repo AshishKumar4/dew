@@ -90,8 +90,9 @@ def offline(monkeypatch):
 
 def test_a_pushed_decoder_resolves_downloads_and_loads_through_the_hub(api, throwaway, fresh_cache, tmp_path,
                                                                        monkeypatch):
+    from huggingface_hub import snapshot_download
+
     from dew.interop import PretrainedDecoder, sources
-    from dew.interop.hub import pull_from_hub
     from dew.interop.pretrained import Pretrained
     from dew.nn.backbones import CausalTransformer
 
@@ -129,7 +130,7 @@ def test_a_pushed_decoder_resolves_downloads_and_loads_through_the_hub(api, thro
         assert cached.revision == commit
         np.testing.assert_array_equal(np.asarray(cached.model.apply(cached.variables, ids)), expected)
 
-    pulled = pull_from_hub(repo, revision=commit)
+    pulled = Path(snapshot_download(repo_id=repo, revision=commit))
     assert pulled == directory and "consolidated.safetensors" in files_under(pulled)
 
 

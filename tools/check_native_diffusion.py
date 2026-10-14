@@ -10,6 +10,7 @@ import argparse
 from dataclasses import replace
 import json
 from pathlib import Path
+import sys
 import tempfile
 
 import jax
@@ -399,9 +400,19 @@ def check_model(directory):
     x = jnp.asarray(reference["input"])
     output = jax.jit(predict)(x)
     gradient = jax.jit(jax.grad(lambda value: jnp.sum(predict(value) * reference["probe"])))(x)
+    # Held to Diffusers' own float64 run on the same weights and inputs (tools/native_unet_reference.py
+    # --float64) by the float64 rule: a constant between two float32 implementations read one input's
+    # VJP 1.1e-4 off on one CPU and within on another.
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tests"))
+    from reference_error import assert_as_exact_as_the_reference, distance
+
+    truth = np.load(Path(__file__).resolve().parents[1] / "tests/fixtures/native_unet_float64.npz")
     errors = {}
-    compare(errors, "prediction", output, reference["output"], 1e-4)
-    compare(errors, "input_vjp", gradient, reference["vjp"], 1e-4)
+    for name, ours, theirs, key in (("prediction", output, reference["output"], "output"),
+                                    ("input_vjp", gradient, reference["vjp"], "vjp")):
+        wide = truth[f"{directory.name}/{key}"]
+        errors[name] = {"dew": distance(ours, wide), "reference": distance(theirs, wide)}
+        assert_as_exact_as_the_reference(ours, theirs, wide, f"{directory.name} {name}")
     print(json.dumps({"model": directory.name, "errors": errors}))
 
 

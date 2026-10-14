@@ -85,9 +85,9 @@ reference path where the call asks for arithmetic only it honours
 (`reference_only`), or where jax.nn's xla kernel would narrow or chain it;
 else triton where cudnn's kernel runs and `triton_runs`; flash where
 `flash_refusal` finds none; cudnn where its kernel runs (`cudnn_runs`); tpu
-where splash's does (`tpu_runs`); and xla anywhere else. A call off the kernel
-the device's target row (`gpu_target().kernels`) measured fastest is logged
-once a process with the reason (`ran_kernel`).
+where splash's does (`tpu_runs`); and xla anywhere else. A bf16 or fp16 call
+off the kernel the device's target row (`gpu_target().kernels`) measured
+fastest is logged at INFO once a process with the reason (`ran_kernel`).
 """
 
 
@@ -1023,17 +1023,10 @@ FLASH_PACKED_SEGMENTS = 64
 
 def flash_architectures() -> tuple[str, ...] | None:
     """The GPU generations the installed dew_flash_attn holds code for, as the wheel reports them
-    (its build's CUDA architectures), or None where it is not installed. A wheel from before it
-    reported them, 0.1.0, holds sm80's alone."""
+    (its build's CUDA architectures), or None where it is not installed."""
     if importlib.util.find_spec('dew_flash_attn') is None:
         return None
-    return _reported_architectures(importlib.import_module('dew_flash_attn'))
-
-
-def _reported_architectures(wheel) -> tuple[str, ...]:
-    """The boundary with an installed dew_flash_attn: the architectures it reports, or sm80's alone
-    for 0.1.0, which predates the report."""
-    return getattr(wheel, 'ARCHITECTURES', ('sm80',))
+    return importlib.import_module('dew_flash_attn').ARCHITECTURES
 
 
 def flash_built_for(generation: str, architectures: tuple[str, ...]) -> bool:
@@ -1687,8 +1680,8 @@ def resolve_implementation(implementation, query, key, *, dtype=None, precision=
     (`reference_only`), else triton where `triton_runs` and cudnn's kernel
     would take the call, flash where `flash_refusal` has no refusal, cudnn
     where `cudnn_runs` and the call has no sinks and no bidirectional window,
-    the tpu kernel where `tpu_runs`, and xla anywhere else; a call off flash
-    where it was measured fastest is logged (`ran_kernel`). Any other name is returned as it is,
+    the tpu kernel where `tpu_runs`, and xla anywhere else; a bf16 or fp16 call
+    off flash where it was measured fastest is logged (`ran_kernel`). Any other name is returned as it is,
     so an explicit kernel still refuses what it cannot honour by name.
     """
     if implementation not in get_args(AttentionImpl):
@@ -1721,7 +1714,8 @@ def resolve_implementation(implementation, query, key, *, dtype=None, precision=
         chosen = 'tpu'
     else:
         chosen = 'xla'
-    return ran_kernel('attention', chosen, refusal)
+    # FlashAttention takes no other query dtype, so such a call declines no kernel it could run.
+    return ran_kernel('attention', chosen, refusal) if query.dtype in CUDNN_DTYPES else chosen
 
 
 def kernel_for_materialized_mask(implementation: str, query, *, dtype=None, precision=None,

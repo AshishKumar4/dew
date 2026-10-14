@@ -35,6 +35,11 @@ class ThreadPrefetchIterDataset(IterDataset[T], Generic[T]):
     def __init__(self, parent: IterDataset[T], *, prefetch_buffer_size: int) -> None: ...
 
 
+class FlatMapTransform:
+    max_fan_out: int
+    def flat_map(self, element: Any) -> Sequence[Any]: ...
+
+
 class FlatMapIterDataset(IterDataset[T], Generic[T]):
     def __init__(self, parent: IterDataset[Any], transform: Any) -> None: ...
 
