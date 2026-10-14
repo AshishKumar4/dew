@@ -55,8 +55,9 @@ jobs:
       matrix:
         # Three runners of about two and a half minutes of notebooks each (01
         # 83 s, 03 40; 02 55, 04 47, 05 20, 07 18; 06 35, 08 107 in run
-        # 37786757641). 04 reads the checkpoint 02 writes, so they share one.
-        notebooks: ["01 03", "02 04 05 07", "06 08"]
+        # 37786757641; 11 about 40 s on armada). 04 reads the checkpoint 02
+        # writes, so they share one.
+        notebooks: ["01 03 11", "02 04 05 07", "06 08", "10"]
     name: smoke (${{ matrix.notebooks }})
     steps:
     - uses: actions/checkout@v4
@@ -76,7 +77,11 @@ jobs:
       uses: actions/cache@v4
       with:
         path: ~/.cache/huggingface
-        key: tutorials-hf-v1
+        # One cache per job, since each job downloads only its own notebooks' files; a shared key
+        # kept whichever job saved first, and the others fetched from the Hub on every run. A
+        # notebook edit saves a new cache on top of the last one.
+        key: tutorials-hf-${{ matrix.notebooks }}-${{ hashFiles('tutorials/*.ipynb') }}
+        restore-keys: tutorials-hf-${{ matrix.notebooks }}-
     - name: Run the tutorials
       run: python tools/run_tutorials.py ${{ matrix.notebooks }} --workdir "$RUNNER_TEMP/tutorials" --imports "$RUNNER_TEMP/imports.json"
     - name: Report outputs older than the code they ran

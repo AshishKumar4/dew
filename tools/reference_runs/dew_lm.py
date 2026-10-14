@@ -299,7 +299,7 @@ def record(args: argparse.Namespace, run: Run, curves: Curves, probe: RouterProb
         "compile_seconds": run.compile_seconds,
         "flops_per_token": flops_token,
         "work": dataclasses.asdict(run.work),
-        "hlo_flops_per_step": run.trainer.flops_per_step,
+        "hlo_flops_per_step": (run.trainer.step_flops and run.trainer.step_flops.hardware),
         "mfu": None if peak_rate is None else run.work.training_flops_per_step * curves.timed_steps
             / curves.window_seconds / (peak_rate * devices),
         "memory": {"peak_allocated_bytes": [int(s.get("peak_bytes_in_use", 0)) for s in stats],

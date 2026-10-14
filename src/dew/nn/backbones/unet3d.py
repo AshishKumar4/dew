@@ -14,6 +14,8 @@ import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
+from dew.objectives.base import merge
+
 from ..attention import NormalAttention, RMSNorm
 from ..blocks import TimeProjection
 from ..dit import ROPE_THETA
@@ -133,12 +135,4 @@ def inflate_unet_variables(variables_2d, variables_3d):
     reproduces the 2D model frame by frame until training moves the temporal
     weights.
     """
-    def merge(dst, src):
-        out = dict(dst)
-        for key, value in src.items():
-            if isinstance(value, dict):
-                out[key] = merge(dst[key], value)
-            else:
-                out[key] = value
-        return out
     return merge(variables_3d, variables_2d)

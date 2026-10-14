@@ -7,9 +7,9 @@ and head. `pretrained` names another: a Laya-style repository (one with an
 fresh, with `lora` to train an adapter in place of the whole model. A fresh
 head is Laya's, reading the layout the backbone's order asks for, or with
 `head` Clef's joint schema head, reading every question of an example in one
-row (`JointLayout`). `mixture` trains on several labelled sets, each at its
-share of every step, in place of `data`'s table. A tenth
-of the rows, at most 400, are held out (`DecisionTable.held_out`);
+row (`JointLayout`). A `Decisions` recipe reads a table or a mixture manifest
+whose sets contribute their recorded shares. A tenth
+of the table's rows, at most 400, are held out by the default `HoldOut`;
 validation scores them, and after training they fit the temperatures the
 task divides its logits by, saved into the run, so `Decide.from_run` and
 `dew.pipeline` answer calibrated. A question type's temperature needs ten
@@ -19,7 +19,7 @@ held-out answers and a bucket's 2000, Laya's floors.
 from __future__ import annotations
 
 import dataclasses
-import logging
+import json
 import os
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -27,8 +27,10 @@ from typing import TYPE_CHECKING
 import jax
 
 from dew.config import ModelConfig, ObjectiveConfig, OptimConfig, Prepared, RunConfig
+from dew.config.data import HoldOut, loader
+from dew.data.storage import Store
 from dew.data.text import HFTokenizer
-from dew.decision.data import DecisionMixture, DecisionTable, Example, Weighted
+from dew.decision.data import Decisions
 from dew.decision.head import JointSchemaHead
 from dew.decision.laya import LayaCheckpoint
 from dew.decision.layout import JointLayout, Layout, MarkerLayout, StateFirstLayout
@@ -39,9 +41,8 @@ from dew.decision.scoring import LogLoss
 from dew.decision.task import Decide
 from dew.nn.backbones.decoder_block import remat_policy
 from dew.nn.protocols import RematChoosing
+from dew.records import number, record
 from dew.training.state import TrainState
-
-_log = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from dew.interop import Pretrained
@@ -68,9 +69,8 @@ class DecisionRunConfig(RunConfig):
     objective: ObjectiveConfig = dataclasses.field(default_factory=lambda: ObjectiveConfig("decision"))
     """The decision objective and its arguments: its scoring rule (`loss`),
     label smoothing, option shuffling and none-of-the-above rate."""
-    data: DecisionTable = dataclasses.field(default_factory=DecisionTable)
-    mixture: DecisionMixture | None = None
-    """Labelled sets to train on, each at its share of every step, in place of `data`."""
+    data: Decisions = dataclasses.field(default_factory=lambda: Decisions(
+        source="tickets.csv", validation=HoldOut(fraction=0.1, by="random", most=400)))
     optim: OptimConfig = dataclasses.field(default_factory=lambda: OptimConfig(learning_rate=2.5e-5))
     model: ModelConfig = dataclasses.field(
         default_factory=lambda: ModelConfig("causal_transformer", {"dtype": "bfloat16"}))
@@ -119,7 +119,6 @@ class DecisionRunConfig(RunConfig):
     (a hundred options, or a document's many hypotheses) fits under a `max_len`
     set for it without lengthening every other row's state. None lets the
     state fill the row."""
-
     def prepare(self) -> Prepared:
         """The objective over the backbone `pretrained` names, on the table's
         or the mixture's rows, scored on the held-out ones, which calibrate the
@@ -129,6 +128,7 @@ class DecisionRunConfig(RunConfig):
         chooses its layer recomputation before looping or attaching LoRA."""
         from dew.interop import Pretrained, sources
 
+        self = dataclasses.replace(self, trainer=self.trainer.derived())
         decided = sorted(set(self.model.fields) - {"dtype", "attention_impl"})
         if decided:
             raise ValueError(f"--model sets {decided}, which {self.pretrained} decides; only dtype and "
@@ -174,37 +174,38 @@ class DecisionRunConfig(RunConfig):
         objective = self.objective.build(backbone=start, **derived)
         assert isinstance(objective, DecisionObjective), "a decision run's objective is a DecisionObjective"
         summary: dict[str, object] = {"pretrained": self.pretrained}
-        if self.mixture is None:
-            train, held_out = self.data.examples()
-            weighted = {"examples": Weighted(train, 1.0)}
-        else:
-            weighted, held_out = self.mixture.read()
-            summary["mixture"] = self.mixture.shares()
-            summary["made"] = self.mixture.recorded()
-        fitting, held_out, unfit = _fitting(objective, weighted, held_out)
+        if isinstance(self.data.source, str):
+            manifest = Store(self.data.source).child("mixture.json")
+            fs, path = manifest.resolve()
+            if fs.exists(path):
+                made = record(json.loads(manifest.read()), "mixture.json")
+                weights = {name: number(value, f"weights.{name}") for name, value in
+                           record(made.get("weights", {}), "weights").items()} | dict(self.data.weights)
+                summary["mixture"] = {name: value for name, value in weights.items() if value > 0}
+                summary["made"] = made
+        dataset = loader(self.data, batch=self.trainer.batch_size, tokens=self.trainer.batch_tokens,
+                       read=self.data_read,
+                       provision=self.provision, seed=self.data_seed, loading=self.loading,
+                       validation_records=self.validation_records,
+                       objective=objective.data())
+        summary["records"] = dataset.records
+        unfit = {name: counter.rejected.get("unfit", 0) for name, counter in dataset.counts.items()}
+        unfit["held out"] = sum(counter.rejected.get("unfit",
+            0) for counter in dataset.validation_counts.values())
         if any(unfit.values()):
             summary["unfit"] = unfit
-        left = sorted(set(weighted) - set(fitting))
-        if left:
-            summary["left out"] = left
-            _log.warning("%s left out of the mixture: none of their rows fits a joint row of %d tokens",
-                         ", ".join(left), objective.layout.max_len)
-        weighted = fitting
-        examples = weighted if self.mixture is not None else weighted["examples"].examples
-        dataset = objective.dataset(examples, batch=self.trainer.batch_size, validation=held_out or None,
-                                    seed=self.data.seed, loading=self.data.loading)
-        summary["records"] = dataset.records
 
         def calibrate(state: TrainState, directory: str) -> None:
             """Fit the task's temperatures on the held-out rows; process zero saves them into the run."""
             task = objective.pipeline(state)
             assert isinstance(task, Decide), "a decision objective's task is a Decide"
-            calibrated = dataclasses.replace(task.calibrated(held_out), name=os.path.basename(directory))
+            assert dataset.val is not None
+            calibrated = dataclasses.replace(task.calibrated(dataset.val), name=os.path.basename(directory))
             if jax.process_index() == 0:
                 calibrated.save(directory)
 
         metrics = (Accuracy(), ECE(), AURC(), LogLoss())
-        fitted = calibrate if self.calibrate and held_out else None
+        fitted = calibrate if self.calibrate and dataset.val is not None else None
         return Prepared(self, lambda name: self.train(objective, dataset, name=name, metrics=metrics,
                                                       summary=summary, after=fitted))
 
@@ -238,44 +239,6 @@ def _budgeted(layout: Layout, budgets: dict[str, int]) -> Layout:
     if unknown:
         raise ValueError(f"{', '.join(unknown)} budget a row that {type(layout).__name__} does not lay out")
     return dataclasses.replace(layout, **budgets)
-
-
-def _fitting(objective: DecisionObjective, weighted: dict[str, Weighted],
-             held: list[Example]) -> tuple[dict[str, Weighted], list[Example], dict[str, int]]:
-    """The examples the objective's layout can lay out, and how many of each set it cannot.
-
-    A joint row holds every question of an example, and one whose questions
-    alone pass the layout's `max_len` cannot be laid out at all: it is dropped
-    and counted here, rather than stopping the run when a worker reaches it. A
-    layout of one row per question lays out every example.
-
-    A set none of whose rows fit has nothing to train on and is left out of
-    the mixture, its rows counted, since grain refuses to mix an empty set;
-    the run's summary names it (`prepare`). A budget no set fits is refused.
-    """
-    if not objective.layout.joint:
-        return weighted, held, {}
-
-    def fits(example: Example) -> bool:
-        try:
-            objective.layout.rows(objective.tokenizer, objective.specials, example.state, example.questions)
-        except ValueError:
-            return False
-        return True
-
-    kept, unfit = {}, {}
-    for name, entry in weighted.items():
-        examples = [example for example in map(Example.of, entry.examples) if fits(example)]
-        unfit[name] = len(entry.examples) - len(examples)
-        if examples:
-            kept[name] = Weighted(examples, entry.weight)
-    if not kept:
-        raise ValueError(
-            f"no row of {sorted(weighted)} fits a joint row of {objective.layout.max_len} tokens: each "
-            f"one's questions alone pass it; raise --max-len")
-    held_kept = [example for example in held if fits(example)]
-    unfit["held out"] = len(held) - len(held_kept)
-    return kept, held_kept, unfit
 
 
 __all__ = ["DecisionRunConfig", "JointShape"]

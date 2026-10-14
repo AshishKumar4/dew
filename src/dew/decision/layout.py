@@ -15,6 +15,7 @@ for a causal backbone. `JointLayout` is Clef's, one row for every question
 of a request, each option a span of its own.
 """
 
+import dataclasses
 import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -27,7 +28,7 @@ from flax import struct
 from dew import records
 from dew.data.text import HFTokenizer, Tokenizer
 from dew.decision.questions import Choice, Noul, Question, Score, kind_of
-from dew.nn.inputs import pad_token_rows
+from dew.nn.inputs import Coordinates, coordinates, pad_token_rows
 from dew.records import JSON
 
 
@@ -136,8 +137,19 @@ def _slots(count: int, order: Sequence[int] | None) -> list[int]:
 
 
 @dataclass(frozen=True)
+class Bounds:
+    """The most rows (`segments`), questions and options one packed window holds;
+    `options` is None where the layout trims a question's options to share a
+    budget rather than giving each tokens of its own (`QuestionLayout`)."""
+
+    segments: int
+    questions: int
+    options: int | None
+
+
+@dataclass(frozen=True)
 class Layout:
-    """How a state and its questions become rows of at most `max_len` tokens."""
+    """How a state and its questions become rows of tokens that fit `max_len` (`fits`)."""
 
     max_len: int = 512
     joint: ClassVar[bool] = False
@@ -157,6 +169,42 @@ class Layout:
         `image` text places in the row.
         """
         raise NotImplementedError
+
+    def fits(self, row: Encoded) -> bool:
+        """Whether `row` is within `max_len`. A layout cuts the state to fit
+        and keeps a schema whole, so a row whose schema alone passes
+        `max_len` does not fit: training leaves its example out (`Fit`),
+        counted as unfit, and a task refuses it."""
+        return len(row.tokens) <= self.max_len
+
+    def bounds(self, encoder: Tokenizer, specials: Specials) -> Bounds:
+        """The most rows, questions and options a window of `max_len` tokens
+        packs, from the fewest tokens each takes in this layout: a row of one
+        one-option question about an empty state, and what one more option or
+        one more one-option question adds to it, laid out with room to spare
+        so that nothing is cut. A window of m rows then holds at most m
+        questions and m options in m rows' tokens, and each further question
+        or option takes its own. The packer holds every window to these
+        bounds, so a row shorter still starts a new window rather than
+        outgrowing one."""
+        roomy = dataclasses.replace(self, max_len=1 << 30)
+
+        def size(*options: int) -> int:
+            asked = {f"q{index}": Choice("x", [str(option) for option in range(count)])
+                     for index, count in enumerate(options)}
+            return sum(len(row.tokens) for row in roomy.rows(encoder, specials, "", asked))
+
+        row = size(1)
+        question, option = size(1, 1) - row, size(2) - row
+        if row > self.max_len:
+            raise ValueError(f"max_len={self.max_len} holds no row of a {type(self).__name__}, whose "
+                             f"shortest is {row} tokens")
+        rows = range(1, self.max_len // row + 1)
+        each = min(option, question)
+        options = None if each <= 0 else max(count + int((self.max_len - count * row) // each)
+                                             for count in rows)
+        return Bounds(len(rows), max(count + (self.max_len - count * row) // question for count in rows),
+                      options)
 
 
 @dataclass(frozen=True)
@@ -328,7 +376,8 @@ class JointLayout(Layout):
     A choice's options come in the order of their keys, and a noul's as true,
     then false, with Clef's descriptions where the question gives none. The
     state is cut to `max_state_tokens`, and to what the schema leaves of
-    `max_len`; the schema itself is never cut.
+    `max_len`; the schema itself is never cut, so a schema longer than
+    `max_len` leaves no state and a row that does not fit (`fits`).
     """
 
     max_len: int = 16384
@@ -374,11 +423,7 @@ class JointLayout(Layout):
         whole = len(state_ids)
         if self.max_state_tokens is not None:
             state_ids = state_ids[:self.max_state_tokens]
-        fixed = len(prefix) + len(schema) + len(suffix)
-        if fixed > self.max_len:
-            raise ValueError(f"the schema needs {fixed} tokens before the state, more than the "
-                             f"maximum context length, max_len={self.max_len}")
-        state_ids = state_ids[:self.max_len - fixed]
+        state_ids = state_ids[:max(0, self.max_len - len(prefix) - len(schema) - len(suffix))]
         offset = len(prefix) + len(state_ids)
 
         def moved(span: tuple[int, int]) -> tuple[int, int]:
@@ -441,31 +486,31 @@ def _parallel(spans: list[tuple[int, int]], length: int) -> tuple[tuple[int, ...
 
 @struct.dataclass
 class DecisionInputs:
-    """A batch of laid-out rows, padded to the longest row, the most questions and the most options.
+    """A batch of laid-out rows: packed windows of whole rows, or rows padded to the longest.
 
-    - `tokens` `[B, L]` ids, `valid` `[B, L]` the real tokens, each row's
-      first (`collate` and the training `Encoding` pad after them, and the
-      model reads its rows as right-padded);
+    - `tokens` `[B, L]` ids, `segments` `[B, L]` each token's row in its
+      window, numbered from 1 in window order and 0 on the padding after the
+      last (`Pack`); a padded batch is windows of one row each (`collate`);
+    - `positions` `[B, L]` each token's place in its row (None: counted from
+      0 along it), and in the parallel layout `slots` `[B, L]` each token's
+      option slot, 0 for the tokens every option shares;
     - `kinds` `[B, Q]` each question's type (`KINDS`), `questions` `[B, Q]` the
-      real questions, `spans` `[B, Q, 2]` their instructions' (start, end);
+      real questions, in their rows' window order, `spans` `[B, Q, 2]` their
+      instructions' (start, end) in the window;
     - `option_spans` `[B, Q, K, 2]` each option slot's (start, end), `options`
       `[B, Q, K]` the real slots;
-    - in the parallel layout, `positions` `[B, L]` and `slots` `[B, L]`;
-    - `option_slots` `[B, P]` each row's real options as flat indices `q * K + k`
-      into its `[Q, K]` grid, in that order (`compacted`), and `slotted` `[B, P]`
-      which of them are real, or None for the grid itself.
+    - `option_slots` `[B, P]` each window's real options as flat indices
+      `q * K + k` into its `[Q, K]` grid, in that order (`compacted`), and
+      `slotted` `[B, P]` which of them are real, or None for the grid itself.
 
-    A row of one question with one marker per option, Laya's, has Q of 1 and
-    spans one token long.
-
-    The grid holds the most questions times the most options, and a row's real
-    options are a few of them: in the Qwen3.5-0.8B decision mixture 24 to 100 of
-    28 x 100. A head that reads `option_slots` computes the real ones alone,
-    P rather than Q x K of them.
+    A row of one question with one marker per option, Laya's, has spans one
+    token long. A head that reads `option_slots` computes the real options
+    alone, P rather than Q x K of them: a window holds a few of its grid's.
+    `max_segments` bounds the rows a window holds (`Layout.bounds`).
     """
 
     tokens: jnp.ndarray
-    valid: jnp.ndarray
+    segments: jnp.ndarray
     kinds: jnp.ndarray
     questions: jnp.ndarray
     spans: jnp.ndarray
@@ -475,6 +520,24 @@ class DecisionInputs:
     slots: jnp.ndarray | None = None
     option_slots: jnp.ndarray | None = None
     slotted: jnp.ndarray | None = None
+    max_segments: int = struct.field(pytree_node=False, default=1)
+
+    @property
+    def valid(self) -> jnp.ndarray:
+        """Return the `[B, L]` real tokens."""
+        return self.segments != 0
+
+    def coordinates(self) -> Coordinates:
+        """The tokens' `Coordinates`: each row a document, real tokens first. A
+        window's padding after its rows is one more document, so the documents a
+        window holds are its rows' bound and one (a sequence kernel's capacity)."""
+        return coordinates(segments=self.segments, positions=self.positions,
+                           max_segments=self.max_segments + 1, right_padded=True)
+
+    @property
+    def question_segments(self) -> jnp.ndarray:
+        """Return the `[B, Q]` row each question belongs to, 0 for a padding slot."""
+        return jnp.where(self.questions, jnp.take_along_axis(self.segments, self.spans[..., 0], axis=1), 0)
 
     @property
     def markers(self) -> jnp.ndarray:
@@ -484,7 +547,8 @@ class DecisionInputs:
     @classmethod
     def collate(cls, rows: Sequence[Encoded], pad: int, *, questions: int | None = None,
                 options: int | None = None, option_slots: int | None = None) -> "DecisionInputs":
-        """Right-pad `rows` into one batch (`pad_token_rows`), its question and option slots to the widest.
+        """Right-pad `rows` into one batch (`pad_token_rows`), one row a window, its question
+        and option slots to the widest.
 
         `questions` and `options` widen those slots further, to shapes a caller
         keeps fixed. `option_slots` is the real options a row may hold, a shape
@@ -520,7 +584,7 @@ class DecisionInputs:
         else:
             compact = True
         indexed = [compacted(row, option_slots) for row in real_options] if compact else None
-        return cls(jnp.asarray(tokens), jnp.asarray(valid), jnp.asarray(kinds), jnp.asarray(real),
+        return cls(jnp.asarray(tokens), jnp.asarray(valid, jnp.int32), jnp.asarray(kinds), jnp.asarray(real),
                    jnp.asarray(spans), jnp.asarray(option_spans), jnp.asarray(real_options),
                    jnp.asarray(padded["positions"], jnp.int32) if parallel else None,
                    jnp.asarray(padded["slots"], jnp.int32) if parallel else None,

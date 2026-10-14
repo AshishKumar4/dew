@@ -26,7 +26,9 @@ from __future__ import annotations
 import dataclasses
 import functools
 import os
+import re
 from collections.abc import Mapping
+from typing import TYPE_CHECKING
 
 import jax
 import jax.numpy as jnp
@@ -46,6 +48,9 @@ from dew.objectives.base import FROZEN, Step, merge, thaw
 from dew.training.distributed import batch_shardings
 from dew.training.host import transfer
 from dew.training.transaction import Realization
+
+if TYPE_CHECKING:
+    from dew.data.pipeline import DeviceStep
 
 BANK_MEMORY = "pinned_host"
 """Where a layer's bank sits beside the accelerator: the stack fetches one
@@ -268,6 +273,18 @@ def _selected(tree, paths):
     return selected
 
 
+def _after(device: tuple[DeviceStep, ...], loss, variables, batch, execution):
+    """`loss` over the batch the dataset's `device` steps make of `batch`."""
+    for step in device:
+        batch = step(batch)
+    return loss(variables, batch, execution)
+
+
+def _named(step: DeviceStep) -> str:
+    """A device step as its program's name keeps it: its repr, without a process's addresses."""
+    return re.sub(r" at 0x[0-9a-f]+", "", repr(step))
+
+
 def _forward(loss, primal, frozen, store, batch, execution, *, layout):
     """`loss` of the moving leaves `primal` beside the `frozen` ones, the
     store's other collections, the batch and the step's clock and keys, with
@@ -308,14 +325,22 @@ class HostExecution:
     accelerator, runs the loss there, and hands back a pullback. It keeps no
     state of its own between attempts.
     """
-    def __init__(self, objective, layout, accelerator, cpu):
+    def __init__(self, objective, layout, accelerator, cpu, device: tuple[DeviceStep, ...] = ()):
         self.objective, self.layout = objective, layout
         self.accelerator, self.cpu = accelerator, cpu
         self.sites = bank_sites(objective) if objective.bank_sites else ()
-        # The objective owns the program, which its fit ladder replaces with its model.
-        self.forward = objective._compiled_program(
-            'host_forward', functools.partial(_forward, objective._loss), static_argnames=("layout",))
+        self.device = device
         self.unstack = jax.jit(functools.partial(_logical, sites=self.sites))
+
+    @property
+    def forward(self):
+        """The loss and its pullback, compiled for the objective's modules as they are now: the
+        objective owns the program, which its fit ladder replaces with its model. The dataset's
+        device steps run in it, on the accelerator, before the loss; its name says which they are."""
+        return self.objective.program(
+            "host_forward" + "".join(f" then {_named(step)}" for step in self.device),
+            functools.partial(_forward, functools.partial(_after, self.device, self.objective._loss)),
+            static_argnames=("layout",))
 
     def snapshot(self, variables):
         """The declared stacks as banks, everything else as it is stored.

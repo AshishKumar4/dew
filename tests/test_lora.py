@@ -33,7 +33,7 @@ from reference_error import assert_as_exact_as_the_reference
 from safetensors.numpy import load_file
 
 from dew import lora
-from dew.data import Dataset
+from dew.data.dataset import Loader
 from dew.diffusion.process import DenoisingCondition
 from dew.interop.pretrained import Pretrained
 from dew.interop.safetensors_io import read_file
@@ -180,7 +180,7 @@ def test_an_adapted_head_trains_on_its_exact_logits(decoder, reference):
     np.testing.assert_allclose(first, optax.softmax_cross_entropy_with_integer_labels(
         logits, batch["text"][:, 1:]).mean(), rtol=1e-5)
 
-    data = Dataset(train=lambda partition: iter([{"text": tokens[np.arange(rows) % 2]}] * 3), val=None,
+    data = Loader(train=lambda partition: iter([{"text": tokens[np.arange(rows) % 2]}] * 3), val=None,
                    records=rows, batch=rows)
     state = trainer.fit(data, steps=3, log_every=3)
     assert objective.scalar_loss(state.variables, batch, step)[0] < first
@@ -200,7 +200,7 @@ def test_one_trainer_step_moves_the_adapter_and_nothing_else(decoder, loaded, re
     tokens = np.asarray(reference["input_ids"])
     rows = 2 * jax.device_count()
     objective = LMObjective(adapter.model, tokens.shape[1] - 1, variables=adapter.variables, ema_decay=None)
-    data = Dataset(
+    data = Loader(
         train=lambda partition: iter([{"text": tokens[np.arange(rows) % 2]}]),
         val=None,
         records=rows,
@@ -259,7 +259,7 @@ def test_a_source_fine_tunes_through_its_own_adapted_bundle(decoder, reference, 
                       layout=Layout(min_shard=2**30))
     initial = trainer.initial_state()
     state = trainer.fit(
-        Dataset(train=lambda partition: iter([batch, batch]), val=None, records=rows, batch=rows),
+        Loader(train=lambda partition: iter([batch, batch]), val=None, records=rows, batch=rows),
         steps=2,
         log_every=2,
     )
@@ -694,7 +694,7 @@ def test_a_pipeline_lora_run_moves_its_factors_and_nothing_else(family, pipeline
              **objective.inputs.tokenize([PROMPTS[row % 2] for row in range(rows)])}
     trainer = Trainer(objective, optax.sgd(1e-2), key=jax.random.key(3))
     initial = trainer.initial_state()
-    data = Dataset(train=lambda partition: iter([batch] * 3), val=None, records=rows, batch=rows)
+    data = Loader(train=lambda partition: iter([batch] * 3), val=None, records=rows, batch=rows)
     state = trainer.fit(data, steps=3, log_every=3)
 
     assert set(_flat(state.variables["params"])) == {
@@ -738,18 +738,41 @@ def test_a_tuned_pipeline_saves_its_adapter_and_its_merged_weights(family, pipel
 EXPORTS = ROOT / "tests" / "fixtures" / "lora_exports"
 
 
-def _recorded(name: str):
+def _recorded(name: str) -> dict[str, np.ndarray]:
     with np.load(EXPORTS / f"{name}.npz") as data:
-        arrays = {key: data[key] for key in data}
-    return arrays, json.loads(arrays.pop("meta").tobytes())
+        return {key: data[key] for key in data if key != "meta"}
 
 
-def _assert_written_as_read(name: str, directory: Path, meta) -> None:
-    from tools.lora_export_reference import digests
+def _layout(directory: Path) -> dict:
+    """Each file of an adapter as its reader parses it, values aside: a safetensors file's metadata
+    and every tensor's name, dtype and shape, a JSON file's contents."""
+    from safetensors import safe_open
 
-    assert digests(directory) == meta["digests"], (
-        "Dew's adapter changed: rerun both halves of tools/lora_export_reference.py, "
+    layout = {}
+    for path in sorted(directory.iterdir()):
+        if path.suffix == ".safetensors":
+            with safe_open(str(path), "numpy") as file:
+                layout[path.name] = (file.metadata(), {name: (str(file.get_tensor(name).dtype),
+                                                              file.get_tensor(name).shape)
+                                                       for name in sorted(file.keys())})
+        else:
+            layout[path.name] = json.loads(path.read_text())
+    return layout
+
+
+def _written_as_read(name: str, source, variables, directory: Path) -> Adapter:
+    """The adapter `export_case` wrote into `directory` on this device reads back as the variables
+    it wrote, in the layout of the files PEFT or Diffusers read (tests/fixtures/lora_exports/<name>,
+    which tools/lora_export_reference.py's `export` wrote); returns the adapter those files hold,
+    which the reader's outputs were recorded from."""
+    assert _layout(directory) == _layout(EXPORTS / name), (
+        "Dew's adapter files changed: rerun both halves of tools/lora_export_reference.py, "
         "`consume` in its PEFT environment, so PEFT and Diffusers read the new files")
+    again = LoRA.load(source.model, source.variables, directory, layouts=source.layouts)
+    for written, read in zip(jax.tree.leaves(variables["params"]), jax.tree.leaves(again.variables["params"]),
+                             strict=True):
+        np.testing.assert_array_equal(np.asarray(read), np.asarray(written))
+    return LoRA.load(source.model, source.variables, EXPORTS / name, layouts=source.layouts)
 
 
 @pytest.mark.parametrize("name", ["llama", "llama-rslora", "llama-patterns"])
@@ -759,14 +782,15 @@ def test_peft_reads_the_adapter_dew_writes_at_dews_logits(name, decoder, tmp_pat
     rsLoRA, and the committed one whose rank and alpha patterns Dew writes
     back, each with its factors moved) onto transformers' llama-tiny: every
     tensor of the file lands, and the adapted and `merge_and_unload` logits
-    are recorded in float32 and float64. The adapter written here is the
-    one that was read, and Dew's adapted and merged logits hold the float64
-    rule against PEFT's."""
+    are recorded in float32 and float64. The adapter written here, on this
+    device, reads back as written, in the layout of the files PEFT read, and
+    Dew's adapted and merged logits from those files hold the float64 rule
+    against PEFT's."""
     from tools.lora_export_reference import CASES, export_case
 
-    adapter, variables = export_case(CASES[name], decoder, tmp_path)
-    arrays, meta = _recorded(name)
-    _assert_written_as_read(name, tmp_path, meta)
+    _, written = export_case(CASES[name], decoder, tmp_path)
+    adapter = _written_as_read(name, decoder, written, tmp_path)
+    variables, arrays = adapter.variables, _recorded(name)
     ids = jnp.asarray(arrays["input_ids"])
     adapted = adapter.model.apply(variables, ids)
     merged = decoder.model.apply(adapter.merge(variables), ids)
@@ -789,9 +813,9 @@ def test_diffusers_reads_the_adapter_dew_writes_at_dews_prediction(family, pipel
     from tools.lora_export_reference import CASES, export_case
 
     source = pipelines[family]
-    adapter, variables = export_case(CASES[family], source, tmp_path)
-    arrays, meta = _recorded(family)
-    _assert_written_as_read(family, tmp_path, meta)
+    _, written = export_case(CASES[family], source, tmp_path)
+    adapter = _written_as_read(family, source, written, tmp_path)
+    variables, arrays = adapter.variables, _recorded(family)
     model = torch_unet(source.model) if family == "sd" else source.model
     if family == "sd":
         adapter = _rebound(adapter, model)
@@ -818,14 +842,16 @@ def _recipe_run(tmp_path, image_size, *args):
 
     config = DiffusionRunConfig.cli([
         "--model.dtype", "float32", "--model.attention-impl", "xla",
-        "data:tfds-images", "--data.path", str(IMAGES), "--data.image-size", str(image_size),
-        "--data.augmentation", "none", "--data.val-batches", "None", "--objective.solver",
+        "data:images", "--data.source", json.dumps({"class": "dew.data.sources.tfds:TFDS", "fields": {
+            "name": "dew_images", "path": str(IMAGES), "split": "all"}}), "--data.image-size",
+                str(image_size),
+        "--data.validation", "None", "--objective.solver",
         '{"class": "euler"}', "--objective.guidance", "None", "--objective.steps", "2",
         "--objective.ema-decay", "None", "--val-metrics",
         "--trainer.checkpoint-dir", str(tmp_path), "--trainer.batch-size", str(jax.device_count()),
         "--trainer.steps", "2", "--trainer.eval-every", "None", "--trainer.checkpoint-every", "2",
         "--trainer.compilation-cache-dir", "None", "--trainer.multi-host", "False", "--trainer.name", "run",
-        *args])
+        *args, "data.augment:none"])
     return config, config.run()
 
 
@@ -897,7 +923,7 @@ def test_a_custom_objective_trains_only_an_adapters_factors(decoder, reference):
     adapter = LoRA(rank=2, modules=("q_proj", "v_proj")).apply(decoder.model, decoder.variables, key=0,
                                                                layouts=decoder.layouts)
     rows = jax.device_count()
-    data = Dataset(train=lambda partition: iter([{"text": tokens[np.arange(rows) % 2]}] * 2), val=None,
+    data = Loader(train=lambda partition: iter([{"text": tokens[np.arange(rows) % 2]}] * 2), val=None,
                    records=rows, batch=rows)
     trainer = Trainer(Squared(adapter.model, adapter.variables), optax.sgd(0.1), key=0)
     initial = trainer.initial_state()

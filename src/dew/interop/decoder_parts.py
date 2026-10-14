@@ -924,7 +924,8 @@ _SANDWICH_NORMS = {
     'pre_feedforward_layernorm': 'post_attention_layernorm',
     'post_feedforward_layernorm': 'mlp_output_norm',
 }
-_PROJECTIONS = {'self_attn': ('q_proj', 'k_proj', 'v_proj', 'o_proj'),
+# An attention gate_proj is Muse Glimmer's output gate (`CausalSelfAttention.gate_projection`).
+_PROJECTIONS = {'self_attn': ('q_proj', 'k_proj', 'v_proj', 'gate_proj', 'o_proj'),
                 'mlp': ('gate_proj', 'up_proj', 'down_proj', 'gate')}
 _HEAD_NORMS = ('q_norm', 'k_norm')
 # The MLA projections and norms live under self_attn beside the standard
@@ -940,6 +941,21 @@ MOE_SHARED = ('gate_proj', 'up_proj', 'down_proj')
 # does; its Linear leaves transpose like any other, and the rest keep the
 # checkpoint's names and shapes (GatedDeltaNet in dew.nn.linear). Qwen3-Next
 # stores the same projections fused as in_proj_qkvz and in_proj_ba.
+type Leaves = Mapping[str, tuple[str, ...]]
+"""A family's own tensors, by their dotted names, onto their paths."""
+
+
+KDA_LEAVES: Leaves = {
+    'self_attn.A_log': ('self_attn', 'A_log'), 'self_attn.dt_bias': ('self_attn', 'dt_bias'),
+    'self_attn.o_norm.weight': ('self_attn', 'o_norm', 'weight'),
+    **{f'self_attn.{conv}.weight': ('self_attn', conv, 'weight')
+       for conv in ('q_conv1d', 'k_conv1d', 'v_conv1d')},
+    **{f'self_attn.{projection}.weight': ('self_attn', projection, 'kernel')
+       for projection in ('f_a_proj', 'f_b_proj', 'b_proj', 'g_a_proj', 'g_b_proj')},
+}
+"""Kimi Delta Attention's tensors below its layer, beside the shared q, k and v
+projections: the decay, its bias, the output norm, the short convolutions and
+the gate projections, which Kimi Linear, Kimi K3 and GLM-5 Next hold alike."""
 _LINEAR_PROJECTIONS = ('in_proj_qkv', 'in_proj_z', 'in_proj_b', 'in_proj_a',
                        'in_proj_qkvz', 'in_proj_ba', 'out_proj')
 _LINEAR_LEAVES: frozenset[tuple[str, ...]] = frozenset(
@@ -1033,9 +1049,21 @@ def renamed(name: str, renames: Renames, *, export: bool = False) -> str:
     return '.'.join(spelled)
 
 
-def renamed_path(renames: Renames, name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
-    """`dew_path` of a family whose names differ from the shared ones by `renames`."""
-    return dew_path(renamed(name, renames), config)
+def renamed_path(renames: Renames, name: str, config: Mapping[str, object], *, leaves: Leaves | None = None,
+                 layer_leaves: Leaves | None = None) -> tuple[str, ...] | None:
+    """`dew_path` of a family whose names differ from the shared ones by
+    `renames`, and that holds tensors the shared map has no place for:
+    `leaves` by their whole name, `layer_leaves` by their name below
+    `model.layers.N.`, each spelled after the renames and placed under
+    `params`, a layer's in its own."""
+    spelled = renamed(name, renames)
+    if leaves is not None and spelled in leaves:
+        return ('params', *leaves[spelled])
+    parts = spelled.split('.', 3)
+    if (layer_leaves is not None and len(parts) == 4 and parts[:2] == ['model', 'layers']
+            and parts[2].isdigit() and parts[3] in layer_leaves):
+        return ('params', f'layers_{parts[2]}', *layer_leaves[parts[3]])
+    return dew_path(spelled, config)
 
 
 def renamed_name(renames: Renames, dew_name: str, config: Mapping[str, object]) -> str | None:
@@ -1187,13 +1215,9 @@ def _hyper_connection_param_path(parts: list[str]) -> tuple[str, ...] | None:
             return (f'{site}_hc', suffix)
     if module == 'self_attn':
         tail = tuple(parts[4:])
-        if tail in (('A_log',), ('dt_bias',), ('o_norm', 'weight')):
-            return (module, *tail)
-        if len(tail) == 2 and tail[1] == 'weight':
-            if tail[0] in ('q_conv1d', 'k_conv1d', 'v_conv1d'):
-                return (module, *tail)
-            if tail[0] in ('f_a_proj', 'f_b_proj', 'b_proj', 'g_a_proj', 'g_b_proj'):
-                return (module, tail[0], 'kernel')
+        kda = KDA_LEAVES.get('.'.join(parts[3:]))
+        if kda is not None:
+            return kda
         if len(tail) == 2 and tail[0] == 'indexer' and tail[1] in (
                 'index_kpool_compress_ape', 'index_kpool_compress_gate'):
             return (module, *tail)
@@ -1282,11 +1306,11 @@ def decoder_tensors(family: "DecoderFamily", model: CausalTransformer, variables
         kernel = name.endswith('.kernel') and value.ndim == 2
         layouts[target] = WeightLayout(target, (('params', *name.split('.')),), value.shape[::-1]
                                        if kernel else value.shape, (1, 0) if kernel else None)
-    return layout_tensors(_packed_layouts(layouts, family.packed), tree, model.layer_scalar)
+    return layout_tensors(_packed_layouts(layouts, family.packed, config), tree, model.layer_scalar)
 
 
-def _packed_layouts(layouts: Mapping[str, WeightLayout],
-                    packed: Sequence["Packed"]) -> dict[str, WeightLayout]:
+def _packed_layouts(layouts: Mapping[str, WeightLayout], packed: Sequence["Packed"],
+                    config: Mapping[str, object]) -> dict[str, WeightLayout]:
     """`layouts` with each `packed` source tensor built from its parts' layouts,
     in the place of its first part."""
     source: dict[str, WeightLayout] = {}
@@ -1303,7 +1327,7 @@ def _packed_layouts(layouts: Mapping[str, WeightLayout],
             raise ValueError(f'{stem}{packing.name} packs {name} with {missing}, which nothing writes')
         if part == packing.parts[0]:
             source[stem + packing.name] = packing.layout(
-                stem + packing.name, [layouts[stem + other] for other in packing.parts])
+                stem + packing.name, [layouts[stem + other] for other in packing.parts], config)
     return source
 
 
@@ -1361,7 +1385,10 @@ class Packed:
     Each name is a suffix after the stem a tensor and its parts share. A load
     splits the tensor into views of its parts (`DecoderFamily.prepare_weights`)
     and an export packs their leaves back (`layout`), so the one entry is
-    both directions.
+    both directions. With `chunks` the tensor is that many equal runs on
+    `axis`, each holding its share of every part in turn, as a checkpoint
+    pre-sharded for as many tensor-parallel ranks stores them; each part is
+    its shares in run order.
     """
 
     name: str
@@ -1369,25 +1396,38 @@ class Packed:
     axis: int = -1
     transpose: tuple[int, ...] | None = None
     widths: Callable[[Mapping[str, object]], tuple[int, ...]] | None = None
-    """Config-derived unequal part widths, as in Phi-3's grouped-query qkv."""
+    """Config-derived unequal part widths, as in Phi-3's grouped-query qkv;
+    with `chunks`, one run's."""
+    chunks: Callable[[Mapping[str, object]], int] | None = None
+    """Config-derived count of the runs the parts are interleaved in, as in
+    MiMo-V2.6's fused qkv, pre-sharded over its key heads."""
 
     def split(self, name: str, tensor: np.ndarray,
               config: Mapping[str, object] | None = None) -> dict[str, np.ndarray]:
-        """The parts of the source tensor `name`, as views of it."""
+        """The parts of the source tensor `name`, as views of it, or copies
+        where they are interleaved in runs."""
         stem = name.removesuffix(self.name)
         stored = tensor if self.transpose is None else tensor.transpose(self.transpose)
+        if (self.widths is not None or self.chunks is not None) and config is None:
+            raise ValueError(f'{name} needs translated geometry to split its projections')
+        axis = self.axis % stored.ndim
+        runs = 1 if self.chunks is None or config is None else self.chunks(config)
+        if runs < 1 or stored.shape[axis] % runs:
+            raise ValueError(f'{name} has shape {stored.shape}, which {runs} equal runs do not divide')
+        run = stored.reshape(*stored.shape[:axis], runs, stored.shape[axis] // runs, *stored.shape[axis + 1:])
         sections: int | np.ndarray = len(self.parts)
-        if self.widths is not None:
-            if config is None:
-                raise ValueError(f'{name} needs translated geometry to split its projections')
+        if self.widths is not None and config is not None:
             widths = self.widths(config)
-            if len(widths) != len(self.parts) or min(widths) < 1 or sum(widths) != stored.shape[self.axis]:
-                raise ValueError(f'{name} has shape {stored.shape}, incompatible with part widths {widths}')
+            if len(widths) != len(self.parts) or min(widths) < 1 or sum(widths) != run.shape[axis + 1]:
+                raise ValueError(f'{name} has shape {stored.shape}, incompatible with part widths {widths} '
+                                 f'in {runs} runs')
             sections = np.cumsum(widths[:-1])
-        return {stem + part: piece for part, piece in
-                zip(self.parts, np.split(stored, sections, axis=self.axis), strict=True)}
+        pieces = np.split(run, sections, axis=axis + 1)
+        return {stem + part: piece.reshape(*stored.shape[:axis], -1, *stored.shape[axis + 1:])
+                for part, piece in zip(self.parts, pieces, strict=True)}
 
-    def layout(self, name: str, parts: Sequence[WeightLayout]) -> WeightLayout:
+    def layout(self, name: str, parts: Sequence[WeightLayout],
+               config: Mapping[str, object] | None = None) -> WeightLayout:
         """The layout of the source tensor `name`, from each part's one-leaf layout."""
         ndim = len(parts[0].shape)
         # A part's axis k is its leaf's axis order[k].
@@ -1398,10 +1438,12 @@ class Packed:
         back = tuple(range(ndim)) if self.transpose is None else tuple(
             int(k) for k in np.argsort(self.transpose))
         transpose = tuple(order[k] for k in back)
+        runs = None if self.chunks is None or config is None else self.chunks(config)
         return WeightLayout(name, tuple(path for part in parts for path in part.paths),
                             tuple(shape[k] for k in back),
                             None if transpose == tuple(range(ndim)) else transpose,
-                            None if len(parts) == 1 else order[axis] - ndim)
+                            None if len(parts) == 1 else order[axis] - ndim,
+                            chunks=None if runs == 1 else runs)
 
 
 # Gemma 4, Qwen3-Next and Qwen 3.5 MoE hold their routed experts as torch

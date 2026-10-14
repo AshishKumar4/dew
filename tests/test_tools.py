@@ -218,13 +218,13 @@ def test_flaxdiff_fixture_is_what_the_generator_writes(tmp_path, architecture, c
 
 def token_directory(tmp_path: Path) -> Path:
     """A byte-tokenized corpus, in the directory the curve reads from."""
-    from dew.data import TokenCorpus
+    from token_support import encoded_token_fixture
 
     corpus = tmp_path / "corpus.txt"
     corpus.write_text("".join(f"line {i}: the quick brown fox jumps over the lazy dog\n"
                               for i in range(60)))
     out = tmp_path / "tokens"
-    TokenCorpus.write(corpus, out, tokenizer="byte", val_fraction=0.1)
+    encoded_token_fixture(out, [corpus.read_text()], tokenizer="byte", val_fraction=0.1)
     return out
 
 
@@ -403,7 +403,7 @@ def parameter_movement(tool, case, steps: int = 2):
     assert bool(finite) and np.isfinite(float(loss))
     moved = {name: float(jnp.max(jnp.abs(value - before[name])))
              for name, value in after.items()}
-    return moved, trainer.flops_per_step
+    return moved, trainer.step_flops and trainer.step_flops.hardware
 
 
 @pytest.mark.parametrize("architecture", ["sd3_transformer", "flux_transformer"])

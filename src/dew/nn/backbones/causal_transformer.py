@@ -35,6 +35,7 @@ import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
+from dew.objectives.base import merge
 from dew.records import JSON
 from dew.registry import from_record, mixers
 
@@ -88,17 +89,19 @@ from ..sharding import (
 from .decoder_block import (
     DECODER_REMAT,
     MLP_RESIDUALS,
+    NORM_SITES,
     RESIDUALS,
     BlockWiring,
     DecoderBlock,
     Mixture,
     MTPBlock,
+    NormSpec,
     RematPolicy,
     decoder_norm,
     remat_policy,
     remat_record,
 )
-from .decoder_stack import WRITTEN, DecoderBank, Loop, PassView, StackView, _merged, run_pipeline, run_stack
+from .decoder_stack import WRITTEN, DecoderBank, Loop, PassView, StackView, run_pipeline, run_stack
 from .layer_plan import LayerKind, LayerSpec, ResolvedKind, group_name, scan_groups
 
 INTERMEDIATES = "intermediates"
@@ -212,6 +215,10 @@ class CausalTransformer(nn.Module):
     norm_eps: float = 1e-5
     norm_type: Literal['rms', 'layer'] = 'rms'
     norm_bias: bool = False
+    norms: Mapping[str, NormSpec] | None = None
+    """The norms that differ from the model's others, by module name
+    (`decoder_block.NORM_SITES`): K2 Horizon's grouped statistics, an
+    epsilon or a weight of a norm's own."""
     embedding_norm: bool = False
     """Normalize token embeddings before the first block, as BLOOM and ModernBERT do."""
     first_attention_norm: bool = True
@@ -401,6 +408,14 @@ class CausalTransformer(nn.Module):
         if isinstance(self.mlp, Mapping):
             # A config states SiTU's betas as a record in the activation's place.
             object.__setattr__(self, "mlp", from_record(Situ, self.mlp))
+        if self.norms is not None:
+            unknown = sorted(set(self.norms) - set(NORM_SITES))
+            if unknown:
+                raise ValueError(f"norms names {unknown}, which are no norms the decoder builds; "
+                                 f"it builds {list(NORM_SITES)}")
+            object.__setattr__(self, "norms", flax.core.freeze({
+                name: spec if isinstance(spec, NormSpec) else NormSpec(**spec)
+                for name, spec in self.norms.items()}))
         if self.kinds is not None:
             # Frozen, because a module's fields are static to jit and a plain
             # dict cannot be hashed.
@@ -1079,7 +1094,7 @@ class CausalTransformer(nn.Module):
             self.embedding_layernorm = decoder_norm(
                 self.norm_type, epsilon=self.norm_eps, bias=self.norm_bias,
                 scale_offset=self.scale_offset, scale_after_cast=self.scale_after_cast,
-                dtype=self.dtype)(name='embedding_layernorm')
+                dtype=self.dtype, specs=self.norms)(name='embedding_layernorm')
         if self.position_embedding == 'learned':
             self.embed_positions = TokenEmbedding(
                 num_embeddings=self.position_embedding_size or self.max_seq_len,
@@ -1149,7 +1164,7 @@ class CausalTransformer(nn.Module):
         self.norm = decoder_norm(
             self.norm_type, epsilon=self.norm_eps, bias=self.norm_bias,
             scale_offset=self.scale_offset, scale_after_cast=self.scale_after_cast,
-            dtype=self.dtype)(name='norm')
+            dtype=self.dtype, specs=self.norms)(name='norm')
         if self.loop is not None and self.loop.exit_gate:
             self.early_exit_gate = nn.Dense(
                 projections['early_exit_gate'][1], dtype=self.dtype, precision=self.precision,
@@ -1167,7 +1182,7 @@ class CausalTransformer(nn.Module):
             self.head_norm = decoder_norm(
                 self.norm_type, epsilon=self.norm_eps, bias=self.norm_bias,
                 scale_offset=self.scale_offset, scale_after_cast=self.scale_after_cast,
-                dtype=self.dtype)(name='head_norm')
+                dtype=self.dtype, specs=self.norms)(name='head_norm')
         if self.head_bias:
             self.head_bias_value = self.param(
                 'head_bias', nn.initializers.zeros_init(), (self.vocab_size,), jnp.float32)
@@ -1246,6 +1261,7 @@ class CausalTransformer(nn.Module):
             norm_eps=self.norm_eps,
             norm_type=self.norm_type,
             norm_bias=self.norm_bias,
+            norms=self.norms,
             scale_offset=self.scale_offset,
             scale_after_cast=self.scale_after_cast,
             wiring=wiring,
@@ -2015,7 +2031,7 @@ class CausalTransformer(nn.Module):
             if stacked and first in tree:
                 held = jax.tree.map(functools.partial(shapes, drop=True), tree[first])
             if 'layers_0' in tree:
-                held = _merged(held, jax.tree.map(functools.partial(shapes, drop=False), tree['layers_0']))
+                held = merge(held, jax.tree.map(functools.partial(shapes, drop=False), tree['layers_0']))
             if held:
                 variables[collection] = held
         return variables

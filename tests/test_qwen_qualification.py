@@ -26,7 +26,7 @@ def test_a_media_source_trains_and_saves_text_without_loading_media(monkeypatch,
     import optax
     from transformers import AutoProcessor
 
-    from dew.data.dataset import Dataset
+    from dew.data.dataset import Loader
     from dew.data.text import load_tokenizer
     from dew.training import Layout, MeshSpec, Trainer
 
@@ -60,7 +60,7 @@ def test_a_media_source_trains_and_saves_text_without_loading_media(monkeypatch,
                             pad_id=tokenizer.pad_token_id)
     rows = 2 * jax.device_count()
     batch = inputs.take_rows(jnp.arange(rows) % 2)
-    data = Dataset(train=lambda partition: iter([{"text": batch}]), val=None, records=rows, batch=rows)
+    data = Loader(train=lambda partition: iter([{"text": batch}]), val=None, records=rows, batch=rows)
     state = Trainer(objective, optax.sgd(1e-3), key=jax.random.key(0), mesh=MeshSpec(),
                     layout=Layout(min_shard=2**30)).fit(data, steps=1, log_every=1)
     assert any(np.any(np.asarray(before) != np.asarray(after)) for before, after in zip(

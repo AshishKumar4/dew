@@ -14,12 +14,13 @@ import optax
 import pytest
 
 from dew.checkpoints import Checkpoints
-from dew.data import Loading, TokenWindows
+from dew.config.data import TextData, loader
+from dew.data import Loading
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import REMAT_POLICIES
 from dew.nn.sharding import LayoutRefused
 from dew.objectives.lm import LMObjective
-from dew.training import Trainer, memory, planning
+from dew.training import Trainer, memory, planning, rungs
 from dew.training.distributed import Layout, MeshSpec, microbatch
 from dew.training.planning import Timer, planned, splits
 
@@ -146,8 +147,10 @@ def test_a_batch_that_does_not_fit_whole_is_split_before_anything_is_recomputed(
 
 
 def test_a_later_run_starts_its_search_at_the_plan_an_earlier_one_recorded(monkeypatch):
-    """The plan is recorded beside the compilation cache, so a restart
-    compiles the recorded candidate first, from the cache, and keeps it."""
+    """The plan is recorded beside the compilation cache, read before the step
+    traces, so a restart compiles the recorded candidate first, from the
+    cache, and keeps it, with the FLOPs the first run counted for the same
+    executable."""
     _, temps = trained(lm(split=1), steps=0)
     _, halves = trained(lm(split=2), steps=0)
     room(monkeypatch, (temps + halves) // 2)
@@ -155,8 +158,34 @@ def test_a_later_run_starts_its_search_at_the_plan_an_earlier_one_recorded(monke
     trained(first, steps=0)
     room(monkeypatch, 2 * temps)
     again = lm()
+    counted = []
+    monkeypatch.setattr(rungs, "step_flops", lambda executable: counted.append(executable))
     trained(again, steps=0)
     assert [probe["split"] for probe in again.plan["probes"]] == [first.plan["split"]]
+    # The executable is the one the first run counted, so its FLOPs are the record's, its text unread.
+    assert counted == [] and again.step_flops == first.step_flops
+
+
+@pytest.mark.gpu("a step's Pallas launches are read from a lowering of their own on a CUDA GPU alone")
+def test_a_recorded_plan_settles_its_kernel_launches_without_lowering_the_step_for_them():
+    """A step's kernel launches are read from a lowering of its own (`tune`) and recorded with
+    its plan, so a later run settles their configs from the record and lowers the step once."""
+    lowered = []
+
+    def lowering(event, seconds, *, fun_name=None, **_):
+        if event == "/jax/core/compile/jaxpr_to_mlir_module_duration" and fun_name == "jit(step)":
+            lowered.append(seconds)
+
+    counts = []
+    jax.monitoring.register_event_duration_secs_listener(lowering)
+    try:
+        for _ in range(2):
+            trained(lm(), steps=0)
+            counts.append(len(lowered))
+            lowered.clear()
+    finally:
+        jax.monitoring.unregister_event_duration_listener(lowering)
+    assert counts == [2, 1]
 
 
 def test_a_pinned_split_is_read_as_given_and_its_state_holds_it():
@@ -203,8 +232,8 @@ def token_files(directory):
 
 
 def windows(corpus):
-    return TokenWindows(path=str(corpus), seq_len=4, stride=1, seed=7, val_batches=4,
-                        loading=Loading(workers=0, threads=1, read_buffer=1)).load(batch=8)
+    return loader(TextData(source=str(corpus), seq_len=4, stride=1), batch=8, read="memory", seed=7,
+                  loading=Loading(workers=0, threads=1, read_buffer=1), validation_records=4 * 8)
 
 
 def windowed(directory, split):
@@ -308,3 +337,32 @@ def test_a_run_trains_on_from_the_state_its_plan_timed(monkeypatch, tmp_path):
     state = trainer.fit(windows(token_files(tmp_path)), steps=3, checkpoint_every=None)
     assert [plan["seconds"] > 0 for plan in trainer.plan["timed"]] == [True, True]
     assert int(state.step) == 3
+
+
+KEY = """
+import json, sys
+sys.path.insert(0, "tests")
+from test_plan import BATCH, lm
+from dew.training.rungs import rung_key
+trainer = lm()
+state, _, _ = trainer.place()
+print(json.dumps(rung_key(trainer.objective.program_key(), (state, BATCH), [1, 2], trainer.device_mesh)))
+"""
+
+
+def test_two_processes_name_one_run_alike():
+    """A record is found by the next process of the same run, so nothing the key names may be one
+    process's alone, such as an address Python prints beside a function."""
+    import json
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    keys = []
+    for _ in range(2):
+        done = subprocess.run([sys.executable, "-c", KEY], cwd=root, capture_output=True, text=True,
+                              timeout=300)
+        assert done.returncode == 0, done.stderr[-3000:]
+        keys.append(json.loads(done.stdout.splitlines()[-1]))
+    assert keys[0] == keys[1]

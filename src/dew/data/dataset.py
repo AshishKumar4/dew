@@ -1,11 +1,4 @@
-"""The `Dataset` a run trains on, and the Grain plumbing every dataset shares.
-
-A `DatasetSpec` is a frozen dataclass that
-says what a dataset is and how to read it. `load(batch=)` turns it into a
-`Dataset`, which a recipe passes to the trainer. This module holds what the
-image, video and token specs have in common: the share of each batch a reader
-reads, the shuffled training stream, the ordered validation pass, and the
-slice that keeps the two disjoint.
+"""The compiled `Loader`, shared reader partitions and checkpoint contracts.
 
 Every stream is opened for a `DataPartition`, the share of each global batch
 its reader reads. The trainer gets it from the mesh (`DataPartition.of`),
@@ -13,11 +6,9 @@ because processes that a pipeline or a split sequence spans hold the same rows
 and so read the same share. A loader reads the share it is given and nothing
 else.
 
-A training stream's position is one global record count, not a shard offset,
-so a run saved on one process count resumes on another. `GlobalStream` here
-and `dew.position` define that contract. A weighted `mixture` of corpora and a
-`Ramp` of the batch are both cut from that one order, so neither adds anything
-to what a checkpoint holds.
+An indexed global order resumes from a record count across process counts.
+Unknown-length, rejecting and token-budget orders instead save Grain's
+per-share state and refuse changed topology before a reader opens.
 """
 
 from __future__ import annotations
@@ -31,20 +22,20 @@ import itertools
 import json
 import logging
 import math
-import sys
+import os
 import threading
 import typing
-from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from typing import TYPE_CHECKING, Protocol, overload, runtime_checkable
+from pathlib import Path
+from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
 
 import grain.python as pygrain
 import jax
 import numpy as np
 import tyro
 from absl import flags
+from grain._src.python.dataset.transformations.batch import make_batch
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
-from numpy.typing import ArrayLike
 
 from dew import position
 from dew.nn.sharding import BATCH_AXES, LayoutRefused
@@ -55,17 +46,18 @@ from dew.objectives.base import VALID_ROWS, Batch
 
 _log = logging.getLogger(__name__)
 
+# Grain's worker processes read absl flags, which a script without absl.app never
+# parsed; importing Dew's data layer marks them parsed, as `absl.app` would.
+if not flags.FLAGS.is_parsed():
+    flags.FLAGS.mark_as_parsed()
+
 if TYPE_CHECKING:
-    from _typeshed import DataclassInstance
-    from torch.utils.data import Dataset as TorchDataset
+    from dew.data.mixing import CorpusCounts
+    from dew.data.pipeline import DeviceStep
+    from dew.data.plan import Plan
 
 
 
-
-type Tokenize = Callable[[Sequence[str]], Batch]
-"""A run's caption reader: the batch's captions in, the batch fields its
-conditions want out. The dataset carries the text, the encoder behind this
-decides what tokens it becomes."""
 
 @dataclasses.dataclass(frozen=True)
 class DataPartition:
@@ -93,6 +85,8 @@ class DataPartition:
     """
     reader: int = 0
     """This process's place among the share's readers, in process order (0 for the first)."""
+    row_multiple: int = 1
+    """Number of distinct row shards this reader feeds within its host."""
 
     def __post_init__(self):
         if not 0 <= self.index < self.count or not 0 <= self.reader < self.readers:
@@ -100,7 +94,8 @@ class DataPartition:
                 f"a data partition is share index of count, 0 <= index < count, read "
                 f"by one or more readers, of which this is reader 0 <= reader < readers; "
                 f"got index {self.index} of {self.count} read by {self.readers}, reader "
-                f"{self.reader}")
+                f"{self.reader}"
+            )
 
     @classmethod
     def of(cls, mesh: Mesh) -> DataPartition:
@@ -131,8 +126,12 @@ class DataPartition:
         if batch % self.count:
             raise ValueError(
                 f"batch {batch} does not split into {self.count} equal shares, "
-                f"one for each group of processes that reads its own rows")
-        return batch // self.count
+                f"one for each group of processes that reads its own rows"
+            )
+        rows = batch // self.count
+        if rows % self.row_multiple:
+            raise ValueError(f"batch {batch} must divide across {self.count * self.row_multiple} row shards")
+        return rows
 
 
 @functools.cache
@@ -143,30 +142,28 @@ def _partition(mesh: Mesh) -> DataPartition:
     for device, index in placement.items():
         held.setdefault(device.process_index, set()).add(index[0].start or 0)
     groups = sorted({frozenset(rows) for rows in held.values()}, key=min)
-    if (sum(len(group) for group in groups) != shards
-            or len({len(group) for group in groups}) != 1):
+    if sum(len(group) for group in groups) != shards or len({len(group) for group in groups}) != 1:
         raise LayoutRefused(
             f"the processes of this mesh hold the row shards "
             f"{ {process: sorted(rows) for process, rows in sorted(held.items())} }, "
             f"which overlap without being the same; each group of processes has to "
-            f"hold rows no other group holds, so it can read them as its own share")
+            f"hold rows no other group holds, so it can read them as its own share"
+        )
     mine = frozenset(held[jax.process_index()])
     readers = sorted(process for process, rows in held.items() if frozenset(rows) == mine)
-    return DataPartition(index=groups.index(mine), count=len(groups), readers=len(readers),
-                         reader=readers.index(jax.process_index()))
+    return DataPartition(
+        index=groups.index(mine),
+        count=len(groups),
+        readers=len(readers),
+        reader=readers.index(jax.process_index()),
+        row_multiple=len(mine),
+    )
 
 
 type Reader = Callable[[DataPartition], Iterator[Batch]]
 """Opens a fresh iterator over one share of every global batch, the share the
 partition names. The iterator is its caller's to close."""
 
-type GrainPipeline = pygrain.MapDataset[Batch] | Callable[[DataPartition], pygrain.IterDataset[Batch]]
-"""A grain pipeline a caller built, for `Dataset.from_grain`: a `MapDataset`,
-read by index, which a share is cut from; or a function of the partition that
-builds the `IterDataset` one share reads, since a pipeline read as it comes is
-sharded by whoever builds it. Which of the two it is decides what a saved
-position can be. Elements are one example's fields, the shape `Batch` names,
-since grain stacks them into a batch of those fields."""
 
 @runtime_checkable
 class Records(Protocol):
@@ -174,8 +171,10 @@ class Records(Protocol):
 
     A record is one example's fields, in the shape `Batch` names, or the
     packed bytes an ArrayRecord file holds, which the spec's own transform
-    unpacks into fields. A Grain dataset returns None for an index its padding
-    covers, and Grain's reader skips those instead of batching them.
+    unpacks into fields. A record may be missing (None). A memory read and a
+    cache leave a missing record out and count it, records held in memory
+    leave it out of an order batched by index, and a stream skips it; any
+    other source read in an order batched by index must hold every record.
 
     Grain's own `RandomAccessDataSource` declares the same two methods with the
     record as a type parameter. That parameter is invariant, so a source
@@ -185,83 +184,13 @@ class Records(Protocol):
 
     def __len__(self) -> int: ...
 
-    def __getitem__(self, index: int) -> Batch | bytes | None: ...
+    def __getitem__(self, index: int, /) -> Batch | bytes | None: ...
 
 
 type Indexed = Records | Sequence[Batch]
 """Records read by index: a source that answers grain's two methods, or a
 plain sequence of them. A spec that lists its records in memory hands over
 the sequence, the way the video specs list their clips."""
-
-type InMemory = Mapping[str, ArrayLike] | Indexed
-"""Records a caller holds, for `Dataset.from_records`: columns whose first
-axis is the record, or anything `Indexed`."""
-
-
-class Columns:
-    """Reads records from equal-length columns, one row of each column per record.
-
-    The description that a saved position is compared against names the
-    fields, their per-record shapes and dtypes, and the record count. It cannot
-    tell apart two tables with the same layout; no source description can
-    without reading the data.
-    """
-
-    def __init__(self, columns: Mapping[str, ArrayLike]):
-        held = {name: np.asarray(column) for name, column in columns.items()}
-        if not held:
-            raise ValueError("in-memory records need at least one column")
-        first, *_ = held
-        for name, column in held.items():
-            if column.ndim == 0:
-                raise ValueError(
-                    f"column {name!r} is a single value; a column holds one value per "
-                    f"record along its first axis")
-            if len(column) != len(held[first]):
-                raise ValueError(
-                    f"a column holds one row per record, and {name!r} holds "
-                    f"{len(column)} records and {first!r} holds {len(held[first])}")
-        self._columns = held
-
-    def __len__(self) -> int:
-        return len(next(iter(self._columns.values())))
-
-    def __getitem__(self, index: int) -> Batch:
-        return {name: column[index] for name, column in self._columns.items()}
-
-    def __repr__(self) -> str:
-        fields = ", ".join(f"{name} {column.dtype}{list(column.shape[1:])}"
-                           for name, column in self._columns.items())
-        return f"Columns({fields}; {len(self)} records)"
-
-
-def in_memory(records: InMemory) -> Indexed:
-    """`records` as a source read by index: columns wrapped, the rest as given."""
-    return Columns(records) if isinstance(records, Mapping) else records
-
-
-def json_argument[Options: DataclassInstance](
-        options: type[Options]) -> tyro.constructors.PrimitiveConstructorSpec[Options]:
-    """`options` written as one JSON object on the command line.
-
-    A spec holds a provider's options as one frozen value, and some of that
-    value's fields are the library's own objects: a `datasets.Features`, a
-    tfds decoder tree. Their types are imported on use, so a flag per field
-    would need annotations this process has not resolved and has no spelling
-    for the objects anyway. The whole value is one argument instead, the way
-    a model field holding records is one JSON value.
-    """
-    return tyro.constructors.PrimitiveConstructorSpec(
-        nargs=1,
-        metavar="JSON",
-        instance_from_str=lambda given: options(**json.loads(given[0])),
-        is_instance=lambda given: isinstance(given, options),
-        # Only for the help text, where a library object is best shown as
-        # itself; nothing reads this back.
-        str_from_instance=lambda given: [json.dumps(
-            {field.name: getattr(given, field.name)
-             for field in dataclasses.fields(given)}, default=repr)],
-    )
 
 
 def record_argument[Value](annotation: type[Value]) -> tyro.constructors.PrimitiveConstructorSpec[Value]:
@@ -401,10 +330,23 @@ class Loading:
     Each knob counts something different:
 
     - `workers`: worker processes;
-    - `threads`: record reads one worker keeps in flight;
-    - `read_buffer`: records one worker reads ahead;
+    - `threads`: reads one worker keeps in flight;
+    - `read_buffer`: reads one worker holds ahead;
     - `worker_buffer`: whole batches one worker holds ready for the training
-      process, since a worker stacks the records it read into batches.
+      process.
+
+    `threads` and `read_buffer` count the elements a read produces: a whole
+    batch where the order is indexed, which is cut into batches by index
+    before any reader starts, as Grain's own indexed pipelines are, and a
+    record where the order streams and is batched as it arrives.
+
+    The defaults, 16 reads in flight and 16 held ahead, keep enough reads in
+    flight for a remote store's latency while holding few batches. On an
+    8-core armada host with two workers, Dew read 128-pixel images at 0.91 to
+    1.04 times plain Grain under the same settings, within the run-to-run
+    noise of parity, and held about 32 batches, 50 MB for 32 such images, per
+    worker. 64 and 128 buffered 300 MB per worker and matched Grain only
+    because Grain itself slowed down there.
 
     Zero workers is Grain's own default: threads in the training process read
     the records. Each worker process imports the program again, so it costs
@@ -415,10 +357,48 @@ class Loading:
     0.1 s and 0.23 GiB with none.
     """
 
-    workers: int = 0
-    threads: int = 64
-    read_buffer: int = 128
+    workers: int | Literal["auto"] = 0
+    threads: int = 16
+    read_buffer: int = 16
     worker_buffer: int = 2
+    ram_budget_mb: int | None = None
+    max_workers: int | None = None
+
+    def resolved(self, records: pygrain.IterDataset) -> Loading:
+        """Ask Grain to size workers and buffers within the host's RAM limit."""
+        if self.workers != "auto":
+            return self
+        import grain.experimental as gx
+        import psutil
+
+        available = psutil.virtual_memory().available
+        maximum, current = Path("/sys/fs/cgroup/memory.max"), Path("/sys/fs/cgroup/memory.current")
+        if maximum.is_file() and current.is_file():
+            limit = maximum.read_text().strip()
+            if limit != "max":
+                available = min(available, max(0, int(limit) - int(current.read_text())))
+        budget = self.ram_budget_mb if self.ram_budget_mb is not None else max(1, available // (2 * 1024**2))
+        try:
+            picked = gx.pick_performance_config(
+                records,
+                ram_budget_mb=budget,
+                max_workers=self.max_workers or os.cpu_count() or 1,
+                max_buffer_size=self.read_buffer,
+            )
+        except StopIteration:
+            _log.warning("Grain autotune found no element; using explicit Loading fallback (0 workers)")
+            return dataclasses.replace(self, workers=0)
+        workers = 0 if picked.multiprocessing_options is None else picked.multiprocessing_options.num_workers
+        buffers = (
+            self.read_buffer if picked.read_options is None else picked.read_options.prefetch_buffer_size
+        )
+        return dataclasses.replace(self, workers=workers, read_buffer=buffers)
+
+    @property
+    def worker_count(self) -> int:
+        if self.workers == "auto":
+            raise ValueError("automatic Loading must be resolved on its Grain pipeline")
+        return self.workers
 
     @property
     def stop_seconds(self) -> float:
@@ -433,7 +413,10 @@ class Loading:
         # Grain's kill timeout is read from Grain (`_grain_kill_seconds`), so an
         # upgrade that changes it moves this budget too. The 5.1 to 7.4 s stop
         # was examples/sft_gemma4.py's four workers.
-        return float(_grain_kill_seconds() * (1 + self.workers))
+        return float(
+            _grain_kill_seconds()
+            * (1 + (self.max_workers or os.cpu_count() or 1) if self.workers == "auto" else 1 + self.workers)
+        )
 
     @contextlib.contextmanager
     def announced_stop(self) -> Iterator[None]:
@@ -455,10 +438,12 @@ class Loading:
         once `_QUIET_STOP_SECONDS` pass. None with no workers, and None where
         no thread can start (at interpreter shutdown, or at the process's
         thread limit), since the stop must run with or without its line."""
-        if not self.workers:
+        if not self.workers or self.workers == "auto":
             return None
-        line = (f"waiting for {self.workers} grain workers to stop, "
-                f"up to {self.workers * _grain_kill_seconds()} s")
+        line = (
+            f"waiting for {self.workers} grain workers to stop, "
+            f"up to {self.workers * _grain_kill_seconds()} s"
+        )
         timer = threading.Timer(_QUIET_STOP_SECONDS, _log.warning, (line,))
         timer.daemon = True
         try:
@@ -469,7 +454,8 @@ class Loading:
         return timer
 
 
-_DEFAULT_LOADING = Loading()
+def _data_statistics() -> Mapping[str, float]:
+    return {}
 
 
 @dataclasses.dataclass(frozen=True)
@@ -503,6 +489,7 @@ class Ramp:
     buffered batch while Dew keeps reading, so from then on MaxText reads
     later records than Dew in each step, although the batch sizes match.
     """
+
     # MaxText reference: configs/base.yml:755-765 and
     # utils/rampup_batch.py:38-50,53-101.
 
@@ -521,16 +508,19 @@ class Ramp:
             raise ValueError(
                 f"a batch ramp counts records: start={self.start}, "
                 f"increment={self.increment} and samples={self.samples} are all "
-                f"positive")
+                f"positive"
+            )
         if final <= self.start:
             raise ValueError(
                 f"a batch ramp grows into the run's batch: it starts at "
                 f"{self.start} and the dataset's batch is {final}, so there is "
-                f"nothing to ramp")
+                f"nothing to ramp"
+            )
         if (final - self.start) % self.increment:
             raise ValueError(
                 f"a batch ramp reaches the run's batch in whole increments: "
-                f"{final} - {self.start} is not a multiple of {self.increment}")
+                f"{final} - {self.start} is not a multiple of {self.increment}"
+            )
         increments = (final - self.start) // self.increment
         stages, batch, records = [], self.start, 0
         while batch < final:
@@ -556,7 +546,7 @@ class Ramp:
 
 
 @dataclasses.dataclass(frozen=True)
-class Dataset:
+class Loader:
     """Opens the batches a run trains and validates on.
 
     `train(partition)` opens an endless shuffled stream. `val(partition)`
@@ -570,21 +560,27 @@ class Dataset:
     kept back for validation, which `fit` reports when the run starts; it is 0
     when validation is a separate split or there is none.
 
-    Each factory call returns a fresh iterator that the caller owns. Close it
-    after use if it has `close`, but never close the shared dataset or its
-    backing store. A source's optional `request_stop` is a separate,
-    thread-safe signal; it does not make it safe to call the final `close`
-    while another thread is still iterating.
+    Each factory call returns a fresh iterator, and the code that opened it
+    owns closing it. Close it after use when it is `Closeable`; every wrapper
+    around a stream (host steps, ramps, phases, the readers) forwards `close`
+    to the stream it wraps. Never close the shared dataset or its backing
+    store. A batch an iterator yields stays valid until its consumer asks for
+    the next one. A consumer that keeps batches longer copies them, since a
+    batch made by worker processes lives in shared memory and holds a
+    descriptor for as long as it is kept. A source's optional `request_stop`
+    is a separate, thread-safe signal; it does not make it safe to call the
+    final `close` while another thread is still iterating.
 
     Image and video fields are uint8 in [0, 255], text is the tokenized
     `{"input_ids", "attention_mask"}` dict under "text", and a token window
     is int32 ids under "text".
 
-    Whether a run can checkpoint its position depends on the iterator.
-    Grain-backed iterators have `get_state` and `set_state`, a fetch-as-you-go
-    stream has neither, and `tokenized` forwards the pair. A run over a stream
-    without them must train with `checkpoint_every=None` and is refused
-    otherwise. A `train_stream` position is global and resumes on any
+    Whether a run resumes its data position depends on the iterator.
+    Grain-backed iterators have `get_state` and `set_state`, and host
+    transforms forward the pair. A stream with neither trains, and a resume
+    of its checkpoint is refused, unless its reader declares that it reads
+    the same batches each time it opens (`replayed`), which positions it by
+    replay. An indexed global-order position resumes on any
     partition, over one corpus or a weighted mixture. A stream that batches
     its own records reports its share's own position, and `dew.checkpoints`
     resumes it only on a reader of that share.
@@ -596,121 +592,14 @@ class Dataset:
     batch: int
     ramp: Ramp | None = None
     held_out: int = 0
-
-    @classmethod
-    def from_grain(cls, train: GrainPipeline, *, batch: int,
-                   validation: GrainPipeline | None = None,
-                   records: int | None = None,
-                   loading: Loading = _DEFAULT_LOADING) -> Dataset:
-        """Build a dataset from Grain pipelines the caller built.
-
-        The caller decides the order, the shuffle and what each record turns into.
-        This adds what every spec's `load` adds, with the same helpers: the reader's
-        share of the batch, whole training batches, a validation pass over every
-        record with its last batch padded (`VALID_ROWS`), and the state pair a
-        checkpoint saves.
-
-        A `MapDataset` is read by index, so it gets the same training stream as
-        every spec: repeated endlessly, cut into the reader's share, and saved as one
-        global record count. A pipeline read in sequence is sharded by whoever builds
-        it, so pass it as a function that takes the partition and builds that
-        share's `IterDataset`. It is batched as it is and reports Grain's own
-        iterator state, which `dew.checkpoints` restores only into a reader of the
-        same share.
-
-        `records` is the number of records in one pass, which `steps_per_epoch`
-        divides. It defaults to a `MapDataset`'s own length, so if you repeated your
-        dataset before passing it in, give the length of one pass instead. A Grain
-        pipeline has no description of its own, so the saved position names the
-        pipeline's type and length, not the corpus under it. If you swap the corpus
-        under one pipeline, Dew cannot detect it.
-        """
-        mapped = train if isinstance(train, pygrain.MapDataset) else None
-        for pipeline in (train, validation):
-            if isinstance(pipeline, pygrain.MapDataset):
-                _refuse_filters(pipeline)
-        if mapped is not None:
-            endless = mapped.repeat(None)
-            order = f"{describe(mapped)}, {len(mapped)} records"
-
-            def training(partition: DataPartition) -> Iterator[Batch]:
-                rows = partition.rows(batch)
-                return GlobalStream(
-                    lambda offset: _shared(endless, rows=rows, partition=partition,
-                                           loading=loading, offset=offset),
-                    batch, order, loading)
-        else:
-            def training(partition: DataPartition) -> Iterator[Batch]:
-                return _shared(train, rows=partition.rows(batch), partition=partition,
-                               loading=loading)
-
-        def validating(partition: DataPartition) -> Iterator[Batch]:
-            assert validation is not None
-            return _shared(validation, rows=partition.rows(batch), partition=partition,
-                           loading=loading, remainder=True)
-
-        return cls(
-            train=training,
-            val=None if validation is None else validating,
-            records=len(mapped) if records is None and mapped is not None else records,
-            batch=batch,
-        )
-
-    @classmethod
-    def from_records(cls, records: InMemory, *, batch: int, seed: int = 0,
-                     validation: InMemory | None = None,
-                     loading: Loading = _DEFAULT_LOADING) -> Dataset:
-        """Build a dataset from records the caller holds: columns, rows or a source.
-
-        `records` is a mapping of columns whose first axis is the record, such as
-        `{"x": x, "y": y}`, a sequence of per-record mappings, or any source read by
-        index. Training reshuffles the records from `seed` every epoch, with the same
-        stream every spec reads (`train_stream`), so the position a checkpoint saves
-        is a global record count and each process reads its own share of every
-        batch. `validation` is read once, in order, and every record is scored, with
-        the last batch padded (`VALID_ROWS`).
-        """
-        source = in_memory(records)
-        if len(source) < batch:
-            raise ValueError(
-                f"{len(source)} training records, fewer than one batch of {batch}: a "
-                f"batch would hold a record twice and an epoch would take no steps")
-        return cls(
-            train=train_stream(source, [], batch=batch, seed=seed, loading=loading),
-            val=None if validation is None else cls.validation(validation, batch=batch, loading=loading),
-            records=len(source),
-            batch=batch,
-        )
-
-    @staticmethod
-    def validation(records: InMemory, *, batch: int, loading: Loading = _DEFAULT_LOADING) -> Reader:
-        """A validation split over records the caller holds, as `from_records`
-        reads them: each record scored once, in order, the last batch padded
-        (`VALID_ROWS`), however few there are. `fit(validation=...)` and
-        `EvalSuite` take it beside the dataset's own."""
-        return validation_pass(in_memory(records), [], batch=batch, seed=0, loading=loading)
-
-    @classmethod
-    def from_torch(cls, dataset: TorchDataset, *, batch: int, fields: Sequence[str] | None = None,
-                   seed: int = 0, validation: TorchDataset | None = None,
-                   loading: Loading = _DEFAULT_LOADING) -> Dataset:
-        """Build a dataset from a map-style `torch.utils.data.Dataset`, read
-        by index as `from_records` reads a source.
-
-        A dict sample keeps its keys, and `fields` names the values of a
-        tuple sample, `("image", "label")` for torchvision's. Tensors and PIL
-        images arrive as numpy, an image as its own array: a grey one `[H, W]`
-        and a palette one its indices. A `DataLoader` and an `IterableDataset` are
-        refused, naming what to pass instead
-        (`dew.data.sources.pytorch.TorchRecords`). The first sample is read
-        here, so one `fields` does not name is refused before the run.
-        """
-        from .sources.pytorch import TorchRecords
-
-        records = TorchRecords(dataset, fields)
-        held = None if validation is None else TorchRecords(validation, fields)
-        records[0]
-        return cls.from_records(records, batch=batch, seed=seed, validation=held, loading=loading)
+    counts: Mapping[str, CorpusCounts] = dataclasses.field(default_factory=dict)
+    validation_counts: Mapping[str, CorpusCounts] = dataclasses.field(default_factory=dict)
+    plan: Plan | None = None
+    statistics: Callable[[], Mapping[str, float]] = dataclasses.field(default=_data_statistics, repr=False)
+    batch_tokens: int | None = None
+    device: tuple[DeviceStep, ...] = ()
+    """The training batch's steps the compiled training step runs, on the
+    accelerator, after the reader delivers it (`DeviceStep`)."""
 
     @property
     def steps_per_epoch(self) -> int | None:
@@ -723,52 +612,18 @@ class Dataset:
     def epoch_steps(self, epochs: int = 1) -> int:
         """Return the number of steps that `epochs` passes over the records take.
 
+        A batch ramp grows the batch over the run's first records once, so its
+        smaller early steps count once across all the passes, not once a pass.
         A stream without a record count has no epoch, so a run over it must
         give its length in steps instead.
         """
-        if self.steps_per_epoch is None:
+        if self.records is None:
             raise ValueError(
                 "epochs need a dataset with a record count; this one streams "
-                "without one, so give the run length in steps")
-        return epochs * self.steps_per_epoch
-
-
-@dataclasses.dataclass(frozen=True)
-class DatasetSpec(ABC):
-    """Describes a dataset and how to read it, with one frozen dataclass per kind.
-
-    `seed` and `loading` apply to every kind, so they are declared once here.
-    The seed sets the record order and keys the per-record rng; `loading` sets
-    how fast records are read, which changes neither the records nor their
-    order. Both are keyword-only, so a kind can still declare its own fields
-    without defaults.
-
-    Every kind's `load` takes `tokenize`, so a caller holding any
-    `DatasetSpec` can load it. A dataset that captions its records passes the
-    captions to `tokenize` and writes back what it returns. The dataset only
-    produces the captions; the run's condition decides which encoder reads
-    them and at which context length. A dataset without captions has nothing
-    for a reader and raises if given one (`uncaptioned`).
-    """
-
-    seed: int = dataclasses.field(default=0, kw_only=True)
-    loading: Loading = dataclasses.field(default=Loading(), kw_only=True)
-
-    @abstractmethod
-    def load(self, *, batch: int, tokenize: Tokenize | None = None) -> Dataset:
-        """Return the dataset's batches, `batch` records a step across all processes."""
-
-    def uncaptioned(self, tokenize: Tokenize | None) -> None:
-        """Raise if a caption reader is given to a dataset that writes no captions.
-
-        The parameter is on every `load` so that one caller can load any spec.
-        Dropping it silently would train a conditional run on nothing without
-        saying why.
-        """
-        if tokenize is not None:
-            raise TypeError(
-                f"{type(self).__name__} writes no captions, so tokenize= has "
-                f"nothing to read; an image or video dataset takes one")
+                "without one, so give the run length in steps"
+            )
+        records = epochs * self.records
+        return records // self.batch if self.ramp is None else self.ramp.steps_for(records, self.batch)
 
 
 CAPTION = "caption"
@@ -788,10 +643,10 @@ Dew's own envelope is bytes, and Grain reports a JSON object, which
 class Checkpointable(Protocol):
     """A data stream that can report where it stopped and resume from there.
 
-    Grain's iterators satisfy this, and so does `GlobalStream`. `Trainer.fit`
-    refuses a run that asks for checkpoints over a stream without these
-    methods. The state itself is opaque here; `dew.position` tells which of its
-    two kinds a checkpoint holds.
+    Grain's iterators satisfy this, and so does `GlobalStream`, and so does
+    a stream a reader declares to replay (`replayed`). The state itself is
+    opaque here; `dew.position` tells which of its two kinds a checkpoint
+    holds.
     """
 
     def get_state(self) -> Position: ...
@@ -816,6 +671,115 @@ class Identified(Protocol):
     def identity(self) -> str: ...
 
 
+type _Held = Mapping[str, _Held] | Sequence[_Held] | str | bytes | np.ndarray | np.generic | float | None
+"""What a batch's fields hold, as `batch_digest` reads them."""
+
+
+def batch_digest(batch: Batch) -> str:
+    """A digest of what `batch` holds: its fields by name, their values'
+    dtypes, shapes and every element, its strings, bytes and scalars, and
+    the type of any other object."""
+    digest = hashlib.blake2b(digest_size=16)
+
+    def visit(value: _Held) -> None:
+        if isinstance(value, Mapping):
+            digest.update(b"{%d" % len(value))
+            for key in sorted(value, key=repr):
+                digest.update(repr(key).encode())
+                visit(value[key])
+        elif isinstance(value, (list, tuple)):
+            digest.update(b"[%d" % len(value))
+            for element in value:
+                visit(element)
+        elif isinstance(value, str):
+            digest.update(b"s" + value.encode())
+        elif isinstance(value, bytes):
+            digest.update(b"b" + value)
+        elif value is None or isinstance(value, (bool, int, float, complex)):
+            digest.update(b"v" + repr(value).encode())
+        else:
+            array = np.asarray(value)
+            digest.update(f"{array.dtype}{array.shape}".encode())
+            if array.dtype != object:
+                digest.update(np.ascontiguousarray(array).data)
+            elif array.ndim:
+                for element in array.flat:
+                    visit(element)
+            else:
+                # An object NumPy holds whole, whose text may name its address: its type alone.
+                digest.update(type(value).__qualname__.encode())
+
+    visit(batch)
+    return digest.hexdigest()
+
+
+class Replayed(Forwarding):
+    """The batches of a stream declared to read the same batches each time
+    `reopen()` opens it, positioned by how many it has read and a digest of
+    the last.
+
+    A resume reopens the stream and reads that many again. The digest of the
+    batch at the position is a guard, not a proof: a stream whose batch there
+    differs is refused, and one that agrees there and differs elsewhere, one
+    drawing on a process-wide RNG or the clock after that batch, passes and
+    resumes on other data. Hashing every batch costs the reader about a
+    millisecond a megabyte."""
+
+    def __init__(self, reopen: Callable[[], Iterator[Batch]], source: Iterator[Batch] | None = None):
+        self._reopen = reopen
+        self._source: Iterator[Batch] | None = iter(reopen()) if source is None else source
+        self._read, self._last = 0, None
+
+    def __iter__(self):
+        return self
+
+    def __next__(self) -> Batch:
+        if self._source is None:
+            raise StopIteration
+        batch = next(self._source)
+        self._read += 1
+        self._last = batch_digest(batch)
+        return batch
+
+    def get_state(self) -> dict[str, int | str | None]:
+        return {"read": self._read, "last": self._last}
+
+    def set_state(self, state: Mapping[str, object]) -> None:
+        read, last = state.get("read"), state.get("last")
+        if not isinstance(read, int) or read < 0 or (read and not isinstance(last, str)):
+            raise ValueError(f"a replayed stream's position is the count it read and the last one's "
+                             f"digest, not {dict(state)!r}")
+        self.close()
+        self._source, self._read, self._last = iter(self._reopen()), 0, None
+        if read:
+            _log.info("replaying %d batches of %s to resume", read, stream_identity(self._source))
+        for skipped in range(read - 1):
+            try:
+                next(self._source)
+            except StopIteration:
+                raise ValueError(f"the stream ran out after {skipped} batches, short of the {read} "
+                                 f"a resume reads again") from None
+            self._read += 1
+        if read:
+            next(self)
+            if self._last != last:
+                raise ValueError(
+                    f"this stream does not replay deterministically: its batch {read} reads back "
+                    f"other data than before the checkpoint. Make it Checkpointable "
+                    f"(get_state and set_state) or read it through dew.data")
+
+
+def replayed(reader: Reader) -> Reader:
+    """`reader`, declared to read the same batches each time it opens, as a
+    script restarted from the top reads them: its streams are positioned by
+    replay (`Replayed`), so a run over it resumes where it stopped."""
+
+    def opened(partition: DataPartition) -> Iterator[Batch]:
+        return Replayed(lambda: reader(partition))
+
+    return opened
+
+
 def stream_identity(stream: Iterator[Batch] | None) -> str:
     """What `stream` reads, as `Identified` names it, or else its type."""
     return stream.identity() if isinstance(stream, Identified) else type(stream).__name__
@@ -827,29 +791,6 @@ def stream_endless(stream: Iterator[Batch] | None) -> bool:
     return isinstance(stream, Identified) and stream.endless
 
 
-def tokenized(stream: Reader, tokenize: Tokenize | None) -> Reader:
-    """Return `stream` with each batch's captions replaced by the fields `tokenize` makes from them.
-
-    `tokenize` takes the batch's captions and returns the batch fields the
-    run's conditions need. The encoder then decides its own context length,
-    so `--text.encoder char_table` and `--text.encoder clip_text` read the
-    same dataset. It runs on the host, once per batch and outside the Grain
-    workers, so no encoder weights are pickled into the workers.
-
-    The captions themselves are dropped, since they are strings and a device
-    takes numbers. Pass None for an unconditional run, or a `tokenize` that
-    returns the words to keep them.
-    """
-    def stage(batch: Batch) -> Batch:
-        fields = dict(batch)
-        captions = [str(caption) for caption in fields.pop(CAPTION)]
-        if tokenize is not None:
-            fields.update(tokenize(captions))
-        return fields
-
-    return mapped(stream, stage)
-
-
 def tapped(stream: Reader, on_batch: Callable[[Batch], None]) -> Reader:
     """Return `stream` with `on_batch` called on every batch as it is read, leaving the batch unchanged.
 
@@ -857,6 +798,7 @@ def tapped(stream: Reader, on_batch: Callable[[Batch], None]) -> Reader:
     trainer's prefetch worker, so a consumer sees each batch as soon as it is
     read.
     """
+
     def stage(batch: Batch) -> Batch:
         on_batch(batch)
         return batch
@@ -866,6 +808,7 @@ def tapped(stream: Reader, on_batch: Callable[[Batch], None]) -> Reader:
 
 def mapped(stream: Reader, stage: Callable[[Batch], Batch]) -> Reader:
     """Return `stream` with `stage` applied to each batch, forwarding stop, close and position."""
+
     def start(partition: DataPartition) -> Iterator[Batch]:
         source = iter(stream(partition))
         if isinstance(source, Checkpointable):
@@ -933,8 +876,7 @@ class SourceSlice:
     def __repr__(self) -> str:
         # The description a saved position compares against, so it carries
         # the wrapped corpus's own (`describe`).
-        return (f"SourceSlice({describe(self.source)}, "
-                f"start={self.start}, length={self.length})")
+        return f"SourceSlice({describe(self.source)}, start={self.start}, length={self.length})"
 
     def __len__(self) -> int:
         return self.length
@@ -943,57 +885,6 @@ class SourceSlice:
         if not 0 <= index < self.length:
             raise IndexError(index)
         return self.source[self.start + index]
-
-
-def hold_out(source: Indexed, records: int, held_out: int,
-             name: str) -> tuple[SourceSlice, SourceSlice | None]:
-    """`(train_source, val_source)`: the first `held_out` of `records` records,
-    in canonical order, as the validation split, and the rest as training.
-
-    A held-out slice off the head keeps the two disjoint, so FID and CLIP are
-    not measured on records the model trained on. `held_out` of zero holds
-    nothing out and validates nothing.
-    """
-    if not held_out:
-        return SourceSlice(source, 0, records), None
-    if not held_out < records:
-        raise ValueError(
-            f"{name} holds out {held_out} validation records, which leaves "
-            f"nothing of its {records} records to train on")
-    return (SourceSlice(source, held_out, records),
-            SourceSlice(source, 0, held_out))
-
-
-def checked_count(count: int, length: int, name: str) -> int:
-    """`count` records off the head of `name`'s `length`, refused when there
-    are fewer of them than that."""
-    if count > length:
-        raise ValueError(
-            f"count {count} is more than the {length} records of {name}")
-    return count
-
-
-def _refuse_filters(pipeline: pygrain.MapDataset[Batch]) -> None:
-    """Refuse a pipeline holding a `filter`, as grain's `ElasticIterator` does.
-
-    A filter answers None at the indices it drops, so an index range yields
-    fewer records than it spans: a global record count then no longer says
-    where a resumed run starts, and process shares cut by index fill uneven
-    batches. grain names no public type for the filter, so it is read from
-    where grain's own iterator reads it.
-    """
-    from grain._src.python.dataset.transformations.filter import FilterMapDataset
-
-    pending: list[pygrain.MapDataset[Batch]] = [pipeline]
-    while pending:
-        node = pending.pop()
-        if isinstance(node, FilterMapDataset):
-            raise ValueError(
-                "this MapDataset filters its records, and a filter yields fewer records than "
-                "the indices it reads, so a record count cannot say where a resumed run "
-                "starts; filter the records before the source, or pass a function of the "
-                "partition that builds an IterDataset, whose position is grain's own")
-        pending.extend(node.parents)
 
 
 def describe(source: Indexed | pygrain.MapDataset[Batch]) -> str:
@@ -1011,75 +902,8 @@ def describe(source: Indexed | pygrain.MapDataset[Batch]) -> str:
     return repr(source) if described else type(source).__name__
 
 
-@dataclasses.dataclass(frozen=True)
-class Corpus:
-    """One corpus of a weighted mixture: what it reads and how much of a step it fills.
-
-    `weight` is a share of the step, not a record count, so the mixture keeps
-    its proportions whatever the corpora's lengths. A small corpus comes round
-    again while a large one is still on its first pass.
-
-    `offset` is how many records of the corpus's endless training order
-    earlier phases of the run already read (`PhasedStream`). The corpus starts
-    after them, so a phase continues the order instead of replaying its start.
-    It is zero for a run with one order.
-    """
-
-    name: str
-    source: Records
-    weight: float
-    offset: int = 0
-
-
-def _endless(source: Records, seed: int, offset: int) -> pygrain.MapDataset[Batch]:
-    """`source` reshuffled from `seed` every epoch, endlessly, past its first
-    `offset` records."""
-    order = pygrain.MapDataset.source(source).seed(seed).shuffle(seed).repeat(None)
-    return order[offset:] if offset else order
-
-
-SAMPLED_RECORDS = 16
-"""How many records, spread evenly over a corpus, `sampled` reads."""
-
-
-def sampled(source: Indexed) -> str:
-    """A digest of `SAMPLED_RECORDS` records spread evenly over `source`, read
-    as stored, before any transformation.
-
-    Two copies of a corpus with one name and one length can hold different
-    records, and a pool whose hosts read different copies trains on neither.
-    The digest is a sample, not a checksum: it reads a few records of a corpus
-    that may be terabytes.
-    """
-    digest, count = hashlib.sha256(), len(source)
-    spread = {count * part // SAMPLED_RECORDS for part in range(SAMPLED_RECORDS)} if count else set()
-    for index in sorted(spread):
-        record = source[index]
-        digest.update(str(jax.tree.structure(record)).encode())
-        for leaf in jax.tree.leaves(record):
-            value = np.asarray(leaf)
-            digest.update(f"{value.dtype}{value.shape}".encode())
-            digest.update(type(leaf).__name__.encode() if value.dtype == object else value.tobytes())
-    return digest.hexdigest()[:16]
-
-
-def _described(corpus: Corpus) -> str:
-    """`corpus` as a saved position names it: its source, and where in its
-    order the run starts it."""
-    start = f", from record {corpus.offset}" if corpus.offset else ""
-    return f"{describe(corpus.source)}, {len(corpus.source)} records{start}"
-
-
-def mixed_counts(corpora: Sequence[Corpus], records: int) -> tuple[int, ...]:
-    """How many of the first `records` records of `mixture(corpora, seed)`
-    each corpus supplies, for any seed.
-
-    This is grain's own selection read in closed form: weights scaled to
-    integers against the smallest (`_float_to_int_proportions`) and the count
-    of dataset i in the first k + 1 elements peeled off one proportion at a
-    time (`_dataset_and_key_of_next_element`, mix.py at grain 0.2).
-    """
-    shares = _shares(corpora)
+def weight_counts(shares: Sequence[float], records: int) -> tuple[int, ...]:
+    """Grain's proportional selection counts over a prefix of an indexed mixture."""
     scale = 100 / min(shares)
     proportions = [int(share * scale) for share in shares]
     counts, remaining, left = [], sum(proportions), records
@@ -1088,199 +912,6 @@ def mixed_counts(corpora: Sequence[Corpus], records: int) -> tuple[int, ...]:
         counts.append(left - rest)
         left, remaining = rest, remaining - proportion
     return tuple(counts)
-
-
-def _shares(corpora: Sequence[Corpus]) -> tuple[float, ...]:
-    """What each corpus of `corpora` fills of a step, as fractions of one.
-
-    Normalised here, as MaxText normalises a mixture's weights before it
-    hands them to grain (`input_pipeline/grain_data_processing.py:180-184`),
-    so weights are read as ratios and 7/3 is the mixture 0.7/0.3 is.
-    """
-    if len(corpora) < 2:
-        raise ValueError(
-            f"a mixture reads two or more corpora, and this one names "
-            f"{len(corpora)}; one corpus is that corpus")
-    weights = [corpus.weight for corpus in corpora]
-    if min(weights) <= 0:
-        raise ValueError(
-            f"every corpus of a mixture fills a positive share of a step, and "
-            f"{ {corpus.name: corpus.weight for corpus in corpora} } does not; a "
-            f"corpus a run reads none of is a corpus the run does not read")
-    total = sum(weights)
-    return tuple(weight / total for weight in weights)
-
-
-def mixture(corpora: Sequence[Corpus], seed: int | None) -> pygrain.MapDataset[Batch]:
-    """`corpora` read together at their weights, as one order over records.
-
-    `MapDataset.mix` decides which corpus record k comes from: the one whose
-    share of the first k + 1 records is short by one. Every prefix of the
-    order, and so every global batch, holds each corpus's share to within one
-    record, and nothing is drawn at random
-    (`grain/_src/python/dataset/transformations/mix.py:314-347`). Weights
-    reach grain as ratios and it scales them to integers against the
-    smallest, so a share is exact to a hundredth of the smallest one
-    (`mix.py:305-311`).
-
-    With `seed`, every corpus is reshuffled per epoch and repeated before the
-    mixing, so the mixture is endless and each corpus cycles its own records
-    at its own rate. That is grain's own instruction for keeping a mixture's
-    proportions under a shuffle, and what MaxText's pipeline does
-    (`input_pipeline/grain_data_processing.py:110-112,169-184`). Without a
-    seed the corpora are read in their own order and the mixture stops before
-    any of them would come round again (grain's own length rule,
-    `mix.py:52-68`), which is the pass a validation split wants.
-
-    The mixing happens before the shard, so a mixture's position is one
-    global record count: which corpus record k comes from is a function of k.
-    The shares hold over the global batch, not over one process's rows. Two
-    corpora at equal weights alternate, so of two processes one reads only
-    the first and the other only the second; the step's gradient is the same
-    sum either way. A resume onto a changed mixture is refused, as a resume
-    onto a changed corpus is.
-    """
-    shares = _shares(corpora)
-
-    def order(corpus: Corpus) -> pygrain.MapDataset[Batch]:
-        if seed is not None:
-            return _endless(corpus.source, seed, corpus.offset)
-        if corpus.offset:
-            raise ValueError("an ordered pass reads each corpus from its first record")
-        return pygrain.MapDataset.source(corpus.source)
-
-    return pygrain.MapDataset.mix([order(corpus) for corpus in corpora], list(shares))
-
-
-def mixed_records(corpora: Sequence[Corpus]) -> int:
-    """One pass over a mixture: the records in which every corpus of it has
-    been read at least once.
-
-    A mixture has no pass of its own: a corpus filling a tenth of a step
-    comes round ten times while one filling the rest is read once. The pass
-    is the longest of the corpora's own, which is `len(source)` for one
-    corpus and the records of both for two equal corpora at equal weights.
-    That is the count `steps_per_epoch` divides everywhere else.
-    """
-    return max(math.ceil(len(corpus.source) / share)
-               for corpus, share in zip(corpora, _shares(corpora), strict=True))
-
-
-class _WorkerBatches[Record](pygrain.MapDataset[Record]):
-    """`parent` re-indexed so each grain worker reads whole, contiguous batches.
-
-    Grain gives worker i every index where i == index % W. Index
-    `q*W*B + p*W + w` is record p of batch `q*W + w`, so worker w batches
-    inside its own process. The training process interleaves the workers
-    round-robin, which restores batch order 0, 1, 2, ...
-
-    The length is padded to whole rounds of one batch per worker. An index
-    past the parent's last whole batch, or with `remainder` past its last
-    record, answers None, which grain's reader skips.
-    """
-
-    _MUTATES_ELEMENT_SPEC = False
-
-    def __init__(self, parent: pygrain.MapDataset[Record], batch: int, workers: int, *,
-                 remainder: bool = False):
-        super().__init__(parent)
-        self._batch, self._workers = batch, workers
-        self._whole = -(-len(parent) // batch) if remainder else len(parent) // batch
-        self._length = min(math.ceil(self._whole / workers) * workers * batch, sys.maxsize)
-
-    def __len__(self) -> int:
-        return self._length
-
-    @overload
-    def __getitem__(self, index: slice) -> pygrain.MapDataset[Record]: ...
-    @overload
-    def __getitem__(self, index: int) -> Record | None: ...
-
-    def __getitem__(self, index: int | slice) -> Record | pygrain.MapDataset[Record] | None:
-        if isinstance(index, slice):
-            return self.slice(index)
-        worker, within = index % self._workers, index // self._workers
-        round_, row = divmod(within, self._batch)
-        which = round_ * self._workers + worker
-        record = which * self._batch + row
-        return None if which >= self._whole or record >= len(self._parent) else self._parent[record]
-
-
-@dataclasses.dataclass(frozen=True)
-class LengthGroups:
-    """Global batches of records of like length, for a stream whose batches are
-    cut to their longest record.
-
-    The order is read `window` global batches at a time: each window's
-    records are sorted by `length`, cut into batches again, and those batches
-    are put back in a random order of the window's own (`_Grouped`). Every
-    record is still read once a pass and a position is still one record
-    count. A batch's corpus shares now hold over its window rather than over
-    the batch. `length` reads a record as the order holds it, before any
-    operation runs, and only ranks: an estimate is enough.
-    """
-    length: Callable[[Batch], int]
-    window: int = 64
-
-
-class _Grouped(pygrain.MapDataset[Batch]):
-    """`parent` with each window of `rows * window` records sorted by length
-    and cut into batches of `rows`, the batches shuffled within the window
-    from `seed`. A window's order is computed once, by the first reading thread
-    to need it while the others wait, and the last few windows' orders are kept."""
-
-    _MUTATES_ELEMENT_SPEC = False
-
-    def __init__(self, parent: pygrain.MapDataset[Batch], groups: LengthGroups, rows: int, seed: int):
-        super().__init__(parent)
-        self._groups, self._rows, self._seed = groups, rows, seed
-        self._span = rows * groups.window
-        self._orders: dict[int, np.ndarray] = {}
-        self._lock = threading.Lock()
-
-    def __getstate__(self) -> dict:
-        state = dict(self.__dict__)
-        del state["_lock"]
-        return state
-
-    def __setstate__(self, state: dict) -> None:
-        self.__dict__.update(state)
-        self._lock = threading.Lock()
-
-    def __len__(self) -> int:
-        return len(self._parent)
-
-    @overload
-    def __getitem__(self, index: slice) -> pygrain.MapDataset[Batch]: ...
-    @overload
-    def __getitem__(self, index: int) -> Batch | None: ...
-
-    def __getitem__(self, index: int | slice) -> Batch | pygrain.MapDataset[Batch] | None:
-        if isinstance(index, slice):
-            return self.slice(index)
-        start = index - index % self._span
-        return self._parent[start + int(self._order(start)[index - start])]
-
-    def _order(self, start: int) -> np.ndarray:
-        order = self._orders.get(start)
-        if order is None:
-            with self._lock:
-                order = self._orders.get(start)
-                if order is None:
-                    order = self._ordered(start)
-                    # A new dict, so a thread reading the old one never sees it change.
-                    self._orders = {**dict(list(self._orders.items())[-3:]), start: order}
-        return order
-
-    def _ordered(self, start: int) -> np.ndarray:
-        size = min(self._span, len(self._parent) - start)
-        records = [self._parent[start + offset] for offset in range(size)]
-        # A record the parent filtered out reads as None and is skipped wherever it lands.
-        ranked = np.argsort([0 if record is None else self._groups.length(record) for record in records],
-                            kind="stable")
-        batches = [ranked[first:first + self._rows] for first in range(0, size, self._rows)]
-        shuffled = np.random.default_rng([self._seed, start]).permutation(len(batches))
-        return np.concatenate([batches[index] for index in shuffled])
 
 
 class FilledBatch(pygrain.MapTransform):
@@ -1298,71 +929,8 @@ class FilledBatch(pygrain.MapTransform):
         if held == self._rows and self._real:
             return element
         plan = RowPlan(None, held, self._rows, 0, 1)
-        return {**plan.pad(element), VALID_ROWS: ~plan.padding & self._real}
-
-
-def _batches[Record](records: pygrain.MapDataset[Record], *, rows: int,
-                     partition: DataPartition, loading: Loading, offset: int = 0,
-                     remainder: bool = False,
-                     cut: Callable[[Batch], Batch] | None = None) -> pygrain.DatasetIterator[Batch]:
-    """The partition's share of `records`, in batches of `rows` records.
-
-    A training stream is endless and takes whole batches. An evaluation pass
-    (`remainder`) takes every record: its last batch is filled out to `rows`
-    (`FilledBatch`). `cut` maps each batch once it is stacked.
-
-    The slice is `offset + index :: count`. Global batch k is then the same
-    records at every count, and an offset is a slice bound rather than a
-    replay.
-
-    Reads are records: the threads behind `to_iter_dataset` each fetch one,
-    so no read waits on a whole batch. Grain's `ElasticIterator` batches
-    ahead of its read and is an order of magnitude slower on a slow source.
-    The batch is stacked inside the worker, so each transfer to this process
-    is a whole batch. `_WorkerBatches` permutes the slice to make a worker's
-    share whole batches, and that permutation depends only on the batch and
-    worker counts, so neither changes which records a batch holds.
-    """
-    mine = records[offset + partition.index::partition.count]
-    # A share a pass's split holds no record for, as process 1's of one record
-    # on two, reads one batch of the split's first record with every row a
-    # repeat: it meets its peers' first batch and scores nothing.
-    empty = remainder and not len(mine) and len(records)
-    if empty:
-        mine = records[:1]
-    if loading.workers:
-        mine = _WorkerBatches(mine, rows, loading.workers, remainder=remainder)
-    stream = mine.to_iter_dataset(pygrain.ReadOptions(loading.threads, loading.read_buffer))
-    stream = stream.batch(rows, drop_remainder=not remainder)
-    if cut is not None:
-        stream = stream.map(cut)
-    if remainder:
-        stream = stream.map(FilledBatch(rows, real=not empty))
-    if loading.workers:
-        # grain's workers read absl flags, which a script without absl.app never parsed.
-        if not flags.FLAGS.is_parsed():
-            flags.FLAGS.mark_as_parsed()
-        stream = stream.mp_prefetch(pygrain.MultiprocessingOptions(
-            num_workers=loading.workers,
-            per_worker_buffer_size=loading.worker_buffer))
-    return iter(stream)
-
-
-def _shared(source: GrainPipeline, *, rows: int, partition: DataPartition, loading: Loading,
-            offset: int = 0, remainder: bool = False) -> pygrain.DatasetIterator[Batch]:
-    """The partition's share of `source`, in batches of `rows` records.
-
-    A `MapDataset` is read by index, which is what `_batches` needs to cut a
-    share and to start it at a record offset. A pipeline read as it comes has
-    neither, so the caller's function builds the share's own and it is
-    batched where it is. Only the indexed branch is opened at an offset,
-    since only it has a position to resume.
-    """
-    if isinstance(source, pygrain.MapDataset):
-        return _batches(source, rows=rows, partition=partition, loading=loading, offset=offset,
-                        remainder=remainder)
-    batches = source(partition).batch(rows, drop_remainder=not remainder)
-    return iter(batches.map(FilledBatch(rows)) if remainder else batches)
+        indices = plan.pad(np.arange(held))
+        return {**take_batch(element, indices), VALID_ROWS: ~plan.padding & self._real}
 
 
 def rows_of(batch: Mapping[str, object]) -> int:
@@ -1373,7 +941,19 @@ def rows_of(batch: Mapping[str, object]) -> int:
     there are; a batch of such fields alone holds none. Any mapping of
     fields answers, so the trainer's own batch type reaches this as it is.
     """
-    return next((np.shape(leaf)[0] for leaf in jax.tree.leaves(batch) if np.shape(leaf)), 0)
+    leaves = jax.tree.leaves(batch, is_leaf=lambda column: isinstance(column, list))
+    return next((len(leaf) if isinstance(leaf, list) else np.shape(leaf)[0]
+                 for leaf in leaves if isinstance(leaf, list) or np.shape(leaf)), 0)
+
+
+def take_batch(batch: Batch, indices: int | slice | np.ndarray) -> Batch:
+    """Rows selected along array axes and opaque lists of object records."""
+    return jax.tree.map(
+        lambda column: ([column[int(index)] for index in indices]
+                        if isinstance(column, list) and isinstance(indices, np.ndarray)
+                        else column[indices]),
+        batch, is_leaf=lambda column: isinstance(column, list),
+    )
 
 
 _UNSTACKED = "Expected all input elements to have the same structure"
@@ -1381,16 +961,42 @@ _UNSTACKED = "Expected all input elements to have the same structure"
 not stack. A grain that words it otherwise raises its own error unchanged."""
 
 
-def stacked(reads: Iterator[Batch]) -> Batch:
-    """The next batch of `reads`, with grain's failure to stack its records
-    said in terms of what to change.
+def _stacked(value) -> bool:
+    """Whether Grain stacks `value` into one array: numbers, strings and bytes,
+    and mappings of them; not lists, object arrays or other records."""
+    if isinstance(value, Mapping):
+        return bool(value) and all(_stacked(field) for field in value.values())
+    return (isinstance(value, (np.ndarray, np.generic, jax.Array, int, float, complex, str, bytes))
+            and np.asarray(value).dtype.kind in "biufcSU")
+
+
+def record_batch(rows: Sequence[Batch], *, shared: bool = False) -> Batch:
+    """Numeric and text columns stacked by Grain, with object columns (a
+    conversation's messages, a record's tools) kept as record lists."""
+    if not rows:
+        raise ValueError("a batch needs at least one record")
+    if any(row.keys() != rows[0].keys() for row in rows[1:]):
+        raise ValueError("the records of one batch must hold the same fields")
+    batched: Batch = {}
+    for name in rows[0]:
+        values = [row[name] for row in rows]
+        batched[name] = (make_batch(values, output_to_shared_memory=shared)
+                         if all(_stacked(value) for value in values) else values)
+    return batched
+
+
+def stacked(rows: Sequence[Batch], stack: Callable[[Sequence[Batch]], Batch]) -> Batch:
+    """`rows` stacked into one batch by `stack`, with grain's failure to
+    stack them said in terms of what to change. Every batch Dew makes of
+    rows is stacked here, so a reader and the loading tuner that samples it
+    refuse alike.
 
     The usual cause is a field of varying length, as token ids are before
     anything cuts or packs them, and grain's message names the batch's
     structure rather than the field or the remedy.
     """
     try:
-        return next(reads)
+        return stack(rows)
     except ValueError as failed:
         if not str(failed).startswith(_UNSTACKED):
             raise
@@ -1398,7 +1004,8 @@ def stacked(reads: Iterator[Batch]) -> Batch:
             "the records of one batch hold a field in different shapes, and a batch "
             "stacks each field into one array: cut or pad a variable-length field, such "
             "as token ids, to one length, or pack documents into fixed windows (Training "
-            "data, Packing). Grain's report of the shapes is the cause below") from failed
+            "data, Packing). Grain's report of the shapes is the cause below"
+        ) from failed
 
 
 class GlobalStream:
@@ -1418,22 +1025,34 @@ class GlobalStream:
     stream restored before it is read does not start its workers twice.
 
     The offset alone would resume that many records into whatever order the
-    run now has, so `order` is saved with it and a restore whose order
-    disagrees is refused. `dew.position` defines the format that both this
-    class and `dew.checkpoints` read.
+    run now has, so the plan's order (`order`) and the plan are saved with
+    it and a restore whose plan disagrees is refused (`Plan.check`).
+    `dew.position` defines the format that both this class and
+    `dew.checkpoints` read.
     """
 
     endless = True
 
-    def __init__(self, open_at: Callable[[int], pygrain.DatasetIterator[Batch]],
-                 batch: int, order: str, loading: Loading, content: Callable[[], str] | None = None):
+    def __init__(
+        self,
+        open_at: Callable[[int], pygrain.DatasetIterator[Batch]],
+        batch: int,
+        plan: Plan,
+        loading: Loading,
+        *,
+        resume: Literal["exact", "non-exact"] = "exact",
+        endless: bool = True,
+    ):
         self._open = open_at
+        self.endless = endless
         self._batch = batch
-        self._order = order
-        self._content = content
+        self._order = json.dumps(plan.order, sort_keys=True)
         self._records = 0
         self._reads: pygrain.DatasetIterator[Batch] | None = None
         self._loading = loading
+        self._plan = plan
+        self._resume: Literal["exact", "non-exact"] = resume
+        self.manifest_changes: tuple[str, ...] = ()
         self.stop_seconds = loading.stop_seconds
 
     def __iter__(self) -> Iterator[Batch]:
@@ -1442,14 +1061,24 @@ class GlobalStream:
     def __next__(self) -> Batch:
         if self._reads is None:
             self._reads = self._open(self._records)
-        batch = stacked(self._reads)
+        batch = next(self._reads)
         # Counted after the batch: a step the stream did not deliver is not
         # a step a resume may skip.
         self._records += self._batch
         return batch
 
     def get_state(self) -> bytes:
-        return position.encode(position.Global(records=self._records, order=self._order))
+        return position.encode(
+            position.Global(
+                records=self._records,
+                order=self._order,
+                plan=self._plan.record(),
+            )
+        )
+
+    @property
+    def records(self) -> int:
+        return self._records
 
     @property
     def order(self) -> str:
@@ -1457,27 +1086,29 @@ class GlobalStream:
         return self._order
 
     def identity(self) -> str:
-        """The order, and a sample of the records it reads (`sampled`) when
-        the stream can read them as stored.
-
-        The order names the corpus by its source, length and seed, and two
-        hosts' copies of a corpus can hold different records under one name.
-        """
-        return self._order if self._content is None else f"{self._order}, sampled {self._content()}"
+        """The plan's identity (`Plan.identity`), which a pool agrees before it
+        reads: hosts whose copies of a corpus hold other records, or whose
+        steps make other values, are refused however the sources describe
+        themselves."""
+        return self._plan.identity()
 
     def set_state(self, state: bytes) -> None:
         saved = position.read(state)
+        if saved.plan is not None:
+            self.manifest_changes = self._plan.check(saved.plan, resume=self._resume)
         if saved.completed:
             raise ValueError(
                 f"the saved data position is {saved.records} records into a phased run "
                 f"past {len(saved.completed)} phase(s), and this run reads one order "
-                f"({self._order}); resume it with the phases that wrote it")
+                f"({self._order}); resume it with the phases that wrote it"
+            )
         if saved.order != self._order:
             raise ValueError(
                 f"the saved data position is {saved.records} records into "
                 f"{saved.order}, and this run reads {self._order}; a record count "
                 f"is a place in one order and another place in another, so resume "
-                f"the corpus, record count and seed the checkpoint was written with")
+                f"the corpus, record count and seed the checkpoint was written with"
+            )
         self.close()
         self._records = saved.records
 
@@ -1488,11 +1119,24 @@ class GlobalStream:
                 reads.close()
 
 
+@runtime_checkable
+class GlobalReader(Protocol):
+    @property
+    def records(self) -> int: ...
+    @property
+    def order(self) -> str: ...
+    def __next__(self) -> Batch: ...
+    def get_state(self) -> Position: ...
+    def set_state(self, state: bytes) -> None: ...
+    def close(self) -> None: ...
+    def identity(self) -> str: ...
+
+
 class PhasedStream:
     """Reads one global order per phase, switching at step boundaries.
 
-    Each phase is a `GlobalStream` factory (`train_stream`, `mixed_stream`)
-    with the global record count it ends at, or None for the last phase, which
+    Each phase opens a `GlobalReader`, such as a compiled global order, and
+    has the global record count it ends at, or None for the last phase, which
     runs on. Phase k starts its own order at its own record zero when the
     run's count reaches the end of phase k - 1, so the records a step reads
     depend only on the step and the phase list, at any process count.
@@ -1510,8 +1154,7 @@ class PhasedStream:
 
     endless = True
 
-    def __init__(self, phases: Sequence[tuple[Callable[[], GlobalStream], int | None]],
-                 stop_seconds: float):
+    def __init__(self, phases: Sequence[tuple[Callable[[], GlobalReader], int | None]], stop_seconds: float):
         ends = [end for _, end in phases]
         bounded = [end for end in ends[:-1] if end is not None]
         if not phases or ends[-1] is not None or len(bounded) != len(ends) - 1:
@@ -1539,20 +1182,24 @@ class PhasedStream:
             if self._current is not None:
                 self._streams[self._current].close()
             stream = self._streams[phase]
-            stream.set_state(position.encode(position.Global(
-                records=self._records - self._start(phase), order=stream.order)))
+            stream.set_state(
+                position.encode(
+                    position.Global(records=self._records - self._start(phase), order=stream.order)
+                )
+            )
             self._current = phase
         stream = self._streams[phase]
         # The stream's own count, which it advances only for a batch it
         # delivered; its checkpoint envelope is for checkpoints.
-        before = stream._records
+        before = stream.records
         batch = next(stream)
-        read = stream._records - before
+        read = stream.records - before
         self._records += read
         if phase < len(self._ends) and self._records > self._ends[phase]:
             raise ValueError(
                 f"a step of {read} records crossed the phase boundary at record "
-                f"{self._ends[phase]}; phases end on step boundaries")
+                f"{self._ends[phase]}; phases end on step boundaries"
+            )
         return batch
 
     def get_state(self) -> bytes:
@@ -1560,50 +1207,66 @@ class PhasedStream:
         # phase is read yet, so the finished one is still current and a
         # resume may change what follows it or extend it.
         phase = bisect.bisect_left(self._ends, self._records)
-        return position.encode(position.Global(
-            records=self._records, order=self._streams[phase].order,
-            completed=tuple((self._streams[index].order, self._ends[index])
-                            for index in range(phase))))
+        plans = [
+            position.read(_global_position(stream.get_state())).plan for stream in self._streams[: phase + 1]
+        ]
+        return position.encode(
+            position.Global(
+                records=self._records,
+                order=self._streams[phase].order,
+                completed=tuple((self._streams[index].order, self._ends[index]) for index in range(phase)),
+                plan={"phases": plans} if any(plan is not None for plan in plans) else None,
+            )
+        )
 
     def set_state(self, state: bytes) -> None:
         saved = position.read(state)
+        if saved.plan is not None:
+            plans = saved.plan.get("phases") if "phases" in saved.plan else [saved.plan]
+            if not isinstance(plans, list) or len(plans) != len(saved.completed) + 1:
+                raise ValueError("saved phase plans do not cover the completed and current phases")
+            for index, plan in enumerate(plans):
+                if index >= len(self._streams) or (plan is not None and not isinstance(plan, Mapping)):
+                    raise ValueError("saved phase plan is not part of this run")
+                end = saved.completed[index][1] if index < len(saved.completed) else saved.records
+                self._streams[index].set_state(
+                    position.encode(
+                        position.Global(
+                            records=end - self._start(index), order=self._streams[index].order, plan=plan
+                        )
+                    )
+                )
         for index, (order, end) in enumerate(saved.completed):
             if index >= len(self._ends) or (self._streams[index].order, self._ends[index]) != (order, end):
                 raise ValueError(
                     f"the saved run finished phase {index} reading {order} to record "
                     f"{end}, and this run's phase {index} is not that; a phase the "
-                    f"run has read cannot change under it")
+                    f"run has read cannot change under it"
+                )
         phase = len(saved.completed)
         if phase >= len(self._streams) or self._streams[phase].order != saved.order:
             raise ValueError(
                 f"the saved position is {saved.records} records into phase {phase}, "
                 f"reading {saved.order}, and this run's phase {phase} reads something "
-                f"else; resume with the order the checkpoint was written in")
+                f"else; resume with the order the checkpoint was written in"
+            )
         if phase < len(self._ends) and saved.records > self._ends[phase]:
             raise ValueError(
                 f"the saved run has read {saved.records} records, past this run's end "
-                f"of phase {phase} at {self._ends[phase]}")
+                f"of phase {phase} at {self._ends[phase]}"
+            )
         self.close()
         self._records = saved.records
 
     def identity(self) -> str:
-        return "; ".join([*(stream.identity() for stream in self._streams),
-                          f"phases ending at records {list(self._ends)}"])
+        return "; ".join(
+            [*(stream.identity() for stream in self._streams), f"phases ending at records {list(self._ends)}"]
+        )
 
     def close(self) -> None:
         if self._current is not None:
             self._streams[self._current].close()
         self._current = None
-
-
-def phased(phases: Sequence[tuple[Callable[[DataPartition], GlobalStream], int | None]], *,
-           loading: Loading) -> Callable[[DataPartition], PhasedStream]:
-    """A `PhasedStream` factory over `phases`, each a stream factory and the
-    global record count it ends at (None for the last); every phase reads
-    the share its reader is handed."""
-    return lambda partition: PhasedStream(
-        [(functools.partial(open_stream, partition), end) for open_stream, end in phases],
-        loading.stop_seconds)
 
 
 @runtime_checkable
@@ -1623,7 +1286,8 @@ def _global_position(state: Position) -> bytes:
     if not isinstance(state, bytes):
         raise TypeError(
             f"a batch ramp reads a global record position, and this stream "
-            f"reports {type(state).__name__}, which counts one process's shard")
+            f"reports {type(state).__name__}, which counts one process's shard"
+        )
     return state
 
 
@@ -1631,7 +1295,7 @@ class RampedStream(Forwarding):
     """Grows a training stream's step over the run's first records.
 
     It wraps a stream whose position is a global record count (a
-    `GlobalStream`, or `tokenized` over one) and decides only how many of its
+    `GlobalStream` or a host transform over one) and decides only how many of its
     records each step reads. Reads run one whole final-size batch ahead, and
     each step is cut from a rolling buffer, as in MaxText's loader. A step
     therefore reads the records the run would have read without the ramp, in
@@ -1642,6 +1306,7 @@ class RampedStream(Forwarding):
     the position, which is the number of records handed out so far. A restore
     gives the source that count, so it reopens its read there.
     """
+
     # MaxText reference: common/data_loader.py:122-176.
 
     def __init__(self, source: Resumable, stages: Sequence[Stage], partition: DataPartition):
@@ -1674,10 +1339,15 @@ class RampedStream(Forwarding):
         rows = self._partition.rows(stage.batch)
         while self._held is None or rows_of(self._held) < rows:
             read = next(self._source)
-            self._held = read if self._held is None else jax.tree.map(
-                lambda kept, new: np.concatenate([kept, new]), self._held, read)
-        step = jax.tree.map(lambda field: field[:rows], self._held)
-        self._held = jax.tree.map(lambda field: field[rows:], self._held)
+            self._held = (
+                read
+                if self._held is None
+                else jax.tree.map(lambda kept, new: kept + new if isinstance(kept, list)
+                                  else np.concatenate([kept, new]), self._held, read,
+                                  is_leaf=lambda column: isinstance(column, list))
+            )
+        step = take_batch(self._held, slice(rows))
+        self._held = take_batch(self._held, slice(rows, None))
         self._records += stage.batch
         return step
 
@@ -1695,14 +1365,15 @@ class RampedStream(Forwarding):
                 f"the saved data position is {self._records} records in, and this "
                 f"ramp reads {stage.batch} records a step from record "
                 f"{stage.records} on, so no step of it ends there: the checkpoint "
-                f"was written by a run that ramped differently")
+                f"was written by a run that ramped differently"
+            )
 
     def close(self) -> None:
         self._held = None
         super().close()
 
 
-def ramped(dataset: Dataset, ramp: Ramp) -> Dataset:
+def ramped(dataset: Loader, ramp: Ramp) -> Loader:
     """`dataset` with the training batch growing to `dataset.batch` over `ramp`.
 
     A validation pass keeps the whole batch, since a score over a growing
@@ -1721,7 +1392,8 @@ def ramped(dataset: Dataset, ramp: Ramp) -> Dataset:
             stream.close()
             raise TypeError(
                 "phases end at step boundaries of the full batch, and a batch ramp "
-                "cuts other steps; ramp a run of one order")
+                "cuts other steps; ramp a run of one order"
+            )
         if isinstance(stream, Resumable):
             state = stream.get_state()
             if isinstance(state, bytes) and position.translates(state):
@@ -1731,146 +1403,22 @@ def ramped(dataset: Dataset, ramp: Ramp) -> Dataset:
         raise TypeError(
             f"a batch ramp cuts the step out of a global record order, and "
             f"{type(stream).__name__} hands over batches it has cut itself; ramp "
-            f"a dataset read through train_stream or mixed_stream")
+            f"a dataset compiled to a global record order"
+        )
 
     return dataclasses.replace(dataset, train=train, ramp=ramp)
-
-
-def train_stream(source: Records, operations: Sequence[pygrain.Transformation], *,
-                 batch: int, seed: int, loading: Loading, offset: int = 0,
-                 groups: LengthGroups | None = None,
-                 cut: Callable[[Batch], Batch] | None = None) -> Callable[[DataPartition], GlobalStream]:
-    """Return an endless shuffled stream over `source`, `batch` records a global step.
-
-    The order is the corpus reshuffled from `seed` every epoch, endlessly, and
-    the reader's share is cut from it. Global batch k is then the same records
-    at every partition, and a `GlobalStream` position is a record count rather
-    than a shard offset.
-
-    `operations` run after the order and before the slice. So they run inside
-    the workers, a record's rng is keyed by its place in the endless stream,
-    and what a record turns into depends on neither the share count nor the worker
-    count.
-
-    `offset` starts the order past the records earlier phases read. `groups`
-    reads the order a window of batches at a time with each batch's records
-    of like length (`LengthGroups`), and `cut` maps every batch once it is
-    stacked, as a stream that pads each batch only to its longest record
-    does; a cut batch's shape is its own, so one reader reads the stream.
-    """
-    start = f", from record {offset}" if offset else ""
-    order = f"{describe(source)}, {len(source)} records reshuffled from seed {seed}{start}{_grouping(groups)}"
-
-    def records() -> pygrain.MapDataset[Batch]:
-        return _ordered(_endless(source, seed, offset), groups, batch, seed).apply(list(operations))
-
-    return _global_stream(records, order, batch=batch, loading=loading,
-                          content=functools.partial(sampled, source), cut=cut)
-
-
-def mixed_stream(corpora: Sequence[Corpus], operations: Sequence[pygrain.Transformation], *,
-                 batch: int, seed: int, loading: Loading, groups: LengthGroups | None = None,
-                 cut: Callable[[Batch], Batch] | None = None) -> Callable[[DataPartition], GlobalStream]:
-    """An endless stream over `corpora` at their weights, `batch` records a global step.
-
-    The order is `mixture(corpora, seed)` and everything after it is
-    `train_stream`'s: the same share's slice, the same batch behind the
-    reads, and the same position. A mixture's place in its corpora is
-    therefore one record count and resumes on any partition. The
-    `operations` sit above the mixture, so a record's rng is keyed by its
-    place in the mixed stream rather than in the corpus it came from.
-    `groups` and `cut` are `train_stream`'s.
-    """
-    shares = _shares(corpora)
-    order = "mixture reshuffled from seed {} of [{}]{}".format(seed, ", ".join(
-        f"{corpus.name} at {share:.6g}: {_described(corpus)}"
-        for corpus, share in zip(corpora, shares, strict=True)), _grouping(groups))
-
-    def records() -> pygrain.MapDataset[Batch]:
-        return _ordered(mixture(corpora, seed).seed(seed), groups, batch, seed).apply(list(operations))
-
-    def content() -> str:
-        return ", ".join(sampled(corpus.source) for corpus in corpora)
-
-    return _global_stream(records, order, batch=batch, loading=loading, content=content, cut=cut)
-
-
-def _ordered(records: pygrain.MapDataset[Batch], groups: LengthGroups | None, batch: int,
-             seed: int) -> pygrain.MapDataset[Batch]:
-    return records if groups is None else _Grouped(records, groups, batch, seed)
-
-
-def _grouping(groups: LengthGroups | None) -> str:
-    """What `groups` adds to an order's description: a position saved under
-    one grouping is refused under another."""
-    return "" if groups is None else f", grouped by length {groups.window} batches at a time"
-
-
-def _global_stream(records: Callable[[], pygrain.MapDataset[Batch]], order: str, *,
-                   batch: int, loading: Loading, content: Callable[[], str],
-                   cut: Callable[[Batch], Batch] | None = None) -> Callable[[DataPartition], GlobalStream]:
-    """A `GlobalStream` factory over the endless order `records` builds.
-
-    Each reader gets its own pipeline over its share, opened at whatever
-    record offset a restore hands it, and `order` is the description a saved
-    position is compared against. `content` samples the corpus under it.
-    """
-    def stream(partition: DataPartition) -> GlobalStream:
-        rows = partition.rows(batch)
-        if cut is not None and partition.count > 1:
-            raise ValueError(
-                f"a cut batch takes a shape of its own, and {partition.count} readers would each cut "
-                "their share to a different one; read a cut stream on one process")
-
-        def open_at(offset: int) -> pygrain.DatasetIterator[Batch]:
-            return _batches(records(), rows=rows, partition=partition, loading=loading,
-                            offset=offset, cut=cut)
-
-        return GlobalStream(open_at, batch, order, loading, content)
-
-    return stream
-
-
-def validation_pass(source: Records, transformations: Sequence[pygrain.Transformation], *,
-                    batch: int, seed: int, loading: Loading) -> Reader:
-    """One pass over `source` in record order, `batch` records a global step.
-
-    Grain's DataLoader gives each worker its own slice of the split to fill a
-    whole batch out of, so which records a batch holds moves with
-    worker_count. `_batches` hands a worker the records of one batch instead,
-    so the split is cut into the same batches at every count.
-
-    Sharding is grain's slice convention, so share p of n reads records
-    p, p + n, ... of the split. The transforms are applied before that slice
-    because grain keys a record's rng by its index in the dataset the random
-    map sits on. Applied after the slice, record k would take its key from
-    its place in the slice, and one seed would augment it differently on one
-    host than on a pod. A part-full batch cannot be sharded over a device
-    mesh, so the last one is filled out to the batch's rows with repeats
-    that `VALID_ROWS` marks, and the pass still counts every record once.
-    """
-    def stream(partition: DataPartition) -> Iterator[Batch]:
-        records = pygrain.MapDataset.source(source).seed(seed).apply(list(transformations))
-        return _batches(records, rows=partition.rows(batch), partition=partition, loading=loading,
-                        remainder=True)
-
-    return stream
 
 
 __all__ = [
     "Budgeted",
     "Checkpointable",
     "Closeable",
-    "Columns",
-    "Corpus",
     "DataPartition",
     "DataPhase",
-    "Dataset",
-    "DatasetSpec",
     "Forwarding",
     "GlobalStream",
     "Identified",
-    "LengthGroups",
+    "Loader",
     "Loading",
     "PhasedStream",
     "Ramp",
@@ -1881,9 +1429,6 @@ __all__ = [
     "SourceSlice",
     "Stage",
     "Stoppable",
-    "Tokenize",
     "mapped",
     "record_argument",
-    "tokenized",
-    "train_stream",
 ]

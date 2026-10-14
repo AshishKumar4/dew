@@ -1,0 +1,807 @@
+"""Indexed files and checkpointable physical-shard readers over filesystem URLs."""
+
+from __future__ import annotations
+
+import bisect
+import csv
+import hashlib
+import io
+import itertools
+import json
+import posixpath
+import threading
+from collections.abc import Iterator, Mapping, Sequence
+from dataclasses import dataclass, field
+from functools import cached_property, lru_cache
+from pathlib import PurePosixPath
+from typing import BinaryIO, Literal
+
+import grain.python as grain
+import numpy as np
+import pyarrow as pa
+import pyarrow.dataset as ds
+import pyarrow.fs as pafs
+from fsspec.spec import AbstractFileSystem
+from fsspec.utils import infer_compression
+
+from dew.data.dataset import Batch, Records
+from dew.data.pipeline import Dataset
+from dew.data.storage import Store, content_version, local
+from dew.records import integer, record
+
+from .base import Read, Shard, ShardManifest, preparing
+from .index import ArrayIndex
+
+type Format = Literal["jsonl", "text", "csv", "parquet", "arrow", "array_record", "files", "webdataset"]
+
+
+def _format(url: str) -> Format:
+    if url.lower().endswith((".jsonl.gz", ".jsonl.zst")):
+        return "jsonl"
+    suffix = PurePosixPath(url).suffix.lower()
+    formats: dict[str, Format] = {
+        ".jsonl": "jsonl",
+        ".txt": "text",
+        ".csv": "csv",
+        ".parquet": "parquet",
+        ".arrow": "arrow",
+        ".feather": "arrow",
+        ".array_record": "array_record",
+        ".tar": "webdataset",
+    }
+    if suffix not in formats:
+        raise ValueError(f"source {url!r} needs format=; a URL does not declare its record format")
+    return formats[suffix]
+
+
+def _arrow_filesystem(fs) -> pafs.FileSystem:
+    protocols = (fs.protocol,) if isinstance(fs.protocol, str) else fs.protocol
+    if "file" in protocols:
+        return pafs.LocalFileSystem()
+    if "s3" in protocols:
+        from urllib.parse import urlsplit
+
+        endpoint = fs.client_kwargs.get("endpoint_url") or fs.endpoint_url
+        parsed = urlsplit(endpoint) if endpoint else None
+        return pafs.S3FileSystem(
+            access_key=fs.key,
+            secret_key=fs.secret,
+            session_token=fs.token,
+            anonymous=fs.anon,
+            region=fs.client_kwargs.get("region_name"),
+            endpoint_override=parsed.netloc if parsed else None,
+            scheme=parsed.scheme if parsed else "https",
+        )
+    if (
+        "gs" in protocols
+        and fs.credentials.method in ("google_default", "cloud", "anon")
+        and not fs.requester_pays
+    ):
+        from urllib.parse import urlsplit
+
+        endpoint = urlsplit(fs._location)
+        return pafs.GcsFileSystem(
+            anonymous=fs.credentials.method == "anon",
+            scheme=endpoint.scheme,
+            endpoint_override=endpoint.netloc,
+        )
+    return pafs.PyFileSystem(pafs.FSSpecHandler(fs))
+
+
+def _mount_root(paths: Sequence[str]) -> str:
+    """The directory local `paths` share, a single file's own directory."""
+    if not paths:
+        return ""
+    return posixpath.dirname(paths[0]) if len(set(paths)) == 1 else posixpath.commonpath(paths)
+
+
+def _fragment_rows(fragment) -> int:
+    if isinstance(fragment, ds.ParquetFileFragment):
+        return sum(group.num_rows for group in fragment.row_groups)
+    return fragment.count_rows()
+
+
+def _open_lines(fs: AbstractFileSystem, path: str):
+    compression = infer_compression(path.lower())
+    if compression == "zstd":
+        from zstandard import ZstdDecompressor
+
+        return io.BufferedReader(ZstdDecompressor().stream_reader(fs.open(path, "rb")))
+    return fs.open(path, "rb", compression=compression)
+
+
+def _seek_lines(file: BinaryIO, offset: int) -> None:
+    if file.seekable():
+        file.seek(offset)
+        return
+    while file.tell() < offset:
+        if not file.read(min(offset - file.tell(), 2**20)):
+            raise ValueError("file reader position exceeds its decompressed stream")
+
+
+@dataclass(frozen=True)
+class Files(Dataset):
+    """Files at URLs, with producer indexes or explicit provisioning for text.
+
+    Parquet partitions are discovered with Arrow's Hive partitioning. A
+    predicate runs within each streamed fragment; indexed predicates need
+    a provisioned accepted-row index and are refused here.
+    """
+
+    url: str | tuple[str, ...]
+    format: Format | None = None
+    index: str | None = None
+    columns: tuple[str, ...] | None = None
+    where: ds.Expression | None = None
+    partitioning: str | None = "hive"
+    shard_bytes: int = 64 * 2**20
+    storage_options: Mapping[str, object] | None = field(default=None, repr=False)
+    spark: bool = False
+    file_info: Mapping[str, Mapping[str, object]] | None = None
+
+    @cached_property
+    def declared(self) -> Mapping[str, Mapping[str, object]]:
+        if self.file_info is not None:
+            return self.file_info
+        committed = self.committed
+        if committed is None:
+            return {}
+        entries = committed["files"]
+        if not isinstance(entries, list):
+            raise ValueError("export manifest files must be a list")
+        return {
+            Store(str(self.url), self.storage_options).child(entry["path"]).url: entry for entry in entries
+        }
+
+    def _header(self, url: str) -> Mapping[str, object]:
+        if url in self.declared:
+            stated = self.declared[url]
+            return {"name": url, "size": stated["bytes"], **stated}
+        fs, path = Store(url, self.storage_options).resolve()
+        return fs.info(path)
+
+    @cached_property
+    def kind(self) -> Format:
+        if self.committed is not None:
+            declared = _format("data." + str(self.committed["format"]))
+            if self.format is not None and self.format != declared:
+                raise ValueError(f"source {self.url!r} declares format={declared}, not {self.format}")
+            return declared
+        return self.format or _format(self.url if isinstance(self.url, str) else self.url[0])
+
+    @cached_property
+    def committed(self) -> Mapping[str, object] | None:
+        if self.file_info is not None or not isinstance(self.url, str):
+            return None
+        store = Store(self.url, self.storage_options).child("_dew_manifest.json")
+        fs, path = store.resolve()
+        if not fs.exists(path):
+            return None
+        try:
+            manifest = json.loads(fs.cat_file(path))
+        except ValueError as error:
+            raise ValueError(f"committed export manifest is corrupt: {store.url}") from error
+        if not isinstance(manifest, dict) or manifest.get("schema") != 1:
+            raise ValueError(f"committed export manifest has an unknown schema: {store.url}")
+        return manifest
+
+    @cached_property
+    def paths(self) -> tuple[str, ...]:
+        if self.file_info is not None:
+            urls = (self.url,) if isinstance(self.url, str) else self.url
+            missing = [url for url in urls if url not in self.file_info]
+            if missing:
+                raise ValueError(f"published source facts do not name {missing[0]}")
+            return urls
+        if self.committed is not None:
+            root = Store(str(self.url), self.storage_options)
+            entries = self.committed["files"]
+            if not isinstance(entries, list):
+                raise ValueError(f"export manifest has invalid files at {self.url}")
+            return tuple(root.child(str(entry["path"])).url for entry in entries)
+        urls = (self.url,) if isinstance(self.url, str) else self.url
+        found = []
+        for url in urls:
+            fs, path = Store(url, self.storage_options).resolve()
+            if self.spark and not fs.exists(path.rstrip("/") + "/_SUCCESS"):
+                raise ValueError(f"Spark source {url!r} is uncommitted: _SUCCESS is missing")
+            if any(character in path for character in "*?["):
+                names = sorted(fs.glob(path))
+            elif fs.isdir(path):
+                names = sorted(
+                    name
+                    for name in fs.find(path)
+                    if self.kind not in ("parquet", "arrow")
+                    or not any(part.startswith(("_", ".")) for part in PurePosixPath(name[len(path) :]).parts)
+                )
+                extensions = {
+                    "parquet": ".parquet",
+                    "arrow": ".arrow",
+                    "jsonl": (".jsonl", ".jsonl.gz", ".jsonl.zst"),
+                    "text": ".txt",
+                    "csv": ".csv",
+                    "array_record": ".array_record",
+                    "webdataset": ".tar",
+                }
+                if self.kind != "files":
+                    names = [name for name in names if name.lower().endswith(extensions[self.kind])]
+            else:
+                names = [path]
+            found.extend(fs.unstrip_protocol(name) for name in names if fs.isfile(name))
+        if not found:
+            raise FileNotFoundError(f"source {self.url!r} matched no {self.kind} files")
+        return tuple(found)
+
+    def describe(self) -> str:
+        return f"files:{self.kind}:{self.url}"
+
+    def fingerprint(self) -> Mapping[str, object]:
+        return self._snapshot
+
+    @property
+    def _indexes(self) -> tuple[str, ...]:
+        if self.kind not in ("jsonl", "text", "csv"):
+            return ()
+        return (self.index,) if self.index else tuple(self._index_url(url) for url in self.paths)
+
+    @cached_property
+    def _file_facts(self) -> tuple[tuple[str, Mapping[str, object]], ...]:
+        files = []
+        indexes = self._indexes
+        indexed = set(indexes)
+        resolved = [(url, *Store(url, self.storage_options).resolve()) for url in (*self.paths, *indexes)]
+        # Local copies are named by their place under the files' common directory and their
+        # content, so hosts that mounted one dataset at different paths name it alike.
+        root = _mount_root([path for _, fs, path in resolved if local(fs)])
+        for url, fs, path in resolved:
+            if url in indexed and url not in self.declared and not fs.exists(path):
+                continue
+            metadata = self._header(url)
+            version = (
+                metadata.get("sha256")
+                or metadata.get("ETag")
+                or metadata.get("etag")
+                or metadata.get("generation")
+            )
+            if local(fs):
+                # A copy on this host's disk is named by what it holds, which its producer's
+                # declaration, where it states one, must describe.
+                size = integer(fs.info(path)["size"], "size")
+                version = content_version(fs, path, size)
+                stated = self.declared.get(url, {})
+                if stated.get("bytes", size) != size or stated.get("sha256", version) != version:
+                    raise ValueError(
+                        f"{url} declares {stated.get('bytes')} bytes (sha256 {stated.get('sha256')}), but "
+                        f"the file holds {size} (sha256 {version}): the store's metadata is stale")
+                metadata = {**metadata, "size": size}
+            elif version is None:
+                version = fs.ukey(path)
+            files.append(
+                (url, {
+                    "uri": posixpath.relpath(path, root) if local(fs) else url,
+                    "bytes": metadata["size"],
+                    "version": version,
+                })
+            )
+        return tuple(files)
+
+    @cached_property
+    def _snapshot(self) -> Mapping[str, object]:
+        return {
+            "store": self.kind,
+            "files": [metadata for _, metadata in self._file_facts],
+            "columns": self.columns,
+            "where": str(self.where),
+            "partitioning": self.partitioning,
+            "shard_bytes": self.shard_bytes,
+            "manifest": None
+            if self.committed is None
+            else hashlib.sha256(
+                json.dumps(self.committed, sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest(),
+            "transport": Store(self.paths[0], self.storage_options).describe() if self.paths else {},
+        }
+
+    def supports(self, read: Read) -> bool:
+        if read != "indexed" or self.kind == "files":
+            return True
+        if self.kind == "array_record":
+            if self.committed is not None:
+                return True
+            for url in self.paths:
+                fs, _ = Store(url, self.storage_options).resolve()
+                protocols = (fs.protocol,) if isinstance(fs.protocol, str) else fs.protocol
+                if not {"file", "gs", "gcs"}.intersection(protocols):
+                    return False
+            return True
+        if self.where is not None:
+            return False
+        if self.kind in ("arrow", "parquet"):
+            return True
+        if self.kind == "webdataset":
+            return False
+        if "index_headers" in self.__dict__:
+            return True
+        headers = {}
+        for url in self._indexes:
+            try:
+                headers[url] = self._header(url)
+            except FileNotFoundError:
+                return False
+        self.__dict__["index_headers"] = headers
+        return True
+
+    @staticmethod
+    def _index_url(url: str) -> str:
+        if infer_compression(url.lower()) is not None:
+            return url + ".index.npy"
+        return url.rsplit(".", 1)[0] + ".index.npy"
+
+    def can_provision(self, read: Read) -> bool:
+        return (read == "indexed" and self.where is None
+                and self.kind in ("array_record", "jsonl", "text", "csv"))
+
+    def provision(self) -> Files:
+        if self.kind == "array_record":
+            return self._provision_arrayrecord()
+        if self.kind not in ("jsonl", "text", "csv"):
+            raise ValueError(f"{self.describe()} has no provisionable offset index")
+        stores = [Store(url, self.storage_options).resolve() for url in self.paths]
+        preparing(self, sum(fs.size(path) or 0 for fs, path in stores), "an offset index beside each file")
+        for url in self.paths:
+            fs, path = Store(url, self.storage_options).resolve()
+            offsets = []
+            with _open_lines(fs, path) as file:
+                if self.kind == "csv":
+                    reader = csv.DictReader(_CsvLines(file))
+                    _ = reader.fieldnames
+                    while True:
+                        start = file.tell()
+                        try:
+                            next(reader)
+                        except StopIteration:
+                            break
+                        offsets.append((0, start, file.tell() - start))
+                else:
+                    while True:
+                        start = file.tell()
+                        line = file.readline()
+                        if not line:
+                            break
+                        if self.kind == "jsonl":
+                            if not line.strip():
+                                continue
+                            json.loads(line)
+                        offsets.append((0, start, len(line)))
+            encoded = io.BytesIO()
+            np.save(
+                encoded,
+                np.array(offsets, dtype=[("shard", "<u4"), ("offset", "<u8"), ("bytes", "<u8")]),
+                allow_pickle=False,
+            )
+            Store(self._index_url(url), self.storage_options).write(encoded.getvalue())
+        self.__dict__.pop("paths", None)
+        self.__dict__.pop("_file_facts", None)
+        self.__dict__.pop("_snapshot", None)
+        self.__dict__.pop("_metadata", None)
+        self.__dict__.pop("index_headers", None)
+        return self
+
+    def _provision_arrayrecord(self) -> Files:
+        from .records import ArrayRecords
+
+        if not isinstance(self.url, str) or any(mark in self.url for mark in "*?["):
+            raise ValueError("ArrayRecord provisioning needs one directory URL")
+        root = Store(self.url, self.storage_options)
+        fs, directory = root.resolve()
+        if not fs.isdir(directory):
+            raise ValueError("ArrayRecord provisioning needs its containing directory URL")
+        files = []
+        for url in self.paths:
+            filesystem, path = Store(url, self.storage_options).resolve()
+            opened = ArrayRecords((url,), self.storage_options)
+            try:
+                count = len(opened)
+                mirror, mirrored_path = Store(url, self.storage_options).cached().resolve()
+                with mirror.open(mirrored_path, "rb") as reader:
+                    if not isinstance(reader.name, str):
+                        raise ValueError(f"ArrayRecord provisioning needs a mirror that can hold {url}")
+                    with open(reader.name, "rb") as local:
+                        digest = hashlib.file_digest(local, "sha256").hexdigest()
+            finally:
+                opened.close()
+            files.append(
+                {
+                    "path": path[len(directory) :].lstrip("/"),
+                    "rows": count,
+                    "bytes": filesystem.size(path),
+                    "sha256": digest,
+                }
+            )
+        manifest = {
+            "schema": 1,
+            "format": "array_record",
+            "codec": None,
+            "rows": sum(entry["rows"] for entry in files),
+            "files": files,
+            "metadata": {},
+        }
+        root.child("_dew_manifest.json").put_if_absent(json.dumps(manifest, sort_keys=True).encode())
+        self.__dict__.pop("committed", None)
+        self.__dict__.pop("declared", None)
+        self.__dict__.pop("_file_facts", None)
+        self.__dict__.pop("_snapshot", None)
+        self.__dict__.pop("_metadata", None)
+        return self
+
+    def records(self, read: Read) -> Records:
+        if not self.supports(read):
+            raise FileNotFoundError(
+                f"{self.describe()} cannot read {read}; provision its offset or accepted "
+                "index with dew data provision, or choose read='streamed'"
+            )
+        if self.kind == "files":
+            return _Paths(self.paths)
+        if self.kind in ("parquet", "arrow"):
+            rows = _ArrowRecords(self)
+        elif self.kind == "array_record":
+            from .records import ArrayRecords
+
+            committed = self.committed
+            counts = self._declared_rows()
+            rows = ArrayRecords(
+                self.paths,
+                self.storage_options,
+                record_codec=committed is not None and committed.get("codec") == 1,
+                counts=counts,
+            )
+        elif read == "memory":
+            return tuple(row for shard in self.manifest().shards for row in self._read_shard(shard))
+        else:
+            rows = _IndexedLines(self)
+        return tuple(rows[index] for index in range(len(rows))) if read == "memory" else rows
+
+    @cached_property
+    def arrow(self) -> ds.Dataset:
+        fs, _ = Store(self.paths[0], self.storage_options).resolve()
+        paths = [Store(url, self.storage_options).resolve()[1] for url in self.paths]
+        return ds.dataset(
+            paths,
+            filesystem=_arrow_filesystem(fs),
+            format="ipc" if self.kind == "arrow" else "parquet",
+            partitioning=self.partitioning,
+        )
+
+    @cached_property
+    def fragments(self):
+        if not self.paths:
+            return ()
+        return tuple(
+            piece
+            for fragment in self.arrow.get_fragments()
+            for piece in (fragment.split_by_row_group() if self.kind == "parquet" else (fragment,))
+        )
+
+    def manifest(self) -> ShardManifest:
+        shards = []
+        if self.kind in ("parquet", "arrow"):
+            for number, fragment in enumerate(self.fragments):
+                rows = None if self.where is not None else _fragment_rows(fragment)
+                shards.append(Shard(f"{fragment.path}:{number}", fragment.path, number, number + 1, rows))
+        elif self.kind == "array_record":
+            shards.extend(Shard(url, url) for url in self.paths)
+        else:
+            for url in self.paths:
+                size = integer(self._header(url)["size"], "file bytes")
+                if infer_compression(url.lower()) is not None:
+                    # Compressed bytes cannot be cut at logical record offsets.
+                    shards.append(Shard(f"{url}:0", url))
+                    continue
+                step = self.shard_bytes if self.kind in ("jsonl", "text") else max(size, 1)
+                if step < 1:
+                    raise ValueError("file shard_bytes must be positive")
+                shards.extend(
+                    Shard(f"{url}:{start}", url, start, min(start + step, size))
+                    for start in range(0, size, step)
+                )
+        return ShardManifest(tuple(shards), self._read_shard)
+
+    def _read_shard(self, shard: Shard) -> grain.IterDataset:
+        if self.kind in ("parquet", "arrow"):
+            return grain.MapDataset.source(_ArrowFragment(self, shard.start)).to_iter_dataset()
+        if self.kind == "array_record":
+            from .records import ArrayRecords
+
+            return grain.MapDataset.source(
+                ArrayRecords(
+                    (shard.uri,),
+                    self.storage_options,
+                    record_codec=self.committed is not None and self.committed.get("codec") == 1,
+                )
+            ).to_iter_dataset()
+        if self.kind == "webdataset":
+            from .webdataset import TarRows
+
+            return TarRows(shard.uri, self.storage_options)
+        if self.kind == "files":
+            return grain.MapDataset.source(_Paths((shard.uri,))).to_iter_dataset()
+        return _Lines(self, shard)
+
+    def locality(self) -> tuple[tuple[int, ...], bool]:
+        remote = False
+        for url in self.paths:
+            fs, _ = Store(url, self.storage_options).resolve()
+            protocols = (fs.protocol,) if isinstance(fs.protocol, str) else fs.protocol
+            remote |= "file" not in protocols and "memory" not in protocols
+        if self.kind in ("parquet", "arrow") and self.where is None:
+            return tuple(_fragment_rows(fragment) for fragment in self.fragments), remote
+        if self.kind in ("jsonl", "text", "csv") and self.supports("indexed"):
+            indexed = _IndexedLines(self)
+            if self.index is None:
+                return tuple(len(table) for table in indexed.tables), remote
+            shards = indexed.tables[0]["shard"]
+            boundaries = [bisect.bisect_left(shards, shard) for shard in range(len(self.paths) + 1)]
+            return tuple(right - left for left, right in itertools.pairwise(boundaries)), remote
+        if self.kind == "array_record" and self.committed is not None:
+            return self._declared_rows() or (), remote
+        if self.kind == "files":
+            return tuple(1 for _ in self.paths), remote
+        return (), remote
+
+    def _declared_rows(self) -> tuple[int, ...] | None:
+        if self.committed is None:
+            return None
+        entries = self.committed["files"]
+        if not isinstance(entries, list):
+            raise ValueError("export manifest files must be a list")
+        return tuple(integer(record(entry, "export file")["rows"], "export shard rows") for entry in entries)
+
+    def order_fingerprints(self) -> Mapping[str, str]:
+        if self.kind not in ("jsonl", "text", "csv"):
+            return {}
+        if "index_headers" not in self.__dict__ and not self.supports("indexed"):
+            return {}
+        indexes = set(self._indexes)
+        headers = [metadata for url, metadata in self._file_facts if url in indexes]
+        return {"row_index": hashlib.sha256(json.dumps(headers, sort_keys=True).encode()).hexdigest()}
+
+    def metadata(self) -> Mapping[str, object]:
+        return self._metadata
+
+    @cached_property
+    def _metadata(self) -> Mapping[str, object]:
+        if self.committed is not None:
+            metadata = self.committed.get("metadata", {})
+            if not isinstance(metadata, Mapping):
+                raise ValueError("export metadata must be a mapping")
+            return {**metadata, "rows": self.committed["rows"], "format": self.committed["format"]}
+        if self.kind in ("parquet", "arrow"):
+            schema = self.arrow.schema.metadata or {}
+            details = json.loads(schema[b"huggingface"]) if b"huggingface" in schema else {}
+            features = details.get("info", {}).get("features", {})
+            names = {
+                name: tuple(feature["names"])
+                for name, feature in features.items()
+                if isinstance(feature, Mapping) and feature.get("_type") == "ClassLabel"
+            }
+            counts = (
+                {"rows": sum(_fragment_rows(fragment) for fragment in self.fragments)}
+                if self.where is None
+                else {}
+            )
+            return {"class_names": names, **counts}
+        if self.kind in ("jsonl", "text", "csv") and self.supports("indexed"):
+            return {"rows": len(_IndexedLines(self))}
+        if self.kind == "files":
+            return {"rows": len(self.paths)}
+        return {}
+
+    def lengths(self) -> np.ndarray | None:
+        if self.kind in ("parquet", "arrow") and "length" in self.arrow.schema.names:
+            return self.arrow.to_table(columns=["length"])["length"].to_numpy()
+        if self.index:
+            with io.BytesIO(Store(self.index, self.storage_options).read()) as file:
+                index = np.load(file, allow_pickle=False)
+                if index.dtype.names and "length" in index.dtype.names:
+                    return index["length"]
+        return None
+
+
+@dataclass(frozen=True)
+class _Paths:
+    paths: Sequence[str]
+
+    def __len__(self) -> int:
+        return len(self.paths)
+
+    def __getitem__(self, index: int) -> Batch:
+        return {"path": self.paths[index]}
+
+
+@dataclass(frozen=True)
+class _ArrowFragment:
+    source: Files
+    index: int
+    lock: threading.RLock = field(default_factory=threading.RLock, compare=False, repr=False)
+
+    @property
+    def table(self) -> pa.Table:
+        with self.lock:
+            if "_table" not in self.__dict__:
+                self.__dict__["_table"] = self.source.fragments[self.index].to_table(
+                    schema=self.source.arrow.schema,
+                    columns=list(self.source.columns) if self.source.columns is not None else None,
+                    filter=self.source.where,
+                )
+            return self.__dict__["_table"]
+
+    def __len__(self) -> int:
+        return self.table.num_rows
+
+    def __getitem__(self, index: int) -> Batch:
+        return self.table.slice(index, 1).to_pylist()[0]
+
+    def __getstate__(self) -> Mapping[str, object]:
+        return {"source": self.source, "index": self.index}
+
+    def __setstate__(self, state: Mapping[str, object]) -> None:
+        self.__dict__.update(state)
+        self.__dict__["lock"] = threading.RLock()
+
+
+class _ArrowRecords:
+    def __init__(self, source: Files):
+        self.source = source
+        self.offsets = np.cumsum([0, *(_fragment_rows(fragment) for fragment in source.fragments)])
+
+    @cached_property
+    def _group(self):
+        @lru_cache(maxsize=1)
+        def opened(index: int) -> _ArrowFragment:
+            return _ArrowFragment(self.source, index)
+
+        return opened
+
+    def __getstate__(self) -> Mapping[str, object]:
+        return {key: value for key, value in self.__dict__.items() if key != "_group"}
+
+    def __len__(self) -> int:
+        return int(self.offsets[-1])
+
+    def __getitem__(self, index: int) -> Batch:
+        if not 0 <= index < len(self):
+            raise IndexError(index)
+        group = bisect.bisect_right(self.offsets, index) - 1
+        return self._group(group)[index - int(self.offsets[group])]
+
+
+class _IndexedLines:
+    def __init__(self, source: Files):
+        self.source = source
+        self.indexes = (
+            (source.index,) if source.index else tuple(source._index_url(url) for url in source.paths)
+        )
+        headers = source.__dict__.get("index_headers", {})
+        self.index_files = tuple(
+            ArrayIndex(url, source.storage_options, headers.get(url)) for url in self.indexes
+        )
+        self.tables = tuple(index.values for index in self.index_files)
+        self.offsets = np.cumsum([0, *(len(index) for index in self.tables)])
+
+    def __getstate__(self) -> Mapping[str, object]:
+        return {"source": self.source}
+
+    def __setstate__(self, state: Mapping[str, object]) -> None:
+        source = state["source"]
+        if not isinstance(source, Files):
+            raise ValueError("invalid indexed file source state")
+        self.__init__(source)
+
+    @cached_property
+    def fieldnames(self) -> tuple[tuple[str, ...], ...]:
+        headers = []
+        for url in self.source.paths:
+            fs, path = Store(url, self.source.storage_options).resolve()
+            with _open_lines(fs, path) as file:
+                headers.append(tuple(next(csv.reader(_CsvLines(file)))))
+        return tuple(headers)
+
+    def __len__(self) -> int:
+        return int(self.offsets[-1])
+
+    def __getitem__(self, index: int) -> Batch:
+        if not 0 <= index < len(self):
+            raise IndexError(index)
+        group = bisect.bisect_right(self.offsets, index) - 1
+        entry = self.tables[group][index - int(self.offsets[group])]
+        shard = int(entry["shard"]) if self.source.index else group
+        fs, path = Store(self.source.paths[shard], self.source.storage_options).resolve()
+        names = self.fieldnames[shard] if self.source.kind == "csv" else None
+        offset = int(entry["offset"])
+        compression = infer_compression(path.lower())
+        if compression is not None:
+            with _open_lines(fs, path) as file:
+                _seek_lines(file, offset)
+                payload = file.read(int(entry["bytes"]))
+        else:
+            payload = fs.cat_file(path, start=offset, end=offset + int(entry["bytes"]))
+        if names is not None:
+            return next(csv.DictReader(io.StringIO(payload.decode()), fieldnames=names))
+        return json.loads(payload) if self.source.kind == "jsonl" else {"text": payload.decode()}
+
+
+class _CsvLines(Iterator[str]):
+    def __init__(self, file: BinaryIO):
+        csv.field_size_limit(2**31 - 1)
+        self.file = file
+
+    def __next__(self) -> str:
+        line = self.file.readline()
+        if not line:
+            raise StopIteration
+        return line.decode()
+
+
+class _Lines(grain.IterDataset):
+    def __init__(self, source: Files, shard: Shard):
+        super().__init__()
+        self.source = source
+        self.shard = shard
+
+    def __iter__(self) -> grain.DatasetIterator:
+        return _LineIterator(self.source, self.shard)
+
+
+class _LineIterator(grain.DatasetIterator):
+    # Whether `file` is open: an iterator whose opening failed has nothing to close.
+    _opened = False
+
+    def __init__(self, source: Files, shard: Shard):
+        super().__init__()
+        self.source, self.shard = source, shard
+        self.fs, self.path = Store(shard.uri, source.storage_options).resolve()
+        self.compression = infer_compression(self.path.lower())
+        self.file = _open_lines(self.fs, self.path)
+        self._opened = True
+        self.csv = csv.DictReader(_CsvLines(self.file)) if source.kind == "csv" else None
+        if self.csv is not None:
+            _ = self.csv.fieldnames
+        elif shard.start:
+            self.file.seek(shard.start - 1)
+            if self.file.read(1) != b"\n":
+                self.file.readline()
+
+    def __next__(self) -> Batch:
+        if self.shard.stop is not None and self.file.tell() >= self.shard.stop:
+            raise StopIteration
+        if self.csv is not None:
+            return next(self.csv)
+        while True:
+            line = self.file.readline()
+            if not line:
+                raise StopIteration
+            if self.source.kind == "text":
+                return {"text": line.decode()}
+            if line.strip():
+                return json.loads(line)
+            if self.shard.stop is not None and self.file.tell() >= self.shard.stop:
+                raise StopIteration
+
+    def get_state(self) -> dict[str, int]:
+        return {"offset": self.file.tell()}
+
+    def set_state(self, state: Mapping[str, object]) -> None:
+        offset = state["offset"]
+        if not isinstance(offset, int) or offset < self.shard.start:
+            raise ValueError(f"invalid file reader position for {self.shard.id}")
+        if self.compression is not None:
+            # Zstandard streams seek forward only; restoration starts from a fresh decoder.
+            self.file.close()
+            self.file = _open_lines(self.fs, self.path)
+            if self.csv is not None:
+                self.csv = csv.DictReader(_CsvLines(self.file), fieldnames=self.csv.fieldnames)
+        _seek_lines(self.file, offset)
+
+    def close(self) -> None:
+        if self._opened:
+            self.file.close()

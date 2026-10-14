@@ -13,6 +13,7 @@ An `Objective` defines what a run learns. It creates the variables, computes the
 | `ema` | No | An `EMASpec`, or `None` for no moving average |
 | `optimizer(tx, *, accumulation)` | No | The optimizer the trainer steps `params` with; `tx` by default |
 | `averages(update)` | No | Whether an update moves the EMA; every update by default |
+| `program(name, function, *, static_argnames=())` | No; you call it | `function` jitted as the objective's program `name`, compiled again when the trainer replaces its modules |
 
 You pass `Trainer` an instance of the objective. A configuration file or a saved run names it by its import path and the constructor arguments it states (`ObjectiveConfig`).
 
@@ -151,7 +152,7 @@ import optax
 from flax import linen as nn
 
 from dew import Trainer
-from dew.data import Dataset
+from dew.data.dataset import Loader
 from dew.objectives.base import Aux, Objective
 
 
@@ -181,7 +182,7 @@ class StatefulRegression(Objective):
 
 x = np.arange(32, dtype=np.float32).reshape(8, 4)
 batch = {"x": x, "y": x.mean(axis=1, keepdims=True)}
-data = Dataset(train=lambda partition: itertools.repeat(batch), val=None, records=8, batch=8)
+data = Loader(train=lambda partition: itertools.repeat(batch), val=None, records=8, batch=8)
 objective = StatefulRegression()
 trainer = Trainer(objective, optax.sgd(0.001), key=jax.random.key(0))
 state = trainer.fit(data, steps=3, log_every=1)

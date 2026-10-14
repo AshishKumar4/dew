@@ -11,8 +11,10 @@ Local resume combines Dew's run and data-position policies; Orbax oracles the st
 
 import contextlib
 import dataclasses
+import itertools
 import json
 import os
+import signal
 import subprocess
 import sys
 from pathlib import Path
@@ -23,7 +25,7 @@ import numpy as np
 import optax
 import orbax.checkpoint as ocp
 import pytest
-from affine_run import BATCH, FEATURES, Counting, Data, Features, Regression, Spread, raw_leaf, val_batches
+from affine_run import BATCH, FEATURES, Counting, Features, Regression, Spread, dataset, raw_leaf, val_batches
 from recording import RecordingTracker
 from steady_state import steady_state
 
@@ -31,10 +33,12 @@ from dew import position
 from dew.artifacts import Representations
 from dew.checkpoints import Ranking
 from dew.config import OptimConfig
-from dew.data import DataPartition
+from dew.config.data import loader
+from dew.data.dataset import DataPartition, Loader, replayed
 from dew.objectives.base import Aux, EMASpec, Objective, merge, under
 from dew.training import Checkpoints, Layout, MeshSpec, Trainer, TrainState, ema_update
 from dew.training.optim import Cosine, Power
+from dew.training.runtime import Preempted
 from dew.training.state import CHECKPOINTED
 
 
@@ -73,7 +77,7 @@ class TokenRegression(Regression):
 def test_a_real_token_budget_counts_each_microbatch_without_padding(log_every, accumulation):
     tracker = RecordingTracker()
     trainer = make_trainer(objective=TokenRegression(), tracker=tracker, accumulation=accumulation)
-    state = trainer.fit(Data(), total_tokens=30, log_every=log_every)
+    state = trainer.fit(dataset(), tokens=30, log_every=log_every)
     assert int(state.step) == 3  # Eight rows of lengths 1, 2, 3 cross 30 at 48.
     if log_every == 1:
         assert [scalars["train/tokens"] for _, scalars in tracker.scalars if "train/tokens" in scalars] == [
@@ -81,7 +85,7 @@ def test_a_real_token_budget_counts_each_microbatch_without_padding(log_every, a
 
 
 def test_a_token_budget_and_step_cap_stop_at_the_first_reached():
-    state = make_trainer(objective=TokenRegression()).fit(Data(), steps=2, total_tokens=30)
+    state = make_trainer(objective=TokenRegression()).fit(dataset(), steps=2, tokens=30)
     assert int(state.step) == 2
 
 
@@ -89,34 +93,34 @@ def test_a_token_budget_and_step_cap_stop_at_the_first_reached():
                                        Cosine(peak=.1, warmup_steps=1, decay_steps=8)])
 def test_a_token_only_run_uses_the_schedules_own_horizon(schedule):
     config = OptimConfig(schedule=schedule)
-    state = make_trainer(objective=TokenRegression(), optimizer=config).fit(Data(), total_tokens=30)
+    state = make_trainer(objective=TokenRegression(), optimizer=config).fit(dataset(), tokens=30)
     assert int(state.step) == 3
 
 
 def test_a_token_budget_resumes_its_count_from_the_checkpoint(tmp_path):
     first = make_trainer(tmp_path, objective=TokenRegression())
-    assert int(first.fit(Data(), steps=2, total_tokens=30, log_every=1).step) == 2
+    assert int(first.fit(dataset(), steps=2, tokens=30, log_every=1).step) == 2
     assert first.checkpoints.control(2)["tokens"] == 24
     resumed = make_trainer(tmp_path, objective=TokenRegression())
-    assert int(resumed.fit(Data(), total_tokens=30, log_every=1).step) == 3
+    assert int(resumed.fit(dataset(), tokens=30, log_every=1).step) == 3
     assert resumed.checkpoints.control(3)["tokens"] == 48
     complete = make_trainer(tmp_path, objective=TokenRegression())
-    assert int(complete.fit(Data(), total_tokens=30).step) == 3
+    assert int(complete.fit(dataset(), tokens=30).step) == 3
 
 
 def test_an_explicit_state_starts_a_token_count_with_its_own_reader(tmp_path):
-    make_trainer(tmp_path, objective=TokenRegression()).fit(Data(), steps=2, total_tokens=30)
+    make_trainer(tmp_path, objective=TokenRegression()).fit(dataset(), steps=2, tokens=30)
     trainer = make_trainer(tmp_path, objective=TokenRegression())
     state = trainer.initial_state()
-    assert int(trainer.fit(Data(), total_tokens=30, state=state).step) == 3
+    assert int(trainer.fit(dataset(), tokens=30, state=state).step) == 3
 
 
 def test_a_step_only_prefix_keeps_lifetime_real_tokens(tmp_path):
     first = make_trainer(tmp_path, objective=TokenRegression())
-    first.fit(Data(), steps=2, log_every=1)
+    first.fit(dataset(), steps=2, log_every=1)
     assert first.checkpoints.control(2)["tokens"] == 24
     resumed = make_trainer(tmp_path, objective=TokenRegression())
-    assert int(resumed.fit(Data(), total_tokens=30, log_every=1).step) == 3
+    assert int(resumed.fit(dataset(), tokens=30, log_every=1).step) == 3
 
 
 class LargeTokenRegression(Regression):
@@ -137,17 +141,18 @@ class LargeTokenRows(Counting):
 @pytest.mark.parametrize("cadence", [1, 100])
 def test_a_token_budget_stays_exact_above_float32_integer_resolution(cadence):
     trainer = make_trainer(objective=LargeTokenRegression())
-    state = trainer.fit(Data(LargeTokenRows), total_tokens=65 * 262143 + 1, log_every=cadence)
+    state = trainer.fit(dataset(LargeTokenRows), tokens=65 * 262143 + 1, log_every=cadence)
     assert int(state.step) == 66
 
 
 @pytest.mark.parametrize("cadence", [1, 100])
 def test_resumed_tokens_stay_exact_above_float32_integer_resolution(tmp_path, cadence):
     first = make_trainer(tmp_path, objective=LargeTokenRegression())
-    first.fit(Data(LargeTokenRows), steps=65, log_every=cadence)
+    first.fit(dataset(LargeTokenRows), steps=65, log_every=cadence)
     assert first.checkpoints.control(65)["tokens"] == 65 * 262143
     resumed = make_trainer(tmp_path, objective=LargeTokenRegression())
-    assert int(resumed.fit(Data(LargeTokenRows), total_tokens=65 * 262143 + 1, log_every=cadence).step) == 66
+    state = resumed.fit(dataset(LargeTokenRows), tokens=65 * 262143 + 1, log_every=cadence)
+    assert int(state.step) == 66
 
 
 @pytest.mark.parametrize("variant", ["ema", "accumulation", "schedule", "dynamic_scale", "checkpoints"])
@@ -175,7 +180,7 @@ def test_steps_after_the_first_logs_neither_compile_nor_move_data_unasked(varian
     tracker = Steady()
     try:
         make_trainer(tracker=tracker, **options).fit(
-            Data(), steps=24, log_every=4, checkpoint_every=4 if variant == "checkpoints" else None)
+            dataset(), steps=24, log_every=4, checkpoint_every=4 if variant == "checkpoints" else None)
     finally:
         window.close()
     assert [step for step, scalars in tracker.scalars if "train/loss" in scalars] == [4, 8, 12, 16, 20, 24]
@@ -184,8 +189,8 @@ def test_steps_after_the_first_logs_neither_compile_nor_move_data_unasked(varian
 def test_integer_root_key_matches_a_typed_key_bit_exactly():
     integer = Trainer(Regression(), optax.adam(1e-3), key=0)
     typed = Trainer(Regression(), optax.adam(1e-3), key=jax.random.key(0))
-    left = integer.fit(Data(), steps=3, log_every=1)
-    right = typed.fit(Data(), steps=3, log_every=1)
+    left = integer.fit(dataset(), steps=3, log_every=1)
+    right = typed.fit(dataset(), steps=3, log_every=1)
     assert jax.tree.structure(left) == jax.tree.structure(right)
     for actual, expected in zip(jax.tree.leaves(left), jax.tree.leaves(right), strict=True):
         np.testing.assert_array_equal(np.asarray(raw_leaf(actual)), np.asarray(raw_leaf(expected)))
@@ -196,9 +201,9 @@ def test_typed_root_key_round_trips_and_resumes_bit_exactly(tmp_path):
         return Trainer(Regression(), optax.adam(1e-3), key=0,
                        checkpoints=None if path is None else Checkpoints(str(path)))
 
-    baseline = build().fit(Data(), steps=4, log_every=1)
+    baseline = build().fit(dataset(), steps=4, log_every=1)
     split = build(tmp_path / "typed")
-    prefix = split.fit(Data(), steps=2, checkpoint_every=1, log_every=1)
+    prefix = split.fit(dataset(), steps=2, checkpoint_every=1, log_every=1)
     assert jnp.issubdtype(prefix.key.dtype, jax.dtypes.prng_key)
     fresh = build(tmp_path / "typed")
     restored, _, position = fresh.place()
@@ -210,7 +215,7 @@ def test_typed_root_key_round_trips_and_resumes_bit_exactly(tmp_path):
             np.testing.assert_array_equal(np.asarray(before), np.asarray(after), err_msg=field)
     assert json.loads(position)["index"] == 2
     np.testing.assert_array_equal(jax.random.key_data(restored.key), jax.random.key_data(prefix.key))
-    resumed = fresh.fit(Data(), steps=4, checkpoint_every=1, log_every=1)
+    resumed = fresh.fit(dataset(), steps=4, checkpoint_every=1, log_every=1)
     assert int(resumed.step) == 4 and fresh.checkpoints.latest == 4
     assert (tmp_path / "typed" / "4").is_dir()
     assert not (tmp_path / "typed" / "0").exists()
@@ -240,13 +245,99 @@ def test_a_resumed_run_continues_the_key_stream(tmp_path):
     its keys, or restored the step but not the run key, lands where the
     uninterrupted run does not.
     """
-    make_trainer(tmp_path, objective=Keyed()).fit(Data(), steps=2, log_every=1)
-    resumed = make_trainer(tmp_path, objective=Keyed()).fit(Data(), steps=4, log_every=1)
-    whole = make_trainer(objective=Keyed()).fit(Data(), steps=4, log_every=1)
+    make_trainer(tmp_path, objective=Keyed()).fit(dataset(), steps=2, log_every=1)
+    resumed = make_trainer(tmp_path, objective=Keyed()).fit(dataset(), steps=4, log_every=1)
+    whole = make_trainer(objective=Keyed()).fit(dataset(), steps=4, log_every=1)
 
     for expected, actual in zip(jax.tree.leaves(whole.variables),
                                 jax.tree.leaves(resumed.variables), strict=True):
         np.testing.assert_allclose(np.asarray(expected), np.asarray(actual), rtol=1e-6)
+
+
+def drawn(seed=0, opened=None, diverge=None):
+    """A plain generator, without a position of its own: each batch drawn
+    from `seed`'s stream, or from fresh entropy with `seed=None`. With
+    `opened` (a list counting the generator's openings) and `diverge`, the
+    batches past index `diverge` differ on each opening."""
+    if opened is not None:
+        opened.append(None)
+    rng = np.random.default_rng(seed)
+    for index in itertools.count():
+        if diverge is not None and index == diverge + 1:
+            rng = np.random.default_rng([seed, len(opened)])
+        x = rng.normal(size=(BATCH, FEATURES)).astype(np.float32)
+        yield {"x": x, "y": 2 * x[:, :2]}
+
+
+def stream(reader):
+    return Loader(reader, None, batch=BATCH, records=None)
+
+
+class Preempting(RecordingTracker):
+    """Sends this process the scheduler's SIGTERM, once, when step `at` is
+    logged. The loop reads a step's log once the next step is dispatched, so
+    the notice stops the run after step `at` + 1."""
+
+    def __init__(self, at):
+        super().__init__()
+        self.at = at
+
+    def log(self, scalars, step):
+        super().log(scalars, step)
+        if step == self.at:
+            self.at = None
+            os.kill(os.getpid(), signal.SIGTERM)
+
+
+def preempted_and_resumed(tmp_path, data, at=3, steps=6):
+    """`data` trained to `steps`, preempted when step `at` is logged, and resumed in a fresh trainer."""
+    with pytest.raises(Preempted):
+        make_trainer(tmp_path, tracker=Preempting(at)).fit(data, steps=steps, log_every=1)
+    return make_trainer(tmp_path).fit(data, steps=steps, log_every=1)
+
+
+def same_variables(left, right) -> bool:
+    return all(np.array_equal(a, b) for a, b in zip(
+        jax.tree.leaves(jax.device_get(left.variables)), jax.tree.leaves(jax.device_get(right.variables)),
+        strict=True))
+
+
+def test_a_generator_declared_to_replay_resumes_on_the_batches_the_whole_run_reads(tmp_path):
+    """A generator declared to read the same batches each time it opens is
+    positioned by replay: preempted at step 3 and resumed, it reads its first
+    three batches again and trains on the rest, landing on the uninterrupted
+    run bit for bit."""
+    data = stream(replayed(lambda partition: drawn()))
+    resumed = preempted_and_resumed(tmp_path, data)
+    assert int(resumed.step) == 6
+    assert same_variables(resumed, make_trainer().fit(data, steps=6, log_every=1))
+
+
+def test_an_undeclared_generator_trains_and_its_resume_is_refused(tmp_path):
+    """A plain generator trains and checkpoints, but its checkpoint holds no
+    position, so a resume, which would read its data again from the start,
+    is refused by name."""
+    with pytest.raises(ValueError, match="holds no data position"):
+        preempted_and_resumed(tmp_path, stream(lambda partition: drawn()))
+
+
+def test_a_declared_stream_whose_batch_at_the_position_differs_is_refused(tmp_path):
+    """The replay guard: a stream declared to replay that reads back another
+    batch at its position, one over fresh entropy, is refused."""
+    with pytest.raises(ValueError, match="does not replay deterministically"):
+        preempted_and_resumed(tmp_path, stream(replayed(lambda partition: drawn(None))))
+
+
+def test_the_replay_guard_reads_only_the_batch_at_the_position(tmp_path):
+    """The guard's limit: a declared stream that agrees up to its position,
+    the four batches before the preemption, and differs after it resumes
+    without complaint, on other data than the uninterrupted run read, which
+    is why replay is declared, not assumed."""
+    opened = []
+    data = stream(replayed(lambda partition: drawn(0, opened, diverge=3)))
+    resumed = preempted_and_resumed(tmp_path, data)
+    assert int(resumed.step) == 6
+    assert not same_variables(resumed, make_trainer().fit(data, steps=6, log_every=1))
 
 
 # --------------------------------------------------------------------------
@@ -256,7 +347,7 @@ def test_a_resumed_run_continues_the_key_stream(tmp_path):
 @pytest.mark.parametrize("cadence, steps, expected", [(None, 5, set()), (2, 5, {2, 4}), (2, 6, {2, 4, 6})])
 def test_final_checkpoint_policy_is_independent_of_the_cadence(tmp_path, cadence, steps, expected):
     trainer = make_trainer(tmp_path, keep=4)
-    trainer.fit(Data(), steps=steps, checkpoint_every=cadence, checkpoint_final=False)
+    trainer.fit(dataset(), steps=steps, checkpoint_every=cadence, checkpoint_final=False)
     assert set(trainer.checkpoints._open().all_steps()) == expected
 
 
@@ -302,7 +393,7 @@ def test_native_frozen_variables_train_save_and_resume_as_plain_ones(tmp_path):
         np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
     regression = make_trainer(objective=Regression())
     supplied = regression.initial_state()
-    assert int(regression.fit(Data(), steps=1, state=supplied.replace(
+    assert int(regression.fit(dataset(), steps=1, state=supplied.replace(
         variables=FrozenDict(supplied.variables))).step) == 1
 
 
@@ -347,7 +438,8 @@ def test_a_runs_checkpoint_opens_with_orbax_alone(tmp_path):
 
 
 def test_overlapping_token_windows_resume_in_a_fresh_trainer_bit_exactly(tmp_path):
-    from dew.data import Loading, TokenWindows
+    from dew.config.data import TextData
+    from dew.data import Loading
     from dew.data.dataset import Forwarding
 
     tokens = np.arange(29, dtype=np.uint16)
@@ -378,8 +470,8 @@ def test_overlapping_token_windows_resume_in_a_fresh_trainer_bit_exactly(tmp_pat
             self._source.set_state(state)
 
     def dataset(seen):
-        data = TokenWindows(path=str(tmp_path), seq_len=4, stride=1, seed=7,
-                            loading=Loading(workers=0, threads=1, read_buffer=1)).load(batch=BATCH)
+        data = loader(TextData(source=str(tmp_path), seq_len=4, stride=1), batch=BATCH, read="memory", seed=7,
+            loading=Loading(workers=0, threads=1, read_buffer=1), validation_records=4 * (BATCH))
         return dataclasses.replace(data, train=lambda partition: Observed(data.train(partition), seen))
 
     def trainer(directory):
@@ -423,7 +515,8 @@ def test_a_cuda_lm_repeats_and_resumes_bit_exactly_with_deterministic_ops(tmp_pa
     before the backend opens. Check every state leaf, not just parameters.
     bf16 at the default precision runs the head that rounds its logits and
     their gradient to bf16, and resumes bit-exactly too."""
-    from dew.data import Loading, TokenWindows
+    from dew.config.data import TextData
+    from dew.data import Loading
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.objectives.lm import LMObjective
 
@@ -434,8 +527,8 @@ def test_a_cuda_lm_repeats_and_resumes_bit_exactly_with_deterministic_ops(tmp_pa
         "tokenizer": "symbols", "vocab_size": 8, "dtype": "uint8",
         "train_tokens": len(tokens), "val_tokens": 128, "eos_id": None,
     }))
-    data = TokenWindows(path=str(tmp_path), seq_len=16,
-                        loading=Loading(workers=0)).load(batch=8)
+    data = loader(TextData(source=str(tmp_path), seq_len=16), batch=8, read="memory",
+        loading=Loading(workers=0), validation_records=4 * (8))
     model = CausalTransformer(vocab_size=8, emb_features=16, num_layers=1,
                               num_heads=2, mlp_features=32, max_seq_len=32, dtype=dtype)
     objective = LMObjective(model, seq_len=16, ema_decay=None)
@@ -514,6 +607,80 @@ def test_two_processes_train_a_conv_model_to_the_bit_under_the_repeatable_flags(
         np.testing.assert_array_equal(runs[0][name], runs[1][name])
 
 
+RATE_RESUMES = """
+import json
+import shutil
+import sys
+
+import jax
+import numpy as np
+from affine_run import Regression, dataset
+from recording import RecordingTracker
+
+from dew.cache import enable_compilation_cache
+from dew.config import OptimConfig
+from dew.telemetry.instrumentation import compilation_cache_counts
+from dew.training import Checkpoints, Layout, Trainer
+from dew.training.optim import Cosine, ParamGroup
+
+root, grouped = sys.argv[1], sys.argv[2] == "grouped"
+enable_compilation_cache(root + "/cache")
+
+
+def fit(peak, steps, path):
+    groups = (ParamGroup("kernel", ("*kernel",), learning_rate_multiplier=0.5), ParamGroup("rest", ("*",)))
+    config = OptimConfig(schedule=Cosine(peak=peak, warmup_steps=1, decay_steps=8),
+                         param_groups=groups if grouped else ())
+    sink = RecordingTracker()
+    trainer = Trainer(Regression(), config, key=jax.random.key(0), layout=Layout(min_shard=1, tolerance=1.0),
+                      checkpoints=Checkpoints(path), tracker=sink)
+    before = compilation_cache_counts()
+    state = trainer.fit(dataset(), steps=steps, checkpoint_every=2, log_every=1)
+    after = compilation_cache_counts()
+    return {"params": [np.asarray(leaf).tolist() for leaf in jax.tree.leaves(state.variables["params"])],
+            "rates": {step: row["train/learning_rate"] for step, row in sink.scalars
+                      if "train/learning_rate" in row},
+            **{name: after.get(f"train/cache_{name}", 0) - before.get(f"train/cache_{name}", 0)
+               for name in ("hits", "misses")}}
+
+
+runs = {"first": fit(1e-3, 2, root + "/run")}
+for name, peak in (("slow", 4e-3), ("fast", 8e-3)):
+    shutil.copytree(root + "/run", f"{root}/{name}")
+    runs[name] = fit(peak, 3, f"{root}/{name}")
+print(json.dumps(runs))
+"""
+
+
+@pytest.mark.parametrize("grouped", [False, True], ids=["one", "groups"])
+def test_a_run_resumed_at_another_rate_steps_at_it_on_the_compiled_step(tmp_path, grouped):
+    """A run trained at one peak rate, resumed from its checkpoint at a
+    second and then a third: each resumed step moves the parameters by its
+    configured rate, not the checkpoint's, and the third compiles nothing:
+    the rate is an operand of the optimizer's state, so the step it runs is
+    the executable the persistent cache holds. The second resume pays for the
+    restore's own programs, which the first run never compiled. In a fresh
+    process, with a cache of its own."""
+    root = Path(__file__).resolve().parents[1]
+    environment = {**os.environ, "PYTHONPATH": os.pathsep.join([str(root / "src"), str(root / "tests")])}
+    done = subprocess.run(
+        [sys.executable, "-c", RATE_RESUMES, str(tmp_path), "grouped" if grouped else "one"],
+        env=environment, capture_output=True, text=True, timeout=600)
+    assert done.returncode == 0, done.stderr[-3000:]
+    runs = json.loads(done.stdout.splitlines()[-1])
+    assert runs["fast"]["misses"] == 0 and runs["fast"]["hits"] >= 1
+    for start, slow, fast in zip(*(runs[name]["params"] for name in ("first", "slow", "fast")), strict=True):
+        start, slow, fast = (np.asarray(leaf, np.float32) for leaf in (start, slow, fast))
+        assert np.all(slow != start)
+        # Each step's parameters round to float32, so the moves differ by up to their spacing.
+        np.testing.assert_allclose(fast - start, 2 * (slow - start), rtol=1e-5,
+                                   atol=2 * np.spacing(np.abs(start).max()))
+    if not grouped:
+        for name, peak in (("slow", 4e-3), ("fast", 8e-3)):
+            schedule = optax.warmup_cosine_decay_schedule(0.0, peak, 1, 8)
+            assert runs[name]["rates"]["3"] == pytest.approx(float(schedule(2)))
+
+
 def test_the_compiled_step_consumes_the_state_it_is_given():
     """`new = step(old, batch)` runs the update in place: the old state's
     buffers move into the new one, so peak memory holds one copy of the
@@ -533,7 +700,7 @@ def test_the_compiled_step_consumes_the_state_it_is_given():
 
 def test_restore_preserves_the_optimizer_state_the_ema_and_the_key(tmp_path):
     trainer = make_trainer(tmp_path, optimizer=optax.adam(1e-3))
-    trained = trainer.fit(Data(), steps=3, log_every=1)
+    trained = trainer.fit(dataset(), steps=3, log_every=1)
 
     resumed = make_trainer(tmp_path, optimizer=optax.adam(1e-3))
     state, _, position = resumed.place()
@@ -566,7 +733,7 @@ def test_a_global_position_is_read_by_any_process_count(tmp_path):
     process's position as well. Only a shard offset ties a resume to the
     count that wrote it."""
     trainer = make_trainer(tmp_path)
-    trainer.fit(Data(), steps=1, log_every=1)
+    trainer.fit(dataset(), steps=1, log_every=1)
     global_position = position.encode(position.Global(records=16, order="Counting"))
     _rewrite_position(trainer, 2, [global_position, global_position], shares=[[0, 2], [1, 2]])
 
@@ -714,7 +881,7 @@ def local_trainer(tmp_path, **kwargs):
 
 def test_terminal_local_cadence_does_not_need_a_final_persistent_save(tmp_path):
     trainer = local_trainer(tmp_path)
-    trainer.fit(Data(), steps=2, checkpoint_final=False)
+    trainer.fit(dataset(), steps=2, checkpoint_final=False)
     restored, _, _ = local_trainer(tmp_path).place()
     assert int(restored.step) == 2
     assert not os.path.exists(tmp_path / "run" / "2")
@@ -726,7 +893,7 @@ def test_the_local_checkpoint_is_written_on_its_own_cadence_and_keeps_the_newest
     local one holds 8 alone (2, 4 and 6 replaced), and the persistent directory holds nothing of the
     local cadence."""
     trainer = local_trainer(tmp_path)
-    trainer.fit(Data(), steps=8, log_every=1, checkpoint_every=3)
+    trainer.fit(dataset(), steps=8, log_every=1, checkpoint_every=3)
     checkpoints = trainer.checkpoints
 
     assert sorted(checkpoints._open().all_steps()) == [3, 6, 8]
@@ -764,7 +931,7 @@ def test_a_checkpoint_that_does_not_land_fails_the_run(tmp_path):
     trainer = make_trainer(tmp_path)
     trainer.checkpoints._manager = ExplodingManager()
     with pytest.raises(OSError):
-        trainer.fit(Data(), steps=1, log_every=1)
+        trainer.fit(dataset(), steps=1, log_every=1)
 
 
 # --------------------------------------------------------------------------
@@ -776,7 +943,7 @@ def test_eval_every_scores_the_validation_split_and_logs_the_artifacts():
     tracker = RecordingTracker()
     objective = Features()
     trainer = make_trainer(objective=objective, tracker=tracker)
-    state = trainer.fit(Data(val=val_batches(3)), steps=4, log_every=2, eval_every=2,
+    state = trainer.fit(dataset(val=val_batches(3)), steps=4, log_every=2, eval_every=2,
                         metrics=(Spread(seen),), preview=True)
 
     # Two passes: at step 2, and at the end of the run.
@@ -799,9 +966,9 @@ def test_each_suite_is_scored_on_its_own_cadence_with_its_own_metrics():
 
     tracker = RecordingTracker()
     trainer = make_trainer(objective=Features(), tracker=tracker)
-    trainer.fit(Data(val=None), steps=6, log_every=2, eval_every=2, metrics=(Spread([]),),
-                validation={"often": Data(val=val_batches(1)).val,
-                            "rare": EvalSuite(Data(val=val_batches(2)).val, (Spread([]),), 3)})
+    trainer.fit(dataset(val=None), steps=6, log_every=2, eval_every=2, metrics=(Spread([]),),
+                validation={"often": dataset(val=val_batches(1)).val,
+                            "rare": EvalSuite(dataset(val=val_batches(2)).val, (Spread([]),), 3)})
     steps = {name: [step for step, scores in tracker.scalars if f"{name}/spread" in scores]
              for name in ("often", "rare")}
     assert steps == {"often": [2, 4, 6], "rare": [3, 6]}
@@ -812,11 +979,11 @@ def test_the_validation_split_is_the_one_suite_val():
     from dew.training import EvalSuite
 
     runs = []
-    held = Data(val=val_batches(3)).val
+    held = dataset(val=val_batches(3)).val
     for validation in (None, {"val": held}, {"val": EvalSuite(held, (Spread([]),), 3)}):
         tracker = RecordingTracker()
         make_trainer(objective=Features(), tracker=tracker).fit(
-            Data(val=val_batches(3)), steps=6, log_every=2, eval_every=3, metrics=(Spread([]),),
+            dataset(val=val_batches(3)), steps=6, log_every=2, eval_every=3, metrics=(Spread([]),),
             validation=validation)
         runs.append([(step, scores["val/spread"]) for step, scores in tracker.scalars
                      if "val/spread" in scores])
@@ -829,7 +996,7 @@ def test_the_validation_split_is_the_one_suite_val():
 
 def test_the_log_tick_carries_the_loss_the_objective_metrics_and_the_throughput():
     tracker = RecordingTracker()
-    make_trainer(tracker=tracker).fit(Data(endless), steps=4, log_every=2)
+    make_trainer(tracker=tracker).fit(dataset(endless), steps=4, log_every=2)
 
     ticks = [(step, scalars) for step, scalars in tracker.scalars if "train/loss" in scalars]
     assert [step for step, _ in ticks] == [2, 4]
@@ -914,7 +1081,7 @@ class Counted(Objective):
 
 def test_aux_variables_are_written_back_into_the_state_and_checkpointed(tmp_path):
     trainer = make_trainer(tmp_path, objective=Counted(), optimizer=optax.adamw(1e-2, weight_decay=1.0))
-    state = trainer.fit(Data(), steps=3, log_every=1)
+    state = trainer.fit(dataset(), steps=3, log_every=1)
     assert float(state.variables["stats"]["seen"]) == 3.0
     assert set(state.opt_state[0].mu) == {"w"}
 
@@ -944,7 +1111,7 @@ class TwoTrees(Objective):
 def test_the_ema_stores_only_the_selected_subtree_and_merges_over_the_rest():
     objective = TwoTrees(EMASpec(decay=optax.constant_schedule(0.5),
                                  select=under("params", "tracked")))
-    state = make_trainer(objective=objective).fit(Data(endless), steps=2, log_every=1)
+    state = make_trainer(objective=objective).fit(dataset(endless), steps=2, log_every=1)
 
     assert set(state.ema["params"]) == {"tracked"}
     live = state.variables["params"]
@@ -1034,14 +1201,14 @@ def test_a_custom_step_alternates_two_optimizers_on_the_same_checkpoints_and_tra
                        checkpoints=Checkpoints(str(tmp_path / "gan"), keep=2),
                        tracker=tracker, step=alternating(gen, disc))
 
-    state = trainer().fit(Data(), steps=2, log_every=1)
+    state = trainer().fit(dataset(), steps=2, log_every=1)
     # Step 0 moved the generator half way to 1 (lr 0.25 on a gradient of 2(g - 1));
     # step 1 moved the discriminator half way to the generator.
     assert float(state.variables["params"]["gen"]["g"]) == pytest.approx(0.5)
     assert float(state.variables["params"]["disc"]["d"]) == pytest.approx(0.25)
     assert [s["train/player"] for _, s in tracker.scalars if "train/player" in s] == [0.0, 1.0]
 
-    resumed = trainer().fit(Data(), steps=4, log_every=1)
+    resumed = trainer().fit(dataset(), steps=4, log_every=1)
     assert float(resumed.variables["params"]["gen"]["g"]) == pytest.approx(0.75)
     assert float(resumed.variables["params"]["disc"]["d"]) == pytest.approx(0.5)
     assert Checkpoints(str(tmp_path / "gan")).latest == 4
@@ -1110,6 +1277,46 @@ def test_a_step_compiles_from_its_arrays_shapes_before_they_are_placed():
     assert int(advanced.step) == 1 and bool(finite)
 
 
+def test_a_field_no_device_holds_stays_on_the_host_for_the_code_that_reads_it():
+    """A batch may carry a field no device holds, a caption: the step and the
+    objective's evaluation take the rest, and a metric reads the caption on
+    the host, for the rows it scores."""
+
+    def captioned(source):
+        for batch in source:
+            yield {**batch, "caption": np.array([f"row {index}" for index in batch["index"]])}
+
+    captions = []
+
+    class Captions(Spread):
+        def __call__(self, artifact, batch):
+            captions.extend(batch["caption"].tolist())
+            return super().__call__(artifact, batch)
+
+    data = dataset(lambda: captioned(Counting()), val=lambda: captioned(val_batches(1)()))
+    state = Trainer(Features(), optax.sgd(.1), key=jax.random.key(0)).fit(
+        data, steps=2, eval_every=2, metrics=(Captions([]),), checkpoint_final=False)
+    scored = next(val_batches(1)())["index"]
+    assert int(state.step) == 2 and captions == [f"row {index}" for index in scored]
+
+
+def test_a_batch_of_other_dtypes_at_the_same_shapes_runs_a_step_compiled_for_them():
+    """The compiled step is held under the batch's whole abstract signature, its fields and
+    each leaf's dtype as well as its shape: a stream whose inputs turn half precision at the
+    same shapes runs a step compiled for them, which an executable for float32 refuses."""
+
+    class Narrowing(Counting):
+        def __next__(self):
+            batch = super().__next__()
+            return batch if self.index % 2 else {**batch, "x": batch["x"].astype(np.float16)}
+
+    tracker = RecordingTracker()
+    Trainer(Regression(), optax.sgd(.1), key=jax.random.key(0), tracker=tracker).fit(
+        dataset(Narrowing), steps=4, log_every=1, checkpoint_final=False)
+    compiles = [scalars["train/compiles"] for _, scalars in tracker.scalars if "train/compiles" in scalars]
+    assert compiles[-1] == 2
+
+
 def test_a_failing_metric_fails_the_validation_pass():
     class Broken:
         name = "broken"
@@ -1125,5 +1332,5 @@ def test_a_failing_metric_fails_the_validation_pass():
             return accumulated
 
     with pytest.raises(ZeroDivisionError):
-        make_trainer(objective=Features()).fit(Data(val=val_batches(1)), steps=1,
+        make_trainer(objective=Features()).fit(dataset(val=val_batches(1)), steps=1,
                                                log_every=1, eval_every=1, metrics=(Broken(),))

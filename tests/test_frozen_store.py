@@ -14,7 +14,8 @@ import pytest
 from etils import epath
 
 from dew.checkpoints import FROZEN_STORE, Checkpoints
-from dew.data import Dataset, Loading
+from dew.config.data import RecordsData, loader
+from dew.data import Loading
 from dew.lora import Adapter, LoRA
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.objectives.base import FROZEN, Aux, Objective, Ratio
@@ -24,9 +25,9 @@ from dew.training import Trainer
 LOADING = Loading(workers=0, threads=1, read_buffer=1)
 
 
-def model():
-    return CausalTransformer(vocab_size=16, emb_features=32, num_layers=2, num_heads=2,
-                             mlp_features=64, max_seq_len=16, dtype="float32", attention_impl="xla")
+def model(width: int = 32):
+    return CausalTransformer(vocab_size=16, emb_features=width, num_layers=2, num_heads=2,
+                             mlp_features=2 * width, max_seq_len=16, dtype="float32", attention_impl="xla")
 
 
 def size(path) -> int:
@@ -34,16 +35,18 @@ def size(path) -> int:
     return sum(entry.stat().st_size for entry in Path(str(path)).rglob("*") if entry.is_file())
 
 
-def adapted_run(directory, steps: int, *, keep: int = 3) -> tuple[Trainer, Checkpoints, object]:
+def adapted_run(directory, steps: int, *, keep: int = 3, width: int = 32
+                ) -> tuple[Trainer, Checkpoints, object]:
     """A LoRA run of `steps` steps, each checkpointed, and the state it ends with."""
-    base = model()
+    base = model(width)
     adapter = LoRA(rank=2, modules=("q_proj", "v_proj")).apply(
         base, base.init(jax.random.key(0), jnp.zeros((1, 8), jnp.int32)), key=1)
     objective = LMObjective(adapter.model, seq_len=8, ema_decay=None, variables=adapter.variables)
     rows = [{"text": (np.arange(9, dtype=np.int32) + index) % 16} for index in range(16)]
     checkpoints = Checkpoints(str(directory), keep=keep)
     trainer = Trainer(objective, optax.sgd(1.0), key=0, checkpoints=checkpoints)
-    state = trainer.fit(Dataset.from_records(rows, batch=8, loading=LOADING), steps=steps,
+    state = trainer.fit(loader(RecordsData(source=rows), batch=8, loading=LOADING, read="memory"),
+                        steps=steps,
                         checkpoint_every=1, log_every=100)
     checkpoints.wait()
     return trainer, checkpoints, state
@@ -57,7 +60,9 @@ def recorded(checkpoints: Checkpoints, step: int) -> dict:
 def test_a_lora_run_writes_its_frozen_base_once_and_each_step_holds_its_factors(tmp_path):
     """Three checkpoints of a LoRA run record one digest for the base under
     `frozen`, written once to the store, and each step holds the factors
-    alone of the variables: with Orbax's own files, under a fifth of the base."""
+    alone of the variables: a base four times as large leaves a step's
+    files within a fifth of what it adds to the store, however large
+    Orbax's own files are on the backend."""
     _, checkpoints, state = adapted_run(tmp_path / "run", 3)
     root = epath.Path(checkpoints.directory)
     store = sorted(path.name for path in (root / FROZEN_STORE).iterdir())
@@ -66,9 +71,12 @@ def test_a_lora_run_writes_its_frozen_base_once_and_each_step_holds_its_factors(
     assert [recorded(checkpoints, int(step)) for step in sorted(steps)] == [
         {"variables": {FROZEN: store[0]}}] * 3
     assert len(store) == 1
-    base = size(root / FROZEN_STORE / store[0])
-    sizes = [size(root / step) for step in steps]
-    assert all(held < base / 5 for held in sizes), (base, sizes)
+    _, wider, _ = adapted_run(tmp_path / "wider", 1, width=64)
+    wider_root = epath.Path(wider.directory)
+    [wider_store] = (wider_root / FROZEN_STORE).iterdir()
+    added = size(wider_store) - size(root / FROZEN_STORE / store[0])
+    held = size(wider_root / "1") - size(root / "1")
+    assert held < added / 5, (held, added)
     held = checkpoints.stored(3)["variables"]
     assert set(held) == {"params", FROZEN}
     written = checkpoints._open().metadata(3).item_metadata.tree["variables"]
@@ -144,7 +152,8 @@ def test_a_stored_collection_stays_while_a_kept_step_records_it_and_goes_with_th
     rows = [{"x": np.full(3, index, np.float32), "y": np.float32(index)} for index in range(8)]
     checkpoints = Checkpoints(str(tmp_path / "run"), keep=1)
     trainer = Trainer(Counting(), optax.sgd(0.01), key=0, checkpoints=checkpoints)
-    trainer.fit(Dataset.from_records(rows, batch=8, loading=LOADING), steps=4, checkpoint_every=1,
+    trainer.fit(loader(RecordsData(source=rows), batch=8, loading=LOADING, read="memory"), steps=4,
+        checkpoint_every=1,
                 log_every=100)
     checkpoints.wait()
     store = epath.Path(checkpoints.directory) / FROZEN_STORE
@@ -196,7 +205,8 @@ def test_a_collection_saved_with_x64_on_restores_with_it_off(tmp_path):
     with jax.enable_x64(new_val=True):
         checkpoints = Checkpoints(str(tmp_path / "run"))
         Trainer(Wide(), optax.sgd(0.01), key=0, checkpoints=checkpoints).fit(
-            Dataset.from_records(rows, batch=8, loading=LOADING), steps=1, checkpoint_every=1, log_every=100)
+            loader(RecordsData(source=rows), batch=8, loading=LOADING, read="memory"), steps=1,
+                checkpoint_every=1, log_every=100)
         checkpoints.wait()
         table = np.asarray(Wide().init(None)["constants"]["table"])
     assert not jax.config.jax_enable_x64

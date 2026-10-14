@@ -77,6 +77,7 @@ from dew.sampling.sample import sample
 from dew.sampling.solvers import DDIM, Consistency, Solver
 
 if TYPE_CHECKING:
+    from dew.data.pipeline import ObjectiveData
     from dew.inference.tasks import Processor
 
 # Samples a validation batch draws, conditioned or not.
@@ -239,6 +240,19 @@ class DiffusionObjective(Objective[Ratio]):
     resolved = ("solver", "guidance", "steps")
 
     counts_tokens = False
+
+    def data(self, tokenizer=None) -> ObjectiveData:
+        """Each batch's captions tokenized for the conditions, on the host, as
+        the step reads them, and the fields other conditions read (a clip's
+        sound) encoded; without text conditions, captions are dropped."""
+        from dew.data.pipeline import ObjectiveData
+        from dew.data.steps.image import EncodeCaptions, EncodeFields
+
+        conditions = self.inputs.conditions.values()
+        steps = (EncodeCaptions(self.inputs.tokenize if conditions else None),
+                 *((EncodeFields(self.inputs.encode_fields),)
+                   if any(not condition.encoder.reads_captions for condition in conditions) else ()))
+        return ObjectiveData(train_batch=steps, evaluate_batch=steps)
 
     def real_lengths(self, batch: Batch) -> np.ndarray:
         """The denoiser's real patch-token lengths from the objective's latent shape."""
@@ -429,9 +443,6 @@ class DiffusionObjective(Objective[Ratio]):
         self.autoencoder = autoencoder
         self.variables = variables
         self.uncertainty = None if uncertainty is None else Uncertainty(uncertainty)
-        self.alignment, self.representation = (None, None) if alignment is None else alignment.network(
-            None if variables is None else variables.get(REPRESENTATION))
-        self.end_to_end = end_to_end
         if end_to_end is not None:
             if alignment is None or autoencoder is None or inputs.mask is not None:
                 raise ValueError("end-to-end tuning trains a KL autoencoder through REPA's loss; it "
@@ -440,6 +451,11 @@ class DiffusionObjective(Objective[Ratio]):
             jax.eval_shape(autoencoder.moments, autoencoder.params, jnp.zeros((1, *inputs.sample.shape)))
         if inputs.mask is not None and autoencoder is None:
             raise ValueError("Masked-image conditioning requires an autoencoder")
+        check_solver(self.process, solver, steps)
+        # Refusals come first: resolving the alignment's encoder may download its weights.
+        self.alignment, self.representation = (None, None) if alignment is None else alignment.network(
+            None if variables is None else variables.get(REPRESENTATION))
+        self.end_to_end = end_to_end
         self.unconditional_prob = unconditional_prob
         self.solver = solver
         self.guidance = guidance
@@ -448,11 +464,10 @@ class DiffusionObjective(Objective[Ratio]):
             decay=ema_decay if callable(ema_decay) else optax.constant_schedule(ema_decay),
             select=under("params")))
         self.artifact = VideoGrid if len(inputs.sample.shape) == 4 else ImageGrid
-        check_solver(self.process, solver, steps)
 
     @property
     def _sample(self):
-        return self._compiled_program('sample', self._sample_impl, static_argnames=("count",))
+        return self.program('sample', self._sample_impl, static_argnames=("count",))
 
     def task_record(self) -> Mapping[str, JSON]:
         """The process, input encoders, autoencoder and sampling convention."""
