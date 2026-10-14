@@ -3,10 +3,10 @@
 Every head takes the backbone's `[B, L, D]` final states and the laid-out
 `DecisionInputs`, and returns `[B, Q, K]` fp32 option logits, unmasked: the
 caller drops the slots past each question's options. `DecisionHead` is
-Laya's, which reads one marker token per option; `JointSchemaHead` is
-Clef's, which reads every question of a row together and pools the tokens
-of each option. A head that reads the backbone's output table says so with
-`reads_table`, and is given it as `[V, D]` rows.
+Laya's, which reads one marker token per option; `JointSchemaHead` reads
+every question of a row together and pools the tokens of each option. A head
+that reads the backbone's output table says so with `reads_table`, and is
+given it as `[V, D]` rows.
 """
 
 import dataclasses
@@ -175,13 +175,13 @@ class DecisionHead(Head):
         return scores.astype(at_least_fp32(scores.dtype))
 
 
-# Clef numbers its type embedding noul 0, choice 1, score 2
-# (joint_schema_model.py QUESTION_TYPES), and the rows number them as KINDS does.
-_CLEF_ROWS = tuple({Noul: 0, Choice: 1, Score: 2}[kind] for kind in KINDS)
+# The type embedding's rows: noul 0, choice 1, score 2, read through KINDS' order,
+# which a saved joint head's table keeps.
+_TYPE_ROWS = tuple({Noul: 0, Choice: 1, Score: 2}[kind] for kind in KINDS)
 
 
 class _RoutingLayer(nn.Module):
-    """Clef's `EvidenceRoutingLayer`: each option attends to the row's memory, then a feed-forward."""
+    """An evidence routing layer: each option attends to the row's memory, then a feed-forward."""
 
     width: int
     heads: int
@@ -269,10 +269,9 @@ def _laid_back(values: jax.Array, inputs: DecisionInputs) -> jax.Array:
 
 
 class JointSchemaHead(Head):
-    """Clef's joint schema head: decides every question of a row together.
+    """The joint schema head: decides every question of a row together.
 
-    This is `JointSchemaHead` of joint_schema_model.py at Cloudflare/clef
-    2f3de3dd. Over the backbone's normed states it pools each question's
+    Over the backbone's normed states it pools each question's
     instructions and each option's tokens, and each option's output-table rows
     (the lexical vector). The options attend to the row in `routing_layers`
     routing layers; each question becomes a field from its own pooled tokens,
@@ -370,7 +369,7 @@ class JointSchemaHead(Head):
     def __call__(self, states: jax.Array, inputs: DecisionInputs, table: jax.Array | None = None,
                  train: bool = False) -> jax.Array:
         if table is None:
-            raise ValueError("Clef's head reads the backbone's output table, its lexical prior")
+            raise ValueError("the joint schema head reads the backbone's output table, its lexical prior")
         hidden = self.hidden_norm(states)
         batch = inputs.tokens.shape[0]
         memory = self.memory_projection(hidden)
@@ -405,7 +404,7 @@ class JointSchemaHead(Head):
         affinity = jnp.einsum("bqkw,bqw->bqk", grid, fields) / math.sqrt(self.width)
         weights = jax.nn.softmax(jnp.where(inputs.options, affinity, -jnp.inf), axis=-1)
         summaries = jnp.einsum("bqk,bqkw->bqw", jnp.where(inputs.options, weights, 0.0), grid)
-        types = jnp.asarray(_CLEF_ROWS)[inputs.kinds]
+        types = jnp.asarray(_TYPE_ROWS)[inputs.kinds]
         fields = (fields + self.option_summary_norm(summaries) + self.global_projection(last_state)
                   + self.type_embedding(types))
         for layer in self.field_layers:
