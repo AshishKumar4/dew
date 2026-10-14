@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 import io
 import json
-import logging
 import uuid
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import ExitStack, closing
@@ -21,7 +20,7 @@ from dew.data.dataset import Batch, Records
 from dew.data.pipeline import Record, Rejected
 from dew.data.retention import LocalRetention
 from dew.data.sources.base import Read, Shard, ShardManifest, Source
-from dew.data.sources.codec import decode, encode
+from dew.data.sources.codec import decode, fingerprint
 from dew.data.sources.index import ArrayIndex
 from dew.data.sources.records import ArrayRecords
 from dew.data.storage import Store, Versioned
@@ -30,7 +29,6 @@ from dew.records import JSON
 if TYPE_CHECKING:
     from dew.data.cache import Cache
 
-_log = logging.getLogger(__name__)
 type Outputs = tuple[Record, ...]
 type RowId = int | tuple[str, int]
 
@@ -74,15 +72,6 @@ def _checked(root: Store, entry: Mapping[str, object]) -> bytes:
             f"expected bytes={entry['bytes']}, sha256={entry['sha256']}"
         )
     return payload
-
-
-def _outputs_digest(outputs: Sequence[Record]) -> str:
-    digest = hashlib.sha256()
-    for value in outputs:
-        payload = encode(value)
-        digest.update(len(payload).to_bytes(8, "little"))
-        digest.update(payload)
-    return digest.hexdigest()
 
 
 def _accepted(outputs: Sequence[Record]) -> Outputs:
@@ -251,11 +240,7 @@ def _retain_committed(
         for row_id, entry in retained.items():
             candidate = completions.get(row_id)
             if candidate is not None and candidate["payload_sha256"] != entry["payload_sha256"]:
-                if not candidate["volatile"]:
-                    raise ValueError(f"conflicting committed cache row {row_id}")
-                _log.warning(
-                    "volatile cache conflict for committed row %s; retaining its generation copy", row_id
-                )
+                raise ValueError(f"conflicting committed cache row {row_id}")
             completions[row_id] = entry
     shards.update(prior.manifest["shards"])
 
@@ -287,14 +272,10 @@ def _sealed(root: Store, pins: ExitStack) -> tuple[dict, dict]:
                     )
                 for entry in record["completions"]:
                     _completion(entry, rows[entry["record"]])
-                    candidate = {**entry, "shard": record["shard"]["path"], "volatile": record["volatile"]}
+                    candidate = {**entry, "shard": record["shard"]["path"]}
                     existing = completions.get(entry["id"])
                     if existing is not None and existing["payload_sha256"] != entry["payload_sha256"]:
-                        if not record["volatile"]:
-                            raise ValueError(f"conflicting cache duplicate for row {entry['id']}")
-                        _log.warning(
-                            "volatile cache conflict for row %s; keeping the first sealed copy", entry["id"]
-                        )
+                        raise ValueError(f"conflicting cache duplicate for row {entry['id']}")
                     completions.setdefault(entry["id"], candidate)
                     collected.append(entry["id"])
             shards[record["shard"]["path"]] = record["shard"]
@@ -312,9 +293,9 @@ def _completion(entry: Mapping[str, object], encoded: Batch | bytes | None) -> N
     accepted = _accepted(values)
     if len(accepted) != entry["fanout"]:
         raise ValueError(f"cache completion fanout differs for {entry['id']}")
-    if _outputs_digest(values) != entry["payload_sha256"]:
+    if fingerprint(values) != entry["payload_sha256"]:
         raise ValueError(f"cache completion checksum differs for {entry['id']}")
-    if _outputs_digest(accepted) != entry["sha256"]:
+    if fingerprint(accepted) != entry["sha256"]:
         raise ValueError(f"cache accepted-output checksum differs for {entry['id']}")
     if entry["outputs"] != [[entry["id"], index] for index in range(len(accepted))]:
         raise ValueError(f"cache completion output IDs differ for {entry['id']}")
@@ -460,7 +441,7 @@ class Generation:
         if not isinstance(payload, bytes):
             raise ValueError(f"committed cache record is not bytes: {self.url}")
         values = _decode_outputs(payload)
-        if not isinstance(values, tuple) or _outputs_digest(values) != entry["payload_sha256"]:
+        if not isinstance(values, tuple) or fingerprint(values) != entry["payload_sha256"]:
             raise ValueError(f"committed cache completion is corrupt for {row_key}")
         return values
 

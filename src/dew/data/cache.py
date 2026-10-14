@@ -35,14 +35,13 @@ from dew.data.generation import (
     _fact,
     _hash,
     _json,
-    _outputs_digest,
     _publish,
     _row_key,
 )
 from dew.data.pipeline import Record, Rejected, Volatile
 from dew.data.retention import LocalRetention
 from dew.data.sources.base import Shard, ShardManifest, Source
-from dew.data.sources.codec import encode
+from dew.data.sources.codec import encode, fingerprint
 from dew.data.sources.records import ArrayRecords
 from dew.data.storage import PreconditionFailed, Store, _byte_size
 
@@ -337,8 +336,8 @@ class _Writer:
                     "fanout": len(accepted),
                     "record": offset,
                     "outputs": [[row_id, index] for index in range(len(accepted))],
-                    "sha256": _outputs_digest(accepted),
-                    "payload_sha256": _outputs_digest(outputs),
+                    "sha256": fingerprint(accepted),
+                    "payload_sha256": fingerprint(outputs),
                     "lengths": [_fact(value, "_dew_length") for value in accepted],
                     "valid_targets": [_fact(value, "_dew_valid_targets") for value in accepted],
                     "rejections": [value.reason for value in outputs if isinstance(value, Rejected)],
@@ -398,7 +397,6 @@ class _Writer:
                         "schema": 1,
                         "shard": {"path": shard, "bytes": len(payload), "sha256": _hash(payload)},
                         "completions": entries,
-                        "volatile": False,
                     }
                 )
                 if self.closed:
