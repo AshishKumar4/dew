@@ -431,6 +431,9 @@ class Gateway:
                         await page.fail(message["id"], ValueError(refusal))
                         continue
                     step = self.run if message["op"] == "execute" else self.restart
+                    if step == self.restart:
+                        # Before the next message is read: a restart of this cell admitted now is refused.
+                        page.restarting.add(cell)
                     before = page.running.get(cell), page.requests.get(cell)
                     task = asyncio.create_task(step(page, message, cell, before))
                     page.tasks.add(task)
@@ -492,7 +495,6 @@ class Gateway:
     async def restart(self, page, message, cell, before):
         """End what runs in `cell`, give it a fresh context, and answer done: the notebook's Restart."""
         previous, ended = before
-        page.restarting.add(cell)
         try:
             if previous is not None and not previous.done():
                 page.stops.add(cell)
