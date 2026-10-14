@@ -1563,12 +1563,11 @@ class DecoderFamily:
 
         A fused tensor and a part stored under its own name, such as Qwen's
         `experts.gate_up_proj` beside `experts.gate_proj`, both hold that
-        part, and one leaf reads it. A quantized copy reaches this already
-        decoded and rounded to the storage dtype (`Pretrained.load`), so the
-        two copies are compared at the narrower of their dtypes, the most
-        precision both hold, and the wider is kept: unequal copies are refused,
-        and equal ones load the same leaf whichever the checkpoint lists
-        first."""
+        part, and one leaf reads it, so the two must be the same tensor, of
+        one dtype and equal values; any other pair is refused, whichever the
+        checkpoint lists first. A quantized copy reaches this decoded at the
+        load's storage dtype (`Pretrained.load`), so beside a dense copy it
+        loads at float32 storage alone."""
         prepared = self.prepare(tensors, config)
         if not self.packed:
             return prepared
@@ -1579,12 +1578,10 @@ class DecoderFamily:
             for part, value in parts.items():
                 held = split.setdefault(part, value)
                 if held is not value:
-                    wide, narrow = sorted((np.asarray(held), np.asarray(value)),
-                                          key=lambda copy: copy.dtype.itemsize, reverse=True)
-                    if not np.array_equal(wide.astype(narrow.dtype), narrow):
-                        raise ValueError(f"{name} holds {part}, which another of the checkpoint's "
-                                         "tensors holds with other values")
-                    split[part] = wide
+                    held, value = np.asarray(held), np.asarray(value)
+                    if held.dtype != value.dtype or not np.array_equal(held, value):
+                        raise ValueError(f"{name} holds {part} as {value.dtype}, which another of the "
+                                         f"checkpoint's tensors holds as a different {held.dtype} tensor")
         return split
 
     def tensor_name(self, name: str, config: Mapping[str, object]) -> str | None:
