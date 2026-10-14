@@ -105,7 +105,8 @@ def test_the_compensated_norm_vjp_lowers_for_both_gpu_generations(generation):
 
 def _step_lowered(generation: str):
     """A bf16 Qwen 3.5 hybrid's language-model training step (tests/fixtures/hf/qwen35-tiny: three gated
-    delta net layers and one attention layer), lowered for `generation` from abstract state as
+    delta net layers and one attention layer, its delta nets' heads 32 wide, a power of two as a real
+    model's and the short conv's kernels take), lowered for `generation` from abstract state as
     tools/kernel_picks.py lowers one (`Trainer(lower_for=...)`)."""
     import optax
 
@@ -116,7 +117,8 @@ def _step_lowered(generation: str):
     from dew.training._lowering import Lowered
 
     config = json.loads((ROOT / "tests" / "fixtures" / "hf" / "qwen35-tiny" / "config.json").read_text())
-    fields = translate_config(config.get("text_config", config))
+    fields = translate_config({**config.get("text_config", config), "linear_key_head_dim": 32,
+                               "linear_value_head_dim": 32})
     model = CausalTransformer(**{**fields, "dtype": jnp.bfloat16})
     trainer = Trainer(LMObjective(model, 128), optax.adamw(1e-4), key=jax.random.key(0),
                       lower_for=generation)
