@@ -827,8 +827,10 @@ def shard_batch(mesh: Mesh, batch: Batch, reads: Mapping[Signature, tuple[bool, 
 
     `reads` holds, by the signature of a batch as placed (`batch_signature`
     of what this returns), which of its leaves the step compiled for it reads
-    (`step_reads`); one it does not read stays a host copy of its own, no
-    transfer made, the reader's buffer still released at the next read. A
+    (`step_reads`); one it does not read stays on the host, no transfer
+    made, the reader's buffer still released at the next read: a copy of its
+    own where this process holds every row, else a stand-in of the placed
+    shape, which the executable checks and drops, its values unread. A
     batch whose placed signature it lacks is placed whole. The lookup is
     here, where the placed shapes are made, so the step that publishes a
     mask and the placement that reads it name one batch alike.
@@ -855,8 +857,12 @@ def shard_batch(mesh: Mesh, batch: Batch, reads: Mapping[Signature, tuple[bool, 
     signature = tree, tuple(jax.ShapeDtypeStruct(placed(np.shape(leaf)), jnp.result_type(leaf))
                             for leaf in leaves)
     read = (reads or {}).get(signature, (True,) * len(leaves))
-    held = {index: np.array(leaf, copy=True) for index, (leaf, kept) in enumerate(zip(leaves, read,
-                                                                                       strict=True))
+    # An unread leaf is still an argument the executable checks against the placed shapes before it
+    # drops it, so in a pool, whose process holds a share of the rows, it is a zero-cost stand-in
+    # of the placed shape; a process that holds every row keeps its own copy.
+    held = {index: np.array(leaf, copy=True) if placed(np.shape(leaf)) == np.shape(leaf)
+            else np.broadcast_to(np.zeros((), np.asarray(leaf).dtype), placed(np.shape(leaf)))
+            for index, (leaf, kept) in enumerate(zip(leaves, read, strict=True))
             if not kept and not isinstance(leaf, jax.Array)}
     moving = [leaf if isinstance(leaf, jax.Array) else np.array(leaf, copy=True) if cpu else np.asarray(leaf)
               for index, leaf in enumerate(leaves) if index not in held]

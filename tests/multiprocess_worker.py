@@ -486,6 +486,7 @@ def mode_reads(args) -> dict:
     placed = shard_batch(mesh, batch, {batch_signature(first): step_reads(compiled)})
     return {"read_differs_from_placed": batch_signature(batch) != batch_signature(first),
             "unused_on_host": isinstance(placed["unused"], np.ndarray),
+            "unused_shape": list(np.shape(placed["unused"])),
             "x_placed": isinstance(placed["x"], jax.Array),
             "sum": float(compiled(jnp.zeros(()), placed))}
 
