@@ -111,6 +111,11 @@ class DiffusionGemma(nn.Module):
         return self.text.vocab_size
 
     @property
+    def dtype(self) -> Dtype | None:
+        """The compute dtype, the text model's, which every part computes in."""
+        return self.text.dtype
+
+    @property
     def bank_sites(self) -> tuple[DecoderBank, ...]:
         # decoder shares text's scope; it is another reader, not another bank.
         return tuple(DecoderBank(("text", *site.namespace), site.view, site.scanned)
