@@ -3,6 +3,8 @@ Worker forwards it, to a stand-in for the Kernel Gateway that speaks its REST an
 import asyncio
 import importlib.util
 import json
+import os
+import subprocess
 import sys
 import time
 import uuid
@@ -247,3 +249,45 @@ def test_every_connection_of_a_session_ends_at_the_session_end(bridge, monkeypat
             await runner.cleanup()
 
     asyncio.run(scenario())
+
+
+def test_the_context_smoke_loads_beside_the_bridge_it_reports_with(bridge):
+    """benchmark_gateway.py, the preparation's required context smoke, imports and reports the host's
+    load through the bridge's own probe."""
+    spec = importlib.util.spec_from_file_location("benchmark_gateway", CONTAINER / "benchmark_gateway.py")
+    smoke = importlib.util.module_from_spec(spec)
+    sys.path.insert(0, str(CONTAINER))
+    try:
+        spec.loader.exec_module(smoke)
+    finally:
+        sys.path.remove(str(CONTAINER))
+    assert {"loadavg", "stalls", "cpu_ticks"} <= set(smoke.load())
+
+
+def test_a_training_context_caps_the_batch_of_every_way_a_cell_loads_data(tmp_path):
+    """In a training context (live_training.install), a bare source through dew.data.load, a recipe
+    through its loader and a recipe's own load each read batches of BATCH rows, saying so first."""
+    import numpy as np
+
+    np.arange(400, dtype=np.uint16).tofile(tmp_path / "train.bin")
+    np.arange(400, dtype=np.uint16).tofile(tmp_path / "val.bin")
+    code = f"""
+import json, sys
+sys.path.insert(0, {str(CONTAINER)!r})
+import live_training
+live_training.install()
+from dew.config.data import TextData, loader
+from dew.data import Loading, Memory, load
+windows = TextData(source={str(tmp_path)!r}, seq_len=4, stride=1)
+options = dict(read="memory", loading=Loading(workers=0), validation_records=32)
+bare = load(Memory([{{"id": index}} for index in range(320)]), batch=64, provision=False,
+            loading=Loading(workers=0))
+batches = [bare.batch, loader(windows, batch=64, **options).batch, windows.load(batch=64, **options).batch]
+print(json.dumps(batches))
+"""
+    done = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=600,
+                          env={**os.environ, "JAX_PLATFORMS": "cpu"})
+    assert done.returncode == 0, done.stderr[-4000:]
+    *said, batches = done.stdout.strip().splitlines()
+    assert json.loads(batches) == [8, 8, 8]
+    assert said == ["Live run: batch 64 -> 8, so it fits a shared 4-vCPU host."] * 3
