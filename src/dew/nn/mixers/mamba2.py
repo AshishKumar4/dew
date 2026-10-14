@@ -67,7 +67,7 @@ from dew.nn.inputs import AttentionMetadata, coordinates_of
 from dew.nn.kernels import mamba_ssd
 from dew.nn.kernels.generation import first_refusal, measured_kernel, ran_kernel, triton_runs
 from dew.nn.kernels.ssd import ssd_chunk_scan, ssd_kernel_platform
-from dew.nn.linear import DepthwiseConv1d, causal_conv1d, document_conv1d, held_scan
+from dew.nn.linear import DepthwiseConv1d, causal_conv1d, held_scan
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.mixers.mamba import inverse_softplus_step
 from dew.nn.precision import at_least_fp32
@@ -539,12 +539,12 @@ def _sequence_mix(mixed, dt, segments, starts, weights, *, scan, dtype):
             f"conv reads behind its first; use fewer sequence shards or longer sequences")
     forward = [(shard, shard + 1) for shard in range(jax.lax.axis_size(SEQUENCE_AXIS) - 1)]
     history = jax.lax.ppermute(mixed[:, length - width:], SEQUENCE_AXIS, forward)
-    if segments is None:
-        stream = jnp.concatenate([history, mixed], axis=1)
-        convolved = causal_conv1d(stream, taps, bias=bias, dtype=dtype)[:, width:]
-    else:
+    owners = None
+    if segments is not None:
         before = jax.lax.ppermute(segments[:, length - width:], SEQUENCE_AXIS, forward)
-        convolved = document_conv1d(history, mixed, before, segments, taps, bias).astype(dtype)
+        owners = jnp.concatenate([before, segments], axis=1)
+    stream = jnp.concatenate([history, mixed], axis=1)
+    convolved = causal_conv1d(stream, taps, bias=bias, segments=owners, dtype=dtype)[:, width:]
     out, _ = scan(convolved, dt, (dt_bias, A, D), starts=starts, axis=SEQUENCE_AXIS)
     return out
 
