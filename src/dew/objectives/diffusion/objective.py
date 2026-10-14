@@ -443,9 +443,6 @@ class DiffusionObjective(Objective[Ratio]):
         self.autoencoder = autoencoder
         self.variables = variables
         self.uncertainty = None if uncertainty is None else Uncertainty(uncertainty)
-        self.alignment, self.representation = (None, None) if alignment is None else alignment.network(
-            None if variables is None else variables.get(REPRESENTATION))
-        self.end_to_end = end_to_end
         if end_to_end is not None:
             if alignment is None or autoencoder is None or inputs.mask is not None:
                 raise ValueError("end-to-end tuning trains a KL autoencoder through REPA's loss; it "
@@ -454,6 +451,11 @@ class DiffusionObjective(Objective[Ratio]):
             jax.eval_shape(autoencoder.moments, autoencoder.params, jnp.zeros((1, *inputs.sample.shape)))
         if inputs.mask is not None and autoencoder is None:
             raise ValueError("Masked-image conditioning requires an autoencoder")
+        check_solver(self.process, solver, steps)
+        # Refusals come first: resolving the alignment's encoder may download its weights.
+        self.alignment, self.representation = (None, None) if alignment is None else alignment.network(
+            None if variables is None else variables.get(REPRESENTATION))
+        self.end_to_end = end_to_end
         self.unconditional_prob = unconditional_prob
         self.solver = solver
         self.guidance = guidance
@@ -462,11 +464,10 @@ class DiffusionObjective(Objective[Ratio]):
             decay=ema_decay if callable(ema_decay) else optax.constant_schedule(ema_decay),
             select=under("params")))
         self.artifact = VideoGrid if len(inputs.sample.shape) == 4 else ImageGrid
-        check_solver(self.process, solver, steps)
 
     @property
     def _sample(self):
-        return self._compiled_program('sample', self._sample_impl, static_argnames=("count",))
+        return self.program('sample', self._sample_impl, static_argnames=("count",))
 
     def task_record(self) -> Mapping[str, JSON]:
         """The process, input encoders, autoencoder and sampling convention."""

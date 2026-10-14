@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import dataclasses
 import functools
-import hashlib
 import itertools
 import json
 import random
@@ -18,7 +17,7 @@ import tyro
 from dew.data.dataset import Batch, Records
 from dew.data.pipeline import Dataset, Mixture, Phases, Pipeline, Rejected, Stage
 from dew.data.sources.base import Read, Shard, ShardManifest, Source, _consumed
-from dew.data.sources.codec import encode
+from dew.data.sources.codec import content_fingerprint
 from dew.records import integer
 
 if TYPE_CHECKING:
@@ -81,12 +80,12 @@ def _inside(row: Batch | bytes, low: float, high: float, key: str | None) -> boo
     """Whether `row`'s identity falls in [`low`, `high`) of the unit interval: the hash of its
     `key` field, or of its whole content, the same wherever and however the row is read."""
     if key is None:
-        identity = encode(row)
+        identity = content_fingerprint(row)
     elif isinstance(row, Mapping) and key in row:
-        identity = encode(row[key])
+        identity = content_fingerprint(row[key])
     else:
         raise ValueError(f"a holdout by {key!r} reads that field, which this record lacks")
-    hashed = int.from_bytes(hashlib.sha256(identity).digest()[:8], "big")
+    hashed = int.from_bytes(identity[:8], "big")
     return int(low * 2**64) <= hashed < int(high * 2**64)
 
 
@@ -131,7 +130,7 @@ class _HashSource:
 
     def fingerprint(self) -> Mapping[str, object]:
         return {**self.source.fingerprint(), "holdout": [self.low, self.high], "held": self.held,
-                "key": self.key}
+                "key": self.key, "content_hash": "sha256:sorted-mappings-v1"}
 
     def supports(self, read: Read) -> bool:
         return read != "indexed" and self.source.supports(read)

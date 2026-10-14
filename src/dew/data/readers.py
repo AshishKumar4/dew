@@ -24,9 +24,10 @@ from dew.data.dataset import (
     Reader,
     _window_order,
     rows_of,
+    take_batch,
 )
 from dew.data.mixing import CorpusCounts, state_counts
-from dew.data.pipeline import HostStep
+from dew.data.pipeline import HostStep, Map
 from dew.data.plan import Plan
 from dew.records import integer, record
 
@@ -102,11 +103,13 @@ class _Host(Forwarding):
         return self
 
     def __next__(self) -> Batch:
+        from dew.data.lowering import _outputs
+
         if self._source is None:
             raise StopIteration
         value = next(self._source)
         for step in self._steps:
-            value = step.map(value) if isinstance(step, pygrain.MapTransform) else step(value)
+            value = record(_outputs(Map(step), None, value)[0], "host map result")
         return value
 
     def close(self) -> None:
@@ -301,10 +304,8 @@ class _FillShare:
     batch: int
 
     def __call__(self, batch: Batch) -> Batch:
-        import jax
-
-        mine = jax.tree.map(lambda value: value[self.partition.index :: self.partition.count], batch)
+        mine = take_batch(batch, slice(self.partition.index, None, self.partition.count))
         empty = rows_of(mine) == 0
         if empty:
-            mine = jax.tree.map(lambda value: value[:1], batch)
+            mine = take_batch(batch, slice(1))
         return FilledBatch(self.partition.rows(self.batch), real=not empty).map(mine)
