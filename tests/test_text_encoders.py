@@ -336,9 +336,10 @@ def test_the_real_checkpoint_embeddings_match_the_reference():
 
 
 @pytest.mark.parametrize("kind", ["clip-text", "clip", "t5"])
-def test_public_text_encoder_storage_is_separate_from_compute(kind):
+def test_public_text_encoder_storage_is_separate_from_compute(kind, tmp_path):
     import jax
     import jax.numpy as jnp
+    from flax.core import freeze
 
     from dew.nn.text_encoders import T5EncoderModel
 
@@ -356,6 +357,21 @@ def test_public_text_encoder_storage_is_separate_from_compute(kind):
     for before, after in zip(
         jax.tree.leaves(masters.variables), jax.tree.leaves(native.variables), strict=True
     ):
+        assert isinstance(before, jax.Array) and isinstance(after, jax.Array)
         assert np.asarray(before).dtype == np.float32
         assert after.dtype == jnp.bfloat16
         np.testing.assert_array_equal(after, np.asarray(before).astype(jnp.bfloat16))
+    if kind != "clip":
+        metadata = tmp_path / "metadata"
+        metadata.mkdir()
+        (metadata / "config.json").write_bytes((directory / "config.json").read_bytes())
+        supplied = freeze({**jax.tree.map(np.asarray, native.variables),
+                           "constants": {"step": np.asarray(0, np.int32)}})
+        rebound = cls.from_pretrained(str(metadata), dtype=jnp.float32, variables=supplied)
+        assert rebound.variables is supplied
+        expected = reference(directory)
+        before_output = native(expected["input_ids"], expected["attention_mask"])
+        after_output = rebound(expected["input_ids"], expected["attention_mask"])
+        if kind == "clip-text":
+            before_output, after_output = before_output.last_hidden_state, after_output.last_hidden_state
+        np.testing.assert_array_equal(after_output, before_output)

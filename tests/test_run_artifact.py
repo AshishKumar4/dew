@@ -224,9 +224,9 @@ def test_an_adapted_denoiser_run_loads_what_it_trained(tmp_path):
 
 @pytest.mark.parametrize("kind", ["text", "masked", "block"])
 def test_task_from_pretrained_selects_the_requested_snapshot(tmp_path, monkeypatch, kind):
+    import huggingface_hub
     from flax.core import freeze
 
-    import dew.interop.hub as hub
     from dew.diffusion.discrete import MDLM
     from dew.inference import BlockGeneration, MaskedGeneration, TextGeneration
     from dew.nn.diffusion_gemma import DiffusionGemma
@@ -254,8 +254,8 @@ def test_task_from_pretrained_selects_the_requested_snapshot(tmp_path, monkeypat
         checkpoints = Checkpoints(str(tmp_path / name))
         checkpoints.save(0, state, None, artifact=objective.inference_record())
         checkpoints.wait()
-    monkeypatch.setattr(hub, "snapshot_download", lambda repo_id, revision=None:
-                        tmp_path / ("main" if revision is None else {"pinned": "pinned"}[revision]))
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", lambda repo_id, revision=None:
+                        str(tmp_path / ("main" if revision is None else {"pinned": "pinned"}[revision])))
     task = task_type.from_pretrained("user/published-model", revision="pinned", ema=False)
     assert jax.tree.structure(task.variables) == jax.tree.structure(freeze(selected))
     for actual, expected in zip(jax.tree.leaves(task.variables), jax.tree.leaves(selected), strict=True):

@@ -10,6 +10,15 @@ spell the layout in the authors' own fields (`hybrid_layer_pattern`,
 `swa_num_key_value_heads`, ...), which transformers 5.16.1 does not read: it
 derives the same model from its defaults, so each such field is accepted
 only where it states what the reference computes.
+
+MiMo-V2.6 (`mimo_v2`) is the same decoder under the authors' own config,
+which its remote code reads (modeling_mimo_v2.py at 6a7f202): the layout
+from `hybrid_layer_pattern` and `moe_layer_freq`, each kind's geometry from
+the `swa_*` fields, and a sink per head on the kinds whose flag asks for
+one. Its Pro release stores each layer's q, k and v projections fused,
+pre-sharded over the key heads (`attention_projection_layout` 'fused_qkv',
+vLLM's `_shard_fp8_qkv_proj` at 78b32b3), and its towers and prediction
+layers ride along unread and are written back.
 """
 
 from __future__ import annotations
@@ -18,7 +27,7 @@ from collections.abc import Mapping
 from functools import partial
 
 from dew import records
-from dew.interop.config_records import NativeFields
+from dew.interop.config_records import NativeFields, native_fields
 from dew.interop.decoder_parts import (
     DecoderFamily,
     DecoderFields,
@@ -26,6 +35,7 @@ from dew.interop.decoder_parts import (
     Ropes,
     base_config,
     decoder_kinds,
+    grouped_qkv,
     plain_partial_rope,
     refuse,
     renamed_name,
@@ -34,6 +44,7 @@ from dew.interop.decoder_parts import (
 from dew.interop.families.deepseek import deepseek_layout
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
+from dew.nn.backbones.layer_plan import LayerKind
 
 _KINDS = ('full_attention', 'sliding_attention')
 
@@ -116,8 +127,6 @@ def _mimo_v2_flash_config(hf: Mapping[str, object], used: set[str]) -> DecoderFi
         # and gives it the sinks (modeling_mimo_v2_flash.py:348, 363).
         kinds['sliding_attention'].update(num_kv_heads=2 * kv_heads, sinks=True,
                                           partial_rotary_factor=local_factor)
-    if hf.get('norm_topk_prob', True) is not True:
-        refuse('norm_topk_prob', 'DeepseekV3TopkRouter renormalizes the top-k weights')
     scale = hf.get('attention_value_scale', 0.707)
     config.update(
         kinds=kinds, value_head_dim=records.integer(hf.get('v_head_dim', 128), 'v_head_dim'),
@@ -125,14 +134,30 @@ def _mimo_v2_flash_config(hf: Mapping[str, object], used: set[str]) -> DecoderFi
         o_proj_bias=False, partial_rotary_factor=None if full_factor == 1.0 else full_factor,
         partial_rotary_type='default',
         attention_dropout_rate=records.number(hf.get('attention_dropout', 0.), 'attention_dropout'),
-        mixture=NativeFields(Mixture, {
-            **deepseek_layout({**hf, 'routed_scaling_factor': hf.get('routed_scaling_factor') or 1.0},
-                              count, used, sparse_layers=sparse),
-            'score_function': 'sigmoid', 'bias': True,
-            'groups': records.integer(hf.get('n_group') or 1, 'n_group'),
-            'groups_per_token': records.integer(hf.get('topk_group') or 1, 'topk_group'),
-        }) if sparse else None)
+        mixture=_mixture(hf, count, used, sparse))
     return config
+
+
+def _mixture(hf: Mapping[str, object], count: int, used: set[str],
+             sparse: tuple[int, ...]) -> NativeFields | None:
+    """DeepSeek V3's routed experts on the `sparse` layers: sigmoid scores, a
+    balancing bias, grouped choice and renormalized top-k weights. A config
+    that states experts no layer routes to builds dense layers alone, as the
+    reference does; its expert fields are read all the same."""
+    if hf.get('n_routed_experts') is None and not sparse:
+        return None
+    layout = deepseek_layout({**hf, 'routed_scaling_factor': hf.get('routed_scaling_factor') or 1.0},
+                             count, used, sparse_layers=sparse)
+    if not sparse:
+        return None
+    if hf.get('norm_topk_prob', True) is not True:
+        refuse('norm_topk_prob', 'DeepseekV3TopkRouter renormalizes the top-k weights')
+    return NativeFields(Mixture, {
+        **layout,
+        'score_function': 'sigmoid', 'bias': True,
+        'groups': records.integer(hf.get('n_group') or 1, 'n_group'),
+        'groups_per_token': records.integer(hf.get('topk_group') or 1, 'topk_group'),
+    })
 
 
 def _mimo_v2_flash_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
@@ -178,4 +203,130 @@ MIMO_V2_FLASH = DecoderFamily(
     _mimo_v2_flash_export, weight_path=_mimo_v2_flash_path, export_path=partial(renamed_name, _NAMES),
     # Its experts are stored one tensor each, so a save writes them back through the source's own names.
     preserve_source_layout=True,
+)
+
+
+_V2_FIELDS = ('swa_num_attention_heads', 'swa_num_key_value_heads', 'swa_head_dim', 'swa_v_head_dim',
+              'swa_rope_theta', 'sliding_window_size', 'layernorm_epsilon', 'add_full_attention_sink_bias',
+              'add_swa_attention_sink_bias', 'attention_projection_layout', 'attention_value_scale',
+              'v_head_dim', 'partial_rotary_factor', 'rope_parameters', 'rope_theta', 'norm_topk_prob',
+              'scoring_func', 'topk_method', 'attention_dropout')
+_V2_UNREAD = ('attention_chunk_size', 'moe_router_dtype', 'audio_config', 'vision_config', 'processor_config',
+              'vision_model_type', 'audio_token_id', 'audio_start_token_id', 'audio_end_token_id',
+              'image_token_id', 'video_token_id', 'vision_start_token_id', 'vision_end_token_id')
+"""Fields MiMoV2ForCausalLM's text decoder never reads: the chunk the window
+is restated as, the router dtype its fp32 gate ignores (modeling_mimo_v2.py:153),
+and the towers' sections and tokens, whose tensors ride unread."""
+
+
+def _layer_flags(hf: Mapping[str, object], used: set[str],
+                 count: int) -> tuple[tuple[bool, ...], tuple[bool, ...]]:
+    """Which layers slide and which route, as MiMoV2Config derives them
+    (configuration_mimo_v2.py:206-232): `hybrid_layer_pattern`, else one full
+    layer closing each `hybrid_block_size` block, else every layer full;
+    `moe_layer_freq` a flag a layer, or every `moe_layer_freq`-th from the
+    first, else none."""
+    used.update(('hybrid_layer_pattern', 'hybrid_block_size', 'moe_layer_freq'))
+    block = hf.get('hybrid_block_size')
+    pattern = hf.get('hybrid_layer_pattern')
+    if pattern is None:
+        size = None if block is None else records.integer(block, 'hybrid_block_size')
+        sliding = tuple(bool(size and (index + 1) % size) for index in range(count))
+    else:
+        sliding = tuple(bool(slides) for slides in records.integers(pattern, 'hybrid_layer_pattern'))
+    frequency = hf.get('moe_layer_freq')
+    if isinstance(frequency, int) and not isinstance(frequency, bool):
+        routed = tuple(frequency > 0 and index % frequency == 0 for index in range(count))
+    elif frequency is None:
+        routed = (False,) * count
+    elif isinstance(frequency, (list, tuple)) and all(routes in (0, 1) for routes in frequency):
+        # A saved MiMoV2Config writes the flags it derived as booleans, a release as 0 and 1.
+        routed = tuple(bool(routes) for routes in frequency)
+    else:
+        refuse(f'moe_layer_freq {frequency!r}', 'a period or one 0-or-1 flag a layer')
+    if len(sliding) != count or len(routed) != count:
+        refuse('hybrid_layer_pattern and moe_layer_freq', f'one entry a layer, {count} of them')
+    return sliding, routed
+
+
+def _mimo_v2_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
+    count = records.integer(hf['num_hidden_layers'], 'num_hidden_layers')
+    sliding, routed = _layer_flags(hf, used, count)
+    layers = tuple('sliding_attention' if slides else 'full_attention' for slides in sliding)
+    experts = hf.get('n_routed_experts') is not None
+    sparse = tuple(index for index, routes in enumerate(routed) if routes and experts)
+    # MiMoV2Config's geometry and its defaults (configuration_mimo_v2.py:156-197).
+    heads = records.integer(hf.get('num_attention_heads', 32), 'num_attention_heads')
+    kv_heads = records.integer(hf.get('num_key_value_heads') or heads, 'num_key_value_heads')
+    width = records.integer(hf['hidden_size'], 'hidden_size')
+    head_dim = records.integer(hf.get('head_dim') or width // heads, 'head_dim')
+    value_dim = records.integer(hf.get('v_head_dim') or head_dim, 'v_head_dim')
+    swa_head_dim = records.integer(hf.get('swa_head_dim') or head_dim, 'swa_head_dim')
+    swa = {'swa_num_attention_heads': (records.integer(hf.get('swa_num_attention_heads') or heads,
+                                                       'swa_num_attention_heads'), heads),
+           'swa_head_dim': (swa_head_dim, head_dim),
+           'swa_v_head_dim': (records.integer(hf.get('swa_v_head_dim') or swa_head_dim, 'swa_v_head_dim'),
+                              value_dim)}
+    for key, (stated, full) in swa.items():
+        if stated != full and 'sliding_attention' in layers:
+            refuse(f'{key} {stated}', f"Dew's sliding layers hold the full layers' {full}; "
+                                      'its kinds differ in key heads alone')
+    swa_kv_heads = records.integer(hf.get('swa_num_key_value_heads') or kv_heads,
+                                   'swa_num_key_value_heads')
+    layout = hf.get('attention_projection_layout') or 'split'
+    if layout not in ('split', 'fused_qkv'):
+        refuse(f'attention_projection_layout {layout!r}', "MiMoV2Attention stores 'split' or 'fused_qkv'")
+    if layout == 'fused_qkv' and swa_kv_heads != kv_heads and 'sliding_attention' in layers:
+        refuse('attention_projection_layout fused_qkv', 'its runs are one geometry for every layer here, '
+               f'not {kv_heads} key heads on the full layers and {swa_kv_heads} on the sliding ones')
+    window = hf.get('sliding_window') or hf.get('sliding_window_size')
+    if (hf.get('scoring_func') or 'sigmoid', hf.get('topk_method') or 'noaux_tc') != ('sigmoid', 'noaux_tc'):
+        refuse('scoring_func and topk_method', "MiMoV2MoEGate implements sigmoid scores under 'noaux_tc'")
+    theta, factor = plain_partial_rope(hf, default_factor=1.0, reference='MiMoV2RotaryEmbedding')
+    used.update(_V2_FIELDS + _V2_UNREAD)
+    config = base_config({**hf, 'num_attention_heads': heads, 'num_key_value_heads': kv_heads,
+                          'head_dim': head_dim, 'rms_norm_eps': hf.get('layernorm_epsilon', 1e-6),
+                          'moe_intermediate_size': (hf.get('moe_intermediate_size')
+                                                    or hf.get('intermediate_size'))},
+                         used, layer_types=layers, rope=Ropes(theta), scale_after_cast=True,
+                         reads=frozenset({'sliding_window', 'attention_bias'}))
+    local_theta = records.number(hf.get('swa_rope_theta') or theta, 'swa_rope_theta')
+    kinds = decoder_kinds(layers, None if window is None else records.integer(window, 'sliding_window'),
+                          local_theta, None, None)
+    for kind, key in (('full_attention', 'add_full_attention_sink_bias'),
+                      ('sliding_attention', 'add_swa_attention_sink_bias')):
+        if records.boolean(hf.get(key, False), key) and kind in layers:
+            kinds.setdefault(kind, native_fields(LayerKind)())['sinks'] = True
+    if 'sliding_attention' in kinds:
+        # A windowed kind rotates whole heads unless it states its own
+        # factor (`LayerKind`); MiMoV2Attention turns the same third of both.
+        kinds['sliding_attention'].update(num_kv_heads=swa_kv_heads, partial_rotary_factor=factor)
+    scale = hf.get('attention_value_scale')
+    config.update(
+        kinds=kinds, value_head_dim=value_dim,
+        value_scale=None if scale is None else records.number(scale, 'attention_value_scale'),
+        o_proj_bias=False, partial_rotary_factor=None if factor == 1.0 else factor,
+        partial_rotary_type='default',
+        attention_dropout_rate=records.number(hf.get('attention_dropout', 0.), 'attention_dropout'),
+        mixture=_mixture(hf, count, used, sparse))
+    return config
+
+
+_FUSED_QKV = grouped_qkv('.self_attn.qkv_proj')
+
+
+def _mimo_v2_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
+    """The shared map under the family's names. The fused qkv is read through
+    its parts (`_FUSED_QKV`); the prediction layers, which the reference skips
+    on load, and the towers, which the text decoder never runs, have no place."""
+    if name.startswith(('model.mtp.', 'visual.', 'audio_encoder.', 'speech_embeddings.')):
+        return None
+    if name.endswith(tuple(packing.name for packing in _FUSED_QKV)):
+        return None
+    return renamed_path(_NAMES, name, config)
+
+
+MIMO_V2 = DecoderFamily(
+    ('mimo_v2',), _mimo_v2_config, lambda fields: False, 'mimo_v2', 'MiMoV2ForCausalLM',
+    lambda model: {}, weight_path=_mimo_v2_path, packed=_FUSED_QKV, preserve_source_layout=True,
 )

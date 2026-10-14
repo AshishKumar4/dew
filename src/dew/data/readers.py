@@ -13,120 +13,37 @@ import numpy as np
 
 from dew.data.dataset import (
     Batch,
-    Checkpointable,
     Closeable,
     DataPartition,
     FilledBatch,
     Forwarding,
     GlobalReader,
-    LengthGroups,
-    Position,
     Reader,
-    _window_order,
+    _CheckpointableMapping,
     rows_of,
     take_batch,
 )
 from dew.data.mixing import CorpusCounts, state_counts
 from dew.data.pipeline import HostStep, Map
 from dew.data.plan import Plan
-from dew.records import integer, record
+from dew.records import record
 
 
-class _GroupedIterator(pygrain.DatasetIterator[Batch]):
-    def __init__(self, parent: pygrain.DatasetIterator[Batch], groups: LengthGroups, rows: int, seed: int):
-        super().__init__(parent)
-        self._read, self._groups, self._rows, self._seed = parent, groups, rows, seed
-        self._before = parent.get_state()
-        self._buffer: list[Batch] = []
-        self._emitted, self._window = 0, 0
+@dataclasses.dataclass(frozen=True)
+class _HostSteps:
+    steps: tuple[HostStep, ...]
 
-    def _fill(self) -> None:
-        self._before = self._read.get_state()
-        held = []
-        for _ in range(self._rows * self._groups.window):
-            try:
-                held.append(next(self._read))
-            except StopIteration:
-                break
-        order = _window_order(
-            [self._groups.length(value) for value in held],
-            self._rows,
-            np.random.default_rng([self._seed, self._window]),
-        )
-        self._buffer = [held[index] for index in order]
-        self._emitted = 0
-
-    def __next__(self) -> Batch:
-        if self._emitted == len(self._buffer):
-            if self._buffer:
-                self._window += 1
-            self._fill()
-        if not self._buffer:
-            raise StopIteration
-        value = self._buffer[self._emitted]
-        self._emitted += 1
-        return value
-
-    def get_state(self) -> Mapping[str, object]:
-        return {"parent": self._before, "emitted": self._emitted, "window": self._window}
-
-    def set_state(self, state: Mapping[str, object]) -> None:
-        self._read.set_state(record(state["parent"], "group parent"))
-        self._window = integer(state["window"], "group window")
-        self._fill()
-        self._emitted = integer(state["emitted"], "group emitted")
-        if not 0 <= self._emitted <= len(self._buffer):
-            raise ValueError("saved grouping position exceeds its window")
-
-    def close(self) -> None:
-        self._read.close()
-
-
-class _GroupedRows(pygrain.IterDataset[Batch]):
-    def __init__(self, parent: pygrain.IterDataset[Batch], groups: LengthGroups, rows: int, seed: int):
-        super().__init__(parent)
-        self._records, self._groups, self._rows, self._seed = parent, groups, rows, seed
-
-    def __iter__(self) -> pygrain.DatasetIterator[Batch]:
-        return _GroupedIterator(iter(self._records), self._groups, self._rows, self._seed)
-
-
-class _Host(Forwarding):
-    def __init__(self, source: Iterator[Batch], steps: tuple[HostStep, ...]):
-        self._source: Iterator[Batch] | None = source
-        self._steps = steps
-
-    def _forwarded(self) -> Iterator[Batch] | None:
-        return self._source
-
-    def __iter__(self) -> Iterator[Batch]:
-        return self
-
-    def __next__(self) -> Batch:
+    def __call__(self, value: Batch) -> Batch:
         from dew.data.lowering import _outputs
 
-        if self._source is None:
-            raise StopIteration
-        value = next(self._source)
-        for step in self._steps:
+        for step in self.steps:
             value = record(_outputs(Map(step), None, value)[0], "host map result")
         return value
 
-    def close(self) -> None:
-        try:
-            super().close()
-        finally:
-            self._source = None
 
-    def get_state(self) -> Position:
-        if not isinstance(self._source, Checkpointable):
-            raise TypeError("map_batch parent does not expose a checkpoint position")
-        return self._source.get_state()
-
-    def set_state(self, state: Position) -> None:
-        if not isinstance(self._source, Checkpointable):
-            raise TypeError("map_batch parent does not expose a checkpoint position")
-        self._source.set_state(state)
+class _Host(_CheckpointableMapping):
+    def __init__(self, source: Iterator[Batch], steps: tuple[HostStep, ...]):
+        super().__init__(source, _HostSteps(steps))
 
     @property
     def records(self) -> int:

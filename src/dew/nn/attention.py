@@ -29,6 +29,7 @@ from dew.telemetry.devices import deterministic_ops_requested
 
 from .attention_sinks import attention_with_sinks
 from .flops import attention_flops, cross_attention_flops, projection_flops
+from .inputs import cu_seqlens
 from .kernels import decode_attention, generation, norm_swiglu
 from .kernels.generation import (
     bf16_dot_runs,
@@ -84,9 +85,9 @@ reference path where the call asks for arithmetic only it honours
 (`reference_only`), or where jax.nn's xla kernel would narrow or chain it;
 else triton where cudnn's kernel runs and `triton_runs`; flash where
 `flash_refusal` finds none; cudnn where its kernel runs (`cudnn_runs`); tpu
-where splash's does (`tpu_runs`); and xla anywhere else. A call off the kernel
-the device's target row (`gpu_target().kernels`) measured fastest is logged
-once a process with the reason (`ran_kernel`).
+where splash's does (`tpu_runs`); and xla anywhere else. A bf16 or fp16 call
+off the kernel the device's target row (`gpu_target().kernels`) measured
+fastest is logged at INFO once a process with the reason (`ran_kernel`).
 """
 
 
@@ -1012,21 +1013,20 @@ FLASH_MAX_HEAD_DIM = 256
 # Its backward takes heads up to 192 wide on sm8x parts other than sm80: "FlashAttention backward for
 # head dim > 192 requires A100/A800 or H100/H800", measured on an RTX 4080.
 FLASH_MAX_BACKWARD_HEAD_DIM = 192
+# Packed rows run as varlen sequences, each row's documents and its padding after them, so a row's
+# share of the grid is its declared document cap whatever it holds. At Qwen3.5-0.8B's attention (8 x 3072, 8
+# query heads over 2 of 256, causal) a cap of 64 ran forward and backward in 2.7 to 4.2 ms on an H100
+# and 6.7 to 13.7 on an A100 against the document mask's 12.3 to 12.7 and 22.7 to 24.7; the row
+# length's cap took 80 and 160 (docs/performance.md).
+FLASH_PACKED_SEGMENTS = 64
 
 
 def flash_architectures() -> tuple[str, ...] | None:
     """The GPU generations the installed dew_flash_attn holds code for, as the wheel reports them
-    (its build's CUDA architectures), or None where it is not installed. A wheel from before it
-    reported them, 0.1.0, holds sm80's alone."""
+    (its build's CUDA architectures), or None where it is not installed."""
     if importlib.util.find_spec('dew_flash_attn') is None:
         return None
-    return _reported_architectures(importlib.import_module('dew_flash_attn'))
-
-
-def _reported_architectures(wheel) -> tuple[str, ...]:
-    """The boundary with an installed dew_flash_attn: the architectures it reports, or sm80's alone
-    for 0.1.0, which predates the report."""
-    return getattr(wheel, 'ARCHITECTURES', ('sm80',))
+    return importlib.import_module('dew_flash_attn').ARCHITECTURES
 
 
 def flash_built_for(generation: str, architectures: tuple[str, ...]) -> bool:
@@ -1036,10 +1036,11 @@ def flash_built_for(generation: str, architectures: tuple[str, ...]) -> bool:
 
 
 def flash_refusal(query, key, causal=False, sliding_window=None, mask=None, bias=None, softcap=None,
-                  sinks=None) -> str | None:
+                  sinks=None, segment_ids=None, max_segments=None) -> str | None:
     """Why 'auto' does not send a call to FlashAttention (`flash_attention`),
     or None where it does: the GPU's target row names it, and names it for a
-    sliding window or sinks where the call has them, the query is bf16 or
+    sliding window, sinks or packed documents where the call has them, the
+    packing declaring at most `FLASH_PACKED_SEGMENTS` documents a row, the query is bf16 or
     fp16 with heads a multiple of 8 up to 256 wide (192 on sm8x parts other
     than sm80, whose backward takes no wider), a causal call is square, the
     call has no mask, bias or softcap, no deterministic ops are asked for,
@@ -1057,6 +1058,11 @@ def flash_refusal(query, key, causal=False, sliding_window=None, mask=None, bias
          f"the call has a sliding window, for which its target row names it on no {generation}"),
         (sinks is None or measured_kernel('attention_sinks', 'xla') == 'flash',
          f"the call has attention sinks, for which its target row names it on no {generation}"),
+        (segment_ids is None or measured_kernel('attention_packed', 'xla') == 'flash',
+         f"the call packs documents, for which its target row names it on no {generation}"),
+        (segment_ids is None or (max_segments is not None and max_segments <= FLASH_PACKED_SEGMENTS),
+         f"the call packs up to {max_segments} documents a row, past the {FLASH_PACKED_SEGMENTS} "
+         "its empty sequences cost less than the document mask"),
         (query.dtype in CUDNN_DTYPES, f"the query is {query.dtype}"),
         (head_dim % 8 == 0 and head_dim <= widest, f"the heads are {head_dim} wide"),
         (not causal or query.shape[-3] == key.shape[-3], "a causal call has more keys than queries"),
@@ -1070,15 +1076,19 @@ def flash_refusal(query, key, causal=False, sliding_window=None, mask=None, bias
     )
 
 
-def flash_attention(query, key, value, causal: bool, sliding_window=None, sinks=None):
+def flash_attention(query, key, value, causal: bool, sliding_window=None, sinks=None, segment_ids=None,
+                    max_segments: int | None = None):
     """FlashAttention (dew_flash_attn, kernels/flash_attn) over `[B, S, H, D]`
     arrays at jax.nn's default scale: FlashAttention-3 on Hopper and
     FlashAttention-2 elsewhere. A window keeps the keys `window_sides` counts,
     and `sinks` `[H]` puts one value-free logit a head in each row's
-    denominator. Its causal mask is
-    aligned to the last key, where jax.nn's is aligned to the first, so a
-    causal call is square. On a mesh it runs per shard (`_per_shard`). It runs
-    where the installed wheel holds code for the device (`flash_built_for`)."""
+    denominator. Packed rows, `segment_ids` `[B, S]` with at most
+    `max_segments` documents a row, run as the kernel's varlen sequences: each
+    document, and each row's padding after them, one sequence over the
+    flattened tokens. Its causal mask is aligned to the last key, where
+    jax.nn's is aligned to the first, so a causal call is square. On a mesh it
+    runs per shard (`_per_shard`). It runs where the installed wheel holds
+    code for the device (`flash_built_for`)."""
     generation = device_generation()
     architectures = flash_architectures()
     if architectures is None:
@@ -1086,13 +1096,25 @@ def flash_attention(query, key, value, causal: bool, sliding_window=None, sinks=
     if not flash_built_for(generation, architectures):
         raise ValueError(f"the installed dew_flash_attn holds code for {', '.join(architectures)} and this "
                          f"device is {generation}; use attention_impl 'cudnn' or 'xla'")
+    if segment_ids is not None and max_segments is None:
+        raise ValueError("flash attention runs packed rows as varlen sequences, and needs max_segments, "
+                         "the most documents a row holds (Coordinates.max_segments), to bound them")
     flash = importlib.import_module('dew_flash_attn')
     window = (-1, -1) if sliding_window is None else window_sides(causal, sliding_window)
 
-    def local(query, key, value, sinks=None):
-        return flash.flash_mha(query, key, value, is_causal=causal, window_size=window, sinks=sinks)
+    def local(query, key, value, sinks=None, segment_ids=None):
+        if segment_ids is None or max_segments is None:
+            return flash.flash_mha(query, key, value, is_causal=causal, window_size=window, sinks=sinks)
+        rows, length = segment_ids.shape
+        changes = segment_ids[:, 1:] != segment_ids[:, :-1]
+        begins = jnp.concatenate([jnp.ones((rows, 1), bool), changes], axis=1)
+        offsets = cu_seqlens(begins, rows * (max_segments + 1))
+        out = flash.flash_mha_varlen(*(x.reshape(rows * length, *x.shape[2:]) for x in (query, key, value)),
+                                     offsets, length, is_causal=causal, window_size=window, sinks=sinks)
+        return out.reshape(rows, length, *out.shape[1:])
 
-    return _per_shard(local, query, key, value, sinks=(sinks, ("activation_heads",)))
+    return _per_shard(local, query, key, value, sinks=(sinks, ("activation_heads",)),
+                      segment_ids=(segment_ids, ("activation_batch", None)))
 
 
 def triton_attention(query, key, value, causal: bool):
@@ -1198,7 +1220,7 @@ def softcapped_attention(query, key, value, softcap: float, dtype=None, precisio
 def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
                                  force_fp32_for_softmax=True, implementation='auto',
                                  causal=False, sliding_window=None, mask=None, bias=None,
-                                 sinks=None, softcap=None, segment_ids=None,
+                                 sinks=None, softcap=None, segment_ids=None, max_segments=None,
                                  key_value_seq_lengths=None, dropout_rate=0.0,
                                  dropout_rng=None, deterministic=True):
     """Attend over [B, S, H, D] queries, keys and values: [B, S, H, Dv] out.
@@ -1216,7 +1238,9 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
     `bias` is additive and broadcasts to [B, H, Q, K] (T5's position table).
     `sinks` is one learned value-free logit per query head in the denominator.
     `softcap` is Gemma 2's tanh on the scaled logits. `segment_ids` `[B, S]`
-    keeps each packed document to itself, 0 as padding (`document_mask`).
+    keeps each packed document to itself, 0 as padding (`document_mask`), and
+    `max_segments`, static, bounds the documents a row holds
+    (`Coordinates.max_segments`), which flash's packed sequences need.
     `key_value_seq_lengths` `[B]` ends each row's keys, which cuDNN skips; a
     mask that only ends rows early costs cuDNN a dense bias per head, so pass
     lengths for right padding.
@@ -1258,7 +1282,7 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
     else:
         out = kernel(query, key, value, causal=causal, sliding_window=sliding_window,
                      mask=mask, bias=bias, sinks=sinks, segment_ids=segment_ids,
-                     key_value_seq_lengths=key_value_seq_lengths)
+                     max_segments=max_segments, key_value_seq_lengths=key_value_seq_lengths)
     return checkpoint_name(out, 'attention_output')
 
 
@@ -1380,7 +1404,7 @@ def folded_attention(query, key, value, mask=None):
 
 
 def fused_attention(query, key, value, bias, mask, causal, sliding_window, implementation, *,
-                    softcap, sinks, segment_ids, key_value_seq_lengths):
+                    softcap, sinks, segment_ids, key_value_seq_lengths, max_segments=None):
     """Run the fused kernel `implementation` names, at the query's head width.
 
     A narrower value rides in padded and its columns come back out, at no
@@ -1447,7 +1471,7 @@ def fused_attention(query, key, value, bias, mask, causal, sliding_window, imple
             raise ValueError("attention implementation 'flash' cannot run under --xla_gpu_deterministic_ops: "
                              "its backward sums the query gradient with atomics. "
                              "Use attention_impl 'xla'.")
-        out = flash_attention(query, key, value, causal, sliding_window, sinks)
+        out = flash_attention(query, key, value, causal, sliding_window, sinks, segment_ids, max_segments)
     elif (implementation == 'xla' and mask is None and folds(query, key, bias, mask, causal, sliding_window)
           and key_value_seq_lengths is not None and decode_attention.fits(query, key)):
         out = decode_attention.attend(query, key, value, key_value_seq_lengths)
@@ -1496,7 +1520,7 @@ def forward_mode_attention():
 def attention_kernel(query, key, value, dtype=None, precision=None,
                      force_fp32_for_softmax=True, implementation='auto',
                      causal=False, sliding_window=None, mask=None, bias=None, sinks=None,
-                     softcap=None, segment_ids=None, key_value_seq_lengths=None):
+                     softcap=None, segment_ids=None, max_segments=None, key_value_seq_lengths=None):
     """Dispatch one whole-sequence attention call to the kernel it names,
     differentiable in forward mode under `forward_mode_attention`.
 
@@ -1515,11 +1539,12 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
     resolved = resolve_implementation(
         implementation, query, key, dtype=dtype, precision=precision,
         force_fp32_for_softmax=force_fp32_for_softmax, softcap=softcap, sinks=sinks,
-        causal=causal, sliding_window=sliding_window, mask=masked, bias=bias)
+        causal=causal, sliding_window=sliding_window, mask=masked, bias=bias,
+        segment_ids=segment_ids, max_segments=max_segments)
     call = functools.partial(
         _attention_kernel, dtype=dtype, precision=precision, force_fp32_for_softmax=force_fp32_for_softmax,
         causal=causal, sliding_window=sliding_window, mask=mask, masked=masked, softcap=softcap,
-        segment_ids=segment_ids, lengths=lengths)
+        segment_ids=segment_ids, max_segments=max_segments, lengths=lengths)
     if not FORWARD_MODE.get() or resolved not in ('cudnn', 'triton', 'flash', 'tpu'):
         return call(query, key, value, bias=bias, sinks=sinks, implementation=resolved)
 
@@ -1549,11 +1574,12 @@ def forward_differentiable(value, tangent, *arrays):
 
 def _attention_kernel(query, key, value, *, bias, sinks, implementation, dtype, precision,
                       force_fp32_for_softmax, causal, sliding_window, mask, masked, softcap,
-                      segment_ids, lengths):
+                      segment_ids, max_segments, lengths):
     """Run one whole-sequence attention call on the kernel `attention_kernel` resolved.
 
     `masked` is `mask` with the key `lengths` in it. Splash takes sinks, a
-    softcap and packed segment ids itself; elsewhere segment ids become the
+    softcap and packed segment ids itself, and flash takes the ids as its
+    packed sequences given `max_segments`; elsewhere segment ids become the
     document mask, and sinks and a softcap run their own XLA paths, since
     `jax.nn.dot_product_attention` has neither. The rest goes to
     `fused_attention` once the arguments it cannot honour have raised. Key
@@ -1561,7 +1587,8 @@ def _attention_kernel(query, key, value, *, bias, sinks, implementation, dtype, 
     they mean, which splash cannot describe, so 'auto' never picks 'tpu' for
     them.
     """
-    if segment_ids is not None and implementation != 'tpu':
+    packed = implementation == 'tpu' or (implementation == 'flash' and max_segments is not None)
+    if segment_ids is not None and not packed:
         mask = with_documents(mask, segment_ids)
         masked = with_documents(masked, segment_ids)
         # cuDNN would take the document mask as an additive bias
@@ -1603,7 +1630,8 @@ def _attention_kernel(query, key, value, *, bias, sinks, implementation, dtype, 
         implementation, query, dtype, precision, force_fp32_for_softmax)
     return fused_attention(query, key, value, bias, mask, causal, sliding_window,
                            implementation, softcap=softcap, sinks=sinks,
-                           segment_ids=segment_ids, key_value_seq_lengths=lengths)
+                           segment_ids=segment_ids, max_segments=max_segments,
+                           key_value_seq_lengths=lengths)
 
 
 def reference_only(query, dtype, precision, force_fp32_for_softmax) -> bool:
@@ -1641,7 +1669,8 @@ def _xla_kernel_chains(query, key) -> bool:
 
 def resolve_implementation(implementation, query, key, *, dtype=None, precision=None,
                            force_fp32_for_softmax=True, softcap=None, sinks=None, causal=False,
-                           sliding_window=None, mask=None, bias=None) -> str:
+                           sliding_window=None, mask=None, bias=None, segment_ids=None,
+                           max_segments=None) -> str:
     """The concrete kernel an `AttentionImpl` names for this call.
 
     Only 'auto' chooses, against the call's shapes and this machine's
@@ -1651,8 +1680,8 @@ def resolve_implementation(implementation, query, key, *, dtype=None, precision=
     (`reference_only`), else triton where `triton_runs` and cudnn's kernel
     would take the call, flash where `flash_refusal` has no refusal, cudnn
     where `cudnn_runs` and the call has no sinks and no bidirectional window,
-    the tpu kernel where `tpu_runs`, and xla anywhere else; a call off flash
-    where it was measured fastest is logged (`ran_kernel`). Any other name is returned as it is,
+    the tpu kernel where `tpu_runs`, and xla anywhere else; a bf16 or fp16 call
+    off flash where it was measured fastest is logged (`ran_kernel`). Any other name is returned as it is,
     so an explicit kernel still refuses what it cannot honour by name.
     """
     if implementation not in get_args(AttentionImpl):
@@ -1670,11 +1699,13 @@ def resolve_implementation(implementation, query, key, *, dtype=None, precision=
     # tokamax's Triton kernel, where it takes the call, ran
     # SimpleDiT-B's 64-wide heads as fast as FlashAttention-2 on the A100 and
     # faster on the L4; on an H100 FlashAttention-3 took half its time, so a
-    # target row names the kernel for heads it takes (`attention_narrow`).
-    if fused and measured_kernel('attention_narrow', 'triton') == 'triton' and triton_runs(
-            query, sliding_window, mask, bias):
+    # target row names the kernel for heads it takes (`attention_narrow`). It
+    # takes no packed documents.
+    if (fused and segment_ids is None and measured_kernel('attention_narrow', 'triton') == 'triton'
+            and triton_runs(query, sliding_window, mask, bias)):
         return 'triton'
-    refusal = flash_refusal(query, key, causal, sliding_window, mask, bias, softcap, sinks)
+    refusal = flash_refusal(query, key, causal, sliding_window, mask, bias, softcap, sinks, segment_ids,
+                            max_segments)
     if refusal is None:
         return 'flash'
     if fused:
@@ -1683,7 +1714,8 @@ def resolve_implementation(implementation, query, key, *, dtype=None, precision=
         chosen = 'tpu'
     else:
         chosen = 'xla'
-    return ran_kernel('attention', chosen, refusal)
+    # FlashAttention takes no other query dtype, so such a call declines no kernel it could run.
+    return ran_kernel('attention', chosen, refusal) if query.dtype in CUDNN_DTYPES else chosen
 
 
 def kernel_for_materialized_mask(implementation: str, query, *, dtype=None, precision=None,

@@ -1133,6 +1133,30 @@ tools/benchmark_attention.py --implementations xla flash --sequence-lengths 4096
 --value-dim 128 --batch-size 2 --heads 128 --kv-groups 16 --causal True --sliding-window 128
 --sinks`.
 
+### Packed rows on FlashAttention's varlen kernel, 2026-10-13
+
+A packed call ran XLA's attention under the document mask. Flash's varlen kernel takes the rows as
+sequences instead, each document and each row's padding after them one sequence over the flattened
+tokens, so `cu_seqlens` holds `B * (max_segments + 1)` sequences whatever the rows hold: the cap is
+a static size, and the sequences past a row's documents are empty but still launch. At Qwen3.5-0.8B's
+attention (8 x 3072 tokens, 8 query heads over 2 of 256, causal, 64 padding tokens a row), forward
+and backward in ms, median of 20, jax 0.11.2:
+
+| documents a row | xla, document mask | flash, cap = documents | flash, cap 64 | flash, cap 3072 |
+|---|---:|---:|---:|---:|
+| H100 SXM, 1 | 12.58 | 2.63 | 4.19 | 81.61 |
+| H100 SXM, 4 | 12.68 | 1.71 | 3.22 | 81.03 |
+| H100 SXM, 16 | 12.27 | 1.45 | 2.66 | 79.94 |
+| A100 40GB, 1 | 22.75 | 8.23 | 13.69 | 162.51 |
+| A100 40GB, 4 | 22.73 | 5.77 | 9.19 | 159.02 |
+| A100 40GB, 16 | 24.65 | 3.94 | 6.69 | 157.13 |
+
+An empty sequence costs about 3.2 us on the H100 and 6.3 on the A100, so a cap of the row length
+loses to the mask, and 64 wins at every document count. The target rows of sm80 and sm90 name
+flash for `attention_packed`, and `flash_refusal` takes a packed call there when its
+`Coordinates.max_segments` is at most 64 (`FLASH_PACKED_SEGMENTS`); a cap the data does not declare
+is the row length, which stays on the mask.
+
 ### Splash's tiles on the TPU, 2026-10-02
 
 Splash attention took 34 ms of Dew's 156 ms Qwen3-0.6B step at 8 x 1024
@@ -3132,6 +3156,49 @@ costs, so Dew keeps the branch beside the module's product. The kernel and the b
 mode are on the branch `perf/lora-in-gemm` at `837154b54`:
 `PYTHONPATH=src python tools/benchmark_kernels.py lora --tokens 768 --tiles 128,128,32,4,3
 128,128,64,4,3 128,256,64,8,3 64,128,32,4,4` (jax 0.11.2). The G4 (sm120) was not measured.
+
+### A LoRA run's frozen base in FP8, 2026-10-13
+
+A frozen projection takes part in two products a step, its forward and its input's gradient, and
+neither needs the kernel's gradient, so its kernel can be packed in E4M3 once for both
+(`dew.training.quantization.frozen_fp8_leaves`, `LoRA.fp8_base`). Each product then casts its other
+operand's rows to E4M3 at their current amax, multiplies the codes widened to fp32, which XLA
+rewrites to a cuBLASLt FP8 GEMM, and applies both rows' scales after. The cast of the activation
+rows costs a read and a write of them each product, so FP8 pays where the product is wide in both
+widths. Forward plus input gradient of one projection on an H100 80GB HBM3, bf16 against FP8,
+jitted medians of five interleaved groups of thirty calls, 8192 tokens (jax 0.11.2):
+
+| in x out | bf16 ms | FP8 ms | ratio |
+|---|---:|---:|---:|
+| 1024 x 1024 | 0.131 | 0.187 | 0.70 |
+| 1024 x 3584 | 0.273 | 0.364 | 0.75 |
+| 2048 x 2048 | 0.292 | 0.341 | 0.86 |
+| 4096 x 1024 | 0.304 | 0.392 | 0.78 |
+| 2048 x 8192 | 0.894 | 0.844 | 1.06 |
+| 4096 x 4096 | 0.839 | 0.766 | 1.10 |
+| 4096 x 8192 | 1.741 | 1.332 | 1.31 |
+| 4096 x 12288 | 2.609 | 1.779 | 1.47 |
+| 12288 x 4096 | 2.639 | 1.820 | 1.45 |
+
+So a Qwen3.5-0.8B's projections (1024 wide) stay in bf16, and a 9B's attention and MLP
+projections gain. Which sites run FP8 is that measurement on the run's own GPU and token count
+(`measured_fp8_sites`), recorded with the generation it was taken on; another generation is
+refused rather than reusing it. The function changes by E4M3's rounding of both operands.
+
+The packed codes stand in the train state in place of the frozen kernels they encode, two bytes a
+parameter as bf16's are, and a merge decodes them (`frozen_fp8_kernel`). A whole run, Qwen3.5-9B
+under a rank-16 LoRA on its attention and MLP projections, 2 x 2048 fineweb-edu tokens a step, 300
+steps on an H100 80GB HBM3 (jax 0.11.2), each arm on the same windows:
+
+| base | step ms | peak GiB | loss over bf16's, last 50 steps |
+|---|---:|---:|---:|
+| bf16 | 299.8 | 44.59 | |
+| bf16, another LoRA seed | 299.8 | 44.59 | under 0.02% |
+| FP8 at the 189 sites measured faster | 255.3 | 44.83 | +0.40% |
+
+The FP8 run's loss sits about 0.4% above bf16's from the first step on, the rounding of both
+operands, where another seed of the bf16 run moves it by under 0.02%; a run that wants bf16's
+function keeps its base in bf16.
 
 ### Faster kernels not adopted
 

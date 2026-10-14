@@ -103,8 +103,9 @@ TARGETS = {target.generation: target for target in (
               aliases=('gpu:t4', 't4')),
     GpuTarget('sm80', 'NVIDIA A100-SXM4-80GB', 163 * 1024,
               {'attention': 'flash', 'attention_window': 'flash', 'attention_sinks': 'flash',
-               'grouped_matmul': 'pallas', 'xla_triton_gemm': 'off', 'narrow_copies': 'on',
-               'rms_norm': 'pallas', 'swiglu': 'pallas', 'gated_delta_rule': 'fla', 'ssd': 'pallas'},
+               'attention_packed': 'flash', 'grouped_matmul': 'pallas', 'xla_triton_gemm': 'off',
+               'narrow_copies': 'on', 'rms_norm': 'pallas', 'swiglu': 'pallas', 'gated_delta_rule': 'fla',
+               'ssd': 'pallas'},
               {'NVIDIA A100': {'bf16': 312e12}}, ('gpu:a100', 'a100')),
     GpuTarget('sm86', 'NVIDIA A10', 99 * 1024, {'grouped_matmul': 'pallas'},
               {'NVIDIA A10': {}, 'NVIDIA GeForce RTX 3090': {'bf16': 71e12}}),
@@ -116,8 +117,8 @@ TARGETS = {target.generation: target for target in (
                'NVIDIA GeForce RTX 4080': {'bf16': 97.5e12}}, ('gpu:l4', 'l4')),
     GpuTarget('sm90', 'NVIDIA H100 80GB HBM3', 227 * 1024,
               {'attention': 'flash', 'attention_narrow': 'flash', 'attention_window': 'flash',
-               'attention_sinks': 'flash', 'grouped_matmul': 'pallas', 'rms_norm': 'pallas',
-               'swiglu': 'pallas', 'gated_delta_rule': 'fla', 'ssd': 'pallas'}, {
+               'attention_sinks': 'flash', 'attention_packed': 'flash', 'grouped_matmul': 'pallas',
+               'rms_norm': 'pallas', 'swiglu': 'pallas', 'gated_delta_rule': 'fla', 'ssd': 'pallas'}, {
         'NVIDIA H100': {'bf16': 989e12, 'fp8': 1979e12},
         'NVIDIA H100 PCIe': {'bf16': 756e12, 'fp8': 1513e12},
         'NVIDIA H100 NVL': {'bf16': 835e12, 'fp8': 1670.5e12},
@@ -200,16 +201,20 @@ def _compute_capability(device) -> str | None:
 
 
 def device_generation() -> str:
-    """Return the default device's hardware generation.
+    """Return the hardware generation of the devices a call is placed on.
 
     The generation is 'sm89' for a GPU of compute capability 8.9, 'v6e' for a
     TPU v6e, and the platform's name otherwise; within `assumed`, the one it
-    names.
+    names. A call placed off the process's default backend (`placed_platform`),
+    as a host-layout run's on a GPU host's CPU, takes its platform's name, so
+    every choice a target row measures (`measured_kernel`) follows it there.
     """
     import jax
     generation = ASSUMED.get()
     if generation is not None:
         return generation
+    if (platform := placed_platform()) != jax.default_backend():
+        return platform
     device = jax.devices()[0]
     capability = _compute_capability(device) if device.platform == 'gpu' else None
     if capability:
@@ -232,15 +237,16 @@ _logged: set[tuple[str, str, str]] = set()
 def ran_kernel(choice: str, kernel: str, refusal: str, fastest: str | None = None) -> str:
     """Return `kernel`, which a call to `choice` runs because the kernel measured fastest on this
     generation, `fastest` or else the one `KERNELS` names, turned it down for `refusal`. The first such
-    call in a process for each kernel and refusal is logged as a warning naming both, so a change that
-    sends calls off the measured kernel shows in a run's log, not only in its step time. A generation
-    without a measurement, or a call that runs the measured kernel, logs nothing."""
+    call in a process for each kernel and refusal is logged at INFO naming both, so a change that sends
+    calls off the measured kernel shows in a run's log, not only in its step time; it is the dispatch's
+    own choice, which a user has nothing to act on. A generation without a measurement, or a call that
+    runs the measured kernel, logs nothing."""
     generation = device_generation()
     measured = fastest or gpu_target(generation).kernels.get(choice)
     if measured not in (None, kernel) and (choice, kernel, refusal) not in _logged:
         _logged.add((choice, kernel, refusal))
-        _log.warning("%s runs %r, not %r, the kernel measured fastest on %s: %s",
-                     choice, kernel, measured, generation, refusal)
+        _log.info("%s runs %r, not %r, the kernel measured fastest on %s: %s",
+                  choice, kernel, measured, generation, refusal)
     return kernel
 
 

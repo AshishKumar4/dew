@@ -12,7 +12,7 @@ of each option. A head that reads the backbone's output table says so with
 import dataclasses
 import functools
 import math
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import ClassVar, Self
 
 import jax
@@ -22,13 +22,13 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew import records
-from dew.decision.layout import DecisionInputs
+from dew.decision.layout import DecisionInputs, Encoded
 from dew.decision.questions import KINDS, Choice, Noul, Score
 from dew.nn.activations import gelu_exact_torch
 from dew.nn.attention import NormalAttention, l2_normalized
 from dew.nn.backbones.decoder_block import BlockWiring, DecoderBlock, decoder_norm
 from dew.nn.flops import attention_flops, projection_flops, real_lengths
-from dew.nn.inputs import AttentionMetadata, coordinates
+from dew.nn.inputs import AttentionMetadata
 from dew.nn.mixer_base import MixerContext
 from dew.nn.mixers import AttentionMixer
 from dew.nn.mlp import GatedMLP
@@ -52,8 +52,18 @@ class Head(nn.Module):
     """
 
     reads_table: ClassVar[bool] = False
+    one_question: ClassVar[bool] = False
+    """Whether the head reads one question a row, refusing a joint row's several
+    questions at the host boundary (`validate_rows`)."""
     width_field: ClassVar[str] = "features"
     """The field holding the width of the states the head reads."""
+
+    @nn.nowrap
+    def validate_rows(self, rows: Sequence[Encoded]) -> None:
+        """Refuse encoded host rows that ask more questions than this head reads."""
+        if self.one_question and any(len(row.questions) > 1 for row in rows):
+            raise ValueError("this head reads one question a row; lay the rows out with a "
+                             "QuestionLayout or use a joint head")
 
     def record(self) -> JSON:
         """Return the head's name and the fields a run records."""
@@ -96,8 +106,10 @@ class DecisionHead(Head):
     out, because its own model card reports that it carries no signal.
 
     It reads one question per row (`QuestionLayout`), the first token of each
-    option slot being its marker.
+    option slot being its marker, and a window's rows apart from each other.
     """
+
+    one_question: ClassVar[bool] = True
 
     features: int
     layers: int = 2
@@ -147,19 +159,19 @@ class DecisionHead(Head):
 
     def __call__(self, states: jax.Array, inputs: DecisionInputs, table: jax.Array | None = None,
                  train: bool = False) -> jax.Array:
-        if inputs.kinds.shape[1] != 1:
-            raise ValueError("Laya's head reads one question per row; lay the rows out with a QuestionLayout")
-        x = states + self.type_embedding(inputs.kinds[:, 0])[:, None, :].astype(states.dtype)
-        valid = inputs.valid
-        metadata = AttentionMetadata(
-            coordinates=None if valid is None else coordinates(valid=valid))
+        # Every token takes its row's question type: a QuestionLayout row asks one question.
+        owned = inputs.question_segments[:, None, :] == inputs.segments[:, :, None]
+        kinds = jnp.sum(jnp.where(owned, inputs.kinds[:, None, :], 0), axis=-1)
+        x = states + self.type_embedding(kinds).astype(states.dtype)
+        metadata = AttentionMetadata(coordinates=inputs.coordinates())
         for block in self.blocks:
             x = block(x, train=train, attention_metadata=metadata)
             if not isinstance(x, jax.Array):
                 raise TypeError("the head's blocks carry one plain residual stream")
-        marked = jnp.take_along_axis(x, inputs.markers[:, 0, :, None], axis=1)
+        batch, count, width = inputs.markers.shape
+        marked = _gathered(x, inputs.markers.reshape(batch, count * width))
         hidden = gelu_exact_torch(self.scorer_hidden(self.scorer_norm(marked)))
-        scores = self.scorer_out(hidden)[:, None, :, 0]
+        scores = self.scorer_out(hidden)[..., 0].reshape(batch, count, width)
         return scores.astype(at_least_fp32(scores.dtype))
 
 
@@ -179,13 +191,13 @@ class _RoutingLayer(nn.Module):
     attention_impl: str = "auto"
 
     @nn.compact
-    def __call__(self, queries: jax.Array, memory: jax.Array, tokens: jax.Array) -> jax.Array:
+    def __call__(self, queries: jax.Array, memory: jax.Array, read: jax.Array) -> jax.Array:
         attention = NormalAttention(self.width, heads=self.heads, dim_head=self.width // self.heads,
                                     dtype=self.dtype, precision=self.precision,
                                     attention_impl=self.attention_impl, name="attention")
         memory = _layer_norm(self.dtype, "memory_norm")(memory)
         normed = _layer_norm(self.dtype, "query_norm")(queries)
-        queries = queries + attention(normed, memory, key_value_seq_lengths=tokens)
+        queries = queries + attention(normed, memory, mask=read)
         mlp = GatedMLP(hidden_features=self.feedforward, out_features=self.width, activation="gelu_exact",
                        use_bias=True, dtype=self.dtype, precision=self.precision, name="feedforward")
         return queries + mlp(_layer_norm(self.dtype, "feedforward_norm")(queries))
@@ -203,17 +215,17 @@ class _FieldLayer(nn.Module):
     attention_impl: str = "auto"
 
     @nn.compact
-    def __call__(self, fields: jax.Array, memory: jax.Array, questions: jax.Array,
-                 tokens: jax.Array) -> jax.Array:
+    def __call__(self, fields: jax.Array, memory: jax.Array, asked: jax.Array,
+                 read: jax.Array) -> jax.Array:
         def attention(name: str) -> NormalAttention:
             return NormalAttention(self.width, heads=self.heads, dim_head=self.width // self.heads,
                                    dtype=self.dtype, precision=self.precision,
                                    attention_impl=self.attention_impl, name=name)
 
         normed = _layer_norm(self.dtype, "norm1")(fields)
-        fields = fields + attention("self_attn")(normed, key_value_seq_lengths=questions)
+        fields = fields + attention("self_attn")(normed, mask=asked)
         normed = _layer_norm(self.dtype, "norm2")(fields)
-        fields = fields + attention("multihead_attn")(normed, memory, key_value_seq_lengths=tokens)
+        fields = fields + attention("multihead_attn")(normed, memory, mask=read)
         mlp = GatedMLP(hidden_features=self.feedforward, out_features=self.width, activation="gelu_exact",
                        use_bias=True, dtype=self.dtype, precision=self.precision, name="mlp")
         return fields + mlp(_layer_norm(self.dtype, "norm3")(fields))
@@ -272,9 +284,11 @@ class JointSchemaHead(Head):
     scales are learned in log space and held to 100 at most.
 
     It reads every question of a row (`JointLayout`), and the backbone's output
-    table. Each option is computed on its own but for its weight in its
-    question's summary, so where the inputs compact each row's real options
-    (`DecisionInputs.option_slots`) it computes those alone, and lays their
+    table. In a window of packed rows each question and option reads its own
+    row alone, and the row's last token is its own. Each option is computed on
+    its own but for its weight in its question's summary, so where the inputs
+    compact each window's real options (`DecisionInputs.option_slots`) it
+    computes those alone, and lays their
     routed states (for the summaries) and their logits back on the grid.
     """
 
@@ -358,10 +372,13 @@ class JointSchemaHead(Head):
         if table is None:
             raise ValueError("Clef's head reads the backbone's output table, its lexical prior")
         hidden = self.hidden_norm(states)
-        batch = inputs.valid.shape[0]
+        batch = inputs.tokens.shape[0]
         memory = self.memory_projection(hidden)
-        last = jnp.maximum(jnp.sum(inputs.valid, axis=1) - 1, 0)
-        last_state = hidden[jnp.arange(batch), last]
+        # Each question reads its own row of the window: that row's last token, and its tokens alone.
+        rows = inputs.question_segments
+        own = (rows[:, :, None] == inputs.segments[:, None, :]) | (rows[:, :, None] == 0)
+        last = jnp.max(jnp.where(own, jnp.arange(inputs.tokens.shape[1]), 0), axis=-1)
+        last_state = _gathered(hidden, last)
         questions = _span_means(hidden, inputs.spans)
         count, width = inputs.options.shape[1:]
         # The option slots computed, `[B, P]` flat indices into the grid, and each one's question.
@@ -375,29 +392,27 @@ class JointSchemaHead(Head):
 
         queries = (self.option_context_projection(contexts) + self.option_lexical_projection(lexical)
                    + _gathered(self.option_question_projection(questions), owners))
-        # A row's tokens and questions are right-padded, so each attention is told where its keys end
-        # (at least one, for a padding row) rather than given a dense mask, which a fused kernel reads
-        # as a bias per head, [B, H, Q*K, T]: 0.24 GiB of the step's temporaries at B=16 with 2,800
-        # option queries over 3,072 tokens (c47).
-        tokens = jnp.maximum(jnp.sum(inputs.valid, axis=1, dtype=jnp.int32), 1)
-        asked = jnp.maximum(jnp.sum(inputs.questions, axis=1, dtype=jnp.int32), 1)
+        # A slot reads its own row's tokens and questions, and a padding slot every one of them, so
+        # each query has a key. The masks are [B, 1, queries, keys], one for every head.
+        read = _gathered(own, owners)[:, None]
+        asked = ((rows[:, :, None] == rows[:, None, :]) | (rows[:, :, None] == 0))[:, None]
         routed = queries
         for layer in self.evidence_layers:
-            routed = layer(routed, memory, tokens)
+            routed = layer(routed, memory, read)
         grid = _laid_back(routed, inputs)
 
         fields = self.question_projection(questions)
         affinity = jnp.einsum("bqkw,bqw->bqk", grid, fields) / math.sqrt(self.width)
         weights = jax.nn.softmax(jnp.where(inputs.options, affinity, -jnp.inf), axis=-1)
         summaries = jnp.einsum("bqk,bqkw->bqw", jnp.where(inputs.options, weights, 0.0), grid)
-        rows = jnp.asarray(_CLEF_ROWS)[inputs.kinds]
-        fields = (fields + self.option_summary_norm(summaries) + self.global_projection(last_state)[:, None]
-                  + self.type_embedding(rows))
+        types = jnp.asarray(_CLEF_ROWS)[inputs.kinds]
+        fields = (fields + self.option_summary_norm(summaries) + self.global_projection(last_state)
+                  + self.type_embedding(types))
         for layer in self.field_layers:
-            fields = layer(fields, memory, asked, tokens)
+            fields = layer(fields, memory, asked, own[:, None])
         fields = self.field_norm(fields)
 
-        anchor = _gathered(l2_normalized(questions + last_state[:, None], 1e-12), owners)
+        anchor = _gathered(l2_normalized(questions + last_state, 1e-12), owners)
         prior = (jnp.exp(jnp.minimum(self.prior_logit_scale, math.log(100.0)))
                  * jnp.einsum("bpd,bpd->bp", l2_normalized(lexical, 1e-12), anchor))
         options = self.option_norm(routed)
