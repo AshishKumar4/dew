@@ -208,7 +208,7 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
         from dew.data.pipeline import ObjectiveData
         from dew.data.steps.text import FixedTokens
 
-        geometry = FixedTokens(self.sequence_length, pad_id=self.pad_token_id)
+        geometry = FixedTokens(self.sequence_length)
         return ObjectiveData(train=(geometry,), evaluate=(geometry,))
 
     def _process(self):
