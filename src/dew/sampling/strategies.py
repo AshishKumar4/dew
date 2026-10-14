@@ -762,14 +762,14 @@ def _committed(block_size: int, step: StepState, emitted: jax.Array, terminated:
     """
     active = step.active
     limit = jnp.where(active, jnp.minimum(matched + 1, budget - step.step), 0)
-    walked, live, count, ended = step, active, jnp.zeros_like(step.step), terminated
+    walked, live, ended = step, active, terminated
     for at in range(block_size + 1):
         kept = live & (at < limit)
         walked = walked.commit(emitted[:, at], kept)
         fired = stopping(walked, emitted[:, at]) & kept
-        count, ended, live = count + kept.astype(count.dtype), ended | fired, live & ~fired
-    walked = dataclasses.replace(walked, active=active & ~ended & (step.step + count < budget))
-    return walked, count, ended
+        ended, live = ended | fired, live & ~fired
+    walked = dataclasses.replace(walked, active=active & ~ended & (walked.step < budget))
+    return walked, walked.step - step.step, ended
 
 
 def _written(out: Draws, emitted: jax.Array, behavior: jax.Array, original: jax.Array, keep: jax.Array,
