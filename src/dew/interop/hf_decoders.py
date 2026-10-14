@@ -374,6 +374,10 @@ def _text_aliases(names: Collection[str], read: Callable[[str], np.ndarray], con
                 and parts[3:] in (["embed_tokens", "weight"], ["shared_head", "head", "weight"])):
             shared = embedding_name if parts[3] == "embed_tokens" else head_name
             reference = shared if shared in names else head_name
+            if reference == name:
+                # This copy stands in for the trunk's embedding (`_tied_names`),
+                # so it is the one the tree takes, not a copy of it.
+                continue
             if reference not in names or not np.array_equal(read(name), read(reference)):
                 raise ValueError(f"{name} differs from {shared}, which the depth shares")
             aliases.append((name, reference))
