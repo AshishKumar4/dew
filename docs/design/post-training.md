@@ -39,8 +39,7 @@ Packing reuses the existing machinery. `text_roles` joins as one more per-token 
 | key | shape | dtype | content |
 | --- | --- | --- | --- |
 | `text` | `[B, S+1]` | int32 | packed conversation ids |
-| `text_segment_ids` | `[B, S+1]` | int32 | which document, 0 on pad |
-| `text_positions` | `[B, S+1]` | int32 | position inside that document |
+| `text_coordinates` | `Coordinates`, `[B, S+1]` leaves | int32/bool | which document each token is in, 0 on pad, and its position inside it (`dew.nn.inputs.Coordinates`) |
 | `text_roles` | `[B, S+1]` | int8 | role per token, 0 on pad |
 
 `loss_role` multiplies the objective's existing target weights by `(text_roles[:, 1:] == loss_role)`, together with the pad and segment-boundary weights it already computes. With no `loss_role`, every counted target counts, as in pretraining.
