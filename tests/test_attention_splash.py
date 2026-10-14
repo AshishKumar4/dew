@@ -316,7 +316,8 @@ def exact_value_and_grads(query, key, value, sinks=None, live=None, causal=False
     against key head h // (Hq // Hkv) over sqrt(D), capped `c tanh(l / c)`,
     then the kept keys (k <= q; a causal window's w most recent, or without
     causality the keys within w - 1 of the query; the explicit mask; equal
-    segment ids), a softmax whose denominator a sink joins, and the values."""
+    segment ids), a softmax whose denominator a sink joins, and the values.
+    A query that keeps no key reads nothing: its output is zero."""
     def attention(q, k, v, s):
         _, q_len, heads, width = q.shape
         k_len, kv_heads = k.shape[1], k.shape[2]
@@ -334,12 +335,17 @@ def exact_value_and_grads(query, key, value, sinks=None, live=None, causal=False
             keep = keep & np.asarray(mask, bool)
         if segment_ids is not None:
             ids = np.asarray(segment_ids)
-            keep = keep & (ids[:, None, :, None] == ids[:, None, None, :])
-        logits = jnp.where(keep, logits, -jnp.inf)
+            # Segment 0 is padding, which belongs to no document (`document_mask`).
+            keep = keep & (ids[:, None, :, None] == ids[:, None, None, :]) & (ids[:, None, :, None] != 0)
+        keep = np.broadcast_to(keep, logits.shape)
+        sees = keep.any(-1, keepdims=True)
+        # A row that keeps no key softmaxes zeros instead of only -inf, whose
+        # NaN would reach every gradient through the weights zeroed below.
+        logits = jnp.where(keep, logits, jnp.where(sees, -jnp.inf, 0.0))
         if s is not None:
             sink = jnp.broadcast_to(s[None, :, None, None], (*logits.shape[:3], 1))
             logits = jnp.concatenate([logits, sink], -1)
-        weights = jax.nn.softmax(logits, axis=-1)[..., :k_len]
+        weights = jnp.where(keep & sees, jax.nn.softmax(logits, axis=-1)[..., :k_len], 0.0)
         return jnp.einsum('bhqk,bkhd->bqhd', weights, v[:, :, group])
 
     def loss(q, k, v, s):

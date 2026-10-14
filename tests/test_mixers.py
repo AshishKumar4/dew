@@ -136,26 +136,33 @@ def pulled(forward, variables, cotangent):
     return logits, pull(cotangent.astype(logits.dtype))[0]
 
 
-def packed_and_alone(model, variables, tokens, cotangent):
-    """Logits and parameter gradients of the documents' `tokens` `[1, sum(DOCUMENTS)]` run packed
-    (segment ids and positions restarting per document, then PADDING segment-0 slots whose logits
-    the loss ignores) and of each document run alone, the latter concatenated (`documents_alone`)."""
+def packed_forward(model, tokens, *, segmented=True):
+    """The forward of the documents' `tokens` `[1, sum(DOCUMENTS)]` packed in one row (positions
+    restarting per document, then PADDING slots whose logits the loss ignores), their segment ids
+    given, or with `segmented` False the same row and positions without them."""
     total = sum(DOCUMENTS)
+    assert tokens.shape == (1, total)
     documents = [jnp.full((1, length), i + 1, jnp.int32) for i, length in enumerate(DOCUMENTS)]
     segments = jnp.concatenate([*documents, jnp.zeros((1, PADDING), jnp.int32)], axis=1)
     positions = jnp.concatenate([*(jnp.arange(length)[None] for length in DOCUMENTS),
                                  jnp.zeros((1, PADDING), jnp.int32)], axis=1)
     row = jnp.concatenate([tokens, jnp.zeros((1, PADDING), tokens.dtype)], axis=1)
+    tokens_at = (coordinates(segments=segments, positions=positions, max_segments=len(DOCUMENTS) + 1)
+                 if segmented else coordinates(positions=positions))
 
-    def packed(variables):
-        return model.apply(variables, row, coordinates=coordinates(
-            segments=segments, positions=positions, max_segments=len(DOCUMENTS) + 1))[:, :total]
+    def forward(variables):
+        return model.apply(variables, row, coordinates=tokens_at)[:, :total]
 
+    return forward
+
+
+def packed_and_alone(model, variables, tokens, cotangent):
+    """Logits and parameter gradients of the documents' `tokens` run packed (`packed_forward`) and
+    of each document run alone, the latter concatenated (`documents_alone`)."""
     def run(forward):
         return jax.jit(functools.partial(pulled, forward))(variables, cotangent)
 
-    assert tokens.shape == (1, total)
-    return run(packed), run(documents_alone(model, tokens))
+    return run(packed_forward(model, tokens)), run(documents_alone(model, tokens))
 
 
 KIND_FIELDS = {"mlp": ({"intermediate_size": 64}, {}), "llama4": ({}, {"qk_norm": False}),
@@ -167,8 +174,8 @@ KIND_FIELDS = {"mlp": ({"intermediate_size": 64}, {}), "llama4": ({}, {"qk_norm"
 recurrent kinds default to their models' heads (Kimi Linear's 64 of 128, Qwen3.5's 32 of 128), whose
 per-key pairwise decays alone take 134 MB a chunk in KDA's portable math."""
 
-REFUSED = {"kpool_sparse_attention": "a packed row of documents"}
-"""Kinds that refuse packed rows by name, and the name."""
+REFUSED = {"kpool_sparse_attention"}
+"""Kinds that refuse packed rows."""
 
 
 @pytest.mark.parametrize("kind", sorted(mixers.paths))
@@ -193,7 +200,9 @@ def test_a_packed_row_computes_what_its_documents_compute_alone(kind):
     variables = model.init(jax.random.key(4), tokens)
     cotangent = jax.random.normal(jax.random.key(5), (1, sum(DOCUMENTS), VOCAB))
     if kind in REFUSED:
-        with pytest.raises(ValueError, match=REFUSED[kind]):
+        unsegmented = functools.partial(pulled, packed_forward(model, tokens, segmented=False))
+        jax.block_until_ready(jax.jit(unsegmented)(variables, cotangent))
+        with pytest.raises(ValueError):
             packed_and_alone(model, variables, tokens, cotangent)
         return
     with jax.default_matmul_precision("highest"):
@@ -208,12 +217,23 @@ def test_a_packed_row_computes_what_its_documents_compute_alone(kind):
                            terms={"logits": terms, "grads": terms_grads})
 
 
+def embedded(module, tokens):
+    """The scaled token embeddings the model's first layer reads, which `input_embeddings` replace."""
+    return module.scaled_embeddings(module.token_embeddings(tokens))
+
+
 @pytest.mark.parametrize("kind", sorted(mixers.paths))
 def test_no_token_reaches_another_document(kind):
     """Every mixer in the registry, on every backend: in a packed row (DOCUMENTS' first two, then
     segment-0 padding), changing the first document's tokens and the padding's leaves the second's
-    logits, and the gradients of a loss on them alone, bitwise as they were. The same program on the
-    same shapes, so any difference is information crossing a document boundary."""
+    logits, the parameters' gradients of a loss on them alone and its gradient at the second's
+    embedded tokens bitwise as they were. The same program on the same shapes, so any difference is
+    information crossing a document boundary.
+
+    The loss is differentiated at the embedded tokens, not through the lookup: the table's gradient
+    adds each position's by a scatter, which a GPU's deterministic XLA (`--xla_gpu_deterministic_ops`)
+    sums in an order every id in the row decides, so new ids in the first document reorder the
+    second's sums though nothing crosses."""
     if kind in REFUSED:
         pytest.skip(f"{kind} refuses packed rows")
     fields, overrides = KIND_FIELDS.get(kind, ({}, {}))
@@ -231,12 +251,14 @@ def test_no_token_reaches_another_document(kind):
     tokens_at = coordinates(segments=segments, positions=positions, max_segments=3)
 
     def second_document(row):
-        def loss(variables):
-            logits = model.apply(variables, row, coordinates=tokens_at)
+        def loss(variables, inputs):
+            logits = model.apply(variables, row, input_embeddings=inputs, coordinates=tokens_at)
             return jnp.sum(logits * weight), logits[:, first:first + second]
 
-        (_, logits), grads = jax.jit(jax.value_and_grad(loss, has_aux=True))(variables)
-        return logits, grads
+        inputs = model.apply(variables, row, method=embedded)
+        (_, logits), (grads, at_inputs) = jax.jit(jax.value_and_grad(loss, argnums=(0, 1), has_aux=True))(
+            variables, inputs)
+        return logits, grads, at_inputs[:, first:first + second]
 
     for (path, mine), theirs in zip(jax.tree_util.tree_leaves_with_path(second_document(changed)),
                                     jax.tree.leaves(second_document(tokens)), strict=True):

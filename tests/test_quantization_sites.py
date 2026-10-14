@@ -59,17 +59,20 @@ def test_the_scanned_stack_quantizes_each_layer_with_its_own_scales(case):
     assert_quantized(scanned.apply(loaded.variables, reference["ids"].astype(np.int32)), reference, "scanned")
 
 
-def test_layers_quantized_apart_refuse_one_scanned_run_by_name(case):
+def test_layers_quantized_apart_refuse_one_scanned_run(case):
     """A checkpoint that quantizes two otherwise like layers differently, here
     one with a projection left unquantized, gives them different scale trees,
-    which one scanned body cannot read; the scan says so."""
+    which one scanned body cannot read; the scan refuses them, and runs the
+    checkpoint whose layers are quantized alike."""
     _, loaded, reference = case
+    scanned = loaded.model.clone(scan_layers=True)
+    scanned.apply(dict(loaded.variables), reference["ids"].astype(np.int32))
     variables = jax.tree.map(lambda leaf: leaf, dict(loaded.variables))
     layer = variables[QUANTIZATION]["layers_1"]
     mixer = next(name for name in layer if "q_proj" in layer[name] or "qkv" in layer[name])
     layer[mixer] = {name: leaves for name, leaves in layer[mixer].items() if name != "q_proj"}
-    with pytest.raises(ValueError, match="'quantization' differs between layers_0 and layers_1"):
-        loaded.model.clone(scan_layers=True).apply(variables, reference["ids"].astype(np.int32))
+    with pytest.raises(ValueError):
+        scanned.apply(variables, reference["ids"].astype(np.int32))
 
 
 @pytest.mark.mesh(devices=2)
@@ -146,7 +149,7 @@ def test_a_server_of_the_packed_task_reloads_the_loaded_models_own_tree(case):
     member = node[group.members[1]]
     leaf = next(iter(member))
     node[group.members[1]] = {**member, leaf: np.float32(2) * member[leaf]}
-    with pytest.raises(ValueError, match="quantize their one input apart"):
+    with pytest.raises(ValueError):
         server.reload(variables)
 
 
@@ -181,9 +184,11 @@ def test_a_linear_given_its_input_by_name_quantizes_it_too():
     assert not np.array_equal(np.asarray(nn.Dense(8).apply({"params": params}, x)), np.asarray(positional))
 
 
-def test_a_scheme_its_arithmetic_ignores_is_refused_by_name():
+def test_a_scheme_its_arithmetic_ignores_is_refused():
     """ModelOpt's NVFP4 always rounds its local scales to E4M3, so a record
     that says otherwise is refused where it is made, not computed apart."""
-    with pytest.raises(ValueError, match="always rounds its local scales to E4M3"):
+    InputQuantization(e4m3_scale=True, format="modelopt")
+    InputQuantization(e4m3_scale=False)
+    with pytest.raises(ValueError):
         InputQuantization(e4m3_scale=False, format="modelopt")
 
