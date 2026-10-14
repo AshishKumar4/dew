@@ -9,6 +9,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 from reference_error import assert_as_exact_as_the_reference
+from steady_state import steady_state
 
 from dew.decision import (
     Abstention,
@@ -254,6 +255,33 @@ def test_score_is_a_validation_pass_through_the_task_s_temperatures(decide):
     assert set(scores) == {"accuracy", "ece", "aurc", "log_loss"}
     assert scores["accuracy"] == pytest.approx(np.mean([int(np.argmax(answer.probabilities)) == 0
                                                         for answer in answers]))
+    # A second score runs the forward the first compiled.
+    with steady_state(allow=("host_to_device", "device_to_host")):
+        assert decide.score(examples) == scores
+
+
+def test_an_evaluation_runs_the_modules_the_objective_holds_now(decide):
+    """A substitution at the same shapes that changes the arithmetic, as a
+    narrowed or quantized head does, is what the next evaluation runs, as an
+    objective built holding it runs it."""
+    import jax.numpy as jnp
+
+    from dew.decision import DecisionObjective
+
+    def logits(objective):
+        return np.concatenate([found for _, found, _ in passed(objective, decide.variables, examples)])
+
+    examples = answered()
+    objective = DecisionObjective(decide)
+    before = logits(objective)
+    backbone, head = (entry.module for entry in objective.program_key())
+    narrowed = [backbone, head.clone(dtype=jnp.bfloat16)]
+    objective.substitute(narrowed)
+    built = DecisionObjective(decide)
+    built.substitute(narrowed)
+    expected = logits(built)
+    assert not np.array_equal(before, expected)
+    np.testing.assert_array_equal(logits(objective), expected)
 
 
 def test_an_objective_from_a_calibrated_task_validates_without_its_temperatures(decide):
