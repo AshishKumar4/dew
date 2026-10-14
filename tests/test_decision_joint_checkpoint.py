@@ -1,4 +1,7 @@
-"""Clef's layout and head against Clef's own code (Cloudflare/clef 2f3de3dd), under the float64 rule."""
+"""A joint-head release's layout and head against the release's own code, under the float64 rule.
+
+The release and its commit are tests/fixtures/joint_checkpoint/tiny/source.json's,
+and tools/joint_checkpoint_reference.py wrote the fixtures from its code."""
 
 import base64
 import io
@@ -32,13 +35,13 @@ from dew.decision import (
     TopProbability,
 )
 from dew.decision.calibration import softmax
-from dew.decision.clef import ClefHead
 from dew.decision.data import Decisions
 from dew.decision.images import Images
+from dew.decision.joint_checkpoint import StoredJointHead
 from dew.training.trainer import Trainer
 
 FIXTURES = Path(__file__).parent / "fixtures"
-TINY = FIXTURES / "clef" / "tiny"
+TINY = FIXTURES / "joint_checkpoint" / "tiny"
 BACKBONE = FIXTURES / "hf" / "qwen38-dense-tiny"
 CASES = json.loads((FIXTURES / "laya" / "cases.json").read_text())
 
@@ -58,10 +61,10 @@ def laid_out(tokenizer: HFTokenizer) -> dict[str, tuple[dict[str, Question], Enc
     return rows
 
 
-def test_the_joint_layout_lays_out_what_clef_does(tokenizer):
-    """Token for token and span for span: Clef's prompt, a choice's options by
-    key, a noul's true first with Clef's descriptions, structured values as
-    compact sorted JSON, and every option's span."""
+def test_the_joint_layout_lays_out_what_the_release_does(tokenizer):
+    """Token for token and span for span: the release's prompt, a choice's
+    options by key, a noul's true first with the release's descriptions,
+    structured values as compact sorted JSON, and every option's span."""
     expected = json.loads((TINY / "layouts.json").read_text())
     for case, (questions, row) in laid_out(tokenizer).items():
         assert list(row.tokens) == expected[case]["ids"], case
@@ -73,9 +76,9 @@ def test_the_joint_layout_lays_out_what_clef_does(tokenizer):
 
 
 def head_logits(tokenizer: HFTokenizer) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Dew's head, Clef's fp32 head, and Clef's float64 head, all on the same
+    """Dew's head, the release's fp32 head, and its float64 head, all on the same
     fp32 backbone states, over every question of every case."""
-    loaded = ClefHead.load(TINY, attention_impl="xla")
+    loaded = StoredJointHead.load(TINY, attention_impl="xla")
     table = load_file(BACKBONE / "model.safetensors")["lm_head.weight"]
     found, reference, truth = [], [], []
     with np.load(TINY / "states.npz") as states, np.load(TINY / "logits.npz") as logits:
@@ -90,18 +93,18 @@ def head_logits(tokenizer: HFTokenizer) -> tuple[np.ndarray, np.ndarray, np.ndar
     return np.concatenate(found), np.concatenate(reference), np.concatenate(truth)
 
 
-def test_clefs_head_matches_clef_under_the_float64_rule(tokenizer):
+def test_the_stored_joint_head_matches_its_release_under_the_float64_rule(tokenizer):
     """Every question of every case, read off the same fp32 backbone states,
-    held to twice Clef's own head's fp32 distance from its float64 run
-    (measured: 1.42 times)."""
-    assert_as_exact_as_the_reference(*head_logits(tokenizer), "Clef head logits")
+    held to twice the release's own head's fp32 distance from its float64
+    run (measured: 1.42 times)."""
+    assert_as_exact_as_the_reference(*head_logits(tokenizer), "stored joint head logits")
 
 
 def test_a_padded_batch_scores_every_row_as_it_scores_alone(tokenizer):
     """All five cases in one batch, padded to the longest row and the most
     questions and options: padding reaches none of the head's pooling or
     attention, so each question scores as it does alone."""
-    loaded = ClefHead.load(TINY, attention_impl="xla")
+    loaded = StoredJointHead.load(TINY, attention_impl="xla")
     table = load_file(BACKBONE / "model.safetensors")["lm_head.weight"]
     rows = laid_out(tokenizer)
     inputs = DecisionInputs.collate([row for _, row in rows.values()], 0)
@@ -124,12 +127,13 @@ def test_a_padded_batch_scores_every_row_as_it_scores_alone(tokenizer):
     assert np.all(np.isfinite(gradient)) and np.any(gradient)
 
 
-def test_a_clef_release_answers_as_clefs_own_model(tmp_path):
-    """`Decide.from_pretrained` reads a Clef release, the Qwen 3.5 backbone
-    with the head beside it. Dew's backbone and head together are held to
-    twice Clef's own fp32 model's distance from its float64 run, and
-    `systemone`, with Clef's confidence, gives each option the probability
-    Clef's fp32 logits give it, within the fourth decimal both round to."""
+def test_a_joint_release_answers_as_its_own_model(tmp_path):
+    """`Decide.from_pretrained` reads a joint-head release, the Qwen 3.5
+    backbone with the head beside it. Dew's backbone and head together are
+    held to twice the release's own fp32 model's distance from its float64
+    run, and `systemone`, with the release's confidence (the top
+    probability), gives each option the probability the release's fp32
+    logits give it, within the fourth decimal both round to."""
     for source in [*BACKBONE.iterdir(), TINY / "joint_head_config.json", TINY / "joint_head.safetensors"]:
         (tmp_path / source.name).symlink_to(source.resolve())
     decide = replace(Decide.from_pretrained(tmp_path, attention_impl="xla"), confidence=TopProbability())
@@ -141,13 +145,13 @@ def test_a_clef_release_answers_as_clefs_own_model(tmp_path):
             [row] = decide.layout.rows(decide.tokenizer, decide.specials, request["state"], questions)
             scores = np.asarray(decide.model.logits(decide.variables, DecisionInputs.collate([row], 0)))
             answers = decide.systemone(request)["answers"]
-            for slot, (laid, clef) in enumerate(zip(row.questions, layouts[case]["questions"], strict=True)):
+            for slot, (laid, kept) in enumerate(zip(row.questions, layouts[case]["questions"], strict=True)):
                 key = f"{case}/{laid.name}"
                 found.append(scores[0, slot, :len(laid.options)])
                 reference.append(logits[key])
                 truth.append(logits[f"{key}/f64"])
                 probabilities = softmax(logits[key].astype(np.float64), 1.0)
-                expected = dict(zip(clef["option_ids"], probabilities, strict=True))
+                expected = dict(zip(kept["option_ids"], probabilities, strict=True))
                 answer = answers[laid.name]
                 given = ({"true": answer["noul"]} if answer["type"] == "noul" else answer["probabilities"])
                 for option, value in given.items():
@@ -155,11 +159,11 @@ def test_a_clef_release_answers_as_clefs_own_model(tmp_path):
                 if answer["type"] != "noul":
                     assert answer["confidence"] == max(given.values())
     assert_as_exact_as_the_reference(np.concatenate(found), np.concatenate(reference), np.concatenate(truth),
-                                     "Clef over Dew's Qwen 3.5")
+                                     "the joint head over Dew's Qwen 3.5")
 
 
-def test_a_clef_release_fine_tunes_and_reloads_from_the_run(tmp_path):
-    """A Clef release is a whole task to fine-tune: its Qwen 3.5 backbone,
+def test_a_joint_release_fine_tunes_and_reloads_from_the_run(tmp_path):
+    """A joint-head release is a whole task to fine-tune: its Qwen 3.5 backbone,
     joint head and layout train together on rows of several questions, and
     the saved run loads back as a task with identical probabilities."""
     release = tmp_path / "release"
@@ -172,7 +176,7 @@ def test_a_clef_release_fine_tunes_and_reloads_from_the_run(tmp_path):
                 ("how much is pro", "sales", "false"), ("refund please", "billing", "false"))
     examples = [Example(state, {"team": team, "urgent": urgent}, {"team": label, "urgent": hurry})
                 for state, label, hurry in answered * 2]
-    # Training pads every row to the layout's max_len; Clef serves up to 16384.
+    # Training pads every row to the layout's max_len; the release serves up to 16384.
     objective = DecisionObjective(Decide.from_pretrained(release, attention_impl="xla"),
                                   layout=JointLayout(max_len=1024))
     data = loader(Decisions(source=examples, validation=examples), batch=8, read="memory",
@@ -195,10 +199,11 @@ def test_a_clef_release_fine_tunes_and_reloads_from_the_run(tmp_path):
         np.testing.assert_array_equal(answer.probabilities, again.probabilities)
 
 
-def test_a_clef_release_reads_images_as_clefs_own_model_does(tmp_path):
+def test_a_joint_release_reads_images_as_its_own_model_does(tmp_path):
     """A request's images, laid out before the state by the backbone's own
-    processor as Clef's `systemone` lays them out: the same token ids, and
-    logits held to twice Clef's fp32 model's distance from its float64 run,
+    processor as the release's `systemone` lays them out: the same token ids,
+    and logits held to twice the release's fp32 model's distance from its
+    float64 run,
     the vision tower included. `systemone` reads them as data URLs."""
     for source in [*BACKBONE.iterdir(), TINY / "joint_head_config.json", TINY / "joint_head.safetensors"]:
         (tmp_path / source.name).symlink_to(source.resolve())
@@ -218,7 +223,7 @@ def test_a_clef_release_reads_images_as_clefs_own_model_does(tmp_path):
         reference = [logits[name] for name in names]
         truth = [logits[f"{name}/f64"] for name in names]
         assert_as_exact_as_the_reference(np.concatenate(found), np.concatenate(reference),
-                                         np.concatenate(truth), "Clef over Dew's Qwen 3.5, with images")
+                                         np.concatenate(truth), "joint head over Dew's Qwen 3.5, with images")
 
     def url(picture: Image.Image) -> str:
         encoded = io.BytesIO()

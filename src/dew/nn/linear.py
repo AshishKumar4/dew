@@ -497,7 +497,7 @@ def _ranged_transpose(decay, cotangent):
 def _chunk_decay_tangent(primals, tangents):
     """The pairs' own tangent, in forward and reverse mode alike: the decay's is each pair's range
     (`_ranged`), and its transpose sums only the pairs spanning a position (`_ranged_transpose`).
-    On Qwen3.5-tiny's packed decision rows (tests/test_decision_packing.py, clef) the prefix
+    On Qwen3.5-tiny's packed decision rows (tests/test_decision_packing.py, joint) the prefix
     difference's gradient put the gated delta net's A_log 3.58 and dt_bias 4.49 times as far from
     float64 as the rows run alone, against 2 allowed; with this and the memory write's decay row
     (`xla_chunk_states`) every backbone leaf sat at 0.77-0.93, on six CPUs of two models. It costs
