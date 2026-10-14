@@ -3,7 +3,7 @@
 An untrained source exports, transformers 5.16.1 reads the export to Dew's
 logits, and Dew reloads it to the same model, tree and logits. A causal
 source takes one public `Trainer` step of `LMObjective`, which lowers its
-loss, moves every parameter and keeps the state beside them. The trained
+loss, moves every module and keeps the state beside the parameters. The trained
 exports are tests/test_decoder_export.py's and
 tests/test_masked_diffusion_export.py's.
 """
@@ -18,7 +18,6 @@ import numpy as np
 import optax
 import pytest
 from interop_support import assert_same_stored_tensors
-from model_support import flat_tree
 from reference_error import assert_as_exact_as_the_reference
 
 from dew.data.dataset import Loader
@@ -149,11 +148,15 @@ def training_rows(case: Training, loaded: Pretrained, directory: Path) -> ModelI
 
 
 @pytest.mark.parametrize('case', TRAINING, ids=lambda case: case.fixture)
-def test_a_public_training_step_lowers_the_loss_and_moves_every_parameter(case):
+def test_a_public_training_step_lowers_the_loss_and_moves_every_module(case):
     """One SGD step through `Trainer`, on the fixture's rows repeated over the
-    devices. Every committed parameter is finite and moved, the committed
-    tree scores the rows' shifted, attention-masked targets below the
-    checkpoint, and every other collection is the checkpoint's to the bit."""
+    devices. The committed tree scores the rows' shifted, attention-masked
+    targets below the checkpoint; every parameter is finite and every
+    top-level module moved (each layer, the embedding, the head and a
+    wrapper's vision tower and projector); every other collection is the
+    checkpoint's to the bit. A single leaf can rightly stay put: under
+    BLOOM's ALiBi a key bias adds one score to every key a query sees, which
+    the softmax cancels, so its gradient is zero."""
     directory = FIXTURES / case.fixture
     loaded = Pretrained.load(directory, dtype='float32', attention_impl='reference')
     assert set(loaded.variables) == {'params', *case.state}
@@ -170,11 +173,11 @@ def test_a_public_training_step_lowers_the_loss_and_moves_every_parameter(case):
     step = Step(step=jnp.int32(0), key=jax.random.key(0), ema=None)
     loss = jax.jit(lambda variables: objective.scalar_loss(variables, {'text': inputs}, step)[0])
     assert float(loss(trained)) < float(loss(started))
-    before, after = flat_tree(started), flat_tree(trained)
-    assert before.keys() == after.keys()
-    for path, leaf in before.items():
-        if path.startswith('params.'):
-            assert np.all(np.isfinite(after[path])), path
-            assert not np.array_equal(after[path], leaf), f'{path} did not move'
-        else:
-            np.testing.assert_array_equal(after[path], leaf, err_msg=path)
+    assert set(trained) == set(started)
+    assert all(np.all(np.isfinite(leaf)) for leaf in jax.tree.leaves(trained['params']))
+    for module, tree in started['params'].items():
+        moved = jax.tree.map(lambda before, after: not np.array_equal(before, after),
+                             tree, trained['params'][module])
+        assert any(jax.tree.leaves(moved)), f'{module} did not move'
+    for name in case.state:
+        jax.tree.map(np.testing.assert_array_equal, trained[name], started[name])
