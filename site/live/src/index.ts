@@ -111,7 +111,7 @@ export default {
 		if (url.pathname === '/v1/operator/retire' && request.method === 'POST') {
 			if (!operatorAuthorized(request, env)) return new Response('Forbidden', { status: 403 });
 			const host = url.searchParams.get('host') ?? '';
-			await env.SHARED.get(env.SHARED.idFromName(host)).retire();
+			await env.POOL.get(env.POOL.idFromName('global')).retire(host);
 			return Response.json({ retired: host });
 		}
 		if (url.pathname === '/v1/operator/snapshots') {

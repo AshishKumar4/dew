@@ -10,24 +10,28 @@ const PORT = 8888;
 const START_MS = 180_000;
 const LIFETIME_MS = 30 * 24 * 60 * 60_000;
 
+/**
+ * One model host: its container, restored from its generation's snapshot, its health and the
+ * authenticated transport to its bridge (shared_bridge.py). Which sessions it holds, and when it
+ * starts and retires, is the pool's (model-pool.ts); which contexts it runs, the bridge's.
+ */
 export class SharedHost extends DurableObject<Env> {
 	private starting: Promise<void> | undefined;
 
-	async configure(generation: SnapshotGeneration, keepWarm = false): Promise<void> {
+	async configure(generation: SnapshotGeneration): Promise<void> {
 		const stored = await this.ctx.storage.get<SnapshotGeneration>('generation');
 		if (stored && stored.snapshot.id !== generation.snapshot.id) throw new Error('a host cannot change its generation');
 		await this.ctx.storage.put('generation', generation);
-		await this.ctx.storage.put('keepWarm', keepWarm);
 	}
 
-	async warm(): Promise<void> {
+	/** Start the host, or keep it running; `busy` (it holds sessions) lets it miss two health checks. */
+	async warm(busy: boolean): Promise<void> {
 		if (this.ctx.container?.running && !this.starting && !(await this.available())) {
 			// A host busy with a run can miss one check; restarting it would end every cell on it.
 			const missed = ((await this.ctx.storage.get<number>('missed')) ?? 0) + 1;
 			await this.ctx.storage.put('missed', missed);
-			const sessions = (await this.ctx.storage.get<string[]>('sessions'))?.length ?? 0;
-			if (sessions && missed < 3) return;
-			console.error('model host restarted after failing its health check', missed, 'times with', sessions, 'contexts');
+			if (busy && missed < 3) return;
+			console.error('model host restarted after failing its health check', missed, 'times, busy:', busy);
 			await this.ctx.container.destroy();
 		}
 		await this.ctx.storage.delete('missed');
@@ -41,13 +45,8 @@ export class SharedHost extends DurableObject<Env> {
 		catch { return null; }
 	}
 
+	/** Stop the host, which the pool assigns no session any more (`ModelPool.retire`). */
 	async retire(): Promise<void> {
-		// A context that ended without a close through this host stays a member; only the
-		// contexts the container still holds keep it from retiring.
-		for (const session of (await this.ctx.storage.get<string[]>('sessions')) ?? []) {
-			if (!(await this.has(session))) await this.membership(session, false);
-		}
-		if ((await this.ctx.storage.get<string[]>('sessions'))?.length) throw new Error('a model host still has active contexts');
 		if (this.ctx.container?.running) await this.ctx.container.destroy();
 		await this.ctx.storage.deleteAlarm();
 	}
@@ -73,7 +72,6 @@ export class SharedHost extends DurableObject<Env> {
 			await this.ctx.storage.put('started', Date.now());
 		}
 		await container.setInactivityTimeout((limits.wallSeconds + limits.warmSeconds + 60) * 1000);
-		await this.ctx.storage.setAlarm(Date.now() + 30_000);
 		const deadline = Date.now() + START_MS;
 		while (!(await this.available())) {
 			if (Date.now() > deadline || !container.running) throw new Error('the shared model did not finish warming up');
@@ -97,29 +95,15 @@ export class SharedHost extends DurableObject<Env> {
 		return this.ctx.container!.getTcpPort(PORT).fetch(request);
 	}
 
-	private async membership(session: string, present: boolean): Promise<void> {
-		await this.ctx.storage.transaction(async (storage) => {
-			const sessions = (await storage.get<string[]>('sessions')) ?? [];
-			await storage.put('sessions', present ? [...new Set([...sessions, session])] : sessions.filter((value) => value !== session));
-			await storage.put('used', Date.now());
-		});
-	}
-
+	/** Start `session`'s context on the bridge, which `fetch` then connects a page to. */
 	async allocate(session: string): Promise<void> {
-		await this.membership(session, true);
-		try {
-			const response = await this.request(session);
-			if (!response.ok) throw new Error(await response.text());
-		} catch (error) {
-			await this.membership(session, false);
-			throw error;
-		}
+		const response = await this.request(session);
+		if (!response.ok) throw new Error(await response.text());
 	}
 
 	override async fetch(request: Request): Promise<Response> {
 		const session = request.headers.get(SESSION_HEADER);
 		if (!session) return new Response('no session', { status: 400 });
-		await this.allocate(session);
 		return this.request(session, 'ws', request);
 	}
 
@@ -129,19 +113,5 @@ export class SharedHost extends DurableObject<Env> {
 
 	async close(session: string): Promise<void> {
 		await this.request(session, 'close');
-		await this.membership(session, false);
-	}
-
-	override async alarm(): Promise<void> {
-		const container = this.ctx.container;
-		if (!container?.running) return;
-		const sessions = (await this.ctx.storage.get<string[]>('sessions')) ?? [];
-		const used = (await this.ctx.storage.get<number>('used')) ?? 0;
-		const { warmSeconds } = limitsOf(this.env);
-		if (!(await this.ctx.storage.get<boolean>('keepWarm')) && sessions.length === 0 && Date.now() > used + warmSeconds * 1000) {
-			await container.destroy();
-			return;
-		}
-		await this.ctx.storage.setAlarm(Date.now() + 30_000);
 	}
 }
