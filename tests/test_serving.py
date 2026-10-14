@@ -87,7 +87,7 @@ def test_a_server_holds_its_weights_at_decoding_storage_and_reloads_into_it():
     from dew.interop import Pretrained
 
     masters, native = (Pretrained.load(Path(__file__).parent / "fixtures/hf/phi-tiny", dtype="bfloat16",
-                                       attention_impl="xla", max_seq_len=48, **storage)
+                                       attention_impl="xla", max_seq_len=64, **storage)
                        for storage in ({}, {"param_dtype": "bfloat16"}))
     assert native.variables["params"]["head_bias"].dtype == jnp.float32
     sampling = Sampling(temperature=0, eos_token_ids=None)
