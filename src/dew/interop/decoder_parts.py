@@ -3,7 +3,7 @@
 The config readers (`base_config`, `translated`), the maps between Dew's
 parameter paths and a checkpoint's tensor names (`dew_path`,
 `hf_tensor_name`, `Renames`), tensors a checkpoint stores packed (`Packed`),
-the shared export writer (`decoder_tensors`) and the entry type
+the shared export writer (`decoder_tensors`, `leaf_layouts`) and the entry type
 (`DecoderFamily`). Each module in `dew.interop.families` builds its entries
 from these, `decoder_families` orders the entries, and `hf_decoders` reads
 and writes checkpoints through that table: each imports only what precedes it.
@@ -1286,37 +1286,59 @@ def _dense_decoder_weights(family: "DecoderFamily", model: CausalTransformer, va
 
 def decoder_tensors(family: "DecoderFamily", model: CausalTransformer, variables: Mapping[str, object],
                     config: Mapping[str, object]) -> LazyTensors:
-    """Write every leaf under the name `family` gives it (`DecoderFamily.tensor_name`).
+    """Write every parameter under the name `family` gives it (`DecoderFamily.tensor_name`).
 
-    Each leaf is stored as the load oriented it, a 2-D kernel transposed, and
-    the family's `packed` tensors are built from their parts. Gemma 4's layer
-    scalars are read from the collection `model.layer_scalar` names.
+    Each is bound by `leaf_layouts`, and the family's `packed` tensors are
+    built from their parts. Gemma 4's layer scalars are read from the
+    collection `model.layer_scalar` names.
     """
     params = variables.get('params', variables)
     if not isinstance(params, Mapping):
         raise ValueError('params must contain the decoder parameter tree')
     tree = variables if 'params' in variables else {'params': params}
-    leaves = dict(flatten_dict(dict(params), sep='.'))
+    leaves: dict[tuple[str, ...], object] = {
+        ('params', *path): value for path, value in flatten_dict(dict(params)).items()}
     constants = tree.get('constants')
     if model.layer_scalar == 'frozen' and isinstance(constants, Mapping):
-        leaves.update((name, value) for name, value in flatten_dict(dict(constants), sep='.').items()
-                      if name.endswith('.layer_scalar'))
-    layouts: dict[str, WeightLayout] = {}
-    for name, value in leaves.items():
-        target = family.tensor_name(name, config)
-        if target is None:
-            continue
-        if not isinstance(value, (jax.Array, np.ndarray)):
-            raise TypeError(f'{name} is a {type(value).__name__}, not an array')
-        if target in layouts:
-            raise ValueError(f'{name} and {layouts[target].paths[0]} both write {target}')
-        kernel = name.endswith('.kernel') and value.ndim == 2
-        layouts[target] = WeightLayout(target, (('params', *name.split('.')),), value.shape[::-1]
-                                       if kernel else value.shape, (1, 0) if kernel else None)
+        leaves.update({('params', *path): value for path, value in flatten_dict(dict(constants)).items()
+                       if path[-1] == 'layer_scalar'})
+    layouts = leaf_layouts(leaves, lambda path: family.tensor_name('.'.join(path[1:]), config))
     # A packed tensor's geometry is the model's, read as a translated config spells it.
     geometry = {'num_heads': model.num_heads, 'num_kv_heads': model.kv_heads,
                 'head_dim': model.features_per_head, 'value_head_dim': model.value_head_dim}
     return layout_tensors(_packed_layouts(layouts, family.packed, geometry), tree, model.layer_scalar)
+
+
+def leaf_layouts(leaves: Mapping[tuple[str, ...], object],
+                 names: Callable[[tuple[str, ...]], str | tuple[str, ...] | None]) -> dict[str, WeightLayout]:
+    """Bind each leaf, by its path from its collection, to the source tensor `names` gives it.
+
+    A leaf is stored as the load oriented it, a 2-D kernel transposed. None
+    writes nothing, as for the tied head. A tuple names one tensor per expert
+    of a stacked leaf, in expert order, each that expert's slice, as a source
+    holding one tensor per expert is stacked on load.
+    """
+    layouts: dict[str, WeightLayout] = {}
+    for path, value in leaves.items():
+        named = names(path)
+        if named is None:
+            continue
+        if not isinstance(value, (jax.Array, np.ndarray)):
+            raise TypeError(f"{'.'.join(path)} is a {type(value).__name__}, not an array")
+        if isinstance(named, str):
+            slices, shape = [(named, None)], value.shape
+        elif value.shape[:1] == (len(named),):
+            slices, shape = [(name, expert) for expert, name in enumerate(named)], value.shape[1:]
+        else:
+            raise ValueError(f"{'.'.join(path)} holds {value.shape}, not one slice for each of "
+                             f"{len(named)} named experts")
+        kernel = path[-1] == 'kernel' and len(shape) == 2
+        for target, expert in slices:
+            if target in layouts:
+                raise ValueError(f"{'.'.join(path)} and {layouts[target].paths[0]} both write {target}")
+            layouts[target] = WeightLayout(target, (path,), shape[::-1] if kernel else shape,
+                                           (1, 0) if kernel else None, expert_index=expert)
+    return layouts
 
 
 def _packed_layouts(layouts: Mapping[str, WeightLayout], packed: Sequence["Packed"],
@@ -1525,7 +1547,8 @@ class DecoderFamily:
     export_weights: Callable[["DecoderFamily", CausalTransformer, Mapping[str, object], Mapping[str, object]],
                              Mapping[str, np.ndarray]] = _dense_decoder_weights
     """Whole-variable encoder, given its family; the families with one add
-    their checks or storage to the shared writer (`decoder_tensors`)."""
+    their checks, storage or names to the shared writer (`decoder_tensors`,
+    `leaf_layouts`)."""
     sandwich_norms: bool = False
     prepare: WeightPreparer = field(default=lambda tensors, _config=None: dict(tensors))
     """Storage the path map cannot read as stored that no `packed` entry
