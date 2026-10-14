@@ -46,12 +46,15 @@ def frames_from_cast(cast: str, count: int = 41) -> dict:
                 break
         rows = terminal_cells(screen, header["width"])
         # A terminal can retain a fragment of an earlier, shorter live panel
-        # above the current one. The viewport starts at the latest Dew panel;
-        # the original cast still contains the uncut terminal output.
-        panels = [i for i, row in enumerate(rows)
-                  if "dew ·" in "".join(run["text"] for run in row)]
-        if panels:
-            rows = rows[panels[-1]:]
+        # above the current one. The viewport starts after the last such
+        # panel row above the latest Dew panel, so output printed before the
+        # panel, such as a warning, stays where the terminal showed it; the
+        # original cast still contains the uncut terminal output.
+        texts = ["".join(run["text"] for run in row) for row in rows]
+        panels = [i for i, text in enumerate(texts) if "dew ·" in text]
+        start = max((i + 1 for i in range(panels[-1]) if texts[i].lstrip()[:1] in set("│╭╰╮╯")),
+                    default=0) if panels else 0
+        rows = rows[start:]
         if not rows:
             continue
         text = "\n".join("".join(run["text"] for run in row) for row in rows)
@@ -89,7 +92,7 @@ def frames_from_cast(cast: str, count: int = 41) -> dict:
     return {"columns": header["width"], "seconds": seconds,
             "duration": elapsed, "frames": frames,
             "source_rows": header["height"], "viewer_rows": screen.lines,
-            "final_cursor_row": screen.cursor.y - (panels[-1] if panels else 0), "source_final_screen": source_rows,
+            "final_cursor_row": screen.cursor.y - start, "source_final_screen": source_rows,
             "sha256": hashlib.sha256(cast.encode()).hexdigest()}
 
 
