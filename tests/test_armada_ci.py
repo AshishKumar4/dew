@@ -2,6 +2,7 @@
 
 import importlib.util
 import json
+import os
 import re
 import sys
 import time
@@ -117,6 +118,139 @@ def test_a_task_rows_each_file_red_where_ci_would_fail(ci, tmp_path):
         "3.12:tests/test_pass.py": 1, "3.12:tests/test_dies.py": 1}
 
 
+def test_the_gpu_tier_is_every_file_whose_tests_read_the_backend_or_are_marked_for_a_gpu(
+        ci, tmp_path, monkeypatch, cache_worker, capsys):
+    """A task keeps, beside each green file's key, where its run read the
+    backend and its GPU marks (executed.py), and the GPU tier is each file
+    with either, each whose inputs changed since, and each without a record
+    the Worker returns. A read is the file's whose test calls it, by any
+    name, every file's of a task where a session fixture made it, and a
+    test module's under whose body it ran, though another file imported it
+    first, beside others. The `sys` and `platform` modules are no read. A
+    file that started a process has no key, so it is in, and no task reuses
+    its row. The command line spreads the tier over its shards, each file
+    once, and per batch names the files the checkout marks for a GPU."""
+    url, stored, _ = cache_worker
+    monkeypatch.setenv("DEW_XLA_CACHE_URL", url)
+    monkeypatch.setenv("DEW_XLA_CACHE_TOKEN", "token")
+    device = "class Device:\n    platform = 'gpu'\n"
+    files = {
+        "devices.py": device + "def placed(device): return device.platform\n",
+        "conftest.py": "import pytest\nfrom devices import Device, placed\n"
+                       "@pytest.fixture(scope='session')\ndef where(): return placed(Device())\n",
+        "test_routes.py": device + "def chosen(device): return device.platform == 'gpu'\n"
+                                   "def test_routes(): assert chosen(Device())\n",
+        "test_passed.py": "def chosen(default_backend): return default_backend()\n"
+                          "def test_passed(): assert chosen(lambda: 'gpu') == 'gpu'\n",
+        "test_one.py": "def test_one(where): assert where == 'gpu'\n",
+        "test_two.py": "def test_two(request): assert request.getfixturevalue('where') == 'gpu'\n",
+        "test_importer.py": "import test_imported, test_imported_too\n"
+                            "def test_imports(): assert test_imported.ON == test_imported_too.ON == 'gpu'\n",
+        "test_imported.py": "from devices import Device, placed\nON = placed(Device())\n"
+                            "def test_on(): assert ON == 'gpu'\n",
+        "test_imported_too.py": "from devices import Device, placed\nON = placed(Device())\n"
+                                "def test_on(): assert ON == 'gpu'\n",
+        "test_marked.py": "import pytest\n@pytest.mark.gpu\ndef test_on_a_gpu(): pass\n",
+        "test_machine.py": "import platform, sys\n"
+                           "def test_machine(): assert platform.python_version() and sys.platform\n",
+        "plain.py": "def helper(): return 1\n",
+        "test_plain.py": "def test_plain():\n    from plain import helper\n    assert helper() == 1\n",
+        "test_lost.py": "def test_lost(): pass\n",
+        "test_spawns.py": "import subprocess, sys\n"
+                          "def test_child(): subprocess.run([sys.executable, '-c', 'pass'], check=True)\n",
+        "test_new.py": "def test_unrun(): pass\n",
+    }
+    for name, source in files.items():
+        (tmp_path / "tests" / name).write_text(source)
+    venv = tmp_path / ".venv-3.12/bin"
+    venv.mkdir(parents=True)
+    (venv / "python").write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
+    (venv / "python").chmod(0o755)
+    out = tmp_path / "verdict.json"
+    # The session fixture's files in a task of their own, where it reads for every file.
+    fixtures = ["tests/test_one.py", "tests/test_two.py"]
+    ran = [f"tests/{name}" for name in files if name.startswith("test_") and name != "test_new.py"]
+    for tests in ([name for name in ran if name not in fixtures], fixtures):
+        ci.task("3.12", tests, "", out, 600.0)
+        assert {row["name"]: row["exitCode"] for row in json.loads(out.read_text())["rows"]} == {
+            f"3.12:{name}": 0 for name in tests}
+    (tmp_path / "tests/plain.py").write_text("def helper(): return 2 - 1\n")
+    # A group of test_lost.py's the Worker lists and does not return.
+    stored[ci.cache_url("3.12", "3.12:tests/test_lost.py#2/2", ci.cpu_class())[len(url):]] = None
+    assert ci.gpu_tier("3.12") == {
+        "tests/test_imported.py": ["tests/devices.py:placed"],
+        "tests/test_imported_too.py": ["tests/devices.py:placed"],
+        "tests/test_importer.py": ["tests/devices.py:placed"],
+        "tests/test_lost.py": ["unrecorded"],
+        "tests/test_marked.py": ["mark:gpu"],
+        "tests/test_new.py": ["unrecorded"],
+        "tests/test_one.py": ["tests/devices.py:placed"],
+        "tests/test_passed.py": ["tests/test_passed.py:chosen"],
+        "tests/test_plain.py": ["changed"],
+        "tests/test_routes.py": ["tests/test_routes.py:chosen"],
+        "tests/test_spawns.py": ["changed"],
+        "tests/test_two.py": ["tests/devices.py:placed"]}
+    common = ci.shared("3.12")
+    assert [ci.reused("3.12", f"tests/{name}", "", common) is not None
+            for name in ("test_machine.py", "test_spawns.py")] == [True, False]
+    monkeypatch.setattr(sys, "argv", ["ci.py", "gpu-tier", "--shards=2"])
+    capsys.readouterr()
+    assert ci.main() == 0
+    shards = [line.split() for line in capsys.readouterr().out.splitlines()]
+    assert len(shards) == 2 and all(shards)
+    assert sorted(name for names in shards for name in names) == sorted(ci.gpu_tier("3.12"))
+    # A file gains a kernel's test after its record: per batch the checkout's marks choose, not records.
+    (tmp_path / "tests/test_plain.py").write_text(
+        "import pytest\n@pytest.mark.kernel\ndef test_lowers(): pass\n")
+    monkeypatch.setattr(sys, "argv", ["ci.py", "gpu-tier", "--marked"])
+    assert ci.main() == 0
+    assert capsys.readouterr().out.split() == ["tests/test_marked.py", "tests/test_plain.py"]
+
+
+def test_a_gpu_lane_runs_each_file_in_a_process_of_its_own_within_its_memory_share(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """The GPU lane gives each file a process of its own and a part of the
+    lane's memory share, a quarter where no record names the file's peak,
+    so four run at once, each with its part. Its rows join one verdict, each
+    recorded as a task's are, and a second lane reuses the green ones."""
+    url, _, _ = cache_worker
+    monkeypatch.setenv("DEW_XLA_CACHE_URL", url)
+    monkeypatch.setenv("DEW_XLA_CACHE_TOKEN", "token")
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0")
+    monkeypatch.setenv("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.5")
+    # nvidia-smi as the driver answers it for an 80 GiB GPU.
+    tools = tmp_path / "bin"
+    tools.mkdir()
+    (tools / "nvidia-smi").write_text("#!/bin/sh\necho 81920\n")
+    (tools / "nvidia-smi").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tools}:{os.environ['PATH']}")
+    source = ("import os, time\n"
+              "def test_runs():\n"
+              "    began = time.monotonic()\n"
+              "    time.sleep(1)\n"
+              "    with open(f'ran-{os.getpid()}', 'w') as ran:\n"
+              "        share = os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION']\n"
+              "        ran.write(f'{share} {began} {time.monotonic()}')\n")
+    names = [f"tests/test_file_{index}.py" for index in range(5)]
+    for name in names:
+        (tmp_path / name).write_text(source)
+    venv = tmp_path / ".venv-3.12/bin"
+    venv.mkdir(parents=True)
+    (venv / "python").write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
+    (venv / "python").chmod(0o755)
+    out = tmp_path / "verdict.json"
+    assert ci.gpu_lane("3.12", names, out, cache=True, processes=4, deadline=600.0) == 0
+    rows = json.loads(out.read_text())["rows"]
+    assert [(row["name"], row["exitCode"]) for row in rows] == [(f"3.12:{name}", 0) for name in names]
+    runs = [path.read_text().split() for path in tmp_path.glob("ran-*")]
+    assert [share for share, *_ in runs] == ["0.125"] * len(names), "a process a file, a quarter each"
+    spans = [(float(began), float(ended)) for _, began, ended in runs]
+    overlapping = max(sum(began <= moment < ended for began, ended in spans) for moment, _ in spans)
+    assert 2 <= overlapping <= 4
+    assert ci.gpu_lane("3.12", names, out, cache=True, processes=4, deadline=600.0) == 0
+    assert len(list(tmp_path.glob("ran-*"))) == len(names), "the second lane reused every green row"
+
+
 def test_a_split_files_groups_run_every_test_once(ci, tmp_path):
     """Each task of a split file runs its own group (split.py) of the same
     cut, so the groups together run every test, none twice, a test the
@@ -195,12 +329,16 @@ def test_a_tasks_rows_share_its_wall_time_by_their_tests_times(ci, tmp_path):
 def test_a_task_reuses_a_green_row_only_on_the_cpu_class_and_inputs_it_ran_on(ci, tmp_path, monkeypatch):
     """A file that ran green is reused by a later task on the same CPU class while its inputs are
     unchanged; a task on another class, after its inputs change, or planned with DEW_TEST_CACHE=off
-    (the daily full run) runs it again. Each task runs as armada starts it: .armada.json's command
-    filled from its plan entry."""
+    (the daily full run) runs it again, and once it has run red on those inputs, so does every task
+    after, though the red run died before it wrote a report. Each task runs as armada starts it:
+    .armada.json's command filled from its plan entry."""
     (tmp_path / "tests/test_counted.py").write_text(
+        "import os\n"
         "from pathlib import Path\n"
         "def test_ok():\n"
-        "    with Path('runs').open('a') as runs: runs.write('x')\n")
+        "    with Path('runs').open('a') as runs: runs.write('x')\n"
+        "    assert not os.environ.get('FAIL')\n"
+        "    if os.environ.get('EXIT'): os._exit(3)\n")
     venv = tmp_path / ".venv-3.12/bin"
     venv.mkdir(parents=True)
     (venv / "python").write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
@@ -229,7 +367,7 @@ def test_a_task_reuses_a_green_row_only_on_the_cpu_class_and_inputs_it_ran_on(ci
         monkeypatch.delenv("DEW_TEST_CACHE")
         assert ci.main() == 0
         [only] = json.loads(out.read_text())["rows"]
-        assert only["exitCode"] == 0
+        assert (only["exitCode"] == 0) == (not os.environ.get("FAIL") and not os.environ.get("EXIT"))
         return len((tmp_path / "runs").read_text())
 
     assert run("GenuineIntel-6-143") == 1
@@ -240,6 +378,17 @@ def test_a_task_reuses_a_green_row_only_on_the_cpu_class_and_inputs_it_ran_on(ci
     (tmp_path / "tests/test_counted.py").write_text(
         (tmp_path / "tests/test_counted.py").read_text() + "def test_more(): pass\n")
     assert run("GenuineIntel-6-143") == 4
+    # A flaky red on the inputs a green run recorded: the green row is not reused after it.
+    monkeypatch.setenv("FAIL", "1")
+    assert run("GenuineIntel-6-143", policy="off") == 5
+    monkeypatch.delenv("FAIL")
+    assert run("GenuineIntel-6-143") == 6
+    assert run("GenuineIntel-6-143") == 6
+    # A red run that died before it wrote its report.
+    monkeypatch.setenv("EXIT", "1")
+    assert run("GenuineIntel-6-143", policy="off") == 7
+    monkeypatch.delenv("EXIT")
+    assert run("GenuineIntel-6-143") == 8
 
 
 def test_a_task_past_its_deadline_is_interrupted_and_every_row_it_holds_is_red(ci, tmp_path):
