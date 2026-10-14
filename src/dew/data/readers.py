@@ -18,6 +18,7 @@ from dew.data.dataset import (
     FilledBatch,
     Forwarding,
     GlobalReader,
+    Position,
     Reader,
     _CheckpointableMapping,
     rows_of,
@@ -44,18 +45,34 @@ class _HostSteps:
 class _Host(_CheckpointableMapping):
     def __init__(self, source: Iterator[Batch], steps: tuple[HostStep, ...]):
         super().__init__(source, _HostSteps(steps))
+        # The global reader this reads, kept through close: it states its order
+        # and position, and reads on from a position set again, as a phased run
+        # does of a finished phase. Closed, this reads nothing until then.
+        self._global = source if isinstance(source, GlobalReader) else None
+
+    def get_state(self) -> Position:
+        return super().get_state() if self._global is None else self._global.get_state()
+
+    def set_state(self, state: Position) -> None:
+        source = self._source
+        self._source = self._global or source
+        try:
+            super().set_state(state)
+        except BaseException:
+            self._source = source
+            raise
 
     @property
     def records(self) -> int:
-        if not isinstance(self._source, GlobalReader):
+        if self._global is None:
             raise TypeError("host-stage parent has no global record count")
-        return self._source.records
+        return self._global.records
 
     @property
     def order(self) -> str:
-        if not isinstance(self._source, GlobalReader):
+        if self._global is None:
             raise TypeError("host-stage parent has no global order")
-        return self._source.order
+        return self._global.order
 
 
 class _CanonicalPass:

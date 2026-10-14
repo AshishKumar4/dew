@@ -14,9 +14,9 @@ from pathlib import Path
 import numpy as np
 import torch
 from safetensors.torch import save_file
-from tokenizers.pre_tokenizers import ByteLevel
 from transformers import AutoModelForCausalLM, AutoModelForImageTextToText, AutoProcessor, Qwen2Tokenizer, Qwen3_5Config
 from transformers import Qwen3_5MoeTextConfig
+from make_tiny_tokenizer import qwen_byte_tokenizer
 from qwen_mtp_reference import QwenMTP, prediction_inputs
 
 ROOT = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "hf"
@@ -25,16 +25,9 @@ SOURCES = ROOT / "qwen38-source"
 
 def tokenizer(source: Path) -> Qwen2Tokenizer:
     metadata = json.loads((source / "tokenizer_config.json").read_text())
-    special = [item["content"] for item in metadata["added_tokens_decoder"].values()]
-    vocab = {word: index for index, word in enumerate(sorted(ByteLevel.alphabet()))}
-    for word in special:
-        if word not in vocab:
-            vocab[word] = len(vocab)
     template_file = source / "chat_template.jinja"
     template = template_file.read_text() if template_file.exists() else metadata["chat_template"]
-    return Qwen2Tokenizer(vocab=vocab, merges=[], eos_token=metadata["eos_token"],
-                          pad_token=metadata["pad_token"], bos_token=metadata.get("bos_token"),
-                          additional_special_tokens=special, chat_template=template, padding_side="left")
+    return qwen_byte_tokenizer(metadata, chat_template=template, padding_side="left")
 
 
 def tiny_config(source: Path, tokenizer: Qwen2Tokenizer) -> dict:
