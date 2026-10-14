@@ -744,3 +744,21 @@ def test_column_verbs_preserve_simultaneous_renames_and_selection(read):
     actual = list(chain.iterate())
     assert [{name: int(value) for name, value in row.items()} for row in actual] == [
         {"b": index, "a": 10 + index} for index in range(3)]
+
+
+def _stamped(facts):
+    """A run-scoped step that writes the run's row count into each record."""
+    count = facts["rows"]
+    return lambda row: {**row, "rows": np.int32(count)}
+
+
+@pytest.mark.parametrize("sizes", [(1, 2, 3), (3, 1, 2), (1, 2, 1)])
+def test_a_fact_two_corpora_state_differently_reaches_no_run_step_whatever_another_states(sizes):
+    """A run-scoped step reads only facts every corpus shares: corpora of 1, 2 and 3 records
+    share no row count, in any order, as two of them do not, and a third that agrees with
+    the first does not make the count shared again."""
+    members = [Memory([{"x": np.int32(index)}] * size, identity=f"corpus {index}")
+               for index, size in enumerate(sizes)]
+    with pytest.raises(ValueError):
+        compile(mix(members).map(Configured(_stamped, needs=("rows",), scope="run")).batch(1),
+                read="indexed", loading=Loading(workers=0))
