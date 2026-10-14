@@ -389,6 +389,18 @@ def test_a_rounding_survives_the_reduction_it_feeds(helper):
     assert np.all(np.abs(sums - rounded.sum(-1)) < np.abs(sums - x.astype(np.float64).sum(-1)))
 
 
+@pytest.mark.parametrize("configured, default", [("F32_F32_F32", False), ("BF16_BF16_F32", False),
+                                                  ("TF32_TF32_F32_X3", False), ("tensorfloat32", False),
+                                                  ("highest", False), ("bfloat16", True), ("default", True)])
+def test_a_configured_dot_algorithm_reads_as_the_precision_it_asks(configured, default):
+    """`jax_default_matmul_precision` takes a dot algorithm preset's name as well as a precision's, and
+    a product without a precision of its own asks for the default only where the configured one is
+    the default."""
+    from dew.nn import precision
+    with jax.default_matmul_precision(configured):
+        assert precision.asks_default_precision(None, configured=True) is default
+
+
 def test_a_compensated_running_sum_holds_its_value_rounded_in_its_high_half():
     """Chained `compensated_add`s keep the pair renormalised: after -1 and 63 additions of -2^-25,
     each a quarter of a float32 step of the running sum and so lost from a plain one, the high half
