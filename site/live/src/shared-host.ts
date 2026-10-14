@@ -13,7 +13,7 @@ const LIFETIME_MS = 30 * 24 * 60 * 60_000;
 /**
  * One model host: its container, restored from its generation's snapshot, its health and the
  * authenticated transport to its bridge (shared_bridge.py). Which sessions it holds, and when it
- * starts and retires, is the pool's (model-pool.ts); which contexts it runs, the bridge's.
+ * starts, restarts and retires, is the pool's (model-pool.ts); which contexts it runs, the bridge's.
  */
 export class SharedHost extends DurableObject<Env> {
 	private starting: Promise<void> | undefined;
@@ -24,17 +24,15 @@ export class SharedHost extends DurableObject<Env> {
 		await this.ctx.storage.put('generation', generation);
 	}
 
-	/** Start the host, or keep it running; `busy` (it holds sessions) lets it miss two health checks. */
-	async warm(busy: boolean): Promise<void> {
-		if (this.ctx.container?.running && !this.starting && !(await this.available())) {
-			// A host busy with a run can miss one check; restarting it would end every cell on it.
-			const missed = ((await this.ctx.storage.get<number>('missed')) ?? 0) + 1;
-			await this.ctx.storage.put('missed', missed);
-			if (busy && missed < 3) return;
-			console.error('model host restarted after failing its health check', missed, 'times, busy:', busy);
-			await this.ctx.container.destroy();
-		}
-		await this.ctx.storage.delete('missed');
+	/** Start the host, or renew one that runs healthy; one that runs unhealthy is the pool's to restart. */
+	async warm(): Promise<void> {
+		if (this.ctx.container?.running && !this.starting && !(await this.available())) return;
+		await this.ready();
+	}
+
+	/** Stop the host and start it again, which ends every context on it (`ModelPool.failed`). */
+	async restart(): Promise<void> {
+		if (this.ctx.container?.running) await this.ctx.container.destroy();
 		await this.ready();
 	}
 

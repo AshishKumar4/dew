@@ -12,6 +12,8 @@ interface Host {
 	ready: boolean;
 	lastUsed: number;
 	retiring?: boolean;
+	/** Health checks failed in a row while busy, which the pool lets a host with sessions miss twice. */
+	missed?: number;
 }
 interface Pool {
 	desired?: SnapshotGeneration;
@@ -105,20 +107,56 @@ export class ModelPool extends DurableObject<Env> {
 	 * that holds sessions is refused, and stays as it was.
 	 */
 	async retire(host: string): Promise<void> {
-		await this.ctx.storage.transaction(async (storage) => {
+		const held = await this.fence(host);
+		if (held) throw new Error(`the model host ${host} holds ${held} sessions`);
+		await this.stop(host);
+	}
+
+	/** Mark `id` retiring, which assigns it no session from now, unless it holds sessions: how many it holds. */
+	private async fence(id: string): Promise<number> {
+		return this.ctx.storage.transaction(async (storage) => {
 			const pool = (await storage.get<Pool>('pool')) ?? { hosts: [], sessions: {} };
-			const held = Object.values(pool.sessions).filter((id) => id === host).length;
-			if (held) throw new Error(`the model host ${host} holds ${held} sessions`);
-			const found = pool.hosts.find((entry) => entry.id === host);
-			if (!found) throw new Error(`no model host ${host}`);
-			found.retiring = true;
-			await storage.put('pool', pool);
+			const host = pool.hosts.find((entry) => entry.id === id);
+			if (!host) throw new Error(`no model host ${id}`);
+			const held = Object.values(pool.sessions).filter((entry) => entry === id).length;
+			if (!held) {
+				host.retiring = true;
+				await storage.put('pool', pool);
+			}
+			return held;
 		});
-		await this.env.SHARED.get(this.env.SHARED.idFromName(host)).retire();
+	}
+
+	/** Stop `id`, which is marked retiring, and forget it; one that does not stop stays marked for the next alarm. */
+	private async stop(id: string): Promise<void> {
+		await this.env.SHARED.get(this.env.SHARED.idFromName(id)).retire();
 		await this.ctx.storage.transaction(async (storage) => {
 			const pool = (await storage.get<Pool>('pool'))!;
-			pool.hosts = pool.hosts.filter((entry) => entry.id !== host);
+			pool.hosts = pool.hosts.filter((host) => host.id !== id);
 			await storage.put('pool', pool);
+		});
+	}
+
+	/**
+	 * Count a failed health check of `id`: whether to restart it, which then takes no session until
+	 * it is ready again. One with no session restarts at once; one busy with a run can miss two
+	 * checks, since restarting it ends every cell on it. Its sessions are read as the miss is counted.
+	 */
+	private async failed(id: string): Promise<boolean> {
+		return this.ctx.storage.transaction(async (storage) => {
+			const pool = (await storage.get<Pool>('pool'))!;
+			const host = pool.hosts.find((entry) => entry.id === id);
+			if (!host) return false;
+			const held = Object.values(pool.sessions).filter((entry) => entry === id).length;
+			const missed = (host.missed ?? 0) + 1;
+			const restart = !held || missed >= 3;
+			if (restart) {
+				console.error('model host restarts after failing its health check', missed, 'times with', held, 'sessions');
+				host.ready = false;
+				delete host.missed;
+			} else host.missed = missed;
+			await storage.put('pool', pool);
+			return restart;
 		});
 	}
 
@@ -130,26 +168,24 @@ export class ModelPool extends DurableObject<Env> {
 	}
 
 	override async alarm(): Promise<void> {
-		// A Worker whose POOL binding moved to another script's pool leaves this one running on
-		// its alarm, warming hosts no visitor reaches: it retires them and stops instead.
-		if (!this.env.POOL.idFromName('global').equals(this.ctx.id)) {
-			const pool = await this.state();
-			for (const host of pool.hosts) {
-				try { await this.env.SHARED.get(this.env.SHARED.idFromName(host.id)).retire(); }
-				catch (error) {
-					console.error('orphaned model host did not retire', host.id, error);
-					await this.ctx.storage.setAlarm(Date.now() + CHECK_MS);
-					return;
-				}
-			}
-			await this.ctx.storage.deleteAll();
-			return;
-		}
+		// A Worker whose POOL binding moved to another script's pool leaves this one running on its
+		// alarm, warming hosts no visitor reaches: it retires each host once its sessions end, and stops.
+		const orphaned = !this.env.POOL.idFromName('global').equals(this.ctx.id);
+		let stopped = false;
 		try {
 			let pool = await this.state();
-			if (!pool.desired) return;
+			if (!orphaned && !pool.desired) return;
 			for (const [session, host] of Object.entries(pool.sessions)) {
 				if (!(await this.env.SHARED.get(this.env.SHARED.idFromName(host)).has(session))) await this.close(session);
+			}
+			if (orphaned) {
+				for (const host of (await this.state()).hosts) {
+					try { if (!(await this.fence(host.id))) await this.stop(host.id); }
+					catch (error) { console.error('orphaned model host did not retire', host.id, error); }
+				}
+				stopped = !(await this.state()).hosts.length;
+				if (stopped) await this.ctx.storage.deleteAll();
+				return;
 			}
 			pool = await this.state();
 			const target = Math.max(MIN_HOSTS, Math.ceil(Object.keys(pool.sessions).length / TARGET_LOAD));
@@ -167,7 +203,10 @@ export class ModelPool extends DurableObject<Env> {
 				const shared = this.env.SHARED.get(this.env.SHARED.idFromName(host.id));
 				try {
 					await shared.configure(host.generation);
-					await shared.warm(Object.values(pool.sessions).includes(host.id));
+					await shared.warm();
+					if (await shared.available()) return { id: host.id, ready: true };
+					if (!(await this.failed(host.id))) return { id: host.id, ready: false };
+					await shared.restart();
 					return { id: host.id, ready: await shared.available() };
 				} catch (error) {
 					console.error('model host did not warm', host.id, error);
@@ -176,7 +215,10 @@ export class ModelPool extends DurableObject<Env> {
 			}));
 			await this.ctx.storage.transaction(async (storage) => {
 				const current = (await storage.get<Pool>('pool'))!;
-				for (const host of current.hosts) host.ready = health.find((checked) => checked.id === host.id)?.ready ?? false;
+				for (const host of current.hosts) {
+					host.ready = health.find((checked) => checked.id === host.id)?.ready ?? false;
+					if (host.ready) delete host.missed;
+				}
 				if (current.hosts.filter((host) => host.ready && host.generation.snapshot.id === current.desired?.snapshot.id).length >= MIN_HOSTS) {
 					current.serving = current.desired!.snapshot.id;
 				}
@@ -199,17 +241,11 @@ export class ModelPool extends DurableObject<Env> {
 				return removed;
 			});
 			for (const id of retired) {
-				try {
-					await this.env.SHARED.get(this.env.SHARED.idFromName(id)).retire();
-					await this.ctx.storage.transaction(async (storage) => {
-						const current = (await storage.get<Pool>('pool'))!;
-						current.hosts = current.hosts.filter((host) => host.id !== id);
-						await storage.put('pool', current);
-					});
-				} catch (error) { console.error('model host did not retire', id, error); }
+				try { await this.stop(id); }
+				catch (error) { console.error('model host did not retire', id, error); }
 			}
 		} finally {
-			await this.ctx.storage.setAlarm(Date.now() + CHECK_MS);
+			if (!stopped) await this.ctx.storage.setAlarm(Date.now() + CHECK_MS);
 		}
 	}
 }
