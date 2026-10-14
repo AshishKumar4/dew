@@ -153,7 +153,8 @@ def test_every_built_in_autoencoder_rebuilds_from_its_saved_record_alone(kind, t
     assert type(rebuilt) is type(original)
     side = 2 * original.downscale_factor
     frames = (5,) if kind == "wan" else ()
-    shape = (*frames, side, side, 3)
+    # Qwen-Image's VAE takes four image channels.
+    shape = (*frames, side, side, getattr(original.model, "image_channels", 3))
     assert rebuilt.latent_shape(shape) == original.latent_shape(shape)
     image = jax.random.uniform(jax.random.key(0), (1, *shape), minval=-1.0, maxval=1.0)
     latent = original.encode(params, image)
