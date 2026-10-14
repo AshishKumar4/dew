@@ -19,7 +19,9 @@ import tyro
 from dew import Checkpoints, Field, InputSpec, Trainer
 from dew.artifacts import uint8_pixels
 from dew.config import OptimConfig
-from dew.data import Dataset, Loading, PreferencePairs, TokenWindows
+from dew.config.data import PreferenceData, TextData, loader
+from dew.data import Loading
+from dew.data.dataset import Loader
 from dew.diffusion.presets import Flow
 from dew.nn.backbones import CausalTransformer, SimpleDiT
 from dew.objectives.base import Step
@@ -46,10 +48,8 @@ def language_model(out: Path):
         "tokenizer": "demo-symbols", "vocab_size": 8, "dtype": "uint8",
         "train_tokens": 1024, "val_tokens": 128, "eos_id": None,
     }))
-    data = TokenWindows(
-        path=str(tokens), seq_len=8, val_batches=1,
-        loading=Loading(workers=0, threads=1, read_buffer=2),
-    ).load(batch=8)
+    data = loader(TextData(source=str(tokens), seq_len=8), batch=8, read="memory",
+                validation_records=8, loading=Loading(workers=0, threads=1, read_buffer=2))
     model = CausalTransformer(
         vocab_size=8, emb_features=16, num_layers=1,
         num_heads=2, mlp_features=32, max_seq_len=16,
@@ -87,10 +87,8 @@ def preferences(model, pretrained):
     """Start DPO from the trained policy; freeze that policy as the reference."""
     row = {"chosen": [1, 2, 3, 4], "rejected": [1, 2, 6, 4],
            "chosen_mask": [0, 0, 1, 1], "rejected_mask": [0, 0, 1, 1]}
-    data = PreferencePairs(
-        records=(json.dumps(row),) * 8, seq_len=4,
-        loading=Loading(workers=0, threads=1, read_buffer=2),
-    ).load(batch=8)
+    data = loader(PreferenceData(source=(row,) * 8, seq_len=4), batch=8, read="memory",
+                loading=Loading(workers=0, threads=1, read_buffer=2))
     # The objective predicts three next tokens from each four-ID sequence.
     objective = DPOObjective(model, seq_len=3, beta=0.1, variables=pretrained)
     reference = jax.tree.map(lambda x: np.array(x, copy=True), pretrained)
@@ -108,7 +106,7 @@ def flow_images(out: Path):
     images = np.zeros((8, 8, 8, 3), dtype=np.uint8)
     images[:, :, ::2, :] = 255
     batch = {"image": images}
-    data = Dataset(train=lambda partition: itertools.repeat(batch), val=None,
+    data = Loader(train=lambda partition: itertools.repeat(batch), val=None,
                    records=8, batch=8)
     model = SimpleDiT(
         patch_size=4, emb_features=16, num_layers=1,

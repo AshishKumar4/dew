@@ -115,7 +115,7 @@ class FitStarted:
     tensor) splits."""
     seed: int | None = None
     """None: no integer seed recorded (a JAX key was supplied, or the record predates the field)."""
-    total_tokens: int | None = None
+    tokens: int | None = None
 
 
 @dataclasses.dataclass(frozen=True)

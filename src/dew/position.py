@@ -20,6 +20,9 @@ from __future__ import annotations
 
 import dataclasses
 import json
+from collections.abc import Mapping
+
+from dew.records import record
 
 ENVELOPE = "dew_global_position"
 """The key a global position is written under.
@@ -47,6 +50,8 @@ class Global:
     record count it ended at, oldest first; empty for a run of one order.
     `records` counts every record of the run, the completed phases' too."""
 
+    plan: Mapping[str, object] | None = None
+
 
 def encode(place: Global) -> bytes:
     """`place` as the bytes a checkpoint stores for it."""
@@ -69,14 +74,15 @@ def decode(position: bytes) -> Global | None:
     envelope = stored.get(ENVELOPE) if isinstance(stored, dict) else None
     if not isinstance(envelope, dict):
         return None
-    fields = {field.name for field in dataclasses.fields(Global)}
+    fields = {"records", "order", "completed"}
     if fields - set(envelope):
         raise ValueError(
             f"a saved global data position is missing {sorted(fields - set(envelope))}; "
             f"the checkpoint's position was written by dew and is damaged")
     completed = tuple((str(order), int(end)) for order, end in envelope["completed"])
+    plan = envelope.get("plan")
     return Global(records=int(envelope["records"]), order=str(envelope["order"]),
-                  completed=completed)
+                  completed=completed, plan=None if plan is None else record(plan, "data plan"))
 
 
 def read(position: bytes) -> Global:

@@ -1,0 +1,728 @@
+"""Write-through artifacts with per-input completions and conditional publication."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import logging
+import sqlite3
+import tempfile
+import threading
+import time
+import uuid
+import weakref
+from collections.abc import Callable, Mapping
+from concurrent.futures import Future, ThreadPoolExecutor, wait
+from contextlib import ExitStack
+from dataclasses import dataclass, field
+from functools import cached_property, lru_cache
+from pathlib import Path
+from typing import Literal, TypedDict, overload
+
+import grain.python as grain
+import numpy as np
+from array_record.python.array_record_module import ArrayRecordWriter
+
+from dew.data.dataset import _QUIET_STOP_SECONDS
+from dew.data.generation import (
+    DependencyManifest,
+    Generation,
+    Outputs,
+    RowId,
+    _accepted,
+    _checked,
+    _decode_outputs,
+    _fact,
+    _hash,
+    _json,
+    _outputs_digest,
+    _publish,
+    _row_key,
+)
+from dew.data.pipeline import Record, Rejected, Volatile
+from dew.data.retention import LocalRetention
+from dew.data.sources.base import Shard, ShardManifest, Source
+from dew.data.sources.codec import encode
+from dew.data.sources.records import ArrayRecords
+from dew.data.storage import PreconditionFailed, Store, _byte_size
+
+_log = logging.getLogger(__name__)
+type Transform = Callable[[int, Record], Outputs]
+type CachedValue = Record | Outputs
+
+
+class CacheStats(TypedDict):
+    admitting: bool
+    spool_bytes: int
+    uploaded_bytes: int
+    upload_seconds: float
+    abandoned: int
+
+
+def _transformed(ordinal: int, value: Record, transform: Transform | None) -> Outputs:
+    outputs = (value,) if transform is None else transform(ordinal, value)
+    if not isinstance(outputs, tuple):
+        raise TypeError("cache input transform must return a tuple of outputs")
+    return outputs
+
+
+def _volatile(transform: Transform) -> bool:
+    return isinstance(transform, Volatile) and transform.volatile
+
+
+@dataclass(frozen=True)
+class _Passthrough:
+    transform: Transform
+
+    def __call__(self, index: int, value: Record) -> Outputs:
+        return _transformed(index, value, self.transform)
+
+
+@dataclass(frozen=True)
+class Cache:
+    """Cache a deterministic prefix without changing a filling run's execution plan.
+
+    CURRENT is read only by an explicit generation open. Each process keeps
+    its own writes; it never discovers another filling writer's rows.
+    Volatile prefixes run on every read and produce no completions.
+    """
+
+    url: str
+    spool_bytes: int | str = 256 * 2**20
+    mirror_bytes: int | str = 8 * 2**30
+    keep_local_bytes: int | str = 8 * 2**30
+    on_full: Literal["stop", "block"] = "stop"
+    upload_workers: int = 2
+    retry: int = 3
+    shard_bytes: int | str = 16 * 2**20
+    storage_options: Mapping[str, object] | None = field(default=None, repr=False)
+
+    def __post_init__(self) -> None:
+        if min(self.spool_limit, _byte_size(self.mirror_bytes), self.local_limit, self.shard_limit) < 1:
+            raise ValueError("cache byte budgets must be positive")
+        if self.shard_limit > self.spool_limit or self.upload_workers < 1 or self.retry < 0:
+            raise ValueError(
+                "cache shard_bytes must fit the spool; upload_workers positive and retry nonnegative"
+            )
+        if self.on_full not in ("stop", "block"):
+            raise ValueError("cache on_full is 'stop' or 'block'")
+
+    @property
+    def spool_limit(self) -> int:
+        return _byte_size(self.spool_bytes)
+
+    @property
+    def shard_limit(self) -> int:
+        return _byte_size(self.shard_bytes)
+
+    @property
+    def local_limit(self) -> int:
+        return _byte_size(self.keep_local_bytes)
+
+    def _mirror_options(self) -> Mapping[str, object]:
+        options = dict(self.storage_options or {})
+        configured = options.get("dewcache", {})
+        if not isinstance(configured, Mapping):
+            raise ValueError("dewcache storage_options must be a mapping")
+        options["dewcache"] = {**configured, "max_bytes": _byte_size(self.mirror_bytes)}
+        return options
+
+    def reference(self, manifest: DependencyManifest) -> str:
+        """The cache a plan reads, by the key of the rows it serves: where the cache lives is no part
+        of the data, so a run resumes against the same rows cached anywhere."""
+        return f"filling {manifest.key}"
+
+    def _root(self, manifest: DependencyManifest) -> Store:
+        if not manifest.clean:
+            raise ValueError("cache writes need a clean Dew revision")
+        if not manifest.exact:
+            raise ValueError("cache prefix contains a step without a stable identity")
+        base = Store(self.url, self.storage_options)
+        fs, path, scheme = base._backend()
+        if scheme == "file":
+            base = Store(
+                fs.unstrip_protocol(path), self.storage_options, LocalRetention(Path(path), self.local_limit)
+            )
+        return base.child(manifest.key)
+
+    def mapped(
+        self,
+        parent: grain.MapDataset,
+        key: DependencyManifest,
+        source: Source,
+        *,
+        transform: Transform | None = None,
+    ) -> _Mapped:
+        self._root(key)
+        if transform is not None and _volatile(transform):
+            return _Mapped(parent.map_with_index(_Passthrough(transform)))
+        return _CachedMap(parent, self, key, source, transform)
+
+    def streamed(
+        self,
+        reader: Callable[[Shard], grain.IterDataset],
+        key: DependencyManifest,
+        manifest: ShardManifest,
+        *,
+        transform: Transform | None = None,
+    ) -> Callable[[Shard], grain.IterDataset]:
+        self._root(key)
+        if transform is not None and _volatile(transform):
+            return _PassthroughReader(reader, _Passthrough(transform))
+        return _CachedReader(reader, self, key, transform)
+
+    def generation(self, key: DependencyManifest) -> Generation | None:
+        root = self._root(key)
+        try:
+            current = root.child("CURRENT").get_versioned()
+        except FileNotFoundError:
+            _log.debug("cache generation has not been published at %s", root.url)
+            return None
+        record = json.loads(current.data)
+        if record["manifest"] != key.key:
+            raise ValueError(f"cache CURRENT manifest differs at {root.url}")
+        _checked(
+            root,
+            {
+                "path": f"generations/{record['generation']}/manifest.json",
+                "bytes": record["bytes"],
+                "sha256": record["sha256"],
+            },
+        )
+        return Generation(root.child(f"generations/{record['generation']}").url, self._mirror_options())
+
+    def publish(
+        self,
+        key: DependencyManifest,
+        source: Source,
+        *,
+        plan: Callable[[Generation], Mapping[str, np.ndarray]] | None = None,
+    ) -> Generation:
+        with ExitStack() as pins:
+            return _publish(self, key, source, plan, pins)
+
+
+class _Writer:
+    def __init__(self, cache: Cache, key: DependencyManifest, *, expected: int | None = None):
+        self.cache, self.root = cache, cache._root(key)
+        self.writer = uuid.uuid4().hex
+        _, root_path, scheme = self.root._backend()
+        self.pin = LocalRetention.pin(Path(root_path) / "shards" / self.writer) if scheme == "file" else None
+        self.directory = tempfile.TemporaryDirectory(prefix="dew-spool-")
+        self.pool = ThreadPoolExecutor(cache.upload_workers, thread_name_prefix="dew-cache-upload")
+        self.lock = threading.Condition(threading.RLock())
+        self.futures: list[Future] = []
+        self.segments: list[dict] = []
+        self.index = sqlite3.connect(Path(self.directory.name) / "inputs.sqlite", check_same_thread=False)
+        self.index.execute(
+            "CREATE TABLE inputs (id TEXT PRIMARY KEY, shard INTEGER, offset INTEGER, digest TEXT)"
+        )
+        self.pending: dict[str, bytes] = {}
+        self.pending_bytes = 0
+        self.spool_bytes = 0
+        self.admitting = True
+        self.closed = False
+        self.closing = False
+        self.uploaded_bytes = 0
+        self.upload_seconds = 0.0
+        self.abandoned = 0
+        self.expected = expected
+        self.seal_future: Future | None = None
+
+    @cached_property
+    def _records(self):
+        @lru_cache(maxsize=2)
+        def opened(shard: int) -> ArrayRecords:
+            return ArrayRecords(
+                (self.root.child(f"shards/{self.writer}/{shard:06d}.array_record").url,),
+                self.cache._mirror_options(),
+            )
+
+        return opened
+
+    def process(self, row_id: RowId, ordinal: int, value: Record, transform: Transform | None) -> CachedValue:
+        row_key = _row_key(row_id)
+        with self.lock:
+            existing = None if self.closing else self.pending.get(row_key)
+            completed = (
+                None
+                if self.closing
+                else self.index.execute(
+                    "SELECT shard, offset, digest FROM inputs WHERE id=?", (row_key,)
+                ).fetchone()
+            )
+        if existing is not None:
+            values = _decode_outputs(existing)
+            return values if transform is not None else values[0]
+        if completed is not None and self.futures[completed[0]].done():
+            uploaded = self.futures[completed[0]]
+            if uploaded.exception() is None:
+                payload = self._records(completed[0])[completed[1]]
+                if not isinstance(payload, bytes) or _hash(payload) != completed[2]:
+                    raise ValueError(f"cache writer record is corrupt for row {row_key}")
+                values = _decode_outputs(payload)
+                return values if transform is not None else values[0]
+        outputs = _transformed(ordinal, value, transform)
+        if self.closing:
+            return outputs if transform is not None else outputs[0]
+        payload = encode(outputs)
+        transient = any(isinstance(output, Rejected) and not output.permanent for output in outputs)
+        with self.lock:
+            if self.closing:
+                return outputs if transform is not None else outputs[0]
+            existing = self.pending.get(row_key)
+            if existing is not None:
+                if existing != payload:
+                    raise ValueError(f"conflicting cache duplicate for row {row_key}")
+                cached = _decode_outputs(existing)
+                return cached if transform is not None else cached[0]
+            completed = self.index.execute(
+                "SELECT shard, offset, digest FROM inputs WHERE id=?", (row_key,)
+            ).fetchone()
+            if completed is not None:
+                if _hash(payload) != completed[2]:
+                    raise ValueError(f"conflicting cache duplicate for row {row_key}")
+                return outputs if transform is not None else outputs[0]
+            if not transient and self.admitting:
+                self._admit(row_key, payload)
+        return outputs if transform is not None else outputs[0]
+
+    def _admit(self, row_key: str, payload: bytes) -> None:
+        pages = self.index.execute("PRAGMA page_count").fetchone()[0]
+        page_size = self.index.execute("PRAGMA page_size").fetchone()[0]
+        if (pages + 2) * page_size > self.cache.local_limit:
+            self.admitting = False
+            _log.warning("cache %s stopped admission at its local index budget", self.root.url)
+        if len(payload) > self.cache.spool_limit:
+            if self.cache.on_full == "block":
+                raise ValueError(f"cache row {row_key} exceeds spool_bytes={self.cache.spool_bytes}")
+            self.admitting = False
+        while self.admitting and self.spool_bytes + len(payload) > self.cache.spool_limit:
+            self._flush()
+            if self.cache.on_full == "stop":
+                self.admitting = False
+                break
+            self.lock.wait(0.1)
+            for future in self.futures:
+                if future.done():
+                    future.result()
+        if self.admitting:
+            self.pending[row_key] = payload
+            self.pending_bytes += len(payload)
+            self.spool_bytes += len(payload)
+            if self.pending_bytes >= self.cache.shard_limit:
+                self._flush()
+            if self.expected is not None and self.index.total_changes + len(self.pending) == self.expected:
+                self._flush()
+                self.seal_future = self.pool.submit(self.seal)
+
+    def _flush(self) -> None:
+        if not self.pending:
+            return
+        number = len(self.futures)
+        path = Path(self.directory.name) / f"{number}.array_record"
+        writer = ArrayRecordWriter(str(path), "group_size:1")
+        entries = []
+        positions = []
+        used = self.pending_bytes
+        for offset, (row_id, payload) in enumerate(self.pending.items()):
+            outputs = _decode_outputs(payload)
+            if not isinstance(outputs, tuple):
+                raise ValueError(f"cache pending row {row_id} is not an input completion")
+            writer.write(payload)
+            accepted = _accepted(outputs)
+            entries.append(
+                {
+                    "id": row_id,
+                    "fanout": len(accepted),
+                    "record": offset,
+                    "outputs": [[row_id, index] for index in range(len(accepted))],
+                    "sha256": _outputs_digest(accepted),
+                    "payload_sha256": _outputs_digest(outputs),
+                    "lengths": [_fact(value, "_dew_length") for value in accepted],
+                    "valid_targets": [_fact(value, "_dew_valid_targets") for value in accepted],
+                    "rejections": [value.reason for value in outputs if isinstance(value, Rejected)],
+                }
+            )
+            positions.append((row_id, number, offset, _hash(payload)))
+        writer.close()
+        actual = path.stat().st_size
+        if not self._reserve_shard(actual, used, path):
+            self.pending.clear()
+            self.pending_bytes = 0
+            return
+        self.index.executemany("INSERT INTO inputs VALUES (?, ?, ?, ?)", positions)
+        self.index.commit()
+        self.pending.clear()
+        self.pending_bytes = 0
+        self.futures.append(self.pool.submit(self._upload, number, path, entries, actual))
+
+    def _reserve_shard(self, actual: int, provisional: int, path: Path) -> bool:
+        if actual > self.cache.spool_limit:
+            path.unlink()
+            self.spool_bytes -= provisional
+            if self.cache.on_full == "block":
+                raise ValueError(
+                    f"closed cache shard requires {actual} bytes, exceeding "
+                    f"spool_bytes={self.cache.spool_limit}"
+                )
+            self.admitting = False
+            _log.warning("cache %s stopped admission: one shard exceeds its spool budget", self.root.url)
+            return False
+        while self.spool_bytes - provisional + actual > self.cache.spool_limit:
+            if self.cache.on_full == "stop":
+                path.unlink()
+                self.spool_bytes -= provisional
+                self.admitting = False
+                _log.warning("cache %s stopped admission at its spool budget", self.root.url)
+                return False
+            self.lock.wait(0.1)
+            for future in self.futures:
+                if future.done():
+                    future.result()
+        self.spool_bytes += actual - provisional
+        return True
+
+    def _upload(self, number: int, path: Path, entries: list[dict], used: int) -> dict:
+        started = time.monotonic()
+        payload = path.read_bytes()
+        shard = f"shards/{self.writer}/{number:06d}.array_record"
+        segment = f"segments/{self.writer}/{number:06d}.json"
+        for attempt in range(self.cache.retry + 1):
+            if self.closed:
+                raise RuntimeError("cache upload was cancelled")
+            try:
+                self.root.child(shard).put_immutable(payload)
+                encoded = _json(
+                    {
+                        "schema": 1,
+                        "shard": {"path": shard, "bytes": len(payload), "sha256": _hash(payload)},
+                        "completions": entries,
+                        "volatile": False,
+                    }
+                )
+                if self.closed:
+                    raise RuntimeError(f"cache upload abandoned before segment publication: {shard}")
+                self.root.child(segment).put_immutable(encoded)
+                with self.lock:
+                    self.spool_bytes -= used
+                    self.uploaded_bytes += used
+                    self.upload_seconds += time.monotonic() - started
+                    self.lock.notify_all()
+                path.unlink(missing_ok=True)
+                return {"path": segment, "bytes": len(encoded), "sha256": _hash(encoded)}
+            except OSError:
+                if attempt == self.cache.retry:
+                    raise
+                time.sleep(min(0.25 * 2**attempt, 10))
+        raise RuntimeError("cache upload retry budget exhausted")
+
+    def metrics(self) -> CacheStats:
+        with self.lock:
+            return {
+                "admitting": self.admitting,
+                "spool_bytes": self.spool_bytes,
+                "uploaded_bytes": self.uploaded_bytes,
+                "upload_seconds": self.upload_seconds,
+                "abandoned": self.abandoned,
+            }
+
+    def seal(self) -> None:
+        with self.lock:
+            self._flush()
+        self.segments = [future.result() for future in self.futures]
+        chain = b""
+        rows = []
+        for entry in self.segments:
+            payload = _checked(self.root, entry)
+            chain = hashlib.sha256(chain + payload).digest()
+            rows.extend(completion["id"] for completion in json.loads(payload)["completions"])
+        payload = _json(
+            {
+                "count": len(self.segments),
+                "segments": self.segments,
+                "first": rows[0] if rows else None,
+                "last": rows[-1] if rows else None,
+                "sha256": chain.hex(),
+            }
+        )
+        if self.closed:
+            raise RuntimeError(f"cache writer was abandoned before its seal: {self.writer}")
+        try:
+            self.root.child(f"segments/{self.writer}/seal.json").put_if_absent(payload)
+        except PreconditionFailed:
+            if self.root.child(f"segments/{self.writer}/seal.json").read() != payload:
+                raise
+
+    def finish(self) -> None:
+        with self.lock:
+            if self.closing:
+                return
+            self.closing = True
+        try:
+            self.seal()
+            if self.seal_future is not None:
+                self.seal_future.result()
+        except OSError as error:
+            if self.cache.on_full == "block":
+                raise
+            _log.warning("cache %s remains filling after upload failure: %s", self.root.url, error)
+        finally:
+            self.closed = True
+            self.pool.shutdown(wait=True, cancel_futures=True)
+            self.index.close()
+            self.directory.cleanup()
+            if self.pin is not None:
+                self.pin.close()
+
+    def close(self) -> None:
+        with self.lock:
+            if self.closing:
+                return
+            self.closing = True
+            pending = len(self.pending)
+            self.pending.clear()
+            self.spool_bytes -= self.pending_bytes
+            self.pending_bytes = 0
+        tasks = [*self.futures, *([self.seal_future] if self.seal_future is not None else [])]
+        _, unfinished = wait(tasks, timeout=_QUIET_STOP_SECONDS) if tasks else (set(), set())
+        with self.lock:
+            self.closed = True
+            self.abandoned += pending + len(unfinished)
+        for future in unfinished:
+            future.cancel()
+        self.pool.shutdown(wait=False, cancel_futures=True)
+        self.index.close()
+        if self.abandoned:
+            _log.warning("data/cache/abandoned=%d at %s", self.abandoned, self.root.url)
+        if unfinished:
+            remaining = set(unfinished)
+
+            def released(future: Future) -> None:
+                with self.lock:
+                    remaining.discard(future)
+                    if not remaining:
+                        self.directory.cleanup()
+                        if self.pin is not None:
+                            self.pin.close()
+
+            for future in unfinished:
+                future.add_done_callback(released)
+        else:
+            self.directory.cleanup()
+            if self.pin is not None:
+                self.pin.close()
+
+
+class _Mapped(grain.MapDataset[CachedValue]):
+    """An indexed cache read, with no fill for a volatile prefix."""
+
+    def __init__(self, parent: grain.MapDataset):
+        super().__init__(parent)
+        self.input_parent = parent
+
+    def __len__(self) -> int:
+        return len(self.input_parent)
+
+    @overload
+    def __getitem__(self, index: slice) -> grain.MapDataset[CachedValue]: ...
+
+    @overload
+    def __getitem__(self, index: int) -> CachedValue: ...
+
+    def __getitem__(self, index):
+        return self.slice(index) if isinstance(index, slice) else self.record(index)
+
+    def record(self, index: int) -> CachedValue:
+        return self.input_parent[index]
+
+    def close(self) -> None:
+        pass
+
+    def finish(self) -> None:
+        pass
+
+    def metrics(self) -> CacheStats:
+        return {"admitting": False, "spool_bytes": 0, "uploaded_bytes": 0,
+                "upload_seconds": 0.0, "abandoned": 0}
+
+    def iterated(
+        self, view: grain.MapDataset[CachedValue], read_options: grain.ReadOptions | None = None
+    ) -> grain.IterDataset[CachedValue]:
+        """An indexed view read without a cache writer."""
+        return view.to_iter_dataset(read_options)
+
+
+class _CachedMap(_Mapped):
+    def __init__(
+        self,
+        parent: grain.MapDataset,
+        cache: Cache,
+        key: DependencyManifest,
+        source: Source,
+        transform: Transform | None,
+    ):
+        super().__init__(parent)
+        self.cache, self.key, self.input_source, self.transform = cache, key, source, transform
+        self.writer_lock = threading.RLock()
+
+    @property
+    def writer(self) -> _Writer:
+        with self.writer_lock:
+            if "_writer" not in self.__dict__:
+                writer = _Writer(
+                    self.cache,
+                    self.key,
+                    expected=len(self),
+                )
+                finalizer = weakref.finalize(self, writer.close)
+                finalizer.atexit = False
+                self.__dict__["_writer"] = writer
+            return self.__dict__["_writer"]
+
+    def record(self, index: int) -> CachedValue:
+        return self.writer.process(
+            index % len(self), index % len(self), self.input_parent[index], self.transform
+        )
+
+    def close(self) -> None:
+        if "_writer" in self.__dict__:
+            self.writer.close()
+
+    def finish(self) -> None:
+        if "_writer" in self.__dict__:
+            self.writer.finish()
+
+    def metrics(self) -> CacheStats:
+        return self.writer.metrics()
+
+    def to_iter_dataset(
+        self, read_options: grain.ReadOptions | None = None, *, allow_nones: bool = False
+    ) -> grain.IterDataset[CachedValue]:
+        return _ClosingCache(super().to_iter_dataset(read_options, allow_nones=allow_nones), self)
+
+    def iterated(
+        self, view: grain.MapDataset[CachedValue], read_options: grain.ReadOptions | None = None
+    ) -> grain.IterDataset[CachedValue]:
+        """A view of this map, such as one share of it, read as an iterator that
+        finishes the fill when it runs out and closes the cache with it."""
+        return _ClosingCache(view.to_iter_dataset(read_options), self)
+
+    def __getstate__(self) -> dict:
+        return {key: value for key, value in self.__dict__.items() if key not in ("_writer", "writer_lock")}
+
+    def __setstate__(self, state: Mapping[str, object]) -> None:
+        self.__dict__.update(state)
+        self.writer_lock = threading.RLock()
+
+
+class _ClosingCache(grain.IterDataset[CachedValue]):
+    def __init__(self, parent: grain.IterDataset[CachedValue], owner: _CachedMap):
+        super().__init__(parent)
+        self.input_parent, self.owner = parent, owner
+
+    def __iter__(self) -> grain.DatasetIterator[CachedValue]:
+        return _ClosingCacheIterator(self.input_parent.__iter__(), self.owner)
+
+
+class _ClosingCacheIterator(grain.DatasetIterator[CachedValue]):
+    def __init__(self, parent: grain.DatasetIterator[CachedValue], owner: _CachedMap):
+        super().__init__(parent)
+        self.input_parent, self.owner = parent, owner
+
+    def __next__(self) -> CachedValue:
+        try:
+            return next(self.input_parent)
+        except StopIteration:
+            self.owner.finish()
+            raise
+
+    def get_state(self) -> Mapping[str, object]:
+        return self.input_parent.get_state()
+
+    def set_state(self, state: Mapping[str, object]) -> None:
+        self.input_parent.set_state(state)
+
+    def close(self) -> None:
+        self.input_parent.close()
+        self.owner.close()
+
+
+@dataclass(frozen=True)
+class _PassthroughReader:
+    reader: Callable[[Shard], grain.IterDataset]
+    transform: _Passthrough
+
+    def __call__(self, shard: Shard) -> grain.IterDataset:
+        return self.reader(shard).map_with_index(self.transform)
+
+
+@dataclass(frozen=True)
+class _CachedReader:
+    reader: Callable[[Shard], grain.IterDataset]
+    cache: Cache
+    key: DependencyManifest
+    transform: Transform | None
+
+    def __call__(self, shard: Shard) -> grain.IterDataset:
+        return _CachedIter(self.reader(shard), self.cache, self.key, shard, self.transform)
+
+
+class _CachedIter(grain.IterDataset):
+    def __init__(
+        self,
+        parent: grain.IterDataset,
+        cache: Cache,
+        key: DependencyManifest,
+        shard: Shard,
+        transform: Transform | None,
+    ):
+        super().__init__(parent)
+        self.cache, self.key, self.shard, self.transform = cache, key, shard, transform
+        self.input_parent = parent
+
+    def __iter__(self) -> grain.DatasetIterator:
+        return _CachedIterator(self.input_parent.__iter__(), self.cache, self.key, self.shard, self.transform)
+
+
+class _CachedIterator(grain.DatasetIterator):
+    def __init__(
+        self,
+        parent: grain.DatasetIterator,
+        cache: Cache,
+        key: DependencyManifest,
+        shard: Shard,
+        transform: Transform | None,
+    ):
+        super().__init__(parent)
+        self.parent, self.shard, self.transform = parent, shard, transform
+        self.writer = _Writer(cache, key)
+        self.ordinal = 0
+
+    def __next__(self):
+        try:
+            value = next(self.parent)
+        except StopIteration:
+            self.writer.finish()
+            raise
+        value = self.writer.process((self.shard.id, self.ordinal), self.ordinal, value, self.transform)
+        self.ordinal += 1
+        return value
+
+    def get_state(self) -> dict:
+        return {"parent": self.parent.get_state(), "ordinal": self.ordinal}
+
+    def set_state(self, state: Mapping[str, object]) -> None:
+        ordinal = state["ordinal"]
+        parent = state["parent"]
+        if not isinstance(ordinal, int) or not isinstance(parent, Mapping):
+            raise ValueError("invalid cached shard iterator state")
+        self.parent.set_state(parent)
+        self.ordinal = ordinal
+
+    def close(self) -> None:
+        self.parent.close()
+        self.writer.close()
+
+    def metrics(self) -> CacheStats:
+        return self.writer.metrics()

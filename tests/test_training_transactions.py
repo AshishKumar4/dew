@@ -13,7 +13,7 @@ from affine_run import raw_leaf
 from flax import struct
 
 from dew.checkpoints import Checkpoints
-from dew.data import DataPartition
+from dew.data.dataset import DataPartition
 from dew.objectives import Aux, EMASpec, Objective, Ratio
 from dew.objectives.base import under
 from dew.training import Trainer
@@ -197,7 +197,7 @@ def test_real_lm_mtp_router_and_qk_update_matches_combined_batch(auxiliary):
         scores = objective.token_scores(start, combined["text"], depths=True)
         roles = combined["text_roles"] == int(Role.ASSISTANT)
         numerator = jnp.sum(scores.losses * roles[:, 1:])
-        for depth, (losses, _) in enumerate(scores.depths, 1):
+        for depth, (losses, _, _) in enumerate(scores.depths, 1):
             numerator += .3 / 2 * jnp.sum(losses * roles[:, depth + 1:])
         np.testing.assert_allclose(expected_loss, numerator / jnp.sum(roles[:, 1:]), rtol=1e-6)
 

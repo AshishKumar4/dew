@@ -21,6 +21,7 @@ import pytest
 from recording import RecordingTracker
 from reference_error import assert_as_exact_as_the_reference
 
+from dew.data.dataset import Loader
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.inputs import ModelInputs
 from dew.nn.mla import INDEXER, indexer_kl
@@ -399,15 +400,6 @@ def test_evaluation_and_scoring_read_the_split_tree():
     assert objective.ema.select(("params", "layers_0"))
 
 
-class Data:
-    def __init__(self, batches):
-        self._batches = batches
-
-    def train(self, partition):
-        return self._batches()
-
-    val, batch, records, steps_per_epoch = None, 8, None, None
-
 
 def token_batches():
     rng = np.random.default_rng(0)
@@ -431,7 +423,8 @@ def test_the_warmup_trains_through_the_trainer():
     # differently from an eager one at the last bit.
     initial, _, _ = trainer.place()
 
-    state = trainer.fit(Data(token_batches), steps=3, log_every=1)
+    state = trainer.fit(Loader(lambda partition: token_batches(), None, batch=8, records=None),
+                        steps=3, log_every=1)
 
     assert jax.tree.structure(state.opt_state) == jax.tree.structure(
         optax.adam(1e-2).init(initial.variables["params"]))
