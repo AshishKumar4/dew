@@ -14,13 +14,13 @@ V]`, per-token gates `[B, T, HV]`, the memory each chunk enters `[B, T // BT, HV
 reads its chunk of its head where it sits, as fla's pointer arithmetic does.
 
 Each kernel is a launch the tuner times (`dew.nn.kernels.tuning.KernelOp`) over the tiles fla's own
-autotuner lists for it that fit the GPU's block (`_space`), fla's picks for 99 KB GPUs its heuristic
-(`HEURISTICS`); `dew.nn.linear.fla_rule` shapes any other call to them. Every public kernel accepts
-explicit block/warp/stage overrides for the lab.
+autotuner lists for it that fit the GPU's block (its `SPACES`), fla's picks for 99 KB GPUs its
+heuristic (its `PICKS`); `dew.nn.linear.fla_rule` shapes any other call to them.
 """
 
 import dataclasses
 import functools
+from collections.abc import Mapping
 from typing import ClassVar, NamedTuple
 
 import jax
@@ -60,14 +60,16 @@ class Tiles:
 
 @dataclasses.dataclass(frozen=True)
 class _Launch(tuning.KernelOp):
-    """One of the port's nine launches, its `Tiles` measured per GPU model and shape over its kernel's
-    space (`_space`) by the tuner, with the narrow GPUs' fla pick its heuristic (`HEURISTICS`). A
-    subclass names its kernel and the arguments whose widths clip its blocks."""
+    """One of the port's launches, its `Tiles` measured per GPU model and shape over its 16-bit
+    `SPACES` by the tuner, `PICKS` its heuristic. A subclass names its kernel, the arguments whose
+    widths clip its blocks, and its tiles (`_spaces`, `_picks`)."""
 
     config_cls: ClassVar[type[Tiles]] = Tiles
     NAME: ClassVar[str]
     KEYS: ClassVar[str | None] = None
     VALUES: ClassVar[str | None] = None
+    SPACES: ClassVar[Mapping[bool, frozenset[Tiles]]]
+    PICKS: ClassVar[Mapping[tuple[str, bool], Tiles]]
 
     def _tiles(self, ba, tiles: Tiles) -> Tiles:
         """`tiles` with its blocks clipped to the call's key and value widths."""
@@ -75,21 +77,13 @@ class _Launch(tuning.KernelOp):
                   for block, name in ((tiles.bk, self.KEYS), (tiles.bv, self.VALUES)))
         return dataclasses.replace(tiles, bk=bk, bv=bv)
 
-    def heuristic(self, dtype: str, wide: bool) -> Tiles:
-        """The kernel's tiles without a measurement (`HEURISTICS`)."""
-        return HEURISTICS[dtype, wide][self.NAME]
-
-    def space(self, wide: bool) -> frozenset[Tiles]:
-        """The kernel's 16-bit tiles to measure (`_space`)."""
-        return _space(self.NAME, wide)
-
     def _get_heuristics_config(self, ba) -> Tiles:
-        return self._tiles(ba, self.heuristic(_dtype(ba.arguments[self.KEYS or self.VALUES or "g"]), _wide()))
+        return self._tiles(ba, self.PICKS[_dtype(ba.arguments[self.KEYS or self.VALUES or "g"]), _wide()])
 
     def _get_autotuning_configs(self, ba) -> set[Tiles]:
         if _dtype(ba.arguments[self.KEYS or self.VALUES or "g"]) == "float32":
             return {self._get_heuristics_config(ba)}
-        return {self._tiles(ba, tiles) for tiles in self.space(_wide())}
+        return {self._tiles(ba, tiles) for tiles in self.SPACES[_wide()]}
 
     def operands(self, specs: list[jax.ShapeDtypeStruct], seed: int) -> list[jax.Array]:
         """Normal floats, and chunk and sequence descriptors (`Sequences`) a timed launch can run: the
@@ -110,65 +104,28 @@ def _tiles(blocks, warps, stages) -> frozenset[Tiles]:
     return frozenset(Tiles(bk, bv, w, s) for bk, bv in blocks for w in warps for s in stages)
 
 
-def _space(kernel: str, wide: bool) -> frozenset[Tiles]:
-    """`kernel`'s 16-bit tiles to measure on a GPU whose block holds an A100's shared memory (`wide`)
-    or 99 KB: fla's own autotune lists for it (chunk_delta_h.py:41-44, 350-353; chunk_o.py:35-37,
-    151-153, 339-341, 444-446; wy_fast.py:31-33, 111-113; cumsum.py:26-27; chunk_scaled_dot_kkt.py:24-
-    27), the blocks fla picks by heuristic tried at both of its sizes, each within the GPU's block at
-    the 0.8B's, 9B's and 256-wide keys' shapes (every candidate compiled by Triton on a CPU for sm80,
-    sm89 and sm120, 2026-10-13)."""
-    up_to = (2, 3, 4) if wide else (1, 2)
-    return {
-        "chunk_local_cumsum": _tiles([(0, 0)], (1, 2, 4, 8), (1,)),
-        "kkt_solve": _tiles([(32, 0), (64, 0)], (1, 2, 4), (2, 3, 4)),
-        "recompute_w_u": _tiles([(64, 64)], (2, 4, 8), (2, 3, 4)),
-        "chunk_fwd_h": _tiles([(0, 32), (0, 64)], (2, 4), up_to),
-        "chunk_fwd_o": frozenset({Tiles(128, 128, 8, 3), Tiles(64, 64, 4, 3), Tiles(32, 32, 2, 3)}),
-        "chunk_bwd_dv_local": _tiles([(64, 64), (128, 128)], (2, 4, 8), (2, 3, 4)),
-        "chunk_bwd_dhu": _tiles([(0, 32), (0, 64)], (2, 4), (2, 3) if wide else (1, 2)),
-        "chunk_bwd_dqkwg": _tiles([(64, 64), (64, 128), (128, 64), (128, 128)], (2, 4, 8),
-                                  (1, 2) if wide else (1,)),
-        "prepare_wy_repr_bwd": _tiles([(32, 32), (64, 64)], (2, 4, 8), (1, 2, 3)),
-    }[kernel]
+def _spaces(wide: frozenset[Tiles],
+            narrow: frozenset[Tiles] | None = None) -> Mapping[bool, frozenset[Tiles]]:
+    """A launch's 16-bit tiles to measure on a GPU whose block holds an A100's shared memory (True) and
+    on one of 99 KB: fla's own autotune lists for the kernel (chunk_delta_h.py:41-44, 350-353;
+    chunk_o.py:35-37, 151-153, 339-341, 444-446; wy_fast.py:31-33, 111-113; cumsum.py:26-27;
+    chunk_scaled_dot_kkt.py:24-27; chunk_intra.py:33-39; gla/chunk.py:335-344; chunk_bwd.py:331), the
+    blocks fla picks by heuristic tried at both of its sizes, each within the GPU's block at the
+    0.8B's, 9B's and 256-wide keys' shapes (every candidate compiled by Triton on a CPU for sm80,
+    sm89 and sm120, 2026-10-13); `narrow` where the 99 KB one differs."""
+    return {True: wide, False: wide if narrow is None else narrow}
 
 
-_A100 = {
-    "chunk_local_cumsum": Tiles(0, 0, 2, 1),
-    "kkt_solve": Tiles(64, 0, 1, 3),
-    "recompute_w_u": Tiles(64, 64, 2, 4),
-    "chunk_fwd_h": Tiles(0, 32, 4, 3),
-    "chunk_fwd_o": Tiles(128, 128, 8, 3),
-    "chunk_bwd_dv_local": Tiles(64, 64, 2, 3),
-    "chunk_bwd_dhu": Tiles(0, 32, 4, 3),
-    # One stage: its loop over a key head's value heads holds every block of a head, and a second
-    # stage stages the next head's whole, past an RTX's 99 KB at the 9B's two heads a key.
-    "chunk_bwd_dqkwg": Tiles(64, 64, 4, 1),
-    "prepare_wy_repr_bwd": Tiles(64, 64, 4, 2),
-}
-# Eight warps for fp32's WY backward on every GPU: at TF32x3 four took ptxas 40 s on sm80 and 66 s on
-# sm89, eight 17 s.
-_FP32_WY = {"prepare_wy_repr_bwd": Tiles(64, 64, 8, 2)}
-# fla's stage and block lists for devices under an A100's shared memory (chunk_delta_h.py:43-44,
-# 352-353), with two warps for the forward h.
-_SMALL = {**_A100, "chunk_fwd_h": Tiles(0, 32, 2, 2), "chunk_bwd_dhu": Tiles(0, 64, 4, 1)}
-# Measured over each space at Qwen3.5-0.8B's shape (8 x 3072, 16 heads of 128, bf16), CUPTI, 2026-10-13:
-# dqkwg 128/128/8/1 1.33 ms on an A100 (64/64/4/1 2.65, best 128/64/8/1 1.19) and 0.65 on an H100
-# (64/64/4/1 0.52, 128/64/8/1 1.02); dhu 0/64/4/3 1.09 and 0.315, the fastest on both.
-_WIDE_16 = {**_A100, "chunk_bwd_dqkwg": Tiles(128, 128, 8, 1), "chunk_bwd_dhu": Tiles(0, 64, 4, 3)}
-HEURISTICS = {
-    ("bfloat16", True): _WIDE_16,
-    ("bfloat16", False): _SMALL,
-    # One stage for fp32's dhu: three took 254,984 bytes of an A100's 166,912 (c58).
-    ("float32", True): {**_A100, **_FP32_WY, "chunk_fwd_h": Tiles(0, 64, 4, 2),
-                        "chunk_bwd_dhu": Tiles(0, 64, 4, 1)},
-    # One stage for fp32's WY backward on a 99 KB block: its looped blocks stage the next one, 102,400
-    # bytes at two stages (sm89).
-    ("float32", False): {**_SMALL, "prepare_wy_repr_bwd": Tiles(64, 64, 8, 1),
-                         "chunk_fwd_h": Tiles(0, 64, 2, 1), "chunk_bwd_dhu": Tiles(0, 32, 4, 1)},
-}
-"""Each launch's tiles without a measurement, by activation dtype and whether the GPU's block holds an
-A100's shared memory: fla's own A100 choices, and its narrower picks for 99 KB devices. fp32 runs the
-tests, not training: its space is its heuristic alone."""
+def _picks(tiles: Tiles, *, small: Tiles | None = None, wide_bf16: Tiles | None = None,
+           wide_fp32: Tiles | None = None,
+           small_fp32: Tiles | None = None) -> Mapping[tuple[str, bool], Tiles]:
+    """A launch's tiles without a measurement, by activation dtype and whether the GPU's block holds
+    an A100's shared memory: `tiles`, fla's A100 choice, where no other is named; `small`, fla's
+    narrower pick for 99 KB devices; fp32 runs the tests, not training, so its space is its pick
+    alone."""
+    small = tiles if small is None else small
+    return {("bfloat16", True): wide_bf16 or tiles, ("bfloat16", False): small,
+            ("float32", True): wide_fp32 or tiles, ("float32", False): small_fp32 or small}
 
 
 def _dtype(x) -> str:
@@ -352,6 +309,8 @@ class ChunkLocalCumsum(_Launch):
 
     NAME = "chunk_local_cumsum"
     KEYS, VALUES = None, None
+    SPACES = _spaces(_tiles([(0, 0)], (1, 2, 4, 8), (1,)))
+    PICKS = _picks(Tiles(0, 0, 2, 1))
 
     def _fwd(self, g: jax.Array, chunk_spans: jax.Array, sequence_spans: jax.Array, *, chunk: int,
              scale: float | None, reverse: bool, interpret: bool, config: Tiles,
@@ -508,6 +467,8 @@ class KktSolve(_Launch):
 
     NAME = "kkt_solve"
     KEYS, VALUES = 'k', None
+    SPACES = _spaces(_tiles([(32, 0), (64, 0)], (1, 2, 4), (2, 3, 4)))
+    PICKS = _picks(Tiles(64, 0, 1, 3))
 
     def _fwd(self, k: jax.Array, g: jax.Array, g_lo: jax.Array, beta: jax.Array, chunk_spans: jax.Array,
              sequence_spans: jax.Array, *, chunk: int, sub: int, interpret: bool, config: Tiles,
@@ -582,6 +543,8 @@ class RecomputeWU(_Launch):
 
     NAME = "recompute_w_u"
     KEYS, VALUES = 'k', 'v'
+    SPACES = _spaces(_tiles([(64, 64)], (2, 4, 8), (2, 3, 4)))
+    PICKS = _picks(Tiles(64, 64, 2, 4))
 
     def _fwd(self, k: jax.Array, v: jax.Array, beta: jax.Array, a: jax.Array, g: jax.Array,
              chunk_spans: jax.Array, sequence_spans: jax.Array, *, chunk: int, interpret: bool,
@@ -701,6 +664,11 @@ class ChunkFwdH(_Launch):
 
     NAME = "chunk_fwd_h"
     KEYS, VALUES = 'k', 'u'
+    SPACES = _spaces(_tiles([(0, 32), (0, 64)], (2, 4), (2, 3, 4)),
+                     _tiles([(0, 32), (0, 64)], (2, 4), (1, 2)))
+    # fla's stages for devices under an A100's shared memory (chunk_delta_h.py:43-44), with two warps.
+    PICKS = _picks(Tiles(0, 32, 4, 3), small=Tiles(0, 32, 2, 2), wide_fp32=Tiles(0, 64, 4, 2),
+                   small_fp32=Tiles(0, 64, 2, 1))
 
     def _fwd(self, k: jax.Array, w: jax.Array, u: jax.Array, g: jax.Array, g_lo: jax.Array, h0: jax.Array,
              chunk_spans: jax.Array, sequence_spans: jax.Array, *, chunk: int, interpret: bool,
@@ -843,6 +811,12 @@ class ChunkBwdDhu(_Launch):
 
     NAME = "chunk_bwd_dhu"
     KEYS, VALUES = 'k', 'do'
+    SPACES = _spaces(_tiles([(0, 32), (0, 64)], (2, 4), (2, 3)), _tiles([(0, 32), (0, 64)], (2, 4), (1, 2)))
+    # Measured at Qwen3.5-0.8B's shape (8 x 3072, 16 heads of 128, bf16), CUPTI, 2026-10-13: 0/64/4/3
+    # 1.09 ms on an A100 and 0.315 on an H100, the fastest on both. One stage for fp32: three took
+    # 254,984 bytes of an A100's 166,912 (c58); fla's blocks for 99 KB devices (chunk_delta_h.py:352-353).
+    PICKS = _picks(Tiles(0, 64, 4, 3), small=Tiles(0, 64, 4, 1), wide_fp32=Tiles(0, 64, 4, 1),
+                   small_fp32=Tiles(0, 32, 4, 1))
 
     def _fwd(self, q: jax.Array, k: jax.Array, w: jax.Array, g: jax.Array, g_lo: jax.Array, dht: jax.Array,
              do: jax.Array, dv: jax.Array, chunk_spans: jax.Array, sequence_spans: jax.Array, *, scale: float,
@@ -939,6 +913,8 @@ class ChunkBwdDvLocal(_Launch):
 
     NAME = "chunk_bwd_dv_local"
     KEYS, VALUES = 'k', 'do'
+    SPACES = _spaces(_tiles([(64, 64), (128, 128)], (2, 4, 8), (2, 3, 4)))
+    PICKS = _picks(Tiles(64, 64, 2, 3))
 
     def _fwd(self, q: jax.Array, k: jax.Array, g: jax.Array, g_lo: jax.Array, do: jax.Array,
              chunk_spans: jax.Array, sequence_spans: jax.Array, *, scale: float, chunk: int, interpret: bool,
@@ -1069,6 +1045,13 @@ class ChunkBwdDqkwg(_Launch):
 
     NAME = "chunk_bwd_dqkwg"
     KEYS, VALUES = 'k', 'v'
+    SPACES = _spaces(_tiles([(64, 64), (64, 128), (128, 64), (128, 128)], (2, 4, 8), (1, 2)),
+                     _tiles([(64, 64), (64, 128), (128, 64), (128, 128)], (2, 4, 8), (1,)))
+    # One stage elsewhere: its loop over a key head's value heads holds every block of a head, and a
+    # second stage stages the next head's whole, past an RTX's 99 KB at the 9B's two heads a key.
+    # Measured at Qwen3.5-0.8B's shape, CUPTI, 2026-10-13: 128/128/8/1 1.33 ms on an A100 (64/64/4/1
+    # 2.65, best 128/64/8/1 1.19) and 0.65 on an H100 (64/64/4/1 0.52, 128/64/8/1 1.02).
+    PICKS = _picks(Tiles(64, 64, 4, 1), wide_bf16=Tiles(128, 128, 8, 1))
 
     def _fwd(self, q: jax.Array, k: jax.Array, v: jax.Array, w: jax.Array, g: jax.Array, g_lo: jax.Array,
              h: jax.Array, dv: jax.Array, do: jax.Array, dh: jax.Array, chunk_spans: jax.Array,
@@ -1230,6 +1213,11 @@ class PrepareWyReprBwd(_Launch):
 
     NAME = "prepare_wy_repr_bwd"
     KEYS, VALUES = 'k', 'v'
+    SPACES = _spaces(_tiles([(32, 32), (64, 64)], (2, 4, 8), (1, 2, 3)))
+    # Eight warps for fp32 on every GPU: at TF32x3 four took ptxas 40 s on sm80 and 66 s on sm89, eight
+    # 17 s; one stage on a 99 KB block, whose looped blocks stage the next one, 102,400 bytes at two
+    # (sm89).
+    PICKS = _picks(Tiles(64, 64, 4, 2), wide_fp32=Tiles(64, 64, 8, 2), small_fp32=Tiles(64, 64, 8, 1))
 
     def _fwd(self, k: jax.Array, v: jax.Array, beta: jax.Array, g: jax.Array, g_lo: jax.Array, a: jax.Array,
              dw: jax.Array, du: jax.Array, dk: jax.Array | None, chunk_spans: jax.Array,
@@ -1328,6 +1316,8 @@ class ChunkFwdO(_Launch):
 
     NAME = "chunk_fwd_o"
     KEYS, VALUES = 'k', 'v'
+    SPACES = _spaces(frozenset({Tiles(128, 128, 8, 3), Tiles(64, 64, 4, 3), Tiles(32, 32, 2, 3)}))
+    PICKS = _picks(Tiles(128, 128, 8, 3))
 
     def _fwd(self, q: jax.Array, k: jax.Array, v: jax.Array, h: jax.Array, g: jax.Array, g_lo: jax.Array,
              chunk_spans: jax.Array, sequence_spans: jax.Array, *, scale: float, chunk: int,
