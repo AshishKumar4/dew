@@ -1,0 +1,1770 @@
+{
+  "schema": 1,
+  "commit": "5e4698ff52b5349c81c0d0cfb81efa89b29a8707",
+  "inputs": {
+    "image": {
+      "path": "/home/ubuntu/tightpig-receipt/work/image/images.array_record",
+      "bytes": 983040,
+      "sha256": "6f7e125353b7677951f22da3ef9df1a6d702a0ac111e77e4ffd57320f8eed6a7",
+      "rows": 4096,
+      "source": "/home/ubuntu/tightpig-receipt/work/image"
+    },
+    "text": {
+      "path": "/home/ubuntu/tightpig-receipt/work/text/train.bin",
+      "bytes": 2044542,
+      "sha256": "7f6c7f1e9e5bd27c6b620e9d25f2a7990468df341b29ea74195272054b0bbf3a",
+      "rows": 18000,
+      "tokens": 1022271,
+      "source": "/home/ubuntu/tightpig-receipt/work/text"
+    }
+  },
+  "rows": [
+    {
+      "engine": "dew",
+      "workload": "image",
+      "config": {
+        "engine": "dew",
+        "workload": "image",
+        "source": "/home/ubuntu/tightpig-receipt/work/image",
+        "output": "/home/ubuntu/tightpig-receipt/work/0-image-dew.json",
+        "steps": 128,
+        "warmup": 8,
+        "train_steps": 16,
+        "stage_batches": 16,
+        "workers": 2,
+        "batch": 32,
+        "tokens": 16384,
+        "seq_len": 128,
+        "image_size": 128,
+        "seed": 17,
+        "cold": false
+      },
+      "policy": {
+        "records": 4096,
+        "read": "indexed",
+        "batch_policy": "fixed rows",
+        "plan_sha256": "bc25532a1890cffb3546f529978da422818a9b2404b78b79b520e17a497b351b",
+        "lowering": "global",
+        "exact": true
+      },
+      "cold_open_seconds": 0.6088687489973381,
+      "loader": {
+        "first_batch_seconds": 4.7334580040187575,
+        "batches": 128,
+        "batches_per_second": 142.63371907895694,
+        "records_per_second": 4564.279010526622,
+        "tokens_per_second": 0.0,
+        "latency_p50_ms": 6.2838849844411016,
+        "latency_p95_ms": 22.561382997082546
+      },
+      "loading": {
+        "workers": 2,
+        "threads": 16,
+        "read_buffer": 16,
+        "worker_buffer": 2,
+        "ram_budget_mb": null,
+        "max_workers": null
+      },
+      "device": "NVIDIA A100-SXM4-40GB",
+      "cold_scope": "fresh process and loader objects; shared OS page cache after input preparation",
+      "environment": {
+        "python": "3.12.15",
+        "platform": "Linux-6.8.0-60-generic-x86_64-with-glibc2.35",
+        "cpu": "x86_64",
+        "packages": {
+          "jax": "0.11.2.post4",
+          "jaxlib": "0.11.2",
+          "numpy": "2.5.4",
+          "grain": "0.2.18",
+          "transformers": "5.16.1"
+        }
+      },
+      "first_batch_from_open_seconds": 5.342326753016096,
+      "training": {
+        "steps": 16,
+        "data_wait_ms": 0.2374823143327376,
+        "step_ms": 1.5562335611321032,
+        "dispatch_ms": 1.5026561868580757,
+        "records_per_second": 17840.060646007947,
+        "tokens_per_second": 0.0,
+        "padding_fraction": null,
+        "compile_count": 1,
+        "compiles": [
+          {
+            "signature": [
+              [
+                "['image']",
+                [
+                  32,
+                  128,
+                  128,
+                  3
+                ],
+                "uint8"
+              ]
+            ],
+            "seconds": 0.6039236530195922,
+            "flops": 1152.0
+          }
+        ],
+        "losses": [
+          0.3950677216053009,
+          0.3942751884460449,
+          0.3937223553657532,
+          0.3936479687690735,
+          0.39369288086891174,
+          0.3924245238304138,
+          0.39246973395347595,
+          0.39263400435447693,
+          0.39208275079727173,
+          0.3921275734901428,
+          0.39169585704803467,
+          0.3918594717979431,
+          0.39130908250808716,
+          0.3909968435764313,
+          0.39104124903678894,
+          0.3901352882385254
+        ],
+        "scope": "real asynchronous Trainer.compile updates; compilation boundaries excluded",
+        "model_mfu_bf16_peak": null,
+        "model_flops_scope": "objective.training_flops on real host lengths and layout; custom image-mean model and frozen legacy API have no analytic count",
+        "hlo_utilization_bf16_peak": 2.05846853607784e-09,
+        "utilization_scope": "optimized executable work, including padding, over dense bf16 peak; not an analytic real-token MFU"
+      },
+      "stages": [
+        {
+          "file": "threading.py",
+          "line": 637,
+          "function": "wait",
+          "self_seconds": 0.000591003,
+          "cumulative_seconds": 7.511256171,
+          "calls": 142
+        },
+        {
+          "file": "~",
+          "line": 0,
+          "function": "<built-in method builtins.next>",
+          "self_seconds": 0.00030365300000000003,
+          "cumulative_seconds": 4.8098726560000005,
+          "calls": 368
+        },
+        {
+          "file": "dataset.py",
+          "line": 831,
+          "function": "__next__",
+          "self_seconds": 7.9239e-05,
+          "cumulative_seconds": 4.80984677,
+          "calls": 20
+        },
+        {
+          "file": "threading.py",
+          "line": 323,
+          "function": "wait",
+          "self_seconds": 0.001114048,
+          "cumulative_seconds": 4.798951132,
+          "calls": 160
+        },
+        {
+          "file": "stats.py",
+          "line": 320,
+          "function": "wrapper",
+          "self_seconds": 0.000407756,
+          "cumulative_seconds": 4.797553440000001,
+          "calls": 53
+        },
+        {
+          "file": "~",
+          "line": 0,
+          "function": "<method 'acquire' of '_thread.lock' objects>",
+          "self_seconds": 2.7126325000000002,
+          "cumulative_seconds": 4.7970746790000005,
+          "calls": 738
+        },
+        {
+          "file": "dataset.py",
+          "line": 1061,
+          "function": "__next__",
+          "self_seconds": 3.9945000000000005e-05,
+          "cumulative_seconds": 4.795040221000001,
+          "calls": 18
+        },
+        {
+          "file": "traceback_util.py",
+          "line": 359,
+          "function": "reraise_with_filtered_traceback",
+          "self_seconds": 8.3109e-05,
+          "cumulative_seconds": 4.781790685000001,
+          "calls": 36
+        },
+        {
+          "file": "queues.py",
+          "line": 98,
+          "function": "get",
+          "self_seconds": 0.000255733,
+          "cumulative_seconds": 4.779630002,
+          "calls": 25
+        },
+        {
+          "file": "connection.py",
+          "line": 253,
+          "function": "poll",
+          "self_seconds": 0.0017179550000000002,
+          "cumulative_seconds": 4.776561665,
+          "calls": 37
+        },
+        {
+          "file": "stats.py",
+          "line": 423,
+          "function": "wrapper",
+          "self_seconds": 0.000173985,
+          "cumulative_seconds": 4.769241175,
+          "calls": 36
+        },
+        {
+          "file": "process_prefetch.py",
+          "line": 494,
+          "function": "__next__",
+          "self_seconds": 0.000217118,
+          "cumulative_seconds": 4.767065752000001,
+          "calls": 17
+        },
+        {
+          "file": "connection.py",
+          "line": 439,
+          "function": "_poll",
+          "self_seconds": 0.010308860000000001,
+          "cumulative_seconds": 4.766240424,
+          "calls": 37
+        },
+        {
+          "file": "__init__.py",
+          "line": 951,
+          "function": "children",
+          "self_seconds": 0.027782042000000003,
+          "cumulative_seconds": 1.945352183,
+          "calls": 137
+        },
+        {
+          "file": "_pslinux.py",
+          "line": 1562,
+          "function": "ppid_map",
+          "self_seconds": 0.189693931,
+          "cumulative_seconds": 1.8033237720000002,
+          "calls": 137
+        },
+        {
+          "file": "_common.py",
+          "line": 681,
+          "function": "open_binary",
+          "self_seconds": 0.023847223,
+          "cumulative_seconds": 0.62572724,
+          "calls": 77561
+        },
+        {
+          "file": "~",
+          "line": 0,
+          "function": "<built-in method _io.open>",
+          "self_seconds": 0.595968216,
+          "cumulative_seconds": 0.59602182,
+          "calls": 77563
+        },
+        {
+          "file": "~",
+          "line": 0,
+          "function": "<method 'read' of '_io.BufferedReader' objects>",
+          "self_seconds": 0.5872509800000001,
+          "cumulative_seconds": 0.58741803,
+          "calls": 76461
+        },
+        {
+          "file": "~",
+          "line": 0,
+          "function": "<method '__exit__' of '_io._IOBase' objects>",
+          "self_seconds": 0.19963169500000003,
+          "cumulative_seconds": 0.19966709800000002,
+          "calls": 77567
+        },
+        {
+          "file": "_pslinux.py",
+          "line": 1523,
+          "function": "pids",
+          "self_seconds": 0.029838635000000002,
+          "cumulative_seconds": 0.158982583,
+          "calls": 137
+        }
+      ],
+      "stage_scope": "separate untimed 16-batch parent-thread cProfile; excludes worker CPU",
+      "parent_rss_peak_bytes": 2223816704,
+      "worker_rss_peak_bytes": 1206771712,
+      "cold": false
+    },
+    {
+      "engine": "grain",
+      "workload": "image",
+      "config": {
+        "engine": "grain",
+        "workload": "image",
+        "source": "/home/ubuntu/tightpig-receipt/work/image",
+        "output": "/home/ubuntu/tightpig-receipt/work/1-image-grain.json",
+        "steps": 128,
+        "warmup": 8,
+        "train_steps": 16,
+        "stage_batches": 16,
+        "workers": 2,
+        "batch": 32,
+        "tokens": 16384,
+        "seq_len": 128,
+        "image_size": 128,
+        "seed": 17,
+        "cold": false
+      },
+      "policy": {
+        "read": "indexed",
+        "batch_policy": "fixed rows",
+        "reference": "native Grain transforms"
+      },
+      "cold_open_seconds": 0.03391092599486001,
+      "loader": {
+        "first_batch_seconds": 4.792911841999739,
+        "batches": 128,
+        "batches_per_second": 157.85834335444594,
+        "records_per_second": 5051.46698734227,
+        "tokens_per_second": 0.0,
+        "latency_p50_ms": 3.0046900210436434,
+        "latency_p95_ms": 31.816948001505807
+      },
+      "loading": {
+        "workers": 2,
+        "threads": 16,
+        "read_buffer": 16,
+        "worker_buffer": 2,
+        "ram_budget_mb": null,
+        "max_workers": null
+      },
+      "device": "NVIDIA A100-SXM4-40GB",
+      "cold_scope": "fresh process and loader objects; shared OS page cache after input preparation",
+      "environment": {
+        "python": "3.12.15",
+        "platform": "Linux-6.8.0-60-generic-x86_64-with-glibc2.35",
+        "cpu": "x86_64",
+        "packages": {
+          "jax": "0.11.2.post4",
+          "jaxlib": "0.11.2",
+          "numpy": "2.5.4",
+          "grain": "0.2.18",
+          "transformers": "5.16.1"
+        }
+      },
+      "first_batch_from_open_seconds": 4.826822767994599,
+      "training": {
+        "steps": 16,
+        "data_wait_ms": 0.3679054971144069,
+        "step_ms": 1.0951715648843674,
+        "dispatch_ms": 1.0431288774270797,
+        "records_per_second": 21871.711908519286,
+        "tokens_per_second": 0.0,
+        "padding_fraction": null,
+        "compile_count": 1,
+        "compiles": [
+          {
+            "signature": [
+              [
+                "['image']",
+                [
+                  32,
+                  128,
+                  128,
+                  3
+                ],
+                "uint8"
+              ]
+            ],
+            "seconds": 0.3235368719906546,
+            "flops": 1152.0
+          }
+        ],
+        "losses": [
+          0.3950677216053009,
+          0.3942751884460449,
+          0.3937223553657532,
+          0.3936479687690735,
+          0.39369288086891174,
+          0.3924245238304138,
+          0.39246973395347595,
+          0.39263400435447693,
+          0.39208275079727173,
+          0.3921275734901428,
+          0.39169585704803467,
+          0.3918594717979431,
+          0.39130908250808716,
+          0.3909968435764313,
+          0.39104124903678894,
+          0.3901352882385254
+        ],
+        "scope": "real asynchronous Trainer.compile updates; compilation boundaries excluded",
+        "model_mfu_bf16_peak": null,
+        "model_flops_scope": "objective.training_flops on real host lengths and layout; custom image-mean model and frozen legacy API have no analytic count",
+        "hlo_utilization_bf16_peak": 2.5236590663676098e-09,
+        "utilization_scope": "optimized executable work, including padding, over dense bf16 peak; not an analytic real-token MFU"
+      },
+      "stages": [
+        {
+          "file": "_common.py",
+          "line": 681,
+          "function": "open_binary",
+          "self_seconds": 0.023057681,
+          "cumulative_seconds": 5.361971517000001,
+          "calls": 78346
+        },
+        {
+          "file": "~",
+          "line": 0,
+          "function": "<built-in method _io.open>",
+          "self_seconds": 0.559959183,
+          "cumulative_seconds": 5.338155406,
+          "calls": 78348
+        },
+        {
+          "file": "~",
+          "line": 0,
+          "function": "<built-in method builtins.next>",
+          "self_seconds": 0.000315044,
+          "cumulative_seconds": 4.785512606,
+          "calls": 309
+        },
+        {
+          "file": "traceback_util.py",
+          "line": 359,
+          "function": "reraise_with_filtered_traceback",
+          "self_seconds": 0.000156701,
+          "cumulative_seconds": 4.770660653,
+          "calls": 38
+        },
+        {
+          "file": "stats.py",
+          "line": 423,
+          "function": "wrapper",
+          "self_seconds": 0.000257493,
+          "cumulative_seconds": 4.758599380000001,
+          "calls": 36
+        },
+        {
+          "file": "threading.py",
+          "line": 637,
+          "function": "wait",
+          "self_seconds": 0.000596942,
+          "cumulative_seconds": 2.694412928,
+          "calls": 143
+        },
+        {
+          "file": "__init__.py",
+          "line": 951,
+          "function": "children",
+          "self_seconds": 0.02117418,
+          "cumulative_seconds": 1.914868416,
+          "calls": 137
+        },
+        {
+          "file": "_pslinux.py",
+          "line": 1562,
+          "function": "ppid_map",
+          "self_seconds": 0.184417453,
+          "cumulative_seconds": 1.7813858480000002,
+          "calls": 137
+        },
+        {
+          "file": "~",
+          "line": 0,
+          "function": "<method 'read' of '_io.BufferedReader' objects>",
+          "self_seconds": 0.60052192,
+          "cumulative_seconds": 0.600939914,
+          "calls": 77238
+        },
+        {
+          "file": "~",
+          "line": 0,
+          "function": "<method '__exit__' of '_io._IOBase' objects>",
+          "self_seconds": 0.19443178500000002,
+          "cumulative_seconds": 0.19451205600000002,
+          "calls": 78349
+        },
+        {
+          "file": "_pslinux.py",
+          "line": 1523,
+          "function": "pids",
+          "self_seconds": 0.029056173,
+          "cumulative_seconds": 0.157550839,
+          "calls": 138
+        },
+        {
+          "file": "~",
+          "line": 0,
+          "function": "<built-in method posix.listdir>",
+          "self_seconds": 0.118146445,
+          "cumulative_seconds": 0.118146445,
+          "calls": 138
+        },
+        {
+          "file": "_pslinux.py",
+          "line": 1589,
+          "function": "wrapper",
+          "self_seconds": 0.003075954,
+          "cumulative_seconds": 0.111336579,
+          "calls": 2480
+        },
+        {
+          "file": "~",
+          "line": 0,
+          "function": "<method 'split' of 'bytes' objects>",
+          "self_seconds": 0.10424931800000001,
+          "cumulative_seconds": 0.10424931800000001,
+          "calls": 78341
+        },
+        {
+          "file": "_pslinux.py",
+          "line": 1848,
+          "function": "create_time",
+          "self_seconds": 0.0018048640000000002,
+          "cumulative_seconds": 0.09217446600000001,
+          "calls": 1240
+        },
+        {
+          "file": "__init__.py",
+          "line": 775,
+          "function": "create_time",
+          "self_seconds": 0.00040629800000000003,
+          "cumulative_seconds": 0.061331594,
+          "calls": 551
+        },
+        {
+          "file": "_pslinux.py",
+          "line": 1507,
+          "function": "boot_time",
+          "self_seconds": 0.048865013000000006,
+          "cumulative_seconds": 0.059867169000000005,
+          "calls": 551
+        },
+        {
+          "file": "_common.py",
+          "line": 367,
+          "function": "wrapper",
+          "self_seconds": 0.003389277,
+          "cumulative_seconds": 0.049194189000000006,
+          "calls": 1240
+        },
+        {
+          "file": "__init__.py",
+          "line": 313,
+          "function": "__init__",
+          "self_seconds": 0.0005105660000000001,
+          "cumulative_seconds": 0.038586802,
+          "calls": 689
+        },
+        {
+          "file": "__init__.py",
+          "line": 316,
+          "function": "_init",
+          "self_seconds": 0.0025998740000000003,
+          "cumulative_seconds": 0.038076236,
+          "calls": 689
+        }
+      ],
+      "stage_scope": "separate untimed 16-batch parent-thread cProfile; excludes worker CPU",
+      "parent_rss_peak_bytes": 2135085056,
+      "worker_rss_peak_bytes": 1178767360,
+      "cold": false
+    },
+    {
+      "engine": "dew",
+      "workload": "text",
+      "config": {
+        "engine": "dew",
+        "workload": "text",
+        "source": "/home/ubuntu/tightpig-receipt/work/text",
+        "output": "/home/ubuntu/tightpig-receipt/work/2-text-dew.json",
+        "steps": 128,
+        "warmup": 8,
+        "train_steps": 16,
+        "stage_batches": 16,
+        "workers": 2,
+        "batch": 32,
+        "tokens": 16384,
+        "seq_len": 128,
+        "image_size": 128,
+        "seed": 17,
+        "cold": false
+      },
+      "policy": {
+        "records": 8851,
+        "read": "indexed",
+        "batch_policy": "fixed rows",
+        "plan_sha256": "908e6f6bf3357b6f8cfcc124ab7ba97a2445fc6e9d1ab438599ad9a91d2eaccd",
+        "lowering": "global",
+        "exact": true
+      },
+      "cold_open_seconds": 0.5220746959967073,
+      "loader": {
+        "first_batch_seconds": 4.537329385988414,
+        "batches": 128,
+        "batches_per_second": 344.30622015660566,
+        "records_per_second": 11017.799045011381,
+        "tokens_per_second": 1251493.9326376722,
+        "latency_p50_ms": 2.069506997941062,
+        "latency_p95_ms": 7.1922359929885715
+      },
+      "loading": {
+        "workers": 2,
+        "threads": 16,
+        "read_buffer": 16,
+        "worker_buffer": 2,
+        "ram_budget_mb": null,
+        "max_workers": null
+      },
+      "device": "NVIDIA A100-SXM4-40GB",
+      "cold_scope": "fresh process and loader objects; shared OS page cache after input preparation",
+      "environment": {
+        "python": "3.12.15",
+        "platform": "Linux-6.8.0-60-generic-x86_64-with-glibc2.35",
+        "cpu": "x86_64",
+        "packages": {
+          "jax": "0.11.2.post4",
+          "jaxlib": "0.11.2",
+          "numpy": "2.5.4",
+          "grain": "0.2.18",
+          "transformers": "5.16.1"
+        }
+      },
+      "first_batch_from_open_seconds": 5.059404081985122,
+      "training": {
+        "steps": 16,
+        "data_wait_ms": 1.0029782497440465,
+        "step_ms": 3.0538833125319798,
+        "dispatch_ms": 2.9749290024483344,
+        "records_per_second": 7887.870835318077,
+        "tokens_per_second": 883688.0295192284,
+        "padding_fraction": 0.124755859375,
+        "compile_count": 1,
+        "compiles": [
+          {
+            "signature": [
+              [
+                "['text']",
+                [
+                  32,
+                  129
+                ],
+                "int32"
+              ],
+              [
+                "['text_positions']",
+                [
+                  32,
+                  129
+                ],
+                "int32"
+              ],
+              [
+                "['text_segment_ids']",
+                [
+                  32,
+                  129
+                ],
+                "int32"
+              ]
+            ],
+            "seconds": 6.496554233977804,
+            "flops": 654311424.0
+          }
+        ],
+        "losses": [
+          6.034376621246338,
+          6.016653060913086,
+          6.019070148468018,
+          5.9994215965271,
+          5.979976654052734,
+          5.9965620040893555,
+          5.97848653793335,
+          5.954032897949219,
+          5.964736461639404,
+          5.945396900177002,
+          5.963879108428955,
+          5.95078706741333,
+          5.9288105964660645,
+          5.899726390838623,
+          5.890012264251709,
+          5.922085762023926
+        ],
+        "scope": "real asynchronous Trainer.compile updates; compilation boundaries excluded",
+        "model_mfu_bf16_peak": 0.000352814280284358,
+        "model_flops_scope": "objective.training_flops on real host lengths and layout; custom image-mean model and frozen legacy API have no analytic count",
+        "hlo_utilization_bf16_peak": 0.0005169395030634055,
+        "utilization_scope": "optimized executable work, including padding, over dense bf16 peak; not an analytic real-token MFU"
+      },
+      "stages": [
+        {
+          "file": "threading.py",
+          "line": 637,
+          "function": "wait",
+          "self_seconds": 0.0005352190000000001,
+          "cumulative_seconds": 7.160551518,
+          "calls": 137
+        },
+        {
+          "file": "~",
+          "line": 0,
+          "function": "<built-in method builtins.next>",
+          "self_seconds": 0.000367504,
+          "cumulative_seconds": 4.539680553,
+          "calls": 362
+        },
+        {
+          "file": "dataset.py",
+          "line": 1061,
+          "function": "__next__",
+          "self_seconds": 7.0499e-05,
+          "cumulative_seconds": 4.5369691670000005,
+          "calls": 19
+        },
+        {
+          "file": "threading.py",
+          "line": 323,
+          "function": "wait",
+          "self_seconds": 0.000984641,
+          "cumulative_seconds": 4.5315853310000005,
+          "calls": 153
+        },
+        {
+          "file": "stats.py",
+          "line": 320,
+          "function": "wrapper",
+          "self_seconds": 0.00045668700000000005,
+          "cumulative_seconds": 4.528212335,
+          "calls": 53
+        },
+        {
+          "file": "~",
+          "line": 0,
+          "function": "<method 'acquire' of '_thread.lock' objects>",
+          "self_seconds": 2.6302568330000002,
+          "cumulative_seconds": 4.528071000000001,
+          "calls": 748
+        },
+        {
+          "file": "traceback_util.py",
+          "line": 359,
+          "function": "reraise_with_filtered_traceback",
+          "self_seconds": 0.00047896500000000003,
+          "cumulative_seconds": 4.498574159,
+          "calls": 37
+        },
+        {
+          "file": "stats.py",
+          "line": 423,
+          "function": "wrapper",
+          "self_seconds": 0.00030003200000000004,
+          "cumulative_seconds": 4.494352231000001,
+          "calls": 36
+        },
+        {
+          "file": "process_prefetch.py",
+          "line": 432,
+          "function": "start_prefetch",
+          "self_seconds": 6.8434e-05,
+          "cumulative_seconds": 4.216506938,
+          "calls": 19
+        },
+        {
+          "file": "__init__.py",
+          "line": 951,
+          "function": "children",
+          "self_seconds": 0.020019094,
+          "cumulative_seconds": 1.7805518470000001,
+          "calls": 132
+        },
+        {
+          "file": "_pslinux.py",
+          "line": 1562,
+          "function": "ppid_map",
+          "self_seconds": 0.18487666600000002,
+          "cumulative_seconds": 1.647588241,
+          "calls": 132
+        },
+        {
+          "file": "~",
+          "line": 0,
+          "function": "<method 'read' of '_io.BufferedReader' objects>",
+          "self_seconds": 0.5466277740000001,
+          "cumulative_seconds": 0.54675734,
+          "calls": 74075
+        },
+        {
+          "file": "_common.py",
+          "line": 681,
+          "function": "open_binary",
+          "self_seconds": 0.023314893,
+          "cumulative_seconds": 0.5404891580000001,
+          "calls": 75137
+        },
+        {
+          "file": "~",
+          "line": 0,
+          "function": "<built-in method _io.open>",
+          "self_seconds": 0.515913001,
+          "cumulative_seconds": 0.51590296,
+          "calls": 75139
+        },
+        {
+          "file": "~",
+          "line": 0,
+          "function": "<method '__exit__' of '_io._IOBase' objects>",
+          "self_seconds": 0.186585346,
+          "cumulative_seconds": 0.186646567,
+          "calls": 75142
+        },
+        {
+          "file": "_pslinux.py",
+          "line": 1523,
+          "function": "pids",
+          "self_seconds": 0.028216462,
+          "cumulative_seconds": 0.149076398,
+          "calls": 132
+        },
+        {
+          "file": "_pslinux.py",
+          "line": 1589,
+          "function": "wrapper",
+          "self_seconds": 0.003051906,
+          "cumulative_seconds": 0.112615425,
+          "calls": 2383
+        },
+        {
+          "file": "~",
+          "line": 0,
+          "function": "<built-in method posix.listdir>",
+          "self_seconds": 0.110695714,
+          "cumulative_seconds": 0.110695714,
+          "calls": 132
+        },
+        {
+          "file": "_pslinux.py",
+          "line": 1848,
+          "function": "create_time",
+          "self_seconds": 0.001763337,
+          "cumulative_seconds": 0.09373677300000001,
+          "calls": 1192
+        },
+        {
+          "file": "~",
+          "line": 0,
+          "function": "<method 'split' of 'bytes' objects>",
+          "self_seconds": 0.07945642600000001,
+          "cumulative_seconds": 0.07945642600000001,
+          "calls": 75134
+        }
+      ],
+      "stage_scope": "separate untimed 16-batch parent-thread cProfile; excludes worker CPU",
+      "parent_rss_peak_bytes": 2422493184,
+      "worker_rss_peak_bytes": 1236439040,
+      "cold": false
+    },
+    {
+      "engine": "grain",
+      "workload": "text",
+      "config": {
+        "engine": "grain",
+        "workload": "text",
+        "source": "/home/ubuntu/tightpig-receipt/work/text",
+        "output": "/home/ubuntu/tightpig-receipt/work/3-text-grain.json",
+        "steps": 128,
+        "warmup": 8,
+        "train_steps": 16,
+        "stage_batches": 16,
+        "workers": 2,
+        "batch": 32,
+        "tokens": 16384,
+        "seq_len": 128,
+        "image_size": 128,
+        "seed": 17,
+        "cold": false
+      },
+      "policy": {
+        "read": "indexed",
+        "batch_policy": "fixed rows",
+        "reference": "planned first-fit windows read from token store"
+      },
+      "cold_open_seconds": 0.05911485099932179,
+      "loader": {
+        "first_batch_seconds": 4.581460688990774,
+        "batches": 128,
+        "batches_per_second": 373.04236728246804,
+        "records_per_second": 11937.355753038977,
+        "tokens_per_second": 1355944.8884148947,
+        "latency_p50_ms": 1.8880440038628876,
+        "latency_p95_ms": 7.1968670235946774
+      },
+      "loading": {
+        "workers": 2,
+        "threads": 16,
+        "read_buffer": 16,
+        "worker_buffer": 2,
+        "ram_budget_mb": null,
+        "max_workers": null
+      },
+      "device": "NVIDIA A100-SXM4-40GB",
+      "cold_scope": "fresh process and loader objects; shared OS page cache after input preparation",
+      "environment": {
+        "python": "3.12.15",
+        "platform": "Linux-6.8.0-60-generic-x86_64-with-glibc2.35",
+        "cpu": "x86_64",
+        "packages": {
+          "jax": "0.11.2.post4",
+          "jaxlib": "0.11.2",
+          "numpy": "2.5.4",
+          "grain": "0.2.18",
+          "transformers": "5.16.1"
+        }
+      },
+      "first_batch_from_open_seconds": 4.640575539990095,
+      "training": {
+        "steps": 16,
+        "data_wait_ms": 1.0707199362514075,
+        "step_ms": 2.8725933134410297,
+        "dispatch_ms": 2.7892994967260165,
+        "records_per_second": 8115.003291330171,
+        "tokens_per_second": 909133.9624818332,
+        "padding_fraction": 0.124755859375,
+        "compile_count": 1,
+        "compiles": [
+          {
+            "signature": [
+              [
+                "['text']",
+                [
+                  32,
+                  129
+                ],
+                "int32"
+              ],
+              [
+                "['text_positions']",
+                [
+                  32,
+                  129
+                ],
+                "int32"
+              ],
+              [
+                "['text_segment_ids']",
+                [
+                  32,
+                  129
+                ],
+                "int32"
+              ]
+            ],
+            "seconds": 2.412334084016038,
+            "flops": 654311424.0
+          }
+        ],
+        "losses": [
+          6.034376621246338,
+          6.016652584075928,
+          6.01907205581665,
+          5.9994215965271,
+          5.979976177215576,
+          5.996562480926514,
+          5.978484153747559,
+          5.954032897949219,
+          5.964736461639404,
+          5.9453911781311035,
+          5.963879108428955,
+          5.950781345367432,
+          5.928813457489014,
+          5.899726867675781,
+          5.890007972717285,
+          5.922093868255615
+        ],
+        "scope": "real asynchronous Trainer.compile updates; compilation boundaries excluded",
+        "model_mfu_bf16_peak": 0.0003629736218443537,
+        "model_flops_scope": "objective.training_flops on real host lengths and layout; custom image-mean model and frozen legacy API have no analytic count",
+        "hlo_utilization_bf16_peak": 0.0005318248557006141,
+        "utilization_scope": "optimized executable work, including padding, over dense bf16 peak; not an analytic real-token MFU"
+      },
+      "stages": [
+        {
+          "file": "~",
+          "line": 0,
+          "function": "<built-in method builtins.next>",
+          "self_seconds": 0.00028619800000000004,
+          "cumulative_seconds": 4.593158185,
+          "calls": 343
+        },
+        {
+          "file": "threading.py",
+          "line": 323,
+          "function": "wait",
+          "self_seconds": 0.001255182,
+          "cumulative_seconds": 4.576037868,
+          "calls": 157
+        },
+        {
+          "file": "~",
+          "line": 0,
+          "function": "<method 'acquire' of '_thread.lock' objects>",
+          "self_seconds": 2.670228243,
+          "cumulative_seconds": 4.571726225,
+          "calls": 753
+        },
+        {
+          "file": "process_prefetch.py",
+          "line": 494,
+          "function": "__next__",
+          "self_seconds": 0.000205416,
+          "cumulative_seconds": 4.566422349000001,
+          "calls": 18
+        },
+        {
+          "file": "traceback_util.py",
+          "line": 359,
+          "function": "reraise_with_filtered_traceback",
+          "self_seconds": 6.9372e-05,
+          "cumulative_seconds": 4.564784794,
+          "calls": 38
+        },
+        {
+          "file": "connection.py",
+          "line": 253,
+          "function": "poll",
+          "self_seconds": 0.00010176300000000001,
+          "cumulative_seconds": 4.5617529910000005,
+          "calls": 32
+        },
+        {
+          "file": "connection.py",
+          "line": 439,
+          "function": "_poll",
+          "self_seconds": 0.000316622,
+          "cumulative_seconds": 4.557337837,
+          "calls": 32
+        },
+        {
+          "file": "queues.py",
+          "line": 98,
+          "function": "get",
+          "self_seconds": 0.000131283,
+          "cumulative_seconds": 4.555528625,
+          "calls": 18
+        },
+        {
+          "file": "stats.py",
+          "line": 423,
+          "function": "wrapper",
+          "self_seconds": 0.00016968900000000002,
+          "cumulative_seconds": 4.541858353,
+          "calls": 36
+        },
+        {
+          "file": "process_prefetch.py",
+          "line": 432,
+          "function": "start_prefetch",
+          "self_seconds": 4.8555000000000005e-05,
+          "cumulative_seconds": 4.259194845000001,
+          "calls": 19
+        },
+        {
+          "file": "threading.py",
+          "line": 637,
+          "function": "wait",
+          "self_seconds": 0.000555803,
+          "cumulative_seconds": 2.6722769140000002,
+          "calls": 139
+        },
+        {
+          "file": "__init__.py",
+          "line": 951,
+          "function": "children",
+          "self_seconds": 0.028088168,
+          "cumulative_seconds": 1.7830922050000002,
+          "calls": 133
+        },
+        {
+          "file": "_pslinux.py",
+          "line": 1562,
+          "function": "ppid_map",
+          "self_seconds": 0.184744826,
+          "cumulative_seconds": 1.640250261,
+          "calls": 133
+        },
+        {
+          "file": "_common.py",
+          "line": 681,
+          "function": "open_binary",
+          "self_seconds": 0.022262253000000003,
+          "cumulative_seconds": 0.542890298,
+          "calls": 76054
+        },
+        {
+          "file": "~",
+          "line": 0,
+          "function": "<method 'read' of '_io.BufferedReader' objects>",
+          "self_seconds": 0.530806451,
+          "cumulative_seconds": 0.5310058950000001,
+          "calls": 74982
+        },
+        {
+          "file": "~",
+          "line": 0,
+          "function": "<built-in method _io.open>",
+          "self_seconds": 0.520396591,
+          "cumulative_seconds": 0.520531253,
+          "calls": 76056
+        },
+        {
+          "file": "~",
+          "line": 0,
+          "function": "<method '__exit__' of '_io._IOBase' objects>",
+          "self_seconds": 0.20368713200000002,
+          "cumulative_seconds": 0.20371086200000002,
+          "calls": 76060
+        },
+        {
+          "file": "_pslinux.py",
+          "line": 1523,
+          "function": "pids",
+          "self_seconds": 0.029078996000000003,
+          "cumulative_seconds": 0.151636704,
+          "calls": 134
+        },
+        {
+          "file": "_pslinux.py",
+          "line": 1589,
+          "function": "wrapper",
+          "self_seconds": 0.0031842000000000003,
+          "cumulative_seconds": 0.12109665200000001,
+          "calls": 2408
+        },
+        {
+          "file": "~",
+          "line": 0,
+          "function": "<built-in method posix.listdir>",
+          "self_seconds": 0.11219258800000001,
+          "cumulative_seconds": 0.11219258800000001,
+          "calls": 134
+        }
+      ],
+      "stage_scope": "separate untimed 16-batch parent-thread cProfile; excludes worker CPU",
+      "parent_rss_peak_bytes": 2191634432,
+      "worker_rss_peak_bytes": 1007153152,
+      "cold": false
+    },
+    {
+      "engine": "grain_prepacked",
+      "workload": "text",
+      "config": {
+        "engine": "grain_prepacked",
+        "workload": "text",
+        "source": "/home/ubuntu/tightpig-receipt/work/text",
+        "output": "/home/ubuntu/tightpig-receipt/work/4-text-grain_prepacked.json",
+        "steps": 128,
+        "warmup": 8,
+        "train_steps": 16,
+        "stage_batches": 16,
+        "workers": 2,
+        "batch": 32,
+        "tokens": 16384,
+        "seq_len": 128,
+        "image_size": 128,
+        "seed": 17,
+        "cold": false
+      },
+      "policy": {
+        "read": "indexed",
+        "batch_policy": "fixed rows",
+        "reference": "prepacked in-memory native-Grain first-fit list"
+      },
+      "cold_open_seconds": 2.4582254360138904,
+      "loader": {
+        "first_batch_seconds": 5.014965510985348,
+        "batches": 128,
+        "batches_per_second": 768.0052608313915,
+        "records_per_second": 24576.16834660453,
+        "tokens_per_second": 2791567.122217903,
+        "latency_p50_ms": 0.30599700403399765,
+        "latency_p95_ms": 2.69496301189065
+      },
+      "loading": {
+        "workers": 2,
+        "threads": 16,
+        "read_buffer": 16,
+        "worker_buffer": 2,
+        "ram_budget_mb": null,
+        "max_workers": null
+      },
+      "device": "NVIDIA A100-SXM4-40GB",
+      "cold_scope": "fresh process and loader objects; shared OS page cache after input preparation",
+      "environment": {
+        "python": "3.12.15",
+        "platform": "Linux-6.8.0-60-generic-x86_64-with-glibc2.35",
+        "cpu": "x86_64",
+        "packages": {
+          "jax": "0.11.2.post4",
+          "jaxlib": "0.11.2",
+          "numpy": "2.5.4",
+          "grain": "0.2.18",
+          "transformers": "5.16.1"
+        }
+      },
+      "first_batch_from_open_seconds": 7.473190946999239,
+      "training": {
+        "steps": 16,
+        "data_wait_ms": 0.7766266880935291,
+        "step_ms": 3.1721188734081807,
+        "dispatch_ms": 3.0955733145674458,
+        "records_per_second": 8103.839434980051,
+        "tokens_per_second": 907883.2617001089,
+        "padding_fraction": 0.124755859375,
+        "compile_count": 1,
+        "compiles": [
+          {
+            "signature": [
+              [
+                "['text']",
+                [
+                  32,
+                  129
+                ],
+                "int32"
+              ],
+              [
+                "['text_positions']",
+                [
+                  32,
+                  129
+                ],
+                "int32"
+              ],
+              [
+                "['text_segment_ids']",
+                [
+                  32,
+                  129
+                ],
+                "int32"
+              ]
+            ],
+            "seconds": 2.1594452499994077,
+            "flops": 654311424.0
+          }
+        ],
+        "losses": [
+          6.034376621246338,
+          6.016652584075928,
+          6.01907205581665,
+          5.9994215965271,
+          5.979976177215576,
+          5.996562480926514,
+          5.978484153747559,
+          5.954032897949219,
+          5.964736461639404,
+          5.945390701293945,
+          5.963879108428955,
+          5.950777053833008,
+          5.928815841674805,
+          5.899725437164307,
+          5.890007972717285,
+          5.922090530395508
+        ],
+        "scope": "real asynchronous Trainer.compile updates; compilation boundaries excluded",
+        "model_mfu_bf16_peak": 0.00036247427696084857,
+        "model_flops_scope": "objective.training_flops on real host lengths and layout; custom image-mean model and frozen legacy API have no analytic count",
+        "hlo_utilization_bf16_peak": 0.0005310932212108526,
+        "utilization_scope": "optimized executable work, including padding, over dense bf16 peak; not an analytic real-token MFU"
+      },
+      "stages": [
+        {
+          "file": "~",
+          "line": 0,
+          "function": "<built-in method builtins.next>",
+          "self_seconds": 0.00024253000000000002,
+          "cumulative_seconds": 10.273252399,
+          "calls": 345
+        },
+        {
+          "file": "traceback_util.py",
+          "line": 359,
+          "function": "reraise_with_filtered_traceback",
+          "self_seconds": 0.00011594900000000001,
+          "cumulative_seconds": 10.272554301000001,
+          "calls": 37
+        },
+        {
+          "file": "~",
+          "line": 0,
+          "function": "<method 'acquire' of '_thread.lock' objects>",
+          "self_seconds": 2.640361148,
+          "cumulative_seconds": 5.1621506020000005,
+          "calls": 714
+        },
+        {
+          "file": "stats.py",
+          "line": 423,
+          "function": "wrapper",
+          "self_seconds": 0.00016772300000000002,
+          "cumulative_seconds": 5.15322407,
+          "calls": 36
+        },
+        {
+          "file": "interleave.py",
+          "line": 96,
+          "function": "__next__",
+          "self_seconds": 0.000218289,
+          "cumulative_seconds": 5.151371138,
+          "calls": 17
+        },
+        {
+          "file": "process_prefetch.py",
+          "line": 432,
+          "function": "start_prefetch",
+          "self_seconds": 0.0033809680000000003,
+          "cumulative_seconds": 4.838773505000001,
+          "calls": 20
+        },
+        {
+          "file": "threading.py",
+          "line": 323,
+          "function": "wait",
+          "self_seconds": 0.013391129000000002,
+          "cumulative_seconds": 2.642003352,
+          "calls": 154
+        },
+        {
+          "file": "__init__.py",
+          "line": 951,
+          "function": "children",
+          "self_seconds": 0.020413231,
+          "cumulative_seconds": 1.8287461340000002,
+          "calls": 132
+        },
+        {
+          "file": "_pslinux.py",
+          "line": 1562,
+          "function": "ppid_map",
+          "self_seconds": 0.198854572,
+          "cumulative_seconds": 1.703342044,
+          "calls": 132
+        },
+        {
+          "file": "_common.py",
+          "line": 681,
+          "function": "open_binary",
+          "self_seconds": 0.271734199,
+          "cumulative_seconds": 0.848490815,
+          "calls": 75149
+        },
+        {
+          "file": "~",
+          "line": 0,
+          "function": "<built-in method _io.open>",
+          "self_seconds": 0.56087443,
+          "cumulative_seconds": 0.5610690970000001,
+          "calls": 75151
+        },
+        {
+          "file": "~",
+          "line": 0,
+          "function": "<method 'read' of '_io.BufferedReader' objects>",
+          "self_seconds": 0.535099308,
+          "cumulative_seconds": 0.5354323870000001,
+          "calls": 74093
+        },
+        {
+          "file": "~",
+          "line": 0,
+          "function": "<method '__exit__' of '_io._IOBase' objects>",
+          "self_seconds": 0.182592327,
+          "cumulative_seconds": 0.18266632900000002,
+          "calls": 75154
+        },
+        {
+          "file": "_pslinux.py",
+          "line": 1523,
+          "function": "pids",
+          "self_seconds": 0.039180274,
+          "cumulative_seconds": 0.18079165500000002,
+          "calls": 133
+        },
+        {
+          "file": "~",
+          "line": 0,
+          "function": "<built-in method posix.listdir>",
+          "self_seconds": 0.110500579,
+          "cumulative_seconds": 0.110500579,
+          "calls": 133
+        },
+        {
+          "file": "__init__.py",
+          "line": 1009,
+          "function": "__getitem__",
+          "self_seconds": 0.087297366,
+          "cumulative_seconds": 0.104479018,
+          "calls": 53158
+        },
+        {
+          "file": "_pslinux.py",
+          "line": 1589,
+          "function": "wrapper",
+          "self_seconds": 0.0029331630000000003,
+          "cumulative_seconds": 0.103711678,
+          "calls": 2371
+        },
+        {
+          "file": "_pslinux.py",
+          "line": 1848,
+          "function": "create_time",
+          "self_seconds": 0.0016904140000000001,
+          "cumulative_seconds": 0.085574284,
+          "calls": 1185
+        },
+        {
+          "file": "~",
+          "line": 0,
+          "function": "<method 'split' of 'bytes' objects>",
+          "self_seconds": 0.08081363300000001,
+          "cumulative_seconds": 0.08081363300000001,
+          "calls": 75146
+        },
+        {
+          "file": "__init__.py",
+          "line": 775,
+          "function": "create_time",
+          "self_seconds": 0.00040862300000000005,
+          "cumulative_seconds": 0.058503591,
+          "calls": 526
+        }
+      ],
+      "stage_scope": "separate untimed 16-batch parent-thread cProfile; excludes worker CPU",
+      "parent_rss_peak_bytes": 2283839488,
+      "worker_rss_peak_bytes": 1101299712,
+      "cold": false
+    },
+    {
+      "engine": "dew",
+      "workload": "image",
+      "config": {
+        "engine": "dew",
+        "workload": "image",
+        "source": "/home/ubuntu/tightpig-receipt/work/5-image-dew-cold.inputs",
+        "output": "/home/ubuntu/tightpig-receipt/work/5-image-dew-cold.json",
+        "steps": 4,
+        "warmup": 0,
+        "train_steps": 0,
+        "stage_batches": 0,
+        "workers": 2,
+        "batch": 32,
+        "tokens": 16384,
+        "seq_len": 128,
+        "image_size": 128,
+        "seed": 17,
+        "cold": true
+      },
+      "policy": {
+        "records": 4096,
+        "read": "indexed",
+        "batch_policy": "fixed rows",
+        "plan_sha256": "de4b7b95b16ca5fb12324b5733895ac4171f1eb095d6c6f60670aae073a6583d",
+        "lowering": "global",
+        "exact": true
+      },
+      "cold_open_seconds": 0.5426998639886733,
+      "loader": {
+        "first_batch_seconds": 4.824370890011778,
+        "batches": 4,
+        "batches_per_second": 0.8287284372998459,
+        "records_per_second": 26.51930999359507,
+        "tokens_per_second": 0.0,
+        "latency_p50_ms": 2.0405169925652444,
+        "latency_p95_ms": 4824.321199994301
+      },
+      "loading": {
+        "workers": 2,
+        "threads": 16,
+        "read_buffer": 16,
+        "worker_buffer": 2,
+        "ram_budget_mb": null,
+        "max_workers": null
+      },
+      "device": "NVIDIA A100-SXM4-40GB",
+      "cold_scope": "fresh process and cache home over a fresh copy of the inputs, never provisioned, evicted from the page cache",
+      "environment": {
+        "python": "3.12.15",
+        "platform": "Linux-6.8.0-60-generic-x86_64-with-glibc2.35",
+        "cpu": "x86_64",
+        "packages": {
+          "jax": "0.11.2.post4",
+          "jaxlib": "0.11.2",
+          "numpy": "2.5.4",
+          "grain": "0.2.18",
+          "transformers": "5.16.1"
+        }
+      },
+      "first_batch_from_open_seconds": 5.367070754000451,
+      "stages": [],
+      "stage_scope": "not recorded",
+      "parent_rss_peak_bytes": 1018765312,
+      "worker_rss_peak_bytes": 1181462528,
+      "cold": true
+    },
+    {
+      "engine": "grain",
+      "workload": "image",
+      "config": {
+        "engine": "grain",
+        "workload": "image",
+        "source": "/home/ubuntu/tightpig-receipt/work/6-image-grain-cold.inputs",
+        "output": "/home/ubuntu/tightpig-receipt/work/6-image-grain-cold.json",
+        "steps": 4,
+        "warmup": 0,
+        "train_steps": 0,
+        "stage_batches": 0,
+        "workers": 2,
+        "batch": 32,
+        "tokens": 16384,
+        "seq_len": 128,
+        "image_size": 128,
+        "seed": 17,
+        "cold": true
+      },
+      "policy": {
+        "read": "indexed",
+        "batch_policy": "fixed rows",
+        "reference": "native Grain transforms"
+      },
+      "cold_open_seconds": 0.034411459986586124,
+      "loader": {
+        "first_batch_seconds": 4.766392573015764,
+        "batches": 4,
+        "batches_per_second": 0.8388742237591285,
+        "records_per_second": 26.84397516029211,
+        "tokens_per_second": 0.0,
+        "latency_p50_ms": 2.0352669816929847,
+        "latency_p95_ms": 4766.064786002971
+      },
+      "loading": {
+        "workers": 2,
+        "threads": 16,
+        "read_buffer": 16,
+        "worker_buffer": 2,
+        "ram_budget_mb": null,
+        "max_workers": null
+      },
+      "device": "NVIDIA A100-SXM4-40GB",
+      "cold_scope": "fresh process and cache home over a fresh copy of the inputs, never provisioned, evicted from the page cache",
+      "environment": {
+        "python": "3.12.15",
+        "platform": "Linux-6.8.0-60-generic-x86_64-with-glibc2.35",
+        "cpu": "x86_64",
+        "packages": {
+          "jax": "0.11.2.post4",
+          "jaxlib": "0.11.2",
+          "numpy": "2.5.4",
+          "grain": "0.2.18",
+          "transformers": "5.16.1"
+        }
+      },
+      "first_batch_from_open_seconds": 4.8008040330023505,
+      "stages": [],
+      "stage_scope": "not recorded",
+      "parent_rss_peak_bytes": 1015545856,
+      "worker_rss_peak_bytes": 1166970880,
+      "cold": true
+    },
+    {
+      "engine": "dew",
+      "workload": "text",
+      "config": {
+        "engine": "dew",
+        "workload": "text",
+        "source": "/home/ubuntu/tightpig-receipt/work/7-text-dew-cold.inputs",
+        "output": "/home/ubuntu/tightpig-receipt/work/7-text-dew-cold.json",
+        "steps": 4,
+        "warmup": 0,
+        "train_steps": 0,
+        "stage_batches": 0,
+        "workers": 2,
+        "batch": 32,
+        "tokens": 16384,
+        "seq_len": 128,
+        "image_size": 128,
+        "seed": 17,
+        "cold": true
+      },
+      "policy": {
+        "records": 8851,
+        "read": "indexed",
+        "batch_policy": "fixed rows",
+        "plan_sha256": "303fdc971fbecaa54d51cee0ed81420b9d18a2720c6bf9d6ee93c88491431ea5",
+        "lowering": "global",
+        "exact": true
+      },
+      "cold_open_seconds": 0.5246392650005873,
+      "loader": {
+        "first_batch_seconds": 4.596422053000424,
+        "batches": 4,
+        "batches_per_second": 0.8696466168805346,
+        "records_per_second": 27.828691740177106,
+        "tokens_per_second": 3100.725012487546,
+        "latency_p50_ms": 2.1019889973104,
+        "latency_p95_ms": 4596.386541990796
+      },
+      "loading": {
+        "workers": 2,
+        "threads": 16,
+        "read_buffer": 16,
+        "worker_buffer": 2,
+        "ram_budget_mb": null,
+        "max_workers": null
+      },
+      "device": "NVIDIA A100-SXM4-40GB",
+      "cold_scope": "fresh process and cache home over a fresh copy of the inputs, never provisioned, evicted from the page cache",
+      "environment": {
+        "python": "3.12.15",
+        "platform": "Linux-6.8.0-60-generic-x86_64-with-glibc2.35",
+        "cpu": "x86_64",
+        "packages": {
+          "jax": "0.11.2.post4",
+          "jaxlib": "0.11.2",
+          "numpy": "2.5.4",
+          "grain": "0.2.18",
+          "transformers": "5.16.1"
+        }
+      },
+      "first_batch_from_open_seconds": 5.121061318001011,
+      "stages": [],
+      "stage_scope": "not recorded",
+      "parent_rss_peak_bytes": 1005654016,
+      "worker_rss_peak_bytes": 1006284800,
+      "cold": true
+    },
+    {
+      "engine": "grain",
+      "workload": "text",
+      "config": {
+        "engine": "grain",
+        "workload": "text",
+        "source": "/home/ubuntu/tightpig-receipt/work/8-text-grain-cold.inputs",
+        "output": "/home/ubuntu/tightpig-receipt/work/8-text-grain-cold.json",
+        "steps": 4,
+        "warmup": 0,
+        "train_steps": 0,
+        "stage_batches": 0,
+        "workers": 2,
+        "batch": 32,
+        "tokens": 16384,
+        "seq_len": 128,
+        "image_size": 128,
+        "seed": 17,
+        "cold": true
+      },
+      "policy": {
+        "read": "indexed",
+        "batch_policy": "fixed rows",
+        "reference": "planned first-fit windows read from token store"
+      },
+      "cold_open_seconds": 0.05798441800288856,
+      "loader": {
+        "first_batch_seconds": 4.5183212970150635,
+        "batches": 4,
+        "batches_per_second": 0.8797710945405856,
+        "records_per_second": 28.152675025298738,
+        "tokens_per_second": 3136.8238375844576,
+        "latency_p50_ms": 24.08053001272492,
+        "latency_p95_ms": 4517.935258016223
+      },
+      "loading": {
+        "workers": 2,
+        "threads": 16,
+        "read_buffer": 16,
+        "worker_buffer": 2,
+        "ram_budget_mb": null,
+        "max_workers": null
+      },
+      "device": "NVIDIA A100-SXM4-40GB",
+      "cold_scope": "fresh process and cache home over a fresh copy of the inputs, never provisioned, evicted from the page cache",
+      "environment": {
+        "python": "3.12.15",
+        "platform": "Linux-6.8.0-60-generic-x86_64-with-glibc2.35",
+        "cpu": "x86_64",
+        "packages": {
+          "jax": "0.11.2.post4",
+          "jaxlib": "0.11.2",
+          "numpy": "2.5.4",
+          "grain": "0.2.18",
+          "transformers": "5.16.1"
+        }
+      },
+      "first_batch_from_open_seconds": 4.576305715017952,
+      "stages": [],
+      "stage_scope": "not recorded",
+      "parent_rss_peak_bytes": 1003278336,
+      "worker_rss_peak_bytes": 1006923776,
+      "cold": true
+    }
+  ],
+  "comparisons": [
+    {
+      "workload": "image",
+      "metric": "records_per_second",
+      "dew_over_grain": 0.9035551498136243,
+      "rss_over_grain": 1.0352266743794543,
+      "first_batch_from_open_seconds": 5.342326753016096,
+      "cold_first_batch_from_open_seconds": 5.367070754000451,
+      "device_idle_fraction": 0.13239684031407378,
+      "checks": {
+        "within_5_percent_of_grain": false,
+        "rss_within_grain_plus_10_percent": true,
+        "warm_first_batch_under_10_seconds": true,
+        "device_idle_under_5_percent": false,
+        "cold_first_batch_under_30_seconds": true
+      }
+    },
+    {
+      "workload": "text",
+      "metric": "tokens_per_second",
+      "dew_over_grain": 0.922968140763209,
+      "rss_over_grain": 1.1438497017750084,
+      "first_batch_from_open_seconds": 5.059404081985122,
+      "cold_first_batch_from_open_seconds": 5.121061318001011,
+      "device_idle_fraction": 0.2472300901442011,
+      "checks": {
+        "within_5_percent_of_grain": false,
+        "rss_within_grain_plus_10_percent": false,
+        "warm_first_batch_under_10_seconds": true,
+        "device_idle_under_5_percent": false,
+        "cold_first_batch_under_30_seconds": true
+      }
+    }
+  ],
+  "config": {
+    "output": "/home/ubuntu/tightpig-receipt/matrix-a100.json",
+    "work": "/home/ubuntu/tightpig-receipt/work",
+    "seed": 17,
+    "steps": 128,
+    "warmup": 8,
+    "train_steps": 16,
+    "stage_batches": 16,
+    "workers": 2,
+    "batch": 32,
+    "tokens": 16384,
+    "seq_len": 128,
+    "image_size": 128,
+    "engines": [
+      "dew",
+      "grain"
+    ],
+    "workloads": [
+      "image",
+      "text"
+    ],
+    "cold": true
+  }
+}
