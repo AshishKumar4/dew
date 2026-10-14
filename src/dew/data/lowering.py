@@ -38,16 +38,7 @@ from dew.data.analysis import (
     _name,
     _until,
 )
-from dew.data.dataset import (
-    Batch,
-    DataPartition,
-    FilledBatch,
-    Loading,
-    Records,
-    _Grouped,
-    record_batch,
-    stacked,
-)
+from dew.data.dataset import Batch, DataPartition, FilledBatch, Loading, Records, record_batch, stacked
 from dew.data.mixing import Accepted, PrimedMix, SearchBudget, TokenDeficit, primed_maps, token_weights
 from dew.data.pipeline import (
     Artifact,
@@ -56,7 +47,6 @@ from dew.data.pipeline import (
     Expansion,
     Filter,
     FlatMap,
-    Group,
     Interleave,
     Limit,
     Map,
@@ -77,14 +67,13 @@ from dew.data.pipeline import (
     Shuffle,
     Slice,
     Stage,
-    TokenBudget,
     TokenSplit,
     Volatile,
     Windows,
     Workers,
 )
 from dew.data.plan import Manifest
-from dew.data.readers import _FillShare, _GroupedRows
+from dew.data.readers import _FillShare
 from dew.data.sources.base import Read, Shard, ShardManifest, Source
 from dew.data.steps.generic import Fields
 from dew.data.tokens import _WrappingDataset
@@ -376,15 +365,16 @@ def _as_iter(rows: Rows, loading: Loading) -> pygrain.IterDataset:
 
 def _packed(documents: pygrain.IterDataset, stage: Pack) -> pygrain.IterDataset:
     """`documents` packed by Grain's own packer for the stage's policy."""
-    sizes = dict.fromkeys(stage.fields, stage.seq_len)
+    sizes = dict.fromkeys(stage.fields, stage.seq_len) | dict(stage.along)
     if stage.policy == "concat":
         return gx.ConcatThenSplitIterDataset(documents, length_struct=sizes)
     packer = gx.FirstFitPackIterDataset if stage.policy == "first-fit" else gx.BestFitPackIterDataset
-    return packer(documents, length_struct=sizes, num_packing_bins=stage.bins, shuffle_bins=False)
+    return packer(documents, length_struct=sizes, num_packing_bins=stage.bins, shuffle_bins=False,
+                  max_sequences_per_bin=stage.segments)
 
 
 def _reordered(stage: Shuffle | Repeat | Slice | Limit, rows: pygrain.MapDataset) -> pygrain.MapDataset:
-    """An order stage over an indexed dataset, applied alike to its rows and their lengths."""
+    """An order stage over an indexed dataset."""
     if isinstance(stage, Shuffle):
         if stage.window is None:
             return rows.shuffle(stage.seed)
@@ -410,23 +400,18 @@ class _Build:
     def global_order(self) -> bool:
         return not self.lowering.per_share
 
-    def mixed(self, pipeline: Pipeline, partition: DataPartition) -> tuple[Rows, pygrain.MapDataset | None]:
+    def mixed(self, pipeline: Pipeline, partition: DataPartition) -> Rows:
         source = pipeline.source
         if not isinstance(source, Mixture):
             raise ValueError("phases need the global phased lowering")
-        built = [
+        parents = [
             dataclasses.replace(self, lowering=analysis).records(child, partition)
             for child, analysis in zip(source.pipelines, self.lowering.children, strict=True)
         ]
-        parents, lengths = zip(*built, strict=True)
         if all(isinstance(parent, pygrain.MapDataset) for parent in parents):
             mapped = [parent for parent in parents if isinstance(parent, pygrain.MapDataset)]
-            weights = _weights(source)
-            measured = [length for length in lengths if length is not None]
             checked = primed_maps(mapped, [_name(child) for child in source.pipelines])
-            return pygrain.MapDataset.mix(checked, weights).seed(self.seed), (
-                pygrain.MapDataset.mix(measured, weights) if len(measured) == len(parents) else None
-            )
+            return pygrain.MapDataset.mix(checked, _weights(source)).seed(self.seed)
         streams = [
             Accepted(_as_iter(parent, self.loading), _name(child), budget=self.budget)
             for parent, child in zip(parents, source.pipelines, strict=True)
@@ -438,14 +423,14 @@ class _Build:
                 tokens=source.tokens,
                 names=[_name(child) for child in source.pipelines],
                 budget=self.budget,
-            ), None
+            )
         return PrimedMix(streams, source.weights, [_name(child) for child in source.pipelines]).seed(
             self.seed
-        ), None
+        )
 
     def indexed(
         self, pipeline: Pipeline, source: Source, partition: DataPartition, last: int
-    ) -> tuple[Rows, pygrain.MapDataset | None, int]:
+    ) -> tuple[Rows, int]:
         """The root of an indexed read, cut to its share by index (`shared`),
         and through its cache when it has one, with the stages it consumed.
 
@@ -459,25 +444,20 @@ class _Build:
         cache = self.lowering.cache
         if cache is None:
             identifiers = source.identifiers if isinstance(source, _Materialized) else ()
-            lengths = source.lengths()
             present = _Present.of(records) if _in_memory(source) else None
             if present is not None:
                 stored = pygrain.MapDataset.source(present).seed(self.seed)
                 identifiers = tuple((int(position),) for position in present.positions)
-                lengths = None if lengths is None else np.asarray(lengths)[present.positions]
             placed = _Placed(identifiers=identifiers, rows=len(stored))
             rows = stored.map_with_index(placed) if last >= 0 else stored
-            measured = None if lengths is None else pygrain.MapDataset.source(lengths)
-            if measured is not None:
-                measured = self.shared(measured, pipeline, partition)
-            return self.shared(rows, pipeline, partition), measured, 0
+            return self.shared(rows, pipeline, partition), 0
         filled, manifest, prefix = _fill(pipeline, source, cache, self.read)
         cached = filled.mapped(stored, manifest, source, transform=prefix)
         placed = cached.map_with_index(_Placed(rows=len(cached))) if last > cache else cached
         view = self.shared(placed, pipeline, partition)
         rows = cached.iterated(view, pygrain.ReadOptions(self.loading.threads, self.loading.read_buffer))
         flat = gx.FlatMapIterDataset(rows, _CachedOutputs())
-        return Accepted(flat, _name(pipeline), budget=self.budget), None, cache + 1
+        return Accepted(flat, _name(pipeline), budget=self.budget), cache + 1
 
     def sharded(
         self, pipeline: Pipeline, source: Source, partition: DataPartition, last: int
@@ -530,48 +510,40 @@ class _Build:
             epochs=self.lowering.epochs if self.training else 1,
         ).seed(self.seed)
 
-    def records(self, pipeline: Pipeline, partition: DataPartition) -> tuple[Rows, pygrain.MapDataset | None]:
-        """The rows before the batch, with their lengths where known. A global
-        order comes back indexed, whole, for `batches` to cut into shares; a
-        per-share order comes back as this share's stream of accepted rows."""
+    def records(self, pipeline: Pipeline, partition: DataPartition) -> Rows:
+        """The rows before the batch. A global order comes back indexed,
+        whole, for `batches` to cut into shares; a per-share order comes back
+        as this share's stream of accepted rows."""
         source = pipeline.source
         placed = [index for index, stage in enumerate(pipeline.stages) if isinstance(stage, MapWithIndex)]
         last = max(placed, default=-1)
-        lengths: pygrain.MapDataset | None = None
         if isinstance(source, (Mixture, Phases)):
-            (rows, lengths), consumed = self.mixed(pipeline, partition), 0
+            rows, consumed = self.mixed(pipeline, partition), 0
         elif self.read == "streamed":
             rows, consumed = self.sharded(pipeline, source, partition, last)
         else:
-            rows, lengths, consumed = self.indexed(pipeline, source, partition, last)
+            rows, consumed = self.indexed(pipeline, source, partition, last)
         for index, stage in enumerate(pipeline.stages[consumed:], start=consumed):
-            if isinstance(stage, (BatchStage, TokenBudget, MapBatch, Rebatch)):
+            if isinstance(stage, (BatchStage, MapBatch, Rebatch)):
                 break
             if index == self.lowering.absorbed:
                 continue
             if isinstance(stage, Prefetch) and self.global_order:
                 continue
-            rows, lengths = self.stage(rows, lengths, stage, pipeline, partition)
+            rows = self.stage(rows, stage, pipeline, partition)
             if index == last:
                 rows = rows.map(_unplaced)
         if not self.global_order:
             rows = Accepted(_as_iter(rows, self.loading), _name(pipeline), budget=self.budget)
-        return rows, lengths
+        return rows
 
-    def stage(
-        self,
-        rows: Rows,
-        lengths: pygrain.MapDataset | None,
-        stage: Stage,
-        pipeline: Pipeline,
-        partition: DataPartition,
-    ) -> tuple[Rows, pygrain.MapDataset | None]:
+    def stage(self, rows: Rows, stage: Stage, pipeline: Pipeline, partition: DataPartition) -> Rows:
         if isinstance(stage, (Map, RandomMap, MapWithIndex, Filter, FlatMap)):
-            return self.record_stage(rows, lengths, stage, pipeline)
+            return self.record_stage(rows, stage, pipeline)
         if isinstance(stage, Shuffle) and stage.block_shards is not None:
-            return self.block_shuffle(rows, lengths, stage, pipeline, partition)
+            return self.block_shuffle(rows, stage, pipeline, partition)
         if isinstance(stage, (Shuffle, Repeat, Slice, Limit)) and isinstance(rows, pygrain.MapDataset):
-            return _reordered(stage, rows), None if lengths is None else _reordered(stage, lengths)
+            return _reordered(stage, rows)
         if isinstance(stage, Shuffle) and stage.window is not None:
             rows = gx.WindowShuffleIterDataset(
                 _as_iter(rows, self.loading), window_size=stage.window, seed=stage.seed
@@ -593,52 +565,30 @@ class _Build:
                     num_workers=stage.count, per_worker_buffer_size=stage.buffer
                 )
             )
-            lengths = None
         elif isinstance(stage, Rebatch):
             rows = gx.RebatchIterDataset(
                 _as_iter(rows, self.loading), partition.rows(stage.size), drop_remainder=self.training
             )
         elif isinstance(stage, Native):
             rows = stage.function(rows)
-            lengths = None
         elif isinstance(stage, Batched):
             groups = _as_iter(rows, self.loading).batch(stage.size, drop_remainder=False, batch_fn=list)
             rows = gx.FlatMapIterDataset(groups, _Groups(stage))
-            lengths = None
         else:
-            return self.layout_stage(rows, lengths, stage, pipeline, partition)
-        return rows, lengths
+            return self.layout_stage(rows, stage, pipeline)
+        return rows
 
-    def layout_stage(
-        self,
-        rows: Rows,
-        lengths: pygrain.MapDataset | None,
-        stage: Stage,
-        pipeline: Pipeline,
-        partition: DataPartition,
-    ) -> tuple[Rows, pygrain.MapDataset | None]:
+    def layout_stage(self, rows: Rows, stage: Stage, pipeline: Pipeline) -> Rows:
         if isinstance(stage, TokenSplit):
             if not isinstance(rows, pygrain.MapDataset):
                 raise ValueError(f"token split in {_name(pipeline)} needs a finite indexed order")
-            rows, lengths = _TokenSplit(rows, stage), None
+            rows = _TokenSplit(rows, stage)
         elif isinstance(stage, Pack):
-            rows = _packed(_as_iter(rows, self.loading).map(Fields(stage.fields)), stage)
-            lengths = None
+            rows = _packed(_as_iter(rows, self.loading).map(Fields(stage.packed)), stage)
         elif isinstance(stage, Windows):
             from dew.data.steps.windows import CausalWindows
 
             rows = CausalWindows(_as_iter(rows, self.loading), stage)
-            lengths = None
-        elif isinstance(stage, Group):
-            if isinstance(rows, pygrain.MapDataset):
-                if lengths is None:
-                    raise ValueError(
-                        f"length grouping of {_name(pipeline)} needs producer lengths or read='memory'"
-                    )
-                rows = _Grouped(rows, stage.groups, self.batch, self.seed, length_at=_LengthAt(lengths))
-            else:
-                rows = _GroupedRows(rows, stage.groups, partition.rows(self.batch), self.seed)
-            lengths = None
         elif isinstance(stage, Artifact):
             if not isinstance(rows, pygrain.MapDataset) or isinstance(pipeline.source, (Mixture, Phases)):
                 raise ValueError("a cache belongs on each corpus's indexed rows, before mix and interleave")
@@ -647,17 +597,10 @@ class _Build:
             rows = _filled(stage).mapped(rows, manifest, pipeline.source)
         elif not isinstance(stage, Interleave):
             raise ValueError(f"{type(stage).__name__} in {_name(pipeline)} has no lowering here")
-        return rows, lengths
+        return rows
 
-    def block_shuffle(
-        self,
-        rows: Rows,
-        lengths: pygrain.MapDataset | None,
-        stage: Shuffle,
-        pipeline: Pipeline,
-        partition: DataPartition,
-    ) -> tuple[Rows, pygrain.MapDataset | None]:
-        from dew.data.ordering import BlockShuffle, PermutedLengths
+    def block_shuffle(self, rows: Rows, stage: Shuffle, pipeline: Pipeline, partition: DataPartition) -> Rows:
+        from dew.data.ordering import BlockShuffle
 
         if not isinstance(rows, pygrain.MapDataset) or not isinstance(pipeline.source, _Locality):
             raise ValueError(
@@ -676,17 +619,11 @@ class _Build:
                 )
                 for start, size in zip(starts, sizes, strict=True)
             )
-        blocked = BlockShuffle(rows, sizes, stage.block_shards, stage.seed)
-        lengths = None if lengths is None else PermutedLengths(lengths, blocked.index)
-        return blocked, lengths
+        return BlockShuffle(rows, sizes, stage.block_shards, stage.seed)
 
     def record_stage(
-        self,
-        rows: Rows,
-        lengths: pygrain.MapDataset | None,
-        stage: Map | RandomMap | MapWithIndex | Filter | FlatMap,
-        pipeline: Pipeline,
-    ) -> tuple[Rows, pygrain.MapDataset | None]:
+        self, rows: Rows, stage: Map | RandomMap | MapWithIndex | Filter | FlatMap, pipeline: Pipeline
+    ) -> Rows:
         lowered = _Rows(stage)
         if isinstance(stage, FlatMap):
             rows = gx.FlatMapIterDataset(_as_iter(rows, self.loading), lowered)
@@ -694,14 +631,13 @@ class _Build:
             rows = rows.random_map(lowered) if isinstance(stage, RandomMap) else rows.map(lowered)
         if isinstance(stage, (Filter, FlatMap)) or stage.rejects:
             rows = Accepted(_as_iter(rows, self.loading), _name(pipeline), budget=self.budget)
-            lengths = None
-        return rows, lengths
+        return rows
 
     def batches(
         self, pipeline: Pipeline, partition: DataPartition, offset: int = 0, *, fill: bool = True
     ) -> pygrain.DatasetIterator[Batch]:
         """This share's batches, through the stages after the batch."""
-        batching = next(stage for stage in pipeline.stages if isinstance(stage, (BatchStage, TokenBudget)))
+        batching = next(stage for stage in pipeline.stages if isinstance(stage, BatchStage))
         stream = self.batched(pipeline, partition, offset, fill=fill)
         return iter(self.after_batch(stream, pipeline, partition, batching))
 
@@ -714,11 +650,8 @@ class _Build:
         reader starts, as Grain's own indexed pipelines are, so each read in
         flight is a whole batch and each worker reads whole batches of its
         own; any other order is batched as its rows arrive."""
-        budget = next((stage for stage in pipeline.stages if isinstance(stage, TokenBudget)), None)
-        if budget is not None:
-            return self.token_batches(pipeline, partition, budget)
         canonical = not self.training and not self.global_order
-        rows, _ = self.records(pipeline, DataPartition() if canonical else partition)
+        rows = self.records(pipeline, DataPartition() if canonical else partition)
         batch_stage = next(stage for stage in pipeline.stages if isinstance(stage, BatchStage))
         shared_size = partition.rows(batch_stage.size)
         size = batch_stage.size if canonical else shared_size
@@ -738,7 +671,7 @@ class _Build:
             stream = _as_iter(batched, self.loading)
             for stage in pipeline.stages[: pipeline.stages.index(batch_stage)]:
                 if isinstance(stage, Prefetch):
-                    advanced, _ = self.stage(stream, None, stage, pipeline, partition)
+                    advanced = self.stage(stream, stage, pipeline, partition)
                     stream = _as_iter(advanced, self.loading)
         else:
             stream = _as_iter(rows, self.loading).batch(
@@ -755,7 +688,7 @@ class _Build:
         stream: pygrain.IterDataset,
         pipeline: Pipeline,
         partition: DataPartition,
-        batch_stage: BatchStage | TokenBudget,
+        batch_stage: BatchStage,
     ) -> pygrain.IterDataset:
         """The stages after the batch, each as `stage` lowers it, with the
         loading's own workers last when the pipeline names none. Host steps
@@ -765,22 +698,10 @@ class _Build:
             stages = (*stages, Workers(self.loading.worker_count, self.loading.worker_buffer))
         for stage in stages:
             if not isinstance(stage, MapBatch):
-                advanced, _ = self.stage(stream, None, stage, pipeline, partition)
+                advanced = self.stage(stream, stage, pipeline, partition)
                 stream = _as_iter(advanced, self.loading)
         return stream
 
-    def token_batches(
-        self, pipeline: Pipeline, partition: DataPartition, budget: TokenBudget
-    ) -> pygrain.IterDataset:
-        from dew.data.batching import TokenBatches
-
-        if partition.count > 1:
-            raise ValueError(
-                "token-budget batching requires one share until a synchronized shape schedule is supplied"
-            )
-        rows, _ = self.records(pipeline, partition)
-        budget = budget if self.training else dataclasses.replace(budget, drop_remainder=False)
-        return TokenBatches(_as_iter(rows, self.loading), budget, partition, self.seed)
 
 
 def _epoch_records(train: Pipeline, build: _Build) -> int | None:
@@ -804,8 +725,8 @@ def _epoch_records(train: Pipeline, build: _Build) -> int | None:
             weights = _weights(source)
             shares = zip(known, weights, strict=True)
             return max(math.ceil(size * sum(weights) / weight) for size, weight in shares)
-        at = _until(pipeline.stages, (Repeat, Group))
-        rows, _ = build.records(dataclasses.replace(pipeline, stages=pipeline.stages[:at]), DataPartition())
+        at = _until(pipeline.stages, (Repeat,))
+        rows = build.records(dataclasses.replace(pipeline, stages=pipeline.stages[:at]), DataPartition())
         return len(rows) if isinstance(rows, pygrain.MapDataset) else None
 
     return counted(train, build)
@@ -823,7 +744,7 @@ def _split_spans(pipeline: Pipeline, build: _Build) -> Iterator[list[tuple[int, 
     for at, split in enumerate(pipeline.stages):
         if at in build.lowering.splits and isinstance(split, TokenSplit):
             before = dataclasses.replace(pipeline, stages=pipeline.stages[:at])
-            rows, _ = build.records(before, DataPartition())
+            rows = build.records(before, DataPartition())
             if not isinstance(rows, pygrain.MapDataset):
                 raise ValueError(f"token split in {_name(pipeline)} needs a finite indexed order")
             yield _TokenSplit(rows, split).spans
@@ -915,14 +836,3 @@ class _Batched:
         if self.batch_fn is not None:
             return stacked(payload, self.batch_fn)
         return stacked(payload, functools.partial(record_batch, shared=self.shared))
-
-
-@dataclasses.dataclass(frozen=True)
-class _LengthAt:
-    lengths: pygrain.MapDataset[int]
-
-    def __call__(self, index: int) -> int:
-        measured = self.lengths[index]
-        if measured is None:
-            raise ValueError(f"length metadata is missing index {index}")
-        return int(measured)

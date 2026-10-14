@@ -13,6 +13,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
+from flax.core import freeze, unfreeze
 from reference_error import assert_as_exact_as_the_reference
 
 from dew.nn.attention import GroupNorm, LayerNorm, Stage
@@ -466,6 +467,9 @@ def test_unet3d_inflation_reproduces_2d_unet(rng):
                     "constants": jax.tree.map(lambda table: table * 1.5, variables_2d["constants"])}
     variables_3d = model_3d.init(jax.random.PRNGKey(7), x, temb, textcontext)
     inflated = inflate_unet_variables(variables_2d, variables_3d)
+    # A checkpoint read as a FrozenDict inflates alike, its temporal blocks the 3D init's.
+    frozen = unfreeze(inflate_unet_variables(freeze(variables_2d), variables_3d))
+    assert jax.tree.all(jax.tree.map(jnp.array_equal, frozen, unfreeze(inflated)))
 
     out_3d = model_3d.apply(inflated, x, temb, textcontext)
     frames_2d = jnp.stack(
