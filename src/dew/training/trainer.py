@@ -1140,16 +1140,16 @@ class Trainer(Generic[Loss, Effects]):
 
         def run(current, batch):
             with self._traced_on(mesh):
+                if candidate.copies and current.compute is None:
+                    current = dataclasses.replace(current, compute=jax.jit(
+                        lambda variables: narrowed(variables, candidate.copies),
+                        out_shardings=candidate.shardings.compute)(current.variables))
                 if current.accumulation is None and split * self.accumulation > 1 and self.step is None:
                     # The window, and with it the split, is the state's from here on.
                     current = dataclasses.replace(self._initialize_accumulation(
                         current, candidate.micro, candidate.shapes, window=split * self.accumulation),
                         window_size=jnp.asarray(split * self.accumulation, jnp.int32))
                     current = jax.device_put(current, candidate.shardings)
-                if candidate.copies and current.compute is None:
-                    current = dataclasses.replace(current, compute=jax.jit(
-                        lambda variables: narrowed(variables, candidate.copies),
-                        out_shardings=candidate.shardings.compute)(current.variables))
                 outputs = []
                 for part in parts:
                     current, *output = executable(current, batch, part)
