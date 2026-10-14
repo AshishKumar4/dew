@@ -264,7 +264,16 @@ class Files(Dataset):
                 or metadata.get("generation")
             )
             if local(fs):
-                version = content_version(fs, path, integer(metadata["size"], "size"))
+                # A copy on this host's disk is named by what it holds, which its producer's
+                # declaration, where it states one, must describe.
+                size = integer(fs.info(path)["size"], "size")
+                version = content_version(fs, path, size)
+                stated = self.declared.get(url, {})
+                if stated.get("bytes", size) != size or stated.get("sha256", version) != version:
+                    raise ValueError(
+                        f"{url} declares {stated.get('bytes')} bytes (sha256 {stated.get('sha256')}), but "
+                        f"the file holds {size} (sha256 {version}): the store's metadata is stale")
+                metadata = {**metadata, "size": size}
             elif version is None:
                 version = fs.ukey(path)
             files.append(
