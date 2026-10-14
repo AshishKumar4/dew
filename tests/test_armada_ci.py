@@ -128,8 +128,9 @@ def test_the_gpu_tier_is_every_file_whose_tests_read_the_backend_or_are_marked_f
     test module's under whose body it ran, though another file imported it
     first, beside others. The `sys` and `platform` modules are no read. A
     file that started a process, a shell's or multiprocessing's included,
-    has no key, so it is in, and no task reuses its row; one that asked a
-    native tool about the host (`executed.TOOLS`) keeps its key. The command line
+    has no key, so it is in, and no task reuses its row, whatever names its
+    program (a descriptor, for `os.execve`); one that asked a native tool
+    about the host (`executed.TOOLS`) keeps its key. The command line
     spreads the tier over its shards, each file once, and per batch names
     the files the checkout marks for a GPU."""
     url, stored, _ = cache_worker
@@ -164,8 +165,17 @@ def test_the_gpu_tier_is_every_file_whose_tests_read_the_backend_or_are_marked_f
                         "def test_tool():\n"
                         "    subprocess.run(['git', '--version'], check=True, capture_output=True)\n"
                         "    assert platform.platform()\n",
-        "test_shell.py": "import subprocess\n"
-                         "def test_shell(): subprocess.run('git --version', shell=True, check=True)\n",
+        "test_shell.py": "import os, subprocess, sys\n"
+                         "def test_shell(): subprocess.run('git --version', shell=True, check=True)\n"
+                         "def test_by_descriptor():\n"
+                         "    child = os.fork()\n"
+                         "    if child == 0:\n"
+                         "        try:\n"
+                         "            program = os.open(sys.executable, os.O_RDONLY)\n"
+                         "            os.execve(program, ['python', '-c', 'pass'], {})\n"
+                         "        finally:\n"
+                         "            os._exit(1)\n"
+                         "    assert os.waitstatus_to_exitcode(os.waitpid(child, 0)[1]) == 0\n",
         "test_pool.py": "import multiprocessing, os\n"
                         "def test_pool():\n"
                         "    child = multiprocessing.get_context('spawn').Process(target=os.getpid)\n"
