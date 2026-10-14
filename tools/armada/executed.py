@@ -5,8 +5,8 @@ is not run again.
 It counts a file once per test file through sys.monitoring's function-start event, disabled after
 the first and restarted at each test file, so it costs about nothing. What collection and
 session-scoped fixtures execute serves every test file after them, so it joins every file's record.
-A test file that starts another process runs code no event sees, so its record says so, and the
-cache never skips it.
+A test file that starts another Python process runs code no event sees, so its record says so, and
+the cache never skips it; a tool it runs (ptxas, nvidia-smi, git) runs none of the checkout's code.
 
 It also records where each test file's run read the backend (`reads_backend`) and which of its tests
 are marked to run on a GPU (`MARKS`): a file with either takes another path on a GPU, so the H100 tier
@@ -18,6 +18,9 @@ which runs once, as it is imported, is its own test file's too, and every file's
 import dis
 import json
 import os
+import re
+import shlex
+import shutil
 import sys
 import types
 from pathlib import Path
@@ -27,8 +30,10 @@ from ci import MARKS
 
 TOOL = 3
 """sys.monitoring's tool ids 0-2 and 5 are the debugger's, coverage's, the profiler's and the optimizer's."""
-SPAWNS = {"subprocess.Popen", "os.fork", "os.forkpty", "os.posix_spawn", "os.spawn", "os.exec"}
-"""Audit events of a process start."""
+SPAWNS = {"subprocess.Popen": 1, "_posixsubprocess.fork_exec": 1, "os.posix_spawn": 1, "os.spawn": 2,
+          "os.exec": 1, "os.fork": None, "os.forkpty": None}
+"""Audit events of a process start, and where in their arguments the child's command line is: a fork
+has none, its child being this process's copy."""
 
 root = str(Path.cwd()) + os.sep
 shared: set[str] = set()
@@ -100,8 +105,39 @@ def reads_backend(code: types.CodeType) -> bool:
 
 
 def audited(event, args):
-    if running and event in SPAWNS:
+    if running and event in SPAWNS and (SPAWNS[event] is None or runs_python(args[SPAWNS[event]])):
         spawned.add(running[-1])
+
+
+def runs_python(command) -> bool:
+    """Whether a child of `command`, a command line or a shell's string, runs Python: a word of it
+    names an interpreter, a module path or a program whose first line does, through any wrapper."""
+    for word in words(command):
+        name = os.path.basename(word)
+        if re.fullmatch(r"python[\d.]*", name) or name.endswith(".py") or word == sys.executable:
+            return True
+        program = word if os.sep in word else shutil.which(word)
+        if program and not word.startswith("-") and os.path.isfile(program):
+            try:
+                with open(program, "rb") as opened:
+                    first = opened.readline(256)
+            except OSError:
+                continue
+            if first.startswith(b"#!") and b"python" in first:
+                return True
+    return False
+
+
+def words(command) -> list[str]:
+    """The words of a command line, each part's own words too: a shell's `-c` string holds a command."""
+    found = []
+    for part in [command] if isinstance(command, (str, bytes)) else command:
+        part = os.fsdecode(part)
+        try:
+            found += [part, *shlex.split(part)]
+        except ValueError:
+            found += [part, *part.split()]
+    return found
 
 
 # Recording starts as `-p executed` imports this, before pytest loads the initial conftests, which
