@@ -56,10 +56,10 @@ def _only_when(due, taken, kept, operand):
 
     XLA's conditional simplifier judges a branch by its ops' kinds, not their
     size: one of elementwise ops and reductions, an optimizer update among
-    them, it runs on every call and selects (`TryRemoveConditional`). On E1
-    that ran the whole AdamW update on every microbatch, about 44 ms of a
-    731 ms step on an A100. The barrier, an op it counts as expensive, keeps
-    the branch a branch.
+    them, it runs on every call and selects (`TryRemoveConditional`). In a
+    Qwen3.5-0.8B fine-tune at 8 x 3072, bf16, that ran the whole AdamW
+    update on every microbatch, about 44 ms of a 731 ms step on an A100. The
+    barrier, an op it counts as expensive, keeps the branch a branch.
     """
     return jax.lax.cond(due, lambda current: jax.lax.optimization_barrier(taken(current)), kept, operand)
 
@@ -462,7 +462,7 @@ class Transaction:
             # A pooled window's gradient sum (a replayed window keeps none)
             # goes round the reset too, its next first microbatch restarting
             # it (`prepare_attempt`): passed through on every microbatch the
-            # window does not commit, it was copied each time (E1's 1 GB
+            # window does not commit, it was copied each time (Qwen3.5-0.8B's 1 GB
             # embedding sum, twice a step on an A100).
             window = jax.lax.cond(pending.due, clear, retain, dataclasses.replace(candidate, gradient=None))
             numerical = dataclasses.replace(
