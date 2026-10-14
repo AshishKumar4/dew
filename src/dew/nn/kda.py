@@ -185,8 +185,7 @@ class KimiDeltaAttention(nn.Module):
             if S == 1:
                 return recurrent_delta_rule(query, key, value, g, beta, held, starts=starts)
             return chunk_gated_delta_rule(query, key, value, g, beta, held, self.chunk_size,
-                                          projected=projected.dtype if ported else None, starts=starts,
-                                          max_segments=tokens.max_segments)
+                                          projected=projected.dtype if ported else None, starts=starts)
 
         # The decode state is GatedDeltaNet's pair, here in fp32; the
         # allocation-only call returns before any state is written. The conv
