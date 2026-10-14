@@ -198,3 +198,23 @@ def test_a_mamba2_layer_lowers_for_the_gpu_with_the_ssd_scan_its_generation_choo
     it does not, to none of them."""
     expected = SHORT_CONV.union(*(FAMILIES[key][1] for key in chosen(generation, "mamba2")))
     assert set(triton_kernels(_mamba2_lowered(generation))) == expected
+
+
+def test_a_call_the_dispatch_sends_off_flash_is_logged_at_info_and_a_float32_call_not_at_all(monkeypatch,
+                                                                                               caplog):
+    """FlashAttention takes no float32 query, so a float32 call declines nothing and says so nowhere; a
+    bf16 call the dispatch sends off the kernel measured fastest is the dispatch's own choice, logged
+    once at INFO, which a run's console does not show."""
+    import logging
+
+    from dew.nn import attention
+    from dew.nn.kernels import generation
+
+    monkeypatch.setattr(generation, "_logged", set())
+    with assumed("sm80"), caplog.at_level(logging.INFO, logger=generation.__name__):
+        # Packed rows, which no Triton kernel takes, as the hero's are.
+        chosen = {dtype: attention.resolve_implementation("auto", query, query, segment_ids=jnp.ones((1, 8)),
+                                                          max_segments=2)
+                  for dtype in (jnp.float32, jnp.bfloat16) for query in [jnp.zeros((1, 8, 2, 64), dtype)]}
+    assert [(record.levelno, record.args[:3]) for record in caplog.records] == [
+        (logging.INFO, ("attention", chosen[jnp.bfloat16], "flash"))]
