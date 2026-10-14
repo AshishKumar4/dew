@@ -210,11 +210,12 @@ class Scorer:
 
 
 def load_pipe(experiment):
-    from dew.interop.hub import pull_from_hub
+    from huggingface_hub import snapshot_download
+
     from dew.sampling import TextToImage
 
-    directory = pull_from_hub(experiment.model, revision=experiment.revision)
-    return TextToImage.from_run(str(directory)), directory
+    directory = snapshot_download(repo_id=experiment.model, revision=experiment.revision)
+    return TextToImage.from_run(directory), directory
 
 
 def provenance(experiment, pipe, directory):
@@ -223,8 +224,8 @@ def provenance(experiment, pipe, directory):
     return {
         "model": experiment.model,
         "revision": experiment.revision,
-        "loaded_with": f"dew.sampling.TextToImage.from_run(pull_from_hub({experiment.model!r}, "
-        "revision=...)), the run from_pretrained loads",
+        "loaded_with": "dew.sampling.TextToImage.from_run(huggingface_hub.snapshot_download("
+        f"{experiment.model!r}, revision=...)), the run from_pretrained loads",
         "checkpoint_step": experiment.checkpoint_step,
         "parameters": int(sum(math.prod(leaf.shape) for leaf in jax.tree.leaves(pipe.variables["params"]))),
         "dew_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=REPO, text=True).strip(),

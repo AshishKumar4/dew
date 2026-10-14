@@ -9,23 +9,27 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import asdict
 
+from dew import records
 from dew.interop.config_records import native_fields
 from dew.interop.decoder_parts import (
+    DEFAULT_MAX_SEQ_LEN,
     DecoderFamily,
     DecoderFields,
-    Ropes,
+    RopeSpelling,
     base_config,
     dew_path,
     hf_tensor_name,
+    read_rope,
     refuse,
 )
-from dew.interop.families.deepseek import deepseek_rope
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
 
 
 def _gpt_oss_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:
-    theta, yarn = deepseek_rope(hf_config, used)
+    ropes = read_rope(hf_config, used, records.integer(hf_config.get(
+        'max_position_embeddings', DEFAULT_MAX_SEQ_LEN), 'max_position_embeddings'),
+        RopeSpelling(theta=150000.0), ramps=('yarn',), per_kind=False)
     layers = hf_config['num_hidden_layers']
     experts = hf_config['num_local_experts']
     top_k = hf_config['num_experts_per_tok']
@@ -34,8 +38,8 @@ def _gpt_oss_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderF
     pattern = tuple('sliding_attention' if index % 2 == 0 else 'full_attention'
                     for index in range(layers))
     config = base_config(hf_config, used, layer_types=pattern,
-                          rope=Ropes(theta), scale_after_cast=False)
-    config.update(mlp='swigluoai', attention_sinks=True, yarn=yarn,
+                          rope=ropes, scale_after_cast=False)
+    config.update(mlp='swigluoai', attention_sinks=True,
                   mixture=native_fields(Mixture)(experts=experts, top_k=top_k))
     if hf_config.get('swiglu_limit', 7.0) != 7.0:
         refuse('swiglu_limit', 'GptOssExperts clamps at 7.0')
