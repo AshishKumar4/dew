@@ -733,10 +733,10 @@ class Layout:
                           for path, param in path_leaves]
         shardable_elements = 0
         replicated = []
-        for (path, param), sharding, ruled in zip(
+        for (path, param), sharding, has_rule in zip(
                 path_leaves, jax.tree.leaves(shardings), splittable, strict=True):
             elements = int(np.prod(param.shape, dtype=np.int64))
-            if elements < self.min_shard or not ruled:
+            if elements < self.min_shard or not has_rule:
                 continue
             shardable_elements += elements
             if any(axis in mesh_axes(assignment)
