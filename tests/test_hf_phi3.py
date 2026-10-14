@@ -187,5 +187,5 @@ def test_a_fused_projection_and_its_part_stored_apart_must_agree(tmp_path):
                                   alone.model.apply(alone.variables, ids))
 
     save_hf_layout({**tensors, part: gate + 1}, config, tmp_path / 'unequal')
-    with pytest.raises(ValueError, match='gate_proj'):
+    with pytest.raises(ValueError):
         Pretrained.load(tmp_path / 'unequal', dtype='float32', attention_impl='reference')

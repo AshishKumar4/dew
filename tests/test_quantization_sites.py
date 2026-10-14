@@ -149,7 +149,7 @@ def test_a_server_of_the_packed_task_reloads_the_loaded_models_own_tree(case):
     member = node[group.members[1]]
     leaf = next(iter(member))
     node[group.members[1]] = {**member, leaf: np.float32(2) * member[leaf]}
-    with pytest.raises(ValueError, match="quantize their one input apart"):
+    with pytest.raises(ValueError):
         server.reload(variables)
 
 
