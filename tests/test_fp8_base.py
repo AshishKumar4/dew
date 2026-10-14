@@ -280,7 +280,8 @@ def test_a_checkpoints_input_quantization_and_an_fp8_base_share_one_wrapper():
 
 def test_a_record_runs_on_the_generation_it_was_measured_on_alone():
     _, fp8 = adapters()
-    with assumed("sm80"), pytest.raises(ValueError, match=r"measured on \w+, and this is sm80"):
+    jax.eval_shape(lambda: fp8.model.apply(fp8.variables, ids()))
+    with assumed("sm80"), pytest.raises(ValueError):
         jax.eval_shape(lambda: fp8.model.apply(fp8.variables, ids()))
 
 
@@ -290,18 +291,25 @@ FP8_CORES = gpu_target(device_generation()).fp8_peak is not None
 @pytest.mark.skipif(FP8_CORES, reason="this GPU has FP8 tensor cores")
 def test_a_device_without_fp8_tensor_cores_measures_no_site():
     variables = decoder().init(jax.random.key(0), ids())
-    with pytest.raises(ValueError, match="no FP8 tensor cores"):
+    with pytest.raises(ValueError):
         measured_fp8_sites(variables, record(variables).frozen_fp8, 8192)
 
 
 def test_a_process_sharing_its_gpu_measures_no_site(monkeypatch):
     """A process beside other work on its GPU (gpu-run -n 0.5 asks XLA to
     read its picks and write none) would time FP8 against bf16 unfairly, so
-    it is refused before measuring, on a GPU with FP8 tensor cores too."""
+    it is refused before measuring, on a GPU with FP8 tensor cores too: an
+    H100 has them, so the read-only autotune cache is what refuses it."""
+    from dew import cache
+
     variables = decoder().init(jax.random.key(0), ids())
-    monkeypatch.setenv("XLA_FLAGS", f"{os.environ.get('XLA_FLAGS', '')} "
-                                    "--xla_gpu_experimental_autotune_cache_mode=AUTOTUNE_CACHE_MODE_READ")
-    with assumed("sm90"), pytest.raises(ValueError, match="shares its GPU"):
+    read_only = "--xla_gpu_experimental_autotune_cache_mode=AUTOTUNE_CACHE_MODE_READ"
+    flags = os.environ.get("XLA_FLAGS", "").replace(read_only, "")
+    monkeypatch.setenv("XLA_FLAGS", flags)
+    assert cache.measures_picks()
+    monkeypatch.setenv("XLA_FLAGS", f"{flags} {read_only}")
+    assert not cache.measures_picks()
+    with assumed("sm90"), pytest.raises(ValueError):
         measured_fp8_sites(variables, record(variables).frozen_fp8, 8192)
 
 

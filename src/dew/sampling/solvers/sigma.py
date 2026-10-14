@@ -27,6 +27,11 @@ def _euler_step(x, denoised, source, target):
     return x + derivative * dt, derivative, x_0_coeff, dt
 
 
+def _ancestral_noise(key: jax.Array, x: jax.Array) -> jax.Array:
+    """The unit normal an ancestral step draws from its key and scales by sigma_up."""
+    return jax.random.normal(key, x.shape)
+
+
 def _ancestral(sigma_t, sigma_s):
     """k-diffusion's `get_ancestral_step` at eta 1: `(sigma_down, sigma_up)`,
     the level a deterministic step goes down to and the fresh noise that
@@ -65,7 +70,7 @@ class EulerAncestral:
         _, sigma_s = process.rates(t_next, like=x)
         sigma_down, sigma_up = _ancestral(sigma_t, sigma_s)
         dx = (x - denoised) / sigma_t
-        dW = jax.random.normal(key, x.shape) * sigma_up
+        dW = _ancestral_noise(key, x) * sigma_up
         return x + dx * (sigma_down - sigma_t) + dW, state
 
 
@@ -210,7 +215,7 @@ class KDPM2:
             denoised_mid, _ = denoise(x_mid, schedule.t_of_sigma(sigma_mid.reshape(-1)))
             stepped = x + (x_mid - denoised_mid) / sigma_mid * (target - sigma_t)
             if self.ancestral:
-                stepped = stepped + jax.random.normal(key, x.shape) * sigma_up
+                stepped = stepped + _ancestral_noise(key, x) * sigma_up
             return jnp.where(positive, stepped, denoised)
 
         return lax.cond(jnp.all(sigma_s == 0), lambda _: denoised, midpoint, None), state
