@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+from hub_support import native_builder
 from token_support import write_token_corpus
 
 from dew.config.data import HoldOut, ImageData, RecordsData, TextData
@@ -54,10 +55,9 @@ def hub(tmp_path, monkeypatch):
     for revision, offset in (("frozen-default", 0), ("frozen-release", 1000)):
         ids = list(range(offset, offset + 512))
         texts[revision] = [f"document {index:04d} " + "x" * 113 for index in ids]
-        path = tmp_path / f"{revision}.parquet"
-        datasets.Dataset.from_dict({"id": ids, "text": texts[revision]}).to_parquet(path)
-        builders[revision] = datasets.load_dataset_builder(
-            "parquet", data_files={"train": str(path)}, cache_dir=str(tmp_path / revision))
+        split = datasets.Dataset.from_dict({"id": ids, "text": texts[revision]})
+        builders[revision] = native_builder({"train": split}, tmp_path / f"{revision}-files",
+                                            tmp_path / revision)
 
     def info(self, repo, revision=None, **options):
         assert repo == "acme/simple"
