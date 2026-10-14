@@ -408,7 +408,7 @@ def chunk_local_cumsum(g, *, chunk: int = 64, scale: float | None = None, revers
                    g, *spans, chunk=chunk, scale=scale, reverse=reverse, interpret=interpret)
 
 
-def _dot(a, b, *, exact: bool, ieee: bool = False):
+def _dot(a, b, *, exact: bool, ieee: bool = False, solve: jnp.dtype | None = None):
     """`a @ b`, same-dtype operands, with fp32 accumulation; reject mismatches before any interpret-mode
     widening, so CPU tests catch dots Triton rejects. Exact interpretation widens bf16/fp16 inputs
     for CPUs without narrow-input/fp32-accumulating dots.
@@ -423,8 +423,12 @@ def _dot(a, b, *, exact: bool, ieee: bool = False):
       plain TF32 (pallas/triton/lowering.py `_TF32_PRECISIONS`), so the preset is named. IEEE there
       lowers on sm80 to FMA loops ptxas took 3.5 to over 15 minutes to compile for the WY backward;
       TF32x3 compiles in seconds.
-    - interpreted: no precision, the CPU's fp32.
-    The kkt merge's TF32 products name `Precision.DEFAULT` themselves (`_kkt_solve_kernel`)."""
+    - fp32 with `solve`, the call's dtype, at the solves' products of fp32 intermediates (the kkt and
+      KDA sub-chunk merges and products, fla's SOLVE_TRIL_DOT_PRECISION): TF32x3 in an fp32 call,
+      where one TF32 put a Kimi linear layer's logits 100 times the reference's distance from
+      float64 on an H100; one TF32, fla's, in a 16-bit call, whose operands' rounding it stays under
+      and where TF32x3 cost Kimi Linear's bf16 layer 17% on an H100 and 19% on an A100.
+    - interpreted: no precision, the CPU's fp32."""
     if jnp.dtype(a.dtype) != jnp.dtype(b.dtype):
         raise TypeError(f"Pallas dot operands must have the same dtype, got {a.dtype} and {b.dtype}")
     wide = jnp.dtype(a.dtype) == jnp.float32
@@ -432,7 +436,9 @@ def _dot(a, b, *, exact: bool, ieee: bool = False):
         a, b = a.astype(jnp.float32), b.astype(jnp.float32)
         precision = jax.lax.Precision.HIGHEST if ieee and wide else None
     elif wide:
-        precision = jax.lax.Precision.HIGHEST if ieee else jax.lax.DotAlgorithmPreset.TF32_TF32_F32_X3
+        narrow_call = solve is not None and jnp.dtype(solve).itemsize < 4
+        precision = (jax.lax.Precision.HIGHEST if ieee else jax.lax.Precision.DEFAULT if narrow_call
+                     else jax.lax.DotAlgorithmPreset.TF32_TF32_F32_X3)
     else:
         precision = None
     return jnp.dot(a, b, preferred_element_type=jnp.float32, precision=precision)
@@ -452,19 +458,14 @@ def _tril_inverse(diagonal, index):
     return inverse + (index[:, None] == index[None, :])
 
 
-def _tf32_dot(a, b):
-    """`a @ b` of fp32 blocks at TF32, fla's SOLVE_TRIL_DOT_PRECISION on an sm80 or later."""
-    return jnp.dot(a, b, preferred_element_type=jnp.float32, precision=jax.lax.Precision.DEFAULT)
-
-
 def _kkt_solve_kernel(chunk_ref, k_ref, g_ref, lo_ref, beta_ref, a_ref, *, chunk: int, aligned: bool,
                       sub: int, bk: int, exact: bool):
     """fla's `chunk_gated_delta_rule_fwd_kkt_solve_kernel` (fla/ops/gated_delta_rule/chunk_fwd.py:40-
     321) for one chunk of one head: `(I + A)^-1` for `A = tril(beta_s (k_s . k_t) exp2(g_s - g_t), -1)`,
     in `sub`-row blocks (fla's BC = 16 of BT = 64). Every lower block of `k k^T` accumulates over the
     key columns `bk` at a time; the gate and beta scale them; forward substitution inverts each
-    diagonal block; and neighbouring inverses merge as `-X_i A_ij X_j`, the merge's products at TF32
-    as fla's SOLVE_TRIL_DOT_PRECISION takes them on an sm80 or later."""
+    diagonal block; and neighbouring inverses merge as `-X_i A_ij X_j`, the merge's products at
+    the call's solve precision (`_dot`'s `solve`)."""
     start, taken = _chunk_of(chunk_ref, chunk, aligned)
 
     @pl.when(taken > 0)
@@ -499,16 +500,14 @@ def _kkt_solve_chunk(k_ref, g_ref, lo_ref, beta_ref, a_ref, start, taken, *, chu
 
     blocks = {(i, j): block(i, j) for i in range(count) for j in range(i + 1)}
 
-    def tf32(a, b):
-        return _tf32_dot(a, b)
-
     inverse = {(i, i): _tril_inverse(blocks[i, i], index) for i in range(count)}
     for distance in range(1, count):
         for i in range(distance, count):
             j = i - distance
             # X_ij = -X_ii (sum over j <= m < i of A_im X_mj), fla's merge order.
-            inner = sum(tf32(blocks[i, m], inverse[m, j]) for m in range(j, i))
-            inverse[i, j] = -tf32(inverse[i, i], inner)
+            inner = sum(_dot(blocks[i, m], inverse[m, j], exact=exact, solve=k_ref.dtype)
+                        for m in range(j, i))
+            inverse[i, j] = -_dot(inverse[i, i], inner, exact=exact, solve=k_ref.dtype)
     # fla zero-fills A before its kernel stores the lower blocks; here the blocks above are stored as zeros.
     for i in range(count):
         for j in range(count):
@@ -1321,7 +1320,9 @@ def _o_kernel(chunk_ref, q_ref, k_ref, v_ref, h_ref, g_ref, lo_ref, o_ref, *, ch
     """fla's `chunk_fwd_kernel_o` (fla/ops/common/chunk_o.py:43-147) for one chunk of one head and
     `BV` value columns: `o = scale * ((q h) exp2(g) + tril((q k^T) exp2(g_s - g_t)) v)`, the key
     columns walked `bk` at a time into fp32 accumulators, `A` cast to the values' dtype for its
-    product, as fla does."""
+    product, as fla does. fp32 products are IEEE here (`_dot`'s `ieee`), where the other kernels take
+    TF32x3: the output reads them directly, and at TF32x3 a Qwen3.5 hybrid's fp32 scores on an H100
+    sat 2.03 times their fp32 reference's distance from float64, 1.17 at IEEE."""
     start, taken = _chunk_of(chunk_ref, chunk, aligned)
 
     @pl.when(taken > 0)
@@ -1334,15 +1335,15 @@ def _o_kernel(chunk_ref, q_ref, k_ref, v_ref, h_ref, g_ref, lo_ref, o_ref, *, ch
         for block in range(q_ref.shape[-1] // bk):
             columns = pl.ds(block * bk, bk)
             query = read(q_ref, columns)
-            out += _dot(query, h_ref[columns, :], exact=exact)
-            scores += _dot(query, read(k_ref, columns).T, exact=exact)
+            out += _dot(query, h_ref[columns, :], exact=exact, ieee=True)
+            scores += _dot(query, read(k_ref, columns).T, exact=exact, ieee=True)
         gate = _halves(g_ref, lo_ref, start, taken, chunk)
         out = out * jnp.exp2(gate[0])[:, None]
         scores = scores * jnp.exp2(_pairs(gate, gate))
         index = jnp.arange(chunk)
         scores = jnp.where(index[:, None] >= index[None, :], scores, 0.0)
         value = read(v_ref)
-        out = out * scale + _dot(scores.astype(value.dtype), value, exact=exact) * scale
+        out = out * scale + _dot(scores.astype(value.dtype), value, exact=exact, ieee=True) * scale
         _write(_rows(o_ref, start, chunk), taken, out)
 
 

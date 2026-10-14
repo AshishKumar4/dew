@@ -266,8 +266,7 @@ class DiffusionGemma(nn.Module):
             raise ValueError("image conditioning requires a vision conditioner and image_indices")
         safe = jnp.where(image_indices >= 0, 0, tokens)
         embedded = self.text.scaled_embeddings(self.text.embed_tokens(safe))
-        fused = self.conditioner.fuse(safe, embedded, image_indices, conditioning, train=train)
-        return fused.tokens, fused.embeddings
+        return safe, self.conditioner.fuse(embedded, image_indices, conditioning, train=train)
 
     def hidden_states(self, tokens, *, train: bool = False, image_indices=None,
                       conditioning: Mapping[str, jax.Array] | None = None, **fields):
