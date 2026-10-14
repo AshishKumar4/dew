@@ -212,6 +212,26 @@ def test_a_sampled_rollout_packs_its_completions():
         np.testing.assert_array_equal(np.asarray(out[key]), np.asarray(again[key]))
 
 
+def test_a_prompts_group_is_the_policys_continuations_of_one_request():
+    """A rollout draws each prompt's group as the policy's `groups`
+    continuations of one request under its key: one prefill, and the chains
+    the task's own call draws, in its row order."""
+    objective = tiny_objective()
+    params = objective.init(jax.random.key(0))
+    sampling = Sampling(temperature=1.3, top_k=5)
+    rollout = SampledRollout(objective, Calls(), groups=GROUPS, max_new_tokens=NEW_TOKENS,
+                             sampling=sampling)
+    batch = prompt_batch()
+    out = rollout(FakeState(params), batch, jax.random.key(4))
+    drawn = objective.policy(params, sampling)(batch["prompt"], NEW_TOKENS, key=jax.random.key(4),
+                                               n=GROUPS).host()
+    found = chains(out)
+    for index, chain in found.items():
+        np.testing.assert_array_equal(chain["input_ids"], drawn.tokens[index])
+        sampled = chain["response_mask"] != 0
+        np.testing.assert_array_equal(chain["behavior_log_probs"][sampled], drawn.behavior_log_probs[index])
+
+
 def test_rewards_and_advantages_follow_the_calls():
     """The reward sees each row's own context, and the advantages are the
     group family over exactly the rewards the calls returned."""
