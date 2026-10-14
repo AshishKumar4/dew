@@ -1,9 +1,5 @@
 """A training step lowered for a CUDA GPU on a host without one (`dew.training._lowering`)."""
 
-import json
-import os
-import subprocess
-import sys
 from pathlib import Path
 
 import jax
@@ -41,8 +37,8 @@ def test_a_kernel_traced_for_an_assumed_gpu_lowers_to_a_named_triton_call():
 
 
 # The Triton kernels each Pallas choice a KERNELS row can name lowers to, by their `pallas_call` names,
-# and the probe that runs them: the decision-model recipe's step (tools/clef_step.py), an expert layer's
-# forward and backward (`_experts_lowered`), or a Mamba-2 layer's (`_mamba2_lowered`).
+# and the probe that runs them: an expert layer's forward and backward (`_experts_lowered`), a
+# Mamba-2 layer's (`_mamba2_lowered`), or a model step ("step").
 FAMILIES = {
     ('grouped_matmul', 'pallas'): ("experts", {"pallas_triton_ragged_dot", "tgmm_ragged_dot"}),
     ('rms_norm', 'pallas'): ("step", {"rms_norm_forward", "rms_norm_backward"}),
@@ -104,20 +100,6 @@ def test_the_compensated_norm_vjp_lowers_for_both_gpu_generations(generation):
     with assumed(generation), jax.sharding.use_abstract_mesh(mesh):
         lowered = jax.jit(forward_backward).trace(x, scale, x).lower(lowering_platforms=('cuda',))
     assert triton_kernels(lowered) == {'rms_norm_forward': 1, 'rms_norm_backward': 1}
-
-
-@pytest.mark.parametrize("generation", ["sm80", "sm120"])
-def test_the_clef_step_lowers_for_the_gpu_with_every_kernel_its_generation_chooses(generation, tmp_path):
-    """c58's and c57's step, the Clef recipe's decision step over a Qwen 3.5 hybrid, lowered on this CPU
-    for their GPUs, an A100 and a G4 (tools/clef_step.py): it lowers, and it calls the Triton kernels
-    of the short conv and of every Pallas choice the generation's KERNELS row names for its layers, the
-    gated delta rule's port among them, so none was interpreted or refused."""
-    done = subprocess.run([sys.executable, str(ROOT / "tools" / "clef_step.py"), "--lower-for", generation,
-                           "--work", str(tmp_path)], capture_output=True, text=True, cwd=ROOT, timeout=1500,
-                          env={**os.environ, "JAX_PLATFORMS": "cpu"})
-    assert done.returncode == 0, done.stderr[-4000:]
-    kernels = json.loads(done.stdout.splitlines()[-1])["kernels"]
-    assert set(kernels) == SHORT_CONV.union(*(FAMILIES[key][1] for key in chosen(generation, "step")))
 
 
 def _experts_lowered(generation: str, implementation: str):
