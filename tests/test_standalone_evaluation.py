@@ -20,6 +20,13 @@ from dew.sampling import Sampling
 from dew.training import MeshSpec
 
 
+def tiny_decoder(**fields):
+    """An eight-token decoder small enough to evaluate in a test, with `fields` changed."""
+    return CausalTransformer(**{"vocab_size": 8, "emb_features": 16, "num_layers": 1, "num_heads": 2,
+                                "mlp_features": 32, "max_seq_len": 16, "dtype": "float32",
+                                "attention_impl": "xla", **fields})
+
+
 class Recording:
     def __init__(self):
         self.scalars = []
@@ -33,8 +40,7 @@ class Recording:
 
 
 def test_standalone_trained_variables_match_fit_and_return_hosted_previews():
-    model = CausalTransformer(vocab_size=8, emb_features=16, num_layers=1, num_heads=2,
-                              mlp_features=32, max_seq_len=16, dtype="float32", attention_impl="xla")
+    model = tiny_decoder()
     objective = LMObjective(model, seq_len=4, samples=Samples([1, 2], 2, sampling=Sampling(temperature=0)),
                             ema_decay=0.999)
     batch = {"text": np.tile(np.array([1, 2, 3, 4, 1], np.int32), (8, 1))}
@@ -66,8 +72,7 @@ def test_a_second_pass_over_a_split_neither_compiles_nor_moves_data_unasked():
     same shapes, reuses the programs the first compiled, and moves only what
     it places and what it brings home for the metrics (`steady_state`). The
     variables and the key are placed over the mesh, as fit's state keeps them."""
-    model = CausalTransformer(vocab_size=8, emb_features=16, num_layers=1, num_heads=2,
-                              mlp_features=32, max_seq_len=16, dtype="float32", attention_impl="xla")
+    model = tiny_decoder()
     objective = LMObjective(model, seq_len=4)
     mesh = MeshSpec().build()
     params = jax.device_put(objective.init(jax.random.key(0)), NamedSharding(mesh, P()))
@@ -103,14 +108,12 @@ class CountedMasked(MaskedDiffusionObjective):
 
 
 def counted_lm():
-    model = CausalTransformer(vocab_size=8, emb_features=16, num_layers=1, num_heads=2,
-                              mlp_features=32, max_seq_len=16, dtype="float32", attention_impl="xla")
+    model = tiny_decoder()
     return CountedLM(model, seq_len=4), 5
 
 
 def counted_masked():
-    model = CausalTransformer(vocab_size=8, emb_features=16, num_layers=1, num_heads=2, mlp_features=32,
-                              max_seq_len=4, causal=False, dtype="float32", attention_impl="xla")
+    model = tiny_decoder(max_seq_len=4, causal=False)
     return CountedMasked(model, MDLM(mask_id=7)(), seq_len=4, ema_decay=None), 4
 
 
