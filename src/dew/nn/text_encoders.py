@@ -542,14 +542,15 @@ def check_tree(variables: Mapping[str, object], module: nn.Module, *inputs) -> N
             f"unexpected {unexpected}, mismatched {mismatched}")
 
 
-def _bind_text_tower[Tower: nn.Module](
+def bind_text_tower[Tower: nn.Module](
     name: str, translate: Callable[[Mapping[str, object]], NativeFields[Tower]],
     path_of: Callable[[str], tuple[str, ...] | None], name_or_dir: str, revision: str | None,
     variables: Mapping[str, object] | None, dtype: Dtype | None, param_dtype: str, *,
     validate: Callable[[Mapping[str, np.ndarray]], None] | None = None,
-) -> tuple[Tower, Mapping[str, object], NativeFields[Tower]]:
-    """A text tower at `dtype` with its config and the variables it accepts:
-    those supplied, bound unchanged, or the checkpoint's at `param_dtype`."""
+) -> tuple[Tower, Mapping[str, object]]:
+    """A text tower at `dtype` and the variables it accepts: those supplied,
+    bound unchanged with only the configuration read, or the checkpoint's at
+    `param_dtype`, FP32 masters by default whatever the checkpoint stores."""
     directory, stored_config = component_source(name_or_dir, revision, weights=variables is None)
     config = translate(records.record(stored_config, "config.json"))
     transformer = config.value.clone(dtype=resolve_dtype(dtype))
@@ -561,44 +562,10 @@ def _bind_text_tower[Tower: nn.Module](
     bound, _, _, _ = bind_component(
         directory, name, stored_config, transformer, lambda name, rank: path_of(name),
         lambda bound: (transformer, variables if variables is not None else {
-            "params": jax.tree.map(jnp.asarray, bound)}, config),
+            "params": jax.tree.map(jnp.asarray, bound)}),
         prefix=(), params=params, param_dtype=param_dtype, validate=validate,
         inputs=(jax.ShapeDtypeStruct((1, 2), jnp.int32),))
     return bound
-
-
-class CLIPTextModel:
-    """A CLIP text tower with its weights, callable the way the encoder calls it.
-
-    `dew.inputs.encoders.CLIPText.from_pretrained` loads its tower and
-    weights from this. Call it with `input_ids` and the tokenizer's
-    `attention_mask` and read `last_hidden_state` off the result.
-    """
-
-    def __init__(self, transformer: CLIPTextTransformer, variables, config):
-        self.transformer = transformer
-        self.variables = variables
-        self.config = config
-        self._apply = jax.jit(transformer.apply)
-
-    @classmethod
-    def from_pretrained(cls, name_or_dir: str = DEFAULT_MODEL, *,
-                        dtype: Dtype | None = None, param_dtype: str = "float32",
-                        revision: str | None = None,
-                        variables: Mapping[str, object] | None = None) -> "CLIPTextModel":
-        """Load a checkpoint from the Hub or a local directory.
-
-        dtype selects computation; param_dtype selects weight storage and
-        defaults to FP32 masters independently of the checkpoint dtype.
-        Supplied variables are bound unchanged; only configuration is read.
-        """
-        return cls(*_bind_text_tower("CLIP text", translate_config, _text_path, name_or_dir,
-                                     revision, variables, dtype, param_dtype))
-
-    def __call__(self, input_ids, attention_mask=None) -> CLIPTowerOutput:
-        if attention_mask is not None:
-            attention_mask = jnp.asarray(attention_mask)
-        return self._apply(self.variables, jnp.asarray(input_ids), attention_mask)
 
 
 class CLIPModel:
@@ -871,38 +838,3 @@ def translate_t5_weights(
     """
     t5_embedding(hf_tensors)
     return translate_parameters(hf_tensors, _t5_path, param_dtype)
-
-
-class T5EncoderModel:
-    """A T5 encoder with its weights, callable the way the encoder calls it.
-
-    This is what `dew.inputs.encoders.T5Text` holds: call it with `input_ids`
-    and the tokenizer's `attention_mask`, read the last hidden states off the
-    result.
-    """
-
-    def __init__(self, transformer: T5EncoderTransformer, variables, config):
-        self.transformer = transformer
-        self.variables = variables
-        self.config = config
-        self._apply = jax.jit(transformer.apply)
-
-    @classmethod
-    def from_pretrained(cls, name_or_dir: str = DEFAULT_T5_MODEL, *,
-                        dtype: Dtype | None = None, param_dtype: str = "float32",
-                        revision: str | None = None,
-                        variables: Mapping[str, object] | None = None) -> "T5EncoderModel":
-        """Load a checkpoint from the Hub or a local directory, encoder
-        tensors only.
-
-        dtype selects computation; param_dtype selects weight storage and
-        defaults to FP32 masters. Sharded checkpoints load as one tower.
-        Supplied variables are bound unchanged; only configuration is read.
-        """
-        return cls(*_bind_text_tower("T5", translate_t5_config, _t5_path, name_or_dir,
-                                     revision, variables, dtype, param_dtype, validate=t5_embedding))
-
-    def __call__(self, input_ids, attention_mask=None) -> jax.Array:
-        if attention_mask is not None:
-            attention_mask = jnp.asarray(attention_mask)
-        return self._apply(self.variables, jnp.asarray(input_ids), attention_mask)
