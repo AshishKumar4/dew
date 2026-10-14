@@ -418,13 +418,24 @@ class RAEAutoencoder(ModuleAutoEncoder[RAE]):
     out and its inverse on the way in, per latent position where the
     checkpoint gives per-position statistics."""
 
+    record_name = 'rae'
+    record_module = RAE
+
     def __init__(self, *, model: RAE, params: Variables, latents_mean=None, latents_std=None,
                  scaling_factor: float = 1.0):
         super().__init__(model, params)
+        # The checkpoint's statistics as given, in the source's layout, for the record.
+        self.statistics: dict[str, object] = {
+            name: None if value is None else np.asarray(value, np.float32)
+            for name, value in (('latents_mean', latents_mean), ('latents_std', latents_std))}
+        self.statistics['scaling_factor'] = scaling_factor
         self.latent_shift = _statistic(latents_mean, model.grid, model.encoder_width, 0.0)
         self.latent_scale = scaling_factor / (
             _statistic(latents_std, model.grid, model.encoder_width, 1.0) + 1e-5
         )
+
+    def record_arguments(self) -> dict:
+        return self.statistics
 
     @property
     def downscale_factor(self) -> int:

@@ -106,14 +106,14 @@ class GuidanceDistillationObjective(DiffusionObjective):
 
         teacher = self.teacher
         frozen = jax.lax.stop_gradient(variables[TEACHER])
-        given, blank = teacher._conditions(frozen, batch, drop_key, dropout=False)
+        given, blank = teacher._conditions(frozen, batch, drop_key)
         # The teacher reads the student's noised sample at the time drawn on the training schedule.
         denoise = teacher.process.denoiser(teacher.model, teacher.model_variables(frozen), given, blank,
                                            schedule=schedule)
         conditional, unconditional = denoise.raw_both(noisy, t)
         target = jax.lax.stop_gradient(guide(conditional, unconditional, scale))
 
-        conditions, _ = self._conditions(variables, batch, drop_key, dropout=False)
+        conditions, _ = self._conditions(variables, batch, drop_key)
         if not any(isinstance(value, DenoisingCondition) and value.guidance is not None
                    for value in conditions.values()):
             raise ValueError("the student's conditioning carries no guidance input to distill into")
