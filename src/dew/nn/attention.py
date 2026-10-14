@@ -221,6 +221,43 @@ def combined_attention_mask(query_length: int, key_length: int, causal: bool,
     return mask
 
 
+def visible_rows(query_length: int, key_length: int, causal: bool, sliding_window: int | None,
+                 mask=None, segment_ids=None, key_value_seq_lengths=None) -> jax.Array | None:
+    """Whether each query row sees a key, `[B or 1, Q, H or 1, 1]` over the
+    output, or None where every row does.
+
+    A row that sees no key reads nothing, so attention gives it exactly zero
+    on every implementation (`scaled_dot_product_attention`): a softmax over
+    no keys has no value, and a kernel left to it returns the mean of the
+    values or, in Splash's backward, gradients from a uniform weight over
+    masked keys. Causality, a window, key lengths and segment ids decide a
+    row from its index; an explicit mask is reduced over its keys, folded
+    with them (`combined_attention_mask`).
+    """
+    if mask is not None or (segment_ids is not None and key_value_seq_lengths is not None):
+        visible = combined_attention_mask(query_length, key_length, causal, sliding_window, mask)
+        if segment_ids is not None:
+            visible = with_documents(visible, segment_ids)
+        if key_value_seq_lengths is not None:
+            visible = with_key_lengths(visible, key_value_seq_lengths, key_length)
+        assert visible is not None
+        rows = jnp.any(visible, -1)
+        rows = rows.reshape((1,) * (3 - rows.ndim) + rows.shape)
+        return jnp.swapaxes(rows, -1, -2)[..., None]
+    # The keys row i may see run from 0 to the last one; causality keeps 0 in
+    # reach, and a window ends `left` keys before the row.
+    left = None if sliding_window is None else window_sides(causal, sliding_window)[0]
+    if key_value_seq_lengths is None:
+        last = np.full((1, 1), key_length - 1)
+        reach = (last >= 0) if left is None else (np.arange(query_length)[None] - left <= last)
+        if segment_ids is None:
+            return None if reach.all() else jnp.asarray(reach)[:, :, None, None]
+        return (jnp.asarray(reach) & (jnp.asarray(segment_ids) != 0))[:, :, None, None]
+    last = jnp.asarray(key_value_seq_lengths)[:, None] - 1
+    reach = (last >= 0) if left is None else (jnp.arange(query_length)[None] - left <= last)
+    return reach[:, :, None, None]
+
+
 def with_key_lengths(mask: jax.Array | None, lengths: jax.Array, key_length: int) -> jax.Array:
     """`mask` narrowed to each row's first `lengths[b]` keys, `[B, 1, 1, K]`
     where there was no mask. This is the mask a `key_value_seq_lengths`
@@ -1259,7 +1296,9 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
             query, key, value, dtype, precision, force_fp32_for_softmax, implementation,
             causal, sliding_window, mask, bias, sinks, softcap, segment_ids,
             key_value_seq_lengths, dropout_rate, dropout_rng, shards)
-        return checkpoint_name(out, 'attention_output')
+        live = visible_rows(query.shape[-3], key.shape[-3], causal, sliding_window, mask, segment_ids,
+                            key_value_seq_lengths)
+        return checkpoint_name(_read_nothing(out, live), 'attention_output')
     if shards > 1 and segment_ids is not None:
         # The exchanges split an explicit mask along the sequence and have no
         # split for the ids, so the documents travel as the mask they stand
@@ -1284,6 +1323,12 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
                      mask=mask, bias=bias, sinks=sinks, segment_ids=segment_ids,
                      max_segments=max_segments, key_value_seq_lengths=key_value_seq_lengths)
     return checkpoint_name(out, 'attention_output')
+
+
+def _read_nothing(out: jax.Array, live: jax.Array | None) -> jax.Array:
+    """`out` with each row that sees no key (`visible_rows`) exactly zero. Its
+    cotangent is zero there too, so no kernel's backward reads those rows."""
+    return out if live is None else jnp.where(live, out, jnp.zeros((), out.dtype))
 
 
 def _dropout_attention(query, key, value, dtype, precision, force_fp32_for_softmax, implementation,
@@ -1525,7 +1570,9 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
     differentiable in forward mode under `forward_mode_attention`.
 
     'auto' resolves here, once, against this call's shapes and backend, and
-    `_attention_kernel` runs the call on the kernel it resolved to.
+    `_attention_kernel` runs the call on the kernel it resolved to. A query
+    row that sees no key comes back zero whichever kernel ran
+    (`visible_rows`), inside a sequence exchange too.
     """
     if sliding_window is not None and sliding_window < 1:
         raise ValueError(f"sliding_window must be positive, got {sliding_window}")
@@ -1545,8 +1592,9 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
         _attention_kernel, dtype=dtype, precision=precision, force_fp32_for_softmax=force_fp32_for_softmax,
         causal=causal, sliding_window=sliding_window, mask=mask, masked=masked, softcap=softcap,
         segment_ids=segment_ids, max_segments=max_segments, lengths=lengths)
+    live = visible_rows(query.shape[-3], key.shape[-3], causal, sliding_window, mask, segment_ids, lengths)
     if not FORWARD_MODE.get() or resolved not in ('cudnn', 'triton', 'flash', 'tpu'):
-        return call(query, key, value, bias=bias, sinks=sinks, implementation=resolved)
+        return _read_nothing(call(query, key, value, bias=bias, sinks=sinks, implementation=resolved), live)
 
     def fused(query, key, value, bias, sinks):
         return call(query, key, value, bias=bias, sinks=sinks, implementation=resolved)
@@ -1554,7 +1602,7 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
     def reference(query, key, value, bias, sinks):
         return call(query, key, value, bias=bias, sinks=sinks, implementation='reference')
 
-    return forward_differentiable(fused, reference, query, key, value, bias, sinks)
+    return _read_nothing(forward_differentiable(fused, reference, query, key, value, bias, sinks), live)
 
 
 def forward_differentiable(value, tangent, *arrays):
