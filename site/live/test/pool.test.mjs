@@ -36,6 +36,19 @@ test('idle scale-in never removes the two minimum warm hosts', async () => {
 	assert.equal(result.idle.ready, 2);
 	assert.equal(result.idle.active, 0);
 });
+test('an operator retires a host through the pool, which assigns it no session from then', async () => {
+	const result = await scenario('retire');
+	assert.match(result.busy, /holds 1 sessions/, 'a host with a session is refused');
+	assert.ok(result.hosts.includes(result.held));
+	if (result.retired === 'fulfilled') {
+		assert.equal(result.stopped, true);
+		assert.ok(!result.hosts.includes(result.other));
+		assert.notEqual(result.assigned, result.other, 'no session went to the host retired meanwhile');
+	} else {
+		assert.equal(result.assigned, result.other, 'the retirement was refused because the session took the host first');
+		assert.equal(result.stopped, false);
+	}
+});
 test('a generation handed over after a newer one does not replace it', async () => {
 	assert.equal((await scenario('older')).desired, 'newer');
 });

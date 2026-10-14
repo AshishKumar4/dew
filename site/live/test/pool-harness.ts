@@ -38,6 +38,19 @@ export default {
 			return Response.json({ retired, left: await orphan.left() });
 		}
 		const pool = env.POOL.get(env.POOL.idFromName('global'));
+		if (scenario === 'retire') {
+			await pool.configure(generation);
+			await pool.runAlarm();
+			const [first, second] = Object.keys((await pool.status()).hosts);
+			const held = await pool.allocate('session-0', 'snapshot');
+			const other = held === first ? second : first;
+			const busy = await pool.retire(held).then(() => 'retired', (error) => String(error));
+			// An operator's retirement and a visitor's assignment at once.
+			const [retired, assigned] = await Promise.allSettled([pool.retire(other), pool.allocate('session-1', 'snapshot')]);
+			const stopped = await env.SHARED.get(env.SHARED.idFromName(other)).retired();
+			return Response.json({ held, other, busy, retired: retired.status, assigned: assigned.status === 'fulfilled' ? assigned.value : null,
+				stopped, hosts: (await pool.left()).pool!.hosts.map((host: { id: string }) => host.id) });
+		}
 		if (scenario === 'older') {
 			await pool.configure({ ...generation, snapshot: { id: 'newer' }, created: generation.created + 1 });
 			await pool.configure(generation);

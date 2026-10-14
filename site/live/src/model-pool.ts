@@ -100,6 +100,28 @@ export class ModelPool extends DurableObject<Env> {
 		});
 	}
 
+	/**
+	 * Retire `host` for an operator: the pool assigns it no session from now, and it stops. A host
+	 * that holds sessions is refused, and stays as it was.
+	 */
+	async retire(host: string): Promise<void> {
+		await this.ctx.storage.transaction(async (storage) => {
+			const pool = (await storage.get<Pool>('pool')) ?? { hosts: [], sessions: {} };
+			const held = Object.values(pool.sessions).filter((id) => id === host).length;
+			if (held) throw new Error(`the model host ${host} holds ${held} sessions`);
+			const found = pool.hosts.find((entry) => entry.id === host);
+			if (!found) throw new Error(`no model host ${host}`);
+			found.retiring = true;
+			await storage.put('pool', pool);
+		});
+		await this.env.SHARED.get(this.env.SHARED.idFromName(host)).retire();
+		await this.ctx.storage.transaction(async (storage) => {
+			const pool = (await storage.get<Pool>('pool'))!;
+			pool.hosts = pool.hosts.filter((entry) => entry.id !== host);
+			await storage.put('pool', pool);
+		});
+	}
+
 	async close(session: string): Promise<void> {
 		const pool = await this.state();
 		const host = pool.sessions[session];
@@ -144,8 +166,8 @@ export class ModelPool extends DurableObject<Env> {
 			const health = await Promise.all(pool.hosts.filter((host) => !host.retiring).map(async (host) => {
 				const shared = this.env.SHARED.get(this.env.SHARED.idFromName(host.id));
 				try {
-					await shared.configure(host.generation, true);
-					await shared.warm();
+					await shared.configure(host.generation);
+					await shared.warm(Object.values(pool.sessions).includes(host.id));
 					return { id: host.id, ready: await shared.available() };
 				} catch (error) {
 					console.error('model host did not warm', host.id, error);
