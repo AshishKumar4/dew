@@ -61,7 +61,7 @@ EXPORTS = (
     Export('phi-tiny', derived=True),
     Export('phi3-tiny', derived=True),
     Export('bloom-tiny'),
-    # The dense-family fp32 bound; observed 2.38e-7.
+    # Its fixture has no float64 logits, so the dense-family fp32 bound.
     Export('gpt2-tiny', bound=1e-4),
     Export('gpt-neo-tiny'),
     Export('mimo-v2-flash-tiny'),
@@ -72,10 +72,10 @@ EXPORTS = (
 @pytest.mark.parametrize('case', EXPORTS, ids=lambda case: case.fixture)
 def test_an_untrained_export_reads_in_transformers_and_reloads_bit_for_bit(case, tmp_path):
     """The export names its family and holds the source's tensors byte for
-    byte, or the family it writes instead; transformers, on eager attention
-    and eager experts, reads it to logits Dew's are as exact as under the
-    float64 rule; and Dew reads it back to the model, tree and logits it
-    was saved from."""
+    byte, unless it writes another family's. Transformers reads it on eager
+    attention and eager experts, and Dew's logits are as exact as its under
+    the float64 rule. Dew reads it back to the model, tree and logits it was
+    saved from."""
     import torch
     import transformers
 
@@ -154,7 +154,7 @@ def test_a_public_training_step_lowers_the_loss_and_moves_every_module(case):
     targets below the checkpoint; every parameter is finite and every
     top-level module moved (each layer, the embedding, the head and a
     wrapper's vision tower and projector); every other collection is the
-    checkpoint's to the bit. A single leaf can rightly stay put: under
+    checkpoint's to the bit. A single leaf can rightly stay put. Under
     BLOOM's ALiBi a key bias adds one score to every key a query sees, which
     the softmax cancels, so its gradient is zero."""
     directory = FIXTURES / case.fixture
