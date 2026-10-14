@@ -125,7 +125,7 @@ For conditional image training, pass `host=(EncodeCaptions(objective.inputs.toke
 
 ## Text, chat and packing
 
-`TextData` tokenizes raw text or opens a produced token store. Fixed windows contain `seq_len + 1` IDs with one overlap token. `pack="first-fit"` places documents in padded windows; `"concat"` concatenates and splits them. A packed batch carries `text_coordinates`, a `dew.nn.inputs.Coordinates` pytree built on the host. Its `.segments` array stops attention and target scoring at document boundaries, and its `.positions` array restarts within each document. Record-level transforms before batching still read `text_segment_ids` and `text_positions`.
+`TextData` tokenizes raw text or opens a produced token store. Fixed windows contain `seq_len + 1` IDs with one overlap token. `pack="first-fit"` places documents in padded windows, a document longer than a window cut into window-long pieces first; `"concat"` concatenates and splits them. A packed batch carries `text_coordinates`, a `dew.nn.inputs.Coordinates` pytree built on the host. Its `.segments` array stops attention and target scoring at document boundaries, and its `.positions` array restarts within each document. Record-level transforms before batching still read `text_segment_ids` and `text_positions`.
 
 `Chat` renders conversations with the tokenizer's chat template. Its default long-record policy truncates; `long="chunk"` keeps an over-length conversation as chunks, and `long="drop"` rejects it. The recipe emits role IDs for every token. The objective chooses the loss role, for example `LMObjective(..., loss_role=Role.ASSISTANT)`.
 
@@ -175,7 +175,7 @@ Use a fresh output directory: exports commit immutable shards and a manifest, an
 
 Run configurations select this with --trainer.batch-size None, --trainer.batch-tokens 24576 and --trainer.update-tokens 98304. Both budgets are required, positive, and update_tokens must divide into whole micro-batches. Prepared.run records the derived accumulation (four in this example); an explicitly conflicting accumulation is refused. Row-batch ramps cannot be combined with token budgets.
 
-`Pipeline.pack(seq_len, segments=..., along=...)` packs rows of several axes with Grain's packer: `along` names fields packed on axes of their own, each to its own length, and `segments` bounds the rows a window holds. Decision rows pack this way, their questions along a second axis. Packed causal LM geometry keeps its shifted final ID; denoising objectives declare their own sequence geometry.
+A first-fit or best-fit `Pipeline.pack(seq_len)` places each document whole and refuses one longer than its window: `flat_map(text.chunk(seq_len))` just before it cuts documents into window-long pieces, which a store's plan of document lengths cuts alike. `Pipeline.pack(seq_len, segments=..., along=...)` packs rows of several axes with Grain's packer: `along` names fields packed on axes of their own, each to its own length, and `segments` bounds the rows a window holds. Decision rows pack this way, their questions along a second axis. Packed causal LM geometry keeps its shifted final ID; denoising objectives declare their own sequence geometry.
 
 ## Decision layouts and explicit order
 
