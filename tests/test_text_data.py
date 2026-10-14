@@ -364,6 +364,12 @@ def test_an_input_inside_the_export_directory_is_read_and_left_alone(tmp_path):
 # Packed documents
 # ---------------------------------------------------------------------------------
 
+def _laid_rows(rows) -> list[tuple[tuple[int, ...], ...]]:
+    """Each row's tokens, and its documents and their positions as its coordinates lay them out."""
+    return [(tuple(row["text"].tolist()), tuple(row["text_coordinates"].segments.tolist()),
+             tuple(row["text_coordinates"].positions.tolist())) for row in rows]
+
+
 @pytest.mark.parametrize("read", ["indexed", "streamed", "memory"])
 @pytest.mark.parametrize("eos_id,ends,segments", [
     (0, [4, 7, 9], [1, 1, 1, 1, 2, 2, 2, 3, 3]),
@@ -383,7 +389,7 @@ def test_a_document_runs_through_its_eos_and_the_tail_past_the_last_is_one_too(
                   batch=1, read=read, loading=Loading(workers=0, threads=1, read_buffer=1))
     (window,) = _read(data.val(DataPartition()))
     assert window["text"].tolist() == [*stream, *[0] * 7]
-    assert window["text_segment_ids"].tolist() == [*segments, *[0] * 7]
+    assert window["text_coordinates"].segments.tolist() == [*segments, *[0] * 7]
 
 
 def test_a_store_without_a_document_index_packs_its_documents_by_one_planned_order(tmp_path):
@@ -405,15 +411,11 @@ def test_a_store_without_a_document_index_packs_its_documents_by_one_planned_ord
               for read in ("indexed", "memory")}
     assert all(data.plan.lowering == "global" for data in loaded.values())
     assert len({data.records for data in loaded.values()}) == 1
-    rows = {read: sorted(tuple(tuple(row[key].tolist()) for key in
-                              ("text", "text_segment_ids", "text_positions"))
-                         for row in _read(data.train(DataPartition()), data.steps_per_epoch))
+    rows = {read: sorted(_laid_rows(_read(data.train(DataPartition()), data.steps_per_epoch)))
             for read, data in loaded.items()}
     assert rows["indexed"] == rows["memory"]
     streamed = loader(recipe, batch=2, read="streamed", loading=loading)
-    assert rows["indexed"] == sorted(tuple(tuple(row[key].tolist()) for key in
-                                          ("text", "text_segment_ids", "text_positions"))
-                                    for row in _read(streamed.val(DataPartition())))
+    assert rows["indexed"] == sorted(_laid_rows(_read(streamed.val(DataPartition()))))
     assert not (directory / "train.documents.npy").exists()
 
 
@@ -477,7 +479,7 @@ def test_a_producer_document_index_allows_packing_without_an_eos_id(tmp_path):
                   loading=Loading(workers=0, threads=1, read_buffer=1))
     (window,) = _read(data.val(DataPartition()))
     assert window["text"].tolist() == [*stream, 0, 0, 0]
-    assert window["text_segment_ids"].tolist() == [1, 1, 2, 2, 2, 0, 0, 0]
+    assert window["text_coordinates"].segments.tolist() == [1, 1, 2, 2, 2, 0, 0, 0]
 
 
 def test_packed_loader_fills_windows_with_whole_documents(tmp_path):
