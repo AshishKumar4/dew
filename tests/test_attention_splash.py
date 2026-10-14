@@ -335,7 +335,8 @@ def exact_value_and_grads(query, key, value, sinks=None, live=None, causal=False
             keep = keep & np.asarray(mask, bool)
         if segment_ids is not None:
             ids = np.asarray(segment_ids)
-            keep = keep & (ids[:, None, :, None] == ids[:, None, None, :])
+            # Segment 0 is padding, which belongs to no document (`document_mask`).
+            keep = keep & (ids[:, None, :, None] == ids[:, None, None, :]) & (ids[:, None, :, None] != 0)
         keep = np.broadcast_to(keep, logits.shape)
         sees = keep.any(-1, keepdims=True)
         # A row that keeps no key softmaxes zeros instead of only -inf, whose
