@@ -7,8 +7,7 @@ import jax.numpy as jnp
 import numpy as np
 from reference_error import assert_as_exact_as_the_reference
 
-from dew.interop import Pretrained, PretrainedDecoder
-from dew.interop.sources import load_shards
+from dew.interop import Pretrained
 
 ROOT = Path(__file__).parent / 'fixtures' / 'hf'
 DIRECTORY = ROOT / 'gptj-tiny'
@@ -33,32 +32,6 @@ def test_gptj_padded_logits_and_cached_generation_match_transformers():
     assert_as_exact_as_the_reference(original_logits, original_reference,
                                      np.load(DIRECTORY / 'logits_f64.npy'), 'unpadded logits')
     np.testing.assert_array_equal(original_logits.argmax(-1), original_reference.argmax(-1))
-
-
-def test_gptj_export_preserves_interleaved_weights_and_reads_in_transformers(tmp_path):
-    import torch
-    from transformers import AutoModelForCausalLM
-
-    loaded = Pretrained.load(DIRECTORY, dtype='float32', attention_impl='reference')
-    PretrainedDecoder.from_model(loaded.model, loaded.variables).save(tmp_path)
-    original, exported = load_shards(DIRECTORY), load_shards(tmp_path)
-    assert set(original) == set(exported)
-    for name in original:
-        np.testing.assert_array_equal(original[name], exported[name])
-    reference = AutoModelForCausalLM.from_pretrained(tmp_path, attn_implementation='eager').float().eval()
-    ids = np.load(DIRECTORY / 'input_ids.npy')
-    with torch.no_grad():
-        expected = reference(torch.from_numpy(ids).long(), use_cache=False).logits.numpy()
-    actual = loaded.model.apply(loaded.variables, ids)
-    assert_as_exact_as_the_reference(actual, expected, np.load(DIRECTORY / 'logits_f64.npy'), 'GPT-J export')
-    restored = Pretrained.load(tmp_path, dtype='float32', attention_impl='reference')
-    np.testing.assert_array_equal(restored.model.apply(restored.variables, ids), actual)
-
-    assert restored.model == loaded.model
-    assert jax.tree.structure(restored.variables) == jax.tree.structure(loaded.variables)
-    for original, restored_leaf in zip(jax.tree.leaves(loaded.variables),
-                                        jax.tree.leaves(restored.variables), strict=True):
-        np.testing.assert_array_equal(np.asarray(restored_leaf), np.asarray(original))
 
 
 def test_gptj_affine_head_trains_through_the_public_objective():

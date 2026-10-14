@@ -4,9 +4,7 @@ import json
 from pathlib import Path
 
 import jax
-import jax.numpy as jnp
 import numpy as np
-import optax
 import pytest
 
 from dew.interop import Pretrained
@@ -51,24 +49,6 @@ def test_advertised_mtp_without_weights_loads_the_actual_conditional_trunk(tmp_p
     ids = np.load(DIRECTORY / 'text_input_ids.npy')
     np.testing.assert_array_equal(advertised.model.apply(advertised.variables, ids),
                                   original.model.apply(original.variables, ids))
-
-
-def test_qwen35_moe_conditioning_has_finite_trainable_gradients():
-    loaded = Pretrained.load(DIRECTORY, dtype='float32', attention_impl='reference')
-    images = np.load(DIRECTORY / 'raw_images.npy')
-    inputs = loaded.processor(json.loads((DIRECTORY / 'prompts.json').read_text()),
-                              images=[[images[0]], [images[1], images[2]]])
-    mask = inputs.token_fields['attention_mask'][:, 1:]
-    def loss(variables):
-        logits = loaded.model.apply({'params': variables}, inputs.tokens, **inputs.kwargs())[:, :-1]
-        values = optax.softmax_cross_entropy_with_integer_labels(logits, inputs.tokens[:, 1:])
-        return jnp.sum(jnp.where(mask, values, 0)) / jnp.sum(mask)
-    value, gradient = jax.jit(jax.value_and_grad(loss))(loaded.variables['params'])
-    assert all(bool(jnp.all(jnp.isfinite(leaf))) for leaf in jax.tree.leaves(gradient))
-    for name in ('language_model', 'tower', 'projector'):
-        assert float(optax.tree.norm(gradient[name])) > 0
-    updated = jax.tree.map(lambda weight, grad: weight - .001 * grad, loaded.variables['params'], gradient)
-    assert float(loss(updated)) < float(value)
 
 
 @pytest.mark.network

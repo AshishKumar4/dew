@@ -42,16 +42,12 @@ def test_gemma4_unshared_layers_ignore_the_double_width_flag(tmp_path):
 
 @pytest.mark.network
 def test_published_gemma4_tiny_logits_and_cached_generation(tmp_path):
-    import torch
     from reference_error import assert_as_exact_as_the_reference
 
     from tools.gemma4_fp64_reference import CHECKPOINT, REVISION, reference_text
     from tools.wrapper_checkpoint_parity import measure_checkpoint
 
-    # A CPU-only Torch build still supplies the reference when Dew runs on a GPU.
-    reference_device = None if torch.cuda.is_available() else 'cpu'
-    result, logits = measure_checkpoint(CHECKPOINT, tmp_path / 'measurement.json', revision=REVISION,
-                                        reference_device=reference_device)
+    result, logits = measure_checkpoint(CHECKPOINT, tmp_path / 'measurement.json', revision=REVISION)
     assert all(row['argmax_agreement'] and row['generation_agreement']
                for row in result['observations']), result
     actual, reference, ids = logits[0]
