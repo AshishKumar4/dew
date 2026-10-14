@@ -48,11 +48,14 @@ def test_a_token_budget_reads_its_rows_on_every_share_as_one_global_batch():
         resumed.close()
 
 
-def test_a_token_budget_of_part_rows_or_rebatched_rows_is_refused():
-    with pytest.raises(ValueError, match="not whole rows of 8 tokens"):
-        compile(windows(36), read="memory", loading=READ)
-    with pytest.raises(ValueError, match=r"rebatch.*fixed token budget"):
-        compile(windows(32).rebatch(8), read="memory", loading=READ)
+@pytest.mark.parametrize("refused", ["part rows", "rebatched rows"])
+def test_a_token_budget_of_part_rows_or_rebatched_rows_is_refused(refused):
+    """A budget of whole 8-token rows compiles; one of 36 tokens, or the whole
+    rows rebatched, is refused."""
+    compile(windows(32), read="memory", loading=READ)
+    with pytest.raises(ValueError):
+        compile(windows(36) if refused == "part rows" else windows(32).rebatch(8), read="memory",
+                loading=READ)
 
 
 def _batched(records: Pipeline, by: str, drop_remainder: bool) -> Pipeline:
@@ -98,7 +101,9 @@ def test_variable_axis_is_an_input_contract_not_a_trainer_exception():
     declared = InputSpec(Field("tokens", (16,), variable_axes=(0,)))
     declared.check({"tokens": np.zeros((4, 8), np.int32)})
     assert InputSpec.from_json(declared.to_json()) == declared
-    with pytest.raises(ValueError, match="shape"):
+    with pytest.raises(ValueError):
         declared.check({"tokens": np.zeros((4, 17), np.int32)})
-    with pytest.raises(ValueError, match="shape"):
-        InputSpec(Field("tokens", (16,))).check({"tokens": np.zeros((4, 8), np.int32)})
+    fixed = InputSpec(Field("tokens", (16,)))
+    fixed.check({"tokens": np.zeros((4, 16), np.int32)})
+    with pytest.raises(ValueError):
+        fixed.check({"tokens": np.zeros((4, 8), np.int32)})

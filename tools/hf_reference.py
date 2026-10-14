@@ -1429,18 +1429,13 @@ DIFFUSION_DENOISER_TEXT = {
 }
 
 
-def write_diffusion_denoiser_tiny() -> None:
-    """One DiffusionGemma denoise step: the text weights under the released
-    encoder/decoder prefixes, the text config, a fixed prompt, canvas and
-    previous logits, and the fp32 reference logits with and without
-    self-conditioning.
-
-    The reference ties its encoder and decoder text weights, so the fixture
-    copies the encoder's text weights over the decoder's after scattering;
-    the dew tree holds them once. The tied check in the loader refuses a
-    checkpoint that disagrees there.
-    """
-    from safetensors.torch import save_file
+def diffusion_gemma_tiny(fields: dict, canvas_length: int):
+    """A tiny DiffusionGemma for block diffusion over the text config `fields`
+    (its `model_type` dropped) and one small vision tower, in float32 and
+    evaluation mode. The reference ties its encoder and decoder text weights,
+    so the decoder's are copied from the encoder's after initialization; the
+    dew tree holds them once, and the loader's tied check refuses a
+    checkpoint that disagrees there."""
     from transformers.models.diffusion_gemma.configuration_diffusion_gemma import (
         DiffusionGemmaConfig, DiffusionGemmaTextConfig,
     )
@@ -1449,32 +1444,42 @@ def write_diffusion_denoiser_tiny() -> None:
     )
     from transformers.models.gemma4.configuration_gemma4 import Gemma4VisionConfig
 
-    text = DiffusionGemmaTextConfig(**{
-        key: value for key, value in DIFFUSION_DENOISER_TEXT.items()
-        if key != "model_type"})
+    text = DiffusionGemmaTextConfig(**{key: value for key, value in fields.items() if key != "model_type"})
     vision = Gemma4VisionConfig(
         hidden_size=32, intermediate_size=64, num_hidden_layers=1,
         num_attention_heads=2, num_key_value_heads=2, head_dim=16, patch_size=8,
         pooling_kernel_size=2, position_embedding_size=64)
     model = DiffusionGemmaForBlockDiffusion(DiffusionGemmaConfig(
-        text_config=text, vision_config=vision, canvas_length=4,
-        tie_word_embeddings=False))
+        text_config=text, vision_config=vision, canvas_length=canvas_length, tie_word_embeddings=False))
     state = model.state_dict()
     for name in list(state):
         if name.startswith("model.decoder.layers.") or name in (
                 "model.decoder.embed_tokens.weight", "model.decoder.norm.weight"):
-            counterpart = name.replace("model.decoder.", "model.encoder.language_model.", 1)
-            state[name].copy_(state[counterpart])
+            state[name].copy_(state[name.replace("model.decoder.", "model.encoder.language_model.", 1)])
     model.load_state_dict(state)
-    model = model.float().eval()
-    saved = {name: tensor for name, tensor in model.state_dict().items()
-             if name.startswith("model.encoder.language_model.")
-             or name.startswith("model.decoder.") or name == "lm_head.weight"}
-    directory = FIXTURES / "diffusion-gemma-denoise-tiny"
+    return model.float().eval()
+
+
+def save_diffusion_gemma(model, fields: dict, fixture: str) -> Path:
+    """`model`'s text weights under the released encoder/decoder prefixes and
+    its text config `fields`, in the fixture directory `fixture`."""
+    from safetensors.torch import save_file
+
+    directory = FIXTURES / fixture
     directory.mkdir(parents=True, exist_ok=True)
-    save_file(saved, directory / "model.safetensors")
-    (directory / "config.json").write_text(
-        json.dumps(DIFFUSION_DENOISER_TEXT, indent=1) + "\n")
+    released = ("model.encoder.language_model.", "model.decoder.")
+    save_file({name: tensor for name, tensor in model.state_dict().items()
+               if name.startswith(released) or name == "lm_head.weight"}, directory / "model.safetensors")
+    (directory / "config.json").write_text(json.dumps(fields, indent=1) + "\n")
+    return directory
+
+
+def write_diffusion_denoiser_tiny() -> None:
+    """One DiffusionGemma denoise step (`diffusion_gemma_tiny`): its weights
+    and text config, a fixed prompt, canvas and previous logits, and the fp32
+    reference logits with and without self-conditioning."""
+    model = diffusion_gemma_tiny(DIFFUSION_DENOISER_TEXT, canvas_length=4)
+    directory = save_diffusion_gemma(model, DIFFUSION_DENOISER_TEXT, "diffusion-gemma-denoise-tiny")
     prompt = np.array([[2, 5, 7, 9]], np.int32)
     canvas = np.array([[3, 4, 5, 6]], np.int32)
     prev = np.random.RandomState(3).randn(1, 4, 64).astype(np.float32)
@@ -1504,42 +1509,16 @@ def write_diffusion_window_tiny() -> None:
     The fp32 and float64 reference logits, the latter for the float64 rule.
     """
     from diffusers_wan_reference import float64
-    from safetensors.torch import save_file
-    from transformers.models.diffusion_gemma.configuration_diffusion_gemma import (
-        DiffusionGemmaConfig, DiffusionGemmaTextConfig,
-    )
-    from transformers.models.diffusion_gemma.modeling_diffusion_gemma import (
-        DiffusionGemmaForBlockDiffusion,
-    )
-    from transformers.models.gemma4.configuration_gemma4 import Gemma4VisionConfig
 
     fields = {**DIFFUSION_DENOISER_TEXT, "sliding_window": 4,
               "layer_types": ["sliding_attention", "full_attention"]}
-    text = DiffusionGemmaTextConfig(**{key: value for key, value in fields.items() if key != "model_type"})
-    vision = Gemma4VisionConfig(
-        hidden_size=32, intermediate_size=64, num_hidden_layers=1,
-        num_attention_heads=2, num_key_value_heads=2, head_dim=16, patch_size=8,
-        pooling_kernel_size=2, position_embedding_size=64)
     torch.manual_seed(0)
-    model = DiffusionGemmaForBlockDiffusion(DiffusionGemmaConfig(
-        text_config=text, vision_config=vision, canvas_length=6, tie_word_embeddings=False))
-    state = model.state_dict()
-    for name in list(state):
-        if name.startswith("model.decoder.layers.") or name in (
-                "model.decoder.embed_tokens.weight", "model.decoder.norm.weight"):
-            state[name].copy_(state[name.replace("model.decoder.", "model.encoder.language_model.", 1)])
-    model.load_state_dict(state)
-    model = model.float().eval()
+    model = diffusion_gemma_tiny(fields, canvas_length=6)
     # The experts' loop, since the grouped matmul has no float64 kernel.
     for module in model.modules():
         if hasattr(module, "experts") and hasattr(module.experts, "config"):
             module.experts.config._experts_implementation = "eager"
-    directory = FIXTURES / "diffusion-gemma-window-tiny"
-    directory.mkdir(parents=True, exist_ok=True)
-    save_file({name: tensor for name, tensor in model.state_dict().items()
-               if name.startswith(("model.encoder.language_model.", "model.decoder.")) or name == "lm_head.weight"},
-              directory / "model.safetensors")
-    (directory / "config.json").write_text(json.dumps(fields, indent=1) + "\n")
+    directory = save_diffusion_gemma(model, fields, "diffusion-gemma-window-tiny")
     prompt = np.array([[2, 5, 7, 9, 11, 13]], np.int32)
     canvas = np.array([[3, 4, 5, 6, 8, 10]], np.int32)
 
@@ -1803,6 +1782,7 @@ def main() -> None:
     write_qwen35_mm_tiny()
     write_diffusion_sc_tiny()
     write_diffusion_denoiser_tiny()
+    write_diffusion_window_tiny()
     write_released_config("diffusiongemma-26b", "google/diffusiongemma-26B-A4B-it")
     write_released_config("llada-8b", "GSAI-ML/LLaDA-8B-Base")
     write_released_config("dream-7b", "Dream-org/Dream-v0-Base-7B")

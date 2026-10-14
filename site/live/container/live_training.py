@@ -1,7 +1,8 @@
 """Bounds a live training cell to a couple of minutes on a shared 4-vCPU host.
 
 A training context runs Dew itself, not the stand-ins of model_client.
-`install` caps the batch of a `dew.data.load` dataset at BATCH and a
+`install` caps the batch of a dataset `dew.data.load` or a recipe's loader
+(`dew.config.data.loader`, which a recipe's `load` calls) reads at BATCH, and a
 `Trainer.fit` at STEPS steps, logging at least four times. Each cap prints
 what it changed before the run's own output, so the cell's first lines say
 how this run differs from the code on the page.
@@ -11,12 +12,12 @@ BATCH, STEPS = 8, 20
 
 
 def capped_load(load):
-    """`load`, with a batch over BATCH lowered to it."""
-    def capped(source, *, batch, **options):
-        if batch > BATCH:
-            print(f"Live run: batch {batch} -> {BATCH}, so it fits a shared 4-vCPU host.")
-            batch = BATCH
-        return load(source, batch=batch, **options)
+    """`load`, with a batch over BATCH lowered to it; a token budget's batch is not counted in rows."""
+    def capped(source, **options):
+        if (options.get("batch") or 0) > BATCH:
+            print(f"Live run: batch {options['batch']} -> {BATCH}, so it fits a shared 4-vCPU host.")
+            options["batch"] = BATCH
+        return load(source, **options)
     return capped
 
 
@@ -40,6 +41,7 @@ def capped_fit(fit):
 def install():
     import warnings
 
+    import dew.config.data
     import dew.data
     from dew.training import Trainer
 
@@ -47,3 +49,4 @@ def install():
     warnings.filterwarnings("ignore", message="IProgress not found")
 
     dew.data.load, Trainer.fit = capped_load(dew.data.load), capped_fit(Trainer.fit)
+    dew.config.data.loader = capped_load(dew.config.data.loader)

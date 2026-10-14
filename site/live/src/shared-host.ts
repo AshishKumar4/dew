@@ -1,6 +1,8 @@
 import { DurableObject } from 'cloudflare:workers';
 import { limitsOf } from './limits';
 export const SESSION_HEADER = 'X-Dew-Session';
+/** When a connection's session ends, in milliseconds since the epoch (shared_bridge.py's DEADLINE_HEADER). */
+export const DEADLINE_HEADER = 'X-Dew-Deadline';
 import { health, restore } from './container';
 import type { SnapshotGeneration } from './snapshots';
 
@@ -67,8 +69,7 @@ export class SharedHost extends DurableObject<Env> {
 		if (!container.running) {
 			if (generation.created + LIFETIME_MS <= Date.now()) throw new Error('this snapshot expired; the model is warming up');
 			restore(container, generation.snapshot, 'model host', { entrypoint: ['sh', '/opt/live/start-shared.sh'],
-				env: { DEW_SHARED_SECRET: secret, DEW_LIVE_IDLE_SECONDS: String(limits.idleSeconds),
-					DEW_LIVE_WALL_SECONDS: String(limits.wallSeconds) } });
+				env: { DEW_SHARED_SECRET: secret, DEW_LIVE_IDLE_SECONDS: String(limits.idleSeconds) } });
 			await this.ctx.storage.put('started', Date.now());
 		}
 		await container.setInactivityTimeout((limits.wallSeconds + limits.warmSeconds + 60) * 1000);

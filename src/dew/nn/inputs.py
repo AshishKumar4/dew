@@ -45,6 +45,16 @@ type FieldExtension = Callable[[jax.Array, jax.Array, int], jax.Array]
 PredictionPhase = Literal["ordinary", "extend", "draft"]
 
 
+def token_id(value: object, *, where: str) -> int:
+    """`value` read as one token id: a Python or NumPy integer, not a bool,
+    from 0 through int32's largest. Every parser of ids, a dataset's or a
+    request's, reads them by this law; `where` names what held the value."""
+    if (not isinstance(value, (int, np.integer)) or isinstance(value, (bool, np.bool_))
+            or not 0 <= int(value) <= np.iinfo(np.int32).max):
+        raise ValueError(f"{where} holds token ids, nonnegative int32 integers, got {value!r}")
+    return int(value)
+
+
 def pad_token_rows(rows: Sequence[Sequence[int]] | np.ndarray, *, pad_id: int = 0,
                    padding_side: Literal["left", "right"] = "left",
                    fields: Mapping[str, Sequence[Sequence[int]] | np.ndarray] | None = None

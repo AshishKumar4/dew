@@ -41,12 +41,13 @@ from pathlib import Path
 import jax
 import jax.numpy as jnp
 import numpy as np
+from flax import linen as nn
 from flax.core import freeze
 from jax.experimental import io_callback
 from reference_error import distance
 
 from dew.interop import Pretrained
-from dew.nn.fake_quant import fake_quant_fp4, fake_quant_fp8, straight_through
+from dew.nn.fake_quant import FakeQuantizing, fake_quant_fp4, fake_quant_fp8, straight_through
 from dew.nn.inputs import ModelInputs
 from dew.nn.multimodal import MultimodalTransformer
 from dew.objectives.base import Step
@@ -176,26 +177,26 @@ def decided(run, model, variables):
     a TPU only emulates float64, which cannot round (reduce_precision), and
     a GPU runs float64 at a fraction of its float32 rate.
 
-    Wrappers stand in for `dew.nn.deepseek_v4`'s quantizers and for
-    `jax.lax.top_k` while the runs trace or execute: the twin's hand each
-    decision to the host through an ordered callback, and the given run's
-    take them back through one in the same order and record the quantizer
-    inputs and top-k rows they meet. Returns the given run's result, the
-    twin's, and that record."""
-    from dew.nn import deepseek_v4
-
-    fp8, fp4, top_k = deepseek_v4.fake_quant_fp8, deepseek_v4.fake_quant_fp4, jax.lax.top_k
+    The layers' roundings (`FakeQuantizing`'s methods, through
+    `nn.intercept_methods`) and `jax.lax.top_k` are stood in for while the
+    runs trace or execute: the twin's hand each decision to the host through
+    an ordered callback, and the given run's take them back through one in
+    the same order and record the quantizer inputs and top-k rows they meet.
+    Returns the given run's result, the twin's, and that record."""
+    top_k = jax.lax.top_k
     made, record = [], Captured()
 
     def keep(value):
         made.append(np.asarray(value))
 
-    def exact(quantize):
-        def call(*args, **kwargs):
-            out = quantize(*args, **kwargs)
+    def rounds(context) -> bool:
+        return isinstance(context.module, FakeQuantizing) and context.method_name in ("fp8", "fp4")
+
+    def exact(call, args, kwargs, context):
+        out = call(*args, **kwargs)
+        if rounds(context):
             jax.debug.callback(keep, out, ordered=True)
-            return out
-        return call
+        return out
 
     def picked(values, k, is_stable=True):
         out = top_k(values, k, is_stable=is_stable)
@@ -235,18 +236,24 @@ def decided(run, model, variables):
         jax.debug.callback(selected, values, picks, ordered=True)
         return jnp.take_along_axis(values, picks, -1), picks
 
+    def replayed(call, args, kwargs, context):
+        if not rounds(context):
+            return call(*args, **kwargs)
+        return (window if context.method_name == "fp8" else fourbit)(*args, **kwargs)
+
     host = jax.devices("cpu")[0]
     try:
-        deepseek_v4.fake_quant_fp8, deepseek_v4.fake_quant_fp4, jax.lax.top_k = exact(fp8), exact(fp4), picked
-        with jax.enable_x64(new_val=True), jax.default_device(host):
+        jax.lax.top_k = picked
+        with nn.intercept_methods(exact), jax.enable_x64(new_val=True), jax.default_device(host):
             wide = run(*widened(model, jax.device_put(variables, host)))
             jax.effects_barrier()
         pending = iter(made)
-        deepseek_v4.fake_quant_fp8, deepseek_v4.fake_quant_fp4, jax.lax.top_k = window, fourbit, ranked
-        given = run(model, variables)
-        jax.effects_barrier()
+        jax.lax.top_k = ranked
+        with nn.intercept_methods(replayed):
+            given = run(model, variables)
+            jax.effects_barrier()
     finally:
-        deepseek_v4.fake_quant_fp8, deepseek_v4.fake_quant_fp4, jax.lax.top_k = fp8, fp4, top_k
+        jax.lax.top_k = top_k
     if next(pending, None) is not None:
         raise ValueError("the run leaves decisions its float64 twin made untaken")
     return given, wide, record

@@ -21,7 +21,13 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from interop_support import assert_layout_tensors, extract_fixture, fixture_arrays, scaled_gap
+from interop_support import (
+    assert_autoencoder_vjp,
+    assert_layout_tensors,
+    extract_fixture,
+    fixture_arrays,
+    scaled_gap,
+)
 from safetensors.numpy import load_file, save_file
 
 from dew.nn.autoencoders.dc_ae import DCAE, load_dc_ae
@@ -47,13 +53,10 @@ def channels_last(array):
     return np.asarray(array).transpose(0, 2, 3, 1)
 
 
-def parameter_gaps(layouts, gradients, reference, walk: str) -> dict[str, float]:
-    """Each native gradient of a source parameter, exported to its tensor's
-    layout, against the source's gradient of that tensor. The batch norms'
-    running statistics are buffers in the source, with no gradient."""
-    return {layout.name: scaled_gap(layout.export({"autoencoder": gradients}), reference[key])
-            for layout in layouts
-            if (key := f"{walk}.grad.{layout.name.removeprefix('vae/')}") in reference}
+def parameters(layouts):
+    """The layouts of the source's parameters: the batch norms' running
+    statistics are buffers in the source, with no gradient."""
+    return [layout for layout in layouts if not layout.name.endswith(("running_mean", "running_var"))]
 
 
 def test_every_published_tensor_is_mapped_and_exports_bit_identical(variant):
@@ -79,41 +82,21 @@ def test_the_quadratic_attention_matches_the_source(variant):
 def test_encoder_gradients_match_the_source(variant):
     _, (autoencoder, params, layouts, _), reference = variant
     model = autoencoder.model
-    probe = channels_last(reference["probe_latent"])
-
-    def objective(params, image):
-        latent = model.apply({"params": params}, image, method=model.encode)
-        return jnp.sum(latent * probe), latent
-
-    (_, latent), (grad_params, grad_image) = jax.value_and_grad(objective, argnums=(0, 1), has_aux=True)(
-        params, channels_last(reference["image"]))
+    latent = assert_autoencoder_vjp(
+        "encode", lambda params, image: model.apply({"params": params}, image, method=model.encode), params,
+        channels_last(reference["image"]), [channels_last(reference["probe_latent"])], parameters(layouts),
+        reference, channels_last(reference["encode.grad_image"]), GRADIENT)
     assert scaled_gap(latent, channels_last(reference["latent"])) < FORWARD
-    image_gap = scaled_gap(grad_image, channels_last(reference["encode.grad_image"]))
-    gaps = parameter_gaps(layouts, grad_params, reference, "encode")
-    worst = max(gaps, key=gaps.get)
-    print(f"encode: image gradient gap {image_gap:.3g}; worst parameter {worst} {gaps[worst]:.3g}")
-    assert image_gap < GRADIENT
-    assert gaps[worst] < GRADIENT, worst
 
 
 def test_decoder_gradients_match_the_source(variant):
     _, (autoencoder, params, layouts, _), reference = variant
     model = autoencoder.model
-    probe = channels_last(reference["probe"])
-
-    def objective(params, latent):
-        pixels = model.apply({"params": params}, latent, method=model.decode)
-        return jnp.sum(pixels * probe), pixels
-
-    (_, pixels), (grad_params, grad_code) = jax.value_and_grad(objective, argnums=(0, 1), has_aux=True)(
-        params, channels_last(reference["code"]))
+    pixels = assert_autoencoder_vjp(
+        "decode", lambda params, code: model.apply({"params": params}, code, method=model.decode), params,
+        channels_last(reference["code"]), [channels_last(reference["probe"])], parameters(layouts), reference,
+        channels_last(reference["decode.grad_code"]), GRADIENT)
     assert scaled_gap(pixels, channels_last(reference["pixels"])) < FORWARD
-    code_gap = scaled_gap(grad_code, channels_last(reference["decode.grad_code"]))
-    gaps = parameter_gaps(layouts, grad_params, reference, "decode")
-    worst = max(gaps, key=gaps.get)
-    print(f"decode: latent gradient gap {code_gap:.3g}; worst parameter {worst} {gaps[worst]:.3g}")
-    assert code_gap < GRADIENT
-    assert gaps[worst] < GRADIENT, worst
 
 
 def test_the_autoencoder_scales_as_the_pipeline_does(variant):
