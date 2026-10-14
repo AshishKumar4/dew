@@ -69,8 +69,8 @@ def through(chunk: int, starts, dy, dfinal):
 
 
 def summed_terms(operands, starts, dy, dfinal, chunk: int) -> dict[str, float]:
-    """The declared invariants of the two leaves that sum their cotangents over every token
-    (`assert_leaves_as_exact`), each the RMS over heads of its terms' absolute sum, in float64: `D`'s
+    """The terms of the two leaves that sum their cotangents over every token (`assert_leaves_as_exact`'s
+    `terms`), each the RMS over heads of its terms' absolute sum, in float64: `D`'s
     terms are `dy x`; `A`'s are each step's log-decay gradient times its step, a document's first token
     (whose decay is the reset) taking none, the gradient read from the XLA scan, which takes the decay
     `A dt` per step (`xla_chunk_scan`)."""
@@ -98,8 +98,8 @@ def summed_terms(operands, starts, dy, dfinal, chunk: int) -> dict[str, float]:
     if starts is not None:
         decay = np.where(np.asarray(starts)[..., None], 0.0, decay)
     skip = np.abs(np.asarray(dy, np.float64) * x).sum(axis=(0, 1, 3))
-    return {"['A']": float(np.sqrt(np.mean(np.abs(decay).sum(axis=(0, 1)) ** 2))),
-            "['D']": float(np.sqrt(np.mean(skip ** 2)))}
+    return {"A": float(np.sqrt(np.mean(np.abs(decay).sum(axis=(0, 1)) ** 2))),
+            "D": float(np.sqrt(np.mean(skip ** 2)))}
 
 
 # tools/mamba_ssd_reference.py's cases: bf16 and fp32 operands over packed documents, a ragged last chunk
@@ -156,8 +156,9 @@ def test_the_port_is_as_exact_as_mamba_ssm(case, heads):
         cotangents = widened((fixture["dy"], fixture["dfinal"]))
         truth = jax.tree.map(np.asarray, jax.jit(through(chunk, starts, *cotangents))(*widened(inputs)))
     reference = {name: fixture[f"mamba.{name}"] for name in ported}
-    assert_leaves_as_exact(ported, reference, truth, reductions=chunk,
-                           invariants=summed_terms(inputs, starts, fixture["dy"], fixture["dfinal"], chunk))
+    summed = summed_terms(inputs, starts, fixture["dy"], fixture["dfinal"], chunk)
+    terms = {name: np.full_like(leaf, summed[name]) if name in summed else leaf for name, leaf in truth.items()}
+    assert_leaves_as_exact(ported, reference, truth, reductions=chunk, terms=terms)
 
 
 @pytest.mark.parametrize("dtype, bound", [(jnp.float32, 1e-4), (jnp.bfloat16, 5e-2)])
