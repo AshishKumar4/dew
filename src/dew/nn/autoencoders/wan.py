@@ -430,11 +430,15 @@ class WanAutoencoder(AutoEncoder):
     `chunked_decode`), so a clip's length does not set the memory they hold.
     """
 
+    record_name = 'wan'
+    record_module = WanVAE
+
     def __init__(self, *, model: WanVAE, params: Variables, latents_mean, latents_std):
         self.model = model
         self.params = params
+        self.latents_std = np.asarray(latents_std, np.float32)
         self.latent_shift = np.asarray(latents_mean, np.float32)
-        self.latent_scale = 1.0 / np.asarray(latents_std, np.float32)
+        self.latent_scale = 1.0 / self.latents_std
         expected = (model.latent,)
         if self.latent_shift.shape != expected or self.latent_scale.shape != expected:
             raise ValueError(
@@ -444,6 +448,9 @@ class WanAutoencoder(AutoEncoder):
         self._encode = jax.jit(lambda params, video, key=None: posterior_latent(
             chunked_moments(model, {"params": params}, video), key))
         self._decode = jax.jit(lambda params, latents: chunked_decode(model, {"params": params}, latents))
+
+    def record_arguments(self) -> dict:
+        return {'latents_mean': self.latent_shift, 'latents_std': self.latents_std}
 
     @property
     def downscale_factor(self) -> int:
