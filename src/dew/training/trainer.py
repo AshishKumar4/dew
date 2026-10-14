@@ -1388,9 +1388,10 @@ class Trainer(Generic[Loss, Effects]):
     ) -> TrainState:
         """Train until the step or real-token cap is reached, resuming the latest checkpoint.
 
-        An explicit `state` takes precedence over initialization and checkpoint
-        restoration; its input reader starts at the position `dataset` supplies, not
-        at a checkpoint's data position.
+        An explicit `state` is the run's initial state, in place of initializing one
+        and of restoring a checkpoint: a float64 truth's widened copy of another
+        run's initial state, say. It is not a continuation, which is a checkpoint's
+        alone: its input reader starts at the position `dataset` supplies.
 
         Every `log_every` steps, the tracker receives the loss, the objective's
         metrics and the throughput.
