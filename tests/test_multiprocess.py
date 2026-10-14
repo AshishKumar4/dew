@@ -113,6 +113,19 @@ def token_corpus(directory: Path, records: int, seq_len: int) -> Path:
 
 
 @pytest.mark.distributed
+
+def test_a_field_no_step_reads_stays_on_the_host_across_processes(tmp_path):
+    """Each process places its share of the rows, so a batch as placed is
+    bigger than as read; the read mask is found by the placed signature, and
+    the step runs on the batch with its unread field left on the host."""
+    for report in run_pool("reads", tmp_path / "out", 2):
+        # The batch as read has a share of the rows, so its own signature names no mask.
+        assert report["read_differs_from_placed"]
+        assert report["unused_on_host"] and report["x_placed"]
+        # A stand-in of the placed rows, which the executable checks and drops.
+        assert report["unused_shape"] == [DEVICES]
+        assert report["sum"] == 3 * DEVICES
+
 def test_a_real_token_budget_agrees_across_processes_after_logging_ticks(tmp_path):
     corpus = token_corpus(tmp_path / "tokens", records=16, seq_len=4)
     reports = run_pool("token_budget", tmp_path / "pool", 2, devices=1, tokens=corpus, timeout=60)
