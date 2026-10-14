@@ -81,6 +81,7 @@ from dew.objectives.base import (
 from dew.objectives.lm.chunked import (
     chunked_tile,
     final_read,
+    fused_chunks,
     fused_head_loss,
     head_cross_entropy,
     head_table,
@@ -908,7 +909,11 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         being linear in the per-token cross entropies: a head the model holds
         as a table and tiles (`head_tile`, where its whole logits do not fit)
         then takes them with their gradient in its forward
-        (`chunked.fused_head_loss`), and the per-token results carry none.
+        (`chunked.fused_head_loss`), a tile's tokens at most a chunk, and the
+        per-token results carry none. It does so where one device's tokens
+        make more than one chunk (`chunked.fused_chunks`): one chunk holds all
+        their logits, which the tiled head bounds to a tile, so a step the
+        planner tiles to fit keeps the tiled head.
         Where the whole logits fit, they are kept: three products either way,
         and on an H100 the whole head ran Qwen3.5-0.8B's 4 x 3072 step at
         36.1% MFU against the fused head's 34.6%.
@@ -935,14 +940,17 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         kls = gathered.get(INDEXER_COLLECTION) if indexer else None
         kept = tuple(layer_output(gathered[INTERMEDIATES], index) for index in layers)
         predict = self.token_accuracy if predict is None else predict
-        table = (head_table(self.model, params) if z_loss is not None and self.head_tile is not None
-                 and reads_states(self.model) else None)
+        head = (head_table(self.model, params) if z_loss is not None and self.head_tile is not None
+                and reads_states(self.model) else None)
+        table = (head if head is not None and fused_chunks(
+            targets.shape, head.matrix.shape[0 if head.vocab_major else -1], self.head_tile) > 1 else None)
         dtype = jnp.promote_types(hidden.dtype, jnp.float32)
         weights = self._row_weights(prepared, roles, dtype)
         total = None
         if table is not None:
             total, (losses, predicted, log_z) = fused_head_loss(
-                hidden, table, targets, weights, z_loss=float(z_loss or 0.0), predict=predict)
+                hidden, table, targets, weights, z_loss=float(z_loss or 0.0), tile=self.head_tile,
+                predict=predict)
         else:
             losses, predicted, log_z = head_cross_entropy(
                 self.model, params, hidden, targets, self.head_chunks, tile=self.head_tile, predict=predict)
@@ -971,7 +979,7 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
                 depth_total = None
                 if table is not None:
                     depth_total, (depth_losses, _, _) = fused_head_loss(
-                        state, table, targets[:, depth:], depth_weights, predict=False)
+                        state, table, targets[:, depth:], depth_weights, tile=self.head_tile, predict=False)
                 else:
                     depth_losses, _, _ = head_cross_entropy(
                         self.model, params, state, targets[:, depth:], self.head_chunks,

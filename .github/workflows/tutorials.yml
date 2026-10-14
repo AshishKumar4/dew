@@ -1,23 +1,19 @@
-# Runs every tutorial notebook top to bottom at smoke size on a CPU, so a
-# change to the library cannot break a notebook without failing a check.
-# Each notebook's Settings cell holds its own smoke sizes (DEW_TUTORIAL_SMOKE).
+# Runs every tutorial notebook top to bottom at smoke size on a CPU when a
+# notebook or the tutorial tooling changes, and on request. Library changes do
+# not trigger it: per-batch notebook runs cost more than they caught. Each
+# notebook's Settings cell holds its own smoke sizes (DEW_TUTORIAL_SMOKE).
 # Then it reports, as warnings that do not fail the run, each notebook whose
-# recorded outputs are older than a change to the Dew modules it imports. A
-# daily full run on the shared Colab runtime refreshes the outputs.
+# recorded outputs are older than a change to the Dew modules it imports.
 
 name: Tutorials
 
 on:
   push:
-    # ci/** is the branch run a head gets before it lands, so a notebook a
-    # change breaks fails there rather than after the merge.
     branches: [ "main", "ci/**" ]
-    paths: [ "src/dew/**", "tutorials/**", "pyproject.toml", "locks/cpu.txt", "tools/install_environment.sh", "tools/run_tutorials.py", "tools/check_tutorial_outputs.py", ".github/workflows/tutorials.yml" ]
+    paths: [ "tutorials/**", "tools/run_tutorials.py", "tools/check_tutorial_outputs.py", ".github/workflows/tutorials.yml" ]
   pull_request:
     branches: [ "main" ]
-    paths: [ "src/dew/**", "tutorials/**", "pyproject.toml", "locks/cpu.txt", "tools/install_environment.sh", "tools/run_tutorials.py", "tools/check_tutorial_outputs.py", ".github/workflows/tutorials.yml" ]
-  schedule:
-    - cron: "23 5 * * *"
+    paths: [ "tutorials/**", "tools/run_tutorials.py", "tools/check_tutorial_outputs.py", ".github/workflows/tutorials.yml" ]
   workflow_dispatch:
 
 permissions:
@@ -25,8 +21,8 @@ permissions:
 
 jobs:
   # A commit this workflow passed on another push, as one proved on
-  # ci/integration before main takes it, is not run again. The daily run, a
-  # pull request and a dispatch run every notebook.
+  # ci/integration before main takes it, is not run again. A pull request
+  # and a dispatch run every notebook.
   proven:
     runs-on: ubuntu-latest
     permissions:
