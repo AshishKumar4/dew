@@ -27,13 +27,13 @@ come from is replaced: `models.vgg16(weights=IMAGENET1K_V1)` and
 from __future__ import annotations
 
 import hashlib
-import urllib.request
 from collections import namedtuple
 from pathlib import Path
 
 import numpy as np
 import torch
-from reference_source import definitions
+from lpips_weights import drawn_weights
+from reference_source import definitions, verified
 from torchvision import models
 
 REPAE = "https://raw.githubusercontent.com/End2End-Diffusion/REPA-E/2ad4e9f69234c109497fb41d3e5e555de7b4b0de/"
@@ -45,34 +45,6 @@ PUBLISHED = {"vgg16-397923af.pth": ("https://download.pytorch.org/models/vgg16-3
                          "082bb24f84c091ea94de2867d34c4544f68e0963/lpips/weights/v0.1/vgg.pth",
                          "a78928a0af1e5f0fcb1f3b9e8f8c3a2a5a3de244d830ad5c1feddc79b8432868")}
 LPIPS_MD5 = "d507d7349b931f0638a25a48a722f98a"
-CONVOLUTIONS = (0, 2, 5, 7, 10, 12, 14, 17, 19, 21, 24, 26, 28)
-CHANNELS = (64, 128, 256, 512, 512)
-
-
-def drawn_weights(seed: int = 0) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
-    """VGG16's `features` and the five linear heads, drawn in torchvision's
-    order from `np.random.default_rng(seed)`'s float32 uniforms: each kernel
-    He uniform over its fan-in, each bias uniform in [-0.01, 0.01), each
-    head's weights uniform in [0, 0.2). A uniform is integer bits times
-    2^-24 and the rest is float32 arithmetic, so every machine draws the
-    same bits. (numpy's float32 normals take their tail through libm's
-    log1pf, whose last bit differs between glibc 2.39 and 2.43.)"""
-    rng = np.random.default_rng(seed)
-
-    def uniform(shape, bound: float) -> np.ndarray:
-        return (rng.random(shape, dtype=np.float32) * np.float32(2) - np.float32(1)) * np.float32(bound)
-
-    vgg, inputs = {}, 3
-    for index, width in zip(CONVOLUTIONS, (64, 64, 128, 128, 256, 256, 256, 512, 512, 512, 512, 512, 512),
-                            strict=True):
-        vgg[f"features.{index}.weight"] = uniform((width, inputs, 3, 3), np.sqrt(6 / (9 * inputs)))
-        vgg[f"features.{index}.bias"] = uniform(width, 0.01)
-        inputs = width
-    linear = {f"lin{stage}.model.1.weight": rng.random((1, width, 1, 1), dtype=np.float32) * np.float32(0.2)
-              for stage, width in enumerate(CHANNELS)}
-    return vgg, linear
-
-
 def lpips_class(vgg: dict[str, torch.Tensor], linear: dict[str, torch.Tensor]) -> type:
     """REPA-E's `LPIPS` with its module scope, reading these weights."""
     names = {"LPIPS", "ScalingLayer", "NetLinLayer", "vgg16", "normalize_tensor", "spatial_average",
@@ -111,12 +83,7 @@ def distances(vgg, linear, images, references, dtype, *, gradient: bool) -> dict
 
 def published_file(name: str) -> Path:
     url, digest = PUBLISHED[name]
-    path = CACHE / name
-    if not path.is_file():
-        CACHE.mkdir(parents=True, exist_ok=True)
-        urllib.request.urlretrieve(url, path)
-    assert hashlib.sha256(path.read_bytes()).hexdigest() == digest, path
-    return path
+    return verified(url, CACHE / name, digest)
 
 
 def images(rng, count: int) -> tuple[np.ndarray, np.ndarray]:

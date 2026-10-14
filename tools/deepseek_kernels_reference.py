@@ -26,22 +26,20 @@ compiles with nvcc, which takes a host gcc of at most 14:
         ~/.cache/dew/reference-venvs/deepseek-v41/bin/python tools/deepseek_kernels_reference.py
 """
 
-import hashlib
 import importlib.util
 import json
 import subprocess
 import sys
 import tempfile
-import urllib.request
 from pathlib import Path
 
 import numpy as np
 import torch
 from deepseek_v41_kernels import E2M1
+from reference_source import CACHE, verified
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURE = ROOT / "tests" / "fixtures" / "codecs" / "deepseek_kernels.npz"
-CACHE = Path.home() / ".cache" / "dew" / "upstream"
 KERNELS = {
     "v3": ("https://raw.githubusercontent.com/{repo}/{commit}/inference/kernel.py",
            "deepseek-ai/DeepSeek-V3", "adecc0efbe2fda18945734168fce6e0df0d804c3",
@@ -59,13 +57,8 @@ V3_SHAPES = ((256, 384), (130, 259), (5, 7))
 def kernel(release: str):
     """One release's inference/kernel.py at its pinned commit, checked."""
     url, repo, commit, digest = KERNELS[release]
-    local = CACHE / repo / commit / "inference" / "kernel.py"
-    if not local.is_file():
-        local.parent.mkdir(parents=True, exist_ok=True)
-        local.write_bytes(urllib.request.urlopen(url.format(repo=repo, commit=commit)).read())
-    found = hashlib.sha256(local.read_bytes()).hexdigest()
-    if found != digest:
-        raise RuntimeError(f"{local} has SHA-256 {found}, not the pinned {digest}")
+    local = verified(url.format(repo=repo, commit=commit),
+                     CACHE / repo / commit / "inference" / "kernel.py", digest)
     spec = importlib.util.spec_from_file_location(f"{release}_kernel", local)
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module

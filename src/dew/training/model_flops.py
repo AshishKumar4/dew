@@ -54,14 +54,13 @@ def prepare_counts[Loss, Effects](objective: Objective[Loss, Effects], batch: Ba
     if any(name in batch for name in (TRAINING_FLOPS, TOKENS)):
         raise ValueError("the input batch contains reserved model-work telemetry columns")
     rows = rows_of(batch)
-    tokens = []
-    for index in range(rows):
-        row = jax.tree.map(lambda leaf, index=index: leaf[index:index + 1]
-                           if np.ndim(leaf) and np.shape(leaf)[0] == rows else leaf, batch)
-        if objective.counts_tokens:
-            tokens.append(np.sum(objective.real_lengths(row), dtype=np.uint64))
     counted = dict(batch)
     if objective.counts_tokens:
+        tokens = []
+        for index in range(rows):
+            row = jax.tree.map(lambda leaf, index=index: leaf[index:index + 1]
+                               if np.ndim(leaf) and np.shape(leaf)[0] == rows else leaf, batch)
+            tokens.append(np.sum(objective.real_lengths(row), dtype=np.uint64))
         counted[TOKENS] = _TokenCount.words(tokens)
     if count_model:
         # Partition the assembled scalar over the batch's row shards. A
