@@ -74,13 +74,16 @@ def as_rgb(pixels: np.ndarray) -> np.ndarray:
 
 
 
-def resize_image(image: np.ndarray, size: int) -> np.ndarray:
-    """`image` at `size` square; area interpolation down, cubic up."""
+def resize_image(image: np.ndarray, size: int | tuple[int, int]) -> np.ndarray:
+    """`image` at `size`, a square side or (height, width); area interpolation
+    where it shrinks along either side, cubic where it only grows."""
     import cv2
-    if image.shape[:2] == (size, size):
+
+    height, width = (size, size) if isinstance(size, int) else size
+    if image.shape[:2] == (height, width):
         return image
-    interpolation = cv2.INTER_AREA if max(image.shape[:2]) > size else cv2.INTER_CUBIC
-    return cv2.resize(image, (size, size), interpolation=interpolation)
+    shrinks = image.shape[0] > height or image.shape[1] > width
+    return cv2.resize(image, (width, height), interpolation=cv2.INTER_AREA if shrinks else cv2.INTER_CUBIC)
 
 
 @dataclasses.dataclass(frozen=True)

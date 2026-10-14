@@ -195,3 +195,12 @@ def test_host_image_augmentation_matches_across_workers_and_resumes_exactly():
     for expected, found in zip(serial[3:], resumed, strict=True):
         for name in expected:
             np.testing.assert_array_equal(expected[name], found[name])
+
+
+@pytest.mark.parametrize("size", [3, 1])
+def test_a_side_and_its_square_resize_alike(size):
+    """resize(n) and resize((n, n)) ask for one geometry, and by default pick one interpolation
+    for it, cubic up and area down, so they make the same pixels."""
+    row = {"image": np.array([[[64, 64, 64], [192, 192, 192]]], np.uint8)}
+    np.testing.assert_array_equal(images.resize(size).map(row)["image"],
+                                  images.resize((size, size)).map(row)["image"])
