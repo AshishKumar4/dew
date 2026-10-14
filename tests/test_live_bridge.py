@@ -80,12 +80,12 @@ class Kernels:
             if code.startswith(("import model_client", "import live_training")):
                 await self.phase("preload")
             elif code.startswith("sleep "):
+                # Its seconds, unless an interrupt ends it first, as an error.
                 self.interrupts[kernel].clear()
-                try:
-                    await asyncio.wait_for(self.interrupts[kernel].wait(), float(code.split()[1]))
-                    status = "error"
-                except TimeoutError:
-                    pass
+                waiting = asyncio.ensure_future(self.interrupts[kernel].wait())
+                done, _ = await asyncio.wait({waiting}, timeout=float(code.split()[1]))
+                waiting.cancel()
+                status = "error" if done else "ok"
             else:
                 await reply("stream", {"name": "stdout", "text": code})
             await reply("execute_reply", {"status": status, "execution_count": 1})
