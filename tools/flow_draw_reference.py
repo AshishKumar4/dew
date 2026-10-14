@@ -26,11 +26,9 @@ from __future__ import annotations
 
 import ast
 import contextlib
-import hashlib
 import json
 import tarfile
 import types
-import urllib.request
 from pathlib import Path
 
 import jax
@@ -38,7 +36,7 @@ import numpy as np
 import torch
 from diffusers import FlowMatchEulerDiscreteScheduler
 from diffusers.training_utils import compute_density_for_timestep_sampling, compute_loss_weighting_for_sd3
-from reference_source import selected, simple_statements
+from reference_source import CACHE, selected, simple_statements, verified
 
 from dew.diffusion.presets import Flow
 
@@ -62,11 +60,9 @@ its unshifted training table."""
 
 def published(name: str) -> str:
     file, digest = SCRIPTS[name]
-    url = f"https://raw.githubusercontent.com/huggingface/diffusers/{COMMIT}/examples/dreambooth/{file}"
-    text = urllib.request.urlopen(url, timeout=120).read()
-    if hashlib.sha256(text).hexdigest() != digest:
-        raise SystemExit(f"{url} is not the pinned file")
-    return text.decode()
+    path = f"examples/dreambooth/{file}"
+    return verified(f"https://raw.githubusercontent.com/huggingface/diffusers/{COMMIT}/{path}",
+                    CACHE / "diffusers" / COMMIT / path, digest).read_text()
 
 
 def defaults(text: str) -> dict[str, object]:
