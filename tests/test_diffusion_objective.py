@@ -15,7 +15,7 @@ import pytest
 from diffusion_stubs import RES, StubText
 from flax import linen as nn
 
-from dew.data import Dataset
+from dew.data.dataset import Loader
 from dew.diffusion import broadcast_rates, expand, presets
 from dew.inputs import CharTable, Condition, Field, InputSpec, unit_range
 from dew.nn.backbones import SimpleDiT, SimpleMMDiT
@@ -203,7 +203,7 @@ def test_a_checkpoint_of_this_state_resumes_in_place(tmp_path):
         return Trainer(make_objective(), optax.adam(1e-3), key=jax.random.PRNGKey(0),
                        checkpoints=Checkpoints(str(tmp_path), keep=1))
 
-    data = Dataset(train=lambda partition: Stream(), val=None, records=None, batch=8)
+    data = Loader(train=lambda partition: Stream(), val=None, records=None, batch=8)
     first = trainer()
     first.fit(data, steps=1, log_every=100, checkpoint_every=1)
     assert first.checkpoints is not None
