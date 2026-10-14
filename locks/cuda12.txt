@@ -386,6 +386,8 @@ importlib-metadata==9.0.1
     # via
     #   diffusers
     #   mlflow-skinny
+importlib-resources==7.1.0
+    # via dewml (pyproject.toml)
 iniconfig==2.3.1
     # via pytest
 ipykernel==7.4.0
