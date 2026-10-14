@@ -68,7 +68,7 @@ const liveEnabled = Boolean(live.endpoint && live.turnstileSitekey);
 </div>
 
 <script>
-	import type { LiveSession, Output } from '../../scripts/live';
+	import type { Output } from '../../scripts/live';
 	import { renderOutput } from '../../scripts/live';
 	import { liveCell } from '../../scripts/landing-kernel';
 
@@ -88,9 +88,6 @@ const liveEnabled = Boolean(live.endpoint && live.turnstileSitekey);
 		const output = q<HTMLElement>('[data-output]');
 		const holder = q<HTMLElement>('[data-turnstile]');
 
-		// The session the sampler last ran on, and whether it has compiled the sampler yet.
-		let last: LiveSession | undefined;
-		let compiled = false;
 		let stopping = false;
 		let failure: string | undefined;
 		let ticker: number | undefined;
@@ -126,7 +123,6 @@ const liveEnabled = Boolean(live.endpoint && live.turnstileSitekey);
 				}
 				if (report?.step !== undefined && report.steps) {
 					untick();
-					compiled = true;
 					show('sampling', `Step ${report.step} of ${report.steps}`, report.step / report.steps);
 					if (message.png) {
 						preview.src = image(message.png);
@@ -174,14 +170,9 @@ const liveEnabled = Boolean(live.endpoint && live.turnstileSitekey);
 			kernel: (text) => {
 				if (!stopping) show('starting', text.replace(/…$/, ''));
 			},
-			begin: (session) => {
-				if (session !== last) {
-					last = session;
-					compiled = session.warm;
-				}
-				// A cold kernel compiles the sampler before its first step (about 15 s on the preview's 4 vCPUs);
-				// a warm spare compiled it before it was handed out.
-				show('sampling', compiled ? 'Sampling' : 'Starting the sampler; a new kernel compiles it first');
+			// The model service compiled the sampler before the host took sessions (model_service.py).
+			begin: () => {
+				show('sampling', 'Sampling');
 				tick('Running');
 				return onOutput;
 			},
