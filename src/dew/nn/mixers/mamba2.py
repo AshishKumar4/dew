@@ -453,31 +453,27 @@ class Mamba2(nn.Module):
             state_size=self.state_size, chunk_size=self.chunk_size,
             time_step_limit=self.time_step_limit)
         shards = sequence_shards()
-        if decode or valid is not None:
-            if shards > 1:
+        if shards > 1:
+            if decode or valid is not None:
                 raise LayoutRefused(
                     f"mamba2 under a sequence axis of {shards} runs whole training sequences; "
                     "decoding and rows with padding slots (attention_metadata.valid) hold one "
                     "state per row. Run them on a mesh with sequence=1.")
-            out = held_scan(self, mixed, taps, bias, functools.partial(scan, dt=dt, heads=heads),
-                            (self.num_heads, self.head_dim, self.state_size),
-                            decode=decode, coordinates=tokens, state_dtype=wide, conv_dtype=wide,
-                            dtype=compute)
-            if out is None:
-                # Allocation only, as the delta net: init_cache's dummy token
-                # must not consume a position or leave state behind.
-                return self.out_proj(jnp.zeros((batch, length, self.intermediate_size), self.dtype))
-            if valid is not None:
-                out = jnp.where(valid[:, :, None], out, 0)
-        elif shards > 1:
             # Wide across the shards, so a halo's gradient and its shard's own add before rounding.
-            out = _over_sequence(functools.partial(_sequence_mix, scan=scan, dtype=compute,
-                                                   axis=SEQUENCE_AXIS),
+            out = _over_sequence(functools.partial(_sequence_mix, scan=scan, dtype=compute),
                                  shards, mixed.astype(wide), dt, tokens.segments, tokens.starts,
                                  (taps, bias, *heads))
-        else:
-            out = _sequence_mix(mixed, dt, tokens.segments, tokens.starts, (taps, bias, *heads), scan=scan,
-                                dtype=compute)
+            return self.out_proj(self.norm(out, gate))
+        out = held_scan(self, mixed, taps, bias, functools.partial(scan, dt=dt, heads=heads),
+                        (self.num_heads, self.head_dim, self.state_size),
+                        decode=decode, coordinates=tokens, state_dtype=wide, conv_dtype=wide,
+                        dtype=compute)
+        if out is None:
+            # Allocation only, as the delta net: init_cache's dummy token
+            # must not consume a position or leave state behind.
+            return self.out_proj(jnp.zeros((batch, length, self.intermediate_size), self.dtype))
+        if valid is not None:
+            out = jnp.where(valid[:, :, None], out, 0)
         return self.out_proj(self.norm(out, gate))
 
 
@@ -522,42 +518,34 @@ def _ssd(convolved, dt, heads, *, num_heads: int, head_dim: int, n_groups: int,
     return out.reshape(batch, length, intermediate), final
 
 
-def _sequence_mix(mixed, dt, segments, starts, weights, *, scan, dtype, axis: str | None = None):
-    """The conv and the scan over whole training sequences, or over this
-    shard's slice of them inside a `shard_map` that holds `axis` manual.
+def _sequence_mix(mixed, dt, segments, starts, weights, *, scan, dtype):
+    """The conv and the scan over this shard's slice of whole training
+    sequences, inside a `shard_map` that holds the sequence axis manual; a
+    single shard runs `held_scan` instead.
 
     `mixed` `[B, S, conv_dim]` the projection, convolved in at least fp32
     and handed to the scan in `dtype`, the model's compute dtype, `dt`
     `[B, S, H]` in fp32, `segments` `[B, S]` and their documents' `starts` or None, `weights` the
-    conv's taps and bias and the heads' `dt_bias`, `A` and `D`. Under `axis`
-    the conv reads the previous shard's last `K-1` tokens and segments by one
-    `ppermute` (zeros on the first) and the scan is corrected for the earlier
-    shards' state (`_ssd`). A segment change resets both wherever it falls."""
+    conv's taps and bias and the heads' `dt_bias`, `A` and `D`. The conv reads
+    the previous shard's last `K-1` tokens and segments by one `ppermute`
+    (zeros on the first) and the scan is corrected for the earlier shards'
+    state (`_ssd`). A segment change resets both wherever it falls."""
     taps, bias, dt_bias, A, D = weights
     width = taps.shape[1] - 1
-    batch, length, channels = mixed.shape
-    history = rows_like(jnp.zeros((batch, width, channels), mixed.dtype), mixed)
-    forward = None
-    if axis is not None:
-        if length < width:
-            raise LayoutRefused(
-                f"each sequence shard holds {length} tokens, fewer than the {width} the "
-                f"conv reads behind its first; use fewer sequence shards or longer sequences")
-        shards = jax.lax.axis_size(axis)
-        forward = [(shard, shard + 1) for shard in range(shards - 1)]
-        history = jax.lax.ppermute(mixed[:, length - width:], axis, forward)
-    if segments is None and forward is None:
-        convolved = causal_conv1d(mixed, taps, bias=bias, dtype=dtype)
-    elif segments is None:
+    length = mixed.shape[1]
+    if length < width:
+        raise LayoutRefused(
+            f"each sequence shard holds {length} tokens, fewer than the {width} the "
+            f"conv reads behind its first; use fewer sequence shards or longer sequences")
+    forward = [(shard, shard + 1) for shard in range(jax.lax.axis_size(SEQUENCE_AXIS) - 1)]
+    history = jax.lax.ppermute(mixed[:, length - width:], SEQUENCE_AXIS, forward)
+    if segments is None:
         stream = jnp.concatenate([history, mixed], axis=1)
         convolved = causal_conv1d(stream, taps, bias=bias, dtype=dtype)[:, width:]
     else:
-        if forward is None:
-            before = jnp.broadcast_to(segments[:, :1], (batch, width))
-        else:
-            before = jax.lax.ppermute(segments[:, length - width:], axis, forward)
+        before = jax.lax.ppermute(segments[:, length - width:], SEQUENCE_AXIS, forward)
         convolved = document_conv1d(history, mixed, before, segments, taps, bias).astype(dtype)
-    out, _ = scan(convolved, dt, (dt_bias, A, D), starts=starts, axis=axis)
+    out, _ = scan(convolved, dt, (dt_bias, A, D), starts=starts, axis=SEQUENCE_AXIS)
     return out
 
 

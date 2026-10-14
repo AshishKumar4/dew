@@ -294,8 +294,18 @@ def held_conv1d(x, kernel, valid, held=None, *, bias=None, segments=None, right_
         ends = jnp.sum(valid, axis=1, dtype=jnp.int32)
         rows = (ends[:, None] + jnp.arange(width)[None, :])[:, :, None]
         return conv(x, valid=valid), jnp.take_along_axis(stream, rows, axis=1)
-    if valid is not None or segments is not None:
-        valid = jnp.ones(x.shape[:2], bool) if valid is None else valid
+    if valid is None and segments is not None:
+        # Every slot real: each packed document convolves alone where it stands (`document_conv1d`), the
+        # held history counting as the first's, without the masked conv's gathers over every slot; the
+        # history left keeps only the last document's tokens, as `_masked_conv1d`'s does.
+        state = rows_like(jnp.zeros((x.shape[0], width, x.shape[2]), x.dtype), x) if held is None else held
+        before = jnp.broadcast_to(segments[:, :1], (x.shape[0], width))
+        out = document_conv1d(state, x, before, segments, kernel, bias)
+        kept = jnp.concatenate([before, segments], axis=1)[:, -width:]
+        history = jnp.where((kept == segments[:, -1:])[:, :, None],
+                            jnp.concatenate([state, x], axis=1)[:, -width:], 0)
+        return conv_pieces(out, parts, x.dtype if dtype is None else dtype), history
+    if valid is not None:
         return _masked_conv1d(x, kernel, valid, held, bias=bias, segments=segments, parts=parts, dtype=dtype)
     history = x if held is None else jnp.concatenate([held, x], axis=1)
     return conv(x), history[:, -width:]
