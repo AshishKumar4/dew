@@ -10,35 +10,14 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from reference_error import assert_computes_the_oracle, chain_roundings
+from tool_support import load
 
 from dew.artifacts import ImageGrid
 from dew.eval import LPIPS
 from dew.eval.lpips import LPIPSNetwork, variables_from_torch
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "lpips"
-CONVOLUTIONS = (0, 2, 5, 7, 10, 12, 14, 17, 19, 21, 24, 26, 28)
-WIDTHS = (64, 64, 128, 128, 256, 256, 256, 512, 512, 512, 512, 512, 512)
-CHANNELS = (64, 128, 256, 512, 512)
-
-
-def drawn_weights(seed: int = 0) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
-    """The tool's `drawn_weights`: torchvision's order from
-    `np.random.default_rng(seed)`'s float32 uniforms, kernels He uniform,
-    biases in [-0.01, 0.01), heads in [0, 0.2): integer bits and float32
-    arithmetic, the same bits on every machine."""
-    rng = np.random.default_rng(seed)
-
-    def uniform(shape, bound: float) -> np.ndarray:
-        return (rng.random(shape, dtype=np.float32) * np.float32(2) - np.float32(1)) * np.float32(bound)
-
-    vgg, inputs = {}, 3
-    for index, width in zip(CONVOLUTIONS, WIDTHS, strict=True):
-        vgg[f"features.{index}.weight"] = uniform((width, inputs, 3, 3), np.sqrt(6 / (9 * inputs)))
-        vgg[f"features.{index}.bias"] = uniform(width, 0.01)
-        inputs = width
-    linear = {f"lin{stage}.model.1.weight": rng.random((1, width, 1, 1), dtype=np.float32) * np.float32(0.2)
-              for stage, width in enumerate(CHANNELS)}
-    return vgg, linear
+drawn_weights = load("lpips_weights").drawn_weights
 
 
 def test_the_distance_and_its_gradient_are_repa_es():
