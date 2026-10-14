@@ -98,7 +98,6 @@ class LMRunConfig(RunConfig):
         or a fresh draw from the run's key, so the objective trains its factors
         alone. Perplexity scores each validation pass.
         """
-        self = dataclasses.replace(self, trainer=self.trainer.derived())
         tokens = self.tokens()
         written, vocab_size = token_vocabulary(tokens)
         if self.tokenizer != written:

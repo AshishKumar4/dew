@@ -45,7 +45,7 @@ from dew.inference.tasks import Processor, recorded_tokenizer
 from dew.inputs import Field, InputSpec
 from dew.nn.backbones.causal_transformer import INTERMEDIATES, layer_output, layer_outputs
 from dew.nn.flops import MissingFlopsCount, counted_flops
-from dew.nn.inputs import ModelInputs
+from dew.nn.inputs import Coordinates, ModelInputs
 from dew.nn.mla import INDEXER, INDEXER_COLLECTION
 from dew.nn.moe import RouterMoments, global_router_loss, load_balance_update, sequence_router_losses
 from dew.nn.protocols import (
@@ -267,15 +267,18 @@ def _leaves(tree: Variables) -> dict[tuple[str, ...], jax.Array]:
 
 
 def _prepared(tokens: ModelInputs | jax.Array, segment_ids: jax.Array | None = None,
-              positions: jax.Array | None = None) -> ModelInputs:
+              positions: jax.Array | None = None, coordinates: Coordinates | None = None) -> ModelInputs:
     """The rows as `ModelInputs`, bare ids cast to int32, their packing among the token fields.
 
-    A packed batch names each row's `segment_ids` and `positions` either in
-    columns beside the ids or in its `ModelInputs`; a field named both ways
-    is refused. Everything after reads the packing off what this returns.
+    A packed batch from a data pipeline carries its windows' `coordinates`
+    (`dew.nn.inputs.Coordinates`, the packer's); a rollout's names each row's
+    `segment_ids` and `positions`. Either comes beside the ids or in the
+    `ModelInputs`; a field named both ways is refused. Everything after reads
+    the packing off what this returns (`documents_of`).
     """
     prepared = tokens if isinstance(tokens, ModelInputs) else ModelInputs(jnp.asarray(tokens, jnp.int32))
-    columns = {name: column for name, column in (("positions", positions), ("segment_ids", segment_ids))
+    columns = {name: column for name, column in (("positions", positions), ("segment_ids", segment_ids),
+                                                 ("coordinates", coordinates))
                if column is not None}
     for name in columns:
         if name in prepared.token_fields:
@@ -336,12 +339,22 @@ def _unpadded(values: jax.Array, padding: jax.Array) -> tuple[jax.Array, jax.Arr
 
 def batch_text(batch) -> ModelInputs:
     """The batch's `text` rows as `_prepared` gives them, a packed batch's
-    `text_segment_ids` and `text_positions` columns folded in."""
-    segment_ids = batch.get("text_segment_ids")
-    positions = batch.get("text_positions")
-    return _prepared(batch[TEXT_KEY],
-                     None if segment_ids is None else jnp.asarray(segment_ids, jnp.int32),
-                     None if positions is None else jnp.asarray(positions, jnp.int32))
+    `text_coordinates` folded in."""
+    stale = sorted({"text_segment_ids", "text_positions"} & set(batch))
+    if stale:
+        raise ValueError(f"a packed batch lays its documents out in text_coordinates "
+                         f"(dew.nn.inputs.coordinates), not {', '.join(stale)}")
+    laid = batch.get("text_coordinates")
+    return _prepared(batch[TEXT_KEY], coordinates=None if laid is None else jax.tree.map(jnp.asarray, laid))
+
+
+def documents_of(fields: Mapping[str, jax.Array | Coordinates]) -> jax.Array | None:
+    """The document of each token the token fields name: their coordinates'
+    segments, or a rollout's `segment_ids`; None for rows of one document."""
+    laid, segments = fields.get("coordinates"), fields.get("segment_ids")
+    if isinstance(laid, Coordinates):
+        return laid.segments
+    return None if isinstance(segments, Coordinates) else segments
 
 
 def text_preview[S](phase: str, setup: Callable[[], S | None],
@@ -657,7 +670,8 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         raw = batch[TEXT_KEY]
         prepared = raw if isinstance(raw, ModelInputs) else ModelInputs(raw)
         fields = prepared.token_fields
-        documents = batch.get("text_segment_ids", fields.get("segment_ids"))
+        laid = batch.get("text_coordinates")
+        documents = laid.segments if isinstance(laid, Coordinates) else documents_of(fields)
         mask = fields.get("attention_mask")
         return (np.asarray(prepared.tokens), None if mask is None else np.asarray(mask, bool),
                 None if documents is None else np.asarray(documents))
@@ -1021,7 +1035,7 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
                 f"{tuple(prepared.tokens.shape)} ids; the roles align with the input "
                 "tokens, one per token")
         return scored_targets(jnp, prepared.tokens, self.pad_id, fields.get("attention_mask"),
-                              fields.get("segment_ids"), roles=roles,
+                              documents_of(fields), roles=roles,
                               role=None if self.loss_role is None else int(self.loss_role)).astype(dtype)
 
     def _depth_weights(self, prepared, roles, dtype, depth: int):
@@ -1029,7 +1043,7 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         p scores the target d further out (`scored_targets`)."""
         fields = prepared.token_fields
         return scored_targets(jnp, prepared.tokens, self.pad_id, fields.get("attention_mask"),
-                              fields.get("segment_ids"), depth, roles=roles,
+                              documents_of(fields), depth, roles=roles,
                               role=None if self.loss_role is None else int(self.loss_role)).astype(dtype)
 
     def tile_head(self, tile: tuple[int, int] | None = None) -> str | None:
@@ -1140,7 +1154,7 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         inputs = prepared.tokens[:, :-1]
         weights = (jnp.ones_like(inputs, dtype) if self.pad_id is None
                    else (inputs != self.pad_id).astype(dtype))
-        documents = prepared.token_fields.get("segment_ids")
+        documents = documents_of(prepared.token_fields)
         if documents is not None:
             weights = weights * (documents[:, :-1] != 0).astype(dtype)
         valid = prepared.token_fields.get("attention_mask")

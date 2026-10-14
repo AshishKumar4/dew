@@ -37,7 +37,7 @@ from dew.nn.backbones.unet_condition import UNet2DCondition
 from dew.nn.backbones.wan import WanTransformer
 from dew.nn.backbones.z_image import ZImageTransformer
 from dew.nn.diffusion_gemma import DiffusionGemma
-from dew.nn.inputs import ModelInputs
+from dew.nn.inputs import ModelInputs, coordinates
 from dew.nn.multimodal import MultimodalTransformer, VisionConditioner
 from dew.nn.vision import ProjectorBase, TowerBase
 from dew.objectives.base import Objective, Variables
@@ -91,13 +91,16 @@ class _DenoisingTextTable(ConditionEncoder[str]):
                 "guidance": self.guidance, "masked": self.masked}
 
 
-def mesh_spec(mesh: Mapping[str, int]) -> MeshSpec:
-    """The `MeshSpec` a case's mesh record names, refusing a field it lacks."""
+def trainer_mesh(mesh: Mapping[str, int]) -> dict[str, object]:
+    """The trainer's `mesh` and `microbatches` a case's mesh record names: its
+    MeshSpec fields and the pipeline's microbatches, refusing a field it lacks."""
     fields = {f.name for f in dataclasses.fields(MeshSpec)}
-    unknown = sorted(set(mesh) - fields)
+    unknown = sorted(set(mesh) - fields - {"microbatches"})
     if unknown:
-        raise ValueError(f"mesh has no field {unknown}; MeshSpec's fields are {sorted(fields)}")
-    return MeshSpec(**mesh)
+        raise ValueError(f"mesh has no field {unknown}; it names MeshSpec's fields {sorted(fields)} "
+                         f"and microbatches")
+    return {"mesh": MeshSpec(**{name: value for name, value in mesh.items() if name != "microbatches"}),
+            "microbatches": mesh.get("microbatches")}
 
 
 def media_values(case: Case) -> tuple[str, TowerBase, ProjectorBase, int]:
@@ -256,7 +259,7 @@ def build_trainer(case: Case, attention_impl: str = 'auto',
     so the step reads it whole and climbs the remat ladder where it must."""
     trainer = Trainer(
         build_objective(case, attention_impl), optimizer or optax.adam(1e-4), key=jax.random.key(0),
-        mesh=mesh_spec(case.mesh), layout=Layout(min_shard=case.fsdp_min_param_size),
+        **trainer_mesh(case.mesh), layout=Layout(min_shard=case.fsdp_min_param_size),
         accumulation=case.accumulation, split=1, checkpoints=None, tracker=None)
     if case.device_order is not None:
         by_id = {device.id: device for device in jax.devices()}
@@ -355,9 +358,11 @@ def global_batch(case: Case) -> Batch:
             per_document = -(-width // case.packed_documents)
             document = np.repeat(np.arange(case.packed_documents), per_document)[:width]
             rows = (case.batch_size, 1)
-            batch["text_segment_ids"] = np.tile(document + 1, rows).astype(np.int32)
-            batch["text_positions"] = np.tile(
-                np.arange(width) - document * per_document, rows).astype(np.int32)
+            # As the packer lays a batch out (`dew.data.steps.generic.Coordinated`).
+            positions = np.arange(width) - document * per_document
+            batch["text_coordinates"] = coordinates(
+                segments=np.tile(document + 1, rows), positions=np.tile(positions, rows),
+                max_segments=case.packed_documents + 1, right_padded=True, xp=np)
     else:
         sample_key = "video" if case.frames else "image"
         batch[sample_key] = rng.integers(

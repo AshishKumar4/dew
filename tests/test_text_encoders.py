@@ -34,13 +34,14 @@ multiplies the logits after (modeling_clip.py, eager_attention_forward).
 
 import json
 import os
+import shutil
 from pathlib import Path
 
 import numpy as np
 import pytest
 
-from dew.inputs import CLIPText, Condition, Field, InputSpec
-from dew.nn.text_encoders import CLIPModel, CLIPTextModel, CLIPTextTransformer, translate_config
+from dew.inputs import CLIPText, Condition, Field, InputSpec, T5Text
+from dew.nn.text_encoders import CLIPModel, translate_config
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "clip"
 TINY = FIXTURES / "tiny"
@@ -81,6 +82,12 @@ def largest_difference(actual, expected) -> float:
     return float(np.max(np.abs(np.asarray(actual, np.float32) - expected)))
 
 
+def hidden(encoder, ids, mask) -> np.ndarray:
+    """The encoder's last hidden state for `ids` under `mask`."""
+    tokens = {"input_ids": ids, "attention_mask": mask}
+    return np.asarray(encoder.encode(encoder.params, tokens).hidden, np.float32)
+
+
 def test_translating_inside_a_module_keeps_its_native_parameter_names():
     import jax
     import jax.numpy as jnp
@@ -106,9 +113,9 @@ def test_tiny_checkpoint_matches_the_reference():
     """Both towers of a CLIP checkpoint in one file, the text one loaded out of
     it, run on the reference's own token ids."""
     expected = reference(TINY)
-    model = CLIPTextModel.from_pretrained(str(TINY))
+    encoder = CLIPText.from_pretrained(str(TINY))
 
-    outputs = model(expected["input_ids"], expected["attention_mask"])
+    outputs = encoder.transformer.apply(encoder.params, expected["input_ids"], expected["attention_mask"])
 
     hidden = float(np.max(np.abs(np.asarray(outputs.last_hidden_state, np.float32)
                                  - expected["last_hidden_state"])))
@@ -119,7 +126,7 @@ def test_tiny_checkpoint_matches_the_reference():
 
     ids = expected["input_ids"]
     rows = np.arange(ids.shape[0])
-    eos = np.argmax(ids == model.config["eos_token_id"], axis=-1)
+    eos = np.argmax(ids == encoder.transformer.eos_token_id, axis=-1)
     np.testing.assert_array_equal(np.asarray(outputs.pooler_output, np.float32),
                                   np.asarray(outputs.last_hidden_state, np.float32)[rows, eos])
     assert (np.argmax(ids, axis=-1) != eos).any()
@@ -170,13 +177,13 @@ def test_padding_is_masked_where_the_reference_masks_it():
     rows by 4.4, which the parity fixture would catch."""
     expected = reference(TINY)
     ids, mask = expected["input_ids"], expected["attention_mask"]
-    model = CLIPTextModel.from_pretrained(str(TINY))
+    encoder = CLIPText.from_pretrained(str(TINY))
     real = mask.astype(bool)
 
     filled = np.where(real, ids, 7).astype(np.int32)
-    baseline = np.asarray(model(ids, mask).last_hidden_state, np.float32)
-    refilled = np.asarray(model(filled, mask).last_hidden_state, np.float32)
-    unmasked = np.asarray(model(ids, np.ones_like(mask)).last_hidden_state, np.float32)
+    baseline = hidden(encoder, ids, mask)
+    refilled = hidden(encoder, filled, mask)
+    unmasked = hidden(encoder, ids, np.ones_like(mask))
 
     assert np.array_equal(baseline[real], refilled[real])
     assert np.array_equal(baseline[real], unmasked[real])
@@ -188,13 +195,13 @@ def test_attention_stays_causal():
     after its own position."""
     expected = reference(TINY)
     ids, mask = expected["input_ids"], expected["attention_mask"]
-    model = CLIPTextModel.from_pretrained(str(TINY))
+    encoder = CLIPText.from_pretrained(str(TINY))
     position = 3
 
     changed = ids.copy()
     changed[:, position] = 5
-    baseline = np.asarray(model(ids, mask).last_hidden_state, np.float32)
-    moved = np.asarray(model(changed, mask).last_hidden_state, np.float32)
+    baseline = hidden(encoder, ids, mask)
+    moved = hidden(encoder, changed, mask)
 
     assert np.array_equal(baseline[:, :position], moved[:, :position])
     assert np.max(np.abs(baseline[:, position] - moved[:, position])) > 0.1
@@ -206,10 +213,10 @@ def test_legacy_eos_token_id_pools_the_argmax_row():
     checkpoint takes this branch, so it has to be the config's choice."""
     expected = reference(TINY)
     ids, mask = expected["input_ids"], expected["attention_mask"]
-    loaded = CLIPTextModel.from_pretrained(str(TINY))
-    legacy = CLIPTextTransformer(**{**loaded.config, "eos_token_id": 2})
+    encoder = CLIPText.from_pretrained(str(TINY))
+    legacy = encoder.transformer.clone(eos_token_id=2)
 
-    outputs = legacy.apply(loaded.variables, ids, mask)
+    outputs = legacy.apply(encoder.params, ids, mask)
     hidden = np.asarray(outputs.last_hidden_state, np.float32)
     rows = np.arange(ids.shape[0])
 
@@ -337,41 +344,40 @@ def test_the_real_checkpoint_embeddings_match_the_reference():
 
 @pytest.mark.parametrize("kind", ["clip-text", "clip", "t5"])
 def test_public_text_encoder_storage_is_separate_from_compute(kind, tmp_path):
+    """`dtype` sets the compute and `param_dtype` the stored weights, each
+    leaf the FP32 master cast; supplied variables are bound as they are, from
+    a directory holding no weights, and encode as the loaded ones do."""
     import jax
     import jax.numpy as jnp
     from flax.core import freeze
 
-    from dew.nn.text_encoders import T5EncoderModel
-
-    cls = {"clip-text": CLIPTextModel, "clip": CLIPModel, "t5": T5EncoderModel}[kind]
+    load = {"clip-text": CLIPText.from_pretrained, "clip": CLIPModel.from_pretrained,
+            "t5": T5Text.from_pretrained}[kind]
     directory = Path(__file__).resolve().parent / "fixtures/t5/tiny" if kind == "t5" else TINY
-    masters = cls.from_pretrained(str(directory), dtype=jnp.bfloat16)
-    native = cls.from_pretrained(str(directory), dtype=jnp.float32, param_dtype="bfloat16")
-    if kind == "clip":
-        assert isinstance(native, CLIPModel)
-        assert native.module.dtype == jnp.float32
+    masters = load(str(directory), dtype=jnp.bfloat16)
+    native = load(str(directory), dtype=jnp.float32, param_dtype="bfloat16")
+    if isinstance(native, CLIPModel):
+        assert isinstance(masters, CLIPModel) and native.module.dtype == jnp.float32
+        stored = (masters.variables, native.variables)
     else:
-        assert isinstance(native, (CLIPTextModel, T5EncoderModel))
-        assert native.transformer.dtype == jnp.float32
-    assert jax.tree.structure(masters.variables) == jax.tree.structure(native.variables)
-    for before, after in zip(
-        jax.tree.leaves(masters.variables), jax.tree.leaves(native.variables), strict=True
-    ):
+        assert isinstance(masters, (CLIPText, T5Text)) and native.transformer.dtype == jnp.float32
+        stored = (masters.params, native.params)
+    assert jax.tree.structure(stored[0]) == jax.tree.structure(stored[1])
+    for before, after in zip(jax.tree.leaves(stored[0]), jax.tree.leaves(stored[1]), strict=True):
         assert isinstance(before, jax.Array) and isinstance(after, jax.Array)
         assert np.asarray(before).dtype == np.float32
         assert after.dtype == jnp.bfloat16
         np.testing.assert_array_equal(after, np.asarray(before).astype(jnp.bfloat16))
-    if kind != "clip":
+    if isinstance(native, (CLIPText, T5Text)):
         metadata = tmp_path / "metadata"
         metadata.mkdir()
-        (metadata / "config.json").write_bytes((directory / "config.json").read_bytes())
-        supplied = freeze({**jax.tree.map(np.asarray, native.variables),
+        for file in directory.iterdir():
+            if file.suffix != ".safetensors":
+                shutil.copy(file, metadata)
+        supplied = freeze({**jax.tree.map(np.asarray, native.params),
                            "constants": {"step": np.asarray(0, np.int32)}})
-        rebound = cls.from_pretrained(str(metadata), dtype=jnp.float32, variables=supplied)
-        assert rebound.variables is supplied
+        rebound = type(native).from_pretrained(str(metadata), dtype=jnp.float32, params=supplied)
+        assert rebound.params is supplied
         expected = reference(directory)
-        before_output = native(expected["input_ids"], expected["attention_mask"])
-        after_output = rebound(expected["input_ids"], expected["attention_mask"])
-        if kind == "clip-text":
-            before_output, after_output = before_output.last_hidden_state, after_output.last_hidden_state
-        np.testing.assert_array_equal(after_output, before_output)
+        np.testing.assert_array_equal(hidden(rebound, expected["input_ids"], expected["attention_mask"]),
+                                      hidden(native, expected["input_ids"], expected["attention_mask"]))
