@@ -297,5 +297,5 @@ def gpu_case(case, dtype):
     if cuts is not None:
         starts = np.zeros((1, length), bool)
         starts[0, list(cuts[1:])] = True
-        rule = functools.partial(fla_rule, starts=jnp.asarray(starts), max_segments=len(cuts))
+        rule = functools.partial(fla_rule, starts=jnp.asarray(starts))
     return inputs, through(rule, inputs[-2].astype(jnp.float32), inputs[-1]), cuts

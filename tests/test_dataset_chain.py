@@ -747,6 +747,32 @@ def test_a_random_step_that_drops_records_draws_alike_on_every_read_and_counts_i
     assert chain.stats(records=24)["data/rejected/coins/tails"] == 24 - len(kept)
 
 
+def may_drop(row, rng) -> dict | Rejected:
+    """Draws as `keep_heads` does and keeps every record, though it says it may drop one."""
+    return {**row, "draw": np.float64(rng.random())}
+
+
+@pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
+def test_a_random_step_that_may_drop_draws_as_one_that_cannot(read):
+    """A draw is keyed by the record's place in the run's order: a random step that may reject
+    draws what random_map draws, in training's endless reader and in an inspection alike, where
+    the share a dropping step reads once sat between the step and its seed and moved its draws."""
+
+    def draws(kind: str) -> tuple[list[float], list[float]]:
+        chain = getattr(Memory(rows("a", 8)), kind)(may_drop)
+        reader = compile(chain.batch(1), read=read, loading=READ).train(DataPartition())
+        try:
+            trained = [float(batch["draw"][0]) for batch in itertools.islice(reader, 8)]
+        finally:
+            reader.close()
+        inspected = dataclasses.replace(chain.chain(), mode=read, loading=READ).iterate()
+        return trained, [float(row["draw"]) for row in inspected]
+
+    expected, inspected = draws("random_map")
+    assert inspected == expected
+    assert draws("random_filter_map") == (expected, expected)
+
+
 class Coin(grain.RandomMapTransform):
     """Keeps a record, with its draw, on heads."""
 
