@@ -232,7 +232,9 @@ class Gateway:
             try:
                 created = await asyncio.shield(creating)
             except asyncio.CancelledError:
-                await self.settle(self.discard(None, creating))
+                async def unmade():
+                    await self.discard(None, (await creating)["id"])
+                await self.settle(unmade())
                 raise
             kernel = {**created, "preload": PRELOAD[kernel]}
             channels = None
@@ -252,21 +254,20 @@ class Gateway:
                 return context
             except BaseException:
                 # Cancellation too (a disconnect, a Restart): nothing else knows this kernel yet.
-                await self.settle(self.discard(channels, creating))
+                await self.settle(self.discard(channels, kernel["id"]))
                 raise
 
-    async def discard(self, channels, creating):
-        """Close a kernel no context holds, once `creating` has made it: its channels, if open, and
-        the kernel, which is deleted though its channels fail to close."""
+    async def discard(self, channels, identifier):
+        """Close a kernel: its channels, if open, and the kernel, deleted though they fail to close."""
         try:
             if channels:
                 await channels.close()
         finally:
-            await self.api(f"/api/kernels/{(await creating)['id']}", method="DELETE")
+            await self.api(f"/api/kernels/{identifier}", method="DELETE")
 
     async def settle(self, cleanup):
-        """Run `cleanup` to its end, though the caller is cancelled again meanwhile; its failure is
-        logged, never raised: what ended the caller is why it ended."""
+        """Run `cleanup` to its end, though the caller is cancelled meanwhile, which then goes on to
+        cancel the caller; its failure is logged, never raised: why the caller ends is its own."""
         task = asyncio.ensure_future(cleanup)
         self.cleanups.add(task)
 
@@ -275,7 +276,7 @@ class Gateway:
             if not task.cancelled() and task.exception() is not None:
                 print(f"a kernel's cleanup failed: {task.exception()!r}", file=sys.stderr, flush=True)
         task.add_done_callback(ended)
-        with suppress(Exception, asyncio.CancelledError):
+        with suppress(Exception):
             await asyncio.shield(task)
 
     async def create(self, session):
@@ -296,8 +297,8 @@ class Gateway:
         return cells[cell]
 
     async def stop(self, context):
-        await context.channels.close()
-        await self.api(f"/api/kernels/{context.identifier}", method="DELETE")
+        """Close `context`'s kernel, to its end though what stops it is cancelled (`settle`)."""
+        await self.settle(self.discard(context.channels, context.identifier))
 
     async def close(self, session):
         for context in self.contexts.pop(session, {}).values():
@@ -475,8 +476,7 @@ class Gateway:
             if isinstance(error, Stopped) and context is not None and page.cells.get(cell) is context:
                 # The next run of this cell starts a new context, with its client loaded again.
                 del page.cells[cell]
-                with suppress(OSError):
-                    await self.stop(context)
+                await self.stop(context)
             elif context:
                 with suppress(OSError):
                     await self.api(f"/api/kernels/{context.identifier}/interrupt", {}, "POST")
@@ -499,8 +499,7 @@ class Gateway:
                                                    "count": None}))
             # A cell that never ran has no context of its own yet; its first run starts a fresh one.
             if cell in page.cells:
-                with suppress(OSError):
-                    await self.stop(page.cells.pop(cell))
+                await self.stop(page.cells.pop(cell))
                 page.cells[cell] = await self.start(page.session)
             await page.socket.send(json.dumps({"id": message["id"], "type": "done", "status": "ok",
                                                "count": None}))

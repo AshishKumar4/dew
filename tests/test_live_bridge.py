@@ -206,6 +206,9 @@ def test_a_context_ended_while_it_starts_leaves_no_kernel(bridge, monkeypatch, p
             await asyncio.wait_for(kernels.entered[phase].wait(), 30)
             if ending == "restart":
                 await socket.send(json.dumps({"op": "restart", "id": "again", "cell": "b"}))
+                # The cancelled start's kernel is deleted once the gateway has made it.
+                kernels.held.clear()
+                kernels.release[phase].set()
                 assert (await answer(socket, "fresh"))[-1]["status"] == "aborted"
                 assert (await answer(socket, "again"))[-1]["status"] == "ok"
             await socket.close()
