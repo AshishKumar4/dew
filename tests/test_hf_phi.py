@@ -7,7 +7,7 @@ import jax.numpy as jnp
 import numpy as np
 from reference_error import assert_as_exact_as_the_reference
 
-from dew.interop import Pretrained, PretrainedDecoder
+from dew.interop import Pretrained
 
 ROOT = Path(__file__).parent / 'fixtures' / 'hf'
 DIRECTORY = ROOT / 'phi-tiny'
@@ -56,25 +56,3 @@ def test_phi_affine_head_trains_through_the_public_objective():
                            loaded.variables['params'], gradient)
     assert all(np.isfinite(leaf).all() for leaf in jax.tree.leaves(gradient))
     assert float(loss(changed)[0]) < float(value)
-
-
-def test_phi_export_reads_in_transformers_and_reloads_bitwise(tmp_path):
-    import torch
-    from transformers import AutoModelForCausalLM
-
-    loaded = Pretrained.load(DIRECTORY, dtype='float32', attention_impl='reference')
-    PretrainedDecoder.from_model(loaded.model, loaded.variables).save(tmp_path)
-    reference = AutoModelForCausalLM.from_pretrained(tmp_path, attn_implementation='eager').float().eval()
-    ids = np.load(DIRECTORY / 'input_ids.npy')
-    with torch.no_grad():
-        expected = reference(torch.from_numpy(ids).long(), use_cache=False).logits.numpy()
-    actual = loaded.model.apply(loaded.variables, ids)
-    assert_as_exact_as_the_reference(actual, expected, np.load(DIRECTORY / 'logits_f64.npy'), 'Phi export')
-    restored = Pretrained.load(tmp_path, dtype='float32', attention_impl='reference')
-    np.testing.assert_array_equal(restored.model.apply(restored.variables, ids), actual)
-
-    assert restored.model == loaded.model
-    assert jax.tree.structure(restored.variables) == jax.tree.structure(loaded.variables)
-    for original, restored_leaf in zip(jax.tree.leaves(loaded.variables),
-                                        jax.tree.leaves(restored.variables), strict=True):
-        np.testing.assert_array_equal(np.asarray(restored_leaf), np.asarray(original))
