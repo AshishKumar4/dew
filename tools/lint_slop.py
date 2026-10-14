@@ -569,23 +569,31 @@ def _module_name(module: Module) -> str:
     return ".".join(parts[:-1] if parts[-1] == "__init__" else parts)
 
 
+def _parent(module: Module) -> list[str]:
+    """The package a module's relative imports start from, as its parts."""
+    name = _module_name(module)
+    return name.split(".") if module.path.name == "__init__.py" else name.split(".")[:-1]
+
+
+def _bound_by(node: ast.Import | ast.ImportFrom, parent: Sequence[str]) -> dict[str, str]:
+    """What each name one import statement binds stands for, as a dotted path."""
+    if isinstance(node, ast.Import):
+        heads = {alias: alias.name.split(".")[0] for alias in node.names}
+        return {alias.asname or head: alias.name if alias.asname else head for alias, head in heads.items()}
+    base = node.module or ""
+    if node.level:
+        base = ".".join([*parent[:len(parent) - node.level + 1], *([base] if base else [])])
+    return {alias.asname or alias.name: f"{base}.{alias.name}" for alias in node.names if alias.name != "*"}
+
+
 def _imports(tree: ast.Module, name: str, package: bool) -> dict[str, str]:
     """What each name a module imports stands for, as a dotted path: every
     import in it, those inside functions and type-checking blocks included."""
-    bound: dict[str, str] = {}
     parent = name.split(".") if package else name.split(".")[:-1]
+    bound: dict[str, str] = {}
     for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            for alias in node.names:
-                head = alias.name.split(".")[0]
-                bound[alias.asname or head] = alias.name if alias.asname else head
-        elif isinstance(node, ast.ImportFrom):
-            base = node.module or ""
-            if node.level:
-                base = ".".join([*parent[:len(parent) - node.level + 1], *([base] if base else [])])
-            for alias in node.names:
-                if alias.name != "*":
-                    bound[alias.asname or alias.name] = f"{base}.{alias.name}"
+        if isinstance(node, ast.Import | ast.ImportFrom):
+            bound |= _bound_by(node, parent)
     return bound
 
 
@@ -791,37 +799,62 @@ def _script_guard(node: ast.If) -> bool:
             and isinstance(test.comparators[0], ast.Constant) and test.comparators[0].value == "__main__")
 
 
-def _resolved(node: ast.expr, bound: Mapping[str, str], local: frozenset[str]) -> str:
-    """The dotted path `node` spells, its first name read as the import `bound`
-    gives it (`_imports`), or "" where no import binds that name or an
-    enclosing function binds it itself (`local`, `_scoped`)."""
-    head, _, rest = _named(node).partition(".")
-    target = "" if head in local else bound.get(head, "")
-    return f"{target}.{rest}" if target and rest else target
+SCOPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef, ast.ListComp, ast.SetComp,
+          ast.DictComp, ast.GeneratorExp)
 
 
-def _scoped(scope: ast.AST, local: frozenset[str] = frozenset()) -> Iterator[tuple[ast.AST, frozenset[str]]]:
-    """Every node under `scope`, with the names an enclosing function binds
-    itself (its parameters and its assignments), which no import stands for there."""
+def _in_scope(scope: ast.AST) -> Iterator[ast.AST]:
+    """Every node of one lexical scope, a nested scope itself but not its contents."""
     for node in ast.iter_child_nodes(scope):
-        inner = local
-        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda):
-            arguments = node.args
-            parameters = (*arguments.posonlyargs, *arguments.args, *arguments.kwonlyargs, arguments.vararg,
-                          arguments.kwarg)
-            assigned = {child.id for child in _own(node)
-                        if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Store)}
-            inner = local | assigned | {parameter.arg for parameter in parameters if parameter is not None}
-        yield node, inner
-        yield from _scoped(node, inner)
+        yield node
+        if not isinstance(node, SCOPES):
+            yield from _in_scope(node)
+
+
+def _scoped(scope: ast.AST, visible: Mapping[str, str], parent: Sequence[str]
+            ) -> Iterator[tuple[ast.AST, Mapping[str, str]]]:
+    """Every node under `scope`, with what each name imported there stands for
+    (`visible` around it): a scope's own imports over its surroundings', and
+    a name it binds otherwise (a parameter, an assignment, a definition)
+    standing for no import. A class body's names reach no scope inside it."""
+    nodes = list(_in_scope(scope))
+    arguments = scope.args if isinstance(scope, ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda) else None
+    local = {node.id for node in nodes if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)}
+    local |= {node.name for node in nodes
+              if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef)}
+    if arguments is not None:
+        parameters = (*arguments.posonlyargs, *arguments.args, *arguments.kwonlyargs, arguments.vararg,
+                      arguments.kwarg)
+        local |= {parameter.arg for parameter in parameters if parameter is not None}
+    imported: dict[str, str] = {}
+    for node in nodes:
+        if isinstance(node, ast.Import | ast.ImportFrom):
+            imported |= _bound_by(node, parent)
+    table = {name: target for name, target in visible.items() if name not in local} | imported
+    inner = visible if isinstance(scope, ast.ClassDef) else table
+    for node in nodes:
+        yield node, table
+        if isinstance(node, SCOPES):
+            yield from _scoped(node, inner, parent)
+
+
+def _resolved(node: ast.expr, table: Mapping[str, str]) -> str:
+    """The dotted path an attribute chain from a name spells, its name read as
+    the import `table` gives it (`_scoped`), or "" for anything else."""
+    attributes = []
+    while isinstance(node, ast.Attribute):
+        attributes.append(node.attr)
+        node = node.value
+    if not isinstance(node, ast.Name) or node.id not in table:
+        return ""
+    return ".".join([table[node.id], *reversed(attributes)])
 
 
 def wording(module: Module) -> Iterator[Finding]:
     """SLOP011: a test that checks wording or source text instead of behaviour."""
-    bound = _imports(module.tree, _module_name(module), module.path.name == "__init__.py")
-    for node, local in _scoped(module.tree):
+    for node, table in _scoped(module.tree, {}, _parent(module)):
         if isinstance(node, ast.Call):
-            called = _resolved(node.func, bound, local)
+            called = _resolved(node.func, table)
             if called == "pytest.raises" and any(keyword.arg == "match" for keyword in node.keywords):
                 yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP011",
                               "matches an error's wording; assert the refusal, not its text")
@@ -836,8 +869,7 @@ def wording(module: Module) -> Iterator[Finding]:
 
 def patches(module: Module) -> Iterator[Finding]:
     """SLOP012: an imported module's attribute replaced or deleted, outside the suite."""
-    bound = _imports(module.tree, _module_name(module), module.path.name == "__init__.py")
-    for node, local in _scoped(module.tree):
+    for node, table in _scoped(module.tree, {}, _parent(module)):
         if isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Store | ast.Del):
             owner, attribute = node.value, node.attr
         elif (isinstance(node, ast.Call) and _named(node.func) in ("setattr", "delattr")
@@ -847,7 +879,7 @@ def patches(module: Module) -> Iterator[Finding]:
             attribute = named.value if spelled else "*"
         else:
             continue
-        origin = _resolved(owner, bound, local)
+        origin = _resolved(owner, table)
         target = f"{origin}.{attribute}"
         # The library rebinds nothing it imported but the interpreter's own hooks; a
         # script, nothing of our package.
