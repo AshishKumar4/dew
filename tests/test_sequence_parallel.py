@@ -32,6 +32,7 @@ from dew.nn.attention import (
     gathered_keys_attention,
     scaled_dot_product_attention,
 )
+from dew.nn.inputs import coordinates
 from dew.nn.rope import rotary_freqs
 from dew.training import MeshSpec
 
@@ -65,8 +66,8 @@ def packed_batch():
         positions[row, :boundary] = np.arange(boundary)
         positions[row, boundary:] = np.arange(SEQ_LEN + 1 - boundary)
     segments[-1, -3:] = 0
-    batch["text_segment_ids"] = segments
-    batch["text_positions"] = positions
+    batch["text_coordinates"] = coordinates(
+        segments=segments, positions=positions, max_segments=SEQ_LEN + 1, right_padded=True, xp=np)
     return batch
 
 
@@ -96,7 +97,7 @@ def packed_mask(segments):
 CALLS = {
     "causal": {"causal": True},
     "window": {"causal": True, "sliding_window": 5},
-    "packed": {"mask": packed_mask(jnp.asarray(packed_batch()["text_segment_ids"][:, :-1]))},
+    "packed": {"mask": packed_mask(jnp.asarray(packed_batch()["text_coordinates"].segments[:, :-1]))},
     # Query-broadcast rows must survive the reorder without being expanded.
     "broadcast_mask": {
         "causal": True, "mask": (jnp.arange(SEQ_LEN) < SEQ_LEN // 2)[None, None, None, :]},

@@ -103,7 +103,7 @@ def test_the_cli_selects_a_token_budget_without_selecting_a_row_batch():
     config = parse(RunConfig, ["--trainer.batch-size", "None", "--trainer.batch-tokens", "24576",
                               "--trainer.update-tokens", "98304", "--trainer.steps", "1"])
     assert config.trainer.batch_size is None
-    assert config.trainer.derived().accumulation == 4
+    assert config.trainer.accumulation == 4
     assert RunConfig.from_dict(json.loads(json.dumps(config.to_dict()))) == config
 
 
