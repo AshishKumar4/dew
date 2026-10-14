@@ -33,6 +33,7 @@ from flax import linen as nn
 
 from dew.diffusion.block import CanvasGeneration, through_eos
 from dew.diffusion.process import Conditioning
+from dew.interop.weights import decoding_storage
 from dew.nn.inputs import RESPONSE_FIELDS, ModelInputs, Request, continuation_keys, local_rows, mesh_of
 from dew.nn.protocols import Logits, TokenModel
 from dew.nn.sharding import explicit_spec
@@ -178,9 +179,9 @@ class DiscreteProcess:
 
         request, _ = Request.prepare(inputs, key, mesh_of(variables), check, phase="masked generation")
         plan = request.plan
-        generated = _compiled(plan.sharding)(model, variables, plan.place(request.padded()),
-                                             plan.keys(request.key), self, solver, max_new_tokens, steps, n,
-                                             eos_token_ids, pad_token_id)
+        generated = _compiled(plan.sharding)(model, decoding_storage(model, variables),
+                                             plan.place(request.padded()), plan.keys(request.key), self,
+                                             solver, max_new_tokens, steps, n, eos_token_ids, pad_token_id)
         return replace(generated, rows=plan.rows * n, prompt_width=request.inputs.tokens.shape[1])
 
 
