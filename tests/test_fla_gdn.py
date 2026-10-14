@@ -334,8 +334,8 @@ def test_the_wy_backward_kernel_is_the_gradient_of_flas_wy_representation(dtype,
 
 
 @pytest.mark.gpu(reason="the compiled kernel's own repeatability on this GPU")
-def test_the_wy_backward_gives_the_same_gradients_on_every_call_at_e1s_shape():
-    """One compiled WY backward, called again on the same operands at the Qwen3.5-0.8B step's shape (8 x
+def test_the_wy_backward_gives_the_same_gradients_on_every_call_at_qwen35_08b_shape():
+    """One compiled WY backward, called again on the same operands at Qwen3.5-0.8B's shape (8 x
     3072, 16 heads of 128, bf16), gives bitwise the same gradients: with its key loop's k k^T taken
     after the dk store, sm90's pipelined loop gave a different dg on each call (20,000 elements, up
     to 0.069)."""

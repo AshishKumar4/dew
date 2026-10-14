@@ -134,23 +134,6 @@ PROMPTS = ["a red cat on a mat", "tiny photo"]
 HEIGHT, WIDTH, STEPS, GUIDANCE = 16, 24, 4, 5.0
 
 
-def tokenizer():
-    """A byte-level Qwen2 tokenizer carrying the published special tokens and
-    chat template: every character is one piece."""
-    from tokenizers.pre_tokenizers import ByteLevel
-    from transformers import Qwen2Tokenizer
-
-    metadata = json.loads((SOURCE / "tokenizer" / "tokenizer_config.json").read_text())
-    special = [item["content"] for item in metadata["added_tokens_decoder"].values()]
-    vocab = {word: index for index, word in enumerate(sorted(ByteLevel.alphabet()))}
-    for word in special:
-        vocab.setdefault(word, len(vocab))
-    made = Qwen2Tokenizer(vocab=vocab, merges=[], eos_token=metadata["eos_token"], pad_token=metadata["pad_token"],
-                          additional_special_tokens=special)
-    made.chat_template = metadata["chat_template"]
-    return made
-
-
 def text_encoder(tok):
     """The published Qwen3 config, narrowed and three layers deep; a causal
     language model with tied embeddings, which saves as the release is
@@ -180,8 +163,10 @@ def build_pipeline(root: Path):
         ZImagePipeline,
         ZImageTransformer2DModel,
     )
+    from make_tiny_tokenizer import qwen_byte_tokenizer
 
-    tok = tokenizer()
+    metadata = json.loads((SOURCE / "tokenizer" / "tokenizer_config.json").read_text())
+    tok = qwen_byte_tokenizer(metadata, chat_template=metadata["chat_template"])
     encoder = text_encoder(tok)
     published = json.loads((SOURCE / "vae" / "config.json").read_text())
     torch.manual_seed(SEED + 7)

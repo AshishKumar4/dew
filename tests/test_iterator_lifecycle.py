@@ -282,8 +282,10 @@ def test_a_field_no_compiled_step_reads_stays_on_the_host():
     rows = jax.device_count()
     batch = {"x": np.ones((rows, 3), np.float32), "unused": np.arange(rows), "absent": None}
     step = jax.jit(lambda state, batch, part: state + jnp.sum(batch["x"]) + part)
-    compiled = step.lower(jnp.zeros(()), shard_batch(mesh, batch), jnp.int32(0)).compile()
-    signature = batch_signature(batch)
+    first = shard_batch(mesh, batch)
+    compiled = step.lower(jnp.zeros(()), first, jnp.int32(0)).compile()
+    # The trainer publishes the mask under the placed batch's signature.
+    signature = batch_signature(first)
     reads = {signature: step_reads(compiled, signature)}
     wider = {**batch, "x": np.ones((rows, 4), np.float32)}
     with DevicePrefetchIterator(iter([batch, wider]), mesh, reads=reads) as stream:
