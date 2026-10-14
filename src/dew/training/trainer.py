@@ -24,7 +24,7 @@ import time
 import types
 import warnings
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from typing import TYPE_CHECKING, Concatenate, Generic, Literal, Protocol
+from typing import TYPE_CHECKING, Generic, Literal, Protocol
 
 import jax
 import jax.numpy as jnp
@@ -120,7 +120,9 @@ from dew.training.distributed import (
     microbatch_shapes,
     placed_bytes,
     prefetched_bytes,
+    ruled,
     shard_batch,
+    stage_microbatches,
     step_reads,
 )
 from dew.training.evaluation import EvalSuite, Evaluation, MetricScores
@@ -147,7 +149,7 @@ from dew.training.model_flops import (
     uncounted,
 )
 from dew.training.narrow import narrowed, narrowed_paths
-from dew.training.optim import RATE_SCALE, RATE_SHAPE, with_rate_scales
+from dew.training.optim import learning_rate, with_rate_scales
 from dew.training.planning import Candidate, Planned, Timer, plan_step, settled, splits, whole_step
 from dew.training.rungs import keep_rung, plan_flops, recorded_launches, recorded_rung
 from dew.training.runtime import Preempted, PreemptionNotice
@@ -209,28 +211,6 @@ class ProfileWindow:
     directory: str
     steps: int
     warmup: int = 2
-
-
-def learning_rate(opt_state: optax.OptState) -> jax.typing.ArrayLike | None:
-    """Return the learning rate stored in `opt_state`, if the optimizer stores one.
-
-    An OptimConfig's solver holds a rate scale and the schedule's value at
-    the last applied update (`dew.training.optim.scaled_solver`), whose
-    product is the rate; an Optax optimizer can inject `learning_rate`
-    itself (`optax.inject_hyperparams`). The result is None when the
-    optimizer closes over the rate, or when parameter groups hold several
-    rates.
-    """
-    injected = (optax.InjectHyperparamsState, optax.InjectStatefulHyperparamsState)
-    rates = []
-    for node in jax.tree.leaves(opt_state, is_leaf=lambda node: isinstance(node, injected)):
-        if not isinstance(node, injected):
-            continue
-        if RATE_SCALE in node.hyperparams:
-            rates.append(node.hyperparams[RATE_SCALE] * node.hyperparams[RATE_SHAPE])
-        elif "learning_rate" in node.hyperparams:
-            rates.append(node.hyperparams["learning_rate"])
-    return rates[0] if len(rates) == 1 else None
 
 
 # How the display shows the metrics the trainer itself logs; an objective,
@@ -424,19 +404,6 @@ _DEFAULT_MESH = MeshSpec()
 _DEFAULT_LAYOUT = Layout()
 
 
-def _ruled[TrainerT: Trainer, **Arguments, Result](
-        method: Callable[Concatenate[TrainerT, Arguments], Result]
-) -> Callable[Concatenate[TrainerT, Arguments], Result]:
-    """`method` of a trainer, run under its layout's rules: they place a
-    batch's rows (`batch_axes`) and a run's data shares as they place the
-    activations its trace constrains."""
-    @functools.wraps(method)
-    def run(trainer: TrainerT, *args: Arguments.args, **kwargs: Arguments.kwargs) -> Result:
-        with nn.logical_axis_rules(trainer.layout.axis_rules):
-            return method(trainer, *args, **kwargs)
-    return run
-
-
 class Trainer(Generic[Loss, Effects]):
     """Runs an `Objective`: gradients, sharding, EMA, checkpoints and logging."""
 
@@ -613,24 +580,13 @@ class Trainer(Generic[Loss, Effects]):
 
     @functools.cached_property
     def device_mesh(self) -> Mesh:
-        """The device mesh, a native one as given or a `MeshSpec`'s built over
-        this process pool's devices, on first use."""
+        """The device mesh (`device_mesh`), built on first use."""
         return device_mesh(self.mesh)
 
     @property
     def microbatches(self) -> int:
-        """The microbatches a pipelined step feeds through the stage axis: as
-        asked, else one a stage. A mesh without a stage axis has one stage."""
-        stages = self.device_mesh.shape.get(STAGE_AXIS, 1)
-        if self._microbatches is None:
-            return stages
-        if stages == 1:
-            raise ValueError(f"microbatches ({self._microbatches}) feed the stage axis, which this mesh "
-                             f"does not split; give it stages or leave microbatches unset")
-        if self._microbatches < stages or self._microbatches % stages:
-            raise ValueError(f"microbatches must be a positive multiple of the stage axis's {stages}, "
-                             f"got {self._microbatches}")
-        return self._microbatches
+        """The microbatches a pipelined step feeds through the stage axis (`stage_microbatches`)."""
+        return stage_microbatches(self.device_mesh, self._microbatches)
 
     @property
     def host_master(self) -> bool:
@@ -659,7 +615,7 @@ class Trainer(Generic[Loss, Effects]):
             self._boxed = boxed_axes(jax.eval_shape(self.objective.initializer, jax.random.key(0)))
         return self._boxed
 
-    @_ruled
+    @ruled
     def shardings(self, state: TrainState) -> Placement[TrainState]:
         """Return where each field of `state` is placed, on the axes that suit its kind.
 
@@ -727,7 +683,7 @@ class Trainer(Generic[Loss, Effects]):
                 lambda s: s.with_memory_kind("device"), getattr(shardings, field)))
             for field in self.layout.host})
 
-    @_ruled
+    @ruled
     def place(self) -> tuple[TrainState, Placement[TrainState], bytes | None]:
         """Put the state on the mesh, fresh or restored.
 
@@ -1123,7 +1079,7 @@ class Trainer(Generic[Loss, Effects]):
             return advanced, loss, aux, None
         return run
 
-    @_ruled
+    @ruled
     def compile(self, state: TrainState, batch: Batch,
                 timed: Callable[[list[CompiledStep]], list[float]] | None = None) -> CompiledStep:
         """Compile a transaction over the state and one already-produced global batch.
@@ -1406,7 +1362,7 @@ class Trainer(Generic[Loss, Effects]):
     # The loop
     # ------------------------------------------------------------------
 
-    @_ruled
+    @ruled
     def fit(
         self,
         dataset: Dataset | Loader,

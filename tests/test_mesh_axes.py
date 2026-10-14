@@ -203,14 +203,15 @@ def native_trainer(mesh, layout, directory, **hybrid) -> Trainer:
 def token_windows(directory):
     """Eight-row batches of windows over a token file, a stream fit
     checkpoints and resumes."""
-    from dew.data import Loading, TokenWindows
+    from dew.config.data import TextData, loader
+    from dew.data import Loading
 
     directory.mkdir(exist_ok=True)
     tokens = (np.arange(400) * 7 % VOCAB).astype(np.uint16)
     for split in ("train", "val"):
         tokens.tofile(directory / f"{split}.bin")
-    return TokenWindows(path=str(directory), seq_len=LENGTH, stride=1, seed=7,
-                        loading=Loading(workers=0, threads=1, read_buffer=1)).load(batch=8)
+    return loader(TextData(source=str(directory), seq_len=LENGTH, stride=1), batch=8, read="memory", seed=7,
+                  loading=Loading(workers=0, threads=1, read_buffer=1), validation_records=32)
 
 
 @pytest.mark.mesh(devices=8)

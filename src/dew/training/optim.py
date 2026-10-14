@@ -602,6 +602,28 @@ def scaled(rate: float | ScheduleBase) -> tuple[float, ScheduleBase | None]:
     return scale, shape
 
 
+def learning_rate(opt_state: optax.OptState) -> jax.typing.ArrayLike | None:
+    """Return the learning rate stored in `opt_state`, if the optimizer stores one.
+
+    An OptimConfig's solver holds a rate scale and the schedule's value at
+    the last applied update (`dew.training.optim.scaled_solver`), whose
+    product is the rate; an Optax optimizer can inject `learning_rate`
+    itself (`optax.inject_hyperparams`). The result is None when the
+    optimizer closes over the rate, or when parameter groups hold several
+    rates.
+    """
+    injected = (optax.InjectHyperparamsState, optax.InjectStatefulHyperparamsState)
+    rates = []
+    for node in jax.tree.leaves(opt_state, is_leaf=lambda node: isinstance(node, injected)):
+        if not isinstance(node, injected):
+            continue
+        if RATE_SCALE in node.hyperparams:
+            rates.append(node.hyperparams[RATE_SCALE] * node.hyperparams[RATE_SHAPE])
+        elif "learning_rate" in node.hyperparams:
+            rates.append(node.hyperparams["learning_rate"])
+    return rates[0] if len(rates) == 1 else None
+
+
 def with_rate_scales(opt_state: optax.OptState, scales: Mapping[str | None, float]) -> optax.OptState:
     """`opt_state` with each `scaled_solver`'s rate scale set to `scales`'
     value for its param group, by name, or under None for a solver of no

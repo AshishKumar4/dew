@@ -16,6 +16,7 @@ import threading
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path
+from typing import Concatenate, Protocol
 
 import jax
 import jax.numpy as jnp
@@ -80,6 +81,38 @@ def device_mesh(mesh: MeshSpec | Mesh) -> Mesh:
     """The device mesh `mesh` names: a native `jax.sharding.Mesh` as it is,
     whatever its axes, or the one a `MeshSpec` builds."""
     return mesh if isinstance(mesh, Mesh) else mesh.build()
+
+
+def stage_microbatches(mesh: Mesh, asked: int | None) -> int:
+    """The microbatches a pipelined step feeds through `mesh`'s stage axis: as
+    `asked`, else one a stage. A mesh without a stage axis has one stage."""
+    stages = mesh.shape.get(STAGE_AXIS, 1)
+    if asked is None:
+        return stages
+    if stages == 1:
+        raise ValueError(f"microbatches ({asked}) feed the stage axis, which this mesh does not split; "
+                         f"give it stages or leave microbatches unset")
+    if asked < stages or asked % stages:
+        raise ValueError(f"microbatches must be a positive multiple of the stage axis's {stages}, "
+                         f"got {asked}")
+    return asked
+
+
+class Ruled(Protocol):
+    layout: Layout
+
+
+def ruled[Owner: Ruled, **Arguments, Result](
+        method: Callable[Concatenate[Owner, Arguments], Result]
+) -> Callable[Concatenate[Owner, Arguments], Result]:
+    """`method`, run under its owner's layout's rules: they place a batch's
+    rows (`batch_axes`) and a run's data shares as they place the activations
+    its trace constrains."""
+    @functools.wraps(method)
+    def run(owner: Owner, *args: Arguments.args, **kwargs: Arguments.kwargs) -> Result:
+        with nn.logical_axis_rules(owner.layout.axis_rules):
+            return method(owner, *args, **kwargs)
+    return run
 
 
 def explicit_axes(mesh: MeshSpec | Mesh) -> tuple[str, ...]:
