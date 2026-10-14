@@ -283,3 +283,32 @@ def test_every_attention_mixer_implements_or_refuses_each_policy_it_is_asked(kin
         assert policy in str(refused)
         return
     assert factory.keywords.get(policy) == POLICY_VALUES[policy]
+
+
+@pytest.mark.parametrize("kind", ["kimi_delta_attention", "mamba", "mamba2", "gated_delta_net"])
+def test_a_remat_policy_keeps_every_residual_a_recurrent_mixer_names(kind, monkeypatch, capsys):
+    """A decoder skips the remat rungs that keep none of its mixers' names (`MixerBase.residuals`), so
+    a kind may name only what its layer marks: under `jax.checkpoint` with a policy saving all of them,
+    a tiny decoder of that kind saves each one for its backward. A delta rule's decay and inverse are
+    its port's (`row_names_port`, interpreted off a GPU)."""
+    from jax.ad_checkpoint import print_saved_residuals
+
+    from dew.nn import linear
+    from dew.nn.backbones.decoder_block import RematPolicy
+
+    monkeypatch.setattr(linear, "measured_kernel",
+                        lambda choice, default: "fla" if choice == "gated_delta_rule" else default)
+    value = mixers.build(kind, **KIND_FIELDS.get(kind, ({}, {}))[0])
+    assert value.residuals is not None
+    model = tiny(mixer=value, max_seq_len=64, **KIND_FIELDS.get(kind, ({}, {}))[1])
+    tokens = jax.random.randint(jax.random.key(3), (1, 64), 0, VOCAB)
+    variables = model.init(jax.random.key(4), tokens)
+    policy = RematPolicy(save=value.residuals).checkpoint_policy()
+
+    def loss(variables):
+        return jnp.sum(model.apply(variables, tokens) ** 2)
+
+    capsys.readouterr()
+    print_saved_residuals(jax.checkpoint(loss, policy=policy), variables)
+    saved = capsys.readouterr().out
+    assert [name for name in value.residuals if f"named '{name}'" not in saved] == []

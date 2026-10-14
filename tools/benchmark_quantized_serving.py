@@ -76,7 +76,7 @@ class Config:
     """Names of modules to leave unquantized, matched anywhere in their path."""
     model: str = "dewml/hybrid-dit-176m"
     """A Hugging Face Hub repository, or a local Dew run directory."""
-    revision: str | None = "0043f4455889f1625fc6a7472241ebfaed751358"
+    revision: str | None = "13393896010260671b58cda12a7a2eab3d270e87"
     """The Hub commit or tag to load; local run directories do not use it."""
     clip: bool = True
     """Sample every prompt at both seeds and score the images with CLIP."""
