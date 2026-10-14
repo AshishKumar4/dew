@@ -3157,6 +3157,49 @@ mode are on the branch `perf/lora-in-gemm` at `837154b54`:
 `PYTHONPATH=src python tools/benchmark_kernels.py lora --tokens 768 --tiles 128,128,32,4,3
 128,128,64,4,3 128,256,64,8,3 64,128,32,4,4` (jax 0.11.2). The G4 (sm120) was not measured.
 
+### A LoRA run's frozen base in FP8, 2026-10-13
+
+A frozen projection takes part in two products a step, its forward and its input's gradient, and
+neither needs the kernel's gradient, so its kernel can be packed in E4M3 once for both
+(`dew.training.quantization.frozen_fp8_leaves`, `LoRA.fp8_base`). Each product then casts its other
+operand's rows to E4M3 at their current amax, multiplies the codes widened to fp32, which XLA
+rewrites to a cuBLASLt FP8 GEMM, and applies both rows' scales after. The cast of the activation
+rows costs a read and a write of them each product, so FP8 pays where the product is wide in both
+widths. Forward plus input gradient of one projection on an H100 80GB HBM3, bf16 against FP8,
+jitted medians of five interleaved groups of thirty calls, 8192 tokens (jax 0.11.2):
+
+| in x out | bf16 ms | FP8 ms | ratio |
+|---|---:|---:|---:|
+| 1024 x 1024 | 0.131 | 0.187 | 0.70 |
+| 1024 x 3584 | 0.273 | 0.364 | 0.75 |
+| 2048 x 2048 | 0.292 | 0.341 | 0.86 |
+| 4096 x 1024 | 0.304 | 0.392 | 0.78 |
+| 2048 x 8192 | 0.894 | 0.844 | 1.06 |
+| 4096 x 4096 | 0.839 | 0.766 | 1.10 |
+| 4096 x 8192 | 1.741 | 1.332 | 1.31 |
+| 4096 x 12288 | 2.609 | 1.779 | 1.47 |
+| 12288 x 4096 | 2.639 | 1.820 | 1.45 |
+
+So a Qwen3.5-0.8B's projections (1024 wide) stay in bf16, and a 9B's attention and MLP
+projections gain. Which sites run FP8 is that measurement on the run's own GPU and token count
+(`measured_fp8_sites`), recorded with the generation it was taken on; another generation is
+refused rather than reusing it. The function changes by E4M3's rounding of both operands.
+
+The packed codes stand in the train state in place of the frozen kernels they encode, two bytes a
+parameter as bf16's are, and a merge decodes them (`frozen_fp8_kernel`). A whole run, Qwen3.5-9B
+under a rank-16 LoRA on its attention and MLP projections, 2 x 2048 fineweb-edu tokens a step, 300
+steps on an H100 80GB HBM3 (jax 0.11.2), each arm on the same windows:
+
+| base | step ms | peak GiB | loss over bf16's, last 50 steps |
+|---|---:|---:|---:|
+| bf16 | 299.8 | 44.59 | |
+| bf16, another LoRA seed | 299.8 | 44.59 | under 0.02% |
+| FP8 at the 189 sites measured faster | 255.3 | 44.83 | +0.40% |
+
+The FP8 run's loss sits about 0.4% above bf16's from the first step on, the rounding of both
+operands, where another seed of the bf16 run moves it by under 0.02%; a run that wants bf16's
+function keeps its base in bf16.
+
 ### Faster kernels not adopted
 
 Kernel matrix, 2026-09-22, jax 0.11.2, forward plus backward medians, every cell checked against float64. Each of these needs a kernel or a dependency that Dew does not have yet:

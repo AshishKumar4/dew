@@ -299,8 +299,8 @@ def test_a_memory_read_of_a_hub_image_split_holds_its_encoded_images(tmp_path, m
     monkeypatch.setattr(datasets, "load_dataset_builder", lambda *args, **kwargs: builder)
     held = Hub("acme/images").records("memory")
     assert [held[index]["image"]["bytes"] for index in range(4)] == [value["bytes"] for value in encoded]
-    data = loader(ImageData(Hub("acme/images"), image_size=8, augment=None), batch=4, read="memory",
-                loading=Loading(workers=0, threads=1, read_buffer=1))
+    data = loader(ImageData(Hub("acme/images"), image_size=8, augment=None, validation=None), batch=4,
+                  read="memory", loading=Loading(workers=0, threads=1, read_buffer=1))
     reader = data.train(DataPartition())
     try:
         batch = next(reader)

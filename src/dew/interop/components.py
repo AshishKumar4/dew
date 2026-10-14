@@ -19,10 +19,11 @@ if TYPE_CHECKING:
 
 def component_source(name_or_dir: str | Path, revision: str | None = None, subfolder: str = "", *,
                      weights: bool) -> tuple[Path, dict]:
-    """Resolve one component's metadata and only the weights its caller needs."""
+    """Resolve required metadata and weights, using the root's conversion fallback."""
     from dew.interop.sources import snapshot
 
-    directory = snapshot(str(name_or_dir), revision, weights=(subfolder,) if weights else False)
+    requested = (subfolder,) if subfolder else True
+    directory = snapshot(str(name_or_dir), revision, weights=requested if weights else False)
     return directory / subfolder, json.loads((directory / subfolder / "config.json").read_text())
 
 
