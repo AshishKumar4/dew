@@ -76,13 +76,12 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
-from flax.core import unfreeze
 from jax.experimental import checkify
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from jax.typing import ArrayLike
 
 from dew.inference.pages import Pages
-from dew.inference.projections import pack_projections, projection_groups
+from dew.inference.projections import pack_projections, packed_layout
 from dew.inference.serving_kernel import (
     Admission,
     Dense,
@@ -452,18 +451,8 @@ class Server:
         )
 
         with self._context():
-            source_shapes = unfreeze(dict(jax.tree.map(
-                lambda leaf: jax.ShapeDtypeStruct(np.shape(leaf), jnp.result_type(leaf)), variables)))
-            for group in projection_groups(model, variables):
-                node = source_shapes["params"]
-                for part in group.path:
-                    node = node[part]
-                if group.packed in node:
-                    packed = node.pop(group.packed)
-                    for projection, width in zip(group.members, group.widths, strict=True):
-                        node[projection] = {field: jax.ShapeDtypeStruct((*leaf.shape[:-1], width), leaf.dtype)
-                                            for field, leaf in packed.items()}
-                    self._weight_groups.append(group)
+            groups, source_shapes = packed_layout(model, variables)
+            self._weight_groups.extend(groups)
             self._source_shapes = jax.tree_util.tree_flatten_with_path(source_shapes)[0]
             shapes = jax.eval_shape(functools.partial(opened, model, pad_id=self.pad_id, slots=slots,
                                                       capacity=capacity), variables)
