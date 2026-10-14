@@ -543,8 +543,8 @@ def packed_checkpoint(tmp_path_factory):
     # A store that states its documents' lengths is packed by a plan over the whole store, which
     # its source names; one read as it streams is packed by a stage.
     order = json.loads(saved["order"])
-    assert ("Pack(" in json.dumps(order["source"])
-            or any(stage.startswith("Pack(") for stage in order["stages"])), "the order has to name the packing"
+    named = "Pack(" in json.dumps(order["source"]) or any(stage.startswith("Pack(") for stage in order["stages"])
+    assert named, "the order has to name the packing"
     return {"run_dir": directory / "run", "corpus": corpus, "reports": reports}
 
 
