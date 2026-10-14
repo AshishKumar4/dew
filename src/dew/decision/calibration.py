@@ -201,17 +201,23 @@ class Abstention:
             if len(group) < bucket_minimum:
                 continue
             tops, correct = _tops(group, temperatures, binning)
-            confidence = np.round(tops, 4)
-            chosen = 1.0
-            for level in sorted(set(confidence.tolist()), reverse=True):
-                accepted = confidence >= level
-                errors = float(np.sum(~correct[accepted]))
-                count = float(np.sum(accepted))
-                rate = (errors + 1) / (count + 1) if conservative else errors / count
-                if rate <= target_error:
-                    chosen = level
-            thresholds[name] = chosen
+            levels, accepted, right = tied_prefixes(np.round(tops, 4), correct)
+            errors = accepted - right
+            rate = (errors + 1) / (accepted + 1) if conservative else errors / accepted
+            met = rate <= target_error
+            thresholds[name] = float(levels[met].min()) if met.any() else 1.0
         return cls(thresholds)
+
+
+def tied_prefixes(confidence: np.ndarray, correct: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Each distinct `confidence`, highest first, with how many answers are at or
+    above it and how many of those are `correct`: a group of tied answers
+    counts as a whole, in any order. Abstention's thresholds and AURC's curve
+    read their accepted answers off these."""
+    order = np.argsort(-confidence, kind="mergesort")
+    confidence, correct = confidence[order], correct[order]
+    last = np.flatnonzero(np.concatenate((confidence[1:] != confidence[:-1], [True])))
+    return confidence[last], last + 1, np.cumsum(correct)[last]
 
 
 def _tops(group: Sequence[Scored], temperatures: Temperatures,

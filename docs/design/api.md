@@ -117,7 +117,6 @@ class Objective(ABC):
     """What is being learned: parameters, loss, what evaluation produces."""
     inputs: InputSpec                    # per-example shapes and dtypes the tree is initialised from
     ema: EMASpec | None = None
-    artifact: type[Artifact] | None = None
 
     @abstractmethod
     def init(self, key: jax.Array, variables: Variables | None = None) -> Variables: ...

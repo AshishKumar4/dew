@@ -25,6 +25,7 @@ from dew.decision.head import DecisionHead
 from dew.decision.layout import MarkerLayout, Specials
 from dew.decision.model import DecisionModel
 from dew.interop import sources
+from dew.interop.decoder_parts import Packed, joined_packed, split_packed
 from dew.interop.hf_decoders import translate_config, translate_weights
 from dew.interop.safetensors_io import read_weights, write_file
 from dew.interop.weights import translate_parameters
@@ -69,35 +70,9 @@ def _head_path(name: str) -> tuple[str, ...] | None:
     return (f"layers_{match[1]}", *_LAYER[match[2]], "scale" if norm and leaf == "weight" else _leaf(leaf))
 
 
-def unpacked_attention(tensors: Mapping[str, np.ndarray]) -> dict[str, np.ndarray]:
-    """Return `tensors` with each `nn.MultiheadAttention`'s packed in_proj as its q, k and v thirds."""
-    split = {}
-    for name, tensor in tensors.items():
-        match = re.fullmatch(r"(.+)\.in_proj_(weight|bias)", name)
-        if match is None:
-            split[name] = tensor
-            continue
-        thirds = np.split(tensor, 3, axis=0)
-        for projection, piece in zip(("q_proj", "k_proj", "v_proj"), thirds, strict=True):
-            split[f"{match[1]}.{projection}.{match[2]}"] = piece
-    return split
-
-
-def packed_attention(tensors: Mapping[str, np.ndarray]) -> dict[str, np.ndarray]:
-    """Return `tensors` with each attention's q, k and v packed into one in_proj.
-
-    That is how `nn.MultiheadAttention` holds them: `unpacked_attention`'s inverse.
-    """
-    packed, thirds = {}, {}
-    for name, tensor in tensors.items():
-        match = re.fullmatch(r"(.+)\.([qkv])_proj\.(weight|bias)", name)
-        if match is None:
-            packed[name] = tensor
-        else:
-            thirds.setdefault(f"{match[1]}.in_proj_{match[3]}", {})[match[2]] = tensor
-    for name, parts in thirds.items():
-        packed[name] = np.concatenate([parts["q"], parts["k"], parts["v"]], axis=0)
-    return packed
+IN_PROJ = tuple(Packed(f"in_proj_{leaf}", tuple(f"{part}.{leaf}" for part in ("q_proj", "k_proj", "v_proj")),
+                      axis=0) for leaf in ("weight", "bias"))
+"""How `nn.MultiheadAttention` holds an attention's q, k and v: one in_proj, the three in turn on axis 0."""
 
 
 @dataclass(frozen=True)
@@ -152,8 +127,8 @@ class LayaCheckpoint:
         head = DecisionHead(features=backbone.emb_features,
                             layers=records.integer(config.get("head_layers", 2), "head_layers"),
                             dtype=backbone.dtype, attention_impl=attention_impl)
-        head_tensors = unpacked_attention({name: tensor for name, tensor in tensors.items()
-                                         if not name.startswith("encoder.")})
+        head_tensors = split_packed({name: tensor for name, tensor in tensors.items()
+                                     if not name.startswith("encoder.")}, IN_PROJ)
         variables = joined({
             "backbone": translate_weights(encoder, record, "modernbert", param_dtype=param_dtype),
             "head": {"params": translate_parameters(head_tensors, _head_path, param_dtype)}})
@@ -228,7 +203,7 @@ def _head_tensors(params: Mapping[str, object]) -> dict[str, np.ndarray]:
         value = np.asarray(leaf)
         torch_leaf = "bias" if keys[-1] == "bias" else "weight"
         tensors[f"{module}.{torch_leaf}"] = value.T if keys[-1] == "kernel" else value
-    return packed_attention(tensors)
+    return joined_packed(tensors, IN_PROJ)
 
 
 def _token(value: object, name: str) -> int:

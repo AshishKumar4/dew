@@ -3,7 +3,7 @@
 The tool is the reproduction command behind every number in
 docs/benchmarks.md and docs/performance.md, and it calls the trainer's
 internals (`compile`, `shardings`, `device_mesh`, `DevicePrefetchIterator`)
-directly, without `fit`, so one cpu-smoke case runs here, end to end, on
+directly, without `fit`, so every cpu-smoke case runs here, end to end, on
 every suite run.
 """
 
@@ -12,6 +12,8 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+
+from tools.benchmark_cases import cpu_smoke_cases
 
 # Needs the eight simulated CPU devices conftest configures; the GPU lane skips it.
 pytestmark = pytest.mark.mesh
@@ -29,13 +31,14 @@ def _benchmark_step():
     return module
 
 
-@pytest.mark.parametrize("fixed_batch", [False, True])
-def test_cpu_smoke_case_measures_a_finite_step_through_the_trainer(fixed_batch):
+@pytest.mark.parametrize("architecture, fixed_batch", [
+    *[(case.architecture, False) for case in cpu_smoke_cases()], ("causal_transformer", True)])
+def test_a_cpu_smoke_case_measures_a_finite_step_through_the_trainer(architecture, fixed_batch):
     """The tool's row is the trainer's own compiled step run for real: a
-    finite loss out of it, timed over the steps asked for, whether each step
-    reads a fresh placement or reuses one."""
+    finite loss out of it, timed over the steps asked for, for every case of
+    the preset, and whether each step reads a fresh placement or reuses one."""
     tool = _benchmark_step()
-    config = tool.BenchmarkConfig(preset='cpu-smoke', architectures=['causal_transformer'],
+    config = tool.BenchmarkConfig(preset='cpu-smoke', architectures=[architecture],
                                   warmup=1, steps=2, dtype='float32', fixed_batch=fixed_batch)
     (case,) = tool.build_cases(config)
 
@@ -44,12 +47,3 @@ def test_cpu_smoke_case_measures_a_finite_step_through_the_trainer(fixed_batch):
     assert row["finite"] and np.isfinite(row["loss"])
     assert row["measured_steps"] == 2 and row["fixed_batch"] is fixed_batch
     assert row["ms_per_step"] > 0 and row["p50_ms"] > 0
-
-
-def test_every_small_case_builds_its_trainer():
-    """The small preset runs every registry architecture in one process, and
-    one case its model refuses ends the sweep: a field a model does not
-    have, such as an mlp_ratio given to a model without one."""
-    tool = _benchmark_step()
-    for case in tool.small_cases('bfloat16'):
-        tool.build_trainer(case)

@@ -69,28 +69,14 @@ async function passTurnstile(holder: HTMLElement): Promise<string> {
 	}
 }
 
-const CLOSE_REASONS: Record<string, string> = {
-	idle: 'The live kernel stopped after five minutes without a request.',
-	time: 'The live kernel reached its 20-minute limit and stopped.',
-	'kernel-failed': 'The live kernel did not start. Try again, or open the notebook in Colab.',
-};
-
 export class LiveSession {
 	private readonly pending = new Map<string, Pending>();
 	private next = 0;
 	onClose: (message: string) => void = () => {};
 
-	private constructor(
-		private readonly socket: WebSocket,
-		/** The kernel was a warm spare, which has already compiled the sampling cell. */
-		readonly warm: boolean,
-	) {
+	private constructor(private readonly socket: WebSocket) {
 		socket.addEventListener('message', (event) => {
 			const message = JSON.parse(String(event.data));
-			if (message.type === 'closing') {
-				this.onClose(CLOSE_REASONS[message.reason] ?? 'The live kernel stopped.');
-				return;
-			}
 			const cell = this.pending.get(String(message.id));
 			if (!cell) return;
 			if (message.type === 'done') {
@@ -103,7 +89,10 @@ export class LiveSession {
 		socket.addEventListener('close', (event) => {
 			for (const cell of this.pending.values()) cell.resolve({ status: 'aborted', count: null });
 			this.pending.clear();
-			if (event.code !== 4000) this.onClose('The connection to the live kernel closed.');
+			// The bridge says why it ended a session (shared_bridge.py); the page closes with 4000.
+			if (event.code !== 4000) {
+				this.onClose(event.reason ? `The live kernel stopped: ${event.reason}.` : 'The connection to the live kernel closed.');
+			}
 		});
 	}
 
@@ -136,7 +125,7 @@ export class LiveSession {
 			socket.removeEventListener('message', onMessage);
 			socket.removeEventListener('close', onClose);
 		}
-		return new LiveSession(socket, body.warm === true);
+		return new LiveSession(socket);
 	}
 
 	/**
@@ -174,7 +163,8 @@ export class LiveSession {
 	}
 
 	close(): void {
-		this.socket.close(1000, 'done');
+		// The bridge answers with the page's code, which the close listener knows as the page's own.
+		this.socket.close(4000, 'done');
 	}
 }
 
