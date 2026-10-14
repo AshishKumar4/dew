@@ -130,9 +130,9 @@ def rloo_advantage(rewards: jax.Array, group: int) -> jax.Array:
     return (grouped - others).reshape(-1)
 
 
-def gae(token_rewards: jax.Array, values: jax.Array, mask: jax.Array,
-        gamma: float, lam: float) -> tuple[jax.Array, jax.Array]:
-    """Compute generalized advantage estimates for `[B, T]` rewards and values.
+def gae_advantages(token_rewards: jax.Array, values: jax.Array, mask: jax.Array,
+                   gamma: float, lam: float) -> jax.Array:
+    """The unwhitened generalized advantage estimates of `[B, T]` rewards and values.
 
     The recursion runs backwards from the last step, with
     `delta_t = r_t + gamma * V(s_{t+1}) - V(s_t)` and
@@ -142,12 +142,11 @@ def gae(token_rewards: jax.Array, values: jax.Array, mask: jax.Array,
     before it. Positions outside the mask hold the neighbouring step's
     carry, as in both references, and the loss masks them again.
 
-    Returns the whitened advantages and the unwhitened returns, in that order.
-    Both references compute `returns = A + V` before whitening.
-
     The recursion runs in float32 whatever the caller's dtype, the way Tunix's
-    GRPO loss casts its log-probabilities. The whitening subtracts two nearby
-    numbers, and bf16 rounds the difference away.
+    GRPO loss casts its log-probabilities. A caller whitens the advantages
+    itself (`gae` over its batch, `PPORollout` over every process's), from
+    these rather than from returns less values: at values far above the
+    advantages, float32 rounds those differences away.
     """
     rewards = jnp.asarray(token_rewards, jnp.float32)
     values = jnp.asarray(values, jnp.float32)
@@ -166,5 +165,19 @@ def gae(token_rewards: jax.Array, values: jax.Array, mask: jax.Array,
     _, transposed = jax.lax.scan(
         step, init=(zeros, zeros),
         xs=(rewards.T, values.T, keep.T), reverse=True)
-    advantages = transposed.T
-    return masked_whiten(advantages, keep), advantages + values
+    return transposed.T
+
+
+def gae(token_rewards: jax.Array, values: jax.Array, mask: jax.Array,
+        gamma: float, lam: float) -> tuple[jax.Array, jax.Array]:
+    """Compute generalized advantage estimates for `[B, T]` rewards and values
+    (`gae_advantages`), whitened over the mask.
+
+    Returns the whitened advantages and the unwhitened returns, in that order.
+    Both references compute `returns = A + V` before whitening. The whitening
+    subtracts two nearby numbers, and bf16 rounds the difference away, so it
+    runs in float32 as the recursion does.
+    """
+    advantages = gae_advantages(token_rewards, values, mask, gamma, lam)
+    returns = advantages + jnp.asarray(values, jnp.float32)
+    return masked_whiten(advantages, jnp.asarray(mask, jnp.float32)), returns

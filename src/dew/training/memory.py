@@ -24,7 +24,7 @@ from dew.nn.sharding import mesh_axes
 from dew.objectives.base import Batch, Objective, Variables
 from dew.records import JSON, integers, json_value
 from dew.telemetry.devices import gpu_free_bytes, xla_flag
-from dew.training.distributed import PARAMETER_AXES
+from dew.training.distributed import parameter_axes
 from dew.training.state import TrainState
 
 _log = logging.getLogger(__name__)
@@ -120,7 +120,7 @@ def compiled_if_it_fits(program: jax.stages.Lowered, options: jax.stages.Compile
 def split_share(params: Variables) -> float:
     """The share of the bytes of `params`, placed arrays, every collection a
     frozen split keeps among them, that a parameter axis splits
-    (`PARAMETER_AXES`): a mesh can name fsdp or tensor and still
+    (`parameter_axes`): a mesh can name fsdp or tensor and still
     split nothing of a model whose parameters all sit below `Layout`'s
     `min_shard`, and the run's banner says how much it does."""
     total = split = 0
@@ -129,7 +129,7 @@ def split_share(params: Variables) -> float:
         sharding = leaf.sharding
         if isinstance(sharding, NamedSharding) and any(
                 sharding.mesh.shape[axis] > 1 for assignment in sharding.spec
-                for axis in mesh_axes(assignment) if axis in PARAMETER_AXES):
+                for axis in parameter_axes(mesh_axes(assignment))):
             split += leaf.nbytes
     return split / total if total else 0.0
 
