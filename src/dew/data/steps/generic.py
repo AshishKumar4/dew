@@ -28,9 +28,6 @@ class Fields(grain.MapTransform):
 
 
 @dataclasses.dataclass(frozen=True)
-
-
-@dataclasses.dataclass(frozen=True)
 class Formatting(grain.MapTransform):
     def map(self, element: Batch) -> Batch:
         fields = record(element, "dataset row")
