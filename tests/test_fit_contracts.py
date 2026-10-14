@@ -5,13 +5,12 @@ import numpy as np
 import optax
 import pytest
 
-from dew.checkpoints import Checkpoints
 from dew.data import Memory
 from dew.data.compile import compile
 from dew.data.pipeline import Pipeline
 from dew.inputs import Field, InputSpec
 from dew.objectives.base import Aux, Objective, Ratio, Step
-from dew.training import Trainer
+from dew.training import Checkpoints, Trainer
 
 
 class ScalarRegression(Objective):
