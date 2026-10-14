@@ -669,7 +669,8 @@ class DeepseekV4Attention(nn.Module):
     def __call__(self, x, decode: bool = False, kv_store=None,
                  attention_metadata: AttentionMetadata | None = None):
         tokens = coordinates_of(attention_metadata, *x.shape[:2])
-        positions, segment_ids = tokens.positions, tokens.segments
+        # Each token's logical place (`Coordinates.places`); a cached call's default is its slot.
+        positions, segment_ids = tokens.positions if decode else tokens.places(), tokens.segments
         if segment_ids is not None and self.compressor is not None:
             raise ValueError("segment_ids are not supported by deepseek_v4 compressed windows")
         if attention_metadata is not None and attention_metadata.rotary_positions is not None:
@@ -688,9 +689,7 @@ class DeepseekV4Attention(nn.Module):
                                        (batch, self.max_seq_len, self.head_dim), x.dtype)
             if positions is None:
                 positions = slots
-        if positions is None:
-            positions = jnp.arange(length) if valid is None else jnp.maximum(jnp.cumsum(valid, axis=1) - 1, 0)
-        positions = jnp.asarray(positions)
+        positions = jnp.arange(length) if positions is None else jnp.asarray(positions)
         rows = jnp.arange(length)
         cos, sin = yarn_rope_freqs(positions, self.rope_dim, self.rope_theta, self.yarn,
                                    dtype=at_least_fp32(x.dtype))
