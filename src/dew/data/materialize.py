@@ -196,6 +196,7 @@ def _memory_stages(
             rows, targets = _targeted([((index,), windows[index]) for index in range(len(windows))], counter,
                                       stage.fields[0])
         elif isinstance(stage, Pack):
+            from dew.data.packing import refuse_overlong
             from dew.data.tokens import PackedWindows
 
             derived[f"accepted_before_pack_{consumed}"] = fingerprint(
@@ -204,6 +205,7 @@ def _memory_stages(
             kept = Fields(stage.packed)
             documents = tuple(kept.map(record(value, "packing document")) for _, value in rows)
             sizes = np.asarray([len(value[stage.fields[0]]) for value in documents], np.int64)
+            refuse_overlong(sizes, stage, source.describe())
             if stage.policy == "first-fit" and not stage.along:
                 packed = PackedWindows(
                     pygrain.MapDataset.source(documents), sizes, stage.seq_len, stage.bins, source.describe(),

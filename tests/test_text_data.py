@@ -522,6 +522,27 @@ def test_packed_loader_cuts_documents_that_outgrow_the_window(tmp_path):
     np.testing.assert_array_equal(positions[0], [0, 1, 2, 3])
 
 
+def test_a_store_packs_its_documents_whole_unless_a_chunk_step_cuts_them(tmp_path):
+    """A store's planned pack places each document whole and refuses one longer than a
+    window; a chunk step before the pack cuts it into window-long pieces, which the plan
+    of the store's document lengths cuts alike, each piece a window of its own here."""
+    from dew.data.compile import compile
+    from dew.data.pipeline import Pipeline
+    from dew.data.text import chunk
+
+    _document_dir(tmp_path, [list(range(10, 19))])  # one 10-id document; windows of 4
+    stored = TokenFiles(str(tmp_path))
+    loading = Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1)
+    with pytest.raises(ValueError):
+        compile(Pipeline(stored).pack(4, bins=1).repeat().batch(1), read="indexed", provision=True,
+                loading=loading)
+    data = compile(Pipeline(stored).flat_map(chunk(4)).pack(4, bins=1).repeat().batch(1), read="indexed",
+                   provision=True, loading=loading)
+    assert data.plan.lowering == "global"
+    rows = [row["text"].tolist() for row in _read(data.train(DataPartition()), 3)]
+    assert rows == [[10, 11, 12, 13], [14, 15, 16, 17], [18, 0, 0, 0]]
+
+
 def test_packed_loader_state_restores_the_next_unseen_batch(tmp_path):
     """The trainer saves the iterator's position in the checkpoint, so a
     restored iterator has to carry on where the saved one had got to."""

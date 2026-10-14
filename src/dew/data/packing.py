@@ -20,7 +20,7 @@ import numpy as np
 
 from dew.data.dataset import Batch, Records
 from dew.data.generation import Generation
-from dew.data.pipeline import Pack
+from dew.data.pipeline import ExpandStep, Pack
 from dew.data.plan import fingerprint
 from dew.data.sources.base import Read, Shard, ShardManifest, Source, _consumed
 from dew.data.tokens import chunk_lengths, chunk_table, first_fit, packed_window
@@ -29,6 +29,29 @@ from dew.records import record
 
 def plan_name(pack: Pack, field: str) -> str:
     return "packing_" + fingerprint(dataclasses.asdict(pack))[:20] + "_" + field
+
+
+def refuse_overlong(lengths, pack: Pack, described: str) -> None:
+    """Refuse documents of `lengths` that a first-fit or best-fit `pack` would
+    have to cut to fit its windows: a pack places documents whole, and a run
+    that means to cut them says so with a chunk step before it
+    (`dew.data.text.chunk`). A concatenating pack splits by design."""
+    longest = int(np.max(lengths, initial=0))
+    if pack.policy != "concat" and longest > pack.seq_len:
+        raise ValueError(
+            f"{described} holds a document of {longest} tokens, longer than the {pack.seq_len}-token "
+            f"windows it packs into; cut documents first with flat_map(dew.data.text.chunk({pack.seq_len}))"
+        )
+
+
+def chunks_for(step: ExpandStep, pack: Pack) -> bool:
+    """Whether `step`, just before `pack`, cuts each document into the pieces a
+    plan of lengths cuts it into (`chunk_table`): consecutive pieces of the
+    window's length, the same cut in every field the pack places."""
+    from dew.data.steps.text import Chunks
+
+    return (isinstance(step, Chunks) and step.length == pack.seq_len and step.overlap == 0
+            and set(pack.fields) <= set(step.fields))
 
 
 def plan_windows(lengths: np.ndarray, pack: Pack) -> Mapping[str, np.ndarray]:
@@ -67,12 +90,18 @@ def plan_windows(lengths: np.ndarray, pack: Pack) -> Mapping[str, np.ndarray]:
 
 @dataclasses.dataclass(frozen=True)
 class PackingPlan:
+    """The plan a generation publishes for `pack`, cutting its documents where
+    a chunk step before the pack says to (`chunked`) and refusing to otherwise."""
+
     pack: Pack
+    chunked: bool = False
 
     def __call__(self, generation: Generation) -> Mapping[str, np.ndarray]:
         lengths = generation.source().lengths()
         if lengths is None:
             raise ValueError("published packing needs certified per-document lengths")
+        if not self.chunked:
+            refuse_overlong(lengths, self.pack, generation.url)
         planned = plan_windows(lengths, self.pack)
         return {plan_name(self.pack, field): value for field, value in planned.items()}
 
@@ -93,6 +122,15 @@ class _Published:
     @property
     def location(self) -> str:
         return self.generation.url
+
+    def refuse_cuts(self) -> None:
+        """Refuse a published plan that cut a document, which an unchunked pack does not."""
+        if self.generation.plan(plan_name(self.pack, "offsets")).any():
+            raise ValueError(
+                f"{self.generation.url} published windows that cut its documents, which its pack "
+                f"places whole; read it with flat_map(dew.data.text.chunk({self.pack.seq_len})) "
+                f"before the pack, as it was published"
+            )
 
     def at(self, field: str, index: int) -> int:
         return int(self.generation.plan_at(plan_name(self.pack, field), index).item())
@@ -123,6 +161,12 @@ class _Held:
     @property
     def location(self) -> str:
         return self.source.describe()
+
+    def refuse_cuts(self) -> None:
+        """Refuse documents the plan would cut, which an unchunked pack places whole."""
+        lengths = self.source.lengths()
+        if lengths is not None:
+            refuse_overlong(lengths, self.pack, self.source.describe())
 
     def at(self, field: str, index: int) -> int:
         return int(self.arrays[field][index])
@@ -178,12 +222,23 @@ class PackedSource:
     plan: _Published | _Held
 
     @classmethod
-    def published(cls, source: Source, generation: Generation, pack: Pack) -> PackedSource:
-        return cls(source, _Published(generation, pack))
+    def published(cls, source: Source, generation: Generation, pack: Pack, *,
+                  chunked: bool = False) -> PackedSource:
+        """`source` read by the plan `generation` published, cutting documents
+        only where a chunk step before the pack says to (`chunked`)."""
+        plan = _Published(generation, pack)
+        if not chunked:
+            plan.refuse_cuts()
+        return cls(source, plan)
 
     @classmethod
-    def planned(cls, source: Source, pack: Pack) -> PackedSource:
-        return cls(source, _Held(source, pack))
+    def planned(cls, source: Source, pack: Pack, *, chunked: bool = False) -> PackedSource:
+        """`source` read by a plan of the lengths it states, cutting documents
+        only where a chunk step before the pack says to (`chunked`)."""
+        plan = _Held(source, pack)
+        if not chunked:
+            plan.refuse_cuts()
+        return cls(source, plan)
 
     def describe(self) -> str:
         return f"{self.documents.describe()} {self.plan.kind} packing={self.plan.pack!r}"

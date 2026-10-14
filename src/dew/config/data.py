@@ -189,7 +189,10 @@ class TextData:
                 raise ValueError(
                     f"packed text needs producer document boundaries or EOS: {source.describe()}"
                 )
-            return Pipeline(source).pack(self.seq_len + 1, bins=self.packing_bins, policy=self.pack)
+            # A document longer than a window is cut into window-long pieces, which the
+            # source's plan of document lengths cuts alike (`PackedSource.planned`).
+            return Pipeline(source).flat_map(Chunks(self.seq_len + 1)).pack(
+                self.seq_len + 1, bins=self.packing_bins, policy=self.pack)
 
         return (
             windows(sources[0], self.seq_len if self.stride is None else self.stride),
