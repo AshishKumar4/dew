@@ -10,15 +10,15 @@ import numpy as np
 import optax
 import pytest
 from flax import linen as nn
-from model_support import decoder, flat_tree
+from model_support import decoder
 
 from dew.diffusion.block import BlockProcess
 from dew.inference import BlockGeneration, TextGeneration
 from dew.interop import Pretrained
+from dew.interop.weights import decoding_storage
 from dew.nn.inputs import ModelInputs
 from dew.objectives.lm import LMObjective
 from dew.sampling import Sampling, generate
-from dew.sampling.text import decoding_storage
 
 FIXTURES = Path(__file__).parent / "fixtures" / "hf"
 SAMPLING = Sampling(temperature=0.8, top_k=5, eos_token_ids=(3, 9))
@@ -32,22 +32,31 @@ def assert_same_generation(actual, expected):
     np.testing.assert_allclose(actual.raw_log_probs, expected.raw_log_probs, atol=2e-6, rtol=2e-6)
 
 
-def test_generate_decodes_wider_weights_at_the_models_compute_dtype():
-    """A bf16 decoder over fp32 weights decodes at bf16 storage: `generate`
-    casts each floating parameter once, the head bias kept fp32 as a
-    checkpoint loaded at bf16 holds it, and draws what the weights stored at
-    bf16 draw."""
-    model = decoder().clone(dtype=jnp.bfloat16, head_bias=True)
-    params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
-    stored = decoding_storage(model, params)
-    held = {name: leaf.dtype for name, leaf in flat_tree(stored).items()}
-    assert held.pop("params.head_bias") == jnp.float32
-    assert set(held.values()) == {jnp.dtype(jnp.bfloat16)}, held
-    assert all(leaf.dtype == jnp.float32 for leaf in jax.tree.leaves(params))
-    prompts = jnp.asarray([[1, 2, 3], [4, 5, 6]], jnp.int32)
-    wide = generate(model, params, prompts, 5, key=3, sampling=SAMPLING)
-    narrow = generate(model, stored, prompts, 5, key=3, sampling=SAMPLING)
-    for field in ("tokens", "lengths", "terminated", "behavior_log_probs", "raw_log_probs"):
+@pytest.mark.parametrize("family", ["llama-tiny", "diffusion-gemma-workflow"])
+def test_decoding_fp32_masters_draws_what_a_bf16_storage_load_draws(family):
+    """A bf16 model over fp32 masters decodes at bf16 storage: the weights it
+    casts once are those a load at bf16 storage reads, and its generation
+    draws what that load's draws, autoregressive or block by block."""
+    from test_interop import assert_parameter_storage
+
+    masters, native = (Pretrained.load(FIXTURES / family, dtype="bfloat16", attention_impl="xla",
+                                       max_seq_len=32, **storage)
+                       for storage in ({}, {"param_dtype": "bfloat16"}))
+    stored = decoding_storage(masters.model, masters.variables)
+    assert_parameter_storage(masters.variables, stored, lambda path: path[0] == "params")
+    for cast, loaded in zip(jax.tree.leaves(stored), jax.tree.leaves(native.variables), strict=True):
+        assert cast.dtype == loaded.dtype
+        np.testing.assert_array_equal(cast, loaded)
+    if family == "llama-tiny":
+        prompts = jnp.asarray([[1, 2, 3], [4, 5, 6]], jnp.int32)
+        wide, narrow = (generate(source.model, source.variables, prompts, 5, key=3, sampling=SAMPLING)
+                        for source in (masters, native))
+        fields = ("tokens", "lengths", "terminated", "behavior_log_probs", "raw_log_probs")
+    else:
+        prompts = ["<bos> t5 t7 t9 t11", "<bos> t6 t8 t10 t12"]
+        wide, narrow = (source.block_generation()(prompts, 7, key=11) for source in (masters, native))
+        fields = ("tokens", "lengths", "terminated", "decoder_steps")
+    for field in fields:
         np.testing.assert_array_equal(getattr(wide, field), getattr(narrow, field))
 
 

@@ -22,6 +22,7 @@ import numpy as np
 from flax import linen as nn, struct
 from typing_extensions import TypeVar, get_protocol_members
 
+from dew.interop.weights import decoding_storage
 from dew.nn.inputs import ModelInputs, Request, continuation_keys, local_rows, mesh_of, prompt_major
 from dew.nn.protocols import BlockDenoiser
 from dew.objectives.base import Variables
@@ -364,6 +365,7 @@ def _materialize(state: CanvasDecodeState, prompt_length: int, max_new_tokens: i
 
 def _generate(model: nn.Module, variables: Variables, inputs: ModelInputs,
               key: jax.Array, plan: CanvasPlan, n: int) -> CanvasGeneration:
+    variables = decoding_storage(model, variables)
     initial = _begin(model, variables, inputs, plan)
     prompt_length = inputs.tokens.shape[1]
 

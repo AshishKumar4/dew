@@ -106,6 +106,7 @@ from dew.inference.tasks import (
     prepared_inputs,
     shape_bucket,
 )
+from dew.interop.weights import decoding_storage
 from dew.nn.inputs import ModelInputs, host_token_rows, mesh_of, request_key
 from dew.nn.kv_cache import CURSOR, POOLED, TABLE, KVCache, Layered, is_paged, leaf_name
 from dew.nn.protocols import ProjectionGroup
@@ -114,7 +115,7 @@ from dew.objectives.base import Variables
 from dew.sampling.decoding import LogitsTransform, Stopping
 from dew.sampling.guided import Grammar
 from dew.sampling.strategies import Sample
-from dew.sampling.text import Generation, Sampling, check_inputs, decoding_storage, rebuild_position, resolve
+from dew.sampling.text import Generation, Sampling, check_inputs, rebuild_position, resolve
 
 Prompt = str | Sequence[int] | ArrayLike | ModelInputs
 """One request: text for the processor, one row of token ids, or one prepared row."""
@@ -392,8 +393,9 @@ class Server:
     refused at `submit`, with the error `TextGeneration` raises for a request
     over the model's context. Over a mesh, the slots and the admission split
     evenly over the groups of rows, and so do the pages of a paged pool. The
-    server holds the weights at their decoding storage (`decoding_storage`),
-    to which `reload` casts the weights it is handed.
+    server holds the weights at their decoding storage
+    (`dew.interop.weights.decoding_storage`), to which `reload` casts the
+    weights it is handed.
     """
 
     def __init__(self, model: nn.Module, variables: Variables, processor: Processor | None, *,

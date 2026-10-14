@@ -33,6 +33,7 @@ from flax import linen as nn
 
 from dew.diffusion.block import CanvasGeneration, through_eos
 from dew.diffusion.process import Conditioning
+from dew.interop.weights import decoding_storage
 from dew.nn.inputs import RESPONSE_FIELDS, ModelInputs, Request, continuation_keys, local_rows, mesh_of
 from dew.nn.protocols import Logits, TokenModel
 from dew.nn.sharding import explicit_spec
@@ -340,10 +341,12 @@ def _generate(model: nn.Module, variables: Variables, inputs: ModelInputs, keys:
 
     Each row is sampled on its own so the response span is the only mutable
     part of it. A continuation keeps the tokens up to its first EOS, pads the
-    rest, and reports the steps it took.
+    rest, and reports the steps it took. The weights are read at their
+    decoding storage (`dew.interop.weights.decoding_storage`).
     """
     from dew.sampling.sample import sample
 
+    variables = decoding_storage(model, variables)
     batch, prompt = inputs.tokens.shape
     if budget == 0:
         zeros = jnp.zeros((batch * n,), jnp.int32)
