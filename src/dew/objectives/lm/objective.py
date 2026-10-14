@@ -1247,7 +1247,7 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
             depths=self.mtp_weight is not None, roles=self._batch_roles(batch),
             qk_stats=self.qk_stats, indexer=self.indexer is not None, layers=layers,
             z_loss=self.z_loss if summed else None, logits=logits)
-        losses, weights, log_z, correct, _, _, routing, depths, qk, kls, sums = scores
+        losses, weights, log_z, correct, _, _, routing, depths, qk, kls, sums, _ = scores
         mass = jax.lax.stop_gradient(self.row_mean(weights, batch).total)
         prediction = Ratio(self.row_mean(losses * weights, batch).total, mass)
         ce, _ = prediction.mean()
