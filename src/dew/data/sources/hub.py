@@ -15,6 +15,7 @@ from dew.data.pipeline import Dataset
 
 from .base import Read, ShardManifest, Source, preparing
 from .files import Files, Format
+from .hf import class_names
 from .memory import _record
 
 
@@ -186,19 +187,11 @@ class Hub(Dataset):
         return self.files.manifest()
 
     def metadata(self) -> Mapping[str, object]:
-        from datasets import ClassLabel
-
-        features = self.builder.info.features
-        class_names = {
-            name: tuple(feature.names)
-            for name, feature in (features or {}).items()
-            if isinstance(feature, ClassLabel)
-        }
         splits = self.builder.info.splits
         rows = (
             {"rows": splits[self.split].num_examples} if splits is not None and self.split in splits else {}
         )
-        return {"class_names": class_names, **rows}
+        return {"class_names": class_names(self.builder.info.features), **rows}
 
     def lengths(self) -> np.ndarray | None:
         return None
