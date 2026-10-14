@@ -274,7 +274,9 @@ def stream(reader):
 
 
 class Preempting(RecordingTracker):
-    """Sends this process the scheduler's SIGTERM, once, when step `at` is logged."""
+    """Sends this process the scheduler's SIGTERM, once, when step `at` is
+    logged. The loop reads a step's log once the next step is dispatched, so
+    the notice stops the run after step `at` + 1."""
 
     def __init__(self, at):
         super().__init__()
@@ -288,7 +290,7 @@ class Preempting(RecordingTracker):
 
 
 def preempted_and_resumed(tmp_path, data, at=3, steps=6):
-    """`data` trained to `steps` with a preemption at step `at` and a resume in a fresh trainer."""
+    """`data` trained to `steps`, preempted when step `at` is logged, and resumed in a fresh trainer."""
     with pytest.raises(Preempted):
         make_trainer(tmp_path, tracker=Preempting(at)).fit(data, steps=steps, log_every=1)
     return make_trainer(tmp_path).fit(data, steps=steps, log_every=1)
@@ -327,11 +329,12 @@ def test_a_declared_stream_whose_batch_at_the_position_differs_is_refused(tmp_pa
 
 
 def test_the_replay_guard_reads_only_the_batch_at_the_position(tmp_path):
-    """The guard's limit: a declared stream that agrees up to its position
-    and differs after it resumes without complaint, on other data than the
-    uninterrupted run read, which is why replay is declared, not assumed."""
+    """The guard's limit: a declared stream that agrees up to its position,
+    the four batches before the preemption, and differs after it resumes
+    without complaint, on other data than the uninterrupted run read, which
+    is why replay is declared, not assumed."""
     opened = []
-    data = stream(replayed(lambda partition: drawn(0, opened, diverge=2)))
+    data = stream(replayed(lambda partition: drawn(0, opened, diverge=3)))
     resumed = preempted_and_resumed(tmp_path, data)
     assert int(resumed.step) == 6
     assert not same_variables(resumed, make_trainer().fit(data, steps=6, log_every=1))
