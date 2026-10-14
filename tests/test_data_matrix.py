@@ -22,6 +22,9 @@ import pytest
 from process_support import run_pool
 from test_multiprocess import assert_same_parameters, dumped_params
 
+from dew.data.dataset import DataPartition
+from dew.training import Checkpoints
+
 pytestmark = [pytest.mark.mesh, pytest.mark.distributed]
 
 STEPS = 3
@@ -48,7 +51,12 @@ def test_a_saved_position_resumes_where_an_uninterrupted_pool_lands(tmp_path, ce
         directory = tmp_path / f"resumed{processes}" / "run"
         shutil.copytree(saved, directory)
         if not elastic and processes != saved_by:
-            with pytest.raises(AssertionError, match="cannot be translated to another share"):
+            # The checkpoint resumes the shares that saved it and refuses another count's.
+            checkpoints = Checkpoints(str(saved / "matrix"))
+            checkpoints.restore(share=DataPartition(0, saved_by))
+            with pytest.raises(ValueError):
+                checkpoints.restore(share=DataPartition(0, processes))
+            with pytest.raises(AssertionError):
                 run_pool("matrix", tmp_path / f"resumed{processes}-out", processes, run_dir=directory,
                          cell=cell, name="matrix", steps=2 * STEPS)
             continue
