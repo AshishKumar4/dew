@@ -9,7 +9,8 @@ piece once (the queries, keys and values as the scans take them, so no copy spli
 backward reads the projection and the cotangents once and writes the projection's gradient once,
 everything between in fp32 registers. Neither saves anything but the projection. The forward writes
 every piece in one call, each program branching statically on the piece its blocks belong to, so that
-a decoding step, whose conv is a few launch-bound programs, launches it once; the backward's pieces
+a decoding step, whose conv is a few launch-bound programs, launches it once (a Qwen3.5-0.8B gated delta
+net's decode step on an H100 at one row, bf16 parameters: 45.4 against 38.1 us); the backward's pieces
 are each their own call, which knows statically whether it normalises and which cotangent it reads,
 and writes its columns of one gradient, each taking the last one's as its output.
 
