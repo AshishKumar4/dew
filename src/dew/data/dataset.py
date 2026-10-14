@@ -970,9 +970,26 @@ def _stacked(value) -> bool:
             and np.asarray(value).dtype.kind in "biufcSU")
 
 
+SHARED_BYTES = 1 << 16
+"""A batch column smaller than this crosses from a loading worker pickled, not in a shared-memory
+segment of its own: making, mapping, closing and unlinking a segment costs the reader more than
+copying a few KiB through the worker's queue (`DatasetOptions.min_shm_size`). A batch's 32
+captions, a shared segment each step, cost an image read 5 to 7% of its throughput."""
+
+
+def _shareable(values: Sequence[object]) -> bool:
+    """Whether a column of `values` stacks into an array of at least `SHARED_BYTES` numbers: a string
+    column's width is only known once stacked, and a column of strings is seldom large."""
+    leaves = jax.tree.leaves(values[0])
+    return (all(np.asarray(leaf).dtype.kind not in "SU" for leaf in leaves)
+            and len(values) * sum(np.asarray(leaf).nbytes for leaf in leaves) >= SHARED_BYTES)
+
+
 def record_batch(rows: Sequence[Batch], *, shared: bool = False) -> Batch:
     """Numeric and text columns stacked by Grain, with object columns (a
-    conversation's messages, a record's tools) kept as record lists."""
+    conversation's messages, a record's tools) kept as record lists. With
+    `shared`, a column large enough to be worth it (`SHARED_BYTES`) is stacked
+    into shared memory, for a loading worker to hand over without a copy."""
     if not rows:
         raise ValueError("a batch needs at least one record")
     if any(row.keys() != rows[0].keys() for row in rows[1:]):
@@ -980,7 +997,7 @@ def record_batch(rows: Sequence[Batch], *, shared: bool = False) -> Batch:
     batched: Batch = {}
     for name in rows[0]:
         values = [row[name] for row in rows]
-        batched[name] = (make_batch(values, output_to_shared_memory=shared)
+        batched[name] = (make_batch(values, output_to_shared_memory=shared and _shareable(values))
                          if all(_stacked(value) for value in values) else values)
     return batched
 

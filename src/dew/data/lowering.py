@@ -38,7 +38,16 @@ from dew.data.analysis import (
     _name,
     _until,
 )
-from dew.data.dataset import Batch, DataPartition, FilledBatch, Loading, Records, record_batch, stacked
+from dew.data.dataset import (
+    SHARED_BYTES,
+    Batch,
+    DataPartition,
+    FilledBatch,
+    Loading,
+    Records,
+    record_batch,
+    stacked,
+)
 from dew.data.mixing import (
     Accepted,
     Chunked,
@@ -609,7 +618,9 @@ class _Build:
                 _as_iter(rows, self.loading), prefetch_buffer_size=stage.buffer
             )
         elif isinstance(stage, Workers):
-            rows = _as_iter(rows, self.loading).mp_prefetch(
+            # A column too small for a shared segment of its own crosses pickled (`SHARED_BYTES`).
+            options = gx.DatasetOptions(min_shm_size=SHARED_BYTES)
+            rows = gx.WithOptionsIterDataset(_as_iter(rows, self.loading), options).mp_prefetch(
                 pygrain.MultiprocessingOptions(
                     num_workers=stage.count, per_worker_buffer_size=stage.buffer
                 ),
