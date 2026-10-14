@@ -20,6 +20,10 @@ argument from another.
 
 Rerunning this script must reproduce the committed files byte for byte; it
 trains on a fixed corpus in a fixed order.
+
+`qwen_byte_tokenizer` is the byte-level Qwen tokenizer the Z-Image, FLUX.2,
+Qwen-Image and Qwen3.8 reference generators save with their tiny Qwen
+models.
 """
 
 from __future__ import annotations
@@ -81,6 +85,27 @@ def build(corpus: list[str], every_byte: bool) -> str:
         token_id = tokenizer.token_to_id(token)
         assert token_id is not None, f"special token {token} missing after training"
     return tokenizer.to_str()
+
+
+def qwen_byte_tokenizer(metadata: dict, **options):
+    """A Qwen2 tokenizer over the byte alphabet, so every character is one
+    piece, for the reference generators' tiny Qwen models.
+
+    `metadata` is a published tokenizer_config.json: its special tokens
+    are numbered after the bytes in its order, and its eos, pad and bos
+    tokens are the tokenizer's. `options` are the caller's own Qwen2Tokenizer
+    settings, such as its chat template or padding side.
+    """
+    from tokenizers.pre_tokenizers import ByteLevel
+    from transformers import Qwen2Tokenizer
+
+    special = [item["content"] for item in metadata["added_tokens_decoder"].values()]
+    vocab = {word: index for index, word in enumerate(sorted(ByteLevel.alphabet()))}
+    for word in special:
+        vocab.setdefault(word, len(vocab))
+    return Qwen2Tokenizer(vocab=vocab, merges=[], eos_token=metadata["eos_token"],
+                          pad_token=metadata["pad_token"], bos_token=metadata.get("bos_token"),
+                          additional_special_tokens=special, **options)
 
 
 def write(out: Path, corpus: list[str], every_byte: bool, embed_template: bool) -> None:

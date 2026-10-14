@@ -349,7 +349,8 @@ def held_scan(module: nn.Module, mixed, taps, bias, scan, state_shape: tuple[int
                       held=None if held is None else held.value)
     if held is not None:
         held.value = final.astype(held.value.dtype)
-    return out
+    # The scan's output, attention's 'context' (a remat policy's `RESIDUALS`).
+    return checkpoint_name(out, 'context')
 
 
 def _masked_conv1d(x, kernel, valid, state=None, bias=None, segments=None, parts=None, dtype=None):
@@ -1130,8 +1131,6 @@ class GatedDeltaNet(nn.Module):
                         parts=heads, dtype=operand if ported else wide)
         if out is None:
             return self.out_proj(jnp.zeros((B, S, self.value_features), self.dtype))
-        # The rule's output, attention's 'context' (a remat policy's `RESIDUALS`).
-        out = checkpoint_name(out, 'context')
 
         gate = z.reshape(B, S, -1, self.head_v_dim)
         out = self.norm(out, gate)  # the norm scales, then the activation gates
@@ -1146,7 +1145,9 @@ class DepthwiseConv1d(nn.Module):
     channel-major input, and the leaf is `weight` so a translation does not
     transpose it as a Linear's kernel. `use_bias` adds `conv1d.bias` [D], as
     Mamba 2's depthwise conv has (modeling_mamba2.py:392-399). Returns the
-    [D, K] taps and the bias (or None), fp32.
+    [D, K] taps and the bias (or None) as stored: every conv widens them to
+    at least fp32 where it sums (the kernels in registers), so parameters
+    held in bf16 are not converted in memory on each decoding step.
     """
 
     features: int
@@ -1160,9 +1161,7 @@ class DepthwiseConv1d(nn.Module):
             'kernel_init'], (self.features, 1, self.kernel))
         bias = (self.param('bias', nn.initializers.zeros, (self.features,), jnp.float32)
                 if self.use_bias else None)
-        wide = at_least_fp32(weight.dtype)
-        return (jnp.asarray(weight[:, 0, :], wide),
-                None if bias is None else jnp.asarray(bias, wide))
+        return weight[:, 0, :], bias
 
 
 class RMSNormGated(nn.Module):

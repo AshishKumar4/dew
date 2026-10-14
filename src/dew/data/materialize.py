@@ -82,7 +82,7 @@ class _Memory:
         return self.held
 
     def metadata(self) -> Mapping[str, object]:
-        return {**self.original.metadata(), **self.facts, "accepted": len(self.held)}
+        return {**self.original.metadata(), **self.facts, "rows": len(self.held), "accepted": len(self.held)}
 
     def lengths(self) -> np.ndarray | None:
         return self.measured
@@ -198,6 +198,7 @@ def _memory_stages(
             rows, targets = _targeted([((index,), windows[index]) for index in range(len(windows))], counter,
                                       stage.fields[0])
         elif isinstance(stage, Pack):
+            from dew.data.packing import refuse_overlong
             from dew.data.tokens import PackedWindows
 
             derived[f"accepted_before_pack_{consumed}"] = fingerprint(
@@ -206,6 +207,7 @@ def _memory_stages(
             kept = Fields(stage.packed)
             documents = tuple(kept.map(record(value, "packing document")) for _, value in rows)
             sizes = np.asarray([len(value[stage.fields[0]]) for value in documents], np.int64)
+            refuse_overlong(sizes, stage, source.describe())
             if stage.policy == "first-fit" and not stage.along:
                 packed = PackedWindows(
                     pygrain.MapDataset.source(documents), sizes, stage.seq_len, stage.bins, source.describe(),
@@ -240,7 +242,7 @@ def _memory_stages(
                 counted = expanded_counts
         consumed += 1
     if counted is not None:
-        targets = {"windows": len(rows), "valid_targets": sum(counted.values())}
+        targets = {"valid_targets": sum(counted.values())}
     if targets is not None and targets["valid_targets"] == 0 and training:
         raise ValueError(f"corpus {_name(pipeline)} has zero valid target tokens")
     inputs = source.inputs if isinstance(source, _Memory) else len(stored)
@@ -262,7 +264,7 @@ def _targeted(
             total += count
         else:
             counter.rejected["zero_targets"] += 1
-    return kept, {"windows": len(kept), "valid_targets": total}
+    return kept, {"valid_targets": total}
 
 
 def _memory_mixture(
