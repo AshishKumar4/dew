@@ -34,6 +34,7 @@ import jax
 import numpy as np
 import tyro
 from absl import flags
+from grain._src.python.dataset.transformations.batch import make_batch
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from dew import position
@@ -1025,7 +1026,8 @@ class FilledBatch(pygrain.MapTransform):
         if held == self._rows and self._real:
             return element
         plan = RowPlan(None, held, self._rows, 0, 1)
-        return {**plan.pad(element), VALID_ROWS: ~plan.padding & self._real}
+        indices = plan.pad(np.arange(held))
+        return {**take_batch(element, indices), VALID_ROWS: ~plan.padding & self._real}
 
 
 def rows_of(batch: Mapping[str, object]) -> int:
@@ -1036,12 +1038,48 @@ def rows_of(batch: Mapping[str, object]) -> int:
     there are; a batch of such fields alone holds none. Any mapping of
     fields answers, so the trainer's own batch type reaches this as it is.
     """
-    return next((np.shape(leaf)[0] for leaf in jax.tree.leaves(batch) if np.shape(leaf)), 0)
+    leaves = jax.tree.leaves(batch, is_leaf=lambda column: isinstance(column, list))
+    return next((len(leaf) if isinstance(leaf, list) else np.shape(leaf)[0]
+                 for leaf in leaves if isinstance(leaf, list) or np.shape(leaf)), 0)
+
+
+def take_batch(batch: Batch, indices: int | slice | np.ndarray) -> Batch:
+    """Rows selected along array axes and opaque lists of object records."""
+    return jax.tree.map(
+        lambda column: ([column[int(index)] for index in indices]
+                        if isinstance(column, list) and isinstance(indices, np.ndarray)
+                        else column[indices]),
+        batch, is_leaf=lambda column: isinstance(column, list),
+    )
 
 
 _UNSTACKED = "Expected all input elements to have the same structure"
 """How grain's batching starts the error it raises when records' fields do
 not stack. A grain that words it otherwise raises its own error unchanged."""
+
+
+def _stacked(value) -> bool:
+    """Whether Grain stacks `value` into one array: numbers, strings and bytes,
+    and mappings of them; not lists, object arrays or other records."""
+    if isinstance(value, Mapping):
+        return bool(value) and all(_stacked(field) for field in value.values())
+    return (isinstance(value, (np.ndarray, np.generic, jax.Array, int, float, complex, str, bytes))
+            and np.asarray(value).dtype.kind in "biufcSU")
+
+
+def record_batch(rows: Sequence[Batch], *, shared: bool = False) -> Batch:
+    """Numeric and text columns stacked by Grain, with object columns (a
+    conversation's messages, a record's tools) kept as record lists."""
+    if not rows:
+        raise ValueError("a batch needs at least one record")
+    if any(row.keys() != rows[0].keys() for row in rows[1:]):
+        raise ValueError("the records of one batch must hold the same fields")
+    batched: Batch = {}
+    for name in rows[0]:
+        values = [row[name] for row in rows]
+        batched[name] = (make_batch(values, output_to_shared_memory=shared)
+                         if all(_stacked(value) for value in values) else values)
+    return batched
 
 
 def stacked(rows: Sequence[Batch], stack: Callable[[Sequence[Batch]], Batch]) -> Batch:
@@ -1401,10 +1439,12 @@ class RampedStream(Forwarding):
             self._held = (
                 read
                 if self._held is None
-                else jax.tree.map(lambda kept, new: np.concatenate([kept, new]), self._held, read)
+                else jax.tree.map(lambda kept, new: kept + new if isinstance(kept, list)
+                                  else np.concatenate([kept, new]), self._held, read,
+                                  is_leaf=lambda column: isinstance(column, list))
             )
-        step = jax.tree.map(lambda field: field[:rows], self._held)
-        self._held = jax.tree.map(lambda field: field[rows:], self._held)
+        step = take_batch(self._held, slice(rows))
+        self._held = take_batch(self._held, slice(rows, None))
         self._records += stage.batch
         return step
 

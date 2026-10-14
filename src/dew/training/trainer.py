@@ -121,6 +121,7 @@ from dew.training.distributed import (
     placed_bytes,
     prefetched_bytes,
     shard_batch,
+    step_reads,
 )
 from dew.training.evaluation import EvalSuite, Evaluation, MetricScores
 from dew.training.interval import Interval
@@ -375,6 +376,9 @@ class _FitRun:
     preempted: int | None = None
     notice: PreemptionNotice | None = None
     endless: bool = False
+    reads: dict[Signature, tuple[bool, ...]] = dataclasses.field(default_factory=dict)
+    """Which leaves of a batch of each signature its compiled step reads
+    (`step_reads`), which the prefetcher alone places."""
 
     def read(self) -> Batch:
         """The training stream's next batch, read through this run each time:
@@ -1558,6 +1562,8 @@ class Trainer(Generic[Loss, Effects]):
                     agreed("training input declaration", functools.partial(inputs.check, checked))
                 known, began = len(compiled), time.perf_counter()
                 train_step, measured_flops, state = self._compiled_for(compiled, state, device)
+                if len(compiled) > known and self.executable is not None and not self.host_master:
+                    run.reads[batch_signature(device)] = step_reads(self.executable)
                 interval.compiles = len(compiled)
                 if not known:
                     # Rebound once the step is compiled, so the first tick
@@ -1695,7 +1701,8 @@ class Trainer(Generic[Loss, Effects]):
                     f"{plan.dataset.batch} records a step of {stream_identity(run.source)}"))
             run.endless = stream_endless(run.source)
             run.train = DevicePrefetchIterator(run.source, mesh, source_state=position,
-                                                prepare=self._counted_batch if self.rollout is None else None)
+                                                prepare=self._counted_batch if self.rollout is None else None,
+                                                reads=run.reads)
             run.source = None  # Lifetime transferred to the prefetch worker.
 
         trained = [entry.module for entry in self.objective.program_key() if entry.trained]

@@ -240,19 +240,19 @@ class ModelInputs:
 class Coordinates:
     """Where each token of a batch sits, built once (`coordinates`) and read by every token mixer.
 
-    `positions` `[B, S]` is each real token's place in its document, counted
-    over real tokens: a packed batch's or the caller's own, None where each
-    token's place is its index in its row, or in a cached call its cache
-    slot (`slots`). `segments` numbers each row's packed documents from 1,
-    0 on the padding slots after them, which run as a document of their own,
-    so no layer carries a real document's state or history into them or
-    back; `valid` is the caller's mask of real tokens; `starts` marks each
-    document's first real token but a
-    row's first, which continues whatever state the row holds. Each is None
-    where it holds nothing (one document a row, every token real, no start),
-    which a layer's fast path reads as a static fact. `slots` is where a cache
-    writes each real token, -1 for padding, which the model fills from its
-    cache's cursor; None for an uncached call. `max_segments` bounds the
+    `positions` `[B, S]` is each real token's logical place in its document,
+    counted over real tokens: a packed batch's or the caller's own, None
+    where none is given, each token's place then its rank among its row's
+    real tokens (`places`) or, in a cached call, the slot its cache writes it
+    at. Rotation, NoPE's temperature, chunked attention and ALiBi read the
+    logical places; a cache addresses keys by slot. `segments` numbers each
+    row's packed documents from 1, 0 on the padding slots after them, which
+    run as a document of their own, so no layer carries a real document's
+    state or history into them or back; `valid` is the caller's mask of real
+    tokens; `starts` marks each document's first real token but a row's
+    first, which continues whatever state the row holds. Each is None where
+    it holds nothing (one document a row, every token real, no start), which
+    a layer's fast path reads as a static fact. `max_segments` bounds the
     documents a row holds (the packer's static plan, else the row length) and
     `right_padded` says every row's real tokens come first.
     """
@@ -261,9 +261,17 @@ class Coordinates:
     segments: jax.Array | None = None
     valid: jax.Array | None = None
     starts: jax.Array | None = None
-    slots: jax.Array | None = None
     max_segments: int = struct.field(pytree_node=False, default=1)
     right_padded: bool = struct.field(pytree_node=False, default=False)
+
+    def places(self) -> jax.Array | None:
+        """Each token's logical place in an uncached call: the given `positions`, else its rank among
+        its row's real tokens `[B, S]` (a padding slot's the rank before it, 0 before any); None
+        where every token is real and none is given, each token's place its index. A cached call's
+        places are the slots its cache writes them at where none are given."""
+        if self.positions is not None or self.valid is None:
+            return self.positions
+        return jnp.maximum(jnp.cumsum(self.valid, axis=1, dtype=jnp.int32) - 1, 0)
 
 
 def coordinates(shape: tuple[int, int] | None = None, *, segments=None, valid=None, positions=None,

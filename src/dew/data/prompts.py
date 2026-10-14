@@ -46,15 +46,12 @@ TRUTH_KEY = "ground_truth"
 INFO_KEY = "extra_info"
 """Batch key holding the reward's extra context as UTF-8 bytes."""
 
-FIELDS = ("prompt", "data_source", "ground_truth", "extra_info", "tools", "reward_model", "ability",
-          "agent_name")
-"""The row fields the source reads; anything else raises.
+FIELDS = ("prompt", "data_source", "ground_truth", "extra_info", "tools", "reward_model")
+"""The fields prompt encoding reads, leaving the others unchanged.
 
 verl's RL parquet (`rl_dataset.py`, `reward_loop/reward_manager/naive.py`
 L42-L46 at 12ebe0c) nests the answer as `reward_model.ground_truth` and
-keeps `tools_kwargs` inside `extra_info`. `ability` and `agent_name` (which
-of verl's agent loops runs the row, a choice a Dew rollout source makes) are
-read and dropped."""
+keeps `tools_kwargs` inside `extra_info`."""
 
 
 
