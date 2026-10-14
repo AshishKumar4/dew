@@ -376,6 +376,30 @@ class _TokenSplit(_WrappingDataset):
         }
 
 
+def _dies_with_parent(index: int, count: int) -> None:
+    """Ends this Grain worker once the process that started it has ended, however it ended.
+
+    A worker reads until its parent sets a stop event, so a parent killed, timed out or crashed
+    left its workers reading into a queue no one empties: 81 of them on one host, 47 GB between
+    them, a day later. A spawned worker holds its parent's sentinel, a pipe only the parent
+    writes, which reads as ended once the parent has exited; a thread waits on it and ends the
+    worker."""
+    import multiprocessing.connection
+    import os
+    import threading
+
+    parent = multiprocessing.parent_process()
+    if parent is None:
+        return
+
+    def watch() -> None:
+        multiprocessing.connection.wait([parent.sentinel])
+        os._exit(1)
+
+    watcher = f"dew worker {index} of {count} watching its parent"
+    threading.Thread(target=watch, name=watcher, daemon=True).start()
+
+
 def _as_iter(rows: Rows, loading: Loading) -> pygrain.IterDataset:
     return (
         rows.to_iter_dataset(pygrain.ReadOptions(loading.threads, loading.read_buffer))
@@ -588,7 +612,8 @@ class _Build:
             rows = _as_iter(rows, self.loading).mp_prefetch(
                 pygrain.MultiprocessingOptions(
                     num_workers=stage.count, per_worker_buffer_size=stage.buffer
-                )
+                ),
+                worker_init_fn=_dies_with_parent,
             )
         elif isinstance(stage, Rebatch):
             rows = gx.RebatchIterDataset(
