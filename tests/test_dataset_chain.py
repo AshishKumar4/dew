@@ -730,21 +730,44 @@ def keep_heads(row, rng) -> dict | Rejected:
 
 
 @pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
-def test_a_random_step_that_drops_records_draws_alike_in_every_read_and_counts_its_drops(read):
-    """A plain `fn(record, rng)` that may reject goes through random_filter_map: every read keeps
-    the same records with the same draws and counts the rest under the step's reason, where a
-    random step that drops once had a verb only as a Grain transform."""
-    def drawn(mode: str):
-        chain = Memory(rows("a", 24)).named("coins").random_filter_map(keep_heads)
-        return dataclasses.replace(chain, mode=mode, loading=READ)
-
-    kept = [(int(row["i"]), float(row["draw"])) for row in drawn(read).iterate()]
-    assert kept == [(int(row["i"]), float(row["draw"])) for row in drawn("memory").iterate()]
+def test_a_random_step_that_drops_records_draws_alike_on_every_read_and_counts_its_drops(read):
+    """A plain `fn(record, rng)` that may reject goes through random_filter_map: each read keeps
+    the records training keeps, with training's draws, and counts the rest under the step's
+    reason, where a random step that drops once had a verb only as a Grain transform."""
+    chain = Memory(rows("a", 24)).named("coins").random_filter_map(keep_heads)
+    chain = dataclasses.replace(chain, mode=read, loading=READ)
+    kept = [(int(row["i"]), float(row["draw"])) for row in chain.iterate()]
+    reader = compile(chain.repeat(1).batch(1, drop_remainder=False), loading=READ).train(DataPartition())
+    try:
+        trained = [(int(batch["i"][0]), float(batch["draw"][0])) for batch in reader]
+    finally:
+        reader.close()
+    assert kept == trained
     assert 0 < len(kept) < 24 and all(draw >= 0.5 for _, draw in kept)
-    assert drawn(read).stats(records=24)["data/rejected/coins/tails"] == 24 - len(kept)
+    assert chain.stats(records=24)["data/rejected/coins/tails"] == 24 - len(kept)
 
 
-def test_filter_map_refuses_a_step_that_draws_and_names_random_filter_map():
+class Coin(grain.RandomMapTransform):
+    """Keeps a record, with its draw, on heads."""
+
+    def random_map(self, element, rng) -> dict | Rejected:
+        return keep_heads(element, rng)
+
+
+def test_an_objective_s_random_step_that_drops_records_runs_in_its_training_branch():
+    """An objective's training step that draws and may reject runs as random_filter_map does,
+    where it once reached filter_map, which now refuses a step that draws."""
+    records = Memory(rows("a", 24)).repeat(1).batch(1, drop_remainder=False)
+    data = compile(records, read="memory", loading=READ, objective=ObjectiveData(train=(Coin(),)))
+    reader = data.train(DataPartition())
+    try:
+        draws = [float(batch["draw"][0]) for batch in reader]
+    finally:
+        reader.close()
+    assert 0 < len(draws) < 24 and all(draw >= 0.5 for draw in draws)
+
+
+def test_filter_map_refuses_a_step_that_draws():
     """A Grain RandomMapTransform draws from a generator, so filter_map, whose steps read the
     record alone, refuses it rather than call it without one."""
     from dew.data import video
