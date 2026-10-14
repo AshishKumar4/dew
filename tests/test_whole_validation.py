@@ -299,7 +299,7 @@ def test_a_metric_reads_the_fields_no_device_holds():
 
     records = Memory(tuple({"x": np.full(FEATURES, index, np.float32), "y": np.full(2, index, np.float32),
                             "index": np.int32(index), "name": f"record {index}"} for index in range(RECORDS)))
-    data = compile(Pipeline(records).repeat().batch(4), validation=Pipeline(records).batch(4),
+    data = compile(Pipeline(records).repeat().batch(ROWS), validation=Pipeline(records).batch(ROWS),
                    objective=Features().data(), read="memory",
                    loading=Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1))
 
