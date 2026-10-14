@@ -1117,3 +1117,27 @@ def test_a_memory_read_counts_valid_targets_where_it_packs():
     documents = [{"text": np.arange(size, dtype=np.int32)} for size in (8, 1, 8)]
     laid = Pipeline(Memory(documents)).pack(8, bins=1).map(Laid(), identity="laid@1").batch(1)
     assert compile(laid, read="memory", loading=READ).records == 2
+
+
+def test_a_worker_batch_shares_its_large_columns_and_pickles_the_small_ones():
+    """A loading worker stacks a batch's large numeric column straight into shared memory, which
+    the reader maps without a copy, and keeps its captions and small columns as plain arrays,
+    which cross pickled: a shared segment costs the reader more to map, close and unlink than a
+    few KiB cost to copy."""
+    from grain._src.python.ipc.shared_memory_array import SharedMemoryArray
+
+    from dew.data.dataset import record_batch
+
+    rows = [{"image": np.full((64, 64, 3), index, np.uint8), "caption": f"a photo {index}",
+             "label": np.int32(index)} for index in range(32)]
+    batch = record_batch(rows, shared=True)
+    try:
+        assert isinstance(batch["image"], SharedMemoryArray)
+        assert type(batch["caption"]) is np.ndarray and type(batch["label"]) is np.ndarray
+        assert batch["caption"].tolist() == [f"a photo {index}" for index in range(32)]
+        assert batch["label"].tolist() == list(range(32))
+        assert batch["image"][:, 0, 0, 0].tolist() == list(range(32))
+    finally:
+        for column in batch.values():
+            if isinstance(column, SharedMemoryArray):
+                column.unlink_on_del()

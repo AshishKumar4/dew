@@ -242,6 +242,13 @@ class _Up(nn.Module):
         return y + pixel_shuffle(jnp.repeat(x, 4 * self.features // self.in_features, axis=-1))
 
 
+def _resamples(layers: tuple[int, ...], level: int) -> bool:
+    """Whether the encoder downsamples after `level` and the decoder upsamples into it: a level with
+    blocks below the last. A first level with none resamples at the image instead (`conv_in` and
+    `conv_out`), so the levels' resamplings, plus that one, are the autoencoder's factor of 2."""
+    return level < len(layers) - 1 and layers[level] > 0
+
+
 class _Encoder(nn.Module):
     latent_channels: int
     head_dim: int
@@ -271,7 +278,7 @@ class _Encoder(nn.Module):
                     self.dtype,
                     f"down_blocks_{level}_{index}",
                 )(x)
-            if level < len(channels) - 1 and count > 0:
+            if _resamples(layers, level):
                 x = _Down(channels[level + 1], self.unshuffle, shortcut=True, dtype=self.dtype,
                           name=f"down_blocks_{level}_{count}")(x)
         return _conv(self.latent_channels, 3, self.dtype, "conv_out")(x) + _group_mean(
@@ -299,7 +306,7 @@ class _Decoder(nn.Module):
         x = x + jnp.repeat(latents, channels[-1] // self.latent_channels, axis=-1)
         for level in reversed(range(len(channels))):
             count = layers[level]
-            upsampled = level < len(channels) - 1 and count > 0
+            upsampled = _resamples(layers, level)
             if upsampled:
                 x = _Up(
                     channels[level + 1],
@@ -361,7 +368,10 @@ class DCAE(nn.Module):
 
     @property
     def downscale_factor(self) -> int:
-        return 2 ** (len(self.encoder_channels) - 1)
+        """2 to the encoder's resamplings: one a level with blocks below the last, and one at the
+        image where the first level has none (`_resamples`)."""
+        layers = self.encoder_layers
+        return 2 ** ((layers[0] == 0) + sum(_resamples(layers, level) for level in range(len(layers))))
 
     def setup(self):
         self.encoder = _Encoder(
@@ -480,18 +490,16 @@ class DCAutoencoder(ModuleAutoEncoder[DCAE]):
     """Native DC-AE weights and the pipeline's latent scaling,
     `z * scaling_factor` on the way out and `z / scaling_factor` on the way in."""
 
+    record_name = 'dc_ae'
+    record_module = DCAE
+
     def __init__(self, *, model: DCAE, params: Variables, latent_scale: float, latent_shift: float = 0.0):
         super().__init__(model, params)
         self.latent_scale = latent_scale
         self.latent_shift = latent_shift
 
-    @property
-    def downscale_factor(self) -> int:
-        return self.model.downscale_factor
-
-    @property
-    def latent_channels(self) -> int:
-        return self.model.latent_channels
+    def record_arguments(self) -> dict:
+        return {'latent_scale': self.latent_scale, 'latent_shift': self.latent_shift}
 
 
 def load_dc_ae(name_or_dir: str | Path, compute=jnp.float32, *, revision: str | None = None,

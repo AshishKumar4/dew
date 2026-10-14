@@ -42,15 +42,14 @@ def rounding_bound(config, reference, *, image=False):
     return float(2 * (_ROUNDING + recurrent_rounding) * epsilon * text.num_hidden_layers * scale)
 
 
-def measure_checkpoint(checkpoint, output, revision=None, *, reference_device=None):
-    """Return parity measurements and each (Dew logits, reference logits, token ids)."""
-    torch.backends.cuda.matmul.allow_tf32 = False
-    torch.backends.cudnn.allow_tf32 = False
+def measure_checkpoint(checkpoint, output, revision=None):
+    """Return parity measurements and each (Dew logits, reference logits, token ids). The reference
+    runs on the CPU whatever JAX's platform, so a CPU-only Torch build supplies it beside a GPU and
+    no TF32 enters it."""
     config = AutoConfig.from_pretrained(checkpoint, revision=revision)
     processor = AutoProcessor.from_pretrained(checkpoint, revision=revision)
-    device = reference_device or ('cuda' if jax.default_backend() == 'gpu' else 'cpu')
     reference = AutoModelForImageTextToText.from_pretrained(
-        checkpoint, dtype=torch.float32, attn_implementation='eager', revision=revision).eval().to(device)
+        checkpoint, dtype=torch.float32, attn_implementation='eager', revision=revision).eval()
     image = np.random.default_rng(67).integers(0, 256, (32, 32, 3), dtype=np.uint8)
     prompt = (f'The image shows {processor.image_token} a' if config.model_type == 'gemma4' else
               'The image shows <|vision_start|><|image_pad|><|vision_end|> a')
@@ -60,12 +59,10 @@ def measure_checkpoint(checkpoint, output, revision=None, *, reference_device=No
     continuations = []
     with torch.no_grad():
         for batch in batches:
-            placed = {name: value.to(device) for name, value in batch.items()}
-            expected.append(reference(**placed, use_cache=False).logits.cpu().numpy())
+            expected.append(reference(**batch, use_cache=False).logits.numpy())
             continuations.append(reference.generate(
-                **placed, max_new_tokens=3, do_sample=False, eos_token_id=None).cpu().numpy()[:, -3:])
+                **batch, max_new_tokens=3, do_sample=False, eos_token_id=None).numpy()[:, -3:])
     del reference
-    torch.cuda.empty_cache()
     loaded = Pretrained.load(checkpoint, dtype='float32', attention_impl='reference', max_seq_len=256,
                              revision=revision)
     language = loaded.model.language_model.clone(precision=jax.lax.Precision.HIGHEST)

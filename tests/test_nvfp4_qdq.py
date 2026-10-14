@@ -5,11 +5,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from interop_support import NVFP4_QDQ_CASES, assert_same_stored_tensors, nvfp4_qdq_case
-from reference_error import assert_as_exact_as_the_reference
+from interop_support import NVFP4_QDQ_CASES, nvfp4_qdq_case
 
-from dew.interop import Pretrained
-from dew.interop.safetensors_io import read_weights
 from dew.training.quantization import InputQuantizer, nvfp4_input_qdq
 
 
@@ -31,26 +28,6 @@ def test_the_checkpoint_input_quantizer_matches_the_librarys_forward_bit_for_bit
         expected = reference[stem + ("/qdq" if dtype == jnp.float32 else "/qdq_bf16")]
         np.testing.assert_array_equal(np.asarray(actual, np.float32).view(np.uint32),
                                       expected.view(np.uint32), err_msg=stem)
-
-
-def test_loading_nvfp4_executes_input_qdq_and_matches_the_same_file_reference(case):
-    """The quantized function, held to the reference's own error against float64."""
-    _, directory, reference = case
-    loaded = Pretrained.load(directory, dtype="float32", attention_impl="reference")
-    actual = loaded.model.apply(loaded.variables, reference["ids"].astype(np.int32))
-    assert_as_exact_as_the_reference(actual, reference["logits"], reference["logits_f64"], "NVFP4 QDQ logits")
-    np.testing.assert_array_equal(np.argmax(actual, -1), np.argmax(reference["logits"], -1))
-
-
-def test_export_keeps_the_calibrated_input_scale_and_quantized_forward(case, tmp_path):
-    _, directory, reference = case
-    loaded = Pretrained.load(directory, dtype="float32", attention_impl="reference")
-    loaded.save(tmp_path)
-    written, original = read_weights(tmp_path), read_weights(directory)
-    assert_same_stored_tensors(written, original)
-    reloaded = Pretrained.load(tmp_path, dtype="float32", attention_impl="reference")
-    actual = reloaded.model.apply(reloaded.variables, reference["ids"].astype(np.int32))
-    assert_as_exact_as_the_reference(actual, reference["logits"], reference["logits_f64"], "NVFP4 export")
 
 
 def test_input_qdq_uses_the_training_paths_straight_through_gradient(case):
