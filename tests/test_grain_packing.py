@@ -3,6 +3,7 @@
 the stage's policy as an indexed read does."""
 
 import grain
+import jax
 import numpy as np
 import pytest
 from grain.experimental import FirstFitPackIterDataset
@@ -58,7 +59,7 @@ def test_a_memory_read_packs_by_the_policy_an_indexed_read_packs_by(policy):
     def windows(read):
         reader = validation(pipeline, batch=2, read=read, loading=READ)(DataPartition())
         try:
-            return [{key: np.asarray(value).tolist() for key, value in batch.items()} for batch in reader]
+            return [jax.tree.map(lambda value: np.asarray(value).tolist(), batch) for batch in reader]
         finally:
             reader.close()
 
