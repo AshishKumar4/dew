@@ -122,15 +122,11 @@ class Engine(BaseHTTPRequestHandler):
     """Records every request's path, query and body and answers like the engine it stands for.
 
     Like vLLM v0.30.0, `/pause` and `/resume` answer a status,
-    `/reset_prefix_cache` answers 200 with `{"success": bool}` whether or not
-    it reset, and `/update_weight_version` answers `{"success": true}`. Like
-    SGLang v0.5.20, a weight update answers `success` in its body, with 400
-    when it fails, and flushes the radix cache unless the request says
-    otherwise. Like vLLM's NCCL weight transfer, `/get_world_size` reports one
-    worker, and opening the group and starting or finishing an update answer
-    200. The server's `failure` makes the reset or update
-    fail: "status" with an error status, "body" with 200 and `success: false`.
-    Every replica is its own server, so each keeps its own record.
+    `/reset_prefix_cache` answers 200 with `{"success": true}`, and
+    `/update_weight_version` answers `{"success": true}`. Like SGLang
+    v0.5.20, a weight update answers `success` in its body and flushes the
+    radix cache unless the request says otherwise. Every replica is its own
+    server, so each keeps its own record.
     """
 
     def answer(self, status, body):
@@ -144,41 +140,20 @@ class Engine(BaseHTTPRequestHandler):
         raw = self.rfile.read(length)
         body = json.loads(raw) if raw else None
         path, _, query = self.path.partition("?")
-        record, failure = self.server.seen, self.server.failure
-        record.append((path, query, body))
+        self.server.seen.append((path, query, body))
         if path in ("/pause", "/resume"):
             return self.answer(200, {"status": "paused" if path == "/pause" else "resumed"})
         if path == "/collective_rpc":
             return self.answer(200, [None])
-        if path == "/admin/weight_version":
-            return self.answer(200, {"weight_version": body["weight_version"]})
         if path == "/update_weight_version":
             return self.answer(200, {"success": True, "new_version": body["new_version"]})
-        if path in ("/init_weight_transfer_engine", "/start_weight_update", "/finish_weight_update"):
-            return self.answer(200, {"success": True})
-        if path == "/update_weights" and failure is None:
-            return self.answer(200, {"success": True})
         if path == "/reset_prefix_cache":
-            if failure == "status":
-                return self.answer(500, {"error": "engine dead"})
-            return self.answer(200, {"success": failure != "body"})
-        if failure is not None:
-            return self.answer(400 if failure == "status" else 200,
-                               {"success": False, "message": "Failed to update weights: shape mismatch",
-                                "num_paused_requests": 0})
+            return self.answer(200, {"success": True})
         self.server.flushed.append(body.get("flush_cache", True))
         self.answer(
             200, {"success": True, "message": "Succeeded to update model weights.", "num_paused_requests": 0}
         )
         return None
-
-    def do_GET(self):
-        path, _, query = self.path.partition("?")
-        self.server.seen.append((path, query, None))
-        if path == "/get_world_size":
-            self.answer(200, {"world_size": 1})
-        else:
-            self.answer(404, {"error": f"no route {path}"})
 
     def log_message(self, *args):
         pass
@@ -186,13 +161,13 @@ class Engine(BaseHTTPRequestHandler):
 
 @pytest.fixture
 def replicas():
-    """Start local engine stand-ins on demand; each has `url`, `seen`, `flushed` and `failure`."""
+    """Start local engine stand-ins on demand; each has `url`, `seen` and `flushed`."""
     started = []
 
     def start(count):
         for _ in range(count):
             server = HTTPServer(("127.0.0.1", 0), Engine)
-            server.seen, server.flushed, server.failure = [], [], None
+            server.seen, server.flushed = [], []
             server.url = f"http://127.0.0.1:{server.server_port}"
             threading.Thread(target=server.serve_forever, daemon=True).start()
             started.append(server)

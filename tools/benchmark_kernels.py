@@ -29,7 +29,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
-from benchmark_cases import Case
+from benchmark_cases import LM_DENSE, LM_MOE, Case
 from benchmark_models import batches, build_trainer
 
 from dew.config import OptimConfig
@@ -37,9 +37,6 @@ from dew.nn.kernels.tuning import samples
 from dew.nn.moe import expert_projection
 from dew.telemetry.profile import capture_options
 from dew.training.distributed import DevicePrefetchIterator
-
-VOCAB = 50304
-SEQUENCE = 1024
 
 
 def timed(function, arguments, repeats: int) -> dict[str, float]:
@@ -139,10 +136,6 @@ def adam(args: argparse.Namespace) -> dict[str, object]:
 
 
 def case_for(path: str, batch: int, args: argparse.Namespace | None) -> Case:
-    def decoder(layers: int, width: int, heads: int, mlp: int) -> dict[str, object]:
-        return {"vocab_size": VOCAB, "emb_features": width, "num_layers": layers,
-                "num_heads": heads, "mlp_features": mlp, "max_seq_len": SEQUENCE}
-
     remat = None if args is None else args.remat
     if path == "dit":
         # DiT-L/2's width and depth on 64x64 inputs, 1024 tokens a sample.
@@ -152,17 +145,15 @@ def case_for(path: str, batch: int, args: argparse.Namespace | None) -> Case:
         return Case("simple_dit", config, dtype="bfloat16", batch_size=batch,
                                    image_size=64)
     if path == "lm-dense":
-        config = decoder(24, 1024, 16, 2816)
+        config = dict(LM_DENSE)
     else:
-        # Every second layer routes, Qwen3-MoE's decoder_sparse_step 2.
-        mixture: dict[str, object] = {"experts": 8, "top_k": 2, "layers": [1, 3, 5, 7, 9, 11],
-                                      "dispatch": "global"}
+        config = dict(LM_MOE)
         if args is not None:
-            mixture["implementation"] = args.implementation
-        config = {**decoder(12, 768, 12, 2048), "mixture": mixture}
+            config["mixture"] = {**LM_MOE["mixture"], "implementation": args.implementation}
     config["remat"] = None if remat in (None, "none") else remat
+    # The decoder's whole context, a window a row.
     return Case("causal_transformer", config, dtype="bfloat16",
-                               batch_size=batch, seq_len=SEQUENCE)
+                               batch_size=batch, seq_len=config["max_seq_len"])
 
 
 def step(args: argparse.Namespace) -> dict[str, object]:
