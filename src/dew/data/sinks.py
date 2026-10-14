@@ -179,9 +179,12 @@ def export(
     elif isinstance(values, Iterable):
         rows = iter(values)
     else:
+        from dew.data.analysis import _preferred_read
         from dew.data.compile import iterate
+        from dew.data.dataset import Loading
 
-        rows = iter(iterate(values, read="streamed"))
+        read = values.mode or _preferred_read(lambda _: (values,), provision=True)
+        rows = iter(iterate(values, read=read, provision=True, loading=values.loading or Loading()))
     root = Store(url, storage_options)
     writer = uuid.uuid4().hex
     target = root.child(f"shards/{writer}")
