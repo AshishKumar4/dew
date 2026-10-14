@@ -49,6 +49,7 @@ import pytest
 from capability_modules import Denoiser, FamilyText, NNXDenoiser, NNXLanguageModel, NNXTokens, TokenModel
 from flax.nnx import bridge
 from recording import RecordingTracker
+from steady_state import steady_state
 from test_precision_policy import PER_ARCH, TINY
 
 from dew.checkpoints import Checkpoints
@@ -445,7 +446,8 @@ def assert_trains(objective, batch: Mapping, directory: Path, *, evaluated: Mapp
     gradient that is not finite would leave the leaf so. The run checkpoints
     its step, and evaluation scores `evaluated` (the batch by default) to
     finite artifacts, or, for an objective that scores no tokens (`scores`
-    False), to none. `data` replaces the batch stream with the method's own;
+    False), to none; a second evaluation runs the programs the first
+    compiled, tracing nothing. `data` replaces the batch stream with the method's own;
     a method that trains on what its `rollout` samples from the batch, not
     on the batch (`sampled` False), has no sample field to check.
     """
@@ -479,6 +481,8 @@ def assert_trains(objective, batch: Mapping, directory: Path, *, evaluated: Mapp
     artifact = objective.evaluate(variables, batch if evaluated is None else evaluated, trained.step)
     # An objective that scores no tokens evaluates to nothing (`Objective.evaluate`).
     assert (artifact is not None and finite(artifact)) if scores else artifact is None, artifact
+    with steady_state(allow=("host_to_device", "device_to_host")):
+        objective.evaluate(variables, batch if evaluated is None else evaluated, trained.step)
     return trained
 
 
