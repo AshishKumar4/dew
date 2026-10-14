@@ -165,28 +165,14 @@ VAE = dict(base_dim=4, decoder_base_dim=6, z_dim=8, dim_mult=[1, 2, 2, 2, 2], nu
            scale_factor_spatial=16, scale_factor_temporal=8)
 
 
-def tokenizer():
-    """A byte-level Qwen2 tokenizer carrying the published special tokens,
-    padding side and chat template: every character is one piece."""
-    from tokenizers.pre_tokenizers import ByteLevel
-    from transformers import Qwen2Tokenizer
-
-    metadata = json.loads((SOURCE / "processor" / "tokenizer_config.json").read_text())
-    special = [item["content"] for item in metadata["added_tokens_decoder"].values()]
-    vocab = {word: index for index, word in enumerate(sorted(ByteLevel.alphabet()))}
-    for word in special:
-        vocab.setdefault(word, len(vocab))
-    return Qwen2Tokenizer(vocab=vocab, merges=[], eos_token=metadata["eos_token"],
-                          pad_token=metadata["pad_token"], additional_special_tokens=special,
-                          padding_side="left")
-
-
 def processor():
+    from make_tiny_tokenizer import qwen_byte_tokenizer
     from transformers import AutoImageProcessor, AutoVideoProcessor, Qwen3VLProcessor
 
     source = SOURCE / "processor"
+    metadata = json.loads((source / "tokenizer_config.json").read_text())
     return Qwen3VLProcessor(image_processor=AutoImageProcessor.from_pretrained(source),
-                            tokenizer=tokenizer(),
+                            tokenizer=qwen_byte_tokenizer(metadata, padding_side="left"),
                             video_processor=AutoVideoProcessor.from_pretrained(source),
                             chat_template=(source / "chat_template.jinja").read_text())
 

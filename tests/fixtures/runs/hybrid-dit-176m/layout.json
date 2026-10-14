@@ -1,0 +1,5764 @@
+{
+ "revision": "13393896010260671b58cda12a7a2eab3d270e87",
+ "artifact": {
+  "objective": "dew.objectives.diffusion.objective:DiffusionObjective",
+  "model": {
+   "name": "dew.nn.backbones.ssm_dit:HybridSSMAttentionDiT",
+   "fields": {
+    "output_channels": 4,
+    "patch_size": 2,
+    "emb_features": 768,
+    "num_layers": 16,
+    "num_heads": 12,
+    "mlp_ratio": 4,
+    "dropout_rate": 0.0,
+    "force_fp32_for_softmax": true,
+    "norm_epsilon": 1e-05,
+    "qk_norm": false,
+    "remat": false,
+    "scan_order": "zigzag",
+    "adaln_silu": false,
+    "text_pooling": "all",
+    "routes": [],
+    "patch_bottleneck": null,
+    "interval": false,
+    "time_scale": 16,
+    "ssm_state_dim": 64,
+    "block_pattern": null,
+    "ssm_attention_ratio": "3:1",
+    "bidirectional_ssm": true,
+    "use_2d_fusion": true,
+    "attention_impl": "auto",
+    "dtype": "float32"
+   }
+  },
+  "process": {
+   "schedule": {
+    "class": "dew.diffusion.schedules.karras:EDMNoiseScheduler",
+    "fields": {
+     "sigma_min": 0.002,
+     "sigma_max": 80.0,
+     "sigma_data": 0.5,
+     "P_mean": -0.4,
+     "P_std": 1.0
+    }
+   },
+   "prediction": {
+    "class": "dew.diffusion.transforms:KarrasPredictionTransform",
+    "fields": {
+     "sigma_data": 0.5,
+     "velocity": false
+    }
+   },
+   "weighting": {
+    "class": "dew.diffusion.transforms:ScheduleWeighting",
+    "fields": {}
+   },
+   "sampling": {
+    "class": "dew.diffusion.schedules.karras:KarrasVENoiseScheduler",
+    "fields": {
+     "sigma_min": 0.002,
+     "sigma_max": 80.0,
+     "rho": 7.0,
+     "sigma_data": 0.5
+    }
+   },
+   "interval": false
+  },
+  "inputs": {
+   "sample": {
+    "key": "image",
+    "shape": [
+     256,
+     256,
+     3
+    ]
+   },
+   "conditions": {
+    "textcontext": {
+     "encoder": {
+      "class": "dew.inputs.encoders:CLIPText",
+      "fields": {
+       "checkpoint": "openai/clip-vit-large-patch14",
+       "dtype": "bfloat16",
+       "param_dtype": "float32"
+      }
+     },
+     "field": "text",
+     "unconditional": ""
+    }
+   }
+  },
+  "autoencoder": {
+   "name": "sd_vae",
+   "fields": {
+    "model": {
+     "channels": [
+      128,
+      256,
+      512,
+      512
+     ],
+     "latent_channels": 4,
+     "image_channels": 3,
+     "blocks_per_level": 2,
+     "norm_groups": 32,
+     "quantize": true,
+     "post_quantize": true,
+     "decoder_channels": null,
+     "dtype": "bfloat16"
+    },
+    "dtype": "bfloat16",
+    "latent_shift": 0.0,
+    "latent_scale": 0.18215
+   }
+  },
+  "solver": {
+   "class": "dew.sampling.solvers.dpm:DPMSolverMultistep",
+   "fields": {
+    "order": 2,
+    "algorithm": "dpmsolver++",
+    "solver_type": "midpoint",
+    "lower_order_final": true,
+    "euler_at_final": false
+   }
+  },
+  "guidance": {
+   "class": "dew.sampling.guidance:CFG",
+   "fields": {
+    "scale": 5.0,
+    "interval": [
+     0.0,
+     1.0
+    ],
+    "rescale": 0.0
+   }
+  },
+  "sampling_steps": 20,
+  "condition_precision": null
+ },
+ "variables": {
+  "autoencoder/decoder/conv_in/bias": [
+   [
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/conv_in/kernel": [
+   [
+    3,
+    3,
+    4,
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/conv_norm_out/bias": [
+   [
+    128
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/conv_norm_out/scale": [
+   [
+    128
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/conv_out/bias": [
+   [
+    3
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/conv_out/kernel": [
+   [
+    3,
+    3,
+    128,
+    3
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/mid_block/attentions_0/group_norm/bias": [
+   [
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/mid_block/attentions_0/group_norm/scale": [
+   [
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/mid_block/attentions_0/key/bias": [
+   [
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/mid_block/attentions_0/key/kernel": [
+   [
+    512,
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/mid_block/attentions_0/proj_attn/bias": [
+   [
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/mid_block/attentions_0/proj_attn/kernel": [
+   [
+    512,
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/mid_block/attentions_0/query/bias": [
+   [
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/mid_block/attentions_0/query/kernel": [
+   [
+    512,
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/mid_block/attentions_0/value/bias": [
+   [
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/mid_block/attentions_0/value/kernel": [
+   [
+    512,
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/mid_block/resnets_0/conv1/bias": [
+   [
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/mid_block/resnets_0/conv1/kernel": [
+   [
+    3,
+    3,
+    512,
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/mid_block/resnets_0/conv2/bias": [
+   [
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/mid_block/resnets_0/conv2/kernel": [
+   [
+    3,
+    3,
+    512,
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/mid_block/resnets_0/norm1/bias": [
+   [
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/mid_block/resnets_0/norm1/scale": [
+   [
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/mid_block/resnets_0/norm2/bias": [
+   [
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/mid_block/resnets_0/norm2/scale": [
+   [
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/mid_block/resnets_1/conv1/bias": [
+   [
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/mid_block/resnets_1/conv1/kernel": [
+   [
+    3,
+    3,
+    512,
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/mid_block/resnets_1/conv2/bias": [
+   [
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/mid_block/resnets_1/conv2/kernel": [
+   [
+    3,
+    3,
+    512,
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/mid_block/resnets_1/norm1/bias": [
+   [
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/mid_block/resnets_1/norm1/scale": [
+   [
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/mid_block/resnets_1/norm2/bias": [
+   [
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/mid_block/resnets_1/norm2/scale": [
+   [
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/up_blocks_0/resnets_0/conv1/bias": [
+   [
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/up_blocks_0/resnets_0/conv1/kernel": [
+   [
+    3,
+    3,
+    512,
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/up_blocks_0/resnets_0/conv2/bias": [
+   [
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/up_blocks_0/resnets_0/conv2/kernel": [
+   [
+    3,
+    3,
+    512,
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/up_blocks_0/resnets_0/norm1/bias": [
+   [
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/up_blocks_0/resnets_0/norm1/scale": [
+   [
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/up_blocks_0/resnets_0/norm2/bias": [
+   [
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/up_blocks_0/resnets_0/norm2/scale": [
+   [
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/up_blocks_0/resnets_1/conv1/bias": [
+   [
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/up_blocks_0/resnets_1/conv1/kernel": [
+   [
+    3,
+    3,
+    512,
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/up_blocks_0/resnets_1/conv2/bias": [
+   [
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/up_blocks_0/resnets_1/conv2/kernel": [
+   [
+    3,
+    3,
+    512,
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/up_blocks_0/resnets_1/norm1/bias": [
+   [
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/up_blocks_0/resnets_1/norm1/scale": [
+   [
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/up_blocks_0/resnets_1/norm2/bias": [
+   [
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/up_blocks_0/resnets_1/norm2/scale": [
+   [
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/up_blocks_0/resnets_2/conv1/bias": [
+   [
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/up_blocks_0/resnets_2/conv1/kernel": [
+   [
+    3,
+    3,
+    512,
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/up_blocks_0/resnets_2/conv2/bias": [
+   [
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/up_blocks_0/resnets_2/conv2/kernel": [
+   [
+    3,
+    3,
+    512,
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/up_blocks_0/resnets_2/norm1/bias": [
+   [
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/up_blocks_0/resnets_2/norm1/scale": [
+   [
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/up_blocks_0/resnets_2/norm2/bias": [
+   [
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/up_blocks_0/resnets_2/norm2/scale": [
+   [
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/up_blocks_0/upsamplers_0/conv/bias": [
+   [
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/up_blocks_0/upsamplers_0/conv/kernel": [
+   [
+    3,
+    3,
+    512,
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/up_blocks_1/resnets_0/conv1/bias": [
+   [
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/up_blocks_1/resnets_0/conv1/kernel": [
+   [
+    3,
+    3,
+    512,
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/up_blocks_1/resnets_0/conv2/bias": [
+   [
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/up_blocks_1/resnets_0/conv2/kernel": [
+   [
+    3,
+    3,
+    512,
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/up_blocks_1/resnets_0/norm1/bias": [
+   [
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/up_blocks_1/resnets_0/norm1/scale": [
+   [
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/up_blocks_1/resnets_0/norm2/bias": [
+   [
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/up_blocks_1/resnets_0/norm2/scale": [
+   [
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/up_blocks_1/resnets_1/conv1/bias": [
+   [
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/up_blocks_1/resnets_1/conv1/kernel": [
+   [
+    3,
+    3,
+    512,
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/up_blocks_1/resnets_1/conv2/bias": [
+   [
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/up_blocks_1/resnets_1/conv2/kernel": [
+   [
+    3,
+    3,
+    512,
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/up_blocks_1/resnets_1/norm1/bias": [
+   [
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/up_blocks_1/resnets_1/norm1/scale": [
+   [
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/up_blocks_1/resnets_1/norm2/bias": [
+   [
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/up_blocks_1/resnets_1/norm2/scale": [
+   [
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/up_blocks_1/resnets_2/conv1/bias": [
+   [
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/up_blocks_1/resnets_2/conv1/kernel": [
+   [
+    3,
+    3,
+    512,
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/up_blocks_1/resnets_2/conv2/bias": [
+   [
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/up_blocks_1/resnets_2/conv2/kernel": [
+   [
+    3,
+    3,
+    512,
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/up_blocks_1/resnets_2/norm1/bias": [
+   [
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/up_blocks_1/resnets_2/norm1/scale": [
+   [
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/up_blocks_1/resnets_2/norm2/bias": [
+   [
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/up_blocks_1/resnets_2/norm2/scale": [
+   [
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/up_blocks_1/upsamplers_0/conv/bias": [
+   [
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/up_blocks_1/upsamplers_0/conv/kernel": [
+   [
+    3,
+    3,
+    512,
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/up_blocks_2/resnets_0/conv1/bias": [
+   [
+    256
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/up_blocks_2/resnets_0/conv1/kernel": [
+   [
+    3,
+    3,
+    512,
+    256
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/up_blocks_2/resnets_0/conv2/bias": [
+   [
+    256
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/up_blocks_2/resnets_0/conv2/kernel": [
+   [
+    3,
+    3,
+    256,
+    256
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/up_blocks_2/resnets_0/conv_shortcut/bias": [
+   [
+    256
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/up_blocks_2/resnets_0/conv_shortcut/kernel": [
+   [
+    1,
+    1,
+    512,
+    256
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/up_blocks_2/resnets_0/norm1/bias": [
+   [
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/up_blocks_2/resnets_0/norm1/scale": [
+   [
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/up_blocks_2/resnets_0/norm2/bias": [
+   [
+    256
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/up_blocks_2/resnets_0/norm2/scale": [
+   [
+    256
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/up_blocks_2/resnets_1/conv1/bias": [
+   [
+    256
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/up_blocks_2/resnets_1/conv1/kernel": [
+   [
+    3,
+    3,
+    256,
+    256
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/up_blocks_2/resnets_1/conv2/bias": [
+   [
+    256
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/up_blocks_2/resnets_1/conv2/kernel": [
+   [
+    3,
+    3,
+    256,
+    256
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/up_blocks_2/resnets_1/norm1/bias": [
+   [
+    256
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/up_blocks_2/resnets_1/norm1/scale": [
+   [
+    256
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/up_blocks_2/resnets_1/norm2/bias": [
+   [
+    256
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/up_blocks_2/resnets_1/norm2/scale": [
+   [
+    256
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/up_blocks_2/resnets_2/conv1/bias": [
+   [
+    256
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/up_blocks_2/resnets_2/conv1/kernel": [
+   [
+    3,
+    3,
+    256,
+    256
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/up_blocks_2/resnets_2/conv2/bias": [
+   [
+    256
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/up_blocks_2/resnets_2/conv2/kernel": [
+   [
+    3,
+    3,
+    256,
+    256
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/up_blocks_2/resnets_2/norm1/bias": [
+   [
+    256
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/up_blocks_2/resnets_2/norm1/scale": [
+   [
+    256
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/up_blocks_2/resnets_2/norm2/bias": [
+   [
+    256
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/up_blocks_2/resnets_2/norm2/scale": [
+   [
+    256
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/up_blocks_2/upsamplers_0/conv/bias": [
+   [
+    256
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/up_blocks_2/upsamplers_0/conv/kernel": [
+   [
+    3,
+    3,
+    256,
+    256
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/up_blocks_3/resnets_0/conv1/bias": [
+   [
+    128
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/up_blocks_3/resnets_0/conv1/kernel": [
+   [
+    3,
+    3,
+    256,
+    128
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/up_blocks_3/resnets_0/conv2/bias": [
+   [
+    128
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/up_blocks_3/resnets_0/conv2/kernel": [
+   [
+    3,
+    3,
+    128,
+    128
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/up_blocks_3/resnets_0/conv_shortcut/bias": [
+   [
+    128
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/up_blocks_3/resnets_0/conv_shortcut/kernel": [
+   [
+    1,
+    1,
+    256,
+    128
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/up_blocks_3/resnets_0/norm1/bias": [
+   [
+    256
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/up_blocks_3/resnets_0/norm1/scale": [
+   [
+    256
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/up_blocks_3/resnets_0/norm2/bias": [
+   [
+    128
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/up_blocks_3/resnets_0/norm2/scale": [
+   [
+    128
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/up_blocks_3/resnets_1/conv1/bias": [
+   [
+    128
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/up_blocks_3/resnets_1/conv1/kernel": [
+   [
+    3,
+    3,
+    128,
+    128
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/up_blocks_3/resnets_1/conv2/bias": [
+   [
+    128
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/up_blocks_3/resnets_1/conv2/kernel": [
+   [
+    3,
+    3,
+    128,
+    128
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/up_blocks_3/resnets_1/norm1/bias": [
+   [
+    128
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/up_blocks_3/resnets_1/norm1/scale": [
+   [
+    128
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/up_blocks_3/resnets_1/norm2/bias": [
+   [
+    128
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/up_blocks_3/resnets_1/norm2/scale": [
+   [
+    128
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/up_blocks_3/resnets_2/conv1/bias": [
+   [
+    128
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/up_blocks_3/resnets_2/conv1/kernel": [
+   [
+    3,
+    3,
+    128,
+    128
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/up_blocks_3/resnets_2/conv2/bias": [
+   [
+    128
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/up_blocks_3/resnets_2/conv2/kernel": [
+   [
+    3,
+    3,
+    128,
+    128
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/up_blocks_3/resnets_2/norm1/bias": [
+   [
+    128
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/up_blocks_3/resnets_2/norm1/scale": [
+   [
+    128
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/up_blocks_3/resnets_2/norm2/bias": [
+   [
+    128
+   ],
+   "float32"
+  ],
+  "autoencoder/decoder/up_blocks_3/resnets_2/norm2/scale": [
+   [
+    128
+   ],
+   "float32"
+  ],
+  "autoencoder/encoder/conv_in/bias": [
+   [
+    128
+   ],
+   "float32"
+  ],
+  "autoencoder/encoder/conv_in/kernel": [
+   [
+    3,
+    3,
+    3,
+    128
+   ],
+   "float32"
+  ],
+  "autoencoder/encoder/conv_norm_out/bias": [
+   [
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/encoder/conv_norm_out/scale": [
+   [
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/encoder/conv_out/bias": [
+   [
+    8
+   ],
+   "float32"
+  ],
+  "autoencoder/encoder/conv_out/kernel": [
+   [
+    3,
+    3,
+    512,
+    8
+   ],
+   "float32"
+  ],
+  "autoencoder/encoder/down_blocks_0/downsamplers_0/conv/bias": [
+   [
+    128
+   ],
+   "float32"
+  ],
+  "autoencoder/encoder/down_blocks_0/downsamplers_0/conv/kernel": [
+   [
+    3,
+    3,
+    128,
+    128
+   ],
+   "float32"
+  ],
+  "autoencoder/encoder/down_blocks_0/resnets_0/conv1/bias": [
+   [
+    128
+   ],
+   "float32"
+  ],
+  "autoencoder/encoder/down_blocks_0/resnets_0/conv1/kernel": [
+   [
+    3,
+    3,
+    128,
+    128
+   ],
+   "float32"
+  ],
+  "autoencoder/encoder/down_blocks_0/resnets_0/conv2/bias": [
+   [
+    128
+   ],
+   "float32"
+  ],
+  "autoencoder/encoder/down_blocks_0/resnets_0/conv2/kernel": [
+   [
+    3,
+    3,
+    128,
+    128
+   ],
+   "float32"
+  ],
+  "autoencoder/encoder/down_blocks_0/resnets_0/norm1/bias": [
+   [
+    128
+   ],
+   "float32"
+  ],
+  "autoencoder/encoder/down_blocks_0/resnets_0/norm1/scale": [
+   [
+    128
+   ],
+   "float32"
+  ],
+  "autoencoder/encoder/down_blocks_0/resnets_0/norm2/bias": [
+   [
+    128
+   ],
+   "float32"
+  ],
+  "autoencoder/encoder/down_blocks_0/resnets_0/norm2/scale": [
+   [
+    128
+   ],
+   "float32"
+  ],
+  "autoencoder/encoder/down_blocks_0/resnets_1/conv1/bias": [
+   [
+    128
+   ],
+   "float32"
+  ],
+  "autoencoder/encoder/down_blocks_0/resnets_1/conv1/kernel": [
+   [
+    3,
+    3,
+    128,
+    128
+   ],
+   "float32"
+  ],
+  "autoencoder/encoder/down_blocks_0/resnets_1/conv2/bias": [
+   [
+    128
+   ],
+   "float32"
+  ],
+  "autoencoder/encoder/down_blocks_0/resnets_1/conv2/kernel": [
+   [
+    3,
+    3,
+    128,
+    128
+   ],
+   "float32"
+  ],
+  "autoencoder/encoder/down_blocks_0/resnets_1/norm1/bias": [
+   [
+    128
+   ],
+   "float32"
+  ],
+  "autoencoder/encoder/down_blocks_0/resnets_1/norm1/scale": [
+   [
+    128
+   ],
+   "float32"
+  ],
+  "autoencoder/encoder/down_blocks_0/resnets_1/norm2/bias": [
+   [
+    128
+   ],
+   "float32"
+  ],
+  "autoencoder/encoder/down_blocks_0/resnets_1/norm2/scale": [
+   [
+    128
+   ],
+   "float32"
+  ],
+  "autoencoder/encoder/down_blocks_1/downsamplers_0/conv/bias": [
+   [
+    256
+   ],
+   "float32"
+  ],
+  "autoencoder/encoder/down_blocks_1/downsamplers_0/conv/kernel": [
+   [
+    3,
+    3,
+    256,
+    256
+   ],
+   "float32"
+  ],
+  "autoencoder/encoder/down_blocks_1/resnets_0/conv1/bias": [
+   [
+    256
+   ],
+   "float32"
+  ],
+  "autoencoder/encoder/down_blocks_1/resnets_0/conv1/kernel": [
+   [
+    3,
+    3,
+    128,
+    256
+   ],
+   "float32"
+  ],
+  "autoencoder/encoder/down_blocks_1/resnets_0/conv2/bias": [
+   [
+    256
+   ],
+   "float32"
+  ],
+  "autoencoder/encoder/down_blocks_1/resnets_0/conv2/kernel": [
+   [
+    3,
+    3,
+    256,
+    256
+   ],
+   "float32"
+  ],
+  "autoencoder/encoder/down_blocks_1/resnets_0/conv_shortcut/bias": [
+   [
+    256
+   ],
+   "float32"
+  ],
+  "autoencoder/encoder/down_blocks_1/resnets_0/conv_shortcut/kernel": [
+   [
+    1,
+    1,
+    128,
+    256
+   ],
+   "float32"
+  ],
+  "autoencoder/encoder/down_blocks_1/resnets_0/norm1/bias": [
+   [
+    128
+   ],
+   "float32"
+  ],
+  "autoencoder/encoder/down_blocks_1/resnets_0/norm1/scale": [
+   [
+    128
+   ],
+   "float32"
+  ],
+  "autoencoder/encoder/down_blocks_1/resnets_0/norm2/bias": [
+   [
+    256
+   ],
+   "float32"
+  ],
+  "autoencoder/encoder/down_blocks_1/resnets_0/norm2/scale": [
+   [
+    256
+   ],
+   "float32"
+  ],
+  "autoencoder/encoder/down_blocks_1/resnets_1/conv1/bias": [
+   [
+    256
+   ],
+   "float32"
+  ],
+  "autoencoder/encoder/down_blocks_1/resnets_1/conv1/kernel": [
+   [
+    3,
+    3,
+    256,
+    256
+   ],
+   "float32"
+  ],
+  "autoencoder/encoder/down_blocks_1/resnets_1/conv2/bias": [
+   [
+    256
+   ],
+   "float32"
+  ],
+  "autoencoder/encoder/down_blocks_1/resnets_1/conv2/kernel": [
+   [
+    3,
+    3,
+    256,
+    256
+   ],
+   "float32"
+  ],
+  "autoencoder/encoder/down_blocks_1/resnets_1/norm1/bias": [
+   [
+    256
+   ],
+   "float32"
+  ],
+  "autoencoder/encoder/down_blocks_1/resnets_1/norm1/scale": [
+   [
+    256
+   ],
+   "float32"
+  ],
+  "autoencoder/encoder/down_blocks_1/resnets_1/norm2/bias": [
+   [
+    256
+   ],
+   "float32"
+  ],
+  "autoencoder/encoder/down_blocks_1/resnets_1/norm2/scale": [
+   [
+    256
+   ],
+   "float32"
+  ],
+  "autoencoder/encoder/down_blocks_2/downsamplers_0/conv/bias": [
+   [
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/encoder/down_blocks_2/downsamplers_0/conv/kernel": [
+   [
+    3,
+    3,
+    512,
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/encoder/down_blocks_2/resnets_0/conv1/bias": [
+   [
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/encoder/down_blocks_2/resnets_0/conv1/kernel": [
+   [
+    3,
+    3,
+    256,
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/encoder/down_blocks_2/resnets_0/conv2/bias": [
+   [
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/encoder/down_blocks_2/resnets_0/conv2/kernel": [
+   [
+    3,
+    3,
+    512,
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/encoder/down_blocks_2/resnets_0/conv_shortcut/bias": [
+   [
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/encoder/down_blocks_2/resnets_0/conv_shortcut/kernel": [
+   [
+    1,
+    1,
+    256,
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/encoder/down_blocks_2/resnets_0/norm1/bias": [
+   [
+    256
+   ],
+   "float32"
+  ],
+  "autoencoder/encoder/down_blocks_2/resnets_0/norm1/scale": [
+   [
+    256
+   ],
+   "float32"
+  ],
+  "autoencoder/encoder/down_blocks_2/resnets_0/norm2/bias": [
+   [
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/encoder/down_blocks_2/resnets_0/norm2/scale": [
+   [
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/encoder/down_blocks_2/resnets_1/conv1/bias": [
+   [
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/encoder/down_blocks_2/resnets_1/conv1/kernel": [
+   [
+    3,
+    3,
+    512,
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/encoder/down_blocks_2/resnets_1/conv2/bias": [
+   [
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/encoder/down_blocks_2/resnets_1/conv2/kernel": [
+   [
+    3,
+    3,
+    512,
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/encoder/down_blocks_2/resnets_1/norm1/bias": [
+   [
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/encoder/down_blocks_2/resnets_1/norm1/scale": [
+   [
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/encoder/down_blocks_2/resnets_1/norm2/bias": [
+   [
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/encoder/down_blocks_2/resnets_1/norm2/scale": [
+   [
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/encoder/down_blocks_3/resnets_0/conv1/bias": [
+   [
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/encoder/down_blocks_3/resnets_0/conv1/kernel": [
+   [
+    3,
+    3,
+    512,
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/encoder/down_blocks_3/resnets_0/conv2/bias": [
+   [
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/encoder/down_blocks_3/resnets_0/conv2/kernel": [
+   [
+    3,
+    3,
+    512,
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/encoder/down_blocks_3/resnets_0/norm1/bias": [
+   [
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/encoder/down_blocks_3/resnets_0/norm1/scale": [
+   [
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/encoder/down_blocks_3/resnets_0/norm2/bias": [
+   [
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/encoder/down_blocks_3/resnets_0/norm2/scale": [
+   [
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/encoder/down_blocks_3/resnets_1/conv1/bias": [
+   [
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/encoder/down_blocks_3/resnets_1/conv1/kernel": [
+   [
+    3,
+    3,
+    512,
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/encoder/down_blocks_3/resnets_1/conv2/bias": [
+   [
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/encoder/down_blocks_3/resnets_1/conv2/kernel": [
+   [
+    3,
+    3,
+    512,
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/encoder/down_blocks_3/resnets_1/norm1/bias": [
+   [
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/encoder/down_blocks_3/resnets_1/norm1/scale": [
+   [
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/encoder/down_blocks_3/resnets_1/norm2/bias": [
+   [
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/encoder/down_blocks_3/resnets_1/norm2/scale": [
+   [
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/encoder/mid_block/attentions_0/group_norm/bias": [
+   [
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/encoder/mid_block/attentions_0/group_norm/scale": [
+   [
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/encoder/mid_block/attentions_0/key/bias": [
+   [
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/encoder/mid_block/attentions_0/key/kernel": [
+   [
+    512,
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/encoder/mid_block/attentions_0/proj_attn/bias": [
+   [
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/encoder/mid_block/attentions_0/proj_attn/kernel": [
+   [
+    512,
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/encoder/mid_block/attentions_0/query/bias": [
+   [
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/encoder/mid_block/attentions_0/query/kernel": [
+   [
+    512,
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/encoder/mid_block/attentions_0/value/bias": [
+   [
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/encoder/mid_block/attentions_0/value/kernel": [
+   [
+    512,
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/encoder/mid_block/resnets_0/conv1/bias": [
+   [
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/encoder/mid_block/resnets_0/conv1/kernel": [
+   [
+    3,
+    3,
+    512,
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/encoder/mid_block/resnets_0/conv2/bias": [
+   [
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/encoder/mid_block/resnets_0/conv2/kernel": [
+   [
+    3,
+    3,
+    512,
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/encoder/mid_block/resnets_0/norm1/bias": [
+   [
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/encoder/mid_block/resnets_0/norm1/scale": [
+   [
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/encoder/mid_block/resnets_0/norm2/bias": [
+   [
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/encoder/mid_block/resnets_0/norm2/scale": [
+   [
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/encoder/mid_block/resnets_1/conv1/bias": [
+   [
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/encoder/mid_block/resnets_1/conv1/kernel": [
+   [
+    3,
+    3,
+    512,
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/encoder/mid_block/resnets_1/conv2/bias": [
+   [
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/encoder/mid_block/resnets_1/conv2/kernel": [
+   [
+    3,
+    3,
+    512,
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/encoder/mid_block/resnets_1/norm1/bias": [
+   [
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/encoder/mid_block/resnets_1/norm1/scale": [
+   [
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/encoder/mid_block/resnets_1/norm2/bias": [
+   [
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/encoder/mid_block/resnets_1/norm2/scale": [
+   [
+    512
+   ],
+   "float32"
+  ],
+  "autoencoder/post_quant_conv/bias": [
+   [
+    4
+   ],
+   "float32"
+  ],
+  "autoencoder/post_quant_conv/kernel": [
+   [
+    1,
+    1,
+    4,
+    4
+   ],
+   "float32"
+  ],
+  "autoencoder/quant_conv/bias": [
+   [
+    8
+   ],
+   "float32"
+  ],
+  "autoencoder/quant_conv/kernel": [
+   [
+    1,
+    1,
+    8,
+    8
+   ],
+   "float32"
+  ],
+  "constants/conditioning/time_embed/layers_0/frequencies": [
+   [
+    384
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/final_layer_norm/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/final_layer_norm/scale": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_0/input_layernorm/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_0/input_layernorm/scale": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_0/mlp/down_proj/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_0/mlp/down_proj/kernel": [
+   [
+    3072,
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_0/mlp/up_proj/bias": [
+   [
+    3072
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_0/mlp/up_proj/kernel": [
+   [
+    768,
+    3072
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_0/post_attention_layernorm/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_0/post_attention_layernorm/scale": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_0/self_attn/k_proj/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_0/self_attn/k_proj/kernel": [
+   [
+    768,
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_0/self_attn/o_proj/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_0/self_attn/o_proj/kernel": [
+   [
+    768,
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_0/self_attn/q_proj/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_0/self_attn/q_proj/kernel": [
+   [
+    768,
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_0/self_attn/v_proj/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_0/self_attn/v_proj/kernel": [
+   [
+    768,
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_1/input_layernorm/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_1/input_layernorm/scale": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_1/mlp/down_proj/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_1/mlp/down_proj/kernel": [
+   [
+    3072,
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_1/mlp/up_proj/bias": [
+   [
+    3072
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_1/mlp/up_proj/kernel": [
+   [
+    768,
+    3072
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_1/post_attention_layernorm/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_1/post_attention_layernorm/scale": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_1/self_attn/k_proj/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_1/self_attn/k_proj/kernel": [
+   [
+    768,
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_1/self_attn/o_proj/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_1/self_attn/o_proj/kernel": [
+   [
+    768,
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_1/self_attn/q_proj/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_1/self_attn/q_proj/kernel": [
+   [
+    768,
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_1/self_attn/v_proj/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_1/self_attn/v_proj/kernel": [
+   [
+    768,
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_10/input_layernorm/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_10/input_layernorm/scale": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_10/mlp/down_proj/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_10/mlp/down_proj/kernel": [
+   [
+    3072,
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_10/mlp/up_proj/bias": [
+   [
+    3072
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_10/mlp/up_proj/kernel": [
+   [
+    768,
+    3072
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_10/post_attention_layernorm/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_10/post_attention_layernorm/scale": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_10/self_attn/k_proj/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_10/self_attn/k_proj/kernel": [
+   [
+    768,
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_10/self_attn/o_proj/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_10/self_attn/o_proj/kernel": [
+   [
+    768,
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_10/self_attn/q_proj/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_10/self_attn/q_proj/kernel": [
+   [
+    768,
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_10/self_attn/v_proj/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_10/self_attn/v_proj/kernel": [
+   [
+    768,
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_11/input_layernorm/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_11/input_layernorm/scale": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_11/mlp/down_proj/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_11/mlp/down_proj/kernel": [
+   [
+    3072,
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_11/mlp/up_proj/bias": [
+   [
+    3072
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_11/mlp/up_proj/kernel": [
+   [
+    768,
+    3072
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_11/post_attention_layernorm/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_11/post_attention_layernorm/scale": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_11/self_attn/k_proj/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_11/self_attn/k_proj/kernel": [
+   [
+    768,
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_11/self_attn/o_proj/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_11/self_attn/o_proj/kernel": [
+   [
+    768,
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_11/self_attn/q_proj/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_11/self_attn/q_proj/kernel": [
+   [
+    768,
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_11/self_attn/v_proj/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_11/self_attn/v_proj/kernel": [
+   [
+    768,
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_2/input_layernorm/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_2/input_layernorm/scale": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_2/mlp/down_proj/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_2/mlp/down_proj/kernel": [
+   [
+    3072,
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_2/mlp/up_proj/bias": [
+   [
+    3072
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_2/mlp/up_proj/kernel": [
+   [
+    768,
+    3072
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_2/post_attention_layernorm/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_2/post_attention_layernorm/scale": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_2/self_attn/k_proj/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_2/self_attn/k_proj/kernel": [
+   [
+    768,
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_2/self_attn/o_proj/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_2/self_attn/o_proj/kernel": [
+   [
+    768,
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_2/self_attn/q_proj/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_2/self_attn/q_proj/kernel": [
+   [
+    768,
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_2/self_attn/v_proj/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_2/self_attn/v_proj/kernel": [
+   [
+    768,
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_3/input_layernorm/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_3/input_layernorm/scale": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_3/mlp/down_proj/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_3/mlp/down_proj/kernel": [
+   [
+    3072,
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_3/mlp/up_proj/bias": [
+   [
+    3072
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_3/mlp/up_proj/kernel": [
+   [
+    768,
+    3072
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_3/post_attention_layernorm/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_3/post_attention_layernorm/scale": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_3/self_attn/k_proj/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_3/self_attn/k_proj/kernel": [
+   [
+    768,
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_3/self_attn/o_proj/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_3/self_attn/o_proj/kernel": [
+   [
+    768,
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_3/self_attn/q_proj/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_3/self_attn/q_proj/kernel": [
+   [
+    768,
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_3/self_attn/v_proj/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_3/self_attn/v_proj/kernel": [
+   [
+    768,
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_4/input_layernorm/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_4/input_layernorm/scale": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_4/mlp/down_proj/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_4/mlp/down_proj/kernel": [
+   [
+    3072,
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_4/mlp/up_proj/bias": [
+   [
+    3072
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_4/mlp/up_proj/kernel": [
+   [
+    768,
+    3072
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_4/post_attention_layernorm/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_4/post_attention_layernorm/scale": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_4/self_attn/k_proj/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_4/self_attn/k_proj/kernel": [
+   [
+    768,
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_4/self_attn/o_proj/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_4/self_attn/o_proj/kernel": [
+   [
+    768,
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_4/self_attn/q_proj/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_4/self_attn/q_proj/kernel": [
+   [
+    768,
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_4/self_attn/v_proj/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_4/self_attn/v_proj/kernel": [
+   [
+    768,
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_5/input_layernorm/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_5/input_layernorm/scale": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_5/mlp/down_proj/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_5/mlp/down_proj/kernel": [
+   [
+    3072,
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_5/mlp/up_proj/bias": [
+   [
+    3072
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_5/mlp/up_proj/kernel": [
+   [
+    768,
+    3072
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_5/post_attention_layernorm/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_5/post_attention_layernorm/scale": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_5/self_attn/k_proj/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_5/self_attn/k_proj/kernel": [
+   [
+    768,
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_5/self_attn/o_proj/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_5/self_attn/o_proj/kernel": [
+   [
+    768,
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_5/self_attn/q_proj/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_5/self_attn/q_proj/kernel": [
+   [
+    768,
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_5/self_attn/v_proj/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_5/self_attn/v_proj/kernel": [
+   [
+    768,
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_6/input_layernorm/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_6/input_layernorm/scale": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_6/mlp/down_proj/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_6/mlp/down_proj/kernel": [
+   [
+    3072,
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_6/mlp/up_proj/bias": [
+   [
+    3072
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_6/mlp/up_proj/kernel": [
+   [
+    768,
+    3072
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_6/post_attention_layernorm/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_6/post_attention_layernorm/scale": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_6/self_attn/k_proj/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_6/self_attn/k_proj/kernel": [
+   [
+    768,
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_6/self_attn/o_proj/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_6/self_attn/o_proj/kernel": [
+   [
+    768,
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_6/self_attn/q_proj/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_6/self_attn/q_proj/kernel": [
+   [
+    768,
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_6/self_attn/v_proj/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_6/self_attn/v_proj/kernel": [
+   [
+    768,
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_7/input_layernorm/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_7/input_layernorm/scale": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_7/mlp/down_proj/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_7/mlp/down_proj/kernel": [
+   [
+    3072,
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_7/mlp/up_proj/bias": [
+   [
+    3072
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_7/mlp/up_proj/kernel": [
+   [
+    768,
+    3072
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_7/post_attention_layernorm/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_7/post_attention_layernorm/scale": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_7/self_attn/k_proj/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_7/self_attn/k_proj/kernel": [
+   [
+    768,
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_7/self_attn/o_proj/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_7/self_attn/o_proj/kernel": [
+   [
+    768,
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_7/self_attn/q_proj/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_7/self_attn/q_proj/kernel": [
+   [
+    768,
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_7/self_attn/v_proj/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_7/self_attn/v_proj/kernel": [
+   [
+    768,
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_8/input_layernorm/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_8/input_layernorm/scale": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_8/mlp/down_proj/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_8/mlp/down_proj/kernel": [
+   [
+    3072,
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_8/mlp/up_proj/bias": [
+   [
+    3072
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_8/mlp/up_proj/kernel": [
+   [
+    768,
+    3072
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_8/post_attention_layernorm/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_8/post_attention_layernorm/scale": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_8/self_attn/k_proj/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_8/self_attn/k_proj/kernel": [
+   [
+    768,
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_8/self_attn/o_proj/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_8/self_attn/o_proj/kernel": [
+   [
+    768,
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_8/self_attn/q_proj/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_8/self_attn/q_proj/kernel": [
+   [
+    768,
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_8/self_attn/v_proj/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_8/self_attn/v_proj/kernel": [
+   [
+    768,
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_9/input_layernorm/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_9/input_layernorm/scale": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_9/mlp/down_proj/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_9/mlp/down_proj/kernel": [
+   [
+    3072,
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_9/mlp/up_proj/bias": [
+   [
+    3072
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_9/mlp/up_proj/kernel": [
+   [
+    768,
+    3072
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_9/post_attention_layernorm/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_9/post_attention_layernorm/scale": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_9/self_attn/k_proj/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_9/self_attn/k_proj/kernel": [
+   [
+    768,
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_9/self_attn/o_proj/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_9/self_attn/o_proj/kernel": [
+   [
+    768,
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_9/self_attn/q_proj/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_9/self_attn/q_proj/kernel": [
+   [
+    768,
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_9/self_attn/v_proj/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/layers_9/self_attn/v_proj/kernel": [
+   [
+    768,
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/position_embedding/embedding": [
+   [
+    77,
+    768
+   ],
+   "float32"
+  ],
+  "encoders/textcontext/params/token_embedding/embedding": [
+   [
+    49408,
+    768
+   ],
+   "float32"
+  ],
+  "params/conditioning/text_context_proj/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "params/conditioning/text_context_proj/kernel": [
+   [
+    768,
+    768
+   ],
+   "float32"
+  ],
+  "params/conditioning/time_embed/layers_1/DenseGeneral_0/bias": [
+   [
+    3072
+   ],
+   "float32"
+  ],
+  "params/conditioning/time_embed/layers_1/DenseGeneral_0/kernel": [
+   [
+    768,
+    3072
+   ],
+   "float32"
+  ],
+  "params/conditioning/time_embed/layers_1/DenseGeneral_1/bias": [
+   [
+    3072
+   ],
+   "float32"
+  ],
+  "params/conditioning/time_embed/layers_1/DenseGeneral_1/kernel": [
+   [
+    3072,
+    3072
+   ],
+   "float32"
+  ],
+  "params/conditioning/time_embed/layers_2/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "params/conditioning/time_embed/layers_2/kernel": [
+   [
+    3072,
+    768
+   ],
+   "float32"
+  ],
+  "params/dit_block_11/ada_params_module/ada_proj/bias": [
+   [
+    4608
+   ],
+   "float32"
+  ],
+  "params/dit_block_11/ada_params_module/ada_proj/kernel": [
+   [
+    768,
+    4608
+   ],
+   "float32"
+  ],
+  "params/dit_block_11/attention/to_k/bias": [
+   [
+    12,
+    64
+   ],
+   "float32"
+  ],
+  "params/dit_block_11/attention/to_k/kernel": [
+   [
+    768,
+    12,
+    64
+   ],
+   "float32"
+  ],
+  "params/dit_block_11/attention/to_out_0/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "params/dit_block_11/attention/to_out_0/kernel": [
+   [
+    12,
+    64,
+    768
+   ],
+   "float32"
+  ],
+  "params/dit_block_11/attention/to_q/bias": [
+   [
+    12,
+    64
+   ],
+   "float32"
+  ],
+  "params/dit_block_11/attention/to_q/kernel": [
+   [
+    768,
+    12,
+    64
+   ],
+   "float32"
+  ],
+  "params/dit_block_11/attention/to_v/bias": [
+   [
+    12,
+    64
+   ],
+   "float32"
+  ],
+  "params/dit_block_11/attention/to_v/kernel": [
+   [
+    768,
+    12,
+    64
+   ],
+   "float32"
+  ],
+  "params/dit_block_11/mlp/down_proj/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "params/dit_block_11/mlp/down_proj/kernel": [
+   [
+    3072,
+    768
+   ],
+   "float32"
+  ],
+  "params/dit_block_11/mlp/up_proj/bias": [
+   [
+    3072
+   ],
+   "float32"
+  ],
+  "params/dit_block_11/mlp/up_proj/kernel": [
+   [
+    768,
+    3072
+   ],
+   "float32"
+  ],
+  "params/dit_block_15/ada_params_module/ada_proj/bias": [
+   [
+    4608
+   ],
+   "float32"
+  ],
+  "params/dit_block_15/ada_params_module/ada_proj/kernel": [
+   [
+    768,
+    4608
+   ],
+   "float32"
+  ],
+  "params/dit_block_15/attention/to_k/bias": [
+   [
+    12,
+    64
+   ],
+   "float32"
+  ],
+  "params/dit_block_15/attention/to_k/kernel": [
+   [
+    768,
+    12,
+    64
+   ],
+   "float32"
+  ],
+  "params/dit_block_15/attention/to_out_0/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "params/dit_block_15/attention/to_out_0/kernel": [
+   [
+    12,
+    64,
+    768
+   ],
+   "float32"
+  ],
+  "params/dit_block_15/attention/to_q/bias": [
+   [
+    12,
+    64
+   ],
+   "float32"
+  ],
+  "params/dit_block_15/attention/to_q/kernel": [
+   [
+    768,
+    12,
+    64
+   ],
+   "float32"
+  ],
+  "params/dit_block_15/attention/to_v/bias": [
+   [
+    12,
+    64
+   ],
+   "float32"
+  ],
+  "params/dit_block_15/attention/to_v/kernel": [
+   [
+    768,
+    12,
+    64
+   ],
+   "float32"
+  ],
+  "params/dit_block_15/mlp/down_proj/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "params/dit_block_15/mlp/down_proj/kernel": [
+   [
+    3072,
+    768
+   ],
+   "float32"
+  ],
+  "params/dit_block_15/mlp/up_proj/bias": [
+   [
+    3072
+   ],
+   "float32"
+  ],
+  "params/dit_block_15/mlp/up_proj/kernel": [
+   [
+    768,
+    3072
+   ],
+   "float32"
+  ],
+  "params/dit_block_3/ada_params_module/ada_proj/bias": [
+   [
+    4608
+   ],
+   "float32"
+  ],
+  "params/dit_block_3/ada_params_module/ada_proj/kernel": [
+   [
+    768,
+    4608
+   ],
+   "float32"
+  ],
+  "params/dit_block_3/attention/to_k/bias": [
+   [
+    12,
+    64
+   ],
+   "float32"
+  ],
+  "params/dit_block_3/attention/to_k/kernel": [
+   [
+    768,
+    12,
+    64
+   ],
+   "float32"
+  ],
+  "params/dit_block_3/attention/to_out_0/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "params/dit_block_3/attention/to_out_0/kernel": [
+   [
+    12,
+    64,
+    768
+   ],
+   "float32"
+  ],
+  "params/dit_block_3/attention/to_q/bias": [
+   [
+    12,
+    64
+   ],
+   "float32"
+  ],
+  "params/dit_block_3/attention/to_q/kernel": [
+   [
+    768,
+    12,
+    64
+   ],
+   "float32"
+  ],
+  "params/dit_block_3/attention/to_v/bias": [
+   [
+    12,
+    64
+   ],
+   "float32"
+  ],
+  "params/dit_block_3/attention/to_v/kernel": [
+   [
+    768,
+    12,
+    64
+   ],
+   "float32"
+  ],
+  "params/dit_block_3/mlp/down_proj/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "params/dit_block_3/mlp/down_proj/kernel": [
+   [
+    3072,
+    768
+   ],
+   "float32"
+  ],
+  "params/dit_block_3/mlp/up_proj/bias": [
+   [
+    3072
+   ],
+   "float32"
+  ],
+  "params/dit_block_3/mlp/up_proj/kernel": [
+   [
+    768,
+    3072
+   ],
+   "float32"
+  ],
+  "params/dit_block_7/ada_params_module/ada_proj/bias": [
+   [
+    4608
+   ],
+   "float32"
+  ],
+  "params/dit_block_7/ada_params_module/ada_proj/kernel": [
+   [
+    768,
+    4608
+   ],
+   "float32"
+  ],
+  "params/dit_block_7/attention/to_k/bias": [
+   [
+    12,
+    64
+   ],
+   "float32"
+  ],
+  "params/dit_block_7/attention/to_k/kernel": [
+   [
+    768,
+    12,
+    64
+   ],
+   "float32"
+  ],
+  "params/dit_block_7/attention/to_out_0/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "params/dit_block_7/attention/to_out_0/kernel": [
+   [
+    12,
+    64,
+    768
+   ],
+   "float32"
+  ],
+  "params/dit_block_7/attention/to_q/bias": [
+   [
+    12,
+    64
+   ],
+   "float32"
+  ],
+  "params/dit_block_7/attention/to_q/kernel": [
+   [
+    768,
+    12,
+    64
+   ],
+   "float32"
+  ],
+  "params/dit_block_7/attention/to_v/bias": [
+   [
+    12,
+    64
+   ],
+   "float32"
+  ],
+  "params/dit_block_7/attention/to_v/kernel": [
+   [
+    768,
+    12,
+    64
+   ],
+   "float32"
+  ],
+  "params/dit_block_7/mlp/down_proj/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "params/dit_block_7/mlp/down_proj/kernel": [
+   [
+    3072,
+    768
+   ],
+   "float32"
+  ],
+  "params/dit_block_7/mlp/up_proj/bias": [
+   [
+    3072
+   ],
+   "float32"
+  ],
+  "params/dit_block_7/mlp/up_proj/kernel": [
+   [
+    768,
+    3072
+   ],
+   "float32"
+  ],
+  "params/embed/hilbert_projection/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "params/embed/hilbert_projection/kernel": [
+   [
+    16,
+    768
+   ],
+   "float32"
+  ],
+  "params/output/final_norm/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "params/output/final_norm/scale": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "params/output/final_proj/bias": [
+   [
+    16
+   ],
+   "float32"
+  ],
+  "params/output/final_proj/kernel": [
+   [
+    768,
+    16
+   ],
+   "float32"
+  ],
+  "params/ssm_block_0/ada_params_module/ada_proj/bias": [
+   [
+    4608
+   ],
+   "float32"
+  ],
+  "params/ssm_block_0/ada_params_module/ada_proj/kernel": [
+   [
+    768,
+    4608
+   ],
+   "float32"
+  ],
+  "params/ssm_block_0/mlp/down_proj/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_0/mlp/down_proj/kernel": [
+   [
+    3072,
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_0/mlp/up_proj/bias": [
+   [
+    3072
+   ],
+   "float32"
+  ],
+  "params/ssm_block_0/mlp/up_proj/kernel": [
+   [
+    768,
+    3072
+   ],
+   "float32"
+  ],
+  "params/ssm_block_0/spatial_fusion/dwconv_dil1/kernel": [
+   [
+    3,
+    3,
+    1,
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_0/spatial_fusion/dwconv_dil2/kernel": [
+   [
+    3,
+    3,
+    1,
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_0/spatial_fusion/dwconv_dil3/kernel": [
+   [
+    3,
+    3,
+    1,
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_0/ssm/out_proj/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_0/ssm/out_proj/kernel": [
+   [
+    1536,
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_0/ssm/s5_backward/A_imag": [
+   [
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_0/ssm/s5_backward/B_im": [
+   [
+    64,
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_0/ssm/s5_backward/B_re": [
+   [
+    64,
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_0/ssm/s5_backward/C_im": [
+   [
+    768,
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_0/ssm/s5_backward/C_re": [
+   [
+    768,
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_0/ssm/s5_backward/D": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_0/ssm/s5_backward/log_A_real": [
+   [
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_0/ssm/s5_backward/log_dt": [
+   [
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_0/ssm/s5_forward/A_imag": [
+   [
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_0/ssm/s5_forward/B_im": [
+   [
+    64,
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_0/ssm/s5_forward/B_re": [
+   [
+    64,
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_0/ssm/s5_forward/C_im": [
+   [
+    768,
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_0/ssm/s5_forward/C_re": [
+   [
+    768,
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_0/ssm/s5_forward/D": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_0/ssm/s5_forward/log_A_real": [
+   [
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_0/ssm/s5_forward/log_dt": [
+   [
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_1/ada_params_module/ada_proj/bias": [
+   [
+    4608
+   ],
+   "float32"
+  ],
+  "params/ssm_block_1/ada_params_module/ada_proj/kernel": [
+   [
+    768,
+    4608
+   ],
+   "float32"
+  ],
+  "params/ssm_block_1/mlp/down_proj/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_1/mlp/down_proj/kernel": [
+   [
+    3072,
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_1/mlp/up_proj/bias": [
+   [
+    3072
+   ],
+   "float32"
+  ],
+  "params/ssm_block_1/mlp/up_proj/kernel": [
+   [
+    768,
+    3072
+   ],
+   "float32"
+  ],
+  "params/ssm_block_1/spatial_fusion/dwconv_dil1/kernel": [
+   [
+    3,
+    3,
+    1,
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_1/spatial_fusion/dwconv_dil2/kernel": [
+   [
+    3,
+    3,
+    1,
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_1/spatial_fusion/dwconv_dil3/kernel": [
+   [
+    3,
+    3,
+    1,
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_1/ssm/out_proj/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_1/ssm/out_proj/kernel": [
+   [
+    1536,
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_1/ssm/s5_backward/A_imag": [
+   [
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_1/ssm/s5_backward/B_im": [
+   [
+    64,
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_1/ssm/s5_backward/B_re": [
+   [
+    64,
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_1/ssm/s5_backward/C_im": [
+   [
+    768,
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_1/ssm/s5_backward/C_re": [
+   [
+    768,
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_1/ssm/s5_backward/D": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_1/ssm/s5_backward/log_A_real": [
+   [
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_1/ssm/s5_backward/log_dt": [
+   [
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_1/ssm/s5_forward/A_imag": [
+   [
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_1/ssm/s5_forward/B_im": [
+   [
+    64,
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_1/ssm/s5_forward/B_re": [
+   [
+    64,
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_1/ssm/s5_forward/C_im": [
+   [
+    768,
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_1/ssm/s5_forward/C_re": [
+   [
+    768,
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_1/ssm/s5_forward/D": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_1/ssm/s5_forward/log_A_real": [
+   [
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_1/ssm/s5_forward/log_dt": [
+   [
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_10/ada_params_module/ada_proj/bias": [
+   [
+    4608
+   ],
+   "float32"
+  ],
+  "params/ssm_block_10/ada_params_module/ada_proj/kernel": [
+   [
+    768,
+    4608
+   ],
+   "float32"
+  ],
+  "params/ssm_block_10/mlp/down_proj/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_10/mlp/down_proj/kernel": [
+   [
+    3072,
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_10/mlp/up_proj/bias": [
+   [
+    3072
+   ],
+   "float32"
+  ],
+  "params/ssm_block_10/mlp/up_proj/kernel": [
+   [
+    768,
+    3072
+   ],
+   "float32"
+  ],
+  "params/ssm_block_10/spatial_fusion/dwconv_dil1/kernel": [
+   [
+    3,
+    3,
+    1,
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_10/spatial_fusion/dwconv_dil2/kernel": [
+   [
+    3,
+    3,
+    1,
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_10/spatial_fusion/dwconv_dil3/kernel": [
+   [
+    3,
+    3,
+    1,
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_10/ssm/out_proj/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_10/ssm/out_proj/kernel": [
+   [
+    1536,
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_10/ssm/s5_backward/A_imag": [
+   [
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_10/ssm/s5_backward/B_im": [
+   [
+    64,
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_10/ssm/s5_backward/B_re": [
+   [
+    64,
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_10/ssm/s5_backward/C_im": [
+   [
+    768,
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_10/ssm/s5_backward/C_re": [
+   [
+    768,
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_10/ssm/s5_backward/D": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_10/ssm/s5_backward/log_A_real": [
+   [
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_10/ssm/s5_backward/log_dt": [
+   [
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_10/ssm/s5_forward/A_imag": [
+   [
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_10/ssm/s5_forward/B_im": [
+   [
+    64,
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_10/ssm/s5_forward/B_re": [
+   [
+    64,
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_10/ssm/s5_forward/C_im": [
+   [
+    768,
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_10/ssm/s5_forward/C_re": [
+   [
+    768,
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_10/ssm/s5_forward/D": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_10/ssm/s5_forward/log_A_real": [
+   [
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_10/ssm/s5_forward/log_dt": [
+   [
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_12/ada_params_module/ada_proj/bias": [
+   [
+    4608
+   ],
+   "float32"
+  ],
+  "params/ssm_block_12/ada_params_module/ada_proj/kernel": [
+   [
+    768,
+    4608
+   ],
+   "float32"
+  ],
+  "params/ssm_block_12/mlp/down_proj/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_12/mlp/down_proj/kernel": [
+   [
+    3072,
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_12/mlp/up_proj/bias": [
+   [
+    3072
+   ],
+   "float32"
+  ],
+  "params/ssm_block_12/mlp/up_proj/kernel": [
+   [
+    768,
+    3072
+   ],
+   "float32"
+  ],
+  "params/ssm_block_12/spatial_fusion/dwconv_dil1/kernel": [
+   [
+    3,
+    3,
+    1,
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_12/spatial_fusion/dwconv_dil2/kernel": [
+   [
+    3,
+    3,
+    1,
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_12/spatial_fusion/dwconv_dil3/kernel": [
+   [
+    3,
+    3,
+    1,
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_12/ssm/out_proj/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_12/ssm/out_proj/kernel": [
+   [
+    1536,
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_12/ssm/s5_backward/A_imag": [
+   [
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_12/ssm/s5_backward/B_im": [
+   [
+    64,
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_12/ssm/s5_backward/B_re": [
+   [
+    64,
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_12/ssm/s5_backward/C_im": [
+   [
+    768,
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_12/ssm/s5_backward/C_re": [
+   [
+    768,
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_12/ssm/s5_backward/D": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_12/ssm/s5_backward/log_A_real": [
+   [
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_12/ssm/s5_backward/log_dt": [
+   [
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_12/ssm/s5_forward/A_imag": [
+   [
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_12/ssm/s5_forward/B_im": [
+   [
+    64,
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_12/ssm/s5_forward/B_re": [
+   [
+    64,
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_12/ssm/s5_forward/C_im": [
+   [
+    768,
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_12/ssm/s5_forward/C_re": [
+   [
+    768,
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_12/ssm/s5_forward/D": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_12/ssm/s5_forward/log_A_real": [
+   [
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_12/ssm/s5_forward/log_dt": [
+   [
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_13/ada_params_module/ada_proj/bias": [
+   [
+    4608
+   ],
+   "float32"
+  ],
+  "params/ssm_block_13/ada_params_module/ada_proj/kernel": [
+   [
+    768,
+    4608
+   ],
+   "float32"
+  ],
+  "params/ssm_block_13/mlp/down_proj/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_13/mlp/down_proj/kernel": [
+   [
+    3072,
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_13/mlp/up_proj/bias": [
+   [
+    3072
+   ],
+   "float32"
+  ],
+  "params/ssm_block_13/mlp/up_proj/kernel": [
+   [
+    768,
+    3072
+   ],
+   "float32"
+  ],
+  "params/ssm_block_13/spatial_fusion/dwconv_dil1/kernel": [
+   [
+    3,
+    3,
+    1,
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_13/spatial_fusion/dwconv_dil2/kernel": [
+   [
+    3,
+    3,
+    1,
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_13/spatial_fusion/dwconv_dil3/kernel": [
+   [
+    3,
+    3,
+    1,
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_13/ssm/out_proj/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_13/ssm/out_proj/kernel": [
+   [
+    1536,
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_13/ssm/s5_backward/A_imag": [
+   [
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_13/ssm/s5_backward/B_im": [
+   [
+    64,
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_13/ssm/s5_backward/B_re": [
+   [
+    64,
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_13/ssm/s5_backward/C_im": [
+   [
+    768,
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_13/ssm/s5_backward/C_re": [
+   [
+    768,
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_13/ssm/s5_backward/D": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_13/ssm/s5_backward/log_A_real": [
+   [
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_13/ssm/s5_backward/log_dt": [
+   [
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_13/ssm/s5_forward/A_imag": [
+   [
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_13/ssm/s5_forward/B_im": [
+   [
+    64,
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_13/ssm/s5_forward/B_re": [
+   [
+    64,
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_13/ssm/s5_forward/C_im": [
+   [
+    768,
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_13/ssm/s5_forward/C_re": [
+   [
+    768,
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_13/ssm/s5_forward/D": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_13/ssm/s5_forward/log_A_real": [
+   [
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_13/ssm/s5_forward/log_dt": [
+   [
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_14/ada_params_module/ada_proj/bias": [
+   [
+    4608
+   ],
+   "float32"
+  ],
+  "params/ssm_block_14/ada_params_module/ada_proj/kernel": [
+   [
+    768,
+    4608
+   ],
+   "float32"
+  ],
+  "params/ssm_block_14/mlp/down_proj/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_14/mlp/down_proj/kernel": [
+   [
+    3072,
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_14/mlp/up_proj/bias": [
+   [
+    3072
+   ],
+   "float32"
+  ],
+  "params/ssm_block_14/mlp/up_proj/kernel": [
+   [
+    768,
+    3072
+   ],
+   "float32"
+  ],
+  "params/ssm_block_14/spatial_fusion/dwconv_dil1/kernel": [
+   [
+    3,
+    3,
+    1,
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_14/spatial_fusion/dwconv_dil2/kernel": [
+   [
+    3,
+    3,
+    1,
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_14/spatial_fusion/dwconv_dil3/kernel": [
+   [
+    3,
+    3,
+    1,
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_14/ssm/out_proj/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_14/ssm/out_proj/kernel": [
+   [
+    1536,
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_14/ssm/s5_backward/A_imag": [
+   [
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_14/ssm/s5_backward/B_im": [
+   [
+    64,
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_14/ssm/s5_backward/B_re": [
+   [
+    64,
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_14/ssm/s5_backward/C_im": [
+   [
+    768,
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_14/ssm/s5_backward/C_re": [
+   [
+    768,
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_14/ssm/s5_backward/D": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_14/ssm/s5_backward/log_A_real": [
+   [
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_14/ssm/s5_backward/log_dt": [
+   [
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_14/ssm/s5_forward/A_imag": [
+   [
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_14/ssm/s5_forward/B_im": [
+   [
+    64,
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_14/ssm/s5_forward/B_re": [
+   [
+    64,
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_14/ssm/s5_forward/C_im": [
+   [
+    768,
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_14/ssm/s5_forward/C_re": [
+   [
+    768,
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_14/ssm/s5_forward/D": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_14/ssm/s5_forward/log_A_real": [
+   [
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_14/ssm/s5_forward/log_dt": [
+   [
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_2/ada_params_module/ada_proj/bias": [
+   [
+    4608
+   ],
+   "float32"
+  ],
+  "params/ssm_block_2/ada_params_module/ada_proj/kernel": [
+   [
+    768,
+    4608
+   ],
+   "float32"
+  ],
+  "params/ssm_block_2/mlp/down_proj/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_2/mlp/down_proj/kernel": [
+   [
+    3072,
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_2/mlp/up_proj/bias": [
+   [
+    3072
+   ],
+   "float32"
+  ],
+  "params/ssm_block_2/mlp/up_proj/kernel": [
+   [
+    768,
+    3072
+   ],
+   "float32"
+  ],
+  "params/ssm_block_2/spatial_fusion/dwconv_dil1/kernel": [
+   [
+    3,
+    3,
+    1,
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_2/spatial_fusion/dwconv_dil2/kernel": [
+   [
+    3,
+    3,
+    1,
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_2/spatial_fusion/dwconv_dil3/kernel": [
+   [
+    3,
+    3,
+    1,
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_2/ssm/out_proj/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_2/ssm/out_proj/kernel": [
+   [
+    1536,
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_2/ssm/s5_backward/A_imag": [
+   [
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_2/ssm/s5_backward/B_im": [
+   [
+    64,
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_2/ssm/s5_backward/B_re": [
+   [
+    64,
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_2/ssm/s5_backward/C_im": [
+   [
+    768,
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_2/ssm/s5_backward/C_re": [
+   [
+    768,
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_2/ssm/s5_backward/D": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_2/ssm/s5_backward/log_A_real": [
+   [
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_2/ssm/s5_backward/log_dt": [
+   [
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_2/ssm/s5_forward/A_imag": [
+   [
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_2/ssm/s5_forward/B_im": [
+   [
+    64,
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_2/ssm/s5_forward/B_re": [
+   [
+    64,
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_2/ssm/s5_forward/C_im": [
+   [
+    768,
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_2/ssm/s5_forward/C_re": [
+   [
+    768,
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_2/ssm/s5_forward/D": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_2/ssm/s5_forward/log_A_real": [
+   [
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_2/ssm/s5_forward/log_dt": [
+   [
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_4/ada_params_module/ada_proj/bias": [
+   [
+    4608
+   ],
+   "float32"
+  ],
+  "params/ssm_block_4/ada_params_module/ada_proj/kernel": [
+   [
+    768,
+    4608
+   ],
+   "float32"
+  ],
+  "params/ssm_block_4/mlp/down_proj/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_4/mlp/down_proj/kernel": [
+   [
+    3072,
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_4/mlp/up_proj/bias": [
+   [
+    3072
+   ],
+   "float32"
+  ],
+  "params/ssm_block_4/mlp/up_proj/kernel": [
+   [
+    768,
+    3072
+   ],
+   "float32"
+  ],
+  "params/ssm_block_4/spatial_fusion/dwconv_dil1/kernel": [
+   [
+    3,
+    3,
+    1,
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_4/spatial_fusion/dwconv_dil2/kernel": [
+   [
+    3,
+    3,
+    1,
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_4/spatial_fusion/dwconv_dil3/kernel": [
+   [
+    3,
+    3,
+    1,
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_4/ssm/out_proj/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_4/ssm/out_proj/kernel": [
+   [
+    1536,
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_4/ssm/s5_backward/A_imag": [
+   [
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_4/ssm/s5_backward/B_im": [
+   [
+    64,
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_4/ssm/s5_backward/B_re": [
+   [
+    64,
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_4/ssm/s5_backward/C_im": [
+   [
+    768,
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_4/ssm/s5_backward/C_re": [
+   [
+    768,
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_4/ssm/s5_backward/D": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_4/ssm/s5_backward/log_A_real": [
+   [
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_4/ssm/s5_backward/log_dt": [
+   [
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_4/ssm/s5_forward/A_imag": [
+   [
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_4/ssm/s5_forward/B_im": [
+   [
+    64,
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_4/ssm/s5_forward/B_re": [
+   [
+    64,
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_4/ssm/s5_forward/C_im": [
+   [
+    768,
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_4/ssm/s5_forward/C_re": [
+   [
+    768,
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_4/ssm/s5_forward/D": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_4/ssm/s5_forward/log_A_real": [
+   [
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_4/ssm/s5_forward/log_dt": [
+   [
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_5/ada_params_module/ada_proj/bias": [
+   [
+    4608
+   ],
+   "float32"
+  ],
+  "params/ssm_block_5/ada_params_module/ada_proj/kernel": [
+   [
+    768,
+    4608
+   ],
+   "float32"
+  ],
+  "params/ssm_block_5/mlp/down_proj/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_5/mlp/down_proj/kernel": [
+   [
+    3072,
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_5/mlp/up_proj/bias": [
+   [
+    3072
+   ],
+   "float32"
+  ],
+  "params/ssm_block_5/mlp/up_proj/kernel": [
+   [
+    768,
+    3072
+   ],
+   "float32"
+  ],
+  "params/ssm_block_5/spatial_fusion/dwconv_dil1/kernel": [
+   [
+    3,
+    3,
+    1,
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_5/spatial_fusion/dwconv_dil2/kernel": [
+   [
+    3,
+    3,
+    1,
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_5/spatial_fusion/dwconv_dil3/kernel": [
+   [
+    3,
+    3,
+    1,
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_5/ssm/out_proj/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_5/ssm/out_proj/kernel": [
+   [
+    1536,
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_5/ssm/s5_backward/A_imag": [
+   [
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_5/ssm/s5_backward/B_im": [
+   [
+    64,
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_5/ssm/s5_backward/B_re": [
+   [
+    64,
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_5/ssm/s5_backward/C_im": [
+   [
+    768,
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_5/ssm/s5_backward/C_re": [
+   [
+    768,
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_5/ssm/s5_backward/D": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_5/ssm/s5_backward/log_A_real": [
+   [
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_5/ssm/s5_backward/log_dt": [
+   [
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_5/ssm/s5_forward/A_imag": [
+   [
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_5/ssm/s5_forward/B_im": [
+   [
+    64,
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_5/ssm/s5_forward/B_re": [
+   [
+    64,
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_5/ssm/s5_forward/C_im": [
+   [
+    768,
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_5/ssm/s5_forward/C_re": [
+   [
+    768,
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_5/ssm/s5_forward/D": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_5/ssm/s5_forward/log_A_real": [
+   [
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_5/ssm/s5_forward/log_dt": [
+   [
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_6/ada_params_module/ada_proj/bias": [
+   [
+    4608
+   ],
+   "float32"
+  ],
+  "params/ssm_block_6/ada_params_module/ada_proj/kernel": [
+   [
+    768,
+    4608
+   ],
+   "float32"
+  ],
+  "params/ssm_block_6/mlp/down_proj/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_6/mlp/down_proj/kernel": [
+   [
+    3072,
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_6/mlp/up_proj/bias": [
+   [
+    3072
+   ],
+   "float32"
+  ],
+  "params/ssm_block_6/mlp/up_proj/kernel": [
+   [
+    768,
+    3072
+   ],
+   "float32"
+  ],
+  "params/ssm_block_6/spatial_fusion/dwconv_dil1/kernel": [
+   [
+    3,
+    3,
+    1,
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_6/spatial_fusion/dwconv_dil2/kernel": [
+   [
+    3,
+    3,
+    1,
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_6/spatial_fusion/dwconv_dil3/kernel": [
+   [
+    3,
+    3,
+    1,
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_6/ssm/out_proj/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_6/ssm/out_proj/kernel": [
+   [
+    1536,
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_6/ssm/s5_backward/A_imag": [
+   [
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_6/ssm/s5_backward/B_im": [
+   [
+    64,
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_6/ssm/s5_backward/B_re": [
+   [
+    64,
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_6/ssm/s5_backward/C_im": [
+   [
+    768,
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_6/ssm/s5_backward/C_re": [
+   [
+    768,
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_6/ssm/s5_backward/D": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_6/ssm/s5_backward/log_A_real": [
+   [
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_6/ssm/s5_backward/log_dt": [
+   [
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_6/ssm/s5_forward/A_imag": [
+   [
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_6/ssm/s5_forward/B_im": [
+   [
+    64,
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_6/ssm/s5_forward/B_re": [
+   [
+    64,
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_6/ssm/s5_forward/C_im": [
+   [
+    768,
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_6/ssm/s5_forward/C_re": [
+   [
+    768,
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_6/ssm/s5_forward/D": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_6/ssm/s5_forward/log_A_real": [
+   [
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_6/ssm/s5_forward/log_dt": [
+   [
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_8/ada_params_module/ada_proj/bias": [
+   [
+    4608
+   ],
+   "float32"
+  ],
+  "params/ssm_block_8/ada_params_module/ada_proj/kernel": [
+   [
+    768,
+    4608
+   ],
+   "float32"
+  ],
+  "params/ssm_block_8/mlp/down_proj/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_8/mlp/down_proj/kernel": [
+   [
+    3072,
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_8/mlp/up_proj/bias": [
+   [
+    3072
+   ],
+   "float32"
+  ],
+  "params/ssm_block_8/mlp/up_proj/kernel": [
+   [
+    768,
+    3072
+   ],
+   "float32"
+  ],
+  "params/ssm_block_8/spatial_fusion/dwconv_dil1/kernel": [
+   [
+    3,
+    3,
+    1,
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_8/spatial_fusion/dwconv_dil2/kernel": [
+   [
+    3,
+    3,
+    1,
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_8/spatial_fusion/dwconv_dil3/kernel": [
+   [
+    3,
+    3,
+    1,
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_8/ssm/out_proj/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_8/ssm/out_proj/kernel": [
+   [
+    1536,
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_8/ssm/s5_backward/A_imag": [
+   [
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_8/ssm/s5_backward/B_im": [
+   [
+    64,
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_8/ssm/s5_backward/B_re": [
+   [
+    64,
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_8/ssm/s5_backward/C_im": [
+   [
+    768,
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_8/ssm/s5_backward/C_re": [
+   [
+    768,
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_8/ssm/s5_backward/D": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_8/ssm/s5_backward/log_A_real": [
+   [
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_8/ssm/s5_backward/log_dt": [
+   [
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_8/ssm/s5_forward/A_imag": [
+   [
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_8/ssm/s5_forward/B_im": [
+   [
+    64,
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_8/ssm/s5_forward/B_re": [
+   [
+    64,
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_8/ssm/s5_forward/C_im": [
+   [
+    768,
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_8/ssm/s5_forward/C_re": [
+   [
+    768,
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_8/ssm/s5_forward/D": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_8/ssm/s5_forward/log_A_real": [
+   [
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_8/ssm/s5_forward/log_dt": [
+   [
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_9/ada_params_module/ada_proj/bias": [
+   [
+    4608
+   ],
+   "float32"
+  ],
+  "params/ssm_block_9/ada_params_module/ada_proj/kernel": [
+   [
+    768,
+    4608
+   ],
+   "float32"
+  ],
+  "params/ssm_block_9/mlp/down_proj/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_9/mlp/down_proj/kernel": [
+   [
+    3072,
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_9/mlp/up_proj/bias": [
+   [
+    3072
+   ],
+   "float32"
+  ],
+  "params/ssm_block_9/mlp/up_proj/kernel": [
+   [
+    768,
+    3072
+   ],
+   "float32"
+  ],
+  "params/ssm_block_9/spatial_fusion/dwconv_dil1/kernel": [
+   [
+    3,
+    3,
+    1,
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_9/spatial_fusion/dwconv_dil2/kernel": [
+   [
+    3,
+    3,
+    1,
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_9/spatial_fusion/dwconv_dil3/kernel": [
+   [
+    3,
+    3,
+    1,
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_9/ssm/out_proj/bias": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_9/ssm/out_proj/kernel": [
+   [
+    1536,
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_9/ssm/s5_backward/A_imag": [
+   [
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_9/ssm/s5_backward/B_im": [
+   [
+    64,
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_9/ssm/s5_backward/B_re": [
+   [
+    64,
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_9/ssm/s5_backward/C_im": [
+   [
+    768,
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_9/ssm/s5_backward/C_re": [
+   [
+    768,
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_9/ssm/s5_backward/D": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_9/ssm/s5_backward/log_A_real": [
+   [
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_9/ssm/s5_backward/log_dt": [
+   [
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_9/ssm/s5_forward/A_imag": [
+   [
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_9/ssm/s5_forward/B_im": [
+   [
+    64,
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_9/ssm/s5_forward/B_re": [
+   [
+    64,
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_9/ssm/s5_forward/C_im": [
+   [
+    768,
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_9/ssm/s5_forward/C_re": [
+   [
+    768,
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_9/ssm/s5_forward/D": [
+   [
+    768
+   ],
+   "float32"
+  ],
+  "params/ssm_block_9/ssm/s5_forward/log_A_real": [
+   [
+    64
+   ],
+   "float32"
+  ],
+  "params/ssm_block_9/ssm/s5_forward/log_dt": [
+   [
+    64
+   ],
+   "float32"
+  ]
+ }
+}
