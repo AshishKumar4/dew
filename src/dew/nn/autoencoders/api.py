@@ -181,3 +181,13 @@ class ModuleAutoEncoder[M: nn.Module](AutoEncoder):
 
     def decode_batch(self, params, z):
         return self.decode_single_frame(params, z)
+
+    @property
+    def downscale_factor(self) -> int:
+        """The module's own, where encoding adds nothing to it."""
+        return self.model.downscale_factor
+
+    @property
+    def latent_channels(self) -> int:
+        """The module's own, where encoding adds nothing to it."""
+        return self.model.latent_channels
