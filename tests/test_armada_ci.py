@@ -127,7 +127,7 @@ def test_the_gpu_tier_is_every_file_whose_tests_read_the_backend_or_are_marked_f
     name, every file's of a task where a session fixture made it, and a
     test module's under whose body it ran, though another file imported it
     first, beside others. The `sys` and `platform` modules are no read. A
-    file that started a process, a shell's or multiprocessing's included,
+    file that started a process, a shell's or any multiprocessing context's,
     has no key, so it is in, and no task reuses its row, whatever names its
     program (a descriptor, for `os.execve`); one that asked a native tool
     about the host (`executed.TOOLS`) keeps its key. The command line
@@ -176,10 +176,12 @@ def test_the_gpu_tier_is_every_file_whose_tests_read_the_backend_or_are_marked_f
                          "        finally:\n"
                          "            os._exit(1)\n"
                          "    assert os.waitstatus_to_exitcode(os.waitpid(child, 0)[1]) == 0\n",
-        "test_pool.py": "import multiprocessing, os\n"
-                        "def test_pool():\n"
-                        "    child = multiprocessing.get_context('spawn').Process(target=os.getpid)\n"
-                        "    child.start()\n    child.join()\n    assert child.exitcode == 0\n",
+        **{f"test_{method}.py": "import multiprocessing, os\n"
+                                "def test_child():\n"
+                                f"    context = multiprocessing.get_context('{method}')\n"
+                                "    child = context.Process(target=os.getpid)\n"
+                                "    child.start()\n    child.join()\n    assert child.exitcode == 0\n"
+           for method in ("spawn", "forkserver", "fork")},
         "test_new.py": "def test_unrun(): pass\n",
     }
     for name, source in files.items():
@@ -209,15 +211,18 @@ def test_the_gpu_tier_is_every_file_whose_tests_read_the_backend_or_are_marked_f
         "tests/test_one.py": ["tests/devices.py:placed"],
         "tests/test_passed.py": ["tests/test_passed.py:chosen"],
         "tests/test_plain.py": ["changed"],
-        "tests/test_pool.py": ["changed"],
+        "tests/test_fork.py": ["changed"],
+        "tests/test_forkserver.py": ["changed"],
         "tests/test_shell.py": ["changed"],
         "tests/test_routes.py": ["tests/test_routes.py:chosen"],
+        "tests/test_spawn.py": ["changed"],
         "tests/test_spawns.py": ["changed"],
         "tests/test_two.py": ["tests/devices.py:placed"]}
     common = ci.shared("3.12")
     assert [ci.reused("3.12", f"tests/{name}", "", common) is not None
-            for name in ("test_machine.py", "test_tool.py", "test_spawns.py", "test_pool.py",
-                         "test_shell.py")] == [True, True, False, False, False]
+            for name in ("test_machine.py", "test_tool.py", "test_spawns.py", "test_spawn.py",
+                         "test_forkserver.py", "test_fork.py", "test_shell.py")] == [
+        True, True, False, False, False, False, False]
     monkeypatch.setattr(sys, "argv", ["ci.py", "gpu-tier", "--shards=2"])
     capsys.readouterr()
     assert ci.main() == 0
