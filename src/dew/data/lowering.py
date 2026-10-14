@@ -26,7 +26,6 @@ from typing import TYPE_CHECKING, Protocol, runtime_checkable
 import grain.experimental as gx
 import grain.python as pygrain
 import numpy as np
-from grain._src.python.dataset.transformations.batch import make_batch
 
 from dew.data.analysis import (
     _LOCAL,
@@ -39,12 +38,22 @@ from dew.data.analysis import (
     _name,
     _until,
 )
-from dew.data.dataset import Batch, DataPartition, FilledBatch, Loading, Records, _Grouped, stacked
+from dew.data.dataset import (
+    Batch,
+    DataPartition,
+    FilledBatch,
+    Loading,
+    Records,
+    _Grouped,
+    record_batch,
+    stacked,
+)
 from dew.data.mixing import Accepted, PrimedMix, SearchBudget, TokenDeficit, primed_maps, token_weights
 from dew.data.pipeline import (
     Artifact,
     Batched,
     BatchStage,
+    Expansion,
     Filter,
     FlatMap,
     Group,
@@ -123,7 +132,9 @@ def _outputs(
     if isinstance(stage, Filter):
         return (value if stage.predicate(record(value, "filter input")) else Rejected(stage.reason),)
     if isinstance(stage, FlatMap):
-        return tuple(stage.step.flat_map(record(value, "flat_map input"))) or (Rejected("empty_expansion"),)
+        element = record(value, "flat_map input")
+        outputs = stage.step.flat_map(element) if isinstance(stage.step, Expansion) else stage.step(element)
+        return tuple(outputs) or (Rejected("empty_expansion"),)
     if isinstance(stage, RandomMap):
         if rng is None:
             raise ValueError(f"random step {_identity(stage).name} needs a record rng")
@@ -716,7 +727,7 @@ class _Build:
         if isinstance(rows, pygrain.MapDataset):
             if self.training and self.lowering.endless and not self.lowering.repeated:
                 rows = rows.repeat(None)
-            elif self.training and not self.lowering.endless:
+            elif self.training and not self.lowering.endless and drop:
                 rows = rows[: len(rows) // batch_stage.size * batch_stage.size]
             whole = rows
             rows = rows[offset + partition.index :: partition.count]
@@ -733,7 +744,7 @@ class _Build:
             stream = _as_iter(rows, self.loading).batch(
                 size, drop_remainder=drop, batch_fn=_Batched(batch_stage.batch_fn)
             )
-        if not self.training and fill:
+        if not drop and fill:
             stream = stream.map(
                 _FillShare(partition, batch_stage.size) if canonical else FilledBatch(size, real=not empty)
             )
@@ -768,6 +779,7 @@ class _Build:
                 "token-budget batching requires one share until a synchronized shape schedule is supplied"
             )
         rows, _ = self.records(pipeline, partition)
+        budget = budget if self.training else dataclasses.replace(budget, drop_remainder=False)
         return TokenBatches(_as_iter(rows, self.loading), budget, partition, self.seed)
 
 
@@ -879,8 +891,8 @@ class _SharedOutput(Protocol):
 @dataclasses.dataclass
 class _Batched:
     """The batch step: each row's private fields dropped (`_Payload`), then
-    the rows stacked (`stacked`) by the pipeline's `batch_fn`, or by Grain's
-    own batch, into shared memory once Grain asks for it. The strip runs
+    the rows stacked (`stacked`) by the pipeline's `batch_fn`, or by
+    `record_batch`, into shared memory once Grain asks for it. The strip runs
     inside the batch, so it adds no Grain stage of its own; rows carry their
     private fields up to it, for the grouping and counting that read them."""
 
@@ -902,7 +914,7 @@ class _Batched:
         payload = [_Payload()(row) for row in rows]
         if self.batch_fn is not None:
             return stacked(payload, self.batch_fn)
-        return stacked(payload, functools.partial(make_batch, output_to_shared_memory=self.shared))
+        return stacked(payload, functools.partial(record_batch, shared=self.shared))
 
 
 @dataclasses.dataclass(frozen=True)

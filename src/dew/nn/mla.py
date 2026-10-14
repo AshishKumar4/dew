@@ -488,7 +488,8 @@ class MultiHeadLatentAttention(nn.Module):
         implementation = self.attention_impl
         batch, length, _ = x.shape
         tokens = coordinates_of(attention_metadata, batch, length)
-        positions, segment_ids = tokens.positions, tokens.segments
+        # Each token's logical place (`Coordinates.places`); a cached call's default is its slot.
+        positions, segment_ids = tokens.positions if decode else tokens.places(), tokens.segments
         valid = None if attention_metadata is None else attention_metadata.valid
         if attention_metadata is not None and attention_metadata.rotary_positions is not None:
             raise ValueError("MLA does not implement multi-axis rotary positions")
@@ -508,11 +509,7 @@ class MultiHeadLatentAttention(nn.Module):
                 x, q_rot, rot, latent, q_resid, logical_positions, valid, kv_store)
             causal = False
         else:
-            if positions is None:
-                positions = (jnp.arange(length) if valid is None else
-                             jnp.maximum(jnp.cumsum(valid, axis=1) - 1, 0))
-            else:
-                positions = jnp.asarray(positions)
+            positions = jnp.arange(length) if positions is None else jnp.asarray(positions)
             q_rot, rot, freqs_cos, freqs_sin = self._rotated(q_rot, rot, positions)
             if segment_ids is not None:
                 inside = document_mask(segment_ids)[:, None]
