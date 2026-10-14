@@ -150,7 +150,7 @@ def test_the_gpu_tier_is_every_file_whose_tests_read_the_backend_or_are_marked_f
                                 "def test_on(): assert ON == 'gpu'\n",
         "test_marked.py": "import pytest\n@pytest.mark.gpu\ndef test_on_a_gpu(): pass\n",
         "test_machine.py": "import platform, sys\n"
-                           "def test_machine(): assert platform.platform() and sys.platform\n",
+                           "def test_machine(): assert platform.python_version() and sys.platform\n",
         "plain.py": "def helper(): return 1\n",
         "test_plain.py": "def test_plain():\n    from plain import helper\n    assert helper() == 1\n",
         "test_lost.py": "def test_lost(): pass\n",
