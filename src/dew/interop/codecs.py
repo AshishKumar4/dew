@@ -627,8 +627,11 @@ def quantize_fp8_blocks(weight: ArrayLike, block: Block = BLOCK, *,
                  for part in _runs(np.asarray(weight), None, runs)[0]]
         return np.concatenate([codes for codes, _ in parts]), np.concatenate([scale for _, scale in parts])
     rows, cols = _sides(block)
-    return _cast_blocks(_finite_matrix(weight), rows, cols, xp=np, divide=np.divide,
-                        rounded=_ue8m0 if ue8m0 else np.asarray)
+    codes, scale_inv = _cast_blocks(_finite_matrix(weight), rows, cols, xp=np, divide=np.divide,
+                                    rounded=_ue8m0 if ue8m0 else np.asarray)
+    # A contiguous copy: sliced off the padding, the codes are a view whose
+    # buffer a writer taking it would read as the padded rows.
+    return np.ascontiguousarray(codes), scale_inv
 
 
 def fp8_block_cast(x: jax.Array, block: Block) -> tuple[jax.Array, jax.Array]:
@@ -654,8 +657,7 @@ def _cast_blocks(values, rows: int, cols: int, *, xp, divide, rounded):
     scale_inv = rounded(divide(amax, xp.float32(E4M3_MAX)))
     # One reciprocal per block, as the reference takes it.
     codes = (tiles * divide(xp.float32(1.0), scale_inv)[:, None, :, None]).astype(E4M3)
-    # A contiguous copy: the slice off the padding is a view a writer taking the buffer misreads.
-    return xp.ascontiguousarray(codes.reshape(padded.shape)[:height, :width]), scale_inv
+    return codes.reshape(padded.shape)[:height, :width], scale_inv
 
 
 def scaled_names(tensors: Mapping[str, np.ndarray]) -> tuple[str, ...]:
