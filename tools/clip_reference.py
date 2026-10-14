@@ -167,6 +167,7 @@ def write_fp64(path: Path) -> None:
         JAX_ENABLE_X64=1 python - <<'PY'
         import functools, json, numpy as np, jax, jax.numpy as jnp
         import dew.nn.text_encoders as te
+        from dew.inputs import CLIPText
         from dew.nn.attention import scaled_dot_product_attention
         te.scaled_dot_product_attention = functools.partial(
             scaled_dot_product_attention, force_fp32_for_softmax=False)
@@ -174,9 +175,9 @@ def write_fp64(path: Path) -> None:
         meta = json.load(open(f"{fixtures}/prompts.json"))
         ids = np.load(f"{fixtures}/reference.npz")
         pure = np.load("/tmp/clip-fp64.npz")
-        model = te.CLIPTextModel.from_pretrained(meta["repo"], dtype=jnp.float64)
-        variables = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64), model.variables)
-        out = model.transformer.apply(variables, ids["input_ids"], ids["attention_mask"])
+        encoder = CLIPText.from_pretrained(meta["repo"], dtype=jnp.float64)
+        variables = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64), encoder.params)
+        out = encoder.transformer.apply(variables, ids["input_ids"], ids["attention_mask"])
         print(np.abs(np.asarray(out.last_hidden_state) - pure["last_hidden_state"]).max())
         PY
     """

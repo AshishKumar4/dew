@@ -72,7 +72,12 @@ def projection_groups(model: nn.Module, variables: Variables) -> tuple[Projectio
 
 
 def pack_projections(variables: Variables, groups: Sequence[ProjectionGroup]) -> Variables:
-    """Move the concatenation of constant serving weights out of the decode step."""
+    """Move the concatenation of constant serving weights out of the decode step.
+
+    The members' input quantization becomes the packed product's, which
+    quantizes their one input once; members scaled apart are refused, since
+    no one scale computes each of them (`projection_groups` leaves such a
+    group unpacked, and a reload into a packed layout cannot)."""
     if not groups:
         return variables
     packed = unfreeze(dict(variables))
@@ -93,10 +98,37 @@ def pack_projections(variables: Variables, groups: Sequence[ProjectionGroup]) ->
             del node[projection]
         quantized = _node(packed, QUANTIZATION, group.path)
         if group.members[0] in quantized:
+            if not _same_quantization(packed, group):
+                raise ValueError(f"{'/'.join(group.path)}'s {', '.join(group.members)} quantize their one "
+                                 f"input apart, which {group.packed} cannot")
             quantized[group.packed] = quantized[group.members[0]]
             for projection in group.members:
                 del quantized[projection]
     return packed
+
+
+def packed_layout(model: nn.Module, variables: Variables) -> tuple[tuple[ProjectionGroup, ...], Variables]:
+    """The groups `variables` hold packed, and the shapes of the tree they
+    were packed from, `pack_projections` undone: each packed kernel and bias
+    split back into its members by their widths, and the packed input
+    quantization each member's own again. A served model's reload takes
+    that tree and packs it again."""
+    shapes = unfreeze(dict(jax.tree.map(
+        lambda leaf: jax.ShapeDtypeStruct(np.shape(leaf), jnp.result_type(leaf)), variables)))
+    groups = tuple(group for group in projection_groups(model, variables)
+                   if group.packed in _node(variables, "params", group.path))
+    for group in groups:
+        node = _node(shapes, "params", group.path)
+        packed = node.pop(group.packed)
+        for projection, width in zip(group.members, group.widths, strict=True):
+            node[projection] = {field: jax.ShapeDtypeStruct((*leaf.shape[:-1], width), leaf.dtype)
+                                for field, leaf in packed.items()}
+        quantized = _node(shapes, QUANTIZATION, group.path)
+        if group.packed in quantized:
+            scale = quantized.pop(group.packed)
+            for projection in group.members:
+                quantized[projection] = scale
+    return groups, shapes
 
 
 def inference_projections(model: nn.Module, variables: Variables) -> Variables:

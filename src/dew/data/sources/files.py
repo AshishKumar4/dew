@@ -36,6 +36,14 @@ type Format = Literal["jsonl", "text", "csv", "parquet", "arrow", "array_record"
 
 
 def _format(url: str) -> Format:
+    inferred = _inferred(url)
+    if inferred is None:
+        raise ValueError(f"source {url!r} needs format=; a URL does not declare its record format")
+    return inferred
+
+
+def _inferred(url: str) -> Format | None:
+    """The record format a URL's suffix declares, or None where it declares none."""
     if url.lower().endswith((".jsonl.gz", ".jsonl.zst")):
         return "jsonl"
     suffix = PurePosixPath(url).suffix.lower()
@@ -49,9 +57,7 @@ def _format(url: str) -> Format:
         ".array_record": "array_record",
         ".tar": "webdataset",
     }
-    if suffix not in formats:
-        raise ValueError(f"source {url!r} needs format=; a URL does not declare its record format")
-    return formats[suffix]
+    return formats.get(suffix)
 
 
 def _arrow_filesystem(fs) -> pafs.FileSystem:
