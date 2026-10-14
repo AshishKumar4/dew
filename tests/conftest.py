@@ -44,6 +44,16 @@ def pytest_terminal_summary(terminalreporter):
         terminalreporter.write_line(_remote.summary())
 
 
+def pytest_collection_finish(session):
+    """A run whose every selected test is a GPU's (`-m gpu`) refuses to start on
+    another backend: the lane defaults JAX_PLATFORMS to cpu (`lane_environment`),
+    where each would only skip and the run would look green."""
+    if (session.items and jax.default_backend() != "gpu"
+            and all(item.get_closest_marker("gpu") for item in session.items)):
+        raise pytest.UsageError(f"every selected test runs on a CUDA GPU, and this run's backend is "
+                                f"{jax.default_backend()}: set JAX_PLATFORMS=cuda")
+
+
 def pytest_runtest_setup(item):
     marker = item.get_closest_marker("mesh")
     needed = marker.kwargs.get("devices", lane_environment.MESH_DEVICES) if marker else 0

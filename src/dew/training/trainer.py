@@ -50,8 +50,8 @@ from dew.data.dataset import (
 )
 from dew.data.pipeline import Dataset, DeviceStep
 from dew.nn.flops import MissingFlopsCount
+from dew.nn.kernels import tuning
 from dew.nn.kernels.generation import assumed, gpu_mesh, gpu_target, measured_kernel
-from dew.nn.kernels.tuning import tune
 from dew.nn.sharding import (
     BATCH_AXES,
     SEQUENCE_AXIS,
@@ -147,7 +147,7 @@ from dew.training.model_flops import (
 )
 from dew.training.narrow import narrowed, narrowed_paths
 from dew.training.planning import Candidate, Planned, Timer, plan_step, settled, splits, whole_step
-from dew.training.rungs import keep_rung, plan_flops, recorded_rung
+from dew.training.rungs import keep_rung, plan_flops, recorded_launches, recorded_rung
 from dew.training.runtime import Preempted, PreemptionNotice
 from dew.training.selection import Best
 from dew.training.state import Accumulation, TrainState
@@ -386,6 +386,29 @@ class _FitRun:
         return next(self.train)
 
 
+def _read_whole(accumulation: int, split: int | None, step: Callable[..., StepFn] | None, layout: Layout,
+                rollout: Rollout | None, mesh: MeshSpec) -> str | None:
+    """Why every step reads its batch whole, or None where a plan may split it,
+    refusing the arguments no Trainer takes together."""
+    if accumulation < 1:
+        raise ValueError(f"accumulation must be at least 1, got {accumulation}")
+    # Split under an Explicit axis, a step met a cotangent the split typed
+    # float32[16@data,16,16] against its forward's float32[16,16,16].
+    whole = ("a custom step owns its execution" if step is not None else
+             "the layout keeps the variables on the host" if "variables" in layout.host else
+             "a rollout writes a batch of its own" if rollout is not None else
+             "an Explicit mesh axis types the step's rows" if mesh.explicit else None)
+    if split is not None and (split < 1 or (whole is not None and split > 1)):
+        raise ValueError(f"split reads each step's batch in that many microbatches, at least 1, and "
+                         f"only 1 where {whole}; got {split}")
+    if step is not None and "variables" in layout.host:
+        raise ValueError(
+            "Parameter-streamed training requires the trainer objective transaction; "
+            "custom steps own their execution"
+        )
+    return whole
+
+
 _DEFAULT_MESH = MeshSpec()
 _DEFAULT_LAYOUT = Layout()
 
@@ -410,6 +433,7 @@ class Trainer(Generic[Loss, Effects]):
         rollout: Rollout | None = None,
         profile: ProfileWindow | None = None,
         lower_for: str | None = None,
+        tune_kernels: bool = False,
     ):
         """Hold everything a run needs, without opening any of it.
 
@@ -426,23 +450,11 @@ class Trainer(Generic[Loss, Effects]):
         attempted-step counter. `rollout` runs once per batch read, before the step and outside
         replay. `layout` and `mesh` say where the state lives. `lower_for`, a CUDA generation, lowers
         the first step for it in place of compiling it (`dew.training._lowering.Lowered`).
+        `tune_kernels` measures each Pallas launch of a step that has no config measured on this GPU,
+        where the process has the GPU to itself (`dew.nn.kernels.tuning.tune`); without it such a
+        launch runs the nearest measured shape's config or its heuristic.
         """
-        if accumulation < 1:
-            raise ValueError(f"accumulation must be at least 1, got {accumulation}")
-        # Split under an Explicit axis, a step met a cotangent the split typed
-        # float32[16@data,16,16] against its forward's float32[16,16,16].
-        whole = ("a custom step owns its execution" if step is not None else
-                 "the layout keeps the variables on the host" if "variables" in layout.host else
-                 "a rollout writes a batch of its own" if rollout is not None else
-                 "an Explicit mesh axis types the step's rows" if mesh.explicit else None)
-        if split is not None and (split < 1 or (whole is not None and split > 1)):
-            raise ValueError(f"split reads each step's batch in that many microbatches, at least 1, and "
-                             f"only 1 where {whole}; got {split}")
-        if step is not None and "variables" in layout.host:
-            raise ValueError(
-                "Parameter-streamed training requires the trainer objective transaction; "
-                "custom steps own their execution"
-            )
+        whole = _read_whole(accumulation, split, step, layout, rollout, mesh)
         self.objective = objective
         built = isinstance(optimizer, optax.GradientTransformation)
         self._config = None if built else optimizer
@@ -460,6 +472,7 @@ class Trainer(Generic[Loss, Effects]):
         self.tracker = tracker
         self.step = step
         self.rollout = rollout
+        self.tune_kernels = tune_kernels
         self.profile = profile
         self.lower_for = lower_for
         # Set by `compile`, for the batch shape it was called with. A ramped
@@ -1152,7 +1165,8 @@ class Trainer(Generic[Loss, Effects]):
         shards = math.prod(mesh.shape[axis] for axis in BATCH_AXES)
 
         def lower(split: int) -> Candidate:
-            return self._candidate(state, batch, schedule, placement, replicated, split)
+            return self._candidate(state, batch, schedule, placement, replicated, split,
+                                   recorded_launches(recorded, {**self._rung(), 'split': split}))
 
         # Read before anything traces, so a recorded rung is the first one lowered.
         record_path, key, recorded = recorded_rung(self.objective.program_key(), (state, batch), candidates,
@@ -1180,16 +1194,19 @@ class Trainer(Generic[Loss, Effects]):
         chosen = {**self._rung(), 'split': planned.split}
         flops, counted = plan_flops(recorded, planned.executable)
         if record_path is not None:
-            keep_rung(record_path, key, {**chosen, 'flops': counted})
+            keep_rung(record_path, key, {**chosen, 'flops': counted, 'launches': planned.candidate.launches})
         self.plan = settled(planned, plans, seconds, probes)
         if planned.split != candidates[0] or seconds:
             _log.warning("the step fits the devices in the plan %s", self.plan)
         return planned, flops
 
     def _candidate(self, state: TrainState, batch: Batch, schedule: Schedule, placement, replicated,
-                   split: int) -> Candidate:
+                   split: int, launches: str | None) -> Candidate:
         """The step reading `batch` in `split` microbatches, lowered at the
-        objective's current rung, with what the fit check holds beside it."""
+        objective's current rung, with what the fit check holds beside it.
+        `launches` are its kernel launches where a record holds them, which
+        settle their configs without the lowering `tune` reads them from, unless
+        the run measures configs (`tune_kernels`)."""
         micro = microbatch_shapes(batch, split)
         shapes, copies, prepared = self._prepared(state, micro, schedule, split * self.accumulation)
         shardings = self.shardings(prepared)
@@ -1205,9 +1222,12 @@ class Trainer(Generic[Loss, Effects]):
         jitted = self._jitted(shapes, copies, shardings, placement, replicated, split)
         part = jax.ShapeDtypeStruct((), jnp.int32, sharding=replicated)
         lower = functools.partial(jitted.lower, prepared, batch, part)
-        # The lowering after `tune` reads the launch configs it settled.
-        tune(lower)
-        return Candidate(micro, shapes, copies, shardings, prepared, held, lower())
+        # The lowering after either reads the launch configs they settled.
+        if launches is None or self.tune_kernels:
+            launches = tuning.tune(lower, measure=self.tune_kernels)
+        else:
+            tuning.settled(launches)
+        return Candidate(micro, shapes, copies, shardings, prepared, held, lower(), launches)
 
     def _prepared(self, state: TrainState, batch: Batch, schedule: Schedule, window: int):
         """The loss's shapes (None under a custom step), the narrow copies and the state's shapes

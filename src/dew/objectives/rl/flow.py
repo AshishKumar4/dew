@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import jax
@@ -33,6 +33,7 @@ from dew.nn.autoencoders import AutoEncoder
 from dew.objectives.base import Aux, Batch, Ratio, Shown, Step, Variables
 from dew.objectives.diffusion.objective import DiffusionObjective
 from dew.registry import metrics
+from dew.rl.surrogate import clipped_surrogate_terms
 from dew.sampling.flow import FlowSDE, FlowTrajectory, GaussianTransition
 from dew.sampling.guidance import CFG, Walk
 from dew.sampling.solvers import Euler, Solver
@@ -235,10 +236,12 @@ class FlowGRPOObjective(DiffusionObjective):
             keep = selected & (transition.variance != 0)
             current = jnp.where(keep, transition.log_prob(action), 0) / dimensions
             previous = jnp.where(keep, old_log_prob, 0) / dimensions
+            # Flow-GRPO's clip is PPO's without the dual cap, one term a sample.
+            surrogate, _ = clipped_surrogate_terms((current - previous)[:, None], advantage, keep[:, None],
+                                                   epsilon_low=self.clip_range, epsilon_high=self.clip_range,
+                                                   dual_clip=None)
+            pg = jnp.where(keep, surrogate[:, 0], 0).sum()
             ratio = jnp.exp(current - previous)
-            unclipped = -advantage * ratio
-            clipped = -advantage * jnp.clip(ratio, 1 - self.clip_range, 1 + self.clip_range)
-            pg = jnp.where(keep, jnp.maximum(unclipped, clipped), 0).sum()
             kl = jnp.asarray(0.0)
             if reference is not None:
                 # The released scripts/train_sd3.py that the module docstring
@@ -300,8 +303,6 @@ class FlowRollout:
     groups: int = 4
     steps: int = 11
     train_steps: int | None = None
-    _generate: Callable[[Variables, Batch, jax.Array], tuple[FlowTrajectory, jax.Array]] = field(
-        init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if self.groups < 2:
@@ -316,7 +317,6 @@ class FlowRollout:
                     OLD_LOG_PROBS_KEY, ADVANTAGES_KEY, REWARDS_KEY, "transition_mask"}
         if any(condition.field in reserved for condition in self.objective.inputs.conditions.values()):
             raise ValueError("conditioning fields must not overwrite FlowGRPO transition fields")
-        object.__setattr__(self, "_generate", jax.jit(self._generate_impl))
 
 
 
@@ -425,7 +425,9 @@ class FlowRollout:
         succeeded before the next collective runs.
         """
         expanded, owned, count = agreed("flow rollout setup", lambda: self._expanded(batch))
-        generated = agreed("flow rollout generation", lambda: self._generate(state.variables, expanded, key))
+        # The objective owns the program; the rollout fixes only its count of time points.
+        generate = self.objective.program(f"flow rollout over {self.steps} time points", self._generate_impl)
+        generated = agreed("flow rollout generation", lambda: generate(state.variables, expanded, key))
         (trajectory, images), context = collective_host(
             (generated, expanded), phase="flow rollout")
 
