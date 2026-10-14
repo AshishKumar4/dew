@@ -23,13 +23,12 @@ import types
 from pathlib import Path
 
 import pytest
+from ci import MARKS
 
 TOOL = 3
 """sys.monitoring's tool ids 0-2 and 5 are the debugger's, coverage's, the profiler's and the optimizer's."""
 SPAWNS = {"subprocess.Popen", "os.fork", "os.forkpty", "os.posix_spawn", "os.spawn", "os.exec"}
 """Audit events of a process start."""
-MARKS = ("gpu", "kernel")
-"""The marks of tests a GPU runs otherwise: those only a GPU runs, and a kernel's, which a CPU interprets."""
 
 root = str(Path.cwd()) + os.sep
 shared: set[str] = set()

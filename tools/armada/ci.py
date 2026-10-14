@@ -448,6 +448,7 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     executed_report = out.with_name(f"{out.name}.executed.json")
     report = out.with_name(f"{out.name}.junit.xml")
     report.unlink(missing_ok=True)
+    executed_report.unlink(missing_ok=True)
     grouping = ["-p", "split", f"--ci-group={split}"] if split else []
     # faulthandler prints every thread's stack when a test runs ten minutes. Unbuffered (-u), so the
     # log holds every test that finished when a task is cut short.
@@ -525,18 +526,20 @@ def record(python: str, rows: list[dict], executed_report: Path, common: str) ->
     its key too, which `reused` reads it back by; a red row has none, so a later run never reuses
     an earlier green row of its file."""
     token = os.environ.get("DEW_XLA_CACHE_TOKEN")
-    if not token or "DEW_XLA_CACHE_URL" not in os.environ or not executed_report.is_file():
+    if not token or "DEW_XLA_CACHE_URL" not in os.environ:
         return
-    executed = json.loads(executed_report.read_text())
+    # A run cut short, or whose collection failed, may have written no report, or none for a file.
+    executed = json.loads(executed_report.read_text()) if executed_report.is_file() else {}
     held = device_class()
     for row_ in rows:
         name = parsed_row(row_["name"])[1]
-        if name not in executed:
+        ran = executed.get(name, {"depends": None, "reads": [], "peak": None})
+        if row_["exitCode"] == 0 and name not in executed:
             continue
-        depends = executed[name]["depends"]
-        green = row_["exitCode"] == 0 and depends is not None
-        body = json.dumps({"key": cache_key(common, name, depends) if green else None, "depends": depends,
-                           "row": row_, "reads": executed[name]["reads"], "peak": executed[name]["peak"]})
+        green = row_["exitCode"] == 0 and ran["depends"] is not None
+        body = json.dumps({"key": cache_key(common, name, ran["depends"]) if green else None,
+                           "depends": ran["depends"], "row": row_, "reads": ran["reads"],
+                           "peak": ran["peak"]})
         cache_request(cache_url(python, row_["name"], held), token, body.encode())
 
 
@@ -557,7 +560,7 @@ def listed(prefix: str, token: str) -> list[str]:
 
 def gpu_tier(python: str) -> dict[str, list[str]]:
     """The test files that take another path on a GPU, each with its evidence: where its tests read
-    the backend and its marks of tools/armada/executed.py's `MARKS`, over every record of its rows,
+    the backend and its marks of `MARKS`, over every record of its rows,
     on every class, a split file's under each count of groups it was planned as. A file is out
     only where every record is of these inputs (`fresh`) and says neither, so a file whose inputs
     changed since it ran is in as "changed", and one without a record, or with one the Worker did not
@@ -583,6 +586,27 @@ def gpu_tier(python: str) -> dict[str, list[str]]:
     every = sorted(str(path) for path in Path("tests").glob("test_*.py") if str(path) not in SKIPPED)
     unrecorded = {name: ["unrecorded"] for name in every if name not in evidence}
     return {name: sorted(evidence[name]) for name in every if evidence.get(name)} | unrecorded
+
+
+MARKS = ("gpu", "kernel")
+"""The marks of tests a GPU runs otherwise: those only a GPU runs, and a kernel's, which a CPU interprets."""
+
+
+def marked(python: str) -> dict[str, int]:
+    """Each test file of this checkout with tests marked one of `MARKS`, and how many, as pytest
+    collects it on the CPU: what a batch's GPU run holds, whatever the records say."""
+    every = sorted(str(path) for path in Path("tests").glob("test_*.py") if str(path) not in SKIPPED)
+    done = subprocess.run([f".venv-{python}/bin/python", "-m", "pytest", "--collect-only", "-q", "-p",
+                           "no:cacheprovider", "-m", " or ".join(MARKS), *every],
+                          capture_output=True, text=True, env={**os.environ, "JAX_PLATFORMS": "cpu"})
+    if done.returncode not in (0, 5):
+        raise SystemExit(f"collecting the marked tests exited {done.returncode}\n"
+                         f"{done.stdout[-4000:]}{done.stderr[-2000:]}")
+    counts: dict[str, int] = {}
+    for node in done.stdout.splitlines():
+        if "::" in node:
+            counts[node.split("::")[0]] = counts.get(node.split("::")[0], 0) + 1
+    return counts
 
 
 GPU_HEADROOM = (1.25, 2 ** 30)
@@ -682,7 +706,7 @@ def main() -> int:
     choosing = operations.add_parser("gpu-tier")
     choosing.add_argument("--evidence", action="store_true", help="each file's backend reads and marks too")
     choosing.add_argument("--marked", action="store_true",
-                          help="only files with a test marked to run on a GPU, and those no record covers")
+                          help="only the files with a test marked to run on a GPU, as collected here")
     choosing.add_argument("--shards", type=int, default=1, help="how many GPUs share the tier")
     lane = operations.add_parser("gpu-lane")
     lane.add_argument("--tests", required=True)
@@ -700,10 +724,8 @@ def main() -> int:
         print(f"{len(recorded)} tests, {sum(recorded.values()):.0f} s, in {DURATIONS}")
         return 0
     if args.operation == "gpu-tier":
-        tier = gpu_tier(PYTHONS[0])
-        if args.marked:
-            tier = {name: evidence for name, evidence in tier.items()
-                    if evidence == ["unrecorded"] or any(read.startswith("mark:") for read in evidence)}
+        tier = ({name: [f"{count} marked"] for name, count in marked(PYTHONS[0]).items()} if args.marked
+                else gpu_tier(PYTHONS[0]))
         if args.evidence:
             for name, evidence in tier.items():
                 print(name, *evidence, sep="\t")

@@ -129,8 +129,7 @@ def test_the_gpu_tier_is_every_file_whose_tests_read_the_backend_or_are_marked_f
     first, beside others. The `sys` and `platform` modules are no read. A
     file that started a process has no key, so it is in, and no task reuses
     its row. The command line spreads the tier over its shards, each file
-    once, and per batch names the files with a marked test and those no
-    record covers."""
+    once, and per batch names the files the checkout marks for a GPU."""
     url, stored, _ = cache_worker
     monkeypatch.setenv("DEW_XLA_CACHE_URL", url)
     monkeypatch.setenv("DEW_XLA_CACHE_TOKEN", "token")
@@ -200,10 +199,12 @@ def test_the_gpu_tier_is_every_file_whose_tests_read_the_backend_or_are_marked_f
     shards = [line.split() for line in capsys.readouterr().out.splitlines()]
     assert len(shards) == 2 and all(shards)
     assert sorted(name for names in shards for name in names) == sorted(ci.gpu_tier("3.12"))
+    # A file gains a kernel's test after its record: per batch the checkout's marks choose, not records.
+    (tmp_path / "tests/test_plain.py").write_text(
+        "import pytest\n@pytest.mark.kernel\ndef test_lowers(): pass\n")
     monkeypatch.setattr(sys, "argv", ["ci.py", "gpu-tier", "--marked"])
     assert ci.main() == 0
-    marked = capsys.readouterr().out.split()
-    assert marked == ["tests/test_lost.py", "tests/test_marked.py", "tests/test_new.py"]
+    assert capsys.readouterr().out.split() == ["tests/test_marked.py", "tests/test_plain.py"]
 
 
 def test_a_gpu_lane_runs_each_file_in_a_process_of_its_own_within_its_memory_share(
@@ -329,13 +330,15 @@ def test_a_task_reuses_a_green_row_only_on_the_cpu_class_and_inputs_it_ran_on(ci
     """A file that ran green is reused by a later task on the same CPU class while its inputs are
     unchanged; a task on another class, after its inputs change, or planned with DEW_TEST_CACHE=off
     (the daily full run) runs it again, and once it has run red on those inputs, so does every task
-    after. Each task runs as armada starts it: .armada.json's command filled from its plan entry."""
+    after, though the red run died before it wrote a report. Each task runs as armada starts it:
+    .armada.json's command filled from its plan entry."""
     (tmp_path / "tests/test_counted.py").write_text(
         "import os\n"
         "from pathlib import Path\n"
         "def test_ok():\n"
         "    with Path('runs').open('a') as runs: runs.write('x')\n"
-        "    assert not os.environ.get('FAIL')\n")
+        "    assert not os.environ.get('FAIL')\n"
+        "    if os.environ.get('EXIT'): os._exit(3)\n")
     venv = tmp_path / ".venv-3.12/bin"
     venv.mkdir(parents=True)
     (venv / "python").write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
@@ -364,7 +367,7 @@ def test_a_task_reuses_a_green_row_only_on_the_cpu_class_and_inputs_it_ran_on(ci
         monkeypatch.delenv("DEW_TEST_CACHE")
         assert ci.main() == 0
         [only] = json.loads(out.read_text())["rows"]
-        assert only["exitCode"] == int(bool(os.environ.get("FAIL")))
+        assert (only["exitCode"] == 0) == (not os.environ.get("FAIL") and not os.environ.get("EXIT"))
         return len((tmp_path / "runs").read_text())
 
     assert run("GenuineIntel-6-143") == 1
@@ -380,6 +383,12 @@ def test_a_task_reuses_a_green_row_only_on_the_cpu_class_and_inputs_it_ran_on(ci
     assert run("GenuineIntel-6-143", policy="off") == 5
     monkeypatch.delenv("FAIL")
     assert run("GenuineIntel-6-143") == 6
+    assert run("GenuineIntel-6-143") == 6
+    # A red run that died before it wrote its report.
+    monkeypatch.setenv("EXIT", "1")
+    assert run("GenuineIntel-6-143", policy="off") == 7
+    monkeypatch.delenv("EXIT")
+    assert run("GenuineIntel-6-143") == 8
 
 
 def test_a_task_past_its_deadline_is_interrupted_and_every_row_it_holds_is_red(ci, tmp_path):
