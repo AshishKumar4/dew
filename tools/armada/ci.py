@@ -4,7 +4,7 @@
     python3 tools/armada/ci.py plan --target=SECONDS --timings=FILE
     python3 tools/armada/ci.py task --python=3.12 --tests="tests/a.py tests/b.py" --split=[G/N] --out=FILE
     python3 tools/armada/ci.py durations VERDICT...
-    python3 tools/armada/ci.py gpu-tier [--evidence] [--shards=N]
+    python3 tools/armada/ci.py gpu-tier [--marked] [--evidence] [--shards=N]
     python3 tools/armada/ci.py gpu-lane --tests="tests/a.py tests/b.py" --out=FILE --cache=on --processes=N
 
 The plan prints a task matrix for each Python CI proves. Whole test files are
@@ -48,9 +48,9 @@ token, a task runs every file.
 
 A row's record also says where its tests read the backend and which are
 marked to run on a GPU, from which `gpu-tier` names the files that take
-another path on a GPU. A GPU node runs them as tasks of a CUDA lane, whose
-rows are recorded and reused on the GPU's class as a CPU task's are on the
-CPU's, so a batch reruns only those whose inputs it changed.
+another path on a GPU (all of them daily, the marked ones per batch). A GPU
+node runs them with `gpu-lane`, each as a task of a CUDA lane, whose rows are
+recorded and reused on the GPU's class as a CPU task's are on the CPU's.
 """
 
 import argparse
@@ -677,6 +677,8 @@ def main() -> int:
                          help="seconds before armada's own task timeout (.armada.json) to interrupt at")
     choosing = operations.add_parser("gpu-tier")
     choosing.add_argument("--evidence", action="store_true", help="each file's backend reads and marks too")
+    choosing.add_argument("--marked", action="store_true",
+                          help="only files with a test marked to run on a GPU, and those no record covers")
     choosing.add_argument("--shards", type=int, default=1, help="how many GPUs share the tier")
     lane = operations.add_parser("gpu-lane")
     lane.add_argument("--tests", required=True)
@@ -695,6 +697,9 @@ def main() -> int:
         return 0
     if args.operation == "gpu-tier":
         tier = gpu_tier(PYTHONS[0])
+        if args.marked:
+            tier = {name: evidence for name, evidence in tier.items()
+                    if evidence == ["unrecorded"] or any(read.startswith("mark:") for read in evidence)}
         if args.evidence:
             for name, evidence in tier.items():
                 print(name, *evidence, sep="\t")
