@@ -6,9 +6,10 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from affine_run import Data
+from affine_run import dataset
 from recording import RecordingTracker
 from reference_error import assert_as_exact_as_the_reference
+from steady_state import steady_state
 
 from dew.artifacts import Representations
 from dew.inputs import Field
@@ -298,7 +299,7 @@ def test_training_makes_the_prediction_depend_on_the_context(mask):
     # Far above fp32 rounding: the loss reads the averaged context encoder.
     assert abs(other - same) > 1e-4 * same
 
-    state = trainer.fit(Data(batches, batch=16), steps=150, log_every=50)
+    state = trainer.fit(dataset(batches, batch=16), steps=150, log_every=50)
 
     after = context_ablation(objective, state.variables, state.ema,
                              normalized_test, mask, jax.random.PRNGKey(9))
@@ -360,7 +361,7 @@ def test_target_encoder_tracks_the_context_encoder(mask):
     trainer = make_jepa_trainer(mask, momentum=(0.5, 0.5), momentum_steps=1)
     initial = jax.tree.map(np.asarray, trainer.initial_state().ema)
 
-    state = trainer.fit(Data(image_batches, batch=8), steps=3, log_every=1)
+    state = trainer.fit(dataset(image_batches, batch=8), steps=3, log_every=1)
 
     # The EMA holds the context encoder alone: the predictor is not averaged.
     assert set(state.ema["params"]) == {"context_encoder"}
@@ -387,7 +388,7 @@ def test_jepa_trains_under_fsdp(mask):
     """
     trainer = make_jepa_trainer(mask, fsdp=2)
     tracker = trainer.tracker = RecordingTracker()
-    state = trainer.fit(Data(image_batches, batch=jax.device_count()), steps=2, log_every=1)
+    state = trainer.fit(dataset(image_batches, batch=jax.device_count()), steps=2, log_every=1)
 
     sharded = [p for p in jax.tree.leaves(state.variables) if 'fsdp' in str(p.sharding.spec)]
     assert sharded, "no JEPA parameter was sharded over the fsdp axis"
@@ -424,7 +425,7 @@ def test_an_adapted_pretrained_encoder_trains_its_factors_over_one_frozen_base(m
     trainer = Trainer(objective, optax.adam(1e-2), key=jax.random.key(0))
     initial = jax.tree.map(np.asarray, trainer.initial_state().variables)
 
-    state = trainer.fit(Data(image_batches, batch=8), steps=3, log_every=3)
+    state = trainer.fit(dataset(image_batches, batch=8), steps=3, log_every=3)
 
     factors = state.variables["params"]["context_encoder"]
     assert factors and all(path[-1].key in ("lora_A", "lora_B")
@@ -461,6 +462,8 @@ def separable_embeddings(num_classes=4, per_class=8, dim=6, noise=0.05):
 
 
 def test_probe_metrics_score_representations_and_average_over_the_pass():
+    """Each batch's linear probe is fit by the program the first batch of its
+    shape compiled, whatever its rates."""
     x, y = separable_embeddings()
     representations = Representations(features=x, labels=y)
     linear, knn = LinearProbe(4, steps=200), KnnProbe(4, k=3)
@@ -468,6 +471,10 @@ def test_probe_metrics_score_representations_and_average_over_the_pass():
     assert linear.finalize(linear.merge(linear(representations, None), (0.0, 1))) == pytest.approx(
         float(linear_probe_accuracy(x, y, 4, steps=200)) / 2)
     assert knn.finalize(knn(representations, None)) > 0.9
+    flipped = Representations(features=-x, labels=y)
+    # The rates go in as operands and the accuracy comes back; nothing compiles.
+    with steady_state(allow=("host_to_device", "device_to_host")):
+        LinearProbe(4, steps=200, learning_rate=3e-2)(flipped, None)
 
 
 def test_the_loss_is_the_mean_squared_error_to_normalized_targets_of_the_same_blocks(mask):

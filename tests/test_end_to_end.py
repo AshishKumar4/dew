@@ -335,8 +335,11 @@ def repae_step_f64(tmp_path_factory) -> SimpleNamespace:
     """The same step in float64 end to end, under `jax.enable_x64`: every
     weight, the batch and the running statistics the reference's float64
     run read, and the step's own draws, which are float32 at any precision
-    as the reference replays them."""
-    with jax.enable_x64(new_val=True):
+    as the reference replays them. It runs on the CPU, as the lane's float64
+    references do: the reference replays draws made there, and a GPU's
+    float32 normal draws differ from a CPU's in their last bits (one in 21
+    on an H100, by up to 2.4e-7), which the float64 rule would see."""
+    with jax.enable_x64(new_val=True), jax.default_device(jax.devices("cpu")[0]):
         return _repae_step(tmp_path_factory.mktemp("repae_f64"), jnp.float64)
 
 
@@ -554,7 +557,7 @@ def test_a_run_config_tunes_its_autoencoder_and_from_run_decodes_with_the_tuned_
 
     from dew.checkpoints import Checkpoints
     from dew.config import ModelConfig, ObjectiveConfig, TrainerConfig
-    from dew.data import TFDSImages
+    from dew.config.data import ImageData
     from dew.objectives.diffusion import DiffusionRunConfig, PretrainedAutoencoder, TextCondition
 
     for name in ("tiny_diffusers", "rae"):
@@ -563,7 +566,8 @@ def test_a_run_config_tunes_its_autoencoder_and_from_run_decodes_with_the_tuned_
     config = DiffusionRunConfig(
         model=ModelConfig("simple_dit", {"patch_size": 1, "emb_features": 16, "num_layers": 2, "num_heads": 2,
                                          "mlp_ratio": 1, "dtype": "float32", "attention_impl": "xla"}),
-        data=TFDSImages(image_size=32), preset=presets.Flow(), val_metrics=(),
+        data=ImageData(source="tfds://oxford_flowers102",
+                       image_size=32), preset=presets.Flow(), val_metrics=(),
         trainer=TrainerConfig(checkpoint_dir=str(tmp_path)),
         text=TextCondition(encoder="char_table", checkpoint="char_table"),
         autoencoder=PretrainedAutoencoder(modelname=str(tmp_path / "tiny_diffusers/sd/vae"), dtype="float32"),

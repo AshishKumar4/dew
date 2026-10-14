@@ -59,6 +59,7 @@ from dew.objectives.base import Metric, Objective, Variables
 from dew.records import JSON, json_value, record
 
 if TYPE_CHECKING:
+    from dew.decision.objective import DecisionObjective
     from dew.training.distributed import Layout as Placement, MeshSpec
 
 TASK_FILE = "decide.json"
@@ -309,6 +310,11 @@ class Decide:
     def _encoded(self, state: JSON, questions: Mapping[str, Question],
                  media: Sequence[int] = ()) -> list[Encoded]:
         rows = self.layout.rows(self.tokenizer, self.specials, state, questions, media=media)
+        for row in rows:
+            if not self.layout.fits(row):
+                raise ValueError(f"the schema needs {len(row.tokens)} tokens besides the state, more than "
+                                 f"the maximum context length, max_len={self.layout.max_len}")
+        self.model.head.validate_rows(rows)
         for laid in (laid for row in rows for laid in row.questions):
             count = len(questions[laid.name].options)
             if len(laid.options) != count:
@@ -354,7 +360,7 @@ class Decide:
         length = _bucket(inputs.tokens.shape[1])
         inputs = replace(
             inputs, tokens=_widened(inputs.tokens, length, self.specials.pad),
-            valid=_widened(inputs.valid, length),
+            segments=_widened(inputs.segments, length),
             positions=None if inputs.positions is None else _widened(inputs.positions, length),
             slots=None if inputs.slots is None else _widened(inputs.slots, length))
         count = _bucket(len(rows), smallest=1)
@@ -401,7 +407,7 @@ class Decide:
         If asked, it also fits a binning map and abstention thresholds that keep the
         error of the accepted answers at `target_error`, as `Calibration`'s parts fit
         them. `held_out` is labelled examples, or a dataset's validation reader
-        (`DecisionObjective.dataset(...).val`), whose rows are already laid out. The
+        (``load(recipe, objective=...).val``), whose rows are already laid out. The
         minimum counts are Laya's: a type's temperature needs `type_minimum` answers
         and a bucket's `bucket_minimum`.
         """
@@ -424,20 +430,31 @@ class Decide:
         and the log loss. The pass agrees its result across a process pool, so
         there every process calls it.
         """
+        from dew.data.compile import validation
+        from dew.decision.data import Decisions as DecisionRecipe
         from dew.decision.metrics import AURC, ECE, Accuracy
-        from dew.decision.objective import DecisionObjective
         from dew.decision.scoring import LogLoss
         from dew.training.distributed import MeshSpec
         from dew.training.evaluation import Evaluation
 
         chosen = list(metrics) or [Accuracy(), ECE(), AURC(), LogLoss()]
-        objective = DecisionObjective(self, temperatures=self.calibration.temperatures)
+        objective = self._scoring
         # A batch is one pass within the budget, as `batch` packs its rows, on
         # one device, as an answer is: a short last batch need not divide.
         rows = max(1, min(self.budget.rows, self.budget.tokens // self.layout.max_len))
-        evaluation = Evaluation.run(objective, self.variables, objective.held_out(examples, batch=rows),
+        held, _, _ = DecisionRecipe(source=tuple(examples)).pipelines()
+        reader = validation(held, batch=rows, objective=objective.data(), read="memory")
+        evaluation = Evaluation.run(objective, self.variables, reader,
                                     key=0, metrics=chosen, mesh=MeshSpec().build(jax.local_devices()[:1]))
         return {metric.name: evaluation.scores[f"val/{metric.name}"] for metric in chosen}
+
+    @functools.cached_property
+    def _scoring(self) -> "DecisionObjective":
+        """The objective `score` evaluates through, one for the task, so a
+        later call runs the forward the first compiled (`Objective.program`)."""
+        from dew.decision.objective import DecisionObjective
+
+        return DecisionObjective(self, temperatures=self.calibration.temperatures)
 
     def _scored(self, examples: Iterable[Example | Mapping[str, object]]) -> list[Scored]:
         scored = []
@@ -455,8 +472,9 @@ class Decide:
 
     def _scored_reader(self, reader: Reader) -> list[Scored]:
         scored = []
+        segments = self.layout.bounds(self.tokenizer, self.specials).segments
         for batch in reader(DataPartition()):
-            inputs = laid_out(batch)
+            inputs = laid_out(batch, segments)
             logits = np.asarray(self._forward(self.variables, inputs))
             answered = (np.asarray(batch["scored"])
                         & (np.asarray(Objective.row_weights(batch, len(logits))) > 0)[:, None])
@@ -578,18 +596,21 @@ def _ordered(laid: Laid, logits: np.ndarray) -> np.ndarray:
     return ordered
 
 
-def laid_out(batch: Mapping[str, object]) -> DecisionInputs:
-    """The `DecisionInputs` of a batch the decision dataset laid out (`Encoding`)."""
+def laid_out(batch: Mapping[str, object], max_segments: int) -> DecisionInputs:
+    """The `DecisionInputs` of a batch of packed windows (`PackedRows`), each
+    holding at most `max_segments` rows."""
     def array(name: str) -> jax.Array:
         return jnp.asarray(batch[name])
 
-    return DecisionInputs(tokens=array("tokens"), valid=array("valid"), kinds=array("kinds"),
+    def given(name: str) -> jax.Array | None:
+        return array(name) if name in batch else None
+
+    return DecisionInputs(tokens=array("tokens"), segments=array("segments"), kinds=array("kinds"),
                           questions=array("questions"), spans=array("spans"),
                           option_spans=array("option_spans"), options=array("options"),
-                          positions=array("positions") if "positions" in batch else None,
-                          slots=array("slots") if "slots" in batch else None,
-                          option_slots=array("option_slots") if "option_slots" in batch else None,
-                          slotted=array("slotted") if "slotted" in batch else None)
+                          positions=array("positions"), slots=given("slots"),
+                          option_slots=given("option_slots"), slotted=given("slotted"),
+                          max_segments=max_segments)
 
 
 def _bucket(value: int, smallest: int = 64) -> int:

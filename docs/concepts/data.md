@@ -1,273 +1,198 @@
 # Training data
 
-A `Dataset` supplies the batches a run trains and validates on. A batch is a dictionary of arrays whose first dimension holds this process's rows of the global batch (all of them with one process). Most readers yield NumPy arrays, but device image augmentation yields pixels that are already JAX arrays on the device. The trainer joins the processes' rows into global arrays, and the objective reads the fields it needs by name.
+A recipe describes records and transforms. `load` compiles it into the `Dataset` a trainer reads. A custom order uses `Pipeline` and `compile` directly. Both paths use Grain for ordering, batching, workers and iterator state.
 
-This page covers the `Dataset` class, one-line datasets from Hugging Face, TFDS, Grain and PyTorch, the fields each built-in objective expects, the built-in readers, reading data that TFDS or Hugging Face already holds, and resuming the data stream from a checkpoint.
+## A small in-memory dataset
 
-![Dataset to global batch: train(partition) opens an iterator of host batches, and shard_batch assembles each into one jax.Array split over the mesh's batch axes.](../assets/data-pipeline-light.svg)
-![Dataset to global batch: train(partition) opens an iterator of host batches, and shard_batch assembles each into one jax.Array split over the mesh's batch axes.](../assets/data-pipeline-dark.svg)
-
-## Dataset
-
-Records you already hold in memory become a `Dataset` through `Dataset.from_records`:
+This example needs NumPy and an installed Dew checkout. It downloads nothing.
 
 ```python
 import numpy as np
-from dew.data import DataPartition, Dataset
+
+from dew.data import Loading
+from dew.config.data import RecordsData, loader
+from dew.data.dataset import DataPartition
 
 x = np.arange(32, dtype=np.float32).reshape(16, 2)
 y = x.sum(axis=1, keepdims=True)
-data = Dataset.from_records({"features": x, "target": y}, batch=8, seed=0,
-                            validation={"features": x[:8], "target": y[:8]})
-
-first = next(data.train(DataPartition()))
-print({name: value.shape for name, value in first.items()})
-print(data.records, data.steps_per_epoch)
+recipe = RecordsData(source={"features": x, "target": y},
+                 validation={"features": x[:8], "target": y[:8]})
+data = loader(recipe, batch=8, seed=0, read="memory", loading=Loading(workers=0))
+stream = data.train(DataPartition())
+try:
+    first = next(stream)
+    print({name: value.shape for name, value in first.items()})
+finally:
+    stream.close()
 ```
 
-```text
-{'features': (8, 2), 'target': (8, 1)}
-16 2
-```
+A source can hold column arrays or a sequence of record dictionaries. Training reshuffles from `seed` every epoch. Validation reads its own records once in order; a real validation split should be disjoint from training. Its final batch repeats rows to fill the shape and marks those repeats with `valid_rows=False`. Objectives and metrics leave them out.
 
-`from_records` takes a mapping of columns whose first axis is the record (as here), a list of per-record mappings, or any source with `__len__` and `__getitem__`. Training reshuffles the records from `seed` every epoch and reads each one once per epoch. Its position goes into each checkpoint, so a resumed run reads the records it had not reached yet. With several processes, each reads its own share of every batch. `validation` is read once, in order, and every record is scored: the last batch is padded with repeated rows, which evaluation leaves out. The example validates on its training records only to show the argument; a real validation score needs records the model does not train on.
+`Dataset.train(partition)` and `Dataset.val(partition)` each open a fresh iterator. Close the iterator after use, never the shared dataset. `Trainer.fit` closes the iterators it opens after success or failure.
 
-Every reader returns the same `Dataset` value:
+## Recipes and fields
 
-| Field | Meaning |
+`load(recipe_or_alias, batch=..., read=...)` accepts one of these recipe values or its registry alias. A bare URI names a source, so it belongs in `source=` rather than in place of the recipe.
+
+| Recipe and alias | Fields after batching |
 |---|---|
-| `train(partition)` | Returns a new iterator of training batches. It must yield at least as many batches as the run takes steps. |
-| `val(partition)` | Returns a new iterator over one pass of the validation records, which then ends. `None` means no validation split. |
-| `records` | The number of training records, or `None` when unknown. |
-| `batch` | The global batch size. |
+| `Records` / `records` | The source's fields, with numeric values in JAX's configured widths |
+| `Text` / `text` | `text`, int32 `[B, seq_len + 1]`; packing adds aligned segment and position arrays |
+| `Chat` / `chat` | Packed token fields and aligned `text_roles` |
+| `Prompts` / `prompts` | Left-padded prompt IDs, prompt lengths and fixed-width reward metadata |
+| `Preferences` / `preferences` | `input_ids` and `completion_mask`, `[B, 2, seq_len]` |
+| `Images` / `images` | RGB uint8 `image`, `[B, H, W, 3]`, and optional labels |
+| `Video` / `video` | Uint8 `video`, `[B, T, H, W, 3]`, and audio features |
+| `Decisions` / `decisions` | The objective's encoded question rows |
 
-`train` and `val` are functions that return iterators, so every new or resumed run can open a fresh one. Whoever opens an iterator is responsible for it. Close it after use if it has a `close` method, but never close the dataset or its backing store. `Trainer.fit` closes the iterators it opens, whether the run finishes or fails. If you keep an exception from a training step after the run, it does not keep the closed prefetch iterator alive.
+Recipes hold source and transform choices. `seed`, `loading`, `read` and `provision` belong to `load`. Overrides of an alias are checked against the recipe's fields.
 
-The argument is a `DataPartition`, which names the share of every global batch this process reads. `DataPartition()` reads every row, which is correct for a single process. With several processes the trainer asks the mesh for each process's share (`DataPartition.of(mesh)`), and the built-in readers read only that share.
+## Sources and read modes
 
-A `Dataset` can also be built from the two functions directly, for a stream no reader covers:
+All stored locations are URLs. Plain paths and `file://` select local files; schemes such as `gs://`, `s3://`, `hf://` and named storage profiles select their filesystem. Filesystem options belong to the source or store, not to a second loader implementation.
+
+| Source | Memory | Indexed | Streamed |
+|---|---|---|---|
+| `Memory` records or columns | Materialize records | Direct random access | A physical shard manifest |
+| JSONL or text `Files` | Read the source | Producer offset index, or explicit provisioning | Newline-aligned byte ranges |
+| CSV `Files` | Read the source | Parse-aware offset index | Whole files |
+| Parquet or Arrow `Files` | Read the selected records | Footer row groups | Physical row groups |
+| Produced ArrayRecord tokens | Materialize records | Producer length index | Physical shards |
+| `Hub` | Prepared Arrow | Prepared Arrow | Hub Parquet shards |
+| `TFDS` | Prepared ArrayRecords | Prepared ArrayRecords | Prepared shard ranges |
+| `Torch` | Map-style samples | Map-style samples | Refused |
+
+`read="memory"` explicitly runs deterministic transforms, filtering, expansion and packing over the whole source before training. It keeps a dense record order and the global position contract. Use it for small data.
+
+`read="indexed"` requires an index that already exists. `read="streamed"` reads physical shards without a whole-store pass. The chosen mode applies to every source, including validation and all mixture leaves. Unsupported modes are refused before a reader opens.
+
+A run that states no read (`--data-read`, `load(read=None)`) lets its sources choose: memory for records held in memory, indexed for a store that reads by index, streamed otherwise, and a mixture the least eager of its corpora's choices.
+
+Provisioning is explicit. `provision=True` can prepare TFDS, prepare a Hub Arrow cache or create an offset index. A missing artifact otherwise raises an error naming it. Creating an artifact can download data and take a long time; it does not happen implicitly at step zero.
+
+For example, a prepared image source is:
+
+<!-- not run: needs prepared TFDS data -->
+```python
+from dew.data import Loading, TFDS
+from dew.config.data import Augment, ImageData, Split, loader
+
+flowers = ImageData(
+    source=TFDS("oxford_flowers102", path="data/oxford_flowers102/2.1.1", split="train"),
+    validation=Split("validation"), image_size=128,
+    caption_templates=("a photo of a {}",),
+    augment=Augment(flip=True, jitter=True),
+)
+data = loader(flowers, batch=32, read="memory", loading=Loading(workers=0))
+```
+
+A named Hub source takes `repo`, `config`, `revision`, `split` and `cache_dir`. A direct Parquet URL uses `Files`. For a large corpus, prepare the source separately or use its streamed Parquet files.
+
+## Validation and branches
+
+`HoldOut(records=N)` reserves the first N source records. `HoldOut(fraction=f, by="hash")` splits by immutable record identity without scanning a stream. `Split("validation")` opens a named split. An explicit source or Pipeline is also valid.
+
+A recipe shares deterministic prefix steps between training and evaluation. Random crop, flip and jitter belong to training; evaluation resizes the full image. Caption encoding is a common host stage. A custom pipeline spells out these branches:
 
 ```python
-import itertools
-
 import numpy as np
-from dew.data import Dataset
+from dew.data import Loading, Memory
+from dew.data.compile import compile
+from dew.data.pipeline import Pipeline
 
-x = np.arange(16, dtype=np.float32).reshape(8, 2)
-batch = {"features": x, "target": x.sum(axis=1, keepdims=True)}
-data = Dataset(train=lambda partition: itertools.repeat(batch), val=None, records=8, batch=8)
+records = [{"x": np.float32(index)} for index in range(24)]
+train = Pipeline(Memory(records[8:])).shuffle(7).repeat().batch(4)
+held = Pipeline(Memory(records[:8])).batch(4)
+data = compile(train, validation=held, read="memory", loading=Loading(workers=0), seed=7)
 ```
 
-Such a function has to do two things that `from_records` does for you. It must read only the share its partition names, and if the run checkpoints, its iterator needs `get_state` and `set_state` (see [Resuming the data stream](#resuming-the-data-stream)). This one does neither, so it only suits a single-process run with `checkpoint_every=None`. If you built a Grain pipeline yourself, pass it to `Dataset.from_grain`.
+Validation is finite and never inherits a training repeat or augmentation stage. `validation_records=N` on `load` caps accepted evaluation records, before the share cut. A training rejection is dropped before mixtures are weighted; attempted, accepted, truncated and rejected records are counted per corpus.
 
-`Dataset.steps_per_epoch` is `records // batch`, or `None` when `records` is `None`. A stream without a record count needs an explicit `steps` in `fit`.
+`map_batch(step)` runs in the training process after batching and workers. It forwards position and ownership. Steps on only one branch affect that branch; `compile(..., host=(step,))` applies a common host step to both branches.
 
-## Datasets from other libraries
+For conditional image training, pass `host=(EncodeCaptions(objective.inputs.tokenize),)` to `load`. Without a caption reader, the default host stage removes strings before device transfer.
 
-A Hugging Face, TFDS, Grain or PyTorch dataset is one call, with nothing to download or convert first:
+## Text, chat and packing
 
-<!-- not run: downloads the datasets on first use -->
-```python
-import grain
-import torchvision
-import dew.data
-from dew.data import Dataset, HFImages, TFDSImages
+`Text` tokenizes raw text or opens a produced token store. Fixed windows contain `seq_len + 1` IDs with one overlap token. `pack="first-fit"` places documents in padded windows; `"concat"` concatenates and splits them. Aligned segment IDs stop attention and target scoring at document boundaries, and positions restart within each document.
 
-text = dew.data.load("hf/winglian/tiny-shakespeare", batch=64, tokenizer="byte", seq_len=256)
-cifar = HFImages(name="uoft-cs/cifar10", image_column="img", image_size=32).load(batch=64)
-digits = dew.data.load("tfds/mnist", batch=64)
-mnist = TFDSImages(name="mnist", image_size=32).load(batch=64)
-records = Dataset.from_grain(grain.MapDataset.source([{"x": i} for i in range(1024)]), batch=64)
-digits_torch = Dataset.from_torch(torchvision.datasets.MNIST("data", download=True), batch=64,
-                                  fields=("image", "label"))
-```
+`Chat` renders conversations with the tokenizer's chat template. Its default long-record policy truncates; `long="chunk"` keeps an over-length conversation as chunks, and `long="drop"` rejects it. The recipe emits role IDs for every token. The objective chooses the loss role, for example `LMObjective(..., loss_role=Role.ASSISTANT)`.
 
-| Call | A batch holds |
-|---|---|
-| `load("hf/<name>", tokenizer=, seq_len=)` | `text`: int32 `[B, seq_len + 1]` token windows |
-| `HFImages(name=...)`, `TFDSImages(name=...)` | `image`: uint8 `[B, image_size, image_size, 3]`, `label`: int32 `[B]` |
-| `load("tfds/<builder>")`, `load("hf/<name>")` | The provider's own fields as arrays, as [TFDS and Hugging Face datasets](#tfds-and-hugging-face-datasets) describes |
-| `Dataset.from_grain(map_dataset)` | The pipeline's own fields |
-| `Dataset.from_torch(dataset, fields=)` | A dict sample's keys, or one field per `fields` name of a tuple sample |
+`Prompts` rejects over-length prompts by default. `long="truncate"` keeps their tail when that is the desired RL policy. `Preferences` refuses an over-length completion rather than cutting away its supervision.
 
-`tokenizer` is `"byte"` or a Hugging Face tokenizer name such as `"gpt2"`. The split's `text` column is tokenized once, each row ended with the tokenizer's eos id, into `~/.cache/dew/tokens/<owner>--<name>/<key>` (`$XDG_CACHE_HOME/dew/tokens` when that is set), and the first 1% of the stream is the validation split. The key covers the dataset name, `split`, the tokenizer and the `HFOptions` that choose the rows (`config`, `data_dir`, `data_files`, `revision`), so the same call made again opens the cached ids without calling `datasets`, the Hub or the tokenizer, and runs offline. A setup step that makes the call once, with network access, fills the cache for a sandbox without it. A model that encodes or decodes with the same Hugging Face tokenizer still needs it in the Hugging Face cache, which `HF_HUB_OFFLINE=1` then reads. Rows that change under the same request are not read again until you delete the directory, so pass `options=HFOptions(revision=...)` to pin a version. In a run's config, the call is `TokenWindows(hub=HubText("winglian/tiny-shakespeare", tokenizer="byte"), seq_len=256)`.
-
-`HFImages` reads each image in whatever mode it is stored, grey, 16-bit, a palette or with transparency, as RGB, with transparency composited onto white. A dataset without a caption column, such as CIFAR-10, loads without `caption_columns=()` as long as no caption reader is passed. Images and Arrow tables stay in the `datasets` cache, so after one load with network access, `HF_DATASETS_OFFLINE=1` reads them offline.
-
-`tfds/<builder>` and `TFDSImages(name=)` without a path read `~/.cache/dew/tfds` (`$XDG_CACHE_HOME/dew/tfds`). A builder that is not there yet is prepared there as ArrayRecords, in a separate Python process so that the training process never imports TensorFlow. That process needs `tensorflow` and the dataset's own packages, and TFDS 4.9.10 also imports `importlib_resources` without declaring it. Without TensorFlow, as on Python 3.14, the call raises an error that names how to prepare the builder elsewhere: prepare it into that directory from another environment, or pass the prepared directory as `path`. A prepared builder reads offline.
-
-`Dataset.from_grain` takes a `MapDataset` without batching: it repeats it, reads each process's share and saves a global record position. `Dataset.from_torch` reads a map-style `torch.utils.data.Dataset` by index, as `from_records` reads records: shuffled from `seed` every epoch, a share per process, and a global record position. Tensors arrive as NumPy, PIL images as their own arrays and 64-bit numbers as 32-bit ones. It refuses a `DataLoader`, whose sampler and `collate_fn` the run's stream would replace, so pass `loader.dataset` if you want the samples without them. It also refuses an `IterableDataset`, which has no index to shuffle or resume from; build a Grain `IterDataset` over it instead.
-
-## Fields per objective
-
-| Objective | Fields | Shape and dtype |
-|---|---|---|
-| Image diffusion | `image` | `(B, H, W, C)` uint8 in `[0, 255]`; the objective converts to its model's range |
-| Video diffusion | The configured video field | `(B, T, H, W, C)`; check the source and the objective |
-| Next-token language modeling | `text` | `(B, S + 1)` int32 token ids; inputs and targets overlap by one position |
-| Packed language modeling | `text`, `text_segment_ids`, `text_positions` | Token, document and position arrays of the same shape |
-| SFT | Packed token fields and `text_roles` | Role ids aligned with the tokens; the objective scores the target roles |
-| Custom objective | Your own names | Whatever your `init` and `loss` read |
-
-For text-conditioned diffusion, the condition encoder tokenizes the caption field and passes the encoding to the model. Keep token ids, attention masks, padding ids and the tokenizer vocabulary consistent with the checkpoint you load.
-
-## Dataset specifications
-
-The built-in readers are dataset specifications. Each one is a frozen dataclass that describes a dataset, and its `load(batch=...)` builds the reading pipeline and returns a `Dataset`. For example, `TokenWindows` reads fixed windows of `seq_len + 1` token ids from a tokenized directory:
+To produce token records, export a deterministic prefix. This example downloads nothing:
 
 ```python
-import json
+from dew.data import ByteTokenizer, Loading, Memory
+from dew.config.data import TextData, loader
+from dew.data.pipeline import Pipeline
+from dew.data.sinks import export
 import tempfile
-from pathlib import Path
+from dew.data.steps.text import Tokenize
 
-import numpy as np
-from dew.data import DataPartition, Loading, TokenWindows
-
-corpus = Path(tempfile.mkdtemp())
-np.arange(1000, dtype=np.uint16).tofile(corpus / "train.bin")
-np.arange(1000, 1200, dtype=np.uint16).tofile(corpus / "val.bin")
-(corpus / "meta.json").write_text(json.dumps({"vocab_size": 1200}))
-
-data = TokenWindows(path=str(corpus), seq_len=8, loading=Loading(workers=0)).load(batch=4)
-windows = next(data.train(DataPartition()))
-print(windows["text"].shape, windows["text"].dtype, data.records)
-print(windows["text"][0])
+tokenizer = ByteTokenizer()
+documents = Memory([{"text": "one document " * 40}, {"text": "another document " * 40}])
+prefix = Pipeline(documents).map(Tokenize("byte", eos=True))
+token_store = tempfile.mkdtemp(prefix="dew-tokens-")
+export(prefix, token_store, format="array_record", length_field="text",
+       metadata={"token_store": True, "tokenizer": "byte",
+                 "vocab_size": tokenizer.vocab_size, "dtype": "int32",
+                 "eos_id": tokenizer.eos_id})
+data = loader(TextData(source=token_store, seq_len=32, pack="first-fit"),
+            batch=4, read="memory", loading=Loading(workers=0))
 ```
 
-```text
-(4, 9) int32 124
-[392 393 394 395 396 397 398 399 400]
+Use a fresh output directory: exports commit immutable shards and a manifest, and refuse an existing publication. Export validation to a second URL and pass it as `validation=`. Existing binary token stores remain readable through `TokenFiles`; their tokenizer, dtype and document boundaries come from producer metadata.
+
+A raw-text memory run can reserve a token-axis fraction with `token_holdout=HoldOut(fraction=0.01)`. This splits after tokenization and before windows. Indexed and streamed runs need producer-published token splits.
+
+## Mixtures, objectives and order
+
+`Pipeline.mix(other, weights=...)` mixes accepted records before sharding. A text recipe can name a mapping of token-store URLs to weights; its shares count valid targets, not padding. `Text(phases=(DataPhase(...), ...))` changes mixtures at step boundaries and continues each corpus where its earlier phase stopped.
+
+## Token-budget batches
+
+`Pipeline.batch(tokens=24576)` takes as many rows as a token budget holds rather than a row count. Every row holds the same number of tokens, which a record step states by declaring `TokenGeometry` (`FixedTokens` for token windows, `PackedRows` for packed decision windows); the compiler does not guess from field names, and a budget that is not whole rows is refused.
+
+Run configurations select this with --trainer.batch-size None, --trainer.batch-tokens 24576 and --trainer.update-tokens 98304. Both budgets are required, positive, and update_tokens must divide into whole micro-batches. Prepared.run records the derived accumulation (four in this example); an explicitly conflicting accumulation is refused. Row-batch ramps cannot be combined with token budgets.
+
+`Pipeline.pack(seq_len, segments=..., along=...)` packs rows of several axes with Grain's packer: `along` names fields packed on axes of their own, each to its own length, and `segments` bounds the rows a window holds. Decision rows pack this way, their questions along a second axis. Packed causal LM geometry keeps its shifted final ID; denoising objectives declare their own sequence geometry.
+
+## Decision layouts and explicit order
+
+`Decisions` reads examples or a produced mixture manifest. `DecisionObjective.data()` supplies fit, layout and packing steps. The source owns rows and validation; the objective owns layout and model-specific budgets. See [decision models](../guides/decision-models.md).
+
+Pipeline stages execute where written. Use `map`, `random_map`, `filter`, `flat_map`, `shuffle`, `repeat`, `slice`, `mix`, `windows`, `pack`, `batch`, `workers`, `prefetch` and `map_batch` to choose that order. A global shuffle requires an indexed pipeline, and a host batch step requires batching first.
+
+## Cache and storage publication
+
+`pipeline.cache(Cache(url, ...))` is a bounded write-through artifact stage. It identifies the source snapshot, transform code, dependencies and tokenizer. A filling run keeps its own plan even if another process publishes a complete generation.
+
+`publish(prefix, Cache(url), read=...)` drains a deterministic prefix, certifies source coverage and publishes one generation transactionally. A future run names `Generation(url)` explicitly to read it. Random steps belong after the cache; a plain function before it needs a stable identity. Cache writes require a clean checkout.
+
+`export(pipeline, url, format="parquet" | "array_record")` writes committed shards. Reads follow fsspec URLs. Transactional publication supports local files, memory, S3 and the S3-compatible endpoints that honour its conditional PUTs, GCS, Hub repositories, and any fsspec filesystem that supplies its own conditional writes through a `put_conditional` method (`dew.data.storage.Store`). It refuses other write protocols rather than putting a partial publication. Producer manifests and indexes are the indexed reader's authority. Transport caches use URL chaining such as `dewcache::s3://bucket/path` and are separate from transformed artifacts.
+
+A storage profile names a filesystem and its options once. Profiles live in `~/.config/dew/storage.toml`, or the file `DEW_STORAGE_CONFIG` names, as one table per profile with the `base` protocol it extends. A value written `env:NAME` or `file:PATH` is read from that environment variable or file when the filesystem opens. Cloudflare R2, for example, is an S3 endpoint:
+
+```toml
+[r2]
+base = "s3"
+endpoint_url = "https://ACCOUNT_ID.r2.cloudflarestorage.com"
+key = "env:R2_ACCESS_KEY_ID"
+secret = "env:R2_SECRET_ACCESS_KEY"
 ```
 
-The training stream is shuffled, which is why the first window of the first batch is window 49 of the corpus. `records` is the number of windows, `(1000 - 1) // 8 = 124`.
+With it, `r2://bucket/path` reads and publishes through s3fs with those options.
 
-Each window starts `seq_len` ids after the previous one, so the last id of one window is the first id of the next. `dew tokenize` (or `TokenCorpus.write` in Python) writes `train.bin`, `val.bin` and `meta.json` from raw text; see [Packing](#packing). To read token ids already stored in parquet, use `dew.data.load("hf/parquet", options=HFOptions(data_files=...))` or give a Grain pipeline to `Dataset.from_grain`.
+## Loading and image augmentation
 
-Other specifications include `TFDSImages` (a prepared TFDS image dataset, captioned from its class names), `HFImages`, `ChatMessages` and the video and preference readers, and the [API reference](../reference/core-api.md) lists them all. Each has its own fields for paths, tokenization, transforms and splits. Every specification also has these two fields:
+`Loading` changes concurrency, never data order or per-record draws. Explicit `Loading(workers=0)` reads in the training process. The `load` default uses `workers="auto"` and Grain's memory-budgeted tuning. Threads and buffers can be set explicitly. A script that starts worker processes needs an `if __name__ == "__main__":` guard.
 
-| Field | Meaning |
-|---|---|
-| `seed` | The record order and the key of each record's random draws (augmentation, captions, clip starts) |
-| `loading` | A `Loading` with Grain's throughput settings |
+`Augment(backend="device")` runs the crop, flip and colour jitter on a batch with JAX. `backend="host"` uses the host implementation. `augment=None` selects deterministic resize. `staging_size` is the decoded square before cropping, and `crop_scale` is the area fraction kept.
 
-`Loading` changes how fast records are read, never which records a run sees or what is in them:
+Each record's key comes from Grain's data seed and position. Changing reader threads or batch placement changes no augmentation draw. A backend change changes the transform and cannot be substituted silently on resume. Validation keeps the host's deterministic resize.
 
-| `Loading` field | Default | Counts |
-|---|---|---|
-| `workers` | 0 | Grain worker processes; `0` reads in the training process |
-| `threads` | 64 | Record reads one worker keeps in flight |
-| `read_buffer` | 128 | Records one worker reads ahead |
-| `worker_buffer` | 2 | Batches one worker holds ready |
-
-The default reads in the training process, as Grain's own default does. Each worker process imports the program again, which costs seconds and memory before the first batch. Workers pay off only when decoding or augmentation is more work than the reading threads can keep up with, so raise `workers` only after measuring the input pipeline on your data and hardware. A script that starts workers needs an `if __name__ == "__main__":` guard, because each worker imports the script.
-
-Image sources can need network access the first time. Token-window sources read files written by `dew tokenize`. Streaming sources can depend on remote servers and may have no position to restore. [Recipes](../recipes.md) lists the command-line entry points, and [Installation](../installation.md#optional-extras) lists the extras each source needs.
-
-`OnlineImages` and `OnlineVideos` (`data:online-videos` in a recipe) stream Hugging Face tables of urls and captions. `OnlineVideos` decodes each url's video the same way `LocalVideos` reads a file, as `frames` consecutive frames at 25 fps, resized to `image_size` squares, without audio.
-
-## Image datasets on the Hugging Face Hub
-
-`HFImages` reads a Hub image dataset by index through the image pipeline, which decodes each image to RGB, resizes it to `image_size`, applies augmentation and reads captions for text conditioning. Its column fields tell it where each record keeps its data. `image_column` names the image column, and the caption is the first of `caption_columns` that a record has. Where the dataset has a `label` column, it holds the record's class index. CIFAR-10, for example, keeps its image under `img`, a class under `label` and no caption:
-
-<!-- not run: downloads CIFAR-10 on first use -->
-```python
-from dew.data import DataPartition, HFImages
-
-data = HFImages(name="uoft-cs/cifar10", image_column="img", image_size=32,
-                augmentation="flip_only", val_split="test", val_batches=None).load(batch=64)
-batch = next(data.train(DataPartition()))
-print({name: (value.shape, value.dtype) for name, value in batch.items()})
-print(data.records, data.steps_per_epoch)
-```
-
-```text
-{'image': ((64, 32, 32, 3), dtype('uint8')), 'label': ((64,), dtype('int32'))}
-50000 781
-```
-
-Captions are read only when `load` is given a caption reader (`tokenize`), so a dataset without a caption column loads for an unconditional or class-conditional run, and a caption reader over it is refused. If you name an image column the split does not hold, loading the spec raises an error that lists the columns it does hold. Without `val_split`, the first `val_batches` batches of the training split are held out for validation. With a `val_split`, `val_batches=None` scores the whole named split.
-
-Validation reads each image through the deterministic resize and skips the crop, flip and jitter that training applies, so a metric scores the same images a reference implementation would.
-
-## Device image augmentation
-
-`TFDSImages`, `HFImages` and the prepared `ArrayRecordImages` readers share
-`ImageDataset`'s transforms. By default (`augmentation_backend="device"`)
-random crop/resize, horizontal flip and colour jitter run on each decoded
-batch with JAX, on the accelerator, and the host only decodes and resizes.
-On an 8-vCPU host that reads about 2.4 times the images per second it reads
-when it also augments (512x384 JPEGs to 256-pixel crops). Without an
-accelerator the JAX path costs about 20% more than OpenCV's, so set
-`augmentation_backend="host"` for a CPU-only run; a run record keeps the
-backend it trained with. `augmentation="flip_only"` turns off colour jitter,
-and `"none"` keeps only the deterministic resize, with no random crop.
-
-On either backend the colour jitter is torchvision's float
-`ColorJitter(brightness=0.2, contrast=0.05, saturation=0.2)`. It applies the
-three factors in a random order, clamps each one to the pixel range, and
-rounds to uint8 once at the end.
-
-<!-- not run: needs a prepared Oxford Flowers version directory -->
-```python
-from dew.data import Loading, TFDSImages
-
-data = TFDSImages(
-    path="data/oxford_flowers102/2.1.1",
-    image_size=128,
-    augmentation="flip_jitter",
-    crop_scale=(0.6, 1.0),
-    augmentation_size=160,
-    loading=Loading(workers=0, threads=4),
-).load(batch=32)
-```
-
-`crop_scale` is the fraction of the area to keep, drawn uniformly and applied
-as an integer crop of the staging square, so both sides shrink by its square
-root. `(1.0, 1.0)` keeps the full image. `augmentation_size` is the side of
-the staging square, and `None` stages at `image_size`. A larger size keeps
-more pixels for the crop and resize, but it costs more transfer and device
-memory.
-
-Decoding, the first area/cubic resize into a dense square, and caption
-tokenization still run on the host. The JPEGs vary in size, so they cannot be
-stacked into one array as they are, and neither JAX nor this option decodes
-them. The crop's bilinear resize, the flip and the jitter then run on the
-device, followed by one final uint8 round and clip. CPU consumers,
-`OnlineImages` and video decoding still need the host path, and this option
-does not change them.
-
-Each example's key comes from Grain's data seed and the example's global
-record position, and JAX derives every augmentation draw from that key. The
-example's row in the batch plays no part, so changing the reader threads,
-batch size or process shares changes no draw. Restoring the data position
-also restores the augmentation, with no separate RNG state to save. Switching
-the backend changes the RNG algorithm, which makes it a transform change, so
-do not switch it when you resume an existing run.
-
-Augmentation runs on the process's default JAX device, normally its first
-local device. With several local devices, that device augments the whole
-local batch before the trainer redistributes the rows onto its mesh. This
-option does not shard augmentation across the local devices.
-
-Validation reads through the host's deterministic resize, whatever the
-training augmentation and backend.
-
-A test runs the JAX op and the OpenCV bilinear host op with identical crop,
-flip and colour parameters and compares them in float64. On the RTX 4080 the
-largest absolute error was 6.55e-6, and the rounded uint8 codes were identical
-across 18 cases. OpenCV's interpolation coefficients are float32, so four
-bilinear corner-weight errors and a combined jitter gain below two give the
-bound `255 * 8 * eps(float32)`, which is at most one code value after
-rounding. The default host resize is unchanged and still uses area
-interpolation to shrink and cubic to enlarge.
-
-`tools/benchmark_image_pipeline.py` compares OpenCV, PIL, TFDS's NumPy decoder
-and torchvision on identical Flowers JPEG bytes, with the same final resize.
-It also measures input-pipeline throughput and real prefetched pixel-diffusion
-updates on the selected device, with device synchronization. The decoder
-microbenchmark leaves out storage reads and startup. The training measurement
-includes decode, resize, augmentation, transfer and optimizer updates, and
-leaves out compilation and warmup.
+The following measurements predate the recipe migration. They compare decoder and augmentation implementations on the stated machine, not startup or remote-storage performance of the new compiler.
 
 Measured on 2026-10-01 with an RTX 4080 (16 GB) and an i9-12900K, JAX
 0.11.2.post3, OpenCV 5.0.0, Pillow 11.3.0, TFDS 4.9.10 and torchvision
@@ -329,166 +254,17 @@ python tools/benchmark_image_pipeline.py \
 The [raw measurements](https://github.com/AshishKumar4/dew/blob/main/tools/measurements/data-rtx4080.json)
 include each timing interval, the image-byte SHA-256 and the example outputs.
 
-## Real image and masked-text examples
+## Position and multiple processes
 
-[`train_masked_lm.py`](https://github.com/AshishKumar4/dew/blob/main/examples/train_masked_lm.py)
-trains MDLM on TinyStories, or any Hugging Face text dataset with a `text`
-column. `HubText` tokenizes the train split once (GPT-2 ids by default) into
-Dew's cache, and the head 1% of that stream is held out. A bidirectional
-`CausalTransformer` learns MDLM's negative ELBO, with the mask one id past
-the tokenizer's vocabulary. Every `--eval-every` steps the trainer reports
-`val/perplexity`, the exponential of the NELBO per token, which is the bound
-MDLM reports. At the end the script loads the run back with `dew.pipeline`,
-scores the whole held-out split and unmasks a continuation of each
-`--prompts`, into `result.json` and `samples.txt`.
+The checkpoint stores the compiled plan with the iterator position: source snapshots, step identities, ordering, derived order and packing facts, cache generations and topology constraints. A resume rebuilds that plan and refuses changed data, tokenizer, order or transforms. A change only to the code that ran the steps (Dew's revision, the installed packages, the interpreter, the platform or the bytes of a step's module or of the factory that configured it) is a warning on a global resume and a refusal on a per-share one. A step states a change to what it computes in its configuration or its declared `identity`.
 
-[`sft_diffusion_gemma_images.py`](https://github.com/AshishKumar4/dew/blob/main/examples/sft_diffusion_gemma_images.py)
-trains a fresh DiffusionGemma with a Gemma 4 vision tower to caption Oxford
-Flowers 102 with the flower's name. It stages the three splits as small
-parquet files once, trains on train and validation with random crops, and
-scores canvas cross entropy on test. Then it reloads the run as a
-`BlockGeneration` task, captions every test image, and records in
-`result.json` how many captions name the right flower. It trains a small
-model from scratch and does not fine-tune the released 26B DiffusionGemma.
-On an A100 40 GB the default 6000 steps train in 13 minutes, and 33.3% of
-the 6149 test captions name the right flower (14.1% after 3000 steps).
-
-Both scripts accept `--smoke`, which writes a few local records, shrinks the
-model and runs four CPU steps without the network. It shows that the
-workflow runs end to end and says nothing about quality.
-
-<!-- not run: downloads the datasets and trains for hours on a GPU -->
-```bash
-python examples/train_masked_lm.py --out runs/mdlm-tinystories
-python examples/sft_diffusion_gemma_images.py --out runs/flowers-caption
-JAX_PLATFORMS=cpu python examples/train_masked_lm.py --smoke --out /tmp/mdlm-smoke
-```
-
-## TFDS and Hugging Face datasets
-
-`dew.data.load("<provider>/<name>", batch=...)` reads a dataset that TFDS or Hugging Face already holds and returns a `Dataset`. Pass `preprocess(record, rng)` to turn one provider record into batch fields. Without it, each field of a record goes into the batch as an array. A list column becomes one `[batch, n]` field, 64-bit numbers become 32-bit ones, and strings and bytes stay as they are. Nothing is decoded, renamed or dropped, and an integer that does not fit in 32 bits is refused with an error that names its field. `dataset=` takes a Hugging Face split that is already in memory:
-
-```python
-import datasets
-import numpy as np
-import dew.data
-
-table = datasets.Dataset.from_dict({"x": [[float(i), float(i)] for i in range(32)],
-                                    "label": list(range(32))})
-data = dew.data.load("hf/toy", batch=8, dataset=table, loading=dew.data.Loading(workers=0),
-                     preprocess=lambda record, rng: {"x": np.asarray(record["x"], np.float32),
-                                                     "label": np.int32(record["label"])})
-first = next(data.train(dew.data.DataPartition()))
-print(first["x"].shape, first["label"][:4], data.records)
-```
-
-```text
-(8, 2) [26  4 10 30] 32
-```
-
-| Argument | Meaning |
-|---|---|
-| `split`, `val_split` | The provider's own split expressions. The validation split is read in order and never shuffled. |
-| `records` | The record count, for a source that cannot report one |
-| `seed` | The record order and the per-record random key |
-| `shuffle_buffer` | Rows a streamed Hugging Face split shuffles through |
-| `options` | `TFDSOptions` for `tfds/...`, `HFOptions` for `hf/...`; the other provider's options raise `TypeError` |
-| `loading` | Throughput only, as above |
-| `tokenizer`, `seq_len` | Read an `hf/...` split's `text` column as token windows (see [Datasets from other libraries](#datasets-from-other-libraries)) |
-
-`tfds/<builder>` reads the ArrayRecord files that a TFDS preparation run wrote under `TFDSOptions.path`. It reads them through TFDS's read-only builder, so the training process does not import TensorFlow. Without a `path`, it reads Dew's own TFDS directory and prepares a missing builder there first, as [Datasets from other libraries](#datasets-from-other-libraries) describes; [Installation](../installation.md#preparing-tfds-data) shows how to prepare data yourself. `path` is either a prepared version directory or the `data_dir` above one, and in the second case `config` and `version` select the directory inside it. Dew checks the prepared metadata against the builder, config and version you asked for, and passes `decoders` to the builder unchanged.
-
-<!-- not run: needs a prepared TFDS directory -->
-```python
-import dew.data
-from dew.data import TFDSOptions
-
-data = dew.data.load("tfds/dew_images", batch=8, split="train", val_split="test",
-                     options=TFDSOptions(path="/data/prepared"),
-                     preprocess=lambda record, rng: {"image": record["image"]})
-```
-
-`hf/<name>` reads one Arrow-backed split through `datasets.load_dataset`. When the local cache does not have the dataset, `load_dataset` downloads it and writes its Arrow cache. `HFOptions` holds `config`, `data_files`, `features`, `storage_options` and the other `load_dataset` arguments, with the types that function takes.
-
-`streaming=True` reads an `IterableDataset` as it goes. A streamed split has no length, so unless you pass `records`, both `records` and `Dataset.steps_per_epoch` are `None`. Processes split the rows with `datasets.distributed.split_dataset_by_node`. When there are more processes than rows, one process would get none, so Dew refuses the run.
-
-A streamed split loaded by name without shuffling resumes at the record where it stopped, with the same per-record random draws. Three kinds of streamed split have no position to resume from, so they must train with `checkpoint_every=None`, and `Trainer.fit` refuses them otherwise:
-
-- a split read with `shuffle_buffer` set, because `datasets` does not restore the shuffle buffer;
-- a split passed as `dataset=`, because it may carry transformations Dew did not apply;
-- a split whose source implements no state in `datasets`.
-
-## Packing
-
-Packing places tokens from several documents into rows of a fixed width. Segment ids (`text_segment_ids`) stop attention and target scoring from crossing document boundaries, and position ids (`text_positions`) restart at each document. Every per-token array must be sliced and packed the same way as the token ids.
-
-A batch stacks each field into one array, so token ids of varying length cannot go into it as they are. If you tokenize in `preprocess` and batch the result, you get an error that says so. There are two ways to get fixed rows, offline and online.
-
-Offline, `dew tokenize --pack` (or `TokenCorpus.write(..., pack=True)` in Python) writes a token directory with an eos id after every document, and `TokenWindows(pack=True)` packs it. It saves its position as a global record count, which resumes on any process count. `TokenCorpus.write` takes a text file, a directory of `.txt` files, or any iterable of strings with one document each, such as a Hugging Face split's text column.
-
-Online, Grain's packers build the rows as the documents are read, and `Dataset.from_grain` batches them. Each process builds the pipeline over its own share:
-
-<!-- not run: downloads wikitext and the SmolLM2 tokenizer on first use -->
-```python
-import datasets
-import grain
-import numpy as np
-
-from dew.data import DataPartition, Dataset, HFTokenizer
-
-tokenizer = HFTokenizer("HuggingFaceTB/SmolLM2-135M")
-split = datasets.load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split="train[:2000]")
-seq_len = 128
-
-
-def tokenized(row):
-    return {"text": np.asarray(tokenizer.encode(row["text"]), np.int32)}
-
-
-def documents(partition):
-    rows = (grain.MapDataset.source(split).seed(0).shuffle().repeat(None)
-            .map(tokenized).filter(lambda row: len(row["text"]) > 0))
-    share = rows[partition.index::partition.count].to_iter_dataset()
-    return grain.experimental.ConcatThenSplitIterDataset(
-        share, length_struct={"text": seq_len + 1})
-
-
-data = Dataset.from_grain(documents, batch=8)
-batch = next(data.train(DataPartition()))
-print({name: (value.shape, value.dtype) for name, value in batch.items()})
-print([len(set(row)) for row in batch["text_segment_ids"]])
-```
-
-```text
-{'text': ((8, 129), dtype('int32')), 'text_positions': ((8, 129), dtype('int32')), 'text_segment_ids': ((8, 129), dtype('int32'))}
-[1, 1, 2, 2, 3, 2, 1, 2]
-```
-
-`ConcatThenSplitIterDataset` concatenates the documents and cuts the stream into rows of `seq_len + 1` ids, splitting any document that crosses the end of a row. It also writes `text_segment_ids` and `text_positions`, the field names `LMObjective` reads. The last printed line counts the documents in each row.
-
-To pack whole documents with padding, use `grain.experimental.FirstFitPackIterDataset`. It refuses a document longer than the row, so cut long documents first. An online pipeline's position is Grain's own iterator state for one share, so it resumes only on the process count that wrote it (see [Resuming the data stream](#resuming-the-data-stream)).
-
-Padding and packing change the number of valid targets even when the array shapes are equal. Gradient accumulation adds the loss totals and masses of its microbatches before dividing, so the accumulated gradient is the gradient of one token mean over the whole window. Before you treat two runs with different packing as equivalent, check how each one is normalized.
-
-## Resuming the data stream
-
-If an iterator has `get_state()` and `set_state(state)`, Dew saves its position in every checkpoint and restores it on resume. The resumed run must use the same data order, tokenizer and transforms as the run that wrote the checkpoint. There are two kinds of position:
-
-| Kind | Written by | Resumes on |
+| Lowering | Position | Resume topology |
 |---|---|---|
-| Global record count | Every reader built on `train_stream`: token windows, packed documents and conversations, weighted mixtures, images, video, prompts, preference pairs | Any process count that divides the global batch |
-| Shard offset | Custom iterators that report their own state | Only the process count that wrote it |
+| Indexed, count-preserving or memory-materialized | Global consumed-record count | Any process count dividing the global row batch |
+| Streamed, online rejecting, expanding or packing | Grain iterator state per share | The recorded share and worker topology |
 
-A global position is the number of records the whole run has consumed, and every process reports the same number. Step *k* reads records `[k * batch, (k + 1) * batch)` of one shuffled order, and process *p* of *n* reads every *n*-th record of that step. So a checkpoint written by two processes restores on one or on four, and the steps after the resume read the same records an uninterrupted run would have read. Restoring sets where the stream starts reading, so no record is read twice.
+Volatile fetches cannot claim exact resume until their bytes are persisted. They use the first-reader rule when readers replicate a share.
 
-The position also records which stream it counts through: the source's description, its record count and the shuffle seed. Dew refuses to resume with a different record count or seed. A source without its own `__repr__` is described by its type name, so Dew can tell two corpora of the same length and seed apart only if the source describes its data. Give any source you resume across runs a `__repr__` that names its data.
+`Dataset.batch` is global. `DataPartition(index, count)` names a disjoint share; `DataPartition.of(mesh)` derives it from placement. Canonical validation takes accepted rows before the share cut. Record-level random transforms stay keyed to the global order; model noise keyed by batch row can change when process placement changes.
 
-Which process holds which row of a step depends on the process count, so randomness keyed by row, such as diffusion noise or sampled timesteps, falls on different records at a different process count. The resumed run then draws different noise for the same records. It optimizes the same objective, but its losses are not the numbers an uninterrupted run would have logged. A record's own random draws are keyed by its place in the shuffled stream and do not depend on the process count.
-
-`Checkpoints.restore` refuses a shard offset written by a different number of processes, and the error names both counts. Resume such a run on the process count that wrote it. [Checkpoints](../guides/checkpoints.md) shows the whole save and restore path.
-
-## Multiple processes
-
-`Dataset.batch` is the global batch. With several JAX processes, each process reads its share and Dew assembles the global arrays with `jax.make_array_from_process_local_data`. The built-in readers and `Dataset.from_records` split records between processes themselves. A custom `train` function must read only the share its `partition` names, `partition.index` of `partition.count`. Otherwise every process trains on the same records.
-
-Before a multi-process run, check on the target topology that process shares do not overlap, that sharding is as expected and that a resume continues the stream. [Distributed training](distributed.md) describes placement.
+[Checkpoints](../guides/checkpoints.md) and [distributed training](distributed.md) cover the trainer's restore and placement contracts.

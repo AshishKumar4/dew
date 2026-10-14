@@ -33,10 +33,11 @@ import atexit
 import dataclasses
 import functools
 import gc
+import itertools
 import re
 import shutil
 import tempfile
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -48,14 +49,17 @@ import pytest
 from capability_modules import Denoiser, FamilyText, NNXDenoiser, NNXLanguageModel, NNXTokens, TokenModel
 from flax.nnx import bridge
 from recording import RecordingTracker
+from steady_state import steady_state
 from test_precision_policy import PER_ARCH, TINY
 
 from dew.checkpoints import Checkpoints
-from dew.data import DataPartition
+from dew.config.data import loader
+from dew.data.dataset import DataPartition, Loader
 from dew.data.preferences import IDS_KEY as PAIR_IDS_KEY, MASK_KEY as PAIR_MASK_KEY
 from dew.data.prompts import LENGTH_KEY, PROMPT_KEY
 from dew.data.text import ByteTokenizer
 from dew.decision import Choice, DecisionObjective, Example, MarkerLayout, Specials, StateFirstLayout
+from dew.decision.data import Decisions
 from dew.diffusion import presets
 from dew.diffusion.discrete import MDLM
 from dew.inference.tasks import TextGeneration
@@ -410,21 +414,6 @@ def loaded(family: Family) -> Loaded:
 
 # --- running a method ------------------------------------------------------
 
-class Batches:
-    """The `Dataset` a trainer reads: `batch`, over and over."""
-
-    def __init__(self, batch: Mapping):
-        self._batch = batch
-        self.batch = ROWS
-        self.records = None
-        self.val = None
-        self.steps_per_epoch = None
-
-    def train(self, partition) -> Iterator[Mapping]:
-        while True:
-            yield self._batch
-
-
 def finite(tree) -> bool:
     return all(bool(np.all(np.isfinite(leaf))) for leaf in jax.tree.leaves(tree)
                if np.issubdtype(np.asarray(leaf).dtype, np.inexact))
@@ -449,30 +438,36 @@ def assert_trains(objective, batch: Mapping, directory: Path, *, evaluated: Mapp
                   data=None, sampled: bool = True, rollout=None, scores: bool = True) -> Trained:
     """The proof every supported cell gives, on `batch`.
 
-    The first batch passes the objective's input check and a cut one does
-    not. The trainer builds the tree, and its step on the batch logs a finite
+    The first batch passes the objective's input check, and one whose sample
+    runs a position past its declared bound, which no geometry admits, fixed
+    or variable, does not. The trainer builds the tree, and its step on the batch logs a finite
     loss and leaves every trained leaf finite, some of them moved: Adam's
     first update moves a leaf exactly where its gradient is nonzero, and a
     gradient that is not finite would leave the leaf so. The run checkpoints
     its step, and evaluation scores `evaluated` (the batch by default) to
     finite artifacts, or, for an objective that scores no tokens (`scores`
-    False), to none. `data` replaces the batch stream with the method's own;
+    False), to none; a second evaluation runs the programs the first
+    compiled, tracing nothing. `data` replaces the batch stream with the method's own;
     a method that trains on what its `rollout` samples from the batch, not
     on the batch (`sampled` False), has no sample field to check.
     """
     if objective.inputs is not None and sampled:
         objective.inputs.check(batch)
-        cut = {key: value[:, :-1] if key == objective.inputs.sample.key else value
-               for key, value in batch.items()}
+        sample = objective.inputs.sample
+        longer = {key: np.pad(value, [(0, 0), (0, sample.shape[0] + 1 - np.shape(value)[1]),
+                                      *[(0, 0)] * (np.ndim(value) - 2)]) if key == sample.key else value
+                  for key, value in batch.items()}
         with pytest.raises(ValueError):
-            objective.inputs.check(cut)
+            objective.inputs.check(longer)
     tracker = RecordingTracker()
     checkpoints = Checkpoints(str(directory))
     trainer = Trainer(objective, optax.adam(1e-3), key=0, checkpoints=checkpoints, tracker=tracker,
                       rollout=rollout)
     initial = trainer.initial_state()
     started = jax.device_get(initial.variables["params"])
-    state = trainer.fit(Batches(batch) if data is None else data, steps=1, log_every=1, state=initial)
+    if data is None:
+        data = Loader(lambda partition: itertools.repeat(batch), None, batch=ROWS, records=None)
+    state = trainer.fit(data, steps=1, log_every=1, state=initial)
     checkpoints.wait()
     losses = [scalars["train/loss"] for _, scalars in tracker.scalars if "train/loss" in scalars]
     assert len(losses) == 1 and np.isfinite(losses[0]), losses
@@ -486,6 +481,8 @@ def assert_trains(objective, batch: Mapping, directory: Path, *, evaluated: Mapp
     artifact = objective.evaluate(variables, batch if evaluated is None else evaluated, trained.step)
     # An objective that scores no tokens evaluates to nothing (`Objective.evaluate`).
     assert (artifact is not None and finite(artifact)) if scores else artifact is None, artifact
+    with steady_state(allow=("host_to_device", "device_to_host")):
+        objective.evaluate(variables, batch if evaluated is None else evaluated, trained.step)
     return trained
 
 
@@ -631,7 +628,8 @@ def decision(family: Family, directory: Path) -> None:
     layout = (StateFirstLayout if CAUSAL in family.facts else MarkerLayout)(
         max_len=48, head_max_len=32, option_tokens=4)
     objective = DecisionObjective(held.given, tokenizer=tokenizer, specials=specials, layout=layout)
-    data = objective.dataset(EXAMPLES, batch=ROWS, validation=EXAMPLES)
+    data = loader(Decisions(source=EXAMPLES, validation=EXAMPLES), batch=ROWS, read="memory",
+        objective=objective.data())
     batch = next(iter(data.train(DataPartition())))
     trained = assert_trains(objective, batch, directory, data=data)
     live = objective.pipeline(trained.state)

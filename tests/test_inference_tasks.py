@@ -12,9 +12,11 @@ import pytest
 from flax import linen as nn
 from model_support import decoder
 
+from dew.data.dataset import Loader
 from dew.diffusion.block import BlockProcess
 from dew.inference import BlockGeneration, TextGeneration
 from dew.interop import Pretrained
+from dew.interop.weights import decoding_storage
 from dew.nn.inputs import ModelInputs
 from dew.objectives.lm import LMObjective
 from dew.sampling import Sampling, generate
@@ -29,6 +31,34 @@ def assert_same_generation(actual, expected):
     np.testing.assert_array_equal(actual.terminated, expected.terminated)
     np.testing.assert_allclose(actual.behavior_log_probs, expected.behavior_log_probs, atol=2e-6, rtol=2e-6)
     np.testing.assert_allclose(actual.raw_log_probs, expected.raw_log_probs, atol=2e-6, rtol=2e-6)
+
+
+@pytest.mark.parametrize("family", ["llama-tiny", "diffusion-gemma-workflow"])
+def test_decoding_fp32_masters_draws_what_a_bf16_storage_load_draws(family):
+    """A bf16 model over fp32 masters decodes at bf16 storage: the weights it
+    casts once are those a load at bf16 storage reads, and its generation
+    draws what that load's draws, autoregressive or block by block."""
+    from test_interop import assert_parameter_storage
+
+    masters, native = (Pretrained.load(FIXTURES / family, dtype="bfloat16", attention_impl="xla",
+                                       max_seq_len=32, **storage)
+                       for storage in ({}, {"param_dtype": "bfloat16"}))
+    stored = decoding_storage(masters.model, masters.variables)
+    assert_parameter_storage(masters.variables, stored, lambda path: path[0] == "params")
+    for cast, loaded in zip(jax.tree.leaves(stored), jax.tree.leaves(native.variables), strict=True):
+        assert cast.dtype == loaded.dtype
+        np.testing.assert_array_equal(cast, loaded)
+    if family == "llama-tiny":
+        prompts = jnp.asarray([[1, 2, 3], [4, 5, 6]], jnp.int32)
+        wide, narrow = (generate(source.model, source.variables, prompts, 5, key=3, sampling=SAMPLING)
+                        for source in (masters, native))
+        fields = ("tokens", "lengths", "terminated", "behavior_log_probs", "raw_log_probs")
+    else:
+        prompts = ["<bos> t5 t7 t9 t11", "<bos> t6 t8 t10 t12"]
+        wide, narrow = (source.block_generation()(prompts, 7, key=11) for source in (masters, native))
+        fields = ("tokens", "lengths", "terminated", "decoder_steps")
+    for field in fields:
+        np.testing.assert_array_equal(getattr(wide, field), getattr(narrow, field))
 
 
 def test_a_bound_task_draws_from_the_weights_it_was_bound_to():
@@ -89,7 +119,7 @@ def test_a_loader_takes_a_dtype_and_records_its_name():
 
 
 def test_a_pretrained_bundle_fine_tunes_identically_to_explicit_wiring():
-    from dew import Dataset, Trainer
+    from dew import Trainer
     from dew.objectives.base import Step
 
     source = Pretrained.load(FIXTURES / "llama-tiny", dtype="float32", attention_impl="xla",
@@ -107,7 +137,7 @@ def test_a_pretrained_bundle_fine_tunes_identically_to_explicit_wiring():
     def loss(objective):
         return jax.jit(objective.scalar_loss)(objective.init(key), batch, step)[0]
     np.testing.assert_array_equal(loss(bundled), loss(explicit))
-    data = Dataset(train=lambda partition: iter([batch]), val=None, records=count, batch=count)
+    data = Loader(train=lambda partition: iter([batch]), val=None, records=count, batch=count)
     states = [Trainer(objective, optax.adamw(1e-3), key=key).fit(
         data, steps=1, log_every=100, checkpoint_every=None) for objective in (explicit, bundled)]
     assert int(states[1].updates) == 1
@@ -262,7 +292,7 @@ def test_a_placed_diffusion_gemma_task_keeps_its_rows_sharded_and_draws_the_same
 @pytest.mark.parametrize("kind", ["dpo", "grpo", "ppo"])
 def test_pipeline_publishes_the_updated_policy_not_the_frozen_reference(kind, tmp_path):
     import dew
-    from dew.data import Dataset
+    from dew.data.dataset import Loader
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.objectives.lm import Samples
     from dew.objectives.rl import DPOObjective, GRPOObjective, PPOObjective, ValueHead
@@ -300,7 +330,7 @@ def test_pipeline_publishes_the_updated_policy_not_the_frozen_reference(kind, tm
         if kind == "ppo":
             values = np.asarray(objective.values(before.variables, batch))
             batch.update(old_values=values, returns=values + mask)
-    data = Dataset(train=lambda partition: iter([batch, batch]), val=None, records=2 * count, batch=count)
+    data = Loader(train=lambda partition: iter([batch, batch]), val=None, records=2 * count, batch=count)
     state = trainer.fit(data, steps=2, log_every=100, checkpoint_every=None)
     def draw(weights):
         task = objective.policy(weights) if kind == "ppo" else objective.policy(weights, sampling)

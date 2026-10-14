@@ -54,12 +54,12 @@ from dew.nn.protocols import (
     CountedPredictions,
     CountedPredictionTraining,
     DecoderTraining,
-    Logits,
     TokenModel,
 )
 from dew.nn.sharding import LOGITS, constrain
 from dew.objectives.base import (
     OMITTED,
+    VALID_ROWS,
     Aux,
     Batch,
     EMASpec,
@@ -80,12 +80,14 @@ from dew.objectives.base import (
 )
 from dew.objectives.lm.chunked import (
     chunked_tile,
+    final_read,
+    fused_head_loss,
     head_cross_entropy,
     head_table,
-    logits_cross_entropy,
     logits_support_log_probs,
     model_logits,
     reads_states,
+    refuse_without_logits,
     support_log_probs,
 )
 from dew.records import JSON
@@ -143,10 +145,7 @@ def _check_reads(model: nn.Module) -> None:
     """
     if isinstance(model, TokenModel) and not model.causal:
         raise ValueError("LMObjective requires a causal model for next-token likelihoods")
-    if not reads_states(model) and not isinstance(model, Logits):
-        raise TypeError(
-            f"LMObjective scores a model's logits, and a {type(model).__name__} gives none: no head over "
-            f"its final states (HiddenStates with AffineHead or LogitsFromHidden) and no Logits")
+    refuse_without_logits(model, "LMObjective")
 
 
 def _streamed_depths(model: nn.Module) -> bool:
@@ -461,9 +460,13 @@ class Scores(NamedTuple):
     logits of a model that gives them only from its tokens (`chunked.reads_states`),
     and `layers` the states of
     the layers `token_scores` was asked for, in that order. `routing` is what the
-    routers recorded, `depths` the prediction depths' (losses, weights) pairs, `qk`
-    the attention layers' per-head logit maxima, and `indexer` their per-query
-    indexer KL; each is None or empty unless its flag asked for it.
+    routers recorded, `depths` the prediction depths' (losses, weights, total)
+    triples, `qk` the attention layers' per-head logit maxima, and `indexer`
+    their per-query indexer KL; each is None or empty unless its flag asked for
+    it. `total` is the weighted sum of the losses and the z-loss
+    (`chunked.fused_head_loss`), and a depth's total its losses' weighted sum,
+    where `token_scores` was asked for the sums alone (`z_loss`): then only
+    the totals carry a gradient. Otherwise they are None.
     """
 
     losses: jax.Array
@@ -476,6 +479,7 @@ class Scores(NamedTuple):
     depths: list
     qk: dict | None
     indexer: dict | None
+    total: jax.Array | None = None
 
 
 @struct.dataclass
@@ -502,14 +506,16 @@ _DEFAULT_SAMPLING = Sampling()
 
 
 
-def scored_targets(xp, tokens, pad_id: int | None, attention_mask, segment_ids, depth: int = 0):
+def scored_targets(xp, tokens, pad_id: int | None, attention_mask, segment_ids, depth: int = 0,
+                   roles=None, role: int | None = None):
     """Whether each target the loss scores at prediction `depth` counts, as
     `[B, S - 1 - depth]` booleans, in `xp` (numpy for the host's FLOP
-    geometry, jax.numpy for the loss): the state at p scores the token
-    `depth + 1` later, which counts when it is not padding, when the
-    attention mask keeps every position from the state to it, and, in a
-    packed batch, when the state and it share a document (segment 0 is
-    padding)."""
+    geometry and the data's target counts, jax.numpy for the loss): the
+    state at p scores the token `depth + 1` later, which counts when it is
+    not padding, when the attention mask keeps every position from the state
+    to it, in a packed batch when the state and it share a document (segment
+    0 is padding), and with a `role` (`loss_role`) when `roles`, one per
+    token, give the target that role."""
     span = depth + 1
     width = tokens.shape[1] - span
     counted = xp.ones((tokens.shape[0], width), bool) if pad_id is None else tokens[:, span:] != pad_id
@@ -518,6 +524,8 @@ def scored_targets(xp, tokens, pad_id: int | None, attention_mask, segment_ids, 
             counted = counted & attention_mask[:, offset:offset + width].astype(bool)
     if segment_ids is not None:
         counted = counted & (segment_ids[:, span:] == segment_ids[:, :-span]) & (segment_ids[:, span:] != 0)
+    if role is not None and roles is not None:
+        counted = counted & (roles[:, span:] == role)
     return counted
 
 class LMObjective(Objective[Ratio | LMStatistics, Variables]):
@@ -872,7 +880,7 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
                      depths: bool = False, roles=None, qk_stats: bool = False,
                      indexer: bool = False, layers: Sequence[int] = (),
                      routes: tuple[jax.Array, jax.Array | None] | None = None,
-                     predict: bool | None = None):
+                     predict: bool | None = None, z_loss: float | None = None):
         """Score per-token next-token cross entropy over a `[B, seq_len + 1]` batch.
 
         Returns `Scores`: the losses, the weight of each target, whether each
@@ -894,6 +902,16 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         router selects those experts instead of its own top-k and still
         weights them from its scores (`dew.nn.protocols.Routes`); the stack slices
         the record by layer however it runs.
+
+        `z_loss` asks for the weighted sums alone (`Scores.total`, PaLM's
+        z-loss at that weight included, and each depth's), the caller's loss
+        being linear in the per-token cross entropies: a head the model holds
+        as a table and tiles (`head_tile`, where its whole logits do not fit)
+        then takes them with their gradient in its forward
+        (`chunked.fused_head_loss`), and the per-token results carry none.
+        Where the whole logits fit, they are kept: three products either way,
+        and on an H100 the whole head ran Qwen3.5-0.8B's 4 x 3072 step at
+        36.1% MFU against the fused head's 34.6%.
         """
         prepared = _prepared(tokens, segment_ids, positions)
         inputs, targets = self._rows(prepared.tokens)
@@ -917,11 +935,18 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         kls = gathered.get(INDEXER_COLLECTION) if indexer else None
         kept = tuple(layer_output(gathered[INTERMEDIATES], index) for index in layers)
         predict = self.token_accuracy if predict is None else predict
-        losses, predicted, log_z = (
-            head_cross_entropy(self.model, params, hidden, targets, self.head_chunks, tile=self.head_tile,
-                               predict=predict) if reads_states(self.model)
-            else logits_cross_entropy(hidden, targets, predict=predict))
-        weights = self._row_weights(prepared, roles, losses.dtype)
+        table = (head_table(self.model, params) if z_loss is not None and self.head_tile is not None
+                 and reads_states(self.model) else None)
+        dtype = jnp.promote_types(hidden.dtype, jnp.float32)
+        weights = self._row_weights(prepared, roles, dtype)
+        total = None
+        if table is not None:
+            total, (losses, predicted, log_z) = fused_head_loss(
+                hidden, table, targets, weights, z_loss=float(z_loss or 0.0), predict=predict)
+        else:
+            losses, predicted, log_z = head_cross_entropy(
+                self.model, params, hidden, targets, self.head_chunks, tile=self.head_tile, predict=predict)
+        weights = weights.astype(losses.dtype)
         correct = None if predicted is None else (predicted == targets).astype(losses.dtype)
         depth_scores = []
         if depths:
@@ -942,37 +967,50 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
                 if indexer:
                     kls = {**(kls or {}), **depth_sown.get(INDEXER_COLLECTION, {})}
             for depth, state in enumerate(states, start=1):
-                depth_losses, _, _ = head_cross_entropy(
-                    self.model, params, state, targets[:, depth:], self.head_chunks,
-                    tile=self.head_tile, predict=False)
-                depth_scores.append((depth_losses, self._depth_weights(prepared, roles, losses.dtype, depth)))
-        return Scores(losses, weights, log_z, correct, hidden, kept, sown, depth_scores, qk, kls)
+                depth_weights = self._depth_weights(prepared, roles, losses.dtype, depth)
+                depth_total = None
+                if table is not None:
+                    depth_total, (depth_losses, _, _) = fused_head_loss(
+                        state, table, targets[:, depth:], depth_weights, predict=False)
+                else:
+                    depth_losses, _, _ = head_cross_entropy(
+                        self.model, params, state, targets[:, depth:], self.head_chunks,
+                        tile=self.head_tile, predict=False)
+                depth_scores.append((depth_losses, depth_weights, depth_total))
+        return Scores(losses, weights, log_z, correct, hidden, kept, sown, depth_scores, qk, kls, total)
+
+    def data(self, tokenizer=None):
+        from dew.data.pipeline import ObjectiveData
+        from dew.data.steps.text import CountTargets, FixedTokens
+
+        geometry = FixedTokens(self.seq_len, extra=1)
+        if self.loss_role is None and self.pad_id is None:
+            return ObjectiveData(train=(geometry,), evaluate=(geometry,))
+        counted = CountTargets(
+            role=None if self.loss_role is None else int(self.loss_role), pad_id=self.pad_id
+        )
+        return ObjectiveData(train=(counted, geometry), evaluate=(counted, geometry))
 
     def _row_weights(self, prepared, roles, dtype):
         """Weight the targets the row itself scores (`scored_targets`), and
         with `loss_role` one role's targets alone."""
         fields = prepared.token_fields
-        weights = scored_targets(jnp, prepared.tokens, self.pad_id, fields.get("attention_mask"),
-                                 fields.get("segment_ids")).astype(dtype)
-        if roles is not None:
-            if roles.shape != prepared.tokens.shape:
-                raise ValueError(
-                    f"text_roles has shape {tuple(roles.shape)} for "
-                    f"{tuple(prepared.tokens.shape)} ids; the roles align with the input "
-                    "tokens, one per token")
-            if self.loss_role is not None:
-                weights = weights * (roles[:, 1:] == int(self.loss_role))
-        return weights
+        if roles is not None and roles.shape != prepared.tokens.shape:
+            raise ValueError(
+                f"text_roles has shape {tuple(roles.shape)} for "
+                f"{tuple(prepared.tokens.shape)} ids; the roles align with the input "
+                "tokens, one per token")
+        return scored_targets(jnp, prepared.tokens, self.pad_id, fields.get("attention_mask"),
+                              fields.get("segment_ids"), roles=roles,
+                              role=None if self.loss_role is None else int(self.loss_role)).astype(dtype)
 
     def _depth_weights(self, prepared, roles, dtype, depth: int):
         """Weight the targets one prediction depth scores: depth d's state at
         p scores the target d further out (`scored_targets`)."""
         fields = prepared.token_fields
-        weights = scored_targets(jnp, prepared.tokens, self.pad_id, fields.get("attention_mask"),
-                                 fields.get("segment_ids"), depth).astype(dtype)
-        if roles is not None and self.loss_role is not None:
-            weights = weights * (roles[:, depth + 1:] == int(self.loss_role))
-        return weights
+        return scored_targets(jnp, prepared.tokens, self.pad_id, fields.get("attention_mask"),
+                              fields.get("segment_ids"), depth, roles=roles,
+                              role=None if self.loss_role is None else int(self.loss_role)).astype(dtype)
 
     def tile_head(self, tile: tuple[int, int] | None = None) -> str | None:
         """Move a head that keeps its whole logits to `tile`, and report what it moved to.
@@ -990,19 +1028,15 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
     def _hidden_states(self, params, inputs, train, rngs, collections: list[str],
                        packing: dict[str, jax.Array | Mapping[str, jax.Array]],
                        layers: Sequence[int] = ()):
-        """Run the model over `inputs` and return its final states, or the
-        logits of a model that gives them only from its tokens (`reads_states`).
+        """Run the model over `inputs` and return what a loss scores (`chunked.final_read`).
 
         Beside them come whatever the open `collections` gathered, empty
         when none was opened, and under `intermediates` the outputs of
         every layer when `layers` asks for any.
         """
         opened = [*collections, INTERMEDIATES] if layers else collections
-        hidden = self.model.apply(params, inputs, train=train, rngs=rngs,
-                                  method="hidden_states" if reads_states(self.model) else "logits",
-                                  mutable=opened or False,
-                                  capture_intermediates=layer_outputs if layers else False,
-                                  **packing)
+        hidden = final_read(self.model, params, inputs, train=train, rngs=rngs, mutable=opened or False,
+                            capture_intermediates=layer_outputs if layers else False, **packing)
         if not opened:
             return hidden, {}
         return hidden
@@ -1043,11 +1077,8 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         params = thaw(params)
         targets = tokens[:, 1:]
         if temperature != 1.0:
-            losses, _, _ = (
-                head_cross_entropy(self.model, params, scores.hidden, targets, self.head_chunks,
-                                   tile=self.head_tile, predict=False, temperature=temperature)
-                if reads_states(self.model)
-                else logits_cross_entropy(scores.hidden, targets, predict=False, temperature=temperature))
+            losses, _, _ = head_cross_entropy(self.model, params, scores.hidden, targets, self.head_chunks,
+                                              tile=self.head_tile, predict=False, temperature=temperature)
             log_probs = -losses
         if support is not None:
             ids, columns = (jnp.asarray(value, jnp.int32) for value in support)
@@ -1058,8 +1089,7 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
                 filtered, present = support_log_probs(scores.hidden, head, targets, ids, owners,
                                                       temperature=temperature)
             else:
-                logits = (model_logits(self.model, params, scores.hidden) if reads_states(self.model)
-                          else scores.hidden)
+                logits = model_logits(self.model, params, scores.hidden)
                 filtered, present = logits_support_log_probs(logits, targets, ids, owners,
                                                              temperature=temperature)
             log_probs = jnp.where(present, filtered, log_probs)
@@ -1148,7 +1178,8 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
     def loss(self, variables, batch, step: Step) -> tuple[Ratio | LMStatistics, Aux[Variables]]:
         if self._warmup:
             return self._warmup_loss(variables, batch, step)
-        statistics, aux, _ = self._scored_loss(variables, batch, step, train=step.training)
+        statistics, aux, _ = self._scored_loss(variables, batch, step, train=step.training,
+                                               summed=step.training)
         return statistics, aux
 
     def predict(self, params, batch, step: Step, *, train: bool,
@@ -1171,22 +1202,28 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
                 "student's routers with balance_rate instead")
         statistics, aux, scores = self._scored_loss(params, batch, step, train=train, layers=layers)
         assert isinstance(statistics, Ratio)
-        logits = constrain(model_logits(self.model, thaw(params), scores.hidden)
-                           if reads_states(self.model) else scores.hidden, LOGITS)
+        logits = constrain(model_logits(self.model, thaw(params), scores.hidden), LOGITS)
         return statistics, aux, Prediction(logits, scores.losses, scores.weights, scores.layers)
 
-    def _scored_loss(self, params, batch, step: Step, *, train: bool, layers: Sequence[int] = ()
-                     ) -> tuple[Ratio | LMStatistics, Aux[Variables], Scores]:
-        """Compute the loss's statistics and reports, with the scores they came from."""
+    def _scored_loss(self, params, batch, step: Step, *, train: bool, layers: Sequence[int] = (),
+                     summed: bool = False) -> tuple[Ratio | LMStatistics, Aux[Variables], Scores]:
+        """Compute the loss's statistics and reports, with the scores they came from.
+
+        `summed` takes the cross entropies, the z-loss and the depths' as
+        their weighted sums alone (`token_scores`'s `z_loss`), which a
+        training step's loss is: a sum of a batch's rows, each counted once.
+        """
         prepared = batch_text(batch)
         rate = self.balance_rate
         alpha = self.aux_loss_alpha
+        summed = summed and VALID_ROWS not in batch
         scores = self.token_scores(
             params, prepared, train=train, rngs=model_rngs(step.key, training=train),
             routing=rate is not None or alpha is not None or bool(self.router_z_loss),
             depths=self.mtp_weight is not None, roles=self._batch_roles(batch),
-            qk_stats=self.qk_stats, indexer=self.indexer is not None, layers=layers)
-        losses, weights, log_z, correct, _, _, routing, depths, qk, kls = scores
+            qk_stats=self.qk_stats, indexer=self.indexer is not None, layers=layers,
+            z_loss=self.z_loss if summed else None)
+        losses, weights, log_z, correct, _, _, routing, depths, qk, kls, sums = scores
         mass = jax.lax.stop_gradient(self.row_mean(weights, batch).total)
         prediction = Ratio(self.row_mean(losses * weights, batch).total, mass)
         ce, _ = prediction.mean()
@@ -1199,11 +1236,14 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
             z_total = self.z_loss * self.row_mean(jnp.square(log_z) * weights, batch).total
             reported["z_loss"] = z_total / jnp.where(mass > 0, mass, 1)
             prediction = Ratio(prediction.total + z_total, mass)
+        if sums is not None:
+            # The head's sum carries the gradient; the per-token terms above report.
+            prediction = Ratio(sums, mass)
         if self.mtp_weight is not None:
             # Depths retain the main target denominator and configured depth average.
             mtp_total = jnp.mean(jnp.stack([
-                self.row_mean(depth_losses * depth_weights, batch).total
-                for depth_losses, depth_weights in depths]))
+                self.row_mean(depth_losses * depth_weights, batch).total if depth_sum is None else depth_sum
+                for depth_losses, depth_weights, depth_sum in depths]))
             reported["mtp_ce"], _ = Ratio(mtp_total, mass).mean()
             prediction = Ratio(prediction.total + self.mtp_weight * mtp_total, mass)
         if self.indexer is not None:

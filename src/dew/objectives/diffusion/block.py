@@ -204,6 +204,13 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
         self.ema = EMASpec.constant(ema_decay)
         self.head_chunks = head_chunks
 
+    def data(self, tokenizer=None):
+        from dew.data.pipeline import ObjectiveData
+        from dew.data.steps.text import FixedTokens
+
+        geometry = FixedTokens(self.sequence_length)
+        return ObjectiveData(train=(geometry,), evaluate=(geometry,))
+
     def _process(self):
         """The task's process, over the canvas the model generates on: the one `build_task` samples
         with and `task_record` saves."""

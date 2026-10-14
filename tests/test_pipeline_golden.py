@@ -1,0 +1,164 @@
+"""Loader batches and RNG against frozen references, with real workers.
+
+Images pin the public-stage recipe; the other loaders pin 66beb5305.
+"""
+
+import gzip
+import hashlib
+import itertools
+import json
+from pathlib import Path
+
+import cv2
+import jax
+import numpy as np
+import pyarrow as pa
+import pyarrow.parquet as pq
+import pytest
+from array_record.python.array_record_module import ArrayRecordWriter
+
+from dew.config.data import (
+    Augment,
+    ChatData,
+    HoldOut,
+    ImageData,
+    PreferenceData,
+    PromptData,
+    RecordsData,
+    TextData,
+    loader,
+)
+from dew.data.dataset import DataPartition, DataPhase, Loading
+from dew.data.sources.codec import pack_dict_of_byte_arrays
+from dew.data.sources.files import Files
+from dew.data.sources.tfds import TFDS
+
+GOLD = Path(__file__).parent / "fixtures/golden/loaders-66beb5305.json.gz"
+CASES = ("text_windows", "text_packed", "text_phases", "chat", "prompts", "preferences", "images_memory",
+         "images_arrayrecord", "images_hf", "images_tfds", "hub_records", "tfds_records")
+"""The recipes the old loaders read alike. Decision rows are not among them: they pack into windows,
+which no old loader did (tests/test_decision_packing.py); nor is the video recipe, whose record the
+media stages changed on purpose (a waveform and its validity in place of per-frame rows and features):
+tests/test_data.py holds that recipe to itself across workers and a resume."""
+
+
+def _digest(batch):
+    leaves = []
+    for value in jax.tree.leaves(batch):
+        array = np.asarray(value)
+        encoded = (json.dumps(array.tolist(), sort_keys=True).encode()
+                   if array.dtype.hasobject else array.tobytes())
+        leaves.append({"shape": list(array.shape), "dtype": array.dtype.str,
+                       "sha256": hashlib.sha256(encoded).hexdigest()})
+    return {"tree": str(jax.tree.structure(batch)), "leaves": leaves}
+
+
+def _token_files(root, name, shift):
+    directory = root / name
+    directory.mkdir()
+    train = np.asarray([token for index in range(100)
+                        for token in [*((np.arange(5 + index % 15) + index + shift) % 200), 255]], np.uint16)
+    held = train[:180]
+    (directory / "train.bin").write_bytes(train.tobytes())
+    (directory / "val.bin").write_bytes(held.tobytes())
+    (directory / "meta.json").write_text(json.dumps({"tokenizer": "byte", "vocab_size": 256,
+                                                   "dtype": "uint16", "train_tokens": len(train),
+                                                   "val_tokens": len(held), "eos_id": 255}))
+    return str(directory)
+
+
+def _image_sources(root, pixels):
+    image_root = root / "images"
+    image_root.mkdir()
+    writer = ArrayRecordWriter(str(image_root / "00.array_record"), "group_size:1")
+    for row in pixels:
+        writer.write(pack_dict_of_byte_arrays({"image": row["image"].tobytes(),
+                                               "shape": np.asarray([16, 16], "<i4").tobytes(),
+                                               "caption": row["caption"].encode(),
+                                               "label": np.asarray(row["label"], np.int32).tobytes()}))
+    writer.close()
+    image_file = root / "images.parquet"
+    pq.write_table(pa.Table.from_pylist([
+        {**row, "image": {"bytes": cv2.imencode(".png", row["image"][..., ::-1])[1].tobytes(), "path": None}}
+        for row in pixels]), image_file)
+    return str(image_root), str(image_file)
+
+
+@pytest.fixture(scope="module")
+def recipes(tmp_path_factory):
+    root = tmp_path_factory.mktemp("pipeline-golden")
+    tokens, other = _token_files(root, "tokens", 0), _token_files(root, "other", 10)
+    conversations = tuple({"messages": [{"role": "user", "content": f"question {index}"},
+                                        {"role": "assistant", "content": f"answer {index % 5}"}]}
+                          for index in range(40))
+    prompts = tuple({"prompt": list(range(1, 3 + index % 6)), "data_source": "rule",
+                     "ground_truth": str(index % 3), "extra_info": ""} for index in range(40))
+    pairs = tuple({"chosen": list(range(1, 3 + index % 4)), "rejected": [2, 3, 4],
+                   "chosen_mask": [0] + [1] * (1 + index % 4), "rejected_mask": [0, 1, 1]}
+                  for index in range(40))
+    pixels = tuple({"image": ((np.arange(16 * 16 * 3).reshape(16, 16, 3) + index * 7) % 256).astype(np.uint8),
+                    "label": index % 3, "caption": f"picture {index}"} for index in range(40))
+    image_root, image_file = _image_sources(root, pixels)
+    table = root / "records.parquet"
+    pq.write_table(pa.table({"id": list(range(40)), "x": [[index, index + 1] for index in range(40)]}), table)
+    augment = Augment(backend="host", jitter=True)
+    return {
+        "text_windows": (TextData(tokens, seq_len=16), {"validation_records": 16}),
+        "text_packed": (TextData(tokens, seq_len=16, pack="first-fit"), {"validation_records": 16}),
+        "text_phases": (TextData(phases=(DataPhase(tokens, 3), DataPhase(other)), seq_len=16),
+                        {"validation_records": 16}),
+        "chat": (ChatData(conversations, "tests/fixtures/tokenizers/tiny-chat", seq_len=64, long="chunk",
+                       validation=conversations), {"validation_records": 16}),
+        "prompts": (PromptData(prompts, "byte", max_prompt_len=16, long="truncate"), {}),
+        "preferences": (PreferenceData(pairs, seq_len=16), {}),
+        "images_memory": (ImageData(pixels, image_size=16, augment=augment, validation=HoldOut(records=16)),
+                          {}),
+        "images_arrayrecord": (ImageData(Files(image_root, format="array_record"), image_size=16,
+                                      augment=augment, validation=HoldOut(records=16)), {}),
+        "images_hf": (ImageData(Files(image_file), image_size=16, augment=augment,
+                              validation=HoldOut(records=16)), {}),
+        "images_tfds": (ImageData(TFDS("dew_images", split="all",
+                                       path="tests/fixtures/tfds/dew_images/1.0.0"),
+                                image_size=8, augment=augment, caption_templates=("a photo of a {}",),
+                                validation=HoldOut(records=4)), {}),
+        "hub_records": (RecordsData(Files(str(table))), {}),
+        "tfds_records": (RecordsData(TFDS("dew_images", path="tests/fixtures/tfds/dew_images/1.0.0")), {}),
+    }
+
+
+@pytest.mark.parametrize("name", CASES)
+@pytest.mark.parametrize("workers", [0, 2])
+@pytest.mark.parametrize("shares", [1, 2])
+def test_loader_batches_positions_and_rng_match_the_frozen_reference(recipes, name, workers, shares):
+    with gzip.open(GOLD, "rt") as source:
+        expected = json.load(source)["cases"][name][f"workers={workers},shares={shares}"]
+    recipe, fields = recipes[name]
+    loaded = loader(recipe, batch=4, read="memory", seed=7,
+                  loading=Loading(workers=workers, threads=1, read_buffer=4, worker_buffer=1), **fields)
+    assert loaded.records == expected["records"]
+    assert loaded.held_out == expected["held_out"]
+    for share in range(shares):
+        partition = DataPartition(share, shares)
+        reader = loaded.train(partition)
+        try:
+            first = [_digest(row) for row in itertools.islice(reader, 4)]
+            state = reader.get_state()
+            rest = [_digest(row) for row in itertools.islice(reader, 4)]
+        finally:
+            reader.close()
+        assert first == expected["shares"][share]["first"]
+        assert rest == expected["shares"][share]["after_save"]
+        resumed = loaded.train(partition)
+        try:
+            resumed.set_state(state)
+            assert [_digest(row) for row in itertools.islice(resumed, 4)] == rest
+        finally:
+            resumed.close()
+        if loaded.val is not None:
+            held = loaded.val(partition)
+            try:
+                observed = [_digest(row) for row in itertools.islice(held, 100)]
+                assert next(held, None) is None
+            finally:
+                held.close()
+            assert observed == expected["shares"][share]["validation"]

@@ -9,6 +9,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 from reference_error import assert_as_exact_as_the_reference
+from steady_state import steady_state
 
 from dew.decision import (
     Abstention,
@@ -208,13 +209,20 @@ def passed(objective, variables, examples):
 
     step = Step(jnp.asarray(0), jax.random.key(0), None)
     rows = []
-    for batch in objective.held_out(examples, batch=8)(DataPartition()):
+    from dew.data.compile import validation
+    from dew.decision.data import Decisions as DecisionRecipe
+
+    pipeline, _, _ = DecisionRecipe(source=examples).pipelines()
+    reader = validation(pipeline, batch=8, objective=objective.data(), read="memory")
+    for batch in reader(DataPartition()):
         probabilities = np.asarray(objective.evaluate(variables, batch, step).probabilities)
-        logits = np.asarray(objective._logits(variables, laid_out(batch)))
-        # A batch the pass filled with repeats marks its real rows.
-        for row in np.flatnonzero(batch.get(VALID_ROWS, np.ones(len(batch["kinds"]), bool))):
-            count = int(batch["options"][row, 0].sum())
-            rows.append((int(batch["kinds"][row, 0]), logits[row, 0, :count], probabilities[row, 0, :count]))
+        logits = np.asarray(objective._logits(variables, laid_out(batch, objective.bounds.segments)))
+        # A batch the pass filled with repeats marks its real windows.
+        for window in np.flatnonzero(batch.get(VALID_ROWS, np.ones(len(batch["kinds"]), bool))):
+            for slot in np.flatnonzero(batch["questions"][window]):
+                count = int(batch["options"][window, slot].sum())
+                rows.append((int(batch["kinds"][window, slot]), logits[window, slot, :count],
+                             probabilities[window, slot, :count]))
     return rows
 
 
@@ -249,6 +257,33 @@ def test_score_is_a_validation_pass_through_the_task_s_temperatures(decide):
     assert set(scores) == {"accuracy", "ece", "aurc", "log_loss"}
     assert scores["accuracy"] == pytest.approx(np.mean([int(np.argmax(answer.probabilities)) == 0
                                                         for answer in answers]))
+    # A second score runs the forward the first compiled.
+    with steady_state(allow=("host_to_device", "device_to_host")):
+        assert decide.score(examples) == scores
+
+
+def test_an_evaluation_runs_the_modules_the_objective_holds_now(decide):
+    """A substitution at the same shapes that changes the arithmetic, as a
+    narrowed or quantized head does, is what the next evaluation runs, as an
+    objective built holding it runs it."""
+    import jax.numpy as jnp
+
+    from dew.decision import DecisionObjective
+
+    def logits(objective):
+        return np.concatenate([found for _, found, _ in passed(objective, decide.variables, examples)])
+
+    examples = answered()
+    objective = DecisionObjective(decide)
+    before = logits(objective)
+    backbone, head = (entry.module for entry in objective.program_key())
+    narrowed = [backbone, head.clone(dtype=jnp.bfloat16)]
+    objective.substitute(narrowed)
+    built = DecisionObjective(decide)
+    built.substitute(narrowed)
+    expected = logits(built)
+    assert not np.array_equal(before, expected)
+    np.testing.assert_array_equal(logits(objective), expected)
 
 
 def test_an_objective_from_a_calibrated_task_validates_without_its_temperatures(decide):

@@ -14,7 +14,7 @@ from flax import linen as nn
 import dew.config
 import dew.nn.backbones
 from dew.config import ModelConfig, OptimConfig, RunConfig, TrainerConfig
-from dew.data import Dataset
+from dew.data.dataset import Loader
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.vision import GemmaProjector, SiglipVision
 from dew.objectives.diffusion import DiffusionRunConfig
@@ -24,12 +24,15 @@ from dew.training import Checkpoints, Layout, MeshSpec
 
 @pytest.mark.parametrize("dataset", ["tfds", "arrayrecord_shards", "arrayrecord_path"])
 def test_to_dict_and_from_dict_round_trip_a_run(dataset, tmp_path):
-    from dew.data.images import ArrayRecordImages
+    from dew.config.data import ImageData
+    from dew.data import Files
 
     data = {
-        "tfds": datasets["tfds_images"](image_size=64),
-        "arrayrecord_shards": datasets["array_record_images"](image_size=64, shards=("cc12m",)),
-        "arrayrecord_path": ArrayRecordImages(path=str(tmp_path), image_size=8),
+        "tfds": ImageData(source="tfds://oxford_flowers102", image_size=64),
+        "arrayrecord_shards": ImageData(
+            source=Files((str(tmp_path / "cc12m" / "*.array_record"),), format="array_record"),
+            image_size=64),
+        "arrayrecord_path": ImageData(source=str(tmp_path), image_size=8),
     }[dataset]
     config = RunConfig(
         model=ModelConfig("simple_dit", {"patch_size": 4, "emb_features": 64}),
@@ -41,8 +44,7 @@ def test_to_dict_and_from_dict_round_trip_a_run(dataset, tmp_path):
     record = config.to_dict()
     assert record["trainer"]["layout"]["rules"] == [["mlp", "fsdp"]]
     assert RunConfig.from_dict(json.loads(json.dumps(record))) == config
-    if isinstance(data, ArrayRecordImages):
-        assert record["data"]["class"] == datasets.paths["array_record_images"]
+    assert record["data"]["class"] == datasets.paths["images"]
 
 
 def test_a_record_with_an_unknown_field_or_without_a_required_one_is_refused():
@@ -55,17 +57,44 @@ def test_a_record_with_an_unknown_field_or_without_a_required_one_is_refused():
         RunConfig.from_dict({**record, "data": {"class": "flowers", "fields": {}}})
 
 
+@pytest.mark.parametrize("fields", [
+    {"batch_tokens": 24},
+    {"update_tokens": 96},
+    {"batch_tokens": 24, "update_tokens": 96},
+    {"batch_size": None, "batch_tokens": 0, "update_tokens": 96},
+    {"batch_size": None, "batch_tokens": 24, "update_tokens": 95},
+    {"batch_size": None},
+])
+def test_token_budget_flags_refuse_an_ambiguous_or_fractional_batch(fields):
+    with pytest.raises(ValueError):
+        TrainerConfig(**fields)
+
+
+def test_token_budgets_derive_the_recorded_accumulation_without_changing_the_requested_config():
+    requested = TrainerConfig(batch_size=None, batch_tokens=24576, update_tokens=98304, steps=1)
+    derived = requested.derived()
+    assert requested.accumulation == 1 and derived.accumulation == 4
+    config = RunConfig(trainer=derived)
+    loaded = RunConfig.from_dict(json.loads(json.dumps(config.to_dict())))
+    assert loaded.trainer.batch_size is None
+    assert loaded.trainer.batch_tokens == 24576 and loaded.trainer.update_tokens == 98304
+    assert loaded.trainer.accumulation == 4
+    conflicting = dataclasses.replace(requested, accumulation=3)
+    with pytest.raises(ValueError):
+        conflicting.derived()
+
+
 def test_an_unregistered_member_fails_at_write_not_at_reload(tmp_path):
     """A spec the registry does not know cannot be written: to_dict raises
     now, instead of saving a record from_dict can never load back."""
-    from dew.data.images import ImageDataset
+    from dew.config.data import ImageData
 
     @dataclasses.dataclass(frozen=True)
-    class Unregistered(ImageDataset):
-        path: str | None = None
+    class Unregistered(ImageData):
+        pass
 
     config = RunConfig(
-        data=Unregistered(path=str(tmp_path), image_size=8),
+        data=Unregistered(source=str(tmp_path), image_size=8),
         trainer=TrainerConfig(steps=1))
     with pytest.raises(ValueError):
         config.to_dict()
@@ -131,29 +160,26 @@ def test_the_run_length_is_steps_or_epochs():
     with pytest.raises(ValueError):
         TrainerConfig(steps=10, epochs=1)
 
-    class Streamed:
-        steps_per_epoch = None
+    streamed = Loader(train=lambda partition: iter(()), val=None, records=None, batch=4)
+    sized = Loader(train=lambda partition: iter(()), val=None, records=100, batch=4)
 
-    class Sized:
-        steps_per_epoch = 25
-
-    assert TrainerConfig(steps=10).total_steps(Sized()) == 10
-    assert TrainerConfig(epochs=4).total_steps(Sized()) == 100
+    assert TrainerConfig(steps=10).total_steps(sized) == 10
+    assert TrainerConfig(epochs=4).total_steps(sized) == 100
     with pytest.raises(ValueError):
-        TrainerConfig(epochs=4).total_steps(Streamed())
+        TrainerConfig(epochs=4).total_steps(streamed)
     with pytest.raises(ValueError):
-        TrainerConfig().total_steps(Sized())
+        TrainerConfig().total_steps(sized)
 
 
 def test_the_cli_parses_the_mesh_the_layout_and_a_dataset_subcommand():
     config = RunConfig.cli( [
         "--trainer.mesh.fsdp", "2", "--trainer.layout.min-shard", "8",
         "--trainer.steps", "5", "--model", "uvit", "--model.emb_features", "32",
-        "data:token-windows", "--data.path", "tokens", "--data.seq-len", "8"])
+        "data:text", "--data.source", "tokens", "--data.seq-len", "8"])
     assert config.trainer.mesh == MeshSpec(fsdp=2)
     assert config.trainer.layout.min_shard == 8
     assert config.model.fields == {"emb_features": 32}
-    assert type(config.data) is datasets["token_windows"]
+    assert type(config.data) is datasets["text"]
     assert config.data.seq_len == 8
     assert RunConfig.from_dict(config.to_dict()) == config
 
@@ -248,13 +274,13 @@ def test_a_record_that_names_a_field_the_value_does_not_have_is_refused():
 
 
 def _data(records=48, batch=8):
-    """A Dataset value with nothing behind it: the intervals read only its
+    """A Loader value with nothing behind it: the intervals read only its
     record count and its batch."""
-    return Dataset(train=lambda partition: iter(()), val=None, records=records, batch=batch)
+    return Loader(train=lambda partition: iter(()), val=None, records=records, batch=batch)
 
 
 def test_a_run_records_its_token_budget_and_final_checkpoint_policy(tmp_path):
-    config = TrainerConfig(total_tokens=30, checkpoint_final=False, batch_size=8,
+    config = TrainerConfig(tokens=30, checkpoint_final=False, batch_size=8,
                            checkpoint_dir=str(tmp_path), eval_every=None, checkpoint_every=None)
     run = RunConfig(trainer=config)
     assert RunConfig.from_dict(run.to_dict()).trainer == config
@@ -264,7 +290,7 @@ def test_a_run_records_its_token_budget_and_final_checkpoint_policy(tmp_path):
 def test_a_run_can_disable_final_checkpoint_saving(tmp_path):
     run = RunConfig(trainer=TrainerConfig(steps=1, checkpoint_final=False, batch_size=8,
                     checkpoint_dir=str(tmp_path), eval_every=None, checkpoint_every=None))
-    data = Dataset(lambda partition: batches(), None, None, 8)
+    data = Loader(lambda partition: batches(), None, None, 8)
     assert int(run.train(Regression(), data, name="no-final").step) == 1
     assert Checkpoints(str(tmp_path / "no-final")).latest is None
 
@@ -283,9 +309,9 @@ def test_a_dataset_at_another_batch_than_the_run_is_refused(tmp_path, capsys):
         eval_every=None, checkpoint_every=None))
 
     with pytest.raises(ValueError):
-        run.train(Regression(), Dataset(lambda partition: batches(), None, None, 16), name="batch")
+        run.train(Regression(), Loader(lambda partition: batches(), None, None, 16), name="batch")
 
-    state = run.train(Regression(), Dataset(lambda partition: batches(), None, None, 8), name="batch")
+    state = run.train(Regression(), Loader(lambda partition: batches(), None, None, 8), name="batch")
     assert int(state.step) == 1
     output = capsys.readouterr().out
     assert "Experiment_Name: batch" in output
@@ -301,7 +327,7 @@ def test_train_scores_every_named_validation_split(tmp_path):
     held = next(batches())
     splits = {"val": lambda partition: iter([held]),
               "test": lambda partition: iter([{"x": held["x"], "y": held["y"] + 1}])}
-    run.train(Regression(), Dataset(lambda partition: batches(), None, None, 8), name="splits",
+    run.train(Regression(), Loader(lambda partition: batches(), None, None, 8), name="splits",
               validation=splits)
     rows = [json.loads(line) for line in
             (tmp_path / "runs" / "splits" / "tracking" / "scalars.jsonl").read_text().splitlines()]
@@ -326,7 +352,7 @@ def test_train_runs_the_trainer_its_config_describes(tmp_path):
         dynamic_scale=True, mesh=MeshSpec(fsdp=2), layout=Layout(min_shard=1, tolerance=1.0),
         profile=ProfileWindow(str(trace), steps=1, warmup=1), eval_every=None, checkpoint_every=None)
 
-    state = RunConfig(trainer=config).train(Regression(), Dataset(lambda partition: batches(), None, None, 8),
+    state = RunConfig(trainer=config).train(Regression(), Loader(lambda partition: batches(), None, None, 8),
                                             name="built")
 
     assert any(not leaf.sharding.is_fully_replicated for leaf in jax.tree.leaves(state.variables))
@@ -487,7 +513,7 @@ def test_a_learning_rate_schedule_is_a_typed_record_that_round_trips():
     groups included."""
     from dew.training.optim import ParamGroup, Power, PowerTail
     config = RunConfig(
-        data=datasets["array_record_images"](image_size=64, shards=("cc12m",)),
+        data=datasets["images"](source="data/cc12m", image_size=64),
         trainer=TrainerConfig(steps=1),
         optim=OptimConfig(schedule=Power(peak=0.01, warmup_steps=5, a=4.0, c=16.0,
                                          tail=PowerTail(start=8)),
@@ -502,7 +528,7 @@ def test_param_groups_with_schedules_momentum_and_bounds_round_trip():
     from dew.training.optim import Cosine, Exponential, OneCycle, ParamGroup
     momentum = OneCycle(peak=0.85, init=0.95, end=0.95, every=40)
     config = RunConfig(
-        data=datasets["array_record_images"](image_size=64, shards=("cc12m",)),
+        data=datasets["images"](source="data/cc12m", image_size=64),
         trainer=TrainerConfig(steps=1),
         optim=OptimConfig(
             optimizer="adam", schedule=Exponential(init=1e-3, end=1e-5, decay_steps=8, offset=1e-6),

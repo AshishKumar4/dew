@@ -66,7 +66,8 @@ def splits(rows: Sequence[int] | None, batch: Batch, mesh: Mesh | AbstractMesh, 
 class Candidate:
     """A step a plan compiles: the shapes of the microbatch it reads, the
     loss's shapes, the narrow copies, the state's placement and shapes as it
-    traces them, the bytes held beside it, and the program lowered."""
+    traces them, the bytes held beside it, the program lowered and its kernel
+    launches (`dew.nn.kernels.tuning.tune`)."""
     micro: Batch
     shapes: object
     copies: dict
@@ -74,6 +75,7 @@ class Candidate:
     prepared: TrainState
     held: int
     program: jax.stages.Lowered
+    launches: str
 
 
 @jax.jit
@@ -260,11 +262,11 @@ def settled(planned: Planned, plans: Sequence[Planned], seconds: Sequence[float]
 def plan_step[LossT, EffectsT](
         lower: Callable[[int], Candidate], options: Callable[[Candidate], jax.stages.CompilerOptions | None],
         candidates: Sequence[int], first: int, *, objective: Objective[LossT, EffectsT], mesh: Mesh,
-        xla_defaults: bool, base: tuple[int, int] | None, resumed: JSON, lowered: dict[int, Candidate],
+        xla_defaults: bool, base: tuple[int, int] | None, resumed: JSON,
         frontier: bool) -> tuple[list[Planned], tuple[Probe, ...]]:
     """The first of `candidates` (`splits`) and the objective's rungs to fit
     the devices (`planned`), each lowered by `lower` at the objective's
-    current rung, `lowered` holding those already, and compiled under its
+    current rung once, and compiled under its
     `options`, or under XLA's defaults on the half rung above, the head
     returning to the run's own tile `base` at each remat rung
     (`recompute_more`). `resumed`, the rung a checkpoint trained the shape
@@ -283,6 +285,7 @@ def plan_step[LossT, EffectsT](
     `tile`)."""
     probes: list[Probe] = []
     refusals: list[RuntimeError] = []
+    lowered: dict[int, Candidate] = {}
     chosen: jax.stages.CompilerOptions | None = None
     fitted: tuple[Candidate, jax.stages.Compiled] | None = None
 

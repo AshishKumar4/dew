@@ -34,7 +34,7 @@ from dew.artifacts import TextSamples, TokenScores
 from dew.diffusion.discrete import MDLM_STEPS, DiscreteProcess, Unmask
 from dew.inference.tasks import MaskedGeneration
 from dew.inputs import Field, InputSpec
-from dew.nn.protocols import Logits, TokenModel
+from dew.nn.protocols import TokenModel
 from dew.objectives.base import (
     OMITTED,
     Aux,
@@ -49,7 +49,7 @@ from dew.objectives.base import (
     model_rngs,
     thaw,
 )
-from dew.objectives.lm.chunked import head_cross_entropy, logits_cross_entropy, reads_states
+from dew.objectives.lm.chunked import final_read, head_cross_entropy, refuse_without_logits
 from dew.objectives.lm.objective import TEXT_KEY, batch_text, text_preview
 from dew.records import JSON
 from dew.sampling.sample import sample
@@ -107,11 +107,7 @@ class MaskedDiffusionObjective(Objective[Ratio]):
             raise ValueError(
                 "a masked diffusion model reads the whole corrupted row, so its states attend "
                 "both ways (TokenModel with causal False), as CausalTransformer(causal=False)'s do")
-        if not reads_states(model) and not isinstance(model, Logits):
-            raise TypeError(
-                f"masked diffusion scores a model's logits, and a {type(model).__name__} gives none: no "
-                f"head over its final states (HiddenStates with AffineHead or LogitsFromHidden) and "
-                f"no Logits")
+        refuse_without_logits(model, "masked diffusion")
         self.model = model
         self.process = process
         self.seq_len = seq_len
@@ -125,7 +121,14 @@ class MaskedDiffusionObjective(Objective[Ratio]):
 
     @property
     def _sample(self):
-        return self._compiled_program('sample', self._sample_impl, static_argnames=("count",))
+        return self.program('sample', self._sample_impl, static_argnames=("count",))
+
+    def data(self, tokenizer=None):
+        from dew.data.pipeline import ObjectiveData
+        from dew.data.steps.text import FixedTokens
+
+        geometry = FixedTokens(self.seq_len)
+        return ObjectiveData(train=(geometry,), evaluate=(geometry,))
 
     def task_record(self) -> Mapping[str, JSON]:
         """The row length, response budget, tokenizer, process, solver and sampling steps: the
@@ -183,7 +186,7 @@ class MaskedDiffusionObjective(Objective[Ratio]):
 
         The model reads every field the batch's `ModelInputs` carries, and a
         model that takes no such field refuses it. A packed batch
-        (`TokenWindows(pack=True)`) names each window's documents in
+        (``Text(pack="first-fit")``) names each window's documents in
         `text_segment_ids`, 0 for the padded tail, and their positions in
         `text_positions`. Each document then attends to itself alone, in both
         directions, with its own positions, and the tail is neither masked
@@ -213,16 +216,14 @@ class MaskedDiffusionObjective(Objective[Ratio]):
         is_masked = is_masked & real
         masked = jnp.where(is_masked, masked, tokens)
 
-        over_states = reads_states(self.model)
-        read = self.model.apply(params, masked, train=train, rngs=model_rngs(dropout_key, training=train),
-                                method="hidden_states" if over_states else "logits", mutable=False,
-                                capture_intermediates=False, **prepared.kwargs())
+        read = final_read(self.model, params, masked, train=train,
+                          rngs=model_rngs(dropout_key, training=train), mutable=False,
+                          capture_intermediates=False, **prepared.kwargs())
         # MDLM's SUBS parameterization gives the mask token no mass: it is
         # never a target, so the partition and the prediction leave it out.
         mask_id = self.process.mask_id
-        losses, predicted, _ = (
-            head_cross_entropy(self.model, params, read, tokens, self.head_chunks, excluded=mask_id)
-            if over_states else logits_cross_entropy(read, tokens, excluded=mask_id))
+        losses, predicted, _ = head_cross_entropy(self.model, params, read, tokens, self.head_chunks,
+                                                  excluded=mask_id)
         counted = is_masked.astype(losses.dtype)
         return tokens, losses, counted * self.process.weight(t)[:, None], counted, predicted, real
 
