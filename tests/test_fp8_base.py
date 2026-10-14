@@ -25,6 +25,7 @@ from jax.sharding import NamedSharding, PartitionSpec
 from model_support import TINY_DECODER
 from reference_error import assert_leaves_as_exact
 
+from dew import cache
 from dew.data.dataset import Loader
 from dew.interop.codecs import dequantize_fp8_blocks, quantize_fp8_blocks
 from dew.lora import LoRA
@@ -300,6 +301,8 @@ def test_a_wide_site_measures_faster_in_fp8_and_compiles_to_an_fp8_gemm():
     that width. The packed leaves and the gradient are the step's arguments,
     as a train state's are: XLA folds widened constant codes into a float32
     GEMM."""
+    if not cache.measures_picks():
+        pytest.skip("measuring and cuBLASLt's FP8 GEMM need the GPU to itself: gpu-run without -n")
     variables = {"params": {"wide": {"kernel": jnp.zeros((4096, 12288), jnp.float32)},
                             "narrow": {"kernel": jnp.zeros((1024, 1024), jnp.float32)}}}
     measured = measured_fp8_sites(variables, ("wide", "narrow"), 8192)

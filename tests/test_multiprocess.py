@@ -1062,6 +1062,18 @@ def test_a_pool_agrees_one_validity_schema_when_only_some_ranks_padded(tmp_path)
 
 
 @pytest.mark.distributed
+def test_a_pool_holds_process_zeros_frozen_fp8_sites(tmp_path):
+    """The frozen FP8 sites decide which kernels a rank's train state holds
+    packed, so every rank must hold one record. Process 0 measures both
+    shapes and the others take its record without timing anything, even
+    where their own timers would have chosen otherwise."""
+    reports = run_pool("fp8_sites", tmp_path / "pool", 2, timeout=180)
+    assert [report["sites"] for report in reports] == [["wide", "narrow"]] * 2
+    assert [report["generation"] for report in reports] == ["sm90"] * 2
+    assert [report["timed"] for report in reports] == [4, 0]
+
+
+@pytest.mark.distributed
 def test_the_front_door_answers_the_same_rows_on_a_pool(tmp_path):
     """Identical user code on one device and on a two-process pool: the run's
     weights land on the mesh under the trainer's layout, each rank hands in

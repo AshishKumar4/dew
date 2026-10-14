@@ -752,6 +752,32 @@ def mode_pool_refusals(args) -> dict:
     return outcomes
 
 
+def mode_fp8_sites(args) -> dict:
+    """The frozen FP8 record each rank holds after `measured_fp8_sites`,
+    its GPU taken for an H100 (sm90) and its timer made to split the pool as
+    two GPUs' noise can on a close call: process 0 times FP8 faster, every
+    other process slower. bf16 is timed before FP8 for each shape."""
+    import jax
+
+    from dew.nn.kernels import tuning
+    from dew.nn.kernels.generation import assumed
+    from dew.training.quantization import measured_fp8_sites
+
+    timed: list[object] = []
+
+    def samples(fn, *operands, repeats):
+        timed.append(fn)
+        fp8 = len(timed) % 2 == 0
+        return [1.0 if fp8 == (jax.process_index() == 0) else 2.0]
+
+    tuning.samples = samples
+    variables = {"params": {"wide": {"kernel": np.zeros((64, 96), np.float32)},
+                            "narrow": {"kernel": np.zeros((32, 32), np.float32)}}}
+    with assumed("sm90"):
+        record = measured_fp8_sites(variables, ("wide", "narrow"), 8)
+    return {"sites": list(record.frozen_fp8), "generation": record.measured_on, "timed": len(timed)}
+
+
 def mode_profile_failure(args) -> dict:
     """A scheduled profile window whose directory is a file on rank 0 only.
 
@@ -2342,7 +2368,8 @@ MODES = {"matrix": mode_matrix, "token_budget": mode_token_budget,
          "evaluation_replicas": mode_evaluation_replicas,
          "evaluation_clocks": mode_evaluation_clocks,
          "builtin_preview_failures": mode_builtin_preview_failures,
-         "profile_failure": mode_profile_failure, "pool_refusals": mode_pool_refusals}
+         "profile_failure": mode_profile_failure, "pool_refusals": mode_pool_refusals,
+         "fp8_sites": mode_fp8_sites}
 
 
 def parse_args(argv=None):
