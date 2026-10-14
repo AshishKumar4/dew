@@ -664,6 +664,9 @@ class TrainerConfig:
     """
     dynamic_scale: bool = False
     mesh: MeshSpec = dataclasses.field(default_factory=MeshSpec)
+    microbatches: int | None = None
+    """Microbatches a pipelined step feeds through the mesh's stages, a
+    multiple of `mesh.stage`; unset feeds one a stage."""
     layout: Layout = dataclasses.field(default_factory=Layout)
     profile: ProfileWindow | None = None
     """One profiler window: the steps to trace, the warmup before them and the output directory.
@@ -734,6 +737,13 @@ class TrainerConfig:
                 raise ValueError("--trainer.update-tokens must be a multiple of --trainer.batch-tokens")
             if self.batch_ramp is not None:
                 raise ValueError("--trainer.batch-ramp grows row batches and cannot use token budgets")
+            # The budgets determine the accumulation, held here so every reader of the config,
+            # RunConfig.train's Trainer among them, sees the one value.
+            accumulation = self.update_tokens // self.batch_tokens
+            if self.accumulation not in (1, accumulation):
+                raise ValueError("token budgets determine --trainer.accumulation; omit it or match "
+                                 f"the derived value {accumulation}")
+            object.__setattr__(self, 'accumulation', accumulation)
         elif self.batch_size is None or self.batch_size < 1:
             raise ValueError("--trainer.batch-size must be positive without token budgets")
         if self.split is not None and self.split < 1:
@@ -762,18 +772,6 @@ class TrainerConfig:
             object.__setattr__(
                 self, "best", tuple(rebuilt) if isinstance(self.best, (tuple, list)) else rebuilt[0]
             )
-
-    def derived(self) -> Self:
-        """The trainer settings with token-budget accumulation recorded explicitly."""
-        if self.batch_tokens is None:
-            return self
-        if self.update_tokens is None:
-            raise ValueError("token-budget accumulation requires --trainer.update-tokens")
-        accumulation = self.update_tokens // self.batch_tokens
-        if self.accumulation not in (1, accumulation):
-            raise ValueError("token budgets determine --trainer.accumulation; omit it or match "
-                             f"the derived value {accumulation}")
-        return dataclasses.replace(self, accumulation=accumulation)
 
     def best_policies(self):
         if self.best is None:
@@ -998,18 +996,19 @@ class RunConfig:
         Under `model` or `objective`, a name the config does not declare is an
         argument of the class it names, as `--model.num_layers` is on the
         command line. A path the run does not declare raises, rather than
-        training the unchanged config.
+        training the unchanged config. The paths are set together and the run
+        is built once, so fields valid only together (a token budget with no
+        row batch) are one point; each path is placed in this config, so a path
+        under `model` names an argument of the model this config holds.
         """
-        config = self
+        record = self.to_dict()
         for path, value in point.items():
-            record = config.to_dict()
-            *groups, field = _placed(config, path)[0]
+            *groups, field = _placed(self, path)[0]
             node = record
             for group in groups:
                 node = _within(node, group)
             node[field] = value
-            config = type(config).from_dict(record)
-        return config
+        return type(self).from_dict(record)
 
     def assigned(self, assignments: Sequence[str]) -> Self:
         """This config with each `path=value` in `assignments` set (`override`).
@@ -1019,13 +1018,13 @@ class RunConfig:
         command line, None for an optional field, and anything else (a record,
         a list of records) as JSON, or as the text itself when it is not JSON.
         """
-        config = self
+        point: dict[str, JSON] = {}
         for assignment in assignments:
             path, equals, text = assignment.partition("=")
             if not equals:
                 raise ValueError(f"{assignment!r} sets no value; write path=value, as trainer.steps=2000")
-            config = config.override({path: _parsed(path, text, _placed(config, path)[1])})
-        return config
+            point[path] = _parsed(path, text, _placed(self, path)[1])
+        return self.override(point)
 
     def save(self, directory: str) -> str:
         """Write this config as `run.json` in `directory` and return the path.
@@ -1149,7 +1148,6 @@ class RunConfig:
         """Build what this run trains: the objective its record names around
         its model, on its data. A kind of run with settings of its own builds
         from them in its own `prepare`."""
-        self = dataclasses.replace(self, trainer=self.trainer.derived())
         if self.objective is None or self.lora is not None:
             raise ValueError(f"{type(self).__name__} builds the objective it names around its whole model; "
                              "name an objective, and train an adapter as a kind of run that attaches one")
@@ -1278,12 +1276,13 @@ class RunConfig:
                         processes=jax.process_count()), 0)
 
             agreed("run metadata", record_run)
-            # The trainer holds mesh, layout, accumulation, split, dynamic_scale,
-            # profile and tune_kernels; prepare_process read the process fields,
-            # and the rest are fit's arguments or built the checkpoints and the tracker.
+            # The trainer holds mesh, microbatches, layout, accumulation, split,
+            # dynamic_scale, profile and tune_kernels; prepare_process read the
+            # process fields, and the rest are fit's arguments or built the
+            # checkpoints and the tracker.
             state = Trainer(
-                objective, self.optim, key=trainer.key,
-                mesh=trainer.mesh, layout=trainer.layout, accumulation=trainer.accumulation,
+                objective, self.optim, key=trainer.key, mesh=trainer.mesh,
+                microbatches=trainer.microbatches, layout=trainer.layout, accumulation=trainer.accumulation,
                 split=trainer.split, dynamic_scale=trainer.dynamic_scale, checkpoints=checkpoints,
                 tracker=tracker, rollout=rollout, profile=trainer.profile, lower_for=trainer.lower_for,
                 tune_kernels=trainer.tune_kernels,

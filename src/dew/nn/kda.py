@@ -31,6 +31,7 @@ from __future__ import annotations
 import dataclasses
 import functools
 
+import jax
 import jax.numpy as jnp
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
@@ -160,7 +161,12 @@ class KimiDeltaAttention(nn.Module):
             # The reference zeroes padded rows before projecting them
             # (apply_mask_to_padding_states, modeling_glm5_next.py:361-370).
             x = jnp.where(valid[:, :, None], x, 0)
-        projected = jnp.concatenate([self.q_proj(x), self.k_proj(x), self.v_proj(x)], axis=-1)
+        projections = (self.q_proj(x), self.k_proj(x), self.v_proj(x))
+        if decode:
+            # At one row XLA lowers each projection to a reduction and fuses the three into their
+            # concatenate, which ran 34 of an H100's 151 us a step (`held_conv1d`'s barrier, behind it).
+            projections = jax.lax.optimization_barrier(projections)
+        projected = jnp.concatenate(projections, axis=-1)
         wide = at_least_fp32(projected.dtype)
         taps = jnp.concatenate([conv()[0] for conv in (self.q_conv1d, self.k_conv1d, self.v_conv1d)])
         g = self._decay(x)

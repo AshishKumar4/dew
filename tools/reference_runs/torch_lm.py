@@ -57,6 +57,7 @@ from common import (
     host,
     kernel_summary,
     peak_flops,
+    run_arguments,
     sha256,
     steps_for,
     throughput,
@@ -68,12 +69,7 @@ from common import (
 
 
 def arguments(argv=None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--model", required=True)
-    parser.add_argument("--data", required=True)
-    parser.add_argument("--out", required=True)
-    parser.add_argument("--work", required=True, help="Dew's work.json for this config and global shape")
-    parser.add_argument("--batch", type=int, required=True, help="global rows per step")
+    parser = argparse.ArgumentParser(parents=[run_arguments()])
     parser.add_argument("--micro-batch", type=int, default=None,
                         help="rows per forward on one rank; unset is the rank's whole share")
     parser.add_argument("--precision", choices=("autocast", "autocast-bf16-residual", "fp32", "fsdp-bf16"),
@@ -86,24 +82,8 @@ def arguments(argv=None) -> argparse.Namespace:
                              "weights' dtype; 'eager' loops F.linear, which autocast runs in bf16")
     parser.add_argument("--compile", action="store_true",
                         help="torch.compile each decoder layer, the final norm and head, and the loss")
-    parser.add_argument("--steps", type=int, default=None, help="stop early; unset runs every epoch")
-    parser.add_argument("--lr-peak", type=float, default=2e-5)
-    parser.add_argument("--lr-init", type=float, default=2e-6)
-    parser.add_argument("--lr-end", type=float, default=2e-6)
-    parser.add_argument("--warmup", type=int, default=16)
-    parser.add_argument("--b1", type=float, default=0.9)
-    parser.add_argument("--b2", type=float, default=0.95)
-    parser.add_argument("--eps", type=float, default=1e-8)
-    parser.add_argument("--weight-decay", type=float, default=0.1)
-    parser.add_argument("--clip", type=float, default=1.0)
     parser.add_argument("--router-aux", type=float, default=None,
                         help="MoE: weight of the per-layer Switch balance loss (moe_aux)")
-    parser.add_argument("--probe-every", type=int, default=None,
-                        help="MoE: router loads and entropy on a fixed batch every this many steps")
-    parser.add_argument("--probe-rows", type=int, default=4)
-    parser.add_argument("--timing-warmup", type=int, default=10)
-    parser.add_argument("--profile-steps", type=int, default=5)
-    parser.add_argument("--trace-dir", default=None)
     return parser.parse_args(argv)
 
 
