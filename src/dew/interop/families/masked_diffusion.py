@@ -65,52 +65,63 @@ def _llada_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFie
     layers = records.integer(std['num_hidden_layers'], 'num_hidden_layers/n_layers')
     config = base_config(std, set(), layer_types=('full_attention',) * layers,
                           rope=Ropes(records.number(std['rope_theta'], 'rope_theta')))
-    used.update(key for key in _LLADA_READ if key in hf_config)
+    used.update(key for aliases in _LLADA_ALIASES for key in aliases if key in hf_config)
     mask = _mask_token(hf_config, used)
     _llada_refusals(hf_config, used, std)
     config.update(causal=False, mask_token_id=mask)
     return config
 
 
-# The config aliases the release writes, beside the standard spellings the
-# shared reader takes; a key present under either name has been read.
-_LLADA_READ = ('hidden_size', 'd_model', 'num_hidden_layers', 'n_layers', 'num_layers',
-               'num_attention_heads', 'n_heads', 'num_key_value_heads', 'n_kv_heads',
-               'head_dim', 'intermediate_size', 'mlp_hidden_size', 'vocab_size',
-               'embedding_size', 'max_position_embeddings', 'max_sequence_length',
-               'rms_norm_eps', 'norm_eps', 'rope_theta', 'attention_bias', 'include_bias',
-               'include_qkv_bias', 'tie_word_embeddings', 'weight_tying', 'hidden_act',
-               'hidden_activation', 'activation_type')
+# The standard spelling wins over the release's aliases, but every present
+# spelling has been read when the generic reader accounts for source keys.
+_LLADA_ALIASES = (
+    ('hidden_size', 'd_model'),
+    ('num_hidden_layers', 'n_layers', 'num_layers'),
+    ('num_attention_heads', 'n_heads'),
+    ('num_key_value_heads', 'n_kv_heads'),
+    ('head_dim',),
+    ('intermediate_size', 'mlp_hidden_size'),
+    ('vocab_size', 'embedding_size'),
+    ('max_position_embeddings', 'max_sequence_length'),
+    ('rms_norm_eps', 'norm_eps'),
+    ('rope_theta',),
+    ('attention_bias', 'include_bias', 'include_qkv_bias'),
+    ('tie_word_embeddings', 'weight_tying'),
+    ('hidden_act', 'hidden_activation', 'activation_type'),
+)
 
 
 def _llada_geometry(hf_config: Mapping[str, object]) -> Mapping[str, object]:
     """Rewrite LLaDA's own config spellings under the standard names `base_config` reads.
 
-    The aliases are d_model, n_layers, n_heads, n_kv_heads, mlp_hidden_size,
-    embedding_size and max_sequence_length. Each is read beside the standard
-    spelling it stands in for.
+    The first present spelling in each alias group wins, even when its
+    value is null, as the release's nested get calls do.
     """
-    hidden = hf_config.get('hidden_size', hf_config.get('d_model'))
-    layers = hf_config.get('num_hidden_layers', hf_config.get('n_layers',
-                           hf_config.get('num_layers')))
-    heads = hf_config.get('num_attention_heads', hf_config.get('n_heads'))
-    kv_heads = hf_config.get('num_key_value_heads', hf_config.get('n_kv_heads'))
-    intermediate = hf_config.get('intermediate_size', hf_config.get('mlp_hidden_size'))
-    vocab = hf_config.get('vocab_size', hf_config.get('embedding_size'))
+    values: dict[str, object] = {}
+    for aliases in _LLADA_ALIASES:
+        for key in aliases:
+            if key in hf_config:
+                values[aliases[0]] = hf_config[key]
+                break
+    hidden = values.get('hidden_size')
+    layers = values.get('num_hidden_layers')
+    heads = values.get('num_attention_heads')
+    kv_heads = values.get('num_key_value_heads')
+    intermediate = values.get('intermediate_size')
+    vocab = values.get('vocab_size')
     if hidden is None or layers is None or heads is None or intermediate is None or vocab is None:
         refuse('llada geometry',
                 'd_model/hidden_size, n_layers/num_hidden_layers, n_heads/num_attention_heads, '
                 'mlp_hidden_size/intermediate_size and embedding_size/vocab_size are required')
     kv_heads = heads if kv_heads is None else kv_heads
-    head_dim = hf_config.get('head_dim')
+    head_dim = values.get('head_dim')
     head_dim = (
         records.integer(head_dim, "head_dim")
         if head_dim is not None
         else records.integer(hidden, "hidden_size/d_model")
         // records.integer(heads, "num_attention_heads/n_heads")
     )
-    max_pos = hf_config.get('max_position_embeddings',
-                            hf_config.get('max_sequence_length', DEFAULT_MAX_SEQ_LEN))
+    max_pos = values.get('max_position_embeddings', DEFAULT_MAX_SEQ_LEN)
     std: dict[str, object] = {
         "hidden_size": records.integer(hidden, "hidden_size/d_model"),
         "num_attention_heads": records.integer(heads, "num_attention_heads/n_heads"),
@@ -123,20 +134,12 @@ def _llada_geometry(hf_config: Mapping[str, object]) -> Mapping[str, object]:
             records.integer(max_pos, "max_position_embeddings/max_sequence_length"), DEFAULT_MAX_SEQ_LEN
         ),
         "rms_norm_eps": records.number(
-            hf_config.get("rms_norm_eps", hf_config.get("norm_eps", 1e-6)), "rms_norm_eps"
+            values.get("rms_norm_eps", 1e-6), "rms_norm_eps"
         ),
-        "rope_theta": records.number(hf_config.get("rope_theta", 500000.0), "rope_theta"),
-        "attention_bias": bool(
-            hf_config.get(
-                "attention_bias", hf_config.get("include_bias", hf_config.get("include_qkv_bias", False))
-            )
-        ),
-        "tie_word_embeddings": bool(
-            hf_config.get("tie_word_embeddings", hf_config.get("weight_tying", False))
-        ),
-        "hidden_act": hf_config.get(
-            "hidden_act", hf_config.get("hidden_activation", hf_config.get("activation_type", "silu"))
-        ),
+        "rope_theta": records.number(values.get("rope_theta", 500000.0), "rope_theta"),
+        "attention_bias": bool(values.get("attention_bias", False)),
+        "tie_word_embeddings": bool(values.get("tie_word_embeddings", False)),
+        "hidden_act": values.get("hidden_act", "silu"),
     }
     return std
 
