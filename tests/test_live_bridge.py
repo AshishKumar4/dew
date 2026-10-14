@@ -80,12 +80,12 @@ class Kernels:
             if code.startswith(("import model_client", "import live_training")):
                 await self.phase("preload")
             elif code.startswith("sleep "):
+                # Its seconds, unless an interrupt ends it first, as an error.
                 self.interrupts[kernel].clear()
-                try:
-                    await asyncio.wait_for(self.interrupts[kernel].wait(), float(code.split()[1]))
-                    status = "error"
-                except TimeoutError:
-                    pass
+                waiting = asyncio.ensure_future(self.interrupts[kernel].wait())
+                done, _ = await asyncio.wait({waiting}, timeout=float(code.split()[1]))
+                waiting.cancel()
+                status = "error" if done else "ok"
             else:
                 await reply("stream", {"name": "stdout", "text": code})
             await reply("execute_reply", {"status": status, "execution_count": 1})
@@ -250,7 +250,8 @@ def test_a_failed_cleanup_never_hides_why_a_start_ended(bridge, monkeypatch):
             await socket.close()
             kernels.release["preload"].set()
             for _ in range(100):
-                if session not in gateway.connected and session not in gateway.contexts:
+                released = session not in gateway.connected and session not in gateway.contexts
+                if released and len(kernels.live) == 1:
                     break
                 await asyncio.sleep(0.1)
             assert session not in gateway.connected and session not in gateway.contexts

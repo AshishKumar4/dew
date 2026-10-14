@@ -453,8 +453,11 @@ class Dataset:
 
     def random_map(self, *steps: RandomStep, identity: str | None = None) -> Pipeline:
         """One record to one, each step drawing from the record's generator
-        (`fn(record, rng)` or a `grain.RandomMapTransform`), the same draws on
-        every read and resume."""
+        (`fn(record, rng)` or a `grain.RandomMapTransform`). A draw is keyed by
+        the record's place in the run's order, its epoch included: the same in
+        every read mode and reader for one order, and on resume; a different
+        shuffle draws differently, and a read cut per share (one that drops
+        records, or a streamed one) keys it by the record's place in its share."""
         for step in steps:
             if _declares_rejects(step):
                 raise TypeError(f"{_named_step(step)} drops records; apply it with random_filter_map")
@@ -476,7 +479,8 @@ class Dataset:
         generator (`fn(record, rng)` or a `grain.RandomMapTransform`) and
         returning its record's replacement or `Rejected(reason)`, which drops
         it, counted by reason, as `video.pick_clip` drops a clip shorter than
-        its window. The draws are the same on every read and resume."""
+        its window. Its draws are keyed as `random_map`'s are, by the record's
+        place in the run's order."""
         return self.then(*(RandomMap(step, identity, rejects=True) for step in steps))
 
     def map_with_index(

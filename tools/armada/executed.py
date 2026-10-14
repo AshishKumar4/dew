@@ -6,7 +6,8 @@ It counts a file once per test file through sys.monitoring's function-start even
 the first and restarted at each test file, so it costs about nothing. What collection and
 session-scoped fixtures execute serves every test file after them, so it joins every file's record.
 A test file that starts another process runs code no event sees, so its record says so, and the
-cache never skips it.
+cache never skips it; but for the native tools Dew and its tests ask about the host (`TOOLS`), which
+run none of the checkout's code.
 
 It also records where each test file's run read the backend (`reads_backend`) and which of its tests
 are marked to run on a GPU (`MARKS`): a file with either takes another path on a GPU, so the H100 tier
@@ -20,6 +21,7 @@ import json
 import os
 import sys
 import types
+from multiprocessing.process import BaseProcess
 from pathlib import Path
 
 import pytest
@@ -27,8 +29,15 @@ from ci import MARKS
 
 TOOL = 3
 """sys.monitoring's tool ids 0-2 and 5 are the debugger's, coverage's, the profiler's and the optimizer's."""
-SPAWNS = {"subprocess.Popen", "os.fork", "os.forkpty", "os.posix_spawn", "os.spawn", "os.exec"}
-"""Audit events of a process start."""
+TOOLS = {"git", "nvidia-smi", "uname", "file"}
+"""The programs a test file may start and keep its key: git (a run's commit), nvidia-smi (the GPUs)
+and uname and file (the `platform` module's answers). Any other start, a shell's or a launcher's
+included, may run the checkout's code."""
+SPAWNS = {"subprocess.Popen", "_posixsubprocess.fork_exec", "os.posix_spawn", "os.spawn", "os.exec",
+          "os.fork", "os.forkpty"}
+"""Audit events of a process start. A multiprocessing child is counted where it starts (`start_child`):
+Python 3.12 audits no spawn or forkserver start, and a forkserver's later children start in its own
+process."""
 
 root = str(Path.cwd()) + os.sep
 shared: set[str] = set()
@@ -100,8 +109,35 @@ def reads_backend(code: types.CodeType) -> bool:
 
 
 def audited(event, args):
-    if running and event in SPAWNS:
+    if running and event in SPAWNS and not native(programs(event, args)):
         spawned.add(running[-1])
+
+
+def programs(event: str, args: tuple) -> list:
+    """The programs a process start of `event` may run, by the paths its audit names: `subprocess`'s
+    executable (its command's first word where it names none), `_posixsubprocess`'s candidates, and
+    none for a fork, whose child runs this process's own code."""
+    if event in ("subprocess.Popen", "os.posix_spawn", "os.exec"):
+        return [args[0]]
+    if event == "_posixsubprocess.fork_exec":
+        return list(args[0] or ())
+    if event == "os.spawn":
+        return [args[1]]
+    return []
+
+
+def native(names: list) -> bool:
+    """Whether every one of `names`, and at least one, is a program of `TOOLS`. A start that names
+    its program by a file descriptor (`os.execve`'s), or by nothing, is no tool's."""
+    return bool(names) and all(isinstance(name, (str, bytes, os.PathLike))
+                               and os.path.basename(os.fsdecode(name)) in TOOLS for name in names)
+
+
+def start_child(self: BaseProcess) -> None:
+    """`BaseProcess.start`, counting the child every multiprocessing context starts: a Python process."""
+    if running:
+        spawned.add(running[-1])
+    multiprocessing_start(self)
 
 
 # Recording starts as `-p executed` imports this, before pytest loads the initial conftests, which
@@ -112,6 +148,8 @@ sys.monitoring.use_tool_id(TOOL, "dew-test-cache")
 sys.monitoring.register_callback(TOOL, sys.monitoring.events.PY_START, started)
 sys.monitoring.set_events(TOOL, sys.monitoring.events.PY_START)
 sys.addaudithook(audited)
+multiprocessing_start = BaseProcess.start
+BaseProcess.start = start_child
 
 
 @pytest.hookimpl(hookwrapper=True)
