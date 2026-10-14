@@ -34,16 +34,27 @@ def at_least_fp32(dtype: DTypeLike | None) -> jnp.dtype:
 def precision_names(precision: PrecisionLike) -> frozenset[str]:
     """The canonical names a `PrecisionLike` spells, unordered.
 
-    flax's alias is None, a string, a `jax.lax.Precision`, or a pair of either.
-    A string goes through `jax.lax.Precision`, so 'tensorfloat32' is 'HIGH' and
-    'bfloat16' is 'DEFAULT'; a dot algorithm keeps its own name.
+    flax's alias is None, a string, a `jax.lax.Precision`, a dot algorithm, or
+    a pair of precisions. A string is read as JAX reads
+    `jax_default_matmul_precision`: a dot algorithm preset's name is that
+    preset ('F32_F32_F32'), any other goes through `jax.lax.Precision`, so
+    'tensorfloat32' is 'HIGH' and 'bfloat16' is 'DEFAULT'; a dot algorithm
+    keeps its own name.
     """
     if precision is None:
         return frozenset()
     written = (precision,) if isinstance(
         precision, str | jax.lax.Precision | jax.lax.DotAlgorithmPreset) else precision
-    return frozenset((jax.lax.Precision(one) if isinstance(one, str) else one).name
-                     for one in written if one is not None)
+    return frozenset(_read(one).name for one in written if one is not None)
+
+
+def _read(precision):
+    """One precision `precision_names` takes, a string read as JAX reads one."""
+    if not isinstance(precision, str):
+        return precision
+    if precision in jax.lax.DotAlgorithmPreset.__members__:
+        return jax.lax.DotAlgorithmPreset[precision]
+    return jax.lax.Precision(precision)
 
 
 def asks_default_precision(precision: PrecisionLike, *, configured: bool = False) -> bool:
