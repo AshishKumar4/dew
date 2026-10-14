@@ -357,13 +357,14 @@ def _text_aliases(names: Collection[str], read: Callable[[str], np.ndarray], con
     `tied_head_names` is the family's own spelling of the head and the
     embedding, which is not `lm_head.weight` everywhere: DeepSeek V4 stores
     its head as `head.weight`, so the depths that share it are checked
-    against that tensor.
+    against that tensor. A tied source that stores its one copy under the
+    head's name alone has no second copy to check; the head fills the
+    embedding (`DecoderFamily.source_path`).
     """
     head_name, embedding_name = tied_head_names
     aliases: list[tuple[str, str]] = []
-    if config["tie_embeddings"] and head_name in names:
-        if (embedding_name not in names
-                or not np.array_equal(read(head_name), read(embedding_name))):
+    if config["tie_embeddings"] and head_name in names and embedding_name in names:
+        if not np.array_equal(read(head_name), read(embedding_name)):
             raise ValueError(f"tie_word_embeddings is set but {head_name} is not the "
                              "embedding it claims to copy")
         aliases.append((head_name, embedding_name))
@@ -435,20 +436,22 @@ def _denoiser_sources(names: Collection[str], read: Callable[[str], np.ndarray],
 
 
 def validate_source_aliases(names: Collection[str], read: Callable[[str], np.ndarray],
-                            config: Mapping[str, object]) -> tuple[tuple[str, str], ...]:
+                            config: Mapping[str, object], *, media: bool) -> tuple[tuple[str, str], ...]:
     """Return the pairs of source tensor names that hold equal values.
 
     `read` decodes one tensor at a time in FP32, so no whole-checkpoint FP32
     copy is built. The pairs are checked before any narrowing cast, so a
     quantized weight and its unquantized copy can share one leaf instead of
-    rounding to different values.
+    rounding to different values. `media` is the loader's own reading of the
+    source as a media wrapper, its decoder under text_config, which a
+    registered family reading a nested config whole (Kimi K3) is not.
     """
     if config.get("model_type") == "diffusion_gemma":
         from dew.interop.diffusion_gemma import text_config
         text, _, aliases = _denoiser_sources(names, read, text_only=False)
         tied = _text_aliases(text, lambda name: read(text[name]), translate_config(text_config(config)))
         return aliases + tuple((text[a], text[b]) for a, b in tied)
-    if "text_config" in config:
+    if media:
         record = translate_wrapper_config(config)
         sources, aliases = _wrapper_sources(names, read, record)
         text = sources["language_model"]
@@ -607,7 +610,7 @@ def translate_weights(
     params: LazyTree = {}
     variables: LazyTree = {'params': params}
     for name, tensor in family.prepare_weights(hf_tensors, config).items():
-        path = family.weight_path(name, config)
+        path = family.source_path(name, config)
         if path is None or name in copies:
             continue
         stored = np.asarray(tensor)

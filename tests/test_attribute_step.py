@@ -1,6 +1,6 @@
 """tools/attribute_step.py: where a profiled step's device time goes, by part and kind.
 
-The rows here are the Qwen3.5-0.8B step's own (c50, a decision step on an A100): XProf's hlo_stats
+The rows here are a Qwen3.5-0.8B training step's own, on an A100: XProf's hlo_stats
 rows and the optimized HLO they ran, cut to the instructions each case reads. A kind is read
 from the op, never from its operands' names, which its expression also holds: FlashAttention's
 backward takes an operand called `%input_concatenate_fusion.8` and is attention, not a layout
@@ -123,7 +123,7 @@ NAMELESS = "\n".join([
 
 
 def test_a_nameless_fusion_is_attributed_by_the_ops_it_fuses(tmp_path):
-    """A multi-output fusion carries no op_name of its own (Qwen3.5-0.8B's 50 ms of
+    """A multi-output fusion carries no op_name of its own (that step's 50 ms of
     "other"): its part and direction come from the ops fused inside it."""
     reports = tmp_path / "profile" / "capture-a" / "reports"
     reports.mkdir(parents=True)
@@ -173,7 +173,7 @@ UPDATE = "\n".join([
 
 def test_a_fusion_that_reads_optimizer_state_is_the_optimizers(tmp_path):
     """AdamW's update of a leaf is one fusion, named by its root, the parameter narrowed for
-    the next step's compute (Qwen3.5-0.8B's 12 ms of "other" on an A100): the moments it reads say it is
+    the next step's compute (that step's 12 ms of "other" on an A100): the moments it reads say it is
     the optimizer's."""
     reports = tmp_path / "profile" / "capture-a" / "reports"
     reports.mkdir(parents=True)
@@ -274,8 +274,8 @@ GEMMS = "\n".join([
 def test_a_gemm_is_judged_at_its_compiled_flops_against_its_own_precisions_peak(tmp_path):
     """A GEMM's work is its compiled FLOPs, counted from the op as the step's count counts it, over
     the measured time; XProf's rates are not read. Its model rate put a cuBLAS weight-gradient GEMM
-    of C6's Qwen3.5-0.8B at 4x its work, and its normalized rate scales by bf16's peak over its own guess of the
-    op's precision (the later Qwen3.5-0.8B step's GEMMs at 1.127 of the A100's). Each GEMM's fraction is of its own
+    of that step at 4x its work, and its normalized rate scales by bf16's peak over its own guess of the
+    op's precision (a later run's GEMMs at 1.127 of the A100's). Each GEMM's fraction is of its own
     precision's peak in Dew's table, as mfu_mixed counts it."""
     reports = tmp_path / "profile" / "capture-a" / "reports"
     reports.mkdir(parents=True)
