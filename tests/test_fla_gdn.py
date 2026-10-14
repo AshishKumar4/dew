@@ -644,8 +644,8 @@ def test_a_bf16_layer_with_wide_keys_hands_the_port_its_narrowed_operands(monkey
     the fp32 ones its convolution leaves, so the port takes it."""
     called = []
 
-    def recorded(query, key, value, g, beta, state, *, starts, max_segments):
-        del starts, max_segments  # an unpacked layer's
+    def recorded(query, key, value, g, beta, state, *, starts):
+        del starts  # an unpacked layer's
         called.append(key.dtype)
         return linear.chunk_delta_rule(jnp.repeat(query, 2, axis=2).astype(jnp.float32),
                                        jnp.repeat(key, 2, axis=2).astype(jnp.float32),
