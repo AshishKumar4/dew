@@ -11,7 +11,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
-from affine_run import Affine, Data
+from affine_run import Affine, dataset
 from flax import linen as nn
 
 from dew.config import ModelConfig, ObjectiveConfig, RunConfig, TrainerConfig
@@ -38,7 +38,7 @@ def test_a_plain_flax_model_trains_on_a_loss_function():
     objective = Supervised(Affine(), squared, inputs=INPUTS)
     trainer = Trainer(objective, optax.adam(0.1), key=jax.random.key(0))
     start = trainer.initial_state()
-    state = trainer.fit(Data(), steps=60, log_every=60)
+    state = trainer.fit(dataset(), steps=60, log_every=60)
     before, _ = objective.scalar_loss(start.variables, batch(), STEP)
     after, _ = objective.scalar_loss(state.variables, batch(), STEP)
     assert after < before / 4
@@ -143,7 +143,7 @@ def test_batch_statistics_update_as_the_model_trains_and_reload_from_its_checkpo
                       key=jax.random.key(0), checkpoints=checkpoints)
     # Copied to the host: a step may donate the buffers it starts from.
     start = jax.tree.map(np.asarray, trainer.initial_state().variables["batch_stats"])
-    state = trainer.fit(Data(), steps=4, log_every=4, checkpoint_every=4)
+    state = trainer.fit(dataset(), steps=4, log_every=4, checkpoint_every=4)
     checkpoints.wait()
     trained = state.variables["batch_stats"]
     for began, ended in zip(jax.tree.leaves(start), jax.tree.leaves(trained), strict=True):
