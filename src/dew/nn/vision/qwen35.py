@@ -12,7 +12,7 @@ from dew._model_types import _QWEN35_VISION_TYPES
 from dew.nn.text_encoders import TOWER_ACTIVATIONS
 from dew.registry import Record
 
-from .common import ProjectorBase, TowerBase, TowerGeometry, _vision_section
+from .common import ProjectorBase, TowerBase, TowerGeometry, _vision_section, block_tensor_path
 from .vit import MergeProjector, VisionTransformer, ViTLayout
 
 
@@ -83,27 +83,9 @@ _QWEN35_VISION_TENSORS = {
 }
 
 
-# A block's norms and maps as `clip_layer`'s decoder block names them.
-_BLOCK_NORMS = {"norm1": "input_layernorm", "norm2": "post_attention_layernorm"}
+# A block's maps as `clip_layer`'s decoder block names them (`block_tensor_path`).
 _BLOCK_MAPS = {("attn", "qkv"): ("self_attn", "qkv_proj"), ("attn", "proj"): ("self_attn", "o_proj"),
                ("mlp", "linear_fc1"): ("mlp", "up_proj"), ("mlp", "linear_fc2"): ("mlp", "down_proj")}
-
-
-def _qwen35_vision_block_path(parts) -> tuple[str, ...] | None:
-    """`blocks.N...` into the block's path."""
-    if (
-        len(parts) < 4
-        or parts[0] != "blocks"
-        or not parts[1].isdigit()
-        or parts[-1] not in ("weight", "bias")
-    ):
-        return None
-    block, leaf = f"blocks_{parts[1]}", parts[-1]
-    if len(parts) == 4 and parts[2] in _BLOCK_NORMS:
-        return (block, _BLOCK_NORMS[parts[2]], "scale" if leaf == "weight" else "bias")
-    if len(parts) == 5 and (parts[2], parts[3]) in _BLOCK_MAPS:
-        return (block, *_BLOCK_MAPS[parts[2], parts[3]], "kernel" if leaf == "weight" else "bias")
-    return None
 
 
 def qwen35_vision_path(hf_name: str) -> tuple[str, ...] | None:
@@ -115,8 +97,7 @@ def qwen35_vision_path(hf_name: str) -> tuple[str, ...] | None:
     """
     if hf_name.split(".")[0] == "merger":
         return None
-    path = _QWEN35_VISION_TENSORS.get(hf_name) or _qwen35_vision_block_path(
-        hf_name.split("."))
+    path = _QWEN35_VISION_TENSORS.get(hf_name) or block_tensor_path(hf_name.split("."), _BLOCK_MAPS)
     if path is None:
         raise ValueError(f"unknown tensor name {hf_name!r}")
     return path

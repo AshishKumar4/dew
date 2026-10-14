@@ -272,7 +272,7 @@ class AdversarialDistillationObjective(FlowDistillationObjective):
         count = samples.shape[0]
         schedule = self.process.schedule
         assert self.process.prediction is not None
-        conditions, _ = self._conditions(variables, batch, drop_key, dropout=True)
+        conditions = self._dropped(*self._conditions(variables, batch, drop_key), batch, drop_key)
         indices = jax.random.randint(time_key, (count,), 0, len(self.student_times))
         t = jnp.asarray(self.student_times)[indices]
         noise = jax.random.normal(noise_key, samples.shape)

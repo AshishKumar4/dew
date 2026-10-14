@@ -45,7 +45,7 @@ def test_the_objective_trains_the_duration_and_one_step_samples_the_interval():
     duration = grads["conditioning"]["duration_embed"]
     assert float(sum(jnp.abs(leaf).sum() for leaf in jax.tree.leaves(duration))) > 0
 
-    given, _ = task._conditions(params, batch, jax.random.PRNGKey(0), dropout=False)
+    given, _ = task._conditions(params, batch, jax.random.PRNGKey(0))
     denoise = task.denoiser(params, given, None)
     x_T = jax.random.normal(jax.random.PRNGKey(3), (4, 4, 4, 3))
     walked = sample(denoise, x_T, 2, solver=Euler(), key=jax.random.PRNGKey(0), final_denoise=False)
