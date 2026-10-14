@@ -9,6 +9,7 @@ import pytest
 from affine_run import dataset
 from recording import RecordingTracker
 from reference_error import assert_as_exact_as_the_reference
+from steady_state import steady_state
 
 from dew.artifacts import Representations
 from dew.inputs import Field
@@ -461,6 +462,8 @@ def separable_embeddings(num_classes=4, per_class=8, dim=6, noise=0.05):
 
 
 def test_probe_metrics_score_representations_and_average_over_the_pass():
+    """Each batch's linear probe is fit by the program the first batch of its
+    shape compiled, whatever its rates."""
     x, y = separable_embeddings()
     representations = Representations(features=x, labels=y)
     linear, knn = LinearProbe(4, steps=200), KnnProbe(4, k=3)
@@ -468,6 +471,10 @@ def test_probe_metrics_score_representations_and_average_over_the_pass():
     assert linear.finalize(linear.merge(linear(representations, None), (0.0, 1))) == pytest.approx(
         float(linear_probe_accuracy(x, y, 4, steps=200)) / 2)
     assert knn.finalize(knn(representations, None)) > 0.9
+    flipped = Representations(features=-x, labels=y)
+    # The rates go in as operands and the accuracy comes back; nothing compiles.
+    with steady_state(allow=("host_to_device", "device_to_host")):
+        LinearProbe(4, steps=200, learning_rate=3e-2)(flipped, None)
 
 
 def test_the_loss_is_the_mean_squared_error_to_normalized_targets_of_the_same_blocks(mask):

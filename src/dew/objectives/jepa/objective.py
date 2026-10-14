@@ -257,4 +257,4 @@ class JepaObjective(Objective[Ratio]):
             features = self.encode(encoder_variables, unit_range(pixels))
             return jnp.mean(features, axis=tuple(range(1, features.ndim - 1)))
 
-        return self._compiled_program('embed', embed)
+        return self.program('embed', embed)
