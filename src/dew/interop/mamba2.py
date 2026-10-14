@@ -80,10 +80,9 @@ def config_from_hf(hf_config: Mapping[str, object], used: set[str] | None = None
     activation = hf_config.get("hidden_act", "silu")
     if activation != "silu":
         raise ValueError(f"hidden_act {activation!r} is not expressible: the SSD conv activates with silu")
-    # Init-time and dtype policy fields of the reference, nothing the
-    # forward reads at fp32.
+    # Init-time fields of the reference, nothing the forward reads.
     read.update(("time_step_rank", "time_step_min", "time_step_max", "time_step_floor",
-                 "residual_in_fp32", "rescale_prenorm_residual", "time_step_limit", "layer_norm_epsilon"))
+                 "rescale_prenorm_residual", "time_step_limit", "layer_norm_epsilon"))
     # The reference leaves the upper bound open by default. transformers
     # 5.x writes an infinite bound as the {"__float__": "Infinity"} record
     # `records` reads, and every published port (AntonV/mamba2-130m-hf,
@@ -117,6 +116,7 @@ def config_from_hf(hf_config: Mapping[str, object], used: set[str] | None = None
         qk_norm=False,
         norm_eps=records.number(hf_config.get("layer_norm_epsilon", 1e-5), "layer_norm_epsilon"),
         tie_embeddings=flag("tie_word_embeddings", default=False),
+        residual_in_fp32=flag("residual_in_fp32", default=True),
         mixer=mixer,
     )
     return fields
