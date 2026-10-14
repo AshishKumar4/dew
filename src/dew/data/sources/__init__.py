@@ -10,7 +10,7 @@ from typing import Protocol, runtime_checkable
 from dew.data.dataset import Batch
 
 from .base import Read, Shard, ShardManifest, Source
-from .files import Files, Format, TokenFiles
+from .files import Files, Format
 from .grain import Grain, from_grain
 from .hf import HF, from_hf
 from .hub import Hub
@@ -18,6 +18,7 @@ from .iterator import Iterated, from_iter
 from .memory import Memory
 from .pytorch import Torch, from_torch
 from .tfds import TFDS
+from .tokens import TokenFiles
 
 
 @runtime_checkable

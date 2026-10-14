@@ -301,6 +301,9 @@ class TFDS(Dataset):
             return False
         return True
 
+    def can_provision(self, read: Read) -> bool:
+        return self.path is None or self.remote
+
     def provision(self) -> TFDS:
         if self.remote:
             preparing(self, None, self.directory)
