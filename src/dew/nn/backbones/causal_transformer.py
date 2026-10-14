@@ -256,6 +256,11 @@ class CausalTransformer(nn.Module):
     """The factor that multiplies every sublayer output before it is added to the
     residual stream: lm-engine's m_residual, and GraniteMoeHybrid's
     `residual_multiplier`."""
+    residual_in_fp32: bool = False
+    """Whether the residual stream between layers sums in at least fp32 whatever
+    the compute dtype, as mamba_ssm's `residual_in_fp32` keeps it (transformers'
+    Mamba, Mamba2 and FalconMamba blocks): each sublayer reads the stream in the
+    compute dtype and its output adds to the stream in fp32 (`stack`)."""
     logits_scaling: float = 1.0
     """The divisor of the logits: lm-engine's m_width (`lm_logits *
     (1 / m_width)`), and GraniteMoeHybrid's `logits_scaling`. The division is
@@ -1859,8 +1864,13 @@ class CausalTransformer(nn.Module):
         settles in (`residual_dtype`). A store built bank by bank
         (`dew.inference.banks`) already holds one array per run, and the view
         leaves it alone. A pipeline raises `LayoutRefused` for `decode` and
-        for a banked store.
+        for a banked store. With `residual_in_fp32` the stream enters widened,
+        so every sublayer's output adds to it in fp32 whichever loop runs.
         """
+        if self.residual_in_fp32 and isinstance(x, Carried):
+            x = x._replace(streams=x.streams.astype(at_least_fp32(x.streams.dtype)))
+        elif self.residual_in_fp32:
+            x = x.astype(at_least_fp32(x.dtype))
         stages = pipeline_stages()
         first, end = (0, self.num_layers) if span is None else span
         spanned = tuple((first + start, count) for start, count in scan_groups(self.specs[first:end],
