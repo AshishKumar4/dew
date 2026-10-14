@@ -145,21 +145,21 @@ Loading(workers=0, threads=16, read_buffer=16, worker_buffer=2)
 
 A recipe is a frozen value implementing `Recipe.pipelines()`: it returns the training Pipeline, an optional finite validation Pipeline and common host steps. The aliases are `records`, `text`, `chat`, `prompts`, `preferences`, `images`, `video` and `decisions`. Source URLs belong in `source`; `load` refuses a bare URI.
 
-`load(..., batch=None, tokens=N, lengths=(...))` selects token-budget batching. It requires record steps declaring `TokenGeometry`; `TokenField.extra` describes an aligned field's additional IDs. The compiled Dataset exposes `batch_tokens`. Row and token budgets are mutually exclusive. Run configurations set TrainerConfig.batch_size=None, batch_tokens and update_tokens, and record the derived update/micro accumulation.
+`load(..., batch=None, tokens=N)` selects token-budget batching: rows of the fixed length a record step declares (`TokenGeometry`), as many as `N` tokens hold. The compiled Dataset exposes `batch_tokens`. Row and token budgets are mutually exclusive. Run configurations set TrainerConfig.batch_size=None, batch_tokens and update_tokens, and record the derived update/micro accumulation.
 
-`Pipeline(source)` is immutable. Its methods add ordered stages: `map`, `random_map`, `map_with_index`, `filter`, `flat_map`, `shuffle`, `repeat`, `slice`, `mix`, `interleave`, `windows`, `pack`, `group`, `batch`, `workers`, `prefetch`, `take`, `cache` and `map_batch`. `batch` takes the global row batch. Host batch steps run after workers in the training process. `compile(..., host=(step,))` applies common steps to both branches.
+`Pipeline(source)` is immutable. Its methods add ordered stages: `map`, `random_map`, `map_with_index`, `filter`, `flat_map`, `shuffle`, `repeat`, `slice`, `mix`, `interleave`, `windows`, `pack`, `batch`, `workers`, `prefetch`, `take`, `cache` and `map_batch`. `batch` takes the global row batch. Host batch steps run after workers in the training process. `compile(..., host=(step,))` applies common steps to both branches.
 
 Sources implement `Source`: `Memory` holds records or columns, `Files` opens a format over URLs, `Hub` opens prepared Arrow or physical Hub Parquet shards, `TFDS` opens prepared ArrayRecords, and `Torch` adapts map-style PyTorch samples with explicit tuple field names. A `DataLoader` keeps its own sampler and collator and is refused.
 
 `read="memory"` materializes deterministic transforms and packing. `read="indexed"` requires a producer index or explicit provisioning. `read="streamed"` reads physical shards. The mode applies to every leaf, including validation. Missing artifacts are named errors unless `provision=True` permits their creation.
 
-`Objective.data()` returns `ObjectiveData`, holding train and evaluation record steps, grouping, and host batch steps for each branch. It does not change `Objective.inputs`. Metadata-dependent steps use `Configured`; the compiler binds their declared facts from the source.
+`Objective.data()` returns `ObjectiveData`, holding train and evaluation record steps and host batch steps for each branch. `ObjectiveData.pack` optionally packs those records into fixed windows, and `ObjectiveData.packed` runs record steps on each window before batching. It does not change `Objective.inputs`. Metadata-dependent steps use `Configured`; the compiler binds their declared facts from the source.
 
 `HoldOut(records=N)` reserves the source's head, `HoldOut(fraction=f, by="hash")` splits immutable record identities, and `Split(name)` opens a named split. An explicit source or Pipeline is also valid. `validation_records` caps accepted records before the share cut.
 
 `train(partition)` opens a new training iterator. `val(partition)` opens one finite pass, or is `None` without validation. Its final partial batch is filled with repeats marked by `valid_rows=False`. `DataPartition.of(mesh)` selects the process's share; `DataPartition()` reads all rows.
 
-`records` is the known accepted training-record count or `None`. `batch` is global. `steps_per_epoch` and `epoch_steps` require an authoritative finite count. The compiled `plan` records source snapshots, transforms, ordering, derived layouts, cache generations and topology constraints.
+`records` is the known accepted training-record count or `None`. `batch` is global. `steps_per_epoch` and `epoch_steps` require an authoritative finite count. The compiled `plan` records source snapshots, transforms, ordering, derived order and packing facts, cache generations and topology constraints.
 
 A global count-preserving or memory-materialized plan resumes across process counts dividing its batch. A streamed, rejecting, expanding or online-packed plan saves exact Grain iterator state per share and refuses topology changes. Volatile fetches cannot claim exact resume before their bytes are persisted.
 

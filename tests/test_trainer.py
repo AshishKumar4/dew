@@ -274,7 +274,9 @@ def stream(reader):
 
 
 class Preempting(RecordingTracker):
-    """Sends this process the scheduler's SIGTERM, once, when step `at` is logged."""
+    """Sends this process the scheduler's SIGTERM, once, when step `at` is
+    logged. The loop reads a step's log once the next step is dispatched, so
+    the notice stops the run after step `at` + 1."""
 
     def __init__(self, at):
         super().__init__()
@@ -288,7 +290,7 @@ class Preempting(RecordingTracker):
 
 
 def preempted_and_resumed(tmp_path, data, at=3, steps=6):
-    """`data` trained to `steps` with a preemption at step `at` and a resume in a fresh trainer."""
+    """`data` trained to `steps`, preempted when step `at` is logged, and resumed in a fresh trainer."""
     with pytest.raises(Preempted):
         make_trainer(tmp_path, tracker=Preempting(at)).fit(data, steps=steps, log_every=1)
     return make_trainer(tmp_path).fit(data, steps=steps, log_every=1)
@@ -327,11 +329,12 @@ def test_a_declared_stream_whose_batch_at_the_position_differs_is_refused(tmp_pa
 
 
 def test_the_replay_guard_reads_only_the_batch_at_the_position(tmp_path):
-    """The guard's limit: a declared stream that agrees up to its position
-    and differs after it resumes without complaint, on other data than the
-    uninterrupted run read, which is why replay is declared, not assumed."""
+    """The guard's limit: a declared stream that agrees up to its position,
+    the four batches before the preemption, and differs after it resumes
+    without complaint, on other data than the uninterrupted run read, which
+    is why replay is declared, not assumed."""
     opened = []
-    data = stream(replayed(lambda partition: drawn(0, opened, diverge=2)))
+    data = stream(replayed(lambda partition: drawn(0, opened, diverge=3)))
     resumed = preempted_and_resumed(tmp_path, data)
     assert int(resumed.step) == 6
     assert not same_variables(resumed, make_trainer().fit(data, steps=6, log_every=1))
@@ -602,6 +605,80 @@ def test_two_processes_train_a_conv_model_to_the_bit_under_the_repeatable_flags(
     assert runs[0].files == runs[1].files
     for name in runs[0].files:
         np.testing.assert_array_equal(runs[0][name], runs[1][name])
+
+
+RATE_RESUMES = """
+import json
+import shutil
+import sys
+
+import jax
+import numpy as np
+from affine_run import Regression, dataset
+from recording import RecordingTracker
+
+from dew.cache import enable_compilation_cache
+from dew.config import OptimConfig
+from dew.telemetry.instrumentation import compilation_cache_counts
+from dew.training import Checkpoints, Layout, Trainer
+from dew.training.optim import Cosine, ParamGroup
+
+root, grouped = sys.argv[1], sys.argv[2] == "grouped"
+enable_compilation_cache(root + "/cache")
+
+
+def fit(peak, steps, path):
+    groups = (ParamGroup("kernel", ("*kernel",), learning_rate_multiplier=0.5), ParamGroup("rest", ("*",)))
+    config = OptimConfig(schedule=Cosine(peak=peak, warmup_steps=1, decay_steps=8),
+                         param_groups=groups if grouped else ())
+    sink = RecordingTracker()
+    trainer = Trainer(Regression(), config, key=jax.random.key(0), layout=Layout(min_shard=1, tolerance=1.0),
+                      checkpoints=Checkpoints(path), tracker=sink)
+    before = compilation_cache_counts()
+    state = trainer.fit(dataset(), steps=steps, checkpoint_every=2, log_every=1)
+    after = compilation_cache_counts()
+    return {"params": [np.asarray(leaf).tolist() for leaf in jax.tree.leaves(state.variables["params"])],
+            "rates": {step: row["train/learning_rate"] for step, row in sink.scalars
+                      if "train/learning_rate" in row},
+            **{name: after.get(f"train/cache_{name}", 0) - before.get(f"train/cache_{name}", 0)
+               for name in ("hits", "misses")}}
+
+
+runs = {"first": fit(1e-3, 2, root + "/run")}
+for name, peak in (("slow", 4e-3), ("fast", 8e-3)):
+    shutil.copytree(root + "/run", f"{root}/{name}")
+    runs[name] = fit(peak, 3, f"{root}/{name}")
+print(json.dumps(runs))
+"""
+
+
+@pytest.mark.parametrize("grouped", [False, True], ids=["one", "groups"])
+def test_a_run_resumed_at_another_rate_steps_at_it_on_the_compiled_step(tmp_path, grouped):
+    """A run trained at one peak rate, resumed from its checkpoint at a
+    second and then a third: each resumed step moves the parameters by its
+    configured rate, not the checkpoint's, and the third compiles nothing:
+    the rate is an operand of the optimizer's state, so the step it runs is
+    the executable the persistent cache holds. The second resume pays for the
+    restore's own programs, which the first run never compiled. In a fresh
+    process, with a cache of its own."""
+    root = Path(__file__).resolve().parents[1]
+    environment = {**os.environ, "PYTHONPATH": os.pathsep.join([str(root / "src"), str(root / "tests")])}
+    done = subprocess.run(
+        [sys.executable, "-c", RATE_RESUMES, str(tmp_path), "grouped" if grouped else "one"],
+        env=environment, capture_output=True, text=True, timeout=600)
+    assert done.returncode == 0, done.stderr[-3000:]
+    runs = json.loads(done.stdout.splitlines()[-1])
+    assert runs["fast"]["misses"] == 0 and runs["fast"]["hits"] >= 1
+    for start, slow, fast in zip(*(runs[name]["params"] for name in ("first", "slow", "fast")), strict=True):
+        start, slow, fast = (np.asarray(leaf, np.float32) for leaf in (start, slow, fast))
+        assert np.all(slow != start)
+        # Each step's parameters round to float32, so the moves differ by up to their spacing.
+        np.testing.assert_allclose(fast - start, 2 * (slow - start), rtol=1e-5,
+                                   atol=2 * np.spacing(np.abs(start).max()))
+    if not grouped:
+        for name, peak in (("slow", 4e-3), ("fast", 8e-3)):
+            schedule = optax.warmup_cosine_decay_schedule(0.0, peak, 1, 8)
+            assert runs[name]["rates"]["3"] == pytest.approx(float(schedule(2)))
 
 
 def test_the_compiled_step_consumes_the_state_it_is_given():
