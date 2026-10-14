@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import ClassVar
+from typing import Any, ClassVar
 
 import jax
 import jax.numpy as jnp
@@ -38,9 +38,9 @@ class AutoEncoder(ABC):
     record_name: ClassVar[str | None] = None
     """The name a built-in subclass's record goes by (`to_json`); None for
     an autoencoder no record declares."""
-    record_module: ClassVar[type[nn.Module]]
+    record_module: ClassVar[type[Any]]
     """The native module class a built-in subclass's `model` is, which its
-    record's 'model' rebuilds."""
+    record's 'model' rebuilds (each subclass's own `model` type)."""
 
     def record_arguments(self) -> dict:
         """The built-in subclass's constructor arguments besides `model` and
@@ -67,23 +67,24 @@ class AutoEncoder(ABC):
         """Rebuild a built-in autoencoder from its `record`, around the checkpoint's own `params`,
         reading no source. A name no built-in declares raises `ValueError`.
         """
-        # Each module declares its wrapper's record (`record_name`).
         from dew.registry import from_record
 
-        from . import dc_ae, flux2, qwen_image, rae, sd_vae, wan  # noqa: F401
+        from .dc_ae import DCAutoencoder
+        from .flux2 import Flux2Autoencoder
+        from .qwen_image import QwenImageAutoencoder
+        from .rae import RAEAutoencoder
+        from .sd_vae import StableDiffusionVAE
+        from .wan import WanAutoencoder
 
-        def declared(base: type[AutoEncoder]):
-            for subclass in base.__subclasses__():
-                yield subclass
-                yield from declared(subclass)
-
-        built = {subclass.record_name: subclass for subclass in declared(AutoEncoder) if subclass.record_name}
+        built = {wrapper.record_name: wrapper for wrapper in (
+            StableDiffusionVAE, DCAutoencoder, WanAutoencoder, RAEAutoencoder, Flux2Autoencoder,
+            QwenImageAutoencoder)}
         if record['name'] not in built:
             raise ValueError(f"{record['name']!r} is not a built-in autoencoder declaration")
         wrapper = built[record['name']]
         fields = dict(record['fields'])
         model = from_record(wrapper.record_module, fields.pop('model'))
-        return wrapper(model=model, params=params, **fields)  # pyright: ignore[reportCallIssue]
+        return wrapper(model=model, params=params, **fields)
 
     @abstractmethod
     def encode_batch(self, params, x: jnp.ndarray,
