@@ -768,8 +768,12 @@ def test_public_quantized_alias_check_uses_original_fp32_values(tmp_path, same_v
         np.testing.assert_array_equal(values, np.full(shape, decoded).astype(ml_dtypes.bfloat16))
 
 
-@pytest.mark.parametrize("copy, loads", [(1. + 1. / 1024, True), (1. + 2. / 1024, True),
-                                         (1. + 1. / 64, False)], ids=["equal", "equal-in-bfloat16", "different"])
+COPIES = {"equal": (1. + 1. / 1024, True), "equal-in-bfloat16": (1. + 2. / 1024, True),
+          "different": (1. + 1. / 64, False)}
+"""Copies of a gate whose FP8 packing decodes to 1 + 1/1024, and whether each loads."""
+
+
+@pytest.mark.parametrize("copy, loads", list(COPIES.values()), ids=list(COPIES))
 def test_a_quantized_packed_tensor_and_its_part_stored_apart_load_one_leaf(tmp_path, copy, loads):
     """Phi-3's gate_up_proj stored in FP8 decodes to 1 + 1/1024, which the
     bfloat16 storage rounds to 1, beside a dense float32 gate_proj. A copy
