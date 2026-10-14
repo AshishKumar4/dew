@@ -38,7 +38,16 @@ from dew.data.analysis import (
     _name,
     _until,
 )
-from dew.data.dataset import Batch, DataPartition, FilledBatch, Loading, Records, record_batch, stacked
+from dew.data.dataset import (
+    SHARED_BYTES,
+    Batch,
+    DataPartition,
+    FilledBatch,
+    Loading,
+    Records,
+    record_batch,
+    stacked,
+)
 from dew.data.mixing import (
     Accepted,
     Chunked,
@@ -538,11 +547,16 @@ class _Build:
     ) -> pygrain.MapDataset:
         """The share of an indexed root that a per-share training read takes,
         repeated unless the pipeline repeats it. Both are views by index, so a
-        cache under them still keys each row by its place in the source."""
+        cache under them still keys each row by its place in the source.
+
+        The share is seeded again: Grain seeds a random step by its depth below
+        the nearest seeded dataset, so the slice and repeat would otherwise key
+        its draws apart from the global order's, a training read's apart from
+        an inspection's."""
         if self.global_order or not self.training:
             return rows
         rows = rows[partition.index :: partition.count]
-        return rows if self.lowering.repeated else rows.repeat(None)
+        return (rows if self.lowering.repeated else rows.repeat(None)).seed(self.seed)
 
     def streamed(
         self, shards: ShardManifest, pipeline: Pipeline, partition: DataPartition
@@ -609,7 +623,9 @@ class _Build:
                 _as_iter(rows, self.loading), prefetch_buffer_size=stage.buffer
             )
         elif isinstance(stage, Workers):
-            rows = _as_iter(rows, self.loading).mp_prefetch(
+            # A column too small for a shared segment of its own crosses pickled (`SHARED_BYTES`).
+            options = gx.DatasetOptions(min_shm_size=SHARED_BYTES)
+            rows = gx.WithOptionsIterDataset(_as_iter(rows, self.loading), options).mp_prefetch(
                 pygrain.MultiprocessingOptions(
                     num_workers=stage.count, per_worker_buffer_size=stage.buffer
                 ),

@@ -15,7 +15,7 @@ from dew import records
 from dew.nn.activations import gelu_exact
 from dew.registry import Record
 
-from .common import ProjectorBase, TowerBase, TowerGeometry, _vision_section
+from .common import ProjectorBase, TowerBase, TowerGeometry, _vision_section, block_tensor_path
 from .vit import VisionTransformer, ViTLayout
 
 
@@ -113,8 +113,7 @@ class DeepseekV41Projector(ProjectorBase):
                                           out_width=self.out_width)
 
 
-# A block's norms and maps as the decoder block names them.
-_BLOCK_NORMS = {"norm1": "input_layernorm", "norm2": "post_attention_layernorm"}
+# A block's maps as the decoder block names them (`block_tensor_path`).
 _BLOCK_MAPS = {("attn", "wqkv"): ("self_attn", "qkv_proj"), ("attn", "wo"): ("self_attn", "o_proj"),
                ("mlp", "w1"): ("mlp", "gate_up_proj"), ("mlp", "w2"): ("mlp", "down_proj")}
 _DEEPSEEK_V41_VISION_TENSORS = {
@@ -127,14 +126,8 @@ _DEEPSEEK_V41_VISION_TENSORS = {
 def deepseek_v41_vision_path(hf_name: str) -> tuple[str, ...]:
     """One DeepSeek-V4.1 ViT tensor name, its `vision.` prefix off, into its
     path in the trunk tree; anything else raises ValueError."""
-    path = _DEEPSEEK_V41_VISION_TENSORS.get(hf_name)
-    parts = hf_name.split(".")
-    if path is None and len(parts) > 3 and parts[0] == "blocks" and parts[1].isdigit():
-        block, leaf = f"blocks_{parts[1]}", parts[-1]
-        if len(parts) == 4 and parts[2] in _BLOCK_NORMS and leaf == "weight":
-            path = (block, _BLOCK_NORMS[parts[2]], "scale")
-        elif len(parts) == 5 and (parts[2], parts[3]) in _BLOCK_MAPS and leaf in ("weight", "bias"):
-            path = (block, *_BLOCK_MAPS[parts[2], parts[3]], "kernel" if leaf == "weight" else "bias")
+    path = (_DEEPSEEK_V41_VISION_TENSORS.get(hf_name)
+            or block_tensor_path(hf_name.split("."), _BLOCK_MAPS, norm_bias=False))
     if path is None:
         raise ValueError(f"unknown tensor name {hf_name!r}")
     return path

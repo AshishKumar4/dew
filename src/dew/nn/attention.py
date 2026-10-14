@@ -1696,11 +1696,11 @@ def resolve_implementation(implementation, query, key, *, dtype=None, precision=
     # refuses a right window without the causal mask), so a bidirectional
     # window goes past it.
     fused = sinks is None and cudnn_runs(query, softcap) and (causal or sliding_window is None)
-    # tokamax's Triton kernel, where it takes the call, ran
-    # SimpleDiT-B's 64-wide heads as fast as FlashAttention-2 on the A100 and
-    # faster on the L4; on an H100 FlashAttention-3 took half its time, so a
-    # target row names the kernel for heads it takes (`attention_narrow`). It
-    # takes no packed documents.
+    # tokamax's Triton kernel, where it takes the call, ran 64-wide heads
+    # faster than cuDNN on the L4; FlashAttention-2 on an A100 and
+    # FlashAttention-3 on an H100 took 0.5 to 0.7 of its time, so a target
+    # row names the kernel for heads it takes (`attention_narrow`). It takes
+    # no packed documents.
     if (fused and segment_ids is None and measured_kernel('attention_narrow', 'triton') == 'triton'
             and triton_runs(query, sliding_window, mask, bias)):
         return 'triton'
