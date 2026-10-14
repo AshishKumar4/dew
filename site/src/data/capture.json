@@ -6,19 +6,19 @@
 		"jax": "0.11.2.post4",
 		"flax": "0.12.10",
 		"optax": "0.2.8",
-		"dew": "8d8b79f18da89abfe257e379b719db31b7b0aa69",
+		"dew": "cb135c1b1865674a99a2a6e9c6df55ffbf9148cf",
 		"date": "2026-10-14",
 		"steps": 1000,
 		"device": "NVIDIA A100-SXM4-40GB",
 		"description": "Tiny Shakespeare from winglian/tiny-shakespeare, 1% of its records held out by content hash, freshly initialized weights, real recorded training",
-		"wall_seconds": 76.2,
+		"wall_seconds": 60.1,
 		"script_sha256": "f7e0cf0918a8c8b973c17f4eb266a58c7b6678254bb70ca7f87c3d449d6e88e5",
 		"validation_perplexity_display": 3.741,
 		"cell_sha256": "ab482387496b3b09eae115c4aec7db254455e030bc5ba0876d55bec2cf92bbb9"
 	},
 	"hero": {
 		"returncode": 0,
-		"seconds": 76.2,
+		"seconds": 60.1,
 		"columns": 96,
 		"screen": [
 			[
@@ -140,7 +140,7 @@
 					"dim": true
 				},
 				{
-					"text": "  0:00:55 "
+					"text": "  0:00:42 "
 				},
 				{
 					"text": "\u2502",
@@ -368,7 +368,7 @@
 					"text": "  "
 				},
 				{
-					"text": "     62.1%",
+					"text": "     62.0%",
 					"bold": true
 				},
 				{
@@ -425,37 +425,37 @@
 					"text": "  "
 				},
 				{
-					"text": "   0.02660",
+					"text": "   0.02572",
 					"bold": true
 				},
 				{
 					"text": "  "
 				},
 				{
-					"text": "\u2585",
+					"text": "\u2586",
 					"fg": "00afd7"
 				},
 				{
-					"text": "\u2584",
+					"text": "\u2586",
 					"fg": "5fafd7"
 				},
 				{
-					"text": "\u2588\u2587\u2583\u2582\u2584",
+					"text": "\u2583\u2585\u2583\u2583\u2588",
 					"fg": "5f87d7"
 				},
 				{
-					"text": "\u2583",
+					"text": "\u2586",
 					"fg": "8787d7"
 				},
 				{
-					"text": "\u2581\u2581",
+					"text": "\u2581\u2585",
 					"fg": "875fd7"
 				},
 				{
 					"text": "  "
 				},
 				{
-					"text": "   \u2193 7.2%",
+					"text": "   \u2193 2.7%",
 					"dim": true
 				},
 				{
@@ -539,7 +539,7 @@
 					"text": "  "
 				},
 				{
-					"text": "     7.000",
+					"text": "     11.00",
 					"bold": true
 				},
 				{
@@ -550,11 +550,11 @@
 					"fg": "00afd7"
 				},
 				{
-					"text": "\u2581",
+					"text": "\u2583",
 					"fg": "5fafd7"
 				},
 				{
-					"text": "\u2581\u2581\u2581\u2588\u2588",
+					"text": "\u2583\u2583\u2583\u2588\u2588",
 					"fg": "5f87d7"
 				},
 				{
@@ -569,7 +569,7 @@
 					"text": "  "
 				},
 				{
-					"text": "   \u2191 133%",
+					"text": "   \u2191 120%",
 					"dim": true
 				},
 				{
@@ -589,14 +589,14 @@
 					"text": " "
 				},
 				{
-					"text": "  cache_misses          ",
+					"text": "  peak_memory_gib       ",
 					"dim": true
 				},
 				{
 					"text": "  "
 				},
 				{
-					"text": "     2.000",
+					"text": "     4.003",
 					"bold": true
 				},
 				{
@@ -611,7 +611,7 @@
 					"fg": "5fafd7"
 				},
 				{
-					"text": "\u2581\u2581\u2581\u2588\u2588",
+					"text": "\u2588\u2588\u2588\u2588\u2588",
 					"fg": "5f87d7"
 				},
 				{
@@ -626,7 +626,7 @@
 					"text": "  "
 				},
 				{
-					"text": "   \u2191 100%",
+					"text": "   \u2191 0.1%",
 					"dim": true
 				},
 				{
@@ -657,15 +657,15 @@
 					"text": "   "
 				},
 				{
-					"text": "peak_memory_gib ",
+					"text": "cache_misses ",
 					"dim": true
 				},
 				{
-					"text": "4.001",
+					"text": "0",
 					"bold": true
 				},
 				{
-					"text": "                                                     "
+					"text": "                                                            "
 				},
 				{
 					"text": "\u2502",
@@ -709,14 +709,14 @@
 					"text": "  "
 				},
 				{
-					"text": "     30.41",
+					"text": "     30.15",
 					"bold": true
 				},
 				{
 					"text": "  "
 				},
 				{
-					"text": "\u2581",
+					"text": "\u2582",
 					"fg": "00afd7"
 				},
 				{
@@ -739,7 +739,7 @@
 					"text": "  "
 				},
 				{
-					"text": "   \u2193 3.6%",
+					"text": "   \u2193 4.9%",
 					"fg": "5faf5f"
 				},
 				{
@@ -766,14 +766,14 @@
 					"text": "  "
 				},
 				{
-					"text": "     2,105",
+					"text": "     2,123",
 					"bold": true
 				},
 				{
 					"text": "  "
 				},
 				{
-					"text": "\u2588",
+					"text": "\u2587",
 					"fg": "00afd7"
 				},
 				{
@@ -796,7 +796,7 @@
 					"text": "  "
 				},
 				{
-					"text": "   \u2191 3.7%",
+					"text": "   \u2191 5.2%",
 					"fg": "5faf5f"
 				},
 				{
@@ -880,14 +880,14 @@
 					"text": "  "
 				},
 				{
-					"text": "   528,485",
+					"text": "   533,040",
 					"bold": true
 				},
 				{
 					"text": "  "
 				},
 				{
-					"text": "\u2588",
+					"text": "\u2587",
 					"fg": "00afd7"
 				},
 				{
@@ -910,7 +910,7 @@
 					"text": "  "
 				},
 				{
-					"text": "   \u2191 3.7%",
+					"text": "   \u2191 5.1%",
 					"fg": "5faf5f"
 				},
 				{
@@ -937,14 +937,14 @@
 					"text": "  "
 				},
 				{
-					"text": "     11.5%",
+					"text": "     11.6%",
 					"bold": true
 				},
 				{
 					"text": "  "
 				},
 				{
-					"text": "\u2588",
+					"text": "\u2587",
 					"fg": "00afd7"
 				},
 				{
@@ -967,7 +967,7 @@
 					"text": "  "
 				},
 				{
-					"text": " \u2191 0.4 pt",
+					"text": " \u2191 0.6 pt",
 					"fg": "5faf5f"
 				},
 				{
@@ -994,14 +994,14 @@
 					"text": "  "
 				},
 				{
-					"text": "     12.3%",
+					"text": "     12.4%",
 					"bold": true
 				},
 				{
 					"text": "  "
 				},
 				{
-					"text": "\u2588",
+					"text": "\u2587",
 					"fg": "00afd7"
 				},
 				{
@@ -1024,7 +1024,7 @@
 					"text": "  "
 				},
 				{
-					"text": " \u2191 0.4 pt",
+					"text": " \u2191 0.6 pt",
 					"fg": "5faf5f"
 				},
 				{
@@ -1051,14 +1051,14 @@
 					"text": "  "
 				},
 				{
-					"text": "     12.3%",
+					"text": "     12.4%",
 					"bold": true
 				},
 				{
 					"text": "  "
 				},
 				{
-					"text": "\u2588",
+					"text": "\u2587",
 					"fg": "00afd7"
 				},
 				{
@@ -1081,7 +1081,7 @@
 					"text": "  "
 				},
 				{
-					"text": " \u2191 0.4 pt",
+					"text": " \u2191 0.6 pt",
 					"fg": "5faf5f"
 				},
 				{
@@ -1224,55 +1224,11 @@
 					"text": "   "
 				},
 				{
-					"text": "attempted/hf:winglian/tiny-shakespeare@619106eee01474d8eaa5dd400b4b405eb3734ebe:None:train",
-					"dim": true
-				},
-				{
-					"text": " "
-				},
-				{
-					"text": "\u2502",
-					"fg": "00afd7"
-				}
-			],
-			[
-				{
-					"text": "\u2502",
-					"fg": "00afd7"
-				},
-				{
-					"text": " "
-				},
-				{
-					"text": "hash holdout=[0.0,0.01),held=False,key=None ",
-					"dim": true
-				},
-				{
-					"text": "468.0",
-					"bold": true
-				},
-				{
-					"text": "                                            "
-				},
-				{
-					"text": "\u2502",
-					"fg": "00afd7"
-				}
-			],
-			[
-				{
-					"text": "\u2502",
-					"fg": "00afd7"
-				},
-				{
-					"text": " "
-				},
-				{
 					"text": "accepted/hf:winglian/tiny-shakespeare@619106eee01474d8eaa5dd400b4b405eb3734ebe:None:train ",
 					"dim": true
 				},
 				{
-					"text": "   "
+					"text": " "
 				},
 				{
 					"text": "\u2502",
@@ -1312,7 +1268,7 @@
 					"text": " "
 				},
 				{
-					"text": "truncated/hf:winglian/tiny-shakespeare@619106eee01474d8eaa5dd400b4b405eb3734ebe:None:train ",
+					"text": "attempted/hf:winglian/tiny-shakespeare@619106eee01474d8eaa5dd400b4b405eb3734ebe:None:train ",
 					"dim": true
 				},
 				{
@@ -1336,11 +1292,11 @@
 					"dim": true
 				},
 				{
-					"text": "0",
+					"text": "468.0",
 					"bold": true
 				},
 				{
-					"text": "                                                "
+					"text": "                                            "
 				},
 				{
 					"text": "\u2502",
@@ -1385,6 +1341,50 @@
 				},
 				{
 					"text": "                                         "
+				},
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "truncated/hf:winglian/tiny-shakespeare@619106eee01474d8eaa5dd400b4b405eb3734ebe:None:train ",
+					"dim": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "hash holdout=[0.0,0.01),held=False,key=None ",
+					"dim": true
+				},
+				{
+					"text": "0",
+					"bold": true
+				},
+				{
+					"text": "                                                "
 				},
 				{
 					"text": "\u2502",
@@ -1521,7 +1521,7 @@
 					"dim": true
 				},
 				{
-					"text": "1000 steps in 0:00:57           "
+					"text": "1000 steps in 0:00:44           "
 				},
 				{
 					"text": "\u2502",
@@ -1541,7 +1541,7 @@
 					"dim": true
 				},
 				{
-					"text": "after 22.27 s                   "
+					"text": "after 12.65 s                   "
 				},
 				{
 					"text": "\u2502",
@@ -1561,7 +1561,7 @@
 					"dim": true
 				},
 				{
-					"text": "32.8 step/s                     "
+					"text": "33.1 step/s                     "
 				},
 				{
 					"text": "\u2502",
@@ -1581,7 +1581,7 @@
 					"dim": true
 				},
 				{
-					"text": "53.8% of the wall time in steps "
+					"text": "68.4% of the wall time in steps "
 				},
 				{
 					"text": "\u2502",
