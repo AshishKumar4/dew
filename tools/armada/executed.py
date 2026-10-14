@@ -86,12 +86,16 @@ def conftest(name: str) -> bool:
 
 
 def reads_backend(code: types.CodeType) -> bool:
-    """Whether `code` calls `default_backend` (jax's), by any name table, or reads a `platform`
-    attribute (a device's), as `platform` alone is the module."""
+    """Whether `code` calls `default_backend` (jax's), by any name table, or reads a device's
+    `platform`: an attribute of anything but the `sys` and `platform` modules."""
     if code not in decided:
-        decided[code] = any(step.argval == "default_backend"
-                            or (step.opname == "LOAD_ATTR" and step.argval == "platform")
-                            for step in dis.get_instructions(code))
+        steps = list(dis.get_instructions(code))
+        decided[code] = any(
+            step.argval == "default_backend"
+            or (step.opname == "LOAD_ATTR" and step.argval == "platform" and not (
+                index and steps[index - 1].opname in ("LOAD_GLOBAL", "LOAD_NAME")
+                and steps[index - 1].argval in ("sys", "platform")))
+            for index, step in enumerate(steps))
     return decided[code]
 
 
