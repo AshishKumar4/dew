@@ -85,6 +85,7 @@ from dew.objectives.lm.chunked import (
     fused_head_loss,
     head_cross_entropy,
     head_table,
+    logits_cross_entropy,
     logits_support_log_probs,
     model_logits,
     reads_states,
@@ -480,7 +481,9 @@ class Scores(NamedTuple):
     it. `total` is the weighted sum of the losses and the z-loss
     (`chunked.fused_head_loss`), and a depth's total its losses' weighted sum,
     where `token_scores` was asked for the sums alone (`z_loss`): then only
-    the totals carry a gradient. Otherwise they are None.
+    the totals carry a gradient. Otherwise they are None. `logits` is the
+    `[B, seq_len, vocab]` logits the losses were scored from, where
+    `token_scores` was asked for them, else None.
     """
 
     losses: jax.Array
@@ -494,6 +497,7 @@ class Scores(NamedTuple):
     qk: dict | None
     indexer: dict | None
     total: jax.Array | None = None
+    logits: jax.Array | None = None
 
 
 @struct.dataclass
@@ -894,7 +898,7 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
                      depths: bool = False, roles=None, qk_stats: bool = False,
                      indexer: bool = False, layers: Sequence[int] = (),
                      routes: tuple[jax.Array, jax.Array | None] | None = None,
-                     predict: bool | None = None, z_loss: float | None = None):
+                     predict: bool | None = None, z_loss: float | None = None, logits: bool = False):
         """Score per-token next-token cross entropy over a `[B, seq_len + 1]` batch.
 
         Returns `Scores`: the losses, the weight of each target, whether each
@@ -930,6 +934,10 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         Where the whole logits fit, they are kept: three products either way,
         and on an H100 the whole head ran Qwen3.5-0.8B's 4 x 3072 step at
         36.1% MFU against the fused head's 34.6%.
+
+        `logits` scores the losses from the whole `[B, seq_len, vocab]`
+        logits and returns them (`Scores.logits`), for a caller that reads
+        every column, so the head is applied once.
         """
         prepared = _prepared(tokens, segment_ids, positions)
         inputs, targets = self._rows(prepared.tokens)
@@ -960,7 +968,10 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         dtype = jnp.promote_types(hidden.dtype, jnp.float32)
         weights = self._row_weights(prepared, roles, dtype)
         total = None
-        if table is not None:
+        whole = model_logits(self.model, params, hidden) if logits else None
+        if whole is not None:
+            losses, predicted, log_z = logits_cross_entropy(whole, targets, predict=predict)
+        elif table is not None:
             total, (losses, predicted, log_z) = fused_head_loss(
                 hidden, table, targets, weights, z_loss=float(z_loss or 0.0), tile=self.head_tile,
                 predict=predict)
@@ -998,7 +1009,8 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
                         self.model, params, state, targets[:, depth:], self.head_chunks,
                         tile=self.head_tile, predict=False)
                 depth_scores.append((depth_losses, depth_weights, depth_total))
-        return Scores(losses, weights, log_z, correct, hidden, kept, sown, depth_scores, qk, kls, total)
+        return Scores(losses, weights, log_z, correct, hidden, kept, sown, depth_scores, qk, kls, total,
+                      whole)
 
     def data(self, tokenizer=None):
         from dew.data.pipeline import ObjectiveData
@@ -1221,18 +1233,22 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
                 "aux_loss_alpha's and router_z_loss's router terms normalise per router, and a "
                 "distillation mixes terms over the counted tokens; balance the "
                 "student's routers with balance_rate instead")
-        statistics, aux, scores = self._scored_loss(params, batch, step, train=train, layers=layers)
-        assert isinstance(statistics, Ratio)
-        logits = constrain(model_logits(self.model, thaw(params), scores.hidden), LOGITS)
+        statistics, aux, scores = self._scored_loss(params, batch, step, train=train, layers=layers,
+                                                    logits=True)
+        assert isinstance(statistics, Ratio) and scores.logits is not None
+        logits = constrain(scores.logits, LOGITS)
         return statistics, aux, Prediction(logits, scores.losses, scores.weights, scores.layers)
 
     def _scored_loss(self, params, batch, step: Step, *, train: bool, layers: Sequence[int] = (),
-                     summed: bool = False) -> tuple[Ratio | LMStatistics, Aux[Variables], Scores]:
+                     summed: bool = False, logits: bool = False
+                     ) -> tuple[Ratio | LMStatistics, Aux[Variables], Scores]:
         """Compute the loss's statistics and reports, with the scores they came from.
 
         `summed` takes the cross entropies, the z-loss and the depths' as
         their weighted sums alone (`token_scores`'s `z_loss`), which a
         training step's loss is: a sum of a batch's rows, each counted once.
+        `logits` scores them from the whole logits and keeps those
+        (`token_scores`'s `logits`).
         """
         prepared = batch_text(batch)
         rate = self.balance_rate
@@ -1243,8 +1259,8 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
             routing=rate is not None or alpha is not None or bool(self.router_z_loss),
             depths=self.mtp_weight is not None, roles=self._batch_roles(batch),
             qk_stats=self.qk_stats, indexer=self.indexer is not None, layers=layers,
-            z_loss=self.z_loss if summed else None)
-        losses, weights, log_z, correct, _, _, routing, depths, qk, kls, sums = scores
+            z_loss=self.z_loss if summed else None, logits=logits)
+        losses, weights, log_z, correct, _, _, routing, depths, qk, kls, sums, _ = scores
         mass = jax.lax.stop_gradient(self.row_mean(weights, batch).total)
         prediction = Ratio(self.row_mean(losses * weights, batch).total, mass)
         ce, _ = prediction.mean()

@@ -6,7 +6,7 @@
 //   GET  /v1/status              {active, maxSessions, budgetUsedSeconds, budgetSeconds}
 
 import { type Opened, type Refusal, coordinatorOf } from './coordinator';
-import { SESSION_HEADER } from './shared-host';
+import { DEADLINE_HEADER, SESSION_HEADER } from './shared-host';
 import { limitsOf } from './limits';
 import { digestIp, sign, verify } from './token';
 import { visitorKey } from './visitor';
@@ -95,10 +95,13 @@ async function connect(request: Request, env: Env, id: string): Promise<Response
 	const image = await pool.image();
 	if (!image) return new Response('queued for a warm model host', { status: 503 });
 	const host = await pool.allocate(id, image);
-	if (!(await coordinatorOf(env).started(id, Date.now(), image))) {
+	const end = await coordinatorOf(env).started(id, Date.now(), image);
+	if (end === null) {
 		await pool.close(id);
 		return new Response('this session is over', { status: 410 });
 	}
+	// The session's one end, whichever connection of it this is; set here, over anything the page sent.
+	forwarded.headers.set(DEADLINE_HEADER, String(end));
 	return env.SHARED.get(env.SHARED.idFromName(host)).fetch(forwarded);
 }
 

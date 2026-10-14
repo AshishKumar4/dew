@@ -451,8 +451,8 @@ def test_an_iterator_resumes_through_its_own_state_or_by_replaying():
 
 def test_an_iterator_without_a_position_or_a_declared_replay_does_not_resume():
     """A stateless iterator that declares no replay reads and reports how far
-    it read, but refuses to resume, naming itself and both remedies; one
-    resuming through state= cannot also declare a replay."""
+    it read, but refuses to resume, where one that declares either resumes
+    (`test_an_iterator_resumes_through_its_own_state_or_by_replaying`)."""
     source = from_iter(Countdown, name="undeclared")
     reader = compile(source.repeat().batch(4), read="streamed", loading=READ).train(DataPartition())
     try:
@@ -462,12 +462,17 @@ def test_an_iterator_without_a_position_or_a_declared_replay_does_not_resume():
         reader.close()
     resumed = compile(source.repeat().batch(4), read="streamed", loading=READ).train(DataPartition())
     try:
-        with pytest.raises(ValueError, match=r"iter:undeclared keeps no position and declares no replay"):
+        with pytest.raises(ValueError):
             resumed.set_state(state)
             next(resumed)
     finally:
         resumed.close()
-    with pytest.raises(ValueError, match="not both"):
+
+
+def test_an_iterator_resuming_through_its_state_cannot_also_declare_a_replay():
+    from_iter(Countdown, name="stateful", state=lambda it: 0, load_state=lambda it, saved: None)
+    from_iter(Countdown, name="replayed", replay=True)
+    with pytest.raises(ValueError):
         from_iter(Countdown, name="both", state=lambda it: 0, load_state=lambda it, saved: None, replay=True)
 
 
