@@ -208,12 +208,23 @@ def test_a_packed_row_computes_what_its_documents_compute_alone(kind):
                            terms={"logits": terms, "grads": terms_grads})
 
 
+def embedded(module, tokens):
+    """The scaled token embeddings the model's first layer reads, which `input_embeddings` replace."""
+    return module.scaled_embeddings(module.token_embeddings(tokens))
+
+
 @pytest.mark.parametrize("kind", sorted(mixers.paths))
 def test_no_token_reaches_another_document(kind):
     """Every mixer in the registry, on every backend: in a packed row (DOCUMENTS' first two, then
     segment-0 padding), changing the first document's tokens and the padding's leaves the second's
-    logits, and the gradients of a loss on them alone, bitwise as they were. The same program on the
-    same shapes, so any difference is information crossing a document boundary."""
+    logits, the parameters' gradients of a loss on them alone and its gradient at the second's
+    embedded tokens bitwise as they were. The same program on the same shapes, so any difference is
+    information crossing a document boundary.
+
+    The loss is differentiated at the embedded tokens, not through the lookup: the table's gradient
+    adds each position's by a scatter, which a GPU's deterministic XLA (`--xla_gpu_deterministic_ops`)
+    sums in an order every id in the row decides, so new ids in the first document reorder the
+    second's sums though nothing crosses."""
     if kind in REFUSED:
         pytest.skip(f"{kind} refuses packed rows")
     fields, overrides = KIND_FIELDS.get(kind, ({}, {}))
@@ -231,12 +242,14 @@ def test_no_token_reaches_another_document(kind):
     tokens_at = coordinates(segments=segments, positions=positions, max_segments=3)
 
     def second_document(row):
-        def loss(variables):
-            logits = model.apply(variables, row, coordinates=tokens_at)
+        def loss(variables, inputs):
+            logits = model.apply(variables, row, input_embeddings=inputs, coordinates=tokens_at)
             return jnp.sum(logits * weight), logits[:, first:first + second]
 
-        (_, logits), grads = jax.jit(jax.value_and_grad(loss, has_aux=True))(variables)
-        return logits, grads
+        inputs = model.apply(variables, row, method=embedded)
+        (_, logits), (grads, at_inputs) = jax.jit(jax.value_and_grad(loss, argnums=(0, 1), has_aux=True))(
+            variables, inputs)
+        return logits, grads, at_inputs[:, first:first + second]
 
     for (path, mine), theirs in zip(jax.tree_util.tree_leaves_with_path(second_document(changed)),
                                     jax.tree.leaves(second_document(tokens)), strict=True):
