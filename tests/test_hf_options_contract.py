@@ -205,6 +205,40 @@ def test_an_unprepared_arrow_store_is_refused_without_preparation(tmp_path, monk
     assert prepared == [True]
 
 
+def test_an_unprepared_pinned_csv_split_selects_the_read_arrow_provisions(tmp_path, monkeypatch):
+    """A pinned CSV split prepares real Arrow and reads it by index, never as native shards."""
+    import datasets
+    from huggingface_hub import HfApi
+
+    from dew.data import Loading
+    from dew.data.compile import compile
+    from dew.data.dataset import DataPartition
+
+    rows = tmp_path / "train.csv"
+    rows.write_text("id,value\n" + "".join(f"{index},{index * 3}\n" for index in range(8)))
+    builder = datasets.load_dataset_builder("csv", data_files={"train": str(rows)},
+                                            cache_dir=str(tmp_path / "arrow"))
+    monkeypatch.setattr(HfApi, "dataset_info", lambda self, repo_id, **kwargs:
+                        SimpleNamespace(sha="frozen"))
+    monkeypatch.setattr(HfApi, "list_repo_files", lambda self, repo_id, **kwargs: ["train.csv"])
+    monkeypatch.setattr(datasets, "load_dataset_builder", lambda *args, **kwargs: builder)
+    source = Hub("acme/records", revision="frozen")
+    loading = Loading(workers=0, threads=1, read_buffer=2)
+    with pytest.raises(ValueError):
+        compile(source.batch(2), loading=loading)
+    assert not source.supports("indexed") and not source.supports("streamed")
+    data = compile(source.batch(2), provision=True, loading=loading)
+    assert data.plan.order["read"] == "indexed"
+    stream = data.train(DataPartition())
+    try:
+        batches = [next(stream) for _ in range(4)]
+        assert [int(value) for batch in batches for value in batch["id"]] == list(range(8))
+        for batch in batches:
+            assert (batch["value"] == batch["id"] * 3).all()
+    finally:
+        stream.close()
+
+
 def test_importing_hub_without_datasets_does_not_load_the_optional_package():
     code = """
 import builtins
