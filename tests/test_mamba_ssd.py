@@ -157,7 +157,8 @@ def test_the_port_is_as_exact_as_mamba_ssm(case, heads):
         truth = jax.tree.map(np.asarray, jax.jit(through(chunk, starts, *cotangents))(*widened(inputs)))
     reference = {name: fixture[f"mamba.{name}"] for name in ported}
     summed = summed_terms(inputs, starts, fixture["dy"], fixture["dfinal"], chunk)
-    terms = {name: np.full_like(leaf, summed[name]) if name in summed else leaf for name, leaf in truth.items()}
+    terms = {name: np.full_like(leaf, summed[name]) if name in summed else leaf
+             for name, leaf in truth.items()}
     assert_leaves_as_exact(ported, reference, truth, reductions=chunk, terms=terms)
 
 
