@@ -13,6 +13,7 @@ from flax import linen as nn
 from dew.artifacts import Representations
 from dew.data.dataset import Loader
 from dew.objectives.base import Aux, EMASpec, Objective
+from dew.training import Checkpoints, Layout, Trainer
 
 BATCH = 8
 FEATURES = 3
@@ -77,6 +78,15 @@ class Counting:
 
     def set_state(self, state):
         self.index = json.loads(state)["index"]
+
+
+def frozen_trainer(tmp_path=None, **kwargs) -> Trainer:
+    """The regression's trainer with its average frozen at unit decay, the
+    reference a preference or RL objective reads, checkpointing under
+    `tmp_path` when one is given."""
+    checkpoints = None if tmp_path is None else Checkpoints(str(tmp_path / "run"))
+    return Trainer(Regression(ema_decay=1.0), optax.sgd(0.1), key=jax.random.key(0),
+                   layout=Layout(min_shard=1, tolerance=1.0), checkpoints=checkpoints, **kwargs)
 
 
 def dataset(train=Counting, val=None, batch=BATCH) -> Loader:
