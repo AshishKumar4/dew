@@ -1,0 +1,67 @@
+{
+  "schema": 1,
+  "config": {
+    "output": "/home/ubuntu/tightpig-receipt/scaling-a100-host.json",
+    "work": "/home/ubuntu/tightpig-receipt/work",
+    "shards": 16,
+    "records": 4096,
+    "cycles": [
+      1,
+      2,
+      4,
+      8
+    ],
+    "steps": 64,
+    "warmup": 4,
+    "batch": 32,
+    "image_size": 128
+  },
+  "rows": [
+    {
+      "cycle": 1,
+      "first_batch_seconds": 0.8103171550028492,
+      "batches": 64,
+      "batches_per_second": 27.00106596976546,
+      "records_per_second": 864.0341110324947,
+      "tokens_per_second": 0.0,
+      "latency_p50_ms": 34.7342680033762,
+      "latency_p95_ms": 57.16356899938546
+    },
+    {
+      "cycle": 2,
+      "first_batch_seconds": 0.8432995320181362,
+      "batches": 64,
+      "batches_per_second": 42.005844968342615,
+      "records_per_second": 1344.1870389869637,
+      "tokens_per_second": 0.0,
+      "latency_p50_ms": 21.55325998319313,
+      "latency_p95_ms": 53.362100006779656
+    },
+    {
+      "cycle": 4,
+      "first_batch_seconds": 0.6598915870126802,
+      "batches": 64,
+      "batches_per_second": 46.55296822907607,
+      "records_per_second": 1489.6949833304343,
+      "tokens_per_second": 0.0,
+      "latency_p50_ms": 15.153962012846023,
+      "latency_p95_ms": 35.341451002750546
+    },
+    {
+      "cycle": 8,
+      "first_batch_seconds": 0.6943925590021536,
+      "batches": 64,
+      "batches_per_second": 51.14709168910949,
+      "records_per_second": 1636.7069340515036,
+      "tokens_per_second": 0.0,
+      "latency_p50_ms": 15.265054011251777,
+      "latency_p95_ms": 32.15794698917307
+    }
+  ],
+  "speedup": {
+    "1": 1.0,
+    "2": 1.5557106158467524,
+    "4": 1.7241159397634125,
+    "8": 1.8942619430796408
+  }
+}
